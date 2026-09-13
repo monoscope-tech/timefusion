@@ -1,6 +1,5 @@
 //! `DedupExec` read-side dedup benchmark.
 //!
-//!   cargo bench --bench dedup_benchmarks
 //!   DEDUP_MEM_REPORT=1 DEDUP_BIG=1 cargo bench --bench dedup_benchmarks
 
 use std::{
@@ -101,7 +100,6 @@ fn make_batches(total: usize, distinct: usize, sorted: bool) -> Vec<RecordBatch>
 fn dedup_plan(batches: Vec<RecordBatch>, sorted: bool, keep_greatest: bool) -> Arc<dyn ExecutionPlan> {
     let src = MemorySourceConfig::try_new(&[batches], schema(), None).unwrap();
     let src = if sorted {
-        // Ordered input enables DedupExec's bounded-window path.
         let ord = LexOrdering::new(vec![PhysicalSortExpr::new(Arc::new(Column::new("timestamp", 1)), Default::default())]).unwrap();
         src.try_with_sort_information(vec![ord]).unwrap()
     } else {
@@ -132,34 +130,36 @@ fn sizes() -> &'static [usize] {
 }
 const DUP_RATIOS: [u32; 4] = [0, 50, 90, 99];
 
+/// Every `(total, ratio, keep_greatest, sorted)` combination shared by the bench
+/// and the memory report, rightmost-fastest.
+fn configs() -> impl Iterator<Item = (usize, u32, bool, bool)> {
+    itertools::iproduct!(sizes().iter().copied(), DUP_RATIOS, [false, true], [false, true])
+}
+
+fn distinct_for(total: usize, ratio: u32) -> usize {
+    (total * (100 - ratio) as usize / 100).max(1)
+}
+
+/// Benchmark id; `sorted_label` differs between the two reports, so it is a parameter.
+fn tag(total: usize, ratio: u32, sorted_label: &str, keep_greatest: bool) -> String {
+    format!("n{}m/dup{}/{}/{}", total / 1_000_000, ratio, sorted_label, if keep_greatest { "greatest" } else { "first" })
+}
+
 fn bench_dedup(c: &mut Criterion) {
     let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).build().unwrap();
     let mut group = c.benchmark_group("dedup");
     group.sample_size(10);
 
-    for &total in sizes() {
-        for &ratio in &DUP_RATIOS {
-            let distinct = (total * (100 - ratio) as usize / 100).max(1);
-            for &keep_greatest in &[false, true] {
-                for &sorted in &[false, true] {
-                    let batches = make_batches(total, distinct, sorted);
-                    let tag = format!(
-                        "n{}m/dup{}/{}/{}",
-                        total / 1_000_000,
-                        ratio,
-                        if sorted { "sorted" } else { "shuffled" },
-                        if keep_greatest { "greatest" } else { "first" },
-                    );
-                    group.throughput(Throughput::Elements(total as u64));
-                    group.bench_with_input(BenchmarkId::from_parameter(&tag), &batches, |b, batches| {
-                        b.to_async(&rt).iter(|| {
-                            let plan = dedup_plan(batches.clone(), sorted, keep_greatest);
-                            async move { drain(plan).await }
-                        });
-                    });
-                }
-            }
-        }
+    for (total, ratio, keep_greatest, sorted) in configs() {
+        let batches = make_batches(total, distinct_for(total, ratio), sorted);
+        let tag = tag(total, ratio, if sorted { "sorted" } else { "shuffled" }, keep_greatest);
+        group.throughput(Throughput::Elements(total as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(&tag), &batches, |b, batches| {
+            b.to_async(&rt).iter(|| {
+                let plan = dedup_plan(batches.clone(), sorted, keep_greatest);
+                async move { drain(plan).await }
+            });
+        });
     }
     group.finish();
 }
@@ -167,24 +167,11 @@ fn bench_dedup(c: &mut Criterion) {
 fn mem_report(rt: &tokio::runtime::Runtime) {
     println!("\n=== dedup memory report (peak live bytes / alloc count) ===");
     println!("{:<28} {:>14} {:>14} {:>10}", "config", "peak_bytes", "allocs", "kept");
-    for &total in sizes() {
-        for &ratio in &DUP_RATIOS {
-            let distinct = (total * (100 - ratio) as usize / 100).max(1);
-            for &keep_greatest in &[false, true] {
-                for &sorted in &[false, true] {
-                    let batches = make_batches(total, distinct, sorted);
-                    let (kept, peak, allocs) = measure(|| rt.block_on(drain(dedup_plan(batches, sorted, keep_greatest))));
-                    let tag = format!(
-                        "n{}m/dup{}/{}/{}",
-                        total / 1_000_000,
-                        ratio,
-                        if sorted { "s" } else { "x" },
-                        if keep_greatest { "greatest" } else { "first" },
-                    );
-                    println!("{tag:<28} {peak:>14} {allocs:>14} {kept:>10}");
-                }
-            }
-        }
+    for (total, ratio, keep_greatest, sorted) in configs() {
+        let batches = make_batches(total, distinct_for(total, ratio), sorted);
+        let (kept, peak, allocs) = measure(|| rt.block_on(drain(dedup_plan(batches, sorted, keep_greatest))));
+        let tag = tag(total, ratio, if sorted { "s" } else { "x" }, keep_greatest);
+        println!("{tag:<28} {peak:>14} {allocs:>14} {kept:>10}");
     }
 }
 
@@ -205,12 +192,7 @@ fn bench_flush_dedup(c: &mut Criterion) {
     group.finish();
 }
 
-/// Cost of the landed-batch identity that lets a flush decline rows Delta
-/// already holds (`docs/plans/2026-09-02-stop-manufacturing-duplicates.md`),
-/// against the parquet encode it guards. Exists because the first estimate was
-/// taken in a DEBUG build, where SHA-256 runs ~30x under its release speed and
-/// the digest looked 5x more expensive than the encode. The flag's cost is
-/// this ratio; measure it here, not in a test binary.
+/// Canonical Arrow IPC bytes for a batch — the encode the landed-batch digest pays for.
 fn ipc_bytes(batch: &RecordBatch) -> Vec<u8> {
     let mut buf = Vec::with_capacity(batch.get_array_memory_size() + 1024);
     {
@@ -228,8 +210,7 @@ fn bench_landed_digest(c: &mut Criterion) {
         let bytes: usize = batches.iter().map(|b| b.get_array_memory_size()).sum();
         group.throughput(Throughput::Bytes(bytes as u64));
         group.bench_function(BenchmarkId::new("digest", rows), |b| b.iter(|| std::hint::black_box(timefusion::write::landed_digest(&batches))));
-        // The FLOOR: the Arrow round-trip alone, no hash. Tells us how much of
-        // the digest any hash choice can possibly remove.
+        // Floor: the Arrow round-trip alone, no hash.
         group.bench_function(BenchmarkId::new("canonicalize_only", rows), |b| {
             b.iter(|| {
                 let mut total = 0usize;
@@ -242,7 +223,7 @@ fn bench_landed_digest(c: &mut Criterion) {
                 std::hint::black_box(total)
             })
         });
-        // Hash-only, over the canonical bytes: what the hash choice actually buys.
+        // Hash-only, over the canonical bytes.
         let canonical: Vec<Vec<u8>> = batches.iter().map(ipc_bytes).collect();
         group.bench_function(BenchmarkId::new("hash_xxh3_128", rows), |b| {
             b.iter(|| std::hint::black_box(canonical.iter().map(|c| twox_hash::XxHash3_128::oneshot(c) as usize).sum::<usize>()))

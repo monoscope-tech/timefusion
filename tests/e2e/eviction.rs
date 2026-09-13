@@ -1,5 +1,4 @@
-//! Eviction: after force-flush + retention pass, old buckets are gone from
-//! MemBuffer metadata but still visible via Delta. New rows are also visible.
+//! Eviction: evicted buckets leave MemBuffer but stay readable via Delta.
 
 use std::time::Duration;
 
@@ -13,7 +12,6 @@ async fn old_data_evicted_recent_retained() -> anyhow::Result<()> {
     let env = E2eEnv::builder().with_bucket_duration(Duration::from_secs(60)).with_retention(Duration::from_secs(120)).start().await?;
     let client = env.pg_client().await?;
 
-    // Old row in bucket at frozen-start
     insert_at(&client, "old", FROZEN_START_MICROS).await?;
 
     // Advance well past retention; everything before the new "now" is old.

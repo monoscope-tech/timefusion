@@ -1,15 +1,5 @@
-//! What does sorting on the FLUSH path actually cost?
-//!
-//! The flush sort is skipped above `timefusion_sort_skip_bytes`, and the file is
-//! then written unsorted — which poisons the partition's footer ordering for
-//! every scan touching it. Raising that threshold is only safe if flush latency
-//! does not regress, because flush is on the ingest path.
-//!
-//! This times the same workload twice: once with the sort skipped (threshold 0,
-//! today's behaviour for a large bucket) and once with it taken (threshold
-//! high, the merge path). It asserts the ROW COUNTS match and prints both
-//! timings; the assertion is deliberately loose because CI timing is noisy —
-//! the number is for the operator, the guard is against a pathological blowup.
+//! Times the same flush workload with the sort skipped and with it taken, to
+//! bound what sorting on the flush (ingest) path costs.
 
 use std::time::{Duration, Instant};
 
@@ -26,9 +16,8 @@ async fn timed_flush(skip_bytes: usize, rows: i64) -> anyhow::Result<(Duration, 
         .await?;
     let client = env.pg_client().await?;
     for i in 0..rows {
-        // Scrambled event time so the sort has real work: an append-ordered
-        // bucket takes `sort_one_batch`'s already-sorted fast path and would
-        // measure nothing.
+        // Scrambled event time: an append-ordered bucket takes the already-sorted
+        // fast path and measures nothing.
         let jitter = ((i * 7919) % rows) * 1_000;
         insert_at(&client, &format!("f-{i}"), FROZEN_START_MICROS - 600_000_000 + jitter).await?;
     }
@@ -51,8 +40,7 @@ async fn sorting_the_flush_does_not_blow_up_flush_latency() -> anyhow::Result<()
 
     assert_eq!(n_skipped, ROWS, "the skipped-sort flush must persist every row");
     assert_eq!(n_sorted, ROWS, "the sorted flush must persist every row");
-    // Loose by design — this guards against an order-of-magnitude regression,
-    // not against normal variance on a shared CI box.
+    // Loose by design: guards an order-of-magnitude regression, not CI variance.
     assert!(
         sorted < skipped * 10 + Duration::from_secs(5),
         "sorting the flush must not cost an order of magnitude: skipped={skipped:?} sorted={sorted:?}. \

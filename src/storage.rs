@@ -29,18 +29,14 @@ use tokio::{
 use tracing::{Instrument, debug, field::Empty, info, instrument, warn};
 
 /// Align large Parquet data reads so sliding time predicates reuse the same
-/// cache entry even when page/coalescing boundaries move slightly. At most two
-/// edge blocks are extra, bounding amplification to <2 MiB per request.
+/// cache entry even when page/coalescing boundaries move slightly.
 const PARQUET_RANGE_ALIGNMENT_BYTES: u64 = 1024 * 1024;
 
 /// Cache entry with metadata and TTL
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CacheValue {
-    /// `Bytes`, not `Vec<u8>`: served slices refcount the BUFFER, never the
-    /// `HybridCacheEntry` (2bb5e85 pinned entries via `Bytes::from_owner` and
-    /// stalled foyer admission under scan load — 191 failed flushes; see
-    /// 5926f66). Eviction always proceeds; a live slice only delays freeing
-    /// the bytes until its reader drops.
+    /// `Bytes`, not `Vec<u8>`: served slices must refcount the BUFFER, never the
+    /// `HybridCacheEntry` — pinning entries stalls foyer admission.
     data: Bytes,
     #[serde(with = "object_meta_serde")]
     meta: ObjectMeta,
@@ -70,22 +66,17 @@ fn allocated_bytes(path: &std::path::Path) -> u64 {
         .into_iter()
         .flatten()
         .flatten()
-        .map(|entry| {
-            let path = entry.path();
-            if path.file_name().is_some_and(|name| name == "metadata") {
-                return 0;
+        .filter(|entry| !entry.path().file_name().is_some_and(|name| name == "metadata"))
+        .map(|entry| match entry.metadata() {
+            Ok(meta) if meta.is_dir() => allocated_bytes(&entry.path()),
+            #[cfg(unix)]
+            Ok(meta) => {
+                use std::os::unix::fs::MetadataExt;
+                meta.blocks().saturating_mul(512)
             }
-            match entry.metadata() {
-                Ok(meta) if meta.is_dir() => allocated_bytes(&path),
-                #[cfg(unix)]
-                Ok(meta) => {
-                    use std::os::unix::fs::MetadataExt;
-                    meta.blocks().saturating_mul(512)
-                }
-                #[cfg(not(unix))]
-                Ok(meta) => meta.len(),
-                Err(_) => 0,
-            }
+            #[cfg(not(unix))]
+            Ok(meta) => meta.len(),
+            Err(_) => 0,
         })
         .sum()
 }
@@ -164,12 +155,10 @@ pub struct FoyerCacheConfig {
     #[educe(Default = 4)]
     pub metadata_shards: usize,
     /// Optional extra cap on bytes buffered to warm the cache inline from a
-    /// multipart write (see `CachingMultipartUpload`). Always bounded by
-    /// `block_size_bytes`; 0 = bound only by the block size (the default).
+    /// multipart write. Always bounded by `block_size_bytes`; 0 = block size only.
     pub warm_inline_max_bytes: usize,
     /// Per-upload cap on bytes teed into heap by `CachingMultipartUpload`.
-    /// Sized for flush outputs; big compaction outputs skip the tee and are
-    /// warmed post-commit via the read path. 0 = bounded only by the block size.
+    /// 0 = bounded only by the block size.
     #[educe(Default = 33_554_432)] // 32MB — flush-sized files only
     pub write_capture_max_bytes: usize,
     /// Process-wide budget for in-flight write-capture buffers. 0 = unbudgeted.
@@ -192,18 +181,10 @@ pub struct FoyerCacheConfig {
 
 impl FoyerCacheConfig {
     pub fn from_app_config(cfg: &crate::config::AppConfig) -> Self {
-        // The disk block size caps the largest file that can be cached locally,
-        // and compaction writes files at ~the optimize target size. Floor the
-        // block at 2x that target so the two stay in lockstep automatically —
-        // an operator can raise timefusion_optimize_target_size without
-        // silently losing the ability to cache the bigger outputs. The
-        // configured block size acts as a lower bound / explicit override.
+        // Foyer's max entry is `block_size - blob_index_size`, so anything larger
+        // than the block never persists to disk. Floor the block at 2x the
+        // optimize target (and 2GiB) so raising the target keeps big outputs cacheable.
         let optimize_target = cfg.parquet.timefusion_optimize_target_size.max(0) as usize;
-        // Hard floor of 2GiB: the fleet holds compacted files up to ~1.5GB
-        // (historical consolidation outputs), and foyer's max entry is
-        // `block_size - blob_index_size` — with the old 512MB floor every file
-        // above it silently never persisted to the disk tier, re-fetched from
-        // R2 on each scan.
         let block_size_bytes = cfg.cache.block_size_bytes().max(optimize_target.saturating_mul(2)).max(2 << 30);
         let disk_size_bytes = cfg.cache.disk_size_bytes();
         if block_size_bytes > disk_size_bytes {
@@ -242,8 +223,7 @@ impl FoyerCacheConfig {
             disk_size_bytes: 50 * 1024 * 1024,   // 50MB
             ttl: Duration::from_secs(300),
             // Per-process dir: foyer's disk tier outlives the run, so a fixed
-            // path leaks entries into the NEXT `cargo test` and any absence
-            // assertion then passes only on a clean /tmp.
+            // path would leak entries into the next test process.
             cache_dir: PathBuf::from(format!("/tmp/test_foyer_{}_{}", name, std::process::id())),
             shards: 2,
             file_size_bytes: 1024 * 1024, // 1MB
@@ -263,9 +243,7 @@ impl FoyerCacheConfig {
 
     /// Create a test config with specific overrides
     pub fn test_config_with(name: &str, f: impl FnOnce(&mut Self)) -> Self {
-        let mut config = Self::test_config(name);
-        f(&mut config);
-        config
+        tap::Tap::tap_mut(Self::test_config(name), f)
     }
 }
 
@@ -294,8 +272,7 @@ pub struct CombinedCacheStats {
 #[derive(Debug, Default, Clone)]
 pub struct FoyerRuntimeStats {
     pub stats: CombinedCacheStats,
-    /// Admission accounting: who populated the main cache, and whether
-    /// write-captured entries were ever read before they left it.
+    /// Admission accounting: who populated the main cache.
     pub admit_write_capture_bytes: u64,
     pub admit_read_miss_bytes: u64,
     pub admit_refresh_bytes: u64,
@@ -337,37 +314,29 @@ async fn bump(stats: &StatsRef, f: impl FnOnce(&mut CacheStats)) {
 
 /// A cache hit served from `stats`' tier.
 async fn record_hit(stats: &StatsRef, bytes_served: u64) {
-    bump(stats, |s| {
-        s.hits += 1;
-        s.bytes_served += bytes_served;
-    })
-    .await;
+    let mut s = stats.write().await;
+    s.hits += 1;
+    s.bytes_served += bytes_served;
 }
 
 /// A miss on `stats`' tier that triggers an inner-store fetch.
 async fn record_miss_with_fetch(stats: &StatsRef) {
-    bump(stats, |s| {
-        s.misses += 1;
-        s.inner_gets += 1;
-    })
-    .await;
+    let mut s = stats.write().await;
+    s.misses += 1;
+    s.inner_gets += 1;
 }
 
 async fn record_range_hit(stats: &StatsRef, bytes_served: u64) {
-    bump(stats, |s| {
-        s.hits += 1;
-        s.range_hits += 1;
-        s.bytes_served += bytes_served;
-    })
-    .await;
+    let mut s = stats.write().await;
+    s.hits += 1;
+    s.range_hits += 1;
+    s.bytes_served += bytes_served;
 }
 
 async fn record_range_miss(stats: &StatsRef, bytes_read: u64) {
-    bump(stats, |s| {
-        s.range_misses += 1;
-        s.range_bytes_read += bytes_read;
-    })
-    .await;
+    let mut s = stats.write().await;
+    s.range_misses += 1;
+    s.range_bytes_read += bytes_read;
 }
 
 async fn combined_stats(main: &StatsRef, metadata: &StatsRef) -> CombinedCacheStats {
@@ -381,17 +350,13 @@ fn try_combined_stats(main: &StatsRef, metadata: &StatsRef) -> CombinedCacheStat
     CombinedCacheStats { main: snap(main), metadata: snap(metadata) }
 }
 
-/// Floor for the foyer disk block (region) size. Matches the legacy default
-/// (`timefusion_foyer_file_size_mb`), small enough that even a modest disk
-/// budget yields several regions.
+/// Floor for the foyer disk block (region) size — small enough that even a
+/// modest disk budget yields several regions.
 const MIN_DISK_BLOCK_BYTES: usize = 4 * 1024 * 1024;
 
 /// Cap a desired foyer disk block (region) size to the device. Foyer carves the
 /// device into block-sized regions, so a block >= the device leaves zero usable
-/// regions and every disk insert stalls (a 256MB block on a 50MB device wedged
-/// CI). Keep several regions by capping at a quarter of the device, floored at
-/// the legacy 4MB granularity and never above the device itself. Shared by both
-/// cache builders so neither can silently wedge on a small disk.
+/// regions and every disk insert stalls; cap at a quarter of the device.
 fn capped_block_size(desired: usize, disk_size: usize) -> usize {
     desired.min(disk_size / 4).max(MIN_DISK_BLOCK_BYTES).min(disk_size)
 }
@@ -399,14 +364,9 @@ fn capped_block_size(desired: usize, disk_size: usize) -> usize {
 /// Dedicated runtime for foyer's internal fetch/IO tasks, shared by every
 /// cache instance in the process (2 threads, lives for the process).
 ///
-/// Why not the caller's runtime: `RawCache::get_or_fetch_inner` holds its
-/// inflight-manager mutex across `Spawner::spawn`. On a live runtime that's
-/// fine, but on a runtime that is shutting down tokio cancels the spawned
-/// task INLINE — `RawFetch::drop` then re-locks the same non-reentrant mutex
-/// on the same thread and deadlocks. Any in-flight cache get racing runtime
-/// teardown (test end, prod stop-grace) could hang forever; the e2e restart
-/// tests hit it deterministically (3×600s timeouts, 2026-08-03). A dedicated
-/// runtime never dies under foyer, so the inline-cancel path can't trigger.
+/// Must NOT be the caller's runtime: foyer holds its inflight-manager mutex
+/// across `Spawner::spawn`, and a runtime shutting down cancels the spawned task
+/// inline, re-locking that non-reentrant mutex on the same thread — deadlock.
 fn foyer_spawner() -> foyer::Spawner {
     static SPAWNER: std::sync::OnceLock<foyer::Spawner> = std::sync::OnceLock::new();
     SPAWNER
@@ -452,12 +412,6 @@ pub struct SharedFoyerCache {
 }
 
 /// Which path put an entry in the main cache.
-///
-/// `WriteCapture` is the one under scrutiny. It tees every completed upload
-/// into the cache, so every file maintenance rewrites is also written to the
-/// local disk tier — whether or not anything ever reads it. Read-side counters
-/// cannot see it, which is why foyer looked innocent twice while the device
-/// absorbed ~500 MB/s (2026-09-12).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdmitSource {
     /// Teed from a completed multipart upload (`CachingMultipartUpload`).
@@ -469,11 +423,6 @@ pub enum AdmitSource {
 }
 
 /// Admission accounting for the main cache, process-wide.
-///
-/// Answers the question the whole investigation turns on: of the entries
-/// write-capture admits, how many are read even once before they are evicted?
-/// That is the "one-hit wonder" test from the S3-FIFO line of work, and it
-/// decides whether write-capture is warming anything or just burning the disk.
 #[derive(Debug, Default)]
 pub struct AdmissionStats {
     pub write_capture_bytes: AtomicU64,
@@ -526,9 +475,8 @@ impl SharedFoyerCache {
             config.metadata_disk_size_bytes / 1024 / 1024 / 1024,
             config.ttl.as_secs()
         );
-        // A sub-5-minute TTL is almost certainly a debug leftover (a real one
-        // shipped in .env once): every idle partition re-cold-starts after
-        // expiry, silently erasing the entire warm-path win.
+        // A sub-5-minute TTL is almost certainly a debug leftover: every idle
+        // partition re-cold-starts after expiry, erasing the warm-path win.
         if config.ttl < std::time::Duration::from_secs(300) {
             warn!(
                 "Foyer TTL is only {}s — cached footers expire between queries; set TIMEFUSION_FOYER_TTL_SECONDS higher unless debugging",
@@ -540,8 +488,6 @@ impl SharedFoyerCache {
         let metadata_cache_dir = config.cache_dir.join("metadata");
         std::fs::create_dir_all(&metadata_cache_dir)?;
 
-        // The main data cache wants a block big enough to hold full compaction
-        // outputs (128MB) so they persist, capped to the device so it can't wedge.
         let data_block_size = capped_block_size(config.block_size_bytes, config.disk_size_bytes);
         let evictions = Arc::new(AtomicU64::new(0));
         let admission = Arc::new(AdmissionStats::default());
@@ -597,10 +543,8 @@ impl SharedFoyerCache {
             metadata_memory_size_bytes: self.config.metadata_memory_size_bytes,
             metadata_disk_size_bytes: self.config.metadata_disk_size_bytes,
             l1_used_bytes: self.cache.memory().usage(),
-            // A recursive `read_dir` + `metadata()` over the whole L2 cache
-            // directory — tens of thousands of files at the configured disk
-            // size — and `timefusion_stats` is a pgwire query, so this runs on
-            // a runtime worker every time anything reads the stats table.
+            // Recursive `read_dir` over the whole L2 directory: must not run
+            // directly on a runtime worker.
             l2_used_bytes: crate::support::without_blocking_the_worker(|| allocated_bytes(&self.config.cache_dir)),
             entry_count: self.cache.memory().entries(),
             evictions: self.evictions.load(Ordering::Relaxed),
@@ -618,34 +562,21 @@ impl SharedFoyerCache {
         self.metadata_stats.read().await.log();
     }
 
-    /// How long Foyer's close may take before it is abandoned. Small on purpose:
-    /// see the note in `shutdown_by`.
+    /// How long Foyer's close may take before it is abandoned.
     const CLOSE_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 
     /// Close the caches, bounded by `deadline`. Foyer's `close()` flushes
-    /// in-memory entries to disk; on a large cache / slow disk this can run for
-    /// minutes (prod 2026-07-13: 377MB → 8.5min), and because it blocks process
-    /// exit it also blocks `wal.lock` release, stalling the incoming instance of
-    /// a redeploy. The disk cache is a rebuildable READ cache, so abandoning an
-    /// in-progress flush loses only warmth, never durable data — prioritize
-    /// releasing the WAL lock over cache completeness.
+    /// in-memory entries to disk and can run for minutes, blocking process exit
+    /// and therefore `wal.lock` release. The disk cache is rebuildable, so
+    /// abandoning the flush loses only warmth — never durable data.
     pub async fn shutdown_by(&self, deadline: tokio::time::Instant) -> anyhow::Result<()> {
         info!("Shutting down Foyer cache...");
         self.log_stats().await;
 
-        // Foyer close gets a SMALL slice of the grace, not all of it.
-        //
-        // An unclean kill leaves the disk cache in a state where `close()` never
-        // completes. Bounded only by `deadline`, the next shutdown then spends
-        // the ENTIRE stop grace here (measured 2026-08-02: 70.003s against a 70s
-        // grace) and leaves nothing for the WAL cursor snapshot — so the process
-        // is SIGKILLed, `clean_shutdown=false`, and the next boot pays a full
-        // blocking WAL replay, which can overrun and kill uncleanly again. One
-        // dirty kill otherwise makes every later restart slow and dirty.
-        //
-        // Everything at stake here is rebuildable cache warmth, so it is the
-        // cheapest thing in shutdown to abandon. See issue #82, where the same
-        // close overran "for minutes" in prod and stalled the wal.lock release.
+        // Foyer close gets a SMALL slice of the grace, not all of it: after an
+        // unclean kill `close()` may never complete, and consuming the whole stop
+        // grace here starves the WAL cursor snapshot, making every later restart
+        // dirty too.
         let close_deadline = deadline.min(tokio::time::Instant::now() + Self::CLOSE_BUDGET);
         info!("Closing Foyer caches...");
         match tokio::time::timeout_at(close_deadline, async {
@@ -671,19 +602,15 @@ impl SharedFoyerCache {
     }
 
     /// Best-effort eviction of a main (full-file) cache entry by its key — the
-    /// relativized object path, matching `make_cache_key`. Used to proactively
-    /// drop the (now dead) full-file bytes of a file a compaction tombstoned,
-    /// instead of waiting for VACUUM / TTL / LRU to reclaim them.
+    /// relativized object path, matching `make_cache_key`.
     pub fn evict_data_entry(&self, key: &str) {
         self.cache.remove(key);
     }
 
     /// Non-populating existence probe on the main cache, keyed like
-    /// `evict_data_entry` (the object-store-relative path). Checks L1 plus the
-    /// disk bloom filter, so it costs no IO and never promotes an entry — which
-    /// is what makes the pre-drain confirm free for already-captured files.
-    /// May false-positive on a hash collision (foyer's contract): the cost is
-    /// one un-warmed file, i.e. a later cache miss.
+    /// `evict_data_entry` (the object-store-relative path). Costs no IO and never
+    /// promotes an entry. May false-positive on a hash collision (foyer's
+    /// contract); the cost is one un-warmed file.
     pub fn contains_data(&self, key: &str) -> bool {
         self.cache.contains(key)
     }
@@ -723,19 +650,13 @@ pub async fn warm_parquet_metadata(store: &dyn ObjectStore, location: &Path, met
 /// Best-effort: warm the Parquet footer of `location` into the cache by issuing
 /// a ranged GET of the last `metadata_size_hint` bytes through `store`. When
 /// `store` is a [`FoyerObjectStoreCache`], that ranged GET lands in the
-/// metadata cache, so subsequent query planning (footer parse, row-group
-/// stats, schema, pruning) pays zero S3 round-trips. The single `head` resolves
-/// the file size needed to address the tail.
+/// metadata cache, so subsequent query planning pays zero S3 round-trips.
 ///
-/// Strictly best-effort: every error is swallowed and reported via the return
-/// value. Warming must never affect correctness or a caller's commit. Returns
-/// `true` if the footer range was fetched.
+/// Strictly best-effort: every error is swallowed. Returns `true` if the footer
+/// range was fetched.
 pub async fn warm_footer(store: &dyn ObjectStore, location: &Path, metadata_size_hint: u64) -> bool {
-    // Single suffix GET: the response carries the resolved absolute range + total
-    // size, so a `FoyerObjectStoreCache` caches the footer under the same
-    // absolute key a later bounded footer read requests — one round-trip, no
-    // separate HEAD. Falls back to HEAD + bounded GET for stores that don't
-    // support suffix ranges.
+    // Suffix GET: the response carries the resolved absolute range, so the footer
+    // is cached under the same key a later bounded footer read requests.
     let opts = GetOptions { range: Some(GetRange::Suffix(metadata_size_hint.max(1))), ..Default::default() };
     match store.get_opts(location, opts).await {
         Ok(result) => result.bytes().await.is_ok(),
@@ -751,8 +672,7 @@ async fn warm_footer_via_head(store: &dyn ObjectStore, location: &Path, metadata
         return false;
     }
     let start = size.saturating_sub(metadata_size_hint.max(1));
-    let opts = GetOptions { range: Some(GetRange::Bounded(start..size)), ..Default::default() };
-    store.get_opts(location, opts).await.is_ok()
+    store.get_opts(location, GetOptions { range: Some(GetRange::Bounded(start..size)), ..Default::default() }).await.is_ok()
 }
 
 /// Best-effort: warm the full contents of `location` into the cache via a plain
@@ -760,15 +680,9 @@ async fn warm_footer_via_head(store: &dyn ObjectStore, location: &Path, metadata
 /// (full-file) cache so ranged data reads — DataFusion row-group scans — hit
 /// Foyer instead of S3. Errors are swallowed; see [`warm_footer`].
 pub async fn warm_full(store: &dyn ObjectStore, location: &Path) -> bool {
-    // Explicitly drain the body: `GetResult`'s payload is a stream, and a
-    // generic store may not have read it yet by the time `get_opts` returns.
-    // (`FoyerObjectStoreCache` populates the cache eagerly inside `get_opts`,
-    // but consuming the bytes keeps this correct for any inner store and is
-    // a no-op cost there.)
-    match store.get_opts(location, GetOptions::default()).await {
-        Ok(result) => result.bytes().await.is_ok(),
-        Err(_) => false,
-    }
+    // Must drain the body: a generic store's payload is a lazy stream.
+    let Ok(result) = store.get_opts(location, GetOptions::default()).await else { return false };
+    result.bytes().await.is_ok()
 }
 
 tokio::task_local! {
@@ -777,42 +691,33 @@ tokio::task_local! {
 }
 
 /// Run `fut` with cache POPULATION suppressed (lookups still hit normally) when
-/// `bypass` is set — scan-resistant admission, so a wide historical scan can't
-/// evict the hot tail it will never re-read (ClickHouse's big-scan bypass).
+/// `bypass` is set, so a wide historical scan can't evict the hot tail.
 ///
-/// Task-local, so it covers everything awaited inside `fut` but NOT work the
-/// inner store hands to a separate task. That's the intended blast radius: the
-/// gated scan's own fetches are what read GBs of cold parquet.
+/// Task-local: covers everything awaited inside `fut` but NOT work the inner
+/// store hands to a separate task.
 pub fn scan_bypass_scope<F: std::future::Future>(bypass: bool, fut: F) -> impl std::future::Future<Output = F::Output> {
     SCAN_BYPASS.scope(bypass, fut)
 }
 
-/// Cap on [`FoyerObjectStoreCache::repeat_sighting`]'s key set. ~100k keys of
-/// path-length strings is a few MB — small against a 4 GB L1, and large enough
-/// that a whole dashboard's working set fits without a reset mid-refresh.
+/// Cap on [`FoyerObjectStoreCache::repeat_sighting`]'s key set — sized so a
+/// whole dashboard's working set fits without a reset mid-refresh.
 const BYPASS_SEEN_MAX: usize = 100_000;
 
 pub fn bypass_active() -> bool {
     SCAN_BYPASS.try_with(|b| *b).unwrap_or(false)
 }
 
-/// [`warm_full`] that skips the GET when the cache already holds the object —
-/// on the flush path most files were captured during their own upload, so the
-/// Influx-oracle confirm costs one free existence probe and only fetches the
-/// gap write-capture left (over its per-upload cap or the process budget).
+/// [`warm_full`] that skips the GET when the cache already holds the object.
 /// Returns `true` iff bytes were actually fetched.
-/// `cache_key` is the key inserts actually used — bucket-relative, NOT the
-/// table-relative `location` the (prefixed) `store` GETs by. Probing with
-/// `location` made this always-miss in prod (every confirm re-downloaded its
-/// own upload).
+///
+/// `cache_key` must be the key inserts actually use — bucket-relative, NOT the
+/// table-relative `location` the (prefixed) `store` GETs by.
 pub async fn warm_full_if_absent(store: &dyn ObjectStore, shared: &SharedFoyerCache, location: &Path, cache_key: &str) -> bool {
     !shared.contains_data(cache_key) && warm_full(store, location).await
 }
 
 /// Parse the `date=YYYY-MM-DD` Hive partition segment from `s`. `None` for
 /// strings without a parseable segment (Delta log, checkpoints, undated paths).
-/// Single source of truth for the magic `date=` offset/format, reused by the
-/// recency window here and the prefilter coverage gate in `database.rs`.
 pub fn date_partition_of(s: &str) -> Option<chrono::NaiveDate> {
     s.find("date=").and_then(|i| s.get(i + 5..i + 15)).and_then(|d| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").ok())
 }
@@ -820,9 +725,6 @@ pub fn date_partition_of(s: &str) -> Option<chrono::NaiveDate> {
 /// Parse the `date=YYYY-MM-DD` partition segment from `s` and return whether it
 /// is on or after `cutoff`. Strings without a parseable date segment (Delta log,
 /// checkpoints) are always within the window; a `None` cutoff means no age limit.
-///
-/// Shared by the cache-admission window here and the compaction-warm recency
-/// filter in `database.rs` so the two parsers can't drift.
 pub fn date_partition_within(s: &str, cutoff: Option<chrono::NaiveDate>) -> bool {
     let Some(cutoff) = cutoff else { return true };
     date_partition_of(s).is_none_or(|date| date >= cutoff)
@@ -831,18 +733,13 @@ pub fn date_partition_within(s: &str, cutoff: Option<chrono::NaiveDate>) -> bool
 /// Whether `location` should be admitted to the cache given the recent-days
 /// window. Paths without a `date=YYYY-MM-DD` segment (Delta log, checkpoints)
 /// are always admitted. 0 days = no age limit.
-///
-/// Keeps cold-tier rewrites (recompress of week+-old partitions) out of the
-/// cache so recent data stays local and old data is served from S3.
 fn is_within_recent_window(location: &Path, recent_days: usize) -> bool {
     let cutoff = (recent_days > 0).then(|| Utc::now().date_naive() - chrono::Duration::days(recent_days as i64));
     date_partition_within(location.as_ref(), cutoff)
 }
 
-/// Insert into the main full-file cache, steering large entries to disk-only
-/// (`Location::OnDisk`, which makes them phantom in L1) so warming a 128MB
-/// compaction output doesn't evict the hot small-entry working set from memory.
-/// Small entries keep the default L1+disk placement for fastest repeat reads.
+/// Insert into the main full-file cache, steering entries over
+/// `l1_max_entry_bytes` to disk-only so they can't evict the hot L1 working set.
 fn insert_main(cache: &FoyerCache, key: String, value: CacheValue, l1_max_entry_bytes: usize) {
     if l1_max_entry_bytes > 0 && value.data.len() > l1_max_entry_bytes {
         cache.insert_with_properties(key, value, HybridCacheProperties::default().with_location(Location::OnDisk));
@@ -852,23 +749,15 @@ fn insert_main(cache: &FoyerCache, key: String, value: CacheValue, l1_max_entry_
 }
 
 /// Synthesize an `ObjectMeta` for a just-written object from its `PutResult`
-/// (e_tag/version) and known size — lets the write path warm the cache without
-/// a post-write GET just to learn the metadata.
+/// and known size, so the write path can warm the cache without a GET.
 fn put_result_meta(location: Path, size: u64, result: &PutResult) -> ObjectMeta {
     ObjectMeta { location, last_modified: Utc::now(), size, e_tag: result.e_tag.clone(), version: result.version.clone() }
 }
 
 /// A cached byte range, stamped with the file's identity (etag/version/mtime)
-/// but the *range's* length as its size. Takes `Bytes` so admitting a range
-/// shares the fetched buffer instead of copying it.
+/// but the *range's* length as its size.
 fn range_value(location: &Path, data: Bytes, file: &ObjectMeta) -> CacheValue {
-    let meta = ObjectMeta {
-        location: location.clone(),
-        last_modified: file.last_modified,
-        size: data.len() as u64,
-        e_tag: file.e_tag.clone(),
-        version: file.version.clone(),
-    };
+    let meta = ObjectMeta { location: location.clone(), size: data.len() as u64, ..file.clone() };
     CacheValue::new(data, meta)
 }
 
@@ -889,7 +778,6 @@ pub struct FoyerObjectStoreCache {
     /// Keys a bypassed (wide) scan has asked to admit once already. See
     /// [`Self::repeat_sighting`].
     bypass_seen: Arc<DashSet<String>>,
-    /// Shared, process-wide: who admitted what, and whether it was ever read.
     admission: Arc<AdmissionStats>,
 }
 
@@ -921,7 +809,6 @@ impl FoyerObjectStoreCache {
         info!("Explicitly invalidating and refreshing _last_checkpoint cache for table: {}", key);
         self.cache.remove(&key);
 
-        // Immediately fetch and cache the new version.
         if let Ok(get_result) = self.inner.get(&Path::from(key.as_str())).await {
             let (data, meta) = Self::collect_payload(get_result).await;
             if !data.is_empty() {
@@ -941,8 +828,6 @@ impl FoyerObjectStoreCache {
         &self.admission
     }
 
-    /// Record a metadata-tier hit and stamp the span fields that always
-    /// accompany one.
     async fn record_meta_hit(&self, span: &tracing::Span, bytes_served: u64) {
         record_hit(&self.metadata_stats, bytes_served).await;
         span.record("cache_hit", true);
@@ -950,9 +835,8 @@ impl FoyerObjectStoreCache {
     }
 
     /// Spawn a background (best-effort) task, registering it for the shutdown
-    /// join when `background_tasks` isn't contended. A contended lock only means
-    /// the task detaches — it still runs, it just isn't awaited on shutdown, so
-    /// `background_tasks` is not an exhaustive registry.
+    /// join when `background_tasks` isn't contended. On contention the task
+    /// detaches, so `background_tasks` is not an exhaustive registry.
     fn spawn_tracked(&self, fut: impl std::future::Future<Output = ()> + Send + 'static) {
         let handle = tokio::spawn(fut);
         if let Ok(mut tasks) = self.background_tasks.try_lock() {
@@ -971,9 +855,7 @@ impl FoyerObjectStoreCache {
     }
 
     /// Key for a path's `ObjectMeta` in the metadata cache, kept distinct from
-    /// range keys (`#range:`). Delta data files are immutable, so a path's
-    /// size/etag is stable for the cache TTL — caching it lets footer reads skip
-    /// the per-read HEAD.
+    /// range keys (`#range:`). Valid because Delta data files are immutable.
     fn make_meta_cache_key(location: &Path) -> String {
         format!("{}#meta", location)
     }
@@ -992,8 +874,8 @@ impl FoyerObjectStoreCache {
         debug!("Invalidated metadata cache entries for: {}", location);
     }
 
-    /// One-shot `GetResult` over already-materialized bytes, reporting the
-    /// absolute range they occupy in the object (`start` = 0 for a full read).
+    /// One-shot `GetResult` over already-materialized bytes; `start` is their
+    /// absolute offset in the object (0 for a full read).
     fn make_get_result_at(data: Bytes, meta: ObjectMeta, attributes: Attributes, start: u64) -> GetResult {
         let data_len = data.len() as u64;
         GetResult {
@@ -1047,15 +929,13 @@ impl FoyerObjectStoreCache {
         }
     }
 
-    /// Best-effort [`Self::read_payload`] for warm paths: a failed read yields
-    /// empty bytes, which every caller treats as "nothing to cache".
+    /// Best-effort [`Self::read_payload`]: a failed read yields empty bytes,
+    /// which callers treat as "nothing to cache".
     async fn collect_payload(result: GetResult) -> (Vec<u8>, ObjectMeta) {
         let meta = result.meta.clone();
         (Self::read_payload(result.payload).await.unwrap_or_default(), meta)
     }
 
-    /// Serve a live main-cache entry: record the hit (stats + span) and
-    /// materialize the body.
     async fn serve_hit(&self, span: &tracing::Span, value: &CacheValue) -> GetResult {
         record_hit(&self.stats, value.data.len() as u64).await;
         span.record("cache_hit", true);
@@ -1081,16 +961,15 @@ impl FoyerObjectStoreCache {
 
         let ttl = self.config.ttl;
 
-        // Try cache first
         if let Ok(Some(entry)) = self.cache.get(&cache_key).await {
             let value = entry.value();
 
-            // Special handling for _last_checkpoint: stale-while-revalidate
+            // _last_checkpoint is mutable: stale-while-revalidate
             if Self::is_last_checkpoint(location) && !value.is_expired(ttl) {
                 let result = self.serve_hit(&span, value).await;
                 let age_millis = value.age_millis();
-                // Stale (>5s) checkpoints are served immediately and refreshed
-                // behind the request; one refresh in flight per key.
+                // Served immediately, refreshed behind the request; one refresh
+                // in flight per key.
                 if age_millis > 5000 && self.refreshing.insert(cache_key.clone()) {
                     let (inner, cache, refreshing, location, key) =
                         (self.inner.clone(), self.cache.clone(), self.refreshing.clone(), location.clone(), cache_key.clone());
@@ -1106,10 +985,9 @@ impl FoyerObjectStoreCache {
                     });
                 }
                 debug!("Foyer cache HIT (_last_checkpoint) for: {} (age: {}ms)", location, age_millis);
-                return Ok(result); // the cached value is always served immediately
+                return Ok(result);
             }
 
-            // Regular cache expiration check for non-checkpoint files
             if value.is_expired(ttl) {
                 bump(&self.stats, |s| s.ttl_expirations += 1).await;
                 self.cache.remove(&cache_key);
@@ -1144,7 +1022,6 @@ impl FoyerObjectStoreCache {
             }
         }
 
-        // Cache miss - fetch from inner store
         span.record("cache_hit", false);
         span.record("cache_fetch_leader", true);
         record_miss_with_fetch(&self.stats).await;
@@ -1180,11 +1057,8 @@ impl FoyerObjectStoreCache {
     /// slice and the entry's age; `None` when the entry is absent, expired, or
     /// too short. Refreshes the entry's sliding TTL on a hit.
     ///
-    /// Zero-copy, second attempt. 2bb5e85 pinned the cache ENTRY
-    /// (`Bytes::from_owner(entry)`) and stalled foyer admission under scan load;
-    /// this slice shares only the `Bytes` buffer, so eviction and accounting
-    /// proceed regardless — a live slice at worst delays freeing one evicted
-    /// file body until its reader drops.
+    /// The returned slice must share only the `Bytes` buffer, never the cache
+    /// entry — pinning the entry stalls foyer admission under scan load.
     async fn live_slice(&self, cache: &FoyerCache, key: &str, base: u64, range: &Range<u64>, l1_max_entry_bytes: usize) -> Option<(Bytes, u64)> {
         // Bounds first: an out-of-entry range must not cost a cache get (which
         // promotes the entry in L1 and may read the disk tier).
@@ -1236,12 +1110,9 @@ impl FoyerObjectStoreCache {
             return Ok(sliced);
         }
 
-        // Full-file coverage is preferred, but cache the exact coalesced data
-        // ranges DataFusion repeatedly requests as a resilient second line.
-        // This avoids making every dashboard refresh wait on R2 when upload or
-        // post-commit full warming has not converged yet. Range entries live in
-        // the main tier (not the small metadata tier) and remain subject to the
-        // recent-window and wide-scan admission policies.
+        // Second line after full-file coverage: cache the exact coalesced data
+        // ranges DataFusion repeatedly requests. These live in the main tier and
+        // stay subject to the recent-window and wide-scan admission policies.
         if is_parquet && let Ok(Some(entry)) = self.cache.get(&range_cache_key).await {
             let value = entry.value();
             if !value.is_expired(self.config.ttl) {
@@ -1255,12 +1126,9 @@ impl FoyerObjectStoreCache {
             self.cache.remove(&range_cache_key);
         }
 
-        // For Parquet files, implement smart caching based on the range
         if is_parquet {
-            // Probe the metadata range cache *before* any HEAD: its key is just
-            // (location, range), so a steady-state footer read served from cache
-            // pays zero S3 round-trips. Data ranges aren't stored here and fall
-            // through to the size-based classification below.
+            // Probe the metadata range cache *before* any HEAD, so a steady-state
+            // footer read pays zero S3 round-trips.
             // l1_max=0: metadata entries are tiny, always keep in L1.
             if let Some((sliced, age_millis)) = self.live_slice(&self.metadata_cache, &range_cache_key, range.start, &range, 0).await {
                 self.record_meta_hit(&span, sliced.len() as u64).await;
@@ -1268,9 +1136,8 @@ impl FoyerObjectStoreCache {
                 return Ok(sliced);
             }
 
-            // Range-cache miss: we need the file size to classify the request and
-            // to stamp the cached range's meta. Use the cached ObjectMeta
-            // (immutable Delta files) so this HEAD is paid at most once per file.
+            // Need the file size to classify the request and stamp the cached
+            // range's meta; the cached ObjectMeta keeps this HEAD to once per file.
             let file_meta = self.head_cached(location).await.inspect_err(|e| debug!("Failed to get metadata for {}: {}", location, e))?;
             range_meta = Some(file_meta.clone());
 
@@ -1279,45 +1146,30 @@ impl FoyerObjectStoreCache {
 
             // Containment probe against the two ranges `warm_footer` can have
             // populated: the suffix tail (size-hint..size) and — for files
-            // smaller than the hint — the whole file (0..size). The reader's
-            // own footer reads (8-byte tail, then the parsed metadata range)
-            // never equal those keys exactly, so the exact-key probe above
-            // misses and a pre-warmed cold partition still paid 1-2 S3 RTTs
-            // of metadata latency (300 ms+ observed against OVH).
+            // smaller than the hint — the whole file (0..size). The reader's own
+            // footer reads never equal those keys exactly, so the exact-key probe
+            // above misses even on a pre-warmed file.
             let warm_start = file_size.saturating_sub(metadata_size_hint);
-            // When warm_start == 0 the two candidate ranges coincide; probe once.
-            // candidate=0 also means files smaller than the hint are fully
-            // cached here by warm_footer — any in-bounds read (including data
-            // pages) is intentionally served from the metadata cache.
-            // Probe the suffix key first: for files larger than the hint only
-            // (warm_start..size) exists, so leading with it saves an always-miss
-            // (0..size) lookup on the common footer-read path.
+            // warm_start == 0: the two candidates coincide; probe once. Otherwise
+            // probe the suffix key first — only it exists for larger files.
             let candidates: &[u64] = if warm_start == 0 { &[0] } else { &[warm_start, 0] };
             for &candidate in candidates.iter().filter(|&&c| c <= range.start && range.end <= file_size) {
                 let key = Self::make_range_cache_key(location, &(candidate..file_size));
                 if let Some((sliced, _)) = self.live_slice(&self.metadata_cache, &key, candidate, &range, 0).await {
                     self.record_meta_hit(&span, range.end - range.start).await;
-                    // Distinct from the exact-key HIT log above so cache-key
-                    // alignment is diagnosable on a new deployment.
                     debug!("Metadata cache HIT (containment {}..{}) for: {} (range: {}..{})", candidate, file_size, location, range.start, range.end);
                     return Ok(sliced);
                 }
             }
 
-            // Check if this is likely a metadata request (reading from near the end of the file)
-            // A file no bigger than the metadata hint is FULL-FILE class, not
-            // metadata: for such a file every range satisfies the footer
-            // proximity test, so the old test routed all its data pages down
-            // the per-(file,range) metadata path — one R2 GET per coalesced
-            // range per query, forever, and the main tier read as unused
-            // (prod 2026-08-03: hits=0/misses=0 with 1703 warmed entries while
-            // a sea of sub-1MB flush files paid per-range GETs). Falling
-            // through caches the whole body in the main tier with ONE GET.
+            // A metadata request reads from near the end of the file. A file no
+            // bigger than the hint is FULL-FILE class, not metadata: every range
+            // in it satisfies footer proximity, so classifying it as metadata
+            // would pay one GET per coalesced range instead of caching the body once.
             let is_metadata_request = range.end <= 8 || (file_size > metadata_size_hint && range.start >= file_size.saturating_sub(metadata_size_hint));
             span.record("is_metadata", is_metadata_request);
 
             if is_metadata_request {
-                // Cache miss for metadata range - fetch just the range
                 span.record("cache_hit", false);
                 record_miss_with_fetch(&self.metadata_stats).await;
                 debug!("Metadata cache MISS for Parquet: {} (range: {}..{}, file_size: {})", location, range.start, range.end, file_size);
@@ -1348,13 +1200,10 @@ impl FoyerObjectStoreCache {
             }
 
             // A small file (≤ the L1 entry cap) is cheap enough to cache whole
-            // inline. Large files are warmed only by upload capture and the
-            // post-commit/restart warmer. Never start a full-object download
-            // from a query miss: in production one 1h count needed ~5MB of
-            // selected parquet bytes but query-triggered detached warms read
-            // 1.33GB from object storage (266x amplification) and competed
-            // with the foreground range requests. A large miss therefore
-            // falls through to the exact range fetch below.
+            // inline. Never start a full-object download from a query miss on a
+            // large file — the read amplification competes with the foreground
+            // range requests; large files are warmed only by upload capture and
+            // the post-commit/restart warmer.
             if file_meta.size <= self.config.l1_max_entry_bytes as u64 {
                 debug!("Foyer cache MISS for Parquet data: {} (range: {}..{}, fetching full file)", location, range.start, range.end);
                 if let Ok(result) = self.get_cached(location).await {
@@ -1364,10 +1213,8 @@ impl FoyerObjectStoreCache {
                     }
                 }
             } else if file_size > PARQUET_RANGE_ALIGNMENT_BYTES {
-                // Exact DataFusion ranges depend on the sliding predicate and
-                // page-index result. Normalize their edges so the next refresh
-                // addresses the same cache entry instead of downloading a
-                // nearly-identical multi-MB range again.
+                // Exact DataFusion ranges shift with the predicate; normalize
+                // their edges so the next refresh addresses the same cache entry.
                 let aligned_start = (range.start / PARQUET_RANGE_ALIGNMENT_BYTES) * PARQUET_RANGE_ALIGNMENT_BYTES;
                 let aligned_end = range.end.div_ceil(PARQUET_RANGE_ALIGNMENT_BYTES).saturating_mul(PARQUET_RANGE_ALIGNMENT_BYTES).min(file_size);
                 let aligned = aligned_start..aligned_end;
@@ -1385,7 +1232,6 @@ impl FoyerObjectStoreCache {
             }
         }
 
-        // Fallback to regular range request for non-parquet files
         span.record("cache_hit", false);
         record_miss_with_fetch(&self.stats).await;
         debug!("get_range request for: {} (range: {}..{}, parquet={})", location, range.start, range.end, is_parquet);
@@ -1450,8 +1296,7 @@ impl FoyerObjectStoreCache {
         span.record("cache_hit", false);
         let inner_span = tracing::trace_span!(parent: &span, "s3.head", location = %location);
         let meta = self.inner.head(location).instrument(inner_span).await?;
-        // Cache immutable parquet meta so later footer reads skip the HEAD. Skip
-        // mutable paths (Delta log / _last_checkpoint can be rewritten in place).
+        // Only parquet meta is cacheable; Delta log paths can be rewritten in place.
         if is_parquet_file(location) {
             self.admit_meta(location, meta.clone());
         }
@@ -1464,9 +1309,7 @@ impl FoyerObjectStoreCache {
         let payload_size = payload.content_length();
         let is_parquet = is_parquet_file(location);
 
-        // Keep a cheap (Arc-backed) handle to the payload so we can warm the
-        // cache from the bytes we already hold — no need to re-download what we
-        // just wrote to S3.
+        // Cheap (Arc-backed) clone: warms the cache without re-downloading.
         let payload_for_cache = payload.clone();
 
         debug!("S3 PUT request starting: {} (size: {} bytes, parquet: {})", location, payload_size, is_parquet);
@@ -1480,11 +1323,8 @@ impl FoyerObjectStoreCache {
             is_parquet
         );
 
-        // Warm the cache directly from the just-written bytes — a range-agnostic
-        // full-file entry, so any subsequent ranged read is served by a slice.
-        // ObjectMeta is reconstructed from the PutResult (e_tag/version) and the
-        // known payload size; no post-write GET. insert_main_value applies the
-        // recent-days window and large-entry disk steering.
+        // Warm a range-agnostic full-file entry from the just-written bytes, with
+        // ObjectMeta reconstructed from the PutResult — no post-write GET.
         if payload_size > 0 {
             let data = payload_for_cache.as_ref().concat();
             let meta = put_result_meta(location.clone(), payload_size as u64, &result);
@@ -1492,9 +1332,7 @@ impl FoyerObjectStoreCache {
             debug!("Warmed cache from write payload: {} (size: {} bytes)", location, payload_size);
         }
 
-        // Overwrites land a fresh full-file entry (checked first on read), but
-        // stale per-range metadata entries from a previous version of this key
-        // must still be dropped.
+        // Stale per-range metadata entries from the previous version must be dropped.
         if is_parquet {
             self.invalidate_metadata_cache(location).await;
         }
@@ -1509,24 +1347,28 @@ impl FoyerObjectStoreCache {
         }
     }
 
-    /// Admit a full-file entry to the main cache, honoring the recent-days
-    /// window (cold/old partitions are skipped → served from S3) and steering
-    /// large entries to disk-only so they don't evict the L1 hot set.
-    fn insert_main_value(&self, location: &Path, value: CacheValue, source: AdmitSource) {
+    /// Admit an entry to the main cache under `key`, honoring the recent-days
+    /// window (older partitions are skipped, served from S3) and steering large
+    /// entries to disk-only so they don't evict the L1 hot set.
+    fn admit_main_value(&self, location: &Path, key: String, value: CacheValue, source: AdmitSource) {
         if !is_within_recent_window(location, self.config.cache_recent_days) {
             return;
         }
-        let (key, bytes) = (Self::make_cache_key(location), value.data.len() as u64);
-        if self.admit(&self.cache, key.clone(), value, self.config.l1_max_entry_bytes) {
+        let bytes = value.data.len() as u64;
+        if self.admit(&self.cache, key, value, self.config.l1_max_entry_bytes) {
             self.admission.record(source, bytes);
         }
     }
 
+    /// Full-file admission, under the key the read path derives from `location`.
+    fn insert_main_value(&self, location: &Path, value: CacheValue, source: AdmitSource) {
+        self.admit_main_value(location, Self::make_cache_key(location), value, source);
+    }
+
     /// Single funnel for every cache population, so `scan_bypass_scope` can
     /// suppress all of them in one place. `l1_max_entry_bytes = 0` (metadata
-    /// entries) keeps the default L1+disk placement.
-    /// Returns whether the entry was actually admitted, so callers can account
-    /// for it without double-counting the bypass path.
+    /// entries) keeps the default L1+disk placement. Returns whether the entry
+    /// was actually admitted.
     fn admit(&self, cache: &FoyerCache, key: String, value: CacheValue, l1_max_entry_bytes: usize) -> bool {
         if bypass_active() && !self.repeat_sighting(&key) {
             crate::observability::record_cache_insert_bypassed();
@@ -1538,23 +1380,10 @@ impl FoyerObjectStoreCache {
 
     /// Has a bypassed scan already tried to admit `key` once?
     ///
-    /// The bypass exists so a ONE-OFF wide scan cannot evict the hot set on its
-    /// way through — a real concern with L2 full (118.5 of 120 GB, 12.3k
-    /// evictions, prod 2026-08-09). But a dashboard panel is the opposite of a
-    /// one-off: it is the most repeated query in the system, and under a blanket
-    /// bypass it can never warm its own working set. Measured on prod, the same
-    /// 3d panel ran 24.4 s cold and plateaued at ~11-15 s warm purely on the
-    /// caches the bypass does NOT touch (parquet metadata, provider) — the data
-    /// blocks never stuck.
-    ///
-    /// First sighting records and still declines; the second admits. So an
-    /// ad-hoc scan that touches a key once pays nothing, and a panel that
-    /// refreshes converges. `DashSet` insert returns false when already present,
-    /// which is exactly the second-sighting test.
-    ///
-    /// Bounded by clearing wholesale at [`BYPASS_SEEN_MAX`] rather than tracking
-    /// per-entry recency: this is a hint, and a rare full reset costs one extra
-    /// cold pass, not correctness.
+    /// First sighting records and still declines; the second admits — so a
+    /// one-off wide scan never evicts the hot set, while a repeated query still
+    /// warms its working set. Bounded by clearing wholesale at
+    /// [`BYPASS_SEEN_MAX`]; this is a hint, so a reset costs a cold pass only.
     fn repeat_sighting(&self, key: &str) -> bool {
         if self.bypass_seen.len() >= BYPASS_SEEN_MAX {
             self.bypass_seen.clear();
@@ -1570,13 +1399,7 @@ impl FoyerObjectStoreCache {
     /// Admit an exact parquet data range to the main cache. This is the
     /// fallback for files whose full-file post-commit warm has not landed.
     fn admit_data_range(&self, location: &Path, key: String, data: Bytes, file: &ObjectMeta) {
-        if !is_within_recent_window(location, self.config.cache_recent_days) {
-            return;
-        }
-        let bytes = data.len() as u64;
-        if self.admit(&self.cache, key.clone(), range_value(location, data, file), self.config.l1_max_entry_bytes) {
-            self.admission.record(AdmitSource::ReadMiss, bytes);
-        }
+        self.admit_main_value(location, key, range_value(location, data, file), AdmitSource::ReadMiss);
     }
 
     /// Cache a path's `ObjectMeta` (body-less entry) so later reads skip the HEAD.
@@ -1585,19 +1408,11 @@ impl FoyerObjectStoreCache {
     }
 
     /// Sliding-TTL refresh: keep an entry at most `ttl` past its *last query*
-    /// rather than its insertion. On a hit, once an entry is more than halfway
-    /// to expiry, re-insert it with a fresh timestamp so frequently-queried
-    /// data survives indefinitely while cold data still ages out after `ttl`.
-    ///
-    /// Throttled (the halfway gate + one in-flight refresh per key) so a hot
-    /// entry is rewritten at most once per `ttl/2`, and run in the background
-    /// off a cheap `entry` clone so the read never blocks on the re-insert (the
-    /// data clone happens in the spawned task, not on the query path).
+    /// rather than its insertion. Throttled by the halfway gate plus one
+    /// in-flight refresh per key, and re-inserted off the query path.
     fn maybe_touch(&self, cache: &FoyerCache, key: &str, entry: CacheEntry, l1_max_entry_bytes: usize) {
-        // `as_millis()` is u128; clamp before the u64 cast so an absurdly large
-        // configured TTL can't silently truncate into a tiny value.
+        // Clamp before the u64 cast so a huge configured TTL can't truncate small.
         let ttl_millis = self.config.ttl.as_millis().min(u64::MAX as u128) as u64;
-        // Still fresh enough (or already refreshing) — don't churn the cache.
         if entry.value().age_millis().saturating_mul(2) <= ttl_millis || !self.refreshing.insert(key.to_string()) {
             return;
         }
@@ -1614,12 +1429,9 @@ impl FoyerObjectStoreCache {
 }
 
 /// Wraps an inner [`MultipartUpload`] to tee written bytes into a bounded
-/// buffer, so the completed file can be inserted into the cache directly — we
-/// never re-download a file we just streamed to S3. If the upload grows past
-/// `max_warm_bytes` the buffer is dropped and the rest streams through
-/// un-captured (large compaction outputs fall back to the selective
-/// post-commit warm path); this bounds both transient memory and L1 cache
-/// pressure. Strictly best-effort: failure to capture never affects the write.
+/// buffer, so the completed file is inserted into the cache without a
+/// re-download. Past `max_warm_bytes` the buffer is dropped and the rest streams
+/// through un-captured. Best-effort: failure to capture never affects the write.
 #[derive(derive_more::Debug)]
 #[debug("CachingMultipartUpload {{ location: {} }}", location)]
 struct CachingMultipartUpload {
@@ -1637,9 +1449,8 @@ struct CachingMultipartUpload {
 }
 
 /// Bytes currently reserved by in-flight write captures. Each capturing upload
-/// reserves its full per-upload cap up front — the buffer's final size isn't
-/// known until `complete()`, so reserving the worst case is what makes the
-/// bound real rather than advisory.
+/// reserves its full per-upload cap up front: the final size isn't known until
+/// `complete()`, so only reserving the worst case makes the bound real.
 static WRITE_CAPTURE_INFLIGHT: AtomicUsize = AtomicUsize::new(0);
 
 /// RAII claim on `WRITE_CAPTURE_INFLIGHT`.
@@ -1672,8 +1483,7 @@ impl MultipartUpload for CachingMultipartUpload {
     fn put_part(&mut self, data: PutPayload) -> object_store::UploadPart {
         if let Some(buf) = self.buffer.as_mut() {
             if buf.len().saturating_add(data.content_length()) > self.max_warm_bytes {
-                // Too big to warm without risking memory / L1 eviction — give
-                // up capturing for this upload and return its budget slice.
+                // Over cap: abandon capture for this upload, return its budget slice.
                 self.buffer = None;
                 self.reservation = None;
                 crate::observability::record_write_capture_skipped();
@@ -1692,9 +1502,7 @@ impl MultipartUpload for CachingMultipartUpload {
         {
             let size = buf.len() as u64;
             let meta = put_result_meta(self.location.clone(), size, &result);
-            // Use the same key derivation as the read path so a multipart-warmed
-            // entry is found by a later GET even if `make_cache_key` ever does
-            // more than `location.to_string()`.
+            // Must use the read path's key derivation or the entry is never found.
             let key = FoyerObjectStoreCache::make_cache_key(&self.location);
             insert_main(&self.cache, key.clone(), CacheValue::new(buf, meta), self.l1_max_entry_bytes);
             self.admission.record(AdmitSource::WriteCapture, size);
@@ -1710,9 +1518,8 @@ impl MultipartUpload for CachingMultipartUpload {
     }
 }
 
-// DIAG (commit-throughput profiling): wraps a list stream to log total items +
-// duration when it finishes, surfacing slow `_delta_log` scans during the ~40s
-// Delta commit. Remove once the commit bottleneck is confirmed/fixed.
+// Wraps a list stream to log total items + duration when it finishes, surfacing
+// slow `_delta_log` scans during a Delta commit.
 struct TimedListStream {
     inner: BoxStream<'static, ObjectStoreResult<ObjectMeta>>,
     started: std::time::Instant,
@@ -1753,29 +1560,19 @@ impl ObjectStore for FoyerObjectStoreCache {
 
     async fn put_multipart_opts(&self, location: &Path, opts: PutMultipartOptions) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
         let inner = self.inner.put_multipart_opts(location, opts).await?;
-        // Skip capture for cold-partition rewrites (e.g. tier recompress of
-        // week+-old data) — recent data stays local, old data is served from S3.
+        // Skip capture for cold-partition rewrites; old data is served from S3.
         if !is_within_recent_window(location, self.config.cache_recent_days) {
             return Ok(inner);
         }
-        // Parquet writers (flush + compaction outputs) stream large files via
-        // multipart. Tee the written bytes into a bounded buffer so the
-        // completed file warms the cache directly — no re-download of what we
-        // just uploaded. Cap the buffer at the disk block size (the largest
-        // entry foyer can persist), optionally tightened by warm_inline_max_bytes.
-        // `write_capture_max_bytes` tightens this to flush-file scale so a
-        // 256MB compaction output never sits in heap: it skips the tee here and
-        // is warmed post-commit through the read path (warm_cache_for_uris).
-        // A cap above the budget would make EVERY reservation fail (each
-        // acquires its full cap up front), silently disabling capture — most
-        // easily hit with `write_capture_max_mb=0`, whose documented meaning is
-        // "bounded only by the block size", not "off". Clamp instead.
+        // Cap the tee buffer at the disk block size (the largest entry foyer can
+        // persist), tightened by the inline-warm and per-upload caps. The budget
+        // must be part of the min: a cap above it would fail EVERY reservation
+        // (each acquires its full cap up front), silently disabling capture.
         let cap = [self.config.warm_inline_max_bytes, self.config.write_capture_max_bytes, self.config.write_capture_budget_bytes]
             .into_iter()
             .filter(|&c| c > 0)
             .fold(self.config.block_size_bytes, usize::min);
-        // Best-effort claim on the process-wide capture budget. Denied = this
-        // upload streams through un-teed; the upload itself never waits or fails.
+        // Denied = this upload streams through un-teed; it never waits or fails.
         let reservation = CaptureReservation::acquire(cap, self.config.write_capture_budget_bytes);
         if reservation.is_none() {
             crate::observability::record_write_capture_skipped();
@@ -1793,9 +1590,9 @@ impl ObjectStore for FoyerObjectStoreCache {
     }
 
     async fn get_opts(&self, location: &Path, options: GetOptions) -> ObjectStoreResult<GetResult> {
-        // Bounded and suffix ranges share the dedicated range-cache path: a suffix
-        // (footer warm + any suffix reader) is resolved to an ABSOLUTE range from
-        // cached meta, so it lands on the same cache keys as a bounded footer read.
+        // Bounded and suffix ranges share the range-cache path: a suffix is
+        // resolved to an ABSOLUTE range from cached meta so both land on the
+        // same cache keys.
         if is_unconditional(&options) {
             let resolved = match &options.range {
                 Some(GetRange::Bounded(r)) => Some((r.clone(), None)),
@@ -1818,17 +1615,15 @@ impl ObjectStore for FoyerObjectStoreCache {
                 };
                 return Ok(Self::make_get_result_at(bytes, meta, Attributes::new(), range.start));
             }
-            // Suffix with unknown size: a single suffix GET to the inner store
-            // learns the absolute range + size from the response — one
-            // round-trip, no separate HEAD.
+            // Suffix with unknown size: one suffix GET learns the absolute range
+            // and size from the response, so no separate HEAD is needed.
             if let Some(GetRange::Suffix(n)) = options.range {
                 let result = self.inner.get_opts(location, GetOptions { range: Some(GetRange::Suffix(n.max(1))), ..Default::default() }).await?;
                 let (meta, abs_range, attributes) = (result.meta.clone(), result.range.clone(), result.attributes.clone());
                 let bytes = result.bytes().await?;
                 record_miss_with_fetch(&self.metadata_stats).await;
-                // Populate both the footer-range cache (under the absolute key bounded
-                // reads use) and the immutable-meta cache, so the next footer read is
-                // a pure cache hit.
+                // Populate the footer-range cache under the absolute key bounded
+                // reads use, plus the meta cache, so the next footer read hits.
                 if is_parquet_file(location) {
                     self.admit_range(location, Self::make_range_cache_key(location, &abs_range), bytes.clone(), &meta);
                     self.admit_meta(location, meta.clone());
@@ -1884,11 +1679,8 @@ impl ObjectStore for FoyerObjectStoreCache {
 /// control-plane objects Delta's transaction protocol reads and writes
 /// (`_delta_log/NNN.json`, `_last_checkpoint`, and log LISTs).
 ///
-/// Checkpoint **parquet** under `_delta_log/` is deliberately NOT log class: a
-/// checkpoint for a 26k-file table is a multi-MB bulk transfer whose duration
-/// scales with the table, exactly like a data file — and it already has its own
-/// bound (`CHECKPOINT_OP_TIMEOUT`). Only the sub-second control-plane traffic
-/// gets the short client.
+/// Checkpoint **parquet** under `_delta_log/` is deliberately NOT log class — it
+/// is a multi-MB bulk transfer, and it has its own `CHECKPOINT_OP_TIMEOUT`.
 pub fn is_commit_log_path(location: &Path) -> bool {
     let p = location.as_ref();
     p.contains("_delta_log/") && !p.ends_with(".parquet")
@@ -1896,18 +1688,15 @@ pub fn is_commit_log_path(location: &Path) -> bool {
 
 /// Routes object-store requests to one of two S3 clients by REQUEST CLASS: the
 /// commit log gets a client with a short request timeout, everything else the
-/// long-timeout data client.
+/// long-timeout data client. This bounds a hung request pinning a per-table
+/// commit lock.
 ///
-/// This is the primary defence against the 2026-07-30 stall class — a hung R2
-/// request pinning a per-table commit lock. Bounding it here rather than with an
-/// outer `tokio::time::timeout` is what makes it safe: at this layer a
-/// timed-out commit is an ordinary commit error that TimeFusion's landed-probe
-/// already knows how to classify, whereas an outer timeout abandons a future
-/// mid-flight and manufactures an unconfirmed landing every time it fires.
+/// Bound it HERE, not with an outer `tokio::time::timeout`: at this layer a
+/// timed-out commit is an ordinary commit error, whereas an outer timeout
+/// abandons the future mid-flight and manufactures an unconfirmed landing.
 ///
-/// Sits BELOW the foyer cache and the instrumentation wrapper (see
-/// `create_delta_table_internal`), so cache semantics, metrics and cache keys
-/// are byte-for-byte unchanged — only the HTTP client underneath differs.
+/// Must sit BELOW the foyer cache and the instrumentation wrapper so cache
+/// semantics, metrics and cache keys are unchanged.
 #[derive(Debug, derive_more::Display)]
 #[display("RequestClassRouter(log={}, data={})", log, data)]
 pub struct RequestClassRouter {
@@ -1924,9 +1713,8 @@ impl RequestClassRouter {
         if is_commit_log_path(location) { &self.log } else { &self.data }
     }
 
-    /// Prefix-based routing for LIST. A `None` prefix (or a table-root prefix)
-    /// enumerates data files, so only an explicit `_delta_log` prefix is log
-    /// class — a whole-table LIST must keep the generous data bound.
+    /// Prefix-based routing for LIST: only an explicit `_delta_log` prefix is log
+    /// class, since a whole-table LIST must keep the generous data bound.
     fn route_prefix(&self, prefix: Option<&Path>) -> &Arc<dyn ObjectStore> {
         match prefix {
             Some(p) if p.as_ref().contains("_delta_log") => &self.log,
@@ -1956,8 +1744,7 @@ impl ObjectStore for RequestClassRouter {
 
     fn delete_stream(&self, locations: BoxStream<'static, ObjectStoreResult<Path>>) -> BoxStream<'static, ObjectStoreResult<Path>> {
         // A mixed-class stream can't be split without buffering it; log cleanup
-        // (the only bulk-delete caller that touches `_delta_log`) is off the
-        // commit lock and already bounded by CHECKPOINT_OP_TIMEOUT.
+        // is off the commit lock and already bounded by CHECKPOINT_OP_TIMEOUT.
         self.data.delete_stream(locations)
     }
 
@@ -2029,11 +1816,19 @@ mod tests {
         ObjectMeta { location: path.clone(), last_modified: Utc::now(), size, e_tag: None, version: None }
     }
 
-    /// The request-class split is the PRIMARY bound on commit-lock hold time
-    /// (prod 2026-07-30), so what counts as commit-log class is load-bearing:
-    /// misroute the commit PUT and it silently goes back to the 900s data
-    /// client; misroute a parquet part and a legitimate multi-minute upload
-    /// starts failing at 30s.
+    /// Stream `parts` through the cache's multipart path and complete the upload.
+    async fn mpu_put(cache: &FoyerObjectStoreCache, path: &Path, parts: &[Bytes]) -> anyhow::Result<()> {
+        let mut upload = cache.put_multipart(path).await?;
+        for part in parts {
+            upload.put_part(part.clone().into()).await?;
+        }
+        upload.complete().await?;
+        Ok(())
+    }
+
+    /// Pins what counts as commit-log class: misrouting the commit PUT puts it
+    /// back on the long data timeout, misrouting a parquet part makes a
+    /// legitimate multi-minute upload fail early.
     #[tokio::test]
     async fn commit_log_traffic_routes_to_the_short_timeout_client() -> anyhow::Result<()> {
         let log = Arc::new(InMemory::new());
@@ -2048,39 +1843,28 @@ mod tests {
         }
         assert!(log.head(&commit).await.is_ok(), "the commit entry must use the short-timeout client");
         assert!(data.head(&commit).await.is_err());
-        // A checkpoint is a multi-MB bulk transfer, not control plane.
         assert!(data.head(&checkpoint).await.is_ok(), "checkpoint parquet stays on the data client");
         assert!(data.head(&part).await.is_ok(), "data parquet stays on the data client");
         assert!(log.head(&part).await.is_err());
-        // Reads follow the same split, so a commit-log GET can't hang for the
-        // data bound either.
         assert_eq!(router.get(&commit).await?.bytes().await?, Bytes::from_static(b"x"));
 
-        // LIST routes by prefix: only an explicit _delta_log prefix is control
-        // plane — a whole-table listing enumerates data files.
+        // LIST routes by prefix: only an explicit _delta_log prefix is log class.
         assert!(matches!(router.route_prefix(Some(&Path::from("tbl/_delta_log"))), s if Arc::ptr_eq(s, &(log.clone() as Arc<dyn ObjectStore>))));
         assert!(matches!(router.route_prefix(Some(&Path::from("tbl"))), s if Arc::ptr_eq(s, &(data.clone() as Arc<dyn ObjectStore>))));
         assert!(matches!(router.route_prefix(None), s if Arc::ptr_eq(s, &(data.clone() as Arc<dyn ObjectStore>))));
         Ok(())
     }
 
-    // Locks in the containment-probe slice math in get_range_cached. Two
-    // distinct probe branches, neither of which may cost an inner fetch after a
-    // footer warm:
-    //   - file > hint → the warm key is the suffix (size-hint..size), and a
-    //     strict sub-range of it never EQUALS the warm key, so only the
-    //     containment probe can serve it;
-    //   - file <= hint → warm_footer caches the file WHOLE under (0..size), and
-    //     the candidate=0 probe then deliberately serves even data-page reads
-    //     near the file START from the metadata cache.
+    // Locks in the containment-probe slice math in get_range_cached: neither
+    // probe branch (suffix warm key, or candidate=0 for a whole small file) may
+    // cost an inner fetch after a footer warm.
     #[test_case::test_case("containment_probe", 4096, 3100..3500 ; "suffix key: a strict sub-range of the warmed footer")]
     #[test_case::test_case("containment_probe_small", 512, 16..96 ; "candidate 0: small file warmed whole, read nowhere near the footer")]
     #[tokio::test]
     async fn containment_probe_serves_a_warmed_file_without_an_inner_fetch(name: &str, size: u32, r: Range<u64>) -> anyhow::Result<()> {
         let inner = Arc::new(InMemory::new());
-        // The probe computes its candidate key from the CONFIG's size hint, so
-        // the warm call below must use the same value (as prod does — both
-        // read config.cache.timefusion_parquet_metadata_size_hint).
+        // The probe derives its candidate key from the config size hint, so the
+        // warm below must pass the same value.
         let hint = 1024u64;
         let (cache, _dir) = cache_with(name, inner.clone(), |c| c.parquet_metadata_size_hint = hint as usize).await?;
         let path = Path::from("tbl/date=2026-01-01/part.parquet");
@@ -2088,9 +1872,8 @@ mod tests {
         // Put via the inner store so nothing is cached from a write payload.
         inner.put(&path, PutPayload::from(data.clone())).await?;
 
-        // Warm through &cache (not &*inner) deliberately: prod warms through the
-        // caching layer, so this also covers the suffix-GET path that populates
-        // the range key.
+        // Warm through &cache, not &*inner, so the suffix-GET path that
+        // populates the range key is covered too.
         assert!(warm_footer(&cache, &path, hint).await, "footer warm must succeed");
 
         let before = cache.get_stats().await;
@@ -2105,10 +1888,8 @@ mod tests {
         Ok(())
     }
 
-    // Regression for issue #82: shutdown must never block past its deadline.
-    // The unbounded foyer close() stalled process exit (and wal.lock release)
-    // for ~8.5min on a redeploy. With an already-elapsed deadline, shutdown_by
-    // must abandon the flush and return promptly.
+    // With an already-elapsed deadline, shutdown_by must abandon the foyer flush
+    // and return promptly rather than stalling process exit.
     #[tokio::test]
     async fn shutdown_by_respects_elapsed_deadline() -> anyhow::Result<()> {
         let cache = SharedFoyerCache::new(FoyerCacheConfig::test_config("shutdown_deadline")).await?;
@@ -2182,14 +1963,9 @@ mod tests {
         Ok(())
     }
 
-    /// THE test the first zero-copy attempt (2bb5e85) needed: a slice held by a
-    /// reader must never pin the cache ENTRY. That attempt handed `Bytes` an
-    /// owner holding the `HybridCacheEntry`; entries stopped being reclaimable
-    /// under scan load, foyer admission stalled, and the tantivy manifest GET
-    /// on the flush path timed out — 191 failed flushes in prod (see 5926f66).
-    /// Now `CacheValue.data` is itself `Bytes`, so a served slice refcounts the
-    /// BUFFER only: removal and further cache traffic must complete while
-    /// slices are held, and the held slices must stay readable afterwards.
+    /// A slice held by a reader must refcount the BUFFER only, never pin the
+    /// cache ENTRY: removal and further cache traffic must complete while slices
+    /// are held, and the held slices must stay readable afterwards.
     #[tokio::test]
     async fn held_slice_does_not_pin_the_cache_entry() -> anyhow::Result<()> {
         let (cache, store, _dir) = shared_with("no_pin", Arc::new(InMemory::new()), |_| {}).await?;
@@ -2262,8 +2038,12 @@ mod tests {
         Ok(())
     }
 
+    /// The footer range of a large parquet file is cached per (file, range) in
+    /// the metadata tier; a read away from the footer promotes the whole file to
+    /// the main tier; and a `put` through the cache re-warms that file so later
+    /// reads are served from main rather than a stale metadata range.
     #[tokio::test]
-    async fn test_parquet_metadata_optimization() -> anyhow::Result<()> {
+    async fn parquet_metadata_ranges_are_cached_then_superseded_by_the_full_file() -> anyhow::Result<()> {
         let inner = Arc::new(InMemory::new());
         let (cache, _dir) = cache_with("parquet_metadata", inner.clone(), |c| {
             c.parquet_metadata_size_hint = 1024; // 1KB for testing
@@ -2271,151 +2051,84 @@ mod tests {
         })
         .await?;
 
-        // Create a test parquet file (10KB)
         let file_size = 10 * 1024;
-        let parquet_data = vec![b'x'; file_size];
         let path = Path::from("test/file.parquet");
-
-        // Put the file directly in the inner store to avoid caching
-        inner.put(&path, PutPayload::from(Bytes::from(parquet_data.clone()))).await?;
-
-        // Reset stats to start fresh
+        // Straight to the inner store, so nothing is cached from a write payload.
+        inner.put(&path, PutPayload::from(Bytes::from(vec![b'x'; file_size]))).await?;
         cache.reset_stats().await;
 
-        // Test 1: Request metadata (last 1KB) - should cache only the range
-        let metadata_range = (file_size - 1024) as u64..file_size as u64;
-        let metadata = cache.get_range(&path, metadata_range.clone()).await?;
+        // 1. The footer (last 1KB) caches only the range, via one inner get_range.
+        let footer = (file_size - 1024) as u64..file_size as u64;
+        let metadata = cache.get_range(&path, footer.clone()).await?;
         assert_eq!(metadata.len(), 1024);
+        let s = cache.get_stats().await.metadata;
+        assert_eq!((s.inner_gets, s.misses, s.hits), (1, 1, 0), "footer read is a metadata miss plus one fetch");
 
-        let stats = cache.get_stats().await;
-        assert_eq!(stats.metadata.inner_gets, 1); // One get_range call for metadata
-        assert_eq!(stats.metadata.misses, 1);
-        assert_eq!(stats.metadata.hits, 0);
+        // 2. The same range again is a metadata hit — no additional inner get.
+        assert_eq!(cache.get_range(&path, footer.clone()).await?, metadata);
+        let s = cache.get_stats().await.metadata;
+        assert_eq!((s.inner_gets, s.misses, s.hits), (1, 1, 1), "repeat footer read is served from the metadata cache");
 
-        // Test 2: Request same metadata range again - should hit range cache
-        let metadata2 = cache.get_range(&path, metadata_range.clone()).await?;
-        assert_eq!(metadata2.len(), 1024);
-        assert_eq!(metadata, metadata2);
+        // 3. Data from the beginning fetches and caches the FULL file.
+        assert_eq!(cache.get_range(&path, 0..1024).await?.len(), 1024);
+        let s = cache.get_stats().await;
+        assert_eq!((s.main.inner_gets, s.main.misses), (1, 1), "a data read promotes the file to the main tier");
+        assert_eq!(s.metadata.hits, 1, "still the one metadata hit");
 
-        let stats = cache.get_stats().await;
-        assert_eq!(stats.metadata.inner_gets, 1); // No additional inner get
-        assert_eq!(stats.metadata.hits, 1); // Cache hit on range
-        assert_eq!(stats.metadata.misses, 1);
+        // 4. Any range now hits the full-file entry.
+        assert_eq!(cache.get_range(&path, 2048..3072).await?.len(), 1024);
+        let s = cache.get_stats().await.main;
+        assert_eq!((s.inner_gets, s.hits), (1, 1), "no additional inner get once the file is cached whole");
 
-        // Test 3: Request data from beginning - should fetch and cache full file
-        let data_range = 0..1024;
-        let data = cache.get_range(&path, data_range.clone()).await?;
-        assert_eq!(data.len(), 1024);
-
-        let stats = cache.get_stats().await;
-        assert_eq!(stats.main.inner_gets, 1); // One get for full file
-        assert_eq!(stats.main.misses, 1);
-        assert_eq!(stats.metadata.hits, 1); // Still have metadata cache hit
-
-        // Test 4: Request any range now - should hit full file cache
-        let another_range = 2048..3072;
-        let another_data = cache.get_range(&path, another_range).await?;
-        assert_eq!(another_data.len(), 1024);
-
-        let stats = cache.get_stats().await;
-        assert_eq!(stats.main.inner_gets, 1); // No additional inner get
-        assert_eq!(stats.main.hits, 1); // Cache hit on full file
-
-        cache.shutdown().await?;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_metadata_cache_invalidation() -> anyhow::Result<()> {
-        let inner = Arc::new(InMemory::new());
-        let (cache, _dir) = cache_with("metadata_invalidation", inner.clone(), |c| {
-            c.parquet_metadata_size_hint = 1024;
-            c.metadata_memory_size_bytes = 5 * 1024 * 1024;
-            c.metadata_disk_size_bytes = 20 * 1024 * 1024;
-        })
-        .await?;
+        // 5. Rewriting the file through the cache invalidates the metadata
+        //    entries and warms main from the put payload, so even the footer
+        //    range is served from the main cache afterwards.
         cache.reset_stats().await;
-
-        // Create a parquet file directly in inner store (to avoid main cache)
-        let path = Path::from("test.parquet");
-        let file_size = 10 * 1024; // 10KB
-        let data = vec![b'a'; file_size];
-        inner.put(&path, PutPayload::from(Bytes::from(data.clone()))).await?;
-
-        // Read metadata range - should use metadata cache
-        let metadata_range = (file_size - 1024) as u64..file_size as u64;
-        let result = cache.get_range(&path, metadata_range.clone()).await?;
-        assert_eq!(result.len(), 1024, "Should get correct range size");
-
-        let stats = cache.get_stats().await;
-        assert_eq!(stats.metadata.misses, 1, "Should have metadata cache miss");
-        assert_eq!(stats.metadata.hits, 0, "Should have no metadata cache hits yet");
-
-        // Read again - should hit metadata cache
-        let _ = cache.get_range(&path, metadata_range.clone()).await?;
-        let stats = cache.get_stats().await;
-        assert_eq!(stats.metadata.hits, 1, "Should hit metadata cache");
-
-        // Update the file via cache - should invalidate metadata cache
-        let new_data = vec![b'b'; file_size];
-        cache.put(&path, PutPayload::from(Bytes::from(new_data))).await?;
-
-        // Read metadata again - should be served from main cache now (file was cached on put)
-        let _ = cache.get_range(&path, metadata_range).await?;
-        let stats = cache.get_stats().await;
-        // The range will be served from the main cache since put() caches the full file
-        assert_eq!(stats.main.hits, 1, "Should hit main cache after put");
+        cache.put(&path, PutPayload::from(Bytes::from(vec![b'b'; file_size]))).await?;
+        let _ = cache.get_range(&path, footer).await?;
+        assert_eq!(cache.get_stats().await.main.hits, 1, "Should hit main cache after put");
 
         cache.shutdown().await?;
         Ok(())
     }
 
-    /// The multipart write-capture tee is bounded two independent ways — the
-    /// inline warm cap and the per-upload write-capture cap — and either bound
-    /// behaves identically: under-cap uploads are captured into the cache on
-    /// `complete()` (so a read needs no re-download), while over-cap uploads
-    /// abandon capture and still upload correct, readable bytes. The per-upload
-    /// cap must bound the tee independently of the (much larger) block size:
-    /// that is the memory fix — before it, a 256MB compaction output sat in heap
-    /// per concurrent upload. Both caps are set below the 4MB block size so the
-    /// captured and skipped paths are both reachable.
-    #[test_case::test_case("mpu_capture", 1024 * 1024, 0, 256 * 1024, 768 * 1024 ; "bounded by the inline warm cap")]
-    #[test_case::test_case("wcap_cap", 0, 512 * 1024, 128 * 1024, 384 * 1024 ; "bounded by the per-upload write-capture cap")]
+    /// The multipart tee is bounded independently by the inline-warm cap and the
+    /// per-upload capture cap: under-cap uploads are captured on `complete()`,
+    /// over-cap uploads abandon capture and still upload correct bytes.
+    ///
+    /// The last row covers the clamp: `write_capture_max_bytes = 0` means
+    /// "bounded only by the block size", not "disabled", and without the clamp
+    /// every reservation would be denied and capture would stop entirely.
+    #[test_case::test_case("mpu_capture", 1024 * 1024, 0, 0, 256 * 1024, 768 * 1024 ; "bounded by the inline warm cap")]
+    #[test_case::test_case("wcap_cap", 0, 512 * 1024, 0, 128 * 1024, 384 * 1024 ; "bounded by the per-upload write-capture cap")]
+    #[test_case::test_case("wcap_clamp", 0, 0, 512 * 1024, 128 * 1024, 384 * 1024 ; "block-size cap clamped down to the budget")]
     #[tokio::test]
     async fn an_over_cap_multipart_write_abandons_capture_but_not_the_upload(
-        name: &str, inline_cap: usize, capture_cap: usize, small_len: usize, chunk_len: usize,
+        name: &str, inline_cap: usize, capture_cap: usize, budget: usize, small_len: usize, chunk_len: usize,
     ) -> anyhow::Result<()> {
         let inner = Arc::new(InMemory::new());
         let (cache, _dir) = cache_with(name, inner.clone(), |c| {
             c.warm_inline_max_bytes = inline_cap;
             c.write_capture_max_bytes = capture_cap;
-            c.write_capture_budget_bytes = 0; // isolate the per-upload caps
+            c.write_capture_budget_bytes = budget; // 0 isolates the per-upload caps
         })
         .await?;
         cache.reset_stats().await;
 
-        // Under the cap → captured (flush-sized files keep the feature), so the
-        // read is served entirely from cache.
+        // Under the cap → captured, so the read is served entirely from cache.
         let small_path = Path::from("table/date=2026-06-05/small.parquet");
-        let small = Bytes::from(vec![b'a'; small_len]);
-        let mut upload = cache.put_multipart(&small_path).await?;
-        upload.put_part(small.clone().into()).await?;
-        upload.complete().await?;
+        mpu_put(&cache, &small_path, &[Bytes::from(vec![b'a'; small_len])]).await?;
         assert_eq!(cache.get(&small_path).await?.bytes().await?.len(), small_len);
         let stats = cache.get_stats().await;
         assert_eq!(stats.main.hits, 1, "under-cap multipart write should warm the cache ({name})");
         assert_eq!(stats.main.misses, 0, "no S3 read needed after multipart capture");
 
-        // Over the cap → capture abandoned, the upload streams through. The
-        // object is fully and correctly uploaded regardless — only the cache tee
-        // was sacrificed, so the first read is a genuine miss.
+        // Over the cap → capture abandoned but the upload is still correct, so
+        // the first read is a genuine miss.
         cache.reset_stats().await;
         let big_path = Path::from("table/date=2026-06-05/big.parquet");
         let chunk = Bytes::from(vec![b'b'; chunk_len]);
-        let mut upload = cache.put_multipart(&big_path).await?;
-        upload.put_part(chunk.clone().into()).await?;
-        upload.put_part(chunk.clone().into()).await?;
-        upload.complete().await?;
+        mpu_put(&cache, &big_path, &[chunk.clone(), chunk]).await?;
 
         assert_eq!(inner.get(&big_path).await?.bytes().await?.len(), 2 * chunk_len, "upload must be unaffected by capture abandonment");
         let _ = cache.get(&big_path).await?;
@@ -2425,30 +2138,16 @@ mod tests {
         Ok(())
     }
 
-    /// Both write-side warm paths must be accounted as WRITE CAPTURE, never as a
-    /// read miss.
-    ///
-    /// This is the guard for a defect that cost real time: the single-part
-    /// `put_cached` warm was tagged `ReadMiss`, so prod showed
-    /// `write_capture_admitted = 0` beside 290 GB of "read" admissions with the
-    /// main cache reporting no inner reads at all. The mislabelling sent the
-    /// investigation at the wrong code path. Asserting the SOURCE split is what
-    /// makes the counters trustworthy enough to decide anything.
+    /// Both write-side warm paths (single-part and multipart) must be accounted
+    /// as WRITE CAPTURE, never as a read miss.
     #[tokio::test]
     async fn both_write_paths_are_accounted_as_write_capture_not_read_miss() -> anyhow::Result<()> {
-        let inner = Arc::new(InMemory::new());
-        let config = FoyerCacheConfig::test_config("wc_accounting");
-        let _dir = CacheDirGuard(config.cache_dir.clone());
-        let cache = FoyerObjectStoreCache::new(inner, config).await?;
+        let (cache, _dir) = cache_with("wc_accounting", Arc::new(InMemory::new()), |_| {}).await?;
 
-        // Single-part PUT: carries the bulk of write-side warming in prod.
         let body = Bytes::from(vec![b'p'; 2 * 1024 * 1024]);
         cache.put(&Path::from("t/date=2026-09-12/put.parquet"), PutPayload::from(body.clone())).await?;
 
-        // Multipart: the same warm through the tee.
-        let mut upload = cache.put_multipart(&Path::from("t/date=2026-09-12/mpu.parquet")).await?;
-        upload.put_part(body.clone().into()).await?;
-        upload.complete().await?;
+        mpu_put(&cache, &Path::from("t/date=2026-09-12/mpu.parquet"), &[body.clone()]).await?;
 
         let admission = cache.admission();
         assert_eq!(admission.write_capture_admitted.load(Ordering::Relaxed), 2, "both write paths must register as write capture");
@@ -2462,9 +2161,7 @@ mod tests {
         Ok(())
     }
 
-    /// Bytes must land under the source that produced them — that split is the
-    /// whole point of this accounting, and getting it wrong once already sent an
-    /// investigation at the wrong code path.
+    /// Bytes must land under the source that produced them.
     #[test]
     fn admission_bytes_are_attributed_to_the_source_that_produced_them() {
         let stats = AdmissionStats::default();
@@ -2477,31 +2174,6 @@ mod tests {
         assert_eq!(stats.write_capture_admitted.load(Ordering::Relaxed), 2);
         assert_eq!(stats.read_miss_bytes.load(Ordering::Relaxed), 30);
         assert_eq!(stats.refresh_bytes.load(Ordering::Relaxed), 40);
-    }
-
-    /// `write_capture_max_bytes = 0` means "bounded only by the block size", not
-    /// "disabled" — but the block size can exceed the budget, and a reservation
-    /// asks for its full cap, so without a clamp every acquire is denied and
-    /// capture silently stops entirely.
-    #[tokio::test]
-    async fn test_write_capture_cap_is_clamped_to_budget() -> anyhow::Result<()> {
-        let (cache, _dir) = cache_with("wcap_clamp", Arc::new(InMemory::new()), |c| {
-            c.write_capture_max_bytes = 0; // bounded by the (4MB) block size
-            c.write_capture_budget_bytes = 512 * 1024; // …which exceeds the budget
-        })
-        .await?;
-        cache.reset_stats().await;
-
-        let path = Path::from("table/date=2026-06-05/clamped.parquet");
-        let data = Bytes::from(vec![b'd'; 128 * 1024]);
-        let mut upload = cache.put_multipart(&path).await?;
-        upload.put_part(data.clone().into()).await?;
-        upload.complete().await?;
-        let _ = cache.get(&path).await?;
-        assert_eq!(cache.get_stats().await.main.hits, 1, "capture must stay on when the cap is clamped to the budget");
-
-        cache.shutdown().await?;
-        Ok(())
     }
 
     /// The process-wide budget stops N concurrent captures from stacking. Once
@@ -2521,8 +2193,7 @@ mod tests {
         let second_path = Path::from("table/date=2026-06-05/second.parquet");
         let data = Bytes::from(vec![b'c'; 64 * 1024]);
 
-        // Hold the first upload open so its reservation is still outstanding
-        // when the second one asks for budget.
+        // Hold the first upload open so its reservation is still outstanding.
         let mut first = cache.put_multipart(&first_path).await?;
         first.put_part(data.clone().into()).await?;
         let mut second = cache.put_multipart(&second_path).await?; // over budget → no capture
@@ -2530,24 +2201,19 @@ mod tests {
         second.complete().await?;
         first.complete().await?;
 
-        // Both uploads succeeded with correct bytes.
         assert_eq!(inner.get(&first_path).await?.bytes().await?.len(), data.len());
         assert_eq!(inner.get(&second_path).await?.bytes().await?.len(), data.len());
 
-        // First was captured (hit), second was budget-skipped (miss).
         let _ = cache.get(&first_path).await?;
         let _ = cache.get(&second_path).await?;
         let stats = cache.get_stats().await;
         assert_eq!(stats.main.hits, 1, "the in-budget upload should be captured");
         assert_eq!(stats.main.misses, 1, "the over-budget upload should skip capture");
 
-        // Reservations are released once the uploads finish, so capture works
-        // again — the budget is a transient bound, not a latch.
+        // The budget is a transient bound, not a latch: capture works again.
         cache.reset_stats().await;
         let third_path = Path::from("table/date=2026-06-05/third.parquet");
-        let mut third = cache.put_multipart(&third_path).await?;
-        third.put_part(data.clone().into()).await?;
-        third.complete().await?;
+        mpu_put(&cache, &third_path, std::slice::from_ref(&data)).await?;
         let _ = cache.get(&third_path).await?;
         assert_eq!(cache.get_stats().await.main.hits, 1, "budget must be released when an upload completes");
 
@@ -2555,11 +2221,9 @@ mod tests {
         Ok(())
     }
 
-    /// The 2GiB hard floor wins over both the configured block size and 2x the
-    /// optimize target: the fleet holds ~1.5GB files, and foyer's max entry is
-    /// the block size — anything above it silently never persists. Above the
-    /// floor the block size tracks 2x the target, so bigger outputs stay
-    /// cacheable without touching the cache config.
+    /// foyer's max entry IS the block size — anything larger silently never
+    /// persists — so a 2GiB floor wins over the configured block size, and above
+    /// the floor the block size tracks 2x the optimize target.
     #[test_case::test_case(None, None => 2 << 30 ; "defaults: the 2GiB hard floor")]
     #[test_case::test_case(Some(2 * 1024 * 1024 * 1024), None => 4 << 30 ; "block size tracks 2x a target above the floor")]
     #[test_case::test_case(Some(16 * 1024 * 1024), Some(256) => 2 << 30 ; "a small target and a small block size still floor at 2GiB")]
@@ -2582,14 +2246,12 @@ mod tests {
         let path = Path::from("table/part-hot.parquet");
         cache.put(&path, PutPayload::from(Bytes::from(vec![b'h'; 4096]))).await?;
 
-        // Query past the halfway point (ttl/2 = 500ms) → triggers a sliding-TTL
-        // refresh that re-stamps the entry to "now".
+        // Query past ttl/2 → sliding-TTL refresh re-stamps the entry to "now".
         tokio::time::sleep(Duration::from_millis(600)).await;
         let _ = cache.get(&path).await?; // hit + background touch
         tokio::time::sleep(Duration::from_millis(200)).await; // let the re-insert land
 
-        // Now ~1200ms since the original insert (> base TTL) but well within the
-        // refreshed window — a non-sliding TTL would have expired this entry.
+        // Now past the base TTL but inside the refreshed window.
         tokio::time::sleep(Duration::from_millis(400)).await;
         cache.reset_stats().await;
         let _ = cache.get(&path).await?;
@@ -2607,7 +2269,6 @@ mod tests {
         let recent = Path::from(format!("t/date={}/part.parquet", today));
         let old = Path::from(format!("t/date={}/part.parquet", today - chrono::Duration::days(30)));
 
-        // Recent partitions are admitted; week+-old ones are skipped.
         assert!(is_within_recent_window(&recent, 8));
         assert!(!is_within_recent_window(&old, 8));
         // 0 = no age limit → everything admitted.
@@ -2618,7 +2279,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_recent_window_skips_old_partition_writes() -> anyhow::Result<()> {
-        // cache_recent_days = 8 enforces the window in this test.
         let (cache, _dir) = cache_with("recent_window", Arc::new(InMemory::new()), |c| c.cache_recent_days = 8).await?;
         cache.reset_stats().await;
 
@@ -2627,48 +2287,16 @@ mod tests {
         let old = Path::from(format!("t/date={}/part.parquet", today - chrono::Duration::days(30)));
         let data = Bytes::from(vec![b'a'; 4096]);
 
-        // Recent write is admitted → served from cache (no S3 read).
         cache.put(&recent, PutPayload::from(data.clone())).await?;
         let _ = cache.get(&recent).await?;
         assert_eq!(cache.get_stats().await.main.hits, 1, "recent write should be cached");
 
-        // Old-partition write is NOT admitted → read falls through to S3 (miss).
         cache.reset_stats().await;
         cache.put(&old, PutPayload::from(data.clone())).await?;
         let _ = cache.get(&old).await?;
         let stats = cache.get_stats().await;
         assert_eq!(stats.main.hits, 0, "old-partition write should not be cached");
         assert_eq!(stats.main.misses, 1, "old partition served from S3");
-
-        cache.shutdown().await?;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_warm_footer_primes_metadata_cache() -> anyhow::Result<()> {
-        let inner = Arc::new(InMemory::new());
-        let (cache, _dir) = cache_with("warm_footer", inner.clone(), |c| c.parquet_metadata_size_hint = 1024).await?;
-
-        // Write the file straight to the inner store so nothing is cached yet —
-        // this simulates a multipart compaction output that bypassed put_cached.
-        let file_size = 10 * 1024;
-        let path = Path::from("table/date=2026-06-05/part-0.parquet");
-        inner.put(&path, PutPayload::from(Bytes::from(vec![b'x'; file_size]))).await?;
-        cache.reset_stats().await;
-
-        // Warm the footer. The ranged GET should populate the metadata cache.
-        assert!(warm_footer(&cache, &path, 1024).await);
-
-        let stats = cache.get_stats().await;
-        assert_eq!(stats.metadata.misses, 1, "warm should fetch the footer once");
-        assert_eq!(stats.metadata.hits, 0);
-
-        // A subsequent read of the same footer range is now a metadata HIT —
-        // i.e. query planning pays zero S3 round-trips post-warm.
-        let metadata_range = (file_size - 1024) as u64..file_size as u64;
-        let _ = cache.get_range(&path, metadata_range).await?;
-        let stats = cache.get_stats().await;
-        assert_eq!(stats.metadata.hits, 1, "footer read should hit after warm");
 
         cache.shutdown().await?;
         Ok(())
@@ -2684,16 +2312,12 @@ mod tests {
         inner.put(&path, PutPayload::from(Bytes::from(vec![b'y'; file_size]))).await?;
         cache.reset_stats().await;
 
-        // Warm the full file into the main cache. The warm itself incurs one
-        // miss (the fetch from the inner store); reset so we isolate the
-        // post-warm read behavior.
+        // The warm itself is one miss; reset to isolate post-warm reads.
         assert!(warm_full(&cache, &path).await);
         let stats = cache.get_stats().await;
         assert_eq!(stats.main.misses, 1, "warm should fetch the full file once");
         cache.reset_stats().await;
 
-        // Any subsequent data read is served from the full-file cache (main HIT),
-        // never falling back to S3.
         let _ = cache.get_range(&path, 0..1024).await?;
         let stats = cache.get_stats().await;
         assert_eq!(stats.main.hits, 1, "data read should hit main cache after full warm");
@@ -2724,18 +2348,11 @@ mod tests {
         Ok(())
     }
 
-    /// Guards key consistency across the three cache paths that derive a key
-    /// independently: the write warm (a `put` payload, or multipart
-    /// `complete()`), the read path (`make_cache_key`), and the compaction
-    /// eviction path (`evict_data_entry` on a relativized object path). If any
-    /// of them diverged, a warmed entry would either never be read back or never
-    /// be evicted (tombstoned files would linger).
-    ///
-    /// Proactive eviction is what the compaction path does for tombstoned files.
-    /// foyer's `HybridCache::remove` deletes the on-disk copy asynchronously, so
-    /// the assertions are on the in-memory layer for a deterministic result; the
-    /// dead bytes are reclaimed from disk shortly after rather than waiting for
-    /// VACUUM.
+    /// Guards key consistency across the three paths that derive a cache key
+    /// independently: the write warm, the read path (`make_cache_key`) and
+    /// `evict_data_entry`. Divergence means an entry is never read back, or
+    /// never evicted. Assertions are on the in-memory layer because foyer's
+    /// `remove` deletes the on-disk copy asynchronously.
     #[test_case::test_case("evict_entry", false ; "a single put warms from the write payload")]
     #[test_case::test_case("mpu_key_consistency", true ; "a multipart complete() warms under the same key")]
     #[tokio::test]
@@ -2746,16 +2363,12 @@ mod tests {
         let path = Path::from("table/date=2026-06-05/part.parquet");
         let data = Bytes::from(vec![b'z'; 64 * 1024]);
         if multipart {
-            let mut upload = cache.put_multipart(&path).await?;
-            upload.put_part(data.clone().into()).await?;
-            upload.complete().await?;
+            mpu_put(&cache, &path, std::slice::from_ref(&data)).await?;
         } else {
             cache.put(&path, PutPayload::from(data.clone())).await?;
         }
 
-        // Read path: a plain GET must find the entry the write warmed — i.e. the
-        // write inserted under the same key the read derives. A key mismatch
-        // would surface here as a miss + an S3 fetch.
+        // A key mismatch surfaces here as a miss plus an S3 fetch.
         let _ = cache.get(&path).await?;
         let stats = cache.get_stats().await;
         assert_eq!(stats.main.hits, 1, "warmed entry must be found by a plain GET, warm/read key match ({name})");
@@ -2769,10 +2382,8 @@ mod tests {
         Ok(())
     }
 
-    /// Wraps an `InMemory` store and counts S3-equivalent round-trips, so tests
-    /// can assert that warming + reads issue the expected number of HEADs/GETs.
-    /// `head()` is an extension method that routes through `get_opts(head:true)`,
-    /// so we count it there.
+    /// Wraps an `InMemory` store and counts S3-equivalent round-trips. `head()`
+    /// routes through `get_opts(head: true)`, so it is counted there.
     #[derive(Debug, derive_more::Display)]
     #[display("CountingStore")]
     struct CountingStore {
@@ -2849,9 +2460,8 @@ mod tests {
         Ok(())
     }
 
-    /// Locks in both performance wins: a suffix-based footer warm is a single GET
-    /// (no HEAD), and a later footer read of a warmed file is a pure cache hit —
-    /// zero S3 round-trips (no HEAD to classify, no GET).
+    /// A footer warm is a single suffix GET (no HEAD), and a later footer read of
+    /// a warmed file costs zero round-trips.
     #[tokio::test]
     async fn test_warm_footer_eliminates_read_path_heads() -> anyhow::Result<()> {
         let mem = Arc::new(InMemory::new());
@@ -2863,27 +2473,25 @@ mod tests {
         let (cache, _dir) = cache_with("warm_footer_heads", counting, |c| c.parquet_metadata_size_hint = 1024).await?;
         cache.reset_stats().await;
 
-        // Footer warm: a single suffix GET, no HEAD.
         assert!(warm_footer(&cache, &path, 1024).await);
         assert_eq!(heads.load(Ordering::Relaxed), 0, "suffix warm must not issue a HEAD");
         assert_eq!(gets.load(Ordering::Relaxed), 1, "suffix warm is a single GET");
+        let s = cache.get_stats().await.metadata;
+        assert_eq!((s.misses, s.hits), (1, 0), "warm should fetch the footer once");
 
-        // A later footer read of the warmed file is served entirely from cache:
-        // no HEAD to classify the range, no GET for the bytes.
         let footer = (file_size - 1024) as u64..file_size as u64;
         let bytes = cache.get_range(&path, footer).await?;
         assert_eq!(bytes.len(), 1024);
         assert_eq!(heads.load(Ordering::Relaxed), 0, "warmed footer read must not HEAD");
         assert_eq!(gets.load(Ordering::Relaxed), 1, "warmed footer read must not GET (still just the warm)");
-        assert_eq!(cache.get_stats().await.metadata.hits, 1, "footer served from the metadata cache");
+        assert_eq!(cache.get_stats().await.metadata.hits, 1, "footer read should hit the metadata cache after warm");
 
         cache.shutdown().await?;
         Ok(())
     }
 
-    // P0 scan-resistant admission: a wide historical scan must be able to READ
-    // through the cache without POPULATING it, or one 14d query evicts the hot
-    // tail the whole design exists to keep local.
+    // A wide historical scan must READ through the cache without POPULATING it,
+    // so one big query cannot evict the hot tail.
     #[tokio::test]
     async fn bypass_scope_suppresses_population_but_not_hits() -> anyhow::Result<()> {
         let inner = Arc::new(InMemory::new());
@@ -2905,8 +2513,7 @@ mod tests {
         assert!(!cache.cache.contains(cold.as_ref()), "a bypassed miss must not populate the cache");
         assert!(cache.cache.contains(hot.as_ref()), "the pre-existing hot entry survives the scan");
 
-        // Same read outside the scope populates normally — the suppression is
-        // scoped, not a config kill switch.
+        // Same read outside the scope populates normally.
         cache.get(&cold).await?.bytes().await?;
         assert!(cache.cache.contains(cold.as_ref()));
         assert!(!bypass_active(), "the scope must not leak past its future");
@@ -2915,12 +2522,8 @@ mod tests {
         Ok(())
     }
 
-    /// A wide scan is bypassed so a ONE-OFF cannot evict the hot set, but a
-    /// dashboard panel is the most REPEATED query in the system and under a
-    /// blanket bypass could never warm its own working set: measured on prod
-    /// 2026-08-09 the same 3d panel went 24.4 s cold -> ~11-15 s warm purely on
-    /// the metadata/provider caches the bypass does not touch, while its data
-    /// blocks never stuck. Second sighting admits.
+    /// A bypassed scan declines on first sighting but admits on the second, so a
+    /// repeating dashboard panel still converges.
     #[tokio::test]
     async fn a_repeated_bypassed_scan_warms_on_the_second_sighting() -> anyhow::Result<()> {
         let inner = Arc::new(InMemory::new());
@@ -2939,14 +2542,8 @@ mod tests {
         Ok(())
     }
 
-    /// A parquet file no bigger than the metadata size hint is FULL-FILE
-    /// class: its first data-range read pays ONE inner GET that populates the
-    /// main tier, and every later range on it is a main-tier hit with zero
-    /// inner traffic. Before the fix every range on such a file satisfied the
-    /// footer-proximity test and went down the per-(file,range) metadata path
-    /// — one R2 GET per distinct range per query, forever (prod 2026-08-03:
-    /// main tier read 0/0 while a sea of sub-1MB flush files paid per-range
-    /// GETs).
+    /// A parquet file no bigger than the metadata size hint is FULL-FILE class:
+    /// one inner GET populates the main tier and every later range is a hit.
     #[tokio::test]
     async fn tiny_parquet_file_is_cached_whole_not_per_range() -> anyhow::Result<()> {
         let mem = Arc::new(InMemory::new());
@@ -2965,10 +2562,8 @@ mod tests {
         Ok(())
     }
 
-    /// A data-range miss on a large parquet file is range-only. Full-file cache
-    /// convergence belongs to upload capture and the post-commit/restart
-    /// warmer; doing it from the query path causes severe bandwidth
-    /// amplification and competes with the request it is meant to accelerate.
+    /// A data-range miss on a large parquet file is range-only; full-file warming
+    /// belongs to upload capture and the warmer, never to the query path.
     #[tokio::test]
     async fn large_file_query_miss_reads_ranges_without_warming_full_file() -> anyhow::Result<()> {
         let mem = Arc::new(InMemory::new());
@@ -3028,8 +2623,8 @@ mod tests {
         Ok(())
     }
 
-    // The oracle's whole point is that files already captured during upload are
-    // free to confirm: only the write-capture gap may cost a fetch.
+    // Files already captured during upload are free to confirm: only the
+    // write-capture gap may cost a fetch.
     #[tokio::test]
     async fn warm_full_if_absent_fetches_only_the_uncaptured_files() -> anyhow::Result<()> {
         let mem = Arc::new(InMemory::new());
@@ -3057,15 +2652,13 @@ mod tests {
 }
 
 // ===== snapshot_cache =====
-// Local persistence of Delta table snapshots so a restart restores the last
-// known state from disk and replays only commits made since, instead of
-// rebuilding from checkpoint + log tail on S3 (prod boot replay was the
-// dominant cold-start cost). Files live next to the WAL metadata under
-// `TIMEFUSION_DATA_DIR/.timefusion_meta/delta_snapshots/` and are
-// best-effort: any failure to write or read falls back to a full S3 load.
+// Local persistence of Delta table snapshots so a restart replays only commits
+// made since, instead of rebuilding from S3. Files live under
+// `TIMEFUSION_DATA_DIR/.timefusion_meta/delta_snapshots/`; any failure falls
+// back to a full S3 load.
 //
-// Format: zstd-compressed JSON of `(FORMAT_VERSION, table_url, state)`.
-// JSON (not bincode) because delta-rs's snapshot Serialize uses
+// Format: zstd-compressed JSON of `(FORMAT_VERSION, table_url, state)`. JSON
+// (not bincode) because delta-rs's snapshot Serialize uses
 // `serialize_seq(None)`, which non-self-describing formats reject.
 
 use std::fs;
@@ -3080,9 +2673,8 @@ const FORMAT_VERSION: u32 = 1;
 /// tables (active ones rewrite theirs every flush).
 pub const SNAPSHOT_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 3600);
 
-/// FROZEN HASH: this names a FILE on disk, so changing the hasher orphans
-/// every existing snapshot sidecar (a cold-start cost, not corruption, but a
-/// real one). Not part of the XXH3 sweep for that reason.
+/// FROZEN HASH: this names a FILE on disk, so changing the hasher orphans every
+/// existing snapshot sidecar.
 fn path_for(dir: &std::path::Path, table_url: &str) -> std::path::PathBuf {
     use std::hash::{DefaultHasher, Hash, Hasher};
     let mut h = DefaultHasher::new();
@@ -3090,9 +2682,8 @@ fn path_for(dir: &std::path::Path, table_url: &str) -> std::path::PathBuf {
     dir.join(format!("{:016x}.json.zst", h.finish()))
 }
 
-/// Best-effort atomic persist (tmp + rename, same pattern as the WAL cursor
-/// snapshot). Failures are logged, never propagated — persistence is an
-/// optimization, not a correctness requirement.
+/// Best-effort atomic persist (tmp + rename). Failures are logged, never
+/// propagated — persistence is an optimization, not a correctness requirement.
 pub fn store_snapshot(dir: &std::path::Path, table_url: &str, state: &DeltaTableState) {
     let path = path_for(dir, table_url);
     let write = || -> anyhow::Result<()> {
@@ -3133,9 +2724,7 @@ pub fn load_snapshot(dir: &std::path::Path, table_url: &str) -> Option<DeltaTabl
     }
 }
 
-/// Remove snapshot files not refreshed within `max_age` (active tables
-/// rewrite theirs every flush, so stale files belong to dropped or long-idle
-/// tables). Bounds disk growth; best-effort.
+/// Remove snapshot files not refreshed within `max_age`. Best-effort.
 pub fn prune_stale(dir: &std::path::Path, max_age: Duration) {
     fs::read_dir(dir)
         .into_iter()
@@ -3171,8 +2760,7 @@ mod snapshot_cache_tests {
         Ok(builder(mem, url)?.build()?.create().with_columns(get_default_schema().columns().unwrap_or_default()).await?)
     }
 
-    /// A metadata commit through the high-level ops API exercises the same
-    /// `CommitBuilder` post-commit hook the flush path uses.
+    /// Exercises the same `CommitBuilder` post-commit hook the flush path uses.
     async fn commit_property(table: DeltaTable) -> anyhow::Result<DeltaTable> {
         Ok(table.set_tbl_properties().with_properties(HashMap::from([("delta.checkpointInterval".to_string(), "50".to_string())])).await?)
     }
@@ -3181,36 +2769,21 @@ mod snapshot_cache_tests {
         table.state.as_ref().unwrap().has_materialized_files()
     }
 
-    /// Decisive probe: does a delta-rs commit (the `CommitBuilder` post-commit
-    /// hook that produces `finalized.snapshot()` in TF's flush path) preserve
-    /// the materialized file list? If a commit drops it, every subsequent
-    /// post-commit `snapshot.update()` falls back to a full checkpoint replay —
-    /// the 2-8s/flush prod cost — even though load/update preserve it.
+    /// A commit must preserve the materialized file list, and
+    /// `ensure_materialized_files` must restore it after a full load — otherwise
+    /// every post-commit update falls back to a full checkpoint replay.
     #[tokio::test(flavor = "multi_thread")]
-    async fn commit_preserves_materialized_files() -> anyhow::Result<()> {
-        let (mem, url) = mem_store("commit_mat")?;
+    async fn full_load_materialization() -> anyhow::Result<()> {
+        let (mem, url) = mem_store("full_load")?;
         let table = create_table(&mem, &url).await?;
         assert!(materialized(&table), "freshly created table is materialized");
 
         let table = commit_property(table).await?;
         assert_eq!(table.version(), Some(1));
         assert!(materialized(&table), "post-commit state must stay materialized; if false, every flush full-scans");
-        Ok(())
-    }
-
-    /// Does a full `.load()` (the path TF takes when there's no usable local
-    /// snapshot — e.g. a legacy on-disk snapshot that misses) come back
-    /// materialized? If not, every post-commit update stays on the full-scan
-    /// branch and never self-heals — the suspected prod cause. Also verifies
-    /// `ensure_materialized_files` (Tier A) repairs it.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn full_load_materialization() -> anyhow::Result<()> {
-        let (mem, url) = mem_store("full_load")?;
-        commit_property(create_table(&mem, &url).await?).await?;
 
         let mut loaded = builder(&mem, &url)?.load().await?;
         let materialized_on_load = materialized(&loaded);
-        // Tier A must leave the state materialized regardless of how it loaded.
         let log_store = loaded.log_store();
         loaded.state.as_mut().unwrap().ensure_materialized_files(log_store.as_ref()).await?;
         assert!(materialized(&loaded), "ensure_materialized_files must materialize after a full load");
@@ -3218,9 +2791,7 @@ mod snapshot_cache_tests {
         Ok(())
     }
 
-    /// Round-trip: persist a snapshot, restore it into a fresh unloaded
-    /// handle, and incrementally catch up to a commit made after the persist.
-    /// This is exactly the boot path — restore at version V, replay > V.
+    /// The boot path: restore at version V, replay commits > V.
     #[tokio::test(flavor = "multi_thread")]
     async fn snapshot_roundtrip_and_incremental_catchup() -> anyhow::Result<()> {
         let (mem, url) = mem_store("snap_tbl")?;
@@ -3240,11 +2811,8 @@ mod snapshot_cache_tests {
         restored.update_state().await?;
         assert_eq!(restored.version(), Some(1), "restored snapshot must incrementally reach the latest commit");
 
-        // The fork persists the materialized file list (MaterializedFilesWire),
-        // so a restored snapshot must come back materialized and STAY that way
-        // across updates — otherwise post-commit updates fall back to a full
-        // checkpoint replay (the 2-8s/flush prod cost). Guard the whole chain:
-        // ensure (idempotent) → update (incremental) → reconcile rebuild.
+        // A restored snapshot must come back materialized and STAY that way across
+        // updates, or post-commit updates fall back to a full checkpoint replay.
         assert!(materialized(&restored), "restored snapshot must come back materialized");
         let log_store = restored.log_store();
         restored.state.as_mut().unwrap().ensure_materialized_files(log_store.as_ref()).await?;
@@ -3260,25 +2828,18 @@ mod snapshot_cache_tests {
 }
 
 // ===== certification_store =====
-// Best-effort durable record of sweep certifications.
+// Best-effort durable record of sweep certifications, so the read-side dedup
+// skip survives a restart.
 //
-// `dedup_clean_fp` is process-local, so every restart begins with zero certified
-// partitions and the read-side dedup skip starts from cold. TF deploys several
-// times a day, which is why the skip was measured firing on 0.2–0.5% of
-// Delta-reading scans (`docs/plans/2026-08-11-certification-survival.md`).
-//
-// What is stored is exactly what `record_certification` decided — the
-// fingerprint it proved the partition clean over, never a verdict re-derived at
-// a different strictness. Nothing here can widen certification: a loaded entry
-// is subject to the same fingerprint-equality check against the live file list
-// as an in-memory one, so a stale or corrupted record can only cost a skip, not
-// grant a wrong one.
+// What is stored is exactly what `record_certification` decided, never a verdict
+// re-derived at a different strictness. A loaded entry faces the same
+// fingerprint-equality check against the live file list as an in-memory one, so
+// a stale or corrupt record can only cost a skip, never grant a wrong one.
 
 use std::io::ErrorKind;
 
-/// Newest-first cap on what is written. Bounds the file for a process that has
-/// certified a very large number of partitions; the tail it drops is the oldest,
-/// which is also the likeliest to have been invalidated already.
+/// Newest-first cap on what is written, bounding the file size; the oldest
+/// entries are dropped.
 pub const PERSIST_CAP: usize = 20_000;
 
 /// Only evidence produced with position-correct deletion-vector scans is reusable.
@@ -3297,26 +2858,18 @@ pub struct StoredCertification {
     pub date: String,
     /// `partition_file_fp` over the file set the certifying pass proved clean.
     pub fp: u64,
-    /// Wall-clock ms since the epoch at which it was granted. Wall-clock rather
-    /// than a monotonic instant precisely because it has to survive the process:
-    /// it exists so dwell measures a certification's real lifetime instead of
-    /// restarting at every deploy.
+    /// Wall-clock ms since the epoch at which it was granted — wall-clock, not a
+    /// monotonic instant, because it must survive the process.
     pub granted_unix_ms: u64,
     /// The file paths the certifying pass proved clean, for the per-FILE skip.
-    /// `default` so stores written before this field load as "no per-file
-    /// evidence" rather than failing — those certifications still serve the
-    /// whole-partition skip through `fp`.
+    /// `default` so older stores load as "no per-file evidence".
     #[serde(default)]
     pub files: Vec<String>,
     /// Whether the certification may still grant the WHOLE-PARTITION skip, or
-    /// only vouch for the files it names.
-    ///
-    /// Load-bearing across restarts: slice-derived certifications are stale by
-    /// construction (they proved one time window, never a day), and prod
-    /// restarts on every deploy. Restoring them as non-stale would let a proof
-    /// about ten minutes satisfy a day-wide skip. `default` = false so stores
-    /// written before this field keep their old meaning: they only ever held
-    /// whole-day grants.
+    /// only vouch for the files it names. Slice-derived certifications are stale
+    /// by construction (they proved one time window, never a day), so restoring
+    /// them as non-stale would let a proof about ten minutes satisfy a day-wide
+    /// skip. `default` = false: older stores only ever held whole-day grants.
     #[serde(default)]
     pub stale: bool,
 }
@@ -3326,9 +2879,8 @@ pub fn now_unix_ms() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
 }
 
-/// How long ago `granted_unix_ms` was, or `None` if it is in the future — which
-/// a backwards clock jump or a hand-edited file can produce, and which must not
-/// become a nonsense dwell.
+/// How long ago `granted_unix_ms` was, or `None` if it is in the future (a
+/// backwards clock jump or a hand-edited file).
 pub fn age_since(granted_unix_ms: u64) -> Option<std::time::Duration> {
     now_unix_ms().checked_sub(granted_unix_ms).map(std::time::Duration::from_millis)
 }
@@ -3342,9 +2894,8 @@ pub struct DirtyBin {
     pub table_name: String,
     pub date: String,
     pub bin: i64,
-    /// The bin width `bin` was computed at. Carried PER RECORD rather than per
-    /// file so a sidecar written across a width change still reads correctly,
-    /// and so an old file (no field) means the historical 10 minutes.
+    /// The bin width `bin` was computed at. Carried PER RECORD so a sidecar
+    /// written across a width change still reads correctly.
     #[serde(default = "default_bin_minutes")]
     pub width_minutes: i64,
 }
@@ -3355,10 +2906,8 @@ fn default_bin_minutes() -> i64 {
 
 /// Every bin at `to_micros` that overlaps bin `bin` of width `from_micros`.
 ///
-/// Both directions and non-multiple widths, because the only safe error is an
-/// over-approximation: marking a clean bin dirty costs one probe, while missing
-/// a dirty bin leaves duplicates in place forever. Widening maps many old bins
-/// onto one new; narrowing fans one old bin out across several.
+/// Must over-approximate: marking a clean bin dirty costs one probe, while
+/// missing a dirty bin leaves duplicates in place forever.
 pub fn remap_bin(bin: i64, from_micros: i64, to_micros: i64) -> std::ops::RangeInclusive<i64> {
     if from_micros == to_micros {
         return bin..=bin;
@@ -3368,10 +2917,8 @@ pub fn remap_bin(bin: i64, from_micros: i64, to_micros: i64) -> std::ops::RangeI
     lo.div_euclid(to_micros)..=hi.div_euclid(to_micros)
 }
 
-/// Sidecar files in the WAL meta dir (certifications, dirty bins): best-effort,
-/// never load-bearing. A missing, unreadable or corrupt file degrades to "empty"
-/// with a warning rather than failing a boot, and a failed store is logged and
-/// dropped — losing one costs re-derived work, never correctness.
+/// Load a best-effort sidecar file from the WAL meta dir. A missing, unreadable
+/// or corrupt file degrades to empty with a warning rather than failing a boot.
 pub fn load_sidecar<T: serde::de::DeserializeOwned>(data_dir: &std::path::Path, (file, what): (&str, &str)) -> Vec<T> {
     let path = crate::write::wal::meta_path(data_dir, file);
     match fs::read(&path).map(|data| serde_json::from_slice(&data)) {
@@ -3388,24 +2935,17 @@ pub fn load_sidecar<T: serde::de::DeserializeOwned>(data_dir: &std::path::Path, 
     }
 }
 
-/// Returns whether the write landed. Deliberately not `#[must_use]`: the hint
-/// stores (certifications, dirty bins) are best-effort by design and losing one
-/// costs a recomputation, so their call sites are right to ignore this. A store
-/// whose contents are an AUTHORITY is not — see `JsonCoverageLedger::persist`.
+/// Returns whether the write landed. Deliberately not `#[must_use]`: hint stores
+/// are best-effort, but a store whose contents are an AUTHORITY must check it.
 pub fn store_sidecar<T: Serialize>(data_dir: &std::path::Path, (file, what): (&str, &str), items: &[T]) -> bool {
     use std::io::Write;
     let path = crate::write::wal::meta_path(data_dir, file);
-    // The SERIALIZE is the expensive half here, and it sat outside the wrap
-    // `write_atomic_with` already has: the coverage ledger persists
-    // write-through on every rollup publication and re-encodes every cell it
-    // has ever seen, so this is a multi-MB `to_vec` on a runtime worker at
-    // maintenance frequency. (Nested `block_in_place` is fine — pinned by
-    // `support::tests::nested_helper_calls_are_allowed`.)
+    // The SERIALIZE must be inside the blocking wrap too: the coverage ledger
+    // re-encodes every cell on every write, a multi-MB `to_vec` on a worker.
     let result = crate::support::without_blocking_the_worker(|| {
         path.parent()
             .map_or(Ok(()), fs::create_dir_all)
             .and_then(|()| serde_json::to_vec(items).map_err(std::io::Error::other))
-            // Reuses the WAL's tmp+rename helper, which also cleans up the tmp file on failure.
             .and_then(|bytes| crate::write::wal::write_atomic_with(&path, false, |f| f.write_all(&bytes)))
     });
     if let Err(error) = result {
@@ -3421,13 +2961,8 @@ pub const SLICE_COVERAGE: (&str, &str) = ("dedup_slice_coverage.json", "slice co
 pub const UNTAGGED_CELLS: (&str, &str) = ("rollup_untagged_cells.json", "untagged tier cell store");
 
 /// A `(source, project, tier table, date)` partition holding tier files with no
-/// identity tags, persisted so the DAMAGE RANK survives a restart.
-///
-/// The repair units themselves are already durable — they live in the task
-/// journal — but their priority was not: `claim_next` reads a runtime set that
-/// only `recover_rollup_coverage` fills, and that runs ~40 minutes after boot.
-/// Prod 2026-08-23 restarted four times in one hour, so the rank was never once
-/// active and the queued repairs drained at the slow unprioritised rate.
+/// identity tags, persisted so the repair DAMAGE RANK survives a restart (the
+/// repair units themselves are already durable in the task journal).
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct StoredUntaggedCell {
     pub source: String,
@@ -3437,9 +2972,7 @@ pub struct StoredUntaggedCell {
 }
 
 /// One partition's accumulated clean-slice intervals, persisted write-through so
-/// certification evidence survives the restarts that the journal's Complete
-/// marks do (a day straddling a restart was otherwise permanently
-/// uncertifiable — cert_granted_total=0, diagnosed 2026-08-21).
+/// certification evidence survives a restart.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct StoredSliceCoverage {
     pub proof_version: DedupProofVersion,
@@ -3453,17 +2986,9 @@ pub const DIRTY_BINS: (&str, &str) = ("dedup_dirty_bins.json", "dirty-bin queue"
 
 pub const ROLLUP_COVERAGE: (&str, &str) = ("rollup_coverage_ledger.json", "rollup coverage ledger");
 
-/// One slice of a rollup tier, and what it was built FROM.
-///
-/// Today the same facts live in Delta metadata tags on each parquet file
-/// (`maintenance_coordinator::TAG_SLICE_START` and friends), which makes the
-/// files self-describing and makes coverage cost a full log replay to read. It
-/// also means an unrelated `OPTIMIZE` that drops custom tags destroys coverage
-/// state, and that two files covering different slices can never be compacted
-/// into one — the tier built to make 30d queries fast is itself thousands of
-/// small files.
-///
-/// See `docs/plans/2026-08-24-open-work-after-untagged-convergence.md` §3.
+/// One slice of a rollup tier, and what it was built FROM. The same facts also
+/// live in Delta metadata tags on each parquet file
+/// (`maintenance_coordinator::TAG_SLICE_START` and friends).
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct CoverageEntry {
     pub start_micros: i64,
@@ -3472,37 +2997,17 @@ pub struct CoverageEntry {
     pub generation: String,
     pub source_fingerprint: u64,
     /// The witness that this slice is not stale: the source partition's PHYSICAL
-    /// `num_records` sum at build time, i.e. exactly `TAG_SOURCE_ROWS`, which is
-    /// what `record_readable_coverage` copies in here.
-    ///
-    /// It is deliberately the same computation the read path re-derives, because
-    /// comparing unlike quantities is worse than not comparing at all — see
-    /// `rollup::slice_coverage_agrees`. Being physical is also its defect: a
-    /// dedup rewrite or a DML delete changes `num_records` without changing what
-    /// the rollup aggregated, and ingest anywhere else in the day moves it too,
-    /// so correct slices are voided. See
-    /// `docs/plans/2026-08-25-rollup-witness-design.md`. `None` means no witness,
-    /// which every read must treat as unverifiable rather than fresh.
+    /// `num_records` sum at build time (`TAG_SOURCE_ROWS`). It must stay the same
+    /// computation the read path re-derives — see `rollup::slice_coverage_agrees`.
+    /// `None` means no witness, which every read must treat as unverifiable
+    /// rather than fresh.
     pub source_rows: Option<i64>,
-    /// The tier files that SERVE this range.
-    ///
-    /// Without this the ledger can say a range is covered but not what to read
-    /// for it, so file selection would still have to come from the tags and the
-    /// tags could never be dropped — the ledger would be a supplement rather
-    /// than a replacement, and files would stay non-anonymous and therefore
-    /// non-compactable, which is the whole point of moving coverage off them.
-    ///
-    /// It is also what makes an on-demand slice split possible later: a hole
-    /// inside a wide covering file cannot be republished today because the file
-    /// physically holds the hole's rows and re-tagging does not remove them, so
-    /// both copies would be summed. Naming files per range is the prerequisite
-    /// for a reader that can prefer one over the other.
+    /// The tier files that SERVE this range; without it the ledger could say a
+    /// range is covered but not what to read for it.
     #[serde(default)]
     pub files: Vec<String>,
     /// The measure columns these files actually MATERIALIZED, from
-    /// `TAG_MEASURES`. `None` on an entry written before the tag existed, which
-    /// the read path treats as unproven rather than as "no measures" — the
-    /// distinction `#[serde(default)]` preserves for ledgers already on disk.
+    /// `TAG_MEASURES`. `None` means unproven, not "no measures".
     #[serde(default)]
     pub measures: Option<Vec<String>>,
 }
@@ -3513,92 +3018,56 @@ pub type CoverageCell = (String, String, String, String);
 
 /// Where rollup coverage is recorded and read.
 ///
-/// A trait rather than a concrete store because the sidecar JSON here is the
-/// FIRST backend, not the intended one: this state is destined for a real
-/// datastore (Postgres, SlateDB) where a point read does not mean loading every
-/// cell. Keeping callers on this interface makes that a backend swap.
-///
-/// **The decision, recorded 2026-08-24:** the real backend is DEFERRED, and JSON
-/// is the fallback rather than the plan. Nothing is blocked on it — the tags are
-/// still the authority and the ledger is still being verified against them — so
-/// the datastore is worth choosing when the ledger becomes load-bearing, not
-/// before. What must not happen in the meantime is callers reaching past this
-/// trait to `JsonCoverageLedger`, because that is what would turn a backend swap
-/// back into a rewrite. Two known JSON limits set the bar the replacement has to
-/// clear: `CoverageEntry.files` makes the sidecar grow with the FILE count
-/// (~13,800 live tier files in prod, not the cell count), and every change
-/// re-serializes every cell — `replace_many` bounds that to one write per tier
-/// pass and cannot do better within a single-document store.
+/// A trait so the JSON sidecar backend can be swapped for a real datastore;
+/// callers must not reach past it to `JsonCoverageLedger`.
 ///
 /// **Ordering is the safety property.** The Delta commit and the ledger write
-/// are not one transaction, and the two failure modes are not symmetric:
-///
-/// - the ledger UNDERSTATES coverage — a wasted rebuild, cheap;
-/// - the ledger CLAIMS coverage that is not there — wrong query results.
-///
-/// So `record` is called only AFTER the commit lands, and a crash in between
-/// leaves an understating ledger. Never the reverse order.
+/// are not one transaction, and the failure modes are not symmetric: an
+/// understating ledger costs a wasted rebuild, while a ledger claiming coverage
+/// that is not there gives wrong query results. So `record` is called only AFTER
+/// the commit lands. Never the reverse order.
 pub trait CoverageLedger: Send + Sync {
     fn coverage(&self, cell: &CoverageCell) -> Vec<CoverageEntry>;
     /// Record a slice that is ALREADY COMMITTED. See the ordering note above.
     fn record(&self, cell: &CoverageCell, entry: CoverageEntry);
     /// Replace a cell's coverage wholesale with what a replay just proved.
     ///
-    /// `record` alone is APPEND-ONLY, and coverage is not: a slice rebuilt under
-    /// a new generation supersedes the old entry rather than joining it, and a
-    /// slice whose files were removed leaves nothing behind at all. Re-recording
-    /// every hour without replacing would accumulate superseded entries forever
-    /// and — worse than the size — keep serving ranges whose files are gone,
-    /// which is the ledger's one unacceptable failure: claiming coverage that is
-    /// not there.
+    /// `record` is APPEND-ONLY and coverage is not: a slice rebuilt under a new
+    /// generation supersedes the old entry, and a slice whose files were removed
+    /// leaves nothing behind. Without replacement the ledger keeps serving ranges
+    /// whose files are gone.
     fn replace(&self, cell: &CoverageCell, entries: Vec<CoverageEntry>);
-    /// Apply a whole tier's worth of replacements as ONE durable write.
-    ///
-    /// `replace` persists the entire ledger, so calling it per cell costs
-    /// O(cells^2) serialization — and the recovery pass that writes this ledger
-    /// walks every cell of a tier, hourly, with every file path in every write.
-    /// A batch API is not a convenience here, it is the difference between one
-    /// write and thousands.
-    ///
-    /// An empty entry list retires that cell, same as `replace`.
+    /// Apply a whole tier's worth of replacements as ONE durable write —
+    /// `replace` persists the entire ledger, so per-cell calls cost O(cells^2)
+    /// serialization. An empty entry list retires that cell, same as `replace`.
     fn replace_many(&self, cells: Vec<(CoverageCell, Vec<CoverageEntry>)>) {
         for (cell, entries) in cells {
             self.replace(&cell, entries);
         }
     }
-    /// Drop a cell entirely — its partition aged out, or its coverage is being
-    /// rebuilt from scratch.
+    /// Drop a cell entirely.
     fn retire(&self, cell: &CoverageCell);
     fn cells(&self) -> Vec<CoverageCell>;
 }
 
 /// Merge entries of the SAME generation whose slices touch or overlap.
-///
-/// Without this a cell accumulates one entry per incremental build forever, and
-/// the ledger — which is meant to make coverage a cheap read — grows without
-/// bound. Generations are kept apart because a differing generation means the
-/// slices were built from different source content; merging those would invent
-/// a range no single build ever produced.
+/// Generations are kept apart: a differing generation means the slices were
+/// built from different source content, so merging would invent a range no
+/// single build ever produced.
 pub fn merge_coverage(mut entries: Vec<CoverageEntry>) -> Vec<CoverageEntry> {
     entries.sort_by(|a, b| (&a.generation, a.start_micros).cmp(&(&b.generation, b.start_micros)));
-    // Folded into the accumulator rather than `Itertools::coalesce`: that hands
-    // the un-merged pair back through `Err((last, entry))`, and a pair of
-    // entries is a 224-byte Err variant on every non-merging step.
     entries.into_iter().fold(Vec::new(), |mut merged: Vec<CoverageEntry>, entry| {
         match merged.last_mut() {
             Some(last) if last.generation == entry.generation && entry.start_micros <= last.end_micros => {
                 last.end_micros = last.end_micros.max(entry.end_micros);
-                // A merged range is only as trustworthy as its weakest part: one
-                // witness-less contributor makes the whole span unverifiable,
-                // which is the conservative direction (a rebuild, not a false
-                // claim of freshness).
+                // One witness-less contributor makes the whole span unverifiable
+                // — a rebuild, not a false claim of freshness.
                 last.source_rows = match (last.source_rows, entry.source_rows) {
                     (Some(a), Some(b)) => Some(a.saturating_add(b)),
                     _ => None,
                 };
-                // Union, not replace: a merged range is served by every file
-                // that served any part of it, and dropping one would make the
-                // ledger describe a range it cannot actually produce.
+                // Union, not replace: a merged range is served by every file that
+                // served any part of it.
                 last.files.extend(entry.files);
                 last.files.sort_unstable();
                 last.files.dedup();
@@ -3620,12 +3089,9 @@ pub struct StoredCoverage {
     pub entries: Vec<CoverageEntry>,
 }
 
-/// The first `CoverageLedger` backend: in memory, written through to the same
-/// best-effort JSON sidecar the certification and dirty-bin stores use.
-///
-/// Write-through rather than periodic, for the reason certifications had to
-/// become write-through (2026-08-21): this box restarts constantly, and state
-/// that only reaches disk on a clean shutdown is state that never reaches disk.
+/// The first `CoverageLedger` backend: in memory, written through to a JSON
+/// sidecar. Write-through rather than periodic — state that only reaches disk on
+/// a clean shutdown is state that never reaches disk.
 #[derive(Debug)]
 pub struct JsonCoverageLedger {
     data_dir: std::path::PathBuf,
@@ -3642,17 +3108,10 @@ impl JsonCoverageLedger {
         Self { data_dir, cells }
     }
 
-    /// Write-through, and COUNTED when it fails.
-    ///
-    /// The sidecar helper warns and continues, which is correct for a hint and
-    /// wrong for an authority: a dropped write means the in-memory ledger and
-    /// the disk copy diverge, and only the memory copy knows. Losing one is safe
-    /// while the Delta tags remain the authority — the ledger merely understates
-    /// coverage and costs a rebuild — so this does NOT fail the recovery pass.
-    /// It has to be VISIBLE, though, because a ledger that silently stopped
-    /// persisting reads exactly like a ledger with nothing to say:
-    /// `coverage_ledger_persist_failures` beside `coverage_ledger_disagreements`
-    /// is what says which one it is. Both must read zero before the tags can go.
+    /// Write-through, and COUNTED when it fails: a dropped write is not fatal
+    /// while the Delta tags remain the authority, but a ledger that silently
+    /// stopped persisting reads exactly like one with nothing to say, so the
+    /// failure must be visible in `coverage_ledger_persist_failures`.
     fn persist(&self) {
         let rows: Vec<StoredCoverage> = self
             .cells
@@ -3668,18 +3127,9 @@ impl JsonCoverageLedger {
     }
 
     /// The covered ranges this ledger claims for one `(source, tier table)`,
-    /// keyed by project — the shape the ROUTING path needs, as opposed to the
-    /// per-cell shape maintenance needs.
-    ///
-    /// This is the bridge for moving reads off the tags. Routing currently
-    /// answers "is this window covered, and is that coverage current?" from
-    /// `rollup_slice_coverage`, which is rebuilt from Delta tags. The same
-    /// question answered from here is what lets the tags go.
-    ///
-    /// Ranges are returned MERGED, so this is deliberately coarser than the
-    /// per-slice map: two adjacent slices of one generation are one range here
-    /// and two entries there. The covered SET is identical, which is the only
-    /// thing routing asks.
+    /// keyed by project — the shape the ROUTING path needs. Ranges are returned
+    /// MERGED, so this is coarser than the per-slice map; the covered SET is
+    /// identical.
     pub fn routing_view(&self, source: &str, table_name: &str) -> std::collections::HashMap<String, Vec<CoverageEntry>> {
         self.cells
             .iter()
@@ -3692,13 +3142,8 @@ impl JsonCoverageLedger {
     }
 
     /// Drop cells whose date is older than `keep_from` (a `YYYY-MM-DD` bound),
-    /// returning how many went.
-    ///
-    /// Retirement is not optional: without it the ledger grows for as long as
-    /// the process has ever seen a partition, including partitions that aged out
-    /// of retention months ago. Dates are compared as strings, which is exactly
-    /// right for zero-padded ISO dates and wrong for anything else — the format
-    /// is fixed by the Delta partition value.
+    /// returning how many went. Dates are compared as strings, which is valid
+    /// only for the zero-padded ISO form the Delta partition value uses.
     pub fn retire_before(&self, keep_from: &str) -> usize {
         let stale: Vec<CoverageCell> = self.cells.iter().filter(|e| e.key().3.as_str() < keep_from).map(|e| e.key().clone()).collect();
         for cell in &stale {
@@ -3753,9 +3198,7 @@ impl CoverageLedger for JsonCoverageLedger {
     }
 
     fn retire(&self, cell: &CoverageCell) {
-        if self.apply(cell.clone(), Vec::new()) {
-            self.persist();
-        }
+        self.replace(cell, Vec::new());
     }
 
     fn cells(&self) -> Vec<CoverageCell> {
@@ -3821,20 +3264,9 @@ mod coverage_ledger_tests {
     }
 
     /// Merging `(0,10,"g1",Some(3))` with a second slice, summarised as
-    /// `(start, end, rows, file count)` per surviving range.
-    ///
-    /// - *merge*: a cell gains an entry per incremental build; left unmerged the
-    ///   ledger grows without bound, defeating why it exists (coverage as a cheap
-    ///   read, not a log replay). The merged range keeps every file that served
-    ///   any part of it and a witness that is the sum of what was merged.
-    /// - *never merge*: different generations were built from different source
-    ///   content, so merging invents a range no build produced — and the ledger
-    ///   is the authority, so an invented range is served as truth.
-    /// - *poisons the witness*: the witness is what lets a read trust a slice is
-    ///   not stale, so a merged range is only as trustworthy as its weakest
-    ///   contributor. Summing `3 + unknown` into `3` manufactures a witness for
-    ///   rows nobody counted, failing in the dangerous direction — claiming
-    ///   freshness. Unverifiable beats a manufactured count.
+    /// `(start, end, rows, file count)` per surviving range. Merging across
+    /// generations would invent a range no build produced, and a witnessless
+    /// contributor must poison the merged witness rather than manufacture one.
     #[test_case::test_case("g1", Some(4) => vec![(0, 20, Some(7), 2)] ; "touching slices of one generation merge")]
     #[test_case::test_case("g2", Some(4) => vec![(0, 10, Some(3), 1), (10, 20, Some(4), 1)] ; "different generations never merge")]
     #[test_case::test_case("g1", None => vec![(0, 20, None, 2)] ; "a witnessless slice poisons the witness of the range it merges into")]
@@ -3845,33 +3277,28 @@ mod coverage_ledger_tests {
             .collect()
     }
 
-    /// Write-through, not on shutdown. Certifications had to learn this the hard
-    /// way (2026-08-21): a box that restarts constantly never reaches a clean
-    /// shutdown, so state that only persists then never persists at all.
+    /// One cell's whole life: record → restart → supersede → retire.
     #[test]
-    fn coverage_survives_a_restart() {
+    fn a_cells_coverage_is_written_through_superseded_then_retired() {
         let (dir, ledger) = ledger();
         ledger.record(&cell(), entry(0, 10, "g1", Some(5)));
 
+        // Write-through, not on shutdown.
         let reloaded = JsonCoverageLedger::load(dir.path());
         assert_eq!(reloaded.coverage(&cell()), vec![entry(0, 10, "g1", Some(5))], "a recorded slice is on disk before the process ends");
-    }
 
-    /// `record` is append-only; coverage is not. A slice rebuilt under a new
-    /// generation SUPERSEDES the old entry, and re-recording every hour without
-    /// replacing would keep the superseded range live forever — serving coverage
-    /// whose files are gone, which is the one failure the ledger must never have.
-    #[test]
-    fn replacing_a_cell_drops_superseded_entries_rather_than_accumulating_them() {
-        let (dir, ledger) = ledger();
-        ledger.record(&cell(), entry(0, 10, "g1", Some(5)));
+        // `record` is append-only; coverage is not — a slice rebuilt under a new
+        // generation SUPERSEDES the old entry.
         ledger.record(&cell(), entry(20, 30, "g1", Some(5)));
         assert_eq!(ledger.coverage(&cell()).len(), 2, "two disjoint ranges are two entries");
-
         ledger.replace(&cell(), vec![entry(0, 10, "g2", Some(9))]);
-
         assert_eq!(ledger.coverage(&cell()), vec![entry(0, 10, "g2", Some(9))], "what the replay proved is ALL the cell holds");
         assert_eq!(JsonCoverageLedger::load(dir.path()).coverage(&cell()).len(), 1, "and the replacement is durable");
+
+        // Replacing with nothing is a retirement, not a cell holding an empty
+        // list — those are different claims.
+        ledger.replace(&cell(), Vec::new());
+        assert!(ledger.cells().is_empty(), "the cell is gone, not empty");
     }
 
     /// `replace` persists the WHOLE ledger, so the recovery pass — which walks
@@ -3918,17 +3345,6 @@ mod coverage_ledger_tests {
             "a failed persist must be visible in timefusion_stats, not only in a log line"
         );
         assert_eq!(ledger.coverage(&cell()).len(), 1, "and the in-memory ledger still answers — losing the write is not losing the coverage");
-    }
-
-    /// Replacing with nothing means the replay found no coverage at all, which
-    /// is a retirement — not a cell holding an empty list, which would read back
-    /// as "known to have no coverage" and is a different claim.
-    #[test]
-    fn replacing_with_nothing_retires_the_cell() {
-        let (_dir, ledger) = ledger();
-        ledger.record(&cell(), entry(0, 10, "g1", Some(5)));
-        ledger.replace(&cell(), Vec::new());
-        assert!(ledger.cells().is_empty(), "the cell is gone, not empty");
     }
 
     #[test]

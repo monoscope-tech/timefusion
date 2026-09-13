@@ -1,14 +1,12 @@
-//! Regression: copy A of a row flushes to Delta, then a retry (copy B) lands
-//! in a different Delta file in the same `(project_id, date)` partition.
-//! Flush-time dedup runs per-bucket and cannot see across files, so without
-//! a Delta-vs-Delta compaction pass the duplicate persists forever.
+//! Dedup/compaction tests: cross-file duplicates within a `(project_id, date)`
+//! partition, the merge-on-read read path, and schema-skew regressions.
 
 use std::sync::Arc;
 
 use anyhow::Result;
 use datafusion::arrow::{
-    array::{Array, AsArray},
-    datatypes::Int64Type,
+    array::{Array, AsArray, RecordBatch},
+    datatypes::{Float64Type, Int64Type, TimestampMicrosecondType},
 };
 use serial_test::serial;
 use test_case::test_case;
@@ -23,16 +21,54 @@ fn new_project_id() -> String {
     format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8])
 }
 
-/// `hours` back from now. The dedup fixtures use 3h because dedup only rewrites
-/// hour chunks sealed for 2h+ (late data may still flush into newer hours).
-/// Partition dates are derived from the timestamp, so a midnight-UTC crossing
-/// stays consistent.
+/// `hours` back from now. Fixtures use 3h: dedup only rewrites hour chunks
+/// sealed for 2h+.
 fn hours_ago(hours: i64) -> i64 {
     (chrono::Utc::now() - chrono::Duration::hours(hours)).timestamp_micros()
 }
 
 fn date_of(ts: i64) -> chrono::NaiveDate {
     chrono::DateTime::<chrono::Utc>::from_timestamp_micros(ts).unwrap().date_naive()
+}
+
+/// Every row of `batches` projected through `row`, empty batches skipped.
+fn rows_of<T>(batches: &[RecordBatch], row: impl Fn(&RecordBatch, usize) -> T) -> Vec<T> {
+    batches.iter().filter(|b| b.num_rows() > 0).flat_map(|b| (0..b.num_rows()).map(|i| row(b, i)).collect::<Vec<_>>()).collect()
+}
+
+fn i64_at(b: &RecordBatch, col: usize, row: usize) -> i64 {
+    b.column(col).as_primitive::<Int64Type>().value(row)
+}
+
+fn f64_at(b: &RecordBatch, col: usize, row: usize) -> f64 {
+    b.column(col).as_primitive::<Float64Type>().value(row)
+}
+
+fn ts_at(b: &RecordBatch, col: usize, row: usize) -> i64 {
+    b.column(col).as_primitive::<TimestampMicrosecondType>().value(row)
+}
+
+/// otel string columns arrive as `Utf8View` on the routed path and `Utf8`
+/// elsewhere; `array_get_str` handles both.
+fn str_at(b: &RecordBatch, col: usize, row: usize) -> String {
+    array_get_str(b.column(col).as_ref(), row)
+}
+
+/// `cfg` with `f` applied.
+fn tweak(cfg: Arc<timefusion::config::AppConfig>, f: impl FnOnce(&mut timefusion::config::AppConfig)) -> Arc<timefusion::config::AppConfig> {
+    let mut cfg = (*cfg).clone();
+    f(&mut cfg);
+    Arc::new(cfg)
+}
+
+/// The default fixture config (buffered mode, no rollups) with `f` applied.
+fn tuned_cfg(name: &str, f: impl FnOnce(&mut timefusion::config::AppConfig)) -> Arc<timefusion::config::AppConfig> {
+    tweak(TestConfigBuilder::new(name).with_buffer_mode(BufferMode::Enabled).build(), f)
+}
+
+/// `plain_db` over a config `f` tweaked.
+async fn tuned_db(name: &str, f: impl FnOnce(&mut timefusion::config::AppConfig)) -> Result<(Arc<Database>, String)> {
+    db_of(tuned_cfg(name, f)).await
 }
 
 /// A `Database` over `cfg`, plus a fresh project id.
@@ -50,24 +86,21 @@ async fn table_of(db: &Arc<Database>, table: &str) -> Arc<tokio::sync::RwLock<de
     db.unified_tables().read().await.get(table).expect("table created").clone()
 }
 
-/// One span committed straight to Delta (`skip_queue = true`), i.e. as its own
-/// Delta commit — which is what manufactures separate files in one partition.
+/// One span committed straight to Delta (`skip_queue = true`) as its own Delta
+/// commit, which is what manufactures separate files in one partition.
 async fn commit_span(db: &Arc<Database>, project_id: &str, id: &str, name: &str, ts: i64) -> Result<()> {
     db.insert_records_batch(project_id, "otel_logs_and_spans", vec![json_to_batch(vec![test_span_ts(id, name, project_id, ts)])?], true, None).await?;
     Ok(())
 }
 
 /// Two independent Delta commits of the SAME `(id, timestamp)` → a physical
-/// duplicate in one partition. This is the cross-flush scenario in production:
-/// bucket A flushes, then a client retry arrives in a fresh bucket B and
-/// flushes separately.
+/// duplicate in one partition (the cross-flush scenario).
 async fn commit_dup_pair(db: &Arc<Database>, project_id: &str, ts: i64) -> Result<()> {
     commit_span(db, project_id, "dup_id", "first", ts).await?;
     commit_span(db, project_id, "dup_id", "second", ts).await
 }
 
-/// Scalar `i64` through `query_delta_only` — the Delta-only path a rollup build
-/// reads through.
+/// Scalar `i64` through `query_delta_only` (the path a rollup build reads through).
 async fn delta_scalar(db: &Arc<Database>, sql: &str) -> Result<i64> {
     Ok(db
         .query_delta_only(sql)
@@ -86,15 +119,14 @@ fn ctx_for(db: &Arc<Database>) -> Result<datafusion::prelude::SessionContext> {
     Ok(ctx)
 }
 
-/// Scalar `i64` from an EXISTING session context — for tests that must keep
-/// querying the very context whose caches they warmed.
+/// Scalar `i64` from an EXISTING session context (keeps the warmed caches).
 async fn scalar_in(ctx: &datafusion::prelude::SessionContext, sql: &str) -> Result<i64> {
-    Ok(ctx.sql(sql).await?.collect().await?[0].column(0).as_primitive::<Int64Type>().value(0))
+    Ok(i64_at(&ctx.sql(sql).await?.collect().await?[0], 0, 0))
 }
 
 /// Scalar `i64` through the ROUTED scan (MemBuffer ∪ Delta, read-side dedup).
 async fn routed_scalar(db: &Arc<Database>, sql: &str) -> Result<i64> {
-    Ok(ctx_for(db)?.sql(sql).await?.collect().await?[0].column(0).as_primitive::<Int64Type>().value(0))
+    scalar_in(&ctx_for(db)?, sql).await
 }
 
 #[serial]
@@ -106,13 +138,11 @@ async fn dedup_compaction_collapses_cross_flush_duplicates() -> Result<()> {
     let ts = hours_ago(3);
     commit_dup_pair(&db, &project_id, ts).await?;
 
-    // Sanity: the duplicate really did land physically in Delta. Measured via
-    // the Delta log stats (`delta_physical_row_count`), NOT a routed query —
-    // the read-side DedupExec would otherwise mask the on-disk duplicate.
+    // Measured via Delta log stats, NOT a routed query: read-side DedupExec
+    // would otherwise mask the on-disk duplicate.
     let table_ref = table_of(&db, "otel_logs_and_spans").await;
     assert_eq!(delta_physical_row_count(&table_ref).await?, 2, "pre-dedup: cross-flush duplicate should exist as 2 physical rows in Delta");
 
-    // two commits did not coalesce by accident).
     let part_marker = format!("project_id={}/date={}", project_id, date_of(ts));
     let file_count_before = table_ref.read().await.get_file_uris()?.filter(|u| u.contains(&part_marker)).count();
     assert!(file_count_before >= 2, "expected >=2 files in partition before dedup, got {}", file_count_before);
@@ -120,26 +150,20 @@ async fn dedup_compaction_collapses_cross_flush_duplicates() -> Result<()> {
     let (dropped, complete) = db.dedup_partition(&table_ref, "otel_logs_and_spans", &project_id, date_of(ts)).await?;
     assert_eq!((dropped, complete), (1, true), "expected exactly one duplicate row dropped in a complete pass");
 
-    // After the sweep, the duplicate is physically gone (1 row on disk).
     assert_eq!(delta_physical_row_count(&table_ref).await?, 1, "post-dedup: duplicate should be physically collapsed to a single row");
 
     Ok(())
 }
 
-/// Read-side dedup (parity plan Defect 2 #1): a cross-flush physical duplicate
-/// that the background sweep has NOT yet collapsed must still read as a single
-/// row through the normal routed scan path (`ProjectRoutingTable`, MemBuffer ∪
-/// Delta), so `COUNT(*)` is correct regardless of physical dupes. Without the
-/// in-scan `DedupExec` this query returns 2. Also covers the dedup-keys-projected-
-/// away case (`SELECT name`, `COUNT(*)`), which exercises projection augmentation.
+/// A cross-flush physical duplicate the sweep has NOT yet collapsed must still
+/// read as a single row through the routed scan, including when the dedup keys
+/// are projected away (projection augmentation).
 #[serial]
 #[tokio::test]
 async fn dup_across_flush_is_deduped_on_read() -> Result<()> {
     let (db, project_id) = plain_db("read_side_dedup").await?;
-    // Two independent Delta commits → physical duplicate in one partition. No sweep run.
     commit_dup_pair(&db, &project_id, hours_ago(3)).await?;
 
-    // Routed scan (NOT query_delta_only): read-side dedup must collapse to 1.
     let count_sql = format!("SELECT COUNT(*) AS cnt FROM otel_logs_and_spans WHERE project_id = '{}' AND id = 'dup_id'", project_id);
     assert_eq!(
         routed_scalar(&db, &count_sql).await?,
@@ -147,7 +171,6 @@ async fn dup_across_flush_is_deduped_on_read() -> Result<()> {
         "read-side dedup must collapse the cross-flush duplicate to a single row (COUNT(*) projects keys away)"
     );
 
-    // Non-empty projection that omits the dedup keys: augmentation must still dedup.
     let name_sql = format!("SELECT name FROM otel_logs_and_spans WHERE project_id = '{}' AND id = 'dup_id'", project_id);
     let rows: usize = ctx_for(&db)?.sql(&name_sql).await?.collect().await?.iter().map(|b| b.num_rows()).sum();
     assert_eq!(rows, 1, "read-side dedup must still collapse when dedup keys are projected away (`SELECT name`)");
@@ -155,32 +178,18 @@ async fn dup_across_flush_is_deduped_on_read() -> Result<()> {
     Ok(())
 }
 
-/// Does the path a ROLLUP BUILD reads through deduplicate?
-///
-/// This decides how expensive rollup coverage has to be. `rollup_backfill_tick`
-/// certifies a partition duplicate-free — a full `dedup_partition` pass — before
-/// it may build, and on 2026-08-15 that gate was what stopped every LARGE tenant
-/// from ever getting coverage: certification needs a zero-drop pass over an
-/// UNCHANGED file set, which a busy partition never offers while compaction is
-/// draining. Small tenants had rollups; shipbubble and the whale had none.
-///
-/// If `query_delta_only` (what `rebuild_rollup_partition` reads through) already
-/// collapsed duplicates, the gate would be redundant and could simply be
-/// dropped. `dup_across_flush_is_deduped_on_read` deliberately says "routed scan
-/// (NOT query_delta_only)", so pin the actual behaviour rather than infer it —
-/// the answer is the difference between a one-line fix and a redesign, and
-/// guessing wrong ships silently wrong dashboard numbers.
+/// `query_delta_only` — what a rollup build reads through — must deduplicate
+/// exactly like the routed scan. That is what makes building over an
+/// uncertified partition correct, and the certification gate redundant.
 #[serial]
 #[tokio::test]
 async fn query_delta_only_deduplicates_so_a_rollup_build_needs_no_certification() -> Result<()> {
     let (db, project_id) = plain_db("rollup_read_dedup_premise").await?;
-    // Two independent commits → one physical duplicate, no sweep run.
     commit_dup_pair(&db, &project_id, hours_ago(3)).await?;
 
     let via_delta_only =
         delta_scalar(&db, &format!("SELECT COUNT(*)::BIGINT FROM otel_logs_and_spans WHERE project_id = '{project_id}' AND id = 'dup_id'")).await?;
 
-    // The routed scan is the deduplicated reference.
     let routed_sql = format!("SELECT COUNT(*) AS cnt FROM otel_logs_and_spans WHERE project_id = '{project_id}' AND id = 'dup_id'");
     let routed = routed_scalar(&db, &routed_sql).await?;
     assert_eq!(routed, 1, "precondition: the routed scan deduplicates");
@@ -195,35 +204,20 @@ async fn query_delta_only_deduplicates_so_a_rollup_build_needs_no_certification(
     Ok(())
 }
 
-/// END-TO-END proof that dropping the certification gate is safe: a sealed
-/// partition that still holds PHYSICAL DUPLICATES and was never certified must
-/// still roll up to the deduplicated answer.
-///
-/// This is the test that licenses the change. `rollup_backfill_tick` used to run
-/// a full `dedup_partition` per partition before building, which no large tenant
-/// could ever satisfy (see the comment at its call site), so shipbubble and the
-/// whale had zero coverage and every 7-day query fell back to raw scans. The
-/// gate is redundant because the build reads through `query_delta_only`, which
-/// deduplicates — but "redundant" is a claim about NUMBERS, and a wrong rollup
-/// is silently wrong, so assert the numbers.
+/// END-TO-END: a sealed partition that still holds PHYSICAL DUPLICATES and was
+/// never certified must still roll up to the deduplicated answer.
 #[serial]
 #[tokio::test]
 async fn a_rollup_built_over_an_uncertified_duplicated_partition_matches_the_deduped_answer() -> Result<()> {
-    let mut cfg = (*TestConfigBuilder::new("rollup_no_cert").with_buffer_mode(BufferMode::Enabled).with_rollups().build()).clone();
-    // Pinned to 4 to keep this fixture's horizon small and explicit; the
-    // shipped default is 35 (it was 0/disabled until 2026-08-17).
-    cfg.maintenance.timefusion_rollup_backfill_days = 4;
-    let (db, project_id) = db_of(Arc::new(cfg)).await?;
-    // YESTERDAY, deliberately: it is the boundary of what the backfill claims.
-    // It used to be excluded as "the sweep's job", but the sweep only builds at
-    // its certification point and large tenants never certify — so yesterday
-    // stayed uncovered for exactly them, and a rolling 7-day window (the only
-    // shape a dashboard sends) paid a full raw day for it.
+    // Horizon pinned to 4 to keep the fixture small; the shipped default is 35.
+    let base = TestConfigBuilder::new("rollup_no_cert").with_buffer_mode(BufferMode::Enabled).with_rollups().build();
+    let (db, project_id) = db_of(tweak(base, |c| c.maintenance.timefusion_rollup_backfill_days = 4)).await?;
+    // YESTERDAY deliberately: the boundary of what the backfill claims.
     let day = chrono::Utc::now().date_naive() - chrono::Duration::days(1);
     let ts = day.and_hms_opt(9, 0, 0).unwrap().and_utc().timestamp_micros();
 
-    // Three distinct spans, one of which is written TWICE in separate commits →
-    // a physical duplicate in a partition nothing ever certifies.
+    // Three distinct spans, one written TWICE in separate commits → a physical
+    // duplicate in a partition nothing ever certifies.
     for (id, name) in [("a", "first"), ("b", "first"), ("dup", "first"), ("dup", "second")] {
         commit_span(&db, &project_id, id, name, ts).await?;
     }
@@ -231,14 +225,7 @@ async fn a_rollup_built_over_an_uncertified_duplicated_partition_matches_the_ded
     let deduped_raw = delta_scalar(&db, &format!("SELECT COUNT(*)::BIGINT FROM otel_logs_and_spans WHERE project_id = '{project_id}'")).await?;
     assert_eq!(deduped_raw, 3, "precondition: 4 physical rows, 3 distinct ids");
 
-    let built = {
-        // Plan, then step past FINALIZATION_DELAY: units are minted with a
-        // deadline in the future, so draining immediately claims nothing.
-        db.plan_rollup_backfill().await?;
-        timefusion::support::advance_micros(16 * 60 * 1_000_000);
-        db.drain_coordinator_rollups(64).await?
-    };
-    assert!(built > 0, "the backfill must build an UNCERTIFIED partition — that is the whole point of dropping the gate");
+    assert!(plan_and_drain_backfill(&db).await? > 0, "the backfill must build an UNCERTIFIED partition — that is the whole point of dropping the gate");
 
     let rolled = delta_scalar(
         &db,
@@ -249,25 +236,10 @@ async fn a_rollup_built_over_an_uncertified_duplicated_partition_matches_the_ded
     Ok(())
 }
 
-/// The rollup backfill must not disturb work that is already queued.
-///
-/// Backfill exists because nothing else queues an untouched sealed day:
-/// `reconcile_maintenance_task_cursors` enqueues only partitions named by
-/// commits after its durable cursor, and DML invalidation only covers what it
-/// touched. Prod 2026-08-17 had rollup rows for exactly two dates against 30+
-/// days of source data, so every 7d/14d/30d query was refused with `not_built`.
-///
-/// But the enqueue path it reuses, `invalidate`, takes
-/// `deadline.max(new_deadline)`. So re-invalidating a day that ALREADY has an
-/// eligible task pushes that task's deadline out by a full finalization delay,
-/// and a planner running every 60s holds the live frontier permanently just out
-/// of reach. That is not hypothetical: the first version of this planner did
-/// exactly that, and two rollup-parity tests went from correct totals to
-/// building nothing at all.
-///
-/// So the precondition of a backfill — "nothing has touched this day" — has to
-/// be literal. This pins it, and pins the horizon switch that turns the whole
-/// thing off.
+/// The rollup backfill must only claim days nothing has touched. Its enqueue
+/// path (`invalidate`) takes `deadline.max(new_deadline)`, so re-invalidating a
+/// day that already has an eligible task pushes that task's deadline out every
+/// pass and starves the live frontier. Also pins the horizon off-switch.
 #[serial]
 #[tokio::test]
 async fn rollup_backfill_leaves_already_queued_days_alone() -> Result<()> {
@@ -276,7 +248,6 @@ async fn rollup_backfill_leaves_already_queued_days_alone() -> Result<()> {
 
     let (db, project_id) = db_of(Arc::clone(&base)).await?;
 
-    // Writing the day queues rollup work for it through the normal path.
     let day = chrono::Utc::now().date_naive() - chrono::Duration::days(3);
     let ts = day.and_hms_opt(9, 0, 0).unwrap().and_utc().timestamp_micros();
     for id in ["a", "b", "c"] {
@@ -292,7 +263,6 @@ async fn rollup_backfill_leaves_already_queued_days_alone() -> Result<()> {
         "a day that already has queued rollup work must not be re-invalidated; doing so pushes its deadline out every pass and starves the live frontier"
     );
 
-    // The horizon switch must still turn it off, or there is no way back.
     let mut off = (*base).clone();
     off.maintenance.timefusion_rollup_backfill_days = 0;
     let db_off = Arc::new(Database::with_config(Arc::new(off)).await?);
@@ -300,28 +270,17 @@ async fn rollup_backfill_leaves_already_queued_days_alone() -> Result<()> {
     Ok(())
 }
 
-/// TODAY may be rolled up to the buffer boundary, and the answer must still
-/// equal the raw one.
-///
-/// Sealed history already answers a 7-day window in ~0.3s on prod, but a ROLLING
-/// window pays a raw scan for today at roughly a second per elapsed hour, so by
-/// evening today dominates and the window misses its budget. Covering today up
-/// to the oldest still-buffered row leaves only the last few minutes raw.
-///
-/// The danger is claiming MORE than the build read: buckets above the bound
-/// would be served from a rollup that never aggregated them, which is the
-/// silent-wrong-number failure no read-side guard can catch. So this asserts
-/// (a) today really is covered — otherwise the test passes vacuously by falling
-/// back to raw — and (b) the aggregate equals the same aggregate over raw rows.
+/// TODAY may be rolled up only up to the oldest still-buffered row, and the
+/// answer must still equal the raw one. Claiming buckets ABOVE that bound serves
+/// them from a rollup that never aggregated them. Asserts both that today really
+/// is covered (else the test passes vacuously via raw) and that totals match.
 #[serial]
 #[tokio::test]
 async fn today_is_rolled_up_to_the_buffer_boundary_and_still_matches_the_raw_answer() -> Result<()> {
-    let mut cfg = (*TestConfigBuilder::new("rollup_today").with_buffer_mode(BufferMode::Enabled).with_rollups().build()).clone();
-    cfg.maintenance.timefusion_rollup_backfill_days = 2;
-    let cfg = Arc::new(cfg);
-    // A REAL buffered layer: without one `min_buffered_micros` is always None,
-    // the bound degenerates to the day end, and the partial-day case this test
-    // exists for is never exercised.
+    let base = TestConfigBuilder::new("rollup_today").with_buffer_mode(BufferMode::Enabled).with_rollups().build();
+    let cfg = tweak(base, |c| c.maintenance.timefusion_rollup_backfill_days = 2);
+    // A REAL buffered layer: without one `min_buffered_micros` is always None
+    // and the bound degenerates to the day end, skipping the partial-day case.
     let layer = Arc::new(timefusion::support::test_helpers::test_layer(Arc::clone(&cfg))?);
     let db = Arc::new(Database::with_config(cfg).await?.with_buffered_layer(Arc::clone(&layer)));
     let project_id = new_project_id();
@@ -336,26 +295,18 @@ async fn today_is_rolled_up_to_the_buffer_boundary_and_still_matches_the_raw_ans
         })])
     };
 
-    // SETTLED: early rows, flushed to Delta so a build can aggregate them.
+    // SETTLED: flushed to Delta so a build can aggregate them.
     for (i, offset) in [60_000_000i64, 120_000_000, 3_600_000_000].iter().enumerate() {
         db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![row(&format!("s{i}"), 100 + i as i64, midnight + offset)?], true, None).await?;
     }
     layer.flush_all_now().await?;
 
-    // STILL BUFFERED: later rows, deliberately not flushed. These sit at or
-    // above the bound, so the build cannot see them and must not claim them.
+    // STILL BUFFERED: at or above the bound, so the build must not claim them.
     for (i, offset) in [7_200_000_000i64, 7_260_000_000].iter().enumerate() {
         db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![row(&format!("b{i}"), 900 + i as i64, midnight + offset)?], true, None).await?;
     }
 
-    let built = {
-        // Plan, then step past FINALIZATION_DELAY: units are minted with a
-        // deadline in the future, so draining immediately claims nothing.
-        db.plan_rollup_backfill().await?;
-        timefusion::support::advance_micros(16 * 60 * 1_000_000);
-        db.drain_coordinator_rollups(64).await?
-    };
-    assert!(built > 0, "the backfill must claim TODAY — otherwise this test proves nothing about partial-day coverage");
+    assert!(plan_and_drain_backfill(&db).await? > 0, "the backfill must claim TODAY — otherwise this test proves nothing about partial-day coverage");
 
     let rollup_rows =
         delta_scalar(&db, &format!("SELECT COUNT(*)::BIGINT FROM otel_logs_and_spans_rollup_dashboard_1m_v3 WHERE project_id = '{project_id}'")).await?;
@@ -368,30 +319,23 @@ async fn today_is_rolled_up_to_the_buffer_boundary_and_still_matches_the_raw_ans
          AND timestamp >= to_timestamp_micros({midnight}) AND timestamp < to_timestamp_micros({day_end})"
     );
     let routed = ctx_for(&db)?.sql(&agg).await?.collect().await?;
-    let (n, total) = (routed[0].column(0).as_primitive::<Int64Type>().value(0), routed[0].column(1).as_primitive::<Int64Type>().value(0));
+    let (n, total) = (i64_at(&routed[0], 0, 0), i64_at(&routed[0], 1, 0));
 
-    // Every row written, whatever leg served it: 3 settled + 2 buffered.
+    // 3 settled + 2 buffered.
     assert_eq!(n, 5, "the union must return every row — a bound that over-claims drops the buffered tail");
     assert_eq!(total, 100 + 101 + 102 + 900 + 901, "durations must match exactly; a wrong interior shows up here as a wrong SUM");
     Ok(())
 }
 
-/// Regression for the LIMIT-pushdown-undercount bug found in code review: a pushed
-/// `LIMIT N` must not be forwarded into the underlying Delta scan, because that
-/// truncates to N rows *before* DedupExec drops duplicates — so the deduped union
-/// can yield < N distinct rows even when more exist below the truncation point, and
-/// the top-level limit can't recover them. With many physical copies of one id plus
-/// one other id, `LIMIT 2` must still return 2 distinct rows.
+/// A pushed `LIMIT N` must not be forwarded into the Delta scan: that truncates
+/// *before* DedupExec drops duplicates, so the deduped union can yield < N rows.
 #[serial]
 #[tokio::test]
 async fn limit_query_not_truncated_below_read_dedup() -> Result<()> {
     let (db, project_id) = plain_db("read_dedup_limit").await?;
 
     let ts = hours_ago(3);
-    // 3 physical copies of "a" (one (id,timestamp) key) plus one "b": 4 physical
-    // rows in Delta, 2 distinct. Pushing fetch=2 into the scan truncates to 2
-    // physical rows that often are both "a", collapsing to a single deduped row;
-    // the fix suppresses the scan limit so all 4 are read and dedup yields {a,b}.
+    // 3 physical copies of "a" plus one "b": 4 physical rows, 2 distinct.
     for _ in 0..3 {
         commit_span(&db, &project_id, "a", "a", ts).await?;
     }
@@ -404,54 +348,41 @@ async fn limit_query_not_truncated_below_read_dedup() -> Result<()> {
     Ok(())
 }
 
-/// Regression: the dedup *sweep* (`dedup_today_partitions`) was scoped to
-/// `today` only, so a cross-flush duplicate that landed in a prior-day
-/// partition — e.g. a late DLQ `WriteTfOnly` replay crossing midnight UTC —
-/// was never collapsed (observed in prod: a 4-day-old window still 2×). The
-/// sweep must cover a recent-day lookback window, not just today.
+/// The dedup sweep (`dedup_today_partitions`) must cover a recent-day lookback
+/// window, not just today — late data can land in a prior-day partition.
 #[serial]
 #[tokio::test]
 async fn dedup_sweep_collapses_prior_day_partition() -> Result<()> {
     let (db, project_id) = plain_db("dedup_sweep_lookback").await?;
 
-    // Yesterday at noon UTC: always a prior-day `date=` partition and always
-    // >2h sealed (≥12h ago regardless of wall-clock), so dedup will rewrite it.
+    // Yesterday noon UTC: always a prior-day partition and always >2h sealed.
     let ts = (chrono::Utc::now().date_naive() - chrono::Duration::days(1)).and_hms_opt(12, 0, 0).unwrap().and_utc().timestamp_micros();
     commit_dup_pair(&db, &project_id, ts).await?;
 
-    // Physical row count (Delta log stats), so the read-side DedupExec doesn't
-    // mask whether the *sweep* actually rewrote the on-disk duplicate.
+    // Physical row count (Delta log stats), so read-side DedupExec can't mask it.
     let table_ref = table_of(&db, "otel_logs_and_spans").await;
     assert_eq!(delta_physical_row_count(&table_ref).await?, 2, "pre-sweep: prior-day cross-flush duplicate should exist as 2 physical rows");
 
-    // The production entry point the scheduler calls. With today-only scope this
-    // is a no-op for a yesterday partition; with the lookback window it collapses it.
     db.dedup_today_partitions(&table_ref, "otel_logs_and_spans", "otel_logs_and_spans").await?;
 
     assert_eq!(delta_physical_row_count(&table_ref).await?, 1, "post-sweep: prior-day duplicate must be physically collapsed to a single row");
     Ok(())
 }
 
-/// Regression for the 2026-06-11 prod OOM/restart loop: dedup's replace_where
-/// commit carries a bare-string timestamp predicate that delta-kernel's OCC
-/// checker cannot evaluate ("arrow_cast should have been simplified"), so any
-/// append landing between dedup's snapshot and commit aborted the sweep —
-/// every attempt, every 5 minutes, materializing and abandoning chunk writes
-/// (observed climbing to the 70GB memcg ceiling). The in-process
-/// `delta_commit_lock` serializes commits so the rebase sees no newer
-/// versions and the checker never runs: dedup must succeed under append fire.
+/// Dedup must commit under concurrent append fire. The in-process
+/// `delta_commit_lock` serializes commits so the OCC rebase never has to
+/// evaluate dedup's timestamp predicate, which delta-kernel cannot.
 #[serial]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn dedup_commits_despite_concurrent_appends() -> Result<()> {
     use std::sync::atomic::Ordering::{Acquire, Release};
     let (db, project_id) = plain_db("dedup_occ_race").await?;
 
-    // Duplicate pair in a sealed (3h-old) bin — the chunk dedup will rewrite.
     let ts = hours_ago(3);
     commit_dup_pair(&db, &project_id, ts).await?;
 
-    // Append fire: fresh-timestamp rows (same partition date space, distinct
-    // ids) committing continuously while dedup rewrites the sealed chunk.
+    // Append fire: fresh-timestamp rows committing continuously while dedup
+    // rewrites the sealed chunk.
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let committed = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let appender = {
@@ -468,9 +399,8 @@ async fn dedup_commits_despite_concurrent_appends() -> Result<()> {
         })
     };
 
-    // Gate dedup on the appender's first committed row so the race is guaranteed,
-    // not a scheduling artifact: on a loaded CI runner dedup could otherwise finish
-    // before the spawned task is scheduled, failing the `appended > 0` assertion.
+    // Gate dedup on the appender's first commit so the race is guaranteed rather
+    // than a scheduling artifact.
     while committed.load(Acquire) == 0 {
         tokio::task::yield_now().await;
     }
@@ -487,20 +417,18 @@ async fn dedup_commits_despite_concurrent_appends() -> Result<()> {
     Ok(())
 }
 
-/// Regression: light OPTIMIZE (bin-pack compact) must preserve ALL partition
-/// values on rewritten files. The kernel narrows `partitionValues_parsed` to
-/// the predicate-referenced subset (data skipping), and optimize used that
-/// narrowed map for grouping/output — so a `date = today` filter rewrote
-/// files as partitionValues={date}, silently NULLing project_id and hiding
-/// every compacted row from project-scoped queries.
+/// Light OPTIMIZE (bin-pack compact) must preserve ALL partition values on
+/// rewritten files. The kernel narrows `partitionValues_parsed` to the
+/// predicate-referenced subset, and using that narrowed map for output silently
+/// NULLs `project_id` and hides every compacted row from project-scoped queries.
 #[serial]
 #[tokio::test]
 async fn optimize_preserves_all_partition_values() -> Result<()> {
     let (db, project_id) = plain_db("optimize_partition_preserve").await?;
 
     let ts = chrono::Utc::now().timestamp_micros();
-    // Distinct ids → no dedup interplay; 6 separate commits → 6 small files
-    // (>= timefusion_compact_min_files=5 so the optimize commit isn't skipped).
+    // 6 separate commits → 6 small files (>= timefusion_compact_min_files=5, so
+    // the optimize commit isn't skipped).
     for i in 0..6 {
         commit_span(&db, &project_id, &format!("opt_id_{i}"), "row", ts + i).await?;
     }
@@ -521,26 +449,19 @@ async fn optimize_preserves_all_partition_values() -> Result<()> {
     Ok(())
 }
 
-/// The dedup rewrite is a TARGETED file transaction (remove+add of exactly
-/// the files holding the duplicate chunk's rows) — a bystander file in the
-/// same partition but outside the duplicate's 10-minute window must survive
-/// byte-identical (same path, never rewritten), while the duplicate-bearing
-/// files are replaced. Pins the 2026-07-04 fix: the old replace_where's
-/// bare-string predicate planned against the whole table.
+/// The dedup rewrite is a TARGETED file transaction: a bystander file in the
+/// same partition but outside the duplicate's 10-minute window must survive at
+/// the same path, while the duplicate-bearing files are replaced.
 #[serial]
 #[tokio::test]
 async fn dedup_rewrite_targets_only_duplicate_files() -> Result<()> {
-    // Copy-on-write mode: this test asserts file REPLACEMENT (a duplicate-bearing
-    // file is rewritten to a new path, bystanders untouched). DV masks in place —
-    // same path — so file-targeting is a copy-on-write-only property. The DV
-    // equivalent (bystanders untouched, same paths) is covered by the e2e
+    // Copy-on-write mode: file REPLACEMENT is a copy-on-write-only property (a
+    // DV masks in place, same path). DV equivalent: e2e
     // `dv_dedup_drops_cross_file_duplicate`.
     let (db, project_id) = db_of(TestConfigBuilder::new("dedup_targeted").with_buffer_mode(BufferMode::Enabled).without_deletion_vectors().build()).await?;
 
-    // Duplicate pair 3h back (sealed); bystander 20 minutes earlier — a
-    // different 10-minute chunk, usually the same date partition (if the test
-    // straddles midnight UTC the bystander lands in a different partition,
-    // which only makes the untouched assertion trivially true).
+    // Duplicate pair 3h back (sealed); bystander 20 min earlier, a different
+    // 10-minute chunk.
     let ts = hours_ago(3);
     let ts_bystander = ts - chrono::Duration::minutes(20).num_microseconds().unwrap();
 
@@ -573,31 +494,17 @@ async fn dedup_rewrite_targets_only_duplicate_files() -> Result<()> {
 const SHARDABLE: &[(&str, i64)] = &[("a", 0), ("a", 0), ("b", 1), ("c", 2), ("d", 3)];
 const ONE_HOT_KEY: &[(&str, i64)] = &[("hot", 0), ("hot", 0), ("hot", 0)];
 
-/// Fix 3 (2026-07-09): a chunk whose estimated decoded footprint exceeds the
-/// budget must NOT be skipped (leaving the dupe forever — prod project dcad860a's
-/// 743 MB single-file chunks skipped every 5-min sweep). Instead the rewrite
-/// SHARDS by an md5 hash of the dedup keys so each pass stays under the budget,
-/// the duplicate is collapsed, AND every distinct row survives — no row lost to a
-/// shard, none duplicated across shards. Pre-fix this SKIPPED (dropped=0, all rows
-/// persist); the fix collapses exactly the duplicate.
+/// A chunk whose estimated decoded footprint exceeds the budget must SHARD by a
+/// hash of the dedup keys rather than be skipped, collapsing the duplicate while
+/// every distinct row survives exactly once.
 ///
-/// `bytes_per_row`/`inflation` are pinned so the estimate is deterministic: 5 rows
-/// × 1 MB × 2 = 10 MB est over a 5 MB budget ⇒ 2 shards; the largest key group
-/// (a×2 = 4 MB) stays under budget so it is shardable, not skipped.
+/// SKEW SAFETY VALVE (second case): sharding cannot split a single key group, so
+/// when one group alone exceeds the budget the chunk is SKIPPED (0, false)
+/// rather than materialized into an OOM.
 ///
-/// SKEW SAFETY VALVE (the second case): sharding can't split a single key group
-/// (all copies hash to one bucket). If that one group alone exceeds the decoded
-/// budget, no shard count helps, so the chunk is SKIPPED (0, false) rather than
-/// materialized into an OOM — preserving the pre-fix safety. There one key has 3
-/// copies (3 × 1 MB × 2 = 6 MB) over a 4 MB budget, so it must skip and leave
-/// the rows physically intact.
-///
-/// Inserts are `(id, timestamp offset)` — each one its own Delta commit. Base
-/// timestamp is 3h back (sealed); distinct (id, ts) tuples hash to spread
-/// buckets, and a repeated (id, ts) lands in the same bucket ⇒ the same shard.
-///
-/// `SHARDABLE`: 5 rows, "a" twice at the SAME (id, ts). `ONE_HOT_KEY`: 3 copies
-/// of one key, which no shard count can split.
+/// `bytes_per_row`/`inflation` are pinned to make the estimate deterministic.
+/// Inserts are `(id, timestamp offset)`, each its own Delta commit, 3h back
+/// (sealed); a repeated `(id, ts)` hashes to the same shard.
 #[test_case("dedup_shard_preserve", 5_000_000, SHARDABLE, 5, (1, true), 4, &["a", "b", "c", "d"] ; "shards over budget and preserves rows")]
 #[test_case("dedup_hot_key", 4_000_000, ONE_HOT_KEY, 3, (0, false), 3, &["hot"] ; "skips single hot key over budget")]
 #[serial]
@@ -605,11 +512,12 @@ const ONE_HOT_KEY: &[(&str, i64)] = &[("hot", 0), ("hot", 0), ("hot", 0)];
 async fn dedup_over_budget(
     name: &str, max_decoded_bytes: u64, inserts: &[(&str, i64)], physical_before: i64, outcome: (u64, bool), physical_after: i64, ids_after: &[&str],
 ) -> Result<()> {
-    let mut cfg = (*TestConfigBuilder::new(name).with_buffer_mode(BufferMode::Enabled).build()).clone();
-    cfg.maintenance.timefusion_dedup_bytes_per_row = 1_000_000;
-    cfg.maintenance.timefusion_dedup_decode_inflation = 1;
-    cfg.maintenance.timefusion_dedup_max_decoded_bytes = max_decoded_bytes;
-    let (db, project_id) = db_of(Arc::new(cfg)).await?;
+    let (db, project_id) = tuned_db(name, |c| {
+        c.maintenance.timefusion_dedup_bytes_per_row = 1_000_000;
+        c.maintenance.timefusion_dedup_decode_inflation = 1;
+        c.maintenance.timefusion_dedup_max_decoded_bytes = max_decoded_bytes;
+    })
+    .await?;
 
     let base = hours_ago(3);
     for (id, offset) in inserts {
@@ -628,32 +536,18 @@ async fn dedup_over_budget(
     Ok(())
 }
 
-/// `UPDATE ... FROM` against duplicate keys, on the TARGET side and on the
-/// SOURCE side. Both cases end with one logical row holding the winning value.
+/// `UPDATE ... FROM` against duplicate keys, on the TARGET and the SOURCE side.
+/// Both cases end with one logical row holding the winning value.
 ///
-/// `duplicated target` — characterization, refuting the target-dup hypothesis: a
-/// duplicated *target* row does NOT break `UPDATE ... FROM`. The cardinality
-/// violation that aborted prod's MERGE is source-side, not a consequence of the
-/// over-budget dedup skip leaving target duplicates. The reported count differs
-/// by table kind, and BOTH are correct:
-/// - in-place (delta-rs MERGE): two physical rows are two rows to rewrite ⇒ 2.
-/// - merge-on-read: the two physical rows share `(id, timestamp)`, so they are
-///   ONE logical row. The scan feeding the append is post-`DedupExec`, and the
-///   single appended version supersedes both copies ⇒ 1.
-///   `otel_logs_and_spans` is merge-on-read, so 1 is the answer here; asserting
-///   2 would be asserting that the append duplicated the row. The point of the
-///   case is that the MERGE did not abort, and the duplicate is gone from the
-///   logical table rather than half-updated.
+/// `duplicated target`: a duplicated target row does not break the update. The
+/// reported count is 1 here because `otel_logs_and_spans` is merge-on-read — the
+/// two physical rows are ONE logical row, and the single appended version
+/// supersedes both. (An in-place table would report 2.)
 ///
-/// `duplicate source keys` — regression for the prod 2026-07-09 `MERGE matched a
-/// target row with multiple source rows` cardinality abort, and its 2026-07-19
-/// fix (`split_source_rounds`, commit 9314499). The violation is SOURCE-side:
-/// two source rows sharing a join key both match one target row, which delta-rs
-/// would abort. TF now splits such a source into successive single-key rounds
-/// and applies them last-write-wins instead of failing — so same-key multi-tag
-/// hash enrichment neither errors nor silently drops tags. The UPDATE must
-/// therefore SUCCEED, apply every round (count = rounds), and leave the target
-/// holding the LAST source row's value.
+/// `duplicate source keys`: two source rows sharing a join key would be a
+/// delta-rs cardinality abort. TF splits such a source into successive
+/// single-key rounds applied last-write-wins, so count = rounds and the target
+/// holds the LAST source row's value.
 #[test_case("update_dup_target", &["first", "second"], "('dup_id', 'enriched')", 1, "enriched" ; "duplicated target updates all copies")]
 #[test_case("update_dup_source", &["orig"], "('dup_id', 'a'), ('dup_id', 'b')", 2, "b" ; "duplicate source keys apply last write wins")]
 #[serial]
@@ -661,8 +555,7 @@ async fn dedup_over_budget(
 async fn update_from_resolves_to_one_logical_row(name: &str, target_names: &[&str], source_values: &str, expect_updated: u64, expect_name: &str) -> Result<()> {
     let (db, project_id) = plain_db(name).await?;
 
-    // One skip_queue insert per name, all at the SAME (id, timestamp) → that
-    // many physical target rows for 'dup_id'.
+    // All at the SAME (id, timestamp) → that many physical rows for 'dup_id'.
     let ts = hours_ago(3);
     for n in target_names {
         commit_span(&db, &project_id, "dup_id", n, ts).await?;
@@ -683,13 +576,9 @@ async fn update_from_resolves_to_one_logical_row(name: &str, target_names: &[&st
     Ok(())
 }
 
-/// Regression for the 2026-07-21 wide-dashboard latency incident: the cold
-/// consolidate sweep must produce event-time DISJOINT sorted runs. The old
-/// whole-partition optimize binned files in snapshot (arrival) order, so a day
-/// whose files interleave event times (dedup rewrites, DV merges, backfill)
-/// merged into runs that ALL overlapped the full day — a recent-window or
-/// ORDER-BY-timestamp-DESC-LIMIT query had to open every file. Event-time
-/// binned selection makes successive runs cover strictly later slices.
+/// The cold consolidate sweep must produce event-time DISJOINT sorted runs.
+/// Binning in snapshot (arrival) order instead yields runs that all overlap the
+/// whole day, so a recent-window or ORDER-BY-DESC-LIMIT query opens every file.
 #[serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn cold_consolidate_produces_event_time_disjoint_runs() -> Result<()> {
@@ -698,9 +587,8 @@ async fn cold_consolidate_produces_event_time_disjoint_runs() -> Result<()> {
     let dir = format!("/tmp/timefusion-{id}");
     let project_id = new_project_id();
 
-    // A sealed, cold date (3 days back). Arrival order interleaves event
-    // times: hours [0, 6, 1, 7, 2, 8] — snapshot-order binning mixes early and
-    // late hours in every bin; event-time binning separates them.
+    // A sealed, cold date. Arrival order deliberately interleaves event times,
+    // so snapshot-order binning would mix early and late hours in every bin.
     let base = (chrono::Utc::now() - chrono::Duration::days(3)).date_naive().and_hms_opt(0, 0, 0).unwrap().and_utc();
     let date = base.date_naive();
     let hours = [0i64, 6, 1, 7, 2, 8];
@@ -712,27 +600,31 @@ async fn cold_consolidate_produces_event_time_disjoint_runs() -> Result<()> {
         Some((get("minValues")?, get("maxValues")?))
     }
 
-    // The flush path (not the skip_queue direct commit) is what writes
-    // min/max timestamp stats into the Add actions — the same files the prod
-    // selection sees; flush_immediately lands each insert as its own commit.
-    let cfg = {
-        let mut c = (*minio_test_config(&id, &dir)).clone();
-        c.buffer.timefusion_flush_immediately = true;
-        Arc::new(c)
-    };
-    let sizes: Vec<i64> = {
+    /// The partition's live files' (min,max) event-time ranges, sorted. A run
+    /// without readable stats is mapped to (MIN, MAX) so it fails disjointness —
+    /// unreadable stats are as fatal for pruning as an overlap.
+    async fn sorted_ranges(table: &Arc<tokio::sync::RwLock<deltalake::DeltaTable>>, filters: &[deltalake::PartitionFilter]) -> Result<Vec<(i64, i64)>> {
+        use futures::TryStreamExt;
+        let guard = table.read().await;
+        let adds: Vec<_> = guard.get_active_add_actions_by_partitions(filters).try_collect().await?;
+        let mut r: Vec<_> = adds.iter().map(|a| a.stats().and_then(|s| ts_range(&s)).unwrap_or((i64::MIN, i64::MAX))).collect();
+        r.sort();
+        Ok(r)
+    }
+
+    // Only the flush path writes min/max timestamp stats into the Add actions;
+    // flush_immediately lands each insert as its own commit.
+    let cfg = tweak(minio_test_config(&id, &dir), |c| c.buffer.timefusion_flush_immediately = true);
+    let mut sizes: Vec<i64> = {
         let db = Arc::new(Database::with_config(Arc::clone(&cfg)).await?);
         for (i, h) in hours.iter().enumerate() {
             let ts = (base + chrono::Duration::hours(*h)).timestamp_micros();
             let mut row = test_span_ts(&format!("id-{i}"), &format!("span-{i}"), &project_id, ts);
-            // Data-dominated file sizes (incompressible ~140KB payload): run
-            // sizes must scale with their member rows for the size-based
-            // convergence assertions below; 1-row files are otherwise pure
-            // footer overhead and merging wouldn't grow them.
+            // Incompressible ~140KB payload so file size scales with row count;
+            // 1-row files would otherwise be pure footer overhead.
             let blob: String = (0..4000).map(|_| uuid::Uuid::new_v4().to_string()).collect();
             row["summary"] = serde_json::json!([blob]);
             let batch = json_to_batch(vec![row])?;
-            // flush_immediately → each insert flushes as its own Delta commit.
             db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch], false, None).await?;
         }
         let table_ref = db.unified_tables().read().await.get("otel_logs_and_spans").expect("table created").clone();
@@ -749,73 +641,36 @@ async fn cold_consolidate_produces_event_time_disjoint_runs() -> Result<()> {
     assert_eq!(sizes.len(), 6, "each skip_queue insert must land as its own file");
 
     // Cold target sized so ~2 files fit per run but 3 don't → forces >1 run.
-    let median = {
-        let mut s = sizes.clone();
-        s.sort();
-        s[s.len() / 2]
-    };
-    let mut cfg2 = (*cfg).clone();
-    cfg2.parquet.timefusion_cold_optimize_target_size = median * 5 / 2;
-    // The daily cold sweep that used to wrap this resolved the same target per
-    // date and looped; with one partition under test, calling the binned
-    // consolidation directly is the identical work and keeps the coverage on the
-    // function the CLI still calls.
-    let cold_target = cfg2.parquet.timefusion_cold_optimize_target_size;
-    let db = Arc::new(Database::with_config(Arc::new(cfg2)).await?);
+    sizes.sort();
+    let cold_target = sizes[sizes.len() / 2] * 5 / 2;
+    let db = Arc::new(Database::with_config(tweak(cfg, |c| c.parquet.timefusion_cold_optimize_target_size = cold_target)).await?);
     let table_ref = db.get_or_create_unified_table("otel_logs_and_spans").await?;
     db.consolidate_date_binned(&table_ref, "otel_logs_and_spans", date, cold_target, None, usize::MAX).await?;
 
-    // Collect (min,max) event-time ranges of the partition's live files.
     let filters = vec![
         deltalake::PartitionFilter::try_from(("project_id", "=", project_id.as_str()))?,
         deltalake::PartitionFilter::try_from(("date", "=", date.to_string().as_str()))?,
     ];
-    let ranges: Vec<(i64, i64)> = {
-        use futures::TryStreamExt;
-        let guard = table_ref.read().await;
-        let adds: Vec<_> = guard.get_active_add_actions_by_partitions(&filters).try_collect().await?;
-        // A run without readable timestamp stats overlaps everything —
-        // equally fatal for pruning, so it must fail the disjointness assert.
-        adds.iter().map(|a| a.stats().and_then(|s| ts_range(&s)).unwrap_or((i64::MIN, i64::MAX))).collect()
-    };
-    assert!(ranges.len() < 6, "consolidation must merge files (got {} of 6)", ranges.len());
-    assert!(ranges.len() >= 2, "target must split the day into multiple runs (got {})", ranges.len());
-    let mut sorted = ranges.clone();
-    sorted.sort();
+    let sorted = sorted_ranges(&table_ref, &filters).await?;
+    assert!(sorted.len() < 6, "consolidation must merge files (got {} of 6)", sorted.len());
+    assert!(sorted.len() >= 2, "target must split the day into multiple runs (got {})", sorted.len());
     for w in sorted.windows(2) {
         assert!(w[0].1 < w[1].0, "consolidated runs must be event-time disjoint, got overlapping ranges {:?} and {:?} (all: {:?})", w[0], w[1], sorted);
     }
     assert_eq!(delta_physical_row_count(&table_ref).await?, 6, "consolidation must not lose rows");
 
     // Idempotence: a second sweep must not rewrite converged runs.
-    let before: Vec<(i64, i64)> = sorted.clone();
     db.consolidate_date_binned(&table_ref, "otel_logs_and_spans", date, cold_target, None, usize::MAX).await?;
-    let after: Vec<(i64, i64)> = {
-        use futures::TryStreamExt;
-        let guard = table_ref.read().await;
-        let adds: Vec<_> = guard.get_active_add_actions_by_partitions(&filters).try_collect().await?;
-        let mut r: Vec<_> = adds.iter().map(|a| a.stats().and_then(|s| ts_range(&s)).unwrap_or((i64::MIN, i64::MAX))).collect();
-        r.sort();
-        r
-    };
-    assert_eq!(after, before, "second sweep must be a no-op on converged runs");
+    assert_eq!(sorted_ranges(&table_ref, &filters).await?, sorted, "second sweep must be a no-op on converged runs");
     Ok(())
 }
 
-// Merge-on-read read path (docs/plans/2026-08-01-merge-on-read-dml.md §3).
-//
-// Keep-greatest only engages while `DedupExec`'s input still DECLARES an
-// ordering on the leading dedup key — that is what makes every version of a key
-// arrive in one contiguous run. `DedupExec` requires `SinglePartition`, which
-// otherwise gets an ordering-erasing `CoalescePartitionsExec`, and the
-// mem ∪ hot ∪ delta union is unordered while the MemBuffer branch declares
-// nothing. `scan` therefore sorts the (in-memory, cheap) mem/hot legs up to the
-// Delta leg's declared footer ordering; the union then advertises it and
-// `EnforceDistribution` picks a `SortPreservingMergeExec` instead.
-//
-// The shape under test is the production one: the base row is already flushed to
-// Delta (one file → the fork's footer pushdown declares `timestamp DESC`) and
-// the new version is still in MemBuffer.
+// Merge-on-read read path. Keep-greatest only engages while `DedupExec`'s input
+// still DECLARES an ordering on the leading dedup key, so every version of a key
+// arrives in one contiguous run: `scan` sorts the cheap in-memory legs up to the
+// Delta leg's declared footer ordering so the union can advertise it and
+// `EnforceDistribution` picks `SortPreservingMergeExec` over an ordering-erasing
+// `CoalescePartitionsExec`.
 
 /// A `Database` with a real buffered layer, so writes can land in MemBuffer.
 async fn buffered_db(name: &str) -> Result<(Arc<Database>, String)> {
@@ -825,9 +680,8 @@ async fn buffered_db(name: &str) -> Result<(Arc<Database>, String)> {
     Ok((db, new_project_id()))
 }
 
-/// The merge-on-read production shape: `count` base rows already flushed to
-/// Delta (one file → the fork's footer pushdown declares `timestamp DESC`) plus
-/// a newer version of `k0` still sitting in MemBuffer.
+/// `count` base rows already flushed to Delta (one file, so the footer pushdown
+/// declares `timestamp DESC`) plus a newer version of `k0` still in MemBuffer.
 async fn seed_mor_versions(db: &Arc<Database>, table: &str, project_id: &str, count: i64) -> Result<()> {
     let ts = chrono::Utc::now().timestamp_micros();
     let rows = (0..count).map(|i| mor_row(&format!("k{i}"), "v", project_id, ts - i * 1000, None)).collect();
@@ -835,12 +689,8 @@ async fn seed_mor_versions(db: &Arc<Database>, table: &str, project_id: &str, co
     write_to(db, table, project_id, vec![mor_row("k0", "v2", project_id, ts, None)], false).await
 }
 
-/// `to_delta = true` commits straight to Delta (the already-flushed base row);
-/// `false` goes through the buffered layer into MemBuffer (the new version).
-async fn write(db: &Arc<Database>, project_id: &str, rows: Vec<serde_json::Value>, to_delta: bool) -> Result<()> {
-    write_to(db, "otel_logs_and_spans", project_id, rows, to_delta).await
-}
-
+/// `to_delta = true` commits straight to Delta; `false` goes through the
+/// buffered layer into MemBuffer.
 async fn write_to(db: &Arc<Database>, table: &str, project_id: &str, rows: Vec<serde_json::Value>, to_delta: bool) -> Result<()> {
     let batch = timefusion::support::test_helpers::json_to_batch_for(table, rows)?;
     db.insert_records_batch(project_id, table, vec![batch], to_delta, None).await?;
@@ -848,18 +698,15 @@ async fn write_to(db: &Arc<Database>, table: &str, project_id: &str, rows: Vec<s
 }
 
 /// A `mor_versioned` row — the fixture table that ships `version_append: true`,
-/// so the merge-on-read read path is actually live on it.
+/// so the merge-on-read read path is live on it.
 fn mor_row(id: &str, name: &str, project_id: &str, ts: i64, deleted: Option<bool>) -> serde_json::Value {
     let date = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(ts).unwrap().date_naive().to_string();
     serde_json::json!({ "timestamp": ts, "id": id, "name": name, "project_id": project_id, "date": date, "deleted": deleted })
 }
 
-/// Run the dedup sweep until the window's partitions carry a clean fingerprint —
-/// the precondition both the read-side dedup skip and `count_pushdown` gate on.
-/// Only a 0-drop pass over an UNCHANGED live file set certifies a partition, so
-/// a first pass that rewrote anything marks nothing — the second pass over the
-/// settled set is what certifies. Two passes; the second is an early-return
-/// no-op when the first already left the table's version untouched.
+/// Sweep until the window's partitions carry a clean fingerprint — the
+/// precondition the read-side dedup skip and `count_pushdown` gate on. Only a
+/// 0-drop pass over an UNCHANGED file set certifies, so two passes are needed.
 async fn sweep_clean(db: &Arc<Database>, table: &str) -> Result<()> {
     let table_ref = table_of(db, table).await;
     for _ in 0..2 {
@@ -885,22 +732,13 @@ fn find_node(plan: &Arc<dyn datafusion::physical_plan::ExecutionPlan>, name: &st
 }
 
 async fn column_strings(db: &Arc<Database>, sql: &str) -> Result<Vec<String>> {
-    Ok(ctx_for(db)?
-        .sql(sql)
-        .await?
-        .collect()
-        .await?
-        .iter()
-        .flat_map(|b| (0..b.num_rows()).map(|i| timefusion::support::test_helpers::array_get_str(b.column(0).as_ref(), i)).collect::<Vec<_>>())
-        .collect())
+    col0_in(&ctx_for(db)?, sql).await
 }
 
-/// A plain merge-on-read `SELECT` must never sort the DELTA leg — that
-/// blocking whole-window SortExec exhausted the query pool on prod
-/// 2026-08-02. In-memory legs MAY be sorted (bounded, already materialized):
-/// when the Delta leg declares its footer ordering, the cheap mem-leg sort
-/// plus a `SortPreservingMergeExec` is the intended shape, because it gives
-/// `DedupExec` a bounded keep-greatest instead of a full-set buffer.
+/// A plain merge-on-read `SELECT` must never sort the DELTA leg — that blocking
+/// whole-window SortExec exhausts the query pool. In-memory legs MAY be sorted
+/// (bounded, already materialized); mem-leg sort + `SortPreservingMergeExec` is
+/// the intended shape, giving `DedupExec` a bounded keep-greatest.
 #[serial]
 #[tokio::test]
 async fn plain_select_dedups_without_sorting_under_mor() -> Result<()> {
@@ -919,18 +757,14 @@ async fn plain_select_dedups_without_sorting_under_mor() -> Result<()> {
     Ok(())
 }
 
-/// The other half of the gate, and the one that ships: while `version_append` is
-/// OFF, the ordering machinery must be completely absent from the scan. No
-/// version can exist, so the blocking `SortExec` over the mem/hot legs and the
-/// k-way `SortPreservingMergeExec` (one in-flight batch per Delta partition —
-/// the 2026-07-20 OOM shape) would be pure cost. `DedupExec` keeps its
-/// keep-first behaviour behind the pre-existing `CoalescePartitionsExec`.
+/// While `version_append` is OFF no version can exist, so the ordering
+/// machinery (mem/hot `SortExec`, k-way `SortPreservingMergeExec`) must be
+/// absent — it would be pure cost, and the merge holds one in-flight batch per
+/// Delta partition. `DedupExec` keeps keep-first behind `CoalescePartitionsExec`.
 #[serial]
 #[tokio::test]
 async fn dormant_version_append_table_keeps_coalesce_and_no_injected_sort() -> Result<()> {
-    // `mor_dormant`, not otel: otel itself played this role until it flipped
-    // `version_append: true`, at which point asserting the dormant shape on it
-    // asserted the opposite of what ships.
+    // `mor_dormant`, not otel: otel ships `version_append: true`.
     let (db, project_id) = buffered_db("mor_plan_shape_dormant").await?;
     seed_mor_versions(&db, "mor_dormant", &project_id, 8).await?;
 
@@ -957,10 +791,9 @@ async fn no_tiebreak_table_plan_is_unchanged() -> Result<()> {
     Ok(())
 }
 
-/// The behavioural contract of merge-on-read: two versions of one
-/// `(timestamp, id)` that differ only in their TF-stamped `updated_at` must both
-/// read back as the NEWER version — through a plain `SELECT` and through an
-/// aggregation. Under keep-first (arrival order) this returns "v1".
+/// The merge-on-read contract: two versions of one `(timestamp, id)` differing
+/// only in their TF-stamped `updated_at` read back as the NEWER version, through
+/// a plain `SELECT` and through an aggregation.
 #[serial]
 #[tokio::test]
 async fn keep_greatest_returns_newest_version() -> Result<()> {
@@ -979,12 +812,10 @@ async fn keep_greatest_returns_newest_version() -> Result<()> {
     Ok(())
 }
 
-/// Merge-on-read `DELETE`: the tombstone version must first BEAT the older live
-/// version on `updated_at` (so keep-greatest picks it), and only then remove the
-/// row. Filtering below the dedup would drop the tombstone and resurrect the
-/// stale live row. It must vanish from `SELECT` and from `COUNT(*)` alike — the
-/// latter also pins that the stats-based `count_pushdown` declines on a
-/// tombstone table, where `numRecords` counts versions it never materializes.
+/// Merge-on-read `DELETE`: the tombstone must first BEAT the older live version
+/// on `updated_at`, and only then remove the row. Filtering below the dedup
+/// would drop the tombstone and resurrect the stale row. Covers `SELECT` and
+/// `COUNT(*)` (the stats-based pushdown must decline on a tombstone table).
 #[serial]
 #[tokio::test]
 async fn tombstoned_row_hidden_from_select_and_count() -> Result<()> {
@@ -1005,11 +836,10 @@ async fn tombstoned_row_hidden_from_select_and_count() -> Result<()> {
     Ok(())
 }
 
-/// `COUNT(*)` over a Delta-only, fully-flushed, timestamp-bounded window — the
-/// exact shape `count_pushdown` answers from add-action `numRecords`, and one
-/// `dedup_window_clean` will happily certify. Those stats count a tombstone as a
-/// row and the live version it retires as another, so the pushdown must decline
-/// wherever tombstones can exist; the answer here is 0, not 2.
+/// `COUNT(*)` over a Delta-only, flushed, timestamp-bounded window — the shape
+/// `count_pushdown` answers from add-action `numRecords`. Those stats count a
+/// tombstone and the live version it retires as two rows, so the pushdown must
+/// decline wherever tombstones can exist; the answer here is 0, not 2.
 #[serial]
 #[tokio::test]
 async fn count_pushdown_declines_where_tombstones_are_possible() -> Result<()> {
@@ -1028,26 +858,18 @@ async fn count_pushdown_declines_where_tombstones_are_possible() -> Result<()> {
         iso(ts + 60_000_000)
     );
     // A successful pushdown replaces the whole plan with a one-row in-memory
-    // exec; declining leaves the real scan (dedup + tombstone filter) standing.
+    // exec; declining leaves the real scan standing. Assert on the scan, NOT on
+    // `DedupExec` — a certified partition legitimately drops the dedup.
     let text = rendered(&physical_plan(&db, &sql).await?);
-    // A real scan must survive. NOT "DedupExec must survive": once the sweep
-    // certifies this partition the read-side skip legitimately removes it (there
-    // is one winning row per key by then — see
-    // `a_swept_mor_partition_holds_one_winning_row_per_key`), and asserting the
-    // operator instead of the property made this test pass only for as long as
-    // the partition happened never to be certified.
     assert!(text.contains("DeltaScanExec"), "count_pushdown must decline where tombstones can exist — it answered from add-action stats:\n{text}");
-    // Whichever way dedup resolves, the tombstone filter is what makes the count
-    // right, and it must be in the plan.
     assert!(text.contains("IS DISTINCT FROM true"), "the tombstone filter must be part of the counted plan:\n{text}");
 
     assert_eq!(routed_scalar(&db, &sql).await?, 0, "the tombstone wins its key and removes the row — stats would have said 2");
     Ok(())
 }
 
-/// The tombstone column is live (all NULL) before any tombstone is ever
-/// written: NULL must read as LIVE, so the filter is a provable no-op on
-/// pre-existing data — which is what lets a table declare the column at birth.
+/// NULL must read as LIVE, so the tombstone filter is a no-op on pre-existing
+/// data — which is what lets a table declare the column at birth.
 #[serial]
 #[tokio::test]
 async fn null_tombstone_is_live() -> Result<()> {
@@ -1060,10 +882,9 @@ async fn null_tombstone_is_live() -> Result<()> {
 }
 
 /// A predicate on the tombstone marker must NEVER be pushed into a scan leg:
-/// applied at the source it drops the tombstone row before the dedup, so the
-/// older live version wins and a deleted row silently resurrects. It is reported
-/// `Unsupported` (DataFusion keeps its own `FilterExec` above the whole scan)
-/// and stripped again inside `scan`.
+/// applied at the source it drops the tombstone before the dedup, so the older
+/// live version wins and a deleted row silently resurrects. Reported
+/// `Unsupported`, and stripped again inside `scan`.
 #[serial]
 #[tokio::test]
 async fn tombstone_predicate_is_not_pushed_into_the_scan() -> Result<()> {
@@ -1079,24 +900,22 @@ async fn tombstone_predicate_is_not_pushed_into_the_scan() -> Result<()> {
         "a tombstone-column predicate must never be pushed to the scan legs"
     );
 
-    // End to end: the dedup still runs under a user predicate on the marker —
-    // the predicate is applied above the whole scan, not inside a leg.
+    // End to end: the dedup still runs under a user predicate on the marker.
     let text = rendered(&physical_plan(&db, &format!("SELECT name FROM mor_versioned WHERE project_id = '{project_id}' AND deleted")).await?);
     assert!(text.contains("DedupExec"), "the dedup must still run under a tombstone predicate:\n{text}");
     Ok(())
 }
 
-/// The existing top-K path must still early-terminate: `ORDER BY timestamp DESC
-/// LIMIT n` must not regrow the blocking whole-window `SortExec` that
-/// `ordered_union_for_topk` exists to remove — every surviving sort carries a
-/// fetch (a TopK).
+/// `ORDER BY timestamp DESC LIMIT n` must not regrow the blocking whole-window
+/// `SortExec` that `ordered_union_for_topk` removes — every surviving sort
+/// carries a fetch (a TopK).
 #[serial]
 #[tokio::test]
 async fn topk_path_still_streams() -> Result<()> {
     let (db, project_id) = buffered_db("mor_topk").await?;
     let ts = chrono::Utc::now().timestamp_micros();
-    write(&db, &project_id, (0..8).map(|i| test_span_ts(&format!("t{i}"), "n", &project_id, ts - i * 1000)).collect(), true).await?;
-    write(&db, &project_id, vec![test_span_ts("t9", "n", &project_id, ts + 1000)], false).await?;
+    write_to(&db, "otel_logs_and_spans", &project_id, (0..8).map(|i| test_span_ts(&format!("t{i}"), "n", &project_id, ts - i * 1000)).collect(), true).await?;
+    write_to(&db, "otel_logs_and_spans", &project_id, vec![test_span_ts("t9", "n", &project_id, ts + 1000)], false).await?;
 
     let sql = format!("SELECT name FROM otel_logs_and_spans WHERE project_id = '{project_id}' ORDER BY timestamp DESC LIMIT 2");
     let text = rendered(&physical_plan(&db, &sql).await?);
@@ -1108,8 +927,7 @@ async fn topk_path_still_streams() -> Result<()> {
 }
 
 /// The URI + storage options `get_or_create_unified_table` will resolve for
-/// `table` under `cfg` — so a test can reach the SAME Delta table out-of-band
-/// and manufacture states TF's own write path would never produce.
+/// `table` under `cfg`, so a test can reach the SAME Delta table out-of-band.
 fn unified_table_location(cfg: &timefusion::config::AppConfig, table: &str) -> (String, std::collections::HashMap<String, String>) {
     let endpoint = cfg.aws.aws_s3_endpoint.clone();
     let uri = format!("s3://{}/{}/{}/?endpoint={}", cfg.aws.aws_s3_bucket.as_ref().unwrap(), cfg.core.timefusion_table_prefix, table, endpoint);
@@ -1127,6 +945,26 @@ fn unified_table_location(cfg: &timefusion::config::AppConfig, table: &str) -> (
     (uri, opts)
 }
 
+/// Pre-create `table`'s unified Delta at the OLD column set (the YAML minus
+/// `added`), at exactly the URI `get_or_create_unified_table` will resolve, so
+/// TF LOADS this table instead of creating one from the YAML. That skew is what
+/// a long-lived table is in; a table built from the current YAML proves nothing.
+async fn create_at_old_column_set(
+    cfg: &timefusion::config::AppConfig, table: &str, added: &[&str],
+) -> Result<(String, std::collections::HashMap<String, String>)> {
+    let schema = timefusion::schema::get_schema(table).expect("fixture registered");
+    let old_columns: Vec<_> = schema.columns()?.into_iter().filter(|c| !added.contains(&c.name().as_str())).collect();
+    assert_eq!(old_columns.len(), schema.columns()?.len() - added.len(), "the fixture must still declare the columns this test removes");
+    let (storage_uri, storage_options) = unified_table_location(cfg, table);
+    deltalake::operations::create::CreateBuilder::new()
+        .with_location(&storage_uri)
+        .with_columns(old_columns)
+        .with_partition_columns(schema.partitions.clone())
+        .with_storage_options(storage_options.clone())
+        .await?;
+    Ok((storage_uri, storage_options))
+}
+
 /// `table`'s Delta loaded OUT OF BAND, so a test can read the COMMITTED schema
 /// rather than TF's cached view of it.
 async fn load_out_of_band(cfg: &timefusion::config::AppConfig, table: &str) -> Result<deltalake::DeltaTable> {
@@ -1134,20 +972,17 @@ async fn load_out_of_band(cfg: &timefusion::config::AppConfig, table: &str) -> R
     Ok(deltalake::DeltaTableBuilder::from_url(url::Url::parse(&storage_uri)?)?.with_storage_options(storage_options).load().await?)
 }
 
-/// A `SchemaMode::Merge` write straight to `table`'s Delta, bypassing TF. This
-/// is the only way to manufacture the on-disk states TF's own (casting) write
-/// path never produces — a nullability-widened file, a row with no
-/// `updated_at` stamp — which is what makes those regressions testable at all.
+/// A `SchemaMode::Merge` write straight to `table`'s Delta, bypassing TF — the
+/// only way to manufacture on-disk states TF's own casting write path never
+/// produces (a nullability-widened file, a row with no `updated_at` stamp).
 async fn merge_write_out_of_band(cfg: &timefusion::config::AppConfig, table: &str, batches: Vec<datafusion::arrow::array::RecordBatch>) -> Result<()> {
     load_out_of_band(cfg, table).await?.write(batches).with_schema_mode(deltalake::operations::write::SchemaMode::Merge).await?;
     Ok(())
 }
 
-/// Column 0 of every row, as strings. otel string columns arrive as `Utf8View`
-/// on the routed path and `Utf8` elsewhere; `array_get_str` handles both, so a
-/// test never has to cast to assert on a value.
-fn col0_strings(batches: &[datafusion::arrow::array::RecordBatch]) -> Vec<String> {
-    batches.iter().flat_map(|b| (0..b.num_rows()).map(|i| array_get_str(b.column(0).as_ref(), i)).collect::<Vec<_>>()).collect()
+/// Column 0 of every row, as strings.
+fn col0_strings(batches: &[RecordBatch]) -> Vec<String> {
+    rows_of(batches, |b, i| str_at(b, 0, i))
 }
 
 /// `col0_strings` over a query run on an EXISTING context (the warmed one).
@@ -1155,67 +990,28 @@ async fn col0_in(ctx: &datafusion::prelude::SessionContext, sql: &str) -> Result
     Ok(col0_strings(&ctx.sql(sql).await?.collect().await?))
 }
 
-/// REGRESSION GUARD for the 7d68f01 prod outage (2026-07-31): adding a column to
-/// a table that ALREADY HAS live Delta data.
+/// Adding a column to a table that ALREADY HAS live Delta data. Ordinary tests
+/// create their Delta table FROM the YAML, so the two schemas always agree and
+/// the skew is invisible; this manufactures it by creating the table at a
+/// trimmed column set and then writing the FULL YAML column set through
+/// `insert_records_batch`. Both `skip_queue` variants are exercised.
 ///
-/// 7d68f01 appended two nullable columns (`updated_at`, `deleted`) to
-/// `otel_logs_and_spans`. Every local suite passed. Prod took 268 flush failures
-/// and rejected pgwire INSERTs within minutes:
-///
-///     Arrow error: Invalid argument error: number of columns(94) must match
-///     number of fields(92)
-///
-/// The suites passed because a test creates its Delta table FROM the YAML, so
-/// the YAML schema and the stored Delta schema always agree. Prod's tables were
-/// created months earlier and still declare the OLD column set. No amount of
-/// from-scratch testing can see that skew — this test manufactures it.
-///
-/// It creates the Delta table at a TRIMMED column set (the YAML minus its two
-/// trailing nullable columns — the same two columns, appended in the same place,
-/// as the change that broke prod), then drives a normal write carrying the FULL
-/// YAML column set through `Database::insert_records_batch`.
-///
-/// COVERS: the unified-table write path against a narrower-on-disk Delta schema
-/// — `prepare_staged_write`'s `evolves` detection, the staged `RecordBatchWriter`
-/// fast path, and the locked `WriteBuilder` + `SchemaMode::Merge` fallback — for
-/// a nullable column appended at the END, which is the only shape anyone has
-/// proposed adding. Both `skip_queue` variants (direct Delta commit and the
-/// buffered/flush path that produced the 268 failures) are exercised.
-///
-/// DOES NOT COVER: custom (BYO-bucket) project tables, which take a different
-/// `get_or_create_*` branch; non-nullable or mid-schema column insertions; type
-/// CHANGES to an existing column; the reverse skew (Delta wider than the YAML,
-/// i.e. a rollback); the tantivy sidecar and the dedup/optimize rewrite paths,
-/// which read the stored schema separately. A green run here is evidence that
-/// the plain write path tolerates the skew, NOT that a column addition is safe
-/// to deploy.
+/// DOES NOT COVER: custom (BYO-bucket) project tables, non-nullable or
+/// mid-schema insertions, type changes, the reverse skew (Delta wider than the
+/// YAML), or the tantivy/dedup/optimize paths, which read the stored schema
+/// separately. Green here means the plain write path tolerates the skew, not
+/// that a column addition is safe to deploy.
 #[serial]
 #[tokio::test]
 async fn adding_a_column_to_an_existing_table_is_caught() -> Result<()> {
-    use deltalake::operations::create::CreateBuilder;
-
     const TABLE: &str = "mor_versioned";
     let cfg = TestConfigBuilder::new("schema_skew").with_buffer_mode(BufferMode::Enabled).build();
 
-    // Pre-create the unified Delta table at the OLD column set, at exactly the
-    // URI `get_or_create_unified_table` will later resolve, so TF LOADS this
-    // table instead of creating one from the YAML.
-    let schema = timefusion::schema::get_schema(TABLE).expect("fixture registered");
     let added = ["updated_at", "deleted"];
-    let old_columns: Vec<_> = schema.columns()?.into_iter().filter(|c| !added.contains(&c.name().as_str())).collect();
-    assert_eq!(old_columns.len(), schema.columns()?.len() - added.len(), "the fixture must still declare the columns this test removes");
+    let (storage_uri, storage_options) = create_at_old_column_set(&cfg, TABLE, &added).await?;
 
-    let (storage_uri, storage_options) = unified_table_location(&cfg, TABLE);
-    CreateBuilder::new()
-        .with_location(&storage_uri)
-        .with_columns(old_columns)
-        .with_partition_columns(schema.partitions.clone())
-        .with_storage_options(storage_options.clone())
-        .await?;
-
-    // Wire the Delta write callback exactly as `bootstrap` does — without it a
-    // flush drains the MemBuffer and never reaches Delta, and this test's whole
-    // point is the Delta commit.
+    // Wire the Delta write callback as `bootstrap` does — without it a flush
+    // drains the MemBuffer and never reaches Delta.
     let db_inner = Database::with_config(Arc::clone(&cfg)).await?;
     let db_for_cb = db_inner.clone();
     let cb: timefusion::write::DeltaWriteCallback = Arc::new(move |project, table, batches, wm| {
@@ -1227,9 +1023,8 @@ async fn adding_a_column_to_an_existing_table_is_caught() -> Result<()> {
     let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
     let ts = chrono::Utc::now().timestamp_micros();
 
-    // The write path now builds batches at the FULL (wider) YAML column set
-    // while the loaded Delta table declares the narrower one. This is the exact
-    // skew that failed every prod flush.
+    // Batches are built at the FULL (wider) YAML column set while the loaded
+    // Delta table declares the narrower one.
     for (i, skip_queue) in [(0, true), (1, false)] {
         let rows = vec![mor_row(&format!("k{i}"), "v", &project_id, ts - i * 1000, None)];
         let batch = timefusion::support::test_helpers::json_to_batch_for(TABLE, rows)?;
@@ -1242,9 +1037,6 @@ async fn adding_a_column_to_an_existing_table_is_caught() -> Result<()> {
         })?;
     }
 
-    // Drain the buffered row through the FLUSH path — the leg that actually
-    // produced the 268 prod failures. Without this the MemBuffer row never
-    // reaches a Delta commit and the test would pass on the fast path alone.
     // Pre-flush the buffered row is served from the MemBuffer leg; both rows
     // must be visible through the routed scan.
     let where_ = format!("WHERE project_id = '{project_id}'");
@@ -1257,8 +1049,8 @@ async fn adding_a_column_to_an_existing_table_is_caught() -> Result<()> {
         "the added column must carry values — silently dropping it is the quieter form of this bug"
     );
 
-    // `flush_all_now` swallows per-bucket errors into `buckets_failed`; that
-    // counter IS the 268, so it is the assertion that matters.
+    // `flush_all_now` swallows per-bucket errors into `buckets_failed`, so that
+    // counter — not the Result — is the assertion that matters.
     let stats = layer.flush_all_now().await.map_err(|e| {
         anyhow::anyhow!(
             "flushing a buffered write into a Delta table created at an OLDER column set failed: {e}\n\
@@ -1268,16 +1060,14 @@ async fn adding_a_column_to_an_existing_table_is_caught() -> Result<()> {
     assert_eq!(stats.buckets_failed, 0, "a bucket failed to flush against the older Delta schema: {stats:?}");
     assert!(stats.total_rows > 0, "the flush must have moved the buffered row to Delta, got {stats:?}");
 
-    // Both rows are now physically in Delta. Read the log FRESH (not through
-    // TF's cached snapshot, which lags a flush) so this asserts what durably
-    // landed rather than what a cache remembers.
+    // Read the log FRESH: TF's cached snapshot lags a flush, so only an
+    // out-of-band load asserts what durably landed.
     let table = deltalake::DeltaTableBuilder::from_url(url::Url::parse(&storage_uri)?)?.with_storage_options(storage_options).load().await?;
     let snapshot = table.snapshot()?;
     let adds = snapshot.add_actions_table(true)?;
     let nr = adds.column_by_name("num_records").expect("num_records").as_primitive::<Int64Type>();
     let physical: i64 = (0..nr.len()).filter(|&i| !nr.is_null(i)).map(|i| nr.value(i)).sum();
     assert_eq!(physical, 2, "both rows must be durable in Delta after the flush");
-    // ...and the evolved stored schema really did gain the columns.
     let stored: Vec<String> = snapshot.schema().fields().map(|f| f.name().to_string()).collect();
     for c in added {
         assert!(stored.contains(&c.to_string()), "the write path did not evolve the stored Delta schema — `{c}` is still missing: {stored:?}");
@@ -1285,50 +1075,24 @@ async fn adding_a_column_to_an_existing_table_is_caught() -> Result<()> {
     Ok(())
 }
 
-/// REGRESSION GUARD for the 2026-07-31 dashboard outage — the SECOND failure
-/// from 7d68f01, and the one that survived the rollback.
+/// Aggregating over a column whose on-disk parquet is NULLABLE while the YAML
+/// (and the committed Delta schema) declare it NOT NULL. delta-rs merges
+/// nullability by union, so a `SchemaMode::Merge` write permanently widens the
+/// physical parquet without changing the Delta schema, and the logical/physical
+/// mismatch used to reject `GROUP BY time_bucket(timestamp)` while `GROUP BY`
+/// on a nullable-declared column kept working — both are asserted.
 ///
-/// While 7d68f01 was live TF wrote parquet into the LIVE `otel_logs_and_spans`
-/// table with `timestamp` NULLABLE, though the YAML declares it NOT NULL. Those
-/// files are permanent table content: no `metaData` action was ever committed
-/// (the Delta schema never changed), so rolling the binary back fixed nothing.
-/// Every logical plan still types `timestamp` NOT NULL from the YAML, and
-/// DataFusion rejected the resulting aggregate:
+/// The out-of-band merge write is essential: TF's staged write path casts to the
+/// table's arrow schema and does NOT widen, so `insert_records_batch` alone
+/// cannot reproduce the state.
 ///
-///     Internal error: Physical input schema should be the same as the one
-///     converted from logical input schema. Differences: field nullability at
-///     index 0 [timestamp]: (physical) true vs (logical) false.
-///
-/// which killed `GROUP BY time_bucket(timestamp)` on every project. `GROUP BY
-/// status_code` (a nullable-declared column) kept working — that asymmetry is
-/// the fingerprint, so this test asserts both.
-///
-/// Reproduces it through the SAME mechanism prod hit: a `SchemaMode::Merge`
-/// write. delta-rs merges nullability by UNION (`left.is_nullable() ||
-/// right.is_nullable()`, `kernel/schema/cast/merge_schema.rs:149`), so a
-/// nullable incoming batch permanently widens the physical parquet — while the
-/// committed Delta schema, which only changes when the STRUCTURAL schema does,
-/// stays NOT NULL. That merge path is exactly what `prepare_staged_write` falls
-/// back to when a batch carries a column the table lacks, which is why the
-/// column addition and the nullability widening were one event.
-///
-/// Note TF's normal (staged) write path casts to the table's arrow schema and
-/// does NOT widen — so a test that merely hands `insert_records_batch` a
-/// nullable batch passes with or without the flag and proves nothing. The
-/// out-of-band merge write below is what makes this a real guard.
-///
-/// Guards `datafusion.execution.skip_physical_aggregate_schema_check`.
-///
-/// HONESTY NOTE: with the state above reproduced exactly, this query passes on
-/// THIS branch whether or not the flag is set — the failure was observed on
-/// 5692555, and something in the scan path here already normalizes the schema.
-/// So it pins prod's on-disk state and the dashboards' query shape, but it does
-/// NOT by itself prove the flag is what keeps them working. Do not delete the
-/// flag on the strength of this test being green.
+/// Relates to `datafusion.execution.skip_physical_aggregate_schema_check`, but
+/// NOTE: this query passes on this branch with or without that flag, so a green
+/// run is not grounds for deleting it.
 #[serial]
 #[tokio::test]
 async fn aggregate_groups_on_a_nullability_widened_column() -> Result<()> {
-    use datafusion::arrow::{datatypes::Schema, record_batch::RecordBatch};
+    use datafusion::arrow::datatypes::Schema;
 
     const TABLE: &str = "otel_logs_and_spans";
     let cfg = TestConfigBuilder::new("nullability_widened").with_buffer_mode(BufferMode::Enabled).build();
@@ -1340,7 +1104,7 @@ async fn aggregate_groups_on_a_nullability_widened_column() -> Result<()> {
     let rows: Vec<_> = (0..2).map(|i| test_span_ts(&format!("n{i}"), "v", &project_id, ts + i * 1000)).collect();
     db.insert_records_batch(&project_id, TABLE, vec![json_to_batch(rows)?], true, None).await?;
 
-    // as the 7d68f01 binary did. Values untouched — only the field flags move.
+    // Write out-of-band with `timestamp`/`id` nullability widened; values untouched.
     let rows: Vec<_> = (2..4).map(|i| test_span_ts(&format!("n{i}"), "v", &project_id, ts + i * 1000)).collect();
     let batch = json_to_batch(rows)?;
     let widened: Vec<_> = batch
@@ -1353,16 +1117,13 @@ async fn aggregate_groups_on_a_nullability_widened_column() -> Result<()> {
 
     merge_write_out_of_band(&cfg, TABLE, vec![batch]).await?;
 
-    // Precondition: the file set really is nullability-widened. If this ever
-    // stops holding, the test below is green for the wrong reason.
+    // Precondition: the committed schema is untouched while the new file's footer
+    // says nullable. Without that mismatch the test is green for the wrong reason.
     let table = load_out_of_band(&cfg, TABLE).await?;
     let ts_field = table.snapshot()?.schema().field("timestamp").expect("timestamp declared").clone();
-    // The COMMITTED schema is untouched (no `metaData` action) while the file
-    // just written has `timestamp nullable = true` in its parquet footer —
-    // verified out-of-band against MinIO, and the exact state prod is in.
     assert!(!ts_field.is_nullable(), "the COMMITTED Delta schema must still say NOT NULL — that is the whole mismatch");
 
-    // THE production query shape. Without the skip flag this is an
+    // Without the skip flag this is an
     // `Internal error: Physical input schema should be the same ...`.
     let ctx = ctx_for(&db)?;
     let sql = format!("SELECT time_bucket('1 hour', timestamp) AS b, COUNT(*) AS c FROM {TABLE} WHERE project_id = '{project_id}' GROUP BY b");
@@ -1374,9 +1135,8 @@ async fn aggregate_groups_on_a_nullability_widened_column() -> Result<()> {
     })?;
     assert_eq!(got.iter().map(|b| b.num_rows()).sum::<usize>(), 1, "all four rows fall in one hour bucket");
 
-    // The asymmetry that identified the bug in prod: grouping on a column the
-    // YAML already declares nullable was never affected, so a green result there
-    // alone would NOT have proved anything.
+    // Grouping on an already-nullable column was never affected, so a green
+    // result here alone would prove nothing.
     let sql = format!("SELECT status_code, COUNT(*) FROM {TABLE} WHERE project_id = '{project_id}' GROUP BY status_code");
     assert_eq!(ctx.sql(&sql).await?.collect().await?.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
     Ok(())
@@ -1386,28 +1146,21 @@ async fn aggregate_groups_on_a_nullability_widened_column() -> Result<()> {
 ///
 /// Applied at the source it selects rows by a value belonging to a SUPERSEDED
 /// version AND removes the newer version from `DedupExec`'s input, so
-/// keep-greatest returns the stale row and it passes the same filter above. The
-/// row then reads back — and for an UPDATE, gets a new version written — under a
-/// value it no longer has. Found 2026-08-02 when `integration::test_update_
-/// operations` reported 3 rows matching `status_code = 'OK'` where 2 were
-/// correct, one of them already updated to 'ERROR'.
-///
-/// `Inexact` pushdown cannot fix this: re-applying the filter above the scan
-/// cannot recover a version the source already dropped.
+/// keep-greatest returns the stale row. `Inexact` pushdown cannot fix this:
+/// re-applying the filter above the scan cannot recover a version the source
+/// already dropped.
 #[serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_filter_on_an_updated_column_never_matches_the_superseded_version() -> Result<()> {
     let (db, project_id) = buffered_db("mor_mutable_filter").await?;
     let ts = chrono::Utc::now().timestamp_micros();
-    write(&db, &project_id, vec![test_span_ts("row", "before", &project_id, ts)], true).await?;
+    write_to(&db, "otel_logs_and_spans", &project_id, vec![test_span_ts("row", "before", &project_id, ts)], true).await?;
 
     let ctx = ctx_for(&db)?;
     ctx.sql(&format!("UPDATE otel_logs_and_spans SET hashes = make_array('after') WHERE project_id = '{project_id}' AND id = 'row'")).await?.collect().await?;
 
-    // Filter the column the UPDATE actually touched. `hashes` is the one
-    // declared-mutable column, so its predicate must stay ABOVE the dedup;
-    // filtering an immutable column here would prove nothing, since those
-    // are pushed to the legs precisely because no UPDATE can change them.
+    // `hashes` is the one declared-mutable column, so its predicate must stay
+    // ABOVE the dedup; filtering an immutable column here would prove nothing.
     let count = |name: &str| format!("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = '{project_id}' AND array_element(hashes, 1) = '{name}'");
     assert_eq!(scalar_in(&ctx, &count("after")).await?, 1, "the current version must match its own value");
     assert_eq!(
@@ -1418,15 +1171,9 @@ async fn a_filter_on_an_updated_column_never_matches_the_superseded_version() ->
     Ok(())
 }
 
-/// THE state prod is in on the first deploy after the merge-on-read flip: every
-/// row already in Delta was written before `updated_at` existed, so its stamp is
-/// NULL, while every new version carries a real one.
-///
-/// If keep-greatest let NULL win, every UPDATE after the deploy would silently
-/// do nothing — the row would keep reading back at its pre-update value with no
-/// error anywhere. The `mor_versioned` fixture cannot catch this: TF stamps
-/// everything it writes, so a legacy NULL-stamped row has to be manufactured
-/// out-of-band, exactly as the nullability-widening regression above does.
+/// A row written before `updated_at` existed has a NULL stamp; a stamped version
+/// must beat it, or every UPDATE against such a row is a silent no-op. The row
+/// has to be manufactured out-of-band because TF stamps everything it writes.
 #[serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_legacy_null_stamped_row_loses_to_a_stamped_version() -> Result<()> {
@@ -1436,10 +1183,9 @@ async fn a_legacy_null_stamped_row_loses_to_a_stamped_version() -> Result<()> {
     let project_id = new_project_id();
     let ts = hours_ago(3);
 
-    // A normal write, to create the table.
-    db.insert_records_batch(&project_id, TABLE, vec![json_to_batch(vec![test_span_ts("other", "v", &project_id, ts)])?], true, None).await?;
+    commit_span(&db, &project_id, "other", "v", ts).await?;
 
-    // leaves `updated_at` NULL just like every pre-migration row in prod.
+    // An out-of-band write leaves `updated_at` NULL, like a pre-migration row.
     let batch = json_to_batch(vec![test_span_ts("legacy", "before", &project_id, ts)])?;
     assert!(
         batch.column_by_name("updated_at").is_none_or(|c| c.null_count() == c.len()),
@@ -1453,8 +1199,6 @@ async fn a_legacy_null_stamped_row_loses_to_a_stamped_version() -> Result<()> {
 
     ctx.sql(&format!("UPDATE {TABLE} SET hashes = make_array('after') WHERE project_id = '{project_id}' AND id = 'legacy'")).await?.collect().await?;
 
-    // The appended version carries a real stamp; the legacy row's is NULL. The
-    // stamped version MUST win, and there must be exactly one logical row left.
     assert_eq!(
         col0_in(&ctx, &sql).await?,
         vec!["after"],
@@ -1463,42 +1207,20 @@ async fn a_legacy_null_stamped_row_loses_to_a_stamped_version() -> Result<()> {
     Ok(())
 }
 
-/// The migration that must run BEFORE a shipped table's YAML may declare new
-/// columns.
-///
-/// `otel_logs_and_spans` and `otel_metrics` cannot turn on `version_append`
-/// without two new columns: a TF-owned tiebreak (the stamp OVERWRITES whatever
-/// the client sent, so it must not reuse a client field like
-/// `observed_timestamp`) and a nullable Boolean tombstone. Widening the YAML
-/// alone is what broke prod in 7d68f01. `migrate_add_columns` widens STORAGE
-/// first, so the YAML change that follows is a no-op for the stored schema.
-///
-/// The fixture creates the table at the OLD column set — the state every live
-/// prod table is in — because a table built from the current YAML already has
-/// the columns and would prove nothing.
+/// `migrate_add_columns` widens STORAGE first, so a later YAML change declaring
+/// the same columns is a no-op for the stored schema. Widening the YAML alone is
+/// not safe. The fixture creates the table at the OLD column set, because a
+/// table built from the current YAML already has the columns.
 #[tokio::test(flavor = "multi_thread")]
 #[serial_test::serial]
 async fn migrate_add_columns_widens_the_stored_schema_and_is_idempotent() -> Result<()> {
-    use deltalake::operations::create::CreateBuilder;
-
     const TABLE: &str = "mor_versioned";
     let cfg = TestConfigBuilder::new("migrate_cols").with_buffer_mode(BufferMode::Enabled).build();
-
-    let schema = timefusion::schema::get_schema(TABLE).expect("fixture registered");
-    let added = ["updated_at", "deleted"];
-    let old_columns: Vec<_> = schema.columns()?.into_iter().filter(|c| !added.contains(&c.name().as_str())).collect();
-    let (storage_uri, storage_options) = unified_table_location(&cfg, TABLE);
-    CreateBuilder::new()
-        .with_location(&storage_uri)
-        .with_columns(old_columns)
-        .with_partition_columns(schema.partitions.clone())
-        .with_storage_options(storage_options)
-        .await?;
+    create_at_old_column_set(&cfg, TABLE, &["updated_at", "deleted"]).await?;
 
     let db = Database::with_config(Arc::clone(&cfg)).await?;
     let adds = vec![("updated_at".to_string(), "timestamp".to_string()), ("deleted".to_string(), "boolean".to_string())];
 
-    // Dry run must report the work without committing any of it.
     let dry = db.migrate_add_columns(TABLE, &adds, true).await?;
     assert_eq!(dry.added.len(), 2, "dry run must report both missing columns");
     assert_eq!(dry.stored_after, dry.stored_before, "dry run must not change the stored schema");
@@ -1507,19 +1229,13 @@ async fn migrate_add_columns_widens_the_stored_schema_and_is_idempotent() -> Res
     assert_eq!(first.added.len(), 2, "both columns must be added to the STORED schema, got {:?}", first.added);
     assert_eq!(first.stored_after, first.stored_before + 2, "stored column count must grow by exactly the two added");
 
-    // Idempotent: re-running after a crash or a partial rollout must be a no-op,
-    // not a second commit that re-adds the columns.
+    // Idempotent: re-running must be a no-op, not a second commit.
     let second = db.migrate_add_columns(TABLE, &adds, false).await?;
     assert!(second.added.is_empty(), "re-running the migration must add nothing, got {:?}", second.added);
     assert_eq!(second.stored_before, first.stored_after, "the second run must observe the widened schema");
 
-    // A ROLLUP MEASURE must be migratable, or the documented rule — widen
-    // storage first, only then declare it in YAML — cannot be followed for the
-    // one kind of column most likely to be added. It could not: only
-    // timestamp|boolean were supported, while counts are Int64, sums/min/max
-    // Int64 or Float64, and `tdigest`/`hll` states are Binary. That is why
-    // `duration_digest` was declared on 2026-08-22 without a migration, and why
-    // every derived unit over the 1m tier then failed to plan.
+    // Rollup measure types must be migratable: counts are Int64, sums/min/max
+    // Int64 or Float64, and `tdigest`/`hll` states are Binary.
     let measures =
         vec![("m_count".to_string(), "bigint".to_string()), ("m_ratio".to_string(), "double".to_string()), ("m_digest".to_string(), "binary".to_string())];
     let widened = db.migrate_add_columns(TABLE, &measures, false).await?;
@@ -1527,11 +1243,8 @@ async fn migrate_add_columns_widens_the_stored_schema_and_is_idempotent() -> Res
     assert_eq!(widened.stored_after, widened.stored_before + 3);
     assert!(db.migrate_add_columns(TABLE, &measures, false).await?.added.is_empty(), "measure migration must be idempotent too");
 
-    // A promoted ATTRIBUTE must be migratable for the same reason, and it is
-    // the ordinary case rather than the exotic one: every promoted OTel
-    // attribute that is not a count or a timestamp is Utf8. Without `text` the
-    // documented order could be followed for a rollup measure and not for
-    // `attributes___http___route`.
+    // A promoted OTel attribute that is not a count or timestamp is Utf8, so
+    // `text`/`string` must be migratable too.
     let attrs = vec![("a_route".to_string(), "text".to_string()), ("a_alias".to_string(), "string".to_string())];
     let widened_attrs = db.migrate_add_columns(TABLE, &attrs, false).await?;
     assert_eq!(widened_attrs.added.len(), 2, "a Utf8 attribute column must be migratable, got {:?}", widened_attrs.added);
@@ -1544,7 +1257,6 @@ async fn migrate_add_columns_widens_the_stored_schema_and_is_idempotent() -> Res
         assert!(format!("{:?}", f.data_type()).contains("String"), "a_route must land as a string, got {:?}", f.data_type());
     }
 
-    // An unknown type must still be refused rather than guessed at.
     assert!(db.migrate_add_columns(TABLE, &[("m_bad".to_string(), "decimal".to_string())], true).await.is_err());
 
     Ok(())
@@ -1553,12 +1265,6 @@ async fn migrate_add_columns_widens_the_stored_schema_and_is_idempotent() -> Res
 /// The hot-tail skip, end to end: with the default ON, a reconcile whose only
 /// uncovered files are in TODAY's partition builds nothing — while the census
 /// still counts them, so the today/week/older breakdown stays honest.
-///
-/// The unit case table pins the RULE; this pins the WIRING, which is the half
-/// that can silently regress (a flag read in the wrong place looks identical to
-/// a flag that works). It matters because this default ships ON: today's files
-/// are covered at birth by the flush callback and the two inline-reindex paths,
-/// so what is deferred is re-indexing churn, not first coverage.
 #[serial]
 #[tokio::test]
 async fn tantivy_backfill_skips_todays_partition_but_the_census_still_counts_it() -> Result<()> {
@@ -1570,12 +1276,11 @@ async fn tantivy_backfill_skips_todays_partition_but_the_census_still_counts_it(
         Arc::new(TantivyIndexService::new(store, Arc::new(cfg.tantivy.clone()), std::env::temp_dir().join(format!("tf-scratch-{}", uuid::Uuid::new_v4()))));
     let db = Arc::new(Database::with_config(Arc::clone(&cfg)).await?.with_tantivy_indexer(svc));
     let project_id = new_project_id();
-    // Must land in TODAY's partition whatever the hour: `now - 2h` falls into
-    // YESTERDAY between 00:00 and 02:00 UTC, which is not skipped, and the test
-    // would fail for two hours a day.
+    // Must land in TODAY's partition whatever the hour: a bare `now - 2h` falls
+    // into YESTERDAY between 00:00 and 02:00 UTC, which is not skipped.
     let now = chrono::Utc::now();
     let ts = (now - chrono::Duration::hours(2)).max(now.date_naive().and_hms_opt(0, 0, 1).unwrap().and_utc()).timestamp_micros();
-    db.insert_records_batch(&project_id, TABLE, vec![json_to_batch(vec![test_span_ts("hot", "n", &project_id, ts)])?], true, None).await?;
+    commit_span(&db, &project_id, "hot", "n", ts).await?;
 
     let (uncovered, _, _) = db.tantivy_coverage_census().await?;
     assert!(uncovered >= 1, "the census must still SEE today's uncovered files, got {uncovered}");
@@ -1584,32 +1289,21 @@ async fn tantivy_backfill_skips_todays_partition_but_the_census_still_counts_it(
     Ok(())
 }
 
-/// Regression (2026-08-02): the optimize CLI built its `Database` without a
-/// tantivy service, so `tantivy_indexer()` was `None` and every off-box
-/// compaction silently skipped both the output reindex and the input GC —
-/// orphaned manifest entries accumulated and compacted files stayed
-/// unindexed until a server-boot backfill. `tantivy_reconcile_table` is the
-/// CLI's post-run repair; it must also visit the per-uuid manifests that the
-/// in-server hook's fixed "default"+customs GC list never reaches.
+/// `tantivy_reconcile_table` is the optimize CLI's post-run repair: it must
+/// backfill uncovered files AND GC stale entries, including the per-uuid
+/// manifests the in-server hook's fixed "default"+customs list never reaches.
 #[serial]
 #[tokio::test]
 async fn tantivy_reconcile_backfills_new_files_and_gcs_orphans() -> Result<()> {
     use timefusion::tantivy::{load_manifest, search::TantivyIndexService};
     const TABLE: &str = "otel_logs_and_spans";
     // The rows below land in TODAY's partition, which the backfill skips by
-    // default (`timefusion_tantivy_backfill_skip_today`) because today is churn.
-    // This test is about the CLI repair path's backfill+GC mechanics, so it opts
-    // out — and asserts the default's effect first, so the opt-out cannot hide a
-    // regression in either direction.
-    let cfg = {
-        let mut cfg = (*TestConfigBuilder::new("tantivy_reconcile").with_buffer_mode(BufferMode::Enabled).build()).clone();
-        assert!(
-            cfg.tantivy.timefusion_tantivy_backfill_skip_today,
-            "the hot-tail skip must be ON by default — this test's opt-out is what makes it meaningful"
-        );
-        cfg.tantivy.timefusion_tantivy_backfill_skip_today = false;
-        Arc::new(cfg)
-    };
+    // default. This test is about backfill+GC mechanics, so it opts out — after
+    // asserting the default, so the opt-out cannot hide a regression.
+    let cfg = tuned_cfg("tantivy_reconcile", |c| {
+        assert!(c.tantivy.timefusion_tantivy_backfill_skip_today, "the hot-tail skip must be ON by default — this test's opt-out is what makes it meaningful");
+        c.tantivy.timefusion_tantivy_backfill_skip_today = false;
+    });
     let tantivy_store: Arc<dyn object_store::ObjectStore> = Arc::new(object_store::memory::InMemory::new());
     let svc = Arc::new(TantivyIndexService::new(
         tantivy_store.clone(),
@@ -1620,23 +1314,20 @@ async fn tantivy_reconcile_backfills_new_files_and_gcs_orphans() -> Result<()> {
     let project_id = new_project_id();
     let ts = hours_ago(3);
 
-    // Two direct commits → two live parquet files, neither indexed (the
-    // direct insert path has no flush-time index callback).
-    let row = |id: &str| -> Result<_> { json_to_batch(vec![test_span_ts(id, "n", &project_id, ts)]) };
-    db.insert_records_batch(&project_id, TABLE, vec![row("id_a")?], true, None).await?;
-    db.insert_records_batch(&project_id, TABLE, vec![row("id_b")?], true, None).await?;
+    // Two direct commits → two live parquet files, neither indexed (the direct
+    // insert path has no flush-time index callback).
+    for id in ["id_a", "id_b"] {
+        commit_span(&db, &project_id, id, "n", ts).await?;
+    }
 
     // Seed the global gauge so an unwritten zero cannot pass the census checks.
     let tantivy_stats = timefusion::observability::maintenance_stats();
     let ordering = std::sync::atomic::Ordering::Relaxed;
     tantivy_stats.tantivy_uncovered_files.store(999, ordering);
 
-    // Only the all-table census owns global coverage totals.
     let (uncovered_before, _, by_age_before) = db.tantivy_coverage_census().await?;
     assert!(uncovered_before >= 2, "census must count uncovered live files before any build, got {uncovered_before}");
-    // The age split must partition the total, not merely exist: it is what
-    // separates "a rewrite path is minting uncovered files" from "an old
-    // backlog", and those want opposite fixes.
+    // The age split must partition the total, not merely exist.
     assert_eq!(by_age_before.iter().sum::<u64>(), uncovered_before, "age buckets must account for every uncovered file: {by_age_before:?}");
 
     assert_eq!(db.tantivy_reconcile_table("mor_versioned").await?, (0, 0, 0));
@@ -1656,12 +1347,9 @@ async fn tantivy_reconcile_backfills_new_files_and_gcs_orphans() -> Result<()> {
     let m = load_manifest(tantivy_store.as_ref(), TABLE, &project_id).await?;
     assert_eq!(m.entries.len(), 2, "per-uuid manifest covers both files");
 
-    // Compact 2 files → 1: the inputs' entries are now stale.
     let table_ref = table_of(&db, TABLE).await;
     db.compact_date_concurrent(&table_ref, TABLE, date_of(ts), Some(&project_id), None).await?;
 
-    // Reconcile #2: stale entries GC'd (via manifest enumeration — the fixed
-    // "default" list would miss this manifest) and the output file covered.
     let (_, removed2, _) = db.tantivy_reconcile_table(TABLE).await?;
     assert!(removed2 >= 2, "pre-compaction entries must be GC'd, removed={removed2}");
     let m = load_manifest(tantivy_store.as_ref(), TABLE, &project_id).await?;
@@ -1687,14 +1375,10 @@ fn yesterday_noon() -> i64 {
     noon_days_ago(1)
 }
 
-/// Two versions of ONE key, committed separately so they land in separate files
-/// — the shape merge-on-read produces for an UPDATE.
-///
-/// The versions differ only in `hashes`, the column declared `mutable: true`.
-/// Differing in an immutable column instead would violate the contract the
-/// read-side pushdown rests on, which is what these tests exist to police.
-/// `stamp_version` gives the second commit the greater `updated_at`, so
-/// `"updated"` is the winner and `"original"` the superseded version.
+/// Two versions of ONE key in separate files — the shape merge-on-read produces
+/// for an UPDATE. They differ only in `hashes` (the `mutable: true` column);
+/// the second commit gets the greater `updated_at`, so `"updated"` wins and
+/// `"original"` is the superseded version.
 async fn commit_two_hash_versions(db: &Arc<Database>, project_id: &str, ts: i64) -> Result<()> {
     for tag in ["original", "updated"] {
         let mut value = test_span_ts("mor_key", "span", project_id, ts);
@@ -1708,9 +1392,7 @@ async fn commit_two_hash_versions(db: &Arc<Database>, project_id: &str, ts: i64)
 /// `timefusion_read_dedup_skip_swept` is off by default, so these fixtures are
 /// the only place that path runs until an operator opts in.
 async fn skip_swept_db(name: &str) -> Result<(Arc<Database>, String)> {
-    let mut cfg = (*TestConfigBuilder::new(name).with_buffer_mode(BufferMode::Enabled).build()).clone();
-    cfg.maintenance.timefusion_read_dedup_skip_swept = true;
-    db_of(Arc::new(cfg)).await
+    tuned_db(name, |c| c.maintenance.timefusion_read_dedup_skip_swept = true).await
 }
 
 /// Rows whose `hashes[0]` equals `val` in the single-instant window at `ts`,
@@ -1726,17 +1408,8 @@ async fn hash_matches(db: &Arc<Database>, project_id: &str, ts: i64, val: &str) 
 }
 
 /// The safety precondition for dropping the read-side `DedupExec` on a swept
-/// partition — the change that would reclaim the `id` projection (43% of a
-/// file's bytes) for charts and `count(*)`. See
-/// `docs/plans/2026-08-09-per-date-dedup.md`.
-///
-/// `dedup_skip_allowed` refuses outright when a table sets `version_append`,
-/// on the belief that merge-on-read leaves superseded versions a skip would
-/// serve. Inspection says otherwise — the sweep calls `dedup_batches` with the
-/// schema tiebreak (keep-greatest), and `filter_tombstones` runs OUTSIDE
-/// `match dedup_on` so deletes never depend on dedup. This asserts it by
-/// EXECUTION, because inspection cannot rule out an ordering interaction and
-/// serving a superseded row is silent corruption.
+/// partition: after the sweep a certified partition holds exactly one row per
+/// key, even on a `version_append` table.
 ///
 /// Deliberately reads PHYSICAL rows (Delta log stats), never a routed query:
 /// the read-side dedup would mask exactly the property under test.
@@ -1752,9 +1425,6 @@ async fn a_swept_mor_partition_holds_one_winning_row_per_key() -> Result<()> {
 
     db.dedup_today_partitions(&table_ref, "otel_logs_and_spans", "otel_logs_and_spans").await?;
 
-    // THE claim: after the sweep a certified partition holds exactly one row
-    // per key. If this ever fails, the `version_append` bail is load-bearing
-    // and the per-date dedup skip must NOT be built on top of it.
     assert_eq!(
         delta_physical_row_count(&table_ref).await?,
         1,
@@ -1765,15 +1435,7 @@ async fn a_swept_mor_partition_holds_one_winning_row_per_key() -> Result<()> {
 
 /// End-to-end guard for the read-side dedup skip on a merge-on-read table:
 /// a certified partition must return the UPDATED value, never the superseded
-/// one. See `docs/plans/2026-08-09-per-date-dedup.md`.
-///
-/// The skip removes `DedupExec` and (now) the dedup-key projection with it —
-/// `id` alone is 43% of an otel file's bytes. Its whole safety rests on the
-/// sweep having collapsed each key to its winner, so this asserts the winner is
-/// what a query actually gets, through the routed scan rather than the log.
-///
-/// `timefusion_read_dedup_skip_swept` is off by default, so this is the only
-/// place the path runs until an operator opts in.
+/// one — asserted through the routed scan rather than the Delta log.
 #[serial]
 #[tokio::test]
 async fn dedup_skip_on_a_swept_mor_partition_returns_the_updated_row() -> Result<()> {
@@ -1784,7 +1446,6 @@ async fn dedup_skip_on_a_swept_mor_partition_returns_the_updated_row() -> Result
     let table_ref = table_of(&db, "otel_logs_and_spans").await;
     db.dedup_today_partitions(&table_ref, "otel_logs_and_spans", "otel_logs_and_spans").await?;
 
-    // Through the routed scan, which is where a wrong skip would show up.
     let sql = format!(
         "SELECT array_element(hashes, 1) FROM otel_logs_and_spans WHERE project_id = '{project_id}' \
          AND timestamp >= {ts} AND timestamp <= {ts}",
@@ -1797,27 +1458,21 @@ async fn dedup_skip_on_a_swept_mor_partition_returns_the_updated_row() -> Result
     Ok(())
 }
 
-/// Dedup-as-you-compact (docs/plans/2026-08-20 §3): with
-/// `timefusion_compact_dedup_merge` on, the on-demand compaction path
-/// (`compact_date`) must collapse merge-on-read versions WHILE merging files —
-/// one physical row per (timestamp, id) key, the greatest `updated_at` winning —
-/// and must RETAIN tombstones (a key whose winning version carries
-/// `deleted=true` keeps that row; dropping it would resurrect the base row).
+/// With `timefusion_compact_dedup_merge` on, `compact_date` must collapse
+/// merge-on-read versions while merging files — one physical row per
+/// (timestamp, id), greatest `updated_at` winning — and must RETAIN tombstones
+/// (dropping a `deleted=true` winner would resurrect the base row).
 ///
-/// Physical rows are asserted via the Delta log (`delta_physical_row_count`);
-/// the read-side DedupExec would mask exactly the property under test.
+/// Physical rows are asserted via the Delta log; the read-side DedupExec would
+/// mask exactly the property under test.
 #[serial]
 #[tokio::test]
 async fn compact_dedup_merge_collapses_versions_and_retains_tombstones() -> Result<()> {
-    let mut cfg = (*TestConfigBuilder::new("compact_dedup_merge").with_buffer_mode(BufferMode::Enabled).build()).clone();
-    cfg.maintenance.timefusion_compact_dedup_merge = true;
-    let (db, project_id) = db_of(Arc::new(cfg)).await?;
+    let (db, project_id) = tuned_db("compact_dedup_merge", |c| c.maintenance.timefusion_compact_dedup_merge = true).await?;
     let ts = yesterday_noon();
 
-    // Key A: two versions across two files, the second one the survivor.
     commit_two_hash_versions(&db, &project_id, ts).await?;
-    // Key B: a tombstone — its (single, winning) version marks deletion. The
-    // merge must carry it through verbatim, never drop it.
+    // Key B: a tombstone the merge must carry through verbatim.
     let tombstone = {
         let mut value = test_span_ts("dead_key", "span", &project_id, ts + 1);
         value["deleted"] = serde_json::json!(true);
@@ -1831,44 +1486,25 @@ async fn compact_dedup_merge_collapses_versions_and_retains_tombstones() -> Resu
     let date = date_of(ts);
     db.compact_date(&table_ref, "otel_logs_and_spans", date, Some(&project_id)).await?;
 
-    // THE claim: the merged output is unique-within — one physical row per key.
     // The 2 includes key B's tombstone: dropping it would have left 1.
     assert_eq!(delta_physical_row_count(&table_ref).await?, 2, "post-compact: key A collapsed to its winner, key B's tombstone retained");
-    // Through the read path: key A's greatest-updated_at version is what a query
-    // gets; key B is invisible — its retained tombstone keeps suppressing it
-    // (which is exactly why the row must survive the merge physically).
     let rows = db
         .query_delta_only(&format!("SELECT id, array_element(hashes, 1) AS tag FROM otel_logs_and_spans WHERE project_id = '{project_id}' ORDER BY id"))
         .await?;
-    let got: Vec<(String, String)> = rows
-        .iter()
-        .flat_map(|b| (0..b.num_rows()).map(|i| (array_get_str(b.column(0).as_ref(), i), array_get_str(b.column(1).as_ref(), i))).collect::<Vec<_>>())
-        .collect();
+    let got: Vec<(String, String)> = rows_of(&rows, |b, i| (str_at(b, 0, i), str_at(b, 1, i)));
     assert_eq!(got, vec![("mor_key".into(), "updated".into())], "the greatest-updated_at version wins and the tombstoned key stays suppressed");
     Ok(())
 }
 
-/// Regression, prod 2026-08-09 → 08-11: every 5-minute service-map rollup failed with
-///
-///     Internal error: DedupExec key `id` not in input schema
-///
-/// from the day `f1f0b90` enabled the swept-partition dedup skip by default.
-///
-/// The shape is the rollup's own: a date whose Delta partition the sweep has CERTIFIED,
-/// plus fresher rows for that date still sitting in the MemBuffer. `pre_skip_dedup` reads
-/// the certified Delta partition and drops the dedup keys from the scan projection — but
-/// the mem ∪ delta union path "never grants `skip_dedup`" (see the exclusion-range comment
-/// in `ProjectRoutingTable::scan`), so a `DedupExec` is still built, over a scan that no
-/// longer carries `id`.
-///
-/// The query must project neither a dedup key nor the tombstone marker, which is what the
-/// dispatcher's `SELECT DISTINCT project_id` does.
+/// A CERTIFIED Delta partition plus fresher MemBuffer rows for the same date,
+/// queried without projecting a dedup key or the tombstone marker. `pre_skip_dedup`
+/// drops the dedup keys from the scan projection while the mem ∪ delta union path
+/// never grants `skip_dedup`, so a `DedupExec` could be built over a scan that no
+/// longer carries `id` (`Internal error: DedupExec key 'id' not in input schema`).
 #[serial]
 #[tokio::test]
 async fn a_certified_partition_with_buffered_rows_still_answers_without_the_keys_projected() -> Result<()> {
-    let mut cfg = (*TestConfigBuilder::new("dedup_skip_mem_union").with_buffer_mode(BufferMode::Enabled).build()).clone();
-    cfg.maintenance.timefusion_read_dedup_skip_swept = true;
-    let cfg = Arc::new(cfg);
+    let cfg = tuned_cfg("dedup_skip_mem_union", |c| c.maintenance.timefusion_read_dedup_skip_swept = true);
     let db0 = Database::with_config(Arc::clone(&cfg)).await?;
     let layer = Arc::new(timefusion::support::test_helpers::test_layer(Arc::clone(&cfg))?.with_delta_writer(timefusion::server::delta_write_callback(&db0)));
     let db = Arc::new(db0.with_buffered_layer(Arc::clone(&layer)));
@@ -1879,18 +1515,16 @@ async fn a_certified_partition_with_buffered_rows_still_answers_without_the_keys
     let (lo, hi) = (day.and_hms_opt(0, 0, 0).unwrap().and_utc().to_rfc3339(), day.and_hms_opt(23, 59, 59).unwrap().and_utc().to_rfc3339());
 
     // Delta leg: committed directly, then swept so the partition is certified.
-    db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![json_to_batch(vec![test_span_ts("settled", "delta", &project_id, ts)])?], true, None)
-        .await?;
+    commit_span(&db, &project_id, "settled", "delta", ts).await?;
     let table_ref = table_of(&db, "otel_logs_and_spans").await;
     db.dedup_today_partitions(&table_ref, "otel_logs_and_spans", "otel_logs_and_spans").await?;
 
     // MemBuffer leg: same date, never flushed — this is what makes it a union.
-    db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![json_to_batch(vec![test_span_ts("buffered", "mem", &project_id, ts + 1)])?], false, None)
-        .await?;
+    write_to(&db, "otel_logs_and_spans", &project_id, vec![test_span_ts("buffered", "mem", &project_id, ts + 1)], false).await?;
 
     let ctx = ctx_for(&db)?;
-    // Warm the fast-resolve cache the way a live process is warm: `pre_skip_dedup` reads it,
-    // and a cold cache leaves the skip off — which is why this never reproduced in-harness.
+    // Warm the fast-resolve cache: `pre_skip_dedup` reads it, and a cold cache
+    // leaves the skip off entirely.
     let _ = ctx.sql(&format!("SELECT id FROM otel_logs_and_spans WHERE project_id = '{project_id}'")).await?.collect().await?;
 
     // `name` is neither a dedup key (timestamp, id) nor the tombstone marker.
@@ -1907,33 +1541,21 @@ async fn a_certified_partition_with_buffered_rows_still_answers_without_the_keys
 }
 
 /// A predicate on a version-MUTABLE column, pushed into the Delta leg because
-/// the window is sweep-certified. This is the half of the swept-partition work
-/// that reclaims ROWS rather than the key projection: prod 2026-08-09 measured
-/// monoscope-self decoding 15.97 M rows to keep 35.89 K (445x) because
-/// `version_mutable_columns` withheld every dashboard predicate and only
-/// `timestamp >=` ever reached Parquet.
+/// the window is sweep-certified. Pushing such a predicate BELOW the dedup
+/// normally drops the newer version of a key and leaves keep-greatest serving
+/// the superseded one; the claim is that a certified partition has no superseded
+/// version to serve. Asserts BOTH directions: the new value is found, the old is not.
 ///
-/// It is also the change most able to corrupt a read. Pushing such a predicate
-/// BELOW the dedup normally drops the newer version of a key and leaves
-/// keep-greatest serving the superseded one — `WHERE status_code = 'OK'`
-/// matching a row already updated to 'ERROR' (2026-08-02,
-/// `integration::test_update_operations`). The claim is that a certified
-/// partition has no superseded version to serve, so this asserts BOTH
-/// directions: the new value is found, and the old value is NOT.
-///
-/// The UNCERTIFIED case is the guard on the certified one: it must NOT get the
-/// pushdown, and must still answer correctly. Same two versions, but no sweep —
-/// so `dedup_skip_allowed` refuses, the mutable predicate is re-stripped by
-/// `leg_safe`, `DedupExec` runs, and the FilterExec above it rejects the stale
-/// match. If the pushdown ever escapes its certification gate that case is what
-/// catches it, because there the superseded row really is still on disk.
+/// The UNCERTIFIED case is the guard: no sweep, so `dedup_skip_allowed` refuses,
+/// the predicate is re-stripped by `leg_safe` and `DedupExec` runs. There the
+/// superseded row really is still on disk, so an escaped pushdown shows up.
 #[test_case("swept_pushdown_mutable", true ; "a certified partition may push the predicate")]
 #[test_case("uncertified_no_pushdown", false ; "an uncertified window keeps the dedup above the scan")]
 #[serial]
 #[tokio::test]
 async fn a_mutable_predicate_never_matches_the_superseded_row(name: &str, certified: bool) -> Result<()> {
     // The skip is ON in BOTH cases: the uncertified case must be refused by the
-    // certification gate, not by the flag happening to be off.
+    // certification gate, not by the flag being off.
     let (db, project_id) = skip_swept_db(name).await?;
     let ts = yesterday_noon();
     commit_two_hash_versions(&db, &project_id, ts).await?;
@@ -1984,9 +1606,8 @@ async fn rollup_env(name: &str) -> Result<RollupEnv> {
     rollup_env_of(TestConfigBuilder::new(name).with_buffer_mode(BufferMode::Enabled).with_rollups().build()).await
 }
 
-/// The same scaffold over a config the caller tweaked — a backfill horizon, a
-/// restart over the SAME storage prefix — where the `Arc<AppConfig>` itself has
-/// to outlive the `Database` built from it.
+/// The same scaffold over a caller-tweaked config, which must outlive the
+/// `Database` built from it.
 async fn rollup_env_of(cfg: Arc<timefusion::config::AppConfig>) -> Result<RollupEnv> {
     let (db, project_id) = db_of(cfg).await?;
     Ok(RollupEnv {
@@ -2006,9 +1627,7 @@ impl RollupEnv {
         self.insert_row(id, ts, service, duration, "OK", summary).await
     }
 
-    /// As `insert`, with `status_code` varied too — the second grouped dimension
-    /// the derived-table chart groups on, where a single value would make the
-    /// group-for-group equality assertion trivial.
+    /// As `insert`, with `status_code` varied too — the second grouped dimension.
     async fn insert_row(&self, id: &str, ts: i64, service: Option<&str>, duration: Option<i64>, status: &str, summary: &str) -> Result<()> {
         let batch = json_to_batch(vec![serde_json::json!({
             "timestamp": ts, "id": id, "name": "op", "project_id": self.project_id, "hashes": [], "summary": [summary],
@@ -2037,9 +1656,7 @@ impl RollupEnv {
     }
 
     async fn certify(&self) -> Result<()> {
-        let table_ref = table_of(&self.db, "otel_logs_and_spans").await;
-        self.db.dedup_today_partitions(&table_ref, "otel_logs_and_spans", "otel_logs_and_spans").await?;
-        Ok(())
+        sweep_once(&self.db).await
     }
 
     /// The window predicate every parity query shares: this project, from the
@@ -2064,23 +1681,13 @@ fn any_rollup_hits() -> u64 {
 /// Two scalar `i64`s from one probe row, through `query_delta_only` — the
 /// fixture preconditions every parity test asserts before trusting equality.
 async fn delta_pair(db: &Arc<Database>, sql: &str) -> Result<(i64, i64)> {
-    Ok(db
-        .query_delta_only(sql)
-        .await?
-        .iter()
-        .filter(|b| b.num_rows() > 0)
-        .map(|b| (b.column(0).as_primitive::<Int64Type>().value(0), b.column(1).as_primitive::<Int64Type>().value(0)))
-        .next()
-        .expect("a probe row"))
+    let batches = db.query_delta_only(sql).await?;
+    let b = batches.iter().find(|b| b.num_rows() > 0).expect("a probe row");
+    Ok((i64_at(b, 0, 0), i64_at(b, 1, 0)))
 }
 
-/// Every rollup miss counter, by name.
-///
-/// A bare `hits() > before` cannot say WHY a query missed, and that assertion has
-/// been read as a verdict on unrelated changes more than once. Reporting the
-/// reasons that MOVED names the mechanism (build never ran vs coverage
-/// incomplete vs shape unsupported) instead of sending the next reader to bisect
-/// the tree.
+/// Every rollup miss counter, by name — so a failing route assertion can report
+/// WHY the query missed.
 fn miss_counters() -> Vec<(&'static str, u64)> {
     let s = timefusion::observability::maintenance_stats();
     let load = |c: &std::sync::atomic::AtomicU64| c.load(std::sync::atomic::Ordering::Relaxed);
@@ -2117,18 +1724,36 @@ fn miss_delta(before: &[(&'static str, u64)]) -> String {
         .join(" ")
 }
 
-/// The backfill fixture, shared by the two tests that need units to genuinely
-/// commit: a rollups-enabled db with a 7-day horizon, plus one span on D-5 and
-/// one on D-4 — sealed days FAR outside the dedup lookback (default 1), which is
-/// exactly the gap the backfill exists to close. A bare config drains ZERO units
-/// and every assertion downstream then passes vacuously.
+/// Run `query` on the routed session and assert it was served as a hybrid
+/// (rollup ∪ raw fringe) union, reporting the miss reasons that moved on failure.
 ///
-/// Returns the config too: coverage recovery has to be proved by a SECOND
-/// `Database` over the same storage prefix.
+/// The routing decision is only observable through the counter: the substitution
+/// happens in `DmlQueryPlanner`, and EXPLAIN renders its inner plan with the
+/// DEFAULT planner, so an explained query always shows the raw scan.
+async fn routed_hybrid(ctx: &datafusion::prelude::SessionContext, query: &str, why: &str) -> Result<Vec<RecordBatch>> {
+    let (before, misses) = (hybrid_hits(), miss_counters());
+    let out = ctx.sql(query).await?.collect().await?;
+    assert_eq!(hybrid_hits(), before + 1, "{why} (misses: [{}])", miss_delta(&misses));
+    Ok(out)
+}
+
+/// As `routed_hybrid`, for a shape that may legitimately be served either wholly
+/// from the tier or as a hybrid.
+async fn routed_any(ctx: &datafusion::prelude::SessionContext, query: &str, why: &str) -> Result<Vec<RecordBatch>> {
+    let (before, misses) = (any_rollup_hits(), miss_counters());
+    let out = ctx.sql(query).await?.collect().await?;
+    assert!(any_rollup_hits() > before, "{why} (misses: [{}])", miss_delta(&misses));
+    Ok(out)
+}
+
+/// The backfill fixture: a rollups-enabled db with a 7-day horizon plus spans on
+/// D-5 and D-4 — sealed days outside the dedup lookback (default 1), the gap the
+/// backfill exists to close. A bare config drains ZERO units and every assertion
+/// downstream then passes vacuously. Returns the config so coverage recovery can
+/// be proved by a SECOND `Database` over the same storage prefix.
 async fn backfill_env(name: &str) -> Result<(Arc<timefusion::config::AppConfig>, RollupEnv)> {
-    let mut cfg = (*TestConfigBuilder::new(name).with_buffer_mode(BufferMode::Enabled).with_rollups().build()).clone();
-    cfg.maintenance.timefusion_rollup_backfill_days = 7;
-    let cfg = Arc::new(cfg);
+    let base = TestConfigBuilder::new(name).with_buffer_mode(BufferMode::Enabled).with_rollups().build();
+    let cfg = tweak(base, |c| c.maintenance.timefusion_rollup_backfill_days = 7);
     let env = rollup_env_of(Arc::clone(&cfg)).await?;
     for back in [5i64, 4] {
         env.insert(&format!("d{back}"), noon_days_ago(back), Some("cart"), Some(100), "backfill fixture").await?;
@@ -2164,16 +1789,9 @@ fn window_select(column: &str, project_id: &str, lo: i64, hi: i64) -> String {
     )
 }
 
-/// End-to-end for the dashboard rollup: certifying a partition must build its
-/// buckets, and those buckets must agree with the raw aggregate EXACTLY.
-///
-/// A rollup that disagrees is worse than no rollup — it returns a wrong number
-/// silently, on the panel people trust most. So this compares the stored
-/// measures against the same aggregate computed from raw spans, rather than
-/// asserting the rollup merely exists.
-///
-/// It also pins idempotence: the build is triggered by certification, and a
-/// partition can be certified more than once, so a second build must REPLACE
+/// End-to-end for the dashboard rollup: certifying a partition must build
+/// buckets that agree with the raw aggregate EXACTLY. Also pins idempotence —
+/// a partition can be certified more than once, so a second build must REPLACE
 /// its rows rather than double every count.
 #[serial]
 #[tokio::test]
@@ -2181,10 +1799,8 @@ async fn certifying_a_partition_builds_rollup_buckets_that_match_the_raw_aggrega
     let env = rollup_env("rollup_build_parity").await?;
     let (db, project_id, ts) = (Arc::clone(&env.db), env.project_id.clone(), env.yesterday_noon);
 
-    // Several spans inside one minute bucket, plus one in the next.
     for (i, offset) in [0i64, 1_000_000, 2_000_000, 60_000_000].iter().enumerate() {
-        let batch = json_to_batch(vec![test_span_ts(&format!("span_{i}"), "op", &project_id, ts + offset)])?;
-        db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch], true, None).await?;
+        commit_span(&db, &project_id, &format!("span_{i}"), "op", ts + offset).await?;
     }
 
     assert!(env.certify_and_drain().await? > 0, "eligible slice tasks must be drained");
@@ -2200,30 +1816,20 @@ async fn certifying_a_partition_builds_rollup_buckets_that_match_the_raw_aggrega
     );
     assert!(raw_total > 0, "precondition: the fixture actually wrote rows");
 
-    // The publication counters must move on the COORDINATOR path, not only on
-    // the retired cohort path (`stage_rollup_wave`) they were originally wired
-    // to. Prod 2026-08-16 reported rollup_output_rows_total = 0 and
-    // rollup_staged_projects_total = 0 while this very table held 1,220 rows for
-    // a live project — a metric reading zero while the system works is worse
-    // than no metric, and it cost a full diagnosis pass chasing a rollup outage
-    // that was not happening. nextest gives each test its own process, so these
-    // process-global counters are this test's alone.
+    // The publication counters must move on the COORDINATOR path, not only on the
+    // cohort path they were originally wired to. nextest gives each test its own
+    // process, so these process-global counters are this test's alone.
     let stats = timefusion::observability::maintenance_stats();
     let ordering = std::sync::atomic::Ordering::Relaxed;
     assert!(stats.rollup_output_rows.load(ordering) > 0, "the coordinator published rollup rows but rollup_output_rows_total stayed 0");
     assert!(stats.rollup_staged_projects.load(ordering) > 0, "the coordinator published a slice but rollup_staged_projects_total stayed 0");
     assert!(stats.rollup_commit_actions.load(ordering) > 0, "the coordinator committed Delta actions but rollup_commit_actions_total stayed 0");
 
-    // Certify again: the build must replace, not append.
     env.certify().await?;
     assert_eq!(delta_scalar(&db, &rollup_total).await?, raw_total, "a second certification must REPLACE the buckets, not double every measure");
 
-    // A second independently replaceable slice must leave the first slice
-    // untouched. If slice replacement drops or duplicates the earlier state,
-    // the total moves and no read-side guard can repair it.
     let late = date_of(ts).and_hms_opt(20, 30, 0).unwrap().and_utc().timestamp_micros();
-    db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![json_to_batch(vec![test_span_ts("span_late", "op", &project_id, late)])?], true, None)
-        .await?;
+    commit_span(&db, &project_id, "span_late", "op", late).await?;
     assert!(env.certify_and_drain().await? > 0, "late slice tasks must be drained");
     assert_eq!(delta_scalar(&db, &rollup_total).await?, raw_total + 1, "an incremental rebuild must carry the untouched hours forward exactly once");
     Ok(())
@@ -2232,18 +1838,12 @@ async fn certifying_a_partition_builds_rollup_buckets_that_match_the_raw_aggrega
 /// The rollup must answer a window it only PARTLY covers, by unioning its
 /// certified interior with raw fringes, and the answer must equal the raw one.
 ///
-//// THE gate for routing `COALESCE(<dimension>, 'null')` — the spelling every
-/// monoscope grouped chart emits, and one that declined as `unsupported_shape`
-/// until 2026-08-22 (3,237 ms raw against 276 ms routed at 3 days).
-///
-/// COALESCE folds NULL and the literal string `'null'` into ONE group, so the
-/// question this must settle is whether the rollup can reproduce that fold. It
-/// can, because `COALESCE(dim, lit)` is a function of `dim`: the tier's
-/// partition by `dim` REFINES the partition by `COALESCE(dim, lit)`, and
-/// re-aggregating decomposable states over a refinement equals aggregating raw
-/// rows. This asserts that claim on data engineered to break it — a NULL
-/// service AND a literal-'null' service, both in the rollup-covered day and in
-/// the raw tail, so the fold has to survive the union of the two legs.
+/// The gate for routing `COALESCE(<dimension>, 'null')`, which folds NULL and
+/// the literal string `'null'` into ONE group. The tier's partition by `dim`
+/// REFINES the partition by `COALESCE(dim, lit)`, so re-aggregating decomposable
+/// states over the refinement equals aggregating raw rows. The fixture holds a
+/// NULL service AND a literal-'null' one, in both legs, so the fold must survive
+/// the union.
 ///
 /// Asserts routing as well as equality: a miss also returns the right answer,
 /// so equality alone would pass vacuously.
@@ -2254,12 +1854,8 @@ async fn a_coalesced_dimension_folds_null_and_the_literal_identically_through_th
     let db = Arc::clone(&env.db);
     db.cancel_maintenance();
 
-    // `service: None` writes a genuine SQL NULL; "null" is the four-character
-    // string. Collapsing those two is the whole point of the test, so they must
-    // be distinct in the fixture — asserted below before anything else.
-    //
-    // Yesterday, spread over hours so the interior is worth a union. Each of the
-    // three service shapes appears in the COVERED day.
+    // `service: None` is a genuine SQL NULL; "null" is the four-character string.
+    // Yesterday, spread over hours so the interior is worth a union.
     for (i, (service, offset)) in [
         (None, 17i64),
         (Some("cart"), 61_000_000),
@@ -2278,18 +1874,16 @@ async fn a_coalesced_dimension_folds_null_and_the_literal_identically_through_th
 
     assert!(env.certify_and_drain().await? > 0, "eligible yesterday slices must be drained");
 
-    // Written AFTER certification, so these reach the query only via the raw
-    // leg — and both fold-participants appear here too, which is what forces the
-    // outer merge to combine a folded group ACROSS the two legs.
+    // Written AFTER certification, so these reach the query only via the raw leg;
+    // both fold-participants appear here too, forcing the outer merge to combine
+    // a folded group ACROSS the two legs.
     for (i, (service, offset)) in [(None, 5_000_000i64), (Some("null"), 3_600_000_000), (Some("cart"), 3_700_000_000)].iter().enumerate() {
         env.insert(&format!("t{i}"), env.midnight + offset, *service, Some(100), "coalesce fixture").await?;
     }
 
     let window = env.window();
 
-    // The fixture is only meaningful if a real NULL and a real 'null' both
-    // exist. Without this the test could silently degrade into all-strings and
-    // still pass, proving nothing about the fold.
+    // Without both a real NULL and a real 'null' the fold is never exercised.
     let (nulls, literals) = delta_pair(
         &db,
         &format!(
@@ -2301,7 +1895,6 @@ async fn a_coalesced_dimension_folds_null_and_the_literal_identically_through_th
     .await?;
     assert!(nulls > 0 && literals > 0, "the fixture must hold BOTH real NULLs and literal 'null's, got nulls={nulls} literals={literals}");
 
-    // monoscope's real two-key chart shape: bucket AND coalesced dimension.
     let query = format!(
         "SELECT time_bucket('1 hours', timestamp) AS tb, COALESCE(resource___service___name, 'null') AS svc, \
                 COUNT(*) AS c, min(duration) AS lo, max(duration) AS hi \
@@ -2310,56 +1903,29 @@ async fn a_coalesced_dimension_folds_null_and_the_literal_identically_through_th
 
     let ctx = ctx_for(&db)?;
 
-    let rows_of = |batches: Vec<datafusion::arrow::array::RecordBatch>| {
-        batches
-            .iter()
-            .filter(|b| b.num_rows() > 0)
-            .flat_map(|b| {
-                (0..b.num_rows())
-                    .map(|r| {
-                        (
-                            b.column(0).as_primitive::<datafusion::arrow::datatypes::TimestampMicrosecondType>().value(r),
-                            array_get_str(b.column(1).as_ref(), r),
-                            b.column(2).as_primitive::<Int64Type>().value(r),
-                            b.column(3).as_primitive::<Int64Type>().value(r),
-                            b.column(4).as_primitive::<Int64Type>().value(r),
-                        )
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>()
-    };
+    let row = |b: &RecordBatch, r: usize| (ts_at(b, 0, r), str_at(b, 1, r), i64_at(b, 2, r), i64_at(b, 3, r), i64_at(b, 4, r));
 
-    let before = hybrid_hits();
-    let routed = rows_of(ctx.sql(&query).await?.collect().await?);
-    assert_eq!(hybrid_hits(), before + 1, "the coalesced chart must route, or this proves nothing about the rollup's fold");
+    let routed = rows_of(&routed_hybrid(&ctx, &query, "the coalesced chart must route, or this proves nothing about the rollup's fold").await?, row);
 
     // `query_delta_only` bypasses rollup and buffer, so it is the authority.
-    let raw = rows_of(db.query_delta_only(&query).await?);
+    let raw = rows_of(&db.query_delta_only(&query).await?, row);
     assert_eq!(routed, raw, "the coalesced group must match the raw aggregate row for row");
 
-    // Every fixture row lands in exactly one group, and the NULLs really did
-    // fold in with the literals rather than forming their own group.
     assert_eq!(routed.iter().map(|row| row.2).sum::<i64>(), 11, "every fixture row must be counted exactly once: {routed:?}");
     assert!(routed.iter().all(|row| row.1 == "null" || row.1 == "cart"), "COALESCE must leave only folded labels: {routed:?}");
     Ok(())
 }
 
-/// THE gate for dropping `duration IS NOT NULL` — the predicate monoscope emits
-/// on EVERY latency chart, and the one 2026-08-22's counter A/B isolated as the
-/// whole of `filter_not_eligible` (the same p95 query declined
-/// `filter_not_eligible` with it and `stale_coverage` without it, 3 reps each).
+/// The gate for dropping `duration IS NOT NULL` when routing a latency chart.
 ///
-/// Dropping it is NOT free. `percentile_agg` skips nulls, so the VALUES are
-/// unaffected — but the raw query also ELIMINATES a bucket whose every row has a
-/// null duration, and the rollup, which aggregated all rows, would resurrect it
-/// as a 0. So the predicate is replaced by `HAVING sum(duration_count) > 0`,
-/// `duration_count` being `count(duration)` and therefore exactly the count of
-/// rows the predicate would have kept.
+/// Dropping it is NOT free: `percentile_agg` skips nulls so the VALUES are
+/// unaffected, but the raw query also ELIMINATES a bucket whose every row has a
+/// null duration, which the rollup would resurrect as a 0. So the predicate is
+/// replaced by `HAVING sum(duration_count) > 0` — `duration_count` is
+/// `count(duration)`, exactly the rows the predicate would have kept.
 ///
-/// The fixture is built to break precisely that: one hour whose rows ALL have a
-/// null duration, beside hours that mix null and non-null. If the guard is wrong
-/// the routed answer gains a bucket the raw answer does not have.
+/// The fixture has one hour whose rows are ALL null, beside mixed hours; if the
+/// guard is wrong the routed answer gains a bucket the raw answer lacks.
 #[serial]
 #[tokio::test]
 async fn an_all_null_duration_bucket_is_eliminated_identically_through_the_rollup() -> Result<()> {
@@ -2379,16 +1945,15 @@ async fn an_all_null_duration_bucket_is_eliminated_identically_through_the_rollu
 
     assert!(env.certify_and_drain().await? > 0, "eligible yesterday slices must be drained");
 
-    // Today, reachable only through the raw leg — including its own all-null
-    // hour, so the guard has to hold on BOTH sides of the union.
+    // Today, reachable only through the raw leg — with its own all-null hour, so
+    // the guard has to hold on BOTH sides of the union.
     for (i, (duration, offset)) in [(None, 5_000_000i64), (None, 60_000_000), (Some(700), 3_700_000_000)].iter().enumerate() {
         env.insert(&format!("t{i}"), env.midnight + offset, Some("cart"), *duration, "null-guard fixture").await?;
     }
 
     let window = env.window();
 
-    // Without an all-null bucket the test proves nothing, so assert the fixture
-    // really contains one before trusting the comparison below.
+    // Without an all-null bucket the comparison below proves nothing.
     let all_null_buckets = delta_scalar(
         &db,
         &format!(
@@ -2399,7 +1964,6 @@ async fn an_all_null_duration_bucket_is_eliminated_identically_through_the_rollu
     .await?;
     assert!(all_null_buckets > 0, "the fixture must contain a bucket whose rows ALL have a null duration, got {all_null_buckets}");
 
-    // monoscope's p95 chart, verbatim down to the IS NOT NULL.
     let query = format!(
         "SELECT time_bucket('1 hours', timestamp) AS tb, \
                 COALESCE(approx_percentile(0.95, percentile_agg(CAST(duration AS DOUBLE PRECISION))), 0) AS p95 \
@@ -2408,28 +1972,11 @@ async fn an_all_null_duration_bucket_is_eliminated_identically_through_the_rollu
 
     let ctx = ctx_for(&db)?;
 
-    let rows_of = |batches: Vec<datafusion::arrow::array::RecordBatch>| {
-        batches
-            .iter()
-            .filter(|b| b.num_rows() > 0)
-            .flat_map(|b| {
-                (0..b.num_rows())
-                    .map(|r| {
-                        (
-                            b.column(0).as_primitive::<datafusion::arrow::datatypes::TimestampMicrosecondType>().value(r),
-                            b.column(1).as_primitive::<datafusion::arrow::datatypes::Float64Type>().value(r).round() as i64,
-                        )
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>()
-    };
+    let row = |b: &RecordBatch, r: usize| (ts_at(b, 0, r), f64_at(b, 1, r).round() as i64);
 
-    let before = hybrid_hits();
-    let routed = rows_of(ctx.sql(&query).await?.collect().await?);
-    assert_eq!(hybrid_hits(), before + 1, "the p95 chart must route, or this proves nothing about the null guard");
+    let routed = rows_of(&routed_hybrid(&ctx, &query, "the p95 chart must route, or this proves nothing about the null guard").await?, row);
 
-    let raw = rows_of(db.query_delta_only(&query).await?);
+    let raw = rows_of(&db.query_delta_only(&query).await?, row);
     assert_eq!(routed, raw, "the guarded p95 must match the raw aggregate bucket for bucket");
     assert!(!routed.is_empty(), "the fixture must produce buckets, or equality is vacuous: {routed:?}");
     Ok(())
@@ -2437,20 +1984,10 @@ async fn an_all_null_duration_bucket_is_eliminated_identically_through_the_rollu
 
 /// `count(*)` under a null guard ROUTES, and answers from `duration_count`.
 ///
-/// This test previously asserted the opposite. The reasoning it encoded — that
-/// such a query "counts a different row set than the tier's `request_count`" — is
-/// correct about `request_count` and was the right conservative call while that
-/// was the only count measure the matcher would reach. But under `col IS NOT
-/// NULL`, consumed as a guard rather than pushed, `count(*)` is *exactly*
-/// `count(col)`, and `duration_count` declares precisely that. So the query is
-/// answerable rather than merely refusable, and the equality below — routed
-/// against raw, bucket for bucket — is what proves it.
-///
-/// The case the original doc comment describes, `count(*)` **alongside** a
-/// percentile, is a different query and is still refused; see
-/// `a_guarded_count_beside_a_percentile_still_declines` in `src/rollup.rs`. That
-/// refusal is about pre-08-22 cells having no `duration_digest` column, not about
-/// the count.
+/// Under `col IS NOT NULL` consumed as a guard rather than pushed, `count(*)` is
+/// exactly `count(col)`, which `duration_count` declares. (`count(*)` *alongside*
+/// a percentile is a different query and is still refused — see
+/// `a_guarded_count_beside_a_percentile_still_declines` in `src/rollup.rs`.)
 #[serial]
 #[tokio::test]
 async fn a_count_star_under_a_null_guard_routes_via_duration_count() -> Result<()> {
@@ -2467,10 +2004,9 @@ async fn a_count_star_under_a_null_guard_routes_via_duration_count() -> Result<(
     }
     env.certify_and_drain().await?;
 
-    // Bound to YESTERDAY, where the fixture's rows are and the tier is certified.
-    // The refusal test this was inverted from ran to `midnight + 2h`, reaching into
-    // the live frontier: the certified interior is then a tiny slice of a ~14h
-    // window and `TinyInterior` declines before the guarded count is considered.
+    // Bound to YESTERDAY, where the tier is certified: reaching into the live
+    // frontier makes the interior a tiny slice of the window and `TinyInterior`
+    // declines before the guarded count is ever considered.
     let (lo, hi) = (env.yesterday_noon + 17, env.midnight);
     let query = format!(
         "SELECT time_bucket('1 hours', timestamp) AS tb, COUNT(*) AS c \
@@ -2480,13 +2016,10 @@ async fn a_count_star_under_a_null_guard_routes_via_duration_count() -> Result<(
     );
 
     let ctx = ctx_for(&db)?;
-    let before = any_rollup_hits();
-    let routed = ctx.sql(&query).await?.collect().await?;
-    assert!(any_rollup_hits() > before, "count(*) under a null guard is exactly count(duration), which duration_count declares; it must route");
+    let why = "count(*) under a null guard is exactly count(duration), which duration_count declares; it must route";
+    let routed = routed_any(&ctx, &query, why).await?;
 
-    let total = |batches: &[datafusion::arrow::array::RecordBatch]| {
-        batches.iter().filter(|b| b.num_rows() > 0).flat_map(|b| (0..b.num_rows()).map(|r| b.column(1).as_primitive::<Int64Type>().value(r))).sum::<i64>()
-    };
+    let total = |batches: &[RecordBatch]| rows_of(batches, |b, r| i64_at(b, 1, r)).into_iter().sum::<i64>();
     assert_eq!(
         total(&routed),
         total(&db.query_delta_only(&query).await?),
@@ -2495,21 +2028,17 @@ async fn a_count_star_under_a_null_guard_routes_via_duration_count() -> Result<(
     Ok(())
 }
 
-/// monoscope's *Active Services* widget — `dcount(resource.service.name)`, which
-/// lowers to `distinct_count(approx_count_distinct(col))` — must route and must
-/// agree with the raw sketch, both as a bare scalar and bucketed.
+/// `dcount(resource.service.name)`, which lowers to
+/// `distinct_count(approx_count_distinct(col))`, must agree with the raw sketch
+/// both as a bare scalar and bucketed.
 ///
-/// `Merge::Hll` and the `hll_agg`/`hll_merge` UDAFs already existed; what was
-/// missing was a DECLARED `{agg: hll, …}` measure, so every dcount panel declined
-/// `missing_measure` (docs/monoscope-query-shapes.md §5). `resource___service___name`
-/// is the one dcount column that routes on the measure alone: it is a declared
-/// dimension, so its `IS NOT NULL` becomes a row filter. Every other dcount widget
-/// guards on a NON-dimension (`name`, `body`, `context___trace_id`) and would
-/// additionally need a `{agg: count, column: …}` guard measure.
+/// `resource___service___name` is the one dcount column that could route on the
+/// measure alone: it is a declared dimension, so its `IS NOT NULL` becomes a row
+/// filter. A dcount over a NON-dimension would additionally need a
+/// `{agg: count, column: …}` guard measure.
 ///
-/// Equality is exact rather than approximate: HLL merge is register-wise max and
-/// therefore associative, so the hybrid's `hll_merge(states) ∪ hll_agg(fringe)`
-/// is the same sketch the raw leg builds in one pass.
+/// Equality is exact, not approximate: HLL merge is register-wise max and so
+/// associative, making the hybrid's merged sketch identical to the raw one.
 #[serial]
 #[tokio::test]
 async fn a_distinct_count_over_services_routes_and_matches_the_raw_sketch() -> Result<()> {
@@ -2517,10 +2046,8 @@ async fn a_distinct_count_over_services_routes_and_matches_the_raw_sketch() -> R
     let db = Arc::clone(&env.db);
     db.cancel_maintenance();
 
-    // Services REPEAT within and across hours, so a distinct count differs from a
-    // row count and parity is not vacuous; one null-service row proves the
-    // `IS NOT NULL` row filter does work on both legs. Yesterday certifies into
-    // the tier, today can only come from the raw fringe.
+    // Services REPEAT, so a distinct count differs from a row count; one
+    // null-service row exercises the `IS NOT NULL` row filter on both legs.
     let fixture = [
         (Some("cart"), 17i64),
         (Some("cart"), 61_000_000),
@@ -2539,11 +2066,8 @@ async fn a_distinct_count_over_services_routes_and_matches_the_raw_sketch() -> R
         env.insert(&format!("t{i}"), env.midnight + offset, *service, Some(100), "dcount fixture").await?;
     }
 
-    // The dcount widget's own `IS NOT NULL`, on top of the shared window.
     let window = format!("{} AND resource___service___name IS NOT NULL", env.window());
 
-    // The fixture must hold both a repeat and a null, or neither the distinct
-    // count nor the row filter is exercised.
     let (rows, services) =
         delta_pair(&db, &format!("SELECT COUNT(*)::BIGINT, COUNT(DISTINCT resource___service___name)::BIGINT FROM otel_logs_and_spans WHERE {}", env.window()))
             .await?;
@@ -2556,7 +2080,6 @@ async fn a_distinct_count_over_services_routes_and_matches_the_raw_sketch() -> R
         datafusion::arrow::util::pretty::pretty_format_batches(&kept).expect("format").to_string()
     };
 
-    // The widget verbatim (a bare scalar), and its bucketed sibling.
     for select in [
         "distinct_count(approx_count_distinct(resource___service___name))::float AS dcount FROM otel_logs_and_spans WHERE {window}".to_string(),
         "time_bucket('1 hours', timestamp) AS tb, distinct_count(approx_count_distinct(resource___service___name))::float AS dcount \
@@ -2566,17 +2089,10 @@ async fn a_distinct_count_over_services_routes_and_matches_the_raw_sketch() -> R
         let query = format!("SELECT {}", select.replace("{window}", &window));
         let before = any_rollup_hits();
         let routed = show(ctx.sql(&query).await?.collect().await?);
-        // Declared but DELIBERATELY NOT SERVABLE yet. `MEASURES_NOT_YET_SERVABLE`
-        // refuses `service_name_hll` on every cell, tagged or not, because an
-        // audit on 2026-08-26 found its stored state absent on every date up to
-        // 08-25 and only 26-68% present on 08-26 — and `distinct_count` of an
-        // EMPTY sketch is 0, not NULL, so a routed widget renders 0 services
-        // rather than declining (measured: est 1 vs truth 2, est 15 vs truth 18).
-        //
-        // So the assertion that matters here is the ANSWER, not the route: the
-        // query must fall back to raw and still be exact. Flip the first
-        // assertion back to `any_rollup_hits() > before` when the guard is lifted
-        // — that is what proves the measure earns its declaration.
+        // `service_name_hll` is declared but on `MEASURES_NOT_YET_SERVABLE`:
+        // `distinct_count` of an EMPTY sketch is 0, not NULL, so a routed widget
+        // over cells missing the state would silently render 0 services. Until
+        // the guard is lifted the query must fall back to raw and still be exact.
         assert_eq!(any_rollup_hits(), before, "the hll measure is on the not-yet-servable list, so this must NOT route: {query}");
         assert_eq!(routed, show(db.query_delta_only(&query).await?), "and the raw answer must still be exact: {query}");
     }
@@ -2596,73 +2112,59 @@ async fn sweep_once(db: &Arc<Database>) -> Result<()> {
     Ok(())
 }
 
-/// How many rows a `query_delta_only` scan actually returns — the authority the
-/// COUNT-parity assertions are measured against, because it is the path where
-/// `DedupExec` (and the skip that removes it) actually runs.
+/// How many rows a `query_delta_only` scan returns — the path where `DedupExec`
+/// (and the skip that removes it) actually runs.
 async fn delta_row_count(db: &Arc<Database>, sql: &str) -> Result<usize> {
     Ok(db.query_delta_only(sql).await?.iter().map(|b| b.num_rows()).sum())
 }
 
 /// One arm of a COUNT-parity run over a read-side dedup skip.
 ///
-/// `configure` sets the flag under test (the control arm sets it OFF). Then
+/// `configure` sets the flag under test (the control arm sets it OFF).
 /// `duplicated` keys are committed TWICE across separate flushes — cross-file
-/// duplicates, which flush-time per-bucket dedup cannot see, and the way
-/// duplicates survive in production — plus `unique` keys committed once, and two
-/// certifying sweeps. A non-zero `churn` adds a later band written twice AFTER
-/// certification, in a DISJOINT timestamp band, which moves the partition
-/// fingerprint so every all-or-nothing skip must decline while a per-file skip
-/// may still fire for the certified band.
+/// duplicates, which flush-time per-bucket dedup cannot see — plus `unique` keys
+/// committed once, then two certifying sweeps. A non-zero `churn` adds a later,
+/// DISJOINT band written twice AFTER certification, moving the partition
+/// fingerprint so an all-or-nothing skip must decline while a per-file skip may
+/// still fire for the certified band.
 ///
-/// Returns the rows the scan returns and how far `metric` moved over the
-/// measured query. Rows, NOT `count(*)`: a bare count is answered by
-/// `count_pushdown` from Delta statistics without ever building a scan, so it
-/// exercises neither `DedupExec` nor the skip that removes it. Counting the rows
-/// the scan returns is the same assertion about the same hazard (silent
-/// over-counting), through the path that can produce it.
+/// Returns the scanned rows and how far `metric` moved. Rows, NOT `count(*)`: a
+/// bare count is answered by `count_pushdown` from Delta statistics without ever
+/// building a scan, so it exercises neither `DedupExec` nor the skip.
 async fn dedup_skip_parity_arm(
     tag: &'static str, configure: impl FnOnce(&mut timefusion::config::AppConfig), duplicated: usize, unique: usize, churn: usize, metric: &'static str,
 ) -> Result<(i64, u64)> {
     // A second apart, so the churn batch's file span cannot touch the certified
-    // band's. Overlapping bands would (correctly) refuse the skip, and the test
-    // would pass while proving nothing.
+    // band's; overlapping bands would (correctly) refuse the skip.
     const CHURN_OFFSET: i64 = 1_000_000;
     const CHURN_KEY_BASE: usize = 1_000;
     let ts = yesterday_noon();
-    let mut cfg = (*TestConfigBuilder::new(tag).with_buffer_mode(BufferMode::Enabled).build()).clone();
-    configure(&mut cfg);
-    let (db, project_id) = db_of(Arc::new(cfg)).await?;
+    let (db, project_id) = tuned_db(tag, configure).await?;
 
     for _ in 0..2 {
         commit_span_run(&db, &project_id, ts, 0, duplicated).await?;
     }
     commit_span_run(&db, &project_id, ts, duplicated, duplicated + unique).await?;
 
-    // TWICE. The first pass drops duplicates, and `record_certification` requires
-    // `dropped == 0` over a file set that did not move — a pass cannot certify
-    // what it just rewrote. The second is the confirming pass, and without it the
-    // skip never engages. (That the second pass runs at all, with nothing
-    // committed in between, is
-    // `a_rewriting_sweep_is_confirmed_by_the_next_pass_with_no_other_commit`.)
+    // TWICE. `record_certification` requires `dropped == 0` over an unmoved file
+    // set, so the rewriting first pass cannot certify; the second confirms it and
+    // without it the skip never engages.
     sweep_once(&db).await?;
     sweep_once(&db).await?;
 
-    // THE CHURN: itself duplicated across two flushes, so the uncertified leg
+    // The churn is itself duplicated across two flushes, so the uncertified leg
     // genuinely still has work to do.
     let churn_flushes = if churn > 0 { 2 } else { 0 };
     for _ in 0..churn_flushes {
         commit_span_run(&db, &project_id, ts + CHURN_OFFSET, CHURN_KEY_BASE, CHURN_KEY_BASE + churn).await?;
     }
 
-    // TIME-BOUNDED. Without a window `dedup_skip_allowed` returns `NoWindow` and
-    // refuses before it ever consults a certification, so an unbounded query
-    // silently measures nothing.
+    // TIME-BOUNDED: without a window `dedup_skip_allowed` returns `NoWindow` and
+    // refuses before consulting any certification.
     let hi = ts + if churn > 0 { CHURN_OFFSET + (CHURN_KEY_BASE + churn) as i64 + 1 } else { (duplicated + unique) as i64 + 1 };
     let sql = window_select("id", &project_id, ts - 1, hi);
     // Warm the fast-resolve cache: `pre_skip_dedup` consults `try_fast_resolve`
     // and a miss declines outright, so a cold first query never reaches the skip.
-    // Three earlier attempts at a skip test were green against broken code for
-    // exactly this reason.
     db.query_delta_only(&sql).await?;
     let before = counter_value(metric);
     let rows = delta_row_count(&db, &sql).await? as i64;
@@ -2671,13 +2173,8 @@ async fn dedup_skip_parity_arm(
 
 /// The same chart wrapped in a derived table ROUTES, and answers what raw does.
 ///
-/// A `SubqueryAlias` — any CTE or derived table under the aggregate — used to
-/// stop the walker dead, which made it the largest miss class on prod (126 of
-/// 414, 2026-08-25). Walking through it is only sound if the alias's
-/// re-qualification is undone on the way back: the aggregate's group field is
-/// `t.timestamp`-derived where the rewrite produces unqualified columns. The
-/// unit tests in `src/rollup.rs` pin that reassembly; this pins the ANSWER,
-/// because a routing change that returns wrong numbers is worse than a miss.
+/// Walking through a `SubqueryAlias` is only sound if the alias's
+/// re-qualification is undone on the way back.
 #[serial]
 #[tokio::test]
 async fn a_chart_under_a_derived_table_routes_and_agrees_with_raw() -> Result<()> {
@@ -2686,13 +2183,8 @@ async fn a_chart_under_a_derived_table_routes_and_agrees_with_raw() -> Result<()
     db.cancel_maintenance();
     let project_id = env.project_id.clone();
 
-    // PIN THE CLOCK. The fixture's window is fixed relative to `today`, but how
-    // far rollup coverage extends is a function of `now`: run at 03:55 UTC the
-    // 1m tier's covered range stopped at yesterday 14:00, run at 12:00 it
-    // reached today 00:00. The 1h tier ends at 14:00 either way, leaving a
-    // single 1h bucket inside the window -- below `MIN_INTERIOR_BUCKETS` -- so
-    // the whole query's fate rests on the 1m tier, and therefore on the hour the
-    // suite happened to start. Freeze it; the env's guard restores wall time.
+    // Rollup coverage extent is a function of `now`, so pin the clock or the
+    // outcome depends on the hour the suite started. The env's guard restores it.
     timefusion::support::set_micros(env.midnight + 12 * 3_600_000_000);
 
     for (i, (status, offset)) in [("OK", 17i64), ("ERROR", 61_000_000), ("OK", 3_661_000_000)].iter().enumerate() {
@@ -2701,8 +2193,8 @@ async fn a_chart_under_a_derived_table_routes_and_agrees_with_raw() -> Result<()
     env.certify_and_drain().await?;
 
     let (lo, hi) = (env.yesterday_noon + 17, env.midnight + 7_200_000_017);
-    // The grouped chart monoscope emits, moved under a derived table: the alias
-    // qualifies both the bucket's argument and the grouped dimension.
+    // Grouped chart under a derived table: the alias qualifies both the bucket's
+    // argument and the grouped dimension.
     let query = format!(
         "SELECT time_bucket('1 hours', t.timestamp) AS tb, t.status_code, count(*) AS c \
          FROM (SELECT timestamp, status_code, project_id FROM otel_logs_and_spans \
@@ -2712,54 +2204,31 @@ async fn a_chart_under_a_derived_table_routes_and_agrees_with_raw() -> Result<()
     );
 
     let ctx = ctx_for(&db)?;
-    // A bare bool cannot say WHY, and this assertion has been read as a verdict
-    // on unrelated changes more than once — so report the miss reasons that moved.
-    let (before, misses_before) = (any_rollup_hits(), miss_counters());
-    let routed = ctx.sql(&query).await?.collect().await?;
-    assert!(any_rollup_hits() > before, "a derived table only re-qualifies; the chart under it must route. misses: [{}]", miss_delta(&misses_before));
+    let routed = routed_any(&ctx, &query, "a derived table only re-qualifies; the chart under it must route").await?;
 
-    let rows = |batches: &[datafusion::arrow::array::RecordBatch]| {
-        batches
-            .iter()
-            .filter(|b| b.num_rows() > 0)
-            .flat_map(|b| (0..b.num_rows()).map(|r| (b.column(1).as_string_view().value(r).to_string(), b.column(2).as_primitive::<Int64Type>().value(r))))
-            .collect::<Vec<_>>()
-    };
+    let rows = |batches: &[RecordBatch]| rows_of(batches, |b, r| (str_at(b, 1, r), i64_at(b, 2, r)));
     assert_eq!(rows(&routed), rows(&db.query_delta_only(&query).await?), "the ROUTED answer must equal raw, bucket for bucket and group for group");
     Ok(())
 }
 
-// This is the shape production actually sends: microsecond-precision bounds
-/// running up to now. Before the union it was refused outright, so the feature
-/// never served a single query. A hybrid that merely *runs* is worthless — the
-/// failure mode is a plausible wrong number — so this asserts row-for-row
-/// equality against the same aggregate computed from raw spans, AND asserts the
-/// query really routed. Without the second assertion the test passes vacuously,
-/// because a miss also returns the right answer.
+/// A partly covered window must union the rollup with raw and match raw exactly,
+/// AND must really route — a miss also returns the right answer, so without the
+/// routing assertion the test passes vacuously.
 ///
-/// The fixture makes coverage partial deterministically, with no dependence on
-/// flush timing: yesterday is certified, today is written afterwards and never
-/// certified. So the interior ends at midnight and today's rows can only be
-/// reached through the raw leg.
+/// Coverage is made partial deterministically: yesterday is certified, today is
+/// written afterwards and never certified.
 #[serial]
 #[tokio::test]
 async fn a_partly_covered_window_unions_the_rollup_with_raw_and_matches_the_raw_answer() -> Result<()> {
-    // This test publishes selected coverage explicitly below. A background
-    // coordinator can race that fixture and change the routing counters being
-    // asserted, so isolate the routing behavior under test.
+    // A background coordinator would race the explicit coverage published below.
     let env = rollup_env("rollup_hybrid").await?;
     let db = Arc::clone(&env.db);
     db.cancel_maintenance();
     let (project_id, midnight, yesterday_noon) = (env.project_id.clone(), env.midnight, env.yesterday_noon);
 
-    // Varied duration/service so avg/min/max and the group set are all
-    // non-trivial, and one service that appears ONLY in the raw tail — the case
-    // a naive merge drops.
-    //
-    // Yesterday, spread over six genuinely touched hours and starting
-    // mid-bucket so the left fringe is non-empty too. The hybrid cost guard
-    // intentionally declines a rollup covering less than 20% of the requested
-    // window; keeping these rows in one hour made this test depend on the old
+    // Varied duration/service so avg/min/max and the group set are non-trivial.
+    // Spread over six hours and starting mid-bucket: the hybrid cost guard
+    // declines a rollup covering less than 20% of the requested window.
     for (i, offset) in
         [17i64, 61_000_000, 130_000_000, 610_000_000, 3_661_000_000, 7_330_000_000, 10_810_000_000, 14_410_000_000, 18_010_000_000].iter().enumerate()
     {
@@ -2774,7 +2243,7 @@ async fn a_partly_covered_window_unions_the_rollup_with_raw_and_matches_the_raw_
         env.insert(&format!("t{i}"), midnight + offset, Some("checkout"), Some(500 + i as i64 * 10), "rollup hybrid fixture").await?;
     }
 
-    // Unaligned on both ends, exactly like a dashboard's `now`-relative window.
+    // Unaligned on both ends, like a dashboard's `now`-relative window.
     let (lo, hi) = (yesterday_noon + 17, midnight + 7_200_000_017);
     let query = format!(
         "SELECT resource___service___name AS svc, COUNT(*) AS c, avg(duration) AS mean, min(duration) AS lo, max(duration) AS hi \
@@ -2784,21 +2253,12 @@ async fn a_partly_covered_window_unions_the_rollup_with_raw_and_matches_the_raw_
 
     let ctx = ctx_for(&db)?;
 
-    // Precondition: certification really did build yesterday's buckets. Without
-    // this the routing assertion below cannot distinguish "the rewrite is broken"
-    // from "there was nothing to rewrite to".
+    // Precondition: without this the routing assertion below cannot distinguish
+    // "the rewrite is broken" from "there was nothing to rewrite to".
     let built = env.tier_rows(TIER_1M).await?;
-    // On failure ONLY, print what the tier actually holds. This assertion has
-    // failed intermittently in CI (`left: 10, right: 9`) while passing 6/6 locally
-    // in isolation and 985/985 in a full local suite — it reproduces only under
-    // the concurrency of a loaded shard, so it cannot be caught by re-running it.
-    //
-    // Nine spans are inserted, so a sum of TEN is a double count, not an extra
-    // row. The dump distinguishes the two shapes that produce it — one bucket
-    // with `request_count = 2`, versus two live `rollup_generation`s covering the
-    // same bucket (the #139 shape, where a wider file and a narrower one both
-    // stay live and a SUM counts both). Those want opposite fixes, and the
-    // counter alone cannot tell them apart.
+    // On failure only, dump the tier: a double count shows either one bucket with
+    // `request_count = 2` or two live `rollup_generation`s over the same bucket,
+    // and the counter alone cannot tell those apart.
     if built != 9 {
         let rows = db
             .query_delta_only(&format!(
@@ -2822,12 +2282,9 @@ async fn a_partly_covered_window_unions_the_rollup_with_raw_and_matches_the_raw_
             action.tags.as_ref().is_some_and(|tags| tags.contains_key(timefusion::maintenance_coordinator::TAG_SLICE_START))
         })
         .count();
-    // Every published file must carry its slice tags — a derived unit selects
-    // its input by them, so an untagged file is invisible to the coarse tier.
-    // Counted as "all of them", not ">= 6": that literal encoded the
-    // pre-coarsening slice granularity, and `coarsen_sealed_slices` (#134) now
-    // collapses a sealed day's fine units into one, so a correct run publishes
-    // ONE day-wide tagged file. The invariant is that none is untagged.
+    // Every published file must carry its slice tags — a derived unit selects its
+    // input by them, so an untagged file is invisible to the coarse tier. The
+    // invariant is "none untagged", not a file count: sealed slices get coarsened.
     let total_files = base_target.read().await.snapshot()?.log_data().iter().count();
     assert!(
         tagged_files > 0 && tagged_files == total_files,
@@ -2836,98 +2293,46 @@ async fn a_partly_covered_window_unions_the_rollup_with_raw_and_matches_the_raw_
     let derived_built = env.tier_rows(TIER_1H).await?;
     assert_eq!(derived_built, 9, "derived coverage must merge every independently published base slice");
 
-    let rows_of = |batches: Vec<datafusion::arrow::array::RecordBatch>| {
-        batches
-            .iter()
-            .filter(|b| b.num_rows() > 0)
-            .flat_map(|b| {
-                (0..b.num_rows())
-                    .map(|r| {
-                        (
-                            array_get_str(b.column(0).as_ref(), r),
-                            b.column(1).as_primitive::<Int64Type>().value(r),
-                            b.column(2).as_primitive::<datafusion::arrow::datatypes::Float64Type>().value(r),
-                            b.column(3).as_primitive::<Int64Type>().value(r),
-                            b.column(4).as_primitive::<Int64Type>().value(r),
-                        )
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>()
-    };
+    let row = |b: &RecordBatch, r: usize| (str_at(b, 0, r), i64_at(b, 1, r), f64_at(b, 2, r), i64_at(b, 3, r), i64_at(b, 4, r));
 
-    // The routing decision is only observable through this counter. `EXPLAIN`
-    // cannot see it: the substitution happens in `DmlQueryPlanner`, and EXPLAIN
-    // renders its inner plan with the DEFAULT planner, so an explained query
-    // always shows the raw scan even when the real one routes.
-    let (before, misses_before) = (hybrid_hits(), miss_counters());
-    let hybrid = rows_of(ctx.sql(&query).await?.collect().await?);
-    assert_eq!(
-        hybrid_hits(),
-        before + 1,
-        "the query must be served from the rollup as a hybrid union, not a raw scan (misses: [{}])",
-        miss_delta(&misses_before)
-    );
+    let why = "the query must be served from the rollup as a hybrid union, not a raw scan";
+    let hybrid = rows_of(&routed_hybrid(&ctx, &query, why).await?, row);
 
     // `query_delta_only` bypasses both the rollup and the buffer, so it is the
-    // authority: every fixture row was written straight to Delta.
-    let raw = rows_of(db.query_delta_only(&query).await?);
+    // authority here.
+    let raw = rows_of(&db.query_delta_only(&query).await?, row);
 
     assert_eq!(hybrid, raw, "the hybrid rewrite must equal the raw aggregate exactly");
     assert_eq!(hybrid.len(), 2, "both services must survive, including the one that exists only in the raw tail: {hybrid:?}");
     assert_eq!(hybrid.iter().map(|row| row.1).sum::<i64>(), 11, "every fixture row must be counted exactly once: {hybrid:?}");
 
-    // THE SAME WINDOW WITH NO UPPER BOUND — the shape monoscope's 7d and 14d
-    // panels actually send. Until 2026-08-15 the matcher demanded both bounds
-    // and answered `UnboundedTime`, so a fully built window fell back to a raw
-    // scan and timed out at the 60s statement cap.
-    //
-    // Accepting it introduces the opposite failure: `hi` becomes a plan-time
-    // stand-in, and if the trailing raw range closed at it the rewrite would
-    // silently drop the newest rows. This row sits PAST the bounded window, so
-    // only an open tail can reach it — the bounded assertions above still see 6
-    // because it is outside their `hi`.
+    // THE SAME WINDOW WITH NO UPPER BOUND. With an open tail `hi` is a plan-time
+    // stand-in; if the trailing raw range closed at it the rewrite would silently
+    // drop the newest rows. This row sits PAST the bounded window, so only an open
+    // tail can reach it.
     env.insert("t_open", hi + 1_000_000, Some("checkout"), Some(700), "rollup hybrid fixture").await?;
-    // Keep the open-ended plan-time upper bound deterministic. If this test
-    // inherits the wall clock late in the UTC day, the same six-hour covered
-    // interior falls below the 20% hybrid cost threshold and the assertion
-    // becomes time-of-day dependent.
+    // Keep the open-ended plan-time upper bound deterministic: on the wall clock
+    // the covered interior can fall below the 20% hybrid cost threshold depending
+    // on the hour of day.
     timefusion::support::set_micros(hi + 3_600_000_000);
     let open = query.replace(&format!(" AND timestamp < to_timestamp_micros({hi})"), "");
-    let (before, misses_before) = (hybrid_hits(), miss_counters());
-    let open_rows = rows_of(ctx.sql(&open).await?.collect().await?);
-    assert_eq!(hybrid_hits(), before + 1, "an open-ended window must route, not fall back to a raw scan (misses: [{}])", miss_delta(&misses_before));
-    assert_eq!(open_rows, rows_of(db.query_delta_only(&open).await?), "the open-ended rewrite must equal the raw aggregate exactly");
+    let open_rows = rows_of(&routed_hybrid(&ctx, &open, "an open-ended window must route, not fall back to a raw scan").await?, row);
+    assert_eq!(open_rows, rows_of(&db.query_delta_only(&open).await?, row), "the open-ended rewrite must equal the raw aggregate exactly");
     assert_eq!(open_rows.iter().map(|row| row.1).sum::<i64>(), 12, "the open tail must reach the row past the bounded window: {open_rows:?}");
 
-    // The shape prod's `rollup_declined_shape` log printed for months: a CAST
-    // over an aggregate plus `ORDER BY <an aggregate> LIMIT n` optimizes to
-    // `Projection(Sort(Projection(Aggregate)))`. Every peeling matcher declined
-    // it — and no bare-`SessionContext` unit test could reproduce it, because
-    // WHERE the optimizer puts that Sort depends on the session's analyzer
-    // rules. This runs on the real `Database` session, which is the only place
-    // the difference exists. `LIMIT 1` keeps it deterministic: the top bucket
-    // holds 4 rows and the other two hold 1 each.
+    // A CAST over an aggregate plus `ORDER BY <aggregate> LIMIT n` optimizes to
+    // `Projection(Sort(Projection(Aggregate)))`. Where the optimizer puts that
+    // Sort depends on the session's analyzer rules, so this must run on a real
+    // `Database` session; a bare `SessionContext` cannot reproduce it. `LIMIT 1`
+    // is deterministic: the top bucket holds 4 rows, the other two hold 1 each.
     let shaped = format!(
         "SELECT COUNT(*) AS c, avg(duration)::BIGINT AS m FROM otel_logs_and_spans \
          WHERE project_id = '{project_id}' AND timestamp >= to_timestamp_micros({lo}) AND timestamp < to_timestamp_micros({hi}) \
          GROUP BY time_bucket('1 hours', timestamp) ORDER BY 1 DESC LIMIT 1"
     );
-    let counts = |batches: Vec<datafusion::arrow::array::RecordBatch>| {
-        batches
-            .iter()
-            .filter(|b| b.num_rows() > 0)
-            .flat_map(|b| {
-                (0..b.num_rows())
-                    .map(|r| (b.column(0).as_primitive::<Int64Type>().value(r), b.column(1).as_primitive::<Int64Type>().value(r)))
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>()
-    };
-    let (before, misses_before) = (hybrid_hits(), miss_counters());
-    let routed = counts(ctx.sql(&shaped).await?.collect().await?);
-    assert_eq!(hybrid_hits(), before + 1, "the shape that defeated every peeling matcher must route (misses: [{}])", miss_delta(&misses_before));
-    assert_eq!(routed, counts(db.query_delta_only(&shaped).await?), "the substituted plan must equal the raw answer exactly");
+    let counts = |b: &RecordBatch, r: usize| (i64_at(b, 0, r), i64_at(b, 1, r));
+    let routed = rows_of(&routed_hybrid(&ctx, &shaped, "the shape that defeated every peeling matcher must route").await?, counts);
+    assert_eq!(routed, rows_of(&db.query_delta_only(&shaped).await?, counts), "the substituted plan must equal the raw answer exactly");
 
     // An UPDATE scoped to TODAY must not invalidate YESTERDAY's coverage.
     //
@@ -2945,9 +2350,7 @@ async fn a_partly_covered_window_unions_the_rollup_with_raw_and_matches_the_raw_
     .await?
     .collect()
     .await?;
-    let (before, misses_before) = (hybrid_hits(), miss_counters());
-    let after_update = rows_of(ctx.sql(&query).await?.collect().await?);
-    assert_eq!(hybrid_hits(), before + 1, "a DML confined to today must leave yesterday's coverage intact (misses: [{}])", miss_delta(&misses_before));
+    let after_update = rows_of(&routed_hybrid(&ctx, &query, "a DML confined to today must leave yesterday's coverage intact").await?, row);
     assert_eq!(after_update.iter().map(|row| row.1).sum::<i64>(), 11, "the enrichment must not change the counted rows: {after_update:?}");
 
     // monoscope's Golden Signals row filter, which is exactly the predicate the
@@ -2959,9 +2362,7 @@ async fn a_partly_covered_window_unions_the_rollup_with_raw_and_matches_the_raw_
          WHERE project_id = '{project_id}' AND (kind = 'server' OR name = 'apitoolkit-http-span' OR name = 'monoscope.http') \
            AND timestamp >= to_timestamp_micros({lo}) AND timestamp < to_timestamp_micros({hi}) GROUP BY 1 ORDER BY 2 DESC"
     );
-    let (before, misses_before) = (hybrid_hits(), miss_counters());
-    let routed_golden = ctx.sql(&golden).await?.collect().await?;
-    assert_eq!(hybrid_hits(), before + 1, "the promoted row filter must route (misses: [{}])", miss_delta(&misses_before));
+    let routed_golden = routed_hybrid(&ctx, &golden, "the promoted row filter must route").await?;
     assert_eq!(
         routed_golden.iter().map(|b| b.num_rows()).sum::<usize>(),
         db.query_delta_only(&golden).await?.iter().map(|b| b.num_rows()).sum::<usize>(),
@@ -2974,9 +2375,7 @@ async fn a_partly_covered_window_unions_the_rollup_with_raw_and_matches_the_raw_
     // difference between working and getting lucky, since monoscope's enrichment
     // happens to carry a time range but nothing guarantees the next writer will.
     ctx.sql(&format!("UPDATE otel_logs_and_spans SET hashes = make_array('by-id') WHERE project_id = '{project_id}' AND id = 't0'")).await?.collect().await?;
-    let (before, misses_before) = (hybrid_hits(), miss_counters());
-    let after_by_id = rows_of(ctx.sql(&query).await?.collect().await?);
-    assert_eq!(hybrid_hits(), before + 1, "an id-scoped DML on today's row must leave yesterday's coverage intact (misses: [{}])", miss_delta(&misses_before));
+    let after_by_id = rows_of(&routed_hybrid(&ctx, &query, "an id-scoped DML on today's row must leave yesterday's coverage intact").await?, row);
     assert_eq!(after_by_id.iter().map(|row| row.1).sum::<i64>(), 11, "the id-scoped update must not change the counted rows: {after_by_id:?}");
 
     // LAST, because it writes a new row and would move every count above it.
@@ -3101,12 +2500,10 @@ async fn a_committed_rollup_records_date_level_coverage() -> Result<()> {
 async fn a_certification_survives_a_restart_and_still_grants_the_skip() -> Result<()> {
     init_local_metrics_for_test();
     let ts = yesterday_noon();
-    let cfg = {
-        let mut cfg = (*TestConfigBuilder::new("cert_restart").with_buffer_mode(BufferMode::Enabled).build()).clone();
-        cfg.maintenance.timefusion_read_dedup_skip_swept = true;
-        cfg.maintenance.timefusion_dedup_certification_persist = true;
-        Arc::new(cfg)
-    };
+    let cfg = tuned_cfg("cert_restart", |c| {
+        c.maintenance.timefusion_read_dedup_skip_swept = true;
+        c.maintenance.timefusion_dedup_certification_persist = true;
+    });
     let project_id = new_project_id();
     let sql = window_select("name", &project_id, ts - 1, ts + 1_000);
 
@@ -3412,10 +2809,11 @@ async fn per_date_dedup_skip_matches_the_all_or_nothing_result() -> Result<()> {
     let (recent_ts, older_ts) = (noon_days_ago(0), noon_days_ago(3));
 
     let run = |per_date: bool| async move {
-        let mut cfg = (*TestConfigBuilder::new(&format!("per_date_skip_{per_date}")).with_buffer_mode(BufferMode::Enabled).build()).clone();
-        cfg.maintenance.timefusion_read_dedup_skip_swept = true;
-        cfg.maintenance.timefusion_read_dedup_skip_per_date = per_date;
-        let (db, project_id) = db_of(Arc::new(cfg)).await?;
+        let (db, project_id) = tuned_db(&format!("per_date_skip_{per_date}"), |c| {
+            c.maintenance.timefusion_read_dedup_skip_swept = true;
+            c.maintenance.timefusion_read_dedup_skip_per_date = per_date;
+        })
+        .await?;
         let row = |key: &str, ts: i64, tag: &str| -> Result<_> {
             let mut value = test_span_ts(key, "span", &project_id, ts);
             value["hashes"] = serde_json::json!([tag]);
@@ -3441,15 +2839,7 @@ async fn per_date_dedup_skip_matches_the_all_or_nothing_result() -> Result<()> {
             lo = older_ts - 1,
             hi = recent_ts + 1,
         );
-        let batches = db.query_delta_only(&sql).await?;
-        let mut rows: Vec<String> = batches
-            .iter()
-            .flat_map(|b| {
-                let col = datafusion::arrow::compute::kernels::cast::cast(b.column(0), &datafusion::arrow::datatypes::DataType::Utf8).expect("cast");
-                let col = col.as_string::<i32>();
-                (0..b.num_rows()).map(|i| col.value(i).to_string()).collect::<Vec<_>>()
-            })
-            .collect();
+        let mut rows = col0_strings(&db.query_delta_only(&sql).await?);
         rows.sort();
         Ok::<Vec<String>, anyhow::Error>(rows)
     };
@@ -3480,11 +2870,13 @@ async fn per_date_dedup_skip_matches_the_all_or_nothing_result() -> Result<()> {
 #[serial]
 #[tokio::test]
 async fn a_pruned_to_nothing_delta_scan_does_not_panic() -> Result<()> {
-    let mut cfg = (*TestConfigBuilder::new("pruned_to_nothing").with_buffer_mode(BufferMode::FlushImmediately).build()).clone();
-    cfg.maintenance.timefusion_file_bloom_pruning = true;
-    cfg.maintenance.timefusion_read_dedup_skip_swept = true;
-    cfg.maintenance.timefusion_read_dedup_skip_per_date = true;
-    let (db, project_id) = db_of(Arc::new(cfg)).await?;
+    let base = TestConfigBuilder::new("pruned_to_nothing").with_buffer_mode(BufferMode::FlushImmediately).build();
+    let (db, project_id) = db_of(tweak(base, |c| {
+        c.maintenance.timefusion_file_bloom_pruning = true;
+        c.maintenance.timefusion_read_dedup_skip_swept = true;
+        c.maintenance.timefusion_read_dedup_skip_per_date = true;
+    }))
+    .await?;
     let ts = chrono::Utc::now().timestamp_micros();
     commit_span_run(&db, &project_id, ts, 0, 8).await?;
     // Blooms are what prune whole files; without the sidecars the scan keeps
@@ -3521,7 +2913,7 @@ async fn dv_window_filters_before_read_dedup() -> Result<()> {
     let sql = format!("SELECT id FROM mor_dormant WHERE project_id = '{project_id}' AND timestamp >= '{}' AND timestamp < '{}'", at(10), at(15));
     let plan = ctx.sql(&sql).await?.create_physical_plan().await?;
     let batches = datafusion::physical_plan::collect(plan.clone(), ctx.task_ctx()).await?;
-    let mut ids: Vec<_> = batches.iter().flat_map(|b| (0..b.num_rows()).map(|i| array_get_str(b.column(0).as_ref(), i))).collect();
+    let mut ids = col0_strings(&batches);
     ids.sort();
     assert_eq!(ids, ["k10", "k11", "k13", "k14"], "filtering must not shift deletion-vector row positions");
     let dedup = find_node(&plan, "DedupExec").expect("fixture must exercise read-side dedup");

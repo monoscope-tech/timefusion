@@ -1,18 +1,11 @@
-//! Restart recovery: simulates a process crash by shutting down the
-//! BufferedWriteLayer and re-bootstrapping against the same MinIO bucket +
-//! data_dir. Asserts:
-//!   - rows that were flushed to Delta pre-restart are still queryable
-//!   - rows that lived only in WAL+MemBuffer pre-restart are restored via
-//!     WAL replay
+//! Restart recovery: crash the BufferedWriteLayer and re-bootstrap against the
+//! same bucket + data_dir, asserting flushed rows survive and unflushed rows
+//! come back via WAL replay.
 
 use std::time::Duration;
 
 use super::harness::{E2eEnv, E2eEnvBuilder, FROZEN_START_MICROS, insert_at, insert_for};
-
-/// The assertion every test here ends with: rows visible for one project.
-async fn count_rows(client: &tokio_postgres::Client, project: &str) -> anyhow::Result<i64> {
-    Ok(client.query_one("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1", &[&project]).await?.get(0))
-}
+use super::ordering_pushdown::count_rows;
 
 async fn insert_n(client: &tokio_postgres::Client, prefix: &str, n: usize) -> anyhow::Result<()> {
     for i in 0..n {
@@ -21,9 +14,8 @@ async fn insert_n(client: &tokio_postgres::Client, prefix: &str, n: usize) -> an
     Ok(())
 }
 
-/// Disable Foyer; push flush/eviction far into the future so the background
-/// tasks can't advance the WAL cursor past our writes before we crash, and
-/// every flush below is explicit.
+/// Foyer off and flush/eviction pushed far out, so no background task can
+/// advance the WAL cursor past our writes; every flush must be explicit.
 fn quiesced() -> E2eEnvBuilder {
     E2eEnv::builder().with_foyer_disabled().with_flush_interval(Duration::from_secs(3600)).with_eviction_interval(Duration::from_secs(3600))
 }
@@ -37,8 +29,7 @@ async fn flushed_rows_survive_restart() -> anyhow::Result<()> {
         insert_n(&client, "f", 5).await?;
         let stats = env.force_flush().await?;
         assert!(stats.buckets_flushed > 0, "expected at least one bucket flushed, got {stats:?}");
-        // Client must drop before restart so the pgwire shutdown notify
-        // doesn't fight in-flight queries.
+        // Client must drop before restart: pgwire shutdown fights in-flight queries.
     }
 
     env.restart().await?;
@@ -51,19 +42,11 @@ async fn flushed_rows_survive_restart() -> anyhow::Result<()> {
     Ok(())
 }
 
-// Formerly #[ignore]d as a "harness-side gap": the second-pass read returned
-// zero entries though the WAL held the inserts. That was not harness-side —
-// it was the 2026-07-08 acked-write-loss bug itself: replay's retention
-// cutoff compared virtual-clock `now` (frozen at ~2030 here) against the
-// real-clock WAL stamps, so every entry looked aged-out and was
-// checkpoint-consumed without being applied. With the cutoff removed (the
-// persisted cursor is the replay boundary), this passes and guards the
-// production crash class end-to-end.
+// Guards acked-write loss: the persisted cursor, not a wall-clock retention
+// cutoff, is the replay boundary (this env runs on a frozen virtual clock).
 #[serial_test::serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn unflushed_rows_replayed_from_wal() -> anyhow::Result<()> {
-    // The assertion is strictly about WAL replay, so no background task may
-    // advance the cursor past our writes — see `quiesced`.
     let mut env = quiesced().start().await?;
     {
         let client = env.pg_client().await?;
@@ -73,7 +56,7 @@ async fn unflushed_rows_replayed_from_wal() -> anyhow::Result<()> {
         assert!(stats.mem_total_rows >= 3, "expected rows in MemBuffer pre-crash, got {stats:?}");
     }
 
-    // disk — otherwise crash_for_test() may drop unfsynced bytes.
+    // Let the WAL fsync land; crash_for_test() drops unfsynced bytes.
     tokio::time::sleep(Duration::from_millis(400)).await;
 
     env.restart().await?;
@@ -86,12 +69,8 @@ async fn unflushed_rows_replayed_from_wal() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Cold-start latency benchmark. Builds Delta + WAL history, dirty-crashes,
-/// re-bootstraps, and asserts the second bootstrap completes in seconds — the
-/// prod symptom we're targeting is "FATAL: the database system is starting up"
-/// being returned for minutes after a dirty restart (cursor-snapshot missing
-/// or stale). With `bootstrap()` now mirroring main.rs's cursor reconcile,
-/// this test exercises the same slow path prod hits.
+/// Cold-start latency benchmark: build Delta + WAL history, dirty-crash, and
+/// assert the re-bootstrap completes in seconds rather than minutes.
 #[serial_test::serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn cold_start_under_five_seconds() -> anyhow::Result<()> {
@@ -100,10 +79,8 @@ async fn cold_start_under_five_seconds() -> anyhow::Result<()> {
     let mut env = E2eEnv::builder().start().await?;
     {
         let client = env.pg_client().await?;
-        // Stress what actually scales in derive_wal_cursors_from_delta:
-        //   - many (project, table) topic pairs → many Delta tables to open + scan
-        //   - several flush rounds per project → real commit history depth
-        //   - a final un-flushed batch per project → WAL replay has actual work
+        // Stress what scales in derive_wal_cursors_from_delta: many topic pairs,
+        // real commit-history depth, and un-replayed WAL entries.
         for round in 0..FLUSHED_ROUNDS {
             for p in 0..PROJECTS {
                 for i in 0..5 {
@@ -112,14 +89,13 @@ async fn cold_start_under_five_seconds() -> anyhow::Result<()> {
             }
             env.force_flush().await?;
         }
-        // One more batch per project that we deliberately do NOT flush — so
-        // the WAL has un-replayed entries past the Delta watermark on crash.
+        // Deliberately unflushed, so the WAL has entries past the Delta watermark.
         for p in 0..PROJECTS {
             for i in 0..5 {
                 insert_for(&client, &format!("p-{p}"), &format!("u-{i}"), FROZEN_START_MICROS).await?;
             }
         }
-        // Let WAL fsync (200ms schedule) catch up before the dirty crash.
+        // Let the WAL fsync catch up before the dirty crash.
         tokio::time::sleep(Duration::from_millis(400)).await;
     }
 
@@ -127,9 +103,8 @@ async fn cold_start_under_five_seconds() -> anyhow::Result<()> {
     env.restart().await?;
     let restart_elapsed = t0.elapsed();
 
-    // The physical-history optimization scans the unified Delta log once and
-    // tenant inherited a co-tenant's cursor and that both the flushed prefix
-    // and unflushed WAL tail survived for every project.
+    // Per project: no tenant may inherit a co-tenant's cursor, and both the
+    // flushed prefix and the unflushed WAL tail must survive.
     let client = env.pg_client().await?;
     for p in 0..PROJECTS {
         let project = format!("p-{p}");
@@ -137,39 +112,20 @@ async fn cold_start_under_five_seconds() -> anyhow::Result<()> {
         assert_eq!(count, (FLUSHED_ROUNDS * 5 + 5) as i64, "dirty restart lost or duplicated rows for {project}");
     }
 
-    // Two bars: ~4s isolated (`cargo nextest run cold_start_under_five_seconds`),
-    // but under the full suite's ~10-way parallelism wall-clock inflates ~3x
-    // (measured 11.3s, 2026-08-03), so the in-suite assert is 30s — still far
-    // below the minutes-class prod symptom this guards. Per-phase timing is
-    // logged from bootstrap.rs; grep for `bootstrap.phase=`.
+    // Isolated this is ~4s; the bar is 30s because suite parallelism inflates
+    // wall-clock ~3x, and it still catches the minutes-class regression.
     assert!(restart_elapsed < Duration::from_secs(30), "cold-start regression: re-bootstrap took {:?} (in-suite bar <30s; isolated bar ~5s)", restart_elapsed);
     Ok(())
 }
 
-/// **The seam.** Everything else about the landed-batch skip is unit-tested on
-/// one side or the other; this is the only test that runs the whole chain
-/// against real Delta on real object storage:
+/// The landed-batch skip end to end: commit writes `timefusion.landed_digests`
+/// -> boot scan installs it into the layer -> the re-flush of the replayed rows
+/// is declined.
 ///
-/// ```text
-/// flush commit writes timefusion.landed_digests
-///   -> table.history() surfaces it at boot
-///   -> derive_wal_cursors_from_delta parses + installs it into the layer
-///   -> the re-flush of the REPLAYED rows is DECLINED
-/// ```
-///
-/// Two wiring bugs lived in exactly this gap and no unit test could see
-/// them: the layer was attached to `Database` only AFTER the derive call, so
-/// the install silently found no layer; and the derive is skipped altogether
-/// on a boot whose WAL is already consumed.
-///
-/// **Why the duplicate has to be made with a hook.** Re-sending the same rows
-/// over pgwire does NOT reproduce one: `otel_logs_and_spans` is
-/// `version_append`, so `stamp_version` gives every inbound write a fresh
-/// `updated_at` and the content genuinely differs. Only WAL replay preserves
-/// the durable stamp (`observe_stamp`). That is a property worth stating —
-/// **a client cannot spoof a landed identity, because it cannot reproduce the
-/// stamp** — and it is also why the duplicate here is made the way prod makes
-/// it: a commit that LANDS while its cursor advance is lost.
+/// The duplicate must be produced by the drop-cursor-advance hook, not by
+/// re-sending rows: `otel_logs_and_spans` is `version_append`, so an inbound
+/// write gets a fresh `updated_at` and is genuinely different content. Only WAL
+/// replay preserves the durable stamp, so a client cannot spoof a landed identity.
 #[serial_test::serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn replayed_rows_that_delta_already_holds_are_not_written_again() -> anyhow::Result<()> {
@@ -186,8 +142,7 @@ async fn replayed_rows_that_delta_already_holds_are_not_written_again() -> anyho
 
     env.restart().await?;
 
-    // The duplicate producer, reproduced: rows already durable in Delta are
-    // back in MemBuffer, queued to be written a second time.
+    // Rows already durable in Delta are back in MemBuffer, queued to be written again.
     let stats = env.snapshot_stats();
     assert!(stats.wal_replay_rows >= 5, "replay did not re-insert the committed rows, so there is no duplicate to decline: {stats:?}");
     assert_eq!(stats.landed_skips_total, 0, "a fresh process has skipped nothing yet");

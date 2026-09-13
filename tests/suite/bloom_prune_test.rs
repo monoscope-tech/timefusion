@@ -1,5 +1,4 @@
 //! Integration tests for file-level needle pruning (bloom sidecars).
-//! docs/plans/2026-08-22-file-level-needle-pruning.md
 
 use std::{sync::Arc, time::Duration};
 
@@ -22,8 +21,7 @@ fn row(id: &str, project_id: &str, ts: i64, trace_id: &str) -> serde_json::Value
     })
 }
 
-/// The in-window timestamp every test writes at: 3h ago, so the ±1h query
-/// window in `count_by_trace_id` stays on the same day as the row's partition.
+/// 3h ago: keeps the ±1h window in `count_by_trace_id` on the row's partition day.
 fn ts() -> i64 {
     (chrono::Utc::now() - chrono::Duration::hours(3)).timestamp_micros()
 }
@@ -34,10 +32,8 @@ async fn insert(db: &Arc<Database>, project_id: &str, rows: Vec<serde_json::Valu
     Ok(())
 }
 
-/// Database + a bloom registry attached, plus a fresh project id. The registry's
-/// own object store (sidecar storage) is independent of the table's S3 store —
-/// `bloom_sidecar_reconcile` reads parquet through the table's store and writes
-/// sidecars through the registry's.
+/// Database + bloom registry + a fresh project id. The registry's sidecar store is
+/// deliberately separate from the table's store (reconcile reads one, writes the other).
 async fn setup(name: &str) -> Result<(Arc<Database>, String)> {
     let cfg = TestConfigBuilder::new(name).with_buffer_mode(BufferMode::Enabled).build();
     let reg = Arc::new(BloomPruneRegistry::new(Arc::new(InMemory::new()), 64 << 20, Duration::from_secs(300)));
@@ -46,8 +42,8 @@ async fn setup(name: &str) -> Result<(Arc<Database>, String)> {
     Ok((db, project_id))
 }
 
-/// `COUNT(*)` for a project/trace_id, bounded by a same-day time window (so the
-/// scan's plan path actually consults the bloom registry).
+/// `COUNT(*)` for a project/trace_id; the time bound is required for the scan to
+/// consult the bloom registry.
 async fn count_by_trace_id(db: &Arc<Database>, project_id: &str, trace_id: &str, ts: i64) -> Result<i64> {
     let mut ctx = Arc::clone(db).create_session_context();
     db.setup_session_context(&mut ctx)?;
@@ -66,7 +62,6 @@ async fn bloom_sidecar_build_has_no_false_negatives() -> Result<()> {
     let (db, project_id) = setup("bloom_no_fn").await?;
     let ts = ts();
 
-    // ~100 rows, one distinguished present trace_id among many distinct ones.
     let rows: Vec<_> = (0..100).map(|i| row(&format!("id-{i}"), &project_id, ts, &format!("trace-{i}"))).collect();
     insert(&db, &project_id, rows).await?;
 
@@ -74,9 +69,7 @@ async fn bloom_sidecar_build_has_no_false_negatives() -> Result<()> {
     assert!(built >= 1, "reconcile should have built at least one file's sidecar, got {built}");
     assert_eq!(errors, 0);
 
-    // Present needle: bloom must never produce a false negative.
     assert_eq!(count_by_trace_id(&db, &project_id, "trace-42", ts).await?, 1, "present trace_id must be returned");
-    // Absent needle: bloom pruning should reject the file and the row genuinely doesn't exist.
     assert_eq!(count_by_trace_id(&db, &project_id, "trace-does-not-exist", ts).await?, 0, "absent trace_id must return zero rows");
     Ok(())
 }
@@ -93,16 +86,14 @@ async fn bloom_pruning_never_drops_updated_or_deleted_versions() -> Result<()> {
     db.bloom_sidecar_reconcile().await?;
     assert_eq!(count_by_trace_id(&db, &project_id, trace_id, ts).await?, 1);
 
-    // UPDATE appends a new version (version_append table); the needle column
-    // is untouched, so both versions still carry it and the file must not be
-    // bloom-rejected out from under the fresher version.
+    // UPDATE appends a new version; both versions carry the needle, so neither file
+    // may be bloom-rejected out from under the fresher version.
     let sql = format!("UPDATE otel_logs_and_spans SET hashes = make_array('v2') WHERE project_id = '{project_id}' AND context___trace_id = '{trace_id}'");
     ctx.sql(&sql).await?.collect().await?;
     db.bloom_sidecar_reconcile().await?;
     assert_eq!(count_by_trace_id(&db, &project_id, trace_id, ts).await?, 1, "must still resolve to exactly the latest version, not 0 or 2");
 
-    // DELETE appends a tombstoned version — the row must disappear, not be
-    // resurrected by an older, non-tombstoned physical copy the bloom kept.
+    // DELETE appends a tombstone; an older physical copy must not resurrect the row.
     let del = format!("DELETE FROM otel_logs_and_spans WHERE project_id = '{project_id}' AND context___trace_id = '{trace_id}'");
     ctx.sql(&del).await?.collect().await?;
     db.bloom_sidecar_reconcile().await?;
@@ -116,31 +107,26 @@ async fn bloom_pruning_excludes_files_and_empty_needle_scans_zero_files() -> Res
     let (db, project_id) = setup("bloom_exclude").await?;
     let ts = ts();
 
-    // Two independent Delta commits (two files, same project/date) with
-    // disjoint trace_id sets.
+    // Two commits => two files, same project/date, disjoint trace_id sets.
     insert(&db, &project_id, vec![row("a1", &project_id, ts, "trace-A")]).await?;
     insert(&db, &project_id, vec![row("b1", &project_id, ts, "trace-B")]).await?;
     db.bloom_sidecar_reconcile().await?;
 
     let reg = db.bloom_prune().expect("registry attached");
     let before = reg.stats.files_rejected.load(Relaxed);
-    // Needle only in file A: file B must be provably rejected.
     assert_eq!(count_by_trace_id(&db, &project_id, "trace-A", ts).await?, 1);
     assert!(reg.stats.files_rejected.load(Relaxed) > before, "querying a needle present in only one file must reject the other");
 
     let before2 = reg.stats.files_rejected.load(Relaxed);
-    // Needle in neither file: both files rejected, zero rows, no crash on the
-    // empty-include-selection path.
+    // Needle in neither file: exercises the empty-include-selection path.
     assert_eq!(count_by_trace_id(&db, &project_id, "trace-nowhere", ts).await?, 0);
     assert!(reg.stats.files_rejected.load(Relaxed) >= before2 + 2, "an all-rejected needle must reject every in-window file");
     Ok(())
 }
 
-/// The SPLIT path — the branch prod runs on nearly every point lookup: tantivy
-/// covers SOME files (equality routing engages the prefilter, `covered_files`
-/// is Some) while others are raw debt. Bloom rejection must reach BOTH legs
-/// without dropping rows, and the all-rejected case must take the
-/// empty-include arm, not the unrestricted fallback.
+/// Split path: tantivy covers some files while others are unindexed. Bloom rejection
+/// must reach both legs without dropping rows, and an all-rejected needle must take
+/// the empty-include arm rather than falling back to an unrestricted scan.
 #[tokio::test]
 async fn split_path_bloom_prunes_indexed_and_raw_legs() -> Result<()> {
     use std::sync::atomic::Ordering::Relaxed;
@@ -158,8 +144,8 @@ async fn split_path_bloom_prunes_indexed_and_raw_legs() -> Result<()> {
     let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
     let ts = ts();
 
-    // File 1: tantivy-COVERED (manifest published via the indexer callback,
-    // exactly what the flush hook does). File 2: raw debt, never indexed.
+    // File 1 is tantivy-covered via the indexer callback (what the flush hook does);
+    // file 2 is never indexed.
     let b1 = json_to_batch(vec![row("a1", &project_id, ts, "trace-covered")])?;
     db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![b1.clone()], true, None).await?;
     let file1: Vec<String> = db.list_file_uris(&project_id, "otel_logs_and_spans").await?;
@@ -170,23 +156,18 @@ async fn split_path_bloom_prunes_indexed_and_raw_legs() -> Result<()> {
     db.bloom_sidecar_reconcile().await?;
 
     let stats = &db.bloom_prune().unwrap().stats;
-    // Needle only in the RAW file: the raw leg must serve it (no row loss
-    // through the split) while bloom rejects the covered file.
     let before = stats.files_rejected.load(Relaxed);
     assert_eq!(count_by_trace_id(&db, &project_id, "trace-raw", ts).await?, 1, "raw-leg row must survive the split");
     assert!(stats.files_rejected.load(Relaxed) > before, "covered file must be bloom-rejected for the raw needle");
 
-    // Needle only in the COVERED file: indexed leg serves it, raw file rejected.
     let before = stats.files_rejected.load(Relaxed);
     assert_eq!(count_by_trace_id(&db, &project_id, "trace-covered", ts).await?, 1, "indexed-leg row must survive");
     assert!(stats.files_rejected.load(Relaxed) > before, "raw file must be bloom-rejected for the covered needle");
 
-    // Prove this exercised the SPLIT branch, not the no-coverage fallback:
-    // the prefilter ran (so `covered_files` was Some) while raw debt existed.
+    // Proves the split branch ran rather than the no-coverage fallback.
     assert!(search.stats.queries.load(Relaxed) > 0, "equality routing must have engaged the tantivy prefilter");
 
-    // Needle in NEITHER: all in-window files rejected — the split path's
-    // empty-include arm, and still zero rows.
+    // Needle in neither file: the split path's empty-include arm.
     let before = stats.files_rejected.load(Relaxed);
     assert_eq!(count_by_trace_id(&db, &project_id, "trace-nowhere", ts).await?, 0);
     assert!(stats.files_rejected.load(Relaxed) >= before + 2, "an all-absent needle must reject every file on the split path");

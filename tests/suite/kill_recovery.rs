@@ -1,22 +1,19 @@
-//! SIGKILL durability regression for the 2026-07-27 acked-write loss.
-//!
-//! Unlike the in-process restart tests, this suite kills the real pgwire server
-//! without running destructors. Every acknowledged insert must remain queryable
-//! after restart; rejected inserts carry no such durability promise.
+//! SIGKILL durability tests: the real server binary is killed without running
+//! destructors. Every acknowledged insert must remain queryable after restart;
+//! rejected inserts carry no durability promise.
 
 use anyhow::{Context, Result};
-use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
-use std::time::Duration;
+use std::{
+    path::PathBuf,
+    process::{Child, Command, Stdio},
+    time::Duration,
+};
+use test_case::test_case;
 use tokio_postgres::{Client, NoTls};
 
 const LOCAL_MINIO: &str = "127.0.0.1:9000";
 const PROJECT: &str = "kill_test";
 
-/// An unused localhost port: bind :0, read the assignment, release it. The
-/// window between release and the child's bind is small enough in practice, and
-/// unlike a fixed port it cannot collide with a concurrent test or a socket the
-/// previous incarnation has not finished releasing.
 fn free_port() -> Result<u16> {
     Ok(std::net::TcpListener::bind("127.0.0.1:0")?.local_addr()?.port())
 }
@@ -25,13 +22,10 @@ async fn port_open(addr: &str) -> bool {
     tokio::net::TcpStream::connect(addr).await.is_ok()
 }
 
-/// Local-first MinIO, same resolution order as the sqllogictest harness:
-/// explicit endpoint → already-running :9000 → spawn the local `minio` binary.
-/// Docker is deliberately NOT a fallback here: this suite kills processes and
-/// needs a stable endpoint across restarts. Whichever MinIO answers must
-/// implement conditional PUT (`If-None-Match: *`) — Delta commit versions are
-/// only atomic because of it, and a pre-2024 MinIO turns two racing commits
-/// into a silent overwrite (see `e2e::harness::MINIO_TAG`).
+/// Local-first MinIO: explicit endpoint → already-running :9000 → spawn the
+/// local `minio` binary. No Docker fallback — the endpoint must stay stable
+/// across restarts. Whichever MinIO answers must support conditional PUT
+/// (`If-None-Match: *`), or racing Delta commits silently overwrite.
 async fn ensure_minio() -> Result<String> {
     if let Ok(ep) = std::env::var("TIMEFUSION_TEST_S3_ENDPOINT") {
         return Ok(ep);
@@ -69,25 +63,22 @@ async fn create_bucket(endpoint: &str, bucket: &str) -> Result<()> {
         .force_path_style(true)
         .behavior_version(aws_config::BehaviorVersion::latest())
         .build();
-    match aws_sdk_s3::Client::from_conf(conf).create_bucket().bucket(bucket).send().await {
-        Ok(_) => Ok(()),
-        Err(e) => {
-            let msg = format!("{e:?}");
-            anyhow::ensure!(msg.contains("BucketAlreadyOwnedByYou") || msg.contains("BucketAlreadyExists"), "create_bucket: {msg}");
-            Ok(())
-        }
+    if let Err(e) = aws_sdk_s3::Client::from_conf(conf).create_bucket().bucket(bucket).send().await {
+        let msg = format!("{e:?}");
+        anyhow::ensure!(msg.contains("BucketAlreadyOwnedByYou") || msg.contains("BucketAlreadyExists"), "create_bucket: {msg}");
     }
+    Ok(())
 }
 
-/// Knobs that shape the crash window under test. Defaults give the plain
-/// "acked into WAL+MemBuffer, nothing flushed yet" case.
+/// Knobs shaping the crash window. Defaults give the plain "acked into
+/// WAL+MemBuffer, nothing flushed yet" case.
 #[derive(Clone)]
 struct TfOpts {
-    /// Long by default so nothing flushes behind our back: the WAL is then the
-    /// sole durability mechanism, which is precisely the invariant under test.
+    /// Long by default so nothing flushes behind our back and the WAL is the
+    /// sole durability mechanism.
     flush_interval_secs: u64,
     buffer_max_memory_mb: usize,
-    /// Extra env applied last — lets a case turn on pressure/backpressure paths.
+    /// Applied last, so a case can override anything above.
     extra_env: Vec<(String, String)>,
 }
 
@@ -104,7 +95,7 @@ struct Tf {
     bucket: String,
     prefix: String,
     endpoint: String,
-    /// Child stdout capture (`.stderr.log` sibling for stderr) — see `spawn`.
+    /// Child stdout capture; stderr goes to the `.stderr.log` sibling.
     boot_log: PathBuf,
     opts: TfOpts,
 }
@@ -113,11 +104,9 @@ impl Tf {
     async fn start(test_name: &str, opts: TfOpts) -> Result<Self> {
         let endpoint = ensure_minio().await?;
         let id = uuid::Uuid::new_v4().to_string()[..8].to_string();
-        // Per-run bucket, not a shared one: the e2e/sqllogictest suites reset
-        // MinIO, which silently deletes buckets out from under a concurrent
-        // suite (see CLAUDE.md). A unique prefix does not protect against that;
-        // a unique bucket does. This is why CI's parallel shards saw these
-        // tests fail while they passed locally.
+        // Per-run bucket, not a shared one: other suites reset MinIO and would
+        // delete a shared bucket out from under this one. A unique prefix is
+        // not enough.
         let bucket = format!("timefusion-kill-{id}");
         create_bucket(&endpoint, &bucket).await?;
         let prefix = format!("kill-{test_name}-{id}");
@@ -131,12 +120,10 @@ impl Tf {
     }
 
     /// (Re)spawn the real binary against the SAME data dir + table prefix, so a
-    /// restart sees the previous incarnation's WAL exactly as prod does.
+    /// restart sees the previous incarnation's WAL.
     async fn spawn(&mut self) -> Result<()> {
-        // A fresh port every spawn. A hash-derived fixed port collided between
-        // concurrent tests, and re-binding the same port right after SIGKILL hit
-        // EADDRINUSE while the dead process's socket lingered — both surfaced as
-        // "never became ready", not as a durability failure.
+        // A fresh port every spawn: rebinding the old one right after SIGKILL
+        // races the dead process's lingering socket.
         self.port = free_port()?;
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_timefusion"));
         cmd.env("AWS_S3_ENDPOINT", &self.endpoint)
@@ -156,18 +143,13 @@ impl Tf {
             .env("TIMEFUSION_FLUSH_INTERVAL_SECS", self.opts.flush_interval_secs.to_string())
             .env("TIMEFUSION_BUFFER_MAX_MEMORY_MB", self.opts.buffer_max_memory_mb.to_string())
             .env("TIMEFUSION_FOYER_DISABLED", "true")
-            // Explicit password, matching connect()'s `password=postgres`. Locally
-            // the binary's dotenv() found the repo .env (PGWIRE_PASSWORD=postgres)
-            // and auth happened to line up; on CI there is no .env, so insecure
-            // mode expected an EMPTY password and rejected the harness every
-            // 100ms for 300s — every "never became ready" since the suite landed.
+            // Must be set explicitly to match connect()'s `password=postgres`:
+            // without it, insecure mode expects an EMPTY password and rejects us.
             .env("PGWIRE_PASSWORD", "postgres")
             .env("TIMEFUSION_ALLOW_INSECURE_AUTH", "true")
             .env("RUST_LOG", "warn,timefusion=info")
-            // Capture BOTH streams to a per-spawn file: tracing writes to
-            // stdout, so nulling it made every CI "never became ready" failure
-            // blind — five tests red since the suite landed with zero boot logs
-            // to read. The tail is surfaced in the wait_ready failure.
+            // Capture BOTH streams: tracing writes to stdout, and wait_ready
+            // surfaces the tail of these files on failure.
             .stdout(Stdio::from(std::fs::File::create(&self.boot_log)?))
             .stderr(Stdio::from(std::fs::File::create(self.boot_log.with_extension("stderr.log"))?));
         for (k, v) in &self.opts.extra_env {
@@ -178,11 +160,8 @@ impl Tf {
     }
 
     async fn wait_ready(&self) -> Result<()> {
-        // 60s was enough locally but not on CI, where four test shards, MinIO
-        // and a debug-build TimeFusion contend for one runner: shard 2 failed at
-        // 63.8s having spawned fine. Boot here is dominated by Delta/MinIO
-        // round-trips, so wait generously — a real failure to start still fails,
-        // just later.
+        // Boot is dominated by Delta/MinIO round-trips and CI contends hard, so
+        // the CI budget is deliberately generous (5 min).
         let attempts = if std::env::var_os("CI").is_some() { 3000 } else { 600 };
         for _ in 0..attempts {
             if port_open(&format!("127.0.0.1:{}", self.port)).await && self.connect().await.is_ok() {
@@ -192,20 +171,11 @@ impl Tf {
         }
         let tail = |p: &std::path::Path| {
             std::fs::read_to_string(p)
-                .map(|c| {
-                    c.lines().rev().take(40).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join(
-                        "
-",
-                    )
-                })
+                .map(|c| c.lines().rev().take(40).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n"))
                 .unwrap_or_default()
         };
         anyhow::bail!(
-            "timefusion never became ready on port {}
---- child stdout (last 40 lines) ---
-{}
---- child stderr ---
-{}",
+            "timefusion never became ready on port {}\n--- child stdout (last 40 lines) ---\n{}\n--- child stderr ---\n{}",
             self.port,
             tail(&self.boot_log),
             tail(&self.boot_log.with_extension("stderr.log"))
@@ -250,23 +220,17 @@ impl Drop for Tf {
     }
 }
 
-/// One multi-row INSERT. Returns only after the server acked it — which is the
-/// precise moment the durability promise is made.
+/// One multi-row INSERT. Returns only once the server acked it — the moment the
+/// durability promise is made.
 async fn insert_rows(client: &Client, project: &str, tag: &str, n: usize, base_ts: i64) -> Result<()> {
     let dt = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(base_ts).unwrap();
-    let values: Vec<String> = (0..n)
-        .map(|i| {
-            format!(
-                "('{project}', '{}', '{}', '{tag}-{i}', 'span', 'OK', 'm', 'INFO', ARRAY[]::text[], ARRAY['s'])",
-                dt.date_naive(),
-                dt.format("%Y-%m-%d %H:%M:%S%.f"),
-            )
-        })
-        .collect();
-    let sql = format!(
-        "INSERT INTO otel_logs_and_spans (project_id, date, timestamp, id, name, status_code, status_message, level, hashes, summary) VALUES {}",
-        values.join(",")
-    );
+    let (date, ts) = (dt.date_naive(), dt.format("%Y-%m-%d %H:%M:%S%.f"));
+    let values = (0..n)
+        .map(|i| format!("('{project}', '{date}', '{ts}', '{tag}-{i}', 'span', 'OK', 'm', 'INFO', ARRAY[]::text[], ARRAY['s'])"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql =
+        format!("INSERT INTO otel_logs_and_spans (project_id, date, timestamp, id, name, status_code, status_message, level, hashes, summary) VALUES {values}");
     client.execute(&sql, &[]).await.map(|_| ()).context("insert")
 }
 
@@ -279,11 +243,8 @@ async fn count_rows(client: &Client, project: &str) -> Result<i64> {
 async fn count_after_restart(tf: &Tf, project: &str) -> Result<i64> {
     let mut last = anyhow::anyhow!("no attempt");
     for _ in 0..30 {
-        match tf.connect().await {
-            Ok(c) => match count_rows(&c, project).await {
-                Ok(n) => return Ok(n),
-                Err(e) => last = e,
-            },
+        match async { anyhow::Ok(count_rows(&tf.connect().await?, project).await?) }.await {
+            Ok(n) => return Ok(n),
             Err(e) => last = e,
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -292,23 +253,21 @@ async fn count_after_restart(tf: &Tf, project: &str) -> Result<i64> {
 }
 
 /// Rows the server ACKED, per project — the only rows carrying a durability
-/// promise. Rows rejected with an error are the producer's DLQ problem.
+/// promise.
 type Acked = Vec<(String, usize)>;
 
-/// The crash drill every case below shares: `writer` does the inserts and
-/// reports what was acked; the acked rows must be readable pre-kill, survive a
-/// SIGKILL (no destructors, no flush, no cursor persist — the faithful OOM),
-/// and come back in full after a restart against the same WAL. `kill_delay`
-/// lets a case land the kill inside a specific window (e.g. mid flush-cycle).
+/// The crash drill every case shares: `writer` inserts and reports what was
+/// acked; those rows must be readable pre-kill and again after SIGKILL +
+/// restart against the same WAL. `kill_delay` lands the kill in a specific
+/// window (e.g. mid flush-cycle).
 async fn crash_drill(name: &str, opts: TfOpts, kill_delay: Option<Duration>, writer: impl AsyncFnOnce(&Tf) -> Result<Acked>) -> Result<()> {
     let mut tf = Tf::start(name, opts).await?;
     let acked = writer(&tf).await?;
     let total: usize = acked.iter().map(|(_, n)| n).sum();
     assert!(total > 0, "every insert was rejected; test proves nothing");
 
-    // The readable count must equal exactly what was acked: an ack that
-    // produced no row is silent loss; a row from a rejected insert is a
-    // phantom write.
+    // Readable must equal acked exactly: fewer is silent loss, more is a
+    // phantom write from a rejected insert.
     let client = tf.connect().await?;
     for (p, n) in &acked {
         let readable = count_rows(&client, p).await?;
@@ -334,8 +293,8 @@ async fn crash_drill(name: &str, opts: TfOpts, kill_delay: Option<Duration>, wri
 }
 
 /// `rounds` × `rows` inserts of `PROJECT` from one connection. With `tolerate`,
-/// an Err is explicit backpressure — which the producer DLQs — so it is counted
-/// out instead of failing the test; without it, any error is a failure.
+/// an Err counts as explicit backpressure and is excluded from the acked total
+/// instead of failing the test.
 async fn insert_rounds(tf: &Tf, tag: &str, rounds: usize, rows: usize, tolerate: bool) -> Result<Acked> {
     let client = tf.connect().await?;
     let ts = chrono::Utc::now().timestamp_micros();
@@ -343,56 +302,43 @@ async fn insert_rounds(tf: &Tf, tag: &str, rounds: usize, rows: usize, tolerate:
     for round in 0..rounds {
         match insert_rows(&client, PROJECT, &format!("{tag}{round}"), rows, ts).await {
             Ok(()) => acked += rows,
-            Err(e) => {
-                if !tolerate {
-                    return Err(e);
-                }
-            }
+            Err(e) if !tolerate => return Err(e),
+            Err(_) => {}
         }
     }
     Ok(vec![(PROJECT.to_string(), acked)])
 }
 
-/// CASE 1 — the incident in its simplest form. Rows acked into WAL+MemBuffer,
-/// nothing flushed, process SIGKILLed. WAL replay must restore every acked row.
+// Single-connection crash cases: `rounds` × `rows` inserts, then the shared
+// drill. The first argument names the run (storage prefix + row tag).
+//
+// Nothing flushed before the kill: WAL replay alone must restore every acked row.
+#[test_case("baseline", TfOpts::default(), None, 1, 500, false ; "acked_rows_survive_sigkill")]
+// Killed mid-flush: a flush that advances the WAL cursor for a Delta commit
+// that never lands must not strand the entries it claimed. 2s interval + a
+// 900ms pause puts a flush in flight at kill time.
+#[test_case("during-flush", TfOpts { flush_interval_secs: 2, ..Default::default() }, Some(Duration::from_millis(900)), 10, 200, false ; "acked_rows_survive_sigkill_during_flush")]
+// Killed under memory pressure: 40 × 500 rows far exceeds the 8MB budget, so
+// the pressure valve, relief flush and eviction are all live and some inserts
+// are rejected outright. Acked rows must still survive.
+#[test_case("pressure", TfOpts { flush_interval_secs: 3600, buffer_max_memory_mb: 8, ..Default::default() }, None, 40, 500, true ; "acked_rows_survive_sigkill_under_memory_pressure")]
+// Silent-ack guard: when the server cannot durably accept a write it must
+// error, never return a success tag. A 0GB WAL hard cap arms the backpressure
+// breaker as soon as any WAL exists; the drill's pre-kill equality is what
+// catches a success tag returned for rows that never landed.
+#[test_case(
+    "no-silent-ack",
+    TfOpts { flush_interval_secs: 3600, buffer_max_memory_mb: 8, extra_env: vec![("TIMEFUSION_WAL_HARD_LIMIT_GB".into(), "0".into())] },
+    None, 30, 200, true ; "rejected_writes_error_and_are_never_silently_acked"
+)]
 #[tokio::test(flavor = "multi_thread")]
 #[serial_test::serial]
-async fn acked_rows_survive_sigkill() -> Result<()> {
-    crash_drill("baseline", TfOpts::default(), None, async |tf| insert_rounds(tf, "base", 1, 500, false).await).await
+async fn sigkill_drill(name: &str, opts: TfOpts, kill_delay: Option<Duration>, rounds: usize, rows: usize, tolerate: bool) -> Result<()> {
+    crash_drill(name, opts, kill_delay, async |tf| insert_rounds(tf, name, rounds, rows, tolerate).await).await
 }
 
-/// CASE 2 — kill while a background flush is in flight. Reproduces the prod
-/// shape where an emergency flush was running as the box died: a flush that
-/// advances the WAL cursor for a Delta commit that never lands must not strand
-/// the entries it claimed.
-#[tokio::test(flavor = "multi_thread")]
-#[serial_test::serial]
-async fn acked_rows_survive_sigkill_during_flush() -> Result<()> {
-    // 2s flush interval + a 900ms pause before the kill => a flush is
-    // near-certainly mid-commit when we kill, without warning.
-    crash_drill("during-flush", TfOpts { flush_interval_secs: 2, ..Default::default() }, Some(Duration::from_millis(900)), async |tf| {
-        insert_rounds(tf, "f", 10, 200, false).await
-    })
-    .await
-}
-
-/// CASE 3 — kill under memory pressure. Prod was thrashing for ~9 minutes
-/// before the OOM; the pressure valve, relief flush and eviction were all live.
-/// Every row the server ACKED must still survive, however hard it was squeezed.
-#[tokio::test(flavor = "multi_thread")]
-#[serial_test::serial]
-async fn acked_rows_survive_sigkill_under_memory_pressure() -> Result<()> {
-    // 40 × 500 rows pushes well past the 8MB budget, so the pressure path is
-    // genuinely engaged and some inserts are rejected outright.
-    crash_drill("pressure", TfOpts { flush_interval_secs: 3600, buffer_max_memory_mb: 8, ..Default::default() }, None, async |tf| {
-        insert_rounds(tf, "p", 40, 500, true).await
-    })
-    .await
-}
-
-/// CASE 4 — multi-tenant. Prod lost data across 10 projects at once; WAL topics
-/// are sharded per (project, table), so a per-shard cursor/hold bug can strand
-/// some tenants while others survive. Single-tenant tests would miss that.
+/// WAL topics are sharded per (project, table), so a per-shard cursor/hold bug
+/// can strand some tenants while others survive — invisible to a single-tenant test.
 #[tokio::test(flavor = "multi_thread")]
 #[serial_test::serial]
 async fn acked_rows_survive_sigkill_multi_tenant() -> Result<()> {
@@ -411,34 +357,8 @@ async fn acked_rows_survive_sigkill_multi_tenant() -> Result<()> {
     .await
 }
 
-/// CASE 5 — the silent-ack guard. When the server CANNOT durably accept a
-/// write it must return an error, never a success tag. This is the contract the
-/// producer's DLQ depends on; prod saw zero DLQ traffic while losing 200k rows,
-/// so a success-on-failure path anywhere here is fatal by itself.
-///
-/// Armed by driving the WAL hard-backpressure breaker to its floor; whatever
-/// the acked/rejected split turns out to be, the drill's pre-kill equality is
-/// what catches a success tag returned for rows that never landed.
-#[tokio::test(flavor = "multi_thread")]
-#[serial_test::serial]
-async fn rejected_writes_error_and_are_never_silently_acked() -> Result<()> {
-    crash_drill(
-        "no-silent-ack",
-        TfOpts {
-            flush_interval_secs: 3600,
-            buffer_max_memory_mb: 8,
-            // 0GB hard cap => the breaker is armed as soon as any WAL exists.
-            extra_env: vec![("TIMEFUSION_WAL_HARD_LIMIT_GB".into(), "0".into())],
-        },
-        None,
-        async |tf| insert_rounds(tf, "sa", 30, 200, true).await,
-    )
-    .await
-}
-
-/// CASE 6 — concurrent inserts from many connections, then kill. Prod ingest is
-/// 9 monoscope consumers writing in parallel; the WAL append path shards and
-/// takes per-shard locks, so a lost-hold race only shows under real concurrency.
+/// The WAL append path takes per-shard locks, so a lost-hold race only shows
+/// under genuinely concurrent writers.
 #[tokio::test(flavor = "multi_thread")]
 #[serial_test::serial]
 async fn acked_rows_survive_sigkill_under_concurrent_writers() -> Result<()> {

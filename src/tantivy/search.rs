@@ -3,11 +3,9 @@
 //! Disk cache layout (under `cache_root`):
 //!   tantivy_cache/{table}/{project_id}/{file_uuid}/  (extracted index dir)
 //!
-//! Missing blobs are downloaded, unpacked, atomically installed, memory-mapped,
-//! and retained in a process LRU. Immutable blob paths need only eviction.
-//!
-//! [`TantivySearchService::reap_disk_cache`] bounds extracted indexes because
-//! object-store GC cannot see them and the cache shares disk with the WAL.
+//! Blob paths are immutable, so cached dirs are never stale — only evicted
+//! (see [`TantivySearchService::reap_disk_cache`], which bounds the tree since
+//! object-store GC cannot see it).
 
 use std::{
     collections::{HashMap, HashSet},
@@ -34,15 +32,8 @@ use crate::tantivy::{
     upsert_manifest,
 };
 
-/// Per-phase timings and counts for one process's tantivy read path, so the
-/// prefilter's cost can be attributed from `timefusion_stats` instead of by
-/// differencing query wall-clock on a loaded box. Sums and counts only —
-/// they divide into means and that is all this needs to answer.
-///
-/// Every counter here was added because the path had NONE: the pre-existing
-/// `index_opens` was incremented and never read by anything, and the OTel
-/// counters don't reach pgwire, so the biggest cost centre on the read path
-/// could not be attributed in-process at all.
+/// Per-phase timings and counts for one process's tantivy read path, surfaced
+/// via `timefusion_stats`. Sums and counts only; they divide into means.
 #[derive(Debug, Default)]
 pub struct SearchStats {
     pub histogram_snapshots: AtomicU64,
@@ -59,32 +50,25 @@ pub struct SearchStats {
     pub reader_hits: AtomicU64,
     pub searches: AtomicU64,
     pub search_us: AtomicU64,
-    /// Indexes consulted across all queries — the fan-out this path is
-    /// dominated by. Divided by `queries`, this is indexes-per-query.
+    /// Indexes consulted across all queries; divided by `queries`, this is
+    /// indexes-per-query.
     pub indexes_searched: AtomicU64,
     pub queries: AtomicU64,
     /// Hits actually materialized (doc-store reads) by prefilter searches.
     /// The fat-needle abort must keep this O(max_hits), never O(matches).
     pub hits_materialized: AtomicU64,
-    /// Extracted-index dirs seeded by the indexer at publish time, i.e. S3
-    /// round trips this process avoided by keeping what it just built.
+    /// Extracted-index dirs seeded by the indexer at publish time.
     pub cache_seeded: AtomicU64,
     pub cache_seed_failures: AtomicU64,
-    /// Turning the manifest into the work list: the schema-version scan, the
-    /// time-prune, and the `covered_files` union — all of which walk EVERY
-    /// entry, not just the in-window ones, and clone their URI strings.
+    /// Turning the manifest into the work list (schema scan, time-prune,
+    /// `covered_files` union), all of which walk every entry.
     pub plans: AtomicU64,
     pub plan_us: AtomicU64,
-    /// Per-index setup that precedes the search proper: `ensure_cached`'s
-    /// `last_used` stamp and segment stat, plus the reader-LRU lookup. Charged
-    /// separately because a fully-resident, fully-open index still pays it once
-    /// per index per query, and `search_us` deliberately starts after it.
+    /// Per-index setup preceding the search proper; `search_us` starts after it.
     pub prepares: AtomicU64,
     pub prepare_us: AtomicU64,
-    /// WALL time of the whole fan-out — driving every per-index task to
-    /// completion and merging their hits. `fanout_us - prepare_us - search_us`
-    /// is the result-merge bookkeeping (the hit/coverage/row-selection sets),
-    /// which no other counter can see.
+    /// Wall time of the whole fan-out. `fanout_us - prepare_us - search_us` is
+    /// the result-merge bookkeeping, which no other counter can see.
     pub fanouts: AtomicU64,
     pub fanout_us: AtomicU64,
 }
@@ -100,9 +84,8 @@ impl SearchStats {
     }
 }
 
-/// `timed` as an RAII guard, for a phase with early returns. The fan-out exits
-/// three ways (`?`, the max_hits abort, the no-usable-index path); charging it
-/// only on the happy path would make the abort — the expensive case — invisible.
+/// `timed` as an RAII guard, so a phase with early returns is charged on every
+/// exit path, not just the happy one.
 struct TimedPhase<'a> {
     count: &'a AtomicU64,
     micros: &'a AtomicU64,
@@ -137,7 +120,7 @@ pub struct SearchResult {
 }
 
 /// One file and its winner mask, captured by the query's visibility resolver.
-/// The entry is pinned by the caller rather than refreshed from the manifest TTL cache.
+/// The entry is pinned by the caller, not refreshed from the manifest TTL cache.
 pub struct HistogramFile<'a> {
     pub table_root: &'a url::Url,
     pub manifest_key: &'a str,
@@ -167,17 +150,14 @@ pub struct TantivySearchService {
     pub object_store: Arc<dyn ObjectStore>,
     pub cache_root: PathBuf,
     pub config: Arc<TantivyConfig>,
-    /// Per-phase attribution for the read path; surfaced via `timefusion_stats`.
     pub stats: SearchStats,
     readers: Mutex<LruCache<PathBuf, (Index, IndexReader)>>,
     /// TTL cache of parsed manifests, keyed (table, project). Per-service
     /// (not global) so distinct object stores never cross-contaminate.
     manifests: DashMap<(String, String), (Instant, Arc<Manifest>)>,
     /// Last time each cache dir was served to a query — the reaper's recency
-    /// signal. mmap reads don't reliably move a directory's atime, so the
-    /// filesystem cannot be asked what is hot. Dirs absent here (never touched
-    /// by this process, i.e. the post-restart case) fall back to dir mtime,
-    /// which is their unpack time.
+    /// signal, since mmap reads don't reliably move a directory's atime. Dirs
+    /// absent here fall back to dir mtime, which is their unpack time.
     last_used: DashMap<PathBuf, SystemTime>,
 }
 
@@ -257,8 +237,7 @@ impl TantivySearchService {
         Ok(self.search_with_stats(table, project_id, &node, usize::MAX, None).await?.map(|r| r.hits))
     }
 
-    /// Returns buckets directly from one snapshot-bound sidecar. No event IDs,
-    /// hit cap, or selectivity threshold participate in this path.
+    /// Returns buckets directly from one snapshot-bound sidecar.
     ///
     /// The caller must obtain `file.visible` from complete version resolution
     /// across its Delta/memory snapshot, or equivalent certification. Errors
@@ -304,11 +283,9 @@ impl TantivySearchService {
             let (index, reader) = self.open_cached(&dir)?;
             let searcher = reader.searcher();
             anyhow::ensure!(searcher.num_docs() == entry.rows, "histogram index row count differs from its manifest");
-            for segment in searcher.segment_readers() {
-                if segment.num_docs() != 0 {
-                    let ordinals = segment.fast_fields().u64(super::ROW_ORDINAL_FIELD)?;
-                    anyhow::ensure!(ordinals.max_value() < entry.rows, "histogram index ordinal exceeds its physical source");
-                }
+            for segment in searcher.segment_readers().iter().filter(|s| s.num_docs() != 0) {
+                let ordinals = segment.fast_fields().u64(super::ROW_ORDINAL_FIELD)?;
+                anyhow::ensure!(ordinals.max_value() < entry.rows, "histogram index ordinal exceeds its physical source");
             }
             Ok((index, searcher))
         })
@@ -322,11 +299,8 @@ impl TantivySearchService {
     ///
     /// `time_range` is the query's `[lo, hi]` timestamp window (micros), if any.
     /// Entries whose `[min,max]_timestamp_micros` can't overlap it are skipped
-    /// without downloading their blob — so a `trace_id =` over a 1h window
-    /// touches only the indexes covering that window, not every index the
-    /// project ever built (the cold-old-data latency cliff). Pruning is sound:
-    /// a non-overlapping index only covers rows outside the window, which the
-    /// query's own timestamp filter excludes anyway.
+    /// without downloading their blob. Pruning is sound: a non-overlapping index
+    /// only covers rows the query's own timestamp filter excludes anyway.
     ///
     /// Returns:
     /// - `Ok(None)` — no usable index, or hit cap exceeded.
@@ -337,14 +311,8 @@ impl TantivySearchService {
         Ok(self.search_detailed(table, project_id, node, max_hits, time_range).await?.ok())
     }
 
-    /// `search_with_stats`, but saying WHY it could not answer.
-    ///
-    /// The four refusals below had one label between them
-    /// (`delta_no_index_or_cap_exceeded`), and they want opposite fixes: an
-    /// empty manifest needs a backfill, a blown cap needs a bigger cap or a
-    /// narrower query, and entries-but-none-usable needs a reindex. "76% of
-    /// prefilter skips are a missing index" was measured through that label and
-    /// could not distinguish them.
+    /// `search_with_stats`, but the `Err` says WHY it could not answer: the
+    /// refusals want opposite fixes (backfill / bigger cap / reindex).
     pub async fn search_detailed(
         &self, table: &str, project_id: &str, node: &PredNode, max_hits: usize, time_range: Option<(i64, i64)>,
     ) -> Result<std::result::Result<SearchResult, &'static str>> {
@@ -383,15 +351,8 @@ impl TantivySearchService {
         let mut tasks = futures::stream::iter(work.into_iter().map(|(file_uuid, blob_path, rows, entry_covered, ordinals_valid)| async move {
             let prepare_started = Instant::now();
             let dir = self.ensure_cached(table, project_id, &file_uuid, &blob_path).await?;
-            // Everything from here to the end of the search is synchronous
-            // tantivy work — mmap-ing segments, then a CPU-bound search that
-            // yields nowhere and has cost seconds on a fat needle (4.5M
-            // matches, 2026-08-22). Inline it holds a runtime worker, and a
-            // held worker stalls every unrelated task queued on it. This is
-            // the same defect as the 2026-08-25 journal fsync, on the query
-            // path. `block_in_place` rather than `spawn_blocking` because the
-            // body borrows `self`, `node` and the stats — moving the OTHER
-            // tasks off this thread needs no ownership changes at all.
+            // The rest is synchronous, CPU-bound tantivy work that yields
+            // nowhere; running it inline would hold a runtime worker.
             crate::support::without_blocking_the_worker(|| {
                 let (index, reader) = self.open_cached(&dir).with_context(|| format!("open index {file_uuid}"))?;
                 SearchStats::timed(&self.stats.prepares, &self.stats.prepare_us, prepare_started);
@@ -400,14 +361,10 @@ impl TantivySearchService {
                     PredsQuery::MissingField => Some((None, rows, entry_covered, ordinals_valid)),
                     PredsQuery::Query(q) => {
                         let searcher = reader.searcher();
-                        // Count-first: a raw per-index match count over `max_hits`
-                        // already forces the abort verdict (the prefilter can no
-                        // longer prove completeness), so establish it with the
-                        // cheap Count collector instead of materializing hits —
-                        // a 4.5M-match needle cost 4-6s of plan time per query
-                        // doing doc-store reads it then threw away (prod
-                        // 2026-08-22). The limit on the materializing search is a
-                        // backstop; `search()` passes usize::MAX, hence saturating.
+                        // Count-first: a per-index count over `max_hits` already
+                        // forces the abort, so establish it with the cheap Count
+                        // collector rather than materializing hits we'd discard.
+                        // `search()` passes usize::MAX, hence the saturating add.
                         let count = searcher.search(&*q, &tantivy::collector::Count).map_err(|e| anyhow!("count: {e}"))?;
                         if count > max_hits {
                             None
@@ -424,8 +381,6 @@ impl TantivySearchService {
         }))
         .buffer_unordered(self.config.search_concurrency());
 
-        // Imperative: seven interdependent accumulators plus an early abort once
-        // `max_hits` is exceeded — a fold would only hide the control flow.
         let mut all_hits: Vec<Hit> = Vec::new();
         let mut seen: HashSet<(i64, String)> = HashSet::new();
         let mut any_usable = false;
@@ -445,10 +400,9 @@ impl TantivySearchService {
                 return Ok(Err("delta_cap_exceeded_one_index"));
             };
             let Some(hits) = hits else {
-                // An in-window index that can't answer a queried field (e.g.
-                // built before the column was indexed) is a coverage hole the
-                // file-level `covered_files` set can't see — signal the caller
-                // to skip the prefilter rather than drop this file's matches.
+                // An index that can't answer a queried field is a coverage hole
+                // `covered_files` can't see — the caller must skip the prefilter
+                // rather than drop this file's matches.
                 field_coverage_gap = true;
                 unprunable_files.extend(entry_covered);
                 continue;
@@ -486,15 +440,13 @@ impl TantivySearchService {
         Ok(Ok(SearchResult { hits: all_hits, indexed_rows, covered_files, zero_hit_files, row_selections, field_coverage_gap }))
     }
 
-    /// Warm the local disk cache with every blob whose data is at most
-    /// `days` old, across all projects of `table`. Turns the cold-window
-    /// download cliff after a restart into a background cost. Best-effort:
-    /// individual blob failures are skipped.
+    /// Warm the local disk cache with every blob whose data is at most `days`
+    /// old, across all projects of `table`. Best-effort: individual blob
+    /// failures are skipped. Returns the number of blobs warmed.
     pub async fn warm_recent(self: &Arc<Self>, table: &str, days: u32) -> Result<usize> {
         let cutoff = crate::support::now_micros() - i64::from(days) * 86_400_000_000;
         let prefix = ObjPath::from(format!("{}/{table}", MANIFEST_PREFIX));
         let objs: Vec<_> = self.object_store.list(Some(&prefix)).try_collect().await?;
-        // Imperative: every step is awaited IO whose failures are individually skipped.
         let mut warmed = 0usize;
         for meta in objs.iter().filter(|m| m.location.as_ref().ends_with("/manifest.json")) {
             // .../{project}/manifest.json
@@ -504,21 +456,15 @@ impl TantivySearchService {
             let Ok(m) = load_manifest(self.object_store.as_ref(), table, project).await else {
                 continue;
             };
-            // Owned, not borrowed from `m`: the warm tasks below must be
-            // 'static to be driven concurrently from the cron.
+            // Owned, not borrowed from `m`: the warm tasks below must be 'static.
             let recent: Vec<(String, String)> = m
                 .entries
                 .iter()
                 .filter(|(_, e)| e.schema_version == SCHEMA_VERSION && e.max_timestamp_micros.is_some_and(|mx| mx >= cutoff))
                 .filter_map(|(key, e)| Some((file_uuid(key).to_string(), e.index.as_ref()?.clone())))
                 .collect();
-            // Concurrent, at the same width as a query's fan-out. Sequentially
-            // this was one round trip at a time: a cold start after a restart
-            // has ~550 blobs to pull for the largest project alone, so serial
-            // warming took minutes per project and the "hot window is local"
-            // guarantee did not hold until long after the box was serving.
-            // Already-resident blobs cost one `has_any_segment` stat each, so a
-            // steady-state pass stays cheap at this width.
+            // Concurrent, at the same width as a query's fan-out; already-resident
+            // blobs cost one `has_any_segment` stat each.
             warmed += futures::stream::iter(recent.into_iter().map(|(uuid, blob)| {
                 let (me, table, project) = (Arc::clone(self), table.to_string(), project.to_string());
                 async move { me.ensure_cached(&table, &project, &uuid, &blob).await }
@@ -531,8 +477,7 @@ impl TantivySearchService {
         Ok(warmed)
     }
 
-    /// TTL-cached manifest read (see `MANIFEST_CACHE_TTL` for the staleness
-    /// argument). Removes the per-query S3 GET + JSON parse.
+    /// TTL-cached manifest read, removing the per-query S3 GET + JSON parse.
     pub(crate) async fn load_manifest_cached(&self, table: &str, project_id: &str) -> Result<Arc<Manifest>> {
         let key = (table.to_string(), project_id.to_string());
         if let Some(m) = self.manifests.get(&key).filter(|e| e.0.elapsed() < self.config.manifest_ttl()).map(|e| e.1.clone()) {
@@ -547,58 +492,37 @@ impl TantivySearchService {
     }
 
     /// Fold a just-published entry into the cached manifest instead of dropping
-    /// it, so this process sees its own write without paying to reload all of
-    /// it. Where there is nothing cached, do nothing — the next read loads it.
-    ///
-    /// This replaced a `remove()`, and the difference is not cosmetic: with a
-    /// remove, prod measured **manifest_hit_pct = 0.0 across 56 loads for 54
-    /// queries** — busy projects publish far more often than they are queried,
-    /// so every publish threw away the entry the next query needed and the
-    /// 300s TTL bought exactly nothing. Updating in place keeps the cache warm
-    /// while still never letting our own write go unseen.
+    /// it, so this process sees its own write without reloading. Dropping
+    /// instead would drive the hit rate to zero on busy projects, which publish
+    /// far more often than they are queried.
     pub fn apply_published_entry(&self, table: &str, project_id: &str, key: &str, entry: crate::tantivy::ManifestEntry) {
-        // `entry()` holds the shard lock across the read-modify-write. A plain
-        // get-clone-insert would let two concurrent publishes for the same
-        // project (a flush overlapping a backfill/compaction build) each start
-        // from the same snapshot, so the second write would silently drop the
-        // first one's entry — leaving a covered file looking uncovered here
-        // until the TTL expired. The S3 manifest is unaffected either way,
-        // since `upsert_manifest` serializes per (table, project).
+        // `entry()` holds the shard lock across the read-modify-write; a plain
+        // get-clone-insert would let concurrent publishes drop each other's entry.
         let dashmap::mapref::entry::Entry::Occupied(mut occupied) = self.manifests.entry((table.to_string(), project_id.to_string())) else {
             // Nothing cached: the next read loads it, including this entry.
             return;
         };
         let (loaded_at, current) = occupied.get();
-        // Keep the ORIGINAL load time. Refreshing it here would mean a project
-        // that publishes every few minutes never re-reads its manifest at all,
-        // so writers we don't observe (the repair CLI) would be invisible
-        // forever rather than for at most one TTL.
+        // Keep the ORIGINAL load time, or a frequently-publishing project would
+        // never re-read its manifest and never see other writers.
         let (loaded_at, mut updated) = (*loaded_at, (**current).clone());
         updated.entries.insert(key.to_string(), entry);
         occupied.insert((loaded_at, Arc::new(updated)));
     }
 
-    /// Drop a cached manifest so the next read reloads it from S3. The GC
-    /// counterpart of `apply_published_entry`, and deliberately the opposite
-    /// treatment: GC deletes blobs, so a manifest cached across it routes the
-    /// plan path at objects that are gone for up to a full TTL. That is soft —
-    /// the prefilter reads a missing blob as "no usable index" — but it is a
-    /// wasted lookup where latency is the whole point.
-    ///
-    /// Drop rather than install the pruned manifest: a concurrent publish may
-    /// have folded in an entry the GC's snapshot predates, and installing would
-    /// silently drop it, recreating the covered-file-looks-uncovered bug
-    /// `apply_published_entry` exists to avoid. A reload from S3 is
-    /// authoritative. Affordable only because GC runs once per project per
-    /// hour — on the publish path, which fires constantly, this same `remove`
-    /// is what drove the hit rate to 0%.
+    /// Drop a cached manifest so the next read reloads it from S3, the GC
+    /// counterpart of `apply_published_entry`. Drop rather than install the
+    /// pruned manifest: a concurrent publish may have folded in an entry the
+    /// GC's snapshot predates, and installing would silently drop it. Only
+    /// affordable because GC is rare; on the publish path this would destroy
+    /// the cache hit rate.
     pub fn invalidate_manifest(&self, table: &str, project_id: &str) {
         self.manifests.remove(&(table.to_string(), project_id.to_string()));
     }
 
-    /// LRU-cached open, keyed by cache dir — 1:1 with the (immutable) blob
-    /// path, so entries are never stale, and the reaper can drop the reader
-    /// for a dir it deletes under that same key.
+    /// LRU-cached open, keyed by cache dir — 1:1 with the immutable blob path,
+    /// so entries are never stale and the reaper can drop a deleted dir's reader
+    /// under the same key.
     fn open_cached(&self, dir: &Path) -> Result<(Index, IndexReader)> {
         if let Some(v) = self.readers.lock().get(dir) {
             SearchStats::add(&self.stats.reader_hits, 1);
@@ -615,19 +539,15 @@ impl TantivySearchService {
     async fn ensure_cached(&self, table: &str, project_id: &str, file_uuid: &str, blob_path: &str) -> Result<PathBuf> {
         let dir = super::local_cache_path(&self.cache_root, table, project_id, &cache_generation_key(file_uuid, blob_path));
         // Stamped on every hit, not only on miss: recency is what the reaper
-        // sorts by, and a dir serving a query every minute must never look as
-        // old as its unpack time.
+        // sorts by, so a frequently-served dir must not look as old as its unpack.
         self.last_used.insert(dir.clone(), SystemTime::now());
         if has_any_segment(&dir) {
             return Ok(dir);
         }
         let started = Instant::now();
         let blob = super::download(self.object_store.as_ref(), &ObjPath::from(blob_path)).await?;
-        // `spawn_blocking`, matching the seeding path below: this zstd-decodes
-        // and untars a whole index blob, which is CPU-and-IO bound and yields
-        // nowhere. Called inline it held a runtime worker on the QUERY path,
-        // and a held worker stalls every unrelated task queued on it — the
-        // 2026-08-25 fsync fix, same defect in a different place.
+        // `spawn_blocking`: zstd-decoding and untarring a whole blob is CPU+IO
+        // bound and yields nowhere, so inline it would hold a runtime worker.
         let (target, bytes) = (dir.clone(), blob.clone());
         tokio::task::spawn_blocking(move || install_blob_into_cache(&target, &bytes)).await??;
         SearchStats::timed(&self.stats.blob_fetches, &self.stats.blob_fetch_us, started);
@@ -639,19 +559,13 @@ impl TantivySearchService {
     /// `spawn_blocking`.
     ///
     /// Eviction is pure cache loss, never a correctness risk: every dir is an
-    /// immutable extraction of an object-store blob, and the next query that
-    /// wants it re-downloads through `ensure_cached`. That is also why this
-    /// consults nothing but the filesystem — it does NOT need to know which
-    /// parquet files are still live, so a compacted-away file's dir is reaped
-    /// by the same rule that reaps a merely cold one: nobody opened it.
+    /// immutable extraction of a blob `ensure_cached` can re-download, which is
+    /// why this consults nothing but the filesystem. Racing `ensure_cached` is
+    /// likewise only ever a cache miss.
     ///
-    /// Unlinking a dir whose index is still mmap'd is safe on Unix (existing
-    /// mappings stay valid), but the space is not reclaimed until the last
-    /// mapping drops — so the reader-LRU entry is dropped with the dir.
-    ///
-    /// Racing `ensure_cached` is likewise only ever a cache miss: the loser
-    /// either re-downloads, or fails `open_index` on a half-deleted dir and
-    /// its query falls back to a full scan.
+    /// Unlinking a dir whose index is still mmap'd is safe on Unix, but the
+    /// space is not reclaimed until the last mapping drops — so the reader-LRU
+    /// entry must be dropped with the dir.
     pub fn reap_disk_cache(&self, budget_bytes: u64) -> ReapReport {
         let root = self.cache_root.join("tantivy_cache");
         let mut entries = collect_index_dirs(&root);
@@ -675,8 +589,7 @@ impl TantivySearchService {
                     report.bytes_removed += entry.bytes;
                     prune_empty_parents(&entry.dir, &root);
                 }
-                // Already gone, or racing an unpack — either way not ours to
-                // account for, and retried on the next sweep.
+                // Already gone, or racing an unpack; retried on the next sweep.
                 Err(_) => report.errors += 1,
             }
         }
@@ -688,8 +601,7 @@ impl TantivySearchService {
 struct CachedDir {
     dir: PathBuf,
     bytes: u64,
-    /// Unpack time, the recency fallback for dirs this process never served
-    /// (post-restart, or another process's leftovers).
+    /// Unpack time, the recency fallback for dirs this process never served.
     mtime: SystemTime,
 }
 
@@ -697,13 +609,7 @@ struct CachedDir {
 /// directory is a leaf index iff it holds `meta.json`; anything else is an
 /// interior node of the `{table}/{project}/{file_uuid}` tree and is descended
 /// into. Crashed-unpack leftovers (`tempfile`'s `.tmpXXXX` dirs) hold a
-/// `meta.json` too, so they are collected — with an old mtime and no
-/// `last_used` entry they sort to the very front of the eviction order, which
-/// is exactly where they belong.
-///
-/// The list is materialized because eviction has to sort it globally. That is
-/// on the order of 100 bytes per index dir, so it stays clear of mattering on
-/// a memory-tight box even with a cache in the hundreds of GB.
+/// `meta.json` too, so they are collected and sort to the front of eviction.
 fn collect_index_dirs(root: &Path) -> Vec<CachedDir> {
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
@@ -725,8 +631,7 @@ fn collect_index_dirs(root: &Path) -> Vec<CachedDir> {
 }
 
 /// Remove now-empty ancestors of a reaped dir, stopping at `root` (kept) or at
-/// the first non-empty directory. Without this the `{table}/{project}`
-/// skeleton outlives every index it ever held.
+/// the first non-empty directory.
 fn prune_empty_parents(dir: &Path, root: &Path) {
     let mut cur = dir.parent();
     while let Some(p) = cur.filter(|p| *p != root && p.starts_with(root)) {
@@ -744,11 +649,9 @@ fn usable_entry(e: &crate::tantivy::ManifestEntry) -> bool {
 }
 
 /// Whether a manifest entry's `[min,max]` timestamp span could contain rows in
-/// the query's `[lo,hi]` window. Conservative by design: an entry with unknown
-/// bounds (`None`, e.g. legacy or a failed-stats build) always overlaps so it's
-/// never wrongly pruned, and a `None` query range (no timestamp filter) matches
-/// everything. Correctness rests on this never returning `false` for an entry
-/// that covers an in-window row.
+/// the query's `[lo,hi]` window. Unknown bounds and a `None` range always
+/// overlap. Correctness rests on this never returning `false` for an entry that
+/// covers an in-window row.
 fn entry_overlaps(min: Option<i64>, max: Option<i64>, range: Option<(i64, i64)>) -> bool {
     range.is_none_or(|(lo, hi)| max.unwrap_or(i64::MAX) >= lo && min.unwrap_or(i64::MIN) <= hi)
 }
@@ -767,19 +670,14 @@ fn cache_generation_key(key: &str, blob: &str) -> String {
 }
 
 /// Unpack `blob` into a temp dir adjacent to `dir`, then atomically rename it
-/// into place. Shared by the reader (after a download) and the indexer (right
-/// after publishing a blob it just built) so a freshly built index is never
-/// fetched back from S3 to answer the first query that needs it.
+/// into place. Shared by the reader (after a download) and the indexer (seeding
+/// a blob it just built).
 ///
-/// Concurrency-safe by construction: unpack happens in a private temp dir and
-/// only the rename is observable, so a query downloading the same blob and an
-/// indexer seeding it can race freely — whoever renames second finds the dir
-/// present and keeps the winner's copy. Blob paths are immutable, so the two
-/// copies are byte-identical anyway.
+/// Concurrency-safe by construction: only the rename is observable, and blob
+/// paths are immutable so racing copies are byte-identical.
 ///
-/// Deliberately does NOT stamp `last_used`: a seeded dir's mtime is its unpack
-/// time, which the reaper already treats as the recency fallback, so it sorts
-/// as newest and is evicted last. That is what the seeding is for.
+/// Deliberately does NOT stamp `last_used` — a seeded dir's mtime is its unpack
+/// time, which already sorts it as newest for the reaper.
 fn install_blob_into_cache(dir: &Path, blob: &bytes::Bytes) -> Result<()> {
     let parent = dir.parent().ok_or_else(|| anyhow!("cache path has no parent"))?;
     std::fs::create_dir_all(parent).context("mkdir cache parent")?;
@@ -852,28 +750,21 @@ mod tests {
         // Emptied ancestors go with it, but the cache root itself stays.
         assert!(tmp.path().join("tantivy_cache").exists());
         assert!(!tmp.path().join("tantivy_cache/tbl/p/cold").exists());
+        // A stale reader pinning the mmap would hold the space despite the unlink.
+        assert!(svc.readers.lock().peek(&cold).is_none(), "the reader LRU entry goes with the dir");
+        assert!(svc.last_used.get(&cold).is_none(), "the recency stamp goes with the dir");
     }
 
-    /// `seed` plants one 1000-byte index first; without it the cache root never
-    /// exists. Returns (dirs_scanned, dirs_removed, bytes_removed, dir survives).
+    /// `seed` plants one 1000-byte index (1002 bytes on disk, meta.json included).
+    /// Returns (dirs_scanned, dirs_removed, bytes_removed, dir survives).
     #[test_case(true, u64::MAX => (1, 0, 0, true) ; "reap under budget is a no-op")]
+    #[test_case(true, 0 => (1, 1, 1002, false) ; "reap at budget zero removes the only dir")]
     #[test_case(false, 0 => (0, 0, 0, false) ; "reap on a missing root reports nothing")]
     fn reap_reports(seed: bool, budget: u64) -> (usize, usize, u64, bool) {
         let tmp = tempfile::tempdir().unwrap();
         let dir = seed.then(|| fake_index(tmp.path(), "tbl/p/only", 1000));
         let report = service(tmp.path()).reap_disk_cache(budget);
         (report.dirs_scanned, report.dirs_removed, report.bytes_removed, dir.is_some_and(|d| d.exists()))
-    }
-
-    #[test]
-    fn reap_drops_the_reader_entry_with_the_dir() {
-        let tmp = tempfile::tempdir().unwrap();
-        let svc = service(tmp.path());
-        let dir = fake_index(tmp.path(), "tbl/p/x", 1000);
-        // A stale reader pinning the mmap would hold the space despite the unlink.
-        assert!(svc.reap_disk_cache(0).dirs_removed == 1);
-        assert!(svc.readers.lock().peek(&dir).is_none());
-        assert!(svc.last_used.get(&dir).is_none());
     }
 
     /// An unknown bound is treated permissively (won't wrongly prune), but a
@@ -906,13 +797,10 @@ mod tests {
 }
 
 // ===== reader =====
-// Run text/range queries against a built tantivy index and return
-// `(timestamp_micros, id)` candidate pairs for downstream Delta filtering.
-//
-// `build_preds_query` is the single place SQL-side `text_match` predicates
-// become a tantivy query (AND of per-field parsed queries) — shared by the
-// Delta sidecar search and the MemBuffer bucket index so both interpret
-// predicates identically.
+// Run queries against a built tantivy index and return `(timestamp_micros, id)`
+// candidate pairs for downstream Delta filtering. `build_node_query` is the
+// single place SQL-side `text_match` predicates become a tantivy query, shared
+// by the Delta sidecar search and the MemBuffer bucket index.
 
 use tantivy::{
     Searcher, TantivyDocument, Term,
@@ -929,7 +817,7 @@ pub struct Hit {
     pub id: String,
     /// Row offset within the covered parquet file, when the index carries the
     /// `_row_ordinal` fast field. Only meaningful for read-back-built indexes
-    /// (`ManifestEntry.ordinals_valid`) — see schema.rs.
+    /// (`ManifestEntry.ordinals_valid`).
     pub row_ordinal: Option<u64>,
 }
 
@@ -940,12 +828,6 @@ pub enum PredsQuery {
     /// it cannot answer the predicate; callers must treat this as a
     /// coverage gap, not an empty result.
     MissingField,
-}
-
-/// Compile `preds` (implicitly AND-ed) into one tantivy query for `index`.
-pub fn build_preds_query(index: &Index, preds: &[TextMatchPred]) -> Result<PredsQuery> {
-    let node = PredNode::from_preds(preds).ok_or_else(|| anyhow!("no predicates"))?;
-    build_node_query(index, &node)
 }
 
 /// Compile a routable predicate tree into one tantivy query for `index`:
@@ -966,9 +848,9 @@ pub fn build_node_query(index: &Index, node: &PredNode) -> Result<PredsQuery> {
             };
             match &tokenizer {
                 // On ngram3 a trailing `*` is only a routing marker (prefix ⊆
-                // substring), so the literal can always be analyzed. On raw/
-                // default it carries real prefix semantics that a conjunction of
-                // whole terms would UNDER-match, so those keep the parser.
+                // substring). On raw/default it carries real prefix semantics
+                // that a conjunction of whole terms would UNDER-match, so those
+                // keep the parser.
                 Some(tok) if tok.as_str() == NGRAM3_TOKENIZER || !p.query.ends_with('*') => analyzed_conjunction_query(index, field, tok, &p.query)?,
                 _ => {
                     let mut qp = QueryParser::for_index(index, vec![field]);
@@ -1000,34 +882,25 @@ pub fn build_node_query(index: &Index, node: &PredNode) -> Result<PredsQuery> {
 /// Compile a routed literal against `field` WITHOUT tantivy's `QueryParser`:
 /// run the field's own analyzer over the literal and AND the resulting terms.
 ///
-/// The parser's grammar is fatal here: routed literals are user data, and a
-/// whitespace-adjacent `-` (`"accept -header"`) becomes a MustNot clause while
-/// bare `AND`/`OR`/`NOT` become operators — and on a raw-tokenized field any
-/// whitespace splits one indexed token into two unmatchable ones. Such a query
-/// parses "successfully" and returns ZERO hits, so the intersecting
-/// `id IN (hits)` prefilter silently drops matching rows.
+/// The parser's grammar must not be used here — routed literals are user data,
+/// and `-`, `AND`/`OR`/`NOT` or whitespace would parse as operators, yielding a
+/// query that "succeeds" with ZERO hits and silently drops matching rows from
+/// the intersecting `id IN (hits)` prefilter.
 ///
-/// Matching semantics vs. the old parser path: `QueryParser` turned a
-/// multi-token word into a PhraseQuery (for ngram3, consecutive trigrams). A
-/// conjunction of the same terms is a strict SUPERSET of that — always sound
-/// for a prefilter, which may only ever over-select. Preserved from the old
-/// path: whitespace splits into independently-required words, a word too short
-/// to produce a token simply broadens (is dropped), and a literal that yields
-/// no token at all errors out into a full scan.
+/// A conjunction over-selects relative to a phrase query, which is always sound
+/// for a prefilter. A word too short to produce a token is dropped (broadens);
+/// a literal yielding no token at all errors out into a full scan.
 fn analyzed_conjunction_query(index: &Index, field: Field, tokenizer: &str, query: &str) -> Result<Box<dyn Query>> {
     let mut analyzer = index.tokenizers().get(tokenizer).ok_or_else(|| anyhow!("tokenizer {tokenizer} not registered"))?;
-    // ngram3 keeps the parser's whitespace-AND behaviour (each word required
-    // independently, short words dropped). The other tokenizers must see the
-    // WHOLE literal: `default` splits it itself, and `raw` indexes the value as
-    // one token, so pre-splitting it would under-match.
+    // ngram3 requires each whitespace-separated word independently. The others
+    // must see the WHOLE literal: `default` splits it itself and `raw` indexes
+    // the value as one token, so pre-splitting would under-match.
     let words: Vec<&str> = if tokenizer == NGRAM3_TOKENIZER { query.split_whitespace().collect() } else { vec![query] };
     let clauses: Vec<(Occur, Box<dyn Query>)> = words
         .iter()
         // Plan-time classification appends `*` for `LIKE 'foo%'`; on a 3-gram
-        // field a prefix match is a subset of the substring match, so dropping
-        // the marker keeps the prefilter a superset. (Non-ngram3 `*` queries
-        // never reach here — see the caller.) `process` sinks into a Vec because
-        // tantivy hands tokens to an `FnMut` sink, not an iterator.
+        // field prefix ⊆ substring, so dropping the marker keeps the prefilter a
+        // superset. (Non-ngram3 `*` queries never reach here — see the caller.)
         .flat_map(|word| {
             let mut terms = Vec::new();
             analyzer.token_stream(word.trim_end_matches('*')).process(&mut |t| terms.push(t.text.clone()));
@@ -1049,10 +922,9 @@ pub fn query_index(index: &Index, query: &dyn Query, limit: Option<usize>) -> Re
     query_with_searcher(&reader.searcher(), query, limit)
 }
 
-/// As `query_index`, but with a caller-provided (cached) searcher.
-/// Hit extraction prefers fast fields (`_timestamp` is always FAST; `_id`
-/// is FAST on indexes built after 2026-07-05) and falls back to the doc
-/// store per segment for older indexes.
+/// As `query_index`, but with a caller-provided (cached) searcher. Hit
+/// extraction prefers fast fields and falls back per segment to the doc store
+/// for older indexes that lack a fast `_id`.
 pub fn query_with_searcher(searcher: &Searcher, query: &dyn Query, limit: Option<usize>) -> Result<Vec<Hit>> {
     let schema = searcher.schema();
     let ts_field = schema.get_field(TS_FIELD).map_err(|e| anyhow!("missing _timestamp: {e}"))?;
@@ -1068,8 +940,7 @@ pub fn query_with_searcher(searcher: &Searcher, query: &dyn Query, limit: Option
     // = this segment has no fast `_id` (pre-fast-field index) → doc store.
     type FfCols = (tantivy::columnar::Column<i64>, tantivy::columnar::StrColumn, Option<tantivy::columnar::Column<u64>>);
     let mut ff_cols: Vec<Option<Option<FfCols>>> = vec![None; searcher.segment_readers().len()];
-    // `id_buf` is reused across hits so the fast path allocates once per hit
-    // (the `clone` into the Hit) instead of twice.
+    // Reused across hits so the fast path allocates once per hit, not twice.
     let mut id_buf = String::new();
     top.into_iter()
         .map(|(_score, addr)| {
@@ -1080,28 +951,21 @@ pub fn query_with_searcher(searcher: &Searcher, query: &dyn Query, limit: Option
                     _ => None,
                 }
             });
-            // `None` = no fast columns for this segment, or this doc carries no
-            // value for them (shouldn't happen for required fields) — either way
-            // fall back to the doc store.
-            let fast = if let Some((ts_col, id_col, ord_col)) = cols
+            // No fast columns for this segment, or no value for this doc — fall
+            // through to the doc store.
+            if let Some((ts_col, id_col, ord_col)) = cols
                 && let (Some(ts), Some(ord)) = (ts_col.first(addr.doc_id), id_col.term_ords(addr.doc_id).next())
             {
                 id_buf.clear();
-                id_col.ord_to_str(ord, &mut id_buf).map_err(|e| anyhow!("fast _id read: {e}"))?.then(|| Hit {
-                    timestamp_micros: ts,
-                    id: id_buf.clone(),
-                    row_ordinal: ord_col.as_ref().and_then(|c| c.first(addr.doc_id)),
-                })
-            } else {
-                None
-            };
-            fast.map(Ok).unwrap_or_else(|| {
-                let doc: TantivyDocument = searcher.doc(addr).map_err(|e| anyhow!("doc fetch: {e}"))?;
-                Ok(Hit {
-                    timestamp_micros: doc.get_first(ts_field).and_then(|v| v.as_i64()).ok_or_else(|| anyhow!("hit missing _timestamp"))?,
-                    id: doc.get_first(id_field).and_then(|v| v.as_str()).map(str::to_string).ok_or_else(|| anyhow!("hit missing _id"))?,
-                    row_ordinal: None,
-                })
+                if id_col.ord_to_str(ord, &mut id_buf).map_err(|e| anyhow!("fast _id read: {e}"))? {
+                    return Ok(Hit { timestamp_micros: ts, id: id_buf.clone(), row_ordinal: ord_col.as_ref().and_then(|c| c.first(addr.doc_id)) });
+                }
+            }
+            let doc: TantivyDocument = searcher.doc(addr).map_err(|e| anyhow!("doc fetch: {e}"))?;
+            Ok(Hit {
+                timestamp_micros: doc.get_first(ts_field).and_then(|v| v.as_i64()).ok_or_else(|| anyhow!("hit missing _timestamp"))?,
+                id: doc.get_first(id_field).and_then(|v| v.as_str()).map(str::to_string).ok_or_else(|| anyhow!("hit missing _id"))?,
+                row_ordinal: None,
             })
         })
         .collect()
@@ -1120,11 +984,8 @@ mod reader_tests {
         tantivy::{build_for_table, udf::PredNode},
     };
 
-    /// Index three docs whose text contains tokens that tantivy's `QueryParser`
-    /// grammar would swallow (`-x` → MustNot, bare `NOT` → operator). Before
-    /// the parser was taken out of the substring path these queries parsed
-    /// "successfully" and returned zero hits, so the `id IN (hits)` prefilter
-    /// silently dropped the matching rows.
+    /// Docs whose text contains tokens tantivy's `QueryParser` grammar would
+    /// swallow (`-x` → MustNot, bare `NOT` → operator).
     fn ngram_index() -> Index {
         let table = TableSchema {
             rollups: vec![],
@@ -1144,15 +1005,8 @@ mod reader_tests {
                     data_type: "String".into(),
                     nullable: true,
                     // body → ngram3 (default), level → raw single token.
-                    tantivy: Some(TantivyFieldConfig {
-                        indexed: true,
-                        tokenizer: (name == "level").then(|| "raw".to_string()),
-                        flatten: None,
-                        list_mode: Default::default(),
-                    }),
-                    dictionary: None,
-                    bloom_filter: false,
-                    mutable: false,
+                    tantivy: Some(TantivyFieldConfig { indexed: true, tokenizer: (name == "level").then(|| "raw".to_string()), ..Default::default() }),
+                    ..Default::default()
                 })
                 .collect(),
         };
@@ -1176,9 +1030,7 @@ mod reader_tests {
     fn hit_ids_on(column: &str, query: &str) -> std::result::Result<String, String> {
         let node = PredNode::Leaf(TextMatchPred { column: column.into(), query: query.into() });
         let PredsQuery::Query(q) = build_node_query(&NGRAM_INDEX, &node).map_err(|e| e.to_string())? else { panic!("field must exist") };
-        let mut ids: Vec<String> = query_index(&NGRAM_INDEX, &*q, None).map_err(|e| e.to_string())?.into_iter().map(|h| h.id).collect();
-        ids.sort();
-        Ok(ids.join(","))
+        Ok(query_index(&NGRAM_INDEX, &*q, None).map_err(|e| e.to_string())?.into_iter().map(|h| h.id).sorted().join(","))
     }
 
     // `body` (ngram3): query-grammar chars in routed substrings must still hit,
@@ -1205,14 +1057,12 @@ mod reader_tests {
 }
 
 // ===== service =====
-// High-level glue: a `TantivyIndexService` that owns the object_store
-// handle and produces the `TantivyIndexCallback` used by `BufferedWriteLayer`.
+// `TantivyIndexService` owns the object_store handle and produces the
+// `TantivyIndexCallback` used by `BufferedWriteLayer`.
 //
 // Index keying: a commit that added exactly one parquet file is keyed by that
 // file's table-relative path (partition-mirrored blob); anything else falls
-// back to a fresh `"bucket-{uuid}"` key. The read-side resolves
-// manifest entries by intersecting their `[min_ts, max_ts]` with the query's
-// time predicates (or scans the full manifest for full-text predicates).
+// back to a fresh `"bucket-{uuid}"` key.
 
 use std::{collections::BTreeMap, sync::atomic::AtomicI64};
 
@@ -1235,19 +1085,13 @@ pub struct TantivyIndexService {
     /// successfully published; `i64::MIN` until the first one. Feeds the
     /// `index_lag_seconds` gauge.
     newest_indexed_micros: AtomicI64,
-    /// The reader this process serves queries from, if it has one. Held so a
-    /// publish can seed the reader's extracted-index cache and invalidate its
-    /// manifest — the indexer and reader are separate services, but in the
-    /// server they are two halves of one process and there is no reason for
-    /// the reader to re-fetch from S3 what the indexer just wrote.
-    ///
-    /// `Weak` because the reader also holds no ownership claim on the indexer
-    /// and both are `Arc`-held by `Database`; a strong ref here would make the
-    /// pair mutually immortal.
+    /// The reader this process serves queries from, if it has one, so a publish
+    /// can seed its extracted-index cache and invalidate its manifest.
+    /// `Weak` because both are `Arc`-held by `Database`; a strong ref here
+    /// would make the pair mutually immortal.
     reader: Mutex<Option<std::sync::Weak<TantivySearchService>>>,
-    /// Data-volume root under which index builds take their scratch space.
-    /// Explicit rather than defaulted to `std::env::temp_dir()` — see
-    /// `crate::tantivy::scratch_tempdir` for what that default cost in prod.
+    /// Data-volume root for index-build scratch space. Explicit rather than
+    /// `std::env::temp_dir()`, which is not sized for it.
     scratch_root: PathBuf,
 }
 
@@ -1257,9 +1101,8 @@ impl TantivyIndexService {
         Self { object_store, config, newest_indexed_micros: AtomicI64::new(i64::MIN), reader: Mutex::new(None), scratch_root }
     }
 
-    /// Attach the reader whose cache publishes should seed. Without this the
-    /// indexer still works — it just uploads and lets the first query download
-    /// the blob back, which is the pre-existing behaviour.
+    /// Attach the reader whose cache publishes should seed. Optional: without
+    /// it the first query simply downloads the blob back.
     pub fn with_reader(&self, reader: &Arc<TantivySearchService>) {
         *self.reader.lock() = Some(Arc::downgrade(reader));
     }
@@ -1298,11 +1141,10 @@ impl TantivyIndexService {
     async fn build_and_publish(
         &self, project_id: &str, table_name: &str, batches: Vec<arrow::record_batch::RecordBatch>, added_files: Vec<String>,
     ) -> Result<()> {
-        // Partition-mirrored 1:1 path when the commit added exactly one file
-        // (the common case: a 10-min bucket lands in one date partition).
-        // Multi-file commits keep the legacy one-blob-covers-all shape — rows
-        // can't be attributed to files without re-deriving the partition
-        // split, and a multi-covered entry is still correct for coverage.
+        // Partition-mirrored 1:1 path when the commit added exactly one file.
+        // Multi-file commits keep the one-blob-covers-all shape: rows can't be
+        // attributed to files without re-deriving the partition split, and a
+        // multi-covered entry is still correct for coverage.
         let (key, path) = match added_files.as_slice() {
             [uri] => parquet_rel_of_uri(uri).map(|rel| (rel.to_string(), super::index_path_for_parquet(table_name, rel))),
             _ => None,
@@ -1319,8 +1161,7 @@ impl TantivyIndexService {
     /// table-RELATIVE `parquet_rel` at the deterministic partition-mirrored
     /// path. `parquet_uri` is the same file as it appears in
     /// `get_file_uris()` — recorded in `covered_files` so the coverage gate
-    /// and `gc_after_compaction` (both URI-keyed) recognize the entry.
-    /// Idempotent. The reused primitive behind compaction-reindex/backfill.
+    /// and `gc_after_compaction` (both URI-keyed) recognize the entry. Idempotent.
     pub async fn build_index_for_file(
         &self, table_name: &str, project_id: &str, parquet_rel: &str, parquet_uri: &str, delta_store: Arc<dyn ObjectStore>,
     ) -> Result<()> {
@@ -1331,11 +1172,9 @@ impl TantivyIndexService {
     /// writing it, so a caller building many files for one project can commit
     /// them in a single manifest write (see `upsert_manifest_many`).
     ///
-    /// The blob is uploaded and the reader cache seeded exactly as usual, so
-    /// the only thing deferred is the manifest record. A crash between upload
-    /// and batch-commit therefore leaves an orphan blob and an uncovered file —
-    /// the next pass rebuilds it, which is idempotent. Batches are bounded for
-    /// that reason: the exposure is at most one batch of re-done work.
+    /// Only the manifest record is deferred; the blob is uploaded as usual. A
+    /// crash before the batch commit leaves an orphan blob and an uncovered
+    /// file that the next (idempotent) pass rebuilds, so keep batches bounded.
     pub async fn build_index_for_file_deferred(
         &self, table_name: &str, project_id: &str, parquet_rel: &str, parquet_uri: &str, delta_store: Arc<dyn ObjectStore>,
     ) -> Result<(String, crate::tantivy::ManifestEntry)> {
@@ -1355,9 +1194,7 @@ impl TantivyIndexService {
 
     /// Build+pack `batches`, upload to `blob_path`, and upsert the manifest
     /// entry keyed by `manifest_key`. On build failure records a failed entry
-    /// (index=None, error set) and returns the error. Shared by the flush
-    /// callback (random bucket key + flat path) and `build_index_for_file`
-    /// (parquet-rel key + partition-mirrored path).
+    /// (index=None, error set) and returns the error.
     async fn build_pack_upload(
         &self, table_name: &str, project_id: &str, manifest_key: &str, blob_path: object_store::path::Path, covered_files: Vec<String>,
         batches: Vec<arrow::record_batch::RecordBatch>,
@@ -1371,7 +1208,6 @@ impl TantivyIndexService {
         let scratch = self.scratch_root.clone();
         let pack_result = tokio::task::spawn_blocking(move || {
             let (blob, stats) = super::build_and_pack(svc_table, &batches, level, merge, &scratch)?;
-            // Guard against publishing a corrupt archive (see super::verify_blob).
             super::verify_blob(&blob).context("verify packed blob")?;
             Ok::<_, anyhow::Error>((blob, stats))
         })
@@ -1394,16 +1230,11 @@ impl TantivyIndexService {
                 return Err(e);
             }
         };
-        // INFO, not debug: the size distribution of what the backfill indexes is
-        // the input to every sizing decision around it — the pass cap, the
-        // oldest-first reservation, and `max_file_mb` (4096, i.e. 4 GB) were all
-        // set without it. At ~4-6 builds/hr this is a handful of lines an hour.
-        // `segments` is the cheap proxy for scale: the writer serializes one each
-        // time its 64 MB arena fills, so 40+ segments means multi-GB of content.
+        // `segments` is the cheap proxy for scale: the writer serializes one
+        // each time its 64 MB arena fills.
         tracing::info!(project_id, table_name, rows = stats.rows, index_bytes = blob.len(), segments = stats.segments, event = "tantivy_index_built");
-        // S3 first, always: it is the source of truth and the local copy is
-        // only ever a cache. Seeding after a failed upload would leave a
-        // locally-readable index no manifest entry points at.
+        // Upload before seeding: S3 is the source of truth, and seeding after a
+        // failed upload leaves a locally-readable index nothing points at.
         let blob_path = super::generation_blob_path(&blob_path, uuid::Uuid::new_v4());
         super::upload(self.object_store.as_ref(), &blob_path, blob.clone()).await?;
         self.seed_reader_cache(table_name, project_id, manifest_key, blob_path.as_ref(), blob).await;
@@ -1422,10 +1253,9 @@ impl TantivyIndexService {
         if !defer {
             upsert_manifest(self.object_store.as_ref(), table_name, project_id, manifest_key, entry.clone()).await?;
         }
-        // Our own write must never wait out the manifest TTL, which is what
-        // lets that TTL be minutes rather than seconds. Applied for a deferred
-        // entry too: the blob IS uploaded, so consulting it is already correct,
-        // and the batch commit only makes it durable.
+        // Our own write must never wait out the manifest TTL. Applied for a
+        // deferred entry too: the blob IS uploaded, so consulting it is already
+        // correct; the batch commit only makes it durable.
         if let Some(reader) = self.reader() {
             reader.apply_published_entry(table_name, project_id, manifest_key, entry.clone());
         }
@@ -1435,12 +1265,10 @@ impl TantivyIndexService {
         Ok(defer.then(|| (manifest_key.to_string(), entry)))
     }
 
-    /// Install a just-published blob into the reader's extracted-index cache,
-    /// so the first query needing it reads local disk instead of S3.
-    ///
-    /// Strictly best-effort: every failure path leaves the pre-existing
-    /// behaviour (download on first read) intact, so this can never fail a
-    /// flush. Unpack is CPU + disk, hence `spawn_blocking`.
+    /// Install a just-published blob into the reader's extracted-index cache so
+    /// the first query needing it reads local disk instead of S3. Strictly
+    /// best-effort — every failure path falls back to download-on-first-read,
+    /// so this can never fail a flush.
     async fn seed_reader_cache(&self, table: &str, project_id: &str, manifest_key: &str, blob_path: &str, blob: bytes::Bytes) {
         if !self.config.seed_cache_on_publish() {
             return;
@@ -1472,27 +1300,19 @@ impl TantivyIndexService {
         Ok(())
     }
 
-    /// Carry existing coverage FORWARD across a compaction instead of
-    /// re-indexing its output.
-    ///
-    /// A rewrite's output holds exactly its inputs' rows under the same ids, so
-    /// an index that answered "these ids match" for the inputs still answers it
-    /// for the output. Extending `covered_files` therefore buys the same
-    /// coverage for a manifest read-modify-write, where re-indexing costs a full
-    /// S3 read-back and a build — and a build was measured at ~4/hr on this box,
-    /// so this is the difference between keeping up and not.
+    /// Carry existing coverage FORWARD across a compaction (by extending
+    /// `covered_files`) instead of re-indexing its output: a rewrite's output
+    /// holds exactly its inputs' rows under the same ids.
     ///
     /// **The guard is the whole correctness argument:** every removed file must
-    /// already be covered. If even one was not, the output holds rows no index
-    /// has seen, and marking it covered would cause a FALSE NEGATIVE — the one
-    /// failure mode that is not tolerable, since the read path trusts coverage
-    /// to skip files. In that case this returns `false` and the caller rebuilds
-    /// exactly as before.
+    /// already be covered, or the output holds rows no index has seen and
+    /// marking it covered is a FALSE NEGATIVE — intolerable, since the read path
+    /// trusts coverage to skip files. Then this returns `false` and the caller
+    /// rebuilds.
     ///
-    /// Stale membership is safe in the other direction: an entry may now list a
-    /// file whose rows it also indexed under an older path, which yields false
-    /// POSITIVES that the scan filters. `ordinals_valid` is surrendered because
-    /// row ordinals are per-file positions and the output's are not the inputs'.
+    /// Stale membership is safe the other way: it yields false POSITIVES the
+    /// scan filters. `ordinals_valid` is surrendered because row ordinals are
+    /// per-file positions and the output's are not the inputs'.
     ///
     /// Returns whether the carry-forward applied.
     pub async fn carry_forward_after_compaction(&self, table: &str, project_id: &str, removed: &[String], added: &[String]) -> Result<bool> {
@@ -1500,17 +1320,14 @@ impl TantivyIndexService {
             return Ok(false);
         }
         // Callers disagree on path form: the optimize path passes absolute URIs
-        // (`get_file_uris`), the wave path passes Delta-relative `add.path`.
-        // Comparing them raw would never match and this would silently refuse
-        // every time — implemented and inert. Anchor both on the table-relative
-        // form, which `parquet_rel_of_uri` derives from either.
+        // (`get_file_uris`), the wave path Delta-relative `add.path`. Comparing
+        // them raw never matches, so anchor both on the table-relative form.
         let rel_of = |u: &str| parquet_rel_of_uri(u).unwrap_or(u).to_string();
         let removed_rel: HashSet<String> = removed.iter().map(|u| rel_of(u)).collect();
         let applied = super::mutate(self.object_store.as_ref(), table, project_id, |m| {
-            // EXACTLY the reader's usability predicate, schema_version included.
-            // An entry the reader filters out cannot be evidence that an input
-            // is covered: it would vouch for a file at carry-forward time and be
-            // invisible at query time, which is a false negative.
+            // EXACTLY the reader's usability predicate: an entry the reader
+            // filters out cannot be evidence that an input is covered, or it
+            // would vouch here and be invisible at query time (false negative).
             let covered: HashSet<String> = m.entries.values().filter(|e| usable_entry(e)).flat_map(|e| e.covered_files.iter().map(|u| rel_of(u))).collect();
             if !removed_rel.iter().all(|u| covered.contains(u)) {
                 return (false, false);
@@ -1536,33 +1353,21 @@ impl TantivyIndexService {
     /// `covered_files` are still present in `live_uris`, and prune the departed
     /// files from the entries that survive.
     ///
-    /// It used to drop an entry as soon as ANY covered file died, which took
-    /// that entry's still-live siblings down with it — a multi-file flush
-    /// commit publishes ONE entry, so compacting a single member un-covered
-    /// files nothing had touched. That collateral is proportional to the
-    /// compaction rate and is a standing contributor to the coverage
-    /// divergence measured 2026-08-22, where every rewrite path was reindexing
-    /// its own output successfully and coverage still lost ~60 files/hr.
-    ///
-    /// Keeping the entry is sound because the index is a candidate generator:
-    /// hits belonging to the departed file are false positives the scan
-    /// filters out, and `zero_hit` pruning only ever gets more conservative.
-    /// Row ORDINALS are not sound across the change — they are per-file
-    /// positions, and pruning a two-file entry to one would make
+    /// Keeping a partially-dead entry is sound because the index is a candidate
+    /// generator: hits belonging to the departed file are false positives the
+    /// scan filters out. Row ORDINALS are not sound across the change — they are
+    /// per-file positions, and pruning a two-file entry to one would make
     /// `covered_files.len() == 1` re-enable them against the wrong file — so a
     /// pruned entry gives them up.
     ///
     /// `live_uris` should be the current Delta table's `get_file_uris()` set
-    /// after the compaction commit. Entries built before per-file tracking
-    /// existed (empty `covered_files`) are treated as **stale** and dropped —
-    /// they cannot be proven to cover live data, so dropping them is the
-    /// correctness-preserving choice; queries fall back to a full scan + UDF
-    /// post-filter until the next flush rebuilds.
+    /// after the compaction commit. Entries with empty `covered_files` cannot be
+    /// proven to cover live data and are dropped; queries fall back to a full
+    /// scan + UDF post-filter until the next flush rebuilds.
     pub async fn gc_after_compaction(&self, table: &str, project_id: &str, live_uris: &[String]) -> Result<GcReport> {
         let live: HashSet<&str> = live_uris.iter().map(String::as_str).collect();
-        // Under the per-manifest lock: this is a read-modify-write like every
-        // other manifest mutation, and doing it outside `mutate` raced concurrent
-        // upserts (last writer wins, silently un-covering files).
+        // Must stay inside `mutate`: outside the per-manifest lock this
+        // read-modify-write races concurrent upserts and un-covers files.
         let (stale, retired, kept_len, changed) = super::mutate(self.object_store.as_ref(), table, project_id, |m| {
             let (stale, mut kept): (BTreeMap<_, _>, BTreeMap<_, _>) =
                 std::mem::take(&mut m.entries).into_iter().partition(|(_, e)| !e.covered_files.iter().any(|u| live.contains(u.as_str())));
@@ -1587,9 +1392,8 @@ impl TantivyIndexService {
         })
         .await?;
         let mut report = GcReport { kept: kept_len, entries_removed: stale.len(), ..Default::default() };
-        // Effectful: delete stale blobs concurrently (serial deletes made a
-        // 100k-blob GC take hours). A blob already gone counts as deleted —
-        // re-runs after an interrupted GC must not report errors.
+        // A blob already gone counts as deleted, so re-runs after an interrupted
+        // GC don't report errors.
         let results: Vec<(String, bool)> = futures::stream::iter(stale.into_values().filter_map(|e| e.index).chain(retired))
             .map(|blob| async move {
                 let deleted = match super::delete(self.object_store.as_ref(), &object_store::path::Path::from(blob.as_str())).await {

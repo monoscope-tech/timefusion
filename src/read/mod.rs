@@ -1,21 +1,16 @@
 //! Read-side merge-on-read deduplication for `(timestamp, id)` rows.
 //!
-//! The physical operator runs after routing so filter and partition pushdown
-//! remain intact. It stores encoded keys rather than wide payload rows.
-//!
 //! Two survivor policies:
 //!
-//! * **keep-first** stores seen keys. Arrival order chooses the physical copy.
+//! * **keep-first** stores seen keys; arrival order chooses the physical copy.
 //! * **keep-greatest** keeps the greatest tiebreak per key, with NULL lowest.
 //!   Ordered input streams by timestamp run; each run is memory-capped.
 //!
-//! Unordered keep-greatest buffers to end-of-stream. It cannot degrade to
-//! keep-first because doing so can return the pre-update version.
+//! Unordered keep-greatest buffers to end-of-stream. It must never degrade to
+//! keep-first: doing so can return the pre-update version.
 //!
-//! This stays single-partition: repartitioning copies every wide column and was
-//! slower and much larger in measured production-shaped benchmarks.
-//!
-//! The caller adds key/tiebreak columns, then restores the requested projection.
+//! The operator stays single-partition, and the caller adds key/tiebreak
+//! columns then restores the requested projection.
 
 pub mod bloom_prune;
 pub mod functions;
@@ -87,16 +82,10 @@ impl Bound {
     }
 
     /// Advance the run bound, counting violations into `violations`. Returns
-    /// true when this row OPENS a new run (i.e. it moved forward and was not the
-    /// very first row).
-    ///
-    /// A value moving AGAINST the declared direction proves this scan's
-    /// advertised ordering is false — a parquet footer's `sorting_columns` is
-    /// lying. Dedup stays sound either way (the bound column stays in the dedup
-    /// key — see `dedup_key_idxs`), but this is the only direct signal that the
-    /// hot-tail footer repair still has work to do; a zero here across prod
-    /// would exonerate footers entirely and send the 2026-08-07 under-count
-    /// investigation elsewhere.
+    /// true when this row OPENS a new run (moved forward and was not the first
+    /// row). A value moving AGAINST the declared direction means the scan's
+    /// advertised ordering is false (a lying parquet footer); dedup stays sound
+    /// because the bound column stays in the dedup key.
     fn step(&mut self, t: i64, violations: &AtomicU64) -> bool {
         if self.last.is_some_and(|l| self.ahead(l, t)) {
             violations.fetch_add(1, Ordering::Relaxed);
@@ -104,18 +93,16 @@ impl Bound {
         self.last.is_none_or(|l| self.ahead(t, l)) && self.last.replace(t).is_some()
     }
 
-    /// Advance against the global counter, the one every dedup scan feeds.
+    /// Advance against the global counter every dedup scan feeds.
     fn advance(&mut self, t: i64) -> bool {
         self.step(t, &ORDERING_VIOLATIONS)
     }
 }
 
-/// Which union leg a row came from. Also carries the sortability the plan
-/// builder needs, so the two can no longer drift apart in parallel vectors —
-/// the Delta leg is the one that must never be sorted at read time (an UPDATE
-/// writes a row's ORIGINAL timestamp into a NEW file, so its files overlap and
-/// the blocking sort that "fixes" that exhausted the query pool, prod
-/// 2026-08-02).
+/// Which union leg a row came from, plus the sortability the plan builder
+/// needs. The Delta leg must never be sorted at read time: an UPDATE writes a
+/// row's ORIGINAL timestamp into a NEW file, so its files overlap and the
+/// blocking sort that "fixes" that exhausts the query pool.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, strum::IntoStaticStr)]
 #[strum(serialize_all = "lowercase")]
 pub enum LegKind {
@@ -147,49 +134,30 @@ pub fn ordering_violations_by_leg() -> [(&'static str, u64); 2] {
     [LegKind::Mem, LegKind::Delta].map(|leg| (leg.label(), leg.counter().load(Ordering::Relaxed)))
 }
 
-/// Diagnostic wrapper that answers "which leg's declared ordering is false?".
-///
 /// A file's row-timestamp span, as Delta add-action statistics report it.
 ///
 /// `None` means the file carries no timestamp statistics. It is NOT "empty" and
-/// must never be treated as disjoint from anything — the same direction
-/// `PartitionStats::overlaps` takes for a partition with no stats.
+/// must never be treated as disjoint from anything.
 pub(crate) type FileSpan = Option<(i64, i64)>;
 
 /// May a set of files a sweep proved duplicate-free skip `DedupExec`, given the
 /// files in the same scan that were NOT proved clean?
 ///
-/// This is the soundness rule for making certification ADDITIVE over a file set
-/// instead of exact over a whole-partition fingerprint. Today any new file voids
-/// a partition's certification, so recent partitions — rewritten continuously by
-/// ingest, hot-tail compaction and the sealed backlog — churn faster than sweeps
-/// can certify them, and prod 2026-08-22 measured `dedup_denied_never_certified`
-/// at 100% of eligible scans with the 97 live certifications sitting on days
-/// nobody queries.
-///
 /// **The rule, applied PER FILE.** A certified file may skip iff no uncertified
-/// file's timestamp span overlaps ITS span. Per file rather than per set on
-/// purpose: in a churning partition the newest files interleave with the oldest
-/// certified ones, so judging the certified set by its union span lets a single
-/// neighbouring file poison every certified file behind it — which is exactly
-/// the case this work exists to unblock.
+/// file's timestamp span overlaps ITS span. Per file rather than per set, so one
+/// neighbouring file cannot poison every certified file behind it.
 ///
 /// **Why it holds.** The dedup key is `(timestamp, id)` and merge-on-read
-/// re-appends preserve the original row's `timestamp` (`write/mod.rs`), which is
-/// the same fact the per-date skip rests on. So every version and tombstone of a
-/// row carries that row's timestamp. A duplicate of a row inside the certified
-/// set therefore has a timestamp within the certified span, and any file holding
-/// it must have a span containing that timestamp — i.e. overlapping. Excluding
-/// overlap with the uncertified files therefore excludes every duplicate that
-/// could be split across the two legs. Duplicates *within* the certified set are
-/// excluded by construction: the sweep proved that set clean together.
+/// re-appends preserve the original row's `timestamp`, so every version and
+/// tombstone of a row carries that row's timestamp. A duplicate of a certified
+/// row therefore lies inside the certified span and any file holding it must
+/// overlap that span. Duplicates *within* the certified set are excluded by
+/// construction: the sweep proved that set clean together.
 ///
-/// **Fail-closed cases, all of which decline:**
-/// - a certified or uncertified file with no timestamp statistics (`None` span)
-///   — an unknown span overlaps everything;
-/// - an empty certified set — the result is empty, and "no evidence" must never
-///   read as "proved clean" (the bug `certified_any` exists to prevent);
-/// - any uncertified span touching the certified span, on either side.
+/// **Fail-closed cases, all of which decline:** a certified or uncertified file
+/// with no statistics (`None` span overlaps everything); an empty certified set
+/// ("no evidence" must never read as "proved clean"); any uncertified span
+/// touching the certified span on either side.
 ///
 /// Spans are INCLUSIVE of both bounds, because Delta min/max statistics are.
 ///
@@ -207,25 +175,18 @@ pub(crate) fn skippable_certified_files<'a>(certified: impl IntoIterator<Item = 
     }
     let (skippable, blocked): (Vec<_>, Vec<_>) =
         certified.into_iter().partition(|(_, span)| span.is_some_and(|(lo, hi)| uncertified.iter().flatten().all(|(flo, fhi)| *fhi < lo || *flo > hi)));
-    // Counted separately because they mean opposite things: overlap says
-    // certification is too SPARSE (a certified file still has an uncertified
-    // neighbour, so contiguous runs are what pay), while the no-stats return
-    // above says one file poisoned the whole scan regardless of coverage.
+    // Counted separately: overlap means certification is too SPARSE, while the
+    // no-stats return above means one file poisoned the whole scan.
     metrics::counter!(scan_metric_names::CERT_SKIP_BLOCKED_OVERLAP).increment(blocked.len() as u64);
     metrics::counter!(scan_metric_names::CERT_SKIP_FILES).increment(skippable.len() as u64);
     skippable.into_iter().map(|(path, _)| path).collect()
 }
 
-/// `ORDERING_VIOLATIONS` is counted inside `DedupExec`, which is single-partition
-/// and sits above the mem ∪ hot ∪ delta union — so by the time a violation is
-/// seen the row's leg is gone, and the plan algebra alone cannot say which leg
-/// lied (I tried; every leg looks honest on paper because a leg that declares
-/// nothing stops the union from declaring either). This checks each leg against
-/// its OWN declared ordering, so a nonzero counter names the culprit directly.
+/// Checks one union leg against its OWN declared ordering, so a nonzero counter
+/// names which leg lied (`DedupExec` sits above the union and cannot).
 ///
-/// OFF by default (`TIMEFUSION_ORDERING_PROBE`): it costs one i64 compare per
-/// row per leg, which is the same order as the bound check it duplicates. Turn
-/// it on when `ordering_violations_total` is nonzero and you need attribution.
+/// OFF by default (`TIMEFUSION_ORDERING_PROBE`): costs one i64 compare per row
+/// per leg. Turn it on when `ordering_violations_total` is nonzero.
 #[derive(derive_more::Debug)]
 #[debug("OrderingProbeExec: leg={}", leg.label())]
 pub struct OrderingProbeExec {
@@ -269,10 +230,7 @@ impl ExecutionPlan for OrderingProbeExec {
     fn execute(&self, partition: usize, context: Arc<TaskContext>) -> DFResult<SendableRecordBatchStream> {
         let stream = self.inner.execute(partition, context)?;
         let schema = stream.schema();
-        // The leg's OWN claim — not the union's, and ignoring whether the column
-        // is a dedup key: the probe cares only about "did this leg honour what it
-        // declared". `None` means this leg declares nothing, and a leg that
-        // promises nothing cannot break a promise.
+        // The leg's OWN claim: `None` means it declares nothing to violate.
         let Some(mut bound) = leading_bound(&self.inner, &schema, |_| true) else {
             return Ok(stream);
         };
@@ -336,21 +294,15 @@ fn sort_col(se: &datafusion::physical_expr::PhysicalSortExpr) -> Option<&datafus
 
 /// Emergency kill switch for bounded[timestamp] dedup. Defaults ON.
 ///
-/// Correctness does NOT depend on this — `dedup_key_idxs` keeps the operator
-/// sound under a lying footer. Turning it off is a big hammer with a real cost:
-/// bounded mode is what lets keep-greatest emit per run instead of buffering to
-/// end-of-stream, so disabling it also disables LIMIT early termination
-/// (`keep_greatest_limit_terminates_early` runs unbounded and does not finish).
-/// A "top 100" log-explorer query would scan the whole window. Reach for it only
-/// if a bounded scan is proven to be serving wrong rows again.
+/// Correctness does not depend on it, but turning it off also disables LIMIT
+/// early termination: keep-greatest then buffers to end-of-stream, so a
+/// "top 100" query scans the whole window.
 static BOUNDED_DEDUP_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
 static ORDERING_PROBE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
-/// Per-leg ordering attribution (`OrderingProbeExec`). OFF unless
-/// `TIMEFUSION_ORDERING_PROBE=true`: it costs an i64 compare per row per leg,
-/// and it answers a question you only ask when `ordering_violations_total` is
-/// already nonzero.
+/// Per-leg ordering attribution (`OrderingProbeExec`); OFF unless
+/// `TIMEFUSION_ORDERING_PROBE=true`.
 pub fn ordering_probe_enabled() -> bool {
     *ORDERING_PROBE.get_or_init(|| std::env::var("TIMEFUSION_ORDERING_PROBE").is_ok_and(|v| v.eq_ignore_ascii_case("true") || v == "1"))
 }
@@ -364,23 +316,11 @@ pub fn set_bounded_dedup_enabled(enabled: bool) {
     let _ = BOUNDED_DEDUP_ENABLED.set(enabled);
 }
 
-/// The dedup key columns to hash. The bound column is ALWAYS retained.
-///
-/// It used to be filtered out here: within
-/// a *genuinely* sorted run the bound is constant, so encoding it into every key
-/// is redundant, and dropping it saved one timestamp encoding per physical row.
-///
-/// That reasoning holds only while the declared ordering is TRUE. A parquet
-/// footer missing/misreporting `sorting_columns` makes a scan declare
-/// `output_ordering=[timestamp DESC]` over data that is not in that order (see
-/// the hot-tail footer repair). The bound then never advances across the
-/// mis-ordered stretch, one "run" spans many timestamps, and a key reduced to
-/// `id` alone collapses rows that differ only in `timestamp` — distinct rows.
-/// Prod 2026-08-07: a single minute read 132 rows instead of 1620, surfacing as
-/// multi-minute holes in customer dashboards.
-///
-/// Keeping the bound in the key makes bounded mode fail-SAFE: a false ordering
-/// can now only under-dedup (emit a duplicate), never drop a distinct row.
+/// The dedup key columns to hash. The bound column is ALWAYS retained: dropping
+/// it (redundant only while the declared ordering is TRUE) lets a lying parquet
+/// footer collapse rows that differ only in `timestamp`. Keeping it makes
+/// bounded mode fail-safe — a false ordering can only under-dedup, never drop a
+/// distinct row.
 fn dedup_key_idxs(key_idxs: &[usize]) -> Vec<usize> {
     key_idxs.to_vec()
 }
@@ -389,10 +329,8 @@ fn dedup_key_idxs(key_idxs: &[usize]) -> Vec<usize> {
 /// i64-backed type AND `timefusion_read_dedup_bounded` is on.
 ///
 /// The ordering here is *declared*, never verified — `output_ordering()` is only
-/// as trustworthy as the parquet footer behind it. `dedup_key_idxs` keeps the
-/// operator sound when that declaration lies; the flag is the kill switch for
-/// when it lies badly enough to matter, and defaults OFF until the footer repair
-/// has drained the poisoned files.
+/// as trustworthy as the parquet footer behind it; `dedup_key_idxs` keeps the
+/// operator sound when that declaration lies.
 fn detect_bound(input: &Arc<dyn ExecutionPlan>, keys: &[String], in_schema: &SchemaRef, enabled: bool) -> Option<Bound> {
     enabled.then(|| leading_bound(input, in_schema, |name| keys.iter().any(|k| k == name))).flatten()
 }
@@ -432,17 +370,9 @@ pub struct DedupExec {
     /// Keep-greatest engages only if it is also present in the input schema.
     tiebreak: Option<String>,
     /// Ordering keep-greatest DEPENDS on, declared as *required* so
-    /// `EnforceSorting` preserves it.
-    ///
-    /// Without this the operator is silently correctness-fragile: the caller
-    /// builds a `SortPreservingMergeExec` to supply the run property, but
-    /// EnforceSorting deletes any ordering no parent requires — which is every
-    /// aggregate. The plan then reaches `execute` unordered, `detect_bound`
-    /// returns `None`, keep-greatest degrades to keep-FIRST, and a merge-on-read
-    /// table answers `MAX(updated_at)` with the PRE-update row while the same
-    /// data read by a plain projection answers correctly. Requiring the ordering
-    /// is what makes version resolution a property of the operator rather than
-    /// of what happens to sit above it.
+    /// `EnforceSorting` preserves it. Without the requirement EnforceSorting
+    /// deletes the ordering, keep-greatest degrades to keep-first, and a
+    /// merge-on-read table answers with the PRE-update row.
     required_ordering: Option<datafusion::physical_expr::LexOrdering>,
     /// Indices into `input.schema()` to emit after dedup, restoring the
     /// originally-requested projection. `None` = emit the input schema as-is.
@@ -467,22 +397,17 @@ impl DedupExec {
             Some(idxs) => Arc::new(in_schema.project(idxs)?),
             None => in_schema.clone(),
         };
-        // Dedup preserves the input's row order (it only drops rows), so the
-        // input's output ordering remains valid on the output (remapped through
-        // the projection). Without this the sorted Delta scan's declared order
-        // (fork sort-order pushdown) dies here and `ORDER BY timestamp LIMIT n`
-        // re-sorts the whole window instead of early-terminating.
-        // `Option` is an `IntoIterator`, so "no surviving ordering" is the empty
-        // ordering set — the same thing `EquivalenceProperties::new` builds.
+        // Dedup only drops rows, so the input's ordering stays valid on the
+        // output (remapped through the projection). Propagating it is what lets
+        // `ORDER BY timestamp LIMIT n` early-terminate instead of re-sorting.
         let eq = datafusion::physical_expr::EquivalenceProperties::new_with_orderings(schema.clone(), remap_ordering(&input, &output_projection, &schema));
         let properties =
             Arc::new(PlanProperties::new(eq, Partitioning::UnknownPartitioning(1), input.properties().emission_type, input.properties().boundedness));
         Ok(Self { input, keys, key_idxs, tiebreak, required_ordering: None, output_projection, schema, properties, metrics: ExecutionPlanMetricsSet::new() })
     }
 
-    /// Declare the ordering keep-greatest needs (see `required_ordering`).
-    /// `None` leaves the operator ordering-agnostic — the pre-merge-on-read
-    /// behaviour every table without `version_append` keeps.
+    /// Declare the ordering keep-greatest needs. `None` leaves the operator
+    /// ordering-agnostic (tables without `version_append`).
     pub fn requiring(mut self, ordering: Option<datafusion::physical_expr::LexOrdering>) -> Self {
         self.required_ordering = ordering;
         self
@@ -497,19 +422,11 @@ impl DedupExec {
 
 impl DisplayAs for DedupExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        // Surface which seen-set mode this scan will actually run. `bounded`
-        // clears state whenever the bound advances (O(distinct keys within one
-        // bound value)); `full-set` retains every key for the whole scan — the
-        // multi-GB risk this module's docs warn about, and ~19% of prod live
-        // heap in the 2026-07-31 profile. The two are indistinguishable in
-        // EXPLAIN without this, so the only symptom is unexplained heap growth.
+        // Surface the seen-set mode: `bounded` clears state when the bound
+        // advances, `full-set` retains every key for the whole scan (a multi-GB
+        // risk otherwise invisible in EXPLAIN).
         let in_schema = self.input.schema();
         write!(f, "DedupExec: keys=[{}], mode=", self.keys.join(", "))?;
-        // Which SURVIVOR rule runs matters as much as the seen-set size:
-        // unbounded input with a tiebreak now keeps the GREATEST version
-        // (buffering to end-of-stream); without a tiebreak it is keep-first.
-        // Reading `full-set` alone used to hide that difference, and under
-        // merge-on-read keep-first silently serves the pre-update row.
         let survivor = if self.tiebreak.as_ref().is_some_and(|tb| in_schema.index_of(tb).is_ok()) { "greatest" } else { "first" };
         match detect_bound(&self.input, &self.keys, &in_schema, bounded_dedup_enabled()) {
             Some(b) => write!(f, "bounded[{}]/{survivor}", in_schema.field(b.idx).name()),
@@ -537,10 +454,8 @@ impl ExecutionPlan for DedupExec {
     }
 
     fn maintains_input_order(&self) -> Vec<bool> {
-        // Streaming dedup: surviving rows appear in input order (keep-greatest
-        // emits a closed run in input position order). Lets EnforceSorting swap
-        // the single-partition coalesce below for a SortPreservingMergeExec when
-        // a downstream ordering requires it.
+        // Surviving rows appear in input order (keep-greatest emits a closed run
+        // in input position order).
         vec![true]
     }
 
@@ -561,36 +476,19 @@ impl ExecutionPlan for DedupExec {
         }
         let in_schema = self.input.schema();
         let bound = detect_bound(&self.input, &self.keys, &in_schema, bounded_dedup_enabled());
-        // Which mode a scan got is the difference between a `LIMIT 251` that
-        // terminates after a few batches and one that buffers the whole window
-        // into the 2 GiB budget and fails. It was visible only in EXPLAIN, so the
-        // footer-repair backlog showed up as a user-facing error rather than as a
-        // number: 2026-08-22 the whale answered log_list@30d bounded while p1
-        // failed on the identical shape, because 38 of p1's 86 file groups carry
-        // no footer `sorting_columns` and ONE unordered branch erases the ordering
-        // the whole leg declares.
+        // Bounded vs full-set is the difference between a LIMIT that terminates
+        // early and one that buffers the whole window into the 2 GiB budget.
         metrics::counter!(match bound {
             Some(_) => scan_metric_names::DEDUP_BOUNDED_TOTAL,
             None => scan_metric_names::DEDUP_FULL_SET_TOTAL,
         })
         .increment(1);
         let key_idxs = dedup_key_idxs(&self.key_idxs);
-        // A bound lets keep-greatest emit per run without buffering the stream,
-        // so it is the preferred shape — but it is no longer REQUIRED. Refusing
-        // to run unbounded is what forced `version_append` scans to manufacture
-        // an ordering they could not get for free (merge-on-read writes a row's
-        // ORIGINAL timestamp into a NEW file, so Delta files overlap in time),
-        // and that blocking SortExec exhausted the query pool on prod
-        // 2026-08-02. Unbounded keep-greatest buffers to end-of-stream instead —
-        // strictly cheaper than the sort it replaces, and it keeps the operator
-        // CORRECT, where the old unbounded fallback (keep-first) would serve the
-        // pre-update row.
-        // The run buffer is REAL heap the pool must see: unbounded keep-greatest
-        // holds the whole scan's batches until end-of-stream, and untracked
-        // that is exactly the anon-RSS growth that OOM-killed prod on
-        // 2026-08-03 (kernel: anon-rss 125GB against a 120GiB cgroup). Under
-        // the pool an oversized window fails ITS query with
-        // ResourcesExhausted; the server survives.
+        // A bound lets keep-greatest emit per run, but is not required: without
+        // one it buffers to end-of-stream rather than forcing a blocking sort.
+        // That buffer is real heap the pool must see, so an oversized window
+        // fails its own query with ResourcesExhausted instead of OOM-killing the
+        // server.
         let reservation = MemoryConsumer::new("DedupExec[keep-greatest]").register(context.memory_pool());
         let greatest = self
             .tiebreak
@@ -617,9 +515,8 @@ impl ExecutionPlan for DedupExec {
         let baseline = BaselineMetrics::new(&self.metrics, partition);
         let input_rows = MetricBuilder::new(&self.metrics).counter("input_rows", partition);
         // One input batch can yield several output batches (a keep-greatest
-        // flush emits one per buffered batch) or none at all; `flat_map` fans
-        // them out lazily — an empty result just re-polls the source, and a
-        // downstream LIMIT can stop mid-run.
+        // flush emits one per buffered batch) or none at all, so `flat_map` fans
+        // them out lazily.
         let stream = futures::stream::unfold((input, dedup, baseline, input_rows, false), |(mut input, mut dedup, baseline, input_rows, done)| async move {
             if done {
                 return None;
@@ -650,18 +547,11 @@ impl ExecutionPlan for DedupExec {
         })
         .flat_map(|r| futures::stream::iter(r.map_or_else(|e| vec![Err(e)], |bs| bs.into_iter().map(Ok).collect::<Vec<_>>())));
 
-        // A statement timeout is enforced by DROPPING the in-flight future
-        // (`run_with_statement_timeout`), and `tokio::time::timeout_at` can only
-        // fire when a poll returns `Pending`. Unbounded keep-greatest buffers to
-        // end-of-stream, so one `poll_next` here can run for minutes of pure CPU
-        // — and while it does, the deadline is unobservable.
-        //
-        // Prod 2026-08-22: a 7-day aggregate ran >20 min against a 60s effective
-        // cap that never fired, on a container with 2h uptime that was answering
-        // `SELECT 1` on new connections the whole time. DataFusion's own coop
-        // docs name this exact failure: "this prevents the query execution from
-        // being cancelled". Built-in sources carry yield points; custom
-        // operators like this one have to opt in.
+        // Statement timeouts are enforced by dropping the in-flight future, and
+        // that can only happen when a poll returns `Pending`. Unbounded
+        // keep-greatest can burn minutes of pure CPU inside one `poll_next`, so
+        // this custom operator must opt into cooperative yielding or the
+        // deadline is unobservable.
         Ok(datafusion::physical_plan::coop::make_cooperative(Box::pin(RecordBatchStreamAdapter::new(out_schema, stream))))
     }
 
@@ -678,9 +568,8 @@ struct Cand {
     tb: TiebreakValue,
 }
 
-/// Most telemetry timestamps identify one logical event, so a bounded run
-/// normally has one winner (plus its physical MOR copies). Avoid hashing those
-/// tiny runs; promote only an unusually wide equal-timestamp run to a map.
+/// A bounded run normally has one winner, so tiny runs stay in a vec; only an
+/// unusually wide equal-timestamp run is promoted to a hash map.
 const SMALL_WINNER_LIMIT: usize = 8;
 
 enum WinnerUpdate {
@@ -832,20 +721,17 @@ struct Greatest {
     conv: Option<RowConverter>,
     best: Winners,
     batches: Vec<RecordBatch>,
-    /// Winner masks accumulated for CLOSED runs. A bounded stream may contain
-    /// thousands of timestamp runs in one Arrow batch; filtering the whole
-    /// batch at every boundary made that path O(rows × batch_rows). We mark
-    /// winners here and filter each retained batch once when it is safe to
-    /// emit.
+    /// Winner masks accumulated for CLOSED runs. Marking here and filtering each
+    /// retained batch once avoids an O(rows × batch_rows) filter per run
+    /// boundary.
     masks: Vec<Vec<bool>>,
     bytes: usize,
-    /// Pool accounting for `batches` (`bytes` mirrors its size). The winner
-    /// map is second-order (one small entry per key) and stays untracked.
+    /// Pool accounting for `batches` (`bytes` mirrors its size). The winner map
+    /// is second-order and stays untracked.
     reservation: MemoryReservation,
     /// Re-arm point for `compact_to_winners`: twice what the winners cost after
-    /// the last compaction. Without it a scan whose winners genuinely fill the
-    /// buffer would re-filter every retained batch on every push and make no
-    /// progress — the compaction has to buy more than it costs.
+    /// the last compaction, so a buffer genuinely full of winners does not
+    /// re-filter on every push.
     compact_floor: usize,
 }
 
@@ -865,25 +751,13 @@ impl Greatest {
     ///
     /// **Sound only while the whole scan is one open run** — i.e. unbounded
     /// keep-greatest, where `close_run` has not fired and every `masks` entry is
-    /// still false. Under that condition a retained row is either the live
-    /// winner for its key, or a version some strictly greater tiebreak already
-    /// beat; a beaten version can never be emitted, so dropping it changes no
-    /// answer. Bounded mode must NOT call this: its masks carry closed-run
+    /// still false. Bounded mode must NOT call this: its masks carry closed-run
     /// winners that have not been emitted yet, and this would discard them.
     ///
-    /// This is what bounds unordered dedup by DISTINCT KEYS instead of by rows.
-    /// `push` already releases the PREFIX of batches ahead of the earliest live
-    /// candidate (`min_batch` + `emit_prefix`), which is why a few keys updated
-    /// together cost nothing. What it cannot release is a batch holding one
-    /// live winner among many dead rows, or any batch after an early-pinned
-    /// key: one long-lived candidate in batch 0 pins the prefix at 0 and every
-    /// batch behind it is retained whole. With millions of distinct keys that
-    /// is the normal case, so the retained buffer grows with VERSIONS while the
-    /// answer grows with keys — the 2 GiB ceiling in `check_unbounded_growth`
-    /// is reached by the duplicates, not by the answer. That is p1's 30d
-    /// `log_list` failing while p4 answers the identical shape, and it is why
-    /// the variable is duplicate density rather than window width
-    /// (2026-08-24).
+    /// This is what bounds unordered dedup by DISTINCT KEYS instead of by rows:
+    /// `emit_prefix` can only release the prefix ahead of the earliest live
+    /// candidate, so one long-lived winner in batch 0 otherwise pins everything
+    /// behind it.
     fn compact_to_winners(&mut self) -> DFResult<()> {
         if self.batches.is_empty() {
             return Ok(());
@@ -907,11 +781,9 @@ impl Greatest {
             for (next, (row, _)) in mask.iter().enumerate().filter(|(_, k)| **k).enumerate() {
                 rows[row] = (bi, next as u32);
             }
-            // `compact_batch` after the filter, not just the filter: Arrow's
-            // filter over a view array produces new views over the ORIGINAL
-            // buffers, so without this the parquet column-chunk blocks stay
-            // alive and the compaction frees nothing (the same hazard the
-            // buffering path above already pays for).
+            // `compact_batch` after the filter: Arrow's filter over a view array
+            // produces new views over the ORIGINAL buffers, so without it the
+            // parquet column-chunk blocks stay alive and this frees nothing.
             let compacted = crate::write::mem_buffer::compact_batch(filter_record_batch(&batch, &BooleanArray::from(mask.clone())).map_err(arrow_err)?);
             kept_bytes += compacted.get_array_memory_size();
             self.batches.push(compacted);
@@ -924,7 +796,7 @@ impl Greatest {
         });
         self.masks = self.batches.iter().map(|b| vec![false; b.num_rows()]).collect();
         // The pool must see the drop, or the reservation outlives the memory it
-        // stands for and the next query inherits a buffer that is not there.
+        // stands for.
         match kept_bytes.cmp(&self.bytes) {
             std::cmp::Ordering::Less => self.reservation.shrink(self.bytes - kept_bytes),
             std::cmp::Ordering::Greater => self.reservation.try_grow(kept_bytes - self.bytes)?,
@@ -992,8 +864,7 @@ struct Dedup {
     seen: SeenSet,
     bound: Option<Bound>,
     greatest: Option<Greatest>,
-    /// Greatest-mode fast path for one non-null string key. The production
-    /// bounded key becomes just `id: Utf8View` after removing timestamp.
+    /// Greatest-mode fast path for a single non-null string key column.
     direct_string_key: Option<usize>,
 }
 
@@ -1032,11 +903,8 @@ impl Dedup {
         let proj = self.output_projection.as_deref();
         let mut out = Vec::new();
         // Only a BOUNDED run may flush early. Without a bound the whole scan is
-        // one open run: any key can still be beaten by a later batch, so emitting
-        // it now would serve the superseded row — exactly the merge-on-read bug
-        // this operator exists to prevent. Unbounded therefore buffers until
-        // end-of-stream, which is no worse than the blocking SortExec that
-        // forcing an ordering used to insert (and is a hash, not a spill).
+        // one open run: any key can still be beaten by a later batch, so
+        // emitting now would serve the superseded row.
         if self.bound.is_some() && g.bytes > RUN_BUFFER_MAX_BYTES {
             g.close_run(&mut self.seen, true);
             out.extend(g.emit_prefix(g.batches.len(), proj)?);
@@ -1050,7 +918,7 @@ impl Dedup {
         let not_i64 = |idx| DataFusionError::Internal(format!("DedupExec bound column {idx} is not i64-backed"));
         let bvals = self.bound.as_ref().map(|b| bound_slice(batch.column(b.idx)).ok_or_else(|| not_i64(b.idx))).transpose()?;
         // Index of `batch` within the open run's buffer; `None` until a row of
-        // this batch wins something, and reset by every flush (the run changed).
+        // this batch wins something.
         let mut cur: Option<u32> = None;
         for i in 0..batch.num_rows() {
             if let (Some(bound), Some(vals)) = (self.bound.as_mut(), bvals.as_ref())
@@ -1071,18 +939,10 @@ impl Dedup {
             let bi = match cur {
                 Some(bi) => bi,
                 None => {
-                    // Pool BEFORE buffering: on ResourcesExhausted the query
-                    // fails here instead of the cgroup killing the server.
-                    //
-                    // Compact first, because the run buffer RETAINS what it
-                    // holds. Batches read back by the DML UPDATE path are view
-                    // arrays over the parquet reader's whole column-chunk
-                    // blocks, so buffering one both charges the pool that block
-                    // and keeps it alive — prod 2026-08-17: the enrichment
-                    // UPDATE failed after 16.9s asking for 15.2 GB on a pool
-                    // 1.8 GB into 16 GB, fed by 847 KB and 5 MB of files.
-                    // `compact_batch` returns the batch untouched when there is
-                    // nothing to compact.
+                    // Pool BEFORE buffering, and compact first: a retained view
+                    // array keeps the parquet reader's whole column-chunk block
+                    // alive and charges the pool for it. `compact_batch` is a
+                    // no-op when there is nothing to compact.
                     let owned = crate::write::mem_buffer::compact_batch(batch.clone());
                     let size = owned.get_array_memory_size();
                     if self.bound.is_none() {
@@ -1115,10 +975,8 @@ impl Dedup {
     }
 }
 
-/// Filter only columns the caller will consume. COUNT and narrow projections
-/// augment the scan with ID/tiebreak columns solely for winner selection;
-/// filtering those variable-width arrays and then throwing them away was a
-/// large avoidable copy on amplified merge-on-read scans.
+/// Project BEFORE filtering, so the key/tiebreak columns added solely for winner
+/// selection are not copied and then discarded.
 fn filter_project_out(batch: &RecordBatch, mask: &BooleanArray, output_projection: Option<&[usize]>) -> DFResult<RecordBatch> {
     let projected = match output_projection {
         Some(idxs) => batch.project(idxs).map_err(arrow_err)?,
@@ -1133,16 +991,13 @@ fn filter_project_out(batch: &RecordBatch, mask: &BooleanArray, output_projectio
 fn dedup_first(
     batch: &RecordBatch, keys: &datafusion::arrow::row::Rows, seen: &mut SeenSet, output_projection: Option<&[usize]>, mut bound: Option<&mut Bound>,
 ) -> DFResult<Option<RecordBatch>> {
-    // Bounded-window values (Tier 2). `bound_slice` returning None (unsupported
-    // type) silently disables eviction for this batch — still correct.
-    // `.map(idx)` first so the slice's lifetime is tied to `batch`, not to the
-    // borrow of `bound` the closure below needs mutably.
+    // `bound_slice` returning None (unsupported type) disables eviction for this
+    // batch — still correct. `.map(idx)` first so the slice borrows `batch`, not
+    // `bound`, which the closure below needs mutably.
     let bvals = bound.as_ref().map(|b| b.idx).and_then(|i| bound_slice(batch.column(i)));
-    // Borrowed probe: hash the encoded bytes in place; on a miss (first sighting)
-    // allocate one `Box<[u8]>`. Duplicates never allocate — the mask is the
-    // negation folded into the `&&` so a hit short-circuits before `insert`.
-    // When bounded and the bound advances past the current run, the seen-set is
-    // cleared first: no earlier key can recur in a sorted stream.
+    // Borrowed probe: hash the encoded bytes in place and allocate only on a
+    // miss. When the bound advances past the current run the seen-set is cleared
+    // first — no earlier key can recur in a sorted stream.
     let mask: BooleanArray = (0..batch.num_rows())
         .map(|i| {
             if let (Some(b), Some(vals)) = (bound.as_deref_mut(), bvals)
@@ -1163,11 +1018,9 @@ fn dedup_first(
 
 #[cfg(test)]
 mod tests {
-    /// The soundness rule for additive, file-set certification. Getting this
-    /// wrong silently over-counts every dashboard tile, so the cases that must
-    /// DECLINE are enumerated as carefully as the ones that may skip.
-    ///
-    /// `("a", span)` names the file; the assertion is on which names survive.
+    /// The soundness rule for additive, file-set certification: getting it wrong
+    /// silently over-counts. `("a", span)` names the file; the assertion is on
+    /// which names survive.
     #[test_case::test_case(&[("a", Some((10, 20)))], &[Some((30, 40))], &["a"] ; "uncertified sits entirely after")]
     #[test_case::test_case(&[("a", Some((30, 40)))], &[Some((10, 20))], &["a"] ; "entirely before")]
     #[test_case::test_case(&[("a", Some((10, 20)))], &[], &["a"] ; "nothing uncertified to collide with")]
@@ -1179,10 +1032,8 @@ mod tests {
     #[test_case::test_case(&[("a", None)], &[Some((30, 40))], &[] ; "a certified file with no stats has an unknown span")]
     #[test_case::test_case(&[], &[Some((30, 40))], &[] ; "an empty certified set proves nothing")]
     #[test_case::test_case(&[], &[], &[] ; "nothing at all still proves nothing")]
-    // THE case the per-file rule exists for: a churning partition where one new
-    // file sits among the certified ones. Judged by the certified set's UNION
-    // span every file would be refused; judged per file, only the genuine
-    // neighbour is.
+    // THE case the per-file rule exists for: judged by the certified set's UNION
+    // span every file would be refused; per file, only the real neighbour is.
     #[test_case::test_case(&[("old", Some((10, 20))), ("mid", Some((45, 55))), ("new", Some((80, 90)))], &[Some((50, 60))], &["new", "old"] ; "only the overlapping certified file is held back")]
     fn certified_files_skip_dedup_only_when_no_uncertified_file_could_hold_another_version(
         certified: &[(&str, FileSpan)], uncertified: &[FileSpan], skippable: &[&str],
@@ -1205,24 +1056,25 @@ mod tests {
     #[test]
     fn winner_store_avoids_hashing_small_runs_and_promotes_wide_runs() {
         let mut winners = Winners::new();
+        // Probe then apply as `Dedup::push` does; reports whether the probe
+        // chose ReplaceLarge.
+        let offer = |w: &mut Winners, key: &[u8], batch: u32, row: u32, stamp: i64| -> bool {
+            let tb = TiebreakRef::I64(Some(stamp));
+            let update = w.probe(key, &tb);
+            let replace_large = matches!(update, WinnerUpdate::ReplaceLarge);
+            w.apply(key, Cand { batch, row, tb: tb.into_owned() }, update);
+            replace_large
+        };
         for row in 0..SMALL_WINNER_LIMIT {
-            let key = format!("id-{row}");
-            let tb = TiebreakRef::I64(Some(1));
-            let update = winners.probe(key.as_bytes(), &tb);
-            winners.apply(key.as_bytes(), Cand { batch: 0, row: row as u32, tb: tb.into_owned() }, update);
+            offer(&mut winners, format!("id-{row}").as_bytes(), 0, row as u32, 1);
         }
         assert!(matches!(winners, Winners::Small(_)));
 
-        let key = b"promotes";
-        let tb = TiebreakRef::I64(Some(1));
-        let update = winners.probe(key, &tb);
-        winners.apply(key, Cand { batch: 0, row: 8, tb: tb.into_owned() }, update);
+        let key: &[u8] = b"promotes";
+        offer(&mut winners, key, 0, 8, 1);
         assert!(matches!(winners, Winners::Large(_)));
 
-        let newer = TiebreakRef::I64(Some(2));
-        let update = winners.probe(key, &newer);
-        assert!(matches!(update, WinnerUpdate::ReplaceLarge));
-        winners.apply(key, Cand { batch: 1, row: 9, tb: newer.into_owned() }, update);
+        assert!(offer(&mut winners, key, 1, 9, 2), "a greater stamp must replace the stored large-run winner");
         assert_eq!(winners.min_batch(99), 0);
 
         let mut drained = 0;
@@ -1236,24 +1088,22 @@ mod tests {
         RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(ids.to_vec())), Arc::new(Int64Array::from(vals.to_vec()))]).unwrap()
     }
 
-    fn conv() -> RowConverter {
-        RowConverter::new(vec![SortField::new(DataType::Utf8)]).unwrap()
+    /// Keep-first over `b` keyed on `idxs`, threading the caller's seen-set and
+    /// bound.
+    fn first(b: &RecordBatch, idxs: &[usize], seen: &mut SeenSet, bound: Option<&mut Bound>) -> Option<RecordBatch> {
+        let schema = b.schema();
+        let conv = RowConverter::new(idxs.iter().map(|&i| SortField::new(schema.field(i).data_type().clone())).collect()).unwrap();
+        let keys = conv.convert_columns(&idxs.iter().map(|&i| b.column(i).clone()).collect::<Vec<_>>()).unwrap();
+        dedup_first(b, &keys, seen, None, bound).unwrap()
     }
 
-    fn keys_of(b: &RecordBatch, idxs: &[usize], c: &RowConverter) -> datafusion::arrow::row::Rows {
-        c.convert_columns(&idxs.iter().map(|&i| b.column(i).clone()).collect::<Vec<_>>()).unwrap()
-    }
-
-    /// COUNT-correctness + keep-first across batches: the seen-set threads
-    /// state, duplicates (including cross-batch) collapse, and the *first*
-    /// occurrence's row survives (its `v`). Regression guard for the
-    /// bytes-keyed borrowed-probe rewrite (parity plan Point 3, Tier 1).
+    /// Keep-first across batches: the seen-set threads state, duplicates
+    /// (including cross-batch) collapse, and the *first* occurrence survives.
     #[test]
     fn dedup_batch_keeps_first_and_counts_distinct() {
-        let converter = conv();
         let mut seen = SeenSet::default();
         let b1 = batch(&["a", "b", "a", "c"], &[1, 2, 3, 4]);
-        let out1 = dedup_first(&b1, &keys_of(&b1, &[0], &converter), &mut seen, None, None).unwrap().unwrap();
+        let out1 = first(&b1, &[0], &mut seen, None).unwrap();
         let ids = out1.column(0).as_any().downcast_ref::<StringArray>().unwrap();
         let vs = out1.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
         assert_eq!(ids.iter().flatten().collect::<Vec<_>>(), vec!["a", "b", "c"]);
@@ -1261,75 +1111,60 @@ mod tests {
 
         // Second batch: every key already seen → whole batch drops (None).
         let b2 = batch(&["b", "a"], &[9, 9]);
-        assert!(dedup_first(&b2, &keys_of(&b2, &[0], &converter), &mut seen, None, None).unwrap().is_none());
+        assert!(first(&b2, &[0], &mut seen, None).is_none());
 
         // A fresh key in an otherwise-dup batch survives alone.
         let b3 = batch(&["a", "d"], &[9, 5]);
-        let out3 = dedup_first(&b3, &keys_of(&b3, &[0], &converter), &mut seen, None, None).unwrap().unwrap();
+        let out3 = first(&b3, &[0], &mut seen, None).unwrap();
         assert_eq!(out3.num_rows(), 1);
         assert_eq!(out3.column(0).as_any().downcast_ref::<StringArray>().unwrap().value(0), "d");
     }
 
-    /// Tier-2 bounded-window: keying on `(id, ts)` with `ts` as the bound, a
-    /// later batch whose `ts` has advanced clears the seen-set — so an `id`
-    /// re-seen at a *new* ts is a distinct dedup key and correctly survives
-    /// (it is NOT the same row), while an exact `(id, ts)` dup within one run
-    /// still collapses. Also asserts the set actually shrinks (eviction fired).
+    /// Bounded window: an advancing `ts` clears the seen-set, so an `id` re-seen
+    /// at a NEW ts survives while an exact `(id, ts)` dup within a run collapses.
     #[test]
     fn dedup_batch_bounded_window_evicts_on_advance() {
         // Two-column key (id, ts); bound = ts (col 1), ascending.
-        let converter = RowConverter::new(vec![SortField::new(DataType::Utf8), SortField::new(DataType::Int64)]).unwrap();
         let mut seen = SeenSet::default();
         let mut bound = Bound { idx: 1, desc: false, last: None };
 
         // Run ts=10: a,b,a → within-run dup of `a` collapses.
         let r1 = batch(&["a", "b", "a"], &[10, 10, 10]);
-        let o1 = dedup_first(&r1, &keys_of(&r1, &[0, 1], &converter), &mut seen, None, Some(&mut bound)).unwrap().unwrap();
+        let o1 = first(&r1, &[0, 1], &mut seen, Some(&mut bound)).unwrap();
         assert_eq!(o1.num_rows(), 2, "(a,10),(b,10) survive; second (a,10) dropped");
         assert_eq!(seen.len(), 2);
 
-        // ts advances to 11: seen cleared; `a` re-seen at a NEW ts is a distinct
-        // key and survives. Set shrank to the new run only.
+        // ts advances to 11: seen cleared, so `a` at a NEW ts survives.
         let r2 = batch(&["a", "a"], &[11, 11]);
-        let o2 = dedup_first(&r2, &keys_of(&r2, &[0, 1], &converter), &mut seen, None, Some(&mut bound)).unwrap().unwrap();
+        let o2 = first(&r2, &[0, 1], &mut seen, Some(&mut bound)).unwrap();
         assert_eq!(o2.num_rows(), 1, "(a,11) survives once; second (a,11) is a same-run dup");
         assert_eq!(seen.len(), 1, "seen-set bounded to the current run, not O(all distinct)");
         assert_eq!(bound.last, Some(11));
     }
 
-    /// A parquet footer that DECLARES `timestamp DESC` over data not actually in
-    /// that order makes the bound never advance, so one "run" spans many
-    /// timestamps. Reducing the key to `id` alone (the old optimisation) then
-    /// collapsed rows differing only in `timestamp` — distinct rows. Prod
-    /// 2026-08-07: one minute read 132 rows instead of 1620, seen by customers
-    /// as multi-minute holes in their dashboards.
+    /// A footer declaring `timestamp DESC` over unsorted data makes the bound
+    /// never advance, so one "run" spans many timestamps; the key must still
+    /// include the bound or distinct rows collapse.
     #[test]
     fn bounded_dedup_false_ordering_does_not_collapse_distinct_timestamps() {
         // Declared DESC, actually ASCENDING — the footer lied.
         let mut bound = Bound { idx: 1, desc: true, last: None };
         let b = batch(&["a", "a"], &[5, 10]);
 
-        // The reduced key (`id` only) is what lost the rows.
-        let reduced = RowConverter::new(vec![SortField::new(DataType::Utf8)]).unwrap();
         let mut seen = SeenSet::default();
-        let lost = dedup_first(&b, &keys_of(&b, &[0], &reduced), &mut seen, None, Some(&mut bound)).unwrap().unwrap();
+        let lost = first(&b, &[0], &mut seen, Some(&mut bound)).unwrap();
         assert_eq!(lost.num_rows(), 1, "documents the old bug: (a,5) and (a,10) collapsed");
 
-        // `dedup_key_idxs` must therefore RETAIN the bound column, making the
-        // operator fail-safe under a false ordering.
         assert_eq!(dedup_key_idxs(&[0, 1]), vec![0, 1], "bound column must stay in the dedup key");
 
-        let full = RowConverter::new(vec![SortField::new(DataType::Utf8), SortField::new(DataType::Int64)]).unwrap();
         let mut bound2 = Bound { idx: 1, desc: true, last: None };
         let mut seen2 = SeenSet::default();
-        let kept = dedup_first(&b, &keys_of(&b, &[0, 1], &full), &mut seen2, None, Some(&mut bound2)).unwrap().unwrap();
+        let kept = first(&b, &[0, 1], &mut seen2, Some(&mut bound2)).unwrap();
         assert_eq!(kept.num_rows(), 2, "(a,5) and (a,10) are DISTINCT rows and must both survive");
     }
 
-    /// The kill switch must actually reach `detect_bound`: with bounded dedup
-    /// disabled, no ordering — however confidently declared — selects bounded
-    /// mode. It defaults ON (disabling it also disables LIMIT early
-    /// termination), so correctness must not depend on it.
+    /// With bounded dedup disabled, no declared ordering selects bounded mode.
+    /// It defaults ON (off also disables LIMIT early termination).
     #[test]
     fn bounded_dedup_kill_switch_forces_full_set() {
         let plan = greatest_plan(vec![vbatch(&["a", "a"], &[5, 10], &[Some(1), Some(2)])]);
@@ -1338,8 +1173,7 @@ mod tests {
         assert!(bounded_dedup_enabled(), "default must stay ON: full-set has no LIMIT early termination");
     }
 
-    /// An out-of-order row must be COUNTED, so prod can tell whether footers
-    /// actually lie rather than inferring it.
+    /// An out-of-order row under a declared ordering must be counted.
     #[test]
     fn advance_counts_declared_ordering_violations() {
         let before = ordering_violations();
@@ -1350,12 +1184,8 @@ mod tests {
         assert_eq!(ordering_violations(), before + 1);
     }
 
-    /// EXPLAIN must say WHICH seen-set mode a scan will run. `full-set` retains
-    /// every key for the whole scan (multi-GB on wide scans, ~19% of prod live
-    /// heap on 2026-07-31) while `bounded` clears per run — previously the plan
-    /// rendered identically either way, so the only symptom was heap growth
-    /// with no way to attribute it. Both spellings are asserted so this
-    /// diagnostic can't quietly stop distinguishing them.
+    /// EXPLAIN must say which seen-set mode a scan runs: `full-set` retains
+    /// every key for the whole scan, `bounded` clears per run.
     #[test]
     fn explain_reveals_seen_set_mode() {
         let b = batch(&["a"], &[10]);
@@ -1390,7 +1220,7 @@ mod tests {
     // ---- keep-greatest (merge-on-read phase 2) ----
 
     /// (id Utf8, ts Int64, tb Int64 nullable) — dedup key `(id, ts)` sorted by
-    /// `ts`, tiebreak `tb`. Mirrors `(timestamp, id)` + `updated_at`.
+    /// `ts`, tiebreak `tb`.
     fn vbatch(ids: &[&str], ts: &[i64], tb: &[Option<i64>]) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Utf8, false),
@@ -1409,31 +1239,25 @@ mod tests {
         DedupExec::with_tiebreak(src, vec!["ts".into(), "id".into()], Some("tb".into()), None).unwrap()
     }
 
-    /// Same, but the source declares NO ordering — the merge-on-read shape, where
-    /// an UPDATE writes the row's original timestamp into a new file so the Delta
-    /// leg's files overlap in time and no ordering can be declared.
+    /// Same, but the source declares NO ordering — the merge-on-read shape,
+    /// where an UPDATE rewrites a row under its original timestamp so the
+    /// Delta leg's files overlap in time.
     fn unbounded_greatest_plan(batches: Vec<RecordBatch>) -> DedupExec {
         let src = source(&[batches], None);
         DedupExec::with_tiebreak(src, vec!["ts".into(), "id".into()], Some("tb".into()), None).unwrap()
     }
 
-    /// Unsorted input MUST still keep the greatest version. This is the whole
-    /// reason merge-on-read can be enabled without forcing an ordering: the old
-    /// code refused keep-greatest without a bound and degraded to keep-FIRST,
-    /// which serves the PRE-UPDATE row. Forcing the ordering instead inserted a
-    /// blocking SortExec that exhausted the query pool on prod (2026-08-02:
-    /// 1h ~13s, 3h timing out), so neither existing branch was usable.
+    /// Unsorted input MUST still keep the greatest version: degrading to
+    /// keep-first would serve the pre-UPDATE row under merge-on-read.
     #[tokio::test(flavor = "multi_thread")]
     async fn keep_greatest_without_a_bound_still_picks_the_newest_version() {
         // `a` is updated in a LATER batch; `b`'s newer version arrives FIRST.
-        // Neither ordering assumption holds, and the ts column is not monotonic.
         let plan = unbounded_greatest_plan(vec![vbatch(&["a", "b"], &[10, 20], &[Some(1), Some(9)]), vbatch(&["b", "a"], &[20, 10], &[Some(2), Some(7)])]);
         let mut got = collect_rows(&plan).await;
         got.sort();
         assert_eq!(got, vec![("a".into(), 10, Some(7)), ("b".into(), 20, Some(9))], "unbounded keep-greatest must win on the tiebreak, not on arrival order");
 
-        // A NULL stamp (a legacy row written before the version column existed)
-        // must still lose to any stamped version, in either arrival order.
+        // A NULL stamp must lose to any stamped version, in either order.
         let plan = unbounded_greatest_plan(vec![vbatch(&["c"], &[30], &[None]), vbatch(&["c"], &[30], &[Some(4)])]);
         assert_eq!(collect_rows(&plan).await, vec![("c".into(), 30, Some(4))]);
     }
@@ -1465,11 +1289,8 @@ mod tests {
         assert_eq!(rows.collect::<Vec<_>>(), vec![("a".into(), Some("z".into())), ("b".into(), None)]);
     }
 
-    /// The unbounded run buffer must be POOL-TRACKED: untracked it grows with
-    /// the whole scan as anon heap the cgroup cannot see coming, which
-    /// OOM-killed prod on 2026-08-03 (kernel: anon-rss 125GB / 120GiB limit).
-    /// Under a pool the oversized query fails with ResourcesExhausted and the
-    /// server survives.
+    /// The unbounded run buffer must be pool-tracked, so an oversized scan
+    /// fails its own query instead of growing untracked anon heap.
     #[tokio::test(flavor = "multi_thread")]
     async fn unbounded_run_buffer_is_pool_tracked_so_an_oversized_scan_fails_its_query() {
         use datafusion::execution::{memory_pool::GreedyMemoryPool, runtime_env::RuntimeEnvBuilder};
@@ -1490,15 +1311,8 @@ mod tests {
     }
 
     /// A batch whose columns are slices of a much larger parent must be charged
-    /// for the rows it owns, not for the allocation it borrows from.
-    ///
-    /// Prod 2026-08-17: monoscope's enrichment UPDATE failed after 16.9s with
-    /// `Failed to allocate additional 15.2 GB for DedupExec[keep-greatest]` on
-    /// a pool that was 1.8 GB used of 16 GB, fed by scans reading 847 KB and
-    /// 5 MB of files. Batches from the DML UPDATE path are view arrays over the
-    /// parquet reader's full column-chunk blocks, and `get_array_memory_size`
-    /// charges the whole block — the mechanism `mem_buffer::compact_batch`
-    /// already exists to neutralize.
+    /// for the rows it owns, not for the allocation it borrows from:
+    /// `get_array_memory_size` charges the whole parent column-chunk block.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_batch_slicing_a_big_parent_is_charged_for_its_own_rows() {
         use datafusion::execution::{memory_pool::GreedyMemoryPool, runtime_env::RuntimeEnvBuilder};
@@ -1521,17 +1335,14 @@ mod tests {
         let inherited = batches[0].get_array_memory_size();
         assert!(inherited > 64 * 1024, "a slice of a 64k-row parent must report the parent's buffers, else this test proves nothing");
 
-        // Comfortably above the 16 rows actually retained, far below 8 x the
-        // inherited charge. Only honest accounting fits here.
-        let plan = unbounded_greatest_plan(batches);
+        // Above the 16 rows retained, far below 8 x the inherited charge:
+        // only honest accounting fits in this pool.
         let runtime = RuntimeEnvBuilder::new().with_memory_pool(Arc::new(GreedyMemoryPool::new(inherited))).build_arc().unwrap();
         let ctx = Arc::new(TaskContext::default().with_runtime(runtime));
-        let mut stream = plan.execute(0, ctx).unwrap();
-        let mut rows = 0;
-        while let Some(r) = futures::StreamExt::next(&mut stream).await {
-            rows += r.expect("16 sliced rows must not be charged the whole parent").num_rows();
-        }
-        assert_eq!(rows, owned, "every distinct key must survive");
+        let out = datafusion::physical_plan::collect(Arc::new(unbounded_greatest_plan(batches)), ctx)
+            .await
+            .expect("16 sliced rows must not be charged the whole parent");
+        assert_eq!(out.iter().map(RecordBatch::num_rows).sum::<usize>(), owned, "every distinct key must survive");
     }
 
     #[test]
@@ -1543,8 +1354,7 @@ mod tests {
     }
 
     /// EXPLAIN must distinguish the SURVIVOR rule, not just the seen-set size:
-    /// `full-set/first` silently serves the pre-update row under merge-on-read,
-    /// while `full-set/greatest` is correct. They were indistinguishable before.
+    /// `full-set/first` serves the pre-update row, `full-set/greatest` is right.
     #[test]
     fn explain_reports_the_survivor_rule() {
         let plan = unbounded_greatest_plan(vec![vbatch(&["a"], &[1], &[Some(1)])]);
@@ -1552,84 +1362,70 @@ mod tests {
         assert!(shown.contains("mode=full-set/greatest"), "unsorted + tiebreak must report keep-greatest, got: {shown}");
     }
 
+    /// The `(id, ts, tb)` rows of `batches`, in batch order.
+    fn batch_rows(batches: &[RecordBatch]) -> Vec<(String, i64, Option<i64>)> {
+        batches
+            .iter()
+            .flat_map(|b| {
+                let (ids, ts, tb) = (
+                    b.column(0).as_any().downcast_ref::<StringArray>().unwrap(),
+                    b.column(1).as_any().downcast_ref::<Int64Array>().unwrap(),
+                    b.column(2).as_any().downcast_ref::<Int64Array>().unwrap(),
+                );
+                (0..b.num_rows()).map(|i| (ids.value(i).to_string(), ts.value(i), tb.is_valid(i).then(|| tb.value(i)))).collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
     async fn collect_rows(plan: &DedupExec) -> Vec<(String, i64, Option<i64>)> {
         let mut stream = plan.execute(0, Arc::new(TaskContext::default())).unwrap();
         let mut out = Vec::new();
         while let Some(b) = futures::StreamExt::next(&mut stream).await {
-            let b = b.unwrap();
-            let (ids, ts, tb) = (
-                b.column(0).as_any().downcast_ref::<StringArray>().unwrap(),
-                b.column(1).as_any().downcast_ref::<Int64Array>().unwrap(),
-                b.column(2).as_any().downcast_ref::<Int64Array>().unwrap(),
-            );
-            out.extend((0..b.num_rows()).map(|i| (ids.value(i).to_string(), ts.value(i), tb.is_valid(i).then(|| tb.value(i)))));
+            out.push(b.unwrap());
         }
-        out
+        batch_rows(&out)
     }
 
-    /// Run a `DedupExec` over `spec` and return the rows in EMISSION order.
+    /// THE survivor rules of `DedupExec`, one case per arrival shape. Rows are
+    /// asserted in emission order: survivors come out at their own input
+    /// positions, so any declared input ordering still holds on the output.
     /// `ordered` declares the `ts` ordering on the source (bounded runs);
     /// `tiebreak` supplies the `tb` version stamp.
-    fn dedup_rows(ordered: bool, tiebreak: bool, spec: &[BatchSpec<'_>]) -> Vec<(String, i64, Option<i64>)> {
+    #[test_case::test_case(true, true, &[(&["a", "b"], &[10, 10], &[Some(1), Some(5)]), (&["a", "b"], &[10, 10], &[Some(7), Some(2)]), (&["a"], &[10], &[Some(3)])] => vec![("b".to_string(), 10, Some(5)), ("a".to_string(), 10, Some(7))] ; "keep_greatest picks the highest tiebreak across batches")]
+    // Runs are the unit of emission: a closed run's keys emit when the bound
+    // advances, and a key re-seen at a *new* ts is a different row.
+    #[test_case::test_case(true, true, &[(&["a", "a", "b"], &[10, 10, 11], &[Some(1), Some(9), Some(1)]), (&["a", "b"], &[11, 11], &[Some(4), Some(8)]), (&["a"], &[12], &[Some(0)])] => vec![("a".to_string(), 10, Some(9)), ("a".to_string(), 11, Some(4)), ("b".to_string(), 11, Some(8)), ("a".to_string(), 12, Some(0))] ; "keep_greatest across a run boundary")]
+    // NULL tiebreak sorts lowest, in either arrival order.
+    #[test_case::test_case(true, true, &[(&["a", "a", "b", "b"], &[1, 1, 2, 2], &[None, Some(1), Some(1), None])] => vec![("a".to_string(), 1, Some(1)), ("b".to_string(), 2, Some(1))] ; "keep_greatest null tiebreak loses in either order")]
+    // All-NULL keeps exactly ONE row. The two inputs are byte-identical, so
+    // this asserts the row count only, not which row survived.
+    #[test_case::test_case(true, true, &[(&["a", "a"], &[1, 1], &[None, None])] => vec![("a".to_string(), 1, None)] ; "keep_greatest all-NULL stamps keep exactly one row")]
+    // No `dedup_tiebreak` ⇒ keep-FIRST, even though a later copy would have
+    // won under keep-greatest.
+    #[test_case::test_case(true, false, &[(&["a", "a"], &[1, 1], &[Some(1), Some(9)])] => vec![("a".to_string(), 1, Some(1))] ; "no tiebreak stays keep-first")]
+    // Unordered input has no run boundary, so keep-greatest buffers to
+    // end-of-stream rather than degrading to keep-first (which would serve the
+    // pre-UPDATE row) or forcing a blocking sort.
+    #[test_case::test_case(false, true, &[(&["a", "a"], &[1, 1], &[Some(1), Some(9)])] => vec![("a".to_string(), 1, Some(9))] ; "unordered input keeps the newest version")]
+    // A table WITHOUT a tiebreak still keeps first: nothing ranks its versions.
+    #[test_case::test_case(false, false, &[(&["a", "a"], &[1, 1], &[Some(1), Some(9)])] => vec![("a".to_string(), 1, Some(1))] ; "unordered input without a tiebreak keeps first")]
+    fn dedup_survivor_rules(ordered: bool, tiebreak: bool, spec: &[BatchSpec<'_>]) -> Vec<(String, i64, Option<i64>)> {
         let batches: Vec<RecordBatch> = spec.iter().map(|(ids, ts, tb)| vbatch(ids, ts, tb)).collect();
         let src = source(&[batches], ordered.then(|| col_asc("ts", 1)));
         let plan = DedupExec::with_tiebreak(src, vec!["ts".into(), "id".into()], tiebreak.then(|| "tb".to_string()), None).unwrap();
         tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap().block_on(collect_rows(&plan))
     }
 
-    /// THE survivor rules of `DedupExec`, one case per arrival shape. Rows are
-    /// asserted in emission order: survivors come out at their own input
-    /// positions, i.e. a subsequence of the input, so any declared ordering —
-    /// not just the bound column — still holds.
-    //
-    // The version-append contract: the greatest-tiebreak copy of a key wins,
-    // even when the newer version arrives in a later batch (`a` upgraded to 7,
-    // `b`'s older copy loses), and even when the key's versions straddle
-    // batches within one `ts` run. Counts stay right.
-    #[test_case::test_case(true, true, &[(&["a", "b"], &[10, 10], &[Some(1), Some(5)]), (&["a", "b"], &[10, 10], &[Some(7), Some(2)]), (&["a"], &[10], &[Some(3)])] => vec![("b".to_string(), 10, Some(5)), ("a".to_string(), 10, Some(7))] ; "keep_greatest picks the highest tiebreak across batches")]
-    // Runs are the unit of emission: keys of a closed run are emitted when the
-    // bound advances, and a key re-seen at a *new* ts is a different row (a@11
-    // wins at row 0 of batch 2, b@11 at row 1).
-    #[test_case::test_case(true, true, &[(&["a", "a", "b"], &[10, 10, 11], &[Some(1), Some(9), Some(1)]), (&["a", "b"], &[11, 11], &[Some(4), Some(8)]), (&["a"], &[12], &[Some(0)])] => vec![("a".to_string(), 10, Some(9)), ("a".to_string(), 11, Some(4)), ("b".to_string(), 11, Some(8)), ("a".to_string(), 12, Some(0))] ; "keep_greatest across a run boundary")]
-    // NULL tiebreak sorts lowest: a pre-existing (unstamped) row always loses
-    // to any stamped version, in either arrival order.
-    #[test_case::test_case(true, true, &[(&["a", "a", "b", "b"], &[1, 1, 2, 2], &[None, Some(1), Some(1), None])] => vec![("a".to_string(), 1, Some(1)), ("b".to_string(), 2, Some(1))] ; "keep_greatest null tiebreak loses in either order")]
-    // All-NULL keeps exactly ONE row (no spurious duplicate). The two inputs are
-    // byte-identical, so naming the surviving row asserts only the row count —
-    // do not generalize this into a which-row-survives claim.
-    #[test_case::test_case(true, true, &[(&["a", "a"], &[1, 1], &[None, None])] => vec![("a".to_string(), 1, None)] ; "keep_greatest all-NULL stamps keep exactly one row")]
-    // No `dedup_tiebreak` ⇒ byte-for-byte the old behaviour: keep-FIRST, even
-    // though a later copy would have won under keep-greatest.
-    #[test_case::test_case(true, false, &[(&["a", "a"], &[1, 1], &[Some(1), Some(9)])] => vec![("a".to_string(), 1, Some(1))] ; "no tiebreak stays keep-first")]
-    // Unordered input has no run boundary, so keep-greatest buffers to
-    // end-of-stream rather than degrading to keep-first. It used to degrade,
-    // which under merge-on-read served the PRE-UPDATE row; the alternative the
-    // planner then took — forcing an ordering — inserted a blocking SortExec
-    // that exhausted the query pool on prod (2026-08-02). Buffering here is
-    // strictly cheaper than that sort, and unlike keep-first it is correct.
-    #[test_case::test_case(false, true, &[(&["a", "a"], &[1, 1], &[Some(1), Some(9)])] => vec![("a".to_string(), 1, Some(9))] ; "unordered input keeps the newest version")]
-    // A table WITHOUT a tiebreak still keeps first: nothing ranks its versions.
-    #[test_case::test_case(false, false, &[(&["a", "a"], &[1, 1], &[Some(1), Some(9)])] => vec![("a".to_string(), 1, Some(1))] ; "unordered input without a tiebreak keeps first")]
-    fn dedup_survivor_rules(ordered: bool, tiebreak: bool, spec: &[BatchSpec<'_>]) -> Vec<(String, i64, Option<i64>)> {
-        dedup_rows(ordered, tiebreak, spec)
-    }
-
-    /// A production OTel batch contains many distinct timestamps. Bounded
-    /// greatest-version dedup must filter that Arrow batch once, not once per
-    /// timestamp run (the latter made a nominally streaming 24h scan spend
-    /// seconds rebuilding full-batch Boolean masks).
+    /// Bounded greatest-version dedup must filter an input batch once, not
+    /// once per timestamp run inside it.
     #[tokio::test(flavor = "multi_thread")]
     async fn bounded_greatest_coalesces_many_runs_in_one_input_batch() {
         let ids: Vec<String> = (0..4096).map(|i| format!("id-{i}")).collect();
         let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
         let ts: Vec<i64> = (0..4096).collect();
         let tb: Vec<Option<i64>> = (0..4096).map(Some).collect();
-        let plan = greatest_plan(vec![vbatch(&id_refs, &ts, &tb)]);
-        let mut stream = plan.execute(0, Arc::new(TaskContext::default())).unwrap();
-        let mut batches = Vec::new();
-        while let Some(batch) = futures::StreamExt::next(&mut stream).await {
-            batches.push(batch.unwrap());
-        }
+        let plan = Arc::new(greatest_plan(vec![vbatch(&id_refs, &ts, &tb)]));
+        let batches = datafusion::physical_plan::collect(plan, Arc::new(TaskContext::default())).await.unwrap();
         assert_eq!(batches.len(), 1, "one input batch must not fragment into one output batch per timestamp");
         assert_eq!(batches[0].num_rows(), 4096);
     }
@@ -1646,8 +1442,8 @@ mod tests {
         assert_eq!(b.column(0).as_any().downcast_ref::<Int64Array>().unwrap().values(), &[1, 3]);
     }
 
-    /// PlanProperties must not lie: one output partition, the remapped input
-    /// ordering preserved (that is what keeps `ORDER BY … LIMIT` streaming).
+    /// One output partition, and the remapped input ordering preserved — that
+    /// is what keeps `ORDER BY … LIMIT` streaming.
     #[test]
     fn plan_properties() {
         let data = vec![vec![batch(&["a"], &[1])]];
@@ -1659,8 +1455,7 @@ mod tests {
     }
 
     /// Lazy ordered source that counts the batches actually pulled — the probe
-    /// for early-LIMIT termination. One `ts` run per batch, each with a
-    /// duplicate pair so dedup has real work to do.
+    /// for early-LIMIT termination. One `ts` run per batch, each a duplicate pair.
     #[derive(Debug)]
     struct CountingExec {
         schema: SchemaRef,
@@ -1710,10 +1505,8 @@ mod tests {
         }
     }
 
-    /// The load-bearing claim of the merge-on-read design: keep-greatest still
-    /// streams. A `LIMIT` over a huge ordered input must terminate after pulling
-    /// a handful of batches — if the operator buffered versions past a run
-    /// boundary it would drain the whole source instead.
+    /// Keep-greatest must still stream: a `LIMIT` over a huge ordered input
+    /// terminates after a handful of batches, not by draining the source.
     #[tokio::test(flavor = "multi_thread")]
     async fn keep_greatest_limit_terminates_early() {
         use datafusion::physical_plan::{collect, limit::GlobalLimitExec};
@@ -1731,19 +1524,7 @@ mod tests {
     /// batches hold only the open run, not O(scan).
     #[test]
     fn keep_greatest_run_state_is_bounded() {
-        let in_schema = vbatch(&["a"], &[0], &[Some(0)]).schema();
-        let mut d = Dedup {
-            key_idxs: vec![1, 0],
-            conv: RowConverter::new(vec![SortField::new(DataType::Int64), SortField::new(DataType::Utf8)]).unwrap(),
-            output_projection: None,
-            seen: SeenSet::default(),
-            bound: Some(Bound { idx: 1, desc: false, last: None }),
-            direct_string_key: None,
-            greatest: Some(
-                Greatest::new(2, in_schema.field(2).data_type(), MemoryConsumer::new("test").register(&Arc::new(TaskContext::default()).memory_pool().clone()))
-                    .unwrap(),
-            ),
-        };
+        let mut d = dedup_state(Some(Bound { idx: 1, desc: false, last: None }));
         for t in 0..200i64 {
             d.push(&vbatch(&["a", "b", "a"], &[t, t, t], &[Some(1), Some(1), Some(2)])).unwrap();
         }
@@ -1756,16 +1537,16 @@ mod tests {
     /// One `vbatch` as a case-table row: ids, timestamps, tiebreak stamps.
     type BatchSpec<'a> = (&'a [&'a str], &'a [i64], &'a [Option<i64>]);
 
-    /// An UNBOUNDED keep-greatest state (`bound: None`) — the merge-on-read
-    /// shape that buffers to end-of-stream and owns the 2 GiB ceiling.
-    fn unbounded_dedup() -> Dedup {
+    /// A keep-greatest `Dedup` over the `(id, ts, tb)` shape. `bound: None` is
+    /// the unbounded merge-on-read shape that buffers to end-of-stream.
+    fn dedup_state(bound: Option<Bound>) -> Dedup {
         let in_schema = vbatch(&["a"], &[0], &[Some(0)]).schema();
         Dedup {
             key_idxs: vec![1, 0],
             conv: RowConverter::new(vec![SortField::new(DataType::Int64), SortField::new(DataType::Utf8)]).unwrap(),
             output_projection: None,
             seen: SeenSet::default(),
-            bound: None,
+            bound,
             direct_string_key: None,
             greatest: Some(
                 Greatest::new(2, in_schema.field(2).data_type(), MemoryConsumer::new("test").register(&Arc::new(TaskContext::default()).memory_pool().clone()))
@@ -1775,24 +1556,16 @@ mod tests {
     }
 
     fn rows_of(batches: &[RecordBatch]) -> Vec<(String, i64, Option<i64>)> {
-        let mut out: Vec<_> = batches
-            .iter()
-            .flat_map(|b| {
-                let ids = b.column(0).as_any().downcast_ref::<StringArray>().unwrap();
-                let ts = b.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
-                let tb = b.column(2).as_any().downcast_ref::<Int64Array>().unwrap();
-                (0..b.num_rows()).map(|i| (ids.value(i).to_string(), ts.value(i), tb.is_valid(i).then(|| tb.value(i)))).collect::<Vec<_>>()
-            })
-            .collect();
+        let mut out = batch_rows(batches);
         out.sort();
         out
     }
 
     /// Push `batches`, optionally collapsing the retained buffer after each one,
-    /// and return the deduped answer. `compact_every` forces the path that
-    /// `RUN_BUFFER_MAX_BYTES` would otherwise only reach at 64 MB.
+    /// and return the deduped answer. `compact_every` forces the compaction
+    /// path that `RUN_BUFFER_MAX_BYTES` would otherwise only reach at 64 MB.
     fn run_unbounded(batches: &[RecordBatch], compact_every: bool) -> Vec<(String, i64, Option<i64>)> {
-        let mut d = unbounded_dedup();
+        let mut d = dedup_state(None);
         let mut out = Vec::new();
         for b in batches {
             out.extend(d.push(b).unwrap());
@@ -1804,44 +1577,32 @@ mod tests {
         rows_of(&out)
     }
 
-    /// THE correctness assertion for winner-row compaction: collapsing the
-    /// retained buffer must not change a single answer, and in particular a key
-    /// whose newest version arrives in a LATER batch must still be replaceable
-    /// after its earlier version survived a compaction.
-    ///
-    /// Each case is an arrival order over the same logical rows. `b`'s newest
-    /// version arrives first, `a`'s arrives last, and `c` carries the NULL stamp
-    /// (a legacy row written before the version column existed) that must lose
-    /// to any stamped version regardless of where the compaction falls.
+    /// Collapsing the retained buffer to current winners must not change a
+    /// single answer; in particular a key whose newest version arrives in a
+    /// LATER batch must still be replaceable after an earlier compaction.
+    /// Each case is one arrival order over the same logical rows.
     #[test_case::test_case(&[(&["a", "b"], &[10, 20], &[Some(1), Some(9)]), (&["b", "a"], &[20, 10], &[Some(2), Some(7)])] ; "update arrives in a later batch")]
     #[test_case::test_case(&[(&["a"], &[10], &[Some(7)]), (&["a"], &[10], &[Some(1)])] ; "the winner arrives FIRST and later versions lose")]
     #[test_case::test_case(&[(&["c"], &[30], &[None]), (&["c"], &[30], &[Some(4)])] ; "a NULL stamp loses across a compaction")]
     #[test_case::test_case(&[(&["c"], &[30], &[Some(4)]), (&["c"], &[30], &[None])] ; "and in the other arrival order")]
     #[test_case::test_case(&[(&["a", "a", "a"], &[10, 10, 10], &[Some(1), Some(3), Some(2)]), (&["a"], &[10], &[Some(9)]), (&["b"], &[20], &[Some(1)])] ; "many versions in one batch, then a later winner")]
     #[test_case::test_case(&[(&["a"], &[10], &[Some(1)]), (&["b"], &[20], &[Some(1)]), (&["a"], &[10], &[Some(2)]), (&["b"], &[20], &[Some(2)])] ; "two keys updated alternately")]
-    // A TIE across the compaction. `beats` is strict, so the equal challenger is
-    // never applied and the incumbent's row is the only one retained. The two
-    // versions are indistinguishable in every observable column, so what this
-    // pins is that a tie at the boundary loses no key and emits no duplicate —
-    // not which of the two identical rows survived.
+    // A TIE across the compaction: `beats` is strict, so the equal challenger
+    // never unseats the incumbent. Pins that a tie loses no key and emits no
+    // duplicate — not which of the two identical rows survived.
     #[test_case::test_case(&[(&["a"], &[10], &[Some(5)]), (&["a"], &[10], &[Some(5)])] ; "an equal stamp does not unseat the incumbent")]
     fn a_winner_compaction_changes_no_answer(spec: &[BatchSpec<'_>]) {
         let batches: Vec<RecordBatch> = spec.iter().map(|(ids, ts, tb)| vbatch(ids, ts, tb)).collect();
         assert_eq!(run_unbounded(&batches, true), run_unbounded(&batches, false), "compacting the retained buffer to current winners changed the answer");
     }
 
-    /// And the reason to do it — reproduced as the shape prod actually has, not
-    /// as a few keys updated together.
-    ///
-    /// `p` is a key whose winner lands in batch 0 and is never beaten. That
-    /// PINS the prefix at 0, so `push`'s own `min_batch`/`emit_prefix` release
-    /// can never fire, and every later batch is retained whole including its
-    /// dead versions. With millions of distinct keys over a 30-day window some
-    /// key always plays `p`'s part, which is why the release that works in the
-    /// unit tests above does nothing on the query that fails.
+    /// `p` is a key whose winner lands in batch 0 and is never beaten, pinning
+    /// the prefix at 0 so `push`'s `min_batch`/`emit_prefix` release can never
+    /// fire and every later batch is retained whole, dead versions included.
+    /// Over a wide window some key always plays `p`'s part.
     #[test]
     fn a_winner_compaction_retains_one_row_per_key_not_per_version() {
-        let mut d = unbounded_dedup();
+        let mut d = dedup_state(None);
         d.push(&vbatch(&["p"], &[1], &[Some(1)])).unwrap();
         // 40 further keys, each arriving as three versions inside one batch.
         for i in 0..40i64 {
@@ -1858,21 +1619,18 @@ mod tests {
         assert_eq!(after, 41, "one row per live key survives, got {after}");
         assert!(g.bytes < bytes_before, "the pool reservation must fall with the rows ({bytes_before} -> {})", g.bytes);
 
-        // The surviving row per key is the WINNER (tb=3), not the first-arrived
-        // (tb=1) — this is the assertion a bad remap fails.
+        // The surviving row per key is the WINNER (tb=3), not the first-arrived.
         let out = rows_of(&d.finish().unwrap());
         assert_eq!(out.len(), 41);
         assert!(out.iter().all(|(id, _, tb)| id == "p" || *tb == Some(3)), "a compaction re-pointed a candidate at the wrong row: {out:?}");
     }
 
     /// A compaction that leaves a batch with no winners must drop the batch and
-    /// re-point every surviving candidate. Dropping a batch shifts every later
-    /// batch's index, so this is where an off-by-one shows up as a wrong row
-    /// rather than as a panic. `p` pins the prefix so `push` does not release
-    /// the emptied batch on its own.
+    /// re-point every surviving candidate, since dropping shifts every later
+    /// batch index. `p` pins the prefix so `push` cannot release it instead.
     #[test]
     fn a_compaction_that_empties_a_batch_repoints_the_survivors() {
-        let mut d = unbounded_dedup();
+        let mut d = dedup_state(None);
         d.push(&vbatch(&["p"], &[1], &[Some(1)])).unwrap();
         d.push(&vbatch(&["a"], &[10], &[Some(1)])).unwrap();
         // Beats `a`, so the middle batch loses its only winner and must go.
@@ -1903,21 +1661,17 @@ mod ordering_probe_tests {
         prelude::SessionContext,
     };
     use datafusion_datasource::{memory::MemorySourceConfig, source::DataSourceExec};
-    use futures::StreamExt;
 
     use super::{LegKind, OrderingProbeExec, ordering_violations_by_leg};
 
-    /// A leg whose declared ordering is a LIE: it claims timestamp DESC and
-    /// then hands back ascending rows. This is the shape the probe exists to
-    /// catch — `DedupExec` counts the violation globally, but it sits above the
-    /// union and cannot say WHICH leg produced it.
+    /// A leg whose declared ordering is a LIE: claims timestamp DESC, hands
+    /// back ascending rows.
     fn lying_desc_leg(values: Vec<i64>) -> Arc<dyn ExecutionPlan> {
         let schema = Arc::new(Schema::new(vec![Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, None), false)]));
         let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(TimestampMicrosecondArray::from(values))]).unwrap();
         let src = MemorySourceConfig::try_new(&[vec![batch]], schema.clone(), None).unwrap();
         let exec = Arc::new(DataSourceExec::new(Arc::new(src))) as Arc<dyn ExecutionPlan>;
-        // Declare DESC regardless of the data — exactly what a stale/false
-        // parquet footer does to a Delta scan.
+        // Declare DESC regardless of the data, as a stale parquet footer does.
         let ordering = LexOrdering::new(vec![PhysicalSortExpr::new_default(Arc::new(Column::new("timestamp", 0))).desc()]).unwrap();
         let props = PlanProperties::new(
             EquivalenceProperties::new_with_orderings(schema, [ordering]),
@@ -1959,20 +1713,12 @@ mod ordering_probe_tests {
     }
 
     async fn drain(plan: Arc<dyn ExecutionPlan>) {
-        let ctx = SessionContext::new();
-        let mut s = plan.execute(0, ctx.task_ctx()).unwrap();
-        while let Some(b) = s.next().await {
-            b.unwrap();
-        }
+        datafusion::physical_plan::collect(plan, SessionContext::new().task_ctx()).await.unwrap();
     }
 
-    /// The probe must name the leg that lied and leave the innocent legs at
-    /// zero — a diagnostic that blames everyone is no better than the global
-    /// counter it is meant to disambiguate — and a leg that honours its claim
-    /// must be silent, or the counter is noise.
-    ///
+    /// The probe must name the leg that lied and leave the other legs at zero.
     /// Returns the (delta, mem) violation counts this drain added.
-    // Ascending rows behind a DESC claim: every step after the first is a violation.
+    // Ascending rows behind a DESC claim: every step after the first violates.
     #[test_case::test_case(vec![1, 2, 3, 4], LegKind::Delta => with |(delta, mem): (u64, u64)| {
         assert!(delta >= 3, "the lying delta leg must be attributed, got {delta}");
         assert_eq!(mem, 0, "an innocent leg must not be blamed");
@@ -1992,10 +1738,9 @@ mod ordering_probe_tests {
         (delta("delta"), delta("mem"))
     }
 
-    /// `LegKind::sortable()` is what replaced the parallel `leg_sortable` mask.
     /// The Delta leg must never be sortable: an UPDATE writes a row's ORIGINAL
     /// timestamp into a NEW file, so its files overlap, and the blocking sort
-    /// that "fixes" that exhausted the query pool (prod 2026-08-02).
+    /// that would "fix" that exhausts the query pool.
     #[test]
     fn only_the_in_memory_legs_are_sortable() {
         assert!(LegKind::Mem.sortable());
@@ -2004,32 +1749,14 @@ mod ordering_probe_tests {
 }
 
 // ===== count_pushdown =====
-// COUNT(*) pushdown from Delta add-action statistics.
+// COUNT(*) pushdown from Delta add-action statistics: `Σ stats.numRecords`
+// over the project's files lying FULLY inside the window, with zero parquet IO.
 //
-// `SELECT COUNT(*) FROM t WHERE project_id = 'x' AND timestamp >= lo AND
-// timestamp < hi` is the highest-frequency dashboard tile shape. When every
-// gate below holds, the answer is `Σ stats.numRecords` over the project's
-// files that lie FULLY inside the window — zero parquet IO. Any doubt →
-// `Ok(None)` and the normal scan runs; this module may only ever *decline*,
-// never approximate.
-//
-// Gates (all required):
-// - plan is exactly `[Projection] ← Aggregate[count, no groups] ←
-//   [Projection/SubqueryAlias]* ← [Filter] ← TableScan(ProjectRoutingTable)`
-//   (row count is invariant under projection/alias; anything else — Limit,
-//   Join, Union, other aggregates — bails);
-// - predicates are exactly `project_id = <lit>` + both timestamp bounds
-//   (a missing upper bound would race incoming MemBuffer writes);
-// - MemBuffer holds no rows in the window (fully flushed);
-// - table has no dedup keys OR every window partition is sweep-verified
-//   clean (same fingerprint gate as the read-side dedup skip — duplicates
-//   in Delta would inflate numRecords);
-// - every in-window file's `[min,max]` timestamp lies fully inside the
-//   window (boundary-straddling files bail — v1 has no hybrid scan);
-// - no file carries a deletion vector (numRecords is pre-DV);
-// - the table cannot hold merge-on-read tombstones (`tombstone_column`
-//   declared *and* `version_append` on — a declared-but-dormant column can
-//   hold none, so it does not disqualify the fast path).
+// This module may only ever *decline* (`Ok(None)` → normal scan), never
+// approximate. Every gate below must hold: the recognized plan shape; a
+// `project_id` equality plus a timestamp window; no MemBuffer rows in the
+// window; no duplicates possible; no boundary-straddling file; no deletion
+// vector (numRecords is pre-DV); no merge-on-read tombstones.
 
 use datafusion::{
     arrow::array::Int64Array,
@@ -2094,10 +1821,9 @@ fn classify_conjunct(e: &Expr) -> Option<Conjunct> {
                 return None;
             };
             match op {
-                // Normalize to an INCLUSIVE window: a file whose min/max sits
-                // exactly on a strict bound would otherwise be counted whole
-                // while the predicate excludes its boundary rows, so `>`/`<`
-                // shrink by 1µs.
+                // Normalize to an INCLUSIVE window: `>`/`<` shrink by 1µs, or a
+                // file sitting exactly on a strict bound is counted whole while
+                // the predicate excludes its boundary rows.
                 Operator::GtEq => Some(Conjunct::TsLow(lit)),
                 Operator::Gt => Some(Conjunct::TsLow(lit.checked_add(1)?)),
                 Operator::LtEq => Some(Conjunct::TsHigh(lit)),
@@ -2139,27 +1865,18 @@ fn match_count_plan(plan: &LogicalPlan) -> Option<CountQuery> {
         return None;
     }
     // count(*) / count(1) / count(non-null literal); no DISTINCT, no FILTER.
-    let count_ok = match unalias(&agg.aggr_expr[0]) {
-        Expr::AggregateFunction(AggregateFunction { func, params }) => {
-            func.name() == "count"
-                && !params.distinct
-                && params.filter.is_none()
-                && match params.args.as_slice() {
-                    [] => true,
-                    [Expr::Literal(v, _)] => !v.is_null(),
-                    _ => false,
-                }
-        }
+    let Expr::AggregateFunction(AggregateFunction { func, params }) = unalias(&agg.aggr_expr[0]) else { return None };
+    let args_ok = match params.args.as_slice() {
+        [] => true,
+        [Expr::Literal(v, _)] => !v.is_null(),
         _ => false,
     };
-    if !count_ok {
+    if func.name() != "count" || params.distinct || params.filter.is_some() || !args_ok {
         return None;
     }
 
     // Walk down: row count is invariant under Projection/SubqueryAlias.
     // Collect Filter predicates and (below) the TableScan's pushed filters.
-    // Imperative: a descent that rebinds `node` and breaks with the scan has
-    // no iterator form that reads better.
     let mut node = agg.input.as_ref();
     let mut preds: Vec<&Expr> = Vec::new();
     let scan = loop {
@@ -2177,14 +1894,12 @@ fn match_count_plan(plan: &LogicalPlan) -> Option<CountQuery> {
     if scan.fetch.is_some() {
         return None;
     }
-    // The provider must BE the routing table — a bare-name match alone would
-    // let a session-created table (`CREATE TABLE s.otel_logs_and_spans ...`)
-    // or any name-colliding provider be answered from the real Delta stats.
+    // The provider must BE the routing table: a bare-name match would let a
+    // name-colliding session table be answered from the real Delta stats.
     scan.source.downcast_ref::<DefaultTableSource>().and_then(|src| src.table_provider.downcast_ref::<crate::database::ProjectRoutingTable>())?;
 
-    // No dedup needed although the same conjunct commonly appears in both the
-    // Filter node and the scan's pushed filters: every fold step below is
-    // idempotent (equal project_id, max/min of an equal bound).
+    // The same conjunct commonly appears in both the Filter node and the scan's
+    // pushed filters; every fold step below is idempotent, so no dedup needed.
     let (project_id, lo, hi) = preds.into_iter().chain(scan.filters.iter().flat_map(split_conjunction)).try_fold(
         (None::<String>, None::<i64>, None::<i64>),
         |(project_id, lo, hi), p| {
@@ -2202,12 +1917,9 @@ fn match_count_plan(plan: &LogicalPlan) -> Option<CountQuery> {
 }
 
 /// Resolve the count window's bounds. A lower bound is required (an unbounded
-/// count would scan everything). A one-sided `timestamp > cutoff` (no upper
-/// bound) is the common dashboard/export shape: treat the missing upper bound as
-/// `now`, keeping the window bounded so the dedup-clean date check stays cheap.
-/// The downstream MemBuffer-flushed + dedup-clean gates keep the result exact —
-/// an unflushed or dirty recent tail simply bails to a normal scan. Returns
-/// `None` when there's no lower bound or the window is empty (`lo > hi`).
+/// count would scan everything); a missing upper bound becomes `now`, which
+/// keeps the window bounded for the downstream dedup-clean check. Returns
+/// `None` when there is no lower bound or the window is empty (`lo > hi`).
 fn finalize_window(lo: Option<i64>, hi: Option<i64>, now: i64) -> Option<(i64, i64)> {
     let lo = lo?;
     let hi = hi.unwrap_or(now);
@@ -2237,22 +1949,11 @@ pub async fn try_count_pushdown(plan: &LogicalPlan, database: &Arc<Database>) ->
         return Ok(None);
     }
     let Some(q) = match_count_plan(plan) else { return Ok(None) };
-    // Only tables served by ProjectRoutingTable qualify (system tables like
-    // timefusion_stats share the session but not the storage model).
     let Some(schema) = crate::schema::get_schema(&q.table_name) else { return Ok(None) };
-    // Tombstones make `stats.numRecords` an over-count in exactly the way
-    // deletion vectors do (below), except invisibly: a merge-on-read DELETE is
-    // an APPEND, so the file stats count both the tombstone version and the
-    // live version it retires. There is no per-file statistic that could tell
-    // us how many — the answer only exists after the dedup+filter the scan
-    // does. Silent wrong answer if we don't decline.
-    //
-    // Gated on tombstones being *possible*, not merely declared: a declared
-    // column with `version_append: false` can hold none, and declining there
-    // would trade the whole stats fast path (the highest-frequency dashboard
-    // tile) for an unbounded scan that buys nothing. See
-    // `TableSchema::tombstones_possible` for the ordering invariant that makes
-    // this sound. The logical-count index is the one exact answer for such a
+    // A merge-on-read DELETE is an APPEND, so file stats count both the
+    // tombstone and the live version it retires and no per-file statistic can
+    // correct for it. Gated on tombstones being *possible*, not merely
+    // declared. The logical-count index is the one exact answer for such a
     // table, so try it first and decline when it has no covering partition.
     if schema.tombstones_possible() {
         let Some(total) = try_logical_count(database, &q, schema).await else { return Ok(None) };
@@ -2268,12 +1969,10 @@ pub async fn try_count_pushdown(plan: &LogicalPlan, database: &Arc<Database>) ->
         return Ok(None);
     }
 
-    // Resolve ONCE and hold a single read guard across the dedup-clean gate
-    // and the stats sum — the fingerprint verdict applies to exactly the
-    // snapshot being summed (no check-then-use window). The MemBuffer gate
-    // above intentionally precedes this: rows leave the buffer only AFTER
-    // their commit swapped the shared table, so anything missing from mem at
-    // gate time is present in this (later) snapshot.
+    // Hold ONE read guard across the dedup-clean gate and the stats sum, so the
+    // verdict applies to exactly the snapshot being summed. The MemBuffer gate
+    // must precede this: rows leave the buffer only after their commit swapped
+    // the shared table, so anything missing from mem is in this later snapshot.
     let Ok(table_ref) = database.resolve_table(&q.project_id, &q.table_name).await else {
         return Ok(None);
     };
@@ -2313,9 +2012,9 @@ async fn try_logical_count(database: &Arc<Database>, q: &CountQuery, schema: &cr
     let lo_date = chrono::DateTime::from_timestamp_micros(q.lo)?.date_naive();
     let hi_date = chrono::DateTime::from_timestamp_micros(q.hi)?.date_naive();
     let days = (hi_date - lo_date).num_days();
-    // The resident budget guarantees four daily indexes at once, which covers
-    // a three-day window crossing four UTC dates. Deeper scans keep the
-    // authoritative plan instead of churning the hot dashboard working set.
+    // The resident budget guarantees four daily indexes at once, i.e. a
+    // three-day window crossing four UTC dates. Deeper scans keep the
+    // authoritative plan rather than churning the cache.
     if !(0..=3).contains(&days) {
         return None;
     }
@@ -2342,16 +2041,15 @@ async fn try_logical_count(database: &Arc<Database>, q: &CountQuery, schema: &cr
         for date in &dates {
             let date_string = date.to_string();
             let (_, files) = Database::logical_count_partition_snapshot(&table, &q.project_id, &date_string).ok()?;
-            match database.logical_count_memory_for_files(&q.project_id, &q.table_name, &date_string, &files) {
-                Some((index, mut added)) => {
-                    indexes.push((*date, index));
-                    if !added.is_empty() {
-                        stale_dates.push(date_string);
-                    }
-                    added_files.append(&mut added);
-                }
-                None => missing.push(date_string),
+            let Some((index, mut added)) = database.logical_count_memory_for_files(&q.project_id, &q.table_name, &date_string, &files) else {
+                missing.push(date_string);
+                continue;
+            };
+            indexes.push((*date, index));
+            if !added.is_empty() {
+                stale_dates.push(date_string);
             }
+            added_files.append(&mut added);
         }
         (indexes, missing, added_files, stale_dates, delta_snapshot, table.log_store())
     };
@@ -2363,9 +2061,8 @@ async fn try_logical_count(database: &Arc<Database>, q: &CountQuery, schema: &cr
     }
 
     let columns = crate::read::LogicalCountColumns { timestamp: "timestamp", keys: &keys, tiebreak, deleted };
-    // Keep the synchronous append delta small. The full rebuild is already
-    // single-flight; a large gap falls back to authoritative DedupExec until
-    // the new base is ready instead of moving that scan onto every query.
+    // Keep the synchronous append delta small: a large gap falls back to the
+    // authoritative DedupExec until the rebuilt base is ready.
     if added_files.len() > crate::read::MAX_APPEND_OVERLAY_FILES {
         for date in stale_dates {
             database.schedule_logical_count_build(&q.project_id, &q.table_name, &date, true);
@@ -2384,8 +2081,7 @@ async fn try_logical_count(database: &Arc<Database>, q: &CountQuery, schema: &cr
 }
 
 /// A timestamp stats column as microseconds, or `None` when it is absent or not
-/// a timestamp. Shared with the rollup coverage fingerprint, which reads the
-/// same per-file span this pushdown does.
+/// a timestamp.
 pub(crate) fn ts_micros_column(b: &RecordBatch, name: &str) -> Option<Int64Array> {
     use datafusion::arrow::{array::TimestampMicrosecondArray, compute::cast, datatypes::TimeUnit};
     let c = b.column_by_name(name)?;
@@ -2398,8 +2094,8 @@ pub(crate) fn ts_micros_column(b: &RecordBatch, name: &str) -> Option<Int64Array
 /// flattened add-actions batch and sum the fully-contained ones. `None` on
 /// any missing column/stat, DV presence, or boundary straddle.
 fn sum_from_actions(actions: &RecordBatch, q: &CountQuery) -> Option<u64> {
-    // Deletion vectors make numRecords an over-count — bail if ANY file has
-    // one (column families vary by writer; check every dv-prefixed column).
+    // Deletion vectors make numRecords an over-count — bail if ANY file has one
+    // (column families vary by writer, so check every dv-prefixed column).
     if actions.schema().fields().iter().zip(actions.columns()).any(|(f, c)| f.name().starts_with("deletionVector") && c.null_count() < actions.num_rows()) {
         return None;
     }
@@ -2432,27 +2128,20 @@ mod count_pushdown_tests {
         assert_eq!(sum_fully_contained([], 0, 50), Some(0));
     }
 
-    #[test]
-    fn finalize_window_defaults_open_upper_bound_to_now() {
-        // Two-sided window passes through unchanged.
-        assert_eq!(finalize_window(Some(10), Some(50), 999), Some((10, 50)));
-        // One-sided `timestamp > cutoff` → upper bound becomes now.
-        assert_eq!(finalize_window(Some(10), None, 999), Some((10, 999)));
-        // No lower bound → not eligible (would scan everything).
-        assert_eq!(finalize_window(None, Some(50), 999), None);
-        // Empty window (lo > hi) → None.
-        assert_eq!(finalize_window(Some(60), Some(50), 999), None);
+    #[test_case::test_case(Some(10), Some(50) => Some((10, 50)) ; "a two-sided window passes through unchanged")]
+    #[test_case::test_case(Some(10), None => Some((10, 999)) ; "one-sided timestamp > cutoff takes now as the upper bound")]
+    #[test_case::test_case(None, Some(50) => None ; "no lower bound is ineligible - it would scan everything")]
+    #[test_case::test_case(Some(60), Some(50) => None ; "an empty window lo > hi is ineligible")]
+    fn finalize_window_defaults_open_upper_bound_to_now(lo: Option<i64>, hi: Option<i64>) -> Option<(i64, i64)> {
+        finalize_window(lo, hi, 999)
     }
 }
 
 // ===== logical_count_index =====
-// Exact logical row counts for merge-on-read tables.
-//
-// Cache tiers remove IO, but they cannot answer `COUNT(*)` without decoding
-// and resolving every physical version. This index stores only the winning
-// version of each dedup key and a timestamp histogram. It is derived data:
-// callers must bind it to a Delta snapshot fingerprint and invalidate or
-// advance it with every write before using it for a query.
+// Exact logical row counts for merge-on-read tables: the winning version of
+// each dedup key plus a timestamp histogram, so `COUNT(*)` needs no per-version
+// decode. Derived data — callers must bind it to a Delta snapshot fingerprint
+// and invalidate or advance it on every write before querying it.
 
 use std::{
     fs::File,
@@ -2467,11 +2156,8 @@ use arrow::{
 };
 use arrow_ipc::{reader::FileReader, writer::FileWriter};
 
-// "2": the key tail became the FULL dedup key (see `KeyTail`). A "1" file
-// encodes `id` alone, so appending "2" keys to it would count one logical row
-// per (timestamp, id) and one per (timestamp, service, id) in the same index.
-// Version 3 binds cached winners to complete DV descriptors and rejects indexes
-// built before physical row ordering was fixed.
+// Bumped whenever an older on-disk index would be mis-read rather than merely
+// stale — e.g. a narrower key tail, or winners not bound to full DV descriptors.
 const FORMAT_VERSION: &str = "3";
 const META_VERSION: &str = "tf.logical_count.version";
 const META_FINGERPRINT: &str = "tf.logical_count.fingerprint";
@@ -2485,8 +2171,8 @@ struct Winner {
     deleted: bool,
 }
 
-/// Packed immutable winner metadata. IDs live in one shared byte arena, so a
-/// production partition pays no allocator/header cost per key.
+/// Packed immutable winner metadata. IDs live in one shared byte arena, so
+/// there is no per-key allocation.
 #[derive(Debug, Clone, Copy)]
 struct PackedWinner {
     timestamp: i64,
@@ -2504,14 +2190,13 @@ const FLAG_DELETED: u8 = 2;
 struct PackedIndex {
     winners: Vec<PackedWinner>,
     ids: Vec<u8>,
-    /// One entry per live winner, sorted. Two binary searches answer any exact
-    /// time window without the former per-timestamp BTree node overhead.
+    /// One entry per live winner, sorted: two binary searches answer any exact
+    /// time window.
     live_timestamps: Vec<i64>,
 }
 
-/// Mutable build form plus a packed immutable query form. Builders use the
-/// hash map for exact version resolution, then `finalize` releases it before
-/// cache admission.
+/// Mutable build form plus a packed immutable query form: builders resolve
+/// versions in the hash map, then `finalize` releases it before admission.
 #[derive(Debug, Clone, Default)]
 pub struct LogicalCountIndex {
     winners: HashMap<Box<[u8]>, Winner, ahash::RandomState>,
@@ -2522,9 +2207,8 @@ pub struct LogicalCountIndex {
 #[derive(Debug, Clone, Copy)]
 pub struct LogicalCountColumns<'a> {
     pub timestamp: &'a str,
-    /// The dedup keys after `timestamp`, in schema order. More than one is the
-    /// normal case since `otel_logs_and_spans` widened its key to match its
-    /// sort prefix; the index groups by the FULL key, or it would under-count.
+    /// The dedup keys after `timestamp`, in schema order. The index must group
+    /// by the FULL key or it under-counts.
     pub keys: &'a [&'a str],
     pub tiebreak: &'a str,
     pub deleted: &'a str,
@@ -2562,10 +2246,8 @@ struct CachedPartition {
 }
 
 /// Process-local front for persistent `.arrow` logical-count partitions.
-///
 /// Missing, stale, corrupt, or partially-written entries are ordinary cache
-/// misses. Query code must fall back to the authoritative scan in every such
-/// case; this cache never weakens correctness.
+/// misses; query code must fall back to the authoritative scan in every case.
 #[derive(Debug)]
 pub struct LogicalCountCache {
     root: PathBuf,
@@ -2619,11 +2301,9 @@ impl LogicalCountCache {
     }
 
     fn safe_component(value: &str) -> String {
-        // Encode every byte, including otherwise-safe ASCII. Replacing unsafe
-        // bytes with `_` made distinct tenants such as `a/b` and `a_b` share a
-        // path; if their 64-bit file-set fingerprints happened to match, one
-        // tenant could consume the other's exact-count index. Hex is injective
-        // over UTF-8 bytes and contains no path separators.
+        // Hex-encode every byte: injective over UTF-8 and free of path
+        // separators, so distinct tenants can never share a path (escaping
+        // only the unsafe bytes collides `a/b` with `a_b`).
         hex::encode(value)
     }
 
@@ -2657,8 +2337,8 @@ impl LogicalCountCache {
         }
     }
 
-    /// Return a complete exact index for this fingerprint, loading its Arrow
-    /// file lazily after restart. Any validation failure is a cache miss.
+    /// Exact index for this fingerprint, loading its Arrow file lazily. Any
+    /// validation failure is a cache miss.
     pub fn get(&self, key: &CountPartition, fingerprint: u64) -> Option<Arc<LogicalCountIndex>> {
         self.get_memory(key, fingerprint).or_else(|| {
             let (loaded, files) = LogicalCountIndex::load(&self.path(key), fingerprint).ok()?;
@@ -2667,9 +2347,8 @@ impl LogicalCountCache {
         })
     }
 
-    /// Background restart warm-up for an append-only successor snapshot.
-    /// A removed base file refuses the load; newly added files are handled by
-    /// the query's narrow append overlay.
+    /// Load a cached index whose file set is a subset of `current_files`,
+    /// returning the number of added files. A removed base file refuses.
     pub fn load_appendable(&self, key: &CountPartition, current_files: &CountFiles) -> Option<usize> {
         if let Some(entry) = self.entries.get(key) {
             if contains_count_files(current_files, &entry.files) {
@@ -2688,10 +2367,8 @@ impl LogicalCountCache {
         self.insert_memory(key.clone(), fingerprint, files, Arc::new(index)).then_some(added)
     }
 
-    /// Query-path lookup that never performs filesystem IO. Disk loading and
-    /// index construction belong to a bounded background builder; a cold SQL
-    /// request must fall back to the authoritative scan instead of blocking a
-    /// PGWire worker on a multi-million-key Arrow file.
+    /// Query-path lookup that must never perform filesystem IO: a cold request
+    /// falls back to the authoritative scan rather than blocking on disk.
     pub fn get_memory(&self, key: &CountPartition, fingerprint: u64) -> Option<Arc<LogicalCountIndex>> {
         let entry = self.entries.get(key)?;
         if entry.fingerprint != fingerprint {
@@ -2701,10 +2378,9 @@ impl LogicalCountCache {
         Some(Arc::clone(&entry.index))
     }
 
-    /// Return a snapshot whose indexed file set is an exact subset of the
-    /// caller's current partition. The difference is safe to scan as a narrow
-    /// append overlay. Any removal/rewrite declines because the base may then
-    /// count rows no longer present.
+    /// Snapshot whose indexed file set is a subset of `current_files`, plus the
+    /// added paths to scan as an append overlay. Any removal/rewrite declines,
+    /// since the base could then count rows no longer present.
     pub fn get_memory_appendable(&self, key: &CountPartition, current_files: &CountFiles) -> Option<(Arc<LogicalCountIndex>, Vec<String>)> {
         let entry = self.entries.get(key)?;
         if !contains_count_files(current_files, &entry.files) {
@@ -2715,8 +2391,8 @@ impl LogicalCountCache {
         Some((Arc::clone(&entry.index), added))
     }
 
-    /// Remove only the memory front. The stale Arrow file remains harmless:
-    /// its embedded fingerprint prevents it from being reused after a write.
+    /// Remove only the memory front; the stale Arrow file stays harmless because
+    /// its embedded fingerprint bars reuse after a write.
     pub fn invalidate(&self, key: &CountPartition) {
         let _guard = self.admission_lock.lock();
         self.remove_entry(key);
@@ -2727,17 +2403,14 @@ impl LogicalCountCache {
     }
 }
 
-/// Separator and NULL marker for a multi-column key tail. Both are control
-/// characters no identifier or service name can contain, so distinct tuples
-/// cannot collide and a NULL segment stays distinguishable from an empty one.
+/// Separator and NULL marker for a multi-column key tail: control characters no
+/// identifier can contain, so tuples cannot collide and NULL ≠ empty.
 const KEY_SEP: char = '\u{1f}';
 const KEY_NULL: char = '\u{0}';
 
-/// The index key is `timestamp_be || tail`, where `tail` is the remaining
-/// dedup keys joined by [`KEY_SEP`]. The tail is opaque bytes to the packed
-/// form, so widening `dedup_keys` needs no layout change — only a
-/// `FORMAT_VERSION` bump, because a cached index encodes a shorter tail and
-/// mixing widths would over-count.
+/// The index key is `timestamp_be || tail`, where `tail` is the remaining dedup
+/// keys joined by [`KEY_SEP`]. Widening `dedup_keys` requires a
+/// `FORMAT_VERSION` bump: mixing tail widths over-counts.
 fn key(timestamp: i64, id: &str) -> Box<[u8]> {
     [timestamp.to_be_bytes().as_slice(), id.as_bytes()].concat().into_boxed_slice()
 }
@@ -2766,9 +2439,8 @@ impl<'a> KeyTail<'a> {
     }
 }
 
-/// The four narrow columns a logical-count batch carries, resolved once per
-/// batch: `timestamp`, the remaining dedup keys, the version tiebreak and the
-/// tombstone marker.
+/// The four narrow columns of a logical-count batch, resolved once per batch:
+/// `timestamp`, the remaining dedup keys, the version tiebreak, the tombstone.
 struct CountColumns<'a> {
     timestamps: &'a TimestampMicrosecondArray,
     tiebreaks: &'a TimestampMicrosecondArray,
@@ -2787,11 +2459,7 @@ impl<'a> CountColumns<'a> {
     }
 
     /// `(timestamp, encoded key tail, winner)` for one row, reusing `buffer`.
-    ///
-    /// `None` when the timestamp is NULL: a bounded timestamp predicate never
-    /// matches one, so such a row contributes to no count index. A NULL in any
-    /// other key encodes as a distinct segment rather than erroring — it can
-    /// only split a group, never merge two.
+    /// `None` when the timestamp is NULL — no bounded predicate matches one.
     fn row<'b>(&self, row: usize, buffer: &'b mut String) -> Option<(i64, &'b str, Winner)> {
         if self.timestamps.is_null(row) {
             return None;
@@ -2826,8 +2494,8 @@ impl LogicalCountIndex {
         Self::default()
     }
 
-    /// Every stored winner, whichever representation is live: `(timestamp, id
-    /// bytes, winner)`. The one place the packed/build split is spelled out.
+    /// Every stored winner as `(timestamp, id bytes, winner)`, over whichever of
+    /// the packed/build representations is live.
     fn entries(&self) -> impl Iterator<Item = (i64, &[u8], Winner)> {
         match &self.packed {
             Some(packed) => itertools::Either::Left(packed.winners.iter().map(move |w| (w.timestamp, packed_id(&packed.ids, w), w.winner()))),
@@ -2840,11 +2508,9 @@ impl LogicalCountIndex {
         u64::try_from(self.entries().filter(|&(timestamp, _, winner)| keep(timestamp, winner)).count()).expect("logical-count partition length fits u64")
     }
 
-    /// Apply one physical version. Returns whether it changed the logical row.
-    ///
-    /// Ordering exactly matches `DedupExec`'s primitive keep-greatest rule:
-    /// `None` sorts below every non-null value, and an equal tiebreak does not
-    /// replace the existing winner.
+    /// Apply one physical version; returns whether the logical row changed.
+    /// Ordering must match `DedupExec`'s keep-greatest rule: `None` sorts below
+    /// every value, and an equal tiebreak does not replace the winner.
     pub fn apply(&mut self, timestamp: i64, id: &str, tiebreak: Option<i64>, deleted: bool) -> bool {
         assert!(self.packed.is_none(), "cannot mutate a finalized logical-count index");
         let encoded = key(timestamp, id);
@@ -2909,8 +2575,7 @@ impl LogicalCountIndex {
         let narrow = CountColumns::new(batch, columns)?;
         let mut buffer = String::new();
         let mut changed = 0;
-        // Imperative: each row hands back a `&str` borrowed from the reused
-        // `buffer`, which no iterator chain can thread through a closure.
+        // Not an iterator chain: each row borrows from the reused `buffer`.
         for row in 0..batch.num_rows() {
             if let Some((timestamp, id, winner)) = narrow.row(row, &mut buffer) {
                 changed += usize::from(self.apply(timestamp, id, winner.tiebreak, winner.deleted));
@@ -2919,18 +2584,10 @@ impl LogicalCountIndex {
         Ok(changed)
     }
 
-    /// Exact base count with unflushed MemBuffer versions overlaid. The base
-    /// index is never cloned or mutated: only keys present in `batches` occupy
-    /// the temporary map, so the cost follows the hot tail rather than the
-    /// full 24-hour cardinality.
-    pub fn count_with_overlay(&self, batches: &[RecordBatch], lo: i64, hi: i64, columns: LogicalCountColumns<'_>) -> Result<u64> {
-        self.count_with_covered_overlay(LogicalCountOverlay { authoritative_batches: batches, delta_batches: &[], covered_ranges: &[] }, lo, hi, columns)
-    }
-
-    /// Count after applying the same coverage contract as the ordinary
-    /// `mem ∪ Delta` scan. Rows in `authoritative_batches` replace covered
-    /// Delta rows; `delta_batches` are newly appended Delta files and remain
-    /// subject to the same range gate as the indexed base.
+    /// Count under the same coverage contract as the `mem ∪ Delta` scan: rows in
+    /// `authoritative_batches` replace covered Delta rows; `delta_batches` are
+    /// newly appended files, gated by the same range as the indexed base.
+    /// The base index is never cloned or mutated.
     pub fn count_with_covered_overlay(&self, input: LogicalCountOverlay<'_>, lo: i64, hi: i64, columns: LogicalCountColumns<'_>) -> Result<u64> {
         use std::collections::hash_map::Entry;
         let LogicalCountOverlay { authoritative_batches, delta_batches, covered_ranges } = input;
@@ -2989,7 +2646,6 @@ impl LogicalCountIndex {
         if lo >= hi {
             return 0;
         }
-        // The packed form pays two binary searches instead of a full walk.
         if let Some(packed) = &self.packed {
             let start = packed.live_timestamps.partition_point(|timestamp| *timestamp < lo);
             let end = packed.live_timestamps.partition_point(|timestamp| *timestamp < hi);
@@ -3009,9 +2665,8 @@ impl LogicalCountIndex {
         self.packed.as_ref().map_or(self.winners.len(), |packed| packed.winners.len())
     }
 
-    /// Conservative resident-size estimate for build admission. Includes the
-    /// key bytes plus allocation/hash-table overhead; it intentionally rounds
-    /// up because this map lives outside DataFusion's tracked memory pool.
+    /// Resident-size estimate for build admission. Deliberately rounds up: this
+    /// map lives outside DataFusion's tracked memory pool.
     pub fn estimated_heap_bytes(&self) -> usize {
         if let Some(packed) = &self.packed {
             return packed
@@ -3024,12 +2679,8 @@ impl LogicalCountIndex {
         self.key_bytes.saturating_add(self.winners.len().saturating_mul(64))
     }
 
-    /// Atomically persist the derived winners as Arrow IPC.
-    ///
-    /// The compact timestamp histogram is rebuilt on load; persisting one
-    /// canonical winner table avoids two sources of truth. A fingerprint is
-    /// embedded in schema metadata and must match the caller's current Delta
-    /// snapshot before the file can be served.
+    /// Atomically persist the winners as Arrow IPC. `fingerprint` is embedded in
+    /// schema metadata and must match the reader's Delta snapshot to be served.
     pub fn save(&self, path: &Path, fingerprint: u64, files: &CountFiles) -> Result<()> {
         use itertools::Itertools;
         if let Some(parent) = path.parent() {
@@ -3045,10 +2696,8 @@ impl LogicalCountIndex {
         let write = || -> Result<()> {
             let file = File::create(&tmp).with_context(|| format!("create logical-count cache {}", tmp.display()))?;
             let mut writer = FileWriter::try_new(file, schema.as_ref())?;
-            // A production day can contain tens of millions of keys. Building
-            // and sorting one second full-sized row vector here doubled the
-            // index's peak memory during warm-up. IPC order is irrelevant to
-            // correctness, so stream bounded batches directly from the map.
+            // Stream bounded batches: materializing all rows at once doubles
+            // peak memory, and IPC order is irrelevant to correctness.
             const WRITE_ROWS: usize = 64 * 1024;
             for chunk in &self.entries().chunks(WRITE_ROWS) {
                 let rows = chunk
@@ -3130,8 +2779,8 @@ impl LogicalCountIndex {
     }
 }
 
-/// The one definition of the persisted winner table: `save` writes exactly
-/// these columns and `load_file` refuses a file that does not match them.
+/// The one definition of the persisted winner table: `load_file` refuses any
+/// file whose schema does not match it exactly.
 fn ipc_fields() -> Vec<Field> {
     vec![
         Field::new("timestamp", DataType::Int64, false),
@@ -3141,9 +2790,8 @@ fn ipc_fields() -> Vec<Field> {
     ]
 }
 
-/// One named column of a logical-count batch as its concrete Arrow array type.
-/// The downcast IS the type check — a wrong timestamp unit or a non-Boolean
-/// tombstone column fails here rather than being read as something else.
+/// One named column as its concrete Arrow array type. The downcast IS the type
+/// check: a wrong timestamp unit fails here rather than being misread.
 fn column_as<'a, A: 'static>(batch: &'a RecordBatch, name: &str) -> Result<&'a A> {
     let column = batch.column_by_name(name).with_context(|| format!("logical-count batch missing {name}"))?;
     column.as_any().downcast_ref::<A>().with_context(|| format!("logical-count {name} has unsupported type {}", column.data_type()))
@@ -3305,17 +2953,17 @@ mod logical_count_index_tests {
         index.apply_batch(&versions(&[(10, "a", Some(1), Some(false)), (20, "b", Some(1), None), (30, "gone", Some(2), Some(true))]), columns).unwrap();
         assert_eq!(index.count(0, 100), 2);
 
-        // a is tombstoned, b gets a stale no-op, gone is resurrected, and c
-        // is a new unflushed key. A repeated Delta+Mem copy with an equal
-        // tiebreak remains one logical row.
-        let tail = versions(&[
+        // a tombstoned, b a stale no-op, gone resurrected, c new and unflushed;
+        // a repeated copy with an equal tiebreak stays one logical row.
+        let tail = [versions(&[
             (10, "a", Some(3), Some(true)),
             (20, "b", Some(0), Some(true)),
             (20, "b", Some(1), Some(false)),
             (30, "gone", Some(4), Some(false)),
             (40, "c", Some(1), None),
-        ]);
-        assert_eq!(index.count_with_overlay(&[tail], 0, 100, columns).unwrap(), 3);
+        ])];
+        let overlay = LogicalCountOverlay { authoritative_batches: &tail, delta_batches: &[], covered_ranges: &[] };
+        assert_eq!(index.count_with_covered_overlay(overlay, 0, 100, columns).unwrap(), 3);
         assert_eq!(index.logical_rows(), 2, "overlay must not mutate the persistent base");
     }
 
@@ -3581,37 +3229,20 @@ fn table_stats(table: &DeltaTable, page_row_limit: usize) -> Result<(usize, usiz
 }
 
 // ===== hll =====
-// HyperLogLog: a mergeable, bounded distinct-count sketch.
+// HyperLogLog: a mergeable, bounded distinct-count sketch, in two
+// representations behind one type — Sparse (the exact hash set, up to
+// [`SPARSE_MAX`], so the estimate is exact) and Dense ([`M`] one-byte
+// registers, ~1.6% standard error).
 //
-// The point is the same one t-digest makes for percentiles: `COUNT(DISTINCT x)`
-// is not decomposable, so a rollup cannot store it and every dashboard tile that
-// asks for one falls back to a raw scan of the whole window. A sketch IS
-// decomposable — union is associative and commutative — so a distinct count can
-// be pre-aggregated per bucket and folded across buckets, dimensions and rollup
-// tiers at read time.
-//
-// Two representations behind one type:
-//
-// * **Sparse** — the exact set of hashes, up to [`SPARSE_MAX`]. The estimate is
-//   then the set size, i.e. EXACT. Most dashboard groups (distinct users in a
-//   minute, distinct services on a span) never leave this mode, so the common
-//   case is not an approximation at all.
-// * **Dense** — [`M`] one-byte registers once the exact set outgrows the dense
-//   encoding. Standard error is `1.04/sqrt(M)` ≈ 1.6%.
-//
-// Serialized sketches are PERSISTED in rollup tables and merged months later,
-// so both the hash function and the wire format are frozen. [`hash_bytes`] is
-// written out here rather than taken from `ahash`/`RandomState` precisely so a
-// dependency bump cannot silently re-hash the world and inflate every stored
-// cardinality. Changing `SEED`, `P`, or the tag bytes requires a new rollup
-// spec name, exactly like changing a measure.
+// Sketches are PERSISTED in rollup tables and merged months later, so both the
+// hash function and the wire format are frozen: changing `SEED`, `P` or the tag
+// bytes requires a new rollup spec name, exactly like changing a measure.
 
 /// Register-index bits. 12 → 4096 registers, 4 KiB dense, ~1.6% standard error.
 const P: u32 = 12;
 /// Register count.
 const M: usize = 1 << P;
-/// Above this many exact hashes the sparse encoding costs more than the dense
-/// one (`M` bytes), so it converts. 512 × 8 B = 4 KiB, matching `M`.
+/// Sparse→dense conversion point: 512 × 8 B = 4 KiB, matching the dense `M`.
 const SPARSE_MAX: usize = 512;
 
 const TAG_SPARSE: u8 = 1;
@@ -3629,10 +3260,7 @@ const fn mix(mut x: u64) -> u64 {
     x ^ (x >> 31)
 }
 
-/// Stable 64-bit hash. Frozen: see the module note on persistence.
-///
-/// Eight bytes per round (~0.6 cycles/byte) rather than FNV's one, which matters
-/// because this runs once per row over columns like `context___trace_id`.
+/// Stable 64-bit hash. Frozen — see the module note on persistence.
 #[inline]
 pub fn hash_bytes(bytes: &[u8]) -> u64 {
     let mut acc = SEED ^ (bytes.len() as u64);
@@ -3690,8 +3318,7 @@ impl Hll {
         *self = Self::Dense(registers);
     }
 
-    /// Union. Associative and commutative, which is the whole reason this type
-    /// can live in a rollup.
+    /// Union. Associative and commutative, which is what lets this live in a rollup.
     pub fn merge(&mut self, other: &Self) {
         match (&mut *self, other) {
             (Self::Sparse(mine), Self::Sparse(theirs)) => {
@@ -3716,9 +3343,8 @@ impl Hll {
             Self::Dense(registers) => registers,
         };
         let zeros = registers.iter().filter(|&&r| r == 0).count();
-        // Linear counting is the better estimator while most registers are still
-        // empty; it is also what keeps the seam at the sparse→dense boundary from
-        // jumping.
+        // Linear counting: the better estimator while most registers are empty,
+        // and it keeps the sparse→dense seam continuous.
         if zeros > 0 {
             let linear = M as f64 * (M as f64 / zeros as f64).ln();
             if linear <= 2.5 * M as f64 {
@@ -3728,12 +3354,9 @@ impl Hll {
         // Flajolet's harmonic-mean estimator. `alpha` is the standard bias
         // constant for m >= 128.
         let alpha = 0.7213 / (1.0 + 1.079 / M as f64);
-        // 2^-r by constructing the IEEE-754 exponent directly, not `powi`. The
-        // sum runs over all M registers on every estimate, and `powi` is an
-        // opaque call LLVM will not vectorize; this is widen-subtract-shift-
-        // bitcast, which it turns into AVX2. Total for any `r: u8` — the
-        // exponent field cannot underflow, so a corrupt payload is still a
-        // finite positive number rather than UB.
+        // 2^-r built as an IEEE-754 exponent, not `powi`: vectorizable, and
+        // total for any `r: u8` — the exponent cannot underflow, so a corrupt
+        // payload yields a finite positive number rather than UB.
         let harmonic: f64 = registers.iter().map(|&r| f64::from_bits((1023 - u64::from(r)) << 52)).sum();
         (alpha * (M * M) as f64 / harmonic).round() as u64
     }
@@ -3745,8 +3368,8 @@ impl Hll {
         }
     }
 
-    /// Decode. A malformed payload is an error rather than an empty sketch: a
-    /// silently-empty sketch would under-report a cardinality forever.
+    /// Decode. A malformed payload errors rather than decoding to an empty
+    /// sketch, which would under-report a cardinality forever.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
         match bytes {
             [] => Ok(Self::default()),
@@ -3786,9 +3409,7 @@ mod hll_tests {
         sketch
     }
 
-    /// The sparse mode is not an approximation, which is what makes this safe to
-    /// put behind the low-cardinality dashboard tiles (distinct services, distinct
-    /// hosts) where a 2% error would be visible as a wrong integer.
+    /// Sparse mode is exact, not an approximation.
     #[test]
     fn small_cardinalities_are_exact() {
         for n in [0u64, 1, 7, 100, SPARSE_MAX as u64] {
@@ -3796,12 +3417,9 @@ mod hll_tests {
         }
     }
 
-    /// Dense estimates must land inside the error bound, and `merge` must be an
-    /// order-independent union that does not double-count the overlap — the
-    /// property the whole rollup design rests on.
-    ///
-    /// 1.04/sqrt(4096) = 1.6% standard error; the cases allow 3 sigma so they are
-    /// not flaky against a hash-dependent but deterministic outcome.
+    /// Dense estimates stay inside the error bound and `merge` is an
+    /// order-independent union that does not double-count the overlap. The 5%
+    /// tolerance is 3 sigma on a 1.6% standard error.
     #[test_case::test_case(sketch_of(0..5_000), 5_000 ; "dense at 5k")]
     #[test_case::test_case(sketch_of(0..50_000), 50_000 ; "dense at 50k")]
     #[test_case::test_case(sketch_of(0..1_000_000), 1_000_000 ; "dense at 1M")]
@@ -3814,8 +3432,7 @@ mod hll_tests {
         assert!(error < 0.05, "truth={truth}: estimated {estimate}, error {:.3}%", error * 100.0);
     }
 
-    /// Sketches are persisted and merged months later, so a round-trip through
-    /// bytes must be bit-identical, and a truncated payload must be loud.
+    /// Byte round-trips must be exact and truncated payloads must be loud.
     #[test]
     fn round_trips_through_bytes() {
         for n in [0u64, 10, SPARSE_MAX as u64 + 1, 100_000] {
@@ -3829,9 +3446,8 @@ mod hll_tests {
     }
 
     proptest::proptest! {
-        /// The pinned sizes above cover the encoding boundaries; this covers the
-        /// payloads they cannot enumerate. 400 hashes a side is enough that a
-        /// union can cross `SPARSE_MAX` and densify inside `merge`.
+        /// 400 hashes a side is enough for a union to cross `SPARSE_MAX` and
+        /// densify inside `merge`.
         #[test]
         fn merge_is_commutative_and_bytes_round_trip(
             left in proptest::collection::vec(proptest::prelude::any::<u64>(), 0..400),
@@ -3846,8 +3462,8 @@ mod hll_tests {
         }
     }
 
-    /// A dense sketch is bounded no matter how many rows it sees: that bound is
-    /// what lets a rollup row carry one.
+    /// A dense sketch is bounded however many rows it sees — that bound is what
+    /// lets a rollup row carry one.
     #[test]
     fn serialized_size_is_bounded() {
         assert!(sketch_of(0..10_000_000).to_bytes().len() <= M + 1);

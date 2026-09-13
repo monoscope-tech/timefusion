@@ -1,17 +1,13 @@
-//! Smoke test: the regression guard for the actual prod symptom we just hit
-//! — "no response returned to queries on timefusion even though responses
-//! were always returned in the past". Every E2E run starts here. If this
-//! breaks, nothing else matters.
+//! Smoke tests: pgwire answers queries at all, COUNT(*) is correct, and the
+//! harness object store enforces put-if-absent.
 
 use std::time::Duration;
 
-use super::harness::E2eEnv;
+use super::{harness::E2eEnv, ordering_pushdown::count_rows};
 
 const QUERY_RESPONSE_BUDGET: Duration = Duration::from_secs(5);
 
-/// The single-row INSERT every smoke test uses: today's partition and a
-/// current timestamp, with id/name/status_code/status_message/level/summary
-/// bound as parameters `$2..$7`.
+/// Single-row INSERT with id/name/status_code/status_message/level/summary bound as `$2..$7`.
 fn insert_sql() -> String {
     format!(
         "INSERT INTO otel_logs_and_spans (project_id, date, timestamp, id, name, status_code, status_message, level, hashes, summary) \
@@ -54,21 +50,17 @@ async fn count_star_returns_correct_value() -> anyhow::Result<()> {
     for i in 0..7 {
         client.execute(&insert, &[&"e2e_project", &format!("smoke-{i}"), &"s", &"OK", &"m", &"INFO", &vec!["s"]]).await?;
     }
-    let count: i64 = client.query_one("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1", &[&"e2e_project"]).await?.get(0);
+    let count = count_rows(&client, "e2e_project").await?;
     if count != 7 {
-        // WHICH LEG lost them. A bare `4 != 7` cannot distinguish rows that were
-        // never durable from rows that exist but are momentarily unreadable, and
-        // this failure was filed as a flake for three days on exactly that
-        // ambiguity. Everything below is READ-ONLY diagnosis of a live failure.
+        // Read-only diagnosis: identify WHICH leg lost the rows before panicking.
         let ids: Vec<String> = client
             .query("SELECT id FROM otel_logs_and_spans WHERE project_id = $1 ORDER BY id", &[&"e2e_project"])
             .await?
             .iter()
             .map(|r| r.get::<_, String>(0))
             .collect();
-        // Is it TRANSIENT? If a second identical query returns 7, the rows were
-        // always durable and the first read was wrong — a read-path race, not loss.
-        let again: i64 = client.query_one("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1", &[&"e2e_project"]).await?.get(0);
+        // A second query returning 7 means a read-path race, not row loss.
+        let again = count_rows(&client, "e2e_project").await?;
         // MemBuffer's own view, bypassing SQL entirely.
         let mem_rows: usize = env
             .db()
@@ -81,10 +73,8 @@ async fn count_star_returns_correct_value() -> anyhow::Result<()> {
                     .unwrap_or(usize::MAX)
             })
             .unwrap_or(0);
-        // Delta's own view, bypassing SQL entirely. VERSION as well as file
-        // count: "one file exists" and "the snapshot the scan planned against
-        // knows about it" are different claims, and only the second explains a
-        // query that returns exactly the MemBuffer's rows.
+        // Delta's own view, bypassing SQL. Version matters as well as file count:
+        // a file existing and the planned-against snapshot knowing it are different claims.
         let (delta_files, delta_version) = match env.db().resolve_table("e2e_project", "otel_logs_and_spans").await {
             Ok(table_ref) => {
                 let table = table_ref.read().await;
@@ -92,11 +82,8 @@ async fn count_star_returns_correct_value() -> anyhow::Result<()> {
             }
             Err(_) => (0, None),
         };
-        // THE DISCRIMINATOR. Delta-only, no MemBuffer leg, no union, no mask:
-        //   == 7 - mem_rows -> Delta holds the missing rows and the UNION lost
-        //                      them (mask or dedup), so the bug is above the scan;
-        //   == 0            -> the scan itself cannot see a committed file, so
-        //                      it is snapshot staleness below the union.
+        // Discriminator: `7 - mem_rows` here means the union (mask/dedup) lost them;
+        // 0 means the scan cannot see a committed file (snapshot staleness).
         let delta_only = match env.db().query_delta_only("SELECT id FROM otel_logs_and_spans WHERE project_id = 'e2e_project' ORDER BY id").await {
             Ok(batches) => datafusion::arrow::util::pretty::pretty_format_batches(&batches).map_or_else(|e| e.to_string(), |t| t.to_string()),
             Err(e) => format!("query_delta_only failed: {e}"),
@@ -114,14 +101,9 @@ async fn count_star_returns_correct_value() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The whole suite's OCC coverage is only as sound as the object store's
-/// put-if-absent. Delta commits via `PutMode::Create`; a store that answers it
-/// with a plain overwrite lets two writers "commit" the same version and the
-/// loser's actions — acked, committed rows — vanish with no error anywhere.
-/// That is exactly how `append_during_dv_merge_is_not_dropped` was flaky until
-/// 2026-07-30 (see `harness::MINIO_TAG`). Assert the precondition on the very
-/// store commits are written through, cache wrapper included, so a container
-/// image or storage-option change can never silently re-disarm it.
+/// Precondition for every concurrent-writer test: Delta commits via `PutMode::Create`,
+/// so a store that silently overwrites instead lets two writers claim the same version.
+/// Probed through the same store (cache wrapper included) that commits are written to.
 #[serial_test::serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn harness_object_store_enforces_atomic_commits() -> anyhow::Result<()> {

@@ -25,9 +25,7 @@ pub struct Bootstrapped {
     pub shutdown: CancellationToken,
 }
 
-/// Raise the open-file soft limit to the hard limit.
-///
-/// Best-effort raises the open-file soft limit to support mmap indexes and WAL.
+/// Best-effort raise of the open-file soft limit to the hard limit.
 pub fn raise_file_limit() {
     // SAFETY: both calls take a valid, fully-initialized `rlimit`, and neither
     // retains the pointer past the call.
@@ -78,8 +76,8 @@ pub async fn bootstrap(cfg: Arc<AppConfig>) -> Result<Bootstrapped> {
         let svc = Arc::new(crate::tantivy::search::TantivyIndexService::new(obj_store.clone(), tcfg.clone(), cfg.core.timefusion_data_dir.clone()));
         layer = layer.with_tantivy_indexer(tantivy_index_callback(&db, Arc::clone(&svc)));
         let search = Arc::new(crate::tantivy::search::TantivySearchService::new(obj_store, cfg.core.timefusion_data_dir.clone(), tcfg));
-        // Two halves of one process: let a publish seed the reader's cache and
-        // invalidate its manifest instead of round-tripping through S3.
+        // Lets a publish seed the reader's cache and invalidate its manifest
+        // in-process instead of round-tripping through S3.
         svc.with_reader(&search);
         db = db.with_tantivy_search(search).with_tantivy_indexer(svc);
     }
@@ -95,12 +93,9 @@ pub async fn bootstrap(cfg: Arc<AppConfig>) -> Result<Bootstrapped> {
 
     let buffered_layer = Arc::new(layer);
 
-    // Mirror main.rs: clean snapshot → skip the Delta cursor scan; dirty/missing
-    // snapshot → derive cursors from Delta so WAL replay doesn't re-inject
-    // entries Delta already has. Keeping this in the test-shared bootstrap
-    // means e2e startup-time assertions exercise the same path as prod.
-    // Per-phase timing is emitted at INFO so cold-start regressions surface
-    // without needing trace-level enabled.
+    // Clean snapshot → skip the Delta cursor scan; dirty/missing snapshot →
+    // derive cursors from Delta so WAL replay doesn't re-inject entries Delta
+    // already has.
     let wal_ref = buffered_layer.wal();
     let t_snap = std::time::Instant::now();
     let clean_snapshot = wal_ref.load_cursor_snapshot().is_some_and(|snap| wal_ref.restore_cursor_snapshot(&snap).is_ok() && snap.clean_shutdown);
@@ -185,7 +180,7 @@ pub fn coalesced_delta_write_callback(db: &crate::database::Database) -> crate::
                 })
                 .unzip();
             let results = db.insert_records_batches_coalesced(units).await;
-            // Any successful commit proves this topic has Delta files, even when
+            // A successful commit proves this topic has Delta files even when
             // concurrent snapshot attribution returns an empty added-file list.
             topics
                 .iter()
@@ -240,11 +235,9 @@ pub struct AuthConfig {
 }
 
 impl AuthConfig {
-    /// Construct from `CoreConfig`, requiring an explicit password unless
-    /// `TIMEFUSION_ALLOW_INSECURE_AUTH=true` is set. We hard-fail the
-    /// startup path rather than silently accept an empty password — the
-    /// PG wire protocol's cleartext handler treats `None` as "accept any",
-    /// which is an open ingest endpoint when bound to 0.0.0.0.
+    /// Construct from `CoreConfig`, erroring unless a password is set or
+    /// `TIMEFUSION_ALLOW_INSECURE_AUTH=true`. The cleartext handler treats a
+    /// `None` password as "accept any", i.e. an open endpoint.
     pub fn from_core(core: &crate::config::CoreConfig) -> anyhow::Result<Self> {
         let allow_insecure = crate::config::is_insecure_auth_allowed();
         match (&core.pgwire_password, allow_insecure) {
@@ -284,9 +277,8 @@ pub struct LoggingHandlerFactory {
 
 #[bon::bon]
 impl LoggingHandlerFactory {
-    /// `db` enables the on-demand `OPTIMIZE <table> WHERE date = '...'` admin
-    /// command (intercepted in the simple-query path). Unset in test servers,
-    /// which don't need it.
+    /// `db` enables the admin commands intercepted in the simple-query path;
+    /// leave it unset to disable them.
     #[builder]
     pub fn new(
         session_context: Arc<SessionContext>, auth_config: AuthConfig, scan_metrics: Option<Arc<crate::database::ScanMetrics>>, db: Option<Arc<Database>>,
@@ -297,9 +289,8 @@ impl LoggingHandlerFactory {
         Self { session_context, auth_config, plan_cache, connections: Arc::default(), scan_metrics, db, max_statement_secs }
     }
 
-    /// Hook list passed to every `DfSessionService` instance the factory
-    /// produces. Sharing the single `plan_cache` Arc is what makes the LRU
-    /// global rather than per-connection.
+    /// Hooks for every `DfSessionService` this factory produces. Sharing one
+    /// `plan_cache` Arc is what makes the LRU global rather than per-connection.
     fn hooks(&self) -> Vec<Arc<dyn QueryHook>> {
         vec![
             Arc::new(CursorStatementHook),
@@ -336,21 +327,9 @@ impl LoggingHandlerFactory {
     }
 }
 
-/// pgwire calls these factory methods **per connection**, so their cost is
-/// per-connection setup — the phase between "socket open" and "ready for
-/// query".
-///
-/// That phase is the one the 2026-08-24 investigation could not attribute: a
-/// sample with `connect` at 1,450 ms and a warm `SELECT 1` at 77.5 ms, on a
-/// calm box. The original plan discharged the connection path because a warm
-/// query paid the cost too — but every sample it had was taken during a deploy,
-/// where everything is slow. With that churn removed, connection-establishment
-/// stalls are what remain, and nothing inside the process could say which part.
-///
-/// They are sync and allocate a `DfSessionService` each time, so they occupy a
-/// worker for their duration — `BlockWatch` (the `block` component), not
-/// `TimedSection`. Auth itself is a string compare (`AuthConfig`'s `AuthSource`
-/// impl), which is why it is not separately timed.
+/// pgwire calls these factory methods **per connection**. They are sync and
+/// allocate a `DfSessionService` each time, so they occupy a worker for their
+/// duration — hence `BlockWatch` rather than `TimedSection`.
 impl PgWireServerHandlers for LoggingHandlerFactory {
     fn query_handlers(&self) -> (Arc<impl SimpleQueryHandler>, Arc<impl ExtendedQueryHandler>) {
         // SessionContext::clone shares its mutable state. Clone the SessionState
@@ -392,10 +371,8 @@ impl ErrorHandler for LoggingErrorHandler {
     where
         C: ClientInfo,
     {
-        // `ApiError` wraps an internal failure (DataFusion error, including
-        // `Internal error` assertions that indicate a bug) — surface at error so
-        // it isn't buried. Everything else (client `UserError`, `IoError` /
-        // connection resets, protocol errors) is expected or infra noise — info.
+        // `ApiError` wraps an internal failure (a bug); everything else is
+        // client error or connection noise.
         match error {
             PgWireError::ApiError(_) => error!("PgWire internal error: {}", error),
             _ => info!("PgWire error: {}", error),
@@ -403,14 +380,11 @@ impl ErrorHandler for LoggingErrorHandler {
     }
 }
 
-/// Concurrent-giant-statement gate. A mega-statement (monoscope's multi-MB
-/// INSERTs / unnest-array enrichment UPDATEs) materializes its literals and
-/// bound parameters as ScalarValue arrays during plan + bind — tens to
-/// hundreds of MB of transient heap per statement, bounded only by connection
-/// concurrency. The 08:13Z 2026-08-03 OOM's pre-kill heap dumps were dominated
-/// by exactly this (`ScalarValue::iter_to_array`/`make_run_array` under
-/// pgwire). Two permits: one giant can always run while another queues, and
-/// worst-case transient parse heap is 2x one statement instead of Nx.
+/// Concurrent-giant-statement gate. A multi-MB statement materializes its
+/// literals and bound parameters as ScalarValue arrays during plan + bind —
+/// transient heap otherwise bounded only by connection concurrency. Two
+/// permits: one giant always runs while another queues, capping that heap at
+/// 2x one statement instead of Nx.
 const GIANT_STMT_BYTES: usize = 2 * 1024 * 1024;
 static GIANT_STMT_SEM: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
 
@@ -431,15 +405,9 @@ fn client_statement_timeout(client: &(impl ClientInfo + ?Sized)) -> Option<std::
     client.metadata().get("statement_timeout_ms").and_then(|value| value.parse::<u64>().ok()).map(std::time::Duration::from_millis)
 }
 
-/// Writes are exempt from the statement timeout.
-///
-/// `run_with_statement_timeout` enforces by DROPPING the in-flight future, and
-/// the DML path runs its WAL append and Delta commit *inside* that future — so
-/// cancelling a slow bulk INSERT or a MOR UPDATE reports failure to the client
-/// for a write that is already partly durable, and it reappears on the next WAL
-/// replay. PostgreSQL's `statement_timeout` aborts a statement transactionally;
-/// dropping a future cannot, so the deadline only covers read-only statements.
-/// `classify_query` errs toward matching DML, which errs toward no timeout.
+/// Writes are exempt from the statement timeout: the deadline is enforced by
+/// DROPPING the in-flight future, and the DML path commits inside it, so
+/// cancelling would report failure for a write that is already partly durable.
 fn statement_timeout_applies(query: &str) -> bool {
     !matches!(classify_query(query).0, "DML" | "DDL")
 }
@@ -474,7 +442,7 @@ fn with_response_deadline(response: Response, deadline: Option<tokio::time::Inst
                         None => rows.next().await.map(|row| (row, Some(rows))),
                     };
                     if let Some((Err(error), _)) = &next {
-                        // Escape multiline causes so line-based collectors retain the query context with the full error.
+                        // `?` escapes multiline causes so line-based collectors keep the full error on one line.
                         warn!(event = "pgwire.stream_failed", error = ?error.to_string(), "PostgreSQL row stream failed");
                     }
                     next
@@ -492,13 +460,8 @@ fn with_response_deadline(response: Response, deadline: Option<tokio::time::Inst
 /// The shared tail of both protocol handlers: the giant-statement gate, the
 /// `datafusion.execute` span, the statement deadline, and the latency/failure
 /// events. `finish` applies the deadline to whatever shape of response the
-/// protocol returns.
-///
-/// A failure is logged from INSIDE the query span, so the span's `query.text`
-/// lands on the same line as the error. `LoggingErrorHandler` runs outside the
-/// span and can only report the message — which is why a pgAdmin planning
-/// failure showed up in prod as a bare "Invalid function" with no way to tell
-/// which statement produced it.
+/// protocol returns. Failures are logged from INSIDE the query span so the
+/// span's `query.text` lands on the same line as the error.
 async fn run_statement<T, R>(
     scan_metrics: Option<&crate::database::ScanMetrics>, max_statement_secs: u64, client_timeout: Option<std::time::Duration>, query: &str,
     protocol: &'static str, execute: impl std::future::Future<Output = PgWireResult<T>>, finish: impl FnOnce(T, Option<tokio::time::Instant>) -> R,
@@ -558,18 +521,14 @@ impl LoggingSimpleQueryHandler {
     }
 
     /// Execute an intercepted `FLUSH` — drain the whole MemBuffer to Delta.
-    /// Ops pre-restart hook: run it right before a planned restart/deploy so
-    /// the stop grace never bounds the shutdown flush and the boot's WAL
-    /// replay is near-empty. Errors when any bucket fails so callers can
-    /// gate on it.
+    /// Intended to be run once before a planned restart/deploy. Errors when any
+    /// bucket fails so callers can gate on it.
     async fn run_flush(&self) -> PgWireResult<Vec<Response>> {
         let layer = require_available(self.db.as_ref().and_then(|d| d.buffered_layer()), "FLUSH")?;
-        // Misuse guard: FLUSH commits the open window per table (tiny parquet
-        // files + tantivy builds), so a looping client mints file-count
-        // explosion and contends flush_lock with routine flushes. Operator
-        // cadence is "once before a deploy" — enforce a floor between runs.
-        // Frozen-clock (test) harnesses are exempt: their cadence is
-        // script-driven and the frozen epoch resets between environments.
+        // Misuse guard: each FLUSH commits the open window per table (tiny
+        // parquet files + tantivy builds) and contends flush_lock with routine
+        // flushes, so a looping client would explode the file count.
+        // Frozen-clock (test) harnesses are exempt.
         use std::sync::atomic::{AtomicI64, Ordering};
         const FLUSH_MIN_INTERVAL_SECS: i64 = 10;
         static LAST_FLUSH_MICROS: AtomicI64 = AtomicI64::new(i64::MIN);
@@ -589,10 +548,8 @@ impl LoggingSimpleQueryHandler {
                 stats.buckets_failed, stats.buckets_flushed
             )));
         }
-        // Wake Walrus's safe reclaim worker and wait for its completion while
-        // this instance is still serving, otherwise the replacement pays to
-        // scan the outgoing instance's consumed WAL.
-        // Frozen-clock test harnesses skip this operational handoff delay.
+        // Reclaim the consumed WAL while this instance is still serving,
+        // otherwise the replacement pays to scan it at boot.
         if !crate::support::is_frozen() {
             layer.reclaim_wal_after_flush().await;
         }
@@ -610,8 +567,7 @@ impl LoggingSimpleQueryHandler {
         Ok(vec![Response::Execution(Tag::new(&format!("HANDOFF {}", stats.total_rows)))])
     }
 
-    /// Read recent Delta commit metadata without requiring direct object-store
-    /// credentials on the operator's machine.
+    /// Read recent Delta commit metadata over pgwire.
     async fn run_delta_history(&self, cmd: DeltaHistoryCmd) -> PgWireResult<Vec<Response>> {
         let (_, table_ref) = self.admin_table("DELTA HISTORY", &cmd.table).await?;
         let commits: Vec<_> =
@@ -670,10 +626,9 @@ impl LoggingSimpleQueryHandler {
             .get_active_add_actions_by_partitions(&[])
             .try_filter_map(|view| {
                 let include = removed.contains(view.path().as_ref());
-                // The replacement Arrow-table API is intended for analytics
-                // and does not round-trip a complete Add action. Recovery must
-                // preserve raw stats/tags byte-for-byte, which this delta-rs
-                // compatibility method explicitly guarantees.
+                // Do not "modernize" this: the replacement Arrow-table API does
+                // not round-trip a complete Add action, and recovery must
+                // preserve raw stats/tags byte-for-byte.
                 #[allow(deprecated)]
                 let source = include.then(|| view.add_action());
                 futures::future::ready(Ok(source))
@@ -768,10 +723,9 @@ pub(crate) fn parse_delta_recovery_audit(query: &str) -> Result<Option<DeltaVers
 pub(crate) struct OptimizeCmd {
     pub table: String,
     pub date: chrono::NaiveDate,
-    /// Restrict the compaction to one tenant's partition. A whole-date
-    /// optimize spans every project's files for that date — tens of GB on a
-    /// busy day, which doesn't fit in-process next to serving load
-    /// (2026-07-27: two OOMs). One (project, date) partition is a few GB.
+    /// Restrict the compaction to one tenant's partition. A whole-date optimize
+    /// spans every project's files for that date and can OOM the instance; one
+    /// (project, date) partition is the safe unit.
     pub project_id: Option<String>,
 }
 
@@ -839,10 +793,8 @@ fn filter_value(rest: &str) -> Result<&str, String> {
 ///
 /// - `Ok(None)`: not an OPTIMIZE statement — fall through to DataFusion.
 /// - `Ok(Some(_))`: valid, run it.
-/// - `Err(msg)`: it *is* OPTIMIZE but malformed (no table, missing/non-`date`
-///   filter, bad date). A bare `OPTIMIZE <table>` is rejected on purpose — an
-///   unbounded in-process compaction can OOM the instance — and surfaced as a
-///   clear error rather than a confusing DataFusion parser error.
+/// - `Err(msg)`: it *is* OPTIMIZE but malformed. A bare `OPTIMIZE <table>` is
+///   rejected on purpose — an unbounded in-process compaction can OOM.
 pub(crate) fn parse_optimize(query: &str) -> Result<Option<OptimizeCmd>, String> {
     let Some(rest) = strip_command(query, "optimize") else { return Ok(None) };
     let (table, where_part) = rest.split_once(char::is_whitespace).map(|(t, w)| (t.trim(), w.trim())).unwrap_or((rest, ""));
@@ -854,9 +806,8 @@ pub(crate) fn parse_optimize(query: &str) -> Result<Option<OptimizeCmd>, String>
             "OPTIMIZE {table} needs a date filter: OPTIMIZE {table} WHERE date = 'YYYY-MM-DD' (bare OPTIMIZE is disabled — it would compact all history in-process)"
         ));
     };
-    // `WHERE date = '...'` optionally AND-ed (either order) with
-    // `project_id = '...'`. Values are simple quoted literals, so splitting on
-    // a top-level ` AND ` needs no nesting awareness.
+    // Values are simple quoted literals, so splitting on ` AND ` needs no
+    // nesting awareness.
     static AND: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\s+and\s+").unwrap());
     let (date, project_id) = AND.split(conds.trim()).try_fold((None, None), |(date, project_id), cond| {
         let cond = cond.trim();
@@ -887,8 +838,7 @@ pub(crate) struct VacuumCmd {
 /// - `Ok(None)`: not a VACUUM statement — fall through to DataFusion.
 /// - `Ok(Some(_))`: valid, run it.
 /// - `Err(msg)`: it *is* VACUUM but malformed. A bare `VACUUM` (no table) is
-///   rejected on purpose — name the table explicitly. Unlike OPTIMIZE, VACUUM is
-///   table-wide (all partitions) and takes no date filter; the optional
+///   rejected on purpose. VACUUM is table-wide and takes no date filter;
 ///   `RETAIN <n> HOURS` overrides the configured retention.
 pub(crate) fn parse_vacuum(query: &str) -> Result<Option<VacuumCmd>, String> {
     let Some(rest) = strip_command(query, "vacuum") else { return Ok(None) };
@@ -921,29 +871,21 @@ pub(crate) fn parse_handoff(query: &str) -> bool {
     strip_command(query, "handoff").is_some_and(str::is_empty)
 }
 
-/// Rewrites Postgres synonyms that DataFusion's SQL parser doesn't accept.
-///
-/// `ABORT [ WORK | TRANSACTION ]` is a Postgres alias for `ROLLBACK`. Hasql's
-/// connection pool emits `ABORT` defensively on session acquisition to clear
-/// any leftover transaction state; without this rewrite, every Hasql client
-/// (e.g. monoscope) sees its first statement on each connection fail with
-/// `sql parser error: Expected: an SQL statement, found: ABORT`, which then
-/// poisons the whole session.
+/// Rewrites Postgres synonyms that DataFusion's SQL parser doesn't accept:
+/// `ABORT [ WORK | TRANSACTION ]` → `ROLLBACK` (some pools emit it on session
+/// acquisition), plus the `row_to_json` rewrite below.
 fn rewrite_pg_synonyms(query: &str) -> Cow<'_, str> {
     let query = strip_keyword(query.trim_start(), "ABORT", |c| c.is_whitespace() || c == ';')
         .map_or(Cow::Borrowed(query), |rest| Cow::Owned(format!("ROLLBACK{rest}")));
     rewrite_row_to_json_record(&query).map_or(query, Cow::Owned)
 }
 
-/// `row_to_json(t)` over a derived-table alias, which DataFusion rejects while
-/// planning the SQL — before any analyzer rule could see it. pgAdmin's dashboard
-/// polls that shape every 5s.
+/// Rewrites `row_to_json(t)` over a derived-table alias, which DataFusion
+/// rejects while planning the SQL — before any analyzer rule could see it.
 ///
-/// This is an AST rewrite, not a text substitution: the statement is parsed,
-/// visited, and unparsed only if something actually changed. Anything that fails
-/// to parse, or that the visitor declines to touch, is returned unchanged and
-/// reaches DataFusion byte-for-byte as before — a malformed or unusual statement
-/// can never be corrupted into a different valid statement by this path.
+/// An AST rewrite, not a text substitution: anything that fails to parse, or
+/// that the visitor declines to touch, is returned unchanged, so a malformed
+/// statement can never be turned into a different valid one here.
 fn rewrite_row_to_json_record(query: &str) -> Option<String> {
     use datafusion::sql::sqlparser::{dialect::PostgreSqlDialect, parser::Parser};
 
@@ -1002,9 +944,7 @@ fn query_template(query: &str) -> String {
 }
 
 /// Identity of a normalized query, for tracing and metrics only — never
-/// persisted and never a security boundary, so it uses the same XXH3 as the
-/// rest of the codebase rather than a cryptographic hash. (It was SHA-256,
-/// which bought nothing here and cost a full digest on every query.)
+/// persisted and never a security boundary, hence non-cryptographic XXH3.
 fn query_fingerprint(query: &str) -> String {
     format!("{:032x}", twox_hash::XxHash3_128::oneshot(normalized_query(query).as_bytes()))
 }
@@ -1025,15 +965,9 @@ fn record_statement_latency(metrics: Option<&crate::database::ScanMetrics>, quer
     if let Some(metrics) = metrics {
         metrics.record_pgwire_query(duration_us);
     }
-    // A FAILED statement is always worth an event, however fast it died. The
-    // `LoggingErrorHandler` runs OUTSIDE the query span, so its "PgWire internal
-    // error: ..." line carries no `query.text` — which on 2026-09-04 left the
-    // failing statement to be guessed from whichever span happened to be logged
-    // next, on a different thread. That is adjacency, not attribution.
-    //
-    // Emitted here, inside the span, so a resource-exhaustion failure names the
-    // query that caused it. Failures are rare relative to traffic; a retrying
-    // client is a handful per minute.
+    // Emitted here, inside the query span, so a failure names the query that
+    // caused it (`LoggingErrorHandler` runs outside the span and cannot).
+    // Failures always, successes only when slow.
     const SLOW_QUERY_US: u64 = 1_000_000;
     let slow = duration_us >= SLOW_QUERY_US;
     if success && !slow {
@@ -1090,8 +1024,7 @@ impl SimpleQueryHandler for LoggingSimpleQueryHandler {
         let rewritten = rewrite_pg_synonyms(query);
         let query = rewritten.as_ref();
 
-        // Admin commands, caught before DataFusion (whose parser rejects all
-        // OPTIMIZE/VACUUM maintenance plus FLUSH and HANDOFF durability hooks.
+        // Admin commands, caught before DataFusion (whose parser rejects them).
         // Order is significant: `parse_delta_history` ERRORS on any other DELTA
         // statement, so it stays last of the three DELTA parsers.
         macro_rules! admin {
@@ -1151,10 +1084,8 @@ impl LoggingExtendedQueryHandler {
 }
 
 /// Applies the same statement rewrites to the extended protocol that
-/// `rewrite_pg_synonyms` applies to the simple one. pgAdmin's dashboard uses
-/// simple queries, but a rewrite that fires on one protocol and not the other
-/// would mean identical SQL succeeding or failing depending on how the client
-/// sent it.
+/// `rewrite_pg_synonyms` applies to the simple one, so identical SQL does not
+/// succeed or fail depending on how the client sent it.
 pub struct RewritingQueryParser {
     inner: Arc<<DfSessionService as ExtendedQueryHandler>::QueryParser>,
 }
@@ -1363,9 +1294,8 @@ mod pgwire_handlers_tests {
         Ok(())
     }
 
-    /// The deadline is enforced by dropping the in-flight future, and the DML
-    /// path commits inside it — so a timed-out write is reported as failed while
-    /// already partly durable. Reads only.
+    /// The statement timeout applies to reads only; see
+    /// `statement_timeout_applies`.
     #[test_case("SELECT count(*) FROM otel_logs_and_spans" => true ; "read")]
     #[test_case("SHOW server_version" => true ; "show")]
     #[test_case("INSERT INTO otel_logs_and_spans VALUES (1)" => false ; "insert")]
@@ -1375,28 +1305,17 @@ mod pgwire_handlers_tests {
         super::statement_timeout_applies(query)
     }
 
-    /// Mode D, pinned as a test: the statement deadline is COOPERATIVE. It is
-    /// enforced by dropping the in-flight future, and `tokio::time::timeout_at`
-    /// only gets to run when a poll returns `Pending`. A future that computes
-    /// without yielding therefore overruns the deadline by however long it likes
-    /// — the timer is never polled.
-    ///
-    /// Prod 2026-08-22: a 7-day aggregate ran >20 min against a 60s effective
-    /// cap that never fired, on a container with 2h uptime still answering
-    /// `SELECT 1` on new connections. This is why the operators that can run
-    /// long inside one poll (`DedupExec`, `GatedScanExec`) wrap their output in
-    /// DataFusion's `coop::make_cooperative`: it spends a task budget per batch,
-    /// which is what makes the deadline observable at all.
-    ///
-    /// The test asserts the LIMITATION, not the fix, so it keeps passing and
-    /// keeps the reason discoverable. If someone later makes the deadline
-    /// preemptive, this is the test that should be rewritten deliberately.
+    /// The statement deadline is COOPERATIVE: `tokio::time::timeout_at` only
+    /// runs when a poll returns `Pending`, so a future that computes without
+    /// yielding overruns it indefinitely. This is why long-running operators
+    /// (`DedupExec`, `GatedScanExec`) wrap their output in
+    /// `coop::make_cooperative`. The test pins the LIMITATION — rewrite it
+    /// deliberately if the deadline is ever made preemptive.
     #[tokio::test(start_paused = true)]
     async fn the_statement_deadline_cannot_interrupt_a_future_that_never_yields() {
         use super::run_with_statement_timeout;
-        // Awaits a timer ⇒ returns Pending, the deadline is observed, it fires.
-        // (Under a paused clock tokio auto-advances once every task is idle, so
-        // this is deterministic rather than a real 10s wait.)
+        // Awaits a timer ⇒ returns Pending, so the deadline is observed. Under a
+        // paused clock tokio auto-advances when idle: no real 10s wait.
         let yielding = async {
             tokio::time::sleep(std::time::Duration::from_secs(10)).await;
             Ok(())
@@ -1404,9 +1323,7 @@ mod pgwire_handlers_tests {
         let timed_out = run_with_statement_timeout(Some(std::time::Duration::from_secs(1)), yielding).await;
         assert!(timed_out.is_err(), "a future that yields must be interruptible by the deadline");
 
-        // Never yields ⇒ runs to completion regardless of the deadline. Under a
-        // paused clock this is exact rather than timing-dependent: no timer can
-        // advance while the future holds the thread.
+        // Never yields ⇒ runs to completion regardless of the deadline.
         let non_yielding = async { Ok(41 + 1) };
         let (value, _) = run_with_statement_timeout(Some(std::time::Duration::from_nanos(1)), non_yielding)
             .await
@@ -1419,8 +1336,7 @@ mod pgwire_handlers_tests {
     #[test_case("OPTIMIZE otel_logs_and_spans WHERE date = '2026-06-19'" => Ok(Some("otel_logs_and_spans|2026-06-19|None".to_string())) ; "table and date")]
     #[test_case("optimize t where DATE='2026-01-02';" => Ok(Some("t|2026-01-02|None".to_string())) ; "lowercase, unspaced, trailing semicolon")]
     #[test_case("  OPTIMIZE  t  WHERE  date  =  \"2026-01-02\"  " => Ok(Some("t|2026-01-02|None".to_string())) ; "loose spacing and double quotes")]
-    // Tenant-scoped compaction (2026-07-27: whole-date OPTIMIZE OOM'd twice
-    // in-process; one (project, date) partition is the safe unit).
+    // Tenant-scoped compaction: one (project, date) partition is the safe unit.
     #[test_case("OPTIMIZE t WHERE project_id = 'p-1' AND date = '2026-01-02'" => Ok(Some("t|2026-01-02|Some(\"p-1\")".to_string())) ; "project_id then date")]
     #[test_case("optimize t where date='2026-01-02' and PROJECT_ID=\"p-1\"" => Ok(Some("t|2026-01-02|Some(\"p-1\")".to_string())) ; "date then project_id, mixed case")]
     #[test_case("OPTIMIZE t WHERE date = '2026-01-02'" => Ok(Some("t|2026-01-02|None".to_string())) ; "date alone leaves project_id unset")]
@@ -1532,16 +1448,11 @@ mod pgwire_handlers_tests {
 }
 
 // ===== pgwire_early_bind =====
-// Early-bind responder that occupies `:5432` during the slow startup
-// window (WAL replay, Delta-table open, foyer init), returning the
-// Postgres SQLSTATE 57P03 "the database system is starting up" error
-// to every connection until the real server takes over the listener.
-//
-// Without this, packets DNAT'd into the container during the multi-minute
-// startup get RST'd back as ECONNREFUSED — clients like Hasql / pgjdbc /
-// libpq treat 57P03 as transient and back off cleanly, ECONNREFUSED as a
-// hard error. Hand the same `TcpListener` to `serve_with_listener` once
-// ready: no rebind, no ECONNREFUSED window.
+// Early-bind responder that occupies the pgwire port during the slow startup
+// window, answering every connection with SQLSTATE 57P03 "the database system
+// is starting up" — which clients treat as transient, unlike the ECONNREFUSED
+// they would otherwise see. The same `TcpListener` is then handed to
+// `serve_with_listener`, so there is no rebind gap.
 
 use std::{io, time::Duration};
 
@@ -1554,16 +1465,14 @@ use tracing::debug;
 
 const SSL_REQUEST_CODE: u32 = SslRequest::BODY_MAGIC_NUMBER as u32;
 const GSS_REQUEST_CODE: u32 = GssEncRequest::BODY_MAGIC_NUMBER as u32;
-/// Cap on the StartupMessage size we'll drain. Real pg clients send well
-/// under 1 KiB; 64 KiB is comfortably above any legitimate payload and
-/// bounds the work a malformed/hostile client can force on us.
+/// Cap on the StartupMessage we'll drain: well above any legitimate payload
+/// (real clients send under 1 KiB), and bounds a hostile client's work.
 const MAX_STARTUP_BYTES: u64 = 64 * 1024;
 const STARTUP_READ_TIMEOUT: Duration = Duration::from_secs(10);
 /// Budget for the over-cap fast path: response write only, no startup drain.
 const CAP_RESPONSE_TIMEOUT: Duration = Duration::from_secs(1);
-/// Hard cap on concurrent early-bind handlers. A thundering-herd reconnect
-/// storm during startup could otherwise spawn unbounded tasks, each holding
-/// a socket FD for up to STARTUP_READ_TIMEOUT.
+/// Hard cap on concurrent early-bind handlers: a reconnect storm would
+/// otherwise spawn unbounded tasks, each holding an FD for STARTUP_READ_TIMEOUT.
 const MAX_CONCURRENT_EARLY_HANDLERS: usize = 512;
 
 /// Run the 57P03 acceptor on `listener` until `shutdown` is cancelled.
@@ -1580,11 +1489,9 @@ async fn accept_loop(listener: &TcpListener, shutdown: CancellationToken, max_ha
             _ = shutdown.cancelled() => return,
             res = listener.accept() => match res {
                 Ok((sock, addr)) => {
-                    // Over the cap (probable reconnect storm) we still send the canned
-                    // 57P03 frame — dropping the socket unanswered would RST, which
-                    // Hasql/libpq treat as ECONNREFUSED, the exact failure mode this
-                    // responder exists to avoid — but skip the startup drain so the task
-                    // is bounded by accept rate × write latency (~ms).
+                    // Over the cap we still send the canned 57P03 frame — dropping the
+                    // socket unanswered would RST, the failure mode this responder exists
+                    // to avoid — but skip the startup drain to keep the task ~ms-bounded.
                     let permit = Arc::clone(&permits).try_acquire_owned().ok();
                     let (limit, drain) = match &permit {
                         Some(_) => (STARTUP_READ_TIMEOUT, true),
@@ -1665,11 +1572,7 @@ mod pgwire_early_bind_tests {
         assert_eq!(body.last(), Some(&0u8));
     }
 
-    async fn spawn_acceptor() -> (u16, CancellationToken, tokio::task::JoinHandle<()>) {
-        spawn_acceptor_with(MAX_CONCURRENT_EARLY_HANDLERS).await
-    }
-
-    async fn spawn_acceptor_with(max_handlers: usize) -> (u16, CancellationToken, tokio::task::JoinHandle<()>) {
+    async fn spawn_acceptor(max_handlers: usize) -> (u16, CancellationToken, tokio::task::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let shutdown = CancellationToken::new();
@@ -1714,7 +1617,7 @@ mod pgwire_early_bind_tests {
     #[test_case(None, MAX_STARTUP_BYTES as u32 + 1024, b"" => false ; "rejects oversized startup")]
     #[tokio::test]
     async fn responds_to_every_startup_shape(negotiation: Option<u32>, declared_len: u32, params: &[u8]) -> bool {
-        let (port, shutdown, task) = spawn_acceptor().await;
+        let (port, shutdown, task) = spawn_acceptor(MAX_CONCURRENT_EARLY_HANDLERS).await;
         let mut client = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
         if let Some(magic) = negotiation {
             client.write_all(&8u32.to_be_bytes()).await.unwrap();
@@ -1742,7 +1645,7 @@ mod pgwire_early_bind_tests {
     /// closed after STARTUP_READ_TIMEOUT instead of holding the slot forever.
     #[tokio::test(start_paused = true)]
     async fn silent_client_closed_after_timeout() {
-        let (port, shutdown, task) = spawn_acceptor().await;
+        let (port, shutdown, task) = spawn_acceptor(MAX_CONCURRENT_EARLY_HANDLERS).await;
         let mut client = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
         // No bytes sent; advance virtual time past the timeout.
         tokio::time::advance(STARTUP_READ_TIMEOUT + Duration::from_secs(1)).await;
@@ -1752,20 +1655,17 @@ mod pgwire_early_bind_tests {
     }
 
     /// At the handler cap, excess connections still receive 57P03 rather than
-    /// RST — Hasql/libpq treat RST as ECONNREFUSED, which is the failure mode
-    /// this responder exists to avoid.
+    /// an RST (which clients report as ECONNREFUSED).
     #[tokio::test]
     async fn cap_serves_57p03_without_waiting_for_startup() {
-        let (port, shutdown, task) = spawn_acceptor_with(1).await;
+        let (port, shutdown, task) = spawn_acceptor(1).await;
 
         // First connection holds the only permit — never sends startup, so it
         // sits inside handle_one's read awaiting bytes.
         let _holder = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
 
-        // Poll for cap behaviour rather than sleeping a fixed amount: open
-        // probes until one comes back with the canned 57P03 frame, confirming
-        // the holder has the permit and the cap fast-path is firing.
-        // Robust on loaded CI runners.
+        // Poll rather than sleep a fixed amount: open probes until one comes
+        // back with the canned frame, confirming the cap fast-path is firing.
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         loop {
             let mut probe = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
@@ -1857,8 +1757,8 @@ mod streaming_tests {
         panic!("{why}");
     }
 
-    // Uses production authentication, handlers, DataFusion execution, encoding,
-    // and TCP. The input cannot finish until a row has reached the client.
+    // End-to-end over real TCP with the production handlers; the gated input
+    // cannot finish until a row has reached the client.
     #[tokio::test]
     async fn wire_streams_cancels_and_reuses_connection() -> anyhow::Result<()> {
         use super::{AuthConfig, handler_factory};

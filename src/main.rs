@@ -1,31 +1,18 @@
-// main.rs
 #![recursion_limit = "512"]
 
-// Production profiling (--features profiling, Linux): jemalloc as the global
-// allocator with its heap profiler, plus a pprof CPU sampler (started in
-// async_main). Deployed to attribute the prod OOM. See src/profiling.rs.
+// Optional profiling build (--features profiling, Linux): jemalloc as the global
+// allocator with its heap profiler, plus a pprof CPU sampler started in async_main.
 #[cfg(all(feature = "profiling", target_os = "linux"))]
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-// jemalloc reads this symbol at startup — bakes the profiler config into the
-// binary so no MALLOC_CONF env (host is read-only) is needed.
-// prof_prefix points into the data-dir volume we can read off the host.
-// Analyze: `jeprof --svg <binary> <prof_prefix>.*.heap`.
+// jemalloc reads this symbol at startup, so the profiler config is baked into the
+// binary (no MALLOC_CONF env; the host is read-only). Sampling is compiled in but
+// inactive — re-arm at runtime via the `prof.active` mallctl.
+// `dirty_decay_ms` must stay non-zero: decay 0 madvises every freed page back to
+// the kernel, which costs significant CPU in page-fault churn under scan load.
 #[cfg(all(feature = "profiling", target_os = "linux"))]
 #[unsafe(export_name = "malloc_conf")]
-// `prof:true, prof_active:false`: sampling stays compiled in but off by default —
-// re-arm at runtime via the `prof.active` mallctl (no rebuild) when heap
-// attribution is next needed. lg_prof_sample:19 = ~512KiB sampling; keeping it
-// off saves CPU/heap on this box, whose memory headroom gates compaction.
-//
-// `dirty_decay_ms:10000` (was 0): decay 0 madvise()s every freed page back to
-// the kernel immediately, which under maintenance load (2026-08-18 perf trace)
-// cost ~18% CPU in page-fault/TLB-shootdown churn from Arrow scan buffers being
-// freed and re-faulted. 10s amortizes that while still returning idle memory;
-// the 85% maintenance brake remains the OOM backstop. Don't drop this back to 0
-// without re-measuring under maintenance load — it was set there in 2026-08-03
-// to fight OOMs from since-fixed causes (unbounded scans, DedupExec).
 pub static MALLOC_CONF: &[u8] = b"prof:true,prof_active:false,lg_prof_sample:19,lg_prof_interval:35,prof_prefix:/app/data/timefusion/profiles/jeprof,background_thread:true,dirty_decay_ms:10000,muzzy_decay_ms:10000\0";
 
 use std::sync::Arc;
@@ -43,22 +30,15 @@ use timefusion::{
 use tokio::time::{Duration, sleep};
 use tracing::{error, info, warn};
 
-/// Stack size for every Tokio worker.
-///
-/// Tokio's default (2 MiB) overflowed planning a merge-on-read UPDATE on
-/// 2026-08-16 (deep recursion over a wide schema + IN-list pushdown), which
-/// aborts the whole process, not just the task — prod restart-looped on exit
-/// 134. Plan depth follows schema width and predicate shape, not just pushdown
-/// size, so this bounds the stack directly rather than the recursion. Reserved
-/// lazily, so untouched pages cost address space, not RSS.
+/// Stack size for every Tokio worker. Query planning recurses with schema width
+/// and predicate shape, and an overflow aborts the whole process, so Tokio's
+/// 2 MiB default is not enough. Reserved lazily: untouched pages cost address
+/// space, not RSS.
 const WORKER_STACK_BYTES: usize = 32 * 1024 * 1024;
-// Planning depth follows schema width and predicate shape, not just the
-// pushdown cap, so keep real headroom over Tokio's 2 MiB default.
 const _: () = assert!(WORKER_STACK_BYTES >= 8 * 2 * 1024 * 1024);
 
 fn main() -> anyhow::Result<()> {
-    // First statement in the process: `timefusion_stats` reports uptime against
-    // this, and every counter it reports is only readable against uptime.
+    // Must be the first statement: `timefusion_stats` reports uptime against this.
     timefusion::observability::mark_process_start();
     dotenv().ok();
     // Before the runtime, so every worker thread/listener inherits the raised
@@ -69,21 +49,14 @@ fn main() -> anyhow::Result<()> {
     match subcommand.as_deref() {
         Some("healthcheck") => return run_pgwire_healthcheck(),
         Some("encrypt-secret") => return config::run_cli(),
-        // Replays a prod maintenance journal through the real scheduler on
-        // virtual time — must stay config/bucket-free, that's what lets it
-        // answer scheduler questions without a deploy.
+        // Must stay config/bucket-free — that is what lets it run anywhere.
         Some("sim") => return run_sim_cli(),
         _ => {}
     }
 
-    // Maintenance CLIs get the maintenance-heavy budget shape (the server shape
-    // strands cgroup memory in query/ingest slices a one-shot CLI never uses).
-    // Must precede init_config, which snapshots the tree.
-    //
-    // `run-unit` excluded: it drives a coordinator unit whose pool comes from
-    // `coordinator_share_bytes()`, which is a hard 0 under this profile
-    // ("no coordinator runs under MaintenanceCli") — every invocation died at
-    // `pool_size: 0.0 B`. Found 2026-08-20.
+    // Maintenance CLIs get the maintenance-heavy budget shape. Must precede
+    // init_config, which snapshots the tree. `run-unit` is deliberately excluded:
+    // `coordinator_share_bytes()` is 0 under this profile, so its unit gets no pool.
     //
     // SAFETY: no threads exist yet - we're before the Tokio runtime is built.
     if matches!(subcommand.as_deref(), Some("optimize" | "redrive-dml" | "migrate-columns")) {
@@ -101,10 +74,9 @@ fn main() -> anyhow::Result<()> {
         Some("retention") => rt.block_on(run_retention_cli(cfg)),
         _ => {
             let result = rt.block_on(async_main(cfg));
-            // Must END THE PROCESS here: dropping the runtime waits on
-            // lingering blocking/detached threads, and that hang left a
-            // zombie container blocking swarm's replacement (2026-08-06
-            // pgwire outage). Everything durable is already on disk.
+            // Must END THE PROCESS here: dropping the runtime waits on lingering
+            // blocking/detached threads and can hang forever. Everything durable
+            // is already on disk.
             match result {
                 Ok(()) => std::process::exit(0),
                 Err(e) => {
@@ -125,30 +97,16 @@ fn run_pgwire_healthcheck() -> anyhow::Result<()> {
     pgwire_ready_at(([127, 0, 0, 1], port).into())
 }
 
-/// Per-operation deadline for the readiness probe, so its worst case is 3x this
+/// Per-operation deadline for the readiness probe; worst case is 3x this
 /// (connect + write + read) and must stay inside the Dockerfile's
 /// `HEALTHCHECK --timeout` (pinned by `probe_worst_case_fits_the_docker_timeout`).
-///
-/// Was 750ms, and that was the actual killer (prod 2026-08-08): a probe measured
-/// at 0.896s with no deploy in flight and the server perfectly healthy, three of
-/// those in a row, and Swarm replaced the task — mid footer repair, discarding a
-/// 40-minute rewrite. The handshake competes for the same runtime as ingest and
-/// maintenance, so sub-second is not a budget a loaded database can hold. This
-/// is a LIVENESS probe: the question is "is this still a database", not "is it
-/// fast right now".
+/// This is a LIVENESS probe — the handshake shares a runtime with ingest and
+/// maintenance, so a sub-second budget is not one a loaded database can hold.
 const PROBE_OP_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1500);
 
-/// A probe verdict is useless without knowing WHICH stage was slow: a slow
-/// `connect` is the accept loop (or the listen backlog) not getting scheduled,
-/// a slow `auth` read is the handshake task losing its runtime slice behind
-/// CPU-bound maintenance. On 2026-08-11 a probe timeout killed the task
-/// mid-repair with CPU at 805%/4800% and 17.8 of 96 GiB — neither saturation
-/// nor OOM, so the deadline was measuring something we could not see.
-///
-/// Printed on BOTH paths (Docker records healthcheck output either way), so a
-/// `docker inspect` health log reads as a stage histogram over time rather than
-/// a column of bare "unhealthy". Deliberately not widened — read the stages
-/// first; widening the deadline destroys the only signal there is.
+/// Connects and reads the first PGWire response byte, printing per-stage timings
+/// (connect / write / auth) on both success and failure so the Docker health log
+/// reads as a stage histogram rather than a column of bare "unhealthy".
 fn pgwire_ready_at(addr: std::net::SocketAddr) -> anyhow::Result<()> {
     use std::io::{Read, Write};
 
@@ -171,10 +129,8 @@ fn pgwire_ready_at(addr: std::net::SocketAddr) -> anyhow::Result<()> {
     let mut stream = connect.inspect_err(|e| println!("probe stage=connect ms={connect_ms} result=error err={e}"))?;
 
     let body = b"user\0timefusion_healthcheck\0database\0postgres\0\0";
-    let mut startup = Vec::with_capacity(8 + body.len());
-    startup.extend_from_slice(&((8 + body.len()) as u32).to_be_bytes());
-    startup.extend_from_slice(&196_608u32.to_be_bytes()); // protocol 3.0
-    startup.extend_from_slice(body);
+    // length | protocol 3.0 | body
+    let startup = [&((8 + body.len()) as u32).to_be_bytes()[..], &196_608u32.to_be_bytes()[..], &body[..]].concat();
     let wrote = stream.write_all(&startup);
     let write_ms = stage(&mut mark);
     wrote.inspect_err(|e| println!("probe stage=write connect_ms={connect_ms} ms={write_ms} result=error err={e}"))?;
@@ -206,10 +162,8 @@ fn pgwire_ready_at(addr: std::net::SocketAddr) -> anyhow::Result<()> {
     anyhow::bail!("PGWire returned unexpected response tag {:?}", tag[0] as char)
 }
 
-/// Argument cursor shared by every subcommand CLI below. Two-token flags need
-/// lookahead, so `next()` yields the flag and `value`/`parse` pull the token
-/// after it; a struct rather than a closure keeps the borrow from overlapping
-/// the `next()` that drives the loop.
+/// Argument cursor shared by every subcommand CLI below: `next()` yields the
+/// flag, `value`/`parse` pull the token after it.
 struct Args(std::iter::Skip<std::env::Args>);
 
 impl Args {
@@ -241,6 +195,22 @@ impl Iterator for Args {
     }
 }
 
+/// The subcommand parse loop every CLI below repeats: `"--flag" => action` arms
+/// plus the one identical unknown-argument bail.
+macro_rules! cli_args {
+    ($it:expr, $usage:expr, { $($flag:literal => $arm:expr),* $(,)? }) => {
+        while let Some(a) = $it.next() {
+            match a.as_str() {
+                $($flag => $arm,)*
+                other => {
+                    let usage = $usage;
+                    anyhow::bail!("unknown argument: {other} ({usage})")
+                }
+            }
+        }
+    };
+}
+
 fn init_cli_tracing() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")))
@@ -251,18 +221,13 @@ fn init_cli_tracing() {
 /// [--workers N] [--streams N] [--scale F] [--seed N] [--no-mint]
 /// [--floorless] [--guard-off] [--json]`
 ///
-/// Replay a copied-out prod maintenance journal through the real scheduler on
-/// virtual time (`timefusion::maintenance_sim`). The answer to "does this
-/// policy keep up" without a deploy. Fetch the input with e.g.
-/// `ssh ubuntu@captain.s.past3.tech 'docker cp <container>:/data/.timefusion_meta/maintenance_tasks.json -'`.
+/// Replay a maintenance journal through the real scheduler on virtual time
+/// (`timefusion::maintenance_sim`), to answer "does this policy keep up"
+/// without deploying.
 fn run_sim_cli() -> anyhow::Result<()> {
     use timefusion::maintenance_sim::{SimConfig, load_sandboxed, run};
-    // The sim stays config-free by default (that's what lets it answer
-    // scheduler questions without a deploy) — but rank() reads its emergency
-    // kill switches through the global config, which is None here, so their
-    // defaults apply. Installing the config ONLY when such a switch is
-    // explicitly set keeps the default path config-free while letting an A/B
-    // arm exercise the switched-off ordering.
+    // The sim is config-free by default; install the config only when a rank()
+    // kill switch is explicitly set, so an A/B arm can exercise that ordering.
     if std::env::var_os("TIMEFUSION_DEDUP_CONTIGUITY_RANK").is_some() {
         timefusion::config::init_config().map_err(|e| anyhow::anyhow!("kill-switch env set but config failed to load: {e}"))?;
     }
@@ -274,44 +239,31 @@ fn run_sim_cli() -> anyhow::Result<()> {
     let mut floorless = false;
     let mut mint = false;
     let mut debris_slice = 1i64;
-    while let Some(a) = it.next() {
-        match a.as_str() {
-            "--hours" => cfg.horizon_micros = it.hours_micros("--hours")?,
-            "--workers" => cfg.workers = it.parse("--workers", "an integer")?,
-            "--streams" => cfg.streams = Some(it.parse("--streams", "an integer")?),
-            "--scale" => cfg.duration_scale = it.parse("--scale", "a number")?,
-            "--seed" => cfg.seed = u64::from_str_radix(it.value("--seed")?.trim_start_matches("0x"), 16).context("--seed must be hex")?,
-            "--restarts-every-hours" => cfg.restart_every_micros = it.hours_micros("--restarts-every-hours")?,
-            "--restart-at-hours" => cfg.restart_at_micros = Some(it.hours_micros("--restart-at-hours")?),
-            "--no-mint" => cfg.mint_frontier = false,
-            // `synth:whale` disables minting by default (below). `--mint`
-            // turns arrivals back on, which is what makes `--streams` — and so
-            // any capacity experiment — mean anything on a synthetic queue.
-            "--mint" => mint = true,
-            // The bin-width axis: same total debris work as `600 / n` units of
-            // `n` minutes. See `synthetic_whale_queue`.
-            "--debris-slice-minutes" => debris_slice = it.parse("--debris-slice-minutes", "an integer")?,
-            // The floorless control, and the pre-69e6503 behaviour, for
-            // `synth:whale`.
-            "--floorless" => floorless = true,
-            "--guard-off" => cfg.split_guard = timefusion::maintenance_sim::SplitGuard::Off,
-            "--json" => json = true,
-            other => anyhow::bail!("unknown argument: {other} ({usage})"),
-        }
-    }
+    cli_args!(it, usage, {
+        "--hours" => cfg.horizon_micros = it.hours_micros("--hours")?,
+        "--workers" => cfg.workers = it.parse("--workers", "an integer")?,
+        "--streams" => cfg.streams = Some(it.parse("--streams", "an integer")?),
+        "--scale" => cfg.duration_scale = it.parse("--scale", "a number")?,
+        "--seed" => cfg.seed = u64::from_str_radix(it.value("--seed")?.trim_start_matches("0x"), 16).context("--seed must be hex")?,
+        "--restarts-every-hours" => cfg.restart_every_micros = it.hours_micros("--restarts-every-hours")?,
+        "--restart-at-hours" => cfg.restart_at_micros = Some(it.hours_micros("--restart-at-hours")?),
+        "--no-mint" => cfg.mint_frontier = false,
+        // `synth:whale` disables minting by default; `--mint` turns arrivals
+        // back on, which is what makes `--streams` mean anything there.
+        "--mint" => mint = true,
+        // Bin-width axis: same total debris work as `600 / n` units of `n` minutes.
+        "--debris-slice-minutes" => debris_slice = it.parse("--debris-slice-minutes", "an integer")?,
+        "--floorless" => floorless = true,
+        "--guard-off" => cfg.split_guard = timefusion::maintenance_sim::SplitGuard::Off,
+        "--json" => json = true,
+    });
     let now = support::now_micros();
-    // `synth:whale` needs no journal at all: the queue shape that shredded prod
-    // is reproducible locally, and it is the only input that exercises the byte
-    // preflight (a real journal carries estimates the sim would never read).
+    // `synth:whale` needs no journal, and is the only input that exercises the
+    // byte preflight (a real journal carries estimates the sim never reads).
     let report = if let Some(shape) = input.strip_prefix("synth:") {
         anyhow::ensure!(shape == "whale", "the only synthetic queue is `synth:whale`");
-        // `--streams` scales the INGESTING streams discovered in a real
-        // journal. A synthetic queue has none and sets `mint_frontier = false`
-        // below, so without minting there are no arrivals and the flag is
-        // silently inert: `--streams 26` and `--streams 260` produced
-        // BYTE-IDENTICAL reports at the same seed (2026-09-04) while the summary
-        // line still printed the count it was given — a "10x" run that modelled
-        // 1x. Refuse it rather than answer a capacity question with the baseline.
+        // `--streams` scales ingesting streams, which a synthetic queue only has
+        // when minting is on — otherwise the flag would be silently inert.
         anyhow::ensure!(
             cfg.streams.is_none() || mint,
             "--streams needs arrivals to scale: pass --mint (a synthetic queue disables minting by default), or use a real journal."
@@ -367,9 +319,9 @@ fn run_sim_cli() -> anyhow::Result<()> {
 /// [--op base|derived|dedup|hot|sealed|repair] [--slice-hours N] [--offset-hours N]`
 ///
 /// Execute ONE maintenance unit against the configured storage and print where
-/// its time went (scan/stage/commit/end-to-end deltas + wall). The per-unit
-/// cost decomposition as a command. Claims only the requested task and preserves
-/// unrelated journal entries. Normal admission and dependency checks still apply.
+/// its time went (scan/stage/commit deltas + wall). Claims only the requested
+/// task and preserves unrelated journal entries; normal admission and dependency
+/// checks still apply.
 async fn run_unit_cli(cfg: &'static AppConfig) -> anyhow::Result<()> {
     init_cli_tracing();
     let mut source = "otel_logs_and_spans".to_string();
@@ -379,38 +331,30 @@ async fn run_unit_cli(cfg: &'static AppConfig) -> anyhow::Result<()> {
     let mut slice_hours: i64 = 24;
     let mut offset_hours: i64 = 0;
     let mut it = Args::new();
-    while let Some(a) = it.next() {
-        match a.as_str() {
-            "--source" => source = it.value("--source")?,
-            "--project" => project = Some(it.value("--project")?),
-            "--date" => date = Some(it.parse("--date", "YYYY-MM-DD")?),
-            "--slice-hours" => slice_hours = it.parse("--slice-hours", "an integer")?,
-            "--offset-hours" => offset_hours = it.parse("--offset-hours", "an integer")?,
-            "--op" => {
-                use timefusion::maintenance_coordinator::Operation;
-                operation = match it.value("--op")?.as_str() {
-                    "base" => Operation::BaseRollup,
-                    "derived" => Operation::DerivedRollup,
-                    "dedup" => Operation::Dedup,
-                    "hot" => Operation::HotPacking,
-                    "sealed" => Operation::SealedConsolidation,
-                    "repair" => Operation::Repair,
-                    other => anyhow::bail!("unknown --op {other}: base|derived|dedup|hot|sealed|repair"),
-                }
+    cli_args!(it, "usage: timefusion run-unit --project ID [--source T] [--date D] [--op OP] [--slice-hours N] [--offset-hours N]", {
+        "--source" => source = it.value("--source")?,
+        "--project" => project = Some(it.value("--project")?),
+        "--date" => date = Some(it.parse("--date", "YYYY-MM-DD")?),
+        "--slice-hours" => slice_hours = it.parse("--slice-hours", "an integer")?,
+        "--offset-hours" => offset_hours = it.parse("--offset-hours", "an integer")?,
+        "--op" => {
+            use timefusion::maintenance_coordinator::Operation;
+            operation = match it.value("--op")?.as_str() {
+                "base" => Operation::BaseRollup,
+                "derived" => Operation::DerivedRollup,
+                "dedup" => Operation::Dedup,
+                "hot" => Operation::HotPacking,
+                "sealed" => Operation::SealedConsolidation,
+                "repair" => Operation::Repair,
+                other => anyhow::bail!("unknown --op {other}: base|derived|dedup|hot|sealed|repair"),
             }
-            other => anyhow::bail!(
-                "unknown argument: {other} (usage: timefusion run-unit --project ID [--source T] [--date D] [--op OP] [--slice-hours N] [--offset-hours N])"
-            ),
-        }
-    }
+        },
+    });
     let project = project.context("--project is required")?;
     let date = date.unwrap_or_else(|| support::today_utc() - chrono::Duration::days(1));
     let db = Database::with_config(Arc::new(cfg.clone())).await?;
-    // The server loads this in `start_maintenance_schedulers`, which run-unit
-    // deliberately skips — without it every invocation starts with an empty
-    // verified-sorted set, re-selects the same already-probed file, and a
-    // repeated run-unit loop never advances past it (12 identical iterations,
-    // 2026-09-05, before this line existed).
+    // run-unit skips `start_maintenance_schedulers`, so load this explicitly or
+    // every invocation re-selects the same already-probed file and never advances.
     db.load_verified_sorted();
     let report = db.run_unit_once(&source, &project, date, operation, slice_hours, offset_hours).await?;
     println!("{report}");
@@ -424,13 +368,10 @@ async fn run_redrive_dml_cli(cfg: &'static AppConfig) -> anyhow::Result<()> {
     let mut dir = cfg.core.wal_dir().join(timefusion::write::wal::QUARANTINE_DIR_NAME).join("dml");
     let mut dry_run = false;
     let mut it = Args::new();
-    while let Some(a) = it.next() {
-        match a.as_str() {
-            "--dir" => dir = it.value("--dir")?.into(),
-            "--dry-run" => dry_run = true,
-            other => anyhow::bail!("unknown argument: {other} (usage: timefusion redrive-dml [--dir PATH] [--dry-run])"),
-        }
-    }
+    cli_args!(it, "usage: timefusion redrive-dml [--dir PATH] [--dry-run]", {
+        "--dir" => dir = it.value("--dir")?.into(),
+        "--dry-run" => dry_run = true,
+    });
     let db = Arc::new(Database::with_config(Arc::new(cfg.clone())).await?);
     let (ok, skipped) = timefusion::dml::redrive_dml_quarantine(&db, &dir, dry_run).await;
     println!("redrive-dml: {ok} recovered, {skipped} left parked (dir {dir:?})");
@@ -444,10 +385,8 @@ async fn sidecar_store(db: &Database, cfg: &AppConfig, bucket: &str, kind: &str)
 
 async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
     observability::init_telemetry(&cfg.telemetry)?;
-    // AFTER init_telemetry: config is built before the subscriber exists, so
-    // logging the tree at derivation time is silently swallowed — which is why
-    // prod could carry TIMEFUSION_MEMORY_LIMIT_GB=26 while actually budgeting
-    // 120 GiB with nothing on the box revealing the gap (2026-07-31).
+    // Must come AFTER init_telemetry: config is built before the subscriber
+    // exists, so logging the budget tree any earlier is silently swallowed.
     cfg.derived.log();
     support::init_from_env();
 
@@ -459,12 +398,10 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
 
     let cfg_arc = Arc::new(cfg.clone());
 
-    // Bind :5432 immediately, before the slow startup work (Database open,
-    // WAL recovery — up to ~15 min when WAL has accumulated). Clients
-    // connecting in this window get SQLSTATE 57P03 ("starting up") from
-    // the early-bind responder instead of ECONNREFUSED, which is what
-    // Hasql / pgjdbc / libpq expect during a backend restart and retry
-    // on cleanly. See pgwire_early_bind for the responder.
+    // Bind the pgwire port before the slow startup work (Database open, WAL
+    // recovery). Clients connecting in that window get SQLSTATE 57P03
+    // ("starting up") from the early-bind responder instead of ECONNREFUSED,
+    // which standard drivers retry on cleanly.
     let pg_opts = ServerOptions::new().with_host("0.0.0.0".to_string()).with_port(cfg.core.pgwire_port);
     let pg_listener = datafusion_postgres::bind_listener(pg_opts.host(), *pg_opts.port(), *pg_opts.backlog()).await?;
     let early_shutdown = tokio_util::sync::CancellationToken::new();
@@ -477,16 +414,10 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
     });
 
     // Take exclusive ownership of the WAL directory before ANY WAL access (boot
-    // GC below, recovery, or writes). TimeFusion's WAL is single-writer with no
-    // cross-process coordination; two live processes on the same dir fork it —
-    // the newer one recovers only the prefix present at its start and orphans
-    // the older's concurrent appends (silent loss on an overlapping redeploy).
-    // Blocks until any previous process exits and releases the flock, serving
-    // 57P03 via the early-bind responder above meanwhile. Held for the whole
-    // process lifetime; released by the kernel even on SIGKILL. Under a
-    // start-first deploy this self-resolves (readiness is a TCP check the early
-    // responder already satisfies, so the orchestrator stops the old instance,
-    // which releases the lock); stop-first shortens the handoff but isn't required.
+    // GC, recovery, writes). The WAL is single-writer with no cross-process
+    // coordination: two live processes on one dir fork it and silently lose the
+    // older process's appends. Blocks until the previous process releases the
+    // flock; held for the whole process lifetime and released even on SIGKILL.
     let _wal_dir_lock = timefusion::write::wal::WalDirLock::acquire(&cfg.core.wal_dir()).await?;
 
     let t_db = std::time::Instant::now();
@@ -505,35 +436,25 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
         Arc::new(move |project_id: String, table_name: String, batches: Vec<arrow::array::RecordBatch>, wal_watermark: timefusion::write::DeltaWatermark| {
             let db = db_for_callback.clone();
             Box::pin(async move {
-                // insert_records_batch returns the URIs of files newly added by this
-                // commit, derived from the post-write snapshot under the same write
-                // lock — no second log scan. Watermark goes into Delta commit metadata
-                // for crash-mid-flush recovery.
-                // insert_records_batch warms the just-flushed files itself
-                // (watermark-gated) — no warm here, or every flush would issue
-                // the warm GETs twice.
+                // Returns the URIs newly added by this commit; the watermark goes
+                // into Delta commit metadata for crash-mid-flush recovery. It also
+                // warms the just-flushed files itself — don't warm again here.
                 let added = db.insert_records_batch(&project_id, &table_name, batches, true, Some(&wal_watermark)).await?;
-                // Unconditional on a successful commit — the flag means "this
-                // (project, table) has Delta files", true as soon as the commit
-                // lands even if file attribution came back empty. See the
-                // coalesced callback in `bootstrap.rs` for the full rationale.
+                // Unconditional on a successful commit: the flag means "this
+                // (project, table) has Delta files", true even if file attribution
+                // came back empty.
                 db.mark_delta_has_files(&project_id, &table_name);
                 Ok(added)
             })
         });
 
-    // Register UDFs on the real SessionContext up front so its FunctionRegistry
-    // doubles as the WAL-replay registry — no throwaway bootstrap context.
-    // Table providers depend on buffered_layer and are registered after recovery.
+    // Register UDFs up front so this context's FunctionRegistry doubles as the
+    // WAL-replay registry. Table providers depend on buffered_layer and are
+    // registered after recovery.
     let mut session_context = Arc::new(db.clone()).create_session_context();
     db.setup_session_udfs(&mut session_context)?;
     let registry: Arc<timefusion::read::functions::FnRegistry> = Arc::new(session_context.state());
 
-    // Tantivy sidecar indexes are always-on whenever at least one table has
-    // `tantivy.indexed: true` fields in its YAML schema (or appears in the
-    // optional `TIMEFUSION_TANTIVY_INDEXED_TABLES` override). The query layer
-    // accelerates standard SQL predicates (`=`, `LIKE 'prefix%'`) via the
-    // TantivyPredicateRewriter — callers don't need to know tantivy exists.
     // Pre-init WAL GC (gated + drained-flag consumption inside the helper).
     timefusion::write::wal::boot_wal_gc(&cfg.core.wal_dir());
 
@@ -555,8 +476,8 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
         let svc = Arc::new(timefusion::tantivy::search::TantivyIndexService::new(obj_store.clone(), tcfg.clone(), cfg.core.timefusion_data_dir.clone()));
         layer = layer.with_tantivy_indexer(timefusion::server::tantivy_index_callback(&db, Arc::clone(&svc)));
         let search = Arc::new(timefusion::tantivy::search::TantivySearchService::new(obj_store, cfg.core.timefusion_data_dir.clone(), tcfg));
-        // Two halves of one process: let a publish seed the reader's cache and
-        // invalidate its manifest instead of round-tripping through S3.
+        // Lets a publish seed the reader's cache and invalidate its manifest
+        // in-process instead of round-tripping through S3.
         svc.with_reader(&search);
         db = db.with_tantivy_search(search).with_tantivy_indexer(svc.clone());
         info!("Tantivy sidecar indexes active for tables: {:?}", indexed_tables);
@@ -572,35 +493,29 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
     }
     let buffered_layer = Arc::new(layer);
 
-    // Initialize OpenTelemetry metrics — observable gauges read snapshot_stats()
-    // each export cycle (30s), keeping the hot path untouched. Weak ref so
-    // metrics don't extend the layer's lifetime.
+    // Observable gauges read snapshot_stats() each export cycle, keeping the hot
+    // path untouched. Weak ref so metrics don't extend the layer's lifetime.
     if let Err(e) =
         timefusion::observability::init_metrics(&cfg.telemetry, Arc::downgrade(&buffered_layer), tantivy_svc_for_metrics.as_ref().map(Arc::downgrade))
     {
         error!("Failed to initialize OTel metrics: {} — continuing without metrics export", e);
     }
 
-    // Starts here, not after WAL replay: replay is exactly the window where a
-    // probe deadline gets missed, so the sampler has to already be running to
-    // catch it. Its OWN token, not `early_shutdown` — that one is cancelled at
-    // the early-bind handoff, which is precisely when the sampler starts being
-    // interesting.
+    // Must start before WAL replay — that is the window where probe deadlines
+    // get missed. Its OWN token: `early_shutdown` is cancelled at the early-bind
+    // handoff, and the sampler has to outlive that.
     let lag_shutdown = tokio_util::sync::CancellationToken::new();
     timefusion::observability::spawn_runtime_lag_sampler(lag_shutdown.clone());
 
-    // Fast-forward walrus cursors before WAL replay so we don't re-inject
-    // entries Delta already has. Fast path: a `clean_shutdown=true` snapshot
-    // on local disk lets us skip the ~6.5-min R2 scan entirely. Dirty/missing
-    // snapshot still seeds positions, then falls through to the (env-tuned,
-    // shorter) Delta verifier to catch commits made after the last snapshot.
+    // Fast-forward walrus cursors before WAL replay so we don't re-inject entries
+    // Delta already has. A `clean_shutdown=true` snapshot on local disk skips the
+    // remote scan entirely; a dirty/missing one seeds positions and then falls
+    // through to the Delta verifier for commits made after the last snapshot.
     let wal_ref = buffered_layer.wal();
     let t_snap = std::time::Instant::now();
     let clean_snapshot = wal_ref.load_cursor_snapshot().is_some_and(|snap| {
-        // age_secs is surfaced in the boot log only — not gating the skip. See
-        // CursorSnapshot docs for the single-writer assumption and the `rm`
-        // escape hatch. Backwards clock skew (NTP correction, snapshot ported
-        // across hosts) is clamped to 0 by `saturating_sub`, not wrapped negative.
+        // age_secs is logged only, it does not gate the skip. Backwards clock skew
+        // is clamped to 0 by `saturating_sub` rather than wrapping.
         let age_secs = timefusion::support::now_micros().saturating_sub(snap.written_at_micros) / 1_000_000;
         match wal_ref.restore_cursor_snapshot(&snap) {
             Ok(tables_advanced) => {
@@ -619,20 +534,14 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
             }
         }
     });
-    // A dirty/missing snapshot normally requires the expensive remote scan.
-    // But when every durable cursor is already at its exact local WAL tail and
-    // no interrupted-recovery marker exists, there is no payload whose cursor
-    // Delta could advance. This covers the common deploy failure mode where
-    // pre-deploy FLUSH drained successfully but the old container was killed
-    // before it could write clean_shutdown=true.
+    // A dirty/missing snapshot normally requires the expensive remote scan, but
+    // when every durable cursor is already at its exact local WAL tail and no
+    // interrupted-recovery marker exists, there is no payload Delta could advance.
     let local_wal_consumed = !clean_snapshot
-        && match wal_ref.can_skip_delta_reconcile() {
-            Ok(v) => v,
-            Err(e) => {
-                warn!("Local WAL tail/cursor proof failed, retaining Delta reconciliation: {e}");
-                false
-            }
-        };
+        && wal_ref.can_skip_delta_reconcile().unwrap_or_else(|e| {
+            warn!("Local WAL tail/cursor proof failed, retaining Delta reconciliation: {e}");
+            false
+        });
     let skip_delta_scan = clean_snapshot || local_wal_consumed;
     info!(
         "bootstrap.phase=cursor_snapshot skip_delta_scan={skip_delta_scan} clean_snapshot={clean_snapshot} local_wal_consumed={local_wal_consumed} elapsed_ms={}",
@@ -674,28 +583,19 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
     db.setup_session_tables(&mut session_context)?;
     // Non-blocking: snapshot load + footer warm-up off the first query's path.
     db.preload_tables();
-    // Config-gated background index maintenance: backfill uncovered files,
-    // warm the local index cache with recent blobs.
     db.spawn_tantivy_backfill();
     db.spawn_tantivy_prefetch();
 
-    // Start PGWire server on the listener we pre-bound at the top of
-    // async_main. First, hand control of that listener back from the
-    // early-bind 57P03 responder.
-    //
-    // Ownership handoff: the listener was moved into early_task and is
-    // returned as its final value, so `early_task.await?` hands back the
-    // owned TcpListener — no Arc, no rebind, no ECONNREFUSED window.
-    // handle_one tasks accepted just before shutdown may still be running;
-    // they own only the accepted sockets and complete independently.
+    // Hand the pre-bound listener back from the early-bind 57P03 responder: it
+    // was moved into early_task and is returned as that task's value, so there is
+    // no rebind and no ECONNREFUSED window.
     info!("startup complete, transferring :5432 from early-bind 57P03 responder to real PGWire server");
     early_shutdown.cancel();
     let listener = early_task.await?;
 
     let auth_config = timefusion::server::AuthConfig::from_core(&cfg.core)?;
 
-    // PGWire shutdown signal: when cancelled, the accept loop in
-    // `serve_with_handlers` stops accepting new connections so the
+    // When cancelled, the accept loop stops taking new connections so the
     // BufferedWriteLayer flush isn't racing fresh inserts. Already-accepted
     // connections finish on their own spawned tasks.
     let pgwire_shutdown = tokio_util::sync::CancellationToken::new();
@@ -726,9 +626,8 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
     // relief files be indexed.
     db.spawn_deferred_tantivy_reindex(Arc::clone(&buffered_layer));
 
-    // Catch SIGTERM (k8s rolling restart) in addition to SIGINT (Ctrl-C).
-    // Without SIGTERM handling, k8s sends SIGKILL after the grace period
-    // and in-flight writes are dropped.
+    // Catch SIGTERM (orchestrated restart) as well as SIGINT; without it the
+    // grace period expires into a SIGKILL and in-flight writes are dropped.
     let term_signal = async {
         #[cfg(unix)]
         {
@@ -742,12 +641,9 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
         }
     };
 
-    // In a start-first rollout the replacement binds its isolated listener,
-    // then blocks on the shared WAL flock and writes a takeover request. A
-    // successful HANDOFF has already fenced writes and drained every hold, so
-    // the predecessor can exit at that exact moment while continuing to serve
-    // reads until the replacement actually exists. Without HANDOFF readiness,
-    // requests are ignored and SIGTERM remains the only shutdown authority.
+    // In a start-first rollout the replacement blocks on the shared WAL flock and
+    // writes a takeover request. Handoff readiness means writes are already fenced
+    // and every hold drained, so the predecessor can exit at that moment.
     let takeover_signal = async {
         loop {
             tokio::time::sleep(Duration::from_millis(25)).await;
@@ -758,14 +654,10 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
             if buffered_layer.is_deploy_handoff_ready() {
                 break;
             }
-            // Escalation. Handoff readiness is the FAST path, not the only one:
-            // an instance the orchestrator has lost track of is never sent
-            // SIGTERM, so if readiness is the sole authority it holds the WAL
-            // lock forever and every replacement starves behind it — measured
-            // 2026-08-10 at 47 minutes with six live containers stacking up on
-            // one box. A request nobody has satisfied for this long means the
-            // predecessor is that instance, so take the ordinary graceful path
-            // anyway; it fences writes and flushes exactly like SIGTERM does.
+            // Escalation: an instance the orchestrator has lost track of is never
+            // sent SIGTERM, so readiness alone would hold the WAL lock forever and
+            // starve every replacement. Take the ordinary graceful path anyway —
+            // it fences writes and flushes exactly like SIGTERM does.
             if timefusion::write::wal::takeover_request_age(&wal_dir).is_some_and(|age| age >= timefusion::write::wal::TAKEOVER_ESCALATE_AFTER) {
                 warn!(
                     "WAL takeover requested {}s ago and this instance never reached handoff readiness; shutting down anyway so the replacement can start",
@@ -776,9 +668,8 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
         }
     };
 
-    // Wait for shutdown signal. Borrow `pg_task` so we can still await it
-    // in the drain phase below — the select! only watches it for early
-    // failure, not for ownership.
+    // Borrow `pg_task` so it can still be awaited in the drain phase below — the
+    // select! only watches it for early failure, not for ownership.
     tokio::select! {
         res = &mut pg_task => {
             match res {
@@ -797,38 +688,26 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
         }
     }
 
-    // Fence writes immediately. datafusion-postgres stops its accept loop but
-    // does not join per-connection tasks; without this barrier an already-
-    // accepted INSERT could append after the final flush/snapshot, forcing the
-    // replacement back onto dirty recovery (or making a clean claim stale).
+    // Fence writes immediately: the accept loop stops but per-connection tasks are
+    // not joined, so without this barrier an already-accepted INSERT could append
+    // after the final flush/snapshot and force the replacement onto dirty recovery.
     buffered_layer.stop_accepting_writes();
     let preflushed_handoff = buffered_layer.is_drained();
 
-    // Stop maintenance first: an in-flight light-optimize/dedup sweep must bail
-    // before the buffered-layer flush, not compete with it and then outlive the
-    // Foyer cache (a running sweep hitting a closed cache previously hung
-    // shutdown until the orchestrator SIGKILLed us after the stop grace).
+    // Stop maintenance first: an in-flight sweep must bail before the
+    // buffered-layer flush, or it outlives the Foyer cache and hangs shutdown.
     db.cancel_maintenance();
 
-    // Drain order matters:
-    // 0. Stop PGWire from accepting new connections. Without this, the
-    //    BufferedWriteLayer flush below races fresh inserts that pile back
-    //    into MemBuffer + WAL, defeating the whole point of a graceful
-    //    shutdown.
-    // 1. Flush and checkpoint the fenced buffered layer.
-    // 2. Shut down database (cache, foyer, log store).
-    // One shutdown budget shared by all serial phases (TIMEFUSION_STOP_GRACE_SECS,
-    // sized to fit the orchestrator's SIGTERM→SIGKILL grace). The drain phases
-    // get small caps so a hung connection can't starve the buffer flush +
-    // cursor snapshot — the phase that determines next-boot cost; their unused
-    // slack flows forward automatically because the buffered layer works off
-    // the same absolute deadline.
+    // Drain order: stop accepting connections, flush and checkpoint the fenced
+    // buffered layer, then shut down the database (cache, foyer, log store).
+    // All serial phases share one budget (TIMEFUSION_STOP_GRACE_SECS, sized to fit
+    // the orchestrator's SIGTERM→SIGKILL grace). The per-phase caps below keep a
+    // hung connection from starving the buffer flush + cursor snapshot; unused
+    // slack flows forward because every phase works off the same absolute deadline.
     let configured_grace = cfg.buffer.stop_grace();
-    // Only a layer that is STILL drained after the admission fence can use the
-    // constant-time handoff. At production ingest rates tens of thousands of
-    // rows can arrive during an online FLUSH, so a recent FLUSH marker alone is
-    // not evidence that replay is small. A post-FLUSH tail gets the normal
-    // correctness-first budget and is flushed after the fence.
+    // Only a layer STILL drained after the admission fence can use the fast
+    // handoff — a recent FLUSH marker alone is not evidence that replay is small,
+    // since rows keep arriving during an online FLUSH.
     let grace = if preflushed_handoff { configured_grace.min(Duration::from_secs(1)) } else { configured_grace };
     let deadline = tokio::time::Instant::now() + grace;
     pgwire_shutdown.cancel();
@@ -843,21 +722,18 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
     if let Err(e) = buffered_layer.shutdown_by(deadline).await {
         error!("Error during buffered layer shutdown: {}", e);
     }
-    // Share the same absolute `deadline` as the buffered-layer flush above so
-    // the whole serial shutdown fits one stop-grace budget — every phase that
-    // can block on a slow Delta/S3 backend (DML drain, foyer `close()`) is
-    // bounded by it, so process exit and `wal.lock` release stay inside the
-    // orchestrator's SIGTERM→SIGKILL window (issue #82).
+    // Shares the same absolute `deadline` as the flush above, so every phase that
+    // can block on a slow Delta/S3 backend is bounded and process exit (and the
+    // `wal.lock` release) stays inside the SIGTERM→SIGKILL window.
     if let Err(e) = db.shutdown_by(deadline).await {
         error!("Error during database shutdown: {}", e);
     }
 
     info!("Shutdown complete.");
-    // Do not synchronously flush OTLP here. Its exporter has a 10-second
-    // network timeout, and `_wal_dir_lock` must remain held until this future
-    // returns so no detached runtime work can overlap the replacement's WAL
-    // access. Losing the final telemetry batch is preferable to extending a
-    // planned database outage; normal batches are exported continuously.
+    // Do NOT synchronously flush OTLP here: its exporter has a 10s network
+    // timeout, and `_wal_dir_lock` is held until this future returns, so the
+    // replacement would wait that long for the WAL. Losing the final telemetry
+    // batch is cheaper than extending the outage.
 
     Ok(())
 }
@@ -865,14 +741,12 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
 /// Adds nullable columns to a live table's STORED Delta schema, without
 /// touching the YAML.
 ///
-/// A shipped table can't gain a column via YAML alone — the YAML and the
-/// Delta transaction log are two separate schemas, and a mismatch produces
-/// batch/field count errors and rejected INSERTs (see 7d68f01, and the doc
-/// block atop `schema_loader.rs`). Run this against prod first; only once
-/// every live table has the columns may the YAML declare them.
+/// The YAML and the Delta transaction log are two separate schemas, and a
+/// mismatch produces batch/field-count errors and rejected INSERTs. Run this
+/// against every live table FIRST; only then may the YAML declare the columns.
 ///
-/// Writes a ZERO-ROW batch at the widened schema (`SchemaMode::Merge`), so
-/// it's metadata-only and idempotent.
+/// Writes a ZERO-ROW batch at the widened schema (`SchemaMode::Merge`), so it is
+/// metadata-only and idempotent.
 ///
 ///   timefusion migrate-columns --table otel_logs_and_spans \
 ///       --add updated_at:timestamp --add deleted:boolean [--dry-run]
@@ -883,18 +757,15 @@ async fn run_migrate_columns_cli(cfg: &'static AppConfig) -> anyhow::Result<()> 
     let mut adds: Vec<(String, String)> = Vec::new();
     let mut dry_run = false;
     let mut it = Args::new();
-    while let Some(a) = it.next() {
-        match a.as_str() {
-            "--table" => table = it.value("--table")?,
-            "--dry-run" => dry_run = true,
-            "--add" => {
-                let spec = it.next().context("--add needs NAME:TYPE")?;
-                let (n, t) = spec.split_once(':').context("--add expects NAME:TYPE (timestamp|boolean|bigint|double|binary|text)")?;
-                adds.push((n.to_string(), t.to_string()));
-            }
-            other => anyhow::bail!("unknown argument: {other} (usage: timefusion migrate-columns --table T --add NAME:TYPE [--add ...] [--dry-run])"),
-        }
-    }
+    cli_args!(it, "usage: timefusion migrate-columns --table T --add NAME:TYPE [--add ...] [--dry-run]", {
+        "--table" => table = it.value("--table")?,
+        "--dry-run" => dry_run = true,
+        "--add" => {
+            let spec = it.next().context("--add needs NAME:TYPE")?;
+            let (n, t) = spec.split_once(':').context("--add expects NAME:TYPE (timestamp|boolean|bigint|double|binary|text)")?;
+            adds.push((n.to_string(), t.to_string()));
+        },
+    });
     anyhow::ensure!(!adds.is_empty(), "nothing to do: pass at least one --add NAME:TYPE");
 
     let db = Database::with_config(Arc::new(cfg.clone())).await?;
@@ -913,31 +784,22 @@ async fn run_migrate_columns_cli(cfg: &'static AppConfig) -> anyhow::Result<()> 
 
 /// Retention CLI (`timefusion retention --older-than-days N --table A,B [--dry-run] [--yes]`).
 ///
-/// Drops whole `date=` partitions older than the cutoff via the fork's
-/// PARTITION-ONLY delete: the predicate references only the `date` partition
-/// column, so the builder evaluates it against `partitionValues_parsed` and
-/// commits pure Remove actions — no data scan, no rewrite, no deletion
-/// vectors. Meant to run OFF-BOX against prod storage like `optimize`;
-/// commits OCC-retry against the live server safely.
+/// Drops whole `date=` partitions older than the cutoff with a PARTITION-ONLY
+/// delete: the predicate references only the `date` partition column, so the
+/// builder commits pure Remove actions — no data scan, rewrite, or deletion
+/// vectors. Safe to run off-box against live storage; commits OCC-retry.
 ///
 /// **Never route retention through pgwire `DELETE`**: on a `version_append`
-/// table that path APPENDS a full-row tombstone per deleted row — for a
-/// retention sweep that is billions of appended rows, the opposite of cleanup.
+/// table that path APPENDS a full-row tombstone per deleted row.
 ///
-/// **Scope: unified tables ONLY — bring-your-own-bucket projects are exempt
-/// from the 30-day promise and are structurally unreachable here.** Every
-/// table is resolved via `get_or_create_unified_table`, whose root is the
-/// default bucket/prefix; custom-storage projects live in their own Delta
-/// tables at their own bucket (`get_or_create_custom_table`) and this command
-/// never opens those. Keep it that way — a `--project` flag pointed at a
-/// custom table would silently break that contract.
+/// **Scope: unified tables ONLY.** Every table is resolved via
+/// `get_or_create_unified_table`; bring-your-own-bucket projects live in their
+/// own Delta tables and are deliberately unreachable here. Do not add a
+/// `--project` flag that could point at one.
 ///
-/// Physical bytes are reclaimed by the existing vacuum cron only after
-/// `timefusion_vacuum_retention_hours` (default 72 — a floor with a data-loss
-/// incident behind it; see the config doc). This command deliberately does NOT
-/// vacuum early: the delete makes the data invisible and unmaintained
-/// immediately, which is the part that matters, and the 72h window keeps one
-/// bad cutoff recoverable via time travel.
+/// Physical bytes are reclaimed by the vacuum cron only after
+/// `timefusion_vacuum_retention_hours`, which keeps a bad cutoff recoverable via
+/// time travel.
 async fn run_retention_cli(cfg: &'static AppConfig) -> anyhow::Result<()> {
     init_cli_tracing();
 
@@ -946,15 +808,12 @@ async fn run_retention_cli(cfg: &'static AppConfig) -> anyhow::Result<()> {
     let mut dry_run = false;
     let mut yes = false;
     let mut it = Args::new();
-    while let Some(a) = it.next() {
-        match a.as_str() {
-            "--table" => tables.extend(it.value("--table")?.split(',').map(str::to_owned)),
-            "--older-than-days" => older_than_days = Some(it.parse("--older-than-days", "an integer")?),
-            "--dry-run" => dry_run = true,
-            "--yes" => yes = true,
-            other => anyhow::bail!("unknown argument: {other} (usage: timefusion retention --older-than-days N --table A[,B,...] [--dry-run] [--yes])"),
-        }
-    }
+    cli_args!(it, "usage: timefusion retention --older-than-days N --table A[,B,...] [--dry-run] [--yes]", {
+        "--table" => tables.extend(it.value("--table")?.split(',').map(str::to_owned)),
+        "--older-than-days" => older_than_days = Some(it.parse("--older-than-days", "an integer")?),
+        "--dry-run" => dry_run = true,
+        "--yes" => yes = true,
+    });
     let days = older_than_days.context("--older-than-days is required")?;
     anyhow::ensure!(days >= 7, "refusing a cutoff under 7 days — that is not retention, that is data loss");
     anyhow::ensure!(!tables.is_empty(), "--table is required; retention never guesses at a table list");
@@ -964,7 +823,6 @@ async fn run_retention_cli(cfg: &'static AppConfig) -> anyhow::Result<()> {
     let db = Database::with_config(Arc::new(cfg.clone())).await?;
     println!("retention cutoff: {predicate}  (today - {days}d)\n");
 
-    // Inventory first, from the same snapshot the delete will run against.
     let mut plan: Vec<(String, usize, i64)> = Vec::new();
     for t in &tables {
         let table_ref = db.get_or_create_unified_table(t).await?;
@@ -993,7 +851,7 @@ async fn run_retention_cli(cfg: &'static AppConfig) -> anyhow::Result<()> {
             continue;
         }
         let table_ref = db.get_or_create_unified_table(t).await?;
-        // Snapshot clone, no lock across the commit — the same shape as DML.
+        // Snapshot clone: never hold the table lock across the commit.
         let table = { table_ref.read().await.clone() };
         let (new_table, metrics) = table.delete().with_predicate(predicate.as_str()).await.with_context(|| format!("retention delete on {t}"))?;
         anyhow::ensure!(
@@ -1010,9 +868,9 @@ async fn run_retention_cli(cfg: &'static AppConfig) -> anyhow::Result<()> {
 
 /// One-off compaction CLI (`timefusion optimize [...]`): compacts old `date=`
 /// partitions outside the scheduled 48h Z-order window via `Database::compact_date`
-/// per partition. Meant to run off-box against prod storage so it doesn't load
-/// the live server's memory; commits use the same S3/R2 conditional-put
-/// coordination as the live server, so concurrent commits OCC-retry safely.
+/// per partition. Meant to run off-box so it doesn't load the live server's
+/// memory; commits use the same conditional-put coordination, so concurrent
+/// commits OCC-retry safely.
 async fn run_optimize_cli(cfg: &'static AppConfig) -> anyhow::Result<()> {
     init_cli_tracing();
 
@@ -1028,41 +886,32 @@ async fn run_optimize_cli(cfg: &'static AppConfig) -> anyhow::Result<()> {
     let mut recompress = false;
     let mut target_size_mb: Option<i64> = None;
     let mut it = Args::new();
-    while let Some(a) = it.next() {
-        match a.as_str() {
-            "--table" => table = it.value("--table")?,
-            "--date" => only_date = Some(it.parse("--date", "YYYY-MM-DD")?),
-            "--older-than-hours" => older_than_hours = it.parse("--older-than-hours", "an integer")?,
-            "--all" => all = true,
-            "--dry-run" => dry_run = true,
-            "--project" => project = Some(it.value("--project")?),
-            "--concurrency" => concurrency = Some(it.parse("--concurrency", "an integer")?),
-            "--consolidate" => consolidate = true,
-            "--dedup" => dedup = true,
-            "--recompress" => recompress = true,
-            "--target-size-mb" => target_size_mb = Some(it.parse("--target-size-mb", "an integer")?),
-            other => anyhow::bail!(
-                "unknown argument: {other} (usage: timefusion optimize [--table T] [--date YYYY-MM-DD | --older-than-hours N | --all] [--project ID] [--concurrency N] [--consolidate [--target-size-mb N]] [--dedup] [--recompress] [--dry-run])"
-            ),
-        }
-    }
+    cli_args!(it, "usage: timefusion optimize [--table T] [--date YYYY-MM-DD | --older-than-hours N | --all] [--project ID] [--concurrency N] [--consolidate [--target-size-mb N]] [--dedup] [--recompress] [--dry-run]", {
+        "--table" => table = it.value("--table")?,
+        "--date" => only_date = Some(it.parse("--date", "YYYY-MM-DD")?),
+        "--older-than-hours" => older_than_hours = it.parse("--older-than-hours", "an integer")?,
+        "--all" => all = true,
+        "--dry-run" => dry_run = true,
+        "--project" => project = Some(it.value("--project")?),
+        "--concurrency" => concurrency = Some(it.parse("--concurrency", "an integer")?),
+        "--consolidate" => consolidate = true,
+        "--dedup" => dedup = true,
+        "--recompress" => recompress = true,
+        "--target-size-mb" => target_size_mb = Some(it.parse("--target-size-mb", "an integer")?),
+    });
     anyhow::ensure!(target_size_mb.is_none() || consolidate, "--target-size-mb only applies to --consolidate");
 
     let db = Database::with_config(Arc::new(cfg.clone())).await?;
-    // Attach the tantivy sidecar service exactly like the server bootstrap.
-    // Without it `tantivy_indexer()` is None, so the post-optimize reindex/GC
-    // hooks silently no-op: every CLI compaction orphans the rewritten files'
-    // index entries and leaves its outputs unindexed until a server backfill.
-    let db = match (cfg.tantivy.indexed_tables().is_empty(), cfg.aws.aws_s3_bucket.as_deref().unwrap_or_default()) {
-        (false, bucket) if !bucket.is_empty() => {
-            let obj_store = sidecar_store(&db, cfg, bucket, "tantivy").await?;
-            db.with_tantivy_indexer(Arc::new(timefusion::tantivy::search::TantivyIndexService::new(
-                obj_store,
-                Arc::new(cfg.tantivy.clone()),
-                cfg.core.timefusion_data_dir.clone(),
-            )))
-        }
-        _ => db,
+    // Attach the tantivy sidecar service as the server bootstrap does; without it
+    // the post-optimize reindex/GC hooks silently no-op and every CLI compaction
+    // orphans the rewritten files' index entries.
+    let bucket = cfg.aws.aws_s3_bucket.as_deref().unwrap_or_default();
+    let db = if !cfg.tantivy.indexed_tables().is_empty() && !bucket.is_empty() {
+        let obj_store = sidecar_store(&db, cfg, bucket, "tantivy").await?;
+        let svc = timefusion::tantivy::search::TantivyIndexService::new(obj_store, Arc::new(cfg.tantivy.clone()), cfg.core.timefusion_data_dir.clone());
+        db.with_tantivy_indexer(Arc::new(svc))
+    } else {
+        db
     };
     let table_ref = db.get_or_create_unified_table(&table).await?;
     println!("table prefix='{}' → {}", cfg.core.timefusion_table_prefix, table);
@@ -1080,7 +929,6 @@ async fn run_optimize_cli(cfg: &'static AppConfig) -> anyhow::Result<()> {
         (None, false) => format!("older than {older_than_hours}h"),
     } + &project.as_deref().map_or(String::new(), |p| format!(", project_id={p}"));
 
-    // --dry-run: list candidate partitions + file counts, mutate nothing.
     if dry_run {
         let uris: Vec<String> = timefusion::database::file_uris(&*table_ref.read().await);
         println!("DRY RUN — {} candidate partition(s) of '{}' ({}):", dates.len(), table, scope);
@@ -1098,19 +946,13 @@ async fn run_optimize_cli(cfg: &'static AppConfig) -> anyhow::Result<()> {
         return db.shutdown().await;
     }
 
-    // `--recompress` is the ONLY force-rewrite. Bin-packing (`Compact`/`SortBy`,
-    // and `consolidate`'s leveled variant) skips files already at target AND
-    // drops single-file bins, so a lone file can never be rewritten by them —
-    // which is exactly the shape of a partition poisoned by ONE file with no
-    // `sorting_columns` footer. On prod 2026-08-07 that was 448 of 501 poisoned
-    // partitions: `optimize` and `--consolidate` both reported success having
-    // changed nothing (`removed=0 added=0`, file bytes identical).
-    //
-    // `recompress_partition` rewrites the partition through `replace_where`
-    // with the schema ORDER BY, regardless of file count or size, so the output
-    // carries an honest sorted footer. `--project` narrows the overwrite
-    // predicate to `date = '...' AND project_id = '...'`, which is what makes
-    // the job small enough to run on an ordinary runner.
+    // `--recompress` is the ONLY force-rewrite. Bin-packing skips files already at
+    // target and drops single-file bins, so it can never fix a partition poisoned
+    // by ONE file with no `sorting_columns` footer — it reports success having
+    // changed nothing. `recompress_partition` rewrites through `replace_where`
+    // with the schema ORDER BY regardless of file count or size, so the output
+    // carries an honest sorted footer; `--project` narrows the overwrite
+    // predicate, which is what keeps the job small enough to run anywhere.
     if recompress {
         let level = cfg.parquet.timefusion_zstd_compression_level;
         let scope = project.as_deref().map_or(String::new(), |p| format!(" project={p}"));
@@ -1126,11 +968,9 @@ async fn run_optimize_cli(cfg: &'static AppConfig) -> anyhow::Result<()> {
     }
     println!("compacting {} partition(s) of '{}' ({})", dates.len(), table, scope);
     if consolidate || dedup {
-        // Leveled event-time-disjoint consolidation (the cold sweep's engine,
-        // pointed at any date/target) and/or a dedup pass, per project so a
-        // busy day's tens of GB never sit in one merge. Oldest event-time
-        // slices rewrite first; incremental per-run commits make an
-        // interrupted run resumable.
+        // Leveled event-time-disjoint consolidation and/or a dedup pass, run per
+        // project so a busy day's tens of GB never sit in one merge. Incremental
+        // per-run commits make an interrupted run resumable.
         const MAX_ATTEMPTS: u64 = 5;
         for d in &dates {
             let projects = match &project {
@@ -1141,8 +981,7 @@ async fn run_optimize_cli(cfg: &'static AppConfig) -> anyhow::Result<()> {
                 let target = target_size_mb.map_or(cfg.parquet.timefusion_cold_optimize_target_size, |mb| mb * 1024 * 1024);
                 for p in &projects {
                     println!("  consolidate date={d} project={p} target={}MB", target / (1024 * 1024));
-                    // Committed runs persist across attempts (excluded from
-                    // re-selection), so retrying after a transient S3/OCC error
+                    // Committed slices are excluded from re-selection, so a retry
                     // resumes at the next slice rather than restarting.
                     for attempt in 1..=MAX_ATTEMPTS {
                         match db.consolidate_date_binned(&table_ref, &table, *d, target, Some(p), usize::MAX).await {
@@ -1168,7 +1007,6 @@ async fn run_optimize_cli(cfg: &'static AppConfig) -> anyhow::Result<()> {
         reconcile_tantivy(&db, &table).await;
         return db.shutdown().await;
     }
-    // Effectful loop: each partition awaits a compaction and prints as it lands.
     let (mut tot_r, mut tot_a) = (0u64, 0u64);
     for d in &dates {
         match db.compact_date_concurrent(&table_ref, &table, *d, project.as_deref(), concurrency).await {
@@ -1228,11 +1066,9 @@ mod healthcheck_tests {
         pgwire_ready_at(one_response(response)).is_ok()
     }
 
-    /// The probe and the Dockerfile are one budget split across two files, and
-    /// the split is only correct in one direction: if Docker's `--timeout` is
-    /// below the probe's own worst case, Docker kills the probe before it can
-    /// report a verdict, and every slow-but-alive moment counts as a failure.
-    /// That is the prod 2026-08-08 shape — a HEALTHY task replaced mid-repair.
+    /// The probe and the Dockerfile are one budget split across two files: if
+    /// Docker's `--timeout` is below the probe's worst case, Docker kills the
+    /// probe before it can report, and every slow-but-alive moment reads as dead.
     #[test]
     fn probe_worst_case_fits_the_docker_timeout() {
         let line = include_str!("../Dockerfile").lines().find(|l| l.starts_with("HEALTHCHECK ")).expect("Dockerfile must declare a HEALTHCHECK");
@@ -1252,12 +1088,8 @@ mod healthcheck_tests {
         assert!(flag("--retries=") >= 5, "3 consecutive misses inside 15s is 'busy', not 'dead' (prod 2026-08-08)");
     }
 
-    /// Workers must not run on Tokio's default stack.
-    ///
-    /// A stack overflow in a worker aborts the process, so this is a restart
-    /// loop rather than a failed query — that is exactly how prod fell over on
-    /// 2026-08-16 while planning a merge-on-read UPDATE. The builder call is one
-    /// token to lose in a refactor and nothing else would notice, so pin it.
+    /// Workers must not run on Tokio's default stack: an overflow aborts the
+    /// process, so losing this builder call is a restart loop, not a failed query.
     #[test]
     fn workers_get_more_than_the_default_stack() {
         assert!(include_str!("main.rs").contains(".thread_stack_size(WORKER_STACK_BYTES)"), "the runtime must actually be built with WORKER_STACK_BYTES");

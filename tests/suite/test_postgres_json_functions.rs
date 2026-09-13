@@ -29,7 +29,7 @@ mod test_json_functions {
         r#"INSERT INTO test_table VALUES ('001', 'test_span', 1500, '{"status": "ok"}')"#,
     ];
 
-    // to_jsonb is registered as an alias of to_json — Postgres syntax used by monoscope queries.
+    // to_jsonb is registered as an alias of to_json.
     #[test_case(&[], "json_build_array('a', 'b', 'c')" => r#"["a","b","c"]"# ; "json_build_array")]
     #[test_case(&[], r#"to_json('{"hello": "world"}')"# => r#"{"hello":"world"}"# ; "to_json object")]
     #[test_case(&[], "to_json(123)" => "123" ; "to_json number")]
@@ -50,18 +50,14 @@ mod test_json_functions {
         assert_eq!(results.len(), 1);
         let column = results[0].column(0);
         let value = column.as_any().downcast_ref::<datafusion::arrow::array::Float64Array>().unwrap();
-        // The timestamp is interpreted as UTC
+        // The timestamp is interpreted as UTC.
         assert_eq!(value.value(0), 1754560800.0);
 
         Ok(())
     }
 
-    // Regression: task-jsonpath-pg-compat. Monoscope (src/Pkg/Parser/Expr.hs)
-    // emits Postgres SQL/JSON-path (`$[*] ? (@ == "x")`, dot-quoted members,
-    // `like_regex ... flag "i"`, `starts with`), which is NOT RFC 9535. The old
-    // serde_json_path engine couldn't parse it, so a log-pattern click returned
-    // an empty result set. We now use the sql-json-path crate (PG-parity parser)
-    // plus a TypePlanner that resolves the `::jsonpath` cast to Utf8.
+    // Paths here are Postgres SQL/JSON-path, NOT RFC 9535: dot-quoted members,
+    // `like_regex ... flag "i"`, `starts with`, and the `::jsonpath` cast.
     #[tokio::test]
     async fn test_jsonb_path_exists_pg_dialect() -> Result<()> {
         let ctx = session().await?;
@@ -71,48 +67,28 @@ mod test_json_functions {
             Ok(batch.column(0).as_any().downcast_ref::<datafusion::arrow::array::BooleanArray>().unwrap().value(0))
         }
 
-        // #1 array membership / log-pattern filter — the dominant case.
-        assert!(
-            eval(&ctx, r#"jsonb_path_exists(json_to_variant('["pat:ed6bf5b6","other"]'), '$[*] ? (@ == "pat:ed6bf5b6")')"#).await?,
-            "present value must match"
-        );
-        assert!(!eval(&ctx, r#"jsonb_path_exists(json_to_variant('["other"]'), '$[*] ? (@ == "pat:ed6bf5b6")')"#).await?, "absent value must not match");
-        // #2 nested-field equality with a dot-quoted member on a JSON array.
-        assert!(
-            eval(&ctx, r#"jsonb_path_exists(json_to_variant('[{"error_type":"boom"}]'), '$[*]."error_type" ? (@ == "boom")')"#).await?,
-            "nested dot-quoted member equality must match"
-        );
-        // #3 like_regex + flag "i" — monoscope always appends `flag "i"`; RFC 9535 has no regex.
-        assert!(
-            eval(&ctx, r#"jsonb_path_exists(json_to_variant('{"msg":"ABCdef"}'), '$."msg" ? (@ like_regex "^abc.*" flag "i")')"#).await?,
-            "case-insensitive like_regex must match"
-        );
-        // #4 `starts with` operator.
-        assert!(
-            eval(&ctx, r#"jsonb_path_exists(json_to_variant('[{"path":"/api/x"}]'), '$[*]."path" ? (@ starts with "/api")')"#).await?,
-            "starts with must match"
-        );
-        // #5 the `::jsonpath` cast (TypePlanner → Utf8). This is what monoscope actually
-        // sends over the wire; SqlToRel would otherwise reject the unknown SQL type.
-        assert!(
-            eval(&ctx, r#"jsonb_path_exists(json_to_variant('["pat:ed6bf5b6"]'), '$[*] ? (@ == "pat:ed6bf5b6")'::jsonpath)"#).await?,
-            "::jsonpath cast must plan and match"
-        );
-        // #6 NULL input row → SQL NULL, not false. The simple-path fast lane must gate
-        // on the input's null buffer (regression: code-review found it returned false).
+        for (predicate, want) in [
+            // array membership
+            (r#"jsonb_path_exists(json_to_variant('["pat:ed6bf5b6","other"]'), '$[*] ? (@ == "pat:ed6bf5b6")')"#, true),
+            (r#"jsonb_path_exists(json_to_variant('["other"]'), '$[*] ? (@ == "pat:ed6bf5b6")')"#, false),
+            // dot-quoted member
+            (r#"jsonb_path_exists(json_to_variant('[{"error_type":"boom"}]'), '$[*]."error_type" ? (@ == "boom")')"#, true),
+            // like_regex + flag "i"
+            (r#"jsonb_path_exists(json_to_variant('{"msg":"ABCdef"}'), '$."msg" ? (@ like_regex "^abc.*" flag "i")')"#, true),
+            // `starts with`
+            (r#"jsonb_path_exists(json_to_variant('[{"path":"/api/x"}]'), '$[*]."path" ? (@ starts with "/api")')"#, true),
+            // `::jsonpath` cast — SqlToRel rejects the unknown SQL type without the TypePlanner.
+            (r#"jsonb_path_exists(json_to_variant('["pat:ed6bf5b6"]'), '$[*] ? (@ == "pat:ed6bf5b6")'::jsonpath)"#, true),
+        ] {
+            assert_eq!(eval(&ctx, predicate).await?, want, "expected {want} from: {predicate}");
+        }
+        // NULL input → SQL NULL, not false (the simple-path fast lane must honour the null buffer).
         let batch = &ctx.sql(r#"SELECT jsonb_path_exists(json_to_variant(NULL), '$.a') AS r"#).await?.collect().await?[0];
         assert!(batch.column(0).is_null(0), "NULL variant input must yield NULL, not false");
 
         Ok(())
     }
 
-    // Regression: the RUM dashboard widgets rendered error overlays with
-    // "Error during planning: Invalid function 'jsonb_path_query_first'".
-    // Monoscope's KQL compiler (shared/src/Pkg/Parser/Expr.hs,
-    // `transformFlattenedAttribute`) emits this for EVERY `attributes.exception.*`
-    // field, because an OTel SDK may carry the exception as a span event rather
-    // than a flattened attribute, so it COALESCEs both sources. Anything
-    // exception-related — log explorer, monitors, dashboards — failed to plan.
     #[tokio::test]
     async fn test_jsonb_path_query_first_returns_the_matched_value() -> Result<()> {
         let ctx = session().await?;
@@ -123,12 +99,10 @@ mod test_json_functions {
             Ok((!col.is_null(0)).then(|| get_str(col.as_ref(), 0).to_string()))
         }
 
-        // The exact span-event shape monoscope reads, and the exact path it emits.
         const EVENTS: &str = r#"[{"event_name":"exception","event_attributes":{"exception":{"type":"TypeError","message":"Cannot read cart"}}}]"#;
         let path = r#"'$[*] ? (@.event_name == "exception").event_attributes.exception.type'"#;
 
-        // `#>> '{}'` is the whole document as TEXT: the JSON string must be unwrapped.
-        // `TypeError`, never `"TypeError"` — a widget showing the quotes is still broken.
+        // `#>> '{}'` is the whole document as TEXT, so the JSON string is unwrapped.
         assert_eq!(
             text(&ctx, &format!(r#"jsonb_path_query_first(json_to_variant('{EVENTS}'), {path}) #>> '{{}}'"#)).await?,
             Some("TypeError".to_string()),
@@ -146,8 +120,7 @@ mod test_json_functions {
             Some("\"TypeError\"".to_string()),
             "bare jsonb_path_query_first returns jsonb, which for a string leaf is quoted"
         );
-        // No match, NULL input, and non-exception events all mean NULL, never an error:
-        // a span without an exception is the common case, not a failure.
+        // No match, NULL input and non-exception events all mean NULL, never an error.
         for (label, expr) in [
             ("no exception event", format!(r#"jsonb_path_query_first(json_to_variant('[{{"event_name":"log"}}]'), {path})"#)),
             ("empty array", format!(r#"jsonb_path_query_first(json_to_variant('[]'), {path})"#)),
@@ -155,7 +128,7 @@ mod test_json_functions {
         ] {
             assert_eq!(text(&ctx, &expr).await?, None, "{label} must be NULL");
         }
-        // First match wins, as the name promises.
+        // First match wins.
         let two = r#"[{"event_name":"exception","event_attributes":{"exception":{"type":"First"}}},{"event_name":"exception","event_attributes":{"exception":{"type":"Second"}}}]"#;
         assert_eq!(
             text(&ctx, &format!(r#"jsonb_path_query_first(json_to_variant('{two}'), {path}) #>> '{{}}'"#)).await?,
@@ -163,17 +136,14 @@ mod test_json_functions {
             "with several exception events the FIRST must win"
         );
 
-        // The full COALESCE monoscope actually emits: the flattened column wins when
-        // present, and the span event is the fallback when it is NULL.
+        // COALESCE: the flattened column wins, the span event is the fallback when it is NULL.
         assert_eq!(
             text(&ctx, &format!(r#"COALESCE(CAST(NULL AS VARCHAR), jsonb_path_query_first(json_to_variant('{EVENTS}'), {path}) #>> '{{}}')"#)).await?,
             Some("TypeError".to_string()),
             "the COALESCE fallback must reach the span event when the flattened column is NULL"
         );
 
-        // The verbatim widget SQL from the production log, which is what actually
-        // rendered the error overlay. Planning is the assertion: it died at
-        // "Invalid function 'jsonb_path_query_first'" before reaching execution.
+        // Real dashboard-widget SQL; planning successfully IS the assertion.
         for sql in [
             r#"SELECT distinct_count(approx_count_distinct(attributes___session___id))::float AS dcount_attributes_session_id FROM otel_logs_and_spans WHERE project_id='00000000-0000-0000-0000-000000000000' and timestamp BETWEEN '2026-08-30T12:58:53.348826Z' AND '2026-08-30T13:58:53.348826Z' and ((resource___telemetry___sdk___language = 'webjs' AND attributes___session___id IS NOT NULL AND (status_code = 'ERROR' OR COALESCE(attributes___exception___type, (jsonb_path_query_first(events, '$[*] ? (@.event_name == "exception").event_attributes.exception.type') #>> '{}')) IS NOT NULL) AND ('' = '' OR resource___service___name = '')))"#,
             r#"SELECT distinct_count(approx_count_distinct(attributes___user___id))::float AS dcount_attributes_user_id FROM otel_logs_and_spans WHERE project_id='00000000-0000-0000-0000-000000000000' and timestamp BETWEEN '2026-08-30T12:58:53.403066Z' AND '2026-08-30T13:58:53.403066Z' and ((resource___telemetry___sdk___language = 'webjs' AND attributes___user___id IS NOT NULL AND (status_code = 'ERROR' OR COALESCE(attributes___exception___type, (jsonb_path_query_first(events, '$[*] ? (@.event_name == "exception").event_attributes.exception.type') #>> '{}')) IS NOT NULL) AND ('' = '' OR resource___service___name = '')))"#,

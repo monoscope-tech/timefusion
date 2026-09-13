@@ -1,11 +1,5 @@
-//! Microbenchmark: concurrent insert+query against MemBuffer in-process.
-//!
-//! Bypasses TF startup, pgwire, MinIO. Iterates an order of magnitude faster
-//! than `bench/concurrent_load.py`. Use to find the contention point in
-//! MemBuffer itself before paying release-build time.
-//!
-//! Run: `cargo test --release --test membuffer_concurrency_bench -- --nocapture`
-//! Or for fast iteration: `cargo test --test membuffer_concurrency_bench -- --nocapture`
+//! Microbenchmarks: concurrent insert+query against MemBuffer in-process,
+//! bypassing TF startup, pgwire and MinIO. Use a release build for real numbers.
 
 use std::{
     sync::{
@@ -51,15 +45,9 @@ fn batch(schema: Arc<Schema>, base_ts: i64, n: usize) -> RecordBatch {
     .unwrap()
 }
 
-/// Ingest-dedup overhead bench: dedup-on vs dedup-off arms, ALTERNATED
-/// (A/B/A/B…, so both see the same machine state), against an index PRELOADED
-/// with ~20M entries — an empty DashMap is artificially fast. The on-arm runs
-/// the exact production probe (`ingest_dedup_filter_batch`) on realistic otel
-/// batches before each MemBuffer insert; incoming keys are fresh, so it
-/// exercises the steady-state stage-1 path (~0% key hits), like prod. Also
-/// prices the key-hit (stage-2) path and the flush-time populate separately.
-///
-/// Run: `BENCH_DURATION=3 cargo nextest run --release ingest_dedup_insert_overhead_bench --run-ignored all --no-capture`
+/// Prices ingest-dedup: dedup-on vs dedup-off arms alternated (A/B/A/B…) so both
+/// see the same machine state, against a preloaded index — an empty DashMap is
+/// artificially fast. Also prices the key-hit (stage-2) path and flush-time populate.
 #[test]
 #[ignore = "microbench: opt-in via --run-ignored; use a release build for real numbers"]
 fn ingest_dedup_insert_overhead_bench() {
@@ -71,8 +59,7 @@ fn ingest_dedup_insert_overhead_bench() {
     let batch_rows: usize = 128;
     let table = "otel_logs_and_spans";
 
-    // Realistic otel batches (the real ~90-column schema), distinct ids per
-    // batch so probe keys are fresh — the steady state.
+    // Distinct ids per batch so probe keys are fresh — the steady state.
     let now_micros = now_micros();
     let mk_batch = |tag: &str, b: usize| {
         timefusion::write::mem_buffer::compact_batch(
@@ -100,8 +87,7 @@ fn ingest_dedup_insert_overhead_bench() {
     println!("\n=== ingest-dedup overhead bench ===");
     println!("preloaded {preload} index entries in {:?}; writers={writers} slices={slices}x{slice_s}s batch={batch_rows} rows", t0.elapsed());
 
-    // Alternated arms over a fresh MemBuffer per slice (so neither arm inherits
-    // the other's bucket growth). Writers record PER-INSERT latency.
+    // Fresh MemBuffer per slice so neither arm inherits the other's bucket growth.
     let mut arm_lat: [Vec<u64>; 2] = [Vec::new(), Vec::new()];
     let mut arm_inserts: [u64; 2] = [0, 0];
     let mut arm_secs: [f64; 2] = [0.0, 0.0];
@@ -164,8 +150,7 @@ fn ingest_dedup_insert_overhead_bench() {
         (on_p50.saturating_sub(off_p50)) as f64 / batch_rows as f64
     );
 
-    // Stage-2 (key-hit) path: batches whose keys ARE in the index with
-    // different content — worst-case version traffic (100% key hits).
+    // Stage-2 worst case: keys already in the index with different content.
     let hit_pool: Vec<_> = (0..8).map(|b| mk_batch("hit", b)).collect();
     for b in &hit_pool {
         for (k, _) in per_row_identities(b, &key_idxs, &content_idxs).unwrap() {
@@ -180,18 +165,14 @@ fn ingest_dedup_insert_overhead_bench() {
     }
     println!("stage-2 path (100% key hits, worst case): {:.0}ns/row", t.elapsed().as_nanos() as f64 / (reps * batch_rows) as f64);
 
-    // Flush-time populate cost (off the ack path): full two-hash identity.
+    // Flush-time populate cost (off the ack path).
     let t = Instant::now();
     for i in 0..reps {
         let _ = per_row_identities(&pool[i % pool.len()], &key_idxs, &content_idxs).unwrap();
     }
     println!("populate identity (flush-time, off ack path): {:.0}ns/row", t.elapsed().as_nanos() as f64 / (reps * batch_rows) as f64);
 
-    // REAL-PATH context: the production insert includes a WAL append with
-    // fsync-per-append (`sync_each`, prod default) — the microbench above
-    // deliberately excludes it. Measure the full `layer.insert` per-row cost
-    // (probe included; it is always-on) so the probe's share of the real ack
-    // path can be stated, not guessed.
+    // Real ack path, including the WAL fsync the microbench above excludes.
     let cfg = timefusion::support::test_helpers::TestConfigBuilder::new("dedup_bench").build();
     let layer = Arc::new(timefusion::support::test_helpers::test_layer(cfg).unwrap());
     let rt = tokio::runtime::Runtime::new().unwrap();
@@ -240,65 +221,59 @@ fn concurrent_insert_query_bench() {
     let now_micros = now_micros();
 
     let inserts = Arc::new(AtomicU64::new(0));
-    let mut writer_handles = vec![];
-    for p in 0..projects {
-        let buf = buf.clone();
-        let stop = stop.clone();
-        let schema = schema.clone();
-        let inserts = inserts.clone();
-        let pid = format!("proj-{p:04}");
-        let per_batch_sleep = if writer_rate > 0.0 { Duration::from_secs_f64(batch_size as f64 / writer_rate) } else { Duration::ZERO };
-        writer_handles.push(std::thread::spawn(move || {
-            let mut next = Instant::now();
-            let mut i: i64 = 0;
-            while !stop.load(Ordering::Relaxed) {
-                let ts = now_micros + i * 1_000;
-                let b = batch(schema.clone(), ts, batch_size);
-                buf.insert(&pid, "otel", b, ts).unwrap();
-                inserts.fetch_add(batch_size as u64, Ordering::Relaxed);
-                i += 1;
-                if per_batch_sleep > Duration::ZERO {
-                    next += per_batch_sleep;
-                    let now = Instant::now();
-                    if next > now {
-                        std::thread::sleep(next - now);
-                    } else {
-                        next = now;
+    let per_batch_sleep = if writer_rate > 0.0 { Duration::from_secs_f64(batch_size as f64 / writer_rate) } else { Duration::ZERO };
+    let writer_handles: Vec<_> = (0..projects)
+        .map(|p| {
+            let (buf, stop, schema, inserts) = (buf.clone(), stop.clone(), schema.clone(), inserts.clone());
+            let pid = format!("proj-{p:04}");
+            std::thread::spawn(move || {
+                let mut next = Instant::now();
+                let mut i: i64 = 0;
+                while !stop.load(Ordering::Relaxed) {
+                    let ts = now_micros + i * 1_000;
+                    let b = batch(schema.clone(), ts, batch_size);
+                    buf.insert(&pid, "otel", b, ts).unwrap();
+                    inserts.fetch_add(batch_size as u64, Ordering::Relaxed);
+                    i += 1;
+                    if per_batch_sleep > Duration::ZERO {
+                        next += per_batch_sleep;
+                        let now = Instant::now();
+                        if next > now {
+                            std::thread::sleep(next - now);
+                        } else {
+                            next = now;
+                        }
                     }
                 }
-            }
-        }));
-    }
+            })
+        })
+        .collect();
 
     let lat = Arc::new(parking_lot::Mutex::new(Vec::<u64>::with_capacity(1_000_000)));
-    let mut reader_handles = vec![];
-    for r in 0..readers {
-        let buf = buf.clone();
-        let stop = stop.clone();
-        let lat = lat.clone();
-        reader_handles.push(std::thread::spawn(move || {
-            let mut local: Vec<u64> = Vec::with_capacity(50_000);
-            let mut rng_state: u64 = (r as u64).wrapping_mul(0x9E3779B97F4A7C15);
-            while !stop.load(Ordering::Relaxed) {
-                rng_state ^= rng_state << 13;
-                rng_state ^= rng_state >> 7;
-                rng_state ^= rng_state << 17;
-                let pid_idx = (rng_state as usize) % projects;
-                let pid = format!("proj-{pid_idx:04}");
-                let t0 = Instant::now();
-                let _ = buf.query(&pid, "otel", &[]).unwrap();
-                local.push(t0.elapsed().as_micros() as u64);
-            }
-            lat.lock().extend(local);
-        }));
-    }
+    let reader_handles: Vec<_> = (0..readers)
+        .map(|r| {
+            let (buf, stop, lat) = (buf.clone(), stop.clone(), lat.clone());
+            std::thread::spawn(move || {
+                let mut local: Vec<u64> = Vec::with_capacity(50_000);
+                let mut rng_state: u64 = (r as u64).wrapping_mul(0x9E3779B97F4A7C15);
+                while !stop.load(Ordering::Relaxed) {
+                    rng_state ^= rng_state << 13;
+                    rng_state ^= rng_state >> 7;
+                    rng_state ^= rng_state << 17;
+                    let pid_idx = (rng_state as usize) % projects;
+                    let pid = format!("proj-{pid_idx:04}");
+                    let t0 = Instant::now();
+                    let _ = buf.query(&pid, "otel", &[]).unwrap();
+                    local.push(t0.elapsed().as_micros() as u64);
+                }
+                lat.lock().extend(local);
+            })
+        })
+        .collect();
 
     std::thread::sleep(Duration::from_secs(duration_s));
     stop.store(true, Ordering::Relaxed);
-    for h in writer_handles {
-        h.join().unwrap();
-    }
-    for h in reader_handles {
+    for h in writer_handles.into_iter().chain(reader_handles) {
         h.join().unwrap();
     }
 

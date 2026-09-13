@@ -1,10 +1,5 @@
-//! Bulk-write alias. `INSERT INTO otel_logs_and_spans__bulk ...` must commit
-//! straight to Delta (`skip_queue=true`), bypassing the BufferedWriteLayer
-//! (WAL + MemBuffer), while the same rows stay queryable from the real table.
-//! This backs the DLQ-drain / backfill path that must not pressure the live
-//! MemBuffer. The session context is shared across connections, so a dedicated
-//! table name (not a per-connection GUC) is how a client opts into the direct
-//! path.
+//! Bulk-write alias: `INSERT INTO <table>__bulk` commits straight to Delta,
+//! bypassing the BufferedWriteLayer, while staying queryable from the real table.
 
 use super::harness::{E2eEnv, FROZEN_START_MICROS, insert_at};
 

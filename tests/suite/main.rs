@@ -1,12 +1,5 @@
-//! Single integration-test binary.
-//!
-//! Every `tests/suite/*.rs` file is a module here rather than its own Cargo
-//! target. Each extra target is a separate full link of a ~100 MB binary
-//! against 1200+ deps, so 26 targets cost 26 links on every source edit —
-//! the dominant term in the edit→test loop. One target links once.
-//!
-//! Run everything: `cargo nextest run`. Run one file: `cargo nextest run
-//! -E 'binary(suite)' <substring>`, e.g. `cargo nextest run dedup_compaction`.
+//! Single integration-test binary: every `tests/suite/*.rs` file is a module
+//! here rather than its own Cargo target, so the large binary links once.
 
 mod bloom_prune_test;
 mod buffer_consistency_test;
@@ -23,6 +16,7 @@ mod membuffer_concurrency_bench;
 mod merge_date_prune_test;
 mod pg_client_compat;
 mod pgwire_dml_tag_test;
+mod pgwire_harness;
 mod plan_cache_shape_repro;
 mod proptest_invariants;
 mod query_pool_insert_test;

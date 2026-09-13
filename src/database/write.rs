@@ -5,21 +5,18 @@ use super::*;
 /// Shared OCC retry budget for the staged single-unit and coalesced commit loops.
 const MAX_COMMIT_RETRIES: u32 = 5;
 
-/// How many top memory-pool consumers to name when a pool is exhausted
-/// (shared by the query and maintenance-family pool builders).
+/// How many top memory-pool consumers to name when a pool is exhausted.
 const TOP_POOL_CONSUMERS: std::num::NonZeroUsize = std::num::NonZeroUsize::new(5).unwrap();
 
-/// Acquire a per-table commit lock with FLUSH PRIORITY: a [`flush_waiter`] is
-/// registered across the WAIT only. Waves stand down while the count is nonzero
-/// (see `flush_waiter_counts`), so it must fall the moment the lock is held —
-/// or the moment a watchdog cancels this future.
+/// Acquire a per-table commit lock with flush priority: a [`flush_waiter`] is
+/// registered across the WAIT only. Maintenance waves stand down while the count
+/// is nonzero, so it must fall the moment the lock is held or the future is cancelled.
 async fn lock_with_flush_priority<'a>(lock: &'a tokio::sync::Mutex<()>, waiters: &Arc<std::sync::atomic::AtomicUsize>) -> tokio::sync::MutexGuard<'a, ()> {
     let _waiting = flush_waiter(waiters);
     lock.lock().await
 }
 
-/// Spawn detached post-commit work that a maintenance shutdown cancels — it is
-/// all best-effort, so dropping it mid-flight on shutdown is correct.
+/// Spawn detached best-effort post-commit work that a maintenance shutdown cancels.
 fn spawn_until_shutdown(shutdown: Arc<CancellationToken>, work: impl std::future::Future<Output = ()> + Send + 'static) {
     tokio::spawn(async move {
         tokio::select! {
@@ -29,21 +26,19 @@ fn spawn_until_shutdown(shutdown: Arc<CancellationToken>, work: impl std::future
     });
 }
 
-/// Which path is driving [`Database::commit_staged_group`] — everything the
-/// per-project and coalesced staged commits do differently, in one value.
+/// Which path is driving [`Database::commit_staged_group`].
 #[derive(Clone, Copy)]
 enum StagedCommitKind {
     /// One project's unit. `warm` is the caller's `watermark.is_some()`: only
-    /// the BufferedWriteLayer flush path warms the cache (see
-    /// [`Database::record_committed_write`]).
+    /// the BufferedWriteLayer flush path warms the cache.
     Flush { warm: bool },
     /// One physical table's coalesced group — always a flush, always warms.
     Coalesced,
 }
 
 impl StagedCommitKind {
-    /// `(refresh, commit)` labels for the commit-lock timeout metric — they are
-    /// documented per-value in `observability.rs`, so they are not cosmetic.
+    /// `(refresh, commit)` labels for the commit-lock timeout metric; they must
+    /// match the values documented in `observability.rs`.
     fn ops(self) -> (&'static str, &'static str) {
         match self {
             Self::Flush { .. } => ("flush_refresh", "flush_commit"),
@@ -74,23 +69,19 @@ struct StagedCommit<'a> {
 }
 
 impl Database {
-    /// Directory holding locally persisted Delta snapshots (see `snapshot_cache`).
+    /// Directory holding locally persisted Delta snapshots.
     pub(crate) fn delta_snapshot_dir(cfg: &AppConfig) -> PathBuf {
         crate::write::wal::meta_path(&cfg.core.timefusion_data_dir, "delta_snapshots")
     }
 
-    /// Whether snapshot refreshes may take the incremental catch-up fast path
-    /// (see [`refresh_table_snapshot`]) — exposed for the DML path in dml.rs.
+    /// Whether snapshot refreshes may take the incremental catch-up fast path.
     pub(crate) fn incremental_snapshot(&self) -> bool {
         self.config.maintenance.timefusion_incremental_snapshot
     }
 
-    /// Let the post-commit hook advance the snapshot incrementally — carry the
-    /// materialized file list forward, append the committed files, drop any
-    /// removed ones — instead of re-materializing the whole active set. Safe for
-    /// the staged (pure-append) and schema-evolution merge paths alike: the hook
-    /// rebuilds the kernel snapshot from the log, so a MetaData/schema change IS
-    /// applied; only the file-list re-materialize is skipped.
+    /// Let the post-commit hook advance the snapshot incrementally instead of
+    /// re-materializing the whole active file set. The hook still rebuilds the
+    /// kernel snapshot from the log, so schema changes are applied either way.
     fn with_incremental_advance(&self, properties: CommitProperties) -> CommitProperties {
         match self.incremental_snapshot() {
             true => properties.with_incremental_advance(true),
@@ -109,75 +100,58 @@ impl Database {
                     crate::config::MemoryPoolKind::FairSpill => Arc::new(TrackConsumersPool::new(FairSpillPool::new(pool_size), TOP_POOL_CONSUMERS)),
                 };
                 let meta_cache_bytes = self.config.cache.timefusion_df_metadata_cache_mb * 1024 * 1024;
-                // Queries spill to the data volume like maintenance does. Without
-                // this the DiskManager defaults to `std::env::temp_dir()` — `/tmp`
-                // on the container's overlay2 layer — unbounded by our config and
-                // invisible to the spill knobs. See `timefusion_query_spill_max_gb`.
-                let spill_dir = self.config.core.timefusion_data_dir.join("query_spill");
-                let _ = std::fs::create_dir_all(&spill_dir);
-                reap_orphaned_spill_dirs(&spill_dir);
-                let disk = spill_disk_builder(spill_dir, self.config.maintenance.timefusion_query_spill_max_gb);
+                // Spill to the data volume: the DiskManager otherwise defaults to
+                // `std::env::temp_dir()`, unbounded by our config.
+                let disk = self.spill_disk("query_spill", self.config.maintenance.timefusion_query_spill_max_gb);
                 Arc::new(build_query_runtime_env(pool, meta_cache_bytes, disk))
             })
             .clone()
     }
 
+    /// Create `subdir` under the data volume, reap dirs orphaned by a previous
+    /// process, then cap it — the ceiling must never be left to DataFusion's
+    /// 100 GB default (see [`spill_disk_builder`]).
+    fn spill_disk(&self, subdir: &str, max_gb: u64) -> datafusion::execution::disk_manager::DiskManagerBuilder {
+        let dir = self.config.core.timefusion_data_dir.join(subdir);
+        let _ = std::fs::create_dir_all(&dir);
+        reap_orphaned_spill_dirs(&dir);
+        spill_disk_builder(dir, max_gb)
+    }
+
     /// Dedicated `RuntimeEnv` for maintenance jobs (optimize/dedup/recompress).
     ///
-    /// Uses a FairSpill pool so each consumer can reserve its floor and spill, rather than being
-    /// starved by queries on a Greedy pool. Spills land on an explicit on-disk directory under the
-    /// data volume, not a RAM-backed `/tmp`. The bounded pool fails as error rather than OOM-killing,
-    /// and is sized from the budget left over the query pool.
+    /// FairSpill so each consumer can reserve its floor and spill rather than being starved;
+    /// spills land under the data volume, and the bounded pool errors instead of OOM-killing.
     fn build_spill_runtime_env(&self, pool_size: usize, spill_subdir: &str) -> Arc<datafusion::execution::runtime_env::RuntimeEnv> {
         use datafusion::execution::{
             memory_pool::{FairSpillPool, TrackConsumersPool},
             runtime_env::RuntimeEnvBuilder,
         };
-        let spill_dir = self.config.core.timefusion_data_dir.join(spill_subdir);
-        let _ = std::fs::create_dir_all(&spill_dir);
-        reap_orphaned_spill_dirs(&spill_dir);
-        let disk = spill_disk_builder(spill_dir, self.config.maintenance.timefusion_maintenance_spill_max_gb);
+        let disk = self.spill_disk(spill_subdir, self.config.maintenance.timefusion_maintenance_spill_max_gb);
         let pool = Arc::new(TrackConsumersPool::new(FairSpillPool::new(pool_size), TOP_POOL_CONSUMERS));
         Arc::new(RuntimeEnvBuilder::new().with_memory_pool(pool).with_disk_manager_builder(disk).build().expect("build maintenance runtime env"))
     }
 
-    /// Light-optimize slice of the maintenance budget.
-    ///
-    /// Deferred to `light_share_bytes` (not recomputed here) — a local formula
-    /// previously duplicated it by coincidence and drifted when the heavy share moved.
+    /// Light-optimize slice of the maintenance budget. Deferred to the budget
+    /// tree — never recompute a share locally, it drifts when the tree moves.
     pub(crate) fn light_optimize_pool_bytes(&self) -> usize {
         self.config.derived.light_share_bytes()
     }
 
-    /// Packing's dedicated slice of the light pool so repair cannot starve it.
-    ///
-    /// The two passes used to share one pool and `light_optimize_brake` stopped packing while
-    /// any repair bin was in flight. With a 8640s repair budget on a 3600s period, packing
-    /// effectively never ran. An even split covers both sides' measured demand: packing needs
-    /// ~4.5 GB plus sort reservations for 3 bins; repair needs up to its unspillable merge
-    /// reservation ladder. Repair spills either way; the alternative was packing getting nothing
-    /// at all.
+    /// Packing's dedicated slice of the light pool, disjoint from repair's so
+    /// an in-flight repair bin cannot starve packing entirely.
     pub(crate) fn pack_pool_bytes(&self) -> usize {
         (self.light_optimize_pool_bytes() / 2).max(1)
     }
 
-    /// Repair's slice: the light share minus packing's reservation. Still far
-    /// above the unspillable `REPAIR_SORT_PARTITIONS * REPAIR_SORT_RESERVATION_BYTES`
-    /// merge share, and the partition ladder handles the rest. A repair sort
-    /// peaked 14.3 GB of a 15.4 GB pool, but that is a spilling sort taking what
-    /// it is offered, not what it needs — it spills either way.
+    /// Repair's slice: the light share minus packing's reservation.
     pub(crate) fn repair_pool_bytes(&self) -> usize {
         self.light_optimize_pool_bytes() - self.pack_pool_bytes()
     }
 
-    /// Heavy maintenance (dedup, recompress, Z-order).
-    ///
-    /// Deferred to the budget tree rather than derived as "the pool minus
-    /// light". That residual form silently ABSORBED any share the tree carved
-    /// off for someone else: adding the coordinator's slice left heavy holding
-    /// it too, so coordinator + heavy + light came to 24 GiB of a 16 GiB pool.
-    /// A residual definition cannot stay correct across a change to the tree,
-    /// which is the same lesson `light_optimize_pool_bytes` already records.
+    /// Heavy maintenance (dedup, recompress, Z-order). Deferred to the budget
+    /// tree, not derived as "pool minus light": a residual definition silently
+    /// absorbs any share the tree carves off for another consumer.
     pub(crate) fn heavy_pool_bytes(&self) -> usize {
         self.config.derived.heavy_share_bytes()
     }
@@ -186,12 +160,12 @@ impl Database {
         self.maintenance_runtime_env.get_or_init(|| self.build_spill_runtime_env(self.heavy_pool_bytes(), "maintenance_spill")).clone()
     }
 
-    /// Hot-tail PACKING: the reserved slice (see field doc).
+    /// Hot-tail packing env, on packing's reserved slice.
     pub(crate) fn light_optimize_runtime_env(&self) -> Arc<datafusion::execution::runtime_env::RuntimeEnv> {
         self.light_optimize_runtime_env.get_or_init(|| self.build_spill_runtime_env(self.pack_pool_bytes(), "light_optimize_spill")).clone()
     }
 
-    /// Footer REPAIR: its own pool, disjoint from packing's (see `pack_pool_bytes`).
+    /// Footer repair env, on its own pool disjoint from packing's.
     pub(crate) fn repair_runtime_env(&self) -> Arc<datafusion::execution::runtime_env::RuntimeEnv> {
         self.repair_runtime_env.get_or_init(|| self.build_spill_runtime_env(self.repair_pool_bytes(), "repair_spill")).clone()
     }
@@ -202,11 +176,10 @@ impl Database {
 
     /// Sort one flush group, picking the strategy by size.
     ///
-    /// Below `timefusion_sort_skip_bytes` the in-process sort wins on latency. Above it, use the
-    /// pooled+spilling DataFusion sort instead of skipping: a skipped sort writes a file with no
-    /// `sorting_columns` footer, and one such file disables the reader's all-or-nothing ordering for
-    /// every scan touching the partition. Spilling is the better failure mode. `fallback` decides
-    /// what happens when even that fails; see [`UnsortedFallback`].
+    /// Below `timefusion_sort_skip_bytes` the in-process sort wins on latency; above it the
+    /// pooled+spilling DataFusion sort is used rather than skipping, because one file without a
+    /// `sorting_columns` footer disables the reader's all-or-nothing ordering for the whole
+    /// partition. `fallback` decides what happens when even that fails; see [`UnsortedFallback`].
     pub(crate) async fn sort_flush_group(
         &self, schema: &crate::schema::TableSchema, batches: Vec<RecordBatch>, fallback: UnsortedFallback,
     ) -> Result<(FlushBatches, bool)> {
@@ -219,9 +192,6 @@ impl Database {
             // `usize::MAX`: the size decision is made here, so the in-process
             // helper must not second-guess it and silently skip.
             let (out, sorted) = sort_batches_by_schema(schema, batches, usize::MAX);
-            // `sort_batches_by_schema` also degrades on its own (schema merge,
-            // row encoding, lexsort), so the guard belongs here, not only on the
-            // escalation branch.
             anyhow::ensure!(
                 sorted || nothing_to_declare || fallback == UnsortedFallback::Allow,
                 "in-process sort degraded to unsorted on a rewrite path; keeping the committed inputs instead"
@@ -234,46 +204,36 @@ impl Database {
                 Ok((FlushBatches::Ready(sorted.into_iter()), true))
             }
             None => {
-                // A REWRITE must not buy a transient failure with a permanent
-                // one. Its inputs are already committed and already sorted, so
-                // aborting costs one compaction cycle; writing the group
-                // unsorted costs the partition's declared ordering FOREVER
-                // (nothing re-sorts a converged file) and, because
-                // `derive_common_ordering` is all-or-nothing, degrades every
-                // scan whose window touches that date.
+                // A rewrite's inputs are already committed and sorted: aborting
+                // costs one compaction cycle, while writing the group unsorted
+                // costs the partition's declared ordering permanently.
                 anyhow::ensure!(
                     fallback == UnsortedFallback::Allow,
                     "escalated sort of a {} MB rewrite group failed; keeping the committed inputs rather than replacing them with an unsorted file",
                     total / (1 << 20)
                 );
-                // Ingest has no such choice — the rows exist nowhere else, so
-                // losing them is not on the table. Counted because one such file
-                // disables the reader's ordering for its whole partition — this
-                // must never be silent (2026-08-03).
+                // Ingest has no such choice — the rows exist nowhere else. Counted
+                // because one unsorted file disables the reader's ordering for its
+                // whole partition, which must never be silent.
                 crate::observability::record_flush_sort_unsorted_fallback();
                 Ok((FlushBatches::Ready(batches.into_iter()), false))
             }
         }
     }
 
-    /// Flush-path sort pool (see field doc). Bounded and spillable, so an
-    /// oversized bucket degrades to disk I/O instead of an unpooled spike.
+    /// Flush-path sort pool: bounded and spillable, so an oversized bucket
+    /// degrades to disk I/O instead of an unpooled allocation spike.
     fn flush_sort_runtime_env(&self) -> Arc<datafusion::execution::runtime_env::RuntimeEnv> {
         self.flush_sort_runtime_env.get_or_init(|| self.build_spill_runtime_env(self.config.maintenance.flush_sort_pool_bytes(), "flush_sort_spill")).clone()
     }
 
-    /// Sort an oversized flush group inside a DataFusion plan.
-    ///
-    /// The in-process path allocates outside every memory pool, so past a point the only safe
-    /// options are skipping the sort or this pooled, spilling sort. Spilling is strictly better
-    /// than skipping: the footer stays honest and the peak is bounded by the pool. Returns `None`
-    /// on any failure so the caller writes the original batches unsorted; a flush must never lose
-    /// rows to a sort failure.
+    /// Sort an oversized flush group inside a DataFusion plan, so the peak is bounded by a pool
+    /// (the in-process path allocates outside every memory pool). Returns `None` on any failure
+    /// so the caller writes the original batches unsorted; a flush must never lose rows to a
+    /// sort failure.
     async fn sort_flush_group_spilling(&self, schema: &crate::schema::TableSchema, batches: &[RecordBatch]) -> Option<Vec<RecordBatch>> {
         use datafusion::{datasource::MemTable, prelude::SessionContext};
-        // Hold a slice of the shared spill pool for the whole sort. Queueing
-        // here costs latency on an already-oversized group; losing the slice
-        // costs the partition's footer ordering on every later scan.
+        // Hold a slice of the shared spill pool for the whole sort.
         let _slice = self.flush_sort_gate.acquire().await.ok()?;
         let first = batches.first()?.schema();
         // Schema-diverse buckets (an evolved nullable column) must be unified
@@ -308,23 +268,11 @@ impl Database {
             return None;
         }
 
-        // ONE pool consumer per gate permit — `flush_sort_gate`'s 512 MB-per-permit
-        // sizing assumes it. N>1 partitions fans out to N ExternalSorters plus an
-        // UNSPILLABLE SortPreservingMergeExec, and concurrent escalations starved
-        // the FairSpillPool into the unsorted fallback (prod 2026-08-03); a
-        // single-partition sort is slower but spills within its fair share, so the
-        // footer stays honest. Shared by both `sort_flush_group` callers (flush's
-        // `Allow` and the dedup rewrite's `Forbid`) on one 1 GB pool, so this batch
-        // size governs a 6.25 GB rewrite group as much as a flush group.
-        //
-        // SMALL batches, same reason as `repair_session_state` (6ef5ccf):
-        // `ExternalSorterMerge`'s ask scales with `batch_size`. Prod 2026-08-08,
-        // even with the whole pool to itself, a 6252 MB group at 8192-row batches
-        // still failed ("545.4 MB additional, 539.8 MB already allocated, 484.2 MB
-        // remain" — the full pool, so contention wasn't the cause; the merge just
-        // doubled a half-pool reservation). Shrinking the batch trades scan
-        // throughput for the allocation; the alternative — writing the group
-        // UNSORTED — poisons the partition's footer ordering for every later scan.
+        // One partition, deliberately: N>1 fans out to N ExternalSorters plus an
+        // UNSPILLABLE SortPreservingMergeExec, which exhausts the pool and drops
+        // to the unsorted fallback. `flush_sort_gate`'s per-permit sizing assumes
+        // one pool consumer per permit. The small batch size is for the same
+        // reason — `ExternalSorterMerge`'s reservation scales with `batch_size`.
         let state = build_delta_write_session_state(1, self.flush_sort_runtime_env(), "256");
         let ctx = SessionContext::new_with_state(state);
         let name = format!("flush_sort_{}", uuid::Uuid::new_v4().simple());
@@ -334,19 +282,16 @@ impl Database {
         out.inspect_err(|e| warn!("flush sort: spilling DataFusion sort failed, writing unsorted: {e}")).ok()
     }
 
-    /// Heavy-maintenance session state, built once (see field doc).
+    /// Heavy-maintenance session state, built once.
     pub(crate) fn maintenance_session_state(&self) -> datafusion::execution::session_state::SessionState {
         self.maintenance_session_state
             .get_or_init(|| build_optimize_session_state(self.config.memory.timefusion_query_partitions, self.maintenance_runtime_env()))
             .clone()
     }
 
-    /// Packing session state, built once.
-    ///
-    /// Lifts `MAINTENANCE_MAX_PARTITIONS` because that cap is sized for heavy fan-out, while
-    /// packing runs at most `max_light_optimize_k` bins in its own pool. The partition count is
-    /// derived: each partition's reservation is unspillable, so a fixed high number can waste most
-    /// of a small pool before sorting a single row.
+    /// Packing session state, built once. Lifts `MAINTENANCE_MAX_PARTITIONS` (sized for heavy
+    /// fan-out) and derives the partition count instead: each partition's reservation is
+    /// unspillable, so a fixed high number wastes most of a small pool before sorting a row.
     pub(crate) fn light_optimize_session_state(&self) -> datafusion::execution::session_state::SessionState {
         self.light_optimize_session_state
             .get_or_init(|| {
@@ -364,15 +309,11 @@ impl Database {
         pack_sort_partitions(self.pack_pool_bytes(), self.config.derived.max_light_optimize_k(), self.config.derived.cores)
     }
 
-    /// Repair batch size: deliberately smaller than packing's.
-    ///
-    /// A repair bin is one whole large file; `SortPreservingMergeExec` allocates per spill-run
-    /// per batch, so its ask scales with `batch_size`. Sharing 2048 with packing made the merge
-    /// ask exceed headroom. 256 matches the MaintenanceCli budget profile and lets the sort
-    /// admit one batch before spilling. `partitions` comes from
-    /// `REPAIR_SORT_PARTITION_LADDER`: a bin that exhausted the pool is retried with fewer
-    /// partitions because the unspillable merge operator is per-partition. Cached per
-    /// parallelism.
+    /// Repair session state, cached per parallelism. The batch size is deliberately smaller than
+    /// packing's: a repair bin is one whole large file and `SortPreservingMergeExec` allocates per
+    /// spill-run per batch, so its ask scales with `batch_size`. `partitions` comes from
+    /// `REPAIR_SORT_PARTITION_LADDER` — a bin that exhausted the pool is retried with fewer
+    /// partitions, since the unspillable merge operator is per-partition.
     pub(crate) fn repair_session_state(&self, partitions: usize) -> datafusion::execution::session_state::SessionState {
         self.repair_session_states
             .entry(partitions)
@@ -387,11 +328,9 @@ impl Database {
             .clone()
     }
 
-    /// Physical Delta log lock key.
-    ///
-    /// Collapses all default projects sharing a unified table onto one key (empty project_id is
-    /// not valid and cannot collide), while custom-storage tables keep per-project isolation. Shared
-    /// by `dml_lock` and `commit_lock` so both serialize at physical-log granularity.
+    /// Physical Delta log lock key: all default projects sharing a unified table collapse onto one
+    /// key (an empty project_id is not valid, so it cannot collide), while custom-storage tables
+    /// keep per-project isolation. Shared by `dml_lock` and `commit_lock`.
     pub(crate) async fn table_lock_key(&self, project_id: &str, table_name: &str) -> (String, String) {
         let project_key = if self.has_custom_storage(project_id, table_name).await { project_id.to_string() } else { String::new() };
         (project_key, table_name.to_string())
@@ -401,15 +340,13 @@ impl Database {
         self.dml_locks.entry(self.table_lock_key(project_id, table_name).await).or_default().clone()
     }
 
-    /// Per-physical-table Delta commit lock (see `commit_locks`).
+    /// Per-physical-table Delta commit lock.
     pub(crate) async fn commit_lock(&self, project_id: &str, table_name: &str) -> Arc<tokio::sync::Mutex<()>> {
         self.commit_locks.entry(self.table_lock_key(project_id, table_name).await).or_default().clone()
     }
 
-    /// Waiter count for the SAME key as [`Self::commit_lock`] (see
-    /// `flush_waiter_counts`). Flush/ingest commit paths register a
-    /// [`flush_waiter`] on it across their `lock().await`; `commit_wave` reads it
-    /// and stands down while it is nonzero.
+    /// Waiter count keyed identically to [`Self::commit_lock`]. Flush/ingest commit paths register
+    /// a [`flush_waiter`] across their `lock().await`; `commit_wave` stands down while it is nonzero.
     pub(crate) async fn flush_waiters(&self, project_id: &str, table_name: &str) -> Arc<std::sync::atomic::AtomicUsize> {
         self.flush_waiter_counts.entry(self.table_lock_key(project_id, table_name).await).or_default().clone()
     }
@@ -422,12 +359,11 @@ impl Database {
     }
 
     /// Persist `table`'s post-commit snapshot locally (detached) so the next
-    /// boot restores it and replays only later commits (see `snapshot_cache`).
-    /// Called from every commit path that swaps a fresh table state in.
+    /// boot restores it and replays only later commits.
     pub(crate) fn persist_snapshot(&self, table: &DeltaTable) {
-        // Throttle: at most one persist per table per interval. The snapshot is
-        // a boot-recovery seed, not a durability requirement, so skipping most
-        // commits just replays a few extra commits on next boot (see field docs).
+        // At most one persist per table per interval. The snapshot is a boot-recovery
+        // seed, not a durability requirement, so a skipped persist only costs a few
+        // extra replayed commits on the next boot.
         const MIN_PERSIST_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
         let url = table.table_url().to_string();
         let now = std::time::Instant::now();
@@ -467,11 +403,9 @@ impl Database {
                 .with_storage_options(storage_options.clone())
                 .with_allow_http(true))
         };
-        // `spawn_blocking`, mirroring `persist_snapshot`'s store side: this
-        // zstd-decodes and deserializes a whole `DeltaTableState` (22k+ files
-        // on the fat prod tables), which is SECONDS of CPU — long work wants
-        // its own thread, not a borrowed worker. Boot preload runs many of
-        // these concurrently on the same runtime the coordinator is on.
+        // `spawn_blocking`: this zstd-decodes and deserializes a whole
+        // `DeltaTableState`, seconds of CPU on large tables, and boot preload runs
+        // many concurrently on the coordinator's runtime.
         let (snapshot_dir, url_owned) = (Self::delta_snapshot_dir(&self.config), storage_uri.to_string());
         let loaded = tokio::task::spawn_blocking(move || crate::storage::load_snapshot(&snapshot_dir, &url_owned)).await.unwrap_or(None);
         let restored = match loaded {
@@ -479,15 +413,10 @@ impl Database {
                 let restored_version = state.version();
                 let mut table = builder()?.build()?;
                 table.state = Some(state);
-                // `update_state()` only probes versions *after* the supplied
-                // state. It returns Ok when the local snapshot is ahead of the
-                // durable log, even if its own commit disappeared (prod
-                // 2026-08-04: local otel_metrics v140816, S3 ended at v140806).
-                // Such a zombie snapshot serves removed files and makes every
-                // subsequent commit fail with InvalidTableVersion. Require its
-                // anchor commit to exist; if log cleanup legitimately removed
-                // it behind a newer checkpoint, a full load is also the right
-                // path because it starts from that durable checkpoint.
+                // `update_state()` only probes versions *after* the supplied state, so it
+                // returns Ok even for a snapshot ahead of the durable log whose own commit
+                // disappeared — such a zombie serves removed files and fails every later
+                // commit with InvalidTableVersion. Require its anchor commit to exist.
                 match table.log_store().read_commit_entry(restored_version).await {
                     Ok(Some(_)) => table
                         .update_state()
@@ -516,14 +445,10 @@ impl Database {
             Some(t) => t,
             None => builder()?.load().await.map_err(|e| anyhow::anyhow!("Failed to load table: {}", e))?,
         };
-        // Materialize the file list once so every post-commit update stays
-        // incremental. With incremental snapshots on this is a *correctness*
-        // requirement, not just perf: a non-materialized snapshot enumerates an
-        // EMPTY file set, and the fast-advance post-commit hook would build on
-        // it — so fail loud rather than cache a handle that serves empty results
-        // (the caller retries on next access). load()/restore normally arrive
-        // materialized, so this no-ops and can only fail on the rare path that
-        // actually has to materialize.
+        // Correctness, not just perf: with incremental snapshots on, a
+        // non-materialized snapshot enumerates an EMPTY file set that the
+        // fast-advance post-commit hook would then build on. Fail loud rather
+        // than cache a handle serving empty results.
         if self.config.maintenance.timefusion_incremental_snapshot {
             Self::materialize_snapshot_files(&mut table, false)
                 .await
@@ -532,14 +457,10 @@ impl Database {
         Ok(table)
     }
 
-    /// Casts each of `batches` to `writer`'s table schema (`RecordBatchWriter`,
-    /// unlike `WriteBuilder`, doesn't cast for us — Utf8View→Utf8 etc, missing
-    /// columns filled with nulls; safe=true, add_missing=true mirrors
-    /// `WriteBuilder`'s own coercion) and streams them in, flushing at
-    /// `max_file_bytes` so one oversized bucket (the MemBuffer ceiling is GBs)
-    /// doesn't land as a single file — on a sorted stream each flushed piece
-    /// keeps its own footer and stays time-disjoint. Shared by the per-project
-    /// staged-commit path and the cross-project coalesced flush's staging phase.
+    /// Casts each of `batches` to `writer`'s table schema (`RecordBatchWriter`, unlike
+    /// `WriteBuilder`, does not cast for us) and streams them in, flushing at `max_file_bytes`
+    /// so one oversized bucket doesn't land as a single file. On a sorted stream each flushed
+    /// piece keeps its own footer and stays time-disjoint.
     async fn stage_batches(
         writer: &mut deltalake::writer::RecordBatchWriter, batches: FlushBatches, max_file_bytes: usize,
     ) -> Result<Vec<deltalake::kernel::Action>, deltalake::DeltaTableError> {
@@ -558,20 +479,15 @@ impl Database {
     }
 
     /// Everything a staged (lock-free parquet upload) Delta write needs, built
-    /// once per (project, table) unit. Shared by `insert_records_batch` and the
-    /// cross-project coalesced flush path so both prepare writes identically.
+    /// once per (project, table) unit.
     ///
-    /// `staged_writer` is `None` when the fast path is unavailable — a batch
-    /// carries a column the table schema lacks (delta-rs' Default-mode
-    /// `RecordBatchWriter` cannot evolve schema on a partitioned table), or the
-    /// writer could not be built at all. That unit must take the locked
-    /// WriteBuilder merge path.
+    /// `staged_writer` is `None` when the fast path is unavailable — a batch carries a column
+    /// the table schema lacks (delta-rs' Default-mode `RecordBatchWriter` cannot evolve schema
+    /// on a partitioned table), or the writer could not be built. That unit must take the
+    /// locked WriteBuilder merge path.
     async fn prepare_staged_write(&self, project_id: &str, table_name: &str, batches: Vec<RecordBatch>) -> Result<PreparedWrite> {
-        // Delta-kernel's `unshredded_variant()` expects Struct{Binary,Binary}
-        // on write, but our MemBuffer carries Struct{BinaryView,BinaryView}
-        // (matches what the parquet reader natively produces — no per-row
-        // casts on read). Cast just-before-write so the Delta commit
-        // accepts the schema.
+        // Delta-kernel's `unshredded_variant()` expects Struct{Binary,Binary} on write,
+        // but MemBuffer carries Struct{BinaryView,BinaryView}.
         let batches: Vec<RecordBatch> = batches.into_iter().map(cast_variant_columns_to_binary).collect::<DFResult<Vec<_>>>()?;
 
         let table_ref = self.get_or_create_table(project_id, table_name).await?;
@@ -580,8 +496,7 @@ impl Database {
         let dirty_bins: Vec<(String, i64)> = if schema.dedup_keys.is_empty() {
             Vec::new()
         } else {
-            // Dirty-bin granularity, intentionally independent of MemBuffer's (configurable,
-            // currently 5-min) bucket duration — the two ideas coincide at "10 min" only historically.
+            // Dirty-bin granularity is intentionally independent of MemBuffer's bucket duration.
             use crate::database::compact::bin_micros;
             batches
                 .iter()
@@ -596,38 +511,36 @@ impl Database {
                 .collect()
         };
 
-        // Cluster by the declared sort keys (timestamp-first) so the parquet
-        // SortingColumn footer is honest and the page index localizes the lead
-        // key. `sorted` is false when a schema-evolved bucket can't be combined
-        // (we then write unsorted) — declare the footer only when it's true.
-        // Ingest: these rows are not committed anywhere else yet, so an unsorted
-        // write beats losing them (`UnsortedFallback::Allow` never errors).
+        // Cluster by the declared sort keys so the parquet SortingColumn footer is
+        // honest; declare it only when `sorted`. Ingest rows are committed nowhere
+        // else, so an unsorted write beats losing them (`Allow` never errors).
         let (batches, sorted) = self.sort_flush_group(schema, batches, UnsortedFallback::Allow).await?;
         let writer_properties = self.create_writer_properties(schema, self.config.parquet.timefusion_zstd_compression_level, sorted);
 
         let staging_table = { table_ref.read().await.clone() };
         let stage_store = staging_table.log_store().object_store(None);
-        let staged_writer = match deltalake::writer::RecordBatchWriter::for_table(&staging_table) {
-            Ok(w) => {
-                let w = w.with_writer_properties(writer_properties.clone());
+        let staged_writer = deltalake::writer::RecordBatchWriter::for_table(&staging_table)
+            .inspect_err(|e| debug!("RecordBatchWriter::for_table failed, using merge path: {}", e))
+            .ok()
+            .map(|w| w.with_writer_properties(writer_properties.clone()))
+            .filter(|w| {
                 let arrow_schema = w.arrow_schema();
                 let table_fields: HashSet<&str> = arrow_schema.fields().iter().map(|f| f.name().as_str()).collect();
-                let evolves = batches.schemas().iter().any(|s| s.fields().iter().any(|f| !table_fields.contains(f.name().as_str())));
-                (!evolves).then_some(w)
-            }
-            Err(e) => {
-                debug!("RecordBatchWriter::for_table failed, using merge path: {}", e);
-                None
-            }
-        };
+                !batches.schemas().iter().any(|s| s.fields().iter().any(|f| !table_fields.contains(f.name().as_str())))
+            });
         Ok(PreparedWrite { table_ref, schema, dirty_bins, batches, writer_properties, stage_store, staged_writer, sorted })
     }
 
+    /// Identity of one flush unit's batch set; `None` when the replay-decline is
+    /// off for it (kill-switch, or a table with no identity).
+    fn landed_digest_for(&self, table_name: &str, batches: &[RecordBatch]) -> Option<crate::write::LandedDigest> {
+        let gated = self.config.buffer.landed_skip_enabled() && crate::write::landed_identity_applies(table_name);
+        gated.then(|| crate::write::landed_digest(batches)).flatten()
+    }
+
     /// Insert batches and return the URIs of files newly added by this commit
-    /// (empty for the buffered-layer / batch-queue paths where the actual
-    /// Delta write happens later). Callers use the returned list to drive
-    /// cache warming and the tantivy sidecar without paying for a second
-    /// `update_state()` log scan.
+    /// (empty for the buffered-layer / batch-queue paths, where the actual Delta
+    /// write happens later).
     #[instrument(
         name = "delta.insert_batch",
         skip_all,
@@ -651,19 +564,13 @@ impl Database {
         &self, project_id: &str, table_name: &str, batches: Vec<RecordBatch>, skip_queue: bool, watermark: Option<&crate::write::DeltaWatermark>, bound: bool,
     ) -> Result<Vec<String>> {
         let span = tracing::Span::current();
-        // Normalize timezone-as-offset (`+00:00`) timestamp columns to the
-        // IANA `"UTC"` form. Delta-rs Arrow→Delta schema conversion only
-        // accepts `"UTC"`; without this normalisation the flush callback
-        // path (which feeds MemBuffer batches straight into Delta) errors
-        // out and data piles up in MemBuffer.
+        // Delta-rs' Arrow→Delta schema conversion only accepts the IANA `"UTC"`
+        // form, not a `+00:00` offset.
         let batches: Vec<RecordBatch> =
             batches.into_iter().map(normalize_timestamp_tz).map(|batch| batch.and_then(derive_date_partition)).collect::<DFResult<_>>()?;
 
-        // Extract project_id from first batch if not provided. If neither the
-        // caller nor the data carries one, log loudly and bucket under
-        // "default" — silently misrouting writes is the worst outcome, but
-        // returning an error would break callers that already rely on the
-        // legacy fallback.
+        // Extract project_id from the first batch if not provided; bucket under
+        // "default" (loudly) when neither the caller nor the data carries one.
         let project_id = match (project_id, batches.first()) {
             ("", Some(first)) => extract_project_id(first).unwrap_or_else(|| {
                 warn!("insert_records_batch: empty project_id and batch has no project_id column → bucketing under 'default'");
@@ -682,29 +589,21 @@ impl Database {
             self.invalidate_rollup_batches(&project_id, &table_name, &batches)?;
         }
 
-        // Stamp the schema's TF-owned version column. This is the single funnel
-        // every *inbound* write passes through — pgwire INSERT (`write_all`),
-        // the `__bulk` direct-to-Delta alias, and the legacy batch queue —
-        // regardless of whether the buffered layer is configured, and it
-        // runs before the WAL append so the durable record carries the value.
-        //
-        // A `watermark` marks the one caller that is NOT inbound: the flush of
-        // buffered rows back out to Delta (bucket flush, coalesced flush, boot
-        // relief). Those rows were stamped on their way in and must keep that
-        // value — a re-stamp would give a crash-retried flush a different value
-        // than the WAL holds. WAL replay bypasses this function entirely and
-        // seeds the clock via `insert_coerce::observe_batch` instead.
+        // Stamp the schema's TF-owned version column: this is the single funnel every
+        // *inbound* write passes through, and it runs before the WAL append so the
+        // durable record carries the value. A `watermark` marks the one non-inbound
+        // caller — a flush of already-stamped buffered rows — which must keep the
+        // original value, or a crash-retried flush would disagree with the WAL.
         let batches = if watermark.is_none() { crate::write::stamp_version(&table_name, batches) } else { batches };
 
-        // If buffered layer is configured and not skipping, use it (WAL → MemBuffer flow).
-        // No files are written synchronously on this path; an empty URI list is correct.
+        // Buffered layer (WAL → MemBuffer): nothing is written synchronously, so an
+        // empty URI list is correct.
         if !skip_queue && let Some(layer) = self.buffered_layer() {
             span.record("use_queue", "buffered_layer");
             layer.insert_bounded(&project_id, &table_name, batches, bound).await?;
             return Ok(Vec::new());
         }
 
-        // Fallback to legacy batch queue if configured
         if !skip_queue
             && self.config.core.enable_batch_queue
             && let Some(ref queue) = self.batch_queue
@@ -716,43 +615,29 @@ impl Database {
 
         span.record("use_queue", false);
 
-        // Identity of the batch set this commit carries, so a later boot can
-        // decline to re-write it (see `LANDED_DIGESTS_KEY`). Computed on the
-        // batches AS THE FLUSH HANDED THEM OVER — before `prepare_staged_write`
-        // coerces or sorts — because that is exactly what the flush side hashes
-        // when it checks. Only the flush path (`watermark.is_some()`) records
-        // one: an inbound write is not something replay can duplicate.
-        let landed = (self.config.buffer.landed_skip_enabled() && watermark.is_some() && crate::write::landed_identity_applies(&table_name))
-            .then(|| crate::write::landed_digest(&batches))
-            .flatten();
+        // Identity of the batch set this commit carries, so a later boot can decline
+        // to re-write it. Must be computed on the batches AS THE FLUSH HANDED THEM
+        // OVER — before `prepare_staged_write` coerces or sorts — because that is
+        // what the flush side hashes when it checks.
+        let landed = watermark.is_some().then(|| self.landed_digest_for(&table_name, &batches)).flatten();
 
         let PreparedWrite { table_ref, schema, dirty_bins, batches, writer_properties, stage_store, staged_writer, sorted } =
             self.prepare_staged_write(&project_id, &table_name, batches).await?;
 
-        // Hoist out of the retry loop — the watermark is the same on every attempt.
-        // Base properties (hooks off) when there is no watermark: leaving this
-        // unset would let WriteBuilder's own default re-enable the checkpoint hook.
+        // Base properties (hooks off) when there is no watermark: leaving this unset
+        // lets WriteBuilder's own default re-enable the checkpoint hook.
         let commit_properties = self.with_incremental_advance(watermark.map_or_else(base_commit_properties, |w| {
             build_watermark_commit_properties(
                 [(project_id.clone(), table_name.clone(), w.clone())],
                 landed.map(|d| (project_id.clone(), table_name.clone(), d)),
             )
         }));
-        // STAGED COMMIT (fast path): encode parquet + upload to S3 OUTSIDE the
-        // per-table commit lock, then serialize only the tiny commit-log
-        // append. The old path held the lock across the whole `.write()`
-        // (parquet encode + S3 upload + commit), serializing every tenant's
-        // upload behind one mutex — the ~8-17 rows/s flush ceiling under heavy
-        // backfill. A staged write parallelizes the uploads and pays the lock
-        // only for a sub-second log append; OCC conflicts re-commit the already
-        // uploaded parquet (no re-encode/re-upload).
-        //
-        // delta-rs' Default-mode RecordBatchWriter cannot evolve schema on a
-        // partitioned table, so when a batch carries a column absent from the
-        // table schema `prepare_staged_write` returns no staged writer and we
-        // fall back to the locked WriteBuilder merge path below.
+        // STAGED COMMIT (fast path): encode parquet + upload to S3 OUTSIDE the per-table
+        // commit lock, then serialize only the tiny commit-log append. OCC conflicts
+        // re-commit the already-uploaded parquet with no re-encode/re-upload. When a batch
+        // carries a column absent from the table schema there is no staged writer, and the
+        // locked WriteBuilder merge path below runs instead.
         if let Some(mut writer) = staged_writer {
-            // Upload parquet (no commit) on the staging clone — outside the lock.
             let stage_span = tracing::trace_span!(parent: &span, "delta.stage_parquet");
             let max_file_bytes = self.config.maintenance.timefusion_writer_max_file_bytes;
             let adds = Self::stage_batches(&mut writer, batches, max_file_bytes)
@@ -773,10 +658,8 @@ impl Database {
                 )
                 .await
             {
-                // AFTER the commit lands, never before: an abandoned attempt's
-                // staged parquet is deleted, and marking a deleted path is
-                // harmless but a marked path that never committed is a lie we
-                // would keep forever.
+                // Only AFTER the commit lands: a path marked sorted that never
+                // committed would be a permanent lie.
                 Ok(committed) => {
                     self.mark_written_sorted(schema, sorted, &adds);
                     Ok(committed)
@@ -790,14 +673,10 @@ impl Database {
             };
         }
 
-        // SCHEMA-EVOLUTION FALLBACK: locked WriteBuilder merge path. Holds the
-        // commit lock across the whole write so the schema-metadata merge can't
-        // race a concurrent commit. Rare (only when a batch adds a column).
-        //
-        // WriteBuilder re-submits the same rows on every OCC retry, so the lazy
-        // sort-merge has to be materialized once here — this path keeps the old
-        // whole-bucket residency by necessity. It is unreachable when a staged
-        // writer exists (the block above always returns).
+        // SCHEMA-EVOLUTION FALLBACK: locked WriteBuilder merge path, holding the commit
+        // lock across the whole write so the schema-metadata merge cannot race a
+        // concurrent commit. WriteBuilder re-submits the same rows on every OCC retry,
+        // so the lazy sort-merge must be materialized once here.
         let batches: Vec<RecordBatch> = batches.collect::<Result<_, _>>()?;
         let (commit_lock, flush_waiters) = self.commit_lock_and_waiters(&project_id, &table_name).await;
         let mut retry_count = 0;
@@ -844,9 +723,8 @@ impl Database {
                         retry_count += 1;
                         last_error = Some(e);
                         debug!("Delta write conflict detected, retrying... (attempt {}/{})", retry_count, MAX_COMMIT_RETRIES);
-                        // Release the commit lock BEFORE the backoff sleep — do
-                        // not remove. Holding it across the sleep serializes
-                        // every other writer behind this writer's backoff.
+                        // Release the commit lock BEFORE the backoff sleep: holding it
+                        // across the sleep serializes every other writer behind us.
                         drop(commit_guard);
                         tokio::time::sleep(occ_backoff(retry_count as usize)).await;
                         drop(table); // stale clone — the retry re-clones after the reload
@@ -860,21 +738,15 @@ impl Database {
             }
         }
 
-        Err(anyhow::anyhow!(
-            "Delta write failed after {} retries: {}",
-            MAX_COMMIT_RETRIES,
-            last_error.map(|e| e.to_string()).unwrap_or_else(|| "Unknown error".to_string())
-        ))
+        let last_error = last_error.map_or_else(|| "Unknown error".to_string(), |e| e.to_string());
+        Err(anyhow::anyhow!("Delta write failed after {} retries: {}", MAX_COMMIT_RETRIES, last_error))
     }
 
-    /// Cross-project flush commit coalescing.
-    ///
-    /// One tick's per-project flush units become a single Delta commit per physical table.
-    /// Default-storage projects share one `_delta_log`; custom-storage projects keep their own
-    /// commit. Parquet encode/upload still run in parallel outside the lock; only the commit-log
-    /// append is shared. Staging failures exclude only that unit; shared commit failures fail every
-    /// unit in the physical group; schema-evolving units are committed alone so they don't block
-    /// co-tenants. Returns one result per input unit in input order.
+    /// Cross-project flush commit coalescing: one tick's per-project flush units become a single
+    /// Delta commit per physical table. Parquet encode/upload still run in parallel outside the
+    /// lock; only the commit-log append is shared. A staging failure excludes only that unit; a
+    /// shared commit failure fails every unit in the physical group; schema-evolving units are
+    /// committed alone. Returns one result per input unit, in input order.
     pub async fn insert_records_batches_coalesced(&self, units: Vec<CoalescedWriteUnit>) -> Vec<Result<Vec<String>>> {
         use deltalake::kernel::Action;
         use futures::stream::{self, StreamExt};
@@ -905,9 +777,6 @@ impl Database {
         for (i, prep) in prepared {
             match prep {
                 Err(e) => results[i] = Err(e),
-                // `take()` here (not a `staged_writer.is_none()` peek + a later
-                // `.expect()`) so the writer's presence is carried in `stageable`'s
-                // type, not re-asserted at the point of use.
                 Ok((mut p, key)) => match p.staged_writer.take() {
                     Some(writer) => stageable.push((i, p, writer, key)),
                     None => {
@@ -951,20 +820,13 @@ impl Database {
                     let table_ref = group[0].1.table_ref.clone();
                     let adds: Vec<Action> = group.iter().flat_map(|(_, u)| u.adds.iter().cloned()).collect();
                     let watermarks = indices.iter().map(|i| (units[*i].project_id.clone(), units[*i].table_name.clone(), units[*i].watermark.clone()));
-                    // Per-unit landed identity, on the batches the flush handed
-                    // over (see the single-unit path). Each unit's digest is
-                    // scoped to its own topic, so one tenant's identity can
-                    // never decline another's write.
-                    let digests: Vec<(String, String, crate::write::LandedDigest)> = if self.config.buffer.landed_skip_enabled() {
-                        indices
-                            .iter()
-                            .map(|i| &units[*i])
-                            .filter(|u| crate::write::landed_identity_applies(&u.table_name))
-                            .filter_map(|u| crate::write::landed_digest(&u.batches).map(|d| (u.project_id.clone(), u.table_name.clone(), d)))
-                            .collect()
-                    } else {
-                        Vec::new()
-                    };
+                    // Per-unit landed identity, scoped to its own topic, so one
+                    // tenant's identity can never decline another's write.
+                    let digests: Vec<(String, String, crate::write::LandedDigest)> = indices
+                        .iter()
+                        .map(|i| &units[*i])
+                        .filter_map(|u| self.landed_digest_for(&u.table_name, &u.batches).map(|d| (u.project_id.clone(), u.table_name.clone(), d)))
+                        .collect();
                     let commit_properties = self.with_incremental_advance(build_watermark_commit_properties(watermarks, digests));
                     let per_project: Vec<(&str, &[(String, i64)])> =
                         group.iter().map(|(i, u)| (units[*i].project_id.as_str(), u.dirty_bins.as_slice())).collect();
@@ -975,22 +837,19 @@ impl Database {
                         .map(|added| attribute_added_files(added, &projects));
                     match outcome {
                         Ok(per_project_added) => {
-                            // PER UNIT, not per group: a group is one commit but
-                            // many prepared writes, and one unit degrading to an
-                            // unsorted write must not exonerate its neighbours'
-                            // files — nor be exonerated by them.
+                            // Per unit, not per group: one unit degrading to an
+                            // unsorted write must not tar or exonerate its neighbours.
                             for (_, unit) in &group {
                                 self.mark_written_sorted(unit.schema, unit.sorted, &unit.adds);
                             }
                             indices.into_iter().zip(per_project_added).map(|(i, a)| (i, Ok(a))).collect::<Vec<_>>()
                         }
                         Err(e) => {
-                            // Fail EVERY project in the group identically — no
-                            // partial settle. The caller requeues each one's buckets
-                            // with unchanged retry semantics.
+                            // Fail EVERY project in the group identically — no partial
+                            // settle; the caller requeues each one's buckets.
                             if !e.to_string().contains(INCONCLUSIVE_COMMIT_MARKER) {
-                                // Every unit in a physical group stages into the SAME
-                                // store (same Delta table), so one store deletes all.
+                                // Every unit in a physical group stages into the same
+                                // store, so one store deletes all.
                                 Self::cleanup_orphaned_parquet(&group[0].1.stage_store, &adds).await;
                             }
                             indices.into_iter().map(|i| (i, Err(anyhow::anyhow!("coalesced commit failed for {}: {}", table_name, e)))).collect()
@@ -1020,15 +879,12 @@ impl Database {
         results
     }
 
-    /// The shared commit-log append for a staged (parquet already uploaded)
-    /// write: one project's flush unit, or one physical table's coalesced group
-    /// whose actions and watermark metadata span several projects. One OCC retry
-    /// budget + backoff and one landed-despite-error probe for both; `kind`
-    /// carries everything that differs (see [`StagedCommitKind`]).
+    /// The shared commit-log append for a staged (parquet already uploaded) write: one project's
+    /// flush unit, or one physical table's coalesced group spanning several projects.
     ///
-    /// Staged parquet is the CALLER's to clean up: on `Err`, delete it unless
-    /// the message carries [`INCONCLUSIVE_COMMIT_MARKER`] — landing could not be
-    /// confirmed there and deleting would risk a dangling Add.
+    /// Staged parquet is the CALLER's to clean up: on `Err`, delete it unless the message carries
+    /// [`INCONCLUSIVE_COMMIT_MARKER`], where landing could not be confirmed and deleting would
+    /// risk a dangling Add.
     async fn commit_staged_group(
         &self, kind: StagedCommitKind, table_ref: &Arc<RwLock<DeltaTable>>, projects: &[(&str, &[(String, i64)])], table_name: &str, commit: StagedCommit<'_>,
     ) -> Result<Vec<String>> {
@@ -1039,23 +895,16 @@ impl Database {
             partition_by: (!schema.partitions.is_empty()).then(|| schema.partitions.clone()),
             predicate: None,
         };
-        // Any member resolves to the same physical lock (a coalesced group's key
-        // IS `table_lock_key`), so serialization is identical on both paths.
+        // Any member resolves to the same physical lock (a coalesced group's key IS
+        // `table_lock_key`), so serialization is identical on both paths.
         let (commit_lock, flush_waiters) = self.commit_lock_and_waiters(projects[0].0, table_name).await;
         let (refresh_op, commit_op) = kind.ops();
         let mut retry_count = 0u32;
         loop {
-            // Refresh UNDER the lock (the merge path refreshes before locking).
-            // The per-table commit lock serializes all in-process commits to
-            // THIS log, so refreshing here guarantees we build on the previous
-            // committer's version and never self-conflict; refresh is
-            // probe-cheap (a single GET that 404-short-circuits when already
-            // current), so the extra lock-hold is sub-millisecond on the common
-            // path.
+            // Refresh UNDER the lock: the per-table commit lock serializes all in-process
+            // commits to this log, so refreshing here guarantees we build on the previous
+            // committer's version and never self-conflict.
             let commit_guard = lock_with_flush_priority(&commit_lock, &flush_waiters).await;
-            // DIAG (commit-throughput profiling): time the serial commit phases
-            // (refresh + Delta log append) under the lock — these bound the
-            // process-wide commit rate. Remove once the flush bottleneck is found.
             let t_refresh = std::time::Instant::now();
             if let Err(e) =
                 bounded_commit_await(COMMIT_LOCK_OP_TIMEOUT, refresh_op, table_name, refresh_table_snapshot(table_ref, self.incremental_snapshot())).await
@@ -1065,8 +914,8 @@ impl Database {
             let refresh_ms = t_refresh.elapsed().as_millis();
             let mut new_table = { table_ref.read().await.clone() };
             let t_build = std::time::Instant::now();
-            // Bounded for the same reason as the wave path: this await holds the
-            // per-table commit lock every other committer queues on.
+            // Bounded: this await holds the per-table commit lock every other
+            // committer queues on.
             let commit_res = bounded_commit_await(
                 COMMIT_LOCK_OP_TIMEOUT,
                 commit_op,
@@ -1081,9 +930,8 @@ impl Database {
             let build_ms = t_build.elapsed().as_millis();
             match commit_res {
                 Ok(finalized) => {
-                    // Diff pre- vs post-commit file URIs for `added`. Capture
-                    // pre-uris here (only on success) — before the state swap
-                    // below makes `new_table` post-commit — so failed attempts
+                    // Capture pre-commit URIs before the state swap below makes
+                    // `new_table` post-commit; only on success, so failed attempts
                     // don't pay the full-table file-URI walk.
                     let pre_uris: HashSet<String> = file_uris(&new_table);
                     new_table.state = Some(finalized.snapshot());
@@ -1117,12 +965,9 @@ impl Database {
                         tokio::time::sleep(occ_backoff(retry_count as usize)).await;
                         continue;
                     }
-                    // Non-OCC error: the commit MAY have landed (post-commit hook
-                    // / snapshot refresh failed AFTER N.json was written). Capture
-                    // the pre-commit file set from the still-pre-commit clone (only
-                    // on this rare branch — the OCC-retry path must not pay the
-                    // full-table URI walk), then probe. Never delete parquet a
-                    // landed commit references.
+                    // Non-OCC error: the commit MAY have landed (the post-commit hook
+                    // can fail after N.json is written), so probe before letting the
+                    // caller delete parquet a landed commit references.
                     let pre_uris: HashSet<String> = file_uris(&new_table);
                     return match probe_after_timeout(self.probe_commit_landed_bounded(table_ref, adds).await, timed_out) {
                         CommitProbe::Landed => {
@@ -1149,8 +994,7 @@ impl Database {
                                     warn!("coalesced commit for {} errored and landing is UNCONFIRMED — leaving staged parquet in place: {}", table_name, e)
                                 }
                             }
-                            // Signal "do not delete the parquet" by returning a
-                            // distinct marker error the caller checks.
+                            // Marker error: tells the caller not to delete the parquet.
                             Err(anyhow::anyhow!("{}: {} failed (landing unconfirmed): {}", INCONCLUSIVE_COMMIT_MARKER, kind.what(), e))
                         }
                     };
@@ -1159,13 +1003,10 @@ impl Database {
         }
     }
 
-    /// Probe whether a staged commit landed despite returning an error.
-    ///
-    /// Refresh the snapshot and check that every Add we tried to commit is now active. `Landed`
-    /// means treat as success; `NotLanded` means it is safe to delete staged parquet; `Inconclusive`
-    /// means refresh failed or only part of the expected state is visible. Preserve parquet
-    /// in either case: a matching path with a different DV is still a live physical object.
-    /// A probe that exceeds the last-resort timeout is also `Inconclusive`.
+    /// Probe whether a staged commit landed despite returning an error: refresh the snapshot and
+    /// check every Add is active. `NotLanded` is the only verdict that permits deleting staged
+    /// parquet; `Inconclusive` (refresh failed, partial visibility, or probe timeout) preserves it,
+    /// because a matching path with a different DV is still a live physical object.
     pub(crate) async fn probe_commit_landed_bounded(&self, table_ref: &Arc<RwLock<DeltaTable>>, adds: &[deltalake::kernel::Action]) -> CommitProbe {
         match tokio::time::timeout(COMMIT_LOCK_OP_TIMEOUT, self.probe_commit_landed(table_ref, adds)).await {
             Ok(probe) => probe,
@@ -1189,42 +1030,38 @@ impl Database {
             CommitProbe::Landed
         } else if adds.iter().any(|action| matches!(action, deltalake::kernel::Action::Add(add) if active.0.contains_key(&add.path))) {
             // A partial landing or a later DV update cannot authorize deleting
-            // the still-referenced parquet, even though the exact Adds differ.
+            // still-referenced parquet, even though the exact Adds differ.
             CommitProbe::Inconclusive
         } else {
             CommitProbe::NotLanded
         }
     }
 
-    /// Best-effort delete of staged-but-uncommitted parquet after a terminal
-    /// staged-commit failure. Those objects have no Add/Remove action in the
-    /// Delta log, so VACUUM never reclaims them — abandoning them leaks files on
-    /// S3 forever. Logs any path it couldn't remove so an operator can clean up.
+    /// Best-effort delete of staged-but-uncommitted parquet after a terminal staged-commit
+    /// failure. Those objects have no Add/Remove action in the Delta log, so VACUUM never
+    /// reclaims them; any path that could not be removed is logged for manual cleanup.
     pub(crate) async fn cleanup_orphaned_parquet(store: &Arc<dyn object_store::ObjectStore>, adds: &[deltalake::kernel::Action]) {
         use object_store::ObjectStoreExt; // dyn-safe `delete` wrapper
         for action in adds {
-            if let deltalake::kernel::Action::Add(add) = action {
-                let path = object_store::path::Path::from(add.path.as_str());
-                if let Err(e) = store.delete(&path).await {
-                    warn!("orphaned staged parquet (manual cleanup needed): {} — delete failed: {}", add.path, e);
-                }
+            if let deltalake::kernel::Action::Add(add) = action
+                && let Err(e) = store.delete(&object_store::path::Path::from(add.path.as_str())).await
+            {
+                warn!("orphaned staged parquet (manual cleanup needed): {} — delete failed: {}", add.path, e);
             }
         }
     }
 
-    /// Shared post-commit bookkeeping for staged and merge write paths.
-    ///
-    /// Records the version for read-after-write, swaps the shared handle (version-guarded), warms
-    /// just-written files, invalidates stats, and returns the added file URIs. `projects` is every
-    /// `(project_id, dirty_bins)` the commit carried. Per-project work runs once per entry; table-wide
-    /// work runs once for the commit.
+    /// Shared post-commit bookkeeping for staged and merge write paths: records the version for
+    /// read-after-write, swaps the shared handle (version-guarded), warms just-written files,
+    /// invalidates stats, and returns the added file URIs. `projects` is every
+    /// `(project_id, dirty_bins)` the commit carried.
     #[allow(clippy::too_many_arguments)]
     async fn record_committed_write(
         &self, table_ref: &Arc<RwLock<DeltaTable>>, projects: &[(&str, &[(String, i64)])], table_name: &str, new_table: DeltaTable, pre_uris: &HashSet<String>,
         warm: bool,
     ) -> Vec<String> {
         // Jitter anchor + logging identity: any member of the physical group is
-        // equivalent (they all commit to the same log).
+        // equivalent, since they all commit to the same log.
         let project_id = projects.first().map(|(p, _)| *p).unwrap_or("");
         let committed_version = new_table.version();
         if let Some(version) = committed_version {
@@ -1235,7 +1072,7 @@ impl Database {
         }
         let added: Vec<String> = new_table.get_file_uris().map(|it| it.filter(|u| !pre_uris.contains(u)).collect()).unwrap_or_default();
         // Capture the store off the committed handle so the warm task never
-        // re-resolves the table (a possible PG roundtrip + Delta state reload).
+        // re-resolves the table.
         let (warm_store, warm_table_uri) = (new_table.log_store().object_store(None), new_table.table_url().to_string());
         self.persist_snapshot(&new_table);
         // Brief write lock for the swap only. Version-guarded: a concurrent
@@ -1246,24 +1083,18 @@ impl Database {
                 *shared = new_table;
             }
         }
-        // Freshly-flushed files are queried next; warm them now (repeat queries
-        // measured ~300 ms cold vs 8 ms warm on R2). Gated on `warm` (only the
-        // BufferedWriteLayer flush path sets it): direct inserts — tests, tools
-        // — must not spawn detached warm tasks whose in-flight connections
-        // outlive a short-lived runtime and poison the shared client pool.
+        // Warm freshly-flushed files, which are queried next. Gated on `warm` (only the
+        // BufferedWriteLayer flush path sets it): direct inserts from tests and tools must
+        // not spawn detached warm tasks whose in-flight connections outlive a short-lived
+        // runtime and poison the shared client pool.
         if warm {
-            // Influx-oracle ordering: the MemBuffer prefix drains right after
-            // this returns (`settle_flushed_group`), so on the flush path we
-            // confirm the new files are cached BEFORE that handoff — a detached
-            // warm loses the race and the next dashboard query pays an R2
-            // first-byte per fresh file. Bounded + best-effort: it can never
-            // fail the commit. Same warm path either way — only WHEN it returns
-            // differs.
+            // The MemBuffer prefix drains right after this returns, so confirm the new
+            // files are cached BEFORE that handoff. Bounded and best-effort — it can
+            // never fail the commit.
             let warm_added = added.clone();
             if self.object_store_cache.is_some() {
-                // Establish header/footer coverage before the MemBuffer drains.
-                // Full bodies are warmed by the normal detached path below;
-                // the confirm must never make flush durability depend on R2.
+                // Header/footer coverage only; full bodies come from the detached
+                // path below, so flush durability never depends on the remote store.
                 self.warm_cache_for_uris(warm_store.clone(), warm_table_uri.clone(), warm_added.clone(), Some(crate::config::CACHE_CONFIRM_TIMEOUT), false)
                     .await;
             }
@@ -1280,12 +1111,9 @@ impl Database {
             }
         }
         debug!("Invalidated statistics cache after write to {}/{}", project_id, table_name);
-        // Periodic reconcile, OFF the flush path: every Nth commit (offset per
-        // table so tables with uniform write rates don't all rebuild at once)
-        // rebuild the file list from S3 truth in the background. This bounds any
-        // incremental-replay drift without blocking the WAL cursor, and runs on
-        // a detached clone so it never touches `added` (tantivy coverage) or the
-        // persisted snapshot — both already captured from the committed state.
+        // Periodic reconcile, OFF the flush path: every Nth commit, rebuild the file list
+        // from object-store truth in the background to bound incremental-replay drift. Runs
+        // on a detached clone so it never touches `added` or the persisted snapshot.
         let reconcile_n = self.config.maintenance.timefusion_snapshot_reconcile_commits;
         if self.config.maintenance.timefusion_incremental_snapshot
             && reconcile_n > 0
@@ -1327,21 +1155,18 @@ impl Database {
     }
 
     /// Read the latest commit metadata for each WAL topic and fast-forward the walrus cursor to
-    /// `max(local, delta)` per shard.
+    /// `max(local, delta)` per shard, closing the crash-mid-flush window where Delta committed
+    /// but the watermark advance did not finish.
     ///
-    /// Closes the crash-mid-flush window where Delta committed but the watermark advance did not
-    /// finish, so restart does not replay entries already in Delta. Must run before
-    /// `recover_from_wal`. Best-effort: failures are logged and skipped, so this cannot make recovery
-    /// worse than at-least-once.
+    /// MUST run before `recover_from_wal`. Best-effort: failures are logged and skipped, so this
+    /// can never make recovery worse than at-least-once.
     pub async fn derive_wal_cursors_from_delta(
         &self, wal: &crate::write::wal::WalManager, layer: Option<&crate::write::BufferedWriteLayer>,
     ) -> anyhow::Result<usize> {
         use futures::stream::{self, StreamExt};
 
-        // Group logical WAL topics by physical Delta log. Default-storage
-        // projects share one unified table, so opening and scanning that table
-        // once per project made a dirty boot pay the same remote snapshot load
-        // dozens of times. Custom-storage topics retain their isolated group.
+        // Group logical WAL topics by physical Delta log so a dirty boot loads each
+        // unified table's snapshot once, not once per project sharing it.
         let custom = self.custom_storage_keys().await;
         let physical: HashMap<(String, String), Vec<(String, String)>> = wal
             .list_topic_pairs()
@@ -1381,10 +1206,9 @@ impl Database {
         topics
             .into_iter()
             .map(|(project_id, table_name)| {
-                // Same scan, second (independent) reading: the batch-set identities
-                // these commits contain. Feeds ONLY the flush-time decline — never
-                // the cursor advance below, which stays governed by the conservative
-                // watermark. See `LANDED_DIGESTS_KEY`.
+                // Batch-set identities from the same scan. These feed ONLY the flush-time
+                // decline, never the cursor advance below, which stays governed by the
+                // conservative watermark.
                 if self.config.buffer.landed_skip_enabled()
                     && let Some(layer) = layer
                 {
@@ -1409,21 +1233,14 @@ impl Database {
 /// Spill `DiskManager` for one maintenance-family env: the explicit on-disk
 /// directory plus the configured byte ceiling.
 ///
-/// The ceiling must be set HERE, on the builder — DataFusion's default is
-/// 100 GB, and that default is the entire reason the repair backlog was FROZEN
-/// rather than slow: sorting ONE ~800 MB whale file (~17x decoded) spills past
-/// 100 GB, so every attempt ran ~18 min, died at the cap, and requeued as
-/// `compaction_incomplete` — 650 of 662 repair WAL records in one night,
-/// attempts=1661 on one unit, zero files repaired in six weeks (prod
-/// 2026-09-05, project 87576849, slices Jul 21-28). See
-/// `timefusion_maintenance_spill_max_gb` for the sizing argument.
+/// The ceiling must be set HERE, on the builder. DataFusion's default is 100 GB, which a single
+/// large-file sort can exceed — the sort then dies at the cap and the unit requeues forever.
 ///
 /// ```
 /// # use timefusion::database::spill_disk_builder;
 /// let dm = spill_disk_builder(std::env::temp_dir().join("tf-spill-doctest"), 220).build().unwrap();
 /// assert_eq!(dm.max_temp_directory_size(), 220 * 1024 * 1024 * 1024);
-/// // DataFusion's default — what every maintenance env silently ran with, and
-/// // what one whale-file sort exceeds — is far below the configured cap.
+/// // DataFusion's default is far below the configured cap.
 /// assert!(datafusion::execution::disk_manager::DiskManagerBuilder::default().build().unwrap().max_temp_directory_size() < 110 * 1024 * 1024 * 1024);
 /// ```
 pub fn spill_disk_builder(spill_dir: std::path::PathBuf, max_gb: u64) -> datafusion::execution::disk_manager::DiskManagerBuilder {

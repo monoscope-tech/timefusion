@@ -1,10 +1,8 @@
-//! Per-parquet-file Tantivy index: parallel sidecar indexes that pre-filter
+//! Per-parquet-file Tantivy index: sidecar indexes that pre-filter
 //! `(timestamp, id)` candidates so Delta/MemBuffer scans stay narrow.
 //!
-//! Layout: one tantivy index per Delta parquet file, scoped per `project_id`.
-//! Schema is derived from the YAML `TableSchema` via `schema::build_for_table`.
-//! Indexes always store `_timestamp` (i64, fast) and `_id` (text raw); user
-//! columns are indexed-only unless explicitly marked `stored: true`.
+//! One index per Delta parquet file, scoped per `project_id`; schema derived
+//! from the YAML `TableSchema`. Indexes always store `_timestamp` and `_id`.
 
 pub mod histogram;
 pub(crate) mod planner;
@@ -14,22 +12,10 @@ pub mod visibility;
 
 pub use search::{Hit, query_index};
 
-// Build a tantivy index from a stream of `RecordBatch`es.
-//
-// Strategy: in-memory `tantivy::Index` (RAMDirectory) — caller is responsible
-// for serializing it to bytes (see `store::pack_index`). Each build is a
-// one-shot single commit; whether its segments are merged before close is the
-// caller's choice via `MergeMode` (see that type for why deferring is safe).
-//
-// Field mapping (from `schema.rs`):
-// - `_timestamp` ← row's `timestamp` column (Timestamp microseconds)
-// - `_id`        ← row's `id` column (Utf8/Utf8View)
-// - User fields  ← columns marked `tantivy: { indexed: true }` in YAML
-//
-// Variant handling: convert via `parquet_variant_compute::VariantArray` and
-// flatten to text. `flatten: "json"` writes the JSON string; `flatten: "kv"`
-// writes "k1:v1 k2:v2 …" tokens (key+value flattened). Nested objects are
-// traversed recursively.
+// Field mapping: `_timestamp` ← `timestamp` column (micros), `_id` ← `id`
+// column (Utf8/Utf8View), user fields ← columns with `tantivy.indexed: true`.
+// Variant columns flatten to text: `flatten: "json"` writes the JSON string,
+// `flatten: "kv"` writes "k1:v1 k2:v2 …" tokens, recursing into nested objects.
 
 use std::{
     collections::{BTreeMap, HashMap},
@@ -45,6 +31,7 @@ use arrow::{
 };
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
+use itertools::{Either, Itertools};
 use object_store::{ObjectStore, ObjectStoreExt, path::Path as ObjPath};
 use parquet_variant_compute::VariantArray;
 use parquet_variant_json::VariantToJson;
@@ -74,9 +61,8 @@ pub const WRITER_HEAP_BYTES: usize = 64 * 1024 * 1024;
 /// Deferred builds merge past this cap to bound per-query segment cost.
 pub const MAX_DEFERRED_SEGMENTS: usize = 32;
 
-/// When a build is allowed to spend CPU on segment merges.
-///
-/// Merging is logically invisible but expensive during ingestion.
+/// When a build is allowed to spend CPU on segment merges. Merging is
+/// logically invisible but expensive during ingestion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MergeMode {
     /// Defers ingest-path merges up to [`MAX_DEFERRED_SEGMENTS`].
@@ -98,8 +84,7 @@ pub struct IndexBuildStats {
 }
 
 /// Build an in-memory tantivy `Index` from `batches`. Returns the index and
-/// row-level stats. Caller serializes the index (via `store::pack_index`) to
-/// bytes for upload.
+/// row-level stats; the caller serializes it to bytes (`pack_dir`) for upload.
 pub fn build_in_memory(table: &TableSchema, batches: &[RecordBatch]) -> Result<(Index, BuiltSchema, IndexBuildStats)> {
     let built = build_for_table(table);
     let index = Index::create_in_ram(built.schema.clone());
@@ -108,16 +93,9 @@ pub fn build_in_memory(table: &TableSchema, batches: &[RecordBatch]) -> Result<(
     Ok((index, built, stats))
 }
 
-/// Append `batches` to an existing tantivy `Index` (created in RAM or on disk).
-/// Used by `store::build_to_dir` to write directly to a `MmapDirectory`.
-pub fn index_to_writer(built: &BuiltSchema, index: &Index, batches: &[RecordBatch], merge: MergeMode) -> Result<IndexBuildStats> {
-    write_index(built, index, batches, merge)
-}
-
-/// The one writer loop — single commit, explicit merge policy, stats
-/// accumulated per batch. Takes a slice or a stream so the flush and
-/// committed-file paths share it.
-fn write_index(
+/// Append `batches` to an existing tantivy `Index` (created in RAM or on disk)
+/// as a single commit, returning the accumulated build stats.
+pub fn index_to_writer(
     built: &BuiltSchema, index: &Index, batches: impl IntoIterator<Item = impl std::borrow::Borrow<RecordBatch>>, merge: MergeMode,
 ) -> Result<IndexBuildStats> {
     let mut writer: IndexWriter = index.writer(WRITER_HEAP_BYTES).context("create tantivy writer")?;
@@ -140,20 +118,14 @@ fn create_disk_index(built: &BuiltSchema, dir: &Path) -> Result<Index> {
 }
 
 /// Build a committed-file index from a bounded channel of decoded parquet
-/// batches. The reader and Tantivy writer run concurrently, so only the
-/// channel's small window remains live; the old committed-file path collected
-/// the entire wide parquet into Arrow before indexing and a sub-512 MiB file
-/// OOM-killed a 12 GiB repair cgroup in production.
+/// batches, so only the channel's small window is live at once.
 ///
 /// Must run on a blocking thread: `IndexWriter` is CPU/blocking work and
-/// `blocking_recv` intentionally keeps it off Tokio's async workers.
+/// `blocking_recv` would stall a Tokio async worker.
 pub fn build_stream_to_dir(
     table: &TableSchema, dir: &Path, mut batches: tokio::sync::mpsc::Receiver<RecordBatch>, merge: MergeMode,
 ) -> Result<(BuiltSchema, IndexBuildStats)> {
-    let built = build_for_table(table);
-    let index = create_disk_index(&built, dir)?;
-    let stats = write_index(&built, &index, std::iter::from_fn(|| batches.blocking_recv()), merge)?;
-    Ok((built, stats))
+    build_to_dir(table, std::iter::from_fn(|| batches.blocking_recv()), dir, merge)
 }
 
 fn finish_writer(index: &Index, mut writer: IndexWriter, mut stats: IndexBuildStats, merge: MergeMode) -> Result<IndexBuildStats> {
@@ -229,8 +201,8 @@ fn index_batch(built: &BuiltSchema, writer: &mut IndexWriter, batch: &RecordBatc
 
     for row in 0..batch.num_rows() {
         let id = id_kind.extract(id_col, row)?.unwrap_or_default();
-        // stats.rows counts docs already added → the global ordinal of this
-        // one, valid as a parquet row index only for read-back builds.
+        // stats.rows is the doc's global ordinal; only a valid parquet row
+        // index for read-back builds.
         let mut doc = doc!(built.timestamp => ts_col.value(row), built.id => id, built.row_ordinal => stats.rows);
         for uc in &user_cols {
             if uc.list_mode == TantivyListMode::Elements {
@@ -238,7 +210,7 @@ fn index_batch(built: &BuiltSchema, writer: &mut IndexWriter, batch: &RecordBatc
                     let arr = uc.column.as_any().downcast_ref::<ListArray>().context("element index requires list")?;
                     // Raw terms preserve punctuation, whitespace and empty strings.
                     // Repeated terms share a document posting, so they count once.
-                    for_each_list_str(&arr.value(row), |value| doc.add_text(uc.field, value))?;
+                    list_strs(&arr.value(row))?.for_each(|value| doc.add_text(uc.field, value));
                 }
             } else if let Some(text) = uc.kind.extract(uc.column, row)?
                 && !text.is_empty()
@@ -267,8 +239,6 @@ impl ColKind {
             DataType::Utf8View => Self::Utf8View,
             DataType::List(_) => Self::ListUtf8,
             DataType::Struct(_) => {
-                // Canonicalization and schema validation are batch work. A
-                // prepared variant owns shared Arrow buffers, not copied rows.
                 let array = VariantArray::try_new(column.as_ref()).context("prepare variant index column")?;
                 match flatten.unwrap_or("json") {
                     "kv" => Self::VariantKv(array),
@@ -293,33 +263,24 @@ impl ColKind {
     }
 }
 
-/// Apply `f` to every non-null string of one `List(Utf8|Utf8View)` row value.
-fn for_each_list_str(inner: &ArrayRef, f: impl FnMut(&str)) -> Result<()> {
+/// Every non-null string of one `List(Utf8|Utf8View)` row value.
+fn list_strs(inner: &ArrayRef) -> Result<impl Iterator<Item = &str>> {
     if let Some(values) = inner.as_any().downcast_ref::<StringArray>() {
-        values.iter().flatten().for_each(f);
+        Ok(Either::Left(values.iter().flatten()))
     } else if let Some(values) = inner.as_any().downcast_ref::<StringViewArray>() {
-        values.iter().flatten().for_each(f);
+        Ok(Either::Right(values.iter().flatten()))
     } else {
         bail!("list element type unsupported for tantivy: {:?}", inner.data_type())
     }
-    Ok(())
 }
 
 fn list_to_text(arr: &ListArray, row: usize) -> Result<String> {
-    let (mut out, mut first) = (String::new(), true);
-    for_each_list_str(&arr.value(row), |s| {
-        // Space-join, not "skip when empty": empty elements are real terms.
-        if !std::mem::take(&mut first) {
-            out.push(' ');
-        }
-        out.push_str(s);
-    })?;
-    Ok(out)
+    // Space-join, not "skip when empty": empty elements are real terms.
+    Ok(list_strs(&arr.value(row))?.join(" "))
 }
 
-/// Render one Variant row to text. `kv=false` → canonical JSON (the same
-/// `parquet_variant_json` serializer used everywhere: the wire, the coercion
-/// path, and `text_match`'s row-eval), so all three agree byte-for-byte.
+/// Render one Variant row to text. `kv=false` → canonical JSON, produced by the
+/// same serializer as the wire and `text_match` row-eval so all agree byte-for-byte.
 pub(crate) fn variant_to_text(col: &ArrayRef, row: usize, kv: bool) -> Result<Option<String>> {
     let struct_arr = col.as_any().downcast_ref::<StructArray>().context("variant should be StructArray")?;
     if struct_arr.is_null(row) {
@@ -390,9 +351,7 @@ mod builder_tests {
             data_type: dt.into(),
             nullable: true,
             tantivy: tv,
-            dictionary: None,
-            bloom_filter: false,
-            mutable: false,
+            ..Default::default()
         };
         TableSchema {
             rollups: vec![],
@@ -408,7 +367,7 @@ mod builder_tests {
             fields: vec![
                 f("timestamp", "Timestamp(Microsecond, Some(\"UTC\"))", None),
                 f("id", "Utf8", None),
-                f("level", "Utf8", Some(TantivyFieldConfig { indexed: true, tokenizer: Some("raw".into()), flatten: None, list_mode: Default::default() })),
+                f("level", "Utf8", Some(TantivyFieldConfig { indexed: true, tokenizer: Some("raw".into()), ..Default::default() })),
             ],
         }
     }
@@ -422,8 +381,7 @@ mod builder_tests {
     }
 
     /// One row per batch so each `index_to_writer` call is a separate commit
-    /// producing its own (tiny, same-sized) segment — the shape the default
-    /// `LogMergePolicy` would collapse once ≥8 pile up in one level.
+    /// producing its own segment.
     fn batch(n: i64) -> RecordBatch {
         RecordBatch::try_new(
             arrow_schema(DataType::Utf8),
@@ -456,12 +414,8 @@ mod builder_tests {
                 None,
                 Some(vec![Some("*"), Some("α")]),
             ] {
-                if let Some(values) = values {
-                    values.into_iter().for_each(|value| lists.values().append_option(value));
-                    lists.append(true);
-                } else {
-                    lists.append(false);
-                }
+                values.iter().flatten().for_each(|value| lists.values().append_option(*value));
+                lists.append(values.is_some());
             }
             let values: ArrayRef = Arc::new(lists.finish());
             let input = RecordBatch::try_new(
@@ -513,12 +467,8 @@ mod builder_tests {
         hits
     }
 
-    /// Phase 4: merging must not run on the ingest path. Pins all three
-    /// invariants on one index — (i) 12 deferred commits leave 12 segments
-    /// (default `LogMergePolicy` merges at ≥8 same-level segments, so an
-    /// accidental policy regression fails here), (ii) the explicit merge path
-    /// collapses them to one segment, (iii) the hit set is byte-identical
-    /// across the merge, which is what makes deferral safe.
+    /// Merging must not run on the ingest path: deferred commits never merge,
+    /// an explicit merge collapses to one segment, and hits are unchanged.
     #[test]
     fn deferred_commits_do_not_merge_and_explicit_merge_preserves_hits() {
         let built = build_for_table(&table());
@@ -534,24 +484,16 @@ mod builder_tests {
         assert_eq!(unmerged.len(), 6, "6 odd-numbered rows are ERROR");
         assert_eq!(index.searchable_segment_ids().unwrap().len(), 12);
 
-        // Maintenance cadence: no new documents, merge what's there.
-        let stats = index_to_writer(&built, &index, &[], MergeMode::Now).expect("merge build");
+        // No new documents, merge what's there.
+        let stats = index_to_writer(&built, &index, std::iter::empty::<RecordBatch>(), MergeMode::Now).expect("merge build");
         assert_eq!(stats.segments, 1, "explicit merge must collapse segments");
         assert_eq!(index.searchable_segment_ids().unwrap().len(), 1);
 
-        // Merging is semantically invisible: same hits, same ts/id/ordinals.
         assert_eq!(error_hits(&index, &built), unmerged);
     }
 
     /// A COST guard, not a correctness one: the build must put its scratch on
     /// the volume it was handed and write NOTHING under the process temp dir.
-    ///
-    /// In prod `std::env::temp_dir()` is the container's overlay2 layer on the
-    /// same array as the WAL, and 5.4 builds/min of multi-GB indexes there ran
-    /// it to 100% util / 546 ms `w_await`, which is what made client INSERTs
-    /// take 48 s at p99 (2026-09-11). A build that still *works* while writing
-    /// to /tmp passes every correctness assertion and reintroduces the outage,
-    /// so the assertion has to be about where the bytes land.
     #[test]
     fn index_builds_keep_scratch_off_the_process_temp_dir() {
         let scratch = tempfile::tempdir().expect("scratch root");
@@ -559,23 +501,14 @@ mod builder_tests {
         verify_blob(&blob).expect("verify");
 
         assert_eq!(stats.rows, 2, "build must actually have indexed the batches");
-        // Asserts the ROOT, not leftover files: every scratch dir is reclaimed
-        // on drop, so counting files under a redirected TMPDIR finds nothing
-        // whether the fix is present or not. Verified to go red by reverting
-        // `scratch_tempdir` to a bare `tempfile::tempdir()`.
+        // Asserts the ROOT, not leftover files: scratch dirs are reclaimed on
+        // drop, so counting files under a redirected TMPDIR proves nothing.
         assert!(scratch.path().join("tantivy_scratch").is_dir(), "build must root its scratch under the volume it was given");
     }
 
-    /// The scratch dir now outlives a hard kill (it is on the data volume, not
-    /// the container's `/tmp`), so startup must reclaim it or a volume that
-    /// also holds the WAL fills up.
-    /// COST guard: verification must not materialise the index a second time.
-    ///
-    /// It used to unpack the whole archive to disk purely to prove it opens —
-    /// roughly half of every build's disk cost, on the array client INSERTs
-    /// fsync against. A version that writes to disk still verifies correctly
-    /// and still passes the corrupt-blob tests, so the assertion has to be that
-    /// nothing was written.
+    /// COST guard: verification must not materialise the index on disk a
+    /// second time — a disk-writing version still passes every correctness
+    /// assertion, so the assertion has to be that nothing was written.
     #[test]
     fn verifying_a_blob_materializes_nothing_on_disk() {
         let scratch = tempfile::tempdir().expect("scratch");
@@ -635,48 +568,33 @@ mod builder_tests {
 }
 
 // ===== schema =====
-// Build a Tantivy `Schema` from the YAML `TableSchema`.
-//
-// Always emits two reserved fields:
-// - `_timestamp`: i64 microseconds, STORED + FAST (range queries, sort)
-// - `_id`: text raw tokenizer, STORED (returned to caller for prefilter)
-//
-// User fields are honored from `FieldDef.tantivy`. Only fields with
-// `indexed: true` produce a tantivy field. Tokenizer choice:
+// Build a Tantivy `Schema` from the YAML `TableSchema`. Always emits
+// `_timestamp` (i64 micros, STORED+FAST) and `_id` (raw text, STORED); user
+// fields with `tantivy.indexed: true` become text fields. Tokenizer choice:
 //   "raw"     → keyword (exact match, single token; case-sensitive)
-//   "default" → tantivy default tokenizer (lowercase + word split)
-//   "ngram3"  → lowercased 3-grams; supports `LIKE '%substr%'`, `'%suffix'`,
-//               and `ILIKE 'word'`. Larger postings than word tokenizer
-//               but the trigram dictionary is bounded (~10k entries for
-//               ASCII), so net index size is typically 1.5–2× vs default.
-//
-// **Default (no tokenizer specified)**: `ngram3` — substring search is the
-// dominant pattern for logs/traces. Opt-down to `raw`/`default` for
-// point-lookup-only columns (IDs, enums).
+//   "default" → lowercase + word split
+//   "ngram3"  → lowercased 3-grams; supports `LIKE '%substr%'` and `ILIKE`.
+// No tokenizer specified defaults to `ngram3`.
 
-/// Tokenizer name we use for n-gram indexing. Combined with `LowerCaser` so
-/// `ILIKE` semantics fall out automatically.
+/// Tokenizer name for n-gram indexing. Combined with `LowerCaser` so `ILIKE`
+/// semantics fall out automatically.
 pub const NGRAM3_TOKENIZER: &str = "tf_ngram3";
-/// Tokenizer name we use for word-level indexing (lowercase + word split +
-/// ASCII folding + max-length cap). Same name as tantivy's default so
-/// the `TEXT` field options can reuse it.
+/// Word-level indexing (lowercase + word split + ASCII fold + length cap).
+/// Named after tantivy's default so `TEXT` field options can reuse it.
 pub const DEFAULT_TOKENIZER: &str = "default";
 /// Tokenizer name for keyword/exact-match indexing.
 pub const RAW_TOKENIZER: &str = "raw";
 /// Token length cap; bounds posting growth on pathological inputs.
 const MAX_TOKEN_LEN: usize = 256;
 
-// User fields are indexed-only by design: tantivy is a search index, not a
-// document store — the authoritative row payload lives in Delta/parquet.
-// Only `_timestamp` and `_id` are stored, because the reader needs them to
-// emit `(timestamp, id)` hits that the SQL layer joins back against Delta.
+// User fields are indexed-only: only `_timestamp` and `_id` are stored, because
+// the reader emits `(timestamp, id)` hits the SQL layer joins back to Delta.
 
 pub const TS_FIELD: &str = "_timestamp";
 pub const ID_FIELD: &str = "_id";
-/// Global row offset of the doc within the file the index covers (FAST).
-/// Only meaningful when the index was built by reading the parquet back in
-/// row order (`ManifestEntry.ordinals_valid`) — the flush path indexes
-/// pre-sort batches whose order differs from the written file.
+/// Global row offset of the doc within the file the index covers (FAST). Only
+/// meaningful when the index was built by reading the parquet back in row order
+/// (`ManifestEntry.ordinals_valid`); flush-path indexes see pre-sort batches.
 pub const ROW_ORDINAL_FIELD: &str = "_row_ordinal";
 
 /// Result of building a tantivy schema for a table.
@@ -685,8 +603,7 @@ pub struct BuiltSchema {
     pub timestamp: Field,
     pub id: Field,
     pub row_ordinal: Field,
-    /// Map of source-column-name → tantivy field. Only contains user columns
-    /// that were `indexed: true` in YAML. Variants/lists are included here.
+    /// Source-column-name → tantivy field, for `indexed: true` columns only.
     pub user_fields: HashMap<String, UserField>,
 }
 
@@ -729,9 +646,8 @@ pub fn build_for_table(table: &TableSchema) -> BuiltSchema {
 }
 
 fn raw_id_options() -> TextOptions {
-    // FAST (raw-normalized) lets the reader pull hit ids from the columnar
-    // store instead of per-doc doc-store fetches. STORED is kept so indexes
-    // remain readable by the pre-fast-field fallback path (and older readers).
+    // FAST lets the reader pull hit ids columnar instead of per-doc doc-store
+    // fetches; STORED is kept so older readers can still open the index.
     TextOptions::default()
         .set_indexing_options(TextFieldIndexing::default().set_tokenizer(RAW_TOKENIZER).set_index_option(IndexRecordOption::Basic))
         .set_fast(Some(RAW_TOKENIZER))
@@ -739,9 +655,7 @@ fn raw_id_options() -> TextOptions {
 }
 
 /// Canonicalize a YAML tokenizer name. Absent *and* unknown names fall through
-/// to ngram3 (better-than-nothing rather than panic): the vast majority of
-/// log/trace text queries use `LIKE '%substr%'` / `ILIKE`, which only the
-/// n-gram index can accelerate.
+/// to ngram3 rather than panicking.
 fn canonical_tokenizer(cfg: &TantivyFieldConfig) -> &'static str {
     match cfg.tokenizer.as_deref().unwrap_or(NGRAM3_TOKENIZER) {
         RAW_TOKENIZER => RAW_TOKENIZER,
@@ -761,12 +675,6 @@ fn text_options_for(cfg: &TantivyFieldConfig) -> TextOptions {
 /// Register TimeFusion's custom tokenizers on a tantivy `Index`. Must be
 /// called immediately after `Index::create*` and on every reader open;
 /// tantivy's tokenizer registry is per-index, not global.
-///
-/// Registers:
-/// - `tf_ngram3`: 3-grams over lowercased + ASCII-folded text, with a 256-char
-///   length cap to bound posting growth on pathological inputs.
-/// - `default`, `raw`: already registered by tantivy; no-op (just here so the
-///   caller doesn't need to remember which are built-in).
 pub fn register_tokenizers(index: &Index) {
     /// Shared filter chain: length cap → lowercase → ASCII fold.
     fn analyzer<T: Tokenizer>(tokenizer: T) -> TextAnalyzer {
@@ -774,8 +682,7 @@ pub fn register_tokenizers(index: &Index) {
     }
     let tokenizers = index.tokenizers();
     tokenizers.register(NGRAM3_TOKENIZER, analyzer(NgramTokenizer::new(3, 3, false).expect("3-gram bounds are valid")));
-    // Re-register the built-in "raw"/"default" chains explicitly so behavior is
-    // pinned even if upstream changes them.
+    // Re-register the built-in chains so behavior is pinned against upstream.
     tokenizers.register(RAW_TOKENIZER, TextAnalyzer::builder(RawTokenizer::default()).build());
     tokenizers.register(DEFAULT_TOKENIZER, analyzer(SimpleTokenizer::default()));
 }
@@ -790,11 +697,10 @@ pub fn indexed_field_names(table: &TableSchema) -> Vec<String> {
 // index blob URI. Tracks build status so the read-side can fall back to a
 // full scan when an index is missing or marked failed.
 //
-// Manifest is JSON, persisted to object storage via temp+rename. We use
-// `ObjectStore::put` (PUT-overwrite) — collisions are resolved by a coarse
-// in-process lock (DashMap entry per (table, project_id)) plus an etag
-// check on read. Good enough for low-frequency manifest writes; if multiple
-// writers race, last-writer-wins (entries are idempotent upserts).
+// Manifest is JSON written with PUT-overwrite; concurrent writers are
+// serialized by a coarse in-process lock per (table, project_id). Across
+// processes it is last-writer-wins, which is safe because entries are
+// idempotent upserts.
 
 pub const MANIFEST_PREFIX: &str = "index_manifests";
 pub const SCHEMA_VERSION: u32 = 1;
@@ -876,19 +782,14 @@ pub struct ManifestEntry {
     pub max_timestamp_micros: Option<i64>,
     /// Set when build failed; `index` will be None.
     pub error: Option<String>,
-    /// Parquet file URIs that this index covers. Populated from the Delta
-    /// write commit's add-actions. Used by `gc_after_compaction` to detect
-    /// stale entries: when any of these URIs is no longer live (i.e. it was
-    /// compacted away), the entry no longer authoritatively covers its rows
-    /// and can be dropped. Older entries built before this field existed
-    /// will deserialize to an empty Vec.
+    /// Parquet file URIs this index covers. GC drops the entry once any of
+    /// them is no longer live (compacted away).
     #[serde(default)]
     pub covered_files: Vec<String>,
-    /// True when the index's `_row_ordinal` fast field equals parquet row
-    /// order — i.e. the index was built by reading the committed file back
-    /// (compaction reindex / backfill). Flush-path indexes see batches
-    /// BEFORE the writer's sort, so their ordinals must not drive row
-    /// selection. Old entries deserialize to false.
+    /// True when `_row_ordinal` equals parquet row order, i.e. the index was
+    /// built by reading the committed file back. Flush-path indexes see
+    /// batches BEFORE the writer's sort, so their ordinals must not drive
+    /// row selection.
     #[serde(default)]
     pub ordinals_valid: bool,
 }
@@ -899,10 +800,8 @@ pub fn manifest_path(table: &str, project_id: &str) -> ObjPath {
 }
 
 /// Project ids that have a manifest under this table's prefix — the GC's
-/// authoritative iteration set. Manifests are keyed by the project uuid taken
-/// from the parquet URI at build time, so a fixed "default"+custom-projects
-/// list never visits unified tenants' manifests and their entries outlive
-/// every compaction.
+/// authoritative iteration set. Manifests are keyed by the project uuid from
+/// the parquet URI, so a fixed project list would miss unified tenants.
 pub async fn list_manifest_projects(store: &dyn ObjectStore, table: &str) -> Result<Vec<String>> {
     let prefix = ObjPath::from(format!("{MANIFEST_PREFIX}/{table}"));
     let listing = store.list_with_delimiter(Some(&prefix)).await.context("list manifest prefixes")?;
@@ -924,15 +823,12 @@ pub async fn save_manifest(store: &dyn ObjectStore, table: &str, project_id: &st
 
 type ManifestLocks = dashmap::DashMap<TableKey, Arc<tokio::sync::Mutex<()>>>;
 
-/// Load the manifest, apply `f`, and save it back. The shared load/save
-/// skeleton behind `upsert` and `remove_many`. Serialized per
-/// (table, project_id) — concurrent bucket flushes upserting the same
-/// manifest would otherwise interleave load/save and drop each other's
-/// entries (last-writer-wins), silently un-covering files and disabling
-/// the prefilter via the coverage gate.
-/// `f` returns whatever the caller needs out of the mutation (GC needs the
-/// entries it removed, so it can delete their blobs) plus whether the manifest
-/// actually changed — a no-op mutation must not rewrite the object.
+/// Load the manifest, apply `f`, and save it back, serialized per
+/// (table, project_id): concurrent flushes would otherwise interleave
+/// load/save and silently drop each other's entries.
+///
+/// `f` returns the caller's result plus whether the manifest actually changed;
+/// a no-op mutation must not rewrite the object.
 pub async fn mutate<R, F: FnOnce(&mut Manifest) -> (R, bool)>(store: &dyn ObjectStore, table: &str, project_id: &str, f: F) -> Result<R> {
     static LOCKS: std::sync::OnceLock<ManifestLocks> = std::sync::OnceLock::new();
     let lock = LOCKS.get_or_init(Default::default).entry((table.into(), project_id.into())).or_default().clone();
@@ -968,14 +864,9 @@ pub async fn upsert_manifest(store: &dyn ObjectStore, table: &str, project_id: &
     upsert_manifest_many(store, table, project_id, vec![(parquet_key.to_string(), entry)]).await
 }
 
-/// Upsert many entries under ONE load+save of the manifest.
-///
-/// `upsert_manifest` costs a full read-modify-write of the whole manifest —
-/// 745 KB and 950 entries for the busiest project — under a per-(table,project)
-/// lock, so N builds for one project pay that N times and serialize on it. That
-/// is the backfill's throughput ceiling, not the indexing: measured 2026-08-22
-/// at ~60 builds/hr against ~85/hr accrual, i.e. coverage that cannot converge.
-/// Batching makes a 150-file pass cost roughly one manifest write per project.
+/// Upsert many entries under ONE load+save of the manifest. Each
+/// `upsert_manifest` is a full read-modify-write under a per-(table,project)
+/// lock, so batching is what keeps backfill throughput off that ceiling.
 pub async fn upsert_manifest_many(store: &dyn ObjectStore, table: &str, project_id: &str, entries: Vec<(String, ManifestEntry)>) -> Result<()> {
     if entries.is_empty() {
         return Ok(());
@@ -1000,23 +891,16 @@ pub async fn remove_manifest_entries(store: &dyn ObjectStore, table: &str, proje
 }
 
 // ===== store =====
-// Pack/unpack tantivy indexes for object-store transport.
-//
-// Cold form: a single `tar.zst` blob per parquet file.
-// Warm form: an extracted directory (used to mmap-open via tantivy::Index).
-//
-// Path conventions (rooted under whatever prefix the caller chose):
-//   indexes/{table}/v1/{project_id}/{file_uuid}.tantivy.tar.zst
-//
-// `pack_index` serializes the in-memory `Index` to bytes; `unpack_to_dir`
-// is the inverse. Upload/download are thin wrappers around `ObjectStore`.
+// Pack/unpack tantivy indexes for object-store transport. Cold form is a single
+// `tar.zst` blob per parquet file; warm form is an extracted directory that
+// tantivy mmap-opens. Paths: indexes/{table}/v1/{project_id}/{uuid}.tantivy.tar.zst
 
 pub const INDEX_PREFIX: &str = "indexes";
 pub const INDEX_VERSION: &str = "v1";
 pub const BLOB_SUFFIX: &str = ".tantivy.tar.zst";
-/// Decoded Arrow batches allowed between the parquet reader and Tantivy
-/// writer. Backpressure at two bounds source-row memory independent of file
-/// size while keeping decode and indexing overlapped.
+/// Decoded Arrow batches allowed between the parquet reader and Tantivy writer:
+/// bounds source-row memory independently of file size, while keeping decode
+/// and indexing overlapped.
 pub const PARQUET_INDEX_BATCH_WINDOW: usize = 2;
 
 /// Object-store path for a given parquet file's index blob.
@@ -1030,9 +914,7 @@ pub fn blob_path(table: &str, project_id: &str, file_uuid: &str) -> ObjPath {
 /// → indexes/{table}/v1/project_id=<uuid>/date=<d>/part-<id>-c000.zstd.tantivy.tar.zst
 ///
 /// A pure suffix swap under the version prefix, so the mapping is 1:1 with the
-/// parquet tree and reversible (`index_to_parquet_rel` is the inverse):
-/// "does every live parquet have an index?" / "are there orphan blobs?" reduce
-/// to a list + diff against the Delta add-file set.
+/// parquet tree and reversible (`index_to_parquet_rel` is the inverse).
 pub fn index_path_for_parquet(table: &str, parquet_rel: &str) -> ObjPath {
     let stem = parquet_rel.strip_suffix(".parquet").unwrap_or(parquet_rel);
     ObjPath::from(format!("{INDEX_PREFIX}/{table}/{INDEX_VERSION}/{stem}{BLOB_SUFFIX}"))
@@ -1061,10 +943,9 @@ pub fn index_to_parquet_rel(table: &str, blob_path: &str) -> Option<String> {
     Some(format!("{stem}.parquet"))
 }
 
-/// Stream one committed parquet through a bounded two-batch channel into the
-/// on-disk Tantivy writer, then pack and verify the completed index. This is the
-/// memory-bounded counterpart to [`build_and_pack`], retained for flush-time
-/// in-memory batches.
+/// Stream one committed parquet through a bounded channel into the on-disk
+/// Tantivy writer, then pack and verify the completed index — the
+/// memory-bounded counterpart to [`build_and_pack`].
 pub async fn build_parquet_and_pack(
     store: Arc<dyn ObjectStore>, parquet_rel: &str, table: &'static TableSchema, level: i32, merge: MergeMode, scratch: &Path,
 ) -> Result<(Bytes, IndexBuildStats)> {
@@ -1077,9 +958,8 @@ pub async fn build_parquet_and_pack(
     let path = ObjPath::from(parquet_rel);
     let meta = store.head(&path).await.with_context(|| format!("head {parquet_rel}"))?;
     let reader = ParquetObjectReader::new(store, path).with_file_size(meta.size);
-    // Decode exactly the columns the full index consumes. This preserves the
-    // normal index schema and every physical row, without reading unrelated
-    // Parquet column chunks on each rebuild.
+    // Decode exactly the columns the index consumes — same index schema and
+    // every physical row, without reading unrelated column chunks.
     let fields: std::collections::HashSet<&str> =
         table.fields.iter().filter_map(|f| f.tantivy.as_ref()?.indexed.then_some(f.name.as_str())).chain(["timestamp", "id"]).collect();
     let builder = ParquetRecordBatchStreamBuilder::new(reader).await.context("parquet stream builder")?;
@@ -1113,15 +993,9 @@ pub async fn build_parquet_and_pack(
 
 /// Scratch directory for an index build, rooted on the data volume.
 ///
-/// NOT `std::env::temp_dir()`. In prod that resolves to `/tmp` inside the
-/// container, i.e. the overlay2 writable layer — and every TimeFusion disk
-/// tenant shares one physical array (`md3`). On 2026-09-11 index builds ran at
-/// 5.4/min against ~3.8 GB indexes, each written roughly twice (segments, then
-/// `verify_blob`'s full unpack), putting ~300-600 MB/s onto that array; it sat
-/// at 100% util with `w_await` 63-620 ms. Client INSERTs fsync pre-ack on the
-/// same array, so this surfaced as a p99 write latency of 48 s. Keeping the
-/// scratch on the data volume puts the bytes where the operator has already
-/// sized and can observe them, and off the container's copy-on-write layer.
+/// Deliberately NOT `std::env::temp_dir()`: in a container that is the overlay2
+/// copy-on-write layer, where multi-GB build scratch is unsized, unobservable,
+/// and contends with the write path.
 fn scratch_tempdir(root: &Path) -> Result<tempfile::TempDir> {
     let base = scratch_root(root);
     std::fs::create_dir_all(&base).with_context(|| format!("create scratch root {}", base.display()))?;
@@ -1133,26 +1007,17 @@ pub(crate) fn scratch_root(root: &Path) -> std::path::PathBuf {
 }
 
 /// Delete scratch directories left by a previous process, once at startup.
+/// `TempDir` reclaims on drop, but a hard kill skips that and multi-GB indexes
+/// would accumulate on the volume that also carries the WAL.
 ///
-/// `TempDir` reclaims on drop, but this process does not always get to drop:
-/// prod dies by healthcheck kill and maintenance units die to process exit as a
-/// matter of course. While scratch lived in the container's `/tmp` that was
-/// harmless — the writable layer went away with the container. On the data
-/// volume it does not, and multi-GB indexes would accumulate on a volume that
-/// also carries the WAL, where running out of space fails WAL appends.
+/// Snapshot-then-delete off-thread, and only `TempDir`'s own `.tmp*` names:
+/// enumerating lazily would race directories a live build is creating.
 ///
-/// Snapshot-then-delete off-thread, and only touch `TempDir`'s own `.tmp*`
-/// names, for the reason `reap_orphaned_spill_dirs` documents: enumerating
-/// lazily would race directories a live build is creating.
-///
-/// Runs at most ONCE per process. A second service constructed later shares the
-/// root with the first, and its "orphans" would be the first's live scratch —
-/// the suite caught exactly that (19 tantivy failures, green in isolation).
+/// Runs at most ONCE per process — a second service sharing the root would see
+/// the first's live scratch as orphans.
 pub fn reap_orphaned_scratch_dirs(root: &Path) {
-    static REAPED: std::sync::Once = std::sync::Once::new();
-    let mut ran = false;
-    REAPED.call_once(|| ran = true);
-    if !ran {
+    static REAPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if REAPED.swap(true, std::sync::atomic::Ordering::Relaxed) {
         return;
     }
     let base = scratch_root(root);
@@ -1180,7 +1045,9 @@ pub fn build_and_pack(table: &TableSchema, batches: &[RecordBatch], level: i32, 
 }
 
 /// Build a tantivy `Index` to a fresh on-disk directory in one shot.
-pub fn build_to_dir(table: &TableSchema, batches: &[RecordBatch], dir: &Path, merge: MergeMode) -> Result<(BuiltSchema, IndexBuildStats)> {
+pub fn build_to_dir(
+    table: &TableSchema, batches: impl IntoIterator<Item = impl std::borrow::Borrow<RecordBatch>>, dir: &Path, merge: MergeMode,
+) -> Result<(BuiltSchema, IndexBuildStats)> {
     let built = build_for_table(table);
     let index = create_disk_index(&built, dir)?;
     let stats = index_to_writer(&built, &index, batches, merge)?;
@@ -1204,18 +1071,11 @@ pub fn unpack_to_dir(blob: &[u8], dest: &Path) -> Result<()> {
     tar::Archive::new(&tar_bytes[..]).unpack(dest).context("tar unpack")
 }
 
-/// Round-trip a freshly packed blob (unpack + open) before publishing it, so a
-/// structurally-corrupt archive is never uploaded. Blob paths are immutable and
-/// reader-cached, so a poison blob would otherwise fail every future read until
-/// a manual reindex.
-///
-/// Stages into a `RamDirectory` rather than onto disk. The guarantee is
-/// unchanged — every entry is still decoded in full and the index still has to
-/// `open` — but the second full-size materialisation is gone. It was pure
-/// waste: `zstd::decode_all` already holds the whole uncompressed tar in
-/// memory, so writing it out again bought nothing and doubled a build's disk
-/// cost. At prod's 5.4 builds/min against ~3.8 GB indexes that was roughly half
-/// of ~680 MB/s onto the array every client `fsync` waits on (2026-09-11).
+/// Round-trip a freshly packed blob (decode every entry + open it) before
+/// publishing, so a structurally-corrupt archive is never uploaded: blob paths
+/// are immutable and reader-cached, so a poison blob fails every future read
+/// until a manual reindex. Stages into a `RamDirectory` — `zstd::decode_all`
+/// already holds the whole tar in memory, so writing it to disk is pure waste.
 pub fn verify_blob(blob: &[u8]) -> Result<()> {
     let tar_bytes = zstd::decode_all(blob).context("zstd decode")?;
     let staged = tantivy::directory::RamDirectory::create();
@@ -1225,9 +1085,8 @@ pub fn verify_blob(blob: &[u8]) -> Result<()> {
         if !entry.header().entry_type().is_file() {
             continue;
         }
-        // `pack_dir` tars with `append_dir_all(".", …)`, so paths arrive as
-        // `./meta.json`. A tantivy index directory is flat, so the file name is
-        // exactly the key tantivy will look the entry up by.
+        // `pack_dir` tars with `append_dir_all(".", …)` so paths arrive as
+        // `./meta.json`; a tantivy index dir is flat, so the file name is the key.
         let entry_path = entry.path().context("tar entry path")?.into_owned();
         let Some(name) = entry_path.file_name().map(PathBuf::from) else { continue };
         let mut bytes = Vec::with_capacity(usize::try_from(entry.size()).unwrap_or(0));
@@ -1248,9 +1107,8 @@ pub fn open_index(dir: &Path) -> Result<Index> {
 
 fn open_index_in(dir: impl tantivy::Directory) -> Result<Index> {
     let index = Index::open(dir).map_err(|e| anyhow!("open index: {e}"))?;
-    // Tokenizer registry is per-Index, not persisted, so the reader must
-    // re-register exactly the same chains the writer used. Mismatch ⇒ silent
-    // miss (tantivy looks up by name and falls back to default).
+    // Registry is per-Index and not persisted: the reader must re-register the
+    // same chains the writer used, or lookups silently fall back to default.
     register_tokenizers(&index);
     Ok(index)
 }
@@ -1283,39 +1141,26 @@ mod store_tests {
         let rel = "project_id=abc-123/date=2026-06-30/part-00000-deadbeef-c000.zstd.parquet";
         let blob = index_path_for_parquet(table, rel).to_string();
         assert_eq!(blob, "indexes/otel_logs_and_spans/v1/project_id=abc-123/date=2026-06-30/part-00000-deadbeef-c000.zstd.tantivy.tar.zst");
-        // inverse recovers the exact parquet rel path
         assert_eq!(index_to_parquet_rel(table, &blob).as_deref(), Some(rel));
-        // a blob for a different table / a non-blob path is not ours
         assert_eq!(index_to_parquet_rel("other_table", &blob), None);
         assert_eq!(index_to_parquet_rel(table, "indexes/otel_logs_and_spans/v1/foo.txt"), None);
     }
 }
 
 // ===== mem_index =====
-// In-memory tantivy index for a single MemBuffer bucket.
-//
-// Each `TimeBucket` of a tantivy-eligible table holds an `Option<BucketTextIndex>`
-// that's built on first text-match query and re-used until the bucket's
-// row count grows (cheap monotonic check; no per-insert lock contention).
-// Indexes are dropped when the bucket drains or is evicted — they're a
-// pure query cache, never the authoritative source.
-//
-// Memory profile: each index holds `~2× indexed text size` in postings —
-// ~200MB per active bucket at 10 minutes of moderate log ingest. Acceptable
-// while ≤ flush_interval buckets are active; past that window the post-flush
-// callback takes over and these in-memory copies are released.
+// In-memory tantivy index for a single MemBuffer bucket, built on first
+// text-match query and reused until the bucket's row count grows. Dropped when
+// the bucket drains or is evicted — a pure query cache, never authoritative.
+// Each index costs roughly 2x the indexed text size in postings.
 
 /// A built tantivy index covering all rows currently in a bucket.
 pub struct BucketTextIndex {
     pub index: Index,
     pub built_schema: Arc<BuiltSchema>,
-    /// Row count at build time. The cache is valid while
-    /// `bucket.row_count == indexed_rows`. When more rows arrive we
-    /// rebuild on next query; the original SQL predicate keeps results
-    /// correct in the meantime.
+    /// Row count at build time; the cache is valid only while
+    /// `bucket.row_count == indexed_rows`.
     pub indexed_rows: usize,
-    /// Approximate memory cost in bytes (see `estimate_index_size`);
-    /// drives the `MemBuffer` LRU budget.
+    /// Approximate memory cost in bytes; drives the `MemBuffer` LRU budget.
     pub size_bytes: usize,
 }
 
@@ -1328,14 +1173,12 @@ impl BucketTextIndex {
             return Ok(None);
         }
         let size_bytes = estimate_index_size(&indexed, batches);
-        // `build_in_memory` already registers the tokenizers on this index.
         let (index, built_schema, _stats) = build_in_memory(table, batches).with_context(|| format!("build mem-index for {}", table.table_name))?;
         Ok(Some(Self { index, built_schema: Arc::new(built_schema), indexed_rows: row_count, size_bytes }))
     }
 
-    /// Evaluate a routable predicate tree as ONE combined query. Shares the
-    /// query builder with the Delta sidecar search so both sides interpret
-    /// predicates identically (And→Must, Or→Should).
+    /// Evaluate a routable predicate tree as ONE combined query, using the same
+    /// query builder as the Delta sidecar search (And→Must, Or→Should).
     pub fn search_node(&self, node: &PredNode) -> Result<Vec<Hit>> {
         match build_node_query(&self.index, node)? {
             PredsQuery::MissingField => Err(anyhow!("field not in mem-index (schema drift within bucket lifetime)")),
@@ -1344,10 +1187,8 @@ impl BucketTextIndex {
     }
 }
 
-/// Approximate the memory cost of an index built from these batches:
-/// indexed-text bytes × 2 (postings + skip-list overhead, conservative for
-/// trigram tokenizers). Used by the `MemBuffer` LRU budget — accurate to
-/// within ~2× is sufficient since the budget is itself a soft cap.
+/// Approximate memory cost of an index built from these batches: indexed-text
+/// bytes x2 for postings. Feeds the `MemBuffer` LRU budget, itself a soft cap.
 fn estimate_index_size(indexed_fields: &[String], batches: &[RecordBatch]) -> usize {
     use arrow::array::AsArray;
     batches
@@ -1355,8 +1196,8 @@ fn estimate_index_size(indexed_fields: &[String], batches: &[RecordBatch]) -> us
         .flat_map(|batch| indexed_fields.iter().filter_map(move |name| batch.column_by_name(name)))
         .map(|arr| match arr.as_string_opt::<i32>() {
             Some(a) => a.value_data().len(),
-            // Utf8View has no contiguous value buffer — total array bytes
-            // over-count by view/validity overhead but stay in magnitude.
+            // Utf8View has no contiguous value buffer; total array bytes
+            // over-count but stay in magnitude.
             None if arr.as_string_view_opt().is_some() => arr.get_array_memory_size(),
             None => 0,
         })

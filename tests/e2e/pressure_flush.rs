@@ -1,21 +1,13 @@
-//! Memory pressure: with a very small max-memory budget, hammering inserts
-//! must NOT deadlock or OOM — the early-flush path on `insert()` should
-//! drain to Delta. Asserts liveness (we eventually return) and that pressure
-//! pct does not get stuck at 100.
+//! Memory pressure: inserts past the memory budget must apply backpressure and
+//! force-flush rather than deadlock or be rejected.
 
 use std::time::Duration;
 
 use super::harness::{E2eEnv, FROZEN_START_MICROS};
+use super::ordering_pushdown::count_rows;
 
-/// Backpressure-not-rejection through the full prod path. Unlike the liveness
-/// test this replaced (whose ~25MB never crossed the limit), this pushes ~100MB into a
-/// single open bucket — well past the ~76.8MB hard limit on a 64MB budget — so
-/// the open bucket itself is the pressure and only the force-flush escalation
-/// can drain it. With the flush-to-make-room fix every insert must still
-/// succeed (no "Memory limit exceeded"), backpressure must register, and all
-/// rows must be durable + queryable (some in Delta via force-flush, the rest in
-/// MemBuffer). Pre-fix this returned a Postgres error once the buffer crossed
-/// the limit (prod 2026-06-11: 15.8GB > 8GB, every insert rejected).
+/// Pushes ~100MB into a single open bucket, past the hard limit on a 64MB
+/// budget: every insert must still succeed and all rows stay queryable.
 #[serial_test::serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn inserts_over_hard_limit_apply_backpressure_not_rejection() -> anyhow::Result<()> {
@@ -32,9 +24,7 @@ async fn inserts_over_hard_limit_apply_backpressure_not_rejection() -> anyhow::R
 
     const ROWS: usize = 100;
 
-    // ~1MB/row × 100 = ~100MB into one (current) bucket, beyond the ~76.8MB
-    // hard limit — only the current-bucket
-    // force-flush escalation can relieve this.
+    // ~1MB/row × 100 = ~100MB into one open bucket, beyond the hard limit.
     let big_msg = "x".repeat(64 * 1024);
     let big_summary: Vec<String> = (0..16).map(|_| big_msg.clone()).collect();
 
@@ -49,16 +39,12 @@ async fn inserts_over_hard_limit_apply_backpressure_not_rejection() -> anyhow::R
     };
     tokio::time::timeout(Duration::from_secs(90), run).await.map_err(|_| anyhow::anyhow!("inserts under backpressure deadlocked"))??;
 
-    // The ~100MB lands in one open bucket, so only the current-bucket
-    // force-flush escalation can drain it — assert that ran. (We no longer
-    // require `backpressure_engaged_total >= 1`: the background flusher now
-    // escalates proactively at the pressure threshold, often draining the
-    // bucket before any insert reaches the hard-limit backpressure path.)
+    // Only the current-bucket force-flush escalation can drain an open bucket;
+    // `backpressure_engaged_total` is not asserted because proactive flushing
+    // often drains it before an insert hits the hard-limit path.
     assert!(env.snapshot_stats().backpressure_force_flush_total >= 1, "force-flush must drain the over-budget open bucket");
 
-    let rows = client.query("SELECT count(*) FROM otel_logs_and_spans WHERE project_id = $1", &[&"e2e_bp"]).await?;
-    let n: i64 = rows[0].get(0);
-    assert_eq!(n, ROWS as i64, "all backpressured inserts must be durable + queryable");
+    assert_eq!(count_rows(&client, "e2e_bp").await?, ROWS as i64, "all backpressured inserts must be durable + queryable");
 
     Ok(())
 }

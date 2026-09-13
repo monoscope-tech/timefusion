@@ -1,18 +1,8 @@
-//! Property-based tests over MemBuffer + clock interactions. Pure in-process
-//! (no MinIO) so a property loop is fast. The goal is to shake out
-//! invariant violations under sequences a hand-rolled test wouldn't try.
-//!
-//! Invariants asserted:
-//!   - Row count is conserved across insert/query for a fixed (project, table).
-//!   - `compute_bucket_id(ts)` is monotonic in `ts` (sanity check).
-//!   - `current_bucket_id()` strictly increases when the clock is advanced
-//!     by at least one bucket duration.
+//! Property tests over MemBuffer + clock interactions (in-process, no MinIO).
 
 use proptest::prelude::*;
 use timefusion::{support, support::test_helpers, write::mem_buffer::MemBuffer};
 
-// Invariants exercised below: row count conservation across inserts,
-// monotonic bucket id, strict advancement when the frozen clock jumps.
 proptest! {
     #![proptest_config(ProptestConfig { cases: 32, ..ProptestConfig::default() })]
 

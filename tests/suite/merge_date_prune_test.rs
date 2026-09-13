@@ -1,18 +1,6 @@
-//! Reproduction + regression for the 2026-07-17 prod OOM.
-//!
-//! Monoscope's hash-enrichment `UPDATE otel_logs_and_spans ... FROM (unnest)`
-//! carries `project_id = ? AND timestamp >= ? AND timestamp < ?` — a narrow,
-//! recent window. But the table is partitioned by `[project_id, date]`, and
-//! delta-rs cannot map a raw `timestamp` predicate onto the `date` partition,
-//! so the MERGE scanned **all** partitions (prod: 2704 files / 194 GB per
-//! merge → 89 GB RSS → cgroup OOM → restart loop → no queries served).
-//!
-//! `time_range_partition_pruner::with_date_partition_filters` (wired into the
-//! DML Delta-leg predicate) derives `date` bounds from the timestamp window so
-//! the merge prunes to just the touched partition. This test drives delta-rs
-//! merge directly over a multi-date table and asserts the file-scan count
-//! collapses from all-partitions to one when the derived `date` bound is
-//! present.
+//! A raw `timestamp` predicate cannot prune the `date` partition of a
+//! `[project_id, date]`-partitioned table; `with_date_partition_filters`
+//! derives the `date` bounds so a MERGE scans only the touched partition.
 
 use std::sync::Arc;
 
@@ -35,8 +23,8 @@ const BASE_DAY: i32 = 19_723; // 2024-01-01, days since epoch
 const NUM_DAYS: i32 = 5;
 const MID_DAY: i32 = BASE_DAY + 2; // the one date the update targets
 
+/// Noon UTC of `day`, in microseconds.
 fn day_to_micros(day: i32) -> i64 {
-    // noon UTC of the given day, in microseconds
     (day as i64 * 86_400 + 43_200) * 1_000_000
 }
 
@@ -53,13 +41,9 @@ fn schema() -> Arc<Schema> {
 
 const SPAN_ID: &str = "span-mid";
 
-/// One file's worth of rows for the `date=day` partition. Crucially, the
-/// `timestamp` and `context___span_id` VALUES are identical across every file
-/// — only the `date` partition differs. This reproduces the prod condition
-/// (`predicate_filtered=0`): the merge's timestamp-range and join-key stats
-/// overlap every file, so neither prunes, and *only* the exact `date`
-/// partition value can eliminate files. Real prod files behave this way
-/// because UUID span ids and wide per-file timestamp ranges defeat stats.
+/// One file's worth of rows for the `date=day` partition. The `timestamp` and
+/// `context___span_id` values are deliberately identical across every file, so
+/// column stats prune nothing and only the `date` partition value can.
 fn batch_for_day(day: i32) -> Result<RecordBatch> {
     let n = 2;
     let empty_hashes = ListArray::new(
@@ -81,8 +65,8 @@ fn batch_for_day(day: i32) -> Result<RecordBatch> {
 }
 
 /// Create a `[project_id, date]`-partitioned table with one file per day.
-/// The first `write` auto-creates the table (partition columns honored only
-/// on creation); each subsequent write appends one more date-partition file.
+/// The first `write` auto-creates it — partition columns are honored only on
+/// creation.
 async fn build_table(uri: &str) -> Result<()> {
     let mut table = DeltaTable::try_from_url(url::Url::parse(uri)?).await?;
     for day in BASE_DAY..BASE_DAY + NUM_DAYS {
@@ -91,15 +75,14 @@ async fn build_table(uri: &str) -> Result<()> {
     Ok(())
 }
 
-/// The user's WHERE predicate for the mid-day update, minus join key:
-/// `project_id = P AND timestamp >= lo AND timestamp < hi`.
+/// `project_id = P AND timestamp >= lo AND timestamp < hi` — the user's WHERE
+/// predicate for the mid-day update, minus the join key.
 fn user_predicate() -> Expr {
     let ts = || col("target.timestamp");
     let lit_ts = |m: i64| Expr::Literal(ScalarValue::TimestampMicrosecond(Some(m), Some("UTC".into())), None);
     col("target.project_id")
         .eq(lit(PROJECT))
-        // Narrow window (1 h) entirely within MID_DAY — mirrors monoscope's
-        // minutes-wide recent window, so both bounds map to the same `date`.
+        // 1 h window entirely within MID_DAY, so both bounds map to one `date`.
         .and(Expr::BinaryExpr(BinaryExpr::new(Box::new(ts()), Operator::GtEq, Box::new(lit_ts(day_to_micros(MID_DAY) - 3_600_000_000)))))
         .and(Expr::BinaryExpr(BinaryExpr::new(Box::new(ts()), Operator::Lt, Box::new(lit_ts(day_to_micros(MID_DAY) + 3_600_000_000)))))
 }
@@ -125,20 +108,18 @@ async fn merge_files_scanned(table: DeltaTable, predicate: Expr) -> Result<usize
 #[tokio::test(flavor = "multi_thread")]
 async fn merge_prunes_to_single_date_partition() -> Result<()> {
     let dir = tempfile::tempdir()?;
-    // Two identical tables so each merge measures against the pristine 5-file
-    // baseline (a merge commits and rewrites, changing the file set).
-    std::fs::create_dir_all(dir.path().join("raw"))?;
-    std::fs::create_dir_all(dir.path().join("pruned"))?;
-    let raw_uri = format!("file://{}/raw", dir.path().display());
-    let pruned_uri = format!("file://{}/pruned", dir.path().display());
-    build_table(&raw_uri).await?;
-    build_table(&pruned_uri).await?;
+    // Two identical tables: a merge commits and rewrites, so each arm needs its
+    // own pristine baseline.
+    let uri = |name: &str| format!("file://{}/{name}", dir.path().display());
+    for name in ["raw", "pruned"] {
+        std::fs::create_dir_all(dir.path().join(name))?;
+        build_table(&uri(name)).await?;
+    }
+    let (raw_uri, pruned_uri) = (uri("raw"), uri("pruned"));
 
-    // BUG shape: only `timestamp` bounds → delta cannot prune the `date`
-    // partition, so all NUM_DAYS files are scanned.
+    // Only `timestamp` bounds: delta cannot prune `date`, so all files scan.
     let raw_scanned = merge_files_scanned(DeltaTable::try_from_url(url::Url::parse(&raw_uri)?).await?, user_predicate()).await?;
 
-    // FIX: derived `date` bound prunes to the single touched partition.
     let pruned_pred = with_date_partition_filters(user_predicate(), "timestamp");
     let pruned_scanned = merge_files_scanned(DeltaTable::try_from_url(url::Url::parse(&pruned_uri)?).await?, pruned_pred).await?;
 

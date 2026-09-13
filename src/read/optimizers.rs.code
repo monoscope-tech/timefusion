@@ -7,47 +7,33 @@ use datafusion::{
     prelude::col,
     scalar::ScalarValue,
 };
-
-/// Avoids the competing `as_any` methods in this crate's trait scope.
 pub fn downcast<T: 'static>(any: &dyn std::any::Any) -> Option<&T> {
     any.downcast_ref()
 }
-
-/// Borrows any UTF-8 scalar representation; `None` for NULL and non-string scalars.
 fn utf8_scalar(v: &ScalarValue) -> Option<&String> {
     match v {
         ScalarValue::Utf8(s) | ScalarValue::Utf8View(s) | ScalarValue::LargeUtf8(s) => s.as_ref(),
         _ => None,
     }
 }
-
-/// Extracts any UTF-8 scalar representation.
 pub fn extract_utf8_string(v: &ScalarValue) -> Option<String> {
     utf8_scalar(v).cloned()
 }
-
-/// Strips coercion casts that otherwise hide columns and literals from pruning.
 fn peel_casts(expr: &Expr) -> &Expr {
     match expr {
         Expr::Cast(Cast { expr, .. }) | Expr::TryCast(TryCast { expr, .. }) => peel_casts(expr),
         other => other,
     }
 }
-
-/// Matches a column through coercion casts.
 pub fn is_col_through_cast(expr: &Expr, name: &str) -> bool {
     matches!(peel_casts(expr), Expr::Column(c) if c.name == name)
 }
-
-/// Removes coercion casts that otherwise hide literals from pruning.
 pub fn unwrap_literal(expr: &Expr) -> Option<&ScalarValue> {
     match peel_casts(expr) {
         Expr::Literal(scalar, _) => Some(scalar),
         _ => None,
     }
 }
-
-/// Timestamp scalar of any unit → microseconds since epoch.
 pub fn scalar_micros(v: &ScalarValue) -> Option<i64> {
     Some(match v {
         ScalarValue::TimestampSecond(Some(s), _) => s.checked_mul(1_000_000)?,
@@ -57,8 +43,6 @@ pub fn scalar_micros(v: &ScalarValue) -> Option<i64> {
         _ => return None,
     })
 }
-
-/// Reverses comparisons with swapped operands.
 pub fn swap_comparison(op: Operator) -> Operator {
     match op {
         Operator::Gt => Operator::Lt,
@@ -68,12 +52,8 @@ pub fn swap_comparison(op: Operator) -> Operator {
         other => other,
     }
 }
-
-/// Converts timestamp filters to Delta date-partition filters.
 pub mod time_range_partition_pruner {
     use super::*;
-
-    /// Derives partition dates from bounds on the declared time column.
     pub fn timestamp_to_date_filters(expr: &Expr, time_column: &str) -> Vec<Expr> {
         let date_filter = |expr: &Expr, op: Operator| {
             let date = chrono::DateTime::from_timestamp_micros(scalar_micros(unwrap_literal(expr)?)?)?.date_naive();
@@ -86,7 +66,6 @@ pub mod time_range_partition_pruner {
             };
             Some(Expr::BinaryExpr(BinaryExpr::new(Box::new(col("date")), date_op, Box::new(Expr::Literal(ScalarValue::Date32(Some(days_since_epoch)), None)))))
         };
-
         match expr {
             Expr::BinaryExpr(BinaryExpr { left, op, right }) => {
                 let (lit_expr, op) = if is_col_through_cast(left.as_ref(), time_column) {
@@ -104,14 +83,10 @@ pub mod time_range_partition_pruner {
             _ => vec![],
         }
     }
-
-    /// Adds necessary date-partition bounds without excluding matching rows.
     pub fn with_date_partition_filters(predicate: Expr, time_column: &str) -> Expr {
         let date_filters: Vec<Expr> = split_conjunction(&predicate).into_iter().flat_map(|e| timestamp_to_date_filters(e, time_column)).collect();
         date_filters.into_iter().fold(predicate, Expr::and)
     }
-
-    /// Collects date bounds from an AND tree for pruning diagnostics.
     pub fn extract_date_bounds(expr: &Expr) -> Vec<(Operator, i32)> {
         split_conjunction(expr)
             .into_iter()
@@ -125,8 +100,6 @@ pub mod time_range_partition_pruner {
             .collect()
     }
 }
-
-/// Extracts the first positive `project_id = literal` AND-conjunct.
 pub fn extract_project_id_from_expr(expr: &Expr) -> Option<String> {
     match expr {
         Expr::BinaryExpr(BinaryExpr { left, op: Operator::Eq, right }) => match (left.as_ref(), right.as_ref()) {
@@ -137,18 +110,11 @@ pub fn extract_project_id_from_expr(expr: &Expr) -> Option<String> {
         _ => None,
     }
 }
-
 pub struct ProjectIdPushdown;
-
 impl ProjectIdPushdown {
     pub fn has_project_id_filter(filters: &[Expr]) -> bool {
         filters.iter().any(Self::contains_project_id)
     }
-
-    /// Recognises `project_id = 'x'` (either argument order) and AND-conjuncts
-    /// containing one. **OR** is intentionally NOT handled: reporting "no
-    /// project_id filter" for it keeps the multi-tenant guard strict (the query
-    /// errors out instead of silently scanning all projects).
     pub fn contains_project_id(expr: &Expr) -> bool {
         match expr {
             Expr::BinaryExpr(BinaryExpr { left, op: Operator::Eq, right }) => matches!(
@@ -161,7 +127,6 @@ impl ProjectIdPushdown {
         }
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::time_range_partition_pruner::{extract_date_bounds, timestamp_to_date_filters, with_date_partition_filters};
@@ -170,40 +135,29 @@ mod tests {
         arrow::datatypes::{DataType, TimeUnit},
         logical_expr::Between,
     };
-
     fn timestamp(micros: i64) -> Expr {
         Expr::Literal(ScalarValue::TimestampMicrosecond(Some(micros), Some("UTC".into())), None)
     }
-
     fn date_filters(expr: Expr) -> Vec<(Operator, i32)> {
         timestamp_to_date_filters(&expr, "timestamp").iter().flat_map(extract_date_bounds).collect()
     }
-
-    /// 2024-01-01T00:00:00Z in micros → day 19_723.
     const START: i64 = 1_704_067_200_000_000;
-    /// 2024-01-03T00:00:00Z in micros → day 19_725.
     const END: i64 = 1_704_240_000_000_000;
-
     fn cmp(left: Expr, op: Operator, right: Expr) -> Expr {
         Expr::BinaryExpr(BinaryExpr::new(Box::new(left), op, Box::new(right)))
     }
-
     fn ns_type() -> DataType {
         DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into()))
     }
-
     fn cast_ns(expr: Expr) -> Expr {
         Expr::Cast(Cast::new(Box::new(expr), ns_type()))
     }
-
     fn try_cast_ns(expr: Expr) -> Expr {
         Expr::TryCast(TryCast::new(Box::new(expr), ns_type()))
     }
-
     fn scalar(v: ScalarValue) -> Expr {
         Expr::Literal(v, None)
     }
-
     #[test_case::test_case(Expr::Between(Between::new(Box::new(col("timestamp")), false, Box::new(timestamp(START)), Box::new(timestamp(END))))
         => vec![(Operator::GtEq, 19_723), (Operator::LtEq, 19_725)] ; "between derives two inclusive date bounds")]
     #[test_case::test_case(cmp(col("timestamp"), Operator::GtEq, timestamp(START)) => vec![(Operator::GtEq, 19_723)] ; "col >= micros literal")]
@@ -215,25 +169,18 @@ mod tests {
         => vec![(Operator::Eq, 19_723)] ; "millisecond literal equality")]
     #[test_case::test_case(cmp(col("timestamp"), Operator::Eq, scalar(ScalarValue::TimestampSecond(Some(START / 1_000_000), Some("UTC".into()))))
         => vec![(Operator::Eq, 19_723)] ; "second literal equality")]
-    // Extended-protocol param binding + TypeCoercion wrap the bound in a
-    // `Cast(Literal)`; the literal side must be unwrapped or no `date` bound is derived.
     #[test_case::test_case(cmp(col("timestamp"), Operator::GtEq, cast_ns(timestamp(START)))
         => vec![(Operator::GtEq, 19_723)] ; "2026-07-20: cast-wrapped timestamp literal still derives date bounds")]
     fn timestamp_predicates_derive_date_bounds(expr: Expr) -> Vec<(Operator, i32)> {
         date_filters(expr)
     }
-
-    /// A `project_id = ? AND timestamp >= ? AND timestamp < ?` predicate must gain
-    /// `date` partition bounds so the Delta merge prunes files.
     #[test]
     fn monoscope_update_predicate_gains_date_partition_bounds() {
         let predicate = col("project_id")
             .eq(scalar(ScalarValue::Utf8(Some("p".into()))))
             .and(cmp(col("timestamp"), Operator::GtEq, timestamp(START)))
             .and(cmp(col("timestamp"), Operator::Lt, timestamp(END)));
-
         assert!(extract_date_bounds(&predicate).is_empty());
-
         let augmented = with_date_partition_filters(predicate, "timestamp");
         let bounds = {
             let mut b = extract_date_bounds(&augmented); // sorted: derivation order isn't part of the contract
@@ -241,15 +188,11 @@ mod tests {
             b
         };
         assert_eq!(bounds, vec![(Operator::GtEq, 19_723), (Operator::LtEq, 19_725)]);
-
-        // No time-column bounds → predicate returned untouched.
         let no_ts = col("project_id").eq(scalar(ScalarValue::Utf8(Some("p".into()))));
         assert!(extract_date_bounds(&with_date_partition_filters(no_ts, "timestamp")).is_empty());
     }
 }
-
 use std::{collections::HashSet, sync::Arc};
-
 use crate::read::functions::json_to_variant_udf;
 use datafusion::{
     common::{
@@ -261,24 +204,17 @@ use datafusion::{
     optimizer::AnalyzerRule,
 };
 use tracing::debug;
-
 use crate::schema::is_variant_type;
-
-/// Wraps Utf8 expressions going into Variant columns with `json_to_variant()`:
-/// DataFusion's type checker rejects Utf8 -> Variant(Struct) casts outright.
 #[derive(Debug, Default)]
 pub struct VariantInsertRewriter;
-
 impl AnalyzerRule for VariantInsertRewriter {
     fn name(&self) -> &str {
         "variant_insert_rewriter"
     }
-
     fn analyze(&self, plan: LogicalPlan, _config: &ConfigOptions) -> Result<LogicalPlan> {
         plan.transform_up(rewrite_insert_node).map(|t| t.data)
     }
 }
-
 fn rewrite_insert_node(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
     let rewritten = match &plan {
         LogicalPlan::Dml(dml) if matches!(dml.op, WriteOp::Insert(_)) => rewrite_insert(dml)?,
@@ -286,12 +222,9 @@ fn rewrite_insert_node(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
     };
     Ok(rewritten.map_or_else(|| Transformed::no(plan), Transformed::yes))
 }
-
 fn rewrite_insert(dml: &DmlStatement) -> Result<Option<LogicalPlan>> {
     let target_schema = dml.target.schema();
     let input_schema = dml.input.schema();
-
-    // An input column is Variant iff the TARGET column of the same *name* is.
     let variant_indices: HashSet<usize> = input_schema
         .fields()
         .iter()
@@ -299,18 +232,12 @@ fn rewrite_insert(dml: &DmlStatement) -> Result<Option<LogicalPlan>> {
         .filter(|(_, f)| target_schema.column_with_name(f.name()).is_some_and(|(_, t)| is_variant_type(t.data_type())))
         .map(|(i, _)| i)
         .collect();
-
     if variant_indices.is_empty() {
         return Ok(None);
     }
     debug!(table = %dml.table_name, ?variant_indices, "VariantInsertRewriter: wrapping Utf8 literals for Variant columns");
-
     Ok(rewrite_input_for_variant(&dml.input, &variant_indices)?.map(|input| LogicalPlan::Dml(DmlStatement { input: Arc::new(input), ..dml.clone() })))
 }
-
-/// Rewrites only the immediate child of the Dml node: `variant_indices` are
-/// positions in `dml.input.schema()` and are valid for that plan only —
-/// recursing into nested projections would mis-wrap unrelated columns.
 fn rewrite_input_for_variant(input: &LogicalPlan, variant: &HashSet<usize>) -> Result<Option<LogicalPlan>> {
     match input {
         LogicalPlan::Values(v) => Ok(v.values.iter().any(|row| needs_wrap(row, variant)).then(|| {
@@ -320,8 +247,6 @@ fn rewrite_input_for_variant(input: &LogicalPlan, variant: &HashSet<usize>) -> R
         LogicalPlan::Projection(p) => needs_wrap(&p.expr, variant)
             .then(|| Projection::try_new(wrap_variant_exprs(&p.expr, variant, &json_to_variant_udf()), p.input.clone()).map(LogicalPlan::Projection))
             .transpose(),
-        // `INSERT … SELECT` shapes get no wrapping; fail at plan time rather than
-        // with an opaque type mismatch inside the executor.
         other => Err(DataFusionError::Plan(format!(
             "INSERT into Variant column from input shape `{}` is not supported. \
              Use INSERT … VALUES, or add an explicit `json_to_variant(col)` in the SELECT projection.",
@@ -329,49 +254,26 @@ fn rewrite_input_for_variant(input: &LogicalPlan, variant: &HashSet<usize>) -> R
         ))),
     }
 }
-
-/// `func(args…)` as a logical expression — the single UDF-call construction site.
 fn call_udf(func: &Arc<ScalarUDF>, args: Vec<Expr>) -> Expr {
     Expr::ScalarFunction(ScalarFunction { func: func.clone(), args })
 }
-
-/// Shared by the probe and the rewrite below — the two must never disagree.
 fn should_wrap(i: usize, e: &Expr, variant: &HashSet<usize>) -> bool {
     variant.contains(&i) && is_utf8_expr(e)
 }
-
-/// Short-circuiting probe so a no-op insert never pays the per-row clone.
 fn needs_wrap(exprs: &[Expr], variant: &HashSet<usize>) -> bool {
     exprs.iter().enumerate().any(|(i, e)| should_wrap(i, e, variant))
 }
-
 fn wrap_variant_exprs(exprs: &[Expr], variant: &HashSet<usize>, udf: &Arc<ScalarUDF>) -> Vec<Expr> {
     exprs.iter().enumerate().map(|(i, e)| if should_wrap(i, e, variant) { call_udf(udf, vec![e.clone()]) } else { e.clone() }).collect()
 }
-
-/// Matches *literal* Utf8 only (and casts thereof); column references would need
-/// a type lookup against the source plan's schema.
 fn is_utf8_expr(expr: &Expr) -> bool {
     match expr {
-        // NULL literals must pass through: json_to_variant would try to parse "" and fail.
         Expr::Literal(v, _) => utf8_scalar(v).is_some(),
         Expr::Cast(cast) => is_utf8_expr(&cast.expr),
         _ => false,
     }
 }
-
-// Variant-aware SELECT-plan post-processing (non-DML plans only):
-//
-// 1. TableScan schema patch — `ProjectRoutingTable::schema()` reports Variant
-//    columns as `Utf8View` so the INSERT-VALUES type checker accepts raw JSON
-//    literals; SELECT plans need the real Struct{Binary,Binary} type restored so
-//    downstream Variant UDFs receive it.
-// 2. Root-projection JSON wrap — only the *outermost* Projection is wrapped in
-//    `variant_to_json` for the wire, so intermediate operators keep working on
-//    binary Variant.
-
 use std::collections::HashMap;
-
 use datafusion::{
     arrow::datatypes::{DataType, Field, TimeUnit},
     catalog::default_table_source::DefaultTableSource,
@@ -383,45 +285,30 @@ use datafusion::{
     sql::TableReference,
 };
 use tracing::warn;
-
 use crate::{
     database::ProjectRoutingTable,
     read::functions::{VariantToJsonExtUdf, variant_to_json_udf},
 };
-
 #[derive(Debug, Default)]
 pub struct VariantSelectRewriter;
-
 impl AnalyzerRule for VariantSelectRewriter {
     fn name(&self) -> &str {
         "variant_select_rewriter"
     }
-
     fn analyze(&self, plan: LogicalPlan, _config: &ConfigOptions) -> Result<LogicalPlan> {
-        // DML input scans are handled by VariantInsertRewriter; a Variant-typed
-        // schema here would mismatch the writer's expected Utf8 input.
         if matches!(plan, LogicalPlan::Dml(_)) {
             return Ok(plan);
         }
-        // Pass 1 is bottom-up and every parent's cached DFSchema must be recomputed,
-        // or `is_variant_expr` later sees a stale Utf8View type and skips wrapping.
         let patched = restore_variant_scan_types(plan)?.data;
         wrap_root_projection(patched)
     }
 }
-
-/// Restores the real Variant `Struct{Binary,Binary}` type on every TableScan's
-/// `projected_schema`, lowers any Variant-in-text-position expr back to
-/// `variant_to_json`, and recomputes cached schemas bottom-up so the restored
-/// type propagates. `Transformed::yes` iff at least one scan was re-typed.
 pub(crate) fn restore_variant_scan_types(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
     let mut changed = false;
     let out = plan
         .transform_up(|node| {
             let patched = patch_table_scan(node)?;
             changed |= patched.transformed;
-            // Once a scan below is Variant-typed, this node's exprs may face
-            // `Struct op Utf8`; coerce, then recompute so the type propagates.
             if changed {
                 let coerced = coerce_variant_value_positions(patched.data)?;
                 Ok(Transformed::yes(coerced.recompute_schema()?))
@@ -432,35 +319,22 @@ pub(crate) fn restore_variant_scan_types(plan: LogicalPlan) -> Result<Transforme
         .data;
     Ok(if changed { Transformed::yes(out) } else { Transformed::no(out) })
 }
-
-/// Re-applies `restore_variant_scan_types` after DataFusion's `optimize_projections`
-/// rebuilds each `TableScan` and thereby reverts Variant → Utf8View. The physical
-/// scan always emits the real Variant struct, and the Aggregate physical planner
-/// asserts physical-input-schema == logical-input-schema (which `DISTINCT ON` over
-/// a Variant column hits). Must be registered LAST so it runs after
-/// `optimize_projections` in each optimizer pass.
 #[derive(Debug, Default)]
 pub struct VariantScanSchemaRestore;
-
 impl datafusion::optimizer::OptimizerRule for VariantScanSchemaRestore {
     fn name(&self) -> &str {
         "variant_scan_schema_restore"
     }
-
     fn supports_rewrite(&self) -> bool {
         true
     }
-
     fn rewrite(&self, plan: LogicalPlan, _config: &dyn datafusion::optimizer::OptimizerConfig) -> Result<Transformed<LogicalPlan>> {
-        // DML input scans are handled by VariantInsertRewriter; re-typing them
-        // here would mismatch the writer.
         if matches!(plan, LogicalPlan::Dml(_)) {
             return Ok(Transformed::no(plan));
         }
         restore_variant_scan_types(plan)
     }
 }
-
 fn patch_table_scan(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
     let LogicalPlan::TableScan(scan) = plan else {
         return Ok(Transformed::no(plan));
@@ -468,40 +342,25 @@ fn patch_table_scan(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
     let Some(routing) = scan.source.downcast_ref::<DefaultTableSource>().and_then(|src| src.table_provider.downcast_ref::<ProjectRoutingTable>()) else {
         return Ok(Transformed::no(LogicalPlan::TableScan(scan)));
     };
-    // Fast path: no Utf8View columns projected → no Variant columns to restore.
     let lying_schema = scan.projected_schema.as_arrow();
     if !lying_schema.fields().iter().any(|f| matches!(f.data_type(), DataType::Utf8View)) {
         return Ok(Transformed::no(LogicalPlan::TableScan(scan)));
     }
-
     let real = routing.real_schema();
     let variant_by_name: HashMap<&str, &Arc<Field>> = real.fields().iter().filter(|f| is_variant_type(f.data_type())).map(|f| (f.name().as_str(), f)).collect();
     if !lying_schema.fields().iter().any(|f| variant_by_name.contains_key(f.name().as_str())) {
         return Ok(Transformed::no(LogicalPlan::TableScan(scan)));
     }
-    // Restore only the Variant *type*, with EMPTY field metadata — NOT
-    // `Arc::clone(real_field)`, which carries the `ARROW:extension:name` marker
-    // the physical scan does not emit and so fails DataFusion's physical/logical
-    // schema-equality assert. Read-time Variant detection is structural.
     let patched_fields = lying_schema.fields().iter().map(|f| match variant_by_name.get(f.name().as_str()) {
         Some(rf) => Arc::new(Field::new(f.name(), rf.data_type().clone(), rf.is_nullable())),
         None => f.clone(),
     });
-    // Preserve the original DFSchema's column qualifiers (e.g. table aliases).
     let qualified: Vec<(Option<TableReference>, Arc<Field>)> = scan.projected_schema.iter().map(|(q, _)| q.cloned()).zip(patched_fields).collect();
     let new_df: DFSchemaRef = Arc::new(DFSchema::new_with_metadata(qualified, lying_schema.metadata().clone())?);
     debug!(target: "variant_select_rewriter", "patched TableScan({}) schema → Variant", scan.table_name);
     Ok(Transformed::yes(LogicalPlan::TableScan(TableScan { projected_schema: new_df, ..scan })))
 }
-
-/// Lowers a Variant operand sitting in a scalar-text position (comparison, regex,
-/// `LIKE`/`SIMILAR TO`, `CAST(… AS text)`, `IN (str, …)`) to canonical JSON text
-/// via `variant_to_json` — DataFusion cannot coerce `Struct op Utf8`, and the
-/// result matches Postgres `jsonb::text`. The `->`/`->>` accessors have their own
-/// lowering in `VariantAwareExprPlanner` and are not touched here.
 fn coerce_variant_value_positions(plan: LogicalPlan) -> Result<LogicalPlan> {
-    // Merge every input schema (joins have several) so column refs in this node's
-    // exprs resolve to their now Variant-restored types.
     let schema = plan.inputs().iter().fold(DFSchema::empty(), |mut acc, input| {
         acc.merge(input.schema().as_ref());
         acc
@@ -512,25 +371,16 @@ fn coerce_variant_value_positions(plan: LogicalPlan) -> Result<LogicalPlan> {
     let to_json = variant_to_json_udf();
     plan.map_expressions(|expr| expr.transform_up(|e| coerce_expr(e, &schema, &to_json))).map(|t| t.data)
 }
-
-/// Bottom-up rewrite of a single expression: wraps any Variant operand in a
-/// scalar-text position with `variant_to_json`. Idempotent — an already-wrapped
-/// operand types as `Utf8`.
 fn coerce_expr(e: Expr, schema: &DFSchema, to_json: &Arc<ScalarUDF>) -> Result<Transformed<Expr>> {
     let wrap = |x: Expr| call_udf(to_json, vec![x]);
-    // Not struct-update (`..l`): that would read a partially moved `l`.
     let wrap_like = |mut l: Like| {
         l.expr = Box::new(wrap(*l.expr));
         l
     };
     match e {
-        // CAST(variant AS text) → CAST(variant_to_json(variant) AS <same text type>).
-        // The outer cast is kept so the result describes over the wire as real text
-        // (pg OID 25), not variant_to_json's jsonb-tagged output (OID 3802).
         Expr::Cast(Cast { expr, field }) if is_text_type(field.data_type()) && is_variant_expr(&expr, schema) => {
             Ok(Transformed::yes(Expr::Cast(Cast { expr: Box::new(wrap(*expr)), field })))
         }
-        // Comparison / regex where a Variant operand faces text.
         Expr::BinaryExpr(BinaryExpr { left, op, right })
             if is_text_comparison_op(op) && (is_variant_expr(&left, schema) || is_variant_expr(&right, schema)) =>
         {
@@ -546,13 +396,9 @@ fn coerce_expr(e: Expr, schema: &DFSchema, to_json: &Arc<ScalarUDF>) -> Result<T
         other => Ok(Transformed::no(other)),
     }
 }
-
 fn is_text_type(dt: &DataType) -> bool {
     matches!(dt, DataType::Utf8 | DataType::Utf8View | DataType::LargeUtf8)
 }
-
-/// Deliberately enumerated (not `Operator::is_comparison_operator()`): this is
-/// exactly the set that puts a Variant operand in a scalar-text position.
 fn is_text_comparison_op(op: Operator) -> bool {
     use Operator::{
         Eq, Gt, GtEq, ILikeMatch, IsDistinctFrom, IsNotDistinctFrom, LikeMatch, Lt, LtEq, NotEq, NotILikeMatch, NotLikeMatch, RegexIMatch, RegexMatch,
@@ -561,20 +407,10 @@ fn is_text_comparison_op(op: Operator) -> bool {
     matches!(op, Eq | NotEq | Lt | LtEq | Gt | GtEq | IsDistinctFrom | IsNotDistinctFrom)
         || matches!(op, RegexMatch | RegexIMatch | RegexNotMatch | RegexNotIMatch | LikeMatch | ILikeMatch | NotLikeMatch | NotILikeMatch)
 }
-
-/// Peel Sort / Limit / Distinct / SubqueryAlias from the root and wrap
-/// the underlying Projection's Variant-typed expressions with
-/// `variant_to_json()`. Returns the plan unchanged if no Projection sits
-/// inside that peel.
 fn wrap_root_projection(plan: LogicalPlan) -> Result<LogicalPlan> {
-    // Walk down a single linear path of "peelable" parents, transforming the
-    // first Projection found. MAX_PEEL bounds the recursion so a deeply nested
-    // plan cannot overflow the stack.
     const MAX_PEEL: u16 = 256;
     fn peel(plan: LogicalPlan, depth: u16) -> Result<LogicalPlan> {
         if depth >= MAX_PEEL {
-            // Variant columns in the un-peeled subtree exit unwrapped; warn rather
-            // than fail silently.
             warn!(
                 target: "variant_select_rewriter",
                 max_peel = MAX_PEEL,
@@ -584,7 +420,6 @@ fn wrap_root_projection(plan: LogicalPlan) -> Result<LogicalPlan> {
         }
         let d = depth + 1;
         let down = |input: Arc<LogicalPlan>| -> Result<Arc<LogicalPlan>> { Ok(Arc::new(peel(Arc::unwrap_or_clone(input), d)?)) };
-        // Rebuild a node with its single `input` recursed into.
         macro_rules! descend {
             ($rebuild:expr, $node:expr) => {{
                 let mut node = $node;
@@ -596,22 +431,15 @@ fn wrap_root_projection(plan: LogicalPlan) -> Result<LogicalPlan> {
             LogicalPlan::Sort(s) => descend!(LogicalPlan::Sort, s),
             LogicalPlan::Limit(l) => descend!(LogicalPlan::Limit, l),
             LogicalPlan::SubqueryAlias(s) => descend!(LogicalPlan::SubqueryAlias, s),
-            // Some rewrite passes promote a Filter above the outermost Projection.
             LogicalPlan::Filter(f) => descend!(LogicalPlan::Filter, f),
             LogicalPlan::Distinct(Distinct::All(input)) => Ok(LogicalPlan::Distinct(Distinct::All(down(input)?))),
             LogicalPlan::Distinct(Distinct::On(on)) => descend!(|on| LogicalPlan::Distinct(Distinct::On(on)), on),
             LogicalPlan::Projection(proj) => wrap_projection(proj),
-            // Un-peelable (Union/Aggregate/Join/Window/…): wrap above instead.
             other => add_root_variant_projection(other),
         }
     }
     peel(plan, 0)
 }
-
-/// Adds a top-level Projection wrapping every Variant-typed output column with
-/// `variant_to_json`, for plan shapes that can't be peeled into. Non-Variant
-/// columns pass through as bare `Expr::Column` so names and qualifiers are
-/// unchanged.
 fn add_root_variant_projection(plan: LogicalPlan) -> Result<LogicalPlan> {
     let schema = plan.schema().clone();
     let variant_cols = schema.fields().iter().filter(|f| is_variant_type(f.data_type())).count();
@@ -629,7 +457,6 @@ fn add_root_variant_projection(plan: LogicalPlan) -> Result<LogicalPlan> {
     debug!(target: "variant_select_rewriter", "added root Projection over un-peelable plan: wrapped {variant_cols} Variant column(s)");
     Ok(LogicalPlan::Projection(Projection::try_new(exprs, Arc::new(plan))?))
 }
-
 fn wrap_projection(proj: Projection) -> Result<LogicalPlan> {
     let input_schema = proj.input.schema().clone();
     let wrapped = proj.expr.iter().filter(|e| is_variant_expr(e, &input_schema)).count();
@@ -645,58 +472,28 @@ fn wrap_projection(proj: Projection) -> Result<LogicalPlan> {
     debug!(target: "variant_select_rewriter", "wrapped {wrapped} Variant exprs at root projection");
     Ok(LogicalPlan::Projection(Projection::try_new(new_exprs, proj.input.clone())?))
 }
-
 fn is_variant_expr(expr: &Expr, schema: &DFSchema) -> bool {
-    // Idempotency guard. Matched by concrete UDF type, not by name: a rename or a
-    // same-named UDF would silently break a string check.
     !matches!(expr, Expr::ScalarFunction(sf) if sf.func.inner().downcast_ref::<VariantToJsonExtUdf>().is_some())
         && expr.get_type(schema).is_ok_and(|dt| is_variant_type(&dt))
 }
-
 fn wrap_with_variant_to_json(expr: &Expr, udf: &Arc<ScalarUDF>) -> Expr {
     let wrap = |inner: Expr| call_udf(udf, vec![inner]);
     match expr {
-        // Keep the alias outermost so the output column name is unchanged.
         Expr::Alias(a) => wrap(a.expr.as_ref().clone()).alias(a.name.clone()),
         other => wrap(other.clone()),
     }
 }
-
-/// Peephole: `json_as_text(variant_to_json(v), 'k')` → the Variant-native
-/// extraction `json_to_pg_text(variant_to_json(variant_get(v, "['k']")))`.
-///
-/// `variant_to_json` serializes the WHOLE Variant per row and `json_as_text`
-/// re-parses it to read one field; reading the leaf natively is several times
-/// cheaper. It is an analyzer rule rather than an `ExprPlanner` because a
-/// terminal `->` must keep its JSON-union type, which is only decidable with the
-/// whole expression tree in hand.
-///
-/// Rewritten: an outer `json_as_text` over any chain of `json_get` calls whose
-/// keys are all literals and whose base is `variant_to_json`. Deliberately NOT
-/// rewritten:
-/// - a terminal `json_get` (`->`): return type would go JSON-union → Variant.
-/// - an intermediate `json_as_text`: it unquotes a JSON *string* leaf, so a
-///   further lookup parses that string's contents; `variant_get` would not.
-/// - `json_get_str`/`_int`/`_float`/`_bool`/`_json`: different NULL semantics.
-/// - a non-literal key: the path must be a constant to become a variant path.
-/// - a negative array index: JSON reads it as no-match (NULL), while
-///   `VariantPath` fails to parse it — a NULL answer must not become an error.
 #[derive(Debug, Default)]
 pub struct VariantJsonAccessorPeephole;
-
 impl AnalyzerRule for VariantJsonAccessorPeephole {
     fn name(&self) -> &str {
         "variant_json_accessor_peephole"
     }
-
     fn analyze(&self, plan: LogicalPlan, _config: &ConfigOptions) -> Result<LogicalPlan> {
         plan.transform_up(|plan| {
             plan.map_expressions(|expr| {
                 expr.transform_down(|e| {
                     Ok(match variant_native_extraction(&e) {
-                        // Alias to the original schema name: renaming a projection output
-                        // would change the wire column name. Types are unchanged, so no
-                        // schema recompute is needed.
                         Some(native) => Transformed::yes(native.alias(e.schema_name().to_string())),
                         None => Transformed::no(e),
                     })
@@ -706,34 +503,25 @@ impl AnalyzerRule for VariantJsonAccessorPeephole {
         .map(|t| t.data)
     }
 }
-
-/// The Variant-native equivalent of a `json_as_text` over `variant_to_json`,
-/// or None when the shape is not one of the provably equivalent cases.
 fn variant_native_extraction(expr: &Expr) -> Option<Expr> {
     use crate::read::functions::{PathComponent, build_variant_path, extract_path_component, json_to_pg_text_udf, variant_get_udf};
-
     fn peel(expr: &Expr) -> &Expr {
         match expr {
             Expr::Alias(alias) => peel(&alias.expr),
             other => other,
         }
     }
-    // The JSON planner alias-wraps every node it plans, so peel at each step.
     fn call<'a>(expr: &'a Expr, name: &str) -> Option<&'a ScalarFunction> {
         match peel(expr) {
             Expr::ScalarFunction(sf) if sf.func.name() == name => Some(sf),
             _ => None,
         }
     }
-
     let (mut node, mut path) = {
         let sf = call(expr, "json_as_text")?;
         let (json, keys) = sf.args.split_first()?;
         (json, keys.iter().map(extract_path_component).collect::<Option<Vec<_>>>()?)
     };
-    // Walk down the `->` chain, prepending each hop's keys: a json_get over a
-    // json_get takes only the container arm of the inner union, which is exactly
-    // a nested variant path.
     let variant = loop {
         if let Some(sf) = call(node, "variant_to_json") {
             let [variant] = sf.args.as_slice() else { return None };
@@ -748,22 +536,13 @@ fn variant_native_extraction(expr: &Expr) -> Option<Expr> {
     if path.iter().any(|p| matches!(p, PathComponent::Index(i) if *i < 0)) {
         return None;
     }
-
     let leaf = call_udf(&variant_get_udf(), vec![variant.clone(), Expr::Literal(ScalarValue::Utf8(Some(build_variant_path(&path))), None)]);
-    // `variant_get` cannot stringify numeric/boolean leaves, so reuse the exact
-    // composition `VariantAwareExprPlanner` already emits for `->>`.
     Some(call_udf(&json_to_pg_text_udf(), vec![call_udf(&variant_to_json_udf(), vec![leaf])]))
 }
-
 #[cfg(test)]
 mod variant_json_accessor_tests {
-    //! Equivalence tests: each case runs the same SQL with and without the
-    //! peephole and demands identical rows and schema, plus whether the rewrite
-    //! was supposed to fire.
     use datafusion::prelude::SessionContext;
-
     use super::*;
-
     async fn run(sql: &str, with_rule: bool) -> (String, Vec<datafusion::arrow::record_batch::RecordBatch>) {
         let mut ctx = SessionContext::new();
         crate::read::functions::register_custom_functions(&mut ctx).expect("custom functions");
@@ -775,10 +554,6 @@ mod variant_json_accessor_tests {
         let batches = SessionContext::from(ctx.state()).execute_logical_plan(plan.clone()).await.unwrap().collect().await.expect("execute");
         (plan.display_indent().to_string(), batches)
     }
-
-    /// `doc` is the JSON the Variant holds; `accessor` is appended to
-    /// `variant_to_json(json_to_variant(d))`. Cases run over a column, not a
-    /// folded scalar, so the array kernels are what get compared.
     #[test_case::test_case(r#"{"a":"x"}"#, "->>'a'", true ; "string leaf")]
     #[test_case::test_case(r#"{"a":42}"#, "->>'a'", true ; "numeric leaf keeps its text form")]
     #[test_case::test_case(r#"{"a":1.5}"#, "->>'a'", true ; "float leaf")]
@@ -795,47 +570,33 @@ mod variant_json_accessor_tests {
     #[test_case::test_case(r#"{"a":"{\"b\":1}"}"#, "->'a'->>'b'", true ; "a string leaf holding JSON is NOT re-parsed")]
     #[test_case::test_case(r#"{"a":1}"#, "->>''", true ; "the empty key is a key, not an empty path")]
     #[test_case::test_case(r#"{"a":{"b":1}}"#, "->'a'", false ; "a terminal arrow keeps its JSON union type")]
-    // datafusion-functions-json's own rewriter (registered here, not in TF's
-    // session) folds a chained ->> into ONE multi-key json_as_text first.
     #[test_case::test_case(r#"{"a":{"b":"c"}}"#, "->>'a'->>'b'", true ; "chained long arrows, unnested upstream")]
     #[tokio::test]
     async fn both_spellings_agree(doc: &str, accessor: &str, rewritten: bool) {
         let sql = format!("SELECT variant_to_json(json_to_variant(d)){accessor} AS v FROM (VALUES ('{doc}'), (NULL)) t(d)");
         let (plan, batches) = run(&sql, true).await;
         let (base_plan, base) = run(&sql, false).await;
-
         assert_eq!(plan.contains("variant_get"), rewritten, "peephole fired unexpectedly\nwith: {plan}\nwithout: {base_plan}");
         assert!(!base_plan.contains("variant_get"), "control plan must keep the serialized form: {base_plan}");
         assert_eq!(batches.iter().map(|b| b.schema()).collect::<Vec<_>>(), base.iter().map(|b| b.schema()).collect::<Vec<_>>(), "wire schema changed");
         let fmt = |b: &[datafusion::arrow::record_batch::RecordBatch]| datafusion::arrow::util::pretty::pretty_format_batches(b).unwrap().to_string();
         assert_eq!(fmt(&batches), fmt(&base), "rows differ\nwith: {plan}");
     }
-
-    /// TF's session omits `ApplyFunctionRewrites`, so a chained
-    /// `variant_to_json(v)->'a'->0->>'b'` stays a NESTED `json_get` tower. The only
-    /// test that walks the descent loop; it also pins the path encoding.
     #[test]
     fn the_nested_json_get_tower_prod_emits_folds_into_one_path() {
-        // Exactly what JsonExprPlanner emits, aliases and all; `::` binds tighter
-        // than `->>`, so the last key arrives wrapped in a Cast.
         let level1 =
             call_udf(&datafusion_functions_json::udfs::json_get_udf(), vec![call_udf(&variant_to_json_udf(), vec![col("v")]), lit("a")]).alias("v -> 'a'");
         let level2 = call_udf(&datafusion_functions_json::udfs::json_get_udf(), vec![level1, lit(0i64)]).alias("v -> 'a' -> 0");
         let cast_key = Expr::Cast(Cast::new(Box::new(lit("b")), DataType::Utf8));
         let tower = call_udf(&datafusion_functions_json::udfs::json_as_text_udf(), vec![level2, cast_key]);
-
         let native = super::variant_native_extraction(&tower).expect("the nested tower is the shape this rule exists for");
         assert!(native.to_string().contains(r"['a'][0]['b']"), "one bracket-quoted path, not dot notation: {native}");
     }
-
-    /// Shapes the peephole must refuse, including ones the SQL cases cannot reach
-    /// because DataFusion's JSON rewriter normalizes them away first.
     #[test]
     fn an_excluded_shape_is_left_alone() {
         let as_text = |args: Vec<Expr>| call_udf(&datafusion_functions_json::udfs::json_as_text_udf(), args);
         let variant = call_udf(&variant_to_json_udf(), vec![col("v")]);
         let rewrite = |e: Expr| super::variant_native_extraction(&e);
-
         assert!(rewrite(as_text(vec![variant.clone(), lit(1i64)])).is_some(), "a non-negative index is rewritten");
         assert!(rewrite(as_text(vec![variant.clone(), lit(-1i64)])).is_none(), "negative index");
         assert!(rewrite(as_text(vec![variant.clone(), col("k")])).is_none(), "non-literal key");
@@ -843,19 +604,14 @@ mod variant_json_accessor_tests {
         assert!(rewrite(call_udf(&datafusion_functions_json::udfs::json_get_str_udf(), vec![variant, lit("a")])).is_none(), "json_get_str family");
     }
 }
-
 #[cfg(test)]
 mod peel_tests {
-    //! `wrap_root_projection` peel logic: the Sort / Limit / Distinct /
-    //! SubqueryAlias / Filter branches and the MAX_PEEL guard.
     use datafusion::{
         arrow::datatypes::{DataType, Field, Schema},
         common::DFSchema,
         logical_expr::{EmptyRelation, builder::LogicalPlanBuilder, col, lit},
     };
-
     use super::*;
-
     fn variant_projection() -> LogicalPlan {
         let variant_field = Field::new(
             "v",
@@ -867,12 +623,10 @@ mod peel_tests {
         let empty = LogicalPlan::EmptyRelation(EmptyRelation { produce_one_row: false, schema: df });
         LogicalPlanBuilder::from(empty).project(vec![col("v")]).unwrap().build().unwrap()
     }
-
     fn analyze(plan: LogicalPlan) -> LogicalPlan {
         let cfg = ConfigOptions::default();
         VariantSelectRewriter.analyze(plan, &cfg).unwrap()
     }
-
     fn is_variant_to_json_call(expr: &Expr) -> bool {
         let inner = match expr {
             Expr::Alias(a) => a.expr.as_ref(),
@@ -880,7 +634,6 @@ mod peel_tests {
         };
         matches!(inner, Expr::ScalarFunction(sf) if sf.func.inner().downcast_ref::<VariantToJsonExtUdf>().is_some())
     }
-
     fn first_projection_expr(plan: &LogicalPlan) -> &Expr {
         fn find(p: &LogicalPlan) -> Option<&Expr> {
             if let LogicalPlan::Projection(proj) = p {
@@ -890,9 +643,6 @@ mod peel_tests {
         }
         find(plan).expect("expected a Projection in the plan")
     }
-
-    /// Each case stacks nodes on top of the bare variant projection and asks
-    /// whether the root projection still ends up wrapped in `variant_to_json`.
     #[test_case::test_case(|b| b => true ; "bare projection is wrapped")]
     #[test_case::test_case(|b| b.filter(lit(true)).unwrap() => true ; "peels Filter")]
     #[test_case::test_case(|b| b.distinct().unwrap() => true ; "peels Distinct")]
@@ -905,10 +655,8 @@ mod peel_tests {
         let plan = steps(LogicalPlanBuilder::from(variant_projection())).build().unwrap();
         is_variant_to_json_call(first_projection_expr(&analyze(plan)))
     }
-
     #[test]
     fn idempotent_on_double_analyze() {
-        // Running the analyzer twice must not double-wrap.
         let once = analyze(variant_projection());
         let twice = analyze(once.clone());
         let expr_twice = first_projection_expr(&twice);
@@ -919,11 +667,8 @@ mod peel_tests {
         assert_eq!(sf.args.len(), 1);
         assert!(matches!(sf.args[0], Expr::Column(_)), "second pass nested the call: {:?}", sf.args[0]);
     }
-
     #[test]
     fn max_peel_short_circuits_on_pathological_depth() {
-        // Runs on a larger stack: DataFusion's own transform_up walk over a
-        // 300-deep plan blows the default 2 MiB test stack.
         std::thread::Builder::new()
             .stack_size(16 * 1024 * 1024)
             .spawn(|| {
@@ -936,64 +681,30 @@ mod peel_tests {
             .unwrap();
     }
 }
-
-// Transparent Tantivy acceleration for standard SQL predicates: LIKE / ILIKE /
-// `=` / `IN` / literal-substring regex on tantivy-indexed columns gain an
-// additively AND-ed `text_match(col, q)` call, which `ProjectRoutingTable` turns
-// into an `id IN (...)` prefilter narrowing the Delta scan.
-//
-// Correctness invariants:
-// 1. The original predicate is preserved verbatim — it is the post-filter for
-//    MemBuffer rows and Delta files whose index hasn't built yet.
-// 2. Only columns confirmed `tantivy.indexed: true` are rewritten.
-// 3. Idempotent under repeated passes.
-// 4. Patterns the *target column's tokenizer* can't accelerate are left alone.
-// 5. `!=` / `NOT IN` are never routed — negation has no term form. Under `OR`,
-//    a node is routable only if every branch is fully covered by a `text_match`.
-//
-// Regex routes only for a plain literal substring on a text-typed column;
-// Variant/List columns are excluded because the index holds our canonical
-// rendering, not SQL's `::text` cast output. `_` (single-char wildcard) is never
-// accelerated, and strings shorter than 3 chars have no full trigram on ngram3.
-
 use std::sync::OnceLock;
-
 use datafusion::{
     common::tree_node::TreeNodeRecursion,
     logical_expr::{and, lit, or},
 };
-
 use crate::tantivy::{
     DEFAULT_TOKENIZER, NGRAM3_TOKENIZER, RAW_TOKENIZER,
     udf::{NGRAM_MIN_QUERY_LEN, TEXT_MATCH_NAME, TextMatchUdf, classify_like_pattern, is_eq_term_safe, regex_literal_substring},
 };
-
-/// Per-column index facts: the resolved tokenizer, and whether the *stored*
-/// column is a plain string. The latter gates regex routing — on a Variant/List
-/// column the index holds our own text rendering, which need not match SQL's
-/// `::text` cast, so routing there could drop rows.
 type IndexedCol = (&'static str, bool);
 type IndexedCols = HashMap<String, IndexedCol>;
-
 #[derive(Debug, Default)]
 pub struct TantivyPredicateRewriter {
-    /// Route exact `=` on raw columns through tantivy (`tantivy.route_equality`).
-    /// A field, not a global-config read: the config singleton may be
-    /// uninitialized under tests that build a `Database` from a local config.
     route_equality: bool,
 }
-
 impl TantivyPredicateRewriter {
     pub fn new(route_equality: bool) -> Self {
         Self { route_equality }
     }
 }
-
 impl AnalyzerRule for TantivyPredicateRewriter {
     fn name(&self) -> &str {
         "tantivy_predicate_rewriter"
     }
-
     fn analyze(&self, plan: LogicalPlan, _config: &ConfigOptions) -> Result<LogicalPlan> {
         match plan {
             LogicalPlan::Dml(_) => Ok(plan),
@@ -1001,7 +712,6 @@ impl AnalyzerRule for TantivyPredicateRewriter {
         }
     }
 }
-
 fn rewrite_node(plan: LogicalPlan, allow_eq: bool) -> Result<Transformed<LogicalPlan>> {
     match plan {
         LogicalPlan::Filter(mut filter) => match scanned_indexed_columns(&filter.input) {
@@ -1009,20 +719,14 @@ fn rewrite_node(plan: LogicalPlan, allow_eq: bool) -> Result<Transformed<Logical
             Some(columns) => {
                 let rewritten = std::mem::replace(&mut filter.predicate, lit(true)).transform_down(|e| rewrite_expr(e, columns, allow_eq))?;
                 filter.predicate = rewritten.data;
-                // The expr traversal's `tnr` (possibly `Jump`) must not leak into the plan walk.
                 Ok(Transformed::new(LogicalPlan::Filter(filter), rewritten.transformed, TreeNodeRecursion::Continue))
             }
         },
         _ => Ok(Transformed::no(plan)),
     }
 }
-
-/// Longest IN-list expanded into an OR of `text_match` calls; beyond this the
-/// per-item query cost outweighs the pruning.
 const MAX_ROUTED_IN_LIST: usize = 100;
-
 fn rewrite_expr(expr: Expr, indexed_columns: &IndexedCols, allow_eq: bool) -> Result<Transformed<Expr>> {
-    // Skip the children of a text_match call (already a tantivy predicate).
     if matches!(&expr, Expr::ScalarFunction(sf) if sf.func.name() == TEXT_MATCH_NAME) {
         return Ok(Transformed::new(expr, false, TreeNodeRecursion::Jump));
     }
@@ -1034,9 +738,6 @@ fn rewrite_expr(expr: Expr, indexed_columns: &IndexedCols, allow_eq: bool) -> Re
         None => Transformed::no(expr),
     })
 }
-
-/// `col IN ('a','b',...)` on a RAW-tokenized column → per-item term queries,
-/// under the same gates as exact `=` routing. `NOT IN` is never routed.
 fn match_indexed_in_list(expr: &Expr, indexed_columns: &IndexedCols, allow_eq: bool) -> Option<(String, Vec<Route>)> {
     let Expr::InList(InList { expr: col, list, negated: false }) = expr else { return None };
     let Expr::Column(c) = col.as_ref() else { return None };
@@ -1045,33 +746,20 @@ fn match_indexed_in_list(expr: &Expr, indexed_columns: &IndexedCols, allow_eq: b
     }
     list.iter().map(eq_term_route).collect::<Option<Vec<_>>>().map(|items| (c.name.clone(), items))
 }
-
-/// RHS of a raw-column equality (`=` or one `IN` item) as a route: literals are
-/// classified now, placeholders defer to scan time.
 fn eq_term_route(rhs: &Expr) -> Option<Route> {
     match rhs {
         Expr::Literal(s, _) => extract_utf8_string(s).filter(|v| !v.is_empty() && v.chars().all(is_eq_term_safe)).map(Route::Ready),
-        // Value unknown until Bind; the deferred tag keeps the prefilter in
-        // plans cached with placeholders.
         Expr::Placeholder(_) => Some(Route::Deferred { rhs: rhs.clone(), kind: "eq".into() }),
         _ => None,
     }
 }
-
-/// How a routed predicate reaches tantivy.
 #[derive(Debug, PartialEq)]
 enum Route {
-    /// Literal classified at plan time → `text_match(col, query)`.
     Ready(String),
-    /// `$N` placeholder, emitted as `text_match(col, $N, kind)`; the scan-side
-    /// collector classifies it once the literal is known.
     Deferred { rhs: Expr, kind: String },
 }
-
 impl Route {
-    /// `text_match(col, query)` — or `text_match(col, $N, kind)` when deferred.
     fn into_call(self, column: String) -> Expr {
-        // Cached Arc — analyzer rules run on every query.
         static CELL: OnceLock<Arc<ScalarUDF>> = OnceLock::new();
         let col = Expr::Column(Column::new_unqualified(column));
         let args = match self {
@@ -1081,14 +769,8 @@ impl Route {
         call_udf(CELL.get_or_init(|| Arc::new(ScalarUDF::from(TextMatchUdf::default()))), args)
     }
 }
-
-/// If `expr` is a rewritable predicate on an indexed column, returns
-/// `(column_name, route)`. Raw tokenizers can't do substring; ngram3 can do
-/// everything; default is in between.
 fn match_indexed_predicate(expr: &Expr, indexed_columns: &IndexedCols, allow_eq: bool) -> Option<(String, Route)> {
     match expr {
-        // Exact `col = 'lit'` on a RAW-tokenized column: raw is a single
-        // case-sensitive token, so the tantivy match set equals the `=` match set.
         Expr::BinaryExpr(BinaryExpr { left, op: Operator::Eq, right }) if allow_eq => {
             let (c, rhs) = match (left.as_ref(), right.as_ref()) {
                 (Expr::Column(c), other) | (other, Expr::Column(c)) => (c, other),
@@ -1102,20 +784,13 @@ fn match_indexed_predicate(expr: &Expr, indexed_columns: &IndexedCols, allow_eq:
         Expr::Like(Like { negated: false, expr: l, pattern: r, escape_char, case_insensitive }) => {
             let Expr::Column(c) = l.as_ref() else { return None };
             let tok = indexed_columns.get(&c.name)?.0;
-            // ILIKE on raw (case-sensitive single token) is not accelerable
-            // without a parallel case-insensitive index — skip.
             if *case_insensitive && tok == RAW_TOKENIZER {
                 return None;
             }
-            // Remaining tokenizers lowercase both index and query side, so ILIKE
-            // needs no extra work; the preserved LIKE/ILIKE re-runs on the Delta side.
             let route = match r.as_ref() {
                 Expr::Literal(s, _) => classify_like_pattern(utf8_scalar(s)?, *escape_char, tok == NGRAM3_TOKENIZER)
-                    // ngram3 needs a full trigram to match anything.
                     .filter(|q| tok != NGRAM3_TOKENIZER || q.chars().filter(|c| *c != '*').count() >= NGRAM_MIN_QUERY_LEN)
                     .map(Route::Ready)?,
-                // Pattern arrives at Bind: defer classification. Custom escape
-                // chars aren't carried in the tag — don't route them.
                 Expr::Placeholder(_) if escape_char.is_none() => {
                     Route::Deferred { rhs: r.as_ref().clone(), kind: format!("{}:{tok}", if *case_insensitive { "ilike" } else { "like" }) }
                 }
@@ -1123,11 +798,6 @@ fn match_indexed_predicate(expr: &Expr, indexed_columns: &IndexedCols, allow_eq:
             };
             Some((c.name.clone(), route))
         }
-        // `col ~* 'substr'` / `col ~ 'substr'`, optionally through a string cast,
-        // routed as the ngram3 substring query. ngram3 lowercases + ASCII-folds
-        // both sides, so its hit set is a superset of both `~` and `~*`, and the
-        // original regex is preserved as the post-filter. Only PLAIN substrings
-        // route; anchors and other regex features fall through untouched.
         Expr::BinaryExpr(BinaryExpr { left, op: Operator::RegexMatch | Operator::RegexIMatch, right }) => {
             let c = column_through_string_cast(left)?;
             let (tok, text_typed) = *indexed_columns.get(&c.name)?;
@@ -1140,9 +810,6 @@ fn match_indexed_predicate(expr: &Expr, indexed_columns: &IndexedCols, allow_eq:
         _ => None,
     }
 }
-
-/// The column under zero or more string casts, which are value-preserving for
-/// string types (non-string sources are rejected by the `text_typed` gate).
 fn column_through_string_cast(e: &Expr) -> Option<&Column> {
     match e {
         Expr::Column(c) => Some(c),
@@ -1150,12 +817,7 @@ fn column_through_string_cast(e: &Expr) -> Option<&Column> {
         _ => None,
     }
 }
-
-/// Indexed columns of the first TableScan below `plan` that has a tantivy
-/// index. Stops at the first one; cross-table joins on indexed columns are
-/// not supported — each filter is rewritten relative to its own subtree's scan.
 fn scanned_indexed_columns(plan: &LogicalPlan) -> Option<&'static IndexedCols> {
-    // Pre-order, same order as TreeNode::apply (which descends into `inputs()`).
     if let LogicalPlan::TableScan(ts) = plan
         && let Some(cols) = indexed_columns_for(ts.table_name.table())
     {
@@ -1163,13 +825,6 @@ fn scanned_indexed_columns(plan: &LogicalPlan) -> Option<&'static IndexedCols> {
     }
     plan.inputs().into_iter().find_map(scanned_indexed_columns)
 }
-
-/// Indexed columns for a table from the static schema registry — keyed by
-/// column name, value is the resolved tokenizer (raw/default/ngram3).
-/// Returns `None` when the table isn't in the registry.
-///
-/// The cache is populated once; valid only because the schema registry is
-/// compiled-in YAML. Runtime schema reload would need an invalidatable cache.
 fn indexed_columns_for(table: &str) -> Option<&'static IndexedCols> {
     static CACHE: OnceLock<HashMap<String, IndexedCols>> = OnceLock::new();
     CACHE
@@ -1202,16 +857,11 @@ fn indexed_columns_for(table: &str) -> Option<&'static IndexedCols> {
         })
         .get(table)
 }
-
 #[cfg(test)]
 mod tantivy_rewriter_tests {
     use super::*;
     use crate::tantivy::udf::{PredNode, collect_text_match_tree};
     use test_case::test_case;
-
-    /// `(pattern, escape, allow_substring)` → routed query, over every
-    /// tokenizer-visible shape. `_` and embedded `%` never accelerate;
-    /// leading `%` only on ngram3 (`allow_substring`).
     #[test_case("foo", None, false => Some("foo".to_string()) ; "bare literal is a term")]
     #[test_case("foo%", None, false => Some("foo*".to_string()) ; "trailing % is a prefix query")]
     #[test_case("%foo", None, false => None ; "leading % without substring support")]
@@ -1227,52 +877,35 @@ mod tantivy_rewriter_tests {
     fn like_classifier_cases(pat: &str, esc: Option<char>, substring: bool) -> Option<String> {
         classify_like_pattern(pat, esc, substring)
     }
-
     const UID: &str = "0fee13b9-ac71-5c55-acd1-109542595054";
-
-    /// Shared test column map: `tid`/`sid` raw-tokenized, `name` ngram3, all
-    /// text-typed; `body` is ngram3 but NOT text-typed (a Variant/List column).
-    /// `unindexed` is deliberately absent.
     fn cols() -> IndexedCols {
         [("tid", RAW_TOKENIZER, true), ("sid", RAW_TOKENIZER, true), ("name", NGRAM3_TOKENIZER, true), ("body", NGRAM3_TOKENIZER, false)]
             .into_iter()
             .map(|(k, tok, text)| (k.to_string(), (tok, text)))
             .collect()
     }
-
     fn col(name: &str) -> Expr {
         Expr::Column(Column::new_unqualified(name))
     }
-
     fn cmp(c: &str, op: Operator, val: &str) -> Expr {
         Expr::BinaryExpr(BinaryExpr::new(Box::new(col(c)), op, Box::new(lit(val))))
     }
-
     fn eq(c: &str, val: &str) -> Expr {
         cmp(c, Operator::Eq, val)
     }
-
     fn ilike(c: &str, pat: &str) -> Expr {
         Expr::Like(Like { negated: false, expr: Box::new(col(c)), pattern: Box::new(lit(pat)), escape_char: None, case_insensitive: true })
     }
-
-    /// `col::text <op> 'pat'` when `cast`, else the bare column.
     fn re(c: &str, op: Operator, pat: &str, cast: bool) -> Expr {
         let lhs = if cast { Expr::Cast(Cast::new(Box::new(col(c)), DataType::Utf8)) } else { col(c) };
         Expr::BinaryExpr(BinaryExpr::new(Box::new(lhs), op, Box::new(lit(pat))))
     }
-
     fn in_list(c: &str, items: &[&str], negated: bool) -> Expr {
         Expr::InList(InList { expr: Box::new(col(c)), list: items.iter().map(|s| lit(*s)).collect(), negated })
     }
-
     fn ready(c: &str, q: &str) -> Option<(String, Route)> {
         Some((c.to_string(), Route::Ready(q.to_string())))
     }
-
-    /// Exact `=` routes only on a raw column; every other shape (ngram3, `!=`,
-    /// flag off, literals the QueryParser would mis-handle against a single raw
-    /// token) must fall back to the plain `=`.
     #[test_case(eq("tid", "d01762b88f4ed54d"), true => ready("tid", "d01762b88f4ed54d") ; "raw column + flag on routes as a term")]
     #[test_case(eq("tid", UID), true => ready("tid", UID) ; "dashed uuid: the `-` survives (e2e-proven)")]
     #[test_case(eq("tid", "abc123"), false => None ; "flag off reverts to bloom/stats")]
@@ -1282,8 +915,6 @@ mod tantivy_rewriter_tests {
     #[test_case(eq("tid", "foo bar"), true => None ; "space, AND-split can't match one raw token")]
     #[test_case(eq("tid", "a.b"), true => None ; "dot conservatively excluded")]
     #[test_case(eq("tid", ""), true => None ; "empty literal")]
-    // ILIKE on a raw-tokenized (case-sensitive) column would silently miss
-    // case variants; ngram3 lowercases both sides, so substrings route.
     #[test_case(ilike("tid", "foo"), true => None ; "ILIKE never routes on a raw column")]
     #[test_case(ilike("name", "%foo%"), true => ready("name", "foo") ; "ILIKE substring routes on ngram3")]
     #[test_case(re("name", Operator::RegexIMatch, "runServer", true), true => ready("name", "runServer") ; "cast-wrapped regex imatch on ngram3 routes")]
@@ -1291,8 +922,6 @@ mod tantivy_rewriter_tests {
     #[test_case(re("name", Operator::RegexMatch, "runServer", true), true => ready("name", "runServer") ; "cast-wrapped regex match on ngram3 routes")]
     #[test_case(re("name", Operator::RegexMatch, "runServer", false), true => ready("name", "runServer") ; "bare column regex match routes")]
     #[test_case(re("name", Operator::RegexIMatch, "svc\\.user-api", true), true => ready("name", "svc.user-api") ; "escapeRegex output: `\\.` decodes to a literal")]
-    // Unescaped metachars / anchors (startswith & endswith) / short patterns /
-    // raw-tokenized columns / non-text columns: never routed.
     #[test_case(re("name", Operator::RegexIMatch, "run.*", true), true => None ; "unescaped metachar")]
     #[test_case(re("name", Operator::RegexIMatch, "a|b", true), true => None ; "alternation")]
     #[test_case(re("name", Operator::RegexIMatch, "^foo", true), true => None ; "startswith anchor")]
@@ -1303,16 +932,10 @@ mod tantivy_rewriter_tests {
     #[test_case(re("name", Operator::RegexIMatch, "", true), true => None ; "empty pattern")]
     #[test_case(re("name", Operator::RegexIMatch, "a\\", true), true => None ; "trailing backslash")]
     #[test_case(re("tid", Operator::RegexIMatch, "abcdef", true), true => None ; "regex never routes on a raw column")]
-    // Variant/List column (not text-typed): the index holds our canonical
-    // rendering, which `::text` need not reproduce — never routed.
     #[test_case(re("body", Operator::RegexIMatch, "boom", true), true => None ; "non-text column never routes")]
     fn match_indexed_predicate_cases(expr: Expr, allow_eq: bool) -> Option<(String, Route)> {
         match_indexed_predicate(&expr, &cols(), allow_eq)
     }
-
-    /// OR-safety: both branches routed → an Or node; one unroutable branch →
-    /// NO prefilter at all. Renders the prefilter tree the scan side would see
-    /// (`none` when nothing routes), including leaf column and query.
     #[test_case(or(eq("tid", "x"), eq("sid", "y")), true => "or(tid:x,sid:y)" ; "both routed branches must union")]
     #[test_case(or(eq("tid", "x"), eq("unindexed", "y")), true => "none" ; "an OR with an unroutable branch must not seed the prefilter")]
     #[test_case(and(eq("tid", "x"), lit(true)), true => "tid:x" ; "a top-level conjunct still routes")]
@@ -1333,47 +956,13 @@ mod tantivy_rewriter_tests {
         collect_text_match_tree(&[expr.transform_down(|x| rewrite_expr(x, &cols(), allow_eq)).unwrap().data]).as_ref().map_or("none".to_string(), go)
     }
 }
-
-// Rewrite Postgres array literals (`'{}'`, `'{a,b}'`) into typed list
-// literals where an array type is expected, e.g. `COALESCE(hashes, '{}')`.
-//
-// Runs before `TypeCoercion`. For any `coalesce` call where at least one
-// argument types to a list and another is a `'{...}'` string literal, the
-// literal is re-parsed as a PG array literal of the list's element type. Only
-// string element types are handled; anything else is left for TypeCoercion.
-//
-// Known divergences from PG (each pinned by a test): a string COLUMN coalesced
-// with a list errors rather than silently wrapping into a one-element list;
-// malformed quoting inside a brace-wrapped literal parses leniently;
-// multi-dimensional literals are rejected.
-
 use std::mem::take;
-
 use datafusion::common::{plan_err, tree_node::TreeNodeIterator};
-
-/// `coalesce` wrapper whose coercion additionally unifies string args into a
-/// sibling list type. Needed because the SQL planner computes projection
-/// schemas (→ `coerce_types`) BEFORE analyzer rules run, so
-/// `coalesce(List, Utf8)` must type-check up front.
-///
-/// Registered under the built-in's name, shadowing it session-wide; every
-/// trait method delegates to the inner built-in. On a DataFusion upgrade,
-/// re-check `ScalarUDFImpl` for new methods and forward them here too — the
-/// const assert below fails the build until that audit happens.
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub struct PgCoalesceUdf {
     inner: Arc<datafusion::logical_expr::ScalarUDF>,
 }
-
-/// DataFusion version `PgCoalesceUdf`'s method forwarding was last audited
-/// against, compared at compile time to `datafusion::DATAFUSION_VERSION`.
-/// A `cargo update` of datafusion breaks the build here on purpose:
-/// re-audit `ScalarUDFImpl` for new methods, forward them above, then bump.
-/// DATAFUSION_VERSION resolves through the delta-rs fork's patched graph, so
-/// fork upgrades that keep the version string still need the manual audit.
 const AUDITED_DATAFUSION_VERSION: &str = "54.1.0";
-// Byte loop because `&str` equality (PartialEq) isn't const-callable on
-// stable — assert!(a == b) won't compile in a const block.
 const _: () = {
     let (a, b) = (datafusion::DATAFUSION_VERSION.as_bytes(), AUDITED_DATAFUSION_VERSION.as_bytes());
     assert!(a.len() == b.len(), "DataFusion bumped: re-audit PgCoalesceUdf's ScalarUDFImpl forwarding, then update AUDITED_DATAFUSION_VERSION");
@@ -1383,21 +972,17 @@ const _: () = {
         i += 1;
     }
 };
-
-/// Element type of any list-shaped Arrow type; `None` for non-list types.
 fn list_elem_type(t: &DataType) -> Option<&DataType> {
     match t {
         DataType::List(f) | DataType::LargeList(f) | DataType::FixedSizeList(f, _) => Some(f.data_type()),
         _ => None,
     }
 }
-
 impl Default for PgCoalesceUdf {
     fn default() -> Self {
         Self { inner: datafusion::functions::core::coalesce() }
     }
 }
-
 impl datafusion::logical_expr::ScalarUDFImpl for PgCoalesceUdf {
     fn name(&self) -> &str {
         "coalesce"
@@ -1430,44 +1015,29 @@ impl datafusion::logical_expr::ScalarUDFImpl for PgCoalesceUdf {
     }
     fn coerce_types(&self, arg_types: &[DataType]) -> Result<Vec<DataType>> {
         self.inner.coerce_types(arg_types).or_else(|e| {
-            // Runs only after the built-in coercion failed. Promote EVERY string
-            // arg to the sibling list type (arg types carry no expression info
-            // here); the analyzer rule below rewrites the literals to real lists
-            // and rejects any string arg it can't rewrite. First list type wins;
-            // a call mixing list element types fails the retry and surfaces the
-            // original error.
             let list_t = arg_types.iter().find(|t| list_elem_type(t).is_some()).ok_or(e)?.clone();
             let patched: Vec<DataType> = arg_types.iter().map(|t| if is_text_type(t) { list_t.clone() } else { t.clone() }).collect();
             self.inner.coerce_types(&patched)
         })
     }
 }
-
 #[derive(Debug, Default)]
 pub struct PgArrayLiteralRewriter;
-
 impl AnalyzerRule for PgArrayLiteralRewriter {
     fn name(&self) -> &str {
         "pg_array_literal_rewriter"
     }
-
     fn analyze(&self, plan: LogicalPlan, _config: &ConfigOptions) -> Result<LogicalPlan> {
         plan.transform_up(rewrite_in_plan).map(|t| t.data)
     }
 }
-
 fn rewrite_in_plan(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
-    // Leaf nodes (TableScan with pushed-down filters, Values) have no inputs;
-    // their exprs are typed by their own schema instead. Without this, a
-    // coalesce pushed into a TableScan's filter list would skip both the
-    // rewrite and the string-arg guard below.
     let input_schemas = match plan.inputs().as_slice() {
         [] => vec![Arc::clone(plan.schema())],
         inputs => inputs.iter().map(|i| Arc::clone(i.schema())).collect(),
     };
     plan.map_expressions(|expr| expr.transform_up(|e| rewrite_in_expr(e, &input_schemas)))
 }
-
 fn rewrite_in_expr(expr: Expr, input_schemas: &[Arc<DFSchema>]) -> Result<Transformed<Expr>> {
     let Expr::ScalarFunction(ScalarFunction { func, args }) = expr else {
         return Ok(Transformed::no(expr));
@@ -1476,33 +1046,20 @@ fn rewrite_in_expr(expr: Expr, input_schemas: &[Arc<DFSchema>]) -> Result<Transf
     if func.name() != "coalesce" {
         return no(args);
     }
-
-    // Element type of the first arg that resolves to a list type.
     let Some(elem_type) = args.iter().find_map(|a| input_schemas.iter().find_map(|s| list_elem_type(&a.get_type(s.as_ref()).ok()?).cloned())) else {
         return no(args);
     };
-
     let Transformed { data: new_args, transformed, .. } = args.into_iter().map_until_stop_and_collect(|a| {
         Ok(match pg_list_literal(&a, &elem_type) {
             Some(list) => Transformed::yes(Expr::Literal(list, None)),
             None => Transformed::no(a),
         })
     })?;
-    // Any arg still string-typed here survived only because the coerce_types
-    // fallback over-promoted it. Letting it reach TypeCoercion would NOT error:
-    // arrow-cast's blanket `(_, List)` rule wraps each value in a single-element
-    // list, a silently wrong result. Reject it like PG instead.
     if let Some(bad) = new_args.iter().find_map(|a| input_schemas.iter().find_map(|s| a.get_type(s.as_ref()).ok().filter(is_text_type))) {
         return plan_err!("COALESCE types {bad} and List({elem_type}) cannot be matched");
     }
     Ok(Transformed::new_transformed(Expr::ScalarFunction(ScalarFunction { func, args: new_args }), transformed))
 }
-
-/// The typed list literal a string arg denotes as a PG array literal, or None
-/// if it isn't a string literal, isn't a PG array literal, or has an element
-/// that doesn't parse as `elem_type` (caller then leaves the arg alone).
-/// Always emits `ScalarValue::List`; TypeCoercion casts it onward to
-/// LargeList/FixedSizeList, so only the element type matters here.
 fn pg_list_literal(arg: &Expr, elem_type: &DataType) -> Option<ScalarValue> {
     let Expr::Literal(v, _) = arg else { return None };
     let vals: Vec<ScalarValue> = parse_pg_string_array(utf8_scalar(v)?)?
@@ -1511,13 +1068,6 @@ fn pg_list_literal(arg: &Expr, elem_type: &DataType) -> Option<ScalarValue> {
         .collect::<Option<_>>()?;
     Some(ScalarValue::List(ScalarValue::new_list_nullable(&vals, elem_type)))
 }
-
-/// Parse a PG array literal of strings: `{}`, `{a,b}`, `{"a,b",NULL}`.
-/// Returns None if `s` isn't brace-wrapped (not an array literal), or if it
-/// contains unquoted nested braces (multi-dimensional arrays like
-/// `{{a},{b}}` — the schema is 1-D only, so bail rather than misparse the
-/// inner braces as element text). Malformed quoting parses leniently.
-/// Only the bare `NULL` keyword is a null element; `\N` stays literal text.
 fn parse_pg_string_array(s: &str) -> Option<Vec<Option<String>>> {
     let inner = s.trim().strip_prefix('{')?.strip_suffix('}')?;
     if inner.trim().is_empty() {
@@ -1544,9 +1094,6 @@ fn parse_pg_string_array(s: &str) -> Option<Vec<Option<String>>> {
     elems.push(finish_elem(cur, was_quoted));
     Some(elems)
 }
-
-/// One scanned element: unquoted `NULL` is the null element, quoted text keeps
-/// its whitespace, unquoted text is trimmed.
 fn finish_elem(raw: String, quoted: bool) -> Option<String> {
     if quoted {
         return Some(raw);
@@ -1554,13 +1101,10 @@ fn finish_elem(raw: String, quoted: bool) -> Option<String> {
     let trimmed = raw.trim();
     (!trimmed.eq_ignore_ascii_case("null")).then(|| trimmed.to_string())
 }
-
 #[cfg(test)]
 mod pg_array_literal_rewriter_tests {
     use datafusion::{execution::session_state::SessionStateBuilder, prelude::SessionContext};
-
     use super::*;
-
     fn ctx_with_rule() -> SessionContext {
         let rules: Vec<Arc<dyn AnalyzerRule + Send + Sync>> =
             vec![Arc::new(PgArrayLiteralRewriter), Arc::new(datafusion::optimizer::analyzer::type_coercion::TypeCoercion::new())];
@@ -1569,11 +1113,8 @@ mod pg_array_literal_rewriter_tests {
         ctx.register_udf(datafusion::logical_expr::ScalarUDF::from(PgCoalesceUdf::default()));
         ctx
     }
-
-    // Asserts the actual coalesced value, not merely that planning succeeded.
     #[test_case::test_case("SELECT cardinality(COALESCE(CAST(NULL AS VARCHAR[]), '{}')) AS n FROM (SELECT 1)", "| 0 " ; "coalesce_empty_pg_array_literal")]
     #[test_case::test_case("SELECT COALESCE(CAST(NULL AS VARCHAR[]), '{a, b, \"c,d\", NULL}') AS v FROM (SELECT 1)", "[a, b, c,d, ]" ; "coalesce_nonempty_pg_array_literal")]
-    // No list-typed arg → rule must not fire; plain string coalesce still works.
     #[test_case::test_case("SELECT COALESCE(CAST(NULL AS VARCHAR), '{}') AS v FROM (SELECT 1)", "{}" ; "non_array_string_untouched")]
     #[tokio::test]
     async fn coalesce_evaluates_to(sql: &str, want: &str) {
@@ -1581,15 +1122,10 @@ mod pg_array_literal_rewriter_tests {
         let out = datafusion::arrow::util::pretty::pretty_format_batches(&batches).unwrap().to_string();
         assert!(out.contains(want), "{sql}\n{out}");
     }
-
-    // Without the explicit guard, arrow-cast's blanket `(_, List)` rule would
-    // silently return `[varchar_value]` instead of failing like PG.
     #[test_case::test_case("SELECT COALESCE(v, l) FROM (SELECT CAST('x' AS VARCHAR) AS v, CAST(NULL AS VARCHAR[]) AS l)" ; "coalesce_string_column_with_list_errors")]
     #[test_case::test_case("SELECT COALESCE(CAST(NULL AS VARCHAR[]), 'not-an-array') FROM (SELECT 1)" ; "coalesce_unparseable_literal_with_list_errors")]
     #[tokio::test]
     async fn coalesce_with_list_arg_errors(sql: &str) {
-        // Analyzer rules run at physical planning, so the error may surface at
-        // sql() or collect() — either way it must never execute successfully.
         let ctx = ctx_with_rule();
         let err = match ctx.sql(sql).await {
             Err(e) => e.to_string(),
@@ -1597,9 +1133,6 @@ mod pg_array_literal_rewriter_tests {
         };
         assert!(err.contains("cannot be matched"), "{sql}\n{err}");
     }
-
-    // Leaf-node path in rewrite_in_plan: a TableScan carrying a pushed-down
-    // coalesce filter has no inputs, so its exprs are typed against its own schema.
     #[test]
     fn rewrites_inside_table_scan_filters() {
         use datafusion::{
@@ -1621,23 +1154,16 @@ mod pg_array_literal_rewriter_tests {
         let Expr::ScalarFunction(f) = be.left.as_ref() else { panic!("expected coalesce") };
         assert!(matches!(f.args[1], Expr::Literal(ScalarValue::List(_), _)), "array literal in TableScan filter not rewritten: {:?}", f.args[1]);
     }
-
     fn elems(v: &[Option<&str>]) -> Option<Vec<Option<String>>> {
         Some(v.iter().map(|e| e.map(str::to_string)).collect())
     }
-
     #[test_case::test_case("{}" => elems(&[]) ; "empty literal")]
     #[test_case::test_case("{a,b}" => elems(&[Some("a"), Some("b")]) ; "bare elements")]
     #[test_case::test_case(r#"{"a,b", c }"# => elems(&[Some("a,b"), Some("c")]) ; "quoted comma, unquoted element trimmed")]
     #[test_case::test_case("{NULL,\"NULL\"}" => elems(&[None, Some("NULL")]) ; "unquoted NULL is null, quoted NULL is text")]
-    // PG rejects these literals; we parse leniently. Pinned as intentional.
     #[test_case::test_case("{\"a\"x,b}" => elems(&[Some("a"), Some("b")]) ; "trailing junk after a closing quote is dropped")]
     #[test_case::test_case("{a\"b\"}" => elems(&[Some("ab")]) ; "text before an opening quote is concatenated")]
-    // Lone trailing backslash must leave the arg unrewritten — never a panic
-    // or a half-parsed list.
     #[test_case::test_case("{\"a\\}" => None ; "lone trailing backslash")]
-    // Multi-dimensional literals are rejected, not silently flattened;
-    // braces inside quotes are ordinary element text.
     #[test_case::test_case("{{a},{b}}" => None ; "multi-dimensional literal rejected")]
     #[test_case::test_case(r#"{"{x}",y}"# => elems(&[Some("{x}"), Some("y")]) ; "braces inside quotes are element text")]
     #[test_case::test_case("plain" => None ; "not brace-delimited")]
@@ -1645,23 +1171,6 @@ mod pg_array_literal_rewriter_tests {
         parse_pg_string_array(s)
     }
 }
-
-// Order the unordered branches of a routed MemBuffer∪Delta union so an
-// `ORDER BY <sort-keys> LIMIT n` becomes a streaming, early-terminating TopK
-// instead of a full blocking sort over the whole window.
-//
-// A union is order-preserving only when *every* child shares the ordering. The
-// Delta branch advertises the table's footer ordering; the MemBuffer branch
-// advertises none. This rule runs before `EnforceDistribution`/`EnforceSorting`
-// and wraps the unsatisfying child(ren) in a `SortExec(req).with_fetch(n)`.
-//
-// Scope guards:
-// - Only fires under a *fetching* sort, so no MemBuffer sort is bolted onto
-//   counts/aggregations.
-// - Only fires on a *mixed* union (≥1 child ordered, ≥1 not).
-// - The requested ordering is re-resolved by column *name* against the union
-//   schema, so an intervening projection can't misalign the sort-key indices.
-
 use datafusion::{
     arrow::datatypes::Schema,
     physical_expr::{LexOrdering, PhysicalSortExpr, expressions::Column as PhysColumn},
@@ -1672,23 +1181,14 @@ use datafusion::{
         union::UnionExec,
     },
 };
-
-/// `node` with its only child replaced, or `node` untouched when the rewrite
-/// declined — the shape every physical rule in this file ends in.
 fn swap_child(node: Arc<dyn ExecutionPlan>, child: Option<Arc<dyn ExecutionPlan>>) -> Result<Transformed<Arc<dyn ExecutionPlan>>> {
     match child {
         Some(child) => Ok(Transformed::yes(node.with_new_children(vec![child])?)),
         None => Ok(Transformed::no(node)),
     }
 }
-
 #[derive(Debug, Default)]
 pub struct OrderedUnionForTopK;
-
-/// Re-express `req` (sort keys, possibly indexed against a downstream projected
-/// schema) as plain columns resolved by name against `schema`. Returns `None`
-/// if any key is not a plain column or is absent from `schema` — in which case
-/// the rule bails (correctness over cleverness).
 fn resolve_ordering(req: &LexOrdering, schema: &Schema) -> Option<LexOrdering> {
     req.iter()
         .map(|se| {
@@ -1699,26 +1199,6 @@ fn resolve_ordering(req: &LexOrdering, schema: &Schema) -> Option<LexOrdering> {
         .collect::<Option<Vec<_>>>()
         .and_then(LexOrdering::new)
 }
-
-/// The shared mechanism: `children` with every child that does not already
-/// satisfy `req` wrapped in `SortExec(req)` (carrying `fetch`), so a union over
-/// them advertises `req`.
-///
-/// Callers: this rule (top-K, `fetch` known) and `ProjectRoutingTable::scan`,
-/// which uses it with no fetch so the mem ∪ hot ∪ delta union advertises the
-/// table's lead sort key and `EnforceDistribution` satisfies `DedupExec`'s
-/// `SinglePartition` with a `SortPreservingMergeExec` rather than a
-/// `CoalescePartitionsExec` (which declares no ordering, leaving keep-greatest
-/// dormant).
-///
-/// `Ok(None)` means "leave the plan alone":
-/// - every child already satisfies `req`, or
-/// - a child that doesn't satisfy it is marked unsortable — `sortable[i] ==
-///   false` means a blocking sort on that leg costs more than the ordering buys
-///   (indices past `sortable`'s end are sortable), or
-/// - `require_ordered_child` and no child is ordered. `scan` does NOT set this:
-///   a MemBuffer-only scan has no ordered leg by construction, yet is exactly
-///   where a fresh version append lives, so it must still be ordered.
 pub fn ordered_children(
     children: &[Arc<dyn ExecutionPlan>], req: &LexOrdering, fetch: Option<usize>, sortable: &[bool], require_ordered_child: bool,
 ) -> Result<Option<Vec<Arc<dyn ExecutionPlan>>>> {
@@ -1729,9 +1209,6 @@ pub fn ordered_children(
         children
             .iter()
             .zip(sat)
-            // `preserve_partitioning`: sort each input partition independently
-            // rather than requiring a `CoalescePartitionsExec` that serialises
-            // the leg; per-partition ordering is what the union advertises.
             .map(|(c, s)| {
                 if s {
                     Arc::clone(c)
@@ -1742,26 +1219,14 @@ pub fn ordered_children(
             .collect()
     }))
 }
-
-/// Walk down from a fetching sort through single-child order-preserving
-/// operators to the first `UnionExec`; if the union is mixed (some children
-/// satisfy `req`, some don't), sort the unsatisfying children by `req` (with
-/// `fetch`) so the union becomes order-preserving. Returns the rewritten
-/// subtree, or `None` when nothing applied.
 fn order_union(plan: &Arc<dyn ExecutionPlan>, req: &LexOrdering, fetch: Option<usize>) -> Result<Option<Arc<dyn ExecutionPlan>>> {
     if let Some(union) = downcast::<UnionExec>(plan.as_ref()) {
         let Some(req_here) = resolve_ordering(req, &union.schema()) else {
             return Ok(None);
         };
-        // Mixed union only (`require_ordered_child`): an ordered child to merge
-        // toward AND an unordered child to fix.
         let children: Vec<Arc<dyn ExecutionPlan>> = union.children().into_iter().cloned().collect();
         return ordered_children(&children, &req_here, fetch, &[], true)?.map(UnionExec::try_new).transpose();
     }
-    // Descend only through single-child, order-preserving operators so the
-    // ordering propagates up to the sort — but NEVER through a DedupExec: its
-    // survivors are decided across ALL input rows, so a `with_fetch` cut on a
-    // leg below it can drop the newer version of a row.
     let children = plan.children();
     if children.len() == 1
         && downcast::<crate::read::DedupExec>(plan.as_ref()).is_none()
@@ -1772,20 +1237,16 @@ fn order_union(plan: &Arc<dyn ExecutionPlan>, req: &LexOrdering, fetch: Option<u
     }
     Ok(None)
 }
-
 impl PhysicalOptimizerRule for OrderedUnionForTopK {
     fn name(&self) -> &str {
         "ordered_union_for_topk"
     }
-
     fn schema_check(&self) -> bool {
         true
     }
-
     fn optimize(&self, plan: Arc<dyn ExecutionPlan>, _config: &ConfigOptions) -> Result<Arc<dyn ExecutionPlan>> {
         Ok(plan
             .transform_down(|node| {
-                // Anchor: a fetching global sort (the `ORDER BY … LIMIT n` shape).
                 let Some((req, fetch)) = downcast::<SortExec>(node.as_ref())
                     .map(|s| (s.expr().clone(), s.fetch()))
                     .or_else(|| downcast::<SortPreservingMergeExec>(node.as_ref()).map(|m| (m.expr().clone(), m.fetch())))
@@ -1800,50 +1261,20 @@ impl PhysicalOptimizerRule for OrderedUnionForTopK {
             .data)
     }
 }
-
-// The delta-rs fork isolates footer-less files into a sibling scan with no
-// ordering claim rather than voiding the claim for the whole scan. But a
-// `UnionExec` advertises an ordering only when EVERY child does, so the Delta
-// leg as a whole advertises none: `DedupExec` falls from bounded keep-greatest
-// to the unbounded `full-set` mode, and `ORDER BY ts DESC LIMIT n` stays a
-// BLOCKING `SortExec` over the whole window. ONE non-conforming file flips it.
-//
-/// The repair, applied to a Delta leg as it leaves `provider.scan`: sort each
-/// isolated unordered child of a mixed scan union whose selected bytes fit
-/// `max_bytes`, so the union advertises the ordering again. `0` disables it.
-///
-/// Done HERE and not as a `PhysicalOptimizerRule` because `DedupExec` declares no
-/// required input ordering: a sort injected before `EnforceSorting` is deleted as
-/// unused. `ProjectRoutingTable::scan` builds — and pins — its own
-/// `SortPreservingMergeExec` over the leg, which is what keeps this alive.
-///
-/// No fetch is pushed: sorting a child changes no rows, so this is sound under
-/// `DedupExec`, where a top-n cut on a leg would truncate row versions.
 pub(crate) fn repair_isolated_scan_ordering(plan: Arc<dyn ExecutionPlan>, max_bytes: u64) -> Result<Arc<dyn ExecutionPlan>> {
-    // No early return for `max_bytes == 0`: it falls through to the
-    // `bytes <= max_bytes` test so the disabled case exercises that comparison.
-    // Bottom-up so a rewritten union's new ordering propagates through the
-    // `DeltaScanExec` wrapping it as the parents are rebuilt.
     Ok(plan
         .transform_up(|node| {
             let Some(union) = downcast::<UnionExec>(node.as_ref()) else {
                 return Ok(Transformed::no(node));
             };
             let children: Vec<Arc<dyn ExecutionPlan>> = union.children().into_iter().cloned().collect();
-            // Only the fork's isolation shape: every child a bare file scan.
-            // TimeFusion's own `mem ∪ delta` union has a non-scan child.
             let Some(sizes) = children.iter().map(crate::database::selected_file_work).collect::<Option<Vec<_>>>() else {
                 return Ok(Transformed::no(node));
             };
             let Some(req) = children.iter().find_map(|c| c.properties().output_ordering()).cloned() else {
-                // NO child declares an ordering: every file in the union is
-                // non-conforming, so there is nothing to give back.
                 metrics::counter!(crate::database::scan_metric_names::ORDERING_REPAIR_NO_CLAIM).increment(1);
                 return Ok(Transformed::no(node));
             };
-            // `sortable` IS the byte budget: sorting a whole-window parquet leg
-            // OOMs. `ordered_children` bails on the whole union as soon as one
-            // over-budget child misses the ordering.
             let sortable: Vec<bool> = sizes.iter().map(|(_, bytes)| *bytes <= max_bytes).collect();
             Ok(match ordered_children(&children, &req, None, &sortable, true)? {
                 Some(ordered) => {
@@ -1851,11 +1282,6 @@ pub(crate) fn repair_isolated_scan_ordering(plan: Arc<dyn ExecutionPlan>, max_by
                     Transformed::yes(UnionExec::try_new(ordered)?)
                 }
                 None => {
-                    // Declining costs the query its streaming top-N: the union
-                    // advertises no ordering, `DedupExec` falls to unbounded
-                    // `full-set`, and `ORDER BY ts DESC LIMIT n` becomes a
-                    // blocking sort. The over-budget leg bytes are the number
-                    // `timefusion_read_sort_unordered_leg_max_mb` is set against.
                     let over: u64 = sizes.iter().map(|(_, bytes)| *bytes).filter(|b| *b > max_bytes).sum();
                     metrics::counter!(crate::database::scan_metric_names::ORDERING_REPAIR_DECLINED).increment(1);
                     if crate::observability::sample_rollup_miss("ordering_repair_declined") {
@@ -1874,7 +1300,6 @@ pub(crate) fn repair_isolated_scan_ordering(plan: Arc<dyn ExecutionPlan>, max_by
         })?
         .data)
 }
-
 #[cfg(test)]
 mod ordered_union_for_topk_tests {
     use datafusion::{
@@ -1888,27 +1313,20 @@ mod ordered_union_for_topk_tests {
             execution_plan::{Boundedness, EmissionType},
         },
     };
-
     use super::*;
-
     fn schema() -> SchemaRef {
         Arc::new(Schema::new(vec![
             Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), false),
             Field::new("id", DataType::Utf8, false),
         ]))
     }
-
     fn ts_desc() -> LexOrdering {
         LexOrdering::new(vec![PhysicalSortExpr::new(Arc::new(PhysColumn::new("timestamp", 0)), SortOptions { descending: true, nulls_first: true })]).unwrap()
     }
-
-    /// A leaf exec that lets the test declare whatever output ordering it wants,
-    /// standing in for either the ordered Delta scan or the unordered MemBuffer.
     #[derive(Debug)]
     struct MockLeaf {
         props: Arc<PlanProperties>,
     }
-
     impl MockLeaf {
         fn leaf(schema: SchemaRef, ordering: Option<LexOrdering>) -> Arc<dyn ExecutionPlan> {
             let eq = EquivalenceProperties::new_with_orderings(schema, ordering);
@@ -1916,13 +1334,11 @@ mod ordered_union_for_topk_tests {
             Arc::new(MockLeaf { props })
         }
     }
-
     impl datafusion::physical_plan::DisplayAs for MockLeaf {
         fn fmt_as(&self, _t: datafusion::physical_plan::DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
             write!(f, "MockLeaf")
         }
     }
-
     impl ExecutionPlan for MockLeaf {
         fn name(&self) -> &'static str {
             "MockLeaf"
@@ -1940,34 +1356,19 @@ mod ordered_union_for_topk_tests {
             unimplemented!()
         }
     }
-
-    /// Number of `SortExec` nodes anywhere in the tree.
     fn count_sorts(plan: &Arc<dyn ExecutionPlan>) -> usize {
         usize::from(downcast::<SortExec>(plan.as_ref()).is_some()) + plan.children().into_iter().map(count_sorts).sum::<usize>()
     }
-
-    /// `SortExec(ts DESC, fetch)` over `mem (unordered) ∪ delta`, where delta
-    /// advertises `[ts DESC]` only when `delta_ordered` — the two dimensions the
-    /// guards below vary. Returns the plan and the requested ordering.
     fn fetching_sort_over_union(delta_ordered: bool, fetch: Option<usize>) -> (Arc<dyn ExecutionPlan>, LexOrdering) {
         let (s, ord) = (schema(), ts_desc());
         let union = UnionExec::try_new(vec![MockLeaf::leaf(s.clone(), None), MockLeaf::leaf(s, delta_ordered.then(|| ord.clone()))]).unwrap();
         (Arc::new(SortExec::new(ord.clone(), union).with_fetch(fetch)), ord)
     }
-
-    /// Runs `ordered_children` over one `MockLeaf` per `ordered` flag (`true` =
-    /// advertises `[ts DESC]`, i.e. a sorted Delta scan) and reports, per leg,
-    /// how many `SortExec`s the rewrite left — `None` when it declined to
-    /// rewrite at all.
     fn ordered_children_sorts(ordered: &[bool], sortable: &[bool], require_ordered_child: bool) -> Option<Vec<usize>> {
         let (s, ord) = (schema(), ts_desc());
         let legs: Vec<Arc<dyn ExecutionPlan>> = ordered.iter().map(|o| MockLeaf::leaf(s.clone(), o.then(|| ord.clone()))).collect();
         ordered_children(&legs, &ord, None, sortable, require_ordered_child).unwrap().map(|out| out.iter().map(count_sorts).collect())
     }
-
-    // The rule must sort the mem branch to match delta's advertised ordering —
-    // top sort + one injected mem sort = 2 SortExecs — and must not touch plans
-    // with no fetch, or where neither branch is ordered.
     #[test_case::test_case(true, Some(50) => 2 ; "exactly one SortExec injected over the unordered mem branch")]
     #[test_case::test_case(true, None => 1 ; "no injection when there is no fetch")]
     #[test_case::test_case(false, Some(50) => 1 ; "no injection when neither branch is ordered")]
@@ -1976,7 +1377,6 @@ mod ordered_union_for_topk_tests {
         let out = OrderedUnionForTopK.optimize(top, &ConfigOptions::new()).unwrap();
         let sorts = count_sorts(&out);
         if sorts == 2 {
-            // The union is now order-preserving: it advertises [ts DESC].
             assert!(
                 out.children()[0].properties().equivalence_properties().ordering_satisfy(ord.iter().cloned()).unwrap(),
                 "union must advertise the sort ordering after the rule runs"
@@ -1984,71 +1384,37 @@ mod ordered_union_for_topk_tests {
         }
         sorts
     }
-
-    // `ordered_children` is also called directly by `ProjectRoutingTable::scan`,
-    // with `sortable` marking the cheap in-memory legs and
-    // `require_ordered_child = false`.
     #[test_case::test_case(&[false, true], &[true, false], false => Some(vec![1, 0]) ; "mixed union: only the mem leg is sorted")]
-    // An unsortable unordered leg must bail: a blocking sort over a whole-window
-    // parquet scan OOMs.
     #[test_case::test_case(&[false, false], &[true, false], false => None ; "an unsortable unordered leg aborts the whole rewrite")]
-    // A lone unordered mem leg is where a fresh version append lives, so it is
-    // still sorted — unless the caller requires an ordered peer.
     #[test_case::test_case(&[false], &[true], false => Some(vec![1]) ; "a lone sortable leg is still sorted")]
     #[test_case::test_case(&[false], &[true], true => None ; "require_ordered_child declines a lone leg with no ordered peer")]
     fn ordered_children_honours_sortable_and_lone_leg(ordered: &[bool], sortable: &[bool], require_ordered_child: bool) -> Option<Vec<usize>> {
         ordered_children_sorts(ordered, sortable, require_ordered_child)
     }
 }
-
-// Rewrites `row_to_json(t)` — a bare relation alias standing for a whole row —
-// into `row_to_json(named_struct('c1', t.c1, …))`.
-//
-// PostgreSQL lets a table alias name the entire row in a function argument.
-// DataFusion rejects it while PLANNING the SQL, before any analyzer or
-// optimizer rule can see the plan — so unlike [`super::ExistsInProjection`]
-// this has to happen on the statement, not the plan.
-//
-// The column names come from the derived table's own SELECT aliases, which are
-// present in the AST, so no schema lookup is needed. A relation whose columns
-// are not all explicitly aliased is left alone rather than guessing names.
-
 use datafusion::sql::sqlparser::ast::{
     Expr as SqlExpr, Function, FunctionArg, FunctionArgExpr, FunctionArgumentList, FunctionArguments, Ident, ObjectName, ObjectNamePart, Query, Select,
     SelectItem, SetExpr, Statement, TableFactor, Value as SqlValue, ValueWithSpan, VisitMut, VisitorMut,
 };
-
-/// Cheap guard so the parse/unparse round trip only happens for statements that
-/// could possibly need it.
 pub fn might_need_rewrite(sql: &str) -> bool {
     sql.to_ascii_lowercase().contains("row_to_json")
 }
-
-/// Returns the rewritten statement only when something actually changed, so an
-/// untouched statement is never round-tripped through the unparser.
 pub fn rewrite(statement: &mut Statement) -> bool {
     let mut visitor = RowToJsonRecord { rewrote: false };
     let _ = statement.visit(&mut visitor);
     visitor.rewrote
 }
-
 struct RowToJsonRecord {
     rewrote: bool,
 }
-
 impl VisitorMut for RowToJsonRecord {
     type Break = ();
-
     fn post_visit_query(&mut self, query: &mut Query) -> std::ops::ControlFlow<Self::Break> {
         self.rewrite_set_expr(query.body.as_mut());
         std::ops::ControlFlow::Continue(())
     }
 }
-
 impl RowToJsonRecord {
-    /// A UNION's branches are `SetExpr`s, not `Query`s, so they are never
-    /// reached by matching on `query.body` alone. Re-running over an
-    /// already-rewritten branch is a no-op.
     fn rewrite_set_expr(&mut self, body: &mut SetExpr) {
         match body {
             SetExpr::Select(select) => self.rewrite_select(select),
@@ -2060,10 +1426,7 @@ impl RowToJsonRecord {
             _ => {}
         }
     }
-
     fn rewrite_select(&mut self, select: &mut Select) {
-        // `post_visit_query` means inner queries are already rewritten, so the
-        // aliases collected here belong to this SELECT's own FROM.
         let relations: Vec<(String, Vec<String>)> = select.from.iter().filter_map(|from| derived_columns(&from.relation)).collect();
         if relations.is_empty() {
             return;
@@ -2074,13 +1437,11 @@ impl RowToJsonRecord {
             }
         }
     }
-
     fn rewrite_expr(&mut self, expr: &mut SqlExpr, relations: &[(String, Vec<String>)]) {
         let SqlExpr::Function(function) = expr else { return };
         if !is_row_to_json(&function.name) {
             return;
         }
-        // A schema-qualified UDF name does not resolve in DataFusion.
         if function.name.0.len() > 1 {
             function.name = ObjectName(vec![ObjectNamePart::Identifier(Ident::new("row_to_json"))]);
             self.rewrote = true;
@@ -2096,13 +1457,9 @@ impl RowToJsonRecord {
         self.rewrote = true;
     }
 }
-
 fn is_row_to_json(name: &ObjectName) -> bool {
     name.0.last().is_some_and(|part| matches!(part, ObjectNamePart::Identifier(ident) if ident.value.eq_ignore_ascii_case("row_to_json")))
 }
-
-/// `named_struct('total', t."total", 'active', t."active", …)`, preserving the
-/// declared column order.
 fn named_struct(alias: &str, columns: &[String]) -> SqlExpr {
     let args = columns
         .iter()
@@ -2127,10 +1484,6 @@ fn named_struct(alias: &str, columns: &[String]) -> SqlExpr {
         within_group: vec![],
     })
 }
-
-/// `(SELECT … AS a, … AS b) t` → `("t", ["a", "b"])`. `None` unless the relation
-/// is a derived table with an alias and every projected column is explicitly
-/// named, since the column names are the whole point.
 fn derived_columns(relation: &TableFactor) -> Option<(String, Vec<String>)> {
     let TableFactor::Derived { subquery, alias, .. } = relation else { return None };
     let alias = alias.as_ref()?;
@@ -2140,7 +1493,6 @@ fn derived_columns(relation: &TableFactor) -> Option<(String, Vec<String>)> {
         .iter()
         .map(|item| match item {
             SelectItem::ExprWithAlias { alias, .. } => Some(alias.value.clone()),
-            // A bare column still has a well-defined name.
             SelectItem::UnnamedExpr(SqlExpr::Identifier(ident)) => Some(ident.value.clone()),
             SelectItem::UnnamedExpr(SqlExpr::CompoundIdentifier(parts)) => parts.last().map(|part| part.value.clone()),
             _ => None,
@@ -2148,24 +1500,18 @@ fn derived_columns(relation: &TableFactor) -> Option<(String, Vec<String>)> {
         .collect::<Option<Vec<_>>>()?;
     (!columns.is_empty()).then(|| (alias.name.value.clone(), columns))
 }
-
 #[cfg(test)]
 mod row_to_json_record_tests {
     use datafusion::sql::sqlparser::{dialect::PostgreSqlDialect, parser::Parser};
-
     use super::*;
-
-    /// `Some(rewritten SQL)` when the rule fired, `None` when it declined.
     fn rewrite_sql(sql: &str) -> Option<String> {
         let mut statements = Parser::parse_sql(&PostgreSqlDialect {}, sql).expect("parses");
         rewrite(&mut statements[0]).then(|| statements[0].to_string())
     }
-
     #[test_case::test_case(r#"SELECT row_to_json(t) FROM (SELECT 1 AS "total", 2 AS "active") t"#,
         &[r#"named_struct('total', t."total", 'active', t."active")"#], &[] ; "bare alias becomes named_struct in declared order")]
     #[test_case::test_case(r#"SELECT pg_catalog.row_to_json(t) FROM (SELECT 1 AS "a") t"#,
         &["named_struct('a', t.\"a\")"], &["pg_catalog.row_to_json"] ; "qualified pg_catalog call is rewritten")]
-    // A visitor that only matches `query.body == Select` skips every UNION branch.
     #[test_case::test_case(r#"SELECT 'a' AS chart_name, pg_catalog.row_to_json(t) AS chart_data FROM (SELECT 1 AS "Total") t
                UNION ALL
                SELECT 'b' AS chart_name, pg_catalog.row_to_json(t) AS chart_data FROM (SELECT 2 AS "Active") t"#,
@@ -2179,50 +1525,31 @@ mod row_to_json_record_tests {
             assert!(!out.contains(forbid), "must not contain {forbid}: {out}");
         }
     }
-
-    // An unnamed column has no name to key the object by.
     #[test_case::test_case("SELECT row_to_json(t) FROM (SELECT count(*), 1 AS b) t" => None ; "unaliased derived column is left alone")]
-    // `row_to_json(some_column)` is an ordinary call on a value, not a record.
     #[test_case::test_case("SELECT row_to_json(payload) FROM events" => None ; "non-relation identifier is left alone")]
-    // A real table alias is not a derived table: its columns are not in the AST.
     #[test_case::test_case("SELECT row_to_json(t) FROM some_table t" => None ; "plain table alias is left alone")]
     fn declines_to_rewrite(sql: &str) -> Option<String> {
         rewrite_sql(sql)
     }
 }
-
-// Rewrites `EXISTS(q)` in a projection to `(SELECT count(1) FROM q) > 0`.
-//
-// DataFusion decorrelates EXISTS only in filter position; an EXISTS in a
-// SELECT list dies in physical planning. Correlated *scalar* subqueries in a
-// projection ARE decorrelated, which is why the count form plans.
-// Semantics-preserving: `EXISTS(q)` is true iff `q` returns at least one row.
-
 use datafusion::{
     functions_aggregate::expr_fn::count,
     logical_expr::{LogicalPlanBuilder, Subquery},
 };
-
 #[derive(Debug)]
 pub struct ExistsInProjection;
-
 impl AnalyzerRule for ExistsInProjection {
     fn name(&self) -> &str {
         "exists_in_projection"
     }
-
     fn analyze(&self, plan: LogicalPlan, _config: &ConfigOptions) -> Result<LogicalPlan> {
         plan.transform_up(|plan| {
             let LogicalPlan::Projection(projection) = plan else { return Ok(Transformed::no(plan)) };
-            // `transform_up` so a nested EXISTS is rewritten before its parent is
-            // inspected; `Alias` nodes must survive untouched or the projection's
-            // output column names change.
             let Transformed { data, transformed, .. } = projection.expr.clone().into_iter().map_until_stop_and_collect(|expr| {
                 expr.transform_up(|expr| match expr {
                     Expr::Exists(exists) => Ok(Transformed::yes(match count_subquery(exists.subquery)? {
                         Some(count) if exists.negated => count.eq(lit(0_i64)),
                         Some(count) => count.gt(lit(0_i64)),
-                        // Provably empty subquery: EXISTS is a constant.
                         None => lit(exists.negated),
                     })),
                     other => Ok(Transformed::no(other)),
@@ -2236,10 +1563,6 @@ impl AnalyzerRule for ExistsInProjection {
         .map(|transformed| transformed.data)
     }
 }
-
-/// `q` → scalar subquery `SELECT count(1) FROM q`, keeping the outer
-/// references so DataFusion still sees it as correlated. `None` means `q` is
-/// provably empty, so the caller can fold the EXISTS to a constant.
 fn count_subquery(subquery: Subquery) -> Result<Option<Expr>> {
     let Subquery { subquery: plan, outer_ref_columns, spans } = subquery;
     let Some(plan) = peel_row_caps(Arc::unwrap_or_clone(plan)) else {
@@ -2248,14 +1571,8 @@ fn count_subquery(subquery: Subquery) -> Result<Option<Expr>> {
     let counted = LogicalPlanBuilder::from(plan).aggregate(Vec::<Expr>::new(), vec![count(lit(1_i64))])?.build()?;
     Ok(Some(Expr::ScalarSubquery(Subquery { subquery: Arc::new(counted), outer_ref_columns, spans })))
 }
-
-/// Strips `LIMIT n` from the top of an EXISTS subquery; a row cap cannot change
-/// whether *some* row exists, and DataFusion will not decorrelate a scalar
-/// subquery containing a Limit. A non-zero `OFFSET` is NOT stripped — dropping
-/// it would change the answer. Returns `None` for `LIMIT 0`.
 fn peel_row_caps(plan: LogicalPlan) -> Option<LogicalPlan> {
     match plan {
-        // A non-zero OFFSET is not peelable, so it falls through to `other`.
         LogicalPlan::Limit(limit) if limit.skip.as_deref().is_none_or(|skip| literal_count(skip) == Some(0)) => {
             if limit.fetch.as_deref().and_then(literal_count) == Some(0) {
                 return None; // LIMIT 0 can never produce a row
@@ -2265,7 +1582,6 @@ fn peel_row_caps(plan: LogicalPlan) -> Option<LogicalPlan> {
         other => Some(other),
     }
 }
-
 fn literal_count(expr: &Expr) -> Option<i64> {
     let Expr::Literal(value, ..) = expr else { return None };
     match value.cast_to(&DataType::Int64).ok()? {
@@ -2273,13 +1589,10 @@ fn literal_count(expr: &Expr) -> Option<i64> {
         _ => None,
     }
 }
-
 #[cfg(test)]
 mod exists_in_projection_tests {
     use datafusion::{execution::session_state::SessionStateBuilder, prelude::SessionContext};
-
     use super::*;
-
     async fn ctx() -> SessionContext {
         let state = SessionStateBuilder::new()
             .with_default_features()
@@ -2291,57 +1604,39 @@ mod exists_in_projection_tests {
         ctx.sql("CREATE TABLE inner_t(fk INT) AS VALUES (1)").await.unwrap().collect().await.unwrap();
         ctx
     }
-
     #[test_case::test_case("SELECT id, EXISTS (SELECT 1 FROM inner_t WHERE fk = outer_t.id LIMIT 1) AS present FROM outer_t ORDER BY id"
         => Ok(vec![true, false]) ; "correlated exists in a projection plans and evaluates: id=1 has a match, id=2 does not")]
     #[test_case::test_case("SELECT id, NOT EXISTS (SELECT 1 FROM inner_t WHERE fk = outer_t.id) AS absent FROM outer_t ORDER BY id"
         => Ok(vec![false, true]) ; "negated exists inverts: id=1 matches so absent=false; id=2 absent=true")]
-    // `LIMIT 1 OFFSET 5` asks whether at least SIX rows exist: an offset must
-    // never be peeled. Making this pass requires counting past the offset.
     #[test_case::test_case("SELECT id, EXISTS (SELECT 1 FROM inner_t WHERE fk = outer_t.id LIMIT 1 OFFSET 5) AS present FROM outer_t"
         => matches Err(_) ; "offset is not peeled and is never answered wrongly: an offset EXISTS must error rather than return a wrong answer")]
     #[test_case::test_case("SELECT id, EXISTS (SELECT 1 FROM inner_t WHERE fk = outer_t.id LIMIT 0) AS present FROM outer_t"
         => Ok(vec![false, false]) ; "limit zero folds to false")]
     #[tokio::test]
     async fn exists_in_a_projection(sql: &str) -> std::result::Result<Vec<bool>, String> {
-        // The offset case must plan logically and fail later, not at parse time.
         let batches = ctx().await.sql(sql).await.expect("logical planning must succeed").collect().await.map_err(|e| e.to_string())?;
         Ok(batches.iter().flat_map(|batch| datafusion::arrow::array::AsArray::as_boolean(batch.column(1)).values().iter().collect::<Vec<_>>()).collect())
     }
 }
-
-// Expand `qualifier.*` inside scalar function arguments into the explicit column
-// list, as Postgres does. Must run before `TypeCoercion`, which rejects a typeless
-// wildcard. Only `ScalarFunction` args and only QUALIFIED wildcards: bare `f(*)`
-// has different semantics (`count(*)`) and is left alone.
-
 use datafusion::common::plan_datafusion_err;
-
 #[derive(Debug, Default)]
 pub struct WildcardFnArgExpander;
-
 impl AnalyzerRule for WildcardFnArgExpander {
     fn name(&self) -> &str {
         "wildcard_fn_arg_expander"
     }
-
     fn analyze(&self, plan: LogicalPlan, _config: &ConfigOptions) -> Result<LogicalPlan> {
         plan.transform_up(expand_in_plan).map(|t| t.data)
     }
 }
-
 fn expand_in_plan(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
-    // The wildcard's qualifier must resolve against one of the direct inputs.
     let input_schemas: Vec<_> = plan.inputs().iter().map(|i| i.schema().clone()).collect();
     if input_schemas.is_empty() {
         return Ok(Transformed::no(plan));
     }
-    // No recompute_schema() needed: expanding a variadic call's args does not change
-    // the projection's output type.
     plan.map_expressions(|expr| expr.transform_up(|e| expand_in_expr(e, &input_schemas)))
 }
-
-#[allow(deprecated)] // Expr::Wildcard is still the variant the SQL planner emits
+#[allow(deprecated)] // Expr::Wildcard is the actual variant the SQL planner emits today (#7765 plans to replace it, not gone yet)
 fn expand_in_expr(expr: Expr, input_schemas: &[Arc<DFSchema>]) -> Result<Transformed<Expr>> {
     let Expr::ScalarFunction(ScalarFunction { func, args }) = expr else {
         return Ok(Transformed::no(expr));
@@ -2359,9 +1654,6 @@ fn expand_in_expr(expr: Expr, input_schemas: &[Arc<DFSchema>]) -> Result<Transfo
         .concat();
     Ok(Transformed::yes(Expr::ScalarFunction(ScalarFunction { func, args })))
 }
-
-/// Columns of the first input schema owning `qualifier`, in declared order. SQL forbids
-/// duplicate qualifier names in one scope, so first-match-wins is unambiguous.
 fn expand_qualifier(qualifier: &TableReference, input_schemas: &[Arc<DFSchema>]) -> Result<Vec<Expr>> {
     input_schemas
         .iter()
@@ -2378,15 +1670,11 @@ fn expand_qualifier(qualifier: &TableReference, input_schemas: &[Arc<DFSchema>])
         .find(|cols| !cols.is_empty())
         .ok_or_else(|| plan_datafusion_err!("Unknown qualifier in function argument: {qualifier}"))
 }
-
 #[cfg(test)]
 mod wildcard_fn_arg_expander_tests {
     use datafusion::{arrow::array::StringViewArray, execution::session_state::SessionStateBuilder, prelude::SessionContext};
-
     use super::*;
-
     fn ctx_with_rule() -> SessionContext {
-        // WildcardFnArgExpander must come before TypeCoercion, as in database.rs.
         let rules: Vec<Arc<dyn datafusion::optimizer::AnalyzerRule + Send + Sync>> = vec![
             Arc::new(datafusion::optimizer::analyzer::resolve_grouping_function::ResolveGroupingFunction::new()),
             Arc::new(WildcardFnArgExpander),
@@ -2397,13 +1685,10 @@ mod wildcard_fn_arg_expander_tests {
         crate::read::functions::register_custom_functions(&mut ctx).unwrap();
         ctx
     }
-
-    /// First row of the single output column, as the JSON text `jsonb_build_array` produces.
     async fn first_json(sql: &str) -> String {
         let batches = ctx_with_rule().sql(sql).await.expect("plan ok").collect().await.expect("exec ok");
         batches[0].column(0).as_any().downcast_ref::<StringViewArray>().expect("StringViewArray").value(0).to_string()
     }
-
     #[test_case::test_case("SELECT jsonb_build_array(sub.*) FROM (SELECT 1 AS a, 'x' AS b, true AS c) sub"
         => r#"[1,"x",true]"#.to_string() ; "qualified wildcard expands in declared column order")]
     #[test_case::test_case("SELECT jsonb_build_array(a.*, b.*) FROM (SELECT 1 AS x, 2 AS y) a CROSS JOIN (SELECT 'p' AS p, 'q' AS q) b"
@@ -2416,9 +1701,6 @@ mod wildcard_fn_arg_expander_tests {
     async fn expands_wildcard_fn_args(sql: &str) -> String {
         first_json(sql).await
     }
-
-    /// An out-of-scope qualifier is caught by DataFusion's planner before this rule
-    /// runs; the rule's own "Unknown qualifier" error is defensive.
     #[tokio::test]
     async fn unknown_qualifier_errors_clearly() {
         let ctx = ctx_with_rule();
@@ -2427,26 +1709,13 @@ mod wildcard_fn_arg_expander_tests {
         assert!(msg.contains("Invalid qualifier sub"), "msg: {msg}");
     }
 }
-
-// Defer expensive scalar projections past TopK (Sort with fetch), so they are
-// evaluated only on the surviving `fetch` rows:
-// `Sort(fetch) → Projection(expensive)` becomes
-// `Projection(expensive, rebuilt) → Sort(fetch, exprs inlined) → Projection(raw cols)`.
-// Must be registered AFTER DataFusion's defaults, so `push_down_limit` has already
-// folded LIMIT into `Sort.fetch`.
-
 use std::collections::BTreeSet;
-
 use datafusion::{
     logical_expr::{Sort, SortExpr},
     optimizer::{ApplyOrder, OptimizerConfig, OptimizerRule},
 };
-
 #[derive(Debug, Default)]
 pub struct DeferExpensiveProjection;
-
-/// Columns, literals, and aliases thereof cost nothing per-row; everything
-/// else (function calls, casts, IS NULL, arithmetic) is worth deferring.
 fn is_trivial(e: &Expr) -> bool {
     match e {
         Expr::Column(_) | Expr::Literal(..) => true,
@@ -2454,34 +1723,26 @@ fn is_trivial(e: &Expr) -> bool {
         _ => false,
     }
 }
-
 impl OptimizerRule for DeferExpensiveProjection {
     fn name(&self) -> &str {
         "defer_expensive_projection"
     }
-
     fn apply_order(&self) -> Option<ApplyOrder> {
         Some(ApplyOrder::TopDown)
     }
-
     fn rewrite(&self, plan: LogicalPlan, _config: &dyn OptimizerConfig) -> Result<Transformed<LogicalPlan>> {
         let rewritten = defer(&plan)?;
         Ok(rewritten.map_or_else(|| Transformed::no(plan), Transformed::yes))
     }
 }
-
-/// `None` when the plan is not a `Sort(fetch)` over a projection worth deferring.
 fn defer(plan: &LogicalPlan) -> Result<Option<LogicalPlan>> {
     let LogicalPlan::Sort(sort) = plan else { return Ok(None) };
     let (LogicalPlan::Projection(proj), Some(_)) = (sort.input.as_ref(), sort.fetch) else { return Ok(None) };
     if proj.expr.iter().all(is_trivial) {
         return Ok(None);
     }
-
-    // (qualifier, name, unaliased expr) per projection output.
     let outputs = || proj.schema.iter().zip(proj.expr.iter()).map(|((q, f), e)| (q.cloned(), f.name(), e.clone().unalias()));
     let out_map: HashMap<Column, Expr> = outputs().map(|(q, name, e)| (Column::new(q, name), e)).collect();
-
     let new_sort_exprs = sort
         .expr
         .iter()
@@ -2502,22 +1763,16 @@ fn defer(plan: &LogicalPlan) -> Result<Option<LogicalPlan>> {
             Ok(SortExpr { expr, asc: se.asc, nulls_first: se.nulls_first })
         })
         .collect::<Result<Vec<_>>>()?;
-
-    // Ordered set, so the rewritten plan is deterministic (`column_refs` is not).
     let needed: BTreeSet<&Column> = proj.expr.iter().chain(new_sort_exprs.iter().map(|se| &se.expr)).flat_map(|e| e.column_refs()).collect();
     if needed.is_empty() {
         return Ok(None);
     }
-
     let min_proj = Projection::try_new(needed.into_iter().cloned().map(Expr::Column).collect(), Arc::clone(&proj.input))?;
     let new_sort = LogicalPlan::Sort(Sort { expr: new_sort_exprs, input: Arc::new(LogicalPlan::Projection(min_proj)), fetch: sort.fetch });
-    // Alias each rebuilt expr to its original (qualifier, name) so the parent
-    // plan's column references and the root schema are unchanged.
     let rebuilt = outputs().map(|(q, name, e)| e.alias_qualified(q, name)).collect();
     let hoisted = Projection::try_new_with_schema(rebuilt, Arc::new(new_sort), Arc::clone(&proj.schema))?;
     Ok(Some(LogicalPlan::Projection(hoisted)))
 }
-
 #[cfg(test)]
 mod defer_expensive_projection_tests {
     use datafusion::{
@@ -2526,9 +1781,7 @@ mod defer_expensive_projection_tests {
         execution::session_state::SessionStateBuilder,
         prelude::SessionContext,
     };
-
     use super::*;
-
     async fn plans(sql: &str, with_rule: bool) -> (String, String) {
         let builder = SessionStateBuilder::new().with_default_features();
         let builder = if with_rule { builder.with_optimizer_rule(Arc::new(DeferExpensiveProjection)) } else { builder };
@@ -2544,11 +1797,7 @@ mod defer_expensive_projection_tests {
         let physical = datafusion::physical_plan::displayable(df.create_physical_plan().await.unwrap().as_ref()).indent(false).to_string();
         (logical, physical)
     }
-
     const TOPK_SQL: &str = "SELECT concat(id, name) FROM t ORDER BY timestamp DESC LIMIT 5";
-
-    /// True when EVERY `concat` sits above `Sort:` in the optimized logical plan,
-    /// i.e. the expensive expr is evaluated on the TopK output, not the window.
     #[test_case::test_case(TOPK_SQL, false => false ; "baseline evaluates concat below Sort, for every row in the window")]
     #[test_case::test_case(TOPK_SQL, true => true ; "defers expensive projection past topk")]
     #[test_case::test_case("SELECT upper(name) AS u, concat(id, name) FROM t ORDER BY u DESC LIMIT 3", true => true ; "inlines expensive sort key")]
@@ -2559,51 +1808,29 @@ mod defer_expensive_projection_tests {
         let sort = plan.find("Sort:").expect(&plan);
         plan.rfind("concat").expect(&plan) < sort
     }
-
-    /// The deferral must survive physical planning, not just logical.
     #[tokio::test]
     async fn defers_expensive_projection_past_topk() {
         let (after, phys) = plans(TOPK_SQL, true).await;
         assert!(after.contains("fetch=5"), "TopK fetch must survive the rewrite:\n{after}");
-        // Physical ProjectionPushdown must not push the projection back below SortExec.
         let p_sort = phys.find("SortExec").expect(&phys);
         assert!(phys.find("concat").expect(&phys) < p_sort, "physical plan must keep concat above SortExec:\n{phys}");
         assert!(phys.contains("TopK"), "SortExec must run as TopK:\n{phys}");
     }
 }
-
-// Keep `DedupExec` fed by an order-PRESERVING merge, not an order-erasing coalesce.
-//
-// `DedupExec` consumes physical run structure (every version of a key arriving
-// contiguously), not ordering as a logical property. When a pushed predicate pins the
-// sort column to a constant, EnforceSorting considers the ordering trivially satisfied
-// and drops the merge in favour of a `CoalescePartitionsExec`, which interleaves
-// partitions — the operator then falls back to unbounded `full-set` mode.
-//
-// So this rule runs after EnforceSorting/EnforceDistribution and puts the merge back.
-// Not a pessimisation: the branches underneath are already ordered (that is why the
-// coalesce was legal), so this is a k-way merge of sorted streams, not a sort.
-
 use datafusion::{common::tree_node::TransformedResult, physical_plan::coalesce_partitions::CoalescePartitionsExec};
-
 use crate::read::DedupExec;
-
 #[derive(Debug)]
 pub struct DedupNeedsOrderedInput;
-
 impl PhysicalOptimizerRule for DedupNeedsOrderedInput {
     fn name(&self) -> &str {
         "DedupNeedsOrderedInput"
     }
-
     fn schema_check(&self) -> bool {
         true
     }
-
     fn optimize(&self, plan: Arc<dyn ExecutionPlan>, _config: &ConfigOptions) -> Result<Arc<dyn ExecutionPlan>> {
         plan.transform_up(|node| {
             let merged = downcast::<DedupExec>(node.as_ref())
-                // No declared ordering means keep-greatest is dormant; a coalesce is fine.
                 .and_then(|dedup| dedup.required_ordering().cloned())
                 .and_then(|req| {
                     let child = Arc::clone(node.children()[0]);
@@ -2615,7 +1842,6 @@ impl PhysicalOptimizerRule for DedupNeedsOrderedInput {
         .data()
     }
 }
-
 #[cfg(test)]
 mod dedup_needs_ordered_input_tests {
     use super::*;
@@ -2628,30 +1854,21 @@ mod dedup_needs_ordered_input_tests {
         datasource::{memory::MemorySourceConfig, source::DataSourceExec},
         physical_expr::{LexOrdering, PhysicalSortExpr, expressions::Column as PhysColumn},
     };
-
     fn ts_ordering() -> LexOrdering {
         LexOrdering::new(vec![PhysicalSortExpr::new(Arc::new(PhysColumn::new("ts", 0)), SortOptions { descending: true, nulls_first: false })]).unwrap()
     }
-
-    /// Two ordered partitions, so a coalesce over them is legal but interleaving.
     fn ordered_source() -> Arc<dyn ExecutionPlan> {
         let schema = Arc::new(Schema::new(vec![Field::new("ts", DataType::Int64, false), Field::new("id", DataType::Int64, false)]));
         let batch = |a: i64| RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![a])), Arc::new(Int64Array::from(vec![a]))]).unwrap();
         let cfg = MemorySourceConfig::try_new(&[vec![batch(2)], vec![batch(1)]], schema, None).unwrap().try_with_sort_information(vec![ts_ordering()]).unwrap();
         Arc::new(DataSourceExec::new(Arc::new(cfg)))
     }
-
     fn dedup_over(child: Arc<dyn ExecutionPlan>, requiring: Option<LexOrdering>) -> Arc<dyn ExecutionPlan> {
         Arc::new(DedupExec::with_tiebreak(child, vec!["ts".into(), "id".into()], None, None).unwrap().requiring(requiring))
     }
-
-    /// Leading alphanumeric run of the child's Debug — the exec's type name.
     fn child_name(plan: &Arc<dyn ExecutionPlan>) -> String {
         format!("{:?}", plan.children()[0]).split(|c: char| !c.is_alphanumeric()).next().unwrap_or_default().to_string()
     }
-
-    // `coalesced` picks the input exec; `requires_order` is whether the DedupExec declares a
-    // required ordering.
     #[test_case::test_case(true, true => "SortPreservingMergeExec" ; "restores the merge a constant sort column let the planner discharge")]
     #[test_case::test_case(true, false => "CoalescePartitionsExec" ; "leaves an ordering agnostic dedup alone")]
     #[test_case::test_case(false, true => "SortPreservingMergeExec" ; "leaves an already merged dedup alone")]
@@ -2663,68 +1880,33 @@ mod dedup_needs_ordered_input_tests {
         };
         let plan = dedup_over(child, requires_order.then(ts_ordering));
         assert_eq!(child_name(&plan), if coalesced { "CoalescePartitionsExec" } else { "SortPreservingMergeExec" }, "precondition");
-
         child_name(&DedupNeedsOrderedInput.optimize(plan, &ConfigOptions::default()).unwrap())
     }
 }
-
-// ===== range_parallel_dedup =====
-
 use datafusion::logical_expr::Filter;
-
-/// Branches a wide aggregate window is split into. `<2` disables the rule.
 static RANGE_SPLIT_BRANCHES: OnceLock<usize> = OnceLock::new();
-
 pub fn range_split_branches() -> usize {
-    *RANGE_SPLIT_BRANCHES.get_or_init(|| 4)
 }
-
-/// Set the range-split branch count. No-op after the first call (OnceLock).
 pub fn set_range_split_branches(branches: usize) {
     let _ = RANGE_SPLIT_BRANCHES.set(branches);
 }
-
-/// Below this span one thread is comfortably inside the statement timeout, so
-/// splitting only adds planning work and re-opens files.
 const MIN_SPLIT_SPAN_MICROS: i64 = 8 * 24 * 3_600 * 1_000_000;
-
-/// `DedupExec` declares `Distribution::SinglePartition`, so every row of a window
-/// funnels through ONE thread. This rule splits a wide window into N disjoint
-/// timestamp ranges, each with its own scan and `DedupExec`, unioned under the
-/// original aggregate.
-///
-/// Exact because `timestamp` is the LEADING dedup key: two versions of a row carry
-/// the same timestamp and can never land either side of a boundary.
-///
-/// RANGE and not HASH: hashing destroys the input ordering, forcing `DedupExec` into
-/// its unbounded `full-set` mode. A range split keeps every branch ordered.
-///
-/// Only under an aggregate: a union of ranges advertises no ordering, so applying
-/// this beneath `ORDER BY timestamp DESC LIMIT n` would trade a streaming TopK for a
-/// blocking sort.
 #[derive(Debug, Default)]
 pub struct RangeParallelDedup;
-
 impl OptimizerRule for RangeParallelDedup {
     fn name(&self) -> &str {
         "range_parallel_dedup"
     }
-
     fn apply_order(&self) -> Option<ApplyOrder> {
         Some(ApplyOrder::TopDown)
     }
-
     fn rewrite(&self, plan: LogicalPlan, _config: &dyn OptimizerConfig) -> Result<Transformed<LogicalPlan>> {
         Ok(split_aggregate(&plan)?.map_or_else(|| Transformed::no(plan), Transformed::yes))
     }
 }
-
-/// `None` when the plan is not an aggregate over a window worth splitting.
 fn split_aggregate(plan: &LogicalPlan) -> Result<Option<LogicalPlan>> {
     let branches = range_split_branches();
     let LogicalPlan::Aggregate(aggregate) = plan else { return Ok(None) };
-    // A Union input is this rule's own output. The optimizer runs to a
-    // fixpoint, and re-splitting each branch would fan out geometrically.
     if branches < 2 || matches!(aggregate.input.as_ref(), LogicalPlan::Union(_)) {
         return Ok(None);
     }
@@ -2734,9 +1916,6 @@ fn split_aggregate(plan: &LogicalPlan) -> Result<Option<LogicalPlan>> {
     let step = (hi - lo) / branches as i64;
     let Some(narrowed) = (0..branches)
         .map(|i| {
-            // Half-open [lo, hi) per branch so a row on a boundary belongs to
-            // exactly one branch. The last branch takes `hi + 1` because the
-            // window `hi` is INCLUSIVE (`<=` folds into it upstream).
             let branch_lo = lo + step * i as i64;
             let branch_hi = if i + 1 == branches { hi.saturating_add(1) } else { lo + step * (i as i64 + 1) };
             narrow_scan_window(&aggregate.input, branch_lo, branch_hi)
@@ -2746,9 +1925,6 @@ fn split_aggregate(plan: &LogicalPlan) -> Result<Option<LogicalPlan>> {
         return Ok(None);
     };
     let union = narrowed[1..].iter().try_fold(LogicalPlanBuilder::new(narrowed[0].clone()), |builder, branch| builder.union(branch.clone()))?.build()?;
-    // A UNION's output fields are UNQUALIFIED, so a parent `t.id` stops resolving.
-    // Re-attach the scan's qualifier; if the schema still differs from the input's,
-    // DECLINE — the replacement must be indistinguishable to every parent.
     let union = if union.schema() == aggregate.input.schema() {
         union
     } else {
@@ -2761,14 +1937,6 @@ fn split_aggregate(plan: &LogicalPlan) -> Result<Option<LogicalPlan>> {
     };
     Ok(Some(LogicalPlan::Aggregate(datafusion::logical_expr::Aggregate::try_new(Arc::new(union), aggregate.group_expr.clone(), aggregate.aggr_expr.clone())?)))
 }
-
-/// The `TableScan` under a subtree the split may pass through, collecting the
-/// filter predicates crossed on the way down.
-///
-/// A WHITELIST, deliberately: the rewrite assumes "the rows of sub-range A" equals
-/// "the rows of the whole window restricted to A". Only nodes that commute with a
-/// row filter may be listed — a LIMIT, DISTINCT, JOIN, WINDOW or nested aggregate
-/// breaks that equality, so an unrecognised node must decline, not miscount.
 fn scan_under<'a>(plan: &'a LogicalPlan, predicates: &mut Vec<&'a Expr>) -> Option<&'a TableScan> {
     match plan {
         LogicalPlan::Filter(filter) => {
@@ -2781,17 +1949,11 @@ fn scan_under<'a>(plan: &'a LogicalPlan, predicates: &mut Vec<&'a Expr>) -> Opti
         _ => None,
     }
 }
-
-/// The finite timestamp window of a subtree the split may pass through.
 fn splittable_window(plan: &LogicalPlan) -> Option<(i64, i64)> {
     let mut predicates = Vec::new();
     let scan = scan_under(plan, &mut predicates)?;
     bounded_window(predicates.into_iter().chain(&scan.filters).flat_map(split_conjunction))
 }
-
-/// Both bounds of `timestamp` across `conjuncts`, or `None` if either is open.
-/// An unbounded side has no finite span to divide, and splitting on a guessed
-/// bound would drop every row outside it.
 fn bounded_window<'a>(conjuncts: impl IntoIterator<Item = &'a Expr>) -> Option<(i64, i64)> {
     let literal_micros = |expr: &Expr| match expr {
         Expr::Literal(scalar, _) => scalar_micros(scalar),
@@ -2816,19 +1978,12 @@ fn bounded_window<'a>(conjuncts: impl IntoIterator<Item = &'a Expr>) -> Option<(
     });
     lo.zip(hi).filter(|(lo, hi)| lo < hi)
 }
-
-/// The scanned table's qualifier, used to restore the qualification a UNION drops.
 fn scan_qualifier(plan: &LogicalPlan) -> Option<datafusion::common::TableReference> {
     scan_under(plan, &mut Vec::new()).map(|scan| scan.table_name.clone())
 }
-
-/// Rebuild `plan` with `[lo, hi)` pinned directly above its TableScan, so the
-/// branch prunes to its own files rather than filtering a full-window scan.
 fn narrow_scan_window(plan: &LogicalPlan, lo: i64, hi: i64) -> Option<LogicalPlan> {
     match plan {
         LogicalPlan::TableScan(scan) => {
-            // Timezone comes from the scanned column, never assumed: a literal in the
-            // wrong timezone or TimeUnit silently shifts the boundary.
             let field = scan.projected_schema.field_with_unqualified_name("timestamp").ok()?;
             let timezone = match field.data_type() {
                 DataType::Timestamp(TimeUnit::Microsecond, timezone) => timezone.clone(),
@@ -2837,17 +1992,11 @@ fn narrow_scan_window(plan: &LogicalPlan, lo: i64, hi: i64) -> Option<LogicalPla
             let literal = |micros| Expr::Literal(ScalarValue::TimestampMicrosecond(Some(micros), timezone.clone()), None);
             let timestamp = Expr::Column(Column::new(Some(scan.table_name.clone()), "timestamp"));
             let (lower, upper) = (timestamp.clone().gt_eq(literal(lo)), timestamp.lt(literal(hi)));
-            // Push the bound INTO the scan, not merely above it: this rule runs after
-            // `push_down_filter`, so a Filter node placed here is never folded into
-            // `TableScan.filters` and every branch would prune to the same files.
-            // The Filter node STAYS too — `TableScan.filters` is only a pruning hint the
-            // provider may apply approximately, so it cannot enforce the branch boundary.
             let mut narrowed = scan.clone();
             narrowed.filters.push(lower.clone());
             narrowed.filters.push(upper.clone());
             Filter::try_new(lower.and(upper), Arc::new(LogicalPlan::TableScan(narrowed))).ok().map(LogicalPlan::Filter)
         }
-        // Pass-through nodes: same node, narrowed child.
         LogicalPlan::Filter(_) | LogicalPlan::Projection(_) | LogicalPlan::SubqueryAlias(_) => {
             let child = narrow_scan_window(plan.inputs()[0], lo, hi)?;
             plan.with_new_exprs(plan.expressions(), vec![child]).ok()
@@ -2855,7 +2004,6 @@ fn narrow_scan_window(plan: &LogicalPlan, lo: i64, hi: i64) -> Option<LogicalPla
         _ => None,
     }
 }
-
 #[cfg(test)]
 mod range_parallel_dedup_tests {
     use datafusion::{
@@ -2864,11 +2012,7 @@ mod range_parallel_dedup_tests {
         execution::session_state::SessionStateBuilder,
         prelude::SessionContext,
     };
-
     use super::*;
-
-    /// `timestamp` is `Timestamp(us, UTC)` as `otel_logs_and_spans` declares it —
-    /// the rule reads the timezone off this field.
     async fn optimized(sql: &str, with_rule: bool) -> String {
         let builder = SessionStateBuilder::new().with_default_features();
         let builder = if with_rule { builder.with_optimizer_rule(Arc::new(RangeParallelDedup)) } else { builder };
@@ -2880,40 +2024,23 @@ mod range_parallel_dedup_tests {
         ctx.register_table("t", Arc::new(MemTable::try_new(schema, vec![vec![]]).unwrap())).unwrap();
         ctx.sql(sql).await.unwrap().into_optimized_plan().unwrap().display_indent().to_string()
     }
-
     const WIDE: &str = "timestamp >= '2026-08-05T00:00:00Z'::timestamp AND timestamp <= '2026-09-04T00:00:00Z'::timestamp";
-
-    /// A wide aggregate becomes N independently-dedupable ranges.
     #[tokio::test]
     async fn splits_a_wide_aggregate_window_into_branches() {
         let plan = optimized(&format!("SELECT count(*) FROM t WHERE {WIDE}"), true).await;
         assert!(plan.contains("Union"), "wide aggregate must split:\n{plan}");
         assert_eq!(plan.matches("TableScan: t").count(), range_split_branches(), "one scan per branch:\n{plan}");
-        // Each branch must carry its OWN bound, or the split multiplies the work.
         assert!(plan.matches("timestamp >=").count() >= range_split_branches(), "each branch needs its own lower bound:\n{plan}");
     }
-
-    /// Every shape here breaks "rows of sub-range A == the window's rows restricted
-    /// to A", or has nothing to gain, so each must come back byte-identical to the
-    /// un-ruled plan. `{W}` is the wide window; the rest is the shape under test.
-    // count(*) over a LIMIT would become branches x limit rows.
     #[test_case::test_case("SELECT count(*) FROM (SELECT * FROM t WHERE {W} LIMIT 100)" ; "limit under the aggregate")]
-    // No aggregate: splitting costs the streaming TopK its ordering.
     #[test_case::test_case("SELECT id FROM t WHERE {W} ORDER BY timestamp DESC LIMIT 5" ; "order by with limit")]
-    // Narrow enough that one thread is comfortably inside the timeout.
     #[test_case::test_case("SELECT count(*) FROM t WHERE timestamp >= '2026-09-01T00:00:00Z'::timestamp AND timestamp <= '2026-09-04T00:00:00Z'::timestamp" ; "span below the threshold")]
-    // An open upper bound has no finite span to divide.
     #[test_case::test_case("SELECT count(*) FROM t WHERE timestamp >= '2026-08-05T00:00:00Z'::timestamp" ; "half-open window")]
     #[tokio::test]
     async fn declines_where_a_split_would_change_the_answer(sql: &str) {
         let sql = sql.replace("{W}", WIDE);
         assert_eq!(optimized(&sql, true).await, optimized(&sql, false).await, "must not rewrite");
     }
-
-    /// A UNION emits UNQUALIFIED fields, so a parent `t.id` would stop resolving:
-    /// the rewrite must be indistinguishable to its parent, qualifier included.
-    /// `SELECT DISTINCT` is itself an `Aggregate`, so it is the shape that
-    /// exercises qualification.
     #[tokio::test]
     async fn split_preserves_the_scan_qualifier_a_union_would_drop() {
         let plan = optimized(&format!("SELECT count(*) FROM (SELECT DISTINCT id FROM t WHERE {WIDE})"), true).await;
@@ -2921,10 +2048,6 @@ mod range_parallel_dedup_tests {
         assert!(plan.contains("SubqueryAlias: t"), "the union must be re-qualified as `t`:\n{plan}");
         assert!(plan.contains("groupBy=[[t.id]]"), "the parent must still bind `t.id`:\n{plan}");
     }
-
-    /// Branches must tile `[lo, hi]` with no gap (drops rows) and no overlap
-    /// (double-counts); both still return a plausible number, so this asserts on
-    /// the boundary VALUES rather than how they are spelled in the plan.
     #[tokio::test]
     async fn branch_bounds_tile_the_window_exactly() {
         let plan = optimized(&format!("SELECT count(*) FROM t WHERE {WIDE}"), true).await;
@@ -2945,20 +2068,13 @@ mod range_parallel_dedup_tests {
         assert!(bounds[0].1 > bounds[0].0, "each branch must be non-empty:\n{plan}");
     }
 }
-
-/// Storage ordering is not sufficient evidence for closing aggregate groups: older
-/// Parquet files can advertise sorted row groups without being sorted ACROSS row-group
-/// boundaries, and dedup preserves that order without repairing it. Scans and LIMITs are
-/// left alone; aggregates must retain every group unless a real sort established the order.
 #[derive(Debug)]
 pub struct AggregateInputOrdering;
-
 #[derive(Debug)]
 struct UnorderedAggregateInput {
     input: Arc<dyn ExecutionPlan>,
     properties: Arc<datafusion::physical_plan::PlanProperties>,
 }
-
 impl UnorderedAggregateInput {
     fn new(input: Arc<dyn ExecutionPlan>) -> Self {
         let mut properties = input.properties().as_ref().clone();
@@ -2966,13 +2082,11 @@ impl UnorderedAggregateInput {
         Self { input, properties: Arc::new(properties) }
     }
 }
-
 impl datafusion::physical_plan::DisplayAs for UnorderedAggregateInput {
     fn fmt_as(&self, _: datafusion::physical_plan::DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(f, "UnorderedAggregateInput")
     }
 }
-
 impl ExecutionPlan for UnorderedAggregateInput {
     fn name(&self) -> &'static str {
         "UnorderedAggregateInput"
@@ -2992,7 +2106,6 @@ impl ExecutionPlan for UnorderedAggregateInput {
         self.input.execute(partition, context)
     }
 }
-
 impl PhysicalOptimizerRule for AggregateInputOrdering {
     fn name(&self) -> &str {
         "AggregateInputOrdering"
@@ -3017,7 +2130,6 @@ impl PhysicalOptimizerRule for AggregateInputOrdering {
         .data()
     }
 }
-
 #[cfg(test)]
 mod aggregate_input_ordering_tests {
     use super::*;
@@ -3031,9 +2143,6 @@ mod aggregate_input_ordering_tests {
         physical_plan::collect,
         prelude::{SessionConfig, SessionContext},
     };
-
-    /// A repeated bucket arrives after an older one: each bucket must be emitted once
-    /// with its full count, never closed early on untrusted storage order.
     #[test_case::test_case(vec![vec![2, 1, 2, 0]] => vec![1_i64, 1, 2] ; "repeat after an older row inside one batch")]
     #[test_case::test_case(vec![vec![2, 1], vec![2, 0]] => vec![1_i64, 1, 2] ; "repeat arrives in a later batch")]
     #[tokio::test]
@@ -3055,7 +2164,6 @@ mod aggregate_input_ordering_tests {
             .unwrap();
         let df = ctx.sql("SELECT time_bucket('1 second', ts) AS bucket, count(*) AS n FROM events GROUP BY 1 ORDER BY 1 DESC").await.unwrap();
         let plan = df.create_physical_plan().await.unwrap();
-        // Use the real merge-on-read operator.
         let plan = plan
             .transform_up(|node| {
                 if downcast::<DataSourceExec>(node.as_ref()).is_some() {

@@ -1,7 +1,5 @@
 //! DML rewrites (UPDATE/DELETE/MERGE) must use TF's zstd writer properties, not
-//! delta-rs's SNAPPY default. Regression for the `.snappy.parquet` files the
-//! merge/update/delete paths produced before `Database::dml_writer_properties`
-//! was wired into all three builders (observed in prod 2026-07-14).
+//! delta-rs's SNAPPY default.
 
 use std::time::Duration;
 
@@ -21,12 +19,8 @@ async fn dml_update_rewrites_are_zstd_not_snappy() -> anyhow::Result<()> {
     env.advance(Duration::from_secs(180));
     env.force_flush().await?;
 
-    // Simple UPDATE routes to perform_delta_update (UpdateBuilder), executed
-    // immediately (dml_coalesce_secs defaults to 0). It rewrites the matched file.
-    // `hashes` is the one column declared `mutable: true`; the rest are immutable
-    // so their read filters can be pushed below the merge-on-read dedup. Which
-    // column is assigned is incidental here — this test is about the codec the
-    // rewrite emits.
+    // `hashes` is the one column declared `mutable: true`; which column is assigned
+    // is incidental — this test is about the codec the rewrite emits.
     client.execute("UPDATE otel_logs_and_spans SET hashes = make_array('ERR') WHERE project_id = 'e2e_project' AND id = 'u-1'", &[]).await?;
 
     let table_ref = env.db().resolve_table("e2e_project", "otel_logs_and_spans").await?;

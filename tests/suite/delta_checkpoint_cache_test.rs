@@ -6,8 +6,7 @@ use serial_test::serial;
 use test_case::test_case;
 use timefusion::storage::{FoyerCacheConfig, FoyerObjectStoreCache, SharedFoyerCache};
 
-/// Removes the cache dir when the test ends — including on panic. `test_config`
-/// makes the path unique per (name, process), so every case needs its own name.
+/// Removes the cache dir on drop. The path is unique per (name, process), so every case needs its own name.
 struct CacheDirGuard(PathBuf);
 
 impl Drop for CacheDirGuard {
@@ -16,8 +15,7 @@ impl Drop for CacheDirGuard {
     }
 }
 
-/// A cache over a fresh `InMemory` store, plus the shared-cache handle (kept
-/// alive for the whole test) and the guard that removes its dir.
+/// A cache over a fresh `InMemory` store; the returned shared handle and guard must be kept alive for the whole test.
 async fn env(name: &str, tweak: impl FnOnce(&mut FoyerCacheConfig)) -> anyhow::Result<(Arc<InMemory>, FoyerObjectStoreCache, SharedFoyerCache, CacheDirGuard)> {
     let config = FoyerCacheConfig::test_config_with(name, tweak);
     let guard = CacheDirGuard(config.cache_dir.clone());
@@ -35,8 +33,7 @@ struct Delta {
     ttl_expirations: u64,
 }
 
-/// Reads `path` through the cache, returning its bytes and the main-cache
-/// counter deltas that read caused.
+/// Reads `path` through the cache, returning its bytes and the counter deltas that read caused.
 async fn get_counted(cache: &FoyerObjectStoreCache, path: &Path) -> anyhow::Result<(Vec<u8>, Delta)> {
     let before = cache.get_stats().await.main;
     let bytes = cache.get(path).await?.into_stream().try_collect::<Vec<_>>().await?.concat();
@@ -45,9 +42,7 @@ async fn get_counted(cache: &FoyerObjectStoreCache, path: &Path) -> anyhow::Resu
     Ok((bytes, delta))
 }
 
-/// Writing through the cache also caches, so the first get is a hit; an object
-/// that only exists in the inner store (Delta's `_last_checkpoint`) misses once,
-/// then hits. Second get always hits, whatever the path kind.
+/// A put through the cache also caches, so the first get hits; an inner-store-only object misses once, then hits.
 #[test_case("data/file.parquet", "regular parquet data", true ; "regular parquet cached by put")]
 #[test_case("table/_delta_log/00000000.json", "metadata", true ; "delta metadata cached by put")]
 #[test_case("table/_delta_log/00000001.json", "commit data", true ; "delta commit cached by put")]
@@ -99,18 +94,14 @@ async fn test_checkpoint_invalidation_on_commit() -> anyhow::Result<()> {
     assert_eq!(data, old.as_bytes(), "second get returns the same bytes");
     assert_eq!(d.hits, 1, "Second get should hit cache");
 
-    // Update the checkpoint underneath the cache, then write a commit file.
     inner.put(&checkpoint_path, PutPayload::from(new.as_bytes())).await?;
     cache.put(&Path::from(format!("{table}/_delta_log/00000011.json")), PutPayload::from(&b"commit 11"[..])).await?;
 
-    // With stale-while-revalidate, checkpoint is still served from cache (stale data).
-    // The refresh happens in background after 5 seconds.
+    // Stale-while-revalidate: the checkpoint is still served stale until the background refresh.
     let (data, d) = get_counted(&cache, &checkpoint_path).await?;
     assert_eq!(data, old.as_bytes(), "Should still get cached (stale) checkpoint data");
     assert_eq!(d.hits, 1, "Should hit cache with stale data");
 
-    // To get the new data, we need to wait for the stale threshold (5 seconds)
-    // or manually invalidate the cache.
     cache.invalidate_checkpoint_cache(table).await;
 
     let (data, d) = get_counted(&cache, &checkpoint_path).await?;
@@ -122,16 +113,13 @@ async fn test_checkpoint_invalidation_on_commit() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The same TTL applies to every path kind: Delta log metadata is not privileged
-/// over a regular parquet file.
+/// The same TTL applies to every path kind: Delta log metadata is not privileged over regular data.
 #[test_case("table/_delta_log/00000000.json", "metadata" ; "delta metadata expires")]
 #[test_case("data/file.parquet", "data" ; "regular file expires on the same TTL")]
 #[tokio::test]
 #[serial]
 async fn test_delta_metadata_ttl(path: &'static str, body: &'static str) -> anyhow::Result<()> {
-    // 2s TTL (not ~100ms): the "within TTL" puts/gets must complete before
-    // expiry, and a loaded CI runner can stall the put→get window past a
-    // tight TTL, spuriously turning the first hit into a miss. Wide margin.
+    // 2s TTL, not ~100ms: a loaded runner can stall the put→get window past a tight TTL and turn the expected hit into a miss.
     let (_inner, cache, _shared, _guard) = env(&format!("ttl_{}", path.replace(['/', '.'], "_")), |c| c.ttl = Duration::from_millis(2000)).await?;
 
     let p = Path::from(path);

@@ -5,12 +5,9 @@ use anyhow::{Context, Result, ensure};
 use arrow::{array::Array, record_batch::RecordBatch};
 use datafusion::execution::TaskContext;
 
-/// Daily partitions probed concurrently inside one histogram query.
-///
-/// Each day separately fans its own files out `search_concurrency` wide, so
-/// this multiplies rather than replaces that bound; 8 keeps worst-case
-/// outstanding object-store GETs in the low hundreds while collapsing a 7-day
-/// chart from seven serial rounds into one.
+/// Daily partitions probed concurrently inside one histogram query. Each day
+/// also fans its own files out `search_concurrency` wide, so this multiplies
+/// rather than replaces that bound; 8 keeps outstanding GETs in the low hundreds.
 const HISTOGRAM_PARTITION_CONCURRENCY: usize = 8;
 
 use crate::tantivy::{
@@ -148,18 +145,13 @@ impl HistogramDeltaCache {
             match reservation.try_grow(bytes) {
                 Ok(()) => return Ok(reservation),
                 Err(error) => {
-                    // Cached data must not prevent a new snapshot from being admitted.
-                    // Pinned queries retain their own ownership and remain charged.
+                    // Cached data must not block a new snapshot; pinned queries stay charged.
                     if self.entries.lock().pop_front().is_none() {
                         return Err(error.into());
                     }
                 }
             }
         }
-    }
-
-    fn insert(&self, entry: Arc<CachedDelta>) {
-        self.insert_entry(HistogramCacheEntry::Rows(entry));
     }
 
     fn insert_entry(&self, entry: HistogramCacheEntry) {
@@ -321,9 +313,8 @@ fn histogram_timestamps(batch: &RecordBatch) -> Result<&[i64]> {
 }
 
 impl CapturedHistogram {
-    /// Request one missing completed-day proof without delaying this query.
-    /// The builder uses the maintenance runtime and shared count-build semaphore.
-    /// The extra permit prevents a chart workload from queuing many days.
+    /// Request one missing completed-day proof without delaying this query. The
+    /// single extra permit stops a chart workload from queuing many days.
     fn seed_missing_proof(&self, database: &super::Database, day: i64) -> Option<tokio::task::JoinHandle<()>> {
         database.tantivy_indexer()?;
         let state = &database.histogram_proof_build;
@@ -380,24 +371,10 @@ impl CapturedHistogram {
     }
 
     async fn count_streaming_before_visibility(&self, mut before_visibility: impl FnMut(i64)) -> Result<HistogramSnapshotResult> {
-        // The index-only probes run CONCURRENTLY across days; the streaming
-        // fallback stays sequential. That split is the whole point.
-        //
-        // A probe is object-store IO — fetch the blob, open the reader, search
-        // it — and a day's own files already fan out `search_concurrency` wide.
-        // Days were awaited one after another, so a covered 7-day chart paid
-        // seven cold rounds end to end and a 30-day chart thirty. Measured on
-        // prod 2026-09-10 against a project covered for every day in the window:
-        // a single day answered in about 1 s once warm, while five days
-        // exceeded a 30 s statement timeout, and the ladder warmed itself
-        // (2 days ran faster than 1 because the wider run had already fetched
-        // the overlap). Single-day charts were never the complaint; 7- and
-        // 30-day ones were.
-        //
-        // The fallback is NOT parallelised. It decodes Parquet and reserves
-        // against the query memory pool per batch, so running days together
-        // would multiply peak decode memory on a box with OOM history. It keeps
-        // its existing order, and `before_visibility` still fires in day order.
+        // Index-only probes (pure object-store IO) run concurrently across days.
+        // The streaming fallback must stay sequential: it reserves decode memory
+        // per batch against the query pool, so parallelising it multiplies peak
+        // decode memory. `before_visibility` fires in day order.
         let days: Vec<_> = self.partitions.iter().collect();
         let mut probes = Vec::with_capacity(days.len());
         for chunk in days.chunks(HISTOGRAM_PARTITION_CONCURRENCY) {
@@ -432,9 +409,8 @@ impl CapturedHistogram {
             .process_results(|mut batches| batches.any(|timestamps| timestamps.iter().any(|&timestamp| timestamp >= lo && timestamp < hi)))
     }
 
-    /// Casts a memory batch onto `schema`, filling absent nullable columns with
-    /// nulls. `strict` is the captured-row path, which also rejects nulls in a
-    /// required column and names the missing one.
+    /// Casts a memory batch onto `schema`, filling absent nullable columns with nulls.
+    /// `strict` (the captured-row path) also rejects nulls in a required column.
     fn memory_projection(batch: &RecordBatch, schema: &arrow::datatypes::SchemaRef, strict: bool) -> Result<RecordBatch> {
         let column = |field: &arrow::datatypes::Field| -> Result<_> {
             let Some(array) = batch.column_by_name(field.name()) else {
@@ -449,27 +425,32 @@ impl CapturedHistogram {
             ensure!(!strict || field.is_nullable() || array.null_count() == 0, "memory required column contains nulls");
             Ok(array)
         };
-        let arrays = schema.fields().iter().map(|field| column(field)).collect::<Result<Vec<_>>>()?;
-        Ok(RecordBatch::try_new(schema.clone(), arrays)?)
+        Ok(RecordBatch::try_new(schema.clone(), schema.fields().iter().map(|field| column(field)).collect::<Result<Vec<_>>>()?)?)
+    }
+
+    /// Exact identity of one day's Delta sources under this captured read view.
+    fn delta_cache_key(&self, files: &[SnapshotFile]) -> DeltaCacheKey {
+        DeltaCacheKey {
+            root: self.log_store.root_url().clone(),
+            files: files.to_vec(),
+            schema: self.projected.clone(),
+            keys: self.keys.clone(),
+            tiebreak: self.tiebreak.clone(),
+        }
+    }
+
+    /// Whether captured memory can still change Delta winners in `[lo, hi)`.
+    fn memory_conflicts(&self, lo: i64, hi: i64) -> Result<bool> {
+        Ok(self.memory.covered_ranges.iter().any(|&(start, end)| start < hi && end > lo) || self.memory_touches(lo, hi)?)
     }
 
     fn visibility_cache_key(&self, day: i64, files: &[SnapshotFile]) -> Result<Option<VisibilityCacheKey>> {
         let (lo, hi) = day_bounds(day)?;
-        if self.memory.covered_ranges.iter().any(|&(start, end)| start < hi && end > lo) || self.memory_touches(lo, hi)? {
+        if self.memory_conflicts(lo, hi)? {
             return Ok(None);
         }
         let (start, end) = self.window.bounds();
-        Ok(Some(VisibilityCacheKey {
-            delta: DeltaCacheKey {
-                root: self.log_store.root_url().clone(),
-                files: files.to_vec(),
-                schema: self.projected.clone(),
-                keys: self.keys.clone(),
-                tiebreak: self.tiebreak.clone(),
-            },
-            bounds: start.max(lo)..end.min(hi),
-            tombstone: self.tombstone.clone(),
-        }))
+        Ok(Some(VisibilityCacheKey { delta: self.delta_cache_key(files), bounds: start.max(lo)..end.min(hi), tombstone: self.tombstone.clone() }))
     }
 
     async fn prepare_file(
@@ -687,7 +668,7 @@ impl CapturedHistogram {
     async fn count_unique_partition(&self, day: i64, files: &[SnapshotFile]) -> Result<Option<HistogramSnapshotResult>> {
         let Some(&logical_count) = self.logical_counts.get(&day) else { return Ok(None) };
         let (lo, hi) = day_bounds(day)?;
-        if self.memory.covered_ranges.iter().any(|&(start, end)| start < hi && end > lo) || self.memory_touches(lo, hi)? {
+        if self.memory_conflicts(lo, hi)? {
             return Ok(None);
         }
         let entries = self.manifest.histogram_entries(&self.root, files)?;
@@ -746,13 +727,7 @@ impl CapturedHistogram {
             batches.push(batch);
         }
         let memory = crate::write::mem_buffer::MemSnapshot { batches, covered_ranges: self.memory.covered_ranges.clone() };
-        let cache_key = DeltaCacheKey {
-            root: self.log_store.root_url().clone(),
-            files: files.to_vec(),
-            schema: self.projected.clone(),
-            keys: self.keys.clone(),
-            tiebreak: self.tiebreak.clone(),
-        };
+        let cache_key = self.delta_cache_key(files);
         let delta = match self.cache.get(&cache_key) {
             Some(delta) => {
                 ensure!(delta.decoded_bytes <= remaining, "cached histogram files exceed decoded budget");
@@ -784,7 +759,7 @@ impl CapturedHistogram {
                 let reservation =
                     self.cache.reserve(decoded_bytes.checked_add(mask_bytes).context("histogram cache size overflow")?, self.context.memory_pool())?;
                 let delta = Arc::new(CachedDelta { key: cache_key, sources, decoded_bytes, reservation });
-                self.cache.insert(delta.clone());
+                self.cache.insert_entry(HistogramCacheEntry::Rows(delta.clone()));
                 delta
             }
         };
@@ -804,8 +779,7 @@ impl CapturedHistogram {
 
 impl super::Database {
     /// Prove a complete Delta partition is unique and contains no tombstones.
-    /// Sorting can spill through the maintenance runtime; the checker retains
-    /// only one batch of encoded keys and the preceding batch's final key.
+    /// Retains only one batch of encoded keys plus the previous batch's last key.
     /// Non-unique partitions decline without publishing a count witness.
     async fn build_histogram_count_proof(&self, key: &crate::read::CountPartition) -> Result<Option<u64>> {
         use arrow::row::{RowConverter, SortField};
@@ -1379,7 +1353,7 @@ mod tests {
             reservation.try_grow(HistogramDeltaCache::MAX_RESIDENT_BYTES)?;
             Ok(Arc::new(CachedDelta { key, sources: vec![], decoded_bytes: 0, reservation }))
         };
-        cache.insert(entry(key.clone())?);
+        cache.insert_entry(HistogramCacheEntry::Rows(entry(key.clone())?));
         let pinned = cache.get(&key).expect("same snapshot must hit");
         for field in 0..8 {
             let mut changed = key.clone();
@@ -1405,7 +1379,7 @@ mod tests {
         }
         let mut next = key.clone();
         next.files[0].size += 1;
-        cache.insert(entry(next.clone())?);
+        cache.insert_entry(HistogramCacheEntry::Rows(entry(next.clone())?));
         assert!(cache.get(&key).is_none(), "resident budget must evict the old entry");
         assert_eq!(pool.reserved(), 2 * HistogramDeltaCache::MAX_RESIDENT_BYTES, "captured queries retain reservations after eviction");
         drop(pinned);

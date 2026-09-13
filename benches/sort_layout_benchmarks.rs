@@ -1,22 +1,6 @@
-//! Sort-layout micro-benchmark.
-//!
-//! Writes the same synthetic dataset to Parquet under three candidate sort
-//! layouts, then times representative queries against each via DataFusion
-//! (which honours row-group min/max stats and Parquet bloom filters for
-//! pruning).
-//!
-//! Layouts:
-//!   A — sort by (timestamp, id)                          — 2-col PK
-//!   B — sort by (timestamp, service_name, id)            — 3-col PK
-//!   C — sort by (level, status_code, service_name, ts)   — pre-change baseline
-//!
-//! Queries:
-//!   Q1 — point lookup    `timestamp = T AND id = X`
-//!   Q2 — service in time `timestamp BETWEEN .. AND service_name = X`
-//!   Q3 — time range only `timestamp BETWEEN ..`
-//!   Q4 — service only    `service_name = X`
-//!
-//! Reports wall time, file size, and (row groups read / total).
+//! Sort-layout micro-benchmark: writes one synthetic dataset to Parquet under
+//! three candidate sort layouts and times representative queries against each,
+//! reporting wall time, file size and row-group counts.
 
 use std::{
     fs::File,
@@ -59,36 +43,20 @@ fn schema() -> Arc<Schema> {
 }
 
 fn generate_batch(seed_offset: usize) -> RecordBatch {
-    let mut ts = Vec::with_capacity(N_ROWS);
-    let mut id = Vec::with_capacity(N_ROWS);
-    let mut svc = Vec::with_capacity(N_ROWS);
-    let mut level = Vec::with_capacity(N_ROWS);
-    let mut status = Vec::with_capacity(N_ROWS);
-    let mut name = Vec::with_capacity(N_ROWS);
-    let mut sev = Vec::with_capacity(N_ROWS);
-    for i in 0..N_ROWS {
-        let t = BASE_TIMESTAMP + ((i as i64) * (TS_SPAN_SECS * 1_000_000) / N_ROWS as i64);
-        ts.push(t);
-        id.push(format!("id_{:08x}", i + seed_offset));
-        svc.push(format!("svc_{:02}", (i + seed_offset) % N_SERVICES));
-        level.push(["INFO", "WARN", "ERROR", "DEBUG"][i % 4].to_string());
-        status.push(["OK", "ERROR", "UNSET"][i % 3].to_string());
-        name.push(format!("op_{}", i % 50));
-        sev.push(((i % 100) as i32) + 1);
-    }
-    RecordBatch::try_new(
-        schema(),
-        vec![
-            Arc::new(TimestampMicrosecondArray::from(ts).with_timezone("UTC")) as ArrayRef,
-            Arc::new(StringArray::from(id)),
-            Arc::new(StringArray::from(svc)),
-            Arc::new(StringArray::from(level)),
-            Arc::new(StringArray::from(status)),
-            Arc::new(StringArray::from(name)),
-            Arc::new(Int32Array::from(sev)),
-        ],
-    )
-    .unwrap()
+    let rows = 0..N_ROWS;
+    let columns: Vec<ArrayRef> = vec![
+        Arc::new(
+            TimestampMicrosecondArray::from_iter_values(rows.clone().map(|i| BASE_TIMESTAMP + ((i as i64) * (TS_SPAN_SECS * 1_000_000) / N_ROWS as i64)))
+                .with_timezone("UTC"),
+        ),
+        Arc::new(StringArray::from_iter_values(rows.clone().map(|i| format!("id_{:08x}", i + seed_offset)))),
+        Arc::new(StringArray::from_iter_values(rows.clone().map(|i| format!("svc_{:02}", (i + seed_offset) % N_SERVICES)))),
+        Arc::new(StringArray::from_iter_values(rows.clone().map(|i| ["INFO", "WARN", "ERROR", "DEBUG"][i % 4]))),
+        Arc::new(StringArray::from_iter_values(rows.clone().map(|i| ["OK", "ERROR", "UNSET"][i % 3]))),
+        Arc::new(StringArray::from_iter_values(rows.clone().map(|i| format!("op_{}", i % 50)))),
+        Arc::new(Int32Array::from_iter_values(rows.map(|i| ((i % 100) as i32) + 1))),
+    ];
+    RecordBatch::try_new(schema(), columns).unwrap()
 }
 
 fn sort_batch(batch: &RecordBatch, by: &[&str]) -> RecordBatch {
@@ -132,12 +100,10 @@ fn row_group_count(path: &Path) -> usize {
 }
 
 async fn time_query(ctx: &SessionContext, sql: &str, iters: u32) -> (f64, usize) {
-    let df = ctx.sql(sql).await.unwrap();
-    let rows: usize = df.collect().await.unwrap().iter().map(|b| b.num_rows()).sum();
+    let rows: usize = ctx.sql(sql).await.unwrap().collect().await.unwrap().iter().map(|b| b.num_rows()).sum();
     let start = Instant::now();
     for _ in 0..iters {
-        let df = ctx.sql(sql).await.unwrap();
-        let _ = df.collect().await.unwrap();
+        let _ = ctx.sql(sql).await.unwrap().collect().await.unwrap();
     }
     let elapsed = start.elapsed().as_secs_f64() / iters as f64 * 1000.0;
     (elapsed, rows)
@@ -165,7 +131,6 @@ async fn main() {
         })
         .collect();
 
-    // Pick a target row from the middle of the dataset.
     let target_idx = N_ROWS / 2;
     let ts_array = raw.column(0).as_any().downcast_ref::<TimestampMicrosecondArray>().unwrap();
     let id_array = raw.column(1).as_any().downcast_ref::<StringArray>().unwrap();
@@ -173,7 +138,7 @@ async fn main() {
     let target_id = id_array.value(target_idx).to_string();
     let target_svc = format!("svc_{:02}", target_idx % N_SERVICES);
 
-    // Time window covering a small fraction (~6 minutes = 0.1 hour) of the dataset.
+    // ~6-minute window, a small fraction of the dataset's 1-hour span.
     let win_start = target_ts - 3 * 60 * 1_000_000;
     let win_end = target_ts + 3 * 60 * 1_000_000;
     let ts_lit = |t: i64| format!("TIMESTAMP '1970-01-01 00:00:00 UTC' + INTERVAL '{} microseconds'", t);

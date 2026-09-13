@@ -1,14 +1,14 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use datafusion::arrow::array::AsArray;
+use datafusion::{arrow::array::AsArray, prelude::SessionContext};
 use serial_test::serial;
 use timefusion::{
     database::Database,
     support::test_helpers::{array_get_str as get_str, *},
 };
 
-async fn setup_test_database() -> Result<(Database, datafusion::prelude::SessionContext)> {
+async fn setup_test_database() -> Result<(Database, SessionContext)> {
     dotenv::dotenv().ok();
     unsafe {
         std::env::set_var("AWS_S3_BUCKET", "timefusion-tests");
@@ -22,15 +22,22 @@ async fn setup_test_database() -> Result<(Database, datafusion::prelude::Session
     Ok((db, ctx))
 }
 
-// The #[ignore]'d tests in this file all use `Database::new()` + per-test
-// `std::env::set_var("TIMEFUSION_TABLE_PREFIX", ...)`. But `config::init_config`
-// is OnceLock-cached, so only the first test's prefix takes effect; subsequent
-// tests share that same Delta table and contend with whatever state earlier
-// tests committed. On CI's MinIO the contention retries past the 15-minute
-// job budget. They run cleanly in isolation
-// (`cargo test --test delta_rs_api_test test_NAME -- --ignored`).
+/// One span into `project`, committed straight to Delta (skip_queue).
+async fn insert_span(db: &Database, project: &str, id: &str, name: &str) -> Result<()> {
+    let batch = json_to_batch(vec![test_span(id, name, project)])?;
+    db.insert_records_batch(project, "otel_logs_and_spans", vec![batch], true, None).await?;
+    Ok(())
+}
 
-/// Tests that add_actions_table returns correct file statistics after inserts
+async fn count(ctx: &SessionContext, project: &str) -> Result<i64> {
+    let sql = format!("SELECT COUNT(*) as cnt FROM otel_logs_and_spans WHERE project_id = '{project}'");
+    Ok(ctx.sql(&sql).await?.collect().await?[0].column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0))
+}
+
+// `config::init_config` is OnceLock-cached, so only the first test's
+// TIMEFUSION_TABLE_PREFIX takes effect and the rest share one Delta table; these
+// tests are #[ignore]d and must be run one at a time (`-- --ignored`).
+
 #[serial]
 #[ignore = "shares OnceLock config across tests in CI; see file-level comment"]
 #[tokio::test(flavor = "multi_thread")]
@@ -38,27 +45,23 @@ async fn test_add_actions_table_statistics() -> Result<()> {
     let (db, ctx) = setup_test_database().await?;
 
     for i in 0..3 {
-        let batch = json_to_batch(vec![test_span(&format!("id_{}", i), &format!("span_{}", i), "stats_project")])?;
-        db.insert_records_batch("stats_project", "otel_logs_and_spans", vec![batch], true, None).await?;
+        insert_span(&db, "stats_project", &format!("id_{i}"), &format!("span_{i}")).await?;
     }
 
-    let result = ctx.sql("SELECT COUNT(*) as cnt FROM otel_logs_and_spans WHERE project_id = 'stats_project'").await?.collect().await?;
-    let count = result[0].column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0);
-    assert!(count >= 3, "Expected at least 3 records, got {}", count);
+    let cnt = count(&ctx, "stats_project").await?;
+    assert!(cnt >= 3, "Expected at least 3 records, got {cnt}");
 
     db.shutdown().await?;
     Ok(())
 }
 
-/// Tests that CreateBuilder correctly orders partition columns
 #[serial]
 #[ignore = "shares OnceLock config across tests in CI; see file-level comment"]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_partition_column_ordering() -> Result<()> {
     let (db, ctx) = setup_test_database().await?;
 
-    let batch = json_to_batch(vec![test_span("partition_test_id", "partition_test", "partition_project")])?;
-    db.insert_records_batch("partition_project", "otel_logs_and_spans", vec![batch], true, None).await?;
+    insert_span(&db, "partition_project", "partition_test_id", "partition_test").await?;
 
     let result = ctx.sql("SELECT project_id, date, id FROM otel_logs_and_spans WHERE project_id = 'partition_project'").await?.collect().await?;
 
@@ -69,26 +72,17 @@ async fn test_partition_column_ordering() -> Result<()> {
     Ok(())
 }
 
-/// Tests table update_state() correctly refreshes table metadata
 #[serial]
 #[ignore = "shares OnceLock config across tests in CI; see file-level comment"]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_table_state_refresh() -> Result<()> {
     let (db, ctx) = setup_test_database().await?;
 
-    let batch = json_to_batch(vec![test_span("refresh_id_1", "span_1", "refresh_project")])?;
-    db.insert_records_batch("refresh_project", "otel_logs_and_spans", vec![batch], true, None).await?;
+    insert_span(&db, "refresh_project", "refresh_id_1", "span_1").await?;
+    assert_eq!(count(&ctx, "refresh_project").await?, 1);
 
-    let result = ctx.sql("SELECT COUNT(*) as cnt FROM otel_logs_and_spans WHERE project_id = 'refresh_project'").await?.collect().await?;
-    let count = result[0].column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0);
-    assert_eq!(count, 1);
-
-    let batch = json_to_batch(vec![test_span("refresh_id_2", "span_2", "refresh_project")])?;
-    db.insert_records_batch("refresh_project", "otel_logs_and_spans", vec![batch], true, None).await?;
-
-    let result = ctx.sql("SELECT COUNT(*) as cnt FROM otel_logs_and_spans WHERE project_id = 'refresh_project'").await?.collect().await?;
-    let count = result[0].column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0);
-    assert_eq!(count, 2);
+    insert_span(&db, "refresh_project", "refresh_id_2", "span_2").await?;
+    assert_eq!(count(&ctx, "refresh_project").await?, 2);
 
     db.shutdown().await?;
     Ok(())

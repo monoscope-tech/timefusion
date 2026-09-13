@@ -1,27 +1,15 @@
-//! Hot-tail compaction must leave the partition with an HONEST sorted footer.
+//! Hot-tail compaction must leave the partition with an honest sorted footer:
+//! the reader's `derive_common_ordering` is all-or-nothing, so one file without
+//! `sorting_columns` costs the whole scan its declared ordering.
 //!
-//! Prod 2026-08-01: it did not, and nothing caught it. `stage_hot_bin` packed a
-//! bin to `light_optimize_target_size` (256 MB of FILE bytes) and then handed it
-//! to an in-process Arrow sort budgeted at 256 MB of IN-MEMORY bytes. zstd on
-//! otel data is ~17x, so every bin arrived ~17x over budget, the sort was
-//! silently skipped, and the output was written with `declare_sorted=false`:
-//! 0 of the 8 largest files in a live partition declared `sorting_columns`.
-//!
-//! One such file is enough. The reader's `derive_common_ordering` is
-//! all-or-nothing, so the whole scan lost its declared ordering — costing the
-//! streaming top-N pushdown AND forcing `DedupExec` into its unbounded
-//! `full-set` seen-set, which is the per-query memory behind the OOM/restart
-//! cycle that made cold reads 26-68s.
-//!
-//! The guard has to exercise the SIZE condition, not just the happy path: a bin
-//! small enough to fit the old budget was sorted correctly even before the fix,
-//! so a test that only compacts a few rows proves nothing. `with_sort_skip_bytes`
-//! shrinks the in-process budget to zero, which is what a 17x-oversized bin
-//! looked like in production.
+//! These tests must exercise the SIZE condition, not the happy path — a bin that
+//! fits the in-process sort budget was always sorted correctly.
+//! `with_sort_skip_bytes(0)` shrinks that budget to zero to force the over-budget
+//! path.
 
 use std::time::Duration;
 
-use timefusion::support;
+use timefusion::{database::TailPass, support};
 use tokio_postgres::Client;
 
 use super::harness::{E2eEnv, E2eEnvBuilder, FROZEN_START_MICROS, insert_at};
@@ -30,17 +18,15 @@ const SEC: i64 = 1_000_000;
 const PROJECT: &str = "e2e_project";
 const TABLE: &str = "otel_logs_and_spans";
 
-/// The shape every test here shares: 60s buckets, an hour of retention, and a
-/// sort key to declare. The flags that make each test its own scenario stay at
-/// the call site, next to the comment explaining why that test needs them.
+/// Shape shared by every test here: 60s buckets, an hour of retention, a sort key.
 fn base_env() -> E2eEnvBuilder {
     E2eEnv::builder().with_bucket_duration(Duration::from_secs(60)).with_retention(Duration::from_secs(60 * 60)).with_optimize_sort_by()
 }
 
 /// `flushes` separately-committed files of 3 rows each in one partition.
 /// `seal = Some(d)` advances the clock past the bucket before flushing (the
-/// today/hot-tail shape); `seal = None` flushes and then snaps the clock back to
-/// the frozen start, so a backdated partition ends up sealed.
+/// today/hot-tail shape); `seal = None` snaps the clock back to the frozen start
+/// after each flush, producing a backdated sealed partition.
 async fn seed_flushes(env: &E2eEnv, client: &Client, prefix: &str, flushes: i64, ts: impl Fn(i64, i64) -> i64, seal: Option<Duration>) -> anyhow::Result<()> {
     for b in 0..flushes {
         for i in 0..3i64 {
@@ -53,6 +39,15 @@ async fn seed_flushes(env: &E2eEnv, client: &Client, prefix: &str, flushes: i64,
         if seal.is_none() {
             support::set_micros(FROZEN_START_MICROS);
         }
+    }
+    Ok(())
+}
+
+/// `n` light-optimize ticks of `pass` against the fixture table.
+async fn light_ticks(env: &E2eEnv, pass: TailPass, n: usize) -> anyhow::Result<()> {
+    let table_ref = env.db().resolve_table(PROJECT, TABLE).await?;
+    for _ in 0..n {
+        env.db().optimize_table_light(&table_ref, TABLE, pass).await?;
     }
     Ok(())
 }
@@ -71,49 +66,40 @@ async fn row_count(client: &Client) -> anyhow::Result<i64> {
     Ok(client.query_one("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1", &[&PROJECT]).await?.get(0))
 }
 
-/// After hot-tail compaction, a recent-window `ORDER BY timestamp DESC LIMIT n`
-/// must still plan as a streaming merge — which it can only do if every file in
-/// the partition, including the freshly compacted one, declares its ordering.
+/// After hot-tail compaction, `ORDER BY timestamp DESC LIMIT n` must still plan
+/// as a streaming merge — only possible if every file, including the freshly
+/// compacted one, declares its ordering.
 #[serial_test::serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn hot_tail_output_declares_its_sorted_footer_even_when_the_bin_exceeds_the_sort_budget() -> anyhow::Result<()> {
-    let bucket_secs = 60u64;
     let env = base_env()
-        // The production shape: every bin is over the in-process sort budget.
+        // Every bin is over the in-process sort budget.
         .with_sort_skip_bytes(0)
         .start()
         .await?;
-    // This test invokes light optimize directly and asserts that call's
-    // rewrite. Keep the background coordinator from consuming or racing the
-    // same fixture files.
+    // Keep the background coordinator from racing the fixture files this test
+    // compacts by hand.
     env.db().cancel_maintenance();
     let client = env.pg_client().await?;
 
-    // The hot tail only considers TODAY's partition and only files whose EVENT
-    // time is sealed (15 min behind the clock), so the rows go 30 min before the
-    // frozen "now" and the clock stays inside the same UTC day.
+    // Hot tail only considers TODAY's partition and only files whose EVENT time
+    // is sealed (15 min behind the clock).
     let base = FROZEN_START_MICROS - 1800 * SEC;
-    // 6 flushes: `timefusion_compact_min_files` is 5, so a smaller run selects no
-    // bin at all and the pass is a silent no-op.
-    seed_flushes(&env, &client, "h", 6, |b, i| base + (b * 3 + i) * 20 * SEC, Some(Duration::from_secs(bucket_secs * 2))).await?;
+    // 6 flushes: `timefusion_compact_min_files` is 5, fewer selects no bin at all.
+    seed_flushes(&env, &client, "h", 6, |b, i| base + (b * 3 + i) * 20 * SEC, Some(Duration::from_secs(120))).await?;
 
-    let table_ref = env.db().resolve_table(PROJECT, TABLE).await?;
-    env.db().optimize_table_light(&table_ref, TABLE, timefusion::database::TailPass::Pack).await?;
+    light_ticks(&env, TailPass::Pack, 1).await?;
 
-    // Fresh rows so the scan spans MemBuffer ∪ the compacted Delta partition —
-    // the shape a dashboard query actually takes.
-    // Advance to the frozen start so every written row is now sealed.
+    // Fresh rows so the scan spans MemBuffer ∪ the compacted Delta partition.
+    // The frozen start makes every written row sealed.
     support::set_micros(FROZEN_START_MICROS);
     let new_base = FROZEN_START_MICROS - 60 * SEC;
     for i in 0..3i64 {
         insert_at(&client, &format!("m-{i}"), new_base + i * SEC).await?;
     }
 
-    // The hot tail collapsed every Delta file into one, and the fresh rows are
-    // still in MemBuffer — so Delta contributes exactly the compacted file. If
-    // that file declares its ordering, the scan advertises one and the top-N
-    // stays a streaming merge; if compaction wrote it unsorted, the same query
-    // degrades to a blocking SortExec. That is the whole bug, end to end.
+    // Delta now contributes exactly the compacted file; if it declares its
+    // ordering the top-N stays a streaming merge, otherwise a blocking SortExec.
     let sql = "SELECT id, timestamp FROM otel_logs_and_spans WHERE project_id = 'e2e_project' ORDER BY timestamp DESC LIMIT 3";
     let plan: String = client
         .query(&format!("EXPLAIN {sql}"), &[])
@@ -131,7 +117,6 @@ async fn hot_tail_output_declares_its_sorted_footer_even_when_the_bin_exceeds_th
          Plan was:\n{plan}"
     );
 
-    // ...and the rewrite must not have lost or duplicated anything.
     assert_eq!(row_count(&client).await?, 21, "18 compacted + 3 buffered rows must survive the sorted rewrite exactly once");
 
     let top: Vec<String> = client.query(sql, &[]).await?.iter().map(|r| r.get::<_, String>(0)).collect();
@@ -141,25 +126,16 @@ async fn hot_tail_output_declares_its_sorted_footer_even_when_the_bin_exceeds_th
 }
 
 /// The REPAIR half: a file that is already "converged" (>= 7/8 of target) but
-/// carries no sorted footer must be rewritten anyway.
-///
-/// Prod 2026-08-01 had 265-778MB files in exactly that state. Hot-tail skipped
-/// them as converged, and the daily consolidate/recompress crons that would
-/// have fixed them had not run in 24h — a job firing at 02:30 rarely survives a
-/// process restarting every 30-120 minutes. So nothing repaired them, and one
-/// of them is enough to disable the reader's all-or-nothing footer ordering for
-/// every scan touching the partition.
-///
-/// The target size is shrunk so a test-sized file lands in the same state.
+/// carries no sorted footer must be rewritten anyway — packing skips it, so
+/// repair is the only path that can restore the partition's footer ordering.
+/// The target size is shrunk so a test-sized file lands in that state.
 #[serial_test::serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn hot_tail_repairs_a_converged_file_that_has_no_sorted_footer() -> anyhow::Result<()> {
-    let bucket_secs = 60u64;
     let env = base_env()
-        // Every flush output is unsorted (the large-coalesced-bucket shape)...
+        // Every flush output is unsorted...
         .with_sort_skip_bytes(0)
-        // ...and counts as converged, so the ONLY way it is ever rewritten is
-        // the repair path.
+        // ...and counts as converged, so only repair can ever rewrite it.
         .with_light_optimize_target(1024)
         .start()
         .await?;
@@ -167,18 +143,15 @@ async fn hot_tail_repairs_a_converged_file_that_has_no_sorted_footer() -> anyhow
     let client = env.pg_client().await?;
 
     let base = FROZEN_START_MICROS - 1800 * SEC;
-    seed_flushes(&env, &client, "r", 6, |b, i| base + (b * 3 + i) * 20 * SEC, Some(Duration::from_secs(bucket_secs * 2))).await?;
+    seed_flushes(&env, &client, "r", 6, |b, i| base + (b * 3 + i) * 20 * SEC, Some(Duration::from_secs(120))).await?;
     support::set_micros(FROZEN_START_MICROS);
 
-    let table_ref = env.db().resolve_table(PROJECT, TABLE).await?;
     let before = live_files(&env).await?;
     assert!(!before.is_empty(), "the fixture must have produced files to repair");
 
-    // Several ticks: repair takes ONE file per bin and only once a project has
-    // no packable slice left, so a backlog drains gradually by design.
-    for _ in 0..6 {
-        env.db().optimize_table_light(&table_ref, TABLE, timefusion::database::TailPass::Pack).await?;
-    }
+    // Several ticks: repair takes ONE file per bin, and only once a project has
+    // no packable slice left.
+    light_ticks(&env, TailPass::Pack, 6).await?;
 
     let after = live_files(&env).await?;
     let rewritten = before.iter().filter(|p| !after.contains(p)).count();
@@ -188,11 +161,9 @@ async fn hot_tail_repairs_a_converged_file_that_has_no_sorted_footer() -> anyhow
          partition's footer ordering. before={before:?} after={after:?}"
     );
 
-    // The repair must converge: once rewritten the output is a tagged sorted
-    // infinite 1->1 rewrite loop.
-    for _ in 0..3 {
-        env.db().optimize_table_light(&table_ref, TABLE, timefusion::database::TailPass::Pack).await?;
-    }
+    // Repair must converge: a rewritten file is tagged sorted, so it is never
+    // re-selected into an infinite 1->1 rewrite loop.
+    light_ticks(&env, TailPass::Pack, 3).await?;
     let settled = live_files(&env).await?;
     let churn = after.iter().filter(|p| !settled.contains(p)).count();
     assert_eq!(churn, 0, "repair must be one-time: a rewritten file carries SORTED_RUN_TAG and is never re-selected");
@@ -203,26 +174,14 @@ async fn hot_tail_repairs_a_converged_file_that_has_no_sorted_footer() -> anyhow
 }
 
 /// A repair pass must not end because ONE of a project's candidates turned out
-/// to be fine.
+/// to be fine. Admission offers every un-verified sealed file as a suspect (the
+/// `delta-rs.optimize.sort_by` tag lies, so only the footer decides), so the next
+/// candidate is usually already sorted; clearing it must RE-SELECT rather than
+/// drop the project from the pass.
 ///
-/// Admission offers every un-verified sealed file as a suspect — the
-/// `delta-rs.optimize.sort_by` tag lies, so only the footer decides — which
-/// means a project's next candidate is usually a correctly-sorted file rather
-/// than poison. Clearing it leaves that project with no bin, and without a
-/// RE-SELECT it drops out of the wave engine's `pending` set for the whole
-/// PASS rather than the wave.
-///
-/// Prod 2026-08-10, project 87576849 (663 footer-less files interleaved with
-/// ~450 sorted ones): every repair pass ended in ~14s having repaired ~1 file,
-/// with `planned=6 completed=6 brakes=0` and its 8640s budget untouched — the
-/// pass was ending on an EMPTY PLAN, not on waves or time. Fixed in d50cedc by
-/// sharing `reselect_until_real_work` between both call sites.
-///
-/// SCOPE: this pins the walk — one pass clears EVERY sorted suspect in the
-/// partition, not one per pass. It does not isolate the per-wave re-plan call
-/// site specifically, because manufacturing a genuinely footer-less file needs
-/// a hand-written parquet (the flush path escalates to a pooled sort rather
-/// than skipping, so `with_sort_skip_bytes(0)` no longer produces one).
+/// SCOPE: pins the walk — one pass clears EVERY sorted suspect in the partition.
+/// It does not isolate the per-wave re-plan call site, which would need a
+/// hand-written footer-less parquet.
 #[serial_test::serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn one_repair_pass_clears_every_sorted_suspect_not_one_per_pass() -> anyhow::Result<()> {
@@ -231,12 +190,9 @@ async fn one_repair_pass_clears_every_sorted_suspect_not_one_per_pass() -> anyho
     let env = base_env()
         // Converged, so nothing but repair would ever look at these files.
         .with_light_optimize_target(1024)
-        // REQUIRED for this test to mean anything. The assertion counts lines in
-        // `repair_verified_sorted.txt`, and since 2026-08-28 the FLUSH writes that
-        // file too — so with marking on, `cleared >= before` is satisfied by the
-        // writes themselves and the repair pass could clear nothing at all and
-        // still pass. Turning marking off makes the probe the file's only author,
-        // which is what the assertion is actually about.
+        // REQUIRED: the flush path also writes `repair_verified_sorted.txt`, so
+        // with marking on the assertion below is satisfied by the flush and the
+        // repair pass could clear nothing and still pass.
         .without_write_time_sort_marking()
         .start()
         .await?;
@@ -247,14 +203,12 @@ async fn one_repair_pass_clears_every_sorted_suspect_not_one_per_pass() -> anyho
     const SUSPECTS: usize = 4;
     seed_flushes(&env, &client, "s", SUSPECTS as i64, |b, i| yesterday + (b * 300 + i * 20) * SEC, None).await?;
 
-    let table_ref = env.db().resolve_table(PROJECT, TABLE).await?;
     let before = live_files(&env).await?.len();
     assert!(before >= SUSPECTS, "fixture must produce at least {SUSPECTS} suspects, got {before}");
 
-    env.db().optimize_table_light(&table_ref, TABLE, timefusion::database::TailPass::Repair).await?;
+    light_ticks(&env, TailPass::Repair, 1).await?;
 
-    // The verified-sorted set is what admission consults, and it is persisted —
-    // so it is also the thing a pass that gave up early leaves half-written.
+    // The persisted verified-sorted set is what admission consults.
     let verified = std::fs::read_to_string(env.data_dir.join("repair_verified_sorted.txt")).unwrap_or_default();
     let cleared = verified.lines().filter(|l| !l.trim().is_empty()).count();
     assert!(
@@ -268,17 +222,11 @@ async fn one_repair_pass_clears_every_sorted_suspect_not_one_per_pass() -> anyho
     Ok(())
 }
 
-/// Two tables must not repair at the same time.
+/// Two tables must not repair at the same time: `round_robin_bins` serialises
+/// repair only WITHIN a table, but the light pool is shared, so two concurrent
+/// repair sorts can exhaust it.
 ///
-/// `round_robin_bins` serialises repair WITHIN a table (concurrency
-/// `(k/2).max(1)` = 1), and `REPAIR_SORT_PARTITIONS` is justified by "repair
-/// runs exactly ONE bin at a time" — but the light pool is shared by every
-/// table, so that was only ever true per table. Prod 2026-08-11 11:30:
-/// `otel_metrics` and `otel_logs_and_spans` repaired concurrently and the pool
-/// held two sorts (`ExternalSorter#36474` at 13.6 GB plus a second merge at
-/// 1245 MB), killing a 981 MB bin with 2.1 MB left of a 15.4 GB pool.
-///
-/// The loser must SKIP its tick, not queue: a repair pass owns a 144-minute
+/// The loser must SKIP its tick, not queue — a repair pass owns a 144-minute
 /// budget, so blocking would stall the other table for hours.
 #[serial_test::serial]
 #[tokio::test(flavor = "multi_thread")]
@@ -286,14 +234,10 @@ async fn a_second_table_skips_its_repair_tick_rather_than_sharing_the_light_pool
     let yesterday = FROZEN_START_MICROS - 24 * 3600 * SEC;
     let env = base_env()
         .with_light_optimize_target(1024)
-        // Without this the fixture has NO repair work at all: write-time marking
-        // (2026-08-28) records these flushed files as verified-sorted the moment
-        // they commit, so both passes find zero suspects, return in a single poll,
-        // and never overlap — `tokio::join!` polls sequentially, so a pass that
-        // does no IO releases the permit before the other is ever polled. The
-        // assertion below then reads 0 and looks like a broken permit rather than
-        // an empty queue. Contention is what this test is about, so it needs a
-        // pass with something to do.
+        // Without this the fixture has NO repair work: write-time marking records
+        // flushed files as verified-sorted on commit, both passes find zero
+        // suspects, and since `tokio::join!` polls sequentially a pass that does
+        // no IO never overlaps the other — the assertion would read 0.
         .without_write_time_sort_marking()
         .start()
         .await?;
@@ -304,19 +248,17 @@ async fn a_second_table_skips_its_repair_tick_rather_than_sharing_the_light_pool
     let table_ref = env.db().resolve_table(PROJECT, TABLE).await?;
     let before = repair_ticks_yielded();
 
-    // Same table twice is the same contention the two tables have: one
-    // process-wide permit, two concurrent passes.
-    let (a, b) = tokio::join!(
-        env.db().optimize_table_light(&table_ref, TABLE, timefusion::database::TailPass::Repair),
-        env.db().optimize_table_light(&table_ref, TABLE, timefusion::database::TailPass::Repair),
-    );
+    // Same table twice reproduces the cross-table contention: one process-wide
+    // permit, two concurrent passes.
+    let (a, b) =
+        tokio::join!(env.db().optimize_table_light(&table_ref, TABLE, TailPass::Repair), env.db().optimize_table_light(&table_ref, TABLE, TailPass::Repair),);
     a?;
     b?;
     let yielded = repair_ticks_yielded() - before;
     assert_eq!(yielded, 1, "exactly one of two overlapping repair passes must yield the permit, got {yielded}");
 
     // And the permit must be RELEASED: a later pass still runs.
-    env.db().optimize_table_light(&table_ref, TABLE, timefusion::database::TailPass::Repair).await?;
+    env.db().optimize_table_light(&table_ref, TABLE, TailPass::Repair).await?;
     let after = repair_ticks_yielded() - before;
     assert_eq!(after, 1, "the permit leaked — a pass that ran alone still yielded");
 

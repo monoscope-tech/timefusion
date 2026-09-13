@@ -1,35 +1,6 @@
-//! Does a pgwire INSERT reserve from the **query** memory pool?
-//!
-//! This decides whether `TIMEFUSION_MEMORY_POOL=fair_spill` is safe to turn on
-//! for the query pool. `81dcc1cd` (2026-05-28) made `Greedy` the default after
-//! every monoscope INSERT bounced with `Memory limit exceeded … > 76MB hard
-//! limit` — FairSpill had sliced the pool into `pool / num_spill` slots and ~30
-//! concurrent writers collapsed each slot below one batch. FairSpill is also
-//! what would bound the `ExternalSorterMerge` exhaustion that restarted prod on
-//! 2026-09-02 (a spillable sorter took 7.3 GB of the 16 GB greedy pool, so the
-//! unspillable merge half had nothing left).
-//!
-//! Both claims are about the same pool — `Database::shared_runtime_env`, which
-//! `create_session_context` hands to every statement, INSERT included. The
-//! write path has had its own FairSpill pool since 2026-08-20
-//! (`flush_sort_runtime_env`), so the question is whether anything on the
-//! INSERT plan still charges the query pool.
-//!
-//! Reading the code does not settle it: `ProjectRoutingTable::write_all`
-//! registers no `MemoryConsumer`, but the reservations in a DataFusion write
-//! come from operators, not from the sink. So measure it.
-//!
-//! Method: sample `memory_pool.reserved()` while the workload runs and keep the
-//! peak. Sampling can miss a reservation shorter than the poll interval, which
-//! is why `a_sort_does_reserve_from_the_query_pool` is in the same file as a
-//! control — it uses the same sampler against a plan that provably reserves. A
-//! green INSERT assertion means nothing without a green control.
-//!
-//! Both inbound routes are covered. `insert_records_batch` sends an INSERT to
-//! the buffered layer when one is configured (prod: `use_queue=buffered_layer`)
-//! and to a synchronous direct-to-Delta commit when none is — and they diverge
-//! below the DataFusion sink, so measuring only the route a bare test config
-//! happens to take would settle the wrong path.
+//! Pins that a pgwire INSERT reserves nothing from the query memory pool, so the
+//! pool's policy (`TIMEFUSION_MEMORY_POOL`) cannot bounce INSERTs. Both inbound routes
+//! of `insert_records_batch` are measured; they diverge below the DataFusion sink.
 //!
 //! Requires MinIO on 127.0.0.1:9000 (`make minio-start`).
 
@@ -48,19 +19,13 @@ mod query_pool_insert {
     use test_case::test_case;
     use timefusion::{config::AppConfig, database::Database, support::test_helpers::minio_test_config};
 
-    /// Rows per INSERT, and INSERTs run concurrently — the ~30-writer shape of
-    /// the 2026-05-28 incident, not a single-statement smoke test.
     const WRITERS: usize = 30;
     const ROWS_PER_INSERT: usize = 64;
 
-    /// Peak `reserved()` observed on `pool` until `stop` is set.
-    ///
-    /// 100 µs, not a millisecond: an INSERT's plan is short-lived, and the
-    /// control test is what proves this interval is tight enough to see one.
+    /// Peak `reserved()` observed on the session's memory pool until `stop` is set.
+    /// The 100 µs interval must stay tight enough to catch a short-lived INSERT plan;
+    /// `a_sort_does_reserve_from_the_query_pool` is the control that proves it is.
     fn spawn_pool_sampler(ctx: &datafusion::prelude::SessionContext) -> (Arc<AtomicUsize>, Arc<AtomicBool>, tokio::task::JoinHandle<()>) {
-        // The session's own runtime env — the same `shared_runtime_env` every
-        // statement gets, reached through the public API rather than the
-        // crate-private accessor.
         let pool = ctx.runtime_env().memory_pool.clone();
         let (peak, stop) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicBool::new(false)));
         let (p, s) = (peak.clone(), stop.clone());
@@ -74,23 +39,18 @@ mod query_pool_insert {
         (peak, stop, handle)
     }
 
-    /// `buffered` selects which of `insert_records_batch`'s two inbound routes
-    /// the INSERT takes. **Prod is the buffered one** (`use_queue=buffered_layer`);
-    /// without a layer the same statement falls through to a synchronous
-    /// direct-to-Delta commit. They diverge below the DataFusion sink, so a
-    /// measurement of one says nothing about the other and both are asserted.
+    /// `buffered` selects which of `insert_records_batch`'s two inbound routes the
+    /// INSERT takes: the buffered layer (prod) or a direct-to-Delta commit.
     async fn fair_spill_db(test_id: &str, buffered: bool) -> Result<Arc<Database>> {
         timefusion::support::init_test_logging();
         let cfg = minio_test_config(test_id, &format!("/tmp/timefusion-qpool-{test_id}"));
         let mut cfg = AppConfig::clone(&cfg);
-        // The pool policy under test. Everything else stays at test defaults so
-        // a failure here is about the pool and nothing else.
+        // The pool policy under test; everything else stays at test defaults.
         cfg.memory.timefusion_memory_pool = timefusion::config::MemoryPoolKind::FairSpill;
         let cfg = Arc::new(cfg);
         let db = Database::with_config(Arc::clone(&cfg)).await?;
         let db = Arc::new(if buffered {
-            // The same Delta writer prod wires; a layer without one errors on
-            // flush rather than exercising the path being measured.
+            // A layer without a Delta writer errors on flush instead of exercising the path.
             let layer = Arc::new(timefusion::support::test_helpers::test_layer(cfg)?.with_delta_writer(timefusion::server::delta_write_callback(&db)));
             db.with_buffered_layer(layer)
         } else {
@@ -119,12 +79,8 @@ mod query_pool_insert {
         )
     }
 
-    /// The answer this file exists for: concurrent INSERTs leave the query pool
-    /// untouched, so the pool's policy cannot bounce them.
-    ///
-    /// `buffered` = prod's route (`use_queue=buffered_layer`); `direct` = the
-    /// direct-to-Delta fallback, which does strictly MORE DataFusion work than
-    /// prod's buffered route — it commits the staged write inline.
+    /// Concurrent INSERTs leave the query pool untouched, so the pool's policy
+    /// cannot bounce them. Asserted on both routes.
     #[test_case(true ; "buffered")]
     #[test_case(false ; "direct")]
     #[serial]
@@ -132,8 +88,7 @@ mod query_pool_insert {
     async fn a_insert_does_not_reserve_from_the_query_pool(buffered: bool) -> Result<()> {
         let test_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
         let db = fair_spill_db(&test_id, buffered).await?;
-        // `insert_records_batch` branches on exactly this, so pin the route
-        // rather than trusting the harness to have wired what it meant to.
+        // `insert_records_batch` branches on exactly this, so pin the route.
         assert_eq!(db.buffered_layer().is_some(), buffered, "harness did not build the route it claims to measure");
         let mut probe = db.clone().create_session_context();
         db.setup_session_context(&mut probe)?;
@@ -148,8 +103,6 @@ mod query_pool_insert {
             })
         });
         for r in futures::future::join_all(writes).await {
-            // An INSERT that failed for pool reasons is exactly the 2026-05-28
-            // symptom, so surface the message rather than a bare unwrap.
             r?.map_err(|e| anyhow::anyhow!("concurrent INSERT failed under a FairSpill query pool: {e}"))?;
         }
 
@@ -164,7 +117,7 @@ mod query_pool_insert {
         Ok(())
     }
 
-    /// Control. Without this, the assertion above could pass because the
+    /// Control: without it, the assertion above could pass merely because the
     /// sampler observes nothing at all.
     #[serial]
     #[tokio::test(flavor = "multi_thread")]
@@ -175,9 +128,8 @@ mod query_pool_insert {
         db.setup_session_context(&mut ctx)?;
 
         let (peak, stop, sampler) = spawn_pool_sampler(&ctx);
-        // Millions of rows, not the handful this file inserts: a sort small
-        // enough to finish between two polls proves nothing about the sampler.
-        // No table involved, so the control cannot fail for storage reasons.
+        // Must stay large: a sort that finishes between two polls proves nothing
+        // about the sampler. No table involved, so it cannot fail for storage reasons.
         ctx.sql("SELECT value FROM generate_series(1, 4000000) ORDER BY value DESC LIMIT 1").await?.collect().await?;
         stop.store(true, Ordering::Relaxed);
         sampler.await?;

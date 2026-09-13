@@ -26,8 +26,7 @@ pub(crate) fn merge_counts(target: &mut BTreeMap<i64, u64>, counts: BTreeMap<i64
     counts.into_iter().try_for_each(|(bucket, count)| bump(target, bucket, count))
 }
 
-/// Exact list membership. Binary operators cannot accidentally express an empty
-/// conjunction, whose SQL semantics depend on null-array presence.
+/// Exact list membership; the binary shape makes an empty conjunction unrepresentable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Membership {
     Contains { column: String, value: String },
@@ -66,8 +65,7 @@ impl Membership {
         })
     }
 
-    /// Compiles literal terms only when the index manifest certifies element mode.
-    /// No tokenizer or query parser may interpret punctuation in these values.
+    /// Compiles literal terms; values are never tokenized or parsed as query syntax.
     pub fn query(&self, schema: &Schema, element_fields: &BTreeSet<String>) -> Result<Box<dyn Query>> {
         match self {
             Self::Contains { column, value } => {
@@ -88,9 +86,6 @@ impl Membership {
 }
 
 /// A bounded histogram in timestamp microseconds. Empty buckets are omitted.
-///
-/// Bucket arithmetic uses integers, including for timestamps outside the exact
-/// range of f64. Construction rejects unrepresentable bucket starts.
 #[derive(Debug, Clone, Copy)]
 pub struct HistogramWindow {
     start: i64,
@@ -104,8 +99,14 @@ impl HistogramWindow {
     pub fn bounds(&self) -> (i64, i64) {
         (self.start, self.end)
     }
+    /// Valid only for timestamps already restricted to `[start, end)`.
+    fn bucket_index(&self, timestamp: i64) -> usize {
+        ((i128::from(timestamp) - i128::from(self.first_bucket)) / i128::from(self.width)) as usize
+    }
+    fn bucket_start(&self, index: usize) -> i64 {
+        (i128::from(self.first_bucket) + index as i128 * i128::from(self.width)) as i64
+    }
     /// Counts captured physical rows through the same winner mask as the index.
-    /// This performs no source reads and preserves SQL membership/null semantics.
     pub fn count_rows(
         &self, batches: &[arrow::record_batch::RecordBatch], visible: &arrow::buffer::BooleanBuffer, membership: Option<&Membership>,
     ) -> Result<BTreeMap<i64, u64>> {
@@ -143,11 +144,7 @@ impl HistogramWindow {
                         && (self.start..self.end).contains(&timestamp)
                         && !predicate.as_ref().is_some_and(|predicate| predicate.is_null(row) || !predicate.value(row))
                 })
-                .try_for_each(|(_, &timestamp)| {
-                    let bucket = i128::from(self.first_bucket)
-                        + (i128::from(timestamp) - i128::from(self.first_bucket)) / i128::from(self.width) * i128::from(self.width);
-                    bump(&mut counts, i64::try_from(bucket)?, 1)
-                })?;
+                .try_for_each(|(_, &timestamp)| bump(&mut counts, self.bucket_start(self.bucket_index(timestamp)), 1))?;
             offset += batch.num_rows();
         }
         Ok(counts)
@@ -157,37 +154,30 @@ impl HistogramWindow {
     pub fn new(start: i64, end: i64, width: i64, origin: i64, max_buckets: usize) -> Result<Self> {
         ensure!(start < end, "histogram window must be nonempty");
         ensure!(width > 0, "histogram width must be positive");
-        let bucket = |timestamp: i64| {
-            let origin = i128::from(origin);
-            let width = i128::from(width);
-            origin + (i128::from(timestamp) - origin).div_euclid(width) * width
-        };
+        let (base, step) = (i128::from(origin), i128::from(width));
+        let bucket = |timestamp: i64| base + (i128::from(timestamp) - base).div_euclid(step) * step;
         let first_bucket = i64::try_from(bucket(start))?;
-        let count = (bucket(end - 1) - i128::from(first_bucket)) / i128::from(width) + 1;
-        let bucket_count = usize::try_from(count)?;
+        let bucket_count = usize::try_from((bucket(end - 1) - i128::from(first_bucket)) / step + 1)?;
         ensure!(bucket_count <= max_buckets, "histogram bucket limit exceeded");
         Ok(Self { start, end, width, first_bucket, bucket_count })
     }
 
     /// Counts matches after applying visibility from the caller's source snapshot.
     ///
-    /// The caller must verify index coverage, exact field representation, and
-    /// physical ordinal validity against that snapshot. `visible` must exclude
-    /// superseded versions and tombstones across all storage legs, including memory.
-    /// Tantivy's own live-document bitmap alone does not establish this contract.
+    /// The caller must first verify index coverage and ordinal validity against that
+    /// snapshot. `visible` takes a physical row ordinal and must exclude superseded
+    /// versions and tombstones across all storage legs; tantivy's live-doc bitmap is not enough.
     pub fn search<P>(&self, searcher: &Searcher, predicate: Box<dyn Query>, visible: P) -> Result<BTreeMap<i64, u64>>
     where
         P: Fn(u64) -> bool + Clone + Send + Sync + 'static,
     {
-        // Fail on legacy indexes without physical ordinals, rather than silently
-        // treating a missing mask column as an empty result.
+        // Fail on indexes lacking physical ordinals instead of returning an empty result.
         searcher.segment_readers().iter().try_for_each(|segment| segment.fast_fields().u64(ROW_ORDINAL_FIELD).map(drop))?;
         let collector = FilterCollector::new(ROW_ORDINAL_FIELD.into(), visible, HistogramCollector(*self));
         Ok(searcher.search(&self.query(predicate), &collector)?)
     }
 
-    /// Tests physical candidates, including superseded versions and tombstones.
-    /// Only a false result can establish absence without resolving visibility.
+    /// Tests physical candidates ignoring visibility, so only `false` proves absence.
     pub(crate) fn has_physical_matches(&self, searcher: &Searcher, predicate: Box<dyn Query>) -> Result<bool> {
         Ok(searcher.search(&self.query(predicate), &tantivy::collector::Count)? != 0)
     }
@@ -219,16 +209,7 @@ impl Collector for HistogramCollector {
                 *total = total.checked_add(count).ok_or_else(|| tantivy::TantivyError::InvalidArgument("histogram count overflow".into()))?;
             }
         }
-        Ok(counts
-            .into_iter()
-            .enumerate()
-            .filter(|(_, count)| *count != 0)
-            .map(|(i, count)| {
-                // Construction proves every bucket lies between first_bucket and end.
-                let key = i128::from(self.0.first_bucket) + i as i128 * i128::from(self.0.width);
-                (key as i64, count)
-            })
-            .collect())
+        Ok(counts.into_iter().enumerate().filter(|(_, count)| *count != 0).map(|(i, count)| (self.0.bucket_start(i), count)).collect())
     }
 }
 
@@ -246,9 +227,8 @@ impl SegmentCollector for HistogramSegment {
             && timestamp >= self.window.start
             && timestamp < self.window.end
         {
-            let bucket = (i128::from(timestamp) - i128::from(self.window.first_bucket)) / i128::from(self.window.width);
             // A segment has at most u32::MAX documents; its counts cannot overflow u64.
-            self.counts[bucket as usize] += 1;
+            self.counts[self.window.bucket_index(timestamp)] += 1;
         }
     }
 

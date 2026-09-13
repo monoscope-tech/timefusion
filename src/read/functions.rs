@@ -42,6 +42,12 @@ fn extract_scalar_string(arg: &ColumnarValue, label: &str) -> datafusion::error:
     }
 }
 
+/// Exactly-N argument destructuring. `what` is the trailing
+/// ": <arg description>" of the error message (empty for one-argument forms).
+fn args_n<'a, const N: usize>(args: &'a [ColumnarValue], name: &str, what: &str) -> datafusion::error::Result<&'a [ColumnarValue; N]> {
+    args.try_into().map_err(|_| DataFusionError::Execution(format!("{name} requires exactly {N} argument{}{what}", if N == 1 { "" } else { "s" })))
+}
+
 /// Materializes scalars as one-element arrays.
 fn as_array(v: &ColumnarValue) -> datafusion::error::Result<ArrayRef> {
     match v {
@@ -55,8 +61,8 @@ fn downcast<T: 'static>(array: &dyn Array, msg: impl std::fmt::Display) -> dataf
     array.as_any().downcast_ref::<T>().ok_or_else(|| DataFusionError::Execution(msg.to_string()))
 }
 
-/// The `name`/`signature` pair every stateless UDF here repeats, plus — when
-/// given — the constant `return_type` and the `aliases()` accessor.
+/// `name`/`signature` accessors, plus — when given — a constant `return_type`
+/// and the `aliases()` accessor.
 macro_rules! udf_boilerplate {
     ($name:literal) => {
         fn name(&self) -> &str {
@@ -81,8 +87,7 @@ macro_rules! udf_boilerplate {
 }
 
 /// Declare a UDF struct whose only state is its `Signature` (plus, optionally,
-/// its `aliases()` list), plus the `Default` that builds it — the shape every
-/// stateless `ScalarUDFImpl`/`AggregateUDFImpl` here repeats.
+/// its `aliases()` list) together with the `Default` that builds it.
 macro_rules! udf_struct {
     ($(#[$m:meta])* $ty:ident, $sig:expr) => {
         $(#[$m])*
@@ -121,7 +126,6 @@ fn uncast(expr: &Expr) -> &Expr {
 }
 
 /// Resolves PostgreSQL types that DataFusion does not model natively as text.
-/// The planner runs for simple and extended protocol casts alike.
 #[derive(Debug, Default)]
 pub struct PostgresTypePlanner;
 
@@ -148,10 +152,8 @@ pub(super) enum PathComponent {
 
 impl ExprPlanner for VariantAwareExprPlanner {
     fn plan_binary_op(&self, expr: RawBinaryExpr, schema: &DFSchema) -> datafusion::error::Result<PlannerResult<RawBinaryExpr>> {
-        // PG array overlap: `a && b` → array_has_any(a, b). DataFusion's
-        // NestedFunctionPlanner rewrites `@>`/`<@` but not `&&`, so it errored
-        // as "Unsupported binary operator: PGOverlap". Only rewrite when both
-        // sides are lists; anything else falls through unchanged.
+        // PG array overlap: `a && b` → array_has_any(a, b), which DataFusion's
+        // NestedFunctionPlanner does not cover. Only when both sides are lists.
         if matches!(expr.op, BinaryOperator::PGOverlap)
             && matches!(expr.left.get_type(schema)?, DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(..))
             && matches!(expr.right.get_type(schema)?, DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(..))
@@ -160,10 +162,7 @@ impl ExprPlanner for VariantAwareExprPlanner {
         }
 
         // `#>`/`#>>` address the same leaves as `->`/`->>`, but take the whole
-        // path as one text[] literal instead of a chain. Postgres callers reach
-        // for them whenever the path is built programmatically, so a store that
-        // supports only the arrow forms silently forces every such query into a
-        // per-store branch on the client.
+        // path as one text[] literal instead of a chain.
         let (is_long_arrow, path_is_array) = match &expr.op {
             BinaryOperator::Arrow => (false, false),
             BinaryOperator::LongArrow => (true, false),
@@ -174,10 +173,6 @@ impl ExprPlanner for VariantAwareExprPlanner {
 
         // The empty path addresses the whole document: PG's `x #> '{}'` is `x`, and
         // `x #>> '{}'` is `x` rendered as text (a JSON string losing its quotes).
-        // Monoscope emits exactly `jsonb_path_query_first(...) #>> '{}'` to read an
-        // exception field out of a span event, so without this arm that whole family
-        // of queries fails to plan with "Operator #>> is not yet supported" — the
-        // function existing is not enough on its own.
         if path_is_array && is_empty_path_array(&expr.right) {
             let base = unalias(&expr.left);
             let json =
@@ -221,16 +216,10 @@ impl ExprPlanner for VariantAwareExprPlanner {
         Ok(PlannerResult::Planned(Expr::Alias(Alias::new(result, None::<&str>, alias_name))))
     }
 
-    // PG's `substring(string FROM pattern)`: when the FROM operand is a string
-    // rather than an offset it is a POSIX regex, and the result is the matched
-    // text — the first capturing group when the pattern has one, the whole match
-    // when it has none. sqlparser lowers that spelling and the offset spelling to
-    // the same 2-arg form, so DataFusion saw `substr(Utf8View, Utf8)` and gave up
-    // at "Function 'substr' requires Int64, but received String" — an operator
-    // reading widget access logs out of `body` lost the whole query to it.
-    //
-    // `regexp_match` is specified with exactly those group/whole-match semantics,
-    // so element 1 of its list IS PG's result, NULL-on-no-match included.
+    // PG's `substring(string FROM pattern)`: a string FROM operand is a POSIX
+    // regex and the result is the matched text (first capture group, else the
+    // whole match). `regexp_match` element 1 has exactly those semantics.
+    // sqlparser lowers this and the offset spelling to the same 2-arg form.
     fn plan_substring(&self, args: Vec<Expr>) -> datafusion::error::Result<PlannerResult<Vec<Expr>>> {
         // Only a string LITERAL routes. A column-typed operand is genuinely
         // ambiguous, and an offset must keep reaching the default planner.
@@ -250,19 +239,15 @@ fn unalias(expr: &Expr) -> Expr {
     }
 }
 
-/// `{}` — the empty `text[]` path, which addresses the whole document rather than
-/// any leaf inside it. Handled by its own arm in the planner above, so
-/// 'extract_path_array' can keep rejecting it instead of returning a path that
-/// would silently address nothing.
+/// `{}` — the empty `text[]` path, addressing the whole document. Handled by its
+/// own arm in the planner above; `extract_path_array` rejects it.
 fn is_empty_path_array(expr: &Expr) -> bool {
     matches!(uncast(expr), Expr::Literal(v, _) if extract_utf8_string(v).is_some_and(|raw| raw.trim() == "{}"))
 }
 
-/// Path operand of `#>`/`#>>`. Postgres spells it `text[]`, which reaches the
-/// planner either as the unparsed literal `{a,b,c}` or as an already-built list.
-/// Quoted elements (`{"a b",c}`) are unquoted, matching Postgres array-literal
-/// parsing; an empty path is rejected here and handled by the whole-document arm
-/// in the planner instead.
+/// Path operand of `#>`/`#>>`: a `text[]`, reaching the planner either as the
+/// unparsed literal `{a,b,c}` or as an already-built list. Quoted elements
+/// (`{"a b",c}`) are unquoted; an empty path returns `None`.
 fn extract_path_array(expr: &Expr) -> Option<Vec<PathComponent>> {
     let parts: Vec<PathComponent> = match uncast(expr) {
         Expr::Literal(v, _) => {
@@ -298,15 +283,10 @@ fn collect_arrow_chain(expr: &Expr) -> (Expr, Vec<PathComponent>) {
 }
 
 pub(super) fn extract_path_component(expr: &Expr) -> Option<PathComponent> {
-    // `::` binds tighter than `->>`, so monoscope's `attributes->>'route'::text`
-    // parses as `attributes ->> CAST('route' AS text)` — the cast lands on the
-    // PATH, not the extracted value. Matching only a bare literal made this
-    // return `None`, `VariantAwareExprPlanner` fall through to
-    // datafusion-functions-json, and the query fail to PLAN against a Variant
-    // column: "Unexpected argument type to 'json_as_text' … got Struct([metadata,
-    // value])". Prod 2026-08-25: 17 of those in 90 minutes, one per chart load —
-    // the panel errors outright rather than rendering slowly. A cast around a
-    // path literal cannot change which field is addressed, so unwrap it.
+    // `::` binds tighter than `->>`, so `attributes->>'route'::text` puts the cast
+    // on the PATH literal. A cast cannot change which field is addressed: unwrap it,
+    // else this returns None and the expr falls through to datafusion-functions-json,
+    // which cannot plan against a Variant column.
     let Expr::Literal(v, _) = uncast(expr) else { return None };
     extract_utf8_string(v).map(PathComponent::Field).or_else(|| {
         Some(PathComponent::Index(match v {
@@ -319,33 +299,22 @@ pub(super) fn extract_path_component(expr: &Expr) -> Option<PathComponent> {
     })
 }
 
+/// UDFs whose result is a Variant, so `->`/`->>` applied to one must route to
+/// `variant_get` rather than fall through to datafusion-functions-json.
+const VARIANT_PRODUCING_UDFS: [&str; 7] =
+    ["json_to_variant", "variant_get", "cast_to_variant", "variant_object_construct", "variant_list_construct", "variant_object_insert", "variant_list_insert"];
+
 /// Check if expression evaluates to a Variant type
 fn is_variant_column(expr: &Expr, schema: &DFSchema) -> bool {
     match expr {
-        // Direct column reference. The SQL-facing schema un-types Variant columns to
-        // Utf8View (see `create_insert_compatible_schema`) and tags them
-        // `tf.pg_type=jsonb`, so by the time the planner runs `plan_binary_op` the real
-        // Struct type is gone. Detect the marker too, else `->`/`->>` fall through to
-        // datafusion-functions-json (json_get/json_as_text) and blow up once the
-        // analyzer restores the Variant struct. On a base column the tag is only ever
-        // set on Variant columns (UDF-output `tf.pg_type` tags live on expressions).
+        // The SQL-facing schema un-types Variant columns to Utf8View and tags them
+        // `tf.pg_type=jsonb`, so the Struct type is gone by planning time — the tag
+        // must be detected too. On a base column the tag is only ever set on Variants.
         Expr::Column(col) => {
             schema.field_from_column(col).is_ok_and(|f| is_variant_type(f.data_type()) || f.metadata().get("tf.pg_type").is_some_and(|v| v == "jsonb"))
         }
         Expr::Alias(alias) => is_variant_column(&alias.expr, schema),
-        Expr::ScalarFunction(func) => {
-            matches!(
-                func.func.name(),
-                "json_to_variant"
-                    | "variant_get"
-                    | "cast_to_variant"
-                    | "variant_object_construct"
-                    | "variant_list_construct"
-                    | "variant_object_insert"
-                    | "variant_list_insert"
-            )
-        }
-        // Try to get the type for other expressions
+        Expr::ScalarFunction(func) => VARIANT_PRODUCING_UDFS.iter().any(|name| *name == func.func.name()),
         _ => expr.get_type(schema).is_ok_and(|dt| is_variant_type(&dt)),
     }
 }
@@ -353,13 +322,10 @@ fn is_variant_column(expr: &Expr, schema: &DFSchema) -> bool {
 /// Build a `variant_get` path string from components:
 /// `["user", "name"]` → `['user']['name']`, `["items", Index(0)]` → `['items'][0]`.
 ///
-/// Field names are ALWAYS bracket-quoted, never emitted as bare dot notation.
-/// `VariantPath` reads `a.b` as a two-element nested path, but Postgres `->>`
-/// takes the whole literal as ONE key — so the everyday OTel shape
-/// `attributes ->> 'http.request.method'` resolved to NULL instead of the
-/// value. The bracket form is the only encoding that can say "one field named
-/// exactly this". Inside the brackets `\` and `]` are backslash-escaped, which
-/// is what `parquet_variant`'s bracket parser unescapes.
+/// Field names are ALWAYS bracket-quoted, never bare dot notation: `VariantPath`
+/// reads `a.b` as a two-element nested path, but Postgres `->>` takes the whole
+/// literal as ONE key (e.g. `attributes ->> 'http.request.method'`). Inside the
+/// brackets `\` and `]` are backslash-escaped, as `parquet_variant` expects.
 pub(super) fn build_variant_path(parts: &[PathComponent]) -> String {
     parts
         .iter()
@@ -398,9 +364,6 @@ udf_struct!(
     /// - JSON null → SQL NULL
     /// - JSON number / boolean → its literal text (`42`, `true`)
     /// - JSON object / array → returned as-is (Postgres `->>` does the same)
-    ///
-    /// Bridges `parquet_variant_compute::variant_get`'s NULL-on-non-string-cast
-    /// behavior to the Postgres `->>` contract.
     JsonToPgTextUdf,
     Signature::uniform(1, vec![DataType::Utf8, DataType::Utf8View, DataType::LargeUtf8], Volatility::Immutable)
 );
@@ -408,20 +371,15 @@ udf_struct!(
 impl ScalarUDFImpl for JsonToPgTextUdf {
     udf_boilerplate!("json_to_pg_text", DataType::Utf8);
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> datafusion::error::Result<ColumnarValue> {
-        let [arg] = args.args.as_slice() else {
-            return Err(DataFusionError::Execution("json_to_pg_text requires exactly 1 argument".into()));
-        };
+        let [arg] = args_n::<1>(&args.args, "json_to_pg_text", "")?;
         let arr = arg.to_array(args.number_rows)?;
-        // Cast once to Utf8 — collapses Utf8/Utf8View/LargeUtf8 to a single
-        // concrete shape, single pass over rows.
+        // Cast once to Utf8 — collapses Utf8/Utf8View/LargeUtf8 to one concrete shape.
         let utf8 = datafusion::arrow::compute::cast(&arr, &DataType::Utf8).map_err(arrow_err)?;
         let strs: &StringArray = downcast(&utf8, "json_to_pg_text: cast to Utf8 failed")?;
-        // Builder (not a `collect()` into StringArray) so the common non-string
-        // case appends the borrowed `&str` without a per-row String alloc.
         let mut b = datafusion::arrow::array::StringBuilder::with_capacity(strs.len(), strs.value_data().len());
-        // Parse via serde_json so escape sequences resolve correctly and false-positive
-        // shapes like '"a"+"b"' don't trigger naive unquoting. JSON null → SQL NULL;
-        // JSON string → its raw text; anything else → its JSON literal text (per PG ->>).
+        // Parse via serde_json so escape sequences resolve and shapes like '"a"+"b"'
+        // don't trigger naive unquoting. JSON null → SQL NULL; JSON string → its raw
+        // text; anything else → its JSON literal text (per PG ->>).
         strs.iter().for_each(|opt| match opt.map(|s| (s, serde_json::from_str::<JsonValue>(s))) {
             None | Some((_, Ok(JsonValue::Null))) => b.append_null(),
             Some((_, Ok(JsonValue::String(inner)))) => b.append_value(&inner),
@@ -431,14 +389,9 @@ impl ScalarUDFImpl for JsonToPgTextUdf {
     }
 }
 
-/// `datafusion-variant`'s UDFs call `try_field_as_variant_array(field)` on
-/// their first arg and bail with "Extension type name missing" when the
-/// field lacks the `ARROW:extension:name = arrow.parquet.variant` marker.
-/// That marker survives in the LogicalPlan's `projected_schema` (set by
-/// `VariantSelectRewriter::patch_table_scan` and by `SchemaRegistry`'s
-/// `fields()`), but is stripped on the way to the physical executor's
-/// per-row Field — so any SELECT touching a Variant column would panic at
-/// execution time. We re-stamp the marker here right before delegating.
+/// Re-stamp the `ARROW:extension:name = arrow.parquet.variant` marker, which the
+/// logical plan carries but the physical executor's per-row Field drops.
+/// `datafusion-variant`'s UDFs fail without it ("Extension type name missing").
 fn stamp_variant_field(f: &FieldRef) -> FieldRef {
     use crate::schema::{VARIANT_EXT_KEY as EXT_KEY, VARIANT_EXT_VALUE as EXT_VAL};
     if !is_variant_type(f.data_type()) || f.metadata().get(EXT_KEY).map(String::as_str) == Some(EXT_VAL) {
@@ -449,12 +402,9 @@ fn stamp_variant_field(f: &FieldRef) -> FieldRef {
     Arc::new(f.as_ref().clone().with_metadata(md))
 }
 
-/// Wrap a `datafusion-variant` UDF so its arg fields get the Variant
-/// extension marker re-stamped before delegation. Generic over the inner
-/// UDF type so `VariantToJsonUdf` and `VariantGetUdf` share one impl.
-/// `JSONB_OUT` tags the output Field with `tf.pg_type = jsonb` so bare
-/// Variant columns (wrapped by VariantPgwireRootWrap) surface PG OID 3802
-/// over the wire instead of text — strict drivers (hasql) reject text.
+/// Wrap a `datafusion-variant` UDF so its arg fields get the Variant extension
+/// marker re-stamped before delegation. `JSONB_OUT` tags the output Field with
+/// `tf.pg_type = jsonb` so it surfaces over the wire as PG OID 3802, not text.
 #[derive(Debug, Hash, PartialEq, Eq, Default)]
 pub struct VariantExtWrapper<U: ScalarUDFImpl + Default + Hash + PartialEq + Eq + 'static, const JSONB_OUT: bool = false> {
     inner: U,
@@ -470,10 +420,8 @@ impl<U: ScalarUDFImpl + Default + Hash + PartialEq + Eq + 'static, const JSONB_O
     fn return_type(&self, arg_types: &[DataType]) -> datafusion::error::Result<DataType> {
         self.inner.return_type(arg_types)
     }
-    // VariantGetUdf in particular panics in `return_type` and instead
-    // computes the output Field shape from arg types via this method, so
-    // we must forward it rather than rely on the default that calls
-    // return_type.
+    // Must be forwarded: `VariantGetUdf` panics in `return_type` and computes its
+    // output Field here instead, so the default impl would not do.
     fn return_field_from_args(&self, args: datafusion::logical_expr::ReturnFieldArgs) -> datafusion::error::Result<FieldRef> {
         let f = self.inner.return_field_from_args(args)?;
         if !JSONB_OUT {
@@ -488,15 +436,11 @@ impl<U: ScalarUDFImpl + Default + Hash + PartialEq + Eq + 'static, const JSONB_O
     }
     fn invoke_with_args(&self, mut args: ScalarFunctionArgs) -> datafusion::error::Result<ColumnarValue> {
         use datafusion::arrow::compute::cast;
-        // The official datafusion-variant UDFs declare a BinaryView Variant output but
-        // pass the input `metadata` buffer through unchanged. TF stores Variants as
-        // Struct(Binary, Binary) (delta-kernel / delta-rs fork requirement), so a
-        // Binary-input Variant makes the inner UDF's *declared* (BinaryView) and
-        // *actual* (Binary metadata) output types disagree → the DataFusion
-        // "result_data_type == expected_type" assertion fires. Coerce Variant args to
-        // BinaryView here so the inner UDF is internally consistent; TF's on-disk /
-        // MemBuffer representation stays Binary.
-        // Indexed loop: rewrites `args.args[i]` / `args.arg_fields[i]` in place.
+        // datafusion-variant's UDFs declare a BinaryView Variant output but pass the
+        // input `metadata` buffer through unchanged; TF stores Variants as
+        // Struct(Binary, Binary), so a Binary input makes the inner UDF's declared and
+        // actual output types disagree. Coerce Variant args to BinaryView here; the
+        // on-disk / MemBuffer representation stays Binary.
         for i in 0..args.args.len() {
             let field = args.arg_fields[i].clone();
             let DataType::Struct(inner) = field.data_type() else { continue };
@@ -524,9 +468,8 @@ impl<U: ScalarUDFImpl + Default + Hash + PartialEq + Eq + 'static, const JSONB_O
 pub type VariantToJsonExtUdf = VariantExtWrapper<datafusion_variant::VariantToJsonUdf, true>;
 pub type VariantGetExtUdf = VariantExtWrapper<datafusion_variant::VariantGetUdf>;
 
-/// Process-wide singletons for the Variant UDFs the analyzer rules splice into
-/// plans. They are stateless, so the rules clone one `Arc` per plan instead of
-/// allocating a fresh `ScalarUDF` per rewritten expression.
+/// Process-wide singleton accessor for a stateless UDF, so analyzer rules clone
+/// one `Arc` instead of allocating a `ScalarUDF` per rewritten expression.
 macro_rules! shared_udf {
     ($(#[$m:meta])* $vis:vis $name:ident: $ty:ty) => {
         $(#[$m])*
@@ -542,20 +485,15 @@ shared_udf!(pub variant_get_udf: VariantGetExtUdf);
 shared_udf!(pub json_to_variant_udf: datafusion_variant::JsonToVariantUdf);
 shared_udf!(pub json_to_pg_text_udf: JsonToPgTextUdf);
 
-/// Register all custom PostgreSQL-compatible functions
-/// Collapse the repetitive `ctx.register_udf(ScalarUDF::from(T))` calls for
-/// UDFs built straight from a unit/default struct.
+/// `ctx.register_udf(ScalarUDF::from(T))` for each UDF built from a default struct.
 macro_rules! reg_from {
     ($ctx:expr, $($udf:expr),+ $(,)?) => { $( $ctx.register_udf(ScalarUDF::from($udf)); )+ };
 }
 
 pub fn register_custom_functions(ctx: &mut datafusion::execution::context::SessionContext) -> Result<()> {
-    // Register Variant-aware expr planner (must be before JSON planner for priority)
+    // Must be registered before the JSON planner, which would otherwise win.
     datafusion::execution::FunctionRegistry::register_expr_planner(ctx, Arc::new(VariantAwareExprPlanner))?;
 
-    // PgCoalesceUdf: PG parity coalesce that type-checks `coalesce(list_col, '{}')`,
-    // replacing the built-in under the same name; see PgArrayLiteralRewriter.
-    // JsonToPgTextUdf bridges variant -> Postgres ->> text semantics (numeric/bool/null → text/NULL).
     reg_from!(
         ctx,
         crate::read::optimizers::PgCoalesceUdf::default(),
@@ -585,30 +523,19 @@ pub fn register_custom_functions(ctx: &mut datafusion::execution::context::Sessi
     // create_udf-based UDFs that carry construction logic.
     ctx.register_udf(create_jsonb_array_elements_udf());
     ctx.register_udf(ScalarUDF::from(TimeBucketUDF::default()));
-    ctx.register_udaf(binary_state_udaf("percentile_agg", DataType::Float64, Arc::new(|_| Ok(Box::<PercentileAccumulator>::default()))));
-    ctx.register_udaf(binary_state_udaf(
-        "tdigest_merge",
-        DataType::Binary,
-        Arc::new(|_| Ok(Box::new(PercentileAccumulator { merging: true, ..Default::default() }) as Box<dyn Accumulator>)),
-    ));
+    ctx.register_udaf(binary_state_udaf("percentile_agg", DataType::Float64, Arc::new(|_| Ok(Box::<SketchAccumulator<TDigestWrapper>>::default()))));
+    ctx.register_udaf(binary_state_udaf("tdigest_merge", DataType::Binary, Arc::new(|_| Ok(SketchAccumulator::<TDigestWrapper>::merging()))));
     ctx.register_udaf(AggregateUDF::from(HllAggUDF::default()));
-    ctx.register_udaf(binary_state_udaf(
-        "hll_merge",
-        DataType::Binary,
-        Arc::new(|_| Ok(Box::new(HllAccumulator { merging: true, ..Default::default() }) as Box<dyn Accumulator>)),
-    ));
+    ctx.register_udaf(binary_state_udaf("hll_merge", DataType::Binary, Arc::new(|_| Ok(SketchAccumulator::<crate::read::Hll>::merging()))));
     ctx.register_udf(create_hll_count_udf());
     ctx.register_udf(hash_bucket_udf());
 
-    // text_match(col, 'query') for tantivy-accelerated full-text search. Naive
-    // substring fallback keeps correctness when tantivy is disabled or when
-    // post-filtering MemBuffer rows; see [[tantivy_index/udf]].
+    // text_match(col, 'query'): tantivy-accelerated full-text search, with a naive
+    // substring fallback when tantivy is off or when post-filtering MemBuffer rows.
     ctx.register_udf(crate::tantivy::udf::text_match_udf());
 
-    // Test-only clock UDFs. Gated behind TIMEFUSION_ENABLE_TEST_UDFS so a
-    // production deployment can't have its eviction/flush clock yanked by
-    // a stray SQL session. Required by the long-duration bench harness in
-    // `bench/timeseries_lifecycle.py` to simulate hours in seconds.
+    // Test-only clock UDFs, gated so a production deployment can't have its
+    // eviction/flush clock yanked by a stray SQL session.
     if std::env::var("TIMEFUSION_ENABLE_TEST_UDFS").is_ok_and(|v| v == "true" || v == "1") {
         ctx.register_udf(create_set_clock_udf());
         ctx.register_udf(create_advance_clock_udf());
@@ -621,10 +548,8 @@ pub fn register_custom_functions(ctx: &mut datafusion::execution::context::Sessi
 
 pub type FnRegistry = dyn datafusion::execution::FunctionRegistry + Send + Sync;
 
-/// Process-wide Arc'd FunctionRegistry pre-populated with all custom UDFs.
-/// Lazy-init via OnceLock so test/bench harnesses that build many layers don't
-/// re-register UDFs 20× per test. Production builds it once at startup either
-/// way.
+/// Process-wide Arc'd FunctionRegistry pre-populated with all custom UDFs,
+/// built once on first call.
 pub fn function_registry() -> Result<Arc<FnRegistry>> {
     static CELL: std::sync::OnceLock<Arc<FnRegistry>> = std::sync::OnceLock::new();
     if let Some(reg) = CELL.get() {
@@ -643,17 +568,12 @@ fn create_set_clock_udf() -> ScalarUDF {
     let fun: ScalarFunctionImplementation = Arc::new(move |args: &[ColumnarValue]| {
         let arr = as_array(&args[0])?;
         let s: &StringArray = downcast(&arr, "timefusion_set_clock expects Utf8")?;
-        let out: Int64Array = s
-            .iter()
-            .map(|v| {
-                v.map(|s| {
-                    chrono::DateTime::parse_from_rfc3339(s)
-                        .map(|t| crate::support::set_micros(t.timestamp_micros()))
-                        .map_err(|e| DataFusionError::Execution(format!("invalid rfc3339: {e}")))
-                })
-                .transpose()
-            })
-            .collect::<datafusion::error::Result<_>>()?;
+        let parse = |s: &str| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .map(|t| crate::support::set_micros(t.timestamp_micros()))
+                .map_err(|e| DataFusionError::Execution(format!("invalid rfc3339: {e}")))
+        };
+        let out: Int64Array = s.iter().map(|v| v.map(parse).transpose()).collect::<datafusion::error::Result<_>>()?;
         Ok(ColumnarValue::Array(Arc::new(out)))
     });
     create_udf("timefusion_set_clock", vec![DataType::Utf8], DataType::Int64, Volatility::Volatile, fun)
@@ -664,8 +584,7 @@ fn create_advance_clock_udf() -> ScalarUDF {
     let fun: ScalarFunctionImplementation = Arc::new(move |args: &[ColumnarValue]| {
         let arr = as_array(&args[0])?;
         let d: &Int64Array = downcast(&arr, "timefusion_advance_clock expects Int64")?;
-        let out: Int64Array = d.iter().map(|v| v.map(crate::support::advance_micros)).collect();
-        Ok(ColumnarValue::Array(Arc::new(out)))
+        Ok(ColumnarValue::Array(Arc::new(d.iter().map(|v| v.map(crate::support::advance_micros)).collect::<Int64Array>())))
     });
     create_udf("timefusion_advance_clock", vec![DataType::Int64], DataType::Int64, Volatility::Volatile, fun)
 }
@@ -683,9 +602,7 @@ impl ScalarUDFImpl for ToCharUDF {
     udf_boilerplate!("to_char", DataType::Utf8View);
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> datafusion::error::Result<ColumnarValue> {
-        let [ts, fmt] = args.args.as_slice() else {
-            return Err(DataFusionError::Execution("to_char requires exactly 2 arguments: timestamp and format string".to_string()));
-        };
+        let [ts, fmt] = args_n::<2>(&args.args, "to_char", ": timestamp and format string")?;
         let format_str = extract_scalar_string(fmt, "Format string")?;
         Ok(ColumnarValue::Array(format_timestamps(&as_array(ts)?, &format_str)?))
     }
@@ -737,8 +654,7 @@ fn format_timestamps(timestamp_array: &ArrayRef, format_str: &str) -> datafusion
 }
 
 /// One segment of a parsed Postgres format string. Most tokens collapse to a
-/// `Chrono` spec; `PgD` / `PgDY` exist because chrono has no exact equivalent
-/// for the Postgres day-of-week semantics (Sun=1..Sat=7 / uppercase abbrev).
+/// `Chrono` spec; `PgD` / `PgDY` have no exact chrono equivalent.
 #[derive(Debug, PartialEq)]
 enum FmtPart {
     /// A chrono strftime spec (e.g. `"%Y"`) or escaped-literal slice.
@@ -757,8 +673,6 @@ fn render_pg_format(parts: &[FmtPart], dt: &DateTime<Utc>) -> String {
             FmtPart::Chrono(spec) => dt.format(spec).to_string(),
             // chrono `num_days_from_sunday` is 0=Sun..6=Sat; Postgres `D` is 1..7.
             FmtPart::PgD => (dt.weekday().num_days_from_sunday() + 1).to_string(),
-            // Abbreviated English weekday is ASCII-only, so to_ascii_uppercase suffices
-            // and avoids the locale-aware Unicode case-folding overhead of to_uppercase.
             FmtPart::PgDY => {
                 let mut s = dt.format("%a").to_string();
                 s.make_ascii_uppercase();
@@ -774,46 +688,27 @@ fn render_pg_format(parts: &[FmtPart], dt: &DateTime<Utc>) -> String {
 /// (with `""` standing for a literal `"`). Outside literals, the longest matching
 /// token is replaced with its chrono equivalent.
 ///
-/// **Known divergences from real Postgres** (intentional):
-/// - `Month` / `Day` output is unpadded; real Postgres pads to 9 chars. E2E
-///   callers rely on the unpadded form. Re-add padding behind a custom
-///   formatter only if a caller asks.
-/// - Token matching is case-sensitive. Real Postgres `to_char` is case-insensitive
-///   (e.g. `yyyy == YYYY`). Has been true since the original chained-replace
-///   implementation; not a regression.
-/// - Unterminated `"..."` literals are accepted (the remainder is copied
-///   verbatim). Real Postgres errors. Lenient behaviour matches the
-///   chained-replace predecessor.
-/// - `HH` aliases `HH12` (12-hour clock with leading zero), matching Postgres.
-///   Do not "fix" it to `%H` — Postgres `HH` is *not* `HH24`.
+/// **Deliberate divergences from real Postgres:** `Month`/`Day` are unpadded (PG
+/// pads to 9 chars); token matching is case-sensitive; unterminated `"..."`
+/// literals are accepted rather than an error. `HH` aliases `HH12` — do NOT
+/// "fix" it to `%H`, Postgres `HH` is *not* `HH24`.
 ///
-/// **Not yet implemented** (silently pass through as literal text — same as the
-/// chained-replace predecessor): `Q`, `WW`, `IW`, `CC`, `J`, `OF`, `TZH`, `TZM`,
-/// rare numeric tokens, locale-affected text tokens. Add to `TOKENS` (or as new
-/// `FmtPart` variants for cases with no chrono equivalent) when a caller needs them.
+/// Unsupported tokens (`Q`, `WW`, `IW`, `CC`, `J`, `OF`, `TZH`, `TZM`, …) pass
+/// through as literal text; add them to `TOKENS` when a caller needs them.
 fn parse_pg_format(pg_format: &str) -> Vec<FmtPart> {
     // ORDER IS LOAD-BEARING: every entry must come before any entry that is one of its
-    // prefixes. E.g. YYYY before YY, HH24/HH12 before HH, Month before Mon before MM.
-    // The loop below uses linear `find` so a misordering would silently match the
-    // shorter token first. Note: `D` and `DY` are handled below as PgD / PgDY (no
-    // chrono equivalent), not here.
+    // prefixes (YYYY before YY, HH24/HH12 before HH, Month before Mon before MM). The
+    // loop below uses linear `find`, so a misordering silently matches the shorter
+    // token. `D` and `DY` are handled in the loop as PgD / PgDY, not here.
     const TOKENS: &[(&str, &str)] = &[
         ("YYYY", "%Y"),
         ("YY", "%y"),
-        // Note: Postgres pads `Month` / `Day` output to 9 chars; chrono's %B / %A do not.
-        // E2E callers rely on the unpadded form, so we keep the divergence — re-add padding
-        // only if a caller asks for it.
         ("Month", "%B"),
         ("Mon", "%b"),
         ("MM", "%m"),
         ("DD", "%d"),
         ("Day", "%A"),
         ("Dy", "%a"),
-        // `D` and `DY` are handled below as PgD / PgDY because chrono has no
-        // exact equivalent for Postgres's Sun=1..Sat=7 numbering or its
-        // uppercase abbreviated weekday name. They must be matched before the
-        // single-char fallback below; they aren't in this table so we test for
-        // them explicitly in the loop.
         ("HH24", "%H"),
         ("HH12", "%I"),
         ("HH", "%I"),
@@ -825,18 +720,14 @@ fn parse_pg_format(pg_format: &str) -> Vec<FmtPart> {
         ("TZ", "%Z"),
         ("AM", "%p"),
         ("PM", "%p"),
-        // Lowercase forms — Postgres `am`/`pm` emit lowercase output (chrono `%P`).
         ("am", "%P"),
         ("pm", "%P"),
     ];
 
-    // All token keys are ASCII so byte-prefix matching is sound, but the non-token
-    // pass-through path must walk UTF-8 char boundaries — a multi-byte char in a `"..."`
-    // literal would otherwise be split into separate `char`s and produce mojibake.
+    // All token keys are ASCII so byte-prefix matching is sound, but the pass-through
+    // path must walk UTF-8 char boundaries or multi-byte chars produce mojibake.
     let bytes = pg_format.as_bytes();
     let mut parts: Vec<FmtPart> = Vec::new();
-    // Accumulate chrono spec / literal text into a buffer; flush on a non-chrono
-    // boundary (PgD / PgDY) or at the end so the resulting Vec stays compact.
     let mut buf = String::with_capacity(pg_format.len());
     let flush = |parts: &mut Vec<FmtPart>, buf: &mut String| {
         if !buf.is_empty() {
@@ -872,21 +763,16 @@ fn parse_pg_format(pg_format: &str) -> Vec<FmtPart> {
             continue;
         }
         // `DY` must be matched before bare `D` (longest-prefix). Neither is in TOKENS.
-        // No trailing-alpha guard here: Postgres consumes `DY` greedily, so `DYY` is
-        // `DY` + leftover `Y`. The bare-`D` guard below is still needed because
-        // `Day`/`Dy`/`DD` are alpha-prefix conflicts; no such conflict exists for `DY`.
+        // Postgres consumes `DY` greedily, so `DYY` is `DY` + leftover `Y`.
         if bytes[i..].starts_with(b"DY") {
             flush(&mut parts, &mut buf);
             parts.push(FmtPart::PgDY);
             i += 2;
             continue;
         }
-        // Alphanumeric guard (vs just alpha) so a future `D1`-style token can't be
-        // greedily consumed as bare `D` + leftover `1` before getting added to TOKENS.
+        // Bare `D` only: the alphanumeric guard stops `D<alnum>` (`Day`, `Dy`, `DD`, or a
+        // future `D1` token) being consumed here before its own rule gets a chance.
         if bytes[i] == b'D' && !bytes.get(i + 1).is_some_and(|b| b.is_ascii_alphanumeric()) {
-            // Bare `D` only — guarded so `D<letter>` (e.g. a future token starting with D)
-            // doesn't get consumed here. `Day`, `Dy`, `DD` are caught by TOKENS; `DY` is
-            // caught by its own check above.
             flush(&mut parts, &mut buf);
             parts.push(FmtPart::PgD);
             i += 1;
@@ -917,9 +803,7 @@ impl ScalarUDFImpl for AtTimeZoneUDF {
     }
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> datafusion::error::Result<ColumnarValue> {
-        let [ts, tz] = args.args.as_slice() else {
-            return Err(DataFusionError::Execution("AT TIME ZONE requires exactly 2 arguments: timestamp and timezone".to_string()));
-        };
+        let [ts, tz] = args_n::<2>(&args.args, "AT TIME ZONE", ": timestamp and timezone")?;
         let tz_str = extract_scalar_string(tz, "Timezone")?;
         Ok(ColumnarValue::Array(convert_timezone(&as_array(ts)?, &tz_str)?))
     }
@@ -955,9 +839,8 @@ impl ScalarUDFImpl for JsonBuildArrayUDF {
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> datafusion::error::Result<ColumnarValue> {
         let num_rows = args.number_rows;
         let args = args.args;
-        // Convert each argument column ONCE up front. Converting inside the
-        // row loop is O(rows² × args) — observed as ~0.6ms/row × millions of
-        // rows, enough to OOM prod on a wide-window span-list query.
+        // Convert each argument column ONCE up front; converting inside the row loop
+        // below would be O(rows² × args).
         let cols = args.iter().map(|arg| array_to_json_values(&as_array(arg)?)).collect::<datafusion::error::Result<Vec<_>>>()?;
 
         let out = StringViewArray::from_iter_values((0..num_rows).map(|row_idx| {
@@ -970,8 +853,7 @@ impl ScalarUDFImpl for JsonBuildArrayUDF {
 }
 
 udf_struct!(
-    /// PG's `row_to_json(record)` is `to_json` over a row. pgAdmin's
-    /// dashboard polls `row_to_json(t)` over a subquery alias every 5s.
+    /// PG's `to_json`, aliased as `row_to_json(record)`.
     ToJsonUDF,
     Signature::any(1, Volatility::Immutable),
     aliases: vec!["row_to_json".to_string()]
@@ -981,17 +863,15 @@ impl ScalarUDFImpl for ToJsonUDF {
     udf_boilerplate!("to_json", DataType::Utf8View, aliases);
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> datafusion::error::Result<ColumnarValue> {
-        let [arg] = args.args.as_slice() else {
-            return Err(DataFusionError::Execution("to_json requires exactly 1 argument".to_string()));
-        };
+        let [arg] = args_n::<1>(&args.args, "to_json", "")?;
         let out = StringViewArray::from_iter_values(array_to_json_values(&as_array(arg)?)?.iter().map(JsonValue::to_string));
         Ok(ColumnarValue::Array(Arc::new(out)))
     }
 }
 
 // JSONB-tagged wrappers around the JSON UDFs. Output stays Utf8View, but the
-// returned Field carries `tf.pg_type = jsonb` so the patched vendor/arrow-pg
-// surfaces PG OID 3802 and prepends the 0x01 binary jsonb version byte.
+// returned Field carries `tf.pg_type = jsonb`, which vendor/arrow-pg turns into
+// PG OID 3802 plus the leading 0x01 binary jsonb version byte.
 fn jsonb_tagged_field() -> FieldRef {
     let meta = [("tf.pg_type".to_string(), "jsonb".to_string())].into_iter().collect();
     Arc::new(Field::new("", DataType::Utf8View, true).with_metadata(meta))
@@ -1031,9 +911,7 @@ impl ScalarUDFImpl for ExtractEpochUDF {
     udf_boilerplate!("extract_epoch", DataType::Float64);
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> datafusion::error::Result<ColumnarValue> {
-        let [arg] = args.args.as_slice() else {
-            return Err(DataFusionError::Execution("extract_epoch requires exactly 1 argument".to_string()));
-        };
+        let [arg] = args_n::<1>(&args.args, "extract_epoch", "")?;
         let array = as_array(arg)?;
         // Divide in the array's own unit so nanosecond inputs keep sub-µs precision.
         let (ticks, per_sec) = timestamp_ticks(&array, "extract_epoch argument")?;
@@ -1042,8 +920,7 @@ impl ScalarUDFImpl for ExtractEpochUDF {
     }
 }
 
-/// Downcast `array` to a primitive Arrow array and map each element to
-/// `json!(value)`, nulls to `JsonValue::Null`.
+/// Map each element of a primitive Arrow array to `json!(value)`, nulls to `JsonValue::Null`.
 macro_rules! json_primitives {
     ($array:expr, $ty:ty) => {
         json_primitives!($array, $ty, |x| json!(x))
@@ -1076,9 +953,8 @@ fn array_to_json_values(array: &ArrayRef) -> datafusion::error::Result<Vec<JsonV
 }
 
 /// `sniff_json` parses Utf8 values that look like JSON into real JSON. PG parity
-/// requires it only at the top level — Variant/Utf8 columns holding JSON
-/// (attributes, events, links) need it — while list elements must stay JSON
-/// strings (`to_jsonb(text[])`), so list recursion always passes `false`.
+/// wants it only at the top level: list elements must stay JSON strings
+/// (`to_jsonb(text[])`), so list/struct recursion always passes `false`.
 fn array_to_json_values_inner(array: &ArrayRef, sniff_json: bool) -> datafusion::error::Result<Vec<JsonValue>> {
     Ok(match array.data_type() {
         DataType::Utf8View => {
@@ -1114,9 +990,7 @@ fn array_to_json_values_inner(array: &ArrayRef, sniff_json: bool) -> datafusion:
                 })
                 .collect::<datafusion::error::Result<_>>()?
         }
-        // A record renders as a JSON object keyed by field name — PG's
-        // `row_to_json(t)`. Without this the generic fallback below tries to cast
-        // Struct to Utf8View and fails outright.
+        // A record renders as a JSON object keyed by field name — PG's `row_to_json(t)`.
         DataType::Struct(fields) => {
             let columns: &datafusion::arrow::array::StructArray = downcast(array, "Failed to downcast to StructArray")?;
             // Field values are converted column-wise, then transposed per row.
@@ -1151,12 +1025,8 @@ fn list_to_json_values<O: datafusion::arrow::array::OffsetSizeTrait>(array: &Arr
 }
 
 udf_struct!(
-    /// TimescaleDB's `time_bucket`, and deliberately BOTH of its spellings for the
-    /// bucket width: our own KQL emits a string (`time_bucket('5 minutes', ts)`),
-    /// but real Timescale SQL — which is what a hand-written widget or a migrated
-    /// dashboard contains — passes an INTERVAL. Accepting only the string form gave
-    /// "Failed to coerce arguments … time_bucket(Interval(MonthDayNano),
-    /// Timestamp)" and lost the whole query (issue 3812a29a, 2026-08-28).
+    /// TimescaleDB's `time_bucket`, accepting BOTH spellings of the bucket width:
+    /// a string (`time_bucket('5 minutes', ts)`) and an INTERVAL.
     TimeBucketUDF,
     {
         let ts = DataType::Timestamp(TimeUnit::Microsecond, Some(Arc::from("UTC")));
@@ -1180,9 +1050,7 @@ impl ScalarUDFImpl for TimeBucketUDF {
     }
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> datafusion::error::Result<ColumnarValue> {
-        let [width, ts] = args.args.as_slice() else {
-            return Err(DataFusionError::Execution("time_bucket requires exactly 2 arguments: interval and timestamp".to_string()));
-        };
+        let [width, ts] = args_n::<2>(&args.args, "time_bucket", ": interval and timestamp")?;
         let micros = match width {
             ColumnarValue::Scalar(ScalarValue::IntervalMonthDayNano(Some(i))) => interval_to_micros(i.months, i.days, i.nanoseconds)?,
             _ => parse_interval_to_micros(&extract_scalar_string(width, "Interval")?)?,
@@ -1193,11 +1061,8 @@ impl ScalarUDFImpl for TimeBucketUDF {
 
 /// Width of an `INTERVAL` bucket in microseconds.
 ///
-/// Months are REJECTED, not approximated: a month is 28-31 days, so folding it
-/// to a fixed width would silently mis-bucket every row — a wrong-answer bug,
-/// strictly worse than the error it replaces. TimescaleDB refuses month widths
-/// in this form for the same reason (it has `time_bucket_ng` for calendar
-/// buckets). Days and nanoseconds are exact.
+/// Months are REJECTED, not approximated: a month is 28-31 days, so folding it to
+/// a fixed width would silently mis-bucket rows. Days and nanoseconds are exact.
 pub(crate) fn interval_to_micros(months: i32, days: i32, nanoseconds: i64) -> datafusion::error::Result<i64> {
     if months != 0 {
         return Err(DataFusionError::Execution(
@@ -1250,17 +1115,75 @@ fn bucket_timestamps(timestamp_array: &ArrayRef, bucket_size_micros: i64) -> dat
     })
 }
 
-/// A UDAF whose partial state is exactly its output: one serialized Binary
-/// sketch/digest. Every sketch aggregate here has that shape.
+/// A UDAF whose partial state is exactly its output: one serialized Binary sketch.
 fn binary_state_udaf(name: &str, input: DataType, factory: datafusion::logical_expr::function::AccumulatorFactoryFunction) -> AggregateUDF {
     create_udaf(name, vec![input], Arc::new(DataType::Binary), Volatility::Immutable, factory, Arc::new(vec![DataType::Binary]))
 }
 
+/// A mergeable sketch whose serialized form IS the aggregate's partial state.
+/// `encode`/`heap_size` are named apart from the inherent `to_bytes`/`size` of
+/// the implementors so the trait never shadows them.
+trait Sketch: Default + std::fmt::Debug + Send + Sync + 'static {
+    /// Message when the `*_merge` state column is not Binary.
+    const MERGE_ERR: &'static str;
+    /// Hash/digest one array's non-null values.
+    fn insert_array(&mut self, array: &ArrayRef) -> datafusion::error::Result<()>;
+    /// Fold one serialized sketch in.
+    fn merge_bytes(&mut self, bytes: &[u8]) -> datafusion::error::Result<()>;
+    fn encode(&self) -> datafusion::error::Result<Vec<u8>>;
+    fn heap_size(&self) -> usize;
+}
+
+/// Backs every sketch UDAF pair: `*_agg` digests raw values, `*_merge` folds
+/// already-serialized sketches.
+#[derive(Debug, Default)]
+struct SketchAccumulator<S: Sketch> {
+    sketch: S,
+    merging: bool,
+}
+
+impl<S: Sketch> SketchAccumulator<S> {
+    fn merging() -> Box<dyn Accumulator> {
+        Box::new(Self { sketch: S::default(), merging: true })
+    }
+
+    fn fold_states(&mut self, arrays: &[ArrayRef]) -> datafusion::error::Result<()> {
+        let Some(array) = arrays.first() else { return Ok(()) };
+        let binary: &BinaryArray = downcast(array, S::MERGE_ERR)?;
+        binary.iter().flatten().try_for_each(|bytes| self.sketch.merge_bytes(bytes))
+    }
+}
+
+impl<S: Sketch> Accumulator for SketchAccumulator<S> {
+    fn update_batch(&mut self, values: &[ArrayRef]) -> datafusion::error::Result<()> {
+        match values.first() {
+            Some(array) if !self.merging => self.sketch.insert_array(array),
+            Some(_) => self.fold_states(values),
+            None => Ok(()),
+        }
+    }
+
+    fn evaluate(&mut self) -> datafusion::error::Result<ScalarValue> {
+        Ok(ScalarValue::Binary(Some(self.sketch.encode()?)))
+    }
+
+    fn size(&self) -> usize {
+        self.sketch.heap_size()
+    }
+
+    fn state(&mut self) -> datafusion::error::Result<Vec<ScalarValue>> {
+        self.evaluate().map(|v| vec![v])
+    }
+
+    fn merge_batch(&mut self, states: &[ArrayRef]) -> datafusion::error::Result<()> {
+        self.fold_states(states)
+    }
+}
+
 const TDIGEST_MAX_CENTROIDS: usize = 200;
 
-/// Wrapper for the bounded, mergeable t-digest state exchanged between partial
-/// and final aggregates. Its binary representation contains centroids, never
-/// the raw input values.
+/// Bounded, mergeable t-digest state. Its binary representation contains
+/// centroids, never the raw input values.
 #[derive(Debug, Default)]
 struct TDigestWrapper {
     digest: Option<TDigest>,
@@ -1284,7 +1207,6 @@ impl TDigestWrapper {
     }
 
     fn merge_digest(&mut self, digest: &TDigest) {
-        // Only clones when this wrapper is still empty.
         let mut merged = self.digest.as_ref().map_or_else(|| digest.clone(), |current| current.merge(digest));
         merged.compress(TDIGEST_MAX_CENTROIDS);
         self.digest = Some(merged);
@@ -1292,8 +1214,7 @@ impl TDigestWrapper {
 
     fn to_bytes(&self) -> datafusion::error::Result<Vec<u8>> {
         let centroids: Vec<(f64, f64)> = self.digest.iter().flat_map(|d| d.centroids().iter().map(|c| (c.mean, c.weight))).collect();
-        // Never swallow the encode failure: an empty payload would silently become an
-        // empty digest downstream and skew every percentile.
+        // Never swallow the encode failure: an empty payload decodes as an empty digest.
         bincode::encode_to_vec(centroids, bincode::config::standard()).map_err(|e| DataFusionError::Execution(format!("Failed to serialize t-digest: {e}")))
     }
 
@@ -1319,51 +1240,28 @@ impl TDigestWrapper {
     }
 }
 
-fn merge_tdigest_batch(digest: &mut TDigestWrapper, arrays: &[ArrayRef]) -> datafusion::error::Result<()> {
-    let Some(array) = arrays.first() else { return Ok(()) };
-    let binary: &BinaryArray = downcast(array, "tdigest_merge expects Binary values")?;
-    binary.iter().flatten().try_for_each(|bytes| {
-        digest.merge(&TDigestWrapper::from_bytes(bytes)?);
+/// `percentile_agg` digests raw Float64 values; `tdigest_merge` folds serialized digests.
+impl Sketch for TDigestWrapper {
+    const MERGE_ERR: &'static str = "tdigest_merge expects Binary values";
+
+    fn insert_array(&mut self, array: &ArrayRef) -> datafusion::error::Result<()> {
+        let floats: &Float64Array = downcast(array, "percentile_agg expects Float64 values")?;
+        self.insert_batch(floats.iter().flatten());
         Ok(())
-    })
-}
-
-/// Shared by both t-digest UDAFs: they differ only in what `update_batch` feeds
-/// in — `percentile_agg` digests raw Float64 values, `tdigest_merge` folds
-/// already-serialized digests.
-#[derive(Debug, Default)]
-struct PercentileAccumulator {
-    digest: TDigestWrapper,
-    merging: bool,
-}
-
-impl Accumulator for PercentileAccumulator {
-    fn update_batch(&mut self, values: &[ArrayRef]) -> datafusion::error::Result<()> {
-        match values.first() {
-            Some(array) if !self.merging => {
-                let floats: &Float64Array = downcast(array, "percentile_agg expects Float64 values")?;
-                self.digest.insert_batch(floats.iter().flatten());
-                Ok(())
-            }
-            Some(_) => merge_tdigest_batch(&mut self.digest, values),
-            None => Ok(()),
-        }
     }
 
-    fn evaluate(&mut self) -> datafusion::error::Result<ScalarValue> {
-        Ok(ScalarValue::Binary(Some(self.digest.to_bytes()?)))
+    fn merge_bytes(&mut self, bytes: &[u8]) -> datafusion::error::Result<()> {
+        let other = Self::from_bytes(bytes)?;
+        self.merge(&other);
+        Ok(())
     }
 
-    fn size(&self) -> usize {
-        self.digest.size()
+    fn encode(&self) -> datafusion::error::Result<Vec<u8>> {
+        self.to_bytes()
     }
 
-    fn state(&mut self) -> datafusion::error::Result<Vec<ScalarValue>> {
-        self.evaluate().map(|v| vec![v])
-    }
-
-    fn merge_batch(&mut self, states: &[ArrayRef]) -> datafusion::error::Result<()> {
-        merge_tdigest_batch(&mut self.digest, states)
+    fn heap_size(&self) -> usize {
+        self.size()
     }
 }
 
@@ -1377,9 +1275,7 @@ impl ScalarUDFImpl for ApproxPercentileUDF {
     udf_boilerplate!("approx_percentile", DataType::Float64);
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> datafusion::error::Result<ColumnarValue> {
-        let [pct_arg, digest_arg] = args.args.as_slice() else {
-            return Err(DataFusionError::Execution("approx_percentile requires exactly 2 arguments: percentile and t-digest".to_string()));
-        };
+        let [pct_arg, digest_arg] = args_n::<2>(&args.args, "approx_percentile", ": percentile and t-digest")?;
         // Result size follows the digest column (which comes from GROUP BY).
         let num_rows = match digest_arg {
             ColumnarValue::Array(array) => array.len(),
@@ -1414,20 +1310,12 @@ impl ScalarUDFImpl for ApproxPercentileUDF {
 // ============================================================================
 //
 // The distinct-count analogue of `percentile_agg` / `tdigest_merge` /
-// `approx_percentile` above, and it exists for the same reason: DataFusion's
-// own `approx_distinct` computes a fine estimate but gives no way to STORE the
-// sketch and fold it later, so a rollup cannot carry a distinct count. (Its
-// `HyperLogLog` type is `pub(crate)`, so it cannot be reused here either.)
-//
-// These three are the rollup's storage layer, not a second user-facing API:
-// queries keep asking for `approx_distinct(x)`, and the rollup matcher answers
-// it with `hll_count(hll_merge(state))` when a measure covers it.
+// `approx_percentile`: unlike DataFusion's `approx_distinct`, the sketch itself
+// is storable, so a rollup measure can carry it and fold it later.
 
-/// Feed one array's non-null values into a sketch.
-///
-/// Strings and binaries are hashed in place; anything else is cast to Utf8View
-/// first, which preserves distinctness for every primitive type at the cost of
-/// a formatting pass that only non-string columns pay.
+/// Feed one array's non-null values into a sketch. Strings and binaries are
+/// hashed in place; anything else is cast to Utf8View first, which preserves
+/// distinctness for every primitive type.
 fn hll_insert_array(sketch: &mut crate::read::Hll, array: &ArrayRef) -> datafusion::error::Result<()> {
     macro_rules! feed {
         ($ty:ty) => {{
@@ -1447,69 +1335,33 @@ fn hll_insert_array(sketch: &mut crate::read::Hll, array: &ArrayRef) -> datafusi
     }
 }
 
-/// Decode and fold a column of serialized sketches.
-fn hll_merge_array(sketch: &mut crate::read::Hll, arrays: &[ArrayRef]) -> datafusion::error::Result<()> {
-    let Some(array) = arrays.first() else { return Ok(()) };
-    let binary: &BinaryArray = downcast(array, "hll_merge expects Binary values")?;
-    binary.iter().flatten().try_for_each(|bytes| {
-        sketch.merge(&crate::read::Hll::from_bytes(bytes).map_err(DataFusionError::Execution)?);
+/// `hll_agg` hashes raw values; `hll_merge` folds stored sketches.
+impl Sketch for crate::read::Hll {
+    const MERGE_ERR: &'static str = "hll_merge expects Binary values";
+
+    fn insert_array(&mut self, array: &ArrayRef) -> datafusion::error::Result<()> {
+        hll_insert_array(self, array)
+    }
+
+    fn merge_bytes(&mut self, bytes: &[u8]) -> datafusion::error::Result<()> {
+        self.merge(&Self::from_bytes(bytes).map_err(DataFusionError::Execution)?);
         Ok(())
-    })
-}
-
-/// Shared by both UDAFs: they differ only in what `update_batch` feeds in.
-#[derive(Debug, Default)]
-struct HllAccumulator {
-    sketch: crate::read::Hll,
-    /// `hll_agg` hashes raw values; `hll_merge` folds stored sketches.
-    merging: bool,
-}
-
-impl Accumulator for HllAccumulator {
-    fn update_batch(&mut self, values: &[ArrayRef]) -> datafusion::error::Result<()> {
-        match values.first() {
-            Some(array) if !self.merging => hll_insert_array(&mut self.sketch, array),
-            Some(_) => hll_merge_array(&mut self.sketch, values),
-            None => Ok(()),
-        }
     }
 
-    fn evaluate(&mut self) -> datafusion::error::Result<ScalarValue> {
-        Ok(ScalarValue::Binary(Some(self.sketch.to_bytes())))
+    fn encode(&self) -> datafusion::error::Result<Vec<u8>> {
+        Ok(self.to_bytes())
     }
 
-    fn size(&self) -> usize {
-        self.sketch.size()
-    }
-
-    fn state(&mut self) -> datafusion::error::Result<Vec<ScalarValue>> {
-        self.evaluate().map(|state| vec![state])
-    }
-
-    fn merge_batch(&mut self, states: &[ArrayRef]) -> datafusion::error::Result<()> {
-        hll_merge_array(&mut self.sketch, states)
+    fn heap_size(&self) -> usize {
+        self.size()
     }
 }
 
 udf_struct!(
-    /// `hll_agg(any) -> Binary`, also spelled `approx_count_distinct`.
-    ///
-    /// Both names are Timescale Toolkit's: there, `approx_count_distinct(x)` builds
-    /// a `hyperloglog` and `distinct_count(sketch)` reads the number out of it. TF
-    /// mirrors that split exactly, so monoscope emits ONE
-    /// `distinct_count(approx_count_distinct(x))` for both backends — the same trick
-    /// `percentile_agg`/`approx_percentile` already play for percentiles. (Getting
-    /// this wrong is easy: Toolkit's `approx_count_distinct` returns a SKETCH, not a
-    /// count, and `approx_count_distinct(x)::float` is a type error there.)
-    ///
-    /// The split is also what makes the rollup work: the aggregate's output IS the
-    /// storable state, so a measure holds it and the scalar reads it back at query
-    /// time.
-    ///
-    /// A hand-written `AggregateUDFImpl` rather than `create_udaf` because the
-    /// argument is deliberately untyped: a distinct count is meaningful over every
-    /// column type, and an `Exact` signature would make `hll_agg(duration)` a
-    /// planning error instead of a cast.
+    /// `hll_agg(any) -> Binary`, also spelled `approx_count_distinct`. Returns a
+    /// SKETCH, not a count — read it with `hll_count`/`distinct_count`, matching
+    /// Timescale Toolkit's split. The signature is deliberately untyped so a
+    /// distinct count over any column type plans as a cast, not an error.
     HllAggUDF,
     Signature::any(1, Volatility::Immutable),
     aliases: vec!["approx_count_distinct".to_string()]
@@ -1531,13 +1383,12 @@ impl datafusion::logical_expr::AggregateUDFImpl for HllAggUDF {
     }
 
     fn accumulator(&self, _acc_args: datafusion::logical_expr::function::AccumulatorArgs) -> datafusion::error::Result<Box<dyn Accumulator>> {
-        Ok(Box::new(HllAccumulator::default()))
+        Ok(Box::new(SketchAccumulator::<crate::read::Hll>::default()))
     }
 }
 
-/// `hll_count(Binary) -> Int64`, also spelled `distinct_count`. Int64 because
-/// that is PG `bigint`, which is what Timescale Toolkit's `distinct_count`
-/// returns.
+/// `hll_count(Binary) -> Int64`, also spelled `distinct_count`. Int64 to match
+/// PG `bigint`.
 fn create_hll_count_udf() -> ScalarUDF {
     create_udf(
         "hll_count",
@@ -1546,10 +1397,8 @@ fn create_hll_count_udf() -> ScalarUDF {
         Volatility::Immutable,
         Arc::new(|args: &[ColumnarValue]| {
             let array = as_array(args.first().ok_or_else(|| DataFusionError::Execution("hll_count requires one argument".to_string()))?)?;
-            let binary =
-                array.as_any().downcast_ref::<BinaryArray>().ok_or_else(|| DataFusionError::Execution("hll_count expects a Binary sketch".to_string()))?;
-            // NULL in, NULL out: a group that never saw the measure has no sketch,
-            // which is not the same claim as "zero distinct values".
+            let binary: &BinaryArray = downcast(&array, "hll_count expects a Binary sketch")?;
+            // NULL in, NULL out: no sketch is not the same claim as zero distinct values.
             let counts: Int64Array = binary
                 .iter()
                 .map(|bytes| {
@@ -1562,18 +1411,11 @@ fn create_hll_count_udf() -> ScalarUDF {
     .with_aliases(["distinct_count"])
 }
 
-/// `hash_bucket(text, n)` — a stable, evenly-spread bucket in `[0, n)`.
-///
-/// The sharded dedup rewrite used `substr(md5(…), 1, 2)` for this. A live CPU
-/// profile on 2026-08-18 put `md5::compress` at **5.71% of all CPU**, larger
-/// than the ZSTD decompression it exists to serve, because each of K passes
-/// hashes every row to keep 1/K of them. Bucketing needs an even, stable spread
-/// — not a cryptographic digest — so this uses the same non-cryptographic mixer
-/// the HLL sketches already hash with.
+/// `hash_bucket(text, n)` — a stable, evenly-spread bucket in `[0, n)`, using the
+/// same non-cryptographic mixer as the HLL sketches.
 ///
 /// NULL hashes as the empty string rather than to NULL: a NULL bucket satisfies
-/// neither `>= lo` nor `< hi`, so such a row would silently fall out of every
-/// shard.
+/// neither `>= lo` nor `< hi`, so such a row would fall out of every shard.
 pub fn hash_bucket_udf() -> ScalarUDF {
     create_udf(
         "hash_bucket",
@@ -1581,9 +1423,7 @@ pub fn hash_bucket_udf() -> ScalarUDF {
         DataType::Int64,
         Volatility::Immutable,
         Arc::new(|args: &[ColumnarValue]| {
-            let [value, buckets] = args else {
-                return Err(DataFusionError::Execution("hash_bucket requires exactly 2 arguments: value and bucket count".to_string()));
-            };
+            let [value, buckets] = args_n::<2>(args, "hash_bucket", ": value and bucket count")?;
             let ColumnarValue::Scalar(count) = buckets else {
                 return Err(DataFusionError::Execution("hash_bucket's bucket count must be a literal".to_string()));
             };
@@ -1610,8 +1450,7 @@ mod hash_bucket_tests {
     use datafusion::prelude::SessionContext;
 
     /// Runs `sql` with `hash_bucket` registered, returning the integer cells of each
-    /// rendered data row (borders and the header carry none, so they drop out) plus
-    /// the raw render, which the NULL check needs as a string.
+    /// rendered data row plus the raw render.
     async fn int_rows(sql: &str) -> (Vec<Vec<i64>>, String) {
         let ctx = SessionContext::new();
         ctx.register_udf(super::hash_bucket_udf());
@@ -1625,10 +1464,8 @@ mod hash_bucket_tests {
         (rows, rendered)
     }
 
-    /// Bucketing is only correct if it PARTITIONS: every row lands in exactly one
-    /// bucket of `[0, n)`, and equal keys always land together — that is what lets
-    /// the dedup rewrite process one shard at a time without splitting a key's
-    /// copies across passes.
+    /// Bucketing must PARTITION: every row lands in exactly one bucket of `[0, n)`,
+    /// and equal keys always land together.
     #[tokio::test]
     async fn hash_bucket_partitions_and_keeps_equal_keys_together() {
         // In range, and the same input always gives the same bucket.
@@ -1642,10 +1479,8 @@ mod hash_bucket_tests {
         assert!(!rendered.contains("NULL"), "NULL must bucket, not propagate: {rendered}");
     }
 
-    /// A row that hashes outside every shard's range is a row the rewrite never
-    /// reads and never rewrites — silent data loss that the conservation checks
-    /// would only catch after the work was done. Spread matters too: a skewed
-    /// bucketing makes one shard carry the memory the split existed to avoid.
+    /// Every key must land inside `[0, n)` and the spread must reach every bucket —
+    /// a row outside every shard's range is a row the sharded rewrite never sees.
     #[tokio::test]
     async fn hash_bucket_spreads_evenly_enough_to_shard_on() {
         // The one data row renders as `| n | distinct | lo | hi |`.
@@ -1676,9 +1511,8 @@ mod hll_tests {
         ScalarValue::try_from_array(column, 0).unwrap().cast_to(&DataType::UInt64).unwrap().to_string().parse().unwrap()
     }
 
-    /// A `series % n` source gives a known distinct count, and 200k rows over
-    /// the default target-partition count guarantees the partial/final split —
-    /// so this also proves the state survives repartitioning.
+    /// 200k rows forces the partial/final split, so this also pins that the sketch
+    /// state survives repartitioning.
     #[tokio::test]
     async fn hll_count_of_hll_agg_matches_the_true_cardinality() {
         for (n, tolerance) in [(1u64, 0.0), (500, 0.0), (5_000, 0.05), (200_000, 0.05)] {
@@ -1689,11 +1523,7 @@ mod hll_tests {
     }
 
     /// The rollup property: sketches built per group and folded afterwards must
-    /// agree with one built over everything at once. Without this a 30-day tile
-    /// cannot be answered from 1-minute buckets. Folding per-bucket sketches is
-    /// the rewrite a rollup substitutes; it must answer the same number as the
-    /// raw fallback it replaces — in both the `hll_*` and the Timescale-toolkit
-    /// spelling of that fallback.
+    /// agree with one built over everything at once, in both spellings.
     #[tokio::test]
     async fn merging_per_bucket_sketches_equals_one_pass_and_the_toolkit_spelling() {
         let rows = "SELECT value % 30000 AS v, value % 7 AS bucket FROM generate_series(1, 300000) t(value)";
@@ -1707,15 +1537,8 @@ mod hll_tests {
     }
 
     /// Distinct counts are asked of every column type, and NULL is not a value.
-    ///
-    /// The `distinct_count(approx_count_distinct(…))` cases are the exact SQL
-    /// monoscope sends to BOTH backends. Verified 2026-08-13 against prod
-    /// Timescale: `distinct_count(approx_count_distinct(v))::float` returns 2
-    /// for (1,2,2,NULL). Toolkit's `approx_count_distinct` builds a SKETCH, not
-    /// a count — `approx_count_distinct(x)::float` is a type error there — so TF
-    /// has to split the same way or the one query text cannot run on both. The
-    /// session query wraps the sketch in `FILTER (WHERE …)`; verified on prod
-    /// Timescale in the same shape, so the one text runs on both.
+    /// The `distinct_count(approx_count_distinct(…))` cases pin Timescale Toolkit
+    /// parity, so one query text runs on both backends.
     #[test_case::test_case("SELECT hll_count(hll_agg(v)) FROM (VALUES (1),(2),(2),(NULL)) t(v)" => 2 ; "ints, and NULL is not a value")]
     #[test_case::test_case("SELECT hll_count(hll_agg(v)) FROM (VALUES (1.5),(2.5),(1.5)) t(v)" => 2 ; "floats")]
     #[test_case::test_case("SELECT hll_count(hll_agg(v)) FROM (VALUES ('a'),('b'),('a')) t(v)" => 2 ; "strings")]
@@ -1762,19 +1585,15 @@ impl ScalarUDFImpl for JsonbPathExistsUDF {
         {
             return Ok(ColumnarValue::Array(fast));
         }
-        // Lax mode (PG default): a data-dependent eval error, or JSON that does not
-        // parse at all, is an empty match — not a query failure.
+        // Lax mode (PG default): an eval error or unparseable JSON is no match, not a failure.
         json_path_eval::<bool, BooleanArray>(&json_array, "jsonb_path_exists", |json| Some(json.is_some_and(|json| json_path.exists(json).unwrap_or(false))))
     }
 }
 
-/// `(json_array, raw_path, compiled_path)` for the two `jsonb_path_*` UDFs: the
-/// path is a scalar because it compiles once per invocation, not once per row.
-/// PG SQL/JSON-path dialect.
+/// `(json_array, raw_path, compiled_path)` for the two `jsonb_path_*` UDFs. The
+/// path must be a scalar: it compiles once per invocation, not once per row.
 fn json_path_args(args: &[ColumnarValue], name: &str) -> datafusion::error::Result<(ArrayRef, String, sql_json_path::JsonPath)> {
-    let [json, path] = args else {
-        return Err(DataFusionError::Execution(format!("{name} requires exactly 2 arguments: json/variant and jsonpath")));
-    };
+    let [json, path] = args_n::<2>(args, name, ": json/variant and jsonpath")?;
     let ColumnarValue::Scalar(scalar) = path else {
         return Err(DataFusionError::Execution("JSONPath must be a scalar string".to_string()));
     };
@@ -1838,61 +1657,32 @@ fn variant_to_serde_json(variant: &parquet_variant::Variant, depth: usize) -> Re
     })
 }
 
-/// Accessor that uniformly reads bytes from either `BinaryArray` or `BinaryViewArray`.
-/// Delta-rs/Parquet may yield either representation depending on
-/// `schema_force_view_types`, so variant decoding handles both transparently.
-enum BinaryAccessor<'a> {
-    Binary(&'a BinaryArray),
-    View(&'a BinaryViewArray),
-}
-
-impl<'a> BinaryAccessor<'a> {
-    fn try_new(col: &'a ArrayRef, field: &str) -> datafusion::error::Result<Self> {
-        (col.as_any().downcast_ref::<BinaryArray>().map(Self::Binary))
-            .or_else(|| col.as_any().downcast_ref::<BinaryViewArray>().map(Self::View))
-            .ok_or_else(|| DataFusionError::Execution(format!("Variant {field} column is not Binary or BinaryView (got {:?})", col.data_type())))
-    }
-
-    fn value(&self, i: usize) -> &[u8] {
-        match self {
-            Self::Binary(a) => a.value(i),
-            Self::View(a) => a.value(i),
-        }
+/// Row accessor reading bytes from either `BinaryArray` or `BinaryViewArray` —
+/// Parquet yields either depending on `schema_force_view_types`.
+fn binary_values<'a>(col: &'a ArrayRef, field: &str) -> datafusion::error::Result<Box<dyn Fn(usize) -> &'a [u8] + 'a>> {
+    if let Some(a) = col.as_any().downcast_ref::<BinaryArray>() {
+        Ok(Box::new(move |i| a.value(i)))
+    } else if let Some(a) = col.as_any().downcast_ref::<BinaryViewArray>() {
+        Ok(Box::new(move |i| a.value(i)))
+    } else {
+        Err(DataFusionError::Execution(format!("Variant {field} column is not Binary or BinaryView (got {:?})", col.data_type())))
     }
 }
 
 /// Fast lane for `jsonb_path_exists` on a Variant (Struct) array: simple
-/// `$.a.b.c[N].d` style paths translate cleanly to a
-/// parquet_variant_compute::VariantPath and we can use the vectorized
-/// `variant_get` kernel, which walks the Variant binary directly without
-/// ever materializing the full JsonValue. Path existence = result is
-/// non-null per row. `None` = not a simple path, take the JsonValue fallback.
+/// `$.a.b.c[N].d` paths use the vectorized `variant_get` kernel, which walks the
+/// Variant binary without materializing a JsonValue. Returns `None` for anything
+/// that is not a simple path, so the caller takes the JsonValue fallback.
 ///
-/// Parity caveat: variant_get resolves like PG *strict* mode — it does NOT
-/// perform PG lax auto-unwrapping (`.a` on an array, `[i]` on a scalar). So
-/// for a filter-free path over an array-shaped-where-object-expected value
-/// this can yield a false negative vs. the PG (lax) engine used by the
-/// fallback. Monoscope's queries are unaffected — they always carry a
-/// `? (...)` filter, which is not a simple path and takes the fallback. A
-/// lax-correct variant-native evaluator is the deferred Phase 3 fix.
-///
-/// The fallback — complex JSONPath (filters, recursive descent, etc.) — walks
-/// the Variant binary into a JsonValue and runs the PG jsonpath engine.
-/// Deferred optimization: evaluate the filter against the Variant binary
-/// directly (no per-row JsonValue). The clean route — impl sql_json_path's
-/// JsonRef over parquet_variant::Variant so the SAME engine (hence identical
-/// PG semantics) walks the binary — is blocked because Variant/VariantList/
-/// VariantObject are Clone, not the Copy that JsonRef requires. It also buys
-/// little for the dominant `$[*] ? (@ == x)` shape: the `[*]` prefix needs
-/// the whole (small) column anyway, so only a JsonValue alloc is saved.
-/// Revisit if a profile shows this materialization is a real hot spot.
+/// Parity caveat: `variant_get` resolves like PG *strict* mode — no lax
+/// auto-unwrapping (`.a` on an array, `[i]` on a scalar) — so a filter-free path
+/// over an array-shaped value can be a false negative versus the lax fallback.
 fn variant_get_exists(array: &ArrayRef, raw_path: &str) -> datafusion::error::Result<Option<ArrayRef>> {
     use parquet_variant_compute::{GetOptions, variant_get};
     let Some(variant_path) = simple_path_to_variant_path(raw_path) else { return Ok(None) };
     let extracted = variant_get(array, GetOptions::new_with_path(variant_path)).map_err(|e| DataFusionError::Execution(format!("variant_get failed: {e}")))?;
-    // A NULL input row → NULL (SQL semantics, matches the fallback path and PG);
-    // a present row → path exists ↔ extracted is non-null. `extracted.is_null(i)`
-    // alone can't tell the two apart, so gate on the input's null buffer.
+    // `extracted.is_null(i)` cannot distinguish a NULL input row from a missing path,
+    // so gate on the input's null buffer: NULL in → NULL out.
     let out: BooleanArray = (0..extracted.len()).map(|i| (!array.is_null(i)).then(|| !extracted.is_null(i))).collect();
     Ok(Some(Arc::new(out)))
 }
@@ -1903,12 +1693,12 @@ fn map_variant_rows<T, A: FromIterator<Option<T>>>(array: &ArrayRef, f: impl Fn(
     use datafusion::arrow::array::StructArray;
     let struct_array = array.as_any().downcast_ref::<StructArray>().ok_or_else(|| DataFusionError::Execution("Expected Variant struct array".to_string()))?;
     let missing = |name: &str| DataFusionError::Execution(format!("Variant missing {name} column"));
-    let metadata_binary = BinaryAccessor::try_new(struct_array.column_by_name("metadata").ok_or_else(|| missing("metadata"))?, "metadata")?;
-    let value_binary = BinaryAccessor::try_new(struct_array.column_by_name("value").ok_or_else(|| missing("value"))?, "value")?;
+    let metadata_binary = binary_values(struct_array.column_by_name("metadata").ok_or_else(|| missing("metadata"))?, "metadata")?;
+    let value_binary = binary_values(struct_array.column_by_name("value").ok_or_else(|| missing("value"))?, "value")?;
     (0..struct_array.len())
         .map(|i| {
             (!struct_array.is_null(i))
-                .then(|| variant_to_serde_json(&parquet_variant::Variant::new(metadata_binary.value(i), value_binary.value(i)), 0).map(|json| f(&json)))
+                .then(|| variant_to_serde_json(&parquet_variant::Variant::new(metadata_binary(i), value_binary(i)), 0).map(|json| f(&json)))
                 .transpose()
                 .map(Option::flatten)
         })
@@ -1951,12 +1741,6 @@ fn simple_path_to_variant_path(raw: &str) -> Option<parquet_variant::VariantPath
 // ============================================================================
 // jsonb_path_query_first: the matched VALUE, where jsonb_path_exists returns
 // only whether one existed.
-//
-// Monoscope's KQL compiler emits this for every `attributes.exception.*` field
-// (`transformFlattenedAttribute`), because OTel SDKs may carry an exception as a
-// span *event* rather than a flattened attribute, so the compiler COALESCEs both
-// sources. Without this function every such query — log explorer, monitors, the
-// RUM dashboard widgets — failed to plan with "Invalid function".
 // ============================================================================
 
 udf_struct!(JsonbPathQueryFirstUDF, Signature::any(2, Volatility::Immutable));
@@ -1968,20 +1752,17 @@ impl ScalarUDFImpl for JsonbPathQueryFirstUDF {
         Ok(DataType::Utf8View)
     }
 
-    // Tagged jsonb, like the other jsonb-returning UDFs: PG returns jsonb here, and the
-    // tag is what makes `#>> '{}'` on the result mean "unwrap this document to text".
+    // Tagged jsonb: the tag is what makes `#>> '{}'` on the result unwrap the document to text.
     fn return_field_from_args(&self, _: datafusion::logical_expr::ReturnFieldArgs) -> datafusion::error::Result<FieldRef> {
         Ok(jsonb_tagged_field())
     }
 
-    /// First match as JSON text, or NULL. Unlike `jsonb_path_exists` there is no
-    /// `variant_get` fast lane: monoscope's paths all carry a `? (...)` filter, which
-    /// is not a simple path, so that lane could never engage for the queries this
-    /// exists to serve — and writing one would duplicate the strict/lax hazard
+    /// First match as JSON text, or NULL. No `variant_get` fast lane here: filtered
+    /// paths are never simple paths, and it would repeat the strict/lax hazard
     /// documented on `variant_get_exists`.
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> datafusion::error::Result<ColumnarValue> {
         let (json_array, _, json_path) = json_path_args(&args.args, "jsonb_path_query_first")?;
-        // Lax mode (PG default): a data-dependent eval error is no match, not a query failure.
+        // Lax mode (PG default): an eval error is no match, not a query failure.
         json_path_eval::<String, StringViewArray>(&json_array, "jsonb_path_query_first", |json| {
             json.and_then(|json| json_path.query_first(json).ok().flatten()).map(|found| found.to_string())
         })
@@ -2007,10 +1788,8 @@ mod tests {
     /// The timestamp every `to_char` parity case is captured against.
     const TS: &str = "TIMESTAMP '2026-06-10 08:10:52.422355'";
 
-    /// `::` binds tighter than `->>`, so monoscope emits a cast on the PATH.
-    /// Both spellings address the same field and must plan to the same
-    /// `variant_get`; before the cast was unwrapped the second one did not
-    /// plan at all against a Variant column.
+    /// `::` binds tighter than `->>`, so a cast can land on the PATH literal. Both
+    /// spellings must address the same field.
     #[test_case::test_case(false ; "bare path literal")]
     #[test_case::test_case(true ; "cast path literal, the shape monoscope emits")]
     fn an_arrow_path_literal_addresses_the_same_field_through_a_cast(cast: bool) {
@@ -2023,10 +1802,8 @@ mod tests {
         );
     }
 
-    /// A field name is ONE key, whatever characters it holds. Dot notation
-    /// cannot say that — `http.method` would address a nested path — so the
-    /// encoder brackets and escapes, and `VariantPath` must read back exactly
-    /// the name that went in.
+    /// A field name is ONE key whatever characters it holds — dot notation cannot
+    /// say that, so the encoder brackets and escapes and must round-trip exactly.
     #[test_case::test_case("plain")]
     #[test_case::test_case("http.request.method" ; "dots are part of the OTel key")]
     #[test_case::test_case("a[0]" ; "brackets")]
@@ -2106,13 +1883,12 @@ mod tests {
     #[test_case::test_case("YYYY-MM-DD" => chrono_only("%Y-%m-%d") ; "date")]
     #[test_case::test_case("YYYY-MM-DD HH24:MI:SS" => chrono_only("%Y-%m-%d %H:%M:%S") ; "date and 24h time")]
     #[test_case::test_case("Day, DD Mon YYYY" => chrono_only("%A, %d %b %Y") ; "names")]
-    // Postgres-style "..." literal escapes: ISO-8601 with T separator and Z suffix.
     #[test_case::test_case(r#"YYYY-MM-DD"T"HH24:MI:SS.US"Z""# => chrono_only("%Y-%m-%dT%H:%M:%S.%6fZ") ; "iso 8601 literal escapes")]
     #[test_case::test_case(r#""YYYY=" YYYY"# => chrono_only("YYYY= %Y") ; "tokens inside a literal stay literal")]
     #[test_case::test_case(r#""a""b""# => chrono_only("a\"b") ; "doubled quote inside a literal is an escaped quote")]
     #[test_case::test_case("100%" => chrono_only("100%%") ; "a bare percent is escaped to chrono literal-percent")]
     #[test_case::test_case(r#"YYYY "tail"# => chrono_only("%Y tail") ; "unterminated literal copies the remainder verbatim")]
-    // D / DY split the buffer (no chrono equivalent).
+    // D / DY have no chrono equivalent, so they split the buffer.
     #[test_case::test_case("D" => vec![FmtPart::PgD] ; "pg D alone")]
     #[test_case::test_case("DY" => vec![FmtPart::PgDY] ; "pg DY alone")]
     #[test_case::test_case("YYYY-D" => vec![FmtPart::Chrono("%Y-".to_string()), FmtPart::PgD] ; "pg D splits the chrono buffer")]
@@ -2121,11 +1897,9 @@ mod tests {
         parse_pg_format(fmt)
     }
 
-    /// End-to-end UDF parity with Postgres/TimescaleDB `to_char`. Expected outputs
-    /// captured from real Postgres 16 with `SELECT to_char(TIMESTAMP '2026-06-10 08:10:52.422355', fmt)`.
+    /// End-to-end `to_char` parity; expected outputs captured from Postgres 16.
     #[test_case::test_case(TS, "YYYY-MM-DD" => "2026-06-10" ; "date")]
     #[test_case::test_case(TS, "YYYY-MM-DD HH24:MI:SS" => "2026-06-10 08:10:52" ; "date and 24h time")]
-    // Monoscope's ISO-8601 target — the bug this fix addresses.
     #[test_case::test_case(TS, r#"YYYY-MM-DD"T"HH24:MI:SS.US"Z""# => "2026-06-10T08:10:52.422355Z" ; "monoscope iso 8601 micros")]
     #[test_case::test_case(TS, r#"YYYY-MM-DD"T"HH24:MI:SS.MS"Z""# => "2026-06-10T08:10:52.422Z" ; "iso 8601 millis")]
     #[test_case::test_case(TS, "DD/MM/YYYY" => "10/06/2026" ; "day first")]
@@ -2133,22 +1907,16 @@ mod tests {
     #[test_case::test_case(TS, "Day, Mon DD YYYY" => "Wednesday, Jun 10 2026" ; "long day name")]
     #[test_case::test_case(TS, "HH12:MI" => "08:10" ; "12h time")]
     #[test_case::test_case(TS, "YY" => "26" ; "two digit year")]
-    // Literal containing characters that look like tokens.
     #[test_case::test_case(TS, r#""YYYY=" YYYY"# => "YYYY= 2026" ; "literal that looks like a token")]
-    // Non-ASCII bytes inside a literal must survive intact (UTF-8 boundary walk).
     #[test_case::test_case(TS, r#""· "YYYY"# => "· 2026" ; "non ascii literal survives the utf8 boundary walk")]
-    // AM/PM, Dy, bare HH round-out token coverage.
     #[test_case::test_case(TS, "HH12:MI AM" => "08:10 AM" ; "am token")]
     #[test_case::test_case(TS, "HH:MI:SS" => "08:10:52" ; "bare HH aliases HH12, 12 hour clock with leading zero")]
     #[test_case::test_case(TS, "HH12:MI am" => "08:10 am" ; "lowercase am token emits lowercase output")]
     #[test_case::test_case(TS, "Dy" => "Wed" ; "abbreviated day name")]
-    // Postgres-specific tokens with no exact chrono equivalent.
     // 2026-06-10 is a Wednesday: Postgres D=4 (Sun=1), DY="WED".
     #[test_case::test_case(TS, "D" => "4" ; "pg D is 1 based from sunday")]
     #[test_case::test_case(TS, "DY" => "WED" ; "pg DY is upper case")]
-    // Order-of-parsing check: DY must beat bare D.
     #[test_case::test_case(TS, "DY-D" => "WED-4" ; "DY must beat bare D")]
-    // A PM timestamp, to actually exercise the PM output of %p.
     #[test_case::test_case("TIMESTAMP '2026-06-10 20:10:52'", "HH12:MI PM" => "08:10 PM" ; "pm token on an afternoon timestamp")]
     #[tokio::test]
     async fn test_to_char_postgres_parity(ts: &str, fmt: &str) -> String {
@@ -2156,26 +1924,21 @@ mod tests {
     }
 
     /// PG parity: `to_jsonb(text[])` produces an array of JSON *strings*. Elements
-    /// that happen to look like JSON (log bodies, attributes payloads in monoscope's
-    /// `summary` column) must NOT be re-parsed into objects/arrays — that broke the
-    /// log explorer's row renderer ("e.indexOf is not a function").
+    /// that happen to look like JSON must NOT be re-parsed into objects/arrays.
     #[tokio::test]
     async fn test_to_jsonb_text_array_elements_stay_strings() {
         let array = text(r#"SELECT to_jsonb(make_array('{"a":1}', '[1,2]', 'plain', '123')) AS s"#).await;
         assert_eq!(array, r#"["{\"a\":1}","[1,2]","plain","123"]"#);
-        // Independent of serialisation format: every element must be a JSON *string*.
         let parsed: serde_json::Value = serde_json::from_str(&array).unwrap();
         assert!(parsed.as_array().unwrap().iter().all(serde_json::Value::is_string), "elements must stay strings: {parsed}");
-        // Top-level Utf8 scalars keep the JSON sniff: Variant/Utf8 columns holding
-        // JSON (attributes, events, links) rely on it to surface as real JSON.
+        // Top-level Utf8 scalars keep the JSON sniff, so JSON-bearing columns surface as JSON.
         assert_eq!(text(r#"SELECT to_jsonb('{"a":1}') AS s"#).await, r#"{"a":1}"#);
-        // to_json shares array_to_json_values, so the same rule applies — monoscope's
-        // selectChildSpansAndLogs emits to_json(summary).
+        // to_json shares array_to_json_values, so the same rule applies.
         assert_eq!(text(r#"SELECT to_json(make_array('{"a":1}')) AS s"#).await, r#"["{\"a\":1}"]"#);
     }
 
-    /// LargeList and FixedSizeList must keep list structure (they used to fall
-    /// through to the cast-to-string arm) and follow the same no-sniff rule.
+    /// LargeList and FixedSizeList must keep list structure and follow the same
+    /// no-sniff rule.
     #[test]
     fn test_large_and_fixed_size_list_to_json_values() {
         use datafusion::arrow::array::{FixedSizeListBuilder, GenericListBuilder, StringViewBuilder};
@@ -2195,10 +1958,8 @@ mod tests {
         assert_eq!(array_to_json_values(&arr).unwrap(), expected);
     }
 
-    /// Regression guard: json_build_array used to call array_to_json_values
-    /// per row per arg — O(rows² × args). At one 8192-row batch that's ~10s;
-    /// linear is <100ms. Also pins mixed scalar+array broadcast (a scalar
-    /// first arg used to clamp num_rows to 1).
+    /// `json_build_array` must stay linear in rows (not O(rows² × args)) and must
+    /// broadcast a scalar arg without clamping the output to one row.
     #[test]
     fn test_json_build_array_linear_and_broadcast() {
         use datafusion::{
@@ -2269,14 +2030,8 @@ mod tests {
         }
     }
 
-    /// `row_to_json` is PG's `to_json` over a record. Struct support also fixes
-    /// `to_json`/`to_jsonb` of a struct column, which previously failed with
-    /// "Cast error: Casting from Struct(...) to Utf8View not supported".
-    ///
-    /// Keys come out SORTED, matching PG's `jsonb`, not `json` (which preserves
-    /// column order). Both share this code path, and serde_json's Map is a
-    /// BTreeMap unless the crate-wide `preserve_order` feature is on — not worth
-    /// flipping globally for key order no caller depends on.
+    /// `row_to_json` is PG's `to_json` over a record. Keys come out SORTED (PG
+    /// `jsonb` order, not `json` column order) because serde_json's Map is a BTreeMap.
     #[test_case::test_case("SELECT row_to_json(named_struct('total', 1, 'active', 2)) AS d" => r#"{"active":2,"total":1}"# ; "row_to_json of a struct")]
     #[test_case::test_case("SELECT to_json(named_struct('total', 1, 'active', 2)) AS d" => r#"{"active":2,"total":1}"# ; "to_json of a struct column")]
     #[tokio::test]
@@ -2284,11 +2039,9 @@ mod tests {
         text(sql).await
     }
 
-    /// Documented limitation. PG lets `row_to_json(t)` name a whole row; DataFusion
-    /// rejects the bare relation alias during SQL PLANNING ("No field named t"),
-    /// before any analyzer rule can rewrite it — so pgAdmin's dashboard charts
-    /// still fail. Fixing it needs an AST-level rewrite that reads the derived
-    /// table's column aliases; the struct form above is what works today.
+    /// Documented limitation: PG lets `row_to_json(t)` name a whole row, but
+    /// DataFusion rejects the bare relation alias during SQL planning, before any
+    /// analyzer rule could rewrite it. Use the struct form above.
     #[tokio::test]
     async fn bare_relation_alias_is_still_unsupported() {
         use datafusion::prelude::SessionContext;

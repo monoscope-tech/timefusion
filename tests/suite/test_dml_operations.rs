@@ -16,26 +16,19 @@ mod tests {
         support::test_helpers::{array_get_str as get_str, json_to_batch, json_to_batch_for, minio_test_config, test_layer},
     };
 
-    // Delta-Only DML Tests (no buffered layer - operations go directly to Delta)
-    // These tests verify that UPDATE/DELETE work correctly on Delta Lake tables.
-
     const OTEL: &str = "otel_logs_and_spans";
-    /// `mor_dormant` is the in-place-DML fixture: `otel_logs_and_spans` flipped
-    /// `version_append` on 2026-08-02, so it no longer takes the delta-rs MERGE
-    /// path those tests are about. See `schemas/mor_dormant.yaml`.
+    /// In-place-DML fixture: `otel_logs_and_spans` uses `version_append`, so it
+    /// does not take the delta-rs MERGE path these tests exercise.
     const INPLACE_TABLE: &str = "mor_dormant";
 
     /// (id, name, level, duration) — the three rows every UPDATE case starts from.
     const BASE_RECORDS: &[(&str, &str, &str, i64)] = &[("1", "Alice", "INFO", 100), ("2", "Bob", "ERROR", 200), ("3", "Charlie", "INFO", 300)];
 
-    fn create_test_config(test_id: &str) -> Arc<AppConfig> {
-        minio_test_config(test_id, &format!("/tmp/timefusion-dml-{test_id}"))
-    }
-
-    /// Logging + a uniquely-prefixed config, the opening of every test here.
+    /// Logging + a uniquely-prefixed config.
     fn test_cfg() -> Arc<AppConfig> {
         timefusion::support::init_test_logging();
-        create_test_config(&uuid::Uuid::new_v4().to_string()[..8])
+        let test_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
+        minio_test_config(&test_id, &format!("/tmp/timefusion-dml-{test_id}"))
     }
 
     fn records(specs: &[(&str, &str, &str, i64)], now: chrono::DateTime<chrono::Utc>) -> Vec<serde_json::Value> {
@@ -77,8 +70,7 @@ mod tests {
         Ok((db, ctx))
     }
 
-    /// Rows affected by a DML statement — also holds the shape asserts every
-    /// caller used to repeat (exactly one batch, exactly one row).
+    /// Rows affected by a DML statement; asserts the single-batch, single-row shape.
     fn affected(result: &[RecordBatch]) -> u64 {
         assert_eq!(result.len(), 1, "DML returns a single batch");
         assert_eq!(result[0].num_rows(), 1, "DML returns a single count row");
@@ -98,31 +90,14 @@ mod tests {
         Ok(results[0].column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0))
     }
 
-    /// Helper: select `duration` for `name` in `test_project`.
-    async fn duration_by_name_in(ctx: &SessionContext, table: &str, name: &str) -> Result<i64> {
-        let q = format!(
-            "SELECT COALESCE(array_element(hashes, 1), CAST(duration AS VARCHAR))::BIGINT AS duration FROM {table} WHERE project_id = 'test_project' AND name = '{}'",
-            name
-        );
-        let df = ctx.sql(&q).await?;
-        let results = df.collect().await?;
-        assert!(!results.is_empty() && results[0].num_rows() == 1, "duration_by_name: expected 1 row for {}", name);
-        Ok(results[0].column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0))
-    }
-
-    async fn duration_by_name(ctx: &SessionContext, name: &str) -> Result<i64> {
-        duration_by_name_in(ctx, OTEL, name).await
-    }
-
-    /// `(duration, level)` of one row, projected through `hashes`: only `hashes`
-    /// is a mutable column on `otel_logs_and_spans`, so an UPDATE's effect is
-    /// read back as `hashes[1]` (duration) and `hashes[2]` (level), falling back
-    /// to the stored column when the array is shorter.
-    async fn row_by_name(ctx: &SessionContext, name: &str) -> Result<(i64, String)> {
+    /// `(duration, level)` of one row. Only `hashes` is mutable on
+    /// `otel_logs_and_spans`, so an UPDATE's effect is read back as `hashes[1]`
+    /// (duration) / `hashes[2]` (level), falling back to the stored column.
+    async fn row_by_name(ctx: &SessionContext, table: &str, name: &str) -> Result<(i64, String)> {
         let q = format!(
             "SELECT COALESCE(array_element(hashes, 1), CAST(duration AS VARCHAR))::BIGINT AS duration, \
                     COALESCE(array_element(hashes, 2), level) AS level \
-             FROM {OTEL} WHERE project_id = 'test_project' AND name = '{name}'"
+             FROM {table} WHERE project_id = 'test_project' AND name = '{name}'"
         );
         let results = ctx.sql(&q).await?.collect().await?;
         assert!(!results.is_empty() && results[0].num_rows() == 1, "row_by_name: expected 1 row for {name}");
@@ -131,24 +106,27 @@ mod tests {
         Ok((duration, col_str(b, "level", 0)))
     }
 
+    /// The `duration` half of [`row_by_name`].
+    async fn duration_by_name_in(ctx: &SessionContext, table: &str, name: &str) -> Result<i64> {
+        Ok(row_by_name(ctx, table, name).await?.0)
+    }
+
+    async fn duration_by_name(ctx: &SessionContext, name: &str) -> Result<i64> {
+        duration_by_name_in(ctx, OTEL, name).await
+    }
+
     /// Runs one UPDATE over `BASE_RECORDS` and renders rows-affected plus the
-    /// post-state of ALL three rows, so each case line asserts both the count
-    /// and that untouched rows stayed untouched.
+    /// post-state of all three rows, so each case asserts the count and that
+    /// untouched rows stayed untouched.
     #[test_case(
         "UPDATE otel_logs_and_spans SET hashes = make_array('500') WHERE project_id = 'test_project' AND name = 'Bob'"
         => "rows=1 Alice=100/INFO Bob=500/ERROR Charlie=300/INFO" ; "test_update_query: single-column UPDATE touches only Bob")]
     #[test_case(
         "UPDATE otel_logs_and_spans SET hashes = make_array('999', 'WARN') WHERE project_id = 'test_project' AND name = 'Alice'"
         => "rows=1 Alice=999/WARN Bob=200/ERROR Charlie=300/INFO" ; "test_update_multiple_columns: multi-value SET on Alice")]
-    // Regression: DataFusion's CommonSubexprEliminate optimizer wraps the UPDATE
-    // assignment Projection in an inner Projection that defines synthetic
-    // `__common_expr_*` columns. extract_dml_info used to overwrite the real
-    // assignments with that inner Projection's contents, so mem_buffer failed
-    // with "Column '__common_expr_1' not found".
-    // `duration + 100` appears TWICE in SET — the CSE-eligible subexpr the
-    // optimizer hoists into a `__common_expr_*` alias. It used to span two
-    // assignments; only `hashes` is declared mutable now, so both uses live in
-    // one array — the plan shape under test is unchanged. Bob: 200 + 100 = 300.
+    // `duration + 100` appears twice in SET, so CommonSubexprEliminate hoists it
+    // into a synthetic `__common_expr_*` column; extract_dml_info must keep the
+    // real assignments. Bob: 200 + 100 = 300.
     #[test_case(
         "UPDATE otel_logs_and_spans \
          SET hashes = make_array(CAST(duration + 100 AS VARCHAR), CAST(duration + 100 AS VARCHAR)) \
@@ -170,8 +148,7 @@ mod tests {
            WHERE project_id = 'test_project'
              AND otel_logs_and_spans.name = u.name"
         => "rows=0 Alice=100/INFO Bob=200/ERROR Charlie=300/INFO" ; "test_update_from_no_match_no_change")]
-    // Extra `WHERE` predicate AND-ed with the join keys must narrow the update:
-    // source matches Bob and Alice, predicate further constrains to Bob only.
+    // An extra `WHERE` predicate AND-ed with the join keys must narrow the update.
     #[test_case(
         "UPDATE otel_logs_and_spans
            SET hashes = make_array(CAST(u.d AS VARCHAR))
@@ -180,8 +157,7 @@ mod tests {
              AND otel_logs_and_spans.name = u.name
              AND otel_logs_and_spans.name = 'Bob'"
         => "rows=1 Alice=100/INFO Bob=777/ERROR Charlie=300/INFO" ; "test_update_from_with_predicate")]
-    // Multi-column SET in a single `UPDATE ... FROM` — mirrors the monoscope
-    // pattern of assigning several fields from a joined source row.
+    // Multi-column SET in a single `UPDATE ... FROM`.
     #[test_case(
         "UPDATE otel_logs_and_spans
            SET hashes = make_array(CAST(u.d AS VARCHAR), u.lvl)
@@ -196,23 +172,16 @@ mod tests {
         let n = exec_dml(&ctx, sql).await.unwrap();
         let mut out = format!("rows={n}");
         for name in ["Alice", "Bob", "Charlie"] {
-            let (duration, level) = row_by_name(&ctx, name).await.unwrap();
+            let (duration, level) = row_by_name(&ctx, OTEL, name).await.unwrap();
             out.push_str(&format!(" {name}={duration}/{level}"));
         }
         out
     }
 
-    /// Runs the same `UPDATE ... FROM` statement TWICE and reports the rows
-    /// affected by each pass — the shape that separates "re-runs are cheap"
-    /// from "every enrichment pass re-appends versions for every matched row".
-    /// `{lo}`/`{hi}` in the template are substituted with now ± 1h.
-    // Structural mirror of monoscope's UPDATE-2 SQL: parallel unnested text
-    // arrays as the source rowset, table aliases (`o`, `u`), array-append into
-    // a list column. If DataFusion's planner or our rewriters fall over on this
-    // shape (unnest inside FROM subquery, user aliases on both sides,
-    // list-typed assignment target) this catches it pre-prod. Join is on `name`
-    // here (single key); monoscope uses two: span_id + trace_id — structurally
-    // identical. With no guard predicate, a second pass re-tags both rows.
+    /// Runs the same `UPDATE ... FROM` statement twice and reports the rows
+    /// affected by each pass. `{lo}`/`{hi}` are substituted with now ± 1h.
+    // Unnest-in-FROM source with aliases on both sides, appending into a list
+    // column. With no guard predicate, a second pass re-tags both rows.
     #[test_case(
         "UPDATE otel_logs_and_spans o
             SET hashes = COALESCE(o.hashes, '{}'::text[]) || ARRAY[u.tag]
@@ -223,13 +192,7 @@ mod tests {
             WHERE o.project_id = 'test_project'
               AND o.name = u.span_name"
         => (2, 2) ; "test_update_from_unnest_text_array")]
-    // Idempotency aspect of the monoscope UPDATE-2 shape: re-running the same
-    // statement with the `NOT @>` predicate must touch zero rows.
-    // Historical note: `MergeBuilder` returns the rows that the join matched
-    // even when the SET expression produces an unchanged value after the WHEN
-    // MATCHED predicate trims them. Untangling needs deeper investigation of
-    // MergeBuilder's accounting of WHEN MATCHED with non-trivial predicate
-    // filtering. Monoscope's re-extraction safety on TF relies on this.
+    // Re-running the same statement with the `NOT @>` guard must touch zero rows.
     #[test_case(
         "UPDATE otel_logs_and_spans o
             SET hashes = COALESCE(o.hashes, '{}'::text[]) || ARRAY[u.tag]
@@ -241,15 +204,10 @@ mod tests {
               AND o.name = u.span_name
               AND NOT (COALESCE(o.hashes, '{}'::text[]) @> ARRAY[u.tag])"
         => (2, 0) ; "test_update_from_unnest_text_array_idempotent")]
-    // Regression for the prod 2026-08-03 write-amplification bug: the
-    // cross-side guard lives in `join.filter`, and the optimizer pushes the
-    // target-side conjuncts (project_id + TIMESTAMP BOUNDS) into a `Filter`
-    // BELOW the join — `extract_dml_info` used to let that deeper Filter
-    // OVERWRITE the accumulated predicate, silently dropping the guard, so
-    // every enrichment pass re-appended versions for every matched row. The
-    // timestamp bound is what distinguishes this from the idempotency case
-    // above: it is the conjunct that did the clobbering in prod. Also
-    // exercises the join-key IN-list pushdown on its engaged (< cap) path.
+    // The cross-side guard lives in `join.filter` while the optimizer pushes the
+    // target-side conjuncts (project_id + timestamp bounds) into a `Filter` below
+    // the join; `extract_dml_info` must accumulate rather than overwrite, or the
+    // guard is dropped and every pass re-appends versions for every matched row.
     #[test_case(
         "UPDATE otel_logs_and_spans o
            SET hashes = COALESCE(o.hashes, '{}'::text[]) || ARRAY[u.tag]
@@ -299,10 +257,8 @@ mod tests {
         format!("deleted={deleted} remaining={}", remaining.join(","))
     }
 
-    /// A source larger than one join-key IN-list bound (4096 rows) is split
-    /// into bounded scans and still updates exactly the matching rows. This is
-    /// the production whale-enrichment shape: falling back to one plain join
-    /// made a tiny update decode and globally deduplicate its whole time range.
+    /// A source larger than the join-key IN-list bound (4096 rows) is split into
+    /// bounded scans and still updates exactly the matching rows.
     #[serial]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_update_from_source_beyond_key_pushdown_cap() -> Result<()> {
@@ -324,14 +280,10 @@ mod tests {
         Ok(())
     }
 
-    /// Regression: main.rs creates the pgwire SessionContext (and its
-    /// DmlQueryPlanner) BEFORE attaching the BufferedWriteLayer (the WAL-replay
-    /// registry needs the context first). The planner used to capture a
-    /// pre-layer clone of Database, so every pgwire UPDATE/DELETE silently
-    /// skipped the mem-buffer leg: updates to rows still in the buffer matched
-    /// zero rows and were lost when the row later flushed with pre-update
-    /// values. The layer must be late-binding — visible to sessions created
-    /// before it was attached.
+    /// main.rs creates the pgwire SessionContext (and its DmlQueryPlanner) BEFORE
+    /// attaching the BufferedWriteLayer, so the layer must be late-binding:
+    /// visible to sessions created before it was attached, or the mem-buffer leg
+    /// of every UPDATE/DELETE is silently skipped.
     #[serial]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_update_mem_leg_survives_late_layer_attach() -> Result<()> {
@@ -357,21 +309,15 @@ mod tests {
         Ok(())
     }
 
-    /// Regression: the UPDATE's Delta leg must not hold the table's write lock
-    /// across the multi-second merge (update_state → scan → parquet rewrite →
-    /// commit). It used to, which convoyed every reader (SELECT needs the read
-    /// lock) and every insert (commit swap needs the write lock) behind each
-    /// UPDATE — the mechanical cause of prod flush starvation at ~2k UPDATEs/h.
-    /// A SELECT and an insert issued mid-UPDATE must complete while the UPDATE
-    /// is still running.
+    /// The UPDATE's Delta leg must not hold the table's write lock across the
+    /// multi-second merge, or every reader and every insert convoys behind it.
+    /// A SELECT and an insert issued mid-UPDATE must complete while it runs.
     #[serial]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_update_from_does_not_block_readers_or_writers() -> Result<()> {
         let mut cfg = (*test_cfg()).clone();
-        // This test observes concurrency during a SLOW merge. Force copy-on-write:
-        // the merge-on-read DV path finishes in milliseconds (it appends the matched
-        // rows + tiny DVs instead of rewriting whole files), leaving no window to
-        // observe reader/writer overlap. Lock behavior is orthogonal to the DV path.
+        // Force copy-on-write: the DV path finishes in milliseconds, leaving no
+        // window in which to observe reader/writer overlap.
         cfg.maintenance.timefusion_use_deletion_vectors = false;
         let (db, ctx) = db_with(Arc::new(cfg)).await?;
 
@@ -381,27 +327,15 @@ mod tests {
         let now = chrono::Utc::now();
         const FILES: usize = 24;
         const ROWS_PER_FILE: usize = 400;
-        // How many rows per file the merge below rewrites. `mor_dormant` is a
-        // much narrower schema than the otel table this used to run against (a
-        // handful of columns vs ~91), so a merge touching one row per file
-        // finishes before the concurrent reader does and the overlap can't be
-        // observed. Growing the TABLE does not fix that — it slows the reader
-        // just as much — so the merge is given more work at a fixed table size.
+        // Rows per file the merge rewrites. Enough work that the merge outlasts
+        // the concurrent reader; growing the table instead would slow the reader
+        // just as much.
         const MATCHED_PER_FILE: usize = 200;
         for f in 0..FILES {
-            let recs: Vec<serde_json::Value> = (0..ROWS_PER_FILE)
-                .map(|r| {
-                    serde_json::json!({
-                        "id": format!("f{f}_r{r}"),
-                        "name": if r == 0 { format!("T{f}") } else { format!("f{f}_r{r}") },
-                        "project_id": "test_project",
-                        "timestamp": now.timestamp_micros(),
-                        "level": "INFO", "status_code": "OK", "duration": 100,
-                        "date": now.date_naive().to_string(), "hashes": [], "summary": []
-                    })
-                })
-                .collect();
-            let batch = json_to_batch_for(INPLACE_TABLE, recs)?;
+            let names: Vec<(String, String)> =
+                (0..ROWS_PER_FILE).map(|r| (format!("f{f}_r{r}"), if r == 0 { format!("T{f}") } else { format!("f{f}_r{r}") })).collect();
+            let specs: Vec<(&str, &str, &str, i64)> = names.iter().map(|(id, name)| (id.as_str(), name.as_str(), "INFO", 100)).collect();
+            let batch = json_to_batch_for(INPLACE_TABLE, records(&specs, now))?;
             db.insert_records_batch("test_project", INPLACE_TABLE, vec![batch], true, None).await?;
         }
 
@@ -427,21 +361,13 @@ mod tests {
         assert!(!update_handle.is_finished(), "SELECT should complete while the UPDATE is still merging — reader was convoyed behind the DML write lock");
 
         // Writer mid-UPDATE (direct Delta insert commits + swaps the handle).
-        let extra = json_to_batch_for(
-            INPLACE_TABLE,
-            vec![serde_json::json!({
-                "id": "extra", "name": "Extra", "project_id": "test_project",
-                "timestamp": now.timestamp_micros(), "level": "INFO", "status_code": "OK",
-                "duration": 1, "date": now.date_naive().to_string(), "hashes": [], "summary": []
-            })],
-        )?;
+        let extra = json_to_batch_for(INPLACE_TABLE, records(&[("extra", "Extra", "INFO", 1)], now))?;
         db.insert_records_batch("test_project", INPLACE_TABLE, vec![extra], true, None).await?;
         assert!(!update_handle.is_finished(), "insert should complete while the UPDATE is still merging — writer was convoyed behind the DML write lock");
 
         assert_eq!(affected(&update_handle.await??) as usize, FILES * MATCHED_PER_FILE);
 
-        // The mid-UPDATE insert must not just be un-blocked — its row must
-        // survive the UPDATE's snapshot swap.
+        // The mid-UPDATE insert's row must survive the UPDATE's snapshot swap.
         assert_eq!(count_rows(&ctx, INPLACE_TABLE).await? as usize, FILES * ROWS_PER_FILE + 1, "concurrent insert's row lost across the DML swap");
         Ok(())
     }
@@ -500,12 +426,9 @@ mod tests {
         Ok(())
     }
 
-    /// Decisive check for the prod 2026-07-09 MERGE cardinality failures: a SINGLE
-    /// `UPDATE ... FROM` whose source carries TWO rows for one join key (the
-    /// monoscope enrichment shape — a span with multiple hash tags unnests to
-    /// repeated (span_id, trace_id)). If the coalescer's `split_rounds` handles it,
-    /// the rows apply across rounds (last wins) and nothing is dropped; if not, the
-    /// MERGE aborts with the cardinality error and the update is lost.
+    /// A single `UPDATE ... FROM` whose source carries two rows for one join key:
+    /// `split_rounds` must apply them across rounds (last wins) rather than let
+    /// the MERGE abort with a cardinality error and drop the update.
     #[serial]
     #[tokio::test(flavor = "multi_thread")]
     async fn coalescer_splits_duplicate_source_keys_single_statement() -> Result<()> {
@@ -523,8 +446,6 @@ mod tests {
         ctx.sql(sql).await?.collect().await?;
         db.dml_coalescer().expect("coalescer enabled").drain(&db).await;
 
-        // split_rounds must apply the dup-key rows across rounds (last wins → 999),
-        // NOT abort the MERGE and drop the update (which would leave Bob at 200).
         assert_eq!(
             duration_by_name(&ctx, "Bob").await?,
             999,
@@ -533,11 +454,8 @@ mod tests {
         Ok(())
     }
 
-    /// Two-join-key variant matching monoscope's enrichment UPDATE-2, which joins on
-    /// (context___span_id, context___trace_id). Source has two rows for the same
-    /// composite key (a span carrying two hash tags). If split_rounds keys on BOTH
-    /// columns it splits them into rounds; a gap here (e.g. under-keyed split) would
-    /// let both rows hit one target row → the prod MERGE cardinality abort.
+    /// Two-join-key variant: `split_rounds` must key on BOTH columns, or two source
+    /// rows with the same composite key hit one target row and the MERGE aborts.
     #[serial]
     #[tokio::test(flavor = "multi_thread")]
     async fn coalescer_splits_duplicate_composite_source_keys() -> Result<()> {
@@ -554,7 +472,7 @@ mod tests {
         let batch = json_to_batch(vec![rec])?;
         db.insert_records_batch("test_project", OTEL, vec![batch], true, None).await?;
 
-        // Source: two rows for the SAME (span_id, trace_id) — the multi-tag shape.
+        // Two source rows for the SAME (span_id, trace_id).
         let sql = "UPDATE otel_logs_and_spans o
                      SET hashes = make_array(u.nm)
                      FROM (VALUES ('S1','T1','a'), ('S1','T1','b')) AS u(sid, tid, nm)
@@ -578,19 +496,14 @@ mod tests {
     }
 
     /// With a buffered layer, the mem leg updates buffer-resident rows
-    /// synchronously and the flush persists the POST-DML values to Delta —
-    /// the invariant that makes both the watermark clamp and coalescer
-    /// deferral sound. Exercises update-before-flush, then verifies Delta
-    /// (buffer bypassed) holds the updated row.
+    /// synchronously and the flush persists the POST-DML values to Delta — the
+    /// invariant that makes the watermark clamp and coalescer deferral sound.
     #[serial]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_update_from_buffered_rows_persisted_by_flush() -> Result<()> {
         timefusion::support::init_test_logging();
         let cfg = timefusion::support::test_helpers::TestConfigBuilder::new("dml_wm").build();
-        // The layer needs the SAME Delta writer prod uses: without it
-        // `flush_bucket` cannot persist anything (it now fails rather than
-        // draining into the void), and this test is precisely about the flush
-        // persisting the post-DML value.
+        // The layer needs a real Delta writer or `flush_bucket` persists nothing.
         let db0 = Database::with_config(Arc::clone(&cfg)).await?;
         let layer = Arc::new(test_layer(Arc::clone(&cfg))?.with_delta_writer(timefusion::server::delta_write_callback(&db0)));
         let db = Arc::new(db0.with_buffered_layer(Arc::clone(&layer)));
@@ -600,9 +513,8 @@ mod tests {
         let batch = json_to_batch(create_test_records(chrono::Utc::now()))?;
         db.insert_records_batch("test_project", OTEL, vec![batch], true, None).await?;
 
-        // Rows are buffer-resident. The mem leg applies; the Delta leg has
-        // nothing committed to touch (and a time window above the watermark
-        // is clamped away entirely).
+        // Rows are buffer-resident: the mem leg applies, the Delta leg has nothing
+        // committed to touch.
         let rows = exec_dml(
             &ctx,
             "UPDATE otel_logs_and_spans
@@ -615,27 +527,18 @@ mod tests {
         assert_eq!(rows, 1, "mem leg updated the buffered row");
         assert_eq!(duration_by_name(&ctx, "Bob").await?, 4242, "overlay read sees the update immediately");
 
-        // Flush → the post-update value must be DURABLE, i.e. still served once
-        // MemBuffer no longer holds it.
-        //
-        // Read through the table, not `query_delta_only`. On a merge-on-read
-        // table Delta legitimately holds BOTH versions — the update appended one
-        // rather than rewriting the row — so a dedup-bypassing read returns
-        // whichever it happens to see first and asserts nothing about currency.
-        // An empty buffer plus a table read is the real statement: the value can
-        // only be coming from Delta, and it went through keep-greatest.
+        // Read through the table, not `query_delta_only`: on a merge-on-read table
+        // Delta holds both versions, so a dedup-bypassing read proves nothing about
+        // currency. Empty buffer + table read means the value came from Delta.
         layer.flush_all_now().await?;
         assert!(layer.is_empty(), "flush must have drained the buffer, or the read below could still be served from memory");
         assert_eq!(duration_by_name(&ctx, "Bob").await?, 4242, "flush persisted the post-DML value");
         Ok(())
     }
 
-    /// Regression (prod 2026-08-04): the admission-time event-time bound ate
-    /// DML tombstones — DELETE on rows with timestamps outside
-    /// [2000-01-01, now+48h] acked but silently never applied, making garbage
-    /// rows (the `date=2238-12-31` partition) undeletable via SQL. DML
-    /// re-appends must bypass the bound: they only rewrite rows that already
-    /// exist in the table.
+    /// DML re-appends must bypass the admission-time event-time bound
+    /// ([2000-01-01, now+48h]) — they only rewrite rows already in the table, and
+    /// otherwise a DELETE on an out-of-range row acks but never applies.
     #[serial]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_delete_applies_to_rows_outside_event_time_bound() -> Result<()> {
@@ -653,7 +556,7 @@ mod tests {
             "date": "2238-12-31", "hashes": [], "summary": []
         });
         let batch = json_to_batch(vec![record])?;
-        // skip_queue=true: straight to Delta, as prod's junk predates the bound.
+        // skip_queue=true: straight to Delta, bypassing admission.
         db.insert_records_batch("test_project", OTEL, vec![batch], true, None).await?;
 
         ctx.sql("DELETE FROM otel_logs_and_spans WHERE project_id = 'test_project' AND id = 'junk-2238'").await?.collect().await?;

@@ -1,36 +1,25 @@
 //! Resumable footer repair: a repair rewrite that was already STAGED must
 //! survive the restart that killed its process.
 //!
-//! Prod 2026-08-08: a footer-repair bin is one 700MB-1GiB whole-file rewrite
-//! taking 40+ minutes. An 08:02 deploy and an unexplained 06:45 same-image task
-//! replacement each threw away ~2GB of already-written parquet, and the next
-//! pass started the identical file from scratch — so the backlog never moved.
-//! With resume, loss is bounded to "the bytes not yet written".
-//!
-//! The resume is hooked at bin SELECTION: before staging, the pass looks for an
-//! intent whose input set is exactly this bin's. That is what makes the restart
-//! case free — selection is deterministic given the snapshot, so the first pass
-//! after a restart re-selects the killed pass's files. The two invariants these
-//! tests pin are the ones that make committing those bytes safe: every input
-//! still live (staleness) and output rows == input rows (a repair is
-//! data-preserving, so a truncated staging is detectable). Declining is always
-//! safe — staged parquet is invisible to readers until the atomic commit — so
-//! the failure to guard against is a WRONG commit, not a missed one.
+//! Resume is hooked at bin SELECTION — before staging, the pass looks for an
+//! intent whose input set is exactly this bin's. A commit is only safe when
+//! every input is still live and output rows == input rows; declining is always
+//! safe, since staged parquet is invisible to readers until the atomic commit.
 
 use std::time::Duration;
 
 use timefusion::{database::TailPass, support};
 
 use super::harness::{E2eEnv, FROZEN_START_MICROS, insert_at};
+use super::ordering_pushdown::{count_rows, hot_partition_builder};
 
 const TABLE: &str = "otel_logs_and_spans";
 const PROJECT: &str = "e2e_project";
-/// Past `STAGED_INTENT_MIN_AGE_SECS` (30 min), the rolling-deploy gate that
-/// stops one instance from adopting another's half-written bin.
+/// Past `STAGED_INTENT_MIN_AGE_SECS` (30 min), the gate that stops one instance
+/// from adopting another's half-written bin.
 const BACKDATE_SECS: u64 = 60 * 60;
 
-/// Six flushes of unsorted, already-"converged" files — the prod shape the
-/// repair path exists for. Returns the resulting Delta file list.
+/// Six flushes of unsorted, already-"converged" files; returns the Delta file list.
 async fn footerless_partition(env: &E2eEnv) -> anyhow::Result<Vec<String>> {
     let client = env.pg_client().await?;
     let sec = 1_000_000i64;
@@ -49,24 +38,19 @@ async fn footerless_partition(env: &E2eEnv) -> anyhow::Result<Vec<String>> {
     Ok(files)
 }
 
-/// The fixture wiring every test here needs: every flush output lands unsorted
-/// and already "converged", so the repair path is the only thing that would
-/// ever rewrite it. `resume` flips the kill switch under test.
+/// Every flush output lands unsorted and already "converged", so the repair path
+/// is the only thing that would rewrite it. `resume` flips the kill switch.
 async fn repair_env(resume: bool) -> anyhow::Result<E2eEnv> {
-    let b = E2eEnv::builder()
-        .with_bucket_duration(Duration::from_secs(60))
-        .with_retention(Duration::from_secs(60 * 60))
-        .with_optimize_sort_by()
-        .with_sort_skip_bytes(0)
-        .with_light_optimize_target(1024);
+    let b = hot_partition_builder().with_optimize_sort_by().with_sort_skip_bytes(0).with_light_optimize_target(1024);
     let env = if resume { b.with_repair_resume() } else { b }.start().await?;
     env.db().cancel_maintenance();
     Ok(env)
 }
 
+/// A fresh client per call: `env.restart()` rebinds the pgwire port, so a
+/// connection held across a restart is dead.
 async fn row_count(env: &E2eEnv) -> anyhow::Result<i64> {
-    let client = env.pg_client().await?;
-    Ok(client.query_one("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1", &[&PROJECT]).await?.get(0))
+    count_rows(&env.pg_client().await?, PROJECT).await
 }
 
 async fn live_files(env: &E2eEnv) -> anyhow::Result<Vec<String>> {
@@ -75,9 +59,9 @@ async fn live_files(env: &E2eEnv) -> anyhow::Result<Vec<String>> {
     Ok(t.snapshot()?.log_data().iter().map(|f| f.path().to_string()).collect())
 }
 
-/// Stage the bin the next real pass would select, then abandon it — the state
-/// a killed process leaves behind. Going through the planner is the point:
-/// resume matches on input-set equality.
+/// Stage the bin the next real pass would select, then abandon it — the state a
+/// killed process leaves behind. Must go through the planner: resume matches on
+/// input-set equality.
 async fn abandon_one_bin(env: &E2eEnv) -> anyhow::Result<Vec<String>> {
     let table_ref = env.db().resolve_table(PROJECT, TABLE).await?;
     let bin = env.db().stage_and_abandon_first_bin(&table_ref, TABLE, TailPass::Pack).await?;
@@ -90,9 +74,8 @@ fn manifest_path(env: &E2eEnv) -> std::path::PathBuf {
     env.data_dir.join("staged_intent.jsonl")
 }
 
-/// Age every manifest entry past the rolling-deploy gate. Without this the
-/// entries are "young" — indistinguishable from a live instance's in-flight
-/// staging — and resume correctly refuses to touch them.
+/// Age every manifest entry past the rolling-deploy gate; young entries are
+/// indistinguishable from another instance's in-flight staging and are refused.
 fn backdate_manifest(env: &E2eEnv) -> anyhow::Result<Vec<serde_json::Value>> {
     let path = manifest_path(env);
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
@@ -117,13 +100,9 @@ fn live_manifest_entries(env: &E2eEnv) -> usize {
     std::fs::read_to_string(manifest_path(env)).map_or(0, |c| c.lines().filter(|l| !l.trim().is_empty()).count())
 }
 
-/// THE test: stage a repair, kill the process, and prove the next pass commits
-/// the staged bytes instead of redoing the rewrite.
-///
-/// "Instead of" is the load-bearing word, and the assertion for it is that the
-/// file now live is the one staged BEFORE the restart. A pass that quietly
-/// re-staged would also end with the right row count — and would have burned
-/// the 40 minutes this exists to save.
+/// Stage a repair, kill the process, and prove the next pass commits the staged
+/// bytes instead of redoing the rewrite: the file now live must be the one staged
+/// BEFORE the restart (a re-stage would also give the right row count).
 #[serial_test::serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_repair_pass_commits_the_bin_a_killed_process_had_already_staged() -> anyhow::Result<()> {
@@ -132,8 +111,7 @@ async fn a_repair_pass_commits_the_bin_a_killed_process_had_already_staged() -> 
     let before = footerless_partition(&env).await?;
     let rows_before = row_count(&env).await?;
 
-    // The rewrite that gets killed: staged parquet on S3, an intent line on
-    // disk, no commit.
+    // The rewrite that gets killed: staged parquet, an intent line, no commit.
     let inputs = abandon_one_bin(&env).await?;
     let entries = backdate_manifest(&env)?;
     assert_eq!(entries.len(), 1, "the abandoned bin must have left an intent line");
@@ -147,17 +125,14 @@ async fn a_repair_pass_commits_the_bin_a_killed_process_had_already_staged() -> 
     assert!(!entry["adds"].as_array().is_none_or(|a| a.is_empty()), "a repair intent must record its Add actions, or resume has to re-read footers");
     let staged = staged_outputs(&entries);
 
-    // The restart the deploy/healthcheck used to make fatal.
     env.restart().await?;
     env.db().cancel_maintenance();
 
     let table_ref = env.db().resolve_table(PROJECT, TABLE).await?;
     env.db().optimize_table_light(&table_ref, TABLE, TailPass::Pack).await?;
 
-    // The pre-restart output is LIVE and its inputs are tombstoned. Staged
-    // parquet is uuid-named by the writer, so nobody else could have produced
-    // that path: a pass that re-staged would show a fresh uuid and leave this
-    // one orphaned. That is the whole claim — the 40 minutes were not respent.
+    // Staged parquet is uuid-named, so a re-stage would show a fresh path and
+    // leave this one orphaned — seeing it live proves the bytes were reused.
     let after = live_files(&env).await?;
     for out in &staged {
         assert!(after.contains(out), "the pre-restart staging must have been COMMITTED, not re-staged: {out} missing from {after:?}");
@@ -167,13 +142,10 @@ async fn a_repair_pass_commits_the_bin_a_killed_process_had_already_staged() -> 
     }
     assert_eq!(live_manifest_entries(&env), 0, "commit_wave clears the intent it landed");
 
-    // Row preservation, end to end. This is the whole point: the rewrite was
-    // done before the crash, and committing it must change nothing logically.
     assert_eq!(row_count(&env).await?, rows_before, "a resumed repair is data-preserving — it must not lose or duplicate a row");
 
-    // A resumed file must be an ordinary compaction output, not a special case:
-    // let the rest of the partition repair normally on top of it.
-    // (`hot_tail_sorted_footer.rs` owns the "footers end up honest" assertion.)
+    // A resumed file must be an ordinary compaction output: the rest of the
+    // partition has to repair normally on top of it.
     for _ in 0..before.len() {
         env.db().optimize_table_light(&table_ref, TABLE, TailPass::Pack).await?;
     }
@@ -181,11 +153,9 @@ async fn a_repair_pass_commits_the_bin_a_killed_process_had_already_staged() -> 
     Ok(())
 }
 
-/// A staged output whose inputs were rewritten underneath it is garbage:
-/// committing it would resurrect removed rows and drop new ones. Two abandoned
-/// bins over the SAME inputs make that concrete — once the first is committed,
-/// the second's inputs are gone. It must be declined, and its parquet reclaimed
-/// by the boot reconcile rather than leaking on S3 forever.
+/// A staged output whose inputs were rewritten underneath it must be declined
+/// (committing it would resurrect removed rows) and its parquet reclaimed by
+/// reconcile. Two abandoned bins over the SAME inputs make that concrete.
 #[serial_test::serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_staged_bin_whose_inputs_were_rewritten_is_declined_and_reclaimed() -> anyhow::Result<()> {
@@ -216,9 +186,7 @@ async fn a_staged_bin_whose_inputs_were_rewritten_is_declined_and_reclaimed() ->
     Ok(())
 }
 
-/// Off by default: the first deploy ships the widened manifest WITHOUT
-/// committing from it, and flipping the flag back off must restore today's
-/// behaviour exactly (the pass re-stages, reconcile deletes the orphan).
+/// With the kill switch off, nothing may ever be committed from the manifest.
 #[serial_test::serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn resume_is_a_no_op_while_the_kill_switch_is_off() -> anyhow::Result<()> {

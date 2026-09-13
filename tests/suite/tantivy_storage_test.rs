@@ -1,83 +1,31 @@
-//! Tier-2: storage roundtrip + manifest tests using `object_store::InMemory`.
-//! No MinIO required; the same code paths are exercised against any
-//! `ObjectStore` impl (S3/MinIO/file).
+//! Tantivy blob storage roundtrip + manifest tests over `object_store::InMemory`.
 
 use std::sync::Arc;
 
-use arrow::{
-    array::{ArrayRef, RecordBatch, StringArray, TimestampMicrosecondArray},
-    datatypes::{DataType, Field, Schema as ArrowSchema, TimeUnit},
-};
+use arrow::array::RecordBatch;
 use object_store::memory::InMemory;
 use tantivy::{Term, query::TermQuery, schema::IndexRecordOption};
 use tempfile::TempDir;
-use timefusion::{
-    schema::{FieldDef, SortingColumnDef, TableSchema, TantivyFieldConfig},
-    tantivy::{
-        IndexBuildStats, ManifestEntry, MergeMode, SCHEMA_VERSION, build_for_table, delete, download, load_manifest, remove_manifest_entries,
-        search::{Hit, query_index},
-        unpack_to_dir, upload, upsert_manifest, verify_blob,
-    },
+use timefusion::tantivy::{
+    IndexBuildStats, ManifestEntry, MergeMode, SCHEMA_VERSION, build_for_table, delete, download, load_manifest, remove_manifest_entries,
+    search::{Hit, query_index},
+    unpack_to_dir, upload, upsert_manifest, verify_blob,
 };
 
-fn table() -> TableSchema {
-    TableSchema {
-        rollups: vec![],
-        table_name: "logs".into(),
-        partitions: vec![],
-        sorting_columns: vec![SortingColumnDef { name: "timestamp".into(), descending: false, nulls_first: false }],
-        z_order_columns: vec![],
-        time_column: None,
-        dedup_keys: vec![],
-        dedup_tiebreak: None,
-        tombstone_column: None,
-        version_append: false,
-        fields: vec![
-            FieldDef {
-                name: "timestamp".into(),
-                data_type: "Timestamp(Microsecond, Some(\"UTC\"))".into(),
-                nullable: false,
-                tantivy: None,
-                dictionary: None,
-                bloom_filter: false,
-                mutable: false,
-            },
-            FieldDef { name: "id".into(), data_type: "Utf8".into(), nullable: false, tantivy: None, dictionary: None, bloom_filter: false, mutable: false },
-            FieldDef {
-                name: "level".into(),
-                data_type: "Utf8".into(),
-                nullable: true,
-                tantivy: Some(TantivyFieldConfig { indexed: true, tokenizer: Some("raw".into()), flatten: None, list_mode: Default::default() }),
-                dictionary: None,
-                bloom_filter: false,
-                mutable: false,
-            },
-        ],
-    }
-}
+use super::tantivy_search_test::{logs_batch, logs_schema};
 
-/// A manifest entry with everything not under test left at its derived default
-/// (`schema_version` defaults to `SCHEMA_VERSION`). Override the rest with
-/// struct-update syntax at the call site.
+/// Manifest entry with all other fields at `Default` (`schema_version` = `SCHEMA_VERSION`).
 fn entry(index: Option<&str>, rows: u64, error: Option<&str>) -> ManifestEntry {
     ManifestEntry { index: index.map(Into::into), rows, error: error.map(Into::into), ..Default::default() }
 }
 
 fn batch() -> RecordBatch {
-    let ts: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![1_000_000, 2_000_000, 3_000_000]).with_timezone("UTC"));
-    let id: ArrayRef = Arc::new(StringArray::from(vec!["a", "b", "c"]));
-    let level: ArrayRef = Arc::new(StringArray::from(vec!["INFO", "ERROR", "INFO"]));
-    let schema = Arc::new(ArrowSchema::new(vec![
-        Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), false),
-        Field::new("id", DataType::Utf8, false),
-        Field::new("level", DataType::Utf8, true),
-    ]));
-    RecordBatch::try_new(schema, vec![ts, id, level]).unwrap()
+    logs_batch(&[(1_000_000, "a", "INFO"), (2_000_000, "b", "ERROR"), (3_000_000, "c", "INFO")], false)
 }
 
 #[tokio::test]
 async fn pack_upload_download_unpack_query_roundtrip() {
-    let table = table();
+    let table = logs_schema();
     let batches = vec![batch()];
 
     let (blob, stats): (_, IndexBuildStats) =
@@ -85,16 +33,13 @@ async fn pack_upload_download_unpack_query_roundtrip() {
     assert_eq!(stats.rows, 3);
     assert!(!blob.is_empty());
 
-    // Upload to in-memory store
     let store_obj: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
     let path = timefusion::tantivy::blob_path("logs", "proj1", "00000000-0000-0000-0000-000000000001");
     upload(store_obj.as_ref(), &path, blob.clone()).await.expect("upload");
 
-    // Download
     let dl = timefusion::tantivy::download(store_obj.as_ref(), &path).await.expect("download");
     assert_eq!(dl, blob);
 
-    // Unpack to a fresh dir, open, query
     let dir = TempDir::new().unwrap();
     unpack_to_dir(&dl, dir.path()).expect("unpack");
     let idx = timefusion::tantivy::open_index(dir.path()).expect("open");
@@ -104,17 +49,14 @@ async fn pack_upload_download_unpack_query_roundtrip() {
     let hits = query_index(&idx, &q, None).expect("query");
     assert_eq!(hits, vec![Hit { timestamp_micros: 2_000_000, id: "b".into(), row_ordinal: Some(1) }]);
 
-    // Delete, then ensure it's gone
     delete(store_obj.as_ref(), &path).await.expect("delete");
     assert!(timefusion::tantivy::download(store_obj.as_ref(), &path).await.is_err());
 }
 
-/// Phase 2 primitive: index a parquet file read back from object storage
-/// (no live flush batches), published at the deterministic partition-mirrored
-/// path with the manifest keyed by the parquet rel path. Confirms the round
-/// trip is searchable — the reused builder behind reconcile/backfill/reindex.
-/// Uses the real `otel_logs_and_spans` schema (the only registered schema
-/// `build_index_for_file` can look up) over an InMemory store (no MinIO).
+/// Indexing a parquet file read back from object storage publishes a searchable
+/// blob at the partition-mirrored path, with the manifest keyed by the parquet
+/// rel path. Must use `otel_logs_and_spans` — the only schema `build_index_for_file`
+/// can look up.
 #[tokio::test]
 async fn build_index_for_file_reads_parquet_and_publishes_searchable_index() {
     use serde_json::json;
@@ -128,7 +70,7 @@ async fn build_index_for_file_reads_parquet_and_publishes_searchable_index() {
     let store_obj: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
     let parquet_rel = "project_id=p1/date=2026-06-30/part-00000-test-c000.zstd.parquet";
 
-    // A 3-row otel batch; `id` is a raw-tokenized indexed column (P0).
+    // `id` is a raw-tokenized indexed column.
     let b = json_to_batch(
         ["aaa", "row-b", "ccc"]
             .iter()
@@ -158,8 +100,6 @@ async fn build_index_for_file_reads_parquet_and_publishes_searchable_index() {
     let parquet_uri = format!("s3://bucket/tf/{TABLE}/{parquet_rel}");
     svc.build_index_for_file(TABLE, "p1", parquet_rel, &parquet_uri, store_obj.clone()).await.expect("build_index_for_file");
 
-    // Manifest entry is keyed by the parquet rel path, points at the
-    // generation of the partition-mirrored blob, and the blob exists.
     let m = load_manifest(store_obj.as_ref(), TABLE, "p1").await.unwrap();
     let entry = m.entries.get(parquet_rel).expect("manifest entry keyed by parquet rel");
     assert_eq!(entry.rows, 3);
@@ -170,7 +110,6 @@ async fn build_index_for_file_reads_parquet_and_publishes_searchable_index() {
     assert!(entry.ordinals_valid, "read-back build indexes parquet row order → ordinals valid for row selection");
     download(store_obj.as_ref(), &object_store::path::Path::from(expected_blob.as_str())).await.expect("blob exists");
 
-    // And the published index is actually searchable end-to-end.
     let cache = TempDir::new().unwrap();
     let search = TantivySearchService::new(store_obj.clone(), cache.path().to_path_buf(), Arc::new(TantivyConfig::default()));
     let hits = search.search(TABLE, "p1", "id", "row-b").await.expect("search").expect("some hits");
@@ -179,16 +118,12 @@ async fn build_index_for_file_reads_parquet_and_publishes_searchable_index() {
 
 #[test]
 fn verify_blob_accepts_built_index_and_rejects_corruption() {
-    // Guards the read-back gate added alongside the tantivy tar-race fix: a
-    // freshly built blob must round-trip (unpack + open), and a structurally
-    // corrupt blob must be rejected before it is ever published (a poison blob
-    // fails every future read on its immutable path). The merge-thread race
-    // that produced corrupt blobs is timing-dependent — the fix is the
-    // `wait_merging_threads()` join in `index_to_writer`; this pins the guard.
-    let (blob, _) = timefusion::tantivy::build_and_pack(&table(), &[batch()], 3, MergeMode::Now, &std::env::temp_dir()).expect("build_and_pack");
+    // A corrupt blob must be rejected before publish: blob paths are immutable,
+    // so a poison blob fails every future read.
+    let (blob, _) = timefusion::tantivy::build_and_pack(&logs_schema(), &[batch()], 3, MergeMode::Now, &std::env::temp_dir()).expect("build_and_pack");
     verify_blob(&blob).expect("freshly built blob must verify");
 
-    // Truncating the blob yields an invalid tar.zst; verify must error, not panic.
+    // Must error, not panic.
     assert!(timefusion::tantivy::verify_blob(&blob[..blob.len() / 2]).is_err(), "corrupt blob must be rejected");
     assert!(timefusion::tantivy::verify_blob(b"not a tantivy archive").is_err(), "garbage blob must be rejected");
 }
@@ -226,9 +161,8 @@ async fn manifest_upsert_and_remove_roundtrip() {
 
 #[tokio::test]
 async fn concurrent_upserts_last_writer_wins() {
-    // Simulates two concurrent upserts to the same project. Last-writer-wins
-    // is the documented behavior; both writes must produce a valid manifest
-    // (no corruption), and the final manifest must contain at least one entry.
+    // Last-writer-wins is the documented behavior: losing an entry to the race is
+    // acceptable, corrupting the manifest is not.
     let store_obj: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
     let writers = [("part-uuid-A.parquet", "a", 1u64), ("part-uuid-B.parquet", "b", 2)].map(|(key, blob, rows)| {
         let s = store_obj.clone();
@@ -238,6 +172,5 @@ async fn concurrent_upserts_last_writer_wins() {
         w.await.unwrap().unwrap();
     }
     let m = load_manifest(store_obj.as_ref(), "logs", "proj1").await.unwrap();
-    // At least one of them survived. Race is acceptable; corruption is not.
     assert!(!m.entries.is_empty());
 }

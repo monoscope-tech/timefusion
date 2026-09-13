@@ -1,11 +1,9 @@
-//! Tier-1 unit tests for `tantivy_index`: schema build, batch indexing,
-//! and query roundtrip. Pure-Rust, no S3, no DataFusion plumbing.
+//! Unit tests for `tantivy_index`: schema build, batch indexing, query roundtrip.
 
 use std::sync::Arc;
 
 use arrow::{
-    array::{Array, ArrayBuilder, ArrayRef, ListArray, RecordBatch, StringArray, StringBuilder, StructArray, TimestampMicrosecondArray},
-    buffer::OffsetBuffer,
+    array::{ArrayRef, ListBuilder, RecordBatch, StringArray, StringBuilder, StructArray, TimestampMicrosecondArray},
     datatypes::{DataType, Field, Schema as ArrowSchema, TimeUnit},
 };
 use parquet_variant_compute::VariantArrayBuilder;
@@ -17,80 +15,28 @@ use tantivy::{
 };
 use test_case::test_case;
 use timefusion::{
-    schema::{FieldDef, SortingColumnDef, TableSchema, TantivyFieldConfig},
+    schema::TableSchema,
     tantivy::{
         build_for_table, build_in_memory,
         search::{Hit, query_index},
     },
 };
 
-fn ts_field(name: &str, nullable: bool) -> FieldDef {
-    FieldDef {
-        name: name.into(),
-        data_type: "Timestamp(Microsecond, Some(\"UTC\"))".into(),
-        nullable,
-        tantivy: None,
-        dictionary: None,
-        bloom_filter: false,
-        mutable: false,
-    }
-}
-fn utf8(name: &str, indexed: bool, tokenizer: &str) -> FieldDef {
-    FieldDef {
-        name: name.into(),
-        data_type: "Utf8".into(),
-        nullable: true,
-        tantivy: indexed.then(|| TantivyFieldConfig { indexed: true, tokenizer: Some(tokenizer.into()), flatten: None, list_mode: Default::default() }),
-        dictionary: None,
-        bloom_filter: false,
-        mutable: false,
-    }
-}
-fn list_utf8(name: &str, tokenizer: &str) -> FieldDef {
-    FieldDef {
-        name: name.into(),
-        data_type: "List(Utf8)".into(),
-        nullable: false,
-        tantivy: Some(TantivyFieldConfig { indexed: true, tokenizer: Some(tokenizer.into()), flatten: None, list_mode: Default::default() }),
-        dictionary: None,
-        bloom_filter: false,
-        mutable: false,
-    }
-}
-fn variant(name: &str, flatten: &str) -> FieldDef {
-    FieldDef {
-        name: name.into(),
-        data_type: "Variant".into(),
-        nullable: true,
-        tantivy: Some(TantivyFieldConfig { indexed: true, tokenizer: Some("default".into()), flatten: Some(flatten.into()), list_mode: Default::default() }),
-        dictionary: None,
-        bloom_filter: false,
-        mutable: false,
-    }
-}
+use super::tantivy_search_test::{TS_TYPE, field, table_schema, tantivy_cfg};
 
 fn small_table() -> TableSchema {
-    TableSchema {
-        rollups: vec![],
-        table_name: "t".into(),
-        partitions: vec![],
-        sorting_columns: vec![SortingColumnDef { name: "timestamp".into(), descending: false, nulls_first: false }],
-        z_order_columns: vec![],
-        time_column: None,
-        dedup_keys: vec![],
-        dedup_tiebreak: None,
-        tombstone_column: None,
-        version_append: false,
-        fields: vec![
-            ts_field("timestamp", false),
-            FieldDef { name: "id".into(), data_type: "Utf8".into(), nullable: false, tantivy: None, dictionary: None, bloom_filter: false, mutable: false },
-            utf8("level", true, "raw"),
-            utf8("message", true, "default"),
-            list_utf8("summary", "default"),
-            variant("body", "json"),
-            variant("attributes", "kv"),
+    table_schema(
+        "t",
+        vec![
+            field("timestamp", TS_TYPE, false, None),
+            field("id", "Utf8", false, None),
+            field("level", "Utf8", true, Some(tantivy_cfg("raw", None))),
+            field("message", "Utf8", true, Some(tantivy_cfg("default", None))),
+            field("summary", "List(Utf8)", false, Some(tantivy_cfg("default", None))),
+            field("body", "Variant", true, Some(tantivy_cfg("default", Some("json")))),
+            field("attributes", "Variant", true, Some(tantivy_cfg("default", Some("kv")))),
         ],
-    }
+    )
 }
 
 /// (timestamp, id, level, message, summary, body_json, attrs_json) — an empty
@@ -104,20 +50,14 @@ fn batch(rows: &[Row<'_>]) -> RecordBatch {
     let level: ArrayRef = Arc::new(StringArray::from(rows.iter().map(|r| r.2).collect::<Vec<_>>()));
     let msg: ArrayRef = Arc::new(StringArray::from(rows.iter().map(|r| r.3).collect::<Vec<_>>()));
 
-    // Summary: List(Utf8)
-    let mut sb = StringBuilder::new();
-    let mut offsets = vec![0i32];
+    // Every summary list is non-null; an empty Vec yields an empty (not null) list.
+    let mut lists = ListBuilder::new(StringBuilder::new());
     for r in rows {
-        for s in &r.4 {
-            sb.append_value(s);
-        }
-        offsets.push(sb.len() as i32);
+        r.4.iter().for_each(|s| lists.values().append_value(s));
+        lists.append(true);
     }
-    let values = sb.finish();
-    let summary: ArrayRef =
-        Arc::new(ListArray::try_new(Arc::new(Field::new("item", DataType::Utf8, true)), OffsetBuffer::new(offsets.into()), Arc::new(values), None).unwrap());
+    let summary: ArrayRef = Arc::new(lists.finish());
 
-    // Variant columns built from JSON literals.
     let body = build_variant(rows.iter().map(|r| r.5).collect());
     let attrs = build_variant(rows.iter().map(|r| r.6).collect());
 
@@ -150,41 +90,16 @@ fn build_variant(jsons: Vec<&str>) -> ArrayRef {
             b.append_json(j).expect("append_json");
         }
     }
-    let arr = b.build();
-    // The builder yields BinaryView; Tantivy code path uses VariantArray::try_new(StructArray)
-    // which works with either Binary or BinaryView for our test purposes — but the builder
-    // currently emits BinaryView, so cast metadata/value down to Binary for parity with what
-    // delta_kernel produces in production.
-    let struct_arr: StructArray = arr.into();
+    // The builder emits BinaryView; cast metadata/value to Binary to match what delta_kernel produces.
+    let struct_arr: StructArray = b.build().into();
     let (fields, columns, nulls) = struct_arr.into_parts();
-    use arrow::array::{BinaryArray, BinaryViewArray};
-    let mut new_cols: Vec<ArrayRef> = Vec::with_capacity(columns.len());
-    let mut new_fields = Vec::with_capacity(fields.len());
-    for (i, c) in columns.into_iter().enumerate() {
-        if let Some(view) = c.as_any().downcast_ref::<BinaryViewArray>() {
-            let mut b = arrow::array::BinaryBuilder::new();
-            for r in 0..view.len() {
-                if view.is_null(r) {
-                    b.append_null();
-                } else {
-                    b.append_value(view.value(r));
-                }
-            }
-            new_cols.push(Arc::new(b.finish()) as ArrayRef);
-            new_fields.push(Arc::new(Field::new(fields[i].name(), DataType::Binary, fields[i].is_nullable())));
-        } else if c.as_any().downcast_ref::<BinaryArray>().is_some() {
-            new_cols.push(c);
-            new_fields.push(Arc::new(Field::new(fields[i].name(), DataType::Binary, fields[i].is_nullable())));
-        } else {
-            panic!("unexpected variant column: {:?}", c.data_type());
-        }
-    }
+    let new_cols: Vec<ArrayRef> = columns.iter().map(|c| arrow::compute::cast(c, &DataType::Binary).expect("variant column must cast to Binary")).collect();
+    let new_fields: Vec<_> = fields.iter().map(|f| Arc::new(Field::new(f.name(), DataType::Binary, f.is_nullable()))).collect();
     Arc::new(StructArray::new(new_fields.into(), new_cols, nulls)) as ArrayRef
 }
 
-/// Row c carries an empty summary list and null variants; its message mentions
-/// "timeout" so a body query for it must NOT match c (text in another field
-/// must not create a body match).
+/// Row c has an empty summary list and null variants; its message says "timeout"
+/// so a body query must not match it — text in one field must not match another.
 fn corpus() -> Vec<Row<'static>> {
     vec![
         (1_000_000, "a", "INFO", "hello world", vec!["alpha", "beta", "greeting"], r#"{"msg":"timeout occurred"}"#, r#"{"http":{"status":"200"}}"#),
@@ -193,9 +108,8 @@ fn corpus() -> Vec<Row<'static>> {
     ]
 }
 
-/// Three batches instead of one: the first two are *sliced* (non-zero offset
-/// into shared buffers), and the third prepares its own variant columns and is
-/// entirely null in them.
+/// Two sliced batches (non-zero offset into shared buffers) plus one whose
+/// variant columns are entirely null.
 fn corpus_batches() -> Vec<RecordBatch> {
     let rows = corpus();
     let ab = batch(&rows[0..2]);
@@ -213,8 +127,6 @@ fn schema_build_emits_reserved_and_user_fields() {
     }
 }
 
-/// One 3-row batch: stats, a raw-tokenizer term query, and a timestamp range
-/// ANDed with a term.
 #[test]
 fn build_and_query_term_range_and_boolean() {
     let table = small_table();
@@ -224,7 +136,6 @@ fn build_and_query_term_range_and_boolean() {
     assert_eq!(stats.min_timestamp_micros, Some(1_000_000));
     assert_eq!(stats.max_timestamp_micros, Some(3_000_000));
 
-    // Term query on raw-tokenizer field (level = ERROR)
     let level = built.user_fields.get("level").unwrap().field;
     let q = TermQuery::new(Term::from_field_text(level, "ERROR"), IndexRecordOption::Basic);
     let hits = query_index(&idx, &q, None).unwrap();
@@ -243,11 +154,8 @@ fn multi_batch_indexes_sliced_and_null_variant_batches() {
     assert_eq!((stats.batches, stats.rows), (3, 3));
 }
 
-// QueryParser over a single user field of the multi-batch corpus; returns the
-// matching ids, sorted and comma-joined.
-// `summary` is List(Utf8) joined into one searchable text field.
-// `attributes` uses kv flatten, which emits "http.status:500" — so "500" matches.
-// `body` uses json flatten (full text over the JSON).
+// Returns matching ids, sorted and comma-joined. `summary` (List(Utf8)) is joined into one
+// text field; `attributes` uses kv flatten (emits "http.status:500"); `body` uses json flatten.
 #[test_case("message", "\"panic on shutdown\"" => "b" ; "phrase on default tokenizer")]
 #[test_case("message", "world" => "a,c" ; "term matching two rows")]
 #[test_case("body", "timeout" => "a" ; "variant json flatten full text")]

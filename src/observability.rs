@@ -1,20 +1,6 @@
-//! OpenTelemetry metrics export.
-//!
-//! Sits next to `telemetry.rs` (which owns traces). On `init_metrics()` we
-//! create a `SdkMeterProvider` with the OTLP exporter, register a few
-//! observable gauges that read from the `BufferedWriteLayer` once per export
-//! cycle, and install it as the global meter provider.
-//!
-//! Why observables (not synchronous counters): the stats we care about
-//! (memory pressure, oldest bucket age, WAL bytes) live inside the
-//! `BufferedWriteLayer` and are already computed by `snapshot_stats()` for
-//! the SQL `timefusion.stats()` view. Polling on each export keeps the hot
-//! path untouched.
-//!
-//! Counters (insert success/failure, corruption events) are exposed through
-//! `MetricsRegistry::record_*` so they can be incremented inline. They live
-//! in a process-global `OnceLock`; if init isn't called (tests, embedded
-//! use), the helpers no-op.
+//! OpenTelemetry metrics export: gauges observed from `BufferedWriteLayer`
+//! snapshots each export cycle, plus counters incremented inline via
+//! `record_*`. All helpers no-op if `init_metrics()` was never called.
 
 use std::{
     sync::{
@@ -24,8 +10,6 @@ use std::{
     time::Duration,
 };
 
-// `parking_lot`, not `std`: these mutexes guard counters and summaries, where a
-// panic leaves no invariant worth propagating, so poison handling was pure noise.
 use parking_lot::Mutex;
 
 static MAINTENANCE_RETRY_REASON: LazyLock<Mutex<String>> = LazyLock::new(Mutex::default);
@@ -39,28 +23,15 @@ pub fn maintenance_retry_reason() -> String {
 }
 
 /// Retries counted per `(operation, reason)`.
-///
-/// The single "last reason" string above cannot distinguish a lane that retries
-/// once from one that has retried forever, and answering "why is HotPacking at
-/// 14 completions and 472 retries?" on 2026-08-31 meant copying a 52 MB journal
-/// out of the prod container. `retry_or_split` writes the reason into the task,
-/// so the fleet-level histogram was the only thing missing.
 static MAINTENANCE_RETRIES: LazyLock<dashmap::DashMap<String, AtomicU64>> = LazyLock::new(dashmap::DashMap::new);
 
-/// Work actually done per `(operation, metric)` — the counterpart to the retry
-/// histogram above, and the metric deploy 12 could not be judged on.
-///
-/// Comparing deploy 11 to 12 on 2026-09-01 meant comparing UNIT counts, which
-/// said the queue drained 2.7x faster before the fix. It had not: 249 of
-/// deploy 11's 288 "finishes" were zero-second claim-and-refuse cycles. Units
-/// per minute measures churn as readily as work, so the fleet needs a rate
-/// whose numerator is work (`rows_dropped`) and whose denominator is capacity
-/// (`worker_secs`).
+/// Work actually done per `(operation, metric)` — numerator (`rows_dropped`)
+/// and denominator (`worker_secs`) for a work rate, since unit counts measure
+/// churn as readily as work.
 static MAINTENANCE_WORK: LazyLock<dashmap::DashMap<String, AtomicU64>> = LazyLock::new(dashmap::DashMap::new);
 
-/// Bounded on purpose: a retry reason can carry error text (`"dedup: Not enough
-/// memory ..."`), so the map stops accepting new keys once it is full rather
-/// than growing with distinct error strings.
+/// Bounded on purpose: a retry reason can carry error text, so the map stops
+/// accepting NEW keys once full rather than growing with distinct error strings.
 fn add_bounded(map: &dashmap::DashMap<String, AtomicU64>, key: String, amount: u64) {
     const MAX_KEYS: usize = 128;
     if let Some(count) = map.get(&key) {
@@ -109,13 +80,12 @@ use crate::{config::TelemetryConfig, tantivy::search::TantivyIndexService, write
 
 static METRICS: OnceLock<MetricsRegistry> = OnceLock::new();
 
-/// Declares the counter registry struct and its `new()` builder from a single
-/// list of `field => "metric.id": "description"` entries, so adding a counter
-/// is a one-line change with no risk of the field and registration drifting.
+/// Declares the counter registry struct and its `new()` builder from one list
+/// of `field => "metric.id": "description"` entries.
 macro_rules! counter_registry {
     ($($field:ident => $id:literal : $desc:literal),+ $(,)?) => {
-        /// Holds counters that need to be incremented from the hot path. Gauges
-        /// are observed by callback and don't need to live here.
+        /// Counters incremented from the hot path. Gauges are observed by
+        /// callback and don't live here.
         pub struct MetricsRegistry {
             $(pub $field: Counter<u64>,)+
         }
@@ -177,25 +147,7 @@ counter_registry! {
     cache_confirm_timeouts     => "timefusion.cache.confirm_timeouts": "Pre-drain cache confirms that hit their bound and gave up. Best-effort — the commit and the drain proceed; the next query on those files just pays an S3 round-trip",
     rollup_hits                => "timefusion.rollup.hits": "Dashboard aggregates served from the pre-aggregated rollup instead of raw spans",
     rollup_misses              => "timefusion.rollup.misses": "Dashboard aggregates that fell through to a raw scan, labelled by REASON. Without the reason breakdown there is no feedback loop telling us which dimension to add next — a rollup silently serving 20% of traffic looks identical to one serving 90%",
-    rollup_scan_cohorts        => "timefusion.rollup.maintenance.scan_cohorts": "Bounded rollup scan cohorts executed",
-    rollup_scan_projects       => "timefusion.rollup.maintenance.scan_projects": "Projects included in bounded rollup scan cohorts",
-    rollup_scan_estimated_bytes => "timefusion.rollup.maintenance.scan_estimated_bytes": "Estimated decoded input bytes admitted to rollup cohort scans",
-    rollup_cohort_splits       => "timefusion.rollup.maintenance.cohort_splits": "Resource-exhausted rollup cohorts split and retried",
-    rollup_singleton_failures  => "timefusion.rollup.maintenance.singleton_failures": "Rollup projects isolated into backoff after singleton failure",
-    rollup_staged_projects     => "timefusion.rollup.maintenance.staged_projects": "Project replacements staged outside the Delta commit lock",
-    rollup_shared_commits      => "timefusion.rollup.maintenance.shared_commits": "Shared rollup replacement transactions committed",
-    rollup_commit_actions      => "timefusion.rollup.maintenance.commit_actions": "Delta actions included in shared rollup commits",
-    rollup_occ_retries         => "timefusion.rollup.maintenance.occ_retries": "Shared rollup commits retried after OCC conflict",
-    rollup_ambiguous_landings  => "timefusion.rollup.maintenance.ambiguous_landings": "Errored rollup commits confirmed landed by probing",
-    rollup_scan_duration_ms    => "timefusion.rollup.maintenance.scan_duration_ms": "Cumulative rollup scan-wave duration in milliseconds",
-    rollup_staging_duration_ms => "timefusion.rollup.maintenance.staging_duration_ms": "Cumulative rollup file-staging duration in milliseconds",
-    rollup_commit_duration_ms  => "timefusion.rollup.maintenance.commit_duration_ms": "Cumulative shared rollup commit duration in milliseconds",
-    rollup_end_to_end_duration_ms => "timefusion.rollup.maintenance.end_to_end_duration_ms": "Cumulative rollup cohort end-to-end duration in milliseconds",
-    rollup_output_rows         => "timefusion.rollup.maintenance.output_rows": "Rows written by rollup maintenance",
-    rollup_output_files        => "timefusion.rollup.maintenance.output_files": "Parquet files staged by rollup maintenance",
-    rollup_full_hours_rebuilt  => "timefusion.rollup.maintenance.full_hours_rebuilt": "Rollup project-hours rebuilt by full scans",
-    rollup_incremental_hours_rebuilt => "timefusion.rollup.maintenance.incremental_hours_rebuilt": "Rollup project-hours rebuilt from durable dirty masks",
-    cache_insert_bypassed      => "timefusion.cache.insert_bypassed": "Cache populations suppressed because the read ran inside a large-scan bypass scope (scan-resistant admission — a wide historical scan must not evict the hot tail)",
+    cache_insert_bypassed    => "timefusion.cache.insert_bypassed": "Cache populations suppressed because the read ran inside a large-scan bypass scope (scan-resistant admission — a wide historical scan must not evict the hot tail)",
     dedup_chunk_skipped        => "timefusion.dedup.chunk_skipped": "Dedup chunk rewrites skipped (over the rewrite-byte budget, or partition in failure backoff). Duplicates persist in Delta — read-side dedup keeps queries correct — until a later sweep or manual compaction clears them. WARN if sustained",
     maintenance_checkpoint_failed => "timefusion.maintenance.checkpoint_failed": "Out-of-band checkpoint attempts that errored (e.g. R2 500 on the checkpoint PUT). Retried next tick; ingest is unaffected. WARN if sustained — checkpoints falling behind slows boot replay and blocks log cleanup",
     maintenance_log_cleanup_failed => "timefusion.maintenance.log_cleanup_failed": "Out-of-band expired-log-cleanup attempts that errored. Retried next tick; the _delta_log grows until it succeeds. WARN if sustained (a growing log slows every commit's version LIST)",
@@ -209,20 +161,10 @@ pub fn registry() -> Option<&'static MetricsRegistry> {
     METRICS.get()
 }
 
-/// Local, in-process side of `metrics::histogram!()` calls, for readback (e.g.
-/// `timefusion_stats` percentiles). The OTel bridge (`metrics_exporter_opentelemetry`)
-/// is push-only — no snapshot API — so the two are fanned out from one global
-/// `metrics::Recorder` via `metrics_util::layers::Fanout`; see `init_metrics()`.
-///
-/// One `Summary` (DDSketch, relative-error quantiles) per metric name, keyed
-/// lazily on first `record()` — replaces hand-rolled power-of-two bucket arrays.
+/// In-process side of `metrics::histogram!()` calls, for readback — the OTel
+/// bridge is push-only, so both are fanned out from one global `Recorder`.
+/// One DDSketch `Summary` per metric name, created lazily on first `record()`.
 struct LocalHistograms(dashmap::DashMap<String, Mutex<metrics_util::storage::Summary>>);
-
-impl LocalHistograms {
-    fn quantile(&self, name: &str, p: f64) -> Option<f64> {
-        self.0.get(name)?.lock().quantile(p)
-    }
-}
 
 struct LocalHistogramHandle {
     histograms: Arc<LocalHistograms>,
@@ -237,12 +179,9 @@ impl metrics::HistogramFn for LocalHistogramHandle {
 
 type CounterGaugeRegistry = metrics_util::registry::Registry<metrics::Key, metrics_util::registry::AtomicStorage>;
 
-/// Local recorder: histograms go through `LocalHistograms` (Summary/DDSketch,
-/// above); counters and gauges go through `metrics_util`'s own `Registry` +
-/// `AtomicStorage` — ready-made `Arc<AtomicU64>`-backed storage, so this needs
-/// no bespoke counter/gauge type of its own. Wrapping both in one newtype
-/// (rather than implementing `Recorder` on `Arc<LocalHistograms>` directly) is
-/// required by the orphan rule — `Arc` isn't a fundamental type.
+/// Local recorder: histograms via `LocalHistograms`, counters/gauges via
+/// `metrics_util`'s `Registry` + `AtomicStorage`. Must be its own newtype —
+/// the orphan rule forbids implementing `Recorder` on `Arc<LocalHistograms>`.
 #[derive(Clone)]
 struct LocalRecorder {
     histograms: Arc<LocalHistograms>,
@@ -273,11 +212,9 @@ impl LocalRecorder {
 static LOCAL_HISTOGRAMS: OnceLock<Arc<LocalHistograms>> = OnceLock::new();
 static LOCAL_REGISTRY: OnceLock<Arc<CounterGaugeRegistry>> = OnceLock::new();
 
-/// Installs `recorder` as the global `metrics` recorder — a no-op if one is
-/// already installed (a second `init_metrics()`, or a test against a booted
-/// server) — and on success publishes `local`'s handles for in-process readback.
-/// `local` is either `recorder` itself or one of its fanout arms, so the two
-/// share the same `Arc`s and readback sees every write.
+/// Installs `recorder` globally (no-op if one is already installed) and on
+/// success publishes `local`'s handles for in-process readback. `local` must be
+/// `recorder` itself or one of its fanout arms, so readback sees every write.
 fn publish_local(local: LocalRecorder, recorder: impl metrics::Recorder + Sync + 'static) {
     if metrics::set_global_recorder(recorder).is_ok() {
         let _ = LOCAL_HISTOGRAMS.set(local.histograms);
@@ -288,13 +225,11 @@ fn publish_local(local: LocalRecorder, recorder: impl metrics::Recorder + Sync +
 /// Read back a quantile (0.0-1.0) for a name recorded via `metrics::histogram!()`.
 /// `None` if metrics weren't initialized or the name has never recorded a value.
 pub fn histogram_quantile(name: &str, p: f64) -> Option<f64> {
-    LOCAL_HISTOGRAMS.get()?.quantile(name, p)
+    LOCAL_HISTOGRAMS.get()?.0.get(name)?.lock().quantile(p)
 }
 
 /// Read back the current value of a name recorded via `metrics::counter!()`.
-/// 0 if metrics weren't initialized or the name has never recorded a value —
-/// matches how these were read before migration (`AtomicU64::load` on an
-/// unused field is also 0), so callers don't need an `Option`.
+/// 0 if metrics weren't initialized or the name has never recorded a value.
 pub fn counter_value(name: &'static str) -> u64 {
     LOCAL_REGISTRY.get().and_then(|r| r.get_counter(&metrics::Key::from_name(name))).map_or(0, |c| c.load(Relaxed))
 }
@@ -304,11 +239,8 @@ pub fn gauge_value(name: &'static str) -> f64 {
     LOCAL_REGISTRY.get().and_then(|r| r.get_gauge(&metrics::Key::from_name(name))).map_or(0.0, |g| f64::from_bits(g.load(Relaxed)))
 }
 
-/// Test helper: installs just the local (non-OTel) side of `init_metrics()`'s recorder, so a
-/// unit/integration test can assert on `metrics::counter!()`/`histogram!()` values via
-/// `counter_value()`/`gauge_value()`/`histogram_quantile()` without a running OTLP collector.
-/// A no-op if a recorder is already installed (e.g. the test runs against a fully bootstrapped
-/// server) — matches `init_metrics()`'s own idempotence.
+/// Test helper: installs only the local (non-OTel) recorder, so tests can read
+/// back `counter!`/`histogram!` values without an OTLP collector. Idempotent.
 pub fn init_local_metrics_for_test() {
     let local = LocalRecorder::new();
     publish_local(local.clone(), local);
@@ -343,15 +275,9 @@ pub fn init_metrics(
 
     let meter = opentelemetry::global::meter("timefusion");
 
-    // Bridges the `metrics` facade (counter!/histogram!/gauge! macros) onto this
-    // same Meter/provider, so ad-hoc call-site metrics (e.g. database::ScanMetrics's
-    // ~40 counters) don't need a hand-rolled Counter/instrument wired through a
-    // struct field. Fanned out to two recorders because the OTel bridge is
-    // push-only (no snapshot API): `local_histograms`/`local_registry` also get
-    // every call so `timefusion_stats` can read values back in-process via
-    // `histogram_quantile()`/`counter_value()`/`gauge_value()`.
-    // Idempotent-guarded by the METRICS OnceLock above; ignore "already installed"
-    // from a second init_metrics() call (tests, embedded use).
+    // Bridges the `metrics` facade onto this Meter. Fanned out to two recorders
+    // because the OTel bridge is push-only: the local arm is what makes values
+    // readable back in-process for `timefusion_stats`.
     let local = LocalRecorder::new();
     let fanout = metrics_util::layers::FanoutBuilder::default()
         .add_recorder(local.clone())
@@ -359,9 +285,8 @@ pub fn init_metrics(
         .build();
     publish_local(local, fanout);
 
-    // Observable gauges polled from snapshot_stats() each export cycle. We
-    // build one shared snapshot per export by stashing the Weak; if the
-    // upgrade fails (layer dropped during shutdown), each gauge records 0.
+    // Observable gauges polled from snapshot_stats() each export cycle; if the
+    // Weak upgrade fails (layer dropped during shutdown) the gauge observes nothing.
     let bl_for_buckets = buffered_layer.clone();
     meter
         .u64_observable_gauge("timefusion.mem_buffer.oldest_bucket_age_seconds")
@@ -373,13 +298,9 @@ pub fn init_metrics(
         })
         .build();
 
-    // Each simple metric upgrades the Weak, snapshots stats, and observes one
-    // derived value; the macro captures that shape so each is a single line.
-    // Metrics with conditional/Option logic (oldest bucket age, index lag) stay
-    // spelled out. `counter` registers a monotonic observable counter (OTel Sum
-    // → Prometheus Counter) so PromQL rate() applies reset detection and
-    // survives restarts (values snap to 0 on boot); use it for cumulative
-    // totals, `gauge` for point-in-time levels.
+    // Upgrade the Weak, snapshot stats, observe one derived value. Use `counter`
+    // for cumulative totals (OTel Sum, so rate() survives the restart-to-0) and
+    // `gauge` for point-in-time levels.
     macro_rules! layer_metric {
         (@build $method:ident, $id:literal, $desc:literal, |$s:ident| $value:expr) => {{
             let weak = buffered_layer.clone();
@@ -398,8 +319,8 @@ pub fn init_metrics(
         (counter $($rest:tt)+) => { layer_metric!(@build u64_observable_counter, $($rest)+) };
     }
 
-    /// Same shape for gauges whose source is a process-global atomic (no Weak,
-    /// no snapshot) — `$read` is evaluated once per export cycle.
+    /// Gauges sourced from a process-global atomic; `$read` is evaluated once
+    /// per export cycle.
     macro_rules! atomic_gauge {
         ($id:literal, $desc:literal, $read:expr) => {
             meter.u64_observable_gauge($id).with_description($desc).with_callback(|obs| obs.observe($read, &[])).build();
@@ -409,11 +330,8 @@ pub fn init_metrics(
     layer_metric!(gauge "timefusion.mem_buffer.pressure_pct", "MemBuffer memory pressure as percentage of max", |s| s.pressure_pct as u64);
     layer_metric!(gauge "timefusion.mem_buffer.estimated_bytes", "MemBuffer estimated heap residency in bytes", |s| s.mem_estimated_bytes as u64);
     layer_metric!(gauge "timefusion.mem_buffer.rows", "Total rows in MemBuffer across all projects/tables", |s| s.mem_total_rows as u64);
-    // Ingest vs drain: rate() these two and compare. Ingested climbing faster
-    // than flushed (while pressure_pct=100, flush_failed flat) = ingest
-    // outpacing a working drain, not a stuck flush. Counters (not gauges) so
-    // rate() handles the restart-to-0 reset. `ingested` includes WAL-recovered
-    // rows so the pair stays comparable after a restart (see snapshot_stats).
+    // Ingest vs drain: rate() these two and compare. `ingested` includes
+    // WAL-recovered rows so the pair stays comparable after a restart.
     layer_metric!(counter "timefusion.mem_buffer.rows_ingested_total", "Cumulative rows accepted into MemBuffer (incl. WAL recovery)", |s| s
         .rows_ingested_total);
     layer_metric!(counter "timefusion.mem_buffer.rows_flushed_total", "Cumulative rows drained from MemBuffer to Delta", |s| s.rows_flushed_total);
@@ -423,18 +341,12 @@ pub fn init_metrics(
         .tantivy_recovery_pending_files
         as u64);
 
-    // Extracted-index disk cache, as of the last reap. Shares a volume with
-    // the WAL, so a plateau at the configured budget is healthy and a climb
-    // past it means the reap cron has stopped running.
     atomic_gauge!(
         "timefusion.tantivy.cache_disk_bytes",
         "Bytes under <data_dir>/tantivy_cache as of the most recent reap; 0 until the first one runs",
         TANTIVY_CACHE_BYTES.load(Relaxed)
     );
 
-    // Runtime scheduling lag — see `spawn_runtime_lag_sampler`. `last` is the
-    // current state; `max` is the high-water mark for the process lifetime, so
-    // a spike that has since recovered is still visible after the fact.
     atomic_gauge!(
         "timefusion.runtime.scheduling_lag_ms",
         "How late a 500ms timer task actually woke — nonzero means workers are starved, which is what a missed health probe looks like from inside",
@@ -457,9 +369,6 @@ pub fn init_metrics(
         maintenance_stats().rollup_oldest_invalidation_age_secs.load(Relaxed)
     );
 
-    // Index lag: how far behind ingest the newest published tantivy index is.
-    // Computed as max(0, now - newest_max_timestamp). Surfaces the post-flush
-    // indexing lag that the rewriter / search service can't shortcut around.
     if let Some(indexer_weak) = tantivy_indexer {
         meter
             .u64_observable_gauge("timefusion.tantivy.index_lag_seconds")
@@ -480,12 +389,9 @@ pub fn init_metrics(
     Ok(())
 }
 
-/// Build the standard (project_id, table_name) attribute pair.
-/// Cardinality math at typical multi-tenant scale: ~100 projects × ~20
-/// tables = 2k series per counter, which OTel handles cleanly. If a
-/// deployment has thousands of projects, switch to label-only on
-/// table_name (or drop project_id) — but that's an upstream knob, not
-/// something to gate at this layer.
+/// Build the standard (project_id, table_name) attribute pair. Series
+/// cardinality is projects × tables — drop `project_id` if a deployment has
+/// thousands of projects.
 fn ingest_attrs(project_id: &str, table_name: &str) -> [KeyValue; 2] {
     [KeyValue::new("project_id", project_id.to_string()), KeyValue::new("table_name", table_name.to_string())]
 }
@@ -518,23 +424,16 @@ pub fn record_flush(success: bool) {
     }
 }
 
-/// Last observed size of the tantivy extracted-index disk cache. Written by
-/// the reap cron, read by the `cache_disk_bytes` gauge callback — the walk it
-/// comes from is far too expensive to run per scrape.
+/// Last observed size of the tantivy extracted-index disk cache. Written by the
+/// reap cron — the directory walk is too expensive to run per scrape.
 static TANTIVY_CACHE_BYTES: AtomicU64 = AtomicU64::new(0);
 
 pub fn record_tantivy_cache_bytes(bytes: u64) {
     TANTIVY_CACHE_BYTES.store(bytes, Relaxed);
 }
 
-/// When this process started, as seen from inside it.
-///
-/// Every accrual and latency number this process reports is only readable
-/// against its own age — a counter reads 0 because it was never exercised or
-/// because the process is four minutes old, and those imply opposite work
-/// (2026-08-23: a tantivy accrual "fix" was credited twice to what was purely
-/// process age). `docker service ps` answers this from outside, but nothing
-/// pairs it with the numbers themselves; `timefusion_stats` now does.
+/// When this process started, as seen from inside it — every accrual counter is
+/// only interpretable against process age.
 static PROCESS_START: LazyLock<std::time::Instant> = LazyLock::new(std::time::Instant::now);
 
 /// Pin the process-start instant. Idempotent; call as early as possible in
@@ -549,11 +448,8 @@ pub fn process_uptime_secs() -> u64 {
 }
 
 /// WHICH instance this is — minted on first use, never reused, and stamped on
-/// everything a restart may have to disown (see `resume_guarded`).
-///
-/// The PID cannot serve: prod runs as PID 1 inside a container, so every
-/// restart would claim to be the same process — the one answer that turns
-/// "somebody else staged this" into "we are still staging it".
+/// everything a restart may have to disown. The PID cannot serve: the process
+/// runs as PID 1 in a container, so every restart would look like the same one.
 pub fn instance_id() -> &'static str {
     static INSTANCE_ID: LazyLock<String> = LazyLock::new(|| uuid::Uuid::new_v4().to_string());
     &INSTANCE_ID
@@ -570,23 +466,9 @@ static RUNTIME_LAG_MAX_MS: AtomicU64 = AtomicU64::new(0);
 /// high-water mark that never comes back down.
 static RUNTIME_LAG_LAST_MS: AtomicU64 = AtomicU64::new(0);
 
-/// How late a task that asked to wake in exactly `SAMPLE_EVERY` actually woke.
-///
-/// This is the direct test of the "the health probe lost its runtime slice"
-/// hypothesis behind the 2026-08-11 `exit 137` (probe deadline missed at CPU
-/// 805%/4800% and 17.8 of 96 GiB — neither saturation nor OOM, so the cause was
-/// never visible in resource metrics). Every maintenance sort, repair rewrite
-/// and flush escalation runs on the same multi-thread runtime as the pgwire
-/// handshake; CPU-bound work that does not yield starves it, and this is what
-/// that looks like from inside.
-///
-/// Read it against the probe's `auth_ms` stage: lag spiking into the seconds at
-/// the moment a probe misses confirms starvation and points at a dedicated
-/// runtime for the listener. Lag flat while probes still miss rules it out, and
-/// the search moves to the accept path.
-///
-/// Cost is one timer wakeup per interval — deliberately cheap enough to leave
-/// on in prod, since the failure it explains only happens in prod.
+/// Samples how late a task that asked to wake in exactly `SAMPLE_EVERY` really
+/// woke — i.e. whether CPU-bound work is starving the runtime the pgwire
+/// handshake shares. Cost is one timer wakeup per interval.
 pub fn spawn_runtime_lag_sampler(cancel: tokio_util::sync::CancellationToken) {
     const SAMPLE_EVERY: Duration = Duration::from_millis(500);
     // Below this, a sample is ordinary timer slack and not worth a log line.
@@ -599,8 +481,7 @@ pub fn spawn_runtime_lag_sampler(cancel: tokio_util::sync::CancellationToken) {
                 _ = tokio::time::sleep_until(deadline) => {}
             }
             // `sleep_until` fires no EARLIER than the deadline, so the excess is
-            // entirely scheduling delay: the timer expired and no worker picked
-            // this task up.
+            // entirely scheduling delay.
             let lag_ms = tokio::time::Instant::now().saturating_duration_since(deadline).as_millis();
             RUNTIME_LAG_LAST_MS.store(lag_ms as u64, Relaxed);
             RUNTIME_LAG_MAX_MS.fetch_max(lag_ms as u64, Relaxed);
@@ -619,12 +500,9 @@ struct SectionStat {
     max_us: AtomicU64,
 }
 
-/// Keyed by `(component, name)`. The component keeps the two kinds apart and is
-/// load-bearing: a `block` row claims a worker was OCCUPIED for that long, a
-/// `section` row only claims wall time, which for an `async` body includes
-/// awaits that gave the worker back. Reading one as the other is how "blocked"
-/// and "slow" get confused, which is the exact confusion this plan exists to
-/// resolve.
+/// Keyed by `(component, name)`. The component is load-bearing: a `block` row
+/// claims a worker was OCCUPIED that long, a `section` row only claims wall
+/// time, which for an `async` body includes awaits that gave the worker back.
 static SECTION_STATS: LazyLock<dashmap::DashMap<(&'static str, &'static str), SectionStat>> = LazyLock::new(dashmap::DashMap::new);
 
 fn record_section(component: &'static str, name: &'static str, elapsed: Duration) {
@@ -638,19 +516,9 @@ fn record_section(component: &'static str, name: &'static str, elapsed: Duration
 /// Times a section that occupies a runtime worker without yielding — a
 /// `std::sync::Mutex` hold, a synchronous rebuild. **Not for `async` bodies**:
 /// use [`TimedSection`] there, which makes no occupancy claim.
-///
-/// This is the instrument `scheduling_lag_ms` asks for and cannot supply: lag
-/// says workers woke late while the host was half idle, which means blocked,
-/// not busy — but not *where*. A CPU sampler is the wrong tool for the same
-/// reason (a blocked worker samples as idle), and prod has none anyway since
-/// the 2026-08-11 SIGSEGV crashloop. Wrap the suspects instead and let
-/// `max_ms` name them.
-///
-/// Cost is two `Instant::now()` and one atomic triple per section entry.
 pub struct BlockWatch(&'static str, std::time::Instant);
 
-/// Wall time of a named section, awaits included. Answers "does this get slower
-/// as the process ages" — hypothesis 3 — without claiming a worker was held.
+/// Wall time of a named section, awaits included — no claim that a worker was held.
 pub struct TimedSection(&'static str, std::time::Instant);
 
 macro_rules! section_timer {
@@ -675,24 +543,14 @@ macro_rules! section_timer {
 section_timer!(BlockWatch, "block", warn_ms = 250, "blocking section held a runtime worker — queries scheduled onto this worker waited behind it");
 section_timer!(TimedSection, "section");
 
-/// jemalloc's own arena accounting, in bytes: `(allocated, active, resident, mapped, retained)`.
-///
-/// `resident - allocated` is fragmentation — memory the kernel has given this
-/// process that no live allocation is using. It is the one quantity left that
-/// could explain the 2026-08-24 finding: query cost flat for an hour, then
-/// climbing past ~1.5 h of uptime, while `journal_hold` froze,
-/// `delta_snapshot_refresh` FELL, buffer pressure stayed at 0–7 % and
-/// `scheduling_lag_ms` never left 0–1. None of those grow; fragmentation does,
-/// and this process churns 13–26 GB every few minutes.
-///
-/// `None` off Linux or without `--features profiling`, where jemalloc is not
-/// the allocator (prod builds with it — see the Dockerfile). Same posture as
-/// the tantivy rows: absent, never faked zeros.
+/// jemalloc's arena accounting, in bytes: `(allocated, active, resident, mapped,
+/// retained)`; `resident - allocated` is fragmentation. `None` off Linux or
+/// without `--features profiling`, where jemalloc is not the allocator.
 #[cfg(all(feature = "profiling", target_os = "linux"))]
 pub fn jemalloc_bytes() -> Option<(u64, u64, u64, u64, u64)> {
     use tikv_jemalloc_ctl::{epoch, stats};
-    // jemalloc's stats are cached; advancing the epoch is what refreshes them.
-    // Without this every sample returns the values from process start.
+    // jemalloc's stats are cached; without advancing the epoch every sample
+    // returns the values from process start.
     epoch::advance().ok()?;
     Some((
         stats::allocated::read().ok()? as u64,
@@ -730,10 +588,9 @@ impl<T> Watched<T> {
     }
 }
 
-/// Generates the no-attribute "increment by one" recorders. Each no-ops on the
-/// OTel side if metrics weren't initialized; `mirror STATIC.field` additionally
-/// bumps a process-global atomic, which — unlike an OTel counter — is readable
-/// back in-process by the `timefusion_stats` view and by tests.
+/// Generates the no-attribute "increment by one" recorders. `mirror
+/// STATIC.field` additionally bumps a process-global atomic, which — unlike an
+/// OTel counter — is readable back in-process by `timefusion_stats` and tests.
 macro_rules! recorders {
     ($($(#[$doc:meta])* $fn_name:ident => $field:ident $(mirror $stats:ident . $mirrored:ident)?),+ $(,)?) => {
         $(
@@ -843,23 +700,8 @@ pub fn record_rollup_hit(mode: &'static str, grain: &str) {
 }
 
 /// True on the first, and then every `ROLLUP_MISS_SAMPLE`th, miss under `key` —
-/// for logging one refused plan with context. Misses run at several per second
-/// on a busy node, so the counter is what you alert on and this is what you
-/// diagnose with.
-///
-/// Budgeted PER KEY. A single shared counter made "does this class ever get
-/// looked at" a function of some other class's rate: prod ran ~1.7 misses/min
-/// across all reasons, so a divisor of 512 is one line per ~5 HOURS and a
-/// measured 4.5h window held exactly ONE sample — of whichever reason happened
-/// to land on the multiple. Keying on the reason bounds the rate within a class
-/// instead of across them, and since the count returned is the one BEFORE the
-/// increment, a key's first occurrence in a process always samples: a rare class
-/// is diagnosable at once rather than after five hours of waiting for its turn.
-///
-/// 64 then sets the steady state. Per key it is what 512 was meant to be and
-/// never was: the largest class measured on prod (~0.5/min) renders once per
-/// ~2h, while the 2.7/s storm the old divisor was sized against — one reason,
-/// 2026-08-17 — still prints only ~2.5 lines/min, the same order as before.
+/// for logging one refused plan with context. Budgeted PER KEY, so a rare miss
+/// reason stays diagnosable regardless of how noisy the other reasons are.
 pub fn sample_rollup_miss(key: &'static str) -> bool {
     const ROLLUP_MISS_SAMPLE: u64 = 64;
     static SEEN: LazyLock<dashmap::DashMap<&'static str, AtomicU64>> = LazyLock::new(dashmap::DashMap::new);
@@ -867,14 +709,9 @@ pub fn sample_rollup_miss(key: &'static str) -> bool {
     SEEN.entry(key).or_default().fetch_add(1, Relaxed).is_multiple_of(ROLLUP_MISS_SAMPLE)
 }
 
-/// One dashboard aggregate that fell through to a raw scan.
-///
-/// Takes the REASON, not its label: the match below is exhaustive, so a new
-/// variant fails the build instead of landing in a catch-all bucket. It
-/// previously matched on the string and four of the thirteen reasons had no
-/// arm, so `missing_project`, `unbounded_time`, `non_decomposable` and
-/// `rewrite_schema_mismatch` were indistinguishable in prod — 29 misses that
-/// could not be diagnosed without a deploy.
+/// One dashboard aggregate that fell through to a raw scan. Takes the REASON,
+/// not its label, so the exhaustive match below fails the build on a new variant
+/// instead of silently bucketing it.
 pub fn record_rollup_miss(reason: crate::rollup::MissReason) {
     use crate::rollup::MissReason as R;
     let stats = maintenance_stats();
@@ -916,12 +753,9 @@ pub fn record_commit_timeout(op: &'static str) {
 }
 
 /// Declares a process-global atomic-counter struct together with its all-zero
-/// static AND its `timefusion_stats` rows, so a new counter can drift from
-/// neither its initializer nor the readout. On 2026-08-25 two counters were
-/// incremented with no arm in `pg_compat`, so no `SELECT` would ever have shown
-/// them; there is deliberately no "declared but not exposed" arm here.
-/// The row key defaults to the field name — `field as "key"` pins the
-/// historical key where it differs (usually a `_total` suffix).
+/// static AND its `timefusion_stats` rows, so a counter cannot be declared
+/// without being exposed. The row key defaults to the field name; `field as
+/// "key"` pins a different one (usually a `_total` suffix).
 macro_rules! atomic_stats {
     ($(#[$sm:meta])* $name:ident => $global:ident as $component:literal { $($(#[$fm:meta])* $field:ident $(as $key:literal)?),+ $(,)? }) => {
         $(#[$sm])*
@@ -949,11 +783,9 @@ atomic_stats! {
         occ_conflicts as "occ_conflicts_total",
         retry_successes as "retry_successes_total",
         retry_exhausted as "retry_exhausted_total",
-        /// Delta merges executed by coalescer drains — readable in-process (the
-        /// OTel counter isn't); tests assert on deltas of this to pin folding.
+        /// Delta merges executed by coalescer drains.
         coalesce_merges,
-        /// Groups parked to `<wal_dir>/quarantine/dml` — in-process readable so
-        /// tests can assert the terminal branch parks instead of dropping.
+        /// Groups parked to `<wal_dir>/quarantine/dml`.
         coalesce_quarantined,
     }
 }
@@ -963,101 +795,74 @@ pub fn dml_stats() -> &'static DmlStats {
 }
 
 atomic_stats! {
-    /// Readable maintenance counters for the `timefusion_stats` view — the OTel
-    /// counters above can't be read back in-process. Process-global const atomics
-    /// (no init needed), incremented by the out-of-band checkpoint + reconcile
-    /// tasks. `checkpoint_lag_versions` is the last observed max lag (a gauge), the
-    /// rest are monotonic.
+    /// Maintenance counters for the `timefusion_stats` view — the OTel counters
+    /// above can't be read back in-process. Monotonic unless noted as a gauge.
     #[derive(Default)]
     MaintenanceStats => MAINTENANCE_STATS as "maintenance" {
         checkpoints_created,
-        /// Durable maintenance-journal commits actually performed, and the
-        /// callers that rode someone else's instead of paying for their own
-        /// `fsync` (see `support::GroupCommit`). Both are gauges republished
-        /// from the committer. `coalesced / (performed + coalesced)` is the
-        /// share of the ingest path's durability barrier that costs no IO;
-        /// near zero under load means the batching is not engaging.
+        /// Durable journal commits performed, and the callers that rode someone
+        /// else's `fsync` instead (see `support::GroupCommit`). Both gauges.
+        /// `coalesced / (performed + coalesced)` is the share of the durability
+        /// barrier that costs no IO.
         journal_commits,
         journal_commits_coalesced,
         checkpoint_failed,
-        /// Checkpoints that wrote OK but failed post-write footer verification
-        /// (the referenced object isn't a readable Parquet). Log cleanup is
-        /// withheld so the JSON log stays recoverable. PAGE if > 0.
+        /// Checkpoints that wrote OK but failed post-write footer verification.
+        /// Log cleanup is withheld so the JSON log stays recoverable. PAGE if > 0.
         checkpoint_corrupt,
         log_files_cleaned,
         log_cleanup_failed,
-        // Max version lag (current - last checkpointed) seen at the last
-        // checkpoint tick. Should stay near checkpoint_interval; a large,
-        // growing value means the checkpoint task is failing or wedged.
+        // Gauge: max version lag (current - last checkpointed) at the last tick.
+        // Large and growing means the checkpoint task is failing or wedged.
         checkpoint_lag_versions,
-        // NONZERO = committed parquet was destroyed elsewhere (2026-07-09
-        // commit-path deletion bug). PAGE and investigate.
+        // NONZERO = committed parquet was destroyed elsewhere. PAGE and investigate.
         dangling_removed,
         reconcile_failed,
         dedup_timed_out as "dedup_timed_out_total",
         dedup_failed as "dedup_failed_total",
         /// Adds a rewrite planner had to drop because the in-memory snapshot listed
         /// the same file twice. Nonzero means reads over that table double-count
-        /// rows — the file list diverged from the log, which no amount of dedup or
-        /// compaction repairs on its own. PAGE if > 0.
+        /// rows — the file list diverged from the log. PAGE if > 0.
         snapshot_duplicate_adds,
         light_optimize_timed_out as "light_optimize_timed_out_total",
-        /// Maintenance units PARKED on a deterministic plan error (a missing field)
-        /// rather than bisected — the 2026-08-24 amplifier, where shredding one bad
-        /// rollup spec failed 477 of 658 claims in eight minutes. Nonzero means a
-        /// spec names a column its source files do not have; the fix is a rebuild or
-        /// a deploy, and no amount of retrying is one.
+        /// Units PARKED on a deterministic plan error (a spec naming a column its
+        /// source files lack) rather than bisected — retrying cannot fix these.
         maintenance_schema_parked as "maintenance_schema_parked_total",
         light_optimize_failed as "light_optimize_failed_total",
         /// Ticks that hit the wall-clock budget with hot projects still pending.
         light_optimize_tick_truncated as "light_optimize_tick_truncated_total",
         /// Wave-engine per-tick accounting. `planned` counts projects the tick's
         /// single metadata walk found work for; `completed` counts bins that landed.
-        /// ALERT when completed lags planned for N consecutive ticks — that's the
-        /// "8 of 11 hot projects never reached" shape (prod 2026-07-29).
+        /// ALERT when completed lags planned for N consecutive ticks.
         light_optimize_projects_planned as "light_optimize_projects_planned_total",
         light_optimize_projects_completed as "light_optimize_projects_completed_total",
         light_optimize_bins_committed as "light_optimize_bins_committed_total",
         light_optimize_waves_committed as "light_optimize_waves_committed_total",
-        /// GAUGE: repair bins sorting right now. A repair pass runs for up to
-        /// `timefusion_footer_repair_budget_secs` and logs nothing between its
-        /// per-bin events, so this is the only cheap way to tell "repair is
-        /// grinding" from "repair is wedged" without SSH.
+        /// GAUGE: repair bins sorting right now — tells "repair is grinding" from
+        /// "repair is wedged" between the sparse per-bin log events.
         repair_bins_in_flight,
         /// Dedup-engine waves (data_change: true) — counted separately so the
         /// light_optimize_* counters mean pure compaction only.
         dedup_bins_committed as "dedup_bins_committed_total",
         dedup_waves_committed as "dedup_waves_committed_total",
         /// Dedup bins STAGED via the deletion-vector path (marks losers with a
-        /// DV bitmap instead of rewriting whole files). Direct proof the DV lever
-        /// is engaging — without it, confirming DV vs copy-on-write dedup in prod
-        /// meant grepping S3 for `.bin` sidecars (the 2026-09-06 deploy).
+        /// DV bitmap instead of rewriting whole files).
         dv_dedup_bins_staged as "dv_dedup_bins_staged_total",
         /// Dedup slices NOT re-pended at reconcile because their commit was a
-        /// self-authored DV-dedup wave (`timefusion.dv_dedup`) — the companion
-        /// floor-lever. This is #4's DIRECT effect: sum of Dedup slices skipped,
-        /// i.e. re-mints the boot reconcile would otherwise upsert Complete→Pending
-        /// (the ~500 `pending_dedup` floor). Rollup re-mint is untouched. 0 with the
-        /// lever off or no DV-dedup commits since the cursor.
+        /// self-authored DV-dedup wave (`timefusion.dv_dedup`).
         dedup_remint_skipped as "dedup_remint_skipped_total",
         /// Rollup slices NOT re-minted because the only commits touching the hour
-        /// were self-authored DV-dedup waves. Symmetric to `dedup_remint_skipped`:
-        /// a DV wave moves neither the partition stats fingerprint nor
-        /// `rollup_source_epochs`, so existing rollup coverage stays valid, and
-        /// the base build already reads its raw input deduped — a rebuild would be
-        /// byte-identical. This is the direct measure of the wasted rollup rebuild
-        /// tax removed (prod 2026-09-07: BaseRollup +111 in 100 min from this).
+        /// were self-authored DV-dedup waves: such a wave moves neither the
+        /// partition stats fingerprint nor `rollup_source_epochs`, and the base
+        /// build already reads its raw input deduped, so a rebuild would be
+        /// byte-identical.
         rollup_remint_skipped as "rollup_remint_skipped_total",
         /// Rollup units COMPLETED without rebuilding because their input file set
         /// (deletion vectors included) was unchanged since the live slice coverage
         /// was published. `rollup_remint_skipped` prevents a task being created;
-        /// this catches the ones created anyway — by the reconciler observing any
-        /// commit, or by the derived tier's `skipped_generation` mint — and proves
-        /// the rebuild redundant at claim time instead of paying for it.
-        ///
-        /// Read against `rollup_staged_projects_total`: the two sum to the units
-        /// claimed, so the ratio is the share of rollup work that was bookkeeping.
-        /// Prod 2026-09-11 measured that share at 72.6% of BaseRollup bytes.
+        /// this catches the ones created anyway and proves the rebuild redundant at
+        /// claim time. Read against `rollup_staged_projects_total`: the two sum to
+        /// the units claimed.
         rollup_noop_rebuild_skipped as "rollup_noop_rebuild_skipped_total",
         /// Rollup slice witnesses repaired in place across a landed dedup,
         /// rather than invalidated.
@@ -1071,65 +876,33 @@ atomic_stats! {
         /// climbing is the EXPECTED shape, not a failure of the carry.
         rollup_witness_carried as "rollup_witness_carried_total",
         /// How many times the maintenance gauges were actually recomputed.
-        ///
-        /// `publish_statistics` is a full linear scan of the journal, and
-        /// `checkpoint` used to call it unconditionally — every claim, completion
-        /// and retry, under the one global `Mutex<TaskJournal>`. Prod 2026-09-11:
-        /// 71,849 tasks, ~2,032 checkpoints/min, 1.70 ms per scan measured at
-        /// that size — about a third of the 5.45 ms average `journal_hold`.
-        ///
-        /// Read against the checkpoint rate: this should sit near one per second
-        /// however busy maintenance gets. Tracking the checkpoint rate instead
-        /// means the throttle is not firing.
+        /// `publish_statistics` is a full linear scan of the journal under the one
+        /// global `Mutex<TaskJournal>`, so it is throttled: this should sit near
+        /// one per second however busy maintenance gets. Tracking the checkpoint
+        /// rate instead means the throttle is not firing.
         journal_stats_publishes as "journal_stats_publishes_total",
-        /// Finished tasks dropped from the journal because their slice is past
-        /// the abandonment horizon. A prod census on 2026-09-12 found 15,202 of
-        /// 79,682 (19.1%) in that state, so the first compaction after a deploy
-        /// should move this sharply once and then only trickle.
-        ///
-        /// Read `tasks_complete` alongside it: if this climbs while that does
-        /// not fall, something is re-creating the keys being pruned.
+        /// Finished tasks dropped from the journal because their slice is past the
+        /// abandonment horizon. If this climbs while `tasks_complete` does not
+        /// fall, something is re-creating the keys being pruned.
         journal_retired_tasks_pruned as "journal_retired_tasks_pruned_total",
         /// Base files a DERIVED unit refused for an obsolete generation, split by
-        /// whether refusing them actually cost anything.
-        ///
-        /// `reproduced` — the CURRENT-generation files the unit selected already
-        /// cover the refused file's whole span, so excluding it loses no rows and
-        /// no rebuild is demanded. This is the livelock that was: prod 2026-09-11
-        /// had derived units at attempts=78 minting a base rebuild every 32
-        /// minutes over `skipped_generation=1`, and the rebuild could never clear
-        /// it because `slice_retires` only retires a file CONTAINED in the
-        /// publishing slice.
-        ///
-        /// `unreproduced` — a genuine hole in current-generation evidence. The
-        /// unit mints the base rebuild and retries, exactly as before.
-        ///
-        /// Chronically rising `reproduced` with a flat `rollup_tier_untagged_found`
-        /// means obsolete tier files are accumulating and nothing retires them —
-        /// real garbage, but no longer a livelock.
+        /// whether refusing them cost anything. `reproduced`: the current-generation
+        /// files already cover the refused file's whole span, so no rebuild is
+        /// demanded. `unreproduced`: a genuine hole, so the unit mints the base
+        /// rebuild and retries. Rising `reproduced` with a flat
+        /// `rollup_tier_untagged_found` means obsolete tier files are accumulating.
         rollup_base_refusal_reproduced as "rollup_base_refusal_reproduced_total",
         rollup_base_refusal_unreproduced as "rollup_base_refusal_unreproduced_total",
         /// Rollup-journal writes performed, and the ones skipped because the
-        /// encoded content had not moved since the last successful store.
-        ///
-        /// `store` costs TWO `fsync`s (temp file, then the parent directory
-        /// after the rename) and runs inside every group commit beside the task
-        /// journal's own — three per commit. Prod 2026-09-12 performed 30,075
-        /// commits in 2,640 s (11.4/s), which is ~100% duty on the commit
-        /// pipeline: `block.journal_commit_wait` averaged 362 ms, max 10.7 s,
-        /// on the pre-ack path.
-        ///
-        /// Read `skipped / (skipped + persists)`: steady ingest re-invalidates
-        /// the same hours idempotently, so a healthy system skips most commits.
-        /// A ratio near zero means the journal really is changing every commit
-        /// and the remaining cost is genuine.
+        /// encoded content had not moved since the last successful store. `store`
+        /// costs two `fsync`s inside every group commit, so a healthy system —
+        /// where steady ingest re-invalidates the same hours idempotently — skips
+        /// most of them; read `skipped / (skipped + persists)`.
         rollup_journal_persists as "rollup_journal_persists_total",
         rollup_journal_persist_skipped as "rollup_journal_persist_skipped_total",
         /// Writes DEFERRED because the journal had changed but was written less
         /// than `ROLLUP_JOURNAL_MAX_STALENESS` ago. Deferred, never dropped: the
-        /// content is still different at the next commit, so the next one past
-        /// the window writes it, and shutdown forces one. This is the term that
-        /// scales with ingest — `skipped` is the idle case.
+        /// next commit past the window writes it, and shutdown forces one.
         rollup_journal_persist_deferred as "rollup_journal_persist_deferred_total",
         /// Waves not STARTED because the WAL was over its emergency-flush threshold
         /// (durability outranks compaction) or memory was near the cgroup limit.
@@ -1142,100 +915,59 @@ atomic_stats! {
         light_optimize_memory_brakes as "light_optimize_memory_brakes_total",
         /// Scans on a `version_append` table where the Delta leg did NOT already
         /// satisfy keep-greatest's ordering, so a `SortExec` was injected over it.
-        ///
-        /// Zero is the healthy state and the PRECONDITION for turning
-        /// `version_append` on for a busy table: the sort is per-partition and
-        /// spillable, but prod's `otel_logs_and_spans` scans read 48 file groups
-        /// (2026-08-01), and 48 concurrent sorts over a measured 145MB peak batch is
-        /// the 2026-07-20 wide-scan OOM shape. Nonzero here means the partition
-        /// carries files without an honest sorted footer — today that is the DML
-        /// rewrite path (`dml_writer_properties` passes `declare_sorted=false`),
-        /// which merge-on-read removes by construction.
+        /// Zero is the healthy state and the PRECONDITION for enabling
+        /// `version_append` on a busy table — one sort per file group over a wide
+        /// scan is an OOM shape. Nonzero means the partition carries files without
+        /// an honest sorted footer.
         mor_delta_leg_sorts as "mor_delta_leg_sorts_total",
         /// Escalated flush sorts that FAILED and wrote their group unsorted. One
         /// unsorted file disables the reader's footer ordering for every scan
-        /// touching its partition (query-time SortExec, unordered MOR dedup), so
-        /// any nonzero here is a read-path incident in the making (2026-08-03).
+        /// touching its partition (query-time SortExec, unordered MOR dedup).
         flush_sort_unsorted_fallbacks as "flush_sort_unsorted_fallbacks_total",
         /// Files marked verified-sorted BY THE WRITE that produced them, rather than
-        /// by reading their footer back. Every count here is a ranged read footer
-        /// repair does not have to pay, and a suspect that never enters admission.
-        ///
-        /// Read it against `flush_sort_unsorted_fallbacks`: this counts the files
-        /// whose footer we stamped, that one counts the files we could not. If this
-        /// stays 0 on a busy process the marking is not reaching the commit path —
-        /// and because the failure mode is a silently-empty path set (encoded vs
-        /// decoded `Add.path`), 0 here reads exactly like a working feature with
-        /// nothing to do. It is the falsifier for the whole mechanism.
+        /// by reading their footer back — each is a ranged read footer repair does
+        /// not pay. 0 on a busy process means the marking is not reaching the commit
+        /// path, which looks identical to a working feature with nothing to do.
         repair_sorted_at_write as "repair_sorted_at_write_total",
         /// Rounds where the WAL-backlog brake DEGRADED the wave to the one-project
         /// service floor (instead of stopping the tick). Chronic nonzero = ingest is
         /// outrunning flush often enough that compaction is running at the floor.
         light_optimize_ticks_degraded as "light_optimize_ticks_degraded_total",
-        /// Repair ticks skipped because ANOTHER table's repair pass already held the
+        /// Repair ticks skipped because ANOTHER table's repair pass held the
         /// process-wide permit. The light pool is shared across tables while the
-        /// wave engine's concurrency cap is per-table, so before this guard two
-        /// repair sorts could co-exist and starve each other (prod 2026-08-11 11:30,
-        /// `otel_metrics` vs `otel_logs_and_spans`, a 981 MB bin lost with 2.1 MB
-        /// left of 15.4 GB). Chronic nonzero = repair is contended, not broken; a
-        /// permanently-zero repair backlog on one table while this climbs means the
-        /// other table is monopolising the permit.
+        /// wave engine's concurrency cap is per-table, so without this guard two
+        /// repair sorts co-exist and starve each other.
         repair_ticks_yielded,
         /// Packing/consolidation turns that declined to CLAIM because no
-        /// `light_rewrite_sem` permit was free. The alternative was claiming anyway
-        /// and blocking inside `stage_hot_bin` — prod 2026-08-25 spent 350-750s of
-        /// every 900s deadline exactly there, so a high number here is the queue
-        /// being paid in refusals (cheap, worker freed for rollup) instead of in
-        /// timeouts (a whole deadline, nothing committed). It is a saturation
-        /// gauge, not a fault: read it against
-        /// `maintenance_coordinator_unit_timed_out`, which it is meant to replace.
+        /// `light_rewrite_sem` permit was free. A saturation gauge, not a fault:
+        /// the alternative is claiming anyway and blocking inside `stage_hot_bin`
+        /// until the deadline, committing nothing.
         compaction_permits_unavailable,
-        /// Packing/consolidation turns that DID take a `light_rewrite_sem` permit.
-        ///
-        /// The denominator `compaction_permits_unavailable` never had. On its own
-        /// a refusal count cannot distinguish healthy contention from a lane that
-        /// is dead: prod 2026-09-12 read 1,812 refusals in 55 minutes and it took
-        /// forty minutes of code reading to establish that the acquisitions behind
-        /// it were 2 per hour, against 196 planned cells and 1.1 TB of sealed
-        /// debt. Read `acquired / (acquired + unavailable)`.
+        /// Packing/consolidation turns that DID take a `light_rewrite_sem` permit —
+        /// the denominator a refusal count needs. Read
+        /// `acquired / (acquired + unavailable)`.
         compaction_permits_acquired,
         /// Units killed by the absolute lifetime cap rather than by going idle —
-        /// see `coordinator_operation_lifetime_cap`.
-        ///
-        /// These are units that were making progress and still not converging. A
-        /// single one cost prod 7,634 s (8.5x its deadline) holding one of ~3
-        /// permits. Nonzero is the cap doing its job; it should be small, and if
-        /// it tracks the claim rate the units are being bisected too slowly.
+        /// see `coordinator_operation_lifetime_cap`. These were making progress and
+        /// still not converging; if this tracks the claim rate, units are being
+        /// bisected too slowly.
         maintenance_unit_lifetime_capped,
         /// `light_rewrite_sem` permits free, sampled whenever a hygiene turn asks
-        /// for one, and the TOTAL the semaphore was built with.
-        ///
-        /// `compaction_permits_unavailable` counts refusals and
-        /// `compaction_permits_acquired` counts successes, but neither can say
-        /// whether the permits are HELD or simply do not exist — and those need
-        /// opposite fixes. Prod 2026-09-12: 12 acquisitions against 6,948
-        /// refusals with zero units capped, which is consistent with both.
-        ///
-        /// `light_rewrite_permits_total` is derived at boot from
-        /// `coordinator_share / COORDINATOR_PER_SORT_BUDGET - repair_holdback`,
-        /// floored at 1 — an arithmetic chain across five functions that has
-        /// silently collapsed to 1 before (prod 2026-09-01, HotPacking stopped
-        /// being claimed at all). Exporting it means never deriving it by hand
-        /// again.
+        /// for one, and the TOTAL the semaphore was built with. Refusal and success
+        /// counts alone cannot say whether permits are HELD or simply do not exist,
+        /// and those need opposite fixes. `light_rewrite_permits_total` is derived
+        /// at boot from `coordinator_share / COORDINATOR_PER_SORT_BUDGET -
+        /// repair_holdback`, floored at 1 — never derive it by hand.
         light_rewrite_permits_available,
         light_rewrite_permits_total,
         /// Dashboard aggregates served from a rollup, split by how much of the
-        /// window the rollup owned. The OTel counters carry the same numbers but
-        /// cannot be read back in-process, and these two are the only signal that
-        /// says whether read routing is actually firing — `rollup_hits_hybrid`
-        /// specifically is the one that proves the raw-fringe union works, since a
-        /// full-window hit needs no union at all.
+        /// window the rollup owned. `rollup_hits_hybrid` is what proves the
+        /// raw-fringe union works, since a full-window hit needs no union.
         rollup_hits_full as "rollup_hits_full_total",
         rollup_hits_hybrid as "rollup_hits_hybrid_total",
         /// Partitions rebuilt from only the hours that changed, vs from scratch.
-        /// The ratio is the whole point of the dirty-hour tracking: a fall to zero
-        /// means something is widening the dirty set to the whole day and every
-        /// enrichment is paying for 24 hours of re-aggregation again.
+        /// Incremental falling to zero means something is widening the dirty set to
+        /// the whole day.
         rollup_rebuilds_incremental as "rollup_rebuilds_incremental_total",
         rollup_rebuilds_full as "rollup_rebuilds_full_total",
         rollup_dirty_partitions,
@@ -1246,26 +978,12 @@ atomic_stats! {
         /// Units that published ZERO rows while the tier they aggregate had published
         /// rows over the SAME slice — and were then marked `complete`, so nothing
         /// revisits them. Empty propagates: `rollup_slice_coverage` records an empty
-        /// publication as covered, so the next tier up sees no hole, reads nothing and
-        /// freezes the same way.
-        ///
-        /// Shipped as a counter first, on the `rollup_skipped_covered_by_wider`
-        /// precedent (#145): the failure has not been reproduced in a test, and the
-        /// obvious guard — retry instead of complete — risks refusing forever. The
-        /// 2026-08-28 prod journal held 276 derived and 450 base cases, none over an
-        /// empty source. If this moves, the guard is justified; the mechanism is still
-        /// open.
+        /// publication as covered, so the next tier up sees no hole and freezes too.
         rollup_published_empty_over_full_base,
         /// Base files a DERIVED unit refused although they carry slice tags, split by
-        /// which test refused them. `untagged_inputs` counts only files with NO tags,
-        /// so these two drops were invisible — prod read `rollup_untagged_inputs = 0`
-        /// while a unit could be skipping every input it had.
-        ///
-        /// `..._tag_range` is the width-sensitive one and is the instrument for the
-        /// 2026-08-28 finding that hour-wide derived units publish empty 14.5% of the
-        /// time while day-wide units never do (0 of 398). Read it against
-        /// `rollup_published_empty_over_full_base`: both moving together is the
-        /// selection hypothesis confirmed.
+        /// which test refused them. `rollup_untagged_inputs` counts only files with
+        /// NO tags, so without these two a unit can skip every input it has while
+        /// that counter reads 0.
         rollup_base_file_skipped_tag_project,
         rollup_base_file_skipped_tag_range,
         /// Relevant base files whose materialization generation could not be proved.
@@ -1274,118 +992,60 @@ atomic_stats! {
         /// Persisted coverage entries rejected during restart generation validation.
         rollup_ledger_seed_rejected_generation,
         /// Splits refused because the unit measured nearly what its parent measured:
-        /// bisection has hit the row-group floor and halving the width again buys
-        /// nothing but journal units.
-        ///
-        /// This is the instrument for the 2026-08-22 shred — 3,455 units for a
-        /// single (project, tier, day). Read it against `pending_base_rollup`: this
-        /// rising while pending stops growing is the fix working. This rising while
-        /// pending ALSO rises means units are being declined and then failing to
-        /// run, which is worse than the shred, not better.
+        /// bisection has hit the row-group floor and halving again buys nothing but
+        /// journal units. Rising while `pending_base_rollup` also rises means units
+        /// are being declined and then failing to run.
         split_declined_at_floor,
-        /// Splits refused for the OTHER reason: bisection produced one child or a
+        /// Splits refused for the OTHER reason: bisection produced one child, or a
         /// child that would need hash sharding, so there is no width to split to.
-        ///
-        /// Added 2026-08-28 because this branch returned `false` silently. The pin
-        /// that night — day-wide sealed units carrying 22-25 GB estimates, abandoned
-        /// 9/9 at the 900 s deadline and re-claimed forever — was only attributable
-        /// to `split_declined_at_floor` because that sibling happened to be counted.
-        /// Had it been this branch instead, nothing would have named it. Read the
-        /// two together: they are the complete set of reasons a unit that cannot
-        /// finish also cannot be made smaller.
+        /// Together with `split_declined_at_floor` this is the complete set of
+        /// reasons a unit that cannot finish also cannot be made smaller.
         split_declined_no_width,
         /// Dedup keys whose versions DISAGREE on a column declared immutable.
-        ///
         /// Immutability is enforced for UPDATE only, so an INSERT can append a
-        /// disagreeing version; read filters on immutable columns are pushed below
-        /// the dedup on the strength of that declaration. Non-zero means the read
-        /// path's premise is false in production and a pushed predicate can match a
-        /// version the winner does not satisfy.
-        ///
-        /// The audit runs unconditionally, so zero here means CLEAN rather than
-        /// "not measured" — the one reading a flag-gated version of this counter
-        /// could never give. Read it WITH `immutable_audit_shards_total`: the
-        /// streaming audit is armed by column lookup, so a rename could silently
-        /// disarm it and this counter would read zero for the other reason.
+        /// disagreeing version — and read filters on immutable columns are pushed
+        /// BELOW the dedup on the strength of that declaration. Non-zero means a
+        /// pushed predicate can match a version the winner does not satisfy. Read
+        /// with `immutable_audit_shards_total`, which says whether it ran at all.
         immutable_column_disagreement_total,
-        /// Dedup shards whose collapse ran with the immutable audit ARMED.
-        ///
-        /// The denominator for `immutable_column_disagreement_total`, and the
-        /// answer to the only question a zero there cannot settle by itself:
-        /// clean, or never measured? `RunCollapse::with_immutable_audit` resolves
-        /// columns by name and disarms itself when none resolve — cheap to do,
-        /// and invisible without this. Non-zero here plus zero there is a real
-        /// clean bill; zero here means the audit is not running at all.
+        /// Dedup shards whose collapse ran with the immutable audit ARMED — the
+        /// denominator for `immutable_column_disagreement_total`.
+        /// `RunCollapse::with_immutable_audit` resolves columns by name and disarms
+        /// itself when none resolve, so zero here means the audit is not running.
         immutable_audit_shards_total,
-        /// Partitions where the coverage ledger and the Delta tags disagree.
-        ///
-        /// The ledger is destined to be the authority, and an authority can DRIFT
-        /// where self-describing files cannot — that is the one risk the design
-        /// adds. This is the standing alarm against it, and it is why the tag replay
-        /// stays after reads move onto the ledger rather than being deleted with the
-        /// tags it reads.
-        ///
-        /// Must be zero before any read path trusts the ledger. Non-zero afterwards
-        /// means queries may be answered from coverage that is not there.
+        /// Partitions where the coverage ledger and the Delta tags disagree. Must be
+        /// zero before any read path trusts the ledger; non-zero afterwards means
+        /// queries may be answered from coverage that is not there.
         coverage_ledger_disagreements,
-        /// Ledger writes that did not reach disk.
-        ///
-        /// `store_sidecar` warns and continues, which is right for a hint and wrong
-        /// for an authority: the in-memory ledger goes on serving what it holds while
-        /// the durable copy falls behind, and nothing else would say so. Understating
-        /// coverage is the safe direction — it costs a rebuild, not a wrong answer —
-        /// so this is not fatal while the Delta tags remain. It must read ZERO
-        /// alongside `coverage_ledger_disagreements` before the tags can go.
+        /// Ledger writes that did not reach disk. `store_sidecar` warns and
+        /// continues, so the in-memory ledger keeps serving while the durable copy
+        /// falls behind. Must read ZERO alongside `coverage_ledger_disagreements`
+        /// before the Delta tags can be removed.
         coverage_ledger_persist_failures,
         /// Base rollup files carrying no parseable slice tags — history written
-        /// before tagging existed.
-        ///
-        /// Until #169 such a file was DROPPED, so it was invisible to the coarse
-        /// tier forever while the unit published rows=0 and completed,
-        /// indistinguishable from a genuinely empty slice. That is what this counter
-        /// was added to expose, and it did: 15 hits in 20 minutes against 16 of 16
-        /// derived publications at rows=0.
-        ///
-        /// It now counts files SELECTED by the fallback — pruned on their own
-        /// timestamp statistics instead of discarded — so it measures how much of the
-        /// base tier predates tagging, not how much is unreachable. Expect it to
-        /// shrink as those partitions are rewritten; a rise means older history is
-        /// being reached, which is the point.
+        /// before tagging existed. Counts files SELECTED by the fallback (pruned on
+        /// their own timestamp statistics), so it measures how much of the base tier
+        /// predates tagging, not how much is unreachable.
         rollup_untagged_inputs,
         /// Untagged files found LIVE IN A TIER at publish time (gauge, overwritten
-        /// per unit), and the running total this publish path has retired.
-        ///
-        /// A tier file with no identity tags used to be immortal — the replace-set
-        /// skipped it, so every rebuild stacked another version of every `id` beside
-        /// it. That ran for a MONTH unnoticed (352 files, 26 days, 7.17 versions per
-        /// id) purely because nothing counted it; it was found by hand while chasing
-        /// an inflated dashboard. After `slice_retires` the steady state is genuinely
-        /// zero, so `found` is alarmable at > 0: nonzero means some path is writing
-        /// or stripping tier tags again and should be named before it costs another
-        /// archaeology session.
-        ///
-        /// `retired` is how a repair is watched draining — the only proof a rebuild
-        /// REMOVED the old file rather than publishing a correct one beside it,
-        /// which is exactly what the first repair attempt did.
+        /// per unit), and the running total this publish path has retired. A tier
+        /// file with no identity tags is skipped by the replace-set, so every
+        /// rebuild stacks another version of every `id` beside it: `found` is
+        /// alarmable at > 0, and `retired` is the proof a rebuild REMOVED the old
+        /// file rather than publishing a correct one beside it.
         rollup_tier_untagged_found,
         rollup_tier_untagged_retired as "rollup_tier_untagged_retired_total",
         /// Recovered slices carrying NO row witness — published before
         /// `TAG_SOURCE_ROWS` existed. Every read refuses them `stale_coverage` and no
-        /// rule can ever rescue them, so this is the size of the backlog that has to
-        /// republish before wide dashboards route. Set from the whole recovery pass,
-        /// hourly, so it reads 0 only when there genuinely are none. Watch it
-        /// fall; `rollup_stale_no_witness` per query falls with it.
+        /// rule can rescue them, so this is the size of the backlog that must
+        /// republish before wide dashboards route. Set from the whole hourly
+        /// recovery pass, so 0 means there genuinely are none.
         rollup_witnessless_slices,
         /// Contiguous sealed days of rollup coverage, counting back from yesterday,
-        /// minimised over every (project, declared tier).
-        ///
-        /// This is the number that governs long-window query latency, and no
-        /// existing metric tracked it. `MIN(date)` reads as progress while the
-        /// middle stays holey — it advanced 08-01 -> 07-30 on 2026-08-17 while the
-        /// coarse tier held only 3 days — and a 30d panel needs 30 CONTIGUOUS days
-        /// in the tier it reads, so one hole anywhere in the window sends it to a
-        /// raw scan. Minimised, not averaged: a single uncovered project is a
-        /// customer whose dashboard is slow.
+        /// minimised over every (project, declared tier). A 30d panel needs 30
+        /// CONTIGUOUS days in the tier it reads, so one hole anywhere sends it to a
+        /// raw scan — `MIN(date)` would read as progress while the middle stays
+        /// holey. Minimised, not averaged: one uncovered project is a slow dashboard.
         rollup_min_contiguous_days,
         rollup_median_contiguous_days,
         rollup_oldest_invalidation_age_secs as "rollup_oldest_invalidation_age_seconds",
@@ -1407,23 +1067,14 @@ atomic_stats! {
         rollup_output_files as "rollup_output_files_total",
         /// Live parquet files the Tantivy manifest does NOT cover, as of the last
         /// reconcile pass, plus the ones skipped for exceeding
-        /// TIMEFUSION_TANTIVY_BACKFILL_MAX_FILE_MB. Gauges, not counters: each pass
-        /// overwrites them.
-        ///
-        /// Without these there is no way to tell whether a reindex is converging or
-        /// how far it has left to run, which is precisely why the reindex was being
-        /// driven by hand from sibling containers — three of which were OOM-killed
-        /// on 2026-08-16. `uncovered` trending to 0 IS the definition of done.
+        /// TIMEFUSION_TANTIVY_BACKFILL_MAX_FILE_MB. Gauges: each pass overwrites
+        /// them. `uncovered` trending to 0 IS the definition of a converged reindex.
         tantivy_uncovered_files,
         tantivy_oversized_skipped,
         /// Pending (non-Complete) tasks split by operation, and the subset that is
         /// ELIGIBLE right now (deadline passed). Gauges, republished each checkpoint.
-        ///
-        /// `tasks_pending` alone cannot answer the only question that matters when
-        /// coverage stalls: is the rollup work absent, present-but-not-eligible, or
-        /// present-and-eligible but out-competed? Prod 2026-08-17 sat at ~128k
-        /// pending with rollup coverage frozen for hours, and there was no way to
-        /// tell which of those three it was without guessing.
+        /// `tasks_pending` alone cannot distinguish work that is absent from work
+        /// that is present-but-not-eligible from work that is out-competed.
         pending_dedup,
         pending_base_rollup,
         pending_derived_rollup,
@@ -1440,12 +1091,10 @@ atomic_stats! {
         maintenance_tasks_complete as "tasks_complete",
         maintenance_backlog_bytes as "backlog_bytes",
         /// Oldest age over work the scheduler still INTENDS to do — tasks whose
-        /// slice ended within `STARVATION_HORIZON_MICROS` — so it is bounded by 31
-        /// days and a reading near the bound is a real stall inside the goal window.
-        ///
-        /// `beyond_horizon_tasks` is the deliberately-abandoned remainder. It is not
-        /// optional company: without it, narrowing the age gauge is
-        /// indistinguishable from hiding the debt.
+        /// slice ended within `STARVATION_HORIZON_MICROS` — so a reading near that
+        /// bound is a real stall inside the goal window. `beyond_horizon_tasks` is
+        /// the deliberately-abandoned remainder; without it, narrowing the age gauge
+        /// is indistinguishable from hiding the debt.
         maintenance_oldest_task_age_secs as "oldest_task_age_seconds",
         maintenance_beyond_horizon_tasks as "beyond_horizon_tasks",
         maintenance_eligible_watermark_lag_secs as "eligible_watermark_lag_seconds",
@@ -1453,12 +1102,10 @@ atomic_stats! {
         maintenance_processed_bytes_per_sec as "processed_bytes_per_second",
         maintenance_raw_tail_duration_secs as "raw_tail_duration_seconds",
         sealed_compaction_debt_bytes,
-        /// How often a unit target WOULD be (or was) shrunk because its lane's
-        /// pool was over half full, and how many bytes that withheld. Emitted
-        /// even when `timefusion_maintenance_pressure_scaling` is off, so the
-        /// flag can be decided from data instead of argument — the pathology it
-        /// targets is measured (2 Repair units = 29% of worker time; one 502 s
-        /// dedup unit = 80% of its lane over a quiet hour) but the remedy is not.
+        /// How often a unit target WOULD be (or was) shrunk because its lane's pool
+        /// was over half full, and how many bytes that withheld. Emitted even when
+        /// `timefusion_maintenance_pressure_scaling` is off, so the flag can be
+        /// decided from data.
         pressure_scale_engaged as "pressure_scale_engaged",
         pressure_scale_bytes_withheld as "pressure_scale_bytes_withheld",
         /// Packing bins whose bytes-per-file-eliminated exceeded the value floor
@@ -1469,14 +1116,9 @@ atomic_stats! {
         maintenance_decoded_bytes_used as "decoded_bytes_used",
         maintenance_object_read_tokens_used as "object_read_tokens_used",
         maintenance_object_write_tokens_used as "object_write_tokens_used",
-        /// Aggregates that fell through to a raw scan, plus the breakdown by reason.
-        ///
-        /// The OTel counter carries the same labels but cannot be read back
-        /// in-process, and the reason is the ONLY thing that distinguishes "the
-        /// build never ran" from "it ran and the source moved under it" from "the
-        /// shape is unsupported" — which is the entire diagnosis of a rollout that
-        /// is building rollups but not serving them. Without it the answer is
-        /// guesswork over a 19k-line log.
+        /// Aggregates that fell through to a raw scan, plus the breakdown by reason —
+        /// the reason is the only thing that distinguishes "never built" from "the
+        /// source moved under it" from "unsupported shape".
         rollup_misses_total,
         rollup_miss_not_built as "rollup_miss_not_built_total",
         rollup_miss_stale_coverage as "rollup_miss_stale_coverage_total",
@@ -1498,15 +1140,9 @@ atomic_stats! {
         rollup_miss_rewrite_schema_mismatch as "rollup_miss_rewrite_schema_mismatch_total",
         rollup_miss_unwalkable_source as "rollup_miss_unwalkable_source_total",
         /// Derived units retried because their BASE tier does not cover the slice
-        /// they were asked to build. Publishing anyway is the 2026-08-25 bug — the
-        /// witness is the RAW partition, which agrees forever on a sealed day, so a
-        /// cell built over a holey base is short and trusted permanently.
-        ///
-        /// Read it as a RATE, not a level. Rising while `rollup_output_rows_total`
-        /// also rises is the derived tier waiting for its base, which is correct.
-        /// Rising while the base tier publishes nothing means the base is stuck and
-        /// the coarse tier is not being served at all — the read path is exact
-        /// either way (an absent slice falls to the raw fringe), only slower.
+        /// they were asked to build. Publishing anyway would trust a short cell
+        /// permanently, since the witness is the RAW partition. Read as a RATE:
+        /// rising while the base tier publishes nothing means the base is stuck.
         rollup_derived_base_incomplete as "rollup_derived_base_incomplete_total",
         dirty_bin_queue_depth,
         dirty_bin_enqueued as "dirty_bin_enqueued_total",
@@ -1514,78 +1150,62 @@ atomic_stats! {
         dirty_bin_processed as "dirty_bin_processed_total",
         dirty_bin_requeued as "dirty_bin_requeued_total",
         /// Queued bins consumed by the whole-date BATCH probe without per-bin
-        /// staging (every flushed bin is enqueued, so in prod ~97% of queued bins
-        /// carry no duplicates at all). Also counted in `dirty_bin_processed`.
+        /// staging — every flushed bin is enqueued, so most carry no duplicates.
+        /// Also counted in `dirty_bin_processed`.
         dirty_bin_batch_probe_clean as "dirty_bin_batch_probe_clean_total",
         dirty_bin_dropped_rows as "dirty_bin_dropped_rows_total",
         dirty_bin_rewrite_duration_ms as "dirty_bin_rewrite_duration_ms_total",
         /// Cold-owned dirty bins (date old enough that the nightly consolidate owns
         /// the partition) DEPRIORITIZED to the tail of a drain pass and left on the
-        /// queue. They are NOT dropped: consolidate bin-packs but does not collapse
+        /// queue. NOT dropped: consolidate bin-packs but does not collapse
         /// duplicates, so the dirty-bin drain stays their only physical dedup.
-        /// NOTE `cold_optimize_after_days` defaults to 1 and the drain already skips
-        /// today, so in the default configuration EVERY drainable bin is cold-owned
-        /// — this then reads as "queued bins this pass had no batch slot for".
-        /// Chronic growth = a backlog the batch size can't keep up with.
+        /// With the default `cold_optimize_after_days = 1` every drainable bin is
+        /// cold-owned, so this reads as "queued bins this pass had no batch slot for".
         dedup_bins_deferred_cold as "dedup_bins_deferred_cold_total",
         /// Drain passes skipped (or cut short between chunks) because the flush path
         /// was behind. Dedup is an optimization — read-side DedupExec keeps results
-        /// correct — so it yields to persistence (2026-07-30: a boot drain over a
-        /// 10-day backlog pinned the commit path and starved flush for a whole
-        /// container life). Chronic nonzero = flush is unhealthy, not dedup.
+        /// correct — so it yields to persistence. Chronic nonzero = flush is
+        /// unhealthy, not dedup.
         dedup_passes_flush_yields as "dedup_passes_flush_yields_total",
-        /// Per-bin STAGING attempts killed at the deadline and requeued. The
-        /// deadline exists so one hung object-store read can't wedge the drain
-        /// for hours behind the 1-permit maintenance semaphore (prod 2026-08-05:
-        /// 6.5h stall, skips=77). Repeated hits are the same bin retrying —
-        /// an oversized bin that can't finish inside the deadline, not noise.
+        /// Per-bin STAGING attempts killed at the deadline and requeued, so one hung
+        /// object-store read cannot wedge the drain behind the maintenance semaphore.
+        /// Repeated hits are the same oversized bin retrying, not noise.
         dedup_bin_stage_timeouts as "dedup_bin_stage_timeouts_total",
-        /// Batch PROBES that did not get a slice of the phase budget. A very
-        /// different event from the staging deadline above, and it used to
-        /// share that counter — which made the number uninterpretable and
-        /// twice produced a wrong conclusion (2026-09-02: a reading of "80% of
-        /// dedup work times out" was in fact 114 probe timeouts and ZERO
-        /// staging timeouts). The probe is the ~200x-cheaper proof that a
-        /// partition is already duplicate-free; a timeout only means this tick
-        /// ran out of budget before reaching that group, so its bins take the
-        /// expensive path instead. Expected to be nonzero while a group
-        /// backlog drains (observed 61 -> 7 groups/phase over an hour) and to
-        /// fall to zero once it has.
+        /// Batch PROBES that did not get a slice of the phase budget — a different
+        /// event from the staging deadline above, and counted apart from it because
+        /// conflating the two makes both uninterpretable. The probe is the much
+        /// cheaper proof that a partition is already duplicate-free; a timeout only
+        /// means its bins take the expensive path this tick. Expected nonzero while
+        /// a group backlog drains, zero once it has.
         dedup_probe_timeouts as "dedup_probe_timeouts_total",
-        /// Wave (dedup / light-optimize) commits that STOOD DOWN rather than queue
-        /// on a per-table commit lock a flush was already waiting for — the flush
-        /// starvation of prod 2026-07-30, where durability waited >600s behind
-        /// legally-slow maintenance commits. The wave's bins are requeued and
-        /// re-staged later, so this is deferred work, not lost work. Chronic nonzero
-        /// = flush is saturating the commit path and compaction is being crowded out.
+        /// Wave (dedup / light-optimize) commits that STOOD DOWN rather than queue on
+        /// a per-table commit lock a flush was already waiting for. The bins are
+        /// requeued and re-staged, so this is deferred work, not lost work. Chronic
+        /// nonzero = flush is saturating the commit path and crowding out compaction.
         wave_commits_yielded_to_flush as "wave_commits_yielded_to_flush_total",
-        /// Boot-time resume of a staged-but-uncommitted footer-repair bin: the
-        /// rewrite survived the restart that killed its process, so the next pass
-        /// doesn't redo the (40+ minute) work. See `resume_staged_intents`.
+        /// Boot-time resume of a staged-but-uncommitted footer-repair bin, so the
+        /// next pass doesn't redo the rewrite. See `resume_staged_intents`.
         repair_resumed as "repair_resumed_total",
         /// Rollup units COMMITTED at claim time from output a previous process
-        /// staged, instead of re-running their ~21-minute scan. Read against
-        /// `rollup_resume_declined`: the ratio is what says whether resume is
-        /// rescuing work or whether the source keeps moving underneath it.
+        /// staged, instead of re-running the scan. Read against
+        /// `rollup_resume_declined` to tell rescued work from a moving source.
         rollup_resumed as "rollup_resumed_total",
         /// Staged rollup outputs refused — the source moved, an input left the
         /// snapshot, another live file already covers the slice, or the parquet is
-        /// short. Every one of these is a correct refusal; a rising count means the
-        /// staging window and the churn window overlap, not that resume is broken.
+        /// short. All correct refusals; a rising count means the staging window and
+        /// the churn window overlap, not that resume is broken.
         rollup_resume_declined as "rollup_resume_declined_total",
-        /// Claims that found NO staged intent for the unit at all (no manifest, or
-        /// no entry naming this task). THE denominator: without it a zero
-        /// `rollup_resumed` cannot be told apart from "resume was never even
-        /// offered a candidate", which is what a code trace had to establish by
-        /// hand on 2026-08-25.
+        /// Claims that found NO staged intent for the unit at all (no manifest, or no
+        /// entry naming this task) — the denominator that tells a zero
+        /// `rollup_resumed` apart from "resume was never offered a candidate".
         rollup_resume_no_intent as "rollup_resume_no_intent_total",
         /// Candidates held back by the ownership guard (see `resume_guarded`) or
         /// belonging to another table. Nonzero with `rollup_resumed` at 0 means the
         /// guard, not the evidence, is what forfeits the work.
         rollup_resume_skipped as "rollup_resume_skipped_total",
         /// Staged rollup output whose Delta commit had already landed — only the
-        /// journal publication was lost, and resume supplies it. Counted apart from
-        /// `rollup_resumed` because it rescues bookkeeping, not the ~21-min scan.
+        /// journal publication was lost. Counted apart from `rollup_resumed` because
+        /// it rescues bookkeeping, not the scan.
         rollup_resume_already_landed as "rollup_resume_already_landed_total",
         /// Repair equivalents of the two above; same reading.
         repair_resume_skipped as "repair_resume_skipped_total",
@@ -1605,18 +1225,16 @@ atomic_stats! {
         /// in flight. A steadily growing value = a wedged/overlong job body.
         cron_ticks_skipped,
         /// Cron fires actually dispatched (all jobs). Frozen while uptime grows =
-        /// the scheduler is dead (2026-07-14 outage signature).
+        /// the scheduler is dead.
         cron_ticks_fired,
         /// Cron runs that exceeded the long-running warning threshold. Slow but
         /// progressing work is allowed to finish; sustained nonzero with no
         /// completion = wedged.
         cron_long_running as "cron_long_running_total",
         /// Ingest-time client-retry dedup: rows DROPPED because their exact
-        /// client-visible content was provably already committed
-        /// (`docs/plans/2026-09-07-ingest-dedup-prevention-design.md`).
-        /// Post-deploy health read: dropped/rows_ingested should sit in the
-        /// known ~0.0004–0.0008% retry band — far higher = misfiring on
-        /// version traffic; ~zero forever = the hash-point drifted inert.
+        /// client-visible content was provably already committed. A far-too-high
+        /// dropped/rows_ingested ratio means it is misfiring on legitimate version
+        /// traffic; a permanent zero means the hash point has drifted inert.
         ingest_dedup_dropped_rows as "ingest_dedup_dropped_rows_total",
         /// Probes whose dedup KEY matched a flushed row (content match or not).
         /// key_hits >> dropped_rows = version traffic, not retries.
@@ -1632,14 +1250,9 @@ pub fn maintenance_stats() -> &'static MaintenanceStats {
 }
 
 /// Resident set size of this process in bytes from `/proc/self/statm`
-/// (Linux only; None elsewhere). Compare against the MemBuffer's
-/// `estimate_batch_size` charge: a large RSS-below-estimate gap means the
-/// per-bucket estimate (`get_array_memory_size` on wide Utf8View / replayed
-/// batches) is over-counting, so backpressure is tripping on phantom bytes
-/// rather than real memory.
+/// (Linux only; `None` elsewhere).
 pub fn process_rss_bytes() -> Option<usize> {
-    // statm fields are in pages; resident is field 2. 4 KiB pages on every
-    // Linux target TF deploys to (x86_64) — avoids a libc dependency.
+    // statm fields are in pages; resident is field 2. 4 KiB pages assumed.
     let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
     statm.split_whitespace().nth(1)?.parse::<usize>().ok().map(|pages| pages * 4096)
 }
@@ -1650,9 +1263,7 @@ mod runtime_lag_tests {
 
     use super::{RUNTIME_LAG_LAST_MS, RUNTIME_LAG_MAX_MS, spawn_runtime_lag_sampler};
 
-    /// The sampler must report near-zero on an idle runtime and must stop on
-    /// cancel. A sampler that reported lag when nothing was competing would
-    /// make the starvation signal unreadable — which is the whole point of it.
+    /// The sampler reports near-zero on an idle runtime and stops on cancel.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn idle_runtime_reports_no_meaningful_lag_and_stops_on_cancel() {
         RUNTIME_LAG_MAX_MS.store(0, Relaxed);
@@ -1684,10 +1295,8 @@ use tracing_subscriber::{EnvFilter, Layer, Registry, layer::SubscriberExt, util:
 /// Kept for `shutdown_telemetry` to flush buffered log batches at exit.
 static LOGGER_PROVIDER: OnceLock<SdkLoggerProvider> = OnceLock::new();
 
-/// Max spans/logs per OTLP export message. TF's spans/logs embed full query
-/// text, so the SDK default (512) overflowed the collector's 4MB gRPC limit
-/// (messages up to 39MB → every export failed). 32 keeps a typical message
-/// ~2-3MB. See init_telemetry.
+/// Max spans/logs per OTLP export message. Spans/logs embed full query text, so
+/// the SDK default (512) overflows the collector's 4MB gRPC limit.
 const EXPORT_BATCH: usize = 32;
 const EXPORT_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -1702,15 +1311,9 @@ pub fn init_telemetry(config: &TelemetryConfig) -> anyhow::Result<()> {
         .with_attributes([KeyValue::new("service.name", service_name.clone()), KeyValue::new("service.version", config.otel_service_version.clone())])
         .build();
 
-    // Span export honors the standard OTEL_TRACES_EXPORTER=none switch. When on
-    // (prod has OTEL_TRACES_EXPORTER=otlp), TF's spans carry full query text +
-    // attributes, so the DEFAULT batch of 512 produced export messages up to
-    // 39MB — far over the collector's 4MB gRPC receive limit — and every export
-    // failed ("resource exhausted"), silently losing TF's self-observability.
-    // opentelemetry-otlp 0.31 can't raise the message-size limit via the public
-    // API, so we cap the batch instead: EXPORT_BATCH keeps a typical message
-    // well under 4MB (≈76KB/span observed → ~2.4MB at 32). A single span larger
-    // than 4MB still can't be sent, but those are rare vs the batch-size overflow.
+    // Span export honors the standard OTEL_TRACES_EXPORTER=none switch. The batch
+    // is capped at EXPORT_BATCH because opentelemetry-otlp 0.31 cannot raise the
+    // gRPC message-size limit through the public API.
     let telemetry_layer = if config.otel_traces_exporter.as_deref() == Some("none") {
         None
     } else {
@@ -1729,14 +1332,11 @@ pub fn init_telemetry(config: &TelemetryConfig) -> anyhow::Result<()> {
         Some(OpenTelemetryLayer::new(tracer_provider.tracer("timefusion")))
     };
 
-    // OTLP logs: bridge tracing events to the collector so TF shows up as a
-    // service in monoscope (the 2026-06-11 OOM loop was diagnosed entirely
-    // from client-side error strings because TF only logged to stdout).
-    // The bridge must not observe the exporter's own tracing output —
-    // tonic/hyper events inside an export would recurse into another export.
+    // OTLP logs: bridge tracing events to the collector. The bridge must not
+    // observe the exporter's own tracing output — tonic/hyper events emitted
+    // inside an export would recurse into another export.
     let log_exporter = opentelemetry_otlp::LogExporter::builder().with_tonic().with_endpoint(otlp_endpoint).with_timeout(EXPORT_TIMEOUT).build()?;
-    // Slow-statement logs also carry full SQL text, so cap the log batch too
-    // (same 4MB-limit reasoning as spans above).
+    // Logs carry full SQL text, so cap the log batch too.
     let log_processor = opentelemetry_sdk::logs::BatchLogProcessor::builder(log_exporter)
         .with_batch_config(opentelemetry_sdk::logs::BatchConfigBuilder::default().with_max_export_batch_size(EXPORT_BATCH).build())
         .build();
@@ -1745,8 +1345,7 @@ pub fn init_telemetry(config: &TelemetryConfig) -> anyhow::Result<()> {
         .with_filter(tracing_subscriber::filter::filter_fn(|meta| !["opentelemetry", "tonic", "h2", "hyper"].iter().any(|p| meta.target().starts_with(p))));
     let _ = LOGGER_PROVIDER.set(logger_provider);
 
-    // Tantivy emits an INFO event for every segment operation; recovery bursts
-    // otherwise flood stdout and OTLP with merge/GC internals.
+    // Tantivy emits an INFO event per segment operation, which floods stdout/OTLP.
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,tantivy=warn"));
 
     let fmt_layer = tracing_subscriber::fmt::layer().with_target(true).with_thread_ids(true).with_thread_names(true);
@@ -1761,18 +1360,14 @@ pub fn init_telemetry(config: &TelemetryConfig) -> anyhow::Result<()> {
 
 pub fn shutdown_telemetry() {
     info!("Shutting down OpenTelemetry");
-    // Tracer/meter providers shut down when dropped; flush buffered logs
-    // explicitly so the final shutdown lines reach the collector.
+    // Tracer/meter providers shut down on drop; buffered logs need an explicit flush.
     let _ = LOGGER_PROVIDER.get().map(SdkLoggerProvider::shutdown);
 }
 
-/// Cell-capped preview formatter for datafusion-tracing spans, replacing the
-/// crate's `default_preview_fn` (comfy_table over WHOLE cell values). Cells
-/// here are unbounded — Variant/JSON bodies on SELECTs, and on an
-/// INSERT…unnest input node ONE cell holds an entire bind array — so the
-/// default burned 86–93% CPU and drove the 85GiB OOM loop of 2026-07-06.
-/// The capped writer aborts each cell's `Display` after `PREVIEW_CELL_CAP`
-/// bytes, so oversized values are never materialized, only their prefix.
+/// Cell-capped preview formatter for datafusion-tracing spans. Cell values here
+/// are unbounded (Variant/JSON bodies, whole bind arrays), so each cell's
+/// `Display` is aborted after `PREVIEW_CELL_CAP` bytes and never materialized in
+/// full — unlike the crate's `default_preview_fn`.
 pub fn capped_preview_fn(batch: &arrow::record_batch::RecordBatch) -> Result<String, arrow::error::ArrowError> {
     use std::fmt::Write;
 
@@ -1798,7 +1393,6 @@ pub fn capped_preview_fn(batch: &arrow::record_batch::RecordBatch) -> Result<Str
     let opts = FormatOptions::default();
     let schema = batch.schema();
     let formatters = batch.columns().iter().map(|c| ArrayFormatter::try_new(c.as_ref(), &opts)).collect::<Result<Vec<_>, _>>()?;
-    // Imperative: every cell writes through `Capped`, which borrows `out` mutably.
     let mut out = String::new();
     for row in 0..batch.num_rows() {
         for (formatter, field) in formatters.iter().zip(schema.fields()) {
@@ -1826,8 +1420,8 @@ mod tests {
 
     use super::*;
 
-    /// The two maps share one bounded adder, so a key collision between them
-    /// would silently mix retry counts into work counts.
+    /// The two maps share one bounded adder; a key collision would mix retry
+    /// counts into work counts.
     #[test]
     fn work_and_retry_counters_accumulate_under_their_own_prefixes() {
         count_maintenance_work("Dedup", "rows_dropped", 7);
@@ -1840,9 +1434,7 @@ mod tests {
         assert!(work.iter().all(|(key, _)| !key.starts_with("work.Dedup.worker_error")), "a retry must not land in the work map: {work:?}");
     }
 
-    /// Regression guard for the 2026-07-06 OOM: a cell holding a huge value
-    /// (like an INSERT…unnest bind array) must preview as a bounded prefix,
-    /// not render in full.
+    /// A cell holding a huge value must preview as a bounded prefix.
     #[test]
     fn capped_preview_bounds_giant_cells() {
         let mut list = ListBuilder::new(StringBuilder::new());
@@ -1863,16 +1455,11 @@ mod tests {
     }
 
     /// One rare miss class must not have its sample budget spent by a common one.
-    ///
-    /// The sampler is the ONLY instrument that renders an offending plan, and a
-    /// single shared counter made "does this class ever get looked at" a function
-    /// of some other class's rate.
     #[test]
     fn the_miss_sampler_budgets_each_reason_separately() {
         let rate = |key| (0..256).filter(|_| sample_rollup_miss(key)).count();
         let quiet = rate("test.quiet");
-        // A noisy neighbour between the two measurements: with one shared counter
-        // it shifts the second key's phase and its sample count with it.
+        // A noisy neighbour: with one shared counter it would shift the next key's phase.
         (0..1000).for_each(|_| {
             sample_rollup_miss("test.noisy");
         });
@@ -1882,23 +1469,10 @@ mod tests {
 }
 
 // ===== profiling =====
-// Production heap + CPU profiling, compiled only under `--features profiling`
-// (Linux-only deps; a default or macOS build sees an empty module).
-//
-// Why baked-in rather than attached at runtime: the CapRover host is
-// strictly read-only for us (no `perf`, no `MALLOC_CONF` env change, no
-// `exec`/signal into the container). So the binary self-instruments and
-// writes artifacts into the data-dir volume, which we CAN read off the host
-// (`/var/lib/docker/volumes/…/_data/timefusion/profiles`).
-//
-// Heap: jemalloc's own profiler (`prof:true`), configured via the baked
-// `malloc_conf` symbol in `main.rs`, auto-dumps a `.heap` every
-// `lg_prof_interval` bytes allocated — so as RSS climbs toward the 89GB
-// cgroup kill, the last dumps before each OOM show the allocation call
-// stacks. Analyze off-host with `jeprof --svg <binary> jeprof.*.heap`.
-//
-// CPU: a `pprof` sampling profiler writes a rolling flamegraph SVG every
-// `interval`, capturing what's hot while memory grows.
+// Self-instrumented heap + CPU profiling, compiled only under
+// `--features profiling` (Linux-only deps). Heap dumps come from jemalloc's own
+// profiler (configured by the baked `malloc_conf` in `main.rs`); CPU comes from a
+// `pprof` sampler. Both write into `<data_dir>/profiles`.
 
 #[cfg(all(feature = "profiling", target_os = "linux"))]
 mod imp {
@@ -1906,36 +1480,20 @@ mod imp {
 
     use tracing::{info, warn};
 
-    /// Start background profiling. Heap profiling is already active via the
-    /// baked `malloc_conf`; here we (1) ensure the artifact dir exists and
-    /// (2) spawn the rolling CPU flamegraph sampler. Safe to call once at boot.
+    /// Ensure the artifact dir exists and spawn the pruner + CPU sampler. Call
+    /// once at boot; heap profiling is already active via the baked `malloc_conf`.
     pub fn start(data_dir: PathBuf) {
-        // MUST equal the parent of the baked jemalloc `prof_prefix` in main.rs
-        // so the heap dumps land in a dir we create — jemalloc does NOT mkdir
-        // its prefix, and the earlier doubled `timefusion/timefusion/profiles`
-        // meant the prefix dir never existed and every .heap silently failed.
+        // MUST equal the parent of the baked jemalloc `prof_prefix` in main.rs:
+        // jemalloc does not mkdir its prefix, and silently drops every dump if
+        // the directory is missing.
         let dir = data_dir.join("profiles");
         if let Err(e) = std::fs::create_dir_all(&dir) {
             warn!("profiling: cannot create {dir:?}: {e} — CPU flamegraphs disabled, heap dumps still land at malloc_conf prof_prefix");
         }
         archive_prekill_dumps(&dir);
-        // The CPU sampler is the one part of boot that can only be removed by a
-        // REBUILD, and it is signal-handler + libunwind code — the classic shape
-        // for a SIGSEGV with no Rust panic. On 2026-08-11 prod crashlooped
-        // (exit 139) with `starting cpu profiler` as the last line of every
-        // attempt, and there was no way to test the hypothesis without shipping
-        // a new image into an outage. Off by env, not by rebuild.
-        //
-        // Heap profiling is unaffected: it is jemalloc's own, configured by the
-        // baked `malloc_conf`, so the dumps that attribute an OOM still land.
-        // Heap-dump pruning must NOT ride on the CPU sampler. jemalloc dumps a
-        // .heap every ~8GiB allocated and never prunes them — left alone they
-        // reached 95GB / 42k files in prod — and the pruning used to live inside
-        // the sampler loop, which the next line can skip entirely. Prod runs
-        // exactly that way (`TIMEFUSION_CPU_PROFILE=false` since the 2026-08-11
-        // crashloop), so the guard was absent in the one configuration where it
-        // matters: `prof_active` is flipped on to attribute an OOM, and the
-        // dumps then grow unpruned on a volume that is already the WAL's.
+        // The CPU sampler is signal-handler + libunwind code, so it is disabled by
+        // env rather than by a rebuild. Heap-dump pruning must stay OUTSIDE it:
+        // the sampler can be off while jemalloc is still dumping.
         spawn_heap_pruner(dir.clone());
         if std::env::var("TIMEFUSION_CPU_PROFILE").is_ok_and(|v| v.eq_ignore_ascii_case("false") || v == "0") {
             info!("profiling: jemalloc heap auto-dump only — CPU sampler disabled by TIMEFUSION_CPU_PROFILE → {dir:?}");
@@ -1945,14 +1503,9 @@ mod imp {
         spawn_cpu_sampler(dir);
     }
 
-    /// Cap the jemalloc heap dumps, independently of whether the CPU sampler
-    /// runs.
-    ///
-    /// jemalloc writes a `.heap` every ~8GiB allocated (`lg_prof_interval`) once
-    /// `prof_active` is on, and never removes one. This is deliberately its own
-    /// thread rather than a step in the CPU sampler: the sampler is disabled in
-    /// prod, so pruning attached to it does nothing in the exact configuration
-    /// where heap dumps are being produced on purpose.
+    /// Cap the jemalloc heap dumps (it writes one every `lg_prof_interval` bytes
+    /// and never removes any). Its own thread on purpose: the CPU sampler, whose
+    /// loop would otherwise host this, can be disabled.
     fn spawn_heap_pruner(dir: PathBuf) {
         const KEEP_HEAP: usize = 50;
         const EVERY: Duration = Duration::from_secs(60);
@@ -1967,10 +1520,9 @@ mod imp {
             .expect("spawn heap-pruner thread");
     }
 
-    /// One CPU profile window at a time on a dedicated OS thread: build a
-    /// guard, sample for `WINDOW`, write a flamegraph, drop, repeat. A fresh
-    /// guard per window keeps each SVG scoped to a recent interval (so the
-    /// window overlapping an OOM isn't diluted by minutes of prior samples).
+    /// One CPU profile window at a time on a dedicated OS thread: build a guard,
+    /// sample for `WINDOW`, write a flamegraph, drop, repeat. A fresh guard per
+    /// window keeps each SVG scoped to a recent interval.
     fn spawn_cpu_sampler(dir: PathBuf) {
         const HZ: i32 = 99; // 99Hz: cheap, avoids lock-step with periodic timers
         const WINDOW: Duration = Duration::from_secs(60);
@@ -1978,7 +1530,7 @@ mod imp {
         std::thread::Builder::new()
             .name("cpu-profiler".into())
             .spawn(move || {
-                let mut seq: u64 = 0; // `mut`: advances per completed window only, so it can't be an iterator counter
+                let mut seq: u64 = 0;
                 loop {
                     let Ok(guard) = pprof::ProfilerGuardBuilder::default()
                         .frequency(HZ)
@@ -1997,10 +1549,6 @@ mod imp {
                     if let Err(e) = write_flamegraph(&path, &report) {
                         warn!("profiling: writing cpu flamegraph {path:?} failed: {e}");
                     }
-                    // Rolling windows: keep the ones straddling an OOM without
-                    // unbounded growth. jemalloc auto-dumps a .heap every ~8GiB
-                    // allocated (lg_prof_interval:33) and never prunes them —
-                    // left alone they grow unbounded (95GB / 42k files in prod).
                     prune_old(&dir, "cpu-", KEEP_CPU);
                     seq += 1;
                 }
@@ -2008,12 +1556,9 @@ mod imp {
             .expect("spawn cpu-profiler thread");
     }
 
-    /// Preserve the PREVIOUS process's final heap dumps before this process's
-    /// pruner evicts them. At prod churn (~4 dumps/min) the rolling KEEP_HEAP
-    /// window is ~12 minutes, so an OOM-killed process's last dumps — the only
-    /// attribution evidence for the kill — were gone before anyone could look
-    /// (2026-08-03, twice). Boot moves the newest few into `prekill-<pid-seq>/`;
-    /// only the 3 newest archives are kept.
+    /// Move the previous process's newest heap dumps into `prekill-<stamp>/` so
+    /// this process's pruner cannot evict the evidence of an OOM kill. Keeps the
+    /// 3 newest archives.
     fn archive_prekill_dumps(dir: &std::path::Path) {
         let dumps = newest_first(dir, |n| n.starts_with("jeprof") && n.ends_with(".heap"));
         let Some((newest, _)) = dumps.first() else { return };
@@ -2027,13 +1572,10 @@ mod imp {
                 let _ = std::fs::rename(p, arch.join(name));
             }
         });
-        // The rest of the dead process's dumps are noise — drop them now so the
-        // rolling pruner starts clean for this process.
+        // Drop the rest so the rolling pruner starts clean for this process.
         dumps.into_iter().skip(5).for_each(|(_, old)| {
             let _ = std::fs::remove_file(old);
         });
-        // Newest-by-mtime, not by the `prekill-<unix secs>` name: same ordering in
-        // practice, and it reuses the pruner's clock-independent helper.
         newest_first(dir, |n| n.starts_with("prekill-")).into_iter().skip(3).for_each(|(_, old)| {
             let _ = std::fs::remove_dir_all(&old);
         });
@@ -2045,13 +1587,9 @@ mod imp {
         Ok(())
     }
 
-    /// Keep only the newest `keep` files whose name starts with `prefix`,
-    /// ordered by mtime — NOT filename. The CPU seq counter resets to 0 on every
-    /// process restart, so a dead process's high-seq files (`cpu-000902`) would
-    /// outsort a live process's fresh low-seq files (`cpu-000003`) by name and
-    /// survive pruning forever, leaving us blind to the current run's CPU. mtime
-    /// is monotonic across restarts, so newest-by-mtime always keeps the live
-    /// process's files and evicts the stale ones.
+    /// Keep only the newest `keep` files whose name starts with `prefix`, ordered
+    /// by mtime — NOT filename: the CPU seq counter restarts at 0 each process, so
+    /// a dead process's high-seq files would outsort live ones by name forever.
     fn prune_old(dir: &std::path::Path, prefix: &str, keep: usize) {
         newest_first(dir, |n| n.starts_with(prefix)).into_iter().skip(keep).for_each(|(_, old)| {
             let _ = std::fs::remove_file(old);
@@ -2067,7 +1605,7 @@ mod imp {
             .filter(|e| e.file_name().to_str().is_some_and(&matches))
             .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
             .collect();
-        files.sort_unstable_by_key(|(mtime, _)| std::cmp::Reverse(*mtime)); // `mut`: std sorts in place
+        files.sort_unstable_by_key(|(mtime, _)| std::cmp::Reverse(*mtime));
         files
     }
 }
@@ -2080,17 +1618,15 @@ pub use imp::start;
 pub fn start(_data_dir: std::path::PathBuf) {}
 
 // ===== errors =====
-// Shared error-wrapping helpers to collapse the repetitive `.map_err(|e| ...)`
-// closures scattered across the write/query paths. Each preserves the original
-// DataFusionError variant and message text.
+// Shared `.map_err` helpers; each preserves the original variant and message.
 
 use std::fmt::Display;
 
 use datafusion::{arrow::error::ArrowError, error::DataFusionError};
 use datafusion_postgres::pgwire::error::PgWireError;
 
-/// Wrap an Arrow error as `DataFusionError::ArrowError`. Unlike
-/// `DataFusionError::from`, skips backtrace capture — these fire on hot paths.
+/// Wrap an Arrow error as `DataFusionError::ArrowError`, skipping the backtrace
+/// capture `DataFusionError::from` would do (these fire on hot paths).
 pub fn arrow_err(e: ArrowError) -> DataFusionError {
     DataFusionError::ArrowError(Box::new(e), None)
 }

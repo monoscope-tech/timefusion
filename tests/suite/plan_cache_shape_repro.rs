@@ -1,9 +1,4 @@
-//! Regression for the 2026-07-20 plan-cache finding: dashboard now()-bearing
-//! shapes negative-cached (shape_hits=0) because the shape path pre-optimizes a
-//! plan with unbound placeholders. Two failure modes were reproduced, and the
-//! fix (parameterize ONLY now() as a TYPED cast, keep other literals inline) is
-//! asserted to build. See src/plan_cache.rs parameterize_statement / the
-//! include_strings=false now()-path.
+//! Plan-cache shape building: only now() may be parameterized, as a typed cast.
 use std::sync::Arc;
 
 use datafusion::{
@@ -39,19 +34,17 @@ async fn build(sql: &str) -> Result<(), String> {
 
 #[tokio::test]
 async fn now_only_typed_shape_builds_while_bare_placeholder_shapes_fail() {
-    // FIX: now() → CAST($n AS TIMESTAMPTZ), all other literals inline. This is
-    // what the include_strings=false now()-path produces, and it must build so
-    // the shape caches (repeated dashboard refreshes reuse it).
+    // now() → CAST($n AS TIMESTAMPTZ), all other literals inline: must build, or nothing caches.
     let fixed = "SELECT greatest(count(*)::float8) FROM otel_logs_and_spans \
         WHERE project_id = 'p' AND timestamp >= CAST($1 AS TIMESTAMPTZ) - INTERVAL '1 hour' AND ((level = 'error')) \
         GROUP BY time_bucket('1 minute', timestamp) ORDER BY time_bucket('1 minute', timestamp) DESC LIMIT 100";
     assert!(build(fixed).await.is_ok(), "typed-now, literals-inline shape must build");
 
-    // Bug B: a BARE (untyped) now-placeholder in `- INTERVAL` fails type inference.
+    // A bare (untyped) placeholder in `- INTERVAL` fails type inference — hence the CAST.
     let bare_now = "SELECT count(*) FROM otel_logs_and_spans WHERE timestamp >= $1 - INTERVAL '1 hour'";
     assert!(build(bare_now).await.is_err(), "bare now-placeholder arithmetic should fail (why we CAST)");
 
-    // Bug A: lifting the string inside INTERVAL → INTERVAL $n is unplannable.
+    // `INTERVAL $n` is unplannable — hence interval strings stay inline.
     let interval_ph = "SELECT count(*) FROM otel_logs_and_spans WHERE timestamp >= now() - INTERVAL $1";
     assert!(build(interval_ph).await.is_err(), "INTERVAL placeholder should fail (why we keep it inline)");
 }

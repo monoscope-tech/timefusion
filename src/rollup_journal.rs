@@ -1,8 +1,7 @@
 //! Crash-safe dirty-range journal for rollup maintenance.
 //!
-//! This is scheduling state, not the read-side correctness boundary. Missing or
-//! unreadable state deliberately loads as empty; an absent dirty entry already
-//! means "full rebuild required" to the builder.
+//! Scheduling state only. Missing or unreadable state loads as empty, which the
+//! builder already reads as "full rebuild required".
 
 use std::{
     fs,
@@ -23,15 +22,12 @@ pub struct RollupInvalidation {
     pub epoch: u64,
     pub dirty_hours: u32,
     pub unknown: bool,
-    /// Wall-clock time when this partition first became dirty. A zero value
-    /// comes from journals written before this field existed and is treated as
-    /// unknown rather than manufacturing an inaccurate age.
+    /// Wall-clock time when this partition first became dirty; zero means unknown.
     #[serde(default)]
     pub invalidated_unix_ms: u64,
 }
 
-// Generic over `entries` so `store` can serialize a borrowed slice without
-// cloning into a `Vec` (the default, used for deserializing in `load`).
+// Generic over `entries` so `store` can serialize a borrowed slice without cloning.
 #[derive(Deserialize, Serialize)]
 struct Snapshot<E = Vec<RollupInvalidation>> {
     version: u32,
@@ -55,18 +51,12 @@ pub fn load(data_dir: &Path) -> Vec<RollupInvalidation> {
 }
 
 /// Atomically and durably replace the journal.
-///
-/// Invalidation callers propagate this error before acknowledging inbound
-/// writes. Clearing after a target commit is best effort: failure only causes a
-/// redundant rebuild after restart.
 pub fn store(data_dir: &Path, entries: &[RollupInvalidation]) -> std::io::Result<()> {
     store_encoded(data_dir, &encode(entries)?)
 }
 
-/// The exact bytes [`store_encoded`] would write. Split out so a caller can
-/// compare them against what it last persisted and skip the write entirely —
-/// see `Database::persist_rollup_journal`. Encoding is cheap next to the two
-/// `fsync`s `store_encoded` costs, which is what makes that trade worth making.
+/// The exact bytes [`store_encoded`] would write, so a caller can compare them
+/// against what it last persisted and skip the write.
 pub fn encode(entries: &[RollupInvalidation]) -> std::io::Result<Vec<u8>> {
     serde_json::to_vec(&Snapshot { version: VERSION, entries }).map_err(std::io::Error::other)
 }
@@ -103,18 +93,15 @@ mod tests {
         assert_eq!(load(dir.path()), entries);
     }
 
-    /// Every unreadable shape must load as empty — which the builder already reads
-    /// as "full rebuild required" — and a pre-timestamp journal must still load,
-    /// with an unknown (zero) invalidation time rather than a manufactured one.
+    /// Unreadable shapes load as empty; a journal lacking the timestamp field
+    /// still loads, with a zero (unknown) invalidation time.
     #[test_case(b"not json" => Vec::<RollupInvalidation>::new() ; "corrupt falls back to full rebuild semantics")]
     #[test_case(br#"{"version":2,"entries":[]}"# => Vec::<RollupInvalidation>::new() ; "unsupported version discarded")]
     #[test_case(br#"{"version":1,"entries":[{"project_id":"p","source":"s","date":"2026-08-15","epoch":7,"dirty_hours":5,"unknown":false}]}"#
         => vec![entry(0)] ; "journal written before invalidation timestamps")]
     fn loads_raw_journal(bytes: &[u8]) -> Vec<RollupInvalidation> {
         let dir = tempfile::tempdir().expect("temp dir");
-        let target = path(dir.path());
-        fs::create_dir_all(target.parent().expect("metadata parent")).expect("create metadata dir");
-        fs::write(&target, bytes).expect("write journal");
+        store_encoded(dir.path(), bytes).expect("write journal");
         load(dir.path())
     }
 }

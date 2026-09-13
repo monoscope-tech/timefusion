@@ -141,8 +141,8 @@ fn empty_pg_table(spec: &str) -> DFResult<Arc<dyn TableProvider>> {
 }
 
 /// Delegates to the pg_catalog crate's schema provider, adding tables it does
-/// not ship. It hardcodes its table list and does not implement
-/// `register_table`, so wrapping is the only way to extend it from here.
+/// not ship. It hardcodes its table list and has no `register_table`, so
+/// wrapping is the only way to extend it.
 #[derive(Debug)]
 struct PgCatalogOverlay {
     inner: Arc<dyn SchemaProvider>,
@@ -167,16 +167,9 @@ impl SchemaProvider for PgCatalogOverlay {
     }
 }
 
-/// The cap this statement actually runs under: `min(client, ceiling)`, where a
-/// session may raise the ceiling from `max_statement_secs` to
-/// `batch_statement_secs` only by ASKING for a longer timeout. Nothing raises
-/// implicitly, so a session that says nothing keeps the interactive cap. At
-/// `batch_statement_secs = 0` this is exactly `min(client, server)`.
-///
-/// Deliberately not per-role: there is one pgwire credential
-/// (`CoreConfig::pgwire_user`), shared by the server, the background jobs and
-/// every operator, so a role cannot distinguish batch traffic from a dashboard.
-/// Asking is the only signal available, and it is the Postgres-native one.
+/// The cap this statement runs under: `min(client, ceiling)`. The ceiling rises
+/// from `max_statement_secs` to `batch_statement_secs` only for a session that
+/// explicitly asks for a longer timeout; silence keeps the interactive cap.
 pub fn effective_statement_timeout(client_timeout: Option<Duration>, max_statement_secs: u64, batch_statement_secs: u64) -> Option<Duration> {
     let client_timeout = client_timeout.filter(|timeout| !timeout.is_zero());
     let ceiling = max_statement_secs.max(if client_timeout.is_some() { batch_statement_secs } else { 0 });
@@ -184,8 +177,8 @@ pub fn effective_statement_timeout(client_timeout: Option<Duration>, max_stateme
     [client_timeout, server_timeout].into_iter().flatten().min()
 }
 
-/// The configured batch ceiling, or 0 before the config singleton is
-/// initialised -- which is the safe direction: no raise.
+/// The configured batch ceiling, or 0 (no raise) before the config singleton is
+/// initialised.
 pub fn batch_statement_secs() -> u64 {
     crate::config::try_config().map_or(0, |config| config.core.timefusion_pgwire_batch_statement_secs)
 }
@@ -263,17 +256,11 @@ impl PgCompatibilityHook {
         Self { role: role.into(), max_statement_secs }
     }
 
-    /// pgAdmin's connect-time role probe, answered here rather than planned.
+    /// pgAdmin's connect-time role probe, answered here because DataFusion
+    /// cannot plan its array-subquery/recursive-CTE form at all.
     ///
-    /// It computes `can_signal_backend` as
-    /// `array_contains(ARRAY(WITH RECURSIVE ...), $1)`, and DataFusion supports
-    /// neither the array-subquery constructor (`Invalid function 'array'`) nor
-    /// that recursive CTE (`project index 0 out of bounds`). The statement
-    /// cannot be planned at all, so pgAdmin cannot connect without this.
-    ///
-    /// An unrecognised alias bails to the planner on purpose: a pgAdmin version
-    /// that adds a column then fails loudly with the same planning error,
-    /// rather than being served a fabricated value for it.
+    /// An unrecognised alias bails to the planner on purpose, so a new pgAdmin
+    /// column fails loudly instead of being served a fabricated value.
     fn role_probe(&self, statement: &Statement) -> Option<Vec<(String, RoleField)>> {
         let Statement::Query(query) = statement else {
             return None;
@@ -301,9 +288,7 @@ impl PgCompatibilityHook {
             // The pg_catalog crate reports this role with oid 0.
             "id" => RoleField::Oid(0),
             "name" => RoleField::Text(self.role.clone()),
-            // TF authenticates a single superuser, and each of these is
-            // `CASE WHEN rolsuper THEN true ELSE ... END` in pgAdmin's own SQL,
-            // so a superuser makes every one of them true.
+            // TF authenticates a single superuser, so all of these are true.
             "is_superuser" | "can_create_role" | "can_create_db" | ROLE_PROBE_ALIAS => RoleField::Bool(true),
             _ => return None,
         })
@@ -319,9 +304,8 @@ impl PgCompatibilityHook {
             "server_version_num" => PG_COMPAT_VERSION_NUM.to_string(),
             "is_superuser" => "on".to_string(),
             // `search_path` is deliberately NOT answered here: `SetShowHook`
-            // runs behind this hook and reads the value `SET search_path` wrote
-            // to the client session. A constant here would report `public` back
-            // to every client that had switched schema.
+            // behind this hook returns the session's actual value; a constant
+            // here would report `public` to clients that switched schema.
             "statement_timeout" => effective_statement_timeout(client_statement_timeout(client), self.max_statement_secs, batch_statement_secs())
                 .map_or_else(|| "0".to_string(), |timeout| format!("{}ms", timeout.as_millis())),
             _ => return None,
@@ -362,11 +346,9 @@ impl QueryHook for PgCompatibilityHook {
         {
             return Some(result);
         }
-        // Deliberately NOT intercepted for the role probe: `handle_extended_parse_query`
-        // already returned a plan that produces the row, and letting the normal
-        // executor run it is what encodes the columns in the result format the
-        // client asked for. A hand-built Response here is always text, which a
-        // client requesting binary cannot decode for int4/bool.
+        // Deliberately NOT intercepted for the role probe: only the normal
+        // executor encodes the row in the result format the client asked for;
+        // a hand-built Response is always text, undecodable for binary int4/bool.
         statement.and_then(|statement| self.show(statement, client)).map(|(name, value)| show_response(&name, &value).map(Response::Query))
     }
 }
@@ -404,10 +386,8 @@ fn role_probe_response(fields: &[(String, RoleField)]) -> PgWireResult<QueryResp
 }
 
 /// A tautology over every `$n` the original statement bound, so the substitute
-/// plan declares the same parameters. Without it the client's Bind is rejected
-/// with "expected 0 parameters but got 1" — pgAdmin binds the role name it is
-/// testing for. The type is Utf8 because that is what pgAdmin sends; the
-/// predicate is always true, so the value is never actually consulted.
+/// plan declares the same parameters and Bind is not rejected. Utf8 because that
+/// is what pgAdmin sends; the predicate is always true, so values are unused.
 fn bound_parameter_tautology(statement: &Statement) -> Option<Expr> {
     let text = statement.to_string();
     (1..)
@@ -420,9 +400,8 @@ fn bound_parameter_tautology(statement: &Statement) -> Option<Expr> {
         .reduce(Expr::and)
 }
 
-/// A plan that *produces* the row, rather than an empty relation shaped like it:
-/// the extended protocol executes this plan, and only the real executor encodes
-/// columns in the result format the client requested.
+/// A plan that *produces* the row, not an empty relation shaped like it: only
+/// the real executor encodes columns in the client's requested result format.
 fn role_probe_plan(statement: &Statement, fields: &[(String, RoleField)]) -> PgWireResult<LogicalPlan> {
     let projection = fields.iter().map(|(name, value)| value.literal().alias(name)).collect::<Vec<_>>();
     let builder = LogicalPlanBuilder::empty(true);
@@ -536,23 +515,9 @@ impl ScalarUDFImpl for CurrentSettingUdf {
 
 /// Every setting `current_setting()` answers — also the row set of
 /// `pg_show_all_settings()`, so the two can never disagree.
-const COMPATIBILITY_SETTING_NAMES: [&str; 15] = [
-    "server_version",
-    "server_version_num",
-    "search_path",
-    "is_superuser",
-    "standard_conforming_strings",
-    "client_encoding",
-    "timezone",
-    "datestyle",
-    "intervalstyle",
-    "statement_timeout",
-    "bytea_output",
-    "client_min_messages",
-    "integer_datetimes",
-    "default_transaction_read_only",
-    "in_hot_standby",
-];
+const COMPATIBILITY_SETTING_NAMES: &str = "server_version,server_version_num,search_path,is_superuser,standard_conforming_strings,client_encoding,\
+                                           timezone,datestyle,intervalstyle,statement_timeout,bytea_output,client_min_messages,integer_datetimes,\
+                                           default_transaction_read_only,in_hot_standby";
 
 fn compatibility_setting(name: &str, max_statement_secs: u64) -> Option<String> {
     Some(match name.to_ascii_lowercase().as_str() {
@@ -572,9 +537,8 @@ fn compatibility_setting(name: &str, max_statement_secs: u64) -> Option<String> 
     })
 }
 
-/// `pg_settings` is a view over this set-returning function; pgAdmin calls the
-/// function directly on connect, and the upstream pg_catalog crate only ships
-/// the view — without this, every pgAdmin connection fails at planning.
+/// The set-returning function `pg_settings` is a view over. pgAdmin calls it
+/// directly on connect; the upstream pg_catalog crate only ships the view.
 #[derive(Debug)]
 struct PgShowAllSettingsFunction {
     max_statement_secs: u64,
@@ -582,40 +546,21 @@ struct PgShowAllSettingsFunction {
 
 impl PgShowAllSettingsFunction {
     fn schema() -> SchemaRef {
-        let text = |name: &str| Field::new(name, DataType::Utf8, true);
         Arc::new(Schema::new(
-            [
-                "name",
-                "setting",
-                "unit",
-                "category",
-                "short_desc",
-                "extra_desc",
-                "context",
-                "vartype",
-                "source",
-                "min_val",
-                "max_val",
-                "enumvals",
-                "boot_val",
-                "reset_val",
-                "sourcefile",
-            ]
-            .map(text)
-            .into_iter()
-            .chain([Field::new("sourceline", DataType::Int32, true), Field::new("pending_restart", DataType::Boolean, true)])
-            .collect::<Vec<_>>(),
+            "name,setting,unit,category,short_desc,extra_desc,context,vartype,source,min_val,max_val,enumvals,boot_val,reset_val,sourcefile"
+                .split(',')
+                .map(|name| Field::new(name, DataType::Utf8, true))
+                .chain([Field::new("sourceline", DataType::Int32, true), Field::new("pending_restart", DataType::Boolean, true)])
+                .collect::<Vec<_>>(),
         ))
     }
 
     fn batch(&self) -> DFResult<RecordBatch> {
         let rows: Vec<(&str, String)> =
-            COMPATIBILITY_SETTING_NAMES.iter().filter_map(|name| compatibility_setting(name, self.max_statement_secs).map(|value| (*name, value))).collect();
+            COMPATIBILITY_SETTING_NAMES.split(',').filter_map(|name| compatibility_setting(name, self.max_statement_secs).map(|value| (name, value))).collect();
         let n = rows.len();
         let strings = |values: Vec<Option<String>>| Arc::new(StringArray::from(values)) as ArrayRef;
         let repeat = |value: &str| strings(vec![Some(value.to_string()); n]);
-        // Computed once and Arc-cloned at each use site rather than rebuilt per
-        // column: `nulls`/`settings` each recur 8/3 times below.
         let nulls = strings(vec![None; n]);
         let settings = strings(rows.iter().map(|(_, value)| Some(value.clone())).collect());
         let columns = vec![
@@ -663,15 +608,9 @@ mod tests {
         batch.column(col).as_string::<i32>().value(0)
     }
 
-    /// With the batch ceiling off this is exactly `min(client, server)`.
-    ///
-    /// With it on, a session raises the cap only by ASKING, and never past the
-    /// configured batch ceiling. The silent case is the one that matters: a
-    /// dashboard connection that sets nothing must keep the interactive cap even
-    /// while batch work is allowed, or enabling this would lift the limit on all
-    /// the traffic it was meant to protect. A batch ceiling *below* the
-    /// interactive cap cannot lower it either -- that is what `max_statement_secs`
-    /// is for, and a misconfiguration must not quietly tighten every query.
+    /// A session raises the cap only by asking, never past the batch ceiling; a
+    /// silent session keeps the interactive cap, and a batch ceiling below the
+    /// interactive cap cannot lower it.
     #[test_case::test_case(None, 60, 0 => Some(60) ; "server cap applies when the client is silent")]
     #[test_case::test_case(Some(0), 60, 0 => Some(60) ; "a zero client timeout means unlimited, so the server caps")]
     #[test_case::test_case(Some(5), 60, 0 => Some(5) ; "the smaller client value wins")]
@@ -702,21 +641,19 @@ mod tests {
         assert_eq!(parameters.get("server_version_num").map(String::as_str), Some(PG_COMPAT_VERSION_NUM));
     }
 
-    /// pgAdmin fails to connect with "table function 'pg_show_all_settings' not
-    /// found" if this regresses; the upstream pg_catalog only ships the view.
+    /// pgAdmin cannot connect if this regresses: upstream only ships the view.
     #[tokio::test]
     async fn pg_show_all_settings_is_callable_as_a_table_function() {
         let one = query("SELECT setting FROM pg_show_all_settings() WHERE name = 'server_version'").await;
         assert_eq!(text(&one, 0), PG_COMPAT_VERSION);
 
         let all = query("SELECT * FROM pg_show_all_settings()").await;
-        assert_eq!(all.num_rows(), COMPATIBILITY_SETTING_NAMES.len());
+        assert_eq!(all.num_rows(), COMPATIBILITY_SETTING_NAMES.split(',').count());
         assert_eq!(all.num_columns(), 17);
     }
 
-    /// pgAdmin's dashboard polls these on a timer; a missing one is a planning
-    /// error on every refresh. Overlaying is load-bearing — the pg_catalog crate
-    /// hardcodes its table list, so a silent overlay regression looks like this.
+    /// pgAdmin polls these on a timer; a missing one is a planning error on
+    /// every refresh.
     #[tokio::test]
     async fn runtime_stat_views_are_queryable_and_empty() {
         let ctx = SessionContext::new();
@@ -731,38 +668,29 @@ mod tests {
         ctx.sql("SELECT oid FROM pg_catalog.pg_database LIMIT 1").await.unwrap().collect().await.unwrap();
     }
 
-    /// Every name in the row set must actually resolve, or the table function
-    /// silently drops it and `current_setting()` still errors on it.
-    #[tokio::test]
-    async fn pgadmin_connect_probes_all_resolve() {
-        for name in COMPATIBILITY_SETTING_NAMES {
-            assert!(compatibility_setting(name, 60).is_some(), "{name} is listed but unresolvable");
-        }
-        let batch = query("SELECT current_setting('bytea_output'), pg_is_in_recovery()").await;
-        assert_eq!(text(&batch, 0), "hex");
-        assert!(!batch.column(1).as_boolean().value(0));
-    }
-
+    /// Every name in the row set must resolve, or the table function silently
+    /// drops it while `current_setting()` still errors on it.
     #[tokio::test]
     async fn identity_and_setting_udfs_match_the_compatibility_contract() {
-        let batch = query("SELECT current_database(), session_user, current_setting('server_version'), current_setting('unknown', true)").await;
+        for name in COMPATIBILITY_SETTING_NAMES.split(',') {
+            assert!(compatibility_setting(name, 60).is_some(), "{name} is listed but unresolvable");
+        }
+        let batch = query(
+            "SELECT current_database(), session_user, current_setting('server_version'), current_setting('unknown', true), current_setting('bytea_output'), \
+             pg_is_in_recovery()",
+        )
+        .await;
         assert_eq!(text(&batch, 0), PG_COMPAT_DATABASE);
         assert_eq!(text(&batch, 1), "operator");
         assert_eq!(text(&batch, 2), PG_COMPAT_VERSION);
         assert!(batch.column(3).is_null(0));
+        assert_eq!(text(&batch, 4), "hex");
+        assert!(!batch.column(5).as_boolean().value(0));
     }
 }
 
-// ===== stats_table =====
-// `timefusion.stats` — operator-visible introspection table.
-//
-// Exposes a flat (component, key, value) view of `BufferedWriteLayer` /
-// `MemBuffer` / `WalManager` internals so monitoring and bench harnesses
-// don't have to scrape `ps -o rss=` and guess what walrus is up to.
-//
-// Usage:
-//     SELECT * FROM timefusion_stats;
-//     SELECT key, value FROM timefusion_stats WHERE component='mem_buffer';
+// `timefusion_stats` — a flat (component, key, value) introspection table over
+// write-layer, buffer, WAL, scan, cache and runtime internals.
 
 use std::sync::atomic::Ordering::Relaxed;
 
@@ -770,11 +698,7 @@ use datafusion::{catalog::Session, datasource::TableType, physical_plan::Executi
 
 use crate::{database::ScanMetrics, observability::arrow_err, storage::FoyerRuntimeStats, write::BufferedWriteLayer};
 
-/// Snapshot of the size of the resolve/provider caches at scan time.
-/// Reported as `scan.fast_resolve_cache_entries` and
-/// `scan.provider_cache_entries` so operators can spot the unbounded
-/// growth (documented on each cache's field) before it shows up as
-/// memory pressure in long-running processes.
+/// (fast-resolve cache entries, provider cache entries) at scan time.
 pub type CacheSizeSnapshot = Arc<dyn Fn() -> (usize, usize) + Send + Sync>;
 pub type FoyerStatsSnapshot = Arc<dyn Fn() -> FoyerRuntimeStats + Send + Sync>;
 /// (used_bytes, pool_size) of the shared query memory pool, live.
@@ -839,11 +763,7 @@ pub struct StatsTableProvider {
     cache_sizes: Option<CacheSizeSnapshot>,
     foyer_stats: Option<FoyerStatsSnapshot>,
     query_pool: Option<PoolSnapshot>,
-    /// Maintenance + coordinator pool usage. Their SIZES were already reported
-    /// (`budget.maintenance_pool_mb`) while their USE was not — so every memory
-    /// decision about maintenance (repair budget, admission ceiling, per-sort
-    /// slice, permit count) was unverifiable after shipping. See
-    /// `docs/plans/2026-09-02-scale-readiness-10x-100x.md`.
+    /// Live maintenance + coordinator pool usage.
     maintenance_pool: Option<PoolSnapshot>,
     coordinator_pool: Option<PoolSnapshot>,
     logical_count: Option<LogicalCountSnapshot>,
@@ -894,10 +814,8 @@ impl StatsTableProvider {
         Self { logical_count: Some(f), ..self }
     }
 
-    /// `Option` because the sidecar is absent whenever no schema declares an
-    /// indexed field or object storage is unconfigured — the stats table then
-    /// simply omits the `tantivy` component rather than reporting zeros that
-    /// look like an idle index.
+    /// Absent service ⇒ the `tantivy` component is omitted entirely, rather
+    /// than reporting zeros that look like an idle index.
     pub fn with_tantivy_search_opt(self, s: Option<Arc<crate::tantivy::search::TantivySearchService>>) -> Self {
         Self { tantivy_search: s, ..self }
     }
@@ -908,10 +826,8 @@ impl StatsTableProvider {
     }
 
     fn snapshot_batch(&self) -> DFResult<RecordBatch> {
-        // Boot memory budget. `slack_mb` is the figure that matters: it is what
-        // absorbs allocation no budget tracks (parquet decode, walrus mmaps,
-        // tantivy, allocator overhead), and a small slack is how the box gets
-        // OOM-killed while every individual budget reads healthy.
+        // Boot memory budget. `slack_mb` absorbs allocation no budget tracks
+        // (parquet decode, walrus mmaps, tantivy, allocator overhead).
         let budget = crate::config::boot_budget_audit().map_or_else(Vec::new, |a| {
             rows!["budget";
                 "committed_mb" => a.committed_mb,
@@ -937,16 +853,10 @@ impl StatsTableProvider {
                         "total_buckets" => s.mem_total_buckets,
                         "total_rows" => s.mem_total_rows,
                         "total_batches" => s.mem_total_batches,
-                        // Replay DML consumed without applying (table already flushed) —
-                        // the quarantine dir no longer captures this loss class; monitor
-                        // this like a quarantine count (growth ⇒ check logs + re-drive).
+                        // Replay DML consumed without applying (table already flushed).
                         "replay_dml_noops_total" => s.mem_replay_dml_noops,
-                        // Suffix `_approx` because the in-bucket coalesce path overwrites
-                        // `memory_bytes` to the post-concat size, but the MemBuffer-level
-                        // running total only adds the pre-concat new_size at insert time
-                        // (no subtraction on coalesce). Drift is at most a few percent
-                        // during coalesce-heavy bursts; the value is for capacity
-                        // alerting, not for billing.
+                        // `_approx`: the running total is not adjusted when buckets
+                        // coalesce, so it drifts high. Capacity alerting only.
                         "estimated_bytes_approx" => s.mem_estimated_bytes,
                         "estimated_mb_approx" => mb(s.mem_estimated_bytes as f64),
                         "bucket_duration_micros" => s.bucket_duration_micros,
@@ -962,26 +872,18 @@ impl StatsTableProvider {
                         "backpressure_force_flush_total" => s.backpressure_force_flush_total,
                         "flush_completed_total" => s.flush_completed_total,
                         "flush_failed_total" => s.flush_failed_total,
-                        // Ingest-vs-drain: both climb in steady state. If ingested pulls
-                        // ahead of flushed while pressure_pct=100 and flush_failed_total is
-                        // flat, ingest is outpacing a working drain (throughput wedge) —
-                        // not a stuck flush. `rows_in_buffer_lag` ≈ rows currently buffered
-                        // (ingested includes WAL-recovered rows, so the pair stays
-                        // comparable after a restart).
+                        // Ingest-vs-drain; `rows_in_buffer_lag` ≈ rows currently buffered.
                         "rows_ingested_total" => s.rows_ingested_total,
                         "rows_flushed_total" => s.rows_flushed_total,
                         "rows_in_buffer_lag" => s.rows_ingested_total.saturating_sub(s.rows_flushed_total),
-                        // Drain effectiveness: flat while pressure_pct=100 and flushes
-                        // commit ⇒ drained buckets are empty (memory is in buckets the
-                        // flush path isn't reaching, e.g. an open window needing force-flush).
+                        // Drain effectiveness: flat under pressure ⇒ the flush path is
+                        // draining empty buckets.
                         "flush_freed_bytes_total" => s.flush_freed_bytes_total,
-                        // Real RSS vs the estimate_batch_size charge. RSS far below
-                        // estimated_bytes_approx ⇒ per-bucket estimate is over-counting and
-                        // backpressure is tripping on phantom bytes, not real memory.
+                        // Real RSS, to check `estimated_bytes_approx` against.
                         "process_rss_bytes" => or_null(s.process_rss_bytes),
                         "process_rss_mb" => or_null(s.process_rss_bytes.map(|v| mb(v as f64))),
-                        // Orphaned topics = failed-commit rows living ONLY in the WAL,
-                        // each pinning the WAL GC floor. PAGE on >0; remedy = restart.
+                        // Failed-commit rows living ONLY in the WAL, each pinning the
+                        // WAL GC floor. Alert on >0; remedy = restart.
                         "orphaned_topics" => s.orphaned_topics,
                         "orphan_pin_age_secs" => or_null(s.orphan_pin_age_secs),
                         "drained" => s.drained,
@@ -990,16 +892,10 @@ impl StatsTableProvider {
                     rows!["wal";
                         "recovery_complete" => s.wal_recovery_complete,
                         "recovery_duration_ms" => s.wal_recovery_duration_ms,
-                        // Rows this boot re-inserted. Replay is not idempotent by
-                        // design, so every restart re-adds rows already in Delta and
-                        // dedup pays to remove them: 58% of the duplicate groups in a
-                        // sampled prod file were byte-identical replay copies, not
-                        // merge-on-read versions. Compare against the dedup drop rate
-                        // to price a restart.
+                        // Rows this boot re-inserted. Replay is not idempotent, so a
+                        // restart re-adds rows already in Delta and dedup removes them.
                         "replay_rows" => s.wal_replay_rows,
-                        // The other half of that comparison: flushes declined
-                        // because the rows were already in Delta. Rising with
-                        // replay_rows is the feature working.
+                        // Flushes declined because the rows were already in Delta.
                         "landed_skips" => s.landed_skips_total,
                         "landed_skipped_rows" => s.landed_skipped_rows_total,
                     ],
@@ -1008,8 +904,7 @@ impl StatsTableProvider {
                         "files" => s.wal_files,
                         "disk_bytes" => s.wal_disk_bytes,
                         "disk_mb" => mb(s.wal_disk_bytes as f64),
-                        // Parked payloads: invisible to wal_disk_bytes (flat walk), which is
-                        // how gc_wal_files deleted them unnoticed. ALERT if files > 0.
+                        // Parked payloads, invisible to wal_disk_bytes. Alert if > 0.
                         "quarantine_files" => s.quarantine_files,
                         "quarantine_mb" => mb(s.quarantine_bytes as f64),
                     ],
@@ -1021,35 +916,24 @@ impl StatsTableProvider {
             },
         );
 
-        let d = crate::observability::dml_stats();
-        let dml = atomic_rows(d.stats_rows());
+        let dml = atomic_rows(crate::observability::dml_stats().stats_rows());
 
-        // NONZERO = a scan advertised an ordering its data does not honour, i.e.
-        // a parquet footer's `sorting_columns` is lying. Drives the hot-tail
-        // footer repair; see read_dedup::Bound::advance.
+        // Nonzero = a scan advertised an ordering its data does not honour (a
+        // parquet footer's `sorting_columns` is lying). Drives hot-tail repair.
         let read_dedup = rows![@atomic "read_dedup";
             "ordering_violations_total" => crate::read::ORDERING_VIOLATIONS,
-            // Per-leg attribution, populated only while
-            // TIMEFUSION_ORDERING_PROBE=true. All zero with a nonzero total
-            // just means the probe is off — not that no leg is at fault.
+            // Per-leg attribution, populated only under TIMEFUSION_ORDERING_PROBE.
             "ordering_violations_mem" => crate::read::ORDERING_VIOLATIONS_MEM,
             "ordering_violations_delta" => crate::read::ORDERING_VIOLATIONS_DELTA,
         ];
 
-        let m = crate::observability::maintenance_stats();
-        let maintenance: Vec<Row> = atomic_rows(m.stats_rows())
+        let maintenance: Vec<Row> = atomic_rows(crate::observability::maintenance_stats().stats_rows())
             .into_iter()
             .chain([("maintenance", "retry_reason".to_owned(), crate::observability::maintenance_retry_reason())])
-            // DERIVED, not hand-listed. `rollup_witnessless_slices` above is one
-            // number for a population that sat byte-identical across four hourly
-            // passes and a restart; these say why, in two dimensions that each sum to
-            // it. Iterating the bucket lists is the point: a reason added without a
-            // row is the bug class that cost 53% of prefilter skips their attribution
-            // on 2026-08-24, and it cannot happen here.
+            // Derived from the bucket lists, never hand-listed: a reason added
+            // without a row would be silently unattributable.
             .chain(crate::database::rollup_unverifiable::gauge_rows().map(|(key, value)| ("maintenance", key, value.to_string())))
-            // Same reason, same shape: one row per (operation, retry reason) the
-            // process has actually seen, rather than a hand-kept list that a new
-            // reason silently misses.
+            // Same shape: one row per (operation, retry reason) actually seen.
             .chain(
                 crate::observability::maintenance_retry_rows()
                     .into_iter()
@@ -1060,12 +944,8 @@ impl StatsTableProvider {
 
         let plan_cache = crate::read::plan_cache::global().map_or_else(Vec::new, |pc| {
             let (hits, misses) = pc.counters();
-            // Shape path = literal-bearing and now()-bearing SELECTs (the dashboard
-            // hot path). Separate from the placeholder-`$N` counters above, and
-            // previously unexposed — so the now()-shape caching (the bulk of the
-            // dashboard work) was entirely invisible in stats. shape_hits = a plan
-            // was served via the shape path (built or reused); shape_skips = a shape
-            // couldn't be parameterized and fell back to a fresh plan.
+            // Shape path = literal- and now()-bearing SELECTs, distinct from the
+            // placeholder-`$N` counters above. shape_skips = not parameterizable.
             let (shape_hits, shape_skips) = pc.shape_counters();
             rows!["plan_cache";
                 "hits" => hits,
@@ -1083,18 +963,14 @@ impl StatsTableProvider {
             let (fr_hits, fr_misses) = (cv(FAST_RESOLVE_HITS), cv(FAST_RESOLVE_MISSES));
             let (cert_never, cert_moved) = (cv(DEDUP_DENIED_NEVER_CERTIFIED), cv(DEDUP_DENIED_FP_MOVED));
             let (pc_hits, pc_misses) = (cv(PROVIDER_CACHE_HITS), cv(PROVIDER_CACHE_MISSES));
-            // Parquet decode heap — the largest consumer outside every budget.
-            // `peak_batch_bytes x polls_inflight_peak` bounds the worst-case
-            // concurrent decode heap, which is what a Transient budget must cover.
-            // High-water marks stay hand-rolled atomics (`m.decode`) — `metrics::Gauge`
-            // has no `fetch_max` equivalent, see `DecodeGauges`.
+            // `peak_batch_bytes x polls_inflight_peak` bounds worst-case concurrent
+            // parquet decode heap. High-water marks are hand-rolled atomics because
+            // `metrics::Gauge` has no `fetch_max`.
             let (dpeak, dinflight_peak) = (m.decode.decode_peak_batch_bytes.load(Relaxed), m.decode.decode_polls_inflight_peak.load(Relaxed));
-            // The number the OOM killer acts on, live: without this the only
-            // record of a memory climb is the kernel's post-mortem kill line.
+            // The number the OOM killer acts on, live.
             let (used, limit) = (crate::database::process_memory_bytes().unwrap_or(0), crate::config::try_config().map_or(0, |c| c.derived.memory_limit_bytes));
             let (pool_used, pool_size) = self.query_pool.as_ref().map_or((0, 0), |f| f());
-            // Reported as `usize::MAX` size when unwired would be misleading, so
-            // keep the same (0, 0) convention as the query pool and guard the pct.
+            // Unwired pools use the same (0, 0) convention as the query pool.
             let (mpool_used, mpool_size) = self.maintenance_pool.as_ref().map_or((0, 0), |f| f());
             let (cpool_used, cpool_size) = self.coordinator_pool.as_ref().map_or((0, 0), |f| f());
             [
@@ -1102,14 +978,9 @@ impl StatsTableProvider {
                     "charged_bytes" => used,
                     "limit_bytes" => limit,
                     "charged_pct" => share_pct(used, limit),
-                    // Saturation here surfaces as "Resources exhausted" query
-                    // errors (2026-08-03 07:06: enrichment UPDATEs failing at
-                    // 30.0/30.0 GB), invisible before this row.
+                    // Saturation here surfaces as "Resources exhausted" query errors.
                     "query_pool_used_bytes" => pool_used,
                     "query_pool_pct" => share_pct(pool_used, pool_size),
-                    // The pools every maintenance memory decision is about. Their
-                    // sizes were already visible; their USE was not, so a budget
-                    // change could not be verified against the pool it moved.
                     "maintenance_pool_used_bytes" => mpool_used,
                     "maintenance_pool_pct" => share_pct(mpool_used, mpool_size),
                     "coordinator_pool_used_bytes" => cpool_used,
@@ -1134,8 +1005,8 @@ impl StatsTableProvider {
                     "provider_build_us_avg" => avg(cv(PROVIDER_BUILD_US_TOTAL), cv(PROVIDER_BUILD_TOTAL)),
                     "provider_scan_us_avg" => avg(cv(PROVIDER_SCAN_US_TOTAL), cv(PROVIDER_SCAN_TOTAL)),
                     "dedup_full_set_pct" => pct(cv(DEDUP_FULL_SET_TOTAL), cv(DEDUP_BOUNDED_TOTAL) + cv(DEDUP_FULL_SET_TOTAL)),
-                    // Read these BEFORE setting TIMEFUSION_WIDE_SCAN_REFUSE_MB — the
-                    // threshold has to sit above p99 or it rejects working dashboards.
+                    // TIMEFUSION_WIDE_SCAN_REFUSE_MB must sit above p99 or it rejects
+                    // working dashboards.
                     "wide_scan_selected_mb_p50" => q(WIDE_SCAN_SELECTED_MB, 0.50),
                     "wide_scan_selected_mb_p90" => q(WIDE_SCAN_SELECTED_MB, 0.90),
                     "wide_scan_selected_mb_p99" => q(WIDE_SCAN_SELECTED_MB, 0.99),
@@ -1189,9 +1060,8 @@ impl StatsTableProvider {
                     "l2_used_bytes" => s.l2_used_bytes,
                     "entry_count" => s.entry_count,
                     "evictions" => s.evictions,
-                    // Admission accounting. `write_capture` is invisible to the
-                    // read-side counters above, which is how ~500 MB/s of local
-                    // writes went unattributed twice (2026-09-12).
+                    // Admission accounting; `write_capture` is invisible to the
+                    // read-side counters above.
                     "admit_write_capture_bytes" => s.admit_write_capture_bytes,
                     "admit_read_miss_bytes" => s.admit_read_miss_bytes,
                     "admit_refresh_bytes" => s.admit_refresh_bytes,
@@ -1213,8 +1083,8 @@ impl StatsTableProvider {
         ];
 
         let cache_sizes = self.cache_sizes.as_ref().map_or_else(Vec::new, |snap| {
-            // Mirror the field-level doc: these caches don't evict; size
-            // tracks unique (project, table) pairs since process start.
+            // These caches don't evict; size tracks unique (project, table) pairs
+            // since process start.
             let (fast_resolve, provider) = snap();
             rows!["scan"; "fast_resolve_cache_entries" => fast_resolve, "provider_cache_entries" => provider]
         });
@@ -1231,11 +1101,8 @@ impl StatsTableProvider {
             ]
         });
 
-        // Tantivy read path. `*_us_avg` are the per-phase means the prefilter
-        // had no way to report before: `indexes_per_query` is the fan-out that
-        // dominates it, `blob_fetches` vs `cache_seeded` says whether the local
-        // cache is actually absorbing reads, and `manifest_hit_pct` says whether
-        // the 745 KB manifest is being re-fetched on the planning path.
+        // Tantivy read path: per-phase means plus the fan-out (`indexes_per_query`)
+        // that dominates them.
         let tantivy = self.tantivy_search.as_ref().map_or_else(Vec::new, |svc| {
             let s = &svc.stats;
             let mean = |us: &std::sync::atomic::AtomicU64, n: &std::sync::atomic::AtomicU64| avg(us.load(Relaxed), n.load(Relaxed));
@@ -1257,9 +1124,8 @@ impl StatsTableProvider {
                 "histogram_unique_partitions" => s.histogram_unique_partitions.load(Relaxed),
                 "manifest_hit_pct" => pct(mh, mh + ml),
                 "manifest_load_us_avg" => mean(&s.manifest_load_us, &s.manifest_loads),
-                // Every blob fetch is an S3 round trip on the planning path that
-                // a resident local cache would have served. Should trend to ~0
-                // for the hot window once seeding + re-warm are working.
+                // Every blob fetch is an S3 round trip on the planning path; should
+                // trend to ~0 for the hot window once seeding is working.
                 "blob_fetches" => s.blob_fetches.load(Relaxed),
                 "blob_fetch_us_avg" => mean(&s.blob_fetch_us, &s.blob_fetches),
                 "index_opens" => io,
@@ -1270,29 +1136,16 @@ impl StatsTableProvider {
                 "search_concurrency" => svc.config.search_concurrency(),
                 "cache_seeded" => s.cache_seeded.load(Relaxed),
                 "cache_seed_failures" => s.cache_seed_failures.load(Relaxed),
-                // Raw cumulative microseconds, alongside the means above,
-                // because a MEAN CANNOT BE DIFFERENCED: each `*_us_avg` divides
-                // by its own denominator (`search_us_avg` by per-index
-                // `searches`, not by `queries`), so reconstructing a total as
-                // avg*count silently mixes denominators — an attribution probe
-                // built that way reported NEGATIVE per-query search time. These
-                // are monotonic, so a before/after delta around a single query
-                // is that query's exact spend, per phase.
-                //
-                // Read `search_us_total` as occupancy, not wall clock: per-index
-                // searches run `search_concurrency`-way, so the sum exceeds the
-                // wall time it cost, by up to that factor.
+                // Raw monotonic microseconds: each `*_us_avg` above divides by its
+                // own denominator, so avg*count mixes denominators and cannot be
+                // differenced. `search_us_total` is occupancy, not wall clock —
+                // per-index searches run `search_concurrency`-way.
                 "manifest_load_us_total" => s.manifest_load_us.load(Relaxed),
                 "blob_fetch_us_total" => s.blob_fetch_us.load(Relaxed),
                 "index_open_us_total" => s.index_open_us.load(Relaxed),
                 "search_us_total" => s.search_us.load(Relaxed),
-                // Closes the attribution gap the four above left open: a routed
-                // 7d equality cost ~420ms more than its unrouted twin while
-                // search_us accounted for only ~45ms of it, with zero IO. The
-                // time is somewhere between "task starts" and "search timer
-                // starts", or in the merge — which is exactly what these three
-                // separate. fanout_us minus prepare_us minus search_us is the
-                // result-merge bookkeeping.
+                // Time the four above cannot see: fanout_us minus prepare_us minus
+                // search_us is the result-merge bookkeeping.
                 "plan_us_total" => s.plan_us.load(Relaxed),
                 "prepare_us_total" => s.prepare_us.load(Relaxed),
                 "prepares" => s.prepares.load(Relaxed),
@@ -1301,8 +1154,7 @@ impl StatsTableProvider {
         });
 
         // File-level needle pruning (bloom sidecars). `files_rejected` /
-        // `files_probed` is the pruning rate; `registry_misses` trending to 0
-        // says the resident set covers the queried window.
+        // `files_probed` is the pruning rate.
         let bloom_prune = self.bloom_prune.as_ref().map_or_else(Vec::new, |reg| {
             let s = &reg.stats;
             rows!["bloom_prune";
@@ -1319,13 +1171,9 @@ impl StatsTableProvider {
             ]
         });
 
-        // Process age and worker starvation, in the same read as everything
-        // else. Every other counter here is process-scoped, so `uptime_seconds`
-        // is what makes them quotable at all: 0 accrual on a four-minute
-        // process and 0 accrual on a five-hour one are opposite findings.
-        // `scheduling_lag_ms` nonzero while the host has idle cores means
-        // workers are BLOCKED, not busy — read it with the `block` rows below,
-        // which name the section.
+        // Every other counter here is process-scoped, so `uptime_seconds` is what
+        // makes them quotable. `scheduling_lag_ms` nonzero with idle cores means
+        // workers are blocked, not busy — read it with the `block` rows below.
         let (lag_last, lag_max) = crate::observability::runtime_lag_ms();
         let runtime = rows!["runtime";
             "uptime_seconds" => crate::observability::process_uptime_secs(),
@@ -1333,10 +1181,8 @@ impl StatsTableProvider {
             "scheduling_lag_max_ms" => lag_max,
             "worker_threads" => std::thread::available_parallelism().map_or(0, std::num::NonZeroUsize::get),
         ];
-        // Fragmentation, if jemalloc is the allocator (prod: yes). `frag_pct`
-        // is the share of resident memory backing no live allocation — the last
-        // candidate for the ~1.5h cost onset, since every other instrument here
-        // either froze or fell across it.
+        // Empty unless jemalloc is the allocator. `frag_pct` is the share of
+        // resident memory backing no live allocation.
         let jemalloc = crate::observability::jemalloc_bytes().map_or_else(Vec::new, |(allocated, active, resident, mapped, retained)| {
             rows!["jemalloc";
                 "allocated_mb" => mib(allocated as usize),
@@ -1419,12 +1265,9 @@ mod stats_table_tests {
         assert!(rows.iter().any(|(c, k, _)| c == component && k == key), "missing {component}.{key}");
     }
 
-    /// Every optional wiring attached at once. Each `with_*` feeds its own
-    /// independent `map_or_else` branch, so one snapshot proves them all.
-    ///
-    /// `with_scan_metrics` is REQUIRED, not incidental: the whole `memory`
-    /// component is emitted inside the scan-metrics branch, so an unwired scan
-    /// hides every pool row too.
+    /// Every optional wiring attached at once, so one snapshot proves them all.
+    /// `with_scan_metrics` is required: the `memory` component is emitted inside
+    /// the scan-metrics branch, so an unwired scan hides every pool row too.
     fn fully_wired_rows() -> Vec<OwnedRow> {
         let snapshot = FoyerRuntimeStats {
             memory_size_bytes: 4 * 1024 * 1024,
@@ -1452,21 +1295,8 @@ mod stats_table_tests {
     }
 
     /// One snapshot, every wired component: the rows a `timefusion_stats` query
-    /// must carry, and the handful whose VALUE is the point.
-    ///
-    /// The pool rows must EXIST and divide by the size they were given. Both
-    /// halves have bitten: an unwired closure reads `(0, 0)` and is
-    /// indistinguishable from an idle pool, and the maintenance row's
-    /// denominator was initially the whole maintenance pool while its numerator
-    /// is reserved from the heavy share — which would have made a saturated pool
-    /// report 30% and argued for widening the very ceiling that was saturating.
-    ///
-    /// Process age and worker starvation must be readable in the same query as
-    /// the counters they qualify — a counter quoted without uptime is not a
-    /// measurement (2026-08-23, twice).
-    ///
-    /// `parquet` rows come from deltalake's global snapshot struct, not from a
-    /// declaration this crate owns — the only counters here still exposed by hand.
+    /// must carry, plus the handful whose VALUE is the point — a pool pct must
+    /// divide used by the size it was handed.
     #[test]
     fn exposes_every_wired_component_foyer_pools_logical_count_runtime_scan_and_parquet() {
         use crate::database::scan_metric_names::{SCAN_DERIVED_ROWS, SCAN_ROWS};
@@ -1475,49 +1305,31 @@ mod stats_table_tests {
         drop(crate::observability::TimedSection::new("test_section"));
 
         let rows = fully_wired_rows();
-        let expect = |component: &str, keys: &[&str]| {
-            for key in keys {
+        let expect = |component: &str, keys: &str| {
+            for key in keys.split(' ') {
                 assert_has(&rows, component, key);
             }
         };
 
         expect(
             "foyer",
-            &[
-                "memory_mb",
-                "disk_gb",
-                "ttl_seconds",
-                "l1_max_entry_mb",
-                "block_size_mb",
-                "cache_recent_days",
-                "cache_dir",
-                "metadata_memory_mb",
-                "metadata_disk_gb",
-                "l1_used_bytes",
-                "l2_used_bytes",
-                "entry_count",
-                "evictions",
-            ],
+            "memory_mb disk_gb ttl_seconds l1_max_entry_mb block_size_mb cache_recent_days cache_dir metadata_memory_mb metadata_disk_gb l1_used_bytes \
+             l2_used_bytes entry_count evictions",
         );
-        expect("memory", &["maintenance_pool_used_bytes", "maintenance_pool_pct", "coordinator_pool_used_bytes", "coordinator_pool_pct"]);
-        expect(
-            "logical_count",
-            &["resident_partitions", "resident_bytes_estimated", "resident_mb_estimated", "resident_limit_bytes", "resident_limit_mb", "active_builds"],
-        );
-        expect("runtime", &["uptime_seconds", "scheduling_lag_ms", "scheduling_lag_max_ms", "worker_threads"]);
+        expect("memory", "maintenance_pool_used_bytes maintenance_pool_pct coordinator_pool_used_bytes coordinator_pool_pct");
+        expect("logical_count", "resident_partitions resident_bytes_estimated resident_mb_estimated resident_limit_bytes resident_limit_mb active_builds");
+        expect("runtime", "uptime_seconds scheduling_lag_ms scheduling_lag_max_ms worker_threads");
         // Same section name under both kinds must stay two distinct rows: one
         // claims worker occupancy, the other only wall time.
         for component in ["block", "section"] {
-            expect(component, &["test_section.count", "test_section.total_ms", "test_section.max_ms", "test_section.avg_us"]);
+            expect(component, "test_section.count test_section.total_ms test_section.max_ms test_section.avg_us");
         }
-        expect("parquet", &["metadata_cache_hits", "bytes_read"]);
+        expect("parquet", "metadata_cache_hits bytes_read");
         for (component, key) in SCAN_ROWS.iter().map(|(c, k, _)| (*c, *k)).chain(SCAN_DERIVED_ROWS.iter().copied()) {
             assert_has(&rows, component, key);
         }
 
-        // The rows whose VALUE, not mere presence, is the assertion: a pct must
-        // divide used by the size it was handed, and a passthrough must not
-        // mangle what it was given.
+        // Rows whose VALUE, not mere presence, is the assertion.
         for (component, key, value) in [
             ("foyer", "cache_dir", "/cache"),
             ("memory", "maintenance_pool_pct", "25"),
@@ -1528,21 +1340,10 @@ mod stats_table_tests {
         }
     }
 
-    /// Scan metrics wired and NOTHING else — the two claims that need exactly
-    /// that shape.
-    ///
-    /// 1. An unwired pool must not divide by zero — it reports 0, like the query
-    ///    pool.
-    /// 2. Every counter `scan_metrics!` declares must reach `timefusion_stats`.
-    ///    `rows`/`reasons` entries are rendered FROM the declaration, so for
-    ///    those this only re-proves what the macro already makes structural. What
-    ///    it actually pins is `derived`: counters that reach stats through a row
-    ///    pg_compat computes by hand (an average, a percentile), the one
-    ///    remaining way a declared counter can go unexposed.
-    ///
-    ///    The bug it retires: the 2026-08-23 prefilter split renamed four reasons
-    ///    and the readout kept asking for the retired string, so `map_or(0, …)`
-    ///    rendered a confident 0 — 53% of prod skips unattributable on 2026-08-24.
+    /// Scan metrics wired and nothing else: an unwired pool reports 0 rather
+    /// than dividing by zero, and every counter `scan_metrics!` declares reaches
+    /// `timefusion_stats` — including the `derived` rows computed here by hand,
+    /// which are the one way a declared counter can go silently unexposed.
     #[test]
     fn unwired_pools_read_zero_and_every_declared_scan_metric_has_a_row() {
         let rows = snapshot_rows(&StatsTableProvider::new(None).with_scan_metrics(Arc::new(ScanMetrics::default())));
@@ -1557,14 +1358,9 @@ mod stats_table_tests {
         );
     }
 
-    /// Every unverifiable-slice bucket must reach `timefusion_stats`, and no row
-    /// may exist that no bucket produces.
-    ///
-    /// Set equality, not a count: a bucket renamed without the readout following
-    /// leaves a row that reads a confident 0 forever, which is exactly how
-    /// `no_index_or_cap` hid 81% of prefilter skips. The rows are derived from
-    /// `ALL`, so this passes by construction today — it is here to fail the day
-    /// someone re-introduces a hand-maintained key list.
+    /// Set equality (not a count) between the unverifiable-slice buckets and the
+    /// exposed rows: it exists to fail the day someone re-introduces a
+    /// hand-maintained key list, which would leave rows reading a confident 0.
     #[test]
     fn every_unverifiable_bucket_is_exposed() {
         use crate::database::rollup_unverifiable::{UnverifiableFate, UnverifiableReason};

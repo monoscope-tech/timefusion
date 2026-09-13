@@ -1,5 +1,5 @@
-//! E2E test harness: dynamic MinIO container, full bootstrap, virtual clock,
-//! pgwire client. Mirrors prod `main.rs` via `timefusion::bootstrap`.
+//! E2E test harness: MinIO, full bootstrap, virtual clock, pgwire client.
+//! Mirrors prod `main.rs` via `timefusion::bootstrap`.
 
 #![allow(dead_code)]
 
@@ -19,21 +19,8 @@ use tokio::sync::Notify;
 use tokio_postgres::{Client, NoTls};
 use uuid::Uuid;
 
-/// MinIO release with atomic conditional PUT support. The testcontainers
-/// module's older default can overwrite racing Delta commits. Modern MinIO
-/// prints its readiness banner on stderr, hence the custom image below.
-/// MinIO's images come from quay.io, NOT Docker Hub.
-///
-/// `minio/minio:RELEASE.2025-09-07T16-13-09Z` 404s — MinIO stopped publishing
-/// that tag to Docker Hub, and testcontainers reports it as
-/// `pull access denied ... repository does not exist or may require docker login`,
-/// which reads like a credentials problem and is not one.
-///
-/// This was invisible for as long as it has been broken, because the harness
-/// resolves MinIO local-first: any developer with a `minio` binary on PATH never
-/// reaches the Docker fallback, and a locally-attested `e2e` makes CI SKIP the
-/// job. CI only ran it — and failed — once an attestation was absent.
-/// `ci/compose.yml` already pulls from quay.io; these two call sites did not.
+/// MinIO release with atomic conditional PUT support (older ones can overwrite
+/// racing Delta commits). Must come from quay.io — this tag is not on Docker Hub.
 pub const MINIO_IMAGE: &str = "quay.io/minio/minio";
 pub const MINIO_TAG: &str = "RELEASE.2025-09-07T16-13-09Z";
 
@@ -93,13 +80,10 @@ impl Default for E2eEnvBuilder {
             wide_scan_max_files: None,
             wide_scan_max_mb: None,
             unordered_leg_sort_max_mb: None,
-            // Mirror the prod default (on) so the whole e2e suite exercises the
-            // merge-on-read DV write path. Opt out per-test with `without_deletion_vectors`.
             use_deletion_vectors: true,
             dml_merge_key_prune: true,
             tantivy_prefilter: true,
-            // 0 = synchronous DML (prod-default off). Prod runs 60s; set >0 to
-            // exercise the coalescer defer/drain path in tests.
+            // 0 = synchronous DML; >0 exercises the coalescer defer/drain path.
             dml_coalesce_secs: 0,
             page_row_count_limit: None,
             repair_resume: false,
@@ -109,147 +93,76 @@ impl Default for E2eEnvBuilder {
     }
 }
 
+/// Consuming `self`-returning setters that take no argument (a flag flip).
+macro_rules! flag_setters {
+    ($( $(#[$m:meta])* $name:ident => $field:ident = $val:expr ),* $(,)?) => {$(
+        $(#[$m])*
+        pub fn $name(mut self) -> Self { self.$field = $val; self }
+    )*};
+}
+
+/// Consuming `self`-returning setters that take one argument; `$val` is the
+/// stored expression, so `.max(1)` / `Some(..)` transforms stay at the site.
+macro_rules! value_setters {
+    ($( $(#[$m:meta])* $name:ident($arg:ident : $ty:ty) => $field:ident = $val:expr ),* $(,)?) => {$(
+        $(#[$m])*
+        pub fn $name(mut self, $arg: $ty) -> Self { self.$field = $val; self }
+    )*};
+}
+
 impl E2eEnvBuilder {
-    pub fn with_bucket_duration(mut self, d: Duration) -> Self {
-        self.bucket_duration_secs = d.as_secs().max(1);
-        self
+    value_setters! {
+        with_bucket_duration(d: Duration) => bucket_duration_secs = d.as_secs().max(1),
+        with_flush_interval(d: Duration) => flush_interval_secs = d.as_secs().max(1),
+        with_eviction_interval(d: Duration) => eviction_interval_secs = d.as_secs().max(1),
+        with_retention(d: Duration) => retention_mins = (d.as_secs() / 60).max(1),
+        /// Shrink the in-process sort budget (in-memory Arrow bytes) so a test can
+        /// reproduce a bin that exceeds it.
+        with_sort_skip_bytes(bytes: usize) => sort_skip_bytes = Some(bytes),
+        /// Shrink the hot-tail compaction target so a test-sized file counts as
+        /// "converged" (>= 7/8 of target).
+        with_light_optimize_target(bytes: i64) => light_optimize_target_size = Some(bytes),
+        /// Shrink the wide-scan file budget so a test-sized file set trips the
+        /// admission gate.
+        with_wide_scan_max_files(files: usize) => wide_scan_max_files = Some(files),
+        /// Budget for `repair_isolated_scan_ordering`; 0 turns the repair off.
+        with_unordered_leg_sort_max_mb(mb: u64) => unordered_leg_sort_max_mb = Some(mb),
+        with_wide_scan_max_mb(mb: u64) => wide_scan_max_mb = Some(mb),
+        with_max_memory_mb(mb: usize) => max_memory_mb = mb,
+        with_frozen_at(micros: i64) => frozen_at_micros = micros,
+        with_checkpoint_interval(n: u64) => checkpoint_interval = n,
+        /// Force small parquet data pages (row-count capped) so a few hundred rows
+        /// yield many pages within one row group — exercises page-index pruning.
+        with_page_row_count_limit(rows: usize) => page_row_count_limit = Some(rows),
+        with_dml_merge_key_prune(on: bool) => dml_merge_key_prune = on,
+        /// The tantivy scan prefilter. Off makes the Delta leg's file list
+        /// independent of whether the sidecar index has finished building — a flush
+        /// spawns that as a detached task, so it is otherwise an unawaitable race.
+        with_tantivy_prefilter(on: bool) => tantivy_prefilter = on,
+        /// Defer `UPDATE ... FROM` Delta legs through the coalescer; drain
+        /// explicitly with `E2eEnv::drain_dml_coalescer`. 0 = synchronous.
+        with_dml_coalesce_secs(secs: u64) => dml_coalesce_secs = secs,
     }
-    pub fn with_flush_interval(mut self, d: Duration) -> Self {
-        self.flush_interval_secs = d.as_secs().max(1);
-        self
-    }
-    pub fn with_eviction_interval(mut self, d: Duration) -> Self {
-        self.eviction_interval_secs = d.as_secs().max(1);
-        self
-    }
-    pub fn with_retention(mut self, d: Duration) -> Self {
-        self.retention_mins = (d.as_secs() / 60).max(1);
-        self
-    }
-    /// Commit staged-but-uncommitted repair parquet at boot instead of deleting
-    /// it. Off in prod for the first deploy, so a test that asserts on resume
-    /// MUST turn it on or the resume path is a silent no-op.
-    /// Leave flush output UNMARKED, so its files are footer-repair suspects.
-    ///
-    /// Write-time marking (2026-08-28) records a file as verified-sorted when the write stamps
-    /// its footer, which means a fixture built by flushing sorted rows has NO repair work — and
-    /// a test that needs repair to actually do something gets a silent no-op instead. Turning
-    /// the mechanism off is the honest way to restore that precondition: it is a real config
-    /// flag, not a test seam, and it gates the seeding sweep too (which would otherwise re-derive
-    /// the same marks from the footers).
-    pub fn without_write_time_sort_marking(mut self) -> Self {
-        self.mark_sorted_at_write = false;
-        self
-    }
-    pub fn with_repair_resume(mut self) -> Self {
-        self.repair_resume = true;
-        self
-    }
-    /// Decline a flush whose rows are provably already committed
-    /// (`docs/plans/2026-09-02-stop-manufacturing-duplicates.md`).
-    pub fn with_landed_skip(mut self) -> Self {
-        self.landed_skip = true;
-        self
-    }
-    /// Shrink the in-process sort budget (in-memory Arrow bytes) so a test can
-    /// reproduce a bin that exceeds it — the production shape, where a 256 MB
-    /// FILE-byte compaction target is ~17x over a 256 MB in-memory budget.
-    pub fn with_sort_skip_bytes(mut self, bytes: usize) -> Self {
-        self.sort_skip_bytes = Some(bytes);
-        self
-    }
-    /// Shrink the hot-tail compaction target so a test-sized file counts as
-    /// "converged" (>= 7/8 of target) — the state a 265-778MB prod file is in.
-    pub fn with_light_optimize_target(mut self, bytes: i64) -> Self {
-        self.light_optimize_target_size = Some(bytes);
-        self
-    }
-    pub fn without_light_optimize(mut self) -> Self {
-        self.light_optimize_enabled = false;
-        self
-    }
-    /// Shrink the wide-scan file budget so a test-sized file set trips the
-    /// admission gate (the prod default is 256 files).
-    pub fn with_wide_scan_max_files(mut self, files: usize) -> Self {
-        self.wide_scan_max_files = Some(files);
-        self
-    }
-    /// Budget for `repair_isolated_scan_ordering`; 0 turns the repair off.
-    pub fn with_unordered_leg_sort_max_mb(mut self, mb: u64) -> Self {
-        self.unordered_leg_sort_max_mb = Some(mb);
-        self
-    }
-    pub fn with_wide_scan_max_mb(mut self, mb: u64) -> Self {
-        self.wide_scan_max_mb = Some(mb);
-        self
-    }
-    pub fn with_foyer_enabled(mut self) -> Self {
-        self.foyer_disabled = false;
-        self
-    }
-    pub fn with_foyer_disabled(mut self) -> Self {
-        self.foyer_disabled = true;
-        self
-    }
-    pub fn with_flush_immediately(mut self) -> Self {
-        self.flush_immediately = true;
-        self
-    }
-    pub fn with_max_memory_mb(mut self, mb: usize) -> Self {
-        self.max_memory_mb = mb;
-        self
-    }
-    pub fn with_frozen_at(mut self, micros: i64) -> Self {
-        self.frozen_at_micros = micros;
-        self
-    }
-    pub fn with_checkpoint_interval(mut self, n: u64) -> Self {
-        self.checkpoint_interval = n;
-        self
-    }
-    pub fn with_optimize_sort_by(mut self) -> Self {
-        self.optimize_sort_by = true;
-        self
-    }
-    /// Force small parquet data pages (row-count capped) so a few hundred rows
-    /// yield many pages within one row group — exercises page-index pruning.
-    pub fn with_page_row_count_limit(mut self, rows: usize) -> Self {
-        self.page_row_count_limit = Some(rows);
-        self
-    }
-    /// Warm freshly-flushed file BODIES (not just footers) into Foyer, so the
-    /// first recent-window scan after a flush is served warm instead of cold
-    /// from S3 — the "keep the hot tail warm" lever.
-    pub fn with_warm_full_files(mut self) -> Self {
-        self.warm_full_files = true;
-        self
-    }
-    pub fn with_deletion_vectors(mut self) -> Self {
-        self.use_deletion_vectors = true;
-        self
-    }
-    pub fn without_deletion_vectors(mut self) -> Self {
-        self.use_deletion_vectors = false;
-        self
-    }
-    pub fn with_dml_merge_key_prune(mut self, on: bool) -> Self {
-        self.dml_merge_key_prune = on;
-        self
-    }
-    /// The tantivy scan prefilter (id IN-list, zero-hit file exclusion and
-    /// row selection all at once). Off makes the Delta leg's file list
-    /// independent of whether the sidecar index has finished building — which
-    /// a flush spawns as a DETACHED task, so it is otherwise a race the test
-    /// cannot observe or await.
-    pub fn with_tantivy_prefilter(mut self, on: bool) -> Self {
-        self.tantivy_prefilter = on;
-        self
-    }
-    /// Defer `UPDATE ... FROM` Delta legs through the coalescer (prod runs 60s);
-    /// drain explicitly with `E2eEnv::drain_dml_coalescer`. 0 = synchronous.
-    pub fn with_dml_coalesce_secs(mut self, secs: u64) -> Self {
-        self.dml_coalesce_secs = secs;
-        self
+
+    flag_setters! {
+        /// Leave flush output UNMARKED so its files stay footer-repair suspects;
+        /// with write-time marking on, a fixture flushed from sorted rows has no
+        /// repair work and a repair test silently no-ops.
+        /// (`with_repair_resume` commits staged-but-uncommitted repair parquet at
+        /// boot instead of deleting it; off by default, so a resume test must set it.)
+        without_write_time_sort_marking => mark_sorted_at_write = false,
+        with_repair_resume => repair_resume = true,
+        /// Decline a flush whose rows are provably already committed.
+        with_landed_skip => landed_skip = true,
+        without_light_optimize => light_optimize_enabled = false,
+        with_foyer_enabled => foyer_disabled = false,
+        with_foyer_disabled => foyer_disabled = true,
+        with_flush_immediately => flush_immediately = true,
+        with_optimize_sort_by => optimize_sort_by = true,
+        /// Warm freshly-flushed file BODIES (not just footers) into Foyer.
+        with_warm_full_files => warm_full_files = true,
+        with_deletion_vectors => use_deletion_vectors = true,
+        without_deletion_vectors => use_deletion_vectors = false,
     }
 
     pub async fn start(self) -> Result<E2eEnv> {
@@ -263,65 +176,24 @@ impl E2eEnvBuilder {
         let test_id = Uuid::new_v4().to_string()[..8].to_string();
         let bucket = format!("e2e-{test_id}");
         let data_dir = std::env::temp_dir().join(format!("timefusion-e2e-{test_id}"));
-        // Defensive: wipe before create. Each test_id is UUID-derived so this can
-        // only target our own dir. CI's /tmp is shared across sequential e2e tests
-        // in the same job, and `gc_wal_files` only deletes files older than
-        // `retention_mins * 2` (~2h20m) — so a fresh leftover from a prior test
-        // survives the gc, and `check_wal_version_stamp` then trips
-        // `Unsupported WAL version: 0 (expected 1)` on what should be a fresh dir.
+        // Wipe before create: a leftover WAL dir from a prior test in the same
+        // /tmp outlives WAL gc and trips the version stamp check.
         let _ = std::fs::remove_dir_all(&data_dir);
         std::fs::create_dir_all(&data_dir).ok();
 
-        // `<data_dir>/wal` is this test's WAL. `WalManager` opens exactly that
-        // path (`cfg.core.wal_dir()`), so nothing process-global is involved and
+        // `<data_dir>/wal` is this test's WAL — nothing process-global, so
         // concurrent tests cannot replay each other's WAL.
         std::fs::create_dir_all(data_dir.join("wal")).ok();
 
-        // Bucket creation: MinIO default credentials are minioadmin/minioadmin.
         create_bucket(&endpoint, &bucket).await.context("create MinIO bucket")?;
 
-        // OS-assigned port: a fixed random window across ~55 parallel test
-        // processes collides — the loser's bind fails silently inside the
-        // spawned task and the client connects to the *other* test's server.
         let (pg_listener, pg_port) = bind_pg_listener().await?;
-        let cfg = build_config(BuildCfgArgs {
-            endpoint: &endpoint,
-            bucket: &bucket,
-            data_dir: data_dir.clone(),
-            pg_port,
-            bucket_duration_secs: self.bucket_duration_secs,
-            flush_interval_secs: self.flush_interval_secs,
-            eviction_interval_secs: self.eviction_interval_secs,
-            retention_mins: self.retention_mins,
-            foyer_disabled: self.foyer_disabled,
-            flush_immediately: self.flush_immediately,
-            max_memory_mb: self.max_memory_mb,
-            checkpoint_interval: self.checkpoint_interval,
-            optimize_sort_by: self.optimize_sort_by,
-            use_deletion_vectors: self.use_deletion_vectors,
-            warm_full_files: self.warm_full_files,
-            dml_merge_key_prune: self.dml_merge_key_prune,
-            tantivy_prefilter: self.tantivy_prefilter,
-            dml_coalesce_secs: self.dml_coalesce_secs,
-            sort_skip_bytes: self.sort_skip_bytes,
-            light_optimize_target_size: self.light_optimize_target_size,
-            light_optimize_enabled: self.light_optimize_enabled,
-            wide_scan_max_files: self.wide_scan_max_files,
-            wide_scan_max_mb: self.wide_scan_max_mb,
-            unordered_leg_sort_max_mb: self.unordered_leg_sort_max_mb,
-            page_row_count_limit: self.page_row_count_limit,
-            repair_resume: self.repair_resume,
-            landed_skip: self.landed_skip,
-            mark_sorted_at_write: self.mark_sorted_at_write,
-            test_id: &test_id,
-        });
+        let cfg = build_config(&self, &endpoint, &bucket, data_dir.clone(), pg_port, &test_id);
 
         let bootstrapped = bootstrap(Arc::clone(&cfg)).await.context("bootstrap")?;
 
-        // Pre-warm the default tenant table (matches integration_test pattern).
         bootstrapped.db.get_or_create_table("e2e_project", "otel_logs_and_spans").await.context("pre-warm table")?;
 
-        // Spawn pgwire server. Shutdown via Notify (same as integration_test).
         let pg_shutdown = Arc::new(Notify::new());
         spawn_pgwire(Arc::clone(&bootstrapped.session_ctx), Arc::clone(&bootstrapped.db), pg_listener, Arc::clone(&pg_shutdown));
         wait_for_pg(pg_port).await.context("pgwire never came up")?;
@@ -361,9 +233,16 @@ impl E2eEnv {
         E2eEnvBuilder::default()
     }
 
-    /// Flush sort budget for the NEXT `restart()`. Toggling it mid-test is the
-    /// only way to build the shape footer repair actually walks in prod: ONE
-    /// partition holding both poisoned and correctly-sorted-but-untagged files.
+    /// Buckets short enough to seal inside a test and retention short enough that
+    /// `force_flush`/`force_evict` move rows into Delta, plus a pgwire client.
+    pub async fn short_buckets() -> Result<(E2eEnv, Client)> {
+        let env = Self::builder().with_bucket_duration(Duration::from_secs(60)).with_retention(Duration::from_secs(120)).start().await?;
+        let client = env.pg_client().await?;
+        Ok((env, client))
+    }
+
+    /// Flush sort budget for the NEXT `restart()` — toggling it mid-test builds a
+    /// partition holding both poisoned and sorted-but-untagged files.
     pub fn set_sort_skip_bytes(&mut self, bytes: usize) {
         self.builder.sort_skip_bytes = Some(bytes);
     }
@@ -380,60 +259,22 @@ impl E2eEnv {
         &self.bootstrapped().db
     }
 
-    /// Crash-and-restart: simulate a process crash (no graceful flush) and
-    /// re-bootstrap against the same MinIO bucket + data_dir. Mirrors a
-    /// hard kill — WAL replay must restore any unflushed rows; rows the
-    /// caller already force-flushed are read back from Delta.
-    ///
-    /// Uses `crash_for_test` (cancels tasks without final flush) rather
-    /// than the graceful `shutdown` — otherwise the buffered layer would
-    /// drain MemBuffer into Delta on the way down, defeating the WAL
-    /// replay assertion.
+    /// Simulate a hard kill (no graceful flush) and re-bootstrap against the same
+    /// bucket + data_dir, so WAL replay must restore any unflushed rows. Uses
+    /// `crash_for_test`, not `shutdown`, which would drain MemBuffer into Delta.
     pub async fn restart(&mut self) -> Result<()> {
         let prev = self.bootstrapped.take().expect("already shut down");
         prev.buffered_layer.crash_for_test().await;
         self.pg_shutdown.notify_one();
-        // Retire the old instance's background work (preload/warm tasks hold
-        // their own Arc<Database>, so dropping `prev` alone leaves them — and
-        // their in-flight Foyer fetches — running for the rest of the test;
-        // see Drop for why a live fetch at Runtime teardown deadlocks).
-        // Crash semantics are preserved: this cancels maintenance and closes
-        // the cache but never drains MemBuffer or advances the WAL cursor.
+        // Retire the old instance's background work: preload/warm tasks hold their
+        // own Arc<Database>, so dropping `prev` alone leaves their Foyer fetches
+        // live (see Drop). This never drains MemBuffer or advances the WAL cursor,
+        // so crash semantics hold.
         let _ = prev.db.shutdown_by(tokio::time::Instant::now() + Duration::from_secs(10)).await;
         drop(prev);
 
         let (pg_listener, pg_port) = bind_pg_listener().await?;
-        let cfg = build_config(BuildCfgArgs {
-            endpoint: &self.endpoint,
-            bucket: &self.bucket,
-            data_dir: self.data_dir.clone(),
-            pg_port,
-            bucket_duration_secs: self.builder.bucket_duration_secs,
-            flush_interval_secs: self.builder.flush_interval_secs,
-            eviction_interval_secs: self.builder.eviction_interval_secs,
-            retention_mins: self.builder.retention_mins,
-            foyer_disabled: self.builder.foyer_disabled,
-            flush_immediately: self.builder.flush_immediately,
-            max_memory_mb: self.builder.max_memory_mb,
-            checkpoint_interval: self.builder.checkpoint_interval,
-            optimize_sort_by: self.builder.optimize_sort_by,
-            use_deletion_vectors: self.builder.use_deletion_vectors,
-            warm_full_files: self.builder.warm_full_files,
-            dml_merge_key_prune: self.builder.dml_merge_key_prune,
-            tantivy_prefilter: self.builder.tantivy_prefilter,
-            dml_coalesce_secs: self.builder.dml_coalesce_secs,
-            sort_skip_bytes: self.builder.sort_skip_bytes,
-            light_optimize_target_size: self.builder.light_optimize_target_size,
-            light_optimize_enabled: self.builder.light_optimize_enabled,
-            wide_scan_max_files: self.builder.wide_scan_max_files,
-            wide_scan_max_mb: self.builder.wide_scan_max_mb,
-            unordered_leg_sort_max_mb: self.builder.unordered_leg_sort_max_mb,
-            page_row_count_limit: self.builder.page_row_count_limit,
-            repair_resume: self.builder.repair_resume,
-            landed_skip: self.builder.landed_skip,
-            mark_sorted_at_write: self.builder.mark_sorted_at_write,
-            test_id: &self.test_id,
-        });
+        let cfg = build_config(&self.builder, &self.endpoint, &self.bucket, self.data_dir.clone(), pg_port, &self.test_id);
 
         let bootstrapped = bootstrap(Arc::clone(&cfg)).await.context("re-bootstrap")?;
         bootstrapped.db.get_or_create_table("e2e_project", "otel_logs_and_spans").await.context("pre-warm table")?;
@@ -451,20 +292,26 @@ impl E2eEnv {
         connect_pg(self.pg_port).await
     }
 
-    /// Advance the virtual clock by `delta`. Doesn't await any background work
-    /// — pair with `await_next_flush` / `await_next_eviction` for assertions.
+    /// Advance the virtual clock by `delta`. Awaits no background work — pair with
+    /// `await_next_flush` / `await_next_eviction` for assertions.
     pub fn advance(&self, delta: Duration) -> i64 {
         support::advance_micros(delta.as_micros() as i64)
     }
 
-    /// Force-run a full flush immediately and synchronously. Returns
-    /// `FlushStats` so tests can assert on what happened.
+    /// Force-run a full flush immediately and synchronously.
     pub async fn force_flush(&self) -> Result<timefusion::write::FlushStats> {
         self.buffered_layer().flush_all_now().await
     }
 
     pub async fn force_evict(&self) -> Result<()> {
         self.buffered_layer().force_evict_now().await
+    }
+
+    /// Commit MemBuffer to Delta and drop it, so what follows reads from Delta
+    /// (the merge scan) rather than the mem leg.
+    pub async fn flush_and_evict(&self) -> Result<()> {
+        self.force_flush().await?;
+        self.force_evict().await
     }
 
     /// Drain the DML coalescer synchronously (runs the deferred Delta-leg
@@ -475,9 +322,8 @@ impl E2eEnv {
         }
     }
 
-    /// Wait for the next flush-task iteration to complete (success or
-    /// failure). Caller MUST call this BEFORE the action that triggers the
-    /// flush (otherwise the notify can fire before we register interest).
+    /// Wait for the next flush-task iteration (success or failure). Caller MUST
+    /// call this BEFORE the triggering action, or the notify can fire first.
     pub async fn await_next_flush(&self, timeout: Duration) -> Result<()> {
         let notify = self.buffered_layer().flush_tick_notify();
         tokio::time::timeout(timeout, notify.notified()).await.map_err(|_| anyhow::anyhow!("flush tick did not fire within {:?}", timeout))?;
@@ -494,8 +340,7 @@ impl E2eEnv {
         self.buffered_layer().snapshot_stats()
     }
 
-    /// Foyer hit/miss/size snapshot. Returns `None` if Foyer was disabled
-    /// via builder. Tests use this to assert cache warmth post-flush.
+    /// Foyer hit/miss/size snapshot; `None` when Foyer is disabled.
     pub async fn foyer_stats(&self) -> Option<timefusion::storage::CombinedCacheStats> {
         let cache = self.db().object_store_cache()?;
         Some(cache.get_stats().await)
@@ -505,20 +350,14 @@ impl E2eEnv {
 impl Drop for E2eEnv {
     fn drop(&mut self) {
         self.pg_shutdown.notify_one();
-        // Deterministic teardown while the runtime is still alive. Leaving it
-        // to Runtime::drop deadlocks: foyer's get_or_fetch spawns its fetch
-        // task while holding the inflight mutex, and on a shutting-down
-        // runtime tokio::spawn drops that future INLINE — RawFetch::drop then
-        // re-locks the same mutex on the same thread, and BlockingPool::
-        // shutdown waits on it forever (the 3×600s e2e timeouts, 2026-08-03).
-        // Database::shutdown cancels the warm tasks and closes Foyer first,
-        // so no fetch survives to Runtime teardown. block_in_place is fine:
-        // every e2e test is `flavor = "multi_thread"`.
+        // Must tear down while the runtime is still alive: leaving it to
+        // Runtime::drop deadlocks, because foyer's get_or_fetch drops its fetch
+        // future inline on a shutting-down runtime and re-locks the inflight mutex
+        // it already holds. block_in_place is fine — every e2e test is multi_thread.
         if let Some(b) = self.bootstrapped.take() {
             let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
             let _ = tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(b.db.shutdown_by(deadline)));
         }
-        // Unfreeze so we don't leak state into the next test in this binary.
         support::unfreeze();
         let _ = std::fs::remove_dir_all(&self.data_dir);
     }
@@ -526,94 +365,59 @@ impl Drop for E2eEnv {
 
 // helpers
 
-struct BuildCfgArgs<'a> {
-    endpoint: &'a str,
-    bucket: &'a str,
-    data_dir: PathBuf,
-    pg_port: u16,
-    bucket_duration_secs: u64,
-    flush_interval_secs: u64,
-    eviction_interval_secs: u64,
-    retention_mins: u64,
-    foyer_disabled: bool,
-    flush_immediately: bool,
-    max_memory_mb: usize,
-    checkpoint_interval: u64,
-    optimize_sort_by: bool,
-    use_deletion_vectors: bool,
-    warm_full_files: bool,
-    dml_merge_key_prune: bool,
-    tantivy_prefilter: bool,
-    dml_coalesce_secs: u64,
-    page_row_count_limit: Option<usize>,
-    sort_skip_bytes: Option<usize>,
-    light_optimize_target_size: Option<i64>,
-    light_optimize_enabled: bool,
-    wide_scan_max_files: Option<usize>,
-    wide_scan_max_mb: Option<u64>,
-    unordered_leg_sort_max_mb: Option<u64>,
-    repair_resume: bool,
-    landed_skip: bool,
-    mark_sorted_at_write: bool,
-    test_id: &'a str,
-}
-
-fn build_config(args: BuildCfgArgs<'_>) -> Arc<AppConfig> {
+fn build_config(b: &E2eEnvBuilder, endpoint: &str, bucket: &str, data_dir: PathBuf, pg_port: u16, test_id: &str) -> Arc<AppConfig> {
     let mut cfg = AppConfig::default();
-    cfg.aws.aws_s3_bucket = Some(args.bucket.to_string());
+    cfg.aws.aws_s3_bucket = Some(bucket.to_string());
     cfg.aws.aws_access_key_id = Some("minioadmin".to_string());
     cfg.aws.aws_secret_access_key = Some("minioadmin".to_string());
-    cfg.aws.aws_s3_endpoint = args.endpoint.to_string();
+    cfg.aws.aws_s3_endpoint = endpoint.to_string();
     cfg.aws.aws_default_region = Some("us-east-1".to_string());
     cfg.aws.aws_allow_http = Some("true".to_string());
-    cfg.core.timefusion_table_prefix = format!("e2e-{}", args.test_id);
-    cfg.core.timefusion_data_dir = args.data_dir;
-    cfg.core.pgwire_port = args.pg_port;
-    cfg.buffer.timefusion_flush_interval_secs = args.flush_interval_secs;
-    // Dwell off: e2e tests drive flushing with advance()+force_flush and
-    // assert prompt visibility in Delta; the gate has dedicated unit tests.
+    cfg.core.timefusion_table_prefix = format!("e2e-{test_id}");
+    cfg.core.timefusion_data_dir = data_dir;
+    cfg.core.pgwire_port = pg_port;
+    cfg.buffer.timefusion_flush_interval_secs = b.flush_interval_secs;
+    // Dwell off: e2e tests drive flushing with advance()+force_flush.
     cfg.buffer.timefusion_flush_dwell_secs = 0;
-    cfg.buffer.timefusion_eviction_interval_secs = args.eviction_interval_secs;
-    cfg.buffer.timefusion_buffer_retention_mins = args.retention_mins;
-    cfg.buffer.timefusion_bucket_duration_secs = args.bucket_duration_secs;
-    cfg.buffer.timefusion_buffer_max_memory_mb = args.max_memory_mb;
-    cfg.buffer.timefusion_flush_immediately = args.flush_immediately;
-    cfg.cache.timefusion_foyer_disabled = args.foyer_disabled;
-    cfg.parquet.timefusion_checkpoint_interval = args.checkpoint_interval;
-    cfg.maintenance.timefusion_optimize_sort_by = args.optimize_sort_by;
-    cfg.maintenance.timefusion_light_optimize_enabled = args.light_optimize_enabled;
-    cfg.maintenance.timefusion_use_deletion_vectors = args.use_deletion_vectors;
-    cfg.maintenance.timefusion_warm_full_files = args.warm_full_files;
-    cfg.maintenance.timefusion_repair_resume_enabled = args.repair_resume;
-    cfg.buffer.timefusion_landed_skip_enabled = args.landed_skip;
-    cfg.maintenance.timefusion_repair_mark_sorted_at_write = args.mark_sorted_at_write;
-    cfg.maintenance.timefusion_dml_merge_key_prune = args.dml_merge_key_prune;
-    // A 0% selectivity floor is the off switch for the WHOLE prefilter: any hit
-    // set covers >= 0% of the indexed rows, so `decide_prefilter` always returns
-    // `low_selectivity` and the Delta scan keeps the original predicate. Turning
-    // off `timefusion_tantivy_file_pruning` alone is NOT enough — a zero-hit
-    // index still yields an empty `id IN ()`, which prunes every file anyway.
-    if !args.tantivy_prefilter {
+    cfg.buffer.timefusion_eviction_interval_secs = b.eviction_interval_secs;
+    cfg.buffer.timefusion_buffer_retention_mins = b.retention_mins;
+    cfg.buffer.timefusion_bucket_duration_secs = b.bucket_duration_secs;
+    cfg.buffer.timefusion_buffer_max_memory_mb = b.max_memory_mb;
+    cfg.buffer.timefusion_flush_immediately = b.flush_immediately;
+    cfg.cache.timefusion_foyer_disabled = b.foyer_disabled;
+    cfg.parquet.timefusion_checkpoint_interval = b.checkpoint_interval;
+    cfg.maintenance.timefusion_optimize_sort_by = b.optimize_sort_by;
+    cfg.maintenance.timefusion_light_optimize_enabled = b.light_optimize_enabled;
+    cfg.maintenance.timefusion_use_deletion_vectors = b.use_deletion_vectors;
+    cfg.maintenance.timefusion_warm_full_files = b.warm_full_files;
+    cfg.maintenance.timefusion_repair_resume_enabled = b.repair_resume;
+    cfg.buffer.timefusion_landed_skip_enabled = b.landed_skip;
+    cfg.maintenance.timefusion_repair_mark_sorted_at_write = b.mark_sorted_at_write;
+    cfg.maintenance.timefusion_dml_merge_key_prune = b.dml_merge_key_prune;
+    // A 0% selectivity floor is the off switch for the WHOLE prefilter. Clearing
+    // `timefusion_tantivy_file_pruning` alone is NOT enough: a zero-hit index
+    // still yields an empty `id IN ()`, which prunes every file.
+    if !b.tantivy_prefilter {
         cfg.tantivy.timefusion_tantivy_prefilter_min_selectivity_pct = 0;
     }
-    cfg.buffer.timefusion_dml_coalesce_secs = args.dml_coalesce_secs;
-    if let Some(b) = args.sort_skip_bytes {
-        cfg.maintenance.timefusion_sort_skip_bytes = b;
+    cfg.buffer.timefusion_dml_coalesce_secs = b.dml_coalesce_secs;
+    if let Some(v) = b.sort_skip_bytes {
+        cfg.maintenance.timefusion_sort_skip_bytes = v;
     }
-    if let Some(t) = args.light_optimize_target_size {
-        cfg.maintenance.timefusion_light_optimize_target_size = t;
+    if let Some(v) = b.light_optimize_target_size {
+        cfg.maintenance.timefusion_light_optimize_target_size = v;
     }
-    if let Some(rows) = args.page_row_count_limit {
-        cfg.parquet.timefusion_page_row_count_limit = rows;
+    if let Some(v) = b.page_row_count_limit {
+        cfg.parquet.timefusion_page_row_count_limit = v;
     }
-    if let Some(files) = args.wide_scan_max_files {
-        cfg.memory.timefusion_wide_scan_max_files = files;
+    if let Some(v) = b.wide_scan_max_files {
+        cfg.memory.timefusion_wide_scan_max_files = v;
     }
-    if let Some(mb) = args.unordered_leg_sort_max_mb {
-        cfg.memory.timefusion_read_sort_unordered_leg_max_mb = mb;
+    if let Some(v) = b.unordered_leg_sort_max_mb {
+        cfg.memory.timefusion_read_sort_unordered_leg_max_mb = v;
     }
-    if let Some(mb) = args.wide_scan_max_mb {
-        cfg.memory.timefusion_wide_scan_max_mb = mb;
+    if let Some(v) = b.wide_scan_max_mb {
+        cfg.memory.timefusion_wide_scan_max_mb = v;
     }
     Arc::new(cfg)
 }
@@ -622,9 +426,7 @@ fn build_config(args: BuildCfgArgs<'_>) -> Arc<AppConfig> {
 ///   1. `TIMEFUSION_TEST_S3_ENDPOINT` if set (CI's MinIO, or any hand-run one).
 ///   2. An already-running MinIO on 127.0.0.1:9000 (e.g. `make minio-start`).
 ///   3. The local `minio` binary — spawned DETACHED on :9000 and left running,
-///      because e2e tests run as ~55 parallel processes and a per-test kill
-///      would tear the server out from under every sibling. `make minio-stop`
-///      reclaims it; subsequent runs reuse it (hit case 2).
+///      since a per-test kill would tear it out from under parallel siblings.
 ///   4. Docker (testcontainers) — only when no `minio` binary is on PATH.
 ///
 /// Per-test isolation comes from the unique bucket, never from the server.
@@ -640,8 +442,8 @@ async fn ensure_local_minio() -> Result<(Option<ContainerAsync<GenericImage>>, S
     if std::process::Command::new("minio").arg("--version").output().map(|o| o.status.success()).unwrap_or(false) {
         let data_dir = std::env::temp_dir().join("timefusion-e2e-minio");
         std::fs::create_dir_all(&data_dir).ok();
-        // Concurrent first-run races are fine: the losers' binds fail while the
-        // health loop below waits for whichever sibling won.
+        // Concurrent first-run races are fine: losers' binds fail and the health
+        // loop below waits for whichever sibling won.
         std::process::Command::new("minio")
             .args(["server", data_dir.to_str().unwrap(), "--address", LOCAL])
             .env("MINIO_ROOT_USER", "minioadmin")
@@ -681,7 +483,6 @@ async fn create_bucket(endpoint: &str, bucket: &str) -> Result<()> {
         .behavior_version(aws_config::BehaviorVersion::latest())
         .build();
     let client = aws_sdk_s3::Client::from_conf(cfg);
-    // create_bucket is idempotent enough — ignore BucketAlreadyOwnedByYou.
     match client.create_bucket().bucket(bucket).send().await {
         Ok(_) => Ok(()),
         Err(e) => {
@@ -697,6 +498,7 @@ async fn create_bucket(endpoint: &str, bucket: &str) -> Result<()> {
 
 /// Bind an OS-assigned loopback port for pgwire. The listener is handed to the
 /// server as-is, so there is no bind/connect race and no port window to collide in.
+/// Never pick from a fixed port window — parallel test processes collide.
 async fn bind_pg_listener() -> Result<(tokio::net::TcpListener, u16)> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.context("bind pgwire listener")?;
     let port = listener.local_addr()?.port();
@@ -760,18 +562,16 @@ pub async fn insert_at(client: &tokio_postgres::Client, id: &str, ts_micros: i64
     insert_for(client, "e2e_project", id, ts_micros).await
 }
 
-/// Insert one row into `mor_dormant`, which declares fewer columns than otel.
-/// The deletion-vector tests moved here when `otel_logs_and_spans` flipped
-/// `version_append`: under merge-on-read an UPDATE appends a row version rather
-/// than masking-and-rewriting, so DV behaviour needs a non-versioned subject.
+/// Insert one row into `mor_dormant`, a non-versioned table (unlike
+/// `otel_logs_and_spans`, where an UPDATE appends a row version instead of
+/// masking-and-rewriting) — deletion-vector tests need it as their subject.
 pub async fn insert_dormant_at(client: &tokio_postgres::Client, id: &str, ts_micros: i64) -> Result<()> {
     insert_dormant_named(client, id, ts_micros, "span").await
 }
 
-/// Like [`insert_dormant_at`] but with an explicit `name`: a row that shares a
-/// dedup KEY with an earlier one but differs in content passes the always-on
-/// ingest-time content-identity filter (an exact re-send would be dropped
-/// there and never become a physical duplicate for maintenance dedup to find).
+/// Like [`insert_dormant_at`] but with an explicit `name`: a row sharing a dedup
+/// KEY but differing in content gets past the ingest-time content-identity filter,
+/// which would drop an exact re-send before it became a physical duplicate.
 pub async fn insert_dormant_named(client: &tokio_postgres::Client, id: &str, ts_micros: i64, name: &str) -> Result<()> {
     let dt = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(ts_micros).unwrap();
     let sql = format!(

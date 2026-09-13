@@ -1,18 +1,10 @@
-//! File-level needle pruning: per-file bloom sidecars consulted at
-//! file-selection time so a point lookup (`trace_id = '…'`) selects only
-//! files that can contain the needle, instead of every file in the window
-//! (measured 284→284 file-level pruning at 24h before this existed).
+//! File-level needle pruning: per-(project, date) sidecars holding each
+//! file's parquet blooms, consulted at file-selection time so a point lookup
+//! selects only files that can contain the needle.
 //!
-//! The builder never decodes rows — it lifts each file's EXISTING parquet
-//! blooms (already folded to actual NDV by the writer) off the footer
-//! metadata and stores them per (project, date) in object storage. The
-//! read path consults only the in-process registry: a miss spawns one
-//! background load and contributes no rejections, so the plan path never
-//! awaits IO. Staleness is safe in both directions — an unknown file is
-//! included, a rejected-but-retired file is a no-op, and Delta never
-//! reuses a file path for different contents.
-//!
-//! Design + review trail: docs/plans/2026-08-22-file-level-needle-pruning.md
+//! The plan path never awaits IO — a registry miss spawns a background load
+//! and contributes no rejections. Staleness is safe both ways: an unknown file
+//! is included, and a rejected-but-retired file is a no-op.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -39,22 +31,21 @@ use object_store::{ObjectStore, ObjectStoreExt, path::Path};
 use tokio::time::Instant;
 use tracing::{debug, warn};
 
-/// IN-lists above this skip pruning — probing the registry per value must
-/// stay negligible next to the planning it saves.
+/// IN-lists above this skip pruning: per-value probe cost must stay
+/// negligible next to the planning it saves.
 pub(crate) const MAX_NEEDLE_VALUES: usize = 64;
-/// A file whose bloom payload exceeds this is recorded `no_bloom`: a bloom
-/// this dense prunes little and would bloat the blob (whale-file guard).
+/// A file whose bloom payload exceeds this is recorded `no_bloom` — a bloom
+/// this dense prunes little and would bloat the sidecar.
 pub(crate) const PER_FILE_BLOOM_CAP_BYTES: u64 = 4 * 1024 * 1024;
-/// Windows wider than this skip pruning — the per-date probe cost scales
-/// with the window while its value concentrates in point lookups.
+/// Windows wider than this skip pruning: per-date probe cost scales with the
+/// window, while the value concentrates in point lookups.
 pub(crate) const MAX_PRUNE_DATES: usize = 92;
 const SIDECAR_VERSION: u8 = 1;
 const BINCODE_CONFIG: bincode::config::Configuration = bincode::config::standard();
 
-/// One file's serialized blooms: column name → serialized `Sbbf`
-/// (header+bitset, byte-identical to the parquet payload) per row group.
-/// A column appears only when EVERY row group has a bloom — a partial set
-/// cannot prove absence.
+/// One file's serialized blooms: column name → one serialized `Sbbf` per row
+/// group. A column appears only when EVERY row group has a bloom — a partial
+/// set cannot prove absence.
 #[derive(Encode, Decode)]
 pub struct FileBlooms {
     pub rel: String,
@@ -76,11 +67,9 @@ pub fn encode_sidecar(sidecar: &DateSidecar) -> Result<Vec<u8>> {
 }
 
 pub fn decode_sidecar(bytes: &[u8]) -> Result<DateSidecar> {
-    match bytes.split_first() {
-        Some((&SIDECAR_VERSION, rest)) => Ok(bincode::decode_from_slice(rest, BINCODE_CONFIG)?.0),
-        Some((v, _)) => Err(anyhow!("unknown bloom sidecar version {v}")),
-        None => Err(anyhow!("empty bloom sidecar")),
-    }
+    let Some((&v, rest)) = bytes.split_first() else { anyhow::bail!("empty bloom sidecar") };
+    anyhow::ensure!(v == SIDECAR_VERSION, "unknown bloom sidecar version {v}");
+    Ok(bincode::decode_from_slice(rest, BINCODE_CONFIG)?.0)
 }
 
 /// `project_id=<pid>/date=<d>/part-….parquet` → (pid, date).
@@ -99,7 +88,7 @@ pub fn project_date_of_rel(rel: &str) -> Option<(&str, &str)> {
 
 /// Equality/IN needles over bloom-enabled, non-version-mutable string
 /// columns, from the query's top-level conjuncts. Two conjuncts on the same
-/// column merge value lists — weaker (OR for rejection) but always safe.
+/// column merge value lists — weaker, but always safe.
 pub fn extract_needles(filters: &[Expr], schema: &crate::schema::TableSchema, mutable: Option<&HashSet<String>>) -> Vec<(String, Vec<String>)> {
     let eligible = |name: &str| schema.fields.iter().any(|f| f.name == name && f.bloom_filter) && !mutable.is_some_and(|m| m.contains(name));
     let lit_str = |e: &Expr| match e {
@@ -153,10 +142,10 @@ struct FileProbe {
 }
 
 impl FileProbe {
-    /// True iff some needle column has complete blooms in this file and every
-    /// value of that needle misses in every row group — the file provably
-    /// contains no matching row (and, because updates and tombstones are
-    /// full-row copies, no other version of one either).
+    /// True iff some needle column has complete blooms here and every value of
+    /// that needle misses in every row group, so the file provably contains no
+    /// matching row (updates and tombstones are full-row copies, so no other
+    /// version of one either).
     fn rejects(&self, needles: &[(String, Vec<String>)]) -> bool {
         !self.no_bloom
             && needles
@@ -180,11 +169,11 @@ impl DateBlooms {
             .files
             .into_iter()
             .filter_map(|f| {
-                let columns = f
+                let columns: HashMap<_, _> = f
                     .columns
                     .into_iter()
-                    .map(|(col, blooms)| Ok((col, blooms.iter().map(|b| Sbbf::from_bytes(b)).collect::<Result<Vec<_>, _>>()?)))
-                    .collect::<Result<HashMap<_, _>, deltalake::datafusion::parquet::errors::ParquetError>>()
+                    .map(|(col, blooms)| blooms.iter().map(|b| Sbbf::from_bytes(b)).collect::<Result<Vec<_>, _>>().map(|s| (col, s)))
+                    .collect::<Result<_, _>>()
                     .ok()?; // parse failure ⇒ drop the entry ⇒ file included
                 Some((f.rel, FileProbe { no_bloom: f.no_bloom, columns }))
             })
@@ -235,7 +224,6 @@ impl BloomPruneRegistry {
     /// absent from the result — inclusion on unknown.
     pub fn rejected_rels(self: &Arc<Self>, table: &str, project_id: &str, dates: &[String], needles: &[(String, Vec<String>)]) -> HashSet<String> {
         let mut rejected = HashSet::new();
-        // Effectful loop: each date may spawn a load and bumps counters.
         for date in dates {
             let key = (table.to_string(), project_id.to_string(), date.clone());
             let Some(blooms) = self.entries.get(&key).map(|e| e.clone()) else {
@@ -292,8 +280,8 @@ impl BloomPruneRegistry {
             self.bytes.fetch_sub(old.bytes, Relaxed);
         }
         self.bytes.fetch_add(added, Relaxed);
-        // Byte-capped: evict oldest-loaded until under. Entry count is small
-        // (dates × projects touched), so a scan per eviction is fine.
+        // Evict oldest-loaded until under the byte cap; entry count is small,
+        // so a scan per eviction is fine.
         while self.bytes.load(Relaxed) > self.cap_bytes {
             let Some(oldest) = self.entries.iter().min_by_key(|e| e.value().loaded_at).map(|e| e.key().clone()) else { break };
             if let Some((_, old)) = self.entries.remove(&oldest) {
@@ -322,24 +310,21 @@ impl BloomPruneRegistry {
     }
 }
 
-/// Lift `cols`' existing parquet blooms out of one file: footer + bloom
-/// ranges only, no row decode. `no_bloom` when the file predates bloom
-/// writing or its payload exceeds the density cap.
+/// Lift `cols`' existing parquet blooms out of one file: footer + bloom ranges
+/// only, no row decode. `no_bloom` when the file has no usable blooms or its
+/// payload exceeds `PER_FILE_BLOOM_CAP_BYTES`.
 pub async fn build_file_blooms(store: Arc<dyn ObjectStore>, rel: &str, file_size: u64, cols: &[String]) -> Result<FileBlooms> {
     let reader = ParquetObjectReader::new(store, Path::from(rel)).with_file_size(file_size);
     let mut builder = ParquetRecordBatchStreamBuilder::new(reader).await.context("parquet footer")?;
     let n_rg = builder.metadata().num_row_groups();
     // Leaf indices are resolved up front because reading a bloom borrows the builder mutably.
     let leaves: Vec<Option<usize>> = cols.iter().map(|col| builder.parquet_schema().columns().iter().position(|c| c.path().string() == *col)).collect();
-    // Imperative: each bloom is an await, and both the labeled per-column exit
-    // and the cap's early return escape a stream pipeline.
     let mut columns = Vec::with_capacity(cols.len());
     let mut total = 0u64;
     'col: for (col, leaf) in cols.iter().zip(leaves).filter_map(|(col, leaf)| Some((col, leaf?))) {
         let mut blooms = Vec::with_capacity(n_rg);
         for rg in 0..n_rg {
-            // A column qualifies only with a bloom in EVERY row group — a
-            // partial set can't prove absence.
+            // A column qualifies only with a bloom in EVERY row group.
             let Some(sbbf) = builder.get_row_group_column_bloom_filter(rg, leaf).await.context("read bloom")? else { continue 'col };
             let mut bytes = Vec::new();
             sbbf.write(&mut bytes).map_err(|e| anyhow!("serialize bloom: {e}"))?;
@@ -362,7 +347,7 @@ mod tests {
 
     /// `f1` blooms `context___trace_id` over {present-a, present-b}; `f2` is
     /// `no_bloom`. Built through encode/decode so every case also exercises the
-    /// sidecar round trip (a serialize/parse fault would show as a false negative).
+    /// sidecar round trip.
     fn fixture() -> DateBlooms {
         let mut bloom = Sbbf::new_with_ndv_fpp(100, 0.01).unwrap();
         for v in ["present-a", "present-b"] {

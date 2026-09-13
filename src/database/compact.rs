@@ -12,12 +12,9 @@ impl Database {
         let now = Utc::now();
         let today = now.date_naive();
         let num_days = (window_hours / 24).max(1);
-        // Cold consolidation (daily) owns sealed partitions older than
-        // `cold_optimize_after_days` and bin-packs them to the 512MB target.
-        // Exclude them from the 30-min warm Z-order so it can't fragment those
-        // cold files back to the warm target every cycle (oscillation = wasted
-        // S3 I/O). With after_days=1 this leaves warm processing only today —
-        // the partition still taking writes.
+        // Cold consolidation owns sealed partitions older than
+        // `cold_optimize_after_days`; excluding them here keeps the two tiers
+        // from rewriting each other's output back and forth.
         let after_days = self.config.parquet.cold_optimize_after_days();
         // Light optimization owns today's event-time-disjoint runs.
         let skip_today = self.config.maintenance.timefusion_light_optimize_enabled;
@@ -26,12 +23,10 @@ impl Database {
             .filter(|d| !(Self::date_is_cold(today, *d, after_days) || skip_today && *d == today))
             .collect();
 
-        // Snapshot the current live file set once: drives both the ZOrder
-        // idempotence guard (below) and PR #39's warm/evict (`pre_uris`).
         let all_uris: Vec<String> = file_uris(&table_clone);
-        // Version of the snapshot `all_uris`/`pre_uris` describe. The tantivy
+        // Version the `all_uris`/`pre_uris` snapshot describes; the tantivy
         // carry-forward below is only sound when the optimize commit is the ONLY
-        // commit since it — see the `sole_commit` check.
+        // commit since it (see `sole_commit`).
         let pre_version = table_clone.version();
         let table_url = table_clone.table_url().to_string();
         let current = Self::filesets_for_dates(&all_uris, &window_dates);
@@ -49,12 +44,9 @@ impl Database {
             self.config.parquet.timefusion_optimize_target_size
         };
 
-        // delta-rs ZOrder has NO idempotence guard (unlike Compact it does no
-        // size / single-file / already-sorted check): it rewrites every file in
-        // the selected partitions on every run, even sealed days that didn't
-        // change — and PR #39 then has to re-warm all those cold rewrites. Skip
-        // any partition whose live file set is identical to the last successful
-        // optimize. `today` is always processed (growing leading edge).
+        // delta-rs ZOrder has no idempotence guard: it rewrites every file in the
+        // selected partitions on every run. Skip any partition whose live file set
+        // is identical to the last successful optimize; `today` always runs.
         let kept_dates: Vec<chrono::NaiveDate> = {
             let guard = self.zorder_filesets.read().await;
             let prev = guard.get(&table_url);
@@ -86,14 +78,14 @@ impl Database {
 
         let schema = schema_or_default(table_name);
         // Sorting keeps rewritten files timestamp-local, so short ranges can
-        // prune whole files and row groups. It remains an incident kill switch.
+        // prune whole files and row groups.
         let (optimize_type, declare_sorted) = full_optimize_type(schema, self.config.maintenance.timefusion_optimize_sort_by);
         let writer_properties = self.create_writer_properties(schema, self.config.parquet.timefusion_zstd_level_warm, declare_sorted);
         // SortBy materializes large Arrow buffers, so in-server bins are serial.
         let optimize_concurrency = if declare_sorted { 1 } else { self.config.derived.optimize_merge_tasks() };
 
-        // Bound OCC retries and hold the rewrite permit only across optimize;
-        // stacking this materializing rewrite with dedup caused a cgroup OOM.
+        // Hold the rewrite permit only across optimize: stacking this
+        // materializing rewrite with dedup exhausts the cgroup memory limit.
         const MAX_RETRIES: usize = 4;
         let optimize_result: Result<_> = {
             let mut attempt = 0;
@@ -118,9 +110,8 @@ impl Database {
                         .with_writer_properties(writer_properties.clone())
                         .with_min_commit_interval(tokio::time::Duration::from_secs(10 * 60))
                         .with_commit_properties(incremental_commit_properties(self.config.maintenance.timefusion_incremental_snapshot))
-                        // Avoid the BinaryView read for Variant columns (same issue as
-                        // optimize_table_light); delta-rs's internal session defaults to
-                        // schema_force_view_types=true.
+                        // Avoids the BinaryView read for Variant columns: delta-rs's
+                        // internal session defaults to schema_force_view_types=true.
                         .with_session_state(Arc::new(self.maintenance_session_state()))
                         .await
                 };
@@ -138,17 +129,11 @@ impl Database {
 
         match optimize_result {
             Ok((new_table, metrics)) => {
-                // Record the post-commit file set for the partitions we
-                // rewrote so the next run skips them if nothing changes. Done
-                // before the min_files early-return so state stays consistent
-                // even when we don't adopt the new handle (delta-rs has already
-                // committed the rewrite by this point regardless).
-                {
-                    let new_uris: Vec<String> = file_uris(&new_table);
-                    let new_sets = Self::filesets_for_dates(&new_uris, &kept_dates);
-                    let mut guard = self.zorder_filesets.write().await;
-                    guard.entry(table_url.clone()).or_default().extend(kept_dates.iter().map(|d| (*d, new_sets.get(d).cloned().unwrap_or_default())));
-                }
+                // Record the post-commit file set for the partitions we rewrote so
+                // the next run can skip them. Must happen before the min_files
+                // early-return: delta-rs has already committed by this point.
+                let new_sets = Self::filesets_for_dates(&file_uris::<Vec<String>>(&new_table), &kept_dates);
+                self.zorder_filesets.write().await.entry(table_url).or_default().extend(new_sets);
                 crate::observability::record_optimize_partitions(kept_dates.len() as u64, skipped as u64);
 
                 let min_files = self.config.maintenance.timefusion_compact_min_files;
@@ -167,29 +152,20 @@ impl Database {
                     metrics.total_files_skipped
                 );
                 if metrics.num_files_removed > 0 {
-                    let compression_ratio = metrics.num_files_removed as f64 / metrics.num_files_added as f64;
-                    info!("Optimization compression ratio: {:.2}x", compression_ratio);
+                    info!("Optimization compression ratio: {:.2}x", metrics.num_files_removed as f64 / metrics.num_files_added as f64);
                 }
-                // Swap the optimized table in and refresh the cache (warm
-                // newly-added files, evict tombstoned ones). Returns the new
-                // live file URIs for the tantivy GC hook below.
                 // `added` below is `live_uris - pre_uris`, i.e. everything that
-                // appeared while optimize ran — NOT necessarily what optimize
-                // wrote. Optimize holds a 10-minute commit interval and retries
-                // on OCC conflict, so a flush can land its own parquet in that
-                // window. Carrying coverage forward onto such a file would mark
-                // it covered when no index has seen its rows: a FALSE NEGATIVE,
-                // the one failure the read path cannot tolerate. Exactly one
-                // version of movement proves the optimize commit is the only
-                // one, and `added` is therefore exactly its output.
+                // appeared while optimize ran — not necessarily what optimize
+                // wrote (a concurrent flush can land parquet in that window).
+                // Carrying tantivy coverage onto such a file would mark it covered
+                // when no index has seen its rows, which the read path cannot
+                // tolerate; exactly one version of movement proves otherwise.
                 let sole_commit = matches!((pre_version, new_table.version()), (Some(before), Some(after)) if after == before + 1);
                 let live_uris = self.swap_and_refresh_cache(table_ref, new_table, pre_uris.as_ref(), &[]).await;
-                // Tantivy compaction reindex + GC. Order matters: build
-                // indexes for the compaction's OUTPUT files first, then GC the
-                // inputs' entries — so window coverage never regresses (the
-                // pre-existing gap where GC deleted indexes nothing rebuilt
-                // left old windows permanently un-prefiltered). Best-effort:
-                // errors are logged; the coverage gate keeps queries correct.
+                // Tantivy compaction reindex + GC. Order matters: build indexes for
+                // the compaction's OUTPUT files first, then GC the inputs' entries,
+                // so window coverage never regresses. Best-effort: errors are
+                // logged; the coverage gate keeps queries correct.
                 if let Some(svc) = self.tantivy_indexer().cloned()
                     && svc.config.is_table_indexed(table_name)
                 {
@@ -197,16 +173,15 @@ impl Database {
                     let delta_store = { table_ref.read().await.log_store().object_store(None) };
                     let added: Vec<(String, String, String)> = live_uris
                         .iter()
-                        // `None` (file tracking off) behaves as the empty pre-set,
-                        // exactly as before: every live parquet is treated as new.
+                        // `None` (file tracking off) behaves as the empty pre-set:
+                        // every live parquet is treated as new.
                         .filter(|u| !pre_uris.as_ref().is_some_and(|p| p.contains(*u)) && u.ends_with(".parquet"))
                         .filter_map(|u| Some((project_id_of_uri(u)?.to_string(), parquet_rel_of_uri(u)?.to_string(), u.clone())))
                         .collect();
                     // Carry coverage forward first: a rewrite's output holds its
-                    // inputs' rows under the same ids, so when EVERY input was
-                    // already covered this is a manifest edit instead of an S3
-                    // read-back plus a build (~4 builds/hr on this box). Files
-                    // still uncovered afterwards fall through to the rebuild below.
+                    // inputs' rows under the same ids, so when every input was
+                    // already covered this is a manifest edit instead of a rebuild.
+                    // Files still uncovered afterwards fall through to the rebuild.
                     let removed_by_pid: HashMap<String, Vec<String>> = pre_uris
                         .as_ref()
                         .map(|pre| {
@@ -216,10 +191,8 @@ impl Database {
                                 .into_group_map()
                         })
                         .unwrap_or_default();
-                    // `carry_forward_after_compaction` applies to a project's
-                    // whole output set or to none of it, so its verdict is all
-                    // this needs — asking the manifest again per file would cost
-                    // one 745 KB load each to learn what the call already knew.
+                    // `carry_forward_after_compaction` applies to a project's whole
+                    // output set or to none of it, so its verdict is all this needs.
                     let mut carried: HashSet<String> = HashSet::new();
                     for (pid, removed) in removed_by_pid.iter().filter(|_| sole_commit) {
                         let for_pid: Vec<String> = added.iter().filter(|(p, _, _)| p == pid).map(|(_, _, uri)| uri.clone()).collect();
@@ -229,7 +202,6 @@ impl Database {
                             Err(e) => warn!("tantivy carry-forward failed table={} project={}: {}", table_name, pid, e),
                         }
                     }
-                    // Whatever carry-forward covered needs no build.
                     let added: Vec<_> = added.into_iter().filter(|(_, _, uri)| !carried.contains(uri)).collect();
                     let table_owned = table_name.to_string();
                     let (built, reindex_errs) = futures::stream::iter(added.into_iter().map(|(pid, rel, uri)| {
@@ -253,29 +225,22 @@ impl Database {
                 }
                 // Drop sidecar index entries for files rewritten away.
                 if let Some(svc) = self.tantivy_indexer().cloned() {
-                    let svc_table = table_name.to_string();
-                    // Manifests are keyed by the project uuid taken from the
-                    // parquet URI at build time — enumerate them rather than
-                    // guessing (a fixed "default"+customs list never visited
-                    // unified tenants' manifests, so their stale entries
-                    // outlived every compaction until the nightly reconcile).
-                    let project_ids = match crate::tantivy::list_manifest_projects(svc.object_store.as_ref(), table_name).await {
-                        Ok(pids) => pids,
-                        Err(e) => {
-                            warn!("tantivy gc: manifest enumeration failed for {}: {}", table_name, e);
-                            Vec::new()
-                        }
-                    };
+                    // Manifests are keyed by the project uuid taken from the parquet
+                    // URI at build time, so enumerate them rather than guessing.
+                    let project_ids = crate::tantivy::list_manifest_projects(svc.object_store.as_ref(), table_name).await.unwrap_or_else(|e| {
+                        warn!("tantivy gc: manifest enumeration failed for {}: {}", table_name, e);
+                        Vec::new()
+                    });
                     for pid in project_ids {
-                        match svc.gc_after_compaction(&svc_table, &pid, &live_uris).await {
+                        match svc.gc_after_compaction(table_name, &pid, &live_uris).await {
                             Ok(report) if report.entries_removed > 0 => {
                                 info!(
                                     "tantivy gc: project={} table={} removed={} kept={} blobs_deleted={}",
-                                    pid, svc_table, report.entries_removed, report.kept, report.blobs_deleted
+                                    pid, table_name, report.entries_removed, report.kept, report.blobs_deleted
                                 );
                             }
                             Ok(_) => {}
-                            Err(e) => warn!("tantivy gc failed for project={} table={}: {}", pid, svc_table, e),
+                            Err(e) => warn!("tantivy gc failed for project={} table={}: {}", pid, table_name, e),
                         }
                     }
                 }
@@ -328,26 +293,23 @@ impl Database {
 
     /// Select the specific files a light optimize should bin-pack.
     ///
-    /// Letting `OptimizeBuilder` rewrite the whole `date=today` partition records a read predicate
-    /// spanning the live tail, so every concurrent ingest flush trips the OCC conflict checker and
-    /// the commit loses. Instead, pick only already-flushed small files up to `target_size`, plus at
-    /// most one existing sorted run to merge into, and hand that exact set to `with_binned_files`.
-    /// Appends that land after selection are not in the set, so they do not conflict.
+    /// Rewriting the whole `date=today` partition would record a read predicate spanning the live
+    /// tail, so every concurrent ingest flush trips the OCC checker. Instead pick only
+    /// already-flushed small files up to `target_size`, plus at most one existing sorted run to
+    /// merge into, and hand that exact set to `with_binned_files`.
     ///
-    /// `sorted_run_cap` bounds which already-tagged sorted runs are re-admitted to packing. The cold
-    /// tier passes `i64::MAX` because its leveled re-merge folds any sub-target run. The hot tier
-    /// passes `target/4` so each tick's small output run folds into the next pack until it reaches
-    /// ~1/4 target; otherwise a busy project accrues one run per tick. Files >= 7/8 target are
-    /// always excluded as converged, because re-selecting one alone would rewrite it 1→1 forever.
+    /// `sorted_run_cap` bounds which already-tagged sorted runs are re-admitted to packing: the
+    /// cold tier passes `i64::MAX`, the hot tier `target/4` so a busy project does not accrue one
+    /// run per tick. Files >= 7/8 target are excluded as converged — re-selecting one alone would
+    /// rewrite it 1→1 forever.
     async fn light_optimize_tail(
         table: &DeltaTable, filters: &[PartitionFilter], target_size: i64, min_files: usize, sorted_run_cap: i64,
     ) -> Result<Vec<String>> {
         let adds: Vec<_> = table.get_active_add_actions_by_partitions(filters).try_collect::<Vec<_>>().await?;
         let tail: Vec<TailAdd> = adds
             .iter()
-            // Cheap gate before the stats parse. A DV-bearing file passes even at
-            // target size — it is not converged until rewritten DV-free (pushdown
-            // is disabled per-file while a DV is present).
+            // A DV-bearing file passes even at target size: it is not converged
+            // until rewritten DV-free (pushdown is disabled while a DV is present).
             .filter(|add| add.size() < target_size.max(1) || add.deletion_vector_descriptor().is_some())
             .map(|add| {
                 TailAdd::from_stats(
@@ -380,13 +342,11 @@ impl Database {
             .snapshot()?
             .log_data()
             .iter()
-            // Tag-first: every exclusion below is pure metadata, so a converged
-            // file, an over-cap sorted run, or an already-sorted sealed file
-            // never reaches the stats parse.
+            // Tag-first: every exclusion below is pure metadata, so an excluded
+            // file never reaches the stats parse.
             .filter_map(|file| {
                 let (size, sorted_run) = (file.size(), is_sorted_run(&file.tags()));
                 hot_bin_admits(&file.path(), &date_marker, &repair_markers, size, sorted_run, repairable, policy).then_some(())?;
-                // `stats()` is reached only past both tag/size exclusions.
                 let path = file.path();
                 let project_id = path_partition_value(&path, "project_id").filter(|p| !p.is_empty()).map(str::to_owned)?;
                 Some((
@@ -416,24 +376,11 @@ impl Database {
             })
             .filter(|(_, bin, _)| !bin.is_empty())
             .collect_vec();
-        // Packing goes MOST-fragmented first — that partition opens the most
-        // files per query, so it is the most urgent. Repair inverts it:
-        // SHORTEST-JOB-FIRST.
-        //
-        // A repair backlog is finite per project, so the goal is to finish
-        // projects, not to nibble at the biggest. A project with 3 candidates
-        // can be made clean — and its users unblocked — inside one tick; one
-        // with 300 cannot be finished in any tick, and putting it first means it
-        // holds the (deliberately narrow) repair slots for the whole pass while
-        // everyone else waits behind the wave barrier.
-        //
-        // Prod 2026-08-08, exactly that: 65 minutes into a 144-minute pass, the
-        // two tenants whose users were actually blocked — 3 and 28 candidates —
-        // had not been served at all, because the whale project's hundreds of
-        // candidates sorted first and its multi-GB rewrites occupied both slots.
-        // Widening the admission reach the same morning made it worse, by
-        // promoting that project's 1.6-2.3 GB files from "ineligible" to
-        // "eligible and first in line".
+        // Packing goes MOST-fragmented first (that partition opens the most files
+        // per query). Repair inverts it to SHORTEST-JOB-FIRST: a repair backlog is
+        // finite per project, so the goal is to finish projects. A project with
+        // hundreds of candidates cannot be finished in any tick and would hold the
+        // narrow repair slots for the whole pass while everyone waits at the barrier.
         Ok(planned
             .into_iter()
             .sorted_by(|a, b| {
@@ -459,19 +406,17 @@ impl Database {
         Some((get("minValues")?, get("maxValues")?))
     }
 
-    /// Partition-ownership boundary between the warm (30-min Z-order) and cold
-    /// (daily 512MB consolidate) tiers: a `date` is cold-owned once it's at least
-    /// `after_days` older than `today`. The warm optimize processes the
-    /// complement, so the two tiers never rewrite the same partition (no
-    /// 256MB↔512MB oscillation). Single source of truth for both schedulers.
+    /// Partition-ownership boundary between the warm and cold tiers: a `date` is
+    /// cold-owned once it is at least `after_days` older than `today`. The warm
+    /// optimize processes the complement, so the tiers never rewrite each other's
+    /// output. Single source of truth for both schedulers.
     pub(crate) fn date_is_cold(today: chrono::NaiveDate, date: chrono::NaiveDate, after_days: u64) -> bool {
         (today - date).num_days() >= after_days as i64
     }
 
-    /// Compacted-file target by partition age (calendar-based): sealed days
-    /// consolidate to the larger cold target (fewer files → smaller checkpoint
-    /// → faster commits); the current day stays at the warm target so a
-    /// still-filling partition isn't rewritten to the cold target repeatedly.
+    /// Compacted-file target by partition age: sealed days consolidate to the
+    /// larger cold target; the current day stays at the warm target so a
+    /// still-filling partition is not rewritten to the cold target repeatedly.
     fn optimize_target_for_date(&self, date: chrono::NaiveDate) -> i64 {
         if Self::date_is_cold(Utc::now().date_naive(), date, self.config.parquet.cold_optimize_after_days()) {
             self.config.parquet.timefusion_cold_optimize_target_size
@@ -482,11 +427,9 @@ impl Database {
 
     /// Compact a single `date=` partition by bin-packing its small files
     /// (`Compact`, not Z-order — a pure row-group merge that preserves
-    /// Variant/Binary column bytes). Powers the on-demand `OPTIMIZE <table>
-    /// WHERE date = '...'` pgwire command and the `optimize` CLI subcommand
-    /// (the daily cold sweep uses `consolidate_date_binned` for event-time
-    /// disjoint runs). Target size scales with partition age
-    /// (`optimize_target_for_date`). Commits once; returns (removed, added).
+    /// Variant/Binary column bytes). Backs the `OPTIMIZE <table> WHERE date = '...'`
+    /// pgwire command and the `optimize` CLI subcommand. Target size scales with
+    /// partition age. Commits once; returns (removed, added).
     pub async fn compact_date(
         &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, date: chrono::NaiveDate, project_id: Option<&str>,
     ) -> Result<(u64, u64)> {
@@ -495,27 +438,18 @@ impl Database {
 
     /// `compact_date` with an explicit bin concurrency (off-box CLI
     /// `--concurrency N`); `None` keeps the in-server default.
+    ///
+    /// A merge holds ~target-sized output buffers per task, so concurrency ×
+    /// target size bounds peak memory — keep it low on a memory-tight instance.
     pub async fn compact_date_concurrent(
         &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, date: chrono::NaiveDate, project_id: Option<&str>, concurrency: Option<usize>,
     ) -> Result<(u64, u64)> {
-        let n = concurrency.unwrap_or_else(|| self.config.derived.optimize_merge_tasks()).max(1);
-        self.compact_date_with(table_ref, table_name, date, project_id, n).await
-    }
-
-    /// `compact_date` with an explicit merge concurrency. The cold consolidation
-    /// sweep passes 1: a 512MB-target merge holds ~target-sized output buffers per
-    /// task, so concurrency × 512MB can OOM the memory-tight in-process instance
-    /// (the off-box recipe uses concurrency 1 for the same reason). The on-demand
-    /// pgwire/CLI callers keep the configured concurrency.
-    async fn compact_date_with(
-        &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, date: chrono::NaiveDate, project_id: Option<&str>, max_concurrent: usize,
-    ) -> Result<(u64, u64)> {
+        let max_concurrent = concurrency.unwrap_or_else(|| self.config.derived.optimize_merge_tasks()).max(1);
         let target_size = self.optimize_target_for_date(date);
         let schema = schema_or_default(table_name);
         let mut partition_filters = vec![PartitionFilter::try_from(("date", "=", date.to_string().as_str()))?];
-        // Scope to one tenant when asked: a whole date spans every project's
-        // files (tens of GB on a busy day — doesn't fit in-process), one
-        // (project, date) partition is a few GB.
+        // Scope to one tenant when asked: a whole date spans every project's files
+        // and may not fit in-process; one (project, date) partition does.
         if let Some(pid) = project_id {
             partition_filters.push(PartitionFilter::try_from(("project_id", "=", pid))?);
         }
@@ -523,12 +457,9 @@ impl Database {
         // committed bins reduce the scoped file count.
         const MAX_ATTEMPTS: usize = 4;
         const TOTAL_ATTEMPTS: usize = 32;
-        // Pre-state file set for the warm/evict diff, hoisted out of the retry
-        // loop (only a successful commit — which returns — changes it) and
-        // scoped to the partition being compacted: `optimize().with_filters()`
-        // can only add/remove files under these markers, so diffing the whole
-        // table's URI set was pure waste. `None` when neither warm- nor
-        // evict-after-compaction is on, so the walk is skipped outright.
+        // Pre-state file set for the warm/evict diff, scoped to the partition being
+        // compacted: `optimize().with_filters()` can only add/remove files under
+        // these markers. `None` when neither warm- nor evict-after-compaction is on.
         let track_files = self.config.maintenance.timefusion_warm_after_compaction || self.config.maintenance.timefusion_evict_after_compaction;
         let scope: Vec<String> = std::iter::once(format!("date={date}/")).chain(project_id.map(|pid| format!("project_id={pid}/"))).collect();
         let scope: Vec<&str> = scope.iter().map(String::as_str).collect();
@@ -540,43 +471,18 @@ impl Database {
             // The snapshot is refreshed in the Err arm (needed there anyway for
             // the progress check), so every retry re-plans against fresh state.
             let table_clone = { table_ref.read().await.clone() };
-            // SortBy: sort the partition by the schema keys and declare it, so
-            // cold/consolidated partitions keep an honest DESC footer for the
-            // ordering pushdown (plain Compact concatenates → declare false).
-            // SortBy reads via the ordering-advertising DeltaScanNext: over
-            // already-sorted files `df.sort()` collapses to a streaming
-            // SortPreservingMergeExec (bounded k-way merge). The one exception
-            // is a partition still holding legacy pre-sort files — its first
-            // rewrite is a one-time blocking sort. Force concurrency 1 on the
-            // SortBy path so those transition sorts can't stack and exhaust the
-            // maintenance pool (the 2026-07-14 OOM multiplier); steady-state
-            // SortBy is cheap SPM, so serializing partitions costs little.
-            // Dedup-as-you-compact (`timefusion_compact_dedup_merge`, default
-            // off): upgrade SortBy to SortByDedup so the merge also collapses
-            // merge-on-read versions — the fork drops consecutive equal-key
-            // rows from the sorted stream, keeping the greatest
-            // `dedup_tiebreak` first (tiebreak DESC NULLS LAST is appended to
-            // the sort, so a NULL tiebreak always loses, matching
-            // `dedup_batches`). Versions of one key are consecutive because
-            // the sort leads with the dedup keys (`id` is a content hash
-            // shared by all versions), which is `DedupConfig`'s precondition.
+            // SortBy declares a footer order for ordering pushdown (plain Compact
+            // concatenates → declare false). Over already-sorted files it collapses
+            // to a streaming SortPreservingMergeExec; only a partition holding
+            // legacy pre-sort files pays a one-time blocking sort, which is why the
+            // SortBy path is forced to concurrency 1 below.
             //
-            // SOUNDNESS of per-merge-group keep-greatest: within one merge
-            // group the survivor is the greatest version of its key in the
-            // group. A version OUTSIDE the group is either newer (it beats our
-            // survivor at read time via DedupExec — unchanged) or older (our
-            // survivor already supersedes it). Dropping a version could only
-            // be wrong if that version could beat one surviving elsewhere,
-            // which is impossible: everything we drop loses to the survivor
-            // we keep. TOMBSTONES are retained by construction — SortByDedup
-            // emits >= 1 row per key and never drops a whole key, so a
-            // winning `deleted=true` version survives and keeps suppressing
-            // its base row (cf. stage_dedup_chunk's drop_tombstones=None).
-            //
-            // Known tension, accepted for the default-off experiment: the fork
-            // commits SortByDedup with data_change=false (as sealed
-            // consolidation already ships), while stage_dedup_chunk insists
-            // row-dropping rewrites carry data_change=true.
+            // `timefusion_compact_dedup_merge` upgrades SortBy to SortByDedup so the
+            // merge also collapses merge-on-read versions, keeping the greatest
+            // `dedup_tiebreak` (appended DESC NULLS LAST, so a NULL tiebreak always
+            // loses). This REQUIRES the sort to lead with the dedup keys, so all
+            // versions of a key are consecutive. Tombstones survive because >= 1 row
+            // per key is always emitted.
             let (optimize_type, declare_sorted) = if self.config.maintenance.timefusion_compact_dedup_merge {
                 consolidate_optimize_type(schema, self.config.maintenance.timefusion_optimize_sort_by)
             } else {
@@ -594,13 +500,10 @@ impl Database {
                 .with_max_files_per_bin(self.config.derived.optimize_max_files_per_bin())
                 .with_max_concurrent_tasks(sort_concurrency)
                 .with_writer_properties(writer_properties)
-                // 2min (was 10): bins run serially on the SortBy path, so a
-                // short interval banks incremental commits — an OCC loss to a
-                // concurrent dedup/flush costs one bin's work, not the whole
-                // partition (2026-07-14 all-or-nothing starvation).
+                // Short interval banks incremental commits: bins run serially on the
+                // SortBy path, so an OCC loss costs one bin, not the whole partition.
                 .with_min_commit_interval(tokio::time::Duration::from_secs(2 * 60))
                 .with_commit_properties(incremental_commit_properties(self.config.maintenance.timefusion_incremental_snapshot))
-                // Variant columns: same BinaryView-avoidance session as optimize_table.
                 .with_session_state(Arc::new(self.maintenance_session_state()))
                 .await;
             match result {
@@ -613,10 +516,8 @@ impl Database {
                     let msg = e.to_string();
                     let (occ, s3) = (is_occ_conflict_err(&msg), is_transient_s3_err(&msg));
                     total_attempts += 1;
-                    // Progress check: a failed attempt whose banked bin commits
-                    // shrank the partition resets the no-progress budget (needs
-                    // a fresh snapshot; the retry-refresh above is skipped when
-                    // we bail, so refresh here before counting).
+                    // A failed attempt whose banked bin commits shrank the partition
+                    // resets the no-progress budget; needs a fresh snapshot first.
                     if (occ || s3) && total_attempts < TOTAL_ATTEMPTS {
                         let _ = refresh_table_snapshot(table_ref, self.config.maintenance.timefusion_incremental_snapshot).await;
                         let now_files = scoped_file_uris(&*table_ref.read().await, &scope).len();
@@ -632,11 +533,8 @@ impl Database {
                                 warn!(
                                     "compact date={date}: OCC conflict (no-progress attempt {attempt}/{MAX_ATTEMPTS}, total {total_attempts}), refreshing + retrying: {e}"
                                 );
-                                // Exponential backoff — matches dedup_partition. Zero-delay
-                                // retries under concurrent heavy ingest amplify contention.
                                 tokio::time::sleep(occ_backoff(attempt.max(1) - 1)).await;
                             } else {
-                                // A multipart part connection-dropped mid-merge (nothing committed).
                                 warn!(
                                     "compact date={date}: transient S3 error (no-progress attempt {attempt}/{MAX_ATTEMPTS}, total {total_attempts}), backing off + retrying: {e}"
                                 );
@@ -679,12 +577,8 @@ impl Database {
     /// Rewrite a date partition at a higher ZSTD level using Z-order (or Compact if no
     /// z-order columns).
     ///
-    /// Skips partitions whose probe file already advertises a tier >= `target_level` via Parquet
-    /// footer metadata. Probes only one file per partition: every file in a successfully
-    /// recompressed partition shares the same tier. A partial rewrite can leave mixed tiers; the
-    /// next sweep may skip based on the probe, but the partition is re-evaluated the next day.
-    /// `project` scopes the rewrite to one `project_id=` partition, which is the honest unit of
-    /// repair.
+    /// Skips partitions whose probe file already advertises a tier >= `target_level` in its Parquet
+    /// footer. Probes one file per partition, since a fully recompressed partition shares one tier.
     pub async fn recompress_partition(
         &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, date: chrono::NaiveDate, target_level: i32, project: Option<&str>,
     ) -> Result<RecompressOutcome> {
@@ -708,26 +602,21 @@ impl Database {
             return Ok(RecompressOutcome::Skipped("no files in partition"));
         }
 
-        // Recompress rewrites whole partitions — same pool-invisible Arrow
-        // materialization as dedup/optimize; hold a maintenance-rewrite permit.
-        // Acquired after the empty-partition early-out so no-op calls are free.
+        // Whole-partition rewrite: pool-invisible Arrow materialization, so hold a
+        // maintenance-rewrite permit. Acquired after the early-out so no-ops are free.
         let _rewrite_permit = self.maintenance_rewrite_sem.acquire().await.map_err(|e| anyhow::anyhow!("maintenance rewrite semaphore closed: {e}"))?;
 
-        // Probe one file's footer KV metadata. URIs returned by delta-rs are
-        // absolute (s3://bucket/...); the table's object_store is rooted at
-        // table_uri, so the relative key is the URI with that prefix stripped.
-        // `table_url()` may include a `?endpoint=...` query string (non-AWS
-        // backends like MinIO) which `get_file_uris()` does not — strip it
-        // before matching.
+        // Probe one file's footer KV metadata. delta-rs URIs are absolute and the
+        // object_store is rooted at table_uri, so strip that prefix — including the
+        // `?endpoint=...` query string `table_url()` may carry but URIs do not.
         let probe_uri = &uris[0];
         let table_prefix = table_uri.split('?').next().unwrap_or(&table_uri).trim_end_matches('/');
         let probe_tier = match probe_uri.strip_prefix(table_prefix).map(|s| s.strip_prefix('/').unwrap_or(s)) {
             Some(rel) => {
                 let object_store = log_store.object_store(None);
                 let path = OsPath::from(rel);
-                // `head()` returns `meta.location` relative to the bucket,
-                // but `ParquetObjectReader` consumes object-store-relative
-                // paths and would double-prefix. Pass our original `path`.
+                // Pass our own `path`, not `meta.location`: the latter is
+                // bucket-relative and `ParquetObjectReader` would double-prefix it.
                 match object_store.head(&path).await {
                     Ok(meta) => {
                         let mut reader = ParquetObjectReader::new(object_store.clone(), path.clone()).with_file_size(meta.size);
@@ -750,15 +639,9 @@ impl Database {
         };
 
         // A partition holding an UNSORTED file is never "done", whatever its
-        // compression tier. The tier probe alone made this unreachable: prod
-        // 2026-08-07 had a 924 MB file with `sorting_columns=()` stamped
-        // tier 9, so every `--recompress` at level <= 9 skipped it — and then
-        // printed success. That file is exactly what this command exists to
-        // repair, and it voided the declared ordering for every scan of the
-        // last 30 days. Probe the footers (a ranged read each, and the same
-        // metadata cache the scan would warm) and let sortedness veto the skip.
+        // compression tier — a tier-qualified file with an unsorted footer voids the
+        // declared ordering for every scan. Sortedness vetoes the tier-probe skip.
         let declares_order = get_schema(table_name).is_some_and(|s| !s.sorting_columns.is_empty());
-        // A tier-qualified file without a sorted footer is not converged.
         let any_unsorted = declares_order
             && {
                 let object_store = log_store.object_store(None);
@@ -794,28 +677,17 @@ impl Database {
         info!("recompress: rewriting date={} table={} at zstd={} ({} files)", date_str, table_name, target_level, uris.len());
 
         let schema = schema_or_default(table_name);
-        // Sort and declare footer order when enabled; otherwise stream `SELECT *`.
         let order_by = if self.config.maintenance.timefusion_optimize_sort_by { schema_order_by_clause(schema) } else { String::new() };
         let declare_sorted = !order_by.is_empty();
         let writer_properties = self.create_writer_properties(schema, target_level, declare_sorted);
         let target_size = self.config.parquet.timefusion_optimize_target_size;
 
-        // Force a full-partition rewrite at the new zstd tier via a streaming
-        // `replace_where` overwrite — NOT Z-order. delta-rs `Compact` skips
-        // files already ≥ target and drops single-file bins, so it can't lift
-        // an already-consolidated partition's tier; Z-order *can* force the
-        // rewrite but its space-filling curve scatters `timestamp` across row
-        // groups, wrecking the dominant time-range predicate's pruning. Instead
-        // we read the partition (`date = X`, all project_ids) and write it back
-        // with `SaveMode::Overwrite` + `replace_where`, which atomically
-        // Remove-tombstones the old files and Adds the recompressed ones
-        // (data_change semantics preserved). `with_input_plan` streams the scan
-        // through the writer (bounded by target_file_size) rather than
-        // materializing the whole partition, so peak memory matches a normal
-        // flush — unlike Z-order's global sort. The scan runs on the
-        // variant-safe maintenance session (no `variant_to_json` wrap), so
-        // Variant columns round-trip as raw Struct. Decoupling from
-        // `z_order_columns` lets the schema keep that list empty for queries.
+        // Full-partition rewrite via a streaming `replace_where` overwrite, NOT
+        // Z-order: `Compact` skips files already >= target so it cannot lift an
+        // already-consolidated partition's tier, and Z-order's space-filling curve
+        // scatters `timestamp` across row groups and wrecks time-range pruning.
+        // `with_input_plan` streams the scan through the writer, so peak memory
+        // matches a normal flush.
         let (snapshot, log_store, table_clone) = {
             let table = table_ref.read().await;
             (Arc::new(table.snapshot()?.snapshot().clone()), table.log_store(), table.clone())
@@ -828,10 +700,8 @@ impl Database {
             .build()
             .await
             .map_err(|e| anyhow::anyhow!("recompress scan provider: {e}"))?;
-        // Must be the delta *write* session (carries DeltaPlanner): the write
-        // wraps its input in a MetricObserver node only that planner can
-        // physically plan. It now also reserves sort-spill memory so the added
-        // ORDER BY spills rather than erroring on a large partition.
+        // Must be the delta *write* session (carries DeltaPlanner): the write wraps
+        // its input in a MetricObserver node only that planner can physically plan.
         let session = build_delta_write_session_state(self.config.memory.timefusion_query_partitions, self.maintenance_runtime_env(), "8192");
         let ctx = datafusion::prelude::SessionContext::new_with_state(session);
         ctx.register_table("recompress_src", Arc::new(provider))?;
@@ -853,11 +723,8 @@ impl Database {
         match write_result {
             Ok(new_table) => {
                 info!("recompress: date={} table={} rewritten at zstd={} (was {} files)", date_str, table_name, target_level, uris.len());
-                // Swap + warm-added/evict-removed like the other optimize
-                // paths. A bare swap left the rewritten cold-tier files
-                // un-warmed and the tombstoned ones cached — the next query
-                // on a recompressed partition paid full S3 reads (1.5 s
-                // observed against OVH).
+                // Swap + warm-added/evict-removed: a bare swap would leave the
+                // rewritten files un-warmed and the tombstoned ones cached.
                 self.swap_and_refresh_cache(table_ref, new_table, Some(&pre_uris), &[]).await;
                 Ok(RecompressOutcome::Rewritten { files: uris.len() })
             }
@@ -873,29 +740,20 @@ impl Database {
     ///
     /// Successive passes take strictly later slices, so output runs are event-time disjoint and
     /// range pruning works. Per-pass memory is bounded by one <= target sort. Converges because
-    /// outputs >= 7/8 target are excluded from re-selection. `target_size` and `only_project` are
-    /// caller-supplied so the off-box CLI can consolidate a still-hot date for one tenant.
+    /// outputs >= 7/8 target are excluded from re-selection.
     pub async fn consolidate_date_binned(
         &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, date: chrono::NaiveDate, target_size: i64, only_project: Option<&str>, max_passes: usize,
     ) -> Result<()> {
         let schema = schema_or_default(table_name);
-        // This path already bounds each rewrite to one event-time bin at the
-        // cold target, so it does not share the whole-partition external-sort
-        // hazard guarded by `timefusion_optimize_sort_by`. Its contract is to
-        // produce disjoint sorted runs: leaving this behind that global kill
-        // switch made the default cold compactor strip ordering from historical
-        // files and forced read-side greatest-version dedup to buffer the full
-        // scan. Always sort/dedup the bounded bin; whole-partition optimize and
-        // recompress remain gated by the kill switch.
+        // Deliberately NOT gated on `timefusion_optimize_sort_by`: each rewrite here
+        // is bounded to one event-time bin, so it carries no whole-partition
+        // external-sort hazard, and its contract is to produce disjoint sorted runs.
         let (optimize_type, declare_sorted) = consolidate_optimize_type(schema, true);
         let writer_properties = self.create_writer_properties(schema, self.config.parquet.timefusion_zstd_level_warm, declare_sorted);
         let date_str = date.to_string();
         let uris: Vec<String> = { file_uris(&*table_ref.read().await) };
-        // Backstop against a selection that stops shrinking (e.g. a rewrite
-        // that keeps losing OCC to a dedup); a normal day converges in
-        // partition_bytes/target passes.
-        // Backstop for the full sweep; the catch-up caller passes a small budget
-        // so one tick's work fits between restarts.
+        // Backstop against a selection that stops shrinking (e.g. a rewrite that
+        // keeps losing OCC); a normal day converges in partition_bytes/target passes.
         let max_passes = max_passes.clamp(1, 128);
         for project_id in Self::hot_project_ids(&uris, date).into_iter().filter(|p| only_project.is_none_or(|only| only == p)) {
             let partition_filters =
@@ -934,21 +792,18 @@ impl Database {
     /// (unsealed chunks, rewrite budget, vanished snapshot rows) — the partition must not be
     /// fingerprinted clean, or the read-side dedup skip would serve duplicates.
     ///
-    /// Stage-and-commit the whole partition as a SINGLE wave. Used by the fallback
-    /// sweep, which has no queue to batch across; the dirty-bin path stages with
-    /// [`Self::stage_dedup_partition_range`] directly so one wave can span many bins.
+    /// Commits the whole partition as a SINGLE wave; the dirty-bin path instead stages with
+    /// [`Self::stage_dedup_partition_range`] so one wave can span many bins.
     pub async fn dedup_partition(
         &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, project_id: &str, date: chrono::NaiveDate,
     ) -> Result<(u64, bool)> {
         self.dedup_partition_range_limited(table_ref, table_name, project_id, date, None, None).await.map(|(dropped, complete, _)| (dropped, complete))
     }
 
-    /// Third element: `Some(attachments)` iff every LANDED bin masked its
-    /// losers in place (DV-dedup) — the `(path, dv_unique_id)` pairs this
-    /// pass's commit attached, which is what the certification path needs to
-    /// build the EXPECTED post-state for the DV-visibility guard. `None` for a
-    /// CoW pass (or one that landed nothing), which keeps today's
-    /// dropped-rows-means-dirty rule.
+    /// Third element: `Some(attachments)` iff every LANDED bin masked its losers in
+    /// place (DV-dedup) — the `(path, dv_unique_id)` pairs this pass committed, from
+    /// which certification builds the expected post-state for the DV-visibility
+    /// guard. `None` for a CoW pass, keeping the dropped-rows-means-dirty rule.
     pub(crate) async fn dedup_partition_range_limited(
         &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, project_id: &str, date: chrono::NaiveDate,
         slice: Option<crate::maintenance_coordinator::TimeSlice>, limits: Option<DedupExecutionLimits>,
@@ -961,10 +816,9 @@ impl Database {
         let markers = vec![format!("date={date}/")];
         let result = self.commit_wave(table_ref, table_name, &markers, true, units, 0).await;
         let dropped = wave_dropped_rows(&result.landed);
-        // Landed-only, so this counts committed duplicates and nothing else —
-        // and it is recorded here rather than at the coordinator because the
-        // incomplete branch there discards `dropped` while its bins are already
-        // committed work.
+        // Landed-only, so this counts committed duplicates and nothing else.
+        // Recorded here, not at the coordinator: its incomplete branch discards
+        // `dropped` even though those bins are already committed work.
         crate::observability::count_maintenance_work("Dedup", "rows_dropped", dropped);
         // CARRY THE ROLLUP WITNESS instead of letting the rewrite invalidate it.
         //
@@ -1006,14 +860,12 @@ impl Database {
                 .collect()
         });
         // A unit that didn't land left its duplicates in place — the partition
-        // must NOT be certified clean (2026-07-05 review).
+        // must NOT be certified clean.
         Ok((dropped, complete && result.failed.is_empty(), masked))
     }
 
-    /// Builds a `TableProviderBuilder` scoped to exactly `files` off
-    /// `snapshot`/`log_store` — the "scan just these files" shape every
-    /// maintenance narrow-scan path uses. `file_col` requests the synthetic
-    /// file-identity passthrough column dedup rewrites key on.
+    /// Builds a `TableProviderBuilder` scoped to exactly `files`. `file_col`
+    /// requests the synthetic file-identity column dedup rewrites key on.
     pub(crate) async fn narrow_provider(
         log_store: deltalake::logstore::LogStoreRef, snapshot: Arc<deltalake::kernel::EagerSnapshot>, files: Vec<String>, file_col: Option<&str>,
         row_index_col: Option<&str>,
@@ -1024,9 +876,8 @@ impl Database {
         if let Some(col) = file_col {
             builder = builder.with_file_column(col);
         }
-        // A row-index column makes the fork disable parquet predicate pushdown
-        // (positions must not shift), so request it only when DV-dedup needs
-        // physical loser positions.
+        // A row-index column disables parquet predicate pushdown (positions must not
+        // shift), so request it only when DV-dedup needs physical loser positions.
         if let Some(col) = row_index_col {
             builder = builder.with_row_index_column(col);
         }
@@ -1037,24 +888,20 @@ impl Database {
     ///
     /// Bypasses `ProjectRoutingTable`: its MemBuffer union would feed in-flight rows to dedup,
     /// which would then be written to Delta on the next real flush. Restricts provider construction
-    /// itself, not just the SQL scan: an unrestricted provider eagerly materializes statistics for
-    /// every live file in the unified table before partition pruning. Paths come from this exact
-    /// eager snapshot, so the selection cannot omit a file belonging to the project/date being
-    /// certified.
+    /// itself, not just the SQL scan — an unrestricted provider eagerly materializes statistics for
+    /// every live file in the unified table before partition pruning.
     async fn dedup_probe_ctx(
         &self, table_ref: &Arc<RwLock<DeltaTable>>, project_id: &str, date_str: &str, limits: Option<DedupExecutionLimits>,
     ) -> Result<datafusion::prelude::SessionContext> {
         let (snapshot, log_store) = snapshot_and_store(table_ref).await?;
         let partition_files = dedup_partition_paths(snapshot.log_data().iter().map(|f| f.path().to_string()), project_id, date_str);
-        // Probe-only provider (chunk detection). The rewrite builds its own
-        // provider per attempt — from a FRESH snapshot, with the synthetic
-        // source-file column — in `dedup_rewrite_chunk`.
+        // Probe-only provider; the rewrite builds its own per attempt from a FRESH
+        // snapshot, with the synthetic source-file column.
         let provider =
             Self::narrow_provider(log_store, snapshot, partition_files, None, None).await.map_err(|e| anyhow::anyhow!("delta table provider: {e}"))?;
         // A fresh state is intentional: SessionState clones retain mutable
         // catalog/execution internals and can resolve the scan name to an older
-        // eager snapshot. FileSelection above removes the expensive all-table
-        // statistics replay that made fresh states harmful in production.
+        // eager snapshot.
         let state = limits.map_or_else(
             || build_optimize_session_state(self.config.memory.timefusion_query_partitions, self.maintenance_runtime_env()),
             |limits| {
@@ -1072,9 +919,8 @@ impl Database {
     }
 
     /// The 10-minute duplicate probe: returns the bucket starts whose
-    /// dedup-key groups have count > 1 under `filter`. Aggregates group keys only — bounded by key
-    /// cardinality, not row width. A `SELECT *` + `collect()` of a whole day partition transiently
-    /// allocated tens of gigabytes outside any memory pool.
+    /// dedup-key groups have count > 1 under `filter`. Aggregates group keys only, so it is bounded
+    /// by key cardinality rather than row width (a `SELECT *` here allocates outside any pool).
     async fn dup_bin_starts(ctx: &datafusion::prelude::SessionContext, filter: &str, keys_csv: &str) -> Result<Vec<chrono::NaiveDateTime>> {
         let probe = format!(
             "SELECT CAST(date_bin(INTERVAL '10 minutes', \"timestamp\", TIMESTAMP '1970-01-01T00:00:00') AS VARCHAR) FROM \
@@ -1096,59 +942,29 @@ impl Database {
     /// Counts dedup keys whose versions disagree on a column declared IMMUTABLE,
     /// or `None` when the schema has nothing auditable.
     ///
-    /// Immutability is enforced at plan time for UPDATE only (`extract_dml_info`
-    /// refuses to assign an undeclared column). An INSERT is not checked, so a
-    /// client re-emitting a corrected record appends a version that disagrees —
-    /// and read filters on immutable columns are pushed BELOW the merge-on-read
-    /// dedup precisely because they were promised not to.
+    /// Immutability is enforced at plan time for UPDATE only; an INSERT is not
+    /// checked, so a client re-emitting a corrected record appends a disagreeing
+    /// version — and read filters on immutable columns are pushed BELOW the
+    /// merge-on-read dedup precisely because they were promised not to.
     ///
-    /// Two ways a group can disagree, and the value term alone catches only
-    /// the first:
-    /// - different non-null values — `MIN(c) <> MAX(c)`;
-    /// - null in some versions and set in others — which `COUNT(DISTINCT)`
-    ///   ignores entirely, and which is the SHAPE ENRICHMENT PRODUCES: a field
-    ///   absent on the first emit and filled on the retry. Hence
-    ///   `COUNT(c) > 0 AND COUNT(c) < COUNT(*)`, which must be two-sided: a
-    ///   group where the column is null in EVERY version has `COUNT(c) = 0` and
-    ///   agrees perfectly.
+    /// A group can disagree two ways, and the value term alone catches only the
+    /// first: different non-null values (`MIN(c) <> MAX(c)`), or null in some
+    /// versions and set in others (the shape enrichment produces), hence the
+    /// two-sided `COUNT(c) > 0 AND COUNT(c) < COUNT(*)` — a column null in EVERY
+    /// version has `COUNT(c) = 0` and agrees perfectly.
     ///
     /// Dedup keys are excluded (they are the grouping), as are the tiebreak and
     /// tombstone columns, which vary across versions by construction. Composite
     /// types are excluded because ordering over them is neither cheap nor
     /// meaningful.
     ///
-    /// `MIN(c) <> MAX(c)`, NOT `COUNT(DISTINCT c) > 1`. The two are equivalent
-    /// for the question asked — "does this group hold two different non-null
-    /// values?" — because `MIN <> MAX` exactly when at least two distinct
-    /// non-null values exist, and both ignore nulls identically. But
-    /// `COUNT(DISTINCT)` keeps a per-group HASH SET per column, and this schema
-    /// audits ~150 columns, so it built ~150 hash sets for every dedup key in
-    /// the shard. Prod 2026-09-03: the `GroupedHashAggregateStream` carrying
-    /// them was a top memory consumer at **141 MB peak** inside a
-    /// `fair(pool_size: 5.0 GB)` exhaustion — the heavy share, which is where
-    /// the dedup rewrite's own sort also lives. A correctness audit was helping
-    /// cause the OOMs that stop dedup running.
-    ///
-    /// `MIN`/`MAX` carry O(1) state per group per column, which removed the
-    /// audit from the top-5 consumers — but NOT enough. Measured on prod the
-    /// same day: whale-shard audits still died, and the top consumers at death
-    /// were `RepartitionExec` at ~47 MB with **30-49 MB "remain available"**
-    /// against `fair(pool_size: 5.0 GB)`. A `FairSpillPool` slices into
-    /// per-consumer quotas, so the binding constraint is the SLOT, not the
-    /// total — and the aggregate is still O(groups x ~150 columns), which no
-    /// accumulator swap fixes. Being an extra consumer, it also shrank the
-    /// rewrite's own slot.
-    ///
-    /// So this SQL form is now the FALLBACK, used only when the streaming
-    /// collapse cannot run (`dedup_keys_lead_the_sort` false). When it can, the
-    /// audit rides the collapse instead — see
-    /// `RunCollapse::with_immutable_audit` — at O(1) state and no extra
-    /// consumer. The old call-site claim, "one extra aggregate over a shard this
-    /// rewrite is about to read in full anyway", was never true of either SQL
-    /// formulation; it is true of the streaming one.
-    ///
-    /// This is the single definition of which columns an audit compares, so the
-    /// SQL and the streaming collapse cannot drift.
+    /// The SQL form uses `MIN(c) <> MAX(c)`, never `COUNT(DISTINCT c) > 1`: they
+    /// answer the same question, but `COUNT(DISTINCT)` keeps a per-group hash set
+    /// per column, which over ~150 columns is enough memory to OOM the rewrite.
+    /// It is only the fallback for when the streaming collapse cannot run
+    /// (`dedup_keys_lead_the_sort` false); otherwise the audit rides
+    /// `RunCollapse::with_immutable_audit`. Single definition of which columns an
+    /// audit compares, so SQL and streaming collapse cannot drift.
     fn immutable_audit_columns(schema: &crate::schema::TableSchema) -> Vec<String> {
         let excluded: HashSet<&str> =
             schema.dedup_keys.iter().map(String::as_str).chain(schema.dedup_tiebreak.as_deref()).chain(schema.tombstone_column.as_deref()).collect();
@@ -1180,11 +996,8 @@ impl Database {
         Some(format!("SELECT COUNT(*) FROM (SELECT {keys} FROM {scan_name} WHERE {rows_filter} GROUP BY {keys} HAVING {predicates})"))
     }
 
-    /// Runs `sql` and pulls its first output row's `column(0)` as an `i64` —
-    /// the common "run an aggregate probe, get one scalar back" shape used
-    /// throughout the dedup rewrite path. `None` if the result is empty or
-    /// `column(0)` isn't an `Int64Array`; callers layer their own
-    /// exactly-one-row / non-negative validation on top where needed.
+    /// Runs `sql` and pulls its first output row's `column(0)` as an `i64`.
+    /// `None` if the result is empty or `column(0)` isn't an `Int64Array`.
     async fn scalar_i64(ctx: &datafusion::prelude::SessionContext, sql: &str) -> Result<Option<i64>> {
         let batches = crate::database::maintain::collect_watched(ctx, sql).await?;
         Ok(batches
@@ -1196,8 +1009,7 @@ impl Database {
 
     /// Write one already-cast batch through a staging writer, flushing the
     /// completed files into `adds` once the writer's buffer reaches
-    /// `max_file_bytes`. One definition so every dedup staging path keeps the
-    /// same file-size policy.
+    /// `max_file_bytes`. Single definition of the dedup staging file-size policy.
     async fn write_staged(
         writer: &mut deltalake::writer::RecordBatchWriter, adds: &mut Vec<deltalake::kernel::Action>, batch: RecordBatch, max_file_bytes: usize,
     ) -> Result<()> {
@@ -1239,16 +1051,13 @@ impl Database {
         let date_str = date.to_string();
         let ctx = self.dedup_probe_ctx(table_ref, project_id, &date_str, limits).await?;
         let scan_name = DEDUP_SCAN_NAME;
-        // project_id is currently always a UUID/controlled identifier, but defend in depth: escape single quotes
-        // so a future caller can't inject SQL through the partition predicate. date_str comes from NaiveDate::to_string
-        // and is already safe.
+        // Escape quotes so a caller cannot inject SQL through the partition
+        // predicate; `date_str` comes from NaiveDate::to_string and is already safe.
         let safe_pid = project_id.replace('\'', "''");
-        // Keep the full partition predicate separate from the dirty-bin probe
-        // scope. `stage_dedup_chunk` removes every file touched by the scoped
-        // chunk, then re-reads those files with `partition_filter` so rows in
-        // adjacent bins survive the replacement. Passing the bin predicate as
-        // `partition_filter` silently kept only ten minutes from a multi-bin
-        // parquet file and dropped the rest (prod 2026-08-03).
+        // The full partition predicate MUST stay separate from the bin probe scope:
+        // `stage_dedup_chunk` removes every file the scoped chunk touches, then
+        // re-reads those files with `partition_filter` so rows in adjacent bins
+        // survive. Passing the bin predicate here silently drops them.
         let partition_filter = format!("project_id = '{}' AND date = DATE '{}'", safe_pid, date_str);
         let filter = if let Some(slice) = slice {
             let start = chrono::DateTime::from_timestamp_micros(slice.start_micros)
@@ -1267,22 +1076,17 @@ impl Database {
         // case by key cardinality rather than row width.
         let keys_csv = quoted_csv(&schema.dedup_keys);
 
-        // Identify the hour buckets that actually contain duplicates. A dup
-        // group shares one exact `timestamp` (it's a dedup key), so chunking
-        // the rewrite by hour can never split a group — and it bounds the
-        // materialization below to one hour of one project instead of the
-        // whole day (the crash-loop backlog made EVERY project probe-positive,
-        // so the probe alone still ballooned tens of GB per sweep).
+        // Identify the buckets that actually contain duplicates. A dup group shares
+        // one exact `timestamp` (it is a dedup key), so chunking by time can never
+        // split a group, and it bounds materialization to one bin of one project.
         let (chunks, skipped_any): (Vec<(String, String)>, bool) = if schema.dedup_keys.iter().any(|k| k == "timestamp") {
             // Ten-minute sealed bins bound materialization and avoid racing late
             // flushes; newer duplicates are retried later.
             let sealed_before = Utc::now().naive_utc() - chrono::Duration::hours(2);
             let mut skipped_unsealed = false;
-            // A one-minute whale cannot be split further in time. Bound the
-            // key GROUP BY used by the duplicate probe with the same complete-
-            // key hash partitioning as the rewrite. Each pass may reread the
-            // selected files, but no pass can accumulate the whale's full key
-            // cardinality in memory.
+            // A bin that cannot be split further in time is instead split by the same
+            // complete-key hash partitioning the rewrite uses, so no single pass
+            // accumulates the whole bin's key cardinality in memory.
             let probe_shards = limits.map_or(1, |limits| limits.probe_hash_shards.max(1));
             let bucket_expr = dedup_bucket_expr(schema);
             let mut duplicate_starts = Vec::new();
@@ -1304,11 +1108,8 @@ impl Database {
                     let (s, e) = (start.format("%Y-%m-%d %H:%M:%S"), end.format("%Y-%m-%d %H:%M:%S"));
                     Some((
                         format!("{filter} AND \"timestamp\" >= TIMESTAMP '{s}' AND \"timestamp\" < TIMESTAMP '{e}'"),
-                        // Log label only. The rewrite commits targeted
-                        // Remove+Add actions — no replace_where, so no
-                        // predicate ever needs kernel evaluation (the old
-                        // bare-string predicate defeated file pruning AND
-                        // errored delta-kernel's OCC checker).
+                        // Log label only: the rewrite commits targeted Remove+Add
+                        // actions, so no predicate is ever kernel-evaluated.
                         format!("project_id = '{safe_pid}' AND date = '{date_str}' AND timestamp in ['{s}', '{e}')"),
                     ))
                 })
@@ -1345,12 +1146,8 @@ impl Database {
         for outcome in staged {
             match outcome {
                 Ok(BinOutcome::Staged(unit)) => units.push(unit),
-                // The chunk's rows vanished / were rewritten concurrently:
-                // nothing was verified, so the partition stays uncertified.
-                Ok(BinOutcome::Retry) => all_complete = false,
-                // Unreachable here (only `stage_hot_bin`'s repair arm produces
-                // it), but if it ever arrives the partition was not verified.
-                Ok(BinOutcome::BudgetBusy) => all_complete = false,
+                // Nothing was verified, so the partition stays uncertified.
+                Ok(BinOutcome::Retry | BinOutcome::BudgetBusy) => all_complete = false,
                 // Probe false-positive: verified duplicate-free, nothing to commit.
                 Ok(BinOutcome::Converged) => {}
                 Err(e) => {
@@ -1359,9 +1156,9 @@ impl Database {
             }
         }
         if let Some(e) = first_err {
-            // One chunk's failure abandons the partition's whole staging batch:
-            // clean up the siblings' parquet rather than leaking it (their
-            // Adds are in no commit and VACUUM would take days to notice).
+            // One chunk's failure abandons the whole staging batch: delete the
+            // siblings' parquet, whose Adds are in no commit and which VACUUM
+            // would take days to notice.
             self.discard_bins(table_ref, &units, None).await;
             return Err(e);
         }
@@ -1372,22 +1169,16 @@ impl Database {
     ///
     /// Uses the provider's synthetic `DEDUP_FILE_COL` to find which files hold the chunk's rows,
     /// re-reads those files' full row sets, dedups, and writes replacement parquet. Returns
-    /// `Remove(old) + Add(new)` actions for a wave commit; this function commits nothing. Batching
-    /// chunks under a shared commit lock replaces serial per-chunk commits. Explicit file actions
-    /// are used instead of `replace_where` because delta-rs cannot stringify typed TIMESTAMP
-    /// literals for the commit predicate.
+    /// `Remove(old) + Add(new)` actions for a wave commit; this function commits nothing. Explicit
+    /// file actions rather than `replace_where`, because delta-rs cannot stringify typed TIMESTAMP
+    /// literals for a commit predicate.
     #[allow(clippy::too_many_arguments)]
     async fn stage_dedup_chunk(
         &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, project_id: &str, schema: &crate::schema::TableSchema, scan_name: &str,
         partition_filter: &str, chunk_filter: &str, label: &str, date_str: &str, key: Option<DirtyBinKey>, limits: Option<DedupExecutionLimits>,
     ) -> Result<BinOutcome<StagedBin>> {
-        // DV-dedup: drop losers with a deletion vector rather than a whole-file
-        // rewrite. Gated on the flag AND the table actually declaring the DV
-        // feature — writing a DV to a table without `enableDeletionVectors` is a
-        // protocol violation, so a table created before the flag was on (its
-        // properties not yet reconciled) correctly falls back to copy-on-write.
-        // `partition_filter`/`scan_name` are unused by the DV path — it builds
-        // its own row-index provider.
+        // Writing a DV to a table without `enableDeletionVectors` is a protocol
+        // violation, so fall back to copy-on-write unless the table declares it.
         if self.config.maintenance.timefusion_use_deletion_vectors {
             let dv_enabled =
                 table_ref.read().await.snapshot().ok().map(|s| s.snapshot().table_properties().enable_deletion_vectors == Some(true)).unwrap_or(false);
@@ -1400,15 +1191,8 @@ impl Database {
         // file mappings; `commit_wave` guards the remaining commit window.
         const MAX_REPLANS: usize = 3;
         for replan in 0..MAX_REPLANS {
-            // Scan and file-mapping MUST share one snapshot: the caller's ctx
-            // is pinned at dedup_partition entry, and on the heavily-churned
-            // unified table the live file set diverges from it within seconds
-            // (flush appends + light optimize) — mapping scan results against
-            // the LIVE snapshot mismatched on every attempt in prod
-            // (28/28 re-plan exhaustions, zero successes, 2026-07-04). Each
-            // re-plan therefore rebuilds provider + ctx from a fresh eager
-            // snapshot; the commit-time liveness check below still guards the
-            // remaining snapshot→commit window.
+            // Scan and file-mapping MUST share one snapshot — the live file set
+            // diverges within seconds on the churned unified table.
             let (chunk_snapshot, chunk_log_store) = snapshot_and_store(table_ref).await?;
             let partition_files = dedup_partition_paths(chunk_snapshot.log_data().iter().map(|f| f.path().to_string()), project_id, date_str);
             let provider = Self::narrow_provider(chunk_log_store, Arc::clone(&chunk_snapshot), partition_files, Some(DEDUP_FILE_COL), None)
@@ -1416,17 +1200,14 @@ impl Database {
                 .map_err(|e| anyhow::anyhow!("dedup rewrite provider: {e}"))?;
             // Sort parallelism descends on retry: the merge exec is unspillable
             // and per-partition, so a bin that exhausted the pool at the cap must
-            // not be replanned at the same width (prod 2026-08-25, 56 looping
-            // units). Coordinator-driven units carry the ladder rung; the cron
-            // path has no attempt count and keeps the configured width.
+            // not be replanned at the same width.
             let ctx = datafusion::prelude::SessionContext::new_with_state(build_optimize_session_state(
                 limits.map_or(self.config.memory.timefusion_query_partitions, |l| l.sort_partitions),
                 self.maintenance_runtime_env(),
             ));
             ctx.register_table(scan_name, provider)?;
 
-            // 1. Which files hold the chunk's rows — ground truth from the
-            // scan itself, no per-file stats parsing.
+            // 1. Which files hold the chunk's rows — ground truth from the scan.
             let files_sql = format!("SELECT DISTINCT \"{DEDUP_FILE_COL}\" FROM {scan_name} WHERE {chunk_filter}");
             let file_ids = read_string_column(crate::database::maintain::collect_watched(&ctx, &files_sql).await?)?;
             if file_ids.is_empty() {
@@ -1449,33 +1230,17 @@ impl Database {
                 continue;
             }
 
-            // 2026-07-29 (Phase 2): the delta-rs `SortByDedup` OptimizeBuilder
-            // fast path was removed here. It rewrote AND committed inside one
-            // call, so it could not be staged for a wave — and its per-chunk
-            // commit is precisely the delete-delete partner that aborted against
-            // light optimize. The shard path below covers the same inputs: the
-            // fast path only ran when the whole chunk fit the rewrite budgets,
-            // which is the shard path's `shards == 1` case.
-            //
             // 3. Decide the shard count. A dedup `SELECT * … collect()` decodes to
-            // Arrow at 5-20× compressed OUTSIDE the memory pool, so an over-budget
-            // chunk used to be skipped (dupe left forever). Instead we split the
-            // rewrite into K passes bucketed by a hash of the dedup keys — every
-            // copy of a key hashes to one bucket (never split), and hashing (not
-            // `key % K`, which collides for ms-aligned values) spreads evenly and is
-            // NULL-safe.
-            // K = ceil(estimated decoded bytes / budget); the estimate is the
-            // row-count-vs-inflation MAX ×2 documented on the config fields.
+            // Arrow OUTSIDE the memory pool, so the rewrite is split into K passes
+            // bucketed by a hash of the dedup keys — every copy of a key hashes to
+            // one bucket (never split), and hashing is even and NULL-safe.
+            // K = ceil(estimated decoded bytes / budget).
             let rewrite_bytes: i64 = targets.iter().map(|a| a.size).sum();
             // Copied out because the per-shard closure below moves `targets`.
             let target_files = targets.len();
-            // Fail closed unless the provider's full-file re-read can be
-            // checked against Delta's independent row-count metadata. This is
-            // the invariant that would have stopped the 2026-08-03 loss: the
-            // buggy bin-scoped re-read produced 63k rows while removing files
-            // whose Add actions described 5.8M live rows. Deletion-vector
-            // cardinality is subtracted because the provider correctly hides
-            // those already-deleted physical rows.
+            // Fail closed unless the provider's full-file re-read can be checked
+            // against Delta's independent row-count metadata. DV cardinality is
+            // subtracted: the provider already hides those physical rows.
             let expected_live_rows = targets.iter().try_fold(0u64, |sum, add| -> Result<u64> {
                 let stats = add.get_stats()?.ok_or_else(|| anyhow::anyhow!("dedup rewrite refuses target without num_records stats: {}", add.path))?;
                 let rows = u64::try_from(stats.num_records).map_err(|_| anyhow::anyhow!("dedup rewrite target has negative num_records: {}", add.path))?;
@@ -1502,19 +1267,9 @@ impl Database {
                 .sum::<u64>()
                 .saturating_mul(2); // RowConverter keyed copy in dedup_batches
             let shards = dedup_shard_count(limits.is_some(), est_decoded_bytes, rewrite_bytes.max(0) as u64, decoded_budget, compressed_budget);
-            // K is the read/decode AMPLIFICATION of this rewrite, and nothing
-            // logged it. Each shard is an independent query over the SAME files
-            // (`N shards paid N scans + sorts + writes`, below), so the partition
-            // is decoded K times and every row is md5-hashed K times to keep
-            // 1/K of them.
-            //
-            // K = ceil(est_decoded / budget), and `est_decoded` is deliberately
-            // pessimistic — max(rows x bytes_per_row, compressed x inflation) x 2
-            // — so every unit of over-estimate costs a whole extra pass over the
-            // data. A perf profile on 2026-08-18 put `md5::compress` at 5.71% of
-            // all CPU, above ZSTD decompression, which is what this multiplier
-            // looks like from the outside. Log the inputs so the amplification is
-            // visible before anyone tunes the estimate or the budget.
+            // K is the read/decode amplification: each shard is an independent
+            // query over the SAME files, so every unit of over-estimate in
+            // `est_decoded` costs a whole extra pass. Log the inputs.
             if shards > 1 {
                 info!(
                     table = %table_name,
@@ -1527,10 +1282,6 @@ impl Database {
                 );
             }
             let in_list = file_ids.iter().map(|v| format!("'{}'", v.replace('\'', "''"))).join(", ");
-            // The bucket expr was `substr(md5(…), 1, 2)` until 2026-08-18, when a
-            // live CPU profile put `md5::compress` at 5.71% of all CPU — larger
-            // than the ZSTD decompression it serves, because each of K passes
-            // hashes every row to keep 1/K of them.
             // ONE binding, read both by the writer properties below and by the
             // StagedBin this function returns — `mark_written_sorted` must be
             // told the same fact that decided the footer, not a re-derivation.
@@ -1538,11 +1289,9 @@ impl Database {
             // `keys_varchar` doubles as the GROUP BY for the skew probe below.
             let keys_varchar = schema.dedup_keys.iter().map(|k| format!("CAST(\"{k}\" AS VARCHAR)")).join(", ");
             let bucket_expr = dedup_bucket_expr(schema);
-            // Independent narrow oracle for the staged output count. The
-            // Arrow rewrite below chooses the greatest tiebreak per key, but it
-            // must still emit exactly one row per distinct key (tombstones are
-            // retained). A disagreement rejects the unit before Remove actions
-            // can reach `commit_wave`.
+            // Independent narrow oracle for the staged output count: exactly one
+            // row per distinct key. A disagreement rejects the unit before Remove
+            // actions can reach `commit_wave`.
             let logical_rows_sql = format!(
                 "SELECT count(*) FROM (SELECT 1 FROM {scan_name} WHERE {partition_filter} AND \"{DEDUP_FILE_COL}\" IN ({in_list}) GROUP BY {keys_varchar})"
             );
@@ -1552,8 +1301,7 @@ impl Database {
             .map_err(|_| anyhow::anyhow!("dedup rewrite distinct-key validation returned a negative count"))?;
 
             // Sharding can't split a single key group — all copies share one bucket.
-            // If the largest group alone would blow the budget, no shard count helps,
-            // so skip (preserving the pre-fix OOM-safety) rather than materialize it.
+            // If the largest group alone would blow the budget, no shard count helps.
             if limits.is_none() && shards > 1 && decoded_budget > 0 {
                 let max_group_sql = format!(
                     "SELECT coalesce(max(c), 0) FROM (SELECT count(*) AS c FROM {scan_name} WHERE {partition_filter} AND \"{DEDUP_FILE_COL}\" IN ({in_list}) GROUP BY {keys_varchar})"
@@ -1572,15 +1320,11 @@ impl Database {
                 }
             }
 
-            // 4. Rewrite each shard independently: collect (bounded to ~one budget by
-            // the bucket range), dedup, stage its own parquet. The permit bounds
-            // concurrent Arrow materializations across the sweep — unlike hot-wave
-            // staging (which has its own K-bounded light pool), dedup materializes
-            // Arrow OUTSIDE any pool, which is exactly what this semaphore is for.
-            // Held for the shard loop only, dropped before the unit is handed to a
-            // wave (the commit decodes nothing). Out-of-window rows in the target files carry through verbatim
-            // (their keys are unique → no drop). On any per-shard error, already-staged
-            // parquet is cleaned before returning so a mid-loop failure leaks nothing.
+            // 4. Rewrite each shard independently: collect, dedup, stage its own
+            // parquet. The permit bounds concurrent Arrow materializations (dedup
+            // materializes OUTSIDE any memory pool); held for the shard loop only,
+            // dropped before the unit is handed to a wave. On any per-shard error,
+            // already-staged parquet is cleaned so a mid-loop failure leaks nothing.
             let rewrite_permit = self.maintenance_rewrite_sem.acquire().await.map_err(|e| anyhow::anyhow!("maintenance rewrite semaphore closed: {e}"))?;
             let staging_table = { table_ref.read().await.clone() };
             let stage_store = staging_table.log_store().object_store(None);
@@ -1597,30 +1341,11 @@ impl Database {
                             let shard_pred = shard_bucket_pred(bucket_expr, shard, shards);
                             let rows_filter = format!("{partition_filter} AND \"{DEDUP_FILE_COL}\" IN ({in_list}){shard_pred}");
                             let rows_sql = format!("SELECT * FROM {scan_name} WHERE {rows_filter}");
-                            // Version collapse: greatest `dedup_tiebreak` per key wins, so a
-                            // merge-on-read table's newest version survives and the older ones
-                            // are dropped here rather than at every read.
-                            //
-                            // Tombstones are RETAINED (`drop_tombstones = None`). Dropping one
-                            // requires that no older version of its key can exist outside this
-                            // rewrite's input. The input is every live file of this
-                            // (project_id, date) snapshot holding a row in the 10-minute chunk
-                            // window; since `timestamp` is a dedup key and `date` derives from
-                            // it, all versions of a key do share that window — but three ways
-                            // an older version outlives the rewrite are NOT excludable here:
-                            //   1. files appended after the file-id query (flush, WAL replay,
-                            //      an off-box writer). `commit_wave`'s liveness check verifies
-                            //      the TARGETS still exist; it cannot see a new file carrying
-                            //      an older version of the same key.
-                            //   2. rows still in MemBuffer/WAL/hot tier. The 2h sealed-chunk
-                            //      guard bounds EVENT time, not arrival: a late client re-send
-                            //      (or a version append, which carries the base row's original
-                            //      `timestamp`) lands in a long-sealed window at any wall clock.
-                            //   3. tables whose `dedup_keys` omit `timestamp` take the
-                            //      whole-partition branch above, where versions of one key may
-                            //      sit in date partitions this sweep never holds together.
-                            // A retained tombstone costs one row per deleted key forever; a
-                            // dropped one silently resurrects the row. Retain.
+                            // Version collapse: greatest `dedup_tiebreak` per key wins.
+                            // Tombstones are RETAINED — an older version of a key can always
+                            // outlive this rewrite (later appends, rows still in MemBuffer/WAL,
+                            // keys spanning partitions), and a dropped tombstone silently
+                            // resurrects the row.
                             let writer_properties = self.create_writer_properties(schema, self.config.parquet.timefusion_zstd_compression_level, sorted);
                             let mut writer = deltalake::writer::RecordBatchWriter::for_table(staging_table)
                                 .map_err(|e| anyhow::anyhow!("dedup rewrite writer: {e}"))?
@@ -1647,17 +1372,6 @@ impl Database {
                                 if shard_before == 0 {
                                     return Ok((0, 0));
                                 }
-                                // The dedup sweep is the ONLY place every version of a key is
-                                // visible at once — the read path collapses them, and the
-                                // `skip_dedup` fast path applies only to partitions already
-                                // certified duplicate-free, so it cannot show a disagreement by
-                                // construction. If this is not measured here it is not measurable.
-                                //
-                                // Unconditional: it is one extra aggregate over a
-                                // shard this rewrite is about to read in full
-                                // anyway, and what it detects is silently wrong
-                                // query results. A correctness audit that is off
-                                // is not an audit.
                                 // Keys leading the sort make the window redundant: sort ONCE in
                                 // schema order and collapse adjacent runs (`RunCollapse`). The
                                 // window plan pays two full external sorts — its partition
@@ -1665,25 +1379,13 @@ impl Database {
                                 // DESC output sort.
                                 let order_by = schema_order_by_clause(schema);
                                 let streaming_collapse = dedup_keys_lead_the_sort(schema) && !order_by.is_empty();
-                                // When the collapse runs, it audits inline (see
-                                // `RunCollapse::with_immutable_audit`) and this
-                                // aggregate would be a second, redundant pass —
-                                // one that could not fit its slot of the heavy
-                                // pool on whale shards anyway.
+                                // The collapse audits inline, so this aggregate is only for the
+                                // non-collapse path.
                                 if let Some(audit_sql) = (!streaming_collapse).then(|| Self::immutable_audit_sql(schema, scan_name, &rows_filter)).flatten() {
                                     // Diagnostics must never fail the rewrite that carries them.
                                     match Self::scalar_i64(ctx, &audit_sql).await {
                                         Ok(Some(disagreeing)) if disagreeing > 0 => {
-                                            crate::observability::maintenance_stats()
-                                                .immutable_column_disagreement_total
-                                                .fetch_add(u64::try_from(disagreeing).unwrap_or_default(), std::sync::atomic::Ordering::Relaxed);
-                                            warn!(
-                                                table = %table_name,
-                                                project_id = %project_id,
-                                                disagreeing,
-                                                event = "immutable_column_disagreement",
-                                                "versions of one key differ on a column declared immutable; read filters on it are pushed below dedup"
-                                            );
+                                            note_immutable_disagreements(table_name, project_id, u64::try_from(disagreeing).unwrap_or_default())
                                         }
                                         Ok(_) => {}
                                         Err(error) => warn!(%error, "immutable-column audit failed"),
@@ -1703,28 +1405,13 @@ impl Database {
                                          FROM {scan_name} WHERE {rows_filter}) WHERE __tf_rn = 1{order_by}"
                                     )
                                 };
-                                // A window function and a final ORDER BY: two blocking
-                                // operators between the scan and the write loop, so the
-                                // loop's own progress bump cannot see most of the unit.
-                                // See `PlanProgress`.
                                 let planned_at = std::time::Instant::now();
                                 let plan = ctx.sql(&sql).await?.create_physical_plan().await?;
                                 let t_plan = planned_at.elapsed();
                                 let (mut t_upstream, mut t_write) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
-                                // `RunCollapse` collapses ADJACENT runs, so it needs one ordered
-                                // stream. `execute_stream` merges a multi-partition plan with a
-                                // `CoalescePartitionsExec`, which does NOT preserve ordering —
-                                // harmless while the plan always ended in a single-partition
-                                // `SortExec`, but the footer-ordering fix can remove that sort and
-                                // leave a partitioned scan at the root. Equal keys would then
-                                // arrive interleaved, duplicates would survive, and the unit would
-                                // be REJECTED by the `expected_logical_rows` oracle every time —
-                                // a bin that loops forever rather than a wrong answer, which is
-                                // the right failure but an expensive one to diagnose.
-                                //
-                                // A global `ORDER BY` should already force a single-partition
-                                // root, so this is belt-and-braces; make it explicit rather than
-                                // assumed, because the cost of being wrong is a silent stall.
+                                // `RunCollapse` collapses ADJACENT runs, so it needs ONE ordered
+                                // stream: `execute_stream` would coalesce a multi-partition plan
+                                // without preserving ordering, interleaving equal keys.
                                 let plan = match (streaming_collapse, plan.properties().output_partitioning().partition_count()) {
                                     (true, 2..) => {
                                         let ordering =
@@ -1735,13 +1422,6 @@ impl Database {
                                     }
                                     _ => plan,
                                 };
-                                // Whether the ONE remaining sort survived. With the window gone
-                                // the rewrite's whole cost is this sort, and the delta-rs fork
-                                // already declares footer ordering on conforming files — so a
-                                // scan whose files all carry an honest `sorting_columns` should
-                                // plan a `SortPreservingMergeExec` and no `SortExec` at all.
-                                // Nothing reported which one prod actually gets, and the answer
-                                // decides whether there is a second 5x here or none.
                                 if shard == 0 {
                                     let rendered = datafusion::physical_plan::displayable(plan.as_ref()).indent(false).to_string();
                                     info!(
@@ -1783,11 +1463,8 @@ impl Database {
                                     };
                                     for batch in batches {
                                         shard_after = shard_after.saturating_add(batch.num_rows());
-                                        // Dedup was the lane still dying to its deadline while it
-                                        // was working: 8 timeouts in the first 11 minutes after the
-                                        // 2026-09-01 deploy, because nothing on this path reported
-                                        // progress and `run_until_idle` could not tell it apart from
-                                        // a stall.
+                                        // Without this, `run_until_idle` cannot tell a long
+                                        // rewrite from a stall and kills it at the deadline.
                                         crate::database::maintain::note_unit_progress(batch.num_rows());
                                         decoded_bytes = decoded_bytes.saturating_add(batch.get_array_memory_size());
                                         let casted = deltalake::kernel::schema::cast_record_batch(&batch, target_schema.clone(), true, true)?;
@@ -1796,13 +1473,8 @@ impl Database {
                                         t_write += wrote_at.elapsed();
                                     }
                                 }
-                                // THE decomposition for the lane that uses ~98% of the heavy
-                                // pool. The timers shipped in `prep/unit-phase-timers` cover the
-                                // Pack/Repair staging path in `maintain.rs` and MISS dedup
-                                // entirely — 87 prod units on 2026-09-04 were 86 Pack and 1
-                                // Repair, and none of them was the operation the measurement
-                                // existed to price. Same three phases, same event, so both paths
-                                // aggregate together.
+                                // Same three phases and event name as the Pack/Repair staging
+                                // timers in `maintain.rs`, so both paths aggregate together.
                                 info!(
                                     table_name,
                                     project_id,
@@ -1817,28 +1489,14 @@ impl Database {
                                     "where a maintenance unit's wall clock went"
                                 );
                                 // Reported here rather than mid-stream so one run straddling a
-                                // batch boundary is counted once. Diagnostics must never fail the
-                                // rewrite that carries them, so there is nothing to propagate.
+                                // batch boundary is counted once.
                                 if collapse.as_ref().is_some_and(RunCollapse::is_auditing) {
                                     crate::observability::maintenance_stats().immutable_audit_shards_total.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 }
                                 if let Some(disagreeing) = collapse.as_ref().map(RunCollapse::disagreements).filter(|count| *count > 0) {
-                                    crate::observability::maintenance_stats()
-                                        .immutable_column_disagreement_total
-                                        .fetch_add(disagreeing, std::sync::atomic::Ordering::Relaxed);
-                                    warn!(
-                                        table = %table_name,
-                                        project_id = %project_id,
-                                        disagreeing,
-                                        event = "immutable_column_disagreement",
-                                        "versions of one key differ on a column declared immutable; read filters on it are pushed below dedup"
-                                    );
+                                    note_immutable_disagreements(table_name, project_id, disagreeing);
                                 }
-                                // The coordinator takes this streaming branch, so the
-                                // collecting branch's identical probe below would never fire in
-                                // production. Post-dedup rows, so this UNDER-states the input
-                                // volume — a ratio at or above the estimate is therefore
-                                // conclusive, one below it is not.
+                                // Post-dedup rows, so this UNDER-states the input volume.
                                 log_decoded("streamed", shard_after, decoded_bytes);
                                 (shard_before, shard_after)
                             } else {
@@ -1848,12 +1506,6 @@ impl Database {
                                     .map(|batch| drop_batch_column(batch, DEDUP_FILE_COL))
                                     .collect();
                                 let shard_before = batches.iter().map(RecordBatch::num_rows).sum();
-                                // K is driven entirely by `est_decoded_bytes`, and every 2x of
-                                // over-estimate is a whole extra pass over the data. Neither
-                                // `bytes_per_row = 4096` nor `inflation = 12` has ever been
-                                // checked against a real decoded-vs-compressed ratio, so log
-                                // what this shard ACTUALLY decoded to next to what was
-                                // predicted for it.
                                 log_decoded("collected", shard_before, batches.iter().map(RecordBatch::get_array_memory_size).sum());
                                 if shard_before == 0 {
                                     return Ok((0, 0));
@@ -1915,28 +1567,19 @@ impl Database {
                 Self::cleanup_orphaned_parquet(&stage_store, &adds).await;
                 return Ok(BinOutcome::Converged);
             }
-            // Row-DROPPING rewrite: data_change=true on both sides. See
-            // `staged_actions` — the snapshot-isolation downgrade the hot path
-            // enjoys is only sound for data-preserving commits.
+            // Row-DROPPING rewrite: data_change=true on both sides — the
+            // snapshot-isolation downgrade in `staged_actions` is only sound for
+            // data-preserving commits.
             let (removes, adds) = staged_actions(&targets, adds, true);
             // Record the intent BEFORE the unit can be handed to a wave commit, so
-            // a crash anywhere in the staging->commit window leaves a trail to
-            // clean up (same guarantee as hot bins).
+            // a crash in the staging->commit window leaves a trail to clean up.
             let wave_id = uuid::Uuid::new_v4().to_string();
-            self.record_staged_intent(StagedIntent {
-                wave_id: wave_id.clone(),
-                table_name: table_name.to_string(),
-                project_id: project_id.to_string(),
-                recorded_at: crate::support::now_secs(),
-                paths: adds.iter().filter_map(|a| if let Action::Add(add) = a { Some(add.path.clone()) } else { None }).collect(),
-                // Cleanup-only: a dedup rewrite DROPS rows, so the resume path's
-                // row-preservation check can't tell a valid staging from a
-                // truncated one. See `resumable_staged_bin`.
-                target_paths: Vec::new(),
-                adds: Vec::new(),
-                rollup: None,
-                instance: None,
-            });
+            self.record_staged_intent(dedup_staged_intent(
+                wave_id.clone(),
+                table_name,
+                project_id,
+                adds.iter().filter_map(|a| if let Action::Add(add) = a { Some(add.path.clone()) } else { None }).collect(),
+            ));
             debug!(table_name, project_id, chunk = label, files = targets.len(), before, after, event = "dedup_chunk_staged");
             return Ok(BinOutcome::Staged(StagedBin {
                 project_id: project_id.to_string(),
@@ -1954,12 +1597,10 @@ impl Database {
     }
 
     /// DV-dedup: mark loser rows deleted via a deletion vector instead of
-    /// rewriting whole files to drop them. Same survivor rule as copy-on-write
-    /// (`dedup_batches`); commit shape `Remove(old) + Add(same path, +DV)`. A
-    /// DV-bearing file reads DV-masked automatically, so a later Pack/repair does
-    /// not resurrect. Sharded by dedup-key hash (a dup group shares one bucket, so
-    /// no group splits) to bound decode memory on whale chunks.
-    /// See docs/plans/2026-09-06-dv-dedup-phase1-design.md.
+    /// rewriting whole files. Same survivor rule as copy-on-write
+    /// (`dedup_batches`); commit shape `Remove(old) + Add(same path, +DV)`.
+    /// Sharded by dedup-key hash (a dup group shares one bucket, so no group
+    /// splits) to bound decode memory.
     #[allow(clippy::too_many_arguments)]
     async fn stage_dedup_chunk_dv(
         &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, project_id: &str, schema: &crate::schema::TableSchema, chunk_filter: &str, label: &str,
@@ -1981,8 +1622,7 @@ impl Database {
 
         // (file path, 0-based physical row index) for every row of a projected
         // batch list. The scan exposes a 1-based physical row number; DV indexes
-        // are 0-based (`v - 1`), and physical even on an already-DV'd file (fork
-        // fix `044f7c98`).
+        // are 0-based (`v - 1`), and physical even on an already-DV'd file.
         let pairs_of = |batches: &[RecordBatch]| -> Result<Vec<(String, u64)>> {
             batches.iter().try_fold(Vec::new(), |mut out, b| {
                 let files = datafusion::arrow::compute::cast(b.column(0), &DataType::Utf8)?;
@@ -2035,11 +1675,8 @@ impl Database {
             let shards = dedup_shard_count(limits.is_some(), est_decoded, 0, decoded_budget, u64::MAX).max(1);
 
             // A single dedup-key group cannot be split (all copies share one hash
-            // bucket), so if the largest group alone would blow the decode budget
-            // even at the narrow projection width, no shard count helps — skip and
-            // let compaction shrink the file set first, exactly like the
-            // copy-on-write path. Cheaper here (narrow projection), so it fires
-            // only on a genuinely enormous single key.
+            // bucket), so if the largest group alone blows the decode budget no
+            // shard count helps — skip and let compaction shrink the file set.
             if limits.is_none() && shards > 1 && decoded_budget > 0 {
                 let max_group_sql = format!(
                     "SELECT coalesce(max(c), 0) FROM (SELECT count(*) AS c FROM {DEDUP_SCAN_NAME} WHERE {chunk_filter} GROUP BY {})",
@@ -2123,20 +1760,9 @@ impl Database {
 
             let stage_store = chunk_log_store.object_store(None);
             let wave_id = uuid::Uuid::new_v4().to_string();
-            // Crash-before-commit cleanup: the fresh-UUID `.bin` sidecars. (Boot
-            // reconcile must treat a COMMITTED `.bin` as live via the descriptor
-            // rule — see the reconcile liveness fix.)
-            self.record_staged_intent(StagedIntent {
-                wave_id: wave_id.clone(),
-                table_name: table_name.to_string(),
-                project_id: project_id.to_string(),
-                recorded_at: crate::support::now_secs(),
-                paths: discardable_paths.clone(),
-                target_paths: Vec::new(),
-                adds: Vec::new(),
-                rollup: None,
-                instance: None,
-            });
+            // Crash-before-commit cleanup: the fresh-UUID `.bin` sidecars. Boot
+            // reconcile must treat a COMMITTED `.bin` as live via the descriptor rule.
+            self.record_staged_intent(dedup_staged_intent(wave_id.clone(), table_name, project_id, discardable_paths.clone()));
             crate::observability::maintenance_stats().dv_dedup_bins_staged.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             debug!(table_name, project_id, chunk = label, files = n_files, scanned_total, losers_total, event = "dv_dedup_chunk_staged");
             return Ok(BinOutcome::Staged(StagedBin {
@@ -2154,9 +1780,7 @@ impl Database {
                     before: scanned_total,
                     after: survivors_total,
                 }),
-                // Same-path files: sortedness is unchanged, so DON'T claim it here
-                // (false only costs a footer probe; true on a file we didn't write
-                // is a wrong exoneration).
+                // Same-path files, so don't claim sortedness we didn't write.
                 sorted: false,
             }));
         }
@@ -2175,10 +1799,8 @@ impl Database {
             .into_group_map())
     }
 
-    /// Live `(path, dv_unique_id)` set of one project's `date=` partition — the
-    /// DV-visibility guard's view of it. The certification fingerprint hashes
-    /// URIs only (FROZEN), so a same-path DV commit is invisible to it; this is
-    /// not. Same project grouping rule as [`Self::partition_files_by_pid`].
+    /// Live `(path, dv_unique_id)` set of one project's `date=` partition. Unlike
+    /// the certification fingerprint (URIs only), this sees a same-path DV commit.
     pub(crate) fn partition_dv_state(table: &DeltaTable, project_id: &str, date_marker: &str) -> Result<HashSet<DvEntry>> {
         Ok(table
             .snapshot()?
@@ -2194,29 +1816,11 @@ impl Database {
     }
 }
 
-/// Width of a dedup "dirty bin" — THE definition, used by the producer
-/// (`write.rs`), the prober (`probe_dup_bins`) and the drain (`maintain.rs`).
-///
-/// It was a `const` copy-pasted into all three; they must agree or a bin marked
-/// dirty by one is never found by another, so it lives here now.
-///
-/// **This width is the read-amplification knob.** A dedup unit must rewrite every
-/// file overlapping its bin, and files span 45-90 minutes, so a narrow bin does
-/// not read less — it reads THE SAME FILES once per bin. Measured over the 95
-/// prod cells holding 17+ files
-/// (`docs/plans/2026-09-04-certification-proves-the-wrong-thing.md`):
-///
-/// | width | unit size | total read to sweep once |
-/// |---|---|---|
-/// | 10 min | 1,469 MiB | 19,530 GiB |
-/// | 60 min | 1,734 MiB (+18%) | 3,847 GiB (**5.1x less**) |
-///
-/// Widening is therefore the cheapest known lever on dedup, which consumes ~98%
-/// of the heavy maintenance pool. The DEFAULT is still 10 minutes: 6x fewer,
-/// larger units interact with the claim/lease/900s-deadline machinery in ways
-/// statistics cannot see, and that wants a soak at real object-store latency.
-/// `timefusion_dedup_bin_minutes` is the knob that makes the soak possible
-/// without a code change.
+/// Width of a dedup "dirty bin" — THE definition, shared by the producer
+/// (`write.rs`), the prober (`probe_dup_bins`) and the drain (`maintain.rs`);
+/// they must agree or a bin marked dirty by one is never found by another.
+/// Overridable at runtime with `timefusion_dedup_bin_minutes`; a wider bin reads
+/// fewer files in total, since one unit rewrites every file overlapping its bin.
 pub(crate) const DEFAULT_BIN_MINUTES: i64 = 10;
 
 /// The packing VALUE floor from config (0 = off / shadow in configless
@@ -2242,13 +1846,9 @@ pub(crate) fn bin_micros() -> i64 {
 
 /// Whether every dedup key is a leading `sorting_columns` entry, in order.
 ///
-/// This is the ClickHouse ReplacingMergeTree invariant (`ORDER BY` carries the
-/// full dedup key so merges stream). When it holds, a stream in schema order
-/// has all versions of a key adjacent and `RunCollapse` can keep-greatest in
-/// one pass — replacing the `ROW_NUMBER() OVER (PARTITION BY keys)` plan, which
-/// costs TWO full external sorts because the window normalizes its partition
-/// ordering to ASC and can therefore never produce the DESC output order
-/// (measured 2026-09-02: 2 `SortExec` under every SQL formulation tried).
+/// When it holds, a stream in schema order has all versions of a key adjacent,
+/// so `RunCollapse` can keep-greatest in one pass instead of paying the
+/// two-sort `ROW_NUMBER() OVER (PARTITION BY keys)` plan.
 pub(crate) fn dedup_keys_lead_the_sort(schema: &crate::schema::TableSchema) -> bool {
     !schema.dedup_keys.is_empty()
         && schema.sorting_columns.len() >= schema.dedup_keys.len()
@@ -2260,6 +1860,38 @@ pub(crate) fn dedup_keys_lead_the_sort(schema: &crate::schema::TableSchema) -> b
 async fn snapshot_and_store(table_ref: &Arc<RwLock<DeltaTable>>) -> Result<(Arc<deltalake::kernel::EagerSnapshot>, deltalake::logstore::LogStoreRef)> {
     let table = table_ref.read().await;
     Ok((Arc::new(table.snapshot()?.snapshot().clone()), table.log_store()))
+}
+
+/// Count + warn for dedup keys whose versions disagree on a column declared
+/// immutable. Both audit forms (the streaming collapse and the `GROUP BY`
+/// aggregate it replaces) report through here, so they cannot drift apart.
+fn note_immutable_disagreements(table_name: &str, project_id: &str, disagreeing: u64) {
+    crate::observability::maintenance_stats().immutable_column_disagreement_total.fetch_add(disagreeing, std::sync::atomic::Ordering::Relaxed);
+    warn!(
+        table = %table_name,
+        project_id = %project_id,
+        disagreeing,
+        event = "immutable_column_disagreement",
+        "versions of one key differ on a column declared immutable; read filters on it are pushed below dedup"
+    );
+}
+
+/// A dedup unit's staged-intent line, recorded before the unit can be handed to
+/// a wave commit. Dedup entries are CLEANUP-ONLY (no `target_paths`, no `adds`):
+/// a dedup rewrite DROPS rows, so the resume path's row-preservation check
+/// cannot tell a valid staging from a truncated one.
+fn dedup_staged_intent(wave_id: String, table_name: &str, project_id: &str, paths: Vec<String>) -> StagedIntent {
+    StagedIntent {
+        wave_id,
+        table_name: table_name.to_string(),
+        project_id: project_id.to_string(),
+        recorded_at: crate::support::now_secs(),
+        paths,
+        target_paths: Vec::new(),
+        adds: Vec::new(),
+        rollup: None,
+        instance: None,
+    }
 }
 
 /// `"a", "b", …` — quoted column list for SQL, the shape every dedup query needs.
@@ -2298,8 +1930,7 @@ fn read_string_column(batches: Vec<RecordBatch>) -> Result<Vec<String>> {
 
 /// Map scan file-id values back to Add actions in the SAME snapshot
 /// (suffix-match either direction: the scan column carries the store path, the
-/// log a table-relative one). `add_action` is deprecated in favour of
-/// arrow-direct access, but the Remove tombstones need the Add's exact fields.
+/// log a table-relative one).
 fn adds_for_file_ids(snapshot: &deltalake::kernel::EagerSnapshot, file_ids: &[String], table_name: &str) -> Vec<deltalake::kernel::Add> {
     dedup_adds_by_path(
         snapshot
@@ -2334,11 +1965,9 @@ struct OpenRun {
 /// Keep-greatest over a stream already sorted by the schema's sort key.
 ///
 /// Runs of equal dedup keys are contiguous (see `dedup_keys_lead_the_sort`), so
-/// one row per key is chosen in a single pass, order-preserving, with only the
-/// TRAILING run held back — it is the only one that can continue into the next
-/// batch. Ties keep the first row, matching the window's
-/// `ORDER BY tiebreak DESC NULLS LAST` + `__tf_rn = 1`. Tombstones are retained
-/// (dropping one silently resurrects the row).
+/// one row per key is chosen in a single order-preserving pass, with only the
+/// TRAILING run held back — the only one that can continue into the next batch.
+/// Ties keep the first row; tombstones are retained.
 pub(crate) struct RunCollapse {
     keys: datafusion::arrow::row::RowConverter,
     tiebreak: Option<(usize, datafusion::arrow::row::RowConverter)>,
@@ -2346,7 +1975,7 @@ pub(crate) struct RunCollapse {
     /// The winning row of the run still in flight, as its own compact batch.
     carry: Option<(RecordBatch, Vec<u8>, Option<Vec<u8>>)>,
     /// Immutable-column audit: the columns to compare, and the run state that
-    /// carries across batches with `carry`. See `with_immutable_audit`.
+    /// carries across batches with `carry`.
     audit: Option<(Vec<usize>, datafusion::arrow::row::RowConverter)>,
     run_immutable: Option<Vec<u8>>,
     run_disagreed: bool,
@@ -2373,21 +2002,10 @@ impl RunCollapse {
     }
 
     /// Audit immutable columns while collapsing, instead of with a separate
-    /// `GROUP BY` aggregate.
-    ///
-    /// The collapse already has every version of a key adjacent, so a run
-    /// disagrees exactly when some row's immutable tuple differs from the run's
-    /// first — one row-encoding compare, O(1) state, riding a stream that
-    /// already exists. The SQL form it replaces built ~600 accumulators
-    /// (`MIN`/`MAX`/`COUNT` over ~150 columns) keyed by dedup key, and on prod
-    /// whale shards it could not fit its slot of the 5 GB `FairSpillPool` — so
-    /// the audit failed on exactly the shards that most needed it, while its
-    /// slot also shrank the rewrite's own.
-    ///
-    /// The row encoding distinguishes NULL from any value, so this catches both
-    /// disagreement shapes — two different non-null values, and the enrichment
-    /// shape where a field is absent on first emit and filled on a retry — with
-    /// no separate null-transition term.
+    /// `GROUP BY` aggregate: a run disagrees exactly when some row's immutable
+    /// tuple differs from the run's first, in O(1) state per run. The row
+    /// encoding distinguishes NULL from any value, so both shapes are caught —
+    /// two differing non-null values, and a field absent then later filled.
     pub(crate) fn with_immutable_audit(mut self, schema: &arrow_schema::Schema, columns: &[String]) -> Result<Self> {
         let idxs = columns.iter().filter_map(|name| schema.index_of(name).ok()).collect::<Vec<_>>();
         if idxs.is_empty() {
@@ -2404,7 +2022,7 @@ impl RunCollapse {
     }
 
     /// Whether the immutable audit is armed — `disagreements()` is only a clean
-    /// bill of health when this is true. See `immutable_audit_shards_total`.
+    /// bill of health when this is true.
     pub(crate) fn is_auditing(&self) -> bool {
         self.audit.is_some()
     }
@@ -2492,8 +2110,8 @@ impl RunCollapse {
 #[cfg(test)]
 mod immutable_audit_tests {
     use datafusion::arrow::{
-        array::{BooleanArray, Int64Array, StringArray, TimestampMicrosecondArray},
-        datatypes::{DataType, Field, Schema, TimeUnit},
+        array::{ArrayRef, BooleanArray, Int64Array, StringArray, TimestampMicrosecondArray},
+        datatypes::{DataType, Field, Schema},
     };
     use test_case::test_case;
 
@@ -2503,6 +2121,12 @@ mod immutable_audit_tests {
         crate::schema::get_schema("otel_logs_and_spans").expect("the real shipped schema")
     }
 
+    /// A batch from `(column, array)` pairs — every column nullable, as the
+    /// real rewrite output is. The fixtures below differ only in their columns.
+    fn batch_of(columns: Vec<(&str, ArrayRef)>) -> RecordBatch {
+        RecordBatch::try_from_iter_with_nullable(columns.into_iter().map(|(name, array)| (name, array, true))).expect("batch")
+    }
+
     /// The audit query over the real shipped schema — the shape every
     /// SQL-form assertion below is about.
     fn audit_sql() -> String {
@@ -2510,9 +2134,7 @@ mod immutable_audit_tests {
     }
 
     /// Trim the real schema to `keep`, declare every kept column immutable and
-    /// key it by `id`, then run the audit over `batch`. Returns the count WITH
-    /// the SQL, because a wrong count is only diagnosable next to the query
-    /// that produced it.
+    /// key it by `id`, then run the audit over `batch`. Returns `(count, sql)`.
     async fn audit_count(keep: &[&str], batch: RecordBatch) -> (i64, String) {
         let mut schema = logs_schema().clone();
         schema.fields.retain(|field| keep.contains(&field.name.as_str()));
@@ -2529,12 +2151,9 @@ mod immutable_audit_tests {
         (count, sql)
     }
 
-    /// `MIN`/`MAX` ignore nulls, so on their own they cannot see the shape
-    /// enrichment actually produces: a column absent on the first emit and
-    /// filled on the retry. The null-transition term is what makes the audit
-    /// answer the question it was written for, and it must be TWO-SIDED — a
-    /// group whose column is null in every version agrees perfectly and must not
-    /// be counted.
+    /// `MIN`/`MAX` ignore nulls, so the audit needs a null-transition term to
+    /// see a column absent on first emit and filled on retry — and it must be
+    /// two-sided, since a column null in every version agrees.
     #[test]
     fn the_audit_catches_a_null_to_value_transition_not_just_differing_values() {
         let sql = audit_sql();
@@ -2545,10 +2164,8 @@ mod immutable_audit_tests {
         );
     }
 
-    /// The grouping columns cannot disagree with themselves, and the tiebreak
-    /// and tombstone vary across versions BY CONSTRUCTION — auditing them would
-    /// report every duplicated key in the table as a violation, which is the
-    /// most expensive kind of false alarm: one that is always firing.
+    /// The grouping columns, tiebreak and tombstone vary across versions by
+    /// construction; auditing them would flag every duplicated key.
     #[test]
     fn the_audit_skips_columns_that_vary_by_construction() {
         let schema = logs_schema();
@@ -2576,38 +2193,23 @@ mod immutable_audit_tests {
         assert!(Database::immutable_audit_sql(&schema, "scan", "true").is_none(), "all-mutable schema has nothing to audit");
     }
 
-    /// The assertions above check the SQL's SHAPE. This one runs it, because a
-    /// query that mentions the right aggregates and still does not execute — or
-    /// executes and counts the wrong groups — reports a comfortable zero, and a
-    /// zero from this audit is exactly what would be taken as "the hazard is not
-    /// real".
+    /// The assertions above check the SQL's shape; this one runs it, since a
+    /// query that plans but counts the wrong groups reports a misleading zero.
     #[tokio::test]
     async fn the_audit_query_actually_counts_disagreeing_keys() {
-        let arrow = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, true), Field::new("level", DataType::Utf8, true)]));
-        let batch = RecordBatch::try_new(
-            arrow,
-            vec![
-                //                 differing values   null -> value      agrees      all null
-                Arc::new(StringArray::from(vec!["a", "a", "b", "b", "c", "c", "d", "d"])),
-                Arc::new(StringArray::from(vec![Some("info"), Some("error"), None, Some("error"), Some("info"), Some("info"), None, None])),
-            ],
-        )
-        .expect("batch");
+        //                             differing values   null -> value      agrees      all null
+        let batch = batch_of(vec![
+            ("id", Arc::new(StringArray::from(vec!["a", "a", "b", "b", "c", "c", "d", "d"])) as ArrayRef),
+            ("level", Arc::new(StringArray::from(vec![Some("info"), Some("error"), None, Some("error"), Some("info"), Some("info"), None, None])) as ArrayRef),
+        ]);
 
         let (count, sql) = audit_count(&["id", "level"], batch).await;
         assert_eq!(count, 2, "`a` differs outright and `b` goes null -> error; `c` agrees and `d` is null throughout ({sql})");
     }
 
-    /// THE PERFORMANCE PROPERTY, pinned so it cannot regress silently.
-    ///
-    /// `COUNT(DISTINCT c)` keeps a per-group HASH SET per column, and this
-    /// schema audits ~150 columns — so the old formulation built ~150 hash sets
-    /// for every dedup key in the shard. Prod 2026-09-03 measured the
-    /// `GroupedHashAggregateStream` carrying them at **141 MB peak**, a top
-    /// consumer inside a `fair(pool_size: 5.0 GB)` exhaustion of the heavy
-    /// share — the same pool the dedup rewrite's own sort draws on.
-    ///
-    /// `MIN`/`MAX` answer the identical question with O(1) state per group.
+    /// `COUNT(DISTINCT c)` keeps a per-group hash set per column, and this
+    /// schema audits ~150 columns; `MIN`/`MAX` answer the same question with
+    /// O(1) state per group.
     #[test]
     fn the_audit_uses_no_distinct_accumulators() {
         let sql = audit_sql();
@@ -2616,40 +2218,26 @@ mod immutable_audit_tests {
         assert!(audited > 50, "the real schema audits many columns, or this test proves nothing: {audited}");
     }
 
-    /// `MIN`/`MAX` must PLAN for every non-composite type the audit admits, not
-    /// just the strings the truth-table test uses. A type DataFusion cannot
-    /// order would make the audit query error at plan time — and the call site
-    /// swallows that into `warn!`, so the audit would go silently dead while
-    /// still looking present in the SQL.
+    /// `MIN`/`MAX` must PLAN for every non-composite type the audit admits: a
+    /// plan-time error is swallowed into `warn!` at the call site, so the audit
+    /// would go silently dead while still looking present in the SQL.
     #[tokio::test]
     async fn the_audit_plans_for_non_string_types() {
         // A bool, an int and a timestamp alongside the key.
         let kept = ["id", "context___is_remote", "message_size_bytes", "observed_timestamp"];
-        let arrow = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Utf8, true),
-            Field::new("context___is_remote", DataType::Boolean, true),
-            Field::new("message_size_bytes", DataType::Int64, true),
-            Field::new("observed_timestamp", DataType::Timestamp(TimeUnit::Microsecond, None), true),
-        ]));
-        let batch = RecordBatch::try_new(
-            arrow,
-            vec![
-                Arc::new(StringArray::from(vec!["a", "a", "b", "b"])),
-                Arc::new(BooleanArray::from(vec![Some(true), Some(false), Some(true), Some(true)])),
-                Arc::new(Int64Array::from(vec![Some(1), Some(1), Some(2), Some(2)])),
-                Arc::new(TimestampMicrosecondArray::from(vec![Some(10), Some(10), Some(20), Some(20)])),
-            ],
-        )
-        .expect("batch");
+        let batch = batch_of(vec![
+            ("id", Arc::new(StringArray::from(vec!["a", "a", "b", "b"])) as ArrayRef),
+            ("context___is_remote", Arc::new(BooleanArray::from(vec![Some(true), Some(false), Some(true), Some(true)])) as ArrayRef),
+            ("message_size_bytes", Arc::new(Int64Array::from(vec![Some(1), Some(1), Some(2), Some(2)])) as ArrayRef),
+            ("observed_timestamp", Arc::new(TimestampMicrosecondArray::from(vec![Some(10), Some(10), Some(20), Some(20)])) as ArrayRef),
+        ]);
 
         let (count, sql) = audit_count(&kept, batch).await;
         assert_eq!(count, 1, "only `a` disagrees, on the boolean ({sql})");
     }
 
-    /// The whole streaming-collapse rewrite rests on this one property, and it
-    /// lives in a YAML file anyone can reorder. `service` sat BETWEEN the dedup
-    /// keys until 2026-09-02, which is exactly the arrangement that forces the
-    /// two-sort window plan.
+    /// The streaming-collapse rewrite rests on this property, and it lives in a
+    /// YAML file anyone can reorder.
     #[test]
     fn the_shipped_dedup_keys_lead_the_shipped_sort() {
         assert!(dedup_keys_lead_the_sort(logs_schema()), "otel dedup keys must be the leading sorting_columns, or the rewrite silently reverts to the window");
@@ -2658,12 +2246,10 @@ mod immutable_audit_tests {
         assert!(!dedup_keys_lead_the_sort(&misaligned), "keys with `service` wedged between them are NOT a prefix");
     }
 
-    /// The differential gate on a path that DELETES rows: the one-pass collapse
-    /// must agree with the `ROW_NUMBER()` window it replaces, row for row and in
-    /// order, on data built to break it — several versions per key, a tombstone,
-    /// a NULL service, a NULL tiebreak, tied tiebreaks, and (via `batch_size 1`)
-    /// every run straddling a batch boundary, which is the case the carried
-    /// trailing run exists for.
+    /// The one-pass collapse must agree with the `ROW_NUMBER()` window it
+    /// replaces, row for row and in order, on data built to break it — several
+    /// versions per key, a tombstone, NULL service, NULL and tied tiebreaks, and
+    /// (via `batch_size 1`) every run straddling a batch boundary.
     #[tokio::test]
     async fn the_streaming_collapse_agrees_with_the_window_it_replaces() {
         let mut schema = logs_schema().clone();
@@ -2672,14 +2258,6 @@ mod immutable_audit_tests {
         schema.sorting_columns.retain(|column| kept.contains(&column.name.as_str()));
         assert!(dedup_keys_lead_the_sort(&schema), "the trimmed schema keeps the property under test");
 
-        let ts = DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
-        let arrow = Arc::new(Schema::new(vec![
-            Field::new("timestamp", ts.clone(), true),
-            Field::new("resource___service___name", DataType::Utf8, true),
-            Field::new("id", DataType::Utf8, true),
-            Field::new("level", DataType::Utf8, true),
-            Field::new("updated_at", ts, true),
-        ]));
         //         ts   service      id    level     updated_at
         let rows = [
             (10, Some("api"), "a", "info", Some(1)), // three versions of one key,
@@ -2691,17 +2269,13 @@ mod immutable_audit_tests {
             (20, None, "c", "info", Some(1)),        // ...and ties keep one row
             (30, Some("api"), "d", "info", Some(5)), // tombstone-shaped: retained either way
         ];
-        let batch = RecordBatch::try_new(
-            arrow,
-            vec![
-                Arc::new(TimestampMicrosecondArray::from(rows.iter().map(|r| r.0).collect::<Vec<_>>()).with_timezone("UTC")),
-                Arc::new(StringArray::from(rows.iter().map(|r| r.1).collect::<Vec<_>>())),
-                Arc::new(StringArray::from(rows.iter().map(|r| r.2).collect::<Vec<_>>())),
-                Arc::new(StringArray::from(rows.iter().map(|r| r.3).collect::<Vec<_>>())),
-                Arc::new(TimestampMicrosecondArray::from(rows.iter().map(|r| r.4).collect::<Vec<_>>()).with_timezone("UTC")),
-            ],
-        )
-        .expect("batch");
+        let batch = batch_of(vec![
+            ("timestamp", Arc::new(TimestampMicrosecondArray::from(rows.iter().map(|r| r.0).collect::<Vec<_>>()).with_timezone("UTC")) as ArrayRef),
+            ("resource___service___name", Arc::new(StringArray::from(rows.iter().map(|r| r.1).collect::<Vec<_>>())) as ArrayRef),
+            ("id", Arc::new(StringArray::from(rows.iter().map(|r| r.2).collect::<Vec<_>>())) as ArrayRef),
+            ("level", Arc::new(StringArray::from(rows.iter().map(|r| r.3).collect::<Vec<_>>())) as ArrayRef),
+            ("updated_at", Arc::new(TimestampMicrosecondArray::from(rows.iter().map(|r| r.4).collect::<Vec<_>>()).with_timezone("UTC")) as ArrayRef),
+        ]);
 
         let columns = schema.fields.iter().map(|field| crate::rollup::quoted(&field.name)).join(", ");
         let keys = quoted_csv(&schema.dedup_keys);
@@ -2770,16 +2344,11 @@ mod immutable_audit_tests {
         collapse.disagreements()
     }
 
-    /// The streaming audit replaces a `GROUP BY` aggregate that could not fit
-    /// its slot of the heavy pool on whale shards. It must count a dedup key
-    /// ONCE when its versions disagree on an immutable column, across both
-    /// disagreement shapes, and with `batch_size 1` every run straddles a batch
-    /// boundary — the carry path, which is where a per-run flag can double-count
-    /// or reset.
-    ///
-    /// The last case is `a_collapse_without_the_audit_counts_nothing`: a collapse
-    /// with no audit configured must not count anything — the audit is opt-in,
-    /// and the non-streaming path still uses the SQL form.
+    /// The streaming audit must count a dedup key ONCE when its versions
+    /// disagree on an immutable column, across both disagreement shapes, and
+    /// with every run straddling a batch boundary (the carry path, where a
+    /// per-run flag can double-count or reset). The last case pins that an
+    /// un-armed collapse counts nothing — the audit is opt-in.
     #[test_case(&[(10, "a", Some("info")), (10, "a", Some("warn"))], true => 1 ; "two different non-null values")]
     #[test_case(&[(10, "a", None), (10, "a", Some("info"))], true => 1 ; "enrichment: absent then filled")]
     #[test_case(&[(10, "a", Some("info")), (10, "a", Some("info"))], true => 0 ; "versions that agree")]
@@ -2789,23 +2358,20 @@ mod immutable_audit_tests {
     #[test_case(&[(10, "a", Some("x")), (10, "a", Some("y")), (20, "b", Some("p")), (20, "b", Some("q"))], true => 2 ; "two disagreeing keys count separately")]
     #[test_case(&[(10, "a", Some("info")), (10, "a", Some("warn"))], false => 0 ; "a collapse without the audit counts nothing")]
     fn the_collapse_audit_counts_disagreeing_keys(rows: &[(i64, &str, Option<&str>)], audited: bool) -> u64 {
-        // One row per batch, so every run is carried across a boundary. The
-        // run state lives on the collapse, not on the batch, so the whole-batch
-        // form — the only one that closes a run INSIDE `push` — must agree.
+        // One row per batch, so every run is carried across a boundary; the
+        // whole-batch form (which closes runs inside `push`) must agree.
         let carried = collapse_disagreements(rows, audited, 1);
         assert_eq!(collapse_disagreements(rows, audited, rows.len()), carried, "the count cannot depend on batch boundaries: {rows:?}");
         carried
     }
 
     /// The streaming audit arms by resolving column NAMES against the rewrite's
-    /// output schema, and disarms silently when none resolve. That is the seam:
-    /// a rename would leave `immutable_column_disagreement_total` reading zero
-    /// for the wrong reason. Pin it against the real shipped schema.
+    /// output schema and disarms silently when none resolve, so a rename would
+    /// leave the counter reading zero for the wrong reason.
     #[test]
     fn the_streaming_audit_arms_against_the_real_rewrite_schema() {
         let schema = logs_schema();
-        // The rewrite selects every schema field, so this is the shape
-        // `plan.schema()` has at the call site.
+        // The rewrite selects every schema field, so this is `plan.schema()`.
         let arrow = Schema::new(schema.fields.iter().map(|field| Field::new(&field.name, DataType::Utf8, true)).collect::<Vec<_>>());
         let columns = Database::immutable_audit_columns(schema);
         let collapse = RunCollapse::new(&arrow, &schema.dedup_keys, schema.dedup_tiebreak.as_deref())

@@ -1,16 +1,14 @@
-//! Reproduces monoscope's hash-enrichment flow: write a span with empty `hashes`,
-//! then almost immediately `UPDATE ... FROM (unnest) ... SET hashes = COALESCE(hashes,'{}') || ARRAY[tag]`
-//! joined on (span_id, trace_id), and query with `hashes && ARRAY[tag]` (array overlap).
-//! Exercises it both while the row is still in the MemBuffer and after it has flushed
-//! to Delta (where the update lands as a merge-on-read deletion-vector rewrite).
+//! Hash-enrichment flow: insert a span with empty `hashes`, append a tag via
+//! `UPDATE ... FROM (unnest) ...` joined on (span_id, trace_id), and query with
+//! `hashes && ARRAY[tag]` — both in the MemBuffer and after flushing to Delta
+//! (where the update lands as a merge-on-read deletion-vector rewrite).
 
 use std::time::Duration;
 
 use super::harness::{E2eEnv, FROZEN_START_MICROS};
 
-/// Every test here runs the prod merge-on-read DV path with the 60s buckets the
-/// enrichment flow assumes. `coalesce_secs > 0` defers the Delta leg to the DML
-/// coalescer (prod runs 60); `prune` is the join-key bloom filter.
+/// Merge-on-read DV path with 60s buckets. `coalesce_secs > 0` defers the Delta
+/// leg to the DML coalescer; `prune` is the join-key bloom filter.
 async fn env_with(prune: bool, coalesce_secs: u64) -> anyhow::Result<E2eEnv> {
     E2eEnv::builder()
         .with_deletion_vectors()
@@ -24,14 +22,6 @@ async fn env_with(prune: bool, coalesce_secs: u64) -> anyhow::Result<E2eEnv> {
 /// Synchronous DML (coalesce=0), key-prune on — the default for these tests.
 async fn dv_env() -> anyhow::Result<E2eEnv> {
     env_with(true, 0).await
-}
-
-/// Push every buffered row out of the MemBuffer so a following enrichment MUST
-/// hit the Delta merge scan (DV rewrite) rather than the mem leg.
-async fn flush_and_evict(env: &E2eEnv) -> anyhow::Result<()> {
-    env.force_flush().await?;
-    env.force_evict().await?;
-    Ok(())
 }
 
 fn ts(micros: i64) -> String {
@@ -51,9 +41,7 @@ async fn insert_span(client: &tokio_postgres::Client, id: &str, span: &str, trac
     Ok(())
 }
 
-/// Insert one round's baseline rows in a single pgwire statement. The race
-/// regression below needs a non-trivial Delta file, not hundreds of network
-/// round trips to construct it.
+/// Insert one round's baseline rows in a single pgwire statement.
 async fn insert_span_batch(client: &tokio_postgres::Client, round: usize, rows: usize, ts: i64) -> anyhow::Result<(Vec<String>, Vec<String>)> {
     let dt = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(ts).unwrap();
     let ids = (0..rows).map(|i| format!("base-{round}-{i}")).collect::<Vec<_>>();
@@ -71,9 +59,8 @@ async fn insert_span_batch(client: &tokio_postgres::Client, round: usize, rows: 
     Ok((spans, traces))
 }
 
-/// The enrichment UPDATE-2 skeleton from monoscope BackgroundJobs.hs. `set_tag`
-/// is the appended-tag expression, `source` the FROM subquery body, and `bounds`
-/// the `timestamp >= lo AND timestamp < hi` predicate monoscope always sends.
+/// Enrichment UPDATE skeleton. `set_tag` is the appended-tag expression, `source`
+/// the FROM subquery body, `bounds` the optional `timestamp >= lo AND < hi` predicate.
 fn enrich_sql(set_tag: &str, source: &str, bounds: Option<(i64, i64)>) -> String {
     let bounded = bounds.map_or(String::new(), |(lo, hi)| format!(" AND o.timestamp >= '{}' AND o.timestamp < '{}'", ts(lo), ts(hi)));
     format!(
@@ -87,8 +74,7 @@ fn enrich_sql(set_tag: &str, source: &str, bounds: Option<(i64, i64)>) -> String
     )
 }
 
-/// Flat inlined `unnest(ARRAY[...])` source — the shape that does NOT trigger
-/// the prod projection crash (see `enrich_prod_shape`).
+/// Flat inlined `unnest(ARRAY[...])` source.
 fn inline_source(spans: &[&str], traces: &[&str], tags: &[&str]) -> String {
     let arr = |xs: &[&str]| xs.iter().map(|x| format!("'{x}'")).collect::<Vec<_>>().join(",");
     format!(
@@ -99,35 +85,28 @@ fn inline_source(spans: &[&str], traces: &[&str], tags: &[&str]) -> String {
     )
 }
 
-/// The exact enrichment UPDATE-2 shape from monoscope BackgroundJobs.hs: one
-/// key, the tag a literal in the SET.
+/// Enrichment of one key, with the tag a literal in the SET.
 async fn enrich(client: &tokio_postgres::Client, span: &str, trace: &str, tag: &str) -> anyhow::Result<u64> {
     Ok(client.execute(&enrich_sql(&format!("'{tag}'"), &inline_source(&[span], &[trace], &[tag]), None), &[]).await?)
 }
 
-/// Enrichment where one batch carries the SAME (span,trace) key twice with
-/// different tags — the prod "MERGE matched a target row against multiple source
-/// rows" shape. Both tags must be applied (append-accumulate), so the merge must
-/// split same-key rows into successive rounds, not dedup them.
+/// Enrichment where one batch carries the SAME (span,trace) key with different
+/// tags. All tags must be applied, so the merge must split same-key rows into
+/// successive rounds rather than dedup them.
 async fn enrich_multi(client: &tokio_postgres::Client, span: &str, trace: &str, tags: &[&str]) -> anyhow::Result<u64> {
     let (spans, traces) = (vec![span; tags.len()], vec![trace; tags.len()]);
     Ok(client.execute(&enrich_sql("u.tag", &inline_source(&spans, &traces, tags), None), &[]).await?)
 }
 
-/// Exact prod shape: two equi-keys AND `timestamp >= lo AND timestamp < hi`
-/// bounds (monoscope always sends them). Reproduces the prod "No field named
-/// otel_logs_and_spans.context___span_id" schema error if the time bounds change
-/// the merge plan's projection.
+/// Two equi-keys plus `timestamp >= lo AND timestamp < hi` bounds, which can
+/// change the merge plan's projection.
 async fn enrich_bounded(client: &tokio_postgres::Client, span: &str, trace: &str, tag: &str, lo: i64, hi: i64) -> anyhow::Result<u64> {
     Ok(client.execute(&enrich_sql("u.tag", &inline_source(&[span], &[trace], &[tag]), Some((lo, hi))), &[]).await?)
 }
 
-/// The EXACT monoscope prod shape: nested source subquery with `ORDER BY`, and
-/// parameterized `unnest($1::text[])` arrays. The Sort + nested projection change
-/// the join plan so the equi-key equality is retained in the Filter (and thus in
-/// the DV merge's target_predicate) — reproducing the prod "No field named
-/// otel_logs_and_spans.context___span_id" crash + dropped rows. Flat inlined
-/// unnest (see `enrich`) does NOT trigger it.
+/// Nested source subquery with `ORDER BY` and parameterized `unnest($1::text[])`
+/// arrays. The Sort + nested projection retain the equi-key equality in the Filter,
+/// and thus in the DV merge's target_predicate; flat inlined unnest does not.
 async fn enrich_prod_shape(client: &tokio_postgres::Client, spans: &[&str], traces: &[&str], tags: &[&str], lo: i64, hi: i64) -> anyhow::Result<u64> {
     let sql = enrich_sql(
         "u.tag",
@@ -172,9 +151,7 @@ async fn hash_enrichment_queryable_membuffer_and_after_flush() -> anyhow::Result
 
     // Hash predicates must survive projection pushdown (which may drop `hashes`
     // from the scan while the predicate still references it) and, for the
-    // IS NOT NULL case, delta_kernel data-skipping — both reproduced prod
-    // "Predicate references unknown column: hashes", the second breaking every
-    // hash query that includes the null-check.
+    // IS NOT NULL case, delta_kernel data-skipping.
     for (sql, want, what) in [
         (
             "SELECT id, timestamp, hashes FROM otel_logs_and_spans \
@@ -203,9 +180,8 @@ async fn hash_enrichment_queryable_membuffer_and_after_flush() -> anyhow::Result
     Ok(())
 }
 
-/// Repro for the prod "MERGE matched a target row against multiple source rows"
-/// failures: a single enrichment batch with the same (span,trace) key repeated
-/// with distinct tags must apply ALL tags, on both the MemBuffer and DV paths.
+/// A single enrichment batch repeating one (span,trace) key with distinct tags
+/// must apply ALL tags, on both the MemBuffer and DV paths.
 #[serial_test::serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn hash_enrichment_same_key_multiple_tags_applies_all() -> anyhow::Result<()> {
@@ -230,7 +206,7 @@ async fn hash_enrichment_same_key_multiple_tags_applies_all() -> anyhow::Result<
 }
 
 /// Insert `rows` spans (distinct span/trace ids under `prefix`) into one flushed
-/// parquet file. Returns nothing; caller evicts.
+/// parquet file; the caller evicts.
 async fn insert_file(client: &tokio_postgres::Client, env: &E2eEnv, prefix: &str, rows: usize, ts: i64) -> anyhow::Result<()> {
     for r in 0..rows {
         insert_span(client, &format!("{prefix}-{r}"), &format!("{prefix}-span-{r}"), &format!("{prefix}-trace-{r}"), ts).await?;
@@ -239,10 +215,8 @@ async fn insert_file(client: &tokio_postgres::Client, env: &E2eEnv, prefix: &str
     Ok(())
 }
 
-/// #1 LOCAL A/B BENCHMARK (run on demand): enrich one span against many files
-/// with the bloom-prune ON vs OFF and compare merge wall-clock. Proves the
-/// join-key IN-filter actually reduces merge scan work locally — not just in prod.
-/// `cargo test --test e2e --features e2e bench_bloom_prune_ab -- --ignored --nocapture`
+/// On-demand A/B benchmark: enrich one span against many files with bloom-prune
+/// ON vs OFF, asserting the join-key IN-filter reduces merge scan work.
 #[ignore]
 #[serial_test::serial]
 #[tokio::test(flavor = "multi_thread")]
@@ -278,12 +252,9 @@ async fn bench_bloom_prune_ab() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// #1 bloom-prune soundness: the `key IN (source keys)` filter pushed into the DV
-/// merge scan (so parquet bloom filters skip non-matching files) must never drop a
-/// real match. Insert N spans into N separate flushed+evicted files (same
-/// timestamp, so only the join key distinguishes them), enrich several across
-/// different files, and assert every one lands — a false bloom-negative would lose
-/// a tag here.
+/// Bloom-prune soundness: the `key IN (source keys)` filter pushed into the DV
+/// merge scan must never drop a real match. N spans live in N separate files with
+/// identical timestamps, so only the join key distinguishes them.
 #[serial_test::serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn hash_enrichment_bloom_prune_never_drops_a_match() -> anyhow::Result<()> {
@@ -299,8 +270,6 @@ async fn hash_enrichment_bloom_prune_never_drops_a_match() -> anyhow::Result<()>
     env.advance(Duration::from_secs(600));
     env.force_evict().await?;
 
-    // Enrich spans in several different files; each must be found despite the
-    // bloom-prune IN-filter narrowing the scan.
     const ENRICHED: [usize; 4] = [3, 6, 0, 7];
     for i in ENRICHED {
         let tag = format!("P{i}");
@@ -314,13 +283,9 @@ async fn hash_enrichment_bloom_prune_never_drops_a_match() -> anyhow::Result<()>
     Ok(())
 }
 
-/// Coverage of the exact monoscope prod shape (nested source subquery with
-/// ORDER BY + parameterized unnest arrays) on the DV path. NOTE: this does NOT
-/// reproduce the prod "No field named ...context___span_id" crash — it passes
-/// even with strip_source_conjuncts reverted, so the real trigger is some prod
-/// condition not captured locally (verified 2026-07-19). Kept as happy-path
-/// coverage of the prod SQL shape; the strip fix is covered by strip_tests +
-/// confirmed in prod (errors 8/10min → 0 on 73a9d3d).
+/// Happy-path coverage of the nested-ORDER-BY-source shape on the DV path.
+/// It passes with `strip_source_conjuncts` reverted, so it is NOT a guard for
+/// that fix — `strip_tests` covers it.
 #[serial_test::serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn hash_enrichment_prod_shape_ordered_subquery_dv_path() -> anyhow::Result<()> {
@@ -342,8 +307,7 @@ async fn hash_enrichment_prod_shape_ordered_subquery_dv_path() -> anyhow::Result
     Ok(())
 }
 
-/// Repro attempt for the prod "No field named otel_logs_and_spans.context___span_id"
-/// schema error — exact prod shape with `timestamp` bounds, on the DV path.
+/// Enrichment with `timestamp` bounds on the DV path.
 #[serial_test::serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn hash_enrichment_bounded_timestamp_dv_path() -> anyhow::Result<()> {
@@ -360,14 +324,9 @@ async fn hash_enrichment_bounded_timestamp_dv_path() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// PROD REPRO (2026-07-20): with the coalescer ON (prod runs
-/// TIMEFUSION_DML_COALESCE_SECS=60), the deferred Delta-leg merge for an
-/// already-flushed row DROPS after 3 retries with
-/// "No field named otel_logs_and_spans.context___span_id" — so flushed rows
-/// never get their enrichment hashes, breaking anomaly-alert matching. Every
-/// other hash_enrichment test runs the sync path (coalesce=0) and passes; this
-/// one exercises the untested coalescer drain path. Must end with the hash
-/// present.
+/// With the coalescer ON, the deferred Delta-leg merge for an already-flushed row
+/// must apply the enrichment. Every other test here runs the sync path
+/// (coalesce=0); this one covers the coalescer drain path.
 #[serial_test::serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn coalesced_enrichment_of_flushed_row_is_not_dropped() -> anyhow::Result<()> {
@@ -377,15 +336,12 @@ async fn coalesced_enrichment_of_flushed_row_is_not_dropped() -> anyhow::Result<
     // Row lands in Delta and is evicted from the MemBuffer, so only the deferred
     // Delta leg can apply the enrichment (the mem leg no-ops).
     insert_span(&client, "c-1", "span-c", "trace-c", FROZEN_START_MICROS).await?;
-    flush_and_evict(&env).await?;
+    env.flush_and_evict().await?;
 
-    // Enrich with the EXACT prod shape (nested ORDER BY source), routed through
-    // the coalescer: mem leg no-ops (row evicted), Delta leg deferred.
     let lo = FROZEN_START_MICROS - 1_000_000;
     let hi = FROZEN_START_MICROS + 60_000_000;
     enrich_prod_shape(&client, &["span-c"], &["trace-c"], &["C1"], lo, hi).await?;
 
-    // Drain the coalescer: this is the exact path that DROPS in prod.
     env.drain_dml_coalescer().await;
 
     assert_eq!(
@@ -396,15 +352,12 @@ async fn coalesced_enrichment_of_flushed_row_is_not_dropped() -> anyhow::Result<
     Ok(())
 }
 
-/// Cross-project fold (2026-07-26 merge storm): same-shape enrichments for N
-/// projects, drained once, must apply every project's tag via ONE folded merge
-/// — one kernel metadata scan + one OCC commit instead of one per project.
-/// COALESCE_MERGES pins the fold; per-project counts pin correctness.
+/// Same-shape enrichments for N projects, drained once, must apply every
+/// project's tag via ONE folded merge (one metadata scan + one OCC commit).
 ///
-/// Subject is `mor_dormant`: once `otel_logs_and_spans` set `version_append` an
-/// enrichment UPDATE there appends a row version instead of going through the
-/// DML coalescer's MERGE, so otel folds ZERO merges and can no longer witness
-/// this. The row-level assertions still passed on otel — only the fold did not.
+/// Subject must be `mor_dormant`: `otel_logs_and_spans` uses `version_append`, so
+/// an enrichment UPDATE there appends a row version instead of going through the
+/// coalescer's MERGE, folding zero merges and making the fold unobservable.
 #[serial_test::serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn coalesced_enrichment_folds_across_projects_into_one_merge() -> anyhow::Result<()> {
@@ -424,13 +377,13 @@ async fn coalesced_enrichment_folds_across_projects_into_one_merge() -> anyhow::
         client.execute(&sql, &[]).await?;
     }
     // Rows must be Delta-only so the enrichment rides the deferred Delta leg.
-    flush_and_evict(&env).await?;
+    env.flush_and_evict().await?;
 
     let merges_before = timefusion::observability::dml_stats().coalesce_merges.load(std::sync::atomic::Ordering::Relaxed);
     let (lo, hi) = (FROZEN_START_MICROS - 1_000_000, FROZEN_START_MICROS + 60_000_000);
     for p in projects {
-        // NOT `enrich_sql`: this shape carries no `NOT (hashes @> ...)` guard, and
-        // which conjuncts reach the DV merge's filter is what the prod crashes here were.
+        // NOT `enrich_sql`: this shape deliberately carries no `NOT (hashes @> ...)`
+        // guard, varying which conjuncts reach the DV merge's filter.
         let (span, trace, tag) = (format!("span-{p}"), format!("trace-{p}"), format!("TAG-{p}"));
         let sql = format!(
             "UPDATE mor_dormant o \
@@ -455,28 +408,16 @@ async fn coalesced_enrichment_folds_across_projects_into_one_merge() -> anyhow::
     Ok(())
 }
 
-/// 2026-07-27 incident reproduction: rows APPENDED WHILE A DV MERGE IS IN
-/// FLIGHT must survive the merge's commit.
+/// Rows appended while a DV merge is in flight must survive the merge's commit.
 ///
-/// `3c9a6aa` made coalesced DV merges commit with
-/// `with_tolerate_concurrent_appends`: instead of aborting when a flush commit
-/// wins the OCC race, the merge rebases over the winning AddFile-only commit.
-/// Its soundness argument is:
-///
-///   "the mem leg runs before every Delta leg, so concurrently flushed rows
-///    already carry post-DML values"
-///
-/// That holds only for rows already in MemBuffer when the mem leg ran. A row
-/// INSERTed after the mem leg and flushed before the merge commits is an
-/// AddFile the merge now tolerates — but the merge's rewritten file set was
-/// computed from a snapshot that predates it. If the rebase reconciles by
-/// replacing state rather than layering onto it, that row is silently removed
-/// from Delta: no error, no DLQ, the producer was already acked. That is
-/// exactly the prod signature — 9 minutes of acked, committed rows absent with
-/// zero failure signal anywhere in the pipeline.
+/// Coalesced DV merges commit with `with_tolerate_concurrent_appends`, rebasing
+/// over a winning AddFile-only commit rather than aborting. A row INSERTed after
+/// the mem leg and flushed before the merge commits is such an AddFile, but the
+/// merge's rewritten file set predates it — a rebase that replaces state instead
+/// of layering onto it silently drops an already-acked row.
 ///
 /// Loops the interleaving: the race window is the merge's metadata scan, so a
-/// single pass can miss it while a handful reliably lands in it.
+/// single pass can miss it.
 #[serial_test::serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn append_during_dv_merge_is_not_dropped() -> anyhow::Result<()> {
@@ -489,10 +430,10 @@ async fn append_during_dv_merge_is_not_dropped() -> anyhow::Result<()> {
     let mut expected = 0usize;
     for round in 0..ROUNDS {
         // (1) Baseline rows, flushed to Delta so the enrichment rides the
-        //     deferred Delta leg (merge-on-read DV rewrite) rather than MemBuffer.
+        //     deferred Delta leg rather than MemBuffer.
         let (spans, traces) = insert_span_batch(&client, round, BASE_ROWS, FROZEN_START_MICROS).await?;
         expected += BASE_ROWS;
-        flush_and_evict(&env).await?;
+        env.flush_and_evict().await?;
 
         // (2) Queue an enrichment for the baseline rows; the coalescer holds the
         //     Delta leg until we drain it.
@@ -528,7 +469,7 @@ async fn append_during_dv_merge_is_not_dropped() -> anyhow::Result<()> {
         drain.await?;
 
         // (4) Nothing may have vanished. Count from Delta only.
-        flush_and_evict(&env).await?;
+        env.flush_and_evict().await?;
         let row = client.query_one("SELECT count(*) FROM otel_logs_and_spans WHERE project_id = 'e2e_project'", &[]).await?;
         let got: i64 = row.get(0);
         assert_eq!(

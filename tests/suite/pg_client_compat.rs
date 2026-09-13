@@ -13,16 +13,47 @@ use tokio::{
 use tokio_postgres::NoTls;
 use uuid::Uuid;
 
-struct TestServer {
-    port: u16,
+/// Connect to a local pgwire server, retrying until `timeout` elapses; the
+/// connection task is spawned, so callers only need the client.
+pub(crate) async fn connect_with_retry(port: u16, timeout: Duration) -> Result<tokio_postgres::Client, tokio_postgres::Error> {
+    let conn_str = format!("host=127.0.0.1 port={port} user=postgres password=postgres");
+    let deadline = tokio::time::Instant::now() + timeout;
+    let (client, connection) = loop {
+        match tokio_postgres::connect(&conn_str, NoTls).await {
+            Ok(pair) => break pair,
+            Err(e) if tokio::time::Instant::now() >= deadline => return Err(e),
+            Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+        }
+    };
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            eprintln!("conn error: {e}");
+        }
+    });
+    Ok(client)
+}
+
+pub(crate) struct TestServer {
+    pub(crate) port: u16,
     shutdown: Arc<Notify>,
 }
 
 impl TestServer {
-    async fn start() -> Result<Self> {
+    pub(crate) async fn start() -> Result<Self> {
+        Self::start_with_tables(&[]).await
+    }
+
+    /// `tables` are pre-created under `test_project` before the server starts,
+    /// so schema failures surface here rather than as a lazy-create error later.
+    pub(crate) async fn start_with_tables(tables: &[&str]) -> Result<Self> {
+        timefusion::support::init_test_logging();
         let id = Uuid::new_v4().to_string();
+        // OS-assigned free port: bind, capture, drop; the re-bind race is harmless.
         let port = std::net::TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
         let db = Arc::new(Database::with_config(minio_test_config(&id, &format!("/tmp/timefusion-{id}"))).await?);
+        for table in tables {
+            db.get_or_create_table("test_project", table).await?;
+        }
         let shutdown = Arc::new(Notify::new());
         let shutdown_clone = Arc::clone(&shutdown);
         let db_clone = Arc::clone(&db);
@@ -48,12 +79,9 @@ impl TestServer {
         anyhow::bail!("pgwire server did not accept connections within 10s")
     }
 
-    async fn client(&self) -> Result<tokio_postgres::Client> {
-        let (client, connection) = tokio_postgres::connect(&format!("host=127.0.0.1 port={} user=postgres password=postgres", self.port), NoTls).await?;
-        tokio::spawn(async move {
-            let _ = connection.await;
-        });
-        Ok(client)
+    /// The server accepts TCP before it can authenticate, so this retries.
+    pub(crate) async fn client(&self) -> Result<tokio_postgres::Client> {
+        connect_with_retry(self.port, Duration::from_secs(10)).await.context("pgwire server did not accept connections within 10s")
     }
 }
 
@@ -108,14 +136,10 @@ async fn catalog_query_does_not_create_a_routing_scan() -> Result<()> {
     Ok(())
 }
 
-/// pgAdmin's connect-time role probe, with the bound parameter it really sends.
-///
-/// The query is unplannable — `ARRAY(WITH RECURSIVE ...)` hits both DataFusion's
-/// missing array-subquery constructor and a recursive-CTE planning bug — so
-/// `PgCompatibilityHook` answers it instead. This covers what the .slt case
-/// cannot: the extended protocol with a parameter bound, where the hook's plan
-/// declares no placeholders. Booleans must arrive as real bools, not the
-/// strings "t"/"f", because pgAdmin treats any non-empty string as true.
+/// pgAdmin's connect-time role probe: unplannable SQL answered by
+/// `PgCompatibilityHook` over the extended protocol with a parameter bound,
+/// where the hook's plan declares no placeholders. Booleans must arrive as real
+/// bools, not "t"/"f" strings — pgAdmin treats any non-empty string as true.
 #[tokio::test(flavor = "multi_thread")]
 async fn pgadmin_role_probe_answers_with_a_bound_parameter() -> Result<()> {
     let server = TestServer::start().await?;
@@ -163,10 +187,9 @@ async fn simple_query_charts(sql: &str) -> Result<Vec<String>> {
     Ok(charts)
 }
 
-/// pgAdmin's dashboard polls this every 5s over the SIMPLE protocol, so it must
-/// work there and not only via the extended path the .slt harness exercises.
-/// `row_to_json(t)` names a whole row, which DataFusion rejects during SQL
-/// planning; RowToJsonRecordRewriter turns it into named_struct first.
+/// `row_to_json(t)` names a whole row, which DataFusion rejects during planning;
+/// RowToJsonRecordRewriter turns it into named_struct. Pins the SIMPLE protocol,
+/// which the .slt harness does not exercise.
 #[tokio::test(flavor = "multi_thread")]
 async fn pgadmin_dashboard_row_to_json_over_simple_protocol() -> Result<()> {
     let charts = simple_query_charts(
@@ -179,10 +202,8 @@ async fn pgadmin_dashboard_row_to_json_over_simple_protocol() -> Result<()> {
     Ok(())
 }
 
-/// pgAdmin sends one branch per chart, UNION ALL, with capitalised quoted
-/// aliases. The first fix matched only `query.body == Select`, so every branch
-/// of the real query was skipped and prod still logged
-/// `No field named t. Valid fields are t."Total", t."Active", t."Idle"`.
+/// The row_to_json rewrite must reach every UNION ALL branch, not just a
+/// top-level Select, and must survive capitalised quoted aliases.
 #[tokio::test(flavor = "multi_thread")]
 async fn pgadmin_dashboard_rewrites_every_union_branch() -> Result<()> {
     let charts = simple_query_charts(

@@ -4,8 +4,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, ensure};
 use arrow::{
-    array::BooleanBufferBuilder,
-    array::{Array, ArrayRef, BooleanArray, UInt32Array, UInt64Array},
+    array::{Array, ArrayRef, BooleanArray, BooleanBufferBuilder, UInt32Array, UInt64Array},
     buffer::BooleanBuffer,
     compute::filter_record_batch,
     datatypes::{DataType, Field, Schema},
@@ -18,7 +17,6 @@ use datafusion::{
 };
 use itertools::Itertools;
 
-/// `None` on overflow, so each caller keeps its own context message.
 fn total_rows(batches: &[RecordBatch]) -> Option<usize> {
     batches.iter().try_fold(0_usize, |sum, batch| sum.checked_add(batch.num_rows()))
 }
@@ -36,9 +34,8 @@ fn masked_rows(batches: &[RecordBatch], live: &BooleanBuffer) -> Result<usize> {
     Ok(rows)
 }
 
-/// Exact daily count derived from complete Delta winner resolution. File names
-/// alone are insufficient: a same-path deletion-vector update changes the proof.
-/// Keeping this small result in the manifest avoids retaining every event key.
+/// Exact daily count derived from complete Delta winner resolution. File names alone
+/// are insufficient: a same-path deletion-vector update changes the proof.
 #[serde_with::serde_as]
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct PartitionCountProof {
@@ -75,15 +72,15 @@ impl PartitionCountProof {
         })
     }
 
-    /// Rebuilding the proof is the whole check: any field `new` derives from the
-    /// captured view — including `version` — must still match what was recorded.
+    /// Rebuilding the proof is the whole check: every field `new` derives from the
+    /// captured view — `version` included — must still match what was recorded.
     pub fn matches(&self, root: &url::Url, files: &crate::read::CountFiles, table: &crate::schema::TableSchema) -> bool {
         Self::new(root.clone(), files.clone(), table, self.logical_count).is_ok_and(|current| current == *self)
     }
 }
 
-/// Resolves an index source URI against the captured table root.
-/// Absolute URIs outside this store or table cannot establish coverage.
+/// Resolves an index source URI against the captured table root; `None` when the URI
+/// is outside this store or table.
 pub fn relative_source_path(root: &url::Url, source: &str) -> Result<Option<String>> {
     use object_store::path::Path;
     if !source.contains("://") {
@@ -91,12 +88,9 @@ pub fn relative_source_path(root: &url::Url, source: &str) -> Result<Option<Stri
         return Ok(Some(Path::parse(source)?.to_string()));
     }
     let source = url::Url::parse(source)?;
-    let differs = source.scheme() != root.scheme()
-        || source.host_str() != root.host_str()
-        || source.port() != root.port()
-        || source.username() != root.username()
-        || source.password() != root.password();
-    if differs || source.query().is_some() || source.fragment().is_some() {
+    let same_store = (source.scheme(), source.host_str(), source.port(), source.username(), source.password())
+        == (root.scheme(), root.host_str(), root.port(), root.username(), root.password());
+    if !same_store || source.query().is_some() || source.fragment().is_some() {
         return Ok(None);
     }
     let path = Path::from_url_path(source.path())?;
@@ -114,8 +108,7 @@ pub struct SnapshotFile {
 }
 
 impl SnapshotFile {
-    /// Captures public file metadata without depending on deprecated Add conversion.
-    /// Refuses a narrowed file view that omits any table partition column.
+    /// Errors if the file view omits any of `partition_columns`.
     pub fn capture(file: &deltalake::kernel::LogicalFileView, partition_columns: &[String]) -> Result<Self> {
         let partition_values: std::collections::HashMap<_, _> = file
             .partition_values()
@@ -134,9 +127,8 @@ impl SnapshotFile {
 }
 
 /// Physical batches from one file or memory snapshot, in source row order.
-/// `live` identifies rows eligible for subsequent version resolution. It starts
-/// with deletion-vector visibility and can also exclude superseded Delta versions
-/// or rows replaced by memory authority ranges.
+/// `live` marks rows eligible for version resolution: deletion-vector visibility,
+/// minus superseded versions and rows replaced by memory authority ranges.
 #[derive(Clone, Debug)]
 pub struct SourceRows {
     pub batches: Vec<RecordBatch>,
@@ -144,8 +136,8 @@ pub struct SourceRows {
 }
 
 impl SourceRows {
-    /// Excludes Delta rows replaced by the captured memory authority ranges.
-    /// This preserves physical ordinals and existing deletion-vector exclusions.
+    /// Excludes rows replaced by the memory authority `ranges`, preserving physical
+    /// ordinals and existing deletion-vector exclusions.
     pub fn exclude_memory_ranges(&mut self, timestamp: &str, ranges: &[(i64, i64)]) -> Result<()> {
         if ranges.is_empty() {
             return Ok(());
@@ -174,14 +166,12 @@ impl SourceRows {
 }
 
 /// Captured sources and their winning physical rows, with memory last.
-/// The batches remain available for fallback without reading a newer snapshot.
 pub struct ResolvedSnapshot {
     pub sources: Vec<SourceRows>,
     pub winners: Vec<BooleanBuffer>,
 }
 
 /// Resolves one project's pinned Delta sources and its captured memory overlay.
-/// Exclusions run before deduplication, including ranges emptied by memory DML.
 /// The caller must capture memory before Delta and include complete key groups.
 pub async fn resolve_with_memory(
     mut delta: Vec<SourceRows>, memory: crate::write::mem_buffer::MemSnapshot, keys: &[String], tiebreak: Option<&str>, tombstone: Option<&str>,
@@ -195,9 +185,9 @@ pub async fn resolve_with_memory(
     Ok(ResolvedSnapshot { sources: delta, winners })
 }
 
-/// Reads selected logical columns in physical Parquet order from a pinned file.
-/// Partition columns are reconstructed from that snapshot, as in the Delta reader.
-/// No predicate runs before ordinals have been assigned by the visibility resolver.
+/// Reads selected logical columns in physical Parquet order from a pinned file,
+/// reconstructing partition columns from the snapshot. No predicate may run before
+/// the visibility resolver has assigned ordinals.
 pub async fn read_file_rows(
     log_store: deltalake::logstore::LogStoreRef, add: &SnapshotFile, schema: arrow::datatypes::SchemaRef, max_decoded_bytes: usize,
 ) -> Result<SourceRows> {
@@ -215,8 +205,7 @@ pub async fn read_file_rows(
 }
 
 /// Streams logical columns in physical order without collecting output batches.
-/// The separate DV mask never filters the stream or changes physical ordinals.
-/// Consumers must account for retained batches and the mask in their memory budget.
+/// The returned DV mask never filters the stream or changes physical ordinals.
 pub async fn stream_file_rows(
     log_store: deltalake::logstore::LogStoreRef, add: &SnapshotFile, schema: arrow::datatypes::SchemaRef,
 ) -> Result<(futures::stream::BoxStream<'static, Result<RecordBatch>>, BooleanBuffer)> {
@@ -224,8 +213,8 @@ pub async fn stream_file_rows(
     Ok((prepared.stream(schema)?, prepared.live))
 }
 
-/// Immutable Parquet metadata and DV visibility shared by repeatable source scans.
-/// Each scan creates its own reader; no execution consumes another query's stream.
+/// Immutable Parquet metadata and DV visibility shared by repeatable source scans;
+/// each scan creates its own reader.
 #[derive(Clone, Debug)]
 pub(crate) struct PreparedFileRows {
     store: Arc<dyn object_store::ObjectStore>,
@@ -277,12 +266,10 @@ impl PreparedFileRows {
         let builder = ParquetRecordBatchStreamBuilder::new_with_metadata(reader, self.metadata.clone());
         let rows = self.live.len();
         let mut projection = Vec::new();
-        for field in schema.fields() {
-            if !self.partitions.contains_key(field.name()) {
-                match builder.schema().index_of(field.name()) {
-                    Ok(index) => projection.push(index),
-                    Err(_) => ensure!(field.is_nullable(), "required visibility column is absent from Parquet: {}", field.name()),
-                }
+        for field in schema.fields().iter().filter(|field| !self.partitions.contains_key(field.name())) {
+            match builder.schema().index_of(field.name()) {
+                Ok(index) => projection.push(index),
+                Err(_) => ensure!(field.is_nullable(), "required visibility column is absent from Parquet: {}", field.name()),
             }
         }
         let projection = ProjectionMask::roots(builder.parquet_schema(), projection);
@@ -319,7 +306,6 @@ impl PreparedFileRows {
 }
 
 /// Reads the deletion vector pinned in a Delta snapshot, preserving physical ordinals.
-/// Uses the same kernel reader as Delta, including inline and absolute-path vectors.
 pub async fn deletion_vector_mask(
     log_store: deltalake::logstore::LogStoreRef, descriptor: Option<&deltalake::kernel::DeletionVectorDescriptor>, rows: usize,
 ) -> Result<BooleanBuffer> {
@@ -353,13 +339,10 @@ pub async fn deletion_vector_mask(
 
 /// Resolves complete key groups and returns one physical-row mask per source.
 ///
-/// The caller must supply all competing versions from the same query snapshot,
-/// including uncovered files and memory. Projection must retain the complete
-/// deduplication key, version, and tombstone columns. Source order establishes
-/// the canonical operator's first-wins rule for equal versions.
-///
-/// Source ordinals are attached before deletion-vector filtering. Consequently a
-/// surviving row keeps its physical ordinal even when earlier rows are deleted.
+/// The caller must supply all competing versions from the same query snapshot, with
+/// the key, version and tombstone columns projected. Source order is the first-wins
+/// rule for equal versions. Ordinals are attached before deletion-vector filtering,
+/// so a surviving row keeps its physical ordinal even when earlier rows are deleted.
 pub async fn winner_masks(
     sources: &[SourceRows], keys: &[String], tiebreak: Option<&str>, tombstone: Option<&str>, context: Arc<TaskContext>,
 ) -> Result<Vec<BooleanBuffer>> {
@@ -491,8 +474,7 @@ impl datafusion::physical_plan::streaming::PartitionStream for FileVisibilitySou
 }
 
 /// Resolve physical lineage from a complete source plan without collecting its output.
-/// The explicit sort preserves source/ordinal ties and lets canonical deduplication
-/// release timestamp runs. Its memory pool and spill limits come from `context`.
+/// The explicit sort preserves source/ordinal ties so deduplication can release runs.
 pub(crate) async fn stream_winner_masks(
     input: Arc<dyn ExecutionPlan>, source_rows: Vec<usize>, keys: &[String], tiebreak: Option<&str>, tombstone: Option<&str>, context: Arc<TaskContext>,
 ) -> Result<Vec<BooleanBuffer>> {
@@ -504,8 +486,8 @@ pub(crate) async fn stream_winner_masks(
     let schema = input.schema();
     let [source_column, ordinal_column] = VISIBILITY_LINEAGE.map(|name| schema.index_of(name));
     let (source_column, ordinal_column) = (source_column?, ordinal_column?);
-    // Greatest-first within a key also keeps canonical early run emission exact
-    // when a single timestamp group exceeds its retained-buffer ceiling.
+    // Greatest-first within a key keeps early run emission exact when one timestamp
+    // group exceeds the retained-buffer ceiling.
     let ascending = arrow::compute::SortOptions::default();
     let ordering = keys
         .iter()
@@ -552,7 +534,6 @@ mod tests {
     use super::*;
     use arrow::array::{Int64Array, StringArray};
 
-    /// The canonical dedup key of the test fixtures below.
     fn keys() -> [String; 4] {
         ["project", "timestamp", "service", "id"].map(str::to_owned)
     }
@@ -567,6 +548,13 @@ mod tests {
         let schema = crate::schema::get_schema("mor_versioned").unwrap();
         let files: crate::read::CountFiles = [("part/file.parquet".into(), None)].into();
         let proof = PartitionCountProof::new(root.clone(), files.clone(), schema, 7)?;
+        let dv = deltalake::kernel::DeletionVectorDescriptor {
+            storage_type: deltalake::kernel::StorageType::UuidRelativePath,
+            path_or_inline_dv: "dv".into(),
+            offset: Some(1),
+            size_in_bytes: 10,
+            cardinality: 1,
+        };
         for change in 0..8 {
             let mut changed = proof.clone();
             match change {
@@ -576,16 +564,7 @@ mod tests {
                     changed.files.insert("other.parquet".into(), None);
                 }
                 3 => {
-                    changed.files.insert(
-                        "part/file.parquet".into(),
-                        Some(deltalake::kernel::DeletionVectorDescriptor {
-                            storage_type: deltalake::kernel::StorageType::UuidRelativePath,
-                            path_or_inline_dv: "dv".into(),
-                            offset: Some(1),
-                            size_in_bytes: 10,
-                            cardinality: 1,
-                        }),
-                    );
+                    changed.files.insert("part/file.parquet".into(), Some(dv.clone()));
                 }
                 4 => changed.keys.reverse(),
                 5 => changed.tiebreak = None,
@@ -630,6 +609,12 @@ mod tests {
             operations::deletion_vectors::{FileDeletion, write_deletion_vectors},
         };
         use futures::TryStreamExt;
+        fn adds(actions: &[Action]) -> impl Iterator<Item = &deltalake::kernel::Add> {
+            actions.iter().filter_map(|action| match action {
+                Action::Add(add) => Some(add),
+                _ => None,
+            })
+        }
         let store = Arc::new(object_store::memory::InMemory::new());
         let url = url::Url::parse("memory:///histogram-visibility")?;
         let mut table = DeltaTableBuilder::from_url(url.clone())?
@@ -654,13 +639,7 @@ mod tests {
             .filter(|line| !line.is_empty())
             .map(serde_json::from_slice::<Action>)
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        let mut add = actions
-            .into_iter()
-            .find_map(|action| match action {
-                Action::Add(add) => Some(add),
-                _ => None,
-            })
-            .context("write commit has no file")?;
+        let mut add = adds(&actions).next().cloned().context("write commit has no file")?;
         let mut previous = None;
         let mut captured = SnapshotFile::capture(&table.snapshot()?.log_data().iter().next().context("missing snapshot file")?, &["project".into()])?;
         let original = captured.clone();
@@ -669,20 +648,8 @@ mod tests {
         for (row, expected) in [(1, vec![true, false, true, true]), (3, vec![true, false, true, false])] {
             let actions =
                 write_deletion_vectors(log_store.as_ref(), log_store.root_url(), vec![FileDeletion { add: add.clone(), deleted_indexes: vec![row] }]).await?;
-            add = actions
-                .iter()
-                .find_map(|action| match action {
-                    Action::Add(add) => Some(add.clone()),
-                    _ => None,
-                })
-                .context("DV commit has no file")?;
-            let descriptor = actions
-                .iter()
-                .find_map(|action| match action {
-                    Action::Add(add) => add.deletion_vector.clone(),
-                    _ => None,
-                })
-                .context("missing DV")?;
+            add = adds(&actions).next().cloned().context("DV commit has no file")?;
+            let descriptor = adds(&actions).find_map(|add| add.deletion_vector.clone()).context("missing DV")?;
             let committed = CommitBuilder::default()
                 .with_actions(actions)
                 .build(Some(table.snapshot()?), log_store.clone(), deltalake::protocol::DeltaOperation::Delete { predicate: None })
@@ -785,11 +752,8 @@ mod tests {
             ])],
             live: BooleanBuffer::from(vec![true, true, true, false]),
         }];
-        let mut cached = original.clone();
-        let winners = winner_masks(&cached, &keys, Some("version"), None, ctx()).await?;
-        for (source, live) in cached.iter_mut().zip(winners) {
-            source.live = live;
-        }
+        let winners = winner_masks(&original, &keys, Some("version"), None, ctx()).await?;
+        let cached = original.iter().cloned().zip(winners).map(|(source, live)| SourceRows { live, ..source }).collect_vec();
         for version in [None, Some(1), Some(3), Some(4)] {
             for deleted in [None, Some(false), Some(true)] {
                 for ranges in [vec![], vec![(10, 11)], vec![(10, 12)]] {
@@ -806,8 +770,7 @@ mod tests {
 
     #[tokio::test]
     async fn streamed_winners_preserve_versions_across_large_timestamp_run() -> Result<()> {
-        // Cross the canonical 64 MiB run buffer at an output-batch boundary.
-        // The same key's newer version must still beat the preceding batch.
+        // Crosses the 64 MiB run buffer at an output-batch boundary.
         let rows = 8192;
         let ids = (0..rows).map(|i| format!("{i:05}{}", "x".repeat(8200))).collect::<Vec<_>>();
         let old = batch(&ids.iter().map(|id| ("p", "s", id.as_str(), 10, Some(1), None)).collect::<Vec<_>>());

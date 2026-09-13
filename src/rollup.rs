@@ -1,16 +1,17 @@
-//! Schema-driven dashboard rollups.
+//! Schema-driven dashboard rollups: the aggregate SQL that builds them, the
+//! conversion to the generated target schema, and read routing.
 //!
-//! A rollup is built only after its source partition is duplicate-free. This
-//! module owns the deterministic aggregate SQL and the conversion from its
-//! output to the generated target schema. Read routing lives here as well, but
-//! is deliberately conservative: an unsupported query must use raw data.
+//! A rollup is built only after its source partition is duplicate-free, and an
+//! unsupported query must fall back to raw data.
 
 use crate::schema::{RollupMeasure, RollupSpec};
 use itertools::Itertools;
+use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 
 /// Why a query cannot use a rollup. Variant names ARE the `rollup_misses`
-/// telemetry labels (snake_case); the two `serialize` overrides are historical
-/// names prod dashboards already query on.
+/// telemetry labels (snake_case); the `serialize` overrides pin label names
+/// dashboards already query on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, strum::EnumIter, strum::IntoStaticStr)]
 #[strum(serialize_all = "snake_case")]
 pub enum MissReason {
@@ -20,30 +21,20 @@ pub enum MissReason {
     UnknownGroupBy,
     UnknownFilter,
     /// The residual row filter constrains columns no declared measure filters
-    /// on, so no rollup could ever have answered it. Separated from
-    /// `UnknownFilter` so that counter means "a filter we should have matched
-    /// and didn't" — see the decline site for the prod evidence.
+    /// on, so no rollup could ever have answered it.
     FilterNotEligible,
     /// The query carries NULL-guards on two different columns. A count measure
-    /// is a single measure by construction, so it cannot express both, and
-    /// guarding on one while ignoring the other would silently answer a
-    /// different question. Carved out of `FilterNotEligible` on 2026-09-04:
-    /// that label was returned from THREE sites, so 78 prod declines said a
-    /// filter was refused without saying which rule refused it — the same shape
-    /// as the tantivy prefilter label that hid four refusals until it was split.
+    /// is a single measure by construction, so it cannot express both.
     #[strum(serialize = "filter_multiple_null_guards")]
     FilterMultipleNullGuards,
     /// The measure's column and the query's NULL-guard column disagree, so the
     /// stored measure counts a different population than the query asks for.
-    /// Carved out of `FilterNotEligible` on 2026-09-04 — see above.
     #[strum(serialize = "filter_null_guard_mismatch")]
     FilterNullGuardMismatch,
     MissingMeasure,
     #[strum(serialize = "non_decomposable")]
     NonDecomposableAggregate,
-    /// Names the ONLY thing this reason still means: a `time_bucket` width that
-    /// is not a multiple of the grain. The window's own alignment stopped
-    /// mattering once raw fringes were added.
+    /// A `time_bucket` width that is not a multiple of the grain.
     #[strum(serialize = "unaligned_bucket_width")]
     PartialBucket,
     /// No rollup was ever built for a date in the window.
@@ -62,21 +53,12 @@ pub enum MissReason {
     /// An aggregate over a rollup-BEARING table whose plan the matcher could not
     /// walk from the aggregate down to the scan — a node between them that
     /// `source_and_filters` refuses, in practice DataFusion's CSE lifting a
-    /// group expression into a `__common_expr_N` projection.
-    ///
-    /// Its population is deliberately narrow: only plans whose underlying table
-    /// actually declares rollups are counted, so a join or a `pg_catalog`
-    /// aggregate stays silent. Before this existed the whole class was invisible
-    /// — `match_aggregates` returned `Ok(Vec::new())` and the caller's `Ok(None)`
-    /// arm recorded nothing, so "no miss counter moved" read as "it routed" when
-    /// it could equally mean "the matcher was never reached". Prod 2026-08-25:
-    /// monoscope's log-explorer count chart declined here, 7 days raw, silently.
+    /// group expression into a `__common_expr_N` projection. Counted only for
+    /// plans whose underlying table actually declares rollups.
     UnwalkableSource,
     /// The cell is fresh, but its FILES do not carry a measure the query needs,
-    /// so Delta null-fills the column and the merge — `tdigest_merge` or SQL
-    /// `SUM` alike — skips those nulls and answers from the covered fraction.
-    /// Distinct from `StaleCoverage`: nothing moved under the build, the build
-    /// never wrote the column.
+    /// so Delta null-fills the column and the merge skips those nulls. Distinct
+    /// from `StaleCoverage`: nothing moved, the build never wrote the column.
     MeasureNotStored,
 }
 
@@ -92,40 +74,20 @@ fn sql_literal(value: &str) -> String {
 
 /// Deterministic identity for one rollup generation.
 ///
-/// It was a random UUID, which made the rollup rows on S3 unreadable after a
-/// restart. It deliberately does not include the source fingerprint: independently
-/// replaceable slices of one date must share a generation so a query can merge
-/// them. The fingerprint remains in each Add tag and in the read ticket, where
-/// it is a validity check rather than a row-selection key.
+/// Deliberately excludes the source fingerprint: independently replaceable
+/// slices of one date must share a generation so a query can merge them.
 ///
-/// The spec participates because a REDEFINED measure — same name, different
-/// `agg`/`column`/`filter` — would otherwise serve rows built under the old
-/// definition as if current. It participates through `measures`, which is the
-/// set the cell actually MATERIALIZED (`TAG_MEASURES`): the spec is restricted
-/// to those measures before hashing, so a cell is measured against the spec IT
-/// WAS BUILT UNDER rather than against every measure declared since.
-///
-/// That distinction is the difference between a cheap spec edit and a fleet-wide
-/// outage. Hashing the whole spec meant ADDING a measure changed every tier's
-/// generation, the recovery gate then refused every slice built before it, and
-/// the read path answered `not_built` for the entire history while no gauge
-/// moved — `duration_digest` on 2026-08-22 did exactly that. Addition is now
-/// covered per cell instead, by `TAG_MEASURES` + `measures_available`: a cell
-/// that does not hold a measure is refused for queries needing it and serves
-/// every other query unchanged.
-///
-/// Within one materialization version, restricting the spec preserves the
-/// generation when measures are appended. Redefined measures and source-read
-/// semantic changes require a new generation. `None` uses the whole spec;
-/// measure availability remains a separate proof at read time.
+/// `measures` restricts the spec to what the cell actually MATERIALIZED before
+/// hashing, so a cell is judged against the spec it was built under. Appending
+/// a measure therefore preserves the generation (availability is proved per
+/// cell at read time); a REDEFINED measure changes it. `None` uses the whole
+/// spec.
 pub fn generation_id(spec: &RollupSpec, source: &str, project_id: &str, date: &str, _source_fp: u64, measures: Option<&[String]>) -> String {
-    use std::hash::{Hash, Hasher};
     let restricted = measures.map(|names| RollupSpec { measures: spec.measures.iter().filter(|m| names.contains(&m.name)).cloned().collect(), ..spec.clone() });
     let spec = restricted.as_ref().unwrap_or(spec);
     let mut hasher = fnv::FnvHasher::default();
-    // Materialized aggregates depend on source-read semantics as well as the
-    // SQL spec. Older generations may contain results from incorrect physical
-    // deletion-vector row positions and must be rebuilt from the fixed reader.
+    // Bump when source-read semantics change, not just the SQL spec: older
+    // generations must then be rebuilt.
     const MATERIALIZATION_VERSION: u8 = 1;
     MATERIALIZATION_VERSION.hash(&mut hasher);
     format!("{spec:?}").hash(&mut hasher);
@@ -163,11 +125,6 @@ pub(crate) fn stats_time_range(stats: &str) -> Option<(i64, i64)> {
 /// when stats or timestamp bounds are absent — the caller falls back to
 /// `ALL_HOURS`, never to skipping work. A computed mask of zero (bounds
 /// entirely outside the partition day) is likewise treated as absent.
-///
-/// This is what lets a boot reconcile invalidate the ONE hour a downtime
-/// commit actually touched instead of all 24 (`enqueue_maintenance_hours`
-/// with `ALL_HOURS` was ~312 durable tasks per active project per restart,
-/// prod 2026-08-18 — the queue's dominant growth source under deploy churn).
 pub(crate) fn hours_from_stats_json(stats: &str, day_start_micros: i64) -> Option<u32> {
     let (lo, hi) = stats_time_range(stats)?;
     let (lo_h, hi_h) = ((lo - day_start_micros).div_euclid(HOUR_MICROS), (hi - day_start_micros).div_euclid(HOUR_MICROS));
@@ -238,52 +195,38 @@ pub async fn rollup_partial_for_batches(
 /// One measure's projection in a rollup build, as `<expression> AS <name>`.
 ///
 /// `derived` selects the tier-to-tier merge (folding the base tier's stored
-/// states) over the build-from-raw aggregate. Both spellings lived inline in
-/// two callers and had to stay in step; this repo has already lost a caveat
-/// that way ("that caveat used to be recorded on only one of the copies of
-/// this query, which is how it would have been lost").
-///
-/// A derived merge deliberately re-reads no filter: the base tier already
-/// applied it when the state was built, and applying it twice over an
-/// aggregated column is not the same predicate.
+/// states) over the build-from-raw aggregate. A derived merge deliberately
+/// re-reads no filter: the base tier already applied it when the state was
+/// built, and applying it twice over an aggregated column is a different
+/// predicate.
 fn measure_projection(spec: &RollupSpec, measure: &RollupMeasure, derived: bool) -> anyhow::Result<String> {
-    let (expression, filter) = if derived {
-        let expression = match measure.agg.as_str() {
-            "min" => format!("MIN({})", measure.name),
-            "max" => format!("MAX({})", measure.name),
-            "tdigest" => format!("tdigest_merge(CAST({} AS BYTEA))", measure.name),
-            "hll" => format!("hll_merge(CAST({} AS BYTEA))", measure.name),
-            // Order by the COMPANION, never by the base tier's bucket
-            // timestamp: a fine bucket whose filter matched nothing stores a
-            // NULL value AND a NULL companion, and ordering by the bucket would
-            // pick that NULL and poison the coarse bucket. `NULLS LAST` puts
-            // those buckets after every real one, so they win only when there is
-            // nothing else -- which is the correct answer.
-            "first" => format!(
-                "first_value({} ORDER BY {} NULLS LAST)",
-                measure.name,
-                spec.first_companion(measure)
-                    .ok_or_else(|| anyhow::anyhow!("`first` measure `{}` has no companion min(timestamp) measure", measure.name))?
-                    .name
-            ),
-            _ => format!("SUM({})", measure.name),
-        };
-        (expression, None)
-    } else {
-        let expression = match (measure.agg.as_str(), measure.column.as_deref()) {
-            ("count", None) => "COUNT(*)".to_string(),
-            ("count", Some(column)) => format!("COUNT({column})"),
-            ("tdigest", Some(column)) => format!("percentile_agg(CAST({column} AS DOUBLE))"),
-            ("hll", Some(column)) => format!("hll_agg({column})"),
-            // Built from raw, the ordering key is the row's own timestamp. The
-            // FILTER appended below applies to both, so the stored value and the
-            // companion describe the SAME row.
-            ("first", Some(column)) => format!("first_value({column} ORDER BY timestamp)"),
-            (aggregate, Some(column)) => format!("{}({column})", aggregate.to_uppercase()),
-            (aggregate, None) => return Err(anyhow::anyhow!("{} measure `{}` needs a source column", aggregate, measure.name)),
-        };
-        (expression, measure.filter.as_deref())
+    let expression = match (derived, measure.agg.as_str(), measure.column.as_deref()) {
+        (true, "min", _) => format!("MIN({})", measure.name),
+        (true, "max", _) => format!("MAX({})", measure.name),
+        (true, "tdigest", _) => format!("tdigest_merge(CAST({} AS BYTEA))", measure.name),
+        (true, "hll", _) => format!("hll_merge(CAST({} AS BYTEA))", measure.name),
+        // Order by the COMPANION, never by the base tier's bucket timestamp: a
+        // fine bucket whose filter matched nothing stores a NULL value AND a
+        // NULL companion, and ordering by the bucket would pick that NULL.
+        // `NULLS LAST` makes such buckets win only when nothing else matched.
+        (true, "first", _) => format!(
+            "first_value({} ORDER BY {} NULLS LAST)",
+            measure.name,
+            spec.first_companion(measure).ok_or_else(|| anyhow::anyhow!("`first` measure `{}` has no companion min(timestamp) measure", measure.name))?.name
+        ),
+        (true, _, _) => format!("SUM({})", measure.name),
+        (false, "count", None) => "COUNT(*)".to_string(),
+        (false, "count", Some(column)) => format!("COUNT({column})"),
+        (false, "tdigest", Some(column)) => format!("percentile_agg(CAST({column} AS DOUBLE))"),
+        (false, "hll", Some(column)) => format!("hll_agg({column})"),
+        // Built from raw, the ordering key is the row's own timestamp. The
+        // FILTER appended below applies to both, so the stored value and the
+        // companion describe the SAME row.
+        (false, "first", Some(column)) => format!("first_value({column} ORDER BY timestamp)"),
+        (false, aggregate, Some(column)) => format!("{}({column})", aggregate.to_uppercase()),
+        (false, aggregate, None) => return Err(anyhow::anyhow!("{} measure `{}` needs a source column", aggregate, measure.name)),
     };
+    let filter = if derived { None } else { measure.filter.as_deref() };
     Ok(format!("{} AS {}", filtered(expression, filter), measure.name))
 }
 
@@ -291,18 +234,12 @@ fn measure_projection(spec: &RollupSpec, measure: &RollupMeasure, derived: bool)
 /// raw leg and the `HAVING` guard all render a measure's declared filter, and
 /// they must render it identically.
 fn filtered(expression: String, filter: Option<&str>) -> String {
-    match filter {
-        Some(filter) => format!("{expression} FILTER (WHERE {filter})"),
-        None => expression,
-    }
+    if let Some(filter) = filter { format!("{expression} FILTER (WHERE {filter})") } else { expression }
 }
 
 /// The bucketed `timestamp`, the dimensions and the measures every rollup build
-/// selects, plus the `, dim…` fragment its carried-forward leg reuses.
-///
-/// ONE spelling of the bucket-floor formula: it was written out in both the
-/// per-project and the cohort builder, where the two had to stay in step by
-/// hand — the same way this file has already lost a caveat.
+/// selects, plus the `, dim…` fragment its carried-forward leg reuses. The only
+/// spelling of the bucket-floor formula.
 fn bucketed_projection(spec: &RollupSpec, derived: bool) -> anyhow::Result<(String, String)> {
     let grain = spec.grain_micros().ok_or_else(|| anyhow::anyhow!("invalid rollup grain `{}`", spec.grain))?;
     let dimensions = spec.dimensions.join(", ");
@@ -317,10 +254,8 @@ fn bucketed_projection(spec: &RollupSpec, derived: bool) -> anyhow::Result<(Stri
 /// The partition's rows, rebuilt over `ranges` only and carried forward from
 /// `target` everywhere else. Empty `ranges` means the whole day, from scratch.
 ///
-/// The carried-forward rows are re-emitted verbatim: they were aggregated from
-/// source rows that have not changed since, so re-aggregating them would produce
-/// the same numbers at the cost of scanning the raw partition again — which is
-/// the entire expense this exists to avoid.
+/// The carried-forward rows are re-emitted verbatim: their source rows have not
+/// changed, so re-aggregating them would cost a raw scan for the same numbers.
 pub(crate) fn build_partition_sql_ranges(
     spec: &RollupSpec, source: &str, from: &str, target: &str, project_id: &str, date: &str, ranges: &[(i64, i64)],
 ) -> anyhow::Result<String> {
@@ -363,11 +298,8 @@ pub(crate) fn build_cohort_sql_range_mode(
 }
 
 /// FROZEN HASH: this IS the persisted bucket id in rollup slices, so changing
-/// the hasher orphans every rollup ever written — the same failure as changing
-/// a spec name. Not part of the XXH3 sweep.
+/// the hasher orphans every rollup ever written.
 fn generated_bucket_id(bucket: i64, grain: i64, generation: &str, dimensions: &[datafusion::scalar::ScalarValue]) -> String {
-    use std::hash::{Hash, Hasher};
-
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     (bucket, grain, generation).hash(&mut hasher);
     dimensions.len().hash(&mut hasher);
@@ -378,10 +310,9 @@ fn generated_bucket_id(bucket: i64, grain: i64, generation: &str, dimensions: &[
 /// Convert aggregate batches into rows for the generated rollup schema.
 ///
 /// The aggregate output contains `timestamp`, then configured dimensions and
-/// configured measures. All remaining target fields are internal identity or
-/// partition fields. The conversion deliberately copies each configured Arrow
-/// array and casts it only at the generated target boundary, so binary digest
-/// state and non-string dimensions retain their types.
+/// measures; all remaining target fields are internal identity or partition
+/// fields. Each configured array is copied and cast only at the target
+/// boundary, so binary digest state and non-string dimensions keep their types.
 pub fn to_rollup_batches(
     spec: &RollupSpec, source: &str, project_id: &str, date: &str, generation: &str, aggregated: &[arrow::record_batch::RecordBatch],
 ) -> anyhow::Result<Vec<arrow::record_batch::RecordBatch>> {
@@ -390,6 +321,7 @@ pub fn to_rollup_batches(
         compute::kernels::cast::cast,
         datatypes::DataType,
     };
+    use datafusion::{common::Result as DFResult, scalar::ScalarValue};
     use std::sync::Arc;
 
     let target = spec.table_name(source);
@@ -420,13 +352,10 @@ pub fn to_rollup_batches(
                 .collect::<anyhow::Result<Vec<&ArrayRef>>>()?;
             let ids = (0..rows)
                 .map(|row| {
-                    let values = dimension_columns
-                        .iter()
-                        .map(|column| datafusion::scalar::ScalarValue::try_from_array(column, row))
-                        .collect::<datafusion::common::Result<Vec<_>>>()?;
+                    let values = dimension_columns.iter().map(|column| ScalarValue::try_from_array(column, row)).collect::<DFResult<Vec<_>>>()?;
                     Ok(generated_bucket_id(timestamps[row], grain, generation, &values))
                 })
-                .collect::<datafusion::common::Result<Vec<_>>>()?;
+                .collect::<DFResult<Vec<_>>>()?;
 
             let columns = schema
                 .fields()
@@ -457,20 +386,20 @@ pub fn to_rollup_batches(
 /// with its own generation. The aggregate must retain `project_id` as a group
 /// key; synthesizing it from the cohort request would mix tenant identities.
 pub(crate) fn to_rollup_batches_by_project(
-    spec: &RollupSpec, source: &str, date: &str, generations: &std::collections::HashMap<String, String>, aggregated: &[arrow::record_batch::RecordBatch],
-) -> anyhow::Result<std::collections::HashMap<String, Vec<arrow::record_batch::RecordBatch>>> {
+    spec: &RollupSpec, source: &str, date: &str, generations: &HashMap<String, String>, aggregated: &[arrow::record_batch::RecordBatch],
+) -> anyhow::Result<HashMap<String, Vec<arrow::record_batch::RecordBatch>>> {
     use arrow::{
         array::{Array, StringArray},
         compute::cast,
         datatypes::DataType,
     };
 
-    let mut grouped: std::collections::HashMap<String, Vec<arrow::record_batch::RecordBatch>> = std::collections::HashMap::new();
+    let mut grouped: HashMap<String, Vec<arrow::record_batch::RecordBatch>> = HashMap::new();
     for batch in aggregated.iter().filter(|batch| batch.num_rows() > 0) {
         let projects = batch.column_by_name("project_id").ok_or_else(|| anyhow::anyhow!("cohort aggregate is missing project_id"))?;
         let projects = cast(projects, &DataType::Utf8)?;
         let projects = projects.as_any().downcast_ref::<StringArray>().ok_or_else(|| anyhow::anyhow!("cohort project_id cannot cast to Utf8"))?;
-        let rows_by_project: std::collections::HashMap<&str, Vec<u32>> = (0..batch.num_rows())
+        let rows_by_project: HashMap<&str, Vec<u32>> = (0..batch.num_rows())
             .map(|row| match projects.is_null(row) {
                 true => Err(anyhow::anyhow!("cohort aggregate project_id is null")),
                 false => Ok((projects.value(row), u32::try_from(row)?)),
@@ -494,8 +423,8 @@ pub(crate) fn to_rollup_batches_by_project(
 ///
 /// The same combinator serves both shapes: over measure columns when the rollup
 /// answers alone, and over the union's state aliases when a raw leg is present.
-/// That is only sound because every variant is associative over a *partition* of
-/// the row set — which is exactly what [`interior`] guarantees.
+/// Sound only because every variant is associative over a *partition* of the
+/// row set, which [`interior`] guarantees.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Merge {
     Count,
@@ -506,12 +435,11 @@ pub(crate) enum Merge {
     TDigest,
     /// A distinct-count sketch. Like `TDigest`, the query's output IS the folded
     /// state: `distinct_count` reads the number out of it in the projection
-    /// above the aggregate, which the rewrite never touches.
+    /// above the aggregate.
     Hll,
-    /// Earliest value in the window. Two states -- the value and the timestamp
-    /// of the row it came from -- because "earliest" is not recoverable from
-    /// the value alone. Associative for the same reason `Min` is: the winner of
-    /// the winners is the winner.
+    /// Earliest value in the window. Two states — the value and the timestamp of
+    /// the row it came from — because "earliest" is not recoverable from the
+    /// value alone.
     First,
 }
 
@@ -538,11 +466,9 @@ impl Merge {
 
     /// One partial-state expression per stored column, for the rollup leg.
     ///
-    /// Every merge but `First` folds each of its state columns with the same
-    /// associative operator, so the default is `partial_op` applied columnwise.
-    /// `First` cannot: its two states are a value and the timestamp that
-    /// selects it, and they need different operators -- the value is picked BY
-    /// the companion, the companion is minimised.
+    /// Every merge but `First` folds each state column with the same
+    /// associative operator. `First` needs two: the value is picked BY the
+    /// companion timestamp, the companion is minimised.
     fn partial_states(self, columns: &[String]) -> Vec<String> {
         match (self, columns) {
             (Self::First, [value, at]) => vec![format!("first_value({value} ORDER BY {at} NULLS LAST)"), format!("MIN({at})")],
@@ -565,12 +491,11 @@ impl Merge {
             }
             (Self::TDigest, [digest]) => format!("tdigest_merge({digest})"),
             (Self::Hll, [sketch]) => format!("hll_merge({sketch})"),
-            // `NULLS LAST` for the same reason the derive uses it: a leg that
-            // matched nothing contributes a NULL pair, and it must lose to any
-            // leg that matched something.
+            // `NULLS LAST`: a leg that matched nothing contributes a NULL pair
+            // and must lose to any leg that matched something.
             (Self::First, [value, at]) => format!("first_value({value} ORDER BY {at} NULLS LAST)"),
-            // `arity()` is the single source of truth for how many states each
-            // variant is built with, so this is unreachable by construction.
+            // `arity()` fixes the state count per variant, so this is
+            // unreachable by construction.
             _ => unreachable!("merge {self:?} built with {} states", states.len()),
         }
     }
@@ -584,8 +509,8 @@ struct RoutedMeasure {
     /// Rollup-table measure columns, one per state, in `merge` order.
     measures: Vec<String>,
     /// Raw-leg aggregate SQL, one per state, in `merge` order. Rendered from the
-    /// measure's declared filter text rather than by unparsing the query's
-    /// `Expr` — the matcher has already proven the two are canonically equal.
+    /// measure's declared filter text, which the matcher has already proven
+    /// canonically equal to the query's own `Expr`.
     raw: Vec<String>,
 }
 
@@ -607,13 +532,9 @@ const fn ceil_grain(value: i64, grain: i64) -> i64 {
 /// `None` when the raw plan should be left alone.
 ///
 /// `horizon` is the exclusive bound of the certified, buffer-free prefix. Both
-/// endpoints are snapped to a grain boundary because a rollup row is indivisible:
-/// half of one cannot be given to a fringe. That alignment is the invariant the
-/// whole rewrite rests on — with `a` or `b` off-grain the legs either double
-/// count a bucket or drop one, and no aggregate can detect it afterwards.
-///
-/// Test-only: the single-interval shape, kept because the cost-floor and
-/// alignment cases read far more clearly against one range than a set.
+/// endpoints are snapped to a grain boundary because a rollup row is
+/// indivisible: off-grain, the legs either double count a bucket or drop one,
+/// and no aggregate can detect it afterwards.
 #[cfg(test)]
 pub(crate) fn interior(lo: i64, hi: i64, grain: i64, horizon: i64) -> Option<(i64, i64)> {
     interiors(lo, hi, grain, horizon, &[(lo, hi)]).into_iter().next()
@@ -627,9 +548,7 @@ pub(crate) fn interior(lo: i64, hi: i64, grain: i64, horizon: i64) -> Option<(i6
 /// are certified.
 ///
 /// Taking a set rather than a prefix is what stops one stale day in the middle
-/// of a window discarding the rollup for every day after it — measured in
-/// production, a single uncovered date made a 7-day query scan 8.4M raw rows
-/// while the other six days sat fully built.
+/// of a window discarding the rollup for every day after it.
 pub(crate) fn interiors(lo: i64, hi: i64, grain: i64, horizon: i64, covered: &[(i64, i64)]) -> Vec<(i64, i64)> {
     let capped = hi.min(horizon);
     let ranges: Vec<(i64, i64)> = covered
@@ -642,81 +561,38 @@ pub(crate) fn interiors(lo: i64, hi: i64, grain: i64, horizon: i64, covered: &[(
             (end.saturating_sub(start) >= MIN_INTERIOR_BUCKETS.saturating_mul(grain)).then_some((start, end))
         })
         .collect();
-    // The floor applies to the TOTAL, not to each run: what makes the union
-    // worth its extra scan and barrier is how much of the window it removes from
-    // the raw leg, and that is the sum however it is distributed. It is measured
-    // against the window the QUERY asked for, never the horizon-capped one — a
-    // sliver of certified data is no more worth a second scan just because the
-    // buffer bound happens to sit just past it.
+    // The floor applies to the TOTAL, not to each run, and is measured against
+    // the window the QUERY asked for, never the horizon-capped one.
     let total: i64 = ranges.iter().map(|(start, end)| end - start).sum();
     if total < hi.saturating_sub(lo) / MIN_INTERIOR_FRACTION { Vec::new() } else { ranges }
 }
 
-/// The upper bound of a window the query left open. Chosen as `i64::MAX` so it
-/// compares above every real timestamp and so `complement` needs no special
-/// case: the trailing gap simply runs to it, and `range_sql` renders that one
-/// range without an upper bound.
+/// The upper bound of a window the query left open. `i64::MAX` so it compares
+/// above every real timestamp and `complement` needs no special case; `range_sql`
+/// renders that one range without an upper bound.
 pub(crate) const OPEN_END: i64 = i64::MAX;
 
 /// May a date's slice coverage be read from the tier at all?
 ///
-/// Slice coverage is the ONLY live coverage (the per-date map was dead code),
-/// and until this guard existed it was checked for project/source/target/range
-/// overlap and nothing else — no fingerprint, no epoch. A slice therefore kept
-/// claiming its range after the source partition moved underneath it, and the
-/// tier served an aggregate built from fewer rows than the partition now holds.
-/// Prod 2026-08-22: P1's 08-20 rollup was short 21.7% and 08-21 short 96%, and
-/// those two shortfalls summed to the 2.86M-row under-count a 3-day throughput
-/// chart returned (`docs/plans/2026-08-22-rollup-correctness-and-routing.md`).
-///
 /// `witnesses` is each covering slice's record of how many rows the DATE
-/// partition held when it was built, and `current` is how many it holds now.
-/// Both must be the same computation — `PartitionStats::rows`, i.e. the
-/// add-action `num_records` sum — or this compares unlike quantities and is
-/// worthless: the build's decoded input excludes tombstones and superseded
-/// merge-on-read versions, `num_records` counts them.
-///
-/// Witnesses are never SUMMED: slices of one day are built at different times
-/// against a churning partition, so each is a snapshot of the whole date, and
-/// summing snapshots would compare a total against one sample.
-///
-/// Callers evaluate one slice at a time. A witness is a statement about the
-/// WHOLE partition ("it held N rows when I built"), so two slices that each
-/// still agree with the present N are both current, independently — and a slice
-/// that cannot be verified drops out alone instead of condemning its whole
-/// date. Condemning the date meant a single un-rebuilt slice kept a fully
-/// rebuilt day on the raw path, which with thousands of slices queued is
-/// indefinite.
-///
-/// Equality is two-sided on purpose. "Rows only accrue" is false here — dedup
-/// rewrites and vacuum shrink `num_records` too — so a disagreement in either
-/// direction means the partition moved and the coverage cannot be trusted.
-///
-/// A slice with no witness predates the tag and CANNOT be verified, so it is
-/// refused; those dates read raw until the coordinator republishes them.
-///
-/// Expressed through [`verify_slice_witness`] so there is ONE definition of what
-/// re-proves a slice. This is `SliceWitness::Physical` and nothing else, so the
-/// answer is bit-identical to the hand-rolled comparison it replaces. What proves
-/// that is the PRE-EXISTING case table below
-/// (`slice_coverage_is_trusted_only_when_every_witness_matches_the_partition_now`):
-/// its nine hard-coded verdicts were written against the old body and still hold
-/// against this one. A fresh test comparing the two would be circular — after the
-/// delegation both sides run the same code.
+/// partition held when it was built; `current` is how many it holds now. Both
+/// must be `PartitionStats::rows` (the add-action `num_records` sum) or this
+/// compares unlike quantities. Witnesses are never SUMMED — each is a snapshot
+/// of the WHOLE date, so they are verified one at a time — and equality is
+/// two-sided, since dedup rewrites and vacuum shrink `num_records` too. A slice
+/// with no witness cannot be verified and is refused.
 pub(crate) fn slice_coverage_agrees(witnesses: &[Option<u64>], current: Option<u64>) -> bool {
     let files = current.map(|rows| [SourceFile { min_ts: None, max_ts: None, rows }]);
     let source = LiveSource { files: files.as_ref().map(|files| &files[..]), logical: None };
     !witnesses.is_empty() && witnesses.iter().all(|witness| verify_slice_witness(witness.map(SliceWitness::Physical), source) == WitnessVerdict::Valid)
 }
 
-/// One live file of a rollup SOURCE partition, as the Delta add-actions
-/// describe it — not to be confused with [`LiveFile`], which is a file of the
-/// tier the source feeds.
+/// One live file of a rollup SOURCE partition, as the Delta add-actions describe
+/// it — not [`LiveFile`], which is a file of the tier the source feeds.
 ///
-/// `min_ts`/`max_ts` are `None` when the file carries no timestamp statistic.
-/// That is not the same as "spans nothing": a file that cannot say where its
-/// rows sit cannot be placed relative to a slice bound, so any bounded witness
-/// must refuse rather than guess (see [`verify_slice_witness`]).
+/// `min_ts`/`max_ts` are `None` when the file carries no timestamp statistic,
+/// which is not "spans nothing": it cannot be placed relative to a slice bound,
+/// so any bounded witness must refuse rather than guess.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct SourceFile {
     pub min_ts: Option<i64>,
@@ -730,32 +606,22 @@ pub(crate) struct SourceFile {
 /// What a rollup slice recorded about its source partition at build time.
 ///
 /// Versioned because the shapes are not comparable: a witness recorded under one
-/// variant can only ever be re-proved under the same variant, so old slices keep
-/// exactly the semantics they were written with and a shape change re-darkens
-/// nothing it did not have to.
+/// variant can only ever be re-proved under the same variant.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SliceWitness {
     /// v1, what `TAG_SOURCE_ROWS` holds today: the WHOLE partition's
     /// `num_records` sum, unbounded. Any ingest anywhere in the day moves it,
-    /// including hours no slice of this build ever claimed — which is why
-    /// `rollup_stale_grew` (4103) dwarfs `rollup_stale_shrank` (400) in prod.
+    /// including hours no slice of this build ever claimed.
     Physical(u64),
     /// v2: `num_records` summed over the live files lying WHOLLY BELOW the
     /// slice's `covered_through`. Ingest past the bound no longer perturbs it.
-    ///
-    /// Not constructed outside the tests yet, and deliberately: STAMPING one
-    /// means a new Delta tag on the build path, which is the step this change
-    /// does not take. Kept in the type because a predicate that cannot express
-    /// the candidate cannot be used to evaluate it, and the case table is the
-    /// evaluation — see `docs/plans/2026-08-25-rollup-witness-design.md` §2.
+    /// Not stamped by the build path yet; exercised only by the case table.
     #[allow(dead_code)]
     PhysicalBelow { rows: u64, bound: i64 },
     /// v3: the exact LOGICAL row count of `[lo, hi)` — deduped and
     /// tombstone-aware, i.e. what the build actually aggregated. Invariant under
     /// every rewrite that preserves logical content, and moves only on genuine
-    /// ingest or DML inside the slice's own range.
-    ///
-    /// Unconstructed for the same reason as `PhysicalBelow`.
+    /// ingest or DML inside the slice's own range. Unconstructed, as above.
     #[allow(dead_code)]
     Logical { rows: u64, lo: i64, hi: i64 },
 }
@@ -773,10 +639,9 @@ pub(crate) struct LiveSource<'a> {
 }
 
 /// Three-valued on purpose. `Stale` is a proven disagreement; `Unverifiable` is
-/// an absence of evidence. Both must keep the range off the tier, but they
-/// demand opposite work — `Stale` needs a rebuild, `Unverifiable` needs the
-/// evidence to exist — and collapsing them is what made `stale_coverage` a
-/// single undiagnosable bucket for months.
+/// an absence of evidence. Both keep the range off the tier, but they demand
+/// opposite work: `Stale` needs a rebuild, `Unverifiable` needs the evidence to
+/// exist.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum WitnessVerdict {
     Valid,
@@ -787,17 +652,11 @@ pub(crate) enum WitnessVerdict {
 /// Re-prove one slice's witness against the source partition as it stands now.
 ///
 /// Strictly generalises `slice_coverage_agrees`: `Physical` reproduces it
-/// exactly (see the case table), so v1 slices are judged by today's rule and
-/// only slices stamped with a newer witness get the newer semantics.
+/// exactly, so v1 slices keep v1 semantics.
 ///
-/// The straddle rule is the whole soundness argument for `PhysicalBelow`. Delta
+/// The straddle rule is the soundness argument for `PhysicalBelow`: Delta
 /// statistics are per FILE, so a file whose rows sit on both sides of the bound
-/// cannot be split by arithmetic: counting it admits rows the build never read,
-/// dropping it hides rows that landed INSIDE the covered range — the
-/// silent-wrong-number direction. It therefore poisons the whole witness. This
-/// is not free: once a day is packed into one file per date, every slice bound
-/// falls inside a file and the whole date reads `Unverifiable`. That cost is the
-/// reason `PhysicalBelow` is a candidate and not a recommendation.
+/// cannot be split by arithmetic and poisons the whole witness.
 pub(crate) fn verify_slice_witness(witness: Option<SliceWitness>, source: LiveSource<'_>) -> WitnessVerdict {
     let verdict = |expected: u64, actual: u64| if expected == actual { WitnessVerdict::Valid } else { WitnessVerdict::Stale };
     let (Some(witness), Some(files)) = (witness, source.files) else { return WitnessVerdict::Unverifiable };
@@ -815,9 +674,7 @@ pub(crate) fn verify_slice_witness(witness: Option<SliceWitness>, source: LiveSo
             })
             .map_or_else(std::convert::identity, |below| verdict(rows, below)),
         // The witness carries its own range so a count taken over a DIFFERENT
-        // window cannot be mistaken for evidence about this one — the index is
-        // per (project, date) and every slice of that date asks it a different
-        // question.
+        // window cannot be mistaken for evidence about this one.
         SliceWitness::Logical { rows, lo, hi } => match source.logical {
             Some((live_lo, live_hi, live)) if (live_lo, live_hi) == (lo, hi) => verdict(rows, live),
             _ => WitnessVerdict::Unverifiable,
@@ -829,8 +686,7 @@ pub(crate) fn verify_slice_witness(witness: Option<SliceWitness>, source: LiveSo
 ///
 /// `ranges` must be ascending and disjoint, which `interiors` guarantees. Every
 /// bound is half-open and comes from the SAME list that drives the rollup leg,
-/// so the two together partition `[lo, hi)`: no row is read twice, none is
-/// missed, and no aggregate downstream could detect it if one were.
+/// so the two together partition `[lo, hi)` exactly.
 pub(crate) fn complement(lo: i64, hi: i64, ranges: &[(i64, i64)]) -> Vec<(i64, i64)> {
     // The `(hi, hi)` sentinel emits the trailing gap and can contribute nothing else.
     ranges
@@ -847,11 +703,9 @@ pub(crate) fn complement(lo: i64, hi: i64, ranges: &[(i64, i64)]) -> Vec<(i64, i
 
 /// [`complement`] for a coverage set that is neither sorted nor disjoint.
 ///
-/// Slice coverage arrives from a `DashMap` in hash order and its ranges overlap
-/// freely — `split_time_task` cuts a day into children and `coarsen_sealed_slices`
-/// fuses them back, so the same hours are published at several widths at once.
-/// Sorting by start is all `complement` needs; its `cursor.max(end)` already
-/// absorbs overlap.
+/// Slice coverage arrives in hash order and its ranges overlap freely (the same
+/// hours are published at several widths at once). Sorting by start is all
+/// `complement` needs; its `cursor.max(end)` already absorbs overlap.
 pub(crate) fn uncovered(lo: i64, hi: i64, mut ranges: Vec<(i64, i64)>) -> Vec<(i64, i64)> {
     ranges.sort_unstable();
     complement(lo, hi, &ranges)
@@ -864,10 +718,8 @@ pub(crate) fn hybrid_branch_count(lo: i64, hi: i64, ranges: &[(i64, i64)]) -> us
 /// Which projects the ROLLUP leg is allowed to answer for, and which must be
 /// read raw across the whole window because their coverage was not proved.
 ///
-/// Coverage is intersected across a cross-project query's projects, so before
-/// this a single project short of coverage refused the query for every other
-/// project too. Prod 2026-08-18: 9 of 10 projects had coverage for the window
-/// and the tenth sent all ten to a raw scan.
+/// Splitting rather than intersecting keeps one project short of coverage from
+/// sending every other project in the query to a raw scan.
 #[derive(Debug, Default)]
 pub(crate) struct ProjectSplit {
     /// `None` means every project the query reads — the pinned case, or a
@@ -894,13 +746,12 @@ pub(crate) struct RoutedRollup {
     open_end: bool,
     pub grain: i64,
     pub target: String,
-    /// The `Aggregate` node this route replaces, verbatim. The caller substitutes
-    /// the rewrite for exactly this node and leaves every node above it alone, so
-    /// this is the whole interface between the matcher and the plan.
+    /// The `Aggregate` node this route replaces, verbatim. The caller
+    /// substitutes the rewrite for exactly this node and leaves every node above
+    /// it alone.
     pub matched: datafusion::logical_expr::LogicalPlan,
     /// A `COUNT` over the promoted row filter, carried through the legs but NOT
-    /// selected: it exists only to power the `HAVING` that reproduces group
-    /// elimination. See `promote` in `route_with_spec`.
+    /// selected: it only powers the `HAVING` that reproduces group elimination.
     guard: Option<RoutedMeasure>,
     row_filters: Vec<String>,
     /// `(expression, output alias)`. Every expression is valid, and means the
@@ -924,15 +775,11 @@ pub(crate) struct SliceDedup<'a> {
 
 /// The identity a generated rollup tier is physically written with.
 ///
-/// A tier's own `TableSchema` declares `dedup_keys = [timestamp, id]` (see
-/// `RollupSpec::synthesize`), so the QUERY path collapses versions through the
-/// planner's `DedupExec`. It has to: a rebuild appends a new version of a
-/// bucket, and the replace-set that is meant to retire the old file skips any
-/// file carrying no slice tags — so partitions really do hold several versions
-/// of one `id` (prod 2026-08-20: 7.17 per id).
-///
-/// A MAINTENANCE read gets no such help — it registers the tier directly rather
-/// than through the routing table — so it must spell the same identity out.
+/// A tier's own `TableSchema` declares `dedup_keys = [timestamp, id]`, so the
+/// QUERY path collapses versions through the planner's `DedupExec` — partitions
+/// really do hold several versions of one `id`. A MAINTENANCE read registers the
+/// tier directly rather than through the routing table, so it must spell the
+/// same identity out.
 pub(crate) fn rollup_tier_dedup(schema: &crate::schema::TableSchema) -> Option<(Vec<String>, &'static str, Option<&str>)> {
     let has = |name: &str| schema.fields.iter().any(|field| field.name == name);
     (has("timestamp") && has("id") && has("updated_at"))
@@ -967,41 +814,28 @@ pub(crate) struct SlicePublish<'a> {
 
 /// Whether this publication retires `file`.
 ///
-/// A TAGGED file is retired when this slice CONTAINS it — see the replace-set's
-/// own comment for why containment and not equality.
-///
-/// An UNTAGGED file was previously immortal: no tags meant not contained, meant
-/// never removed, so every rebuild stacked another version of every `id` beside
-/// it and nothing could ever collapse them (prod 2026-08-20: 352 such files,
-/// 7.17 versions per id). It is retired only when this partition provably
+/// A TAGGED file is retired when this slice CONTAINS it (containment, not
+/// equality). An UNTAGGED file is retired only when this partition provably
 /// reproduces it, by any of three proofs, cheapest first:
 ///
-/// - the slice spans a WHOLE partition day, so it reproduces everything a file
-///   in `date=D` can hold — files are partitioned by `(project_id, date)`, so
-///   such a file cannot carry rows outside `D`;
-/// - the file's own statistics place it inside this slice. Statistics survive
-///   tag loss, so this reaches a file no tag can identify;
-/// - the union of live tagged slices covers the file's statistics range. This
-///   is the only proof that reaches a LARGE tenant: a day over
-///   `MAX_DECODED_BYTES` is split before it ever runs, so no day-wide slice
-///   exists for it, and a file spanning most of the day fits inside none of the
-///   children either. 21 of the 70 files left after the 2026-08-20 repair were
-///   exactly that shape — reachable by no single slice at any width.
+/// - the slice spans a WHOLE partition day, which reproduces everything a file
+///   in that `(project_id, date)` can hold;
+/// - the file's own statistics place it inside this slice (statistics survive
+///   tag loss, so this reaches a file no tag can identify);
+/// - the union of live tagged slices covers the file's statistics range — the
+///   only proof that reaches a large tenant, whose day is split into slices none
+///   of which contains such a file.
 ///
-/// All three require `rows > 0`: if raw has aged out the rebuild is empty and
-/// the untagged file may be the only copy, so removing it would delete data
-/// rather than a duplicate. And all three require the file to be in this very
-/// partition — another project's file, or another day's, is not reproduced by
-/// this slice however wide it is.
+/// All three require `rows > 0` (an empty rebuild means the untagged file may be
+/// the only copy) and the file to be in this very partition.
 pub(crate) fn slice_retires(file: &LiveFile<'_>, publish: &SlicePublish<'_>) -> bool {
     let (start, end) = publish.slice;
     match file.slice {
         Some((file_start, file_end)) => file.project == Some(publish.project_id) && file_start >= start && file_end <= end,
         None => {
-            if publish.rows == 0 || file.partition != Some((publish.project_id, publish.date)) {
-                return false;
-            }
-            spans_whole_day(start, end) || file.stats.is_some_and(|(lo, hi)| (lo >= start && hi < end) || ranges_cover(publish.covered, (lo, hi)))
+            publish.rows > 0
+                && file.partition == Some((publish.project_id, publish.date))
+                && (spans_whole_day(start, end) || file.stats.is_some_and(|(lo, hi)| (lo >= start && hi < end) || ranges_cover(publish.covered, (lo, hi))))
         }
     }
 }
@@ -1009,14 +843,9 @@ pub(crate) fn slice_retires(file: &LiveFile<'_>, publish: &SlicePublish<'_>) -> 
 /// How many obsolete-generation refusals a derived unit must actually pay for.
 ///
 /// A derived unit refuses a base file whose materialization generation is not
-/// current, and historically ANY refusal made it demand a base rebuild and
-/// retry. That is a livelock whenever the refused file's span is already
-/// reproduced by the current-generation files the unit selected: the rebuild
-/// republishes the same slices and cannot retire the offender, because
-/// `slice_retires` only retires a tagged file CONTAINED in the publishing slice
-/// and the offender is wider than the children a day is published as. Prod
-/// 2026-09-11 sat at `attempts=78`, re-minting every 32 minutes, over
-/// `skipped_generation=1` — one stale file.
+/// current. Demanding a rebuild for EVERY refusal livelocks when the refused
+/// span is already reproduced by the files selected: the rebuild republishes the
+/// same slices and `slice_retires` cannot retire a wider offender.
 ///
 /// `refused` spans are INCLUSIVE of both ends (matching [`ranges_cover`]), and
 /// `None` means the file would not say what it holds — which can never be shown
@@ -1025,8 +854,8 @@ pub(crate) fn slice_retires(file: &LiveFile<'_>, publish: &SlicePublish<'_>) -> 
 /// ```
 /// # use timefusion::rollup::unreproduced_refusals as unpaid;
 /// const H: i64 = 3_600_000_000;
-/// // The prod shape: one stale DAY-wide file over a day published as two halves.
-/// // Both halves are selected, they tile the day, so refusing it costs nothing.
+/// // One stale DAY-wide file over a day published as two halves: both halves
+/// // are selected and tile the day, so refusing it costs nothing.
 /// assert_eq!(unpaid(&[Some((0, 24 * H - 1))], &[(0, 12 * H), (12 * H, 24 * H)]), 0);
 /// // A real hole: the selected files stop at noon, the refusal reaches past it.
 /// assert_eq!(unpaid(&[Some((0, 24 * H - 1))], &[(0, 12 * H)]), 1);
@@ -1064,16 +893,11 @@ pub(crate) fn ranges_cover(ranges: &[(i64, i64)], (lo, hi): (i64, i64)) -> bool 
 /// The sub-ranges of `untagged` that no live tagged slice covers — the exact
 /// work that would close proof C for this partition.
 ///
-/// Queueing the whole DAY instead is what stalled the 2026-08-22 mid-tail: a
-/// day's rollup input is far over `MAX_DECODED_BYTES`, so the preflight shreds
-/// it down the bisection ladder to the one-minute floor — prod held 3,455 units
-/// for a single (project, tier, day), 1,423 of them pending. The actual holes
-/// were 22 MINUTES wide (`18:00-18:22`, `12:00-12:22` — the leftovers of an
-/// earlier shred), each one unit that fits the budget whole.
-///
-/// A partition with no tagged ranges at all yields the untagged spans
-/// themselves, so this is a refinement of "rebuild the day", never a narrowing
-/// below what was already queued.
+/// Queueing the whole DAY instead is far worse: a day's rollup input is normally
+/// over `MAX_DECODED_BYTES`, so the preflight shreds it to the one-minute floor,
+/// while the actual holes usually fit a single unit. A partition with no tagged
+/// ranges yields the untagged spans themselves, so this never narrows below what
+/// "rebuild the day" would have queued.
 ///
 /// Ends are EXCLUSIVE here, but a file's statistics `hi` is a row timestamp, so
 /// callers pass `hi + 1`.
@@ -1098,32 +922,24 @@ pub(crate) fn uncovered_gaps(untagged: &[(i64, i64)], tagged: &[(i64, i64)]) -> 
             gaps.push((reached, hi));
         }
     }
-    // Adjacent holes are ONE hole. Each untagged file contributes its own
-    // statistics span, so a day whose files tile it end-to-end yields a gap per
-    // file; `dedup` alone removes only exact repeats, and the leftovers became a
-    // unit each (prod 2026-08-23: 1,440 sixty-second units for one cell, and
-    // 92.9% of fusion candidates then refused on budget trying to re-assemble
-    // what shredding split). Cheaper never to shred: the coordinator still
-    // bisects a merged hole that genuinely does not fit.
+    // Adjacent holes are ONE hole: each untagged file contributes its own
+    // statistics span, so a day whose files tile it end-to-end would otherwise
+    // yield a unit per file. The coordinator still bisects a merged hole that
+    // genuinely does not fit.
     crate::write::mem_buffer::merge_ranges(gaps)
 }
 
 /// The units `enqueue_untagged_rebuilds` should actually queue for one
 /// partition: gaps snapped to the claimable floor, then merged.
 ///
-/// ALIGN, then merge — the order is the whole point. Merging raw gaps is not
-/// enough, because they come from row statistics: two holes either side of one
-/// file's last row are separated by MILLISECONDS, far too little to matter and
-/// far too much for `merge_ranges` to bridge. Snapped to `MIN_SLICE_MICROS`
-/// they become the same minute, and one unit instead of two overlapping ones.
-///
-/// Aligning first cannot swallow real coverage: no published slice is narrower
-/// than the floor.
+/// ALIGN, then merge — the order matters. Gaps come from row statistics, so two
+/// holes either side of one file's last row are milliseconds apart: too little
+/// to matter, too much for `merge_ranges` to bridge. Aligning first cannot
+/// swallow real coverage, as no published slice is narrower than the floor.
 ///
 /// Where a live tagged slice already CONTAINS a gap, that slice is queued
-/// instead. Publishing the contained span is refused by the `covered_by_wider`
-/// guard — two overlapping files would both stay live — which escalates to the
-/// covering slice and gets there in two hops instead of one.
+/// instead: publishing the contained span would be refused by the
+/// `covered_by_wider` guard anyway.
 pub(crate) fn rebuild_slices(gaps: Vec<(i64, i64)>, tagged: &[(i64, i64)], day_start: i64, day_end: i64) -> Vec<(i64, i64)> {
     let floor = crate::maintenance_coordinator::MIN_SLICE_MICROS;
     let aligned = gaps
@@ -1152,38 +968,20 @@ const fn spans_whole_day(start: i64, end: i64) -> bool {
 
 /// The declared measures a build actually MATERIALIZES, for `TAG_MEASURES`.
 ///
-/// Two independent ways a declared measure ends up as an all-NULL column, one
-/// per tier, and a measure counts only if it survives both:
+/// Two independent ways a declared measure ends up an all-NULL column, and a
+/// measure counts only if it survives both:
 ///
-/// - its INPUT is missing. A derived tier reads the base tier's own state
-///   column (`measure.name`); a base build reads the raw `measure.column`. When
-///   `slice_input_sql` projects `NULL AS …` for it, the aggregate above folds
-///   nulls and writes an empty state.
-/// - its TARGET column is missing. The writer conforms to the tier table as it
-///   already exists, so `cast_record_batch` drops any measure the physical
-///   schema has not been evolved to hold — which is how `duration_digest` was
-///   declared on 2026-08-22 and first written on 08-24. The build now widens
-///   the tier first (`evolve_table_columns`), so this arm only fires when the
-///   widening could not run; the INPUT arm is the one that still bites.
+/// - its INPUT is missing (a derived tier reads `measure.name` on the base tier,
+///   a base build reads the raw `measure.column`), so `slice_input_sql` projects
+///   `NULL AS …` and the aggregate above writes an empty state;
+/// - its TARGET column is missing, so `cast_record_batch` drops it.
 ///
 /// A schema check is not enough on the DERIVED side, which is why
-/// `base_evidence` exists. A derived tier reading base cells that predate the
-/// measure sees the column (the base tier was widened) and folds their NULLs
-/// into an empty state, so those hours would tag the measure as materialized
-/// while holding nothing — and `measures_available`, the gate that exists to
-/// catch exactly this, TRUSTS a tag. Measured on prod 2026-08-25 as a p95 over
-/// 3,438 of 14,830 rows. A derived cell may therefore claim a measure only if
-/// every base cell it consumed proved it too: witness the table you actually
-/// read, the same rule the derived ROW witness follows.
-///
-/// EXPECTED REGRESSION: a derived cell built over old bases now tags HONESTLY,
-/// and the read gate refuses it for that measure where it used to serve it. Some
-/// latency charts get SLOWER on deploy — silent-wrong converted into visible
-/// raw-fallback. That is the intended trade, not a new bug; it clears as those
-/// base cells are rebuilt.
+/// `base_evidence` exists: a derived tier reading base cells that predate the
+/// measure sees the widened column and folds their NULLs into an empty state. A
+/// derived cell may claim a measure only if every base cell it read proved it.
 pub(crate) fn materialized_measures(
-    spec: &RollupSpec, derived: bool, present: &std::collections::HashSet<String>, target: &arrow::datatypes::Schema,
-    base_evidence: Option<&std::collections::HashSet<String>>,
+    spec: &RollupSpec, derived: bool, present: &HashSet<String>, target: &arrow::datatypes::Schema, base_evidence: Option<&HashSet<String>>,
 ) -> Vec<String> {
     spec.measures
         .iter()
@@ -1200,20 +998,15 @@ pub(crate) fn materialized_measures(
 /// What the base cells feeding a derived slice ALL prove they hold, for
 /// `materialized_measures`.
 ///
-/// `None` per cell is a cell with no `TAG_MEASURES` evidence, and it is resolved
-/// exactly as `measures_available(None)` resolves it — everything except
+/// `None` per cell is a cell with no `TAG_MEASURES` evidence, resolved exactly
+/// as `measures_available(None)` resolves it — everything except
 /// `MEASURES_ABSENT_FROM_LEGACY_CELLS`. Treating it as "proves nothing" would
-/// zero the intersection and strip `request_count` from every derived cell built
-/// over a journal-recovered base, which is a fleet-wide count regression far
-/// wider than the digest hole this closes.
+/// zero the intersection for every derived cell built over a legacy base.
 ///
 /// `None` overall means no base cell overlapped the slice at all. Vacuously
-/// permissive on purpose: the base-coverage gate above already retries on a real
-/// hole, so the remaining case is a range the source never held — an EMPTY
-/// derived cell, whose tags cannot mislead anything.
-pub(crate) fn base_measure_evidence<'a>(
-    spec: &RollupSpec, cells: impl Iterator<Item = Option<&'a std::collections::HashSet<String>>>,
-) -> Option<std::collections::HashSet<String>> {
+/// permissive on purpose: the base-coverage gate already retries on a real hole,
+/// so what remains is an EMPTY derived cell, whose tags mislead nothing.
+pub(crate) fn base_measure_evidence<'a>(spec: &RollupSpec, cells: impl Iterator<Item = Option<&'a HashSet<String>>>) -> Option<HashSet<String>> {
     cells
         .map(|held| {
             held.cloned().unwrap_or_else(|| {
@@ -1228,28 +1021,16 @@ pub(crate) fn base_measure_evidence<'a>(
 ///
 /// `schema` describes whatever is registered as `raw` — for a DERIVED tier that
 /// is the BASE TIER, not the raw source. With `dedup` as `None` this emits a
-/// bare `SELECT *`, which is what the derived path used to do: because a tier
-/// holds superseded versions, the aggregate above then SUMs all of them. See
-/// `a_merge_on_read_input_is_deduped_before_the_rollup_aggregate`.
+/// bare `SELECT *`, and since a tier holds superseded versions the aggregate
+/// above would then SUM all of them.
+///
 /// `present` is the column set the registered `raw` provider ACTUALLY has — the
-/// PHYSICAL Delta schema, which is not the synthesized one.
-///
-/// Adding a measure to a rollup spec does not evolve the existing rollup table,
-/// and the writer conforms to the table it already has: a file `dashboard_1m_v3`
-/// wrote on 2026-08-23 22:56 carried `server_duration_digest` and NOT
-/// `duration_digest`, which the spec had declared since 08-22. Selecting the
-/// synthesized field list from that provider is a planning error, and every
-/// derived unit over the tier failed on it — 477 of 658 claims in eight minutes,
-/// a retry loop that froze the 1h tier from 20:17 and starved every other tier.
-///
-/// A column the physical table lacks is projected NULL. Nothing is lost: no file
-/// anywhere holds a value for it, so NULL is what it has always been worth. This
-/// keeps the unit running; the TARGET side is now evolved before the write (see
-/// `evolve_table_columns`), so a declared measure stops being inert from the
-/// first build after its declaration.
+/// PHYSICAL Delta schema, not the synthesized one, since a spec may declare a
+/// measure the table has not been evolved to hold. A column the physical table
+/// lacks is projected NULL.
 pub(crate) fn slice_input_sql(
     schema: &crate::schema::TableSchema, dedup: Option<SliceDedup<'_>>, raw: &str, project_id: &str, (start, end): (i64, i64), shard_predicate: &str,
-    present: Option<&std::collections::HashSet<String>>,
+    present: Option<&HashSet<String>>,
 ) -> String {
     let window = format!(
         "WHERE project_id = {} AND timestamp >= to_timestamp_micros({start}) AND timestamp < to_timestamp_micros({end}){shard_predicate}",
@@ -1283,42 +1064,11 @@ pub(crate) fn slice_input_sql(
 /// Measures a cell WITHOUT `TAG_MEASURES` is known not to hold, and is
 /// therefore refused for.
 ///
-/// A BRIDGE with an expiry. It exists only because cells written before the tag
-/// carry no evidence, and the two wholesale answers are both wrong: trusting
-/// legacy cells preserves the bug this list is here to stop, while refusing them
-/// all sends every count chart back to a raw scan and gives up a verified 7.7x.
-/// Delete the branch — and this constant — once every cell carries the tag, and
-/// ADD AN ENTRY whenever a measure is declared on a spec before the cells that
-/// predate it are rebuilt.
-///
-/// It is not a statement about tdigests. Both audits (2026-08-20, 08-24) found
-/// 14 of 15 declared measures sound on both tiers, `server_duration_digest`
-/// among them, so state encoding is fine — `duration_digest` was declared on
-/// 2026-08-22 (c4d615d) and not materialized until ~08-24 10:30 UTC, and every
-/// date 08-14..08-23 reads `count(duration_digest) = 0` across all 12 projects.
-///
-/// BOUNDARY CORRECTED 2026-08-26, and it moved LATER, not earlier. Probing per
-/// row for `duration_count > 0 AND approx_percentile(0.5, duration_digest) IS
-/// NULL` — which catches a present-but-EMPTY sketch that the earlier count-based
-/// probe could not — the first fully healthy date is **2026-08-25**. Dates up to
-/// 08-23 are 100% unreadable; **08-24 is the dangerous one**, 22-45% empty, so it
-/// answers with a percentile computed from roughly half its rows instead of
-/// declining. Re-sampled 6 minutes apart it was byte-identical: the short-cell
-/// repair rebuilds `request_count`, NOT digests, so this does not self-heal.
-///
-/// Nor can the generation stand in for it: 08-22/08-23 cells carry the CURRENT
-/// generation and still hold no digest.
-///
-/// Nor is "scalar measures are safe" a rule. `Merge::Count` and `Merge::Sum`
-/// fold with SQL `SUM`, which skips NULLs exactly as `tdigest_merge` does — a
-/// missing scalar undercounts just as silently as a missing sketch.
-/// `service_name_hll` is here by the same rule read forward rather than
-/// backward: it is declared 2026-08-26, so it is absent from every cell written
-/// before it BY CONSTRUCTION, tagged or not. `hll_merge` skips the NULLs Delta
-/// fills the missing column with, so a window straddling the declaration would
-/// return a distinct count over only the rebuilt part — plausible, low, and
-/// silent, which is the exact failure the list exists to stop. Any measure
-/// declared from now on belongs here until its history is rebuilt.
+/// A BRIDGE with an expiry, since cells written before `TAG_MEASURES` carry no
+/// evidence. ADD AN ENTRY whenever a measure is declared on a spec before the
+/// cells that predate it are rebuilt; delete the constant once every cell
+/// carries the tag. Scalars belong here too: `SUM` skips the NULLs Delta fills a
+/// missing column with exactly as `tdigest_merge`/`hll_merge` do.
 const MEASURES_ABSENT_FROM_LEGACY_CELLS: [&str; 2] = ["duration_digest", "service_name_hll"];
 
 /// Measures refused on EVERY cell, tagged or not, because their stored state is
@@ -1326,22 +1076,11 @@ const MEASURES_ABSENT_FROM_LEGACY_CELLS: [&str; 2] = ["duration_digest", "servic
 /// declining. Strictly stronger than the list above, which only covers cells
 /// carrying no `TAG_MEASURES` at all.
 ///
-/// This exists because a tag proves the COLUMN was present, not that a VALUE was
-/// written. A derived cell built over base cells that predate a measure sees the
-/// widened column, folds the NULLs Delta fills it with into an EMPTY state, and
-/// tags the measure materialized — so the gate above waves it through.
-///
-/// `service_name_hll` (declared 2026-08-26): audited the same day across four
-/// projects and both tiers, it is absent on EVERY date up to 2026-08-25 and only
-/// 26-68% present on 08-26. `hll_merge` skips NULLs and `distinct_count` of an
-/// empty sketch is **0**, not NULL — so a routed dcount over any window before
-/// 08-26 renders 0 services, and a mixed window renders a low number. Measured
-/// wrong: est 1 vs truth 2, and est 15 vs truth 18 over 08-20..08-26.
-///
-/// DELETE THE ENTRY when the value-presence fix lands AND an audit shows the
-/// measure reads back over the window being served. Until then dcount falls to
-/// raw — correct and slower, which is where it was before the measure existed.
-/// The declaration deliberately STAYS so history keeps accruing toward that day.
+/// A tag proves the COLUMN was present, not that a VALUE was written: a derived
+/// cell over bases that predate a measure folds their NULLs into an EMPTY state
+/// and still tags the measure materialized, and `distinct_count` of an empty HLL
+/// sketch is 0, not NULL. DELETE AN ENTRY only once an audit shows the measure
+/// reads back over the window being served.
 const MEASURES_NOT_YET_SERVABLE: [&str; 1] = ["service_name_hll"];
 
 impl RoutedRollup {
@@ -1353,12 +1092,9 @@ impl RoutedRollup {
     }
 
     /// Whether a cell whose materialized measures are `have` may serve this
-    /// query. `None` is a legacy cell — it carries no `TAG_MEASURES` and so
-    /// proves nothing either way, which is what
-    /// `MEASURES_ABSENT_FROM_LEGACY_CELLS` exists to decide.
-    pub(crate) fn measures_available(&self, have: Option<&std::collections::HashSet<String>>) -> bool {
-        // Checked first and against BOTH arms: a tag cannot vouch for a state
-        // that was never written, so `Some` is no safer than `None` here.
+    /// query. `None` is a legacy cell carrying no `TAG_MEASURES`.
+    pub(crate) fn measures_available(&self, have: Option<&HashSet<String>>) -> bool {
+        // Checked against BOTH arms: a tag cannot vouch for a state never written.
         if self.needed_measure_columns().any(|column| MEASURES_NOT_YET_SERVABLE.contains(&column)) {
             return false;
         }
@@ -1368,13 +1104,9 @@ impl RoutedRollup {
         }
     }
 
-    /// A half-open range predicate. Only `>=`/`<` are ever emitted: an inclusive
-    /// bound on either side of a shared boundary double counts a whole bucket.
-    /// `OPEN_END` marks the trailing range of a window the query left unbounded,
-    /// which renders with no upper bound at all rather than at some stand-in
-    /// instant. It is a sentinel and not a real timestamp: `to_timestamp_micros`
-    /// of it is year 294247, so emitting it literally would be both meaningless
-    /// and, at the boundary, wrong.
+    /// A half-open range predicate. Only `>=`/`<` are emitted: an inclusive bound
+    /// on either side of a shared boundary double counts a whole bucket.
+    /// `OPEN_END` is a sentinel, not a timestamp — it renders as no upper bound.
     fn range_sql(&(start, end): &(i64, i64)) -> String {
         if end == OPEN_END {
             return format!("(timestamp >= to_timestamp_micros({start}))");
@@ -1386,16 +1118,11 @@ impl RoutedRollup {
     /// carries synthetic leg aliases or the query's own names. Empty for an
     /// ungrouped aggregate.
     fn group_by(&self) -> String {
-        if self.groups.is_empty() {
-            return String::new();
-        }
-        format!(" GROUP BY {}", (1..=self.groups.len()).join(", "))
+        if self.groups.is_empty() { String::new() } else { format!(" GROUP BY {}", (1..=self.groups.len()).join(", ")) }
     }
 
-    /// One partial-aggregate SELECT over `ranges`, with synthetic column names.
-    ///
-    /// The aliases are synthetic (`__g0`, `__s1_0`) rather than the query's, so a
-    /// dashboard alias like `c` or `time` can never collide with a state column.
+    /// One partial-aggregate SELECT over `ranges`. Aliases are synthetic
+    /// (`__g0`, `__s1_0`) so a query alias can never collide with a state column.
     fn leg(&self, table: &str, ranges: &[(i64, i64)], extra: &str, projects: &str) -> String {
         let select = self
             .groups
@@ -1414,8 +1141,6 @@ impl RoutedRollup {
     }
 
     /// `project_id = '…' AND `, or empty when the query groups by project_id.
-    /// Both legs and the single-leg shape share it so the rollup and raw sides
-    /// can never disagree about which projects they read.
     fn project_predicate(&self) -> String {
         self.project_id.as_deref().map_or_else(String::new, |project| format!("project_id = {} AND ", sql_literal(project)))
     }
@@ -1424,28 +1149,19 @@ impl RoutedRollup {
     /// subset. Empty only when the query groups by project_id AND every project
     /// proved coverage.
     fn projects_in(&self, projects: Option<&[String]>) -> String {
-        match projects {
-            Some(list) => format!("project_id IN ({}) AND ", list.iter().map(|p| sql_literal(p)).join(", ")),
-            None => self.project_predicate(),
-        }
+        projects.map_or_else(|| self.project_predicate(), |list| format!("project_id IN ({}) AND ", list.iter().map(|p| sql_literal(p)).join(", ")))
     }
 
     /// The rewrite. `interior` is the grain-aligned `[a, b)` the rollup leg owns;
-    /// the raw leg owns exactly `[lo, a)` and `[b, hi)`, so the three are a
-    /// partition of `[lo, hi)` — no gap, no overlap.
-    ///
-    /// When the interior is the whole window this collapses to a single
-    /// statement against the rollup table, which is both cheaper and the shape
-    /// the aligned fast path has always emitted.
+    /// the raw leg owns exactly `[lo, a)` and `[b, hi)`, so the three partition
+    /// `[lo, hi)` — no gap, no overlap.
     pub fn sql(&self, generations: &[(String, String, String)], interiors: &[(i64, i64)], split: &ProjectSplit) -> String {
         let generations = format!(
             " AND ({})",
             generations
                 .iter()
                 // A generation id hashes the project, so a cross-project rewrite
-                // cannot name one per date — it must name one per (project,
-                // date) or it would accept another project's generation for the
-                // same day.
+                // must name one per (project, date), not per date.
                 .map(|(project, date, generation)| match self.project_id {
                     Some(_) => format!("(date = {} AND rollup_generation = {})", sql_literal(date), sql_literal(generation)),
                     None =>
@@ -1453,17 +1169,13 @@ impl RoutedRollup {
                 })
                 .join(" OR ")
         );
-        // An open-ended window's raw leg must run to the sentinel, not to the
-        // stand-in `hi`: `complement` would otherwise stop the tail there and
-        // the rewrite would answer without the newest rows.
+        // An open-ended window's raw leg must run to the sentinel, not the
+        // stand-in `hi`, or the rewrite answers without the newest rows.
         let fringes = complement(self.lo, if self.open_end { OPEN_END } else { self.hi }, interiors);
         let rollup_projects = self.projects_in(split.covered.as_deref());
         // A project whose coverage was not proved is read raw across the WHOLE
-        // window. Together with the covered projects' rollup interior and raw
-        // fringes that is an exact partition of (project x time): every cell is
-        // read by exactly one leg, so nothing is dropped and nothing double
-        // counted. Without it a single uncovered project refused the query for
-        // every other project.
+        // window; with the covered projects' interior and fringes that is an
+        // exact partition of (project x time).
         let raw_only_leg = (!split.raw_only.is_empty()).then(|| {
             let whole = [(self.lo, if self.open_end { OPEN_END } else { self.hi })];
             self.leg(&self.source, &whole, "", &self.projects_in(Some(&split.raw_only)))
@@ -1518,14 +1230,9 @@ fn unaliased(expr: &datafusion::logical_expr::Expr) -> &datafusion::logical_expr
 /// `COALESCE(<column>, '<literal>')`, returning the column and the literal.
 ///
 /// Two spellings, because DataFusion's simplifier rewrites `coalesce` into a
-/// `CASE` before the matcher ever sees it — the form prod logs show as
-/// `Case { expr: None, when_then_expr: [(IsNotNull(c), c)], else_expr: Some(lit) }`.
-/// Matching only the `ScalarFunction` spelling silently never fires, which is
-/// how this shape went unrouted in the first place.
-///
-/// Deliberately narrow: exactly one `WHEN`, whose predicate and result are the
-/// SAME column, and a string literal fallback. A three-argument coalesce, or one
-/// over an expression rather than a column, yields `None` and keeps declining.
+/// `CASE` before the matcher sees it. Deliberately narrow: exactly one `WHEN`,
+/// whose predicate and result are the SAME column, and a string literal
+/// fallback. Anything else yields `None`.
 fn coalesced_column(expr: &datafusion::logical_expr::Expr) -> Option<(&str, &str)> {
     use datafusion::logical_expr::Expr;
     match unaliased(expr) {
@@ -1543,10 +1250,8 @@ fn coalesced_column(expr: &datafusion::logical_expr::Expr) -> Option<(&str, &str
 
 /// The `CASE WHEN <probed> IS NOT NULL THEN <then> …` shape DataFusion's
 /// simplifier leaves behind where the query said `coalesce`, as
-/// `(<probed>, <then>)`. ONE spelling of the shape itself — a divergence between
-/// the matcher above and the simplifier below is invisible, the matcher would
-/// simply stop firing, which is how this shape went unrouted in the first place.
-/// How narrowly each caller accepts `probed` stays the caller's own decision.
+/// `(<probed>, <then>)`. Keep ONE spelling of the shape here; how narrowly a
+/// caller accepts `probed` stays the caller's decision.
 fn null_guard_case(case: &datafusion::logical_expr::Case) -> Option<(&datafusion::logical_expr::Expr, &datafusion::logical_expr::Expr)> {
     let [(when, then)] = &case.when_then_expr[..] else { return None };
     case.expr.is_none().then_some(())?;
@@ -1604,14 +1309,10 @@ fn simplify_filtered_group(
 ///
 /// Only `EPOCH` qualifies: every other field (`hour`, `dow`, …) is many-to-one
 /// over buckets and would merge groups the raw path keeps apart. Only integer
-/// casts qualify, because those are the ones whose SQL spelling is reproduced
-/// exactly; anything else declines rather than guessing a type.
+/// casts qualify — those are the ones whose SQL spelling is reproduced exactly.
 fn epoch_of(expr: &datafusion::logical_expr::Expr) -> Option<(&datafusion::logical_expr::Expr, Option<&'static str>)> {
     use datafusion::logical_expr::Expr;
-    let expr = match expr {
-        Expr::Alias(alias) => alias.expr.as_ref(),
-        expr => expr,
-    };
+    let expr = if let Expr::Alias(alias) = expr { alias.expr.as_ref() } else { expr };
     let (expr, cast) = match expr {
         Expr::Cast(inner) => (
             inner.expr.as_ref(),
@@ -1650,7 +1351,7 @@ fn string_literal(expr: &datafusion::logical_expr::Expr) -> Option<&str> {
 /// The literal that `column = '…'` compares against, in either operand order.
 ///
 /// `None` for any other shape — including `project_id = other_column`, which
-/// must stay a predicate the matcher cannot honour rather than being consumed.
+/// must stay an unhonoured predicate rather than being consumed.
 fn eq_literal<'a>(expr: &'a datafusion::logical_expr::Expr, column: &str) -> Option<&'a str> {
     use datafusion::logical_expr::{Expr, Operator};
     let Expr::BinaryExpr(binary) = unaliased(expr) else { return None };
@@ -1662,17 +1363,13 @@ fn eq_literal<'a>(expr: &'a datafusion::logical_expr::Expr, column: &str) -> Opt
 
 /// A timestamp bound in microseconds, whatever precision the literal carries.
 ///
-/// `now()` const-folds to a NANOSECOND literal, so accepting only microseconds
-/// silently refused every `timestamp < now()` window — which is most ad-hoc
-/// queries, and was measured missing in production while the identical window
-/// written with explicit literals routed.
+/// `now()` const-folds to a NANOSECOND literal, so nanosecond bounds must be
+/// accepted or `timestamp < now()` windows never route.
 ///
-/// Sub-microsecond bounds convert by rounding UP, which is exact rather than
-/// merely close: the column is microsecond-typed, so a row at `t` µs satisfies
-/// `t*1000 >= lo_ns` exactly when `t >= ceil(lo_ns/1000)`, and `t*1000 < hi_ns`
-/// exactly when `t < ceil(hi_ns/1000)`. The same ceiling therefore serves both
-/// ends; flooring either one would shift the window by up to a microsecond and
-/// silently include or drop rows.
+/// Sub-microsecond bounds round UP, which is exact for both ends on a
+/// microsecond-typed column: `t*1000 >= lo_ns` iff `t >= ceil(lo_ns/1000)` and
+/// `t*1000 < hi_ns` iff `t < ceil(hi_ns/1000)`. Flooring either shifts the
+/// window and silently includes or drops rows.
 fn timestamp_literal(expr: &datafusion::logical_expr::Expr) -> Option<i64> {
     use datafusion::scalar::ScalarValue;
     let ceil_div = |value: i64, per_micro: i64| value.checked_add(per_micro - 1).map(|v| v.div_euclid(per_micro));
@@ -1694,22 +1391,19 @@ fn dimension_filter_sql(expr: &datafusion::logical_expr::Expr, dimensions: &[Str
         scalar::ScalarValue,
     };
 
-    let literal = |value: &ScalarValue| match value {
-        ScalarValue::Utf8(Some(value)) | ScalarValue::Utf8View(Some(value)) => Some(sql_literal(value)),
-        ScalarValue::Boolean(Some(value)) => Some(value.to_string()),
-        ScalarValue::Int8(Some(value)) => Some(value.to_string()),
-        ScalarValue::Int16(Some(value)) => Some(value.to_string()),
-        ScalarValue::Int32(Some(value)) => Some(value.to_string()),
-        ScalarValue::Int64(Some(value)) => Some(value.to_string()),
-        ScalarValue::UInt8(Some(value)) => Some(value.to_string()),
-        ScalarValue::UInt16(Some(value)) => Some(value.to_string()),
-        ScalarValue::UInt32(Some(value)) => Some(value.to_string()),
-        ScalarValue::UInt64(Some(value)) => Some(value.to_string()),
-        ScalarValue::Float32(Some(value)) => Some(value.to_string()),
-        ScalarValue::Float64(Some(value)) => Some(value.to_string()),
-        ScalarValue::Null => Some("NULL".to_string()),
-        _ => None,
-    };
+    // One generated arm per scalar that renders as itself — through the INNER
+    // value's `Display`, never `ScalarValue`'s own (which spells its type).
+    macro_rules! display_arms {
+        ($($variant:ident),+) => {
+            |value: &ScalarValue| match value {
+                ScalarValue::Utf8(Some(value)) | ScalarValue::Utf8View(Some(value)) => Some(sql_literal(value)),
+                $(ScalarValue::$variant(Some(value)) => Some(value.to_string()),)+
+                ScalarValue::Null => Some("NULL".to_string()),
+                _ => None,
+            }
+        };
+    }
+    let literal = display_arms!(Boolean, Int8, Int16, Int32, Int64, UInt8, UInt16, UInt32, UInt64, Float32, Float64);
     let operator = |operator| match operator {
         Operator::Eq => Some("="),
         Operator::NotEq => Some("<>"),
@@ -1729,9 +1423,6 @@ fn dimension_filter_sql(expr: &datafusion::logical_expr::Expr, dimensions: &[Str
         }
         Expr::IsNull(expr) => Some(format!("{} IS NULL", dimension_filter_sql(expr, dimensions)?)),
         Expr::IsNotNull(expr) => Some(format!("{} IS NOT NULL", dimension_filter_sql(expr, dimensions)?)),
-        // `metric_name IN (…)` is how every metrics panel selects its series;
-        // without this the whole otel_metrics dashboard is one residual filter
-        // away from never routing.
         Expr::InList(list) => Some(format!(
             "{} {}IN ({})",
             dimension_filter_sql(&list.expr, dimensions)?,
@@ -1746,14 +1437,9 @@ fn canonical(expr: &datafusion::logical_expr::Expr) -> String {
     use datafusion::logical_expr::{Expr, Operator};
     match unaliased(expr) {
         Expr::Column(column) => column.name.clone(),
-        // The three string scalars collapse to ONE spelling. `{:?}` names the
-        // Rust type, so `Utf8("server")` and `Utf8View("server")` canonicalized
-        // differently and a query's filter could not match the identical
-        // declared one. Prod hit this and no local test could: the plan cache
-        // lifts a literal to `$N` and casts it to the inferred param type, while
-        // the measure probe parses the same literal inline and coerces it its
-        // own way — two spellings of one predicate. A MemTable session and the
-        // integration harness both lack a plan cache, so both agreed.
+        // The three string scalars must collapse to ONE spelling: `{:?}` names
+        // the Rust type, so `Utf8("x")` and `Utf8View("x")` would canonicalize
+        // differently and identical predicates would fail to match.
         Expr::Literal(value, _) => match value {
             datafusion::scalar::ScalarValue::Utf8(value)
             | datafusion::scalar::ScalarValue::Utf8View(value)
@@ -1775,13 +1461,10 @@ fn canonical(expr: &datafusion::logical_expr::Expr) -> String {
             if binary.op == Operator::And {
                 strip_index_hints(&mut operands);
             }
-            // Idempotence, at EVERY level rather than only the outermost one:
-            // the duplicated conjuncts observed in prod were nested inside an OR
-            // branch, where a top-level dedupe cannot reach them.
-            //
-            // `exactly_one` carries the other half: stripping or deduping can
-            // leave one operand, and a one-element conjunction IS that operand —
-            // `((X))` must not differ from `(X)`.
+            // Idempotence at EVERY level, not just the outermost: duplicated
+            // conjuncts also occur nested inside an OR branch. `exactly_one`
+            // covers the other half — a one-element conjunction IS that operand,
+            // so `((X))` must not differ from `(X)`.
             let separator = if binary.op == Operator::And { " AND " } else { " OR " };
             operands.into_iter().map(canonical).sorted().dedup().exactly_one().unwrap_or_else(|mut terms| format!("({})", terms.join(separator)))
         }
@@ -1794,35 +1477,23 @@ fn canonical(expr: &datafusion::logical_expr::Expr) -> String {
 
 /// Drop tantivy `text_match` accelerators from one AND level.
 ///
-/// `optimizers::tantivy_rewriter` ADDITIVELY ANDs `text_match(col, q)` next to a
-/// predicate it can accelerate and, by its own stated invariant, never removes
-/// the original comparison — so the semantics live entirely in the other terms
-/// and the hint is noise for an equality comparison.
-///
-/// It has to go, because the two sides do not receive the same hints. Measured
-/// in prod 2026-08-12, the query side of the Golden Signals filter carried
-/// THREE hints in two different arities — `text_match(kind,"server")` and
-/// `text_match(kind,"server","eq")` — where the declared measure filter carried
-/// one. That is also a rewriter bug (its invariant 3 claims idempotence under
-/// repeated passes), but the matcher must not depend on the rewriter being
-/// idempotent to compare two spellings of the same predicate.
+/// `optimizers::tantivy_rewriter` ADDITIVELY ANDs `text_match(col, q)` beside a
+/// predicate it accelerates and never removes the original, so the hint carries
+/// no semantics. It must be stripped because the query side and the declared
+/// measure filter do not receive the same hints, and the matcher must not depend
+/// on the rewriter being idempotent to compare two spellings of one predicate.
 ///
 /// Only a hint on a column this AND level already compares is dropped, so a
-/// `text_match` the USER wrote against some other column is preserved and the
-/// filter correctly fails to match any declared measure.
+/// `text_match` the USER wrote against another column is preserved.
 fn strip_index_hints(operands: &mut Vec<&datafusion::logical_expr::Expr>) {
     use datafusion::logical_expr::{Expr, Operator};
     fn hint_column(expr: &Expr) -> Option<String> {
         match unaliased(expr) {
-            Expr::ScalarFunction(function) if function.name() == "text_match" => match unaliased(function.args.first()?) {
-                Expr::Column(column) => Some(column.name.clone()),
-                _ => None,
-            },
-            // The IN-list spelling: the rewriter expands `col IN (a, b, …)`
-            // into an OR of per-item `text_match` calls, so the hint arrives as
-            // a whole subtree rather than a node. Only an OR whose EVERY leaf
-            // hints the SAME column counts — a mixed OR is a real predicate and
-            // dropping it would widen the filter.
+            Expr::ScalarFunction(function) if function.name() == "text_match" => column_name(function.args.first()?).map(str::to_string),
+            // The IN-list spelling arrives as a whole OR subtree of per-item
+            // `text_match` calls. Only an OR whose EVERY leaf hints the SAME
+            // column counts — a mixed OR is a real predicate, and dropping it
+            // would widen the filter.
             Expr::BinaryExpr(binary) if binary.op == Operator::Or => {
                 let (left, right) = (hint_column(&binary.left)?, hint_column(&binary.right)?);
                 (left == right).then_some(left)
@@ -1839,13 +1510,9 @@ fn strip_index_hints(operands: &mut Vec<&datafusion::logical_expr::Expr>) {
 }
 
 fn canonical_and<'a>(expressions: impl IntoIterator<Item = &'a datafusion::logical_expr::Expr>) -> String {
-    // AND is idempotent, so `X AND X` must canonicalize to `X`. Both sides
-    // genuinely do repeat conjuncts: the optimizer leaves a predicate on the
-    // Filter node AND re-pushes it into the TableScan's `partial_filters`, so
-    // `source_and_filters` collects it twice (observed in prod 2026-08-12 —
-    // every declared filter printed as `(X) AND (X)`). It happened to cancel
-    // out while both sides duplicated equally, which is precisely the kind of
-    // accident that stops holding the moment one side is shaped differently.
+    // AND is idempotent, so `X AND X` must canonicalize to `X`. Both sides do
+    // repeat conjuncts: the optimizer leaves a predicate on the Filter node AND
+    // re-pushes it into the TableScan, so `source_and_filters` collects it twice.
     expressions.into_iter().map(canonical).sorted().dedup().join(" AND ")
 }
 
@@ -1863,13 +1530,8 @@ fn parse_bucket_micros(value: &str) -> Option<i64> {
 }
 
 /// The scanned table, or a description of the node that stopped the walk.
-///
-/// The `Err` side is the whole reason this returns a `Result` rather than an
-/// `Option`: `UnwalkableSource` became the largest miss reason in production
-/// (157 of 379 over 8h on 2026-08-25) while emitting nothing at all, so the
-/// class could not be attributed to a shape without a deploy. Describing the
-/// refusal at the point of refusal keeps that description single-sourced — a
-/// parallel "explain why it refused" walk drifts from the walk it explains.
+/// The `Err` side describes the refusal at the point of refusal, so the
+/// description cannot drift from the walk it explains.
 pub(crate) fn source_and_filters(plan: &datafusion::logical_expr::LogicalPlan, filters: &mut Vec<datafusion::logical_expr::Expr>) -> Result<String, String> {
     use datafusion::logical_expr::{Expr, LogicalPlan};
     match plan {
@@ -1887,40 +1549,21 @@ pub(crate) fn source_and_filters(plan: &datafusion::logical_expr::LogicalPlan, f
             filters.extend(scan.filters.clone());
             Ok(scan.table_name.table().to_string())
         }
-        // Name only the exprs that DISQUALIFIED the projection, never the whole
-        // node: the `SELECT *` variant-wrap over `otel_logs_and_spans` projects
-        // every column of a wide schema, and `display()` on it is a multi-KB
-        // log line.
+        // Name only the exprs that DISQUALIFIED the projection: `display()` on a
+        // wide `SELECT *` node is a multi-KB log line.
         LogicalPlan::Projection(projection) => {
             Err(truncated(&format!("Projection: {}", projection.expr.iter().filter(|expr| !matches!(expr, Expr::Column(_))).take(4).join(", "))))
         }
-        // A derived table or CTE — `count(1) FROM (SELECT id …) t` is the shape
-        // every monoscope benchmark and every top-K CTE emits, and it was the
-        // largest miss class on prod (126 of 414, 2026-08-25).
-        //
-        // An alias re-qualifies; it never RENAMES. `t.id` outside is
-        // `otel_logs_and_spans.id` inside, and every matcher below reads
-        // `Column::name` alone — `column_name`, `canonical`'s Column arm,
-        // `dimension_filter_sql`, `eq_literal`, `is_probe_scaffolding`. The chain
-        // admitted here holds exactly ONE TableScan (the projection arm above is
-        // rename-free and nothing else is walked), so a bare name still
-        // identifies exactly one column. A subquery that DOES rename is refused
-        // by that same projection arm, one level down — which is what stops
-        // `SELECT kind AS status_code` from being read as the dimension.
-        //
-        // On the output side the aggregate keeps the alias qualifier on its group
-        // fields; `dml::requalified` restores it onto the rewrite field for field,
-        // and `substitute`'s bottom-up `recompute_schema` re-resolves the parent's
-        // `Column(t, …)` against it, so a qualifier that did not line up fails
-        // there as a recorded miss rather than answering.
+        // A derived table or CTE. An alias re-qualifies; it never RENAMES, and
+        // the chain admitted here holds exactly ONE TableScan, so the bare
+        // `Column::name` every matcher below reads still identifies one column.
+        // A subquery that DOES rename is refused by the projection arm above.
         LogicalPlan::SubqueryAlias(alias) => {
             let source = source_and_filters(&alias.input, filters)?;
-            // One spelling for the whole chain. The optimizer both leaves a
-            // predicate on a Filter and re-pushes it into the TableScan, so the
-            // same conjunct arrives twice — once qualified by the alias, once by
-            // the scan — and `canonical_and`'s idempotence dedup (see there)
-            // could no longer cancel the pair. Lossless: one scan, so the name
-            // is the identity.
+            // Unqualify so the whole chain has one spelling: the same conjunct
+            // arrives twice, once qualified by the alias and once by the scan,
+            // and `canonical_and`'s dedup could not otherwise cancel the pair.
+            // Lossless — one scan, so the name is the identity.
             use datafusion::common::{
                 Column,
                 tree_node::{Transformed, TreeNode},
@@ -1945,30 +1588,19 @@ pub(crate) fn source_and_filters(plan: &datafusion::logical_expr::LogicalPlan, f
 /// One bounded log field: node descriptions are attacker-free but unbounded.
 fn truncated(text: &str) -> String {
     const LIMIT: usize = 240;
-    match text.char_indices().nth(LIMIT) {
-        None => text.to_string(),
-        Some((cut, _)) => format!("{}…", &text[..cut]),
-    }
+    text.char_indices().nth(LIMIT).map_or_else(|| text.to_string(), |(cut, _)| format!("{}…", &text[..cut]))
 }
 
 /// Undo DataFusion's common-subexpression extraction, for MATCHING only.
 ///
-/// `GROUP BY COALESCE(status_code, 'null')` plans as a `CASE` that names its
-/// operand twice, so CSE lifts the operand into `Projection: … AS
-/// __common_expr_1` and the aggregate groups by `CASE WHEN __common_expr_1 …`.
-/// Every dimension matcher below reads bare columns, so the group expression
-/// stopped resembling a dimension and `source_and_filters` refused the aliased
-/// projection outright — the query fell through with no reason recorded at all.
-/// That is not an edge case: it is the shape monoscope emits for EVERY chart
-/// (`COALESCE(<dimension>::text, 'null')`), and on prod 2026-08-25 it cost 39.2s
-/// against 4.25s for the identical query written with a bare column.
+/// `GROUP BY COALESCE(c, 'null')` plans as a `CASE` naming its operand twice, so
+/// CSE lifts it into `Projection: … AS __common_expr_1` and the group expression
+/// stops resembling a dimension. Substituting each `__common_expr_N` back
+/// restores the pre-CSE shape.
 ///
-/// Substituting each `__common_expr_N` back into the aggregate's own expressions
-/// restores the pre-CSE shape. Deliberately narrow, because walking through a
-/// projection that RENAMES would make the matcher read a dimension off the wrong
-/// column: only CSE's own generated aliases are inlined, any other alias
-/// declines, and the rebuilt aggregate must still carry field-for-field the same
-/// names and types — it stands in for the original only where they agree.
+/// Deliberately narrow — walking through a projection that RENAMES would read a
+/// dimension off the wrong column. Only CSE's own aliases are inlined, and the
+/// rebuilt aggregate must carry field-for-field the same names and types.
 pub(crate) fn inline_common_exprs(aggregate: &datafusion::logical_expr::Aggregate) -> Option<datafusion::logical_expr::Aggregate> {
     use datafusion::common::tree_node::{Transformed, TreeNode};
     use datafusion::logical_expr::{Aggregate, Expr, LogicalPlan};
@@ -1976,8 +1608,8 @@ pub(crate) fn inline_common_exprs(aggregate: &datafusion::logical_expr::Aggregat
     const CSE_PREFIX: &str = "__common_expr_";
 
     let LogicalPlan::Projection(projection) = aggregate.input.as_ref() else { return None };
-    // A rename, a computed projection — anything else is exactly what
-    // `source_and_filters` refuses to walk, and for the same reason.
+    // A rename or a computed projection declines, exactly as in
+    // `source_and_filters` and for the same reason.
     let definitions = projection.expr.iter().try_fold(std::collections::HashMap::new(), |mut definitions, expr| match expr {
         Expr::Alias(alias) if alias.name.starts_with(CSE_PREFIX) => {
             definitions.insert(alias.name.clone(), alias.expr.as_ref().clone());
@@ -1986,9 +1618,7 @@ pub(crate) fn inline_common_exprs(aggregate: &datafusion::logical_expr::Aggregat
         Expr::Column(_) => Some(definitions),
         _ => None,
     })?;
-    if definitions.is_empty() {
-        return None;
-    }
+    (!definitions.is_empty()).then_some(())?;
     let inline = |expr: &Expr| {
         expr.clone()
             .transform_up(|node| {
@@ -1999,9 +1629,8 @@ pub(crate) fn inline_common_exprs(aggregate: &datafusion::logical_expr::Aggregat
             })
             .map(|transformed| transformed.data)
             .ok()
-            // CSE may define one alias in terms of another; a single bottom-up
-            // pass would leave the inner one dangling over a scan that has no
-            // such column. Decline rather than route a half-substituted shape.
+            // CSE may define one alias in terms of another; one bottom-up pass
+            // leaves the inner one dangling, so decline a half-substituted shape.
             .filter(|inlined| !inlined.column_refs().iter().any(|column| column.name.starts_with(CSE_PREFIX)))
     };
     let group_expr = aggregate.group_expr.iter().map(inline).collect::<Option<Vec<_>>>()?;
@@ -2022,12 +1651,9 @@ fn scanned_table(plan: &datafusion::logical_expr::LogicalPlan) -> Option<String>
     }
 }
 
-/// Does this predicate constrain ONLY `project_id`/`timestamp`?
-///
-/// Those are the two the probe injects to satisfy the scan admission guard, and
-/// they are also the two a measure filter can never usefully be about — the
-/// rollup is already partitioned by project and bucketed by time. So dropping
-/// them recovers exactly the declared predicate.
+/// Does this predicate constrain ONLY `project_id`/`timestamp`? Those are the
+/// two the probe injects to satisfy the scan admission guard, so dropping them
+/// recovers exactly the declared predicate.
 fn is_probe_scaffolding(expr: &datafusion::logical_expr::Expr) -> bool {
     let columns = expr.column_refs();
     !columns.is_empty() && columns.iter().all(|column| matches!(column.name.as_str(), "project_id" | "timestamp"))
@@ -2035,13 +1661,10 @@ fn is_probe_scaffolding(expr: &datafusion::logical_expr::Expr) -> bool {
 
 /// Canonicalized declared filters, keyed by (source, spec, measure).
 ///
-/// The probe below PLANS a statement per filtered measure, and the matcher runs
-/// on every aggregate query — 9 filtered measures across 2 tiers is 18 logical
-/// plans per query, paid even by queries that then decline. The canonical form
-/// depends only on the declared filter text and the schema's coercion rules;
-/// the project and time bounds are injected purely to satisfy the scan
-/// admission guard and stripped straight back out, so the result is the same
-/// for every caller and safe to memoize for the life of the process.
+/// The probe below PLANS a statement per filtered measure on every aggregate
+/// query, which is expensive. The canonical form depends only on the declared
+/// filter text and the schema's coercion rules — the injected project/time
+/// bounds are stripped back out — so it is safe to memoize for the process.
 static MEASURE_FILTERS: std::sync::OnceLock<dashmap::DashMap<(String, String, String), String>> = std::sync::OnceLock::new();
 
 async fn measure_filters<'a>(
@@ -2057,36 +1680,21 @@ async fn measure_filters<'a>(
         }
         let filter = match &measure.filter {
             None => String::new(),
-            // Canonicalized through the SAME pipeline the query side went
-            // through — optimized (so literals carry the coerced type) and split
-            // into conjuncts — or the two strings can never be equal and every
-            // filtered measure is dead weight.
+            // Canonicalized through the SAME pipeline as the query side —
+            // optimized so literals carry the coerced type, then split into
+            // conjuncts — or the two strings can never be equal.
             Some(filter) => {
                 // `SELECT timestamp`, never `SELECT *`: on a real session `*`
-                // expands to every column, and the Variant rewriter wraps the
-                // Variant ones in `variant_to_json(…)`. That projection is not
-                // rename-free, so `source_and_filters` refuses to walk it and
-                // EVERY filtered measure — hence every spec declaring one —
-                // failed to resolve. Unit tests could not see it: a bare
-                // `MemTable` session has no Variant rewriter registered.
-                //
-                // The probe also carries the QUERY's project and time bounds.
-                // Without them the scan admission guard rejects it outright —
-                // an unbounded scan of the whole table is exactly what that
-                // guard exists to stop — so on a real session every filtered
-                // measure failed and `otel_logs_and_spans`, whose nine
-                // `server_*` measures all declare filters, could never route at
-                // all. `otel_metrics` routed only because its measures declare
-                // none, so it skipped this probe entirely. The injected
-                // predicates are stripped back out below.
+                // expands to every column and the Variant rewriter wraps some in
+                // `variant_to_json(…)`, a projection `source_and_filters` refuses
+                // to walk. The project and time bounds satisfy the scan admission
+                // guard and are stripped back out below.
                 let probe = format!(
                     "SELECT timestamp FROM {source} WHERE project_id = {} AND timestamp >= to_timestamp_micros({lo}) AND timestamp < to_timestamp_micros({hi}) AND ({filter})",
                     sql_literal(project_id)
                 );
                 // A failure here disqualifies EVERY filtered measure, so the spec
-                // stops routing at all — and from outside the process it looks
-                // identical to a query whose own filter simply did not match.
-                // Discarding the error is what made the two indistinguishable.
+                // stops routing at all — log it rather than discarding the error.
                 let planned = async { session.optimize(&session.create_logical_plan(&probe).await?) }.await;
                 let plan = planned.map_err(|error| {
                     tracing::warn!(event = "rollup_measure_probe_failed", source, measure = %measure.name, probe, %error, "a declared measure filter could not be planned");
@@ -2108,13 +1716,10 @@ async fn measure_filters<'a>(
 
 /// The outermost `Aggregate`, wherever the optimizer put it.
 ///
-/// Nothing above it is inspected, peeled or rebuilt. The rewrite is
-/// substituted for this node IN PLACE, and a node carrying the aggregate's
-/// output names and types is interchangeable with it by construction —
-/// which is a property of the aggregate alone. Earlier versions matched a
-/// fixed grammar of parents (`Sort`, then `Limit`, then a second
-/// `Projection`…) and production kept producing one layer more than the
-/// grammar knew, because the shape depends on the session's analyzer rules.
+/// Nothing above it is inspected, peeled or rebuilt: the rewrite is substituted
+/// IN PLACE, and a node carrying the aggregate's output names and types is
+/// interchangeable with it. Do not match a fixed grammar of parent nodes — the
+/// shape above depends on the session's analyzer rules.
 fn outermost_aggregate(plan: &datafusion::logical_expr::LogicalPlan) -> Option<&datafusion::logical_expr::LogicalPlan> {
     match plan {
         datafusion::logical_expr::LogicalPlan::Aggregate(_) => Some(plan),
@@ -2131,11 +1736,9 @@ pub(crate) async fn match_aggregates(
 ) -> Result<Vec<RoutedRollup>, MissReason> {
     use datafusion::logical_expr::LogicalPlan;
 
-    // Read paths only. Searching the whole tree — rather than a peeled root —
-    // means an aggregate nested inside a statement is now reachable, and neither
-    // kind is ours: rewriting inside an UPDATE would return a plan the DML
-    // interception below never sees, and rewriting inside an EXPLAIN would
-    // record a hit for a query that never runs.
+    // Read paths only: the whole-tree search would otherwise reach an aggregate
+    // nested inside a DML statement or an EXPLAIN, neither of which may be
+    // rewritten.
     if matches!(
         plan,
         LogicalPlan::Dml(_) | LogicalPlan::Ddl(_) | LogicalPlan::Copy(_) | LogicalPlan::Explain(_) | LogicalPlan::Analyze(_) | LogicalPlan::Statement(_)
@@ -2145,8 +1748,7 @@ pub(crate) async fn match_aggregates(
     let Some(matched) = outermost_aggregate(plan) else { return Ok(Vec::new()) };
     let LogicalPlan::Aggregate(original) = matched else { unreachable!("outermost_aggregate returns an Aggregate") };
     // Match against the pre-CSE shape where there is one. `matched` stays the
-    // node actually in the tree, because that is what the rewrite substitutes
-    // for; the inlined copy only ever answers "does this resemble a dimension".
+    // node actually in the tree — that is what the rewrite substitutes for.
     let inlined = inline_common_exprs(original);
     let aggregate = inlined.as_ref().unwrap_or(original);
     let shape = || matched.display_indent_schema().to_string().lines().take(6).join(" | ");
@@ -2155,23 +1757,15 @@ pub(crate) async fn match_aggregates(
         Ok(source) => source,
         Err(node) => {
             // Count this ONLY when a rollup-bearing table sits underneath; an
-            // aggregate over a join or `pg_catalog` was never a candidate and must
-            // not inflate the reason breakdown. See `MissReason::UnwalkableSource`.
+            // aggregate over a join or `pg_catalog` was never a candidate.
             if let Some(table) =
                 scanned_table(&aggregate.input).filter(|table| crate::schema::get_schema(table).is_some_and(|schema| !schema.rollups.is_empty()))
             {
                 crate::observability::record_rollup_miss(MissReason::UnwalkableSource);
-                // Unconditional warn, not `sample_rollup_miss`: even budgeted per
-                // reason that sampler is 1-in-64, and this class runs ~20/hr, so
-                // sampling would print one line every three hours — the same
-                // invisibility this event exists to end. `node` is bounded by
-                // `truncated`.
-                //
-                // `inlined_cse` separates two populations that look identical in
-                // the dump: a `__common_expr_N` projection here means
-                // `inline_common_exprs` itself declined (mixed alias+rename,
-                // a dangling nested CSE reference, or a rebuild whose schema
-                // stopped matching), NOT that CSE is unhandled.
+                // Unconditional warn, not `sample_rollup_miss`: this class is too
+                // rare to survive 1-in-64 sampling. `node` is bounded by
+                // `truncated`. `inlined_cse` distinguishes "CSE unhandled" from
+                // "`inline_common_exprs` itself declined".
                 tracing::warn!(
                     event = "rollup_declined_shape",
                     source = %table,
@@ -2187,11 +1781,8 @@ pub(crate) async fn match_aggregates(
     };
     let Some(schema) = crate::schema::get_schema(&source).filter(|schema| !schema.rollups.is_empty()) else { return Ok(Vec::new()) };
 
-    // Try every declared rollup, coarsest grain first: a coarser grain reads
-    // strictly fewer rows for the same answer. Ties break toward the narrower
-    // dimension set, which is the smaller table. A spec that cannot serve this
-    // query — wrong grain, missing dimension, missing measure — declines and the
-    // next one is tried, so adding a spec can only ever widen what routes.
+    // Coarsest grain first: a coarser grain reads strictly fewer rows for the
+    // same answer. Ties break toward the narrower dimension set (smaller table).
     let candidates = schema.rollups.iter().sorted_by_key(|spec| (std::cmp::Reverse(spec.grain_micros().unwrap_or(0)), spec.dimensions.len()));
     let (mut miss, mut grain_miss) = (None, None);
     let mut routes = Vec::new();
@@ -2200,45 +1791,23 @@ pub(crate) async fn match_aggregates(
             // The rewrite replaces the node that is IN the tree, never the
             // inlined stand-in — `substitute` finds it by structural equality.
             Ok(route) => routes.push(RoutedRollup { matched: matched.clone(), ..route }),
-            // GRAIN-ONLY disqualifications never win the report. `PartialBucket`
-            // (bucket width not a whole number of grains) and `TinyInterior`
-            // (window shorter than `MIN_INTERIOR_BUCKETS` grains) are the whole
-            // class: each compares the spec's grain against a width the QUERY
-            // chose and reads nothing else about what the spec declares, so
-            // neither names anything an operator could act on. Every other
-            // reason is a declared-schema gap, which is actionable.
-            //
-            // Reporting them masked the real reason at every sub-hour width,
-            // because the coarsest tier is disqualified that way there by
-            // construction — and monoscope's 3-day charts bucket at 30 minutes.
-            // Prod A/B 2026-08-25: the identical non-dimension group-by reported
-            // `unaligned_bucket_width` at '30 minutes' and `unsupported_shape`
-            // at '1 hours'; 6 declines in a 26-shape sweep were mislabelled, so
-            // the standing `unaligned_bucket_width = 14` was 14 unknown reasons.
-            //
-            // Finest spec wins (candidates run coarsest-first), so the reason
-            // comes from the tier with the best chance of serving this width. A
-            // grain reason is still the answer when EVERY spec was disqualified
-            // that way, since then it is true rather than masking.
+            // GRAIN-ONLY disqualifications are held back so they cannot mask an
+            // actionable declared-schema gap: both compare the spec's grain
+            // against a width the QUERY chose and say nothing an operator could
+            // act on. They are still reported when EVERY spec declined that way.
             Err(reason @ (MissReason::PartialBucket | MissReason::TinyInterior)) => grain_miss = Some(reason),
             Err(reason) => miss = Some(reason),
         }
     }
-    // EVERY viable spec, not just the best one on paper. Coverage is not known
-    // here — it is per (spec, date) and lives in the database — so returning
-    // only the coarsest match would hand back a tier that happens to be
-    // unbuilt for the oldest date in the window and miss, while a finer tier
-    // that IS built sits unused. Measured in production: the 1h tier covered
-    // 08-05.. and the 1m tier 08-04.., and a window starting 08-04 missed.
+    // EVERY viable spec, not just the best on paper: coverage is per (spec,
+    // date) and known only to the caller, so the coarsest match may be unbuilt
+    // for a date a finer tier does cover.
     if !routes.is_empty() {
         return Ok(routes);
     }
-    // The per-reason miss counters say WHICH gap, but a shape gap is the one
-    // with nothing to look at — and the one no bare test session can reproduce,
-    // since the nodes above an aggregate depend on the session's analyzer rules.
-    // So it alone carries the plan text at warn; every other reason is a
-    // declared-schema question the counters already answer, and keeping those at
-    // debug stops an ordinary unroutable panel from spamming prod's warn stream.
+    // Only a shape gap carries the plan text at warn — no bare test session can
+    // reproduce it. Every other reason is a declared-schema question the
+    // counters already answer, so it stays at debug.
     let reason = miss.or(grain_miss).unwrap_or(MissReason::UnsupportedShape);
     let shape = shape();
     match reason {
@@ -2258,11 +1827,10 @@ pub(crate) async fn match_aggregates(
 /// window and would serve rows the query excluded.
 fn narrow_timestamp(term: &datafusion::logical_expr::Expr, lo: &mut Option<i64>, hi: &mut Option<i64>) -> Result<bool, MissReason> {
     use datafusion::logical_expr::{Expr, Operator};
-    // Both bounds only ever TIGHTEN, so the merge is max on the inclusive start
-    // and min on the exclusive end; an absent bound takes the new value whole.
+    // Bounds only ever TIGHTEN: max on the inclusive start, min on the exclusive
+    // end; an absent bound takes the new value whole.
     let narrow = |bound: &mut Option<i64>, value: i64, tighten: fn(i64, i64) -> i64| *bound = Some(bound.map_or(value, |current| tighten(current, value)));
-    // The exclusive end of an INCLUSIVE bound (`BETWEEN`, `<=`). Overflow here is
-    // a window nothing can be inside, which reads the same as unbounded.
+    // The exclusive end of an INCLUSIVE bound (`BETWEEN`, `<=`).
     let exclusive = |value: i64| value.checked_add(1).ok_or(MissReason::UnboundedTime);
     match term {
         Expr::Between(between) if !between.negated && column_name(&between.expr) == Some("timestamp") => {
@@ -2283,11 +1851,7 @@ fn narrow_timestamp(term: &datafusion::logical_expr::Expr, lo: &mut Option<i64>,
             }
         }
         // `date_trunc(unit, timestamp) = X` bounds the window exactly as
-        // `timestamp >= X AND timestamp < X + width(unit)` does. Left to fall
-        // through it becomes a residual row filter with no declared measure
-        // filter to match, and the whole query is refused — which is how
-        // monoscope's hourly overview stayed a raw scan of every project even
-        // after the cross-project fix landed.
+        // `timestamp >= X AND timestamp < X + width(unit)` does.
         Expr::BinaryExpr(binary) if binary.op == Operator::Eq => {
             let Some((width, start)) = [(&binary.left, &binary.right), (&binary.right, &binary.left)]
                 .into_iter()
@@ -2296,8 +1860,7 @@ fn narrow_timestamp(term: &datafusion::logical_expr::Expr, lo: &mut Option<i64>,
                 return Ok(false);
             };
             // No timestamp truncates to an unaligned instant, so this is
-            // unsatisfiable rather than a window. Serving `[X, X+width)` for it
-            // would return an hour of rows where the answer is none.
+            // unsatisfiable rather than a window.
             if start.rem_euclid(width) != 0 {
                 return Err(MissReason::UnknownFilter);
             }
@@ -2315,8 +1878,7 @@ fn narrow_timestamp(term: &datafusion::logical_expr::Expr, lo: &mut Option<i64>,
 ///
 /// Only epoch-aligned, constant-width units are listed. `month`/`quarter`/`year`
 /// are not a fixed number of microseconds, and `week` truncates to Monday while
-/// the epoch was a Thursday — so for all of them the alignment test the caller
-/// applies would be wrong, and no `[X, X+width)` rewrite is exact.
+/// the epoch was a Thursday, so the caller's alignment test would be wrong.
 fn date_trunc_width(expr: &datafusion::logical_expr::Expr) -> Option<i64> {
     let datafusion::logical_expr::Expr::ScalarFunction(function) = unaliased(expr) else { return None };
     if !function.name().eq_ignore_ascii_case("date_trunc") || function.args.len() != 2 || column_name(&function.args[1]) != Some("timestamp") {
@@ -2334,9 +1896,8 @@ fn date_trunc_width(expr: &datafusion::logical_expr::Expr) -> Option<i64> {
 /// The half-open `[lo, hi)` microsecond window `predicate` confines `timestamp`
 /// to, or `None` when it does not bound it on both sides.
 ///
-/// Only conjuncts narrow: `split_conjunction` hands an `OR` back whole, so a
-/// disjunction contributes no bound and the window stays open — which is the
-/// safe direction for every caller.
+/// Only conjuncts narrow: a disjunction contributes no bound and the window
+/// stays open, which is the safe direction for every caller.
 pub(crate) fn timestamp_window(predicate: &datafusion::logical_expr::Expr) -> Option<(i64, i64)> {
     let (mut lo, mut hi) = (None, None);
     // An unreadable bound is not "no bound": treat it as unbounded.
@@ -2361,96 +1922,68 @@ async fn route_with_spec(
     let (mut lo, mut hi) = (None, None);
     let mut row_filters = Vec::new();
     let mut promotable: Vec<&Expr> = Vec::new();
-    // `col IS NOT NULL`, held apart from `promotable`. monoscope emits it on EVERY
-    // latency chart (`AND duration IS NOT NULL`), which made `filter_not_eligible`
-    // the largest miss reason on prod — 2026-08-22's A/B isolated the predicate
-    // exactly: the same p95 query declined `filter_not_eligible` with it and
-    // `stale_coverage` without it, three reps each.
+    // `col IS NOT NULL`, held apart from `promotable` and resolved as the guard.
     let mut null_guards: Vec<&str> = Vec::new();
-    // Strip tantivy hints BEFORE classifying, for the same reason `canonical`
-    // strips them: they are accelerators the rewriter adds beside a predicate it
-    // never removes. Here the stakes are higher than a cosmetic mismatch — a
-    // hint on `kind` is orphaned into `promotable` once `kind = 'server'` itself
-    // is consumed as a dimension filter, so the promoted filter carries a term
-    // no declared measure can ever have and an otherwise routable panel is
-    // refused. Observed in prod 2026-08-12.
+    // Strip tantivy hints BEFORE classifying: a hint on `kind` would otherwise be
+    // orphaned into `promotable` once `kind = 'server'` is consumed as a
+    // dimension filter, leaving a term no declared measure can match.
     let mut terms: Vec<&Expr> = predicates.iter().flat_map(split_conjunction).collect();
     strip_index_hints(&mut terms);
     for term in terms {
         if narrow_timestamp(term, &mut lo, &mut hi)? {
             continue;
         }
-        // A predicate we can push into the rollup scan is a dimension filter;
-        // one we cannot may NOT be answered by picking a measure that was
-        // pre-filtered the same way. The measure carries the right value, but
-        // the raw query also *eliminates* the groups and buckets where nothing
-        // matched, and re-aggregating the rollup resurrects them as 0/NULL rows.
-        // (`count(*) FILTER (WHERE …)` is unaffected — an aggregate filter
-        // changes values, never which groups exist.)
+        // A predicate we can push into the rollup scan is a dimension filter; one
+        // we cannot may NOT be answered by a measure pre-filtered the same way,
+        // because the raw query also ELIMINATES the groups where nothing matched
+        // and re-aggregating resurrects them as 0/NULL rows. (`count(*) FILTER
+        // (WHERE …)` is unaffected — it changes values, not which groups exist.)
         match (eq_literal(term, "project_id"), dimension_filter_sql(term, &spec.dimensions)) {
             // Two different literals cannot both hold; never keep the last.
             (Some(value), _) if project_id.as_deref().is_some_and(|current| current != value) => return Err(MissReason::MissingProject),
             (Some(value), _) => project_id = Some(value.to_string()),
             (None, Some(filter)) => row_filters.push(filter),
-            // `col IS NOT NULL` over a non-dimension is a residual like any other,
-            // except that a `count(col)` measure expresses it EXACTLY — so it is set
-            // aside here and resolved as the guard below rather than promoted.
+            // `col IS NOT NULL` over a non-dimension is a residual that a
+            // `count(col)` measure expresses EXACTLY, so it becomes the guard.
             (None, None) => match unaliased(term) {
                 Expr::IsNotNull(inner) if column_name(inner).is_some() => null_guards.push(column_name(inner).unwrap_or_default()),
                 _ => promotable.push(term),
             },
         }
     }
-    // Two different columns cannot both be expressed by one count measure, and the
-    // guard is a single measure by construction. Fail closed rather than guard on
-    // one and silently ignore the other.
+    // The guard is a single measure, so two guarded columns must fail closed
+    // rather than guard on one and ignore the other.
     if !null_guards.iter().all_equal() {
         return Err(MissReason::FilterMultipleNullGuards);
     }
     let null_guard = null_guards.first().copied();
-    // A query that neither pins nor groups by project_id would fold every
-    // tenant into one row, so it stays refused. Grouping by it is answerable:
-    // project_id is a real column on the rollup table, and the coverage check
-    // downstream then has to hold for every project in the window rather than
-    // for one.
+    // A query that neither pins nor groups by project_id would fold every tenant
+    // into one row. Grouping by it is answerable — project_id is a real column on
+    // the rollup table — but coverage must then hold for every project.
     if project_id.is_none() && !aggregate.group_expr.iter().any(|expr| column_name(expr) == Some("project_id")) {
         return Err(MissReason::MissingProject);
     }
-    // A dashboard panel writes its window as `timestamp >= now() - interval 'N
-    // days'` and stops there. Demanding an upper bound sent every such query —
-    // the wide ones, the only kind worth accelerating — to a full raw scan.
-    // Prod 2026-08-15: a 7d panel timed out past the 60s statement cap and the
-    // same query with `AND timestamp < now()` returned in 5.5s.
-    //
-    // `now` closes the window for the interior arithmetic ONLY. `open_end`
-    // carries the missing bound through to `sql`, which leaves the trailing raw
-    // range unbounded so rows past `now` are still returned.
+    // A panel often writes only `timestamp >= now() - interval 'N days'`. `now`
+    // closes the window for the interior arithmetic ONLY; `open_end` carries the
+    // missing bound to `sql`, which leaves the trailing raw range unbounded so
+    // rows past `now` are still returned.
     let open_end = hi.is_none();
     let (lo, hi) = lo.zip(hi.or_else(|| Some(crate::support::now_micros()))).filter(|(lo, hi)| lo < hi).ok_or(MissReason::UnboundedTime)?;
     let grain = spec.grain_micros().ok_or(MissReason::UnsupportedShape)?;
-    // A grain too coarse for the window can never yield a usable interior — the
-    // aligned span inside it is empty or below the cost floor. Rejecting it here
-    // rather than at interior() matters because specs are tried coarsest-first:
-    // otherwise a 1h tier would shadow the 1m tier that CAN serve a 10-minute
-    // window, and the query would miss entirely instead of routing.
-    // With nothing to promote, a window too narrow for this grain is the whole
-    // answer and the measure probe below — which plans a statement per filtered
-    // measure — is pure waste. With a residual present, the filter is the
-    // actionable diagnosis and must be reported in preference to the grain, so
-    // the same check runs again once the promotion has been resolved.
+    // A grain too coarse for the window yields no usable interior. Reject it here
+    // rather than at interior(), or a 1h tier would shadow the 1m tier that CAN
+    // serve a 10-minute window. With a residual present the filter is the more
+    // actionable diagnosis, so the same check runs again after promotion.
     let too_narrow = hi.saturating_sub(lo) < grain.saturating_mul(MIN_INTERIOR_BUCKETS);
     if too_narrow && promotable.is_empty() {
         return Err(MissReason::TinyInterior);
     }
-    // The probe's project literal is scaffolding the canonicalizer strips back
-    // out — it exists only to satisfy the scan admission guard, and the result
-    // is memoized across every caller. A cross-project query has no literal to
-    // give it, and any value satisfies the guard's SHAPE check.
+    // Scaffolding the canonicalizer strips back out; any value satisfies the scan
+    // admission guard's SHAPE check.
     let probe_project = project_id.as_deref().unwrap_or("rollup-probe");
     let configured_filters = measure_filters(session, source, spec, probe_project, lo, hi).await?;
-    // ONE lookup for the whole matcher: a declared measure is identified by its
-    // aggregate, its column and the canonical text of its filter, and both the
-    // promotion guard and every routed aggregate below resolve on exactly that.
+    // A declared measure is identified by its aggregate, its column and the
+    // canonical text of its filter.
     let declared_measure = |aggregate: &str, column: Option<&str>, filter: &str| {
         configured_filters
             .iter()
@@ -2458,31 +1991,17 @@ async fn route_with_spec(
             .map(|(measure, _)| *measure)
     };
 
-    // ROW-FILTER PROMOTION. A residual predicate is normally fatal: the rollup
-    // aggregated over every row, so re-aggregating it resurrects the groups the
-    // raw query eliminated, as 0/NULL rows rather than absent ones.
+    // ROW-FILTER PROMOTION. A residual predicate is normally fatal, but when it
+    // canonicalizes to exactly a DECLARED measure filter, the pre-filtered
+    // measures carry the right values and a `HAVING` over a count sharing that
+    // filter reproduces the raw query's group elimination exactly.
     //
-    // But when the residual canonicalizes to exactly a DECLARED measure filter,
-    // the pre-filtered measures already carry the right values, and a `HAVING`
-    // over a count sharing that filter reproduces the elimination exactly — a
-    // bucket where nothing matched has a zero count and is dropped. That makes
-    // every panel using the standard `server` filter routable without changing
-    // what any of them display, which the monoscope-side alternatives could not:
-    // dropping the filter counts every span, and moving it into per-aggregate
-    // FILTER clauses turns absent buckets into zeros.
-    //
-    // The guard must be a `count` with NO column: `count(col)` skips nulls, so a
-    // bucket whose only matching rows had a null column would be dropped where
-    // the raw query kept it.
-    //
-    // `col IS NOT NULL` is the same rule read one step wider. `count(col)` skips
-    // nulls, so a measure `{agg: count, column: col, filter: F}` IS
-    // `count(*) FILTER (WHERE F AND col IS NOT NULL)` — one lookup covers the bare
-    // predicate, the promoted filter, and their conjunction, and it fails closed
-    // when no such measure is declared. The conjunction matters: guarding on
-    // `server_request_count > 0` and `duration_count > 0` SEPARATELY is weaker than
-    // the raw query, because a bucket holding server rows with null duration beside
-    // non-server rows with duration passes both and raw eliminates it.
+    // Without a null guard the count must have NO column: `count(col)` skips
+    // nulls, so a bucket whose only matching rows had a null column would be
+    // dropped where the raw query kept it. With one, `{agg: count, column: col,
+    // filter: F}` IS `count(*) FILTER (WHERE F AND col IS NOT NULL)`, so a single
+    // lookup covers the conjunction — guarding on the two counts SEPARATELY is
+    // weaker than the raw query and would keep a bucket raw eliminates.
     let promoted = (!promotable.is_empty()).then(|| canonical_and(promotable.iter().copied()));
     let guard = match (promoted.as_deref(), null_guard) {
         (None, None) => None,
@@ -2494,21 +2013,10 @@ async fn route_with_spec(
                     .map(|(measure, filter)| format!("{}={filter}", measure.name))
                     .join(" | ")
             };
-            // A residual constraining columns NO declared filter even
-            // mentions was never a candidate — it is log-explorer and
-            // facet traffic (`attributes___…___name IS NOT NULL`,
-            // `jsonb_path_exists`, `LIKE`), not a promotion that failed.
-            // Prod 2026-08-12: 84 declines in 3h, every one of them this
-            // shape and not one a dashboard panel. Folding those into
-            // `unknown_filter` made the counter unreadable — it could not
-            // distinguish "should have matched and didn't" from "never
-            // eligible" — and warning about them 84 times in 3h on a hot
-            // path is how the real case gets buried.
-            // A null guard is eligible on the same test read through the
-            // measure's COLUMN rather than its filter text: `duration IS
-            // NOT NULL` is a near-miss because `duration_count` exists,
-            // while `attributes___…___name IS NOT NULL` is log-explorer
-            // traffic no measure was ever going to answer.
+            // A residual constraining columns NO declared filter mentions was
+            // never a candidate (log-explorer/facet traffic), so it gets its own
+            // reason rather than inflating `unknown_filter`. A null guard is
+            // judged by the measure's COLUMN rather than its filter text.
             let guard_column_declared = column.is_some_and(|column| configured_filters.iter().any(|(measure, _)| measure.column.as_deref() == Some(column)));
             if !guard_column_declared
                 && !promotable
@@ -2526,11 +2034,9 @@ async fn route_with_spec(
                 );
                 return MissReason::FilterNotEligible;
             }
-            // A genuine near-miss: the residual talks about the same
-            // columns a declared measure filters on, yet did not match.
-            // The two canonical strings are the whole content of this
-            // decline and there is no way to see them from outside. This
-            // has already cost two deploys to diagnose; print both.
+            // A genuine near-miss: the residual names the same columns a declared
+            // measure filters on, yet did not match. Print both canonical strings
+            // — they are the whole content of this decline.
             tracing::warn!(
                 event = "rollup_promotion_unmatched",
                 source,
@@ -2548,6 +2054,9 @@ async fn route_with_spec(
         return Err(MissReason::TinyInterior);
     }
 
+    // `project_id` is the partition column rather than a declared dimension, but
+    // it groups exactly like one.
+    let is_dimension = |column: &str| column == "project_id" || spec.dimensions.iter().any(|dimension| dimension == column);
     let groups = aggregate
         .group_expr
         .iter()
@@ -2556,22 +2065,14 @@ async fn route_with_spec(
             let alias = aggregate.schema.field(index).name();
             let simplified = simplify_filtered_group(expression, predicates, &spec.dimensions).map_err(|_| MissReason::UnsupportedShape)?;
             let expression = &simplified;
-            // monoscope's chart SQL groups by `extract(epoch from time_bucket(w,
-            // timestamp))::integer`, never by the bare bucket, so every percentile
-            // and grouped panel declined as `unsupported_shape` and scanned raw —
-            // 3,525 ms against 278 ms routed at 3 days (2026-08-22 A/B).
-            //
-            // Epoch-of-bucket is injective on the bucket, so the grouping is
-            // identical and only the spelling differs. The wrapper is REPRODUCED
-            // rather than lifted: the rewrite is substituted for this aggregate and
-            // must match its schema types, so dropping a cast here would fail
-            // `has_equivalent_names_and_types` instead of routing.
+            // `extract(epoch from time_bucket(w, timestamp))::integer` is injective
+            // on the bucket, so the grouping is identical and only the spelling
+            // differs. The wrapper is REPRODUCED rather than lifted: the rewrite
+            // must match the aggregate's schema types, so dropping a cast here
+            // would fail `has_equivalent_names_and_types` instead of routing.
             let epoch_wrapped = epoch_of(expression);
             let expression = match epoch_wrapped.map_or_else(|| unaliased(expression), |(inner, _)| inner) {
-                // `project_id` is not a declared dimension — it is the partition
-                // column, written on every rollup row by `to_rollup_batches` — but
-                // it groups exactly like one.
-                Expr::Column(column) if column.name == "project_id" || spec.dimensions.iter().any(|dimension| dimension == &column.name) => column.name.clone(),
+                Expr::Column(column) if is_dimension(&column.name) => column.name.clone(),
                 Expr::ScalarFunction(function)
                     if function.name().eq_ignore_ascii_case("time_bucket")
                         && function.args.len() == 2
@@ -2581,45 +2082,33 @@ async fn route_with_spec(
                     let width = parse_bucket_micros(interval).ok_or(MissReason::UnsupportedShape)?;
                     // A width that is not a whole number of grains would make one
                     // rollup row straddle two output buckets, and no state can be
-                    // split across them. Raw fringes do not change this: the
-                    // interior is still answered by whole rollup rows.
+                    // split across them.
                     if width < grain || width % grain != 0 {
                         return Err(MissReason::PartialBucket);
                     }
                     format!("time_bucket({}, timestamp)", sql_literal(interval))
                 }
-                // monoscope spells EVERY grouped chart's dimension
-                // `COALESCE(<dimension>, 'null')`, so the bare-column arm above
-                // never matched one and every such panel scanned raw — 3,237 ms
-                // against 276 ms routed at 3 days (2026-08-22 A/B).
-                //
-                // Sound because `COALESCE(dim, lit)` is a FUNCTION of `dim`: the
-                // rollup's partition by `dim` therefore REFINES the partition by
-                // `COALESCE(dim, lit)`, and re-aggregating decomposable states over
-                // a refinement equals aggregating the raw rows. So the expression is
-                // emitted verbatim onto both legs and NULL needs no special case —
-                // the NULL cell and the literal-'null' cell simply merge, exactly as
-                // the raw rows do.
-                other
-                    if coalesced_column(other)
-                        .is_some_and(|(column, _)| column == "project_id" || spec.dimensions.iter().any(|dimension| dimension == column)) =>
-                {
-                    let (column, fallback) = coalesced_column(other).ok_or(MissReason::UnsupportedShape)?;
+                // `COALESCE(dim, lit)` is a FUNCTION of `dim`, so the rollup's
+                // partition by `dim` REFINES it and re-aggregating decomposable
+                // states over a refinement equals aggregating the raw rows. The
+                // expression is emitted verbatim onto both legs; NULL needs no
+                // special case because the NULL and literal-'null' cells merge.
+                other => {
+                    // A bare column that is not a declared dimension keeps its own
+                    // reason — it is the one shape an operator can act on.
+                    let Some((column, fallback)) = coalesced_column(other).filter(|(column, _)| is_dimension(column)) else {
+                        return Err(if matches!(other, Expr::Column(_)) { MissReason::UnknownGroupBy } else { MissReason::UnsupportedShape });
+                    };
                     format!("COALESCE({column}, {})", sql_literal(fallback))
                 }
-                Expr::Column(_) => return Err(MissReason::UnknownGroupBy),
-                _ => return Err(MissReason::UnsupportedShape),
             };
             // Only the bucket may wear the epoch wrapper; a dimension grouped by
             // `extract(epoch …)` is nonsense and must not be silently accepted.
             let expression = match epoch_wrapped {
-                Some((_, cast)) if expression.starts_with("time_bucket(") => {
-                    let epoch = format!("date_part('EPOCH', {expression})");
-                    match cast {
-                        Some(sql_type) => format!("CAST({epoch} AS {sql_type})"),
-                        None => epoch,
-                    }
-                }
+                Some((_, cast)) if expression.starts_with("time_bucket(") => match cast {
+                    Some(sql_type) => format!("CAST(date_part('EPOCH', {expression}) AS {sql_type})"),
+                    None => format!("date_part('EPOCH', {expression})"),
+                },
                 Some(_) => return Err(MissReason::UnsupportedShape),
                 None => expression,
             };
@@ -2635,11 +2124,10 @@ async fn route_with_spec(
             let alias = aggregate.schema.field(aggregate.group_expr.len() + index).name().to_string();
             let Expr::AggregateFunction(function) = unaliased(expression) else { return Err(MissReason::NonDecomposableAggregate) };
             // An ORDER BY inside an aggregate makes it depend on row order, which no
-            // partial state can carry -- with one exception. `first_value(x ORDER BY
-            // timestamp)` orders by the very axis the rollup buckets on, so the
-            // earliest row of the earliest bucket IS the earliest row overall, and a
-            // (value, timestamp) pair merges associatively. Nothing else is relaxed:
-            // ordering by any other column, or DESC, still declines.
+            // partial state can carry -- except `first_value(x ORDER BY timestamp)`,
+            // which orders by the axis the rollup buckets on, so a (value,
+            // timestamp) pair merges associatively. Any other column, or DESC,
+            // still declines.
             let ordered_by_timestamp = function.func.name().eq_ignore_ascii_case("first_value")
                 && matches!(
                     function.params.order_by.as_slice(),
@@ -2649,39 +2137,18 @@ async fn route_with_spec(
                 return Err(MissReason::NonDecomposableAggregate);
             }
             // The promoted conjuncts join the aggregate's own, so a `count(*) FILTER
-            // (WHERE status_code = 'ERROR' …)` under the `server` row filter resolves
-            // to `server_error_count`, which is declared as exactly that conjunction.
+            // (WHERE status_code = 'ERROR')` under a promoted `server` filter
+            // resolves to the measure declared as exactly that conjunction.
             let filter = canonical_and(function.params.filter.iter().flat_map(|filter| split_conjunction(filter.as_ref())).chain(promotable.iter().copied()));
             let name = function.func.name().to_ascii_lowercase();
             let column = function.params.args.first().and_then(column_name).map(str::to_string);
-            // Dropping `col IS NOT NULL` is only sound for aggregates that skip nulls
-            // over THAT column. `SELECT count(*), p95(duration) … WHERE duration IS NOT
-            // NULL` is real monoscope traffic (the top-K tables) and its `count(*)`
-            // counts only rows with a duration, where `request_count` counts them all.
-            //
-            // `count(*)` is the one aggregate that can be REWRITTEN to satisfy the
-            // guard instead of being refused by it: under `col IS NOT NULL`,
-            // `count(*) ≡ count(col)`. The guard was set aside above rather than
-            // pushed, so neither leg re-applies it — and `{agg: count, column: col}`
-            // skips exactly the rows the predicate excluded, while the raw leg emits
-            // `COUNT(col)` for the same measure. Before this, monoscope's log-explorer
-            // latency widget (`count(*)` folded in from `HAVING COUNT(*) > 0` beside
-            // `percentile_agg(duration)`) was refused outright and scanned 7 days raw.
-            //
-            // This was briefly withheld from queries also carrying a `percentile_agg`,
-            // because cells built before the 2026-08-22 spec change hold no
-            // `duration_digest` COLUMN and the reader null-fills it, so a routed
-            // latency chart rendered a hole over the rollup interior. That stopgap is
-            // gone: `TAG_MEASURES` now records what each cell MATERIALIZED and
-            // `Database::rollup_rewrite_for` gates both coverage paths on
-            // `RoutedRollup::measures_available`, so a date or slice that cannot prove
-            // the digest falls to the raw fringe while its siblings keep routing —
-            // pinned by `a_date_that_cannot_prove_its_digest_falls_to_the_raw_fringe`
-            // in `src/database/mod.rs`, which covers this widget's exact shape.
-            let column = match (column, null_guard) {
-                (None, Some(guard)) if name == "count" => Some(guard.to_string()),
-                (column, _) => column,
-            };
+            // Dropping `col IS NOT NULL` is only sound for aggregates that skip
+            // nulls over THAT column. `count(*)` is the one that can instead be
+            // REWRITTEN to satisfy the guard: under `col IS NOT NULL`,
+            // `count(*) ≡ count(col)`. The guard is set aside rather than pushed,
+            // so neither leg re-applies it and `{agg: count, column: col}` skips
+            // exactly the rows the predicate excluded.
+            let column = if name == "count" && column.is_none() { null_guard.map(str::to_string) } else { column };
             if null_guard.is_some() && column.as_deref() != null_guard {
                 return Err(MissReason::FilterNullGuardMismatch);
             }
@@ -2696,25 +2163,15 @@ async fn route_with_spec(
                 "max" => (Merge::Max, one("max")),
                 "avg" => (Merge::Avg, measure("sum", column.as_deref()).zip(measure("count", column.as_deref())).map(|(sum, count)| vec![sum, count])),
                 "percentile_agg" => (Merge::TDigest, one("tdigest")),
-                // `hll_agg`, a.k.a. Toolkit's `approx_count_distinct`. It behaves
-                // exactly like `percentile_agg` above: the aggregate yields the STATE
-                // and the scalar that reads a number out of it (`distinct_count`)
-                // sits above, untouched. DataFusion's own `approx_distinct` is NOT
-                // routed — it returns a bare count with no state to store. Exact
-                // `COUNT(DISTINCT x)` stays non-decomposable and is still declined;
-                // approximating it without being asked is what the measure list
-                // refuses to do.
+                // Like `percentile_agg`: the aggregate yields the STATE and the
+                // scalar reading a number out of it sits above, untouched.
+                // DataFusion's `approx_distinct` is NOT routed (bare count, no
+                // state), and exact `COUNT(DISTINCT x)` stays non-decomposable.
                 "hll_agg" => (Merge::Hll, one("hll")),
-                // Resolves to a PAIR, exactly as `avg` resolves to sum/count: the
-                // stored value plus the companion `min(timestamp)` that says which
-                // row it came from. `RollupSpec::validate` guarantees a `first`
-                // measure cannot be declared without its companion, so a spec that
-                // reaches here either resolves both or neither.
-                //
-                // Declines under a null guard. The guard is set aside rather than
-                // applied to either leg, which is only sound for aggregates that
-                // skip nulls over the guarded column -- and `first_value` does not:
-                // it returns the earliest row's value even when that value is NULL.
+                // Resolves to a PAIR like `avg`: the stored value plus the
+                // companion `min(timestamp)` saying which row it came from.
+                // Declines under a null guard — the guard is never applied to
+                // either leg, and `first_value` does not skip nulls.
                 "first_value" if null_guard.is_none() => {
                     (Merge::First, measure("first", column.as_deref()).zip(measure("min", Some("timestamp"))).map(|(first, at)| vec![first, at]))
                 }
@@ -2722,10 +2179,9 @@ async fn route_with_spec(
             };
             let resolved = resolved.ok_or(MissReason::MissingMeasure)?;
             debug_assert_eq!(resolved.len(), merge.arity(), "{merge:?} resolved the wrong number of measures");
-            // The raw leg reproduces the measure's DECLARED filter text verbatim.
-            // The matcher has already proven the query's aggregate filter
-            // canonicalizes to the same predicate, so this is exact — and it avoids
-            // unparsing an optimized `Expr` back into SQL.
+            // The raw leg reproduces the measure's DECLARED filter text verbatim;
+            // the matcher has already proven the query's filter canonicalizes to
+            // the same predicate, so this is exact.
             let raw = resolved
                 .iter()
                 .map(|measure| {
@@ -2733,9 +2189,8 @@ async fn route_with_spec(
                     let expression = match (merge, measure.column.as_deref()) {
                         (Merge::TDigest, Some(column)) => format!("percentile_agg(CAST({column} AS DOUBLE))"),
                         (Merge::Hll, Some(column)) => format!("hll_agg({column})"),
-                        // The companion of a `first` pair is an ordinary `min`
-                        // measure, so it renders through the general arm below;
-                        // only the value state needs the ordered spelling.
+                        // Only the value state needs the ordered spelling; the
+                        // companion is an ordinary `min` and falls through below.
                         (Merge::First, Some(column)) if measure.agg == "first" => format!("first_value({column} ORDER BY timestamp)"),
                         (_, None) => "COUNT(*)".to_string(),
                         (_, Some(column)) => format!("{aggregate}({column})"),
@@ -2751,9 +2206,8 @@ async fn route_with_spec(
         alias: "__guard".to_string(),
         merge: Merge::Count,
         measures: vec![measure.name.clone()],
-        // `COUNT(col)` when the guard carries one — the raw leg must eliminate the
-        // same buckets the rollup leg's `HAVING sum(count(col)) > 0` does, and
-        // `COUNT(*)` there would keep an all-null bucket the rollup drops.
+        // `COUNT(col)` when the guard carries one: `COUNT(*)` here would keep an
+        // all-null bucket that the rollup leg's `HAVING` drops.
         raw: vec![filtered(measure.column.as_deref().map_or_else(|| "COUNT(*)".to_string(), |column| format!("COUNT({column})")), measure.filter.as_deref())],
     });
 
@@ -2786,18 +2240,14 @@ mod tests {
 
     const SOURCE: &str = "otel_logs_and_spans";
 
-    /// The derived-rollup base gate feeds `uncovered` a `DashMap` iteration —
-    /// unsorted, and overlapping because one range is published at several
-    /// widths at once. A "sorted and disjoint" contract silently reports holes
-    /// that are not there, which for that gate means retrying forever.
+    /// `uncovered` must accept unsorted, overlapping coverage — callers pass
+    /// `DashMap` iteration order and republish one range at several widths.
     #[test]
     fn uncovered_tolerates_unsorted_overlapping_coverage() {
         for (covered, want) in [
             (vec![], vec![(0, 100)]),
             (vec![(0, 100)], vec![]),
-            // Reversed and overlapping: still tiles [0,100).
             (vec![(50, 100), (0, 60)], vec![]),
-            // The 1h-tier shape: hour 20 built, 21-23 absent.
             (vec![(0, 25)], vec![(25, 100)]),
             (vec![(25, 50), (75, 100)], vec![(0, 25), (50, 75)]),
         ] {
@@ -2806,9 +2256,7 @@ mod tests {
     }
 
     /// `MissReason::label` feeds the `rollup_misses` counter, so these strings
-    /// are a prod dashboard contract, not an implementation detail. Pinned
-    /// exhaustively (via `EnumIter`) so a rename or a new variant has to state
-    /// its label here rather than silently changing what a panel counts.
+    /// are a telemetry contract; pinned exhaustively via `EnumIter`.
     #[test]
     fn miss_reason_labels_are_the_prod_telemetry_contract() {
         use strum::IntoEnumIterator as _;
@@ -2844,10 +2292,7 @@ mod tests {
     const DAY: i64 = 20_683 * DAY_MICROS;
     const HOUR: i64 = HOUR_MICROS;
 
-    /// An untagged tier file used to be IMMORTAL — `slice_tag_range` returned
-    /// `None`, the replace-set skipped it, and every rebuild stacked another
-    /// version of every `id` beside it forever. It is retired only when this
-    /// partition provably reproduces it.
+    /// A file is retired only when this partition provably reproduces it.
     #[test_case::test_case(Some((DAY, DAY + HOUR)), None, (DAY, DAY + DAY_MICROS), &[], 9, true; "tagged file contained by the slice")]
     #[test_case::test_case(Some((DAY - HOUR, DAY + DAY_MICROS)), None, (DAY, DAY + DAY_MICROS), &[], 9, false; "tagged file wider than the slice")]
     #[test_case::test_case(None, None, (DAY, DAY + DAY_MICROS), &[], 9, true; "untagged, whole-day slice needs no stats")]
@@ -2855,8 +2300,6 @@ mod tests {
     #[test_case::test_case(None, Some((DAY, DAY + HOUR - 1)), (DAY, DAY + HOUR), &[], 9, true; "untagged, stats inside a sub-day slice")]
     #[test_case::test_case(None, Some((DAY, DAY + HOUR)), (DAY, DAY + HOUR), &[], 9, false; "untagged, stats touch the exclusive end")]
     #[test_case::test_case(None, Some((DAY, DAY + HOUR - 1)), (DAY, DAY + HOUR), &[], 0, false; "empty rebuild may be the only copy left")]
-    // The split-tenant shape: no single slice contains the file, but the live
-    // tagged slices tile the range it spans.
     #[test_case::test_case(None, Some((DAY, DAY + DAY_MICROS - 1)), (DAY, DAY + 6 * HOUR),
         &[(DAY, DAY + 6 * HOUR), (DAY + 6 * HOUR, DAY + 12 * HOUR), (DAY + 12 * HOUR, DAY + DAY_MICROS)], 9, true; "union of live slices tiles the file")]
     #[test_case::test_case(None, Some((DAY, DAY + DAY_MICROS - 1)), (DAY, DAY + 6 * HOUR),
@@ -2880,13 +2323,8 @@ mod tests {
         assert!(!slice_retires(&file, &publish));
     }
 
-    /// The untagged gauge must not be masked by a sibling tier.
-    ///
-    /// It is one exported slot and the tiers publish independently, so storing each publish's own
-    /// count overwrote it: prod 2026-08-20 read `rollup_tier_untagged_found = 0` — after a publish
-    /// to the already-clean 1h tier — while the 1m tier still held 67 untagged files across 39
-    /// cells. A gauge that reads clean over live damage is worse than no gauge, and this one exists
-    /// precisely to catch a month of silent accumulation.
+    /// The untagged gauge is one exported slot but tiers publish independently,
+    /// so it must SUM per-tier counts rather than store the latest publish's.
     #[test]
     fn the_untagged_gauge_sums_tiers_rather_than_letting_one_mask_another() {
         let per_tier: dashmap::DashMap<String, u64> = dashmap::DashMap::new();
@@ -2895,21 +2333,17 @@ mod tests {
         per_tier.insert("otel_logs_and_spans_rollup_dashboard_1m_v3".to_owned(), 67);
         assert_eq!(exported(), 67);
 
-        // The clean tier publishes next. Under the shared-slot version this
-        // reported 0 and the 1m tier's 67 files became invisible.
         per_tier.insert("otel_logs_and_spans_rollup_dashboard_1h_v2".to_owned(), 0);
         assert_eq!(exported(), 67, "a clean tier's publish must not hide another tier's damage");
 
-        // Zero is reached only when EVERY tier is clean — which is what makes
-        // "alarm on > 0" a statement about the whole tier population.
+        // Zero only when EVERY tier is clean, which is what makes "alarm on > 0"
+        // a statement about the whole tier population.
         per_tier.insert("otel_logs_and_spans_rollup_dashboard_1m_v3".to_owned(), 0);
         assert_eq!(exported(), 0);
     }
 
     #[test]
     fn ranges_cover_needs_an_unbroken_run_past_the_inclusive_end() {
-        // Out of order, and adjacent rather than overlapping: both are normal
-        // for slices republished at different widths.
         assert!(ranges_cover(&[(DAY + HOUR, DAY + 2 * HOUR), (DAY, DAY + HOUR)], (DAY, DAY + 2 * HOUR - 1)));
         // Reaching exactly the inclusive end is NOT enough: a slice end is
         // exclusive, so a row AT `hi` would not be reproduced.
@@ -2919,18 +2353,14 @@ mod tests {
         assert!(!ranges_cover(&[(DAY, DAY + HOUR), (DAY + 2 * HOUR, DAY + 9 * HOUR)], (DAY, DAY + 3 * HOUR)));
     }
 
-    /// The complement is what must be REBUILT, and it is what makes the repair
-    /// affordable: prod 2026-08-22's mid-tail holes were 22 minutes wide inside
-    /// a day whose rollup input shreds into ~1,440 units.
+    /// The complement of the live tagged ranges is what must be REBUILT.
     #[test]
     fn uncovered_gaps_are_the_complement_of_the_live_tagged_ranges() {
-        // Nothing tagged: the whole span is the gap, which is the old
-        // rebuild-the-day behaviour and the floor this must never fall below.
+        // Nothing tagged: the whole span is the gap.
         assert_eq!(uncovered_gaps(&[(DAY, DAY + 2 * HOUR)], &[]), vec![(DAY, DAY + 2 * HOUR)]);
         // One interior hole between two published slices.
         assert_eq!(uncovered_gaps(&[(DAY, DAY + 3 * HOUR)], &[(DAY, DAY + HOUR), (DAY + 2 * HOUR, DAY + 3 * HOUR)]), vec![(DAY + HOUR, DAY + 2 * HOUR)]);
-        // Fully covered — no work at all, and the last range reaching exactly
-        // the exclusive end is enough.
+        // Fully covered: the last range reaching exactly the exclusive end is enough.
         assert!(uncovered_gaps(&[(DAY, DAY + HOUR)], &[(DAY, DAY + HOUR)]).is_empty());
         // Ranges that overrun the span are clipped to it, out-of-order input is
         // fine, and two files sharing a hole report it once.
@@ -2938,25 +2368,15 @@ mod tests {
             uncovered_gaps(&[(DAY + HOUR, DAY + 2 * HOUR), (DAY + HOUR, DAY + 2 * HOUR)], &[(DAY + 90 * 60_000_000, DAY + 9 * HOUR), (DAY, DAY + HOUR)]),
             vec![(DAY + HOUR, DAY + 90 * 60_000_000)]
         );
-        // ADJACENT gaps are ONE hole, and must be reported as one.
-        //
-        // Each untagged file contributes its own statistics span, so a day whose
-        // files tile it end-to-end produces a gap per file. `dedup` only removes
-        // exact duplicates, so those stayed separate and
-        // `enqueue_untagged_rebuilds` minted a UNIT EACH — measured on prod
-        // 2026-08-23 as 1,440 sixty-second units for a single (project, date),
-        // 14.9x queue inflation overall, and 92.9% of fusion candidates then
-        // refused on budget because fusion SUMS what shredding split.
-        //
-        // Cheaper to never shred than to reassemble: one contiguous hole is one
-        // scan, and the coordinator still splits it if it genuinely does not fit.
+        // ADJACENT gaps are ONE hole: each untagged file contributes its own
+        // statistics span, and one unit per span would shred the day into
+        // thousands of units. The coordinator still splits a hole that does not fit.
         let minute = 60 * 1_000_000;
         assert_eq!(
             uncovered_gaps(&[(DAY, DAY + minute), (DAY + minute, DAY + 2 * minute), (DAY + 2 * minute, DAY + 3 * minute)], &[]),
             vec![(DAY, DAY + 3 * minute)],
             "three back-to-back holes are one hole"
         );
-        // Overlapping spans likewise collapse, and a genuine separation survives.
         assert_eq!(uncovered_gaps(&[(DAY, DAY + 2 * HOUR), (DAY + HOUR, DAY + 3 * HOUR)], &[]), vec![(DAY, DAY + 3 * HOUR)]);
         assert_eq!(
             uncovered_gaps(&[(DAY, DAY + HOUR), (DAY + 2 * HOUR, DAY + 3 * HOUR)], &[]),
@@ -2965,13 +2385,9 @@ mod tests {
         );
     }
 
-    /// Merging raw gaps is not enough on real data, which is why
-    /// `rebuild_slices` aligns FIRST.
-    ///
-    /// Gaps come from row statistics, so two holes either side of one file's
-    /// last row are separated by milliseconds — `merge_ranges` cannot bridge
-    /// that, and minute-aligning afterwards turns them into two OVERLAPPING
-    /// units. Aligning first makes them the same minute, and one unit.
+    /// `rebuild_slices` must align BEFORE merging: gaps come from row
+    /// statistics, so sub-minute separations would otherwise survive the merge
+    /// and then align into two OVERLAPPING units.
     #[test]
     fn rebuild_slices_aligns_before_merging_so_a_sub_minute_separation_is_one_unit() {
         const DAY: i64 = 86_400_000_000;
@@ -2979,7 +2395,6 @@ mod tests {
         let day_end = DAY + DAY;
         let near = vec![(DAY, DAY + floor / 3), (DAY + floor / 3 + 247_000, DAY + floor / 2)];
         assert_eq!(rebuild_slices(near.clone(), &[], DAY, day_end), vec![(DAY, DAY + floor)], "a 247ms separation is one minute of work");
-        // Merging without aligning is exactly what does not work.
         assert_eq!(crate::write::mem_buffer::merge_ranges(near).len(), 2);
         // A separation wider than the floor still yields two units, and a gap
         // contained by a live tagged slice is queued as that slice.
@@ -2997,6 +2412,7 @@ mod tests {
     fn hours_from_stats_json_bounds_the_hours_a_file_can_touch() {
         let day_start = chrono::NaiveDate::from_ymd_opt(2026, 8, 18).unwrap().and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_micros();
         let at = |hour: i64, minute: i64| day_start + hour * HOUR_MICROS + minute * 60 * 1_000_000;
+        let bounds = |lo: i64, hi: i64| format!(r#"{{"minValues": {{"timestamp": {lo}}}, "maxValues": {{"timestamp": {hi}}}}}"#);
 
         // Epoch micros form: a file spanning 09:10..10:45 touches hours 9 and 10.
         let stats = format!(r#"{{"numRecords": 100, "minValues": {{"timestamp": {}}}, "maxValues": {{"timestamp": {}}}}}"#, at(9, 10), at(10, 45));
@@ -3007,14 +2423,12 @@ mod tests {
         assert_eq!(hours_from_stats_json(stats, day_start), Some(1 << 3));
 
         // A whole-day file is honestly all hours.
-        let stats = format!(r#"{{"minValues": {{"timestamp": {}}}, "maxValues": {{"timestamp": {}}}}}"#, day_start, day_start + 24 * HOUR_MICROS - 1);
-        assert_eq!(hours_from_stats_json(&stats, day_start), Some(ALL_HOURS));
+        assert_eq!(hours_from_stats_json(&bounds(day_start, day_start + 24 * HOUR_MICROS - 1), day_start), Some(ALL_HOURS));
 
         // Bounds spilling outside the partition day are clamped, never trusted
         // into an empty mask.
-        let stats = format!(r#"{{"minValues": {{"timestamp": {}}}, "maxValues": {{"timestamp": {}}}}}"#, day_start - 5 * HOUR_MICROS, at(2, 0));
-        assert_eq!(hours_from_stats_json(&stats, day_start), Some(0b111));
-        let stats = format!(r#"{{"minValues": {{"timestamp": {}}}, "maxValues": {{"timestamp": {}}}}}"#, day_start - 5 * HOUR_MICROS, day_start - HOUR_MICROS);
+        assert_eq!(hours_from_stats_json(&bounds(day_start - 5 * HOUR_MICROS, at(2, 0)), day_start), Some(0b111));
+        let stats = bounds(day_start - 5 * HOUR_MICROS, day_start - HOUR_MICROS);
         assert_eq!(hours_from_stats_json(&stats, day_start), None, "a file wholly outside the day must read as unknown, not as nothing");
 
         // No stats, no timestamp bounds, garbage: all unknown.
@@ -3124,10 +2538,8 @@ mod tests {
         assert_eq!(show(&merged), show(&rebuilt), "appending partials and merging them must equal one rebuild over the same rows");
     }
 
-    /// The two SQL arms `First` adds. Neither is reachable from the matcher
-    /// tests -- those stop at `MissingMeasure` because no spec declares a
-    /// `first` measure yet -- so without this they are generated code nothing
-    /// ever generates.
+    /// The two SQL arms `First` adds; unreachable from the matcher tests, which
+    /// stop at `MissingMeasure` while no spec declares a `first` measure.
     #[test]
     fn first_picks_the_value_by_its_companion_on_both_legs() {
         let columns = ["landing_url".to_owned(), "landing_at".to_owned()];
@@ -3138,12 +2550,10 @@ mod tests {
         );
         let states = ["__s0_0".to_owned(), "__s0_1".to_owned()];
         assert_eq!(Merge::First.sql(&states), "first_value(__s0_0 ORDER BY __s0_1 NULLS LAST)");
-        // The union's outer merge consumes exactly what the legs project.
         assert_eq!(Merge::First.arity(), columns.len());
     }
 
-    /// A `first` measure and its companion, as the sessions rollup would
-    /// declare them: the first non-empty landing URL of a session.
+    /// A `first` measure and its companion: the first non-empty landing URL.
     fn first_spec() -> RollupSpec {
         let filter = Some("attributes___url___path <> ''".to_owned());
         RollupSpec {
@@ -3168,15 +2578,9 @@ mod tests {
         assert!(sql.contains("MIN(timestamp) FILTER (WHERE attributes___url___path <> '') AS landing_at"), "{sql}");
     }
 
-    /// The coarse tier orders by the COMPANION, never by the base tier's bucket
-    /// timestamp.
-    ///
-    /// A fine bucket whose filter matched nothing stores a NULL value and a NULL
-    /// companion. Ordering by the bucket would rank that empty bucket first
-    /// whenever it happens to be the earliest, and the coarse bucket would
-    /// answer NULL while a later bucket held a real value. `NULLS LAST` on the
-    /// companion puts every empty bucket after every real one, so it wins only
-    /// when there is genuinely nothing else.
+    /// The coarse tier orders by the COMPANION with NULLS LAST, never by the
+    /// base tier's bucket timestamp: a fine bucket that matched nothing stores
+    /// NULLs and would otherwise win whenever it happens to be the earliest.
     #[test]
     fn a_derived_first_orders_by_the_companion_with_nulls_last() {
         let mut coarse = first_spec();
@@ -3192,15 +2596,8 @@ mod tests {
     }
 
     /// `first_value` is the one aggregate allowed to carry an ORDER BY, and only
-    /// when it orders by `timestamp` ascending -- the axis the rollup buckets
-    /// on, which is what makes the earliest row of the earliest bucket the
-    /// earliest row overall.
-    ///
-    /// The assertion is on the miss REASON, not on success: no production spec
-    /// declares a `first` measure yet (the sessions rollup needs `session_key`
-    /// promoted at ingest first), so the accepted spelling gets past the
-    /// order-by gate and stops at `MissingMeasure`. Reaching that reason is
-    /// exactly the proof that the gate let it through.
+    /// ordering by `timestamp` ascending — the axis the rollup buckets on.
+    /// Reaching `MissingMeasure` is the proof the gate let the spelling through.
     #[tokio::test]
     async fn only_first_value_ordered_by_timestamp_passes_the_order_by_gate() {
         let state = session().await;
@@ -3221,49 +2618,26 @@ mod tests {
         }
     }
 
-    /// A window with a lower bound and NO upper bound must still route.
-    ///
-    /// Prod 2026-08-15: monoscope's 7d and 14d panels timed out at the 60s
-    /// statement cap. `route_with_spec` demanded BOTH bounds and answered
-    /// `UnboundedTime`, so a window with fully built rollups fell back to a raw
-    /// scan of every row in it. Measured on the demo project: `timestamp >=
-    /// now() - interval '7 days'` timed out past 60s, while the identical query
-    /// plus `AND timestamp < now()` returned in 5.5s.
+    /// A window with a lower bound and NO upper bound must still route, and the
+    /// open end must reach the raw leg: a concrete stand-in `hi` makes the
+    /// interior computable but must never close the trailing fringe, or the
+    /// rewrite drops every row after it — the newest rows.
     #[tokio::test]
-    async fn an_open_ended_window_routes() {
+    async fn an_open_ended_window_routes_and_keeps_an_open_raw_tail() {
         let state = session().await;
         let sql = format!(
             "SELECT count(*) FROM {SOURCE} WHERE project_id = 'p' AND timestamp >= to_timestamp_micros(1786500000000000) GROUP BY resource___service___name"
         );
         let route = route_for(&state, &sql).await;
         assert!(route.is_ok(), "an open-ended window must route: {route:?}");
-    }
-
-    /// The open end must reach the raw leg, not be silently closed at plan time.
-    ///
-    /// Substituting a concrete `hi` makes the interior computable, but if that
-    /// same `hi` also closed the trailing fringe the rewrite would DROP every
-    /// row after it — the newest rows, which is exactly what a live dashboard
-    /// is looking at. The last raw range must carry no upper bound.
-    #[tokio::test]
-    async fn an_open_ended_window_keeps_an_open_raw_tail() {
-        let state = session().await;
-        let sql = format!(
-            "SELECT count(*) FROM {SOURCE} WHERE project_id = 'p' AND timestamp >= to_timestamp_micros(1786500000000000) GROUP BY resource___service___name"
-        );
-        let route = route_for(&state, &sql).await.expect("route").expect("a route");
-        let generated = hybrid_sql(&route, crate::support::now_micros());
+        let generated = hybrid_sql(&route.expect("route").expect("a route"), crate::support::now_micros());
         let tail = generated.rsplit("timestamp >=").next().expect("a trailing range");
         assert!(!tail.contains("timestamp <"), "the trailing raw range must stay open-ended, got: {generated}");
     }
 
-    /// The partition invariant has to survive the open end.
-    ///
-    /// `complement` is what guarantees the rollup interior and the raw fringes
-    /// cover the window exactly once. A gap is a silently missing row and an
-    /// overlap is a silently doubled one, and no aggregate above can detect
-    /// either. Substituting a stand-in `hi` is only safe while this holds all
-    /// the way out to `OPEN_END`.
+    /// The interior and its complement must cover the window exactly once all
+    /// the way out to `OPEN_END`: a gap drops rows, an overlap doubles them, and
+    /// no aggregate above can detect either.
     #[test]
     fn an_open_ended_window_is_still_partitioned_exactly() {
         let (grain, lo) = (60_000_000i64, 1_786_500_000_000_000i64);
@@ -3560,22 +2934,30 @@ mod tests {
     /// one-minute fixture would exercise the rejection path, not the matcher.
     const WINDOW: &str = "timestamp >= to_timestamp_micros(60000000) AND timestamp < to_timestamp_micros(660000000)";
     const WIDE_HORIZON: i64 = 540_000_000;
+    /// The predicate monoscope's Golden Signals panels send, which is also
+    /// exactly what the `server_*` measures declare.
+    const SERVER: &str = "(kind = 'server' OR name = 'apitoolkit-http-span' OR name = 'monoscope.http')";
 
-    /// Register the source AND its generated rollup so a route can be planned
-    /// back into a real logical plan.
-    async fn session() -> datafusion::execution::context::SessionState {
+    /// A session with the custom functions plus an empty MemTable per named schema.
+    fn session_over(tables: impl IntoIterator<Item = String>) -> datafusion::execution::context::SessionState {
         let mut ctx = datafusion::prelude::SessionContext::new();
         crate::read::functions::register_custom_functions(&mut ctx).expect("functions register");
-        // Every declared tier, not just the fine one: specs are tried
-        // coarsest-first, so a session missing the coarse table could not plan a
-        // rewrite the matcher legitimately chose.
-        let targets = crate::schema::get_schema(SOURCE).expect("source schema").rollups.iter().map(|spec| spec.table_name(SOURCE)).collect::<Vec<_>>();
-        for table_name in std::iter::once(SOURCE.to_string()).chain(targets) {
+        for table_name in tables {
             let table = datafusion::datasource::MemTable::try_new(crate::schema::get_schema(&table_name).expect("schema").schema_ref(), vec![vec![]])
                 .expect("empty table");
             ctx.register_table(table_name.as_str(), Arc::new(table)).expect("register table");
         }
         ctx.state()
+    }
+
+    /// Register the source AND its generated rollup so a route can be planned
+    /// back into a real logical plan.
+    async fn session() -> datafusion::execution::context::SessionState {
+        // Every declared tier, not just the fine one: specs are tried
+        // coarsest-first, so a session missing the coarse table could not plan a
+        // rewrite the matcher legitimately chose.
+        let targets = crate::schema::get_schema(SOURCE).expect("source schema").rollups.iter().map(|spec| spec.table_name(SOURCE)).collect::<Vec<_>>();
+        session_over(std::iter::once(SOURCE.to_string()).chain(targets))
     }
 
     async fn optimized(state: &datafusion::execution::context::SessionState, sql: &str) -> datafusion::logical_expr::LogicalPlan {
@@ -3584,6 +2966,12 @@ mod tests {
 
     async fn route_for(state: &datafusion::execution::context::SessionState, sql: &str) -> Result<Option<RoutedRollup>, MissReason> {
         match_aggregates(&optimized(state, sql).await, state).await.map(|routes| routes.into_iter().next())
+    }
+
+    /// For the many tests whose only interest is HOW a shape declines — the
+    /// session is then pure setup.
+    async fn route_alone(sql: &str) -> Result<Option<RoutedRollup>, MissReason> {
+        route_for(&session().await, sql).await
     }
 
     /// Route `sql`, then reassemble exactly as `dml.rs` does — the same two
@@ -3610,6 +2998,22 @@ mod tests {
     /// The rewrite when the rollup owns the whole window — the single-leg shape.
     fn generated_sql(route: &RoutedRollup) -> String {
         route.sql(&[("project".into(), "1970-01-01".into(), "generation".into())], &[(route.lo, route.hi)], &ProjectSplit::default())
+    }
+
+    /// Route `sql` — which must route — and return that single-leg rewrite.
+    async fn routed_sql(state: &datafusion::execution::context::SessionState, sql: &str) -> String {
+        generated_sql(&route_for(state, sql).await.expect("match").expect("declared rollup route"))
+    }
+
+    /// The shape most chart tests assert: `sql` must route, every `want` must
+    /// reach the single-leg rewrite verbatim, and the rewrite must reassemble
+    /// into the query's own schema through `dml.rs`'s own two functions.
+    async fn assert_rewrite_contains(sql: &str, wants: &[&str]) {
+        let state = session().await;
+        let (_, generated) = assert_substitutes(&state, sql, None).await;
+        for want in wants {
+            assert!(generated.contains(want), "`{want}` must reach the rewrite: {generated}");
+        }
     }
 
     /// The rewrite when only part of the window is certified, so raw fringes and
@@ -3708,15 +3112,11 @@ mod tests {
     /// the real one, bucket AND dimension together.
     #[tokio::test]
     async fn a_grouped_chart_coalescing_its_dimension_routes() {
-        let state = session().await;
         let sql = format!(
             "SELECT time_bucket('1 hours', timestamp) AS tb, COALESCE(resource___service___name, 'null') AS svc, COUNT(*) \
              FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW} GROUP BY 1, 2"
         );
-        let route = route_for(&state, &sql).await.expect("match count").expect("declared rollup route");
-        let generated = generated_sql(&route);
-        assert!(generated.contains("COALESCE(resource___service___name, 'null')"), "the coalesce must reach the rewrite verbatim: {generated}");
-        assert_substitutes(&state, &sql, None).await;
+        assert_rewrite_contains(&sql, &["COALESCE(resource___service___name, 'null')"]).await;
     }
 
     /// A measure on the not-yet-servable list is refused on a TAGGED cell, not
@@ -3749,15 +3149,11 @@ mod tests {
     /// project.
     #[tokio::test]
     async fn a_grouped_chart_casting_its_dimension_routes_despite_cse() {
-        let state = session().await;
         let sql = format!(
             "SELECT time_bucket('1 hours', timestamp) AS tb, COALESCE(status_code::text, 'null') AS sc, COUNT(*) \
              FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW} GROUP BY 1, 2"
         );
-        let route = route_for(&state, &sql).await.expect("match count").expect("declared rollup route");
-        let generated = generated_sql(&route);
-        assert!(generated.contains("COALESCE(status_code, 'null')"), "the coalesce must survive CSE into the rewrite: {generated}");
-        assert_substitutes(&state, &sql, None).await;
+        assert_rewrite_contains(&sql, &["COALESCE(status_code, 'null')"]).await;
     }
 
     /// monoscope's log-explorer count chart verbatim — `extract(epoch …)` over
@@ -3767,14 +3163,11 @@ mod tests {
     /// SQL and missed by a simplified stand-in.
     #[tokio::test]
     async fn the_log_explorer_count_chart_routes_verbatim() {
-        let state = session().await;
         let sql = format!(
             "SELECT extract(epoch from time_bucket('1 hours', timestamp))::integer, COALESCE(status_code::text, 'null'), count(*)::float AS count_ \
              FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW} GROUP BY time_bucket('1 hours', timestamp), COALESCE(status_code::text, 'null')"
         );
-        let route = route_for(&state, &sql).await.expect("match count").expect("declared rollup route");
-        assert!(generated_sql(&route).contains("COALESCE(status_code, 'null')"), "the real chart shape must route");
-        assert_substitutes(&state, &sql, None).await;
+        assert_rewrite_contains(&sql, &["COALESCE(status_code, 'null')"]).await;
     }
 
     /// A group expression the matcher cannot serve must DECLINE, not vanish.
@@ -3784,12 +3177,11 @@ mod tests {
     /// like a route. The distinction under test is `Err(_)` versus `Ok(None)`.
     #[tokio::test]
     async fn an_unservable_group_expression_is_counted_rather_than_silent() {
-        let state = session().await;
         let sql = format!(
             "SELECT time_bucket('1 hours', timestamp) AS tb, COALESCE(coalesce(status_code, level)::text, 'null') AS sc, COUNT(*) \
              FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW} GROUP BY 1, 2"
         );
-        assert!(route_for(&state, &sql).await.is_err(), "an unservable group-by must report a reason, not fall through silently");
+        assert!(route_alone(&sql).await.is_err(), "an unservable group-by must report a reason, not fall through silently");
     }
 
     #[test_case::test_case("status_code = 'pickup_accepted'", true)]
@@ -3890,8 +3282,7 @@ mod tests {
             "SELECT time_bucket('1 hours', timestamp) AS tb, COUNT(*) AS c \
              FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW} AND duration IS NOT NULL GROUP BY 1"
         );
-        let route = route_for(&state, &sql).await.expect("match count").expect("declared rollup route");
-        let generated = generated_sql(&route);
+        let generated = routed_sql(&state, &sql).await;
         assert!(generated.contains("duration_count"), "the guarded count(*) must resolve to count(duration): {generated}");
         assert!(!generated.contains("request_count"), "request_count counts null-duration rows the guard excluded: {generated}");
     }
@@ -3926,7 +3317,6 @@ mod tests {
     /// at '30 minutes' and `unsupported_shape` at '1 hours'.
     #[tokio::test]
     async fn a_sub_hour_bucket_reports_the_group_by_not_the_grain() {
-        let state = session().await;
         // A day-wide window on purpose: the 1h tier must be disqualified by the
         // BUCKET WIDTH (`PartialBucket`), which is the prod shape, rather than by
         // a window too narrow to hold two of its grains.
@@ -3934,11 +3324,7 @@ mod tests {
             "SELECT time_bucket('30 minutes', timestamp) AS tb, status_message, COUNT(*) FROM {SOURCE} \
              WHERE project_id = 'project' AND timestamp >= to_timestamp_micros(0) AND timestamp < to_timestamp_micros(86400000000) GROUP BY 1, 2"
         );
-        assert_eq!(
-            route_for(&state, &sql).await.err(),
-            Some(MissReason::UnknownGroupBy),
-            "the 1h tier's grain complaint must not mask the 1m tier's real reason"
-        );
+        assert_eq!(route_alone(&sql).await.err(), Some(MissReason::UnknownGroupBy), "the 1h tier's grain complaint must not mask the 1m tier's real reason");
     }
 
     /// THE benchmark shape from `docs/monoscope-query-shapes.md`: a bare
@@ -3948,11 +3334,9 @@ mod tests {
     /// miss class on prod (126 of 414, 2026-08-25).
     #[tokio::test]
     async fn the_benchmark_count_shape_routes_through_its_derived_table() {
-        let state = session().await;
-        let sql = format!("SELECT count(1) FROM (SELECT id FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW}) t");
-        let route = route_for(&state, &sql).await.expect("match count").expect("declared rollup route");
-        assert!(generated_sql(&route).contains("request_count"), "an unguarded count over a derived table is the tier's request_count");
-        assert_substitutes(&state, &sql, None).await;
+        // An unguarded count over a derived table is the tier's `request_count`.
+        assert_rewrite_contains(&format!("SELECT count(1) FROM (SELECT id FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW}) t"), &["request_count"])
+            .await;
     }
 
     /// The qualifier proof. An alias RE-QUALIFIES its output, so the aggregate's
@@ -3968,20 +3352,18 @@ mod tests {
     /// rather than through the generated SQL alone.
     #[tokio::test]
     async fn a_grouped_derived_table_keeps_its_alias_qualifier_through_the_rewrite() {
-        let state = session().await;
         let sql = format!(
             "SELECT time_bucket('1 hours', t.timestamp) AS tb, t.status_code, count(*)::float AS count_ \
              FROM (SELECT timestamp, status_code, project_id FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW}) t \
              GROUP BY 1, 2"
         );
-        let route = route_for(&state, &sql).await.expect("match count").expect("declared rollup route");
-        let generated = generated_sql(&route);
-        assert!(generated.contains("status_code"), "the alias must not hide the declared dimension: {generated}");
-        // The assertion IS the reassembly: the projection above this aggregate
-        // holds `Column(t, "status_code")`, and `substitute` rebuilds bottom-up
-        // with `recompute_schema`, so a rewrite that did not carry the `t`
-        // qualifier back fails to resolve here instead of answering.
-        assert_substitutes(&state, &sql, None).await;
+        // The alias must not hide the declared dimension, and the reassembly
+        // inside `assert_rewrite_contains` IS the qualifier assertion: the
+        // projection above this aggregate holds `Column(t, "status_code")`, and
+        // `substitute` rebuilds bottom-up with `recompute_schema`, so a rewrite
+        // that did not carry the `t` qualifier back fails to resolve there
+        // instead of answering.
+        assert_rewrite_contains(&sql, &["status_code"]).await;
     }
 
     /// The boundary that makes the arm above safe. A subquery that RENAMES is
@@ -3991,12 +3373,11 @@ mod tests {
     /// rows without any error.
     #[tokio::test]
     async fn a_derived_table_that_renames_a_column_still_declines() {
-        let state = session().await;
         let sql = format!(
             "SELECT t.status_code, count(*) \
              FROM (SELECT kind AS status_code, timestamp, project_id FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW}) t GROUP BY 1"
         );
-        assert!(!matches!(route_for(&state, &sql).await, Ok(Some(_))), "a rename under an alias must never be read as the dimension it shadows");
+        assert!(!matches!(route_alone(&sql).await, Ok(Some(_))), "a rename under an alias must never be read as the dimension it shadows");
     }
 
     /// The arm is deliberately narrow. A dimension the spec does not declare, a
@@ -4008,9 +3389,8 @@ mod tests {
     #[test_case::test_case("COALESCE(CONCAT(resource___service___name, 'x'), 'null')" ; "coalesce over an expression, not a column")]
     #[tokio::test]
     async fn a_coalesce_the_matcher_cannot_prove_still_declines(group: &str) {
-        let state = session().await;
         let sql = format!("SELECT {group} AS g, COUNT(*) FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW} GROUP BY 1");
-        assert!(matches!(route_for(&state, &sql).await, Err(_) | Ok(None)), "{group} must not route");
+        assert!(matches!(route_alone(&sql).await, Err(_) | Ok(None)), "{group} must not route");
     }
 
     /// THE shape monoscope's charts actually emit — `extract(epoch from
@@ -4022,16 +3402,12 @@ mod tests {
     /// substituted for this aggregate and has to match its schema types.
     #[tokio::test]
     async fn a_chart_grouping_by_extract_epoch_of_a_bucket_routes() {
-        let state = session().await;
         let sql = format!(
             "SELECT extract(epoch from time_bucket('1 hours', timestamp))::integer AS tb, COUNT(*) \
              FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW} GROUP BY 1"
         );
-        let route = route_for(&state, &sql).await.expect("match count").expect("declared rollup route");
-        let generated = generated_sql(&route);
-        assert!(generated.contains("date_part('EPOCH', time_bucket('1 hours', timestamp))"), "the epoch wrapper must reach the rewrite: {generated}");
-        assert!(generated.contains("CAST(date_part('EPOCH'"), "the integer cast must be reproduced or the schemas will not match: {generated}");
-        assert_substitutes(&state, &sql, None).await;
+        // The epoch wrapper AND its integer cast, or the schemas will not match.
+        assert_rewrite_contains(&sql, &["date_part('EPOCH', time_bucket('1 hours', timestamp))", "CAST(date_part('EPOCH'"]).await;
     }
 
     /// `extract(epoch …)` is accepted because it is 1:1 over buckets. Every
@@ -4040,14 +3416,13 @@ mod tests {
     /// different answer.
     #[tokio::test]
     async fn extracting_any_field_but_epoch_from_a_bucket_still_declines() {
-        let state = session().await;
         let sql = format!(
             "SELECT extract(hour from time_bucket('1 hours', timestamp))::integer AS tb, COUNT(*) \
              FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW} GROUP BY 1"
         );
         // Declining is the invariant; WHICH reason it declines with is not, so
         // this accepts a miss as readily as a `None` route.
-        assert!(matches!(route_for(&state, &sql).await, Err(_) | Ok(None)), "a non-EPOCH field must not route");
+        assert!(matches!(route_alone(&sql).await, Err(_) | Ok(None)), "a non-EPOCH field must not route");
     }
 
     #[tokio::test]
@@ -4117,14 +3492,12 @@ mod tests {
     /// serve an hour of rows for a query that must return none.
     #[tokio::test]
     async fn a_date_trunc_equality_against_an_unaligned_literal_is_refused() {
-        let state = session().await;
         let sql = format!(
             "SELECT project_id, COUNT(*) FROM {SOURCE} \
              WHERE timestamp >= to_timestamp_micros(0) AND timestamp < to_timestamp_micros(86400000000) \
              AND date_trunc('hour', timestamp) = to_timestamp_micros(90061000000) GROUP BY 1"
         );
-        let miss = route_for(&state, &sql).await.expect_err("an unaligned truncation must be refused");
-        assert!(matches!(miss, MissReason::UnknownFilter), "expected UnknownFilter, got {miss:?}");
+        assert_eq!(route_alone(&sql).await.err(), Some(MissReason::UnknownFilter), "an unaligned truncation must be refused as UnknownFilter");
     }
 
     /// One project short of coverage must not refuse the query for every other
@@ -4177,26 +3550,20 @@ mod tests {
     /// silently fold every project into one row.
     #[tokio::test]
     async fn a_query_with_neither_a_project_filter_nor_a_project_group_is_refused() {
-        let state = session().await;
-        let miss = route_for(&state, &format!("SELECT COUNT(*) FROM {SOURCE} WHERE {WINDOW}")).await.expect_err("must be refused");
-        assert!(matches!(miss, MissReason::MissingProject), "expected MissingProject, got {miss:?}");
+        let miss = route_alone(&format!("SELECT COUNT(*) FROM {SOURCE} WHERE {WINDOW}")).await.err();
+        assert_eq!(miss, Some(MissReason::MissingProject), "expected MissingProject, got {miss:?}");
     }
 
     #[tokio::test]
     async fn a_scalar_projection_above_the_aggregate_survives_untouched() {
-        let state = session().await;
-        let sql = format!("SELECT COUNT(*) + 1 AS total FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW}");
-        assert_substitutes(&state, &sql, None).await;
+        assert_rewrite_contains(&format!("SELECT COUNT(*) + 1 AS total FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW}"), &[]).await;
     }
 
     #[tokio::test]
     async fn matcher_applies_dimension_predicates_to_the_rollup_scan() {
         let state = session().await;
-        let route = route_for(&state, &format!("SELECT COUNT(*) FROM {SOURCE} WHERE project_id = 'project' AND kind = 'server' AND {WINDOW}"))
-            .await
-            .expect("match count")
-            .expect("declared rollup route");
-        assert!(generated_sql(&route).contains("AND (kind = 'server')"));
+        let sql = format!("SELECT COUNT(*) FROM {SOURCE} WHERE project_id = 'project' AND kind = 'server' AND {WINDOW}");
+        assert!(routed_sql(&state, &sql).await.contains("AND (kind = 'server')"));
     }
 
     /// The three ranges must PARTITION `[lo, hi)`: a gap drops rows, an overlap
@@ -4309,14 +3676,7 @@ mod tests {
     /// that used to fall through to `unknown_filter` and disqualify the panel.
     #[tokio::test]
     async fn a_metrics_panel_routes_with_an_in_filter_and_a_digest() {
-        let mut ctx = datafusion::prelude::SessionContext::new();
-        crate::read::functions::register_custom_functions(&mut ctx).expect("functions register");
-        for table_name in ["otel_metrics", "otel_metrics_rollup_metrics_1m_v2"] {
-            let table = datafusion::datasource::MemTable::try_new(crate::schema::get_schema(table_name).expect("schema").schema_ref(), vec![vec![]])
-                .expect("empty table");
-            ctx.register_table(table_name, Arc::new(table)).expect("register table");
-        }
-        let state = ctx.state();
+        let state = session_over(["otel_metrics", "otel_metrics_rollup_metrics_1m_v2"].map(str::to_owned));
         let sql = format!(
             "SELECT time_bucket('1 minute', timestamp) AS bucket, metric_name, AVG(value) AS mean, \
                     approx_percentile(0.95, percentile_agg(CAST(value AS DOUBLE))) AS p95 \
@@ -4740,15 +4100,13 @@ mod tests {
     /// different chart.
     #[tokio::test]
     async fn a_row_filter_that_matches_a_declared_measure_filter_routes_with_a_having() {
-        let state = session().await;
-        const SERVER: &str = "(kind = 'server' OR name = 'apitoolkit-http-span' OR name = 'monoscope.http')";
         let sql = format!(
             "SELECT time_bucket('1 hours', timestamp) AS bucket, COUNT(*) AS c \
              FROM {SOURCE} WHERE project_id = 'project' AND {SERVER} AND {WINDOW} GROUP BY 1 ORDER BY 1 DESC"
         );
-        let (_, generated) = assert_substitutes(&state, &sql, None).await;
-        assert!(generated.contains("server_request_count"), "the pre-filtered measure must answer it: {generated}");
-        assert!(generated.contains("HAVING"), "group elimination must be reproduced, or empty buckets come back as zeros: {generated}");
+        // The pre-filtered measure must answer it, and group elimination must be
+        // reproduced or empty buckets come back as zeros.
+        assert_rewrite_contains(&sql, &["server_request_count", "HAVING"]).await;
     }
 
     /// The aggregate's own FILTER and the promoted row filter combine, so the
@@ -4756,15 +4114,13 @@ mod tests {
     /// conjunction.
     #[tokio::test]
     async fn an_aggregate_filter_combines_with_the_promoted_row_filter() {
-        let state = session().await;
-        const SERVER: &str = "(kind = 'server' OR name = 'apitoolkit-http-span' OR name = 'monoscope.http')";
         let sql = format!(
             "SELECT time_bucket('1 hours', timestamp) AS bucket, \
                     COUNT(*) FILTER (WHERE status_code = 'ERROR' OR COALESCE(attributes___http___response___status_code, 0) >= 500) AS errors \
              FROM {SOURCE} WHERE project_id = 'project' AND {SERVER} AND {WINDOW} GROUP BY 1"
         );
-        let (_, generated) = assert_substitutes(&state, &sql, None).await;
-        assert!(generated.contains("server_error_count"), "the conjunction must resolve to the declared measure: {generated}");
+        // The conjunction must resolve to the declared measure.
+        assert_rewrite_contains(&sql, &["server_error_count"]).await;
     }
 
     /// A residual filter that matches NOTHING declared must still refuse. The
@@ -4774,12 +4130,11 @@ mod tests {
     /// *not eligible* half of the split: nothing could ever have answered it.
     #[tokio::test]
     async fn a_residual_filter_with_no_declared_measure_still_refuses() {
-        let state = session().await;
         let sql = format!(
             "SELECT COUNT(*) AS c FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW} AND status_message = 'nope' \
              GROUP BY time_bucket('1 hours', timestamp)"
         );
-        assert_eq!(route_for(&state, &sql).await.err(), Some(MissReason::FilterNotEligible), "an unmatched residual must not be promoted");
+        assert_eq!(route_alone(&sql).await.err(), Some(MissReason::FilterNotEligible), "an unmatched residual must not be promoted");
     }
 
     /// The other half of the split, and the reason it exists: a residual that
@@ -4794,17 +4149,15 @@ mod tests {
     /// These two tests are what stop them collapsing back together.
     #[tokio::test]
     async fn a_near_miss_on_a_declared_column_is_distinguished_from_an_ineligible_one() {
-        let state = session().await;
         // The shape a drifted panel takes: the declared server filter plus one
         // extra conjunct. It cannot match, but it talks about `kind`/`name`,
         // which declared measures do filter on — so it is worth a warning.
         let sql = format!(
-            "SELECT COUNT(*) AS c FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW} \
-                    AND (kind = 'server' OR name = 'apitoolkit-http-span' OR name = 'monoscope.http') AND status_message = 'nope' \
+            "SELECT COUNT(*) AS c FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW} AND {SERVER} AND status_message = 'nope' \
              GROUP BY time_bucket('1 hours', timestamp)"
         );
         assert_eq!(
-            route_for(&state, &sql).await.err(),
+            route_alone(&sql).await.err(),
             Some(MissReason::UnknownFilter),
             "a residual on a column declared measures filter on is a near-miss, not an ineligible query"
         );
@@ -4816,13 +4169,12 @@ mod tests {
     /// ever have seen it.
     #[tokio::test]
     async fn an_aggregate_inside_a_cte_is_reachable() {
-        let state = session().await;
         let sql = format!(
             "WITH bucketed AS (SELECT time_bucket('1 hours', timestamp) AS t, avg(duration) AS mean \
                                FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW} GROUP BY 1) \
              SELECT t, mean FROM bucketed ORDER BY 1 DESC"
         );
-        assert_substitutes(&state, &sql, None).await;
+        assert_rewrite_contains(&sql, &[]).await;
     }
 
     /// `ORDER BY ... DESC` is on every real dashboard query, so a matcher that
@@ -4882,9 +4234,7 @@ mod tests {
     #[tokio::test]
     async fn avg_casts_before_dividing_so_it_does_not_truncate() {
         let state = session().await;
-        let route =
-            route_for(&state, &format!("SELECT avg(duration) FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW}")).await.expect("match").expect("route");
-        let sql = generated_sql(&route);
+        let sql = routed_sql(&state, &format!("SELECT avg(duration) FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW}")).await;
         assert!(sql.contains("CAST(SUM(duration_sum) AS DOUBLE) / CAST(SUM(duration_count) AS DOUBLE)"), "avg must divide in floating point: {sql}");
     }
 
@@ -4893,91 +4243,80 @@ mod tests {
     /// come back as 0/NULL rows. Refuse the route instead.
     #[tokio::test]
     async fn a_residual_row_filter_refuses_the_route_rather_than_inventing_zero_rows() {
-        let state = session().await;
         // `name` is not a declared dimension, so it cannot be pushed into the
         // rollup scan — it can only pick a pre-filtered measure.
-        let reason = route_for(&state, &format!("SELECT COUNT(*) FROM {SOURCE} WHERE project_id = 'project' AND name = 'monoscope.http' AND {WINDOW}"))
-            .await
-            .expect_err("a residual filter must not route");
-        assert_eq!(reason, MissReason::UnknownFilter);
+        let sql = format!("SELECT COUNT(*) FROM {SOURCE} WHERE project_id = 'project' AND name = 'monoscope.http' AND {WINDOW}");
+        assert_eq!(route_alone(&sql).await.err(), Some(MissReason::UnknownFilter), "a residual filter must not route");
     }
 
     /// `project_id = <column>` used to be consumed and dropped, so the rollup
     /// answered without a predicate the raw query enforces.
     #[tokio::test]
     async fn a_non_literal_project_id_predicate_is_not_silently_dropped() {
-        let state = session().await;
-        let route = route_for(&state, &format!("SELECT COUNT(*) FROM {SOURCE} WHERE project_id = name AND project_id = 'project' AND {WINDOW}")).await;
+        let route = route_alone(&format!("SELECT COUNT(*) FROM {SOURCE} WHERE project_id = name AND project_id = 'project' AND {WINDOW}")).await;
         assert!(matches!(route, Err(MissReason::UnknownFilter) | Ok(None)), "must not route while ignoring `project_id = name`: {route:?}");
+    }
+
+    /// The aggregate batch a rollup build hands to the shapers: `timestamp` and
+    /// every declared dimension and measure, one row per `(micros, dimension
+    /// value, digest bytes, integer measure)`. `projects` prepends the
+    /// `project_id` column the cohort shaper needs and the single-project one
+    /// must not see.
+    fn aggregate_batch(spec: &RollupSpec, projects: Option<&[&str]>, rows: &[(i64, &str, &[u8], i64)]) -> RecordBatch {
+        let mut fields: Vec<Arc<Field>> = Vec::new();
+        let mut columns: Vec<arrow::array::ArrayRef> = Vec::new();
+        if let Some(projects) = projects {
+            fields.push(Arc::new(Field::new("project_id", DataType::Utf8, false)));
+            columns.push(Arc::new(StringArray::from(projects.iter().map(|project| Some(*project)).collect::<Vec<_>>())));
+        }
+        fields.push(Arc::new(Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), false)));
+        columns.push(Arc::new(TimestampMicrosecondArray::from(rows.iter().map(|row| row.0).collect::<Vec<_>>()).with_timezone("UTC")));
+        fields.extend(spec.dimensions.iter().map(|name| Arc::new(Field::new(name, DataType::Utf8, true))));
+        let dims: Vec<Option<&str>> = rows.iter().map(|row| Some(row.1)).collect();
+        columns.extend(spec.dimensions.iter().map(|_| Arc::new(StringArray::from(dims.clone())) as arrow::array::ArrayRef));
+        fields.extend(spec.measures.iter().map(|measure| {
+            Arc::new(Field::new(&measure.name, if measure.agg == "tdigest" { DataType::Binary } else { DataType::Int64 }, measure.agg != "count"))
+        }));
+        columns.extend(spec.measures.iter().map(|measure| {
+            if measure.agg == "tdigest" {
+                Arc::new(BinaryArray::from(rows.iter().map(|row| Some(row.2)).collect::<Vec<_>>())) as arrow::array::ArrayRef
+            } else {
+                Arc::new(Int64Array::from(rows.iter().map(|row| Some(row.3)).collect::<Vec<_>>())) as arrow::array::ArrayRef
+            }
+        }));
+        RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).expect("aggregate batch")
+    }
+
+    /// The first value of a shaped batch's `column`, which the shapers always
+    /// write as a `StringViewArray`.
+    fn utf8(batch: &RecordBatch, column: &str) -> String {
+        batch.column_by_name(column).expect("column").as_any().downcast_ref::<StringViewArray>().expect("utf8 column").value(0).to_owned()
     }
 
     #[test]
     fn shaped_batches_preserve_binary_measure_and_generation() {
         let spec = spec();
-        let mut fields = vec![Arc::new(Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), false))];
-        fields.extend(spec.dimensions.iter().map(|name| Arc::new(Field::new(name, DataType::Utf8, true))));
-        fields.extend(spec.measures.iter().map(|measure| {
-            Arc::new(Field::new(&measure.name, if measure.agg == "tdigest" { DataType::Binary } else { DataType::Int64 }, measure.agg != "count"))
-        }));
-        let mut columns: Vec<arrow::array::ArrayRef> = vec![Arc::new(TimestampMicrosecondArray::from(vec![1_000_000]).with_timezone("UTC"))];
-        columns.extend(spec.dimensions.iter().map(|_| Arc::new(StringArray::from(vec![Some("value")])) as arrow::array::ArrayRef));
-        columns.extend(spec.measures.iter().map(|measure| {
-            if measure.agg == "tdigest" {
-                Arc::new(BinaryArray::from(vec![Some(&[1_u8, 2, 3][..])])) as arrow::array::ArrayRef
-            } else {
-                Arc::new(Int64Array::from(vec![Some(1)])) as arrow::array::ArrayRef
-            }
-        }));
-        let input = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).expect("aggregate batch");
+        let input = aggregate_batch(&spec, None, &[(1_000_000, "value", &[1_u8, 2, 3][..], 1)]);
         let output = to_rollup_batches(&spec, SOURCE, "project", "1970-01-01", "generation-a", std::slice::from_ref(&input)).expect("shape rollup");
         let other = to_rollup_batches(&spec, SOURCE, "project", "1970-01-01", "generation-b", &[input]).expect("shape rollup");
         let batch = output.first().expect("one output batch");
-        let generation = batch.column_by_name("rollup_generation").expect("generation").as_any().downcast_ref::<StringViewArray>().expect("utf8 generation");
-        assert_eq!(generation.value(0), "generation-a");
+        assert_eq!(utf8(batch, "rollup_generation"), "generation-a");
         let digest = batch.column_by_name("server_duration_digest").expect("digest");
         assert_eq!(digest.data_type(), &DataType::Binary);
         assert_eq!(digest.as_any().downcast_ref::<BinaryArray>().expect("binary digest").value(0), &[1, 2, 3]);
-        assert_ne!(
-            batch.column_by_name("id").expect("id").as_any().downcast_ref::<StringViewArray>().expect("utf8 id").value(0),
-            other[0].column_by_name("id").expect("id").as_any().downcast_ref::<StringViewArray>().expect("utf8 id").value(0),
-            "generations must not share a dedup identity"
-        );
+        assert_ne!(utf8(batch, "id"), utf8(&other[0], "id"), "generations must not share a dedup identity");
     }
 
     #[test]
     fn cohort_batch_shaping_preserves_project_generations() {
         let spec = spec();
-        let mut fields = vec![
-            Arc::new(Field::new("project_id", DataType::Utf8, false)),
-            Arc::new(Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), false)),
-        ];
-        fields.extend(spec.dimensions.iter().map(|name| Arc::new(Field::new(name, DataType::Utf8, true))));
-        fields.extend(spec.measures.iter().map(|measure| {
-            Arc::new(Field::new(&measure.name, if measure.agg == "tdigest" { DataType::Binary } else { DataType::Int64 }, measure.agg != "count"))
-        }));
-        let mut columns: Vec<arrow::array::ArrayRef> = vec![
-            Arc::new(StringArray::from(vec![Some("project-b"), Some("project-a")])),
-            Arc::new(TimestampMicrosecondArray::from(vec![2_000_000, 1_000_000]).with_timezone("UTC")),
-        ];
-        columns.extend(spec.dimensions.iter().map(|_| Arc::new(StringArray::from(vec![Some("b"), Some("a")])) as arrow::array::ArrayRef));
-        columns.extend(spec.measures.iter().map(|measure| {
-            if measure.agg == "tdigest" {
-                Arc::new(BinaryArray::from(vec![Some(&[2_u8][..]), Some(&[1_u8][..])])) as arrow::array::ArrayRef
-            } else {
-                Arc::new(Int64Array::from(vec![Some(2), Some(1)])) as arrow::array::ArrayRef
-            }
-        }));
-        let input = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).expect("cohort aggregate batch");
+        let input = aggregate_batch(&spec, Some(&["project-b", "project-a"]), &[(2_000_000, "b", &[2_u8][..], 2), (1_000_000, "a", &[1_u8][..], 1)]);
         let generations =
             std::collections::HashMap::from([("project-a".to_string(), "generation-a".to_string()), ("project-b".to_string(), "generation-b".to_string())]);
         let output = to_rollup_batches_by_project(&spec, SOURCE, "1970-01-01", &generations, &[input]).expect("shape cohort");
         for (project, generation) in [("project-a", "generation-a"), ("project-b", "generation-b")] {
-            let batch = &output[project][0];
-            let project_ids = batch.column_by_name("project_id").expect("project id").as_any().downcast_ref::<StringViewArray>().expect("utf8 project id");
-            let generations =
-                batch.column_by_name("rollup_generation").expect("generation").as_any().downcast_ref::<StringViewArray>().expect("utf8 generation");
-            assert_eq!(project_ids.value(0), project);
-            assert_eq!(generations.value(0), generation);
+            assert_eq!(utf8(&output[project][0], "project_id"), project);
+            assert_eq!(utf8(&output[project][0], "rollup_generation"), generation);
         }
     }
 }

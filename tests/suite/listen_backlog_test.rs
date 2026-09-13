@@ -1,24 +1,6 @@
-//! Reproduces the production "Connection refused" symptom that monoscope's
-//! bulk insert jobs hit against `timefusion.s.past3.tech:5432`.
-//!
-//! Root cause: tokio's `TcpListener::bind` (via mio) hardcodes the listen
-//! backlog to **128** on Linux/macOS. When monoscope's parallel retry loops
-//! converge into a burst of >128 concurrent SYNs faster than the accept loop
-//! drains the queue, the kernel either drops the SYN (default Linux,
-//! manifests as client connect-timeout) or RSTs it (Linux with
-//! `tcp_abort_on_overflow=1`, manifests as `ECONNREFUSED`). The server logs
-//! show nothing because the rejection happens in the kernel, not in
-//! application code.
-//!
-//! This test pins the mechanism by binding a stock `TcpListener` (backlog=128),
-//! stalling the accept loop, and demonstrating that the 129th+ concurrent
-//! connect attempt fails. The fix is to bind via `socket2`/`TcpSocket` with
-//! an explicit larger backlog (e.g. 4096) — see follow-up.
-//!
-//! Run with `RUST_LOG=info` for per-connection diagnostics. Run on Linux with
-//! `sudo sysctl net.ipv4.tcp_abort_on_overflow=1` to surface the exact prod
-//! `ECONNREFUSED` error class; otherwise observed failures are timeouts (same
-//! root cause, different kernel response).
+//! Listen-backlog overflow tests: tokio's `TcpListener::bind` hardcodes a backlog
+//! of 128, so bursts against a stalled or starved acceptor overflow it. Binding via
+//! `TcpSocket` with an explicit backlog fixes that, subject to host `somaxconn`.
 
 use std::{io, sync::Arc, time::Duration};
 
@@ -28,8 +10,7 @@ use tokio::{
     time::timeout,
 };
 
-/// Every scenario bursts the same number of concurrent SYNs, well past the
-/// 128-deep default accept queue.
+/// Concurrent SYNs per scenario — well past the 128-deep default accept queue.
 const BURST: usize = 300;
 
 struct BurstResult {
@@ -38,8 +19,7 @@ struct BurstResult {
     timed_out: usize,
 }
 
-/// Fire `BURST` concurrent TCP connect attempts at the given port, with a
-/// per-connect timeout, classifying each outcome.
+/// Fire `BURST` concurrent connects at `port`, classifying each outcome.
 async fn burst_connect(port: u16, connect_timeout: Duration) -> BurstResult {
     let handles: Vec<_> = (0..BURST).map(|_| tokio::spawn(async move { timeout(connect_timeout, TcpStream::connect(("127.0.0.1", port))).await })).collect();
 
@@ -61,13 +41,12 @@ async fn burst_connect(port: u16, connect_timeout: Duration) -> BurstResult {
 
 /// One burst scenario against a real listener.
 ///
-/// * `backlog` — `None` binds the stock tokio way (mio hardcodes 128);
-///   `Some(n)` binds via `TcpSocket` and requests `n` explicitly (the fix).
-/// * `drain` — `true` runs a tight accept loop (the "correct" spawn-immediately
-///   pattern); `false` wedges the acceptor until the burst is over, so the
-///   kernel keeps queueing SYNs until the accept queue overflows.
-/// * `hogs` — CPU-bound tasks pinned on runtime workers before the burst, to
-///   starve the accept task. Must equal `worker_threads` to saturate.
+/// * `backlog` — `None` binds the stock tokio way (backlog 128); `Some(n)`
+///   binds via `TcpSocket` and requests `n` explicitly.
+/// * `drain` — `true` runs a tight accept loop; `false` wedges the acceptor
+///   until the burst is over so the accept queue overflows.
+/// * `hogs` — CPU-bound tasks pinned on runtime workers to starve the accept
+///   task. Must equal `worker_threads` to saturate.
 async fn run_burst(label: &str, backlog: Option<u32>, drain: bool, connect_timeout: Duration, hogs: usize) -> BurstResult {
     let listener = match backlog {
         None => TcpListener::bind("127.0.0.1:0").await.expect("bind"),
@@ -83,9 +62,7 @@ async fn run_burst(label: &str, backlog: Option<u32>, drain: bool, connect_timeo
 
     let accepter = tokio::spawn(async move {
         if !drain {
-            // Wedged accept loop — equivalent to what monoscope sees when the
-            // prod accept loop falls behind during a thundering-herd retry
-            // burst. Once released, drain so the test exits cleanly.
+            // Wedged accept loop; once released, drain so the test exits cleanly.
             release_c.notified().await;
         }
         loop {
@@ -96,12 +73,9 @@ async fn run_burst(label: &str, backlog: Option<u32>, drain: bool, connect_timeo
         }
     });
 
-    // Saturate every worker with a CPU-bound spin. This mimics heavy query
-    // execution starving the accept task.
-    //
-    // NOTE: tokio::task::spawn_blocking does NOT starve the runtime — it runs
-    // on a dedicated blocking pool. Use tokio::spawn with a tight CPU-bound
-    // loop (no .await points) so the work actually pins a runtime worker.
+    // Saturate every worker with a CPU-bound spin. Must be `tokio::spawn` with
+    // no `.await` points: `spawn_blocking` uses a separate pool and would not
+    // starve the runtime.
     const HOG_DURATION_MS: u64 = 800;
     let hogs: Vec<_> = (0..hogs)
         .map(|i| {
@@ -109,11 +83,6 @@ async fn run_burst(label: &str, backlog: Option<u32>, drain: bool, connect_timeo
                 let deadline = std::time::Instant::now() + Duration::from_millis(HOG_DURATION_MS);
                 let mut x: u64 = i as u64;
                 while std::time::Instant::now() < deadline {
-                    // Cooperative yield budget exhausts after ~128 polls in tokio,
-                    // but a tight loop with no .await points blocks the worker
-                    // entirely. That's the realistic case: a heavy synchronous
-                    // routine inside a handler (e.g. arrow compute) holding the
-                    // worker thread.
                     for _ in 0..1_000_000 {
                         x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
                     }
@@ -123,8 +92,8 @@ async fn run_burst(label: &str, backlog: Option<u32>, drain: bool, connect_timeo
         })
         .collect();
 
-    // Let the listener be polled into the runtime; with hogs a shorter pause,
-    // since they must already be spinning when the burst lands.
+    // Let the listener be polled into the runtime; shorter with hogs, which
+    // must already be spinning when the burst lands.
     tokio::time::sleep(Duration::from_millis(if hogs.is_empty() { 50 } else { 20 })).await;
     eprint!("{label}: burst={BURST} ");
     let res = burst_connect(port, connect_timeout).await;
@@ -133,36 +102,24 @@ async fn run_burst(label: &str, backlog: Option<u32>, drain: bool, connect_timeo
         let _ = h.await;
     }
     release.notify_one();
-    // Only the draining acceptor exits on release; the stalled one keeps
-    // draining until the runtime drops, so awaiting it would hang.
+    // Only the draining acceptor exits on release; awaiting the stalled one hangs.
     if drain {
         let _ = accepter.await;
     }
     res
 }
 
-// Skipped on CI: GitHub Actions runners silently queue SYNs beyond the
-// requested 128 backlog (kernel/network-namespace behaviour we don't control),
-// so the "some connects must fail" assertion fires `ok=300 refused=0 timed_out=0`
-// and the test fails deterministically. Kept as a manual reproducer — run with
-// `cargo test --test listen_backlog_test -- --ignored` on a host where
-// `tcp_abort_on_overflow=1` and the kernel enforces the backlog.
+// Manual reproducer: CI runners queue SYNs beyond the requested backlog, so the
+// "some connects must fail" assertion cannot hold there.
 #[ignore = "kernel-level backlog enforcement not reliable on CI runners"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn listen_backlog_overflows_at_128_when_accept_stalls() {
     let BurstResult { ok, refused, timed_out } = run_burst("stock-backlog", None, false, Duration::from_millis(500), 0).await;
 
-    // The contract we're asserting:
-    //
-    // 1. The accept queue is finite (128 by default), so SOME connects must
-    //    fail when we burst 300 SYNs at a stalled acceptor. If this assertion
-    //    fails, either the OS isn't enforcing the backlog (unlikely) or the
-    //    fix has landed (raise the burst, or delete this test as obsolete).
+    // The accept queue is finite (128 by default), so some of the 300 connects
+    // must fail against a stalled acceptor. Asserted on Linux only: other
+    // kernels silently queue beyond the requested backlog.
     let failed = refused + timed_out;
-    // Strict assertion is Linux-only: some kernels (e.g. macOS dev hosts)
-    // silently queue beyond the requested backlog, which would produce
-    // spurious failures here. The eprintln! below still surfaces the
-    // observed counts on every platform.
     #[cfg(target_os = "linux")]
     assert!(
         failed > 0,
@@ -172,10 +129,6 @@ async fn listen_backlog_overflows_at_128_when_accept_stalls() {
          silently queues beyond the requested backlog."
     );
 
-    // 2. On Linux with `tcp_abort_on_overflow=1`, failures appear as
-    //    ECONNREFUSED — the same error class monoscope's Hasql logs print.
-    //    On macOS and stock Linux, failures appear as connect timeouts.
-    //    Both indicate the same root cause: kernel-level backlog overflow.
     eprintln!("Mechanism reproduced: {failed} of {BURST} connects failed (refused={refused}, timed_out={timed_out}).");
     if cfg!(target_os = "linux") && refused > 0 {
         eprintln!("ECONNREFUSED observed -> host has tcp_abort_on_overflow=1, matches prod.");
@@ -185,36 +138,17 @@ async fn listen_backlog_overflows_at_128_when_accept_stalls() {
     let _ = ok;
 }
 
-/// The fix: bind via `TcpSocket` with an explicit larger backlog (e.g. 4096
-/// or whatever `net.core.somaxconn` allows). With a deeper accept queue,
-/// the same stalled-acceptor burst no longer refuses connections — the
-/// kernel happily queues all 300 SYNs until the acceptor wakes up.
-///
-/// This is the test that should fail before the production fix lands and
-/// pass after. The fix is to either:
-///   1. Patch `datafusion-postgres::serve_with_handlers` to bind with
-///      `TcpSocket::new_v4()? + bind + listen(4096)` instead of
-///      `TcpListener::bind(...)`, or
-///   2. Pre-bind in main.rs and pass a `TcpListener::from_std(...)` into
-///      `serve_with_handlers` (would need a small API addition).
+/// With an explicit deeper backlog, the same stalled-acceptor burst queues all
+/// 300 SYNs instead of refusing any.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn larger_backlog_eliminates_overflow_under_same_burst() {
     const BACKLOG: u32 = 4096;
 
     let BurstResult { ok, refused, timed_out } = run_burst("explicit-backlog=4096", Some(BACKLOG), false, Duration::from_millis(500), 0).await;
 
-    // CRITICAL FINDING: this assertion may fail even after the app-level fix
-    // because the OS clamps the requested backlog to `somaxconn`:
-    //   - macOS:   kern.ipc.somaxconn  (default 128)
-    //   - Linux:   net.core.somaxconn  (modern default 4096; older 128)
-    // So the prod fix is two-part:
-    //   (a) app-level: bind via TcpSocket and request a large backlog (4096+)
-    //   (b) host-level: ensure somaxconn >= the requested backlog
-    // If (b) is below the burst size, the same overflow occurs and clients
-    // see ECONNREFUSED (when tcp_abort_on_overflow=1) or connect timeouts.
-    //
-    // On macOS this test is informational only (somaxconn=128 by default).
-    // On Linux it should pass with the default 4096 somaxconn.
+    // The OS clamps the requested backlog to `somaxconn` (macOS
+    // `kern.ipc.somaxconn` defaults to 128), so requesting a large backlog only
+    // helps if the host allows it — hence informational on macOS, asserted on Linux.
     if ok < BURST {
         eprintln!(
             "Backlog clamped by host somaxconn — requested {BACKLOG}, got effective ~{ok}. \
@@ -223,9 +157,6 @@ async fn larger_backlog_eliminates_overflow_under_same_burst() {
         );
     }
 
-    // Assertion is Linux-only: on macOS, kern.ipc.somaxconn often clamps below
-    // BACKLOG, so we can't enforce a strict ok==BURST contract. The eprintln!
-    // above surfaces the macOS case as a diagnostic.
     #[cfg(target_os = "linux")]
     assert_eq!(
         ok, BURST,
@@ -236,25 +167,14 @@ async fn larger_backlog_eliminates_overflow_under_same_burst() {
     let _ = (refused, timed_out);
 }
 
-/// Reproduces the **realistic** prod scenario: a fast accept loop that
-/// nonetheless falls behind because the tokio runtime workers are saturated
-/// with CPU-bound query work. The accept task is just another task — when
-/// all workers are spinning on `std::hint::black_box(..)` loops, the
-/// accept future doesn't get polled for tens to hundreds of milliseconds,
-/// and the 128-deep accept queue overflows during a burst.
-///
-/// This is closer to what monoscope sees: timefusion is "up", *some*
-/// connections succeed, and others get refused / time out, because the
-/// accept loop is being starved.
+/// A correct, tight accept loop still overflows the 128-deep queue when every
+/// runtime worker is pinned by CPU-bound work and the accept future goes
+/// unpolled. Probabilistic indicator, not a hard contract.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn worker_starvation_causes_backlog_overflow_under_burst() {
-    // hogs == worker_threads: every runtime worker must be pinned to starve
-    // the accept task.
+    // hogs == worker_threads, or the accept task is not starved.
     let BurstResult { ok, refused, timed_out } = run_burst("worker-starved", None, true, Duration::from_millis(400), 2).await;
 
-    // Under worker starvation, the accept task can't drain 128+ SYNs fast
-    // enough during the burst. We expect SOME failures even though the
-    // accept loop itself is "correct" (spawn-immediately pattern).
     let failed = refused + timed_out;
     if failed == 0 {
         eprintln!(
@@ -280,6 +200,5 @@ async fn worker_starvation_causes_backlog_overflow_under_burst() {
 async fn no_overflow_when_acceptor_drains_promptly() {
     let BurstResult { ok, refused, timed_out } = run_burst("fast-acceptor", None, true, Duration::from_millis(2000), 0).await;
 
-    // With a tight accept loop draining the queue, all 300 should land.
     assert_eq!(ok, BURST, "fast acceptor should drain all {BURST} connects (got ok={ok}, refused={refused}, timed_out={timed_out})");
 }

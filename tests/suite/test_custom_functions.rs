@@ -5,9 +5,8 @@ mod tests {
     use test_case::test_case;
     use timefusion::{read::functions::register_custom_functions, support::test_helpers::array_get_str as get_str};
 
-    /// Runs `SELECT {expr}` on a fresh session with the custom functions
-    /// registered, asserts exactly one batch of exactly one row, and returns
-    /// that cell as text.
+    /// Runs `SELECT {expr}` with the custom functions registered, asserting a
+    /// single row, and returns that cell as text.
     async fn eval(expr: &str) -> String {
         let mut ctx = SessionContext::new();
         register_custom_functions(&mut ctx).unwrap();
@@ -29,26 +28,13 @@ mod tests {
         eval(expr).await
     }
 
-    /// `SUBSTRING(x FROM 'regex')` is Postgres regex extraction, but sqlparser
-    /// lowers it to the same 2-arg `substr` as the offset form, so DataFusion
-    /// rejected it with "Function 'substr' requires Int64, but received String"
-    /// and the whole statement failed to plan.
+    /// Pins Postgres `SUBSTRING(x FROM 'regex')` semantics: whole match vs first
+    /// capture group, NULL on no match, and that the offset forms still mean
+    /// `substr`. Must use `create_session_context` — expr-planner ORDER matters,
+    /// and only the real session builds it.
     ///
-    /// Pins PG's two result rules (whole match vs first capture group), the
-    /// NULL-on-no-match case, and that the offset forms still route to `substr`.
-    ///
-    /// Built through `create_session_context`, not a bare `SessionContext`:
-    /// half the fix is expr-planner ORDER, and only the real session builds it.
-    /// The cases stay a loop rather than a `test_case` table so all five share
-    /// one `Database::new()` instead of standing up five.
-    ///
-    /// KNOWN GAP, deliberately not asserted here: over pgwire the all-literal
-    /// form (`SELECT substring('abc-def' FROM '^[a-z]+')`, no column anywhere)
-    /// still fails with "Cannot cast string '^[a-z]+' to value of Int64" — the
-    /// plan cache parameterizes both literals, so arg 2 is a placeholder that
-    /// coerces to Int64 before it is bound. Queries over a real column — which
-    /// is every query that matters, including the operator query this fixes —
-    /// plan and run correctly; verified against prod 2026-08-31.
+    /// Known gap, not asserted: over pgwire the all-literal form still fails,
+    /// because the plan cache parameterizes arg 2 into an Int64 placeholder.
     #[tokio::test]
     async fn substring_from_regex_matches_postgres_semantics() -> Result<()> {
         let db = std::sync::Arc::new(timefusion::database::Database::new().await?);
@@ -56,9 +42,8 @@ mod tests {
         db.setup_session_context(&mut ctx)?;
 
         // (sql, expected) — None expects a NULL result.
-        let cases: Vec<(&str, Option<&str>)> = vec![
-            // No capturing group: the whole match. The pattern an operator ran
-            // against widget access logs on 2026-08-31.
+        for (sql, expected) in [
+            // No capturing group: the whole match.
             (r#"SELECT SUBSTRING('GET /widget.png?w=3 HTTP/1.1' FROM 'widget.png[^"]{0,20}')"#, Some("widget.png?w=3 HTTP/1.1")),
             // One capturing group: that group, NOT the whole match.
             (r#"SELECT SUBSTRING('"GET / HTTP/1.1" 404 12' FROM 'HTTP/[0-9.]+" ([0-9]{3})')"#, Some("404")),
@@ -67,9 +52,7 @@ mod tests {
             // Offsets are untouched: both spellings still mean `substr`.
             ("SELECT SUBSTRING('abcdef' FROM 3)", Some("cdef")),
             ("SELECT SUBSTRING('abcdef' FROM 2 FOR 3)", Some("bcd")),
-        ];
-
-        for (sql, expected) in cases {
+        ] {
             let results = ctx.sql(sql).await?.collect().await?;
             let column = results[0].column(0);
             match expected {
@@ -81,12 +64,9 @@ mod tests {
         Ok(())
     }
 
-    /// The verbatim operator query from 2026-08-31, driven the way the plan
-    /// cache drives it: parse → statement_to_plan → optimize. The results test
-    /// above only proves the rewrite is semantically right on scalars; this
-    /// proves the real shape — regex over a Variant column, inside a
-    /// GROUP BY/ORDER BY/LIMIT — survives planning AND optimization, which is
-    /// what `get_or_build_shape` needs and what actually failed in production.
+    /// Drives a regex-over-Variant query the way the plan cache does
+    /// (parse → statement_to_plan → optimize), which is a different path from
+    /// the scalar results test above.
     #[tokio::test]
     async fn plan_and_optimize_matches_the_plan_cache_path() -> Result<()> {
         use datafusion::sql::parser::DFParser;
@@ -96,7 +76,6 @@ mod tests {
         db.setup_session_context(&mut ctx)?;
         let state = ctx.state();
 
-        // The verbatim operator query from 2026-08-31, over a real column.
         let sql = r#"SELECT SUBSTRING(variant_to_json(body)::TEXT FROM 'widget.png[^"]{0,20}') AS u,
                             SUBSTRING(variant_to_json(body)::TEXT FROM 'HTTP/[0-9.]+" ([0-9]{3})') AS status,
                             count(*)
@@ -110,10 +89,8 @@ mod tests {
         Ok(())
     }
 
-    /// TimescaleDB spells the bucket width as an INTERVAL; our own KQL emits a
-    /// string. Accepting only the string lost every hand-written Timescale-style
-    /// widget to "Failed to coerce arguments … time_bucket(Interval(...),
-    /// Timestamp)" (issue 3812a29a). Both spellings must agree.
+    /// The bucket width may be an INTERVAL (Timescale spelling) or a string (KQL
+    /// emits this); both spellings must agree.
     #[test_case("INTERVAL '5 minutes'" => "2026-08-31 14:35:00" ; "interval 5 minutes")]
     #[test_case("'5 minutes'" => "2026-08-31 14:35:00" ; "string 5 minutes lands on the same bucket")]
     #[test_case("INTERVAL '1 hour'" => "2026-08-31 14:00:00" ; "interval 1 hour")]
@@ -123,8 +100,7 @@ mod tests {
         eval(&format!("to_char(time_bucket({width}, TIMESTAMPTZ '2026-08-31 14:37:45+00'), 'YYYY-MM-DD HH24:MI:SS')")).await
     }
 
-    /// A month is 28-31 days: refuse it instead of bucketing by a wrong width
-    /// (same issue 3812a29a as `time_bucket_accepts_an_interval`).
+    /// A month is 28-31 days: refuse it instead of bucketing by a wrong width.
     #[tokio::test]
     async fn time_bucket_refuses_month_widths() -> Result<()> {
         let mut ctx = SessionContext::new();

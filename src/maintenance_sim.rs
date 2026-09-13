@@ -1,5 +1,4 @@
-//! Replays a production `TaskJournal` through the real scheduler on virtual
-//! time, using measured duration distributions.
+//! Replays a `TaskJournal` through the real scheduler on virtual time.
 //!
 //! Task selection, timeout handling, cycle switching, invalidation and the
 //! claim-time byte preflight are real. Durations, ingest cadence and the bytes
@@ -25,22 +24,16 @@ const HOUR_MICROS: i64 = 3_600_000_000;
 const MINT_INTERVAL_MICROS: i64 = NORMAL_SLICE_MICROS;
 /// Lets idle workers notice newly mature deadlines.
 const IDLE_POLL_MICROS: i64 = 5 * MICROS;
-/// `run_maintenance_coordinator_once` coarsens on the same 60s cadence it plans
-/// debt on. Modelled because coarsening is the only mechanism that SHRINKS the
-/// queue, and without it the sim cannot answer any question about queue size —
-/// which is most of what it is asked. Its absence made a fusion-pricing change
-/// look like it moved 25 units when the sim never fused at all.
+/// Coarsening cadence, matching `run_maintenance_coordinator_once`. It is the
+/// only mechanism that SHRINKS the queue, so the sim cannot omit it.
 const COARSEN_INTERVAL_MICROS: i64 = 60 * MICROS;
-/// A claim, a real scan estimate and a journal write. Charged whether the
-/// preflight splits or dispatches, so a bisection ladder costs throughput in
-/// the model exactly as it does in prod.
+/// A claim, a scan estimate and a journal write. Charged whether the preflight
+/// splits or dispatches, so a bisection ladder costs throughput in the model.
 const PREFLIGHT_COST_MICROS: i64 = MICROS;
 
 /// Decoded bytes of one parquet file, and the least a slice can read of a file
 /// it overlaps (row groups are the pruning unit — a slice cannot read less than
-/// one). Anchored, not derived: prod 2026-08-22 measured **302 MB for a
-/// five-minute slice**, and a 9.2 GB / 1,000-file day reproduces it to within
-/// 1% (see the [`DayShape::bytes`] doctest).
+/// one).
 const FILE_DECODED_BYTES: u64 = 9_200_000;
 const ROW_GROUP_BYTES: u64 = 5_000_000;
 /// How much of a day one file's rows span. Files are not time-sorted, so a
@@ -63,20 +56,16 @@ impl DayShape {
 
     /// What a slice of `width_micros` over this day decodes.
     ///
-    /// `floored` is the real physics — a slice reads at least one row group of
-    /// every file it overlaps, and the overlapping count bottoms out because
-    /// files span time. Floorless (bytes strictly proportional to width) is the
-    /// control: it is the model `byte_bounded_units` itself assumes, so a queue
-    /// that shreds under it is not shredding because of the floor.
+    /// `floored`: a slice reads at least one row group of every file it
+    /// overlaps, and the overlapping count bottoms out because files span time.
+    /// Floorless prices bytes strictly proportional to width (the control).
     ///
     /// ```
     /// # use timefusion::maintenance_sim::DayShape;
-    /// // The 2026-08-22 anchor: 302 MB measured for a five-minute slice.
     /// let day = DayShape::new(9_200_000_000);
     /// assert_eq!(day.files, 1_000);
     /// let five_minutes = day.bytes(300 * 1_000_000, true);
     /// assert!((five_minutes as i64 - 302_000_000).abs() < 3_000_000, "{five_minutes}");
-    /// // Floorless prices the same slice at a thirtieth of that.
     /// assert!(day.bytes(300 * 1_000_000, false) < 32_000_000);
     /// ```
     pub fn bytes(&self, width_micros: i64, floored: bool) -> u64 {
@@ -91,7 +80,7 @@ impl DayShape {
     }
 }
 
-/// The claim-time cost model: what the preflight would MEASURE, per
+/// The claim-time cost model: what the preflight measures, per
 /// (project, day) partition.
 #[derive(Clone, Debug, Default)]
 pub struct ByteModel {
@@ -108,21 +97,15 @@ impl ByteModel {
         self.days.get(&(project_id.to_owned(), day_start_micros)).copied()
     }
 
-    fn day_of(key: &TaskKey) -> i64 {
-        day_start(key.slice.start_micros)
-    }
-
-    /// Unmodelled partitions measure 0 — they never split, which is the right
-    /// default for minted frontier streams the fixture says nothing about.
+    /// Unmodelled partitions measure 0, so they never split.
     fn bytes(&self, key: &TaskKey) -> u64 {
-        self.shape(&key.project_id, Self::day_of(key)).map_or(0, |day| day.bytes(key.slice.width(), self.floored))
+        self.shape(&key.project_id, day_start(key.slice.start_micros)).map_or(0, |day| day.bytes(key.slice.width(), self.floored))
     }
 
     /// The file set the slice overlaps. Siblings of equal width over the same
-    /// partition overlap the same files, so they share an `fp` and fusion
-    /// charges them once — the whole point of stamping it at claim time.
+    /// partition share an `fp`, so fusion charges them once.
     fn footprint(&self, key: &TaskKey) -> Option<InputFootprint> {
-        let day_start = Self::day_of(key);
+        let day_start = day_start(key.slice.start_micros);
         let day = self.shape(&key.project_id, day_start)?;
         let files = day.files_overlapping(key.slice.width());
         let whole = (u128::from(day.decoded_bytes) * u128::from(files) / u128::from(day.files)) as u64;
@@ -141,16 +124,14 @@ impl ByteModel {
 /// `split_time_task` predicate; the others exist to answer "compared to what".
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum SplitGuard {
-    /// 69e6503 as shipped.
+    /// The real `split_time_task` predicate, as shipped.
     #[default]
     Shipped,
-    /// The pre-fix behaviour: every over-budget unit bisects. Defeated by
-    /// clearing `parent_measured_bytes` before the call, so the coordinator is
-    /// untouched and `split_sheds_enough`'s `None` arm does the work.
+    /// No guard: every over-budget unit bisects.
     Off,
     /// Sweep an alternative shed threshold (numerator, denominator), keeping
     /// the shipped rule's two-sided shape — a child measuring MORE than its
-    /// parent still splits, or the synthetic-stamp lineage freezes.
+    /// parent must still split, or the synthetic-stamp lineage freezes.
     Ratio(u64, u64),
 }
 
@@ -165,36 +146,22 @@ pub struct SimConfig {
     /// Model ongoing ingest invalidations for the streams found in the journal.
     #[educe(Default = true)]
     pub mint_frontier: bool,
-    /// Override the minted stream count (10x experiments: 260 streams at 130
-    /// projects). Extra streams clone the first real stream's tables under
-    /// synthetic project ids.
+    /// Override the number of INGESTING streams. Extra streams clone a real
+    /// active stream's tables under synthetic project ids.
     pub streams: Option<usize>,
     #[educe(Default = 1.0)]
     pub duration_scale: f64,
-    /// Model deploy/OOM restarts: re-invalidate the CURRENT HOUR for every
-    /// stream, which is what `reconcile_maintenance_task_cursors` does on boot
-    /// since 2026-08-18 — touched hours are derived from commit file statistics
-    /// rather than resetting the whole partition-day, so it is ~13 tasks per
-    /// stream rather than ~312.
-    ///
-    /// That distinction decides what a restart backtest is worth. Measured
-    /// 2026-08-23 on the real prod journal, 2 virtual hours, 16 workers: with
-    /// the day-scoped model pending ended at 57,444 against 22,484 calm; with
-    /// the hour-scoped one it is 23,948. **Restarts are a ~6% tax, not a 2.6x
-    /// one** — so deploy churn is no longer the queue's dominant growth source,
-    /// and sizing a fix against the old number would price work that already
-    /// shipped.
+    /// Model restarts: re-invalidate the CURRENT HOUR for every stream, which
+    /// is what `reconcile_maintenance_task_cursors` does on boot.
     ///
     /// `restart_every_micros` repeats on an interval (0 = no periodic restarts);
-    /// `restart_at_micros` fires ONE restart at a fixed offset (backtesting a
-    /// known boot time).
+    /// `restart_at_micros` fires ONE restart at a fixed offset.
     pub restart_every_micros: i64,
     pub restart_at_micros: Option<i64>,
     #[educe(Default = 0x5EED)]
     pub seed: u64,
-    /// Model what a claimed slice DECODES, and run the claim-time preflight
-    /// (`database/maintain.rs:1273-1278`) against it. Without one the sim never
-    /// splits on bytes, which is what made it blind to the shred.
+    /// Model what a claimed slice decodes, and run the claim-time preflight
+    /// against it. Without one the sim never splits on bytes.
     pub byte_model: Option<ByteModel>,
     pub split_guard: SplitGuard,
 }
@@ -205,9 +172,7 @@ pub struct SimSample {
     pub pending: usize,
     pub frontier_lag_secs: u64,
     pub min_contiguous_days: u64,
-    /// Cumulative, and the live unit count of the worst cell beside it: the fix
-    /// is the first rising while the second stops rising and falls. Both rising
-    /// is the documented worse-than-the-bug outcome.
+    /// Cumulative, and the live unit count of the worst cell beside it.
     pub split_declined_at_floor: u64,
     pub max_cell_pending: usize,
 }
@@ -223,9 +188,8 @@ pub struct SimReport {
     pub pending_end: usize,
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     pub tasks_end: HashMap<String, usize>,
-    /// What coarsening did over the run: `subsumed` + `fused` is queue removed,
-    /// and `over_budget` against `candidates` is the fusion that was refused —
-    /// the number that says whether the queue CAN shrink at all.
+    /// What coarsening did over the run: `subsumed` + `fused` is queue removed;
+    /// `over_budget` against `candidates` is the fusion that was refused.
     pub coarsen_subsumed: usize,
     pub coarsen_fused: usize,
     pub coarsen_candidates: usize,
@@ -235,29 +199,23 @@ pub struct SimReport {
     pub min_contiguous_days_end: u64,
     pub hours_to_contiguous_14: Option<f64>,
     pub hours_to_contiguous_30: Option<f64>,
-    /// Byte preflight, all cumulative over the run. `byte_splits` are units the
-    /// preflight bisected before dispatch; `split_declined_at_floor` is the
-    /// shipped counter's delta plus the sweep's own declines.
+    /// Byte preflight, cumulative. `byte_splits` are units the preflight
+    /// bisected before dispatch; `split_declined_at_floor` is the shipped
+    /// counter's delta plus the sweep's own declines.
     pub preflight_measures: u64,
     pub byte_splits: u64,
     pub split_declined_at_floor: u64,
-    /// Units that RAN over budget and were divided by the runner's internal
-    /// hash sharding instead of by another journal unit — the mechanism the fix
-    /// falls back on. `narrowest_sharded_run_micros` must stay above
-    /// `MIN_SLICE_MICROS`: reaching the floor is the shred.
+    /// Units that ran over budget and were divided by the runner's internal
+    /// hash sharding instead of by another journal unit.
+    /// `narrowest_sharded_run_micros` must stay above `MIN_SLICE_MICROS`:
+    /// reaching the floor is the shred.
     pub sharded_runs: u64,
     pub sharded_runs_above_min_slice: u64,
     /// Claims bucketed by the DATA AGE of the slice, which is what `starved`
-    /// ranks on — the diagnostic that identifies a starvation livelock and the
-    /// acceptance test for any fix to one.
-    ///
-    /// `starved` improves monotonically past `STARVATION_HORIZON_MICROS`, so a
-    /// cohort whose data is older than 31 days outranks everything else
-    /// permanently; if those units also fail and requeue, they hold the lane and
-    /// the middle band is never reached. Prod 2026-09-03 measured exactly that
-    /// for Dedup: of 29 claims, 20 frontier, 9 privileged, and **0** in the
-    /// 3-31 day band that held 96% of the queue's bytes. A fix is only believable
-    /// if the sim first REPRODUCES `claims_mid_band == 0` and then releases it.
+    /// ranks on. `starved` improves monotonically past
+    /// `STARVATION_HORIZON_MICROS`, so a very old cohort that keeps failing and
+    /// requeueing can hold the lane and starve the middle band —
+    /// `claims_mid_band == 0` is that livelock.
     pub claims_frontier: u64,
     pub claims_mid_band: u64,
     pub claims_privileged: u64,
@@ -267,20 +225,17 @@ pub struct SimReport {
     pub narrowest_sharded_run_micros: i64,
     /// Contiguity outcome at sim end: completed sub-day Dedup slices merged
     /// into runs per (project, source, day) inside the certify window.
-    /// `islands_total / island_cells` near 1.0 is the goal; prod 2026-09-05
-    /// measured a mode of 20-24 — partial coverage that certifies nothing.
+    /// `islands_total / island_cells` near 1.0 is the goal.
     pub dedup_island_cells: usize,
     pub dedup_islands_total: usize,
     /// Cells whose completed-dedup runs merge into ONE interval covering the
-    /// whole day — the shape certification grants on. The FLOW metric; the
-    /// island count above is stock.
+    /// whole day — the shape certification grants on.
     pub dedup_cells_day_covered: usize,
     /// The most any single execution decoded, after runtime sharding. Above
     /// `MAX_DECODED_BYTES` means the memory bound was broken.
     pub max_run_bytes: u64,
-    /// Units ever minted per `project/operation/day` cell, in every state —
-    /// superseded parents included, because minting them is what the shred
-    /// cost. `max_cell*` is the worst cell by that count.
+    /// Units ever minted per `project/operation/day` cell, in every state,
+    /// superseded parents included. `max_cell*` is the worst cell by that count.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub units_per_cell: BTreeMap<String, usize>,
     pub max_cell: String,
@@ -293,41 +248,19 @@ pub struct SimReport {
 }
 
 /// Measured duration ranges in seconds, per operation and width class.
-/// Sources: rollup phase timing (#174, prod 2026-08-18): 174 rollup starts,
-/// NOT ONE over 60s; the rollup counters put e2e at ~3s/unit. Debt units are
-/// the slow ones (#176): HotPacking 320-895s, SealedConsolidation 294-767s.
-/// Dedup is BIMODAL (#175/#177): quick, or past its 300s deadline — nothing
-/// finished between 75s and 300s in the measured window.
+///
+/// The distributions are deliberately BIMODAL: most units find no work and
+/// finish at ~0s, and the rest are very expensive. A single uniform range
+/// cannot express that, and the mean alone hides the shape that sets capacity.
 fn duration_range_secs(operation: Operation, width_micros: i64, rng: &mut Rng) -> u64 {
     let frontier = width_micros < DAY_MICROS;
-    // MEASURED FROM PRODUCTION 2026-09-03: 676 `maintenance_task_finished`
-    // events over 4 h, bucketed by operation and slice width. The previous
-    // numbers predated the 2026-09-02 dedup-key widening AND priced BaseRollup
-    // at 5-60 s when its real mean is 571 s — a ~16x under-estimate that made
-    // rollup look almost free, which is what produced the "dedup costs 7x a
-    // rollup unit" conclusion. It does not: measured means are Dedup 541 s vs
-    // BaseRollup 571 s, and worker-seconds split 43.7% / 46.7%.
-    //
-    // The dominant feature is BIMODALITY, not the mean: ~65-70% of units in both
-    // lanes finish at ~0 s because they find no work, and the rest are very
-    // expensive. A single uniform range cannot express that, and averaging it
-    // away is what hid the real shape.
-    //
-    //   operation            n    p50    p70    p90    max
-    //   BaseRollup <1d     193      0   1227   2034   2368
-    //   Dedup      <1d     202      0      6   1910   7203
-    //   Repair     <1d      67     37     49    663   5678
-    //   DerivedRollup       68      0      0      0      3
-    //   HotPacking          68      0      0      1     13
-    //   SealedConsolidation 68      0      0     14     26
     let pct = rng.next() % 100;
     let (lo, hi) = match (operation, frontier, pct) {
         // 70% no-op, 20% cheap, 10% the long tail that actually costs.
         (Operation::Dedup, _, ..70) => (0, 6),
         (Operation::Dedup, _, ..90) => (6, 300),
         (Operation::Dedup, ..) => (1_910, 7_203),
-        // 65% no-op, then a WIDE and frequent expensive mode — this is the one
-        // the old model got most wrong.
+        // 65% no-op, then a wide and frequent expensive mode.
         (Operation::BaseRollup, true, ..65) => (0, 5),
         (Operation::BaseRollup, true, _) => (1_227, 2_368),
         (Operation::BaseRollup, false, _) => (0, 11),
@@ -341,11 +274,10 @@ fn duration_range_secs(operation: Operation, width_micros: i64, rng: &mut Rng) -
     rng.uniform_secs(lo, hi)
 }
 
-/// Debt work = file rewrites that cannot advance rollup coverage
-/// (`dependencies_complete`): the operations #176's occupancy cap applies to.
-/// Spelled as the COMPLEMENT of the rollup tiers, exactly like the server's own
-/// `_debt_slot` predicate — an operation added later is debt on both sides
-/// rather than silently exempt here.
+/// Debt work = file rewrites that cannot advance rollup coverage: the
+/// operations the occupancy cap applies to. Spelled as the COMPLEMENT of the
+/// rollup tiers, like the server's `_debt_slot` predicate, so an operation
+/// added later is debt on both sides rather than silently exempt here.
 fn is_debt_op(operation: Operation) -> bool {
     !matches!(operation, Operation::BaseRollup | Operation::DerivedRollup)
 }
@@ -375,39 +307,26 @@ struct Stream {
     derived_rollup_table: Option<String>,
     source: String,
     project_id: String,
-    /// Newest `created_unix_ms` this stream ever produced — the journal's own
-    /// record of when it last ingested. See `STREAM_IDLE_MICROS`.
+    /// Newest `created_unix_ms` this stream ever produced. See
+    /// `STREAM_IDLE_MICROS`.
     last_created_ms: u64,
 }
 
-/// How recently a stream must have produced work to count as INGESTING.
-///
-/// The sim used to mint for EVERY stream every `MINT_INTERVAL_MICROS`, but prod
-/// invalidates on actual WRITES — an idle stream costs nothing there. The gap is
-/// not small: measured from `created_unix_ms` in a real journal, prod's arrival
-/// rate is **5,782 tasks/day** against the model's **35,712**, a ~6x
-/// over-estimate, because only **21 of 124** streams were active.
-///
-/// That made the sim useless for the question it exists to answer. With minting
-/// off it drains any backlog (nothing competes); with minting on it buries the
-/// queue under arrivals that are not real. Neither reproduces contention, which
-/// is the regime every scheduler decision actually lives in.
-///
-/// Calibrated from the journal rather than guessed: a stream mints only if it
-/// produced a task within this window of the journal's newest record.
+/// How recently a stream must have produced work to count as INGESTING: a
+/// stream mints only if it produced a task within this window of the journal's
+/// newest record. Production invalidates on actual writes, so minting for every
+/// discovered stream would vastly over-state the arrival rate.
 const STREAM_IDLE_MICROS: i64 = 24 * 60 * 60 * 1_000_000;
 
 /// Contiguity model mirroring `min_contiguous_days`: a day counts for a tier
 /// once that tier covers its full width, and contiguity counts back from
-/// yesterday. Two statistics come off it, exactly as in production: the MIN
-/// over active (source, project) pairs is the reported goal metric, and the
-/// MEDIAN is what `coverage_is_short` steers by.
+/// yesterday. The MIN over active (source, project) pairs is the reported goal
+/// metric; the MEDIAN is what `coverage_is_short` steers by.
 struct Coverage {
     /// (source, project) -> day_start -> [base_width, derived_width] micros.
     days: HashMap<(String, String), BTreeMap<i64, [i64; 2]>>,
     /// The active set: every stream found in the journal, with whether it has a
-    /// derived tier at all. The real gauge reads recent source partitions, which
-    /// is the same set by construction here.
+    /// derived tier at all.
     pairs: Vec<(String, String, bool)>,
 }
 
@@ -427,10 +346,9 @@ impl Coverage {
     }
 
     /// Contiguous covered days back from yesterday, per project of ONE
-    /// (source, tier) — the population production's backfill sweep folds over.
-    /// Per sweep rather than per pair-AND because the fleet gauge is a MEDIAN
-    /// within the sweep and a MIN across sweeps (`fold_fleet_gauge`), and a
-    /// median does not survive being AND-ed first.
+    /// (source, tier). Per sweep rather than per pair-AND because the fleet
+    /// gauge is a MEDIAN within the sweep and a MIN across sweeps
+    /// (`fold_fleet_gauge`), and a median does not survive being AND-ed first.
     fn contiguous_days(&self, now_micros: i64, source: &str, tier: usize) -> Vec<u64> {
         let yesterday = (now_micros.div_euclid(DAY_MICROS) - 1) * DAY_MICROS;
         self.pairs
@@ -444,9 +362,8 @@ impl Coverage {
             .collect()
     }
 
-    /// One entry per (source, tier) sweep, skipping sweeps with no projects —
-    /// a tier no stream declares does not exist to fold, exactly as production
-    /// never sweeps it.
+    /// One entry per (source, tier) sweep, skipping sweeps with no projects:
+    /// a tier no stream declares does not exist to fold.
     fn per_sweep(&self, now_micros: i64) -> Vec<Vec<u64>> {
         let sources = self.pairs.iter().map(|(source, ..)| source.as_str()).collect::<std::collections::BTreeSet<_>>();
         sources.into_iter().flat_map(|source| (0..2).map(move |tier| self.contiguous_days(now_micros, source, tier))).filter(|days| !days.is_empty()).collect()
@@ -459,17 +376,14 @@ impl Coverage {
     }
 
     /// The control signal, computed the way production computes it: the MEDIAN
-    /// over each (source, tier) sweep's projects, folded by MIN, compared through
-    /// the one shared predicate (`database::coverage_is_short_for`). Steering by
-    /// the MIN here — which is what the sim used to do — puts the sim in
-    /// coverage-short mode on states where the server is not, silently
-    /// invalidating exactly the cycle-policy answers the sim exists to give.
+    /// over each (source, tier) sweep's projects, folded by MIN, compared
+    /// through the shared `database::coverage_is_short_for`. Steering by the MIN
+    /// instead would put the sim in coverage-short mode on states the server
+    /// calls healthy.
     ///
-    /// RESIDUAL GAP: production lets a tier younger than the backfill horizon
-    /// ABSTAIN from the fleet fold (`fold_fleet_gauge`'s `ramping`). The sim has
-    /// no tier creation time, so no simulated tier ever abstains; on a freshly
-    /// created tier production reads its median as provisional where the sim
-    /// takes it at face value.
+    /// Known gap: production lets a tier younger than the backfill horizon
+    /// abstain from the fleet fold; the sim has no tier creation time, so no
+    /// simulated tier ever abstains.
     fn coverage_is_short(&self, now_micros: i64) -> bool {
         let fleet = self.per_sweep(now_micros).into_iter().map(|mut days| median_contiguous_days(&mut days)).min().unwrap_or(0);
         coverage_is_short_for(fleet)
@@ -483,8 +397,7 @@ impl Coverage {
 /// the boot time for a restart reconcile.
 fn mint_stream(journal: &mut TaskJournal, stream: &Stream, start_micros: i64, end_micros: i64, observed_at_micros: i64) {
     for (derived, rollup_table) in [(false, stream.base_rollup_table.as_str())].into_iter().chain(stream.derived_rollup_table.as_deref().map(|t| (true, t))) {
-        // Minting must not fail the sim on a pathological journal; an
-        // invalidation error means a skipped window, not a crash.
+        // An invalidation error means a skipped window, not a crash.
         let _ = journal.invalidate(Invalidation {
             source_table: &stream.source_table,
             rollup_table,
@@ -501,9 +414,7 @@ fn mint_stream(journal: &mut TaskJournal, stream: &Stream, start_micros: i64, en
 }
 
 fn streams_from_journal(journal: &TaskJournal) -> Vec<Stream> {
-    // Streams from the journal: dedup tasks name the source table, rollup
-    // tasks name the tier tables. No tasks -> no minting (an empty journal
-    // just idles, which is itself a valid answer).
+    // Dedup tasks name the source table, rollup tasks name the tier tables.
     let mut streams: Vec<Stream> = Vec::new();
     for task in journal.tasks() {
         let key = &task.key;
@@ -538,10 +449,10 @@ fn reconcile_restart(journal: &mut TaskJournal, streams: &[Stream], now: i64) {
     }
 }
 
-/// The claim-time preflight, mirroring `database/maintain.rs:1273-1278`:
-/// measure what the claimed slice reads, record it on the unit whether or not
-/// it splits, and split before dispatch when it is over budget and still wide
-/// enough to divide. `None` means the unit was superseded by children.
+/// The claim-time preflight: measure what the claimed slice reads, record it on
+/// the unit whether or not it splits, and split before dispatch when it is over
+/// budget and still wide enough to divide. `None` means the unit was superseded
+/// by children.
 fn preflight(journal: &mut TaskJournal, model: &ByteModel, guard: SplitGuard, task: &MaintenanceTask, report: &mut SimReport) -> Option<u64> {
     let key = &task.key;
     let observed = model.bytes(key);
@@ -555,12 +466,9 @@ fn preflight(journal: &mut TaskJournal, model: &ByteModel, guard: SplitGuard, ta
         SplitGuard::Shipped => {}
         SplitGuard::Off => defeat_guard(journal, task),
         SplitGuard::Ratio(numerator, denominator) => {
-            // Calls the REAL predicate at the swept ratio. This used to be an
-            // inline transcription, which is a drift hazard by construction —
-            // and is why the sim never reproduced the 2026-09-03
-            // synthetic-observation defect.
-            let sheds = split_sheds_enough_at(task.parent_measured_bytes, observed, numerator, denominator);
-            if !sheds {
+            // Call the REAL predicate at the swept ratio; an inline
+            // transcription here would drift from the shipped rule.
+            if !split_sheds_enough_at(task.parent_measured_bytes, observed, numerator, denominator) {
                 report.split_declined_at_floor += 1;
                 return Some(observed);
             }
@@ -578,10 +486,9 @@ fn preflight(journal: &mut TaskJournal, model: &ByteModel, guard: SplitGuard, ta
     Some(observed)
 }
 
-/// Clear the parent's measurement so `split_sheds_enough` takes its `None` arm
-/// — the only way to run the pre-fix behaviour without touching the shipped
-/// predicate. Read the current task so preflight evidence recorded since the
-/// claim is retained when changing the guard.
+/// Clear the parent's measurement so `split_sheds_enough` takes its `None` arm.
+/// Re-reads the current task so preflight evidence recorded since the claim is
+/// retained.
 fn defeat_guard(journal: &mut TaskJournal, task: &MaintenanceTask) {
     let mut task = journal.tasks().find(|current| current.key == task.key).cloned().expect("preflight task remains in the journal");
     task.parent_measured_bytes = None;
@@ -599,9 +506,8 @@ fn is_open(state: TaskState) -> bool {
 }
 
 /// Earliest future deadline among still-claimable tasks, optionally scoped to
-/// one operation. Shared by the per-operation "known empty until" memo and the
-/// idle-worker wakeup — both jump straight to the next eligibility instant
-/// instead of polling.
+/// one operation. Backs both the per-operation "known empty until" memo and the
+/// idle-worker wakeup.
 fn next_deadline(journal: &TaskJournal, now: i64, operation: Option<Operation>) -> Option<i64> {
     journal
         .tasks()
@@ -610,8 +516,7 @@ fn next_deadline(journal: &TaskJournal, now: i64, operation: Option<Operation>) 
         .min()
 }
 
-/// `project/operation/day` — the (project, tier, day) cell the shred is counted
-/// in.
+/// `project/operation/day` — the cell unit counts are bucketed in.
 fn cell_of(key: &TaskKey) -> String {
     format!("{}/{:?}/{}", key.project_id, key.operation, key.slice.start_micros.div_euclid(DAY_MICROS))
 }
@@ -650,22 +555,13 @@ pub fn run(mut journal: TaskJournal, cfg: &SimConfig, start_micros: i64) -> anyh
     let mut streams = streams_from_journal(&journal);
     // Only streams that are actually INGESTING mint. Discovery walks every task
     // the journal ever held, so without this an account that stopped writing
-    // weeks ago still generates frontier work forever — which is where the ~6x
-    // arrival over-estimate came from. See `STREAM_IDLE_MICROS`.
+    // weeks ago still generates frontier work forever.
     let newest_created_ms = streams.iter().map(|s| s.last_created_ms).max().unwrap_or_default();
     let idle_cutoff_ms = newest_created_ms.saturating_sub(STREAM_IDLE_MICROS as u64 / 1_000);
     anyhow::ensure!(!streams.is_empty() || !cfg.mint_frontier, "no streams found in journal; pass --no-mint");
     if let Some(target) = cfg.streams {
-        // `--streams N` means **N INGESTING streams** — the doc calls it "the
-        // minted stream count", and scaling the active customer count is the
-        // only thing it is used for.
-        //
-        // It used to set the TOTAL, which since minting became activity-gated
-        // means it silently modelled almost nothing: a journal with 124 streams
-        // of which 20 ingest answered `--streams 100` by TRUNCATING to 100 real
-        // streams — still only 20 active — so a "5x" run was 1x. And the clone
-        // template was `streams.first()`, whichever stream the journal happened
-        // to mention first, usually a dormant account whose clones never mint.
+        // `--streams N` means N INGESTING streams, not N total: minting is
+        // activity-gated, so the template must itself be an active stream.
         let Some(template) = streams.iter().find(|s| s.last_created_ms >= idle_cutoff_ms).or_else(|| streams.first()).cloned() else {
             anyhow::bail!("--streams needs at least one real stream in the journal")
         };
@@ -684,8 +580,6 @@ pub fn run(mut journal: TaskJournal, cfg: &SimConfig, start_micros: i64) -> anyh
     let ingesting = streams.iter().filter(|s| s.last_created_ms >= idle_cutoff_ms).count();
 
     if cfg.mint_frontier {
-        // Printed because it is the single number that decides whether an
-        // arrival-rate result is believable at all.
         eprintln!("sim: minting from {ingesting} INGESTING streams of {} in the journal", streams.len());
     }
     let mut coverage =
@@ -703,24 +597,18 @@ pub fn run(mut journal: TaskJournal, cfg: &SimConfig, start_micros: i64) -> anyh
         (None, every) if every > 0 => start_micros + every,
         _ => i64::MAX,
     };
-    // 48 samples over the horizon, floored at five minutes: a 6-hour run
-    // needs a trajectory, not six points.
+    // 48 samples over the horizon, floored at five minutes.
     let tick = (cfg.horizon_micros / 48).max(300 * MICROS);
     let mut next_tick = start_micros + tick;
     let mut next_coarsen = start_micros + COARSEN_INTERVAL_MICROS;
     let mut now = start_micros;
-    // #176: (jobs * 3 / 4).max(1) — the floor keeps debt work possible at all
-    // on a one-worker box.
+    // The `.max(1)` floor keeps debt work possible at all on a one-worker box.
     let debt_cap = (cfg.workers * 3 / 4).max(1);
     // Per-op "known empty until" memo. `claim_next` is deterministic given
-    // (journal state, now), and a None result can only be invalidated by (a) a
-    // state change — completion, timeout/abandon, mint, restart — or (b) a
-    // deadline maturing. So a None at time T holds until the op's next future
-    // deadline; memoizing that collapses the idle-worker rescans that
-    // otherwise dominate wall time on a production-sized journal (16 workers x
-    // up to 12 full scans per wake event). One side effect is lost: the
-    // skipped calls would have bumped `claim_tick`, so the sealed-reservation
-    // parity shifts slightly — reservation SHARE over time is unchanged.
+    // (journal state, now), so a None at time T holds until the op's next
+    // future deadline or any state change — every mutation below refills this.
+    // Side effect: the skipped calls would have bumped `claim_tick`, so
+    // sealed-reservation parity shifts slightly (share over time is unchanged).
     let mut none_until = [0i64; <Operation as strum::EnumCount>::COUNT];
     // Evaluated before any claim, so the initial cycle matches the journal's
     // seeded coverage.
@@ -746,10 +634,9 @@ pub fn run(mut journal: TaskJournal, cfg: &SimConfig, start_micros: i64) -> anyh
         }
 
         if now >= next_coarsen {
-            // With a byte model the CAPPED variant is the one prod runs
-            // (`database/maintain.rs:2383`): footprint-less debris carrying an
-            // inflated estimate only fuses once the partition ceiling says no
-            // unit over that day can decode that much.
+            // With a byte model the CAPPED variant is the one prod runs:
+            // footprint-less debris carrying an inflated estimate only fuses
+            // once the partition ceiling bounds what that day can decode.
             let coarsen = match cfg.byte_model.as_ref() {
                 Some(model) => journal.coarsen_sealed_slices_capped(now, &|project, _source, date| model.partition_ceiling(project, date)),
                 None => journal.coarsen_sealed_slices_reporting(now),
@@ -788,16 +675,16 @@ pub fn run(mut journal: TaskJournal, cfg: &SimConfig, start_micros: i64) -> anyh
                         coverage.record(&key);
                         let contiguous = coverage.min_contiguous_days(now);
                         coverage_short = coverage.coverage_is_short(now);
-                        // Capture milestones at the crossing event, not just at
-                        // report ticks — a tick can land just short of a day
-                        // boundary and read one day less.
+                        // At the crossing event, not just at report ticks: a
+                        // tick can land short of a day boundary and read one
+                        // day less.
                         note_contiguity_milestones(&mut report, contiguous, now - start_micros);
                     }
                     *report.completions.entry(format!("{:?}", key.operation)).or_default() += 1;
                 } else {
                     // Timeout: the worker burned the whole deadline, then the
                     // lease drop abandons the unit — bisect on repeat, else
-                    // deadline-floored backoff. Real code, not a re-imagination.
+                    // deadline-floored backoff.
                     journal.abandon_running(&key, now, None);
                     none_until.fill(0);
                     match journal.state(&key) {
@@ -807,11 +694,10 @@ pub fn run(mut journal: TaskJournal, cfg: &SimConfig, start_micros: i64) -> anyh
                 }
                 report.executions += 1;
             }
-            // Claim the next unit, rotating through the shared cycle exactly
-            // like `run_coordinator_maintenance_once`. While coverage is short,
-            // debt work may occupy at most 3/4 of workers — #176's
-            // `maintenance_debt_slots`, the occupancy cap that keeps
-            // quarter-hour file rewrites from starving seconds-long rollups.
+            // Claim the next unit, rotating through the shared cycle like
+            // `run_coordinator_maintenance_once`. While coverage is short, debt
+            // work may occupy at most 3/4 of workers, so long file rewrites
+            // cannot starve short rollups.
             let cycle = operation_cycle(coverage_short);
             let mut claimed: Option<MaintenanceTask> = None;
             for offset in 0..cycle.len() {
@@ -824,7 +710,7 @@ pub fn run(mut journal: TaskJournal, cfg: &SimConfig, start_micros: i64) -> anyh
                     continue;
                 }
                 if let Some(task) = journal.claim_next(operation, now, false) {
-                    // Bucketed on the SAME quantity `starved` ranks on: how long
+                    // Bucketed on the same quantity `starved` ranks on: how long
                     // ago the slice's DATA ended, not when the record was made.
                     let waited = now.saturating_sub(task.key.slice.end_micros);
                     let band = if waited > STARVATION_HORIZON_MICROS {
@@ -850,8 +736,8 @@ pub fn run(mut journal: TaskJournal, cfg: &SimConfig, start_micros: i64) -> anyh
                 none_until[operation as usize] = next_deadline(&journal, now, Some(operation)).unwrap_or(i64::MAX);
             }
             // The byte preflight runs between the claim and the dispatch, where
-            // prod runs it. A split leaves the worker free after the cost of
-            // the measurement — no unit ran, so the debt slot goes back too.
+            // prod runs it. A split leaves the worker free after the cost of the
+            // measurement — no unit ran, so the debt slot goes back too.
             if let (Some(model), Some(task)) = (cfg.byte_model.as_ref(), claimed.as_ref()) {
                 let Some(observed) = preflight(&mut journal, model, cfg.split_guard, task, &mut report) else {
                     if is_debt_op(task.key.operation) {
@@ -867,10 +753,8 @@ pub fn run(mut journal: TaskJournal, cfg: &SimConfig, start_micros: i64) -> anyh
                     let width = task.key.slice.width();
                     report.sharded_runs += 1;
                     report.sharded_runs_above_min_slice += u64::from(width > MIN_SLICE_MICROS);
-                    report.narrowest_sharded_run_micros = match report.narrowest_sharded_run_micros {
-                        0 => width,
-                        current => current.min(width),
-                    };
+                    let narrowest = &mut report.narrowest_sharded_run_micros;
+                    *narrowest = if *narrowest == 0 { width } else { (*narrowest).min(width) };
                 }
             }
             match claimed {
@@ -881,10 +765,8 @@ pub fn run(mut journal: TaskJournal, cfg: &SimConfig, start_micros: i64) -> anyh
                     worker.busy_until = now + (burn_secs as i64) * MICROS;
                 }
                 None => {
-                    // Nothing claimable: jump straight to the next eligibility
-                    // instant instead of polling — an idle worker re-scanning
-                    // 38k tasks every 5 virtual seconds is what made the sim
-                    // itself slow, not any property of the schedule.
+                    // Nothing claimable: jump to the next eligibility instant
+                    // rather than re-scanning the journal on a poll interval.
                     worker.busy_until = next_deadline(&journal, now, None).unwrap_or(now + IDLE_POLL_MICROS).max(now + 1);
                 }
             }
@@ -920,11 +802,9 @@ pub fn run(mut journal: TaskJournal, cfg: &SimConfig, start_micros: i64) -> anyh
     if let Some((cell, units)) = report.units_per_cell.iter().max_by_key(|(_, units)| **units) {
         (report.max_cell, report.max_cell_units) = (cell.clone(), *units);
     }
-    // The contiguity outcome: completed sub-day Dedup slices merged into runs,
-    // per (project, source, day) cell inside the 14-day certify window.
-    // Certification grants only when the merged runs cover the WHOLE day, so
-    // MANY islands at partial coverage is the shape that certifies nothing —
-    // prod 2026-09-05 measured a mode of 20-24 islands per cell.
+    // Completed sub-day Dedup slices merged into runs, per (project, source,
+    // day) cell inside the 14-day certify window. Certification grants only
+    // when the merged runs cover the WHOLE day.
     {
         let by_cell: HashMap<(String, String, i64), Vec<(i64, i64)>> = journal
             .tasks()
@@ -942,8 +822,6 @@ pub fn run(mut journal: TaskJournal, cfg: &SimConfig, start_micros: i64) -> anyh
                 slices.sort_unstable();
                 let (runs, open_end) = slices.iter().fold((0usize, i64::MIN), |(runs, open), &(start, end)| (runs + usize::from(start > open), open.max(end)));
                 // The grant-relevant outcome: ONE run covering the whole day.
-                // The island count is stock (dominated by pre-sim state); this
-                // is the conversion that certification actually pays on.
                 // `open_end` is the union's max end — with runs == 1 the union
                 // is one interval from the first start to `open_end`.
                 let day_start = day * DAY_MICROS;
@@ -955,9 +833,9 @@ pub fn run(mut journal: TaskJournal, cfg: &SimConfig, start_micros: i64) -> anyh
     Ok(report)
 }
 
-/// `eligible_watermark_lag_seconds`, simplified for the sim: the oldest
-/// eligible, unfinished frontier task's lateness. The production gauge adds a
-/// per-stream watermark; the sim needs only the trend.
+/// `eligible_watermark_lag_seconds`, simplified: the oldest eligible,
+/// unfinished frontier task's lateness. The production gauge adds a per-stream
+/// watermark; the sim needs only the trend.
 fn frontier_lag_secs(journal: &TaskJournal, now_micros: i64) -> u64 {
     journal
         .tasks()
@@ -969,13 +847,13 @@ fn frontier_lag_secs(journal: &TaskJournal, now_micros: i64) -> u64 {
         .unwrap_or_default()
 }
 
-/// A synthetic queue with the shape the 2026-08-22 shred happened in, built
-/// through the `TaskJournal` API — never a hand-written `maintenance_tasks.json`,
-/// whose on-disk form is an internal serde detail that would rot silently.
+/// A synthetic queue with the shape a shred happens in, built through the
+/// `TaskJournal` API — never a hand-written `maintenance_tasks.json`, whose
+/// on-disk form is an internal serde detail that would rot silently.
 pub struct SynthQueue {
     pub journal: TaskJournal,
     pub model: ByteModel,
-    /// The cell that shredded: one day-wide unit over a day of ~100x
+    /// The cell that shreds: one day-wide unit over a day of ~100x
     /// `MAX_DECODED_BYTES`.
     pub whale_cell: String,
     /// A lineage carrying `retry_or_split`'s synthetic `MAX_DECODED_BYTES + 1`
@@ -989,26 +867,13 @@ pub struct SynthQueue {
 /// properties a uniform queue cannot reproduce. Everything starts with
 /// `parent_measured_bytes: None` except the deliberately stamped lineage, so
 /// the first split of each lineage is unconditional and the guard engages only
-/// from the second level down, which is the real sequence.
-/// `debris_slice_minutes` varies unit COUNT at constant total work: the debris
-/// block carries the same bytes over the same window as `600 / n` units of `n`
-/// minutes. 1 = the historical fixture, so every prior result reproduces.
+/// from the second level down.
 ///
-/// **It was built to test bin widening and it CANNOT — recorded here so nobody
-/// repeats the attempt.** Two configurations, both null:
+/// `debris_slice_minutes` varies unit COUNT at constant total work: `600 / n`
+/// units of `n` minutes carry the same bytes over the same window.
 ///
-/// - **With `--mint` at 5x load**: 600 debris units are 0.6% of a ~102,000-unit
-///   queue, so 600 -> 300 moved `pending_end` by 0.1% (102,696 -> 102,804).
-///   Swamped.
-/// - **Without minting**: `pending_start` falls exactly as designed
-///   (813/513/313/263 for n = 1/2/6/12) and **`executions` and `pending_end` are
-///   IDENTICAL at every width** (1,774 and 2 on seed 1). The coordinator's own
-///   coarsening already fuses the debris, so pre-collapsing it adds nothing.
-///
-/// The deeper reason is structural: this simulator schedules rollup/compaction
-/// TASKS on virtual time. Widening `BIN_MICROS` pays off in READ BYTES — the
-/// same file read once per bin it straddles — and an IO-free model cannot see
-/// bytes. **Validating bin width needs real object-store latency, i.e. staging.**
+/// Not usable for bin-width questions: widening a bin pays off in READ BYTES,
+/// and this IO-free model cannot see bytes.
 pub fn synthetic_whale_queue(start_micros: i64, floored: bool, whale_x_max: u64, debris_slice_minutes: i64) -> SynthQueue {
     let dir = tempfile::tempdir().expect("sim fixture tempdir");
     let mut journal = TaskJournal::load(dir.path()).expect("sim fixture journal");
@@ -1032,26 +897,22 @@ pub fn synthetic_whale_queue(start_micros: i64, floored: bool, whale_x_max: u64,
     stamped.parent_measured_bytes = Some(MAX_DECODED_BYTES + 1);
     journal.upsert(stamped);
 
-    // The long tail: 70 projects x 3 sealed days, each a day that fits in one
-    // unit. 210 more cells, so `claim_next`'s ordering, the debt cap and
-    // coarsening all operate at a scale where they interact.
-    for project in 0u64..70 {
-        for back in 1..=3 {
-            cell(&mut journal, &mut model, &format!("tail-{project:02}"), back, 60_000_000 + project * 2_000_000);
-        }
+    // The long tail: 70 projects x 3 sealed days, each fitting in one unit, so
+    // `claim_next` ordering, the debt cap and coarsening interact at scale.
+    for (project, back) in itertools::iproduct!(0u64..70, 1..=3) {
+        cell(&mut journal, &mut model, &format!("tail-{project:02}"), back, 60_000_000 + project * 2_000_000);
     }
 
     // Pre-existing shred debris: 600 one-minute units on ONE partition, no
-    // `InputFootprint` and each claiming 4,466,185,462 bytes — prod project
-    // 87576849's consecutive minutes, over a partition of 35 files / 0.36 GB.
-    // Fusion can only rescue them once the partition ceiling is known.
+    // `InputFootprint` and each claiming far more bytes than the 0.36 GB
+    // partition holds. Fusion can only rescue them via the partition ceiling.
     let debris_day = day(2);
     model.insert("debris", debris_day, 360_000_000);
     let slice = debris_slice_minutes.max(1);
     let debris_units = 600 / slice;
     for unit in 0..debris_units {
-        // Bytes scale with the slice so total work is held constant: the knob
-        // must vary unit COUNT alone, or a sweep confounds count with cost.
+        // Bytes scale with the slice so total work is constant: the knob must
+        // vary unit COUNT alone, or a sweep confounds count with cost.
         journal.enqueue(
             rollup_key("debris", debris_day + unit * slice * MIN_SLICE_MICROS, slice * MIN_SLICE_MICROS),
             start_micros,
@@ -1120,7 +981,7 @@ mod tests {
 
     /// One completed frontier task per project, so stream extraction sees the
     /// requested number of streams. The derived twin deliberately keeps the
-    /// BASE physical table — only the operation is flipped.
+    /// BASE physical table; only the operation is flipped.
     fn journal_with_streams(projects: usize) -> TaskJournal {
         let mut journal = empty_journal();
         for i in 0..projects {
@@ -1152,19 +1013,8 @@ mod tests {
 
     #[test]
     fn the_frontier_already_lags_at_13_projects_and_diverges_further_at_10x() {
-        // RENAMED and re-based on measurement. The old name asserted that 13
-        // projects HOLD the frontier, from "the G6 arithmetic": 26 streams mint
-        // ~8,100 units/day against ~15k/day of *small-unit* capacity.
-        //
-        // That capacity figure is what the 2026-09-03 duration measurements
-        // refute. Units are not small: ~65-70% finish at ~0 s and the rest run
-        // 1,200-2,400 s, so capacity is set by that tail. At 13 projects the
-        // frontier lags ~13,050 s — over twenty times `FRONTIER_LAG_BUDGET_SECS`
-        // — and the old assertion passed only because rollup was modelled at
-        // 5-60 s when its real mean is 571 s.
-        //
-        // What the test still pins, and what it was really for, is the SHAPE:
-        // load makes it strictly worse, and 10x is far worse than 13.
+        // Pins the SHAPE, not a level: 13 projects already exceed the lag
+        // budget, and more load is strictly worse.
         let start = 100 * DAY_MICROS;
         let report_13 = run(journal_with_streams(13), &cfg(6), start).unwrap();
         let pending_13 = report_13.pending_end;
@@ -1177,26 +1027,14 @@ mod tests {
         let cfg_10x = SimConfig { streams: Some(260), ..cfg(2) };
         let report_10x = run(journal_with_streams(13), &cfg_10x, start).unwrap();
         assert!(report_10x.pending_end > 10 * pending_13.max(1), "10x must diverge: pending {} vs {} at 13 projects", report_10x.pending_end, pending_13);
-        // The lag comparison is DELETED, not relaxed: it was never valid. The
-        // two runs use different horizons — `cfg(6)` for 13 projects, `cfg(2)`
-        // for 10x — and maximum lag is bounded by how long the run lasts, so
-        // the 2-hour case cannot exceed 7,200 s however badly it diverges.
-        // Measured: 10x reports 5,400 s against 13-project 13,050 s, i.e. the
-        // "worse" configuration scores BETTER on this metric purely because it
-        // ran for less virtual time. It only ever passed while both lags were
-        // small relative to both horizons, which the optimistic duration model
-        // guaranteed and measurement does not.
-        //
-        // `pending_end` above is the divergence assertion and is horizon-fair,
-        // because it counts work left rather than a time-bounded maximum.
+        // Do NOT add a lag comparison here: the two runs use different horizons
+        // and max lag is bounded by run length, so the worse configuration can
+        // score better. `pending_end` is the horizon-fair divergence metric.
     }
 
     /// The sim and the server must make the SAME coverage-short decision from
-    /// the same coverage state — the cycle it selects is most of what the sim is
-    /// asked about. Each case is the per-project count of contiguous covered
-    /// days; the rows where MIN and MEDIAN disagree are the whole point (the sim
-    /// used to gate on the MIN, so a single laggard put it in coverage-short
-    /// mode on states the server calls healthy).
+    /// the same coverage state. Each case is the per-project count of contiguous
+    /// covered days; the rows where MIN and MEDIAN disagree are the point.
     #[test_case::test_case(&[30, 30, 30], &[30, 30, 30] => false; "fleet covered")]
     #[test_case::test_case(&[2, 3, 4], &[2, 3, 4] => true; "fleet short")]
     #[test_case::test_case(&[0, 20, 25], &[0, 20, 25] => false; "one laggard cannot pin the fleet")]
@@ -1229,8 +1067,7 @@ mod tests {
             }
         }
         // Production sweeps each (source, tier), takes the MEDIAN over that
-        // sweep's projects, and folds the sweeps by MIN — `fold_fleet_gauge`
-        // with no ramping tier.
+        // sweep's projects, and folds the sweeps by MIN.
         let active = projects.iter().map(String::as_str).collect::<HashSet<_>>();
         let fleet = covered.iter().map(|covered| crate::database::min_contiguous_days(covered, &source, today, &active).2).min().unwrap();
         let server = coverage_is_short_for(fleet);
@@ -1241,19 +1078,12 @@ mod tests {
     #[test]
     fn a_sealed_backlog_builds_contiguous_coverage() {
         // 2 projects x 30 sealed days x (base + derived day units), no minting.
-        // ~120 heavy units on 16 workers: ~400s each, so well under a virtual
-        // day to clear, and contiguity must reach 30.
         let mut journal = journal_with_streams(0);
         let start = 100 * DAY_MICROS;
-        for p in ["a", "b"] {
-            for day in 0..30i64 {
-                // Contiguity counts back from yesterday at sim END (start + 24h
-                // = day 101), so the window is days 100..=71 relative to start.
-                let day_start = start - day * DAY_MICROS;
-                for op in [Operation::BaseRollup, Operation::DerivedRollup] {
-                    journal.enqueue(key(p, op, day_start, DAY_MICROS), start, MAX_DECODED_BYTES, 0);
-                }
-            }
+        // Contiguity counts back from yesterday at sim END (start + 24h
+        // = day 101), so the window is days 100..=71 relative to start.
+        for (p, day, op) in itertools::iproduct!(["a", "b"], 0..30i64, [Operation::BaseRollup, Operation::DerivedRollup]) {
+            journal.enqueue(key(p, op, start - day * DAY_MICROS, DAY_MICROS), start, MAX_DECODED_BYTES, 0);
         }
         let cfg = SimConfig { mint_frontier: false, ..cfg(25) };
         let report = run(journal, &cfg, start).unwrap();
@@ -1264,16 +1094,9 @@ mod tests {
 
     #[test]
     fn a_unit_that_overruns_its_deadline_twice_is_bisected() {
-        // One day-sized dedup unit: sampled durations are 300-500s against the
-        // 300s dedup deadline, so timeouts are likely; a repeat timeout must
-        // split via the REAL abandon_running.
-        //
-        // TWENTY units, not one. "With scale 10x a timeout is certain" was true
-        // when every dedup unit ran 60-900 s; under the measured bimodal model
-        // ~70% finish in 0-6 s and never approach the deadline, which made a
-        // one-unit fixture a coin flip. Twenty independent units put the chance
-        // that NONE lands in the expensive mode below one in a thousand, without
-        // adding a knob to force it.
+        // A repeat timeout must split via the REAL `abandon_running`. Twenty
+        // units, not one: ~70% of dedup samples finish near 0s and never
+        // approach the deadline, so one unit would be a coin flip.
         let mut journal = journal_with_streams(0);
         let start = 100 * DAY_MICROS;
         for unit in 0..20 {
@@ -1304,8 +1127,8 @@ mod tests {
         }
     }
 
-    /// The §3c run: `synth:whale`, 6 virtual hours, 16 workers, no minting —
-    /// the queue under study is the fixture, not the frontier.
+    /// The whale fixture: 6 virtual hours, 16 workers, no minting — the queue
+    /// under study is the fixture, not the frontier.
     fn synth_run(floored: bool, guard: SplitGuard) -> (SimReport, String, String) {
         synth_run_at(floored, guard, 100, 1.0)
     }
@@ -1338,9 +1161,7 @@ mod tests {
         let queue = synthetic_whale_queue(start, true, 100, 1);
         let (mut journal, model) = (queue.journal, queue.model);
         let mut report = SimReport::default();
-        // Deep enough to reach the DECLINE, not just the splits above it — the
-        // decline is the behaviour under study, and a trace that stops short of
-        // it leaves §7a's key line derived from counters instead of witnessed.
+        // Deep enough to reach the DECLINE, not just the splits above it.
         for level in 0..9 {
             let Some(task) = journal
                 .tasks()
@@ -1366,76 +1187,46 @@ mod tests {
         }
     }
 
-    /// §3c.1 — the gate. With the floor modelled and the guard defeated, the
-    /// whale cell shreds to the one-minute floor exactly as prod did.
+    /// With the floor modelled and the guard defeated, the whale cell shreds
+    /// all the way to the one-minute floor.
     #[test]
     fn a_floored_whale_shreds_to_the_minute_without_the_guard() {
         let (report, whale, _) = synth_run(true, SplitGuard::Off);
-        // Thresholds are 500, not 1,000: under the measured duration model fewer
-        // units execute per horizon, so the same unguarded shred produces ~819
-        // rather than ~1,200. The POINT of the test is that the shred is
-        // massive and reaches the floor, which 819 demonstrates as well as
-        // 1,200 did; pinning the old number would only pin the old model.
         assert!(cell_units(&report, &whale) > 500, "the shred must reproduce: {} units", cell_units(&report, &whale));
         assert!(report.units_at_min_slice >= 500, "and it must reach MIN_SLICE_MICROS: {}", report.units_at_min_slice);
     }
 
-    /// §3c.2 — the control. Bytes strictly proportional to width is the model
-    /// `byte_bounded_units` assumes. Without independent execution timeouts,
-    /// byte-driven splitting must stop above the floor with either guard.
+    /// The control: bytes strictly proportional to width. Without independent
+    /// execution timeouts, byte-driven splitting must stop above the floor
+    /// under either guard.
     #[test_case::test_case(SplitGuard::Off; "guard defeated")]
     #[test_case::test_case(SplitGuard::Shipped; "shipped guard")]
     fn a_floorless_whale_never_reaches_the_floor(guard: SplitGuard) {
-        // `duration_scale: 0.0` — the duration model is independent of bytes,
-        // and its random timeouts can legitimately split even a small task, so
-        // isolate byte physics here; timeout bisection is exercised by the
-        // failure tests.
+        // `duration_scale: 0.0` isolates byte physics: random timeouts can
+        // legitimately split even a small task, and are covered elsewhere.
         let (report, whale, _) = synth_run_at(false, guard, 100, 0.0);
         assert_eq!(report.timeouts.values().sum::<u64>(), 0);
-        // 255 units, not "tens": 100x MAX_DECODED_BYTES needs 128 leaves,
-        // bisection only makes powers of two, and since bisection descends ONE
-        // level per measurement the 127 intermediate parents are journal rows
-        // too (it was 129 when one call minted the whole subtree). The
-        // discriminating property is unchanged and is the only one asserted
-        // below: NOTHING reaches MIN_SLICE_MICROS.
+        // ~255 units: 128 leaves plus their 127 intermediate parents, which are
+        // journal rows because bisection descends one level per measurement.
         assert!(cell_units(&report, &whale) < 300, "{guard:?}: {} units", cell_units(&report, &whale));
         assert_eq!(report.min_slice_units_per_cell.get(&whale).copied().unwrap_or_default(), 0, "{guard:?}: the floorless whale must not reach the floor");
     }
 
-    /// §3c.3/4 — the fix, and the regression guard for the defect it closed.
+    /// The floor guard must be CONSULTED at every level, and declined units run
+    /// hash-sharded above the floor instead of shredding to it.
     ///
-    /// `69e6503` compared a unit's measurement against `parent_measured_bytes`,
-    /// but `byte_bounded_units` used to descend MANY levels inside ONE call,
-    /// stamping every descendant with the same number. The whale's ladder was
-    /// then only two journal levels deep — day, then five minutes — and the
-    /// third level was already AT `MIN_SLICE_MICROS`, where the preflight never
-    /// asks (`database/maintain.rs:1276` requires `width > MIN_SLICE`). A
-    /// BETWEEN-call test on a WITHIN-call recursion never fires.
-    ///
-    /// Bisecting one level per measurement makes every level a journal level,
-    /// so the guard is consulted at each: the whale ladder now declines at
-    /// 660 s having shed only ~2/3 of its parent, and the declined units RUN,
-    /// hash-sharded internally above the floor.
-    ///
-    /// **`split_declined_at_floor > 0` is the regression assertion** — it is
-    /// exactly 0 for every threshold if the recursion ever descends a subtree
-    /// again.
+    /// `split_declined_at_floor > 0` is the regression assertion: bisection has
+    /// to descend ONE level per measurement, so every level is a journal level.
+    /// If a single call ever descends a whole subtree again the guard is never
+    /// asked and this counter is exactly 0.
     #[test]
     fn the_floor_guard_declines_above_the_floor_and_the_shred_stops() {
         let (fixed, whale, _) = synth_run(true, SplitGuard::Shipped);
         let (unfixed, _, _) = synth_run(true, SplitGuard::Off);
         assert!(fixed.split_declined_at_floor > 0, "the guard must be CONSULTED, which is the whole defect");
-        // Was `== 0` under the optimistic duration model. Under durations
-        // measured from production, 8 units still reach the floor against 819
-        // unguarded — a 99% collapse, not a clean stop. That is NOT a
-        // calibration artifact: production carries the same leak, 147 live
-        // units at or below the 60 s floor and 8,595 completed there
-        // (2026-09-03, all `base_rollup`, all one whale).
-        //
-        // The bound is deliberately tight so a regression is still caught, and
-        // deliberately not 0 so the suite states what the system actually does.
-        // Driving it back to 0 is open work, tracked in
-        // docs/plans/2026-09-03-morning-brief.md.
+        // Not 0: a few units still reach the floor against ~800 unguarded. The
+        // bound is tight enough to catch a regression and honest about the
+        // residual leak; driving it to 0 is open work.
         assert!(fixed.units_at_min_slice <= 16, "the guard must collapse the shred to a trickle: {} reached the floor", fixed.units_at_min_slice);
         assert!(
             cell_units(&fixed, &whale) * 4 < cell_units(&unfixed, &whale),
@@ -1444,27 +1235,18 @@ mod tests {
             cell_units(&unfixed, &whale)
         );
         // Declining is only safe because the runner hash-shards internally, so
-        // memory stays bounded — and now those runs happen ABOVE the floor
-        // instead of at it, which is what §3c.3 asked for.
+        // memory stays bounded.
         assert!(fixed.max_run_bytes <= MAX_DECODED_BYTES, "{} bytes decoded in one run", fixed.max_run_bytes);
         assert!(fixed.sharded_runs_above_min_slice > 0, "a declined unit must run hash-sharded ABOVE the floor");
-        // `>=`, not `>`: the same 8 units that still reach the floor also run
-        // sharded AT it, so the NARROWEST run is now exactly `MIN_SLICE_MICROS`
-        // rather than above it. The property that matters — memory stays
-        // bounded because the runner shards internally — is asserted directly
-        // by `max_run_bytes` above and is unaffected.
+        // `>=`, not `>`: the residual floor units also run sharded AT the floor.
         assert!(fixed.narrowest_sharded_run_micros >= MIN_SLICE_MICROS, "narrowest sharded run {}", fixed.narrowest_sharded_run_micros);
-        // §3c.4's good half: declines rise while the queue still DRAINS. Was
-        // `== 0`; under measured durations 7 units are still in flight when the
-        // horizon ends, which is the horizon expiring rather than the queue
-        // stalling. The bound keeps the property (declining must not wedge the
-        // queue) without pinning the old model's throughput.
+        // Declines must rise while the queue still DRAINS; the small residue is
+        // the horizon expiring, not a wedge.
         assert!(fixed.pending_end <= 16, "declining must not stall the queue: {} left", fixed.pending_end);
     }
 
-    /// §3c.6 — a lineage carrying `retry_or_split`'s synthetic
-    /// `MAX_DECODED_BYTES + 1` stamp must still split at journal scale, not
-    /// just in the predicate's unit test. A child measuring MORE than its
+    /// A lineage carrying `retry_or_split`'s synthetic `MAX_DECODED_BYTES + 1`
+    /// stamp must still split at journal scale: a child measuring MORE than its
     /// parent is evidence the parent's number was never a measurement.
     #[test]
     fn a_synthetic_stamp_still_splits_at_scale() {
@@ -1472,20 +1254,17 @@ mod tests {
         assert!(cell_units(&report, &stamped) > 1, "the stamped lineage must not freeze: {} units", cell_units(&report, &stamped));
     }
 
-    /// §3b's debris, witnessed: 600 footprint-less one-minute units each
-    /// claiming 4,466,185,462 bytes over a 0.36 GB partition. Nothing can fuse
-    /// them on their own prices — only the partition ceiling can, which is why
-    /// a run with a byte model drives `coarsen_sealed_slices_capped`. This is
-    /// the interaction (fusion against the floor guard, at once) that no unit
-    /// test covers.
+    /// Footprint-less debris claims far more bytes than its partition holds, so
+    /// nothing can fuse it on its own prices — only the partition ceiling can.
+    /// Covers fusion and the floor guard interacting, which no unit test does.
     #[test]
     fn the_footprintless_debris_fuses_under_the_partition_ceiling() {
         let (report, _, _) = synth_run(true, SplitGuard::Shipped);
         assert!(report.coarsen_fused > 0, "the ceiling must rescue the debris: fused {} of {} candidates", report.coarsen_fused, report.coarsen_candidates);
     }
 
-    /// §3c.5 — the threshold sweep, over three floor shapes. Printed rather
-    /// than asserted: the constant can only be argued from the table.
+    /// Threshold sweep over three floor shapes. Printed rather than asserted:
+    /// the constant can only be argued from the table.
     #[test]
     fn threshold_sweep() {
         for whale_x_max in [100, 20, 5] {

@@ -1,20 +1,12 @@
-//! Where does a maintenance rewrite's time actually go?
-//!
-//! Every coordinator rewrite — Repair, HotPacking, SealedConsolidation and the
-//! limited Dedup path — sorts with `batch_size = 256` and
-//! `target_partitions = 1` (`maintain.rs:6025`, `compact.rs:998`), and Repair
-//! additionally cuts a bin into N event-time slices, each its own full SQL pass
-//! over the same file. Prod staged 93.8 MB in 322 s that way. This measures
-//! each of those decisions against a REAL prod parquet file, because the cost
-//! is dominated by row shape and row-group layout, which a generator does not
-//! reproduce.
+//! Prices the maintenance rewrite shapes (scan / sort / dedup) against a real
+//! parquet file, varying batch size, partitions, slicing, pool size and
+//! concurrency.
 //!
 //! ```bash
 //! TF_BENCH_PARQUET=/path/to/part-....parquet cargo bench --bench rewrite_throughput
-//! TF_BENCH_POOL_MB=256 ...   # reproduce prod's per-worker share (4.2 GB / 16 jobs)
 //! ```
 //!
-//! The session config here MIRRORS `build_optimize_session_state_tuned`; it is
+//! The session config MIRRORS `build_optimize_session_state_tuned`; it is
 //! duplicated rather than imported because that function is `pub(crate)` and
 //! the crate's lib-test target cannot build in release
 //! (`datafusion_postgres::testing` is gated on debug assertions).
@@ -23,6 +15,7 @@ use std::{sync::Arc, time::Instant};
 
 use datafusion::{
     execution::{
+        SessionStateBuilder,
         disk_manager::{DiskManagerBuilder, DiskManagerMode},
         memory_pool::{FairSpillPool, TrackConsumersPool},
         runtime_env::{RuntimeEnv, RuntimeEnvBuilder},
@@ -78,40 +71,83 @@ fn session(batch: &str, partitions: usize) -> SessionConfig {
     cfg.with_target_partitions(partitions)
 }
 
+/// A context over the bin file, registered as `bin`. The runtime is a parameter
+/// so callers choose whether workers get their own pool or share one.
+async fn parquet_ctx(path: &str, batch: &str, partitions: usize, runtime: Arc<RuntimeEnv>) -> Result<SessionContext, String> {
+    let state = SessionStateBuilder::new().with_config(session(batch, partitions)).with_runtime_env(runtime).with_default_features().build();
+    let ctx = SessionContext::new_with_state(state);
+    ctx.register_parquet("bin", path, ParquetReadOptions::default()).await.map_err(|e| e.to_string())?;
+    Ok(ctx)
+}
+
+/// Event-time bounds of the registered file.
+async fn bounds(ctx: &SessionContext) -> Result<(i64, i64), String> {
+    use arrow::array::Array;
+    let batches = ctx.sql("SELECT min(timestamp), max(timestamp) FROM bin").await.map_err(|e| e.to_string())?.collect().await.map_err(|e| e.to_string())?;
+    let at = |index: usize| {
+        batches[0].column(index).as_any().downcast_ref::<arrow::array::TimestampMicrosecondArray>().map(|array| array.value(0)).unwrap_or_default()
+    };
+    Ok((at(0), at(1)))
+}
+
+/// One event-time slice, spelled as the rewrite spells it.
+fn window(lo: i64, hi: i64) -> String {
+    format!(
+        " WHERE timestamp >= arrow_cast({lo}, 'Timestamp(Microsecond, Some(\"UTC\"))') AND timestamp < arrow_cast({hi}, 'Timestamp(Microsecond, Some(\"UTC\"))')"
+    )
+}
+
+/// Streams a statement to completion, returning the rows it consumed.
+async fn drain(ctx: &SessionContext, sql: &str) -> Result<u64, String> {
+    let mut stream = ctx.sql(sql).await.map_err(|e| e.to_string())?.execute_stream().await.map_err(|e| e.to_string())?;
+    let mut rows = 0u64;
+    while let Some(batch) = stream.next().await {
+        rows += batch.map_err(|e| e.to_string())?.num_rows() as u64;
+    }
+    Ok(rows)
+}
+
+/// Runs `count` workers concurrently, returning how many failed and the first
+/// failure. A join failure (panic, cancellation) counts as a worker failure.
+async fn race<Fut>(count: usize, make: impl Fn(usize) -> Fut) -> (usize, Option<String>)
+where
+    Fut: std::future::Future<Output = Result<(), String>> + Send + 'static,
+{
+    let mut set = tokio::task::JoinSet::new();
+    for worker in 0..count {
+        set.spawn(make(worker));
+    }
+    let (mut failed, mut first) = (0usize, None);
+    while let Some(result) = set.join_next().await {
+        if let Err(error) = result.map_err(|e| e.to_string()).and_then(|worker| worker) {
+            failed += 1;
+            first.get_or_insert(error);
+        }
+    }
+    (failed, first)
+}
+
+/// Prints and flushes immediately, so a later hang or OOM cannot lose rows
+/// already measured.
+fn emit(line: String) {
+    use std::io::Write;
+    println!("{line}");
+    let _ = std::io::stdout().flush();
+}
+
 /// One measured rewrite. `slices > 1` reproduces `repair_bin_sliced`: N
 /// event-time windows, each a separate full pass over the same file.
 async fn pass(
     path: &str, batch: &str, partitions: usize, slices: usize, shape: Shape, pool_bytes: usize, spill: &std::path::Path,
 ) -> Result<(f64, u64), String> {
-    use datafusion::execution::SessionStateBuilder;
-    let state = SessionStateBuilder::new().with_config(session(batch, partitions)).with_runtime_env(runtime(pool_bytes, spill)).with_default_features().build();
-    let ctx = SessionContext::new_with_state(state);
-    ctx.register_parquet("bin", path, ParquetReadOptions::default()).await.map_err(|e| e.to_string())?;
-    let (min, max) = {
-        use arrow::array::Array;
-        let batches = ctx.sql("SELECT min(timestamp), max(timestamp) FROM bin").await.map_err(|e| e.to_string())?.collect().await.map_err(|e| e.to_string())?;
-        let at = |index: usize| {
-            batches[0].column(index).as_any().downcast_ref::<arrow::array::TimestampMicrosecondArray>().map(|array| array.value(0)).unwrap_or_default()
-        };
-        (at(0), at(1))
-    };
+    let ctx = parquet_ctx(path, batch, partitions, runtime(pool_bytes, spill)).await?;
+    let (min, max) = bounds(&ctx).await?;
     let width = (max - min + 1).max(1) / slices as i64 + 1;
     let started = Instant::now();
     let mut rows = 0u64;
     for slice in 0..slices {
-        let filter = if slices == 1 {
-            String::new()
-        } else {
-            let (lo, hi) = (min + width * slice as i64, min + width * (slice as i64 + 1));
-            format!(
-                " WHERE timestamp >= arrow_cast({lo}, 'Timestamp(Microsecond, Some(\"UTC\"))') AND timestamp < arrow_cast({hi}, 'Timestamp(Microsecond, Some(\"UTC\"))')"
-            )
-        };
-        let sql = shape.sql(&filter);
-        let mut stream = ctx.sql(&sql).await.map_err(|e| e.to_string())?.execute_stream().await.map_err(|e| e.to_string())?;
-        while let Some(batch) = stream.next().await {
-            rows += batch.map_err(|e| e.to_string())?.num_rows() as u64;
-        }
+        let filter = if slices == 1 { String::new() } else { window(min + width * slice as i64, min + width * (slice as i64 + 1)) };
+        rows += drain(&ctx, &shape.sql(&filter)).await?;
     }
     Ok((started.elapsed().as_secs_f64(), rows))
 }
@@ -128,36 +164,24 @@ async fn main() {
     println!("\nfile {} ({:.1} MB compressed), pool {pool_mb} MB", path, bytes as f64 / 1e6);
     println!("{:<26} {:>8} {:>11} {:>10}", "variant", "secs", "rows", "MB/s in");
 
-    // Each row is flushed as it completes: a variant that hangs or OOMs must not
-    // take the rows already measured with it.
     let run = async |label: String, batch: &str, partitions: usize, slices: usize, shape: Shape| {
-        use std::io::Write;
-        let line = match pass(&path, batch, partitions, slices, shape, pool_mb * 1024 * 1024, spill.path()).await {
+        emit(match pass(&path, batch, partitions, slices, shape, pool_mb * 1024 * 1024, spill.path()).await {
             Ok((secs, rows)) => format!("{label:<26} {secs:>8.1} {rows:>11} {:>10.2}", bytes as f64 / 1e6 / secs),
             Err(error) => format!("{label:<26} {:>8} {error}", "FAILED"),
-        };
-        println!("{line}");
-        let _ = std::io::stdout().flush();
+        });
     };
 
     if std::env::var("TF_BENCH_FLEET").is_ok() {
-        fleet(&path, pool_mb, bytes).await;
-        return;
+        return fleet(&path, pool_mb, bytes).await;
     }
-
     if std::env::var("TF_BENCH_PROBE").is_ok() {
-        probe_shards(&path, pool_mb, bytes, spill.path()).await;
-        return;
+        return probe_shards(&path, pool_mb, bytes, spill.path()).await;
     }
-
     if std::env::var("TF_BENCH_SLICE").is_ok() {
-        slice_floor(&path, bytes, spill.path()).await;
-        return;
+        return slice_floor(&path, bytes, spill.path()).await;
     }
-
     if std::env::var("TF_BENCH_PRODSHAPE").is_ok() {
-        prod_shape(&path, pool_mb, bytes, spill.path()).await;
-        return;
+        return prod_shape(&path, pool_mb, bytes, spill.path()).await;
     }
 
     run("scan only".to_owned(), "8192", 1, 1, Shape::Scan).await;
@@ -167,90 +191,37 @@ async fn main() {
         }
     }
     run("PROD: b256 p1 x13 slices".to_owned(), "256", 1, 13, Shape::Sort).await;
-    // The dedup rewrite's own two shapes. `Window` is what shipped until
-    // 2026-09-02: `ROW_NUMBER() OVER (PARTITION BY dedup_keys)` plus the output
-    // `ORDER BY`, which plans TWO full external sorts because the window
-    // normalizes its partition ordering to ASC. `Sort` is the replacement —
-    // one sort in schema order, with the keep-greatest done as a one-pass
-    // collapse of adjacent runs (`RunCollapse`), which the widened dedup key
-    // makes valid. The gap between these two rows is the change.
+    // The dedup rewrite's two shapes: `Window` plans two full external sorts
+    // (the window normalizes its partition ordering to ASC); `Sort` is the
+    // one-sort + RunCollapse replacement.
     for (batch, partitions) in [("256", 1usize), ("2048", 1), ("2048", 8)] {
         run(format!("dedup WINDOW b{batch} p{partitions}"), batch, partitions, 1, Shape::Window).await;
         run(format!("dedup COLLAPSE b{batch} p{partitions}"), batch, partitions, 1, Shape::Sort).await;
     }
 }
 
-/// Does the rewrite fleet SCALE with concurrency, and what pool does 10x demand?
-///
-/// The per-unit numbers above say what one rewrite costs. They do not say what
-/// the fleet can sustain, which is the question 10x actually asks: concurrency
-/// is capped by `light_optimize_k = coordinator_share / PER_SORT_BUDGET_BYTES`,
-/// so the thing to measure is aggregate throughput against pool size and
-/// concurrency — including where it stops scaling and where it starts failing.
-///
-/// Each worker gets its own `SessionContext` over the same file and its own
-/// slice of one SHARED pool, which is how prod is arranged: N coordinator units
-/// on one `FairSpillPool`.
-///
-/// ```bash
-/// Does PROD's actual coordinator shape survive? The `fleet` ladder cannot say.
-///
-/// `fleet` hands every worker the WHOLE file, so at 8 workers it drives
-/// `8 x 2,451 MB = 19.6 GB` of decoded work through an 8 GiB pool. A real
-/// coordinator job is admitted for at most `MAX_DECODED_BYTES` = 512 MiB, so
-/// prod's 16 jobs drive `16 x 512 MiB = 8 GB` through that same pool — **2.4x
-/// lighter per byte of pool** than the rung that failed. Quoting fleet's
-/// 8-worker failure as evidence about prod compares two different workloads.
-///
-/// This runs the honest shape: `workers` concurrent sorts, each over ONE
-/// `1/WINDOWS` time-window of the file (~490 MB decoded), sharing one pool.
-/// Pass criterion is `failed == 0`. The 6-worker fleet rung passed at 1.8x
-/// decoded-work-to-pool; this shape is 1.0x, so a clean result corroborates
-/// rather than surprises.
+/// `workers` concurrent sorts, each over ONE `1/WINDOWS` time-window of the
+/// file, sharing one pool — the shape a real coordinator runs, where each job
+/// is admitted for at most `MAX_DECODED_BYTES`. Pass criterion is `failed == 0`.
+/// (`fleet` instead hands every worker the WHOLE file, a much heavier load per
+/// byte of pool, so its rungs do not speak to this question.)
 async fn prod_shape(path: &str, pool_mb: usize, bytes: u64, spill: &std::path::Path) {
     /// Windows the file is cut into; each worker takes one. Five puts a worker's
-    /// share near the 512 MiB admission ceiling for this file.
+    /// share near the 512 MiB admission ceiling.
     const WINDOWS: i64 = 5;
     let workers: usize = std::env::var("TF_BENCH_WORKERS").ok().and_then(|v| v.parse().ok()).unwrap_or(16);
     let shared = runtime(pool_mb * 1024 * 1024, spill);
-    // One probe context reads the bounds; the workers then filter without
-    // re-deriving them (and without each paying a min/max pass).
-    let (min, max) = {
-        use datafusion::execution::SessionStateBuilder;
-        let state = SessionStateBuilder::new().with_config(session("2048", 1)).with_runtime_env(Arc::clone(&shared)).with_default_features().build();
-        let ctx = SessionContext::new_with_state(state);
-        ctx.register_parquet("bin", path, ParquetReadOptions::default()).await.expect("register");
-        let batches = ctx.sql("SELECT min(timestamp), max(timestamp) FROM bin").await.expect("bounds").collect().await.expect("collect");
-        let at = |i: usize| {
-            use arrow::array::Array;
-            batches[0].column(i).as_any().downcast_ref::<arrow::array::TimestampMicrosecondArray>().map(|a| a.value(0)).unwrap_or_default()
-        };
-        (at(0), at(1))
-    };
+    let (min, max) = bounds(&parquet_ctx(path, "2048", 1, Arc::clone(&shared)).await.expect("register")).await.expect("bounds");
     let width = (max - min + 1).max(1) / WINDOWS + 1;
     let per_worker_mb = bytes as f64 / 1e6 * 12.0 / WINDOWS as f64;
     println!("\n{workers} workers x ~{per_worker_mb:.0} MB decoded each = {:.1} GB through a {pool_mb} MB pool", per_worker_mb * workers as f64 / 1000.0);
     let started = Instant::now();
-    let mut set = tokio::task::JoinSet::new();
-    for worker in 0..workers {
+    let (failed, first) = race(workers, |worker| {
         let (path, runtime) = (path.to_owned(), Arc::clone(&shared));
         let (lo, hi) = (min + width * (worker as i64 % WINDOWS), min + width * (worker as i64 % WINDOWS + 1));
-        set.spawn(async move { one_window(&path, runtime, lo, hi).await });
-    }
-    let (mut failed, mut first) = (0usize, None);
-    while let Some(result) = set.join_next().await {
-        match result {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                failed += 1;
-                first.get_or_insert(error);
-            }
-            Err(error) => {
-                failed += 1;
-                first.get_or_insert(error.to_string());
-            }
-        }
-    }
+        async move { one_window(&path, runtime, lo, hi).await }
+    })
+    .await;
     println!("secs {:.1}   failed {failed} of {workers}", started.elapsed().as_secs_f64());
     match first {
         Some(error) => println!("VERDICT: FAIL — {}", error.lines().next().unwrap_or("")),
@@ -260,35 +231,16 @@ async fn prod_shape(path: &str, pool_mb: usize, bytes: u64, spill: &std::path::P
 
 /// One worker's window. Same shape as `one_rewrite`, bounded to a time range.
 async fn one_window(path: &str, runtime: Arc<RuntimeEnv>, lo: i64, hi: i64) -> Result<(), String> {
-    use datafusion::execution::SessionStateBuilder;
-    let state = SessionStateBuilder::new().with_config(session("2048", 1)).with_runtime_env(runtime).with_default_features().build();
-    let ctx = SessionContext::new_with_state(state);
-    ctx.register_parquet("bin", path, ParquetReadOptions::default()).await.map_err(|e| e.to_string())?;
-    let filter = format!(
-        " WHERE timestamp >= arrow_cast({lo}, 'Timestamp(Microsecond, Some(\"UTC\"))') AND timestamp < arrow_cast({hi}, 'Timestamp(Microsecond, Some(\"UTC\"))')"
-    );
-    let mut stream = ctx.sql(&Shape::Sort.sql(&filter)).await.map_err(|e| e.to_string())?.execute_stream().await.map_err(|e| e.to_string())?;
-    while let Some(batch) = stream.next().await {
-        batch.map_err(|e| e.to_string())?;
-    }
-    Ok(())
+    let ctx = parquet_ctx(path, "2048", 1, runtime).await?;
+    drain(&ctx, &Shape::Sort.sql(&window(lo, hi))).await.map(drop)
 }
 
-/// The smallest per-job pool slice a dedup rewrite actually completes in.
+/// The smallest per-job pool slice a dedup rewrite actually completes in —
+/// the input for sizing `COORDINATOR_JOB_POOL_BYTES`.
 ///
-/// Sizes `COORDINATOR_JOB_POOL_BYTES`, which prod currently derives as
-/// `coordinator_share / jobs` = 8 GiB / 16 = **512 MiB — exactly the decoded
-/// bytes a unit is admitted for**, leaving nothing for merge buffers or the
-/// spill reservation. The journal shows the consequence directly: dedup units
-/// retrying with `Not enough memory to continue external sort ... Additional
-/// allocation failed for ExternalSorter[0]`.
-///
-/// The number this prints is the RATIO — minimum viable pool divided by the
-/// decoded bytes the budget prices the same work at
-/// (`compressed x DECODED_BYTES_PER_COMPRESSED`). A ratio above 1 means the
-/// per-job slice must exceed the admission ceiling, and by how much. That is
-/// the second half of the admission/sort-slice pair; widening admission without
-/// it converts a starving queue into a failing one.
+/// Prints the RATIO: minimum viable pool over the decoded bytes the budget
+/// prices the same work at (`compressed x DECODED_BYTES_PER_COMPRESSED`). A
+/// ratio above 1 means the per-job slice must exceed the admission ceiling.
 ///
 /// ```bash
 /// TF_BENCH_SLICE=1 TF_BENCH_PARQUET=… cargo bench --bench rewrite_throughput
@@ -300,24 +252,22 @@ async fn slice_floor(path: &str, bytes: u64, spill: &std::path::Path) {
     let decoded_mb = bytes as f64 / 1e6 * DECODED_PER_COMPRESSED;
     println!("\ndecoded ~{decoded_mb:.0} MB at {DECODED_PER_COMPRESSED:.0}x — the size every budget prices this work at");
     println!("{:<12} {:>8} {:>11} {:>9}  outcome", "pool MB", "secs", "rows", "pool/dec");
-    // Descending: the first failure is the floor, and everything below it is
-    // known-bad, so a failed rung does not end the sweep — a pool can fail for
-    // reasons other than size and that must be visible, not inferred.
+    // Descending, and a failed rung does NOT end the sweep: a pool can fail for
+    // reasons other than size, which must be visible rather than inferred.
     for pool_mb in [4096usize, 3072, 2048, 1536, 1024, 768, 512, 384, 256] {
-        use std::io::Write;
         let ratio = pool_mb as f64 / decoded_mb;
-        // `Sort` is the dedup rewrite's shape since 2026-09-02 (one sort in
-        // schema order + RunCollapse), batch 2048 as `maintenance_batch_size`
-        // sets for the Server profile.
-        let line = match pass(path, "2048", 1, 1, Shape::Sort, pool_mb * 1024 * 1024, spill).await {
+        // `Sort` is the dedup rewrite's shape; batch 2048 is what
+        // `maintenance_batch_size` sets for the Server profile.
+        emit(match pass(path, "2048", 1, 1, Shape::Sort, pool_mb * 1024 * 1024, spill).await {
             Ok((secs, rows)) => format!("{pool_mb:<12} {secs:>8.1} {rows:>11} {ratio:>9.2}  ok"),
             Err(error) => format!("{pool_mb:<12} {:>8} {:>11} {ratio:>9.2}  {}", "FAIL", "-", error.lines().next().unwrap_or("")),
-        };
-        println!("{line}");
-        let _ = std::io::stdout().flush();
+        });
     }
 }
 
+/// Aggregate throughput of N concurrent whole-file rewrites sharing one pool.
+///
+/// ```bash
 /// TF_BENCH_FLEET=1 TF_BENCH_PARQUET=… TF_BENCH_POOL_MB=8192 cargo bench --bench rewrite_throughput
 /// ```
 async fn fleet(path: &str, pool_mb: usize, bytes: u64) {
@@ -326,45 +276,29 @@ async fn fleet(path: &str, pool_mb: usize, bytes: u64) {
 {:<22} {:>8} {:>12} {:>12} {:>9}",
         "concurrency", "secs", "MB/s total", "MB/s each", "failed"
     );
-    // 3, 5, 6 included deliberately: prod runs 4 and the 8-worker rung FAILS at
-    // an 8 GB pool, so the usable ceiling is somewhere in between and that is the
-    // number a permit change has to be justified against.
-    // 10/12/16 included because `coordinator_jobs` reaches **16** on the prod
-    // box while this ladder stopped at 8 — so the rung prod actually runs was
-    // never measured. `pool / jobs` is NOT the share a worker gets: one worker
-    // sorts this file in a 512 MB pool (see `slice_floor`), yet 8 sharing 8 GB
-    // — 1 GB nominal each — fail. Only the ladder answers what a job count costs.
-    // `TF_BENCH_WORKERS=1,2,4,5,6` overrides the rungs. The point is the POOL
-    // ladder: to test whether the cliff is pool-priced rather than a fixed law,
-    // the same rungs run at several pool sizes, and rungs far past a small
-    // pool's predicted cliff only generate spill — which on a nearly-full disk
-    // fails for the wrong reason and reads as an early cliff.
+    // `pool / jobs` is NOT the share a worker gets, so only the ladder answers
+    // what a job count costs. `TF_BENCH_WORKERS=1,2,4,…` overrides the rungs;
+    // rerun the same rungs at several pool sizes to see whether a cliff is
+    // pool-priced. Rungs far past a small pool's cliff only generate spill,
+    // which on a full disk fails for the wrong reason.
     let rungs: Vec<usize> = std::env::var("TF_BENCH_WORKERS")
         .ok()
         .map(|list| list.split(',').filter_map(|n| n.trim().parse().ok()).collect::<Vec<_>>())
         .filter(|rungs: &Vec<usize>| !rungs.is_empty())
         .unwrap_or_else(|| vec![1, 2, 4, 5, 6, 8, 10, 12, 16]);
     for workers in rungs {
-        // A FRESH spill directory per rung, dropped with the rung. The shared
-        // one accumulated every rung's spill for the whole ladder: 2026-09-05
-        // a 0.1 GB fixture took 60 GiB of free disk to 2.7 GiB by rung ten,
-        // after which every later rung failed on ENOSPC and read as a memory
-        // cliff. Spill is per-rung state; the pool is what the ladder varies.
+        // A FRESH spill dir per rung: a shared one accumulates the whole
+        // ladder's spill and later rungs then fail on ENOSPC, which reads as a
+        // memory cliff.
         let rung_spill = tempfile::tempdir().expect("spill dir");
-        // ONE pool for all of them, sized as prod sizes the coordinator's.
+        // ONE pool shared by all workers in the rung, as the coordinator does.
         let shared = runtime(pool_mb * 1024 * 1024, rung_spill.path());
         let started = Instant::now();
-        let mut set = tokio::task::JoinSet::new();
-        for _ in 0..workers {
+        let (failed, _) = race(workers, |_| {
             let (path, runtime) = (path.to_owned(), Arc::clone(&shared));
-            set.spawn(async move { one_rewrite(&path, runtime).await });
-        }
-        let mut failed = 0usize;
-        while let Some(result) = set.join_next().await {
-            if !matches!(result, Ok(Ok(()))) {
-                failed += 1;
-            }
-        }
+            async move { one_rewrite(&path, runtime).await }
+        })
+        .await;
         let secs = started.elapsed().as_secs_f64();
         let moved = bytes as f64 / 1e6 * (workers - failed) as f64;
         println!("{:<22} {secs:>8.1} {:>12.2} {:>12.2} {failed:>9}", format!("{workers} workers"), moved / secs, moved / secs / workers as f64);
@@ -373,89 +307,57 @@ async fn fleet(path: &str, pool_mb: usize, bytes: u64) {
 
 /// One unit's worth of work: the same scan+sort+consume the staging loop drives.
 async fn one_rewrite(path: &str, runtime: Arc<RuntimeEnv>) -> Result<(), String> {
-    use datafusion::execution::SessionStateBuilder;
     // 2048 rows is what `batch_rows_for` picks for an ordinary otel row at the
-    // 8 MB target; the whale's wide rows land lower, which is the point of it.
-    let state = SessionStateBuilder::new().with_config(session("2048", 1)).with_runtime_env(runtime).with_default_features().build();
-    let ctx = SessionContext::new_with_state(state);
-    ctx.register_parquet("bin", path, ParquetReadOptions::default()).await.map_err(|e| e.to_string())?;
-    let frame = ctx.sql(&format!("SELECT * FROM bin{ORDER_BY}")).await.map_err(|e| e.to_string())?;
-    // THE SORT MUST ACTUALLY RUN, and it silently does not on a fixture written
-    // by our own rewrite: such a file carries footer `sorting_columns` equal to
-    // this ORDER BY, DataFusion declares the scan already ordered, and the whole
-    // ladder degenerates into a scan benchmark that reports zero failures at
-    // every pool and every rung. 2026-09-05: `prod204.parquet` did exactly that
-    // — 8 workers passed at a 2 GiB pool, 4.8x past `SAFE_DECODED_PER_POOL_BYTE`,
-    // because there was nothing to spill. A ladder with no failures anywhere is
-    // a broken probe, and this turns it into a loud one.
-    let plan = frame.clone().create_physical_plan().await.map_err(|e| e.to_string())?;
+    // 8 MB target.
+    let ctx = parquet_ctx(path, "2048", 1, runtime).await?;
+    let sql = Shape::Sort.sql("");
+    // THE SORT MUST ACTUALLY RUN. A fixture written by our own rewrite carries
+    // footer `sorting_columns` equal to this ORDER BY, so DataFusion declares
+    // the scan already ordered and the ladder silently degenerates into a scan
+    // benchmark with zero failures at every rung. Fail loudly instead.
+    let plan = ctx.sql(&sql).await.map_err(|e| e.to_string())?.create_physical_plan().await.map_err(|e| e.to_string())?;
     let rendered = datafusion::physical_plan::displayable(plan.as_ref()).indent(true).to_string();
     if !rendered.contains("SortExec") {
         return Err(format!("the fixture is ALREADY SORTED, so no sort ran and this measures a scan:\n{rendered}"));
     }
-    let mut stream = frame.execute_stream().await.map_err(|e| e.to_string())?;
-    while let Some(batch) = stream.next().await {
-        batch.map_err(|e| e.to_string())?;
-    }
-    Ok(())
+    drain(&ctx, &sql).await.map(drop)
 }
 
-/// What do the dedup probe's hash SHARDS cost?
+/// What the dedup probe's hash SHARDS cost: wall time for N passes vs one, at a
+/// given pool.
 ///
-/// `stage_dedup_partition_range` runs the duplicate probe once per shard, and
-/// each pass re-reads the selected files — the shard predicate is a hash over
-/// the dedup keys, so nothing prunes. Prod 2026-09-01 shows the consequence
-/// directly in `maintenance_scan_pruning`: the same 3,433.7 MB scanned SIX
-/// times (90-118 s each, ~640 s total) and the same 9,408 MB scanned twice at
-/// ~1,450 s. Across 45 warm minutes, 462 scans read 58.88 GB in 11,821 s.
-///
-/// Sharding is a deliberate memory-for-IO trade, made when the coordinator pool
-/// was 4.2 GB: one pass must hold the partition's whole dedup-key cardinality,
-/// N passes hold 1/N of it. The pool is now ~10 GB and DataFusion spills
-/// grouped aggregates, so the trade is worth re-deriving rather than assuming —
-/// which is what this measures: wall time for N passes vs one, at a given pool.
+/// `stage_dedup_partition_range` runs the duplicate probe once per shard and
+/// each pass re-reads every selected file (the shard predicate is a hash over
+/// the dedup keys, so nothing prunes). Sharding trades IO for memory: one pass
+/// must hold the partition's whole dedup-key cardinality, N passes hold 1/N.
 ///
 /// ```bash
 /// TF_BENCH_PROBE=1 TF_BENCH_PARQUET=… TF_BENCH_POOL_MB=1024 cargo bench --bench rewrite_throughput
 /// ```
 async fn probe_shards(path: &str, pool_mb: usize, bytes: u64, spill: &std::path::Path) {
-    use std::io::Write;
     println!("\n{:<20} {:>8} {:>12} {:>10}", "probe variant", "secs", "MB/s in", "result");
     for shards in [1usize, 2, 4, 6] {
-        let runtime = runtime(pool_mb * 1024 * 1024, spill);
-        let state = datafusion::execution::SessionStateBuilder::new().with_config(session("8192", 1)).with_runtime_env(runtime).with_default_features().build();
-        let ctx = SessionContext::new_with_state(state);
-        if ctx.register_parquet("bin", path, ParquetReadOptions::default()).await.is_err() {
+        let Ok(ctx) = parquet_ctx(path, "8192", 1, runtime(pool_mb * 1024 * 1024, spill)).await else {
             println!("{:<20} {:>8}", format!("{shards} shard(s)"), "REGISTER-FAILED");
             continue;
-        }
+        };
         let started = Instant::now();
         let mut failed = None;
         for shard in 0..shards {
-            // A non-pruning predicate, exactly like the real hash-bucket one:
-            // every pass still decodes every row. The hash itself is a crate UDF
-            // and irrelevant to the IO this measures.
+            // A non-pruning predicate, like the real hash-bucket one: every
+            // pass still decodes every row.
             let filter = match shards {
                 1 => String::new(),
                 _ => format!(" WHERE abs(length(CAST(\"id\" AS VARCHAR))) % {shards} = {shard}"),
             };
             let sql = format!("SELECT count(*) FROM (SELECT \"timestamp\", count(*) AS c FROM bin{filter} GROUP BY \"timestamp\", \"id\") AS g WHERE c > 1");
-            match ctx.sql(&sql).await {
-                Ok(df) => {
-                    if let Err(error) = df.collect().await {
-                        failed = Some(error.to_string());
-                        break;
-                    }
-                }
-                Err(error) => {
-                    failed = Some(error.to_string());
-                    break;
-                }
+            if let Err(error) = async { ctx.sql(&sql).await?.collect().await }.await {
+                failed = Some(error.to_string());
+                break;
             }
         }
         let secs = started.elapsed().as_secs_f64();
         let outcome = failed.map_or_else(|| "ok".to_owned(), |error| error.chars().take(46).collect());
-        println!("{:<20} {secs:>8.1} {:>12.2} {outcome:>10}", format!("{shards} shard(s)"), bytes as f64 / 1e6 / secs);
-        let _ = std::io::stdout().flush();
+        emit(format!("{:<20} {secs:>8.1} {:>12.2} {outcome:>10}", format!("{shards} shard(s)"), bytes as f64 / 1e6 / secs));
     }
 }

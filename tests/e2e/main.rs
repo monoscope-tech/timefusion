@@ -1,7 +1,4 @@
-//! E2E test binary. One Cargo target so testcontainers MinIO startup can be
-//! amortized across scenarios and so we can share a single harness module.
-//!
-//! Run with: `cargo test --test e2e` (requires Docker for MinIO).
+//! E2E test binary: one Cargo target so all scenarios share a single MinIO harness.
 
 mod harness;
 

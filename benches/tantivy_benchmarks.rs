@@ -1,27 +1,36 @@
-//! Tier-5 tantivy benchmarks.
-//!
-//! Measures:
-//! 1. Index-build throughput: rows/sec for `build_in_memory`.
-//! 2. Index size: ratio of packed (`tar.zst`) bytes to source row count.
-//! 3. Query latency: term query against a 100k-row index.
-//!
-//! Real "scan-with-vs-without" benches against Delta are intentionally
-//! deferred — they require a running MinIO and add minutes to CI. The
-//! tantivy-only benches here are sufficient to detect regressions in
-//! the indexing/query layer itself.
+//! Tantivy benchmarks: index-build throughput, packed index size, and query latency.
 
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use arrow::{
     array::{ArrayRef, RecordBatch, StringArray, TimestampMicrosecondArray},
     datatypes::{DataType, Field, Schema as ArrowSchema, TimeUnit},
 };
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
+use serde_json::json;
 use tantivy::{Term, query::TermQuery, schema::IndexRecordOption};
 use timefusion::{
+    config::{AppConfig, TantivyConfig},
+    database::Database,
     schema::{FieldDef, SortingColumnDef, TableSchema, TantivyFieldConfig},
-    tantivy::{build_in_memory, search::query_index},
+    support::test_helpers::json_to_batch,
+    tantivy::{
+        build_in_memory,
+        search::{TantivyIndexService, TantivySearchService, query_index},
+    },
+    write::DeltaWriteCallback,
 };
+
+/// `tokenizer` present means the column is tantivy-indexed with it.
+fn field(name: &str, data_type: &str, nullable: bool, tokenizer: Option<&str>) -> FieldDef {
+    FieldDef {
+        name: name.into(),
+        data_type: data_type.into(),
+        nullable,
+        tantivy: tokenizer.map(|t| TantivyFieldConfig { indexed: true, tokenizer: Some(t.into()), ..Default::default() }),
+        ..Default::default()
+    }
+}
 
 fn table() -> TableSchema {
     TableSchema {
@@ -35,35 +44,12 @@ fn table() -> TableSchema {
         dedup_tiebreak: None,
         tombstone_column: None,
         version_append: false,
+        // `bench_variant_build` retypes index 3, so "message" must stay last.
         fields: vec![
-            FieldDef {
-                name: "timestamp".into(),
-                data_type: "Timestamp(Microsecond, Some(\"UTC\"))".into(),
-                nullable: false,
-                tantivy: None,
-                dictionary: None,
-                bloom_filter: false,
-                mutable: false,
-            },
-            FieldDef { name: "id".into(), data_type: "Utf8".into(), nullable: false, tantivy: None, dictionary: None, bloom_filter: false, mutable: false },
-            FieldDef {
-                name: "level".into(),
-                data_type: "Utf8".into(),
-                nullable: true,
-                tantivy: Some(TantivyFieldConfig { indexed: true, tokenizer: Some("raw".into()), flatten: None, list_mode: Default::default() }),
-                dictionary: None,
-                bloom_filter: false,
-                mutable: false,
-            },
-            FieldDef {
-                name: "message".into(),
-                data_type: "Utf8".into(),
-                nullable: true,
-                tantivy: Some(TantivyFieldConfig { indexed: true, tokenizer: Some("default".into()), flatten: None, list_mode: Default::default() }),
-                dictionary: None,
-                bloom_filter: false,
-                mutable: false,
-            },
+            field("timestamp", "Timestamp(Microsecond, Some(\"UTC\"))", false, None),
+            field("id", "Utf8", false, None),
+            field("level", "Utf8", true, Some("raw")),
+            field("message", "Utf8", true, Some("default")),
         ],
     }
 }
@@ -97,8 +83,6 @@ fn bench_build(c: &mut Criterion) {
     g.finish();
 }
 
-// Includes real variant serialization, tokenization, final merging and packing.
-// Setup is outside the timing loop; JSON and KV modes use identical source rows.
 fn bench_variant_build(c: &mut Criterion) {
     use parquet_variant_compute::VariantArrayBuilder;
     use parquet_variant_json::JsonToVariant;
@@ -150,32 +134,17 @@ fn bench_size_ratio(c: &mut Criterion) {
     let table = table();
     let n = 100_000usize;
     let b = synthetic_batch(n);
-    let (blob, stats) =
-        timefusion::tantivy::build_and_pack(&table, std::slice::from_ref(&b), 19, timefusion::tantivy::MergeMode::Now, &std::env::temp_dir()).unwrap();
+    let pack =
+        || timefusion::tantivy::build_and_pack(&table, std::slice::from_ref(&b), 19, timefusion::tantivy::MergeMode::Now, &std::env::temp_dir()).unwrap();
+    let (blob, stats) = pack();
     let bytes_per_row = blob.len() as f64 / stats.rows as f64;
     println!("tantivy index size: {} bytes for {} rows ({:.2} bytes/row)", blob.len(), stats.rows, bytes_per_row);
     c.bench_function("tantivy_pack_100k_zstd_19", |bench| {
-        bench.iter(|| {
-            timefusion::tantivy::build_and_pack(&table, std::slice::from_ref(&b), 19, timefusion::tantivy::MergeMode::Now, &std::env::temp_dir()).unwrap();
-        });
+        bench.iter(|| drop(pack()));
     });
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-// End-to-end scan bench: text_match with tantivy prefilter ON vs OFF.
-// Requires MinIO. Skipped if AWS_S3_ENDPOINT isn't reachable.
-// ────────────────────────────────────────────────────────────────────────────
-
-use std::{path::PathBuf, time::Duration};
-
-use serde_json::json;
-use timefusion::{
-    config::{AppConfig, TantivyConfig},
-    database::Database,
-    support::test_helpers::json_to_batch,
-    tantivy::search::{TantivyIndexService, TantivySearchService},
-    write::DeltaWriteCallback,
-};
+// End-to-end scan bench (text_match prefilter ON vs OFF); skipped unless MinIO is reachable.
 
 fn make_app_cfg(test_id: &str) -> Arc<AppConfig> {
     let mut c = AppConfig::default();
@@ -208,18 +177,15 @@ async fn setup_bench_db(test_id: &str, tantivy_enabled: bool, rows: usize) -> Op
     });
     let mut layer = timefusion::support::test_helpers::test_layer(cfg_arc.clone()).ok()?.with_delta_writer(delta_cb);
     if tantivy_enabled {
-        let bucket = cfg_arc.aws.aws_s3_bucket.clone().unwrap();
-        let storage_uri = format!("s3://{}/{}/tantivy", bucket, cfg_arc.core.timefusion_table_prefix);
-        let storage_opts = cfg_arc.aws.build_storage_options(None);
-        let obj_store = db.create_object_store(&storage_uri, &storage_opts).await.ok()?;
+        let storage_uri = format!("s3://{}/{}/tantivy", cfg_arc.aws.aws_s3_bucket.clone().unwrap(), cfg_arc.core.timefusion_table_prefix);
+        let obj_store = db.create_object_store(&storage_uri, &cfg_arc.aws.build_storage_options(None)).await.ok()?;
         let s = Arc::new(TantivyIndexService::new(
             obj_store.clone(),
             Arc::new(cfg_arc.tantivy.clone()),
             std::env::temp_dir().join(format!("tf-scratch-{}", uuid::Uuid::new_v4())),
         ));
         layer = layer.with_tantivy_indexer(timefusion::server::tantivy_index_callback(&db, Arc::clone(&s)));
-        let cache_root = cfg_arc.core.timefusion_data_dir.clone();
-        let search = Arc::new(TantivySearchService::new(obj_store, cache_root, Arc::new(cfg_arc.tantivy.clone())));
+        let search = Arc::new(TantivySearchService::new(obj_store, cfg_arc.core.timefusion_data_dir.clone(), Arc::new(cfg_arc.tantivy.clone())));
         s.with_reader(&search);
         db = db.with_tantivy_search(search).with_tantivy_indexer(s);
     }
@@ -230,7 +196,7 @@ async fn setup_bench_db(test_id: &str, tantivy_enabled: bool, rows: usize) -> Op
     datafusion_functions_json::register_all(&mut ctx).ok()?;
     db.setup_session_context(&mut ctx).ok()?;
 
-    // Insert `rows` rows; only ~1% will match the query "panic" → high selectivity.
+    // One word in five matches "panic", keeping the query highly selective.
     let project = format!("p-{}", &uuid::Uuid::new_v4().to_string()[..8]);
     let words = ["request completed", "shutdown clean", "timeout connection", "request received", "panic occurred"];
     let now = chrono::Utc::now();
@@ -264,25 +230,24 @@ fn bench_e2e_scan(c: &mut Criterion) {
     }
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
 
-    let id_on = uuid::Uuid::new_v4().to_string()[..8].to_string();
-    let id_off = uuid::Uuid::new_v4().to_string()[..8].to_string();
-    let (_db_on, ctx_on, p_on) = rt.block_on(async { setup_bench_db(&id_on, true, 10_000).await.expect("setup ON") });
-    let (_db_off, ctx_off, p_off) = rt.block_on(async { setup_bench_db(&id_off, false, 10_000).await.expect("setup OFF") });
-    let q_on = format!("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id='{p_on}' AND text_match(status_message, 'panic')");
-    let q_off = format!("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id='{p_off}' AND text_match(status_message, 'panic')");
+    // `_db` must stay alive for the whole bench: dropping the Database tears down
+    // the layer the context queries through.
+    let arms = [("scan_10k_with_prefilter", true), ("scan_10k_without_prefilter", false)].map(|(label, tantivy_enabled)| {
+        let id = uuid::Uuid::new_v4().to_string()[..8].to_string();
+        let (db, ctx, project) = rt.block_on(setup_bench_db(&id, tantivy_enabled, 10_000)).unwrap_or_else(|| panic!("setup {label}"));
+        let sql = format!("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id='{project}' AND text_match(status_message, 'panic')");
+        (label, db, ctx, sql)
+    });
 
     let mut g = c.benchmark_group("tantivy_scan_e2e");
     g.measurement_time(Duration::from_secs(15));
-    g.bench_function("scan_10k_with_prefilter", |b| {
-        b.to_async(&rt).iter(|| async {
-            ctx_on.sql(&q_on).await.unwrap().collect().await.unwrap();
+    for (label, _db, ctx, sql) in &arms {
+        g.bench_function(*label, |b| {
+            b.to_async(&rt).iter(|| async {
+                ctx.sql(sql).await.unwrap().collect().await.unwrap();
+            });
         });
-    });
-    g.bench_function("scan_10k_without_prefilter", |b| {
-        b.to_async(&rt).iter(|| async {
-            ctx_off.sql(&q_off).await.unwrap().collect().await.unwrap();
-        });
-    });
+    }
     g.finish();
 }
 

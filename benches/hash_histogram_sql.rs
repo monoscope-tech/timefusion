@@ -1,8 +1,6 @@
 //! Full SQL/Delta/Tantivy benchmark against local MinIO, with exact bucket checks.
 //! Run: cargo bench --bench hash_histogram_sql -- 10000 > histogram.json
-//! The argument is rows per day across 30 days. This excludes PostgreSQL wire
-//! overhead and production payload widths. Data remains under a unique local
-//! MinIO prefix reported in the output so subsequent investigations can reuse it.
+//! The argument is rows per day across 30 days.
 
 use std::{
     collections::BTreeMap,
@@ -100,36 +98,24 @@ struct Measurement {
     buckets: BTreeMap<i64, i64>,
 }
 
-#[derive(Serialize)]
-struct IndexIo {
-    blob_fetches: u64,
-    blob_fetch_us: u64,
-    index_opens: u64,
-    index_open_us: u64,
-    manifest_load_us: u64,
-}
+/// Defines `IndexIo`: a snapshot of the named `SearchStats` counters, plus their pairwise difference.
+macro_rules! index_io {
+    ($($field:ident),+ $(,)?) => {
+        #[derive(Serialize)]
+        struct IndexIo { $($field: u64),+ }
 
-impl IndexIo {
-    fn read(stats: &SearchStats) -> Self {
-        Self {
-            blob_fetches: stats.blob_fetches.load(Ordering::Relaxed),
-            blob_fetch_us: stats.blob_fetch_us.load(Ordering::Relaxed),
-            index_opens: stats.index_opens.load(Ordering::Relaxed),
-            index_open_us: stats.index_open_us.load(Ordering::Relaxed),
-            manifest_load_us: stats.manifest_load_us.load(Ordering::Relaxed),
-        }
-    }
+        impl IndexIo {
+            fn read(stats: &SearchStats) -> Self {
+                Self { $($field: stats.$field.load(Ordering::Relaxed)),+ }
+            }
 
-    fn since(self, before: Self) -> Self {
-        Self {
-            blob_fetches: self.blob_fetches - before.blob_fetches,
-            blob_fetch_us: self.blob_fetch_us - before.blob_fetch_us,
-            index_opens: self.index_opens - before.index_opens,
-            index_open_us: self.index_open_us - before.index_open_us,
-            manifest_load_us: self.manifest_load_us - before.manifest_load_us,
+            fn since(self, before: Self) -> Self {
+                Self { $($field: self.$field - before.$field),+ }
+            }
         }
-    }
+    };
 }
+index_io!(blob_fetches, blob_fetch_us, index_opens, index_open_us, manifest_load_us);
 
 fn record(project: &str, start: i64, spacing: i64, day: i64, row: i64, coverage: Coverage) -> Result<serde_json::Value> {
     let timestamp = start + day * DAY + row * spacing;
@@ -170,11 +156,13 @@ fn sql(project: &str, lo: i64, hi: i64, predicate: Predicate, route: Route) -> R
 }
 
 async fn query(ctx: &SessionContext, search: &TantivySearchService, sql: &str) -> Result<Measurement> {
-    let counters = || (search.stats.histogram_snapshots.load(Ordering::Relaxed), search.stats.histogram_unique_partitions.load(Ordering::Relaxed));
+    let counters = || {
+        let s = &search.stats;
+        [&s.histogram_snapshots, &s.histogram_unique_partitions, &s.histogram_delta_cache_hits, &s.histogram_parquet_prepares]
+            .map(|c| c.load(Ordering::Relaxed))
+    };
     let before = counters();
     let before_io = IndexIo::read(&search.stats);
-    let before_cache = search.stats.histogram_delta_cache_hits.load(Ordering::Relaxed);
-    let before_prepares = search.stats.histogram_parquet_prepares.load(Ordering::Relaxed);
     let started = Instant::now();
     let batches = tokio::time::timeout(Duration::from_secs(30), async { ctx.sql(sql).await?.collect().await })
         .await
@@ -195,10 +183,10 @@ async fn query(ctx: &SessionContext, search: &TantivySearchService, sql: &str) -
         buckets: counts,
         elapsed_ms,
         index_io,
-        histogram_partitions: after.0 - before.0,
-        unique_partitions: after.1 - before.1,
-        delta_cache_hits: search.stats.histogram_delta_cache_hits.load(Ordering::Relaxed) - before_cache,
-        parquet_prepares: search.stats.histogram_parquet_prepares.load(Ordering::Relaxed) - before_prepares,
+        histogram_partitions: after[0] - before[0],
+        unique_partitions: after[1] - before[1],
+        delta_cache_hits: after[2] - before[2],
+        parquet_prepares: after[3] - before[3],
     })
 }
 
@@ -213,8 +201,7 @@ async fn database(config: Arc<AppConfig>, cache: &Path) -> Result<(Arc<Database>
     Ok((Arc::new(db.with_tantivy_search(search.clone()).with_tantivy_indexer(indexer)), search))
 }
 
-// Fresh local metadata and reader caches; the local MinIO server and OS page
-// cache remain warm. A cold query must recover the persisted count proof.
+// Runs against fresh local metadata and reader caches (MinIO and the OS page cache stay warm).
 async fn cold_query(config: &AppConfig, sql: &str) -> Result<Measurement> {
     let dir = tempfile::tempdir()?;
     let mut config = config.clone();

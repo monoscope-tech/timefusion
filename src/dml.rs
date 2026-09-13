@@ -42,11 +42,8 @@ const SLOW_DML_PHASE_US: u64 = 1_000_000;
 /// Maximum source rows in one merge-on-read scan. Each chunk becomes bounded
 /// IN-lists on the complete join key, so a large enrichment UPDATE never falls
 /// back to decoding and deduplicating its whole target time window.
-// Keep this well below the depth that DataFusion's expression optimizer can
-// safely visit on a Tokio worker stack. Production aborted at 4,096 rows
-// while optimizing the two complete-key IN lists (SIGABRT: stack overflow).
-// 256 bounds both decoded work and optimizer recursion without relying on a
-// larger process/thread stack.
+// Must stay small enough that DataFusion's expression optimizer can recurse
+// over the resulting IN-lists on a Tokio worker stack (4,096 overflows it).
 const MOR_KEY_PUSHDOWN_ROWS: usize = 256;
 
 fn log_slow_phase(phase: &'static str, table_name: &str, project_id: &str, started: Instant, rows: Option<u64>) {
@@ -59,29 +56,16 @@ fn log_slow_phase(phase: &'static str, table_name: &str, project_id: &str, start
 /// Build a clean SessionState with config + runtime from the given session but with
 /// delta-rs's DeltaPlanner instead of our custom DmlQueryPlanner.
 pub(crate) fn delta_session_from(session: &SessionState) -> Arc<dyn Session> {
-    // delta-rs's DELETE/UPDATE re-reads existing parquet files and rewrites
-    // them. Without `schema_force_view_types=false`, the reader returns
-    // Struct{BinaryView,BinaryView} for our Variant columns while
-    // delta_kernel's `unshredded_variant()` schema declares Binary —
-    // mismatch rejects the operation with "Expected ... Binary, got ...
-    // BinaryView" even on an empty table.
-    //
-    // Start from `DeltaSessionConfig::default()` so we inherit delta-rs's
-    // other required defaults (hash_join_inlist_pushdown=0, etc.) and only
-    // override the view-types flag.
+    // Start from `DeltaSessionConfig::default()` to inherit delta-rs's required
+    // defaults. `schema_force_view_types=false` is mandatory: otherwise the
+    // reader yields BinaryView for Variant columns while delta_kernel's schema
+    // declares Binary, and the operation is rejected on the type mismatch.
     let cfg: datafusion::prelude::SessionConfig = deltalake::delta_datafusion::DeltaSessionConfig::default().into();
     let cfg = cfg.set_bool("datafusion.execution.parquet.schema_force_view_types", false);
-    // Same nullability-widened file set as `Database::create_session_context`
-    // (2026-07-31, 7d68f01): a DML plan reading those files must not trip the
-    // physical-vs-logical aggregate schema check either.
+    // DML plans read the same nullability-widened files as the query sessions.
     let mut cfg = cfg.set_bool("datafusion.execution.skip_physical_aggregate_schema_check", true);
-    // A MERGE-UPDATE re-reads and rewrites WHOLE wide otel rows, so it is the
-    // most decode-expensive read in the system — and it was the only one still
-    // on DataFusion's 8192-row default. The query and maintenance sessions have
-    // run these same rows at 2048 since the 2026-08-07 heap work; this session
-    // was missed, and a dump taken mid-burst on 2026-08-13 put 38.3 GiB (57% of
-    // live heap) back in exactly the stack that work had cut —
-    // `extend_from_dictionary` under `ByteArrayDecoder::read`.
+    // A MERGE-UPDATE re-reads and rewrites whole wide otel rows — the most
+    // decode-expensive read in the system; keep it on the narrow decode batch.
     let _ = cfg.options_mut().set("datafusion.execution.batch_size", crate::database::WIDE_ROW_DECODE_BATCH_SIZE);
     Arc::new(
         SessionStateBuilder::new()
@@ -93,13 +77,9 @@ pub(crate) fn delta_session_from(session: &SessionState) -> Arc<dyn Session> {
     )
 }
 
-/// Materialized RHS of an `UPDATE ... FROM` statement together with the
-/// equi-join key spec that pairs target rows with source rows.
-///
-/// `batch` is the fully-materialized source side (capped at
-/// [`MAX_UPDATE_SOURCE_ROWS`]). Assignment exprs reference its columns via
-/// the `source` qualifier (e.g. `col("source.value")`); downstream code
-/// expects those refs to resolve against `schema`.
+/// Materialized RHS of an `UPDATE ... FROM` statement plus the equi-join key
+/// spec pairing target rows with source rows. Assignment exprs reference
+/// `batch`'s columns via the `source` qualifier and must resolve against `schema`.
 #[derive(Clone)]
 pub struct UpdateSource {
     pub batch: RecordBatch,
@@ -111,14 +91,12 @@ pub struct UpdateSource {
 
 /// Output of [`extract_dml_info`]: parsed DML shape, with an unmaterialized
 /// source plan when the input contained a `Join` (i.e. `UPDATE ... FROM`).
-/// Materialization runs asynchronously in [`DmlQueryPlanner::create_physical_plan`].
 pub struct DmlInfo {
     pub table_name: String,
     pub project_id: String,
     pub predicate: Option<Expr>,
     pub assignments: Option<Vec<(String, Expr)>>,
-    /// Source plan + join keys when the input contained a `Join`. Materialized
-    /// into [`UpdateSource`] before the physical [`DmlExec`] is constructed.
+    /// Materialized into [`UpdateSource`] before [`DmlExec`] is constructed.
     pub source_plan: Option<UpdateSourcePlan>,
 }
 
@@ -143,12 +121,8 @@ impl DmlQueryPlanner {
 }
 
 /// Give `plan`'s columns the qualifiers `target` carries, field for field.
-///
-/// The rollup SQL produces the right NAMES — its aliases are the aggregate's own
-/// field names — but SELECT aliases are unqualified, while an aggregate's
-/// group-by column keeps its source qualifier. A `Column` reference in an
-/// untouched node above resolves on `(qualifier, name)`, so without this the
-/// substitution would not resolve.
+/// Column references resolve on `(qualifier, name)`, so a substituted subplan
+/// whose aliases are unqualified would not resolve in the nodes above it.
 pub(crate) fn requalified(plan: LogicalPlan, target: &datafusion::common::DFSchemaRef) -> Result<LogicalPlan> {
     let expr = target
         .iter()
@@ -164,16 +138,11 @@ pub(crate) fn requalified(plan: LogicalPlan, target: &datafusion::common::DFSche
 }
 
 /// Swap `replacement` in for the `matched` node, leaving every other node as the
-/// optimizer produced it.
-///
-/// This is the whole reassembly. It replaces peeling the plan apart and
-/// rebuilding it, which could only ever accept a fixed grammar of parent nodes
-/// and kept declining production shapes that had one layer more.
+/// optimizer produced it. Errors if `matched` is not present in `plan`.
 pub(crate) fn substitute(plan: &LogicalPlan, matched: &LogicalPlan, replacement: LogicalPlan) -> Result<LogicalPlan> {
     use datafusion::common::tree_node::TreeNodeRecursion;
     // EVERY occurrence, not just the first: an inlined CTE referenced twice
-    // plans to two identical aggregates, and replacing one would leave the other
-    // scanning raw — the same answer at half the saving.
+    // plans to two identical aggregates; replacing one leaves the other raw.
     let mut replaced = 0usize;
     let rewritten = plan
         .clone()
@@ -186,16 +155,12 @@ pub(crate) fn substitute(plan: &LogicalPlan, matched: &LogicalPlan, replacement:
             Ok(Transformed::new(replacement.clone(), true, TreeNodeRecursion::Jump))
         })?
         .data;
-    // A target that is not in the plan would leave it untouched — a correct RAW
-    // answer reported as a rollup hit, which is the one failure the counters
-    // cannot show. Fail instead; the caller records it as a miss.
     if replaced == 0 {
         return Err(DataFusionError::Internal("rollup substitution target is not in the plan".into()));
     }
-    // Parent nodes cache their `DFSchema`. Rebuilding bottom-up both refreshes
-    // those caches and re-resolves every expression against its new input, so a
-    // replacement whose fields do not line up fails HERE — as a recorded miss
-    // and a raw fallback — rather than reaching the physical planner.
+    // Parent nodes cache their `DFSchema`; rebuilding bottom-up refreshes those
+    // caches and re-resolves every expression, so a mismatched replacement fails
+    // here rather than reaching the physical planner.
     rewritten.transform_up(|node| node.recompute_schema().map(Transformed::yes)).map(|rewritten| rewritten.data)
 }
 
@@ -205,19 +170,9 @@ impl QueryPlanner for DmlQueryPlanner {
         true
     }
 
-    #[instrument(
-        name = "dml.create_physical_plan",
-        skip_all,
-        fields(
-            operation = Empty,
-            table.name = Empty,
-            project_id = Empty,
-        )
-    )]
+    #[instrument(name = "dml.create_physical_plan", skip_all, fields(operation = Empty, table.name = Empty, project_id = Empty))]
     async fn create_physical_plan(&self, logical_plan: &LogicalPlan, session_state: &SessionState) -> Result<Arc<dyn ExecutionPlan>> {
-        // COUNT(*) stats pushdown — answers gate-eligible count tiles from
-        // Delta add-action stats with zero parquet IO; declines to `None`
-        // for anything it can't prove exact.
+        // COUNT(*) from Delta add-action stats; declines unless provably exact.
         if let Some(exec) = crate::read::try_count_pushdown(logical_plan, &self.database).await? {
             return Ok(exec);
         }
@@ -234,10 +189,8 @@ impl QueryPlanner for DmlQueryPlanner {
                 }
                 .await;
                 match rewritten {
-                    // Names, order and types must match; the rollup SQL's aliases
-                    // are unqualified where the original aggregate keeps the
-                    // source qualifier, and a derived `==` on DFSchema compares
-                    // qualifiers — which rejected every grouped query.
+                    // Names, order and types must match — but NOT qualifiers, so
+                    // compare with `has_equivalent_names_and_types`, not `==`.
                     Ok(rewritten) => match rewritten.schema().has_equivalent_names_and_types(logical_plan.schema()) {
                         Ok(()) => match self.planner.create_physical_plan(&rewritten, session_state).await {
                             Ok(exec) if self.database.rollup_ticket_current(&ticket).await => {
@@ -250,9 +203,6 @@ impl QueryPlanner for DmlQueryPlanner {
                                 crate::observability::record_rollup_miss(crate::rollup::MissReason::UnsupportedShape);
                             }
                         },
-                        // The mismatch names the offending field and both types.
-                        // Discarding it leaves `rewrite_schema_mismatch` with no
-                        // way to tell WHICH column drifted.
                         Err(error) => {
                             warn!(%error, event = "rollup_rewrite_failed", stage = "schema", "rollup rewrite does not match the query schema; using raw plan");
                             crate::observability::record_rollup_miss(crate::rollup::MissReason::RewriteSchemaMismatch);
@@ -267,13 +217,8 @@ impl QueryPlanner for DmlQueryPlanner {
             Ok(None) => {}
             Err(reason) => {
                 crate::observability::record_rollup_miss(reason);
-                // A miss counter alone cannot be acted on. Prod 2026-08-17 sat at
-                // ~2.7 MissingProject misses/second with rollup_hits at 0, and
-                // there was no way to tell from outside whether the refused plans
-                // were monoscope's parameterized dashboards or ad-hoc literal
-                // queries — the two need opposite fixes. Sampled so a
-                // multiple-per-second rate cannot flood the log, and the plan is
-                // only rendered when a sample is actually taken.
+                // Sampled so a multiple-per-second miss rate cannot flood the
+                // log; the plan is only rendered when a sample is taken.
                 if crate::observability::sample_rollup_miss(reason.label()) {
                     warn!(
                         reason = reason.label(),
@@ -297,40 +242,36 @@ impl QueryPlanner for DmlQueryPlanner {
                 span.record("table.name", info.table_name.as_str());
                 span.record("project_id", info.project_id.as_str());
 
-                // For `UPDATE ... FROM`, materialize the source RHS once at plan
-                // construction. Both backends (MemBuffer hash-join + Delta MergeBuilder)
-                // consume the materialized batch; replaying the source SQL at execution
-                // time would be non-deterministic if the source references mutable state.
+                // Materialize the `UPDATE ... FROM` source RHS once at plan time:
+                // replaying the source SQL at execution time would be
+                // non-deterministic if it references mutable state.
                 let source = if let Some(sp) = info.source_plan { Some(materialize_source(&self.planner, session_state, sp).await?) } else { None };
 
                 let session = delta_session_from(session_state);
-                // A DELETE carries neither assignments nor a source (both are gated
-                // on `extract_assignments`), so the UPDATE shape covers it exactly.
-                let exec = DmlExec::new(op_type, info.table_name, info.project_id, input_exec, self.database.clone(), session)
-                    .predicate(info.predicate)
-                    .assignments(info.assignments.unwrap_or_default())
-                    .source(source);
-                // Resolve the layer at PLAN time, not planner-construction time:
-                // sessions (and this planner) are created during boot before the
-                // buffered layer is attached to the Database.
-                Ok(Arc::new(exec.buffered_layer(self.database.buffered_layer().cloned())))
+                Ok(Arc::new(DmlExec {
+                    predicate: info.predicate,
+                    assignments: info.assignments.unwrap_or_default(),
+                    source,
+                    // Resolve at PLAN time: this planner is built during boot,
+                    // before the buffered layer is attached to the Database.
+                    buffered_layer: self.database.buffered_layer().cloned(),
+                    ..DmlExec::new(op_type, info.table_name, info.project_id, input_exec, self.database.clone(), session)
+                }))
             }
             _ => self.planner.create_physical_plan(logical_plan, session_state).await,
         }
     }
 }
 
-/// Extract DML information from logical plan.
+/// Extract DML information from a logical plan.
 ///
-/// Walks the projection/filter/scan chain of `dml.input`. When a `Join` is
-/// encountered (i.e. the user wrote `UPDATE t SET … FROM src WHERE t.k = src.k`),
-/// it identifies which side scans the target table, extracts equi-join keys, and
-/// stashes the *other* side's `LogicalPlan` for later async materialization. The
-/// walk then continues down the target side as a plain `UPDATE`.
+/// Walks the projection/filter/scan chain of `dml.input`. On a `Join` (i.e.
+/// `UPDATE t SET … FROM src WHERE t.k = src.k`) it identifies which side scans
+/// the target table, extracts equi-join keys, stashes the *other* side's plan
+/// for later async materialization, and continues down the target side.
+/// Errors if no `project_id` filter is present.
 fn extract_dml_info(input: &LogicalPlan, table_name: &str, extract_assignments: bool) -> Result<DmlInfo> {
-    // Imperative descent: each node kind updates a different slot of the state and
-    // the walk is not a fixed-length iteration, so a fold would just thread the same
-    // four fields by hand. Iterative (not recursive) — plan trees can be deep.
+    // Iterative, not recursive — plan trees can be deep.
     let mut current_plan = input;
     let mut predicate: Option<Expr> = None;
     let mut assignments = None;
@@ -343,31 +284,23 @@ fn extract_dml_info(input: &LogicalPlan, table_name: &str, extract_assignments: 
                 match &mut assignments {
                     // First Projection encountered: real UPDATE assignments.
                     None => assignments = Some(extract_assignments_from_projection(proj)),
-                    // Nested Projection (DataFusion CSE introduces one that defines
-                    // `__common_expr_*`). Inline its aliases into our assignments so
-                    // references to those synthetic columns resolve when we evaluate
-                    // physical exprs against the bare table schema below.
+                    // Nested Projection (DataFusion CSE defines `__common_expr_*`).
+                    // Inline its aliases so those synthetic refs resolve against
+                    // the bare table schema below.
                     Some(existing) => inline_projection_aliases(proj, existing)?,
                 }
                 current_plan = proj.input.as_ref();
             }
             LogicalPlan::Filter(filter) => {
                 // AND-merge, never overwrite: the walk may already hold the
-                // cross-side conjunct pulled from `join.filter` above (e.g. the
-                // enrichment guard `NOT (o.hashes @> ARRAY[u.tag])`), and the
-                // optimizer pushes the target-side filter BELOW the join —
-                // overwriting here silently dropped the guard, so every
-                // enrichment pass re-appended full-row versions for every
-                // matched span, tagged or not (unbounded write amplification;
-                // prod 2026-08-03).
+                // cross-side conjunct pulled from `join.filter` above, and the
+                // optimizer pushes the target-side filter BELOW the join.
+                // Overwriting silently drops that guard.
                 project_id = extract_project_id_from_expr(&filter.predicate).unwrap_or(project_id);
                 predicate = Some(predicate.take().map_or_else(|| filter.predicate.clone(), |existing| existing.and(filter.predicate.clone())));
                 current_plan = filter.input.as_ref();
             }
             LogicalPlan::Join(join) if extract_assignments => {
-                // `UPDATE ... FROM` lowers to a `Join` whose left or right side
-                // scans the target table. Detect which side is target; the other
-                // is the source to materialize.
                 if source_plan.is_some() {
                     return Err(DataFusionError::NotImplemented("UPDATE with multiple FROM sources (chained joins) is not supported".to_string()));
                 }
@@ -375,12 +308,9 @@ fn extract_dml_info(input: &LogicalPlan, table_name: &str, extract_assignments: 
                     return Err(DataFusionError::NotImplemented(format!("UPDATE ... FROM with {:?} join is not supported (only INNER)", join.join_type)));
                 }
                 let (target_side, source_side, keys) = identify_target_side(join, table_name)?;
-                // DataFusion stores cross-side conditions (e.g. user wrote
-                // `NOT (o.hashes @> ARRAY[u.tag])`) in `join.filter` rather
-                // than the surrounding `Filter`. Pull it into the predicate
-                // path so the Delta MergeBuilder AND-s it into the join key
-                // expression, and the MemBuffer hash-join evaluates it
-                // against the widened batch.
+                // Cross-side conditions live in `join.filter`, not the
+                // surrounding `Filter`; pull them into the predicate path so
+                // both backends still evaluate them.
                 if let Some(jf) = &join.filter {
                     predicate = Some(predicate.take().map_or_else(|| jf.clone(), |existing| existing.and(jf.clone())));
                 }
@@ -388,8 +318,6 @@ fn extract_dml_info(input: &LogicalPlan, table_name: &str, extract_assignments: 
                 current_plan = target_side;
             }
             LogicalPlan::SubqueryAlias(alias) => {
-                // Aliases on the source subquery (e.g. `FROM (...) AS u`) wrap
-                // the inner plan; descend through them transparently.
                 current_plan = alias.input.as_ref();
             }
             LogicalPlan::TableScan(scan) => {
@@ -399,9 +327,8 @@ fn extract_dml_info(input: &LogicalPlan, table_name: &str, extract_assignments: 
                 break;
             }
             other => {
-                // Unknown node — Window/Subquery/Union/etc. Fall through the first
-                // input; warn so a missing predicate/project_id below is traceable
-                // to a plan shape this extractor doesn't understand.
+                // Unknown node: descend the first input and warn, so a missing
+                // predicate/project_id is traceable to an unhandled plan shape.
                 warn!(target: "dml", node = ?std::mem::discriminant(other), "extract_dml_info: unhandled LogicalPlan node, descending first child — predicate/project_id extraction may be incomplete");
                 match other.inputs().first() {
                     Some(input) => current_plan = input,
@@ -414,16 +341,10 @@ fn extract_dml_info(input: &LogicalPlan, table_name: &str, extract_assignments: 
     if project_id.is_empty() {
         return Err(DataFusionError::Plan(format!("{} requires a project_id filter in WHERE clause", if extract_assignments { "UPDATE" } else { "DELETE" })));
     }
-    // Columns are IMMUTABLE by default, and the read path pushes filters on them
-    // below the merge-on-read dedup on that basis — sound only while every
-    // version of a row agrees on their value. An UPDATE assigning an undeclared
-    // column would break that silently and at read time, surfacing a stale
-    // version that matches a predicate the winning version does not. Refuse at
-    // plan time so the declaration is enforced rather than trusted.
-    //
-    // The tiebreak and tombstone are exempt: `stamp_version` rewrites the
-    // tiebreak on every append and a delete appends a tombstone row, so both are
-    // mutable by construction and already excluded from the pushdown.
+    // Columns are IMMUTABLE by default and the read path pushes filters on them
+    // below the merge-on-read dedup on that basis, so assigning an undeclared
+    // column must be refused at plan time. The tiebreak and tombstone are exempt:
+    // both are mutable by construction and excluded from that pushdown.
     if let Some(assigned) = assignments.as_ref()
         && let Some(schema) = crate::schema::get_schema(table_name).filter(|schema| schema.version_append)
     {
@@ -446,7 +367,7 @@ fn extract_dml_info(input: &LogicalPlan, table_name: &str, extract_assignments: 
 /// Walk a [`LogicalPlan`] tree until we hit a `TableScan`. Returns the matched
 /// scan's qualified name or `None` if no scan is reachable.
 fn find_table_scan_name(plan: &LogicalPlan) -> Option<String> {
-    // Iterative BFS rather than recursion: plan trees can be arbitrarily deep and Rust has no TCO.
+    // Iterative BFS, not recursion: plan trees can be arbitrarily deep.
     let mut q = VecDeque::from([plan]);
     while let Some(p) = q.pop_front() {
         if let LogicalPlan::TableScan(scan) = p {
@@ -460,7 +381,7 @@ fn find_table_scan_name(plan: &LogicalPlan) -> Option<String> {
 /// Given a `Join` and the target table name, decide which child is the target
 /// (the side that scans the target table) and extract equi-join key pairs in
 /// `(target_col_name, source_col_name)` order.
-#[allow(clippy::type_complexity)] // Tuple shape is the natural result of "(target, source, key_pairs)" and a named type would be one-shot.
+#[allow(clippy::type_complexity)]
 fn identify_target_side<'a>(join: &'a Join, target_table_name: &str) -> Result<(&'a LogicalPlan, &'a LogicalPlan, Vec<(String, String)>)> {
     let left_scan = find_table_scan_name(&join.left);
     let right_scan = find_table_scan_name(&join.right);
@@ -494,13 +415,9 @@ fn identify_target_side<'a>(join: &'a Join, target_table_name: &str) -> Result<(
     Ok((target_side, source_side, join_keys))
 }
 
-/// Pull a bare column name (drop any table qualifier) from an `Expr::Column`.
-/// Unwraps `Alias`, `Cast`, and `TryCast` — DataFusion's logical planner often
-/// inserts an implicit cast on join keys when the two sides have slightly
-/// different types (e.g. `Utf8` vs `Utf8View`), which is irrelevant for the
-/// purposes of identifying which target column the join key resolves to.
-/// Returns `None` for any other expression shape, which propagates as a clean
-/// "not supported" error to the caller.
+/// Pull a bare column name (dropping any table qualifier) from an `Expr::Column`,
+/// unwrapping `Alias`/`Cast`/`TryCast` (the planner inserts implicit casts on
+/// join keys). `None` for any other expression shape.
 fn expr_to_bare_col(expr: &Expr) -> Option<String> {
     match expr {
         Expr::Column(c) => Some(c.name.clone()),
@@ -511,9 +428,8 @@ fn expr_to_bare_col(expr: &Expr) -> Option<String> {
     }
 }
 
-/// Materialize an [`UpdateSourcePlan`] into a single [`RecordBatch`] by running
-/// the source plan as a regular DataFusion query and concatenating the streamed
-/// batches. Errors if the source exceeds [`MAX_UPDATE_SOURCE_ROWS`].
+/// Run an [`UpdateSourcePlan`] and concatenate its batches into one
+/// [`RecordBatch`]. Errors if the source exceeds [`MAX_UPDATE_SOURCE_ROWS`].
 async fn materialize_source(planner: &DefaultPhysicalPlanner, session_state: &SessionState, sp: UpdateSourcePlan) -> Result<UpdateSource> {
     let started = Instant::now();
     let phys = planner.create_physical_plan(&sp.plan, session_state).await?;
@@ -521,8 +437,8 @@ async fn materialize_source(planner: &DefaultPhysicalPlanner, session_state: &Se
     let schema = phys.schema();
     let task_ctx = Arc::new(TaskContext::from(session_state));
 
-    // The source plan may be multi-partition; stream each in turn (lazily, one at
-    // a time) and cap as we go so an oversized source never fully materializes.
+    // Stream partitions lazily and cap as we go, so an oversized source never
+    // fully materializes.
     let (total_rows, batches) = futures::stream::iter((0..phys.properties().partitioning.partition_count()).map(|p| phys.execute(p, task_ctx.clone())))
         .try_flatten()
         .try_fold((0usize, Vec::new()), |(rows, mut acc), batch| async move {
@@ -589,9 +505,9 @@ fn map_columns(expr: Expr, context: &'static str, mut rewrite: impl FnMut(&Colum
     .map_err(exec_err(context))
 }
 
-/// Inline aliases from a nested (CSE) Projection into the existing UPDATE assignment
-/// exprs. Without this, refs like `__common_expr_1` survive into mem_buffer's physical
-/// expr evaluation against the bare table schema and fail with "Column not found".
+/// Inline aliases from a nested (CSE) Projection into the UPDATE assignment
+/// exprs; otherwise refs like `__common_expr_1` reach physical evaluation
+/// against the bare table schema and fail with "Column not found".
 fn inline_projection_aliases(proj: &datafusion::logical_expr::Projection, assignments: &mut [(String, Expr)]) -> Result<()> {
     let subs: HashMap<&str, &Expr> = proj
         .expr
@@ -619,8 +535,7 @@ pub struct DmlExec {
     project_id: String,
     predicate: Option<Expr>,
     assignments: Vec<(String, Expr)>,
-    /// Materialized source for `UPDATE ... FROM`. When `Some`, dispatch
-    /// routes to [`perform_update_with_source`] / [`perform_delta_merge_update`].
+    /// Materialized source for `UPDATE ... FROM`; `Some` selects the merge path.
     #[debug(skip)]
     source: Option<UpdateSource>,
     #[debug(skip)]
@@ -654,23 +569,6 @@ impl DmlExec {
             input.properties().boundedness,
         ));
         Self { op_type, table_name, project_id, predicate: None, assignments: vec![], source: None, input, database, buffered_layer: None, session, properties }
-    }
-
-    pub fn predicate(mut self, predicate: Option<Expr>) -> Self {
-        self.predicate = predicate;
-        self
-    }
-    pub fn assignments(mut self, assignments: Vec<(String, Expr)>) -> Self {
-        self.assignments = assignments;
-        self
-    }
-    pub fn source(mut self, source: Option<UpdateSource>) -> Self {
-        self.source = source;
-        self
-    }
-    pub fn buffered_layer(mut self, layer: Option<Arc<BufferedWriteLayer>>) -> Self {
-        self.buffered_layer = layer;
-        self
     }
 }
 
@@ -720,15 +618,12 @@ impl ExecutionPlan for DmlExec {
     #[instrument(name = "dml.execute", skip_all, fields(operation = self.op_type.as_ref(), table.name = %self.table_name, project_id = %self.project_id, has_predicate = self.predicate.is_some(), rows.affected = Empty))]
     fn execute(&self, _partition: usize, _context: Arc<TaskContext>) -> Result<SendableRecordBatchStream> {
         let span = tracing::Span::current();
-        // DataFusion's standard DML output schema: a single UInt64 "count"
-        // column. The pgwire layer's dml_completion reads exactly this shape
-        // to build the CommandComplete tag — any other name/type silently
-        // reports "UPDATE 0" to clients regardless of rows affected.
+        // DataFusion's standard DML output schema: one UInt64 "count" column.
+        // The pgwire CommandComplete tag reads exactly this shape — any other
+        // name/type silently reports "UPDATE 0" to clients.
         let schema = Arc::new(Schema::new(vec![Field::new("count", DataType::UInt64, false)]));
         let schema_clone = schema.clone();
 
-        // One clone of the (Arc-backed) plan instead of nine field clones; the
-        // future must own everything it touches.
         let this = self.clone();
 
         let future = async move {
@@ -738,18 +633,10 @@ impl ExecutionPlan for DmlExec {
                 &table_name,
                 histogram_dml_scope(predicate.as_ref(), &assignments, source.as_ref().map(|source| source.schema.as_ref())),
             );
-            // A merge-on-read table re-appends every affected row through
-            // `insert_records_batch`, which already invalidates each date those
-            // rows land in — and the append carries each row's ORIGINAL
-            // timestamp, so those are exactly the dates that changed, whatever
-            // the predicate looked like. Invalidating here as well can only be
-            // broader, never more precise.
-            //
-            // The exception is a statement that ASSIGNS `timestamp`: the row
-            // moves to a new date, the append invalidates only the new one, and
-            // the old partition is left holding coverage for a version that is
-            // now superseded. `invalidate_rollup_dml` falls back to the
-            // source-wide wipe for exactly that case.
+            // A merge-on-read append already invalidates the dates its rows land
+            // in, so invalidating here would only be broader — except when the
+            // statement ASSIGNS `timestamp`, which moves rows to a new date and
+            // leaves the old partition covering a superseded version.
             if !is_version_append(&table_name) || assignments.iter().any(|(column, _)| column == "timestamp") {
                 database.invalidate_rollup_dml(&project_id, &table_name, predicate.as_ref(), &assignments)?;
             }
@@ -784,12 +671,11 @@ struct DmlContext<'a> {
 }
 
 impl DmlContext<'_> {
-    /// `delta_op` is a closure (not a bare Future) so its body — which may
-    /// acquire a write lock and call `update_state` — is only constructed
-    /// when there is committed data to operate on. It receives the
-    /// watermark-clamped predicate (see [`delta_leg_predicate`]), computed
-    /// here so no DML path can run a Delta leg with an unclamped window or
-    /// a pre-`await_inflight_flushes` watermark.
+    /// `delta_op` is a closure, not a bare Future, so its body is only
+    /// constructed when there is committed data. It receives the
+    /// watermark-clamped predicate (see [`delta_leg_predicate`]), computed here
+    /// so no DML path can run a Delta leg with an unclamped window or a
+    /// pre-`await_inflight_flushes` watermark.
     async fn execute<F, G, Fut>(self, mem_op: F, delta_op: G) -> Result<u64>
     where
         F: FnOnce(&BufferedWriteLayer, Option<&Expr>) -> Result<u64>,
@@ -816,25 +702,20 @@ impl DmlContext<'_> {
             mem_rows
         );
 
-        // Order the Delta leg AFTER any airborne flush commit of this table:
-        // a commit snapshotted before the mem leg above lands PRE-DML row
-        // values, and only a Delta merge/delete that runs after it can
-        // correct them (critical for DELETE — the removed rows have nothing
-        // left in memory to supersede the stale copies). Also makes the
-        // has_committed check below see a table whose first-ever commit was
-        // airborne when this statement arrived.
+        // The Delta leg must run AFTER any in-flight flush commit: a flush
+        // snapshotted before the mem leg lands PRE-DML values that only the
+        // Delta leg can correct. It also makes the has_committed check below
+        // see a table whose first-ever commit was still airborne.
         if let Some(layer) = self.buffered_layer {
             let started = Instant::now();
             layer.await_inflight_flushes(self.project_id, self.table_name).await;
             log_slow_phase("await_inflight_flush", self.table_name, self.project_id, started, None);
         }
 
-        // Check if there's committed data: either in custom project tables or unified tables.
-        // The unified-tables lookup intentionally uses table_name only (no project_id):
-        // unified tables are shared across all default projects, so a hit here means "some
-        // project has committed data in this table", not "this project has". The delta_op's
-        // predicate already includes `project_id = $self.project_id`, so we never delete or
-        // update another project's rows — at worst we issue a Delta scan that matches nothing.
+        // The unified-tables lookup intentionally ignores project_id: unified
+        // tables are shared, so a hit means "some project has committed data
+        // here". Tenant isolation comes from delta_op's predicate, which always
+        // carries `project_id = …`.
         let has_committed = {
             let custom_tables = self.database.custom_project_tables().read().await;
             let unified_tables = self.database.unified_tables().read().await;
@@ -851,11 +732,9 @@ impl DmlContext<'_> {
     }
 }
 
-/// Debug-format `value` into at most ~`limit` bytes, discarding output past
-/// the cap instead of materializing it first — a 40k-row IN-list predicate
-/// debug-prints to ~50MB, and building that string on the DV-merge failure
-/// path (i.e. during overload) broke OTLP export for the whole process
-/// (2026-07-26 incident).
+/// Debug-format `value` into at most ~`limit` bytes, discarding output past the
+/// cap instead of materializing it first — a large IN-list predicate
+/// debug-prints to tens of MB.
 pub(crate) fn fmt_capped(value: &dyn std::fmt::Debug, limit: usize) -> String {
     struct Trunc {
         buf: String,
@@ -879,19 +758,12 @@ pub(crate) fn fmt_capped(value: &dyn std::fmt::Debug, limit: usize) -> String {
     w.buf
 }
 
-/// Watermark-clamp a Delta leg's predicate (see
-/// `dml::clamp_to_watermark`): rows above the flush watermark are
-/// buffer-only, so the mem leg already updated them and the flush persists
-/// their post-DML values. `None` means the whole window is unflushed and the
-/// Delta leg can be skipped outright.
+/// Watermark-clamp a Delta leg's predicate: rows above the flush watermark are
+/// buffer-only, so the mem leg already updated them. `None` means the whole
+/// window is unflushed and the Delta leg can be skipped.
 ///
-/// Called only from `DmlContext::execute`, after its `await_inflight_flushes`:
-/// a flush snapshotted before the mem leg commits PRE-DML values that only
-/// the Delta leg can correct, and that flush raises the watermark before
-/// committing — so only a post-await watermark is guaranteed to sit
-/// at-or-above every row whose Delta copy might be stale. Clamping with an
-/// earlier watermark would cut exactly those rows out of the merge and lose
-/// the update.
+/// Must be called only AFTER `await_inflight_flushes`: an earlier watermark
+/// would clamp away rows whose Delta copy is still stale, losing the update.
 fn delta_leg_predicate(buffered_layer: Option<&Arc<BufferedWriteLayer>>, table_name: &str, project_id: &str, predicate: Option<&Expr>) -> Option<Option<Expr>> {
     let time_col = crate::dml::table_time_column(table_name);
     let base: Option<Expr> = match buffered_layer {
@@ -908,18 +780,14 @@ fn delta_leg_predicate(buffered_layer: Option<&Arc<BufferedWriteLayer>>, table_n
             }
         }
     };
-    // Derive `date`-partition bounds from the (watermark-clamped) time-column
-    // predicate so the Delta leg prunes files instead of scanning every
-    // partition — only for tables actually partitioned by `date`.
+    // Derive `date`-partition bounds from the clamped time-column predicate so
+    // the Delta leg prunes files instead of scanning every partition.
     let partitions_by_date = crate::schema::get_schema(table_name).is_some_and(|s| s.partitions.iter().any(|p| p == "date"));
     Some(match base {
         Some(p) if partitions_by_date => {
             let augmented = crate::read::optimizers::time_range_partition_pruner::with_date_partition_filters(p, time_col);
-            // Diagnostic for the 2026-07-20 residual full-scans. One compact line
-            // per merge: `days` is the span the derived `date` bounds cover.
-            // Correlate with ScanMetadataCompleted.predicate_filtered:
-            //   days=0 (empty)  → shape gap, timestamp→date derivation missed it;
-            //   days large      → legit wide time-window, nothing to prune.
+            // `days` is the span the derived `date` bounds cover: 0 means the
+            // timestamp→date derivation found nothing to prune with.
             let bounds = crate::read::optimizers::time_range_partition_pruner::extract_date_bounds(&augmented);
             let day_span = bounds.iter().map(|(_, d)| *d).minmax().into_option().map_or(0, |(lo, hi)| hi - lo + 1);
             info!(project_id, table_name, date_bounds = bounds.len(), days = day_span, "DML delta-leg date-partition bounds");
@@ -929,35 +797,23 @@ fn delta_leg_predicate(buffered_layer: Option<&Arc<BufferedWriteLayer>>, table_n
     })
 }
 
-/// Aliases the merge-on-read plan gives its two sides. The source alias matches
-/// `perform_delta_merge_update`'s so [`requalify_for_merge`] serves both paths;
-/// the target keeps the TABLE NAME because the statement's predicate and
-/// assignments were planned against it and may still carry that qualifier.
+/// Source-side alias of the merge-on-read plan. The target side keeps the TABLE
+/// NAME, because the statement's predicate and assignments were planned against
+/// it and may still carry that qualifier.
 const MOR_SOURCE: &str = "source";
 
-/// Merge-on-read DML (`docs/plans/2026-08-01-merge-on-read-dml.md`). On a
-/// `version_append` table an UPDATE/DELETE rewrites NOTHING: it resolves its
-/// target rows through the normal routed read path — mem ∪ hot ∪ delta, already
-/// version-collapsed by `DedupExec` — evaluates the `SET` expressions against
-/// them, and appends the results as new row versions.
-/// [`BufferedWriteLayer::insert`] stamps a fresh monotonic `dedup_tiebreak`
-/// (`insert_coerce::stamp_version`) on the way through, so the appended version
-/// outranks every older copy at read time. No Delta MERGE, no deletion vector,
-/// no OCC retry, and — because nothing existing changes — no hot-tier
-/// invalidation.
+/// Merge-on-read DML. On a `version_append` table an UPDATE/DELETE rewrites
+/// NOTHING: it reads its target rows through the routed (already
+/// version-collapsed) read path, evaluates the `SET` exprs, and appends the
+/// results as new row versions. `insert_records_batch` stamps a fresh monotonic
+/// `dedup_tiebreak`, so the appended version outranks every older copy at read
+/// time. DELETE appends the same FULL row with the schema's `tombstone_column`
+/// set — a key-only stub could not satisfy the table's NOT NULL columns.
 ///
-/// DELETE appends the same FULL row with the schema's `tombstone_column` set,
-/// not a key-only stub: the row has just been read anyway, a stub could not
-/// satisfy the table's NOT NULL columns, and the read side keys off the marker
-/// alone.
-///
-/// STREAMED, not collected. Rows are appended in scan-sized chunks, so an
-/// UPDATE over a wide window costs one batch of memory rather than the whole
-/// match set — the 2026-07-04 `update_with_source` OOM shape. The trade is
-/// statement atomicity: a failure partway leaves the versions already appended
-/// in place. That is sound under merge-on-read (each is a COMPLETE row version,
-/// never a half-written row) and the client sees the error and retries, which
-/// re-appends them idempotently.
+/// Streamed, not collected: an UPDATE over a wide window costs one batch of
+/// memory. The trade is statement atomicity — a partial failure leaves the
+/// already-appended versions in place, which is sound because each is a
+/// complete row version and a retry re-appends them idempotently.
 #[allow(clippy::too_many_arguments)]
 async fn perform_version_append(
     database: &Arc<Database>, layer: Option<&Arc<BufferedWriteLayer>>, table_name: &str, project_id: &str, predicate: Option<Expr>,
@@ -972,32 +828,24 @@ async fn perform_version_append(
         crate::schema::get_schema(table_name).ok_or_else(|| DataFusionError::Execution(format!("merge-on-read: no registered schema for {table_name}")))?;
     let tombstone_col = schema.tombstone_column.clone();
     if tombstone && tombstone_col.is_none() {
-        // `version_append` is documented to require all three columns; a DELETE
-        // with nowhere to write the marker would silently delete nothing.
+        // Without a marker column a DELETE would silently delete nothing.
         return Err(DataFusionError::Execution(format!("merge-on-read: {table_name} sets version_append but declares no tombstone_column")));
     }
     let table_schema = schema.schema_ref();
 
     // The routing provider IS the logical table: it unions MemBuffer, the hot
-    // tier and Delta, prunes by the predicate's project/time bounds, and runs
-    // DedupExec — so the rows we read are already the current versions.
+    // tier and Delta and runs DedupExec, so the rows read are current versions.
     let provider =
         Arc::new(crate::database::ProjectRoutingTable::new(project_id.to_string(), database.clone(), table_schema.clone(), None, table_name.to_string()));
-    // `project_id` is STRIPPED from the DML predicate (it is routing
-    // information, consumed by `extract_dml_info`), so it must be put back as a
-    // row filter here. Routing alone is not tenant isolation: every default
-    // project shares ONE unified Delta table, so without this conjunct an
-    // UPDATE scoped to one tenant rewrites the matching rows of every tenant in
-    // that table. It also prunes, which is why the in-place Delta leg
-    // re-augments its own predicate the same way.
+    // `project_id` is stripped from the DML predicate by `extract_dml_info`, so
+    // it must be put back as a row filter: routing alone is not tenant
+    // isolation, since every default project shares ONE unified Delta table.
     let tenant = Expr::Column(Column::from_name("project_id")).eq(lit(project_id));
     let source_cols: HashSet<String> = source.map(|s| s.schema.fields().iter().map(|f| f.name().clone()).collect()).unwrap_or_default();
-    // The predicate splits at the join: a conjunct referencing any source
-    // column (the enrichment guard `NOT (hashes @> ARRAY[u.tag])`) can only be
-    // evaluated on the joined row, while target-only conjuncts (tenant, time
-    // bounds) belong on the scan where they prune. Dropping the source-side
-    // conjuncts instead of deferring them un-guards the UPDATE — every pass
-    // then re-appends versions for every matched row (prod 2026-08-03).
+    // The predicate splits at the join: conjuncts referencing a source column
+    // can only be evaluated on the joined row, target-only conjuncts belong on
+    // the scan where they prune. Source-side conjuncts must be DEFERRED, never
+    // dropped — dropping them un-guards the UPDATE.
     let (pre_join, post_join): (Vec<Expr>, Vec<Expr>) = predicate
         .as_ref()
         .map(|p| split_conjunction(p).into_iter().cloned().partition(|c| !c.column_refs().iter().any(|col| source_cols.contains(&col.name))))
@@ -1006,13 +854,9 @@ async fn perform_version_append(
     let mut builder = LogicalPlanBuilder::scan(table_name, provider_as_source(provider), None)?.filter(filter)?;
 
     if let Some(src) = source {
-        // The join keys never prune the scan on their own — the equi-join
-        // matches AFTER every row in the window is decoded. Pushing the
-        // source's key values down as IN-lists engages the parquet bloom
-        // filters on exactly these columns and shrinks the scan from "whole
-        // window, all columns" to the matched pages. Sound: join-key target
-        // columns are identity columns, never version-mutable. Skipped above
-        // a cap so a giant source can't build a pathological expression.
+        // The equi-join matches only AFTER the whole window is decoded, so push
+        // the source key values down as IN-lists to engage the parquet bloom
+        // filters. Sound because join-key target columns are never mutable.
         if src.batch.num_rows() <= MOR_KEY_PUSHDOWN_ROWS {
             builder = src.join_keys.iter().try_fold(builder, |builder, (t, s)| {
                 let arr = src.batch.column(src.schema.index_of(s)?);
@@ -1035,9 +879,9 @@ async fn perform_version_append(
         }
     }
 
-    // Full-row versions: every column is carried forward, with the assignments
-    // (and the tombstone marker) substituted in place. The version stamp is
-    // deliberately NOT set here — `insert` owns it.
+    // Full-row versions: every column carried forward with the assignments (and
+    // tombstone marker) substituted in. The version stamp is deliberately NOT
+    // set here — `insert` owns it.
     let exprs = table_schema
         .fields()
         .iter()
@@ -1054,8 +898,8 @@ async fn perform_version_append(
         .collect::<Result<Vec<_>>>()?;
     let plan = builder.project(exprs)?.build()?;
 
-    // `session` is already `delta_session_from(...)`: default analyzer rules
-    // only, so Variant columns round-trip as raw Structs instead of being
+    // `session` must be a `delta_session_from(...)` one: default analyzer rules
+    // only, so Variant columns round-trip as raw Structs rather than being
     // wrapped in `variant_to_json` for the wire and re-parsed on the way back.
     let physical = session.create_physical_plan(&plan).await?;
     let mut stream = datafusion::physical_plan::execute_stream(physical, session.task_ctx())?;
@@ -1066,13 +910,10 @@ async fn perform_version_append(
             continue;
         }
         rows += batch.num_rows() as u64;
-        // Marked before the write, and through the SAME funnel every other
-        // write uses — `insert_records_batch` is what stamps the version
-        // (`insert_coerce::stamp_version`) and routes to the buffered layer
-        // when there is one. Appending via `BufferedWriteLayer::insert`
-        // directly skips the stamp, and every version of a row then ties on the
-        // tiebreak, which keep-greatest resolves ARBITRARILY: five successive
-        // updates read back as the first one.
+        // Must go through `insert_records_batch`: that is what stamps the
+        // version. Appending via `BufferedWriteLayer::insert` directly skips the
+        // stamp, and every version then ties on the tiebreak, which
+        // keep-greatest resolves arbitrarily.
         let batches = vec![batch];
         if let Some(l) = layer {
             l.mark_version_buckets(project_id, table_name, &batches);
@@ -1086,10 +927,9 @@ async fn perform_version_append(
     Ok(rows)
 }
 
-/// Merge-on-read is a per-table property of the SCHEMA alone. It must not also
-/// depend on a buffered layer being attached: a table that appends versions on
-/// one deployment and mutates in place on another would resolve versions
-/// differently for the same data.
+/// Merge-on-read is a property of the SCHEMA alone — never also of whether a
+/// buffered layer is attached, or the same data would resolve differently
+/// across deployments.
 fn is_version_append(table_name: &str) -> bool {
     crate::schema::get_schema(table_name).is_some_and(|s| s.version_append)
 }
@@ -1100,27 +940,19 @@ async fn perform_update_with_buffer(
     assignments: Vec<(String, Expr)>, source: Option<UpdateSource>, session: Arc<dyn Session>, span: &tracing::Span,
 ) -> Result<u64> {
     // Merge-on-read tables take neither leg: one append supersedes the row
-    // wherever it lives, so there is no mem/Delta split to coordinate.
-    //
-    // Same-key source rows still need SUCCESSIVE rounds, for a reason specific
-    // to versioning: `stamp_version` issues ONE stamp per batch, so two source
-    // rows for the same key applied in a single append become two versions
-    // sharing a tiebreak — and keep-greatest resolves a tie ARBITRARILY, so the
-    // last write silently loses (the enrichment worker's same-key multi-tag
-    // pattern, prod 2026-07-19). One round per key occurrence gives each
-    // version its own strictly greater stamp, which is what makes
-    // last-write-wins hold.
+    // wherever it lives. Same-key source rows still need SUCCESSIVE rounds —
+    // `stamp_version` issues one stamp per batch, so two versions of a key in
+    // one append tie on the tiebreak and keep-greatest breaks the tie
+    // arbitrarily, silently losing the last write.
     if is_version_append(table_name) {
         let append_span = tracing::trace_span!(parent: span, "mor.update");
-        // `split_source_rounds` preserves successive applications for duplicate
-        // keys. Keys are disjoint within each round, so bounded sequential
-        // chunks preserve semantics and keep pushdown enabled.
+        // Keys are disjoint within a round, so chunking a round is semantics-
+        // preserving and keeps key pushdown enabled.
         let chunks: Vec<Option<UpdateSource>> = match source {
             Some(src) => crate::dml::split_source_rounds(src)?.into_iter().flat_map(|round| bounded_mor_source_chunks(round).into_iter().map(Some)).collect(),
             None => vec![None],
         };
         let mut total = 0u64;
-        // Sequential awaits accumulating with `?`: ordered and fallible.
         for chunk in chunks {
             total += perform_version_append(database, buffered_layer, table_name, project_id, predicate.clone(), &assignments, chunk.as_ref(), false, &session)
                 .instrument(append_span.clone())
@@ -1129,16 +961,15 @@ async fn perform_update_with_buffer(
         return Ok(total);
     }
 
-    // `UPDATE ... FROM` path: MemBuffer takes the join via update_with_source,
-    // Delta path uses MergeBuilder via perform_delta_merge_update — either
-    // synchronously or deferred through the coalescer when enabled.
+    // `UPDATE ... FROM`: MemBuffer joins via update_with_source, Delta via
+    // MergeBuilder — synchronously, or deferred through the coalescer.
     if let Some(src) = source {
         let coalescer = database.dml_coalescer().cloned();
         // `async move` must not take the Vec itself — the mem closure borrows it.
         let assignments = &assignments;
         // Same-key source rows must be applied in successive rounds: one MERGE
         // can't match a target row against two source rows, and the MemBuffer
-        // hash-join would keep only one — silently dropping the rest.
+        // hash-join would keep only one.
         let mut total = 0u64;
         for round in crate::dml::split_source_rounds(src)? {
             let src_for_mem = round.clone();
@@ -1164,8 +995,6 @@ async fn perform_update_with_buffer(
     }
 
     let update_span = tracing::trace_span!(parent: span, "delta.update");
-    // The delta closure body is only constructed (and assignments only
-    // cloned) when there is committed data. Mem path borrows `assignments`.
     DmlContext { database, buffered_layer, table_name, project_id, predicate }
         .execute(
             |layer, pred| layer.update(project_id, table_name, pred, &assignments),
@@ -1196,16 +1025,13 @@ async fn perform_delete_with_buffer(
     session: Arc<dyn Session>, span: &tracing::Span,
 ) -> Result<u64> {
     // Merge-on-read: a DELETE appends a tombstone version instead of planning a
-    // Delta delete + deletion vector (see `perform_version_append`).
+    // Delta delete + deletion vector.
     if is_version_append(table_name) {
         let append_span = tracing::trace_span!(parent: span, "mor.delete");
         return perform_version_append(database, buffered_layer, table_name, project_id, predicate, &[], None, true, &session).instrument(append_span).await;
     }
 
     let delete_span = tracing::trace_span!(parent: span, "delta.delete");
-    // The clamp applies to deletes too: rows above the flush watermark were
-    // removed from the buffer by the mem leg and will never flush, so Delta
-    // has nothing to do.
     DmlContext { database, buffered_layer, table_name, project_id, predicate }
         .execute(
             |layer, pred| layer.delete(project_id, table_name, pred),
@@ -1215,25 +1041,15 @@ async fn perform_delete_with_buffer(
 }
 
 /// Perform Delta UPDATE operation
-#[instrument(
-    name = "delta.perform_update",
-    skip_all,
-    fields(
-        table.name = %table_name,
-        project_id = %project_id,
-        has_predicate = predicate.is_some(),
-        assignments_count = assignments.len(),
-        rows.updated = Empty,
-    )
-)]
+#[instrument(name = "delta.perform_update", skip_all, fields(table.name = %table_name, project_id = %project_id, has_predicate = predicate.is_some(), assignments_count = assignments.len(), rows.updated = Empty))]
 pub async fn perform_delta_update(
     database: &Database, table_name: &str, project_id: &str, predicate: Option<Expr>, assignments: Vec<(String, Expr)>, session: Arc<dyn Session>,
 ) -> Result<u64> {
     info!("Performing Delta UPDATE on table {} for project {}", table_name, project_id);
 
     let span = tracing::Span::current();
-    // Clone captures per attempt: the operation may rerun after an OCC conflict.
-    // zstd tier for the rewrite: without it the UpdateBuilder writes SNAPPY.
+    // Captures are cloned per attempt: the operation reruns after an OCC
+    // conflict. Explicit writer properties because the builder defaults to SNAPPY.
     let writer_properties = database.dml_writer_properties(table_name, false);
     let use_dv = database.config().maintenance.timefusion_use_deletion_vectors;
     perform_delta_operation(database, table_name, project_id, |delta_table| {
@@ -1259,21 +1075,12 @@ pub async fn perform_delta_update(
 }
 
 /// Perform Delta DELETE operation
-#[instrument(
-    name = "delta.perform_delete",
-    skip_all,
-    fields(
-        table.name = %table_name,
-        project_id = %project_id,
-        has_predicate = predicate.is_some(),
-        rows.deleted = Empty,
-    )
-)]
+#[instrument(name = "delta.perform_delete", skip_all, fields(table.name = %table_name, project_id = %project_id, has_predicate = predicate.is_some(), rows.deleted = Empty))]
 pub async fn perform_delta_delete(database: &Database, table_name: &str, project_id: &str, predicate: Option<Expr>, session: Arc<dyn Session>) -> Result<u64> {
     info!("Performing Delta DELETE on table {} for project {}", table_name, project_id);
 
     let span = tracing::Span::current();
-    // zstd tier for the rewrite: without it the DeleteBuilder writes SNAPPY.
+    // Explicit writer properties: the DeleteBuilder otherwise writes SNAPPY.
     let writer_properties = database.dml_writer_properties(table_name, false);
     let use_dv = database.config().maintenance.timefusion_use_deletion_vectors;
     perform_delta_operation(database, table_name, project_id, |delta_table| {
@@ -1296,21 +1103,18 @@ pub async fn perform_delta_delete(database: &Database, table_name: &str, project
 }
 
 /// Max attempts for a DML Delta operation that loses an OCC race (e.g. a flush
-/// commit landing mid-merge). Backoff mirrors the flush/optimize paths.
+/// commit landing mid-merge).
 const DML_MAX_ATTEMPTS: usize = 4;
 
-/// Common Delta operation logic. Runs the operation on a snapshot clone with
-/// NO table lock held — the exclusive lock used to be held across
-/// update_state → merge → swap, convoying every reader and insert commit
-/// behind each multi-second UPDATE. Like the flush path, we commit
-/// optimistically and take the write lock only for a version-guarded swap;
-/// OCC conflicts (concurrent flush commit) are retried on a fresh snapshot.
+/// Common Delta operation logic. Runs `operation` on a snapshot clone with NO
+/// table lock held — holding it across the merge would convoy every reader and
+/// insert commit behind a multi-second UPDATE — then takes the write lock only
+/// for a version-guarded swap. OCC conflicts retry on a fresh snapshot.
 async fn perform_delta_operation<F, Fut>(database: &Database, table_name: &str, project_id: &str, operation: F) -> Result<u64>
 where
     F: Fn(deltalake::DeltaTable) -> Fut,
     Fut: std::future::Future<Output = Result<(deltalake::DeltaTable, u64)>>,
 {
-    // Use resolve_table which routes to unified or custom table based on storage config
     let table_lock = database
         .resolve_table(project_id, table_name)
         .await
@@ -1321,7 +1125,6 @@ where
 
     let mut attempt = 0;
     loop {
-        // Refresh via clone-update-swap (write lock held for the swap only).
         crate::database::refresh_table_snapshot(&table_lock, database.incremental_snapshot()).await.map_err(exec_err("Failed to refresh table state"))?;
         let snapshot = { table_lock.read().await.clone() };
         let pre_version = snapshot.version();
@@ -1330,11 +1133,9 @@ where
                 if attempt > 0 {
                     crate::observability::record_dml_retry_success();
                 }
-                // A merge matching zero rows commits nothing — same table back,
+                // A merge matching zero rows commits nothing and leaves the
                 // version unchanged: skip persist + swap entirely.
                 if new_table.version() > pre_version {
-                    // Persist so boot replays only post-commit log, same as the
-                    // insert/maintenance paths.
                     database.persist_snapshot(&new_table);
                     let mut guard = table_lock.write().await;
                     if new_table.version() > guard.version() {
@@ -1388,19 +1189,11 @@ fn requalify_for_merge(expr: Expr, source_cols: &HashSet<String>, source_alias: 
 
 /// Keep only the conjuncts of `predicate` that reference none of `strip_cols`,
 /// for use as the DV merge's file-pruning `target_predicate`. `strip_cols` holds
-/// the source columns AND the equi-key TARGET columns, because neither class can
-/// prune target files and both break the fork's file-skipping scan:
-///   - equi-key equalities (`o.context___span_id = u.span_id`) and `NOT (... @> u.tag)`
-///     reference SOURCE columns the file scan has no schema for;
-///   - the optimizer inserts `IsNotNull(o.context___span_id)` null-rejection on
-///     the join keys — TARGET-only, so it survived a source-only strip, but the
-///     high-cardinality key isn't in the stats schema, so the file-skipping scan
-///     fails to resolve it ("No field named otel_logs_and_spans.context___span_id",
-///     dropping ~1000 rows/drop after 3 retries — prod 2026-07-20).
-///
-/// The join_predicate still enforces the equi-keys and their non-null-ness, so
-/// dropping these from the file-pruning predicate is sound (pruning is only an
-/// optimization). Columns matched by NAME, per [`requalify_for_merge`]'s convention.
+/// the source columns AND the equi-key TARGET columns: neither can prune target
+/// files and both break the file-skipping scan (source columns aren't in the file
+/// schema; high-cardinality equi-keys aren't in the stats schema). Sound because
+/// the join_predicate still enforces the equi-keys — pruning is only an
+/// optimization. Columns matched by NAME, per [`requalify_for_merge`]'s convention.
 fn strip_source_conjuncts(predicate: &Expr, strip_cols: &HashSet<String>) -> Option<Expr> {
     split_conjunction(predicate).into_iter().filter(|c| !c.column_refs().iter().any(|col| strip_cols.contains(&col.name))).cloned().reduce(Expr::and)
 }
@@ -1415,9 +1208,8 @@ fn dv_strip_cols(source_cols: &HashSet<String>, join_keys: &[(String, String)], 
 }
 
 /// Build the join predicate that drives the merge: a conjunction of
-/// `target.k_i = source.k_i` clauses for each equi-key pair, AND-ed with the
-/// optional user predicate (which gets routed through [`requalify_for_merge`]
-/// so the user's source/target aliases resolve under `MergeBuilder`'s).
+/// `target.k_i = source.k_i` clauses AND-ed with the optional user predicate,
+/// routed through [`requalify_for_merge`].
 fn build_join_predicate(
     target_alias: &str, source_alias: &str, join_keys: &[(String, String)], extra: Option<&Expr>, source_cols: &HashSet<String>,
 ) -> Result<Expr> {
@@ -1434,39 +1226,25 @@ fn build_join_predicate(
 }
 
 /// Perform Delta UPDATE ... FROM via [`deltalake::operations::merge::MergeBuilder`]
-/// with only a `WHEN MATCHED THEN UPDATE` clause. The materialized
-/// `UpdateSource.batch` becomes the merge source DataFrame; `join_keys` lower
-/// to a conjunctive equi-join predicate; the user's WHERE predicate is AND-ed
-/// in after re-qualification under the `target` alias.
-#[instrument(
-    name = "delta.perform_merge_update",
-    skip_all,
-    fields(
-        table.name = %table_name,
-        project_id = %project_id,
-        has_predicate = predicate.is_some(),
-        assignments_count = assignments.len(),
-        source_rows = source.batch.num_rows(),
-        rows.updated = Empty,
-    )
-)]
+/// with only a `WHEN MATCHED THEN UPDATE` clause: `UpdateSource.batch` is the
+/// merge source, `join_keys` lower to a conjunctive equi-join predicate, and the
+/// user's WHERE predicate is AND-ed in after re-qualification.
+#[instrument(name = "delta.perform_merge_update", skip_all, fields(table.name = %table_name, project_id = %project_id, has_predicate = predicate.is_some(), assignments_count = assignments.len(), source_rows = source.batch.num_rows(), rows.updated = Empty))]
 pub async fn perform_delta_merge_update(
     database: &Database, table_name: &str, project_id: &str, predicate: Option<Expr>, assignments: Vec<(String, Expr)>, source: UpdateSource,
     session: Arc<dyn Session>,
 ) -> Result<u64> {
     info!("Performing Delta MERGE-UPDATE on table {} for project {} ({} source rows)", table_name, project_id, source.batch.num_rows());
 
-    // Gate concurrent merges: each scans the time-windowed target to hash-join
-    // keys; ungated bursts of per-project drains stampede a CPU-throttled box and
-    // starve read queries (prod 2026-07-19). Held across the OCC retry loop.
+    // Gate concurrent merges (each hash-joins against the time-windowed target);
+    // held across the OCC retry loop.
     let _merge_permit = database.dml_merge_sem().acquire().await.map_err(exec_err("dml merge semaphore closed"))?;
 
     let span = tracing::Span::current();
     let source_cols: HashSet<String> = source.schema.fields().iter().map(|f| f.name().clone()).collect();
 
-    // Re-qualify assignments before moving into the closure so the user's
-    // source/target aliases address `MergeBuilder`'s `source` / `target`
-    // (the predicate is re-qualified inside `build_join_predicate`).
+    // Re-qualify assignments so the user's aliases address `MergeBuilder`'s
+    // `source` / `target` (the predicate is re-qualified in `build_join_predicate`).
     let assignments = assignments
         .into_iter()
         .map(|(col_name, expr)| Ok((col_name, requalify_for_merge(expr, &source_cols, "source", "target")?)))
@@ -1477,24 +1255,18 @@ pub async fn perform_delta_merge_update(
     let use_dv = database.config().maintenance.timefusion_use_deletion_vectors;
 
     perform_delta_operation(database, table_name, project_id, |delta_table| {
-        // RecordBatch clones are Arc-backed (cheap); needed since the
-        // operation may rerun after an OCC conflict.
+        // Cloned per attempt: the closure reruns on OCC conflict.
         let (source_batch, source_schema, join_keys, source_cols) =
             (source.batch.clone(), source.schema.clone(), source.join_keys.clone(), source_cols.clone());
         let (predicate, assignments, session) = (predicate.clone(), assignments.clone(), session.clone());
-        // Cloned per attempt (the closure reruns on OCC conflict).
         let writer_properties = writer_properties.clone();
         async move {
             let join_pred = build_join_predicate("target", "source", &join_keys, predicate.as_ref(), &source_cols)?;
 
             // Merge-on-read: append only the updated matched rows and mask the
-            // originals with a DV instead of rewriting whole matched files (the
-            // enrichment-MERGE OOM hotspot). Assignments/join_pred already address
-            // the target/source aliases the DV op scans under.
+            // originals with a DV instead of rewriting whole matched files.
             if use_dv {
                 use deltalake::operations::merge_dv::{MergeDvUpdate, merge_update_with_deletion_vectors};
-                // The equi-key target cols carry the optimizer's IsNotNull(join-key)
-                // conjuncts the fork's stats scan can't resolve — prod drop bug.
                 let partition_cols = crate::schema::get_schema(table_name).map(|s| s.partitions.clone()).unwrap_or_default();
                 let strip_cols = dv_strip_cols(&source_cols, &join_keys, &partition_cols);
                 let target_predicate = predicate.as_ref().and_then(|p| strip_source_conjuncts(p, &strip_cols));
@@ -1512,31 +1284,21 @@ pub async fn perform_delta_merge_update(
                         target_alias: "target".to_string(),
                         source_alias: "source".to_string(),
                         writer_properties: Some(writer_properties),
-                        // Sort the appended rows by the table's sort keys so the
-                        // file's footer can declare them. Unsorted, ONE such
-                        // file disables the reader's all-or-nothing footer
-                        // ordering for the whole partition — measured on prod
-                        // 2026-08-01, a 1-row DML file cost a tenant its top-N
-                        // pushdown while its other 24 files were all sorted.
-                        // Enrichment writes these continuously, so compaction
-                        // cannot sweep them faster than they arrive.
+                        // Sort appended rows by the table's sort keys so the footer
+                        // can declare them: ONE unsorted file disables the reader's
+                        // all-or-nothing footer ordering for the whole partition.
                         append_sort_by: crate::schema::get_schema(table_name)
                             .map(|s| s.sorting_columns.iter().map(|c| (c.name.clone(), c.descending, c.nulls_first)).collect())
                             .unwrap_or_default(),
-                        // Sound here and only here: every perform_delta_merge_update
-                        // caller ran the mem leg first (DmlContext::execute), so
+                        // Sound only because every caller ran the mem leg first, so
                         // concurrently flushed rows already carry post-DML values.
                         tolerate_concurrent_appends: database.config().maintenance.timefusion_dml_merge_append_rebase,
                     },
                 )
                 .await
                 .map_err(|e| {
-                    // Diagnostic for the prod "No field named …context___span_id" DV
-                    // merge drops (2026-07-20): local repro couldn't trigger it, so
-                    // capture the exact predicate shape from prod on failure.
-                    // Truncated: a large source (40k-row IN lists) debug-printed
-                    // here produced 50MB span events that broke OTLP export for
-                    // the whole process during the 2026-07-26 incident.
+                    // Capped on purpose: debug-printing a large source here produced
+                    // span events big enough to break OTLP export process-wide.
                     warn!(
                         error = %e,
                         join_predicate = %fmt_capped(&join_pred, 4096),
@@ -1548,9 +1310,8 @@ pub async fn perform_delta_merge_update(
                 });
             }
 
-            // Wrap the materialized source RecordBatch as a DataFrame. The
-            // throwaway SessionContext only provides the DataFrame builder; merge
-            // execution uses the session passed via `with_session_state`.
+            // The throwaway SessionContext only provides the DataFrame builder;
+            // merge execution uses the session passed via `with_session_state`.
             let source_df =
                 datafusion::prelude::SessionContext::new().read_batch(source_batch).map_err(exec_err("Failed to wrap UPDATE FROM source as DataFrame"))?;
 
@@ -1572,54 +1333,7 @@ pub async fn perform_delta_merge_update(
     .inspect(|rows| {
         span.record("rows.updated", rows);
     })
-    // Diagnostic for the still-unreproduced "No field named ...context___span_id"
-    // schema failures (prod 2026-07-19): dump the exact predicates + keys so the
-    // next occurrence pins the plan shape that leaks a column into the scan.
     .inspect_err(|e| warn!(target: "dml", "Delta MERGE-UPDATE failed for {project_id}/{table_name} keys={:?}: {e}", source.join_keys))
-}
-
-#[cfg(test)]
-mod session_tests {
-    use std::sync::Arc;
-
-    use datafusion::arrow::{array::StringArray, record_batch::RecordBatch};
-
-    /// The DML session must decode the wide otel schema at the same batch size
-    /// as every other session that reads it.
-    ///
-    /// A MERGE-UPDATE re-reads and rewrites WHOLE wide rows, so it is the most
-    /// decode-expensive read in the system, and decode buffers cost
-    /// `batch_size × row width` with none of it pool-accounted. The query and
-    /// maintenance sessions were cut to 2048 by the 2026-08-07 heap work; this
-    /// one kept DataFusion's 8192 default, and a dump taken mid-burst on
-    /// 2026-08-13 put 38.3 GiB — 57% of live heap — back in the very stack that
-    /// work had cut. A default that differs by session is invisible until it is
-    /// measured in a heap profile, so pin it.
-    #[test]
-    fn the_dml_session_decodes_wide_rows_at_the_shared_batch_size() {
-        let base = datafusion::execution::session_state::SessionStateBuilder::new().with_default_features().build();
-        let want: usize = crate::database::WIDE_ROW_DECODE_BATCH_SIZE.parse().expect("the shared constant is a number");
-        // The inherited default is the bug: assert the session actually moves
-        // off it, so this cannot pass by coincidence if DataFusion's default
-        // ever happens to equal ours.
-        assert!(base.config().options().execution.batch_size > want, "DataFusion's default is the wider batch this fix exists to override");
-        let session = super::delta_session_from(&base);
-        assert_eq!(session.config().options().execution.batch_size, want, "a DML rewrite must not decode at a wider batch than a query does");
-    }
-
-    #[test]
-    fn large_mor_sources_stay_inside_the_key_pushdown_bound() {
-        let rows = super::MOR_KEY_PUSHDOWN_ROWS * 2 + 17;
-        let batch = RecordBatch::try_from_iter(vec![("span_id", Arc::new(StringArray::from_iter_values((0..rows).map(|i| format!("span-{i}")))) as _)])
-            .expect("source batch");
-        let schema = batch.schema();
-        let chunks = super::bounded_mor_source_chunks(super::UpdateSource { batch, schema, join_keys: vec![("context___span_id".into(), "span_id".into())] });
-
-        assert_eq!(chunks.iter().map(|chunk| chunk.batch.num_rows()).sum::<usize>(), rows);
-        assert_eq!(chunks.len(), 3);
-        assert!(chunks.iter().all(|chunk| chunk.batch.num_rows() <= super::MOR_KEY_PUSHDOWN_ROWS));
-        assert_eq!(chunks[2].batch.num_rows(), 17);
-    }
 }
 
 #[cfg(test)]
@@ -1635,8 +1349,8 @@ mod strip_tests {
         names.iter().map(|s| s.to_string()).collect()
     }
 
-    /// Catalog of the real predicate shapes, named so a case can say which
-    /// conjuncts go in and exactly which come back out.
+    /// Named predicate shapes, so a case can say which conjuncts go in and which
+    /// come back out.
     fn conjunct(name: &str) -> Expr {
         match name {
             "project_eq" => col("project_id").eq(lit("p1")),
@@ -1660,15 +1374,9 @@ mod strip_tests {
         Some(names.iter().copied().filter(|n| stripped.contains(&format!("{}", conjunct(n)))).collect())
     }
 
-    // Case 1 is the prod hash-enrichment shape: project_id + timestamp bounds
-    // (target-only) AND-ed with the equi-key equality and the NOT(@> u.tag)
-    // cross-filter, both of which reference source columns.
     #[test_case(&["span_id", "trace_id", "tag"], &["project_eq", "ts_gt", "equi_key", "cross_filter"] => Some(vec!["project_eq", "ts_gt"]) ; "source referencing conjuncts dropped target only kept")]
-    // Prod 2026-07-20 drop bug: the optimizer inserts IsNotNull(o.context___span_id)
-    // null-rejection on the join keys. It's TARGET-only (survives a source-only
-    // strip) but the high-cardinality key isn't in the stats schema, so the fork's
-    // file-skipping scan fails to resolve it. strip_cols includes the equi-key
-    // TARGET columns so these conjuncts are dropped from the file-pruning predicate.
+    // The optimizer's IsNotNull(join-key) conjuncts are TARGET-only but unresolvable
+    // by the stats scan, so the equi-key target columns must also be stripped.
     #[test_case(&["span_id", "trace_id", "tag", "context___span_id", "context___trace_id"], &["date_ge", "ts_gt", "isnotnull_span", "isnotnull_trace"] => Some(vec!["date_ge", "ts_gt"]) ; "isnotnull on equi key target columns stripped prunable conjuncts kept")]
     #[test_case(&["span_id"], &["equi_key"] => None ; "all source conjuncts strips to none")]
     fn strips_source_referencing_conjuncts(strip_cols: &[&'static str], pred: &[&'static str]) -> Option<Vec<&'static str>> {
@@ -1697,40 +1405,27 @@ mod strip_tests {
 }
 
 // ===== dml_coalescer =====
-// Deferred, batched Delta legs for `UPDATE ... FROM` (DML coalescing), plus
-// the flush-watermark predicate clamp shared with the synchronous DML path.
-//
-// Why: one Delta MERGE commit per statement (monoscope's hash tagging runs
-// ~1.4k/hr) starves OPTIMIZE via OCC conflicts, accumulates small files, and
-// pays a full copy-on-write parquet rewrite per handful of rows. The mem-leg
-// (synchronous MemBuffer mutation, WAL-backed) already gives read-your-writes
-// through the scan overlay, so the Delta leg is pure durability convergence —
-// it can be deferred and batched.
+// Deferred, batched Delta legs for `UPDATE ... FROM`, plus the flush-watermark
+// predicate clamp shared with the synchronous DML path. The mem leg already
+// gives read-your-writes, so the Delta leg is pure durability convergence.
 //
 // Grouping: statements coalesce when (project, table, join keys, assignments,
-// non-time residual predicate, source schema) all match; per-statement
-// timestamp-range conjuncts are widened to the union window. Same-key source
-// rows with different payloads (e.g. two tags for one span) cannot share one
-// MERGE (Delta forbids duplicate source matches), so the drained batch splits
-// into ordered rounds — round N holds each key's Nth occurrence.
+// non-time residual predicate, source schema) all match; timestamp-range
+// conjuncts are widened to the union window.
 //
-// Contract (see `d_dml_coalesce_secs`): deferred statements must be
-// idempotent under re-application. A row flushed between the mem leg and the
-// drain sees the assignment applied twice, and a failed drain retries whole
-// groups (including rounds that already committed).
+// CONTRACT: deferred statements must be idempotent under re-application — a row
+// flushed between the mem leg and the drain sees the assignment applied twice,
+// and a failed drain retries whole groups including already-committed rounds.
 //
-// Durability: the mem leg WAL-appends `UpdateWithSource` before enqueue, so
-// buffer-resident rows survive a crash with their post-DML values. What a
-// crash CAN lose is the deferred Delta leg for rows that were already in
-// Delta when the statement ran — bounded by the drain interval.
+// A crash can lose the deferred Delta leg for rows that were already in Delta
+// when the statement ran (bounded by the drain interval); buffer-resident rows
+// survive via the mem leg's WAL append.
 //
-// A group that exhausts `MAX_DRAIN_ATTEMPTS` is **parked**, not dropped: its
-// rows go to `<wal_dir>/quarantine/dml` as Arrow IPC + a `.meta` sidecar
-// (`timefusion.dml.coalesce_quarantined`). Dropping was unrecoverable — the
-// Delta leg targets rows already flushed out of the buffer, so there is no
-// newer copy to converge from and read-side dedup (first-seen-wins) cannot
-// repair it. `timefusion.dml.coalesce_dropped` now means the *quarantine
-// write itself* failed, i.e. genuine loss.
+// A group that exhausts `MAX_DRAIN_ATTEMPTS` is parked, not dropped, under
+// `<wal_dir>/quarantine/dml` (Arrow IPC + `.meta` sidecar): the Delta leg targets
+// rows already flushed out of the buffer, so there is no newer copy and read-side
+// dedup cannot repair it. `timefusion.dml.coalesce_dropped` means the quarantine
+// write ITSELF failed, i.e. genuine loss.
 
 use std::{
     collections::{BTreeMap, hash_map::Entry},
@@ -1763,11 +1458,9 @@ const MAX_QUEUED_SOURCE_ROWS: usize = 1_000_000;
 const MAX_DRAIN_ATTEMPTS: u32 = 3;
 
 /// Max source rows fed to a single Delta MERGE. `MAX_QUEUED_SOURCE_ROWS` only
-/// *notifies* a drain, so a group can grow past it unbounded — on 2026-07-27
-/// one reached 1_252_311 rows (7457 statements) and every MERGE attempt died
-/// with "Resources exhausted", costing the whole group. Rounds are therefore
-/// chunked: many bounded merges instead of one unbounded one. Each chunk is an
-/// independent commit, which the idempotence contract already permits.
+/// *notifies* a drain, so a group can grow past it unbounded; chunking rounds
+/// bounds per-merge memory. Each chunk is an independent commit, which the
+/// idempotence contract permits.
 const MAX_MERGE_ROWS: usize = 100_000;
 
 /// Zero-copy slices of `batch` of at most `max` rows, covering every row once.
@@ -1782,14 +1475,9 @@ fn merge_sources<'a>(rounds: &'a [RecordBatch], schema: &'a SchemaRef, join_keys
 }
 
 /// Persist a terminally-failed group's source rows as an Arrow IPC file plus a
-/// `.meta` sidecar, so the Delta leg can be re-driven instead of lost.
-///
-/// Before this existed the terminal branch logged and dropped: 2026-07-27
-/// 04:42Z lost 1_252_311 enrichment rows that way. The loss is permanent
-/// without a sidecar — the mem leg already applied, and the Delta leg is
-/// watermark-clamped to rows that have *already* flushed and left the buffer,
-/// so Delta keeps stale pre-DML values with no newer copy anywhere (read-side
-/// dedup is first-seen-wins and cannot repair it).
+/// `.meta` sidecar, so the Delta leg can be re-driven instead of lost. Dropping
+/// instead is permanent: the Delta leg targets rows already flushed out of the
+/// buffer, so no newer copy exists and read-side dedup cannot repair it.
 ///
 /// Returns false when nothing could be persisted; the caller must then keep
 /// the loud error path, because the rows are genuinely gone.
@@ -1798,8 +1486,8 @@ fn quarantine_group(dir: &std::path::Path, key: &GroupKey, group: &PendingGroup,
         error!("dml quarantine: cannot create {dir:?}: {e}");
         return false;
     }
-    // Schema drift is itself a quarantine reason (concat failure), so keep
-    // only what this IPC file can actually hold and say so if any are left.
+    // Schema drift is itself a quarantine reason, so keep only what this IPC
+    // file can hold and report any left over.
     let (writable, rejected): (Vec<&RecordBatch>, Vec<&RecordBatch>) = batches.iter().partition(|b| b.schema() == group.schema);
     if writable.is_empty() {
         error!(
@@ -1823,10 +1511,9 @@ fn quarantine_group(dir: &std::path::Path, key: &GroupKey, group: &PendingGroup,
         return false;
     };
 
-    // Arrow IPC (not raw bytes): self-describing schema, so a re-drive needs
-    // only the sidecar for the merge shape. Streamed straight to the file —
-    // buffering a multi-GB group in a Vec first risks OOM at the exact moment
-    // memory exhaustion is what brought us here.
+    // Arrow IPC (self-describing schema, so a re-drive needs only the sidecar for
+    // the merge shape), streamed straight to the file: buffering the group in a
+    // Vec first risks OOM at the moment memory exhaustion is what brought us here.
     if let Err(e) = datafusion::arrow::ipc::writer::FileWriter::try_new(std::io::BufWriter::new(file), &group.schema)
         .and_then(|mut w| writable.iter().try_for_each(|b| w.write(b)).and_then(|()| w.finish()))
     {
@@ -1853,9 +1540,8 @@ fn quarantine_group(dir: &std::path::Path, key: &GroupKey, group: &PendingGroup,
     error!("dml quarantine: parked {}/{} ({rows} rows) at {path:?}: {reason}", key.project_id, key.table_name);
     crate::observability::record_dml_coalesce_quarantined();
     if !rejected.is_empty() {
-        // Partially parked is partially LOST — the skipped batches have no
-        // other copy. Page on it, or the recoverable-looking quarantine metric
-        // would mask real loss.
+        // Partially parked is partially LOST — the skipped batches have no other
+        // copy, so page on it rather than let the quarantine metric mask it.
         let (skipped, lost) = (rejected.len(), rejected.iter().copied().map(RecordBatch::num_rows).sum::<usize>());
         crate::observability::record_dml_coalesce_dropped();
         error!("dml quarantine: {skipped} schema-mismatched batch(es) for {}/{} could NOT be parked — {lost} rows LOST", key.project_id, key.table_name);
@@ -1903,10 +1589,9 @@ pub(crate) struct TimeBound {
 }
 
 /// A predicate split into at most one lower / one upper bound on the time
-/// column plus everything else verbatim. Extracting only the first bound per
-/// direction is always sound: the reconstruction conjoins residual + bounds,
-/// so the predicate is preserved exactly — extra time conjuncts just live in
-/// `residual` and block cross-statement grouping via the fingerprint.
+/// column plus everything else verbatim. Only the first bound per direction is
+/// extracted; extra time conjuncts stay in `residual`, so reconstruction
+/// preserves the predicate exactly.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct DecomposedPredicate {
     pub residual: Vec<Expr>,
@@ -1963,8 +1648,7 @@ impl DecomposedPredicate {
 
 /// Union-widen two bounds on the same side: for lowers keep the smaller
 /// value, for uppers the larger; on equal values inclusive wins. Values that
-/// don't compare (mixed types) widen to the safest available — the caller's
-/// fingerprint makes this near-impossible, but never tighten on uncertainty.
+/// don't compare (mixed types) widen — never tighten on uncertainty.
 fn widen_bound(a: TimeBound, b: &TimeBound, lower: bool) -> TimeBound {
     match a.value.partial_cmp(&b.value) {
         Some(std::cmp::Ordering::Equal) => TimeBound { inclusive: a.inclusive || b.inclusive, value: a.value },
@@ -1975,11 +1659,9 @@ fn widen_bound(a: TimeBound, b: &TimeBound, lower: bool) -> TimeBound {
 }
 
 /// Drain-time merge window. The Delta MERGE hash-join builds against every
-/// target row in the predicate's time window regardless of source chunking,
-/// so join memory ∝ window width — 2026-07-30 union-window drains (~1h)
-/// reserved 2.5+ GB per merge and exhausted the 10 GB pool, and k chunks paid
-/// k full scans of the whole window. Bucketing statements by their own bounds
-/// keeps each merge's target side ∝ bucket, not burst.
+/// target row in the predicate's time window regardless of source chunking, so
+/// join memory ∝ window width; bucketing statements by their own bounds keeps
+/// each merge's target side ∝ bucket, not ∝ the burst's union window.
 const DML_MERGE_BUCKET_MICROS: i64 = 5 * 60 * 1_000_000;
 
 /// A statement's own time bounds, captured at enqueue (the group predicate is
@@ -1987,11 +1669,9 @@ const DML_MERGE_BUCKET_MICROS: i64 = 5 * 60 * 1_000_000;
 type StmtBounds = (Option<TimeBound>, Option<TimeBound>);
 type BoundBatch = (RecordBatch, StmtBounds);
 
-/// Timestamp scalar → microseconds (inverse of [`watermark_scalar`]).
 /// The `DML_MERGE_BUCKET_MICROS` bucket span a statement's window covers, or
-/// None when a side is unbounded or non-timestamp (those statements share one
-/// catch-all unit). Spanning statements keep their full window — the span key
-/// just puts same-span statements together; it never narrows anything.
+/// None when a side is unbounded or non-timestamp (those share one catch-all
+/// unit). The span key only groups statements; it never narrows a window.
 fn bounds_span(b: &StmtBounds) -> Option<(i64, i64)> {
     let lo = scalar_micros(&b.0.as_ref()?.value)?;
     let up = b.1.as_ref()?;
@@ -2003,7 +1683,7 @@ fn bounds_span(b: &StmtBounds) -> Option<(i64, i64)> {
 /// Split a drained group into per-time-bucket merge units: each unit keeps the
 /// group's shape (residual, keys, assignments, attempts) but narrows the time
 /// window to the union of only its own statements' bounds. Single-bucket
-/// groups pass through untouched — exactly today's one-merge-unit behavior.
+/// groups pass through untouched.
 fn bucket_group(mut group: PendingGroup) -> Vec<PendingGroup> {
     // BTreeMap, not `into_group_map`'s HashMap: bucket order decides merge and
     // commit order, which must not vary run to run.
@@ -2071,9 +1751,8 @@ pub(crate) enum WatermarkClamp {
 }
 
 /// Clamp `predicate`'s time window to rows that can exist in Delta: rows with
-/// `time_col > watermark` were never handed to a Delta commit (the watermark
-/// is raised before every commit and persisted with it), so the upper bound
-/// tightens to the watermark — and when even the lower bound is above it, the
+/// `time_col > watermark` were never handed to a Delta commit, so the upper
+/// bound tightens to the watermark, and when the lower bound is above it the
 /// Delta leg skips entirely. Predicates without a literal time bound pass
 /// through untouched (no type template to clamp against).
 pub(crate) fn clamp_to_watermark(predicate: Option<&Expr>, time_col: &str, watermark_micros: i64) -> WatermarkClamp {
@@ -2091,9 +1770,8 @@ enum ClampAction {
     Skip,
 }
 
-/// Shared clamp core over a decomposed predicate (used by both the
-/// synchronous path above and the coalescer drain, which clamps the widened
-/// window at drain time — the watermark only rises, so later is tighter).
+/// Shared clamp core over a decomposed predicate. The watermark only rises, so
+/// clamping later (at drain time) is always at least as tight.
 fn clamp_decomposed(d: &mut DecomposedPredicate, watermark_micros: i64) -> ClampAction {
     let Some(wm) = d.lower.as_ref().or(d.upper.as_ref()).and_then(|b| watermark_scalar(&b.value, watermark_micros)) else {
         return ClampAction::Unchanged;
@@ -2120,9 +1798,8 @@ fn clamp_decomposed(d: &mut DecomposedPredicate, watermark_micros: i64) -> Clamp
 
 /// Split an [`UpdateSource`] into merge rounds so no single leg sees duplicate
 /// join keys: the Delta MERGE rejects a source that matches a target row twice,
-/// and the MemBuffer hash-join would silently keep only one match — dropping the
-/// rest (prod 2026-07-19: same-key multi-tag hash enrichment lost tags / errored).
-/// Returns one round for the common no-duplication case.
+/// and the MemBuffer hash-join would silently keep only one match. Returns one
+/// round for the common no-duplication case.
 pub(crate) fn split_source_rounds(source: UpdateSource) -> Result<Vec<UpdateSource>> {
     Ok(split_rounds_on_keys(&source.batch, &source.join_keys)?
         .into_iter()
@@ -2147,9 +1824,9 @@ fn split_rounds(batch: &RecordBatch, key_indices: &[usize]) -> Result<Vec<Record
     let key_rows = RowConverter::new(fields(&key_cols))?.convert_columns(&key_cols)?;
     let full_rows = RowConverter::new(fields(batch.columns()))?.convert_columns(batch.columns())?;
 
-    // Imperative by necessity: the round assignment carries borrowed dedup
-    // state across rows. Row views are bound first so the byte-slice keys can
-    // borrow from them across the loop — no per-row heap copies.
+    // Imperative by necessity: the round assignment carries borrowed dedup state
+    // across rows, and the row views must outlive the byte-slice keys borrowing
+    // from them. An iterator chain cannot express these borrows.
     let full_row_views: Vec<_> = (0..batch.num_rows()).map(|i| full_rows.row(i)).collect();
     let key_row_views: Vec<_> = (0..batch.num_rows()).map(|i| key_rows.row(i)).collect();
     let mut seen_full: HashSet<&[u8]> = HashSet::new();
@@ -2178,10 +1855,8 @@ fn split_rounds(batch: &RecordBatch, key_indices: &[usize]) -> Result<Vec<Record
 }
 
 /// Delta's DV MERGE rejects a source that matches one target row twice.
-/// `split_rounds` should prevent it, yet prod groups still hit it (2026-07-28..30,
-/// root cause open) — so on that error, bisect: halve the source and merge each
-/// half. Single rows cannot multi-match, so recursion always terminates, the
-/// data lands, and the log narrows down the offending key pair.
+/// `split_rounds` should prevent it; on that error anyway, halve the source and
+/// merge each half. A single row cannot multi-match, so recursion terminates.
 pub(crate) fn merge_bisect<'a>(
     db: &'a crate::database::Database, table_name: &'a str, project_id: &'a str, predicate: Option<Expr>, assignments: Vec<(String, Expr)>,
     source: UpdateSource, session: Arc<dyn Session>,
@@ -2207,9 +1882,8 @@ pub(crate) fn merge_bisect<'a>(
 }
 
 /// Re-drive parked `quarantine/dml/*` groups (hash-enrichment shape only; see
-/// [`parse_quarantine_meta`]). Rebuilds the merge from the sidecar, replays it
-/// through round-splitting + [`merge_bisect`], and moves recovered pairs into
-/// `<dir>/redriven/`. Returns `(recovered, skipped)`.
+/// [`parse_quarantine_meta`]), moving recovered pairs into `<dir>/redriven/`.
+/// Returns `(recovered, skipped)`.
 pub async fn redrive_dml_quarantine(db: &Arc<crate::database::Database>, dir: &std::path::Path, dry_run: bool) -> (usize, usize) {
     use datafusion::logical_expr::{col, in_list};
     let Ok(rd) = std::fs::read_dir(dir) else {
@@ -2217,9 +1891,8 @@ pub async fn redrive_dml_quarantine(db: &Arc<crate::database::Database>, dir: &s
         return (0, 0);
     };
     let ctx = db.clone().create_session_context();
-    // Variant columns: the pgwire-facing session reads them as Utf8View, which
-    // the DV-merge write leg cannot cast back to Struct{metadata,value}. Use
-    // the same variant-safe session the interactive DML path hands to merges.
+    // The pgwire-facing session reads Variant columns as Utf8View, which the
+    // DV-merge write leg cannot cast back; use the variant-safe DML session.
     let session: Arc<dyn Session> = crate::dml::delta_session_from(&ctx.state());
     let redriven = dir.join("redriven");
     let (mut ok, mut skipped) = (0usize, 0usize);
@@ -2250,16 +1923,13 @@ pub async fn redrive_dml_quarantine(db: &Arc<crate::database::Database>, dir: &s
                 continue;
             }
         };
-        // Predicate: same shape the group was parked with. Bare column names —
-        // requalification in the merge routes them (project_id binds to the
-        // source side, which the join equates with the target's anyway).
+        // Predicate: same shape the group was parked with, with bare column
+        // names — requalification in the merge routes them.
         //
-        // WINDOW SLICING: the merge hash-join builds against every target row
-        // in the predicate window — independent of source chunking — and a
-        // burst group's full window exhausted a 24 GB pool (2026-07-30,
-        // HashJoinInput 3.7 GB × several partitions). Each target row lies in
-        // exactly one time slice, so merging the SAME source against each
-        // slice is semantically identical with join memory ÷ slices.
+        // Window slicing: the merge hash-join builds against every target row in
+        // the predicate window. Each target row lies in exactly one time slice,
+        // so merging the SAME source against each slice is semantically
+        // identical with join memory ÷ slices.
         let tz: Arc<str> = Arc::from("UTC");
         let (ts_upper, upper_incl) = meta.ts_upper;
         let slices = (meta.rows / 150_000).clamp(1, 32) as i64;
@@ -2286,9 +1956,8 @@ pub async fn redrive_dml_quarantine(db: &Arc<crate::database::Database>, dir: &s
                 (lo, hi, if i + 1 == slices { upper_incl } else { false })
             })
             .collect();
-        // Rebuilt equivalents of the two parked shapes (no empty-list literal
-        // needed): scalar `tag` → append-or-singleton; list `new_hashes` →
-        // take-or-concat.
+        // Rebuilt equivalents of the two parked shapes: scalar `tag` →
+        // append-or-singleton; list `new_hashes` → take-or-concat.
         let assignment = if meta.list_source {
             datafusion::logical_expr::when(col("hashes").is_null(), col("new_hashes"))
                 .otherwise(datafusion::functions_nested::expr_fn::array_concat(vec![col("hashes"), col("new_hashes")]))
@@ -2318,8 +1987,8 @@ pub async fn redrive_dml_quarantine(db: &Arc<crate::database::Database>, dir: &s
                 continue;
             }
         };
-        // Recovery bypasses SQL DML and can replay several projects and slices.
-        // Keep their capture fences until the entire replay finishes or fails.
+        // Recovery bypasses SQL DML and can replay several projects and slices:
+        // hold their capture fences until the whole replay finishes or fails.
         let _histogram_guards: Vec<_> =
             meta.projects.iter().map(|project| db.histogram_dml_guard(project, &meta.table_name, crate::database::HistogramDmlScope::All)).collect();
         // Sequential awaits with `?`: the first failed slice leaves the group parked.
@@ -2450,32 +2119,31 @@ struct PendingGroup {
     /// Statement batches, each with its own time bounds so the drain can
     /// bucket by window ([`bucket_group`]).
     batches: Vec<BoundBatch>,
-    /// Freshest enqueuing statement's session — keeps the drain's function
-    /// registry identical to what the synchronous merge would have used.
+    /// Freshest enqueuing statement's session, so the drain's function registry
+    /// matches what the synchronous merge would have used.
     session: Arc<dyn Session>,
     attempts: u32,
     /// `Some(projects)` marks a drain-time cross-project fold (see
     /// `fold_groups`): batches carry an appended `project_id` column, the
-    /// residual carries a `project_id IN (...)` filter, and the watermark
-    /// clamp must use the MAX watermark across these projects (a row is
-    /// provably buffer-only only when it is unflushed for EVERY member).
+    /// residual carries a `project_id IN (...)` filter, and the watermark clamp
+    /// MUST use the MAX watermark across these projects — a row is provably
+    /// buffer-only only when it is unflushed for EVERY member.
     /// `None` for ordinary single-project statement groups.
     folded_projects: Option<Vec<String>>,
 }
 
 impl PendingGroup {
     fn fence_histogram(&mut self, db: &Database, key: &GroupKey, predicate: Option<&Expr>) {
-        // Folding and widening can touch gaps outside original statement ranges.
-        // Retain the effective merge scope through every retry as well.
+        // Folding and widening can touch gaps outside the original statement
+        // ranges, so fence the effective merge scope through every retry.
         let scope = histogram_dml_scope(predicate, &self.assignments, Some(self.schema.as_ref()));
         let projects = self.folded_projects.as_deref().unwrap_or_else(|| std::slice::from_ref(&key.project_id));
         self.histogram_guards.extend(projects.iter().map(|project| db.histogram_dml_guard(project, &key.table_name, scope.clone())));
     }
 }
 
-/// Hash of everything that must match exactly for two statements to share
-/// one MERGE: join keys, assignment exprs, residual predicate conjuncts
-/// (order-insensitive), and the source schema.
+/// Hash of everything that must match for two statements to share one MERGE:
+/// join keys, assignment exprs, residual conjuncts (order-insensitive), schema.
 fn shape_fingerprint(join_keys: &[(String, String)], assignments: &[(String, Expr)], residual: &[Expr], schema: &SchemaRef) -> u64 {
     let mut h = twox_hash::XxHash3_64::default();
     join_keys.hash(&mut h);
@@ -2489,10 +2157,9 @@ fn shape_fingerprint(join_keys: &[(String, String)], assignments: &[(String, Exp
     h.finish()
 }
 
-/// `project_id = '<id>'` equality conjunct, either operand order — via the
-/// canonical matcher (`extract_project_id_from_expr`) so the routing, DML
-/// extraction, and folding shapes can't drift apart. Any other shape stays in
-/// the residual and blocks folding for that group.
+/// `project_id = '<id>'` equality conjunct, either operand order. Uses the
+/// canonical matcher so routing, DML extraction and folding cannot drift apart;
+/// any other shape stays in the residual and blocks folding for that group.
 fn is_project_eq(e: &Expr, project_id: &str) -> bool {
     crate::read::optimizers::extract_project_id_from_expr(e).as_deref() == Some(project_id)
 }
@@ -2500,21 +2167,17 @@ fn is_project_eq(e: &Expr, project_id: &str) -> bool {
 /// Fold same-shape single-project groups on unified tables into one group per
 /// (table, shape): `project_id` moves from a per-group residual equality into
 /// a source column + join key + `IN (...)` partition filter, so one drain
-/// issues ONE merge (one kernel metadata scan, one OCC commit) instead of one
-/// per project. Data-scan bytes are unchanged — `project_id` is a partition
-/// column, so the folded IN-list prunes to exactly the union of the files the
-/// per-project merges would have read.
+/// issues ONE merge instead of one per project.
 ///
-/// Groups are eligible only when they carry exactly one `project_id = <own>`
-/// residual conjunct (anything else risks changing which rows the predicate
-/// matches), their source schema has no `project_id` column yet, and the
-/// project stores the table in the unified Delta table (custom-storage
-/// projects resolve to physically separate tables — never fold those).
-/// Ineligible groups and singleton buckets pass through untouched; any arrow
-/// failure while folding a bucket falls back to its unfolded members.
+/// Groups are eligible only when they carry at most one `project_id = <own>`
+/// residual conjunct (any other shape could change which rows match), their
+/// source schema has no `project_id` column yet, and the project uses the
+/// unified Delta table — custom-storage projects resolve to physically separate
+/// tables, so never fold those. Ineligible groups, singleton buckets, and
+/// buckets whose fold fails fall through unfolded.
 fn fold_groups(groups: Vec<(GroupKey, PendingGroup)>, custom_storage: &HashSet<(String, String)>) -> Vec<(GroupKey, PendingGroup)> {
-    // A fold candidate: its enqueue key/group plus the residual with the
-    // own-project equality stripped.
+    // A fold candidate: enqueue key/group plus the residual with the own-project
+    // equality stripped.
     type Member = (GroupKey, PendingGroup, Vec<Expr>);
     let is_eligible = |(key, group, stripped): &Member| {
         group.folded_projects.is_none()
@@ -2523,11 +2186,10 @@ fn fold_groups(groups: Vec<(GroupKey, PendingGroup)>, custom_storage: &HashSet<(
             && !group.join_keys.iter().any(|(t, s)| t == "project_id" || s == "project_id")
             && !custom_storage.contains(&(key.project_id.clone(), key.table_name.clone()))
     };
-    // The optimizer usually pushes `project_id = '<id>'` into the TableScan
-    // (partition column), so most predicates carry no project conjunct at all —
-    // scope rides in `key.project_id`. Strip an explicit own-project equality
-    // when present; any OTHER reference to project_id (IN, !=, expressions) is a
-    // shape we can't restate as the folded IN-list, so it stays unfolded.
+    // The optimizer usually pushes `project_id = '<id>'` into the TableScan, so
+    // most predicates carry no project conjunct and scope rides in
+    // `key.project_id`. Any OTHER reference to project_id (IN, !=, expressions)
+    // can't be restated as the folded IN-list, so it stays unfolded.
     let (candidates, ineligible): (Vec<Member>, Vec<Member>) = groups
         .into_iter()
         .map(|(key, group)| {
@@ -2568,11 +2230,10 @@ fn fold_groups(groups: Vec<(GroupKey, PendingGroup)>, custom_storage: &HashSet<(
 /// Assemble the folded group: append a constant `project_id` column to every
 /// member batch, widen the union time window, and swap the per-project
 /// equality residual for one `project_id IN (...)` filter. The folded
-/// GroupKey's fingerprint hashes the shape AND the member set, so a failed
-/// fold re-queued via `requeue` can only ever merge with a fold of the exact
-/// same members — a different member set gets a different key (mixing them
-/// would pin an older IN-list to newer members' rows and silently drop their
-/// delta legs).
+/// GroupKey's fingerprint hashes the shape AND the member set, so a re-queued
+/// fold can only merge with a fold of the exact same members — mixing member
+/// sets would pin an older IN-list to newer members' rows and silently drop
+/// their delta legs.
 fn build_folded(table_name: &str, shape_fp: u64, members: &[(GroupKey, PendingGroup, Vec<Expr>)]) -> Result<(GroupKey, PendingGroup)> {
     use datafusion::arrow::{array::StringArray, datatypes::Field};
     let (rep_key, base, stripped) = &members[0];
@@ -2637,7 +2298,7 @@ fn build_folded(table_name: &str, shape_fp: u64, members: &[(GroupKey, PendingGr
 /// Accumulates deferred `UPDATE ... FROM` Delta legs and drains them as
 /// batched merges. One instance per `Database`, created when
 /// `TIMEFUSION_DML_COALESCE_SECS > 0`.
-/// Manual format: `PendingGroup` holds an `Arc<dyn Session>`, which has no `Debug`.
+/// Manual Debug: `PendingGroup` holds an `Arc<dyn Session>`, which has no `Debug`.
 #[derive(derive_more::Debug)]
 #[debug("DmlCoalescer {{ interval_secs: {interval_secs}, queued_rows: {}, .. }}", queued_rows.load(Ordering::Relaxed))]
 pub struct DmlCoalescer {
@@ -2697,7 +2358,7 @@ impl DmlCoalescer {
         {
             let mut groups = self.groups.lock().expect("dml coalescer mutex poisoned");
             // Widening a fresh group against its own bounds is the identity, so
-            // both the new and the merging case are the same four updates.
+            // the new and the merging case share one code path.
             let g = groups.entry(key).or_insert_with(|| PendingGroup {
                 histogram_guards: Vec::new(),
                 join_keys: source.join_keys.clone(),
@@ -2749,10 +2410,8 @@ impl DmlCoalescer {
                     continue;
                 }
             }
-            // A failure in any prep step (schema drift within a
-            // fingerprint-matched group, missing join key, row conversion) is
-            // a bug, not an operational state — but the rows are still
-            // unapplied in Delta, so park them rather than drop them.
+            // A prep-step failure is a bug, not an operational state — but the
+            // rows are still unapplied in Delta, so park rather than drop them.
             let park_group = |stage: &str, e: &dyn std::fmt::Display, batches: &[RecordBatch]| {
                 if !quarantine_group(&self.quarantine_dir, &key, &group, batches, &format!("{stage} failed: {e}")) {
                     crate::observability::record_dml_coalesce_dropped();
@@ -2794,9 +2453,8 @@ impl DmlCoalescer {
             if let Err(e) = outcome {
                 group.attempts += 1;
                 if group.attempts >= MAX_DRAIN_ATTEMPTS {
-                    // Park, don't drop: the mem leg already applied and the
-                    // Delta leg targets rows no longer in the buffer, so a
-                    // dropped group is permanent divergence with no self-heal.
+                    // Park, don't drop: a dropped group is permanent divergence
+                    // with no self-heal (see `quarantine_group`).
                     let reason = format!("{} failed drains: {e}", group.attempts);
                     if !quarantine_group(&self.quarantine_dir, &key, &group, std::slice::from_ref(&merged), &reason) {
                         crate::observability::record_dml_coalesce_dropped();
@@ -2888,12 +2546,9 @@ mod tests {
         }
     }
 
-    /// The `(lo, hi)` time bounds a batch carries alongside it.
-    type BatchBounds = (Option<TimeBound>, Option<TimeBound>);
-
-    /// A `PendingGroup` with the shared defaults; callers override the fields
-    /// their case is actually about.
-    fn pending(schema: SchemaRef, predicate: DecomposedPredicate, batches: Vec<(RecordBatch, BatchBounds)>) -> PendingGroup {
+    /// A `PendingGroup` with shared defaults; callers override what their case
+    /// is about.
+    fn pending(schema: SchemaRef, predicate: DecomposedPredicate, batches: Vec<BoundBatch>) -> PendingGroup {
         PendingGroup {
             histogram_guards: Vec::new(),
             join_keys: vec![("id".into(), "id".into())],
@@ -2908,9 +2563,8 @@ mod tests {
         }
     }
 
-    /// Regression guard for the 2026-07-27 04:42Z loss: the terminal drain
-    /// branch dropped 1_252_311 enrichment rows with only an `error!`. The
-    /// rows must instead land on disk, self-describing and re-drivable.
+    /// A terminal drain failure must land the rows on disk, self-describing and
+    /// re-drivable, rather than dropping them.
     // #[serial]: asserts exact deltas on the process-global DML_STATS counters.
     #[test]
     #[serial_test::serial]
@@ -2930,8 +2584,7 @@ mod tests {
         let arrow = files.iter().find(|p| p.extension().is_some_and(|e| e == "arrow")).expect("no .arrow payload");
         let meta = std::fs::read_to_string(files.iter().find(|p| p.extension().is_some_and(|e| e == "meta")).expect("no .meta")).unwrap();
 
-        // Payload round-trips through Arrow IPC with rows intact — this is
-        // what makes a re-drive possible at all.
+        // Payload round-trips through Arrow IPC with rows intact.
         let f = std::fs::File::open(arrow).unwrap();
         let reader = datafusion::arrow::ipc::reader::FileReader::try_new(f, None).unwrap();
         let read: Vec<RecordBatch> = reader.map(|b| b.unwrap()).collect();
@@ -2948,11 +2601,9 @@ mod tests {
         assert!(arrow.parent().unwrap() == dir.path(), "payload escaped the quarantine dir");
     }
 
-    /// Two parks of the same project/table must never overwrite each other,
-    /// even under a frozen clock (e2e virtual time) — an overwrite would be
-    /// exactly the silent loss this whole mechanism exists to prevent. And a
-    /// batch that cannot be parked must page via `coalesce_dropped`, not hide
-    /// behind the recoverable-looking `coalesce_quarantined`.
+    /// Two parks of the same project/table must never overwrite each other, even
+    /// under a frozen clock; and a batch that cannot be parked must page via
+    /// `coalesce_dropped`, not the recoverable-looking `coalesce_quarantined`.
     #[test]
     #[serial_test::serial]
     fn parks_are_collision_proof_and_partial_loss_pages() {
@@ -2970,8 +2621,8 @@ mod tests {
         let payloads = std::fs::read_dir(dir.path()).unwrap().filter(|e| e.as_ref().unwrap().path().extension().is_some_and(|x| x == "arrow")).count();
         assert_eq!(payloads, 3, "parks overwrote each other instead of getting distinct names");
 
-        // A batch whose schema differs from the group's cannot go in the IPC
-        // file; that is real loss and must bump the paging metric.
+        // A schema-mismatched batch cannot go in the IPC file; that is real loss
+        // and must bump the paging metric.
         let other =
             RecordBatch::try_new(Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8, false)])), vec![Arc::new(StringArray::from(vec!["z"]))]).unwrap();
         group.batches = vec![(batch.clone(), (None, None)), (other.clone(), (None, None))];
@@ -2990,8 +2641,7 @@ mod tests {
     }
 
     /// A round larger than `MAX_MERGE_ROWS` must be fed to Delta as several
-    /// bounded slices covering every row exactly once — one unbounded MERGE is
-    /// what exhausted memory on 2026-07-27.
+    /// bounded slices covering every row exactly once.
     #[test]
     fn oversized_round_chunks_to_bounded_merges() {
         let rows = MAX_MERGE_ROWS * 2 + 7;
@@ -3039,9 +2689,8 @@ mod tests {
     type ClampedBound = Option<(i64, bool)>;
 
     /// Clamping against a watermark of 500, flattened to `(outcome, lower,
-    /// upper)` with each bound as `(micros, inclusive)`. `"unchanged"` is only
-    /// reported when the returned predicate is *identical* to the input, so a
-    /// pass-through can never be confused with a rebuilt one.
+    /// upper)` with each bound as `(micros, inclusive)`. `"unchanged"` means the
+    /// returned predicate is *identical* to the input, never merely equivalent.
     #[test_case(window(1_000, 2_000) => ("skip", None, None) ; "window entirely above the watermark skips the delta leg")]
     #[test_case(col("timestamp").gt(lit(ts(500))) => ("skip", None, None) ; "exclusive lower exactly at the watermark also skips")]
     // Inclusive lower at the watermark must keep — the row at wm may be flushed.
@@ -3064,7 +2713,6 @@ mod tests {
 
     #[test]
     fn parse_quarantine_meta_recovers_enrichment_shape() {
-        // Verbatim shape of the 2026-07-28..30 parked groups.
         let meta = "project_id=00000000-0000-0000-0000-000000000000\n\
             table_name=otel_logs_and_spans\n\
             folded_projects=00000000-0000-0000-0000-000000000000,28f62f01-46a1-400e-8195-da7bc3505b5b\n\
@@ -3124,9 +2772,7 @@ mod tests {
     }
 
     /// Pin the folded group's whole shape: appended project column + join key,
-    /// IN-list residual, union window, and a member-set-sensitive fingerprint
-    /// (a re-queued fold must never merge with a fold of different members —
-    /// its IN-list would drop the extra members' delta legs).
+    /// IN-list residual, union window, and a member-set-sensitive fingerprint.
     #[test]
     fn build_folded_appends_project_column_and_unions_windows() {
         let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new("span_id", DataType::Utf8, false), Field::new("tag", DataType::Utf8, false)]));
@@ -3195,17 +2841,6 @@ mod tests {
         let mut group = pending(schema, predicate, decomposed.into_iter().map(|d| (batch.clone(), (d.lower, d.upper))).collect());
         group.attempts = 2;
         group
-    }
-
-    /// Bucketed units flattened to `(statements, lower_micros, upper_micros)`,
-    /// ordered by window so the table is order-independent.
-    fn bucket_shape(windows: &[(i64, Option<i64>)]) -> Vec<(usize, Option<i64>, Option<i64>)> {
-        let mut shape: Vec<(usize, Option<i64>, Option<i64>)> = bucket_group(group_with_windows(windows))
-            .iter()
-            .map(|u| (u.batches.len(), u.predicate.lower.as_ref().map(m), u.predicate.upper.as_ref().map(m)))
-            .collect();
-        shape.sort_by_key(|s| (s.1, s.2));
-        shape
     }
 
     #[test]
@@ -3313,7 +2948,12 @@ mod tests {
     #[test_case(&[(0, Some(B)), (10, Some(20))] => vec![(2usize, Some(0i64), Some(B))] ;
         "exclusive upper exactly on a bucket edge stays in the bucket below the edge")]
     fn bucket_group_splits(windows: &[(i64, Option<i64>)]) -> Vec<(usize, Option<i64>, Option<i64>)> {
-        bucket_shape(windows)
+        let mut shape: Vec<_> = bucket_group(group_with_windows(windows))
+            .iter()
+            .map(|u| (u.batches.len(), u.predicate.lower.as_ref().map(m), u.predicate.upper.as_ref().map(m)))
+            .collect();
+        shape.sort_by_key(|s| (s.1, s.2)); // order-independent case table
+        shape
     }
 
     /// Everything but the time window is carried through bucketing unchanged.
@@ -3346,5 +2986,33 @@ mod tests {
         // Different residual constant → different group.
         let d3 = DecomposedPredicate::decompose(Some(&col("project_id").eq(lit("p2")).and(window(1, 2))), "timestamp");
         assert_ne!(shape_fingerprint(&jk, &assign, &d1.residual, &schema), shape_fingerprint(&jk, &assign, &d3.residual, &schema));
+    }
+
+    /// The DML session must decode the wide otel schema at the same batch size as
+    /// every other session: a MERGE-UPDATE rewrites whole wide rows, and decode
+    /// buffers cost `batch_size × row width` with none of it pool-accounted.
+    #[test]
+    fn the_dml_session_decodes_wide_rows_at_the_shared_batch_size() {
+        let base = datafusion::execution::session_state::SessionStateBuilder::new().with_default_features().build();
+        let want: usize = crate::database::WIDE_ROW_DECODE_BATCH_SIZE.parse().expect("the shared constant is a number");
+        // Assert the session actually moves off the inherited default, so this
+        // cannot pass by coincidence if DataFusion's default ever equals ours.
+        assert!(base.config().options().execution.batch_size > want, "DataFusion's default is the wider batch this fix exists to override");
+        let session = super::delta_session_from(&base);
+        assert_eq!(session.config().options().execution.batch_size, want, "a DML rewrite must not decode at a wider batch than a query does");
+    }
+
+    #[test]
+    fn large_mor_sources_stay_inside_the_key_pushdown_bound() {
+        let rows = MOR_KEY_PUSHDOWN_ROWS * 2 + 17;
+        let batch = RecordBatch::try_from_iter(vec![("span_id", Arc::new(StringArray::from_iter_values((0..rows).map(|i| format!("span-{i}")))) as _)])
+            .expect("source batch");
+        let schema = batch.schema();
+        let chunks = bounded_mor_source_chunks(UpdateSource { batch, schema, join_keys: vec![("context___span_id".into(), "span_id".into())] });
+
+        assert_eq!(chunks.iter().map(|chunk| chunk.batch.num_rows()).sum::<usize>(), rows);
+        assert_eq!(chunks.len(), 3);
+        assert!(chunks.iter().all(|chunk| chunk.batch.num_rows() <= MOR_KEY_PUSHDOWN_ROWS));
+        assert_eq!(chunks[2].batch.num_rows(), 17);
     }
 }

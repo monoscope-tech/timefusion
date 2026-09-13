@@ -31,11 +31,7 @@ fn get_i64(batch: &RecordBatch, col: usize, idx: usize) -> i64 {
 /// Database + buffered layer + a session context wired exactly as the pgwire path builds one.
 async fn setup_db_with_buffer(mode: BufferMode) -> Result<(Arc<Database>, Arc<BufferedWriteLayer>, String, SessionContext)> {
     let cfg = TestConfigBuilder::new("buf_test").with_buffer_mode(mode).build();
-    // Wire the SAME Delta writer prod does. A layer without it does not fail —
-    // `flush_bucket` used to log "no delta write callback" and drain the bucket
-    // anyway, so every flushed row was silently destroyed while `is_empty()`
-    // reported success. It now errors instead, which would strand these tests'
-    // rows in MemBuffer; either way the harness must mirror production.
+    // The Delta writer must be wired here or flushes error and rows never leave MemBuffer.
     let db0 = Database::with_config(Arc::clone(&cfg)).await?;
     let layer = Arc::new(timefusion::support::test_helpers::test_layer(Arc::clone(&cfg))?.with_delta_writer(timefusion::server::delta_write_callback(&db0)));
     let db = Arc::new(db0.with_buffered_layer(Arc::clone(&layer)));
@@ -69,6 +65,11 @@ fn create_records(project_id: &str, count: usize) -> Vec<serde_json::Value> {
     create_range(project_id, 0..count, None)
 }
 
+/// Expands the `$T` / `$P` placeholders the case tables use into this run's table and project id.
+fn sql_for(template: &str, project_id: &str) -> String {
+    template.replace("$T", TABLE).replace("$P", project_id)
+}
+
 async fn insert(db: &Database, project_id: &str, records: Vec<serde_json::Value>, skip_queue: bool) -> Result<()> {
     db.insert_records_batch(project_id, TABLE, vec![json_to_batch(records)?], skip_queue, None).await?;
     Ok(())
@@ -79,16 +80,29 @@ async fn count_rows(ctx: &SessionContext, project_id: &str) -> Result<i64> {
     Ok(get_i64(&result[0], 0, 0))
 }
 
-// Parameterized tests - run in both buffer modes
+const COUNT_SQL: &str = "SELECT COUNT(*) AS cnt FROM $T WHERE project_id = '$P'";
+const DELETE_SQL: &str = "DELETE FROM $T WHERE project_id = '$P' AND name = 'name_2'";
+const AGG_SQL: &str = "SELECT COUNT(*) AS cnt, SUM(duration) AS total, AVG(duration) AS avg_dur FROM $T WHERE project_id = '$P'";
 
-#[test_case(BufferMode::Enabled ; "buffered")]
-#[test_case(BufferMode::FlushImmediately ; "immediate")]
+/// Insert `rows` records, optionally run `dml`, then assert the first (i64)
+/// column of `probe`'s first row equals `expect`. `$T`/`$P` expand to the
+/// table and this run's project id.
+#[test_case(BufferMode::Enabled, 10, None, COUNT_SQL, 10 ; "insert_query buffered")]
+#[test_case(BufferMode::FlushImmediately, 10, None, COUNT_SQL, 10 ; "insert_query immediate")]
+#[test_case(BufferMode::Enabled, 5, Some(DELETE_SQL), COUNT_SQL, 4 ; "delete buffered")]
+#[test_case(BufferMode::FlushImmediately, 5, Some(DELETE_SQL), COUNT_SQL, 4 ; "delete immediate")]
+#[test_case(BufferMode::Enabled, 10, None, AGG_SQL, 10 ; "aggregations buffered")]
+#[test_case(BufferMode::FlushImmediately, 10, None, AGG_SQL, 10 ; "aggregations immediate")]
 #[serial]
 #[tokio::test]
-async fn test_insert_query(mode: BufferMode) -> Result<()> {
+async fn test_insert_then_probe(mode: BufferMode, rows: usize, dml: Option<&str>, probe: &str, expect: i64) -> Result<()> {
     let (db, _layer, project_id, ctx) = setup_db_with_buffer(mode).await?;
-    insert(&db, &project_id, create_records(&project_id, 10), true).await?;
-    assert_eq!(count_rows(&ctx, &project_id).await?, 10, "Expected 10 rows");
+    insert(&db, &project_id, create_records(&project_id, rows), true).await?;
+    if let Some(dml) = dml {
+        ctx.sql(&sql_for(dml, &project_id)).await?.collect().await?;
+    }
+    let result = ctx.sql(&sql_for(probe, &project_id)).await?.collect().await?;
+    assert_eq!(get_i64(&result[0], 0, 0), expect, "unexpected count from: {probe}");
     Ok(())
 }
 
@@ -118,65 +132,22 @@ async fn test_update(mode: BufferMode) -> Result<()> {
 
     ctx.sql(&format!("UPDATE {TABLE} SET hashes = make_array('999') WHERE project_id = '{project_id}' AND name = 'name_1'")).await?.collect().await?;
 
-    let result = ctx
-        .sql(&format!(
-            "SELECT name, COALESCE(array_element(hashes, 1), CAST(duration AS VARCHAR))::BIGINT AS duration FROM {TABLE} WHERE project_id = '{project_id}' ORDER BY name"
-        ))
-        .await?
-        .collect()
-        .await?;
+    let probe = format!(
+        "SELECT name, COALESCE(array_element(hashes, 1), CAST(duration AS VARCHAR))::BIGINT AS duration FROM {TABLE} WHERE project_id = '{project_id}' ORDER BY name"
+    );
+    let result = ctx.sql(&probe).await?.collect().await?;
 
     let batch = &result[0];
-    for i in 0..batch.num_rows() {
-        if get_str(batch.column(0).as_ref(), i) == "name_1" {
-            assert_eq!(get_i64(batch, 1, i), 999, "name_1 should have duration=999");
-        }
-    }
+    (0..batch.num_rows())
+        .filter(|&i| get_str(batch.column(0).as_ref(), i) == "name_1")
+        .for_each(|i| assert_eq!(get_i64(batch, 1, i), 999, "name_1 should have duration=999"));
     Ok(())
 }
 
-#[test_case(BufferMode::Enabled ; "buffered")]
-#[test_case(BufferMode::FlushImmediately ; "immediate")]
-#[serial]
-#[tokio::test]
-async fn test_delete(mode: BufferMode) -> Result<()> {
-    let (db, _layer, project_id, ctx) = setup_db_with_buffer(mode).await?;
-    insert(&db, &project_id, create_records(&project_id, 5), true).await?;
-
-    ctx.sql(&format!("DELETE FROM {TABLE} WHERE project_id = '{project_id}' AND name = 'name_2'")).await?.collect().await?;
-
-    assert_eq!(count_rows(&ctx, &project_id).await?, 4, "Expected 4 rows after delete");
-    Ok(())
-}
-
-#[test_case(BufferMode::Enabled ; "buffered")]
-#[test_case(BufferMode::FlushImmediately ; "immediate")]
-#[serial]
-#[tokio::test]
-async fn test_aggregations(mode: BufferMode) -> Result<()> {
-    let (db, _layer, project_id, ctx) = setup_db_with_buffer(mode).await?;
-    insert(&db, &project_id, create_records(&project_id, 10), true).await?;
-
-    let result = ctx
-        .sql(&format!("SELECT COUNT(*) as cnt, SUM(duration) as total, AVG(duration) as avg_dur FROM {TABLE} WHERE project_id = '{project_id}'"))
-        .await?
-        .collect()
-        .await?;
-
-    assert_eq!(get_i64(&result[0], 0, 0), 10);
-    Ok(())
-}
-
-// Union tests - data split between buffer and Delta
-//
-// The two #[ignore]'d tests below write the same (project_id, time-window) to
-// Delta directly AND to MemBuffer, then expect the union to reflect both legs.
-// Production never does this: the buffered layer is the sole write path, and
-// when it flushes (skip_queue=true → direct Delta write) the bucket is
-// drained from MemBuffer *first*, so the per-bucket Delta-exclusion filter in
-// ProjectRoutingTable::scan correctly drops nothing. When a test pollutes both
-// legs concurrently, the exclusion filter wrongly suppresses the Delta-direct
-// rows. Run via `cargo test -- --ignored` if intentionally exercising the race.
+// The two #[ignore]'d tests below write the same (project_id, time-window) to Delta and to
+// MemBuffer at once. Production never does that — a flush drains the bucket from MemBuffer
+// before writing Delta — so the per-bucket Delta-exclusion filter in ProjectRoutingTable::scan
+// wrongly suppresses the Delta-direct rows here.
 
 #[serial]
 #[ignore = "tests architecturally-unsupported simultaneous-write-both-legs pattern; see comment above"]
@@ -200,16 +171,12 @@ async fn test_delta_only_query() -> Result<()> {
     insert(&db, &project_id, create_records(&project_id, 30), true).await?;
     insert(&db, &project_id, create_range(&project_id, 30..50, Some(100)), false).await?;
 
-    // Delta-only query should return only Delta data (30 rows)
     let delta_result = db.query_delta_only(&format!("SELECT COUNT(*) as cnt FROM {TABLE} WHERE project_id = '{project_id}'")).await?;
     assert_eq!(get_i64(&delta_result[0], 0, 0), 30, "Delta-only should return 30 rows from Delta");
 
-    // Normal query should return all 50 (30 from Delta + 20 from buffer)
     assert_eq!(count_rows(&ctx, &project_id).await?, 50, "Full query should return all 50 rows");
     Ok(())
 }
-
-// Immediate flush verification
 
 #[serial]
 #[tokio::test]
@@ -218,12 +185,9 @@ async fn test_immediate_flush_drains_buffer() -> Result<()> {
 
     insert(&db, &project_id, create_records(&project_id, 10), false).await?;
 
-    // Buffer should be empty after immediate flush (flush drains buffer even without callback)
     assert!(layer.is_empty(), "Buffer should be empty after immediate flush");
-    // DRAINED IS NOT PERSISTED. This assertion is the one that matters: an
-    // empty buffer proves the rows LEFT MemBuffer, not that they arrived in
-    // Delta, so on its own it is equally consistent with the flush dropping
-    // them on the floor.
+    // An empty buffer only proves the rows left MemBuffer; the count below is what proves
+    // they landed in Delta rather than being dropped.
     assert_eq!(count_rows(&ctx, &project_id).await?, 10, "every drained row must be readable from Delta");
     Ok(())
 }

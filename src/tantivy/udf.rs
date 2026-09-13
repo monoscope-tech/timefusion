@@ -47,15 +47,14 @@ pub fn classify_like_pattern(pat: &str, escape: Option<char>, allow_substring: b
     let leading_wildcard = it.next_if_eq(&'%').is_some();
     let mut out = String::new();
     let mut trailing_wildcard = false;
-    // Kept imperative: an invalid char must bail the WHOLE function (`return None`),
-    // while a trailing '%' must merely stop the loop (`break`, out still valid) —
-    // collecting via an iterator adapter conflates those two exits.
+    // Imperative on purpose: an invalid char bails the whole function while a
+    // trailing '%' only stops the loop — one iterator adapter can't do both.
     while let Some(c) = it.next() {
         let lit = match c {
             c if c == esc => it.next()?, // trailing escape → bail
             '_' => return None,
-            // Only the leading-or-trailing-only wildcard forms are handled:
-            // `'a%b'` would need positional ranking tantivy can't trivially give.
+            // Only leading/trailing wildcards are routable; `'a%b'` needs
+            // positional ranking tantivy can't give.
             '%' if it.peek().is_none() => {
                 trailing_wildcard = true;
                 break;
@@ -72,36 +71,27 @@ pub fn classify_like_pattern(pat: &str, escape: Option<char>, allow_substring: b
         return None;
     }
     Some(match (leading_wildcard, trailing_wildcard) {
-        // Plain exact / prefix / suffix / infix matches.
         (false, false) => out,      // 'foo'
         (false, true) => out + "*", // 'foo%' (prefix)
-        // Suffix-only and infix forms only meaningful on ngram3; for raw/
-        // default tokenizers we'd be sending tantivy a query that matches
-        // the substring as a whole token (it won't). Bail.
+        // Leading-wildcard forms only work on ngram3; other tokenizers would
+        // match the substring as a whole token, i.e. never.
         (true, false) | (true, true) if !allow_substring => return None,
-        (true, _) => out, // ngram3 will trigram-match the substring
+        (true, _) => out,
     })
 }
 
-/// Regex metacharacters escaped by Monoscope's literal-query encoder.
+/// Regex metacharacters recognised by [`regex_literal_substring`].
 const REGEX_META: &str = ".^$*+?()[]{}|\\";
 
-/// Decode a `~` / `~*` pattern that is a PLAIN LITERAL SUBSTRING into that
+/// Decode a `~` / `~*` pattern that is a plain literal substring into that
 /// substring, or `None` when the pattern uses any regex feature.
 ///
-/// `\X` unescapes to `X` only for X in [`REGEX_META`] — the exact convention
-/// monoscope emits. Any other backslash escape (`\d`, `\m`, `\y`, `\w`, …) is
-/// a character class or word-boundary assertion, not a literal, so it bails.
-/// Unescaped metacharacters bail. The decoded literal must also survive
-/// tantivy's `QueryParser` unchanged ([`is_tantivy_safe_term_char`]).
-///
-/// Anchors (`^foo`, `foo$` — monoscope's startswith/endswith) contain `^`/`$`
-/// and therefore bail: prefix/suffix routing over a 3-gram field needs its own
-/// correctness argument and is out of scope here.
+/// `\X` unescapes to `X` only for X in [`REGEX_META`]; any other escape (`\d`,
+/// `\y`, `\w`, …) is a class/assertion and bails, as do unescaped
+/// metacharacters (including the anchors `^`/`$`). The decoded literal must
+/// also survive tantivy's `QueryParser` unchanged ([`is_tantivy_safe_term_char`]).
 pub fn regex_literal_substring(pat: &str) -> Option<String> {
     let mut it = pat.chars();
-    // `Option<char>` items collect into `Option<String>`, short-circuiting on the
-    // first non-literal exactly like the early `return None`s it replaces.
     let out = std::iter::from_fn(move || {
         let c = it.next()?;
         Some(
@@ -118,13 +108,10 @@ pub fn regex_literal_substring(pat: &str) -> Option<String> {
     (!out.is_empty()).then_some(out)
 }
 
-/// Runtime classification of a DEFERRED (placeholder-routed) `text_match`.
-/// The rewriter couldn't validate a `$N` at plan time, so it tagged the call
-/// with the predicate kind + tokenizer; once parameter substitution turns the
-/// placeholder into a literal, this reproduces exactly the plan-time gates.
+/// Classify a deferred (placeholder-routed) `text_match` once the `$N` has been
+/// substituted, applying the same gates the plan-time path applies.
 /// `kind`: `"eq"` | `"like:<tokenizer>"` | `"ilike:<tokenizer>"`.
-/// `None` = not accelerable → the call is opaque to the prefilter (the
-/// original predicate still post-filters).
+/// `None` = not accelerable; the call is opaque to the prefilter.
 pub fn classify_deferred(kind: &str, value: &str) -> Option<String> {
     use crate::tantivy::{NGRAM3_TOKENIZER, RAW_TOKENIZER};
     let Some((form, tok)) = kind.split_once(':') else {
@@ -147,8 +134,7 @@ pub struct TextMatchUdf {
 impl Default for TextMatchUdf {
     fn default() -> Self {
         // 2-arg: plan-time-classified query. 3-arg: deferred placeholder
-        // routing — (col, $N, kind); the 3rd arg is consumed by the scan-side
-        // collector, not by row evaluation.
+        // routing — (col, $N, kind).
         Self { sig: Signature::one_of(vec![TypeSignature::Any(2), TypeSignature::Any(3)], Volatility::Immutable) }
     }
 }
@@ -168,10 +154,9 @@ impl ScalarUDFImpl for TextMatchUdf {
         let arrs = args.args.iter().map(|c| c.to_array(n)).collect::<DFResult<Vec<ArrayRef>>>()?;
         let col_str = string_extractor(&arrs[0]);
         let pat_str = string_extractor(&arrs[1]);
-        // 3-arg deferred calls carry the RAW predicate value + kind; their
-        // row-eval must reproduce the ORIGINAL predicate's semantics (a
-        // superset of it), not tantivy token containment — substring-matching
-        // a raw LIKE pattern silently dropped rows for `_`/embedded-`%`.
+        // 3-arg deferred calls carry the RAW predicate value + kind, so their
+        // row-eval must reproduce the original predicate's semantics (as a
+        // superset), not tantivy token containment.
         let kind: Option<String> = arrs.get(2).filter(|a| !a.is_empty()).and_then(|a| string_extractor(a)(0));
         let out: BooleanArray = (0..n)
             .map(|i| {
@@ -192,11 +177,9 @@ fn tantivy_tokens_contained(query: &str, haystack: &str) -> bool {
     query.to_lowercase().split_whitespace().map(|tok| tok.trim_matches(|c: char| c == '*' || c == '?')).all(|tok| !tok.is_empty() && h_low.contains(tok))
 }
 
-/// Row-level evaluation of a DEFERRED (3-arg) text_match: a SUPERSET of the
-/// original predicate. `eq` → case-insensitive containment (⊇ `=`); `like`/
-/// `ilike` → case-insensitive SQL LIKE with `%`/`_`/default `\` escape
-/// (case-folding makes it a superset of case-sensitive LIKE; the original
-/// predicate re-filters exactly).
+/// Row eval of a deferred (3-arg) text_match; must stay a SUPERSET of the
+/// original predicate, which re-filters exactly. `eq` → case-insensitive
+/// containment; `like`/`ilike` → case-insensitive SQL LIKE.
 fn deferred_row_matches(kind: &str, value: &str, haystack: &str) -> bool {
     match kind {
         "eq" => haystack.to_lowercase().contains(&value.to_lowercase()),
@@ -215,17 +198,14 @@ fn like_match_ci(pattern: &str, text: &str) -> bool {
     let lowered = pattern.to_lowercase();
     let mut chars = lowered.chars();
     let toks: Vec<Tok> = std::iter::from_fn(|| {
-        chars.next().map(|c| match c {
-            '\\' => chars.next().map(Tok::Lit), // trailing escape is dropped
-            '%' => Some(Tok::Percent),
-            '_' => Some(Tok::One),
-            other => Some(Tok::Lit(other)),
+        Some(match chars.next()? {
+            '\\' => Tok::Lit(chars.next()?), // trailing escape is dropped
+            '%' => Tok::Percent,
+            '_' => Tok::One,
+            other => Tok::Lit(other),
         })
     })
-    .flatten()
     .collect();
-    // Backtracking two-pointer glob: kept imperative — the `%` restart point
-    // is state no iterator adapter expresses without re-walking the text.
     let t: Vec<char> = text.to_lowercase().chars().collect();
     let (mut ti, mut pi) = (0usize, 0usize);
     let mut star: Option<(usize, usize)> = None;
@@ -259,13 +239,9 @@ fn string_extractor(arr: &ArrayRef) -> Box<dyn Fn(usize) -> Option<String> + '_>
     match arr.data_type() {
         DataType::Utf8 => strs(arr, "Utf8 array", |a: &StringArray, i| a.value(i)),
         DataType::Utf8View => strs(arr, "Utf8View array", |a: &StringViewArray, i| a.value(i)),
-        // Variant Struct{metadata,value}: render each row to canonical JSON text
-        // via the SAME serializer the tantivy index and the LIKE-coercion path
-        // use (`builder::variant_to_text`), so text_match's row-eval agrees
-        // byte-for-byte with them and stays a superset of the real predicate.
-        // Without this, predicates on Variant columns (e.g. `body LIKE '%x%'`,
-        // rewritten to `… AND text_match(body,'x')`) silently never match.
-        // Decoded lazily per row (only when the closure is called).
+        // Variant Struct{metadata,value}: render lazily per row via the SAME
+        // serializer the tantivy index uses, or row-eval disagrees with the
+        // index and predicates on Variant columns silently never match.
         DataType::Struct(_) if crate::schema::is_variant_type(arr.data_type()) => {
             Box::new(move |i| crate::tantivy::variant_to_text(arr, i, false).ok().flatten())
         }
@@ -279,10 +255,8 @@ pub fn text_match_udf() -> ScalarUDF {
 }
 
 /// Detect a `text_match(col, 'q'[, kind])` predicate and extract its column
-/// name and tantivy query. 2-arg calls carry a plan-time-classified query;
-/// 3-arg calls were routed on a `$N` placeholder and are classified HERE,
-/// after parameter substitution turned the placeholder into a literal.
-/// `None` = not a routable call (the collector treats it as opaque).
+/// name and tantivy query; 3-arg (placeholder-routed) calls are classified
+/// here. `None` = not routable, and the collector treats it as opaque.
 pub fn extract_text_match(expr: &datafusion::logical_expr::Expr) -> Option<TextMatchPred> {
     use datafusion::{logical_expr::Expr, scalar::ScalarValue};
     fn utf8_lit(e: &Expr) -> Option<String> {
@@ -311,10 +285,8 @@ pub struct TextMatchPred {
     pub query: String,
 }
 
-/// Boolean structure of the routable `text_match` predicates in a filter
-/// tree. Evaluated per tantivy index (And→Must, Or→Should) and against the
-/// MemBuffer bucket indexes, so AND intersects and OR unions *inside* the
-/// engine rather than by combining per-predicate id sets.
+/// Boolean structure of the routable `text_match` predicates in a filter tree,
+/// evaluated inside the tantivy/MemBuffer indexes (And→Must, Or→Should).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PredNode {
     And(Vec<PredNode>),
@@ -331,14 +303,14 @@ impl PredNode {
         }
     }
 
-    /// Conjunction of flat predicates (legacy shape used by tests/tools).
+    /// Conjunction of flat predicates.
     pub fn from_preds(preds: &[TextMatchPred]) -> Option<PredNode> {
         combine(true, preds.iter().cloned().map(PredNode::Leaf))
     }
 }
 
-/// Fold children into one `And`/`Or` node, flattening same-kind nesting (for
-/// readability of the compiled query) and collapsing the 0/1-child cases.
+/// Fold children into one `And`/`Or` node, flattening same-kind nesting and
+/// collapsing the 0/1-child cases.
 fn combine(and: bool, nodes: impl IntoIterator<Item = PredNode>) -> Option<PredNode> {
     let kids: Vec<PredNode> = nodes
         .into_iter()
@@ -357,11 +329,9 @@ fn combine(and: bool, nodes: impl IntoIterator<Item = PredNode>) -> Option<PredN
 
 /// Result of translating one expr subtree.
 /// `node`: the routable prefilter structure found inside, if any.
-/// `complete`: the subtree's TRUE match set is fully covered by `node`
-/// (i.e. `node`'s hits ⊇ subtree's matches). Required for OR-union
-/// soundness: a branch without complete coverage would make the union a
-/// non-superset and silently drop that branch's rows (2026-06-16 dashboard
-/// bug: `(kind='server' OR name='...')` returned 0 from Delta).
+/// `complete`: `node`'s hits ⊇ the subtree's matches. Required for OR-union
+/// soundness — an incomplete branch makes the union a non-superset and
+/// silently drops that branch's rows.
 #[derive(Default)]
 struct NodeRes {
     node: Option<PredNode>,
@@ -370,16 +340,11 @@ struct NodeRes {
 
 /// Extract the routable prefilter tree from pushed-down filters (implicitly
 /// AND-ed). Returns `None` when nothing routable was found. Soundness rules:
-/// - `text_match` leaf: complete (rewriter guarantees hits ⊇ original
-///   predicate's matches).
-/// - AND: prefilter = conjunction of whichever children are routable
-///   (a superset of the AND's matches since each child's prefilter is a
-///   superset of its own matches). Complete if ANY child is complete —
-///   the AND's matches ⊆ that child's matches ⊆ its prefilter. This is what
-///   makes `orig = 'x' AND text_match(...)` (the rewriter's additive shape)
-///   a complete OR branch.
-/// - OR: routable only if ALL children are routable AND complete; else the
-///   whole node is opaque (no prefilter from inside it may be used).
+/// - `text_match` leaf: complete (the rewriter guarantees hits ⊇ matches).
+/// - AND: conjunction of whichever children are routable; complete if ANY
+///   child is complete.
+/// - OR: routable only if ALL children are routable AND complete; otherwise
+///   the whole node is opaque and nothing inside it may be used.
 /// - anything else: opaque, incomplete.
 pub fn collect_text_match_tree(filters: &[datafusion::logical_expr::Expr]) -> Option<PredNode> {
     combine(true, filters.iter().filter_map(|f| expr_node(f).node))
@@ -410,7 +375,6 @@ fn expr_node(e: &datafusion::logical_expr::Expr) -> NodeRes {
 mod tests {
     use super::*;
 
-    // `_` and embedded `%` — the shapes the old substring row-eval dropped.
     #[test_case::test_case("a_c", "abc" => true)]
     #[test_case::test_case("a_c", "abbc" => false)]
     #[test_case::test_case("foo%bar", "fooXbar" => true)]
@@ -437,11 +401,9 @@ mod tests {
 
     #[test]
     fn regex_literal_substring_accepts_only_escaped_literals() {
-        // monoscope's `escapeRegex` output round-trips.
         assert_eq!(regex_literal_substring("runServer"), Some("runServer".into()));
         assert_eq!(regex_literal_substring("svc\\.user-api"), Some("svc.user-api".into()));
         assert_eq!(regex_literal_substring("GET /v1/users"), Some("GET /v1/users".into()));
-        // Any live regex feature bails.
         for p in ["run.*", "^foo", "foo$", "a|b", "f(o)o", "a[bc]", "x{2}", "\\d+", "\\yword\\y", "\\w", "trailing\\", "", "a\\+b"] {
             assert_eq!(regex_literal_substring(p), None, "{p:?} must not decode to a literal");
         }

@@ -12,59 +12,37 @@ use include_dir::{Dir, include_dir};
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 
-/// One continuous-aggregate rollup, declared on the SOURCE table.
-///
-/// TimescaleDB's continuous aggregates in TF's shape: you declare the grain,
-/// the dimensions and the measures, and the rollup table is SYNTHESIZED from
-/// this plus the source schema (`RollupSpec::synthesize`). Nothing is
-/// hand-written, so a rollup column's type cannot drift from the source column
-/// it aggregates, and adding a rollup is a config change rather than a new
-/// YAML file plus a hardcoded constant.
-///
-/// The refresh policy is TF's own and is better than a timer: the build fires
-/// at the point a partition is CERTIFIED duplicate-free, because a bucket
-/// computed over a bin that is later deduped is simply wrong.
+/// One continuous-aggregate rollup, declared on the SOURCE table. The rollup
+/// table is synthesized from this plus the source schema
+/// (`RollupSpec::synthesize`); the build fires when a partition is certified
+/// duplicate-free, since a bucket over a bin that is later deduped is wrong.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct RollupSpec {
     /// Bucket width, e.g. `1m`, `1h`, `1d`. The default table-name suffix, so
     /// the name cannot disagree with the resolution.
     pub grain: String,
-    /// Distinguishing suffix, for a SECOND rollup at the same grain.
-    ///
-    /// Needed only when two rollups share a grain but group differently:
-    /// different dimensions mean a different GROUP BY, hence a different row
-    /// set, hence a genuinely different table. If instead you want another
-    /// MEASURE at a grain you already roll up, add it to that rollup's
-    /// `measures:` — same grain and same dimensions produce the identical row
-    /// set, so a second table would duplicate every identity and dimension
-    /// column and force a query wanting both measures to read two tables.
+    /// Distinguishing suffix, needed only when two rollups share a grain but
+    /// group differently. To add a MEASURE at a grain you already roll up, add
+    /// it to that rollup's `measures:` instead of declaring a second spec.
     #[serde(default)]
     pub name: Option<String>,
     /// Columns a query may GROUP BY **or FILTER on** and still be answerable.
-    /// Filters constrain the design exactly as hard as group-bys — rows for a
-    /// non-dimension are already summed together and cannot be subtracted back
-    /// out — which is the part a rollup design usually gets wrong.
+    /// Filters constrain the design as hard as group-bys: rows for a
+    /// non-dimension are already summed together and cannot be subtracted out.
     pub dimensions: Vec<String>,
     pub measures: Vec<RollupMeasure>,
     /// Build this rollup from ANOTHER rollup on the same source rather than from
-    /// raw rows, naming that spec's `name`.
-    ///
-    /// A coarse tier is what makes a 30-day window cheap, but computing it from
-    /// raw means a second full scan of every partition — on the big table that
-    /// doubles the cost of every certification. Re-aggregating the fine tier
-    /// instead reads a table that is already orders of magnitude smaller, and it
-    /// is exact: every measure here is associative, so folding 1m states into 1h
-    /// states gives the same answer as folding raw rows straight to 1h.
+    /// raw rows, naming that spec's `name`. Exact because every measure here is
+    /// associative.
     #[serde(default)]
     pub derive_from: Option<String>,
 }
 
-/// One stored measure. Only DECOMPOSABLE aggregates are expressible: count/sum/
-/// min/max re-aggregate across buckets and across collapsed dimensions. `avg`
-/// is admissible as sum/count and is expanded before it gets here; exact
-/// percentiles and exact count(distinct) are not, and are refused rather than
-/// answered approximately without being asked.
-#[derive(Debug, Serialize, Deserialize, Clone)]
+/// One stored measure. Only DECOMPOSABLE aggregates are expressible, so they
+/// re-aggregate across buckets and across collapsed dimensions. `avg` is
+/// expanded to sum/count before it gets here; exact percentiles and exact
+/// count(distinct) are refused.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct RollupMeasure {
     /// Column name in the rollup table.
     pub name: String,
@@ -82,8 +60,8 @@ pub struct RollupMeasure {
 }
 
 /// `(name, data_type, nullable)` of the columns every rollup tier carries.
-/// One list: `synthesize` builds them and `validate` refuses a dimension that
-/// collides with one, so the two cannot drift.
+/// `synthesize` builds them and `validate` refuses a dimension colliding with
+/// one.
 const IDENTITY_FIELDS: [(&str, &str, bool); 7] = [
     ("project_id", "Utf8", true),
     ("timestamp", "Timestamp(Microsecond, Some(\"UTC\"))", false),
@@ -95,14 +73,13 @@ const IDENTITY_FIELDS: [(&str, &str, bool); 7] = [
 ];
 
 impl RollupSpec {
-    /// `{source}_rollup_{name|grain}` — see `rollup_table_is_named_after_its_source`.
+    /// `{source}_rollup_{name|grain}`.
     pub fn table_name(&self, source: &str) -> String {
         format!("{source}_rollup_{}", self.name.as_deref().unwrap_or(&self.grain))
     }
 
-    /// Grain in microseconds, parsed from the suffix. `None` for an
-    /// unparseable grain, which `validate` rejects at load rather than at the
-    /// first build.
+    /// Grain in microseconds, parsed from the suffix. `None` if unparseable,
+    /// which `validate` rejects at load.
     pub fn grain_micros(&self) -> Option<i64> {
         let (n, unit) = self.grain.split_at(self.grain.len().checked_sub(1)?);
         let n: i64 = n.parse().ok()?;
@@ -117,16 +94,10 @@ impl RollupSpec {
     }
 
     /// The declared `min(timestamp)` measure that says WHICH row a `first`
-    /// measure's value came from — without it "earliest" is not recoverable
-    /// from the stored value alone, so the coarse tier could not merge.
-    ///
-    /// Resolved by convention rather than by a new field, exactly as `avg`
-    /// resolves to a sum/count pair. The filter must match too: "earliest row
-    /// in the bucket" and "earliest row MATCHING the filter" are different
-    /// rows, and it is the second one whose value was stored.
-    ///
-    /// `validate` refuses a spec without one, so the builder may treat `None`
-    /// here as "never validated".
+    /// measure's value came from; without it the coarse tier cannot merge. The
+    /// filter must match the measure's, since "earliest row matching the filter"
+    /// is a different row. `validate` refuses a spec without one, so `None` here
+    /// means "never validated".
     pub(crate) fn first_companion(&self, measure: &RollupMeasure) -> Option<&RollupMeasure> {
         self.measures.iter().find(|c| c.agg == "min" && c.column.as_deref() == Some("timestamp") && c.filter == measure.filter)
     }
@@ -160,9 +131,8 @@ impl RollupSpec {
             let (Some(fine), Some(coarse)) = (base_spec.grain_micros(), self.grain_micros()) else {
                 anyhow::bail!("rollup {target}: cannot compare grains with `{base}`")
             };
-            // A base bucket must fall entirely inside one of ours, or its state
-            // would have to be split across two output buckets — which no
-            // aggregate state can do.
+            // A base bucket must fall entirely inside one of ours; no aggregate
+            // state can be split across two output buckets.
             anyhow::ensure!(
                 coarse > fine && coarse % fine == 0,
                 "rollup {target}: grain must be a whole multiple of `{base}`'s ({} vs {})",
@@ -181,10 +151,11 @@ impl RollupSpec {
                     .iter()
                     .find(|candidate| candidate.name == measure.name)
                     .ok_or_else(|| anyhow::anyhow!("rollup {target}: measure `{}` is absent from `{base}`", measure.name))?;
-                // Re-aggregating states only works if both sides mean the same
-                // thing; a `sum` folded out of a `min` is silently wrong.
+                // Re-aggregation is only correct if both sides mean the same
+                // thing. Names already match, so struct equality IS
+                // agg+column+filter.
                 anyhow::ensure!(
-                    base_measure.agg == measure.agg && base_measure.column == measure.column && base_measure.filter == measure.filter,
+                    base_measure == measure,
                     "rollup {target}: measure `{}` must match `{base}`'s definition exactly to be derived from it",
                     measure.name
                 );
@@ -198,14 +169,10 @@ impl RollupSpec {
                 matches!(agg.as_str(), "count" | "sum" | "min" | "max" | "tdigest" | "hll" | "first"),
                 "rollup {target}: unsupported aggregate `{agg}`"
             );
-            // Refused at load rather than building a tier whose coarse buckets
-            // are wrong — see `first_companion` for why the pair is needed.
             anyhow::ensure!(
                 agg != "first" || self.first_companion(measure).is_some(),
                 "rollup {target}: `first` measure `{name}` needs a companion `{{agg: min, column: timestamp}}` measure carrying the same filter"
             );
-            // `agg` is one of the seven above, so the only column rules left are
-            // "count may omit it" and "tdigest needs a numeric one".
             match measure.column.as_deref() {
                 None => anyhow::ensure!(agg == "count", "rollup {target}: `{agg}` measure `{name}` needs a source column"),
                 Some(column) => {
@@ -240,27 +207,16 @@ impl RollupSpec {
         let fields = IDENTITY_FIELDS
             .into_iter()
             .map(|(name, data_type, nullable)| Ok(plain(name, data_type, nullable)))
-            // Dimensions are always nullable in the rollup: GROUP BY emits a NULL
-            // group for rows missing the dimension, even when the source column is
-            // not.
-            //
-            // `tantivy: None` explicitly, against the struct update: `kind` and
-            // `status_code` are tantivy-indexed on the source, so inheriting the
-            // config put every rollup tier into `indexed_set()` — 52% of the
-            // indexed file population — and turned a dimension equality into a
-            // `text_match` the prefilter then serves. Measured on prod 2026-08-24,
-            // same rows, 5 reps: `kind = 'server'` over a 2-day rollup window took
-            // 8.2-10.9s against 0.28-1.8s for an opaque control, and a routed 7d
-            // dashboard went 7.2s -> 14.5s when a dimension filter was added. The
-            // index is read, used, and a loss.
+            // Dimensions are always nullable here: GROUP BY emits a NULL group
+            // for rows missing the dimension even when the source column is not.
+            // `tantivy: None` is deliberate — inheriting the source's index
+            // config turns a dimension equality into a much slower `text_match`.
             .chain(self.dimensions.iter().map(|d| Ok(FieldDef { nullable: true, tantivy: None, ..src_field(d)? })))
             .chain(self.measures.iter().map(|m| {
                 let ty = match (m.agg.as_str(), &m.column) {
                     ("count", _) => "Int64".to_string(),
                     // `src_field` for its error, not its type: a sketch column is
-                    // always Binary, but naming a column that does not exist must
-                    // still fail HERE rather than synthesize a phantom field that
-                    // only breaks when the build SQL runs.
+                    // always Binary, but an unknown column must still fail here.
                     ("tdigest" | "hll", Some(c)) => src_field(c).map(|_| "Binary".to_string())?,
                     (_, Some(c)) => src_field(c)?.data_type,
                     (a, None) => anyhow::bail!("rollup {target}: `{a}` measure `{}` needs a source column", m.name),
@@ -278,42 +234,17 @@ impl RollupSpec {
             z_order_columns: vec![],
             fields,
             time_column: Some("timestamp".into()),
-            // A tier declares its identity, so reads collapse superseded
-            // versions. This REVERSES an earlier "no read-time dedup" decision;
-            // both reasons it rested on were re-tested on 2026-08-20 and neither
-            // survives.
-            //
-            // It claimed duplicates were impossible by construction, because
-            // rollup waves removed every file in a (project, date) partition as
-            // they wrote. That architecture is gone. The coordinator's
-            // replace-set removes only files whose slice is CONTAINED in the one
-            // being published, and (until `slice_retires`) untagged files never —
-            // so one measured prod partition held 45,483 rows for 7,923 buckets,
-            // 4 to 8 versions each, written by 320 separate passes.
-            //
-            // It also claimed declaring keys broke planning: "DedupExec key `id`
-            // not in input schema", every routed query falling back to a failing
-            // raw scan. That no longer reproduces anywhere in 1,031 tests, the
-            // routed rollup tests included.
-            //
-            // Both tiers declare the SAME keys, deliberately. The asymmetry this
-            // replaces — a derived tier protected by its maintenance-read
-            // collapse while the base tier had no read-time defence at all — is
-            // why one tier read 1.00 versions per id while the other read 5.64,
-            // with nothing at the schema level to say why.
-            //
-            // Clean bytes remain the goal, not this: a `DedupExec` over a
-            // partition holding one version per key is near-free, over one
-            // holding eight it is not. This is the safety net under the repair,
-            // not a substitute for it.
+            // A tier declares its identity so reads collapse superseded
+            // versions; every tier declares the SAME keys. This is a safety net
+            // under maintenance repair, not a substitute for it — dedup over a
+            // partition with one version per key is near-free, over eight it is
+            // not.
             dedup_keys: vec!["timestamp".into(), "id".into()],
             dedup_tiebreak: Some("updated_at".into()),
             tombstone_column: Some("deleted".into()),
-            // Not version_append: that is for UPDATE/DELETE appending versions in
-            // place, which a tier never does — it is rebuilt wholesale.
+            // A tier is rebuilt wholesale, never UPDATEd in place.
             version_append: false,
-            // A rollup of a rollup is a real design (1m -> 1h -> 1d) but it is
-            // not this change: declaring it here would recurse at load.
+            // Declaring rollups on a synthesized tier would recurse at load.
             rollups: vec![],
         })
     }
@@ -322,10 +253,9 @@ impl RollupSpec {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct TableSchema {
     pub table_name: String,
-    /// Continuous-aggregate rollups derived FROM this table. Declared here
-    /// rather than as separate schema files so a rollup cannot drift from its
-    /// source; the rollup's own `TableSchema` is synthesized at load
-    /// (`RollupSpec::synthesize`) and registered under `{table}_rollup_{grain}`.
+    /// Continuous-aggregate rollups derived FROM this table. Each rollup's own
+    /// `TableSchema` is synthesized at load (`RollupSpec::synthesize`) and
+    /// registered under `{table}_rollup_{grain}`.
     #[serde(default)]
     pub rollups: Vec<RollupSpec>,
     pub partitions: Vec<String>,
@@ -333,74 +263,48 @@ pub struct TableSchema {
     pub z_order_columns: Vec<String>,
     pub fields: Vec<FieldDef>,
     /// Column the optimizer should rewrite into a `date` partition filter.
-    /// Defaults to `"timestamp"` for back-compat with existing schemas.
+    /// Defaults to `"timestamp"`.
     #[serde(default)]
     pub time_column: Option<String>,
     /// Composite key for last-write-wins dedup at flush time. Empty = no dedup
-    /// (append-only). E.g. `[id, timestamp]`. Variant columns rejected at load.
-    /// Only collapses dupes inside one bucket; cross-bucket dupes need the
-    /// read-side row_number() rewrite.
+    /// (append-only). Variant columns are rejected at load. Only collapses dupes
+    /// inside one bucket; cross-bucket dupes need the read-side rewrite.
     #[serde(default)]
     pub dedup_keys: Vec<String>,
     /// Tie-breaker column for dedup: when rows share `dedup_keys`, keep the one
-    /// with the greatest value here (ties → last seen, the back-compat default;
-    /// NULL sorts lowest, so an un-stamped legacy row always loses).
-    /// On a [`Self::version_append`] table the tiebreak is TF-OWNED: every write
-    /// stamps it from a per-table monotonic clock (`insert_coerce::stamp_version`),
-    /// so the newest version of a row wins deterministically. Everywhere else it
-    /// is client-supplied and TF never writes it. `None` = keep-last by position.
+    /// with the greatest value here (ties → last seen; NULL sorts lowest, so an
+    /// un-stamped legacy row always loses). On a [`Self::version_append`] table
+    /// this column is TF-OWNED — every write stamps it
+    /// (`insert_coerce::stamp_version`); elsewhere it is client-supplied and TF
+    /// never writes it. `None` = keep-last by position.
     #[serde(default)]
     pub dedup_tiebreak: Option<String>,
     /// Nullable `Boolean` column marking a row version as a DELETION of its
-    /// `dedup_keys` tuple (merge-on-read). `None` = the table has no tombstones
-    /// and every mechanism below is a no-op. NULL and `false` both mean live —
-    /// only `true` is a tombstone — so a table can declare the column before a
-    /// single tombstone exists (and before any backfill) with zero effect.
-    ///
-    /// Independent of [`Self::version_append`] on purpose: read-side filtering
-    /// and the sweep's version collapse key off this column alone, so they come
-    /// alive (as no-ops) without waiting for the write path.
+    /// `dedup_keys` tuple (merge-on-read). NULL and `false` both mean live, so a
+    /// table can declare the column before any tombstone exists, with no
+    /// backfill and no effect. Independent of [`Self::version_append`]: read-side
+    /// filtering and the sweep's version collapse key off this column alone.
     #[serde(default)]
     pub tombstone_column: Option<String>,
     /// Merge-on-read WRITE path: `UPDATE`/`DELETE` append a new row version
-    /// (with a fresh `dedup_tiebreak`, and `tombstone_column = true` for a
-    /// delete) instead of planning a Delta MERGE. Per-table opt-in; false =
-    /// today's in-place mutation. Requires `dedup_keys`, `dedup_tiebreak` and
+    /// (fresh `dedup_tiebreak`, `tombstone_column = true` for a delete) instead
+    /// of planning a Delta MERGE. Requires `dedup_keys`, `dedup_tiebreak` and
     /// `tombstone_column`.
     ///
-    /// Read-side fast paths that are only *wrong* once a key has more than one
-    /// version on disk gate on THIS flag — e.g. the order-preserving union in
-    /// `ProjectRoutingTable::scan`, which exists only to make `DedupExec`'s
-    /// keep-greatest engage. Declaring the column is inert, so gating those on
-    /// the column alone costs a blocking sort + k-way merge for a feature that
-    /// cannot yet have written anything.
-    ///
-    /// [`Self::tombstones_possible`] deliberately does NOT gate on this flag:
-    /// versions already written outlive the flag being turned off. Anything
-    /// whose correctness depends on what is IN STORAGE must key off the column.
-    ///
-    /// 2026-08-02: enabling this on `otel_logs_and_spans` / `otel_metrics` first
-    /// made recent-window reads unusable (1h ~13s, 3h timing out). Dedup becomes
-    /// mandatory, bounded dedup needed ordered input, and the appended version
-    /// carries the row's ORIGINAL timestamp into a NEW file — so Delta files
-    /// overlap in time, no ordering can be declared, and the planner inserted a
-    /// query-time `SortExec` that exhausted the 27.5GB query pool.
-    ///
-    /// Fixed in `read_dedup`, not by giving up the feature: keep-greatest now
-    /// runs WITHOUT a bound (buffering to end-of-stream), so nothing has to
-    /// manufacture an ordering. `mor_delta_leg_sorts` staying 0 is the signal
-    /// that this is holding.
+    /// Read-side fast paths that are only wrong once a key has more than one
+    /// version on disk gate on THIS flag, not on the column — declaring the
+    /// column is inert, and gating on it would pay for a feature that cannot yet
+    /// have written anything. Conversely, anything whose correctness depends on
+    /// what is IN STORAGE (e.g. [`Self::tombstones_possible`]) must key off the
+    /// column, because versions already written outlive the flag.
     #[serde(default)]
     pub version_append: bool,
 }
 
-// Existing tables need an explicit column migration: their Delta schema is not
+// Adding a column to a shipped table needs an explicit migration that evolves
+// the stored Delta schema of every live table (all projects, unified + custom)
+// BEFORE the binary writing the wider batch is deployed. Delta schemas are not
 // derived from YAML, and new-table tests cannot detect an upgrade mismatch.
-//
-// So: a column addition to a shipped table needs a migration that evolves the
-// stored Delta schema of every live table (all projects, unified + custom)
-// BEFORE the binary that writes the wider batch is deployed — verified against a
-// pre-existing table, not a fresh one.
 
 impl TableSchema {
     pub fn time_column_name(&self) -> &str {
@@ -419,37 +323,18 @@ impl TableSchema {
     }
 
     /// Can a tombstone row EXIST in this table's storage? True as soon as the
-    /// column is declared, regardless of the write path.
-    ///
-    /// The old rule was `column && version_append`, guarded by a warning to
-    /// "never flip the flag off after tombstones were written". That warning was
-    /// correct and the hazard was real: disabling merge-on-read on
-    /// `otel_logs_and_spans` (2026-08-02) would have instantly re-enabled
-    /// COUNT(*)-from-stats over files still holding tombstoned rows, counting
-    /// deleted rows as live. Rather than leave a flag whose safety depends on
-    /// never being turned off, this now tracks STORAGE: a declared column means
-    /// a tombstone may be down there, whatever the writer is doing today.
-    ///
-    /// The cost is that a table which declares the column but has never
-    /// tombstoned anything gives up the stats fast path. That is the right side
-    /// to err on — the alternative silently over-counts. A table that genuinely
-    /// wants the fast path simply must not declare a `tombstone_column`.
+    /// column is declared, regardless of the write path. A table that declares
+    /// the column but never tombstones anything gives up the COUNT(*)-from-stats
+    /// fast path; that is the safe side to err on.
     pub fn tombstones_possible(&self) -> bool {
-        // Deliberately does NOT consult `version_append`. Whether a tombstone can
-        // be sitting in STORAGE is a property of the data, not of whether the
-        // write path happens to be enabled right now — and `version_append` is a
-        // flag that gets toggled. It was `tombstone_column.is_some() &&
-        // version_append`, which meant turning merge-on-read OFF instantly
-        // re-enabled COUNT(*)-from-stats pushdown over files that still contain
-        // tombstoned rows, silently counting deleted rows as live (2026-08-02).
-        // Being conservative here costs a dormant table the stats fast path;
-        // being wrong resurrects deleted rows in every COUNT.
+        // Deliberately does NOT consult `version_append`: that flag can be
+        // toggled off, but the tombstones already written stay in storage, and
+        // counting them as live silently over-counts every COUNT(*).
         self.tombstone_column.is_some()
     }
 
     fn validate(&self) -> anyhow::Result<()> {
-        let element_indexes = self.fields.iter().filter_map(|f| Some((f, f.tantivy.as_ref()?))).filter(|(_, c)| c.list_mode == TantivyListMode::Elements);
-        for (field, config) in element_indexes {
+        for (field, config) in self.fields.iter().filter_map(|f| Some((f, f.tantivy.as_ref()?))).filter(|(_, c)| c.list_mode == TantivyListMode::Elements) {
             anyhow::ensure!(
                 config.indexed
                     && config.tokenizer.as_deref() == Some("raw")
@@ -463,8 +348,6 @@ impl TableSchema {
         let field = |role: &str, name: &str| {
             self.field(name).ok_or_else(|| anyhow::anyhow!("schema `{}`: {role} references unknown field `{}`", self.table_name, name))
         };
-        // A `for` with `?`: each item both fails fast and needs the `?` on
-        // `field(..)` inside the check itself.
         for (role, name) in self.dedup_keys.iter().map(|k| ("dedup_keys", k)).chain(self.dedup_tiebreak.iter().map(|tb| ("dedup_tiebreak", tb))) {
             anyhow::ensure!(field(role, name)?.data_type != "Variant", "schema `{}`: {role} cannot be a Variant column `{}`", self.table_name, name);
         }
@@ -487,8 +370,8 @@ impl TableSchema {
             .iter()
             .map(|f| {
                 let field = Field::new(&f.name, parse_arrow_data_type(&f.data_type)?, f.nullable);
-                // Without the ExtensionType marker fresh tables (variant_bench)
-                // crash on the first INSERT — see `VARIANT_EXT_KEY`.
+                // Without the ExtensionType marker a fresh table crashes on the
+                // first INSERT — see `VARIANT_EXT_KEY`.
                 Ok(Arc::new(match f.data_type.as_str() {
                     "Variant" => field.with_metadata(HashMap::from([(VARIANT_EXT_KEY.to_string(), VARIANT_EXT_VALUE.to_string())])),
                     _ => field,
@@ -515,24 +398,12 @@ impl TableSchema {
     }
 
     pub fn sorting_columns(&self) -> Vec<SortingColumn> {
-        // Parquet data files omit partition columns (they live in the path), so
-        // the `SortingColumn.column_idx` the footer records must be the column's
-        // position among the *non-partition* fields — the physical parquet leaf
-        // order the reader (`ordering_from_parquet_metadata`) indexes into. Using
-        // the raw fields-list index over-counts by every partition column that
-        // precedes a sort key (e.g. `date` at field 0), so the footer points at
-        // the wrong column and the sort-order pushdown silently never fires.
-        // ...and a LEAF is not a FIELD. A Variant/struct column occupies as many
-        // parquet leaves as it has children, so counting fields under-shoots for
-        // every sort key that follows one. On a real prod file (97 leaves, 90
-        // fields) `resource___service___name` was recorded as leaf 76 — which is
-        // `attributes___user___email`. The reader then cannot find that name in
-        // the scan's schema, drops the entry, and the file advertises
-        // `[timestamp, id, level, status_code]`: an ordering the data does not
-        // have (within one timestamp, ids do not ascend across services). It
-        // also blocks the `SortPreservingMerge` that would remove the dedup
-        // rewrite's last sort. `timestamp` was correct only because nothing
-        // nested precedes it.
+        // `SortingColumn.column_idx` indexes physical parquet LEAVES among the
+        // NON-partition fields (partition columns live in the path, not the
+        // file), and a leaf is not a field: a Variant/struct column occupies one
+        // leaf per child. Counting fields instead makes the footer name an
+        // unrelated column, so the reader advertises an ordering the data does
+        // not have.
         fn leaves(data_type: &ArrowDataType) -> i32 {
             use arrow::datatypes::DataType::*;
             match data_type {
@@ -545,8 +416,8 @@ impl TableSchema {
         }
         let partition_set = self.partition_set();
         let Ok(fields) = self.fields() else { return Vec::new() };
-        // Filter BEFORE the scan: partition columns live in the path, so they
-        // must not advance the leaf counter.
+        // Filter BEFORE the scan: partition columns must not advance the leaf
+        // counter.
         let leaf_of: HashMap<&str, i32> = self
             .fields
             .iter()
@@ -582,8 +453,8 @@ pub struct FieldDef {
     #[serde(default)]
     pub tantivy: Option<TantivyFieldConfig>,
     /// Opt-out for dictionary encoding. Default on. Set false for high-entropy
-    /// free-text columns (stacktraces, raw queries, full URLs) where dict just
-    /// builds a useless 8MB before falling back to PLAIN — wasted writer pass.
+    /// free-text columns (stacktraces, raw queries, full URLs), where the
+    /// dictionary is built and then discarded for PLAIN.
     #[serde(default)]
     pub dictionary: Option<bool>,
     /// Per-column bloom filter opt-in. Default off. Enable for high-cardinality
@@ -593,27 +464,17 @@ pub struct FieldDef {
     /// Declares that an UPDATE may change this column, so versions of one row
     /// can disagree on its value.
     ///
-    /// **Columns are immutable by default.** That default is what makes point
-    /// lookups cheap: a filter on an immutable column is safe to push BELOW the
-    /// merge-on-read `DedupExec`, because every version of a key agrees, so the
-    /// predicate keeps or drops a key group whole and dedup-then-filter equals
-    /// filter-then-dedup. A filter on a MUTABLE column must stay above the
-    /// dedup, or a stale version could match a predicate the winning version no
-    /// longer satisfies.
+    /// **Columns are immutable by default**, and that is load-bearing: a filter
+    /// on an immutable column can be pushed BELOW the merge-on-read `DedupExec`
+    /// (every version agrees, so it keeps or drops a key group whole), while a
+    /// filter on a MUTABLE column must stay above it or a stale version could
+    /// match a predicate the winning version no longer satisfies. Marking
+    /// everything mutable strands point-lookup predicates above the dedup and
+    /// materialises the whole window.
     ///
-    /// Getting this backwards is expensive. When every non-key column was
-    /// treated as mutable, a single `context___trace_id` lookup over 24h had its
-    /// predicate stranded above the dedup, so the engine coalesced 623 hot-tier
-    /// files plus the Delta legs into one partition and materialised the ENTIRE
-    /// window keep-greatest before discarding almost all of it — ~4.5 GB/s, 84%
-    /// to 93% of the cgroup limit in ~1.5s, and the instance was killed
-    /// (2026-08-20, exit 137).
-    ///
-    /// The declaration is ENFORCED, not trusted: `extract_dml_info` refuses at
-    /// plan time any UPDATE that assigns a column this does not mark, so the
-    /// read path's premise cannot be broken by a writer. The version tiebreak
-    /// and tombstone columns are always treated as mutable without declaring it
-    /// — they vary across versions by construction.
+    /// Enforced, not trusted: `extract_dml_info` refuses at plan time any UPDATE
+    /// assigning a column this does not mark. The version tiebreak and tombstone
+    /// columns are always treated as mutable without declaring it.
     #[serde(default)]
     pub mutable: bool,
 }
@@ -623,10 +484,9 @@ pub struct FieldDef {
 /// `tokenizer`: "raw" (exact match keyword) or "default" (tokenized text).
 /// `flatten`: for Variant columns — "json" (value-only text) or "kv" (key:value tokens).
 ///
-/// User fields are always indexed-only — the real data lives in Delta/parquet.
-/// Only the reserved `_timestamp` and `_id` reserved fields are stored, and only
-/// because the reader needs them to produce `(timestamp, id)` prefilter hits for
-/// the Delta-side join.
+/// User fields are always indexed-only; the real data lives in Delta/parquet.
+/// Only the reserved `_timestamp` and `_id` fields are stored, because the
+/// reader needs them to produce `(timestamp, id)` prefilter hits.
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct TantivyFieldConfig {
     #[serde(default)]
@@ -639,8 +499,8 @@ pub struct TantivyFieldConfig {
     pub list_mode: TantivyListMode,
 }
 
-/// Representation of string arrays in the search index. The default preserves
-/// existing full-text list searches; elements preserve exact tag boundaries.
+/// Representation of string arrays in the search index: joined full text, or
+/// one term per element (exact tag boundaries).
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TantivyListMode {
@@ -651,7 +511,6 @@ pub enum TantivyListMode {
 
 fn parse_arrow_data_type(s: &str) -> anyhow::Result<ArrowDataType> {
     Ok(match s {
-        // Use Utf8View for better performance with zero-copy string operations
         "Utf8" => ArrowDataType::Utf8View,
         "Date32" => ArrowDataType::Date32,
         "Boolean" => ArrowDataType::Boolean,
@@ -666,24 +525,11 @@ fn parse_arrow_data_type(s: &str) -> anyhow::Result<ArrowDataType> {
         "List(Float64)" => ArrowDataType::List(Arc::new(Field::new("item", ArrowDataType::Float64, true))),
         "Timestamp(Microsecond, None)" => ArrowDataType::Timestamp(TimeUnit::Microsecond, None),
         "Timestamp(Microsecond, Some(\"UTC\"))" => ArrowDataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
-        // Variant: declare the inner buffers as Binary to match
-        // `delta_kernel::unshredded_variant()`. delta-rs's kernel rejects
-        // schema mismatches at scan validation time even when no data
-        // files exist (e.g. fresh DELETE on an empty table). Both
-        // MemBuffer and Delta reads end up as Binary because:
-        //   - the parquet reader honors `schema_force_view_types=false`
-        //     (set in our session and in `delta_session_from` for DML);
-        //   - `convert_variant_columns` casts VariantArrayBuilder's
-        //     BinaryView output to Binary before MemBuffer ever sees it.
-        // The ExtensionType marker (`VARIANT_EXT_KEY`) is added to the Field's
-        // metadata in `fields()`.
-        "Variant" => ArrowDataType::Struct(
-            vec![
-                Arc::new(Field::new(VARIANT_METADATA_FIELD, ArrowDataType::Binary, false)),
-                Arc::new(Field::new(VARIANT_VALUE_FIELD, ArrowDataType::Binary, false)),
-            ]
-            .into(),
-        ),
+        // Inner buffers must be Binary (not BinaryView) to match
+        // `delta_kernel::unshredded_variant()`; the kernel rejects schema
+        // mismatches at scan validation even when no data files exist. The
+        // ExtensionType marker is added to the Field metadata in `fields()`.
+        "Variant" => ArrowDataType::Struct([VARIANT_METADATA_FIELD, VARIANT_VALUE_FIELD].map(|n| Arc::new(Field::new(n, ArrowDataType::Binary, false))).into()),
         _ => anyhow::bail!("Unknown type: {}", s),
     })
 }
@@ -707,7 +553,6 @@ fn parse_delta_data_type(s: &str) -> anyhow::Result<DeltaDataType> {
     })
 }
 
-// Include all YAML files from schemas directory at compile time
 static SCHEMAS_DIR: Dir = include_dir!("$CARGO_MANIFEST_DIR/schemas");
 
 pub struct SchemaRegistry {
@@ -727,12 +572,8 @@ impl SchemaRegistry {
                 (schema.table_name.clone(), schema)
             })
             .collect();
-        // Synthesize a table for every declared rollup. Generated rather than
-        // hand-written so a rollup column's type cannot drift from the source
-        // column it aggregates, and so adding one is a config change.
-        // Two rollups generating one name is a config error, and WHICH error it
-        // is depends on whether they group the same way — so say so, rather
-        // than making the operator infer it from a name collision.
+        // Two rollups generating one table name is a config error; which error
+        // depends on whether they group the same way.
         if let Some((src, a, b)) = schemas
             .values()
             .flat_map(|src| src.rollups.iter().tuple_combinations().map(move |(a, b)| (src, a, b)))
@@ -762,16 +603,14 @@ impl SchemaRegistry {
             })
             .collect();
         for r in synthesized {
-            // A hand-written file under a generated name would silently win or
-            // lose depending on iteration order. (Same-source rollup collisions
-            // are already reported above, with a better message.)
+            // A hand-written file under a generated name would win or lose by
+            // iteration order.
             assert!(!schemas.contains_key(&r.table_name), "rollup table `{}` collides with a hand-written schema file of the same name", r.table_name);
             schemas.insert(r.table_name.clone(), r);
         }
-        // Migration aliases remain queryable while v3/v2 slice generations
-        // shadow-build and canary. They are read-only schema aliases: source
-        // rollup declarations point only at the new targets, so maintenance
-        // cannot accidentally keep writing the retired generations.
+        // Read-only aliases keeping retired rollup generations queryable while
+        // the new ones shadow-build: source declarations point only at the new
+        // targets, so maintenance never writes the retired generations.
         for (current, legacy) in [
             ("otel_logs_and_spans_rollup_dashboard_1m_v3", "otel_logs_and_spans_rollup_dashboard_1m_v2"),
             ("otel_logs_and_spans_rollup_dashboard_1h_v2", "otel_logs_and_spans_rollup_dashboard_1h_v1"),
@@ -799,15 +638,10 @@ impl SchemaRegistry {
     }
 }
 
-// Global registry instance.
-//
-// IMPORTANT: The registry is loaded once via `include_dir!` and `OnceLock`,
-// so schemas are immutable for the lifetime of the process. Several
-// downstream caches rely on this invariant for correctness (not just perf):
-//   - `optimizers::indexed_columns_for` (per-table tokenizer map)
-//   - `plan_cache::PlanCacheHook` (LogicalPlan embeds SchemaRef at parse time)
-// If hot-reload of YAML schemas is ever added, those caches must gain a
-// schema-version token in their key (or be flushed on reload).
+// Schemas are immutable for the process lifetime, and downstream caches
+// (`optimizers::indexed_columns_for`, `plan_cache::PlanCacheHook`) depend on
+// that for CORRECTNESS. Adding hot-reload means giving those caches a
+// schema-version token, or flushing them on reload.
 static SCHEMA_REGISTRY: OnceLock<SchemaRegistry> = OnceLock::new();
 
 pub fn registry() -> &'static SchemaRegistry {
@@ -822,15 +656,13 @@ pub fn get_default_schema() -> &'static TableSchema {
     registry().get_default().expect("No schemas available in registry")
 }
 
-/// `get_schema(table_name)`, falling back to the default schema — the common case at every call site.
+/// `get_schema(table_name)`, falling back to the default schema.
 pub fn schema_or_default(table_name: &str) -> &'static TableSchema {
     get_schema(table_name).unwrap_or_else(get_default_schema)
 }
 
 /// Inner field names of the unshredded Variant struct
-/// (`delta_kernel::unshredded_variant()`). Centralized here so any writer or
-/// validator that constructs a Variant struct uses the same names; if
-/// delta-kernel ever renames these, only this file changes.
+/// (`delta_kernel::unshredded_variant()`).
 pub const VARIANT_METADATA_FIELD: &str = "metadata";
 pub const VARIANT_VALUE_FIELD: &str = "value";
 
@@ -848,36 +680,27 @@ pub fn is_variant_type(data_type: &ArrowDataType) -> bool {
     fields.len() == 2 && binary_named(VARIANT_METADATA_FIELD) && binary_named(VARIANT_VALUE_FIELD)
 }
 
-/// Replaces Variant fields with Utf8View on a schema. This is the schema we hand to the
-/// SQL planner via `TableProvider::schema()` whenever the table contains Variant columns.
+/// Replaces Variant fields with Utf8View, giving the SQL-facing view of a table
+/// with Variant columns (`TableProvider::schema()`); `real_schema()` keeps the
+/// storage view.
 ///
-/// Background: `INSERT INTO t (v) VALUES ('{"a":1}')` fails inside
-/// `LogicalPlanBuilder::values` because `arrow_cast::can_cast_types(Utf8, Struct{Binary,Binary})`
-/// is false. The check is hardcoded in datafusion-expr; there is no extension hook to
-/// register a Utf8→Variant coercion (datafusion exposes `ExprPlanner` for binary ops,
-/// field access, etc., but not for the values-type check). Patching arrow-cast or
-/// datafusion-expr is the only "fundamental" fix and is out of scope.
-///
-/// So we keep two views of the schema:
-/// - SQL-facing view (this function): Utf8View for variant cols → planner accepts JSON literals.
-/// - Storage view (`real_schema()`): the actual Struct{Binary, Binary} variant type.
-///
-/// `DataSink::write_all` converts inbound Utf8/Utf8View → Variant struct (via
-/// `parquet_variant_compute::VariantArrayBuilder`) before the Delta write.
+/// Needed because `INSERT ... VALUES ('{"a":1}')` fails in
+/// `LogicalPlanBuilder::values`: `can_cast_types(Utf8, Struct{Binary,Binary})` is
+/// false and datafusion exposes no hook to register a Utf8→Variant coercion for
+/// that check. `DataSink::write_all` converts inbound Utf8/Utf8View to the
+/// Variant struct before the Delta write.
 pub fn create_insert_compatible_schema(schema: &SchemaRef) -> SchemaRef {
-    // `tf.pg_type = jsonb`: pgwire Describe derives RowDescription from the
-    // *unanalyzed* plan, where Variant cols carry this Utf8View view. Without
-    // the tag, bare Variant columns surface text OID 25 and strict drivers
-    // (hasql) reject the row (expected jsonb 3802). vendor/arrow-pg maps the
-    // tag to OID 3802 + the 0x01 binary jsonb version byte.
+    // `tf.pg_type = jsonb` is required: pgwire Describe derives RowDescription
+    // from the *unanalyzed* plan, so without the tag Variant columns surface as
+    // text OID 25 and strict drivers reject the row. vendor/arrow-pg maps the tag
+    // to OID 3802 + the 0x01 binary jsonb version byte.
     Arc::new(Schema::new(
         schema
             .fields()
             .iter()
             .map(|f| match is_variant_type(f.data_type()) {
                 true => Arc::new(
-                    Field::new(f.name(), ArrowDataType::Utf8View, f.is_nullable())
-                        .with_metadata(HashMap::from([("tf.pg_type".to_string(), "jsonb".to_string())])),
+                    Field::new(f.name(), ArrowDataType::Utf8View, f.is_nullable()).with_metadata(HashMap::from([("tf.pg_type".into(), "jsonb".into())])),
                 ),
                 false => f.clone(),
             })
@@ -905,20 +728,20 @@ mod tests {
         RollupMeasure { name: name.into(), agg: agg.into(), column: column.map(str::to_owned), filter: filter.map(str::to_owned) }
     }
 
-    /// A 1m rollup over `kind` — the shape every spec test varies one part of.
+    /// A 1m rollup over `kind` — the shape every spec test varies.
     fn spec(name: &str, measures: Vec<RollupMeasure>) -> RollupSpec {
         RollupSpec { grain: "1m".into(), name: Some(name.into()), dimensions: vec!["kind".into()], measures, derive_from: None }
     }
 
     /// The merge-on-read triple every tombstoned table must declare identically.
-    /// The tiebreak MUST be the TF-owned column, not the client's:
-    /// `insert_coerce::stamp_version` OVERWRITES whatever this names, so
-    /// pointing it back at `observed_timestamp` / `ingested_at` would destroy
-    /// client data on every write.
+    /// The tiebreak MUST name the TF-owned column: `insert_coerce::stamp_version`
+    /// overwrites whatever it names, so pointing it at a client column would
+    /// destroy client data on every write.
+    #[test_case("mor_versioned")]
     fn assert_tombstone_shape(name: &str) {
         let schema = get_schema(name).unwrap_or_else(|| panic!("{name} registered"));
         assert_eq!(schema.tombstone_column.as_deref(), Some("deleted"), "{name} tombstone column");
-        // Nullable, so the migration needed no backfill: NULL reads as live.
+        // Nullable so no backfill is needed: NULL reads as live.
         assert_eq!(schema.field_def("deleted"), Some((ArrowDataType::Boolean, true)), "{name}.deleted must be nullable Boolean");
         assert_eq!(schema.dedup_tiebreak.as_deref(), Some("updated_at"), "{name} must break ties on the TF-owned stamp");
     }
@@ -939,16 +762,14 @@ mod tests {
     fn synthesized_rollup_stores_a_generation_and_tdigest() {
         let rollup = spec("digest_test", vec![measure("digest", "tdigest", Some("duration"), None)]).synthesize(source()).expect("valid rollup");
         assert_eq!(rollup.field_def("rollup_generation"), Some((ArrowDataType::Utf8View, false)));
-        // `kind` is tantivy-indexed on the source and must NOT inherit it here:
-        // measured 2026-08-24, the prefilter it enables costs 8.2s against a
-        // 0.28s control on the same rows. See the comment in `synthesize`.
+        // `kind` is tantivy-indexed on the source and must NOT inherit it here —
+        // see `synthesize`.
         assert!(rollup.fields.iter().all(|f| f.tantivy.is_none()), "no rollup field may carry a tantivy config");
     }
 
-    /// A `first` measure is only re-aggregable if something records WHICH row
-    /// its value came from, and that something is the companion `min(timestamp)`
-    /// measure. Without one, the coarse tier would have to guess -- so the spec
-    /// is refused at load rather than building a tier whose buckets are wrong.
+    /// A `first` measure is only re-aggregable if a companion `min(timestamp)`
+    /// measure records which row its value came from, so a spec without one is
+    /// refused at load.
     #[test]
     fn a_first_measure_is_refused_without_its_companion() {
         let source = source();
@@ -960,22 +781,19 @@ mod tests {
         assert!(spec(vec![landing(None), companion(None)]).validate(source).is_ok(), "the companion makes it valid");
 
         // "earliest row" and "earliest row MATCHING the filter" are different
-        // rows, and it is the second one whose value was stored -- so a
-        // companion carrying a different filter cannot order this measure.
+        // rows, so a companion with a different filter cannot order this measure.
         let filter = "attributes___url___path <> ''";
         assert!(spec(vec![landing(Some(filter)), companion(None)]).validate(source).is_err(), "the companion's filter must match the measure's");
         assert!(spec(vec![landing(Some(filter)), companion(Some(filter))]).validate(source).is_ok());
 
-        // The stored value keeps the source column's own type -- it IS a value
-        // from that column, not a sketch over it.
+        // The stored value keeps the source column's type: it IS a value from
+        // that column, not a sketch over it.
         let rollup = spec(vec![landing(None), companion(None)]).synthesize(source).expect("valid rollup");
         assert_eq!(rollup.field_def("landing_url").map(|(ty, _)| ty), Some(ArrowDataType::Utf8View));
     }
 
-    /// A sketch measure stores Binary regardless of aggregate. An `hll`, unlike
-    /// every other aggregate, must accept a NON-numeric source column — the
-    /// columns anyone wants a distinct count of (trace id, user id, service
-    /// name) are all strings.
+    /// A sketch measure stores Binary regardless of aggregate, and `hll` — alone
+    /// among the aggregates — must accept a NON-numeric source column.
     #[test_case("tdigest", "duration" => Some((ArrowDataType::Binary, true)) ; "tdigest over a numeric column")]
     #[test_case("hll", "context___trace_id" => Some((ArrowDataType::Binary, true)) ; "hll over a string column")]
     #[test_case("hll", "duration" => Some((ArrowDataType::Binary, true)) ; "hll over a numeric column")]
@@ -1003,48 +821,21 @@ mod tests {
         }
     }
 
-    /// The tombstone column must be nullable Boolean (NULL = live, so no
-    /// backfill) and named by the schema — nothing hard-codes it. Exercised on
-    /// `mor_versioned`, the from-scratch fixture. (It was once the ONLY table
-    /// allowed to declare these columns; the shipped tables joined it after the
-    /// 2026-08-02 migration — see `shipped_mor_tables_declare_the_migrated_columns_last`.)
-    #[test]
-    fn mor_versioned_tombstone_column_is_nullable_boolean() {
-        assert_tombstone_shape("mor_versioned");
-    }
-
-    /// The SHIPPED merge-on-read tables, post-migration (2026-08-02). This guard
-    /// used to assert these tables had NO merge-on-read columns, because adding
-    /// one to a table that already holds live Delta data broke prod (7d68f01):
-    /// the stored transaction log kept the old column set while the write path
-    /// built batches to the YAML's, giving `number of columns(94) must match
-    /// number of fields(92)`.
-    ///
-    /// The migration has since been run and verified against prod
-    /// (`migrate-columns`, commit edb2fd2), so the invariant is no longer
-    /// "absent" but "declared in the SAME SHAPE AND ORDER the stored schema was
-    /// widened in" — the two columns last, nullable, and never before any
-    /// pre-existing field. Reordering them here re-creates 7d68f01 exactly.
+    /// Migrated columns must be declared in the SAME SHAPE AND ORDER the stored
+    /// Delta schema was widened in — last, nullable, never before a pre-existing
+    /// field. Otherwise the write path builds batches the transaction log's
+    /// column set does not match, and every write fails.
     #[test]
     fn shipped_mor_tables_declare_the_migrated_columns_last() {
         for name in ["otel_logs_and_spans", "otel_metrics"] {
             let schema = get_schema(name).unwrap_or_else(|| panic!("{name} registered"));
-            // `version_append` is OFF since 2026-08-02 (it forced a query-time
-            // SortExec that exhausted the query pool), but the migrated columns
-            // and the tombstone/tiebreak declarations MUST stay: tombstones and
-            // multi-version rows written while it was on are still in storage,
-            // and DedupExec + the tombstone filter are what keep them correct.
             assert!(schema.version_append, "{name} ships merge-on-read");
             assert_tombstone_shape(name);
             assert!(matches!(schema.field_def("updated_at"), Some((ArrowDataType::Timestamp(..), true))), "{name}.updated_at must be a nullable timestamp");
 
-            // ORDER is the load-bearing part: `migrate-columns` APPENDS, so
-            // every migrated column sits after every pre-existing one, in the
-            // order storage was widened. The merge-on-read pair went first
-            // (2026-08-02); a later migration appends after them, never between
-            // — inserting one mid-list is 7d68f01 again.
+            // `migrate-columns` APPENDS, so a later migration must extend this
+            // list at the end, never insert mid-list.
             let migrated: &[&str] = match name {
-                // `attributes___http___route`, migrated 2026-09-02.
                 "otel_logs_and_spans" => &["updated_at", "deleted", "attributes___http___route"],
                 _ => &["updated_at", "deleted"],
             };
@@ -1065,24 +856,17 @@ mod tests {
         assert!(parse("version_append: true\n", FIELDS_YAML).unwrap_err().to_string().contains("version_append requires"));
     }
 
-    /// A declared-but-dormant tombstone column must NOT read as "tombstones can
-    /// exist" — that verdict is what the COUNT(*) stats pushdown gates on, and
-    /// reading it off the column alone cost every `COUNT(*)` on the main table
-    /// its fast path (pre-deploy review, 2026-07-31).
+    /// `tombstones_possible` is what the COUNT(*) stats pushdown gates on, so it
+    /// must track the declared column rather than the write-path flag.
     #[test]
     fn tombstones_possible_tracks_storage_not_the_write_path() {
         let parse = |extra: &str| parse_schema(extra, FIELDS_YAML);
 
         assert!(!parse("").tombstones_possible(), "no tombstone column at all");
-        // A declared column means a tombstone MAY sit in storage, whatever the
-        // write path is doing now — `version_append` is a flag that gets toggled,
-        // and turning it off does not delete the tombstones already written.
-        // Consulting it here let COUNT(*)-from-stats count deleted rows as live
-        // the moment merge-on-read was disabled (2026-08-02).
+        // Turning `version_append` off does not delete tombstones already
+        // written, so a declared column alone means they may sit in storage.
         assert!(parse("tombstone_column: deleted\n").tombstones_possible(), "declared column ⇒ tombstones may exist even with the write path off");
         assert!(parse("tombstone_column: deleted\nversion_append: true\n").tombstones_possible(), "write path on → tombstones can exist");
-        // The live schemas. otel has `version_append: false` since 2026-08-02 but
-        // KEEPS its tombstone column, so it must stay conservative.
         assert!(get_schema("otel_logs_and_spans").unwrap().tombstones_possible(), "otel ships merge-on-read");
         assert!(get_schema("mor_versioned").unwrap().tombstones_possible());
         // `mor_dormant` declares a tiebreak but NO tombstone column, so nothing
@@ -1100,18 +884,9 @@ mod tests {
     }
 
     /// A footer `SortingColumn.column_idx` indexes parquet LEAVES, and a
-    /// Variant/struct column is several leaves. Counting fields instead made
-    /// every sort key after the first nested column point at an unrelated
-    /// column: on a real prod file (97 leaves, 90 fields)
-    /// `resource___service___name` was recorded as leaf 76, which is
-    /// `attributes___user___email`. The reader could not find that name in the
-    /// scan schema, dropped the entry, and the file advertised
-    /// `[timestamp, id, level, status_code]` — an ordering the data does not
-    /// have.
-    ///
-    /// Resolving each recorded index back through the same leaf order is what
-    /// makes this checkable at all; asserting a hardcoded number would just
-    /// re-encode the bug.
+    /// Variant/struct column is several leaves, so each recorded index must
+    /// resolve back to the column it names. Asserting hardcoded indices would
+    /// just re-encode a miscount.
     #[test]
     fn footer_sort_indices_resolve_to_the_columns_they_name() {
         fn leaf_paths(name: &str, data_type: &ArrowDataType, out: &mut Vec<String>) {
@@ -1144,10 +919,9 @@ mod tests {
                 );
             }
             assert!(leaves.len() >= fields.len(), "{table}: leaves cannot be fewer than fields, or this test is measuring nothing");
-            // Partition columns live in the path, not in the file, so they must
-            // not consume a leaf. `timestamp` at leaf 0 is what proves `date`
-            // (declared first) was excluded — the older regression this
-            // subsumes, which caught the same class of bug one layer up.
+            // Partition columns live in the path, not the file, so they consume
+            // no leaf: `timestamp` at leaf 0 proves `date` (declared first) was
+            // excluded.
             assert_eq!(leaves.first().map(String::as_str), Some("timestamp"), "{table}: the lead sort key must be leaf 0");
             for partition in &schema.partitions {
                 assert!(!leaves.contains(partition), "{table}: partition `{partition}` must not occupy a parquet leaf");

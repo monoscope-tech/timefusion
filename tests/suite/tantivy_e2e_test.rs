@@ -1,18 +1,7 @@
-//! Tier-3 end-to-end: SQL `text_match()` through DataFusion + Delta + MinIO.
+//! End-to-end: SQL `text_match()` through DataFusion + Delta + MinIO.
 //!
-//! Scenarios covered:
-//! 1. With tantivy enabled, INSERT → flush → SELECT … WHERE text_match(col, 'q')
-//!    returns the same rows as the equivalent full-scan baseline (tantivy disabled).
-//! 2. MemBuffer-only data (un-flushed) is still queryable via text_match (UDF
-//!    fallback). Result equals the baseline.
-//! 3. Mixed mode (some rows in MemBuffer, some flushed to Delta) — result is the
-//!    union, no duplicates, no missed rows.
-//! 4. The id-IN prefilter is actually injected when tantivy is enabled (sanity:
-//!    we observe fewer file reads — measured indirectly via correctness with a
-//!    manifest entry marked failed).
-//!
-//! Requires MinIO running (make minio-start). Serial because we share the test
-//! bucket; each test uses a unique project_id / table_prefix so data is isolated.
+//! Requires MinIO running (make minio-start). Serial because the test bucket is
+//! shared; each test uses a unique project_id / table_prefix for isolation.
 
 #![cfg(test)]
 
@@ -47,15 +36,15 @@ fn cfg(test_id: &str) -> Arc<AppConfig> {
     c.cache.timefusion_foyer_disabled = true;
     c.tantivy = TantivyConfig {
         timefusion_tantivy_compression_level: 3,
-        timefusion_tantivy_route_equality: true, // exercise the P0 `=` routing path
+        timefusion_tantivy_route_equality: true,
         timefusion_tantivy_prefilter_min_selectivity_pct: 50,
         ..Default::default()
     };
     Arc::new(c)
 }
 
-/// The on-disk cache root `cfg` gives a test id — tests that build a second
-/// `TantivySearchService` by hand must point at the same directory.
+/// The on-disk cache root `cfg` gives a test id; a hand-built
+/// `TantivySearchService` must point at the same directory.
 fn data_dir(test_id: &str) -> PathBuf {
     PathBuf::from(format!("/tmp/timefusion-tantivy-e2e-{test_id}"))
 }
@@ -66,7 +55,6 @@ async fn build_db(test_id: &str, tantivy_enabled: bool) -> Result<(Database, Ses
     let cfg_arc = cfg(test_id);
     let mut db = Database::with_config(cfg_arc.clone()).await?;
 
-    // BufferedWriteLayer with delta writer
     let db_for_cb = db.clone();
     let delta_cb: DeltaWriteCallback = Arc::new(move |project_id, table_name, batches, _wm| {
         let db = db_for_cb.clone();
@@ -107,11 +95,9 @@ async fn build_db(test_id: &str, tantivy_enabled: bool) -> Result<(Database, Ses
     Ok((db, ctx, svc))
 }
 
-/// Build a RecordBatch matching the otel_logs_and_spans schema using the
-/// existing test helper. `rows` is `(id, name, status_message)`. The `level`
-/// is derived from the message ("failed" → ERROR, "timeout" → WARN, else
-/// INFO) so tests can query `WHERE level = 'ERROR'` to exercise the
-/// rewriter's `=` path against the raw-tokenized indexed column.
+/// Build an otel_logs_and_spans RecordBatch from `(id, name, status_message)`
+/// rows. `level` is derived from the message ("failed"/"declined" → ERROR,
+/// "timeout" → WARN, else INFO) so tests can query `WHERE level = 'ERROR'`.
 fn make_batch<S: AsRef<str>>(project: &str, rows: &[(S, S, S)]) -> RecordBatch {
     let now = chrono::Utc::now();
     let records: Vec<_> = rows
@@ -143,25 +129,17 @@ fn make_batch<S: AsRef<str>>(project: &str, rows: &[(S, S, S)]) -> RecordBatch {
     json_to_batch(records).expect("json_to_batch")
 }
 
+/// Sorted non-null `id` values (the column may arrive as Utf8 or Utf8View).
 async fn collect_ids(ctx: &SessionContext, sql: &str) -> Result<Vec<String>> {
-    let r = ctx.sql(sql).await?.collect().await?;
-    let mut ids: Vec<String> = Vec::new();
-    for b in &r {
-        let arr = b.column_by_name("id").unwrap();
-        if let Some(s) = arr.as_string_opt::<i32>() {
-            for i in 0..s.len() {
-                if !s.is_null(i) {
-                    ids.push(s.value(i).to_string());
-                }
-            }
-        } else if let Some(s) = arr.as_string_view_opt() {
-            for i in 0..s.len() {
-                if !s.is_null(i) {
-                    ids.push(s.value(i).to_string());
-                }
-            }
-        }
-    }
+    let mut ids: Vec<String> = ctx
+        .sql(sql)
+        .await?
+        .collect()
+        .await?
+        .iter()
+        .filter_map(|b| arrow::compute::cast(b.column_by_name("id").unwrap(), &arrow::datatypes::DataType::Utf8).ok())
+        .flat_map(|a| a.as_string::<i32>().iter().flatten().map(ToString::to_string).collect::<Vec<_>>())
+        .collect();
     ids.sort();
     Ok(ids)
 }
@@ -189,8 +167,7 @@ async fn flush_all(db: &Database) -> Result<()> {
     Ok(())
 }
 
-// Each test uses a unique project_id derived from a UUID so that the shared
-// MinIO bucket (timefusion-tests) doesn't expose state across runs/tests.
+// Unique per test so the shared MinIO bucket can't leak state across runs.
 fn unique_project() -> String {
     format!("p-{}", &uuid::Uuid::new_v4().to_string()[..12])
 }
@@ -200,18 +177,16 @@ const TABLE: &str = "otel_logs_and_spans";
 #[derive(Clone, Copy)]
 enum Land {
     /// Straight to Delta (skip_queue) — bypasses the BufferedWriteLayer, so no
-    /// tantivy index is ever built for these rows.
+    /// tantivy index is built.
     Delta,
-    /// Left in MemBuffer, never flushed — definitely not indexed.
+    /// Left in MemBuffer, never flushed — not indexed.
     Mem,
     /// Through the BufferedWriteLayer and force-flushed, so a real index exists.
     Flushed,
 }
 
-/// A tantivy-on / tantivy-off pair holding identical rows in one project. Every
-/// prefilter test below shares the same correctness invariant — the routed
-/// result must equal the full-scan baseline AND an exact id list — so it is
-/// asserted once here instead of copied per test.
+/// A tantivy-on / tantivy-off pair holding identical rows in one project, so the
+/// shared invariant (routed result == full-scan baseline) is asserted in one place.
 struct Pair {
     on: Database,
     off: Database,
@@ -250,8 +225,8 @@ impl Pair {
         format!("SELECT id FROM {TABLE} WHERE project_id='{}' AND {predicate}", self.p)
     }
 
-    /// The tantivy-off full-scan result, without touching the enabled context —
-    /// querying that would populate its five-second manifest cache.
+    /// The tantivy-off full-scan result. Must not touch the enabled context:
+    /// querying it would populate its five-second manifest cache.
     async fn baseline_ids(&self, predicate: &str) -> Result<Vec<String>> {
         collect_ids(&self.ctx_off, &self.id_sql(predicate)).await
     }
@@ -269,8 +244,8 @@ impl Pair {
     }
 }
 
-/// One flush group: a single matching row plus nine fillers, so the covered
-/// index stays under `prefilter_min_selectivity_pct` and the prefilter engages.
+/// One matching row plus nine fillers, so the index stays under
+/// `prefilter_min_selectivity_pct` and the prefilter engages.
 fn flush_group(hit_id: &str, hit_msg: &str, filler_prefix: &str) -> Vec<(String, String, String)> {
     std::iter::once((hit_id.to_string(), "n".to_string(), hit_msg.to_string()))
         .chain((1..10).map(|i| (format!("{filler_prefix}{i}"), "n".to_string(), "ordinary".to_string())))
@@ -306,8 +281,8 @@ async fn tantivy_histogram_daily_budget_preserves_buckets_and_captured_files() -
     db.insert_records_batch(&project, table, vec![batch], true, None).await?;
     let window = HistogramWindow::new(start, start + 3 * day, width, 0, 16)?;
     let membership = Membership::Contains { column: "hashes".into(), value: hash.clone() };
-    // Each date expands to >128 KiB of hash strings. All three exceed this
-    // budget, while one date fits: execution must release each day's sources.
+    // One date fits the budget but all three together do not: execution must
+    // release each day's sources.
     let captured = db.capture_histogram(&project, table, window, Some(&membership), 192 * 1024, ctx.task_ctx()).await?;
     assert_eq!(captured.count().await?.counts, expected);
     assert!(db.indexed_histogram(&project, table, window, Some(&membership), 1024, ctx.task_ctx()).await.is_err());
@@ -319,7 +294,7 @@ async fn tantivy_histogram_daily_budget_preserves_buckets_and_captured_files() -
 }
 
 /// A newer nonmatching indexed version must defeat an older matching version
-/// outside index coverage. Exercises real SQL planning and merge-on-read.
+/// outside index coverage.
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn mutable_index_filter_cannot_resurrect_an_uncovered_version() -> Result<()> {
@@ -331,8 +306,8 @@ async fn mutable_index_filter_cannot_resurrect_an_uncovered_version() -> Result<
     let table = "mor_versioned";
     let now = chrono::Utc::now();
     let row = |id: &str, name: &str| json!({"timestamp": now.timestamp_micros(), "date": now.date_naive().to_string(), "id": id, "name": name, "hashes": [name], "project_id": project});
-    // Direct writes bypass index construction. The update is appended through
-    // the buffer, whose flush creates the only indexed file.
+    // Direct writes bypass index construction; only the buffered update below
+    // produces an indexed file.
     db.insert_records_batch(&project, table, vec![json_to_batch_for(table, vec![row("changed", "a")])?], true, None).await?;
     let unindexed_sql = format!(
         "SELECT time_bucket('1 second', timestamp), count(*) FROM {table} WHERE project_id='{project}' AND timestamp >= TIMESTAMP '{}' AND timestamp < TIMESTAMP '{}' AND array_has(hashes, 'a') GROUP BY 1",
@@ -460,9 +435,8 @@ async fn mutable_index_filter_cannot_resurrect_an_uncovered_version() -> Result<
 }
 
 /// Poll the tantivy manifest until it has at least `want` entries. The index
-/// build is a detached task since the flush-throughput work (ef13450) —
-/// `flush_all_now()` returning only guarantees the Delta commit, so tests
-/// asserting on the manifest must wait for the sidecar to catch up.
+/// build is a detached task: `flush_all_now()` only guarantees the Delta commit,
+/// so manifest assertions must wait for the sidecar. Errors on a 30s timeout.
 async fn wait_for_manifest_entries(store: &dyn object_store::ObjectStore, project: &str, want: usize) -> Result<timefusion::tantivy::Manifest> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
@@ -470,8 +444,6 @@ async fn wait_for_manifest_entries(store: &dyn object_store::ObjectStore, projec
         if m.entries.len() >= want {
             return Ok(m);
         }
-        // Err (not the short manifest) on expiry — the caller's assert would
-        // otherwise fire with a confusing entry-count mismatch.
         anyhow::ensure!(std::time::Instant::now() <= deadline, "manifest for {project} stuck at {} entries after 30s, want {want}", m.entries.len());
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
@@ -489,18 +461,16 @@ async fn delta_flushed_text_match_matches_baseline() -> Result<()> {
         ("d", "payment", "charge failed: declined card"),
     ];
     let pair = Pair::new("direct", Land::Delta, &rows).await?;
-    // No tantivy index was built (skip_queue=true bypasses BufferedWriteLayer).
-    // Search returns None → no prefilter applied → UDF post-filter does the work.
+    // skip_queue=true bypasses the BufferedWriteLayer, so no index exists and
+    // the UDF post-filter must do the work.
     pair.assert_ids("text_match(status_message, 'failed')", &["b", "d"], "unindexed text_match falls back to the UDF post-filter").await
 }
 
 #[serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn membuffer_only_level_eq_falls_back_correctly() -> Result<()> {
-    // Rows stay in MemBuffer (no flush). Exact `=` is not tantivy-accelerated
-    // (bloom/stats handle it), so `level = 'ERROR'` runs directly against the
-    // in-memory batches. Correctness invariant: result identical to the
-    // tantivy-off baseline.
+    // Rows stay in MemBuffer, so `level = 'ERROR'` runs directly against the
+    // in-memory batches and must still equal the tantivy-off baseline.
     let rows = [("x1", "service-a", "operation completed"), ("x2", "service-a", "operation failed"), ("x3", "service-b", "request timeout")];
     let pair = Pair::new("mem", Land::Mem, &rows).await?;
     pair.assert_ids("level = 'ERROR'", &["x2"], "MemBuffer-only result must equal baseline with rewriter on").await
@@ -509,9 +479,8 @@ async fn membuffer_only_level_eq_falls_back_correctly() -> Result<()> {
 #[serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn tantivy_indexer_actually_writes_manifest_when_flush_routes_through_buffered_layer() -> Result<()> {
-    // This test confirms the *write-side* wiring: when we go through the
-    // BufferedWriteLayer (not skip_queue), and force-flush the bucket, the
-    // tantivy indexer runs and a manifest entry appears.
+    // Write-side wiring: a force-flushed bucket must run the tantivy indexer
+    // and publish a manifest entry.
     let id = uuid::Uuid::new_v4().to_string()[..8].to_string();
     let (db, _ctx, svc) = build_db(&format!("{id}-flush"), true).await?;
     let svc = svc.expect("service should be present when tantivy is enabled");
@@ -554,13 +523,8 @@ async fn tantivy_indexer_actually_writes_manifest_when_flush_routes_through_buff
 #[ignore = "writes Delta+MemBuffer in same time bucket; per-bucket Delta exclusion drops the Delta-direct rows. Production never writes both legs simultaneously. See tests/buffer_consistency_test.rs comment for details."]
 #[tokio::test(flavor = "multi_thread")]
 async fn mixed_membuffer_and_delta_level_eq_returns_union() -> Result<()> {
-    // The hard case: some rows are in Delta (and possibly indexed by
-    // tantivy), some are still in MemBuffer (definitely not indexed).
-    // Exact `=` is not tantivy-accelerated; `level = 'ERROR'` runs as a plain
-    // predicate. Behavior:
-    //   - Delta side pruned by bloom filters / column stats
-    //   - MemBuffer side is queried directly with the predicate
-    //   - Result is the union with no duplicates and no missed rows
+    // Some rows in Delta, some still in MemBuffer: the result must be the union
+    // with no duplicates and no missed rows.
     let pair = Pair::new("mix", Land::Delta, &[("d-old1", "n", "old failed operation"), ("d-old2", "n", "old successful operation")]).await?;
     pair.write(Land::Mem, &[("m-new1", "n", "new failed operation"), ("m-new2", "n", "new clean operation")]).await?;
     pair.assert_ids("level = 'ERROR'", &["d-old1", "m-new1"], "mixed-mode results must be identical between on/off").await
@@ -569,10 +533,8 @@ async fn mixed_membuffer_and_delta_level_eq_returns_union() -> Result<()> {
 #[serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn compaction_gc_drops_stale_indexes_keeps_live_ones() -> Result<()> {
-    // Two separate flushes → two tantivy indexes, each covering its own
-    // parquet file. Simulate compaction by calling gc with a `live_uris` list
-    // that contains only one of the two files. The stale entry should be
-    // dropped, the other kept.
+    // Two flushes → two indexes; gc with only one file live must drop the stale
+    // entry and keep the other.
     let id = uuid::Uuid::new_v4().to_string()[..8].to_string();
     let (db, _ctx, svc) = build_db(&format!("{id}-gc"), true).await?;
     let svc = svc.expect("tantivy enabled");
@@ -586,7 +548,6 @@ async fn compaction_gc_drops_stale_indexes_keeps_live_ones() -> Result<()> {
     let m_before = wait_for_manifest_entries(svc.object_store.as_ref(), &p, 2).await?;
     assert_eq!(m_before.entries.len(), 2, "two flushes → two manifest entries");
 
-    // Collect every URI both entries covered.
     let all_uris: Vec<String> = m_before.entries.values().flat_map(|e| e.covered_files.clone()).collect();
     assert!(!all_uris.is_empty(), "covered_files should be populated");
 
@@ -603,10 +564,8 @@ async fn compaction_gc_drops_stale_indexes_keeps_live_ones() -> Result<()> {
 #[serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn flushed_index_prefilter_is_actually_used() -> Result<()> {
-    // Exercise the *active* prefilter code path: route writes through the
-    // BufferedWriteLayer + flush so a real tantivy index exists. Then query
-    // and verify the result still matches the baseline (correctness in the
-    // happy path where the index covers all rows).
+    // Active prefilter path: a real index covering all rows must still produce
+    // the baseline result.
     let rows = [
         ("k1", "auth", "login failed: bad password"),
         ("k2", "auth", "login successful"),
@@ -619,22 +578,12 @@ async fn flushed_index_prefilter_is_actually_used() -> Result<()> {
     ];
     let pair = Pair::new("pf", Land::Flushed, &rows).await?;
 
-    // Confirm a manifest entry exists for the ON case.
     assert!(!pair.wait_manifest(1).await?.entries.is_empty(), "manifest should have entries after flush");
 
-    // Real-world SQL using a substring LIKE (the path that still routes
-    // through tantivy — exact `=` is now served by bloom filters/stats). The
-    // TantivyPredicateRewriter wraps `status_message LIKE '%login%'` with
-    // `text_match(status_message, 'login')` so the ProjectRoutingTable invokes
-    // the tantivy prefilter; the original LIKE re-runs on the scan output.
-    //   "login failed: bad password" → k1   "login successful" → k2
-    //   "charge declined"            → k3   "charge succeeded" → k4
-    //
-    // The last three are a regression: a routed substring literal carrying
-    // tantivy query-grammar tokens (whitespace-adjacent `-` → MustNot, bare
-    // `NOT` → operator) used to parse "successfully" into a query matching
-    // nothing, so the intersecting `id IN (hits)` prefilter silently dropped
-    // the row that actually matched.
+    // A substring LIKE is rewritten into `text_match(...)` so the routing table
+    // invokes the prefilter; the original LIKE re-runs on the scan output. The
+    // last three patterns pin that query-grammar tokens in a routed literal
+    // (whitespace-adjacent `-`, bare `NOT`) are escaped, not parsed as operators.
     for (pat, want) in
         [("login", vec!["k1", "k2"]), ("charge", vec!["k3", "k4"]), ("accept -header", vec!["k5"]), ("err -1234", vec!["k6"]), ("foo NOT bar", vec!["k7"])]
     {
@@ -643,21 +592,12 @@ async fn flushed_index_prefilter_is_actually_used() -> Result<()> {
     Ok(())
 }
 
-/// P0 end-to-end: exact `level = 'ERROR'` on a raw-tokenized column is routed
-/// through the tantivy id-prefilter (route_equality=true) after flush. Verifies
-/// (a) correctness — the prefiltered result equals the full-scan baseline, no
-/// rows dropped/duplicated; (b) the OR-safety regression: `level='ERROR' OR
-/// name='billing'` must NOT collapse to ∅ (the 2026-06-16 bug) — `name` is
-/// ngram3 so its `=` isn't routed, `collect_text_match_tree` marks the OR
-/// opaque, the scan falls back, and the original predicate runs.
-///
-/// OR-union + IN-list routing: a disjunction of two ROUTABLE raw `=`s and an
-/// `id IN (...)` list both engage the prefilter (PredTree Or → tantivy
-/// Should) and must match the full-scan baseline exactly.
+/// Exact `=`, OR-disjunctions and `IN` lists routed through the id-prefilter
+/// must all equal the full-scan baseline. In particular an OR whose other side
+/// is unroutable must fall back, never intersect down to ∅.
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn flushed_eq_or_and_in_list_prefilters_match_baseline() -> Result<()> {
-    // level derived from message: "failed"/"declined" → ERROR, else INFO.
     let rows = [
         ("k1", "auth", "login failed: bad password"), // ERROR
         ("k2", "auth", "login successful"),           // INFO
@@ -679,26 +619,21 @@ async fn flushed_eq_or_and_in_list_prefilters_match_baseline() -> Result<()> {
     Ok(())
 }
 
-/// P0 regression: exact `id = '<uuid>'` on a raw-tokenized column where the
-/// value contains QueryParser-special chars (the `-` in a UUID is a NOT
-/// operator to tantivy's QueryParser). The prefilter MUST still return the
-/// matching flushed row, not zero it out. Reproduces the bug where routing
-/// equality through `QueryParser::parse_query` ate the dashes → empty hits →
-/// `id IN ()` → the real Delta row silently dropped.
+/// Exact `id = '<uuid>'` must still match: a `-` is a NOT operator to tantivy's
+/// QueryParser, so an unescaped dashed UUID yields empty hits → `id IN ()` →
+/// the real row silently dropped.
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn flushed_eq_on_uuid_id_with_dashes_matches_baseline() -> Result<()> {
-    let uid = "0fee13b9-ac71-5c55-acd1-109542595054"; // realistic monoscope id: dashes = QueryParser NOT
+    let uid = "0fee13b9-ac71-5c55-acd1-109542595054";
     let other = "11111111-2222-3333-4444-555555555555";
     let pair = Pair::new("uuideq", Land::Flushed, &[(uid, "auth", "login ok"), (other, "auth", "other")]).await?;
     pair.wait_manifest(1).await?;
 
     pair.assert_ids(&format!("id = '{uid}'"), &[uid], "exact `id=` on a dashed UUID must match baseline (QueryParser must not eat the `-`)").await?;
 
-    // DECISIVE: query the tantivy search service directly so the result can't
-    // be rescued by the full-scan fallback. If this returns the uid, the
-    // prefilter genuinely fires for exact dashed-UUID equality; if it's empty,
-    // the SQL test above only passed because the scan fell back (P0 = no-op).
+    // Query the search service directly: the SQL assert above can be rescued by
+    // the full-scan fallback, so only this proves the prefilter itself fires.
     let search = TantivySearchService::new(pair.svc.object_store.clone(), pair.cache_root.clone(), Arc::new(TantivyConfig::default()));
     let hits: Vec<String> =
         search.search_with_stats(TABLE, &pair.p, &leaf("id", uid), 1000, None).await?.map(|r| r.hits.into_iter().map(|h| h.id).collect()).unwrap_or_default();
@@ -707,37 +642,25 @@ async fn flushed_eq_on_uuid_id_with_dashes_matches_baseline() -> Result<()> {
     Ok(())
 }
 
-/// Read-side hybrid coverage: when a live Delta file overlapping the query
-/// window is NOT covered by a successful index (compacted away, external
-/// write, failed build), the `id IN (hits)` prefilter may only narrow the
-/// covered file. The uncovered file must remain a separate raw leg so the
-/// result still equals the baseline. Reproduces the landmine: two flushes →
-/// two live parquet files; we neuter one manifest entry (index=None) leaving
-/// its file live-but-uncovered, then confirm `text_match` still returns BOTH
-/// files' rows. Without the gate, the prefilter intersects only the covered
-/// file's hits and the other file's matching row vanishes.
+/// When a live Delta file is not covered by a successful index, the
+/// `id IN (hits)` prefilter may narrow only the covered file; the uncovered file
+/// must stay a separate raw leg or its matching rows vanish.
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn uncovered_live_file_uses_hybrid_prefilter_without_dropping_rows() -> Result<()> {
     use timefusion::tantivy::{load_manifest, save_manifest};
 
-    // Two separate flushes → two parquet files, each with its own index entry.
     let pair = Pair::new("cov", Land::Flushed, &flush_group("c1", "login alpha", "d1")).await?;
     pair.write(Land::Flushed, &flush_group("c2", "login beta", "d2")).await?;
     let store = pair.svc.object_store.clone();
     assert_eq!(pair.wait_manifest(2).await?.entries.len(), 2, "two flushes → two entries");
 
-    // Baseline: both rows match. Do not query the enabled context yet: that
-    // would populate its five-second manifest cache before we mutate coverage
-    // and turn this into a false-positive test of the old manifest.
-    // Match the production point-lookup shape: a completely routable OR of
-    // exact/raw and substring predicates. The analyzer adds text_match leaves
-    // while preserving these originals as the final correctness filter.
+    // Do not query the enabled context yet: it would cache the manifest before
+    // coverage is mutated below, making this a false-positive test.
     let predicate = "(id = 'c1' OR status_message LIKE '%login%')";
     assert_eq!(pair.baseline_ids(predicate).await?, vec!["c1".to_string(), "c2".to_string()]);
 
-    // Neuter exactly one entry: its parquet stays LIVE in Delta but is now
-    // uncovered (index=None). The other entry remains valid + returns hits.
+    // Neuter one entry: its parquet stays live in Delta but is now uncovered.
     let mut m2 = load_manifest(store.as_ref(), TABLE, &pair.p).await?;
     let first_key = m2.entries.keys().next().cloned().unwrap();
     let e = m2.entries.get_mut(&first_key).unwrap();
@@ -745,9 +668,8 @@ async fn uncovered_live_file_uses_hybrid_prefilter_without_dropping_rows() -> Re
     e.error = Some("simulated uncovered file".into());
     save_manifest(store.as_ref(), TABLE, &pair.p, &m2).await?;
 
-    // With one live file uncovered, the covered file uses Tantivy and the
-    // uncovered file scans raw. Their disjoint union must still return BOTH
-    // rows. Applying the covered file's id set globally would drop one.
+    // Covered file uses tantivy, uncovered file scans raw; applying the covered
+    // file's id set globally would drop the other file's row.
     let direct = pair
         .on
         .tantivy_search()

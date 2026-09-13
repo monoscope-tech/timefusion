@@ -1,10 +1,7 @@
-//! Z-order compaction idempotence (commit 4a41fea regression guard):
-//! running OPTIMIZE on the same partition twice must be a no-op the second
-//! time — the file set should not change. We assert directly on Delta's
-//! file URIs rather than on internal counters so the test survives a
-//! refactor of the optimize path.
+//! Running OPTIMIZE twice on the same partition must leave the Delta file set unchanged.
 
 use super::harness::{E2eEnv, FROZEN_START_MICROS};
+use super::ordering_pushdown::count_rows;
 
 #[serial_test::serial]
 #[tokio::test(flavor = "multi_thread")]
@@ -22,7 +19,6 @@ async fn second_optimize_is_a_noop() -> anyhow::Result<()> {
     for i in 0..20 {
         client.execute(&sql, &[&"e2e_project", &format!("z-{i}"), &vec!["s"]]).await?;
     }
-    // Land everything in Delta so OPTIMIZE has something to work on.
     env.force_flush().await?;
 
     let db = env.db();
@@ -30,19 +26,14 @@ async fn second_optimize_is_a_noop() -> anyhow::Result<()> {
         .await
         .ok_or_else(|| anyhow::anyhow!("unified table not found"))?;
 
-    db.optimize_table(&table_ref, "otel_logs_and_spans", None).await?;
-    let files_after_first: Vec<String> = db.list_file_uris("e2e_project", "otel_logs_and_spans").await?;
+    let mut file_sets = Vec::new();
+    for _ in 0..2 {
+        db.optimize_table(&table_ref, "otel_logs_and_spans", None).await?;
+        file_sets.push(db.list_file_uris("e2e_project", "otel_logs_and_spans").await?.into_iter().collect::<std::collections::HashSet<_>>());
+    }
 
-    db.optimize_table(&table_ref, "otel_logs_and_spans", None).await?;
-    let files_after_second: Vec<String> = db.list_file_uris("e2e_project", "otel_logs_and_spans").await?;
+    assert_eq!(file_sets[0], file_sets[1], "second OPTIMIZE rewrote files (churn): {:?} vs {:?}", file_sets[0], file_sets[1]);
 
-    // Exact equality (as sets): the idempotence guard should skip rewriting
-    // unchanged partitions, leaving the file set untouched.
-    let s1: std::collections::HashSet<_> = files_after_first.iter().collect();
-    let s2: std::collections::HashSet<_> = files_after_second.iter().collect();
-    assert_eq!(s1, s2, "second OPTIMIZE rewrote files (churn): {s1:?} vs {s2:?}");
-
-    let count: i64 = client.query_one("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1", &[&"e2e_project"]).await?.get(0);
-    assert_eq!(count, 20);
+    assert_eq!(count_rows(&client, "e2e_project").await?, 20);
     Ok(())
 }

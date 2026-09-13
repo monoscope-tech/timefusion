@@ -1,9 +1,10 @@
 use std::time::Duration;
 
 use super::harness::{E2eEnv, FROZEN_START_MICROS, insert_at};
+use super::ordering_pushdown::explain;
 
-fn plan(rows: &[tokio_postgres::Row]) -> String {
-    rows.iter().map(|r| (0..r.len()).map(|c| r.try_get::<_, String>(c).unwrap_or_default()).collect::<Vec<_>>().join(" | ")).collect::<Vec<_>>().join("\n")
+fn date_of(micros: i64) -> chrono::NaiveDate {
+    chrono::DateTime::<chrono::Utc>::from_timestamp_micros(micros).unwrap().date_naive()
 }
 
 #[serial_test::serial]
@@ -21,22 +22,18 @@ async fn timestamp_between_prunes_to_its_date_partition() -> anyhow::Result<()> 
     env.force_flush().await?;
 
     let middle = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(timestamps[1]).unwrap();
-    let middle_date = middle.date_naive();
     let query =
         format!("SELECT id FROM otel_logs_and_spans WHERE project_id = 'e2e_project' AND timestamp BETWEEN TIMESTAMP '{middle}' AND TIMESTAMP '{middle}'");
-    let explain = plan(&client.query(&format!("EXPLAIN {query}"), &[]).await?);
+    let explain_plan = explain(&client, &query).await?;
 
-    assert!(explain.contains(&format!("date={middle_date}")), "BETWEEN must select its date partition; plan:\n{explain}");
+    assert!(explain_plan.contains(&format!("date={}", middle.date_naive())), "BETWEEN must select its date partition; plan:\n{explain_plan}");
     for timestamp in [timestamps[0], timestamps[2]] {
-        let date = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(timestamp).unwrap().date_naive();
-        assert!(!explain.contains(&format!("date={date}")), "BETWEEN scanned an unrelated date partition; plan:\n{explain}");
+        assert!(!explain_plan.contains(&format!("date={}", date_of(timestamp))), "BETWEEN scanned an unrelated date partition; plan:\n{explain_plan}");
     }
 
-    let broad_date_query =
-        format!("{query} AND date >= DATE '{}'", chrono::DateTime::<chrono::Utc>::from_timestamp_micros(timestamps[0]).unwrap().date_naive());
-    let broad_date_explain = plan(&client.query(&format!("EXPLAIN {broad_date_query}"), &[]).await?);
+    let broad_date_explain = explain(&client, &format!("{query} AND date >= DATE '{}'", date_of(timestamps[0]))).await?;
     assert!(
-        !broad_date_explain.contains(&format!("date={}", chrono::DateTime::<chrono::Utc>::from_timestamp_micros(timestamps[2]).unwrap().date_naive())),
+        !broad_date_explain.contains(&format!("date={}", date_of(timestamps[2]))),
         "an existing date filter must not suppress tighter timestamp-derived bounds; plan:\n{broad_date_explain}"
     );
 
@@ -49,7 +46,6 @@ async fn write_derives_date_partition_from_timestamp() -> anyhow::Result<()> {
     let env = E2eEnv::builder().start().await?;
     let client = env.pg_client().await?;
     let timestamp = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(FROZEN_START_MICROS).unwrap();
-    let expected_date = timestamp.date_naive();
 
     client
         .execute(
@@ -65,7 +61,7 @@ async fn write_derives_date_partition_from_timestamp() -> anyhow::Result<()> {
         .query_one("SELECT CAST(date AS VARCHAR) FROM otel_logs_and_spans WHERE project_id = 'e2e_project' AND id = 'mismatched-date'", &[])
         .await?
         .get(0);
-    assert_eq!(date, expected_date.to_string());
+    assert_eq!(date, timestamp.date_naive().to_string());
 
     Ok(())
 }

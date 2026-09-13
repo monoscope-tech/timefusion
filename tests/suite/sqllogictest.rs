@@ -1,11 +1,6 @@
 #[cfg(test)]
 mod sqllogictest_tests {
-    use std::{
-        fmt,
-        path::Path,
-        sync::Arc,
-        time::{Duration, Instant},
-    };
+    use std::{fmt, path::Path, sync::Arc, time::Duration};
 
     use anyhow::{Context, Result};
     use async_trait::async_trait;
@@ -14,38 +9,25 @@ mod sqllogictest_tests {
     use testcontainers::{ContainerAsync, GenericImage, ImageExt, core::WaitFor, runners::AsyncRunner};
     use timefusion::database::Database;
     use tokio::{sync::Notify, time::sleep};
-    use tokio_postgres::{NoTls, Row};
+    use tokio_postgres::Row;
     use uuid::Uuid;
 
-    // Custom error type that wraps both anyhow and tokio_postgres errors
-    #[derive(Debug)]
+    use crate::pg_client_compat::connect_with_retry;
+
+    /// Render a Postgres error with its SQLSTATE and server message (Display alone is just "db error").
+    fn pg_detail(e: &tokio_postgres::Error) -> String {
+        match e.as_db_error() {
+            Some(db) => format!("Postgres error [{}]: {}", db.code().code(), db.message()),
+            None => format!("Postgres error: {e}"),
+        }
+    }
+
+    #[derive(Debug, thiserror::Error)]
     enum TestError {
-        Postgres(tokio_postgres::Error),
+        #[error("{}", pg_detail(.0))]
+        Postgres(#[from] tokio_postgres::Error),
+        #[error("Error: {0}")]
         Other(String),
-    }
-
-    impl fmt::Display for TestError {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            match self {
-                // tokio_postgres's own Display is the bare string "db error",
-                // which tells you nothing about WHY a statement was refused.
-                // The SQLSTATE and server message are the whole point when the
-                // thing under test is pgwire compatibility.
-                TestError::Postgres(e) => match e.as_db_error() {
-                    Some(db) => write!(f, "Postgres error [{}]: {}", db.code().code(), db.message()),
-                    None => write!(f, "Postgres error: {e}"),
-                },
-                TestError::Other(s) => write!(f, "Error: {}", s),
-            }
-        }
-    }
-
-    impl std::error::Error for TestError {}
-
-    impl From<tokio_postgres::Error> for TestError {
-        fn from(e: tokio_postgres::Error) -> Self {
-            TestError::Postgres(e)
-        }
     }
 
     impl From<anyhow::Error> for TestError {
@@ -65,30 +47,24 @@ mod sqllogictest_tests {
 
         async fn run(&mut self, sql: &str) -> Result<DBOutput<Self::ColumnType>, Self::Error> {
             let sql = sql.trim();
-            // Only print SQL in verbose mode
-            if std::env::var("SQLLOGICTEST_VERBOSE").is_ok() {
-                println!("Executing SQL: {}", sql);
-            }
-            // `WITH` matters as much as `SELECT`: a CTE routed to `execute()`
-            // returns a row COUNT, never rows, so every CTE assertion silently
-            // compared against an empty result set and no CTE over a data table
-            // was testable at all. monoscope's two-stage top-N dashboards are
-            // exactly that shape.
+            let trace = |msg: String| {
+                if std::env::var("SQLLOGICTEST_VERBOSE").is_ok() {
+                    println!("{msg}");
+                }
+            };
+            trace(format!("Executing SQL: {sql}"));
+            // Row-returning statements must go through `query()`; `execute()` yields only a count.
             let lowered = sql.to_lowercase();
             let is_query = ["select", "with", "show", "explain", "values", "table"].iter().any(|kw| lowered.starts_with(kw));
 
             if !is_query {
                 let affected = self.client.execute(sql, &[]).await?;
-                if std::env::var("SQLLOGICTEST_VERBOSE").is_ok() {
-                    println!("Statement executed, {} rows affected", affected);
-                }
+                trace(format!("Statement executed, {affected} rows affected"));
                 return Ok(DBOutput::StatementComplete(affected));
             }
 
             let rows = self.client.query(sql, &[]).await?;
-            if std::env::var("SQLLOGICTEST_VERBOSE").is_ok() {
-                println!("Query returned {} rows", rows.len());
-            }
+            trace(format!("Query returned {} rows", rows.len()));
             if rows.is_empty() {
                 return Ok(DBOutput::Rows { types: vec![], rows: vec![] });
             }
@@ -97,9 +73,8 @@ mod sqllogictest_tests {
                 .columns()
                 .iter()
                 .map(|col| match col.type_().name() {
-                    // UInt64 (from datafusion's array_length, json_length, etc.) is mapped to
-                    // NUMERIC by datafusion-postgres (Postgres has no unsigned types). The
-                    // values are always integral, so report Integer for sqllogictest's `I` checks.
+                    // UInt64 arrives as NUMERIC (Postgres has no unsigned types) but is always
+                    // integral, so report Integer for sqllogictest's `I` checks.
                     "int2" | "int4" | "int8" | "numeric" => DefaultColumnType::Integer,
                     _ => DefaultColumnType::Text,
                 })
@@ -118,8 +93,9 @@ mod sqllogictest_tests {
     }
 
     /// Wrapper that decodes Postgres binary NUMERIC into a plain decimal string.
-    /// Format: ndigits(u16) weight(i16) sign(u16) dscale(u16) digits(u16 base-10000)...
-    /// See postgres backend/utils/adt/numeric.c.
+    /// Wire format: ndigits(u16) weight(i16) sign(u16) dscale(u16) digits(u16 base-10000)...
+    #[derive(derive_more::Display)]
+    #[display("{_0}")]
     struct PgNumeric(String);
 
     impl<'a> tokio_postgres::types::FromSql<'a> for PgNumeric {
@@ -141,28 +117,11 @@ mod sqllogictest_tests {
             if ndigits == 0 {
                 return Ok(PgNumeric(if dscale == 0 { "0".into() } else { format!("0.{}", "0".repeat(dscale)) }));
             }
-            // Integer part: digit group 0 is the most-significant; each subsequent group is 4 decimal digits.
-            let mut int_part = String::new();
-            for w in 0..=weight.max(0) as i32 {
-                let idx = w as usize;
-                let d = if idx < ndigits { digits[idx] } else { 0 };
-                if w == 0 {
-                    int_part.push_str(&d.to_string());
-                } else {
-                    int_part.push_str(&format!("{:04}", d));
-                }
-            }
-            if int_part.is_empty() {
-                int_part.push('0');
-            }
-            // Fractional part
-            let mut frac_part = String::new();
+            let digit = |w: i32| digits.get(w as usize).copied().unwrap_or(0);
+            // Digit group 0 is most-significant; every later group is 4 decimal digits.
+            let int_part: String = (0..=weight.max(0) as i32).map(|w| if w == 0 { digit(w).to_string() } else { format!("{:04}", digit(w)) }).collect();
             let frac_groups = (dscale as i32 + 3) / 4;
-            for w in (weight as i32 + 1).max(0)..(weight as i32 + 1 + frac_groups) {
-                let idx = w as usize;
-                let d = if idx < ndigits { digits[idx] } else { 0 };
-                frac_part.push_str(&format!("{:04}", d));
-            }
+            let mut frac_part: String = ((weight as i32 + 1).max(0)..(weight as i32 + 1 + frac_groups)).map(|w| format!("{:04}", digit(w))).collect();
             frac_part.truncate(dscale);
             let sign_prefix = if sign == 0x4000 { "-" } else { "" };
             Ok(PgNumeric(if dscale == 0 { format!("{sign_prefix}{int_part}") } else { format!("{sign_prefix}{int_part}.{frac_part}") }))
@@ -172,98 +131,40 @@ mod sqllogictest_tests {
         }
     }
 
+    /// Column `i` rendered as `T`. `None` means the decode failed; a SQL NULL renders "NULL".
+    fn decode<'a, T>(row: &'a Row, i: usize) -> Option<String>
+    where
+        T: tokio_postgres::types::FromSql<'a> + fmt::Display,
+    {
+        row.try_get::<_, Option<T>>(i).ok().map(|v| v.map_or_else(|| "NULL".to_string(), |x| x.to_string()))
+    }
+
     fn format_row(row: &Row) -> Vec<String> {
         row.columns()
             .iter()
             .enumerate()
             .map(|(i, col)| {
                 let type_name = col.type_().name();
-
+                let text = || decode::<String>(row, i);
                 match type_name {
-                    "int2" => row
-                        .try_get::<_, Option<i16>>(i)
-                        .map(|v| v.map(|x| x.to_string()).unwrap_or_else(|| "NULL".to_string()))
-                        .unwrap_or_else(|_| "error:int2".to_string()),
-                    "int4" => row
-                        .try_get::<_, Option<i32>>(i)
-                        .map(|v| v.map(|x| x.to_string()).unwrap_or_else(|| "NULL".to_string()))
-                        .unwrap_or_else(|_| "error:int4".to_string()),
-                    "int8" => row
-                        .try_get::<_, Option<i64>>(i)
-                        .map(|v| v.map(|x| x.to_string()).unwrap_or_else(|| "NULL".to_string()))
-                        .unwrap_or_else(|_| "error:int8".to_string()),
-                    // f64 first, then f32: a float4 column is four wire bytes and
-                    // fails an f64 decode outright. Without the fallback every
-                    // `::float` column — which is what monoscope casts nearly
-                    // every chart value to — read back as `error:float`, so no
-                    // float was assertable anywhere in this suite.
-                    "float4" | "float8" => row
-                        .try_get::<_, Option<f64>>(i)
-                        .map(|v| v.map(|x| x.to_string()).unwrap_or_else(|| "NULL".to_string()))
-                        .or_else(|_| row.try_get::<_, Option<f32>>(i).map(|v| v.map(|x| x.to_string()).unwrap_or_else(|| "NULL".to_string())))
-                        .or_else(|_| row.try_get::<_, Option<String>>(i).map(|v| v.unwrap_or_else(|| "NULL".to_string())))
-                        .unwrap_or_else(|_| "error:float".to_string()),
-                    // tokio-postgres has no built-in NUMERIC decoder (would require
-                    // `with-rust_decimal-1`). Parse via a custom FromSql wrapper.
-                    "numeric" => row
-                        .try_get::<_, Option<PgNumeric>>(i)
-                        .map(|v| v.map(|n| n.0).unwrap_or_else(|| "NULL".to_string()))
-                        .unwrap_or_else(|_| "error:numeric".to_string()),
-                    "bool" => row
-                        .try_get::<_, Option<bool>>(i)
-                        .map(|v| v.map(|x| x.to_string()).unwrap_or_else(|| "NULL".to_string()))
-                        .unwrap_or_else(|_| "error:bool".to_string()),
-                    "timestamp" => row
-                        .try_get::<_, Option<chrono::NaiveDateTime>>(i)
-                        .map(|v| v.map(|x| x.to_string()).unwrap_or_else(|| "NULL".to_string()))
-                        .unwrap_or_else(|_| {
-                            row.try_get::<_, Option<String>>(i).map(|v| v.unwrap_or_else(|| "NULL".to_string())).unwrap_or_else(|_| "[timestamp]".to_string())
-                        }),
-                    "json" | "jsonb" => row
-                        .try_get::<_, Option<serde_json::Value>>(i)
-                        .map(|v| v.map(|j| j.to_string()).unwrap_or_else(|| "NULL".to_string()))
-                        .unwrap_or_else(|_| format!("error:{type_name}")),
-                    _ => row.try_get::<_, Option<String>>(i).map(|v| v.unwrap_or_else(|| "NULL".to_string())).unwrap_or_else(|_| type_name.to_string()),
+                    "int2" => decode::<i16>(row, i).unwrap_or_else(|| "error:int2".to_string()),
+                    "int4" => decode::<i32>(row, i).unwrap_or_else(|| "error:int4".to_string()),
+                    "int8" => decode::<i64>(row, i).unwrap_or_else(|| "error:int8".to_string()),
+                    // The f32 fallback is required: a float4 column is 4 wire bytes and fails an f64 decode.
+                    "float4" | "float8" => decode::<f64>(row, i).or_else(|| decode::<f32>(row, i)).or_else(text).unwrap_or_else(|| "error:float".to_string()),
+                    // tokio-postgres has no built-in NUMERIC decoder; use the wrapper above.
+                    "numeric" => decode::<PgNumeric>(row, i).unwrap_or_else(|| "error:numeric".to_string()),
+                    "bool" => decode::<bool>(row, i).unwrap_or_else(|| "error:bool".to_string()),
+                    "timestamp" => decode::<chrono::NaiveDateTime>(row, i).or_else(text).unwrap_or_else(|| "[timestamp]".to_string()),
+                    "json" | "jsonb" => decode::<serde_json::Value>(row, i).unwrap_or_else(|| format!("error:{type_name}")),
+                    _ => text().unwrap_or_else(|| type_name.to_string()),
                 }
             })
             .collect()
     }
 
-    async fn connect_with_retry(port: u16, timeout: Duration) -> Result<(tokio_postgres::Client, tokio::task::JoinHandle<()>), tokio_postgres::Error> {
-        let start = Instant::now();
-        let conn_string = format!("host=localhost port={} user=postgres password=postgres", port);
-
-        while start.elapsed() < timeout {
-            match tokio_postgres::connect(&conn_string, NoTls).await {
-                Ok((client, connection)) => {
-                    let handle = tokio::spawn(async move {
-                        if let Err(e) = connection.await {
-                            eprintln!("Connection error: {}", e);
-                        }
-                    });
-                    return Ok((client, handle));
-                }
-                Err(_) => sleep(Duration::from_millis(100)).await,
-            }
-        }
-
-        // Final attempt
-        let (client, connection) = tokio_postgres::connect(&conn_string, NoTls).await?;
-        let handle = tokio::spawn(async move {
-            if let Err(e) = connection.await {
-                eprintln!("Connection error: {}", e);
-            }
-        });
-
-        Ok((client, handle))
-    }
-
-    /// Owns the MinIO instance for a test run. A locally-spawned `minio` binary
-    /// is killed on drop; a Docker container is stopped by its own Drop; an
-    /// externally-provided endpoint owns nothing.
-    // The `Container` variant is inherently large (owns the testcontainers
-    // handle); this guard is a single short-lived per-run value, so boxing
-    // would add indirection for no benefit. (clippy 1.91 large_enum_variant.)
+    /// Owns the MinIO instance for a test run: a spawned `minio` binary is killed on
+    /// drop, a container stops via its own Drop, an external endpoint owns nothing.
     #[allow(clippy::large_enum_variant)]
     enum MinioGuard {
         Process(std::process::Child),
@@ -284,17 +185,11 @@ mod sqllogictest_tests {
         tokio::net::TcpStream::connect(addr).await.is_ok()
     }
 
-    /// Point the process at local MinIO so `Database::new()` never touches prod
-    /// object storage. Resolution order (local-first, Docker last):
-    ///   1. `TIMEFUSION_TEST_S3_ENDPOINT` if set (CI's MinIO, or any hand-run one).
-    ///   2. An already-running MinIO on 127.0.0.1:9000 (e.g. `make minio-start`).
+    /// Resolve a local MinIO endpoint, local-first so tests never touch remote storage:
+    ///   1. `TIMEFUSION_TEST_S3_ENDPOINT` if set.
+    ///   2. An already-running MinIO on 127.0.0.1:9000.
     ///   3. The local `minio` binary — spawned on :9000, killed when the test ends.
     ///   4. Docker (testcontainers) — only when no `minio` binary is on PATH.
-    ///
-    /// So `cargo test --test sqllogictest` needs zero setup, and Docker is a
-    /// last resort rather than the default. Hitting non-local S3 is deliberately
-    /// hard: it requires exporting the real AWS_* creds *and*
-    /// `TIMEFUSION_TEST_S3_ENDPOINT` yourself.
     async fn ensure_local_minio() -> Result<(MinioGuard, String)> {
         const LOCAL: &str = "127.0.0.1:9000";
         let (guard, endpoint) = if let Ok(ep) = std::env::var("TIMEFUSION_TEST_S3_ENDPOINT") {
@@ -314,12 +209,9 @@ mod sqllogictest_tests {
             }
             (MinioGuard::Process(child), format!("http://{LOCAL}"))
         } else {
-            // Pinned like the e2e harness: the default image predates conditional
-            // PUT, which makes Delta commit versions non-atomic (see MINIO_TAG).
-            // GenericImage because the MinIO module waits for "API:" on stdout,
-            // and modern images banner on stderr (see e2e::harness).
-            // quay.io, NOT Docker Hub: the `minio/minio` tag 404s. Same reason
-            // and same registry as `tests/e2e/harness.rs::MINIO_IMAGE`.
+            // Pinned to a tag with conditional PUT (Delta commits need it), pulled from
+            // quay.io (the Docker Hub tag 404s). GenericImage because modern images
+            // banner "API:" on stderr, which the testcontainers MinIO module does not expect.
             let minio = GenericImage::new("quay.io/minio/minio", "RELEASE.2025-09-07T16-13-09Z")
                 .with_wait_for(WaitFor::message_on_stderr("API:"))
                 .with_cmd(["server", "/data"])
@@ -384,14 +276,12 @@ mod sqllogictest_tests {
 
         let (minio, endpoint) = ensure_local_minio().await?;
 
-        // Free ephemeral port, asked of the kernel rather than derived from the
-        // pid: with one process per .slt file these servers start concurrently,
-        // and `5433 + pid % 100` collides often enough to wedge a whole run.
+        // Ask the kernel for a free port; these servers start concurrently, so any
+        // derived port scheme collides.
         let port = tokio::net::TcpListener::bind("127.0.0.1:0").await?.local_addr()?.port();
 
-        // Explicit config rather than `Database::new()` + `set_var`: the storage
-        // prefix and port are per-test, and writing them into the process env
-        // makes concurrently-starting servers steal each other's values.
+        // Per-test values must go in the config, never the process env: concurrent
+        // servers would otherwise steal each other's prefix and port.
         let mut cfg = timefusion::config::AppConfig::default();
         cfg.aws.aws_s3_bucket = Some(BUCKET.to_string());
         cfg.aws.aws_s3_endpoint = endpoint;
@@ -403,7 +293,6 @@ mod sqllogictest_tests {
         cfg.core.timefusion_data_dir = std::env::temp_dir().join(format!("timefusion-slt-{test_id}"));
         cfg.cache.timefusion_foyer_disabled = true;
 
-        // Use a shareable notification
         let shutdown_signal = Arc::new(Notify::new());
         let shutdown_signal_clone = shutdown_signal.clone();
 
@@ -426,39 +315,29 @@ mod sqllogictest_tests {
             }
         });
 
-        // Generous: these servers boot concurrently with the rest of the suite,
-        // and a debug-build `Database::new()` on a loaded box can take far longer
-        // than it does in isolation. A too-tight budget here shows up as a
-        // spurious .slt failure that only reproduces under full-suite load.
+        // Deliberately generous: startup is much slower under full-suite load, and a
+        // tight budget here surfaces as a spurious .slt failure.
         let _ = connect_with_retry(port, Duration::from_secs(60)).await?;
 
         Ok((shutdown_signal, port, minio))
     }
 
-    /// Run a single `tests/slt/<stem>.slt` against a private server.
-    ///
-    /// One server per file rather than one shared across all of them: under
-    /// nextest each test is its own process, so the files run concurrently.
-    /// They also share unqualified table names (`test_table`, `events`, `t`, …)
-    /// and only stay isolated because each server gets its own storage prefix.
+    /// Run a single `tests/slt/<stem>.slt` against a private server. One server per
+    /// file: the files run concurrently and share unqualified table names, so
+    /// isolation comes from each server's own storage prefix.
     async fn run_slt(stem: &str) -> Result<()> {
         // `_minio` keeps the MinIO instance alive for the whole test.
         let (shutdown_signal, port, _minio) = start_test_server().await?;
         let path = Path::new("tests/slt").join(format!("{stem}.slt"));
 
-        let factory = || async move {
-            let (client, _) = connect_with_retry(port, Duration::from_secs(30)).await?;
-            Ok::<TestDB, TestError>(TestDB { client })
-        };
+        let factory = || async move { Ok::<TestDB, TestError>(TestDB { client: connect_with_retry(port, Duration::from_secs(30)).await? }) };
         let result = sqllogictest::Runner::new(factory).run_file_async(&path).await;
         shutdown_signal.notify_one();
         result.map_err(|e| anyhow::anyhow!("{} failed: {e:?}", path.display()))
     }
 
-    /// One `#[test]` per .slt file, so `cargo nextest run` fans them out across
-    /// cores instead of walking ~2800 lines of SQL serially through one server.
-    /// The test is named after the file, so `cargo nextest run variant_functions`
-    /// runs just that one.
+    /// One `#[test]` per .slt file, named after the file, so nextest runs them in
+    /// parallel and `cargo nextest run <stem>` runs just one.
     macro_rules! slt_files {
         ($($stem:ident),* $(,)?) => {
             $(
@@ -468,8 +347,7 @@ mod sqllogictest_tests {
                 }
             )*
 
-            /// A new .slt file that nobody added to `slt_files!` would otherwise
-            /// be silently never run.
+            /// Fails if a .slt file exists that `slt_files!` never declares.
             #[test]
             fn every_slt_file_has_a_test() {
                 let declared = [$(stringify!($stem)),*];

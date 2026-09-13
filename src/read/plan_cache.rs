@@ -1,13 +1,11 @@
-//! Cross-connection LRU cache for parsed `LogicalPlan`s.
+//! Cross-connection cache for parsed `LogicalPlan`s.
 //!
-//! Reuses canonicalized parameterized plans across connections, including
-//! anonymous statements that the per-connection portal store cannot retain.
-//!
-//! Cached plans embed schemas. This is safe while the compile-time schema
-//! registry is immutable; schema hot reload must invalidate this cache.
+//! Cached plans embed schemas: safe only while the compile-time schema registry
+//! is immutable — schema hot reload must invalidate this cache.
 
 use std::{
     cmp::Reverse,
+    ops::ControlFlow,
     sync::{
         Arc, OnceLock,
         atomic::{
@@ -34,7 +32,16 @@ use datafusion::{
     logical_expr::{Cast, Expr, LogicalPlan, Values, dml::WriteOp},
     prelude::SessionContext,
     scalar::ScalarValue,
-    sql::{parser::Statement as DfStatement, sqlparser::ast::Statement},
+    sql::{
+        parser::Statement as DfStatement,
+        sqlparser::{
+            ast::{
+                CastKind, DataType as SqlDataType, Expr as SqlExpr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, OrderByKind, SelectItem,
+                SetExpr, Statement, TimezoneInfo, Value, ValueWithSpan, visit_expressions, visit_expressions_mut,
+            },
+            tokenizer::Span,
+        },
+    },
 };
 use datafusion_postgres::{
     arrow_pg::encode_dataframe,
@@ -55,7 +62,7 @@ use tracing::{debug, warn};
 
 use crate::observability::{api_err, arrow_err};
 
-/// Approximate retained bytes per expression, calibrated against production.
+/// Approximate retained bytes per expression node.
 const PLAN_BYTES_PER_EXPR: usize = 384;
 
 /// Retained plan budget per cache slot.
@@ -65,7 +72,7 @@ const PLAN_CACHE_PLAN_BYTES_PER_SLOT: usize = 128 * 1024;
 const SWEEP_LOW_WATER_NUM: usize = 1;
 const SWEEP_LOW_WATER_DEN: usize = 2;
 
-/// Estimated retained size of a plan, in bytes. See [`PLAN_BYTES_PER_EXPR`].
+/// Estimated retained size of a plan, in bytes.
 fn plan_bytes(plan: &LogicalPlan) -> usize {
     let mut nodes = 0usize;
     let _ = plan.apply_with_subqueries(|p| {
@@ -113,10 +120,8 @@ impl<V: Clone> WeighedMap<V> {
     }
 
     /// Admit `value` at `weight`, sweeping first if either bound is crossed.
-    ///
-    /// An entry heavier than the whole budget is NOT admitted: it would evict
-    /// everything else on the next crossing and still not survive, so it would
-    /// cost the whole cache to store nothing.
+    /// An entry heavier than the whole budget is not admitted: it would evict
+    /// everything else and still not survive.
     fn insert(&self, key: String, value: V, weight: usize, label: &'static str) {
         if (self.map.len() >= self.capacity || self.bytes() >= self.max_bytes) && !self.sweeping.swap(true, AcqRel) {
             self.sweep(label);
@@ -130,18 +135,11 @@ impl<V: Clone> WeighedMap<V> {
         }
     }
 
-    /// Evict HEAVIEST-FIRST down to the low-water mark.
-    ///
-    /// Heaviest-first, not a random half: the bytes are owed by a
-    /// handful of bulk INSERTs while the population is mostly small dashboard
-    /// SELECTs, so a random half would keep paying the pressure AND throw away
-    /// the hot templates that make the cache worth having. Dropping the biggest
-    /// frees the budget in the fewest evictions, which is also the smallest hit
-    /// to the hit rate.
+    /// Evict heaviest-first down to the low-water mark: the bytes are owed by a
+    /// few bulk INSERTs while the population is mostly small SELECTs, so a
+    /// random half would keep the pressure and drop the hot templates.
     fn sweep(&self, label: &'static str) {
         let low_water = self.max_bytes / SWEEP_LOW_WATER_DEN * SWEEP_LOW_WATER_NUM;
-        // Operator-visible: the workload has more distinct plan templates than
-        // the cache can hold. Expect the next queries to re-pay state.optimize().
         warn!(
             target: "plan_cache",
             cache = label,
@@ -152,9 +150,8 @@ impl<V: Clone> WeighedMap<V> {
             low_water,
             "plan_cache over budget — evicting heaviest-first down to the low-water mark. If this fires steadily, the workload's plan-template variety has grown past the cache budget."
         );
-        // `sorted_unstable_by_key` is EAGER (it collects, then sorts): every
-        // DashMap shard guard is released before the loop below calls `remove`.
-        // A lazy sort would hold a guard across `remove` and deadlock.
+        // `sorted_unstable_by_key` must stay EAGER: it releases every DashMap
+        // shard guard before the loop calls `remove`. A lazy sort deadlocks.
         let by_weight = self.map.iter().map(|e| (e.value().1, e.key().clone())).sorted_unstable_by_key(|&(weight, _)| Reverse(weight));
         // Both bounds are swept in one pass: drop while EITHER is exceeded.
         let mut held = self.bytes();
@@ -172,15 +169,8 @@ impl<V: Clone> WeighedMap<V> {
     }
 }
 
-/// Walk a plan and replace every `CAST(Literal(v), T)` with `Literal(cast(v, T))`.
-///
-/// After `replace_params_with_values` substitutes `$N → literal`, the `CAST`
-/// wrappers `insert_coerce` puts around every placeholder turn into per-cell
-/// `CAST(Literal, T)` exprs inside `ValuesExec`. Executing those casts at
-/// query time, once per (row, column), is responsible for ~9–10 ms/row of
-/// pgwire-INSERT overhead at the 88-col schema (measured). The cast values
-/// are constant so we can fold them once, at substitution time, and let
-/// `ValuesExec` see plain literals.
+/// Walk a plan and replace every `CAST(Literal(v), T)` with `Literal(cast(v, T))`,
+/// so `ValuesExec` does not re-evaluate a constant cast per (row, column).
 fn fold_literal_casts(plan: LogicalPlan) -> DfResult<LogicalPlan> {
     plan.transform_up(|node| {
         let folded: Vec<Transformed<Expr>> = node
@@ -193,8 +183,7 @@ fn fold_literal_casts(plan: LogicalPlan) -> DfResult<LogicalPlan> {
                     let data_type = field.data_type();
                     match value.cast_to(data_type) {
                         Ok(folded) => Ok(Transformed::yes(Expr::Literal(folded, metadata.clone()))),
-                        // A literal that can't be cast (e.g. lossy string-→-number)
-                        // stays put — the executor's cast surfaces a clear error.
+                        // Uncastable literal stays put; the executor's cast reports it.
                         Err(err) => {
                             tracing::trace!(target: "plan_cache", %err, ?value, ?data_type, "fold_literal_casts: cast_to failed, leaving CAST for executor");
                             Ok(Transformed::no(e))
@@ -203,13 +192,9 @@ fn fold_literal_casts(plan: LogicalPlan) -> DfResult<LogicalPlan> {
                 })
             })
             .collect::<DfResult<_>>()?;
-        // Only rebuild when a cast was actually folded. `with_new_exprs` rejects
-        // some nodes whose `expressions()`/`with_new_exprs` round-trip isn't
-        // identity — notably `Unnest`, whose `expressions()` returns its
-        // `exec_columns` but `with_new_exprs` asserts an empty expr list (DF54).
-        // monoscope's `UPDATE … FROM (SELECT unnest($1::text[]) …)` dual-write
-        // carries exactly such an `Unnest`; rebuilding it unconditionally tripped
-        // `Internal error: Assertion failed: expr.is_empty()`.
+        // Only rebuild when a cast was folded: some nodes do not round-trip
+        // through `expressions()`/`with_new_exprs` — notably `Unnest`, which
+        // asserts an empty expr list (DF54).
         if !folded.iter().any(|t| t.transformed) {
             return Ok(Transformed::no(node));
         }
@@ -222,8 +207,6 @@ fn fold_literal_casts(plan: LogicalPlan) -> DfResult<LogicalPlan> {
 /// pgwire-INSERT bypass: recognise `Dml(Insert) → [Projection →] Values(literals)`
 /// and short-circuit the whole DataFusion executor by building the RecordBatch
 /// directly from the literals and calling `ProjectRoutingTable.fast_insert_batch`.
-/// Skips `ValuesExec`, `DataSinkExec`, and the per-row `replace_params_with_values`
-/// walk that together account for ~5-6 ms/row of overhead at the 88-col schema.
 ///
 /// Returns `Ok(Some(rows))` on success, `Ok(None)` if the plan shape isn't
 /// the supported fast-path INSERT (caller should fall back to the regular
@@ -235,13 +218,9 @@ async fn try_fast_path_insert(plan: &LogicalPlan, session_context: &SessionConte
         return Ok(None);
     };
 
-    // Input is either `Projection → Values` (INSERT INTO t (cols) VALUES …) or
-    // `Values` directly. Each projected output column must resolve either to a
-    // Values column (a `Column`/`Alias(Column)` ref — the common case, which
-    // also tells us how to reorder Values columns into the table's layout) or
-    // to a constant the optimizer folded in (NULL defaults for unspecified
-    // columns). Anything more complex (computed cols, unfolded casts,
-    // sub-exprs) falls back to the executor.
+    // Input is either `Projection → Values` or `Values` directly. Each projected
+    // column must resolve to a Values column or to a constant the optimizer
+    // folded in; anything more complex falls back to the executor.
     enum ColumnSource {
         Values(usize),
         Constant(ScalarValue),
@@ -275,10 +254,8 @@ async fn try_fast_path_insert(plan: &LogicalPlan, session_context: &SessionConte
         _ => return Ok(None),
     };
 
-    // Every cell must be a literal — possibly wrapped in an Alias from the
-    // pgwire `$N` placeholder name retained after substitution. Anything else
-    // legitimately needs the full executor (subqueries, function calls,
-    // correlated refs, etc.) — `None` propagates out as "not the fast path".
+    // Every cell must be a literal, possibly wrapped in an Alias left over from
+    // the `$N` placeholder name. `None` means "not the fast path".
     fn cell_as_literal(e: &Expr) -> Option<&ScalarValue> {
         match e {
             Expr::Literal(v, _) => Some(v),
@@ -304,10 +281,9 @@ async fn try_fast_path_insert(plan: &LogicalPlan, session_context: &SessionConte
                 return Ok(Some(new_empty_array(target_ty)));
             }
             let arr = ScalarValue::iter_to_array(scalars)?;
-            // `iter_to_array` may return a different concrete type than the
-            // Values column declares (e.g. all-NULL columns come back as Null).
-            // Cast back to target so the downstream MemBuffer schema check sees
-            // exactly what the table expects.
+            // `iter_to_array` may return a different concrete type than declared
+            // (all-NULL columns come back as Null); cast back so the downstream
+            // MemBuffer schema check sees what the table expects.
             Ok(Some(if arr.data_type() == target_ty { arr } else { cast(&arr, target_ty).map_err(arrow_err)? }))
         })
         .collect::<DfResult<Vec<Option<ArrayRef>>>>()?
@@ -352,17 +328,11 @@ fn non_dml_err() -> PgWireError {
     PgWireError::ApiError("internal error: DML plan returned non-DML completion".into())
 }
 
-/// Mirror of `datafusion_postgres::handlers::dml_completion`,
-/// which is `pub(super)` and so unreachable from outside the crate.
-///
-/// **Re-sync checklist.** When bumping the patched `datafusion-postgres` git dep
-/// (apitoolkit/datafusion-postgres @ `timefusion-df54`, see the `[patch.crates-io]`
-/// in Cargo.toml), diff its `handlers.rs::dml_completion` against this
-/// implementation — upstream changes to the tag format ("INSERT 0 N" oid +
-/// count), the `count` column name, or the count column's Arrow type are silent
-/// divergence here (no compile error, wrong wire response). Search for the
-/// `RE-SYNC-DML-COMPLETION` marker below and confirm parity.
-// RE-SYNC-DML-COMPLETION: keep in sync with apitoolkit/datafusion-postgres@timefusion-df54 src/handlers.rs.
+/// Mirror of `datafusion_postgres::handlers::dml_completion`, which is
+/// `pub(super)` and so unreachable from outside that crate. Re-check parity when
+/// bumping the patched dep: a changed tag format, `count` column name, or count
+/// Arrow type diverges silently (no compile error, wrong wire response).
+// RE-SYNC-DML-COMPLETION: keep in sync with datafusion-postgres src/handlers.rs.
 async fn dml_completion(df: datafusion::dataframe::DataFrame) -> PgWireResult<Response> {
     let tag = match df.logical_plan() {
         LogicalPlan::Dml(d) => match d.op {
@@ -391,11 +361,7 @@ async fn run_simple_query(
     let exec = session_context.execute_logical_plan(plan);
     let df = match timeout {
         Some(d) => tokio::time::timeout(d, exec).await.map_err(|_| {
-            PgWireError::UserError(Box::new(ErrorInfo::new(
-                "ERROR".to_string(),
-                "57014".to_string(),
-                "canceling statement due to statement timeout".to_string(),
-            )))
+            PgWireError::UserError(Box::new(ErrorInfo::new("ERROR".into(), "57014".into(), "canceling statement due to statement timeout".into())))
         })?,
         None => exec.await,
     }
@@ -411,26 +377,27 @@ async fn run_simple_query(
 async fn run_extended_dml(logical_plan: &LogicalPlan, params: &ParamValues, session_context: &SessionContext) -> PgWireResult<Response> {
     let substituted = logical_plan.clone().replace_params_with_values(params).map_err(api_err)?;
     let folded = fold_literal_casts(substituted).map_err(api_err)?;
-    // Fast-path: `Dml(Insert) → [Projection →] Values(literals)` skips the
-    // executor entirely and writes the batch straight into the buffered layer.
-    // Saves the ~5-6 ms/row that `ValuesExec` + `DataSinkExec` were costing at
-    // the 88-col schema.
     if let Some(rows) = try_fast_path_insert(&folded, session_context).await.map_err(api_err)? {
         return Ok(Response::Execution(Tag::new("INSERT").with_oid(0).with_rows(rows as usize)));
     }
     dml_completion(session_context.execute_logical_plan(folded).await.map_err(api_err)?).await
 }
 
-// Fallback when config isn't initialized (test-only factory paths). Prod reads
-// `memory.timefusion_plan_cache_capacity`. See config.rs.
+/// Plan → `insert_coerce::rewrite_plan` → optimize: the full miss-path build
+/// shared by the verbatim cache and the `count(*)`-normalized fallback.
+async fn plan_and_optimize(statement: Statement, session_context: &SessionContext) -> DfResult<LogicalPlan> {
+    let state = session_context.state();
+    state.statement_to_plan(DfStatement::Statement(Box::new(statement))).await.map(crate::write::rewrite_plan).and_then(|p| state.optimize(&p))
+}
+
+// Fallback when config isn't initialized; otherwise `memory.timefusion_plan_cache_capacity`.
 const DEFAULT_PLAN_CACHE_CAPACITY: usize = 1024;
 
 /// Soft cap on the `served` memo (one-shot literal-bearing texts).
 const SERVED_CAP: usize = 4096;
 
-/// Singleton handle so `timefusion_stats` can read the same cache the
-/// pgwire factory writes to without plumbing an Arc through the database
-/// constructor.
+/// Singleton handle so `timefusion_stats` can read the same cache the pgwire
+/// factory writes to.
 static GLOBAL: OnceLock<Arc<PlanCacheHook>> = OnceLock::new();
 
 pub fn set_global(cache: Arc<PlanCacheHook>) {
@@ -441,44 +408,28 @@ pub fn global() -> Option<Arc<PlanCacheHook>> {
     GLOBAL.get().cloned()
 }
 
-/// Lock-free plan cache.
-///
-/// The Mutex<LruCache> design was a serialization point on the hot read path:
-/// every query — even on a cache hit — took the mutex to update LRU order.
-/// At 50+ concurrent readers that became the dominant bottleneck.
-///
-/// OLAP workloads churn through a small set of templates (the harness's prod
-/// replay sees ~5 unique canonical plans across millions of queries), so we
-/// drop LRU entirely. DashMap gives us lock-free reads and a soft size cap
-/// that just clears the cache once exceeded — cheap, correct, and never holds
-/// a lock across the await in `handle_simple_query`.
+/// Lock-free plan cache. No LRU ordering: OLAP workloads churn through a small
+/// set of templates, and DashMap never holds a lock across the await in
+/// `handle_simple_query`.
 pub struct PlanCacheHook {
     cache: WeighedMap<LogicalPlan>,
     hits: AtomicU64,
     misses: AtomicU64,
-    /// Shape cache for LITERAL-bearing SELECTs (generated dashboard SQL that
-    /// never repeats verbatim): keyed by the statement with every string
-    /// literal replaced by `$N`, storing the pre-optimized placeholder plan +
-    /// inferred parameter types. A hit clones the plan and substitutes the
-    /// query's actual literals (cast to the inferred types) — skipping parse,
-    /// analyze, AND optimize. `None` = negative entry: this shape failed to
-    /// plan/parameterize once; don't retry it per query.
-    /// Bounded by WEIGHT as well as count. It holds `LogicalPlan`s exactly like
-    /// `cache` does, and was previously bounded by entry count alone — the same
-    /// bug 12ff764 fixed for `cache` and never applied here.
+    /// Shape cache for literal-bearing SELECTs that never repeat verbatim: keyed
+    /// by the statement with literals replaced by `$N`, storing the pre-optimized
+    /// placeholder plan + inferred parameter types. `None` = negative entry: this
+    /// shape failed to plan/parameterize once; don't retry per query.
+    /// Bounded by weight as well as count — it holds `LogicalPlan`s like `cache`.
     shapes: WeighedMap<Option<ShapeEntry>>,
     /// Canonical texts we served a pre-optimized substituted plan for, so
     /// `was_pre_optimized` can tell the handler to skip `state.optimize()`.
-    /// Literal-bearing texts are one-shot (next dashboard refresh has new
-    /// literals), so recency semantics with a soft cap are enough — a false
-    /// `false` after eviction merely re-optimizes an optimized plan.
+    /// A false `false` after eviction merely re-optimizes an optimized plan.
     served: DashMap<String, ()>,
     shape_hits: AtomicU64,
     shape_skips: AtomicU64,
     /// When true, `now()`-bearing SELECTs go through the shape cache with the
-    /// time function parameterized (fresh instant substituted per query) instead
-    /// of being bypassed. Off by default — it's the hot dashboard path, so enable
-    /// deliberately (TIMEFUSION_PLAN_CACHE_TIME_FNS=1) after canarying.
+    /// time function parameterized (fresh instant per query) instead of being
+    /// bypassed (`TIMEFUSION_PLAN_CACHE_TIME_FNS`).
     time_fn_shapes: bool,
 }
 
@@ -490,14 +441,10 @@ struct ShapeEntry {
     param_types: Vec<Option<DataType>>,
 }
 
-/// Statements whose optimized plan embeds the QUERY START TIME must never be
-/// cached: DataFusion const-folds these Stable functions during
-/// `state.optimize()` (SimplifyExpressions reads query_execution_start_time),
-/// so a cached plan would freeze `now()` at first-build time and serve stale
-/// windows forever. Applies to BOTH the `$N` template cache and the shape
-/// cache — such statements re-plan per query instead.
+/// True if the optimized plan would embed the query start time: DataFusion
+/// const-folds these Stable fns in `state.optimize()`, so caching the result
+/// would freeze `now()` at first-build time. Such statements re-plan per query.
 fn contains_plan_time_folded_fn(stmt: &Statement) -> bool {
-    // Union of both classes; TIME_FNS == PARAMETERIZABLE ∪ UNPARAMETERIZABLE.
     stmt_uses_fn(stmt, PARAMETERIZABLE_TIME_FNS) || stmt_uses_fn(stmt, UNPARAMETERIZABLE_TIME_FNS)
 }
 
@@ -511,39 +458,21 @@ const PARAMETERIZABLE_TIME_FNS: &[&str] = &["now", "current_timestamp", "stateme
 const UNPARAMETERIZABLE_TIME_FNS: &[&str] = &["current_date", "today", "current_time", "localtime"];
 
 /// True if `e` is exactly the bare `count(*)` idiom.
-fn is_count_star(e: &datafusion::sql::sqlparser::ast::Expr) -> bool {
-    use datafusion::sql::sqlparser::ast::{Expr as SqlExpr, FunctionArg, FunctionArgExpr, FunctionArguments};
+fn is_count_star(e: &SqlExpr) -> bool {
     matches!(e, SqlExpr::Function(f)
         if fn_name_is_one_of(f, &["count"])
             && matches!(&f.args, FunctionArguments::List(l) if matches!(l.args.as_slice(), [FunctionArg::Unnamed(FunctionArgExpr::Wildcard)])))
 }
 
-/// Rewrite `count(*)` to `count(1)` — but ONLY for a statement that DataFusion
-/// rejects today, i.e. one whose `ORDER BY <ordinal>` points at a select item
-/// that wraps `count(*)` in a larger expression. `None` for everything else.
+/// Rewrite `count(*)` to `count(1)`, but ONLY for a statement DataFusion rejects
+/// today: one whose `ORDER BY <ordinal>` points at a select item that wraps
+/// `count(*)` in a larger expression. `None` for everything else.
 ///
-/// The narrowness is the point, and it is a correctness requirement rather than
-/// caution. `count(*)` and `count(1)` compute the same thing, but they do not
-/// NAME the same thing: the wire-visible column for `SELECT count(*)` is
-/// `count(*)`, and the shape cache lifts the injected `1` into a placeholder on
-/// top of that, so a blanket rewrite renamed the column to `count($1)` for every
-/// caller (caught by
-/// `normalizing_count_star_leaves_the_output_column_name_alone`). Restricting
-/// the rewrite to statements that currently fail to plan at all means no
-/// working query can change shape or name — a query that errors has no output
-/// contract to break.
-///
-/// A bare `SELECT count(*) ... ORDER BY 1` is deliberately excluded: DataFusion
-/// already resolves that ordinal, so it does not need — and must not get — the
-/// rewrite.
+/// The narrowness is a correctness requirement: `count(*)` and `count(1)` do not
+/// NAME the same column, so rewriting a query that already plans would change its
+/// wire-visible column name. A query that errors has no output contract to break.
+/// A bare `count(*) … ORDER BY 1` already resolves and must not get the rewrite.
 fn normalize_count_star(stmt: &Statement) -> Option<Statement> {
-    use std::ops::ControlFlow;
-
-    use datafusion::sql::sqlparser::ast::{
-        Expr as SqlExpr, FunctionArg, FunctionArgExpr, FunctionArguments, OrderByKind, SelectItem, SetExpr, Value, ValueWithSpan, visit_expressions,
-        visit_expressions_mut,
-    };
-
     let Statement::Query(query) = stmt else { return None };
     let OrderByKind::Expressions(order_exprs) = &query.order_by.as_ref()?.kind else { return None };
     let SetExpr::Select(select) = &*query.body else { return None };
@@ -570,10 +499,7 @@ fn normalize_count_star(stmt: &Statement) -> Option<Statement> {
             && let FunctionArguments::List(list) = &mut f.args
             && let [FunctionArg::Unnamed(arg)] = list.args.as_mut_slice()
         {
-            *arg = FunctionArgExpr::Expr(SqlExpr::Value(ValueWithSpan {
-                value: Value::Number("1".into(), false),
-                span: datafusion::sql::sqlparser::tokenizer::Span::empty(),
-            }));
+            *arg = FunctionArgExpr::Expr(SqlExpr::Value(ValueWithSpan { value: Value::Number("1".into(), false), span: Span::empty() }));
         }
         ControlFlow::Continue(())
     });
@@ -581,7 +507,7 @@ fn normalize_count_star(stmt: &Statement) -> Option<Statement> {
 }
 
 /// Case-insensitive match of a call's last name segment against `names`.
-fn fn_name_is_one_of(f: &datafusion::sql::sqlparser::ast::Function, names: &[&str]) -> bool {
+fn fn_name_is_one_of(f: &Function, names: &[&str]) -> bool {
     f.name.0.last().and_then(|n| n.as_ident()).is_some_and(|i| names.iter().any(|n| n.eq_ignore_ascii_case(&i.value)))
 }
 
@@ -592,9 +518,6 @@ fn contains_unparameterizable_time_fn(stmt: &Statement) -> bool {
 /// True if `stmt` calls any function named in `names`. Shared AST-visitor for
 /// the time-fn classifiers.
 fn stmt_uses_fn(stmt: &Statement, names: &[&str]) -> bool {
-    use std::ops::ControlFlow;
-
-    use datafusion::sql::sqlparser::ast::{Expr as SqlExpr, visit_expressions};
     visit_expressions(stmt, |e: &SqlExpr| match e {
         SqlExpr::Function(f) if fn_name_is_one_of(f, names) => ControlFlow::Break(()),
         _ => ControlFlow::Continue(()),
@@ -602,13 +525,9 @@ fn stmt_uses_fn(stmt: &Statement, names: &[&str]) -> bool {
     .is_break()
 }
 
-/// Highest client-supplied `$N` placeholder index already in `stmt` (0 if none).
-/// Lets the mixed now()+`$N` path number its injected time-fn placeholders
-/// above the client's so the two numbering spaces don't collide.
+/// Highest client-supplied `$N` placeholder index already in `stmt` (0 if none),
+/// so injected time-fn placeholders can be numbered above the client's.
 fn max_placeholder_index(stmt: &Statement) -> usize {
-    use std::ops::ControlFlow;
-
-    use datafusion::sql::sqlparser::ast::{Expr as SqlExpr, Value, visit_expressions};
     let mut max = 0usize;
     let _: ControlFlow<()> = visit_expressions(stmt, |e: &SqlExpr| {
         if let SqlExpr::Value(vs) = e
@@ -630,27 +549,10 @@ fn max_placeholder_index(stmt: &Statement) -> usize {
 /// client's `$1..$base` binds untouched (mixed now()+`$N` path); `include_strings`
 /// is off there because a prepared statement's literals are fixed across binds.
 fn parameterize_statement(stmt: &Statement, base: usize, include_strings: bool) -> Option<(Statement, Vec<ScalarValue>)> {
-    use std::ops::ControlFlow;
-
-    use datafusion::sql::sqlparser::{
-        ast::{
-            CastKind, DataType as SqlDataType, Expr as SqlExpr, FunctionArg, FunctionArgExpr, FunctionArguments, TimezoneInfo, Value, ValueWithSpan,
-            visit_expressions, visit_expressions_mut,
-        },
-        tokenizer::Span,
-    };
-    // A regex `SUBSTRING(x FROM 'pat')` must keep its pattern INLINE. Lifted to
-    // `$N` it becomes an untyped placeholder that coerces to Int64 (substr's
-    // declared arg 2) before it is ever bound, and the query dies in
-    // `simplify_expressions` with "Cannot cast string '…' to value of Int64" —
-    // prod 2026-08-31, logged shape `select substring(? from ?)`.
-    //
-    // Same hazard as the PG array literals below, but there is no content marker
-    // to test for, and the pattern is not reachable from a value-context parent
-    // the way `take_number` filters numbers. So the whole statement opts out of
-    // shape caching: regex-substring is an operator diagnostic, never a hot
-    // cached path, and uncached means the literal survives to the planner where
-    // `VariantAwareExprPlanner::plan_substring` rewrites it correctly.
+    // A regex `SUBSTRING(x FROM 'pat')` must keep its pattern inline: lifted to
+    // `$N` it becomes an untyped placeholder that coerces to substr's declared
+    // Int64 arg 2 and the query dies in `simplify_expressions`. The whole
+    // statement opts out of shape caching so the literal reaches the planner.
     // The offset forms carry `Value::Number` and are unaffected.
     let has_regex_substring = visit_expressions(stmt, |e: &SqlExpr| match e {
         SqlExpr::Substring { substring_from: Some(from), .. } if matches!(&**from, SqlExpr::Value(vs) if matches!(vs.value, Value::SingleQuotedString(_))) => {
@@ -666,24 +568,13 @@ fn parameterize_statement(stmt: &Statement, base: usize, include_strings: bool) 
     let mut stmt = stmt.clone();
     let mut values: Vec<ScalarValue> = Vec::new();
 
-    // Push `v` and return the `$N` placeholder referencing its position — the
-    // bookkeeping shared by every literal-lifting site below.
+    // Push `v` and return the `$N` placeholder referencing its position.
     //
-    // An identical literal REUSES its placeholder instead of taking a new one,
-    // and that is what makes a GROUP BY survive parameterization. DataFusion
-    // requires each SELECT expression to appear in GROUP BY *as the same
-    // expression*, so monoscope's chart query —
-    // `SELECT extract(epoch from time_bucket(60, timestamp)) … GROUP BY
-    // time_bucket(60, timestamp) ORDER BY time_bucket(60, timestamp)` — lifted
-    // the one `60` into `$1`, `$5` and `$6`, the three `time_bucket` calls
-    // stopped being equal, and the shape build failed with "Column in SELECT
-    // must be in GROUP BY or an aggregate function". Every dashboard chart then
-    // re-planned from scratch, forever (prod 2026-08-08, `shape build failed`
-    // logged continuously).
-    //
-    // Reusing is semantics-preserving: both sites bind the same value. It does
-    // narrow the template — `f(5) … g(5)` and `f(5) … g(7)` are now different
-    // shapes — which is correct, just a different cache key.
+    // An identical literal must REUSE its placeholder: DataFusion requires a
+    // SELECT expression to appear in GROUP BY as the *same* expression, so
+    // giving two occurrences of one literal distinct placeholders makes e.g.
+    // `time_bucket(60, ts)` in SELECT and GROUP BY stop matching. Reuse is
+    // semantics-preserving; it only narrows the template.
     fn placeholder_for(values: &mut Vec<ScalarValue>, base: usize, v: ScalarValue) -> Value {
         let idx = values.iter().position(|existing| *existing == v).unwrap_or_else(|| {
             values.push(v);
@@ -694,33 +585,29 @@ fn parameterize_statement(stmt: &Statement, base: usize, include_strings: bool) 
 
     // Parameterize a numeric literal ONLY when reached as a value-context child
     // (function arg, comparison operand, CASE/BETWEEN/cast). A bare
-    // `Expr::Value(Number)` — which is exactly what GROUP BY / ORDER BY ordinals
-    // and LIMIT / OFFSET are — is never a child of these containers, so ordinals
-    // keep their positional meaning at every nesting level. Numbers that can't be
-    // parsed (or would lose precision) stay inline. This is the fix for the
-    // dashboard shape fragmentation: time_bucket(60,…), approx_percentile(0.95,…),
-    // `duration <= 500`, epoch bounds all differ only by numeric literals.
-    fn take_number(e: &mut SqlExpr, base: usize, values: &mut Vec<ScalarValue>) {
-        if let SqlExpr::Value(vs) = e
-            && let Value::Number(n, _) = &vs.value
-            && let Some(sv) =
-                n.parse::<i64>().map(|i| ScalarValue::Int64(Some(i))).ok().or_else(|| n.parse::<f64>().ok().map(|f| ScalarValue::Float64(Some(f))))
-        {
-            vs.value = placeholder_for(values, base, sv);
+    // `Expr::Value(Number)` — exactly what GROUP BY / ORDER BY ordinals and
+    // LIMIT / OFFSET are — is never a child of these containers, so ordinals keep
+    // their positional meaning. Unparseable numbers stay inline.
+    fn take_numbers<'a>(exprs: impl IntoIterator<Item = &'a mut SqlExpr>, base: usize, values: &mut Vec<ScalarValue>) {
+        for e in exprs {
+            if let SqlExpr::Value(vs) = e
+                && let Value::Number(n, _) = &vs.value
+                && let Some(sv) =
+                    n.parse::<i64>().map(|i| ScalarValue::Int64(Some(i))).ok().or_else(|| n.parse::<f64>().ok().map(|f| ScalarValue::Float64(Some(f))))
+            {
+                vs.value = placeholder_for(values, base, sv);
+            }
         }
     }
-    // Capture "now" once so every now()/current_timestamp in the statement
-    // substitutes to the same fresh instant (matching SQL's single-evaluation
-    // semantics). Timezone-aware nanosecond mirrors DataFusion's native now();
-    // the caller casts to the placeholder's inferred type.
+    // Capture "now" once so every now()/current_timestamp substitutes to the same
+    // instant (SQL's single-evaluation semantics). Tz-aware nanoseconds mirrors
+    // DataFusion's native now().
     let now_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
     let _: ControlFlow<()> = visit_expressions_mut(&mut stmt, |e: &mut SqlExpr| {
         match e {
             // PG array literals ('{}', '{a,b}') must stay inline: PgArrayLiteralRewriter
-            // rewrites them to typed list literals during analysis, and it only matches
-            // Expr::Literal — a `$N` placeholder slips past it and gets mis-cast to a
-            // single-element list (COALESCE(list_col, '{a,b}') → ['{a,b}'] instead of
-            // ['a','b']). Cheap to skip: array-literal COALESCE is not a hot cached path.
+            // matches only Expr::Literal, so a `$N` placeholder slips past it and is
+            // mis-cast to a single-element list.
             SqlExpr::Value(vs) if include_strings => {
                 if let Value::SingleQuotedString(s) = &vs.value
                     && !s.trim_start().starts_with('{')
@@ -729,16 +616,12 @@ fn parameterize_statement(stmt: &Statement, base: usize, include_strings: bool) 
                 }
             }
             // now()/current_timestamp/… → placeholder bound to the captured instant,
-            // so the optimized plan is reusable across dashboard refreshes while the
-            // time window stays fresh (never frozen to plan-build time).
+            // so the optimized plan is reusable while the time window stays fresh.
             SqlExpr::Function(f) if fn_name_is_one_of(f, PARAMETERIZABLE_TIME_FNS) => {
                 let value = placeholder_for(&mut values, base, ScalarValue::TimestampNanosecond(Some(now_ns), Some("+00:00".into())));
                 let placeholder = SqlExpr::Value(ValueWithSpan { value, span: Span::empty() });
-                // Wrap in CAST(... AS TIMESTAMPTZ): a BARE placeholder is untyped, so
-                // `now() - INTERVAL '1h'` (every dashboard time window) failed to
-                // optimize with "Cannot infer common argument type Timestamp >=
-                // Interval" → the shape negative-cached → 0 shape hits in prod
-                // (2026-07-20). Typing the placeholder lets the arithmetic infer.
+                // The CAST is required: a bare placeholder is untyped, so
+                // `now() - INTERVAL '1h'` cannot infer a common argument type.
                 *e = SqlExpr::Cast {
                     kind: CastKind::Cast,
                     expr: Box::new(placeholder),
@@ -747,48 +630,33 @@ fn parameterize_statement(stmt: &Statement, base: usize, include_strings: bool) 
                     array: false,
                 };
             }
-            // Value-context containers: parameterize their direct numeric-literal
-            // children. See take_number — this deliberately never touches a
-            // standalone Number (ordinals / LIMIT / OFFSET). Gated on
-            // `include_strings`: the mixed now()+`$N` execute path calls with
-            // `false` and binds only time-fn placeholders positionally, so it must
-            // not gain extra numeric placeholders. EVERY arm below this sentinel
-            // requires `include_strings` — the time-fn arm above deliberately does not.
+            // Every arm BELOW this sentinel requires `include_strings`; the time-fn
+            // arm above deliberately does not. The mixed now()+`$N` execute path
+            // binds time-fn placeholders positionally and must gain no others.
             _ if !include_strings => {}
-            SqlExpr::BinaryOp { left, right, .. } => {
-                take_number(left, base, &mut values);
-                take_number(right, base, &mut values);
-            }
-            SqlExpr::UnaryOp { expr, .. } | SqlExpr::Nested(expr) | SqlExpr::Cast { expr, .. } => take_number(expr, base, &mut values),
-            SqlExpr::Between { expr, low, high, .. } => {
-                take_number(expr, base, &mut values);
-                take_number(low, base, &mut values);
-                take_number(high, base, &mut values);
-            }
-            SqlExpr::InList { expr, list, .. } => {
-                take_number(expr, base, &mut values);
-                list.iter_mut().for_each(|e| take_number(e, base, &mut values));
-            }
-            SqlExpr::Case { operand, conditions, else_result, .. } => {
-                // Walk order (operand → conditions → else) fixes `$N` numbering; keep it.
-                operand.iter_mut().for_each(|e| take_number(e, base, &mut values));
-                conditions.iter_mut().for_each(|w| {
-                    take_number(&mut w.condition, base, &mut values);
-                    take_number(&mut w.result, base, &mut values);
-                });
-                else_result.iter_mut().for_each(|e| take_number(e, base, &mut values));
-            }
+            SqlExpr::BinaryOp { left, right, .. } => take_numbers([&mut **left, &mut **right], base, &mut values),
+            SqlExpr::UnaryOp { expr, .. } | SqlExpr::Nested(expr) | SqlExpr::Cast { expr, .. } => take_numbers([&mut **expr], base, &mut values),
+            SqlExpr::Between { expr, low, high, .. } => take_numbers([&mut **expr, &mut **low, &mut **high], base, &mut values),
+            SqlExpr::InList { expr, list, .. } => take_numbers(std::iter::once(&mut **expr).chain(list.iter_mut()), base, &mut values),
+            // Walk order (operand → conditions → else) fixes `$N` numbering; keep it.
+            SqlExpr::Case { operand, conditions, else_result, .. } => take_numbers(
+                operand
+                    .iter_mut()
+                    .map(|e| &mut **e)
+                    .chain(conditions.iter_mut().flat_map(|w| [&mut w.condition, &mut w.result]))
+                    .chain(else_result.iter_mut().map(|e| &mut **e)),
+                base,
+                &mut values,
+            ),
             SqlExpr::Function(f) => {
                 if let FunctionArguments::List(list) = &mut f.args {
-                    list.args
-                        .iter_mut()
-                        .filter_map(|arg| match arg {
-                            FunctionArg::Unnamed(FunctionArgExpr::Expr(e))
-                            | FunctionArg::Named { arg: FunctionArgExpr::Expr(e), .. }
-                            | FunctionArg::ExprNamed { arg: FunctionArgExpr::Expr(e), .. } => Some(e),
-                            _ => None,
-                        })
-                        .for_each(|e| take_number(e, base, &mut values));
+                    let args = list.args.iter_mut().filter_map(|arg| match arg {
+                        FunctionArg::Unnamed(FunctionArgExpr::Expr(e))
+                        | FunctionArg::Named { arg: FunctionArgExpr::Expr(e), .. }
+                        | FunctionArg::ExprNamed { arg: FunctionArgExpr::Expr(e), .. } => Some(e),
+                        _ => None,
+                    });
+                    take_numbers(args, base, &mut values);
                 }
             }
             _ => {}
@@ -835,13 +703,10 @@ impl PlanCacheHook {
     /// substituted, pre-optimized plan, or `None` to fall back to the normal
     /// parse→optimize pipeline. Every failure installs a negative entry so a
     /// shape that can't parameterize is only attempted once.
-    /// `include_strings=false` lifts ONLY the time fn (now()) and leaves every
-    /// other literal inline — used for now()-bearing queries, where lifting
-    /// strings/numbers breaks planning (INTERVAL '…' → INTERVAL $n is
-    /// unplannable, and the same time_bucket('1m',…) in GROUP BY and ORDER BY
-    /// would get distinct placeholders → "ORDER BY must be in GROUP BY").
-    /// Repeated dashboard refreshes send identical SQL except now(), so the shape
-    /// key is still stable → hits. `true` (pure literal SELECTs) lifts all.
+    ///
+    /// `include_strings=false` lifts ONLY the time fn and leaves every other
+    /// literal inline — required for now()-bearing queries, where lifting
+    /// strings/numbers makes `INTERVAL $n` unplannable. `true` lifts all.
     async fn try_shape_cached_plan(
         &self, statement: &Statement, canonical: &str, session_context: &SessionContext, include_strings: bool,
     ) -> Option<LogicalPlan> {
@@ -865,8 +730,8 @@ impl PlanCacheHook {
     /// tells the handler to skip `state.optimize()`.
     fn mark_served(&self, canonical: &str) {
         self.shape_hits.fetch_add(1, Relaxed);
-        // Soft cap: drop a random half. These texts are one-shot, so losing a
-        // memo only costs a redundant re-optimize.
+        // Soft cap: these texts are one-shot, so losing a memo only costs a
+        // redundant re-optimize.
         if self.served.len() >= SERVED_CAP {
             self.served.retain(|_, _| fastrand::bool());
         }
@@ -882,9 +747,8 @@ impl PlanCacheHook {
         if let Some(e) = self.shapes.get(shape_key) {
             return e; // Some(entry) hit / None negative
         }
-        // Build the placeholder plan once for this shape. The error is logged
-        // rather than swallowed so we can see WHY a shape negative-caches in prod
-        // (2026-07-20: dashboard now()+$N shapes all failed to build → 0 hits).
+        // Build the placeholder plan once; log rather than swallow the error so a
+        // negative-caching shape is diagnosable.
         let state = session_context.state();
         let built = state
             .statement_to_plan(DfStatement::Statement(Box::new(param_stmt)))
@@ -903,8 +767,7 @@ impl PlanCacheHook {
         if built.is_none() {
             self.shape_skips.fetch_add(1, Relaxed);
         }
-        // Shape entries hold a `LogicalPlan` just like template entries, so they
-        // get the same WEIGHED bound. A negative entry weighs only its key.
+        // A negative entry weighs only its key.
         let weight = built.as_ref().map_or(0, |e| plan_bytes(&e.plan)) + shape_key.len();
         self.shapes.insert(shape_key.to_string(), built.clone(), weight, "shape");
         built
@@ -912,10 +775,9 @@ impl PlanCacheHook {
 
     /// Mixed now()+client-`$N` path: cache an OPTIMIZED template whose time-fn
     /// placeholders are numbered above the client's binds and whose client
-    /// placeholders stay open. Returns the template unsubstituted —
-    /// `extra_execute_params` supplies a fresh instant for the time-fn
-    /// placeholders on every execute, so the window never freezes, even for a
-    /// reused (named) prepared statement whose parse hook runs only once.
+    /// placeholders stay open. Returns the template unsubstituted:
+    /// `extra_execute_params` supplies a fresh instant on every execute, so the
+    /// window never freezes even for a reused named prepared statement.
     async fn try_mixed_time_fn_plan(&self, statement: &Statement, canonical: &str, session_context: &SessionContext) -> Option<LogicalPlan> {
         let base = self.mixed_time_fn_base(statement)?;
         let (param_stmt, _) = parameterize_statement(statement, base, false)?;
@@ -929,10 +791,9 @@ impl PlanCacheHook {
     /// `$N`, when this statement is one we inject time-fn placeholders above.
     /// `None` = not a mixed-path statement, so nothing to inject.
     ///
-    /// A base of 0 also covers the `'$1'`-string-literal trap: `has_placeholder`
-    /// is a TEXT scan, so a literal containing `$1` routes a bind-less statement
-    /// here; the template would then be served with an unsubstituted `$1` ("no
-    /// value for placeholder $1" — and cached). The AST is authoritative.
+    /// Filtering out base 0 is load-bearing: `has_placeholder` is a TEXT scan, so
+    /// a `'$1'` string literal routes a bind-less statement here and the template
+    /// would be served (and cached) with an unsubstituted `$1`. The AST decides.
     fn mixed_time_fn_base(&self, stmt: &Statement) -> Option<usize> {
         (self.time_fn_shapes
             && matches!(stmt, Statement::Query(_))
@@ -945,29 +806,17 @@ impl PlanCacheHook {
     /// The cached-plan lookup shared by BOTH protocol paths: cheap AST-kind
     /// gate, the time-fn guards, then the shape / verbatim caches. `None` =
     /// not cacheable, caller falls back to the normal parse→optimize pipeline.
-    /// Normalize `count(*)` before planning, then plan.
+    /// Also normalizes `count(*)` before planning.
     ///
-    /// `count(*)` and `count(1)` are exactly equivalent (`1` is never NULL), but
-    /// DataFusion plans the aggregate as `count(Int64(1))` while an `ORDER BY`
-    /// *ordinal* resolves to the expression as WRITTEN in the select list. When
-    /// that select item wraps the call — `count(*)::int8` — the two never match
-    /// and planning fails with "Column in ORDER BY must be in GROUP BY or an
-    /// aggregate function". Postgres accepts it. monoscope's service graph is
-    /// exactly this shape and it was the single largest error source on prod
-    /// (~5500/hour, 2026-08-08).
+    /// The normalization must be an AST rewrite, not a text rewrite: over raw SQL
+    /// it would also hit INSERT payloads that contain `count(*)` as data.
     ///
-    /// This has to happen at the AST level, not as a text rewrite: the same
-    /// rewrite over raw SQL would also hit INSERTs, and monoscope inserts
-    /// arbitrary span bodies and log text that can contain `count(*)` as data.
-    ///
-    /// A rewritten statement must never return `None`, because the caller then
-    /// falls through to a planner that re-plans the ORIGINAL statement — which
-    /// is the broken one. So when the normal path declines a rewritten
-    /// statement, plan it here instead of handing back the un-normalized form.
+    /// A rewritten statement must never return `None`: the caller would then fall
+    /// through to a planner that re-plans the ORIGINAL (broken) statement. So when
+    /// the normal path declines a rewritten statement, plan it here.
     async fn cached_plan(&self, statement: &Statement, session_context: &SessionContext) -> Option<PgWireResult<LogicalPlan>> {
-        // Cheap AST-variant gate first: skipping non-DML here avoids paying for
-        // `Statement::to_string()` on every Parse message regardless of
-        // cacheability.
+        // Cheap AST-variant gate first: avoids `Statement::to_string()` on every
+        // Parse message regardless of cacheability.
         if !matches!(statement, Statement::Insert(_) | Statement::Query(_) | Statement::Update { .. } | Statement::Delete(_)) {
             return None;
         }
@@ -976,34 +825,21 @@ impl PlanCacheHook {
         };
         match self.cached_plan_normalized(&normalized, session_context).await {
             Some(result) => Some(result),
-            None => {
-                let state = session_context.state();
-                Some(
-                    state
-                        .statement_to_plan(DfStatement::Statement(Box::new(normalized)))
-                        .await
-                        .map(crate::write::rewrite_plan)
-                        .and_then(|plan| state.optimize(&plan))
-                        .map_err(api_err),
-                )
-            }
+            None => Some(plan_and_optimize(normalized, session_context).await.map_err(api_err)),
         }
     }
 
     async fn cached_plan_normalized(&self, statement: &Statement, session_context: &SessionContext) -> Option<PgWireResult<LogicalPlan>> {
-        // now()/current_date/... are const-folded by the optimizer using the
-        // query start time — a verbatim-cached optimized plan would freeze them.
-        // With time-fn shape caching on, route now()-bearing SELECTs to the shape
-        // path (which parameterizes the time fn → fresh instant per query);
-        // otherwise, and for unparameterizable date/time fns, plan fresh.
+        // now()/current_date/... are const-folded against the query start time, so
+        // a verbatim-cached optimized plan would freeze them. With time-fn shape
+        // caching on, route now()-bearing SELECTs to the shape path; otherwise,
+        // and for unparameterizable date/time fns, plan fresh.
         if contains_plan_time_folded_fn(statement) {
             if self.time_fn_shapes && matches!(statement, Statement::Query(_)) && !contains_unparameterizable_time_fn(statement) {
                 let canonical = statement.to_string();
                 return if Self::has_placeholder(&canonical) {
-                    // Mixed now()+client `$N`: cache a template that keeps BOTH the
-                    // client placeholders and the time-fn placeholders open; the
-                    // fresh instant is injected per-execute by extra_execute_params
-                    // (correct even for reused prepared statements).
+                    // Mixed now()+client `$N`: template keeps both open; the fresh
+                    // instant is injected per-execute by extra_execute_params.
                     self.try_mixed_time_fn_plan(statement, &canonical, session_context).await
                 } else {
                     // Pure now()-bearing: lift ONLY now() (include_strings=false),
@@ -1016,13 +852,10 @@ impl PlanCacheHook {
         }
         let canonical = statement.to_string();
         if !Self::has_placeholder(&canonical) {
-            // Literal-bearing SELECT (no now()): lift all literals for a
-            // literal-insensitive shape.
+            // Literal-bearing SELECT (no now()): lift all literals.
             return self.try_shape_cached_plan(statement, &canonical, session_context, true).await.map(Ok);
         }
 
-        // Lock-free read: DashMap.get returns a guard that just locks the
-        // single shard's reader, not the whole cache.
         if let Some(plan) = self.cache.get(&canonical) {
             self.hits.fetch_add(1, Relaxed);
             debug!(target: "plan_cache", %canonical, "plan cache hit");
@@ -1031,51 +864,33 @@ impl PlanCacheHook {
 
         // Miss: build the plan, install it, hand a clone back to caller.
         self.misses.fetch_add(1, Relaxed);
-        let state = session_context.state();
-        // `insert_coerce::rewrite_plan` wraps `$N` placeholders inside Values rows
-        // with `CAST($N AS <col_type>)` so pgwire param-type inference returns the
-        // right type per placeholder (otherwise row-1 types leak across to row-2+
-        // placeholders by position).
-        //
-        // Pre-optimizing at cache-miss time turns a per-query ~30ms cost into a
-        // one-time amortization: the patched datafusion-postgres skips its own
-        // `state.optimize()` when the hook returns Some (see
-        // apitoolkit/datafusion-postgres@timefusion-df54 src/handlers.rs). The plan
-        // still goes through `replace_params_with_values` at exec time, but
-        // non-constant-fold rules are parameter-independent and stay valid across
-        // all bound values.
-        let built =
-            state.statement_to_plan(DfStatement::Statement(Box::new(statement.clone()))).await.map(crate::write::rewrite_plan).and_then(|p| state.optimize(&p));
-        let plan = match built {
+        // The stored plan is already optimized: the patched datafusion-postgres
+        // skips its own `state.optimize()` when the hook returns Some. Safe because
+        // non-constant-fold rules are parameter-independent, and time-folding
+        // statements never reach here.
+        let plan = match plan_and_optimize(statement.clone(), session_context).await {
             Ok(p) => p,
             Err(e) => return Some(Err(api_err(e))),
         };
-        // Admit at the plan's own estimated weight, not at the length of the SQL
-        // that produced it — the two differ by ~600x for a bulk INSERT. The
-        // sweep, its hysteresis and the over-budget bail all live in
-        // `WeighedMap::insert`.
+        // Admit at the plan's own estimated weight, not the length of the SQL that
+        // produced it — the two differ by orders of magnitude for a bulk INSERT.
         let weight = plan_bytes(&plan) + canonical.len();
         self.cache.insert(canonical, plan.clone(), weight, "template");
         Some(Ok(plan))
     }
 
     fn has_placeholder(sql: &str) -> bool {
-        // Naive `contains('$')` would false-positive on dollar-quoted literals
-        // like '$100' and cache statements with embedded literal values.
+        // A bare `contains('$')` false-positives on literals like '$100'.
         sql.as_bytes().windows(2).any(|w| w[0] == b'$' && w[1].is_ascii_digit())
     }
 }
 
 #[async_trait]
 impl QueryHook for PlanCacheHook {
-    /// Serve simple-protocol queries from the same caches the extended path
-    /// uses. `psql`/ad-hoc SQL arrives with literals inline, so the *shape*
-    /// cache is what fires here (literal-insensitive template + per-query
-    /// re-binding of the lifted literals) — a verbatim hit only happens for
-    /// repeated identical text. Everything the extended path bypasses
-    /// (unparameterizable time fns, non-DML kinds, unparameterizable ASTs)
-    /// still bypasses: `cached_plan` returning `None` falls through to the
-    /// vendored `session_context.sql()` path unchanged.
+    /// Serve simple-protocol queries from the same caches the extended path uses.
+    /// Ad-hoc SQL arrives with literals inline, so the *shape* cache is what fires
+    /// here; `cached_plan` returning `None` falls through to the vendored
+    /// `session_context.sql()` path unchanged.
     async fn handle_simple_query(
         &self, statement: &Statement, session_context: &SessionContext, client: &mut dyn HookClient,
     ) -> Option<PgWireResult<Response>> {
@@ -1085,11 +900,9 @@ impl QueryHook for PlanCacheHook {
         if client.transaction_status() == TransactionStatus::Error {
             return None;
         }
-        // On a plan-build error, fall through rather than surfacing it: the
-        // vendored path will produce the same error with its own context.
+        // On a plan-build error, fall through: the vendored path produces the same
+        // error with its own context.
         let plan = self.cached_plan(statement, session_context).await?.ok()?;
-        // Mirror the vendored do_query: the statement timeout covers planning
-        // + DataFrame construction, and rows are encoded in unified text.
         let timeout = client.metadata().get("statement_timeout_ms").and_then(|s| s.parse::<u64>().ok()).map(std::time::Duration::from_millis);
         let format_options = Arc::new(FormatOptions::from_client_metadata(client.metadata()));
         Some(run_simple_query(plan, session_context, timeout, format_options).await)
@@ -1108,9 +921,8 @@ impl QueryHook for PlanCacheHook {
     /// execute. Empty for the pure path (M=0, substituted at parse) and for any
     /// statement we didn't shape-cache — surplus is ignored by the executor.
     fn extra_execute_params(&self, statement: Option<&Statement>) -> Vec<ScalarValue> {
-        // `None` statement = a bulk data statement whose AST the portal store
-        // no longer pins; `None` base = the pure path (substituted at parse) or
-        // a statement we never shape-cached. Nothing to inject either way.
+        // `None` statement = an AST the portal store no longer pins; `None` base =
+        // the pure path or a statement we never shape-cached. Nothing to inject.
         let Some(statement) = statement else { return Vec::new() };
         self.mixed_time_fn_base(statement).and_then(|base| parameterize_statement(statement, base, false)).map_or_else(Vec::new, |(_, values)| values)
     }
@@ -1124,34 +936,18 @@ impl QueryHook for PlanCacheHook {
     async fn handle_extended_query(
         &self, _statement: Option<&Statement>, logical_plan: &LogicalPlan, params: &ParamValues, session_context: &SessionContext, _client: &mut dyn HookClient,
     ) -> Option<PgWireResult<Response>> {
-        // Only intercept DML — for SELECTs the vendored path is fine.
-        // The win here is post-substitution constant folding of `CAST(Literal, T)`
-        // exprs that `insert_coerce` puts around every placeholder; folding them
-        // before `ValuesExec` evaluates the plan saves ~9–10 ms per inserted
-        // row on the 88-col schema (measured).
+        // Only intercept DML — for SELECTs the vendored path is fine. The win is
+        // post-substitution constant folding of the per-placeholder `CAST`s.
         if !matches!(logical_plan, LogicalPlan::Dml(_)) {
             return None;
         }
         Some(run_extended_dml(logical_plan, params, session_context).await)
     }
 
-    /// Signal to the do_query path that any plan we returned is already
-    /// optimized — so `state.optimize()` can be skipped. Plans only land
-    /// in `self.cache` after `state.optimize()` ran inside
-    /// `handle_extended_parse_query`, so a cache lookup here is the
-    /// authoritative answer.
-    ///
-    /// TOCTOU note: between this lookup and the handler calling
-    /// `replace_params_with_values`, the capacity-limit sweep can evict the
-    /// entry. In that case we falsely return `false` and the handler will
-    /// re-optimize the plan it has in hand — specifically, the
-    /// pre-optimised `LogicalPlan` stored on the `Portal` at parse time
-    /// (which IS the optimised plan our hook installed; the eviction only
-    /// removed our memo of having installed it, not the plan itself).
-    /// Re-running `state.optimize()` on an already-optimized plan is a
-    /// near-no-op (analyzer/optimizer rules detect inapplicability and
-    /// short-circuit) — at most a few hundred microseconds of redundant
-    /// work, well below the per-query budget. No correctness risk.
+    /// Signal to the do_query path that any plan we returned is already optimized,
+    /// so `state.optimize()` can be skipped. A sweep between this lookup and the
+    /// handler's use of the plan can make this falsely return `false`; that only
+    /// costs a redundant re-optimize of an already-optimized plan.
     fn was_pre_optimized(&self, canonical_sql: &str) -> bool {
         self.cache.contains_key(canonical_sql) || self.served.contains_key(canonical_sql)
     }
@@ -1188,13 +984,9 @@ mod tests {
         }
     }
 
-    /// The prod-breaking shape: monoscope's service graph, ~5500 planning
-    /// failures/hour. `count(*)` must reach the planner as `count(1)` so the
-    /// `ORDER BY 6` ordinal resolves against the same expression.
-    /// monoscope's chart shape: one literal, three `time_bucket` calls across
-    /// SELECT / GROUP BY / ORDER BY. They must lift to the SAME placeholder or
-    /// the GROUP BY stops matching the SELECT and the shape build fails — which
-    /// is what kept every dashboard chart out of the plan cache on prod.
+    /// One literal, three `time_bucket` calls across SELECT / GROUP BY / ORDER BY:
+    /// they must lift to the SAME placeholder or the GROUP BY stops matching the
+    /// SELECT and the shape build fails.
     #[test]
     fn one_literal_lifts_to_one_placeholder_so_group_by_still_matches_select() {
         let (text, values) = shape(
@@ -1206,13 +998,8 @@ mod tests {
         assert!(!text.contains("$3"), "no placeholder beyond the two distinct literals: {text}");
     }
 
-    /// `SUBSTRING(x FROM 'pat')` is PG regex extraction, and the pattern must
-    /// reach the planner as a literal. Parameterizing it produced the prod
-    /// failure `select substring(? from ?)` → "Cannot cast string
-    /// 'Number 782574.0' to value of Int64" (2026-08-31), because `$N` coerces
-    /// to substr's declared Int64 arg 2 before it is bound. Opting the whole
-    /// statement out of shape caching is what keeps the literal inline.
-    // The first is the exact prod shape (bare scalar), the second the same over a table.
+    /// `SUBSTRING(x FROM 'pat')` is PG regex extraction and the pattern must reach
+    /// the planner as a literal, so the statement opts out of shape caching.
     #[test_case("SELECT substring('abc-def' FROM '^[a-z]+')" => matches None ; "a regex substring pattern is never lifted to a placeholder")]
     #[test_case("SELECT substring(body FROM 'HTTP/[0-9.]+') FROM t WHERE project_id = 'p'" => matches None ; "regex substring over a real table opts out too")]
     // No string/number/time-fn literals to lift → nothing to cache-generalize.
@@ -1223,18 +1010,14 @@ mod tests {
 
     /// Literals that are NOT ordinal-safe value contexts must survive verbatim in
     /// the shape key; in each case only the `'p'` project id may be lifted.
-    // Substring OFFSETs carry a number, not a string — the statement still caches
-    // (unlike the regex form above) and the surrounding literals keep lifting.
+    // Substring OFFSETs carry a number, so the statement still caches.
     #[test_case("SELECT substring(body FROM 3) FROM t WHERE project_id = 'p'", &["FROM 3"] => vec![utf8("p")] ; "an offset substring still caches, offset inline")]
-    // SAFETY regression: GROUP BY / ORDER BY ordinals and LIMIT/OFFSET are bare
-    // Number nodes; parameterizing them would change ORDER BY 1 into ordering by
-    // a constant (wrong results).
+    // Ordinals and LIMIT/OFFSET are bare Number nodes; parameterizing them would
+    // turn ORDER BY 1 into ordering by a constant.
     #[test_case("SELECT status_code, count(*) FROM t WHERE project_id = 'p' GROUP BY 1 ORDER BY 1 LIMIT 100 OFFSET 20", &["GROUP BY 1", "ORDER BY 1", "LIMIT 100", "OFFSET 20"]
         => vec![utf8("p")] ; "ordinals and limit stay inline")]
-    // Regression: parameterizing '{}'/'{a,b}' into a $N placeholder hides them
-    // from PgArrayLiteralRewriter (matches Expr::Literal only), so they got
-    // mis-cast to single-element lists (COALESCE(list_col, '{a,b}') → ['{a,b}']
-    // instead of ['a','b']; edge_cases.slt:172). Array literals must stay inline.
+    // A $N placeholder hides an array literal from PgArrayLiteralRewriter (which
+    // matches Expr::Literal only), mis-casting it to a single-element list.
     #[test_case("SELECT ARRAY_LENGTH(COALESCE(parent_id, '{a,b}')) FROM t WHERE project_id = 'p'", &["'{a,b}'"] => vec![utf8("p")] ; "parameterize keeps pg array literals inline")]
     fn only_the_unsafe_literals_stay_inline(sql: &str, inline: &[&str]) -> Vec<ScalarValue> {
         let (text, values) = shape(sql);
@@ -1245,12 +1028,8 @@ mod tests {
     }
 
     /// Only statements DataFusion rejects today may be rewritten: a working query
-    /// must keep its exact output column names, and declining is also what keeps
-    /// a statement on the ordinary cache path. See `normalize_count_star`.
-    ///
-    /// The reason this is an AST rewrite and not a text rewrite: monoscope
-    /// inserts arbitrary span bodies and log text, and a regex over raw SQL
-    /// would corrupt any row whose DATA contains `count(*)`.
+    /// must keep its exact output column names. The INSERT case pins that this is
+    /// an AST rewrite, so SQL payload data containing `count(*)` is untouched.
     #[test_case("SELECT COUNT(*)::int8 FROM t" => matches None ; "no order by at all")]
     #[test_case("SELECT src, COUNT(*) FROM t GROUP BY src ORDER BY 2 DESC" => matches None ; "ordinal resolves to a bare count(*)")]
     #[test_case("SELECT src, COUNT(*)::int8 FROM t GROUP BY src ORDER BY 1 ASC" => matches None ; "ordinal points elsewhere")]
@@ -1290,9 +1069,7 @@ mod tests {
 
     #[test]
     fn numeric_literals_in_value_contexts_parameterize() {
-        // The 2026-07-20 plateau fix: dashboard shapes that differ only by numeric
-        // literals (bucket size, percentile, duration thresholds, epoch bounds) must
-        // collapse to one cached shape instead of replanning every refresh.
+        // Shapes differing only by numeric literals must collapse to one entry.
         let (ta, va) = shape(
             "SELECT time_bucket(60, timestamp), approx_percentile(0.95, duration) FROM t WHERE project_id = 'p' AND duration <= 500 AND timestamp >= 1721000000000000",
         );
@@ -1306,10 +1083,9 @@ mod tests {
         assert_eq!(va.len(), 5, "captured {:?}", va);
     }
 
-    /// Optimizer const-folds time fns from the query start time — caching the
-    /// optimized plan would freeze the window (2026-07-05 review finding). The
-    /// Date/Time-returning subset is riskier still (different result type) and
-    /// must additionally stay OFF the shape path.
+    /// The optimizer const-folds time fns from the query start time, so caching
+    /// the optimized plan would freeze the window. The Date/Time-returning subset
+    /// must additionally stay off the shape path.
     #[test_case("SELECT id FROM t WHERE project_id = 'p' AND ts > now()" => (true, false) ; "now() folds but parameterizes")]
     #[test_case("SELECT id FROM t WHERE ts > now()" => (true, false) ; "now() folds, bare predicate")]
     #[test_case("SELECT id FROM t WHERE project_id = 'p' AND ts > NOW() - INTERVAL '1 hour'" => (true, false) ; "now() inside an interval arithmetic")]
@@ -1325,8 +1101,6 @@ mod tests {
 
     #[test]
     fn parameterize_replaces_now_with_fresh_timestamp_placeholder() {
-        // now()/current_timestamp become $N bound to a fresh instant so the
-        // optimized plan is reusable while the window stays current (D2).
         let before = chrono::Utc::now().timestamp_nanos_opt().unwrap();
         let (text, values) = shape("SELECT id FROM t WHERE project_id = 'p' AND ts > now() - INTERVAL '1 hour'");
         let after = chrono::Utc::now().timestamp_nanos_opt().unwrap();
@@ -1349,8 +1123,6 @@ mod tests {
 
     #[test]
     fn mixed_parameterizes_time_fns_above_client_binds_only() {
-        // Mixed now()+$N: time-fn numbered above the client's max ($1 → now() = $2),
-        // client $1 untouched, string literals left inline (fixed across binds).
         let stmt = parse("SELECT id FROM t WHERE project_id = $1 AND level = 'error' AND ts > now() - INTERVAL '1 hour'");
         let (param, values) = parameterize_statement(&stmt, 1, false).expect("now() parameterizes");
         let text = param.to_string();
@@ -1379,8 +1151,7 @@ mod tests {
         assert!(hook.extra_execute_params(Some(&parse("SELECT id FROM t WHERE project_id = $1"))).is_empty());
         // Flag off → feature disabled entirely.
         assert!(PlanCacheHook::new(64, false).extra_execute_params(Some(&mixed)).is_empty());
-        // Bulk data statements no longer pin their AST past Parse; nothing to
-        // inject into one, so a dropped AST must not panic or over-count.
+        // A dropped AST (bulk statements do not pin theirs) must not panic.
         assert!(hook.extra_execute_params(None).is_empty());
         assert_eq!(hook.injected_param_count(None), 0);
     }
@@ -1398,17 +1169,15 @@ mod tests {
         ctx
     }
 
-    /// The end-to-end property: the shape that failed to plan now plans, and the
-    /// shapes we decline keep their exact wire-visible column name.
+    /// The shape that failed to plan now plans, and the shapes we decline keep
+    /// their exact wire-visible column name.
     #[tokio::test]
     async fn the_broken_ordinal_shape_plans_and_working_shapes_keep_their_names() {
         let ctx = test_ctx();
         let plan = async |stmt: Statement| ctx.state().statement_to_plan(DfStatement::Statement(Box::new(stmt))).await;
 
-        // Before: this is the monoscope service-graph shape and it does not plan.
         let broken = parse("SELECT project_id, COUNT(*)::int8 FROM t GROUP BY project_id ORDER BY 2 DESC");
         assert!(plan(broken.clone()).await.is_err(), "the bug this fixes must still be reproducible without the rewrite");
-        // After: normalized, it plans.
         let fixed = normalize_count_star(&broken).expect("rewritten");
         assert!(plan(fixed).await.is_ok(), "normalized ordinal resolves");
 
@@ -1425,8 +1194,7 @@ mod tests {
         let ctx = test_ctx();
         let plan_for = async |sql: &str| hook.cached_plan(&parse(sql), &ctx).await.map(|r| r.expect("plan"));
 
-        // 1st and 2nd identical simple queries both come back cached (the shape
-        // is built once — the second is a pure hit, no new shape entry).
+        // The shape is built once; the second identical query is a pure hit.
         assert!(plan_for("SELECT id FROM t WHERE project_id = 'p'").await.is_some());
         assert_eq!(hook.shape_counters(), (1, 0));
         assert!(plan_for("SELECT id FROM t WHERE project_id = 'p'").await.is_some());
@@ -1445,25 +1213,17 @@ mod tests {
         assert_eq!(hook.shape_counters(), (3, 0));
     }
 
-    /// Varying the INSERT batch size must not grow the cache without bound.
-    ///
-    /// Every distinct batch size is a distinct canonical text and therefore a
-    /// distinct entry, and each entry holds a `Values` plan with one `CAST` per
-    /// placeholder — so entry COUNT bounds nothing. Prod 2026-08-13: this
-    /// retention was ~55% of all heap growth and the process was OOM-killed
-    /// every 10-30 minutes with `Cast::new` / `Expr::clone` / `LogicalPlan::clone`
-    /// at the top of the profile.
+    /// Varying the INSERT batch size must not grow the cache without bound: every
+    /// distinct batch size is a distinct entry whose `Values` plan holds one
+    /// `CAST` per placeholder, so entry COUNT bounds nothing.
     #[tokio::test]
     async fn varying_insert_batch_sizes_cannot_grow_the_plan_cache_past_its_byte_budget() {
-        // Fewer statements than slots, so the ENTRY cap can never fire and only
-        // the byte budget can bound this — the prod shape, where 1024 slots were
-        // never filled by count and filled many times over by bytes.
+        // Fewer statements than slots, so only the byte budget can bound this.
         const STATEMENTS: usize = 40;
         let hook = PlanCacheHook::new(64, false);
         let ctx = test_ctx();
 
-        // Each statement is a bulk INSERT longer than the last: a client that
-        // batches by time or by buffer rather than by a fixed row count.
+        // Each statement is a bulk INSERT longer than the last.
         let bulk_insert = |batch: usize| {
             let values = (0..batch * 50).map(|r| format!("(${}, ${})", r * 2 + 1, r * 2 + 2)).collect::<Vec<_>>().join(",");
             parse(&format!("INSERT INTO t (id, project_id) VALUES {values}"))
@@ -1472,23 +1232,17 @@ mod tests {
             assert!(hook.cached_plan(&bulk_insert(batch), &ctx).await.is_some(), "the INSERT must still plan and be served");
         }
 
-        // The budget held, and the accounting matches what is actually retained
-        // — a counter that drifted from the map would silently stop bounding it.
-        // The sweep runs BEFORE the admission that follows it (sweeping after
-        // would evict the statement just built, since it is the heaviest), so
-        // the steady-state bound is the budget plus one statement.
+        // The sweep runs BEFORE the admission that follows it, so the steady-state
+        // bound is the budget plus one statement.
         let largest = hook.cache.map.iter().map(|e| e.value().1).max().unwrap_or(0);
         let retained: usize = hook.cache.map.iter().map(|e| e.value().1).sum();
         assert!(retained <= hook.cache.max_bytes + largest, "cache retains {retained} plan bytes, over its {} budget", hook.cache.max_bytes);
         assert_eq!(hook.cache.bytes(), retained, "the byte counter drifted from the map it bounds");
-        // And it bounded by BYTES, not by count: the entry cap never applied.
         assert!(hook.cache.len() < STATEMENTS, "the sweep must have dropped entries; {} of {STATEMENTS} retained", hook.cache.len());
         assert!(hook.cache.len() < hook.cache.capacity, "the entry cap must not be what bounded this");
 
-        // Evicting largest-first is what makes the bound affordable: the small
-        // dashboard SELECT that shares the cache with this flood must survive
-        // it, or bounding memory would just have traded an OOM for a cache that
-        // never hits. A random half-drop fails this ~50% of the time per sweep.
+        // Evicting largest-first is what makes the bound affordable: the small hot
+        // SELECT sharing the cache with this flood must survive it.
         let select = "SELECT id FROM t WHERE project_id = $1";
         assert!(hook.cached_plan(&parse(select), &ctx).await.is_some());
         for batch in 1..=STATEMENTS {
@@ -1497,13 +1251,8 @@ mod tests {
         assert!(hook.cache.contains_key(&parse(select).to_string()), "the flood evicted the small hot SELECT instead of the bulk INSERTs paying for the bytes");
     }
 
-    /// A sweep must leave HEADROOM, not stop the instant it is legal.
-    ///
-    /// The largest-first loop used to break as soon as `held < max_bytes`, so it
-    /// evicted to exactly the cap and the very next insert re-crossed it. Prod
-    /// 2026-08-14 logged **1036 sweeps in 10 minutes** (~1.7/s) with the byte
-    /// counter pinned just over the cap the whole time — every Parse paying a
-    /// full sort of the map. One insert must not be able to re-trigger a sweep.
+    /// A sweep must leave headroom: evicting to exactly the cap lets the very next
+    /// insert re-cross it, and every Parse then pays a full sort of the map.
     #[test]
     fn a_sweep_leaves_headroom_so_the_next_insert_cannot_re_trigger_it() {
         // 8 slots x 1 KiB = 8 KiB of budget, entries of 1 KiB each.
@@ -1513,8 +1262,8 @@ mod tests {
         }
         assert!(map.bytes() >= map.max_bytes, "the budget must actually be reached to arm the sweep");
 
-        // This insert sweeps. After it, the map must sit at or under the low
-        // water mark plus the one entry just admitted.
+        // This insert sweeps; the map must then sit at or under the low water mark
+        // plus the one entry just admitted.
         map.insert("trigger".into(), 0, 1024, "test");
         let low_water = map.max_bytes / SWEEP_LOW_WATER_DEN * SWEEP_LOW_WATER_NUM;
         assert!(map.bytes() <= low_water + 1024, "swept to {} bytes, expected <= {} — no headroom left", map.bytes(), low_water + 1024);
@@ -1531,10 +1280,9 @@ mod tests {
         assert_eq!(map.bytes(), 0, "a rejected entry must not be charged to the budget");
     }
 
-    /// A `'$1'` STRING LITERAL makes the text-based `has_placeholder` fire while
-    /// the AST holds no bind. Routing that into the mixed-time-fn path returned
-    /// an unsubstituted template — "no value for placeholder $1", cached. It
-    /// must plan through the pure-now() path instead.
+    /// A `'$1'` string literal makes the text-based `has_placeholder` fire while
+    /// the AST holds no bind; it must plan through the pure-now() path rather than
+    /// caching an unsubstituted template.
     #[tokio::test]
     async fn string_literal_that_looks_like_a_placeholder_does_not_poison_the_cache() {
         let hook = PlanCacheHook::new(64, true);

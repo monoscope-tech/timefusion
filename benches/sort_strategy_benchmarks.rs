@@ -1,7 +1,4 @@
 //! Compare in-process Arrow and spillable DataFusion sorts at flush-bucket sizes.
-//!
-//! An unsorted flush file disables ordering for every scan of its partition;
-//! this benchmark identifies when a DataFusion-sort escalation is worthwhile.
 
 use std::{sync::Arc, time::Instant};
 
@@ -15,8 +12,7 @@ use datafusion::{
     prelude::{SessionConfig, SessionContext},
 };
 
-/// Wide-ish rows: the cost that matters is per-ROW comparison plus the `take`
-/// of every payload column, and otel rows carry fat string payloads.
+/// Wide rows with fat string payloads, so the `take` of payload columns is priced.
 fn schema() -> SchemaRef {
     Arc::new(Schema::new(
         [
@@ -32,23 +28,21 @@ fn schema() -> SchemaRef {
 }
 
 fn batch(rows: usize, seed: u64) -> RecordBatch {
-    let mut ts = Vec::with_capacity(rows);
-    let mut ids = Vec::with_capacity(rows);
-    let mut svc = Vec::with_capacity(rows);
-    let mut lvl = Vec::with_capacity(rows);
     let mut x = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
-    for i in 0..rows {
-        x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-        ts.push(1_700_000_000_000_000i64 + ((x >> 17) % 600_000_000) as i64);
-        ids.push(format!("{:032x}", x ^ (i as u64)));
-        svc.push(format!("svc-{}", x % 24));
-        lvl.push((x % 5) as i32);
-    }
+    let draws: Vec<u64> = (0..rows)
+        .map(|_| {
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            x
+        })
+        .collect();
     let mut cols: Vec<ArrayRef> = vec![
-        Arc::new(TimestampMicrosecondArray::from(ts).with_timezone("UTC")),
-        Arc::new(StringArray::from(ids)),
-        Arc::new(StringArray::from(svc)),
-        Arc::new(Int32Array::from(lvl)),
+        Arc::new(
+            TimestampMicrosecondArray::from_iter_values(draws.iter().map(|&x| 1_700_000_000_000_000i64 + ((x >> 17) % 600_000_000) as i64))
+                .with_timezone("UTC"),
+        ),
+        Arc::new(StringArray::from_iter_values(draws.iter().enumerate().map(|(i, &x)| format!("{:032x}", x ^ (i as u64))))),
+        Arc::new(StringArray::from_iter_values(draws.iter().map(|&x| format!("svc-{}", x % 24)))),
+        Arc::new(Int32Array::from_iter_values(draws.iter().map(|&x| (x % 5) as i32))),
     ];
     cols.extend(
         (0..20).map(|i| Arc::new(StringArray::from((0..rows).map(|r| format!("payload-{i}-{r:06}-xxxxxxxxxxxxxxxxxxxx")).collect::<Vec<_>>())) as ArrayRef),
@@ -56,7 +50,7 @@ fn batch(rows: usize, seed: u64) -> RecordBatch {
     RecordBatch::try_new(schema(), cols).unwrap()
 }
 
-/// What the flush path does today: concat + lexsort + take, all in process.
+/// The flush path: concat + lexsort + take, all in process.
 fn arrow_sort(batches: &[RecordBatch]) -> usize {
     let one = arrow::compute::concat_batches(&schema(), batches).unwrap();
     let opts = SortOptions { descending: true, nulls_first: true };
@@ -69,7 +63,7 @@ fn arrow_sort(batches: &[RecordBatch]) -> usize {
     RecordBatch::try_new(schema(), out).unwrap().num_rows()
 }
 
-/// What compaction now does: sort inside a DataFusion plan and stream it.
+/// The compaction path: sort inside a DataFusion plan and stream it.
 async fn datafusion_sort(batches: Vec<RecordBatch>, ctx: &SessionContext) -> usize {
     let mem = MemTable::try_new(schema(), vec![batches]).unwrap();
     let name = format!("s{}", uuid::Uuid::new_v4().simple());

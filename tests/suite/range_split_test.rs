@@ -1,11 +1,6 @@
 //! `RangeParallelDedup` splits a wide aggregate window into disjoint timestamp
-//! ranges so each range's `DedupExec` runs on its own thread. The split is only
-//! sound because `timestamp` LEADS the dedup key, so a row's versions can never
-//! fall either side of a boundary.
-//!
-//! These tests exist because the failure mode is silent: a gap between branches
-//! drops rows and an overlap double-counts them, and either way the query still
-//! returns a plausible number.
+//! ranges. Sound only because `timestamp` LEADS the dedup key, so a row's
+//! versions can never fall either side of a boundary.
 
 use std::sync::Arc;
 
@@ -21,18 +16,16 @@ const DAYS: i64 = 30;
 const BRANCHES: usize = 4;
 const DAY_MICROS: i64 = 24 * 3_600 * 1_000_000;
 
-/// One row per day for 30 days, inserted TWICE as two independent Delta commits
-/// so every logical row exists as two physical versions in different files —
-/// the shape read-side dedup exists to collapse. Returns (db, project, window).
+/// One row per day for 30 days, inserted TWICE as two Delta commits so every
+/// logical row has two physical versions. Returns (db, project, start, end).
 async fn seeded(label: &str) -> Result<(Arc<Database>, String, i64, i64)> {
     timefusion::read::optimizers::set_range_split_branches(BRANCHES);
     let cfg = TestConfigBuilder::new(label).with_buffer_mode(BufferMode::Enabled).build();
     let db = Arc::new(Database::with_config(Arc::clone(&cfg)).await?);
     let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
 
-    // Anchor on a whole day so branch boundaries land on round numbers, then
-    // put a row at each day AND at each branch boundary — the boundary rows are
-    // the ones a half-open/closed mistake loses or counts twice.
+    // Anchor on a whole day so branch boundaries land on round numbers; rows sit
+    // at each day AND each boundary, where a half-open/closed mistake shows up.
     let end = chrono::Utc::now().date_naive().and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_micros();
     let start = end - DAYS * DAY_MICROS;
     let step = (end - start) / BRANCHES as i64;
@@ -42,7 +35,6 @@ async fn seeded(label: &str) -> Result<(Arc<Database>, String, i64, i64)> {
     let rows = |name: &str| -> Result<_> {
         json_to_batch(stamps.iter().enumerate().map(|(i, ts)| test_span_ts(&format!("row_{i}"), name, &project_id, *ts)).collect())
     };
-    // Two commits => two files per partition holding the same logical rows.
     db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![rows("first")?], true, None).await?;
     db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![rows("second")?], true, None).await?;
     Ok((db, project_id, start, end))
@@ -54,14 +46,13 @@ async fn scalar(db: &Arc<Database>, sql: &str) -> Result<i64> {
     Ok(ctx.sql(sql).await?.collect().await?[0].column(0).as_primitive::<Int64Type>().value(0))
 }
 
-/// The predicate both tests query through: one project, one closed timestamp range.
+/// Predicate for one project over a closed timestamp range.
 fn window(project_id: &str, lo: i64, hi: i64) -> String {
     let at = |us: i64| chrono::DateTime::from_timestamp_micros(us).unwrap().to_rfc3339();
     format!("project_id = '{project_id}' AND timestamp >= '{}'::timestamp AND timestamp <= '{}'::timestamp", at(lo), at(hi))
 }
 
-/// Rendered EXPLAIN text for `SELECT count(*)` over `window` — the plan shape is
-/// what both tests assert on.
+/// Rendered EXPLAIN text for `SELECT count(*)` over `window`.
 async fn explain_count(db: &Arc<Database>, window: &str) -> Result<String> {
     let mut ctx = Arc::clone(db).create_session_context();
     db.setup_session_context(&mut ctx)?;
@@ -73,9 +64,8 @@ async fn explain_count(db: &Arc<Database>, window: &str) -> Result<String> {
         .join("\n"))
 }
 
-/// The whole point: a wide window must split, and still count every logical row
-/// exactly once. Asserting the count alone would pass vacuously if the rule
-/// silently declined, so the plan is checked too.
+/// A wide window must split and still count every logical row exactly once. The
+/// plan is checked too: a count assertion alone passes vacuously if the rule declines.
 #[serial]
 #[tokio::test]
 async fn wide_window_splits_and_still_counts_each_row_once() -> Result<()> {
@@ -86,18 +76,11 @@ async fn wide_window_splits_and_still_counts_each_row_once() -> Result<()> {
     let rendered = explain_count(&db, &wide).await?;
     assert!(rendered.contains("Union"), "a {DAYS}-day aggregate must split into branches:\n{rendered}");
 
-    // Branches must prune DIFFERENTLY, or four threads each do the work of one.
-    // Counting rows cannot catch that: the answer stays exactly right while the
-    // cost multiplies, which is how the 2026-09-04 regression reached prod
-    // (14d 14.0s -> 34.2s) past a green suite.
-    //
-    // HONEST LIMIT: this is NOT a falsifier for that bug. Reverting the fix (the
-    // bound written into `TableScan.filters`) leaves this assertion PASSING,
-    // because locally `push_down_filter` runs again after this rule and folds the
-    // Filter in anyway — prod's pgwire path evidently does not. Verified by
-    // reverting the fix and re-running: still green. So this pins that pruning
-    // differs, and nothing more; the prod behaviour has no local reproduction
-    // yet, which is exactly why the split ships OFF.
+    // Branches must prune DIFFERENTLY, or four threads each do the work of one —
+    // a cost bug the row count cannot see.
+    // HONEST LIMIT: this stays GREEN with the pushdown fix reverted, because
+    // locally `push_down_filter` re-runs after this rule while the pgwire path
+    // does not. It pins that pruning differs, and nothing more.
     let bounds: std::collections::HashSet<&str> =
         rendered.lines().filter_map(|line| line.split("predicate=").nth(1)).filter(|predicate| predicate.contains("timestamp")).collect();
     assert!(bounds.len() > 1, "every branch pushed the SAME predicate, so each reads the whole window:\n{rendered}");
@@ -107,8 +90,7 @@ async fn wide_window_splits_and_still_counts_each_row_once() -> Result<()> {
     Ok(())
 }
 
-/// A narrow window has nothing to gain and must keep the un-split plan, so the
-/// hot dashboard path is untouched by this rule.
+/// A narrow window must keep the un-split plan.
 #[serial]
 #[tokio::test]
 async fn narrow_window_is_left_alone() -> Result<()> {
