@@ -8528,21 +8528,26 @@ impl Database {
         if !carried.is_empty() || !files.is_empty() {
             info!(table_name, carried = carried.len(), rebuilding = files.len(), event = "tantivy_wave_carried_forward");
         }
-        let (built, failed) = futures::stream::iter(files.into_iter().map(|(project, rel, uri)| {
-            let (svc, store, table) = (svc.clone(), store.clone(), table.clone());
-            async move { svc.build_index_for_file(&table, &project, &rel, &uri, store).await }
-        }))
-        .buffer_unordered(self.config.tantivy.timefusion_tantivy_build_concurrency.max(1))
-        .fold((0usize, 0usize), |(built, failed), result| async move {
-            match result {
-                Ok(()) => (built + 1, failed),
-                Err(error) => {
-                    warn!(table_name, %error, event = "tantivy_wave_reindex_failed");
-                    (built, failed + 1)
+        let (built, failed) =
+            futures::stream::iter(
+                files.into_iter().map(|(project, rel, uri)| {
+                    let (svc, store, table) = (svc.clone(), store.clone(), table.clone());
+                    async move {
+                        svc.build_index_for_file(&table, &project, &rel, &uri, store).instrument(tracing::info_span!("tantivy_build", cause = "wave")).await
+                    }
+                }),
+            )
+            .buffer_unordered(self.config.tantivy.timefusion_tantivy_build_concurrency.max(1))
+            .fold((0usize, 0usize), |(built, failed), result| async move {
+                match result {
+                    Ok(()) => (built + 1, failed),
+                    Err(error) => {
+                        warn!(table_name, %error, event = "tantivy_wave_reindex_failed");
+                        (built, failed + 1)
+                    }
                 }
-            }
-        })
-        .await;
+            })
+            .await;
         info!(table_name, built, failed, event = "tantivy_wave_reindex_complete");
     }
 

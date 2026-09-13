@@ -40,6 +40,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, postgres::PgPoolOptions};
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument as _;
 use tracing::{Instrument, debug, error, field::Empty, info, instrument, warn};
 use url::Url;
 
@@ -3901,7 +3902,9 @@ impl Database {
                     let store = table.read().await.log_store().object_store(None);
                     let rel =
                         crate::tantivy::search::parquet_rel_of_uri(&file.uri).ok_or_else(|| anyhow::anyhow!("invalid deferred parquet URI {}", file.uri))?;
-                    svc.build_index_for_file(&file.table_name, &file.project_id, rel, &file.uri, store).await
+                    svc.build_index_for_file(&file.table_name, &file.project_id, rel, &file.uri, store)
+                        .instrument(tracing::info_span!("tantivy_build", cause = "deferred"))
+                        .await
                 }
                 .await;
                 match result {
@@ -4298,7 +4301,10 @@ impl Database {
             let mut pending_since: HashMap<String, std::time::Instant> = HashMap::new();
             let mut jobs = futures::stream::iter(work.into_iter().map(|(pid, rel, uri)| {
                 let (svc, store, table) = (svc.clone(), delta_store.clone(), table_owned.clone());
-                async move { (pid.clone(), svc.build_index_for_file_deferred(&table, &pid, &rel, &uri, store).await) }
+                async move {
+                    let built = svc.build_index_for_file_deferred(&table, &pid, &rel, &uri, store);
+                    (pid.clone(), built.instrument(tracing::info_span!("tantivy_build", cause = "backfill")).await)
+                }
             }))
             .buffer_unordered(self.config.tantivy.timefusion_tantivy_build_concurrency.max(1));
             // Flush on a TIMER, not only on build completions. The age bound is
