@@ -253,8 +253,18 @@ const MIN_SORT_SPILL_RESERVATION_BYTES: usize = 8 * MIB;
 /// `ExternalSorter` takes this reservation per partition, up front, and its
 /// merge half cannot spill, so every sort pays it whether or not it sorts
 /// anything — hence the clamp rather than honouring an over-large request.
+/// The share of the pool reservations may consume. The rest is what the sorts
+/// actually sort INTO.
+///
+/// Without this the cap is `pool / (partitions x concurrency)` — the value at
+/// which reservations exactly fill the pool and leave **nothing** for data, which
+/// is not a budget at all. Prod 2026-09-14 ran at 8 partitions x 64 MB x 38
+/// possible clients = 19.5 GB of a 22 GB pool locked up before a single row is
+/// sorted, and failed dashboard reads with 78.1 MB free.
+const RESERVATION_POOL_SHARE: usize = 2;
+
 pub fn sort_spill_reservation_bytes(requested: Option<usize>, partitions: usize, pool_bytes: usize) -> usize {
-    let cap = pool_bytes / (partitions.max(1) * CONCURRENT_SORT_QUERIES);
+    let cap = pool_bytes / (partitions.max(1) * CONCURRENT_SORT_QUERIES * RESERVATION_POOL_SHARE);
     requested.unwrap_or(DEFAULT_SORT_SPILL_RESERVATION_BYTES).min(cap).max(MIN_SORT_SPILL_RESERVATION_BYTES)
 }
 
@@ -2004,11 +2014,22 @@ mod tests {
     // asked what happens at the size prod really runs, which is how a constant
     // describing the client could drift from the client unnoticed.
     #[test_case::test_case(None, 24, 22 * GIB ; "prod today: 24 partitions against the 22 GB pool")]
+    // Prod's REAL partition count, read from information_schema.df_settings on
+    // 2026-09-14: target_partitions is 8, not the 24 an earlier fix assumed.
+    #[test_case::test_case(None, 8, 22 * GIB ; "prod today: the 8 partitions prod actually runs")]
     fn sort_reservation_always_fits_the_pool(requested: Option<usize>, partitions: usize, pool: usize) {
         let got = sort_spill_reservation_bytes(requested, partitions, pool);
         // Divided, not multiplied: an unclamped `usize::MAX` request would
         // overflow the product and fail as a panic rather than as this claim.
-        assert!(got <= pool / (partitions * CONCURRENT_SORT_QUERIES), "{got} x {partitions} x {CONCURRENT_SORT_QUERIES} exceeds the {pool}-byte pool");
+        // Reservations must leave room for the DATA. Asserting only that they fit
+        // the pool passes at the exact point where they fill it and starve every
+        // sort of anywhere to sort into — which is how a clamp that "fits" still
+        // produced `Resources exhausted` with 78.1 MB free.
+        let total = got * partitions * CONCURRENT_SORT_QUERIES;
+        assert!(
+            total <= pool / RESERVATION_POOL_SHARE || got == MIN_SORT_SPILL_RESERVATION_BYTES,
+            "{got} x {partitions} x {CONCURRENT_SORT_QUERIES} = {total} takes more than 1/{RESERVATION_POOL_SHARE} of the {pool}-byte pool"
+        );
         assert!(got >= MIN_SORT_SPILL_RESERVATION_BYTES, "clamped below the merge floor: {got}");
         // Never RAISES a request — this is a ceiling, not a target.
         assert!(got <= requested.unwrap_or(DEFAULT_SORT_SPILL_RESERVATION_BYTES));
