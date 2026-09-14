@@ -135,30 +135,24 @@ fn quarantine_entry(quarantine_dir: &std::path::Path, entry: &WalEntry, kind: &s
         error!("Failed to create WAL quarantine dir {:?}: {}", quarantine_dir, e);
         return false;
     }
+    let WalEntry { timestamp_micros, project_id, table_name, operation, data } = entry;
     // project:table can contain chars unusable in a filename
-    let topic = format!("{}__{}", entry.project_id, entry.table_name).replace(['/', '\\', ':', '\0'], "_");
-    let filename = format!("{}_{}_{}.bin", entry.timestamp_micros, kind, topic);
-    let path = quarantine_dir.join(&filename);
+    let topic = format!("{project_id}__{table_name}").replace(['/', '\\', ':', '\0'], "_");
+    let path = quarantine_dir.join(format!("{timestamp_micros}_{kind}_{topic}.bin"));
     // Raw user data that failed to deserialize — 0600, not world-readable.
-    if let Err(e) = write_owner_only(&path, &entry.data) {
+    if let Err(e) = write_owner_only(&path, data) {
         error!("Failed to write quarantine file {:?}: {}", path, e);
         return false;
     }
     let meta_path = path.with_extension("meta");
     let meta = format!(
-        "ts_micros={}\nproject_id={}\ntable_name={}\noperation={:?}\nkind={}\nreason={}\nbytes={}\n",
-        entry.timestamp_micros,
-        entry.project_id,
-        entry.table_name,
-        entry.operation,
-        kind,
-        reason,
-        entry.data.len()
+        "ts_micros={timestamp_micros}\nproject_id={project_id}\ntable_name={table_name}\noperation={operation:?}\nkind={kind}\nreason={reason}\nbytes={}\n",
+        data.len()
     );
     if let Err(e) = write_owner_only(&meta_path, meta.as_bytes()) {
         error!("Failed to write quarantine meta {:?}: {}", meta_path, e);
     }
-    error!("Quarantined WAL entry to {:?} (kind={}, bytes={})", path, kind, entry.data.len());
+    error!("Quarantined WAL entry to {:?} (kind={}, bytes={})", path, kind, data.len());
     crate::observability::record_wal_corruption();
     true
 }
@@ -1437,6 +1431,10 @@ impl BufferedWriteLayer {
                 quarantine_failures.fetch_add(1, Ordering::Relaxed);
             }
         };
+        fn decode_insert(entry: &WalEntry) -> (Result<RecordBatch, crate::write::wal::WalError>, u128) {
+            let started = std::time::Instant::now();
+            (deserialize_record_batch(&entry.data).map(crate::write::mem_buffer::compact_batch), started.elapsed().as_nanos())
+        }
         // No age cutoff: the persisted cursor already bounds replay to un-flushed
         // entries, and an age filter would lose acked writes older than retention.
         let mut process_entry = |entry: WalEntry,
@@ -1447,10 +1445,7 @@ impl BufferedWriteLayer {
             match entry.operation {
                 WalOperation::Insert => {
                     insert_bytes += entry.data.len() as u64;
-                    let (decoded, decode_nanos) = predecoded_insert.unwrap_or_else(|| {
-                        let decode_start = std::time::Instant::now();
-                        (deserialize_record_batch(&entry.data).map(crate::write::mem_buffer::compact_batch), decode_start.elapsed().as_nanos())
-                    });
+                    let (decoded, decode_nanos) = predecoded_insert.unwrap_or_else(|| decode_insert(&entry));
                     insert_decode_nanos += decode_nanos;
                     match decoded {
                         Ok(batch) => {
@@ -1576,19 +1571,12 @@ impl BufferedWriteLayer {
             // Decode the chunk across tasks; `DECODE_CHUNK_BYTES` bounds the
             // payload in flight. ORDER IS PRESERVED — tasks take disjoint
             // contiguous slices and are joined in order, which DML replay needs.
-            fn decode_one(entry: &WalEntry) -> Option<(Result<RecordBatch, crate::write::wal::WalError>, u128)> {
-                (entry.operation == WalOperation::Insert).then(|| {
-                    let started = std::time::Instant::now();
-                    let batch = deserialize_record_batch(&entry.data).map(crate::write::mem_buffer::compact_batch);
-                    (batch, started.elapsed().as_nanos())
-                })
-            }
             // Non-capturing (so `Copy`, hence usable from every spawned task).
-            let decode_slice = |slice: Vec<_>| {
+            let decode_slice = |slice: Vec<(WalEntry, _, _, _)>| {
                 slice
                     .into_iter()
                     .map(|(entry, shard, pos, frontier)| {
-                        let d = decode_one(&entry);
+                        let d = (entry.operation == WalOperation::Insert).then(|| decode_insert(&entry));
                         (entry, shard, pos, frontier, d)
                     })
                     .collect::<Vec<_>>()
@@ -3139,7 +3127,8 @@ impl BufferedWriteLayer {
     /// replay parses against (mirrors `MemBuffer::update_with_source`'s rewrite), THEN unparse.
     /// Without this the unparser emits table- and alias-qualified columns the replay schema
     /// cannot resolve, quarantining every `UPDATE ... FROM` on restart. `source_cols` are the
-    /// source batch's field names.
+    /// source batch's field names; pass an empty set for plain UPDATE/DELETE, whose replay
+    /// parses against the bare buffer schema and so needs only the qualifier strip.
     fn normalized_wal_sql(expr: &datafusion::logical_expr::Expr, source_cols: &HashSet<String>) -> String {
         use datafusion::{common::tree_node::TreeNode, logical_expr::Expr};
         let bare = strip_column_qualifiers(expr.clone()).unwrap_or_else(|_| expr.clone());
@@ -3156,13 +3145,6 @@ impl BufferedWriteLayer {
             .map(|t| t.data)
             .unwrap_or_else(|_| expr.clone());
         Self::expr_to_wal_sql(&normalized)
-    }
-
-    /// Plain (non-source) UPDATE/DELETE replay parses against the bare buffer
-    /// schema, so strip qualifiers before unparsing — same qualifier hazard as
-    /// [`Self::normalized_wal_sql`] but with no source side.
-    fn stripped_wal_sql(expr: &datafusion::logical_expr::Expr) -> String {
-        Self::expr_to_wal_sql(&strip_column_qualifiers(expr.clone()).unwrap_or_else(|_| expr.clone()))
     }
 
     fn assignments_to_wal_sql(assignments: &[(String, datafusion::logical_expr::Expr)], source_cols: &HashSet<String>) -> Vec<(String, String)> {
@@ -3208,7 +3190,7 @@ impl BufferedWriteLayer {
     #[instrument(skip(self, predicate), fields(project_id, table_name))]
     pub fn delete(&self, project_id: &str, table_name: &str, predicate: Option<&datafusion::logical_expr::Expr>) -> datafusion::error::Result<u64> {
         let _admission = self.admit_dml()?;
-        let predicate_sql = predicate.map(Self::stripped_wal_sql);
+        let predicate_sql = predicate.map(|p| Self::normalized_wal_sql(p, &HashSet::new()));
         // WAL first: a failed append must propagate rather than apply in-memory, or the client
         // sees a commit that the next restart's replay loses.
         self.with_wal_pin(
@@ -3228,7 +3210,7 @@ impl BufferedWriteLayer {
         &self, project_id: &str, table_name: &str, predicate: Option<&datafusion::logical_expr::Expr>, assignments: &[(String, datafusion::logical_expr::Expr)],
     ) -> datafusion::error::Result<u64> {
         let _admission = self.admit_dml()?;
-        let predicate_sql = predicate.map(Self::stripped_wal_sql);
+        let predicate_sql = predicate.map(|p| Self::normalized_wal_sql(p, &HashSet::new()));
         let assignments_sql = Self::assignments_to_wal_sql(assignments, &HashSet::new());
         // See `delete()` — WAL failure must propagate.
         self.with_wal_pin(

@@ -125,6 +125,10 @@ fn uncast(expr: &Expr) -> &Expr {
     }
 }
 
+fn udf_call(func: Arc<ScalarUDF>, args: Vec<Expr>) -> Expr {
+    Expr::ScalarFunction(ScalarFunction { func, args })
+}
+
 /// Resolves PostgreSQL types that DataFusion does not model natively as text.
 #[derive(Debug, Default)]
 pub struct PostgresTypePlanner;
@@ -175,13 +179,8 @@ impl ExprPlanner for VariantAwareExprPlanner {
         // `x #>> '{}'` is `x` rendered as text (a JSON string losing its quotes).
         if path_is_array && is_empty_path_array(&expr.right) {
             let base = unalias(&expr.left);
-            let json =
-                if is_variant_column(&base, schema) { Expr::ScalarFunction(ScalarFunction { func: variant_to_json_udf(), args: vec![base] }) } else { base };
-            return Ok(PlannerResult::Planned(if is_long_arrow {
-                Expr::ScalarFunction(ScalarFunction { func: json_to_pg_text_udf(), args: vec![json] })
-            } else {
-                json
-            }));
+            let json = if is_variant_column(&base, schema) { udf_call(variant_to_json_udf(), vec![base]) } else { base };
+            return Ok(PlannerResult::Planned(if is_long_arrow { udf_call(json_to_pg_text_udf(), vec![json]) } else { json }));
         }
 
         let (base_expr, prefix) = if path_is_array { (unalias(&expr.left), vec![]) } else { collect_arrow_chain(&expr.left) };
@@ -198,13 +197,8 @@ impl ExprPlanner for VariantAwareExprPlanner {
         // JSON text to preserve PostgreSQL `->>` semantics.
         let path_literal = Expr::Literal(ScalarValue::Utf8(Some(build_variant_path(&path_parts))), None);
         let base_repr = expr_repr(&base_expr);
-        let variant_leaf = Expr::ScalarFunction(ScalarFunction { func: variant_get_udf(), args: vec![base_expr, path_literal] });
-        let result = if is_long_arrow {
-            let to_json = Expr::ScalarFunction(ScalarFunction { func: variant_to_json_udf(), args: vec![variant_leaf] });
-            Expr::ScalarFunction(ScalarFunction { func: json_to_pg_text_udf(), args: vec![to_json] })
-        } else {
-            variant_leaf
-        };
+        let variant_leaf = udf_call(variant_get_udf(), vec![base_expr, path_literal]);
+        let result = if is_long_arrow { udf_call(json_to_pg_text_udf(), vec![udf_call(variant_to_json_udf(), vec![variant_leaf])]) } else { variant_leaf };
 
         let op_str = match (path_is_array, is_long_arrow) {
             (false, false) => "->",
@@ -389,6 +383,13 @@ impl ScalarUDFImpl for JsonToPgTextUdf {
     }
 }
 
+/// Rebuild `f` carrying one extra metadata key.
+fn with_meta(f: &Field, key: &str, val: &str) -> FieldRef {
+    let mut md = f.metadata().clone();
+    md.insert(key.into(), val.into());
+    Arc::new(f.clone().with_metadata(md))
+}
+
 /// Re-stamp the `ARROW:extension:name = arrow.parquet.variant` marker, which the
 /// logical plan carries but the physical executor's per-row Field drops.
 /// `datafusion-variant`'s UDFs fail without it ("Extension type name missing").
@@ -397,9 +398,7 @@ fn stamp_variant_field(f: &FieldRef) -> FieldRef {
     if !is_variant_type(f.data_type()) || f.metadata().get(EXT_KEY).map(String::as_str) == Some(EXT_VAL) {
         return f.clone();
     }
-    let mut md = f.metadata().clone();
-    md.insert(EXT_KEY.into(), EXT_VAL.into());
-    Arc::new(f.as_ref().clone().with_metadata(md))
+    with_meta(f, EXT_KEY, EXT_VAL)
 }
 
 /// Wrap a `datafusion-variant` UDF so its arg fields get the Variant extension
@@ -424,12 +423,7 @@ impl<U: ScalarUDFImpl + Default + Hash + PartialEq + Eq + 'static, const JSONB_O
     // output Field here instead, so the default impl would not do.
     fn return_field_from_args(&self, args: datafusion::logical_expr::ReturnFieldArgs) -> datafusion::error::Result<FieldRef> {
         let f = self.inner.return_field_from_args(args)?;
-        if !JSONB_OUT {
-            return Ok(f);
-        }
-        let mut md = f.metadata().clone();
-        md.insert("tf.pg_type".into(), "jsonb".into());
-        Ok(Arc::new(f.as_ref().clone().with_metadata(md)))
+        Ok(if JSONB_OUT { with_meta(&f, "tf.pg_type", "jsonb") } else { f })
     }
     fn coerce_types(&self, arg_types: &[DataType]) -> datafusion::error::Result<Vec<DataType>> {
         self.inner.coerce_types(arg_types)
@@ -624,6 +618,11 @@ fn timestamp_ticks<'a>(array: &'a ArrayRef, label: &str) -> datafusion::error::R
     }
 }
 
+/// A raw tick plus its array's ticks-per-second as a UTC instant.
+fn tick_to_utc(tick: i64, per_sec: i64) -> datafusion::error::Result<DateTime<Utc>> {
+    DateTime::<Utc>::from_timestamp_micros(tick / (per_sec / 1_000_000)).ok_or_else(|| DataFusionError::Execution("Invalid timestamp".to_string()))
+}
+
 /// Map each tick of a timestamp array through `f(tick, ticks_per_second)` and
 /// rebuild a timestamp array of the same unit, carrying `tz` (None = naive).
 fn map_timestamps(
@@ -639,17 +638,8 @@ fn map_timestamps(
 fn format_timestamps(timestamp_array: &ArrayRef, format_str: &str) -> datafusion::error::Result<ArrayRef> {
     let parts = parse_pg_format(format_str);
     let (ticks, per_sec) = timestamp_ticks(timestamp_array, "First argument")?;
-    let per_micro = per_sec / 1_000_000;
-    let out: StringViewArray = ticks
-        .map(|v| {
-            v.map(|t| {
-                DateTime::<Utc>::from_timestamp_micros(t / per_micro)
-                    .ok_or_else(|| DataFusionError::Execution("Invalid timestamp".to_string()))
-                    .map(|dt| render_pg_format(&parts, &dt))
-            })
-            .transpose()
-        })
-        .collect::<datafusion::error::Result<_>>()?;
+    let out: StringViewArray =
+        ticks.map(|v| v.map(|t| tick_to_utc(t, per_sec).map(|dt| render_pg_format(&parts, &dt))).transpose()).collect::<datafusion::error::Result<_>>()?;
     Ok(Arc::new(out))
 }
 
@@ -816,8 +806,7 @@ fn convert_timezone(timestamp_array: &ArrayRef, tz_str: &str) -> datafusion::err
     let tz: Tz = tz_str.parse().map_err(|_| DataFusionError::Execution(format!("Invalid timezone: {tz_str}")))?;
     // `per_sec` is the array's ticks-per-second, so the same shift works for µs and ns.
     map_timestamps(timestamp_array, None, "First argument", |v, per_sec| {
-        let dt =
-            DateTime::<Utc>::from_timestamp_micros(v / (per_sec / 1_000_000)).ok_or_else(|| DataFusionError::Execution("Invalid timestamp".to_string()))?;
+        let dt = tick_to_utc(v, per_sec)?;
         Ok(v + dt.with_timezone(&tz).offset().fix().local_minus_utc() as i64 * per_sec)
     })
 }
@@ -873,8 +862,7 @@ impl ScalarUDFImpl for ToJsonUDF {
 // returned Field carries `tf.pg_type = jsonb`, which vendor/arrow-pg turns into
 // PG OID 3802 plus the leading 0x01 binary jsonb version byte.
 fn jsonb_tagged_field() -> FieldRef {
-    let meta = [("tf.pg_type".to_string(), "jsonb".to_string())].into_iter().collect();
-    Arc::new(Field::new("", DataType::Utf8View, true).with_metadata(meta))
+    with_meta(&Field::new("", DataType::Utf8View, true), "tf.pg_type", "jsonb")
 }
 
 macro_rules! jsonb_wrapper {
@@ -1055,7 +1043,13 @@ impl ScalarUDFImpl for TimeBucketUDF {
             ColumnarValue::Scalar(ScalarValue::IntervalMonthDayNano(Some(i))) => interval_to_micros(i.months, i.days, i.nanoseconds)?,
             _ => parse_interval_to_micros(&extract_scalar_string(width, "Interval")?)?,
         };
-        Ok(ColumnarValue::Array(bucket_timestamps(&as_array(ts)?, micros)?))
+        // floor(timestamp / bucket_size) * bucket_size, in the array's own unit.
+        let bucketed = map_timestamps(&as_array(ts)?, Some("UTC"), "Argument", |v, per_sec| {
+            let size =
+                micros.checked_mul(per_sec / 1_000_000).ok_or_else(|| DataFusionError::Execution("time_bucket width overflows the timestamp unit".into()))?;
+            v.div_euclid(size).checked_mul(size).ok_or_else(|| DataFusionError::Execution("time_bucket result is outside the timestamp range".into()))
+        })?;
+        Ok(ColumnarValue::Array(bucketed))
     }
 }
 
@@ -1104,25 +1098,14 @@ pub(crate) fn parse_interval_to_micros(interval_str: &str) -> datafusion::error:
         .ok_or_else(|| DataFusionError::Execution(format!("Interval '{interval_str}' must be positive and representable")))
 }
 
-/// Bucket timestamps to the nearest bucket boundary
-fn bucket_timestamps(timestamp_array: &ArrayRef, bucket_size_micros: i64) -> datafusion::error::Result<ArrayRef> {
-    // floor(timestamp / bucket_size) * bucket_size, in the array's own unit.
-    map_timestamps(timestamp_array, Some("UTC"), "Argument", |v, per_sec| {
-        let size = bucket_size_micros
-            .checked_mul(per_sec / 1_000_000)
-            .ok_or_else(|| DataFusionError::Execution("time_bucket width overflows the timestamp unit".into()))?;
-        v.div_euclid(size).checked_mul(size).ok_or_else(|| DataFusionError::Execution("time_bucket result is outside the timestamp range".into()))
-    })
-}
-
 /// A UDAF whose partial state is exactly its output: one serialized Binary sketch.
 fn binary_state_udaf(name: &str, input: DataType, factory: datafusion::logical_expr::function::AccumulatorFactoryFunction) -> AggregateUDF {
     create_udaf(name, vec![input], Arc::new(DataType::Binary), Volatility::Immutable, factory, Arc::new(vec![DataType::Binary]))
 }
 
 /// A mergeable sketch whose serialized form IS the aggregate's partial state.
-/// `encode`/`heap_size` are named apart from the inherent `to_bytes`/`size` of
-/// the implementors so the trait never shadows them.
+/// `encode`/`heap_size` are named apart from the inherent `to_bytes`/`size` an
+/// implementor may already have, so the trait never shadows them.
 trait Sketch: Default + std::fmt::Debug + Send + Sync + 'static {
     /// Message when the `*_merge` state column is not Binary.
     const MERGE_ERR: &'static str;
@@ -1234,10 +1217,6 @@ impl TDigestWrapper {
         digest.compress(TDIGEST_MAX_CENTROIDS);
         Ok(Self { digest: Some(digest) })
     }
-
-    fn size(&self) -> usize {
-        std::mem::size_of::<Self>() + self.digest.as_ref().map_or(0, |digest| std::mem::size_of_val(digest.centroids()))
-    }
 }
 
 /// `percentile_agg` digests raw Float64 values; `tdigest_merge` folds serialized digests.
@@ -1251,8 +1230,7 @@ impl Sketch for TDigestWrapper {
     }
 
     fn merge_bytes(&mut self, bytes: &[u8]) -> datafusion::error::Result<()> {
-        let other = Self::from_bytes(bytes)?;
-        self.merge(&other);
+        self.merge(&Self::from_bytes(bytes)?);
         Ok(())
     }
 
@@ -1261,7 +1239,7 @@ impl Sketch for TDigestWrapper {
     }
 
     fn heap_size(&self) -> usize {
-        self.size()
+        std::mem::size_of::<Self>() + self.digest.as_ref().map_or(0, |digest| std::mem::size_of_val(digest.centroids()))
     }
 }
 
@@ -1277,10 +1255,7 @@ impl ScalarUDFImpl for ApproxPercentileUDF {
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> datafusion::error::Result<ColumnarValue> {
         let [pct_arg, digest_arg] = args_n::<2>(&args.args, "approx_percentile", ": percentile and t-digest")?;
         // Result size follows the digest column (which comes from GROUP BY).
-        let num_rows = match digest_arg {
-            ColumnarValue::Array(array) => array.len(),
-            ColumnarValue::Scalar(_) => 1,
-        };
+        let num_rows = if let ColumnarValue::Array(array) = digest_arg { array.len() } else { 1 };
         let percentile_array = pct_arg.to_array(num_rows)?;
         let digest_array = digest_arg.to_array(num_rows)?;
 
@@ -1313,34 +1288,29 @@ impl ScalarUDFImpl for ApproxPercentileUDF {
 // `approx_percentile`: unlike DataFusion's `approx_distinct`, the sketch itself
 // is storable, so a rollup measure can carry it and fold it later.
 
-/// Feed one array's non-null values into a sketch. Strings and binaries are
-/// hashed in place; anything else is cast to Utf8View first, which preserves
-/// distinctness for every primitive type.
-fn hll_insert_array(sketch: &mut crate::read::Hll, array: &ArrayRef) -> datafusion::error::Result<()> {
-    macro_rules! feed {
-        ($ty:ty) => {{
-            let typed: &$ty = downcast(array, "hll_agg: array does not match its own data type")?;
-            typed.iter().flatten().for_each(|value| sketch.insert_hash(crate::read::hash_bytes(AsRef::<[u8]>::as_ref(&value))));
-            return Ok(());
-        }};
-    }
-    match array.data_type() {
-        DataType::Utf8View => feed!(StringViewArray),
-        DataType::Utf8 => feed!(StringArray),
-        DataType::LargeUtf8 => feed!(datafusion::arrow::array::LargeStringArray),
-        DataType::BinaryView => feed!(BinaryViewArray),
-        DataType::Binary => feed!(BinaryArray),
-        DataType::LargeBinary => feed!(datafusion::arrow::array::LargeBinaryArray),
-        _ => hll_insert_array(sketch, &datafusion::arrow::compute::cast(array, &DataType::Utf8View)?),
-    }
-}
-
 /// `hll_agg` hashes raw values; `hll_merge` folds stored sketches.
 impl Sketch for crate::read::Hll {
     const MERGE_ERR: &'static str = "hll_merge expects Binary values";
 
+    /// Strings and binaries are hashed in place; anything else is cast to
+    /// Utf8View first, which preserves distinctness for every primitive type.
     fn insert_array(&mut self, array: &ArrayRef) -> datafusion::error::Result<()> {
-        hll_insert_array(self, array)
+        macro_rules! feed {
+            ($ty:ty) => {{
+                let typed: &$ty = downcast(array, "hll_agg: array does not match its own data type")?;
+                typed.iter().flatten().for_each(|value| self.insert_hash(crate::read::hash_bytes(AsRef::<[u8]>::as_ref(&value))));
+                return Ok(());
+            }};
+        }
+        match array.data_type() {
+            DataType::Utf8View => feed!(StringViewArray),
+            DataType::Utf8 => feed!(StringArray),
+            DataType::LargeUtf8 => feed!(datafusion::arrow::array::LargeStringArray),
+            DataType::BinaryView => feed!(BinaryViewArray),
+            DataType::Binary => feed!(BinaryArray),
+            DataType::LargeBinary => feed!(datafusion::arrow::array::LargeBinaryArray),
+            _ => self.insert_array(&datafusion::arrow::compute::cast(array, &DataType::Utf8View)?),
+        }
     }
 
     fn merge_bytes(&mut self, bytes: &[u8]) -> datafusion::error::Result<()> {
@@ -1434,10 +1404,7 @@ pub fn hash_bucket_udf() -> ScalarUDF {
                 .filter(|n| *n > 0)
                 .ok_or_else(|| DataFusionError::Execution("hash_bucket's bucket count must be positive".to_string()))?;
             let array = as_array(value)?;
-            let strings = array
-                .as_any()
-                .downcast_ref::<StringViewArray>()
-                .ok_or_else(|| DataFusionError::Execution(format!("hash_bucket expects a Utf8View value, got {}", array.data_type())))?;
+            let strings: &StringViewArray = downcast(&array, format!("hash_bucket expects a Utf8View value, got {}", array.data_type()))?;
             let buckets: Int64Array =
                 strings.iter().map(|value| Some((crate::read::hash_bytes(value.unwrap_or_default().as_bytes()) % buckets) as i64)).collect();
             Ok(ColumnarValue::Array(Arc::new(buckets)))

@@ -183,34 +183,35 @@ impl QueryPlanner for DmlQueryPlanner {
         }
         match self.database.rollup_sql(logical_plan, session_state).await {
             Ok(Some(crate::database::RollupRewrite { sql, grain, mode, matched, ticket })) => {
-                let rewritten = async {
-                    let plan = session_state.create_logical_plan(&sql).await?;
-                    session_state.optimize(&substitute(logical_plan, &matched, requalified(plan, matched.schema())?)?)
-                }
-                .await;
-                match rewritten {
+                // Each failure carries its own stage label, log message and miss reason.
+                type RewriteFailure = (DataFusionError, &'static str, &'static str, crate::rollup::MissReason);
+                let planned: std::result::Result<Arc<dyn ExecutionPlan>, RewriteFailure> = async {
+                    let rewritten = async {
+                        let plan = session_state.create_logical_plan(&sql).await?;
+                        session_state.optimize(&substitute(logical_plan, &matched, requalified(plan, matched.schema())?)?)
+                    }
+                    .await
+                    .map_err(|e| (e, "sql", "rollup rewrite SQL could not be planned; using raw plan", crate::rollup::MissReason::UnsupportedShape))?;
                     // Names, order and types must match — but NOT qualifiers, so
                     // compare with `has_equivalent_names_and_types`, not `==`.
-                    Ok(rewritten) => match rewritten.schema().has_equivalent_names_and_types(logical_plan.schema()) {
-                        Ok(()) => match self.planner.create_physical_plan(&rewritten, session_state).await {
-                            Ok(exec) if self.database.rollup_ticket_current(&ticket).await => {
-                                crate::observability::record_rollup_hit(mode, &grain);
-                                return Ok(exec);
-                            }
-                            Ok(_) => crate::observability::record_rollup_miss(crate::rollup::MissReason::StaleCoverage),
-                            Err(error) => {
-                                warn!(%error, event = "rollup_rewrite_failed", stage = "physical", "rollup rewrite could not be planned; using raw plan");
-                                crate::observability::record_rollup_miss(crate::rollup::MissReason::UnsupportedShape);
-                            }
-                        },
-                        Err(error) => {
-                            warn!(%error, event = "rollup_rewrite_failed", stage = "schema", "rollup rewrite does not match the query schema; using raw plan");
-                            crate::observability::record_rollup_miss(crate::rollup::MissReason::RewriteSchemaMismatch);
-                        }
-                    },
-                    Err(error) => {
-                        warn!(%error, event = "rollup_rewrite_failed", stage = "sql", "rollup rewrite SQL could not be planned; using raw plan");
-                        crate::observability::record_rollup_miss(crate::rollup::MissReason::UnsupportedShape);
+                    rewritten.schema().has_equivalent_names_and_types(logical_plan.schema()).map_err(|e| {
+                        (e, "schema", "rollup rewrite does not match the query schema; using raw plan", crate::rollup::MissReason::RewriteSchemaMismatch)
+                    })?;
+                    self.planner
+                        .create_physical_plan(&rewritten, session_state)
+                        .await
+                        .map_err(|e| (e, "physical", "rollup rewrite could not be planned; using raw plan", crate::rollup::MissReason::UnsupportedShape))
+                }
+                .await;
+                match planned {
+                    Ok(exec) if self.database.rollup_ticket_current(&ticket).await => {
+                        crate::observability::record_rollup_hit(mode, &grain);
+                        return Ok(exec);
+                    }
+                    Ok(_) => crate::observability::record_rollup_miss(crate::rollup::MissReason::StaleCoverage),
+                    Err((error, stage, message, reason)) => {
+                        warn!(%error, event = "rollup_rewrite_failed", stage, "{message}");
+                        crate::observability::record_rollup_miss(reason);
                     }
                 }
             }
@@ -232,12 +233,11 @@ impl QueryPlanner for DmlQueryPlanner {
         match logical_plan {
             LogicalPlan::Dml(dml) if matches!(dml.op, WriteOp::Update | WriteOp::Delete) => {
                 let span = tracing::Span::current();
-                let is_update = matches!(dml.op, WriteOp::Update);
-                let op_type = if is_update { DmlOperation::Update } else { DmlOperation::Delete };
+                let op_type = if matches!(dml.op, WriteOp::Update) { DmlOperation::Update } else { DmlOperation::Delete };
                 span.record("operation", AsRef::<str>::as_ref(&op_type));
 
                 let input_exec = self.planner.create_physical_plan(&dml.input, session_state).await?;
-                let info = extract_dml_info(&dml.input, &dml.table_name.to_string(), is_update)?;
+                let info = extract_dml_info(&dml.input, &dml.table_name.to_string(), &op_type)?;
 
                 span.record("table.name", info.table_name.as_str());
                 span.record("project_id", info.project_id.as_str());
@@ -249,13 +249,24 @@ impl QueryPlanner for DmlQueryPlanner {
 
                 let session = delta_session_from(session_state);
                 Ok(Arc::new(DmlExec {
+                    op_type,
+                    table_name: info.table_name,
+                    project_id: info.project_id,
                     predicate: info.predicate,
                     assignments: info.assignments.unwrap_or_default(),
                     source,
                     // Resolve at PLAN time: this planner is built during boot,
                     // before the buffered layer is attached to the Database.
                     buffered_layer: self.database.buffered_layer().cloned(),
-                    ..DmlExec::new(op_type, info.table_name, info.project_id, input_exec, self.database.clone(), session)
+                    properties: Arc::new(PlanProperties::new(
+                        datafusion::physical_expr::EquivalenceProperties::new(input_exec.schema()),
+                        datafusion::physical_plan::Partitioning::UnknownPartitioning(1),
+                        input_exec.properties().emission_type,
+                        input_exec.properties().boundedness,
+                    )),
+                    input: input_exec,
+                    database: self.database.clone(),
+                    session,
                 }))
             }
             _ => self.planner.create_physical_plan(logical_plan, session_state).await,
@@ -270,7 +281,8 @@ impl QueryPlanner for DmlQueryPlanner {
 /// the target table, extracts equi-join keys, stashes the *other* side's plan
 /// for later async materialization, and continues down the target side.
 /// Errors if no `project_id` filter is present.
-fn extract_dml_info(input: &LogicalPlan, table_name: &str, extract_assignments: bool) -> Result<DmlInfo> {
+fn extract_dml_info(input: &LogicalPlan, table_name: &str, op: &DmlOperation) -> Result<DmlInfo> {
+    let updating = matches!(op, DmlOperation::Update);
     // Iterative, not recursive — plan trees can be deep.
     let mut current_plan = input;
     let mut predicate: Option<Expr> = None;
@@ -280,7 +292,7 @@ fn extract_dml_info(input: &LogicalPlan, table_name: &str, extract_assignments: 
 
     loop {
         match current_plan {
-            LogicalPlan::Projection(proj) if extract_assignments => {
+            LogicalPlan::Projection(proj) if updating => {
                 match &mut assignments {
                     // First Projection encountered: real UPDATE assignments.
                     None => assignments = Some(extract_assignments_from_projection(proj)),
@@ -300,7 +312,7 @@ fn extract_dml_info(input: &LogicalPlan, table_name: &str, extract_assignments: 
                 predicate = Some(predicate.take().map_or_else(|| filter.predicate.clone(), |existing| existing.and(filter.predicate.clone())));
                 current_plan = filter.input.as_ref();
             }
-            LogicalPlan::Join(join) if extract_assignments => {
+            LogicalPlan::Join(join) if updating => {
                 if source_plan.is_some() {
                     return Err(DataFusionError::NotImplemented("UPDATE with multiple FROM sources (chained joins) is not supported".to_string()));
                 }
@@ -339,7 +351,7 @@ fn extract_dml_info(input: &LogicalPlan, table_name: &str, extract_assignments: 
     }
 
     if project_id.is_empty() {
-        return Err(DataFusionError::Plan(format!("{} requires a project_id filter in WHERE clause", if extract_assignments { "UPDATE" } else { "DELETE" })));
+        return Err(DataFusionError::Plan(format!("{op} requires a project_id filter in WHERE clause")));
     }
     // Columns are IMMUTABLE by default and the read path pushes filters on them
     // below the merge-on-read dedup on that basis, so assigning an undeclared
@@ -556,20 +568,6 @@ enum DmlOperation {
     Update,
     #[strum(to_string = "DELETE")]
     Delete,
-}
-
-impl DmlExec {
-    fn new(
-        op_type: DmlOperation, table_name: String, project_id: String, input: Arc<dyn ExecutionPlan>, database: Arc<Database>, session: Arc<dyn Session>,
-    ) -> Self {
-        let properties = Arc::new(PlanProperties::new(
-            datafusion::physical_expr::EquivalenceProperties::new(input.schema()),
-            datafusion::physical_plan::Partitioning::UnknownPartitioning(1),
-            input.properties().emission_type,
-            input.properties().boundedness,
-        ));
-        Self { op_type, table_name, project_id, predicate: None, assignments: vec![], source: None, input, database, buffered_layer: None, session, properties }
-    }
 }
 
 impl DisplayAs for DmlExec {
@@ -1849,7 +1847,7 @@ fn split_rounds(batch: &RecordBatch, key_indices: &[usize]) -> Result<Vec<Record
         .map(|(_, idxs)| {
             let idx = UInt32Array::from(idxs);
             let cols = batch.columns().iter().map(|c| take(c, &idx, None)).collect::<std::result::Result<Vec<_>, _>>()?;
-            RecordBatch::try_new(batch.schema(), cols).map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+            RecordBatch::try_new(batch.schema(), cols).map_err(arrow_err)
         })
         .collect()
 }
@@ -1907,21 +1905,18 @@ pub async fn redrive_dml_quarantine(db: &Arc<crate::database::Database>, dir: &s
             skipped += 1;
             continue;
         };
-        let arrow_err = |e| DataFusionError::ArrowError(Box::new(e), None);
-        let merged = match std::fs::File::open(&path)
+        let Ok(merged) = std::fs::File::open(&path)
             .map_err(|e| DataFusionError::External(Box::new(e)))
             .and_then(|f| datafusion::arrow::ipc::reader::FileReader::try_new(f, None).map_err(arrow_err))
             .and_then(|r| r.collect::<std::result::Result<Vec<_>, _>>().map_err(arrow_err))
             .and_then(|b| {
                 let schema = b.first().map(RecordBatch::schema).ok_or_else(|| DataFusionError::Execution("empty IPC file".into()))?;
                 concat_batches(&schema, &b).map_err(arrow_err)
-            }) {
-            Ok(m) => m,
-            Err(e) => {
-                warn!("dml redrive: cannot read {path:?}: {e}; leaving parked");
-                skipped += 1;
-                continue;
-            }
+            })
+            .inspect_err(|e| warn!("dml redrive: cannot read {path:?}: {e}; leaving parked"))
+        else {
+            skipped += 1;
+            continue;
         };
         // Predicate: same shape the group was parked with, with bare column
         // names — requalification in the merge routes them.
@@ -1979,13 +1974,11 @@ pub async fn redrive_dml_quarantine(db: &Arc<crate::database::Database>, dir: &s
             ok += 1;
             continue;
         }
-        let rounds = match split_rounds_on_keys(&merged, &meta.join_keys) {
-            Ok(r) => r,
-            Err(e) => {
-                warn!("dml redrive: round split failed for {path:?}: {e}; leaving parked");
-                skipped += 1;
-                continue;
-            }
+        let Ok(rounds) =
+            split_rounds_on_keys(&merged, &meta.join_keys).inspect_err(|e| warn!("dml redrive: round split failed for {path:?}: {e}; leaving parked"))
+        else {
+            skipped += 1;
+            continue;
         };
         // Recovery bypasses SQL DML and can replay several projects and slices:
         // hold their capture fences until the whole replay finishes or fails.
@@ -2254,7 +2247,7 @@ fn build_folded(table_name: &str, shape_fp: u64, members: &[(GroupKey, PendingGr
             group.batches.iter().map(move |(batch, bounds)| {
                 let project_col = Arc::new(StringArray::from_iter_values(std::iter::repeat_n(key.project_id.as_str(), batch.num_rows())));
                 let cols = batch.columns().iter().cloned().chain(std::iter::once(project_col as _)).collect();
-                Ok((RecordBatch::try_new(out_schema.clone(), cols).map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?, bounds.clone()))
+                Ok((RecordBatch::try_new(out_schema.clone(), cols).map_err(arrow_err)?, bounds.clone()))
             })
         })
         .collect::<Result<_>>()?;
@@ -2400,10 +2393,8 @@ impl DmlCoalescer {
             if let Some(layer) = db.buffered_layer() {
                 // Folded groups clamp against the MAX member watermark: a row
                 // is excludable only when it is unflushed for every member.
-                let wm = match &group.folded_projects {
-                    Some(ps) => ps.iter().map(|p| layer.delta_flushed_watermark(p, &key.table_name)).max().unwrap_or(i64::MIN),
-                    None => layer.delta_flushed_watermark(&key.project_id, &key.table_name),
-                };
+                let projects = group.folded_projects.as_deref().unwrap_or_else(|| std::slice::from_ref(&key.project_id));
+                let wm = projects.iter().map(|p| layer.delta_flushed_watermark(p, &key.table_name)).max().unwrap_or(i64::MIN);
                 if matches!(clamp_decomposed(&mut group.predicate, wm), ClampAction::Skip) {
                     crate::observability::record_dml_delta_leg_skipped();
                     debug!("dml coalesce: skipping {}/{} group — window entirely above flush watermark", key.project_id, key.table_name);
@@ -2419,22 +2410,17 @@ impl DmlCoalescer {
                 }
             };
             let statements = group.batches.len();
-            let merged = match concat_batches(&group.schema, group.batches.iter().map(|(b, _)| b)) {
-                Ok(b) => b,
-                Err(e) => {
-                    park_group("concat", &e, &group.batches.iter().map(|(b, _)| b.clone()).collect::<Vec<_>>());
-                    continue;
-                }
+            let Ok(merged) = concat_batches(&group.schema, group.batches.iter().map(|(b, _)| b))
+                .inspect_err(|e| park_group("concat", e, &group.batches.iter().map(|(b, _)| b.clone()).collect::<Vec<_>>()))
+            else {
+                continue;
             };
             if merged.num_rows() == 0 {
                 continue;
             }
-            let rounds = match split_rounds_on_keys(&merged, &group.join_keys) {
-                Ok(r) => r,
-                Err(e) => {
-                    park_group("round split", &e, std::slice::from_ref(&merged));
-                    continue;
-                }
+            let Ok(rounds) = split_rounds_on_keys(&merged, &group.join_keys).inspect_err(|e| park_group("round split", e, std::slice::from_ref(&merged)))
+            else {
+                continue;
             };
             let predicate = group.predicate.reconstruct(group.time_col);
             group.fence_histogram(db, &key, predicate.as_ref());
@@ -2451,27 +2437,30 @@ impl DmlCoalescer {
             }
             .await;
             if let Err(e) = outcome {
+                // Once out of attempts, park rather than drop: a dropped group is
+                // permanent divergence with no self-heal (see `quarantine_group`).
                 group.attempts += 1;
-                if group.attempts >= MAX_DRAIN_ATTEMPTS {
-                    // Park, don't drop: a dropped group is permanent divergence
-                    // with no self-heal (see `quarantine_group`).
-                    let reason = format!("{} failed drains: {e}", group.attempts);
-                    if !quarantine_group(&self.quarantine_dir, &key, &group, std::slice::from_ref(&merged), &reason) {
-                        crate::observability::record_dml_coalesce_dropped();
-                        error!(
-                            "dml coalesce: LOST {}/{} group after {} failed drains ({statements} stmts, {} rows) — quarantine write failed: {e}",
-                            key.project_id,
-                            key.table_name,
-                            group.attempts,
-                            merged.num_rows()
-                        );
-                    }
-                } else {
+                if group.attempts < MAX_DRAIN_ATTEMPTS {
                     warn!(
                         "dml coalesce: drain failed for {}/{} (attempt {}/{MAX_DRAIN_ATTEMPTS}), re-queueing: {e}",
                         key.project_id, key.table_name, group.attempts
                     );
                     self.requeue(key, group);
+                } else if !quarantine_group(
+                    &self.quarantine_dir,
+                    &key,
+                    &group,
+                    std::slice::from_ref(&merged),
+                    &format!("{} failed drains: {e}", group.attempts),
+                ) {
+                    crate::observability::record_dml_coalesce_dropped();
+                    error!(
+                        "dml coalesce: LOST {}/{} group after {} failed drains ({statements} stmts, {} rows) — quarantine write failed: {e}",
+                        key.project_id,
+                        key.table_name,
+                        group.attempts,
+                        merged.num_rows()
+                    );
                 }
             }
         }

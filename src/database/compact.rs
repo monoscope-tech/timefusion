@@ -574,6 +574,24 @@ impl Database {
         Ok(Self::hot_project_ids(&uris, date))
     }
 
+    /// Read one object's parquet footer and extract from it, relativizing the absolute `uri`
+    /// against the store's root `table_prefix`. `Ok(None)` if unreadable; `Err` is a log-ready reason.
+    async fn probe_footer<T>(
+        object_store: &Arc<dyn object_store::ObjectStore>, table_prefix: &str, uri: &str,
+        extract: impl FnOnce(&deltalake::datafusion::parquet::file::metadata::ParquetMetaData) -> Option<T>,
+    ) -> Result<Option<T>, String> {
+        use deltalake::datafusion::parquet::arrow::async_reader::{AsyncFileReader, ParquetObjectReader};
+        use object_store::{ObjectStoreExt, path::Path as OsPath};
+        let Some(rel) = uri.strip_prefix(table_prefix).map(|s| s.strip_prefix('/').unwrap_or(s)) else {
+            return Err(format!("could not relativize {uri} against {table_prefix}"));
+        };
+        let path = OsPath::from(rel);
+        // Pass our own `path`, not `meta.location`: the latter is bucket-relative and would double-prefix.
+        let meta = object_store.head(&path).await.map_err(|e| format!("head failed for {uri}: {e}"))?;
+        let mut reader = ParquetObjectReader::new(object_store.clone(), path).with_file_size(meta.size);
+        Ok(reader.get_metadata(None).await.ok().and_then(|pq| extract(&pq)))
+    }
+
     /// Rewrite a date partition at a higher ZSTD level using Z-order (or Compact if no
     /// z-order columns).
     ///
@@ -582,9 +600,6 @@ impl Database {
     pub async fn recompress_partition(
         &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, date: chrono::NaiveDate, target_level: i32, project: Option<&str>,
     ) -> Result<RecompressOutcome> {
-        use deltalake::datafusion::parquet::arrow::async_reader::{AsyncFileReader, ParquetObjectReader};
-        use object_store::{ObjectStoreExt, path::Path as OsPath};
-
         let date_str = date.to_string();
         if project.is_some() {
             // Scoped `replace_where` can deadlock; reject it before reading the table.
@@ -611,55 +626,37 @@ impl Database {
         // `?endpoint=...` query string `table_url()` may carry but URIs do not.
         let probe_uri = &uris[0];
         let table_prefix = table_uri.split('?').next().unwrap_or(&table_uri).trim_end_matches('/');
-        let probe_tier = match probe_uri.strip_prefix(table_prefix).map(|s| s.strip_prefix('/').unwrap_or(s)) {
-            Some(rel) => {
-                let object_store = log_store.object_store(None);
-                let path = OsPath::from(rel);
-                // Pass our own `path`, not `meta.location`: the latter is
-                // bucket-relative and `ParquetObjectReader` would double-prefix it.
-                match object_store.head(&path).await {
-                    Ok(meta) => {
-                        let mut reader = ParquetObjectReader::new(object_store.clone(), path.clone()).with_file_size(meta.size);
-                        reader.get_metadata(None).await.ok().and_then(|pq| {
-                            pq.file_metadata().key_value_metadata().and_then(|kvs| {
-                                kvs.iter().find(|kv| kv.key == COMPRESSION_TIER_KEY).and_then(|kv| kv.value.as_ref()).and_then(|v| v.parse::<i32>().ok())
-                            })
-                        })
-                    }
-                    Err(e) => {
-                        warn!("recompress probe: head failed for {}: {}; rewriting anyway", probe_uri, e);
-                        None
-                    }
-                }
-            }
-            None => {
-                warn!("recompress probe: could not relativize {} against {}; rewriting anyway", probe_uri, table_prefix);
-                None
-            }
-        };
+        let object_store = log_store.object_store(None);
+        let probe_tier = Self::probe_footer(&object_store, table_prefix, probe_uri, |pq| {
+            pq.file_metadata()
+                .key_value_metadata()
+                .and_then(|kvs| kvs.iter().find(|kv| kv.key == COMPRESSION_TIER_KEY).and_then(|kv| kv.value.as_ref()).and_then(|v| v.parse::<i32>().ok()))
+        })
+        .await
+        .unwrap_or_else(|reason| {
+            warn!("recompress probe: {}; rewriting anyway", reason);
+            None
+        });
 
         // A partition holding an UNSORTED file is never "done", whatever its
         // compression tier — a tier-qualified file with an unsorted footer voids the
         // declared ordering for every scan. Sortedness vetoes the tier-probe skip.
         let declares_order = get_schema(table_name).is_some_and(|s| !s.sorting_columns.is_empty());
         let any_unsorted = declares_order
-            && {
-                let object_store = log_store.object_store(None);
-                futures::stream::iter(&uris)
+            && futures::stream::iter(&uris)
                 .any(|uri| {
                     let object_store = object_store.clone();
+                    // An unreadable footer is not evidence of sortedness; say
+                    // no for this file and let the tier probe decide.
                     async move {
-                        let Some(rel) = uri.strip_prefix(table_prefix).map(|s| s.trim_start_matches('/')) else { return false };
-                        let path = OsPath::from(rel);
-                        let Ok(meta) = object_store.head(&path).await else { return false };
-                        let mut reader = ParquetObjectReader::new(object_store, path).with_file_size(meta.size);
-                        // An unreadable footer is not evidence of sortedness; say
-                        // no for this file and let the tier probe decide.
-                        matches!(reader.get_metadata(None).await, Ok(pq) if pq.row_groups().iter().any(|rg| rg.sorting_columns().is_none_or(|sc| sc.is_empty())))
+                        Self::probe_footer(&object_store, table_prefix, uri, |pq| {
+                            Some(pq.row_groups().iter().any(|rg| rg.sorting_columns().is_none_or(|sc| sc.is_empty())))
+                        })
+                        .await
+                        .is_ok_and(|unsorted| unsorted == Some(true))
                     }
                 })
-                .await
-            };
+                .await;
 
         // If probe failed or tier is unknown, fall through to rewrite — safer
         // than skipping a partition that may still be at hot tier.
@@ -1007,6 +1004,22 @@ impl Database {
             .map(|a| a.value(0)))
     }
 
+    /// The configured decode ceiling, tightened by the coordinator's execution limit when it supplied one.
+    fn dedup_decoded_budget(&self, limits: Option<DedupExecutionLimits>) -> u64 {
+        limits.map_or(u64::MAX, |limits| limits.max_decoded_bytes).min(self.config.maintenance.timefusion_dedup_max_decoded_bytes)
+    }
+
+    /// The largest dedup-key group under `rows_filter`, but only when that group alone would blow
+    /// `decoded_budget`. Sharding can never split a key group (every copy of a key hashes to one
+    /// bucket), so once one does, no shard count helps.
+    async fn unshardable_group(
+        ctx: &datafusion::prelude::SessionContext, rows_filter: &str, group_by: &str, bytes_per_row: u64, decoded_budget: u64,
+    ) -> Result<Option<i64>> {
+        let sql = format!("SELECT coalesce(max(c), 0) FROM (SELECT count(*) AS c FROM {DEDUP_SCAN_NAME} WHERE {rows_filter} GROUP BY {group_by})");
+        let max_group = Self::scalar_i64(ctx, &sql).await?.unwrap_or(0);
+        Ok(((max_group.max(0) as u64).saturating_mul(bytes_per_row).saturating_mul(2) > decoded_budget).then_some(max_group))
+    }
+
     /// Write one already-cast batch through a staging writer, flushing the
     /// completed files into `adds` once the writer's buffer reaches
     /// `max_file_bytes`. Single definition of the dedup staging file-size policy.
@@ -1029,8 +1042,7 @@ impl Database {
     pub(crate) async fn probe_dup_bins(&self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, project_id: &str, date_str: &str) -> Result<HashSet<i64>> {
         let schema = schema_or_default(table_name);
         let ctx = self.dedup_probe_ctx(table_ref, project_id, date_str, None).await?;
-        let safe_pid = project_id.replace('\'', "''");
-        let filter = format!("project_id = '{safe_pid}' AND date = DATE '{date_str}'");
+        let filter = format!("project_id = '{}' AND date = DATE '{date_str}'", project_id.replace('\'', "''"));
         let keys_csv = quoted_csv(&schema.dedup_keys);
         Ok(Self::dup_bin_starts(&ctx, &filter, &keys_csv).await?.into_iter().map(|s| s.and_utc().timestamp_micros() / bin_micros()).collect())
     }
@@ -1130,16 +1142,16 @@ impl Database {
         // `buffer_unordered` bounds tasks in flight; the rewrite semaphore bounds
         // concurrent Arrow materialization.
         let permits = self.config.derived.rewrite_permits().max(1);
-        let staged: Vec<Result<BinOutcome<StagedBin>>> = futures::stream::iter(chunks.into_iter().map(|(chunk_filter, label)| {
-            let (partition_filter, key, date_str) = (&partition_filter, key.clone(), date_str.as_str());
-            async move {
-                self.stage_dedup_chunk(table_ref, table_name, project_id, schema, scan_name, partition_filter, &chunk_filter, &label, date_str, key, limits)
-                    .await
-            }
-        }))
-        .buffer_unordered(permits)
-        .collect()
-        .await;
+        let staged: Vec<Result<BinOutcome<StagedBin>>> =
+            futures::stream::iter(chunks.into_iter().map(|(chunk_filter, label)| {
+                let (partition_filter, key, date_str) = (&partition_filter, key.clone(), date_str.as_str());
+                async move {
+                    self.stage_dedup_chunk(table_ref, table_name, project_id, schema, partition_filter, &chunk_filter, &label, date_str, key, limits).await
+                }
+            }))
+            .buffer_unordered(permits)
+            .collect()
+            .await;
         let mut units = Vec::new();
         let mut all_complete = !skipped_any;
         let mut first_err = None;
@@ -1174,19 +1186,18 @@ impl Database {
     /// literals for a commit predicate.
     #[allow(clippy::too_many_arguments)]
     async fn stage_dedup_chunk(
-        &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, project_id: &str, schema: &crate::schema::TableSchema, scan_name: &str,
-        partition_filter: &str, chunk_filter: &str, label: &str, date_str: &str, key: Option<DirtyBinKey>, limits: Option<DedupExecutionLimits>,
+        &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, project_id: &str, schema: &crate::schema::TableSchema, partition_filter: &str,
+        chunk_filter: &str, label: &str, date_str: &str, key: Option<DirtyBinKey>, limits: Option<DedupExecutionLimits>,
     ) -> Result<BinOutcome<StagedBin>> {
         // Writing a DV to a table without `enableDeletionVectors` is a protocol
         // violation, so fall back to copy-on-write unless the table declares it.
-        if self.config.maintenance.timefusion_use_deletion_vectors {
-            let dv_enabled =
-                table_ref.read().await.snapshot().ok().map(|s| s.snapshot().table_properties().enable_deletion_vectors == Some(true)).unwrap_or(false);
-            if dv_enabled {
-                return self.stage_dedup_chunk_dv(table_ref, table_name, project_id, schema, chunk_filter, label, date_str, key, limits).await;
-            }
+        if self.config.maintenance.timefusion_use_deletion_vectors
+            && table_ref.read().await.snapshot().is_ok_and(|s| s.snapshot().table_properties().enable_deletion_vectors == Some(true))
+        {
+            return self.stage_dedup_chunk_dv(table_ref, table_name, project_id, schema, chunk_filter, label, date_str, key, limits).await;
         }
         use deltalake::{kernel::Action, writer::DeltaWriter};
+        let scan_name = DEDUP_SCAN_NAME;
         // Re-plan against a fresh snapshot when concurrent rewrites invalidate
         // file mappings; `commit_wave` guards the remaining commit window.
         const MAX_REPLANS: usize = 3;
@@ -1253,9 +1264,7 @@ impl Database {
             })?;
             let compressed_budget = self.config.maintenance.timefusion_dedup_max_rewrite_bytes;
             let inflation = self.config.maintenance.timefusion_dedup_decode_inflation.max(1);
-            let decoded_budget = limits.map_or(self.config.maintenance.timefusion_dedup_max_decoded_bytes, |limits| {
-                self.config.maintenance.timefusion_dedup_max_decoded_bytes.min(limits.max_decoded_bytes)
-            });
+            let decoded_budget = self.dedup_decoded_budget(limits);
             let bytes_per_row = self.config.maintenance.timefusion_dedup_bytes_per_row;
             let est_decoded_bytes: u64 = targets
                 .iter()
@@ -1282,6 +1291,9 @@ impl Database {
                 );
             }
             let in_list = file_ids.iter().map(|v| format!("'{}'", v.replace('\'', "''"))).join(", ");
+            // THE row scope of the rewrite — full row sets of every file the chunk touches. Shared
+            // by both oracles and by each shard, which only appends its bucket range.
+            let chunk_rows_filter = format!("{partition_filter} AND \"{DEDUP_FILE_COL}\" IN ({in_list})");
             // ONE binding, read both by the writer properties below and by the
             // StagedBin this function returns — `mark_written_sorted` must be
             // told the same fact that decided the footer, not a re-derivation.
@@ -1292,32 +1304,26 @@ impl Database {
             // Independent narrow oracle for the staged output count: exactly one
             // row per distinct key. A disagreement rejects the unit before Remove
             // actions can reach `commit_wave`.
-            let logical_rows_sql = format!(
-                "SELECT count(*) FROM (SELECT 1 FROM {scan_name} WHERE {partition_filter} AND \"{DEDUP_FILE_COL}\" IN ({in_list}) GROUP BY {keys_varchar})"
-            );
+            let logical_rows_sql = format!("SELECT count(*) FROM (SELECT 1 FROM {scan_name} WHERE {chunk_rows_filter} GROUP BY {keys_varchar})");
             let expected_logical_rows = u64::try_from(
                 Self::scalar_i64(&ctx, &logical_rows_sql).await?.ok_or_else(|| anyhow::anyhow!("dedup rewrite distinct-key validation returned no scalar"))?,
             )
             .map_err(|_| anyhow::anyhow!("dedup rewrite distinct-key validation returned a negative count"))?;
 
-            // Sharding can't split a single key group — all copies share one bucket.
-            // If the largest group alone would blow the budget, no shard count helps.
-            if limits.is_none() && shards > 1 && decoded_budget > 0 {
-                let max_group_sql = format!(
-                    "SELECT coalesce(max(c), 0) FROM (SELECT count(*) AS c FROM {scan_name} WHERE {partition_filter} AND \"{DEDUP_FILE_COL}\" IN ({in_list}) GROUP BY {keys_varchar})"
+            if limits.is_none()
+                && shards > 1
+                && decoded_budget > 0
+                && let Some(max_group) = Self::unshardable_group(&ctx, &chunk_rows_filter, &keys_varchar, bytes_per_row, decoded_budget).await?
+            {
+                crate::observability::record_dedup_chunk_skipped();
+                error!(
+                    "dedup rewrite SKIPPED (single key group of {} rows over decoded budget — unshardable): table={} chunk=[{}] files={} — duplicates persist until compaction shrinks the file set",
+                    max_group,
+                    table_name,
+                    label,
+                    targets.len()
                 );
-                let max_group = Self::scalar_i64(&ctx, &max_group_sql).await?.unwrap_or(0);
-                if (max_group.max(0) as u64).saturating_mul(bytes_per_row).saturating_mul(2) > decoded_budget {
-                    crate::observability::record_dedup_chunk_skipped();
-                    error!(
-                        "dedup rewrite SKIPPED (single key group of {} rows over decoded budget — unshardable): table={} chunk=[{}] files={} — duplicates persist until compaction shrinks the file set",
-                        max_group,
-                        table_name,
-                        label,
-                        targets.len()
-                    );
-                    return Ok(BinOutcome::Retry);
-                }
+                return Ok(BinOutcome::Retry);
             }
 
             // 4. Rewrite each shard independently: collect, dedup, stage its own
@@ -1334,12 +1340,12 @@ impl Database {
             let staged_shards: Vec<StagedShard> = futures::stream::iter(0..shards)
                 .map(|shard| {
                     let (ctx, staging_table, scan_name) = (&ctx, &staging_table, &scan_name);
-                    let (partition_filter, in_list, bucket_expr) = (&partition_filter, &in_list, &bucket_expr);
+                    let (chunk_rows_filter, bucket_expr) = (&chunk_rows_filter, &bucket_expr);
                     async move {
                         let mut adds: Vec<Action> = Vec::new();
                         let staged: anyhow::Result<(usize, usize)> = async {
                             let shard_pred = shard_bucket_pred(bucket_expr, shard, shards);
-                            let rows_filter = format!("{partition_filter} AND \"{DEDUP_FILE_COL}\" IN ({in_list}){shard_pred}");
+                            let rows_filter = format!("{chunk_rows_filter}{shard_pred}");
                             let rows_sql = format!("SELECT * FROM {scan_name} WHERE {rows_filter}");
                             // Version collapse: greatest `dedup_tiebreak` per key wins.
                             // Tombstones are RETAINED — an older version of a key can always
@@ -1669,28 +1675,20 @@ impl Database {
             let bucket_expr = dedup_bucket_expr(schema);
             let bytes_per_row = self.config.maintenance.timefusion_dedup_bytes_per_row;
             let est_decoded = oracle.saturating_mul(bytes_per_row).saturating_mul(2);
-            let decoded_budget = limits.map_or(self.config.maintenance.timefusion_dedup_max_decoded_bytes, |l| {
-                self.config.maintenance.timefusion_dedup_max_decoded_bytes.min(l.max_decoded_bytes)
-            });
+            let decoded_budget = self.dedup_decoded_budget(limits);
             let shards = dedup_shard_count(limits.is_some(), est_decoded, 0, decoded_budget, u64::MAX).max(1);
 
-            // A single dedup-key group cannot be split (all copies share one hash
-            // bucket), so if the largest group alone blows the decode budget no
-            // shard count helps — skip and let compaction shrink the file set.
-            if limits.is_none() && shards > 1 && decoded_budget > 0 {
-                let max_group_sql = format!(
-                    "SELECT coalesce(max(c), 0) FROM (SELECT count(*) AS c FROM {DEDUP_SCAN_NAME} WHERE {chunk_filter} GROUP BY {})",
-                    quoted_csv(&schema.dedup_keys)
+            if limits.is_none()
+                && shards > 1
+                && decoded_budget > 0
+                && let Some(max_group) = Self::unshardable_group(&ctx, chunk_filter, &quoted_csv(&schema.dedup_keys), bytes_per_row, decoded_budget).await?
+            {
+                crate::observability::record_dedup_chunk_skipped();
+                error!(
+                    "dv-dedup SKIPPED (single key group of {} rows over decoded budget — unshardable): table={} chunk=[{}] — duplicates persist until compaction shrinks the file set",
+                    max_group, table_name, label
                 );
-                let max_group = Self::scalar_i64(&ctx, &max_group_sql).await?.unwrap_or(0);
-                if (max_group.max(0) as u64).saturating_mul(bytes_per_row).saturating_mul(2) > decoded_budget {
-                    crate::observability::record_dedup_chunk_skipped();
-                    error!(
-                        "dv-dedup SKIPPED (single key group of {} rows over decoded budget — unshardable): table={} chunk=[{}] — duplicates persist until compaction shrinks the file set",
-                        max_group, table_name, label
-                    );
-                    return Ok(BinOutcome::Retry);
-                }
+                return Ok(BinOutcome::Retry);
             }
 
             let mut losers_by_file: HashMap<String, Vec<u64>> = HashMap::new();
@@ -2008,11 +2006,7 @@ impl RunCollapse {
     /// two differing non-null values, and a field absent then later filled.
     pub(crate) fn with_immutable_audit(mut self, schema: &arrow_schema::Schema, columns: &[String]) -> Result<Self> {
         let idxs = columns.iter().filter_map(|name| schema.index_of(name).ok()).collect::<Vec<_>>();
-        if idxs.is_empty() {
-            return Ok(self);
-        }
-        let converter = row_converter(schema, &idxs)?;
-        self.audit = Some((idxs, converter));
+        self.audit = (!idxs.is_empty()).then(|| row_converter(schema, &idxs).map(|converter| (idxs, converter))).transpose()?;
         Ok(self)
     }
 

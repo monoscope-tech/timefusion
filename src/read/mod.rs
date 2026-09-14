@@ -773,20 +773,18 @@ impl Greatest {
         let mut kept_bytes = 0usize;
         for (batch, mask) in old.into_iter().zip(&keep) {
             let mut rows = vec![(u32::MAX, u32::MAX); mask.len()];
-            if !mask.iter().any(|k| *k) {
-                moved.push(rows);
-                continue;
+            if mask.iter().any(|k| *k) {
+                let bi = self.batches.len() as u32;
+                for (next, (row, _)) in mask.iter().enumerate().filter(|(_, k)| **k).enumerate() {
+                    rows[row] = (bi, next as u32);
+                }
+                // `compact_batch` after the filter: Arrow's filter over a view array
+                // produces new views over the ORIGINAL buffers, so without it the
+                // parquet column-chunk blocks stay alive and this frees nothing.
+                let compacted = crate::write::mem_buffer::compact_batch(filter_record_batch(&batch, &BooleanArray::from(mask.clone())).map_err(arrow_err)?);
+                kept_bytes += compacted.get_array_memory_size();
+                self.batches.push(compacted);
             }
-            let bi = self.batches.len() as u32;
-            for (next, (row, _)) in mask.iter().enumerate().filter(|(_, k)| **k).enumerate() {
-                rows[row] = (bi, next as u32);
-            }
-            // `compact_batch` after the filter: Arrow's filter over a view array
-            // produces new views over the ORIGINAL buffers, so without it the
-            // parquet column-chunk blocks stay alive and this frees nothing.
-            let compacted = crate::write::mem_buffer::compact_batch(filter_record_batch(&batch, &BooleanArray::from(mask.clone())).map_err(arrow_err)?);
-            kept_bytes += compacted.get_array_memory_size();
-            self.batches.push(compacted);
             moved.push(rows);
         }
         self.best.cands_mut(|cand| {
@@ -2351,28 +2349,27 @@ impl LogicalCountCache {
         self.insert_memory(key.clone(), fingerprint, files, Arc::new(index)).then_some(added)
     }
 
+    /// Resident entry accepted by `accept`, touched only when it is accepted.
+    /// Never performs filesystem IO.
+    fn touch_resident<R>(&self, key: &CountPartition, accept: impl FnOnce(&CachedPartition) -> Option<R>) -> Option<R> {
+        let entry = self.entries.get(key)?;
+        accept(&entry).inspect(|_| entry.last_access.store(self.next_access(), Ordering::Relaxed))
+    }
+
     /// Query-path lookup that must never perform filesystem IO: a cold request
     /// falls back to the authoritative scan rather than blocking on disk.
     pub fn get_memory(&self, key: &CountPartition, fingerprint: u64) -> Option<Arc<LogicalCountIndex>> {
-        let entry = self.entries.get(key)?;
-        if entry.fingerprint != fingerprint {
-            return None;
-        }
-        entry.last_access.store(self.next_access(), Ordering::Relaxed);
-        Some(Arc::clone(&entry.index))
+        self.touch_resident(key, |entry| (entry.fingerprint == fingerprint).then(|| Arc::clone(&entry.index)))
     }
 
     /// Snapshot whose indexed file set is a subset of `current_files`, plus the
     /// added paths to scan as an append overlay. Any removal/rewrite declines,
     /// since the base could then count rows no longer present.
     pub fn get_memory_appendable(&self, key: &CountPartition, current_files: &CountFiles) -> Option<(Arc<LogicalCountIndex>, Vec<String>)> {
-        let entry = self.entries.get(key)?;
-        if !contains_count_files(current_files, &entry.files) {
-            return None;
-        }
-        entry.last_access.store(self.next_access(), Ordering::Relaxed);
-        let added = current_files.keys().filter(|path| !entry.files.contains_key(*path)).cloned().collect();
-        Some((Arc::clone(&entry.index), added))
+        self.touch_resident(key, |entry| {
+            contains_count_files(current_files, &entry.files)
+                .then(|| (Arc::clone(&entry.index), current_files.keys().filter(|path| !entry.files.contains_key(*path)).cloned().collect()))
+        })
     }
 
     /// Remove only the memory front; the stale Arrow file stays harmless because
@@ -2536,7 +2533,6 @@ impl LogicalCountIndex {
         let ids = &packed.ids;
         packed.winners.sort_unstable_by(|left, right| left.timestamp.cmp(&right.timestamp).then_with(|| packed_id(ids, left).cmp(packed_id(ids, right))));
         packed.live_timestamps.sort_unstable();
-        self.key_bytes = packed.ids.len();
         self.packed = Some(packed);
         Ok(())
     }
@@ -2611,18 +2607,12 @@ impl LogicalCountIndex {
 
         let mut count = i128::from(self.count(lo, hi));
         if !covered_ranges.is_empty() {
-            count -= i128::from(self.count_covered_live(lo, hi, covered_ranges));
+            count -= i128::from(self.count_where(|timestamp, winner| !winner.deleted && (lo..hi).contains(&timestamp) && !base_visible(timestamp)));
         }
         for state in overlay.values().filter(|state| (lo..hi).contains(&state.timestamp)) {
             count += i128::from(!state.current.deleted) - i128::from(state.base.is_some_and(|winner| !winner.deleted));
         }
         u64::try_from(count).context("logical-count overlay produced an invalid negative/overflow count")
-    }
-
-    fn count_covered_live(&self, lo: i64, hi: i64, covered_ranges: &[(i64, i64)]) -> u64 {
-        self.count_where(|timestamp, winner| {
-            !winner.deleted && (lo..hi).contains(&timestamp) && covered_ranges.iter().any(|&(start, end)| (start..end).contains(&timestamp))
-        })
     }
 
     /// Exact live row count in the half-open interval `[lo, hi)`.

@@ -334,33 +334,30 @@ impl TableSchema {
     }
 
     fn validate(&self) -> anyhow::Result<()> {
+        let table = &self.table_name;
         for (field, config) in self.fields.iter().filter_map(|f| Some((f, f.tantivy.as_ref()?))).filter(|(_, c)| c.list_mode == TantivyListMode::Elements) {
             anyhow::ensure!(
                 config.indexed
                     && config.tokenizer.as_deref() == Some("raw")
                     && config.flatten.is_none()
                     && matches!(parse_arrow_data_type(&field.data_type)?, ArrowDataType::List(inner) if matches!(inner.data_type(), ArrowDataType::Utf8 | ArrowDataType::Utf8View)),
-                "schema `{}`: element index `{}` requires an indexed string list, raw tokenizer and no flattening",
-                self.table_name,
+                "schema `{table}`: element index `{}` requires an indexed string list, raw tokenizer and no flattening",
                 field.name
             );
         }
-        let field = |role: &str, name: &str| {
-            self.field(name).ok_or_else(|| anyhow::anyhow!("schema `{}`: {role} references unknown field `{}`", self.table_name, name))
-        };
+        let field = |role: &str, name: &str| self.field(name).ok_or_else(|| anyhow::anyhow!("schema `{table}`: {role} references unknown field `{name}`"));
         for (role, name) in self.dedup_keys.iter().map(|k| ("dedup_keys", k)).chain(self.dedup_tiebreak.iter().map(|tb| ("dedup_tiebreak", tb))) {
-            anyhow::ensure!(field(role, name)?.data_type != "Variant", "schema `{}`: {role} cannot be a Variant column `{}`", self.table_name, name);
+            anyhow::ensure!(field(role, name)?.data_type != "Variant", "schema `{table}`: {role} cannot be a Variant column `{name}`");
         }
         if let Some(tc) = &self.tombstone_column {
             let f = field("tombstone_column", tc)?;
             // Nullable Boolean is load-bearing: NULL must be a legal "live"
             // encoding so existing rows need no backfill.
-            anyhow::ensure!(f.data_type == "Boolean" && f.nullable, "schema `{}`: tombstone_column `{}` must be a nullable Boolean field", self.table_name, tc);
+            anyhow::ensure!(f.data_type == "Boolean" && f.nullable, "schema `{table}`: tombstone_column `{tc}` must be a nullable Boolean field");
         }
         anyhow::ensure!(
             !self.version_append || (!self.dedup_keys.is_empty() && self.dedup_tiebreak.is_some() && self.tombstone_column.is_some()),
-            "schema `{}`: version_append requires dedup_keys, dedup_tiebreak and tombstone_column",
-            self.table_name
+            "schema `{table}`: version_append requires dedup_keys, dedup_tiebreak and tombstone_column"
         );
         Ok(())
     }

@@ -132,7 +132,6 @@ const MAX_BATCH_SIZE: usize = 1024 * 1024 * 1024;
 /// whole during recovery and a corrupted entry quarantines whole, so the unit
 /// is kept small even though acceptance goes up to `MAX_BATCH_SIZE`.
 const WAL_SPLIT_TARGET: usize = 100 * 1024 * 1024;
-const FSYNC_SCHEDULE_MS: u64 = 200;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode, strum::FromRepr)]
 #[repr(u8)]
@@ -199,13 +198,6 @@ pub struct UpdateWithSourcePayload {
     pub source: SerializedSource,
 }
 
-/// Number of walrus shards per logical (project_id, table_name) topic. Walrus
-/// serializes appends within a single collection, so routing writes across N
-/// shards lifts the single-project ceiling, at the cost of merging N streams in
-/// timestamp order during recovery. Override via
-/// `BufferConfig::timefusion_wal_shards_per_topic`.
-const WAL_SHARDS_PER_TOPIC_DEFAULT: usize = 4;
-
 /// Stripe count for the per-collection append locks; far exceeds the realistic
 /// distinct-collection count (topics × shards).
 const WAL_APPEND_LOCK_STRIPES: usize = 256;
@@ -218,6 +210,9 @@ pub struct WalManager {
     known_topics: DashSet<String>,
     /// Per-topic round-robin counter choosing the shard for the next batch.
     shard_counter: dashmap::DashMap<String, std::sync::atomic::AtomicU64>,
+    /// Walrus serializes appends within one collection, so N shards lift the
+    /// single-project ceiling, at the cost of merging N streams in timestamp
+    /// order during recovery.
     shards_per_topic: usize,
     /// Per-collection append serialization, striped by `walrus_key` hash.
     /// Walrus rejects *concurrent* appends to one collection; without these
@@ -229,10 +224,6 @@ pub struct WalManager {
 }
 
 impl WalManager {
-    pub fn new(data_dir: PathBuf) -> Result<Self, WalError> {
-        Self::with_fsync_mode_and_shards(data_dir, crate::config::WalFsyncMode::Milliseconds(FSYNC_SCHEDULE_MS), WAL_SHARDS_PER_TOPIC_DEFAULT)
-    }
-
     pub fn with_fsync_mode_and_shards(data_dir: PathBuf, mode: crate::config::WalFsyncMode, shards_per_topic: usize) -> Result<Self, WalError> {
         std::fs::create_dir_all(&data_dir)?;
         Self::check_wal_version_stamp(&data_dir)?;
@@ -1148,7 +1139,7 @@ impl WalReplayIter<'_> {
     }
 }
 
-pub(crate) fn cursor_snapshot_path_in(data_dir: &std::path::Path) -> PathBuf {
+fn cursor_snapshot_path_in(data_dir: &std::path::Path) -> PathBuf {
     meta_path(data_dir, "cursor_snapshot.json")
 }
 

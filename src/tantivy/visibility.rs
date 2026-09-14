@@ -155,8 +155,7 @@ impl SourceRows {
             let timestamps = crate::read::bound_slice(column).context("invalid visibility timestamp representation")?;
             ensure!(column.null_count() == 0, "visibility timestamp contains nulls");
             for &value in timestamps {
-                let next = ranges.partition_point(|&(lo, _)| lo <= value);
-                let covered = next > 0 && value < ranges[next - 1].1;
+                let covered = ranges[..ranges.partition_point(|&(lo, _)| lo <= value)].last().is_some_and(|&(_, hi)| value < hi);
                 live.append(self.live.value(live.len()) && !covered);
             }
         }
@@ -193,7 +192,9 @@ pub async fn read_file_rows(
 ) -> Result<SourceRows> {
     use futures::TryStreamExt;
 
-    let (mut stream, live) = stream_file_rows(log_store, add, schema).await?;
+    let prepared = PreparedFileRows::open(log_store, add).await?;
+    let mut stream = prepared.stream(schema)?;
+    let live = prepared.live;
     let mut batches = Vec::new();
     let mut decoded_bytes = 0_usize;
     while let Some(batch) = stream.try_next().await? {
@@ -202,15 +203,6 @@ pub async fn read_file_rows(
         batches.push(batch);
     }
     Ok(SourceRows { batches, live })
-}
-
-/// Streams logical columns in physical order without collecting output batches.
-/// The returned DV mask never filters the stream or changes physical ordinals.
-pub async fn stream_file_rows(
-    log_store: deltalake::logstore::LogStoreRef, add: &SnapshotFile, schema: arrow::datatypes::SchemaRef,
-) -> Result<(futures::stream::BoxStream<'static, Result<RecordBatch>>, BooleanBuffer)> {
-    let prepared = PreparedFileRows::open(log_store, add).await?;
-    Ok((prepared.stream(schema)?, prepared.live))
 }
 
 /// Immutable Parquet metadata and DV visibility shared by repeatable source scans;
@@ -255,6 +247,7 @@ impl PreparedFileRows {
             .context("prepared source size overflow")
     }
 
+    /// The DV mask in `live` never filters this stream or changes physical ordinals.
     pub fn stream(&self, schema: arrow::datatypes::SchemaRef) -> Result<futures::stream::BoxStream<'static, Result<RecordBatch>>> {
         use deltalake::datafusion::parquet::arrow::{
             ProjectionMask,

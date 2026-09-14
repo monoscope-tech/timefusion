@@ -449,7 +449,7 @@ impl Database {
         // non-materialized snapshot enumerates an EMPTY file set that the
         // fast-advance post-commit hook would then build on. Fail loud rather
         // than cache a handle serving empty results.
-        if self.config.maintenance.timefusion_incremental_snapshot {
+        if self.incremental_snapshot() {
             Self::materialize_snapshot_files(&mut table, false)
                 .await
                 .map_err(|e| anyhow::anyhow!("Materializing file list for '{storage_uri}' failed: {e}"))?;
@@ -679,17 +679,16 @@ impl Database {
         // so the lazy sort-merge must be materialized once here.
         let batches: Vec<RecordBatch> = batches.collect::<Result<_, _>>()?;
         let (commit_lock, flush_waiters) = self.commit_lock_and_waiters(&project_id, &table_name).await;
-        let mut retry_count = 0;
         let mut last_error = None;
-        while retry_count < MAX_COMMIT_RETRIES {
-            if let Err(e) = refresh_table_snapshot(&table_ref, self.config.maintenance.timefusion_incremental_snapshot).await {
-                debug!("Failed to update table state before write (attempt {}): {}", retry_count + 1, e);
+        for attempt in 1..=MAX_COMMIT_RETRIES {
+            if let Err(e) = refresh_table_snapshot(&table_ref, self.incremental_snapshot()).await {
+                debug!("Failed to update table state before write (attempt {}): {}", attempt, e);
             }
             let commit_guard = lock_with_flush_priority(&commit_lock, &flush_waiters).await;
             let table = { table_ref.read().await.clone() };
             let pre_uris: HashSet<String> = file_uris(&table);
 
-            let write_span = tracing::trace_span!(parent: &span, "delta.write_operation", retry_attempt = retry_count + 1);
+            let write_span = tracing::trace_span!(parent: &span, "delta.write_operation", retry_attempt = attempt);
             let write_result = async {
                 table
                     .clone()
@@ -720,15 +719,14 @@ impl Database {
                 }
                 Err(e) => {
                     if is_occ_conflict_err(&e.to_string()) {
-                        retry_count += 1;
                         last_error = Some(e);
-                        debug!("Delta write conflict detected, retrying... (attempt {}/{})", retry_count, MAX_COMMIT_RETRIES);
+                        debug!("Delta write conflict detected, retrying... (attempt {}/{})", attempt, MAX_COMMIT_RETRIES);
                         // Release the commit lock BEFORE the backoff sleep: holding it
                         // across the sleep serializes every other writer behind us.
                         drop(commit_guard);
-                        tokio::time::sleep(occ_backoff(retry_count as usize)).await;
+                        tokio::time::sleep(occ_backoff(attempt as usize)).await;
                         drop(table); // stale clone — the retry re-clones after the reload
-                        if let Err(reload_err) = refresh_table_snapshot(&table_ref, self.config.maintenance.timefusion_incremental_snapshot).await {
+                        if let Err(reload_err) = refresh_table_snapshot(&table_ref, self.incremental_snapshot()).await {
                             debug!("Failed to reload table state after conflict: {}", reload_err);
                         }
                     } else {
@@ -752,18 +750,17 @@ impl Database {
         use futures::stream::{self, StreamExt};
         let parallelism = self.config.buffer.flush_parallelism();
         let mut results: Vec<Result<Vec<String>>> = units.iter().map(|_| Ok(Vec::new())).collect();
-        let units = Arc::new(units);
+        // Shared by every phase's futures; all three streams are collected in this
+        // scope, so a borrow suffices — nothing here is spawned.
+        let units = &units;
 
         // ---- Phase 1: prepare (bounded-concurrent; table resolution + casts).
         let prepared: Vec<(usize, Result<PreparedForPhysicalTable>)> = stream::iter(0..units.len())
-            .map(|i| {
-                let units = units.clone();
-                async move {
-                    let u = &units[i];
-                    let prep = self.prepare_staged_write(&u.project_id, &u.table_name, u.batches.clone()).await;
-                    let key = self.table_lock_key(&u.project_id, &u.table_name).await;
-                    (i, prep.map(|p| (p, key)))
-                }
+            .map(move |i| async move {
+                let u = &units[i];
+                let prep = self.prepare_staged_write(&u.project_id, &u.table_name, u.batches.clone()).await;
+                let key = self.table_lock_key(&u.project_id, &u.table_name).await;
+                (i, prep.map(|p| (p, key)))
             })
             .buffer_unordered(parallelism)
             .collect()
@@ -811,49 +808,45 @@ impl Database {
         }
 
         let committed: Vec<Vec<(usize, Result<Vec<String>>)>> = stream::iter(by_physical.into_values())
-            .map(|group| {
-                let units = units.clone();
-                async move {
-                    let indices: Vec<usize> = group.iter().map(|(i, _)| *i).collect();
-                    let table_name = units[indices[0]].table_name.clone();
-                    let projects: Vec<&str> = indices.iter().map(|i| units[*i].project_id.as_str()).collect();
-                    let table_ref = group[0].1.table_ref.clone();
-                    let adds: Vec<Action> = group.iter().flat_map(|(_, u)| u.adds.iter().cloned()).collect();
-                    let watermarks = indices.iter().map(|i| (units[*i].project_id.clone(), units[*i].table_name.clone(), units[*i].watermark.clone()));
-                    // Per-unit landed identity, scoped to its own topic, so one
-                    // tenant's identity can never decline another's write.
-                    let digests: Vec<(String, String, crate::write::LandedDigest)> = indices
-                        .iter()
-                        .map(|i| &units[*i])
-                        .filter_map(|u| self.landed_digest_for(&u.table_name, &u.batches).map(|d| (u.project_id.clone(), u.table_name.clone(), d)))
-                        .collect();
-                    let commit_properties = self.with_incremental_advance(build_watermark_commit_properties(watermarks, digests));
-                    let per_project: Vec<(&str, &[(String, i64)])> =
-                        group.iter().map(|(i, u)| (units[*i].project_id.as_str(), u.dirty_bins.as_slice())).collect();
-                    let commit = StagedCommit { adds: &adds, schema: group[0].1.schema, properties: commit_properties };
-                    let outcome = self
-                        .commit_staged_group(StagedCommitKind::Coalesced, &table_ref, &per_project, &table_name, commit)
-                        .await
-                        .map(|added| attribute_added_files(added, &projects));
-                    match outcome {
-                        Ok(per_project_added) => {
-                            // Per unit, not per group: one unit degrading to an
-                            // unsorted write must not tar or exonerate its neighbours.
-                            for (_, unit) in &group {
-                                self.mark_written_sorted(unit.schema, unit.sorted, &unit.adds);
-                            }
-                            indices.into_iter().zip(per_project_added).map(|(i, a)| (i, Ok(a))).collect::<Vec<_>>()
+            .map(move |group| async move {
+                let indices: Vec<usize> = group.iter().map(|(i, _)| *i).collect();
+                let table_name = units[indices[0]].table_name.clone();
+                let projects: Vec<&str> = indices.iter().map(|i| units[*i].project_id.as_str()).collect();
+                let table_ref = group[0].1.table_ref.clone();
+                let adds: Vec<Action> = group.iter().flat_map(|(_, u)| u.adds.iter().cloned()).collect();
+                let watermarks = indices.iter().map(|i| (units[*i].project_id.clone(), units[*i].table_name.clone(), units[*i].watermark.clone()));
+                // Per-unit landed identity, scoped to its own topic, so one
+                // tenant's identity can never decline another's write.
+                let digests: Vec<(String, String, crate::write::LandedDigest)> = indices
+                    .iter()
+                    .map(|i| &units[*i])
+                    .filter_map(|u| self.landed_digest_for(&u.table_name, &u.batches).map(|d| (u.project_id.clone(), u.table_name.clone(), d)))
+                    .collect();
+                let commit_properties = self.with_incremental_advance(build_watermark_commit_properties(watermarks, digests));
+                let per_project: Vec<(&str, &[(String, i64)])> = group.iter().map(|(i, u)| (units[*i].project_id.as_str(), u.dirty_bins.as_slice())).collect();
+                let commit = StagedCommit { adds: &adds, schema: group[0].1.schema, properties: commit_properties };
+                let outcome = self
+                    .commit_staged_group(StagedCommitKind::Coalesced, &table_ref, &per_project, &table_name, commit)
+                    .await
+                    .map(|added| attribute_added_files(added, &projects));
+                match outcome {
+                    Ok(per_project_added) => {
+                        // Per unit, not per group: one unit degrading to an
+                        // unsorted write must not tar or exonerate its neighbours.
+                        for (_, unit) in &group {
+                            self.mark_written_sorted(unit.schema, unit.sorted, &unit.adds);
                         }
-                        Err(e) => {
-                            // Fail EVERY project in the group identically — no partial
-                            // settle; the caller requeues each one's buckets.
-                            if !e.to_string().contains(INCONCLUSIVE_COMMIT_MARKER) {
-                                // Every unit in a physical group stages into the same
-                                // store, so one store deletes all.
-                                Self::cleanup_orphaned_parquet(&group[0].1.stage_store, &adds).await;
-                            }
-                            indices.into_iter().map(|i| (i, Err(anyhow::anyhow!("coalesced commit failed for {}: {}", table_name, e)))).collect()
+                        indices.into_iter().zip(per_project_added).map(|(i, a)| (i, Ok(a))).collect::<Vec<_>>()
+                    }
+                    Err(e) => {
+                        // Fail EVERY project in the group identically — no partial
+                        // settle; the caller requeues each one's buckets.
+                        if !e.to_string().contains(INCONCLUSIVE_COMMIT_MARKER) {
+                            // Every unit in a physical group stages into the same
+                            // store, so one store deletes all.
+                            Self::cleanup_orphaned_parquet(&group[0].1.stage_store, &adds).await;
                         }
+                        indices.into_iter().map(|i| (i, Err(anyhow::anyhow!("coalesced commit failed for {}: {}", table_name, e)))).collect()
                     }
                 }
             })
@@ -862,12 +855,9 @@ impl Database {
             .await;
         // ---- Phase 4: schema-evolution units, each on its own (locked merge path).
         let solo_results: Vec<(usize, Result<Vec<String>>)> = stream::iter(solo)
-            .map(|i| {
-                let units = units.clone();
-                async move {
-                    let u = &units[i];
-                    (i, self.insert_records_batch(&u.project_id, &u.table_name, u.batches.clone(), true, Some(&u.watermark)).await)
-                }
+            .map(move |i| async move {
+                let u = &units[i];
+                (i, self.insert_records_batch(&u.project_id, &u.table_name, u.batches.clone(), true, Some(&u.watermark)).await)
             })
             .buffer_unordered(parallelism)
             .collect()
@@ -969,31 +959,25 @@ impl Database {
                     // can fail after N.json is written), so probe before letting the
                     // caller delete parquet a landed commit references.
                     let pre_uris: HashSet<String> = file_uris(&new_table);
+                    let (subject, draining, unconfirmed) = match kind {
+                        StagedCommitKind::Flush { .. } => (
+                            format!("staged commit for {}/{}", projects[0].0, table_name),
+                            "draining bucket",
+                            "UNCONFIRMED (snapshot read failed) — leaving staged parquet in place to avoid a dangling Add",
+                        ),
+                        StagedCommitKind::Coalesced => {
+                            (format!("coalesced commit for {table_name}"), "draining", "UNCONFIRMED — leaving staged parquet in place")
+                        }
+                    };
                     return match probe_after_timeout(self.probe_commit_landed_bounded(table_ref, adds).await, timed_out) {
                         CommitProbe::Landed => {
-                            match kind {
-                                StagedCommitKind::Flush { .. } => warn!(
-                                    "staged commit for {}/{} reported an error but LANDED (post-commit hook failed) — draining bucket: {}",
-                                    projects[0].0, table_name, e
-                                ),
-                                StagedCommitKind::Coalesced => {
-                                    warn!("coalesced commit for {} reported an error but LANDED (post-commit hook failed) — draining: {}", table_name, e)
-                                }
-                            }
+                            warn!("{subject} reported an error but LANDED (post-commit hook failed) — {draining}: {e}");
                             let post = { table_ref.read().await.clone() };
                             Ok(self.record_committed_write(table_ref, projects, table_name, post, &pre_uris, kind.warm()).await)
                         }
                         CommitProbe::NotLanded => Err(anyhow::anyhow!("{} failed: {}", kind.what(), e)),
                         CommitProbe::Inconclusive => {
-                            match kind {
-                                StagedCommitKind::Flush { .. } => warn!(
-                                    "staged commit for {}/{} errored and landing is UNCONFIRMED (snapshot read failed) — leaving staged parquet in place to avoid a dangling Add: {}",
-                                    projects[0].0, table_name, e
-                                ),
-                                StagedCommitKind::Coalesced => {
-                                    warn!("coalesced commit for {} errored and landing is UNCONFIRMED — leaving staged parquet in place: {}", table_name, e)
-                                }
-                            }
+                            warn!("{subject} errored and landing is {unconfirmed}: {e}");
                             // Marker error: tells the caller not to delete the parquet.
                             Err(anyhow::anyhow!("{}: {} failed (landing unconfirmed): {}", INCONCLUSIVE_COMMIT_MARKER, kind.what(), e))
                         }
@@ -1018,7 +1002,7 @@ impl Database {
     }
 
     pub(crate) async fn probe_commit_landed(&self, table_ref: &Arc<RwLock<DeltaTable>>, adds: &[deltalake::kernel::Action]) -> CommitProbe {
-        if refresh_table_snapshot(table_ref, self.config.maintenance.timefusion_incremental_snapshot).await.is_err() {
+        if refresh_table_snapshot(table_ref, self.incremental_snapshot()).await.is_err() {
             return CommitProbe::Inconclusive;
         }
         let guard = table_ref.read().await;
@@ -1115,7 +1099,7 @@ impl Database {
         // from object-store truth in the background to bound incremental-replay drift. Runs
         // on a detached clone so it never touches `added` or the persisted snapshot.
         let reconcile_n = self.config.maintenance.timefusion_snapshot_reconcile_commits;
-        if self.config.maintenance.timefusion_incremental_snapshot
+        if self.incremental_snapshot()
             && reconcile_n > 0
             && committed_version.is_some_and(|v| (v + Self::reconcile_offset(project_id, table_name, reconcile_n)).is_multiple_of(reconcile_n))
         {

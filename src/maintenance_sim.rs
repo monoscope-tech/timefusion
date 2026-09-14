@@ -791,14 +791,11 @@ pub fn run(mut journal: TaskJournal, cfg: &SimConfig, start_micros: i64) -> anyh
 
     report.min_contiguous_days_end = coverage.min_contiguous_days(now);
     report.pending_end = journal.tasks().filter(|t| is_open(t.state)).count();
-    for task in journal.tasks() {
-        *report.tasks_end.entry(format!("{:?}/{:?}", task.key.operation, task.state)).or_default() += 1;
-        *report.units_per_cell.entry(cell_of(&task.key)).or_default() += 1;
-        if task.key.slice.width() <= MIN_SLICE_MICROS {
-            report.units_at_min_slice += 1;
-            *report.min_slice_units_per_cell.entry(cell_of(&task.key)).or_default() += 1;
-        }
-    }
+    report.tasks_end = journal.tasks().map(|task| format!("{:?}/{:?}", task.key.operation, task.state)).counts();
+    report.units_per_cell = journal.tasks().map(|task| cell_of(&task.key)).counts().into_iter().collect();
+    report.min_slice_units_per_cell =
+        journal.tasks().filter(|task| task.key.slice.width() <= MIN_SLICE_MICROS).map(|task| cell_of(&task.key)).counts().into_iter().collect();
+    report.units_at_min_slice = report.min_slice_units_per_cell.values().sum();
     if let Some((cell, units)) = report.units_per_cell.iter().max_by_key(|(_, units)| **units) {
         (report.max_cell, report.max_cell_units) = (cell.clone(), *units);
     }

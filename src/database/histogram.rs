@@ -302,6 +302,17 @@ fn day_bounds(day: i64) -> Result<(i64, i64)> {
     Ok((lo, lo.checked_add(DAY_MICROS).context("histogram date overflow")?))
 }
 
+/// The immutable-identity columns of a table, sorted and deduplicated.
+fn key_columns<'a>(keys: &'a [String], tiebreak: Option<&'a str>, tombstone: Option<&'a str>) -> std::collections::BTreeSet<&'a str> {
+    keys.iter().map(String::as_str).chain(tiebreak).chain(tombstone).collect()
+}
+
+/// Projects `schema` onto `columns`, preserving their sorted field order.
+fn narrow_schema<'a>(schema: &arrow::datatypes::Schema, columns: impl IntoIterator<Item = &'a str>) -> Result<arrow::datatypes::SchemaRef> {
+    let projection = columns.into_iter().map(|column| schema.index_of(column)).collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(Arc::new(schema.project(&projection)?))
+}
+
 fn histogram_timestamps(batch: &RecordBatch) -> Result<&[i64]> {
     let column = batch.column_by_name("timestamp").context("histogram source is missing timestamp")?;
     ensure!(column.null_count() == 0, "histogram timestamp contains nulls");
@@ -453,13 +464,17 @@ impl CapturedHistogram {
         Ok(Some(VisibilityCacheKey { delta: self.delta_cache_key(files), bounds: start.max(lo)..end.min(hi), tombstone: self.tombstone.clone() }))
     }
 
+    fn reserve(&self, bytes: usize) -> Result<datafusion::execution::memory_pool::MemoryReservation> {
+        self.cache.reserve(bytes, self.context.memory_pool())
+    }
+
     async fn prepare_file(
         &self, file: &SnapshotFile,
     ) -> Result<(Arc<crate::tantivy::visibility::PreparedFileRows>, Arc<datafusion::execution::memory_pool::MemoryReservation>)> {
         self.search.stats.histogram_parquet_prepares.fetch_add(1, Ordering::Relaxed);
         metrics::counter!("timefusion_tantivy_histogram_parquet_prepares_total").increment(1);
         let file = Arc::new(crate::tantivy::visibility::PreparedFileRows::open(self.log_store.clone(), file).await?);
-        let owner = Arc::new(self.cache.reserve(file.retained_bytes()?, self.context.memory_pool())?);
+        let owner = Arc::new(self.reserve(file.retained_bytes()?)?);
         Ok((file, owner))
     }
 
@@ -481,7 +496,7 @@ impl CapturedHistogram {
                 metrics::counter!("timefusion_tantivy_histogram_delta_cache_hits_total").increment(1);
                 let rows =
                     self.memory.batches.iter().map(RecordBatch::num_rows).try_fold(0_usize, usize::checked_add).context("memory visibility row overflow")?;
-                let owner = self.cache.reserve(rows.div_ceil(8), self.context.memory_pool())?;
+                let owner = self.reserve(rows.div_ceil(8))?;
                 let memory = arrow::buffer::BooleanBuffer::new_unset(rows);
                 owner.try_resize(memory.inner().capacity())?;
                 (delta, memory, owner, None)
@@ -493,7 +508,7 @@ impl CapturedHistogram {
                 }
                 let mut masks = self.stream_partition_masks(day, &prepared).await?;
                 let memory = masks.pop().context("missing memory winner mask")?;
-                let owner = self.cache.reserve(memory.inner().capacity(), self.context.memory_pool())?;
+                let owner = self.reserve(memory.inner().capacity())?;
                 let header = masks
                     .capacity()
                     .checked_mul(std::mem::size_of::<arrow::buffer::BooleanBuffer>())
@@ -503,7 +518,7 @@ impl CapturedHistogram {
                 let bytes = bytes
                     .checked_add(key.as_ref().map(VisibilityCacheKey::retained_bytes).transpose()?.unwrap_or(0))
                     .context("visibility cache size overflow")?;
-                let reservation = self.cache.reserve(bytes, self.context.memory_pool())?;
+                let reservation = self.reserve(bytes)?;
                 let delta = Arc::new(CapturedDeltaMasks { masks, reservation });
                 if let Some(key) = key {
                     self.cache.insert_entry(HistogramCacheEntry::Visibility { key: Box::new(key), masks: delta.clone() });
@@ -538,7 +553,7 @@ impl CapturedHistogram {
                     while let Some(batch) = rows.try_next().await? {
                         let bytes = batch.get_array_memory_size();
                         ensure!(bytes <= self.max_decoded_bytes, "histogram fallback batch exceeds decoded budget");
-                        let _owner = self.cache.reserve(bytes, self.context.memory_pool())?;
+                        let _owner = self.reserve(bytes)?;
                         let visible = delta.masks[index].slice(offset, batch.num_rows());
                         crate::tantivy::histogram::merge_counts(
                             &mut counts,
@@ -566,10 +581,7 @@ impl CapturedHistogram {
         use datafusion::physical_plan::{streaming::StreamingTableExec, union::UnionExec};
 
         let (lo, hi) = day_bounds(day)?;
-        let columns =
-            self.keys.iter().map(String::as_str).chain(self.tiebreak.as_deref()).chain(self.tombstone.as_deref()).collect::<std::collections::BTreeSet<_>>();
-        let projection = columns.into_iter().map(|name| self.projected.index_of(name)).collect::<std::result::Result<Vec<_>, _>>()?;
-        let narrow = Arc::new(self.projected.project(&projection)?);
+        let narrow = narrow_schema(&self.projected, key_columns(&self.keys, self.tiebreak.as_deref(), self.tombstone.as_deref()))?;
         let schema = lineage_schema(&narrow)?;
         let ranges = Arc::new(self.memory.covered_ranges.clone());
         let partitions = prepared
@@ -598,7 +610,7 @@ impl CapturedHistogram {
         let source_rows = prepared.iter().map(|(file, _)| file.live().len()).chain(std::iter::once(offset)).collect();
         let memory_bytes =
             memory.iter().map(RecordBatch::get_array_memory_size).try_fold(0_usize, usize::checked_add).context("memory visibility size overflow")?;
-        let _memory_owner = self.cache.reserve(memory_bytes, self.context.memory_pool())?;
+        let _memory_owner = self.reserve(memory_bytes)?;
         let memory_plan = datafusion::datasource::memory::MemorySourceConfig::try_new_exec(&[memory], schema.clone(), None)?;
         let input: Arc<dyn datafusion::physical_plan::ExecutionPlan> = if partitions.is_empty() {
             memory_plan
@@ -648,7 +660,7 @@ impl CapturedHistogram {
             }
             // Metadata validates complete coverage; no event rows are decoded.
             let prepared = crate::tantivy::visibility::PreparedFileRows::open(self.log_store.clone(), file).await?;
-            let _owner = self.cache.reserve(prepared.retained_bytes()?, self.context.memory_pool())?;
+            let _owner = self.reserve(prepared.retained_bytes()?)?;
             ensure!(u64::try_from(prepared.live().len())? == indexed_rows, "empty index does not cover every physical row");
         }
         TantivySearchService::record_histogram_snapshot(&self.search.stats);
@@ -695,7 +707,7 @@ impl CapturedHistogram {
             let visible = crate::tantivy::visibility::deletion_vector_mask(self.log_store.clone(), file.deletion_vector.as_ref(), rows).await?;
             let bytes = visible.inner().capacity();
             ensure!(bytes <= self.max_decoded_bytes, "histogram visibility allocation exceeds budget");
-            let _reservation = self.cache.reserve(bytes, self.context.memory_pool())?;
+            let _reservation = self.reserve(bytes)?;
             let counts = self.count_indexed_file(&entry, &file.path, visible).await?;
             crate::tantivy::histogram::merge_counts(&mut result.counts, counts)?;
             result.indexed_sources += 1;
@@ -756,8 +768,7 @@ impl CapturedHistogram {
                 }
                 let decoded_bytes = initial - remaining;
                 let mask_bytes: usize = sources.iter().map(|source| source.live.inner().capacity()).sum();
-                let reservation =
-                    self.cache.reserve(decoded_bytes.checked_add(mask_bytes).context("histogram cache size overflow")?, self.context.memory_pool())?;
+                let reservation = self.reserve(decoded_bytes.checked_add(mask_bytes).context("histogram cache size overflow")?)?;
                 let delta = Arc::new(CachedDelta { key: cache_key, sources, decoded_bytes, reservation });
                 self.cache.insert_entry(HistogramCacheEntry::Rows(delta.clone()));
                 delta
@@ -974,19 +985,11 @@ impl super::Database {
         // retained Arrow batches. Only the capture interval needs this fence.
         capture.validate()?;
         drop(capture);
-        let mut columns = schema
-            .dedup_keys
-            .iter()
-            .map(String::as_str)
-            .chain(schema.dedup_tiebreak.as_deref())
-            .chain(schema.tombstone_column.as_deref())
-            .collect::<std::collections::BTreeSet<_>>();
+        let mut columns = key_columns(&schema.dedup_keys, schema.dedup_tiebreak.as_deref(), schema.tombstone_column.as_deref());
         if let Some(predicate) = membership {
             columns.extend(predicate.columns());
         }
-        let full_schema = schema.schema_ref();
-        let projection = columns.into_iter().map(|column| full_schema.index_of(column)).collect::<std::result::Result<Vec<_>, _>>()?;
-        let projected = Arc::new(full_schema.project(&projection)?);
+        let projected = narrow_schema(&schema.schema_ref(), columns)?;
         let mut partitions: std::collections::BTreeMap<i64, Vec<SnapshotFile>> = Default::default();
         for file in files {
             let date =
@@ -1010,8 +1013,7 @@ impl super::Database {
             let Some(date) = files.first().and_then(|file| file.partition_values.get("date")).and_then(Option::as_deref) else { continue };
             if let Some((index, added)) = self.logical_count_memory_for_files(project, table_name, date, &current)
                 && added.is_empty()
-                && let Some(lo) = day.checked_mul(DAY_MICROS)
-                && let Some(hi) = lo.checked_add(DAY_MICROS)
+                && let Ok((lo, hi)) = day_bounds(day)
             {
                 logical_counts.insert(day, index.count(lo, hi));
             } else if let Some(proof) = manifest.count_proofs.get(&date.parse::<chrono::NaiveDate>()?)

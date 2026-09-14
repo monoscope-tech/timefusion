@@ -92,12 +92,6 @@ struct TimedPhase<'a> {
     started: Instant,
 }
 
-impl<'a> TimedPhase<'a> {
-    fn new(count: &'a AtomicU64, micros: &'a AtomicU64) -> Self {
-        Self { count, micros, started: Instant::now() }
-    }
-}
-
 impl Drop for TimedPhase<'_> {
     fn drop(&mut self) {
         SearchStats::timed(self.count, self.micros, self.started);
@@ -347,7 +341,7 @@ impl TantivySearchService {
         SearchStats::add(&self.stats.queries, 1);
         SearchStats::add(&self.stats.indexes_searched, work.len() as u64);
         SearchStats::timed(&self.stats.plans, &self.stats.plan_us, plan_started);
-        let _fanout = TimedPhase::new(&self.stats.fanouts, &self.stats.fanout_us);
+        let _fanout = TimedPhase { count: &self.stats.fanouts, micros: &self.stats.fanout_us, started: Instant::now() };
         let mut tasks = futures::stream::iter(work.into_iter().map(|(file_uuid, blob_path, rows, entry_covered, ordinals_valid)| async move {
             let prepare_started = Instant::now();
             let dir = self.ensure_cached(table, project_id, &file_uuid, &blob_path).await?;
@@ -662,11 +656,10 @@ fn file_uuid(key: &str) -> &str {
     key.strip_prefix("bucket-").unwrap_or(key)
 }
 
+/// Legacy manifests (no generation in the blob path) keep the bare key, so
+/// existing caches are retained.
 fn cache_generation_key(key: &str, blob: &str) -> String {
-    match super::split_blob_generation(blob) {
-        Some((_, generation)) => format!("{key}.generation-{generation}"),
-        None => key.to_string(), // retain existing caches for legacy manifests
-    }
+    super::split_blob_generation(blob).map_or_else(|| key.to_string(), |(_, generation)| format!("{key}.generation-{generation}"))
 }
 
 /// Unpack `blob` into a temp dir adjacent to `dir`, then atomically rename it
@@ -1138,6 +1131,9 @@ impl TantivyIndexService {
         })
     }
 
+    /// Build+pack `batches`, upload the blob, and upsert the manifest entry. On
+    /// build failure records a failed entry (index=None, error set) and returns
+    /// the error.
     async fn build_and_publish(
         &self, project_id: &str, table_name: &str, batches: Vec<arrow::record_batch::RecordBatch>, added_files: Vec<String>,
     ) -> Result<()> {
@@ -1145,7 +1141,7 @@ impl TantivyIndexService {
         // Multi-file commits keep the one-blob-covers-all shape: rows can't be
         // attributed to files without re-deriving the partition split, and a
         // multi-covered entry is still correct for coverage.
-        let (key, path) = match added_files.as_slice() {
+        let (key, blob_path) = match added_files.as_slice() {
             [uri] => parquet_rel_of_uri(uri).map(|rel| (rel.to_string(), super::index_path_for_parquet(table_name, rel))),
             _ => None,
         }
@@ -1153,7 +1149,21 @@ impl TantivyIndexService {
             let uuid = Uuid::new_v4().to_string();
             (format!("bucket-{uuid}"), super::blob_path(table_name, project_id, &uuid))
         });
-        self.build_pack_upload(table_name, project_id, &key, path, added_files, batches).await
+        // Flush path: batches are indexed BEFORE the Delta writer's sort, so doc
+        // order ≠ parquet row order and ordinals must not drive row selection;
+        // merging is deferred to keep it off the ingest path.
+        let (ordinals_valid, merge) = (false, MergeMode::Deferred);
+        let svc_table = crate::schema::get_schema(table_name).with_context(|| format!("schema not found for {table_name}"))?;
+        let level = self.config.compression_level();
+        let scratch = self.scratch_root.clone();
+        let pack_result = tokio::task::spawn_blocking(move || {
+            let (blob, stats) = super::build_and_pack(svc_table, &batches, level, merge, &scratch)?;
+            super::verify_blob(&blob).context("verify packed blob")?;
+            Ok::<_, anyhow::Error>((blob, stats))
+        })
+        .await
+        .context("join build")?;
+        self.publish_built_index(table_name, project_id, &key, blob_path, added_files, ordinals_valid, pack_result, false).await.map(|_| ())
     }
 
     /// Build & publish an index for a single already-committed parquet file,
@@ -1177,50 +1187,24 @@ impl TantivyIndexService {
     /// file that the next (idempotent) pass rebuilds, so keep batches bounded.
     pub async fn build_index_for_file_deferred(
         &self, table_name: &str, project_id: &str, parquet_rel: &str, parquet_uri: &str, delta_store: Arc<dyn ObjectStore>,
-    ) -> Result<(String, crate::tantivy::ManifestEntry)> {
-        self.build_index_for_file_inner(table_name, project_id, parquet_rel, parquet_uri, delta_store, true)
-            .await?
-            .ok_or_else(|| anyhow!("deferred build returned no manifest entry"))
+    ) -> Result<(String, ManifestEntry)> {
+        self.build_index_for_file_inner(table_name, project_id, parquet_rel, parquet_uri, delta_store, true).await
     }
 
     async fn build_index_for_file_inner(
         &self, table_name: &str, project_id: &str, parquet_rel: &str, parquet_uri: &str, delta_store: Arc<dyn ObjectStore>, defer: bool,
-    ) -> Result<Option<(String, crate::tantivy::ManifestEntry)>> {
+    ) -> Result<(String, ManifestEntry)> {
         let path = super::index_path_for_parquet(table_name, parquet_rel);
         let table = crate::schema::get_schema(table_name).with_context(|| format!("schema not found for {table_name}"))?;
         let result = super::build_parquet_and_pack(delta_store, parquet_rel, table, self.config.compression_level(), MergeMode::Now, &self.scratch_root).await;
         self.publish_built_index(table_name, project_id, parquet_rel, path, vec![parquet_uri.to_string()], true, result, defer).await
     }
 
-    /// Build+pack `batches`, upload to `blob_path`, and upsert the manifest
-    /// entry keyed by `manifest_key`. On build failure records a failed entry
-    /// (index=None, error set) and returns the error.
-    async fn build_pack_upload(
-        &self, table_name: &str, project_id: &str, manifest_key: &str, blob_path: object_store::path::Path, covered_files: Vec<String>,
-        batches: Vec<arrow::record_batch::RecordBatch>,
-    ) -> Result<()> {
-        // Flush path: batches are indexed BEFORE the Delta writer's sort, so doc
-        // order ≠ parquet row order and ordinals must not drive row selection;
-        // merging is deferred to keep it off the ingest path.
-        let (ordinals_valid, merge) = (false, MergeMode::Deferred);
-        let svc_table = crate::schema::get_schema(table_name).with_context(|| format!("schema not found for {table_name}"))?;
-        let level = self.config.compression_level();
-        let scratch = self.scratch_root.clone();
-        let pack_result = tokio::task::spawn_blocking(move || {
-            let (blob, stats) = super::build_and_pack(svc_table, &batches, level, merge, &scratch)?;
-            super::verify_blob(&blob).context("verify packed blob")?;
-            Ok::<_, anyhow::Error>((blob, stats))
-        })
-        .await
-        .context("join build")?;
-        self.publish_built_index(table_name, project_id, manifest_key, blob_path, covered_files, ordinals_valid, pack_result, false).await.map(|_| ())
-    }
-
     #[allow(clippy::too_many_arguments)]
     async fn publish_built_index(
         &self, table_name: &str, project_id: &str, manifest_key: &str, blob_path: object_store::path::Path, covered_files: Vec<String>, ordinals_valid: bool,
         result: Result<(bytes::Bytes, crate::tantivy::IndexBuildStats)>, defer: bool,
-    ) -> Result<Option<(String, crate::tantivy::ManifestEntry)>> {
+    ) -> Result<(String, ManifestEntry)> {
         let (blob, stats) = match result {
             Ok(v) => v,
             Err(e) => {
@@ -1262,7 +1246,7 @@ impl TantivyIndexService {
         if let Some(ts) = stats.max_timestamp_micros {
             self.newest_indexed_micros.fetch_max(ts, Ordering::Relaxed);
         }
-        Ok(defer.then(|| (manifest_key.to_string(), entry)))
+        Ok((manifest_key.to_string(), entry))
     }
 
     /// Install a just-published blob into the reader's extracted-index cache so

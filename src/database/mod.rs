@@ -12,7 +12,7 @@ use chrono::Utc;
 use datafusion::{
     arrow::{array::Array, record_batch::RecordBatch},
     catalog::Session,
-    common::{Statistics, not_impl_err},
+    common::not_impl_err,
     datasource::{
         TableProvider, TableType,
         sink::{DataSink, DataSinkExec},
@@ -134,7 +134,7 @@ type FastResolveCache = Arc<dashmap::DashMap<(String, String), Arc<RwLock<DeltaT
 
 /// Captured per-scan to feed `ScanMetrics::record_scan`. Cheap to copy.
 #[derive(Debug, Default, Clone, Copy)]
-struct ScanShape {
+pub(crate) struct ScanShape {
     skipped_delta: bool,
     has_mem: bool,
     has_delta: bool,
@@ -534,12 +534,9 @@ impl ScanMetrics {
     /// Outcome of the swept-partition dedup skip. A non-`Granted` verdict means
     /// the window was never eligible; `Granted` with no skip means a leg refused
     /// one that was.
-    #[allow(clippy::too_many_arguments)] // one flag per counter; a struct would just rename them
-    pub fn record_scan(
-        &self, duration_us: u64, skipped_delta: bool, has_mem: bool, has_delta: bool, fast_resolve_hit: Option<bool>, dedup_skip: bool,
-        verdict: DedupSkipVerdict,
-    ) {
+    pub(crate) fn record_scan(&self, duration_us: u64, shape: ScanShape, verdict: DedupSkipVerdict) {
         use scan_metric_names::*;
+        let ScanShape { skipped_delta, has_mem, has_delta, fast_resolve_hit, skip_dedup: dedup_skip } = shape;
         metrics::counter!(SCANS_TOTAL).increment(1);
         // Counted only where a Delta leg was actually read.
         if has_delta {
@@ -772,16 +769,14 @@ pub(crate) async fn refresh_table_snapshot(table: &Arc<RwLock<DeltaTable>>, incr
     // Carry the materialized file list forward over the catch-up range instead of
     // the O(active files) re-materialize `update_state` pays; falls back to the
     // full update when not applicable.
-    let advanced = if incremental {
-        let log_store = fresh.log_store();
-        match fresh.state.as_mut() {
-            // Non-fatal: the full update_state below re-attempts the same IO.
-            Some(state) => state.advance_catchup(log_store.as_ref(), REFRESH_APPEND_CATCHUP_MAX_GAP).await.unwrap_or_else(|e| {
-                debug!("incremental catch-up failed, falling back to full update_state: {e}");
-                false
-            }),
-            None => false,
-        }
+    // Bound before `state.as_mut()`: an Arc clone, so it cannot borrow `fresh`.
+    let log_store = fresh.log_store();
+    let advanced = if incremental && let Some(state) = fresh.state.as_mut() {
+        // Non-fatal: the full update_state below re-attempts the same IO.
+        state.advance_catchup(log_store.as_ref(), REFRESH_APPEND_CATCHUP_MAX_GAP).await.unwrap_or_else(|e| {
+            debug!("incremental catch-up failed, falling back to full update_state: {e}");
+            false
+        })
     } else {
         false
     };
@@ -888,18 +883,20 @@ fn select_warm_paths(
     (paths, dropped.len())
 }
 
-/// First row's `project_id`, if the batch carries the column.
-pub fn extract_project_id(batch: &RecordBatch) -> Option<String> {
+/// Row values of a Utf8View/Utf8 column, or `None` if it is neither.
+fn str_col_rows(column: &datafusion::arrow::array::ArrayRef) -> Option<Box<dyn Iterator<Item = Option<&str>> + '_>> {
     use datafusion::arrow::array::{StringArray, StringViewArray};
 
+    let any = column.as_any();
+    any.downcast_ref::<StringViewArray>()
+        .map(|arr| Box::new(arr.iter()) as Box<dyn Iterator<Item = Option<&str>> + '_>)
+        .or_else(|| any.downcast_ref::<StringArray>().map(|arr| Box::new(arr.iter()) as _))
+}
+
+/// First row's `project_id`, if the batch carries the column.
+pub fn extract_project_id(batch: &RecordBatch) -> Option<String> {
     let idx = batch.schema().fields().iter().position(|f| f.name() == "project_id")?;
-    let column = batch.column(idx);
-    column
-        .as_any()
-        .downcast_ref::<StringViewArray>()
-        .and_then(|arr| arr.iter().next().flatten())
-        .or_else(|| column.as_any().downcast_ref::<StringArray>().and_then(|arr| arr.iter().next().flatten()))
-        .map(str::to_string)
+    str_col_rows(batch.column(idx))?.next().flatten().map(str::to_string)
 }
 
 /// Split a batch row-wise by its `project_id` column into per-project sub-batches.
@@ -910,10 +907,7 @@ pub fn extract_project_id(batch: &RecordBatch) -> Option<String> {
 pub fn partition_batch_by_project(batch: RecordBatch, default_project: &str) -> DFResult<Vec<(String, RecordBatch)>> {
     use std::collections::BTreeMap;
 
-    use datafusion::arrow::{
-        array::{StringArray, StringViewArray, UInt32Array},
-        compute::take_record_batch,
-    };
+    use datafusion::arrow::{array::UInt32Array, compute::take_record_batch};
 
     let num_rows = batch.num_rows();
     if num_rows == 0 {
@@ -927,12 +921,7 @@ pub fn partition_batch_by_project(batch: RecordBatch, default_project: &str) -> 
     // The block scopes the iterator's borrow of `batch`.
     let mut groups: BTreeMap<String, Vec<u32>> = BTreeMap::new();
     {
-        let rows: Box<dyn Iterator<Item = Option<&str>> + '_> =
-            match (column.as_any().downcast_ref::<StringViewArray>(), column.as_any().downcast_ref::<StringArray>()) {
-                (Some(arr), _) => Box::new(arr.iter()),
-                (_, Some(arr)) => Box::new(arr.iter()),
-                _ => return Ok(vec![(default_project.to_string(), batch)]),
-            };
+        let Some(rows) = str_col_rows(column) else { return Ok(vec![(default_project.to_string(), batch)]) };
         for (i, pid) in rows.enumerate() {
             let pid = pid.unwrap_or(default_project);
             match groups.get_mut(pid) {
@@ -1750,18 +1739,16 @@ fn window_hour_masks(lo: i64, hi: i64) -> Option<Vec<(String, u32)>> {
     if lo >= hi {
         return None;
     }
-    let dates = window_dates(lo, hi.checked_sub(1)?)?;
-    Some(
-        dates
-            .into_iter()
-            .filter_map(|date| {
-                let day = date.and_hms_opt(0, 0, 0)?.and_utc().timestamp_micros();
-                let hour_of = |t: i64| t.saturating_sub(day).max(0).div_euclid(3_600_000_000).clamp(0, 23);
-                let mask = (hour_of(lo)..=hour_of(hi.checked_sub(1)?)).fold(0u32, |mask, hour| mask | (1 << hour));
-                Some((date.to_string(), mask))
-            })
-            .collect(),
-    )
+    let last = hi.checked_sub(1)?;
+    let masks = window_dates(lo, last)?
+        .into_iter()
+        .filter_map(|date| {
+            let day = date.and_hms_opt(0, 0, 0)?.and_utc().timestamp_micros();
+            let hour_of = |t: i64| t.saturating_sub(day).max(0).div_euclid(3_600_000_000).clamp(0, 23);
+            Some((date.to_string(), (hour_of(lo)..=hour_of(last)).fold(0u32, |mask, hour| mask | (1 << hour))))
+        })
+        .collect();
+    Some(masks)
 }
 
 /// Whether a commit that returned an error actually landed: delta-rs surfaces a post-commit hook or
@@ -3094,12 +3081,11 @@ impl Database {
         let db = Arc::clone(self);
         tokio::spawn(async move {
             for file in layer.deferred_tantivy_files() {
-                let table_ref = match db.resolve_table("default", &file.table_name).await {
-                    Ok(table) => Ok(table),
-                    Err(_) => db.resolve_table(&file.project_id, &file.table_name).await,
-                };
                 let result = async {
-                    let table = table_ref?;
+                    let table = match db.resolve_table("default", &file.table_name).await {
+                        Ok(table) => table,
+                        Err(_) => db.resolve_table(&file.project_id, &file.table_name).await?,
+                    };
                     let store = table.read().await.log_store().object_store(None);
                     let rel =
                         crate::tantivy::search::parquet_rel_of_uri(&file.uri).ok_or_else(|| anyhow::anyhow!("invalid deferred parquet URI {}", file.uri))?;
@@ -3267,14 +3253,12 @@ impl Database {
             for root in self.table_roots(&table_name).await {
                 let Ok(table_ref) = self.resolve_table(&root, &table_name).await else { continue };
                 let (by_pid, ..) = self.group_uncovered_files_by_project(&svc, &table_ref, &table_name, &mut oversized, false).await?;
-                for uris in by_pid.into_values() {
-                    uncovered = uncovered.saturating_add(uris.len() as u64);
-                    for uri in &uris {
-                        // Partition date, not file mtime: a rewrite of old data is still old.
-                        let age_days = crate::storage::date_partition_of(uri)
-                            .map_or(i64::MAX, |d| today - d.and_hms_opt(0, 0, 0).map_or(0, |t| t.and_utc().timestamp_micros() / 86_400_000_000));
-                        by_age[usize::from(age_days > 0) + usize::from(age_days > 7)] += 1;
-                    }
+                for uri in by_pid.into_values().flatten() {
+                    uncovered = uncovered.saturating_add(1);
+                    // Partition date, not file mtime: a rewrite of old data is still old.
+                    let age_days = crate::storage::date_partition_of(&uri)
+                        .map_or(i64::MAX, |d| today - d.and_hms_opt(0, 0, 0).map_or(0, |t| t.and_utc().timestamp_micros() / 86_400_000_000));
+                    by_age[usize::from(age_days > 0) + usize::from(age_days > 7)] += 1;
                 }
             }
         }
@@ -3311,13 +3295,13 @@ impl Database {
                     (rels, t.log_store().object_store(None))
                 };
                 // Group by (project, date); newest dates first so hot partitions converge first.
-                let mut by_pd: HashMap<(String, String), Vec<(String, u64)>> = HashMap::new();
-                for (rel, size) in rels.into_iter().filter(|(rel, _)| rel.ends_with(".parquet")) {
-                    if let Some((pid, date)) = bloom_prune::project_date_of_rel(&rel) {
-                        by_pd.entry((pid.to_string(), date.to_string())).or_default().push((rel, size));
-                    }
-                }
-                let mut cells: Vec<_> = by_pd.into_iter().collect();
+                let mut cells: Vec<_> = rels
+                    .into_iter()
+                    .filter(|(rel, _)| rel.ends_with(".parquet"))
+                    .filter_map(|(rel, size)| Some((bloom_prune::project_date_of_rel(&rel).map(|(p, d)| (p.to_string(), d.to_string()))?, (rel, size))))
+                    .into_group_map()
+                    .into_iter()
+                    .collect();
                 cells.sort_by(|a, b| b.0.1.cmp(&a.0.1));
                 for ((pid, date), files) in cells {
                     if budget == 0 {
@@ -3325,8 +3309,8 @@ impl Database {
                     }
                     let existing = reg.load_sidecar_raw(&table_name, &pid, &date).await.unwrap_or_default();
                     let existing_count = existing.files.len();
-                    let live: HashMap<&str, u64> = files.iter().map(|(rel, size)| (rel.as_str(), *size)).collect();
-                    let mut kept: Vec<bloom_prune::FileBlooms> = existing.files.into_iter().filter(|f| live.contains_key(f.rel.as_str())).collect();
+                    let live: HashSet<&str> = files.iter().map(|(rel, _)| rel.as_str()).collect();
+                    let mut kept: Vec<bloom_prune::FileBlooms> = existing.files.into_iter().filter(|f| live.contains(f.rel.as_str())).collect();
                     let known: HashSet<&str> = kept.iter().map(|f| f.rel.as_str()).collect();
                     let missing: Vec<(String, u64)> =
                         files.iter().filter(|(rel, _)| !known.contains(rel.as_str())).map(|(rel, size)| (rel.clone(), *size)).take(budget).collect();
@@ -3481,6 +3465,15 @@ impl Database {
         coverage.generation == crate::rollup::generation_id(spec, source, project, date, coverage.source_fp, measures.as_deref())
     }
 
+    /// Why a coverage cell cannot serve this route: a stale generation first, then
+    /// the measures its files actually materialized — a cell missing one serves
+    /// NULLs, so it drops to the raw fringe.
+    fn coverage_decline(route: &crate::rollup::RoutedRollup, project: &str, date: &str, coverage: &RollupCoverage) -> Option<crate::rollup::MissReason> {
+        (!Self::rollup_generation_current(&route.source, &route.target, project, date, coverage))
+            .then_some(crate::rollup::MissReason::StaleCoverage)
+            .or_else(|| (!route.measures_available(coverage.measures.as_ref())).then_some(crate::rollup::MissReason::MeasureNotStored))
+    }
+
     pub(crate) async fn rollup_sql(
         &self, logical_plan: &datafusion::logical_expr::LogicalPlan, session: &datafusion::execution::context::SessionState,
     ) -> std::result::Result<Option<RollupRewrite>, crate::rollup::MissReason> {
@@ -3589,18 +3582,12 @@ impl Database {
                 };
                 let source_fp = stats_of(&fingerprints, project, &date).map_or(0, |stats| stats.fingerprint);
                 let source_epoch = self.rollup_source_epochs.get(&(project.clone(), route.source.clone(), date.clone())).map_or(0, |entry| *entry.value());
-                if !Self::rollup_generation_current(&route.source, &route.target, project, &date, &coverage)
-                    || coverage.source_fp != source_fp
-                    || coverage.source_epoch != Some(source_epoch)
+                let moved = coverage.source_fp != source_fp || coverage.source_epoch != Some(source_epoch);
+                if let Some(reason) =
+                    moved.then_some(crate::rollup::MissReason::StaleCoverage).or_else(|| Self::coverage_decline(&route, project, &date, &coverage))
                 {
-                    miss = miss.or(Some(crate::rollup::MissReason::StaleCoverage));
-                    continue;
-                }
-                // Freshness says nothing about which measures the cell's files hold; a cell
-                // missing one serves NULLs, so drop it to the raw fringe.
-                if !route.measures_available(coverage.measures.as_ref()) {
-                    miss = miss.or(Some(crate::rollup::MissReason::MeasureNotStored));
-                    measure_declined = true;
+                    measure_declined |= reason == crate::rollup::MissReason::MeasureNotStored;
+                    miss = miss.or(Some(reason));
                     continue;
                 }
                 debug!(project_id = %project, source = %route.source, target = %route.target, date, "rollup coverage selected");
@@ -3644,14 +3631,10 @@ impl Database {
                     }
                 }
                 for (key, coverage) in fresh {
-                    if !Self::rollup_generation_current(&route.source, &route.target, project, &date, &coverage) {
-                        miss = miss.or(Some(crate::rollup::MissReason::StaleCoverage));
-                        continue;
-                    }
                     // Per slice: one built before the measure existed sends only ITS range raw.
-                    if !route.measures_available(coverage.measures.as_ref()) {
-                        miss = miss.or(Some(crate::rollup::MissReason::MeasureNotStored));
-                        measure_declined = true;
+                    if let Some(reason) = Self::coverage_decline(&route, project, &date, &coverage) {
+                        measure_declined |= reason == crate::rollup::MissReason::MeasureNotStored;
+                        miss = miss.or(Some(reason));
                         continue;
                     }
                     covered.push((key.3, key.4));
@@ -4570,7 +4553,33 @@ impl Database {
         // (all projects share it, partitioned by project_id).
         let is_custom = self.has_custom_storage(project_id, table_name).await;
         span.record("is_custom", is_custom);
-        let t = if is_custom { self.resolve_custom_table(project_id, table_name).await? } else { self.resolve_unified_table(table_name).await? };
+        // Clone the handle and DROP the map guard before refreshing: `update_table`
+        // replays the Delta log, and tokio's RwLock is write-preferring, so a read
+        // guard held across it wedges every later reader.
+        let cached = if is_custom {
+            self.custom_project_tables.read().await.get(&table_key(project_id, table_name)).cloned()
+        } else {
+            self.unified_tables.read().await.get(table_name).cloned()
+        };
+        let t = match cached {
+            Some(table) => {
+                if is_custom {
+                    debug!("Found custom table for project '{}' table '{}' in cache", project_id, table_name);
+                } else {
+                    debug!("Found unified table '{}' in cache", table_name);
+                }
+                // Version tracking keys unified tables under an empty project_id.
+                self.refresh_cached_table(table, if is_custom { project_id } else { "" }, table_name).await?
+            }
+            None if is_custom => self
+                .get_or_create_custom_table(project_id, table_name)
+                .await
+                .map_err(|e| DataFusionError::Execution(format!("Failed to get or create custom table: {}", e)))?,
+            None => self
+                .get_or_create_unified_table(table_name)
+                .await
+                .map_err(|e| DataFusionError::Execution(format!("Failed to get or create unified table: {}", e)))?,
+        };
         self.populate_resolve_caches(project_id, table_name, &t).await;
         Ok(t)
     }
@@ -4603,21 +4612,6 @@ impl Database {
         }
     }
 
-    /// Resolve a unified table (shared by all default projects, partitioned by project_id)
-    async fn resolve_unified_table(&self, table_name: &str) -> DFResult<Arc<RwLock<DeltaTable>>> {
-        // Clone the handle and DROP the map guard before refreshing: `update_table`
-        // replays the Delta log, and tokio's RwLock is write-preferring, so a read
-        // guard held across it wedges every later reader.
-        let cached = self.unified_tables.read().await.get(table_name).cloned();
-        if let Some(table) = cached {
-            debug!("Found unified table '{}' in cache", table_name);
-            // Version tracking keys unified tables under an empty project_id.
-            return self.refresh_cached_table(table, "", table_name).await;
-        }
-
-        self.get_or_create_unified_table(table_name).await.map_err(|e| DataFusionError::Execution(format!("Failed to get or create unified table: {}", e)))
-    }
-
     /// Refresh a cache-hit handle when this process's view may be behind.
     async fn refresh_cached_table(&self, table: Arc<RwLock<DeltaTable>>, project_id: &str, table_name: &str) -> DFResult<Arc<RwLock<DeltaTable>>> {
         let last_written_version = self.last_written_versions.read().await.get(&table_key(project_id, table_name)).cloned();
@@ -4626,21 +4620,6 @@ impl Database {
             self.update_table(&table, project_id, table_name).await.map_err(|e| DataFusionError::Execution(format!("Failed to update table: {e}")))?;
         }
         Ok(table)
-    }
-
-    /// Resolve a custom project table (isolated table for projects with their own S3 bucket)
-    async fn resolve_custom_table(&self, project_id: &str, table_name: &str) -> DFResult<Arc<RwLock<DeltaTable>>> {
-        // Handle cloned and the map guard dropped before the refresh — see
-        // `resolve_unified_table`.
-        let cached = self.custom_project_tables.read().await.get(&table_key(project_id, table_name)).cloned();
-        if let Some(table) = cached {
-            debug!("Found custom table for project '{}' table '{}' in cache", project_id, table_name);
-            return self.refresh_cached_table(table, project_id, table_name).await;
-        }
-
-        self.get_or_create_custom_table(project_id, table_name)
-            .await
-            .map_err(|e| DataFusionError::Execution(format!("Failed to get or create custom table: {}", e)))
     }
 
     /// Load-outside-write-lock, double-check-then-insert cache shape shared by
@@ -5709,10 +5688,7 @@ async fn bin_time_range(ctx: &datafusion::prelude::SessionContext, probe: &str) 
     let (lo, hi) = (int_at(0)?, int_at(1)?);
     // Any NULL in the sort column declines slicing outright: it would fall
     // outside every range and be dropped.
-    match int_at(2) {
-        Some(0) | None => Some((lo, hi)),
-        Some(_) => None,
-    }
+    int_at(2).is_none_or(|nulls| nulls == 0).then_some((lo, hi))
 }
 
 /// Split `[lo, hi]` into `slices` half-open ranges, last one inclusive of `hi`.
@@ -5770,9 +5746,6 @@ fn repair_bounds_from_cuts(lo: i64, hi: i64, cuts: &[i64]) -> Vec<(i64, Option<i
 }
 
 fn schema_order_by_clause(schema: &crate::schema::TableSchema) -> String {
-    if schema.sorting_columns.is_empty() {
-        return String::new();
-    }
     let cols = schema
         .sorting_columns
         .iter()
@@ -5785,7 +5758,7 @@ fn schema_order_by_clause(schema: &crate::schema::TableSchema) -> String {
             )
         })
         .join(", ");
-    format!(" ORDER BY {cols}")
+    if cols.is_empty() { String::new() } else { format!(" ORDER BY {cols}") }
 }
 
 /// Full compaction optionally sorts by the schema's timestamp-leading keys so
@@ -5888,8 +5861,7 @@ fn resume_guarded(entry: &StagedIntent, now_secs: u64) -> bool {
 fn staged_orphan_deletions(entries: &[StagedIntent], table_name: &str, now_secs: u64, referenced: &HashSet<String>) -> Vec<String> {
     entries
         .iter()
-        .filter(|e| e.table_name == table_name)
-        .filter(|e| now_secs.saturating_sub(e.recorded_at) >= STAGED_INTENT_MIN_AGE_SECS)
+        .filter(|e| e.table_name == table_name && now_secs.saturating_sub(e.recorded_at) >= STAGED_INTENT_MIN_AGE_SECS)
         .flat_map(|e| e.paths.iter())
         .filter(|p| !referenced.contains(p.as_str()))
         .cloned()
@@ -5926,6 +5898,18 @@ enum ResumeVerdict {
     Commit,
 }
 
+/// The guard both resume classifiers apply first; `None` means neither branch
+/// fires. On an overlapping rolling deploy the staging instance may still be
+/// alive and about to commit its own output — `resume_guarded` answers that by
+/// ownership. Staged parquet is uuid-named by the writer, so nobody else can
+/// produce those paths: live ⇒ our commit landed.
+fn resume_precheck<V>(entry: &StagedIntent, table_name: &str, now_secs: u64, live: &HashMap<&str, V>) -> Option<ResumeVerdict> {
+    if entry.table_name != table_name || entry.adds.is_empty() || resume_guarded(entry, now_secs) {
+        return Some(ResumeVerdict::Skip);
+    }
+    entry.adds.iter().all(|a| live.contains_key(a.path.as_str())).then_some(ResumeVerdict::AlreadyLanded)
+}
+
 /// Should a killed rollup unit's staged output be committed on the next boot?
 ///
 /// IO-free, like [`classify_resume`], so every branch is unit-testable; the
@@ -5950,13 +5934,8 @@ fn classify_rollup_resume(
     entry: &StagedIntent, table_name: &str, now_secs: u64, live: &HashMap<&str, Option<(i64, i64)>>, current_source_rows: Option<u64>,
 ) -> ResumeVerdict {
     let Some(rollup) = entry.rollup.as_ref() else { return ResumeVerdict::Skip };
-    if entry.table_name != table_name || entry.adds.is_empty() || resume_guarded(entry, now_secs) {
-        return ResumeVerdict::Skip;
-    }
-    // Staged parquet is uuid-named by the writer, so its presence in the live set
-    // means our commit landed.
-    if entry.adds.iter().all(|add| live.contains_key(add.path.as_str())) {
-        return ResumeVerdict::AlreadyLanded;
+    if let Some(verdict) = resume_precheck(entry, table_name, now_secs, live) {
+        return verdict;
     }
     // No witness ⇒ unverifiable; a witness that no longer matches ⇒ the source moved.
     if !matches!((rollup.source_rows, current_source_rows), (Some(built_from), Some(current)) if built_from == current) {
@@ -5980,15 +5959,11 @@ fn classify_rollup_resume(
 /// (`None` = the Add carries no stats, which makes row preservation
 /// unverifiable and is therefore never committable).
 fn classify_resume(entry: &StagedIntent, table_name: &str, now_secs: u64, live: &HashMap<&str, Option<i64>>) -> ResumeVerdict {
-    // On an overlapping rolling deploy the staging instance may still be alive and
-    // about to commit its own output; `resume_guarded` answers that by ownership.
-    if entry.table_name != table_name || entry.target_paths.is_empty() || entry.adds.is_empty() || resume_guarded(entry, now_secs) {
+    if entry.target_paths.is_empty() {
         return ResumeVerdict::Skip;
     }
-    // Staged parquet is uuid-named by the writer, so nobody else can produce
-    // those paths — live ⇒ our commit landed.
-    if entry.adds.iter().all(|a| live.contains_key(a.path.as_str())) {
-        return ResumeVerdict::AlreadyLanded;
+    if let Some(verdict) = resume_precheck(entry, table_name, now_secs, live) {
+        return verdict;
     }
     if !entry.target_paths.iter().all(|p| live.contains_key(p.as_str())) {
         return ResumeVerdict::Stale;
@@ -6410,11 +6385,7 @@ fn select_coordinator_compaction_candidates(mut candidates: Vec<TailAdd>, target
     // The pair floor must apply to the limit the loop actually uses, not only to
     // `target`: whichever budget wins, a bin that cannot hold two files retires
     // nothing and its cell re-enqueues forever.
-    let pair_floor = {
-        let mut sizes: Vec<i64> = candidates.iter().map(|add| add.size).collect();
-        sizes.sort_unstable();
-        sizes.iter().take(2).sum::<i64>()
-    };
+    let pair_floor = candidates.iter().map(|add| add.size).k_smallest(2).sum::<i64>();
     let limit = if has_unsorted { unsorted_bin_budget_bytes() } else { target }.max(pair_floor);
     // SMALLEST FIRST, not event-time: the loop pushes its first candidate
     // unconditionally, so in event-time order one large file can fill the budget
@@ -7945,11 +7916,7 @@ impl ProjectRoutingTable {
         let mut delta_only_filters = optimized_filters.to_vec();
         let delta_table = self.database.resolve_table(project_id, &self.table_name).await?;
         let table = delta_table.read().await;
-        let (verdict, certified_dates) = match query_time_range {
-            _ if dedup_keys.is_empty() || !self.database.config.maintenance.timefusion_read_dedup_skip_swept => (DedupSkipVerdict::Disabled, HashSet::new()),
-            None => (DedupSkipVerdict::NoWindow, HashSet::new()),
-            Some(w) => self.database.dedup_window_certified(&table, project_id, &self.table_name, w),
-        };
+        let (verdict, certified_dates) = self.dedup_skip_certified(&table, project_id, query_time_range, dedup_keys);
         let skip_dedup = pre_skip_dedup && verdict.granted();
         // Partial certification → the certified dates still skip. Only sound on
         // the Delta-only path, where no MemBuffer leg can hold an uncertified
@@ -8244,11 +8211,8 @@ impl ProjectRoutingTable {
         // Variant inner storage may be Struct{Binary,Binary} or
         // Struct{BinaryView,BinaryView} depending on which session built the plan;
         // the kernels accept both, so coercing Variant fields is pure overhead.
-        let differs = |plan_field: &arrow_schema::Field, target_field: &arrow_schema::Field| -> bool {
-            if plan_field.data_type() == target_field.data_type() {
-                return false;
-            }
-            !crate::schema::is_variant_type(target_field.data_type())
+        let differs = |plan_field: &arrow_schema::Field, target_field: &arrow_schema::Field| {
+            plan_field.data_type() != target_field.data_type() && !crate::schema::is_variant_type(target_field.data_type())
         };
 
         if !plan_schema.fields().iter().zip(target_schema.fields()).any(|(plan_field, target_field)| differs(plan_field, target_field)) {
@@ -8272,19 +8236,26 @@ impl ProjectRoutingTable {
     }
 
     /// True iff every `(project, date)` partition in the query window carries a clean fingerprint
-    /// that still matches the live file set.
+    /// that still matches the live file set, plus the certified subset for a partial (per-date) skip.
     ///
     /// Only consulted on Delta-only paths; mem∪delta overlap still needs `DedupExec`.
-    fn dedup_skip_allowed(&self, table: &DeltaTable, project_id: &str, window: Option<(i64, i64)>, dedup_keys: &[String]) -> DedupSkipVerdict {
-        if dedup_keys.is_empty() || !self.database.config.maintenance.timefusion_read_dedup_skip_swept {
-            return DedupSkipVerdict::Disabled;
+    ///
+    /// `version_append` (merge-on-read) is NOT a reason to refuse: on a partition
+    /// the sweep certified duplicate-free there is exactly one winning row per key
+    /// (the sweep collapses versions keep-greatest), and `filter_tombstones` runs
+    /// outside `match dedup_on`, so a skip cannot resurrect a deleted row.
+    fn dedup_skip_certified(
+        &self, table: &DeltaTable, project_id: &str, window: Option<(i64, i64)>, dedup_keys: &[String],
+    ) -> (DedupSkipVerdict, HashSet<String>) {
+        match window {
+            _ if dedup_keys.is_empty() || !self.database.config.maintenance.timefusion_read_dedup_skip_swept => (DedupSkipVerdict::Disabled, HashSet::new()),
+            None => (DedupSkipVerdict::NoWindow, HashSet::new()),
+            Some(w) => self.database.dedup_window_certified(table, project_id, &self.table_name, w),
         }
-        // `version_append` (merge-on-read) is NOT a reason to refuse: on a partition
-        // the sweep certified duplicate-free there is exactly one winning row per key
-        // (the sweep collapses versions keep-greatest), and `filter_tombstones` runs
-        // outside `match dedup_on`, so a skip cannot resurrect a deleted row.
-        let Some(window) = window else { return DedupSkipVerdict::NoWindow };
-        self.database.dedup_window_clean(table, project_id, &self.table_name, window)
+    }
+
+    fn dedup_skip_allowed(&self, table: &DeltaTable, project_id: &str, window: Option<(i64, i64)>, dedup_keys: &[String]) -> DedupSkipVerdict {
+        self.dedup_skip_certified(table, project_id, window, dedup_keys).0
     }
 
     /// Extract time range (min, max) from query filters.
@@ -8737,10 +8708,7 @@ enum PrefilterDecision {
 /// nonmatching row could be removed while an older matching row remains in memory
 /// or an uncovered file. They require global candidate discovery or winner masks.
 fn routed_touches_mutable(mutable: Option<&HashSet<String>>, tree: Option<&crate::tantivy::udf::PredNode>) -> bool {
-    match (mutable, tree) {
-        (Some(m), Some(t)) => t.columns().iter().any(|c| m.contains(*c)),
-        _ => false,
-    }
+    mutable.zip(tree).is_some_and(|(m, t)| t.columns().iter().any(|c| m.contains(*c)))
 }
 
 /// Why one slice's coverage was refused. Mirrors `slice_coverage_agrees`'s FALSE branches.
@@ -9069,7 +9037,6 @@ impl TableProvider for ProjectRoutingTable {
         if let Some(tree) = text_match_tree.as_ref()
             && let Some(svc) = self.database.tantivy_search()
         {
-            use datafusion::logical_expr::{Expr, lit};
             let tcfg = &self.database.config().tantivy;
             let max_hits = tcfg.prefilter_max_hits();
             let min_sel_pct = tcfg.prefilter_min_selectivity_pct() as u64;
@@ -9105,11 +9072,7 @@ impl TableProvider for ProjectRoutingTable {
                     PrefilterDecision::Used { ids, covered_files, exclude_files, row_selections } => {
                         crate::observability::record_tantivy_prefilter_used();
                         metrics::counter!(scan_metric_names::PREFILTER_USED).increment(1);
-                        tantivy_id_filter = Some(Expr::InList(datafusion::logical_expr::expr::InList {
-                            expr: Box::new(datafusion::logical_expr::col("id")),
-                            list: ids.into_iter().map(lit).collect(),
-                            negated: false,
-                        }));
+                        tantivy_id_filter = Some(col("id").in_list(ids.into_iter().map(lit).collect(), false));
                         // Carry the coverage set forward and split against the snapshot taken at
                         // scan construction: a flush or compaction can commit in between.
                         tantivy_covered_files = Some(covered_files);
@@ -9168,15 +9131,12 @@ impl TableProvider for ProjectRoutingTable {
                 if missing.is_empty() {
                     (Some(p.clone()), None, None)
                 } else {
-                    let mut aug = p.clone();
-                    aug.extend(&missing);
-                    // Requested columns occupy the first p.len() positions of the augmented output.
-                    let mut out: Vec<usize> = (0..p.len()).collect();
-                    // The marker alone must survive DedupExec's projection restore.
+                    let aug: Vec<usize> = p.iter().chain(&missing).copied().collect();
+                    // The marker alone must survive DedupExec's projection restore; its index is
+                    // in `missing`, hence in `aug`, by construction. Requested columns occupy the
+                    // first p.len() positions of the augmented output.
                     let extra = tombstone.as_ref().and_then(|t| full_schema.index_of(t).ok()).filter(|i| !p.contains(i));
-                    if let Some(ti) = extra {
-                        out.push(aug.iter().position(|&i| i == ti).expect("just extended with it"));
-                    }
+                    let out: Vec<usize> = (0..p.len()).chain(extra.and_then(|ti| aug.iter().position(|&i| i == ti))).collect();
                     (Some(aug), Some(out), extra.map(|_| p.len()))
                 }
             }
@@ -9209,6 +9169,9 @@ impl TableProvider for ProjectRoutingTable {
         // preserve it, so no dedup key spans a date boundary.
         let wrap_result_split =
             |mut legs: Vec<(Arc<dyn ExecutionPlan>, crate::read::LegKind)>, skip_legs: Vec<Arc<dyn ExecutionPlan>>| -> DFResult<Arc<dyn ExecutionPlan>> {
+                fn union_or_single(mut plans: Vec<Arc<dyn ExecutionPlan>>) -> DFResult<Arc<dyn ExecutionPlan>> {
+                    Ok(if plans.len() == 1 { plans.remove(0) } else { UnionExec::try_new(plans)? as Arc<dyn ExecutionPlan> })
+                }
                 // A leg pruned to nothing bottoms out in an EmptyExec, which declares no output
                 // ordering, and one such leg would veto `merge_req` below (Delta legs are
                 // unsortable) — costing the SPM and forcing DedupExec into full-set mode. An
@@ -9228,11 +9191,7 @@ impl TableProvider for ProjectRoutingTable {
                 // dates' files entirely). Everything below indexes `plans[0]`, so without this
                 // the scan panics. The certified legs need no dedup, only the projection debt.
                 if legs.is_empty() && !skip_legs.is_empty() {
-                    let mut projected = skip_legs.into_iter().map(&pay_projection).collect::<DFResult<Vec<_>>>()?;
-                    return finish(match projected.len() {
-                        1 => projected.remove(0),
-                        _ => UnionExec::try_new(projected)? as Arc<dyn ExecutionPlan>,
-                    });
+                    return finish(union_or_single(skip_legs.into_iter().map(&pay_projection).collect::<DFResult<Vec<_>>>()?)?);
                 }
                 let leg_sortable: Vec<bool> = legs.iter().map(|(_, k)| k.sortable()).collect();
                 let legs: Vec<Arc<dyn ExecutionPlan>> = legs
@@ -9244,7 +9203,7 @@ impl TableProvider for ProjectRoutingTable {
                     .collect();
                 let shape = *scan_state.lock();
                 let us = scan_start.elapsed().as_micros() as u64;
-                scan_metrics.record_scan(us, shape.skipped_delta, shape.has_mem, shape.has_delta, shape.fast_resolve_hit, shape.skip_dedup, skip_verdict);
+                scan_metrics.record_scan(us, shape, skip_verdict);
                 let dedup_on = !dedup_keys.is_empty() && !shape.skip_dedup;
                 let mut plans = legs;
                 // Merge-on-read prerequisite: keep-greatest only engages while the input still
@@ -9282,11 +9241,10 @@ impl TableProvider for ProjectRoutingTable {
                 }
                 // `plans` is non-empty on every known path; erroring rather than indexing turns
                 // an impossible state into a failed query instead of a panicked one.
-                let plan = match plans.len() {
-                    0 => return Err(datafusion::error::DataFusionError::Execution(format!("scan produced no legs to union (project_id={project_id})"))),
-                    1 => plans.remove(0),
-                    _ => UnionExec::try_new(plans)?,
-                };
+                if plans.is_empty() {
+                    return Err(datafusion::error::DataFusionError::Execution(format!("scan produced no legs to union (project_id={project_id})")));
+                }
+                let plan = union_or_single(plans)?;
                 let plan = match merge_req.clone() {
                     Some(req) => Arc::new(datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec::new(req, plan)),
                     None => plan,
@@ -9303,10 +9261,7 @@ impl TableProvider for ProjectRoutingTable {
                 // projection debt as the `dedup_on == false` branch above.
                 let plan = match skip_legs.is_empty() {
                     true => plan,
-                    false => {
-                        let all = std::iter::once(Ok(plan)).chain(skip_legs.into_iter().map(&pay_projection)).collect::<DFResult<Vec<_>>>()?;
-                        UnionExec::try_new(all)? as Arc<dyn ExecutionPlan>
-                    }
+                    false => union_or_single(std::iter::once(Ok(plan)).chain(skip_legs.into_iter().map(&pay_projection)).collect::<DFResult<Vec<_>>>()?)?,
                 };
                 finish(plan)
             };
@@ -9406,18 +9361,11 @@ impl TableProvider for ProjectRoutingTable {
         // direction only: an over-admitted row is a duplicate DedupExec collapses, an
         // under-admitted one is a stale read.
         let mut delta_filters = optimized_filters.clone();
-        let ts_cmp = |op: Operator, t: i64| {
-            Box::new(Expr::BinaryExpr(BinaryExpr {
-                left: Box::new(col("timestamp")),
-                op,
-                right: Box::new(lit(ScalarValue::TimestampMicrosecond(Some(t), Some("UTC".into())))),
-            }))
-        };
+        let ts_us = |t: i64| lit(ScalarValue::TimestampMicrosecond(Some(t), Some("UTC".into())));
+        let ts_cmp = |op: Operator, t: i64| Expr::BinaryExpr(BinaryExpr { left: Box::new(col("timestamp")), op, right: Box::new(ts_us(t)) });
         // NOT (ts >= start AND ts < end)  ≡  (ts < start) OR (ts >= end)
         delta_filters.extend(
-            crate::write::mem_buffer::merge_ranges(mem_ranges)
-                .into_iter()
-                .map(|(start, end)| Expr::BinaryExpr(BinaryExpr { left: ts_cmp(Operator::Lt, start), op: Operator::Or, right: ts_cmp(Operator::GtEq, end) })),
+            crate::write::mem_buffer::merge_ranges(mem_ranges).into_iter().map(|(start, end)| ts_cmp(Operator::Lt, start).or(ts_cmp(Operator::GtEq, end))),
         );
         let resolve_span = tracing::trace_span!(parent: &span, "resolve_delta_table");
         let resolved = self.database.try_fast_resolve(&project_id, &self.table_name);
@@ -9450,10 +9398,6 @@ impl TableProvider for ProjectRoutingTable {
         // favours the freshest copy of a row.
         use crate::read::LegKind;
         wrap_result(std::iter::once((mem_plan, LegKind::Mem)).chain(delta_plans.into_iter().map(|p| (p, LegKind::Delta))).collect())
-    }
-
-    fn statistics(&self) -> Option<Statistics> {
-        None
     }
 }
 

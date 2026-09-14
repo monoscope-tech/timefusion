@@ -151,15 +151,13 @@ fn finish_writer(index: &Index, mut writer: IndexWriter, mut stats: IndexBuildSt
 
 fn index_batch(built: &BuiltSchema, writer: &mut IndexWriter, batch: &RecordBatch, stats: &mut IndexBuildStats) -> Result<()> {
     let schema = batch.schema();
-    let ts_idx = schema.index_of("timestamp").map_err(|e| anyhow!("missing timestamp column: {e}"))?;
-    let id_idx = schema.index_of("id").map_err(|e| anyhow!("missing id column: {e}"))?;
-
-    let ts_col = batch
-        .column(ts_idx)
+    let idx_of = |name: &str| schema.index_of(name).map_err(|e| anyhow!("missing {name} column: {e}"));
+    let ts_any = batch.column(idx_of("timestamp")?);
+    let id_col = batch.column(idx_of("id")?);
+    let ts_col = ts_any
         .as_any()
         .downcast_ref::<TimestampMicrosecondArray>()
-        .ok_or_else(|| anyhow!("timestamp column is not TimestampMicrosecondArray (got {:?})", batch.column(ts_idx).data_type()))?;
-    let id_col = batch.column(id_idx);
+        .ok_or_else(|| anyhow!("timestamp column is not TimestampMicrosecondArray (got {:?})", ts_any.data_type()))?;
     anyhow::ensure!(ts_col.null_count() == 0, "index timestamp column contains nulls");
     for name in built.element_fields() {
         anyhow::ensure!(schema.index_of(&name).is_ok(), "missing element index column: {name}");
@@ -256,7 +254,8 @@ impl ColKind {
         Ok(match self {
             Self::Utf8 => Some(col.as_any().downcast_ref::<StringArray>().context("utf8 cast")?.value(row).to_string()),
             Self::Utf8View => Some(col.as_any().downcast_ref::<StringViewArray>().context("utf8view cast")?.value(row).to_string()),
-            Self::ListUtf8 => Some(list_to_text(col.as_any().downcast_ref::<ListArray>().context("list cast")?, row)?),
+            // Space-join, not "skip when empty": empty elements are real terms.
+            Self::ListUtf8 => Some(list_strs(&col.as_any().downcast_ref::<ListArray>().context("list cast")?.value(row))?.join(" ")),
             Self::VariantJson(array) => prepared_variant_to_text(array, row, false)?,
             Self::VariantKv(array) => prepared_variant_to_text(array, row, true)?,
         })
@@ -272,11 +271,6 @@ fn list_strs(inner: &ArrayRef) -> Result<impl Iterator<Item = &str>> {
     } else {
         bail!("list element type unsupported for tantivy: {:?}", inner.data_type())
     }
-}
-
-fn list_to_text(arr: &ListArray, row: usize) -> Result<String> {
-    // Space-join, not "skip when empty": empty elements are real terms.
-    Ok(list_strs(&arr.value(row))?.join(" "))
 }
 
 /// Render one Variant row to text. `kv=false` → canonical JSON, produced by the
@@ -618,17 +612,21 @@ pub struct UserField {
     pub source: FieldDef,
 }
 
+/// Columns declared `tantivy.indexed: true`, paired with their config — the one
+/// definition shared by schema building and the committed-file rebuild's parquet
+/// projection, so the set indexed and the set decoded cannot drift apart.
+fn indexed_fields(table: &TableSchema) -> impl Iterator<Item = (&FieldDef, &TantivyFieldConfig)> {
+    table.fields.iter().filter_map(|fd| Some((fd, fd.tantivy.as_ref().filter(|cfg| cfg.indexed)?)))
+}
+
 pub fn build_for_table(table: &TableSchema) -> BuiltSchema {
     let mut b = SchemaBuilder::new();
     let timestamp = b.add_i64_field(TS_FIELD, NumericOptions::default() | STORED | FAST | INDEXED);
     let id = b.add_text_field(ID_FIELD, raw_id_options());
     let row_ordinal = b.add_u64_field(ROW_ORDINAL_FIELD, NumericOptions::default() | FAST);
 
-    let user_fields: HashMap<_, _> = table
-        .fields
-        .iter()
-        .filter(|fd| fd.name != TS_FIELD && fd.name != ID_FIELD)
-        .filter_map(|fd| fd.tantivy.as_ref().filter(|cfg| cfg.indexed).map(|cfg| (fd, cfg)))
+    let user_fields: HashMap<_, _> = indexed_fields(table)
+        .filter(|(fd, _)| fd.name != TS_FIELD && fd.name != ID_FIELD)
         .map(|(fd, cfg)| (fd.name.clone(), UserField { field: b.add_text_field(&fd.name, text_options_for(cfg)), source: fd.clone() }))
         .collect();
     BuiltSchema { schema: b.build(), timestamp, id, row_ordinal, user_fields }
@@ -678,7 +676,7 @@ pub fn register_tokenizers(index: &Index) {
 
 /// Helper for tests and pushdown rule: which user fields are configured?
 pub fn indexed_field_names(table: &TableSchema) -> Vec<String> {
-    table.fields.iter().filter(|f| f.tantivy.as_ref().is_some_and(|t| t.indexed)).map(|f| f.name.clone()).collect()
+    indexed_fields(table).map(|(f, _)| f.name.clone()).collect()
 }
 
 // ===== manifest =====
@@ -719,7 +717,7 @@ impl Manifest {
         anyhow::ensure!(paths.len() == files.len(), "histogram snapshot has duplicate physical file paths");
         let mut selected = BTreeMap::new();
         for (key, entry) in &self.entries {
-            if entry.schema_version != SCHEMA_VERSION || entry.index.is_none() || entry.error.is_some() || !entry.ordinals_valid {
+            if !entry.is_usable() || !entry.ordinals_valid {
                 continue;
             }
             let [source] = entry.covered_files.as_slice() else { continue };
@@ -831,13 +829,16 @@ pub async fn mutate<R, F: FnOnce(&mut Manifest) -> (R, bool)>(store: &dyn Object
 }
 
 impl ManifestEntry {
+    /// A successfully built index at the current schema version — the minimum
+    /// for an entry to be evidence that a file is covered.
+    fn is_usable(&self) -> bool {
+        self.index.is_some() && self.error.is_none() && self.schema_version == SCHEMA_VERSION
+    }
     /// Whether this entry has the list representation requested by the table.
     /// Used by both the coverage census and maintenance backfill.
     /// Element histograms also require one-file physical ordinal coverage.
     pub fn covers_current_elements(&self, table: &TableSchema) -> bool {
-        self.index.is_some()
-            && self.error.is_none()
-            && self.schema_version == SCHEMA_VERSION
+        self.is_usable()
             && (self.element_fields.is_empty() || (self.ordinals_valid && self.covered_files.len() == 1))
             && self.element_fields == element_field_names(&table.fields)
     }
@@ -949,8 +950,7 @@ pub async fn build_parquet_and_pack(
     let reader = ParquetObjectReader::new(store, path).with_file_size(meta.size);
     // Decode exactly the columns the index consumes — same index schema and
     // every physical row, without reading unrelated column chunks.
-    let fields: std::collections::HashSet<&str> =
-        table.fields.iter().filter_map(|f| f.tantivy.as_ref()?.indexed.then_some(f.name.as_str())).chain(["timestamp", "id"]).collect();
+    let fields: std::collections::HashSet<&str> = indexed_fields(table).map(|(f, _)| f.name.as_str()).chain(["timestamp", "id"]).collect();
     let builder = ParquetRecordBatchStreamBuilder::new(reader).await.context("parquet stream builder")?;
     let columns = builder.schema().fields().iter().enumerate().filter_map(|(index, field)| fields.contains(field.name().as_str()).then_some(index));
     let projection = ProjectionMask::roots(builder.parquet_schema(), columns);

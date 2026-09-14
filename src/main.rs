@@ -72,19 +72,16 @@ fn main() -> anyhow::Result<()> {
         Some("migrate-columns") => rt.block_on(run_migrate_columns_cli(cfg)),
         Some("run-unit") => rt.block_on(run_unit_cli(cfg)),
         Some("retention") => rt.block_on(run_retention_cli(cfg)),
-        _ => {
-            let result = rt.block_on(async_main(cfg));
-            // Must END THE PROCESS here: dropping the runtime waits on lingering
-            // blocking/detached threads and can hang forever. Everything durable
-            // is already on disk.
-            match result {
-                Ok(()) => std::process::exit(0),
-                Err(e) => {
-                    eprintln!("fatal: {e:#}");
-                    std::process::exit(1)
-                }
+        // Must END THE PROCESS here: dropping the runtime waits on lingering
+        // blocking/detached threads and can hang forever. Everything durable
+        // is already on disk.
+        _ => match rt.block_on(async_main(cfg)) {
+            Ok(()) => std::process::exit(0),
+            Err(e) => {
+                eprintln!("fatal: {e:#}");
+                std::process::exit(1)
             }
-        }
+        },
     }
 }
 
@@ -146,20 +143,20 @@ fn pgwire_ready_at(addr: std::net::SocketAddr) -> anyhow::Result<()> {
         println!("probe connect_ms={connect_ms} write_ms={write_ms} auth_ms={auth_ms} total_ms={total_ms} result=ok tag={}", tag[0] as char);
     }
     read?;
-    if tag[0] == b'R' {
-        return Ok(());
+    match tag[0] {
+        b'R' => Ok(()),
+        b'E' => {
+            let mut length = [0u8; 4];
+            stream.read_exact(&mut length)?;
+            let payload_len = u32::from_be_bytes(length).saturating_sub(4) as usize;
+            anyhow::ensure!(payload_len <= 64 * 1024, "PGWire ErrorResponse is unreasonably large");
+            let mut payload = vec![0; payload_len];
+            stream.read_exact(&mut payload)?;
+            anyhow::ensure!(payload.windows(7).any(|field| field == b"C57P03\0"), "PGWire returned a non-startup error");
+            Ok(())
+        }
+        other => anyhow::bail!("PGWire returned unexpected response tag {:?}", other as char),
     }
-    if tag[0] == b'E' {
-        let mut length = [0u8; 4];
-        stream.read_exact(&mut length)?;
-        let payload_len = u32::from_be_bytes(length).saturating_sub(4) as usize;
-        anyhow::ensure!(payload_len <= 64 * 1024, "PGWire ErrorResponse is unreasonably large");
-        let mut payload = vec![0; payload_len];
-        stream.read_exact(&mut payload)?;
-        anyhow::ensure!(payload.windows(7).any(|field| field == b"C57P03\0"), "PGWire returned a non-startup error");
-        return Ok(());
-    }
-    anyhow::bail!("PGWire returned unexpected response tag {:?}", tag[0] as char)
 }
 
 /// Argument cursor shared by every subcommand CLI below: `next()` yields the

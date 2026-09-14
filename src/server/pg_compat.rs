@@ -300,9 +300,8 @@ impl PgCompatibilityHook {
         };
         let name = variable.iter().map(|ident| ident.value.to_ascii_lowercase()).collect::<Vec<_>>().join(".");
         let value = match name.as_str() {
-            "server_version" => PG_COMPAT_VERSION.to_string(),
-            "server_version_num" => PG_COMPAT_VERSION_NUM.to_string(),
-            "is_superuser" => "on".to_string(),
+            // Delegated so SHOW and `current_setting()` can never disagree.
+            "server_version" | "server_version_num" | "is_superuser" => compatibility_setting(&name, self.max_statement_secs)?,
             // `search_path` is deliberately NOT answered here: `SetShowHook`
             // behind this hook returns the session's actual value; a constant
             // here would report `public` to clients that switched schema.
@@ -563,26 +562,24 @@ impl PgShowAllSettingsFunction {
         let repeat = |value: &str| strings(vec![Some(value.to_string()); n]);
         let nulls = strings(vec![None; n]);
         let settings = strings(rows.iter().map(|(_, value)| Some(value.clone())).collect());
-        let columns = vec![
-            strings(rows.iter().map(|(name, _)| Some((*name).to_string())).collect()),
-            Arc::clone(&settings),
-            Arc::clone(&nulls),
-            Arc::clone(&nulls),
-            Arc::clone(&nulls),
-            Arc::clone(&nulls),
-            repeat("user"),
-            strings(rows.iter().map(|(_, value)| Some(if matches!(value.as_str(), "on" | "off") { "bool" } else { "string" }.to_string())).collect()),
-            repeat("default"),
-            Arc::clone(&nulls),
-            Arc::clone(&nulls),
-            Arc::clone(&nulls),
-            Arc::clone(&settings),
-            settings,
-            nulls,
-            Arc::new(Int32Array::from(vec![None::<i32>; n])) as ArrayRef,
-            Arc::new(BooleanArray::from(vec![Some(false); n])) as ArrayRef,
-        ];
-        RecordBatch::try_new(Self::schema(), columns).map_err(Into::into)
+        let schema = Self::schema();
+        let columns = schema
+            .fields()
+            .iter()
+            .map(|field| match field.name().as_str() {
+                "name" => strings(rows.iter().map(|(name, _)| Some((*name).to_string())).collect()),
+                "setting" | "boot_val" | "reset_val" => Arc::clone(&settings),
+                "context" => repeat("user"),
+                "vartype" => {
+                    strings(rows.iter().map(|(_, value)| Some(if matches!(value.as_str(), "on" | "off") { "bool" } else { "string" }.to_string())).collect())
+                }
+                "source" => repeat("default"),
+                "sourceline" => Arc::new(Int32Array::from(vec![None::<i32>; n])) as ArrayRef,
+                "pending_restart" => Arc::new(BooleanArray::from(vec![Some(false); n])) as ArrayRef,
+                _ => Arc::clone(&nulls),
+            })
+            .collect::<Vec<_>>();
+        RecordBatch::try_new(schema, columns).map_err(Into::into)
     }
 }
 
@@ -755,6 +752,13 @@ fn or_null<T: ToString>(v: Option<T>) -> String {
     v.map_or_else(|| "null".to_string(), |v| v.to_string())
 }
 
+/// `with_*(v)` wiring setters: each fills one optional field and returns `self`.
+macro_rules! opt_setters {
+    ($($name:ident($field:ident: $ty:ty)),* $(,)?) => {
+        $(pub fn $name(self, v: $ty) -> Self { Self { $field: Some(v), ..self } })*
+    };
+}
+
 #[derive(derive_more::Debug)]
 #[debug("StatsTableProvider {{ layer: {layer:?}, scan_metrics: {scan_metrics:?}, .. }}")]
 pub struct StatsTableProvider {
@@ -790,28 +794,16 @@ impl StatsTableProvider {
         }
     }
 
-    pub fn with_scan_metrics(self, m: Arc<ScanMetrics>) -> Self {
-        Self { scan_metrics: Some(m), ..self }
-    }
-
-    pub fn with_cache_sizes(self, f: CacheSizeSnapshot) -> Self {
-        Self { cache_sizes: Some(f), ..self }
-    }
-
-    pub fn with_foyer_stats(self, f: FoyerStatsSnapshot) -> Self {
-        Self { foyer_stats: Some(f), ..self }
-    }
-
-    pub fn with_query_pool(self, f: PoolSnapshot) -> Self {
-        Self { query_pool: Some(f), ..self }
+    opt_setters! {
+        with_scan_metrics(scan_metrics: Arc<ScanMetrics>),
+        with_cache_sizes(cache_sizes: CacheSizeSnapshot),
+        with_foyer_stats(foyer_stats: FoyerStatsSnapshot),
+        with_query_pool(query_pool: PoolSnapshot),
+        with_logical_count(logical_count: LogicalCountSnapshot),
     }
 
     pub fn with_maintenance_pools(self, maintenance: PoolSnapshot, coordinator: PoolSnapshot) -> Self {
         Self { maintenance_pool: Some(maintenance), coordinator_pool: Some(coordinator), ..self }
-    }
-
-    pub fn with_logical_count(self, f: LogicalCountSnapshot) -> Self {
-        Self { logical_count: Some(f), ..self }
     }
 
     /// Absent service ⇒ the `tantivy` component is omitted entirely, rather
@@ -907,8 +899,9 @@ impl StatsTableProvider {
                         // Parked payloads, invisible to wal_disk_bytes. Alert if > 0.
                         "quarantine_files" => s.quarantine_files,
                         "quarantine_mb" => mb(s.quarantine_bytes as f64),
+                        "shards_per_topic" => s.wal_shards_per_topic,
+                        "known_topics" => s.wal_known_topics,
                     ],
-                    rows!["wal"; "shards_per_topic" => s.wal_shards_per_topic, "known_topics" => s.wal_known_topics],
                 ]
                 .into_iter()
                 .flatten()
@@ -931,12 +924,11 @@ impl StatsTableProvider {
             .into_iter()
             .chain([("maintenance", "retry_reason".to_owned(), crate::observability::maintenance_retry_reason())])
             // Derived from the bucket lists, never hand-listed: a reason added
-            // without a row would be silently unattributable.
-            .chain(crate::database::rollup_unverifiable::gauge_rows().map(|(key, value)| ("maintenance", key, value.to_string())))
-            // Same shape: one row per (operation, retry reason) actually seen.
+            // without a row would be silently unattributable. The retry/work rows
+            // that follow have the same shape — one row per (operation, reason) seen.
             .chain(
-                crate::observability::maintenance_retry_rows()
-                    .into_iter()
+                crate::database::rollup_unverifiable::gauge_rows()
+                    .chain(crate::observability::maintenance_retry_rows())
                     .chain(crate::observability::maintenance_work_rows())
                     .map(|(key, value)| ("maintenance", key, value.to_string())),
             )

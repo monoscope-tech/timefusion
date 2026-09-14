@@ -73,9 +73,8 @@ pub const MAX_OPERATION_DEADLINE_SECS: u64 = operation_deadline_secs(Operation::
 /// whole input is downloaded, decoded and spilled.
 pub const fn operation_deadline_secs(operation: Operation) -> u64 {
     match operation {
-        Operation::Dedup => 15 * 60,
         Operation::Repair => 60 * 60,
-        Operation::HotPacking | Operation::SealedConsolidation | Operation::BaseRollup | Operation::DerivedRollup => 15 * 60,
+        Operation::Dedup | Operation::HotPacking | Operation::SealedConsolidation | Operation::BaseRollup | Operation::DerivedRollup => 15 * 60,
     }
 }
 
@@ -708,10 +707,13 @@ impl TaskJournal {
         Some(done)
     }
 
-    /// Apply `edit` to every task `select` accepts, returning how many changed.
-    fn edit_tasks(&mut self, select: impl Fn(&MaintenanceTask) -> bool, edit: impl Fn(&mut MaintenanceTask)) -> usize {
+    /// Apply `edit` to every task `select` accepts, marking each dirty and
+    /// returning how many changed.
+    fn edit_tasks(&mut self, select: impl Fn(&MaintenanceTask) -> bool, mut edit: impl FnMut(&mut MaintenanceTask)) -> usize {
+        let dirty = &mut self.dirty_tasks;
         self.snapshot.tasks.iter_mut().filter(|task| select(task)).fold(0usize, |changed, task| {
             edit(task);
+            dirty.insert(task.key.clone());
             changed + 1
         })
     }
@@ -746,38 +748,37 @@ impl TaskJournal {
     /// with one aligned hour task. Completed publications are not rewritten.
     pub fn migrate_derived_slices(&mut self) -> usize {
         let mut replacements: HashMap<TaskKey, (i64, u64, u64)> = HashMap::new();
-        let dirty = &mut self.dirty_tasks;
-        let candidates = self.snapshot.tasks.iter_mut().filter(|task| {
-            // A SPLIT CHILD is not a legacy fragment: collapsing one back to its
-            // hour erases the bisection ladder and re-enqueues the parent key,
-            // which `enqueue_inner` resurrects to Pending — an endless loop.
-            // `parent_measured_bytes` is set only by `split_time_task`, so it is
-            // the exact discriminator.
-            //
-            // NARROWER than an hour, not merely "not an hour": the replacement
-            // key below is the single hour containing the slice START, so `!=`
-            // would collapse a day-wide unit to hour 00 and drop the other 23.
-            task.key.operation == Operation::DerivedRollup
-                && task.key.slice.width() < DERIVED_SLICE_MICROS
-                && task.parent_measured_bytes.is_none()
-                && !matches!(task.state, TaskState::Complete | TaskState::Superseded)
-        });
-        let migrated = candidates.fold(0usize, |migrated, task| {
-            let start = task.key.slice.start_micros.div_euclid(DERIVED_SLICE_MICROS) * DERIVED_SLICE_MICROS;
-            let key = TaskKey { slice: TimeSlice { start_micros: start, end_micros: start.saturating_add(DERIVED_SLICE_MICROS) }, ..task.key.clone() };
-            replacements
-                .entry(key)
-                .and_modify(|(deadline, estimate, created)| {
-                    *deadline = (*deadline).min(task.deadline_micros);
-                    *estimate = estimate.saturating_add(task.estimated_decoded_bytes);
-                    *created = (*created).min(task.created_unix_ms);
-                })
-                .or_insert((task.deadline_micros, task.estimated_decoded_bytes, task.created_unix_ms));
-            task.state = TaskState::Superseded;
-            task.retry_reason = Some("migrated_to_aligned_hour_slice".to_owned());
-            dirty.insert(task.key.clone());
-            migrated.saturating_add(1)
-        });
+        let migrated = self.edit_tasks(
+            |task| {
+                // A SPLIT CHILD is not a legacy fragment: collapsing one back to its
+                // hour erases the bisection ladder and re-enqueues the parent key,
+                // which `enqueue_inner` resurrects to Pending — an endless loop.
+                // `parent_measured_bytes` is set only by `split_time_task`, so it is
+                // the exact discriminator.
+                //
+                // NARROWER than an hour, not merely "not an hour": the replacement
+                // key below is the single hour containing the slice START, so `!=`
+                // would collapse a day-wide unit to hour 00 and drop the other 23.
+                task.key.operation == Operation::DerivedRollup
+                    && task.key.slice.width() < DERIVED_SLICE_MICROS
+                    && task.parent_measured_bytes.is_none()
+                    && !matches!(task.state, TaskState::Complete | TaskState::Superseded)
+            },
+            |task| {
+                let start = task.key.slice.start_micros.div_euclid(DERIVED_SLICE_MICROS) * DERIVED_SLICE_MICROS;
+                let key = TaskKey { slice: TimeSlice { start_micros: start, end_micros: start.saturating_add(DERIVED_SLICE_MICROS) }, ..task.key.clone() };
+                replacements
+                    .entry(key)
+                    .and_modify(|(deadline, estimate, created)| {
+                        *deadline = (*deadline).min(task.deadline_micros);
+                        *estimate = estimate.saturating_add(task.estimated_decoded_bytes);
+                        *created = (*created).min(task.created_unix_ms);
+                    })
+                    .or_insert((task.deadline_micros, task.estimated_decoded_bytes, task.created_unix_ms));
+                task.state = TaskState::Superseded;
+                task.retry_reason = Some("migrated_to_aligned_hour_slice".to_owned());
+            },
+        );
         for (key, (deadline, estimate, created)) in replacements {
             self.enqueue(key, deadline, estimate, created);
         }
@@ -1293,24 +1294,18 @@ impl TaskJournal {
     }
 
     pub fn prove_base_tier_for_day(&mut self, key: &TaskKey, day_start: i64, day_end: i64) -> usize {
-        let dirty = &mut self.dirty_tasks;
-        self.snapshot
-            .tasks
-            .iter_mut()
-            // Only work that can still run: proving a completed task is a no-op that would
-            // make the returned count read as progress.
-            .filter(|task| {
+        // Only work that can still run: proving a completed task is a no-op that would
+        // make the returned count read as progress.
+        self.edit_tasks(
+            |task| {
                 matches!(task.state, TaskState::Pending | TaskState::Retry)
                     && !task.base_tier_present
                     && Self::same_cell(&task.key, key)
                     && task.key.slice.start_micros >= day_start
                     && task.key.slice.end_micros <= day_end
-            })
-            .fold(0, |proven, task| {
-                task.base_tier_present = true;
-                dirty.insert(task.key.clone());
-                proven + 1
-            })
+            },
+            |task| task.base_tier_present = true,
+        )
     }
 
     /// Remember what a unit reads, measured by the claim-time preflight. Must be recorded on
@@ -1868,14 +1863,14 @@ impl TaskJournal {
     /// A process may die after selecting work. Running is not a durable lease;
     /// requeue it at boot so recovery produces redundant work, never a hole.
     pub fn requeue_running(&mut self, now_micros: i64) -> usize {
-        let dirty = &mut self.dirty_tasks;
-        self.snapshot.tasks.iter_mut().filter(|task| task.state == TaskState::Running).fold(0, |count, task| {
-            task.state = TaskState::Retry;
-            task.deadline_micros = now_micros;
-            task.retry_reason = Some("coordinator_restart".to_owned());
-            dirty.insert(task.key.clone());
-            count + 1
-        })
+        self.edit_tasks(
+            |task| task.state == TaskState::Running,
+            |task| {
+                task.state = TaskState::Retry;
+                task.deadline_micros = now_micros;
+                task.retry_reason = Some("coordinator_restart".to_owned());
+            },
+        )
     }
 
     pub fn tasks(&self) -> impl Iterator<Item = &MaintenanceTask> {
@@ -1931,26 +1926,22 @@ impl TaskJournal {
     /// Deliberately NOT `invalidate`: that would mint `Dedup` work, which a rollup rebuild
     /// says nothing about. Mints no task, so it cannot loop.
     pub fn reopen_derived_over(&mut self, project_id: &str, rollup_table: &str, start_micros: i64, end_micros: i64) -> usize {
-        let dirty = &mut self.dirty_tasks;
-        self.snapshot
-            .tasks
-            .iter_mut()
-            .filter(|task| {
+        self.edit_tasks(
+            |task| {
                 task.state == TaskState::Complete
                     && task.key.operation == Operation::DerivedRollup
                     && task.key.project_id == project_id
                     && task.key.physical_table == rollup_table
                     && task.key.slice.overlaps(start_micros, end_micros)
-            })
-            .fold(0, |reopened, task| {
+            },
+            |task| {
                 task.state = TaskState::Pending;
                 task.retry_reason = None;
                 // `Publication` is what coverage is recovered from at boot; leaving it would
                 // have the next process re-adopt the cell being replaced.
                 task.publication = None;
-                dirty.insert(task.key.clone());
-                reopened + 1
-            })
+            },
+        )
     }
 
     pub fn source_cursor(&self, source: &str) -> Option<u64> {

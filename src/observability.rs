@@ -298,10 +298,13 @@ pub fn init_metrics(
         })
         .build();
 
-    // Upgrade the Weak, snapshot stats, observe one derived value. Use `counter`
-    // for cumulative totals (OTel Sum, so rate() survives the restart-to-0) and
-    // `gauge` for point-in-time levels.
-    macro_rules! layer_metric {
+    // One observable metric. `|s| value` upgrades the Weak, snapshots stats and
+    // observes a derived value; a plain expression is read from a process-global
+    // atomic, evaluated once per export cycle. Use `counter` for cumulative
+    // totals — a counter, not a gauge, so `rate()` still reads correctly across
+    // the reset to zero that every deploy causes, and this service redeploys on
+    // any non-docs push — and `gauge` for point-in-time levels.
+    macro_rules! observe {
         (@build $method:ident, $id:literal, $desc:literal, |$s:ident| $value:expr) => {{
             let weak = buffered_layer.clone();
             meter
@@ -315,64 +318,50 @@ pub fn init_metrics(
                 })
                 .build();
         }};
-        (gauge $($rest:tt)+) => { layer_metric!(@build u64_observable_gauge, $($rest)+) };
-        (counter $($rest:tt)+) => { layer_metric!(@build u64_observable_counter, $($rest)+) };
-    }
-
-    /// Gauges sourced from a process-global atomic; `$read` is evaluated once
-    /// per export cycle.
-    macro_rules! atomic_gauge {
-        ($id:literal, $desc:literal, $read:expr) => {
-            meter.u64_observable_gauge($id).with_description($desc).with_callback(|obs| obs.observe($read, &[])).build();
+        (@build $method:ident, $id:literal, $desc:literal, $read:expr) => {
+            meter.$method($id).with_description($desc).with_callback(|obs| obs.observe($read, &[])).build();
         };
+        (gauge $($rest:tt)+) => { observe!(@build u64_observable_gauge, $($rest)+) };
+        (counter $($rest:tt)+) => { observe!(@build u64_observable_counter, $($rest)+) };
     }
 
-    /// Cumulative totals from a process-global atomic. A counter, not a gauge, so
-    /// `rate()` still reads correctly across the reset to zero that every deploy
-    /// causes — and this service redeploys on any non-docs push.
-    macro_rules! atomic_counter {
-        ($id:literal, $desc:literal, $read:expr) => {
-            meter.u64_observable_counter($id).with_description($desc).with_callback(|obs| obs.observe($read, &[])).build();
-        };
-    }
-
-    layer_metric!(gauge "timefusion.mem_buffer.pressure_pct", "MemBuffer memory pressure as percentage of max", |s| s.pressure_pct as u64);
-    layer_metric!(gauge "timefusion.mem_buffer.estimated_bytes", "MemBuffer estimated heap residency in bytes", |s| s.mem_estimated_bytes as u64);
-    layer_metric!(gauge "timefusion.mem_buffer.rows", "Total rows in MemBuffer across all projects/tables", |s| s.mem_total_rows as u64);
+    observe!(gauge "timefusion.mem_buffer.pressure_pct", "MemBuffer memory pressure as percentage of max", |s| s.pressure_pct as u64);
+    observe!(gauge "timefusion.mem_buffer.estimated_bytes", "MemBuffer estimated heap residency in bytes", |s| s.mem_estimated_bytes as u64);
+    observe!(gauge "timefusion.mem_buffer.rows", "Total rows in MemBuffer across all projects/tables", |s| s.mem_total_rows as u64);
     // Ingest vs drain: rate() these two and compare. `ingested` includes
     // WAL-recovered rows so the pair stays comparable after a restart.
-    layer_metric!(counter "timefusion.mem_buffer.rows_ingested_total", "Cumulative rows accepted into MemBuffer (incl. WAL recovery)", |s| s
+    observe!(counter "timefusion.mem_buffer.rows_ingested_total", "Cumulative rows accepted into MemBuffer (incl. WAL recovery)", |s| s
         .rows_ingested_total);
-    layer_metric!(counter "timefusion.mem_buffer.rows_flushed_total", "Cumulative rows drained from MemBuffer to Delta", |s| s.rows_flushed_total);
-    layer_metric!(gauge "timefusion.wal.disk_bytes", "Disk bytes occupied by WAL shards", |s| s.wal_disk_bytes);
-    layer_metric!(gauge "timefusion.wal.files", "Number of WAL segment files on disk", |s| s.wal_files as u64);
-    layer_metric!(gauge "timefusion.tantivy.recovery_pending_files", "Committed Parquet files awaiting post-WAL-replay Tantivy indexing", |s| s
+    observe!(counter "timefusion.mem_buffer.rows_flushed_total", "Cumulative rows drained from MemBuffer to Delta", |s| s.rows_flushed_total);
+    observe!(gauge "timefusion.wal.disk_bytes", "Disk bytes occupied by WAL shards", |s| s.wal_disk_bytes);
+    observe!(gauge "timefusion.wal.files", "Number of WAL segment files on disk", |s| s.wal_files as u64);
+    observe!(gauge "timefusion.tantivy.recovery_pending_files", "Committed Parquet files awaiting post-WAL-replay Tantivy indexing", |s| s
         .tantivy_recovery_pending_files
         as u64);
 
-    atomic_gauge!(
+    observe!(gauge
         "timefusion.tantivy.cache_disk_bytes",
         "Bytes under <data_dir>/tantivy_cache as of the most recent reap; 0 until the first one runs",
         TANTIVY_CACHE_BYTES.load(Relaxed)
     );
 
-    atomic_gauge!(
+    observe!(gauge
         "timefusion.runtime.scheduling_lag_ms",
         "How late a 500ms timer task actually woke — nonzero means workers are starved, which is what a missed health probe looks like from inside",
         RUNTIME_LAG_LAST_MS.load(Relaxed)
     );
-    atomic_gauge!(
+    observe!(gauge
         "timefusion.runtime.scheduling_lag_max_ms",
         "Worst scheduling lag this process lifetime; survives the spike so a post-mortem can still see it",
         RUNTIME_LAG_MAX_MS.load(Relaxed)
     );
 
-    atomic_gauge!(
+    observe!(gauge
         "timefusion.rollup.maintenance.pending_dirty_partitions",
         "Source partitions with durable rollup invalidations awaiting maintenance",
         maintenance_stats().rollup_dirty_partitions.load(Relaxed)
     );
-    atomic_gauge!(
+    observe!(gauge
         "timefusion.rollup.maintenance.oldest_invalidation_age_seconds",
         "Age of the oldest durable rollup invalidation",
         maintenance_stats().rollup_oldest_invalidation_age_secs.load(Relaxed)
@@ -387,40 +376,40 @@ pub fn init_metrics(
     // and each restart erased the evidence. Meanwhile the metrics that DO have
     // history told the story immediately: over the same seven days
     // `pending_dirty_partitions` rose 340 -> 588 and `cron_long_running` tripled.
-    atomic_gauge!(
+    observe!(gauge
         "timefusion.maintenance.permit_held_without_staging_seconds",
         "Longest a hygiene permit has been held without reaching a sort. THE wedge signal: a wedged lane stops counting rather than counting badly, so every throughput metric goes quiet and quiet reads as healthy",
         maintenance_stats().permit_held_without_staging_secs.load(Relaxed)
     );
-    atomic_gauge!(
+    observe!(gauge
         "timefusion.maintenance.permits_available",
         "Free hygiene rewrite permits. Pinned at 0 while the lane is wedged",
         maintenance_stats().light_rewrite_permits_available.load(Relaxed)
     );
-    atomic_counter!(
+    observe!(counter
         "timefusion.maintenance.permits_acquired",
         "Hygiene permits taken. Frozen against a climbing permits_unavailable is the wedge; both climbing is healthy contention",
         maintenance_stats().compaction_permits_acquired.load(Relaxed)
     );
-    atomic_counter!(
+    observe!(counter
         "timefusion.maintenance.permits_unavailable",
         "Hygiene turns that found no free permit and gave up before claiming",
         maintenance_stats().compaction_permits_unavailable.load(Relaxed)
     );
     // Committed bins per lane — the drain rate. Quoting one without history is how
     // a working-window burst right after a restart gets reported as a sustained rate.
-    atomic_counter!(
+    observe!(counter
         "timefusion.maintenance.light_optimize_bins_committed",
         "Hot-pack and sealed-consolidation bins committed",
         maintenance_stats().light_optimize_bins_committed.load(Relaxed)
     );
-    atomic_counter!("timefusion.maintenance.dedup_bins_committed", "Dedup bins committed", maintenance_stats().dedup_bins_committed.load(Relaxed));
+    observe!(counter "timefusion.maintenance.dedup_bins_committed", "Dedup bins committed", maintenance_stats().dedup_bins_committed.load(Relaxed));
     // Queue depth per lane. Depth alone cannot tell slow from never-claimed —
     // pair it with the permit counters above, which is what settles starvation.
-    atomic_gauge!("timefusion.maintenance.pending_base_rollup", "BaseRollup units queued", maintenance_stats().pending_base_rollup.load(Relaxed));
-    atomic_gauge!("timefusion.maintenance.pending_dedup", "Dedup units queued", maintenance_stats().pending_dedup.load(Relaxed));
-    atomic_gauge!("timefusion.maintenance.pending_repair", "Repair units queued", maintenance_stats().pending_repair.load(Relaxed));
-    atomic_gauge!(
+    observe!(gauge "timefusion.maintenance.pending_base_rollup", "BaseRollup units queued", maintenance_stats().pending_base_rollup.load(Relaxed));
+    observe!(gauge "timefusion.maintenance.pending_dedup", "Dedup units queued", maintenance_stats().pending_dedup.load(Relaxed));
+    observe!(gauge "timefusion.maintenance.pending_repair", "Repair units queued", maintenance_stats().pending_repair.load(Relaxed));
+    observe!(gauge
         "timefusion.maintenance.sealed_compaction_debt_bytes",
         "Sealed compaction debt in DECODED bytes, not bytes on disk — roughly 12x the compressed footprint, and it is a stock of estimates that never decrements, so read it as a shape and never as a drain rate",
         maintenance_stats().sealed_compaction_debt_bytes.load(Relaxed)
@@ -810,16 +799,19 @@ pub fn record_commit_timeout(op: &'static str) {
 }
 
 /// Declares a process-global atomic-counter struct together with its all-zero
-/// static AND its `timefusion_stats` rows, so a counter cannot be declared
-/// without being exposed. The row key defaults to the field name; `field as
-/// "key"` pins a different one (usually a `_total` suffix).
+/// static, its `$accessor()` reader AND its `timefusion_stats` rows, so a
+/// counter cannot be declared without being exposed. The row key defaults to the
+/// field name; `field as "key"` pins a different one (usually a `_total` suffix).
 macro_rules! atomic_stats {
-    ($(#[$sm:meta])* $name:ident => $global:ident as $component:literal { $($(#[$fm:meta])* $field:ident $(as $key:literal)?),+ $(,)? }) => {
+    ($(#[$sm:meta])* $name:ident => $global:ident / $accessor:ident as $component:literal { $($(#[$fm:meta])* $field:ident $(as $key:literal)?),+ $(,)? }) => {
         $(#[$sm])*
         pub struct $name {
             $($(#[$fm])* pub $field: AtomicU64,)+
         }
         static $global: $name = $name { $($field: AtomicU64::new(0),)+ };
+        pub fn $accessor() -> &'static $name {
+            &$global
+        }
         impl $name {
             /// `(component, key, value)` for every counter, for `timefusion_stats`.
             pub fn stats_rows(&self) -> Vec<(&'static str, &'static str, u64)> {
@@ -836,7 +828,7 @@ macro_rules! atomic_stats {
 }
 
 atomic_stats! {
-    DmlStats => DML_STATS as "dml" {
+    DmlStats => DML_STATS / dml_stats as "dml" {
         occ_conflicts as "occ_conflicts_total",
         retry_successes as "retry_successes_total",
         retry_exhausted as "retry_exhausted_total",
@@ -847,15 +839,11 @@ atomic_stats! {
     }
 }
 
-pub fn dml_stats() -> &'static DmlStats {
-    &DML_STATS
-}
-
 atomic_stats! {
     /// Maintenance counters for the `timefusion_stats` view — the OTel counters
     /// above can't be read back in-process. Monotonic unless noted as a gauge.
     #[derive(Default)]
-    MaintenanceStats => MAINTENANCE_STATS as "maintenance" {
+    MaintenanceStats => MAINTENANCE_STATS / maintenance_stats as "maintenance" {
         checkpoints_created,
         /// Durable journal commits performed, and the callers that rode someone
         /// else's `fsync` instead (see `support::GroupCommit`). Both gauges.
@@ -1311,10 +1299,6 @@ atomic_stats! {
         ingest_dedup_index_entries,
         ingest_dedup_epoch_rotations as "ingest_dedup_epoch_rotations_total",
     }
-}
-
-pub fn maintenance_stats() -> &'static MaintenanceStats {
-    &MAINTENANCE_STATS
 }
 
 /// Resident set size of this process in bytes from `/proc/self/statm`

@@ -146,9 +146,6 @@ fn types_compatible(existing: &DataType, incoming: &DataType) -> bool {
         }
         (DataType::Map(f1, _), DataType::Map(f2, _)) => types_compatible(f1.data_type(), f2.data_type()),
         (DataType::Dictionary(_, v1), DataType::Dictionary(_, v2)) => types_compatible(v1, v2),
-        (DataType::Decimal128(p1, s1), DataType::Decimal128(p2, s2)) => p1 == p2 && s1 == s2,
-        (DataType::Decimal256(p1, s1), DataType::Decimal256(p2, s2)) => p1 == p2 && s1 == s2,
-        (DataType::FixedSizeBinary(n1), DataType::FixedSizeBinary(n2)) => n1 == n2,
         (DataType::FixedSizeList(f1, n1), DataType::FixedSizeList(f2, n2)) => n1 == n2 && types_compatible(f1.data_type(), f2.data_type()),
         _ => existing == incoming,
     }
@@ -405,14 +402,14 @@ fn compact_view_arrays(arr: &ArrayRef) -> ArrayRef {
         let v = arr.as_any().downcast_ref::<GenericByteViewArray<T>>().unwrap();
         if wasteful(v.data_buffers(), v.total_buffer_bytes_used()) { Arc::new(v.gc()) } else { arr.clone() }
     }
+    /// Rebuild through `make` only when compacting actually replaced the child values.
+    fn remap(arr: &ArrayRef, vals: &ArrayRef, make: impl FnOnce(ArrayRef) -> ArrayRef) -> ArrayRef {
+        let compacted = compact_view_arrays(vals);
+        if Arc::ptr_eq(&compacted, vals) { arr.clone() } else { make(compacted) }
+    }
     fn compact_list<O: OffsetSizeTrait>(arr: &ArrayRef, field: &FieldRef) -> ArrayRef {
         let l = arr.as_any().downcast_ref::<GenericListArray<O>>().unwrap();
-        let vals = compact_view_arrays(l.values());
-        if Arc::ptr_eq(&vals, l.values()) {
-            arr.clone()
-        } else {
-            Arc::new(GenericListArray::<O>::new(field.clone(), l.offsets().clone(), vals, l.nulls().cloned()))
-        }
+        remap(arr, l.values(), |vals| Arc::new(GenericListArray::<O>::new(field.clone(), l.offsets().clone(), vals, l.nulls().cloned())))
     }
     match arr.data_type() {
         DataType::Utf8View => gc_view::<StringViewType>(arr),
@@ -421,8 +418,7 @@ fn compact_view_arrays(arr: &ArrayRef) -> ArrayRef {
         DataType::LargeList(f) => compact_list::<i64>(arr, f),
         DataType::FixedSizeList(f, size) => {
             let l = arr.as_any().downcast_ref::<FixedSizeListArray>().unwrap();
-            let vals = compact_view_arrays(l.values());
-            if Arc::ptr_eq(&vals, l.values()) { arr.clone() } else { Arc::new(FixedSizeListArray::new(f.clone(), *size, vals, l.nulls().cloned())) }
+            remap(arr, l.values(), |vals| Arc::new(FixedSizeListArray::new(f.clone(), *size, vals, l.nulls().cloned())))
         }
         DataType::Struct(fields) => {
             let s = arr.as_any().downcast_ref::<StructArray>().unwrap();
@@ -491,23 +487,18 @@ pub fn dedup_batches(batches: Vec<RecordBatch>, keys: &[String], tiebreak: Optio
             .collect::<anyhow::Result<Vec<_>>>()?;
         Ok(concat(&cols.iter().map(|a| a.as_ref()).collect::<Vec<_>>())?)
     };
-    let key_arrays: Vec<ArrayRef> = keys.iter().map(|k| concat_col(k)).collect::<anyhow::Result<_>>()?;
-    let converter = RowConverter::new(key_arrays.iter().map(|a| SortField::new(a.data_type().clone())).collect())?;
-    let rows = converter.convert_columns(&key_arrays)?;
+    let rows_of = |arrays: Vec<ArrayRef>| -> anyhow::Result<arrow::row::Rows> {
+        let converter = RowConverter::new(arrays.iter().map(|a| SortField::new(a.data_type().clone())).collect())?;
+        Ok(converter.convert_columns(&arrays)?)
+    };
+    let rows = rows_of(keys.iter().map(|k| concat_col(k)).collect::<anyhow::Result<_>>()?)?;
 
     // A MISSING tiebreak degrades to "no tiebreak" rather than failing: rows
     // buffered under an older schema lack a newly-enabled version column, and
     // erroring would make those buckets permanently unflushable. Missing dedup
     // KEYS stay fatal — that is a real schema fault.
     let has_tiebreak = |col: &str| batches.iter().all(|b| b.column_by_name(col).is_some());
-    let tb_rows = match tiebreak.filter(|col| has_tiebreak(col)) {
-        Some(col) => {
-            let arr = concat_col(col)?;
-            let conv = RowConverter::new(vec![SortField::new(arr.data_type().clone())])?;
-            Some(conv.convert_columns(&[arr])?)
-        }
-        None => None,
-    };
+    let tb_rows = tiebreak.filter(|col| has_tiebreak(col)).map(|col| rows_of(vec![concat_col(col)?])).transpose()?;
 
     // One surviving index per key: greatest tiebreak wins, ties → last
     // occurrence. Keys are BORROWED `Row<'_>` so there is no per-row allocation.
@@ -704,16 +695,16 @@ fn filter_batch_by_id_set(batch: &RecordBatch, ids: &std::collections::HashSet<S
     filter_record_batch(batch, &mask).unwrap_or_else(|_| batch.clone())
 }
 
-/// Best-effort: on any evaluation error the batch is returned UNFILTERED, so
-/// DataFusion's FilterExec must still be in the plan.
-fn apply_predicate(batch: &RecordBatch, pred: &Arc<dyn datafusion::physical_expr::PhysicalExpr>) -> RecordBatch {
-    eval_bool_mask(pred, batch).ok().and_then(|mask| filter_record_batch(batch, &mask).ok()).unwrap_or_else(|| batch.clone())
-}
-
 /// Drop non-matching rows and any batch that ends up empty; `None` is a no-op.
+/// Best-effort: on any evaluation error the batch is kept UNFILTERED, so
+/// DataFusion's FilterExec must still be in the plan.
 pub fn filter_snapshot(snapshot: Vec<RecordBatch>, pred: &Option<Arc<dyn datafusion::physical_expr::PhysicalExpr>>) -> Vec<RecordBatch> {
     let Some(p) = pred else { return snapshot };
-    snapshot.iter().map(|b| apply_predicate(b, p)).filter(|b| b.num_rows() > 0).collect()
+    snapshot
+        .iter()
+        .map(|b| eval_bool_mask(p, b).ok().and_then(|mask| filter_record_batch(b, &mask).ok()).unwrap_or_else(|| b.clone()))
+        .filter(|b| b.num_rows() > 0)
+        .collect()
 }
 
 /// One partition per surviving time bucket. `sorted` = EVERY partition is
@@ -826,6 +817,19 @@ pub(crate) fn strip_column_qualifiers(expr: Expr) -> DFResult<Expr> {
         _ => Ok(datafusion::common::tree_node::Transformed::no(e)),
     })
     .map(|t| t.data)
+}
+
+/// The window one bucket is authoritative over — what the Delta scan must
+/// exclude: its published span, clamped to `bounds`, lifted strictly above
+/// `flushed_through` (read AFTER the span, as both call sites did). Never masks
+/// an instant this bucket already committed: those rows are in Delta and gone
+/// from memory, so masking them would make them answer no query at all.
+fn authority_range(bucket: &TimeBucket, bounds: Option<(i64, i64)>, flushed_through: impl FnOnce() -> Option<i64>) -> Option<(i64, i64)> {
+    let (lo, hi) = bounds.unwrap_or((i64::MIN, i64::MAX));
+    let min = bucket.min_timestamp.load(Ordering::Relaxed).max(lo);
+    let max = bucket.max_timestamp.load(Ordering::Relaxed).min(hi);
+    let min = flushed_through().map_or(min, |through| min.max(through.saturating_add(1)));
+    (min <= max).then_some((min, max + 1))
 }
 
 impl MemBuffer {
@@ -966,17 +970,15 @@ impl MemBuffer {
             anyhow::bail!("Schema incompatible for {}.{}: field types don't match or new non-nullable field added", project_id, table_name)
         };
 
-        if let Some(table) = self.tables.get(&key) {
-            // Registered tables canonicalize in `insert_batch`; checking the
-            // pre-canonical column order here would reject valid WAL entries.
-            if table.declared.is_none() {
-                ensure_compatible(table.schema())?;
-            }
-            return Ok(Arc::clone(&table));
-        }
-
-        let make = || Arc::new(TableBuffer::new(schema.clone(), Arc::from(project_id), Arc::from(table_name)));
-        let table = Arc::clone(&self.tables.entry(key).or_insert_with(make));
+        // Bound to a local so the shard Ref is dropped before `entry` below
+        // re-locks the same shard.
+        let existing = self.tables.get(&key).map(|t| Arc::clone(&t));
+        let table = existing.unwrap_or_else(|| {
+            let make = || Arc::new(TableBuffer::new(schema.clone(), Arc::from(project_id), Arc::from(table_name)));
+            Arc::clone(&self.tables.entry(key).or_insert_with(make))
+        });
+        // Registered tables canonicalize in `insert_batch`; checking the
+        // pre-canonical column order here would reject valid WAL entries.
         if table.declared.is_none() {
             ensure_compatible(table.schema())?;
         }
@@ -1208,12 +1210,8 @@ impl MemBuffer {
             }
             // Use the authority range, not the surviving rows' range: a DELETE
             // can remove all rows while an older flush is still in flight.
-            let min = bucket.min_timestamp.load(Ordering::Relaxed).max(lo);
-            let max = bucket.max_timestamp.load(Ordering::Relaxed).min(hi - 1);
-            let min = self.flushed_max.get(&key).and_then(|map| map.get(&bucket_id).copied()).map_or(min, |through| min.max(through.saturating_add(1)));
-            if min <= max {
-                snapshot.covered_ranges.push((min, max + 1));
-            }
+            let through = || self.flushed_max.get(&key).and_then(|map| map.get(&bucket_id).copied());
+            snapshot.covered_ranges.extend(authority_range(&bucket, Some((lo, hi - 1)), through));
         }
         snapshot.covered_ranges = merge_ranges(snapshot.covered_ranges);
         Ok(snapshot)
@@ -1307,14 +1305,7 @@ impl MemBuffer {
             .buckets
             .iter()
             .filter(|b| *b.key() != current && !force_flushed.as_ref().is_some_and(|s| s.contains(b.key())))
-            .filter_map(|b| {
-                let (min, max) = (b.min_timestamp.load(Ordering::Relaxed), b.max_timestamp.load(Ordering::Relaxed));
-                // Never mask an instant this bucket already committed: those rows
-                // are in Delta and gone from memory, so masking them would make
-                // them answer no query at all.
-                let min = flushed_max.as_ref().and_then(|m| m.get(b.key())).map_or(min, |hi| min.max(hi.saturating_add(1)));
-                (min <= max).then_some((min, max + 1))
-            })
+            .filter_map(|b| authority_range(b.value(), None, || flushed_max.as_ref().and_then(|m| m.get(b.key()).copied())))
             .sorted_by_key(|(s, _)| *s)
             .collect()
     }
@@ -1843,14 +1834,10 @@ impl MemBuffer {
         let rewrite = |e: Expr| -> DFResult<Expr> {
             use datafusion::common::tree_node::Transformed;
             e.transform(|expr| match &expr {
-                Expr::Column(c) => {
-                    let is_source_qual = matches!(c.relation.as_ref(), Some(r) if r.table() == "source");
-                    let is_bare_source = c.relation.is_none() && source_col_names.contains(&c.name);
-                    if is_source_qual || is_bare_source {
-                        Ok(Transformed::yes(Expr::Column(Column::from_name(format!("source__{}", c.name)))))
-                    } else {
-                        Ok(Transformed::no(expr))
-                    }
+                Expr::Column(c)
+                    if matches!(c.relation.as_ref(), Some(r) if r.table() == "source") || (c.relation.is_none() && source_col_names.contains(&c.name)) =>
+                {
+                    Ok(Transformed::yes(Expr::Column(Column::from_name(format!("source__{}", c.name)))))
                 }
                 _ => Ok(Transformed::no(expr)),
             })
@@ -2176,13 +2163,13 @@ impl TableBuffer {
             // batch push: `take_bucket_for_flush` snapshots batches + holds
             // under this lock too, so a concurrent take can never grab rows
             // without their hold (else acked-write loss on crash).
-            if let Some((shard, pos)) = wal_hold {
-                bucket.record_wal_append(shard, Some(pos));
-            }
-            // WAL GC floor: the live path was stamped above; only replay
-            // inserts (no wal_hold) need it here.
-            if wal_hold.is_none() {
-                bucket.first_wal_pin_micros.fetch_min(chrono::Utc::now().timestamp_micros(), Ordering::Relaxed);
+            match wal_hold {
+                Some((shard, pos)) => bucket.record_wal_append(shard, Some(pos)),
+                // WAL GC floor: `record_wal_append` stamps it for the live
+                // path; only replay inserts (no wal_hold) need it here.
+                None => {
+                    bucket.first_wal_pin_micros.fetch_min(chrono::Utc::now().timestamp_micros(), Ordering::Relaxed);
+                }
             }
             g.push(batch);
             bucket.memory_bytes.fetch_add(new_size, Ordering::Relaxed);
@@ -2342,13 +2329,8 @@ impl MemBuffer {
             },
         };
 
-        match idx.search_node(node) {
-            Ok(hits) => Ok((snapshot, Some(hits.into_iter().map(|h| h.id).collect()))),
-            Err(e) => {
-                warn!("mem text index search failed (degrading to unfiltered snapshot): {e}");
-                Ok((snapshot, None))
-            }
-        }
+        let hits = idx.search_node(node).map_err(|e| warn!("mem text index search failed (degrading to unfiltered snapshot): {e}")).ok();
+        Ok((snapshot, hits.map(|hits| hits.into_iter().map(|h| h.id).collect())))
     }
 }
 

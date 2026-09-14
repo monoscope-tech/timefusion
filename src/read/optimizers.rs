@@ -126,16 +126,23 @@ pub mod time_range_partition_pruner {
     }
 }
 
-/// Extracts the first positive `project_id = literal` AND-conjunct.
-pub fn extract_project_id_from_expr(expr: &Expr) -> Option<String> {
+/// Maps the first `project_id = literal` AND-conjunct (either argument order) for
+/// which `f` yields a value. OR is intentionally NOT handled: the multi-tenant guard
+/// must stay strict rather than silently scan all projects.
+fn find_project_id_eq<T>(expr: &Expr, f: fn(&ScalarValue) -> Option<T>) -> Option<T> {
     match expr {
         Expr::BinaryExpr(BinaryExpr { left, op: Operator::Eq, right }) => match (left.as_ref(), right.as_ref()) {
-            (Expr::Column(col), Expr::Literal(v, _)) | (Expr::Literal(v, _), Expr::Column(col)) if col.name == "project_id" => extract_utf8_string(v),
+            (Expr::Column(col), Expr::Literal(v, _)) | (Expr::Literal(v, _), Expr::Column(col)) if col.name == "project_id" => f(v),
             _ => None,
         },
-        Expr::BinaryExpr(BinaryExpr { left, op: Operator::And, right }) => extract_project_id_from_expr(left).or_else(|| extract_project_id_from_expr(right)),
+        Expr::BinaryExpr(BinaryExpr { left, op: Operator::And, right }) => find_project_id_eq(left, f).or_else(|| find_project_id_eq(right, f)),
         _ => None,
     }
+}
+
+/// Extracts the first positive `project_id = literal` AND-conjunct.
+pub fn extract_project_id_from_expr(expr: &Expr) -> Option<String> {
+    find_project_id_eq(expr, extract_utf8_string)
 }
 
 pub struct ProjectIdPushdown;
@@ -145,19 +152,9 @@ impl ProjectIdPushdown {
         filters.iter().any(Self::contains_project_id)
     }
 
-    /// Recognises `project_id = 'x'` (either argument order) and AND-conjuncts
-    /// containing one. OR is intentionally NOT handled: the multi-tenant guard
-    /// must stay strict rather than silently scan all projects.
+    /// Recognises `project_id = <any literal>`, in either argument order.
     pub fn contains_project_id(expr: &Expr) -> bool {
-        match expr {
-            Expr::BinaryExpr(BinaryExpr { left, op: Operator::Eq, right }) => matches!(
-                (left.as_ref(), right.as_ref()),
-                (Expr::Column(col), Expr::Literal(_, _)) | (Expr::Literal(_, _), Expr::Column(col))
-                if col.name == "project_id"
-            ),
-            Expr::BinaryExpr(BinaryExpr { left, op: Operator::And, right }) => Self::contains_project_id(left) || Self::contains_project_id(right),
-            _ => false,
-        }
+        find_project_id_eq(expr, |_| Some(())).is_some()
     }
 }
 
@@ -495,14 +492,13 @@ fn coerce_variant_value_positions(plan: LogicalPlan) -> Result<LogicalPlan> {
     if !schema.fields().iter().any(|f| is_variant_type(f.data_type())) {
         return Ok(plan);
     }
-    let to_json = variant_to_json_udf();
-    plan.map_expressions(|expr| expr.transform_up(|e| coerce_expr(e, &schema, &to_json))).map(|t| t.data)
+    plan.map_expressions(|expr| expr.transform_up(|e| coerce_expr(e, &schema))).map(|t| t.data)
 }
 
 /// Wraps any Variant operand in a scalar-text position with `variant_to_json`.
 /// Idempotent — an already-wrapped operand types as `Utf8`.
-fn coerce_expr(e: Expr, schema: &DFSchema, to_json: &Arc<ScalarUDF>) -> Result<Transformed<Expr>> {
-    let wrap = |x: Expr| call_udf(to_json, vec![x]);
+fn coerce_expr(e: Expr, schema: &DFSchema) -> Result<Transformed<Expr>> {
+    let wrap = |x: Expr| call_udf(&variant_to_json_udf(), vec![x]);
     // Not struct-update (`..l`): that would read a partially moved `l`.
     let wrap_like = |mut l: Like| {
         l.expr = Box::new(wrap(*l.expr));
@@ -517,9 +513,8 @@ fn coerce_expr(e: Expr, schema: &DFSchema, to_json: &Arc<ScalarUDF>) -> Result<T
         Expr::BinaryExpr(BinaryExpr { left, op, right })
             if is_text_comparison_op(op) && (is_variant_expr(&left, schema) || is_variant_expr(&right, schema)) =>
         {
-            let left = if is_variant_expr(&left, schema) { Box::new(wrap(*left)) } else { left };
-            let right = if is_variant_expr(&right, schema) { Box::new(wrap(*right)) } else { right };
-            Ok(Transformed::yes(Expr::BinaryExpr(BinaryExpr { left, op, right })))
+            let wrap_if = |e: Box<Expr>| if is_variant_expr(&e, schema) { Box::new(wrap(*e)) } else { e };
+            Ok(Transformed::yes(Expr::BinaryExpr(BinaryExpr { left: wrap_if(left), op, right: wrap_if(right) })))
         }
         Expr::Like(l) if is_variant_expr(&l.expr, schema) => Ok(Transformed::yes(Expr::Like(wrap_like(l)))),
         Expr::SimilarTo(l) if is_variant_expr(&l.expr, schema) => Ok(Transformed::yes(Expr::SimilarTo(wrap_like(l)))),
@@ -589,34 +584,30 @@ fn wrap_root_projection(plan: LogicalPlan) -> Result<LogicalPlan> {
 /// columns pass through bare so names and qualifiers are unchanged.
 fn add_root_variant_projection(plan: LogicalPlan) -> Result<LogicalPlan> {
     let schema = plan.schema().clone();
-    let variant_cols = schema.fields().iter().filter(|f| is_variant_type(f.data_type())).count();
-    if variant_cols == 0 {
-        return Ok(plan);
-    }
-    let variant_to_json = variant_to_json_udf();
-    let exprs: Vec<Expr> = schema
+    // The alias goes on before the wrap so the output column name is unchanged.
+    let cols: Vec<Expr> = schema
         .iter()
         .map(|(qualifier, field)| {
             let col = Expr::Column(Column::new(qualifier.cloned(), field.name().clone()));
-            if is_variant_type(field.data_type()) { wrap_with_variant_to_json(&col, &variant_to_json).alias(field.name()) } else { col }
+            if is_variant_type(field.data_type()) { col.alias(field.name()) } else { col }
         })
         .collect();
+    let Some((exprs, variant_cols)) = wrap_variant_outputs(&cols, &schema) else { return Ok(plan) };
     debug!(target: "variant_select_rewriter", "added root Projection over un-peelable plan: wrapped {variant_cols} Variant column(s)");
     Ok(LogicalPlan::Projection(Projection::try_new(exprs, Arc::new(plan))?))
 }
 
+/// Wraps every Variant-typed expr with `variant_to_json`, returning the rewritten
+/// exprs and how many were wrapped; `None` when nothing is Variant-typed.
+fn wrap_variant_outputs(exprs: &[Expr], schema: &DFSchema) -> Option<(Vec<Expr>, usize)> {
+    let count = exprs.iter().filter(|e| is_variant_expr(e, schema)).count();
+    let wrapped = exprs.iter().map(|e| if is_variant_expr(e, schema) { wrap_with_variant_to_json(e) } else { e.clone() });
+    (count > 0).then(|| (wrapped.collect(), count))
+}
+
 fn wrap_projection(proj: Projection) -> Result<LogicalPlan> {
     let input_schema = proj.input.schema().clone();
-    let wrapped = proj.expr.iter().filter(|e| is_variant_expr(e, &input_schema)).count();
-    if wrapped == 0 {
-        return Ok(LogicalPlan::Projection(proj));
-    }
-    let variant_to_json = variant_to_json_udf();
-    let new_exprs: Vec<Expr> = proj
-        .expr
-        .iter()
-        .map(|expr| if is_variant_expr(expr, &input_schema) { wrap_with_variant_to_json(expr, &variant_to_json) } else { expr.clone() })
-        .collect();
+    let Some((new_exprs, wrapped)) = wrap_variant_outputs(&proj.expr, &input_schema) else { return Ok(LogicalPlan::Projection(proj)) };
     debug!(target: "variant_select_rewriter", "wrapped {wrapped} Variant exprs at root projection");
     Ok(LogicalPlan::Projection(Projection::try_new(new_exprs, proj.input.clone())?))
 }
@@ -628,8 +619,8 @@ fn is_variant_expr(expr: &Expr, schema: &DFSchema) -> bool {
         && expr.get_type(schema).is_ok_and(|dt| is_variant_type(&dt))
 }
 
-fn wrap_with_variant_to_json(expr: &Expr, udf: &Arc<ScalarUDF>) -> Expr {
-    let wrap = |inner: Expr| call_udf(udf, vec![inner]);
+fn wrap_with_variant_to_json(expr: &Expr) -> Expr {
+    let wrap = |inner: Expr| call_udf(&variant_to_json_udf(), vec![inner]);
     match expr {
         // Keep the alias outermost so the output column name is unchanged.
         Expr::Alias(a) => wrap(a.expr.as_ref().clone()).alias(a.name.clone()),
@@ -2546,7 +2537,7 @@ fn split_aggregate(plan: &LogicalPlan) -> Result<Option<LogicalPlan>> {
     if branches < 2 || matches!(aggregate.input.as_ref(), LogicalPlan::Union(_)) {
         return Ok(None);
     }
-    let Some((lo, hi)) = splittable_window(&aggregate.input).filter(|&(lo, hi)| hi.saturating_sub(lo) >= MIN_SPLIT_SPAN_MICROS) else {
+    let Some((qualifier, lo, hi)) = splittable_window(&aggregate.input).filter(|&(_, lo, hi)| hi.saturating_sub(lo) >= MIN_SPLIT_SPAN_MICROS) else {
         return Ok(None);
     };
     let step = (hi - lo) / branches as i64;
@@ -2570,7 +2561,6 @@ fn split_aggregate(plan: &LogicalPlan) -> Result<Option<LogicalPlan>> {
     let union = if union.schema() == aggregate.input.schema() {
         union
     } else {
-        let Some(qualifier) = scan_qualifier(&aggregate.input) else { return Ok(None) };
         let aliased = LogicalPlanBuilder::new(union).alias(qualifier)?.build()?;
         if aliased.schema() != aggregate.input.schema() {
             return Ok(None);
@@ -2599,11 +2589,13 @@ fn scan_under<'a>(plan: &'a LogicalPlan, predicates: &mut Vec<&'a Expr>) -> Opti
     }
 }
 
-/// The finite timestamp window of a subtree the split may pass through.
-fn splittable_window(plan: &LogicalPlan) -> Option<(i64, i64)> {
+/// The finite timestamp window of a subtree the split may pass through, with the
+/// scanned table's qualifier — a UNION drops qualification, so it must be restored.
+fn splittable_window(plan: &LogicalPlan) -> Option<(TableReference, i64, i64)> {
     let mut predicates = Vec::new();
     let scan = scan_under(plan, &mut predicates)?;
-    bounded_window(predicates.into_iter().chain(&scan.filters).flat_map(split_conjunction))
+    let (lo, hi) = bounded_window(predicates.into_iter().chain(&scan.filters).flat_map(split_conjunction))?;
+    Some((scan.table_name.clone(), lo, hi))
 }
 
 /// Both bounds of `timestamp` across `conjuncts`, or `None` if either is open —
@@ -2631,11 +2623,6 @@ fn bounded_window<'a>(conjuncts: impl IntoIterator<Item = &'a Expr>) -> Option<(
         }
     });
     lo.zip(hi).filter(|(lo, hi)| lo < hi)
-}
-
-/// The scanned table's qualifier, used to restore the qualification a UNION drops.
-fn scan_qualifier(plan: &LogicalPlan) -> Option<datafusion::common::TableReference> {
-    scan_under(plan, &mut Vec::new()).map(|scan| scan.table_name.clone())
 }
 
 /// Rebuild `plan` with `[lo, hi)` pinned directly above its TableScan, so the

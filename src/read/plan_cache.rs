@@ -441,6 +441,22 @@ struct ShapeEntry {
     param_types: Vec<Option<DataType>>,
 }
 
+/// What a shape-cache attempt lifts to `$N`, and whether it substitutes at parse.
+#[derive(Clone, Copy)]
+enum ShapeMode {
+    /// Lift every literal (and any time fn) and substitute at parse.
+    AllLiterals,
+    /// Lift ONLY the time fn, leaving every other literal inline — required for
+    /// now()-bearing queries, where lifting strings/numbers makes `INTERVAL $n`
+    /// unplannable — then substitute at parse.
+    TimeFnOnly,
+    /// Mixed now()+client-`$N`: number the injected time-fn placeholders above
+    /// the client's binds and return the template UNSUBSTITUTED, so
+    /// `extra_execute_params` supplies a fresh instant on every execute and the
+    /// window never freezes even for a reused named prepared statement.
+    MixedWithClientBinds,
+}
+
 /// True if the optimized plan would embed the query start time: DataFusion
 /// const-folds these Stable fns in `state.optimize()`, so caching the result
 /// would freeze `now()` at first-build time. Such statements re-plan per query.
@@ -648,17 +664,16 @@ fn parameterize_statement(stmt: &Statement, base: usize, include_strings: bool) 
                 base,
                 &mut values,
             ),
-            SqlExpr::Function(f) => {
-                if let FunctionArguments::List(list) = &mut f.args {
-                    let args = list.args.iter_mut().filter_map(|arg| match arg {
-                        FunctionArg::Unnamed(FunctionArgExpr::Expr(e))
-                        | FunctionArg::Named { arg: FunctionArgExpr::Expr(e), .. }
-                        | FunctionArg::ExprNamed { arg: FunctionArgExpr::Expr(e), .. } => Some(e),
-                        _ => None,
-                    });
-                    take_numbers(args, base, &mut values);
-                }
-            }
+            SqlExpr::Function(Function { args: FunctionArguments::List(list), .. }) => take_numbers(
+                list.args.iter_mut().filter_map(|arg| match arg {
+                    FunctionArg::Unnamed(FunctionArgExpr::Expr(e))
+                    | FunctionArg::Named { arg: FunctionArgExpr::Expr(e), .. }
+                    | FunctionArg::ExprNamed { arg: FunctionArgExpr::Expr(e), .. } => Some(e),
+                    _ => None,
+                }),
+                base,
+                &mut values,
+            ),
             _ => {}
         }
         ControlFlow::Continue(())
@@ -699,29 +714,32 @@ impl PlanCacheHook {
         (self.shape_hits.load(Relaxed), self.shape_skips.load(Relaxed))
     }
 
-    /// Shape-cache path for literal-bearing SELECTs. Returns a fully
-    /// substituted, pre-optimized plan, or `None` to fall back to the normal
+    /// Shape-cache path for literal-bearing SELECTs. Returns a pre-optimized
+    /// plan — fully substituted, or (for `MixedWithClientBinds`) the template
+    /// with the client's `$N` still open — or `None` to fall back to the normal
     /// parse→optimize pipeline. Every failure installs a negative entry so a
     /// shape that can't parameterize is only attempted once.
-    ///
-    /// `include_strings=false` lifts ONLY the time fn and leaves every other
-    /// literal inline — required for now()-bearing queries, where lifting
-    /// strings/numbers makes `INTERVAL $n` unplannable. `true` lifts all.
-    async fn try_shape_cached_plan(
-        &self, statement: &Statement, canonical: &str, session_context: &SessionContext, include_strings: bool,
-    ) -> Option<LogicalPlan> {
+    async fn try_shape_cached_plan(&self, statement: &Statement, canonical: &str, session_context: &SessionContext, mode: ShapeMode) -> Option<LogicalPlan> {
         if !matches!(statement, Statement::Query(_)) {
             return None;
         }
-        let (param_stmt, values) = parameterize_statement(statement, 0, include_strings)?;
+        let mixed = matches!(mode, ShapeMode::MixedWithClientBinds);
+        let base = if mixed { self.mixed_time_fn_base(statement)? } else { 0 };
+        let (param_stmt, values) = parameterize_statement(statement, base, matches!(mode, ShapeMode::AllLiterals))?;
         let shape_key = param_stmt.to_string();
-        let entry = self.get_or_build_shape(&shape_key, param_stmt, values.len(), session_context).await?;
+        // The mixed path binds its injected params at execute, so it records no
+        // leading `$N` types to cast against.
+        let entry = self.get_or_build_shape(&shape_key, param_stmt, if mixed { 0 } else { values.len() }, session_context).await?;
 
-        // Substitute this query's literals, cast to the inferred types.
-        let cast_values: Vec<ScalarValue> =
-            values.into_iter().zip(entry.param_types.iter()).map(|(v, ty)| ty.as_ref().and_then(|t| v.cast_to(t).ok()).unwrap_or(v)).collect();
-        let plan = entry.plan.clone().replace_params_with_values(&ParamValues::List(cast_values.into_iter().map(Into::into).collect())).ok()?;
-        let plan = fold_literal_casts(plan).ok()?;
+        let plan = if mixed {
+            entry.plan
+        } else {
+            // Substitute this query's literals, cast to the inferred types.
+            let cast_values: Vec<ScalarValue> =
+                values.into_iter().zip(entry.param_types.iter()).map(|(v, ty)| ty.as_ref().and_then(|t| v.cast_to(t).ok()).unwrap_or(v)).collect();
+            let plan = entry.plan.replace_params_with_values(&ParamValues::List(cast_values.into_iter().map(Into::into).collect())).ok()?;
+            fold_literal_casts(plan).ok()?
+        };
         self.mark_served(canonical);
         Some(plan)
     }
@@ -756,13 +774,9 @@ impl PlanCacheHook {
             .and_then(|p| state.optimize(&p))
             .inspect_err(|e| warn!(target: "plan_cache", "shape build failed: {shape_key} — {e}"))
             .ok()
-            .and_then(|plan| match value_count {
-                0 => Some(ShapeEntry { plan, param_types: Vec::new() }),
-                n => {
-                    let types = plan.get_parameter_types().ok()?;
-                    let param_types = (1..=n).map(|i| types.get(&format!("${i}")).cloned().flatten()).collect();
-                    Some(ShapeEntry { plan, param_types })
-                }
+            .and_then(|plan| {
+                let types = if value_count == 0 { Default::default() } else { plan.get_parameter_types().ok()? };
+                Some(ShapeEntry { plan, param_types: (1..=value_count).map(|i| types.get(&format!("${i}")).cloned().flatten()).collect() })
             });
         if built.is_none() {
             self.shape_skips.fetch_add(1, Relaxed);
@@ -771,20 +785,6 @@ impl PlanCacheHook {
         let weight = built.as_ref().map_or(0, |e| plan_bytes(&e.plan)) + shape_key.len();
         self.shapes.insert(shape_key.to_string(), built.clone(), weight, "shape");
         built
-    }
-
-    /// Mixed now()+client-`$N` path: cache an OPTIMIZED template whose time-fn
-    /// placeholders are numbered above the client's binds and whose client
-    /// placeholders stay open. Returns the template unsubstituted:
-    /// `extra_execute_params` supplies a fresh instant on every execute, so the
-    /// window never freezes even for a reused named prepared statement.
-    async fn try_mixed_time_fn_plan(&self, statement: &Statement, canonical: &str, session_context: &SessionContext) -> Option<LogicalPlan> {
-        let base = self.mixed_time_fn_base(statement)?;
-        let (param_stmt, _) = parameterize_statement(statement, base, false)?;
-        let shape_key = param_stmt.to_string();
-        let plan = self.get_or_build_shape(&shape_key, param_stmt, 0, session_context).await?.plan;
-        self.mark_served(canonical);
-        Some(plan)
     }
 
     /// Base index for the mixed now()+client-`$N` path: the client's highest
@@ -837,23 +837,19 @@ impl PlanCacheHook {
         if contains_plan_time_folded_fn(statement) {
             if self.time_fn_shapes && matches!(statement, Statement::Query(_)) && !contains_unparameterizable_time_fn(statement) {
                 let canonical = statement.to_string();
-                return if Self::has_placeholder(&canonical) {
-                    // Mixed now()+client `$N`: template keeps both open; the fresh
-                    // instant is injected per-execute by extra_execute_params.
-                    self.try_mixed_time_fn_plan(statement, &canonical, session_context).await
-                } else {
-                    // Pure now()-bearing: lift ONLY now() (include_strings=false),
-                    // keep other literals inline so INTERVAL/time_bucket plan.
-                    self.try_shape_cached_plan(statement, &canonical, session_context, false).await
-                }
-                .map(Ok);
+                // Mixed now()+client `$N`: template keeps both open; the fresh
+                // instant is injected per-execute by extra_execute_params.
+                // Otherwise pure now()-bearing: lift ONLY now(), keeping other
+                // literals inline so INTERVAL/time_bucket plan.
+                let mode = if Self::has_placeholder(&canonical) { ShapeMode::MixedWithClientBinds } else { ShapeMode::TimeFnOnly };
+                return self.try_shape_cached_plan(statement, &canonical, session_context, mode).await.map(Ok);
             }
             return None;
         }
         let canonical = statement.to_string();
         if !Self::has_placeholder(&canonical) {
             // Literal-bearing SELECT (no now()): lift all literals.
-            return self.try_shape_cached_plan(statement, &canonical, session_context, true).await.map(Ok);
+            return self.try_shape_cached_plan(statement, &canonical, session_context, ShapeMode::AllLiterals).await.map(Ok);
         }
 
         if let Some(plan) = self.cache.get(&canonical) {

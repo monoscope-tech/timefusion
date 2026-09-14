@@ -10,7 +10,11 @@ const GIB: usize = 1024 * 1024 * 1024;
 /// Field-forwarding accessors. `name: Type = (field <tail>);` expands to
 /// `pub fn name(&self) -> Type { self.field <tail> }`; `<tail>` is any suffix
 /// expression (`.max(1)`, `* MIB`, `.join("wal")`).
+/// The `@const` arm forwards a constant instead: `@const name: Type = CONST;`.
 macro_rules! getters {
+    (@const $($(#[$m:meta])* $name:ident: $ty:ty = $val:expr;)*) => {
+        $($(#[$m])* pub fn $name(&self) -> $ty { $val })*
+    };
     ($($(#[$m:meta])* $name:ident: $ty:ty = ($field:ident $($tail:tt)*);)*) => {
         $($(#[$m])* pub fn $name(&self) -> $ty { self.$field $($tail)* })*
     };
@@ -41,12 +45,16 @@ fn parse_meminfo_total_bytes(content: &str) -> Option<usize> {
     content.lines().find(|l| l.starts_with("MemTotal:")).and_then(|l| l.split_whitespace().nth(1)).and_then(|kb| kb.parse::<usize>().ok()).map(|kb| kb * 1024)
 }
 
+/// Whole cores a CFS quota/period pair allows, rounded up. `None` for unlimited.
+fn cores_from_quota(quota: f64, period: f64) -> Option<usize> {
+    (quota > 0.0 && period > 0.0).then(|| ((quota / period).ceil() as usize).max(1))
+}
+
 /// Parse cgroup v2 `cpu.max` content (`"<quota> <period>"` or `"max
 /// <period>"`) into a whole-core count, rounded up. `None` for unlimited.
 fn parse_cgroup_cpu_max(content: &str) -> Option<usize> {
     let mut parts = content.split_whitespace();
-    let (quota, period) = (parts.next()?.parse::<f64>().ok()?, parts.next()?.parse::<f64>().ok()?);
-    (quota > 0.0 && period > 0.0).then(|| ((quota / period).ceil() as usize).max(1))
+    cores_from_quota(parts.next()?.parse().ok()?, parts.next()?.parse().ok()?)
 }
 
 /// Detect the effective memory limit in bytes: cgroup v2 → cgroup v1 →
@@ -66,22 +74,24 @@ fn detect_memory_limit_bytes() -> usize {
                 .inspect(|v| tracing::warn!("budget tree: no cgroup memory limit; deriving from HALF of host RAM ({} GiB)", v / GIB))
         })
         // macOS (dev / off-box CLI): same half-the-machine rule.
-        .or_else(|| {
-            #[cfg(target_os = "macos")]
-            let macos = Some(
-                sysinfo::System::new_with_specifics(sysinfo::RefreshKind::new().with_memory(sysinfo::MemoryRefreshKind::everything())).total_memory() as usize
-                    / 2,
-            )
-            .filter(|half| *half > 0)
-            .inspect(|half| tracing::warn!("budget tree: no cgroup; deriving from HALF of host RAM ({} GiB)", half / GIB));
-            #[cfg(not(target_os = "macos"))]
-            let macos = None;
-            macos
-        })
+        .or_else(host_half_bytes)
         .unwrap_or_else(|| {
             tracing::warn!("budget tree: could not detect memory limit from cgroup or /proc/meminfo; falling back to 8 GiB");
             8 * GIB
         })
+}
+
+/// Half of host RAM, where the platform exposes it outside `/proc/meminfo`.
+#[cfg(target_os = "macos")]
+fn host_half_bytes() -> Option<usize> {
+    Some(sysinfo::System::new_with_specifics(sysinfo::RefreshKind::new().with_memory(sysinfo::MemoryRefreshKind::everything())).total_memory() as usize / 2)
+        .filter(|half| *half > 0)
+        .inspect(|half| tracing::warn!("budget tree: no cgroup; deriving from HALF of host RAM ({} GiB)", half / GIB))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn host_half_bytes() -> Option<usize> {
+    None
 }
 
 /// `TIMEFUSION_MEMORY_LIMIT_GB`, parsed. Consulted ONLY when no cgroup limit
@@ -110,10 +120,7 @@ pub(crate) fn detect_cores() -> usize {
     // parallelism, so clamp. THE process-wide core detector: every sizing
     // decision must read it so they cannot disagree.
     read_parsed("/sys/fs/cgroup/cpu.max", parse_cgroup_cpu_max)
-        .or_else(|| {
-            let (quota, period) = (read_i64("/sys/fs/cgroup/cpu/cpu.cfs_quota_us")?, read_i64("/sys/fs/cgroup/cpu/cpu.cfs_period_us")?);
-            (quota > 0 && period > 0).then(|| ((quota as f64 / period as f64).ceil() as usize).max(1))
-        })
+        .or_else(|| cores_from_quota(read_i64("/sys/fs/cgroup/cpu/cpu.cfs_quota_us")? as f64, read_i64("/sys/fs/cgroup/cpu/cpu.cfs_period_us")? as f64))
         .map_or(host, |c| c.clamp(1, host))
 }
 
@@ -322,13 +329,11 @@ impl DerivedBudget {
         /// Raw-object-bytes half of the cache reservation; the other half is the
         /// logical-count index. Both stay inside the one reservation.
         object_cache_memory_bytes: usize = (foyer_memory_bytes / 2);
+        /// The other half — exactly what `object_cache_memory_bytes` leaves.
+        logical_count_memory_bytes: usize = (foyer_memory_bytes.div_ceil(2));
         writer_reserve_bytes: usize = (writer_reserve_bytes);
         memory_limit_bytes: usize = (memory_limit_bytes);
         maintenance_pool_bytes: usize = (maintenance_pool_bytes);
-    }
-
-    pub fn logical_count_memory_bytes(&self) -> usize {
-        self.foyer_memory_bytes - self.object_cache_memory_bytes()
     }
 
     /// Hands `bytes` back from the maintenance pool (never below the floor);
@@ -397,15 +402,17 @@ impl DerivedBudget {
         }
     }
 
-    /// Concurrent heavy maintenance rewrites. Pinned, not box-derived: the cap
-    /// guards against an uncapped-rewrite OOM.
-    pub fn rewrite_permits(&self) -> usize {
-        HEAVY_REWRITE_PERMITS
-    }
-
-    /// delta-rs concurrent merge tasks per optimize run. Pinned.
-    pub fn optimize_merge_tasks(&self) -> usize {
-        OPTIMIZE_MERGE_TASKS
+    getters! { @const
+        /// Concurrent heavy maintenance rewrites. Pinned, not box-derived: the cap
+        /// guards against an uncapped-rewrite OOM.
+        rewrite_permits: usize = HEAVY_REWRITE_PERMITS;
+        /// delta-rs concurrent merge tasks per optimize run. Pinned.
+        optimize_merge_tasks: usize = OPTIMIZE_MERGE_TASKS;
+        /// Files-per-bin cap for every optimize rewrite; bounds per-merge memory
+        /// regardless of box size.
+        optimize_max_files_per_bin: NonZeroUsize = OPTIMIZE_MAX_FILES_PER_BIN;
+        /// Pinned, not box-derived: the empirical sort peak.
+        per_sort_budget_bytes: usize = PER_SORT_BUDGET_BYTES;
     }
 
     /// Scan batch size for maintenance sessions. A batch is indivisible — it
@@ -418,17 +425,6 @@ impl DerivedBudget {
         }
     }
 
-    /// Files-per-bin cap for every optimize rewrite; bounds per-merge memory
-    /// regardless of box size.
-    pub fn optimize_max_files_per_bin(&self) -> NonZeroUsize {
-        OPTIMIZE_MAX_FILES_PER_BIN
-    }
-
-    /// Pinned, not box-derived: the empirical sort peak.
-    pub fn per_sort_budget_bytes(&self) -> usize {
-        PER_SORT_BUDGET_BYTES
-    }
-
     /// Concurrent hot-tail light-optimize sorts: memory-bound by the
     /// coordinator share, CPU-bound to a quarter of cores, and never more than
     /// there are hot projects to compact.
@@ -438,10 +434,14 @@ impl DerivedBudget {
         // off the top but yields before the hygiene lane is zeroed
         // (`LIGHT_MIN_SLICES`): one permit shared by HotPacking and
         // SealedConsolidation means a single long unit stops the lane dead.
-        let slices = self.coordinator_share_bytes() / COORDINATOR_PER_SORT_BUDGET_BYTES;
+        let slices = self.light_pool_slices();
         let mem_bound = slices.saturating_sub(self.repair_pool_holdback_slices().min(slices.saturating_sub(LIGHT_MIN_SLICES)));
-        let cpu_bound = self.cores / 4;
-        mem_bound.min(cpu_bound).min(hot_project_count).max(1)
+        mem_bound.min(self.cores / 4).min(hot_project_count).max(1)
+    }
+
+    /// Per-sort slices the coordinator share holds — the pool term both light-K variants start from.
+    fn light_pool_slices(&self) -> usize {
+        self.coordinator_share_bytes() / COORDINATOR_PER_SORT_BUDGET_BYTES
     }
 
     /// Concurrently admitted maintenance coordinator units. Bounded by the box:
@@ -482,8 +482,7 @@ impl DerivedBudget {
     /// `max_light_optimize_k` as if repair reserved nothing. Same floors — the
     /// CPU term and the pool's slice count still bind.
     fn max_light_optimize_k_ignoring_holdback(&self) -> usize {
-        let slices = self.coordinator_share_bytes() / COORDINATOR_PER_SORT_BUDGET_BYTES;
-        slices.min(self.cores / 4).max(1)
+        self.light_pool_slices().min(self.cores / 4).max(1)
     }
 
     pub fn tick_budget(&self, cron_period: Duration) -> Duration {

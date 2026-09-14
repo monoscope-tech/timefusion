@@ -164,10 +164,8 @@ pub async fn rollup_partial_for_batches(
 /// applying it again over an aggregated column is a different predicate.
 fn measure_projection(spec: &RollupSpec, measure: &RollupMeasure, derived: bool) -> anyhow::Result<String> {
     let expression = match (derived, measure.agg.as_str(), measure.column.as_deref()) {
-        (true, "min", _) => format!("MIN({})", measure.name),
-        (true, "max", _) => format!("MAX({})", measure.name),
-        (true, "tdigest", _) => format!("tdigest_merge(CAST({} AS BYTEA))", measure.name),
-        (true, "hll", _) => format!("hll_merge(CAST({} AS BYTEA))", measure.name),
+        (true, aggregate @ ("min" | "max"), _) => format!("{}({})", aggregate.to_uppercase(), measure.name),
+        (true, aggregate @ ("tdigest" | "hll"), _) => format!("{aggregate}_merge(CAST({} AS BYTEA))", measure.name),
         // Order by the COMPANION, never the base tier's bucket timestamp: a bucket
         // whose filter matched nothing stores NULL for both, and `NULLS LAST` makes
         // it win only when nothing else matched.
@@ -432,16 +430,13 @@ impl Merge {
     fn sql(self, states: &[String]) -> String {
         match (self, states) {
             (Self::Count, [count]) => format!("COALESCE(SUM({count}), 0)"),
-            (Self::Sum, [sum]) => format!("SUM({sum})"),
-            (Self::Min, [min]) => format!("MIN({min})"),
-            (Self::Max, [max]) => format!("MAX({max})"),
             // CAST the dividend, not the result: both states are Int64, so
             // dividing first truncates.
             (Self::Avg, [sum, count]) => {
                 format!("CASE WHEN COALESCE(SUM({count}), 0) = 0 THEN CAST(NULL AS DOUBLE) ELSE CAST(SUM({sum}) AS DOUBLE) / CAST(SUM({count}) AS DOUBLE) END")
             }
-            (Self::TDigest, [digest]) => format!("tdigest_merge({digest})"),
-            (Self::Hll, [sketch]) => format!("hll_merge({sketch})"),
+            // Single-state variants fold with the same operator the rollup leg used.
+            (Self::Sum | Self::Min | Self::Max | Self::TDigest | Self::Hll, [state]) => format!("{}({state})", self.partial_op()),
             // `NULLS LAST`: a leg that matched nothing contributes a NULL pair
             // and must lose to any leg that matched something.
             (Self::First, [value, at]) => format!("first_value({value} ORDER BY {at} NULLS LAST)"),
@@ -794,17 +789,10 @@ pub fn unreproduced_refusals(refused: &[Option<(i64, i64)>], selected: &[(i64, i
 /// `hi` is INCLUSIVE — it is a row's timestamp, straight from file statistics —
 /// while a slice's end is exclusive, so a range must reach strictly past `hi`.
 pub(crate) fn ranges_cover(ranges: &[(i64, i64)], (lo, hi): (i64, i64)) -> bool {
-    let mut reached = lo;
-    for (start, end) in ranges.iter().copied().sorted() {
-        if start > reached {
-            return false;
-        }
-        reached = reached.max(end);
-        if reached > hi {
-            return true;
-        }
-    }
-    false
+    // No range can reach strictly past `i64::MAX`, so that bound is never covered.
+    let Some(bound) = hi.checked_add(1) else { return false };
+    let clamped = ranges.iter().map(|&(start, end)| (start.max(lo).min(bound), end.max(lo).min(bound))).sorted().collect_vec();
+    complement(lo, bound, &clamped).is_empty()
 }
 
 /// The sub-ranges of `untagged` that no live tagged slice covers — the exact
@@ -815,25 +803,15 @@ pub(crate) fn ranges_cover(ranges: &[(i64, i64)], (lo, hi): (i64, i64)) -> bool 
 /// callers pass `hi + 1`.
 pub(crate) fn uncovered_gaps(untagged: &[(i64, i64)], tagged: &[(i64, i64)]) -> Vec<(i64, i64)> {
     let covered = tagged.iter().copied().sorted().collect_vec();
-    let mut gaps: Vec<(i64, i64)> = Vec::new();
-    for &(lo, hi) in untagged {
-        let mut reached = lo;
-        for &(start, end) in covered.iter().filter(|(_, end)| *end > lo) {
-            if start >= hi {
-                break;
-            }
-            if start > reached {
-                gaps.push((reached, start.min(hi)));
-            }
-            reached = reached.max(end);
-            if reached >= hi {
-                break;
-            }
-        }
-        if reached < hi {
-            gaps.push((reached, hi));
-        }
-    }
+    // Clamping to the span keeps `complement`'s precondition (ascending, inside
+    // `[lo, hi)`) while leaving the gap set unchanged.
+    let gaps = untagged
+        .iter()
+        .flat_map(|&(lo, hi)| {
+            let clamped = covered.iter().map(|&(start, end)| (start.max(lo).min(hi), end.max(lo).min(hi))).collect_vec();
+            complement(lo, hi, &clamped)
+        })
+        .collect();
     // Adjacent holes are ONE hole, else a day tiled by many files yields a unit
     // per file. The coordinator still bisects a merged hole that does not fit.
     crate::write::mem_buffer::merge_ranges(gaps)
@@ -1029,16 +1007,14 @@ impl RoutedRollup {
         format!("SELECT {select} FROM {table} WHERE {projects}({ranges}){extra}{row_filters}{group_by}")
     }
 
-    /// `project_id = '…' AND `, or empty when the query groups by project_id.
-    fn project_predicate(&self) -> String {
-        self.project_id.as_deref().map_or_else(String::new, |project| format!("project_id = {} AND ", sql_literal(project)))
-    }
-
-    /// `project_id IN (…) AND `, or the pinned predicate when the split names no
-    /// subset. Empty only when the query groups by project_id AND every project
-    /// proved coverage.
+    /// `project_id IN (…) AND `, or `project_id = '…' AND ` when the split names
+    /// no subset. Empty only when the query groups by project_id AND every
+    /// project proved coverage.
     fn projects_in(&self, projects: Option<&[String]>) -> String {
-        projects.map_or_else(|| self.project_predicate(), |list| format!("project_id IN ({}) AND ", list.iter().map(|p| sql_literal(p)).join(", ")))
+        match projects {
+            Some(list) => format!("project_id IN ({}) AND ", list.iter().map(|p| sql_literal(p)).join(", ")),
+            None => self.project_id.as_deref().map_or_else(String::new, |project| format!("project_id = {} AND ", sql_literal(project))),
+        }
     }
 
     /// The rewrite. `interiors` are the grain-aligned ranges the rollup leg owns;
@@ -1051,23 +1027,20 @@ impl RoutedRollup {
                 .iter()
                 // A generation id hashes the project, so a cross-project rewrite
                 // names one per (project, date).
-                .map(|(project, date, generation)| match self.project_id {
-                    Some(_) => format!("(date = {} AND rollup_generation = {})", sql_literal(date), sql_literal(generation)),
-                    None =>
-                        format!("(project_id = {} AND date = {} AND rollup_generation = {})", sql_literal(project), sql_literal(date), sql_literal(generation)),
+                .map(|(project, date, generation)| {
+                    let prefix = if self.project_id.is_none() { format!("project_id = {} AND ", sql_literal(project)) } else { String::new() };
+                    format!("({prefix}date = {} AND rollup_generation = {})", sql_literal(date), sql_literal(generation))
                 })
                 .join(" OR ")
         );
         // An open-ended window's raw leg must run to the sentinel, not the
         // stand-in `hi`, or the rewrite answers without the newest rows.
-        let fringes = complement(self.lo, if self.open_end { OPEN_END } else { self.hi }, interiors);
+        let end = if self.open_end { OPEN_END } else { self.hi };
+        let fringes = complement(self.lo, end, interiors);
         let rollup_projects = self.projects_in(split.covered.as_deref());
         // Unproved projects are read raw across the WHOLE window; with the covered
         // projects' interior and fringes that partitions (project x time) exactly.
-        let raw_only_leg = (!split.raw_only.is_empty()).then(|| {
-            let whole = [(self.lo, if self.open_end { OPEN_END } else { self.hi })];
-            self.leg(&self.source, &whole, "", &self.projects_in(Some(&split.raw_only)))
-        });
+        let raw_only_leg = (!split.raw_only.is_empty()).then(|| self.leg(&self.source, &[(self.lo, end)], "", &self.projects_in(Some(&split.raw_only))));
         if fringes.is_empty() && raw_only_leg.is_none() {
             // Single leg: the rollup rows ARE the partial states.
             let select = self
@@ -1518,7 +1491,7 @@ static MEASURE_FILTERS: std::sync::OnceLock<dashmap::DashMap<(String, String, St
 
 async fn measure_filters<'a>(
     session: &datafusion::execution::context::SessionState, source: &str, spec: &'a RollupSpec, project_id: &str, lo: i64, hi: i64,
-) -> Result<Vec<(&'a crate::schema::RollupMeasure, String)>, MissReason> {
+) -> Result<Vec<(&'a RollupMeasure, String)>, MissReason> {
     let cache = MEASURE_FILTERS.get_or_init(dashmap::DashMap::new);
     let mut filters = Vec::with_capacity(spec.measures.len());
     for measure in &spec.measures {
@@ -1734,6 +1707,27 @@ pub(crate) fn timestamp_window(predicate: &datafusion::logical_expr::Expr) -> Op
         narrow_timestamp(term, &mut lo, &mut hi).ok()?;
     }
     lo.zip(hi).filter(|(lo, hi)| lo < hi)
+}
+
+/// One output aggregate: the rollup-leg measure columns plus the raw-leg SQL,
+/// one entry per state, in `merge` order. The raw leg reproduces each measure's
+/// DECLARED filter text verbatim — exact, since the query's filter canonicalizes
+/// to the same predicate. `COUNT(col)` whenever the measure carries a column:
+/// `COUNT(*)` would keep an all-null bucket the rollup leg's `HAVING` drops.
+fn routed_measure(alias: String, merge: Merge, resolved: &[&RollupMeasure]) -> RoutedMeasure {
+    let raw = |measure: &RollupMeasure| {
+        let expression = match (merge, measure.column.as_deref()) {
+            (Merge::TDigest, Some(column)) => format!("percentile_agg(CAST({column} AS DOUBLE))"),
+            (Merge::Hll, Some(column)) => format!("hll_agg({column})"),
+            // Only the value state needs the ordered spelling; the companion is an ordinary `min`.
+            (Merge::First, Some(column)) if measure.agg == "first" => format!("first_value({column} ORDER BY timestamp)"),
+            (_, None) => "COUNT(*)".to_string(),
+            (_, Some(column)) => format!("{}({column})", measure.agg.to_uppercase()),
+        };
+        filtered(expression, measure.filter.as_deref())
+    };
+    let measures = resolved.iter().map(|measure| measure.name.clone()).collect();
+    RoutedMeasure { alias, merge, measures, raw: resolved.iter().copied().map(raw).collect() }
 }
 
 /// Resolve one query against one declared rollup spec. Every output is aliased
@@ -1980,36 +1974,11 @@ async fn route_with_spec(
             };
             let resolved = resolved.ok_or(MissReason::MissingMeasure)?;
             debug_assert_eq!(resolved.len(), merge.arity(), "{merge:?} resolved the wrong number of measures");
-            // The raw leg reproduces the measure's DECLARED filter text verbatim —
-            // exact, since the query's filter canonicalizes to the same predicate.
-            let raw = resolved
-                .iter()
-                .map(|measure| {
-                    let aggregate = measure.agg.to_uppercase();
-                    let expression = match (merge, measure.column.as_deref()) {
-                        (Merge::TDigest, Some(column)) => format!("percentile_agg(CAST({column} AS DOUBLE))"),
-                        (Merge::Hll, Some(column)) => format!("hll_agg({column})"),
-                        // Only the value state needs the ordered spelling; the
-                        // companion is an ordinary `min`.
-                        (Merge::First, Some(column)) if measure.agg == "first" => format!("first_value({column} ORDER BY timestamp)"),
-                        (_, None) => "COUNT(*)".to_string(),
-                        (_, Some(column)) => format!("{aggregate}({column})"),
-                    };
-                    filtered(expression, measure.filter.as_deref())
-                })
-                .collect();
-            Ok(RoutedMeasure { alias, merge, measures: resolved.iter().map(|measure| measure.name.clone()).collect(), raw })
+            Ok(routed_measure(alias, merge, &resolved))
         })
         .collect::<Result<Vec<_>, MissReason>>()?;
 
-    let guard = guard.map(|measure| RoutedMeasure {
-        alias: "__guard".to_string(),
-        merge: Merge::Count,
-        measures: vec![measure.name.clone()],
-        // `COUNT(col)` when the guard carries one: `COUNT(*)` here would keep an
-        // all-null bucket that the rollup leg's `HAVING` drops.
-        raw: vec![filtered(measure.column.as_deref().map_or_else(|| "COUNT(*)".to_string(), |column| format!("COUNT({column})")), measure.filter.as_deref())],
-    });
+    let guard = guard.map(|measure| routed_measure("__guard".to_string(), Merge::Count, &[measure]));
 
     Ok(RoutedRollup {
         source: source.to_string(),
