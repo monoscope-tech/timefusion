@@ -19,14 +19,12 @@ arrow-ipc = "58"
 arrow-json = "58"
 uuid = { version = "1.17", features = ["v4", "serde"] }
 serde = { version = "1", features = ["derive"] }
-serde_arrow = { version = "0.14", features = ["arrow-58"] }
 serde_json = "1.0.141"
 hex = "0.4"
 serde_with = "3.14"
 serde_yaml = "0.9"
 async-trait = "0.1.86"
 log = "0.4.27"
-color-eyre = "0.6.5"
 arrow-schema = "58"
 regex = "1.11.1"
 # delta-rs main + local Variant DML fixes + parquet sort-order pushdown. Fork
@@ -54,11 +52,9 @@ sqlx = { version = "0.8", features = [
 ] }
 futures = { version = "0.3.31", features = ["alloc"] }
 bytes = { version = "1.4", features = ["serde"] }
-tokio-rustls = "0.26.1"
 datafusion-postgres = "0.17"
 datafusion-functions-json = "0.54"
 anyhow = "1.0.100"
-sha2 = "0.10"
 twox-hash = "2.1"
 fastrand = "2"
 fnv = "1"
@@ -80,7 +76,6 @@ instrumented-object-store = "54.0.0"
 dotenv = "0.15.0"
 include_dir = "0.7"
 aws-config = { version = "1.6.0", features = ["behavior-version-latest"] }
-aws-types = "1.3.6"
 aws-sdk-s3 = "1.3.0"
 url = "2.5.4"
 # Cron parsing only. We drive the wall-clock loop ourselves (see
@@ -126,7 +121,6 @@ tempfile = "3"
 sysinfo = { version = "0.32", default-features = false, features = ["system", "disk"] }
 num_cpus = "1.16"
 scopeguard = "1.2.0"
-memmap2 = "0.9.10"
 # `#[derive(Default)]` cannot express a non-`Default::default()` field value, so
 # every such struct needed a hand-written `impl Default`. educe's `Default`
 # derive takes the value on the field, which is where the doc comment already is.
