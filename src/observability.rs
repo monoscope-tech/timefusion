@@ -377,9 +377,22 @@ pub fn init_metrics(
     // history told the story immediately: over the same seven days
     // `pending_dirty_partitions` rose 340 -> 588 and `cron_long_running` tripled.
     observe!(gauge
-        "timefusion.maintenance.permit_held_without_staging_seconds",
-        "Longest a hygiene permit has been held without reaching a sort. THE wedge signal: a wedged lane stops counting rather than counting badly, so every throughput metric goes quiet and quiet reads as healthy",
-        maintenance_stats().permit_held_without_staging_secs.load(Relaxed)
+        "timefusion.maintenance.permit_held_seconds",
+        "Longest a hygiene permit has been held in one phase (high-water mark). Long AND acquisitions climbing = saturated by long sorts; long AND acquisitions frozen = stuck",
+        maintenance_stats().permit_held_secs.load(Relaxed)
+    );
+    // The two failure classes observed on 2026-09-14, neither of which had a
+    // metric. A user-facing error with no history is invisible between incidents,
+    // and "did it get better?" is unanswerable without one.
+    observe!(counter
+        "timefusion.pgwire.stream_failed",
+        "pgwire row streams that died mid-flight — the user-visible query failure",
+        maintenance_stats().pgwire_stream_failed.load(Relaxed)
+    );
+    observe!(counter
+        "timefusion.maintenance.coordinator_errors",
+        "Maintenance turns that ended in an error, most often a rollup aggregation losing the maintenance pool — the upstream of not_built rollup misses",
+        maintenance_stats().maintenance_coordinator_errors.load(Relaxed)
     );
     observe!(gauge
         "timefusion.maintenance.permits_available",
@@ -409,6 +422,26 @@ pub fn init_metrics(
     observe!(gauge "timefusion.maintenance.pending_base_rollup", "BaseRollup units queued", maintenance_stats().pending_base_rollup.load(Relaxed));
     observe!(gauge "timefusion.maintenance.pending_dedup", "Dedup units queued", maintenance_stats().pending_dedup.load(Relaxed));
     observe!(gauge "timefusion.maintenance.pending_repair", "Repair units queued", maintenance_stats().pending_repair.load(Relaxed));
+    // QUERY LATENCY, the headline symptom, which had no usable history at all.
+    // Both latency histograms go through the `metrics` -> OTel bridge and arrive
+    // with a NULL scalar value, so "are queries slow?" — the question this whole
+    // effort exists to answer — could only be answered by running a query by hand
+    // and timing it. The quantiles are already computed in-process to back
+    // `timefusion_stats`; these publish the same numbers so they get a history.
+    // Milliseconds, not seconds: an integer gauge truncates every sub-second
+    // query to 0.
+    macro_rules! latency_gauge {
+        ($id:literal, $desc:literal, $hist:literal, $p:expr) => {
+            observe!(gauge $id, $desc, (histogram_quantile($hist, $p).unwrap_or(0.0) * 1_000.0) as u64);
+        };
+    }
+    latency_gauge!("timefusion.pgwire.query_latency_p50_ms", "Median pgwire end-to-end query latency", "timefusion.pgwire.query_latency_seconds", 0.5);
+    latency_gauge!("timefusion.pgwire.query_latency_p95_ms", "p95 pgwire end-to-end query latency", "timefusion.pgwire.query_latency_seconds", 0.95);
+    latency_gauge!("timefusion.pgwire.query_latency_p99_ms", "p99 pgwire end-to-end query latency", "timefusion.pgwire.query_latency_seconds", 0.99);
+    latency_gauge!("timefusion.scan.latency_p50_ms", "Median ProjectRoutingTable::scan duration", "timefusion.scan.latency_seconds", 0.5);
+    latency_gauge!("timefusion.scan.latency_p95_ms", "p95 ProjectRoutingTable::scan duration", "timefusion.scan.latency_seconds", 0.95);
+    latency_gauge!("timefusion.scan.latency_p99_ms", "p99 ProjectRoutingTable::scan duration", "timefusion.scan.latency_seconds", 0.99);
+
     observe!(gauge
         "timefusion.maintenance.sealed_compaction_debt_bytes",
         "Sealed compaction debt in DECODED bytes, not bytes on disk — roughly 12x the compressed footprint, and it is a stock of estimates that never decrements, so read it as a shape and never as a drain rate",
@@ -1010,11 +1043,23 @@ atomic_stats! {
         /// at boot from `coordinator_share / COORDINATOR_PER_SORT_BUDGET -
         /// repair_holdback`, floored at 1 — never derive it by hand.
         light_rewrite_permits_available,
-        /// Longest a hygiene permit has been held WITHOUT reaching the sort, this
-        /// process. The wedge detector: the lane holds both permits and claims
-        /// nothing, so every throughput counter simply stops rather than reading
-        /// as bad, and a stopped counter is indistinguishable from a quiet one.
-        permit_held_without_staging_secs,
+        /// Longest a hygiene permit has been held in ONE phase, this process, as
+        /// a high-water mark. Read it WITH `compaction_permits_acquired`: a long
+        /// hold while acquisitions keep climbing is a saturated lane (long sorts);
+        /// a long hold while they are FROZEN is a stuck one. Named for the
+        /// measurement, not for a cause — the first reading refuted the cause it
+        /// was built to confirm.
+        permit_held_secs,
+        /// pgwire row streams that died mid-flight — the user-visible failure. Was
+        /// log-only, so a dashboard erroring for an hour left no trace once the
+        /// container was replaced. Measured 2026-09-14: 4 in 44 minutes, intervals
+        /// shrinking to 4 minutes, and nothing recorded it.
+        pgwire_stream_failed,
+        /// Maintenance coordinator turns that ended in an error — most often a
+        /// rollup aggregation losing the 5 GB maintenance pool. Directly produces
+        /// the `not_built` rollup misses the read path then pays for, and likewise
+        /// had no counter: `timefusion.optimize.failed` reports NO DATA over 7 days.
+        maintenance_coordinator_errors,
         light_rewrite_permits_total,
         /// Dashboard aggregates served from a rollup, split by how much of the
         /// window the rollup owned. `rollup_hits_hybrid` is what proves the
