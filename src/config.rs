@@ -222,10 +222,24 @@ const MAINTENANCE_FLOOR_BYTES: usize = GIB;
 /// sort reservation in equal measure. `TIMEFUSION_QUERY_PARTITIONS` overrides it.
 const QUERY_PARTITIONS_MAX: usize = 24;
 
-/// Concurrent sort-bearing queries the query pool must survive — the client's
-/// pgwire connection-pool size, since a dashboard render can fill it and every
-/// widget may plan a sort.
-const CONCURRENT_SORT_QUERIES: usize = 8;
+/// Concurrent sort-bearing queries the query pool must survive.
+///
+/// monoscope opens **TWO** pools against this server, both from `tfParams` in
+/// its `src/System/Config.hs`, and the budget must cover their SUM. Counting
+/// only the first is how prod kept failing dashboard reads with `Resources
+/// exhausted`: at 8 the clamp never binds (22 GB / (24 x 8) = 114 MB, above the
+/// 64 MB default), so nothing limited the real load, and a single observed
+/// failure had the 22 GB pool down to 78.1 MB free behind roughly 344
+/// non-spillable 64 MB merge reservations — about fourteen concurrent sorts,
+/// well past the eight budgeted for.
+///
+/// Keep these two in step with monoscope, or the arithmetic silently protects a
+/// load that does not exist. monoscope's own comment still says "this pool size
+/// IS our concurrency limit against TimeFusion" three lines above the second
+/// pool being opened.
+const CLIENT_PGWIRE_POOL: usize = 8;
+const CLIENT_HASQL_POOL: usize = 30;
+const CONCURRENT_SORT_QUERIES: usize = CLIENT_PGWIRE_POOL + CLIENT_HASQL_POOL;
 
 const DEFAULT_SORT_SPILL_RESERVATION_BYTES: usize = 64 * MIB;
 /// Floor, so a small box (or a large `target_partitions`) cannot clamp the
@@ -1986,6 +2000,10 @@ mod tests {
     #[test_case::test_case(None, 24, 16 * GIB ; "prod: the default already fits")]
     #[test_case::test_case(Some(usize::MAX), 48, 16 * GIB ; "an absurd request cannot escape the pool")]
     #[test_case::test_case(None, 2, 8 * GIB ; "maintenance scan: few partitions, keeps the default")]
+    // Prod's ACTUAL shape. The old table stopped at a 16 GiB pool and never
+    // asked what happens at the size prod really runs, which is how a constant
+    // describing the client could drift from the client unnoticed.
+    #[test_case::test_case(None, 24, 22 * GIB ; "prod today: 24 partitions against the 22 GB pool")]
     fn sort_reservation_always_fits_the_pool(requested: Option<usize>, partitions: usize, pool: usize) {
         let got = sort_spill_reservation_bytes(requested, partitions, pool);
         // Divided, not multiplied: an unclamped `usize::MAX` request would
