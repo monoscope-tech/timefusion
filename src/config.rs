@@ -248,6 +248,11 @@ const CLIENT_PGWIRE_POOL: usize = 8;
 const CLIENT_HASQL_POOL: usize = 30;
 const CONCURRENT_SORT_QUERIES: usize = CLIENT_PGWIRE_POOL + CLIENT_HASQL_POOL;
 
+/// The query pool's concurrency: every client connection that may plan a sort.
+pub const fn client_sort_concurrency() -> usize {
+    CONCURRENT_SORT_QUERIES
+}
+
 const DEFAULT_SORT_SPILL_RESERVATION_BYTES: usize = 64 * MIB;
 /// Floor, so a small box (or a large `target_partitions`) cannot clamp the
 /// reservation to nothing and push sorts back into dying mid-merge.
@@ -270,8 +275,20 @@ const MIN_SORT_SPILL_RESERVATION_BYTES: usize = 8 * MIB;
 /// sorted, and failed dashboard reads with 78.1 MB free.
 const RESERVATION_POOL_SHARE: usize = 2;
 
-pub fn sort_spill_reservation_bytes(requested: Option<usize>, partitions: usize, pool_bytes: usize) -> usize {
-    let cap = pool_bytes / (partitions.max(1) * CONCURRENT_SORT_QUERIES * RESERVATION_POOL_SHARE);
+/// `concurrency` is how many sorts may share `pool_bytes` AT ONCE, and it differs
+/// per pool. The query pool faces monoscope's client connections
+/// (`CONCURRENT_SORT_QUERIES`); the maintenance pool faces its own bounded worker
+/// count and never sees a client at all.
+///
+/// Passing the client number for the maintenance pool over-divides and starves the
+/// reservation — which is not a harmless under-estimate, because this value is the
+/// memory held BACK so a spilling operator can finish its merge. Prod 2026-09-14:
+/// #288 took the maintenance reservation from 64 MB to 33 MB and the 5 GB pool
+/// began failing rollup aggregations with "Failed to reserve memory for sort
+/// during spill" — the exact failure the reservation exists to prevent, four times
+/// in the first four minutes against zero in the preceding hour.
+pub fn sort_spill_reservation_bytes(requested: Option<usize>, partitions: usize, pool_bytes: usize, concurrency: usize) -> usize {
+    let cap = pool_bytes / (partitions.max(1) * concurrency.max(1) * RESERVATION_POOL_SHARE);
     requested.unwrap_or(DEFAULT_SORT_SPILL_RESERVATION_BYTES).min(cap).max(MIN_SORT_SPILL_RESERVATION_BYTES)
 }
 
@@ -2005,33 +2022,67 @@ mod tests {
 
     /// Whatever an operator asks for, the pool must still hold
     /// `CONCURRENT_SORT_QUERIES` sorts of it.
-    #[test_case::test_case(Some(128 * MIB), 24, 16 * GIB ; "prod: an over-large request is clamped")]
-    #[test_case::test_case(None, 24, 16 * GIB ; "prod: the default already fits")]
-    #[test_case::test_case(Some(usize::MAX), 48, 16 * GIB ; "an absurd request cannot escape the pool")]
-    #[test_case::test_case(None, 2, 8 * GIB ; "maintenance scan: few partitions, keeps the default")]
+    #[test_case::test_case(Some(128 * MIB), 24, 16 * GIB, CONCURRENT_SORT_QUERIES ; "prod: an over-large request is clamped")]
+    #[test_case::test_case(None, 24, 16 * GIB, CONCURRENT_SORT_QUERIES ; "prod: the default already fits")]
+    #[test_case::test_case(Some(usize::MAX), 48, 16 * GIB, CONCURRENT_SORT_QUERIES ; "an absurd request cannot escape the pool")]
+    #[test_case::test_case(None, 2, 8 * GIB, 10 ; "maintenance scan: few partitions, keeps the default")]
     // Prod's ACTUAL shape. The old table stopped at a 16 GiB pool and never
     // asked what happens at the size prod really runs, which is how a constant
     // describing the client could drift from the client unnoticed.
-    #[test_case::test_case(None, 24, 22 * GIB ; "prod today: 24 partitions against the 22 GB pool")]
+    #[test_case::test_case(None, 24, 22 * GIB, CONCURRENT_SORT_QUERIES ; "prod today: 24 partitions against the 22 GB pool")]
     // Prod's REAL partition count, read from information_schema.df_settings on
     // 2026-09-14: target_partitions is 8, not the 24 an earlier fix assumed.
-    #[test_case::test_case(None, 8, 22 * GIB ; "prod today: the 8 partitions prod actually runs")]
-    fn sort_reservation_always_fits_the_pool(requested: Option<usize>, partitions: usize, pool: usize) {
-        let got = sort_spill_reservation_bytes(requested, partitions, pool);
+    #[test_case::test_case(None, 8, 22 * GIB, CONCURRENT_SORT_QUERIES ; "prod today: the 8 partitions prod actually runs")]
+    // THE MAINTENANCE POOL, which is shared by maintenance workers and never sees a
+    // client. Feeding it the client count over-divides and starves the reservation:
+    // #288 did exactly that, taking it 64 MB -> 33 MB, and prod began failing rollup
+    // aggregations with "Failed to reserve memory for sort during spill" — six in
+    // seven minutes against zero in the hour before.
+    #[test_case::test_case(None, 2, 5_000_000_000, 10 ; "maintenance pool: its own worker count, not the client count")]
+    fn sort_reservation_always_fits_the_pool(requested: Option<usize>, partitions: usize, pool: usize, concurrency: usize) {
+        let got = sort_spill_reservation_bytes(requested, partitions, pool, concurrency);
         // Divided, not multiplied: an unclamped `usize::MAX` request would
         // overflow the product and fail as a panic rather than as this claim.
         // Reservations must leave room for the DATA. Asserting only that they fit
         // the pool passes at the exact point where they fill it and starve every
         // sort of anywhere to sort into — which is how a clamp that "fits" still
         // produced `Resources exhausted` with 78.1 MB free.
-        let total = got * partitions * CONCURRENT_SORT_QUERIES;
+        let total = got * partitions * concurrency;
         assert!(
             total <= pool / RESERVATION_POOL_SHARE || got == MIN_SORT_SPILL_RESERVATION_BYTES,
-            "{got} x {partitions} x {CONCURRENT_SORT_QUERIES} = {total} takes more than 1/{RESERVATION_POOL_SHARE} of the {pool}-byte pool"
+            "{got} x {partitions} x {concurrency} = {total} takes more than 1/{RESERVATION_POOL_SHARE} of the {pool}-byte pool"
         );
         assert!(got >= MIN_SORT_SPILL_RESERVATION_BYTES, "clamped below the merge floor: {got}");
         // Never RAISES a request — this is a ceiling, not a target.
         assert!(got <= requested.unwrap_or(DEFAULT_SORT_SPILL_RESERVATION_BYTES));
+    }
+
+    /// The maintenance pool must not clamp at all. Its ~5 GB is shared by ~10
+    /// coordinator workers at `MAINTENANCE_MAX_PARTITIONS` = 2, which is 125 MB
+    /// each — comfortably above the 64 MB default, so the ceiling never binds.
+    ///
+    /// #288 passed the CLIENT connection count (38) here instead of the worker
+    /// count, cutting the reservation to 33 MB, and prod began failing rollup
+    /// aggregations with "Failed to reserve memory for sort during spill" — six in
+    /// seven minutes against zero in the hour before. The reservation is the memory
+    /// held BACK so a spilling operator can finish; starving it causes precisely
+    /// the failure it exists to prevent.
+    #[test]
+    fn the_maintenance_pool_never_clamps_its_spill_reservation() {
+        const MAINTENANCE_PARTITIONS: usize = 2;
+        const MAINTENANCE_WORKERS: usize = 10;
+        const POOL: usize = 5_000_000_000;
+        assert_eq!(
+            sort_spill_reservation_bytes(None, MAINTENANCE_PARTITIONS, POOL, MAINTENANCE_WORKERS),
+            DEFAULT_SORT_SPILL_RESERVATION_BYTES,
+            "the maintenance pool is generous enough that the ceiling must not bind"
+        );
+        // And with the client count it WOULD bind — the regression, pinned so the
+        // two numbers can never be confused for each other again.
+        assert!(
+            sort_spill_reservation_bytes(None, MAINTENANCE_PARTITIONS, POOL, CONCURRENT_SORT_QUERIES) < DEFAULT_SORT_SPILL_RESERVATION_BYTES,
+            "using the client count here is what starved the spill reservation"
+        );
     }
 
     // Prod-shaped box (120 GiB / 48 cores, 11 hot projects).
