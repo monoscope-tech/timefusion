@@ -2428,7 +2428,67 @@ impl PhysicalOptimizerRule for DedupNeedsOrderedInput {
             swap_child(node, merged)
         })
         .data()
+        .and_then(unblock_ordered_legs)
     }
+}
+
+/// Turn a leg's blocking re-sort back into the streaming merge its own data
+/// already supports.
+///
+/// A scan whose file groups each declare the sort ordering loses it to a
+/// `CoalescePartitionsExec` (inserted to satisfy a single-partition
+/// requirement), which concatenates partitions instead of merging them.
+/// `EnforceSorting` then restores the ordering the only way it can from an
+/// unordered input: a `SortExec` with no `fetch`, below the `LIMIT`, over the
+/// whole scanned window. Measured 2026-09-15 on a three-day log-explorer read:
+/// eight already-ordered file groups, coalesced, then fully re-sorted in one
+/// partition — the operator that exhausted the query pool.
+///
+/// DataFusion's own `replace_with_order_preserving_variants` cannot reach this:
+/// it does not know that the operators between the sort and the coalesce
+/// (`GatedScanExec`, `OrderingProbeExec`, the Delta scan) pass ordering through.
+///
+/// INERT BY CONSTRUCTION. The coalesce becomes a merge only on its child's OWN
+/// declared ordering — never a requirement resolved from above, which a
+/// projection could misalign — and the `SortExec` is dropped only once the
+/// rebuilt input PROVES it satisfies what the sort provided. Any operator that
+/// fails to propagate ordering fails that proof, and the plan is returned
+/// unchanged.
+fn unblock_ordered_legs(plan: Arc<dyn ExecutionPlan>) -> Result<Arc<dyn ExecutionPlan>> {
+    plan.transform_up(|node| {
+        // A sort carrying a fetch is already a bounded TopK; it is not the problem.
+        // `preserve_partitioning` sorts keep their input's partition count, which a
+        // merge would collapse — only the merging kind is interchangeable with one.
+        let Some(sort) = downcast::<SortExec>(node.as_ref()).filter(|s| s.fetch().is_none() && !s.preserve_partitioning()) else {
+            return Ok(Transformed::no(node));
+        };
+        let req = sort.expr().clone();
+        let rebuilt = Arc::clone(sort.input()).transform_up(|inner| {
+            let Some(coalesce) = downcast::<CoalescePartitionsExec>(inner.as_ref()) else {
+                return Ok(Transformed::no(inner));
+            };
+            let source = Arc::clone(coalesce.children()[0]);
+            // The child's own ordering, in the child's own schema — no index
+            // translation, so nothing to get wrong.
+            match source.properties().equivalence_properties().output_ordering() {
+                Some(ordering) => Ok(Transformed::yes(Arc::new(SortPreservingMergeExec::new(ordering, source)) as Arc<dyn ExecutionPlan>)),
+                None => Ok(Transformed::no(inner)),
+            }
+        })?;
+        if !rebuilt.transformed {
+            return Ok(Transformed::no(node));
+        }
+        // The proof. Only an input that already delivers EVERYTHING the sort
+        // delivered may replace it: the ordering, and the sort's single output
+        // partition (a repartition between coalesce and sort would widen it).
+        // Anything less and we keep the sort we understand.
+        let props = rebuilt.data.properties();
+        match props.output_partitioning().partition_count() == 1 && props.equivalence_properties().ordering_satisfy(req.iter().cloned())? {
+            true => Ok(Transformed::yes(rebuilt.data)),
+            false => Ok(Transformed::no(node)),
+        }
+    })
+    .data()
 }
 
 #[cfg(test)]
@@ -2478,6 +2538,59 @@ mod dedup_needs_ordered_input_tests {
         assert_eq!(child_name(&plan), if coalesced { "CoalescePartitionsExec" } else { "SortPreservingMergeExec" }, "precondition");
 
         child_name(&DedupNeedsOrderedInput.optimize(plan, &ConfigOptions::default()).unwrap())
+    }
+
+    /// Every `SortExec` anywhere in the tree.
+    fn count_sorts(plan: &Arc<dyn ExecutionPlan>) -> usize {
+        usize::from(downcast::<SortExec>(plan.as_ref()).is_some()) + plan.children().into_iter().map(count_sorts).sum::<usize>()
+    }
+
+    fn has_spm(plan: &Arc<dyn ExecutionPlan>) -> bool {
+        downcast::<SortPreservingMergeExec>(plan.as_ref()).is_some() || plan.children().into_iter().any(has_spm)
+    }
+
+    /// The shape prod actually plans (2026-09-15 log explorer): the coalesce is
+    /// buried under passthrough operators, so it is NOT the dedup's direct child
+    /// and the original rule cannot see it. `EnforceSorting` has already put a
+    /// fetch-less `SortExec` on top to rebuild the ordering the coalesce erased.
+    ///
+    /// `ordered` is whether the scan declares its per-partition ordering — the
+    /// only thing that makes the rewrite provable. Without it the plan must come
+    /// back byte-identical, sort and all.
+    #[test_case::test_case(true, 0, true ; "ordered source: the blocking sort goes, a streaming merge replaces it")]
+    #[test_case::test_case(false, 1, false ; "undeclared ordering: nothing is provable, so nothing changes")]
+    fn unblocks_a_buried_coalesce(ordered: bool, want_sorts: usize, want_spm: bool) {
+        let source: Arc<dyn ExecutionPlan> = match ordered {
+            true => ordered_source(),
+            // Same data, same partitioning — only the declaration withheld.
+            false => {
+                let schema = Arc::new(Schema::new(vec![Field::new("ts", DataType::Int64, false), Field::new("id", DataType::Int64, false)]));
+                let batch =
+                    |a: i64| RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![a])), Arc::new(Int64Array::from(vec![a]))]).unwrap();
+                Arc::new(DataSourceExec::new(Arc::new(MemorySourceConfig::try_new(&[vec![batch(2)], vec![batch(1)]], schema, None).unwrap())))
+            }
+        };
+        // scan -> coalesce -> passthrough -> SortExec(no fetch) -> dedup
+        let coalesced = Arc::new(CoalescePartitionsExec::new(source)) as Arc<dyn ExecutionPlan>;
+        let passthrough =
+            Arc::new(datafusion::physical_plan::filter::FilterExec::try_new(datafusion::physical_expr::expressions::lit(true), coalesced).unwrap());
+        let sorted = Arc::new(SortExec::new(ts_ordering(), passthrough)) as Arc<dyn ExecutionPlan>;
+        let plan = dedup_over(sorted, Some(ts_ordering()));
+        assert_eq!(count_sorts(&plan), 1, "precondition: the blocking sort is there to begin with");
+
+        let out = DedupNeedsOrderedInput.optimize(plan, &ConfigOptions::default()).unwrap();
+        assert_eq!(count_sorts(&out), want_sorts);
+        assert_eq!(has_spm(&out), want_spm);
+    }
+
+    /// A sort that already carries a fetch is a bounded TopK and costs nothing to
+    /// leave alone — the rule must not touch it even over a rewritable coalesce.
+    #[test]
+    fn a_fetching_sort_is_left_alone() {
+        let coalesced = Arc::new(CoalescePartitionsExec::new(ordered_source())) as Arc<dyn ExecutionPlan>;
+        let sorted = Arc::new(SortExec::new(ts_ordering(), coalesced).with_fetch(Some(10))) as Arc<dyn ExecutionPlan>;
+        let out = DedupNeedsOrderedInput.optimize(dedup_over(sorted, Some(ts_ordering())), &ConfigOptions::default()).unwrap();
+        assert_eq!(count_sorts(&out), 1, "a TopK must survive the rewrite");
     }
 }
 
