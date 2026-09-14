@@ -381,6 +381,19 @@ pub fn init_metrics(
         "Longest a hygiene permit has been held in one phase (high-water mark). Long AND acquisitions climbing = saturated by long sorts; long AND acquisitions frozen = stuck",
         maintenance_stats().permit_held_secs.load(Relaxed)
     );
+    // The two failure classes observed on 2026-09-14, neither of which had a
+    // metric. A user-facing error with no history is invisible between incidents,
+    // and "did it get better?" is unanswerable without one.
+    observe!(counter
+        "timefusion.pgwire.stream_failed",
+        "pgwire row streams that died mid-flight — the user-visible query failure",
+        maintenance_stats().pgwire_stream_failed.load(Relaxed)
+    );
+    observe!(counter
+        "timefusion.maintenance.coordinator_errors",
+        "Maintenance turns that ended in an error, most often a rollup aggregation losing the maintenance pool — the upstream of not_built rollup misses",
+        maintenance_stats().maintenance_coordinator_errors.load(Relaxed)
+    );
     observe!(gauge
         "timefusion.maintenance.permits_available",
         "Free hygiene rewrite permits. Pinned at 0 while the lane is wedged",
@@ -1037,6 +1050,16 @@ atomic_stats! {
         /// measurement, not for a cause — the first reading refuted the cause it
         /// was built to confirm.
         permit_held_secs,
+        /// pgwire row streams that died mid-flight — the user-visible failure. Was
+        /// log-only, so a dashboard erroring for an hour left no trace once the
+        /// container was replaced. Measured 2026-09-14: 4 in 44 minutes, intervals
+        /// shrinking to 4 minutes, and nothing recorded it.
+        pgwire_stream_failed,
+        /// Maintenance coordinator turns that ended in an error — most often a
+        /// rollup aggregation losing the 5 GB maintenance pool. Directly produces
+        /// the `not_built` rollup misses the read path then pays for, and likewise
+        /// had no counter: `timefusion.optimize.failed` reports NO DATA over 7 days.
+        maintenance_coordinator_errors,
         light_rewrite_permits_total,
         /// Dashboard aggregates served from a rollup, split by how much of the
         /// window the rollup owned. `rollup_hits_hybrid` is what proves the

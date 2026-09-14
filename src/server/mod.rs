@@ -443,6 +443,7 @@ fn with_response_deadline(response: Response, deadline: Option<tokio::time::Inst
                     };
                     if let Some((Err(error), _)) = &next {
                         // `?` escapes multiline causes so line-based collectors keep the full error on one line.
+                        crate::observability::maintenance_stats().pgwire_stream_failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         warn!(event = "pgwire.stream_failed", error = ?error.to_string(), "PostgreSQL row stream failed");
                     }
                     next

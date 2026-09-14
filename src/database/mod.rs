@@ -3890,6 +3890,9 @@ impl Database {
                                         }
                                         Ok(Ok(false)) => true,
                                         Ok(Err(error)) => {
+                                            crate::observability::maintenance_stats()
+                                                .maintenance_coordinator_errors
+                                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                             warn!(worker, %error, event = "maintenance_coordinator_error");
                                             true
                                         }
