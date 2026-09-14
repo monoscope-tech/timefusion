@@ -7537,6 +7537,28 @@ impl Database {
 
         self.maintenance_shutdown.cancel();
 
+        // Signalling is not stopping. Until now the handles were dropped on spawn,
+        // so nothing could wait, and Foyer plus the delta-kernel executor were torn
+        // down underneath tasks still holding them. 2026-09-14 produced three
+        // teardown panics from that — delta-kernel's `TokioMultiThreadExecutor has
+        // crashed: RecvError`, a `bytes` range assertion mid-drain, and a Foyer LRU
+        // panic inside a destructor, which escalated to SIGABRT and killed the
+        // process (a panic in `Drop` while unwinding cannot unwind).
+        //
+        // Bounded and best-effort by necessity: a unit mid-sort observes
+        // cancellation only at its next checkpoint, and one was measured running
+        // 5,051s against a 900s deadline. Waiting the remaining grace closes the
+        // window for everything short-lived and costs nothing when it expires — the
+        // process is exiting either way.
+        self.maintenance_tasks_tracker.close();
+        if tokio::time::timeout_at(deadline, self.maintenance_tasks_tracker.wait()).await.is_err() {
+            warn!(
+                outstanding = self.maintenance_tasks_tracker.len(),
+                event = "maintenance_tasks_outlived_shutdown",
+                "maintenance tasks still running at teardown; dependencies they hold are about to be dropped"
+            );
+        }
+
         if let Some(ref queue) = self.batch_queue {
             info!("Flushing batch queue...");
             if tokio::time::timeout_at(deadline, queue.shutdown()).await.is_err() {
@@ -8295,5 +8317,40 @@ mod unit_lifetime_cap_tests {
         for operation in [Operation::BaseRollup, Operation::DerivedRollup, Operation::Dedup] {
             assert!(coordinator_operation_lifetime_cap(operation).is_none(), "{operation:?} holds no permit and must keep idle-only semantics");
         }
+    }
+}
+
+#[cfg(test)]
+mod maintenance_teardown_tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering::SeqCst},
+    };
+
+    use super::*;
+    use crate::support::test_helpers::TestConfigBuilder;
+
+    /// Shutdown must WAIT for maintenance work, not merely signal it.
+    ///
+    /// The handles used to be dropped on spawn, so `cancel_maintenance` set a flag
+    /// and teardown proceeded immediately — dropping Foyer and the delta-kernel
+    /// executor underneath tasks still using them. 2026-09-14 produced three
+    /// teardown panics from exactly that, one of which aborted the process.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shutdown_waits_for_a_maintenance_task_to_finish() -> Result<()> {
+        let db = Database::with_config(TestConfigBuilder::new("maintenance_teardown").build()).await?;
+        let finished = Arc::new(AtomicBool::new(false));
+
+        let flag = Arc::clone(&finished);
+        db.maintenance_tasks_tracker.spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            flag.store(true, SeqCst);
+        });
+
+        // A deadline comfortably past the task, so expiry cannot be what ends the wait.
+        db.shutdown_by(tokio::time::Instant::now() + std::time::Duration::from_secs(10)).await?;
+
+        assert!(finished.load(SeqCst), "shutdown returned while a maintenance task was still running — its dependencies are torn down next");
+        Ok(())
     }
 }
