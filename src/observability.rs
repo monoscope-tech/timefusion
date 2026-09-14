@@ -377,9 +377,9 @@ pub fn init_metrics(
     // history told the story immediately: over the same seven days
     // `pending_dirty_partitions` rose 340 -> 588 and `cron_long_running` tripled.
     observe!(gauge
-        "timefusion.maintenance.permit_held_without_staging_seconds",
-        "Longest a hygiene permit has been held without reaching a sort. THE wedge signal: a wedged lane stops counting rather than counting badly, so every throughput metric goes quiet and quiet reads as healthy",
-        maintenance_stats().permit_held_without_staging_secs.load(Relaxed)
+        "timefusion.maintenance.permit_held_seconds",
+        "Longest a hygiene permit has been held in one phase (high-water mark). Long AND acquisitions climbing = saturated by long sorts; long AND acquisitions frozen = stuck",
+        maintenance_stats().permit_held_secs.load(Relaxed)
     );
     observe!(gauge
         "timefusion.maintenance.permits_available",
@@ -1030,11 +1030,13 @@ atomic_stats! {
         /// at boot from `coordinator_share / COORDINATOR_PER_SORT_BUDGET -
         /// repair_holdback`, floored at 1 — never derive it by hand.
         light_rewrite_permits_available,
-        /// Longest a hygiene permit has been held WITHOUT reaching the sort, this
-        /// process. The wedge detector: the lane holds both permits and claims
-        /// nothing, so every throughput counter simply stops rather than reading
-        /// as bad, and a stopped counter is indistinguishable from a quiet one.
-        permit_held_without_staging_secs,
+        /// Longest a hygiene permit has been held in ONE phase, this process, as
+        /// a high-water mark. Read it WITH `compaction_permits_acquired`: a long
+        /// hold while acquisitions keep climbing is a saturated lane (long sorts);
+        /// a long hold while they are FROZEN is a stuck one. Named for the
+        /// measurement, not for a cause — the first reading refuted the cause it
+        /// was built to confirm.
+        permit_held_secs,
         light_rewrite_permits_total,
         /// Dashboard aggregates served from a rollup, split by how much of the
         /// window the rollup owned. `rollup_hits_hybrid` is what proves the

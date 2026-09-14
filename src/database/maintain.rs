@@ -2778,14 +2778,14 @@ impl Database {
                     // The gauge is the half that outlives the process: a log line
                     // has to be grepped on a host, this gets history in monoscope.
                     let stats = crate::observability::maintenance_stats();
-                    stats.permit_held_without_staging_secs.fetch_max(held_secs, std::sync::atomic::Ordering::Relaxed);
+                    stats.permit_held_secs.fetch_max(held_secs, std::sync::atomic::Ordering::Relaxed);
                     warn!(
                         phase = PERMIT_PHASES[phase.load(std::sync::atomic::Ordering::Relaxed).min(PERMIT_PHASES.len() - 1)],
                         operation = %watched_operation,
                         held_permit = holds_light_permit,
                         held_secs,
-                        event = "compaction_permit_held_without_staging",
-                        "a light permit has been held this long without starting a sort"
+                        event = "compaction_permit_held",
+                        "a light permit has been held this long in one phase"
                     );
                 }
             }
