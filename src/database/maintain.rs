@@ -4140,18 +4140,62 @@ impl Database {
             }
             return self.record_certification(table_ref, table_name, project_id, date, pre, (dropped, true)).await;
         }
+        // What survives a fingerprint move, computed BEFORE taking the DashMap entry
+        // so the read lock on the table is not held across it.
+        //
+        // The old rule discarded the day's whole accumulated coverage on any
+        // fingerprint move. On a live partition that is every flush — roughly every
+        // ten minutes — so coverage never grew past one slice while files span
+        // hours, and `cert_slice_files_proved` sat at 9 against 2,194 unproven. The
+        // invariant is no longer "proved under the same fp" but "every file added
+        // since is span-disjoint from this interval", which is the same overlap
+        // argument `certified_files_in_partition` already makes per file.
+        //
+        // Sound only where `timestamp` is a dedup key — a duplicate group then
+        // shares one timestamp, so a new file cannot mint duplicates outside its own
+        // span. Everything else resets, as before.
+        let retained: Option<Vec<(i64, i64)>> = if !self.config.maintenance.timefusion_dedup_coverage_retention
+            || !schema_or_default(table_name).dedup_keys.iter().any(|key| key == "timestamp")
+        {
+            None
+        } else {
+            let prior = self.dedup_slice_coverage.get(&key).map(|e| e.value().clone()).filter(|cov| cov.fp != fp && !cov.files.is_empty());
+            match prior {
+                None => None,
+                Some(cov) => {
+                    let known: HashSet<&str> = cov.files.iter().filter_map(|uri| crate::tantivy::search::parquet_rel_of_uri(uri)).collect();
+                    let spans = {
+                        let table = table_ref.read().await;
+                        Self::partition_file_spans(&table, &format!("date={date}"))
+                    };
+                    // A partition we cannot read spans for proves nothing new.
+                    spans.ok().and_then(|spans| {
+                        let arrived: Vec<Option<(i64, i64)>> = spans.iter().filter(|(rel, _)| !known.contains(rel.as_str())).map(|(_, span)| *span).collect();
+                        crate::database::retain_clean_intervals(&cov.intervals, &arrived)
+                    })
+                }
+            }
+        };
         // Bind in its own block: the RefMut must drop before the remove/await below
         // (DashMap-shard self-deadlock).
-        // `intervals` is the ACCUMULATED clean coverage, not just this slice. Every
-        // interval was proved under the same `fp` (the entry resets wholesale when the
-        // fingerprint moves), so the union is exactly as sound as one slice.
         let (covered, intervals) = {
-            let mut entry = self.dedup_slice_coverage.entry(key.clone()).or_insert_with(|| SliceCoverage { fp, intervals: Vec::new() });
+            let mut entry = self.dedup_slice_coverage.entry(key.clone()).or_insert_with(|| SliceCoverage { fp, intervals: Vec::new(), files: Vec::new() });
             if entry.fp != fp {
-                *entry = SliceCoverage { fp, intervals: vec![(start, end)] };
+                match retained {
+                    Some(keep) => {
+                        metrics::counter!(scan_metric_names::CERT_COVERAGE_RETAINED).increment(1);
+                        *entry = SliceCoverage { fp, intervals: keep, files: Vec::new() };
+                        merge_clean_interval(&mut entry.intervals, (start, end));
+                    }
+                    None => {
+                        metrics::counter!(scan_metric_names::CERT_COVERAGE_RESET).increment(1);
+                        *entry = SliceCoverage { fp, intervals: vec![(start, end)], files: Vec::new() };
+                    }
+                }
             } else {
                 merge_clean_interval(&mut entry.intervals, (start, end));
             }
+            entry.files = post.clone();
             (entry.intervals.iter().any(|&(s, e)| s <= day_start && e >= day_end), entry.intervals.clone())
         };
         // Write-through on every mutation: the journal durably marks this slice
@@ -4766,6 +4810,7 @@ impl Database {
                 let ((project_id, table_name, date), cov) = (entry.key().clone(), entry.value().clone());
                 crate::storage::StoredSliceCoverage {
                     proof_version: crate::storage::DedupProofVersion::PhysicalRowOrderV1,
+                    files: cov.files.clone(),
                     project_id,
                     table_name,
                     date,
