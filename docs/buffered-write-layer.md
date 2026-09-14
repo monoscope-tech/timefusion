@@ -363,7 +363,7 @@ pub async fn shutdown(&self) -> anyhow::Result<()> {
 | `src/write/wal.rs` | WAL manager using walrus-rust |
 | `src/write/mem_buffer.rs` | In-memory buffer with time buckets |
 | `src/write/mod.rs` | Orchestration layer |
-| `src/database/mod.rs` | `ProjectRoutingTable::scan()` for unified queries |
+| `src/database/scan.rs` | `ProjectRoutingTable::scan()` for unified queries |
 
 ## Future Improvements
 
