@@ -2213,6 +2213,13 @@ pub struct Database {
     pub scan_metrics: Arc<ScanMetrics>,
     batch_queue: Option<Arc<crate::write::BatchQueue>>,
     maintenance_shutdown: Arc<CancellationToken>,
+    /// Every background maintenance task, so shutdown can WAIT for them rather
+    /// than only signalling. `cancel_maintenance` sets a flag; without this the
+    /// handles were dropped on spawn, so foyer and the delta-kernel executor were
+    /// torn down underneath tasks still using them — which is what produced three
+    /// separate teardown panics on 2026-09-14, one of them a SIGABRT that killed
+    /// the process (a panic inside `Drop` during unwind does not unwind, it aborts).
+    maintenance_tasks_tracker: tokio_util::task::TaskTracker,
     /// Cancels `maintenance_shutdown` when the last guard-holding clone drops. `None` in clones
     /// handed to long-lived background tasks — a task waiting on the token must not hold its own
     /// kill-switch alive.
@@ -2889,6 +2896,7 @@ impl Database {
         // In units, not readers: one reader slot is `DECODE_UNITS_PER_READER` units.
         let heavy_scan_permits = cfg.memory.timefusion_max_concurrent_scan_readers.max(1) * DECODE_UNITS_PER_READER as usize;
         let maintenance_shutdown = CancellationToken::new();
+        let maintenance_tasks_tracker = tokio_util::task::TaskTracker::new();
         let maintenance_cancel_guard = Arc::new(maintenance_shutdown.clone().drop_guard());
         // Narrow so maintenance cannot saturate PGWire; I/O is latency-bound, so it gets more.
         let coordinator_jobs = cfg.derived.coordinator_jobs();
@@ -2921,6 +2929,7 @@ impl Database {
             scan_metrics: Arc::new(ScanMetrics::default()),
             batch_queue: None,
             maintenance_shutdown: Arc::new(maintenance_shutdown),
+            maintenance_tasks_tracker,
             _maintenance_cancel_guard: Some(maintenance_cancel_guard),
             preload_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             preload_replay_complete: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -4179,7 +4188,8 @@ impl Database {
         F: FnOnce(Arc<Self>, Arc<CancellationToken>) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = ()> + Send + 'static,
     {
-        tokio::spawn(async move {
+        let tracker = db.maintenance_tasks_tracker.clone();
+        tracker.spawn(async move {
             if db.wait_for_preload(&cancel).await {
                 body(db, cancel).await;
             }
