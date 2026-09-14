@@ -5062,7 +5062,7 @@ fn filesets_equal_only_when_unchanged() {
 fn sorted_rewrites_sort_by_timestamp_and_consolidation_dedups_opportunistically() {
     use deltalake::operations::optimize::OptimizeType;
     let schema = get_schema("otel_logs_and_spans").unwrap();
-    let (optimize_type, declare_sorted) = full_optimize_type(schema, true);
+    let (optimize_type, declare_sorted) = choose_optimize_type(schema, false, true);
     assert!(matches!(optimize_type, OptimizeType::SortBy(_)));
     assert!(declare_sorted);
 

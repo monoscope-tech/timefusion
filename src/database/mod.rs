@@ -5812,12 +5812,6 @@ fn schema_order_by_clause(schema: &crate::schema::TableSchema) -> String {
     if cols.is_empty() { String::new() } else { format!(" ORDER BY {cols}") }
 }
 
-/// Full compaction optionally sorts by the schema's timestamp-leading keys so
-/// rewritten files retain tight timestamp statistics and an honest footer.
-fn full_optimize_type(schema: &crate::schema::TableSchema, allow_sort: bool) -> (deltalake::operations::optimize::OptimizeType, bool) {
-    choose_optimize_type(schema, false, allow_sort)
-}
-
 /// One staged bin's intent line in the staged-intent manifest.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct StagedIntent {
@@ -7156,6 +7150,8 @@ where
     failed
 }
 
+/// Sorting by the schema's timestamp-leading keys is what keeps rewritten files'
+/// timestamp statistics tight and their footers honest.
 fn choose_optimize_type(schema: &crate::schema::TableSchema, allow_zorder: bool, allow_sort: bool) -> (deltalake::operations::optimize::OptimizeType, bool) {
     use deltalake::operations::optimize::OptimizeType;
     if allow_zorder && !schema.z_order_columns.is_empty() {

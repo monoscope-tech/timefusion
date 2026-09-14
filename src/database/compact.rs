@@ -79,7 +79,7 @@ impl Database {
         let schema = schema_or_default(table_name);
         // Sorting keeps rewritten files timestamp-local, so short ranges can
         // prune whole files and row groups.
-        let (optimize_type, declare_sorted) = full_optimize_type(schema, self.config.maintenance.timefusion_optimize_sort_by);
+        let (optimize_type, declare_sorted) = choose_optimize_type(schema, false, self.config.maintenance.timefusion_optimize_sort_by);
         let writer_properties = self.create_writer_properties(schema, self.config.parquet.timefusion_zstd_level_warm, declare_sorted);
         // SortBy materializes large Arrow buffers, so in-server bins are serial.
         let optimize_concurrency = if declare_sorted { 1 } else { self.config.derived.optimize_merge_tasks() };
