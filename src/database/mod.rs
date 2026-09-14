@@ -4242,18 +4242,14 @@ impl Database {
         // query pool by monoscope's client connections. Using the client count for
         // maintenance starves the spill reservation.
         let (partitions, pool_bytes, pinned, concurrency) = match (self.maintenance_scan, self.config.memory.timefusion_query_partitions) {
-            (true, _) => (
-                MAINTENANCE_MAX_PARTITIONS,
-                self.config.derived.maintenance_pool_bytes(),
-                true,
-                self.config.derived.coordinator_jobs(),
-            ),
+            (true, _) => (MAINTENANCE_MAX_PARTITIONS, self.config.derived.maintenance_pool_bytes(), true, self.config.derived.coordinator_jobs()),
             (false, 0) => (self.config.derived.cores(), self.config.derived.query_pool_bytes(), false, crate::config::client_sort_concurrency()),
             (false, n) => (n, self.config.derived.query_pool_bytes(), true, crate::config::client_sort_concurrency()),
         };
         let _ = options.set(
             "datafusion.execution.sort_spill_reservation_bytes",
-            &crate::config::sort_spill_reservation_bytes(self.config.memory.timefusion_sort_spill_reservation_bytes, partitions, pool_bytes, concurrency).to_string(),
+            &crate::config::sort_spill_reservation_bytes(self.config.memory.timefusion_sort_spill_reservation_bytes, partitions, pool_bytes, concurrency)
+                .to_string(),
         );
         // Cap query parallelism at the container's CPU quota (0 = DataFusion default).
         if pinned {
