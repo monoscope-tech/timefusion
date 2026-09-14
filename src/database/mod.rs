@@ -278,6 +278,12 @@ pub mod scan_metric_names {
         // Summed dirty bins across declined dates, out of 144 per date.
         CERT_DECLINED_DIRTY_BINS = "timefusion.scan.cert_declined_dirty_bins" as scan.cert_declined_dirty_bins;
         CERT_SLICE_FILES_UNPROVEN = "timefusion.scan.cert_slice_files_unproven" as scan.cert_slice_files_unproven;
+        // A fingerprint move that KEPT span-disjoint coverage instead of discarding
+        // the day. Read against `cert_coverage_reset`: coverage that only ever
+        // resets is coverage that never accumulates, which is what held
+        // `cert_slice_files_proved` at 9 against 2,194 unproven.
+        CERT_COVERAGE_RETAINED = "timefusion.scan.cert_coverage_retained" as scan.cert_coverage_retained;
+        CERT_COVERAGE_RESET = "timefusion.scan.cert_coverage_reset" as scan.cert_coverage_reset;
         // `declined`: the isolated non-conforming leg exceeded
         // `timefusion_read_sort_unordered_leg_max_mb`, so the union advertises no
         // ordering and `ORDER BY ts DESC LIMIT n` becomes a blocking sort.
@@ -626,6 +632,28 @@ struct Certification {
 struct SliceCoverage {
     fp: u64,
     intervals: Vec<(i64, i64)>,
+    /// The partition's file set when this coverage was last written, so a later
+    /// fingerprint move can ask WHICH files are new instead of discarding
+    /// everything. Empty means "written before this was recorded" — such an entry
+    /// cannot be diffed and must reset, which is how legacy sidecars load.
+    files: Vec<String>,
+}
+
+/// Which clean intervals survive a set of newly-arrived files.
+///
+/// Sound only where `timestamp` is a dedup key: then a duplicate group shares one
+/// timestamp, so a file spanning `[min, max]` can only mint duplicates inside
+/// `[min, max]` and an interval disjoint from every new span stays proved.
+///
+/// `None` means "cannot decide, reset": a file with no span statistics overlaps
+/// everything, which is the same rule `partition_file_spans` states for readers.
+fn retain_clean_intervals(intervals: &[(i64, i64)], new_spans: &[Option<(i64, i64)>]) -> Option<Vec<(i64, i64)>> {
+    if new_spans.iter().any(Option::is_none) {
+        return None;
+    }
+    let spans: Vec<(i64, i64)> = new_spans.iter().flatten().copied().collect();
+    // Half-open interval vs inclusive span, matching `certify_files_within_slice`.
+    Some(intervals.iter().copied().filter(|&(s, e)| !spans.iter().any(|&(min, max)| s <= max && min < e)).collect())
 }
 
 /// Merge `[start, end)` into a sorted vec of disjoint half-open intervals.
@@ -2824,7 +2852,7 @@ impl Database {
             // Slice coverage too: the journal durably skips completed slices, so losing their
             // evidence makes any day straddling one permanently uncertifiable.
             for e in crate::storage::load_sidecar::<crate::storage::StoredSliceCoverage>(&cfg.core.timefusion_data_dir, crate::storage::SLICE_COVERAGE) {
-                dedup_slice_coverage.insert((e.project_id, e.table_name, e.date), SliceCoverage { fp: e.fp, intervals: e.intervals });
+                dedup_slice_coverage.insert((e.project_id, e.table_name, e.date), SliceCoverage { fp: e.fp, intervals: e.intervals, files: e.files });
             }
             info!(loaded = dedup_slice_coverage.len(), event = "dedup_slice_coverage_loaded");
         }
@@ -17459,5 +17487,49 @@ mod footer_repair_schedule_tests {
         assert_eq!(budget, std::time::Duration::from_secs(8640), "144-minute budget");
         assert!(budget >= std::time::Duration::from_secs(43 * 60 * 3), "must clear 3x the measured solo rewrite");
         assert!(budget > period, "a long run must not be capped by a short cadence");
+    }
+}
+
+#[cfg(test)]
+mod clean_coverage_retention_tests {
+    use super::retain_clean_intervals;
+
+    /// The defect this replaces: coverage was discarded on ANY fingerprint move,
+    /// and on a live partition that is every flush. Prod 2026-09-14 measured the
+    /// consequence — `cert_slice_files_proved` 9 against `cert_slice_files_unproven`
+    /// 2,194, because accumulated coverage never outlived one slice while files
+    /// span hours.
+    ///
+    /// Ingest appends at the TAIL, so the morning's proved intervals are disjoint
+    /// from every file arriving now and must survive.
+    #[test]
+    fn a_tail_append_keeps_the_morning_proved() {
+        let day = [(0i64, 100), (100, 200), (200, 300)];
+        let kept = retain_clean_intervals(&day, &[Some((320, 400))]).expect("spans known");
+        assert_eq!(kept, day.to_vec(), "a file that lands after every interval invalidates none of them");
+    }
+
+    /// Only the overlapped interval is lost — the point of the change.
+    #[test]
+    fn an_overlapping_file_drops_only_what_it_touches() {
+        let day = [(0i64, 100), (100, 200), (200, 300)];
+        let kept = retain_clean_intervals(&day, &[Some((150, 160))]).expect("spans known");
+        assert_eq!(kept, vec![(0, 100), (200, 300)], "the 100-200 interval is the only one the new rows could duplicate into");
+    }
+
+    /// Fails CLOSED. A file with no statistics overlaps everything, the same rule
+    /// `partition_file_spans` states for readers, so the caller must reset.
+    #[test]
+    fn a_file_without_span_statistics_forces_a_reset() {
+        assert!(retain_clean_intervals(&[(0, 100)], &[Some((500, 600)), None]).is_none(), "unknown span must not be read as disjoint");
+    }
+
+    /// Half-open interval against an inclusive span, matching
+    /// `certify_files_within_slice`. A file whose max lands exactly on `start`
+    /// DOES touch the interval; one whose min equals `end` does not.
+    #[test]
+    fn boundaries_match_the_certification_test() {
+        assert_eq!(retain_clean_intervals(&[(100, 200)], &[Some((50, 100))]).unwrap(), Vec::<(i64, i64)>::new(), "max == start overlaps");
+        assert_eq!(retain_clean_intervals(&[(100, 200)], &[Some((200, 250))]).unwrap(), vec![(100, 200)], "min == end does not");
     }
 }

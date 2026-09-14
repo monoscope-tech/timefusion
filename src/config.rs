@@ -1647,6 +1647,11 @@ pub struct MaintenanceConfig {
     /// store costs a skip rather than granting a wrong one.
     #[serde_inline_default(true)]
     pub timefusion_dedup_certification_persist: bool,
+    /// Keep span-disjoint clean coverage across a partition fingerprint move
+    /// instead of discarding the day. Kill switch for the read-side dedup skip:
+    /// a defect here is wrong ROWS, not slow ones, so it reverts in one env var.
+    #[serde_inline_default(true)]
+    pub timefusion_dedup_coverage_retention: bool,
     /// Allow `DedupExec` to run in streaming `bounded[timestamp]` mode, which
     /// trusts the scan's declared `output_ordering` (the parquet footer's
     /// `sorting_columns`). A lying footer makes one "run" span many timestamps

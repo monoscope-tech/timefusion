@@ -2832,6 +2832,12 @@ pub struct StoredSliceCoverage {
     pub date: String,
     pub fp: u64,
     pub intervals: Vec<(i64, i64)>,
+    /// The file set the coverage was proved over. `default` so a sidecar written
+    /// before this field loads as empty, which the reader treats as
+    /// "undiffable, reset on the next fingerprint move" rather than as coverage
+    /// it may retain.
+    #[serde(default)]
+    pub files: Vec<String>,
 }
 pub const DIRTY_BINS: (&str, &str) = ("dedup_dirty_bins.json", "dirty-bin queue");
 
