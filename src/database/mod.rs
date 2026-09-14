@@ -4238,14 +4238,22 @@ impl Database {
         // Partition count and pool together price the sort reservation, which is
         // taken per partition and cannot spill. `pinned` distinguishes a count this
         // session imposes from one merely used to price the reservation.
-        let (partitions, pool_bytes, pinned) = match (self.maintenance_scan, self.config.memory.timefusion_query_partitions) {
-            (true, _) => (MAINTENANCE_MAX_PARTITIONS, self.config.derived.maintenance_pool_bytes(), true),
-            (false, 0) => (self.config.derived.cores(), self.config.derived.query_pool_bytes(), false),
-            (false, n) => (n, self.config.derived.query_pool_bytes(), true),
+        // Concurrency is per POOL: maintenance is shared by its own workers, the
+        // query pool by monoscope's client connections. Using the client count for
+        // maintenance starves the spill reservation.
+        let (partitions, pool_bytes, pinned, concurrency) = match (self.maintenance_scan, self.config.memory.timefusion_query_partitions) {
+            (true, _) => (
+                MAINTENANCE_MAX_PARTITIONS,
+                self.config.derived.maintenance_pool_bytes(),
+                true,
+                self.config.derived.coordinator_jobs(),
+            ),
+            (false, 0) => (self.config.derived.cores(), self.config.derived.query_pool_bytes(), false, crate::config::client_sort_concurrency()),
+            (false, n) => (n, self.config.derived.query_pool_bytes(), true, crate::config::client_sort_concurrency()),
         };
         let _ = options.set(
             "datafusion.execution.sort_spill_reservation_bytes",
-            &crate::config::sort_spill_reservation_bytes(self.config.memory.timefusion_sort_spill_reservation_bytes, partitions, pool_bytes).to_string(),
+            &crate::config::sort_spill_reservation_bytes(self.config.memory.timefusion_sort_spill_reservation_bytes, partitions, pool_bytes, concurrency).to_string(),
         );
         // Cap query parallelism at the container's CPU quota (0 = DataFusion default).
         if pinned {
