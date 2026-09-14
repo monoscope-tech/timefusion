@@ -3040,15 +3040,25 @@ impl Database {
             let completed = match run_until_idle_capped(timeout, coordinator_operation_lifetime_cap(operation), Arc::clone(&progress), work).await {
                 Ok(result) => {
                     // Log only the slow tail; this runs on every claim.
+                    //
+                    // `timeout` is the IDLE threshold — it resets on every progress
+                    // tick — so it is NOT a deadline and elapsed time may exceed it
+                    // many times over while the unit is working normally. Reporting
+                    // it as `deadline_secs` with a `headroom_pct` against total
+                    // elapsed invited exactly the wrong reading: a Dedup unit at
+                    // 5,051 s logged `headroom_pct = -461` and was diagnosed as a
+                    // deadline overrun on 2026-09-14 when it had simply been making
+                    // progress for 84 minutes. The bound that does exist is the
+                    // lifetime cap, and for Dedup and both rollups it is None.
                     let elapsed = started.elapsed();
                     if elapsed.as_secs_f64() > timeout.as_secs_f64() / 4.0 {
                         info!(
                             ?operation,
                             elapsed_secs = elapsed.as_secs(),
-                            deadline_secs = timeout.as_secs(),
-                            headroom_pct = (100.0 * (1.0 - elapsed.as_secs_f64() / timeout.as_secs_f64())) as i64,
+                            idle_timeout_secs = timeout.as_secs(),
+                            lifetime_cap_secs = coordinator_operation_lifetime_cap(operation).map(|cap| cap.as_secs()),
                             event = "maintenance_unit_slow",
-                            "a maintenance unit used a large share of its deadline"
+                            "a maintenance unit ran well past its idle threshold; it was making progress, not overrunning a deadline"
                         );
                     }
                     result?
