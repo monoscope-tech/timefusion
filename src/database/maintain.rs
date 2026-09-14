@@ -2765,12 +2765,17 @@ impl Database {
             let phase = Arc::clone(&phase);
             let watched_operation = watched_operation.clone();
             async move {
-                // Back off doubling. A bin at 1.0x the sort budget legitimately
-                // stages for ~1,710 s, so a flat 60 s interval would put ~28 lines
-                // per healthy unit into the log of a memory-tight box. Doubling
-                // keeps the first report early, where a wedge is still news, and
-                // costs a logarithmic number of lines for the long legitimate ones.
-                let (mut held_secs, mut wait) = (0u64, 60u64);
+                // First report at 5 min, then backing off doubling to 15.
+                //
+                // 60 s was the original threshold and it was set before anyone knew
+                // what normal looked like. Prod then showed sealed-consolidation
+                // sorts sitting at 60-180 s CONSTANTLY and finishing fine, so the
+                // instrument spent its time announcing healthy work — on a box
+                // whose memory is already the binding constraint. The interesting
+                // unit is the one past the ~1,710 s cliff, not the one merely doing
+                // its job. Doubling still bounds a genuinely stuck unit to a
+                // logarithmic number of lines.
+                let (mut held_secs, mut wait) = (0u64, 300u64);
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
                     held_secs += wait;
