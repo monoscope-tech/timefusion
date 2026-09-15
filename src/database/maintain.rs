@@ -614,6 +614,19 @@ async fn run_until_idle_capped<T>(
     }
 }
 
+/// `(lo, hi)` clipped to `date`, or `None` when they do not overlap at all.
+///
+/// BOTH ends must be clipped. Clipping only `lo` asks an interior date to prove
+/// coverage from its own midnight to the far end of a multi-day query, which no
+/// single day's coverage can ever satisfy — the first cut of this shipped that way
+/// and `cert_window_from_slice_coverage` sat at 0 through every read.
+fn clip_to_day(date: chrono::NaiveDate, (lo, hi): (i64, i64)) -> Option<(i64, i64)> {
+    let day_start = day_start_micros(date)?;
+    let day_end = day_start.checked_add(crate::maintenance_coordinator::DAY_MICROS)?;
+    let (lo, hi) = (lo.max(day_start), hi.min(day_end - 1));
+    (lo <= hi).then_some((lo, hi))
+}
+
 /// Is every microsecond of `(lo, hi)` inside the union of `intervals`?
 ///
 /// `intervals` are the disjoint, sorted, half-open runs `merge_clean_interval`
@@ -4459,8 +4472,9 @@ impl Database {
                 && schema_or_default(table_name).dedup_keys.iter().any(|key| key == "timestamp")
                 && let Some(cov) = self.dedup_slice_coverage.get(&fp_key).map(|entry| entry.value().clone())
                 && !cov.files.is_empty()
-                && clean_intervals_cover(&cov.intervals, (lo.max(day_start_micros(date).unwrap_or(lo)), hi))
-                && Self::added_paths_miss_window(table, &date.to_string(), &cov.files, &files, (lo, hi))
+                && let Some(day_window) = clip_to_day(date, (lo, hi))
+                && clean_intervals_cover(&cov.intervals, day_window)
+                && Self::added_paths_miss_window(table, &date.to_string(), &cov.files, &files, day_window)
             {
                 metrics::counter!(scan_metric_names::CERT_WINDOW_FROM_SLICE_COVERAGE).increment(1);
                 certified_any = true;
@@ -8578,5 +8592,45 @@ mod read_skip_from_slice_coverage_tests {
     #[test_case::test_case(&[(0, 100)], (90, 10) => false ; "an inverted window is never covered")]
     fn only_a_window_wholly_inside_one_proved_run_may_skip(intervals: &[(i64, i64)], window: (i64, i64)) -> bool {
         clean_intervals_cover(intervals, window)
+    }
+}
+
+#[cfg(test)]
+mod clip_window_to_date_tests {
+    use super::clip_to_day;
+
+    fn day(d: &str) -> chrono::NaiveDate {
+        d.parse().expect("date")
+    }
+    fn at(d: &str, hour: i64) -> i64 {
+        super::day_start_micros(day(d)).expect("start") + hour * 3_600_000_000
+    }
+
+    /// The bug this exists for: clipping only `lo` left an INTERIOR date of a
+    /// multi-day query asked to prove coverage from its own midnight to the far
+    /// end of the query. No single day can, so the skip never fired —
+    /// `cert_window_from_slice_coverage` read 0 through every scan in production.
+    #[test]
+    fn an_interior_date_is_asked_only_about_its_own_day() {
+        let window = (at("2026-09-13", 6), at("2026-09-15", 18));
+        let (lo, hi) = clip_to_day(day("2026-09-14"), window).expect("interior date overlaps");
+        assert_eq!(lo, at("2026-09-14", 0), "clipped up to the day's start");
+        assert_eq!(hi, at("2026-09-15", 0) - 1, "and DOWN to its end — the half the first cut omitted");
+    }
+
+    /// The first and last dates keep the query's own bounds on their open side.
+    #[test]
+    fn edge_dates_keep_the_querys_own_bound() {
+        let window = (at("2026-09-14", 6), at("2026-09-15", 18));
+        assert_eq!(clip_to_day(day("2026-09-14"), window).expect("first").0, at("2026-09-14", 6));
+        assert_eq!(clip_to_day(day("2026-09-15"), window).expect("last").1, at("2026-09-15", 18));
+    }
+
+    /// A date the window never touches proves nothing and must not be consulted.
+    #[test]
+    fn a_date_outside_the_window_is_none() {
+        let window = (at("2026-09-14", 6), at("2026-09-14", 8));
+        assert!(clip_to_day(day("2026-09-13"), window).is_none(), "before the window");
+        assert!(clip_to_day(day("2026-09-15"), window).is_none(), "after the window");
     }
 }
