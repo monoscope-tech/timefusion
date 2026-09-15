@@ -208,7 +208,13 @@ impl QueryPlanner for DmlQueryPlanner {
                         crate::observability::record_rollup_hit(mode, &grain);
                         return Ok(exec);
                     }
-                    Ok(_) => crate::observability::record_rollup_miss(crate::rollup::MissReason::StaleCoverage),
+                    Ok(_) => {
+                        // Coverage moved between route-build and plan completion — a
+                        // race with a flush/invalidation, distinct from the structural
+                        // staleness the route-build counters above classify.
+                        metrics::counter!(crate::database::scan_metric_names::ROLLUP_TICKET_RECHECK_FAILED).increment(1);
+                        crate::observability::record_rollup_miss(crate::rollup::MissReason::StaleCoverage)
+                    }
                     Err((error, stage, message, reason)) => {
                         warn!(%error, event = "rollup_rewrite_failed", stage, "{message}");
                         crate::observability::record_rollup_miss(reason);

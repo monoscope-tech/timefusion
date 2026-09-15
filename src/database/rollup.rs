@@ -131,11 +131,24 @@ impl Database {
                 let Some(coverage) = self.rollup_coverage.get(&key) else {
                     // Deliberately does NOT set `miss`: after a restart only slice coverage is
                     // recovered, and the slice loop below may still cover the window whole.
+                    // Counted by cause: an invalidation record means the coverage EXISTED
+                    // and `apply_rollup_hours` removed it — destruction that otherwise
+                    // reads as `not_built` and points the blame at the build lane.
+                    match self.rollup_invalidated_at.contains_key(&(project.clone(), route.source.clone(), date.clone())) {
+                        true => metrics::counter!(crate::database::scan_metric_names::ROLLUP_COVERAGE_ABSENT_INVALIDATED).increment(1),
+                        false => metrics::counter!(crate::database::scan_metric_names::ROLLUP_COVERAGE_ABSENT_NEVER_BUILT).increment(1),
+                    }
                     continue;
                 };
                 let source_fp = stats_of(&fingerprints, project, &date).map_or(0, |stats| stats.fingerprint);
                 let source_epoch = self.rollup_source_epochs.get(&(project.clone(), route.source.clone(), date.clone())).map_or(0, |entry| *entry.value());
                 let moved = coverage.source_fp != source_fp || coverage.source_epoch != Some(source_epoch);
+                if moved {
+                    match coverage.source_fp != source_fp {
+                        true => metrics::counter!(crate::database::scan_metric_names::ROLLUP_STALE_FP_MOVED).increment(1),
+                        false => metrics::counter!(crate::database::scan_metric_names::ROLLUP_STALE_EPOCH_MOVED).increment(1),
+                    }
+                }
                 if let Some(reason) =
                     moved.then_some(crate::rollup::MissReason::StaleCoverage).or_else(|| Self::coverage_decline(&route, project, &date, &coverage))
                 {

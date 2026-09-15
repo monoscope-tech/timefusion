@@ -311,6 +311,23 @@ pub mod scan_metric_names {
         // changed (dedup, compaction across the bound) and a rebuild is right.
         ROLLUP_WITNESS_BOUNDED_RESCUED = "timefusion.scan.rollup_witness_bounded_rescued" as scan.rollup_witness_bounded_rescued;
         ROLLUP_WITNESS_BOUNDED_STALE_TOO = "timefusion.scan.rollup_witness_bounded_stale_too" as scan.rollup_witness_bounded_stale_too;
+        // WHY a day's rollup coverage was not usable, split the way the cert-side
+        // split paid off: `stale_coverage` and `not_built` each conflate a
+        // structural cause with a churn cause, and the fix differs per cause.
+        // - fp_moved / epoch_moved: coverage exists but the source moved under it
+        //   (fp: file set changed; epoch: `apply_rollup_hours` bumped the date).
+        // - absent_invalidated: coverage was REMOVED by `apply_rollup_hours` —
+        //   it existed and a write destroyed it, however far the write sat from
+        //   `covered_through`. Reads as `not_built` without this counter.
+        // - absent_never_built: no coverage and no invalidation record — the
+        //   build lane genuinely has not gotten there.
+        ROLLUP_STALE_FP_MOVED = "timefusion.scan.rollup_stale_fp_moved" as scan.rollup_stale_fp_moved;
+        ROLLUP_STALE_EPOCH_MOVED = "timefusion.scan.rollup_stale_epoch_moved" as scan.rollup_stale_epoch_moved;
+        ROLLUP_COVERAGE_ABSENT_INVALIDATED = "timefusion.scan.rollup_coverage_absent_invalidated" as scan.rollup_coverage_absent_invalidated;
+        ROLLUP_COVERAGE_ABSENT_NEVER_BUILT = "timefusion.scan.rollup_coverage_absent_never_built" as scan.rollup_coverage_absent_never_built;
+        // The post-plan ticket recheck failing (dml.rs): coverage moved DURING
+        // planning — a race, not a structural gap; the two need different fixes.
+        ROLLUP_TICKET_RECHECK_FAILED = "timefusion.scan.rollup_ticket_recheck_failed" as scan.rollup_ticket_recheck_failed;
         // A fingerprint move that KEPT span-disjoint coverage instead of discarding
         // the day. Read against `cert_coverage_reset`: coverage that only ever
         // resets is coverage that never accumulates, which is what held

@@ -109,3 +109,31 @@ stage.
   then reverted: premised on the DV mechanism, which was wrong.
   **Conclusion: the 500 ms lever for aggregates is item 2 (rollups), plus the
   build lane draining `not_built` over days — not further cert-side code.**
+- 2026-09-15 (item 4): DONE — the validation the flag's docs mandated already
+  exists and passes: `replayed_rows_that_delta_already_holds_are_not_written_again`
+  (e2e, full dirty-boot replay → flush declined → zero rows lost) and the lib
+  decline test, both green on master. Enabling is now a one-env flip
+  (`TIMEFUSION_LANDED_SKIP_ENABLED=true` in CapRover) — restarts prod, so batch
+  it with the next deploy. Watch `wal.landed_skips` vs `wal.replay_rows` after
+  the next UNCLEAN exit (a clean deploy exercises nothing).
+- 2026-09-15 (item 3 census): violations concentrate in `otel_metrics` (the
+  self-monitoring project above all), 0–114 per controlled query;
+  `otel_logs_and_spans` contributes 0 on every shape tried. Steady-state
+  ~630/min fleet-wide; the alarming 88k/min was this plan's own 7d aggregate
+  ladder. LOW severity, zero correctness impact — leave file rewrites to the
+  repair lane's natural cadence, per the no-new-backlog constraint.
+- 2026-09-15 (item 5b): already covered — foyer's disk tier persists across
+  restarts (BlockEngine on FsDevice) and prod runs `warm_footer` +
+  `TIMEFUSION_WARM_FULL_FILES=true`. Residual first-read gap is plan-cache and
+  fresh-file cost; not worth new code.
+- 2026-09-15 (item 2): the team is mid-flight on exactly this, counter-first
+  (#294→#299). Measured for them: `rollup_witness_bounded_present=61` vs
+  `absent=3002` — the bounded witness reaches 2% of recovered slices, so the
+  read-side flip would be inert TODAY; presence climbs as slices republish.
+  Root anatomy located: `apply_rollup_hours` REMOVES the whole day's
+  `rollup_coverage` and bumps the date epoch on every write, however far the
+  write sits from `covered_through` — destroyed coverage then reads as
+  `not_built` (58% of misses), blaming the build lane. Shipped the attribution
+  counters (this branch): `rollup_stale_{fp,epoch}_moved`,
+  `rollup_coverage_absent_{invalidated,never_built}`,
+  `rollup_ticket_recheck_failed`. Read them before any behavior change.
