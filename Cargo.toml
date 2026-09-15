@@ -37,7 +37,7 @@ deltalake = { git = "https://github.com/tonyalaribe/delta-rs-timefusion.git", re
   "datafusion",
   "s3",
 ] }
-buoyant_kernel = { git = "https://github.com/tonyalaribe/delta-kernel-rs.git", rev = "3718d059c8de1640de63ee952fa718684a113fc6", features = [
+buoyant_kernel = { git = "https://github.com/tonyalaribe/delta-kernel-rs.git", rev = "a58985743a3fb77edb9fdb2707c90387b65b381e", features = [
   "arrow-conversion",
   "default-engine-rustls",
   "arrow-58",
@@ -308,4 +308,4 @@ tikv-jemalloc-sys = { path = "vendor/tikv-jemalloc-sys" }
 # Delta's synchronous readers must deliver async results without waiting for
 # another slot in the same blocking pool (production DV-reader deadlock).
 [patch."https://github.com/buoyant-data/delta-kernel-rs"]
-buoyant_kernel = { git = "https://github.com/tonyalaribe/delta-kernel-rs.git", rev = "3718d059c8de1640de63ee952fa718684a113fc6" }
+buoyant_kernel = { git = "https://github.com/tonyalaribe/delta-kernel-rs.git", rev = "a58985743a3fb77edb9fdb2707c90387b65b381e" }
