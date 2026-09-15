@@ -381,6 +381,13 @@ pub mod scan_metric_names {
         PGWIRE_TOTAL = "timefusion.scan.pgwire_total" as pgwire.queries_total;
         DECODE_BYTES_TOTAL = "timefusion.scan.decode_bytes_total" as scan_decode.bytes_total;
         DECODE_PRESSURE_THROTTLED = "timefusion.scan.decode_pressure_throttled" as scan_decode.pressure_throttled_total;
+        // Heavy-query admission: a spilling-sort query admitted to the pool, one
+        // that had to WAIT for a slot, and one that waited out the timeout. queued
+        // climbing with a healthy admitted rate is orderly backpressure; timeouts
+        // climbing means K is too low or queries too slow.
+        HEAVY_QUERY_ADMITTED = "timefusion.scan.heavy_query_admitted" as scan.heavy_query_admitted;
+        HEAVY_QUERY_QUEUED = "timefusion.scan.heavy_query_queued" as scan.heavy_query_queued;
+        HEAVY_QUERY_QUEUE_TIMEOUT = "timefusion.scan.heavy_query_queue_timeout" as scan.heavy_query_queue_timeout;
     }
     // Per-reason breakdown of `PREFILTER_SKIPPED`.
     reasons {
@@ -3082,6 +3089,13 @@ impl Database {
 
     /// Create and configure a SessionContext with DataFusion settings
     pub fn create_session_context(self: Arc<Self>) -> SessionContext {
+        self.create_session_context_for(false)
+    }
+
+    /// As `create_session_context`, but `for_pgwire` gates the client-facing-only
+    /// rules — heavy-query admission must never touch internal/maintenance
+    /// contexts, which use their own pool.
+    pub fn create_session_context_for(self: Arc<Self>, for_pgwire: bool) -> SessionContext {
         use datafusion::{config::ConfigOptions, execution::SessionStateBuilder};
         use datafusion_tracing::{InstrumentationOptions, instrument_with_info_spans};
 
@@ -3248,6 +3262,11 @@ impl Database {
                 // their discharge of DedupExec's ordering, which otherwise leaves the
                 // operator reading through an order-erasing coalesce.
                 rules.push(Arc::new(crate::read::optimizers::DedupNeedsOrderedInput));
+                // LAST, on the pgwire session only, so it wraps the absolute root
+                // (executed once) of a heavy plan. Off unless the flag is set.
+                if for_pgwire && self.config.memory.timefusion_heavy_query_admission {
+                    rules.push(Arc::new(crate::read::admission::HeavyQueryAdmission));
+                }
                 rules.push(instrument_rule);
                 rules
             })

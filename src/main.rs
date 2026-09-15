@@ -448,7 +448,7 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
     // Register UDFs up front so this context's FunctionRegistry doubles as the
     // WAL-replay registry. Table providers depend on buffered_layer and are
     // registered after recovery.
-    let mut session_context = Arc::new(db.clone()).create_session_context();
+    let mut session_context = Arc::new(db.clone()).create_session_context_for(true);
     db.setup_session_udfs(&mut session_context)?;
     let registry: Arc<timefusion::read::functions::FnRegistry> = Arc::new(session_context.state());
 

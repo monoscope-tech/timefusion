@@ -55,7 +55,7 @@ pub async fn bootstrap(cfg: Arc<AppConfig>) -> Result<Bootstrapped> {
 
     let delta_write_callback = delta_write_callback(&db);
 
-    let mut session_context = Arc::new(db.clone()).create_session_context();
+    let mut session_context = Arc::new(db.clone()).create_session_context_for(true);
     db.setup_session_udfs(&mut session_context)?;
     let registry: Arc<crate::read::functions::FnRegistry> = Arc::new(session_context.state());
 
