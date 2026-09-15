@@ -1791,6 +1791,19 @@ pub struct MemoryConfig {
     pub timefusion_memory_pool: MemoryPoolKind,
     #[serde_inline_default(true)]
     pub timefusion_tracing_record_metrics: bool,
+    /// Rows per decode batch for pgwire QUERY sessions on the wide OTel schema.
+    ///
+    /// Default 2048 = `WIDE_ROW_DECODE_BATCH_SIZE`, unchanged behaviour. The
+    /// parquet decode buffer is NOT pool-accounted, so this bounds ~64-73 KB
+    /// per row of untracked memory per active scan stream — that is why the
+    /// default is a quarter of DataFusion's 8192. The cost of the small value
+    /// is per-batch fixed work: prod profiling (2026-09-15) found no hot
+    /// kernel, just per-batch overhead spread across every operator, which
+    /// this knob multiplies by 4x. Canary upward (4096, then 8192) while
+    /// watching RSS and query-pool `Resources exhausted`; maintenance
+    /// sessions keep their own 2048 regardless.
+    #[serde_inline_default(2048)]
+    pub timefusion_query_batch_size: usize,
     /// DataFusion `target_partitions` for query + maintenance sessions. 0 = auto:
     /// `config::apply()` derives it from the container's CPU quota (num_cpus
     /// ignores the CFS quota and oversubscribes throttled containers).

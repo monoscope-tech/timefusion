@@ -3062,6 +3062,7 @@ impl Database {
 
         use crate::dml::DmlQueryPlanner;
 
+        let query_batch_size = self.config.memory.timefusion_query_batch_size.to_string();
         let mut options = ConfigOptions::new();
         // Defaults set explicitly (even where they match DataFusion's) so a
         // future upstream default flip can't silently regress query plans.
@@ -3092,7 +3093,9 @@ impl Database {
             ("datafusion.explain.show_schema", "true"),
             // Small batches: the wide otel schema makes every decode buffer cost
             // `batch_size × row width`, none of it pool-accounted.
-            ("datafusion.execution.batch_size", WIDE_ROW_DECODE_BATCH_SIZE),
+            // Query sessions read the knob; maintenance sessions stay on the
+            // constant (their sorts admit per batch against fixed budgets).
+            ("datafusion.execution.batch_size", query_batch_size.as_str()),
             // Timestamps are typically sorted; round-robin repartitioning off to
             // maintain sort order.
             ("datafusion.optimizer.prefer_existing_sort", "true"),
