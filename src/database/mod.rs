@@ -2345,6 +2345,13 @@ pub struct Database {
     /// `rollup_slice_coverage`.
     rollup_coverage: Arc<dashmap::DashMap<RollupCoverageKey, RollupCoverage>>,
     rollup_slice_coverage: Arc<dashmap::DashMap<RollupSliceCoverageKey, RollupCoverage>>,
+    /// `partition_file_rows` memoized per source table, keyed by the Delta
+    /// version it was computed from — a new commit invalidates it naturally.
+    /// Without this the bounded-witness rescue re-materialized the add-actions
+    /// batch on EVERY route call that met a stale-looking slice; after a restart
+    /// that is every call until recovery catches up, and the planning drag keeps
+    /// queries in flight longer, which is pool pressure by another name.
+    rollup_file_rows_cache: dashmap::DashMap<String, (u64, std::sync::Arc<crate::database::maintain::PartitionFileRows>)>,
     /// Untagged live files per tier TABLE (tiers publish independently, so one shared slot would
     /// read clean while another tier still held damage). The exported gauge is the SUM over tiers.
     rollup_tier_untagged: Arc<dashmap::DashMap<String, u64>>,
@@ -2935,6 +2942,7 @@ impl Database {
             rollup_source_epochs,
             rollup_coverage: Arc::new(dashmap::DashMap::new()),
             rollup_slice_coverage: Arc::new(dashmap::DashMap::new()),
+            rollup_file_rows_cache: dashmap::DashMap::new(),
             rollup_tier_untagged: Arc::new(dashmap::DashMap::new()),
             coverage_ledger: Arc::new(crate::storage::JsonCoverageLedger::load(&cfg.core.timefusion_data_dir)),
             rollup_dirty,
