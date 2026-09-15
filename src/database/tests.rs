@@ -212,7 +212,13 @@ fn cert_day() -> CertDay {
         date,
         start,
         half: start + DAY_MICROS / 2,
-        at: day.timestamp_micros(),
+        // Mid-FIRST-half, pinned. Using `day.timestamp_micros()` put the span at
+        // whatever time of day the suite happened to run, which since #290 decides
+        // the outcome: a write near this span either overlaps already-proved
+        // coverage (first half, voided) or is span-disjoint from it (second half,
+        // legitimately retained). CI passing at 10:03 UTC and the same commit
+        // failing at 23:45 was that, not a flake.
+        at: start + DAY_MICROS / 4,
     }
 }
 
@@ -645,7 +651,8 @@ async fn slice_evidence_stays_stale_across_a_restart() -> Result<()> {
 /// mid-accumulation would certify over a never-re-swept half.
 #[test_case("none", true ; "two clean halves cover the day and certify the partition")]
 #[test_case("restart", true ; "accumulated slice coverage survives a restart")]
-#[test_case("write", false ; "a write between clean slices voids accumulated coverage")]
+#[test_case("write", false ; "a write INTO proved coverage voids it")]
+#[test_case("write_disjoint", true ; "a write the proved half cannot contain leaves it standing")]
 #[serial]
 #[tokio::test]
 async fn clean_slice_units_accumulate_to_certify_the_partition(between: &str, certifies: bool) -> Result<()> {
@@ -664,8 +671,15 @@ async fn clean_slice_units_accumulate_to_certify_the_partition(between: &str, ce
             drop(db);
             db = Database::with_config(cfg).await?;
         }
-        // A new file lands in the partition: the fp the first slice was proved under is dead.
+        // A new file lands INSIDE the window the first slice proved. It could hold
+        // another version of a row in there, so that coverage must go.
         "write" => insert_a_span(&db, &day.project, "late", day.at + 1).await?,
+        // A new file lands in the OTHER half, which the first slice never claimed.
+        // It cannot hold a duplicate of anything in the proved half (a duplicate
+        // group shares one timestamp), and the second slice sweeps it, so the day
+        // is genuinely proved and must certify. Before #290 this was voided too —
+        // throwing away proof on every flush is what held certification at 0.4%.
+        "write_disjoint" => insert_a_span(&db, &day.project, "late", day.half + DAY_MICROS / 4).await?,
         _ => {}
     }
     assert!(run_dedup_slice(&db, &day.project, day.half, day.start + DAY_MICROS).await?, "second half-day unit must run");
