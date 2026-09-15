@@ -116,6 +116,22 @@ pub const TAG_CONTENT_FINGERPRINT: &str = "timefusion.content_fingerprint";
 /// with the partition's present count. A row count, not a fingerprint, because
 /// row counts survive compaction.
 pub const TAG_SOURCE_ROWS: &str = "timefusion.source_rows";
+
+/// The same count taken BELOW the slice's own end, so rows arriving past the
+/// build's bound cannot perturb it.
+///
+/// `TAG_SOURCE_ROWS` is the whole partition's `num_records`, which any ingest
+/// anywhere in the day moves — and 96.8% of measured rollup staleness is exactly
+/// that (`rollup_stale_grew` 3,769,781 vs `rollup_stale_shrank` 124,695 over 12h).
+/// `partition_stats_bounded` excludes any file whose `max_ts` reaches the bound, so
+/// a file written past it is absent from BOTH this witness and the live count and
+/// the two still agree.
+///
+/// WRITTEN ONLY. Nothing reads it yet: it exists so the data accrues before the
+/// read side is flipped, and so a slice built now is verifiable under the new rule
+/// when it is. A witness is only ever comparable to one recorded the same way, so
+/// this is a separate tag rather than a redefinition of the old one.
+pub const TAG_SOURCE_ROWS_BELOW: &str = "timefusion.source_rows_below";
 pub const TAG_GENERATION: &str = "timefusion.generation";
 /// Which declared measures this slice's files actually MATERIALIZED, comma
 /// separated — NOT what the spec declares. A measure added after a slice was
