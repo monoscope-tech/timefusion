@@ -217,7 +217,7 @@ async fn insert_file(client: &tokio_postgres::Client, env: &E2eEnv, prefix: &str
 
 /// On-demand A/B benchmark: enrich one span against many files with bloom-prune
 /// ON vs OFF, asserting the join-key IN-filter reduces merge scan work.
-#[ignore]
+#[ignore = "on-demand A/B benchmark, not a correctness assertion; run with --ignored"]
 #[serial_test::serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn bench_bloom_prune_ab() -> anyhow::Result<()> {

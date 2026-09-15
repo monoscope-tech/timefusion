@@ -290,9 +290,16 @@ impl BloomPruneRegistry {
         }
     }
 
-    pub async fn load_sidecar_raw(&self, table: &str, project_id: &str, date: &str) -> Option<DateSidecar> {
-        let bytes = self.store.get(&sidecar_path(table, project_id, date)).await.ok()?.bytes().await.ok()?;
-        decode_sidecar(&bytes).map_err(|e| warn!(table, project_id, date, "corrupt bloom sidecar, rebuilding: {e:#}")).ok()
+    /// `Ok(None)` ONLY for a sidecar that does not exist. A transient GET failure must stay an
+    /// `Err`: reported as "absent" it would let the rebuild pass republish a truncated sidecar
+    /// over a good one.
+    pub async fn load_sidecar_raw(&self, table: &str, project_id: &str, date: &str) -> Result<Option<DateSidecar>> {
+        let bytes = match self.store.get(&sidecar_path(table, project_id, date)).await {
+            Err(object_store::Error::NotFound { .. }) => return Ok(None),
+            r => r.context("get bloom sidecar")?.bytes().await.context("read bloom sidecar")?,
+        };
+        // Corruption IS a rebuild trigger: the bytes are unusable either way.
+        Ok(decode_sidecar(&bytes).map_err(|e| warn!(table, project_id, date, "corrupt bloom sidecar, rebuilding: {e:#}")).ok())
     }
 
     /// Persist a rebuilt sidecar and refresh the resident entry in place so

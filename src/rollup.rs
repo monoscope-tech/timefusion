@@ -422,6 +422,9 @@ impl Merge {
     fn partial_states(self, columns: &[String]) -> Vec<String> {
         match (self, columns) {
             (Self::First, [value, at]) => vec![format!("first_value({value} ORDER BY {at} NULLS LAST)"), format!("MIN({at})")],
+            // Same `arity()` contract `sql` enforces: folding a mis-arity First into SUM would
+            // silently produce a different aggregate.
+            (Self::First, _) => unreachable!("first needs (value, companion), got {}", columns.len()),
             _ => columns.iter().map(|column| format!("{}({column})", self.partial_op())).collect(),
         }
     }

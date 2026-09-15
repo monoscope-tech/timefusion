@@ -146,7 +146,7 @@ fn quarantine_entry(quarantine_dir: &std::path::Path, entry: &WalEntry, kind: &s
     }
     let meta_path = path.with_extension("meta");
     let meta = format!(
-        "ts_micros={timestamp_micros}\nproject_id={project_id}\ntable_name={table_name}\noperation={operation:?}\nkind={kind}\nreason={reason}\nbytes={}\n",
+        "ts_micros={timestamp_micros}\nproject_id={project_id}\ntable_name={table_name}\noperation={operation}\nkind={kind}\nreason={reason}\nbytes={}\n",
         data.len()
     );
     if let Err(e) = write_owner_only(&meta_path, meta.as_bytes()) {
@@ -547,9 +547,6 @@ pub type DeltaCoalescedWriteCallback = Arc<dyn Fn(Vec<FlushUnit>) -> futures::fu
 /// into a single combined commit.
 #[derive(Default)]
 struct CoalescedGroup {
-    /// `Option`, not `String`: an empty `project_id` is legitimate, so
-    /// `is_empty` cannot serve as the first-bucket sentinel.
-    key: Option<(String, String)>,
     batches: Vec<RecordBatch>,
     row_count: usize,
     /// Per-shard min hold across absorbed buckets; registered as the commit's
@@ -583,7 +580,6 @@ fn merge_wal_holds(a: &[Option<walrus_rust::WalPosition>], b: &[Option<walrus_ru
 
 impl CoalescedGroup {
     fn absorb(&mut self, b: crate::write::mem_buffer::FlushableBucket) {
-        self.key.get_or_insert_with(|| (b.project_id.clone(), b.table_name.clone()));
         self.row_count += b.row_count;
         self.batches.extend(b.batches.iter().cloned());
         self.wal_first_positions = merge_wal_holds(&self.wal_first_positions, &b.wal_first_positions);
@@ -593,9 +589,8 @@ impl CoalescedGroup {
         self.source_buckets.push(b);
     }
 
-    fn into_combined_bucket(self) -> CombinedBucket {
-        let CoalescedGroup { key, batches, row_count, wal_first_positions, source_buckets, min_timestamp, max_timestamp, first_wal_pin } = self;
-        let (project_id, table_name) = key.unwrap_or_default();
+    fn into_combined_bucket(self, project_id: String, table_name: String) -> CombinedBucket {
+        let CoalescedGroup { batches, row_count, wal_first_positions, source_buckets, min_timestamp, max_timestamp, first_wal_pin } = self;
         // Max source bucket_id, a stable identifier for tracing only.
         let bucket_id = source_buckets.iter().map(|b| b.bucket_id).max().unwrap_or(0);
         let combined = crate::write::mem_buffer::FlushableBucket {
@@ -1505,8 +1500,7 @@ impl BufferedWriteLayer {
                             &entry.table_name,
                             payload.predicate_sql.as_deref(),
                             &payload.assignments,
-                            &payload.source.join_keys,
-                            source_batch,
+                            crate::dml::UpdateSource { schema: source_batch.schema(), batch: source_batch, join_keys: payload.source.join_keys.clone() },
                             registry_ref,
                             Some((shard, pos)),
                         ) {
@@ -1792,7 +1786,7 @@ impl BufferedWriteLayer {
                 failed += 1;
                 continue;
             };
-            if field("operation").as_deref() != Some("Insert") {
+            if field("operation").and_then(|o| o.parse().ok()) != Some(WalOperation::Insert) {
                 failed += 1;
                 continue;
             }
@@ -2209,7 +2203,7 @@ impl BufferedWriteLayer {
                     self.release_inflight_holds(&p, &t, token);
                     return None;
                 }
-                let combined = group.into_combined_bucket();
+                let combined = group.into_combined_bucket(p.clone(), t.clone());
                 if let Some(mut m) = self.inflight_flush_holds.get_mut(&(p, t))
                     && let Some(holds) = m.get_mut(&token)
                 {
@@ -5008,7 +5002,6 @@ mod tests {
     /// `#[ignore]`d: MemBuffer stores strings as `Utf8View` while the source
     /// batch is `Utf8`, and Arrow's `RowConverter` requires byte-identical
     /// types, so the join lookup returns 0 matches. Re-enable once that is fixed.
-    #[ignore = "Utf8/Utf8View RowConverter lookup miss — see comment"]
     #[serial]
     #[tokio::test]
     async fn update_with_source_buffered_only() {
@@ -5038,7 +5031,6 @@ mod tests {
     ///
     /// `#[ignore]`d: blocked on the same Utf8/Utf8View `RowConverter` lookup
     /// miss as `update_with_source_buffered_only`.
-    #[ignore = "Utf8/Utf8View RowConverter lookup miss — see comment"]
     #[serial]
     #[tokio::test]
     async fn update_with_source_wal_replay_after_restart() {
@@ -5570,7 +5562,10 @@ impl BatchQueue {
     }
 
     pub fn queue(&self, batch: RecordBatch) -> Result<()> {
-        self.tx.try_send(batch).map_err(|_| anyhow!("Queue full"))
+        self.tx.try_send(batch).map_err(|e| match e {
+            tokio::sync::mpsc::error::TrySendError::Full(_) => anyhow!("batch queue full"),
+            tokio::sync::mpsc::error::TrySendError::Closed(_) => anyhow!("batch queue worker has shut down"),
+        })
     }
 
     pub async fn shutdown(&self) {

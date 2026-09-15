@@ -66,7 +66,7 @@ pub(crate) fn delta_session_from(session: &SessionState) -> Arc<dyn Session> {
     let mut cfg = cfg.set_bool("datafusion.execution.skip_physical_aggregate_schema_check", true);
     // A MERGE-UPDATE re-reads and rewrites whole wide otel rows — the most
     // decode-expensive read in the system; keep it on the narrow decode batch.
-    let _ = cfg.options_mut().set("datafusion.execution.batch_size", crate::database::WIDE_ROW_DECODE_BATCH_SIZE);
+    crate::database::set_or_warn(cfg.options_mut(), "datafusion.execution.batch_size", crate::database::WIDE_ROW_DECODE_BATCH_SIZE);
     Arc::new(
         SessionStateBuilder::new()
             .with_config(cfg)

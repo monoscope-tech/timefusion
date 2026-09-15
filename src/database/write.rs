@@ -665,7 +665,7 @@ impl Database {
                     Ok(committed)
                 }
                 Err(e) => {
-                    if !e.to_string().contains(INCONCLUSIVE_COMMIT_MARKER) {
+                    if !InconclusiveCommit::marks(&e) {
                         Self::cleanup_orphaned_parquet(&stage_store, &adds).await;
                     }
                     Err(e)
@@ -841,7 +841,7 @@ impl Database {
                     Err(e) => {
                         // Fail EVERY project in the group identically — no partial
                         // settle; the caller requeues each one's buckets.
-                        if !e.to_string().contains(INCONCLUSIVE_COMMIT_MARKER) {
+                        if !InconclusiveCommit::marks(&e) {
                             // Every unit in a physical group stages into the same
                             // store, so one store deletes all.
                             Self::cleanup_orphaned_parquet(&group[0].1.stage_store, &adds).await;
@@ -872,9 +872,9 @@ impl Database {
     /// The shared commit-log append for a staged (parquet already uploaded) write: one project's
     /// flush unit, or one physical table's coalesced group spanning several projects.
     ///
-    /// Staged parquet is the CALLER's to clean up: on `Err`, delete it unless the message carries
-    /// [`INCONCLUSIVE_COMMIT_MARKER`], where landing could not be confirmed and deleting would
-    /// risk a dangling Add.
+    /// Staged parquet is the CALLER's to clean up: on `Err`, delete it unless the error carries
+    /// [`InconclusiveCommit`], where landing could not be confirmed and deleting would risk a
+    /// dangling Add.
     async fn commit_staged_group(
         &self, kind: StagedCommitKind, table_ref: &Arc<RwLock<DeltaTable>>, projects: &[(&str, &[(String, i64)])], table_name: &str, commit: StagedCommit<'_>,
     ) -> Result<Vec<String>> {
@@ -979,7 +979,7 @@ impl Database {
                         CommitProbe::Inconclusive => {
                             warn!("{subject} errored and landing is {unconfirmed}: {e}");
                             // Marker error: tells the caller not to delete the parquet.
-                            Err(anyhow::anyhow!("{}: {} failed (landing unconfirmed): {}", INCONCLUSIVE_COMMIT_MARKER, kind.what(), e))
+                            Err(anyhow::Error::new(InconclusiveCommit).context(format!("{} failed (landing unconfirmed): {}", kind.what(), e)))
                         }
                     };
                 }
@@ -1161,7 +1161,12 @@ impl Database {
             })
             .into_group_map();
         let totals: Vec<usize> = stream::iter(physical.into_values())
-            .map(|topics| async move { self.derive_wal_cursors_for_physical_table(wal, topics, layer).await.unwrap_or(0) })
+            .map(|topics| async move {
+                self.derive_wal_cursors_for_physical_table(wal, topics, layer).await.unwrap_or_else(|e| {
+                    warn!("WAL cursor derivation failed for a physical table; its shards keep their old floor: {e}");
+                    0
+                })
+            })
             .buffer_unordered(self.config.buffer.delta_scan_concurrency())
             .collect()
             .await;

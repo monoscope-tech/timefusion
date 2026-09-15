@@ -353,7 +353,16 @@ impl Database {
                     if budget == 0 {
                         return Ok((built, errors));
                     }
-                    let existing = reg.load_sidecar_raw(&table_name, &pid, &date).await.unwrap_or_default();
+                    // An unreadable sidecar is NOT an absent one: republishing over it would drop
+                    // every bloom it holds. Skip the cell and retry on the next pass.
+                    let existing = match reg.load_sidecar_raw(&table_name, &pid, &date).await {
+                        Ok(existing) => existing.unwrap_or_default(),
+                        Err(e) => {
+                            warn!(table = %table_name, project_id = %pid, date = %date, "bloom sidecar unreadable, leaving it in place: {e:#}");
+                            errors += 1;
+                            continue;
+                        }
+                    };
                     let existing_count = existing.files.len();
                     let live: HashSet<&str> = files.iter().map(|(rel, _)| rel.as_str()).collect();
                     let mut kept: Vec<bloom_prune::FileBlooms> = existing.files.into_iter().filter(|f| live.contains(f.rel.as_str())).collect();

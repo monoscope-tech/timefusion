@@ -1002,6 +1002,15 @@ struct UncappedSort {
 
 /// `batch_override` shrinks the sort's indivisible admission unit; merge memory
 /// scales with fan-in x batch, so callers sorting one huge file need a smaller
+/// `ConfigOptions::set` fails only on an unknown key — i.e. when a DataFusion upgrade renames one of
+/// the load-bearing memory settings below. Silently reverting to the default is how that goes
+/// unnoticed, so say it out loud.
+pub(crate) fn set_or_warn(options: &mut datafusion::config::ConfigOptions, key: &str, value: &str) {
+    if let Err(e) = options.set(key, value) {
+        warn!(%key, %value, error = %e, "DataFusion rejected a config key; it keeps its default");
+    }
+}
+
 /// batch than the packing bins they share a pool with. `uncapped` lifts
 /// `MAINTENANCE_MAX_PARTITIONS` and pins parallelism — see [`UncappedSort`].
 fn build_optimize_session_state_tuned(
@@ -1016,7 +1025,7 @@ fn build_optimize_session_state_tuned(
         Some(u) => maintenance_session_config(SessionConfig::new(), batch_size, usize::MAX).with_target_partitions(u.partitions),
     };
     if let Some(reservation) = uncapped.and_then(|u| u.reservation_bytes) {
-        let _ = cfg.options_mut().set("datafusion.execution.sort_spill_reservation_bytes", &reservation.to_string());
+        set_or_warn(cfg.options_mut(), "datafusion.execution.sort_spill_reservation_bytes", &reservation.to_string());
     }
     let mut state = SessionStateBuilder::new().with_config(cfg).with_runtime_env(runtime_env).with_default_features().build();
     // `hash_bucket` is ours, not a builtin, and these states skip
@@ -1173,7 +1182,7 @@ fn maintenance_session_config(base: datafusion::prelude::SessionConfig, batch_si
         ("datafusion.execution.sort_spill_reservation_bytes", "33554432"),
         ("datafusion.execution.skip_physical_aggregate_schema_check", "true"),
     ] {
-        let _ = cfg.options_mut().set(k, v);
+        set_or_warn(cfg.options_mut(), k, v);
     }
     let parts = if target_partitions == 0 { MAINTENANCE_MAX_PARTITIONS } else { target_partitions.min(MAINTENANCE_MAX_PARTITIONS) };
     cfg.with_target_partitions(parts)
@@ -1822,9 +1831,20 @@ struct StagedUnit {
     sorted: bool,
 }
 
-/// Marks a commit error where landing could not be confirmed. The staged parquet must be left in
-/// place; deleting files a landed commit references creates dangling Adds.
-const INCONCLUSIVE_COMMIT_MARKER: &str = "landing-unconfirmed";
+/// Attached to a commit error where landing could not be confirmed. The staged parquet must be left
+/// in place; deleting files a landed commit references creates dangling Adds. A typed marker, not a
+/// message substring: callers test it with `err.chain().any(|c| c.is::<InconclusiveCommit>())`, so a
+/// `.context()` re-wrap upstream cannot silently disarm the guard.
+#[derive(Debug, thiserror::Error)]
+#[error("landing-unconfirmed")]
+pub(crate) struct InconclusiveCommit;
+
+impl InconclusiveCommit {
+    /// Whether `e` carries the marker anywhere in its cause chain.
+    pub(crate) fn marks(e: &anyhow::Error) -> bool {
+        e.chain().any(|c| c.is::<Self>())
+    }
+}
 
 /// Last-resort circuit breaker on a network await taken while a per-table commit lock is held. NOT
 /// the primary commit timeout: firing here abandons a future mid-flight and manufactures an
@@ -3066,11 +3086,11 @@ impl Database {
             // The per-query share of the (already tree-sized) pool.
             ("datafusion.execution.memory_fraction", "0.9"),
         ] {
-            let _ = options.set(key, value);
+            set_or_warn(&mut options, key, value);
         }
         // Must match `warm_footer`'s suffix range: the Foyer metadata cache keys on
         // (path, exact range), so the reader's first fetch hits the warmed entry.
-        let _ = options.set("datafusion.execution.parquet.metadata_size_hint", &self.config.cache.timefusion_parquet_metadata_size_hint.to_string());
+        set_or_warn(&mut options, "datafusion.execution.parquet.metadata_size_hint", &self.config.cache.timefusion_parquet_metadata_size_hint.to_string());
         // Partition count and pool together price the sort reservation, which is
         // taken per partition and cannot spill. `pinned` distinguishes a count this
         // session imposes from one merely used to price the reservation.
@@ -3082,14 +3102,15 @@ impl Database {
             (false, 0) => (self.config.derived.cores(), self.config.derived.query_pool_bytes(), false, crate::config::client_sort_concurrency()),
             (false, n) => (n, self.config.derived.query_pool_bytes(), true, crate::config::client_sort_concurrency()),
         };
-        let _ = options.set(
+        set_or_warn(
+            &mut options,
             "datafusion.execution.sort_spill_reservation_bytes",
             &crate::config::sort_spill_reservation_bytes(self.config.memory.timefusion_sort_spill_reservation_bytes, partitions, pool_bytes, concurrency)
                 .to_string(),
         );
         // Cap query parallelism at the container's CPU quota (0 = DataFusion default).
         if pinned {
-            let _ = options.set("datafusion.execution.target_partitions", &partitions.to_string());
+            set_or_warn(&mut options, "datafusion.execution.target_partitions", &partitions.to_string());
         }
 
         // A maintenance scan borrows the maintenance pool, not the query pool: that

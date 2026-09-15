@@ -465,8 +465,8 @@ fn day_start_micros(date: chrono::NaiveDate) -> Option<i64> {
     Some(date.and_hms_opt(0, 0, 0)?.and_utc().timestamp_micros())
 }
 
-/// `LogicalFileView::add_action()`, centralizing its one `#[allow(deprecated)]` call site.
-fn add_action(file: &deltalake::kernel::LogicalFileView) -> deltalake::kernel::Add {
+/// `LogicalFileView::add_action()`, centralizing its `#[allow(deprecated)]` call site.
+pub(super) fn add_action(file: &deltalake::kernel::LogicalFileView) -> deltalake::kernel::Add {
     #[allow(deprecated)]
     file.add_action()
 }
@@ -1291,7 +1291,7 @@ impl Database {
             // a spec edit that changes `generation_id` orphans earlier slices, and
             // coverage ignores generation, so force those days back into
             // `missing_tiers` for the ordinary enqueue path below.
-            if let Some(cursor_was) = self.journal().repair_orphaned_coverage_once(&source)
+            if self.journal().repair_orphaned_coverage_once(&source)
                 && let (Ok(from), Ok(before)) =
                     (chrono::NaiveDate::parse_from_str(ORPHAN_REPAIR_FROM, "%Y-%m-%d"), chrono::NaiveDate::parse_from_str(ORPHAN_REPAIR_BEFORE, "%Y-%m-%d"))
             {
@@ -1305,7 +1305,6 @@ impl Database {
                 warn!(
                     source,
                     forced,
-                    cursor_was,
                     from = ORPHAN_REPAIR_FROM,
                     before = ORPHAN_REPAIR_BEFORE,
                     event = "rollup_orphaned_coverage_repair",
@@ -1762,7 +1761,9 @@ impl Database {
         match operation {
             Operation::Dedup => self.run_coordinator_dedup_selected(TaskSelection::Exact(&key)).await?,
             Operation::BaseRollup | Operation::DerivedRollup => self.run_coordinator_rollup_selected(TaskSelection::Exact(&key)).await?,
-            _ => self.run_coordinator_compaction_selected(TaskSelection::Exact(&key)).await?,
+            Operation::HotPacking | Operation::SealedConsolidation | Operation::Repair => {
+                self.run_coordinator_compaction_selected(TaskSelection::Exact(&key)).await?
+            }
         };
         let wall = started.elapsed();
         let after = snapshot();
@@ -3475,7 +3476,11 @@ impl Database {
                 queued += 1;
             }
         }
-        let _ = journal.checkpoint();
+        // The enqueue is replayable from the log, so a failed checkpoint costs a redo, not the
+        // work — but the "queued" line below would otherwise overstate what was made durable.
+        if let Err(e) = journal.checkpoint() {
+            warn!(source, target, "enqueue not checkpointed; it will be replayed from the log: {e:#}");
+        }
         warn!(
             source,
             target,
@@ -3649,7 +3654,11 @@ impl Database {
             let key = TaskKey { physical_table: target.to_owned(), source: source.to_owned(), project_id: project_id.clone(), slice: *slice, operation };
             journal.enqueue(key, now, MAX_DECODED_BYTES, created);
         }
-        let _ = journal.checkpoint();
+        // The enqueue is replayable from the log, so a failed checkpoint costs a redo, not the
+        // work — but the "queued" line below would otherwise overstate what was made durable.
+        if let Err(e) = journal.checkpoint() {
+            warn!(source, target, "enqueue not checkpointed; it will be replayed from the log: {e:#}");
+        }
         warn!(
             source,
             target,

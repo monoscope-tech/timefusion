@@ -868,18 +868,21 @@ impl TaskJournal {
         self.checkpoint()
     }
 
-    /// Claim the one-shot orphaned-coverage repair, or `None` if it already ran.
-    /// The caller does the work; this owns only the once-ness, and marks the
-    /// migration done IMMEDIATELY so a restart mid-repair cannot re-force every
-    /// cell. Keyed PER SOURCE, or the first source processed consumes it for all.
-    pub fn repair_orphaned_coverage_once(&mut self, source: &str) -> Option<u64> {
+    /// Claim the one-shot orphaned-coverage repair; `false` if it already ran. The caller does the
+    /// work; this owns only the once-ness, and marks the migration done IMMEDIATELY so a restart
+    /// mid-repair cannot re-force every cell. Keyed PER SOURCE, or the first source processed
+    /// consumes it for all. Returns `bool`, not a cursor: this repair has no prefix to resume from.
+    pub fn repair_orphaned_coverage_once(&mut self, source: &str) -> bool {
         let key = format!("{}:{source}", Self::ORPHAN_REPAIR_MIGRATION);
         if self.migration_done(&key) {
-            return None;
+            return false;
         }
         self.mark_migration_done(&key);
-        let _ = self.checkpoint();
-        Some(0)
+        // The claim is replayable from the log, so a failed checkpoint costs a redo, not the claim.
+        if let Err(e) = self.checkpoint() {
+            tracing::warn!(source, "orphan-repair claim not checkpointed; it will be replayed from the log: {e:#}");
+        }
+        true
     }
 
     pub fn migrate_fine_grained_backfill(&mut self, now_micros: i64) -> Option<usize> {
@@ -4759,14 +4762,14 @@ mod tests {
     #[test]
     fn the_orphan_repair_claims_itself_once_and_survives_a_reload() {
         let (dir, mut journal) = new_journal();
-        assert_eq!(journal.repair_orphaned_coverage_once("otel_logs_and_spans"), Some(0), "first call claims it");
-        assert_eq!(journal.repair_orphaned_coverage_once("otel_logs_and_spans"), None, "second call in the same process must not");
+        assert!(journal.repair_orphaned_coverage_once("otel_logs_and_spans"), "first call claims it");
+        assert!(!journal.repair_orphaned_coverage_once("otel_logs_and_spans"), "second call in the same process must not");
         // PER SOURCE: the caller loops over sources, so one global cursor would let
         // whichever source runs first consume the repair the others still need.
-        assert_eq!(journal.repair_orphaned_coverage_once("otel_metrics"), Some(0), "a different source claims independently");
+        assert!(journal.repair_orphaned_coverage_once("otel_metrics"), "a different source claims independently");
         drop(journal);
         let mut reloaded = TaskJournal::load(dir.path()).expect("reload");
-        assert_eq!(reloaded.repair_orphaned_coverage_once("otel_logs_and_spans"), None, "a restart must not re-run the repair");
+        assert!(!reloaded.repair_orphaned_coverage_once("otel_logs_and_spans"), "a restart must not re-run the repair");
     }
 
     /// The damage repair's cursor is a consumed-PREFIX index, per source, monotonic,
@@ -4775,7 +4778,7 @@ mod tests {
     fn the_damage_repair_cursor_is_a_per_source_prefix_that_survives_a_reload() {
         const DAMAGE: &str = TaskJournal::DAMAGE_REPAIR_MIGRATION;
         let (dir, mut journal) = new_journal();
-        assert_eq!(journal.repair_orphaned_coverage_once("otel_logs_and_spans"), Some(0), "orphan repair claims");
+        assert!(journal.repair_orphaned_coverage_once("otel_logs_and_spans"), "orphan repair claims");
         assert_eq!(journal.repair_cursor(DAMAGE, "otel_logs_and_spans"), 0, "the orphan repair's cursor must not consume the damage list");
         journal.advance_repair_cursor(DAMAGE, "otel_logs_and_spans", 24).expect("advance");
         assert_eq!(journal.repair_cursor(DAMAGE, "otel_metrics"), 0, "a different source is consumed independently");

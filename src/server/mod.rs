@@ -409,7 +409,7 @@ fn client_statement_timeout(client: &(impl ClientInfo + ?Sized)) -> Option<std::
 /// DROPPING the in-flight future, and the DML path commits inside it, so
 /// cancelling would report failure for a write that is already partly durable.
 fn statement_timeout_applies(query: &str) -> bool {
-    !matches!(classify_query(query).0, "DML" | "DDL")
+    !matches!(classify_query(query).0, QueryKind::Dml | QueryKind::Ddl)
 }
 
 async fn run_with_statement_timeout<T>(
@@ -900,24 +900,51 @@ fn rewrite_row_to_json_record(query: &str) -> Option<String> {
     crate::read::optimizers::rewrite(statement).then(|| statement.to_string())
 }
 
-/// (keyword, space-padded keyword, `query.type`, operation). First match wins,
-/// so order is significant.
-const QUERY_KINDS: [(&str, &str, &str, &str); 7] = [
-    ("select", " select ", "SELECT", "SELECT"),
-    ("update", " update ", "DML", "UPDATE"),
-    ("delete", " delete ", "DML", "DELETE"),
-    ("insert", " insert ", "DML", "INSERT"),
-    ("create", " create ", "DDL", "CREATE"),
-    ("drop", " drop ", "DDL", "DROP"),
-    ("alter", " alter ", "DDL", "ALTER"),
+/// What a statement DOES, as far as the wire layer needs to know. A type, not a `&str`: the
+/// statement-timeout exemption branches on it, and a string there can only be re-parsed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QueryKind {
+    Select,
+    Dml,
+    Ddl,
+    Other,
+}
+
+impl QueryKind {
+    /// The `query.type` span field.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Select => "SELECT",
+            Self::Dml => "DML",
+            Self::Ddl => "DDL",
+            Self::Other => "OTHER",
+        }
+    }
+}
+
+/// (keyword, space-padded keyword, kind, operation).
+const QUERY_KINDS: [(&str, &str, QueryKind, &str); 7] = [
+    ("select", " select ", QueryKind::Select, "SELECT"),
+    ("update", " update ", QueryKind::Dml, "UPDATE"),
+    ("delete", " delete ", QueryKind::Dml, "DELETE"),
+    ("insert", " insert ", QueryKind::Dml, "INSERT"),
+    ("create", " create ", QueryKind::Ddl, "CREATE"),
+    ("drop", " drop ", QueryKind::Ddl, "DROP"),
+    ("alter", " alter ", QueryKind::Ddl, "ALTER"),
 ];
 
-fn classify_query(query: &str) -> (&'static str, &'static str) {
+/// Leading keyword first, across ALL kinds, before any embedded-keyword fallback: the fallback
+/// exists for prefixed statements (`WITH ... SELECT`, `EXPLAIN SELECT`), and scanning it in table
+/// order let `select` win on `INSERT ... SELECT` — handing a write the read-only statement timeout.
+/// In the fallback pass a write outranks a read for the same reason.
+fn classify_query(query: &str) -> (QueryKind, &'static str) {
     let q = query.trim().to_lowercase();
+    let embedded = || QUERY_KINDS.iter().filter(|(_, _, kind, _)| *kind != QueryKind::Select).chain(QUERY_KINDS.iter());
     QUERY_KINDS
         .iter()
-        .find(|(kw, padded, ..)| q.starts_with(kw) || q.contains(padded))
-        .map_or(("OTHER", "UNKNOWN"), |&(.., query_type, operation)| (query_type, operation))
+        .find(|(kw, ..)| q.starts_with(kw))
+        .or_else(|| embedded().find(|(_, padded, ..)| q.contains(padded)))
+        .map_or((QueryKind::Other, "UNKNOWN"), |&(.., kind, operation)| (kind, operation))
 }
 
 /// Redact literal values and comments so the result can safely be indexed and
@@ -953,7 +980,7 @@ fn query_fingerprint(query: &str) -> String {
 /// Classify `query` and stamp the standard query/db tracing fields onto `span`.
 fn record_query_span(span: &tracing::Span, query: &str) {
     let (query_type, operation) = classify_query(query);
-    span.record("query.type", query_type);
+    span.record("query.type", query_type.as_str());
     span.record("query.operation", operation);
     span.record("db.operation", operation);
     span.record("query.text", query_template(query));
@@ -1297,6 +1324,9 @@ mod pgwire_handlers_tests {
     #[test_case("INSERT INTO otel_logs_and_spans VALUES (1)" => false ; "insert")]
     #[test_case("UPDATE otel_logs_and_spans SET name = 'x' WHERE id = '1'" => false ; "update")]
     #[test_case("DELETE FROM otel_logs_and_spans WHERE id = '1'" => false ; "delete")]
+    #[test_case("INSERT INTO otel_logs_and_spans SELECT * FROM staging" => false ; "INSERT ... SELECT is a write, not the SELECT its first keyword table-order match found")]
+    #[test_case("WITH x AS (SELECT 1) INSERT INTO t SELECT * FROM x" => false ; "a data-modifying CTE is a write")]
+    #[test_case("EXPLAIN SELECT 1" => true ; "a prefixed read still reaches the embedded-keyword fallback")]
     fn the_statement_timeout_never_applies_to_a_write(query: &str) -> bool {
         super::statement_timeout_applies(query)
     }

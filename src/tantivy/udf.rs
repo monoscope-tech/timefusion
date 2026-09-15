@@ -181,9 +181,12 @@ fn tantivy_tokens_contained(query: &str, haystack: &str) -> bool {
 /// original predicate, which re-filters exactly. `eq` → case-insensitive
 /// containment; `like`/`ilike` → case-insensitive SQL LIKE.
 fn deferred_row_matches(kind: &str, value: &str, haystack: &str) -> bool {
-    match kind {
-        "eq" => haystack.to_lowercase().contains(&value.to_lowercase()),
-        _ => like_match_ci(value, haystack),
+    match kind.split_once(':') {
+        None if kind == "eq" => haystack.to_lowercase().contains(&value.to_lowercase()),
+        Some(("like" | "ilike", _)) => like_match_ci(value, haystack),
+        // An unrecognized kind must not be mis-evaluated as LIKE; admit the row and
+        // let the original predicate (which re-filters exactly) decide.
+        _ => true,
     }
 }
 

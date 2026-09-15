@@ -545,7 +545,8 @@ fn parse_delta_data_type(s: &str) -> anyhow::Result<DeltaDataType> {
         "List(Int64)" => DeltaDataType::Array(Box::new(ArrayType::new(DeltaDataType::Primitive(Long), true))),
         "List(Float64)" => DeltaDataType::Array(Box::new(ArrayType::new(DeltaDataType::Primitive(Double), true))),
         "Variant" => DeltaDataType::unshredded_variant(),
-        _ if s.starts_with("Timestamp") => DeltaDataType::Primitive(Timestamp),
+        // The two spellings `parse_arrow_data_type` accepts — the decoders must agree on the set.
+        "Timestamp(Microsecond, None)" | "Timestamp(Microsecond, Some(\"UTC\"))" => DeltaDataType::Primitive(Timestamp),
         _ => anyhow::bail!("Unknown type: {}", s),
     })
 }

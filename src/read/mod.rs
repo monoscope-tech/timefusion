@@ -1773,8 +1773,8 @@ fn literal_micros(e: &Expr) -> Option<i64> {
     match e {
         Expr::Literal(ScalarValue::TimestampMicrosecond(Some(ts), _), _) => Some(*ts),
         Expr::Literal(ScalarValue::TimestampNanosecond(Some(ts), _), _) => Some(*ts / 1000),
-        Expr::Literal(ScalarValue::TimestampMillisecond(Some(ts), _), _) => Some(*ts * 1000),
-        Expr::Literal(ScalarValue::TimestampSecond(Some(ts), _), _) => Some(*ts * 1_000_000),
+        Expr::Literal(ScalarValue::TimestampMillisecond(Some(ts), _), _) => ts.checked_mul(1000),
+        Expr::Literal(ScalarValue::TimestampSecond(Some(ts), _), _) => ts.checked_mul(1_000_000),
         Expr::Cast(c) => literal_micros(&c.expr),
         _ => None,
     }

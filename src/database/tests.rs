@@ -6913,7 +6913,7 @@ async fn test_batch_queue_under_load() -> Result<()> {
             let batch = json_to_batch(vec![test_span(&batch_id, &format!("test_{batch_id}"), &project_id)])?;
             match queue.queue(batch) {
                 Ok(_) => {}
-                Err(e) if e.to_string().contains("Queue full") => break,
+                Err(e) if e.to_string().contains("batch queue full") => break,
                 Err(e) => return Err(e),
             }
         }

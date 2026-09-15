@@ -2537,17 +2537,19 @@ fn split_aggregate(plan: &LogicalPlan) -> Result<Option<LogicalPlan>> {
     if branches < 2 || matches!(aggregate.input.as_ref(), LogicalPlan::Union(_)) {
         return Ok(None);
     }
-    let Some((qualifier, lo, hi)) = splittable_window(&aggregate.input).filter(|&(_, lo, hi)| hi.saturating_sub(lo) >= MIN_SPLIT_SPAN_MICROS) else {
+    let Some((qualifier, lo, hi)) = splittable_window(&aggregate.input) else { return Ok(None) };
+    // One span, used for BOTH the admission test and the step: a saturating guard
+    // over a raw subtraction would admit a pair the subtraction then overflows on.
+    let Some(step) = hi.checked_sub(lo).filter(|span| *span >= MIN_SPLIT_SPAN_MICROS).map(|span| span / branches as i64) else {
         return Ok(None);
     };
-    let step = (hi - lo) / branches as i64;
     let Some(narrowed) = (0..branches)
         .map(|i| {
             // Half-open [lo, hi) per branch so a row on a boundary belongs to
             // exactly one branch. The last branch takes `hi + 1` because the
             // window `hi` is INCLUSIVE (`<=` folds into it upstream).
-            let branch_lo = lo + step * i as i64;
-            let branch_hi = if i + 1 == branches { hi.saturating_add(1) } else { lo + step * (i as i64 + 1) };
+            let branch_lo = lo.checked_add(step * i as i64)?;
+            let branch_hi = if i + 1 == branches { hi.saturating_add(1) } else { lo.checked_add(step * (i as i64 + 1))? };
             narrow_scan_window(&aggregate.input, branch_lo, branch_hi)
         })
         .collect::<Option<Vec<_>>>()

@@ -1938,10 +1938,7 @@ fn adds_for_file_ids(snapshot: &deltalake::kernel::EagerSnapshot, file_ids: &[St
                 let p = f.path();
                 file_ids.iter().any(|v| v.ends_with(p.as_ref()) || p.ends_with(v.as_str()))
             })
-            .map(|f| {
-                #[allow(deprecated)]
-                f.add_action()
-            }),
+            .map(|f| super::maintain::add_action(&f)),
         table_name,
     )
 }

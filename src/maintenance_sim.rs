@@ -435,7 +435,7 @@ fn streams_from_journal(journal: &TaskJournal) -> Vec<Stream> {
             Operation::Dedup | Operation::HotPacking => stream.source_table = key.physical_table.clone(),
             Operation::BaseRollup => stream.base_rollup_table = key.physical_table.clone(),
             Operation::DerivedRollup => stream.derived_rollup_table = Some(key.physical_table.clone()),
-            _ => {}
+            Operation::SealedConsolidation | Operation::Repair => {}
         }
     }
     streams

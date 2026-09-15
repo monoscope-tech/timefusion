@@ -1904,11 +1904,19 @@ impl MemBuffer {
                 let tgt_key_cols: Vec<ArrayRef> = source
                     .join_keys
                     .iter()
-                    .map(|(tgt_col, _)| {
-                        batch
+                    .zip(&src_key_cols)
+                    .map(|((tgt_col, _), src_col)| {
+                        let raw = batch
                             .column_by_name(tgt_col)
-                            .cloned()
-                            .ok_or_else(|| datafusion::error::DataFusionError::Plan(format!("Target column '{}' not found", tgt_col)))
+                            .ok_or_else(|| datafusion::error::DataFusionError::Plan(format!("Target column '{}' not found", tgt_col)))?;
+                        // `row_converter` was built from the SOURCE key types. A buffered batch may
+                        // hold a column as `Utf8View` where the declared schema says `Utf8`; feeding
+                        // that in raw makes every lookup miss and the UPDATE silently match 0 rows.
+                        if raw.data_type() == src_col.data_type() {
+                            Ok(raw.clone())
+                        } else {
+                            arrow::compute::cast(raw.as_ref(), src_col.data_type()).map_err(arrow_err)
+                        }
                     })
                     .collect::<DFResult<Vec<_>>>()?;
                 let tgt_rows = row_converter.convert_columns(&tgt_key_cols).map_err(arrow_err)?;
@@ -2020,11 +2028,13 @@ impl MemBuffer {
     /// WAL replay path for `UPDATE ... FROM`: parses the SQL against the widened
     /// schema (target + `source__`-prefixed source columns), then delegates to
     /// [`Self::update_with_source`].
-    #[instrument(skip(self, assignments, source_batch, registry), fields(project_id, table_name, source_rows = source_batch.num_rows()))]
+    #[instrument(skip(self, assignments, source, registry), fields(project_id, table_name, source_rows = source.batch.num_rows()))]
+    // 8 after folding the join keys and the batch into `UpdateSource` (the pair that must agree);
+    // the rest mirror `update_by_sql`'s arguments one for one and are genuinely independent.
     #[allow(clippy::too_many_arguments)]
     pub fn update_with_source_by_sql(
-        &self, project_id: &str, table_name: &str, predicate_sql: Option<&str>, assignments: &[(String, String)], join_keys: &[(String, String)],
-        source_batch: RecordBatch, registry: Option<&FnRegistry>, wal_hold: Option<(usize, walrus_rust::WalPosition)>,
+        &self, project_id: &str, table_name: &str, predicate_sql: Option<&str>, assignments: &[(String, String)], source: crate::dml::UpdateSource,
+        registry: Option<&FnRegistry>, wal_hold: Option<(usize, walrus_rust::WalPosition)>,
     ) -> DFResult<u64> {
         if self.replay_dml_noop(project_id, table_name, "UPDATE...FROM") {
             return Ok(0);
@@ -2033,13 +2043,12 @@ impl MemBuffer {
 
         // Must match the widened DFSchema the assignment SQL was originally
         // parsed against, as built by `update_with_source`.
-        let widened_schema = widen_schema_with_source(target_df_schema.fields(), source_batch.schema().fields());
+        let widened_schema = widen_schema_with_source(target_df_schema.fields(), source.schema.fields());
         let widened_df_schema = DFSchema::try_from(widened_schema.as_ref().clone())?;
 
         let predicate = predicate_sql.map(|s| parse_sql_predicate(s, &widened_df_schema, registry)).transpose()?;
         let parsed_assignments = parse_sql_assignments(assignments, &widened_df_schema, registry)?;
 
-        let source = crate::dml::UpdateSource { schema: source_batch.schema(), batch: source_batch, join_keys: join_keys.to_vec() };
         self.update_with_source(project_id, table_name, predicate.as_ref(), &parsed_assignments, &source, wal_hold)
     }
 
@@ -3200,6 +3209,11 @@ mod tests {
         (n, collect_id_name(&buffer, "p", "t"))
     }
 
+    /// The replay path's `UpdateSource`: schema is always the batch's own.
+    fn replay_source(batch: RecordBatch, join_keys: &[(String, String)]) -> crate::dml::UpdateSource {
+        crate::dml::UpdateSource { schema: batch.schema(), batch, join_keys: join_keys.to_vec() }
+    }
+
     /// WAL replay parses DML against the bare buffer schema (plus `source__`
     /// source cols), so the serializer must store normalized, unqualified column
     /// refs: the qualified form fails to parse, the normalized form applies.
@@ -3210,10 +3224,10 @@ mod tests {
         let assigns = [("name".to_string(), "source__new_name".to_string())];
         let keys = [("id".to_string(), "id".to_string())];
 
-        let bad = buffer.update_with_source_by_sql("p", "t", Some("t.id > 0"), &assigns, &keys, src.batch.clone(), None, None);
+        let bad = buffer.update_with_source_by_sql("p", "t", Some("t.id > 0"), &assigns, replay_source(src.batch.clone(), &keys), None, None);
         assert!(bad.is_err(), "table-qualified predicate must fail against the bare replay schema");
 
-        let n = buffer.update_with_source_by_sql("p", "t", Some("id > 0"), &assigns, &keys, src.batch, None, None).unwrap();
+        let n = buffer.update_with_source_by_sql("p", "t", Some("id > 0"), &assigns, replay_source(src.batch, &keys), None, None).unwrap();
         assert_eq!(n, 2);
         assert_eq!(collect_id_name(&buffer, "p", "t"), rows(&[(1, "a"), (2, "B"), (3, "c"), (4, "D"), (5, "e")]));
     }
@@ -3244,7 +3258,7 @@ mod tests {
         let keys = [("id".to_string(), "id".to_string())];
         let reg = crate::read::functions::function_registry().unwrap();
         let n = buffer
-            .update_with_source_by_sql("p", "t", None, &assigns, &keys, src_batch, Some(reg.as_ref()), None)
+            .update_with_source_by_sql("p", "t", None, &assigns, replay_source(src_batch, &keys), Some(reg.as_ref()), None)
             .expect("normalized hashes UPDATE...FROM must parse AND apply");
         assert_eq!(n, 1, "only id=1 matches the source");
 
@@ -3273,7 +3287,7 @@ mod tests {
         let keys = [("id".to_string(), "id".to_string())];
         let pred = "context___span_id IS NOT NULL AND context___trace_id IS NOT NULL";
         let n = buffer
-            .update_with_source_by_sql("p", "t", Some(pred), &assigns, &keys, src.batch, None, None)
+            .update_with_source_by_sql("p", "t", Some(pred), &assigns, replay_source(src.batch, &keys), None, None)
             .expect("UPDATE...FROM replay on an untracked table must no-op, not schema-error");
         assert_eq!(n, 0);
         assert_eq!(

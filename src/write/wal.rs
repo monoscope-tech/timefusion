@@ -23,6 +23,8 @@ pub enum WalError {
     InvalidOperation(u8),
     #[error("Unsupported WAL version: {version} (expected {expected})")]
     UnsupportedVersion { version: u8, expected: u8 },
+    #[error("Bad WAL magic: {got:02x?}")]
+    BadMagic { got: [u8; 4] },
     /// Fatal: a process that cannot own the WAL must exit rather than linger half-started.
     #[error("{0}")]
     LockContention(String),
@@ -133,7 +135,9 @@ const MAX_BATCH_SIZE: usize = 1024 * 1024 * 1024;
 /// is kept small even though acceptance goes up to `MAX_BATCH_SIZE`.
 const WAL_SPLIT_TARGET: usize = 100 * 1024 * 1024;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode, strum::FromRepr)]
+/// `Display`/`FromStr` are the on-disk spelling in the quarantine `.meta`
+/// sidecar, so the re-drive filter is compiler-checked against a rename.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode, strum::FromRepr, strum::Display, strum::EnumString)]
 #[repr(u8)]
 pub enum WalOperation {
     Insert = 0,
@@ -1043,7 +1047,7 @@ fn deserialize_wal_entry(data: &[u8]) -> Result<WalEntry, WalError> {
         return Err(WalError::TooShort { len: data.len() });
     };
     if [*m0, *m1, *m2, *m3] != WAL_MAGIC {
-        return Err(WalError::UnsupportedVersion { version: *m0, expected: WAL_VERSION });
+        return Err(WalError::BadMagic { got: [*m0, *m1, *m2, *m3] });
     }
     if *version != WAL_VERSION {
         return Err(WalError::UnsupportedVersion { version: *version, expected: WAL_VERSION });
