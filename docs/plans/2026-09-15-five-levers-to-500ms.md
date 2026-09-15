@@ -149,3 +149,21 @@ stage.
   invalidate it at read) and give DAY coverage the same witness rescue slices
   got in #300. The witness read-path branches are active as of 15:09; this
   belongs to that arc.
+- 2026-09-15 evening: **the miss mix transformed again** — coverage destruction
+  is beaten (`not_built` 138, stale ~0; the rescue serves 7-13k/window). Final
+  misses are now QUERY-SHAPE: `unknown_filter` 712, `filter_not_eligible` 712,
+  `unaligned_bucket` 551, `tiny_interior` 542. Sampled shapes
+  (`rollup_miss_sampled`):
+  1. `time_bucket(_, ts), coalesce(status_code::text, _), count(*)` — the
+     status-code timeseries every dashboard runs. The matcher cannot see
+     through `coalesce(dim, const)` to the stored dim. **Teaching it uses
+     EXISTING rollup dims — no backfill, no new backlog. Best next candidate.**
+  2. `name::text ~* _` regex filters — correctly ineligible; would need the
+     text index, not rollups.
+  3. RUM per-session aggregates — genuinely unsupported shape.
+  Also `unaligned_bucket` 551 deserves one check: if the plan-cache's
+  parameterized `time_bucket(?, …)` reaches the matcher as a param, alignment
+  is unprovable and every cached-plan aggregate misses — worth verifying
+  before touching the matcher.
+  (p95 elevated 316→620 ms·10⁻³ this hour — evening peak + young process;
+  re-read after the process ages before treating it as a regression.)
