@@ -614,6 +614,16 @@ async fn run_until_idle_capped<T>(
     }
 }
 
+/// Is every microsecond of `(lo, hi)` inside the union of `intervals`?
+///
+/// `intervals` are the disjoint, sorted, half-open runs `merge_clean_interval`
+/// maintains, so a window is covered exactly when one run contains it — adjacent
+/// runs are already merged, and a window straddling a GAP is genuinely unproved.
+/// Inclusive `hi`, matching the rest of the certification path.
+fn clean_intervals_cover(intervals: &[(i64, i64)], (lo, hi): (i64, i64)) -> bool {
+    lo <= hi && intervals.iter().any(|&(s, e)| s <= lo && hi < e)
+}
+
 /// Do all `added` spans lie entirely outside `(lo, hi)`?
 ///
 /// Bounds are INCLUSIVE on both sides, matching `skippable_certified_files`, so a
@@ -4433,6 +4443,30 @@ impl Database {
             // Bound in a `let`, NOT inlined as the match scrutinee: the `Ref` would live
             // until the end of the match while the stale arm removes from the same
             // shard — a self-deadlock.
+            // The ACCUMULATED clean coverage proves windows even when no whole-day
+            // grant exists — and on this workload a whole-day grant essentially
+            // never does. #290 keeps those intervals alive across flushes and prod
+            // shows it firing 17-37 times per half hour, but until now the only
+            // consumer was the per-FILE skip, which `cert_skip_blocked_overlap`
+            // measured at 27,125 blocked and 0 granted: structurally unreachable,
+            // because merge-on-read appends rows at their ORIGINAL timestamps and
+            // no certified file is ever isolated from every uncertified one.
+            //
+            // So the retained coverage fed nothing. This reads it directly: if the
+            // query window sits inside the proved runs, and nothing added since can
+            // have touched that window, the scan may skip.
+            if self.config.maintenance.timefusion_dedup_window_scoped_certification
+                && schema_or_default(table_name).dedup_keys.iter().any(|key| key == "timestamp")
+                && let Some(cov) = self.dedup_slice_coverage.get(&fp_key).map(|entry| entry.value().clone())
+                && !cov.files.is_empty()
+                && clean_intervals_cover(&cov.intervals, (lo.max(day_start_micros(date).unwrap_or(lo)), hi))
+                && Self::added_paths_miss_window(table, &date.to_string(), &cov.files, &files, (lo, hi))
+            {
+                metrics::counter!(scan_metric_names::CERT_WINDOW_FROM_SLICE_COVERAGE).increment(1);
+                certified_any = true;
+                certified_dates.insert(date.to_string());
+                continue;
+            }
             let certified = self.dedup_clean_fp.get(&fp_key).map(|entry| entry.value().clone());
             match certified {
                 // `!cert.stale` is required, not decorative: a slice-derived
@@ -4515,7 +4549,12 @@ impl Database {
     /// `partition_file_spans` already states for readers). Fails closed, so the
     /// caller falls through to the ordinary fp-moved handling.
     fn added_files_miss_window(table: &DeltaTable, date: &str, cert: &Certification, live: &[String], (lo, hi): (i64, i64)) -> bool {
-        let proved: HashSet<&str> = cert.files.iter().filter_map(|uri| crate::tantivy::search::parquet_rel_of_uri(uri)).collect();
+        Self::added_paths_miss_window(table, date, &cert.files, live, (lo, hi))
+    }
+
+    /// As `added_files_miss_window`, over a bare proved-file list.
+    fn added_paths_miss_window(table: &DeltaTable, date: &str, proved_files: &[String], live: &[String], (lo, hi): (i64, i64)) -> bool {
+        let proved: HashSet<&str> = proved_files.iter().filter_map(|uri| crate::tantivy::search::parquet_rel_of_uri(uri)).collect();
         let added: HashSet<&str> = live.iter().filter_map(|uri| crate::tantivy::search::parquet_rel_of_uri(uri)).filter(|rel| !proved.contains(rel)).collect();
         if added.is_empty() {
             return false; // nothing added, yet the fingerprint moved: a REMOVAL, which this cannot reason about
@@ -8519,5 +8558,25 @@ mod window_scoped_certification_tests {
         let added = live.iter().filter_map(|u| crate::tantivy::search::parquet_rel_of_uri(u)).filter(|r| !proved.contains(r)).count();
         assert_eq!(added, 0, "a removal adds nothing, so the helper returns false and the caller denies");
         let _ = Arc::new(());
+    }
+}
+
+#[cfg(test)]
+mod read_skip_from_slice_coverage_tests {
+    use super::clean_intervals_cover;
+
+    /// #290 retains clean intervals and prod shows it firing 17-37 times per half
+    /// hour, but its only consumer was the per-FILE skip, measured at 27,125
+    /// blocked and 0 granted. This is the consumer that pays: a window inside the
+    /// proved runs can skip dedup with no whole-day grant.
+    #[test_case::test_case(&[(0, 100)], (10, 90) => true ; "a window inside one proved run")]
+    #[test_case::test_case(&[(0, 100)], (0, 99) => true ; "the whole run, inclusive hi")]
+    #[test_case::test_case(&[(0, 100)], (0, 100) => false ; "hi == end is OUTSIDE a half-open run")]
+    #[test_case::test_case(&[(0, 100), (200, 300)], (50, 250) => false ; "a window straddling a GAP is not proved")]
+    #[test_case::test_case(&[(0, 100), (100, 300)], (50, 250) => false ; "unmerged adjacency does not cover; merge_clean_interval coalesces first")]
+    #[test_case::test_case(&[], (0, 10) => false ; "no coverage proves nothing")]
+    #[test_case::test_case(&[(0, 100)], (90, 10) => false ; "an inverted window is never covered")]
+    fn only_a_window_wholly_inside_one_proved_run_may_skip(intervals: &[(i64, i64)], window: (i64, i64)) -> bool {
+        clean_intervals_cover(intervals, window)
     }
 }

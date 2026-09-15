@@ -294,6 +294,11 @@ pub mod scan_metric_names {
         // added since sits outside the query window. Read against
         // dedup_denied_fp_moved, which was 60% of all eligible scans.
         CERT_WINDOW_SURVIVED_FP_MOVE = "timefusion.scan.cert_window_survived_fp_move" as scan.cert_window_survived_fp_move;
+        // A skip granted straight from accumulated slice coverage, with no
+        // whole-day certification involved. The consumer #290's retained
+        // intervals never had: the per-FILE path they fed measured 27,125
+        // blocked and 0 granted.
+        CERT_WINDOW_FROM_SLICE_COVERAGE = "timefusion.scan.cert_window_from_slice_coverage" as scan.cert_window_from_slice_coverage;
         // A fingerprint move that KEPT span-disjoint coverage instead of discarding
         // the day. Read against `cert_coverage_reset`: coverage that only ever
         // resets is coverage that never accumulates, which is what held
