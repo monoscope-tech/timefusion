@@ -183,3 +183,23 @@ stage.
   aggregates now bounded by rollup hit rate (13–17% → ~51% at #300, diurnal);
   coverage destruction named and beaten; the miss ledger is fully attributed —
   nothing left is unexplained.
+- 2026-09-15 night addenda:
+  - Shipped monoscope `d2a2a4a01` (Infra tab: hardcoded 1-minute buckets →
+    `{{rollup_interval}}`) and `7e60867cc` (TF pool exhaustion classified
+    transient on the hasql path — the log explorer's `retryTransientEff 3` site
+    now absorbs the 63/h `Resources exhausted` failures charts already retried).
+  - `rollup_hits_full_total` is alive (340/30 min) — the witness rescue now
+    serves WHOLE windows; anyone reading only `hits_hybrid` will see a false 0.
+  - **#302 sessions-tier pairing, the full map for one sitting:** the tier
+    builds but serves nothing until the RUM session query
+    (`Pages/RealUserMonitoring.hs` `otelSessionRows`) drops BOTH undeclared
+    expression-aggregates: (a) latest page
+    `MAX(concat(CAST(timestamp AS TEXT),'|',path)) FILTER pageviews` → an
+    `agg: first`-style measure (router renders
+    `first_value(col ORDER BY timestamp)`; needs a last/DESC variant or an
+    argmax measure) and (b) user-agent
+    `MAX(COALESCE(NULLIF(attributes___user_agent___original,''),
+    resource___user_agent___original))` → either a declared measure or a
+    separate lookup. Each added measure grows the tier — the storage/backfill
+    cost the user gated this on. Decide, then change spec + client TOGETHER
+    (the filters must stay in lockstep, per the spec's own comment).
