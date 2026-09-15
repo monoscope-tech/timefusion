@@ -1076,6 +1076,11 @@ atomic_stats! {
         /// file already covered them. Expected to be rare; if it is not, a late row
         /// inside an already-published day may be going stale in the coarse tier.
         rollup_skipped_covered_by_wider,
+        /// Escalations short-circuited because the covering slice's witness still
+        /// verified — the coarse tier was current, so no rebuild was owed. The
+        /// counter that distinguishes a healthy escalation from the 2026-09-15
+        /// livelock, where the same 3h slice re-escalated 71 times in 90 minutes.
+        rollup_escalation_skipped_fresh,
         /// Units that published ZERO rows while the tier they aggregate had published
         /// rows over the SAME slice — and were then marked `complete`, so nothing
         /// revisits them. Empty propagates: `rollup_slice_coverage` records an empty
