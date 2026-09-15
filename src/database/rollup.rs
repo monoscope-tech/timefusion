@@ -89,7 +89,7 @@ impl Database {
         // Per-file `(max_ts, rows)` for the bounded-witness rescue. Loaded lazily, at
         // most once per route call, and only when some slice fails the cheap
         // whole-partition compare while carrying a bounded witness.
-        let mut file_rows: Option<crate::database::maintain::PartitionFileRows> = None;
+        let mut file_rows: Option<std::sync::Arc<crate::database::maintain::PartitionFileRows>> = None;
         // Projects come from the SOURCE, never the tier, so a project with no rollup still
         // counts against coverage. Test the window, not just the date.
         let window_dates: HashSet<String> = dates.iter().map(chrono::NaiveDate::to_string).collect();
@@ -192,7 +192,15 @@ impl Database {
                     {
                         if file_rows.is_none() {
                             let table = source_table.read().await;
-                            file_rows = Some(Self::partition_file_rows(&table).unwrap_or_default());
+                            let version = table.version().unwrap_or(u64::MAX);
+                            file_rows = Some(match self.rollup_file_rows_cache.get(&route.source).filter(|hit| hit.0 == version) {
+                                Some(hit) => std::sync::Arc::clone(&hit.1),
+                                None => {
+                                    let fresh = std::sync::Arc::new(Self::partition_file_rows(&table).unwrap_or_default());
+                                    self.rollup_file_rows_cache.insert(route.source.clone(), (version, std::sync::Arc::clone(&fresh)));
+                                    fresh
+                                }
+                            });
                         }
                         let files = file_rows
                             .as_ref()
