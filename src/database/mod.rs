@@ -299,6 +299,12 @@ pub mod scan_metric_names {
         // intervals never had: the per-FILE path they fed measured 27,125
         // blocked and 0 granted.
         CERT_WINDOW_FROM_SLICE_COVERAGE = "timefusion.scan.cert_window_from_slice_coverage" as scan.cert_window_from_slice_coverage;
+        // Recovered rollup slices carrying #298's bounded witness, against those
+        // without. Read BEFORE building the read side on it: present==0 would mean
+        // the bounded witness never reaches a recovered slice and the flip would be
+        // inert, which is how three read-path changes went tonight.
+        ROLLUP_WITNESS_BOUNDED_PRESENT = "timefusion.scan.rollup_witness_bounded_present" as scan.rollup_witness_bounded_present;
+        ROLLUP_WITNESS_BOUNDED_ABSENT = "timefusion.scan.rollup_witness_bounded_absent" as scan.rollup_witness_bounded_absent;
         // A fingerprint move that KEPT span-disjoint coverage instead of discarding
         // the day. Read against `cert_coverage_reset`: coverage that only ever
         // resets is coverage that never accumulates, which is what held
