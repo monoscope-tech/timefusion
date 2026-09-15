@@ -12,6 +12,7 @@ mod flush_sort_cost;
 mod flush_sort_escalation;
 mod flush_warm;
 mod hash_enrichment;
+mod heavy_query_admission;
 mod hot_tail_sorted_footer;
 mod insert_unnest_scaling;
 mod insert_unnest_variant;

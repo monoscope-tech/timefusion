@@ -57,6 +57,7 @@ pub struct E2eEnvBuilder {
     repair_resume: bool,
     landed_skip: bool,
     mark_sorted_at_write: bool,
+    heavy_query_admission: bool,
 }
 
 impl Default for E2eEnvBuilder {
@@ -89,6 +90,7 @@ impl Default for E2eEnvBuilder {
             repair_resume: false,
             landed_skip: false,
             mark_sorted_at_write: true,
+            heavy_query_admission: false,
         }
     }
 }
@@ -151,6 +153,9 @@ impl E2eEnvBuilder {
         /// (`with_repair_resume` commits staged-but-uncommitted repair parquet at
         /// boot instead of deleting it; off by default, so a resume test must set it.)
         without_write_time_sort_marking => mark_sorted_at_write = false,
+        /// Gate spilling-sort queries through the pool-derived heavy-query
+        /// semaphore (the pgwire-path admission rule); off in prod by default.
+        with_heavy_query_admission => heavy_query_admission = true,
         with_repair_resume => repair_resume = true,
         /// Decline a flush whose rows are provably already committed.
         with_landed_skip => landed_skip = true,
@@ -419,6 +424,7 @@ fn build_config(b: &E2eEnvBuilder, endpoint: &str, bucket: &str, data_dir: PathB
     if let Some(v) = b.wide_scan_max_mb {
         cfg.memory.timefusion_wide_scan_max_mb = v;
     }
+    cfg.memory.timefusion_heavy_query_admission = b.heavy_query_admission;
     Arc::new(cfg)
 }
 
