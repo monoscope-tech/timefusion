@@ -167,3 +167,19 @@ stage.
   before touching the matcher.
   (p95 elevated 316→620 ms·10⁻³ this hour — evening peak + young process;
   re-read after the process ages before treating it as a regression.)
+- 2026-09-15 close-out. Residual-filter misses attributed from prod logs: the
+  dominant source is the RUM session-list query (`GROUP BY
+  attributes___session___id` + filtered counts) — genuinely unservable; a
+  session rollup means a new backfill, which this plan's constraint forbids.
+  Regex filters are correct misses. **Remaining decisions, user's call:**
+  1. Dashboard bucket policy: widgets hardcode `time_bucket('1 minute')`,
+     which can never align with hour-grain rollups on wide windows (551
+     `unaligned_bucket`/hr). Fix is monoscope-side (adaptive bucket presets) —
+     product tradeoff (chart resolution vs speed).
+  2. `TIMEFUSION_LANDED_SKIP_ENABLED=true` in CapRover (item 4, validated) —
+     batch with the next deploy.
+  3. Session/RUM rollup tier — only with an accepted backfill cost.
+  Scoreboard for the day: list shape 24–45 s → 0.2–0.5 s warm (goal met);
+  aggregates now bounded by rollup hit rate (13–17% → ~51% at #300, diurnal);
+  coverage destruction named and beaten; the miss ledger is fully attributed —
+  nothing left is unexplained.
