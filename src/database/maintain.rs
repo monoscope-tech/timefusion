@@ -651,6 +651,10 @@ fn added_spans_miss_window(added: impl IntoIterator<Item = crate::read::FileSpan
     added.into_iter().all(|span| span.is_some_and(|(min, max)| max < lo || min > hi))
 }
 
+/// Per-file `(max_ts, num_records)` lists keyed by `(project, date)` — the
+/// inputs `rollup::rows_below` re-proves a bounded witness against.
+pub(crate) type PartitionFileRows = HashMap<(String, String), Vec<(Option<i64>, i64)>>;
+
 /// (project, slice_start, slice_end, generation, source_fp, source_rows) — the
 /// coverage identity `recover_rollup_coverage` reads back off a tier file's tags.
 type TaggedSliceIdentity = (String, i64, i64, String, u64, Option<u64>);
@@ -2402,6 +2406,7 @@ impl Database {
             generation: generation.clone(),
             rows,
             source_rows: source_rows.and_then(|rows| u64::try_from(rows).ok()),
+            source_rows_below: source_rows_below.and_then(|rows| u64::try_from(rows).ok()),
         };
         let actions = replaced.iter().map(|add| Action::Remove(remove_for_add(add, true))).chain(adds.iter().cloned().map(Action::Add)).collect::<Vec<_>>();
         // The staged parquet as commit actions — only the abandon paths need this shape.
@@ -2473,6 +2478,7 @@ impl Database {
                 source_epoch: None,
                 generation: generation.clone(),
                 source_rows: source_rows.and_then(|rows| u64::try_from(rows).ok()),
+                source_rows_below: source_rows_below.and_then(|rows| u64::try_from(rows).ok()),
                 covered_through: key.slice.end_micros,
                 measures: Some(materialized.iter().cloned().collect()),
                 content_fp: Some(content_fp),
@@ -3401,6 +3407,49 @@ impl Database {
 
     /// As [`Self::partition_fingerprints_bounded`], but also carrying the row
     /// timestamps each partition's files span, in one pass.
+    /// Per-file `(max_ts, num_records)` for every partition, keyed like
+    /// [`Self::partition_stats_bounded`] — the inputs `rollup::rows_below` needs
+    /// to re-prove a bounded witness at read time.
+    ///
+    /// Extracted lazily by the rollup route, and only when a slice has already
+    /// failed the whole-partition compare while carrying a bounded witness, so
+    /// the happy path never pays for the second add-actions pass.
+    pub(crate) fn partition_file_rows(table: &DeltaTable) -> Result<PartitionFileRows> {
+        let snapshot = table.snapshot()?.snapshot();
+        let actions = snapshot.add_actions_table(true)?;
+        let (Some(records), Some(dates)) = (actions.column_by_name("num_records").cloned(), actions.column_by_name("partition.date").cloned()) else {
+            return Ok(HashMap::new());
+        };
+        let Some(records) = records.as_any().downcast_ref::<arrow::array::Int64Array>().cloned() else { return Ok(HashMap::new()) };
+        let projects = actions.column_by_name("partition.project_id").cloned();
+        let max_ts = crate::read::ts_micros_column(&actions, "max.timestamp");
+        Ok((0..actions.num_rows()).fold(PartitionFileRows::new(), |mut acc, row| {
+            let Some(date) = Self::partition_string_at(Some(&dates), row) else { return acc };
+            let project = Self::partition_string_at(projects.as_ref(), row).unwrap_or_else(|| "default".to_string());
+            // The SAME row rule as `partition_stats_bounded`: an invalid
+            // `num_records` counts 0, and the max timestamp stays `None` when the
+            // file carries no statistics.
+            let rows = if records.is_valid(row) { records.value(row) } else { 0 };
+            acc.entry((project, date)).or_default().push((Self::valid_at(&max_ts, row), rows));
+            acc
+        }))
+    }
+
+    /// A partition value as `YYYY-MM-DD` whatever its physical type — Delta
+    /// delivers `date` as a typed Date32 while every key in this module spells
+    /// it as a string. Shared by [`Self::partition_stats_bounded`] and
+    /// [`Self::partition_file_rows`] so the two can never key differently.
+    fn partition_string_at(array: Option<&arrow::array::ArrayRef>, row: usize) -> Option<String> {
+        let array = array.filter(|array| array.is_valid(row))?;
+        match array.data_type() {
+            arrow::datatypes::DataType::Date32 => {
+                let days = arrow::array::AsArray::as_primitive_opt::<arrow::datatypes::Date32Type>(array.as_ref())?.value(row);
+                chrono::NaiveDate::from_ymd_opt(1970, 1, 1)?.checked_add_signed(chrono::Duration::days(days as i64)).map(|date| date.to_string())
+            }
+            _ => Some(crate::support::test_helpers::array_get_str(array.as_ref(), row)),
+        }
+    }
+
     pub(crate) fn partition_stats_bounded(
         table: &DeltaTable, tiebreak: Option<&str>, bound_for: &dyn Fn(&str, &str) -> i64,
     ) -> Result<HashMap<(String, String), PartitionStats>> {
@@ -3415,16 +3464,7 @@ impl Database {
         let projects = column("partition.project_id");
         // Partition values arrive typed (`date` is a Date32); render it as `YYYY-MM-DD`
         // so these keys match the spelling used everywhere else.
-        let string_at = |array: Option<&arrow::array::ArrayRef>, row: usize| -> Option<String> {
-            let array = array.filter(|array| array.is_valid(row))?;
-            match array.data_type() {
-                arrow::datatypes::DataType::Date32 => {
-                    let days = arrow::array::AsArray::as_primitive_opt::<arrow::datatypes::Date32Type>(array.as_ref())?.value(row);
-                    chrono::NaiveDate::from_ymd_opt(1970, 1, 1)?.checked_add_signed(chrono::Duration::days(days as i64)).map(|date| date.to_string())
-                }
-                _ => Some(crate::support::test_helpers::array_get_str(array.as_ref(), row)),
-            }
-        };
+        let string_at = |array: Option<&arrow::array::ArrayRef>, row: usize| Self::partition_string_at(array, row);
         let min_ts = crate::read::ts_micros_column(&actions, "min.timestamp");
         let max_ts = crate::read::ts_micros_column(&actions, "max.timestamp");
         // The stamp is a timestamp on every current schema; an integer one is read too
@@ -3675,6 +3715,7 @@ impl Database {
                     source_epoch: Some(self.rollup_source_epochs.get(&(project, source.to_string(), date)).map_or(0, |epoch| *epoch.value())),
                     generation: newest.generation.clone(),
                     source_rows: Some(current_rows),
+                    source_rows_below: None,
                     covered_through,
                     measures: measures.flatten(),
                     content_fp: None,
@@ -3765,6 +3806,7 @@ impl Database {
                     source_epoch: None,
                     generation: entry.generation.clone(),
                     source_rows: entry.source_rows.and_then(|rows| u64::try_from(rows).ok()),
+                    source_rows_below: None,
                     covered_through: entry.end_micros,
                     measures: entry.measures.as_ref().map(|names| names.iter().cloned().collect()),
                     content_fp: None,
@@ -3878,7 +3920,7 @@ impl Database {
             let mut untagged_files = 0u64;
             // Recovery reads only the Delta transaction log (coverage identity lives
             // in Add tags); no rollup data scan competes with startup queries.
-            let (tagged, paths_by_identity, measures_by_identity, content_fp_by_identity, witness_reasons, witnessed) =
+            let (tagged, paths_by_identity, measures_by_identity, content_fp_by_identity, bounded_by_identity, witness_reasons, witnessed) =
                 match self.resolve_table("default", &target).await {
                     Ok(table) => {
                         let table = table.read().await;
@@ -3904,6 +3946,11 @@ impl Database {
                         // the unit, so all its files carry the same value and any
                         // disagreement collapses to `None`, declining the skip.
                         let mut content_fp_by_identity: HashMap<TaggedSliceIdentity, Option<u64>> = HashMap::new();
+                        // The bounded witness, merged like `content_fp`: every file of a
+                        // slice was stamped by the same build, so a disagreement means a
+                        // partial strip and collapses to `None` (fall back to the
+                        // whole-partition compare) rather than picking a side.
+                        let mut bounded_by_identity: HashMap<TaggedSliceIdentity, Option<u64>> = HashMap::new();
                         for add in table.snapshot()?.log_data().iter() {
                             let action = add_action(&add);
                             // An untagged file proves no coverage; remember its partition
@@ -3954,9 +4001,13 @@ impl Database {
                             // tonight were each sound and each fired ~never, and every one
                             // was caught by a counter rather than by argument — so the
                             // counter comes BEFORE the change that would depend on it.
-                            match tag(crate::maintenance_coordinator::TAG_SOURCE_ROWS_BELOW).and_then(|raw| raw.parse::<i64>().ok()) {
-                                Some(rows) if rows >= 0 => metrics::counter!(scan_metric_names::ROLLUP_WITNESS_BOUNDED_PRESENT).increment(1),
-                                _ => metrics::counter!(scan_metric_names::ROLLUP_WITNESS_BOUNDED_ABSENT).increment(1),
+                            let bounded_witness = tag(crate::maintenance_coordinator::TAG_SOURCE_ROWS_BELOW)
+                                .and_then(|raw| raw.parse::<i64>().ok())
+                                .filter(|rows| *rows >= 0)
+                                .and_then(|rows| u64::try_from(rows).ok());
+                            match bounded_witness {
+                                Some(_) => metrics::counter!(scan_metric_names::ROLLUP_WITNESS_BOUNDED_PRESENT).increment(1),
+                                None => metrics::counter!(scan_metric_names::ROLLUP_WITNESS_BOUNDED_ABSENT).increment(1),
                             }
                             let source_rows = witness.ok();
                             let slice_key = (project.to_owned(), slice_start, slice_end, generation.to_owned(), source_fp);
@@ -3982,6 +4033,7 @@ impl Database {
                             });
                             let content_fp = tag(crate::maintenance_coordinator::TAG_CONTENT_FINGERPRINT).and_then(|value| value.parse::<u64>().ok());
                             Self::merge_at(&mut content_fp_by_identity, identity.clone(), content_fp, |seen, new| (seen == new).then_some(seen).flatten());
+                            Self::merge_at(&mut bounded_by_identity, identity.clone(), bounded_witness, |seen, new| (seen == new).then_some(seen).flatten());
                             groups.insert(identity.clone());
                             // The date comes from the file's own partition, not from
                             // `slice_start`: a file in `date=D` cannot hold rows outside
@@ -3990,7 +4042,7 @@ impl Database {
                                 paths_by_identity.entry(identity).or_insert_with(|| ((*partition_project).to_owned(), Vec::new())).1.push(action.path.clone());
                             }
                         }
-                        (groups, paths_by_identity, measures_by_identity, content_fp_by_identity, witness_reasons, witnessed)
+                        (groups, paths_by_identity, measures_by_identity, content_fp_by_identity, bounded_by_identity, witness_reasons, witnessed)
                     }
                     Err(_) => Default::default(),
                 };
@@ -4074,6 +4126,7 @@ impl Database {
                     source_epoch: None,
                     generation: publication.generation.clone(),
                     source_rows: publication.source_rows,
+                    source_rows_below: publication.source_rows_below,
                     covered_through: key.slice.end_micros,
                     // The journal alone has no measure proof. Use matching file
                     // evidence when available, including partial measure sets.
@@ -4151,6 +4204,7 @@ impl Database {
                     // either alone declines the skip, so a pre-tag cell costs one
                     // rebuild rather than freezing.
                     let content_fp = content_fp_by_identity.get(&identity).copied().flatten();
+                    let source_rows_below = bounded_by_identity.get(&identity).copied().flatten();
                     let output_files = paths_by_identity.get(&identity).map_or(0, |(_, paths)| u32::try_from(paths.len()).unwrap_or(u32::MAX));
                     self.rollup_slice_coverage.insert(
                         (project_id, source.to_string(), target.clone(), slice_start, slice_end),
@@ -4159,6 +4213,7 @@ impl Database {
                             source_epoch: None,
                             generation,
                             source_rows,
+                            source_rows_below,
                             covered_through: slice_end,
                             measures: measures.map(|names| names.into_iter().collect()),
                             content_fp,

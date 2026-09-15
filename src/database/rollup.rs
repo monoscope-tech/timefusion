@@ -74,9 +74,9 @@ impl Database {
         // One pass over the add actions for the whole window: asking per date rebuilds the
         // entire add-actions batch each time, which dominates planning cost on a large table.
         let lookup_project = route.project_id.clone().unwrap_or_else(|| "default".to_string());
+        let source_table = self.resolve_table(&lookup_project, &route.source).await.map_err(|_| crate::rollup::MissReason::IncompleteCoverage)?;
         let fingerprints = {
-            let table = self.resolve_table(&lookup_project, &route.source).await.map_err(|_| crate::rollup::MissReason::IncompleteCoverage)?;
-            let table = table.read().await;
+            let table = source_table.read().await;
             // Unbounded (`i64::MAX`) to match how the write side stamps `source_rows` and the
             // date-level `source_fp`; the computation must stay identical on both sides.
             Self::partition_stats_bounded(&table, tiebreak_of(&route.source), &|_, _| i64::MAX).map_err(|_| crate::rollup::MissReason::IncompleteCoverage)?
@@ -86,6 +86,10 @@ impl Database {
         fn stats_of<'a>(fingerprints: &'a HashMap<(String, String), PartitionStats>, project: &str, date: &str) -> Option<&'a PartitionStats> {
             fingerprints.get(&(project.to_string(), date.to_string())).or_else(|| fingerprints.get(&("default".to_string(), date.to_string())))
         }
+        // Per-file `(max_ts, rows)` for the bounded-witness rescue. Loaded lazily, at
+        // most once per route call, and only when some slice fails the cheap
+        // whole-partition compare while carrying a bounded witness.
+        let mut file_rows: Option<crate::database::maintain::PartitionFileRows> = None;
         // Projects come from the SOURCE, never the tier, so a project with no rollup still
         // counts against coverage. Test the window, not just the date.
         let window_dates: HashSet<String> = dates.iter().map(chrono::NaiveDate::to_string).collect();
@@ -169,8 +173,39 @@ impl Database {
                 // partition's row count, so slices agreeing with it are independently current.
                 // Do NOT fall back to `coverage.source_fp` — a slice's own fingerprint hashes
                 // only that slice's files, so it can never equal the whole-partition value.
-                let (fresh, stale): (Vec<_>, Vec<_>) =
-                    slices.into_iter().partition(|(_, coverage)| crate::rollup::slice_coverage_agrees(&[coverage.source_rows], current));
+                let mut fresh = Vec::with_capacity(slices.len());
+                let mut stale = Vec::new();
+                for (key, coverage) in slices {
+                    if crate::rollup::slice_coverage_agrees(&[coverage.source_rows], current) {
+                        fresh.push((key, coverage));
+                        continue;
+                    }
+                    // The whole-partition witness disagreed — which any ingest anywhere
+                    // in the day causes, and 96.8% of measured staleness is exactly that.
+                    // Re-prove against the BOUNDED witness before refusing: rows in
+                    // files wholly below `covered_through`, which a tail append cannot
+                    // move. The per-file pass is loaded at most once per route call and
+                    // only on this path, so a day with no stale-looking slice never
+                    // pays for it.
+                    if self.config.maintenance.timefusion_rollup_bounded_witness
+                        && let Some(witness_below) = coverage.source_rows_below
+                    {
+                        if file_rows.is_none() {
+                            let table = source_table.read().await;
+                            file_rows = Some(Self::partition_file_rows(&table).unwrap_or_default());
+                        }
+                        let files = file_rows
+                            .as_ref()
+                            .and_then(|map| map.get(&(project.clone(), date.clone())).or_else(|| map.get(&("default".to_string(), date.clone()))));
+                        if files.is_some_and(|files| crate::rollup::rows_below(files, coverage.covered_through) == Some(witness_below)) {
+                            metrics::counter!(scan_metric_names::ROLLUP_WITNESS_BOUNDED_RESCUED).increment(1);
+                            fresh.push((key, coverage));
+                            continue;
+                        }
+                        metrics::counter!(scan_metric_names::ROLLUP_WITNESS_BOUNDED_STALE_TOO).increment(1);
+                    }
+                    stale.push((key, coverage));
+                }
                 if !stale.is_empty() {
                     miss = miss.or(Some(crate::rollup::MissReason::StaleCoverage));
                     // `no_witness` = unverifiable, cleared only by a republish; `moved` = the

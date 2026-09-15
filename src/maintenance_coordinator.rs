@@ -353,6 +353,11 @@ pub struct Publication {
     /// path, so such slices read raw until the coordinator republishes.
     #[serde(default)]
     pub source_rows: Option<u64>,
+    /// Mirrors [`TAG_SOURCE_ROWS_BELOW`]: the same count over only the files
+    /// wholly below the slice's end. `default` so journals written before the
+    /// field deserialize as `None` and fall back to the whole-partition compare.
+    #[serde(default)]
+    pub source_rows_below: Option<u64>,
 }
 
 /// What one fusion bucket would cost to scan, accumulated member by member.
@@ -485,7 +490,10 @@ struct Snapshot {
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum JournalRecord {
-    Task(MaintenanceTask),
+    // Boxed for variant-size parity: a task is ~330 bytes against a tombstone's
+    // ~60, and every record in a checkpoint stream pays the larger. `Box<T>`
+    // serializes transparently, so the wire format is unchanged.
+    Task(Box<MaintenanceTask>),
     SourceCursor {
         source: String,
         delta_version: u64,
@@ -663,7 +671,7 @@ impl TaskJournal {
             for line in bytes.split_inclusive(|byte| *byte == b'\n').take_while(|line| line.ends_with(b"\n")) {
                 let record = serde_json::from_slice::<JournalRecord>(&line[..line.len() - 1])?;
                 match record {
-                    JournalRecord::Task(task) => insert_task(&mut snapshot.tasks, &mut task_indices, task),
+                    JournalRecord::Task(task) => insert_task(&mut snapshot.tasks, &mut task_indices, *task),
                     JournalRecord::SourceCursor { source, delta_version } => {
                         snapshot.source_cursors.entry(source).and_modify(|cursor| *cursor = (*cursor).max(delta_version)).or_insert(delta_version);
                     }
@@ -1990,7 +1998,7 @@ impl TaskJournal {
             let records = dirty_tasks
                 .drain()
                 .filter(durable)
-                .filter_map(|key| task_indices.get(&key).map(|&index| JournalRecord::Task(snapshot.tasks[index].clone())))
+                .filter_map(|key| task_indices.get(&key).map(|&index| JournalRecord::Task(Box::new(snapshot.tasks[index].clone()))))
                 .chain(dirty_cursors.drain().filter_map(|source| {
                     (snapshot.source_cursors.get(&source).copied()).map(|delta_version| JournalRecord::SourceCursor { source, delta_version })
                 }))
@@ -3178,7 +3186,7 @@ mod tests {
         let publish = |journal: &mut TaskJournal, project: &str, table: &str, hour: i64, rows: u64| {
             let key = key(project, table, hour);
             journal.enqueue(key.clone(), 0, 1, 1);
-            journal.publish(&key, Publication { source_fingerprint: 0, generation: "g".into(), rows, source_rows: Some(1_000_000) });
+            journal.publish(&key, Publication { source_fingerprint: 0, generation: "g".into(), rows, source_rows: Some(1_000_000), source_rows_below: None });
         };
         publish(&mut journal, "p", "base", 1, 10);
         publish(&mut journal, "p", "base", 2, 0); // an hour the base itself left empty
@@ -3310,7 +3318,7 @@ mod tests {
         let (_dir, mut journal) = new_journal();
         const HOUR: i64 = DERIVED_SLICE_MICROS;
         let derived = |start: i64, end: i64| task_in("derived", "p", start, end, Operation::DerivedRollup).key;
-        let publication = || Publication { source_fingerprint: 7, generation: "g".into(), rows: 5, source_rows: Some(9) };
+        let publication = || Publication { source_fingerprint: 7, generation: "g".into(), rows: 5, source_rows: Some(9), source_rows_below: None };
         for (start, end) in [(0, HOUR), (HOUR, 2 * HOUR), (5 * HOUR, 6 * HOUR)] {
             let key = derived(start, end);
             journal.enqueue(key.clone(), 0, 1, 1);
@@ -3373,7 +3381,9 @@ mod tests {
     fn empty_rollup_publication_survives_restart() {
         let (dir, mut journal) = new_journal();
         let key = upserted(&mut journal, task("p", 0, MIN_SLICE_MICROS, Operation::BaseRollup));
-        assert!(journal.publish(&key, Publication { source_fingerprint: 7, generation: "stable".to_owned(), rows: 0, source_rows: None }));
+        assert!(
+            journal.publish(&key, Publication { source_fingerprint: 7, generation: "stable".to_owned(), rows: 0, source_rows: None, source_rows_below: None })
+        );
         journal.checkpoint().expect("checkpoint");
 
         let loaded = TaskJournal::load(dir.path()).expect("load checkpoint");
@@ -3439,7 +3449,9 @@ mod tests {
 
         // Coverage checkpoint is the only boundary that makes the slice
         // readable after restart, including an empty output.
-        assert!(recovered.publish(&key, Publication { source_fingerprint: 9, generation: "g".to_owned(), rows: 0, source_rows: None }));
+        assert!(
+            recovered.publish(&key, Publication { source_fingerprint: 9, generation: "g".to_owned(), rows: 0, source_rows: None, source_rows_below: None })
+        );
         recovered.checkpoint().expect("coverage checkpoint");
         let recovered = TaskJournal::load(dir.path()).expect("recover publication");
         let published = recovered.published_rollups("source", "table");
