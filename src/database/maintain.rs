@@ -2507,11 +2507,13 @@ impl Database {
                 return retry("slice_occ_stale".to_owned(), std::time::Duration::from_secs(1));
             }
             let op = DeltaOperation::Write { mode: SaveMode::Overwrite, partition_by: Some(target_schema.partitions.clone()), predicate: None };
-            let finalized =
-                deltalake::kernel::transaction::CommitBuilder::from(incremental_commit_properties(self.config.maintenance.timefusion_incremental_snapshot))
-                    .with_actions(actions)
-                    .build(Some(table.snapshot()? as &dyn TableReference), table.log_store(), op)
-                    .await?;
+            let finalized = deltalake::kernel::transaction::CommitBuilder::from(incremental_commit_properties(
+                self.config.maintenance.timefusion_incremental_snapshot,
+                "rollup_publish",
+            ))
+            .with_actions(actions)
+            .build(Some(table.snapshot()? as &dyn TableReference), table.log_store(), op)
+            .await?;
             table.state = Some(finalized.snapshot());
             drop(guard);
             self.swap_and_refresh_cache(&target_ref, table, None, &[&format!("date={date}")]).await;
@@ -6611,9 +6613,10 @@ impl Database {
             // reconcile can skip re-minting Dedup from it; a mixed/CoW wave
             // stays untagged and fails toward minting. Only ONE `with_metadata`
             // call is allowed — it REPLACES the map rather than extending it.
-            let mut commit_props = incremental_commit_properties(self.config.maintenance.timefusion_incremental_snapshot);
+            let mut commit_props = incremental_commit_properties(self.config.maintenance.timefusion_incremental_snapshot, "wave_commit");
             if data_change && fresh.iter().all(StagedBin::masked_in_place) {
-                commit_props = commit_props.with_metadata([(DV_DEDUP_COMMIT_KEY.to_string(), serde_json::Value::Bool(true))]);
+                let [lane] = lane_metadata("wave_commit");
+                commit_props = commit_props.with_metadata([lane, (DV_DEDUP_COMMIT_KEY.to_string(), serde_json::Value::Bool(true))]);
             }
             // Bounded: one slow object-store request here pins the commit lock
             // and stalls every committer on the table.
@@ -7074,6 +7077,7 @@ impl Database {
                     let op = DeltaOperation::Write { mode: SaveMode::Overwrite, partition_by: Some(target_schema.partitions.clone()), predicate: None };
                     let finalized = deltalake::kernel::transaction::CommitBuilder::from(incremental_commit_properties(
                         self.config.maintenance.timefusion_incremental_snapshot,
+                        "rollup_resume",
                     ))
                     .with_actions(actions)
                     .build(Some(table.snapshot()? as &dyn deltalake::kernel::transaction::TableReference), table.log_store(), op)
@@ -7501,7 +7505,7 @@ impl Database {
                 .with_max_concurrent_tasks(self.config.derived.optimize_merge_tasks())
                 .with_writer_properties(writer_properties.clone())
                 .with_min_commit_interval(tokio::time::Duration::from_secs(30))
-                .with_commit_properties(incremental_commit_properties(self.config.maintenance.timefusion_incremental_snapshot))
+                .with_commit_properties(incremental_commit_properties(self.config.maintenance.timefusion_incremental_snapshot, "light_optimize"))
                 // Variant columns are Struct{Binary, Binary} on disk; delta-rs's default
                 // `schema_force_view_types=true` reads them as BinaryView and the rewrite
                 // fails mid-scan, so the session state must disable it.

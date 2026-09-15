@@ -204,3 +204,15 @@ marker per assigned column and drops unchanged rows before the WAL, counted
 as `dml.mor_noop_rows_suppressed_total` vs `mor_version_rows_appended_total`
 in `timefusion_stats`. The counters are the sizing instrument this plan's
 rules demand — read them after a day of prod before crediting the fix.
+
+**Lane attribution shipped with the same change**: every maintenance rewrite
+commit now carries `commitInfo.info["timefusion.lane"]`
+(`optimize_table` / `compact_date` / `recompress` / `rollup_publish` /
+`wave_commit` / `rollup_resume` / `light_optimize`), so the next decomposition
+names the selector that authors the 2-file intraday merges (129-187
+OPTIMIZE commits/project-day, measured 09-16) instead of guessing between
+`select_tail_bin`'s repair bypass and the coordinator. The ratio-vs-floor
+packing trade stays as decided in
+`the_value_floor_lowers_steady_state_write_amplification` (ratio off: fewer
+live files wins while per-file read cost dominates) — re-argue it against the
+lane data, not before.

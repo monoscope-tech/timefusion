@@ -1356,6 +1356,12 @@ const WAL_WATERMARK_KEY: &str = "timefusion.wal_watermark";
 /// no rows, so reconcile skips re-minting Dedup. A commit WITHOUT the marker fails toward minting.
 pub(crate) const DV_DEDUP_COMMIT_KEY: &str = "timefusion.dv_dedup";
 
+/// `commitInfo.info` marker naming which maintenance lane authored a rewrite
+/// commit. Delta history is the one durable record of write volume (counters
+/// reset per deploy), and without the lane every OPTIMIZE reads the same —
+/// which is how 300M rewritten rows/day went unattributed.
+pub(crate) const LANE_COMMIT_KEY: &str = "timefusion.lane";
+
 /// Serialize a per-shard watermark to the JSON map stored in `commitInfo.info[WAL_WATERMARK_KEY]`.
 /// Only shards with a position are included — an absent shard means "no constraint from this
 /// commit".
@@ -1591,9 +1597,16 @@ fn flush_commit_metadata(
 }
 
 /// `CommitProperties` for a compaction/dedup commit (Add + Remove); `enabled` advances the
-/// materialized snapshot incrementally instead of re-materializing every active file.
-fn incremental_commit_properties(enabled: bool) -> CommitProperties {
-    base_commit_properties().with_incremental_advance(enabled)
+/// materialized snapshot incrementally instead of re-materializing every active file. `lane`
+/// lands in `commitInfo.info[LANE_COMMIT_KEY]`; a caller that adds its own metadata must
+/// re-include the lane entry there — `with_metadata` REPLACES the map.
+fn incremental_commit_properties(enabled: bool, lane: &'static str) -> CommitProperties {
+    base_commit_properties().with_incremental_advance(enabled).with_metadata(lane_metadata(lane))
+}
+
+/// The `[LANE_COMMIT_KEY]` entry, for callers composing it with their own metadata.
+fn lane_metadata(lane: &'static str) -> [(String, serde_json::Value); 1] {
+    [(LANE_COMMIT_KEY.to_string(), serde_json::Value::String(lane.to_string()))]
 }
 
 /// Active-file URIs of `table`, restricted to files whose log path contains every marker in

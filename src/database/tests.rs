@@ -2776,10 +2776,18 @@ async fn reconcile_skips_dedup_and_rollup_remint_for_tagged_dv_dedup_commits() -
         (table.version().unwrap_or_default(), table.log_store())
     };
     let bytes = log_store.read_commit_entry(version).await?.expect("dv-dedup commit entry");
-    let tagged = deltalake::logstore::get_actions(version, &bytes)?
-        .iter()
-        .any(|a| matches!(a, deltalake::kernel::Action::CommitInfo(ci) if ci.info.get(DV_DEDUP_COMMIT_KEY).and_then(serde_json::Value::as_bool) == Some(true)));
-    assert!(tagged, "the DV-dedup wave commit must carry {DV_DEDUP_COMMIT_KEY}");
+    let commit_info = deltalake::logstore::get_actions(version, &bytes)?.iter().find_map(|a| match a {
+        deltalake::kernel::Action::CommitInfo(ci) => Some(ci.info.clone()),
+        _ => None,
+    });
+    let info = commit_info.expect("wave commit has commitInfo");
+    assert_eq!(info.get(DV_DEDUP_COMMIT_KEY).and_then(serde_json::Value::as_bool), Some(true), "the DV-dedup wave commit must carry {DV_DEDUP_COMMIT_KEY}");
+    // `with_metadata` REPLACES the map, so the lane must survive the DV tag's call.
+    assert_eq!(
+        info.get(super::LANE_COMMIT_KEY).and_then(serde_json::Value::as_str),
+        Some("wave_commit"),
+        "the lane attribution must ride the same with_metadata call as the DV tag"
+    );
 
     db.reconcile_maintenance_task_cursors().await?;
     let journal = db.maintenance_tasks.lock().unwrap();

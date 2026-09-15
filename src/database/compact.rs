@@ -109,7 +109,7 @@ impl Database {
                         .with_max_concurrent_tasks(optimize_concurrency)
                         .with_writer_properties(writer_properties.clone())
                         .with_min_commit_interval(tokio::time::Duration::from_secs(10 * 60))
-                        .with_commit_properties(incremental_commit_properties(self.config.maintenance.timefusion_incremental_snapshot))
+                        .with_commit_properties(incremental_commit_properties(self.config.maintenance.timefusion_incremental_snapshot, "optimize_table"))
                         // Avoids the BinaryView read for Variant columns: delta-rs's
                         // internal session defaults to schema_force_view_types=true.
                         .with_session_state(Arc::new(self.maintenance_session_state()))
@@ -503,7 +503,7 @@ impl Database {
                 // Short interval banks incremental commits: bins run serially on the
                 // SortBy path, so an OCC loss costs one bin, not the whole partition.
                 .with_min_commit_interval(tokio::time::Duration::from_secs(2 * 60))
-                .with_commit_properties(incremental_commit_properties(self.config.maintenance.timefusion_incremental_snapshot))
+                .with_commit_properties(incremental_commit_properties(self.config.maintenance.timefusion_incremental_snapshot, "compact_date"))
                 .with_session_state(Arc::new(self.maintenance_session_state()))
                 .await;
             match result {
@@ -713,7 +713,7 @@ impl Database {
             .with_replace_where(replace_pred.as_str())
             .with_writer_properties(writer_properties)
             .with_target_file_size(std::num::NonZero::new(target_size as u64))
-            .with_commit_properties(incremental_commit_properties(self.config.maintenance.timefusion_incremental_snapshot))
+            .with_commit_properties(incremental_commit_properties(self.config.maintenance.timefusion_incremental_snapshot, "recompress"))
             .with_session_state(Arc::new(ctx.state()))
             .await;
 
