@@ -137,3 +137,15 @@ stage.
   counters (this branch): `rollup_stale_{fp,epoch}_moved`,
   `rollup_coverage_absent_{invalidated,never_built}`,
   `rollup_ticket_recheck_failed`. Read them before any behavior change.
+- 2026-09-15 (item 2, the counters answered — 35 min of prod on f15c9b74):
+  **`rollup_coverage_absent_invalidated` = 4,062 against `absent_never_built` = 0.**
+  Every "coverage missing" encounter is coverage `apply_rollup_hours` REMOVED,
+  none is the build lane lagging — the historical `not_built` bucket was
+  mislabeled destruction. The exists-but-stale arms are ~0
+  (`stale_fp_moved`/`epoch_moved`/`ticket_recheck` all 0) because #300's
+  bounded-witness rescue re-proves those (`rescued` = 13,711 in the same
+  window). **The one remaining destroyer is the `rollup_coverage.remove(&key)`
+  in `apply_rollup_hours`** — keep the entry (dirty hours and the epoch already
+  invalidate it at read) and give DAY coverage the same witness rescue slices
+  got in #300. The witness read-path branches are active as of 15:09; this
+  belongs to that arc.
