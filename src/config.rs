@@ -292,6 +292,27 @@ pub fn sort_spill_reservation_bytes(requested: Option<usize>, partitions: usize,
     requested.unwrap_or(DEFAULT_SORT_SPILL_RESERVATION_BYTES).min(cap).max(MIN_SORT_SPILL_RESERVATION_BYTES)
 }
 
+/// How many heavy (spilling-sort) queries may execute against the query pool at
+/// once, independent of how many connections exist. Connections are cheap and
+/// TimeFusion caps none of them; a concurrent unbounded sort is ~partitions x a
+/// healthy reservation of NON-spillable pool memory, so N of them physically
+/// cannot share a fixed pool. Accept every connection, admit K heavy queries,
+/// queue the rest — the warehouse-standard split (Redshift WLM, Snowflake).
+///
+/// K is derived from the pool geometry, NEVER from the client connection count:
+/// `pool_share / (partitions x reservation)`, so raising monoscope's pool cannot
+/// silently shrink each sort's merge reservation toward the mid-merge-death floor
+/// (the trap `sort_spill_reservation_bytes`'s client-count divisor set). The
+/// reservation stays a fixed healthy value; only the ADMISSION count flexes.
+pub fn max_concurrent_heavy_sorts(partitions: usize, pool_bytes: usize) -> usize {
+    let per_sort = DEFAULT_SORT_SPILL_RESERVATION_BYTES * partitions.max(1);
+    (pool_bytes / (per_sort * RESERVATION_POOL_SHARE)).max(MIN_CONCURRENT_HEAVY_SORTS)
+}
+
+/// A floor so a small box still admits a useful degree of concurrency rather than
+/// serializing every heavy query.
+const MIN_CONCURRENT_HEAVY_SORTS: usize = 4;
+
 /// The number the whole tree derives from: the detected limit, LOWERED by an
 /// operator request — budgeting above the cgroup is never valid, so an
 /// over-large request is clamped rather than honoured.
@@ -1658,6 +1679,7 @@ pub struct MaintenanceConfig {
     /// AGGREGATES, so it reverts in one env var.
     #[serde_inline_default(true)]
     pub timefusion_rollup_bounded_witness: bool,
+
     /// Let a whole-day certification survive a fingerprint move for windows the
     /// newly-added files cannot have touched. Read-side dedup skip: a defect is
     /// wrong ROWS, so it reverts in one env var.
@@ -1809,6 +1831,13 @@ pub struct MemoryConfig {
     /// ignores the CFS quota and oversubscribes throttled containers).
     #[serde_inline_default(0)]
     pub timefusion_query_partitions: usize,
+    /// Admit at most `max_concurrent_heavy_sorts` spilling-sort queries against the
+    /// query pool at once; queue the rest with a bounded wait rather than letting
+    /// them race into `Resources exhausted`. Off by default — enabling it changes
+    /// the concurrency behaviour of every heavy pgwire query, so it ships dark and
+    /// is turned on only after the concurrent-connection e2e proves it.
+    #[serde(default)]
+    pub timefusion_heavy_query_admission: bool,
     /// Admission guard for wide-window read scans: a query reaching further back
     /// than `timefusion_wide_scan_lookback_hours` is limited to this many
     /// concurrent Parquet batch-decodes across all queries, bounding decode heap
@@ -2112,6 +2141,18 @@ mod tests {
             sort_spill_reservation_bytes(None, MAINTENANCE_PARTITIONS, POOL, CONCURRENT_SORT_QUERIES) < DEFAULT_SORT_SPILL_RESERVATION_BYTES,
             "using the client count here is what starved the spill reservation"
         );
+    }
+
+    /// K is derived from pool geometry, NOT from any client count — the invariant
+    /// that stops a monoscope pool bump from silently starving each sort's merge
+    /// reservation. On prod's 8 partitions x 22 GB pool it admits ~20 concurrent
+    /// heavy sorts, and NEVER fewer than the floor.
+    #[test]
+    fn heavy_sort_admission_is_derived_from_the_pool_not_the_clients() {
+        assert_eq!(max_concurrent_heavy_sorts(8, 22 * GIB), 22 * GIB / (DEFAULT_SORT_SPILL_RESERVATION_BYTES * 8 * RESERVATION_POOL_SHARE));
+        assert!(max_concurrent_heavy_sorts(8, 22 * GIB) >= 20, "prod geometry admits a useful degree of concurrency");
+        // A tiny pool still admits the floor rather than serializing everything.
+        assert_eq!(max_concurrent_heavy_sorts(48, 512 * MIB), MIN_CONCURRENT_HEAVY_SORTS);
     }
 
     // Prod-shaped box (120 GiB / 48 cores, 11 hot projects).

@@ -12,6 +12,7 @@
 //! The operator stays single-partition, and the caller adds key/tiebreak
 //! columns then restores the requested projection.
 
+pub mod admission;
 pub mod bloom_prune;
 pub mod functions;
 pub mod optimizers;
