@@ -3947,6 +3947,17 @@ impl Database {
                             // reported no count". Both become `None`, which the read path
                             // refuses to verify.
                             let witness = crate::database::rollup_unverifiable::classify_witness(tag(crate::maintenance_coordinator::TAG_SOURCE_ROWS));
+                            // REACHABILITY, before the read side is built on it. #298 writes
+                            // TAG_SOURCE_ROWS_BELOW; nothing reads it yet, so without this
+                            // there is no way to know whether the bounded witness is
+                            // actually present on recovered slices. Three read-path changes
+                            // tonight were each sound and each fired ~never, and every one
+                            // was caught by a counter rather than by argument — so the
+                            // counter comes BEFORE the change that would depend on it.
+                            match tag(crate::maintenance_coordinator::TAG_SOURCE_ROWS_BELOW).and_then(|raw| raw.parse::<i64>().ok()) {
+                                Some(rows) if rows >= 0 => metrics::counter!(scan_metric_names::ROLLUP_WITNESS_BOUNDED_PRESENT).increment(1),
+                                _ => metrics::counter!(scan_metric_names::ROLLUP_WITNESS_BOUNDED_ABSENT).increment(1),
+                            }
                             let source_rows = witness.ok();
                             let slice_key = (project.to_owned(), slice_start, slice_end, generation.to_owned(), source_fp);
                             match witness {
