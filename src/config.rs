@@ -1652,6 +1652,11 @@ pub struct MaintenanceConfig {
     /// a defect here is wrong ROWS, not slow ones, so it reverts in one env var.
     #[serde_inline_default(true)]
     pub timefusion_dedup_coverage_retention: bool,
+    /// Let a whole-day certification survive a fingerprint move for windows the
+    /// newly-added files cannot have touched. Read-side dedup skip: a defect is
+    /// wrong ROWS, so it reverts in one env var.
+    #[serde_inline_default(true)]
+    pub timefusion_dedup_window_scoped_certification: bool,
     /// Allow `DedupExec` to run in streaming `bounded[timestamp]` mode, which
     /// trusts the scan's declared `output_ordering` (the parquet footer's
     /// `sorting_columns`). A lying footer makes one "run" span many timestamps

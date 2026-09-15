@@ -290,6 +290,10 @@ pub mod scan_metric_names {
         // Summed dirty bins across declined dates, out of 144 per date.
         CERT_DECLINED_DIRTY_BINS = "timefusion.scan.cert_declined_dirty_bins" as scan.cert_declined_dirty_bins;
         CERT_SLICE_FILES_UNPROVEN = "timefusion.scan.cert_slice_files_unproven" as scan.cert_slice_files_unproven;
+        // A whole-day proof that survived a fingerprint move because every file
+        // added since sits outside the query window. Read against
+        // dedup_denied_fp_moved, which was 60% of all eligible scans.
+        CERT_WINDOW_SURVIVED_FP_MOVE = "timefusion.scan.cert_window_survived_fp_move" as scan.cert_window_survived_fp_move;
         // A fingerprint move that KEPT span-disjoint coverage instead of discarding
         // the day. Read against `cert_coverage_reset`: coverage that only ever
         // resets is coverage that never accumulates, which is what held

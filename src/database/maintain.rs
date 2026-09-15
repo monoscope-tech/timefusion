@@ -614,6 +614,20 @@ async fn run_until_idle_capped<T>(
     }
 }
 
+/// Do all `added` spans lie entirely outside `(lo, hi)`?
+///
+/// Bounds are INCLUSIVE on both sides, matching `skippable_certified_files`, so a
+/// file touching either end counts as overlapping. A `None` span has no statistics
+/// and overlaps everything, so it fails the whole test — the same rule
+/// `partition_file_spans` states for readers.
+///
+/// An EMPTY iterator is vacuously true, so callers must reject the no-additions
+/// case themselves: a fingerprint that moved with nothing added is a REMOVAL, which
+/// this argument says nothing about.
+fn added_spans_miss_window(added: impl IntoIterator<Item = crate::read::FileSpan>, (lo, hi): (i64, i64)) -> bool {
+    added.into_iter().all(|span| span.is_some_and(|(min, max)| max < lo || min > hi))
+}
+
 /// (project, slice_start, slice_end, generation, source_fp, source_rows) — the
 /// coverage identity `recover_rollup_coverage` reads back off a tier file's tags.
 type TaggedSliceIdentity = (String, i64, i64, String, u64, Option<u64>);
@@ -4429,6 +4443,34 @@ impl Database {
                     certified_dates.insert(date.to_string());
                     continue;
                 }
+                // A whole-day proof whose fingerprint moved is still TRUE of any
+                // window the arriving files cannot have touched. The read asks about
+                // `(lo, hi)`, not about the partition as a whole, so a tail append
+                // does not invalidate a morning query.
+                //
+                // This is the same overlap argument #290 made for accumulated clean
+                // coverage, applied at read time, and it targets what #290 left
+                // behind: `never_certified` fell 74% -> 34% of denials while
+                // `fp_moved` rose to 60% of ALL eligible scans. Sound only where
+                // `timestamp` is a dedup key — a duplicate group then shares one
+                // timestamp, so a file spanning `[min, max]` cannot hold another
+                // version of a row outside it.
+                //
+                // `!cert.stale` is required: a stale entry is slice-derived and
+                // proves one window, never the day, so it has no day-wide claim to
+                // carry forward.
+                Some(ref cert)
+                    if self.config.maintenance.timefusion_dedup_window_scoped_certification
+                        && !cert.stale
+                        && !cert.files.is_empty()
+                        && schema_or_default(table_name).dedup_keys.iter().any(|key| key == "timestamp")
+                        && Self::added_files_miss_window(table, &date.to_string(), cert, &files, (lo, hi)) =>
+                {
+                    metrics::counter!(scan_metric_names::CERT_WINDOW_SURVIVED_FP_MOVE).increment(1);
+                    certified_any = true;
+                    certified_dates.insert(date.to_string());
+                    continue;
+                }
                 Some(cert) => {
                     // Provably stale: this fingerprint can never match again until a
                     // sweep re-certifies. Removal is conditional on the value being
@@ -4464,6 +4506,22 @@ impl Database {
             true => (verdict, certified_dates),
             false => (DedupSkipVerdict::NeverCertified, HashSet::new()),
         }
+    }
+
+    /// Do the files added since `cert` all sit outside `(lo, hi)`?
+    ///
+    /// `false` whenever it cannot be decided — an unreadable span table, or any
+    /// added file with no statistics (which overlaps everything, the rule
+    /// `partition_file_spans` already states for readers). Fails closed, so the
+    /// caller falls through to the ordinary fp-moved handling.
+    fn added_files_miss_window(table: &DeltaTable, date: &str, cert: &Certification, live: &[String], (lo, hi): (i64, i64)) -> bool {
+        let proved: HashSet<&str> = cert.files.iter().filter_map(|uri| crate::tantivy::search::parquet_rel_of_uri(uri)).collect();
+        let added: HashSet<&str> = live.iter().filter_map(|uri| crate::tantivy::search::parquet_rel_of_uri(uri)).filter(|rel| !proved.contains(rel)).collect();
+        if added.is_empty() {
+            return false; // nothing added, yet the fingerprint moved: a REMOVAL, which this cannot reason about
+        }
+        let Ok(spans) = Self::partition_file_spans(table, &format!("date={date}")) else { return false };
+        added_spans_miss_window(added.iter().map(|rel| spans.get(*rel).copied().flatten()), (lo, hi))
     }
 
     pub(crate) fn logical_count_partition_snapshot(table: &DeltaTable, project_id: &str, date: &str) -> Result<(u64, crate::read::CountFiles)> {
@@ -8416,5 +8474,50 @@ mod maintenance_teardown_tests {
 
         assert!(finished.load(SeqCst), "shutdown returned while a maintenance task was still running — its dependencies are torn down next");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod window_scoped_certification_tests {
+    use std::sync::Arc;
+
+    use super::*;
+
+    fn cert(files: &[&str]) -> Certification {
+        Certification { fp: 1, since: std::time::Instant::now(), files: files.iter().map(|f| (*f).to_string()).collect::<Vec<_>>().into(), stale: false }
+    }
+
+    /// The read asks about a WINDOW, not the whole partition. A tail append
+    /// cannot have touched the morning, so a morning query keeps its proof.
+    ///
+    /// Before this, any added file denied every window on the date —
+    /// `dedup_denied_fp_moved` was 60% of all eligible scans on 2026-09-15,
+    /// having become dominant once #290 cut `never_certified` from 74% to 34%.
+    #[test_case::test_case((0, 100), Some((500, 600)) => true ; "a tail append misses a morning window")]
+    #[test_case::test_case((0, 100), Some((50, 60)) => false ; "an append INSIDE the window denies it")]
+    #[test_case::test_case((0, 100), Some((100, 200)) => false ; "touching the upper bound denies: bounds are inclusive")]
+    #[test_case::test_case((0, 100), None => false ; "an added file with no statistics overlaps everything")]
+    fn window_survives_only_what_the_new_file_cannot_have_touched(window: (i64, i64), added_span: crate::read::FileSpan) -> bool {
+        super::added_spans_miss_window([added_span], window)
+    }
+
+    /// ONE overlapping file among many disjoint ones denies the window.
+    #[test]
+    fn a_single_overlapping_addition_denies_the_whole_window() {
+        assert!(super::added_spans_miss_window([Some((500, 600)), Some((700, 800))], (0, 100)), "all disjoint");
+        assert!(!super::added_spans_miss_window([Some((500, 600)), Some((50, 60))], (0, 100)), "one inside is enough to deny");
+    }
+
+    /// A fingerprint move with NOTHING added is a REMOVAL — a compaction or a
+    /// deletion vector — which this argument says nothing about, so it must fall
+    /// through to ordinary fp-moved handling rather than grant.
+    #[test]
+    fn a_removal_is_never_waved_through() {
+        let c = cert(&["s3://b/date=2026-09-15/project_id=p/a.parquet", "s3://b/date=2026-09-15/project_id=p/b.parquet"]);
+        let live = ["s3://b/date=2026-09-15/project_id=p/a.parquet".to_string()];
+        let proved: HashSet<&str> = c.files.iter().filter_map(|u| crate::tantivy::search::parquet_rel_of_uri(u)).collect();
+        let added = live.iter().filter_map(|u| crate::tantivy::search::parquet_rel_of_uri(u)).filter(|r| !proved.contains(r)).count();
+        assert_eq!(added, 0, "a removal adds nothing, so the helper returns false and the caller denies");
+        let _ = Arc::new(());
     }
 }
