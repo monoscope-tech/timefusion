@@ -1652,6 +1652,12 @@ pub struct MaintenanceConfig {
     /// a defect here is wrong ROWS, not slow ones, so it reverts in one env var.
     #[serde_inline_default(true)]
     pub timefusion_dedup_coverage_retention: bool,
+    /// Re-prove a stale-looking rollup slice against its bounded witness
+    /// (`TAG_SOURCE_ROWS_BELOW`) before refusing it. The rescue that stops a
+    /// tail append from staling the morning's slices; a defect serves stale
+    /// AGGREGATES, so it reverts in one env var.
+    #[serde_inline_default(true)]
+    pub timefusion_rollup_bounded_witness: bool,
     /// Let a whole-day certification survive a fingerprint move for windows the
     /// newly-added files cannot have touched. Read-side dedup skip: a defect is
     /// wrong ROWS, so it reverts in one env var.

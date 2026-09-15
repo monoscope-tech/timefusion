@@ -305,6 +305,12 @@ pub mod scan_metric_names {
         // inert, which is how three read-path changes went tonight.
         ROLLUP_WITNESS_BOUNDED_PRESENT = "timefusion.scan.rollup_witness_bounded_present" as scan.rollup_witness_bounded_present;
         ROLLUP_WITNESS_BOUNDED_ABSENT = "timefusion.scan.rollup_witness_bounded_absent" as scan.rollup_witness_bounded_absent;
+        // The rescue itself: a slice that failed the whole-partition compare and
+        // was re-proved (or not) against its bounded witness. RESCUED climbing is
+        // the fix working; STALE_TOO means the below-bound content genuinely
+        // changed (dedup, compaction across the bound) and a rebuild is right.
+        ROLLUP_WITNESS_BOUNDED_RESCUED = "timefusion.scan.rollup_witness_bounded_rescued" as scan.rollup_witness_bounded_rescued;
+        ROLLUP_WITNESS_BOUNDED_STALE_TOO = "timefusion.scan.rollup_witness_bounded_stale_too" as scan.rollup_witness_bounded_stale_too;
         // A fingerprint move that KEPT span-disjoint coverage instead of discarding
         // the day. Read against `cert_coverage_reset`: coverage that only ever
         // resets is coverage that never accumulates, which is what held
@@ -723,6 +729,12 @@ struct RollupCoverage {
     /// The source DATE partition's `num_records` sum when this slice was built.
     /// `None` is unverifiable and the read path refuses it.
     source_rows: Option<u64>,
+    /// The same sum over only the files lying wholly below `covered_through`,
+    /// mirroring `TAG_SOURCE_ROWS_BELOW`. Ingest past the bound cannot move it,
+    /// so a slice that fails the whole-partition compare can still be re-proved
+    /// against this — the rescue that stops a tail append from staling the
+    /// morning. `None` on pre-#298 slices, which simply keep today's behaviour.
+    source_rows_below: Option<u64>,
     /// Exclusive upper bound on the source timestamps this build aggregated.
     /// `day_start + DAY_MICROS` for a sealed day, less for a day still being
     /// written. Stored, never recomputed: it is time-varying for today, and the

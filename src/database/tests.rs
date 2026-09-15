@@ -4604,7 +4604,13 @@ fn a_rollup_resumes_only_when_the_source_held_still_and_nothing_else_covers_the_
             slice,
             operation: crate::maintenance_coordinator::Operation::BaseRollup,
         },
-        publication: crate::maintenance_coordinator::Publication { source_fingerprint: 7, generation: "g1".into(), rows: 5, source_rows },
+        publication: crate::maintenance_coordinator::Publication {
+            source_fingerprint: 7,
+            generation: "g1".into(),
+            rows: 5,
+            source_rows,
+            source_rows_below: None,
+        },
         source_rows,
         date: "2026-08-24".into(),
     };

@@ -513,6 +513,19 @@ pub(crate) fn interiors(lo: i64, hi: i64, grain: i64, horizon: i64, covered: &[(
 /// renders that one range without an upper bound.
 pub(crate) const OPEN_END: i64 = i64::MAX;
 
+/// The `num_records` sum over only the files lying wholly below `bound` — the
+/// read half of `TAG_SOURCE_ROWS_BELOW`.
+///
+/// THE RULE MUST MATCH `partition_stats_bounded` EXACTLY: a file is excluded iff
+/// its max timestamp is KNOWN and reaches the bound. A file with no statistics is
+/// therefore counted on BOTH sides, and the two still agree; a straddler is
+/// excluded wholesale on both sides for the same reason. Symmetry is the whole
+/// soundness argument, so any drift between the two rules is a correctness bug,
+/// not a tuning one.
+pub(crate) fn rows_below(files: &[(Option<i64>, i64)], bound: i64) -> Option<u64> {
+    u64::try_from(files.iter().filter(|(max_ts, _)| !max_ts.is_some_and(|hi| hi >= bound)).map(|(_, rows)| rows).sum::<i64>()).ok()
+}
+
 /// May a date's slice coverage be read from the tier at all?
 ///
 /// `witnesses` is each covering slice's record of how many rows the DATE
@@ -3773,5 +3786,32 @@ mod tests {
             assert_eq!(utf8(&output[project][0], "project_id"), project);
             assert_eq!(utf8(&output[project][0], "rollup_generation"), generation);
         }
+    }
+}
+
+#[cfg(test)]
+mod rows_below_tests {
+    use super::rows_below;
+
+    /// The rescue's whole soundness argument is that this rule matches
+    /// `partition_stats_bounded` exactly: excluded iff the max timestamp is KNOWN
+    /// and reaches the bound. Prod measured 96.8% of rollup staleness as ingest
+    /// past the build's own bound — rows this sum, by construction, cannot see.
+    #[test_case::test_case(&[(Some(500), 10), (Some(1_500), 90)], 1_000 => Some(10) ; "a tail append past the bound is invisible")]
+    #[test_case::test_case(&[(Some(999), 10)], 1_000 => Some(10) ; "a file ending just below the bound counts")]
+    #[test_case::test_case(&[(Some(1_000), 10)], 1_000 => Some(0) ; "max == bound is excluded: the write side tests hi >= bound")]
+    #[test_case::test_case(&[(None, 10), (Some(500), 5)], 1_000 => Some(15) ; "a file with no statistics is COUNTED, matching the write side")]
+    #[test_case::test_case(&[], 1_000 => Some(0) ; "no files sum to zero, which still compares")]
+    fn the_read_rule_matches_the_write_rule(files: &[(Option<i64>, i64)], bound: i64) -> Option<u64> {
+        rows_below(files, bound)
+    }
+
+    /// A straddler is excluded WHOLESALE — never split by arithmetic — which is
+    /// what lets compaction across the bound read as stale (a rebuild) rather
+    /// than as a silently wrong partial count.
+    #[test]
+    fn a_straddling_file_is_excluded_wholesale() {
+        // min far below the bound is irrelevant: only max decides.
+        assert_eq!(rows_below(&[(Some(2_000), 100), (Some(500), 7)], 1_000), Some(7));
     }
 }
