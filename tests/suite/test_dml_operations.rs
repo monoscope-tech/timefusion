@@ -231,6 +231,13 @@ mod tests {
     #[test_case(
         "UPDATE otel_logs_and_spans SET hashes = COALESCE(hashes, make_array('x')) WHERE project_id = 'test_project'"
         => (0, 0) ; "test_update_coalesce_of_stored_value_appends_no_version")]
+    // The planner drops identity assignments, so `SET x = x` reaches the MoR
+    // append with NO assignments — a shape that also bypasses the
+    // immutable-column check and, before the guard, appended a byte-for-byte
+    // copy of every matched row.
+    #[test_case(
+        "UPDATE otel_logs_and_spans SET duration = duration WHERE project_id = 'test_project'"
+        => (0, 0) ; "test_update_identity_assignment_appends_no_version")]
     #[serial]
     #[tokio::test(flavor = "multi_thread")]
     async fn update_from_run_twice(sql_template: &'static str) -> (u64, u64) {

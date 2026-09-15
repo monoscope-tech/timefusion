@@ -875,6 +875,9 @@ atomic_stats! {
         /// was manufacturing packing work for zero information.
         mor_version_rows_appended as "mor_version_rows_appended_total",
         mor_noop_rows_suppressed as "mor_noop_rows_suppressed_total",
+        /// UPDATEs whose SET reduced to identity (the planner drops `x = x`),
+        /// answered without scanning or appending anything.
+        mor_noop_statements_skipped as "mor_noop_statements_skipped_total",
     }
 }
 

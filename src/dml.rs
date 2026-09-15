@@ -835,6 +835,16 @@ async fn perform_version_append(
         // Without a marker column a DELETE would silently delete nothing.
         return Err(DataFusionError::Execution(format!("merge-on-read: {table_name} sets version_append but declares no tombstone_column")));
     }
+    if !tombstone && assignments.is_empty() {
+        // The planner drops identity assignments, so `SET x = x` arrives here
+        // EMPTY — every version it could append is a byte-for-byte copy of the
+        // winner (and the shape also slips past the immutable-column check,
+        // which sees nothing assigned). Appending nothing is the only answer
+        // that isn't pure packing work.
+        crate::observability::dml_stats().mor_noop_statements_skipped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        debug!(project_id, table_name, "merge-on-read update with no effective assignments; nothing to append");
+        return Ok(0);
+    }
     let table_schema = schema.schema_ref();
 
     // The routing provider IS the logical table: it unions MemBuffer, the hot
