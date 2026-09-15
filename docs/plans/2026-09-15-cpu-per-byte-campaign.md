@@ -12,7 +12,7 @@ deploy → re-run the IDENTICAL capture. Every number below is from prod.
 | CPU per row | 13.2 mcore·s | **9.1 mcore·s (−31%)** |
 | pgwire p50 / p99 / p999 | 1,015 ms / 47.9 s / 184.8 s (09-11) | **40 ms / 0.54 s / 1.27 s** |
 | RSS | — | 12.8 GiB of 120 (batch_size 4096 canary holds) |
-| naive 10x requirement | 217 cores | **~123 cores** |
+| naive 10x requirement | 217 cores | **~123-135 cores** (band across builds: −26-31% CPU/row) |
 
 ## What shipped (all validated by the same instrument that found them)
 
@@ -36,15 +36,24 @@ Also: tantivy fell from ~39% of CPU (09-13) to ~0.2% as a side effect of the
 `x86-64-v4` (AVX-512, host supports it) remains an untested canary via
 `--build-arg TARGET_CPU`.
 
-## The one profiled bucket left, and why it was deliberately deferred
+## Deploy 5 and what the last bucket turned out to be
 
-`apply_schema` still burns ~9% of work samples through its SECOND caller: the
-expression-evaluator path (`DefaultExpressionEvaluator::evaluate` →
-`apply_schema`), whose input arrays carry a FRESH `Fields` allocation every
-batch — pointer-keyed caching cannot hit there by construction. The fix is
-evaluator-level memoization (the evaluator lives per stream and can own its
-transform plan), a third code area of fork surgery. Deferred rather than
-shipped as a same-day fifth deploy.
+`apply_schema` burned ~9% through its SECOND caller — the expression-evaluator
+path, whose input arrays carry a fresh `Fields` allocation per batch. Deploy 5
+(`e035e5db`) shipped evaluator-owned memoization: the first batch's identity
+verdict transfers to later batches from the same input allocation, sabotage-
+verified (forcing the fast path breaks a real checkpoint test).
+
+**The post-deploy profile then settled what the bucket IS: required work, not
+waste.** With deploy 5 live the transform still runs (~8% of work samples),
+which means the verdict in production is non-identity — `apply_schema` here
+genuinely changes fields (Delta column-mapping metadata). A cache cannot elide
+work whose output differs from its input. The only further lever is a
+plan-replay construction (precompute the field/metadata plan once, rebuild
+arrays per batch without re-deriving it) — worth perhaps half the bucket for a
+substantially larger fork patch. That is where micro-optimization honestly
+ends: every VALIDATED-waste bucket is gone; what remains is required
+transformation or architecture.
 
 ## The honest 10x arithmetic
 
