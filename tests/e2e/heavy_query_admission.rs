@@ -61,10 +61,7 @@ async fn heavy_admission_queues_concurrent_clients_when_on() -> Result<()> {
         CLIENTS as u64,
         "the gate admits each heavy query EXACTLY once — a >16 count means the root fans out to multiple partitions and each takes its own permit",
     );
-    assert!(
-        counter_value(scan_metric_names::HEAVY_QUERY_QUEUED) - queued0 >= 1,
-        "with K < {CLIENTS} at least one query must have waited for a slot",
-    );
+    assert!(counter_value(scan_metric_names::HEAVY_QUERY_QUEUED) - queued0 >= 1, "with K < {CLIENTS} at least one query must have waited for a slot",);
     Ok(())
 }
 
@@ -81,10 +78,6 @@ async fn heavy_admission_is_inert_when_off() -> Result<()> {
     let counts = fire_all(&env).await?;
 
     assert!(counts.iter().all(|&c| c == n), "all clients still succeed, ungated: {counts:?}");
-    assert_eq!(
-        counter_value(scan_metric_names::HEAVY_QUERY_ADMITTED) - admitted0,
-        0,
-        "flag off: the admission rule is never registered on the session",
-    );
+    assert_eq!(counter_value(scan_metric_names::HEAVY_QUERY_ADMITTED) - admitted0, 0, "flag off: the admission rule is never registered on the session",);
     Ok(())
 }
