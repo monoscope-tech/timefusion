@@ -637,6 +637,15 @@ fn clean_intervals_cover(intervals: &[(i64, i64)], (lo, hi): (i64, i64)) -> bool
     lo <= hi && intervals.iter().any(|&(s, e)| s <= lo && hi < e)
 }
 
+/// A stored witness verifies only when it EXISTS and equals the live value.
+///
+/// `None == None` must never read as fresh: an absent witness is an absence of
+/// evidence, and treating it as agreement would let a coverage entry with no
+/// witness at all short-circuit an escalation that a stale coarse tier owes.
+fn witness_matches(stored: Option<u64>, live: Option<u64>) -> bool {
+    stored.is_some() && stored == live
+}
+
 /// Do all `added` spans lie entirely outside `(lo, hi)`?
 ///
 /// Bounds are INCLUSIVE on both sides, matching `skippable_certified_files`, so a
@@ -2377,9 +2386,57 @@ impl Database {
                 .then_some((start, end))
         });
         if let Some((covering_start, covering_end)) = covered_by_wider {
-            // ESCALATE rather than silently complete: dropping the unit leaves that hour
-            // STALE in the coarse tier. Reopening the covering slice terminates — the
-            // wider unit publishes at its own width and never re-enters this branch.
+            // The enqueue below exists because dropping the unit would leave the hour
+            // stale in the coarse tier — WHEN the coarse tier is stale. When the
+            // covering slice's witness still verifies (the same whole-or-bounded rules
+            // the read path applies), the coarse answer is current and this unit can
+            // simply complete.
+            //
+            // Without this check, a planner width that disagrees with the tier width
+            // livelocks on a maintained sealed day: the witness-moved requeue mints
+            // narrow units, each escalates here and unconditionally re-enqueues the
+            // covering unit, which re-aggregates a whale slice into a no-op republish,
+            // and source maintenance keeps the whole-partition witness moving so the
+            // requeue never stops. Prod 2026-09-15: one 3h slice ran 71 times in 90
+            // minutes (30 Complete, 37 Superseded, 34 escalations), pinned against the
+            // same 6h covering file the whole time.
+            let covering_fresh = 'fresh: {
+                let cov_key = (key.project_id.clone(), key.source.clone(), key.physical_table.clone(), covering_start, covering_end);
+                let Some(cov) = self.rollup_slice_coverage.get(&cov_key).map(|entry| entry.value().clone()) else { break 'fresh false };
+                let whole = source_rows.and_then(|rows| u64::try_from(rows).ok());
+                if witness_matches(cov.source_rows, whole) {
+                    break 'fresh true;
+                }
+                let Some(witness_below) = cov.source_rows_below else { break 'fresh false };
+                // Bounded compare at the COVERING slice's own bound — `source_rows_below`
+                // in scope was taken at THIS unit's end, which is not the covering end.
+                let table = from_table.read().await;
+                let witness_guard = match &witness_table {
+                    Some(witness) => Some(witness.read().await),
+                    None => None,
+                };
+                let witness_source: &DeltaTable = witness_guard.as_deref().unwrap_or(&table);
+                let date_string = date.to_string();
+                let below = Self::partition_stats_bounded(witness_source, tiebreak_of(&key.source), &|_, _| covering_end)
+                    .ok()
+                    .and_then(|mut stats| {
+                        stats.remove(&(key.project_id.clone(), date_string.clone())).or_else(|| stats.remove(&("default".to_string(), date_string)))
+                    })
+                    .and_then(|stats| u64::try_from(stats.rows).ok());
+                witness_matches(Some(witness_below), below)
+            };
+            if covering_fresh {
+                crate::observability::maintenance_stats().rollup_escalation_skipped_fresh.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let mut journal = self.journal();
+                journal.complete(&key);
+                journal.checkpoint()?;
+                info!(
+                    table = %key.physical_table, project_id = %key.project_id,
+                    slice_start = key.slice.start_micros, covering_start, covering_end,
+                    event = "maintenance_rollup_completed_under_fresh_covering_slice"
+                );
+                return Ok(true);
+            }
             crate::observability::maintenance_stats().rollup_skipped_covered_by_wider.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let mut journal = self.journal();
             if let Ok(covering) = crate::maintenance_coordinator::TimeSlice::new(covering_start, covering_end) {
@@ -8767,5 +8824,24 @@ mod bounded_witness_tests {
     #[test]
     fn a_straddling_file_is_excluded_wholesale_not_split() {
         assert!(!counted(1_500, 1_000), "min below and max above still excludes — never a partial count");
+    }
+}
+
+#[cfg(test)]
+mod escalation_freshness_tests {
+    use super::witness_matches;
+
+    /// The livelock this gates: prod 2026-09-15 re-ran one 3h slice 71 times in
+    /// 90 minutes because escalation re-enqueued its covering slice
+    /// unconditionally. Completing without the enqueue is only sound when the
+    /// covering slice's witness verifies — and verification requires EVIDENCE,
+    /// so an absent witness can never read as agreement.
+    #[test_case::test_case(Some(100), Some(100) => true ; "matching evidence verifies")]
+    #[test_case::test_case(Some(100), Some(101) => false ; "a moved count refuses")]
+    #[test_case::test_case(None, None => false ; "absent == absent is NOT agreement — the fail-closed guard")]
+    #[test_case::test_case(None, Some(100) => false ; "no stored witness refuses")]
+    #[test_case::test_case(Some(100), None => false ; "no live count refuses")]
+    fn a_witness_verifies_only_on_real_evidence(stored: Option<u64>, live: Option<u64>) -> bool {
+        witness_matches(stored, live)
     }
 }
