@@ -595,3 +595,34 @@ rollups:
   #
   # The one case the fold fix does NOT cover, and it is untested: a long-lived tier
   # REBUILT from scratch under the same table name reads old, so it still pins.
+  # Session analytics. The session-list query (GROUP BY attributes___session___id
+  # with filtered error/pageview counts and user-field maxes) is 25% of all
+  # rollup misses AND one of the heavy raw-scan classes exhausting the query
+  # pool at peak — one tier serves both problems. Filters below are copied from
+  # the predicates monoscope actually sends; matching is canonical through the
+  # shared optimizer pipeline, so they must stay in lockstep with the client.
+  #
+  # NOT yet routable as sent: the query's max(concat(timestamp, ..., url))
+  # latest-URL aggregate is an expression no measure can declare, and routing
+  # requires every aggregate to resolve. monoscope must switch that one
+  # aggregate to first_value/last_value (supported) or fetch it separately.
+  - grain: 1h
+    name: sessions_1h_v1
+    dimensions: [attributes___session___id, resource___service___name]
+    measures:
+      - { name: event_count, agg: count }
+      - {
+          name: error_count,
+          agg: count,
+          filter: "status_code = 'ERROR' OR lower(coalesce(level, '')) = 'error' OR attributes___exception___type IS NOT NULL",
+        }
+      - {
+          name: pageview_count,
+          agg: count,
+          filter: "name LIKE 'Pageview %' OR name = 'documentLoad'",
+        }
+      - { name: first_seen, agg: min, column: timestamp }
+      - { name: last_seen, agg: max, column: timestamp }
+      - { name: user_id, agg: max, column: attributes___user___id }
+      - { name: user_full_name, agg: max, column: attributes___user___full_name }
+      - { name: user_email, agg: max, column: attributes___user___email }
