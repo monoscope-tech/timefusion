@@ -3,6 +3,7 @@ import pathlib
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 import lease as lease_module
 from lease import DeploymentLease, LEASE_REF, RECEIPT_REF
 
@@ -101,6 +102,28 @@ class AbandonedLeaseTest(unittest.TestCase):
             with self.assertRaises(subprocess.CalledProcessError):
                 with b.hold('image-b', wait_seconds=0):
                     self.fail('reclaimed a lease that reached a production mutation')
+
+    def test_a_mutating_lease_whose_run_is_dead_is_reclaimed(self):
+        """The 2026-09-14 wedge: a rollout died mid-flight and its lease blocked
+        every later deploy for 15.6 hours, because `mutating` refused reclaim at
+        any age. A completed GitHub run is proof the holder is gone."""
+        with repo() as (a, b), self.stale_after(0):
+            a.git('push', 'origin', a.commit(
+                {'image': 'image-a', 'mutating': True, 'started': 0, 'run_id': '12345'}) + ':' + LEASE_REF)
+            with mock.patch.object(lease_module, 'MUTATING_DEAD_SECONDS', 0), \
+                 mock.patch.object(lease_module, 'run_is_finished', lambda run_id: run_id == '12345'):
+                with b.hold('image-b', wait_seconds=30) as guard:
+                    self.assertEqual(b.remote(LEASE_REF), guard.owner, 'a dead mutating holder must not wedge deploys forever')
+
+    def test_a_mutating_lease_whose_run_still_runs_is_left_alone(self):
+        """The safety half: an ACTIVE holder may still be changing production,
+        so no amount of age may steal its lease."""
+        with repo() as (a, b), self.stale_after(0):
+            held = a.commit({'image': 'image-a', 'mutating': True, 'started': 0, 'run_id': '999'})
+            a.git('push', 'origin', held + ':' + LEASE_REF)
+            with mock.patch.object(lease_module, 'MUTATING_DEAD_SECONDS', 0), \
+                 mock.patch.object(lease_module, 'run_is_finished', lambda _run_id: False):
+                self.assertFalse(b.abandoned(held), 'a live mutating holder must never be reclaimed')
 
 
 if __name__ == '__main__':
