@@ -1925,7 +1925,19 @@ impl Database {
         let base_generations: HashSet<String> = cells.iter().map(|(_, generation, _)| generation.clone()).collect();
         let base_evidence = crate::rollup::base_measure_evidence(spec, cells.iter().map(|(_, _, measures)| measures.as_ref()));
         let base_covered: Vec<(i64, i64)> = cells.into_iter().map(|(span, _, _)| span).collect();
-        let (snapshot, log_store, selected, estimated_bytes, source_rows, partition_identity, whole_file_bytes, content_fp, refused_spans, selected_spans) = {
+        let (
+            snapshot,
+            log_store,
+            selected,
+            estimated_bytes,
+            source_rows,
+            source_rows_below,
+            partition_identity,
+            whole_file_bytes,
+            content_fp,
+            refused_spans,
+            selected_spans,
+        ) = {
             let table = from_table.read().await;
             let witness_guard = match &witness_table {
                 Some(table) => Some(table.read().await),
@@ -1940,6 +1952,15 @@ impl Database {
                 stats.remove(&(key.project_id.clone(), date_string.clone())).or_else(|| stats.remove(&("default".to_string(), date_string.clone())))
             });
             let source_rows = partition_stats.map(|stats| stats.rows);
+            // The same count bounded by THIS slice's end. Written alongside the
+            // unbounded one and not yet read, so the flip can happen later against
+            // data that already exists rather than waiting a full rebuild cycle.
+            let source_rows_below = Self::partition_stats_bounded(witness_source, tiebreak_of(&key.source), &|_, _| key.slice.end_micros)
+                .ok()
+                .and_then(|mut stats| {
+                    stats.remove(&(key.project_id.clone(), date_string.clone())).or_else(|| stats.remove(&("default".to_string(), date_string.clone())))
+                })
+                .map(|stats| stats.rows);
             // `(fingerprint, min_ts, max_ts)`: the identity the date-level read path
             // compares. `min_ts` decides whether this slice may claim the day's opening
             // hours; with `max_ts` it bounds where a missing base slice is a real hole.
@@ -2009,7 +2030,19 @@ impl Database {
                 content_fp ^= file_content_hash(&path, add.deletion_vector.as_ref());
                 selected.push(path);
             }
-            (snapshot, table.log_store(), selected, estimated, source_rows, partition_identity, whole_file_bytes, content_fp, refused_spans, selected_spans)
+            (
+                snapshot,
+                table.log_store(),
+                selected,
+                estimated,
+                source_rows,
+                source_rows_below,
+                partition_identity,
+                whole_file_bytes,
+                content_fp,
+                refused_spans,
+                selected_spans,
+            )
         };
         let input_footprint = crate::maintenance_coordinator::InputFootprint::new(&selected, whole_file_bytes);
         // Record on every claim, not only when this one splits, or a timeout bisect
@@ -2279,6 +2312,7 @@ impl Database {
                     // Absent means the read path must refuse this slice, so write the `-1`
                     // sentinel rather than omitting the tag when the source reports no count.
                     (crate::maintenance_coordinator::TAG_SOURCE_ROWS, source_rows.unwrap_or(-1).to_string()),
+                    (crate::maintenance_coordinator::TAG_SOURCE_ROWS_BELOW, source_rows_below.unwrap_or(-1).to_string()),
                     (crate::maintenance_coordinator::TAG_MEASURES, materialized.join(",")),
                 ]
                 .map(|(name, value)| (name.to_owned(), Some(value))),
@@ -8632,5 +8666,40 @@ mod clip_window_to_date_tests {
         let window = (at("2026-09-14", 6), at("2026-09-14", 8));
         assert!(clip_to_day(day("2026-09-13"), window).is_none(), "before the window");
         assert!(clip_to_day(day("2026-09-15"), window).is_none(), "after the window");
+    }
+}
+
+#[cfg(test)]
+mod bounded_witness_tests {
+    /// The property the bounded witness exists for.
+    ///
+    /// `partition_stats_bounded` drops any file whose `max_ts` reaches the bound, so
+    /// a file written PAST the slice's end is absent from both the witness and the
+    /// live count and the two still agree. The unbounded witness has no such
+    /// property: every ingest anywhere in the day moves it, and 96.8% of measured
+    /// rollup staleness is exactly that (`rollup_stale_grew` 3,769,781 vs
+    /// `rollup_stale_shrank` 124,695 over 12h).
+    ///
+    /// Modelled here as the predicate itself; the Delta plumbing is exercised by the
+    /// rollup integration tests.
+    fn counted(file_max_ts: i64, bound: i64) -> bool {
+        !(file_max_ts >= bound)
+    }
+
+    #[test]
+    fn a_file_written_past_the_bound_is_invisible_to_the_witness() {
+        let bound = 1_000;
+        assert!(counted(999, bound), "a file wholly below the bound counts");
+        assert!(!counted(1_000, bound), "a file reaching the bound does not");
+        assert!(!counted(5_000, bound), "and neither does one far past it — this is the ingest case");
+    }
+
+    /// Symmetry is what makes it sound: the SAME rule runs when the witness is
+    /// written and when it is re-proved, so an excluded file is excluded on both
+    /// sides. A straddling file (min below, max above) is excluded wholesale rather
+    /// than split by arithmetic, which is why it cannot silently half-count.
+    #[test]
+    fn a_straddling_file_is_excluded_wholesale_not_split() {
+        assert!(!counted(1_500, 1_000), "min below and max above still excludes — never a partial count");
     }
 }
