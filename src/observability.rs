@@ -869,6 +869,12 @@ atomic_stats! {
         coalesce_merges,
         /// Groups parked to `<wal_dir>/quarantine/dml`.
         coalesce_quarantined,
+        /// Merge-on-read row versions actually appended, vs. matched rows whose
+        /// assignments changed nothing and were dropped instead of re-appended.
+        /// suppressed/(appended+suppressed) is the share of UPDATE traffic that
+        /// was manufacturing packing work for zero information.
+        mor_version_rows_appended as "mor_version_rows_appended_total",
+        mor_noop_rows_suppressed as "mor_noop_rows_suppressed_total",
     }
 }
 

@@ -218,6 +218,19 @@ mod tests {
            AND o.name = u.span_name
            AND NOT (COALESCE(o.hashes, '{}'::text[]) @> ARRAY[u.tag])"
         => (2, 0) ; "test_update_guard_survives_pushed_down_time_bounds")]
+    // A second pass re-assigning the value the winner already carries encodes
+    // zero information; merge-on-read must not mint a version for it. (Prod:
+    // monoscope re-drives enrichment UPDATEs whose values are already stored —
+    // every such no-op version is another row today's packing must re-collapse.)
+    #[test_case(
+        "UPDATE otel_logs_and_spans SET hashes = make_array('500') WHERE project_id = 'test_project' AND name = 'Bob'"
+        => (1, 0) ; "test_update_identical_second_pass_appends_no_version")]
+    // The backfill shape: COALESCE over an already-populated column matches
+    // rows but changes nothing — no pass may append a version. Seeds carry
+    // `hashes: []` (non-null), so COALESCE returns the stored value verbatim.
+    #[test_case(
+        "UPDATE otel_logs_and_spans SET hashes = COALESCE(hashes, make_array('x')) WHERE project_id = 'test_project'"
+        => (0, 0) ; "test_update_coalesce_of_stored_value_appends_no_version")]
     #[serial]
     #[tokio::test(flavor = "multi_thread")]
     async fn update_from_run_twice(sql_template: &'static str) -> (u64, u64) {

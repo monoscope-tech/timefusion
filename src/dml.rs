@@ -21,7 +21,7 @@ use datafusion::{
         SendableRecordBatchStream, SessionStateBuilder, TaskContext,
         context::{QueryPlanner, SessionState},
     },
-    logical_expr::{Expr, Join, LogicalPlan, WriteOp, utils::split_conjunction},
+    logical_expr::{Expr, Join, LogicalPlan, Operator, WriteOp, binary_expr, utils::split_conjunction},
     physical_plan::{DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, PlanProperties, stream::RecordBatchStreamAdapter},
     physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner},
 };
@@ -900,6 +900,34 @@ async fn perform_version_append(
             }
         })
         .collect::<Result<Vec<_>>>()?;
+
+    // A version whose assigned columns all equal the winner's stored values
+    // encodes zero information, but still costs a WAL entry, a flush row and
+    // another packing round over today's partition — and production re-drives
+    // enrichment UPDATEs whose values are already stored. Project a change
+    // marker and drop unchanged rows batch-by-batch, counting both sides.
+    // Struct-typed (Variant) assignments are exempt from comparison; one such
+    // assignment disables suppression for the statement rather than half-prove
+    // it. DELETE always appends: the tombstone itself is the change.
+    let comparable = |name: &String| table_schema.field_with_name(name).is_ok_and(|f| !matches!(f.data_type(), DataType::Struct(_)));
+    let changed: Option<Expr> = if !tombstone && !assignments.is_empty() && assignments.iter().all(|(c, _)| comparable(c)) {
+        assignments
+            .iter()
+            .map(|(name, e)| {
+                Ok(binary_expr(
+                    requalify_for_merge(e.clone(), &source_cols, MOR_SOURCE, table_name)?,
+                    Operator::IsDistinctFrom,
+                    col(Column::new(Some(table_name.to_string()), name)),
+                ))
+            })
+            .process_results::<_, _, DataFusionError, _>(|it| it.reduce(Expr::or))?
+    } else {
+        None
+    };
+    let mut exprs = exprs;
+    if let Some(pred) = changed.clone() {
+        exprs.push(pred.alias(MOR_CHANGED_COL));
+    }
     let plan = builder.project(exprs)?.build()?;
 
     // `session` must be a `delta_session_from(...)` one: default analyzer rules
@@ -908,8 +936,15 @@ async fn perform_version_append(
     let physical = session.create_physical_plan(&plan).await?;
     let mut stream = datafusion::physical_plan::execute_stream(physical, session.task_ctx())?;
     let mut rows = 0u64;
+    let mut suppressed = 0u64;
     while let Some(batch) = stream.next().await {
-        let batch = batch?;
+        let mut batch = batch?;
+        if changed.is_some() && batch.num_columns() > 0 {
+            use datafusion::arrow::array::cast::AsArray;
+            let mask = batch.column(batch.num_columns() - 1).as_boolean().clone();
+            batch = datafusion::arrow::compute::filter_record_batch(&batch.project(&(0..batch.num_columns() - 1).collect::<Vec<_>>())?, &mask)?;
+            suppressed += (mask.len() - batch.num_rows()) as u64;
+        }
         if batch.num_rows() == 0 {
             continue;
         }
@@ -927,9 +962,16 @@ async fn perform_version_append(
             .await
             .map_err(|e| DataFusionError::Execution(format!("merge-on-read append failed for {project_id}/{table_name}: {e}")))?;
     }
-    debug!(project_id, table_name, rows, tombstone, "merge-on-read version append");
+    let stats = crate::observability::dml_stats();
+    stats.mor_version_rows_appended.fetch_add(rows, std::sync::atomic::Ordering::Relaxed);
+    stats.mor_noop_rows_suppressed.fetch_add(suppressed, std::sync::atomic::Ordering::Relaxed);
+    debug!(project_id, table_name, rows, suppressed, tombstone, "merge-on-read version append");
     Ok(rows)
 }
+
+/// Marker column carrying the per-row "assignments changed something" verdict;
+/// stripped before the append so the batch matches the table schema.
+const MOR_CHANGED_COL: &str = "__tf_changed";
 
 /// Merge-on-read is a property of the SCHEMA alone — never also of whether a
 /// buffered layer is attached, or the same data would resolve differently
@@ -1444,7 +1486,7 @@ use datafusion::{
         row::{RowConverter, SortField},
     },
     common::ScalarValue,
-    logical_expr::{BinaryExpr, Operator},
+    logical_expr::BinaryExpr,
     prelude::lit,
 };
 use tokio::sync::Notify;

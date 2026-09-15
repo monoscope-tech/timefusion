@@ -171,3 +171,36 @@ L1+L2 name the two lanes that own 97% of it.**
   rewrites outside today's partition are census-only until cert impact is
   understood.
 - Every experiment names the metric it moves before it ships.
+
+
+## 2026-09-16 corrections and progress — read this before acting on the above
+
+Re-running the decomposition with an add-path/remove-path join and the
+commitInfo custom fields settled two things the first pass got wrong:
+
+1. **The "28% 1:1 rewrite lane" is NOT physical churn.** Every one of those
+   commits carries `timefusion.dv_dedup: true` and re-adds the SAME file path
+   with a deletion vector attached (381/381 re-adds in a 22h window). The
+   physical write is the DV bitmap, not the file; counting `add.numRecords`
+   mis-attributed it. **L2 as written is closed** — DV-dedup is behaving as
+   designed.
+2. **Flush commits are already attributed** (`timefusion.landed_digests`,
+   `timefusion.wal_watermark`), so L0's tag mechanism exists; what remains of
+   L0 is tagging maintenance-authored commits (OPTIMIZE variants) and the
+   OTel export.
+
+Corrected physical shape: **~33x row amplification, ~97% of it OPTIMIZE over
+today's partition** (299.5M OPTIMIZE rows/day vs 9.4M flushed, 09-15 window).
+L1 — intraday packing rounds — is almost the whole lever.
+
+**The DML feeder, fixed on this branch.** `otel_logs_and_spans` is
+merge-on-read (`version_append`), so every UPDATE appends a FULL wide row
+version, and `perform_version_append` had no no-change detection: an UPDATE
+whose assignments equal the stored values (monoscope re-drives enrichment and
+backfill statements by design — its `@>`-guard covers only some shapes)
+minted a complete version whose only effect was another row for today's
+packing to re-collapse. Now the append projects an `IS DISTINCT FROM` change
+marker per assigned column and drops unchanged rows before the WAL, counted
+as `dml.mor_noop_rows_suppressed_total` vs `mor_version_rows_appended_total`
+in `timefusion_stats`. The counters are the sizing instrument this plan's
+rules demand — read them after a day of prod before crediting the fix.
