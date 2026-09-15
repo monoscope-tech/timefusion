@@ -21,6 +21,34 @@ RECEIPT_REF = 'refs/timefusion-deploy/completed'
 # One retained for recovery carries `unresolved` and is left for a person.
 STALE_SECONDS = 1800
 
+# A MUTATING lease is not reclaimable on age alone — its holder may still be
+# changing production. But refusing forever turns a transient fault into a
+# permanent outage: prod 2026-09-14 lost a deploy mid-rollout, and the lease it
+# left behind (mutating, holder long dead) blocked EVERY later rollout for 15.6
+# hours until it was deleted by hand — the second such wedge in one night.
+#
+# So the question is not "is it old" but "is its holder still alive". A GitHub run
+# that has completed is proof the holder is gone; the long grace on top is for the
+# case where the API answers wrongly or the holder is local (no run id), where this
+# still refuses.
+MUTATING_DEAD_SECONDS = 7200
+
+
+def run_is_finished(run_id):
+    """True only when GitHub states this run is no longer active.
+
+    Every other outcome — no id, a local holder, an API error, a timeout, an
+    unexpected answer — is False, i.e. "assume alive, do not reclaim".
+    """
+    if not run_id:
+        return False
+    try:
+        done = subprocess.run(['gh', 'run', 'view', str(run_id), '--json', 'status', '-q', '.status'],
+                              capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return done.returncode == 0 and done.stdout.strip() == 'completed'
+
 
 @dataclass
 class RolloutGuard:
@@ -69,18 +97,24 @@ class DeploymentLease:
     def abandoned(self, commit):
         """Whether `commit` is a dead holder's lease rather than a live or mutating one.
 
-        Fail-safe in every direction: an unreadable record, a missing
-        `mutating` key (an older writer, or one that never got to declare), or
-        `mutating` set all mean "leave it alone".
+        Fail-safe in every direction: an unreadable record, or a missing
+        `mutating` key (an older writer, or one that never got to declare), mean
+        "leave it alone". A lease that DID declare a mutation is reclaimable only
+        once GitHub says its run finished AND it is well past
+        `MUTATING_DEAD_SECONDS` — otherwise a holder that dies mid-rollout blocks
+        every later deploy forever, which has now happened twice.
         """
         try:
             self.git('fetch', '--no-write-fetch-head', '--no-tags', 'origin', LEASE_REF)
             record = json.loads(self.git('show', commit + ':record.json'))
         except (subprocess.CalledProcessError, ValueError):
             return False
+        age = time.time() - record.get('started', time.time())
         if record.get('mutating') is not False:
-            return False
-        return time.time() - record.get('started', time.time()) >= STALE_SECONDS
+            # Reclaimable only once the holder is PROVABLY gone. Age alone never
+            # qualifies a mutating lease, and a holder we cannot ask about never does.
+            return age >= MUTATING_DEAD_SECONDS and run_is_finished(record.get('run_id'))
+        return age >= STALE_SECONDS
 
     @contextlib.contextmanager
     def hold(self, image, wait_seconds=2700):
