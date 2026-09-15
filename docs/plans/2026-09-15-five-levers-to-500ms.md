@@ -92,3 +92,20 @@ stage.
 
 - 2026-09-15: plan written. perf/delta-leg-spm (38db0748) verified in prod;
   ordering_violations spike diagnosed sound (un-laundered lying footers).
+- 2026-09-15 (item 5a): already done — `pgwire.stream_failed` became an OTel
+  counter on 09-14 (`observability.rs:388`), history lands in monoscope.
+- 2026-09-15 (item 1): measured on the #296-era build and **largely resolved by
+  the team**: `never_certified` fell 98% → 34% of scans, coverage retained 26 /
+  reset 0. The controlled-query test settles the rest: a SEALED-window query
+  increments `dedup_skipped`; a TODAY-window query increments
+  `dedup_denied_fp_moved` — i.e. the dominant remaining denial is today's
+  partition, whose flush every ~10 min adds files that genuinely need dedup.
+  **That denial is correct, and today's dedup is cheap post-SPM.** Two traps
+  recorded: the certification fingerprint hashes URIs ONLY (a DV commit does
+  NOT move it — `partition_dv_state` exists precisely because of that), and
+  the per-FILE skip is structurally unreachable (MoR re-appends land at
+  ORIGINAL timestamps, so `cert_skip_blocked_overlap` = 27k blocked / 0
+  granted). An `added.is_empty()` retention-removal survival tweak was built,
+  then reverted: premised on the DV mechanism, which was wrong.
+  **Conclusion: the 500 ms lever for aggregates is item 2 (rollups), plus the
+  build lane draining `not_built` over days — not further cert-side code.**
