@@ -4959,6 +4959,8 @@ mod tests {
 
     /// Source schema `(lookup_name: Utf8, new_id: Utf8)`; the join matches target
     /// `name` against source `lookup_name` and overwrites target `id`.
+    /// `rows` is `(id to match, id to write)`. NOTE the fixture's own naming: `test_span(id, name)`
+    /// puts `test*` in the `id` column and `span*` in `name`, so the join key is `id`.
     fn build_update_source_for_id_rewrite(rows: &[(&str, &str)]) -> (crate::dml::UpdateSource, Vec<(String, datafusion::logical_expr::Expr)>) {
         use std::sync::Arc;
 
@@ -4968,40 +4970,31 @@ mod tests {
         };
         use datafusion::prelude::col;
 
-        let lookup_names: ArrayRef = Arc::new(StringArray::from(rows.iter().map(|(n, _)| *n).collect::<Vec<_>>()));
+        let lookup_ids: ArrayRef = Arc::new(StringArray::from(rows.iter().map(|(n, _)| *n).collect::<Vec<_>>()));
         let new_ids: ArrayRef = Arc::new(StringArray::from(rows.iter().map(|(_, i)| *i).collect::<Vec<_>>()));
-        let schema = Arc::new(Schema::new(vec![Field::new("lookup_name", DataType::Utf8, false), Field::new("new_id", DataType::Utf8, false)]));
-        let batch = RecordBatch::try_new(schema.clone(), vec![lookup_names, new_ids]).unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new("lookup_id", DataType::Utf8, false), Field::new("new_id", DataType::Utf8, false)]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![lookup_ids, new_ids]).unwrap();
 
-        let source = crate::dml::UpdateSource { batch, schema, join_keys: vec![("name".to_string(), "lookup_name".to_string())] };
+        let source = crate::dml::UpdateSource { batch, schema, join_keys: vec![("id".to_string(), "lookup_id".to_string())] };
         let assignments = vec![("id".to_string(), col("source.new_id"))];
         (source, assignments)
     }
 
     /// Every visible `(name, id)` pair for `(project, table)` — the read side of
-    /// the `update_with_source` tests. Both columns must be `Utf8`.
+    /// the `update_with_source` tests. MemBuffer stores strings as `Utf8View`,
+    /// Delta hands back `Utf8`, so read both through `array_get_str`.
     fn name_id_rows(layer: &BufferedWriteLayer, project: &str, table: &str) -> Vec<(String, String)> {
+        use crate::support::test_helpers::array_get_str;
         let results = layer.query(project, table, &[]).unwrap();
         assert!(!results.is_empty(), "expected rows for {project}/{table}");
         let combined = arrow::compute::concat_batches(&results[0].schema(), &results).unwrap();
-        let col = |n: &str| {
-            combined
-                .column(combined.schema().index_of(n).unwrap())
-                .as_any()
-                .downcast_ref::<arrow::array::StringArray>()
-                .unwrap_or_else(|| panic!("{n} column should be Utf8"))
-                .clone()
-        };
+        let col = |n: &str| combined.column(combined.schema().index_of(n).unwrap()).clone();
         let (names, ids) = (col("name"), col("id"));
-        (0..combined.num_rows()).map(|i| (names.value(i).to_string(), ids.value(i).to_string())).collect()
+        (0..combined.num_rows()).map(|i| (array_get_str(&names, i), array_get_str(&ids, i))).collect()
     }
 
     /// MemBuffer-only `UPDATE ... FROM` via `update_with_source`: matched rows
     /// are rewritten, non-matched rows untouched.
-    ///
-    /// `#[ignore]`d: MemBuffer stores strings as `Utf8View` while the source
-    /// batch is `Utf8`, and Arrow's `RowConverter` requires byte-identical
-    /// types, so the join lookup returns 0 matches. Re-enable once that is fixed.
     #[serial]
     #[tokio::test]
     async fn update_with_source_buffered_only() {
@@ -5010,17 +5003,17 @@ mod tests {
         let layer = crate::support::test_helpers::test_layer(Arc::clone(&cfg)).unwrap();
         layer.insert(&project, &table, vec![create_test_batch(&project)]).await.unwrap();
 
-        // create_test_batch produces three rows with names test1/test2/test3
-        // and matching ids span1/span2/span3.
+        // create_test_batch produces three rows with ids test1/test2/test3 and names
+        // span1/span2/span3 (`test_span` takes id first).
         let (source, assignments) = build_update_source_for_id_rewrite(&[("test1", "rewritten-1"), ("test3", "rewritten-3")]);
         let updated = layer.update_with_source(&project, &table, None, &assignments, &source).unwrap();
         assert_eq!(updated, 2, "expected 2 rows matched by the join");
 
         for (name, id) in name_id_rows(&layer, &project, &table) {
             match name.as_str() {
-                "test1" => assert_eq!(id, "rewritten-1", "test1 row should have new id"),
-                "test2" => assert_eq!(id, "span2", "test2 row was not in source; must be unchanged"),
-                "test3" => assert_eq!(id, "rewritten-3", "test3 row should have new id"),
+                "span1" => assert_eq!(id, "rewritten-1", "the test1 row should have a new id"),
+                "span2" => assert_eq!(id, "test2", "the test2 row was not in source; must be unchanged"),
+                "span3" => assert_eq!(id, "rewritten-3", "the test3 row should have a new id"),
                 other => panic!("unexpected row name {other}"),
             }
         }
@@ -5029,8 +5022,6 @@ mod tests {
     /// An `UPDATE ... FROM` against MemBuffer-only rows must be reapplied by
     /// `recover_from_wal` after a restart.
     ///
-    /// `#[ignore]`d: blocked on the same Utf8/Utf8View `RowConverter` lookup
-    /// miss as `update_with_source_buffered_only`.
     #[serial]
     #[tokio::test]
     async fn update_with_source_wal_replay_after_restart() {
@@ -5049,9 +5040,11 @@ mod tests {
         {
             let layer = Arc::new(crate::support::test_helpers::test_layer(cfg).unwrap());
             let stats = layer.recover_from_wal().await.unwrap();
-            assert!(stats.entries_replayed >= 2, "expected ≥2 entries replayed (Insert + UpdateWithSource), got {stats:?}");
+            // `entries_replayed` counts INSERT entries only; that the UpdateWithSource entry was
+            // replayed is proved by the rewritten id below, not by this counter.
+            assert_eq!(stats.entries_replayed, 1, "expected the one Insert entry replayed, got {stats:?}");
 
-            let rewritten: Vec<String> = name_id_rows(&layer, &project, &table).into_iter().filter(|(n, _)| n == "test2").map(|(_, id)| id).collect();
+            let rewritten: Vec<String> = name_id_rows(&layer, &project, &table).into_iter().filter(|(n, _)| n == "span2").map(|(_, id)| id).collect();
             assert_eq!(rewritten, ["post-replay-2"], "WAL replay did not reapply UpdateWithSource — test2's id should be 'post-replay-2'");
         }
     }
