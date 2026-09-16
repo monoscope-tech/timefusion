@@ -423,7 +423,52 @@ async fn run_with_statement_timeout<T>(
     Ok((result, deadline))
 }
 
-fn with_response_deadline(response: Response, deadline: Option<tokio::time::Instant>) -> Response {
+#[derive(Clone)]
+struct StreamFailureContext {
+    fingerprint: String,
+    template: String,
+    tables: String,
+    project_id: String,
+    protocol: &'static str,
+    deadline_ms: Option<u64>,
+    started_at: std::time::Instant,
+}
+
+impl StreamFailureContext {
+    fn new(query: &str, protocol: &'static str, timeout: Option<std::time::Duration>, started_at: std::time::Instant) -> Self {
+        let (tables, project_id) = query_dimensions(query);
+        Self {
+            fingerprint: query_fingerprint(query),
+            template: query_template(query),
+            tables,
+            project_id: project_id.to_owned(),
+            protocol,
+            deadline_ms: timeout.map(|timeout| timeout.as_millis().min(u128::from(u64::MAX)) as u64),
+            started_at,
+        }
+    }
+}
+
+fn stream_failure_class(error: &PgWireError) -> &'static str {
+    let error = error.to_string().to_ascii_lowercase();
+    if error.contains("statement timeout") || error.contains("statement_timeout") {
+        "statement_timeout"
+    } else if error.contains("canceling statement") || error.contains("cancelled") || error.contains("canceled") {
+        "client_cancel"
+    } else if error.contains("admission") && (error.contains("timeout") || error.contains("timed out")) {
+        "queue_timeout"
+    } else if error.contains("resources exhausted")
+        || error.contains("failed to allocate")
+        || error.contains("memory reservation")
+        || error.contains("spill limit")
+    {
+        "resource"
+    } else {
+        "other"
+    }
+}
+
+fn with_response_deadline(response: Response, deadline: Option<tokio::time::Instant>, context: StreamFailureContext) -> Response {
     match response {
         Response::Query(QueryResponse { command_tag, row_schema, data_rows, .. }) => {
             // do_query returns before rows are consumed. Keep its scrubbed query
@@ -431,6 +476,7 @@ fn with_response_deadline(response: Response, deadline: Option<tokio::time::Inst
             let span = tracing::Span::current();
             let data_rows = stream::unfold(Some(data_rows), move |rows| {
                 let span = span.clone();
+                let context = context.clone();
                 async move {
                     let mut rows = rows?;
                     let next = match deadline {
@@ -444,7 +490,19 @@ fn with_response_deadline(response: Response, deadline: Option<tokio::time::Inst
                     if let Some((Err(error), _)) = &next {
                         // `?` escapes multiline causes so line-based collectors keep the full error on one line.
                         crate::observability::maintenance_stats().pgwire_stream_failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        warn!(event = "pgwire.stream_failed", error = ?error.to_string(), "PostgreSQL row stream failed");
+                        warn!(
+                            event = "pgwire.stream_failed",
+                            failure.class = stream_failure_class(error),
+                            query.fingerprint = %context.fingerprint,
+                            query.template = %context.template,
+                            query.tables = %context.tables,
+                            project.id = %context.project_id,
+                            protocol = context.protocol,
+                            deadline_ms = ?context.deadline_ms,
+                            duration_us = context.started_at.elapsed().as_micros() as u64,
+                            error = ?error.to_string(),
+                            "PostgreSQL row stream failed"
+                        );
                     }
                     next
                 }
@@ -465,14 +523,16 @@ fn with_response_deadline(response: Response, deadline: Option<tokio::time::Inst
 /// span's `query.text` lands on the same line as the error.
 async fn run_statement<T, R>(
     scan_metrics: Option<&crate::database::ScanMetrics>, max_statement_secs: u64, client_timeout: Option<std::time::Duration>, query: &str,
-    protocol: &'static str, execute: impl std::future::Future<Output = PgWireResult<T>>, finish: impl FnOnce(T, Option<tokio::time::Instant>) -> R,
+    protocol: &'static str, execute: impl std::future::Future<Output = PgWireResult<T>>,
+    finish: impl FnOnce(T, Option<tokio::time::Instant>, StreamFailureContext) -> R,
 ) -> PgWireResult<R> {
     let _giant = giant_stmt_permit(query.len()).await;
     let execute_span = tracing::trace_span!(parent: &tracing::Span::current(), "datafusion.execute");
     let t0 = std::time::Instant::now();
     let timeout = effective_statement_timeout(client_timeout, max_statement_secs, batch_statement_secs()).filter(|_| statement_timeout_applies(query));
-    let result = run_with_statement_timeout(timeout, execute.instrument(execute_span)).await.map(|(value, deadline)| finish(value, deadline));
-    record_statement_latency(scan_metrics, query, protocol, t0.elapsed().as_micros() as u64, result.is_ok());
+    let context = StreamFailureContext::new(query, protocol, timeout, t0);
+    let result = run_with_statement_timeout(timeout, execute.instrument(execute_span)).await.map(|(value, deadline)| finish(value, deadline, context));
+    record_statement_latency(scan_metrics, query, protocol, t0.elapsed().as_micros() as u64, result.as_ref().err());
     if let Err(error) = &result {
         warn!(protocol, error = %error, "statement failed");
     }
@@ -989,7 +1049,9 @@ fn record_query_span(span: &tracing::Span, query: &str) {
 /// Emit one bounded event for statements slow enough to affect the tail. Table
 /// and project dimensions are extracted only for diagnosis; raw SQL is never
 /// included in this event.
-fn record_statement_latency(metrics: Option<&crate::database::ScanMetrics>, query: &str, protocol: &'static str, duration_us: u64, success: bool) {
+fn record_statement_latency(
+    metrics: Option<&crate::database::ScanMetrics>, query: &str, protocol: &'static str, duration_us: u64, failure: Option<&PgWireError>,
+) {
     if let Some(metrics) = metrics {
         metrics.record_pgwire_query(duration_us);
     }
@@ -998,6 +1060,7 @@ fn record_statement_latency(metrics: Option<&crate::database::ScanMetrics>, quer
     // Failures always, successes only when slow.
     const SLOW_QUERY_US: u64 = 1_000_000;
     let slow = duration_us >= SLOW_QUERY_US;
+    let success = failure.is_none();
     if success && !slow {
         return;
     }
@@ -1020,8 +1083,19 @@ fn record_statement_latency(metrics: Option<&crate::database::ScanMetrics>, quer
             )
         };
     }
-    if !success {
-        statement_event!(warn, "pgwire.failed_statement", "PostgreSQL statement failed");
+    if let Some(error) = failure {
+        warn!(
+            event = "pgwire.failed_statement",
+            failure.class = stream_failure_class(error),
+            query.class = operation,
+            query.fingerprint = %fingerprint,
+            query.template = %template,
+            query.tables = %tables,
+            project.id = %project_id,
+            protocol,
+            duration_us,
+            "PostgreSQL statement failed"
+        );
     }
     if slow {
         statement_event!(info, "pgwire.slow_statement", "slow PostgreSQL statement", success = success);
@@ -1084,7 +1158,9 @@ impl SimpleQueryHandler for LoggingSimpleQueryHandler {
             query,
             "simple",
             <DfSessionService as SimpleQueryHandler>::do_query(&self.inner, client, query),
-            |responses: Vec<Response>, deadline| responses.into_iter().map(|response| with_response_deadline(response, deadline)).collect(),
+            |responses: Vec<Response>, deadline, context| {
+                responses.into_iter().map(|response| with_response_deadline(response, deadline, context.clone())).collect()
+            },
         )
         .await
     }
@@ -1239,8 +1315,8 @@ pub async fn serve_with_listener(
 #[cfg(test)]
 mod pgwire_handlers_tests {
     use super::{
-        parse_delta_actions, parse_delta_history, parse_delta_recovery_audit, parse_flush, parse_handoff, parse_optimize, parse_vacuum, query_dimensions,
-        query_fingerprint, query_template, rewrite_pg_synonyms, with_response_deadline,
+        StreamFailureContext, parse_delta_actions, parse_delta_history, parse_delta_recovery_audit, parse_flush, parse_handoff, parse_optimize, parse_vacuum,
+        query_dimensions, query_fingerprint, query_template, rewrite_pg_synonyms, with_response_deadline,
     };
     use datafusion_postgres::pgwire::{
         api::results::{QueryResponse, Response},
@@ -1261,19 +1337,21 @@ mod pgwire_handlers_tests {
             Err::<DataRow, _>(crate::server::pg_compat::statement_timeout_error())
         });
         let deadline = Some(tokio::time::Instant::now() + Duration::from_millis(1));
-        let Response::Query(mut response) = with_response_deadline(Response::Query(QueryResponse::new(Arc::new(vec![]), rows)), deadline) else {
+        let context = StreamFailureContext::new("SELECT pg_sleep(1)", "simple", Some(Duration::from_millis(1)), std::time::Instant::now());
+        let Response::Query(mut response) = with_response_deadline(Response::Query(QueryResponse::new(Arc::new(vec![]), rows)), deadline, context) else {
             panic!("expected query response");
         };
         assert!(matches!(response.data_rows.next().await, Some(Err(PgWireError::UserError(_)))));
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn late_stream_failures_keep_scrubbed_query_context() -> anyhow::Result<()> {
-        use tracing::instrument::WithSubscriber;
-
         let log = tempfile::NamedTempFile::new()?;
         let subscriber = tracing_subscriber::fmt().without_time().with_ansi(false).with_writer(std::sync::Mutex::new(log.reopen()?)).finish();
-        async {
+        {
+            // A thread-local default plus the current-thread runtime makes the
+            // capture independent of other tests installing tracing dispatchers.
+            let _subscriber = tracing::subscriber::set_default(subscriber);
             for (case, deadline, fails, stalls) in [
                 ("error", false, true, false),
                 ("bounded_error", true, true, false),
@@ -1294,11 +1372,15 @@ mod pgwire_handlers_tests {
                     .boxed()
                 };
                 let span = tracing::info_span!("query_context", case, query.text = tracing::field::Empty);
-                super::record_query_span(&span, "SELECT 'private-literal-canary' AS value");
+                let query = "SELECT 'private-literal-canary' AS value FROM otel_logs_and_spans";
+                super::record_query_span(&span, query);
+                let timeout = deadline.then_some(Duration::from_secs(1));
+                let context = StreamFailureContext::new(query, "extended", timeout, std::time::Instant::now());
                 let response = span.in_scope(|| {
                     with_response_deadline(
                         Response::Query(QueryResponse::new(Arc::new(vec![]), rows)),
-                        deadline.then(|| tokio::time::Instant::now() + Duration::from_secs(1)),
+                        timeout.map(|timeout| tokio::time::Instant::now() + timeout),
+                        context,
                     )
                 });
                 drop(span);
@@ -1306,14 +1388,40 @@ mod pgwire_handlers_tests {
                 assert_eq!(response.data_rows.next().await.unwrap().is_err(), fails, "{case}");
                 assert!(response.data_rows.next().await.is_none(), "{case}");
             }
+            let failure = crate::server::pg_compat::statement_timeout_error();
+            super::record_statement_latency(None, "SELECT 'private-literal-canary' FROM otel_logs_and_spans", "simple", 10, Some(&failure));
         }
-        .with_subscriber(subscriber)
-        .await;
         let output = std::fs::read_to_string(log.path())?;
         let failures: Vec<_> = output.lines().filter(|line| line.contains("pgwire.stream_failed")).collect();
         assert_eq!(failures.len(), 3, "late failures must be attributed: {output}");
-        assert!(failures.iter().all(|line| line.contains("query_context") && line.contains("query.text")));
+        assert!(failures.iter().all(|line| {
+            line.contains("query_context")
+                && line.contains("query.text")
+                && line.contains("query.fingerprint")
+                && line.contains("query.template")
+                && line.contains("query.tables=otel_logs_and_spans")
+                && line.contains("protocol=\"extended\"")
+        }));
+        assert_eq!(failures.iter().filter(|line| line.contains("failure.class=\"resource\"")).count(), 2, "resource failures must be classified: {output}");
+        assert_eq!(
+            failures.iter().filter(|line| line.contains("failure.class=\"statement_timeout\"")).count(),
+            1,
+            "stream timeout must be classified: {output}"
+        );
+        assert_eq!(
+            failures.iter().filter(|line| line.contains("deadline_ms=Some(1000)")).count(),
+            2,
+            "bounded failures must carry the effective deadline: {output}"
+        );
         assert_eq!(failures.iter().filter(|line| line.contains("sort reservation detail")).count(), 2, "resource cause must stay on the event line: {output}");
+        let failed_statement = output.lines().find(|line| line.contains("pgwire.failed_statement")).expect("pre-stream failure event");
+        assert!(
+            failed_statement.contains("failure.class=\"statement_timeout\"")
+                && failed_statement.contains("query.fingerprint")
+                && failed_statement.contains("query.template")
+                && failed_statement.contains("protocol=\"simple\""),
+            "pre-stream failure must carry the same attribution: {failed_statement}"
+        );
         assert!(!output.contains("private-literal-canary"));
         Ok(())
     }
