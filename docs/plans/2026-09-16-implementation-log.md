@@ -7,12 +7,13 @@ This log records execution against [the next-days work plan](2026-09-16-next-day
 | Plan items | State | Evidence and next action |
 | --- | --- | --- |
 | 01 | Investigated | Current `pgwire.stream_failed` events are dominated by the issue event-sample query and the endpoint auto-ack query. The former uses `? = ANY(hashes) ORDER BY timestamp DESC LIMIT 1`; the latter expands matching hashes into hourly groups. Recover the post-change fingerprint counts and physical plans before changing admission. |
-| 02 | Implemented locally | Late row-stream failures now carry a normalized fingerprint and template, table and project dimensions, protocol, effective deadline, duration, and failure class. The existing failure counter remains the aggregate signal. A controlled timeout/resource test covers the event. |
+| 02 | Deployed and verified | Late row-stream failures now carry a normalized fingerprint and template, table and project dimensions, protocol, effective deadline, duration, and failure class. The existing failure counter remains the aggregate signal. A controlled timeout/resource test covers the event, and production emitted the fields after deployment. |
 | 03 | Audited, no policy change | Admission wraps unbounded `SortExec` only. Bounded TopK, hash aggregate, and hash join plans bypass it. Production recorded 8,559 admissions, zero queued queries, and zero queue timeouts. This does not justify gating every join or aggregate. |
 | 11–12 | Baseline captured | The pre-deploy process was 3.91 hours old and matched the deployment receipt for commit `a2e69c59`. Selected runtime evidence is below. A complete sanitized CapRover environment record remains open. |
 | 25–29 | Blocked on product semantics | The proposed sessions additions were removed from the deploy candidate. They collided with a dimension name, lacked legacy-cell refusal, omitted the real `browserScope`, changed latest-page to first-page semantics, and dropped URL and resource-UA fallbacks. |
 | 40 | Remediated and measuring | The 600 GiB Foyer cache was physically allocated on the 1.8 TiB durable RAID1 volume, which had reached 95% use. It now has a nested bind mount on the 3.5 TiB ephemeral RAID0 scratch volume. The old cache was removed only after recovery and a clean readiness soak. |
 | 43–44 | Deferred | No v4 canary or maintenance offload was attempted. Their measurement and architecture gates remain unmet. |
+| 46 | App identity guarded | The deploy client rejects any `CAPROVER_APP` other than `timefusion`, then proves the opaque app token belongs to that app before `HANDOFF`. The disabled TimeFusion token was enabled and both GitHub deployment secrets were repaired. Read-only verification of replica shape and mounts remains open. |
 
 ## Pre-deploy production baseline
 
@@ -57,6 +58,23 @@ The cache is reconstructible from object storage, so it was moved without changi
 - Deleted the 300 hidden old Foyer backing files from RAID1 after the soak. No WAL or durable table files were removed.
 - RAID1 use fell to 54%, with 778 GB available. The new sparse cache had allocated about 15.4 GB on RAID0 while warming; the scratch filesystem remained 3% used.
 
+After the code deployment and further cache warming, the durable RAID was 50% used with 838 GB available. The ephemeral RAID was 3% used with 3.4 TB available, and Foyer reported 34,122,424,320 L2 bytes in use.
+
+## Production deployment
+
+The merged `c846742a` build is running as the immutable amd64 image `ghcr.io/monoscope-tech/timefusion@sha256:07610d156741471faa94eef4c8dc1b2d1acd81ad0cf90bcc07fcb7a4ac0a2235`.
+
+- Replacement boot: `1789600407094582`.
+- WAL recovery completed in 0 ms.
+- The post-recovery soak passed 55 of 55 probes with no consecutive failures.
+- The shared deployment receipt records this image and boot, and the production lease is clear.
+- The live service retains the nested `/mnt/ephemeral/timefusion-foyer-cache` to `/app/data/timefusion/cache` bind mount.
+- A production resource failure emitted `failure.class`, `query.fingerprint`, `query.template`, `query.tables`, `project.id`, `protocol`, `deadline_ms`, and `duration_us`. The query template contained placeholders instead of literals.
+
+The first local deploy command inherited the web application's CapRover target and submitted the TimeFusion image to `monoscope`. Swarm paused that update before replacing any of its three healthy web tasks. The service was rolled back to `ghcr.io/monoscope-tech/monoscope:1c848e9225ed132d7eece08cb2ef499bdc97f47a`, its CapRover image record was corrected, and it returned to 3/3 replicas before the database app was deployed. This exposed a deployment-safety gap: local deployment credentials need an app-to-service identity check before `HANDOFF` or image submission.
+
+The GitHub deploy failure had a separate credential cause: TimeFusion's app deploy token was disabled while the workflow still carried a stale token. The token was re-enabled, validated against the `timefusion` app, and installed with the explicit app name in GitHub Actions. Enabling it through this CapRover version's full app-definition endpoint reconciled the unchanged service. The replacement boot `1789601305924947` completed WAL recovery in 2 ms, retained the nested Foyer mount, and passed 55 of 55 soak probes. The deploy preflight now uses an empty CapRover upload request: status 1108 proves the token/app pair reached payload validation, which happens before CapRover schedules a build. Its diagnostics persist only the server host, app, verification time, and `token_bound=true`.
+
 ## Query findings
 
 The PostgreSQL parser already rewrites scalar membership into the indexed form. A local live `EXPLAIN` of the issue sample shape produced `array_has(hashes, 'abc')` in the logical and physical filters. Changing `= ANY(hashes)` to another spelling would not fix the timeout.
@@ -82,5 +100,7 @@ Record final results here before push:
 - `cargo fmt --all` and `cargo check --tests`: passed.
 - `cargo test -q late_stream_failures_keep_scrubbed_query_context -- --nocapture`: passed (1 test).
 - `make ci-signoff`: passed `fmt`, `clippy`, `test`, `pg-smoke`, and `e2e`; deployment helper tests and the production image smoke test also passed.
-- Signed candidate: `ghcr.io/monoscope-tech/timefusion@sha256:d8646e00ebfb3a38dde9d877472e37c7e58ee314683687b0f4f96d67a69c148a`.
+- Follow-up deployment guard: `python3 scripts/deploy/test_run.py` passed 10 tests, `python3 scripts/deploy/test_lease.py` passed 6 tests, and `make ci-signoff CHECKS="fmt"` passed while reusing the published image.
+- Signed multi-platform candidate: `ghcr.io/monoscope-tech/timefusion@sha256:d8646e00ebfb3a38dde9d877472e37c7e58ee314683687b0f4f96d67a69c148a`.
+- Deployed amd64 manifest: `ghcr.io/monoscope-tech/timefusion@sha256:07610d156741471faa94eef4c8dc1b2d1acd81ad0cf90bcc07fcb7a4ac0a2235`.
 - GitHub checks not covered locally: none reported by `make ci-status`.

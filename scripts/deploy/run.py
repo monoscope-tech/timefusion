@@ -17,6 +17,7 @@ from lease import DeploymentLease, RECEIPT_REF
 ROOT = Path(__file__).resolve().parents[2]
 CLIENT = 'timefusion-deploy-client:local'
 CREDENTIALS = ('PGURL', 'CAPROVER_SERVER', 'CAPROVER_APP', 'CAPROVER_TOKEN')
+EXPECTED_APP = 'timefusion'
 LIMITS = {'MAX_WAL_RECOVERY_MS': '5000', 'MAX_READY_WAIT_SECS': '10', 'RECOVERY_WAIT_SECS': '720',
           'SOAK_SECS': '120', 'PROBE_INTERVAL_SECS': '2', 'MAX_CONSECUTIVE_FAILURES': '2'}
 
@@ -27,6 +28,19 @@ def execute(*args, **kwargs):
 
 def output(*args):
     return execute(*args, stdout=subprocess.PIPE, text=True).stdout.strip()
+
+
+def deployment_target_error(app):
+    if app != EXPECTED_APP:
+        return f'Deployment target must be {EXPECTED_APP!r}, got {app!r}'
+    return None
+
+
+def prepare_handoff(stage, guard):
+    """Prove the remote app identity before announcing or fencing a mutation."""
+    stage('preflight')
+    guard.submitted()
+    return stage('prepare')
 
 
 # Paths deploy.yml refuses to deploy for, because they cannot change the image.
@@ -63,6 +77,9 @@ def main():
     missing = [name for name in CREDENTIALS if not os.environ.get(name)]
     if missing:
         parser.error('Deployment credentials are required: ' + ', '.join(missing))
+    target_error = deployment_target_error(os.environ['CAPROVER_APP'])
+    if target_error:
+        parser.error(target_error)
     local = args.mode == 'local'
     if local:
         if output('git', 'status', '--porcelain'):
@@ -131,8 +148,7 @@ def main():
             return
         # HANDOFF itself can fence writes. Retain ownership from the first
         # production mutation, including interruption before CapRover submission.
-        guard.submitted()
-        handoff = stage('prepare')
+        handoff = prepare_handoff(stage, guard)
         previous = stage('record-boot')
         values.update(PREVIOUS_BOOT_MICROS=previous['boot_micros'],
                       LAST_OLD_RESPONSE_EPOCH_MS=previous['last_old_response_epoch_ms'],
