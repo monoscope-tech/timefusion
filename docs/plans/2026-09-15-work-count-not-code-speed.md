@@ -258,3 +258,13 @@ COALESCE shape sets once and suppresses thereafter — run-twice case (3, 0)).
 Next measurement, needs hours of post-retraction history: `wave_commit`
 commit/row rate from the lane tags, to size what remains for the wave
 planner.
+
+**Wave-churn response: first read INVALID, do not quote.** Post-retraction
+window (09:25–11:00 UTC) shows wave_commit at 360 commits/h / 64M rows/h vs
+the pre-retraction 67/h / 7.4M/h — but the pre window was deep night and the
+post window is morning peak, 1.5h after a restart that re-inflates the
+maintenance queue. Diurnal swing + post-restart re-mint dominate any
+retraction effect. The fair instrument: same-hour-of-day windows across days
+(e.g. tomorrow 09:25–11:00 vs today), on a process aged >2h, plus the
+retraction ratio itself (95%, which is the direct proof the input lever
+works). Size wave-planner work only from that comparison.
