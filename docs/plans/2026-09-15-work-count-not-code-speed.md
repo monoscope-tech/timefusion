@@ -247,3 +247,14 @@ dedup/hygiene wave rewriting update-dirtied bins. Not `light_optimize`, not
 the duplicate before the wave ever sees it; expect `wave_commit` volume to
 fall with the flag on. Any packing-policy work should target the wave
 planner, not `select_tail_bin`.
+
+**2026-09-16 midday — retraction verified live.** Deploy `9d30d17f` (default
+retraction, no flag): differenced 314s on the new process — appends 427
+rows/s, **retracted 95.2% of them**. The superseded copies no longer reach
+parquet or the dedup waves; expected net ≈ 20% of flushed rows eliminated
+plus the wave churn they drove. Session/user columns are now mutable, so the
+backfill's TF arm converges instead of tripping the circuit breaker (the
+COALESCE shape sets once and suppresses thereafter — run-twice case (3, 0)).
+Next measurement, needs hours of post-retraction history: `wave_commit`
+commit/row rate from the lane tags, to size what remains for the wave
+planner.
