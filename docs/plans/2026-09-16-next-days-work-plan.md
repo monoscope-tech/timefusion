@@ -15,7 +15,7 @@ Measure the effect of eager retraction before changing the wave planner.
 Prepare the sessions query/spec change and its cost estimate together.
 Keep CPU canaries and larger architecture changes behind measured need.
 
-The list contains 45 items. It is a prioritized backlog, not a promise to finish 45 changes in five days.
+The list contains 46 items. It is a prioritized backlog, not a promise to finish 46 changes in five days.
 Several items end with a measurement or a decision instead of a patch.
 This document does not authorize a deployment, a historical backfill, or an infrastructure change.
 
@@ -505,6 +505,14 @@ Items 43–44 remain later decisions unless the preceding evidence changes their
 - **Done:** future work starts from the corrected state without repeating DV, cache, RAID, or certification investigations unnecessarily.
 - **Dependency:** review of this document. Preserve historical measurements with their original time windows.
 
+#### 46. Bind local deploy credentials to the TimeFusion app identity — P0, TF + Ops
+
+- **Evidence:** the September 17 local rollout accepted valid credentials for the `monoscope` web app and submitted the TimeFusion image there. Swarm paused before replacing its three healthy tasks, and the service was restored to its previous image. The database had already entered `HANDOFF`, extending its write fence until the correct app was deployed.
+- **Work:** make the deploy client verify the selected CapRover app, expected Swarm service, current image repository, replica shape, and required durable/cache mounts before `FLUSH` or `HANDOFF`. Keep the check inside the shared leased path and fail closed before any production mutation.
+- **Deliverable:** a preflight identity record in deployment diagnostics and a regression test proving credentials for another valid app cannot reach handoff or image submission.
+- **Done:** a wrong but valid app token or app name exits before fencing writes, while the normal TimeFusion rollout still records the verified image, boot, recovery, and soak receipt.
+- **Dependency:** none. Keep this independent of the broader deployment-handoff measurement in item 06.
+
 ## 5. Research conclusions to retain
 
 These are design inputs, not promises that another system's measured gains transfer to TimeFusion.
@@ -542,7 +550,7 @@ No recommendation here depends on a newly verified Timescale feature claim.
 
 ## 7. Review decisions
 
-The proposed first tranche is **01–03, 06, 09, and 11–14**, followed by the highest-impact query fix that those measurements identify.
+The proposed first tranche is **46, 01–03, 06, 09, and 11–14**, followed by the highest-impact query fix that those measurements identify.
 The wave-policy candidate waits for 15–16. Sessions implementation waits for the paired design and cost proposal.
 
 Review these choices:
