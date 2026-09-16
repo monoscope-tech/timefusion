@@ -1727,7 +1727,7 @@ impl MemBuffer {
         let updated_keys: std::collections::HashSet<Vec<u8>, ahash::RandomState> = (0..probe.num_rows()).map(|i| probe.row(i).as_ref().to_vec()).collect();
         let stamp_rows = |batch: &RecordBatch| -> Option<arrow::row::Rows> {
             let col = batch.column_by_name(tiebreak)?;
-            RowConverter::new(vec![SortField::new(col.data_type().clone())]).ok()?.convert_columns(&[col.clone()]).ok()
+            RowConverter::new(vec![SortField::new(col.data_type().clone())]).ok()?.convert_columns(std::slice::from_ref(col)).ok()
         };
 
         let mut total_removed = 0usize;

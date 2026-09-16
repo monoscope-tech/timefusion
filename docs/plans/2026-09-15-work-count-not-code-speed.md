@@ -235,3 +235,12 @@ packing churn. Fail-safe by construction (a missed row = status quo).
 Enable = `TIMEFUSION_MOR_EAGER_RETRACT=true` (restarts prod; batch with a
 deploy); verify via `dml.mor_versions_retracted_total` ≈ appended rate, and
 flush WRITE rows/day in the Delta log falling ~20%.
+
+**Lane tags, first reading (2.6h of tagged commits):** the intraday OPTIMIZE
+churn's author is **`wave_commit`** — 174 of 217 commits, 19.3M rows — the
+dedup/hygiene wave rewriting update-dirtied bins. Not `light_optimize`, not
+`optimize_table`. So the churn chain is: hash UPDATE → duplicate version in a
+10-minute bin → dedup wave rewrites the bin (again). Eager retraction removes
+the duplicate before the wave ever sees it; expect `wave_commit` volume to
+fall with the flag on. Any packing-policy work should target the wave
+planner, not `select_tail_bin`.
