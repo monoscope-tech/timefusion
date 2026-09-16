@@ -1,5 +1,10 @@
 # Active plans
 
+## September 16
+
+- [Next-days work plan](2026-09-16-next-days-work-plan.md) — the current ordered backlog derived from production evidence, Monoscope issues, and the work-count research.
+- [Implementation log](2026-09-16-implementation-log.md) — current measurements, implemented work, blockers, and deployment validation.
+
 This directory contains active implementation plans only. It does not contain
 incident reports, production snapshots, or completed handovers.
 
