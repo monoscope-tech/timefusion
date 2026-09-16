@@ -216,3 +216,22 @@ packing trade stays as decided in
 `the_value_floor_lowers_steady_state_write_amplification` (ratio off: fewer
 live files wins while per-file read cost dominates) — re-argue it against the
 lane data, not before.
+
+**2026-09-16 (post-deploy measurement + the hash-update lever).** With the
+counters live (`db085d51` deployed): steady state over a differenced 300s on
+an aged process — ingest 1,316 rows/s, `mor_version_rows_appended` **287
+rows/s = ~22% of ingest**; `suppressed` = 0 (surviving updates genuinely
+change values — the hash appends themselves, already guarded upstream). So
+the hash-update lane is ~1/5 of all flushed rows, each a full wide row that
+intraday packing re-collapses.
+
+The economics fix, shipped dark (`6a3a0144`): **eager retraction** — hash
+updates land seconds after ingest, so the superseded row version is almost
+always still in the MemBuffer; after the stamped append, a keep-greatest
+sweep of the appended keys' own buckets removes the older copy, and the
+flush writes ONE row instead of two. Expected effect at the measured rate:
+~22% fewer flushed rows into today's partition and proportionally less
+packing churn. Fail-safe by construction (a missed row = status quo).
+Enable = `TIMEFUSION_MOR_EAGER_RETRACT=true` (restarts prod; batch with a
+deploy); verify via `dml.mor_versions_retracted_total` ≈ appended rate, and
+flush WRITE rows/day in the Delta log falling ~20%.
