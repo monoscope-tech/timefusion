@@ -878,6 +878,10 @@ atomic_stats! {
         /// UPDATEs whose SET reduced to identity (the planner drops `x = x`),
         /// answered without scanning or appending anything.
         mor_noop_statements_skipped as "mor_noop_statements_skipped_total",
+        /// Buffered older versions eagerly dropped after a version append
+        /// (`timefusion_mor_eager_retract`), each one a row the flush no
+        /// longer writes and packing no longer re-collapses.
+        mor_versions_retracted as "mor_versions_retracted_total",
     }
 }
 

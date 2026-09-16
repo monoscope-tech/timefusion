@@ -947,6 +947,8 @@ async fn perform_version_append(
     let mut stream = datafusion::physical_plan::execute_stream(physical, session.task_ctx())?;
     let mut rows = 0u64;
     let mut suppressed = 0u64;
+    let mut retracted = 0u64;
+    let retract_enabled = !tombstone && database.config().buffer.timefusion_mor_eager_retract;
     while let Some(batch) = stream.next().await {
         let mut batch = batch?;
         if changed.is_some() && batch.num_columns() > 0 {
@@ -968,14 +970,21 @@ async fn perform_version_append(
             l.mark_version_buckets(project_id, table_name, &batches);
         }
         database
-            .insert_records_batch_bounded(project_id, table_name, batches, false, None, false)
+            .insert_records_batch_bounded(project_id, table_name, batches.clone(), false, None, false)
             .await
             .map_err(|e| DataFusionError::Execution(format!("merge-on-read append failed for {project_id}/{table_name}: {e}")))?;
+        // AFTER the stamped append is in the buffer: drop the buffered rows it
+        // supersedes so the flush writes one copy, not two. Ordering matters —
+        // retracting first would leave a window where a scan sees neither.
+        if retract_enabled && let (Some(l), Some(tb)) = (layer, schema.dedup_tiebreak.as_deref()) {
+            retracted += l.retract_superseded(project_id, table_name, &batches[0], &schema.dedup_keys, tb) as u64;
+        }
     }
     let stats = crate::observability::dml_stats();
     stats.mor_version_rows_appended.fetch_add(rows, std::sync::atomic::Ordering::Relaxed);
     stats.mor_noop_rows_suppressed.fetch_add(suppressed, std::sync::atomic::Ordering::Relaxed);
-    debug!(project_id, table_name, rows, suppressed, tombstone, "merge-on-read version append");
+    stats.mor_versions_retracted.fetch_add(retracted, std::sync::atomic::Ordering::Relaxed);
+    debug!(project_id, table_name, rows, suppressed, retracted, tombstone, "merge-on-read version append");
     Ok(rows)
 }
 

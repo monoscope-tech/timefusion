@@ -1710,6 +1710,82 @@ impl MemBuffer {
         Ok(total_deleted)
     }
 
+    /// Eagerly drop buffered row versions that `appended` supersedes: among
+    /// buffered rows sharing a dedup key with an appended row, keep only the
+    /// greatest `tiebreak` per key (ties keep both) — exactly what read-side
+    /// dedup keeps, applied before the flush so one copy lands in parquet
+    /// instead of two. Only the appended rows' own buckets are touched (a
+    /// version carries its row's ORIGINAL timestamp, so every older copy lives
+    /// in the same bucket). Fail-safe by construction: a missed row flushes
+    /// both copies and read-side dedup collapses them — the status quo.
+    pub fn retract_superseded(&self, project_id: &str, table_name: &str, appended: &RecordBatch, keys: &[String], tiebreak: &str, time_col: &str) -> usize {
+        let Some(table) = self.get_table(project_id, table_name) else { return 0 };
+        let key_cols = |batch: &RecordBatch| keys.iter().map(|k| batch.column_by_name(k).cloned()).collect::<Option<Vec<ArrayRef>>>();
+        let Some(probe_cols) = key_cols(appended) else { return 0 };
+        let Ok(converter) = RowConverter::new(probe_cols.iter().map(|a| SortField::new(a.data_type().clone())).collect()) else { return 0 };
+        let Ok(probe) = converter.convert_columns(&probe_cols) else { return 0 };
+        let updated_keys: std::collections::HashSet<Vec<u8>, ahash::RandomState> = (0..probe.num_rows()).map(|i| probe.row(i).as_ref().to_vec()).collect();
+        let stamp_rows = |batch: &RecordBatch| -> Option<arrow::row::Rows> {
+            let col = batch.column_by_name(tiebreak)?;
+            RowConverter::new(vec![SortField::new(col.data_type().clone())]).ok()?.convert_columns(&[col.clone()]).ok()
+        };
+
+        let mut total_removed = 0usize;
+        let mut total_freed = 0usize;
+        for bucket_id in batch_bucket_ids(appended, time_col) {
+            let Some(bucket) = table.buckets.get(&bucket_id) else { continue };
+            let mut batches = bucket.batches.lock();
+            // Pass 1: greatest stamp per updated key across the bucket.
+            let per_batch: Vec<Option<(arrow::row::Rows, arrow::row::Rows)>> =
+                batches.iter().map(|b| Some((converter.convert_columns(&key_cols(b)?).ok()?, stamp_rows(b)?))).collect();
+            let mut max_stamp: std::collections::HashMap<Vec<u8>, Vec<u8>, ahash::RandomState> = Default::default();
+            for (krows, srows) in per_batch.iter().flatten() {
+                for i in 0..krows.num_rows() {
+                    let k = krows.row(i);
+                    if updated_keys.contains(k.as_ref()) {
+                        let s = srows.row(i);
+                        match max_stamp.get(k.as_ref()) {
+                            Some(m) if s.as_ref() <= m.as_slice() => {}
+                            _ => {
+                                max_stamp.insert(k.as_ref().to_vec(), s.as_ref().to_vec());
+                            }
+                        }
+                    }
+                }
+            }
+            // Pass 2: remove matching rows strictly below their key's winner.
+            let (mut removed, mut freed) = (0usize, 0usize);
+            let new_batches: Vec<RecordBatch> = batches
+                .iter()
+                .zip(&per_batch)
+                .map(|(batch, rows)| {
+                    let Some((krows, srows)) = rows else { return Ok(batch.clone()) };
+                    let keep: BooleanArray = (0..krows.num_rows())
+                        .map(|i| Some(max_stamp.get(krows.row(i).as_ref()).is_none_or(|m| srows.row(i).as_ref() >= m.as_slice())))
+                        .collect();
+                    if keep.false_count() == 0 {
+                        return Ok(batch.clone());
+                    }
+                    let survived = filter_record_batch(batch, &keep)?;
+                    removed += batch.num_rows() - survived.num_rows();
+                    freed += estimate_batch_size(batch).saturating_sub(estimate_batch_size(&survived));
+                    Ok(survived)
+                })
+                .collect::<anyhow::Result<_>>()
+                .unwrap_or_else(|_| batches.clone());
+            if removed > 0 {
+                *batches = new_batches.into_iter().filter(|b| b.num_rows() > 0).collect();
+                bucket.note_dml_mutation(None);
+                bucket.row_count.fetch_sub(removed, Ordering::Relaxed);
+                sub_saturating(&bucket.memory_bytes, freed);
+                total_removed += removed;
+                total_freed += freed;
+            }
+        }
+        sub_saturating(&self.estimated_bytes, total_freed);
+        total_removed
+    }
+
     /// Compile assignment exprs to `(target column index, physical expr)`.
     /// `rewrite` runs after qualifier stripping — identity (`Ok`) for a plain
     /// UPDATE, the `source__` renamer for `UPDATE ... FROM`.
@@ -3120,6 +3196,34 @@ mod tests {
     fn create_multi_row_batch(ids: Vec<i64>, names: Vec<&str>) -> RecordBatch {
         let ts = chrono::Utc::now().timestamp_micros();
         tin_batch(vec![ts; ids.len()], ids, names.into_iter().map(Into::into).collect())
+    }
+
+    /// Keep-greatest applied eagerly: only strictly-older versions of the
+    /// appended keys leave the buffer; other keys and the winner survive.
+    #[test]
+    fn retract_superseded_drops_only_strictly_older_versions_of_updated_keys() {
+        let buffer = MemBuffer::new();
+        let ts = chrono::Utc::now().timestamp_micros();
+        let mk = |ids: Vec<i64>, stamps: Vec<i64>, names: Vec<&str>| -> RecordBatch {
+            RecordBatch::try_new(
+                schema_of([("timestamp", ts_ty(), false), ("id", Int64, false), ("name", Utf8View, false), ("updated_at", ts_ty(), false)]),
+                vec![
+                    Arc::new(TimestampMicrosecondArray::from(vec![ts; ids.len()]).with_timezone("UTC")),
+                    Arc::new(Int64Array::from(ids)),
+                    Arc::new(StringViewArray::from(names)),
+                    Arc::new(TimestampMicrosecondArray::from(stamps).with_timezone("UTC")),
+                ],
+            )
+            .unwrap()
+        };
+        buffer.insert("p", "t", mk(vec![1, 2], vec![10, 10], vec!["k1-old", "k2"]), ts).unwrap();
+        let appended = mk(vec![1], vec![20], vec!["k1-new"]);
+        buffer.insert("p", "t", appended.clone(), ts).unwrap();
+        let keys = vec!["id".to_string(), "timestamp".to_string()];
+        assert_eq!(buffer.retract_superseded("p", "t", &appended, &keys, "updated_at", "timestamp"), 1, "exactly the superseded k1 version leaves");
+        let rows: usize = buffer.query("p", "t", &[]).unwrap().iter().map(|b| b.num_rows()).sum();
+        assert_eq!(rows, 2, "k2 and the k1 winner survive");
+        assert_eq!(buffer.retract_superseded("p", "t", &appended, &keys, "updated_at", "timestamp"), 0, "idempotent once nothing older remains");
     }
 
     /// The (id, name) table every DML case below mutates.

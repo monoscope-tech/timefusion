@@ -300,6 +300,32 @@ mod tests {
         Ok(())
     }
 
+    /// With `timefusion_mor_eager_retract` on, the superseded buffered version
+    /// is dropped right after the append: 3 seeds + 1 new version − 1 retracted
+    /// = 3 raw buffered rows, so the flush writes ONE copy of the updated row.
+    /// (Flag off, the same sequence leaves 4 — flip it to watch this go red.)
+    #[serial]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_update_eagerly_retracts_superseded_buffer_version() -> Result<()> {
+        let mut c = (*test_cfg()).clone();
+        c.buffer.timefusion_mor_eager_retract = true;
+        let cfg = Arc::new(c);
+        let layer = Arc::new(test_layer(Arc::clone(&cfg))?);
+        let db0 = Database::with_config(cfg).await?;
+        let mut ctx = Arc::new(db0.clone()).create_session_context();
+        let db = Arc::new(db0.with_buffered_layer(Arc::clone(&layer)));
+        db.setup_session_context(&mut ctx)?;
+        let batch = json_to_batch(create_test_records(chrono::Utc::now()))?;
+        db.insert_records_batch("test_project", OTEL, vec![batch], false, None).await?;
+
+        let updated = exec_dml(&ctx, "UPDATE otel_logs_and_spans SET hashes = make_array('500') WHERE project_id = 'test_project' AND name = 'Bob'").await?;
+        assert_eq!(updated, 1);
+        let raw: usize = layer.mem_buffer().query("test_project", OTEL, &[])?.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(raw, 3, "the superseded version must leave the buffer alongside the append");
+        assert_eq!(row_by_name(&ctx, OTEL, "Bob").await?.0, 500, "the surviving copy is the updated one");
+        Ok(())
+    }
+
     /// main.rs creates the pgwire SessionContext (and its DmlQueryPlanner) BEFORE
     /// attaching the BufferedWriteLayer, so the layer must be late-binding:
     /// visible to sessions created before it was attached, or the mem-buffer leg

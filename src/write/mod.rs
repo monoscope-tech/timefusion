@@ -1163,6 +1163,11 @@ impl BufferedWriteLayer {
         }
     }
 
+    /// See [`MemBuffer::retract_superseded`].
+    pub fn retract_superseded(&self, project_id: &str, table_name: &str, appended: &RecordBatch, keys: &[String], tiebreak: &str) -> usize {
+        self.mem_buffer.retract_superseded(project_id, table_name, appended, keys, tiebreak, crate::dml::table_time_column(table_name))
+    }
+
     pub async fn insert(&self, project_id: &str, table_name: &str, batches: Vec<RecordBatch>) -> anyhow::Result<()> {
         self.insert_bounded(project_id, table_name, batches, true).await
     }
