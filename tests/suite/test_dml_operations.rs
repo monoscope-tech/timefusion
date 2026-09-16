@@ -326,6 +326,19 @@ mod tests {
         Ok(())
     }
 
+    /// Columns are immutable unless declared `mutable: true`; assigning a real
+    /// value to one must be refused at plan time (read filters on immutable
+    /// columns are pushed below the merge-on-read dedup on that basis).
+    #[serial]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_update_of_immutable_column_is_refused() -> Result<()> {
+        let (_db, ctx) = seeded(OTEL).await?;
+        let err = exec_dml(&ctx, "UPDATE otel_logs_and_spans SET name = 'renamed' WHERE project_id = 'test_project'").await;
+        let msg = format!("{err:?}");
+        assert!(err.is_err() && msg.contains("immutable"), "assigning an immutable column must fail at plan time, got: {msg}");
+        Ok(())
+    }
+
     /// main.rs creates the pgwire SessionContext (and its DmlQueryPlanner) BEFORE
     /// attaching the BufferedWriteLayer, so the layer must be late-binding:
     /// visible to sessions created before it was attached, or the mem-buffer leg
