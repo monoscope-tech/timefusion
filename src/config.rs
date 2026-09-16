@@ -1831,13 +1831,6 @@ pub struct MemoryConfig {
     /// ignores the CFS quota and oversubscribes throttled containers).
     #[serde_inline_default(0)]
     pub timefusion_query_partitions: usize,
-    /// Admit at most `max_concurrent_heavy_sorts` spilling-sort queries against the
-    /// query pool at once; queue the rest with a bounded wait rather than letting
-    /// them race into `Resources exhausted`. Off by default — enabling it changes
-    /// the concurrency behaviour of every heavy pgwire query, so it ships dark and
-    /// is turned on only after the concurrent-connection e2e proves it.
-    #[serde(default)]
-    pub timefusion_heavy_query_admission: bool,
     /// Admission guard for wide-window read scans: a query reaching further back
     /// than `timefusion_wide_scan_lookback_hours` is limited to this many
     /// concurrent Parquet batch-decodes across all queries, bounding decode heap

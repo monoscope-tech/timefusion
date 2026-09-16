@@ -73,9 +73,8 @@ fn contains_spilling_sort(plan: &Arc<dyn ExecutionPlan>) -> bool {
 /// Wrap a heavy plan's root so its execution holds one heavy-query permit.
 ///
 /// Registered ONLY on the pgwire-facing session (never maintenance, which has its
-/// own pool) and only when `timefusion_heavy_query_admission` is on. Runs last so
-/// it wraps the absolute root, whose `execute` the pgwire result reader calls
-/// exactly once.
+/// own pool). Runs last so it wraps the absolute root, whose `execute` the pgwire
+/// result reader calls exactly once.
 #[derive(Debug)]
 pub struct HeavyQueryAdmission;
 
