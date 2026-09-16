@@ -65,6 +65,38 @@ async fn heavy_admission_queues_concurrent_clients_when_on() -> Result<()> {
     Ok(())
 }
 
+/// #304 PRECISION — the gate catches ONLY genuinely unbounded sorts. A bounded list query is
+/// TopK (not gated); an unbounded `ORDER BY` is gated; and — the case that could have made the
+/// gate dangerous — a rollup-MISSED aggregate is NOT gated. One might fear its dedup adds an
+/// unbounded sort (its outer `LIMIT` sits above the `GROUP BY`, so it can't push into the
+/// input), which at a low rollup hit rate would throttle dashboard histograms, not just raw
+/// scans. This test proves it does not: dedup is a bounded `DedupExec` (not a SortExec) and the
+/// GROUP BY is hash-aggregated. `EXPLAIN` over pgwire is the plan #304 actually sees; the local
+/// `ctx.sql` path re-runs optimizer passes the pgwire path skips (CLAUDE.md).
+#[tokio::test(flavor = "multi_thread")]
+async fn the_gate_catches_unbounded_sorts_but_not_bounded_topk() -> Result<()> {
+    async fn explain(client: &tokio_postgres::Client, sql: &str) -> Result<String> {
+        Ok(client.query(&format!("EXPLAIN {sql}"), &[]).await?.iter().map(|r| r.get::<_, String>(1)).collect::<Vec<_>>().join("\n"))
+    }
+    let env = E2eEnv::builder().with_heavy_query_admission().start().await?;
+    seed(&env, 1000).await?;
+    let client = env.pg_client().await?;
+    let base = "FROM otel_logs_and_spans WHERE project_id = 'e2e_project'";
+    let list = explain(&client, &format!("SELECT id, timestamp {base} ORDER BY timestamp DESC LIMIT 251")).await?;
+    let unbounded = explain(&client, &format!("SELECT id, timestamp {base} ORDER BY timestamp")).await?;
+    let agg = explain(&client, &format!("SELECT time_bucket('60 seconds', timestamp) tb, count(*) {base} GROUP BY tb ORDER BY tb DESC LIMIT 500")).await?;
+    let gated = |p: &str| p.contains("AdmissionExec");
+    assert!(gated(&unbounded), "an unbounded ORDER BY (spilling sort) must be gated:\n{unbounded}");
+    assert!(!gated(&list), "a bounded TopK list query must NOT be gated:\n{list}");
+    // The load-bearing precision check: a rollup-MISSED aggregate is NOT gated. Its dedup is
+    // a custom bounded `DedupExec` (consumes pre-sorted parquet — NOT a SortExec), the GROUP
+    // BY is hash-aggregated (`UnorderedAggregateInput`, no sort), and the only sort is the
+    // outer `ORDER BY … LIMIT` TopK (fetch=Some). So even at a low rollup hit rate the gate
+    // does not throttle dashboard histograms — only genuinely unbounded ORDER BY queries.
+    assert!(!gated(&agg), "a rollup-missed aggregate has no unbounded sort (DedupExec, not SortExec) and must NOT be gated:\n{agg}");
+    Ok(())
+}
+
 /// Flag OFF (prod default): the rule is never installed, so the gate is inert —
 /// the counter does not move. This is the falsifiable evidence behind the
 /// "flag off = zero prod behavior change" claim.
