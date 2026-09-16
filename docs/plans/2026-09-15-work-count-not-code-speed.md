@@ -232,9 +232,12 @@ sweep of the appended keys' own buckets removes the older copy, and the
 flush writes ONE row instead of two. Expected effect at the measured rate:
 ~22% fewer flushed rows into today's partition and proportionally less
 packing churn. Fail-safe by construction (a missed row = status quo).
-Enable = `TIMEFUSION_MOR_EAGER_RETRACT=true` (restarts prod; batch with a
-deploy); verify via `dml.mor_versions_retracted_total` ≈ appended rate, and
-flush WRITE rows/day in the Delta log falling ~20%.
+Per the user's ruling (2026-09-16) the flag was deleted and retraction is
+the DEFAULT behavior; verify via `dml.mor_versions_retracted_total` ≈
+appended rate, and flush WRITE rows/day in the Delta log falling ~20%. The
+same ruling made the five session/user columns `mutable: true` — enrichment
+arrives after the span, so the backfill's TF arm now converges instead of
+being rejected into monoscope's circuit breaker.
 
 **Lane tags, first reading (2.6h of tagged commits):** the intraday OPTIMIZE
 churn's author is **`wave_commit`** — 174 of 217 commits, 19.3M rows — the

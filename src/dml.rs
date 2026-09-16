@@ -948,7 +948,6 @@ async fn perform_version_append(
     let mut rows = 0u64;
     let mut suppressed = 0u64;
     let mut retracted = 0u64;
-    let retract_enabled = !tombstone && database.config().buffer.timefusion_mor_eager_retract;
     while let Some(batch) = stream.next().await {
         let mut batch = batch?;
         if changed.is_some() && batch.num_columns() > 0 {
@@ -976,7 +975,7 @@ async fn perform_version_append(
         // AFTER the stamped append is in the buffer: drop the buffered rows it
         // supersedes so the flush writes one copy, not two. Ordering matters —
         // retracting first would leave a window where a scan sees neither.
-        if retract_enabled && let (Some(l), Some(tb)) = (layer, schema.dedup_tiebreak.as_deref()) {
+        if !tombstone && let (Some(l), Some(tb)) = (layer, schema.dedup_tiebreak.as_deref()) {
             retracted += l.retract_superseded(project_id, table_name, &batches[0], &schema.dedup_keys, tb) as u64;
         }
     }

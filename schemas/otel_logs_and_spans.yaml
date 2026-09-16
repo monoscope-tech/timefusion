@@ -288,6 +288,10 @@ fields:
     data_type: Utf8
     nullable: true
     bloom_filter: true
+    # Session/user enrichment arrives AFTER the span (the backfill sweep fills
+    # sibling spans of a trace), so these five columns are legitimately updated
+    # post-ingest. Mutable ⇒ filters on them stay above the merge-on-read dedup.
+    mutable: true
   - name: attributes___session___previous___id
     data_type: Utf8
     nullable: true
@@ -320,15 +324,19 @@ fields:
     data_type: Utf8
     nullable: true
     bloom_filter: true
+    mutable: true
   - name: attributes___user___email
     data_type: Utf8
     nullable: true
+    mutable: true
   - name: attributes___user___full_name
     data_type: Utf8
     nullable: true
+    mutable: true
   - name: attributes___user___name
     data_type: Utf8
     nullable: true
+    mutable: true
   - name: attributes___user___hash
     data_type: Utf8
     nullable: true

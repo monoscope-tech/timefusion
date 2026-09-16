@@ -238,6 +238,12 @@ mod tests {
     #[test_case(
         "UPDATE otel_logs_and_spans SET duration = duration WHERE project_id = 'test_project'"
         => (0, 0) ; "test_update_identity_assignment_appends_no_version")]
+    // Session/user enrichment arrives after the span, so those columns are
+    // mutable; the backfill's COALESCE shape sets them once and every later
+    // pass is a suppressed no-op instead of a fresh row version.
+    #[test_case(
+        "UPDATE otel_logs_and_spans SET attributes___session___id = COALESCE(attributes___session___id, 'sess-1') WHERE project_id = 'test_project'"
+        => (3, 0) ; "test_update_session_backfill_shape_sets_once_then_noops")]
     #[serial]
     #[tokio::test(flavor = "multi_thread")]
     async fn update_from_run_twice(sql_template: &'static str) -> (u64, u64) {
@@ -300,16 +306,14 @@ mod tests {
         Ok(())
     }
 
-    /// With `timefusion_mor_eager_retract` on, the superseded buffered version
-    /// is dropped right after the append: 3 seeds + 1 new version − 1 retracted
-    /// = 3 raw buffered rows, so the flush writes ONE copy of the updated row.
-    /// (Flag off, the same sequence leaves 4 — flip it to watch this go red.)
+    /// The superseded buffered version is dropped right after the append:
+    /// 3 seeds + 1 new version − 1 retracted = 3 raw buffered rows, so the
+    /// flush writes ONE copy of the updated row. (Skipping the retraction
+    /// leaves 4 — that is the red state this guard was proven against.)
     #[serial]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_update_eagerly_retracts_superseded_buffer_version() -> Result<()> {
-        let mut c = (*test_cfg()).clone();
-        c.buffer.timefusion_mor_eager_retract = true;
-        let cfg = Arc::new(c);
+        let cfg = test_cfg();
         let layer = Arc::new(test_layer(Arc::clone(&cfg))?);
         let db0 = Database::with_config(cfg).await?;
         let mut ctx = Arc::new(db0.clone()).create_session_context();

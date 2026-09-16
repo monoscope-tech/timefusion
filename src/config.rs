@@ -1106,13 +1106,6 @@ pub struct BufferConfig {
     /// on a DIRTY boot, so `wal.landed_skips` reading 0 is dormancy, not failure.
     #[serde_inline_default(true)]
     pub timefusion_landed_skip_enabled: bool,
-    /// After a merge-on-read UPDATE appends its new row versions, eagerly drop
-    /// the superseded older versions still sitting in the MemBuffer (exactly
-    /// what read-side dedup would drop), so the flush writes one copy instead
-    /// of two. Fail-safe: any row this misses just flushes both copies — the
-    /// status quo. Watch `dml.mor_versions_retracted_total`.
-    #[serde_inline_default(false)]
-    pub timefusion_mor_eager_retract: bool,
 }
 
 /// WAL durability mode. See `d_wal_fsync_mode` for the env-var encoding.
