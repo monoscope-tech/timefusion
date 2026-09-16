@@ -5,9 +5,8 @@
 //! completes with the full result, the gate admits each heavy query EXACTLY
 //! once, and at least one waited for a slot. This exercises the real pgwire
 //! session path — the wiring the unit tests (which use a one-partition
-//! `EmptyExec`) cannot see: that the rule is registered only when the flag is
-//! on, wraps the true root, and acquires one permit per query, not per
-//! partition.
+//! `EmptyExec`) cannot see: that the rule is registered on the pgwire session,
+//! wraps the true root, and acquires one permit per query, not per partition.
 
 use anyhow::Result;
 use futures::future::try_join_all;
@@ -42,12 +41,12 @@ async fn fire_all(env: &E2eEnv) -> Result<Vec<usize>> {
     .await
 }
 
-/// Flag ON: 16 clients, K∈{4,8} (pool-derived, floored at 4) < 16, so most queue.
+/// 16 clients, K∈{4,8} (pool-derived, floored at 4) < 16, so most queue.
 /// All complete; admitted moves by exactly 16; at least one waited.
 #[tokio::test(flavor = "multi_thread")]
-async fn heavy_admission_queues_concurrent_clients_when_on() -> Result<()> {
+async fn heavy_admission_queues_concurrent_clients() -> Result<()> {
     init_local_metrics_for_test();
-    let env = E2eEnv::builder().with_heavy_query_admission().start().await?;
+    let env = E2eEnv::builder().start().await?;
     let n = seed(&env, 1000).await?;
 
     let admitted0 = counter_value(scan_metric_names::HEAVY_QUERY_ADMITTED);
@@ -78,7 +77,7 @@ async fn the_gate_catches_unbounded_sorts_but_not_bounded_topk() -> Result<()> {
     async fn explain(client: &tokio_postgres::Client, sql: &str) -> Result<String> {
         Ok(client.query(&format!("EXPLAIN {sql}"), &[]).await?.iter().map(|r| r.get::<_, String>(1)).collect::<Vec<_>>().join("\n"))
     }
-    let env = E2eEnv::builder().with_heavy_query_admission().start().await?;
+    let env = E2eEnv::builder().start().await?;
     seed(&env, 1000).await?;
     let client = env.pg_client().await?;
     let base = "FROM otel_logs_and_spans WHERE project_id = 'e2e_project'";
@@ -94,22 +93,5 @@ async fn the_gate_catches_unbounded_sorts_but_not_bounded_topk() -> Result<()> {
     // outer `ORDER BY … LIMIT` TopK (fetch=Some). So even at a low rollup hit rate the gate
     // does not throttle dashboard histograms — only genuinely unbounded ORDER BY queries.
     assert!(!gated(&agg), "a rollup-missed aggregate has no unbounded sort (DedupExec, not SortExec) and must NOT be gated:\n{agg}");
-    Ok(())
-}
-
-/// Flag OFF (prod default): the rule is never installed, so the gate is inert —
-/// the counter does not move. This is the falsifiable evidence behind the
-/// "flag off = zero prod behavior change" claim.
-#[tokio::test(flavor = "multi_thread")]
-async fn heavy_admission_is_inert_when_off() -> Result<()> {
-    init_local_metrics_for_test();
-    let env = E2eEnv::builder().start().await?;
-    let n = seed(&env, 200).await?;
-
-    let admitted0 = counter_value(scan_metric_names::HEAVY_QUERY_ADMITTED);
-    let counts = fire_all(&env).await?;
-
-    assert!(counts.iter().all(|&c| c == n), "all clients still succeed, ungated: {counts:?}");
-    assert_eq!(counter_value(scan_metric_names::HEAVY_QUERY_ADMITTED) - admitted0, 0, "flag off: the admission rule is never registered on the session",);
     Ok(())
 }

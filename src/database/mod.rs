@@ -3276,8 +3276,9 @@ impl Database {
                 // operator reading through an order-erasing coalesce.
                 rules.push(Arc::new(crate::read::optimizers::DedupNeedsOrderedInput));
                 // LAST, on the pgwire session only, so it wraps the absolute root
-                // (executed once) of a heavy plan. Off unless the flag is set.
-                if for_pgwire && self.config.memory.timefusion_heavy_query_admission {
+                // (executed once) of a heavy plan. Internal SQL contexts (maintenance,
+                // rollup) have their own pool and are never gated.
+                if for_pgwire {
                     rules.push(Arc::new(crate::read::admission::HeavyQueryAdmission));
                 }
                 rules.push(instrument_rule);
