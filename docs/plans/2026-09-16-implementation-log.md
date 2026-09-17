@@ -133,6 +133,12 @@ The exact vacuum failure at `2026-09-12T00:16:19.641527Z` could not read one lis
 
 The production logs show convergence rather than retained-log runaway. `otel_logs_and_spans` had a fresh checkpoint at version 606379 and 1,965 contiguous retained JSON versions from 604419 through 606383. `otel_metrics` had a fresh checkpoint at version 196552 and 1,019 contiguous retained JSON versions from 195547 through 196565. This audit supports the current retry and retention behavior; it does not justify shortening retention.
 
+## Open-issue refresh
+
+The September 17 evening refresh found 367 open TimeFusion-service issues, up from the investigation's 356-item snapshot. Ten were created on September 17. Seven are single-occurrence diagnostic SQL mistakes: four parser probes, a PostgreSQL-schema-qualified Monoscope table sent to TimeFusion, a nonexistent `maintenance` column requested from `timefusion_stats`, and another malformed expression. They are evidence for the diagnostic runbook rather than engine feature demand. One additional single occurrence is a bounded heavy-query admission timeout at 02:15 UTC.
+
+The two actionable new issues map exactly to changes already staged. Issue `7b589527-febd-420c-8cd6-60612f546945` is the correlated `UNNEST(e.hashes)` outer-reference physical-plan failure addressed by Monoscope PR #577. Issue `264cdb65-845a-4432-829c-c9389835c060` is the coalesced-flush group receiving no result after the global commit timeout, addressed by TimeFusion PR #316. Each occurred once. Two sort issues updated at 13:52 UTC still report their original single August 2 occurrence; their `updated_at` values do not establish fresh recurrence.
+
 ## Maintenance task-flow accounting
 
 A paired 82-second capture compared live queue snapshots with two durable maintenance-journal snapshots after replaying each captured WAL tail. The live estimated backlog rose from 1,360,809,010,853 to 1,445,949,060,204 bytes, a gain of 85,140,049,351 bytes. The durable subset rose by 121,707,672,877 bytes: 521 active tasks carrying 123,058,426,529 bytes were added, four carrying 1,350,272,860 bytes retired, and one was repriced by -480,792 bytes. Work outside the durable journal fell by 36,567,623,526 bytes. The combined reconciliation residual was zero.
