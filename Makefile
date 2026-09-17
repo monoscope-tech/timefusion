@@ -190,6 +190,7 @@ ci-signoff:
 	./scripts/ci/ci.sh gate || exit $$?; \
 	exit $$result
 	PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-production-image.py
+	PYTHONDONTWRITEBYTECODE=1 python3 scripts/deploy/test_prepare.py
 	PYTHONDONTWRITEBYTECODE=1 python3 scripts/deploy/test_lease.py
 	PYTHONDONTWRITEBYTECODE=1 python3 scripts/deploy/test_run.py
 	python3 scripts/production-image.py signoff
