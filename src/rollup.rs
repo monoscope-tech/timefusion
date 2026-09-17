@@ -957,7 +957,7 @@ pub(crate) fn slice_input_sql(
 /// A bridge for cells written before `TAG_MEASURES` existed. ADD AN ENTRY
 /// whenever a measure is declared on a spec before the cells predating it are
 /// rebuilt; delete the constant once every cell carries the tag.
-const MEASURES_ABSENT_FROM_LEGACY_CELLS: [&str; 2] = ["duration_digest", "service_name_hll"];
+const MEASURES_ABSENT_FROM_LEGACY_CELLS: [&str; 3] = ["duration_digest", "service_name_hll", "sessions_v2_event_count"];
 
 /// Measures refused on EVERY cell, tagged or not, because their stored state is
 /// known empty and a merge over an empty state answers with a NUMBER rather than
@@ -2379,6 +2379,59 @@ mod tests {
         );
         for refused in ["duration", "timestamp DESC"] {
             assert!(matches!(route(refused).await, Err(MissReason::NonDecomposableAggregate)), "`ORDER BY {refused}` must still be refused outright");
+        }
+    }
+
+    /// Literal mergeable core of Monoscope's RUM session-list query. Page and
+    /// user-agent enrichment run separately after this query selects at most
+    /// 200 session ids; keeping those expressions out is what makes the core
+    /// decomposable across hourly cells.
+    #[tokio::test]
+    async fn sessions_v2_routes_the_browser_scoped_client_core() {
+        let state = session().await;
+        let browser = "(resource___telemetry___sdk___language IN ('webjs', 'javascript', 'js') \
+            OR resource___user_agent___original IS NOT NULL \
+            OR name IN ('documentLoad', 'documentFetch') \
+            OR (name LIKE 'Pageview %' OR name = 'documentLoad'))";
+        let core = |scope: &str, error_only: bool| {
+            let error_having = if error_only {
+                "HAVING COUNT(*) FILTER (WHERE status_code = 'ERROR' OR lower(COALESCE(level, '')) = 'error' OR attributes___exception___type IS NOT NULL) > 0"
+            } else {
+                ""
+            };
+            format!(
+                "SELECT attributes___session___id, \
+                    MIN(timestamp), MAX(timestamp), COUNT(*), \
+                    COUNT(*) FILTER (WHERE status_code = 'ERROR' OR lower(COALESCE(level, '')) = 'error' OR attributes___exception___type IS NOT NULL), \
+                    COUNT(*) FILTER (WHERE name LIKE 'Pageview %' OR name = 'documentLoad'), \
+                    MAX(attributes___user___id), MAX(attributes___user___full_name), MAX(attributes___user___email), \
+                    MAX(resource___service___name) \
+                 FROM {SOURCE} \
+                 WHERE project_id = 'project' \
+                   AND timestamp >= to_timestamp_micros(0) AND timestamp < to_timestamp_micros(86400000000) \
+                   AND {browser} \
+                   AND attributes___session___id IS NOT NULL AND attributes___session___id <> '' \
+                   {scope} \
+                 GROUP BY attributes___session___id {error_having} \
+                 ORDER BY MAX(timestamp) DESC LIMIT 200"
+            )
+        };
+
+        for (scope, error_only) in [
+            ("", false),
+            ("AND resource___deployment___environment___name = 'prod'", false),
+            ("AND resource___service___name = 'storefront'", false),
+            ("AND resource___deployment___environment___name = 'prod' AND resource___service___name = 'storefront'", true),
+        ] {
+            let sql = core(scope, error_only);
+            let route = route_for(&state, &sql)
+                .await
+                .unwrap_or_else(|reason| panic!("sessions v2 must accept the literal client core ({scope}, error_only={error_only}): {reason:?}\n{sql}"))
+                .expect("sessions v2 must provide a route");
+            assert!(route.target.ends_with("_sessions_1h_v2"), "v1 cannot satisfy the browser-scoped client contract: {}", route.target);
+            assert!(!route.measures_available(None), "a tagless v2 cell must fail closed");
+            let stored = route.needed_measure_columns().map(str::to_owned).collect();
+            assert!(route.measures_available(Some(&stored)), "a cell tagged with every required v2 state must serve");
         }
     }
 

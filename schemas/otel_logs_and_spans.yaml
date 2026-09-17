@@ -634,3 +634,71 @@ rollups:
       - { name: user_id, agg: max, column: attributes___user___id }
       - { name: user_full_name, agg: max, column: attributes___user___full_name }
       - { name: user_email, agg: max, column: attributes___user___email }
+
+  # The production RUM session list cannot use v1: it scopes rows to browser
+  # telemetry, permits environment/service filters, and displays a service MAX.
+  # Keep this as a new physical tier so no v1 cell can be mistaken for the new
+  # semantics. Latest-page and user-agent values deliberately stay in a bounded
+  # raw lookup over the selected session ids; their current expressions are not
+  # mergeable stored measures.
+  - grain: 1h
+    name: sessions_1h_v2
+    dimensions:
+      [
+        attributes___session___id,
+        resource___deployment___environment___name,
+        resource___service___name,
+      ]
+    measures:
+      - {
+          # Unique to v2 so a tagless cell can never claim this contract.
+          name: sessions_v2_event_count,
+          agg: count,
+          filter: "resource___telemetry___sdk___language IN ('webjs', 'javascript', 'js') OR resource___user_agent___original IS NOT NULL OR name IN ('documentLoad', 'documentFetch') OR name LIKE 'Pageview %' OR name = 'documentLoad'",
+        }
+      - {
+          name: error_count,
+          agg: count,
+          filter: "(resource___telemetry___sdk___language IN ('webjs', 'javascript', 'js') OR resource___user_agent___original IS NOT NULL OR name IN ('documentLoad', 'documentFetch') OR name LIKE 'Pageview %' OR name = 'documentLoad') AND (status_code = 'ERROR' OR lower(coalesce(level, '')) = 'error' OR attributes___exception___type IS NOT NULL)",
+        }
+      - {
+          name: pageview_count,
+          agg: count,
+          filter: "(resource___telemetry___sdk___language IN ('webjs', 'javascript', 'js') OR resource___user_agent___original IS NOT NULL OR name IN ('documentLoad', 'documentFetch') OR name LIKE 'Pageview %' OR name = 'documentLoad') AND (name LIKE 'Pageview %' OR name = 'documentLoad')",
+        }
+      - {
+          name: first_seen,
+          agg: min,
+          column: timestamp,
+          filter: "resource___telemetry___sdk___language IN ('webjs', 'javascript', 'js') OR resource___user_agent___original IS NOT NULL OR name IN ('documentLoad', 'documentFetch') OR name LIKE 'Pageview %' OR name = 'documentLoad'",
+        }
+      - {
+          name: last_seen,
+          agg: max,
+          column: timestamp,
+          filter: "resource___telemetry___sdk___language IN ('webjs', 'javascript', 'js') OR resource___user_agent___original IS NOT NULL OR name IN ('documentLoad', 'documentFetch') OR name LIKE 'Pageview %' OR name = 'documentLoad'",
+        }
+      - {
+          name: user_id,
+          agg: max,
+          column: attributes___user___id,
+          filter: "resource___telemetry___sdk___language IN ('webjs', 'javascript', 'js') OR resource___user_agent___original IS NOT NULL OR name IN ('documentLoad', 'documentFetch') OR name LIKE 'Pageview %' OR name = 'documentLoad'",
+        }
+      - {
+          name: user_full_name,
+          agg: max,
+          column: attributes___user___full_name,
+          filter: "resource___telemetry___sdk___language IN ('webjs', 'javascript', 'js') OR resource___user_agent___original IS NOT NULL OR name IN ('documentLoad', 'documentFetch') OR name LIKE 'Pageview %' OR name = 'documentLoad'",
+        }
+      - {
+          name: user_email,
+          agg: max,
+          column: attributes___user___email,
+          filter: "resource___telemetry___sdk___language IN ('webjs', 'javascript', 'js') OR resource___user_agent___original IS NOT NULL OR name IN ('documentLoad', 'documentFetch') OR name LIKE 'Pageview %' OR name = 'documentLoad'",
+        }
+      - {
+          name: session_service,
+          agg: max,
+          column: resource___service___name,
+          filter: "resource___telemetry___sdk___language IN ('webjs', 'javascript', 'js') OR resource___user_agent___original IS NOT NULL OR name IN ('documentLoad', 'documentFetch') OR name LIKE 'Pageview %' OR name = 'documentLoad'",
+        }
