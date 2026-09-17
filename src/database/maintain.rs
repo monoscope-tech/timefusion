@@ -6162,7 +6162,7 @@ impl Database {
         let batch_size = batch_rows_for(decoded_in, rows_in, self.config.maintenance.timefusion_maintenance_batch_target_bytes).to_string();
         // Emitted BEFORE the rewrite, because the interesting bins are the ones
         // that never reach `wave_bin_staged`.
-        info!(table_name, project_id, selected_files = targets.len(), bytes_in, permit_wait_ms, event = "wave_bin_staging_started");
+        info!(table_name, project_id, ?pass, selected_files = targets.len(), rows_in, bytes_in, permit_wait_ms, event = "wave_bin_staging_started");
         let stage_store = staging_table.log_store().object_store(None);
         let mut adds: Vec<Action> = Vec::new();
         // Hoisted out of the staging block so the StagedBin below can carry
@@ -6443,11 +6443,32 @@ impl Database {
         // snapshot-isolation downgrade applies and concurrent ingest appends
         // can't veto the wave.
         let (removes, adds) = staged_actions(&targets, adds, false);
+        let output_files = adds.len();
+        let bytes_out: i64 = adds
+            .iter()
+            .filter_map(|action| match action {
+                Action::Add(add) => Some(add.size),
+                _ => None,
+            })
+            .sum();
+        let rows_out: u64 = adds
+            .iter()
+            .filter_map(|action| match action {
+                deltalake::kernel::Action::Add(add) => add_row_count(add),
+                _ => None,
+            })
+            .sum();
         info!(
             table_name,
             project_id,
+            ?pass,
+            wave_id,
             selected_files = targets.len(),
+            rows_in,
             bytes_in,
+            output_files,
+            rows_out,
+            bytes_out,
             staging_ms = stage_started.elapsed().as_millis() as u64,
             permit_wait_ms,
             event = "wave_bin_staged"
@@ -6756,6 +6777,33 @@ impl Database {
     fn record_wave_landed(&self, landed: &[StagedBin], data_change: bool, table_name: &str) {
         use std::sync::atomic::Ordering::Relaxed;
         let stats = crate::observability::maintenance_stats();
+        let rows_out: u64 = landed
+            .iter()
+            .flat_map(|bin| &bin.adds)
+            .filter_map(|action| match action {
+                deltalake::kernel::Action::Add(add) => add_row_count(add),
+                _ => None,
+            })
+            .sum();
+        let bytes_out: i64 = landed
+            .iter()
+            .flat_map(|bin| &bin.adds)
+            .filter_map(|action| match action {
+                deltalake::kernel::Action::Add(add) => Some(add.size),
+                _ => None,
+            })
+            .sum();
+        info!(
+            table_name,
+            data_change,
+            bins = landed.len(),
+            wave_ids = ?landed.iter().map(|bin| bin.wave_id.as_str()).collect::<Vec<_>>(),
+            rows_in = landed.iter().flat_map(|bin| &bin.targets).filter_map(add_row_count).sum::<u64>(),
+            bytes_in = landed.iter().flat_map(|bin| &bin.targets).map(|add| add.size).sum::<i64>(),
+            rows_out,
+            bytes_out,
+            event = "wave_bins_landed"
+        );
         // Marked HERE because this is the single point both landing branches
         // agree the commit is real.
         let schema = schema_or_default(table_name);

@@ -3721,6 +3721,227 @@ fn the_value_floor_lowers_steady_state_write_amplification() {
     assert!(files_both <= files_off * 3, "the pair's file-count trade moved: off {files_off}, both {files_both} (measured 80 vs 31)");
 }
 
+#[derive(serde::Deserialize)]
+struct PackReplayArrival {
+    commit_ms: i64,
+    project: String,
+    date: String,
+    path: String,
+    size: i64,
+    rows: u64,
+    min_event: i64,
+    max_event: i64,
+    sorted: bool,
+    has_dv: bool,
+}
+
+#[derive(Clone)]
+struct PackReplayFile {
+    add: super::TailAdd,
+    born_ms: i64,
+    depth: u32,
+}
+
+#[derive(serde::Serialize)]
+struct PackReplayResult {
+    size_ratio: i64,
+    output_per_mille: i64,
+    arrivals: usize,
+    input_bytes: i64,
+    input_rows: u64,
+    pack_waves: u64,
+    pack_bins: u64,
+    rewrite_bytes: i64,
+    rewrite_rows: u64,
+    amplification: f64,
+    live_files: usize,
+    max_lineage_depth: u32,
+    p50_fan_in: usize,
+    p95_fan_in: usize,
+    max_fan_in: usize,
+    oldest_live_age_secs: i64,
+    drain_ticks: u64,
+}
+
+fn replay_percentile(values: &mut [usize], percentile: usize) -> usize {
+    if values.is_empty() {
+        return 0;
+    }
+    values.sort_unstable();
+    values[((values.len() - 1) * percentile / 100).min(values.len() - 1)]
+}
+
+/// Read-only production-trace arm for the geometric packing candidate.
+///
+/// Generate a sanitized flush trace with `bench/delta_work_ledger.py
+/// --pack-trace`, set `TIMEFUSION_PACK_REPLAY` to it, then run this ignored
+/// test with `--nocapture`. It calls the real selector at real five-minute
+/// ticks and feeds simulated outputs back, so the comparison exercises resume,
+/// floor, seal, sorted-run, row-cap, and size-ratio behavior together. This is
+/// an isolated arrival-cohort replay: it has no active-file seed at the first
+/// tick, and it grants all 12 rounds without modeling staging duration.
+/// Historical wave outputs are deliberately absent from the trace: inheriting
+/// baseline packing decisions would make the counterfactual meaningless.
+#[test]
+#[ignore = "requires a locally generated production Delta trace"]
+fn replay_post_retraction_pack_trace() {
+    use std::{collections::BTreeMap, io::BufRead};
+
+    const TICK_MS: i64 = 5 * 60 * 1000;
+    const SEAL_LAG_MS: i64 = 15 * 60 * 1000;
+    const MIN_FILES: usize = 5;
+    const VALUE_FLOOR: u64 = 1_000_000;
+    const MAX_WAVES: usize = 12;
+
+    let path = std::env::var("TIMEFUSION_PACK_REPLAY").expect("set TIMEFUSION_PACK_REPLAY to JSONL from delta_work_ledger.py --pack-trace");
+    let file = std::fs::File::open(path).expect("open pack replay trace");
+    let mut arrivals: Vec<PackReplayArrival> =
+        std::io::BufReader::new(file).lines().map(|line| serde_json::from_str(&line.expect("read trace line")).expect("parse trace line")).collect();
+    arrivals.sort_unstable_by_key(|arrival| arrival.commit_ms);
+    assert!(!arrivals.is_empty(), "trace has no flush arrivals");
+
+    let output_scales: Vec<i64> = std::env::var("TIMEFUSION_PACK_REPLAY_OUTPUT_PERMILLE")
+        .unwrap_or_else(|_| "1000".into())
+        .split(',')
+        .map(|part| part.trim().parse().expect("output scale is integer permille"))
+        .collect();
+    let target = super::pack_target_bytes(256 * MB, std::time::Duration::from_secs(240));
+
+    let run = |size_ratio: i64, output_per_mille: i64| {
+        let input_bytes = arrivals.iter().map(|arrival| arrival.size).sum::<i64>();
+        let input_rows = arrivals.iter().map(|arrival| arrival.rows).sum::<u64>();
+        let first_tick = arrivals[0].commit_ms.div_euclid(TICK_MS) * TICK_MS;
+        let last_arrival = arrivals.last().unwrap().commit_ms;
+        let mut groups: BTreeMap<(String, String), Vec<PackReplayFile>> = BTreeMap::new();
+        let (mut cursor, mut tick, mut sequence) = (0usize, first_tick, 0u64);
+        let (mut pack_waves, mut pack_bins, mut rewrite_bytes, mut rewrite_rows, mut drain_ticks) = (0u64, 0u64, 0i64, 0u64, 0u64);
+        let mut fan_ins = Vec::new();
+
+        loop {
+            while cursor < arrivals.len() && arrivals[cursor].commit_ms <= tick {
+                let arrival = &arrivals[cursor];
+                groups.entry((arrival.project.clone(), arrival.date.clone())).or_default().push(PackReplayFile {
+                    add: tail_file(
+                        &arrival.path,
+                        arrival.size,
+                        arrival.sorted,
+                        Some((arrival.min_event, arrival.max_event)),
+                        arrival.has_dv,
+                        Some(arrival.rows),
+                    ),
+                    born_ms: arrival.commit_ms,
+                    depth: 0,
+                });
+                cursor += 1;
+            }
+
+            let seal = (tick - SEAL_LAG_MS).saturating_mul(1000);
+            let pack_date = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(tick).expect("tick is a UTC instant").date_naive().to_string();
+            let mut tick_changed = false;
+            for _ in 0..MAX_WAVES {
+                let mut wave_bins = 0u64;
+                for ((_, date), live) in &mut groups {
+                    // Production Pack selects only today's partition. Repair is
+                    // the separate path that reaches into prior dates.
+                    if date != &pack_date {
+                        continue;
+                    }
+                    let candidates: Vec<_> = live.iter().map(|file| file.add.clone()).collect();
+                    let picked = super::select_tail_bin(&candidates, target, MIN_FILES, target / 2, seal, TailPass::Pack, size_ratio, VALUE_FLOOR);
+                    // This arm measures Pack only. A singleton is today's repair
+                    // gap and belongs in a separate real-I/O repair replay.
+                    if picked.len() < 2 {
+                        continue;
+                    }
+                    let selected: std::collections::HashSet<_> = picked.iter().map(String::as_str).collect();
+                    let mut inputs = Vec::with_capacity(picked.len());
+                    live.retain(|file| {
+                        if selected.contains(file.add.path.as_str()) {
+                            inputs.push(file.clone());
+                            false
+                        } else {
+                            true
+                        }
+                    });
+                    assert_eq!(inputs.len(), picked.len(), "selector returned a path that was not live");
+                    let bytes = inputs.iter().map(|file| file.add.size).sum::<i64>();
+                    let rows = inputs.iter().map(|file| file.add.rows.unwrap_or(0)).sum::<u64>();
+                    let min_event = inputs.iter().filter_map(|file| file.add.event_range.map(|range| range.0)).min().unwrap();
+                    let max_event = inputs.iter().filter_map(|file| file.add.event_range.map(|range| range.1)).max().unwrap();
+                    let born_ms = inputs.iter().map(|file| file.born_ms).min().unwrap();
+                    let depth = inputs.iter().map(|file| file.depth).max().unwrap() + 1;
+                    sequence += 1;
+                    live.push(PackReplayFile {
+                        add: tail_file(
+                            &format!("sim-{sequence}"),
+                            bytes.saturating_mul(output_per_mille) / 1000,
+                            true,
+                            Some((min_event, max_event)),
+                            false,
+                            Some(rows),
+                        ),
+                        born_ms,
+                        depth,
+                    });
+                    rewrite_bytes += bytes;
+                    rewrite_rows += rows;
+                    fan_ins.push(inputs.len());
+                    pack_bins += 1;
+                    wave_bins += 1;
+                }
+                if wave_bins == 0 {
+                    break;
+                }
+                pack_waves += 1;
+                tick_changed = true;
+            }
+
+            if cursor == arrivals.len() {
+                drain_ticks += 1;
+                // Once all events are sealed, a no-work tick is a fixed point:
+                // no new candidate can appear without another arrival.
+                if !tick_changed && tick >= last_arrival + SEAL_LAG_MS {
+                    break;
+                }
+                assert!(drain_ticks <= 288, "replay did not quiesce within 24 hours; candidate manufactured debt");
+            }
+            tick += TICK_MS;
+        }
+
+        let live: Vec<_> = groups.values().flatten().collect();
+        assert_eq!(live.iter().map(|file| file.add.rows.unwrap_or(0)).sum::<u64>(), input_rows, "packing changed the row count");
+        let max_lineage_depth = live.iter().map(|file| file.depth).max().unwrap_or(0);
+        let oldest_live_age_secs = live.iter().map(|file| (tick - file.born_ms) / 1000).max().unwrap_or(0);
+        let mut p50 = fan_ins.clone();
+        let mut p95 = fan_ins.clone();
+        PackReplayResult {
+            size_ratio,
+            output_per_mille,
+            arrivals: arrivals.len(),
+            input_bytes,
+            input_rows,
+            pack_waves,
+            pack_bins,
+            rewrite_bytes,
+            rewrite_rows,
+            amplification: rewrite_bytes as f64 / input_bytes.max(1) as f64,
+            live_files: live.len(),
+            max_lineage_depth,
+            p50_fan_in: replay_percentile(&mut p50, 50),
+            p95_fan_in: replay_percentile(&mut p95, 95),
+            max_fan_in: fan_ins.into_iter().max().unwrap_or(0),
+            oldest_live_age_secs,
+            drain_ticks,
+        }
+    };
+
+    for output_per_mille in output_scales {
+        for size_ratio in [0, 4] {
+            println!("{}", serde_json::to_string(&run(size_ratio, output_per_mille)).unwrap());
+        }
+    }
+}
+
 /// A bin's benefit is FILES removed; its cost is BYTES rewritten. The packer fills to
 /// `target` and stops, so two nearly-converged files are a valid but very expensive bin.
 /// The floor cannot be set from a unit test (it reads the global config), so the
