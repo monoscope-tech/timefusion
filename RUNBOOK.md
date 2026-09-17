@@ -312,15 +312,24 @@ PostgreSQL functions merely to make a diagnostic query portable.
 
 ## Disk capacity
 
-WAL, Foyer cache, and the data dir all live under
-`TIMEFUSION_DATA_DIR`. Plan capacity:
+WAL and Foyer use paths below `TIMEFUSION_DATA_DIR`, but those paths do not
+have to share a filesystem. Production mounts
+`/app/data/timefusion/cache` from ephemeral RAID0 inside the durable data-dir
+mount. Verify the effective mount with the container's mount table and the
+`foyer.cache_dir` row in `timefusion_stats`; do not infer the cache device from
+the parent path.
+
+Plan capacity:
 
 - **WAL**: bounded by retention window × ingest rate. With default
   70-min retention and 10k rows/s × 1KB/row ≈ 42 GB worst case. Set up
   a disk-usage alert at 70% of the volume.
-- **Foyer disk cache**: auto-tuned to 40% of free disk at startup (capped
-  500GB). Will stay within budget — but if disk fills from other sources,
-  Foyer can't evict fast enough; writes may slow.
+- **Foyer disk cache**: auto-tuned to 40% of free disk at startup, capped at
+  500 GB when no explicit size is configured. An explicit
+  `TIMEFUSION_FOYER_DISK_GB` overrides that default; production currently uses
+  600 GiB on ephemeral RAID0. The cache is reconstructible after loss. Keep it
+  off the durable WAL volume, verify free space on its actual mount, and watch
+  the `foyer` runtime rows for the effective directory and budget.
 - **Quarantine** (`${data_dir}/wal/quarantine/`): bounded by corruption
   rate. Typically empty. If non-empty, investigate (corrupt WAL entries
   ≠ ok).
