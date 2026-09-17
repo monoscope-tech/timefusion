@@ -52,13 +52,16 @@ class Run:
     oracle_sha256: str | None = None
     result_equal: bool | None = None
     oracle_comparable: bool = False
-    planned_route: str | None = None
-    oracle_planned_route: str | None = None
+    explain_route_hint: str | None = None
+    attributed_route: str | None = None
+    oracle_explain_route_hint: str | None = None
     ambient_miss_reasons: list[str] | None = None
     ambient_physical_bytes_read_upper_bound: int | None = None
     plan: list[str] | None = None
     oracle_plan: list[str] | None = None
     stats_delta: dict[str, int | float] | None = None
+    planner_ambient_stats_delta: dict[str, int | float] | None = None
+    execution_ambient_stats_delta: dict[str, int | float] | None = None
     error: str | None = None
     stop: str | None = None
 
@@ -136,8 +139,9 @@ def ambient_miss_reasons(delta: dict[str, int | float]) -> list[str]:
     )
 
 
-def planned_route(plan: Iterable[str]) -> str:
-    joined = " ".join(plan).lower()
+def explain_route_hint(plan: Iterable[str]) -> str:
+    plans = list(plan)
+    joined = (plans[-1] if plans else "").lower()
     rollup = bool(re.search(r"\botel_(?:logs_and_spans|metrics)_rollup_[a-z0-9_]+\b", joined))
     raw = bool(re.search(r"\botel_(?:logs_and_spans|metrics)\b", joined))
     if rollup and raw:
@@ -147,6 +151,17 @@ def planned_route(plan: Iterable[str]) -> str:
     if raw:
         return "raw"
     return "unknown"
+
+
+def attributed_route(delta: dict[str, int | float], isolated: bool) -> str | None:
+    if not isolated:
+        return None
+    full = int(delta.get("maintenance.rollup_hits_full_total", 0))
+    hybrid = int(delta.get("maintenance.rollup_hits_hybrid_total", 0))
+    misses = int(delta.get("maintenance.rollup_misses_total", 0))
+    if full + hybrid + misses != 1:
+        return None
+    return "full" if full else "hybrid" if hybrid else "raw"
 
 
 def ambient_physical_bytes(delta: dict[str, int | float]) -> int | None:
@@ -166,19 +181,19 @@ def stop_reason(run: Run, scan_budget: int) -> str | None:
         return "oracle_mismatch"
     if run.ambient_physical_bytes_read_upper_bound is not None and run.ambient_physical_bytes_read_upper_bound > scan_budget:
         return "ambient_scan_budget_exceeded"
-    if run.window in LONG_WINDOWS and run.planned_route not in {"full", "hybrid"}:
+    if run.window in LONG_WINDOWS and run.attributed_route not in {"full", "hybrid"}:
         return "long_window_route_unproven"
     return None
 
 
 def explain(cursor: psycopg.Cursor[Any], sql: str, params: dict[str, Any]) -> list[str]:
     cursor.execute("EXPLAIN " + sql, params)
-    return [str(row[0]) for row in cursor.fetchall()]
+    return [str(row[0] if len(row) == 1 else row[1]) for row in cursor.fetchall()]
 
 
 def execute_once(
     cursor: psycopg.Cursor[Any], oracle: psycopg.Cursor[Any] | None, query: dict[str, Any], window: str, period: str,
-    iteration: str, start: datetime, end: datetime, expected_boot: str, scan_budget: int,
+    iteration: str, start: datetime, end: datetime, expected_boot: str, scan_budget: int, isolated: bool,
 ) -> Run:
     executed_at = datetime.now(timezone.utc)
     run = Run(
@@ -188,10 +203,11 @@ def execute_once(
     params = {**query.get("params", {}), "project_id": query["project_id"], "start": start, "end": end}
     try:
         sql = validate_sql(query["sql"])
-        plan = explain(cursor, sql, params)
         before = stats_snapshot(cursor)
         if before.get("buffered_layer.boot_micros") != expected_boot:
             raise RuntimeError("TimeFusion boot changed before query")
+        plan = explain(cursor, sql, params)
+        after_plan = stats_snapshot(cursor)
         began = time.perf_counter()
         cursor.execute(sql, params)
         rows = cursor.fetchall()
@@ -203,15 +219,18 @@ def execute_once(
         ordered = query.get("comparison", "ordered") == "ordered"
         run.rows, run.result_sha256 = len(rows), result_digest(rows, ordered)
         run.plan, run.stats_delta = plan, delta
-        run.planned_route = planned_route(plan)
+        run.planner_ambient_stats_delta = stats_delta(before, after_plan)
+        run.execution_ambient_stats_delta = stats_delta(after_plan, after)
+        run.explain_route_hint = explain_route_hint(plan)
+        run.attributed_route = attributed_route(delta, isolated)
         run.ambient_miss_reasons = ambient_miss_reasons(delta)
         run.ambient_physical_bytes_read_upper_bound = ambient_physical_bytes(delta)
         if oracle is not None:
             run.oracle_plan = explain(oracle, sql, params)
-            run.oracle_planned_route = planned_route(run.oracle_plan)
+            run.oracle_explain_route_hint = explain_route_hint(run.oracle_plan)
             oracle.execute(sql, params)
             run.oracle_sha256 = result_digest(oracle.fetchall(), ordered)
-            run.oracle_comparable = run.planned_route in {"full", "hybrid"} and run.oracle_planned_route == "raw"
+            run.oracle_comparable = isolated and run.attributed_route in {"full", "hybrid"} and run.oracle_explain_route_hint == "raw"
             if run.oracle_comparable:
                 run.result_equal = run.result_sha256 == run.oracle_sha256
         run.stop = stop_reason(run, scan_budget)
@@ -222,6 +241,8 @@ def execute_once(
             run.stop = "identity_changed"
         elif any(marker in message.lower() for marker in DEPLOYMENT_MARKERS):
             run.stop = "deployment_response"
+        elif "statement timeout" in message.lower():
+            run.stop = "statement_deadline"
         else:
             run.stop = "query_error"
     return run
@@ -272,12 +293,13 @@ def main() -> None:
     parser.add_argument("--deadline-seconds", type=int, default=10)
     parser.add_argument("--scan-budget-bytes", type=int, default=1 << 30)
     parser.add_argument("--sealed-lag-days", type=int, default=2)
+    parser.add_argument("--isolated", action="store_true", help="attribute process counters to this query; never use on a shared production process")
     args = parser.parse_args()
     if args.deadline_seconds <= 0 or args.scan_budget_bytes <= 0 or args.sealed_lag_days < 1:
         parser.error("deadline and scan budget must be positive; sealed lag must be at least one day")
 
     manifest = load_manifest(args.manifest)
-    report: dict[str, Any] = {"expected_image": args.image, "captured_at": datetime.now(timezone.utc).isoformat(), "runs": []}
+    report: dict[str, Any] = {"expected_image": args.image, "captured_at": datetime.now(timezone.utc).isoformat(), "isolated": args.isolated, "runs": []}
     with psycopg.connect(args.dsn, autocommit=True) as connection, connection.cursor() as cursor:
         cursor.execute(f"SET statement_timeout = '{args.deadline_seconds}s'")
         initial = stats_snapshot(cursor)
@@ -306,7 +328,7 @@ def main() -> None:
                     for period in query.get("periods", ["today", "sealed"]):
                         start, end = window_bounds(now, window, period, args.sealed_lag_days)
                         for iteration in ("first", "warm"):
-                            run = execute_once(cursor, oracle, query, window, period, iteration, start, end, boot, args.scan_budget_bytes)
+                            run = execute_once(cursor, oracle, query, window, period, iteration, start, end, boot, args.scan_budget_bytes, args.isolated)
                             report["runs"].append(asdict(run))
                             write_report(args.output, report)
                             if run.stop in {"deployment_response", "identity_changed"}:
