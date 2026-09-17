@@ -249,17 +249,87 @@ For operator inspection, every counter/gauge is also queryable via SQL:
 
 ---
 
+## Safe diagnostic SQL
+
+Run operational queries against the TimeFusion PGWire endpoint. Do not send
+them to the Monoscope application database. Keep the connection URL in an
+environment variable supplied by the secret manager:
+
+```sh
+psql "$TIMEFUSION_PG_URL" -X -v ON_ERROR_STOP=1 -P pager=off -c \
+  "SELECT component, key, value FROM timefusion_stats ORDER BY component, key"
+```
+
+`timefusion_stats` has exactly three text columns: `component`, `key`, and
+`value`. Filter `key` as a column. Double quotes identify a column, so
+`"mor_%"` asks for a field with that name and creates diagnostic noise. This
+query reads the merge-on-read counters without relying on wildcard quoting:
+
+```sql
+SELECT component, key, value
+FROM timefusion_stats
+WHERE component = 'dml'
+  AND key IN (
+    'mor_version_rows_appended_total',
+    'mor_noop_rows_suppressed_total',
+    'mor_noop_statements_skipped_total',
+    'mor_versions_retracted_total'
+  )
+ORDER BY key;
+```
+
+Values are returned in their declared units. Keep byte values numeric and
+format them in the calling script. PostgreSQL helpers such as
+`pg_size_pretty` are not part of the TimeFusion SQL contract. For example:
+
+```sql
+SELECT component, key, value
+FROM timefusion_stats
+WHERE component IN ('buffered_layer', 'wal', 'scan', 'foyer')
+ORDER BY component, key;
+```
+
+When an event must be inspected, always provide its project, a half-open time
+window, and a small limit. Event IDs can repeat across timestamps, so an ID
+without a time window is not a unique lookup:
+
+```sql
+SELECT timestamp, id, name, status_code
+FROM otel_logs_and_spans
+WHERE project_id = '<project-id>'
+  AND timestamp >= TIMESTAMP '2026-09-17T14:00:00Z'
+  AND timestamp <  TIMESTAMP '2026-09-17T14:05:00Z'
+  AND id = '<event-id>'
+ORDER BY timestamp DESC
+LIMIT 20;
+```
+
+Start with `EXPLAIN` for any broader customer-data query. Stop if the plan
+selects an unexpected time range or file set. Do not add unsupported
+PostgreSQL functions merely to make a diagnostic query portable.
+
+---
+
 ## Disk capacity
 
-WAL, Foyer cache, and the data dir all live under
-`TIMEFUSION_DATA_DIR`. Plan capacity:
+WAL and Foyer use paths below `TIMEFUSION_DATA_DIR`, but those paths do not
+have to share a filesystem. Production mounts
+`/app/data/timefusion/cache` from ephemeral RAID0 inside the durable data-dir
+mount. Verify the effective mount with the container's mount table and the
+`foyer.cache_dir` row in `timefusion_stats`; do not infer the cache device from
+the parent path.
+
+Plan capacity:
 
 - **WAL**: bounded by retention window × ingest rate. With default
   70-min retention and 10k rows/s × 1KB/row ≈ 42 GB worst case. Set up
   a disk-usage alert at 70% of the volume.
-- **Foyer disk cache**: auto-tuned to 40% of free disk at startup (capped
-  500GB). Will stay within budget — but if disk fills from other sources,
-  Foyer can't evict fast enough; writes may slow.
+- **Foyer disk cache**: auto-tuned to 40% of free disk at startup, capped at
+  500 GB when no explicit size is configured. An explicit
+  `TIMEFUSION_FOYER_DISK_GB` overrides that default; production currently uses
+  600 GiB on ephemeral RAID0. The cache is reconstructible after loss. Keep it
+  off the durable WAL volume, verify free space on its actual mount, and watch
+  the `foyer` runtime rows for the effective directory and budget.
 - **Quarantine** (`${data_dir}/wal/quarantine/`): bounded by corruption
   rate. Typically empty. If non-empty, investigate (corrupt WAL entries
   ≠ ok).
