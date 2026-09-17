@@ -1437,9 +1437,11 @@ pub struct MaintenanceConfig {
     /// Refuse to admit a file into a packing bin more than this many times the
     /// size of the bin's smallest member (the similar-size rule). 0 = off.
     ///
-    /// OFF, because it WEDGES when composed with the value floor: refusal returns
-    /// empty instead of resuming past the refused bin. Make selection resume past
-    /// a floor refusal before enabling this.
+    /// OFF. Tail selection now resumes after a value-floor refusal, but the
+    /// 2026-09-17 production-trace replay for ratio 4 missed its rewrite-byte
+    /// gate and multiplied waves and live files. The shared knob also reaches
+    /// coordinator selection, whose admission policy does not yet apply the
+    /// same ratio. Keep it dark until both selectors agree and staging passes.
     #[serde_inline_default(0)]
     pub timefusion_pack_max_size_ratio: i64,
     /// Byte ceiling for ONE output file from a rewrite. `RecordBatchWriter` has
