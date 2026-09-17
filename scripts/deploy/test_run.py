@@ -10,7 +10,7 @@ import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from lease import DeploymentLease
-from run import UNDEPLOYABLE, deployment_target_error, only_undeployable, prepare_handoff
+from run import UNDEPLOYABLE, deployment_target_error, only_undeployable, prepare_handoff, reconcile_replacement
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 
@@ -149,6 +149,43 @@ class DeploymentTargetTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'wrong token'):
             prepare_handoff(stage, Guard())
         self.assertEqual(calls, ['preflight'])
+
+
+class ReplacementReconciliationTest(unittest.TestCase):
+    def run_reconciliation(self, availability_slo_met):
+        calls = []
+
+        def stage(name):
+            calls.append(name)
+            if name == 'verify-recovery':
+                return {'availability_slo_met': availability_slo_met}
+            if name == 'record-boot':
+                return {'boot_micros': '1789610570795968'}
+            return {}
+
+        class Lease:
+            def complete(self, image, boot):
+                calls.append(('complete', image, boot))
+
+        class Guard:
+            def verified(self):
+                calls.append('verified')
+
+        return calls, lambda: reconcile_replacement(stage, Lease(), Guard(), 'image@sha256:digest')
+
+    def test_availability_miss_is_reported_after_soak_receipt_and_verification(self):
+        calls, reconcile = self.run_reconciliation('false')
+        with self.assertRaisesRegex(RuntimeError, 'missed the availability SLO'):
+            reconcile()
+        self.assertEqual(calls, [
+            'verify-recovery', 'soak', 'record-boot',
+            ('complete', 'image@sha256:digest', '1789610570795968'), 'verified',
+        ])
+
+    def test_available_replacement_completes_normally(self):
+        calls, reconcile = self.run_reconciliation('true')
+        self.assertEqual(reconcile(), '1789610570795968')
+        self.assertEqual(calls[-2:], [('complete', 'image@sha256:digest', '1789610570795968'), 'verified'])
 
 
 if __name__ == '__main__':

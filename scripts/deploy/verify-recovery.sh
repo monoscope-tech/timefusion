@@ -20,7 +20,15 @@ while (( SECONDS < deadline )); do
     echo "rollout measurement: total ${ready_elapsed_ms}ms; last-old-query to first-new-query ${QUERY_HANDOFF_MS}ms; longest client-visible unready interval ${OBSERVED_UNREADY_MS}ms; WAL recovery ${recovery_ms}ms"
     [[ "$QUERY_HANDOFF_MS" =~ ^[1-9][0-9]*$ ]] || { echo "::error::rollout probe did not observe the old-to-new query handoff: '$QUERY_HANDOFF_MS'"; exit 1; }
     [[ "$OBSERVED_UNREADY_MS" =~ ^[0-9]+$ ]] || { echo "::error::rollout readiness probe did not produce a valid downtime measurement: '$OBSERVED_UNREADY_MS'"; exit 1; }
-    (( OBSERVED_UNREADY_MS <= MAX_READY_WAIT_SECS * 1000 )) || { echo "::error::replacement returned 57P03/not-ready continuously for ${OBSERVED_UNREADY_MS}ms (budget $((MAX_READY_WAIT_SECS * 1000))ms)"; exit 1; }
+    availability_slo_met=true
+    if (( OBSERVED_UNREADY_MS > MAX_READY_WAIT_SECS * 1000 )); then
+      availability_slo_met=false
+      # The replacement is healthy. Preserve the SLO breach, but let the caller
+      # soak it, record the live boot, and release the deployment lease before
+      # returning a red job. Exiting here strands a successful rollout as an
+      # unresolved mutation and blocks every later deployment.
+      echo "::warning::replacement returned 57P03/not-ready continuously for ${OBSERVED_UNREADY_MS}ms (budget $((MAX_READY_WAIT_SECS * 1000))ms); reconciling the healthy replacement before failing the rollout"
+    fi
     # A PLANNED deploy drains the WAL first, so recovery is 0ms and this
     # budget is the assertion that the drain actually happened. It is NOT
     # a bound on crash recovery: after an OOM or SIGKILL the replacement
@@ -39,7 +47,12 @@ while (( SECONDS < deadline )); do
       fi
       echo "::warning::WAL recovery took ${recovery_ms}ms — the predecessor did not exit cleanly, so this rollout replayed a real backlog"
     fi
-    echo "rollout completed within recovery and availability budgets"
+    echo "availability_slo_met=$availability_slo_met" >> "$GITHUB_OUTPUT"
+    if [ "$availability_slo_met" = true ]; then
+      echo "rollout completed within recovery and availability budgets"
+    else
+      echo "rollout recovered successfully but missed the availability budget"
+    fi
     exit 0
   fi
   sleep 2

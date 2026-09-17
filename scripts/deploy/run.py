@@ -43,6 +43,26 @@ def prepare_handoff(stage, guard):
     return stage('prepare')
 
 
+def reconcile_replacement(stage, lease, guard, image):
+    """Verify the live replacement before surfacing an availability SLO miss.
+
+    A replacement can be healthy while its old-to-new handoff exceeded the
+    availability budget. Soak and record that real production state first;
+    otherwise an early failure leaves the successful mutation unresolved and
+    strands the shared deployment lease.
+    """
+    recovery = stage('verify-recovery')
+    stage('soak')
+    boot = stage('record-boot')['boot_micros']
+    if not re.fullmatch(r'[0-9]+', boot):
+        raise RuntimeError('Cannot record deployment success without a valid live boot identifier')
+    lease.complete(image, boot)
+    guard.verified()
+    if recovery.get('availability_slo_met') != 'true':
+        raise RuntimeError('Production replacement is healthy, but the rollout missed the availability SLO')
+    return boot
+
+
 # Paths deploy.yml refuses to deploy for, because they cannot change the image.
 # Kept in step with its `paths-ignore`; test_run.py asserts the two agree.
 UNDEPLOYABLE = ('docs/', 'bench/')
@@ -156,13 +176,7 @@ def main():
                       PREFLUSHED_HANDOFF=handoff['drained'])
         rollout = stage('rollout')
         values.update(OBSERVED_UNREADY_MS=rollout['observed_unready_ms'], QUERY_HANDOFF_MS=rollout['query_handoff_ms'])
-        stage('verify-recovery')
-        stage('soak')
-        boot = stage('record-boot')['boot_micros']
-        if not re.fullmatch(r'[0-9]+', boot):
-            raise RuntimeError('Cannot record deployment success without a valid live boot identifier')
-        lease.complete(image, boot)
-        guard.verified()
+        reconcile_replacement(stage, lease, guard, image)
         print('Production deployment and recovery verification completed.')
 
 
