@@ -1,0 +1,18 @@
+{
+  "queries": [
+    {
+      "name": "throughput_5m",
+      "project_id": "replace-with-seeded-project",
+      "windows": ["1h", "1d", "7d", "30d"],
+      "periods": ["today", "sealed"],
+      "sql": "SELECT extract(epoch from time_bucket('5 minutes', timestamp))::integer AS bucket, count(*)::float AS value FROM otel_logs_and_spans WHERE project_id = %(project_id)s AND timestamp >= %(start)s AND timestamp < %(end)s GROUP BY time_bucket('5 minutes', timestamp) ORDER BY time_bucket('5 minutes', timestamp)"
+    },
+    {
+      "name": "service_throughput_1h",
+      "project_id": "replace-with-seeded-project",
+      "windows": ["1h", "1d", "7d", "30d"],
+      "periods": ["today", "sealed"],
+      "sql": "SELECT COALESCE(resource___service___name, 'null') AS service, extract(epoch from time_bucket('1 hours', timestamp))::integer AS bucket, count(*)::float AS value FROM otel_logs_and_spans WHERE project_id = %(project_id)s AND timestamp >= %(start)s AND timestamp < %(end)s GROUP BY COALESCE(resource___service___name, 'null'), time_bucket('1 hours', timestamp) ORDER BY service, bucket"
+    }
+  ]
+}
