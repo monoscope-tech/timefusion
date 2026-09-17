@@ -8,7 +8,8 @@ This log records execution against [the next-days work plan](2026-09-16-next-day
 | --- | --- | --- |
 | 01 | Investigated | Current `pgwire.stream_failed` events are dominated by the issue event-sample query and the endpoint auto-ack query. The former uses `? = ANY(hashes) ORDER BY timestamp DESC LIMIT 1`; the latter expands matching hashes into hourly groups. Recover the post-change fingerprint counts and physical plans before changing admission. |
 | 02 | Deployed and verified | Late row-stream failures now carry a normalized fingerprint and template, table and project dimensions, protocol, effective deadline, duration, and failure class. The existing failure counter remains the aggregate signal. A controlled timeout/resource test covers the event, and production emitted the fields after deployment. |
-| 03 | Audited, no policy change | Admission wraps unbounded `SortExec` only. Bounded TopK, hash aggregate, and hash join plans bypass it. Production recorded 8,559 admissions, zero queued queries, and zero queue timeouts. This does not justify gating every join or aggregate. |
+| 03 | Audited; focused policy patch in progress | Admission previously wrapped unbounded `SortExec` only. The dominant log-listing plan instead carries an eight-way `SortPreservingMergeExec` below ordered `DedupExec`, with no `SortExec` or `AdmissionExec`. The focused patch makes that exact shape share the existing heavy-query gate; bounded TopK, one-way ordered scans, ordinary joins, and ordinary aggregates remain outside it. |
+| 04 | Focused protection implemented locally | Multi-partition ordered merge-on-read fan-ins now take one heavy-query permit for the stream lifetime and expose `class=ordered_mor_merge` plus fan-in in `EXPLAIN`. A separate counter records their admissions. Production deployment awaits local CI and review. |
 | 11–12 | Baseline captured | The pre-deploy process was 3.91 hours old and matched the deployment receipt for commit `a2e69c59`. Selected runtime evidence is below. A complete sanitized CapRover environment record remains open. |
 | 25–29 | Blocked on product semantics | The proposed sessions additions were removed from the deploy candidate. They collided with a dimension name, lacked legacy-cell refusal, omitted the real `browserScope`, changed latest-page to first-page semantics, and dropped URL and resource-UA fallbacks. |
 | 40 | Remediated and measuring | The 600 GiB Foyer cache was physically allocated on the 1.8 TiB durable RAID1 volume, which had reached 95% use. It now has a nested bind mount on the 3.5 TiB ephemeral RAID0 scratch volume. The old cache was removed only after recovery and a clean readiness soak. |
@@ -79,6 +80,23 @@ The GitHub deploy failure had a separate credential cause: TimeFusion's app depl
 
 The PostgreSQL parser already rewrites scalar membership into the indexed form. A local live `EXPLAIN` of the issue sample shape produced `array_has(hashes, 'abc')` in the logical and physical filters. Changing `= ANY(hashes)` to another spelling would not fix the timeout.
 
+The current production plan for fingerprint `bfbe3f4a34ef5085edb38b355de6ffef` disproved the initial weighted-sort proposal. Its physical core is `DedupExec -> SortPreservingMergeExec -> OrderingProbeExec -> DeltaScanExec`, with eight scan groups and no `SortExec` or `AdmissionExec`. DataFusion's file repartitioner can split a compressed file above 10 MiB into eight ranges. The merge then opens all ranges and buffers one decoded batch from each. With wide telemetry rows and 2,048-row batches, this explains the observed approximately 930 MiB `SortPreservingMergeExec` reservation even when the outer query requests only 11 rows. `OrderingProbeExec` only observes order; it does not sort or fall back.
+
+Admission coverage after the focused patch is:
+
+| Physical shape | Admitted | Reason |
+| --- | --- | --- |
+| Unbounded `SortExec` | Yes | Spill and merge reservations compete for the fixed query pool. |
+| Ordered `DedupExec` over multi-partition `SortPreservingMergeExec` | Yes | One decoded batch per merge input can approach a GiB before a small fetch returns. |
+| Ordered `DedupExec` over a one-partition merge | No | DataFusion uses the pass-through path; there is no multi-way fan-in. |
+| Bounded TopK | No | Memory is bounded by its fetch. |
+| Ordinary hash aggregate or hash join | No | No current production evidence justifies gating every instance. |
+| Rollup read or point lookup without either heavy shape | No | Preserve cheap-query concurrency. |
+
+The next plan optimization to test is session-local: raise `datafusion.optimizer.repartition_file_min_size` for the exact listing query and verify that eight scan groups become one, results remain identical, and merge memory and latency fall. A global change needs a full single-file scan benchmark because it also removes intra-file parallelism from unrelated analytics.
+
+The active timeout fingerprint `455e7ae0bbfa7d80ac7e1515f077270b` is Monoscope's endpoint auto-ack evidence query. It expands `hashes`, derives an hourly epoch expression, and groups both expressions across a seven-day window. Three consecutive executions reached the 90-second statement deadline. This is separate from the ordered-listing memory failure and needs a client-query result oracle before changing its semantics.
+
 The production prefilter counters point to the remaining mechanism: high-hit predicates exceed the candidate cap and fall back to the raw scan. The event-sample query then evaluates the full matching window before its bounded TopK returns one row. A specialized newest-hit index path may help, but it needs mutable-version and deletion-vector correctness work. The new failure fields should first establish which fingerprints and windows justify that work.
 
 ## Sessions decision
@@ -101,6 +119,8 @@ Record final results here before push:
 - `cargo test -q late_stream_failures_keep_scrubbed_query_context -- --nocapture`: passed (1 test).
 - `make ci-signoff`: passed `fmt`, `clippy`, `test`, `pg-smoke`, and `e2e`; deployment helper tests and the production image smoke test also passed.
 - Follow-up deployment guard: `python3 scripts/deploy/test_run.py` passed 10 tests, `python3 scripts/deploy/test_lease.py` passed 6 tests, and `make ci-signoff CHECKS="fmt"` passed while reusing the published image.
+- The merged deploy guard then passed end to end in GitHub run `35163294171`: the app/token preflight succeeded, the existing signed image passed its smoke test, and the workflow recognized the same production boot and completed 46 readiness probes with zero transient failures instead of restarting it.
+- Ordered-MOR admission patch: 9 focused unit tests and both pgwire admission tests passed. The complete E2E suite passed 65 of 65 tests and published its local attestation. A stale host-dependent queue assertion was replaced with a deterministic exhausted-semaphore test; concurrent pgwire queries still prove complete, exact results and one admission per query. The remaining local signoff checks are being refreshed for the final source fingerprint.
 - Signed multi-platform candidate: `ghcr.io/monoscope-tech/timefusion@sha256:d8646e00ebfb3a38dde9d877472e37c7e58ee314683687b0f4f96d67a69c148a`.
 - Deployed amd64 manifest: `ghcr.io/monoscope-tech/timefusion@sha256:07610d156741471faa94eef4c8dc1b2d1acd81ad0cf90bcc07fcb7a4ac0a2235`.
 - GitHub checks not covered locally: none reported by `make ci-status`.

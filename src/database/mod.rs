@@ -386,6 +386,7 @@ pub mod scan_metric_names {
         // climbing with a healthy admitted rate is orderly backpressure; timeouts
         // climbing means K is too low or queries too slow.
         HEAVY_QUERY_ADMITTED = "timefusion.scan.heavy_query_admitted" as scan.heavy_query_admitted;
+        HEAVY_QUERY_ORDERED_MOR_ADMITTED = "timefusion.scan.heavy_query_ordered_mor_admitted" as scan.heavy_query_ordered_mor_admitted;
         HEAVY_QUERY_QUEUED = "timefusion.scan.heavy_query_queued" as scan.heavy_query_queued;
         HEAVY_QUERY_QUEUE_TIMEOUT = "timefusion.scan.heavy_query_queue_timeout" as scan.heavy_query_queue_timeout;
     }

@@ -41,16 +41,16 @@ async fn fire_all(env: &E2eEnv) -> Result<Vec<usize>> {
     .await
 }
 
-/// 16 clients, K∈{4,8} (pool-derived, floored at 4) < 16, so most queue.
-/// All complete; admitted moves by exactly 16; at least one waited.
+/// Concurrent clients all complete, and the gate admits each query exactly once.
+/// Queueing itself is tested deterministically against an exhausted semaphore in
+/// the unit suite; its pool-derived capacity may exceed this fixture's 16 clients.
 #[tokio::test(flavor = "multi_thread")]
-async fn heavy_admission_queues_concurrent_clients() -> Result<()> {
+async fn heavy_admission_preserves_concurrent_results() -> Result<()> {
     init_local_metrics_for_test();
     let env = E2eEnv::builder().start().await?;
     let n = seed(&env, 1000).await?;
 
     let admitted0 = counter_value(scan_metric_names::HEAVY_QUERY_ADMITTED);
-    let queued0 = counter_value(scan_metric_names::HEAVY_QUERY_QUEUED);
     let counts = fire_all(&env).await?;
 
     assert_eq!(counts.len(), CLIENTS, "every client completed — none rejected");
@@ -60,17 +60,13 @@ async fn heavy_admission_queues_concurrent_clients() -> Result<()> {
         CLIENTS as u64,
         "the gate admits each heavy query EXACTLY once — a >16 count means the root fans out to multiple partitions and each takes its own permit",
     );
-    assert!(counter_value(scan_metric_names::HEAVY_QUERY_QUEUED) - queued0 >= 1, "with K < {CLIENTS} at least one query must have waited for a slot",);
     Ok(())
 }
 
-/// #304 PRECISION — the gate catches ONLY genuinely unbounded sorts. A bounded list query is
-/// TopK (not gated); an unbounded `ORDER BY` is gated; and — the case that could have made the
-/// gate dangerous — a rollup-MISSED aggregate is NOT gated. One might fear its dedup adds an
-/// unbounded sort (its outer `LIMIT` sits above the `GROUP BY`, so it can't push into the
-/// input), which at a low rollup hit rate would throttle dashboard histograms, not just raw
-/// scans. This test proves it does not: dedup is a bounded `DedupExec` (not a SortExec) and the
-/// GROUP BY is hash-aggregated. `EXPLAIN` over pgwire is the plan #304 actually sees; the local
+/// #304 PRECISION — an unbounded sort is gated while small one-partition TopK and aggregate
+/// fixtures are not. Production-sized ordered MOR listings are also gated when file scan
+/// repartition creates a multi-way `SortPreservingMergeExec`; this small fixture deliberately
+/// stays below that threshold. `EXPLAIN` over pgwire is the plan #304 actually sees; the local
 /// `ctx.sql` path re-runs optimizer passes the pgwire path skips (CLAUDE.md).
 #[tokio::test(flavor = "multi_thread")]
 async fn the_gate_catches_unbounded_sorts_but_not_bounded_topk() -> Result<()> {
@@ -87,11 +83,6 @@ async fn the_gate_catches_unbounded_sorts_but_not_bounded_topk() -> Result<()> {
     let gated = |p: &str| p.contains("AdmissionExec");
     assert!(gated(&unbounded), "an unbounded ORDER BY (spilling sort) must be gated:\n{unbounded}");
     assert!(!gated(&list), "a bounded TopK list query must NOT be gated:\n{list}");
-    // The load-bearing precision check: a rollup-MISSED aggregate is NOT gated. Its dedup is
-    // a custom bounded `DedupExec` (consumes pre-sorted parquet — NOT a SortExec), the GROUP
-    // BY is hash-aggregated (`UnorderedAggregateInput`, no sort), and the only sort is the
-    // outer `ORDER BY … LIMIT` TopK (fetch=Some). So even at a low rollup hit rate the gate
-    // does not throttle dashboard histograms — only genuinely unbounded ORDER BY queries.
-    assert!(!gated(&agg), "a rollup-missed aggregate has no unbounded sort (DedupExec, not SortExec) and must NOT be gated:\n{agg}");
+    assert!(!gated(&agg), "this small rollup-missed aggregate has neither an unbounded sort nor a multi-way ordered MOR merge:\n{agg}");
     Ok(())
 }
