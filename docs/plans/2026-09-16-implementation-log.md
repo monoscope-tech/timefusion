@@ -6,7 +6,7 @@ This log records execution against [the next-days work plan](2026-09-16-next-day
 
 | Plan items | State | Evidence and next action |
 | --- | --- | --- |
-| 01 | Fix in review | Fingerprint `455e7ae0bbfa7d80ac7e1515f077270b`, Monoscope's endpoint auto-ack evidence query, produced at least 50 failures in the six hours ending around 04:00 UTC on September 17. Several were 30-second admission queue timeouts. Monoscope PR #572 replaces its one seven-day aggregate with seven sequential daily slices and merges duplicate `(hash, UTC hour)` buckets before applying the existing proof rule. Deploy and verify that the old fingerprint stops recurring. |
+| 01 | Daily split deployed but still failing | Fingerprint `455e7ae0bbfa7d80ac7e1515f077270b`, Monoscope's original seven-day endpoint auto-ack evidence query, produced at least 50 failures in six hours. PR #572 replaced it with seven sequential daily slices. After Monoscope commit `b1a86bf8` deployed, the new fingerprint `652d4028b10fadc5c538db5d0b48c104` completed one slice in 2.003 seconds but produced at least seven 90-second statement timeouts in the next 12 minutes. The fix bounded each scan but did not bound concurrent scheduled work. Keep item 01 open and do not infer success from the old fingerprint's absence. |
 | 02 | Deployed and verified | Late row-stream failures now carry a normalized fingerprint and template, table and project dimensions, protocol, effective deadline, duration, and failure class. The existing failure counter remains the aggregate signal. A controlled timeout/resource test covers the event, and production emitted the fields after deployment. |
 | 03 | Deployed and verified | Admission previously wrapped unbounded `SortExec` only. PR #308 makes the observed multi-partition `SortPreservingMergeExec` below ordered `DedupExec` share the heavy-query gate. The live process has admitted 4,672 ordered merge-on-read queries, proving the production shape reaches the new guard. |
 | 04 | Deployed and measuring | Multi-partition ordered merge-on-read fan-ins take one heavy-query permit for the stream lifetime and expose `class=ordered_mor_merge` plus fan-in in `EXPLAIN`. At the latest snapshot, the live process had admitted 7,240 heavy queries, queued 1,120, and returned 66 bounded queue timeouts. Memory charge was 14%; continue comparing completion and timeout rates before widening coverage. |
@@ -119,6 +119,14 @@ The durable growth was chiefly BaseRollup, led by metrics, dashboard, and sessio
 A separate five-minute sample proved why event logs alone do not close the accounting. Its 200 starts and 196 finishes implied a 97.01 GB estimated decrease, while the live gauge rose 66.22 GB. Aggregate events reported 340 planned compaction-debt tasks and five coarsened slices without task identity. During the same interval, physical progress continued: five flush commits wrote 97,024 rows and 14,236,053 Parquet bytes, while seven wave commits wrote 2,396,715 rows and 133,113,961 bytes. PR #313 keeps estimated task flow, the durable subset, and physical Delta output separate.
 
 ## Query findings
+
+### Endpoint auto-ack daily-slice production result
+
+The immutable post-deploy cutoff is `2026-09-17T13:53:21.623247Z`, when CapRover updated `srv-captain--monoscope` to commit `b1a86bf8`. The last observed failure of the original seven-day fingerprint was at `13:52:35.355066Z`, before that cutoff.
+
+Positive execution evidence disproved the daily split as a complete fix. The replacement fingerprint `652d4028b10fadc5c538db5d0b48c104` completed one slice in 2.003 seconds at `14:03:17.897864Z`, but timed out after about 90 seconds at `14:01:37`, `14:03:09`, `14:04:45`, `14:06:26`, `14:08:15`, `14:10:17`, and `14:12:56Z`. The observed slices selected 32–39 files and about 1.24 GB. TimeFusion declined rollup routing at the UNNEST projection with `reason=unwalkable_source`.
+
+This satisfies the plan's stop condition: the new query ran and failed, so absence of the old fingerprint is not evidence of recovery. No `endpoint_proven_by_traffic` activity was observed in the bounded post-deploy window, and semantic auto-ack verification could not proceed. The next change must bound aggregate scheduled concurrency or further reduce each physical scan; it must retain the 20-request, two-hour, issue-creation, and non-critical gates.
 
 The PostgreSQL parser already rewrites scalar membership into the indexed form. A local live `EXPLAIN` of the issue sample shape produced `array_has(hashes, 'abc')` in the logical and physical filters. Changing `= ANY(hashes)` to another spelling would not fix the timeout.
 
