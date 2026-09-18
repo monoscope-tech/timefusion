@@ -417,6 +417,32 @@ pub fn init_metrics(
         maintenance_stats().light_optimize_bins_committed.load(Relaxed)
     );
     observe!(counter "timefusion.maintenance.dedup_bins_committed", "Dedup bins committed", maintenance_stats().dedup_bins_committed.load(Relaxed));
+    // THE COMPACTION-LAG ALERT SURFACE. Throughput counters alone cannot say
+    // whether a flat line means "no work" or "wedged" — on 2026-09-15 they read
+    // identically for three days while sealed consolidation committed nothing and
+    // p99 query latency went to 29s. These three are what a monitor fires on:
+    // seconds since the last commit, units that claimed a cell and did nothing,
+    // and the invariant break that makes the second one a bug rather than a
+    // converged partition.
+    observe!(gauge
+        "timefusion.maintenance.compaction_seconds_since_commit",
+        "Seconds since the last pack/sealed bin committed. Rises without bound the moment compaction stops for ANY reason — wedge, starvation, crash loop. PAGE above one hour",
+        {
+            let stamped = maintenance_stats().last_compaction_commit_unix.load(Relaxed);
+            let now = crate::support::now_micros().max(0) as u64 / 1_000_000;
+            if stamped == 0 { process_uptime_secs() } else { now.saturating_sub(stamped) }
+        }
+    );
+    observe!(counter
+        "timefusion.maintenance.compaction_units_selected_nothing",
+        "Compaction units that claimed a cell and selected no bin. A converged cell does this once; a wedged lane does it thousands of times a minute. WARN on a sustained rate",
+        maintenance_stats().compaction_units_selected_nothing.load(Relaxed)
+    );
+    observe!(counter
+        "timefusion.maintenance.compaction_invariant_violations",
+        "Units that declined two or more UNDER-TARGET files — files the planner queues the cell on. Structurally impossible; any nonzero value is the 2026-09-15 packer wedge regressing. PAGE if > 0",
+        maintenance_stats().compaction_invariant_violations.load(Relaxed)
+    );
     // Queue depth per lane. Depth alone cannot tell slow from never-claimed —
     // pair it with the permit counters above, which is what settles starvation.
     observe!(gauge "timefusion.maintenance.pending_base_rollup", "BaseRollup units queued", maintenance_stats().pending_base_rollup.load(Relaxed));
@@ -1227,10 +1253,19 @@ atomic_stats! {
         /// decided from data.
         pressure_scale_engaged as "pressure_scale_engaged",
         pressure_scale_bytes_withheld as "pressure_scale_bytes_withheld",
-        /// Packing bins whose bytes-per-file-eliminated exceeded the value floor
-        /// (counted even when the floor is 0/off, so it can be chosen from data).
-        pack_value_refused as "pack_value_refused",
-        pack_value_refused_rows as "pack_value_refused_rows",
+        /// Compaction units that claimed a cell and selected NOTHING. The packer's
+        /// invariant says this can only happen on a converged cell, so a rising
+        /// count against non-zero `sealed_compaction_debt_bytes` means the lane is
+        /// spinning — the 2026-09-15 wedge, which was invisible for three days.
+        compaction_units_selected_nothing as "compaction_units_selected_nothing",
+        /// Unix seconds of the last committed pack/sealed bin. 0 until the first
+        /// commit of this process; the derived gauge reports the process age then,
+        /// so a lane that never commits after a restart still alerts.
+        last_compaction_commit_unix as "last_compaction_commit_unix",
+        /// Units that declined two or more UNDER-TARGET files — files the planner
+        /// queues the cell on. Structurally impossible now that both sides share
+        /// one rule; any non-zero value is a regression of the 2026-09-15 wedge.
+        compaction_invariant_violations as "compaction_invariant_violations",
         maintenance_cpu_tokens_used as "cpu_tokens_used",
         maintenance_decoded_bytes_used as "decoded_bytes_used",
         maintenance_object_read_tokens_used as "object_read_tokens_used",

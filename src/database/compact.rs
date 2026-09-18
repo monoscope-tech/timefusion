@@ -321,7 +321,7 @@ impl Database {
                 )
             })
             .collect();
-        Ok(select_tail_bin(&tail, target_size, min_files, sorted_run_cap, seal_micros_now(), TailPass::Pack, pack_size_ratio(), pack_value_floor()))
+        Ok(select_tail_bin(&tail, target_size, min_files, sorted_run_cap, seal_micros_now(), TailPass::Pack))
     }
 
     /// Plan one hot-optimize bin per hot project for `date=today` in a single snapshot walk.
@@ -359,20 +359,7 @@ impl Database {
             .into_iter()
             .map(|(project_id, adds)| {
                 let debt = adds.len();
-                (
-                    project_id,
-                    select_tail_bin(
-                        &adds,
-                        policy.target_size,
-                        policy.min_files,
-                        policy.sorted_run_cap,
-                        seal,
-                        policy.pass,
-                        pack_size_ratio(),
-                        pack_value_floor(),
-                    ),
-                    debt,
-                )
+                (project_id, select_tail_bin(&adds, policy.target_size, policy.min_files, policy.sorted_run_cap, seal, policy.pass), debt)
             })
             .filter(|(_, bin, _)| !bin.is_empty())
             .collect_vec();
@@ -1820,18 +1807,6 @@ impl Database {
 /// Overridable at runtime with `timefusion_dedup_bin_minutes`; a wider bin reads
 /// fewer files in total, since one unit rewrites every file overlapping its bin.
 pub(crate) const DEFAULT_BIN_MINUTES: i64 = 10;
-
-/// The packing VALUE floor from config (0 = off / shadow in configless
-/// processes). See `refuse_low_value_bin`.
-pub(crate) fn pack_value_floor() -> u64 {
-    crate::config::try_config().map_or(0, |c| c.maintenance.timefusion_pack_max_rows_per_file_eliminated)
-}
-
-/// The similar-size admission ratio for packing bins, from config (0 = off in
-/// processes with no config, e.g. unit tests). See `bin_breaks_size_ratio`.
-pub(crate) fn pack_size_ratio() -> i64 {
-    crate::config::try_config().map_or(0, |c| c.maintenance.timefusion_pack_max_size_ratio)
-}
 
 /// The dedup bin width, in micros. Read through the config `OnceLock`, so it is
 /// fixed for the life of the process — a width that changed under a running

@@ -3611,15 +3611,15 @@ const BIN_TARGET: i64 = 1000;
 const BIN_SEAL: i64 = 10_000;
 
 /// One `select_tail_bin` pass at that shared target/seal.
-fn tail_bin(adds: &[super::TailAdd], min_files: usize, pass: TailPass, max_size_ratio: i64, value_floor: u64) -> Vec<String> {
-    super::select_tail_bin(adds, BIN_TARGET, min_files, BIN_TARGET / 4, BIN_SEAL, pass, max_size_ratio, value_floor)
+fn tail_bin(adds: &[super::TailAdd], min_files: usize, pass: TailPass) -> Vec<String> {
+    super::select_tail_bin(adds, BIN_TARGET, min_files, BIN_TARGET / 4, BIN_SEAL, pass)
 }
 
 /// One packing pass over `(path, size, is_sorted_run, min_event, max_event, has_dv)`
 /// tuples, returning the selected bin as a comma-joined path list ("" = nothing selected).
 fn pack_tail(files: &[(&str, i64, bool, i64, i64, bool)], min_files: usize) -> String {
     let adds: Vec<_> = files.iter().map(|&(p, size, sorted, lo, hi, dv)| tail_file(p, size, sorted, Some((lo, hi)), dv, None)).collect();
-    tail_bin(&adds, min_files, TailPass::Pack, 0, 0).join(",")
+    tail_bin(&adds, min_files, TailPass::Pack).join(",")
 }
 
 /// Fan-in must scale with the bin target: a bin fills to the target, so twice the target
@@ -3631,7 +3631,7 @@ fn fan_in_scales_with_the_bin_target() {
     // 40 candidate files of 16 MiB, contiguous in event time.
     let adds: Vec<_> = (0..40).map(|i| tail_file(&format!("f{i}"), 16 * 1024 * 1024, false, Some((i, i)), false, Some(10_000))).collect();
 
-    let fan_in = |target: i64| super::select_tail_bin(&adds, target, 5, target / 4, SEAL, TailPass::Pack, 0, 0).len();
+    let fan_in = |target: i64| super::select_tail_bin(&adds, target, 5, target / 4, SEAL, TailPass::Pack).len();
     let (at256, at512, at768) = (fan_in(256 * 1024 * 1024), fan_in(512 * 1024 * 1024), fan_in(768 * 1024 * 1024));
     println!("fan-in: 256 MiB -> {at256}   512 MiB -> {at512}   768 MiB -> {at768}");
 
@@ -3643,83 +3643,56 @@ fn fan_in_scales_with_the_bin_target() {
     );
 }
 
-/// STEADY-STATE BENCHMARK: drive the real packer over many rounds, feeding merged output
-/// back in, and measure bytes written per byte ingested with the value floor off vs on.
+/// STEADY-STATE BENCHMARK: drive the real packer over many rounds, feeding merged
+/// output back in, and measure bytes written per byte ingested.
+///
+/// This used to compare a value floor OFF vs ON and assert the floor lowered
+/// amplification. The floor is gone — it could refuse every bin, and on
+/// 2026-09-15 it did, for three days. What replaces the comparison is a CEILING:
+/// the unguarded packer must stay bounded and must converge, so deleting the
+/// guard cannot silently trade an outage for unbounded rewrite cost.
 #[test]
-fn the_value_floor_lowers_steady_state_write_amplification() {
+fn the_unguarded_packer_converges_at_bounded_write_amplification() {
     const TARGET: i64 = 256 * 1024 * 1024;
     const SEAL: i64 = i64::MAX / 4;
     const ARRIVAL: i64 = 18 * 1024 * 1024; // ~176k rows at 104 B/row
     const ROUNDS: usize = 400;
 
     // One partition: files arrive, the packer picks a bin, the bin becomes a single
-    // larger file. Deterministic — no clock, no RNG. The floor and ratio are PARAMETERS
-    // into the real selector, so refusal and resume happen inside it, not here.
-    let run = |floor: u64, ratio: i64| -> (i64, i64, usize) {
-        let (mut live, mut written, mut ingested) = (Vec::<i64>::new(), 0i64, 0i64);
-        for _ in 0..ROUNDS {
-            live.push(ARRIVAL);
-            ingested += ARRIVAL;
-            let adds: Vec<_> = live
-                .iter()
-                .enumerate()
-                .map(|(i, size)| tail_file(&format!("f{i}"), *size, false, Some((i as i64, i as i64)), false, Some((*size as u64) * 12 / 104)))
-                .collect();
-            let picked = super::select_tail_bin(&adds, TARGET, 5, TARGET / 4, SEAL, TailPass::Pack, ratio, floor);
-            if picked.len() < 2 {
-                continue;
-            }
-            let idx: Vec<usize> = picked.iter().filter_map(|p| p.strip_prefix('f')?.parse().ok()).collect();
-            let bytes: i64 = idx.iter().map(|i| live[*i]).sum();
-            let mut keep: Vec<i64> = live.iter().enumerate().filter(|(i, _)| !idx.contains(i)).map(|(_, s)| *s).collect();
-            keep.push(bytes);
-            live = keep;
-            written += bytes;
+    // larger file. Deterministic — no clock, no RNG.
+    let (mut live, mut written, mut ingested) = (Vec::<i64>::new(), 0i64, 0i64);
+    for _ in 0..ROUNDS {
+        live.push(ARRIVAL);
+        ingested += ARRIVAL;
+        let adds: Vec<_> = live
+            .iter()
+            .enumerate()
+            .map(|(i, size)| tail_file(&format!("f{i}"), *size, false, Some((i as i64, i as i64)), false, Some((*size as u64) * 12 / 104)))
+            .collect();
+        let picked = super::select_tail_bin(&adds, TARGET, 5, TARGET / 4, SEAL, TailPass::Pack);
+        if picked.len() < 2 {
+            continue;
         }
-        (written, ingested, live.len())
-    };
+        let idx: Vec<usize> = picked.iter().filter_map(|p| p.strip_prefix('f')?.parse().ok()).collect();
+        let bytes: i64 = idx.iter().map(|i| live[*i]).sum();
+        let mut keep: Vec<i64> = live.iter().enumerate().filter(|(i, _)| !idx.contains(i)).map(|(_, s)| *s).collect();
+        keep.push(bytes);
+        live = keep;
+        written += bytes;
+    }
+    let amplification = written as f64 / ingested as f64;
+    println!("amplification {amplification:.2}x   live files {}", live.len());
 
-    let (w_off, ing, files_off) = run(0, 0);
-    let (w_on, _, files_on) = run(1_000_000, 0); // the measured knee; the fan-in escape makes it safe
-    let amp = |w: i64| w as f64 / ing as f64;
-    println!("amplification: OFF {:.2}x  ON {:.2}x   |   live files: OFF {files_off}  ON {files_on}", amp(w_off), amp(w_on));
-
-    assert!(amp(w_off) > 1.0, "the unguarded packer must rewrite more than it ingests, or the fixture is wrong");
-    assert!(amp(w_on) < amp(w_off), "the value floor must LOWER steady-state write amplification: off {:.2}x, on {:.2}x", amp(w_off), amp(w_on));
-    // Refusing a merge leaves its files in place, so the floor trades maintenance cost
-    // for the READER's file count; it must not blow that count up.
-    assert!(files_on <= files_off * 2, "the floor must not blow up the live file count: off {files_off}, on {files_on}");
-
-    // The similar-size rule, same harness: it stops merge outputs re-absorbing every
-    // fresh arrival, giving generational stratification. Outputs still merge with their
-    // own generation once peers exist.
-    let (w_ratio, _, files_ratio) = run(0, 4);
-    println!(
-        "amplification: OFF {:.2}x  FLOOR {:.2}x  RATIO {:.2}x   |   live files: OFF {files_off}  FLOOR {files_on}  RATIO {files_ratio}",
-        amp(w_off),
-        amp(w_on),
-        amp(w_ratio)
-    );
-    assert!(amp(w_ratio) < amp(w_off), "the size-ratio guard must lower steady-state amplification: off {:.2}x, ratio {:.2}x", amp(w_off), amp(w_ratio));
-    assert!(files_ratio <= files_off * 2, "the ratio guard must not blow up the live file count: off {files_off}, ratio {files_ratio}");
-
-    // COMPOSITION. A guard that refuses without RESUMING past the refused bin
-    // manufactures a livelock whenever that bin is the walker's fixed first choice, so
-    // selection must resume past a floor refusal.
-    let (w_both, ing_both, files_both) = run(1_000_000, 4);
-    println!(
-        "amplification: BOTH {:.2}x   |   live files: BOTH {files_both}   |   ingested {:.0}% of baseline",
-        amp(w_both),
-        100.0 * ing_both as f64 / ing as f64
-    );
-    assert_eq!(ing_both, ing, "floor+ratio must no longer wedge: the run stopped early, so a refusal is still terminal somewhere");
-    assert!(amp(w_both) <= amp(w_on) * 1.10, "floor+ratio must not materially regress the floor alone: floor {:.2}x, both {:.2}x", amp(w_on), amp(w_both));
-    // The pair's trade: fewer writes, more live files. `timefusion_pack_max_size_ratio`
-    // stays 0 by default because the floor alone is the better balance while per-file
-    // read cost dominates. The bound below is the measured level plus margin — pushing
-    // past 3x is a new trade that must be re-argued.
-    assert!(files_both <= files_off * 3, "the pair's file-count trade moved: off {files_off}, both {files_both} (measured 80 vs 31)");
+    assert!(amplification > 1.0, "the packer must rewrite something, or the fixture is wrong");
+    assert!(amplification <= AMPLIFICATION_CEILING, "steady-state write amplification regressed: {amplification:.2}x > {AMPLIFICATION_CEILING:.2}x");
+    // CONVERGENCE: 400 arrivals must not leave 400 live files. The packer has to be
+    // retiring files faster than they arrive, or readers pay the fragmentation.
+    assert!(live.len() * 4 <= ROUNDS, "the packer stopped converging: {} live files after {ROUNDS} arrivals", live.len());
 }
+
+/// Measured ceiling for [`the_unguarded_packer_converges_at_bounded_write_amplification`].
+/// Raising it is a real trade and must be argued, not nudged.
+const AMPLIFICATION_CEILING: f64 = 9.0;
 
 #[derive(serde::Deserialize)]
 struct PackReplayArrival {
@@ -3744,7 +3717,6 @@ struct PackReplayFile {
 
 #[derive(serde::Serialize)]
 struct PackReplayResult {
-    size_ratio: i64,
     output_per_mille: i64,
     arrivals: usize,
     input_bytes: i64,
@@ -3790,7 +3762,6 @@ fn replay_post_retraction_pack_trace() {
     const TICK_MS: i64 = 5 * 60 * 1000;
     const SEAL_LAG_MS: i64 = 15 * 60 * 1000;
     const MIN_FILES: usize = 5;
-    const VALUE_FLOOR: u64 = 1_000_000;
     const MAX_WAVES: usize = 12;
 
     let path = std::env::var("TIMEFUSION_PACK_REPLAY").expect("set TIMEFUSION_PACK_REPLAY to JSONL from delta_work_ledger.py --pack-trace");
@@ -3807,7 +3778,7 @@ fn replay_post_retraction_pack_trace() {
         .collect();
     let target = super::pack_target_bytes(256 * MB, std::time::Duration::from_secs(240));
 
-    let run = |size_ratio: i64, output_per_mille: i64| {
+    let run = |output_per_mille: i64| {
         let input_bytes = arrivals.iter().map(|arrival| arrival.size).sum::<i64>();
         let input_rows = arrivals.iter().map(|arrival| arrival.rows).sum::<u64>();
         let first_tick = arrivals[0].commit_ms.div_euclid(TICK_MS) * TICK_MS;
@@ -3847,7 +3818,7 @@ fn replay_post_retraction_pack_trace() {
                         continue;
                     }
                     let candidates: Vec<_> = live.iter().map(|file| file.add.clone()).collect();
-                    let picked = super::select_tail_bin(&candidates, target, MIN_FILES, target / 2, seal, TailPass::Pack, size_ratio, VALUE_FLOOR);
+                    let picked = super::select_tail_bin(&candidates, target, MIN_FILES, target / 2, seal, TailPass::Pack);
                     // This arm measures Pack only. A singleton is today's repair
                     // gap and belongs in a separate real-I/O repair replay.
                     if picked.len() < 2 {
@@ -3915,7 +3886,6 @@ fn replay_post_retraction_pack_trace() {
         let mut p50 = fan_ins.clone();
         let mut p95 = fan_ins.clone();
         PackReplayResult {
-            size_ratio,
             output_per_mille,
             arrivals: arrivals.len(),
             input_bytes,
@@ -3936,9 +3906,7 @@ fn replay_post_retraction_pack_trace() {
     };
 
     for output_per_mille in output_scales {
-        for size_ratio in [0, 4] {
-            println!("{}", serde_json::to_string(&run(size_ratio, output_per_mille)).unwrap());
-        }
+        println!("{}", serde_json::to_string(&run(output_per_mille)).unwrap());
     }
 }
 
@@ -3966,7 +3934,7 @@ fn a_bin_is_priced_by_files_removed_not_bytes_written() {
 
     // THE CHEAP SHAPE: ten small files, same partition, remove NINE.
     let many: Vec<_> = (0..10).map(|i| tail_file(&format!("s{i}"), 20, false, Some((i * 2 + 1, i * 2 + 2)), false, None)).collect();
-    let picked = tail_bin(&many, 2, TailPass::Pack, 0, 0);
+    let picked = tail_bin(&many, 2, TailPass::Pack);
     assert_eq!(picked.len(), 10, "all ten fit under the target");
     assert_eq!(value(&[("s", 20); 10]), 22, "22 bytes per file eliminated — 39x better value");
 
@@ -4016,21 +3984,7 @@ fn select_tail_bin_policy(files: &[(&str, i64, bool, i64, i64, bool)], min_files
 #[test]
 fn files_without_event_stats_are_never_binned() {
     let no_stats = vec![tail_file("x", 10, false, None, false, None), tail_file("a", 10, false, Some((1, 2)), false, None)];
-    assert_eq!(tail_bin(&no_stats, 2, TailPass::Pack, 0, 0), Vec::<String>::new());
-}
-
-/// The similar-size rule (`bin_breaks_size_ratio`) inside the tail packer:
-/// a dissimilar file ends a viable bin or restarts the slice at itself,
-/// exactly like blowing the byte cap — so tiny files never drag a whale
-/// into their bin, a whale's bin never absorbs stragglers, and the output
-/// stays a time-disjoint run. The coordinator selector applies the SAME predicate.
-#[test_case(&[("a", 5, 1, 2), ("b", 5, 3, 4), ("whale", 100, 5, 6)], 0 => "a,b,whale" ; "ratio off admits the dissimilar file")]
-#[test_case(&[("a", 5, 1, 2), ("b", 5, 3, 4), ("whale", 100, 5, 6)], 4 => "a,b" ; "a whale later in time is left for its own generation")]
-#[test_case(&[("whale", 100, 1, 2), ("a", 5, 3, 4), ("b", 5, 5, 6)], 4 => "a,b" ; "a whale first in time restarts the slice instead of wedging it")]
-#[test_case(&[("p", 95, 1, 2), ("q", 114, 3, 4)], 4 => "p,q" ; "near-peers are untouched at the default ratio")]
-fn a_dissimilar_file_ends_the_bin_instead_of_joining_it(files: &[(&str, i64, i64, i64)], max_size_ratio: i64) -> String {
-    let adds: Vec<_> = files.iter().map(|&(path, size, min, max)| tail_file(path, size, false, Some((min, max)), false, None)).collect();
-    tail_bin(&adds, 2, TailPass::Pack, max_size_ratio, 0).join(",")
+    assert_eq!(tail_bin(&no_stats, 2, TailPass::Pack), Vec::<String>::new());
 }
 
 /// Coordinator unit selection over `(path, bytes, is_sorted_run, rows)` tuples,
@@ -4048,9 +4002,45 @@ fn a_dissimilar_file_ends_the_bin_instead_of_joining_it(files: &[(&str, i64, i64
 #[test_case(&[("converged-a", 520 * MB, false, None), ("converged-b", 512 * MB, false, None)] => "" ; "an already-packed partition produces no work, whatever its tags say")]
 #[test_case(&[("a", 128 * MB, true, None), ("b", 128 * MB, true, None), ("c", 128 * MB, true, None)] => "a,b" ; "three 128 MB sorted runs fill the target exactly and still stop at one run")]
 #[test_case(&[("small", 100_040_704, true, Some(915_417)), ("mid", 120_355_352, true, Some(1_108_187)), ("converged-a", 534_000_000, true, Some(4_675_365)), ("converged-b", 538_000_000, true, Some(4_701_864))] => "small,mid" ; "a pair inside the byte budget is never blocked by the row cap, even at 2,023,604 rows")]
-#[test_case(&[("h0", 60 * MB, true, Some(3_000_000)), ("h1", 60 * MB, true, Some(3_000_000))] => "" ; "the row-cap exemption buys a pair, never an unbounded bin")]
+#[test_case(&[("h0", 60 * MB, true, Some(3_000_000)), ("h1", 60 * MB, true, Some(3_000_000))] => "h0,h1" ; "a pair is admitted whatever its rows — the row cap may bound a bin, never deny it a second file")]
+#[test_case(&[("h0", 60 * MB, true, Some(3_000_000)), ("h1", 60 * MB, true, Some(3_000_000)), ("h2", 60 * MB, true, Some(3_000_000))] => "h0,h1" ; "the pair exemption buys a PAIR, never an unbounded bin: the third file is still capped out")]
 fn coordinator_selection_bins_l0_before_runs_and_never_rewrites_a_converged_file(files: &[(&str, i64, bool, Option<u64>)]) -> String {
     coordinator_pick(files.iter().map(|&(path, size, sorted, rows)| tail_file(path, size, sorted, None, false, rows)).collect()).join(",")
+}
+
+/// THE 2026-09-15 WEDGE, as a property: whenever two or more packable files
+/// exist, the selector MUST return at least two. A selector that can decline all
+/// work has no safe default — sealed consolidation committed nothing for three
+/// days because a value floor wanted five files and the byte budget, pinned by
+/// `coordinator_packing_cap_bytes` to the two smallest, could only ever give two.
+///
+/// Swept across the shape that actually wedged (sizes straddling the decode
+/// margin, row counts far above any plausible per-file floor) and the degenerate
+/// neighbours around it.
+#[test]
+fn coordinator_selector_never_refuses_a_packable_pair() {
+    // 29 candidates, ~48 MB each, ~1M rows each: the production cell from the log
+    // line `target=97498284 smallest_pair_bytes=97498284 selected=0`.
+    for files in [2usize, 3, 5, 29] {
+        for size in [4 * MB, 48 * MB, 97_498_284 / 2, 200 * MB] {
+            for rows in [None, Some(1), Some(1_000_000), Some(5_000_000)] {
+                let adds: Vec<_> = (0..files).map(|i| tail_file(&format!("f{i}"), size, true, None, false, rows)).collect();
+                let picked = coordinator_pick(adds);
+                assert!(picked.len() >= 2, "selector refused {files} packable files of {size} B / {rows:?} rows — the cell would be re-claimed forever");
+            }
+        }
+    }
+}
+
+/// The same invariant where it actually bit: the packing cap collapses onto the
+/// two smallest files, so a bin can hold exactly two. That must still be a bin.
+#[test]
+fn a_pair_that_exactly_fills_the_budget_is_still_a_bin() {
+    let half = 97_498_284 / 2;
+    let adds: Vec<_> = (0..29).map(|i| tail_file(&format!("f{i}"), half, true, None, false, Some(1_038_000))).collect();
+    let target = super::COORDINATOR_SEALED_TARGET_BYTES.min(crate::config::coordinator_packing_cap_bytes(half * 2));
+    assert_eq!(target, half * 2, "the fixture must reproduce the collapsed cap, or it proves nothing");
+    assert_eq!(super::select_coordinator_compaction_candidates(adds, target).len(), 2, "a pair that exactly fills the budget must still be selected");
 }
 
 /// The wide narrow-row `otel_metrics` shape the staging measurements below are written
@@ -4211,25 +4201,24 @@ fn a_bin_is_capped_by_rows_not_only_bytes() {
     assert_eq!(coordinator_pick(unknown).len(), 23, "unknown row counts do not accumulate, so the byte budget still governs");
 }
 
-/// `packer_admits_pair` (the planner's admission test) must agree with the
-/// REAL packer on BOTH budgets — bytes and rows — or a cell is queued for
-/// work the packer then refuses, forever.
+/// The planner queues a cell when it holds two under-target files; the packer
+/// must then bin them. There is no second predicate to drift — this pins that
+/// the packer really does bin every pair the planner will queue, including the
+/// shapes that used to be refused on rows or on a sum above the target.
 #[test]
-fn the_planner_admits_exactly_what_the_packer_can_bin() {
-    let target = super::COORDINATOR_SEALED_TARGET_BYTES;
-
-    // Both cells fit on bytes; only the first fits on rows.
-    let agree = |cell: &str, (size_a, rows_a): (i64, u64), (size_b, rows_b): (i64, u64), expected: bool| {
-        let admits = super::packer_admits_pair((size_a, size_b), (Some(rows_a), Some(rows_b)), target);
-        let packs = coordinator_pick(vec![rows_file("a", size_a, rows_a), rows_file("b", size_b, rows_b)]).len() >= 2;
-        assert_eq!(admits, packs, "{cell}: planner said {admits}, packer said {packs} — the two must never disagree");
-        assert_eq!(admits, expected, "{cell}: expected admits={expected}");
-    };
-    agree("dcad860a/2026-06-17", (100_040_704, 915_417), (120_355_352, 1_108_187), true);
-    agree("be87ebc1/2026-07-02", (103_809_024, 8_509_391), (112_918_528, 4_137_188), false);
-
-    // Absent stats must not make the planner stricter than bytes alone.
-    assert!(super::packer_admits_pair((100 * 1024 * 1024, 100 * 1024 * 1024), (None, None), target), "unknown rows are no objection");
+fn the_packer_bins_every_pair_the_planner_queues() {
+    for (cell, (size_a, rows_a), (size_b, rows_b)) in [
+        ("dcad860a/2026-06-17", (100_040_704, 915_417), (120_355_352, 1_108_187)),
+        // 12.6M rows across the pair: the row cap may bound a bin's growth, never
+        // deny it a second file.
+        ("be87ebc1/2026-07-02", (103_809_024, 8_509_391), (112_918_528, 4_137_188)),
+        // Two under-target files whose SUM exceeds the target. The planner queues
+        // them (both are under-target), so the packer must take them.
+        ("sum-over-target", (200 * MB, 1), (200 * MB, 1)),
+    ] {
+        let packed = coordinator_pick(vec![rows_file("a", size_a, rows_a), rows_file("b", size_b, rows_b)]).len();
+        assert_eq!(packed, 2, "{cell}: the planner queues this cell, so the packer must bin both files (got {packed})");
+    }
 }
 
 /// A bin holding unsorted files is budgeted in DECODED bytes — a
@@ -4363,7 +4352,7 @@ fn coordinator_sealed_units_fit_their_deadline_and_file_count_contract() {
 #[test_case(&[] => "" ; "nothing admitted => no work")]
 fn repair_pass_takes_the_newest_poisoned_file_then_the_smallest(files: &[(&str, i64, i64)]) -> String {
     let adds: Vec<_> = files.iter().map(|&(path, size, min)| tail_file(path, size, false, Some((min, min + 1)), false, None)).collect();
-    tail_bin(&adds, 2, TailPass::Repair, 0, 0).join(",")
+    tail_bin(&adds, 2, TailPass::Repair).join(",")
 }
 
 /// Scope admission for the hot tail. Sealed-date repair exists so an
@@ -5346,7 +5335,7 @@ fn converged_sorted_runs_are_a_counterexample_to_compaction_dedup_convergence() 
     let versions_in_different_runs = vec![run("older-version", 1), run("newer-version", 1)];
 
     assert!(
-        super::select_tail_bin(&versions_in_different_runs, TARGET, 2, i64::MAX, 10_000, TailPass::Pack, 0, 0).is_empty(),
+        super::select_tail_bin(&versions_in_different_runs, TARGET, 2, i64::MAX, 10_000, TailPass::Pack).is_empty(),
         "target-sized runs are terminal, even when their key/time domains overlap"
     );
 }

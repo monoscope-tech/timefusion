@@ -1082,14 +1082,6 @@ pub struct BufferConfig {
     /// writers that committed after the last cursor snapshot.
     #[serde_inline_default(8)]
     pub timefusion_delta_scan_depth: usize,
-    /// Reject a compaction candidate whose merged output's UNION SPAN would
-    /// exceed this many dedup bins; 0 disables. A wide output is re-read once per
-    /// bin it touches, forever, and the other budgets (bytes, rows) do not
-    /// correlate with span. Off by default because any bound that bites also
-    /// rejects most sealed consolidation. Candidates with no event range are no
-    /// objection.
-    #[serde_inline_default(0)]
-    pub timefusion_compaction_span_budget_bins: i64,
     /// Width of a dedup bin, in minutes. A dedup unit rewrites every file
     /// overlapping its bin whole, so a file straddling N bins is read N times;
     /// wider bins trade larger units for far less total read.
@@ -1395,15 +1387,6 @@ pub struct MaintenanceConfig {
     pub timefusion_flush_sort_pool_mb: u64,
     #[serde_inline_default(5)]
     pub timefusion_compact_min_files: usize,
-
-    /// Refuse a packing bin that rewrites more than this many ROWS per file it
-    /// eliminates. 0 = off; the refusal is counted either way. In rows, not
-    /// bytes, because the packer compares COMPRESSED `add.size`.
-    ///
-    /// Load-bearing escape: the guard never refuses a bin of `min_files` or more,
-    /// or a biting floor refuses every bin and packing stops entirely.
-    #[serde_inline_default(1_000_000)]
-    pub timefusion_pack_max_rows_per_file_eliminated: u64,
     /// Five-minute hot-partition compaction is required to prevent a
     /// small-file backlog. Set false only as an incident kill switch.
     #[serde_inline_default(true)]
@@ -1434,16 +1417,6 @@ pub struct MaintenanceConfig {
     /// EXTENDS a completed run — see `TaskJournal::rank`).
     #[serde_inline_default(true)]
     pub timefusion_dedup_contiguity_rank: bool,
-    /// Refuse to admit a file into a packing bin more than this many times the
-    /// size of the bin's smallest member (the similar-size rule). 0 = off.
-    ///
-    /// OFF. Tail selection now resumes after a value-floor refusal, but the
-    /// 2026-09-17 production-trace replay for ratio 4 missed its rewrite-byte
-    /// gate and multiplied waves and live files. The shared knob also reaches
-    /// coordinator selection, whose admission policy does not yet apply the
-    /// same ratio. Keep it dark until both selectors agree and staging passes.
-    #[serde_inline_default(0)]
-    pub timefusion_pack_max_size_ratio: i64,
     /// Byte ceiling for ONE output file from a rewrite. `RecordBatchWriter` has
     /// no target-size support (`flush()` emits one file per partition), so
     /// rewrite paths cut the file themselves once the buffer passes this. An

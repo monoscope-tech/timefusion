@@ -1114,8 +1114,7 @@ impl Database {
                     else {
                         continue;
                     };
-                    let rows = file.num_records().and_then(|n| u64::try_from(n).ok());
-                    partitions.entry((project, date)).or_default().push(CompactionDebtFile { size: file.size(), path: path.to_string(), rows });
+                    partitions.entry((project, date)).or_default().push(CompactionDebtFile { size: file.size(), path: path.to_string() });
                 }
             }
             // Anything seen-but-not-planned is COMPLIANT, which is what retires
@@ -1136,11 +1135,11 @@ impl Database {
                 // is only a *suspect*, and admitting on that would put every
                 // flush-written partition permanently out of policy.
                 let small = files.iter().filter(|file| file.size < small_target).sorted_by_key(|file| file.size).collect_vec();
-                // The same admission test the PACKER applies (sum fits the target
-                // on BOTH bytes and rows), so a queued unit can always retire at
-                // least one file. Unknown row counts are no objection.
-                let mergeable = small.len() >= 2 && packer_admits_pair((small[0].size, small[1].size), (small[0].rows, small[1].rows), small_target);
-                if mergeable {
+                // TWO under-target files ARE the admission test. The packer's byte
+                // budget carries `pair_floor`, so it bins any two of these; a
+                // second, separately-derived predicate here is exactly how planner
+                // and packer drifted apart into a three-day spin (2026-09-15).
+                if small.len() >= 2 {
                     let operation = if date == today { Operation::HotPacking } else { Operation::SealedConsolidation };
                     planned_keys.insert((project_id.clone(), date, operation));
                     // Age from when the partition SEALED, so starvation escalation
@@ -2761,6 +2760,13 @@ impl Database {
         let target = declared_target.min(crate::config::coordinator_packing_cap_bytes(smallest_pair));
         let unsorted_candidates = candidates.iter().filter(|add| !add.is_sorted_run).count();
         let under_target_candidates = candidates.iter().filter(|add| add.size < target).count();
+        // PACKABLE, which is narrower than under-target: the packer also skips a
+        // sorted run while any L0 file is present (L0 is sorted into runs first),
+        // and a lone L0 file is legitimate work rather than a refusal. Only this
+        // count may drive the invariant — `under_target_candidates` includes files
+        // the packer is right to pass over, and asserting on it reports a healthy
+        // L0 pass as a wedge.
+        let packable_candidates = candidates.iter().filter(|add| (add.size < target || add.has_dv) && !(unsorted_candidates > 0 && add.is_sorted_run)).count();
         // A pair that does not fit means planner and packer see different candidate sets
         // (the planner does not apply the packer's range filter).
         let two_smallest = candidates.iter().map(|add| add.size).filter(|size| *size < target).k_smallest(2).collect_tuple();
@@ -2789,8 +2795,21 @@ impl Database {
             }
         }
         // Only when the unit will do nothing: one file is a 1:1 rewrite and retires none.
+        // COUNTED, not just logged: the 2026-09-15 wedge emitted this line thousands of
+        // times a minute for three days and nothing aggregated it, so no alert could fire.
         if selected.len() < 2 {
-            info!(
+            let stats = crate::observability::maintenance_stats();
+            stats.compaction_units_selected_nothing.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // THE INVARIANT. Two under-target files are exactly what the planner
+            // queues on, so the packer declining them is a planner/packer
+            // disagreement — the 2026-09-15 wedge. It cannot happen through the
+            // shared rule, and if a future rule reintroduces one, this is the
+            // alertable signal rather than three silent days.
+            if packable_candidates >= 2 && unsorted_candidates == 0 {
+                stats.compaction_invariant_violations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                debug_assert!(false, "packer refused {packable_candidates} packable files the planner would queue");
+            }
+            warn!(
                 operation = ?key.operation,
                 project_id = %key.project_id,
                 table = %key.physical_table,
@@ -6817,6 +6836,12 @@ impl Database {
         } else {
             stats.light_optimize_bins_committed.fetch_add(landed.len() as u64, Relaxed);
             stats.light_optimize_waves_committed.fetch_add(1, Relaxed);
+            // FRESHNESS, not just throughput. A rate counter cannot distinguish
+            // "nothing needed compacting" from "compaction has been dead since
+            // Tuesday"; a wall-clock stamp can, and the derived
+            // `compaction_seconds_since_commit` gauge is the alert that would have
+            // caught 2026-09-15 on day one instead of day four.
+            stats.last_compaction_commit_unix.store(crate::support::now_micros().max(0) as u64 / 1_000_000, Relaxed);
         }
     }
 
