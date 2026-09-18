@@ -1049,7 +1049,14 @@ impl Database {
         let project_id = projects.first().map(|(p, _)| *p).unwrap_or("");
         let committed_version = new_table.version();
         if let Some(version) = committed_version {
-            self.last_written_versions.write().await.extend(projects.iter().map(|(project, _)| (table_key(project, table_name), version)));
+            // The refresh map is keyed by physical Delta table, exactly like the
+            // commit lock. Default-project writes share a unified table, whose
+            // reader resolves under the empty project key; custom storage stays
+            // isolated per project. Recording the caller's project key here left
+            // a prepared read of a unified table unaware of its own committed
+            // version, so it could retain a stale snapshot after ingestion.
+            let key = self.table_lock_key(project_id, table_name).await;
+            self.last_written_versions.write().await.insert(key, version);
             debug!("Stored last written version for {}/{} (+{} coalesced): {}", project_id, table_name, projects.len().saturating_sub(1), version);
         } else {
             debug!("WARNING: No version available after write for {}/{}", project_id, table_name);

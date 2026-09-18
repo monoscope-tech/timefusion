@@ -145,7 +145,11 @@ tf-start: minio-start
 	@# shell, which the readiness loop below needs.
 	@set -a; . ./.env.minio; set +a; \
 		port="$${PGWIRE_PORT:-12345}"; \
-		( nohup cargo run --release > /tmp/timefusion.log 2>&1 & echo $$! > /tmp/timefusion.pid ); \
+		if nc -z 127.0.0.1 $$port 2>/dev/null; then \
+			echo "PGWire port $$port is already in use; stop that TimeFusion process before starting a new one"; exit 1; \
+		fi; \
+		cargo build --release > /tmp/timefusion.log 2>&1 || { tail -50 /tmp/timefusion.log; exit 1; }; \
+		nohup ./target/release/timefusion >> /tmp/timefusion.log 2>&1 & echo $$! > /tmp/timefusion.pid; \
 		echo "timefusion starting (PGWire: $$port). Logs: /tmp/timefusion.log"; \
 		for i in $$(seq 1 900); do \
 			nc -z 127.0.0.1 $$port 2>/dev/null && { echo "ready on $$port"; exit 0; }; \
@@ -160,16 +164,14 @@ test-e2e:
 	@echo "Running E2E suite (local-first MinIO; Docker only as fallback)..."
 	cargo nextest run --features e2e -E 'binary(e2e)' $${ARGS}
 
-# `cargo run` spawns the server as a child, so killing the recorded pid alone
-# orphans a process still holding PGWire. Kill the whole process group.
+# The PID belongs to the server binary itself (not a `cargo run` wrapper), so a
+# graceful signal cannot orphan a PGWire listener between downstream test runs.
 tf-stop:
 	@if [ -f /tmp/timefusion.pid ]; then \
 		pid=$$(cat /tmp/timefusion.pid); \
-		pgid=$$(ps -o pgid= -p $$pid 2>/dev/null | tr -d " "); \
-		[ -n "$$pgid" ] && kill -TERM -$$pgid 2>/dev/null || kill $$pid 2>/dev/null || true; \
+		kill -TERM $$pid 2>/dev/null || true; \
 	fi
 	@rm -f /tmp/timefusion.pid
-	@echo "timefusion stopped"
 	@echo "timefusion stopped"
 
 # ---------------------------------------------------------------------------

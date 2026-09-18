@@ -2021,12 +2021,15 @@ mod row_to_json_record_tests {
     }
 }
 
-// Rewrites `EXISTS(q)` in a projection to `(SELECT count(1) FROM q) > 0`:
-// DataFusion decorrelates EXISTS only in filter position, but correlated
-// *scalar* subqueries in a projection ARE decorrelated.
+// Rewrites `EXISTS(q)` in a projection to an executable scalar expression:
+// DataFusion decorrelates EXISTS only in filter position. Ordinary correlated
+// subqueries become `(SELECT count(1) FROM q) > 0`; a correlated UNNEST over an
+// outer list becomes `array_any_match(list, item -> predicate)`, because
+// DataFusion cannot decorrelate an outer reference used as an UNNEST input.
 
 use datafusion::{
     functions_aggregate::expr_fn::count,
+    logical_expr::expr::LambdaVariable,
     logical_expr::{LogicalPlanBuilder, Subquery},
 };
 
@@ -2045,9 +2048,9 @@ impl AnalyzerRule for ExistsInProjection {
             // column names change.
             let Transformed { data, transformed, .. } = projection.expr.clone().into_iter().map_until_stop_and_collect(|expr| {
                 expr.transform_up(|expr| match expr {
-                    Expr::Exists(exists) => Ok(Transformed::yes(match count_subquery(exists.subquery)? {
-                        Some(count) if exists.negated => count.eq(lit(0_i64)),
-                        Some(count) => count.gt(lit(0_i64)),
+                    Expr::Exists(exists) => Ok(Transformed::yes(match exists_scalar(exists.subquery)? {
+                        Some(exists_expr) if exists.negated => Expr::Not(Box::new(exists_expr)),
+                        Some(exists_expr) => exists_expr,
                         // Provably empty subquery: EXISTS is a constant.
                         None => lit(exists.negated),
                     })),
@@ -2063,15 +2066,110 @@ impl AnalyzerRule for ExistsInProjection {
     }
 }
 
-/// `q` → scalar subquery `SELECT count(1) FROM q`, keeping the outer references
-/// so DataFusion still sees it as correlated. `None` means `q` is provably empty.
-fn count_subquery(subquery: Subquery) -> Result<Option<Expr>> {
+/// `q` → an executable scalar boolean. `None` means `q` is provably empty.
+fn exists_scalar(subquery: Subquery) -> Result<Option<Expr>> {
     let Subquery { subquery: plan, outer_ref_columns, spans } = subquery;
     let Some(plan) = peel_row_caps(Arc::unwrap_or_clone(plan)) else {
         return Ok(None);
     };
+    if let Some(any_match) = correlated_unnest_exists(&plan)? {
+        return Ok(Some(any_match));
+    }
     let counted = LogicalPlanBuilder::from(plan).aggregate(Vec::<Expr>::new(), vec![count(lit(1_i64))])?.build()?;
-    Ok(Some(Expr::ScalarSubquery(Subquery { subquery: Arc::new(counted), outer_ref_columns, spans })))
+    Ok(Some(Expr::ScalarSubquery(Subquery { subquery: Arc::new(counted), outer_ref_columns, spans }).gt(lit(0_i64))))
+}
+
+/// Converts the SQL planner's single-column correlated-UNNEST shape to
+/// `array_any_match`. The rule deliberately declines projections that derive a
+/// value from the unnested item; treating such an expression as a plain alias
+/// would change the predicate.
+fn correlated_unnest_exists(plan: &LogicalPlan) -> Result<Option<Expr>> {
+    let LogicalPlan::Projection(select) = plan else { return Ok(None) };
+    let (predicate, source) = match select.input.as_ref() {
+        LogicalPlan::Filter(filter) => (filter.predicate.clone(), filter.input.as_ref()),
+        source => (lit(true), source),
+    };
+    let source_schema = source.schema();
+    if source_schema.fields().len() != 1 {
+        return Ok(None);
+    }
+    let element_name = source_schema.field(0).name().clone();
+
+    let mut node = source;
+    loop {
+        node = match node {
+            LogicalPlan::SubqueryAlias(alias) => alias.input.as_ref(),
+            LogicalPlan::Subquery(subquery) => subquery.subquery.as_ref(),
+            LogicalPlan::Projection(projection) => {
+                if projection.expr.iter().any(|expr| !is_unnest_passthrough(expr)) {
+                    return Ok(None);
+                }
+                projection.input.as_ref()
+            }
+            LogicalPlan::Unnest(unnest) => {
+                let [(input_index, list)] = unnest.list_type_columns.as_slice() else {
+                    return Ok(None);
+                };
+                if !unnest.struct_type_columns.is_empty() || list.depth != 1 {
+                    return Ok(None);
+                }
+                let LogicalPlan::Projection(input) = unnest.input.as_ref() else {
+                    return Ok(None);
+                };
+                let Some(Expr::OuterReferenceColumn(list_field, list_column)) = input.expr.get(*input_index).map(peel_alias) else {
+                    return Ok(None);
+                };
+                let element_type = match list_field.data_type() {
+                    DataType::List(field)
+                    | DataType::LargeList(field)
+                    | DataType::ListView(field)
+                    | DataType::LargeListView(field)
+                    | DataType::FixedSizeList(field, _) => Arc::clone(field),
+                    _ => return Ok(None),
+                };
+
+                let lambda_name = "__timefusion_unnest_item";
+                let lambda_var =
+                    Expr::LambdaVariable(LambdaVariable::new(lambda_name.into(), Some(Arc::new(element_type.as_ref().clone().with_name(lambda_name)))));
+                let mut compatible = true;
+                let predicate = predicate
+                    .transform_up(|expr| match expr {
+                        Expr::Column(column) if column.name == element_name => Ok(Transformed::yes(lambda_var.clone())),
+                        Expr::Column(_) | Expr::ScalarSubquery(_) | Expr::Exists(_) | Expr::InSubquery(_) => {
+                            compatible = false;
+                            Ok(Transformed::no(expr))
+                        }
+                        Expr::OuterReferenceColumn(_, column) => Ok(Transformed::yes(Expr::Column(column))),
+                        other => Ok(Transformed::no(other)),
+                    })?
+                    .data;
+                if !compatible {
+                    return Ok(None);
+                }
+
+                let any_match = datafusion::functions_nested::expr_fn::array_any_match(
+                    Expr::Column(list_column.clone()),
+                    datafusion::logical_expr::lambda([lambda_name], predicate),
+                );
+                // EXISTS is never NULL: unknown predicate results are skipped,
+                // and a NULL list produces no rows.
+                let exists = Expr::ScalarFunction(ScalarFunction::new_udf(datafusion::functions::core::coalesce(), vec![any_match, lit(false)]));
+                return Ok(Some(exists));
+            }
+            _ => return Ok(None),
+        };
+    }
+}
+
+fn peel_alias(expr: &Expr) -> &Expr {
+    match expr {
+        Expr::Alias(alias) => peel_alias(&alias.expr),
+        other => other,
+    }
+}
+
+fn is_unnest_passthrough(expr: &Expr) -> bool {
+    matches!(peel_alias(expr), Expr::Column(_) | Expr::OuterReferenceColumn(_, _))
 }
 
 /// Strips `LIMIT n` from the top of an EXISTS subquery; a row cap cannot change
@@ -2114,6 +2212,12 @@ mod exists_in_projection_tests {
         let ctx = SessionContext::new_with_state(state);
         ctx.sql("CREATE TABLE outer_t(id INT) AS VALUES (1), (2)").await.unwrap().collect().await.unwrap();
         ctx.sql("CREATE TABLE inner_t(fk INT) AS VALUES (1)").await.unwrap().collect().await.unwrap();
+        ctx.sql("CREATE TABLE outer_e(id INT, hashes VARCHAR[]) AS VALUES (1, ARRAY['needle', 'other']), (2, ARRAY['other']), (3, ARRAY[]), (4, NULL), (5, ARRAY[NULL, 'other'])")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
         ctx
     }
 
@@ -2126,6 +2230,12 @@ mod exists_in_projection_tests {
         => matches Err(_) ; "offset is not peeled and is never answered wrongly: an offset EXISTS must error rather than return a wrong answer")]
     #[test_case::test_case("SELECT id, EXISTS (SELECT 1 FROM inner_t WHERE fk = outer_t.id LIMIT 0) AS present FROM outer_t"
         => Ok(vec![false, false]) ; "limit zero folds to false")]
+    #[test_case::test_case("SELECT id, EXISTS (SELECT 1 FROM unnest(e.hashes) AS h(value) WHERE value = 'needle') AS present FROM outer_e e ORDER BY id"
+        => Ok(vec![true, false, false, false, false]) ; "correlated unnest predicate treats null list and unknown element predicates as no match")]
+    #[test_case::test_case("SELECT id, EXISTS (SELECT 1 FROM unnest(e.hashes) AS h(value)) AS present FROM outer_e e ORDER BY id"
+        => Ok(vec![true, true, false, false, true]) ; "correlated unnest without a predicate detects any row including a null element")]
+    #[test_case::test_case("SELECT id, NOT EXISTS (SELECT 1 FROM unnest(e.hashes) AS h(value) WHERE value = 'needle') AS absent FROM outer_e e ORDER BY id"
+        => Ok(vec![false, true, true, true, true]) ; "negated correlated unnest inverts the non-null exists result")]
     #[tokio::test]
     async fn exists_in_a_projection(sql: &str) -> std::result::Result<Vec<bool>, String> {
         let batches = ctx().await.sql(sql).await.expect("logical planning must succeed").collect().await.map_err(|e| e.to_string())?;

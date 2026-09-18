@@ -1871,12 +1871,16 @@ impl TableProvider for ProjectRoutingTable {
             crate::write::mem_buffer::merge_ranges(mem_ranges).into_iter().map(|(start, end)| ts_cmp(Operator::Lt, start).or(ts_cmp(Operator::GtEq, end))),
         );
         let resolve_span = tracing::trace_span!(parent: &span, "resolve_delta_table");
-        let resolved = self.database.try_fast_resolve(&project_id, &self.table_name);
-        scan_state.lock().fast_resolve_hit = Some(resolved.is_some());
-        let delta_table = match resolved {
-            Some(t) => t,
-            None => self.database.resolve_table(&project_id, &self.table_name).instrument(resolve_span).await?,
-        };
+        // A query executed through a retained pgwire plan must still see a
+        // committed ingest from another connection. `try_fast_resolve` opts
+        // into an explicitly stale-tolerant snapshot, which is not valid for
+        // an investigation read: it can turn a successful write into apparent
+        // “no data”. `resolve_table` is lock-local on the common path and only
+        // refreshes the Delta snapshot when a newer committed version is known.
+        // No fast resolve was attempted, so do not turn this into a synthetic
+        // cache miss in the scan telemetry.
+        scan_state.lock().fast_resolve_hit = None;
+        let delta_table = self.database.resolve_table(&project_id, &self.table_name).instrument(resolve_span).await?;
         let table = delta_table.read().await;
         let delta_plans = self
             .scan_delta_with_tantivy(
