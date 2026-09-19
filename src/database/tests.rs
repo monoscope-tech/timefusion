@@ -3601,9 +3601,15 @@ fn rows_file(path: &str, bytes: i64, rows: u64) -> super::TailAdd {
     tail_file(path, bytes, true, None, false, Some(rows))
 }
 
+/// The coordinator's own policy through the SHARED packer, so these tests
+/// exercise the exact call `coordinator_compaction_files` makes.
+fn coordinator_bin(files: Vec<super::TailAdd>, target: i64) -> Vec<String> {
+    super::select_bin(&files, super::BinPolicy { target_size: target, max_rows: u64::MAX, order: super::BinOrder::SmallestFirst, level_unsorted_first: true })
+}
+
 /// One coordinator selection pass at the sealed byte target.
 fn coordinator_pick(files: Vec<super::TailAdd>) -> Vec<String> {
-    super::select_coordinator_compaction_candidates(files, super::COORDINATOR_SEALED_TARGET_BYTES)
+    coordinator_bin(files, super::COORDINATOR_SEALED_TARGET_BYTES)
 }
 
 // The shared packing target/seal the policy tests are written against.
@@ -3623,7 +3629,7 @@ fn pack_tail(files: &[(&str, i64, bool, i64, i64, bool)], min_files: usize) -> S
 }
 
 /// Fan-in must scale with the bin target: a bin fills to the target, so twice the target
-/// should hold twice the files. Other budgets (`MAX_BIN_ROWS`, the row cap) could bind
+/// should hold twice the files. Other budgets could bind
 /// first, so this drives the real `select_tail_bin` rather than restating the arithmetic.
 #[test]
 fn fan_in_scales_with_the_bin_target() {
@@ -4003,7 +4009,7 @@ fn files_without_event_stats_are_never_binned() {
 #[test_case(&[("a", 128 * MB, true, None), ("b", 128 * MB, true, None), ("c", 128 * MB, true, None)] => "a,b" ; "three 128 MB sorted runs fill the target exactly and still stop at one run")]
 #[test_case(&[("small", 100_040_704, true, Some(915_417)), ("mid", 120_355_352, true, Some(1_108_187)), ("converged-a", 534_000_000, true, Some(4_675_365)), ("converged-b", 538_000_000, true, Some(4_701_864))] => "small,mid" ; "a pair inside the byte budget is never blocked by the row cap, even at 2,023,604 rows")]
 #[test_case(&[("h0", 60 * MB, true, Some(3_000_000)), ("h1", 60 * MB, true, Some(3_000_000))] => "h0,h1" ; "a pair is admitted whatever its rows — the row cap may bound a bin, never deny it a second file")]
-#[test_case(&[("h0", 60 * MB, true, Some(3_000_000)), ("h1", 60 * MB, true, Some(3_000_000)), ("h2", 60 * MB, true, Some(3_000_000))] => "h0,h1" ; "the pair exemption buys a PAIR, never an unbounded bin: the third file is still capped out")]
+#[test_case(&[("h0", 100 * MB, true, Some(3_000_000)), ("h1", 100 * MB, true, Some(3_000_000)), ("h2", 100 * MB, true, Some(3_000_000))] => "h0,h1" ; "a bin is still BOUNDED, now in bytes: a third 100MB file overruns the 256MB target")]
 fn coordinator_selection_bins_l0_before_runs_and_never_rewrites_a_converged_file(files: &[(&str, i64, bool, Option<u64>)]) -> String {
     coordinator_pick(files.iter().map(|&(path, size, sorted, rows)| tail_file(path, size, sorted, None, false, rows)).collect()).join(",")
 }
@@ -4024,6 +4030,67 @@ fn tail_selector_never_refuses_a_packable_slice() {
             }
         }
     }
+}
+
+/// UNIFICATION, pinned. Both compaction paths must reach the same packer, so a
+/// budget fixed in one is fixed in both. Until 2026-09-19 they were separate
+/// functions: the coordinator's cap collapsed onto the two smallest files while
+/// the off-box CLI packed to its full target, which cost a whole rewrite pass
+/// per doubling and let a value floor wedge one lane and not the other.
+///
+/// Given the same candidates and the same byte budget, the only difference
+/// either policy may produce is ORDER — never how much a bin takes.
+#[test]
+fn both_compaction_paths_pack_to_the_same_budget() {
+    // Eight 40 MB files, contiguous in event time, well under a 256 MB target.
+    let adds: Vec<_> = (0..8).map(|i| tail_file(&format!("f{i}"), 40 * MB, true, Some((i, i)), false, Some(100_000))).collect();
+    let target = 256 * MB;
+
+    let coordinator = coordinator_bin(adds.clone(), target);
+    let offbox =
+        super::select_bin(&adds, super::BinPolicy { target_size: target, max_rows: u64::MAX, order: super::BinOrder::EventTime, level_unsorted_first: false });
+
+    let bytes = |bin: &[String]| bin.len() as i64 * 40 * MB;
+    assert_eq!(bytes(&coordinator), bytes(&offbox), "the two paths packed different BYTES: coordinator {:?}, offbox {:?}", coordinator, offbox);
+    assert!(coordinator.len() >= 6, "a 256MB target must hold six 40MB files, not a pair — got {}", coordinator.len());
+}
+
+/// The pair-collapse, gone. `coordinator_packing_cap_bytes` used to return the
+/// decode margin, so a cell whose two smallest files exceeded it got a target of
+/// exactly that pair and could never bin a third file. The cap is now a multiple
+/// of the target file size and the SORT is what gets sliced.
+#[test]
+fn the_packing_cap_no_longer_collapses_onto_a_pair() {
+    let pair = 97_498_284; // the exact prod value from the 2026-09-15 log line
+    let cap = crate::config::coordinator_packing_cap_bytes(pair);
+    assert!(cap > pair, "cap {cap} still collapses onto the pair {pair}");
+    assert!(
+        cap >= super::COORDINATOR_SEALED_TARGET_BYTES,
+        "cap {cap} binds below the declared target {} — bins would still be shrunk instead of sliced",
+        super::COORDINATOR_SEALED_TARGET_BYTES
+    );
+}
+
+/// A multi-file bin must be SLICED, not shrunk. This is what makes the larger
+/// cap safe: the sort is bounded per slice, so a 256 MB bin never sorts 256 MB
+/// of compressed input in one pass.
+#[test]
+fn a_multi_file_bin_slices_its_sort_instead_of_shrinking() {
+    // The slice budget carries a 3/5 margin: the decoded-bytes ratio is an
+    // optimistic fixed estimate, so a slice priced at a whole sort can overrun.
+    let budget = crate::config::coordinator_per_sort_decoded_bytes() * 3 / 5;
+    // A full 256 MB bin of several files — the shape the new cap admits.
+    let bin_bytes = super::COORDINATOR_SEALED_TARGET_BYTES;
+    let target = super::coordinator_slice_target(TailPass::Pack, 6, bin_bytes).expect("multi-file Pack bins must slice");
+    assert_eq!(target, budget, "a multi-file bin must slice to the sort budget");
+
+    let want = super::repair_slice_want(bin_bytes, target);
+    let decoded = crate::database::maintain::estimated_decoded_bytes(bin_bytes) as i64;
+    assert!(want > 1, "a {bin_bytes}-byte bin decodes to {decoded} and must need more than one slice");
+    assert!(decoded / want as i64 <= budget, "each slice must fit the sort budget: {decoded}/{want} > {budget}");
+
+    // A bin that already fits is left alone.
+    assert_eq!(super::repair_slice_want(1024, target), 1, "a small bin must not be sliced");
 }
 
 /// THE 2026-09-15 WEDGE, as a property: whenever two or more packable files
@@ -4050,15 +4117,21 @@ fn coordinator_selector_never_refuses_a_packable_pair() {
     }
 }
 
-/// The same invariant where it actually bit: the packing cap collapses onto the
-/// two smallest files, so a bin can hold exactly two. That must still be a bin.
+/// Where the wedge actually bit, now the other way round. This cell's files are
+/// the exact prod shape whose PAIR (97,498,284 B) used to become the whole
+/// target, capping every bin at two files. The cap no longer collapses, so the
+/// same cell must now pack well past a pair — and must still never return one.
 #[test]
-fn a_pair_that_exactly_fills_the_budget_is_still_a_bin() {
+fn the_prod_wedge_cell_now_packs_past_a_pair() {
     let half = 97_498_284 / 2;
     let adds: Vec<_> = (0..29).map(|i| tail_file(&format!("f{i}"), half, true, None, false, Some(1_038_000))).collect();
     let target = super::COORDINATOR_SEALED_TARGET_BYTES.min(crate::config::coordinator_packing_cap_bytes(half * 2));
-    assert_eq!(target, half * 2, "the fixture must reproduce the collapsed cap, or it proves nothing");
-    assert_eq!(super::select_coordinator_compaction_candidates(adds, target).len(), 2, "a pair that exactly fills the budget must still be selected");
+    assert_eq!(target, super::COORDINATOR_SEALED_TARGET_BYTES, "the cap must no longer shrink the target onto the pair");
+
+    let picked = coordinator_bin(adds, target);
+    assert!(picked.len() > 2, "the cell that could only ever bin a pair must now pack more — got {}", picked.len());
+    // ...and the bin still respects the budget it was given.
+    assert!((picked.len() as i64) * half <= target, "bin of {} x {half} B exceeds target {target}", picked.len());
 }
 
 /// The wide narrow-row `otel_metrics` shape the staging measurements below are written
@@ -4198,22 +4271,31 @@ fn the_span_budget_rejects_wide_unions_and_is_off_by_default() {
     assert!(span_bins(&near[0], &near[1]) <= 20, "adjacent files stay inside hot packing's observed maximum of 20 bins");
 }
 
-/// A bin is capped by ROWS as well as bytes: row density varies ~3x between
-/// tables, so a byte-only budget lets a dense table build a bin its deadline
-/// cannot finish.
+/// A dense bin is bounded by BYTES, and its SORT by slices.
+///
+/// This used to assert the opposite: that a row cap clipped a dense bin before
+/// the byte budget did. That cap was a second bound in a different unit, and the
+/// moment the byte cap stopped collapsing onto a pair it simply became the new
+/// collapse — two 1.038M-row otel_metrics files exceed 2M rows, so a row-dense
+/// table was still capped at two files. Decoded-byte slicing bounds the sort and
+/// already accounts for row count and row width together.
 #[test]
-fn a_bin_is_capped_by_rows_not_only_bytes() {
-    // Metrics shape: ~47 B/row, so 256 MB is ~5.5 M rows — the row cap stops first.
+fn a_dense_bin_is_bounded_by_bytes_and_its_sort_by_slices() {
+    // Metrics shape: ~47 B/row, 23 files x 11 MB = 253 MB, ~5.5M rows.
     let dense: Vec<_> = (0..23).map(|i| rows_file(&format!("m{i:02}"), 11 * MB, 240_000)).collect();
     let picked = coordinator_pick(dense);
-    let picked_rows = picked.len() as u64 * 240_000;
-    assert!(picked_rows <= super::MAX_BIN_ROWS, "a dense bin must stop at the row cap, took {picked_rows} rows");
-    assert!(picked.len() >= 2, "but it must still retire more than one file, got {}", picked.len());
+    assert_eq!(picked.len(), 23, "a dense cell must now fill its byte target, not stop at a pair");
 
-    // Logs shape: ~155 B/row, so a full 256 MB bin stays under the row cap.
+    // The sort that bin feeds is what gets bounded, per slice.
+    let bin_bytes = picked.len() as i64 * 11 * MB;
+    let target = super::coordinator_slice_target(TailPass::Pack, picked.len(), bin_bytes).expect("multi-file bins slice");
+    let want = super::repair_slice_want(bin_bytes, target);
+    let decoded = crate::database::maintain::estimated_decoded_bytes(bin_bytes) as i64;
+    assert!(decoded / want as i64 <= target, "each slice must fit its budget: {decoded}/{want} > {target}");
+
+    // Logs shape: ~155 B/row — same byte bound, fewer rows, still one bin.
     let sparse: Vec<_> = (0..23).map(|i| rows_file(&format!("l{i:02}"), 11 * MB, 75_000)).collect();
-    assert_eq!(coordinator_pick(sparse).len(), 23, "a sparse bin is still bounded by BYTES, not clipped by the row cap");
-
+    assert_eq!(coordinator_pick(sparse).len(), 23, "a sparse bin is bounded by BYTES too");
     // Absent stats must never make the cap stricter than bytes alone.
     let unknown: Vec<_> = (0..23).map(|i| mb_file(&format!("u{i:02}"), 11, true)).collect();
     assert_eq!(coordinator_pick(unknown).len(), 23, "unknown row counts do not accumulate, so the byte budget still governs");
@@ -4307,8 +4389,15 @@ fn repair_slices_bound_decoded_bytes_not_compressed() {
     // nothing can prune. The sizing invariants above stay asserted so
     // re-enabling the knob cannot re-enable the wrong-unit bug.
     assert_eq!(super::coordinator_slice_target(TailPass::Repair, 1, 40 * MB), None, "repair rewrites in one pass");
-    // A multi-file pack bin is never sliced — only the single-oversized-L0 path is.
-    assert_eq!(super::coordinator_slice_target(TailPass::Pack, 2, 40 * MB), None);
+    // A multi-file pack bin slices to the SORT budget. This asserted `None` until
+    // 2026-09-19, and that was the whole reason a bin which could not fit its
+    // sort had to be shrunk to a pair instead: with no slice to fall back on,
+    // the packing cap was the only lever left.
+    assert_eq!(
+        super::coordinator_slice_target(TailPass::Pack, 2, 40 * MB),
+        Some(crate::config::coordinator_per_sort_decoded_bytes() * 3 / 5),
+        "a multi-file bin must bound its SORT by slicing, not its bin by shrinking"
+    );
 }
 
 /// Candidates arrive in EVENT-TIME order, so a single budget-filling file

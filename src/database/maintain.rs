@@ -2773,7 +2773,23 @@ impl Database {
         let smallest_pair = two_smallest.map_or(-1, |(smaller, larger): (i64, i64)| smaller.saturating_add(larger));
         // Captured before the move: the packer takes `candidates` by value.
         let ranges_by_path: HashMap<String, (i64, i64)> = candidates.iter().filter_map(|add| add.event_range.map(|range| (add.path.clone(), range))).collect();
-        let selected = select_coordinator_compaction_candidates(candidates, target);
+        let selected = crate::database::select_bin(
+            &candidates,
+            crate::database::BinPolicy {
+                target_size: target,
+                // NO row cap. It was a SECOND bound in a different unit from the
+                // byte budget, and once the byte cap stopped collapsing it simply
+                // became the new collapse: two 1.038M-row files exceed 2M, so a
+                // row-dense table like otel_metrics was still capped at a pair.
+                // The sort is bounded in DECODED BYTES by slicing, which already
+                // accounts for row count and row width together.
+                max_rows: u64::MAX,
+                // Smallest-first LEVELS: an L0 tail is sorted into runs before
+                // runs merge with each other.
+                order: crate::database::BinOrder::SmallestFirst,
+                level_unsorted_first: true,
+            },
+        );
         // Span of the output: merging unions the inputs' ranges and dedup reads a file
         // once per 10-minute bin it touches. Reported only — deliberately not enforced.
         if selected.len() >= 2 {

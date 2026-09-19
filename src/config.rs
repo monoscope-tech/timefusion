@@ -183,21 +183,34 @@ pub fn coordinator_bin_compressed_cap_bytes() -> i64 {
     (COORDINATOR_PER_SORT_BUDGET_BYTES / crate::database::DECODED_BYTES_PER_COMPRESSED as usize) as i64
 }
 
-/// The cap a PACKER may use: the decode cap with a margin, but never so small
-/// that two target-sized files cannot pair.
+/// Decoded bytes ONE coordinator sort may hold. Slicing cuts a bin into this
+/// many decoded bytes per pass, so it bounds a SLICE, never the bin.
+pub fn coordinator_per_sort_decoded_bytes() -> i64 {
+    COORDINATOR_PER_SORT_BUDGET_BYTES as i64
+}
+
+/// How many target-sized files one bin may hold. The prior art prices a
+/// compaction cap as a MULTIPLE of the target file size (RocksDB
+/// `max_compaction_bytes` 25x, IOx `max_compact_size` 3x, Iceberg); 4x is the
+/// conservative end of that range.
+const PACKING_CAP_TARGET_MULTIPLE: i64 = 4;
+
+/// The cap a PACKER may use, as a multiple of the target file size.
 ///
-/// The margin exists because `DECODED_BYTES_PER_COMPRESSED` is an optimistic
-/// estimate, so a bin priced at exactly one sort budget still spills into an
-/// unspillable merge. The floor is mandatory: a cap that cannot admit the two
-/// smallest files admits no pair at all, so the cell re-enqueues forever and the
-/// lane retires nothing.
+/// This used to be the DECODE cap — the largest bin one sort could decode in a
+/// single pass. That made "the sort does not fit" mean "shrink the bin", and
+/// when the margin fell below a pair (#276, 2026-09-13) the packer could select
+/// nothing at all and the sealed lane wedged within the hour. #277 patched it to
+/// `margin.max(smallest_pair)`, which unwedged the lane but guaranteed only TWO
+/// files per bin — so converging a day cost one full rewrite pass per doubling.
+///
+/// Sorts are now SLICED for multi-file bins too (`coordinator_slice_target`), so
+/// the decode budget bounds a slice rather than the bin, and the packer is free
+/// to fill its declared target in ONE pass. The pair floor is kept as a
+/// belt-and-braces: it can no longer bind, but it means no future change to the
+/// multiple can reintroduce a cap that refuses a pair.
 pub fn coordinator_packing_cap_bytes(smallest_pair_bytes: i64) -> i64 {
-    let margin = coordinator_bin_compressed_cap_bytes() * 3 / 5;
-    // The floor is the PAIR itself, not a per-file size doubled: doubling loses a
-    // byte whenever the pair sums odd, and prod 2026-09-13 hit exactly that —
-    // `target=82703666 smallest_pair_bytes=82703667 smallest_pair_fits=false`.
-    // One byte short is as unpackable as a hundred megabytes short.
-    margin.max(smallest_pair_bytes)
+    (crate::database::COORDINATOR_HOT_TARGET_BYTES * PACKING_CAP_TARGET_MULTIPLE).max(smallest_pair_bytes)
 }
 /// Concurrent target-sized repair rewrites the repair budget must hold. A repair
 /// unit is exactly ONE file and cannot be split, so the budget is a multiple of
@@ -2846,25 +2859,43 @@ mod bin_decode_budget_tests {
         }
     }
 
-    /// A packing cap must ALWAYS admit two target-sized files, margin or not:
-    /// below 2x the target file size no pair fits, the packer returns empty, and
-    /// the cell re-enqueues forever. A compaction cap is a MULTIPLE of the target
-    /// file size (RocksDB uses 25x, IOx 3x).
+    /// A packing cap must ALWAYS admit two target-sized files: below 2x the
+    /// target file size no pair fits, the packer returns empty, and the cell
+    /// re-enqueues forever (prod #276, 2026-09-13). A compaction cap is a
+    /// MULTIPLE of the target file size (RocksDB 25x, IOx 3x).
+    ///
+    /// What it no longer asserts: that a full bin fits ONE sort. It used to,
+    /// and that is precisely what forced a bin which could not fit to shrink
+    /// onto its two smallest files. Sorts are sliced now, so the safety property
+    /// moved — see `a_full_bin_is_sliced_to_fit_the_sort_budget` below.
     #[test]
     fn a_packing_cap_always_admits_two_target_sized_files() {
         let metrics_file = 36 * 1024 * 1024;
         let cap = coordinator_packing_cap_bytes(metrics_file * 2);
         assert!(cap >= 72_140_172, "the two smallest prod otel_metrics files ({}) must pair under the cap ({cap})", 72_140_172_i64);
         assert!(cap >= metrics_file * 2, "a cap below 2x the target file size can never merge anything");
-        // Where the floor does not bind, the margin still governs.
-        let small = 4 * 1024 * 1024;
-        let margin_cap = coordinator_packing_cap_bytes(small * 2);
         // An ODD pair must still fit: halving then doubling loses a byte, which
         // prod hit as `target=82703666` against `smallest_pair_bytes=82703667`.
         let odd = 82_703_667;
         assert!(coordinator_packing_cap_bytes(odd) >= odd, "an odd-summed pair must fit the cap it was measured against");
-        let ratio = margin_cap as f64 * crate::database::DECODED_BYTES_PER_COMPRESSED as f64 / COORDINATOR_PER_SORT_BUDGET_BYTES as f64;
-        assert!(ratio <= 0.65, "where the floor does not bind, a full bin is {ratio:.2} of a sort budget; 1.00x measured 28.5 minutes");
-        assert!(margin_cap < coordinator_bin_compressed_cap_bytes(), "the margin must still bind below the raw decode cap");
+        // And the cap must not bind BELOW the declared target, or the packer is
+        // back to shrinking bins instead of filling them.
+        assert!(
+            coordinator_packing_cap_bytes(4 * 1024 * 1024) >= crate::database::COORDINATOR_HOT_TARGET_BYTES,
+            "a cap under the declared target reintroduces the pair-collapse"
+        );
+    }
+
+    /// THE replacement safety property. A bin may now exceed one sort budget,
+    /// so what must hold is that every SLICE of it fits.
+    #[test]
+    fn a_full_bin_is_sliced_to_fit_the_sort_budget() {
+        let bin = crate::database::COORDINATOR_HOT_TARGET_BYTES;
+        let budget = coordinator_per_sort_decoded_bytes();
+        let decoded = bin * crate::database::DECODED_BYTES_PER_COMPRESSED;
+        assert!(decoded > budget, "fixture must exceed one sort budget, or it proves nothing ({decoded} vs {budget})");
+        // `+ 1` mirrors `repair_slice_want`: the slice count the staging loop uses.
+        let slices = decoded / budget + 1;
+        assert!(decoded / slices <= budget, "each slice must fit the sort budget: {decoded}/{slices} > {budget}");
     }
 }

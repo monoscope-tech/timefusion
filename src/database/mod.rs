@@ -1213,12 +1213,6 @@ fn coordinator_operation_timeout(operation: crate::maintenance_coordinator::Oper
 pub(crate) const COORDINATOR_HOT_TARGET_BYTES: i64 = 256 * 1024 * 1024;
 const COORDINATOR_SEALED_TARGET_BYTES: i64 = 256 * 1024 * 1024;
 
-/// Rows one compaction bin may cover, alongside the byte budget: a rewrite costs
-/// what it must sort and write, which is rows, and row density varies by an order
-/// of magnitude across tables. Sits above the rows a 256 MB bin of the widest table
-/// holds, so only row-dense tables are split. Rows come from `numRecords` in Add stats.
-const MAX_BIN_ROWS: u64 = 2_000_000;
-
 /// Rows per decode batch for any session that reads the wide OTel schema. The
 /// parquet decode buffer is not pool-accounted, so EVERY such session must set
 /// this or it inherits DataFusion's much larger default.
@@ -5327,68 +5321,106 @@ fn unsorted_bin_budget_bytes() -> i64 {
 
 /// Pack a cell's candidates into ONE bin, smallest first.
 ///
+/// How a bin orders its candidates before packing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BinOrder {
+    /// Smallest first. Levels an L0 tail: the loop takes its first candidate
+    /// unconditionally, so in event-time order a single large file can fill the
+    /// budget alone and the unit selects ONE file — a 1:1 rewrite retiring none.
+    SmallestFirst,
+    /// Earliest event time first, packing a contiguous slice, so output runs are
+    /// time-disjoint and range pruning keeps working.
+    EventTime,
+}
+
+/// What ONE bin may take. Shared by both compaction paths so their budgets
+/// cannot drift apart — see [`select_bin`].
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BinPolicy {
+    pub target_size: i64,
+    pub max_rows: u64,
+    pub order: BinOrder,
+    /// Exclude sorted runs while any unsorted file is present, so L0 arrivals are
+    /// sorted into runs before runs are merged with each other.
+    pub level_unsorted_first: bool,
+}
+
+/// THE bin packer. One implementation, both callers.
+///
 /// INVARIANT, and it is the whole contract: given two or more PACKABLE
-/// candidates (under `target`, matching the lane's sortedness) this returns two
-/// or more paths. Every rule here is a *stopping* rule — it bounds how much one
-/// bin takes — and none may veto a bin outright, because a veto has no next
-/// attempt to fall through to: the cell is simply re-claimed forever.
+/// candidates this returns two or more paths. Every rule here is a *stopping*
+/// rule — it bounds how much one bin takes — and none may veto a bin outright,
+/// because a veto has no next attempt to fall through to: the cell is simply
+/// re-claimed forever.
 ///
 /// Prod 2026-09-15 is why the invariant is written down. A value floor vetoed
-/// bins under five files; `coordinator_packing_cap_bytes` pins the byte budget
-/// to the two smallest files whenever they exceed the decode margin, so a bin
-/// could never hold more than two. The two rules were mutually unsatisfiable,
-/// sealed consolidation committed nothing for three days, and single cells were
-/// re-claimed 1,663 times while CPU sat at 99% of its limit.
-/// `coordinator_selector_never_refuses_a_packable_pair` pins this.
-fn select_coordinator_compaction_candidates(mut candidates: Vec<TailAdd>, target: i64) -> Vec<String> {
-    let has_unsorted = candidates.iter().any(|add| !add.is_sorted_run);
-    // The pair floor must apply to the limit the loop actually uses, not only to
-    // `target`: whichever budget wins, a bin that cannot hold two files retires
-    // nothing and its cell re-enqueues forever.
+/// bins under five files while the packing cap pinned the byte budget to the two
+/// smallest files, so a bin could never hold more than two. The two rules were
+/// mutually unsatisfiable, sealed consolidation committed nothing for three
+/// days, and single cells were re-claimed 1,663 times while CPU sat at 99% of
+/// its limit.
+///
+/// It is ONE function because it used to be two. The coordinator packed
+/// smallest-first under a cap that collapsed onto a pair; the off-box CLI packed
+/// by event time to its full target. Same intent, different budgets, and the
+/// difference was worth a full rewrite pass per doubling — plus a value floor
+/// that wedged one lane and not the other because they disagreed on `min_files`.
+/// Ordering still differs by design; the BUDGETS may not.
+pub(crate) fn select_bin(candidates: &[TailAdd], policy: BinPolicy) -> Vec<String> {
+    let has_unsorted = policy.level_unsorted_first && candidates.iter().any(|add| !add.is_sorted_run);
+    // The pair floor applies to the limit the loop actually uses, not only to
+    // the target: whichever budget wins, a bin that cannot hold two files
+    // retires nothing and its cell re-enqueues forever.
     let pair_floor = candidates.iter().map(|add| add.size).k_smallest(2).sum::<i64>();
-    let limit = if has_unsorted { unsorted_bin_budget_bytes() } else { target }.max(pair_floor);
-    // SMALLEST FIRST, not event-time: the loop pushes its first candidate
-    // unconditionally, so in event-time order one large file can fill the budget
-    // alone and the unit selects ONE file — a 1:1 rewrite that retires nothing.
-    // Tradeoff: an output run can span a wider event range, weakening range
-    // pruning on that file. Rows are still sorted by the table's sorting columns.
-    candidates.sort_by_key(|add| add.size);
+    let limit = if has_unsorted { unsorted_bin_budget_bytes() } else { policy.target_size }.max(pair_floor);
+
+    let mut ordered: Vec<&TailAdd> = candidates
+        .iter()
+        // A file at or above target is converged and never packing's work,
+        // whatever its tags say — sortedness is Repair's job. EXCEPTION: a
+        // DV-bearing file is not converged at any size, it must be rewritten
+        // DV-free to restore parquet pushdown.
+        .filter(|add| add.size < policy.target_size || add.has_dv)
+        .filter(|add| !(has_unsorted && add.is_sorted_run))
+        .collect();
+    match policy.order {
+        BinOrder::SmallestFirst => ordered.sort_by_key(|add| add.size),
+        BinOrder::EventTime => ordered.sort_by_key(|add| add.event_range.map_or(i64::MIN, |range| range.0)),
+    }
+
     let (mut bytes, mut rows) = (0i64, 0u64);
     let mut selected: Vec<&TailAdd> = Vec::new();
-    for add in candidates.iter() {
-        // A file at or above target is converged and never packing's work,
-        // whatever its tags say — sortedness is Repair's job. The skip must
-        // stay unconditional. EXCEPTION: a DV-bearing file is not converged at
-        // any size — it must be rewritten DV-free to restore parquet pushdown.
-        if add.size >= target && !add.has_dv {
-            continue;
-        }
-        if has_unsorted && add.is_sorted_run {
-            continue;
-        }
+    for add in ordered {
         // ROWS, not just bytes: a rewrite costs what it must sort and write.
-        // Unknown row counts (absent stats) do not accumulate, so this can
-        // never be stricter than the byte budget alone.
+        // Unknown row counts (absent stats) do not accumulate, so this can never
+        // be stricter than the byte budget alone.
         let next_rows = rows.saturating_add(add.rows.unwrap_or(0));
         // Neither budget may reduce a bin below a PAIR — a one-file bin retires
-        // nothing and its cell is re-claimed forever. `limit` carries `pair_floor`
-        // for bytes; the second file is UNCONDITIONALLY exempt from the row cap
-        // for the same reason. It used to be exempt only up to `2 * MAX_BIN_ROWS`,
-        // which is still a veto: two 5M-row files could never pair, so their cell
-        // spun forever. The pair's BYTE envelope is unchanged — `pair_floor`
-        // already admitted these two files — so this widens no memory bound; the
-        // sort spills through the FairSpillPool exactly as it did before.
+        // nothing and its cell is re-claimed forever. `limit` carries
+        // `pair_floor` for bytes; the second file is UNCONDITIONALLY exempt from
+        // the row cap for the same reason. It was once exempt only up to
+        // `2 * max_rows`, which is still a veto: two 5M-row files could never
+        // pair, so their cell spun forever.
         let pair_exemption = selected.len() == 1;
         let over_bytes = bytes.saturating_add(add.size) > limit;
-        let over_rows = next_rows > MAX_BIN_ROWS && !pair_exemption;
+        let over_rows = next_rows > policy.max_rows && !pair_exemption;
         if !selected.is_empty() && (over_bytes || over_rows) {
-            break;
+            if selected.len() >= 2 {
+                break;
+            }
+            // RESTART, don't stop: a lone file is already a run and rewriting it
+            // 1:1 retires nothing, so the pass moves on rather than wedging
+            // behind it. Reachable in event-time order, where one early large
+            // file would otherwise block every later one.
+            (bytes, rows, selected) = (0, 0, Vec::new());
         }
         bytes = bytes.saturating_add(add.size);
-        rows = next_rows;
+        rows = rows.saturating_add(add.rows.unwrap_or(0));
         selected.push(add);
     }
-    if !has_unsorted && selected.len() < 2 {
+    // A lone UNSORTED file is real work: sorting it into a run is the L0 pass.
+    // Everywhere else a one-file bin is a 1:1 rewrite that retires nothing.
+    if selected.len() < 2 && !has_unsorted {
         return Vec::new();
     }
     selected.into_iter().map(|add| add.path.clone()).collect()
@@ -5410,12 +5442,28 @@ fn coordinator_slice_target(pass: TailPass, input_files: usize, bytes_in: i64) -
             .try_into()
             .ok()
             .filter(|target: &i64| *target > 0),
-        // The 16 MB compressed budget re-expressed in decoded bytes, so one unit
-        // runs through the whole slicing path.
+        // A LONE oversized L0 file is cut far finer than the sort budget: it is
+        // unsorted, so the whole file must pass through one sort, and the 16 MB
+        // compressed target keeps that pass small.
         TailPass::Pack if input_files == 1 && bytes_in > COORDINATOR_L0_SORT_TARGET_BYTES => {
             Some(crate::database::maintain::estimated_decoded_bytes(COORDINATOR_L0_SORT_TARGET_BYTES) as i64)
         }
-        TailPass::Pack => None,
+        // MULTI-FILE bins slice to the sort budget. This was `None` until
+        // 2026-09-19, which is why a bin that could not fit its sort had to be
+        // SHRUNK instead — the packing cap collapsed onto the two smallest files
+        // and a day converged one doubling per pass. Slicing bounds the sort
+        // directly, so the packer can fill its target in one pass.
+        //
+        // Cheap here in a way it is not for Repair: these inputs are sorted runs
+        // with real event ranges, so each slice's time predicate prunes row
+        // groups instead of re-reading the whole bin. `repair_slice_want`
+        // returns 1 for a bin that already fits, and the caller only slices when
+        // it wants more than one, so small bins are untouched.
+        // 3/5 of the budget, not all of it: `DECODED_BYTES_PER_COMPRESSED` is an
+        // optimistic fixed ratio, so a slice priced at exactly one sort budget
+        // can still overrun it. The same margin the old bin-level cap carried,
+        // moved to where it belongs.
+        TailPass::Pack => Some(crate::config::coordinator_per_sort_decoded_bytes() * 3 / 5),
     }
 }
 
@@ -5643,24 +5691,26 @@ pub(crate) fn select_tail_bin(adds: &[TailAdd], target_size: i64, min_files: usi
         return ranked.sorted_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.2.cmp(&b.2))).take(take).map(|(path, ..)| path.to_string()).collect();
     }
     // Pack the earliest contiguous slice up to `cap` → one time-disjoint run per
-    // tick; later ticks pack the next (strictly later) slice. The byte cap is the
-    // only stopping rule, and it restarts the slice rather than holing it, which
-    // is what keeps the output a time-disjoint run.
-    let nonrepair = fresh.iter().filter(|(_, _, _, r)| !*r).map(|(path, _, size, _)| (*path, *size));
-    let (mut bytes, mut packed) = (0i64, Vec::<&str>::new());
-    for (path, size) in nonrepair {
-        if !packed.is_empty() && bytes + size > cap {
-            // A lone-file slice is already a run — rewriting it is pure churn.
-            // Skip past it to the next time slice instead of wedging the pass.
-            if packed.len() >= 2 {
-                break;
-            }
-            (bytes, packed) = (0, vec![]);
-        }
-        bytes += size;
-        packed.push(path);
-    }
-    let files: Vec<String> = if packed.len() < 2 { vec![] } else { packed.into_iter().map(str::to_string).collect() };
+    // tick; later ticks pack the next (strictly later) slice. THE SAME packer the
+    // coordinator uses — the budgets live in exactly one place now.
+    // From `fresh`, NOT from `adds`: fresh already applied the seal gate, the
+    // converged threshold and `sorted_run_cap`. Rebuilding from `adds` would
+    // silently readmit every file those filters excluded.
+    let packable: std::collections::HashSet<&str> = fresh.iter().filter(|(_, _, _, r)| !*r).map(|(path, ..)| *path).collect();
+    let nonrepair: Vec<TailAdd> = adds.iter().filter(|add| packable.contains(add.path.as_str())).cloned().collect();
+    let files = select_bin(
+        &nonrepair,
+        BinPolicy {
+            target_size: cap,
+            // NO row cap here: the tail's bins are bounded by bytes, and the sort
+            // they feed is sliced (`coordinator_slice_target`), so rows cannot
+            // blow the sort budget.
+            max_rows: u64::MAX,
+            order: BinOrder::EventTime,
+            // Sortedness is handled by `sorted_run_cap` above, not by levelling.
+            level_unsorted_first: false,
+        },
+    );
     // Gap rule, for TODAY only: once a project has no packable slice left, spend
     // the tick rewriting one oversized unsorted file instead. Today's partition
     // converges so the gap reliably appears; on sealed dates it never does, which
