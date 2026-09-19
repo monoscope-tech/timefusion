@@ -434,11 +434,6 @@ pub fn init_metrics(
         }
     );
     observe!(gauge
-        "timefusion.scan.decoded_bytes_per_compressed",
-        "Arrow bytes one compressed parquet byte actually decodes to, as measured by this process. Every sort budget and slice count derives from it. Seeded at 12 and learned UPWARD only, so it can only make sorts more conservative; sitting at the seed means not enough read traffic to measure yet",
-        crate::database::decoded_bytes_per_compressed() as u64
-    );
-    observe!(gauge
         "timefusion.maintenance.sealed_seconds_since_commit",
         "Seconds since the SEALED lane last committed. Separate from the combined gauge because the hot lane kept committing right through the 2026-09-15 sealed-lane outage. PAGE above two hours",
         {

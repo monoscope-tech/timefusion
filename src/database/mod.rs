@@ -74,7 +74,7 @@ pub(crate) use scan::{GatedScanExec, NOMINAL_DECODE_BATCH_BYTES, date_partition_
 
 /// The decode ratio every sort budget is denominated in; `config` derives the
 /// repair budget from it.
-pub(crate) use maintain::{DECODED_BYTES_PER_COMPRESSED, decoded_bytes_per_compressed};
+pub(crate) use maintain::DECODED_BYTES_PER_COMPRESSED;
 pub use maintain::{file_content_hash, note_probe_cost_into, probe_groups_for_budget};
 pub use write::spill_disk_builder;
 
