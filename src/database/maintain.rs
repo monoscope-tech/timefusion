@@ -147,53 +147,22 @@ pub(crate) fn estimated_decoded_bytes_for(table: &str, compressed: i64, rows: u6
     decoded_bytes_per_row(table).map_or(by_ratio, |width| by_ratio.max(rows.saturating_mul(width)))
 }
 
-/// Read traffic required before a measured ratio is trusted at all.
-const DECODE_RATIO_MIN_SAMPLE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
-
-/// And never slice on a wilder ratio than this. A runaway value would cut a bin
-/// into thousands of slices and stall the lane as surely as a veto would.
-const DECODE_RATIO_MAX: i64 = 48;
-
-/// The decode ratio this process has actually OBSERVED, seeded at
-/// [`DECODED_BYTES_PER_COMPRESSED`] and learned from real traffic — but UPWARD
-/// ONLY.
+/// The global compressed→decoded ratio is NOT learned, and must not be.
 ///
-/// Upward only because the two errors are not symmetric: underestimating
-/// overruns a sort, while overestimating merely buys extra slices. Measurement
-/// may therefore make us safer than the seed, never riskier.
+/// It was, briefly, from `scan_decode.bytes_total / parquet.bytes_read`. Those
+/// two counters are not comparable: decoding also serves data out of the Foyer
+/// cache, which never increments `bytes_read`, so the numerator counts bytes the
+/// denominator never saw. Prod measured 977 GB decoded against 12 GB read — a
+/// ratio of 80, clamped to 48 — which sliced a 256 MB bin into ~16 passes
+/// instead of ~4, quadrupling the scan work per bin during a backlog drain.
 ///
-/// It was a bare constant for every table at once, and that is what
-/// `MAX_BIN_ROWS` was really compensating for: multiplying COMPRESSED bytes by a
-/// fixed number cannot tell a narrow-row table from a wide-row one, so a row cap
-/// was bolted on to correct it — and that cap later became its own bin-collapse
-/// the moment the byte cap stopped being the binding one. A ratio that tracks
-/// reality removes the need for the correction rather than tuning it.
-/// Cached so this is not recomputed per call: the estimate it feeds is folded
-/// PER FILE over whole snapshots (`plan_compaction_debt`, the wave accounting),
-/// so a metrics snapshot per call is thousands of snapshots per planning pass.
-/// A budget ratio does not move minute to minute; recomputing it that often is
-/// pure cost.
-static DECODE_RATIO_CACHE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
-static DECODE_RATIO_AT_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-const DECODE_RATIO_REFRESH_SECS: u64 = 60;
-
+/// A mispaired measurement is worse than an honest constant: it looks like
+/// evidence. The measurement that IS correctly paired is the per-table row
+/// width in [`decoded_bytes_per_row`] — same batch, its own bytes and its own
+/// rows — and that is what [`estimated_decoded_bytes_for`] uses to do better
+/// than this constant.
 pub(crate) fn decoded_bytes_per_compressed() -> i64 {
-    use std::sync::atomic::Ordering::Relaxed;
-    let now = crate::support::now_micros().max(0) as u64 / 1_000_000;
-    let cached = DECODE_RATIO_CACHE.load(Relaxed);
-    if cached != 0 && now.saturating_sub(DECODE_RATIO_AT_SECS.load(Relaxed)) < DECODE_RATIO_REFRESH_SECS {
-        return cached;
-    }
-    let read = deltalake::delta_datafusion::parquet_metrics::snapshot().bytes_read;
-    let ratio = if read < DECODE_RATIO_MIN_SAMPLE_BYTES {
-        DECODED_BYTES_PER_COMPRESSED
-    } else {
-        let decoded = crate::observability::counter_value(crate::database::scan_metric_names::DECODE_BYTES_TOTAL);
-        i64::try_from(decoded / read.max(1)).unwrap_or(DECODED_BYTES_PER_COMPRESSED).clamp(DECODED_BYTES_PER_COMPRESSED, DECODE_RATIO_MAX)
-    };
-    DECODE_RATIO_CACHE.store(ratio, Relaxed);
-    DECODE_RATIO_AT_SECS.store(now, Relaxed);
-    ratio
+    DECODED_BYTES_PER_COMPRESSED
 }
 
 pub(crate) fn estimated_decoded_bytes(compressed_size: i64) -> u64 {

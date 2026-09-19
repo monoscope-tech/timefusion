@@ -435,7 +435,7 @@ pub fn init_metrics(
     );
     observe!(gauge
         "timefusion.scan.decoded_bytes_per_compressed",
-        "Arrow bytes one compressed parquet byte actually decodes to, as measured by this process. Every sort budget and slice count derives from it. Seeded at 12 and learned UPWARD only, so it can only make sorts more conservative; sitting at the seed means not enough read traffic to measure yet",
+        "Arrow bytes one compressed parquet byte is ASSUMED to decode to — a constant, deliberately. Learning it from decode_bytes_total/parquet_bytes_read is mispaired (cache-served decodes raise only the numerator) and read 80x in prod. The honest per-table measurement is the row width used by estimated_decoded_bytes_for",
         crate::database::decoded_bytes_per_compressed() as u64
     );
     observe!(gauge
