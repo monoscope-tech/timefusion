@@ -328,6 +328,12 @@ impl Database {
         }
         let stats = crate::observability::maintenance_stats();
         stats.tantivy_uncovered_files.store(uncovered, std::sync::atomic::Ordering::Relaxed);
+        // SEALED-only, and this is the one worth alerting on. Today's partition is
+        // skipped by the backfill on purpose so it cannot race the hot-tail packer,
+        // and it sits in the hundreds during normal operation — alerting on the
+        // total would fire every day on files nothing intends to rebuild. What is
+        // actionable is coverage lost on a date that is DONE being written.
+        stats.tantivy_uncovered_sealed_files.store(by_age[1].saturating_add(by_age[2]), std::sync::atomic::Ordering::Relaxed);
         stats.tantivy_oversized_skipped.store(oversized, std::sync::atomic::Ordering::Relaxed);
         Ok((uncovered, oversized, by_age))
     }
@@ -443,6 +449,9 @@ impl Database {
             let skip_today =
                 (self.config.tantivy.timefusion_tantivy_backfill_skip_today && hot_packed).then(|| format!("date={}", chrono::Utc::now().date_naive()));
             let mut skipped_today = 0u64;
+            // Tracked separately from `uncovered_total`: today's partition is
+            // skipped BY DESIGN so the backfill cannot race the hot-tail packer,
+            // so those files are not actionable and must not drive an alert.
             for (pid, mut uris) in by_pid {
                 // Counted before the hot-tail skip, so the gauge reports the true total.
                 uncovered_total = uncovered_total.saturating_add(uris.len() as u64);

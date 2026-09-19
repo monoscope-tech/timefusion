@@ -463,6 +463,11 @@ pub fn init_metrics(
     // optimize run took it from 46 to 472 and nothing noticed — the backfill that
     // repairs it ran only at boot, so the count simply sat there.
     observe!(gauge
+        "timefusion.tantivy.uncovered_sealed_files",
+        "Live parquet on SEALED dates with no tantivy index — the ACTIONABLE coverage gap, and the one to alert on. Today's partition is excluded because the backfill skips it on purpose to avoid racing the hot-tail packer, and it runs to the hundreds normally",
+        maintenance_stats().tantivy_uncovered_sealed_files.load(Relaxed)
+    );
+    observe!(gauge
         "timefusion.tantivy.uncovered_files",
         "Live parquet files with no tantivy index. The periodic backfill drains this; a flat or rising value means coverage is being lost faster than it is rebuilt, and queries over those files silently fall back to UDF scan",
         maintenance_stats().tantivy_uncovered_files.load(Relaxed)
@@ -1234,6 +1239,9 @@ atomic_stats! {
         /// TIMEFUSION_TANTIVY_BACKFILL_MAX_FILE_MB. Gauges: each pass overwrites
         /// them. `uncovered` trending to 0 IS the definition of a converged reindex.
         tantivy_uncovered_files,
+        /// Uncovered files on SEALED dates only — today's partition is skipped by
+        /// the backfill by design, so the total is not actionable.
+        tantivy_uncovered_sealed_files,
         tantivy_oversized_skipped,
         /// Pending (non-Complete) tasks split by operation, and the subset that is
         /// ELIGIBLE right now (deadline passed). Gauges, republished each checkpoint.

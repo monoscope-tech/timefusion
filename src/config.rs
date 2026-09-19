@@ -2437,6 +2437,8 @@ pub fn apply(config: &mut AppConfig) {
         }
     };
     let disk_share = |fraction: f64, max| available_disk_gb.map(|gb| ((gb as f64 * fraction) as usize).clamp(MIN_FOYER_DISK_GB, max));
+    // `tune` works on usize slots; this field is u64, so stage it through one.
+    let mut backfill_slot = config.tantivy.timefusion_tantivy_backfill_max_bytes_per_pass_mb as usize;
 
     // MemBuffer and foyer memory come from DerivedBudget — ONE set of RAM
     // fractions; autotune only applies them.
@@ -2466,6 +2468,20 @@ pub fn apply(config: &mut AppConfig) {
         "GB",
     );
     tune("TIMEFUSION_FLUSH_PARALLELISM", &mut config.buffer.timefusion_flush_parallelism, Some((cpus / 2).max(2)), "");
+    // Tantivy backfill, sized from the box rather than pinned. Production had
+    // been overriding BOTH of these (concurrency 4, budget 4096MB) on a 32-core
+    // host because the defaults — 2 and 2048MB — are sized for a small machine.
+    // An override that every deployment needs is a default that is wrong.
+    // An eighth of the cores keeps index builds alongside live query load, which
+    // is what the low default was protecting, while still giving a big host the
+    // parallelism it has.
+    tune("TIMEFUSION_TANTIVY_BUILD_CONCURRENCY", &mut config.tantivy.timefusion_tantivy_build_concurrency, Some((cpus / 8).clamp(2, 8)), "");
+    // And the byte budget scales with that concurrency: each concurrent build
+    // holds a file, so a pass that admits fewer bytes than its builders can chew
+    // simply idles them.
+    let backfill_mb = (config.tantivy.timefusion_tantivy_build_concurrency * 1024).clamp(2048, 8192);
+    tune("TIMEFUSION_TANTIVY_BACKFILL_MAX_BYTES_PER_PASS_MB", &mut backfill_slot, Some(backfill_mb), "MB");
+    config.tantivy.timefusion_tantivy_backfill_max_bytes_per_pass_mb = backfill_slot as u64;
     // Query/maintenance target_partitions. `detect_cores` derives from the cgroup
     // quota; DataFusion's own default (`num_cpus::get()`) honors cpuset pinning
     // but not the CFS quota, so it oversubscribes throttled containers.
@@ -2891,6 +2907,22 @@ mod bin_decode_budget_tests {
             coordinator_packing_cap_bytes(4 * 1024 * 1024) >= crate::database::COORDINATOR_HOT_TARGET_BYTES,
             "a cap under the declared target reintroduces the pair-collapse"
         );
+    }
+
+    /// The tantivy backfill sizes itself from the box. Production overrode BOTH
+    /// knobs on a 32-core host (concurrency 4, 4096MB) because the defaults are
+    /// sized for a small machine — an override every deployment needs is a
+    /// default that is wrong.
+    #[test]
+    fn the_tantivy_backfill_sizes_itself_from_the_box() {
+        // A 32-core host must land on at least what prod had been pinning.
+        let concurrency = (32usize / 8).clamp(2, 8);
+        assert_eq!(concurrency, 4, "a 32-core box must derive prod's hand-set concurrency");
+        assert!((concurrency * 1024).clamp(2048, 8192) >= 4096, "and a byte budget that keeps those builders fed");
+        // A small box must not be pushed past the conservative default.
+        let small = (4usize / 8).clamp(2, 8);
+        assert_eq!(small, 2, "a 4-core box keeps the low concurrency the default protects");
+        assert_eq!((small * 1024).clamp(2048, 8192), 2048, "and the original byte budget");
     }
 
     /// THE replacement safety property. A bin may now exceed one sort budget,
