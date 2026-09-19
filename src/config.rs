@@ -1457,7 +1457,7 @@ pub struct MaintenanceConfig {
     /// every query touching its date, but the lookback IS the suspect-set size,
     /// so too wide a value spends the pass clearing already-sorted files.
     /// 0 restores today-only repair.
-    #[serde_inline_default(75)]
+    #[serde_inline_default(31)]
     pub timefusion_light_optimize_repair_days: u64,
     #[serde_inline_default("0 */5 * * * *".to_string())]
     pub timefusion_light_optimize_schedule: String,
