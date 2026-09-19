@@ -2956,9 +2956,21 @@ async fn database_bounds_concurrent_maintenance_jobs() -> Result<()> {
 
     let request = Resources { cpu: 1, decoded_bytes: MAX_DECODED_BYTES, object_reads: 1, object_writes: 1 };
 
-    let permits: Vec<_> =
-        (0..jobs).map(|i| db.maintenance_admission.try_acquire(request).unwrap_or_else(|| panic!("job {i} of {jobs} must be admitted"))).collect();
-    assert!(db.maintenance_admission.try_acquire(request).is_none(), "admission must stop at the configured job count, not run unbounded");
+    // `coordinator_jobs` is the FLOOR of the ceiling, not its cap: the ceiling is
+    // lag-scaled, so an idle runtime admits up to `cores * 3/4` and a starved one
+    // falls back to exactly `jobs`. Asserting an exact count made this test pass
+    // or fail on how busy the runner happened to be. The invariants that actually
+    // matter are that admission is BOUNDED and that every token comes back.
+    const RUNAWAY: usize = 512;
+    let mut permits = Vec::new();
+    while permits.len() < RUNAWAY {
+        match db.maintenance_admission.try_acquire(request) {
+            Some(permit) => permits.push(permit),
+            None => break,
+        }
+    }
+    assert!(permits.len() >= jobs, "admission must reach the configured job count, got {} of {jobs}", permits.len());
+    assert!(permits.len() < RUNAWAY, "admission must be bounded, not run unbounded");
     drop(permits);
     assert!(db.maintenance_admission.try_acquire(request).is_some(), "dropping the jobs returns every admission token");
     Ok(())
