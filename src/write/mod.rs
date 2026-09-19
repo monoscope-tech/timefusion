@@ -3709,13 +3709,17 @@ mod tests {
         }
     }
 
-    /// With coalescing OFF (the default) the per-project writer is used and the
+    /// With coalescing explicitly OFF the per-project writer is used and the
     /// coalescing writer is never called, even when both are wired.
     #[serial]
     #[tokio::test(flavor = "multi_thread")]
     async fn coalescing_disabled_uses_the_per_project_writer() {
-        let (_dir, cfg, table, projects) = cotenant_env("cd", 2, |c| c.buffer.timefusion_flush_dwell_secs = 0);
-        assert!(!cfg.buffer.flush_coalesce_commits(), "coalescing must default to OFF");
+        let (_dir, cfg, table, projects) = cotenant_env("cd", 2, |c| {
+            c.buffer.timefusion_flush_dwell_secs = 0;
+            // Coalescing ships ON now, so this path must be asked for explicitly.
+            c.buffer.timefusion_flush_coalesce_commits = false;
+        });
+        assert!(!cfg.buffer.flush_coalesce_commits(), "this test exercises the per-project writer");
 
         let (per_project, coalesced) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
         let (pp, cc) = (per_project.clone(), coalesced.clone());

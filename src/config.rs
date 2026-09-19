@@ -903,7 +903,7 @@ impl AwsConfig {
     /// Effective connect timeout. Generous on purpose: it trades slower failure
     /// for surviving transient connection refusals.
     pub fn connect_timeout(&self) -> String {
-        normalize_duration(self.timefusion_s3_connect_timeout.as_deref(), "60s")
+        normalize_duration(self.timefusion_s3_connect_timeout.as_deref(), "150s")
     }
 
     pub fn request_timeout(&self) -> String {
@@ -1015,7 +1015,7 @@ pub struct BufferConfig {
     /// Delta table. Parquet writes still fan out `flush_parallelism`-wide; only the
     /// commit is shared. Custom-storage projects have their own `_delta_log` and are
     /// never coalesced with default storage.
-    #[serde_inline_default(false)]
+    #[serde_inline_default(true)]
     pub timefusion_flush_coalesce_commits: bool,
     #[serde(default)]
     pub timefusion_flush_immediately: bool,
@@ -1077,7 +1077,7 @@ pub struct BufferConfig {
     /// the drain sees the assignment applied twice, and a failed drain retries
     /// whole groups. Timestamp-range conjuncts are widened to the union across
     /// coalesced statements.
-    #[serde_inline_default(3)]
+    #[serde_inline_default(60)]
     pub timefusion_dml_coalesce_secs: u64,
     /// Fold same-shape coalesced groups across projects into one MERGE per
     /// unified table per drain (`project_id` becomes a join key + IN-list
@@ -1457,7 +1457,7 @@ pub struct MaintenanceConfig {
     /// every query touching its date, but the lookback IS the suspect-set size,
     /// so too wide a value spends the pass clearing already-sorted files.
     /// 0 restores today-only repair.
-    #[serde_inline_default(31)]
+    #[serde_inline_default(75)]
     pub timefusion_light_optimize_repair_days: u64,
     #[serde_inline_default("0 */5 * * * *".to_string())]
     pub timefusion_light_optimize_schedule: String,
