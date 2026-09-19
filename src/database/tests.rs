@@ -4032,6 +4032,22 @@ fn tail_selector_never_refuses_a_packable_slice() {
     }
 }
 
+/// The decode ratio may only ever be learned UPWARD from its seed.
+///
+/// Underestimating overruns a sort; overestimating only buys extra slices. So a
+/// measured ratio is allowed to make the budget more conservative and never
+/// less, and a wild value cannot cut a bin into thousands of slices.
+#[test]
+fn the_decode_ratio_is_learned_upward_only_and_bounded() {
+    let seed = super::super::database::maintain::DECODED_BYTES_PER_COMPRESSED;
+    let live = crate::database::decoded_bytes_per_compressed();
+    assert!(live >= seed, "a learned ratio below the seed would make every sort budget less safe than today: {live} < {seed}");
+    assert!(live <= 48, "an unbounded ratio would slice a bin into thousands of passes: {live}");
+    // And the conversion must use it, so the estimate tracks the ratio.
+    assert_eq!(crate::database::maintain::estimated_decoded_bytes(1000), 1000 * live as u64);
+    assert_eq!(crate::database::maintain::estimated_decoded_bytes(-5), 0, "a negative size cannot underflow the estimate");
+}
+
 /// UNIFICATION, pinned. Both compaction paths must reach the same packer, so a
 /// budget fixed in one is fixed in both. Until 2026-09-19 they were separate
 /// functions: the coordinator's cap collapsed onto the two smallest files while

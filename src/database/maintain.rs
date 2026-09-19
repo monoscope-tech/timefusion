@@ -98,13 +98,44 @@ pub(crate) fn admit_backfill_pass(
     (want, consumed)
 }
 
-/// Arrow bytes one compressed parquet byte decodes to, at the observed zstd
-/// ratio. Every sort budget in this crate is denominated in DECODED bytes while
-/// `Add.size` is compressed; mixing the two units exhausts the sort pool.
+/// Arrow bytes one compressed parquet byte decodes to — the SEED for
+/// [`decoded_bytes_per_compressed`]. Every sort budget in this crate is
+/// denominated in DECODED bytes while `Add.size` is compressed; mixing the two
+/// units exhausts the sort pool.
 pub(crate) const DECODED_BYTES_PER_COMPRESSED: i64 = 12;
 
+/// Read traffic required before a measured ratio is trusted at all.
+const DECODE_RATIO_MIN_SAMPLE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
+/// And never slice on a wilder ratio than this. A runaway value would cut a bin
+/// into thousands of slices and stall the lane as surely as a veto would.
+const DECODE_RATIO_MAX: i64 = 48;
+
+/// The decode ratio this process has actually OBSERVED, seeded at
+/// [`DECODED_BYTES_PER_COMPRESSED`] and learned from real traffic — but UPWARD
+/// ONLY.
+///
+/// Upward only because the two errors are not symmetric: underestimating
+/// overruns a sort, while overestimating merely buys extra slices. Measurement
+/// may therefore make us safer than the seed, never riskier.
+///
+/// It was a bare constant for every table at once, and that is what
+/// `MAX_BIN_ROWS` was really compensating for: multiplying COMPRESSED bytes by a
+/// fixed number cannot tell a narrow-row table from a wide-row one, so a row cap
+/// was bolted on to correct it — and that cap later became its own bin-collapse
+/// the moment the byte cap stopped being the binding one. A ratio that tracks
+/// reality removes the need for the correction rather than tuning it.
+pub(crate) fn decoded_bytes_per_compressed() -> i64 {
+    let read = deltalake::delta_datafusion::parquet_metrics::snapshot().bytes_read;
+    if read < DECODE_RATIO_MIN_SAMPLE_BYTES {
+        return DECODED_BYTES_PER_COMPRESSED;
+    }
+    let decoded = crate::observability::counter_value(crate::database::scan_metric_names::DECODE_BYTES_TOTAL);
+    i64::try_from(decoded / read.max(1)).unwrap_or(DECODED_BYTES_PER_COMPRESSED).clamp(DECODED_BYTES_PER_COMPRESSED, DECODE_RATIO_MAX)
+}
+
 pub(crate) fn estimated_decoded_bytes(compressed_size: i64) -> u64 {
-    u64::try_from(compressed_size.max(0)).unwrap_or_default().saturating_mul(DECODED_BYTES_PER_COMPRESSED as u64)
+    u64::try_from(compressed_size.max(0)).unwrap_or_default().saturating_mul(decoded_bytes_per_compressed() as u64)
 }
 
 /// Rows per scan batch that put one batch near `target_bytes` of decoded Arrow.
