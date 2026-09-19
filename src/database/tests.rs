@@ -2905,6 +2905,43 @@ fn sweep_rotation_never_rotates_today_out() {
     assert!(empty.is_empty());
 }
 
+/// The CPU ceiling is MEASURED, not pinned at `cores/3`.
+///
+/// Prod 2026-09-19 sat at 10 of 10 cpu tokens with ~2,500 units eligible, 3 of 4
+/// rewrite permits idle and the box at half its CPU limit — the static
+/// reservation was costing throughput it did not need to. It may now rise when
+/// the runtime is not starved, and must fall back to exactly the old value when
+/// it is, so this can never admit LESS than before.
+#[test]
+fn the_cpu_ceiling_follows_runtime_starvation() {
+    use crate::maintenance_coordinator::lag_scaled_cpu_ceiling_for_test as ceiling;
+    let (base, max) = (10u32, 24u32);
+    assert_eq!(ceiling(base, max, 0), max, "an idle runtime gets the full ceiling");
+    assert_eq!(ceiling(base, max, 25), max, "and still does at the full-cap threshold");
+    assert_eq!(ceiling(base, max, 250), base, "a starved runtime falls back to the static reservation");
+    assert_eq!(ceiling(base, max, 5_000), base, "and never below it, however bad the lag");
+    let mid = ceiling(base, max, 137);
+    assert!(mid > base && mid < max, "between the thresholds it interpolates, got {mid}");
+    // A box whose max is not above its base is simply the old behaviour.
+    assert_eq!(ceiling(10, 10, 0), 10);
+}
+
+/// Rollups keep a reserved share. They lose every race otherwise: compaction and
+/// dedup arrive continuously, and prod ran 1,690 eligible base-rollup units with
+/// `rollup_hits_full_total` at ZERO.
+#[test]
+fn rollups_keep_a_reserved_share_of_admission() {
+    use crate::maintenance_coordinator::{AdmissionController, AdmissionLane, MAX_DECODED_BYTES, Resources};
+    let admission = AdmissionController::with_cpu_ceiling(4, 4, u64::MAX, 64, 64);
+    let request = Resources { cpu: 1, decoded_bytes: MAX_DECODED_BYTES / 8, object_reads: 1, object_writes: 1 };
+    // Non-rollup work fills everything EXCEPT the reservation.
+    let held: Vec<_> = std::iter::repeat_with(|| admission.try_acquire_for(request, AdmissionLane::Other)).map_while(|p| p).collect();
+    assert_eq!(held.len(), 2, "other lanes must stop short of the rollup reservation, took {}", held.len());
+    assert!(admission.try_acquire_for(request, AdmissionLane::Other).is_none(), "and stay stopped");
+    // The reserved slots are still there for a rollup.
+    assert!(admission.try_acquire_for(request, AdmissionLane::Rollup).is_some(), "a rollup must reach its reserved share");
+}
+
 /// Maintenance admission is bounded by the configured job count, and every token is returned
 /// when a job finishes.
 #[tokio::test]
@@ -2913,6 +2950,7 @@ async fn database_bounds_concurrent_maintenance_jobs() -> Result<()> {
 
     let db = Database::with_config(create_test_config("bounded-maintenance-jobs")).await?;
     let jobs = db.config.derived.coordinator_jobs();
+
     let request = Resources { cpu: 1, decoded_bytes: MAX_DECODED_BYTES, object_reads: 1, object_writes: 1 };
 
     let permits: Vec<_> =

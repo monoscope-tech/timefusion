@@ -2188,8 +2188,10 @@ impl Database {
         let hash_shards = estimated_bytes.div_ceil(MAX_DECODED_BYTES).max(1);
         anyhow::ensure!(hash_shards <= 65_536, "one-minute slice needs {hash_shards} hash shards; maximum is 65536");
         let per_shard_bytes = estimated_bytes.div_ceil(hash_shards).max(1);
-        let Some(_permit) = self.maintenance_admission.try_acquire(Resources { cpu: 1, decoded_bytes: per_shard_bytes, object_reads: 1, object_writes: 1 })
-        else {
+        let Some(_permit) = self.maintenance_admission.try_acquire_for(
+            Resources { cpu: 1, decoded_bytes: per_shard_bytes, object_reads: 1, object_writes: 1 },
+            crate::maintenance_coordinator::AdmissionLane::Rollup,
+        ) else {
             // Transient, never "too big to admit": the shard count above was chosen so
             // `per_shard_bytes <= MAX_DECODED_BYTES`.
             return retry("admission_busy".to_owned(), self.admission_backoff_for(&key));
@@ -2976,7 +2978,13 @@ impl Database {
         // The request must be the unit's own size, or the occupancy-scaled ceiling
         // refuses everything on a busy pool.
         let request = Resources { cpu: 1, decoded_bytes: task.estimated_decoded_bytes.clamp(1, MAX_DECODED_BYTES), object_reads: 1, object_writes: 1 };
-        let Some(_permit) = self.maintenance_admission.try_acquire(request) else {
+        // Rollups claim the reserved share; every other lane competes for what is
+        // left, so continuous compaction cannot starve them the way it did.
+        let lane = match key.operation {
+            Operation::BaseRollup | Operation::DerivedRollup => crate::maintenance_coordinator::AdmissionLane::Rollup,
+            _ => crate::maintenance_coordinator::AdmissionLane::Other,
+        };
+        let Some(_permit) = self.maintenance_admission.try_acquire_for(request, lane) else {
             return self.retried(&key, "admission_busy".to_owned(), admission_backoff(task.attempts));
         };
         note(2);

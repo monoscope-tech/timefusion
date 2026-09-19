@@ -2903,8 +2903,15 @@ impl Database {
         // Narrow so maintenance cannot saturate PGWire; I/O is latency-bound, so it gets more.
         let coordinator_jobs = cfg.derived.coordinator_jobs();
         let coordinator_io_slots = u32::try_from(coordinator_jobs.saturating_mul(2)).unwrap_or(u32::MAX);
-        let maintenance_admission = crate::maintenance_coordinator::AdmissionController::new(
-            u32::try_from(coordinator_jobs).unwrap_or(1),
+        // The static `coordinator_jobs` (cores/3) is the floor; an unstarved
+        // runtime may go to three quarters of the cores. Prod sat pinned at the
+        // floor with ~2,500 units eligible while the box ran at half its CPU
+        // limit, so the reservation was costing throughput it did not need to.
+        let cpu_base = u32::try_from(coordinator_jobs).unwrap_or(1);
+        let cpu_max = u32::try_from(cfg.derived.cores * 3 / 4).unwrap_or(cpu_base).max(cpu_base);
+        let maintenance_admission = crate::maintenance_coordinator::AdmissionController::with_cpu_ceiling(
+            cpu_base,
+            cpu_max,
             u64::try_from(cfg.derived.memory_limit_bytes).unwrap_or(u64::MAX),
             coordinator_io_slots,
             coordinator_io_slots,

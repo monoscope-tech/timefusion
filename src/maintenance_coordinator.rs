@@ -2326,6 +2326,8 @@ impl Resources {
 struct AdmissionState {
     capacity: Resources,
     available: Resources,
+    /// The static reservation the adaptive ceiling falls back to under load.
+    cpu_base: u32,
 }
 
 impl AdmissionState {
@@ -2353,21 +2355,92 @@ fn occupancy_scaled_ceiling(available: u64, capacity: u64) -> u64 {
     scaled.clamp(FLOOR, MAX_DECODED_BYTES)
 }
 
+/// Which lane is asking. Rollups get a reserved share because they lose every
+/// race otherwise: compaction and dedup arrive continuously while rollups queue
+/// behind them, and prod 2026-09-19 ran 1,690 eligible base-rollup units with
+/// `rollup_hits_full_total` at ZERO — not one query served from a full rollup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdmissionLane {
+    Rollup,
+    Other,
+}
+
+/// CPU slots reserved for rollups, which no other lane may take.
+const ROLLUP_RESERVED_CPU: u32 = 2;
+
+/// CPU slots admitted at the runtime's current scheduling lag.
+///
+/// `cores/3` was a static stand-in for "leave CPU for the query path". It is
+/// MEASURED now: scheduling lag is how late a 500ms timer actually woke, so it
+/// reports runtime starvation directly rather than guessing at it. An idle box
+/// gets the full ceiling; a starved one falls back to exactly the static
+/// reservation and never below it, so this can only ever admit more work than
+/// the constant did, never less.
+#[cfg(test)]
+pub fn lag_scaled_cpu_ceiling_for_test(base: u32, capacity: u32, lag_ms: u64) -> u32 {
+    lag_scaled_cpu_ceiling_inner(base, capacity, lag_ms)
+}
+
+fn lag_scaled_cpu_ceiling(base: u32, capacity: u32) -> u32 {
+    lag_scaled_cpu_ceiling_inner(base, capacity, crate::observability::runtime_lag_ms().0)
+}
+
+fn lag_scaled_cpu_ceiling_inner(base: u32, capacity: u32, lag: u64) -> u32 {
+    /// At or under this lag the runtime is not starved and the full ceiling applies.
+    const FULL_AT_LAG_MS: u64 = 25;
+    /// At or over it, fall back to the static reservation.
+    const BASE_AT_LAG_MS: u64 = 250;
+    if capacity <= base {
+        return base;
+    }
+    if lag <= FULL_AT_LAG_MS {
+        return capacity;
+    }
+    if lag >= BASE_AT_LAG_MS {
+        return base;
+    }
+    let span = u128::from(BASE_AT_LAG_MS - FULL_AT_LAG_MS);
+    let headroom = u128::from(BASE_AT_LAG_MS - lag);
+    base + (u128::from(capacity - base) * headroom / span) as u32
+}
+
 impl AdmissionController {
+    /// `cpu` is the STATIC reservation (the old fixed ceiling) and `cpu_max` the
+    /// most an unstarved runtime will admit; the live ceiling moves between them.
     pub fn new(cpu: u32, cgroup_memory_bytes: u64, object_reads: u32, object_writes: u32) -> Self {
+        Self::with_cpu_ceiling(cpu, cpu, cgroup_memory_bytes, object_reads, object_writes)
+    }
+
+    pub fn with_cpu_ceiling(cpu_base: u32, cpu_max: u32, cgroup_memory_bytes: u64, object_reads: u32, object_writes: u32) -> Self {
         // At most 75% is trackable maintenance decode. The remainder is an
         // unconditional foreground/untracked-allocation reserve.
         let decoded_bytes = cgroup_memory_bytes.saturating_mul(3) / 4;
-        let capacity = Resources { cpu, decoded_bytes, object_reads, object_writes };
-        Self(Arc::new(Mutex::new(AdmissionState { capacity, available: capacity })))
+        let capacity = Resources { cpu: cpu_max.max(cpu_base), decoded_bytes, object_reads, object_writes };
+        Self(Arc::new(Mutex::new(AdmissionState { capacity, available: capacity, cpu_base })))
     }
 
     pub fn try_acquire(&self, request: Resources) -> Option<AdmissionPermit> {
+        self.try_acquire_for(request, AdmissionLane::Other)
+    }
+
+    pub fn try_acquire_for(&self, request: Resources, lane: AdmissionLane) -> Option<AdmissionPermit> {
         if request.decoded_bytes > MAX_DECODED_BYTES {
             return None;
         }
         let mut state = lock(&self.0);
         if request.decoded_bytes > occupancy_scaled_ceiling(state.available.decoded_bytes, state.capacity.decoded_bytes) {
+            return None;
+        }
+        // CPU is the dimension that actually binds — prod sat at 10 of 10 tokens
+        // with ~2,500 units eligible, 3 of 4 rewrite permits idle and the box at
+        // half its CPU limit. Scale it by measured starvation, and hold back a
+        // slice so rollups cannot be crowded out by continuous compaction work.
+        let ceiling = lag_scaled_cpu_ceiling(state.cpu_base, state.capacity.cpu);
+        let ceiling = match lane {
+            AdmissionLane::Rollup => ceiling,
+            AdmissionLane::Other => ceiling.saturating_sub(ROLLUP_RESERVED_CPU).max(1),
+        };
+        if state.used().cpu.saturating_add(request.cpu) > ceiling {
             return None;
         }
         // `checked_sub` is `fits` plus the subtraction, so it is the whole gate.
