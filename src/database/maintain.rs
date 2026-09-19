@@ -98,75 +98,13 @@ pub(crate) fn admit_backfill_pass(
     (want, consumed)
 }
 
-/// Arrow bytes one compressed parquet byte decodes to — the SEED for
-/// [`decoded_bytes_per_compressed`]. Every sort budget in this crate is
-/// denominated in DECODED bytes while `Add.size` is compressed; mixing the two
-/// units exhausts the sort pool.
+/// Arrow bytes one compressed parquet byte decodes to, at the observed zstd
+/// ratio. Every sort budget in this crate is denominated in DECODED bytes while
+/// `Add.size` is compressed; mixing the two units exhausts the sort pool.
 pub(crate) const DECODED_BYTES_PER_COMPRESSED: i64 = 12;
 
-/// Decoded Arrow bytes per row, measured PER TABLE where rows are actually
-/// decoded (`GatedScanExec`). Running totals, not an EWMA: the question is what
-/// a typical row of this table costs, and totals answer it without a tuning
-/// constant of their own.
-static DECODED_ROW_WIDTHS: std::sync::LazyLock<dashmap::DashMap<std::sync::Arc<str>, (std::sync::atomic::AtomicU64, std::sync::atomic::AtomicU64)>> =
-    std::sync::LazyLock::new(dashmap::DashMap::new);
-
-/// Rows a table must have decoded before its width is trusted over the global ratio.
-const ROW_WIDTH_MIN_SAMPLE_ROWS: u64 = 1_000_000;
-
-/// Record what one decoded batch of `table` actually cost.
-pub(crate) fn observe_decoded_batch(table: &std::sync::Arc<str>, rows: u64, decoded_bytes: u64) {
-    use std::sync::atomic::Ordering::Relaxed;
-    if rows == 0 {
-        return;
-    }
-    let entry = DECODED_ROW_WIDTHS.entry(std::sync::Arc::clone(table)).or_default();
-    entry.0.fetch_add(rows, Relaxed);
-    entry.1.fetch_add(decoded_bytes, Relaxed);
-}
-
-/// Measured decoded bytes per row for `table`, once enough rows have been seen.
-pub(crate) fn decoded_bytes_per_row(table: &str) -> Option<u64> {
-    use std::sync::atomic::Ordering::Relaxed;
-    let entry = DECODED_ROW_WIDTHS.get(table)?;
-    let (rows, bytes) = (entry.0.load(Relaxed), entry.1.load(Relaxed));
-    (rows >= ROW_WIDTH_MIN_SAMPLE_ROWS).then(|| bytes / rows.max(1)).filter(|width| *width > 0)
-}
-
-/// Decoded bytes a bin of `rows` rows and `compressed` bytes of THIS table will
-/// hold, taking the MORE CONSERVATIVE of two estimates.
-///
-/// The row-width estimate is the honest one: it is measured per table at the
-/// point rows are decoded, so it sees that a Shipbubble log row carrying a 9.4 KB
-/// body costs vastly more than an `otel_metrics` row, which a single global
-/// compression ratio cannot. But it is only taken when it asks for MORE than the
-/// ratio would — the two errors are not symmetric, and a per-table width that
-/// came out low would quietly make every sort less conservative than today.
-pub(crate) fn estimated_decoded_bytes_for(table: &str, compressed: i64, rows: u64) -> u64 {
-    let by_ratio = estimated_decoded_bytes(compressed);
-    decoded_bytes_per_row(table).map_or(by_ratio, |width| by_ratio.max(rows.saturating_mul(width)))
-}
-
-/// The global compressed→decoded ratio is NOT learned, and must not be.
-///
-/// It was, briefly, from `scan_decode.bytes_total / parquet.bytes_read`. Those
-/// two counters are not comparable: decoding also serves data out of the Foyer
-/// cache, which never increments `bytes_read`, so the numerator counts bytes the
-/// denominator never saw. Prod measured 977 GB decoded against 12 GB read — a
-/// ratio of 80, clamped to 48 — which sliced a 256 MB bin into ~16 passes
-/// instead of ~4, quadrupling the scan work per bin during a backlog drain.
-///
-/// A mispaired measurement is worse than an honest constant: it looks like
-/// evidence. The measurement that IS correctly paired is the per-table row
-/// width in [`decoded_bytes_per_row`] — same batch, its own bytes and its own
-/// rows — and that is what [`estimated_decoded_bytes_for`] uses to do better
-/// than this constant.
-pub(crate) fn decoded_bytes_per_compressed() -> i64 {
-    DECODED_BYTES_PER_COMPRESSED
-}
-
 pub(crate) fn estimated_decoded_bytes(compressed_size: i64) -> u64 {
-    u64::try_from(compressed_size.max(0)).unwrap_or_default().saturating_mul(decoded_bytes_per_compressed() as u64)
+    u64::try_from(compressed_size.max(0)).unwrap_or_default().saturating_mul(DECODED_BYTES_PER_COMPRESSED as u64)
 }
 
 /// Rows per scan batch that put one batch near `target_bytes` of decoded Arrow.
@@ -6264,16 +6202,10 @@ impl Database {
         let permit_wait_ms = permit_wait.elapsed().as_millis() as u64;
         let stage_started = std::time::Instant::now();
         let bytes_in: i64 = targets.iter().map(|a| a.size).sum();
+        let decoded_in = estimated_decoded_bytes(bytes_in);
         let rows_in: u64 = targets.iter().filter_map(add_row_count).sum();
-        // PER TABLE where we can: the measured row width sees a fat-bodied table
-        // that a global compression ratio averages away. Falls back to the ratio
-        // until the table has decoded enough rows to be trusted, and never asks
-        // for LESS than the ratio would.
-        let decoded_in = estimated_decoded_bytes_for(table_name, bytes_in, rows_in);
-        // THIS bin's row width — feeds both the scan batch size and the output's
-        // row-group cap. Genuinely measured now when the table has a learned
-        // width; it used to be `(compressed x 12) / rows`, which is the global
-        // constant reshaped rather than anything observed.
+        // THIS bin's measured row width — feeds both the scan batch size and the
+        // output's row-group cap.
         let measured_bytes_per_row = decoded_in.checked_div(rows_in).filter(|width| *width > 0);
         let batch_size = batch_rows_for(decoded_in, rows_in, self.config.maintenance.timefusion_maintenance_batch_target_bytes).to_string();
         // Emitted BEFORE the rewrite, because the interesting bins are the ones

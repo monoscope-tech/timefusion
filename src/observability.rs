@@ -434,11 +434,6 @@ pub fn init_metrics(
         }
     );
     observe!(gauge
-        "timefusion.scan.decoded_bytes_per_compressed",
-        "Arrow bytes one compressed parquet byte is ASSUMED to decode to — a constant, deliberately. Learning it from decode_bytes_total/parquet_bytes_read is mispaired (cache-served decodes raise only the numerator) and read 80x in prod. The honest per-table measurement is the row width used by estimated_decoded_bytes_for",
-        crate::database::decoded_bytes_per_compressed() as u64
-    );
-    observe!(gauge
         "timefusion.maintenance.sealed_seconds_since_commit",
         "Seconds since the SEALED lane last committed. Separate from the combined gauge because the hot lane kept committing right through the 2026-09-15 sealed-lane outage. PAGE above two hours",
         {
