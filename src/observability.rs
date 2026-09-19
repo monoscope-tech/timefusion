@@ -457,6 +457,16 @@ pub fn init_metrics(
     observe!(gauge "timefusion.maintenance.pending_base_rollup", "BaseRollup units queued", maintenance_stats().pending_base_rollup.load(Relaxed));
     observe!(gauge "timefusion.maintenance.pending_dedup", "Dedup units queued", maintenance_stats().pending_dedup.load(Relaxed));
     observe!(gauge "timefusion.maintenance.pending_repair", "Repair units queued", maintenance_stats().pending_repair.load(Relaxed));
+    // INDEX COVERAGE. Live parquet with no tantivy index: those files fall back
+    // to UDF scan, so queries over them are slow while every compaction metric
+    // looks healthy. It had no metric at all until 2026-09-19, when an off-box
+    // optimize run took it from 46 to 472 and nothing noticed — the backfill that
+    // repairs it ran only at boot, so the count simply sat there.
+    observe!(gauge
+        "timefusion.tantivy.uncovered_files",
+        "Live parquet files with no tantivy index. The periodic backfill drains this; a flat or rising value means coverage is being lost faster than it is rebuilt, and queries over those files silently fall back to UDF scan",
+        maintenance_stats().tantivy_uncovered_files.load(Relaxed)
+    );
     // QUERY LATENCY, the headline symptom, which had no usable history at all.
     // Both latency histograms go through the `metrics` -> OTel bridge and arrive
     // with a NULL scalar value, so "are queries slow?" — the question this whole

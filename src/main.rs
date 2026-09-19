@@ -27,7 +27,7 @@ use timefusion::{
     observability, server, support,
     write::BufferedWriteLayer,
 };
-use tokio::time::{Duration, sleep};
+use tokio::time::Duration;
 use tracing::{error, info, warn};
 
 /// Stack size for every Tokio worker. Query planning recurses with schema width
@@ -878,12 +878,10 @@ async fn run_optimize_cli(cfg: &'static AppConfig) -> anyhow::Result<()> {
     let mut dry_run = false;
     let mut project: Option<String> = None;
     let mut concurrency: Option<usize> = None;
-    let mut consolidate = false;
     let mut dedup = false;
     let mut recompress = false;
-    let mut target_size_mb: Option<i64> = None;
     let mut it = Args::new();
-    cli_args!(it, "usage: timefusion optimize [--table T] [--date YYYY-MM-DD | --older-than-hours N | --all] [--project ID] [--concurrency N] [--consolidate [--target-size-mb N]] [--dedup] [--recompress] [--dry-run]", {
+    cli_args!(it, "usage: timefusion optimize [--table T] [--date YYYY-MM-DD | --older-than-hours N | --all] [--project ID] [--concurrency N] [--dedup] [--recompress] [--dry-run]", {
         "--table" => table = it.value("--table")?,
         "--date" => only_date = Some(it.parse("--date", "YYYY-MM-DD")?),
         "--older-than-hours" => older_than_hours = it.parse("--older-than-hours", "an integer")?,
@@ -891,12 +889,9 @@ async fn run_optimize_cli(cfg: &'static AppConfig) -> anyhow::Result<()> {
         "--dry-run" => dry_run = true,
         "--project" => project = Some(it.value("--project")?),
         "--concurrency" => concurrency = Some(it.parse("--concurrency", "an integer")?),
-        "--consolidate" => consolidate = true,
         "--dedup" => dedup = true,
         "--recompress" => recompress = true,
-        "--target-size-mb" => target_size_mb = Some(it.parse("--target-size-mb", "an integer")?),
     });
-    anyhow::ensure!(target_size_mb.is_none() || consolidate, "--target-size-mb only applies to --consolidate");
 
     let db = Database::with_config(Arc::new(cfg.clone())).await?;
     // Attach the tantivy sidecar service as the server bootstrap does; without it
@@ -964,40 +959,30 @@ async fn run_optimize_cli(cfg: &'static AppConfig) -> anyhow::Result<()> {
         return db.shutdown().await;
     }
     println!("compacting {} partition(s) of '{}' ({})", dates.len(), table, scope);
-    if consolidate || dedup {
-        // Leveled event-time-disjoint consolidation and/or a dedup pass, run per
-        // project so a busy day's tens of GB never sit in one merge. Incremental
-        // per-run commits make an interrupted run resumable.
-        const MAX_ATTEMPTS: u64 = 5;
+    // NO `--consolidate` HERE. Draining a compaction backlog off-box rewrote
+    // files without indexing them: `reconcile_tantivy` delegates to the SAME
+    // budget-bounded backfill pass as the server (~320 files / 2048 MB), so it
+    // cannot re-index a drain of any size however it is placed, and running it
+    // once at the end indexed nothing at all when a run was interrupted. Prod
+    // 2026-09-19: six partitions took `tantivy_uncovered_files` 46 -> 472 while
+    // `sealed_compaction_debt_bytes` fell — a metric that improves as queries
+    // over those dates get slower.
+    //
+    // The in-cluster lane calls `reindex_wave_outputs` inside `commit_wave`, so
+    // it indexes each wave as part of committing it, and since the packer was
+    // unified it fills bins to the target instead of merging pairs. That is the
+    // path for backlogs now; this CLI keeps only the jobs that do not rewrite
+    // data behind the indexer's back.
+    if dedup {
         for d in &dates {
             let projects = match &project {
                 Some(p) => vec![p.clone()],
                 None => db.partition_projects(&table_ref, *d).await?,
             };
-            if consolidate {
-                let target = target_size_mb.map_or(cfg.parquet.timefusion_cold_optimize_target_size, |mb| mb * 1024 * 1024);
-                for p in &projects {
-                    println!("  consolidate date={d} project={p} target={}MB", target / (1024 * 1024));
-                    // Committed slices are excluded from re-selection, so a retry
-                    // resumes at the next slice rather than restarting.
-                    for attempt in 1..=MAX_ATTEMPTS {
-                        match db.consolidate_date_binned(&table_ref, &table, *d, target, Some(p), usize::MAX).await {
-                            Ok(()) => break,
-                            Err(e) if attempt < MAX_ATTEMPTS => {
-                                eprintln!("  consolidate date={d} project={p}: attempt {attempt} failed, retrying: {e}");
-                                sleep(Duration::from_secs(5 * attempt)).await;
-                            }
-                            Err(e) => eprintln!("  consolidate date={d} project={p}: FAILED after {attempt} attempts: {e}"),
-                        }
-                    }
-                }
-            }
-            if dedup {
-                for p in &projects {
-                    match db.dedup_partition(&table_ref, &table, p, *d).await {
-                        Ok((dropped, complete)) => println!("  dedup date={d} project={p}: dropped={dropped} complete={complete}"),
-                        Err(e) => eprintln!("  dedup date={d} project={p}: FAILED: {e}"),
-                    }
+            for p in &projects {
+                match db.dedup_partition(&table_ref, &table, p, *d).await {
+                    Ok((dropped, complete)) => println!("  dedup date={d} project={p}: dropped={dropped} complete={complete}"),
+                    Err(e) => eprintln!("  dedup date={d} project={p}: FAILED: {e}"),
                 }
             }
         }

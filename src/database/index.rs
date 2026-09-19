@@ -103,15 +103,33 @@ pub(crate) fn fair_tantivy_backfill_work(mut queues: Vec<(String, VecDeque<(Stri
 impl Database {
     /// Build partition-mirrored indexes, newest partition first, for live parquet files no
     /// successful manifest entry covers. No-op when no indexer is attached.
+    /// PERIODIC, not once at boot.
+    ///
+    /// This used to run a single pass per process start. Every pass is bounded
+    /// (`max_files_per_pass`, `max_bytes_per_pass_mb`), so one pass cannot clear
+    /// a real backlog — and, worse, a file that lost coverage AFTER boot was
+    /// never rebuilt until the next restart. Prod 2026-09-19 sat at 472
+    /// uncovered files with `built` frozen at 6: the boot pass had already run
+    /// before the files went uncovered, and nothing would touch them again.
+    ///
+    /// A timer is safe here precisely BECAUSE each pass is budget-bounded — that
+    /// is what the bounds are for. The first pass still runs immediately so boot
+    /// behaviour is unchanged.
     pub fn spawn_tantivy_backfill(&self) {
         let Some(svc) = self.tantivy_indexer().cloned() else { return };
         let db = self.clone();
+        let every = std::time::Duration::from_secs(self.config.tantivy.timefusion_tantivy_backfill_interval_secs.max(60));
         tokio::spawn(async move {
-            for table_name in svc.config.indexed_tables() {
-                match db.backfill_table_indexes(&svc, &table_name).await {
-                    Ok(0) => {}
-                    Ok(n) => info!("tantivy backfill: table={} built={}", table_name, n),
-                    Err(e) => warn!("tantivy backfill failed for {}: {}", table_name, e),
+            let mut tick = tokio::time::interval(every);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                for table_name in svc.config.indexed_tables() {
+                    match db.backfill_table_indexes(&svc, &table_name).await {
+                        Ok(0) => {}
+                        Ok(n) => info!("tantivy backfill: table={} built={}", table_name, n),
+                        Err(e) => warn!("tantivy backfill failed for {}: {}", table_name, e),
+                    }
                 }
             }
         });

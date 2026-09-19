@@ -781,6 +781,13 @@ pub struct TantivyConfig {
     /// makes progress instead of wedging the queue.
     #[serde_inline_default(2048)]
     pub timefusion_tantivy_backfill_max_bytes_per_pass_mb: u64,
+    /// How often the backfill sweeps for uncovered files. It ran ONCE per process
+    /// start until 2026-09-19, so anything that lost coverage at runtime stayed
+    /// uncovered until the next restart. Each pass is budget-bounded, which is
+    /// what makes a timer safe; five minutes clears a few hundred files within
+    /// the hour without competing with the hot-tail packer.
+    #[serde_inline_default(300)]
+    pub timefusion_tantivy_backfill_interval_secs: u64,
     /// Percentage of each backfill pass reserved for the OLDEST uncovered files,
     /// carved OUT of the cap (never added to it) so pass cost is unchanged.
     /// 0 = newest-first. Raise it if the oldest files stay frozen while newer
