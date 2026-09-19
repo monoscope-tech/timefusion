@@ -702,6 +702,7 @@ impl ProjectRoutingTable {
             Some(self.database.scan_metrics.clone()),
             bypass_cache,
             mem.timefusion_max_concurrent_scan_readers.max(1) as u32 * DECODE_UNITS_PER_READER,
+            Arc::from(self.table_name.as_str()),
         )))
     }
 
@@ -1053,14 +1054,18 @@ pub(crate) struct GatedScanExec {
     /// Size of `sem`'s pool — `scan_pressure_permits` scales its claim off it
     /// (tokio semaphores don't expose their initial size).
     pool_size: u32,
+    /// Which table these batches belong to, so decoded bytes can be attributed
+    /// per table rather than averaged into one global compression ratio.
+    table_name: Arc<str>,
 }
 
 impl GatedScanExec {
     pub(crate) fn new(
         input: Arc<dyn ExecutionPlan>, sem: Arc<tokio::sync::Semaphore>, metrics: Option<Arc<ScanMetrics>>, bypass_cache: bool, pool_size: u32,
+        table_name: Arc<str>,
     ) -> Self {
         let properties = input.properties().clone();
-        Self { input, sem, properties, metrics, bypass_cache, pool_size }
+        Self { input, sem, properties, metrics, bypass_cache, pool_size, table_name }
     }
 }
 
@@ -1084,7 +1089,7 @@ impl ExecutionPlan for GatedScanExec {
         vec![&self.input]
     }
     fn with_new_children(self: Arc<Self>, children: Vec<Arc<dyn ExecutionPlan>>) -> DFResult<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(Self::new(children[0].clone(), self.sem.clone(), self.metrics.clone(), self.bypass_cache, self.pool_size)))
+        Ok(Arc::new(Self::new(children[0].clone(), self.sem.clone(), self.metrics.clone(), self.bypass_cache, self.pool_size, Arc::clone(&self.table_name))))
     }
     fn execute(&self, partition: usize, context: Arc<TaskContext>) -> DFResult<SendableRecordBatchStream> {
         let inner = self.input.execute(partition, context)?;
@@ -1093,12 +1098,14 @@ impl ExecutionPlan for GatedScanExec {
         let metrics = self.metrics.clone();
         let bypass = self.bypass_cache;
         let pool_size = self.pool_size;
+        let table_name = Arc::clone(&self.table_name);
         // Hold a permit only across each `poll_next` (one batch decode), then release so other
         // partitions/queries can proceed. `last_bytes` is this stream's most recent decoded
         // batch size, so the claim adapts to what this scan actually produces.
         let gated = futures::stream::unfold((inner, 0u64), move |(mut inner, last_bytes)| {
             let sem = sem.clone();
             let metrics = metrics.clone();
+            let table_name = Arc::clone(&table_name);
             async move {
                 // Near the OOM line each poll claims more of the pool, shrinking effective
                 // decode concurrency. The claim never exceeds the pool size, so progress
@@ -1117,7 +1124,16 @@ impl ExecutionPlan for GatedScanExec {
                     true => crate::storage::scan_bypass_scope(true, futures::StreamExt::next(&mut inner)).await,
                     false => futures::StreamExt::next(&mut inner).await,
                 };
-                let produced = next.as_ref().and_then(|r| r.as_ref().ok()).map_or(0, |b: &RecordBatch| b.get_array_memory_size() as u64);
+                let decoded = next.as_ref().and_then(|r| r.as_ref().ok());
+                let produced = decoded.map_or(0, |b: &RecordBatch| b.get_array_memory_size() as u64);
+                // PER TABLE, measured where the rows actually decode. This is the
+                // only place that knows both the Arrow cost and the row count it
+                // came from, which is what makes a per-table row width possible
+                // at all — a global compressed-bytes ratio cannot see that one
+                // table's rows carry 9 KB bodies and another's carry 47 B.
+                if let Some(batch) = decoded {
+                    crate::database::maintain::observe_decoded_batch(&table_name, batch.num_rows() as u64, produced);
+                }
                 if let Some(m) = &metrics {
                     m.decode_end(produced);
                 }
