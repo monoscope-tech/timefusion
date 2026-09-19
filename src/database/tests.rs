@@ -3104,7 +3104,7 @@ async fn gated_scan_exec_releases_permit_between_batches_no_deadlock() {
     let partitions: Vec<Vec<RecordBatch>> =
         (0..8).map(|i| vec![RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![i]))]).unwrap()]).collect();
     let src: Arc<dyn ExecutionPlan> = Arc::new(DataSourceExec::new(Arc::new(MemorySourceConfig::try_new(&partitions, schema.clone(), None).unwrap())));
-    let gated = Arc::new(GatedScanExec::new(src, Arc::new(tokio::sync::Semaphore::new(2)), None, false, 2));
+    let gated = Arc::new(GatedScanExec::new(src, Arc::new(tokio::sync::Semaphore::new(2)), None, false, 2, std::sync::Arc::from("t")));
     let ctx = Arc::new(TaskContext::default());
     let mut streams: Vec<_> = (0..8).map(|p| gated.execute(p, ctx.clone()).unwrap()).collect();
     let firsts = tokio::time::timeout(std::time::Duration::from_secs(10), futures::future::join_all(streams.iter_mut().map(futures::StreamExt::next)))
@@ -3131,7 +3131,7 @@ async fn gated_scan_exec_accounts_decoded_bytes() {
     let src: Arc<dyn ExecutionPlan> = Arc::new(DataSourceExec::new(Arc::new(MemorySourceConfig::try_new(&partitions, schema, None).unwrap())));
 
     let metrics = Arc::new(ScanMetrics::default());
-    let gated = Arc::new(GatedScanExec::new(src, Arc::new(tokio::sync::Semaphore::new(4)), Some(metrics.clone()), false, 4));
+    let gated = Arc::new(GatedScanExec::new(src, Arc::new(tokio::sync::Semaphore::new(4)), Some(metrics.clone()), false, 4, std::sync::Arc::from("t")));
     let mut stream = gated.execute(0, Arc::new(TaskContext::default())).unwrap();
     let mut rows = 0;
     while let Some(b) = futures::StreamExt::next(&mut stream).await {
@@ -4030,6 +4030,61 @@ fn tail_selector_never_refuses_a_packable_slice() {
             }
         }
     }
+}
+
+/// The per-table row width is measured where rows decode, and may only ever make
+/// the estimate MORE conservative than the global ratio.
+///
+/// This is what a single global `DECODED_BYTES_PER_COMPRESSED` could never do:
+/// see that one table's rows carry 9 KB log bodies while another's carry 47 B.
+/// `MAX_BIN_ROWS` was the crude stand-in for exactly this, which is why it could
+/// be deleted once the width became real.
+#[test]
+fn a_tables_row_width_is_measured_and_only_ever_more_conservative() {
+    use crate::database::maintain::{decoded_bytes_per_row, estimated_decoded_bytes, estimated_decoded_bytes_for, observe_decoded_batch};
+    let fat: std::sync::Arc<str> = std::sync::Arc::from("rowwidth-fat");
+    let thin: std::sync::Arc<str> = std::sync::Arc::from("rowwidth-thin");
+
+    // Below the sample floor a table has no opinion, so the ratio governs.
+    observe_decoded_batch(&fat, 10, 10 * 9_000);
+    assert_eq!(decoded_bytes_per_row(&fat), None, "a handful of rows must not set a table's width");
+    assert_eq!(estimated_decoded_bytes_for(&fat, 1_000, 10), estimated_decoded_bytes(1_000), "and the estimate falls back to the ratio");
+
+    // A fat-bodied table: 9 KB per row, far past what compressed x ratio implies.
+    observe_decoded_batch(&fat, 2_000_000, 2_000_000 * 9_000);
+    let width = decoded_bytes_per_row(&fat).expect("enough rows to measure");
+    assert!(width > 8_000, "the measured width must reflect 9 KB rows, got {width}");
+    let compressed = 1_000_000;
+    let rows = 1_000;
+    assert_eq!(
+        estimated_decoded_bytes_for(&fat, compressed, rows),
+        estimated_decoded_bytes(compressed).max(rows * width),
+        "a fat table must take whichever estimate is LARGER"
+    );
+
+    // A thin table whose width asks for LESS than the ratio must not lower it.
+    observe_decoded_batch(&thin, 2_000_000, 2_000_000 * 8);
+    assert_eq!(
+        estimated_decoded_bytes_for(&thin, compressed, rows),
+        estimated_decoded_bytes(compressed),
+        "a narrow table must never make the sort budget less conservative than the ratio"
+    );
+}
+
+/// The decode ratio may only ever be learned UPWARD from its seed.
+///
+/// Underestimating overruns a sort; overestimating only buys extra slices. So a
+/// measured ratio is allowed to make the budget more conservative and never
+/// less, and a wild value cannot cut a bin into thousands of slices.
+#[test]
+fn the_decode_ratio_is_learned_upward_only_and_bounded() {
+    let seed = super::super::database::maintain::DECODED_BYTES_PER_COMPRESSED;
+    let live = crate::database::decoded_bytes_per_compressed();
+    assert!(live >= seed, "a learned ratio below the seed would make every sort budget less safe than today: {live} < {seed}");
+    assert!(live <= 48, "an unbounded ratio would slice a bin into thousands of passes: {live}");
+    // And the conversion must use it, so the estimate tracks the ratio.
+    assert_eq!(crate::database::maintain::estimated_decoded_bytes(1000), 1000 * live as u64);
+    assert_eq!(crate::database::maintain::estimated_decoded_bytes(-5), 0, "a negative size cannot underflow the estimate");
 }
 
 /// UNIFICATION, pinned. Both compaction paths must reach the same packer, so a
