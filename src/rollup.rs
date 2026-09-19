@@ -2954,8 +2954,9 @@ mod tests {
     #[test_case::test_case(
         &format!(
             "SELECT b.status_code, count(*) FROM \
-             (SELECT status_code, trace_id FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW}) b \
-             JOIN (SELECT trace_id FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW}) t ON b.trace_id = t.trace_id \
+             (SELECT status_code, context___trace_id FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW}) b \
+             JOIN (SELECT context___trace_id FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW}) t \
+               ON b.context___trace_id = t.context___trace_id \
              GROUP BY b.status_code"
         ),
         "Join", MissReason::MultiScanSource; "a SELF-JOIN — monoscope rollupServiceEdges, 39% of prod declines")]
