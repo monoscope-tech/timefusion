@@ -2931,12 +2931,15 @@ fn the_cpu_ceiling_follows_runtime_starvation() {
 /// `rollup_hits_full_total` at ZERO.
 #[test]
 fn rollups_keep_a_reserved_share_of_admission() {
-    use crate::maintenance_coordinator::{AdmissionController, AdmissionLane, MAX_DECODED_BYTES, Resources};
-    let admission = AdmissionController::with_cpu_ceiling(4, 4, u64::MAX, 64, 64);
+    use crate::maintenance_coordinator::{AdmissionController, AdmissionLane, MAX_DECODED_BYTES, Resources, rollup_reserved_cpu};
+    // Derive the expectation from the constant: pinning a literal here made this
+    // test fail for the reservation being RETUNED, which is not a regression.
+    let ceiling = 24;
+    let admission = AdmissionController::with_cpu_ceiling(ceiling, ceiling, u64::MAX, 64, 64);
     let request = Resources { cpu: 1, decoded_bytes: MAX_DECODED_BYTES / 8, object_reads: 1, object_writes: 1 };
     // Non-rollup work fills everything EXCEPT the reservation.
     let held: Vec<_> = std::iter::repeat_with(|| admission.try_acquire_for(request, AdmissionLane::Other)).map_while(|p| p).collect();
-    assert_eq!(held.len(), 2, "other lanes must stop short of the rollup reservation, took {}", held.len());
+    assert_eq!(held.len() as u32, ceiling - rollup_reserved_cpu(ceiling), "other lanes must stop short of the rollup reservation, took {}", held.len());
     assert!(admission.try_acquire_for(request, AdmissionLane::Other).is_none(), "and stay stopped");
     // The reserved slots are still there for a rollup.
     assert!(admission.try_acquire_for(request, AdmissionLane::Rollup).is_some(), "a rollup must reach its reserved share");

@@ -2366,7 +2366,23 @@ pub enum AdmissionLane {
 }
 
 /// CPU slots reserved for rollups, which no other lane may take.
-const ROLLUP_RESERVED_CPU: u32 = 2;
+///
+/// Measured on prod 2026-09-20, hours after the reservation shipped at 2: base
+/// rollups ran 6 units per 5 min while `pending_base_rollup` sat at 2198 and
+/// GREW (1690 -> 2198). Compaction arrives continuously and saturates the rest
+/// of the ceiling, so "reserved" was also the ceiling rollups ever got — 72
+/// units/hour, a 30-HOUR drain, slower than new dirty partitions appear.
+///
+/// Eight leaves other lanes 16 of the 24-slot ceiling, still well above the 10
+/// they shared in total before any of this, and takes the drain to ~7 hours.
+pub(crate) const ROLLUP_RESERVED_CPU_MAX: u32 = 8;
+
+/// The reservation is a THIRD of the ceiling, capped at `ROLLUP_RESERVED_CPU_MAX`.
+/// A flat 8 would leave a small box (ceiling 4) just one slot for every other
+/// lane — the reservation has to scale with what there is to reserve from.
+pub(crate) fn rollup_reserved_cpu(ceiling: u32) -> u32 {
+    (ceiling / 3).min(ROLLUP_RESERVED_CPU_MAX)
+}
 
 /// CPU slots admitted at the runtime's current scheduling lag.
 ///
@@ -2438,7 +2454,7 @@ impl AdmissionController {
         let ceiling = lag_scaled_cpu_ceiling(state.cpu_base, state.capacity.cpu);
         let ceiling = match lane {
             AdmissionLane::Rollup => ceiling,
-            AdmissionLane::Other => ceiling.saturating_sub(ROLLUP_RESERVED_CPU).max(1),
+            AdmissionLane::Other => ceiling.saturating_sub(rollup_reserved_cpu(ceiling)).max(1),
         };
         if state.used().cpu.saturating_add(request.cpu) > ceiling {
             return None;
