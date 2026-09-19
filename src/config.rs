@@ -2397,9 +2397,21 @@ pub fn apply(config: &mut AppConfig) {
     );
 
     // A `None` derived value (the disk probe found no mount) leaves the knob alone.
+    //
+    // THE DERIVED VALUE ALWAYS WINS. These knobs size themselves from the
+    // container's own cgroup limits, so a hand-set env var cannot be more
+    // informed than the probe — it can only be staler. Honouring one used to
+    // SKIP the tuning entirely, which is how production ended up pinning
+    // MemBuffer at 4 GB and the foyer cache at 1 GB on a 120 GB box: every
+    // override silently disabled the sizing it was trying to help. An env var
+    // that is set is now reported and ignored, not obeyed.
     let mut applied = Vec::new();
+    let mut overridden = Vec::new();
     let mut tune = |name: &'static str, slot: &mut usize, derived: Option<usize>, unit: &str| {
-        if let Some(d) = derived.filter(|d| *d != *slot && std::env::var(name).is_err()) {
+        if let Some(d) = derived.filter(|d| *d != *slot) {
+            if let Ok(stale) = std::env::var(name) {
+                overridden.push(format!("{name}={stale} (ignored; derived {d}{unit})"));
+            }
             *slot = d;
             applied.push(format!("{name}={d}{unit}"));
         }
@@ -2447,9 +2459,12 @@ pub fn apply(config: &mut AppConfig) {
     tune("TIMEFUSION_QUERY_PARTITIONS", &mut config.memory.timefusion_query_partitions, Some(cpus.min(QUERY_PARTITIONS_MAX)), "");
 
     if applied.is_empty() {
-        info!("Auto-tune: no overrides applied (user has set all knobs explicitly or host signals unavailable)");
+        info!("Auto-tune: nothing to apply (host signals unavailable, or every knob already matches its derived value)");
     } else {
         info!("Auto-tune applied: {}", applied.join(", "));
+    }
+    if !overridden.is_empty() {
+        warn!("Auto-tune IGNORED stale env overrides (delete them; the cgroup probe is authoritative): {}", overridden.join(", "));
     }
 
     // Coherence guard: user-pinned envs can oversubscribe RAM even though the
