@@ -433,6 +433,15 @@ pub fn init_metrics(
             if stamped == 0 { process_uptime_secs() } else { now.saturating_sub(stamped) }
         }
     );
+    observe!(gauge
+        "timefusion.maintenance.sealed_seconds_since_commit",
+        "Seconds since the SEALED lane last committed. Separate from the combined gauge because the hot lane kept committing right through the 2026-09-15 sealed-lane outage. PAGE above two hours",
+        {
+            let stamped = maintenance_stats().last_sealed_commit_unix.load(Relaxed);
+            let now = crate::support::now_micros().max(0) as u64 / 1_000_000;
+            if stamped == 0 { process_uptime_secs() } else { now.saturating_sub(stamped) }
+        }
+    );
     observe!(counter
         "timefusion.maintenance.compaction_units_selected_nothing",
         "Compaction units that claimed a cell and selected no bin. A converged cell does this once; a wedged lane does it thousands of times a minute. WARN on a sustained rate",
@@ -1262,6 +1271,11 @@ atomic_stats! {
         /// commit of this process; the derived gauge reports the process age then,
         /// so a lane that never commits after a restart still alerts.
         last_compaction_commit_unix as "last_compaction_commit_unix",
+        /// Unix seconds of the last SEALED-lane commit, tracked apart from the
+        /// hot lane on purpose: through the 2026-09-15 wedge the hot lane kept
+        /// committing while sealed consolidation was dead, so a combined stamp
+        /// stayed fresh for the whole outage.
+        last_sealed_commit_unix as "last_sealed_commit_unix",
         /// Units that declined two or more UNDER-TARGET files — files the planner
         /// queues the cell on. Structurally impossible now that both sides share
         /// one rule; any non-zero value is a regression of the 2026-09-15 wedge.

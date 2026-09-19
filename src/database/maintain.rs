@@ -3034,7 +3034,20 @@ impl Database {
         };
         let remaining = if completed { !self.coordinator_compaction_files(&table_ref, &key).await?.is_empty() } else { false };
         if completed {
-            crate::observability::maintenance_stats().maintenance_processed_bytes.fetch_add(processed_bytes, std::sync::atomic::Ordering::Relaxed);
+            let stats = crate::observability::maintenance_stats();
+            stats.maintenance_processed_bytes.fetch_add(processed_bytes, std::sync::atomic::Ordering::Relaxed);
+            // FRESHNESS, PER LANE. A rate counter cannot tell "nothing needed
+            // compacting" from "this lane has been dead since Tuesday", and a
+            // SHARED stamp is worse than none: through the 2026-09-15 wedge the
+            // hot lane kept committing while sealed consolidation committed
+            // nothing for four days, so one combined stamp would have stayed
+            // fresh and the alert green for the entire outage. Stamped here
+            // rather than at the commit, which does not know its operation.
+            let now_secs = crate::support::now_micros().max(0) as u64 / 1_000_000;
+            stats.last_compaction_commit_unix.store(now_secs, std::sync::atomic::Ordering::Relaxed);
+            if key.operation == crate::maintenance_coordinator::Operation::SealedConsolidation {
+                stats.last_sealed_commit_unix.store(now_secs, std::sync::atomic::Ordering::Relaxed);
+            }
         }
         let mut journal = self.journal();
         if journal.state(&key) == Some(TaskState::Running) {
@@ -6836,12 +6849,6 @@ impl Database {
         } else {
             stats.light_optimize_bins_committed.fetch_add(landed.len() as u64, Relaxed);
             stats.light_optimize_waves_committed.fetch_add(1, Relaxed);
-            // FRESHNESS, not just throughput. A rate counter cannot distinguish
-            // "nothing needed compacting" from "compaction has been dead since
-            // Tuesday"; a wall-clock stamp can, and the derived
-            // `compaction_seconds_since_commit` gauge is the alert that would have
-            // caught 2026-09-15 on day one instead of day four.
-            stats.last_compaction_commit_unix.store(crate::support::now_micros().max(0) as u64 / 1_000_000, Relaxed);
         }
     }
 
