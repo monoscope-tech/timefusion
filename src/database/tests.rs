@@ -4008,6 +4008,24 @@ fn coordinator_selection_bins_l0_before_runs_and_never_rewrites_a_converged_file
     coordinator_pick(files.iter().map(|&(path, size, sorted, rows)| tail_file(path, size, sorted, None, false, rows)).collect()).join(",")
 }
 
+/// The same invariant for the OTHER selector. `select_tail_bin` feeds the hot
+/// lane and shares `stage_hot_bin` with the coordinator, so a veto reintroduced
+/// here wedges exactly the same way — it just would not have shown up in the
+/// sealed-lane symptoms that made 2026-09-15 visible.
+#[test]
+fn tail_selector_never_refuses_a_packable_slice() {
+    const SEAL: i64 = i64::MAX / 4;
+    for files in [5usize, 9, 40] {
+        for size in [1, BIN_TARGET / 4, BIN_TARGET / 2] {
+            for rows in [None, Some(1), Some(5_000_000)] {
+                let adds: Vec<_> = (0..files).map(|i| tail_file(&format!("f{i}"), size, false, Some((i as i64, i as i64)), false, rows)).collect();
+                let picked = super::select_tail_bin(&adds, BIN_TARGET, 5, BIN_TARGET / 4, SEAL, TailPass::Pack);
+                assert!(picked.len() >= 2, "tail selector refused {files} sealed files of {size} B / {rows:?} rows — the pass would re-claim them forever");
+            }
+        }
+    }
+}
+
 /// THE 2026-09-15 WEDGE, as a property: whenever two or more packable files
 /// exist, the selector MUST return at least two. A selector that can decline all
 /// work has no safe default — sealed consolidation committed nothing for three
