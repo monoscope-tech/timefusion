@@ -864,6 +864,7 @@ pub fn record_rollup_miss(reason: crate::rollup::MissReason) {
         R::NonDecomposableAggregate => &stats.rollup_miss_non_decomposable,
         R::RewriteSchemaMismatch => &stats.rollup_miss_rewrite_schema_mismatch,
         R::UnwalkableSource => &stats.rollup_miss_unwalkable_source,
+        R::MultiScanSource => &stats.rollup_miss_multi_scan_source,
         R::MeasureNotStored => &stats.rollup_miss_measure_not_stored,
     }
     .fetch_add(1, Relaxed);
@@ -1325,6 +1326,10 @@ atomic_stats! {
         rollup_miss_non_decomposable as "rollup_miss_non_decomposable_total",
         rollup_miss_rewrite_schema_mismatch as "rollup_miss_rewrite_schema_mismatch_total",
         rollup_miss_unwalkable_source as "rollup_miss_unwalkable_source_total",
+        /// Declines whose aggregate sits over several scans (a join, a union).
+        /// Structurally unservable by any rollup definition, so this must stay
+        /// out of `unwalkable_source` — that one is meant to be drivable to zero.
+        rollup_miss_multi_scan_source as "rollup_miss_multi_scan_source_total",
         /// Derived units retried because their BASE tier does not cover the slice
         /// they were asked to build. Publishing anyway would trust a short cell
         /// permanently, since the witness is the RAW partition. Read as a RATE:

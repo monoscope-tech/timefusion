@@ -47,6 +47,10 @@ pub enum MissReason {
     /// walk from the aggregate down to the scan (a node `source_and_filters`
     /// refuses). Counted only for tables that actually declare rollups.
     UnwalkableSource,
+    /// Same refusal, but the aggregate sits over SEVERAL scans (a join, a
+    /// union). A rollup answers from one source, so no definition can ever serve
+    /// this — kept apart from `UnwalkableSource` so that number stays actionable.
+    MultiScanSource,
     /// The cell is fresh, but its FILES do not carry a measure the query needs.
     /// Distinct from `StaleCoverage`: nothing moved, the build never wrote the column.
     MeasureNotStored,
@@ -1484,12 +1488,13 @@ pub(crate) fn inline_common_exprs(aggregate: &datafusion::logical_expr::Aggregat
         .filter(|rebuilt| rebuilt.schema.has_equivalent_names_and_types(&aggregate.schema).is_ok())
 }
 
-/// The table `plan` ultimately scans. Diagnostics only — a plan with two scans
-/// yields the first, so this must never feed anything that answers rows.
-fn scanned_table(plan: &datafusion::logical_expr::LogicalPlan) -> Option<String> {
+/// Every table `plan` scans, in walk order. Diagnostics only: the COUNT is what
+/// separates a shape a rollup could plausibly serve from one it structurally
+/// cannot, since a rollup answers from a single source.
+fn scanned_tables(plan: &datafusion::logical_expr::LogicalPlan) -> Vec<String> {
     match plan {
-        datafusion::logical_expr::LogicalPlan::TableScan(scan) => Some(scan.table_name.table().to_string()),
-        plan => plan.inputs().into_iter().find_map(scanned_table),
+        datafusion::logical_expr::LogicalPlan::TableScan(scan) => vec![scan.table_name.table().to_string()],
+        plan => plan.inputs().into_iter().flat_map(scanned_tables).collect(),
     }
 }
 
@@ -1587,17 +1592,18 @@ pub(crate) async fn match_aggregates(
         Ok(source) => source,
         Err(node) => {
             // Count this only when a rollup-bearing table sits underneath; an
-            // aggregate over a join or `pg_catalog` was never a candidate.
-            if let Some(table) =
-                scanned_table(&aggregate.input).filter(|table| crate::schema::get_schema(table).is_some_and(|schema| !schema.rollups.is_empty()))
-            {
-                crate::observability::record_rollup_miss(MissReason::UnwalkableSource);
+            // aggregate over `pg_catalog` alone was never a candidate.
+            let scans = scanned_tables(&aggregate.input);
+            if let Some(table) = scans.iter().find(|table| crate::schema::get_schema(table).is_some_and(|schema| !schema.rollups.is_empty())) {
+                let reason = if scans.len() == 1 { MissReason::UnwalkableSource } else { MissReason::MultiScanSource };
+                crate::observability::record_rollup_miss(reason);
                 // Unconditional warn, not sampled: this class is too rare to
                 // survive 1-in-64 sampling.
                 tracing::warn!(
                     event = "rollup_declined_shape",
                     source = %table,
-                    reason = MissReason::UnwalkableSource.label(),
+                    reason = reason.label(),
+                    scans = scans.len(),
                     node,
                     inlined_cse = inlined.is_some(),
                     plan = %shape(),
@@ -2065,6 +2071,7 @@ mod tests {
                 "too_many_branches",
                 "rewrite_schema_mismatch",
                 "unwalkable_source",
+                "multi_scan_source",
                 "measure_not_stored",
             ]
         );
@@ -2928,29 +2935,43 @@ mod tests {
     /// the Variant analyzer rule a bare `MemTable` session does not register.
     #[test_case::test_case(
         &format!("SELECT count(*) FROM (SELECT 1 FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW} LIMIT 5000) s"),
-        "Limit"; "a bounded existence probe over a derived table — monoscope safetyNetReprocess, BackgroundJobs.hs:2127")]
+        "Limit", MissReason::UnwalkableSource; "a bounded existence probe over a derived table — monoscope safetyNetReprocess, BackgroundJobs.hs:2127")]
     #[test_case::test_case(
         &format!("WITH f AS (SELECT status_code AS sc, timestamp FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW}) SELECT sc, count(*) FROM f GROUP BY sc"),
-        "Projection"; "a CTE that RENAMES the dimension the outer aggregate groups by")]
+        "Projection", MissReason::UnwalkableSource; "a CTE that RENAMES the dimension the outer aggregate groups by")]
     #[test_case::test_case(
         &format!(
             "WITH f AS (SELECT floor(extract(epoch from timestamp) / 60)::bigint AS bucket_idx FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW}) \
              SELECT bucket_idx, count(*) FROM f GROUP BY bucket_idx"
         ),
-        "Projection: CAST(floor"; "a CTE computing the bucket — monoscope endpointRequestStatsByProject and rollupServiceEdges")]
+        "Projection: CAST(floor", MissReason::UnwalkableSource; "a CTE computing the bucket — monoscope endpointRequestStatsByProject and rollupServiceEdges")]
     #[test_case::test_case(
         &format!(
             "SELECT count(*) FROM (SELECT timestamp FROM {SOURCE} WHERE project_id = 'a' AND {WINDOW} \
              UNION ALL SELECT timestamp FROM {SOURCE} WHERE project_id = 'b' AND {WINDOW}) u"
         ),
-        "Union"; "a UNION ALL of two scans — monoscope rollupServiceEdges hops")]
+        "Union", MissReason::MultiScanSource; "a UNION ALL of two scans — monoscope rollupServiceEdges hops")]
+    #[test_case::test_case(
+        &format!(
+            "SELECT b.status_code, count(*) FROM \
+             (SELECT status_code, trace_id FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW}) b \
+             JOIN (SELECT trace_id FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW}) t ON b.trace_id = t.trace_id \
+             GROUP BY b.status_code"
+        ),
+        "Join", MissReason::MultiScanSource; "a SELF-JOIN — monoscope rollupServiceEdges, 39% of prod declines")]
     #[test_case::test_case(
         &format!("SELECT count(DISTINCT status_code) FROM (SELECT DISTINCT status_code FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW}) d"),
-        "Aggregate"; "an inner DISTINCT, which plans as a second Aggregate")]
+        "Aggregate", MissReason::UnwalkableSource; "an inner DISTINCT, which plans as a second Aggregate")]
     #[tokio::test]
-    async fn an_unwalkable_shape_is_counted_and_names_the_node_that_refused(sql: &str, expected_node: &str) {
+    async fn an_unwalkable_shape_is_counted_and_names_the_node_that_refused(sql: &str, expected_node: &str, expected_reason: MissReason) {
         let state = session().await;
-        let counter = &crate::observability::maintenance_stats().rollup_miss_unwalkable_source;
+        let stats = crate::observability::maintenance_stats();
+        // A multi-scan plan is refused by the same walk but can never be served
+        // by a definition, so it must land in its own counter.
+        let counter = match expected_reason {
+            MissReason::MultiScanSource => &stats.rollup_miss_multi_scan_source,
+            _ => &stats.rollup_miss_unwalkable_source,
+        };
         let before = counter.load(std::sync::atomic::Ordering::Relaxed);
         let plan = optimized(&state, sql).await;
 
