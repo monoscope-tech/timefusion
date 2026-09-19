@@ -115,7 +115,14 @@ async fn dv_dedup_drops_cross_file_duplicate_without_rewriting() -> anyhow::Resu
     env.force_flush().await?;
 
     let files_before = parquet_files(&env).await?;
-    assert_eq!(files_before.len(), 2, "expected two flushed files, got {files_before:?}");
+    // At LEAST two, not exactly two: the long flush interval stops the flush
+    // TIMER, but `flush_completed_buckets` also runs off pressure relief, and
+    // these rows are eligible the instant they land (event time 2025 against the
+    // harness's frozen 2030 clock). One firing between the seeds and `dup` claims
+    // the seed rows as a third file. That does not weaken the fixture — what this
+    // test needs is that the two `dup` copies sit in DIFFERENT files, which the
+    // two explicit flushes guarantee either way.
+    assert!(files_before.len() >= 2, "the duplicate must span files, got {files_before:?}");
 
     // Read-time DedupExec already hides the duplicate; dedup's job is to make it physical.
     assert_eq!(count(&client, "").await?, 5, "read-time dedup already resolves the duplicate");
