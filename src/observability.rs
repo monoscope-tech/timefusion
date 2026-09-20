@@ -1335,6 +1335,11 @@ atomic_stats! {
         /// track deploys, and a rise without one means units are being claimed
         /// and dropped for some other reason.
         maintenance_unstarted_releases as "maintenance_unstarted_releases_total",
+        /// Size of the claim-candidate index. Read it against `tasks_pending`:
+        /// they should track. A `claimable` that drifts toward the journal's total
+        /// task count means the permissive set is not being re-derived, and the
+        /// claim scan is paying for dead tasks again.
+        claimable_tasks as "claimable_tasks",
         /// Derived units retried because their BASE tier does not cover the slice
         /// they were asked to build. Publishing anyway would trust a short cell
         /// permanently, since the witness is the RAW partition. Read as a RATE:

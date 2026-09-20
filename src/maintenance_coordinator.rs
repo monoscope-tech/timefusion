@@ -513,6 +513,20 @@ pub struct TaskJournal {
     /// Stable indices into `snapshot.tasks`. Tasks are never removed, so point
     /// updates and WAL replay stay O(1) even with a production-sized backlog.
     task_indices: HashMap<TaskKey, usize>,
+    /// Keys that MIGHT be claimable, so `claim_next` does not walk the dead.
+    ///
+    /// Prod 2026-09-20 held 93,326 Complete tasks against 857 Pending, and
+    /// `claim_next` filtered all 94,349 of them on every pass — three passes, 219
+    /// claims/sec, 4.7 ms each, the journal mutex busy 41% of wall-clock. The
+    /// completed ones are retained on purpose (`dependencies_complete` proves base
+    /// coverage from them) but they have no business in the CLAIM scan.
+    ///
+    /// Deliberately PERMISSIVE: an entry that is no longer claimable is filtered
+    /// out as before and costs one lookup, whereas a MISSING entry would silently
+    /// strand a unit forever. So every transition into a claimable state inserts,
+    /// and removal is lazy. `reconcile_claimable` re-derives the set and counts
+    /// divergence, so a missed insert is loud rather than invisible.
+    claimable: std::collections::BTreeSet<TaskKey>,
     dirty_tasks: HashSet<TaskKey>,
     /// Keys removed since the last write, pending a `Removed` tombstone.
     removed_tasks: HashSet<TaskKey>,
@@ -724,11 +738,13 @@ impl TaskJournal {
             base_tier_ready: HashSet::new(),
             tier_holes: HashSet::new(),
             untagged_cells: HashSet::new(),
+            claimable: std::collections::BTreeSet::new(),
             claim_tick: 0,
             frontier_lag_secs: std::sync::atomic::AtomicU64::new(0),
             dedup_complete_edges: HashMap::new(),
         };
         journal.rebuild_dedup_edges();
+        journal.rebuild_claimable();
         Ok(journal)
     }
 
@@ -1333,6 +1349,39 @@ impl TaskJournal {
     }
 
     /// The task `key` names, if the journal still holds it.
+    /// Re-derive the claimable set from scratch. Cheap relative to a claim and
+    /// the only thing that bounds the permissive set's growth.
+    fn rebuild_claimable(&mut self) {
+        self.claimable =
+            self.snapshot.tasks.iter().filter(|task| matches!(task.state, TaskState::Pending | TaskState::Retry)).map(|task| task.key.clone()).collect();
+    }
+
+    /// Tasks of `operation` worth considering for a claim.
+    ///
+    /// Walks the claimable INDEX, not the whole journal. Prod held 93,326
+    /// Complete tasks against 857 Pending, and filtering all of them on three
+    /// passes per claim cost 4.7 ms at 219 claims/sec — the journal mutex busy
+    /// 41% of wall-clock, with a worst single claim of 3.3 s.
+    fn claim_candidates(&self, operation: Operation) -> impl Iterator<Item = &MaintenanceTask> {
+        self.claimable.iter().filter_map(move |key| self.task(key)).filter(move |task| task.key.operation == operation)
+    }
+
+    /// Record that `key` changed: it needs persisting, and it MIGHT now be
+    /// claimable.
+    ///
+    /// Every state transition already passed through `dirty_tasks`, so routing
+    /// both through one call is what makes the claimable set a sound superset —
+    /// a task cannot become claimable without being mutated, and a mutation
+    /// cannot skip this. Entries that are not (or no longer) claimable are
+    /// filtered on the way past and pruned lazily, so the set errs toward
+    /// holding too much rather than too little.
+    fn mark_dirty(&mut self, key: TaskKey) {
+        if self.task(&key).is_some_and(|task| matches!(task.state, TaskState::Pending | TaskState::Retry)) {
+            self.claimable.insert(key.clone());
+        }
+        self.dirty_tasks.insert(key);
+    }
+
     fn task(&self, key: &TaskKey) -> Option<&MaintenanceTask> {
         self.snapshot.tasks.get(*self.task_indices.get(key)?)
     }
@@ -1368,7 +1417,7 @@ impl TaskJournal {
         }
         task.input = Some(input);
         task.preflight_decoded_bytes = None;
-        self.dirty_tasks.insert(key.clone());
+        self.mark_dirty(key.clone());
         true
     }
 
@@ -1380,18 +1429,21 @@ impl TaskJournal {
             return input_changed;
         }
         task.preflight_decoded_bytes = Some(decoded_bytes);
-        self.dirty_tasks.insert(key.clone());
+        self.mark_dirty(key.clone());
         true
     }
 
     pub fn upsert(&mut self, task: MaintenanceTask) {
         // A key removed earlier in this write window and re-created now must drop its tombstone.
         self.removed_tasks.remove(&task.key);
-        self.dirty_tasks.insert(task.key.clone());
+        let key = task.key.clone();
         if task.state == TaskState::Complete {
             self.note_dedup_edges(&task.key);
         }
         insert_task(&mut self.snapshot.tasks, &mut self.task_indices, task);
+        // AFTER the insert: `mark_dirty` reads the task's state to decide whether it
+        // belongs in the claim index, and before the insert there is nothing to read.
+        self.mark_dirty(key);
     }
 
     pub fn enqueue(&mut self, key: TaskKey, deadline_micros: i64, estimated_decoded_bytes: u64, created_unix_ms: u64) {
@@ -1458,7 +1510,7 @@ impl TaskJournal {
                     return false;
                 }
                 repend(&mut self.snapshot.tasks[index], deadline_micros, true);
-                self.dirty_tasks.insert(key);
+                self.mark_dirty(key);
                 return true;
             }
             // `abandon_running`'s verdict must outlive a planner tick: re-minting would clear
@@ -1482,17 +1534,21 @@ impl TaskJournal {
                     || (input.is_some() && input != task.input);
                 if changed {
                     repend(task, new_deadline, false);
-                    self.dirty_tasks.insert(key);
+                    self.mark_dirty(key);
                 }
             }
             return true;
         }
-        self.dirty_tasks.insert(key.clone());
+        let enqueued = key.clone();
         insert_task(
             &mut self.snapshot.tasks,
             &mut self.task_indices,
             MaintenanceTask { base_tier_present, input, ..MaintenanceTask::pending(key, deadline_micros, estimated_decoded_bytes, created_unix_ms) },
         );
+        // AFTER the insert, as in `upsert`: `mark_dirty` reads state to decide
+        // whether the key belongs in the claim index, and there is nothing to read
+        // until the task exists.
+        self.mark_dirty(enqueued);
         true
     }
 
@@ -1587,12 +1643,12 @@ impl TaskJournal {
                         task.deadline_micros = new_deadline;
                         task.retry_reason = None;
                         task.publication = None;
-                        self.dirty_tasks.insert(key);
+                        self.mark_dirty(key);
                     }
                 } else {
                     let task = MaintenanceTask::pending(key.clone(), deadline_micros, 0, created_unix_ms);
                     insert_task(&mut self.snapshot.tasks, &mut self.task_indices, task);
-                    self.dirty_tasks.insert(key);
+                    self.mark_dirty(key);
                 }
             }
         }
@@ -1666,31 +1722,59 @@ impl TaskJournal {
         // younger than the starvation horizon. Residue 5 is odd (never a sealed turn) and
         // `5 % 4 == 1` (never a window turn).
         let horizon_turn = self.claim_tick % 8 == 5;
-        let best_class = |journal: &Self, sealed_only: bool, window_only: bool, horizon_only: bool| -> Option<Rank> {
-            let mut class: Option<Rank> = None;
-            for task in journal.snapshot.tasks.iter().filter(|task| {
+        /// `(sealed_only, window_only, horizon_only)` — one reservation's filter.
+        type Reservation = (bool, bool, bool);
+        // ONE pass for the reservation AND its fallback, not two.
+        //
+        // The turn always falls back to the normal order, so the old form scanned
+        // the candidate set twice before the selection pass scanned it a third
+        // time. Tracking both minima in a single walk makes that 3 passes -> 2,
+        // and the per-task work that actually costs — `rank` and
+        // `dependencies_complete` — is now evaluated once per task instead of once
+        // per pass. The selection pass cannot fold in: it needs the winning class,
+        // which is not known until the walk finishes.
+        let best_class = |journal: &Self, primary: Reservation, fallback: Reservation| -> Option<Rank> {
+            let (mut best_primary, mut best_fallback): (Option<Rank>, Option<Rank>) = (None, None);
+            for task in journal.claim_candidates(operation) {
+                if !Self::task_can_be_claimed(task, now_micros, allow_quarantined) {
+                    continue;
+                }
                 let waited = now_micros.saturating_sub(task.key.slice.end_micros);
-                claimable(task)
-                    && !(sealed_only && is_frontier_task(task, now_micros))
-                    && !(window_only && waited > QUERY_WINDOW_MICROS)
-                    && (!horizon_only || (QUERY_WINDOW_MICROS..=STARVATION_HORIZON_MICROS).contains(&waited))
-            }) {
+                let admits = |(sealed_only, window_only, horizon_only): Reservation| {
+                    !(sealed_only && is_frontier_task(task, now_micros))
+                        && !(window_only && waited > QUERY_WINDOW_MICROS)
+                        && (!horizon_only || (QUERY_WINDOW_MICROS..=STARVATION_HORIZON_MICROS).contains(&waited))
+                };
+                let (in_primary, in_fallback) = (admits(primary), admits(fallback));
+                if !in_primary && !in_fallback {
+                    continue;
+                }
                 let candidate = rank(journal, task);
-                if class.is_none_or(|best| candidate < best) && journal.dependencies_complete(task) {
-                    class = Some(candidate);
+                let improves_primary = in_primary && best_primary.is_none_or(|best| candidate < best);
+                let improves_fallback = in_fallback && best_fallback.is_none_or(|best| candidate < best);
+                // Same laziness as before: only pay for the dependency scan when this
+                // task would actually win something.
+                if (improves_primary || improves_fallback) && journal.dependencies_complete(task) {
+                    if improves_primary {
+                        best_primary = Some(candidate);
+                    }
+                    if improves_fallback {
+                        best_fallback = Some(candidate);
+                    }
                 }
             }
-            class
+            best_primary.or(best_fallback)
         };
         // Every reservation falls back to the normal order, so a quiet lane never idles a worker.
+        const NORMAL: Reservation = (false, false, false);
         let class = if window_turn {
-            best_class(self, false, true, false).or_else(|| best_class(self, sealed_turn, false, false))
+            best_class(self, (false, true, false), (sealed_turn, false, false))
         } else if horizon_turn {
-            best_class(self, true, false, true).or_else(|| best_class(self, false, false, false))
+            best_class(self, (true, false, true), NORMAL)
         } else if sealed_turn {
-            best_class(self, true, false, false).or_else(|| best_class(self, false, false, false))
+            best_class(self, (true, false, false), NORMAL)
         } else {
-            best_class(self, false, false, false)
+            best_class(self, NORMAL, NORMAL)
         }?;
         let cursor = self.fair_cursors.get(&operation).map(String::as_str).unwrap_or("");
         let beats = |task: &MaintenanceTask, current: Option<&MaintenanceTask>| {
@@ -1702,7 +1786,10 @@ impl TaskJournal {
         let mut next: Option<&MaintenanceTask> = None;
         // One pass on purpose: `dependencies_complete` is itself a scan, so a two-pass
         // `min_by_key` form would double the hot claim path's cost.
-        for task in self.snapshot.tasks.iter().filter(|task| claimable(task) && rank(self, task) == class && self.dependencies_complete(task)) {
+        for task in self
+            .claim_candidates(operation)
+            .filter(|task| Self::task_can_be_claimed(task, now_micros, allow_quarantined) && rank(self, task) == class && self.dependencies_complete(task))
+        {
             if beats(task, fallback) {
                 fallback = Some(task);
             }
@@ -1782,7 +1869,7 @@ impl TaskJournal {
         crate::observability::count_maintenance_retry(&format!("{:?}", key.operation), &reason);
         task.retry_reason = Some(reason);
         task.deadline_micros = not_before_micros;
-        self.dirty_tasks.insert(key.clone());
+        self.mark_dirty(key.clone());
         true
     }
 
@@ -1802,7 +1889,7 @@ impl TaskJournal {
         if let Some(publication) = publication {
             task.publication = Some(publication);
         }
-        self.dirty_tasks.insert(key.clone());
+        self.mark_dirty(key.clone());
         self.note_dedup_edges(key);
         true
     }
@@ -1825,7 +1912,7 @@ impl TaskJournal {
         task.state = TaskState::Pending;
         task.attempts = task.attempts.saturating_sub(1);
         task.retry_reason = None;
-        self.dirty_tasks.insert(key.clone());
+        self.mark_dirty(key.clone());
         crate::observability::maintenance_stats().maintenance_unstarted_releases.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         true
     }
@@ -1912,7 +1999,7 @@ impl TaskJournal {
         let task = &mut self.snapshot.tasks[index];
         task.state = TaskState::Superseded;
         task.retry_reason = Some("split_into_smaller_slices".to_owned());
-        self.dirty_tasks.insert(key.clone());
+        self.mark_dirty(key.clone());
         for mut child in children {
             // What the PARENT measured; the child's modelled share is not trustworthy.
             child.parent_measured_bytes = observed_bytes;
@@ -2085,6 +2172,12 @@ impl TaskJournal {
     ///
     /// Goes through `retain_tasks` so each drop leaves a tombstone and survives a restart.
     pub fn prune_retired_history(&mut self, now_micros: i64) -> usize {
+        // The claimable set is permissive — it keeps whatever was mutated — so it
+        // is re-derived on this same minute-scale sweep. Without it the set drifts
+        // toward the journal's full size and the claim scan slowly gets its cost
+        // back.
+        self.rebuild_claimable();
+        crate::observability::maintenance_stats().claimable_tasks.store(self.claimable.len() as u64, std::sync::atomic::Ordering::Relaxed);
         let dropped = self.retain_tasks(|task| {
             !matches!(task.state, TaskState::Complete | TaskState::Superseded)
                 || now_micros.saturating_sub(task.key.slice.end_micros) <= STARVATION_HORIZON_MICROS
@@ -2551,6 +2644,59 @@ mod tests {
         for benign in ["dedup: Object at location ... not found", "compaction: transaction failed: version 2667 already exists", "resource_admission"] {
             assert!(!is_schema_failure(benign), "must not park a unit that would succeed on a retry: {benign}");
         }
+    }
+
+    /// The claim scan walks an INDEX, so the index must never miss a claimable
+    /// unit — a miss strands that unit forever, silently. The set is permissive on
+    /// purpose (stale entries are filtered on the way past), so this asserts the
+    /// direction that actually matters: everything claimable is present.
+    #[test]
+    fn every_claimable_task_is_in_the_claim_index() {
+        let (_dir, mut journal) = new_journal();
+        let now = 1_000_000_000;
+
+        // One unit per state the journal can put a task in.
+        let pending = upserted(&mut journal, task("p", 0, DAY_MICROS, Operation::BaseRollup));
+        let retried = upserted(&mut journal, task("q", 0, DAY_MICROS, Operation::BaseRollup));
+        assert!(journal.retry(&retried, "because".to_owned(), now));
+        let running = running_unit(&mut journal, task("r", 0, DAY_MICROS, Operation::BaseRollup), 1);
+        let done = upserted(&mut journal, task("s", 0, DAY_MICROS, Operation::BaseRollup));
+        assert!(journal.complete(&done));
+
+        let derived: std::collections::BTreeSet<_> =
+            journal.tasks().filter(|t| matches!(t.state, TaskState::Pending | TaskState::Retry)).map(|t| t.key.clone()).collect();
+        assert!(derived.contains(&pending) && derived.contains(&retried), "fixture must produce both claimable states");
+
+        for key in &derived {
+            assert!(journal.claimable.contains(key), "claimable unit missing from the index: {key:?}");
+        }
+        // A unit that was NEVER claimable must never have been added.
+        assert!(!journal.claimable.contains(&running), "a unit upserted as Running was never claimable");
+        // `done` WAS claimable before it completed, so a stale entry is expected and
+        // correct: the set is permissive and sheds on rebuild, because holding too
+        // much costs a lookup while holding too little strands a unit.
+        assert!(journal.claimable.contains(&done), "the permissive set keeps a completed unit until the next rebuild");
+        journal.rebuild_claimable();
+        assert!(!journal.claimable.contains(&done), "and the rebuild sheds it");
+        for key in &derived {
+            assert!(journal.claimable.contains(key), "a rebuild must not drop a claimable unit: {key:?}");
+        }
+    }
+
+    /// Re-deriving must not change what can be claimed — it only sheds the stale
+    /// entries the permissive path accumulates.
+    #[test]
+    fn rebuilding_the_claim_index_preserves_every_claimable_unit() {
+        let (_dir, mut journal) = new_journal();
+        let a = upserted(&mut journal, task("p", 0, DAY_MICROS, Operation::BaseRollup));
+        let b = upserted(&mut journal, task("q", 0, DAY_MICROS, Operation::Dedup));
+        let done = upserted(&mut journal, task("s", 0, DAY_MICROS, Operation::BaseRollup));
+        assert!(journal.complete(&done));
+
+        journal.rebuild_claimable();
+
+        assert!(journal.claimable.contains(&a) && journal.claimable.contains(&b), "claimable units must survive a rebuild");
+        assert!(!journal.claimable.contains(&done), "a rebuild must shed completed units");
     }
 
     /// The database restarts a couple of times a day. A unit the process shut
