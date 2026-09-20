@@ -41,6 +41,21 @@ failure-output = "immediate-final"
 status-level = "retry"
 retries = 1
 
+# The dedup/compaction tests drive real compaction waves against MinIO and are
+# legitimately the slowest thing here: measured 372s locally and 536-600s on a
+# CI runner, against the 600s cap above. That is ~11% headroom on a shared box,
+# so whether master is green is a coin flip on runner speed — `retries = 1` is
+# what has been hiding it. Observed on f4ada902 (TRY 1 TMT 600.023s, TRY 2 PASS
+# 536.934s) and again on 4ccb9415, where both tries timed out and CI went red.
+#
+# 20 minutes keeps a genuine hang bounded while giving these ~2.2x headroom.
+# Prefer making them faster to raising this again: the ceiling is only honest
+# while it still catches a wedge, and a test that needs 20 minutes to prove a
+# compaction invariant is telling you something about the fixture.
+[[profile.ci.overrides]]
+filter = 'test(/dedup_compaction/)'
+slow-timeout = { period = "60s", terminate-after = 20 }
+
 # Ad-hoc profiling of the tail: flags every test over 4s.
 [profile.timings]
 slow-timeout = { period = "4s", terminate-after = 100 }
