@@ -6,9 +6,9 @@ This document records the synchronization improvements identified in the TimeFus
 
 | Item | Correctness priority | Performance priority | Expected effect |
 |---|---:|---:|---|
-| Replace cache-stat `RwLock` with atomics | P3 | **P0** | Remove a global exclusive async lock from every cache hit and miss |
+| ~~Replace cache-stat `RwLock` with atomics~~ | **SHIPPED** | **SHIPPED** | Removed a global exclusive async lock from every cache hit and miss (`ccebc093`) |
 | Extend journal group commit to direct checkpoint callers | Largely shipped | **P2 residual** | The ack path already coalesces fsyncs via `GroupCommit`; route the remaining direct `checkpoint()` callers through it |
-| Remove long Delta guards from light compaction | P2 | **P1** | Protect query-planning and commit-publication p99 during maintenance |
+| ~~Remove long Delta guards from light compaction~~ | **SHIPPED** | **SHIPPED** | Tail enumeration now clones out from under the guard (`ccebc093`) |
 | Batch and conditionally publish Tantivy manifests | P1 | **P1** | Remove per-file object-store read-modify-write serialization and prevent cross-process lost updates |
 | Instrument and tune maintenance admission | P2 | **P1 for instrumentation; P2 for redesign** | Identify idle capacity, double admission, and priority inversion |
 | Parallelize resumed-bin discovery | P3 | **P2** | Shorten maintenance ticks at high project cardinality |
@@ -16,15 +16,22 @@ This document records the synchronization improvements identified in the TimeFus
 | Prototype immutable Delta snapshot publication | P3 | **P2** | Reduce planning-path lock and cache-line contention |
 | Remove other Delta guards across awaits | P1/P2 | **P2-P3 depending on path** | Improve rare-path, migration, and startup latency |
 | Bound per-key coordination registries | P2 | **P3** | Primarily memory/cardinality protection; premature cleanup could hurt throughput |
-| Replace the WAL allocator spinlock | P0 | **P3 normally; P0 on failure** | Neutral steady-state performance; eliminate infinite spinning after failure |
+| ~~Replace the WAL allocator spinlock~~ | **SHIPPED** | **SHIPPED** | Infinite spinning after an allocation failure is gone (`ce5e4781`) |
 | Add concurrency tests and observability | N/A | **P0 enabler** | Supply the evidence required to optimize safely |
 
 ## 1. Replace cache-stat locks with atomics
 
-**Correctness priority:** P3  
-**Performance priority:** P0
+**Status: SHIPPED** (`ccebc093`). One `cache_stats!` macro now declares the ten
+counters once, as both the plain `CacheStats` snapshot and the `AtomicCacheStats`
+the hot path bumps with relaxed `fetch_add`. Every recorder is synchronous.
 
-### Problem
+Two consequences worth knowing: `get_stats`/`reset_stats`/`log_stats` are no
+longer `async` (callers dropped their `.await`), and `try_get_stats` is GONE —
+it existed only to avoid blocking on the lock, and its `try_read` returned
+all-zero DEFAULTS under contention, which silently corrupted cache-hit readings
+during the md3 write-latency investigation. `get_stats` is now always exact.
+
+### Problem (as it was)
 
 Object-cache accounting stores ten additive counters behind a Tokio `RwLock`. Cache hits, misses, range hits, and byte accounting all acquire the write side of that lock.
 
@@ -104,10 +111,15 @@ Relevant code:
 
 ## 3. Release the Delta table guard before light-compaction enumeration
 
-**Correctness priority:** P2  
-**Performance priority:** P1
+**Status: SHIPPED** (`ccebc093`). The binned-consolidation caller now clones the
+`DeltaTable` out from under the read guard before `light_optimize_tail` consumes
+the async add-action stream, matching the `{ table_ref.read().await.clone() }`
+idiom already used elsewhere in `compact.rs`.
 
-### Problem
+NOT verified under contention: no test asserts that a delayed enumeration leaves
+publication unblocked, and the third acceptance criterion below is untested.
+
+### Problem (as it was)
 
 Light compaction holds a `RwLock<DeltaTable>` read guard while asynchronously collecting active add actions. Tokio's `RwLock` is write-preferring. Once a snapshot publisher queues for the write lock, later query readers queue behind that writer while the maintenance reader remains active.
 
@@ -439,10 +451,17 @@ These maps can grow with historical physical tables, but unified tables collapse
 
 ## 11. Replace the vendored WAL allocator spinlock
 
-**Correctness priority:** P0  
-**Performance priority:** P3 normally; P0 after a failure
+**Status: SHIPPED** (`ce5e4781`). `UnsafeCell<Block>` + `AtomicBool` became
+`std::sync::Mutex<Block>` (not `parking_lot` — that would add a dependency to a
+vendored crate for no gain here; poisoning is recovered via `into_inner`). Both
+manual `unsafe impl Send/Sync` are gone, since `Mutex<Block>` derives them.
 
-### Problem
+Guarded by `a_failed_rollover_releases_the_state_lock`, which was verified to
+FAIL (5.02s, "allocator wedged") against the old release-on-success-only shape.
+It runs via `make test-vendor` / `make prepush`, NOT in CI: ci/checks.tsv invokes
+cargo directly and vendored crates are path deps rather than workspace members.
+
+### Problem (as it was)
 
 The vendored allocator uses `UnsafeCell<Block>` guarded by a manually managed `AtomicBool` spinlock. Fallible file creation and mmap operations use `?` before `unlock`. An error or panic can therefore leave the lock set forever, causing all later allocators to spin indefinitely.
 
@@ -542,12 +561,12 @@ The following synchronization choices are currently appropriate and should not b
 
 ## Recommended execution order
 
-1. Convert cache statistics to relaxed atomics.
+1. ~~Convert cache statistics to relaxed atomics.~~ DONE (`ccebc093`).
 2. Instrument manifest publication, Delta lock waits, and the maintenance gates that lack metrics (journal group commit and the hygiene lane already export theirs).
 3. If `journal_commits_coalesced` shows direct checkpoint callers missing the existing group commit, route them through `commit_journal`.
-4. Release the Delta guard before light-compaction action enumeration.
+4. ~~Release the Delta guard before light-compaction action enumeration.~~ DONE (`ccebc093`).
 5. Batch Tantivy manifest changes and add conditional cross-process publication.
-6. Fix the WAL allocator spinlock for correctness.
+6. ~~Fix the WAL allocator spinlock for correctness.~~ DONE (`ce5e4781`).
 7. Improve resumed-bin probe parallelism and maintenance wake latency where metrics justify it.
 8. Tune or consolidate maintenance gates only after identifying the binding resource.
 9. Prototype immutable published snapshots only if table-lock wait is material.
