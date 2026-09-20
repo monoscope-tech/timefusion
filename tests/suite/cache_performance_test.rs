@@ -50,7 +50,7 @@ async fn read_all(store: &FoyerObjectStoreCache, paths: impl IntoIterator<Item =
 }
 
 async fn finish(shared: &SharedFoyerCache) -> Result<()> {
-    shared.log_stats().await;
+    shared.log_stats();
     shared.shutdown_by(tokio::time::Instant::now() + Duration::from_secs(30)).await
 }
 
@@ -73,7 +73,7 @@ async fn test_cache_performance_and_s3_bypass() -> Result<()> {
         put(&cached, &Path::from(*path_str), data.clone()).await?;
     }
 
-    let stats_after_write = shared_cache.get_stats().await;
+    let stats_after_write = shared_cache.get_stats();
     assert_eq!(stats_after_write.main.inner_puts, 3, "Should have written to inner store 3 times");
     assert_eq!(stats_after_write.main.inner_gets, 0, "Writes warm from payload — no inner GET during write");
 
@@ -82,7 +82,7 @@ async fn test_cache_performance_and_s3_bypass() -> Result<()> {
     let cached_read_time = read_all(&cached, paths(), None).await?;
     assert!(cached_read_time <= first_read_time * 2, "Cached reads should be consistently fast. First: {first_read_time:?}, Cached: {cached_read_time:?}");
 
-    let stats = shared_cache.get_stats().await;
+    let stats = shared_cache.get_stats();
     assert_eq!(stats.main.hits, 6, "Should have 6 cache hits total (3 per read iteration)");
     assert_eq!(stats.main.misses, 0, "Should have no cache misses since files were cached on write");
     assert_eq!(stats.main.inner_gets, 0, "Writes warm from payload and reads hit cache — no inner GETs at all");
@@ -113,7 +113,7 @@ async fn test_large_file_disk_caching() -> Result<()> {
         assert_eq!(chunks[0].len(), data.len(), "Should retrieve full file from cache");
     }
 
-    assert!(shared_cache.get_stats().await.main.hits > 0, "Should have cache hits");
+    assert!(shared_cache.get_stats().main.hits > 0, "Should have cache hits");
 
     finish(&shared_cache).await
 }
@@ -164,11 +164,11 @@ async fn test_parquet_metadata_cache_performance() -> Result<()> {
     }
 
     let footer = (FILE_SIZE - METADATA_SIZE) as u64..FILE_SIZE as u64;
-    let initial_stats = cache.get_stats().await;
+    let initial_stats = cache.get_stats();
     let cold_duration = read_all(&cache, (0..FILE_COUNT).map(part), Some(footer.clone())).await?;
-    let cold_stats = cache.get_stats().await;
+    let cold_stats = cache.get_stats();
     let warm_duration = read_all(&cache, (0..FILE_COUNT).map(part), Some(footer)).await?;
-    let final_stats = cache.get_stats().await;
+    let final_stats = cache.get_stats();
 
     // Only each file's footer is fetched, never the whole object.
     let cold_inner_gets = cold_stats.metadata.inner_gets - initial_stats.metadata.inner_gets;

@@ -343,7 +343,7 @@ impl E2eEnv {
     /// Foyer hit/miss/size snapshot; `None` when Foyer is disabled.
     pub async fn foyer_stats(&self) -> Option<timefusion::storage::CombinedCacheStats> {
         let cache = self.db().object_store_cache()?;
-        Some(cache.get_stats().await)
+        Some(cache.get_stats())
     }
 }
 

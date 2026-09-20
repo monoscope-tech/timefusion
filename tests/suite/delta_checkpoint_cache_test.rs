@@ -35,9 +35,9 @@ struct Delta {
 
 /// Reads `path` through the cache, returning its bytes and the counter deltas that read caused.
 async fn get_counted(cache: &FoyerObjectStoreCache, path: &Path) -> anyhow::Result<(Vec<u8>, Delta)> {
-    let before = cache.get_stats().await.main;
+    let before = cache.get_stats().main;
     let bytes = cache.get(path).await?.into_stream().try_collect::<Vec<_>>().await?.concat();
-    let after = cache.get_stats().await.main;
+    let after = cache.get_stats().main;
     let delta = Delta { hits: after.hits - before.hits, misses: after.misses - before.misses, ttl_expirations: after.ttl_expirations - before.ttl_expirations };
     Ok((bytes, delta))
 }

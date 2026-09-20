@@ -17,6 +17,18 @@
 test:
 	cargo nextest run $${ARGS}
 
+# The vendored crates are path dependencies, NOT workspace members, so a
+# root-level `cargo nextest run` never builds or runs their unit tests — a guard
+# living inside `vendor/` (e.g. the walrus allocator's rollover-wedge test) would
+# otherwise only ever run by hand.
+#
+# Deliberately NOT a prerequisite of `test`: walrus dev-depends on rocksdb, so a
+# cold build of this target is ~7 min. It hangs off `prepush` instead, where it
+# is paid once per push rather than once per inner-loop iteration. ci/checks.tsv
+# invokes cargo directly and so does NOT run this — `make prepush` is the gate.
+test-vendor:
+	cargo nextest run --manifest-path vendor/walrus-rust/Cargo.toml --lib $${ARGS}
+
 # Lib-only: skips the integration binary entirely. Use when iterating on a
 # pure-logic change; `make test` is cheap enough to be the default otherwise.
 test-unit:

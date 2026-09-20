@@ -1,8 +1,7 @@
 use std::{
-    cell::UnsafeCell,
     collections::HashMap,
     sync::{
-        Arc, OnceLock, RwLock,
+        Arc, Mutex, MutexGuard, OnceLock, RwLock,
         atomic::{AtomicBool, AtomicU16, Ordering},
     },
 };
@@ -16,8 +15,13 @@ use crate::wal::{
 };
 
 pub(super) struct BlockAllocator {
-    next_block: UnsafeCell<Block>,
-    lock: AtomicBool,
+    /// A plain `Mutex`, not a hand-rolled spinlock: the critical section is not
+    /// reliably tiny — a file rollover creates and mmaps a file inside it — and
+    /// the fallible steps use `?`, so a spinlock released only on the success
+    /// path stays LOCKED FOREVER after the first file-creation or mmap error,
+    /// burning a core per waiter. The guard releases on every exit, error and
+    /// unwind included.
+    next_block: Mutex<Block>,
     paths: Arc<WalPathManager>,
 }
 
@@ -26,23 +30,27 @@ impl BlockAllocator {
         let file1 = paths.create_new_file()?;
         let mmap: Arc<SharedMmap> = SharedMmapKeeper::get_mmap_arc(&file1)?;
         debug_print!("[alloc] init: created file={}, max_file_size={}B, block_size={}B", file1, MAX_FILE_SIZE, DEFAULT_BLOCK_SIZE);
-        Ok(BlockAllocator {
-            next_block: UnsafeCell::new(Block { id: 1, offset: 0, limit: DEFAULT_BLOCK_SIZE, file_path: file1, mmap, used: 0 }),
-            lock: AtomicBool::new(false),
-            paths,
-        })
+        Ok(BlockAllocator { next_block: Mutex::new(Block { id: 1, offset: 0, limit: DEFAULT_BLOCK_SIZE, file_path: file1, mmap, used: 0 }), paths })
+    }
+
+    /// Allocator state, recovering from poisoning.
+    ///
+    /// Every fallible step below assigns only AFTER its call returns, so a panic
+    /// cannot tear the state mid-update; the worst an error leaves behind is a
+    /// rolled-over `file_path` with the old `offset`, which the next call
+    /// re-detects as needing rollover and repeats. Refusing to allocate forever
+    /// is strictly worse than continuing from that.
+    fn state(&self) -> MutexGuard<'_, Block> {
+        self.next_block.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// SAFETY: Caller must ensure the returned `Block` is treated as uniquely
-    /// owned by a single writer until it is sealed. Internally, a spin lock
-    /// ensures exclusive mutable access to `next_block` while computing the
-    /// next allocation, so the interior `UnsafeCell` is not concurrently
-    /// accessed mutably.
+    /// owned by a single writer until it is sealed — two writers sharing one
+    /// block would race on its mmap. The allocator itself hands out disjoint
+    /// (id, offset) ranges under the state mutex.
     pub(super) unsafe fn get_next_available_block(&self) -> std::io::Result<Block> {
-        self.lock();
-        // SAFETY: Guarded by `self.lock()` above, providing exclusive access
-        // to `next_block` so creating a `&mut` from `UnsafeCell` is sound.
-        let data = unsafe { &mut *self.next_block.get() };
+        let mut guard = self.state();
+        let data = &mut *guard;
         let prev_block_file_path = data.file_path.clone();
         if data.offset >= MAX_FILE_SIZE {
             // mark previous file as fully allocated before switching
@@ -62,14 +70,14 @@ impl BlockAllocator {
         let ret = data.clone();
         data.offset += DEFAULT_BLOCK_SIZE;
         data.id += 1;
-        self.unlock();
+        drop(guard);
         debug_print!("[alloc] handout: block_id={}, file={}, offset={}, limit={}", ret.id, ret.file_path, ret.offset, ret.limit);
         Ok(ret)
     }
 
     /// SAFETY: Caller must ensure the resulting `Block` remains uniquely used
-    /// by one writer and not read concurrently while being written. The
-    /// internal spin lock provides exclusive access to mutate allocator state.
+    /// by one writer and not read concurrently while being written. The state
+    /// mutex only guarantees the handed-out ranges are disjoint.
     pub(super) unsafe fn alloc_block(&self, want_bytes: u64) -> std::io::Result<Block> {
         if want_bytes == 0 || want_bytes > MAX_ALLOC {
             return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid allocation size, a single entry can't be more than 1gb"));
@@ -78,10 +86,8 @@ impl BlockAllocator {
         let alloc_size = alloc_units * DEFAULT_BLOCK_SIZE;
         debug_print!("[alloc] alloc_block: want_bytes={}, units={}, size={}", want_bytes, alloc_units, alloc_size);
 
-        self.lock();
-        // SAFETY: Guarded by `self.lock()` above, providing exclusive access
-        // to `next_block` so creating a `&mut` from `UnsafeCell` is sound.
-        let data = unsafe { &mut *self.next_block.get() };
+        let mut guard = self.state();
+        let data = &mut *guard;
         if data.offset + alloc_size > MAX_FILE_SIZE {
             let prev_block_file_path = data.file_path.clone();
             data.file_path = self.paths.create_new_file()?;
@@ -99,33 +105,11 @@ impl BlockAllocator {
         FileStateTracker::set_block_locked(ret.id as usize);
         data.offset += alloc_size;
         data.id += 1;
-        self.unlock();
+        drop(guard);
         debug_print!("[alloc] handout(sized): block_id={}, file={}, offset={}, limit={}", ret.id, ret.file_path, ret.offset, ret.limit);
         Ok(ret)
     }
-
-    /*
-    the critical section of this call would be absolutely tiny given the exception of when a new file is being created, but it'll be amortized and in the majority of the scenario it would be a handful of microseconds and the overhead of a syscall isnt worth it, a hundred or two cycles are nothing in the grand scheme of things
-    */
-    fn lock(&self) {
-        // Spin lock implementation
-        while self.lock.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
-            std::hint::spin_loop();
-        }
-    }
-
-    fn unlock(&self) {
-        self.lock.store(false, Ordering::Release);
-    }
 }
-
-// SAFETY: `BlockAllocator` uses an internal spin lock to guard all mutable
-// access to `next_block`. It does not expose references to its interior
-// without holding that lock, so concurrent access across threads is safe.
-unsafe impl Sync for BlockAllocator {}
-// SAFETY: The type contains only thread-safe primitives and does not rely on
-// thread-affine resources; moving it to another thread is safe.
-unsafe impl Send for BlockAllocator {}
 
 pub(super) fn flush_check(file_path: String) {
     // readiness check fast path; hook actual reclamation later
@@ -301,5 +285,50 @@ impl FileStateTracker {
         let total = st.total_blocks.load(Ordering::Acquire);
         let fully = st.is_fully_allocated.load(Ordering::Acquire);
         Some((locked, checkpointed, total, fully))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::wal::config::BLOCKS_PER_FILE;
+
+    /// A failed file rollover must leave the allocator USABLE.
+    ///
+    /// The state lock was a hand-rolled spinlock released only on the success
+    /// path, so the `?` on `create_new_file` returned while still holding it and
+    /// every later allocation spun forever on a live core. The second attempt
+    /// below is the assertion: it must come back (with an error), not hang.
+    ///
+    /// Reinstate the spinlock and this fails on the `recv_timeout`.
+    #[test]
+    fn a_failed_rollover_releases_the_state_lock() {
+        let root = std::env::temp_dir().join(format!("walrus-rollover-wedge-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let allocator = Arc::new(BlockAllocator::new(Arc::new(WalPathManager::under(root.clone()))).expect("initial file"));
+
+        // Make every later `create_new_file` fail for ANY uid: `ensure_root`'s
+        // `create_dir_all` cannot succeed while the root path is a regular file.
+        // (A permissions-based injection would be a no-op for root, which is how
+        // CI runs.)
+        std::fs::remove_dir_all(&root).unwrap();
+        std::fs::write(&root, b"not a directory").unwrap();
+
+        // The first BLOCKS_PER_FILE hand-outs consume the initial file; the next
+        // needs a new one and fails.
+        let failed = (0..=BLOCKS_PER_FILE).any(|_| unsafe { allocator.get_next_available_block() }.is_err());
+        assert!(failed, "rollover should fail while the WAL root is a regular file");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let probe = Arc::clone(&allocator);
+        std::thread::spawn(move || {
+            let _ = tx.send(unsafe { probe.get_next_available_block() }.is_err());
+        });
+        let still_answers = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("allocator wedged: the failed rollover never released the state lock");
+        assert!(still_answers, "the root is still a file, so this must error rather than hand out a block");
+
+        let _ = std::fs::remove_file(&root);
     }
 }
