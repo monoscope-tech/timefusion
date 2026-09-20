@@ -483,6 +483,16 @@ pub fn init_metrics(
         "Hygiene turns that found no free permit and gave up before claiming",
         maintenance_stats().compaction_permits_unavailable.load(Relaxed)
     );
+    observe!(counter
+        "timefusion.maintenance.hot_packing_reserve_unavailable",
+        "Coordinator hot-packing turns held back so pending sealed consolidation can take the shared rewrite lanes",
+        maintenance_stats().hot_packing_reserve_unavailable.load(Relaxed)
+    );
+    observe!(counter
+        "timefusion.maintenance.hot_packing_reserve_waits",
+        "Cron-driven hot bins queued before the shared rewrite pool by the sealed-debt reservation",
+        maintenance_stats().hot_packing_reserve_waits.load(Relaxed)
+    );
     // Committed bins per lane — the drain rate. Quoting one without history is how
     // a working-window burst right after a restart gets reported as a sustained rate.
     observe!(counter
@@ -531,6 +541,16 @@ pub fn init_metrics(
     observe!(gauge "timefusion.maintenance.pending_base_rollup", "BaseRollup units queued", maintenance_stats().pending_base_rollup.load(Relaxed));
     observe!(gauge "timefusion.maintenance.pending_dedup", "Dedup units queued", maintenance_stats().pending_dedup.load(Relaxed));
     observe!(gauge "timefusion.maintenance.pending_repair", "Repair units queued", maintenance_stats().pending_repair.load(Relaxed));
+    observe!(gauge
+        "timefusion.maintenance.quarantined_tasks",
+        "Queued units rationed to the quarantine lane after repeated worker failures",
+        maintenance_stats().maintenance_tasks_quarantined.load(Relaxed)
+    );
+    observe!(gauge
+        "timefusion.maintenance.due_nonquarantined_tasks",
+        "Queued units whose deadline passed and which are not quarantined; derived dependencies may still block some",
+        maintenance_stats().maintenance_tasks_due_nonquarantined.load(Relaxed)
+    );
     // INDEX COVERAGE. Live parquet with no tantivy index: those files fall back
     // to UDF scan, so queries over them are slow while every compaction metric
     // looks healthy. It had no metric at all until 2026-09-19, when an off-box
@@ -1165,6 +1185,12 @@ atomic_stats! {
         /// the alternative is claiming anyway and blocking inside `stage_hot_bin`
         /// until the deadline, committing nothing.
         compaction_permits_unavailable,
+        /// Coordinator hot-packing turns declined by the conditional cap that
+        /// reserves most light lanes for pending sealed consolidation.
+        hot_packing_reserve_unavailable,
+        /// Cron-driven hot bins that had to queue behind the same sealed-debt
+        /// reservation. These wait before taking a global rewrite permit.
+        hot_packing_reserve_waits,
         /// Packing/consolidation turns that DID take a `light_rewrite_sem` permit —
         /// the denominator a refusal count needs. Read
         /// `acquired / (acquired + unavailable)`.
@@ -1335,6 +1361,8 @@ atomic_stats! {
         maintenance_tasks_pending as "tasks_pending",
         maintenance_tasks_running as "tasks_running",
         maintenance_tasks_retry as "tasks_retry",
+        maintenance_tasks_quarantined as "tasks_quarantined",
+        maintenance_tasks_due_nonquarantined as "tasks_due_nonquarantined",
         maintenance_tasks_complete as "tasks_complete",
         maintenance_backlog_bytes as "backlog_bytes",
         /// Oldest age over work the scheduler still INTENDS to do — tasks whose
@@ -1437,6 +1465,18 @@ atomic_stats! {
         /// something is invalidating the memo every claim — suspect the bulk
         /// generations first.
         maintenance_rank_computations as "maintenance_rank_computations_total",
+        /// 1 while the hygiene lane may start another sort, 0 while live memory
+        /// has closed it. Read WITH `coordinator_pool_pct` and `charged_pct`: a
+        /// gate pinned at 0 with both well under their thresholds means the
+        /// CEILING is binding, not memory, and the fix is the backstop rather
+        /// than the budget. Pinned at 0 with `charged_pct` high is the gate
+        /// doing its job.
+        hygiene_gate_open,
+        /// Hygiene starts refused by the in-flight BACKSTOP rather than by
+        /// memory. Distinct from `compaction_permits_unavailable` because the
+        /// fixes are opposite: this says raise the ceiling, that says the box is
+        /// genuinely full.
+        hygiene_backstop_refusals as "hygiene_backstop_refusals_total",
         /// Derived units retried because their BASE tier does not cover the slice
         /// they were asked to build. Publishing anyway would trust a short cell
         /// permanently, since the witness is the RAW partition. Read as a RATE:

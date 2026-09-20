@@ -775,11 +775,15 @@ async fn staged_objects_complete(store: &dyn object_store::ObjectStore, adds: &[
 }
 
 impl Database {
-    /// The busy-pool backoff for `key`. Do NOT inline `self.journal().attempts()`
-    /// into a `retry_task` argument: the temporary lives to the end of the
-    /// statement and `retry_task` takes the same non-reentrant mutex.
-    pub(crate) fn admission_backoff_for(&self, key: &crate::maintenance_coordinator::TaskKey) -> std::time::Duration {
-        transient_retry_backoff(self.journal().attempts(key))
+    /// Retry admission promptly after capacity returns.
+    ///
+    /// Admission contention is not a property of the task. Feeding its durable
+    /// attempt count into the prerequisite backoff made an old task wait 64s
+    /// after a momentary runtime-lag spike lowered the CPU ceiling. Five seconds
+    /// bounds refill latency while keeping the observed rejected-worker churn at
+    /// roughly the same order as the former steady-state rate.
+    pub(crate) fn admission_backoff_for(&self, _key: &crate::maintenance_coordinator::TaskKey) -> std::time::Duration {
+        std::time::Duration::from_secs(5)
     }
 
     /// Push a coordinator task's next attempt out by `delay`, journaled and checkpointed.
@@ -963,8 +967,6 @@ impl Database {
             let cursor_key = format!("{storage_project}:{source}");
             // The first coordinator start has no durable cursor: baseline at the
             // loaded snapshot rather than expanding the whole table history.
-            // Bound to its own statement so the journal guard is DROPPED before
-            // the else block takes it again — see `admission_backoff_for`.
             let current_cursor = self.journal().source_cursor(&cursor_key);
             let Some(cursor) = current_cursor else {
                 let mut journal = self.journal();
@@ -1792,7 +1794,7 @@ impl Database {
         let Some(_permit) = self.maintenance_admission.try_acquire(request) else {
             // Deliberately NOT `resource_admission`: that reason makes `retry_or_split`
             // split the unit. The request is clamped, so a refusal means only "busy now".
-            return retry("admission_busy".to_owned(), transient_retry_backoff(task.attempts));
+            return retry("admission_busy".to_owned(), self.admission_backoff_for(&key));
         };
         let probe_hash_shards = usize::try_from(estimated_bytes.div_ceil(MAX_DECODED_BYTES).clamp(1, DEDUP_BUCKET_COUNT)).unwrap_or(1);
         let limits = DedupExecutionLimits {
@@ -2954,21 +2956,65 @@ impl Database {
     async fn run_coordinator_compaction_selected(&self, selection: TaskSelection<'_>) -> Result<bool> {
         let operation = selection.operation();
         use crate::maintenance_coordinator::{MAX_DECODED_BYTES, Operation, Resources, TaskLease, TaskState};
+        // Current-day packing must not repeatedly win every shared light permit
+        // while an older sealed day is waiting. This cap is conditional: once
+        // sealed debt reaches zero, hot packing may use the whole pool again.
+        // Take it before the global permit so a capped hot unit holds no scarce
+        // rewrite capacity while waiting.
+        let _hot_packing_slot = if operation == Operation::HotPacking
+            && crate::observability::maintenance_stats().pending_sealed_consolidation.load(std::sync::atomic::Ordering::Relaxed) != 0
+        {
+            match Arc::clone(&self.hot_packing_sem).try_acquire_owned() {
+                Ok(permit) => Some(permit),
+                Err(_) => {
+                    crate::observability::maintenance_stats().hot_packing_reserve_unavailable.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return Ok(false);
+                }
+            }
+        } else {
+            None
+        };
         // Take the rewrite permit BEFORE the claim, never inside `stage_hot_bin`:
         // blocking on it after `claim_next` has stamped the unit Running spends the
         // unit's whole deadline in a queue. Repair is exempt.
+        //
+        // The permit used to BE the memory budget: a fixed pool of six, each an
+        // implicit 1.25 GiB static reservation. That made the reservation the
+        // ceiling rather than the memory, and prod 2026-09-21 ran
+        // `coordinator_pool_pct` at 28% while refusing 99 acquires a second with
+        // `pending_sealed_consolidation` growing — five times over-reserved, and
+        // the lane starved for it.
+        //
+        // The semaphore is now only a backstop on in-flight tasks; whether there
+        // is room is asked of LIVE memory (`hygiene_admits`), so an idle box
+        // spends its idle memory and a loaded one stops before the wave brake.
         let light_permit = match operation {
             Operation::HotPacking | Operation::SealedConsolidation => {
                 let stats = crate::observability::maintenance_stats();
                 self.rebalance_repair_holdback(stats);
-                stats.light_rewrite_permits_available.store(self.light_rewrite_sem.available_permits() as u64, std::sync::atomic::Ordering::Relaxed);
+                let available = self.light_rewrite_sem.available_permits();
+                stats.light_rewrite_permits_available.store(available as u64, std::sync::atomic::Ordering::Relaxed);
+                let ceiling = self.config.derived.max_light_optimize_k().max(1);
+                let pool = self.coordinator_runtime_env().memory_pool.reserved();
+                if !self.hygiene_gate.admits(
+                    &self.config.derived,
+                    pool,
+                    self.config.derived.coordinator_share_bytes(),
+                    ceiling.saturating_sub(available),
+                    ceiling,
+                ) {
+                    return Ok(false);
+                }
                 match Arc::clone(&self.light_rewrite_sem).try_acquire_owned() {
                     Ok(permit) => {
                         stats.compaction_permits_acquired.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         Some(permit)
                     }
+                    // The gate said yes and the semaphore said no, so the backstop
+                    // is what is binding. Counted separately from a gate refusal:
+                    // they need opposite fixes.
                     Err(_) => {
-                        stats.compaction_permits_unavailable.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        stats.hygiene_backstop_refusals.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         return Ok(false);
                     }
                 }
@@ -2997,7 +3043,8 @@ impl Database {
         // completion-based clock stays silent on precisely the failure it is
         // built to name — the same trap that kept #268's lifetime cap from ever
         // firing, since `tokio::time::timeout` cannot preempt a future that never
-        // reaches an await point. Two permits bound this to two watchdogs.
+        // reaches an await point. One watchdog per in-flight unit, so coverage
+        // scales with the lane instead of with a permit count that no longer bounds it.
         // Every await between taking the permit and starting the sort gets its own
         // name. The earlier five stopped at `compaction_files`, which labelled the
         // whole of the snapshot fold, the repair sortedness probe and the resume
@@ -3070,7 +3117,7 @@ impl Database {
             _ => crate::maintenance_coordinator::AdmissionLane::Other,
         };
         let Some(_permit) = self.maintenance_admission.try_acquire_for(request, lane) else {
-            return self.retried(&key, "admission_busy".to_owned(), transient_retry_backoff(task.attempts));
+            return self.retried(&key, "admission_busy".to_owned(), self.admission_backoff_for(&key));
         };
         note(2);
         let table_ref = match self.resolve_table(&key.project_id, &key.source).await {
@@ -3117,7 +3164,14 @@ impl Database {
         note(7);
         let runtime = self.coordinator_compaction_runtime_env(operation);
         let outcome = self
-            .stage_hot_bin(&table_ref, &key.source, schema, &key.project_id, files, HotStageOptions { pass, runtime_env: Some(runtime), light_permit })
+            .stage_hot_bin(
+                &table_ref,
+                &key.source,
+                schema,
+                &key.project_id,
+                files,
+                HotStageOptions { pass, operation: Some(operation), runtime_env: Some(runtime), light_permit },
+            )
             .await;
         let completed = match outcome {
             Ok(BinOutcome::Staged(unit)) => {
@@ -6020,7 +6074,14 @@ impl Database {
         let Some((project_id, files)) = planned.into_iter().next() else { return Ok(None) };
         let schema = schema_or_default(table_name);
         let outcome = self
-            .stage_hot_bin(table_ref, table_name, schema, &project_id, files.clone(), HotStageOptions { pass, runtime_env: None, light_permit: None })
+            .stage_hot_bin(
+                table_ref,
+                table_name,
+                schema,
+                &project_id,
+                files.clone(),
+                HotStageOptions { pass, operation: None, runtime_env: None, light_permit: None },
+            )
             .await?;
         Ok(matches!(outcome, BinOutcome::Staged(_)).then_some((project_id, files)))
     }
@@ -6179,7 +6240,14 @@ impl Database {
                     let _in_flight = (pass == TailPass::Repair).then(|| in_flight_guard(&crate::observability::maintenance_stats().repair_bins_in_flight));
                     let staged = tokio::time::timeout(
                         left,
-                        self.stage_hot_bin(table_ref, table_name, schema, &project_id, files, HotStageOptions { pass, runtime_env: None, light_permit: None }),
+                        self.stage_hot_bin(
+                            table_ref,
+                            table_name,
+                            schema,
+                            &project_id,
+                            files,
+                            HotStageOptions { pass, operation: None, runtime_env: None, light_permit: None },
+                        ),
                     )
                     .await
                     .unwrap_or_else(|_| Err(anyhow::anyhow!("hot bin staging exceeded the {left:?} left in the tick budget")));
@@ -6238,7 +6306,8 @@ impl Database {
         options: HotStageOptions,
     ) -> Result<BinOutcome<StagedBin>> {
         use deltalake::{delta_datafusion::TableProviderBuilder, kernel::Action, writer::DeltaWriter};
-        let HotStageOptions { pass, runtime_env, light_permit } = options;
+        let HotStageOptions { pass, operation, runtime_env, light_permit } = options;
+        let date = repair_bin_date(&files).to_owned();
         // One read-lock, one table clone per bin: the pinned scan snapshot and
         // the writer's staging table both derive from it.
         let staging_table = { table_ref.read().await.clone() };
@@ -6264,6 +6333,19 @@ impl Database {
         // for heavy rewrites and would cap waves at its 2 permits. Wave staging
         // is already bounded by K and sized by the light pool slice.
         let permit_wait = std::time::Instant::now();
+        // Cron-driven Pack waves do not pass through the coordinator's pre-claim
+        // gate. Apply the same conditional cap here, before acquiring a global
+        // light permit. Waiting here consumes neither a coordinator worker nor a
+        // rewrite lane; the caller's tick deadline still bounds the wait.
+        let _hot_packing_slot = if pass == TailPass::Pack
+            && operation.is_none()
+            && crate::observability::maintenance_stats().pending_sealed_consolidation.load(std::sync::atomic::Ordering::Relaxed) != 0
+        {
+            crate::observability::maintenance_stats().hot_packing_reserve_waits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Some(Arc::clone(&self.hot_packing_sem).acquire_owned().await.map_err(|e| anyhow::anyhow!("hot packing semaphore closed: {e}"))?)
+        } else {
+            None
+        };
         let _light_permit = match light_permit {
             Some(permit) => permit,
             // Repair queues on its OWN one-permit semaphore: its bins are whole
@@ -6305,7 +6387,18 @@ impl Database {
         let batch_size = batch_rows_for(decoded_in, rows_in, self.config.maintenance.timefusion_maintenance_batch_target_bytes).to_string();
         // Emitted BEFORE the rewrite, because the interesting bins are the ones
         // that never reach `wave_bin_staged`.
-        info!(table_name, project_id, ?pass, selected_files = targets.len(), rows_in, bytes_in, permit_wait_ms, event = "wave_bin_staging_started");
+        info!(
+            table_name,
+            project_id,
+            ?operation,
+            ?pass,
+            date,
+            selected_files = targets.len(),
+            rows_in,
+            bytes_in,
+            permit_wait_ms,
+            event = "wave_bin_staging_started"
+        );
         let stage_store = staging_table.log_store().object_store(None);
         let mut adds: Vec<Action> = Vec::new();
         // Hoisted out of the staging block so the StagedBin below can carry
@@ -6604,7 +6697,9 @@ impl Database {
         info!(
             table_name,
             project_id,
+            ?operation,
             ?pass,
+            date,
             wave_id,
             selected_files = targets.len(),
             rows_in,

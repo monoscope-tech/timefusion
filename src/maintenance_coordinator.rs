@@ -82,7 +82,10 @@ pub const fn operation_deadline_secs(operation: Operation) -> u64 {
 /// Matched on the message, not the type: these errors arrive type-erased across
 /// the delta-rs and `anyhow` boundaries.
 pub fn is_capacity_failure(message: &str) -> bool {
-    message.contains("Resources exhausted") || message.contains("Not enough memory to continue external sort") || message.contains("resource_admission")
+    message.contains("Resources exhausted")
+        || message.contains("Failed to allocate additional")
+        || message.contains("Not enough memory to continue external sort")
+        || message.contains("resource_admission")
 }
 
 /// Whether a failure is a DETERMINISTIC PLAN error — the SQL could not be built
@@ -2017,6 +2020,15 @@ impl TaskJournal {
             return;
         }
         let attempts = self.task(key).map_or(1, |task| task.attempts);
+        if failure.is_some_and(is_capacity_failure) {
+            // Shared-pool contention says nothing about this task's health. Keep
+            // it out of `worker_error` quarantine; repeated failures may still
+            // split an intrinsically large unit through the ordinary capacity
+            // path. Prod 2026-09-20 otherwise quarantined 113 rollups after one
+            // over-admitted startup burst and left most workers idle for hours.
+            self.retry_or_split(key, "resource_exhausted".to_owned(), now_micros.saturating_add(30_000_000), attempts);
+            return;
+        }
         if attempts >= 2 && self.split_task(key, SplitTrigger::RepeatedFailure, None) {
             return;
         }
@@ -2321,6 +2333,7 @@ impl TaskJournal {
         let mut latest_frontier_rollup: HashMap<(&str, &str, &str), &MaintenanceTask> = HashMap::new();
         let mut per_operation = [0u64; <Operation as strum::EnumCount>::COUNT];
         let (mut eligible_base_rollup, mut eligible_sealed) = (0u64, 0u64);
+        let (mut quarantined, mut due_nonquarantined) = (0u64, 0u64);
         let now_micros = crate::support::now_micros();
         for task in &self.snapshot.tasks {
             counts[task.state as usize] = counts[task.state as usize].saturating_add(1);
@@ -2339,7 +2352,13 @@ impl TaskJournal {
                 // Per-operation split, plus what is claimable now: when coverage stalls, is
                 // the work absent, ineligible, or out-competed?
                 per_operation[task.key.operation as usize] = per_operation[task.key.operation as usize].saturating_add(1);
+                if matches!(task.state, TaskState::Pending | TaskState::Retry) && Self::is_quarantined(task) {
+                    quarantined = quarantined.saturating_add(1);
+                }
                 if matches!(task.state, TaskState::Pending | TaskState::Retry) && task.deadline_micros <= now_micros {
+                    if !Self::is_quarantined(task) {
+                        due_nonquarantined = due_nonquarantined.saturating_add(1);
+                    }
                     if task.key.operation == Operation::BaseRollup {
                         eligible_base_rollup = eligible_base_rollup.saturating_add(1);
                     }
@@ -2361,6 +2380,8 @@ impl TaskJournal {
         stats.maintenance_tasks_pending.store(counts[0], Relaxed);
         stats.maintenance_tasks_running.store(counts[1], Relaxed);
         stats.maintenance_tasks_retry.store(counts[2], Relaxed);
+        stats.maintenance_tasks_quarantined.store(quarantined, Relaxed);
+        stats.maintenance_tasks_due_nonquarantined.store(due_nonquarantined, Relaxed);
         stats.maintenance_tasks_complete.store(counts[TaskState::Complete as usize].saturating_add(counts[TaskState::Superseded as usize]), Relaxed);
         stats.maintenance_backlog_bytes.store(backlog_bytes, Relaxed);
         stats.sealed_compaction_debt_bytes.store(sealed_debt_bytes, Relaxed);
@@ -2533,7 +2554,7 @@ fn scheduling_class_until(task: &MaintenanceTask, now_micros: i64) -> ((u8, u8, 
         // [floor, horizon] band ties, and each further DAY past it is one step better.
         // Graded in DAYS because `claim_next` matches the winning tuple EXACTLY — a
         // continuous key would make one unit the sole winner and defeat `fair_cursors`.
-        let starved = if waited < STARVATION_MICROS {
+        let age_score = if waited < STARVATION_MICROS {
             u8::MAX
         } else {
             (u8::MAX - 1).saturating_sub(u8::try_from(waited.saturating_sub(STARVATION_HORIZON_MICROS).max(0) / DAY_MICROS).unwrap_or(u8::MAX))
@@ -2543,14 +2564,20 @@ fn scheduling_class_until(task: &MaintenanceTask, now_micros: i64) -> ((u8, u8, 
         let recency = task.key.slice.end_micros.div_euclid(PRIORITY_BUCKET_MICROS);
         // File hygiene ranks by BENEFIT, not date: every hygiene unit is day-wide, so
         // `-width` is constant among them. Zero files orders LAST — "benefit unknown".
-        let benefit = match task.key.operation {
+        let benefit_bucket = match task.key.operation {
             // Bucketed for the same reason recency is: an exact tuple match plus a raw file
             // count would make one cell the sole winner of every claim.
-            Operation::SealedConsolidation | Operation::HotPacking | Operation::Repair => {
-                -i64::from(task.input.map_or(0, |input| input.files) / BENEFIT_BUCKET_FILES)
-            }
+            Operation::SealedConsolidation | Operation::HotPacking | Operation::Repair => task.input.map_or(0, |input| input.files) / BENEFIT_BUCKET_FILES,
             _ => 0,
         };
+        let benefit = -i64::from(benefit_bucket);
+        // Hygiene is cost/benefit work: a newly sealed 400-file cell must not sit
+        // behind a three-file cell merely because the latter crossed a three-day
+        // threshold. Fold file-count benefit into the age score rather than
+        // putting it after age as a powerless tiebreak. The score remains u8 and
+        // age keeps improving one step per day past the horizon, so small old
+        // cells still become strictly best instead of starving forever.
+        let starved = age_score.saturating_sub(u8::try_from(benefit_bucket).unwrap_or(u8::MAX));
         // Keyed on the AGE, not on `starved`: the graded term is 254 in-band, not 0, so
         // testing the rank value here would flip the whole backlog to newest-first. Width
         // goes through `scheduling_width` so splitting does not demote a unit's children.
@@ -2764,11 +2791,18 @@ impl AdmissionController {
     }
 
     pub fn with_cpu_ceiling(cpu_base: u32, cpu_max: u32, cgroup_memory_bytes: u64, object_reads: u32, object_writes: u32) -> Self {
-        use std::sync::atomic::Ordering::Relaxed;
-
         // At most 75% is trackable maintenance decode. The remainder is an
         // unconditional foreground/untracked-allocation reserve.
         let decoded_bytes = cgroup_memory_bytes.saturating_mul(3) / 4;
+        Self::with_decoded_capacity(cpu_base, cpu_max, decoded_bytes, object_reads, object_writes)
+    }
+
+    /// Construct admission against the memory pool these jobs really allocate
+    /// from. Unlike [`Self::with_cpu_ceiling`], `decoded_bytes` is already a
+    /// carved-out capacity and must not receive another cgroup reserve haircut.
+    pub fn with_decoded_capacity(cpu_base: u32, cpu_max: u32, decoded_bytes: u64, object_reads: u32, object_writes: u32) -> Self {
+        use std::sync::atomic::Ordering::Relaxed;
+
         let capacity = Resources { cpu: cpu_max.max(cpu_base), decoded_bytes, object_reads, object_writes };
         let stats = crate::observability::maintenance_stats();
         stats.maintenance_cpu_tokens_capacity.store(u64::from(capacity.cpu), Relaxed);
@@ -2975,6 +3009,22 @@ mod tests {
         let unit = journal.tasks().find(|candidate| candidate.key == key).expect("present");
         assert_eq!(unit.state, TaskState::Retry, "a failure must go to Retry, not back to the queue");
         assert!(unit.deadline_micros > now, "and must carry a backoff, got {}", unit.deadline_micros);
+    }
+
+    /// Pool contention is a capacity signal, not evidence that the unit itself is
+    /// broken. It must not consume the tiny quarantine lane as `worker_error`.
+    #[test]
+    fn a_pool_allocation_failure_stays_out_of_worker_quarantine() {
+        let (_dir, mut journal) = new_journal();
+        let key = running_unit(&mut journal, task("p", 0, 1, Operation::BaseRollup), 2);
+        let now = 1_000_000_000;
+
+        journal.abandon_running(&key, now, Some("Failed to allocate additional 16.1 MB for ExternalSorter[2]"));
+
+        let unit = journal.tasks().find(|candidate| candidate.key == key).expect("present");
+        assert_eq!(unit.state, TaskState::Retry);
+        assert_eq!(unit.retry_reason.as_deref(), Some("resource_exhausted"));
+        assert!(!TaskJournal::is_quarantined(unit), "shared-pool pressure must not poison a healthy task");
     }
 
     /// Releasing is only correct for a unit that is actually claimed; anything
@@ -4308,17 +4358,17 @@ mod tests {
         );
     }
 
-    /// `starved` is `0` only for work aged 3-31 days and is compared BEFORE
-    /// `benefit`, so a merely young cell loses however much debt it holds.
+    /// File-count benefit is folded into the hygiene age score, so a newly
+    /// sealed fragmentation explosion is not hidden behind tiny older cells.
     #[test]
-    fn the_starvation_window_demotes_the_biggest_debt_when_it_is_young() {
+    fn the_starvation_window_does_not_demote_the_biggest_hygiene_debt() {
         let now = 400 * DAY_MICROS;
         let cell = |project: &str, days_ago: i64, files: u32| hygiene_cell(project, now - days_ago * DAY_MICROS, files, Operation::SealedConsolidation);
         let first = claim_winner(now, Operation::SealedConsolidation, |journal| {
             journal.enqueue_planned(&cell("biggest-but-young", 1, 433));
             journal.enqueue_planned(&cell("smaller-but-aged", 3, 238));
         });
-        assert_eq!(first, "smaller-but-aged", "a 238-file cell wins over a 433-file one solely because the bigger one is 1 day old");
+        assert_eq!(first, "biggest-but-young", "433 files must outrank 238 instead of losing solely because the cell is one day old");
     }
 
     /// The most indebted unclaimed hygiene cell must name what outranks it —
@@ -4331,12 +4381,12 @@ mod tests {
         // Shaped exactly like `plan_compaction_debt`: build the unit with the
         // footprint it selected on, then hand it to `enqueue_planned`.
         let cell = |project: &str, hours_ago: i64, files: u32| hygiene_cell(project, now - hours_ago * HOUR, files, Operation::SealedConsolidation);
-        // The biggest debt sealed a day ago, so it is NOT in the starvation band;
-        // a much smaller cell has waited five days and is, so it legitimately wins.
+        // The biggest debt sealed a day ago. A much smaller cell has waited long
+        // enough for bounded age escalation to outweigh its lower benefit.
         // The smaller cell is enqueued FIRST so insertion order contradicts the
         // answer — otherwise `max_by_key` over zeroes would name it by accident.
         let indebted = cell("bigdebt", 24, 238);
-        journal.enqueue_planned(&cell("starved", 120, 10));
+        journal.enqueue_planned(&cell("starved", 1_920, 10));
         journal.enqueue_planned(&indebted);
 
         let refusal = journal.most_indebted_unclaimed(Operation::SealedConsolidation, now).expect("the debt is not being claimed");
@@ -5504,6 +5554,7 @@ mod tests {
          'datafusion.runtime.memory_limit', or decreasing the config: 'datafusion.execution.sort_spill_reservation_bytes'."
         => true ; "the sort-OOM wording")]
     #[test_case::test_case("compaction: Resources exhausted: Additional allocation failed for ExternalSorter[1] with top memory consumers" => true ; "pool exhaustion")]
+    #[test_case::test_case("Failed to allocate additional 16.1 MB for ExternalSorter[2] with 0.0 B already allocated" => true ; "the production fair-pool wording")]
     #[test_case::test_case("dedup: Object at location ... not found" => false ; "a missing object has nothing to do with size")]
     #[test_case::test_case("compaction: transaction failed: version 2667 already exists" => false ; "a commit conflict has nothing to do with size")]
     #[test_case::test_case("source_not_flushed" => false ; "a dependency failure has nothing to do with size")]
@@ -5705,6 +5756,12 @@ mod tests {
         assert_eq!(admission.utilization(), Resources::default());
         assert!(admission.try_acquire(Resources { decoded_bytes: 751, ..Resources::default() }).is_none());
         assert!(admission.try_acquire(Resources { decoded_bytes: MAX_DECODED_BYTES + 1, ..Resources::default() }).is_none());
+    }
+
+    #[test]
+    fn pool_scoped_admission_uses_the_exact_pool_capacity() {
+        let admission = AdmissionController::with_decoded_capacity(1, 4, 1_234, 4, 4);
+        assert_eq!(lock(&admission.0).capacity.decoded_bytes, 1_234, "a carved-out pool must not receive the cgroup constructor's second 25% haircut");
     }
 
     /// THE correctness argument for `rank`'s memo, as one property.

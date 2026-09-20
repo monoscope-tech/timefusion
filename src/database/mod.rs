@@ -1216,6 +1216,13 @@ fn coordinator_operation_timeout(operation: crate::maintenance_coordinator::Oper
 pub(crate) const COORDINATOR_HOT_TARGET_BYTES: i64 = 256 * 1024 * 1024;
 const COORDINATOR_SEALED_TARGET_BYTES: i64 = 256 * 1024 * 1024;
 
+/// Current-day packing's share of the light rewrite pool while sealed debt is
+/// pending. The guard is bypassed when sealed debt is zero, so this is a
+/// catch-up allocation rather than a permanent loss of concurrency.
+pub(crate) fn hot_packing_permits(light_rewrite_permits: usize) -> usize {
+    (light_rewrite_permits / 3).max(1).min(light_rewrite_permits.max(1))
+}
+
 /// Rows per decode batch for any session that reads the wide OTel schema. The
 /// parquet decode buffer is not pool-accounted, so EVERY such session must set
 /// this or it inherits DataFusion's much larger default.
@@ -2444,6 +2451,12 @@ pub struct Database {
     /// Caps hot-tail wave staging. Separate from `maintenance_rewrite_sem` so a long dedup drain
     /// can't starve hot compaction. Sized to the light pool's own K.
     light_rewrite_sem: Arc<tokio::sync::Semaphore>,
+    /// Live-memory admission for the hygiene lane — see [`HygieneGate`].
+    hygiene_gate: Arc<HygieneGate>,
+    /// Caps current-day packing while sealed consolidation is pending. It is
+    /// consulted only while sealed debt exists, so the full light pool remains
+    /// available to hot packing after catch-up.
+    hot_packing_sem: Arc<tokio::sync::Semaphore>,
     /// Light permits currently lent out of the repair lane's reservation. Only
     /// ever 0 or `repair_holdback_permits()`; see `rebalance_repair_holdback`.
     repair_holdback_lent: Arc<std::sync::atomic::AtomicU64>,
@@ -2902,6 +2915,10 @@ impl Database {
             Arc::new(DeltaStatisticsExtractor::new(cfg.parquet.timefusion_stats_cache_size, 300, cfg.parquet.timefusion_page_row_count_limit));
 
         let light_rewrite_permits = cfg.derived.max_light_optimize_k().max(1);
+        // During catch-up, give sealed debt the majority of the scarce sort
+        // lanes. One third (floored at one) keeps today's tail moving; the cap
+        // is bypassed entirely when no sealed unit is pending.
+        let hot_packing_permits = hot_packing_permits(light_rewrite_permits);
         crate::observability::maintenance_stats().light_rewrite_permits_total.store(light_rewrite_permits as u64, std::sync::atomic::Ordering::Relaxed);
         // In units, not readers: one reader slot is `DECODE_UNITS_PER_READER` units.
         let heavy_scan_permits = cfg.memory.timefusion_max_concurrent_scan_readers.max(1) * DECODE_UNITS_PER_READER as usize;
@@ -2923,10 +2940,10 @@ impl Database {
         // The ceiling must be REACHABLE: it is what the slots are sized to, or
         // admission silently re-imposes the old cap the slots were raised past.
         let cpu_max = u32::try_from(coordinator_slots).unwrap_or(cpu_base).max(cpu_base);
-        let maintenance_admission = crate::maintenance_coordinator::AdmissionController::with_cpu_ceiling(
+        let maintenance_admission = crate::maintenance_coordinator::AdmissionController::with_decoded_capacity(
             cpu_base,
             cpu_max,
-            u64::try_from(cfg.derived.memory_limit_bytes).unwrap_or(u64::MAX),
+            cfg.derived.coordinator_decoded_capacity_bytes(),
             coordinator_io_slots,
             coordinator_io_slots,
         );
@@ -3007,6 +3024,8 @@ impl Database {
             repair_degradation: Arc::new(dashmap::DashMap::new()),
             maintenance_rewrite_sem: Arc::new(tokio::sync::Semaphore::new(cfg.derived.rewrite_permits().max(1))),
             light_rewrite_sem: Arc::new(tokio::sync::Semaphore::new(light_rewrite_permits)),
+            hygiene_gate: Arc::new(HygieneGate::default()),
+            hot_packing_sem: Arc::new(tokio::sync::Semaphore::new(hot_packing_permits)),
             repair_holdback_lent: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             repair_rewrite_sem: Arc::new(tokio::sync::Semaphore::new(cfg.derived.repair_rewrite_budget_mib())),
             // Three quarters to debt, leaving a quarter always free for the rollup chain.
@@ -4239,6 +4258,11 @@ pub(crate) struct DedupRangeOptions {
 
 pub(crate) struct HotStageOptions {
     pass: TailPass,
+    /// Coordinator lane that owns this rewrite. The cron-driven wave engine has
+    /// no coordinator operation, so it leaves this as `None` and `pass` remains
+    /// the useful label. Keeping both on the staging events is what lets us tell
+    /// whether a scarce light permit is draining sealed debt or today's tail.
+    operation: Option<crate::maintenance_coordinator::Operation>,
     runtime_env: Option<Arc<datafusion::execution::runtime_env::RuntimeEnv>>,
     /// A `light_rewrite_sem` permit the CALLER already holds. `None` means
     /// `stage_hot_bin` blocks for one itself — right for the wave engine, wrong
@@ -5192,6 +5216,79 @@ fn cron_period(schedule: &str) -> std::time::Duration {
 /// Charged memory for the wave-boundary brake: cgroup `memory.current` (what
 /// memcg OOM-kills on), statm RSS as fallback. `None` on platforms with neither
 /// (dev macOS) — the brake then never engages, safe for a non-prod box.
+/// Decides whether another hygiene sort may start, against LIVE memory.
+///
+/// The policy is [`crate::config::hygiene_admits`], a pure function; this holds
+/// only the state that policy cannot: the hysteresis bit, a cached RSS reading,
+/// and the refusal backoff.
+///
+/// Why a cache: `process_memory_bytes` reads two files under `/sys/fs/cgroup`,
+/// and the coordinator fleet asks this question ~100 times a second. A 500 ms
+/// sample is far fresher than memory moves under a multi-second sort, and costs
+/// two reads a second instead of two hundred.
+#[derive(Debug, Default)]
+pub(crate) struct HygieneGate {
+    state: std::sync::Mutex<HygieneGateState>,
+}
+
+#[derive(Debug)]
+struct HygieneGateState {
+    /// Hysteresis for the MEMORY verdict only — never the backstop. Starts open;
+    /// a cold process with an empty lane has nothing to back off from.
+    open: bool,
+    sampled: Option<(std::time::Instant, usize)>,
+}
+
+impl Default for HygieneGateState {
+    fn default() -> Self {
+        Self { open: true, sampled: None }
+    }
+}
+
+impl HygieneGate {
+    const SAMPLE_TTL: std::time::Duration = std::time::Duration::from_millis(500);
+
+    /// Whether another hygiene sort may start. A refusal is not a failure — the
+    /// unit was never claimed and stays there for whoever can run it.
+    ///
+    /// Deliberately NOT rate-limited beyond the sample cache. An earlier cut
+    /// silenced the lane for a second after each refusal, which also silenced it
+    /// across the moment capacity freed: a test that frees every permit and
+    /// re-asks immediately got refused. The cache already bounds the syscalls,
+    /// which is all the backoff was really buying.
+    fn admits(&self, cfg: &crate::config::DerivedBudget, pool_reserved: usize, pool_size: usize, in_flight: usize, ceiling: usize) -> bool {
+        let now = std::time::Instant::now();
+        let mut state = crate::support::lock(&self.state);
+        let rss = match state.sampled {
+            Some((at, bytes)) if now.duration_since(at) < Self::SAMPLE_TTL => bytes,
+            _ => {
+                let bytes = process_memory_bytes().unwrap_or(0);
+                state.sampled = Some((now, bytes));
+                bytes
+            }
+        };
+        let sample = crate::config::MemorySnapshot {
+            rss_bytes: rss,
+            limit_bytes: cfg.memory_limit_bytes,
+            pool_reserved_bytes: pool_reserved,
+            pool_size_bytes: pool_size,
+        };
+        // The memory latch is updated from memory alone; the floor and backstop
+        // are then composed on top for this caller's answer.
+        let was_open = state.open;
+        state.open = crate::config::hygiene_memory_open(sample, was_open);
+        let stats = crate::observability::maintenance_stats();
+        stats.hygiene_gate_open.store(u64::from(state.open), std::sync::atomic::Ordering::Relaxed);
+        // Once per EPISODE — the open->shut edge — not once per asking worker.
+        // Counting attempts made this read 99/sec on a lane that was merely full,
+        // a number that says nothing about how long it stayed that way.
+        if was_open && !state.open {
+            stats.compaction_permits_unavailable.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        crate::config::hygiene_admits(sample, in_flight, ceiling, cfg.hygiene_floor_slices(), was_open)
+    }
+}
+
 pub(crate) fn process_memory_bytes() -> Option<usize> {
     if let Ok(raw) = std::fs::read_to_string("/sys/fs/cgroup/memory.current")
         && let Ok(v) = raw.trim().parse::<usize>()

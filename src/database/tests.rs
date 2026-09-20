@@ -6,6 +6,14 @@ use test_case::test_case;
 use super::*;
 use crate::{config::AppConfig, schema::get_default_schema, support::test_helpers::*};
 
+#[test_case(1 => 1; "a one-lane pool cannot reserve a lane")]
+#[test_case(2 => 1; "a two-lane pool splits hot and sealed")]
+#[test_case(5 => 1; "production leaves four of five lanes available to sealed debt")]
+#[test_case(6 => 2; "larger pools keep one third for the open day")]
+fn sealed_catch_up_keeps_hot_packing_to_one_third(light_permits: usize) -> usize {
+    hot_packing_permits(light_permits)
+}
+
 #[tokio::test]
 async fn run_unit_preserves_unrelated_journal_tasks() -> Result<()> {
     use crate::maintenance_coordinator::{Operation, TaskKey, TaskState, TimeSlice};
@@ -6048,6 +6056,42 @@ async fn a_packing_unit_never_claims_a_slot_it_cannot_start() -> Result<()> {
     Ok(())
 }
 
+/// Current-day packing may not occupy every light lane while sealed debt is
+/// waiting. The reservation is taken before the claim, so a declined hot turn
+/// neither burns an attempt nor starts a unit deadline.
+#[serial]
+#[tokio::test]
+async fn pending_sealed_debt_reserves_light_lanes_before_hot_claims() -> Result<()> {
+    use crate::maintenance_coordinator::{Operation, TaskKey, TaskState, TimeSlice};
+    use std::sync::atomic::Ordering::Relaxed;
+
+    let db = Database::with_config(create_test_config("sealed-light-reserve")).await?;
+    let day_start = midnight_micros(Utc::now().date_naive());
+    let key = TaskKey {
+        physical_table: "otel_logs_and_spans".to_owned(),
+        source: "otel_logs_and_spans".to_owned(),
+        project_id: "hot-reserve-project".to_owned(),
+        slice: TimeSlice::new(day_start, day_start + crate::maintenance_coordinator::DAY_MICROS)?,
+        operation: Operation::HotPacking,
+    };
+    db.maintenance_tasks.lock().unwrap().enqueue(key.clone(), 0, 1024, 0);
+
+    let hot_capacity = db.hot_packing_sem.available_permits();
+    let held = Arc::clone(&db.hot_packing_sem).acquire_many_owned(u32::try_from(hot_capacity).unwrap()).await?;
+    let stats = crate::observability::maintenance_stats();
+    let prior_pending = stats.pending_sealed_consolidation.swap(1, Relaxed);
+
+    let ran = db.run_coordinator_compaction_once(Operation::HotPacking).await?;
+
+    stats.pending_sealed_consolidation.store(prior_pending, Relaxed);
+    drop(held);
+    let journal = db.maintenance_tasks.lock().unwrap();
+    assert!(!ran, "a capped hot turn must fall through so the worker can serve sealed work");
+    assert_eq!(journal.state(&key), Some(TaskState::Pending), "the hot task must remain claimable");
+    assert_eq!(journal.attempts(&key), 0, "lane contention before a claim is not a task attempt");
+    Ok(())
+}
+
 /// Hot-tail wave staging must hold its own permits, not share the heavy maintenance rewrite
 /// semaphore: a long dedup drain holding every heavy permit must not starve hot compaction.
 #[tokio::test]
@@ -7727,7 +7771,12 @@ async fn a_busy_repair_permit_requeues_instead_of_parking_a_worker() -> Result<(
     let held = Arc::clone(&db.repair_rewrite_sem).try_acquire_many_owned(u32::try_from(budget).unwrap()).expect("the budget starts free");
 
     let stage = async |files: Vec<String>| {
-        let options = HotStageOptions { pass: TailPass::Repair, runtime_env: Some(db.coordinator_runtime_env()), light_permit: None };
+        let options = HotStageOptions {
+            pass: TailPass::Repair,
+            operation: Some(crate::maintenance_coordinator::Operation::Repair),
+            runtime_env: Some(db.coordinator_runtime_env()),
+            light_permit: None,
+        };
         db.stage_hot_bin(&table, "otel_logs_and_spans", schema, &project, files, options).await
     };
 
@@ -7767,11 +7816,10 @@ async fn undrainable_dirty_bins_are_retired_not_left_to_grow() -> Result<()> {
     Ok(())
 }
 
-/// Reading a task's `attempts` must not hold the journal guard into the retry that
-/// re-locks it — `admission_backoff_for` confines the guard to its own body.
-/// Asserted under a timeout because the regression is a HANG, not a wrong value.
+/// Admission contention follows capacity, not task history. An old task must
+/// re-approach promptly after a transient lag spike releases the CPU ceiling.
 #[tokio::test]
-async fn reading_attempts_does_not_hold_the_journal_into_the_retry() -> Result<()> {
+async fn admission_backoff_does_not_grow_with_task_attempts() -> Result<()> {
     let (db, _) = dirty_bin_db("admission-backoff").await?;
     let key = crate::maintenance_coordinator::TaskKey {
         physical_table: "otel_logs_and_spans".to_owned(),
@@ -7780,16 +7828,17 @@ async fn reading_attempts_does_not_hold_the_journal_into_the_retry() -> Result<(
         slice: crate::maintenance_coordinator::TimeSlice { start_micros: 0, end_micros: 60_000_000 },
         operation: crate::maintenance_coordinator::Operation::BaseRollup,
     };
-    let sequence = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        let delay = db.admission_backoff_for(&key);
-        // The second acquisition is the one that deadlocks.
-        let attempts = db.journal().attempts(&key);
-        (delay, attempts)
-    })
-    .await;
-    let (delay, attempts) = sequence.expect("reading attempts must release the journal before the retry re-locks it");
-    assert_eq!(attempts, 0, "an unknown key has no attempts yet");
-    assert_eq!(delay, std::time::Duration::from_secs(1), "and backs off from 1s rather than splitting the unit");
+    {
+        let mut journal = db.journal();
+        journal.enqueue(key.clone(), 0, 1, 0);
+        for _ in 0..10 {
+            journal.claim_exact(&key, 0, false).expect("the retry is immediately due");
+            assert!(journal.retry(&key, "admission_busy".to_owned(), 0));
+        }
+        assert_eq!(journal.attempts(&key), 10, "precondition: this is an old, repeatedly contended task");
+    }
+    let delay = db.admission_backoff_for(&key);
+    assert_eq!(delay, std::time::Duration::from_secs(5), "busy capacity must be revisited promptly and without a task-history multiplier");
     Ok(())
 }
 

@@ -174,6 +174,103 @@ const PER_SORT_BUDGET_BYTES: usize = 2 * GIB;
 /// footprint, one rung below the measured concurrency failure cliff.
 const COORDINATOR_PER_SORT_BUDGET_BYTES: usize = 5 * GIB / 4;
 
+/// Concurrent hygiene sorts the coordinator pool is SIZED to hold comfortably.
+///
+/// This was `MAX_COMPACTION_SORTS`, a hard ceiling on how many could ever run,
+/// described as "the measured safe optimum". It is now only a sizing term: the
+/// pool is still budgeted for six sorts' worth of working set, but how many
+/// actually run is decided by [`hygiene_admits`] against LIVE memory.
+///
+/// Keep the number in mind rather than trusting it. A static reservation meant
+/// each of the six held 1.25 GiB whether it needed 50 MB or all of it, and prod
+/// 2026-09-21 ran `coordinator_pool_pct` at 28% while refusing 99 permit
+/// acquires PER SECOND with `pending_sealed_consolidation` growing — reserving
+/// roughly five times what was in use. But six may yet reassert itself as the
+/// spill equilibrium: `FairSpillPool` divides the pool among its consumers, so
+/// more concurrent sorts each get a smaller share and spill more. If spill rate
+/// climbs without completions rising, six was right and the gate's pool
+/// threshold is what needs tightening.
+const LIGHT_ENVELOPE_SORTS: usize = 6;
+
+/// Untracked bytes a sort touches per tracked pool byte — decode buffers and
+/// arrow batches the `MemoryPool` never sees. The pool spills rather than
+/// failing, so untracked memory is the only term that can actually OOM us;
+/// this is what prices it. Same conversion `coordinator_decoded_capacity_bytes`
+/// uses, for the same reason.
+const UNTRACKED_PER_TRACKED_BYTE: f64 = SAFE_DECODED_PER_POOL_BYTE;
+
+/// Live memory the hygiene gate decides on, sampled once per decision.
+///
+/// A struct, and the decision a pure function over it, so the policy is
+/// testable without `/sys` — the thresholds and their hysteresis are the part
+/// that can silently OOM a box, and they deserve the same treatment the claim
+/// rank memo got.
+#[derive(Clone, Copy, Debug)]
+pub struct MemorySnapshot {
+    /// What the OOM killer acts on: cgroup usage less reclaimable page cache.
+    pub rss_bytes: usize,
+    pub limit_bytes: usize,
+    /// Bytes currently reserved from the coordinator `MemoryPool`.
+    pub pool_reserved_bytes: usize,
+    pub pool_size_bytes: usize,
+}
+
+/// Where the hygiene gate closes, as a fraction of each budget, and where it
+/// reopens. Two thresholds, because one flaps: RSS lags reality (jemalloc does
+/// not return pages promptly), so a single line would admit and refuse in
+/// alternation around it.
+///
+/// The layering that keeps this safe, tightest first:
+///
+///     gate reopens 0.70  <  gate shuts 0.75  <  wave brake 0.80  <  OOM 1.00
+///
+/// Admission therefore stops BEFORE `memory_brake_limit_bytes` engages, so the
+/// brake stays what it was built to be — a one-way valve for bursts already in
+/// flight — rather than the thing that routinely holds the line.
+const HYGIENE_GATE_REOPEN: f64 = 0.70;
+const HYGIENE_GATE_SHUT: f64 = 0.75;
+// Compile-time, not a test: a gate that reopens at or above where it shuts has
+// no hysteresis and will flap admit/refuse around a single reading.
+const _: () = assert!(HYGIENE_GATE_REOPEN < HYGIENE_GATE_SHUT);
+
+/// May another hygiene sort start?
+///
+/// `in_flight` counts sorts already admitted, `ceiling` is the hard backstop and
+/// `floor` the number that run regardless of memory. `was_open` carries the
+/// hysteresis across calls.
+///
+/// The floor bypasses BOTH gates on purpose: external pressure — a query burst,
+/// ingest — must never take the hygiene lane to zero. A lane at zero does not
+/// drain slowly, it WEDGES, and then nothing frees the memory that closed the
+/// gate in the first place.
+pub fn hygiene_admits(sample: MemorySnapshot, in_flight: usize, ceiling: usize, floor: usize, was_open: bool) -> bool {
+    if in_flight < floor {
+        return true;
+    }
+    if in_flight >= ceiling {
+        return false;
+    }
+    hygiene_memory_open(sample, was_open)
+}
+
+/// The MEMORY half of [`hygiene_admits`], independent of how many sorts run.
+///
+/// Split out because the hysteresis belongs to memory alone. Folding a full
+/// backstop into the same latch would make "the lane is busy" look like "the box
+/// is under pressure", and the lane would then have to fall all the way to the
+/// reopen threshold to admit again after merely being full.
+pub fn hygiene_memory_open(sample: MemorySnapshot, was_open: bool) -> bool {
+    let under = |used: usize, total: usize| {
+        // An unreadable or unset budget must not be read as "infinite headroom".
+        if total == 0 {
+            return false;
+        }
+        let fraction = used as f64 / total as f64;
+        fraction < if was_open { HYGIENE_GATE_SHUT } else { HYGIENE_GATE_REOPEN }
+    };
+    under(sample.rss_bytes, sample.limit_bytes) && under(sample.pool_reserved_bytes, sample.pool_size_bytes)
+}
+
 /// The largest COMPRESSED bin one coordinator sort can decode inside its budget.
 ///
 /// Packing targets are expressed in compressed bytes and sort budgets in
@@ -396,16 +493,36 @@ impl DerivedBudget {
     }
 
     /// The durable coordinator's own pool, carved off before the heavy/light
-    /// split. Sized as `jobs x MAX_DECODED_BYTES`, capped at three fifths of the
-    /// maintenance pool: the share divides by `jobs` through the `FairSpillPool`,
-    /// so too small a share drops each rewrite below `ExternalSorterMerge`'s
-    /// floor and units fail instead of spilling.
+    /// split. Sized from the worker slots that may actually reach admission, not
+    /// from the conservative CPU floor. Prod 2026-09-20 raised slots 14 -> 66 but
+    /// left this pool at 14 * 512 MiB while admission advertised 90 GiB; the boot
+    /// burst exhausted this 7 GiB pool and quarantined 113 rollups. Three fifths
+    /// remains the hard share cap, so scaling concurrency cannot overcommit the
+    /// maintenance budget.
     pub fn coordinator_share_bytes(&self) -> usize {
         match self.profile {
             // The CLI drives engines directly; no coordinator runs.
             BudgetProfile::MaintenanceCli => 0,
-            BudgetProfile::Server => (self.coordinator_jobs() * COORDINATOR_JOB_POOL_BYTES).min(self.maintenance_pool_bytes * 3 / 5),
+            BudgetProfile::Server => {
+                let cap = self.maintenance_pool_bytes * 3 / 5;
+                let base = (self.coordinator_jobs() * COORDINATOR_JOB_POOL_BYTES).min(cap);
+                let desired = (self.coordinator_job_slots() * COORDINATOR_JOB_POOL_BYTES).min(cap);
+                // Scale into previously idle headroom, but do not finance it by
+                // shrinking heavy maintenance or the measured six-sort light
+                // envelope. Small boxes that cannot hold those floors retain the
+                // old base instead of losing coordinator capacity.
+                let heavy_floor = (self.maintenance_pool_bytes as f64 * HEAVY_POOL_SHARE) as usize;
+                let light_floor = LIGHT_ENVELOPE_SORTS * COORDINATOR_PER_SORT_BUDGET_BYTES;
+                desired.min(self.maintenance_pool_bytes.saturating_sub(heavy_floor.saturating_add(light_floor)).max(base))
+            }
         }
+    }
+
+    /// Decoded input bytes admission may reserve against the coordinator pool.
+    /// The pool holds working state, not the full decoded input; use the same
+    /// measured safe conversion that prices whole-file repair rewrites.
+    pub fn coordinator_decoded_capacity_bytes(&self) -> u64 {
+        (self.coordinator_share_bytes() as f64 * SAFE_DECODED_PER_POOL_BYTE) as u64
     }
 
     /// The decoded-bytes budget shared by concurrent repair rewrites. Priced in
@@ -490,9 +607,27 @@ impl DerivedBudget {
         mem_bound.min(self.cores / 4).min(hot_project_count).max(1)
     }
 
-    /// Per-sort slices the coordinator share holds — the pool term both light-K variants start from.
+    /// Concurrent hygiene sorts the BACKSTOP allows — not the binding constraint.
+    ///
+    /// This used to be `coordinator_share / 1.25 GiB` capped at six, which made
+    /// every permit a static 1.25 GiB reservation and the reservation the real
+    /// ceiling. [`hygiene_admits`] now decides against live memory, and this
+    /// only bounds how many sorts can be in flight at once so a bug cannot spawn
+    /// unboundedly. A pool term here would double-count what the gate measures.
     fn light_pool_slices(&self) -> usize {
-        self.coordinator_share_bytes() / COORDINATOR_PER_SORT_BUDGET_BYTES
+        // Two bounds, and the memory one is NOT a reservation. A reservation
+        // gates admission, which is what over-reserved the lane five-fold; this
+        // bounds only how far the lane may RAMP after the gate's last yes, so a
+        // fully-ramped fleet still fits under the limit. Live memory decides
+        // moment to moment; this decides the worst case.
+        let headroom = self.memory_limit_bytes as f64 * (1.0 - HYGIENE_GATE_SHUT);
+        let by_ramp = (headroom / (COORDINATOR_PER_SORT_BUDGET_BYTES as f64 * UNTRACKED_PER_TRACKED_BYTE)) as usize;
+        (self.cores / 4).min(by_ramp).max(LIGHT_MIN_SLICES)
+    }
+
+    /// Sorts that run regardless of memory pressure — see [`hygiene_admits`].
+    pub fn hygiene_floor_slices(&self) -> usize {
+        LIGHT_MIN_SLICES.min(self.max_light_optimize_k().max(1))
     }
 
     /// Concurrently admitted maintenance coordinator units. Bounded by the box:
@@ -629,6 +764,7 @@ impl DerivedBudget {
             writer_reserve_gb = self.writer_reserve_bytes() / GIB,
             maintenance_pool_gb = self.maintenance_pool_bytes() / GIB,
             coordinator_share_gb = self.coordinator_share_bytes() / GIB,
+            coordinator_decoded_capacity_gb = self.coordinator_decoded_capacity_bytes() / GIB as u64,
             heavy_share_gb = self.heavy_share_bytes() / GIB,
             light_share_gb = self.light_share_bytes() / GIB,
             coordinator_jobs = self.coordinator_jobs(),
@@ -2200,6 +2336,86 @@ mod tests {
         assert_eq!(max_concurrent_heavy_sorts(48, 512 * MIB), MIN_CONCURRENT_HEAVY_SORTS);
     }
 
+    /// The hygiene gate is what stands between "use all the memory" and an OOM,
+    /// so its invariants are properties, not examples.
+    mod hygiene_gate {
+        use proptest::prelude::*;
+
+        use super::*;
+
+        fn sample(rss_pct: f64, pool_pct: f64) -> MemorySnapshot {
+            let (limit, pool) = (120 * GIB, 30 * GIB);
+            MemorySnapshot {
+                rss_bytes: (limit as f64 * rss_pct) as usize,
+                limit_bytes: limit,
+                pool_reserved_bytes: (pool as f64 * pool_pct) as usize,
+                pool_size_bytes: pool,
+            }
+        }
+
+        #[test]
+        fn the_thresholds_are_ordered_under_the_brake() {
+            // The other half of the ordering (reopen < shut) is a `const _` next
+            // to the constants, so it fails the BUILD rather than a test run.
+            let brake = DerivedBudget::from_limits(120 * GIB, 48);
+            assert!(
+                (brake.memory_limit_bytes as f64 * HYGIENE_GATE_SHUT) < brake.memory_brake_limit_bytes() as f64,
+                "admission must stop before the wave brake engages, or the brake becomes the routine limiter"
+            );
+        }
+
+        proptest! {
+            /// A lane at zero does not drain slowly, it WEDGES — and then nothing
+            /// frees the memory that closed the gate. So the floor outranks every
+            /// other term, including a box that is completely out of memory.
+            #[test]
+            fn the_floor_admits_whatever_the_memory_says(rss in 0.0f64..1.0, pool in 0.0f64..1.0, floor in 1usize..4, was_open in any::<bool>()) {
+                prop_assert!(hygiene_admits(sample(rss, pool), floor - 1, floor + 8, floor, was_open), "the floor must bypass both gates");
+            }
+
+            /// The backstop is the one bound a bug cannot argue with.
+            #[test]
+            fn the_ceiling_is_never_exceeded(rss in 0.0f64..1.0, pool in 0.0f64..1.0, ceiling in 1usize..24, over in 0usize..8, was_open in any::<bool>()) {
+                prop_assert!(!hygiene_admits(sample(rss, pool), ceiling + over, ceiling, 0, was_open), "in-flight at or above the ceiling must refuse");
+            }
+
+            /// Monotonicity: spending more memory can only ever make the gate
+            /// stricter. Without this a threshold typo could make pressure ADMIT.
+            #[test]
+            fn more_memory_used_never_turns_a_refusal_into_an_admission(
+                low in 0.0f64..1.0, extra in 0.0f64..1.0, in_flight in 3usize..12, was_open in any::<bool>(),
+            ) {
+                let high = (low + extra).min(1.0);
+                let (ceiling, floor) = (16, 2);
+                if !hygiene_admits(sample(low, low), in_flight, ceiling, floor, was_open) {
+                    prop_assert!(!hygiene_admits(sample(high, high), in_flight, ceiling, floor, was_open), "more pressure must not admit where less refused");
+                }
+            }
+
+            /// Either budget alone must be able to close it. The pool is tracked
+            /// memory and RSS is what the OOM killer reads; neither implies the
+            /// other, so a gate watching only one is blind in one eye.
+            #[test]
+            fn either_budget_alone_closes_the_gate(which in any::<bool>()) {
+                let over = HYGIENE_GATE_SHUT + 0.2;
+                let s = if which { sample(over, 0.0) } else { sample(0.0, over) };
+                prop_assert!(!hygiene_admits(s, 4, 16, 2, true), "a single saturated budget must refuse");
+            }
+
+            /// Hysteresis, stated as the band it creates: between the two
+            /// thresholds the answer depends on which way we came, and that is
+            /// the entire point — RSS lags, so one line would flap.
+            #[test]
+            fn the_band_between_the_thresholds_remembers_which_way_it_came(offset in 0.001f64..0.049) {
+                let inside = HYGIENE_GATE_REOPEN + offset;
+                prop_assume!(inside < HYGIENE_GATE_SHUT);
+                let s = sample(inside, 0.0);
+                prop_assert!(hygiene_admits(s, 4, 16, 2, true), "an open gate stays open until the shut threshold");
+                prop_assert!(!hygiene_admits(s, 4, 16, 2, false), "a shut gate stays shut until the reopen threshold");
+            }
+        }
+    }
+
     // Prod-shaped box (120 GiB / 48 cores, 11 hot projects).
     #[test]
     fn derived_budget_prod_box_120gib_48cores() {
@@ -2209,9 +2425,13 @@ mod tests {
         assert!((3..=11).contains(&k), "K={k} outside the expected 3..=11 range");
         assert_eq!(
             k + b.repair_pool_holdback_slices(),
-            b.coordinator_share_bytes() / COORDINATOR_PER_SORT_BUDGET_BYTES,
-            "exactly the repair lane's holdback is reserved out of light's share"
+            b.light_pool_slices(),
+            "the compaction lane runs to its CPU backstop and reserves exactly repair's holdback"
         );
+        // The backstop is deliberately wider than the old six-sort ceiling: six was
+        // a static 1.25 GiB reservation per permit, and prod reserved ~5x what it
+        // used. Live memory decides now — see `hygiene_admits`.
+        assert!(b.light_pool_slices() > LIGHT_ENVELOPE_SORTS, "the backstop must not re-impose the reservation-era ceiling");
         // The envelope (permits x per-sort budget) is the invariant, not the raw
         // permit count.
         assert_eq!(
@@ -2322,6 +2542,11 @@ mod tests {
             b.coordinator_jobs(),
             per_job / MIB
         );
+        assert_eq!(
+            b.coordinator_decoded_capacity_bytes(),
+            (b.coordinator_share_bytes() as f64 * SAFE_DECODED_PER_POOL_BYTE) as u64,
+            "decoded admission and pool working bytes must use the measured conversion"
+        );
     }
 
     /// The hot-packing permit must be priced against the pool its units allocate
@@ -2331,15 +2556,31 @@ mod tests {
         let prod = DerivedBudget::from_limits(80 * GIB, 48);
         assert_eq!(
             prod.light_optimize_k(11),
-            prod.coordinator_share_bytes() / COORDINATOR_PER_SORT_BUDGET_BYTES - prod.repair_pool_holdback_slices(),
-            "the memory term is the coordinator's pool, less the pool repair's decoded budget actually needs"
+            prod.light_pool_slices() - prod.repair_pool_holdback_slices(),
+            "the concurrency term is the CPU backstop less repair's holdback; memory is the gate's job, not a reservation's"
         );
         assert!(prod.light_optimize_k(11) > 1, "one permit shared by HotPacking and SealedConsolidation starves packing");
-        // The measured optimum: 6 concurrent rewrites.
+        // The total is the CPU backstop; the light/repair SPLIT may move, the total
+        // may not drift without someone deciding it should.
         assert_eq!(
             prod.light_optimize_k(11) + prod.repair_pool_holdback_slices(),
-            6,
-            "the fleet must run at the measured optimum, not one rung either side — the light/repair SPLIT may move, the total may not"
+            prod.light_pool_slices(),
+            "the lane must run to its backstop — memory pressure is the gate's decision, made against live readings"
+        );
+
+        // NEVER OOM, made checkable. The gate refuses above `HYGIENE_GATE_SHUT` of
+        // the limit, so the headroom a fully-ramped lane may consume after the last
+        // admission is what must fit underneath. Untracked bytes are the term that
+        // matters: the pool SPILLS rather than failing, so tracked memory cannot
+        // kill the process and decode buffers can.
+        let ceiling = prod.light_pool_slices();
+        let worst_case = (ceiling * COORDINATOR_PER_SORT_BUDGET_BYTES) as f64 * UNTRACKED_PER_TRACKED_BYTE;
+        let headroom = prod.memory_limit_bytes as f64 * (1.0 - HYGIENE_GATE_SHUT);
+        assert!(
+            worst_case <= headroom,
+            "a fully-ramped hygiene lane ({ceiling} sorts, {:.1} GiB worst case) must fit the headroom the gate leaves ({:.1} GiB)",
+            worst_case / GIB as f64,
+            headroom / GIB as f64
         );
         // Repair's decoded budget must fit the pool its holdback reserves.
         let holdback_pool_bytes = prod.repair_pool_holdback_slices() * COORDINATOR_PER_SORT_BUDGET_BYTES;
@@ -2884,9 +3125,14 @@ mod light_permit_floor_tests {
             k >= LIGHT_MIN_SLICES.min(share_slices),
             "cores={cores}: share holds {share_slices} sorts but K={k} (was {slices_before_fix} before the holdback cap)"
         );
-        // Repair keeps its full holdback wherever the share can pay for it.
+        // Repair keeps its full holdback wherever the backstop can pay for it.
         if cores == 48 {
-            assert_eq!(k, 3, "the 48-core derivation must not move");
+            assert_eq!(k, budget.light_pool_slices() - budget.repair_pool_holdback_slices(), "the 48-core derivation must not move");
+            // It moved once, deliberately: this was pinned at 3 while the permit
+            // WAS the memory budget. Memory is now measured live, so the lane runs
+            // to its CPU backstop and a regression back toward 3 means someone has
+            // reintroduced a static reservation.
+            assert!(k > 3, "K={k}: the lane must no longer be capped by a per-permit reservation");
         }
     }
 
@@ -2944,14 +3190,14 @@ mod bin_decode_budget_tests {
             let prod = DerivedBudget::from_limits(limit_gib * GIB, cores);
             let lendable = prod.repair_holdback_permits();
             assert!(lendable > 0, "with a holdback in force there must be something to lend, or the hygiene lane can never reach its share");
-            // Lending must land exactly on the share's slice count -- never past it.
-            let share_slices = prod.coordinator_share_bytes() / COORDINATOR_PER_SORT_BUDGET_BYTES;
+            // Lending must land exactly on the backstop -- never past it. This
+            // used to be bounded by `coordinator_share / per_sort_budget`, which
+            // was the right bound while a permit WAS a 1.25 GiB reservation. It
+            // is the backstop now: live memory decides admission, and the
+            // backstop is what bounds a fully-ramped lane.
+            let backstop = prod.light_pool_slices();
             let lent_total = prod.max_light_optimize_k() + lendable;
-            assert!(
-                lent_total <= share_slices.max(1),
-                "lending {lendable} on top of K={} would exceed the {share_slices} slices the coordinator share holds",
-                prod.max_light_optimize_k()
-            );
+            assert!(lent_total <= backstop.max(1), "lending {lendable} on top of K={} would exceed the {backstop}-sort backstop", prod.max_light_optimize_k());
             assert!(lent_total <= prod.cores / 4, "and must still respect the CPU term");
         }
     }
