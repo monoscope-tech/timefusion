@@ -3854,7 +3854,7 @@ impl Database {
         // misses, so a post-warm hit rate would read artificially low.
         let baseline = match (&stats_cache, confirm) {
             (Some(cache), None) => {
-                let s = cache.get_stats().await.main;
+                let s = cache.get_stats().main;
                 Some(if s.hits + s.misses > 0 { (s.hits as f64 / (s.hits + s.misses) as f64) * 100.0 } else { 0.0 })
             }
             _ => None,

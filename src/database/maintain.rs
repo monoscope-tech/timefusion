@@ -8094,7 +8094,7 @@ impl Database {
 
         if let Some(ref cache) = self.object_store_cache {
             info!("Shutting down Foyer cache...");
-            cache.log_stats().await;
+            cache.log_stats();
             cache.shutdown_by(deadline).await?;
         }
 

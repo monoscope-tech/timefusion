@@ -100,72 +100,178 @@ For INSERT paths it does not — `upsert` and `enqueue_inner` both called it bef
 `insert_task`, so newly enqueued units never entered the index and were silently
 unclaimable. The tests caught it; the compiler could not.
 
-## 5. Next: sub-linear selection, for 10-50x
+## 5. What the deploy actually showed, and what it changes
 
-The index makes the scan proportional to CLAIMABLE work rather than to history.
-But claimable work grows with ingest. At 50x:
+Measured over 459 s of steady state after the index and the fold landed:
 
-```
-~50,000 pending x 3 passes x 15 ns  ~=  2.2 ms     — back where we started
-```
+| | before | after | change |
+|---|---|---|---|
+| `coordinator_claim` avg | 4.66 ms | **2.94 ms** | 1.6x |
+| `journal_hold` duty cycle | 41% | **16.2%** | 2.5x |
+| `journal_lock_wait` | 0.80 workers | **0.58 workers** | 1.4x |
+| **worst single claim** | 3,289 ms | **394 ms** | **8.3x** |
+| candidates walked | 94,372 | 1,324 | 71x |
 
-So the index buys headroom, not a scaling story. What scales is making selection
-sub-linear:
+**The 71x fewer candidates bought 1.6x, and that is the finding.** §2's
+arithmetic mis-attributed the cost: the 94k walk only ran the CHEAP filter
+(`state` check plus an operation compare, ~3 ns). `rank` and
+`dependencies_complete` only ever ran on the ~1,000 candidates that PASSED it.
+So the scan was ~18% of the claim, not 90%.
 
-**5.1 Ordered index per operation.** A `BTreeSet` keyed by `(rank, key)` makes
-claiming `O(log N)`. Keying per operation also shards the structure six ways, so
-lanes stop contending with each other for free.
+The fold is the proof. It moved rank evaluations from 3 per candidate to 2 and
+produced 4.66 -> 2.94 ms — almost exactly 3:2. **`rank` is the claim.** It is
+microseconds per call because it does two `hole_rank` set probes,
+`scheduling_class`, and a `dedup_complete_edges` lookup.
 
-**5.2 The obstacle is invalidation, and it is bigger than "rank ages".**
+The tail is the part that already paid off: a worst claim of 394 ms instead of
+3.3 s. That is the number that parks runtime threads.
 
-An early read of this said only `starved` varies with time and flips once. That
-is WRONG, and the correction is the main reason 5.x is not a quick follow-on.
-`rank` has FOUR moving inputs:
+So the lever is EVALUATIONS PER CANDIDATE, not candidates scanned.
 
-| input | changes when | shape |
-|---|---|---|
-| `scheduling_class` / `is_frontier_task` | a task crosses the frontier boundary | time |
-| `starved` | every DAY past the horizon — it is GRADED, not a flip | time, recurring |
-| `hole_rank` (`untagged_cells`, `tier_holes`) | those sets mutate | **bulk** |
-| `adjacent` (`dedup_complete_edges`) | edges mutate | **bulk** |
+## 5a. Rank once per claim (landed with this)
+
+The combined pass ranked every candidate and the selection pass ranked them all
+again. Selection now reuses the first pass's `(rank, task)` pairs: 2 -> 1.
+
+No invalidation exposure whatsoever — the reuse lives for a single claim.
+
+## 5b. Rank once per CHANGE — the endgame
+
+| | rank computations per claim |
+|---|---|
+| originally | ~3 x 1,300 |
+| after the fold | ~2 x 1,300 |
+| after 5a | ~1 x 1,300 |
+| **after 5b** | **~1** |
+
+An ordered set keyed by `(cached_rank, key)`, popped instead of scanned.
+
+**Prior art removed the hard part.** An earlier draft here worried that a stale
+key means claiming in the WRONG ORDER, silently, and scoped a reverse mapping so
+`untagged_cells` / `tier_holes` / `dedup_complete_edges` could report which keys
+they touched, plus a promotion queue for the day-graded `starved` term.
+
+Both are unnecessary. The standard alternative to `decrease-key` is lazy
+validation: reinsert rather than update in place, and VERIFY ON POP —
+"store the current best priority outside the heap and ignore stale heap entries
+when popped". Applied here:
+
+    pop the minimum (cached_rank, key)
+    recompute that ONE task's rank
+      equal    -> claim it
+      differs  -> reinsert at the fresh rank, pop again
+
+A claim is therefore NEVER made on a stale rank, because the popped entry is
+verified before it is used. A stale entry costs one rank computation and a
+reinsert — not a mis-ordered claim. The silent failure mode that made this
+risky does not exist in this form.
+
+RocksDB's shape is the same idea from the other side: `ComputeCompactionScore`
+runs when `VersionStorageInfo` is UPDATED, not when picking, and the scores hang
+off an immutable Version so picking only reads. We cannot copy the immutable
+version (ours is a 31 MB `Vec`), but "compute on change, read at pick" is the
+principle, and verify-on-pop is how a mutable structure gets there safely.
+
+**What is still needed:** ranks must be written into the set when a task is
+mutated (`mark_dirty` already routes every mutation), and a generation counter
+on the bulk sources is worth adding — NOT for correctness, which verify-on-pop
+already gives, but to skip pointless verifies after a bulk change.
+
+**Ordering the set is then free.** Once entries carry a rank, `BTreeSet` gives
+`O(log N)` selection, and keying per operation shards it six ways so lanes stop
+contending. But the win is the rank count, not the ordering: ~1,300 -> ~1.
+
+## 5d. Concrete plan, and where Rust does the work for us
+
+The invariant that matters is *a claim is never made on a stale rank*. In most
+languages that is a code-review rule. Here it can be a COMPILE ERROR.
+
+**D1. Make the rank a type, not a tuple.**
 
 ```rust
-let starved = if waited < STARVATION_MICROS { u8::MAX }
-    else { (u8::MAX - 1).saturating_sub(waited.saturating_sub(STARVATION_HORIZON_MICROS).max(0) / DAY_MICROS) };
+// Was: type Rank = (u8, u8, u8, u8, u8, i64, i64, i64);
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+struct Rank { class: u8, hole_present: u8, starved: u8, hole: u8,
+              not_adjacent: u8, width: i64, benefit: i64, order: i64 }
 ```
 
-So an ordered index is a MATERIALIZED VIEW with two time-driven and two bulk
-invalidation sources — not a membership set with a richer key.
+Derived `Ord` keeps the exact field order, so ordering semantics are unchanged —
+but the fields get names, and `BTreeSet<(Rank, _)>` sorts correctly for free.
+Today an accidental field reorder silently changes scheduling priority; after
+this it is a named struct literal.
 
-**5.3 Why that raises the stakes rather than just the effort.** The membership
-index degrades safely: a missed entry means a unit is claimed LATE, and the
-minute-scale rebuild heals it. An ordered index degrades SILENTLY: a stale key
-means claiming in the wrong priority order, which violates exactly the starvation
-and deadline guarantees `rank` exists to enforce, with nothing to notice it.
+**D2. Make "verified" unforgeable — the core Rust leverage.**
 
-**5.4 Sketch, to be designed properly before any code.** One ordered set per
-`(operation, class)` plus a time-ordered promotion queue keyed on the next
-instant a task's `starved` step changes (day granularity, so the queue is small).
-Bulk sources invalidate by re-inserting the affected cells, which means
-`untagged_cells` / `tier_holes` / `dedup_complete_edges` need to report WHICH
-keys they touched — today they do not. That reverse mapping is the real work, and
-it is a prerequisite, not a detail.
+```rust
+/// A rank recomputed against the CURRENT world and found equal to the cached one.
+///
+/// Only `pop_verified` mints this, and `claim` demands it, so "claimed on a stale
+/// rank" is not a bug you can write — it does not typecheck.
+#[must_use]
+pub(crate) struct Verified(Rank);
+```
 
-A cheaper intermediate worth measuring first: the claim makes THREE passes over
-the candidate set (two `best_class` calls plus selection). Folding the two
-`best_class` calls into one pass is semantics-preserving and buys ~3x on whatever
-the candidate count is, with none of the invalidation exposure above.
+`claim_next` takes `Verified`, never a bare `Rank`. The silent-wrong-order
+failure mode stops being a thing to test for and becomes a thing to compile.
 
-**5.5 What to keep from the turn machinery.** `claim_next`'s sealed/window/
-horizon turns are reservations, not orderings — they choose WHICH ordered set to
-pop from, so they survive the change untouched. That matters: the rank encodes
+**D3. Cheap keys — stop hashing strings in the hot path.**
+
+`TaskKey` holds three `String`s, so every `self.task(key)` in the candidate walk
+pays a string hash. A generational slot makes it a `Copy` integer:
+
+```rust
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct Slot { index: u32, generation: u32 }   // generation survives `retain_tasks`
+```
+
+The ordered set becomes `BTreeSet<(Rank, Slot)>`: comparisons are integer
+compares, lookups are a bounds-checked index, and a slot freed by pruning fails
+its generation check instead of aliasing a new task. This is the arena/slotmap
+pattern, and it is what makes the pop path allocation-free.
+
+**D4. Interior mutability for the cache, so the walk stays `&self`.**
+
+`Cell<Option<Rank>>` on the task: `Cell` is `Copy`-only and has no runtime cost,
+so caching during an immutable walk needs no `RefCell` borrow checks and no
+`&mut` plumbing. Exclude it from `PartialEq`/`Serialize` by hand — a cache must
+not make two equal tasks compare unequal, and must never reach the journal file.
+
+**D5. No allocation per claim.**
+
+5a introduces a per-claim `Vec`. Hoist it to a scratch buffer owned by the
+journal and `clear()` it each time: at 167 claims/sec that is ~16 MB/s of
+allocation avoided, and the buffer reaches steady-state capacity immediately.
+
+**D6. Prove the invariant with `proptest` (already a dependency).**
+
+The property is exact and worth stating as one:
+
+> For any sequence of enqueues, mutations, time advances and bulk-source
+> changes, `claim_next` returns the same task as a brute-force scan that ranks
+> every candidate from scratch.
+
+That is the whole correctness argument for 5b in one test, and proptest will find
+the interleaving a hand-written case would not. Pair it with a shrink-friendly
+model: a `Vec<MaintenanceTask>` and the naive selector.
+
+**D7. Sequence.**
+
+1. D1 (Rank struct) — mechanical, no behaviour change, lands alone.
+2. D6's property test against the CURRENT selector — establishes the oracle
+   while the implementation is still the simple one.
+3. D4 + cached rank, still linear scan. Measure: expect ~2.94 ms -> ~50 us.
+4. D2 + D3 + ordered set with verify-on-pop. Measure: expect ~1 rank per claim.
+5. D5 once the shape is settled.
+
+Steps 1-3 are where the measured win is. Step 4 is what makes it hold at 50x.
+The property test from step 2 guards every step after it.
+
+## 5c. What to keep from the turn machinery
+
+`claim_next`'s sealed/window/horizon turns are reservations, not orderings — they
+choose WHICH set to pop from, so they survive untouched. The rank encodes
 starvation horizons and deadlines that were hard-won, and ClickHouse's move to
-round-robin (PR #46247) is explicitly NOT what we want to copy, because it would
-discard them.
-
-**Do not start 5.x before the index has landed and been measured.** The ordered
-index is the same maintenance problem with a richer key, and every ordering
-hazard in §4 applies to it with more edges.
+round-robin (PR #46247) is explicitly not what to copy here.
 
 ## 6. Verification
 

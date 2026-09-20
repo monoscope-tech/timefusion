@@ -768,7 +768,7 @@ impl Database {
         // Cache stats — every 5 minutes.
         spawn_db_cron(&db, "Cache stats", "0 */5 * * * *", cancel.clone(), |db| async move {
             if let Some(ref cache) = db.object_store_cache {
-                cache.log_stats().await;
+                cache.log_stats();
             }
             let (used, capacity) = db.statistics_extractor.get_cache_stats().await;
             info!("Statistics cache: {}/{} entries used", used, capacity);

@@ -22,10 +22,7 @@ use object_store::{
     PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as ObjectStoreResult, path::Path,
 };
 use serde::{Deserialize, Serialize};
-use tokio::{
-    sync::{Mutex, RwLock},
-    task::JoinSet,
-};
+use tokio::{sync::Mutex, task::JoinSet};
 use tracing::{Instrument, debug, field::Empty, info, instrument, warn};
 
 /// Align large Parquet data reads so sliding time predicates reuse the same cache entry.
@@ -241,20 +238,38 @@ impl FoyerCacheConfig {
     }
 }
 
-/// Statistics for cache operations
-#[derive(Debug, Default, Clone)]
-pub struct CacheStats {
-    pub hits: u64,
-    pub misses: u64,
-    pub range_hits: u64,
-    pub range_misses: u64,
-    pub bytes_served: u64,
-    pub inner_bytes_read: u64,
-    pub range_bytes_read: u64,
-    pub ttl_expirations: u64,
-    pub inner_gets: u64,
-    pub inner_puts: u64,
+/// Declares the cache counters ONCE, as both the live atomics the hot path
+/// bumps and the plain snapshot value callers read.
+macro_rules! cache_stats {
+    ($($field:ident),+ $(,)?) => {
+        /// Statistics for cache operations. A snapshot: each counter is read
+        /// independently, so a snapshot taken under concurrent traffic can mix
+        /// adjacent updates. Nothing here is used to make a decision.
+        #[derive(Debug, Default, Clone)]
+        pub struct CacheStats { $(pub $field: u64,)+ }
+
+        /// The live counters. Relaxed throughout — every field is independently
+        /// additive and publishes no dependent state, so no ordering is needed.
+        /// Atomics rather than a lock because these are bumped on EVERY cache hit:
+        /// a shared `RwLock` made the cheapest cached-IO path take an exclusive
+        /// async lock, serializing otherwise-independent hits.
+        #[derive(Debug, Default)]
+        pub struct AtomicCacheStats { $(pub $field: AtomicU64,)+ }
+
+        impl AtomicCacheStats {
+            fn snapshot(&self) -> CacheStats {
+                CacheStats { $($field: self.$field.load(Ordering::Relaxed),)+ }
+            }
+            /// Zero every counter. A concurrent increment may land either side of
+            /// the reset; tests reset while quiet.
+            fn reset(&self) {
+                $(self.$field.store(0, Ordering::Relaxed);)+
+            }
+        }
+    };
 }
+
+cache_stats!(hits, misses, range_hits, range_misses, bytes_served, inner_bytes_read, range_bytes_read, ttl_expirations, inner_gets, inner_puts);
 
 /// Combined statistics for both caches
 #[derive(Debug, Default, Clone)]
@@ -300,45 +315,36 @@ impl CacheStats {
 
 type FoyerCache = Arc<HybridCache<String, CacheValue>>;
 type CacheEntry = foyer::HybridCacheEntry<String, CacheValue>;
-type StatsRef = Arc<RwLock<CacheStats>>;
+type StatsRef = Arc<AtomicCacheStats>;
 
-async fn bump(stats: &StatsRef, f: impl FnOnce(&mut CacheStats)) {
-    f(&mut *stats.write().await);
+/// Bump a counter. Every recorder below goes through this so the ordering is
+/// stated once.
+fn add(counter: &AtomicU64, n: u64) {
+    counter.fetch_add(n, Ordering::Relaxed);
 }
 
-async fn record_hit(stats: &StatsRef, bytes_served: u64) {
-    let mut s = stats.write().await;
-    s.hits += 1;
-    s.bytes_served += bytes_served;
+fn record_hit(stats: &StatsRef, bytes_served: u64) {
+    add(&stats.hits, 1);
+    add(&stats.bytes_served, bytes_served);
 }
 
-async fn record_miss_with_fetch(stats: &StatsRef) {
-    let mut s = stats.write().await;
-    s.misses += 1;
-    s.inner_gets += 1;
+fn record_miss_with_fetch(stats: &StatsRef) {
+    add(&stats.misses, 1);
+    add(&stats.inner_gets, 1);
 }
 
-async fn record_range_hit(stats: &StatsRef, bytes_served: u64) {
-    let mut s = stats.write().await;
-    s.hits += 1;
-    s.range_hits += 1;
-    s.bytes_served += bytes_served;
+fn record_range_hit(stats: &StatsRef, bytes_served: u64) {
+    record_hit(stats, bytes_served);
+    add(&stats.range_hits, 1);
 }
 
-async fn record_range_miss(stats: &StatsRef, bytes_read: u64) {
-    let mut s = stats.write().await;
-    s.range_misses += 1;
-    s.range_bytes_read += bytes_read;
+fn record_range_miss(stats: &StatsRef, bytes_read: u64) {
+    add(&stats.range_misses, 1);
+    add(&stats.range_bytes_read, bytes_read);
 }
 
-async fn combined_stats(main: &StatsRef, metadata: &StatsRef) -> CombinedCacheStats {
-    CombinedCacheStats { main: main.read().await.clone(), metadata: metadata.read().await.clone() }
-}
-
-/// Non-blocking snapshot: a contended lock yields DEFAULT (zero) counters.
-fn try_combined_stats(main: &StatsRef, metadata: &StatsRef) -> CombinedCacheStats {
-    let snap = |s: &StatsRef| s.try_read().map(|g| g.clone()).unwrap_or_default();
-    CombinedCacheStats { main: snap(main), metadata: snap(metadata) }
+fn combined_stats(main: &StatsRef, metadata: &StatsRef) -> CombinedCacheStats {
+    CombinedCacheStats { main: main.snapshot(), metadata: metadata.snapshot() }
 }
 
 const MIN_DISK_BLOCK_BYTES: usize = 4 * 1024 * 1024;
@@ -498,25 +504,21 @@ impl SharedFoyerCache {
         Ok(Self {
             cache,
             metadata_cache,
-            stats: Arc::new(RwLock::new(CacheStats::default())),
-            metadata_stats: Arc::new(RwLock::new(CacheStats::default())),
+            stats: Arc::new(AtomicCacheStats::default()),
+            metadata_stats: Arc::new(AtomicCacheStats::default()),
             config,
             evictions,
             admission,
         })
     }
 
-    pub async fn get_stats(&self) -> CombinedCacheStats {
-        combined_stats(&self.stats, &self.metadata_stats).await
-    }
-
-    pub fn try_get_stats(&self) -> CombinedCacheStats {
-        try_combined_stats(&self.stats, &self.metadata_stats)
+    pub fn get_stats(&self) -> CombinedCacheStats {
+        combined_stats(&self.stats, &self.metadata_stats)
     }
 
     pub fn runtime_stats(&self) -> FoyerRuntimeStats {
         FoyerRuntimeStats {
-            stats: self.try_get_stats(),
+            stats: self.get_stats(),
             memory_size_bytes: self.config.memory_size_bytes,
             disk_size_bytes: self.config.disk_size_bytes,
             ttl_seconds: self.config.ttl.as_secs(),
@@ -538,11 +540,11 @@ impl SharedFoyerCache {
         }
     }
 
-    pub async fn log_stats(&self) {
+    pub fn log_stats(&self) {
         info!("Main cache stats:");
-        self.stats.read().await.log();
+        self.stats.snapshot().log();
         info!("Metadata cache stats:");
-        self.metadata_stats.read().await.log();
+        self.metadata_stats.snapshot().log();
     }
 
     /// How long Foyer's close may take before it is abandoned.
@@ -553,7 +555,7 @@ impl SharedFoyerCache {
     /// abandoning it loses only cache warmth, never durable data.
     pub async fn shutdown_by(&self, deadline: tokio::time::Instant) -> anyhow::Result<()> {
         info!("Shutting down Foyer cache...");
-        self.log_stats().await;
+        self.log_stats();
 
         // Only a small slice of the stop grace: consuming all of it would starve the
         // WAL cursor snapshot and make every later restart dirty.
@@ -793,7 +795,7 @@ impl FoyerObjectStoreCache {
     }
 
     async fn record_meta_hit(&self, span: &tracing::Span, bytes_served: u64) {
-        record_hit(&self.metadata_stats, bytes_served).await;
+        record_hit(&self.metadata_stats, bytes_served);
         span.record("cache_hit", true);
         span.record("is_metadata", true);
     }
@@ -864,17 +866,13 @@ impl FoyerObjectStoreCache {
         Ok(())
     }
 
-    pub async fn get_stats(&self) -> CombinedCacheStats {
-        combined_stats(&self.stats, &self.metadata_stats).await
+    pub fn get_stats(&self) -> CombinedCacheStats {
+        combined_stats(&self.stats, &self.metadata_stats)
     }
 
-    pub fn try_get_stats(&self) -> CombinedCacheStats {
-        try_combined_stats(&self.stats, &self.metadata_stats)
-    }
-
-    pub async fn reset_stats(&self) {
-        *self.stats.write().await = CacheStats::default();
-        *self.metadata_stats.write().await = CacheStats::default();
+    pub fn reset_stats(&self) {
+        self.stats.reset();
+        self.metadata_stats.reset();
     }
 
     async fn read_payload(payload: GetResultPayload) -> ObjectStoreResult<Vec<u8>> {
@@ -898,7 +896,7 @@ impl FoyerObjectStoreCache {
     }
 
     async fn serve_hit(&self, span: &tracing::Span, value: &CacheValue) -> GetResult {
-        record_hit(&self.stats, value.data.len() as u64).await;
+        record_hit(&self.stats, value.data.len() as u64);
         span.record("cache_hit", true);
         Self::make_get_result(value.data.clone(), value.meta.clone())
     }
@@ -948,7 +946,7 @@ impl FoyerObjectStoreCache {
             }
 
             if value.is_expired(ttl) {
-                bump(&self.stats, |s| s.ttl_expirations += 1).await;
+                add(&self.stats.ttl_expirations, 1);
                 self.cache.remove(&cache_key);
                 debug!("Foyer cache EXPIRED for: {} (TTL: {}s, age: {}ms)", location, ttl.as_secs(), value.age_millis());
             } else {
@@ -983,7 +981,7 @@ impl FoyerObjectStoreCache {
 
         span.record("cache_hit", false);
         span.record("cache_fetch_leader", true);
-        record_miss_with_fetch(&self.stats).await;
+        record_miss_with_fetch(&self.stats);
         let is_parquet = is_parquet_file(location);
         debug!("Foyer cache MISS for: {} (fetching from S3, parquet={}, TTL={}s)", location, is_parquet, ttl.as_secs());
 
@@ -997,7 +995,7 @@ impl FoyerObjectStoreCache {
 
             let data = Self::read_payload(result.payload).await?;
 
-            bump(&self.stats, |s| s.inner_bytes_read += data.len() as u64).await;
+            add(&self.stats.inner_bytes_read, data.len() as u64);
             span.record("cache_entry_bytes", data.len() as i64);
             span.record("cache_admission", if data.len() > self.config.l1_max_entry_bytes { "disk" } else { "memory" });
             let data = Bytes::from(data);
@@ -1054,7 +1052,7 @@ impl FoyerObjectStoreCache {
 
         let full_cache_key = Self::make_cache_key(location);
         if let Some((sliced, age_millis)) = self.live_slice(&self.cache, &full_cache_key, 0, &range, self.config.l1_max_entry_bytes).await {
-            record_range_hit(&self.stats, range.end - range.start).await;
+            record_range_hit(&self.stats, range.end - range.start);
             span.record("cache_hit", true);
             debug!(
                 "Foyer cache HIT (full file) for range: {} (range: {}..{}, size: {} bytes, parquet={}, age={}ms)",
@@ -1073,13 +1071,13 @@ impl FoyerObjectStoreCache {
         if is_parquet && let Ok(Some(entry)) = self.cache.get(&range_cache_key).await {
             let value = entry.value();
             if !value.is_expired(self.config.ttl) {
-                record_range_hit(&self.stats, value.data.len() as u64).await;
+                record_range_hit(&self.stats, value.data.len() as u64);
                 span.record("cache_hit", true);
                 let data = value.data.clone();
                 self.maybe_touch(&self.cache, &range_cache_key, entry, self.config.l1_max_entry_bytes);
                 return Ok(data);
             }
-            bump(&self.stats, |s| s.ttl_expirations += 1).await;
+            add(&self.stats.ttl_expirations, 1);
             self.cache.remove(&range_cache_key);
         }
 
@@ -1123,7 +1121,7 @@ impl FoyerObjectStoreCache {
 
             if is_metadata_request {
                 span.record("cache_hit", false);
-                record_miss_with_fetch(&self.metadata_stats).await;
+                record_miss_with_fetch(&self.metadata_stats);
                 debug!("Metadata cache MISS for Parquet: {} (range: {}..{}, file_size: {})", location, range.start, range.end, file_size);
 
                 let start_time = std::time::Instant::now();
@@ -1145,7 +1143,7 @@ impl FoyerObjectStoreCache {
                     duration.as_millis()
                 );
 
-                bump(&self.metadata_stats, |s| s.inner_bytes_read += data.len() as u64).await;
+                add(&self.metadata_stats.inner_bytes_read, data.len() as u64);
                 self.admit_range(location, range_cache_key, data.clone(), &file_meta);
 
                 return Ok(data);
@@ -1173,7 +1171,7 @@ impl FoyerObjectStoreCache {
                 if aligned != range
                     && let Some((data, _)) = self.live_slice(&self.cache, &aligned_key, aligned.start, &range, self.config.l1_max_entry_bytes).await
                 {
-                    record_range_hit(&self.stats, range.end - range.start).await;
+                    record_range_hit(&self.stats, range.end - range.start);
                     span.record("cache_hit", true);
                     return Ok(data);
                 }
@@ -1184,7 +1182,7 @@ impl FoyerObjectStoreCache {
         }
 
         span.record("cache_hit", false);
-        record_miss_with_fetch(&self.stats).await;
+        record_miss_with_fetch(&self.stats);
         debug!("get_range request for: {} (range: {}..{}, parquet={})", location, range.start, range.end, is_parquet);
 
         let start_time = std::time::Instant::now();
@@ -1206,8 +1204,8 @@ impl FoyerObjectStoreCache {
             is_parquet
         );
 
-        record_range_miss(&self.stats, result.len() as u64).await;
-        bump(&self.stats, |s| s.inner_bytes_read += result.len() as u64).await;
+        record_range_miss(&self.stats, result.len() as u64);
+        add(&self.stats.inner_bytes_read, result.len() as u64);
         if let Some(meta) = range_meta.as_ref() {
             self.admit_data_range(location, range_cache_key, result.clone(), meta);
         }
@@ -1254,7 +1252,7 @@ impl FoyerObjectStoreCache {
     }
 
     async fn put_cached(&self, location: &Path, payload: PutPayload, opts: PutOptions) -> ObjectStoreResult<PutResult> {
-        bump(&self.stats, |s| s.inner_puts += 1).await;
+        add(&self.stats.inner_puts, 1);
         let payload_size = payload.content_length();
         let is_parquet = is_parquet_file(location);
 
@@ -1559,7 +1557,7 @@ impl ObjectStore for FoyerObjectStoreCache {
                 let result = self.inner.get_opts(location, GetOptions { range: Some(GetRange::Suffix(n.max(1))), ..Default::default() }).await?;
                 let (meta, abs_range, attributes) = (result.meta.clone(), result.range.clone(), result.attributes.clone());
                 let bytes = result.bytes().await?;
-                record_miss_with_fetch(&self.metadata_stats).await;
+                record_miss_with_fetch(&self.metadata_stats);
                 // Populate under the absolute key bounded reads use, plus the meta
                 // cache, so the next footer read hits.
                 if is_parquet_file(location) {
@@ -1802,11 +1800,11 @@ mod tests {
         // is covered too.
         assert!(warm_footer(&cache, &path, hint).await, "footer warm must succeed");
 
-        let before = cache.get_stats().await;
+        let before = cache.get_stats();
         let got = cache.get_range(&path, r.clone()).await?;
         assert_eq!(got, data.slice(r.start as usize..r.end as usize), "slice math ({name})");
 
-        let after = cache.get_stats().await;
+        let after = cache.get_stats();
         assert_eq!(after.metadata.hits, before.metadata.hits + 1, "served by the containment probe ({name})");
         assert_eq!(after.metadata.inner_gets, before.metadata.inner_gets, "no inner fetch after warm");
 
@@ -1832,14 +1830,14 @@ mod tests {
     #[tokio::test]
     async fn writes_warm_the_cache_so_reads_never_reach_the_inner_store(name: &str, memory_bytes: usize, sizes: &[usize]) -> anyhow::Result<()> {
         let (cache, _dir) = cache_with(name, Arc::new(InMemory::new()), |c| c.memory_size_bytes = memory_bytes).await?;
-        cache.reset_stats().await;
+        cache.reset_stats();
 
         let files: Vec<(Path, Bytes)> =
             sizes.iter().enumerate().map(|(i, &n)| (Path::from(format!("table/part-{i}.parquet")), Bytes::from(vec![b'a'; n]))).collect();
         for (path, data) in &files {
             cache.put(path, PutPayload::from(data.clone())).await?;
         }
-        assert_eq!(cache.get_stats().await.main.inner_puts, files.len() as u64);
+        assert_eq!(cache.get_stats().main.inner_puts, files.len() as u64);
 
         // Two read passes: both served from the write payload, so no re-fetch.
         for _ in 0..2 {
@@ -1848,12 +1846,12 @@ mod tests {
             }
         }
 
-        let stats = cache.get_stats().await;
+        let stats = cache.get_stats();
         assert_eq!(stats.main.inner_gets, 0, "nothing is ever fetched back from the inner store");
         assert_eq!(stats.main.misses, 0);
         assert_eq!(stats.main.hits, 2 * files.len() as u64);
         assert_eq!(stats.main.bytes_served, 2 * sizes.iter().sum::<usize>() as u64);
-        assert_eq!(cache.try_get_stats().main.bytes_served, stats.main.bytes_served);
+        assert_eq!(cache.get_stats().main.bytes_served, stats.main.bytes_served);
 
         cache.shutdown().await?;
         Ok(())
@@ -1959,11 +1957,11 @@ mod tests {
         let _ = cache.get(&path).await?;
         tokio::time::sleep(Duration::from_millis(200)).await; // let a sliding re-insert land
 
-        cache.reset_stats().await; // normalize: only the final read is under test
+        cache.reset_stats(); // normalize: only the final read is under test
         tokio::time::sleep(Duration::from_millis(wait_ms)).await;
         let _ = cache.get(&path).await?;
 
-        let stats = cache.get_stats().await;
+        let stats = cache.get_stats();
         assert_eq!((stats.main.hits, stats.main.misses, stats.main.ttl_expirations), (hits, misses, expirations), "({name})");
 
         cache.shutdown().await?;
@@ -1986,37 +1984,37 @@ mod tests {
         let path = Path::from("test/file.parquet");
         // Straight to the inner store, so nothing is cached from a write payload.
         inner.put(&path, PutPayload::from(Bytes::from(vec![b'x'; file_size]))).await?;
-        cache.reset_stats().await;
+        cache.reset_stats();
 
         // 1. The footer (last 1KB) caches only the range, via one inner get_range.
         let footer = (file_size - 1024) as u64..file_size as u64;
         let metadata = cache.get_range(&path, footer.clone()).await?;
         assert_eq!(metadata.len(), 1024);
-        let s = cache.get_stats().await.metadata;
+        let s = cache.get_stats().metadata;
         assert_eq!((s.inner_gets, s.misses, s.hits), (1, 1, 0), "footer read is a metadata miss plus one fetch");
 
         // 2. The same range again is a metadata hit — no additional inner get.
         assert_eq!(cache.get_range(&path, footer.clone()).await?, metadata);
-        let s = cache.get_stats().await.metadata;
+        let s = cache.get_stats().metadata;
         assert_eq!((s.inner_gets, s.misses, s.hits), (1, 1, 1), "repeat footer read is served from the metadata cache");
 
         // 3. Data from the beginning fetches and caches the FULL file.
         assert_eq!(cache.get_range(&path, 0..1024).await?.len(), 1024);
-        let s = cache.get_stats().await;
+        let s = cache.get_stats();
         assert_eq!((s.main.inner_gets, s.main.misses), (1, 1), "a data read promotes the file to the main tier");
         assert_eq!(s.metadata.hits, 1, "still the one metadata hit");
 
         // 4. Any range now hits the full-file entry.
         assert_eq!(cache.get_range(&path, 2048..3072).await?.len(), 1024);
-        let s = cache.get_stats().await.main;
+        let s = cache.get_stats().main;
         assert_eq!((s.inner_gets, s.hits), (1, 1), "no additional inner get once the file is cached whole");
 
         // 5. Rewriting through the cache invalidates the metadata entries and warms
         //    main from the put payload, so even the footer range hits main.
-        cache.reset_stats().await;
+        cache.reset_stats();
         cache.put(&path, PutPayload::from(Bytes::from(vec![b'b'; file_size]))).await?;
         let _ = cache.get_range(&path, footer).await?;
-        assert_eq!(cache.get_stats().await.main.hits, 1, "Should hit main cache after put");
+        assert_eq!(cache.get_stats().main.hits, 1, "Should hit main cache after put");
 
         cache.shutdown().await?;
         Ok(())
@@ -2040,25 +2038,25 @@ mod tests {
             c.write_capture_budget_bytes = budget; // 0 isolates the per-upload caps
         })
         .await?;
-        cache.reset_stats().await;
+        cache.reset_stats();
 
         // Under the cap → captured, so the read is served entirely from cache.
         let small_path = Path::from("table/date=2026-06-05/small.parquet");
         mpu_put(&cache, &small_path, &[Bytes::from(vec![b'a'; small_len])]).await?;
         assert_eq!(cache.get(&small_path).await?.bytes().await?.len(), small_len);
-        let stats = cache.get_stats().await;
+        let stats = cache.get_stats();
         assert_eq!(stats.main.hits, 1, "under-cap multipart write should warm the cache ({name})");
         assert_eq!(stats.main.misses, 0, "no S3 read needed after multipart capture");
 
         // Over the cap → capture abandoned, upload still correct, first read misses.
-        cache.reset_stats().await;
+        cache.reset_stats();
         let big_path = Path::from("table/date=2026-06-05/big.parquet");
         let chunk = Bytes::from(vec![b'b'; chunk_len]);
         mpu_put(&cache, &big_path, &[chunk.clone(), chunk]).await?;
 
         assert_eq!(inner.get(&big_path).await?.bytes().await?.len(), 2 * chunk_len, "upload must be unaffected by capture abandonment");
         let _ = cache.get(&big_path).await?;
-        assert_eq!(cache.get_stats().await.main.misses, 1, "over-cap multipart write must not be captured ({name})");
+        assert_eq!(cache.get_stats().main.misses, 1, "over-cap multipart write must not be captured ({name})");
 
         cache.shutdown().await?;
         Ok(())
@@ -2112,7 +2110,7 @@ mod tests {
             c.write_capture_budget_bytes = 512 * 1024;
         })
         .await?;
-        cache.reset_stats().await;
+        cache.reset_stats();
 
         let first_path = Path::from("table/date=2026-06-05/first.parquet");
         let second_path = Path::from("table/date=2026-06-05/second.parquet");
@@ -2131,16 +2129,16 @@ mod tests {
 
         let _ = cache.get(&first_path).await?;
         let _ = cache.get(&second_path).await?;
-        let stats = cache.get_stats().await;
+        let stats = cache.get_stats();
         assert_eq!(stats.main.hits, 1, "the in-budget upload should be captured");
         assert_eq!(stats.main.misses, 1, "the over-budget upload should skip capture");
 
         // The budget is a transient bound, not a latch: capture works again.
-        cache.reset_stats().await;
+        cache.reset_stats();
         let third_path = Path::from("table/date=2026-06-05/third.parquet");
         mpu_put(&cache, &third_path, std::slice::from_ref(&data)).await?;
         let _ = cache.get(&third_path).await?;
-        assert_eq!(cache.get_stats().await.main.hits, 1, "budget must be released when an upload completes");
+        assert_eq!(cache.get_stats().main.hits, 1, "budget must be released when an upload completes");
 
         cache.shutdown().await?;
         Ok(())
@@ -2183,13 +2181,13 @@ mod tests {
     #[tokio::test]
     async fn recent_window_admits_only_recent_partition_writes(name: &str, days_old: i64, hits: u64, misses: u64) -> anyhow::Result<()> {
         let (cache, _dir) = cache_with(name, Arc::new(InMemory::new()), |c| c.cache_recent_days = 8).await?;
-        cache.reset_stats().await;
+        cache.reset_stats();
 
         let path = Path::from(format!("t/date={}/part.parquet", Utc::now().date_naive() - chrono::Duration::days(days_old)));
         cache.put(&path, PutPayload::from(Bytes::from(vec![b'a'; 4096]))).await?;
         let _ = cache.get(&path).await?;
 
-        let stats = cache.get_stats().await;
+        let stats = cache.get_stats();
         assert_eq!((stats.main.hits, stats.main.misses), (hits, misses), "({name})");
 
         cache.shutdown().await?;
@@ -2204,16 +2202,16 @@ mod tests {
         let file_size = 8 * 1024;
         let path = Path::from("table/date=2026-06-05/part-1.parquet");
         inner.put(&path, PutPayload::from(Bytes::from(vec![b'y'; file_size]))).await?;
-        cache.reset_stats().await;
+        cache.reset_stats();
 
         // The warm itself is one miss; reset to isolate post-warm reads.
         assert!(warm_full(&cache, &path).await);
-        let stats = cache.get_stats().await;
+        let stats = cache.get_stats();
         assert_eq!(stats.main.misses, 1, "warm should fetch the full file once");
-        cache.reset_stats().await;
+        cache.reset_stats();
 
         let _ = cache.get_range(&path, 0..1024).await?;
-        let stats = cache.get_stats().await;
+        let stats = cache.get_stats();
         assert_eq!(stats.main.hits, 1, "data read should hit main cache after full warm");
         assert_eq!(stats.main.misses, 0);
 
@@ -2232,10 +2230,10 @@ mod tests {
         let (cache, _dir) = cache_with("header_footer", inner, |c| c.parquet_metadata_size_hint = 1024).await?;
 
         assert!(warm_parquet_metadata(&cache, &path, 1024).await);
-        cache.reset_stats().await;
+        cache.reset_stats();
         assert_eq!(cache.get_range(&path, 0..8).await?.len(), 8);
         assert_eq!(cache.get_range(&path, 3500..3600).await?.len(), 100);
-        let stats = cache.get_stats().await;
+        let stats = cache.get_stats();
         assert_eq!(stats.metadata.hits, 2);
         assert_eq!(stats.metadata.inner_gets, 0);
         cache.shutdown().await?;
@@ -2251,7 +2249,7 @@ mod tests {
     #[tokio::test]
     async fn a_warmed_entry_is_read_back_and_evicted_under_one_key(name: &str, multipart: bool) -> anyhow::Result<()> {
         let (shared, cache, _dir) = shared_with(name, Arc::new(InMemory::new()), |_| {}).await?;
-        cache.reset_stats().await;
+        cache.reset_stats();
 
         let path = Path::from("table/date=2026-06-05/part.parquet");
         let data = Bytes::from(vec![b'z'; 64 * 1024]);
@@ -2263,7 +2261,7 @@ mod tests {
 
         // A key mismatch surfaces here as a miss plus an S3 fetch.
         let _ = cache.get(&path).await?;
-        let stats = cache.get_stats().await;
+        let stats = cache.get_stats();
         assert_eq!(stats.main.hits, 1, "warmed entry must be found by a plain GET, warm/read key match ({name})");
         assert_eq!(stats.main.misses, 0, "no S3 read needed after write capture");
         assert!(shared.cache.memory().contains(&path.to_string()), "warmed entry should be in the in-memory cache");
@@ -2345,7 +2343,7 @@ mod tests {
         first?;
         second?;
         assert_eq!(gets.load(Ordering::Relaxed), 1, "concurrent cold reads must share one inner GET");
-        let stats = cache.get_stats().await;
+        let stats = cache.get_stats();
         assert_eq!(stats.main.misses, 1);
         assert_eq!(stats.main.hits, 1);
         cache.shutdown().await?;
@@ -2363,12 +2361,12 @@ mod tests {
 
         let (counting, heads, gets) = counting_store(&mem, Duration::ZERO);
         let (cache, _dir) = cache_with("warm_footer_heads", counting, |c| c.parquet_metadata_size_hint = 1024).await?;
-        cache.reset_stats().await;
+        cache.reset_stats();
 
         assert!(warm_footer(&cache, &path, 1024).await);
         assert_eq!(heads.load(Ordering::Relaxed), 0, "suffix warm must not issue a HEAD");
         assert_eq!(gets.load(Ordering::Relaxed), 1, "suffix warm is a single GET");
-        let s = cache.get_stats().await.metadata;
+        let s = cache.get_stats().metadata;
         assert_eq!((s.misses, s.hits), (1, 0), "warm should fetch the footer once");
 
         let footer = (file_size - 1024) as u64..file_size as u64;
@@ -2376,7 +2374,7 @@ mod tests {
         assert_eq!(bytes.len(), 1024);
         assert_eq!(heads.load(Ordering::Relaxed), 0, "warmed footer read must not HEAD");
         assert_eq!(gets.load(Ordering::Relaxed), 1, "warmed footer read must not GET (still just the warm)");
-        assert_eq!(cache.get_stats().await.metadata.hits, 1, "footer read should hit the metadata cache after warm");
+        assert_eq!(cache.get_stats().metadata.hits, 1, "footer read should hit the metadata cache after warm");
 
         cache.shutdown().await?;
         Ok(())
@@ -2391,14 +2389,14 @@ mod tests {
         let cold = Path::from("tbl/date=2020-01-01/cold.parquet");
         cache.put(&hot, PutPayload::from_static(b"hot-bytes")).await?; // cached from the write payload
         inner.put(&cold, PutPayload::from_static(b"cold-bytes")).await?; // only in the inner store
-        cache.reset_stats().await;
+        cache.reset_stats();
 
         let (hot_bytes, cold_bytes) =
             scan_bypass_scope(true, async { (cache.get(&hot).await.unwrap().bytes().await.unwrap(), cache.get(&cold).await.unwrap().bytes().await.unwrap()) })
                 .await;
         assert_eq!(hot_bytes, Bytes::from_static(b"hot-bytes"));
         assert_eq!(cold_bytes, Bytes::from_static(b"cold-bytes"));
-        let stats = cache.get_stats().await;
+        let stats = cache.get_stats();
         assert_eq!(stats.main.hits, 1, "lookups still hit inside a bypass scope");
         assert_eq!(stats.main.inner_gets, 1, "the miss still fetches");
         assert!(!cache.cache.contains(cold.as_ref()), "a bypassed miss must not populate the cache");
@@ -2471,13 +2469,13 @@ mod tests {
             assert_eq!(&cache.get_range_cached(&path, r.clone()).await?[..], &body[r.start as usize..r.end as usize]);
         }
         assert!(!shared.contains_data(path.as_ref()), "query ranges must not trigger a full-file cache population");
-        let cold = cache.get_stats().await.main;
+        let cold = cache.get_stats().main;
         assert_eq!(cold.range_misses, misses);
         assert_eq!(cold.range_bytes_read, bytes_read, "inner bytes must track the fetched ranges, not the whole object ({name})");
         assert_eq!(cold.inner_bytes_read, bytes_read);
 
         assert_eq!(&cache.get_range_cached(&path, warm_range.clone()).await?[..], &body[warm_range.start as usize..warm_range.end as usize]);
-        let warm = cache.get_stats().await.main;
+        let warm = cache.get_stats().main;
         assert_eq!(warm.range_hits, 1, "a range inside an already-fetched window must hit the main range cache ({name})");
         assert_eq!(warm.inner_bytes_read, cold.inner_bytes_read, "a range hit must not touch the inner store");
         Ok(())

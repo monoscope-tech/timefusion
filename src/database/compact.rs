@@ -744,7 +744,12 @@ impl Database {
                 vec![PartitionFilter::try_from(("project_id", "=", project_id.as_str()))?, PartitionFilter::try_from(("date", "=", date_str.as_str()))?];
             for _ in 0..max_passes {
                 let selected_files = {
-                    let table = table_ref.read().await;
+                    // Clone out from under the guard rather than enumerating beneath it:
+                    // `get_active_add_actions_by_partitions` is an async stream, and Tokio's
+                    // RwLock is write-preferring, so a snapshot publisher that queues for the
+                    // write side while this reader is parked also blocks every query reader
+                    // arriving behind it.
+                    let table = { table_ref.read().await.clone() };
                     Self::light_optimize_tail(&table, &partition_filters, target_size, 2, i64::MAX).await?
                 };
                 if selected_files.is_empty() {
