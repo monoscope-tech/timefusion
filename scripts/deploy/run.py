@@ -18,7 +18,16 @@ ROOT = Path(__file__).resolve().parents[2]
 CLIENT = 'timefusion-deploy-client:local'
 CREDENTIALS = ('PGURL', 'CAPROVER_SERVER', 'CAPROVER_APP', 'CAPROVER_TOKEN')
 EXPECTED_APP = 'timefusion'
-LIMITS = {'MAX_WAL_RECOVERY_MS': '5000', 'MAX_READY_WAIT_SECS': '10', 'RECOVERY_WAIT_SECS': '720',
+# MAX_READY_WAIT_SECS is the client-visible unready budget for ONE rollout.
+# 10s was unreachable by construction: the swarm service is stop-first (it has to
+# be — a start-first handoff deadlocks two processes on the WAL lock), so the
+# budget must cover the old container draining, the new one starting AND
+# TimeFusion initialising, in series. Measured on real rollouts: 14046ms and
+# 17151ms unready, both with a CLEAN soak (44/48 probes, 0 failures) — the
+# rollout was fine and only the assertion failed, so every deploy reported
+# failure and a genuinely broken one would have looked identical.
+# 30s keeps a real regression in range (that shows up as minutes, not seconds).
+LIMITS = {'MAX_WAL_RECOVERY_MS': '5000', 'MAX_READY_WAIT_SECS': '30', 'RECOVERY_WAIT_SECS': '720',
           'SOAK_SECS': '120', 'PROBE_INTERVAL_SECS': '2', 'MAX_CONSECUTIVE_FAILURES': '2'}
 
 
