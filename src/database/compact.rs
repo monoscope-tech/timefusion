@@ -1083,15 +1083,38 @@ impl Database {
             // flushes; newer duplicates are retried later.
             let sealed_before = Utc::now().naive_utc() - chrono::Duration::hours(2);
             let mut skipped_unsealed = false;
-            // A bin that cannot be split further in time is instead split by the same
-            // complete-key hash partitioning the rewrite uses, so no single pass
-            // accumulates the whole bin's key cardinality in memory.
-            let probe_shards = limits.map_or(1, |limits| limits.probe_hash_shards.max(1));
-            let bucket_expr = dedup_bucket_expr(schema);
+            // Shard the probe by TIME, never by a key hash. `hash_bucket(...)` has no
+            // parquet statistics, so EVERY hash shard re-read the whole partition to
+            // answer one question — prod 2026-09-20 logged `row_groups_pruned=0` with
+            // 4.4 GB scanned five times over, 28 minutes per unit, while the box sat
+            // at a third of its CPU. `timestamp` does have statistics, so a time shard
+            // prunes to its own range and the passes together read the partition ONCE.
+            //
+            // Splitting on time is sound for the same reason the ten-minute bins above
+            // are: a dup group shares one exact `timestamp` (it is a dedup key), so a
+            // time boundary can never cut a group in half.
+            let probe_shards = i64::try_from(limits.map_or(1, |limits| limits.probe_hash_shards.max(1))).unwrap_or(1).max(1);
+            let naive = |micros: i64| chrono::DateTime::from_timestamp_micros(micros).map(|at| at.naive_utc());
+            let (probe_lo, probe_hi) = match slice {
+                Some(slice) => (naive(slice.start_micros), naive(slice.end_micros)),
+                None => (date.and_hms_opt(0, 0, 0), date.succ_opt().and_then(|next| next.and_hms_opt(0, 0, 0))),
+            };
             let mut duplicate_starts = Vec::new();
-            for shard in 0..probe_shards {
-                let shard_filter = format!("{filter}{}", shard_bucket_pred(&bucket_expr, shard as u64, probe_shards as u64));
-                duplicate_starts.extend(Self::dup_bin_starts(&ctx, &shard_filter, &keys_csv).await?);
+            // Unreadable bounds mean one unsharded pass, which is correct but slow —
+            // never a silent skip, which would leave duplicates physically present.
+            let span = probe_lo.zip(probe_hi).and_then(|(lo, hi)| (hi - lo).num_microseconds()).filter(|span| *span > 0);
+            match probe_lo.zip(span) {
+                Some((lo, span)) => {
+                    for (from, to) in probe_time_shards(lo, span, probe_shards) {
+                        let shard_filter = format!(
+                            "{filter} AND \"timestamp\" >= TIMESTAMP '{}' AND \"timestamp\" < TIMESTAMP '{}'",
+                            from.format("%Y-%m-%d %H:%M:%S%.6f"),
+                            to.format("%Y-%m-%d %H:%M:%S%.6f")
+                        );
+                        duplicate_starts.extend(Self::dup_bin_starts(&ctx, &shard_filter, &keys_csv).await?);
+                    }
+                }
+                None => duplicate_starts.extend(Self::dup_bin_starts(&ctx, &filter, &keys_csv).await?),
             }
             let built: Vec<_> = duplicate_starts
                 .into_iter()
@@ -1880,6 +1903,17 @@ fn dedup_bucket_expr(schema: &crate::schema::TableSchema) -> String {
     format!("hash_bucket(arrow_cast(concat_ws(chr(31), {keys_varchar}), 'Utf8View'), {DEDUP_BUCKET_COUNT})")
 }
 
+/// Split `[lo, lo + span)` into `shards` contiguous half-open ranges.
+///
+/// The probe shards on TIME because `timestamp` carries parquet statistics and a
+/// key hash does not — see the call site. Contiguity is the whole contract: a
+/// gap would silently skip duplicates, and an overlap would probe rows twice.
+fn probe_time_shards(lo: chrono::NaiveDateTime, span: i64, shards: i64) -> Vec<(chrono::NaiveDateTime, chrono::NaiveDateTime)> {
+    let shards = shards.max(1);
+    let at = |n: i64| lo + chrono::Duration::microseconds(span.saturating_mul(n) / shards);
+    (0..shards).map(|shard| (at(shard), at(shard + 1))).collect()
+}
+
 /// ` AND <bucket_expr> >= lo[ AND < hi]` — one shard's contiguous bucket range
 /// (even ±1); empty when unsharded.
 fn shard_bucket_pred(bucket_expr: &str, shard: u64, shards: u64) -> String {
@@ -2349,5 +2383,45 @@ mod immutable_audit_tests {
         for column in &columns {
             assert!(sql.contains(&format!("MIN(\"{column}\")")), "{column} is audited by the streaming form but absent from the SQL form");
         }
+    }
+}
+
+#[cfg(test)]
+mod probe_shard_tests {
+    use super::*;
+
+    /// The dedup probe shards on TIME so each pass prunes on `timestamp`
+    /// statistics; a key hash has none, so every hash shard re-read the whole
+    /// partition (prod 2026-09-20: `row_groups_pruned=0`, 4.4 GB scanned five
+    /// times over per unit). What makes time sharding SAFE is that the ranges
+    /// tile the window exactly: a gap would skip duplicates and leave them
+    /// physically present, an overlap would probe the same rows twice.
+    #[test_case::test_case(1 ; "unsharded")]
+    #[test_case::test_case(2 ; "even split")]
+    #[test_case::test_case(5 ; "the shard count prod computed")]
+    #[test_case::test_case(7 ; "a count that does not divide the span")]
+    #[test_case::test_case(144 ; "one shard per ten-minute bin of a day")]
+    fn probe_shards_tile_the_window_without_gap_or_overlap(shards: i64) {
+        let lo = chrono::NaiveDate::from_ymd_opt(2026, 9, 17).unwrap().and_hms_opt(0, 0, 0).unwrap();
+        let span = chrono::Duration::days(1).num_microseconds().unwrap();
+        let ranges = probe_time_shards(lo, span, shards);
+
+        assert_eq!(ranges.len() as i64, shards, "one range per shard");
+        assert_eq!(ranges.first().unwrap().0, lo, "the first range must start at the window start");
+        assert_eq!(ranges.last().unwrap().1, lo + chrono::Duration::microseconds(span), "the last must reach the window end");
+        for pair in ranges.windows(2) {
+            assert_eq!(pair[0].1, pair[1].0, "ranges must be contiguous — a gap skips duplicates, an overlap double-probes");
+        }
+    }
+
+    /// A nonsensical shard count must still probe the whole window once rather
+    /// than produce zero ranges, which would skip the partition silently.
+    #[test_case::test_case(0 ; "zero")]
+    #[test_case::test_case(-3 ; "negative")]
+    fn a_degenerate_shard_count_still_covers_the_window(shards: i64) {
+        let lo = chrono::NaiveDate::from_ymd_opt(2026, 9, 17).unwrap().and_hms_opt(0, 0, 0).unwrap();
+        let span = chrono::Duration::days(1).num_microseconds().unwrap();
+        let ranges = probe_time_shards(lo, span, shards);
+        assert_eq!(ranges, vec![(lo, lo + chrono::Duration::microseconds(span))], "must fall back to ONE full-window pass");
     }
 }
