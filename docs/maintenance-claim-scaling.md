@@ -295,15 +295,46 @@ choose WHICH set to pop from, so they survive untouched. The rank encodes
 starvation horizons and deadlines that were hard-won, and ClickHouse's move to
 round-robin (PR #46247) is explicitly not what to copy here.
 
-## 6. Verification
+## 6. Measured, 2026-09-21
 
-| signal | before | after the index | after 5.x |
+Prod, a 677 s steady-state interval at 202 claims/sec (136,995 claims). Read as
+INTERVAL deltas — an instantaneous read at 177 s uptime said 1.99 ms and was
+cold-start contamination, not signal.
+
+| | original | after the index | after the memo |
 |---|---|---|---|
-| `coordinator_claim.avg_us` | 4,686 | expect < 100 | flat as N grows |
-| `coordinator_claim.max_ms` | 3,289 | expect < 50 | flat |
-| `journal_hold` duty cycle | 41% | expect < 2% | flat |
-| `claimable_tasks` | — | should track `tasks_pending` | same |
-| `maintenance_task_started` rate | 586/min | must not regress | scales with slots |
+| ranks computed **per claim** | ~1,300 | ~1,300 | **0.023** |
+| `coordinator_claim` avg | 4,686 us | 2,940 us | **339 us** |
+| `coordinator_claim` max | 3,289 ms | 394 ms | **293 ms** |
+| `journal_hold` duty cycle | 41% | 16.2% | **3.0%** |
+| `journal_lock_wait` | 0.80 workers | 0.58 workers | **0.050 workers** |
 
-If `claimable_tasks` drifts toward `tasks_complete`, the permissive set is not
-being re-derived and the scan is quietly paying for dead tasks again.
+**0.023 ranks per claim.** Not "once per claim" — once per FORTY claims, because
+a claim usually finds every candidate's rank still valid on all four witnesses.
+Against ~1,300 that is the whole point of the exercise, and it lands 8.7x on the
+claim and 16x on time spent waiting for the journal mutex.
+
+**339 us lands exactly in the 200-500 us band predicted, not the 50 us an
+earlier draft implied.** That was the honest prediction and it held: with the
+ranking gone, what remains is one `TaskKey` hash (three strings) per candidate,
+which is what D3's generational `Slot` exists to remove. Do not read 339 us as
+the memo underperforming — read it as the profile having moved, for the second
+time, exactly where the arithmetic said it would.
+
+The tail is now 293 ms against an original 3,289 ms. That is the number that
+parks runtime threads, and it is no longer in a range where it can.
+
+Backlogs at the same moment, for context on what this is buying: base_rollup 470,
+dedup 272, sealed_consolidation 228, derived_rollup 108, hot_packing 17, repair 0
+— against a wedge that ran base_rollup 2,198 -> 5,026 while committing nothing.
+
+## 6a. What to watch
+
+| signal | healthy | what a regression means |
+|---|---|---|
+| `maintenance_rank_computations_total` / `coordinator_claim.count` | ~0.02 | climbing toward the candidate count: something invalidates the memo every claim — suspect the two generations first |
+| `coordinator_claim.avg_us` | ~340, flat as N grows | growth with the journal means the per-operation index is not being re-derived |
+| `journal_hold` duty cycle | ~3% | — |
+| `claimable_tasks` | tracks `tasks_pending` | drift toward `tasks_complete` means the permissive set is paying for dead tasks again |
+| `maintenance_task_started` rate | scales with slots | must not regress |
+

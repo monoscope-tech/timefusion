@@ -87,6 +87,19 @@ from consuming coordinator and journal capacity every five seconds forever.
 4. Admission refusals are counted independently for CPU, decoded memory,
    object reads, and object writes. If two dimensions bind, both counters rise.
 5. Persistent `source_not_flushed` retries now back off to at most 64 seconds.
+6. `admission_busy` retries use a fixed five-second delay instead of the task's
+   lifetime attempt count. Capacity can refill within five seconds after a lag
+   spike instead of waiting as long as 64 seconds; prerequisite failures retain
+   exponential backoff. At the measured worst floor, 52 rejected workers imply
+   at most about 10.4 retries/second. At the observed 5.5 ms average claim cost,
+   that is roughly 57 ms/second of serialized claim work—close to the existing
+   retry rate, while cutting worst-case refill latency by about 59 seconds.
+7. While sealed consolidation is pending, current-day packing is capped at one
+   third of the light rewrite pool (at least one lane). On the observed
+   five-permit production shape this leaves four lanes available to sealed work
+   and one to the open day. The cap is bypassed when sealed debt reaches zero,
+   so it does not strand capacity after catch-up. Coordinator refusals and
+   cron-wave waits at this gate are exported separately.
 
 The maintenance runtime remains isolated and lower-priority. Its 500 ms
 scheduling-lag feedback comes from the foreground Tokio runtime. With lag at or
@@ -145,3 +158,69 @@ next decision follows the counters:
 Until the patched build produces that window, there is no defensible new ETA.
 The previous state was not converging reliably, and extrapolating it would only
 estimate how long the known 28-slot bottleneck persists.
+
+## Storage truth and the sealed lane
+
+The coordinator's decoded-byte backlog gauge is not the physical backlog. A
+read-only Delta snapshot census at versions 623217, 623236, 623252, and 623382 found
+the actual fragmentation concentrated in the newest sealed dates:
+
+| Date | Active files | Compressed bytes | Projects | Projects over the <=2-file policy |
+|---|---:|---:|---:|---:|
+| 2026-09-18 | 304 | 3.85 GiB | 12 | 9 |
+| 2026-09-19 | 1,250 | 3.28 GiB | 11 | 10 |
+| 2026-09-20 (open) | 199-202 | 2.51-2.60 GiB | 12 | 8-9 |
+
+After the UTC date boundary, version 623382 showed 2026-09-20 newly sealed at
+166 files / 2.65 GiB with six projects out of policy. Hot work had reduced that
+date from 202 files, while 2026-09-19 still had not moved.
+
+Older dates were generally 10-35 files fleet-wide. Across all four censuses,
+the 2026-09-19 row remained exactly 1,250 files and 3.28 GiB even though 165
+Delta versions committed. Thus the worst sealed day had zero physical drain in
+that interval. The 1.85 TiB `sealed_consolidation` gauge is an
+estimated decoded task cost and is inflated by durable queue state; it is not
+1.85 TiB of live parquet waiting to be compacted.
+
+All five light-rewrite permits were occupied during the same investigation.
+Permit watchdogs reported sealed staging at 300, 900, 2,700, 4,500, and 6,300
+seconds and hot packing at 300, 900, and 1,800 seconds. Observed bins ranged
+from tiny multi-file rewrites to 200-525 MB inputs that took roughly 110-240
+seconds to stage. A one-file Pack is intentional only for an unsorted L0 file:
+it creates a sorted run but does not reduce file count. Two near-target inputs
+may also legitimately exceed the 256 MiB packing target because output files
+are capped at 512 MiB; such a pair can still collapse to one output.
+
+The shared semaphore previously had no lane fairness. Hot packing could take
+all five permits even while sealed work was pending. Rotation of task claims is
+not sufficient fairness once a long-running unit owns a permit for minutes or
+hours. The conditional one-third hot cap makes the scarce stage work-conserving
+for catch-up: it preserves today's progress but prevents it from excluding the
+sealed lane whose physical file count was not moving.
+
+The staging events previously exposed only `pass=Pack`, so hot-tail work and
+sealed consolidation were indistinguishable. They now include the coordinator
+operation and partition date. This makes permit allocation and useful drain by
+date measurable after deployment instead of inferred from snapshots.
+
+## Secondary control-loop effect
+
+One foreground-runtime lag sample reached 326 ms. The admission ceiling uses
+the latest sample, so that event temporarily reduced the CPU ceiling from 66
+to the conservative floor of 14. Existing work was not cancelled, but rejected
+tasks used attempt-based backoff capped at 64 seconds. Utilization subsequently
+moved from 14 toward 18 rather than refilling instantly. This is secondary to
+the old 28-slot I/O cap, but it explains short under-filled periods after a lag
+spike. Admission retries now use a fixed five-second delay to remove that refill
+tail without making persistent prerequisites spin. The new per-dimension refusal
+counters are required before changing the lag controller: a high foreground lag
+is a valid reason not to saturate cores.
+
+## Current ETA
+
+There is still no responsible catch-up ETA. The authoritative worst-day sample
+showed zero net file retirement, and the patched scheduler has not run in
+production. After deployment, estimate ETA from at least a stable multi-hour
+window using the change in active files/bytes for sealed dates, subtracting new
+arrivals. If the 2026-09-19 file count still does not fall while CPU is saturated,
+the next bottleneck is the five-permit staging lane rather than global admission.
