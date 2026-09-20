@@ -1903,13 +1903,29 @@ fn dedup_bucket_expr(schema: &crate::schema::TableSchema) -> String {
     format!("hash_bucket(arrow_cast(concat_ws(chr(31), {keys_varchar}), 'Utf8View'), {DEDUP_BUCKET_COUNT})")
 }
 
+/// Ceiling on probe passes, so a pathological window cannot mint unbounded
+/// queries: one day of ten-minute ranges is 144, and this leaves headroom.
+const MAX_PROBE_TIME_SHARDS: i64 = 512;
+
 /// Split `[lo, lo + span)` into `shards` contiguous half-open ranges.
 ///
 /// The probe shards on TIME because `timestamp` carries parquet statistics and a
 /// key hash does not — see the call site. Contiguity is the whole contract: a
 /// gap would silently skip duplicates, and an overlap would probe rows twice.
 fn probe_time_shards(lo: chrono::NaiveDateTime, span: i64, shards: i64) -> Vec<(chrono::NaiveDateTime, chrono::NaiveDateTime)> {
-    let shards = shards.max(1);
+    // Hash sharding was UNIFORM — it split keys evenly whatever the data looked
+    // like. Time sharding is not: rows clustered into one hour would put most of
+    // the keys in one range and loosen the memory bound the sharding exists to
+    // hold. So bound the WIDTH as well as the count — no range wider than one
+    // ten-minute bin, the same granularity the probe already reports in. Skew
+    // can then only concentrate ten minutes of ingest, not a whole partition.
+    //
+    // Affordable precisely because the shards now prune: a pass costs single-digit
+    // milliseconds against the 28 MINUTES an unprunable hash shard used to take,
+    // so the extra passes are far cheaper than the bound they buy.
+    const MAX_SHARD_MICROS: i64 = 10 * 60 * 1_000_000;
+    let by_width = (span.max(0) + MAX_SHARD_MICROS - 1) / MAX_SHARD_MICROS;
+    let shards = shards.max(1).max(by_width).min(MAX_PROBE_TIME_SHARDS);
     let at = |n: i64| lo + chrono::Duration::microseconds(span.saturating_mul(n) / shards);
     (0..shards).map(|shard| (at(shard), at(shard + 1))).collect()
 }
@@ -2406,7 +2422,13 @@ mod probe_shard_tests {
         let span = chrono::Duration::days(1).num_microseconds().unwrap();
         let ranges = probe_time_shards(lo, span, shards);
 
-        assert_eq!(ranges.len() as i64, shards, "one range per shard");
+        // The count is the requested shards RAISED to the width bound: no range may
+        // exceed ten minutes, or time skew could concentrate a whole partition's
+        // keys in one pass and lose the memory bound hash sharding used to give.
+        assert!(ranges.len() as i64 >= shards, "never fewer passes than asked for, got {}", ranges.len());
+        for (from, to) in &ranges {
+            assert!((*to - *from) <= chrono::Duration::minutes(10), "no range may exceed the ten-minute width bound: {from} -> {to}");
+        }
         assert_eq!(ranges.first().unwrap().0, lo, "the first range must start at the window start");
         assert_eq!(ranges.last().unwrap().1, lo + chrono::Duration::microseconds(span), "the last must reach the window end");
         for pair in ranges.windows(2) {
@@ -2414,14 +2436,21 @@ mod probe_shard_tests {
         }
     }
 
-    /// A nonsensical shard count must still probe the whole window once rather
-    /// than produce zero ranges, which would skip the partition silently.
+    /// A nonsensical shard count must still COVER the whole window — zero ranges
+    /// would skip the partition silently, leaving duplicates physically present.
+    /// It no longer collapses to one unbounded pass: the width bound applies
+    /// regardless of the count asked for.
     #[test_case::test_case(0 ; "zero")]
     #[test_case::test_case(-3 ; "negative")]
     fn a_degenerate_shard_count_still_covers_the_window(shards: i64) {
         let lo = chrono::NaiveDate::from_ymd_opt(2026, 9, 17).unwrap().and_hms_opt(0, 0, 0).unwrap();
         let span = chrono::Duration::days(1).num_microseconds().unwrap();
         let ranges = probe_time_shards(lo, span, shards);
-        assert_eq!(ranges, vec![(lo, lo + chrono::Duration::microseconds(span))], "must fall back to ONE full-window pass");
+        assert!(!ranges.is_empty(), "a degenerate count must never produce zero passes");
+        assert_eq!(ranges.first().unwrap().0, lo, "coverage must start at the window start");
+        assert_eq!(ranges.last().unwrap().1, lo + chrono::Duration::microseconds(span), "and reach its end");
+        for pair in ranges.windows(2) {
+            assert_eq!(pair[0].1, pair[1].0, "and stay contiguous");
+        }
     }
 }

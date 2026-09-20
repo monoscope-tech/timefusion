@@ -123,7 +123,7 @@ RUN target-cargo build --release --locked --features profiling && \
     mkdir -p /output && cp "target/$(cat /rust-target)/release/timefusion" /output/timefusion
 
 # App state dirs (distroless runtime has no shell to mkdir at runtime).
-RUN mkdir -p /queue_db /data
+RUN mkdir -p /queue_db /data/timefusion
 # jemalloc's profiler links libunwind dynamically; distroless ships neither it
 # nor its liblzma dep, so stage both (cp -a keeps the soname symlinks) for the
 # runtime stage. Arch-agnostic glob: /usr/lib/{x86_64,aarch64}-linux-gnu.

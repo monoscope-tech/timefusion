@@ -947,7 +947,12 @@ pub enum OtelScanGuard {
 #[serde_inline_default::serde_inline_default]
 #[derive(Debug, Clone, Deserialize)]
 pub struct CoreConfig {
-    #[serde_inline_default(PathBuf::from("./data"))]
+    // `./data/timefusion`, not `./data`: WORKDIR is `/app` and the persistent
+    // volume is bind-mounted at `/app/data/timefusion/`, so the relative default
+    // lands exactly on the mount and the deployment needs NO env var to say so.
+    // `./data` resolved to `/app/data`, which is NOT mounted — data written there
+    // is lost on restart, which is why an override had to exist at all.
+    #[serde_inline_default(PathBuf::from("./data/timefusion"))]
     pub timefusion_data_dir: PathBuf,
     #[serde_inline_default(5432)]
     pub pgwire_port: u16,
