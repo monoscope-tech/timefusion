@@ -1711,7 +1711,6 @@ impl TaskJournal {
             } else {
                 self.claim_tick.is_multiple_of(2)
             };
-        let _claimable = |task: &MaintenanceTask| task.key.operation == operation && Self::task_can_be_claimed(task, now_micros, allow_quarantined);
         // One claim in four is RESERVED for work inside the window dashboards read, chosen
         // WITHOUT reference to `starved` (any starved task outranks any non-starved one).
         // Residue 3 is load-bearing: ODD, so it never collides with a sealed turn (multiples
