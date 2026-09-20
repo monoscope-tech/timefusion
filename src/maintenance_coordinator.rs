@@ -279,6 +279,9 @@ pub struct MaintenanceTask {
     /// would otherwise break that proxy.
     #[serde(default)]
     pub backfill_priority_micros: Option<i64>,
+    /// Memoised claim rank — see [`TaskJournal::rank`]. Runtime only.
+    #[serde(skip)]
+    pub(crate) rank_cache: RankCache,
 }
 
 impl MaintenanceTask {
@@ -305,6 +308,7 @@ impl MaintenanceTask {
             parent_measured_bytes: None,
             preflight_decoded_bytes: None,
             backfill_priority_micros: None,
+            rank_cache: RankCache::default(),
         }
     }
 }
@@ -526,7 +530,19 @@ pub struct TaskJournal {
     /// strand a unit forever. So every transition into a claimable state inserts,
     /// and removal is lazy. `reconcile_claimable` re-derives the set and counts
     /// divergence, so a missed insert is loud rather than invisible.
-    claimable: std::collections::BTreeSet<TaskKey>,
+    /// Keyed by operation because a claim only ever wants one of them: a single
+    /// set made every claim walk all six lanes' keys to use a sixth of them.
+    claimable: std::collections::BTreeMap<Operation, std::collections::BTreeSet<TaskKey>>,
+    /// Bumped when a BULK rank input changes (`tier_holes`, `untagged_cells`),
+    /// invalidating every memoised [`Rank`] at once. Those sets are replaced
+    /// WHOLESALE, so there is nothing finer to track, and a counter cannot be
+    /// wrong the way a per-cell invalidation list can.
+    rank_generation: u64,
+    /// Separate from `rank_generation` — see [`TaskJournal::dedup_generation_for`].
+    dedup_generation: u64,
+    /// Reused across claims so the hot path allocates nothing. Holds indices,
+    /// not references, so it can live on `self` while the walk borrows the tasks.
+    claim_scratch: Vec<(Rank, usize, bool, bool)>,
     dirty_tasks: HashSet<TaskKey>,
     /// Keys removed since the last write, pending a `Removed` tombstone.
     removed_tasks: HashSet<TaskKey>,
@@ -738,7 +754,10 @@ impl TaskJournal {
             base_tier_ready: HashSet::new(),
             tier_holes: HashSet::new(),
             untagged_cells: HashSet::new(),
-            claimable: std::collections::BTreeSet::new(),
+            claimable: std::collections::BTreeMap::new(),
+            rank_generation: 0,
+            dedup_generation: 0,
+            claim_scratch: Vec::new(),
             claim_tick: 0,
             frontier_lag_secs: std::sync::atomic::AtomicU64::new(0),
             dedup_complete_edges: HashMap::new(),
@@ -784,6 +803,7 @@ impl TaskJournal {
     /// Rebuild the completed-dedup boundary index from the snapshot. Called
     /// once at load; `note_dedup_edges` maintains it incrementally after that.
     fn rebuild_dedup_edges(&mut self) {
+        self.dedup_generation = self.dedup_generation.wrapping_add(1);
         self.dedup_complete_edges.clear();
         let edges = &mut self.dedup_complete_edges;
         self.snapshot
@@ -798,6 +818,7 @@ impl TaskJournal {
     /// stale edge is only an ordering preference, never a correctness input.
     fn note_dedup_edges(&mut self, key: &TaskKey) {
         if key.operation == Operation::Dedup {
+            self.dedup_generation = self.dedup_generation.wrapping_add(1);
             Self::insert_dedup_edges(&mut self.dedup_complete_edges, key);
         }
     }
@@ -1188,8 +1209,43 @@ impl TaskJournal {
     /// `starved`, and orders by NEITHER width nor recency — damage units all
     /// tie, so the per-project cursor in `claim_next` rotates across damaged
     /// cells instead of draining one to exhaustion.
+    ///
+    /// Memoised. `rank` IS the claim: prod measured 2.94 ms against ~1,300
+    /// candidates, and folding two ranking passes into one moved it 4.66 -> 2.94
+    /// ms — almost exactly the 3:2 the evaluation count changed by. So the lever
+    /// is evaluations per candidate, not candidates scanned.
+    ///
+    /// The entry is trusted only while all four of its witnesses hold: the time
+    /// boundary, the two bulk generations, and the task's own mutable inputs.
     fn rank(&self, task: &MaintenanceTask, now_micros: i64) -> Rank {
-        let (class, starved, width, benefit, order) = scheduling_class(task, now_micros);
+        let dedup_generation = self.dedup_generation_for(task);
+        let inputs = RankInputs::of(task);
+        if let Some(cached) = task.rank_cache.0.get()
+            && now_micros < cached.valid_until
+            && cached.generation == self.rank_generation
+            && cached.dedup_generation == dedup_generation
+            && cached.inputs == inputs
+        {
+            return cached.rank;
+        }
+        crate::observability::maintenance_stats().maintenance_rank_computations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let (rank, valid_until) = self.rank_uncached(task, now_micros);
+        task.rank_cache.0.set(Some(CachedRank { rank, valid_until, generation: self.rank_generation, dedup_generation, inputs }));
+        rank
+    }
+
+    /// `dedup_complete_edges` enters only a Dedup unit's rank and changes on
+    /// EVERY dedup completion — folding it into `rank_generation` would flush all
+    /// ~1,300 entries a few times a second for nothing.
+    fn dedup_generation_for(&self, task: &MaintenanceTask) -> u64 {
+        if task.key.operation == Operation::Dedup { self.dedup_generation } else { 0 }
+    }
+
+    /// [`Self::rank`] with the memo bypassed, plus the rank's time validity.
+    /// The oracle the cache is tested against, and the only place rank is
+    /// actually computed.
+    fn rank_uncached(&self, task: &MaintenanceTask, now_micros: i64) -> (Rank, i64) {
+        let ((class, starved, width, benefit, order), valid_until) = scheduling_class_until(task, now_micros);
         let hole = self.hole_rank(task);
         let (width, order) = if hole == 0 { (0, 0) } else { (width, order) };
         // Dedup contiguity: a slice adjacent to a COMPLETED dedup slice ranks ahead of one
@@ -1202,7 +1258,8 @@ impl TaskJournal {
                 .get(&task.key.project_id)
                 .and_then(|by_source| by_source.get(&task.key.source))
                 .is_some_and(|edges| edges.contains(&task.key.slice.start_micros) || edges.contains(&task.key.slice.end_micros));
-        (class, u8::from(hole > 0), starved, hole, u8::from(!adjacent), width, benefit, order)
+        let rank = Rank { class, hole_present: u8::from(hole > 0), starved, hole, not_adjacent: u8::from(!adjacent), width, benefit, order };
+        (rank, valid_until)
     }
 
     /// File-count spread of an operation's claimable cells, and how many of them the
@@ -1282,6 +1339,7 @@ impl TaskJournal {
     /// rank holes ahead of re-derives. Replaced wholesale, like `base_tier_ready`.
     pub fn set_tier_holes(&mut self, holes: HashSet<(String, String, String, String)>) {
         self.tier_holes = holes;
+        self.invalidate_ranks();
     }
 
     /// Replace the untagged set for ONE `(source, tier table)`, leaving every
@@ -1289,6 +1347,7 @@ impl TaskJournal {
     pub fn set_untagged_cells(&mut self, source: &str, table: &str, cells: impl IntoIterator<Item = (String, String)>) {
         self.untagged_cells.retain(|(cell_source, _, cell_table, _)| cell_source != source || cell_table != table);
         self.untagged_cells.extend(cells.into_iter().map(|(project, date)| (source.to_owned(), project, table.to_owned(), date)));
+        self.invalidate_ranks();
     }
 
     pub fn untagged_cells_len(&self) -> usize {
@@ -1299,6 +1358,7 @@ impl TaskJournal {
     /// Additive, and safe if stale: a stale entry costs one mis-ranked claim, never correctness.
     pub fn restore_untagged_cells(&mut self, cells: impl IntoIterator<Item = (String, String, String, String)>) {
         self.untagged_cells.extend(cells);
+        self.invalidate_ranks();
     }
 
     /// Every cell currently ranked as damaged, for persisting.
@@ -1310,6 +1370,7 @@ impl TaskJournal {
     /// producer runs once at startup, so without this a converged cell out-ranks real work
     /// until the next restart.
     pub fn clear_untagged_cell(&mut self, source: &str, table: &str, project: &str, date: &str) -> bool {
+        self.invalidate_ranks();
         self.untagged_cells.remove(&(source.to_owned(), project.to_owned(), table.to_owned(), date.to_owned()))
     }
 
@@ -1352,8 +1413,21 @@ impl TaskJournal {
     /// Re-derive the claimable set from scratch. Cheap relative to a claim and
     /// the only thing that bounds the permissive set's growth.
     fn rebuild_claimable(&mut self) {
-        self.claimable =
-            self.snapshot.tasks.iter().filter(|task| matches!(task.state, TaskState::Pending | TaskState::Retry)).map(|task| task.key.clone()).collect();
+        self.claimable.clear();
+        for task in self.snapshot.tasks.iter().filter(|task| matches!(task.state, TaskState::Pending | TaskState::Retry)) {
+            self.claimable.entry(task.key.operation).or_default().insert(task.key.clone());
+        }
+    }
+
+    /// Whether the claim index currently lists `key`. Tests only — the index is
+    /// permissive, so this asserts presence, never absence of stale entries.
+    #[cfg(test)]
+    fn is_indexed_claimable(&self, key: &TaskKey) -> bool {
+        self.claimable.get(&key.operation).is_some_and(|keys| keys.contains(key))
+    }
+
+    fn claimable_len(&self) -> usize {
+        self.claimable.values().map(std::collections::BTreeSet::len).sum()
     }
 
     /// Tasks of `operation` worth considering for a claim.
@@ -1362,8 +1436,13 @@ impl TaskJournal {
     /// Complete tasks against 857 Pending, and filtering all of them on three
     /// passes per claim cost 4.7 ms at 219 claims/sec — the journal mutex busy
     /// 41% of wall-clock, with a worst single claim of 3.3 s.
-    fn claim_candidates(&self, operation: Operation) -> impl Iterator<Item = &MaintenanceTask> {
-        self.claimable.iter().filter_map(move |key| self.task(key)).filter(move |task| task.key.operation == operation)
+    fn claim_candidates(&self, operation: Operation) -> impl Iterator<Item = (usize, &MaintenanceTask)> {
+        self.claimable
+            .get(&operation)
+            .into_iter()
+            .flatten()
+            .filter_map(move |key| self.task_indices.get(key).copied())
+            .filter_map(move |index| Some((index, self.snapshot.tasks.get(index)?)))
     }
 
     /// Record that `key` changed: it needs persisting, and it MIGHT now be
@@ -1377,9 +1456,14 @@ impl TaskJournal {
     /// holding too much rather than too little.
     fn mark_dirty(&mut self, key: TaskKey) {
         if self.task(&key).is_some_and(|task| matches!(task.state, TaskState::Pending | TaskState::Retry)) {
-            self.claimable.insert(key.clone());
+            self.claimable.entry(key.operation).or_default().insert(key.clone());
         }
         self.dirty_tasks.insert(key);
+    }
+
+    /// Everything memoised from `tier_holes` / `untagged_cells` is now suspect.
+    fn invalidate_ranks(&mut self) {
+        self.rank_generation = self.rank_generation.wrapping_add(1);
     }
 
     fn task(&self, key: &TaskKey) -> Option<&MaintenanceTask> {
@@ -1734,18 +1818,15 @@ impl TaskJournal {
             (NORMAL, NORMAL)
         };
 
-        // RANK ONCE per candidate, then reuse.
+        // RANK ONCE per candidate, then reuse. `rank` is the claim's cost (see
+        // its doc comment), so the lever is evaluations, not candidates.
         //
-        // `rank` is the claim's cost — prod measured 2.94 ms per claim against
-        // ~1,300 candidates, and folding the two `best_class` passes into one
-        // moved it 4.66 -> 2.94 ms, almost exactly the 3:2 the evaluation count
-        // changed by. That is the proof rank dominates: the remaining win is
-        // evaluating it once instead of twice, not scanning less.
-        //
-        // `rank` calls `hole_rank` (two set probes), `scheduling_class` and a
-        // `dedup_complete_edges` lookup, so it is microseconds, not nanoseconds.
-        let mut ranked: Vec<(Rank, &MaintenanceTask, bool, bool)> = Vec::new();
-        for task in self.claim_candidates(operation) {
+        // The scratch buffer is reused across claims — at 167 claims/sec a fresh
+        // `Vec` here is ~16 MB/s of pure allocation churn. It holds INDICES so it
+        // can live on `self` while the walk borrows `self.snapshot.tasks`.
+        let mut ranked = std::mem::take(&mut self.claim_scratch);
+        ranked.clear();
+        for (index, task) in self.claim_candidates(operation) {
             if !Self::task_can_be_claimed(task, now_micros, allow_quarantined) {
                 continue;
             }
@@ -1757,19 +1838,35 @@ impl TaskJournal {
             };
             let (in_primary, in_fallback) = (admits(primary), admits(fallback_reservation));
             if in_primary || in_fallback {
-                ranked.push((rank(self, task), task, in_primary, in_fallback));
+                ranked.push((rank(self, task), index, in_primary, in_fallback));
             }
         }
 
+        let selected = self.select_claim(&ranked, operation);
+        ranked.clear();
+        self.claim_scratch = ranked;
+        let key = selected?;
+        self.fair_cursors.insert(operation, key.project_id.clone());
+        self.mark_running(&key);
+        self.task(&key).cloned()
+    }
+
+    /// Pick the winner out of one claim's already-ranked candidates: best
+    /// reservation-admissible class, then the fair-cursor rotation within it.
+    ///
+    /// Split out so `claim_next` can hold the scratch buffer by value across it
+    /// — the borrow checker will not let one `&self` walk read a `Vec` the same
+    /// `self` owns.
+    fn select_claim(&self, ranked: &[(Rank, usize, bool, bool)], operation: Operation) -> Option<TaskKey> {
+        let task_at = |index: usize| &self.snapshot.tasks[index];
         // The reservation always falls back to the normal order, so a quiet lane
         // never idles a worker. Both minima come from the one ranking above.
         let (mut best_primary, mut best_fallback): (Option<Rank>, Option<Rank>) = (None, None);
-        for (candidate, task, in_primary, in_fallback) in &ranked {
+        for (candidate, index, in_primary, in_fallback) in ranked {
             let improves_primary = *in_primary && best_primary.is_none_or(|best| *candidate < best);
             let improves_fallback = *in_fallback && best_fallback.is_none_or(|best| *candidate < best);
-            // Same laziness as before: the dependency scan is paid only when this
-            // task would actually win something.
-            if (improves_primary || improves_fallback) && self.dependencies_complete(task) {
+            // The dependency scan is paid only when this task would actually win.
+            if (improves_primary || improves_fallback) && self.dependencies_complete(task_at(*index)) {
                 if improves_primary {
                     best_primary = Some(*candidate);
                 }
@@ -1786,12 +1883,10 @@ impl TaskJournal {
                 (&task.key.project_id, task.deadline_micros, &task.key) < (&current.key.project_id, current.deadline_micros, &current.key)
             })
         };
-        let mut fallback: Option<&MaintenanceTask> = None;
-        let mut next: Option<&MaintenanceTask> = None;
-        // Reuses the ranks above rather than recomputing them; `dependencies_complete`
-        // stays here because only the winning class needs proving.
-        for (candidate, task, _, _) in ranked.iter().filter(|(candidate, task, _, _)| *candidate == class && self.dependencies_complete(task)) {
-            let _ = candidate;
+        let (mut fallback, mut next): (Option<&MaintenanceTask>, Option<&MaintenanceTask>) = (None, None);
+        for task in
+            ranked.iter().filter(|(candidate, ..)| *candidate == class).map(|(_, index, ..)| task_at(*index)).filter(|task| self.dependencies_complete(task))
+        {
             if beats(task, fallback) {
                 fallback = Some(task);
             }
@@ -1799,10 +1894,7 @@ impl TaskJournal {
                 next = Some(task);
             }
         }
-        let key = next.or(fallback)?.key.clone();
-        self.fair_cursors.insert(operation, key.project_id.clone());
-        self.mark_running(&key);
-        self.task(&key).cloned()
+        Some(next.or(fallback)?.key.clone())
     }
 
     /// Claim exactly the requested task without changing unrelated queue entries.
@@ -2179,7 +2271,7 @@ impl TaskJournal {
         // toward the journal's full size and the claim scan slowly gets its cost
         // back.
         self.rebuild_claimable();
-        crate::observability::maintenance_stats().claimable_tasks.store(self.claimable.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        crate::observability::maintenance_stats().claimable_tasks.store(self.claimable_len() as u64, std::sync::atomic::Ordering::Relaxed);
         let dropped = self.retain_tasks(|task| {
             !matches!(task.state, TaskState::Complete | TaskState::Superseded)
                 || now_micros.saturating_sub(task.key.slice.end_micros) <= STARVATION_HORIZON_MICROS
@@ -2301,8 +2393,81 @@ impl TaskState {
     }
 }
 
-/// The claim-order tuple `claim_next` minimises: see `TaskJournal::rank`.
-type Rank = (u8, u8, u8, u8, u8, i64, i64, i64);
+/// The claim-order key `claim_next` minimises: see `TaskJournal::rank`.
+///
+/// A struct rather than a tuple because the FIELD ORDER IS THE POLICY — derived
+/// `Ord` compares in declaration order, so moving a line here silently changes
+/// what the fleet runs first.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct Rank {
+    class: u8,
+    hole_present: u8,
+    starved: u8,
+    hole: u8,
+    not_adjacent: u8,
+    width: i64,
+    benefit: i64,
+    order: i64,
+}
+
+/// The mutable task fields [`TaskJournal::rank`] reads.
+///
+/// Compared instead of hooking every mutation: `snapshot.tasks[index]` is
+/// written in eight places that bypass `task_mut`, and a missed hook would
+/// mis-order claims SILENTLY. Two field reads cost far less than `rank` and
+/// cannot be forgotten. Everything else `rank` touches is either the key (fixed
+/// for a slot) or a bulk set covered by a generation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RankInputs {
+    width: i64,
+    files: u32,
+}
+
+impl RankInputs {
+    fn of(task: &MaintenanceTask) -> Self {
+        Self { width: task.scheduling_width(), files: task.input.map_or(0, |input| input.files) }
+    }
+}
+
+/// A memoised [`Rank`] with everything needed to prove it still holds.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CachedRank {
+    rank: Rank,
+    /// First `now_micros` at which `rank` could differ. `rank` depends on time
+    /// only through STEP functions of `now - slice.end` — the frontier interval,
+    /// the starvation floor (which also flips the recency sign), and the graded
+    /// term's day steps — so the next boundary is EXACT and the cache needs no
+    /// expiry guess. See `scheduling_class_until`.
+    valid_until: i64,
+    generation: u64,
+    dedup_generation: u64,
+    inputs: RankInputs,
+}
+
+/// Interior-mutable [`CachedRank`] slot, so the claim walk memoises through
+/// `&MaintenanceTask` without `&mut` plumbing. `Cell`, not `RefCell`, because
+/// `CachedRank: Copy` — no borrow flag, no runtime cost.
+///
+/// Equality is unconditional and `Clone` yields an EMPTY slot. A cache must not
+/// make two equal tasks compare unequal, and a clone that escapes the journal
+/// (every `claim_next` returns one) must not carry a rank the journal will later
+/// invalidate without it knowing — which also makes `insert_task` safe for free.
+#[derive(Debug, Default)]
+pub(crate) struct RankCache(std::cell::Cell<Option<CachedRank>>);
+
+impl Clone for RankCache {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl PartialEq for RankCache {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for RankCache {}
 
 // How long past SEALING a partition may carry debt before it is overdue. Raising this does
 // NOT protect the query window — `starved` beats non-starved outright, so a higher threshold
@@ -2316,11 +2481,37 @@ const QUERY_WINDOW_MICROS: i64 = 14 * DAY_MICROS;
 /// which would make the far tail unreachable.
 pub(crate) const STARVATION_HORIZON_MICROS: i64 = 31 * DAY_MICROS;
 
+#[cfg(test)]
 fn scheduling_class(task: &MaintenanceTask, now_micros: i64) -> (u8, u8, i64, i64, i64) {
+    scheduling_class_until(task, now_micros).0
+}
+
+/// [`scheduling_class`], plus the first `now_micros` at which it could CHANGE.
+///
+/// Every time dependence below is a STEP function, so the boundary is exact
+/// rather than a guess: the frontier interval `[slice.start, slice.end + 24 h]`,
+/// the starvation floor at `slice.end + 3 d` (which also flips the recency
+/// sign), and the graded term's day steps past `slice.end + 31 d`. The returned
+/// value is always strictly greater than `now_micros`, which is what stops
+/// `rank`'s memo from recomputing on every call.
+///
+/// It is a bound, not a promise of change: recomputing one claim early costs a
+/// rank, recomputing one late would mis-order a claim.
+fn scheduling_class_until(task: &MaintenanceTask, now_micros: i64) -> ((u8, u8, i64, i64, i64), i64) {
+    let end = task.key.slice.end_micros;
+    let frontier_until = if task.key.operation == Operation::SealedConsolidation {
+        i64::MAX
+    } else if now_micros < task.key.slice.start_micros {
+        task.key.slice.start_micros
+    } else if now_micros <= end.saturating_add(LIVE_FRONTIER_WINDOW_MICROS) {
+        end.saturating_add(LIVE_FRONTIER_WINDOW_MICROS).saturating_add(1)
+    } else {
+        i64::MAX
+    };
     if is_frontier_task(task, now_micros) {
         // Smaller tuples run first, so negating makes the newest minute the most urgent while
         // keeping all projects in that minute deadline-equivalent.
-        (0, 0, 0, 0, -task.key.slice.end_micros.div_euclid(PRIORITY_BUCKET_MICROS))
+        ((0, 0, 0, 0, -end.div_euclid(PRIORITY_BUCKET_MICROS)), frontier_until)
     } else {
         // Newest slice first, but WIDTH outranks recency: a day-sized unit is the only kind
         // that advances the horizon, and a freshly sealed day carries ~144 ten-minute units
@@ -2329,7 +2520,15 @@ fn scheduling_class(task: &MaintenanceTask, now_micros: i64) -> (u8, u8, i64, i6
         // A SEALED task's age is how long its DATA has been sealed, NOT how long its record
         // has existed — records are re-created constantly, so a record birthday makes the
         // threshold unreachable and starves coarsened output.
-        let waited = now_micros.saturating_sub(task.key.slice.end_micros);
+        let waited = now_micros.saturating_sub(end);
+        // Below the floor the only pending change is reaching it; past it, the
+        // graded term steps once per day, so the next step is the next boundary.
+        let starve_until = if waited < STARVATION_MICROS {
+            end.saturating_add(STARVATION_MICROS)
+        } else {
+            let steps = waited.saturating_sub(STARVATION_HORIZON_MICROS).max(0) / DAY_MICROS;
+            end.saturating_add(STARVATION_HORIZON_MICROS).saturating_add(steps.saturating_add(1).saturating_mul(DAY_MICROS))
+        };
         // The horizon is a SLOPE, not a cliff: below the floor is worst, the whole
         // [floor, horizon] band ties, and each further DAY past it is one step better.
         // Graded in DAYS because `claim_next` matches the winning tuple EXACTLY — a
@@ -2355,7 +2554,7 @@ fn scheduling_class(task: &MaintenanceTask, now_micros: i64) -> (u8, u8, i64, i6
         // Keyed on the AGE, not on `starved`: the graded term is 254 in-band, not 0, so
         // testing the rank value here would flip the whole backlog to newest-first. Width
         // goes through `scheduling_width` so splitting does not demote a unit's children.
-        (1, starved, -task.scheduling_width(), benefit, if waited >= STARVATION_MICROS { recency } else { -recency })
+        ((1, starved, -task.scheduling_width(), benefit, if waited >= STARVATION_MICROS { recency } else { -recency }), frontier_until.min(starve_until))
     }
 }
 
@@ -2565,10 +2764,19 @@ impl AdmissionController {
     }
 
     pub fn with_cpu_ceiling(cpu_base: u32, cpu_max: u32, cgroup_memory_bytes: u64, object_reads: u32, object_writes: u32) -> Self {
+        use std::sync::atomic::Ordering::Relaxed;
+
         // At most 75% is trackable maintenance decode. The remainder is an
         // unconditional foreground/untracked-allocation reserve.
         let decoded_bytes = cgroup_memory_bytes.saturating_mul(3) / 4;
         let capacity = Resources { cpu: cpu_max.max(cpu_base), decoded_bytes, object_reads, object_writes };
+        let stats = crate::observability::maintenance_stats();
+        stats.maintenance_cpu_tokens_capacity.store(u64::from(capacity.cpu), Relaxed);
+        stats.maintenance_cpu_tokens_limit.store(u64::from(cpu_base.min(capacity.cpu)), Relaxed);
+        stats.maintenance_rollup_reserved_cpu_tokens.store(u64::from(rollup_reserved_cpu(cpu_base.min(capacity.cpu))), Relaxed);
+        stats.maintenance_decoded_bytes_capacity.store(capacity.decoded_bytes, Relaxed);
+        stats.maintenance_object_read_tokens_capacity.store(u64::from(capacity.object_reads), Relaxed);
+        stats.maintenance_object_write_tokens_capacity.store(u64::from(capacity.object_writes), Relaxed);
         Self(Arc::new(Mutex::new(AdmissionState { capacity, available: capacity, cpu_base })))
     }
 
@@ -2577,26 +2785,57 @@ impl AdmissionController {
     }
 
     pub fn try_acquire_for(&self, request: Resources, lane: AdmissionLane) -> Option<AdmissionPermit> {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let stats = crate::observability::maintenance_stats();
         if request.decoded_bytes > MAX_DECODED_BYTES {
+            stats.maintenance_admission_refused_decoded_bytes.fetch_add(1, Relaxed);
             return None;
         }
         let mut state = lock(&self.0);
-        if request.decoded_bytes > occupancy_scaled_ceiling(state.available.decoded_bytes, state.capacity.decoded_bytes) {
-            return None;
+        // Scale the CPU dimension by measured starvation, and hold back a slice
+        // so rollups cannot be crowded out by continuous compaction work. Every
+        // resource remains independently binding; publish refusals below so a
+        // smaller I/O or memory capacity cannot masquerade as CPU saturation.
+        let global_ceiling = lag_scaled_cpu_ceiling(state.cpu_base, state.capacity.cpu);
+        let reserved = rollup_reserved_cpu(global_ceiling);
+        let published_ceiling = u64::from(global_ceiling);
+        if stats.maintenance_cpu_tokens_limit.load(Relaxed) != published_ceiling {
+            stats.maintenance_cpu_tokens_limit.store(published_ceiling, Relaxed);
         }
-        // CPU is the dimension that actually binds — prod sat at 10 of 10 tokens
-        // with ~2,500 units eligible, 3 of 4 rewrite permits idle and the box at
-        // half its CPU limit. Scale it by measured starvation, and hold back a
-        // slice so rollups cannot be crowded out by continuous compaction work.
-        let ceiling = lag_scaled_cpu_ceiling(state.cpu_base, state.capacity.cpu);
-        let ceiling = match lane {
-            AdmissionLane::Rollup => ceiling,
-            AdmissionLane::Other => ceiling.saturating_sub(rollup_reserved_cpu(ceiling)).max(1),
+        let published_reserved = u64::from(reserved);
+        if stats.maintenance_rollup_reserved_cpu_tokens.load(Relaxed) != published_reserved {
+            stats.maintenance_rollup_reserved_cpu_tokens.store(published_reserved, Relaxed);
+        }
+        let lane_ceiling = match lane {
+            AdmissionLane::Rollup => global_ceiling,
+            AdmissionLane::Other => global_ceiling.saturating_sub(reserved).max(1),
         };
-        if state.used().cpu.saturating_add(request.cpu) > ceiling {
+        let used = state.used();
+        let mut refused = false;
+        if used.cpu.saturating_add(request.cpu) > lane_ceiling {
+            stats.maintenance_admission_refused_cpu.fetch_add(1, Relaxed);
+            refused = true;
+        }
+        if request.decoded_bytes > occupancy_scaled_ceiling(state.available.decoded_bytes, state.capacity.decoded_bytes)
+            || request.decoded_bytes > state.available.decoded_bytes
+        {
+            stats.maintenance_admission_refused_decoded_bytes.fetch_add(1, Relaxed);
+            refused = true;
+        }
+        if request.object_reads > state.available.object_reads {
+            stats.maintenance_admission_refused_object_reads.fetch_add(1, Relaxed);
+            refused = true;
+        }
+        if request.object_writes > state.available.object_writes {
+            stats.maintenance_admission_refused_object_writes.fetch_add(1, Relaxed);
+            refused = true;
+        }
+        if refused {
             return None;
         }
-        // `checked_sub` is `fits` plus the subtraction, so it is the whole gate.
+        // Every field was checked above; failure is now an internal invariant,
+        // not an unclassified admission refusal.
         state.available = state.available.checked_sub(request)?;
         Self::publish_utilization(&state);
         Some(AdmissionPermit { controller: self.clone(), resources: request })
@@ -2670,18 +2909,18 @@ mod tests {
         assert!(derived.contains(&pending) && derived.contains(&retried), "fixture must produce both claimable states");
 
         for key in &derived {
-            assert!(journal.claimable.contains(key), "claimable unit missing from the index: {key:?}");
+            assert!(journal.is_indexed_claimable(key), "claimable unit missing from the index: {key:?}");
         }
         // A unit that was NEVER claimable must never have been added.
-        assert!(!journal.claimable.contains(&running), "a unit upserted as Running was never claimable");
+        assert!(!journal.is_indexed_claimable(&running), "a unit upserted as Running was never claimable");
         // `done` WAS claimable before it completed, so a stale entry is expected and
         // correct: the set is permissive and sheds on rebuild, because holding too
         // much costs a lookup while holding too little strands a unit.
-        assert!(journal.claimable.contains(&done), "the permissive set keeps a completed unit until the next rebuild");
+        assert!(journal.is_indexed_claimable(&done), "the permissive set keeps a completed unit until the next rebuild");
         journal.rebuild_claimable();
-        assert!(!journal.claimable.contains(&done), "and the rebuild sheds it");
+        assert!(!journal.is_indexed_claimable(&done), "and the rebuild sheds it");
         for key in &derived {
-            assert!(journal.claimable.contains(key), "a rebuild must not drop a claimable unit: {key:?}");
+            assert!(journal.is_indexed_claimable(key), "a rebuild must not drop a claimable unit: {key:?}");
         }
     }
 
@@ -2697,8 +2936,8 @@ mod tests {
 
         journal.rebuild_claimable();
 
-        assert!(journal.claimable.contains(&a) && journal.claimable.contains(&b), "claimable units must survive a rebuild");
-        assert!(!journal.claimable.contains(&done), "a rebuild must shed completed units");
+        assert!(journal.is_indexed_claimable(&a) && journal.is_indexed_claimable(&b), "claimable units must survive a rebuild");
+        assert!(!journal.is_indexed_claimable(&done), "a rebuild must shed completed units");
     }
 
     /// The database restarts a couple of times a day. A unit the process shut
@@ -3034,8 +3273,8 @@ mod tests {
         // Another project's completed run must not vouch for this one: same
         // slice as `extend`, different project, and the adjacency slot reads 1.
         let other_project = task("q", day + 3 * TEN_MIN, day + 4 * TEN_MIN, Operation::Dedup);
-        assert_eq!(journal.rank(&other_project, now).4, 1, "adjacency is per (project, source)");
-        assert_eq!(journal.rank(&extend, now).4, 0, "the extender is adjacent in its own project");
+        assert_eq!(journal.rank(&other_project, now).not_adjacent, 1, "adjacency is per (project, source)");
+        assert_eq!(journal.rank(&extend, now).not_adjacent, 0, "the extender is adjacent in its own project");
     }
 
     fn task(project: &str, start: i64, end: i64, operation: Operation) -> MaintenanceTask {
@@ -5466,5 +5705,167 @@ mod tests {
         assert_eq!(admission.utilization(), Resources::default());
         assert!(admission.try_acquire(Resources { decoded_bytes: 751, ..Resources::default() }).is_none());
         assert!(admission.try_acquire(Resources { decoded_bytes: MAX_DECODED_BYTES + 1, ..Resources::default() }).is_none());
+    }
+
+    /// THE correctness argument for `rank`'s memo, as one property.
+    ///
+    /// The cache is trusted on four witnesses — a time boundary, two bulk
+    /// generations, and the task's own mutable inputs — and a memoised rank that
+    /// outlives any of them would mis-order claims SILENTLY, which no example
+    /// test reliably catches. So drive the journal through arbitrary
+    /// interleavings of the things that move each witness and assert, after every
+    /// one, that every cached rank still equals a freshly computed one.
+    ///
+    /// The time strategy straddles the boundaries deliberately: `slice.end + 24 h`
+    /// (frontier), `+ 3 d` (starvation floor and the recency sign flip), and
+    /// `+ 31 d` onward (the graded term's day steps).
+    mod memoised_rank {
+        use proptest::prelude::*;
+
+        use super::*;
+
+        /// One mutation of something `rank` reads.
+        #[derive(Clone, Debug)]
+        enum Step {
+            Advance(i64),
+            Claim(Operation),
+            Complete(usize),
+            Reinput(usize, u32),
+            Holes(bool),
+            Untagged(bool),
+        }
+
+        fn step() -> impl Strategy<Value = Step> {
+            prop_oneof![
+                // Hours, days and months, so every boundary is crossed by some run.
+                prop::sample::select(vec![0, 3_600_000_000, DAY_MICROS, 3 * DAY_MICROS, 28 * DAY_MICROS, 400 * DAY_MICROS]).prop_map(Step::Advance),
+                prop::sample::select(vec![Operation::Dedup, Operation::BaseRollup, Operation::SealedConsolidation]).prop_map(Step::Claim),
+                (0usize..6).prop_map(Step::Complete),
+                (0usize..6, 0u32..40).prop_map(|(unit, files)| Step::Reinput(unit, files)),
+                any::<bool>().prop_map(Step::Holes),
+                any::<bool>().prop_map(Step::Untagged),
+            ]
+        }
+
+        /// Six units spread across operations and ages, so no run is all-frontier
+        /// or all-sealed.
+        fn seed(journal: &mut TaskJournal, now: i64) -> Vec<TaskKey> {
+            let operations = [Operation::Dedup, Operation::BaseRollup, Operation::SealedConsolidation];
+            (0..6)
+                .map(|unit| {
+                    let end = now - i64::from(unit) * 5 * DAY_MICROS;
+                    let unit = task("p", end - DAY_MICROS, end, operations[unit as usize % operations.len()]);
+                    let key = unit.key.clone();
+                    journal.upsert(unit);
+                    key
+                })
+                .collect()
+        }
+
+        /// Every memoised rank in the journal, recomputed and compared.
+        fn assert_memo_is_transparent(journal: &TaskJournal, now: i64, after: &str) {
+            for unit in &journal.snapshot.tasks {
+                let memoised = journal.rank(unit, now);
+                let (fresh, _) = journal.rank_uncached(unit, now);
+                assert_eq!(memoised, fresh, "stale memo for {:?} at now={now} after {after}", unit.key);
+            }
+        }
+
+        fn ranks_computed() -> u64 {
+            crate::observability::maintenance_stats().maintenance_rank_computations.load(std::sync::atomic::Ordering::Relaxed)
+        }
+
+        /// The transparency property above passes VACUOUSLY for a memo that never
+        /// hits, so pin both directions: no recomputation while every witness
+        /// holds, and a recomputation the moment one moves.
+        #[test]
+        fn a_warm_rank_is_not_recomputed_until_a_witness_moves() {
+            let (_dir, mut journal) = new_journal();
+            let now = 500 * DAY_MICROS;
+            let keys = seed(&mut journal, now);
+            let unit = journal.task(&keys[0]).expect("seeded").clone();
+
+            journal.rank(&unit, now);
+            let warm = ranks_computed();
+            for _ in 0..50 {
+                journal.rank(&unit, now);
+            }
+            assert_eq!(ranks_computed(), warm, "an unchanged world must not recompute a single rank");
+
+            // One step past the boundary the class itself promised.
+            let (_, valid_until) = scheduling_class_until(&unit, now);
+            journal.rank(&unit, valid_until);
+            assert_eq!(ranks_computed(), warm + 1, "crossing `valid_until` must recompute");
+
+            // And a bulk source moving invalidates without any time passing.
+            let warm = ranks_computed();
+            journal.set_tier_holes(HashSet::new());
+            journal.rank(&unit, now);
+            assert_eq!(ranks_computed(), warm + 1, "a bulk rank input moving must recompute");
+        }
+
+        proptest! {
+            /// `valid_until` is the memo's whole safety argument: the class must be
+            /// CONSTANT across `[now, valid_until)`, or a claim is ordered on a rank
+            /// that stopped being true. Probes inside the promised interval.
+            #[test]
+            fn the_class_holds_for_exactly_as_long_as_it_promises(age_days in 0i64..400, operation in 0usize..3, probe in 0.0f64..1.0) {
+                let operations = [Operation::Dedup, Operation::BaseRollup, Operation::SealedConsolidation];
+                let now = 500 * DAY_MICROS;
+                let end = now - age_days * DAY_MICROS;
+                let unit = task("p", end - DAY_MICROS, end, operations[operation]);
+                let (class, valid_until) = scheduling_class_until(&unit, now);
+                prop_assert!(valid_until > now, "the boundary must advance, or the memo recomputes forever");
+                // `i64::MAX` means "never changes again"; probe a long way out instead.
+                let last = valid_until.min(now + 1000 * DAY_MICROS).saturating_sub(1);
+                let at = now + ((last - now) as f64 * probe) as i64;
+                prop_assert_eq!(scheduling_class_until(&unit, at).0, class, "class changed at {} inside its own validity window ending {}", at, valid_until);
+            }
+        }
+
+        proptest! {
+            #[test]
+            fn a_memoised_rank_always_equals_a_freshly_computed_one(steps in prop::collection::vec(step(), 1..24)) {
+                let (_dir, mut journal) = new_journal();
+                let mut now = 500 * DAY_MICROS;
+                let keys = seed(&mut journal, now);
+                // Keyed off the KEY, not the journal, so it does not hold a borrow
+                // across the mutations below. Same shape as `cell_of`.
+                let date = |unit: &TaskKey| chrono::DateTime::from_timestamp_micros(unit.slice.start_micros).unwrap().date_naive().to_string();
+                let cell = |unit: &TaskKey| (unit.source.clone(), unit.project_id.clone(), unit.physical_table.clone(), date(unit));
+
+                for step in steps {
+                    // Warm the memo first, so each step is mutating a POPULATED cache.
+                    assert_memo_is_transparent(&journal, now, "warm-up");
+                    let label = format!("{step:?}");
+                    match step {
+                        Step::Advance(by) => now += by,
+                        Step::Claim(operation) => {
+                            journal.claim_next(operation, now, true);
+                        }
+                        Step::Complete(unit) => {
+                            journal.complete(&keys[unit]);
+                        }
+                        // `input.files` feeds `benefit`, and this writes it through
+                        // `snapshot.tasks[index]` — one of the paths that bypasses
+                        // `task_mut` and would defeat a hook-based invalidation.
+                        Step::Reinput(unit, files) => {
+                            let index = journal.task_indices[&keys[unit]];
+                            journal.snapshot.tasks[index].input = Some(InputFootprint::new(["f"].iter(), u64::from(files)));
+                            let _ = files;
+                        }
+                        Step::Holes(set) => {
+                            let holes = if set { keys.iter().map(&cell).collect() } else { HashSet::new() };
+                            journal.set_tier_holes(holes);
+                        }
+                        Step::Untagged(set) => {
+                            let cells = if set { vec![(keys[0].project_id.clone(), date(&keys[0]))] } else { vec![] };
+                            journal.set_untagged_cells(&keys[0].source, &keys[0].physical_table, cells);
+                        }
+                    }
+                    assert_memo_is_transparent(&journal, now, &label);
+                }
+            }
+        }
     }
 }

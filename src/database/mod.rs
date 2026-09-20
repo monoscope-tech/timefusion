@@ -1178,12 +1178,15 @@ const COORDINATOR_LOOP_TIMEOUT: std::time::Duration = std::time::Duration::from_
 const COVERAGE_RECOVERY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
 
 /// How long before a unit whose source is still buffered could possibly run: the
-/// slice's end plus the write path's finalization delay, floored at five seconds.
-/// A flat retry would let buffered slices monopolize `claim_next`.
-fn buffered_source_retry_delay(slice: crate::maintenance_coordinator::TimeSlice, now_micros: i64) -> std::time::Duration {
+/// slice's end plus the write path's finalization delay, floored at five seconds
+/// and backed off for a sealed slice whose flush remains stuck. A flat five-second
+/// retry let unavailable inputs consume thousands of claims and journal commits
+/// per ten minutes while doing no work.
+fn buffered_source_retry_delay(slice: crate::maintenance_coordinator::TimeSlice, now_micros: i64, attempts: u32) -> std::time::Duration {
     const FLOOR: std::time::Duration = std::time::Duration::from_secs(5);
     let earliest = slice.end_micros.saturating_add(crate::maintenance_coordinator::FINALIZATION_DELAY_MICROS);
-    u64::try_from(earliest.saturating_sub(now_micros)).map_or(FLOOR, |micros| std::time::Duration::from_micros(micros).max(FLOOR))
+    let until_finalized = u64::try_from(earliest.saturating_sub(now_micros)).map_or(FLOOR, std::time::Duration::from_micros);
+    until_finalized.max(FLOOR).max(crate::database::maintain::transient_retry_backoff(attempts))
 }
 
 /// Absolute wall-clock ceiling for the lanes that hold a rewrite permit others are
@@ -2905,17 +2908,21 @@ impl Database {
         let maintenance_shutdown = CancellationToken::new();
         let maintenance_tasks_tracker = tokio_util::task::TaskTracker::new();
         let maintenance_cancel_guard = Arc::new(maintenance_shutdown.clone().drop_guard());
-        // Narrow so maintenance cannot saturate PGWire; I/O is latency-bound, so it gets more.
+        // Every unit holds its I/O tokens across object-store waits. Their capacity
+        // must reach the worker-slot ceiling or it silently becomes the real
+        // concurrency cap (prod: 66 slots and CPU tokens, but only 28 I/O tokens).
         let coordinator_jobs = cfg.derived.coordinator_jobs();
-        let coordinator_io_slots = u32::try_from(coordinator_jobs.saturating_mul(2)).unwrap_or(u32::MAX);
+        let coordinator_slots = cfg.derived.coordinator_job_slots();
+        let coordinator_io_slots = u32::try_from(cfg.derived.coordinator_io_slots()).unwrap_or(u32::MAX);
         // The static `coordinator_jobs` (cores/3) is the floor; an unstarved
-        // runtime may go to three quarters of the cores. Prod sat pinned at the
-        // floor with ~2,500 units eligible while the box ran at half its CPU
-        // limit, so the reservation was costing throughput it did not need to.
+        // runtime may exceed the thread count because a unit retains its token
+        // while parked on I/O. Prod sat pinned at the floor with ~2,500 units
+        // eligible while the box ran at half its CPU limit, so the reservation
+        // was costing throughput it did not need to.
         let cpu_base = u32::try_from(coordinator_jobs).unwrap_or(1);
         // The ceiling must be REACHABLE: it is what the slots are sized to, or
         // admission silently re-imposes the old cap the slots were raised past.
-        let cpu_max = u32::try_from(cfg.derived.coordinator_job_slots()).unwrap_or(cpu_base).max(cpu_base);
+        let cpu_max = u32::try_from(coordinator_slots).unwrap_or(cpu_base).max(cpu_base);
         let maintenance_admission = crate::maintenance_coordinator::AdmissionController::with_cpu_ceiling(
             cpu_base,
             cpu_max,

@@ -394,6 +394,80 @@ pub fn init_metrics(
         "Maintenance turns that ended in an error, most often a rollup aggregation losing the maintenance pool — the upstream of not_built rollup misses",
         maintenance_stats().maintenance_coordinator_errors.load(Relaxed)
     );
+    // Multi-resource admission must expose BOTH sides of every ratio. The
+    // 2026-09-20 under-utilization incident had 66 workers and CPU tokens but
+    // only 28 object-I/O tokens; used=28 alone could not identify that static
+    // capacity as the limiter.
+    observe!(gauge
+        "timefusion.maintenance.cpu_tokens_used",
+        "Maintenance CPU tokens held, including units parked on I/O",
+        maintenance_stats().maintenance_cpu_tokens_used.load(Relaxed)
+    );
+    observe!(gauge
+        "timefusion.maintenance.cpu_tokens_limit",
+        "Live lag-scaled maintenance CPU-token limit before the rollup reservation",
+        maintenance_stats().maintenance_cpu_tokens_limit.load(Relaxed)
+    );
+    observe!(gauge
+        "timefusion.maintenance.cpu_tokens_capacity",
+        "Maximum configured maintenance CPU-token capacity",
+        maintenance_stats().maintenance_cpu_tokens_capacity.load(Relaxed)
+    );
+    observe!(gauge
+        "timefusion.maintenance.rollup_reserved_cpu_tokens",
+        "CPU tokens inside the live limit reserved for rollup work",
+        maintenance_stats().maintenance_rollup_reserved_cpu_tokens.load(Relaxed)
+    );
+    observe!(gauge
+        "timefusion.maintenance.decoded_bytes_used",
+        "Estimated decoded bytes reserved by admitted maintenance units",
+        maintenance_stats().maintenance_decoded_bytes_used.load(Relaxed)
+    );
+    observe!(gauge
+        "timefusion.maintenance.decoded_bytes_capacity",
+        "Configured maintenance decoded-byte admission capacity",
+        maintenance_stats().maintenance_decoded_bytes_capacity.load(Relaxed)
+    );
+    observe!(gauge
+        "timefusion.maintenance.object_read_tokens_used",
+        "Maintenance object-read reservations currently held",
+        maintenance_stats().maintenance_object_read_tokens_used.load(Relaxed)
+    );
+    observe!(gauge
+        "timefusion.maintenance.object_read_tokens_capacity",
+        "Configured maintenance object-read reservation capacity",
+        maintenance_stats().maintenance_object_read_tokens_capacity.load(Relaxed)
+    );
+    observe!(gauge
+        "timefusion.maintenance.object_write_tokens_used",
+        "Maintenance object-write reservations currently held",
+        maintenance_stats().maintenance_object_write_tokens_used.load(Relaxed)
+    );
+    observe!(gauge
+        "timefusion.maintenance.object_write_tokens_capacity",
+        "Configured maintenance object-write reservation capacity",
+        maintenance_stats().maintenance_object_write_tokens_capacity.load(Relaxed)
+    );
+    observe!(counter
+        "timefusion.maintenance.admission_refused_cpu",
+        "Maintenance reservations refused because the requesting lane reached its CPU-token limit",
+        maintenance_stats().maintenance_admission_refused_cpu.load(Relaxed)
+    );
+    observe!(counter
+        "timefusion.maintenance.admission_refused_decoded_bytes",
+        "Maintenance reservations refused by aggregate or occupancy-scaled decoded-memory admission",
+        maintenance_stats().maintenance_admission_refused_decoded_bytes.load(Relaxed)
+    );
+    observe!(counter
+        "timefusion.maintenance.admission_refused_object_reads",
+        "Maintenance reservations refused because object-read tokens were exhausted",
+        maintenance_stats().maintenance_admission_refused_object_reads.load(Relaxed)
+    );
+    observe!(counter
+        "timefusion.maintenance.admission_refused_object_writes",
+        "Maintenance reservations refused because object-write tokens were exhausted",
+        maintenance_stats().maintenance_admission_refused_object_writes.load(Relaxed)
+    );
     observe!(gauge
         "timefusion.maintenance.permits_available",
         "Free hygiene rewrite permits. Pinned at 0 while the lane is wedged",
@@ -1299,10 +1373,25 @@ atomic_stats! {
         /// queues the cell on. Structurally impossible now that both sides share
         /// one rule; any non-zero value is a regression of the 2026-09-15 wedge.
         compaction_invariant_violations as "compaction_invariant_violations",
+        /// Admission capacities and the live lag-scaled CPU limit. Without these,
+        /// a used-token gauge pinned at 28 cannot distinguish saturation from an
+        /// accidental 28-token configuration ceiling.
+        maintenance_cpu_tokens_capacity as "cpu_tokens_capacity",
+        maintenance_cpu_tokens_limit as "cpu_tokens_limit",
+        maintenance_rollup_reserved_cpu_tokens as "rollup_reserved_cpu_tokens",
+        maintenance_decoded_bytes_capacity as "decoded_bytes_capacity",
+        maintenance_object_read_tokens_capacity as "object_read_tokens_capacity",
+        maintenance_object_write_tokens_capacity as "object_write_tokens_capacity",
         maintenance_cpu_tokens_used as "cpu_tokens_used",
         maintenance_decoded_bytes_used as "decoded_bytes_used",
         maintenance_object_read_tokens_used as "object_read_tokens_used",
         maintenance_object_write_tokens_used as "object_write_tokens_used",
+        /// Refused reservations by binding dimension. Several counters may rise
+        /// for one request when several resources are exhausted simultaneously.
+        maintenance_admission_refused_cpu as "admission_refused_cpu_total",
+        maintenance_admission_refused_decoded_bytes as "admission_refused_decoded_bytes_total",
+        maintenance_admission_refused_object_reads as "admission_refused_object_reads_total",
+        maintenance_admission_refused_object_writes as "admission_refused_object_writes_total",
         /// Aggregates that fell through to a raw scan, plus the breakdown by reason —
         /// the reason is the only thing that distinguishes "never built" from "the
         /// source moved under it" from "unsupported shape".
@@ -1340,6 +1429,14 @@ atomic_stats! {
         /// task count means the permissive set is not being re-derived, and the
         /// claim scan is paying for dead tasks again.
         claimable_tasks as "claimable_tasks",
+        /// Ranks actually COMPUTED, against `coordinator_claim.count` from the
+        /// block stats. `rank` is the claim's whole cost, so this ratio is the
+        /// scheduler's efficiency in one number: it was ~1,300 per claim before
+        /// the memo and should sit near the count of newly enqueued or newly
+        /// aged units. A ratio climbing back toward the candidate count means
+        /// something is invalidating the memo every claim — suspect the bulk
+        /// generations first.
+        maintenance_rank_computations as "maintenance_rank_computations_total",
         /// Derived units retried because their BASE tier does not cover the slice
         /// they were asked to build. Publishing anyway would trust a short cell
         /// permanently, since the witness is the RAW partition. Read as a RATE:

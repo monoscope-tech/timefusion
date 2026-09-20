@@ -233,14 +233,15 @@ fn a_slice_that_has_not_finished_backs_off_past_its_own_end() {
     let day = TimeSlice::new(0, 24 * HOUR).expect("day slice");
 
     // Today's day-wide unit cannot succeed before midnight plus finalization.
-    let delay = super::buffered_source_retry_delay(day, now);
+    let delay = super::buffered_source_retry_delay(day, now, 12);
     let expected = (24 * HOUR - now + FINALIZATION_DELAY_MICROS) as u64;
     assert_eq!(delay.as_micros() as u64, expected, "a unit must wait out the rest of its own slice, not 5 seconds");
     assert!(delay.as_secs() > 4 * 3_600, "the old 5s retry is what made this an unbounded spin");
 
     // A sealed slice merely waiting on a slow flush keeps the fast floor.
     let sealed = TimeSlice::new(0, HOUR).expect("sealed slice");
-    assert_eq!(super::buffered_source_retry_delay(sealed, now).as_secs(), 5, "an already-sealed slice keeps the fast retry");
+    assert_eq!(super::buffered_source_retry_delay(sealed, now, 0).as_secs(), 5, "a newly blocked sealed slice keeps the fast retry");
+    assert_eq!(super::buffered_source_retry_delay(sealed, now, 12).as_secs(), 64, "a persistently blocked slice backs off instead of churning the journal");
 }
 
 /// A pending unit for one rollup tier must not veto planning another tier of
@@ -2957,10 +2958,11 @@ async fn database_bounds_concurrent_maintenance_jobs() -> Result<()> {
     let request = Resources { cpu: 1, decoded_bytes: MAX_DECODED_BYTES, object_reads: 1, object_writes: 1 };
 
     // `coordinator_jobs` is the FLOOR of the ceiling, not its cap: the ceiling is
-    // lag-scaled, so an idle runtime admits up to `cores * 3/4` and a starved one
-    // falls back to exactly `jobs`. Asserting an exact count made this test pass
-    // or fail on how busy the runner happened to be. The invariants that actually
-    // matter are that admission is BOUNDED and that every token comes back.
+    // lag-scaled, so an idle runtime may exceed the thread count to cover I/O wait
+    // and a starved one falls back to exactly `jobs`. Asserting an exact count made
+    // this test pass or fail on how busy the runner happened to be. The invariants
+    // that actually matter are that admission is BOUNDED and that every token comes
+    // back.
     const RUNAWAY: usize = 512;
     let mut permits = Vec::new();
     while permits.len() < RUNAWAY {

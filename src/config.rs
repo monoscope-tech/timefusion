@@ -536,6 +536,17 @@ impl DerivedBudget {
         (self.cores * 3 / 2).clamp(self.coordinator_jobs(), 128)
     }
 
+    /// Concurrent object-store operations maintenance admission may reserve.
+    ///
+    /// Every coordinator unit reserves one read and one write token for its
+    /// whole lifetime, including time parked on object storage. Consequently
+    /// either I/O capacity being below [`Self::coordinator_job_slots`] is also a
+    /// hard cap on in-flight units. Keep these capacities together: raising only
+    /// the worker and CPU ceilings leaves the old concurrency limit in force.
+    pub fn coordinator_io_slots(&self) -> usize {
+        self.coordinator_job_slots()
+    }
+
     /// OS threads for the maintenance runtime. This — not the slot count — is
     /// what bounds maintenance CPU, so it tracks the box rather than the queue.
     /// Reads keep priority through thread niceness, not through starving this.
@@ -620,6 +631,10 @@ impl DerivedBudget {
             coordinator_share_gb = self.coordinator_share_bytes() / GIB,
             heavy_share_gb = self.heavy_share_bytes() / GIB,
             light_share_gb = self.light_share_bytes() / GIB,
+            coordinator_jobs = self.coordinator_jobs(),
+            coordinator_job_slots = self.coordinator_job_slots(),
+            coordinator_io_slots = self.coordinator_io_slots(),
+            coordinator_runtime_threads = self.coordinator_runtime_threads(),
             rewrite_permits = self.rewrite_permits(),
             optimize_merge_tasks = self.optimize_merge_tasks(),
             light_optimize_k_at_11_hot_projects = self.light_optimize_k(11),
@@ -2260,10 +2275,11 @@ mod tests {
     /// coordinator pool must scale with the jobs sharing it, and the three
     /// maintenance shares must still sum to the pool. Each job's slice must also
     /// clear `ExternalSorterMerge`'s 32 MB floor, or units fail instead of spilling.
-    #[test_case::test_case(80, 48, 2..=16 ; "prod-shaped box must run maintenance in parallel")]
-    #[test_case::test_case(16, 4, 1..=2 ; "a 4-core box must not run maintenance wide")]
-    #[test_case::test_case(8, 4, 1..=2 ; "a tiny box stays modest rather than thrashing")]
-    fn coordinator_jobs_and_pool_scale_with_the_box(limit_gb: usize, cores: usize, jobs: std::ops::RangeInclusive<usize>) {
+    #[test_case::test_case(120, 44, 2..=16, 66 ; "current prod box keeps every admission dimension reachable")]
+    #[test_case::test_case(80, 48, 2..=16, 72 ; "prod-shaped box must run maintenance in parallel")]
+    #[test_case::test_case(16, 4, 1..=2, 6 ; "a 4-core box must not run maintenance wide")]
+    #[test_case::test_case(8, 4, 1..=2, 6 ; "a tiny box stays modest rather than thrashing")]
+    fn coordinator_jobs_and_pool_scale_with_the_box(limit_gb: usize, cores: usize, jobs: std::ops::RangeInclusive<usize>, expected_slots: usize) {
         let b = DerivedBudget::from_limits(limit_gb * GIB, cores);
         let committed = b.query_pool_bytes() + b.buffer_max_bytes() + b.foyer_memory_bytes() + b.writer_reserve_bytes() + b.maintenance_pool_bytes();
         assert!(committed <= limit_gb * GIB, "{limit_gb} GiB box over-committed: {committed}");
@@ -2287,9 +2303,11 @@ mod tests {
             "{limit_gb} GiB/{cores}-core: slots must never sit below the admission floor, {slots} < {}",
             b.coordinator_jobs()
         );
-        assert!(
-            slots >= (cores * 3 / 4).min(64).max(b.coordinator_jobs()),
-            "{limit_gb} GiB/{cores}-core: slots must reach the admission ceiling (cores*3/4), got {slots}"
+        assert_eq!(slots, expected_slots, "{limit_gb} GiB/{cores}-core: worker slots must cover I/O wait without running unbounded");
+        assert_eq!(
+            b.coordinator_io_slots(),
+            slots,
+            "{limit_gb} GiB/{cores}-core: every worker reserves I/O for its lifetime, so I/O admission must not make slots unreachable"
         );
         // Every admitted unit reserves at most MAX_DECODED_BYTES, so concurrent
         // decode reservation must still fit the maintenance pool.

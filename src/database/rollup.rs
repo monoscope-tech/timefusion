@@ -513,6 +513,7 @@ impl Database {
                             migrated_tasks,
                             runtime_workers = coordinator_runtime_workers,
                             job_workers = coordinator_job_workers,
+                            io_slots = db.config.derived.coordinator_io_slots(),
                             event = "maintenance_runtime_started"
                         );
 

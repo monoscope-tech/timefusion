@@ -370,10 +370,10 @@ mod batch_rows_tests {
     }
 }
 
-/// How long a unit waits after the pool turned it away for being busy. Backs off
-/// without splitting — the unit is the right size, the pool had no room — and is
-/// capped so a lane recovers quickly once the pool drains.
-fn admission_backoff(attempts: u32) -> std::time::Duration {
+/// Exponential delay for a transient prerequisite that has not changed yet.
+/// Capping it lets a lane notice recovery promptly without repeatedly claiming,
+/// journaling, and releasing work that cannot make progress.
+pub(super) fn transient_retry_backoff(attempts: u32) -> std::time::Duration {
     std::time::Duration::from_secs(1u64 << attempts.min(6))
 }
 
@@ -779,7 +779,7 @@ impl Database {
     /// into a `retry_task` argument: the temporary lives to the end of the
     /// statement and `retry_task` takes the same non-reentrant mutex.
     pub(crate) fn admission_backoff_for(&self, key: &crate::maintenance_coordinator::TaskKey) -> std::time::Duration {
-        admission_backoff(self.journal().attempts(key))
+        transient_retry_backoff(self.journal().attempts(key))
     }
 
     /// Push a coordinator task's next attempt out by `delay`, journaled and checkpointed.
@@ -1176,6 +1176,7 @@ impl Database {
                     parent_measured_bytes: None,
                     preflight_decoded_bytes: None,
                     backfill_priority_micros: None,
+                    rank_cache: Default::default(),
                 }
             };
             let mut partitions: HashMap<(String, chrono::NaiveDate), Vec<CompactionDebtFile>> = HashMap::new();
@@ -1725,7 +1726,7 @@ impl Database {
         let retry = |reason: String, delay: std::time::Duration| -> Result<bool> { self.retried(&key, reason, delay) };
 
         if self.buffered_layer().is_some_and(|layer| layer.has_rows_in_range(&key.project_id, &key.source, key.slice.start_micros, key.slice.end_micros)) {
-            return retry("source_not_flushed".to_owned(), buffered_source_retry_delay(key.slice, crate::support::now_micros()));
+            return retry("source_not_flushed".to_owned(), buffered_source_retry_delay(key.slice, crate::support::now_micros(), task.attempts));
         }
         let Some(date) = chrono::DateTime::from_timestamp_micros(key.slice.start_micros).map(|time| time.date_naive()) else {
             return retry("invalid_slice_timestamp".to_owned(), std::time::Duration::from_secs(3_600));
@@ -1791,7 +1792,7 @@ impl Database {
         let Some(_permit) = self.maintenance_admission.try_acquire(request) else {
             // Deliberately NOT `resource_admission`: that reason makes `retry_or_split`
             // split the unit. The request is clamped, so a refusal means only "busy now".
-            return retry("admission_busy".to_owned(), admission_backoff(task.attempts));
+            return retry("admission_busy".to_owned(), transient_retry_backoff(task.attempts));
         };
         let probe_hash_shards = usize::try_from(estimated_bytes.div_ceil(MAX_DECODED_BYTES).clamp(1, DEDUP_BUCKET_COUNT)).unwrap_or(1);
         let limits = DedupExecutionLimits {
@@ -1961,7 +1962,7 @@ impl Database {
         if !derived
             && self.buffered_layer().is_some_and(|layer| layer.has_rows_in_range(&key.project_id, &key.source, key.slice.start_micros, key.slice.end_micros))
         {
-            return retry("source_not_flushed".to_owned(), buffered_source_retry_delay(key.slice, crate::support::now_micros()));
+            return retry("source_not_flushed".to_owned(), buffered_source_retry_delay(key.slice, crate::support::now_micros(), task.attempts));
         }
 
         // The witness must describe the RAW source partition: the read path verifies
@@ -3069,7 +3070,7 @@ impl Database {
             _ => crate::maintenance_coordinator::AdmissionLane::Other,
         };
         let Some(_permit) = self.maintenance_admission.try_acquire_for(request, lane) else {
-            return self.retried(&key, "admission_busy".to_owned(), admission_backoff(task.attempts));
+            return self.retried(&key, "admission_busy".to_owned(), transient_retry_backoff(task.attempts));
         };
         note(2);
         let table_ref = match self.resolve_table(&key.project_id, &key.source).await {
@@ -8753,18 +8754,24 @@ mod rollup_journal_persist_tests {
         // Every call bumps the source epoch, so the CONTENT differs every time — only the
         // staleness window stops these.
         let before = counts();
+        let started = std::time::Instant::now();
         for hour in 0..13u32 {
             db.apply_rollup_hours(&project, "otel_logs_and_spans", &date, 1 << hour)?;
             db.commit_journal()?;
         }
-        let after = counts();
-        assert_eq!(after.0, before.0, "13 commits inside the staleness window must not each pay two fsyncs");
-        assert_eq!(after.2 - before.2, 13, "and each must be counted as deferred, not silently dropped");
+        let (after, elapsed) = (counts(), started.elapsed());
+        // Bounded by the WINDOW, not by a fixed count. Asserting zero writes here
+        // bets that 13 checkpoint fsyncs fit inside one second, which is a wall-clock
+        // race the test does not mean to make and which CI's disk loses: it failed
+        // there while passing locally. The invariant is the coalescing ratio.
+        let windows = 1 + (elapsed.as_secs_f64() / Database::ROLLUP_JOURNAL_MAX_STALENESS.as_secs_f64()) as u64;
+        assert!(after.0 - before.0 <= windows, "13 commits must pay at most one write per staleness window, not {} in {elapsed:?}", after.0 - before.0);
+        assert_eq!(after.2 - before.2 + (after.0 - before.0), 13, "and every commit must be accounted for — deferred or written, never silently dropped");
 
         // Deferred is not dropped: shutdown has no later commit to carry the write, so it
         // forces one and the journal on disk holds the hours those commits marked.
         db.flush_rollup_journal()?;
-        assert_eq!(counts().0 - after.0, 1, "shutdown must flush what the window deferred");
+        assert!(counts().0 - after.0 <= 1, "shutdown must flush what the window deferred, in one write");
         let persisted = crate::rollup_journal::load(&db.config.core.timefusion_data_dir);
         let entry =
             persisted.iter().find(|entry| entry.project_id == project && entry.date == date).expect("the partition must be on disk after a forced flush");

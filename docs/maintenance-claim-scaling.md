@@ -181,90 +181,112 @@ already gives, but to skip pointless verifies after a bulk change.
 `O(log N)` selection, and keying per operation shards it six ways so lanes stop
 contending. But the win is the rank count, not the ordering: ~1,300 -> ~1.
 
-## 5d. Concrete plan, and where Rust does the work for us
+## 5d. Landed: D1, D4, D5 and the property that guards them
 
 The invariant that matters is *a claim is never made on a stale rank*. In most
-languages that is a code-review rule. Here it can be a COMPILE ERROR.
+languages that is a code-review rule. Here most of it is a type or a property.
 
-**D1. Make the rank a type, not a tuple.**
+**D1. `Rank` is a struct, not a tuple.** Derived `Ord` compares in declaration
+order, so the field order IS the scheduling policy — now it is eight named
+fields instead of eight positions, and `.4` at a call site is `.not_adjacent`.
 
-```rust
-// Was: type Rank = (u8, u8, u8, u8, u8, i64, i64, i64);
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
-struct Rank { class: u8, hole_present: u8, starved: u8, hole: u8,
-              not_adjacent: u8, width: i64, benefit: i64, order: i64 }
-```
+**D4. The rank is memoised, and the cache key is EXACT.**
 
-Derived `Ord` keeps the exact field order, so ordering semantics are unchanged —
-but the fields get names, and `BTreeSet<(Rank, _)>` sorts correctly for free.
-Today an accidental field reorder silently changes scheduling priority; after
-this it is a named struct literal.
+The insight that makes this sound rather than heuristic: `rank` depends on time
+only through STEP functions of `waited = now - slice.end` — the frontier interval
+`[start, end + 24 h]`, the starvation floor at `end + 3 d` (which also flips the
+recency sign), and the graded term's day steps past `end + 31 d`. So
+`scheduling_class_until` returns the class AND the first `now` at which it could
+change, computed next to the comparisons it mirrors. No expiry guess, no drift.
 
-**D2. Make "verified" unforgeable — the core Rust leverage.**
+A cached entry is trusted on four witnesses:
 
-```rust
-/// A rank recomputed against the CURRENT world and found equal to the cached one.
-///
-/// Only `pop_verified` mints this, and `claim` demands it, so "claimed on a stale
-/// rank" is not a bug you can write — it does not typecheck.
-#[must_use]
-pub(crate) struct Verified(Rank);
-```
+| witness | moved by |
+|---|---|
+| `valid_until` | time |
+| `rank_generation` | `set_tier_holes`, `set_untagged_cells`, `restore_untagged_cells`, `clear_untagged_cell` |
+| `dedup_generation` | every dedup completion — consulted ONLY by Dedup units, or ~1,300 entries would flush a few times a second |
+| `RankInputs` | the task's own `scheduling_width()` and `input.files` |
 
-`claim_next` takes `Verified`, never a bare `Rank`. The silent-wrong-order
-failure mode stops being a thing to test for and becomes a thing to compile.
+`RankInputs` is the interesting one. The obvious design clears the cache from
+every mutation site, but `snapshot.tasks[index]` is written in EIGHT places that
+bypass `task_mut`, and a missed hook there mis-orders claims silently — the same
+shape as the `mark_dirty`-before-`insert_task` bug in §4, which the compiler
+could not catch. Comparing two scalar fields costs far less than `rank` and
+cannot be forgotten. The cache carries no invalidation protocol at all.
 
-**D3. Cheap keys — stop hashing strings in the hot path.**
+`Cell<Option<CachedRank>>`, not `RefCell`: `CachedRank` is `Copy`, so the walk
+memoises through `&MaintenanceTask` with no borrow flag and no `&mut` plumbing.
+`Clone` yields an EMPTY slot, which makes `insert_task` and every task that
+escapes via `claim_next` safe for free; `PartialEq` is unconditional, because a
+cache must not make two equal tasks compare unequal. `#[serde(skip)]` keeps it
+out of the journal file.
 
-`TaskKey` holds three `String`s, so every `self.task(key)` in the candidate walk
-pays a string hash. A generational slot makes it a `Copy` integer:
+**Per-operation claim index.** `claimable` is now keyed by `Operation`, so a
+claim walks its own lane's keys instead of all six lanes' and discarding
+five-sixths after the `TaskKey` hash.
 
-```rust
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-struct Slot { index: u32, generation: u32 }   // generation survives `retain_tasks`
-```
+**D5. The claim allocates nothing.** The ranked-candidate buffer lives on the
+journal and is reused; it holds INDICES, not references, so it can be owned by
+the same `self` the walk borrows. At 167 claims/sec that is ~16 MB/s of pure
+allocation churn removed.
 
-The ordered set becomes `BTreeSet<(Rank, Slot)>`: comparisons are integer
-compares, lookups are a bounds-checked index, and a slot freed by pruning fails
-its generation check instead of aliasing a new task. This is the arena/slotmap
-pattern, and it is what makes the pop path allocation-free.
+**D6. One property is the whole correctness argument.**
 
-**D4. Interior mutability for the cache, so the walk stays `&self`.**
+> After any interleaving of enqueues, completions, claims, time advances, input
+> rewrites and bulk-set replacements, every memoised rank equals a freshly
+> computed one.
 
-`Cell<Option<Rank>>` on the task: `Cell` is `Copy`-only and has no runtime cost,
-so caching during an immutable walk needs no `RefCell` borrow checks and no
-`&mut` plumbing. Exclude it from `PartialEq`/`Serialize` by hand — a cache must
-not make two equal tasks compare unequal, and must never reach the journal file.
+`rank_uncached` is both the only place rank is computed and the oracle it is
+checked against. The time strategy straddles every boundary deliberately, and
+the input-rewrite step writes through `snapshot.tasks[index]` on purpose — the
+path a hook-based design would have missed.
 
-**D5. No allocation per claim.**
+Two more pin what the property alone cannot:
 
-5a introduces a per-claim `Vec`. Hoist it to a scratch buffer owned by the
-journal and `clear()` it each time: at 167 claims/sec that is ~16 MB/s of
-allocation avoided, and the buffer reaches steady-state capacity immediately.
+- **The memo must actually HIT.** A cache that never hits satisfies
+  transparency vacuously. So: 50 ranks over an unchanged world compute ZERO, and
+  crossing `valid_until` or moving a bulk source computes exactly one.
+- **`valid_until` must be honest.** The class is probed at arbitrary points
+  inside `[now, valid_until)` and must be unchanged. Recomputing one claim early
+  costs a rank; recomputing one late mis-orders a claim.
 
-**D6. Prove the invariant with `proptest` (already a dependency).**
+**Measure it with `maintenance_rank_computations_total`** against
+`coordinator_claim.count`. That ratio is the scheduler's efficiency in one
+number: ~1,300 before, and it should now track newly enqueued or newly aged
+units rather than candidates walked. A ratio climbing back toward the candidate
+count means something invalidates every claim — suspect the generations first.
 
-The property is exact and worth stating as one:
+Expect ~0.2-0.5 ms per claim, NOT the 50 us an earlier draft implied: the walk
+still pays one `TaskKey` hash (three strings) per candidate. That residual is
+what D3 below exists to remove, so do not read 0.3 ms as the memo failing.
 
-> For any sequence of enqueues, mutations, time advances and bulk-source
-> changes, `claim_next` returns the same task as a brute-force scan that ranks
-> every candidate from scratch.
+## 5e. Still to do — D2 and D3, the ordered set
 
-That is the whole correctness argument for 5b in one test, and proptest will find
-the interleaving a hand-written case would not. Pair it with a shrink-friendly
-model: a `Vec<MaintenanceTask>` and the naive selector.
+Held back deliberately: verify-on-pop has two design gaps §5b glosses over, and
+neither blocks the win above.
 
-**D7. Sequence.**
+**The reservation turns break naive pop-min.** On a sealed turn you pop past
+every class-0 entry to reach sealed work. Worse, on a WINDOW turn the rank order
+is inverted with respect to what the turn wants — starved units sort FIRST
+(small `starved`) and window units LAST (`starved = u8::MAX`) — so with no
+frontier work pending, pop-min walks the entire starved backlog, and that
+degenerate case is exactly the deep backlog the turn exists to serve. It needs
+per-band sets with lazy migration on pop, or a hybrid: ordered set for the normal
+and sealed turns, memoised linear scan for window and horizon.
 
-1. D1 (Rank struct) — mechanical, no behaviour change, lands alone.
-2. D6's property test against the CURRENT selector — establishes the oracle
-   while the implementation is still the simple one.
-3. D4 + cached rank, still linear scan. Measure: expect ~2.94 ms -> ~50 us.
-4. D2 + D3 + ordered set with verify-on-pop. Measure: expect ~1 rank per claim.
-5. D5 once the shape is settled.
+**A min-rank task failing `dependencies_complete`** must go to a side buffer for
+the duration of the claim, or verify-on-pop loops on it forever.
 
-Steps 1-3 are where the measured win is. Step 4 is what makes it hold at 50x.
-The property test from step 2 guards every step after it.
+When they are built, D2 and D3 are what make them safe and cheap:
+
+- **D2, `#[must_use] struct Verified(Rank)`** — minted only by `pop_verified`,
+  demanded by `claim`. "Claimed on a stale rank" stops being a thing to test for
+  and becomes a thing that does not typecheck.
+- **D3, a generational `Slot { index: u32, generation: u32 }`** replacing
+  `TaskKey` in the set. Integer compares instead of three string hashes, and a
+  slot freed by pruning fails its generation check rather than aliasing a new
+  task.
 
 ## 5c. What to keep from the turn machinery
 
