@@ -1481,7 +1481,7 @@ impl Database {
                                         shard_after = shard_after.saturating_add(batch.num_rows());
                                         // Without this, `run_until_idle` cannot tell a long
                                         // rewrite from a stall and kills it at the deadline.
-                                        crate::database::maintain::note_unit_progress(batch.num_rows());
+                                        crate::database::maintain::note_unit_progress_yielding(batch.num_rows()).await;
                                         decoded_bytes = decoded_bytes.saturating_add(batch.get_array_memory_size());
                                         let casted = deltalake::kernel::schema::cast_record_batch(&batch, target_schema.clone(), true, true)?;
                                         let wrote_at = std::time::Instant::now();

@@ -595,6 +595,22 @@ impl Drop for TaskLease {
         );
         if outcome == Some(TaskState::Running) {
             let failure = self.failure.get_mut().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+            // A unit that never started is not a worker failure. `mark_running`
+            // already charged it an attempt and `abandon_running` would charge a
+            // `worker_error` and a backoff on top — then SPLIT it at two attempts
+            // and quarantine it at `QUARANTINE_ATTEMPTS`. The database restarts a
+            // couple of times a day, so without this a unit merely UNLUCKY with
+            // deploys is punished as if it had repeatedly failed.
+            // `None` means we are outside a unit scope, which is read as "it ran":
+            // never guess a unit into a free retry.
+            let did_no_work = crate::database::maintain::current_unit_progress() == Some(0);
+            if failure.is_none() && did_no_work {
+                journal.release_unstarted(&self.key);
+                if let Err(error) = journal.checkpoint() {
+                    tracing::error!(error = %error, task = ?self.key, "failed to checkpoint unstarted maintenance task release");
+                }
+                return;
+            }
             journal.abandon_running(&self.key, crate::support::now_micros(), failure.as_deref());
             if let Err(error) = journal.checkpoint() {
                 tracing::error!(error = %error, task = ?self.key, "failed to checkpoint maintenance task lease recovery");
@@ -1788,6 +1804,25 @@ impl TaskJournal {
     /// not meet. Once is a blip: back off and retry whole. Twice means the slice does not fit
     /// its deadline, so bisect TIME (byte splitting does not cover this). Only positive
     /// evidence of a DETERMINISTIC plan error in `failure` suppresses the bisect.
+    /// Give a claimed unit back WITHOUT charging it an attempt.
+    ///
+    /// `mark_running` increments `attempts` at claim time, so a unit released
+    /// before doing any work must give that increment back or a restart looks
+    /// exactly like a failed run. Returns false when the unit is not Running,
+    /// which is the racy-but-harmless case of a concurrent state change.
+    pub fn release_unstarted(&mut self, key: &TaskKey) -> bool {
+        let Some(task) = self.task_mut(key) else { return false };
+        if task.state != TaskState::Running {
+            return false;
+        }
+        task.state = TaskState::Pending;
+        task.attempts = task.attempts.saturating_sub(1);
+        task.retry_reason = None;
+        self.dirty_tasks.insert(key.clone());
+        crate::observability::maintenance_stats().maintenance_unstarted_releases.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        true
+    }
+
     pub fn abandon_running(&mut self, key: &TaskKey, now_micros: i64, failure: Option<&str>) {
         if let Some(error) = failure.filter(|failure| is_schema_failure(failure)) {
             self.park_schema_failure(key, now_micros, error);
@@ -2509,6 +2544,36 @@ mod tests {
         for benign in ["dedup: Object at location ... not found", "compaction: transaction failed: version 2667 already exists", "resource_admission"] {
             assert!(!is_schema_failure(benign), "must not park a unit that would succeed on a retry: {benign}");
         }
+    }
+
+    /// The database restarts a couple of times a day. A unit the process shut
+    /// down on BEFORE it ran must come back untouched: `mark_running` already
+    /// charged it an attempt, and charging a second one via `abandon_running`
+    /// would SPLIT it at two (`SplitTrigger::RepeatedFailure`) and quarantine it
+    /// at `QUARANTINE_ATTEMPTS` — punishing a unit that was merely unlucky with
+    /// deploys as though it had failed repeatedly.
+    #[test]
+    fn a_unit_released_before_it_ran_is_not_charged_an_attempt() {
+        let (_dir, mut journal) = new_journal();
+        let key = running_unit(&mut journal, task("p", 0, DAY_MICROS, Operation::BaseRollup), 1);
+
+        assert!(journal.release_unstarted(&key), "a Running unit must be releasable");
+
+        let unit = journal.tasks().find(|candidate| candidate.key == key).expect("still queued");
+        assert_eq!(unit.state, TaskState::Pending, "it must go back to the queue, not to Retry");
+        assert_eq!(unit.attempts, 0, "the claim's attempt must be given back, got {}", unit.attempts);
+        assert!(unit.retry_reason.is_none(), "a release is not a failure and must not carry a retry reason");
+    }
+
+    /// Releasing is only correct for a unit that is actually claimed; anything
+    /// else means a concurrent state change won the race and must be left alone.
+    #[test]
+    fn releasing_a_unit_that_is_not_running_changes_nothing() {
+        let (_dir, mut journal) = new_journal();
+        let key = upserted(&mut journal, task("p", 0, DAY_MICROS, Operation::BaseRollup));
+
+        assert!(!journal.release_unstarted(&key), "a Pending unit is not ours to release");
+        assert_eq!(journal.tasks().find(|c| c.key == key).expect("present").attempts, 0);
     }
 
     /// A missing column cannot be halved away: every CHILD of a bisection names

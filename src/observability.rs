@@ -1330,6 +1330,11 @@ atomic_stats! {
         /// Structurally unservable by any rollup definition, so this must stay
         /// out of `unwalkable_source` — that one is meant to be drivable to zero.
         rollup_miss_multi_scan_source as "rollup_miss_multi_scan_source_total",
+        /// Units handed back WITHOUT being charged an attempt because the process
+        /// shut down before they did any work. Read as a RESTART cost: it should
+        /// track deploys, and a rise without one means units are being claimed
+        /// and dropped for some other reason.
+        maintenance_unstarted_releases as "maintenance_unstarted_releases_total",
         /// Derived units retried because their BASE tier does not cover the slice
         /// they were asked to build. Publishing anyway would trust a short cell
         /// permanently, since the witness is the RAW partition. Read as a RATE:

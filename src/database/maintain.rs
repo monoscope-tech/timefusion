@@ -130,6 +130,47 @@ mod liveness_clock_tests {
     };
     use std::time::Duration;
 
+    /// A long unit must let its neighbours run.
+    ///
+    /// Both futures are spawned on a SINGLE-threaded runtime, so the only way the
+    /// second makes progress is if the first hands the thread back. Without the
+    /// `consume_budget` in `note_unit_progress_yielding` the first future has no
+    /// await point in its loop at all, so it runs to completion first — which is
+    /// also why `tokio::time::timeout` and shutdown cancellation could not fire
+    /// against a busy unit.
+    #[test]
+    fn a_long_unit_yields_to_its_neighbours() {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
+        let order = Arc::new(std::sync::Mutex::new(Vec::<&'static str>::new()));
+        let progress = Arc::new(AtomicU64::new(0));
+
+        runtime.block_on(async {
+            let long = {
+                let order = Arc::clone(&order);
+                let progress = Arc::clone(&progress);
+                tokio::spawn(super::UNIT_PROGRESS.scope(progress, async move {
+                    // Enough batches to exhaust the cooperative budget several times.
+                    for _ in 0..4096 {
+                        super::note_unit_progress_yielding(1).await;
+                    }
+                    order.lock().expect("lock").push("long");
+                }))
+            };
+            let short = {
+                let order = Arc::clone(&order);
+                tokio::spawn(async move {
+                    tokio::task::yield_now().await;
+                    order.lock().expect("lock").push("short");
+                })
+            };
+            let (_, _) = tokio::join!(long, short);
+        });
+
+        let order = order.lock().expect("lock").clone();
+        assert_eq!(order.first().copied(), Some("short"), "the short unit must run before the long one finishes, got {order:?}");
+        assert_eq!(progress.load(Relaxed), 4096, "every batch must still be counted");
+    }
+
     /// Every liveness test here runs against the same 30s idle window, uncapped.
     async fn run_capped<T>(progress: &Arc<AtomicU64>, work: impl std::future::Future<Output = T>) -> Result<T, tokio::time::error::Elapsed> {
         super::run_until_idle_capped(Duration::from_secs(30), None, Arc::clone(progress), work).await
@@ -482,9 +523,43 @@ tokio::task_local! {
     static UNIT_OPERATION: &'static str;
 }
 
+/// Rows the current unit has written, or `None` outside a unit scope.
+///
+/// `TaskLease::drop` uses this to tell "the process shut down before this unit
+/// did anything" from "this unit failed". Outside a scope it returns `None`,
+/// which callers must read as "assume it ran" — the conservative direction.
+pub(crate) fn current_unit_progress() -> Option<u64> {
+    UNIT_PROGRESS.try_with(|progress| progress.load(std::sync::atomic::Ordering::Relaxed)).ok()
+}
+
 /// Report that the current maintenance unit wrote `rows`; no-op outside a unit.
 pub(crate) fn note_unit_progress(rows: usize) {
     let _ = UNIT_PROGRESS.try_with(|progress| progress.fetch_add(rows as u64, std::sync::atomic::Ordering::Relaxed));
+}
+
+/// Report progress AND give the runtime a chance to switch units.
+///
+/// A maintenance unit is one long `async` body whose expensive parts — parquet
+/// decode, sort, merge — are SYNCHRONOUS work inside `poll()`. Tokio's
+/// cooperative budget only covers tokio's own primitives, so such a loop can
+/// hold a runtime thread with no await point in it at all. Two things follow,
+/// and the second is the important one:
+///
+/// - ready units on that thread do not run, however short they are; and
+/// - NOTHING that needs an await point can fire. `shutdown_by` records a unit
+///   "running 5,051s against a 900s deadline" because it "observes cancellation
+///   only at its next checkpoint", and `PERMIT_PHASES` records the same trap —
+///   "`tokio::time::timeout` cannot preempt a future that never reaches an await
+///   point". The deadline and the shutdown cancellation are already written; they
+///   simply had nowhere to land.
+///
+/// `consume_budget` rather than `yield_now`: it yields only once this task's
+/// cooperative budget is spent, so a short unit pays nothing while a long decode
+/// loop reliably lets its neighbours in. `yield_now` yields unconditionally and
+/// would add a scheduler round-trip to every batch.
+pub(crate) async fn note_unit_progress_yielding(rows: usize) {
+    note_unit_progress(rows);
+    tokio::task::consume_budget().await;
 }
 
 /// Keep the current unit's liveness clock alive while its physical plan is still
@@ -6381,7 +6456,7 @@ impl Database {
                     rows_staged += batch.num_rows();
                     // The unit is alive as long as this moves; `run_until_idle`
                     // reads it instead of a fixed budget.
-                    note_unit_progress(batch.num_rows());
+                    note_unit_progress_yielding(batch.num_rows()).await;
                     let casted = deltalake::kernel::schema::cast_record_batch(&batch, target_schema.clone(), true, true)?;
                     let wrote_at = std::time::Instant::now();
                     writer.write(casted).await.map_err(|e| anyhow::anyhow!("hot bin stage: {e}"))?;

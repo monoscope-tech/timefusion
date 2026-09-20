@@ -58,7 +58,7 @@ mod index;
 pub(crate) use compact::DEFAULT_BIN_MINUTES;
 pub use histogram::CapturedHistogram;
 pub(crate) use histogram::{HistogramDmlGuard, HistogramDmlScope};
-mod maintain;
+pub(crate) mod maintain;
 mod rollup;
 mod scan;
 mod write;
