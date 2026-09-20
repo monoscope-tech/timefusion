@@ -8,6 +8,9 @@ use super::*;
 /// Nice value for maintenance runtime threads. Positive = lower priority, so the
 /// kernel schedules the pgwire runtime ahead of compaction whenever both are
 /// runnable. 5 is a clear preference without starving maintenance outright.
+/// Only `setpriority` reads it, and only on Linux — prod is the only place this
+/// applies, but a dev build on macOS must not fail `-D warnings` over it.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const MAINTENANCE_THREAD_NICE: i32 = 5;
 
 /// Longest an idle coordinator worker parks without an enqueue signal.
