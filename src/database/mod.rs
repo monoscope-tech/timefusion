@@ -2391,6 +2391,11 @@ pub struct Database {
     /// Durable slice work from the same pre-ack invalidation path as `rollup_dirty`; the
     /// finer-grained source of truth coordinator workers consume.
     maintenance_tasks: Arc<std::sync::Mutex<crate::maintenance_coordinator::TaskJournal>>,
+    /// Raised whenever work is enqueued, so idle coordinator workers wake on the
+    /// event instead of rediscovering it on the next poll. `Notify` is tokio's
+    /// primitive for exactly this; the loop kept a one-second sleep as its only
+    /// wakeup, which is a second of idle cores every time a backlog reappears.
+    maintenance_work: Arc<tokio::sync::Notify>,
     maintenance_admission: crate::maintenance_coordinator::AdmissionController,
     maintenance_debt_planned_at: Arc<std::sync::atomic::AtomicI64>,
     /// Last Tantivy coverage census. Metadata-only, so it is throttled by time, not by admission.
@@ -2908,7 +2913,9 @@ impl Database {
         // floor with ~2,500 units eligible while the box ran at half its CPU
         // limit, so the reservation was costing throughput it did not need to.
         let cpu_base = u32::try_from(coordinator_jobs).unwrap_or(1);
-        let cpu_max = u32::try_from(cfg.derived.cores * 3 / 4).unwrap_or(cpu_base).max(cpu_base);
+        // The ceiling must be REACHABLE: it is what the slots are sized to, or
+        // admission silently re-imposes the old cap the slots were raised past.
+        let cpu_max = u32::try_from(cfg.derived.coordinator_job_slots()).unwrap_or(cpu_base).max(cpu_base);
         let maintenance_admission = crate::maintenance_coordinator::AdmissionController::with_cpu_ceiling(
             cpu_base,
             cpu_max,
@@ -2973,6 +2980,7 @@ impl Database {
             rollup_journal_persisted: Arc::new(std::sync::Mutex::new(PersistedRollupJournal::default())),
             journal_group_commit: Arc::new(crate::support::GroupCommit::default()),
             maintenance_tasks: Arc::new(std::sync::Mutex::new(maintenance_tasks)),
+            maintenance_work: Arc::new(tokio::sync::Notify::new()),
             maintenance_admission,
             maintenance_debt_planned_at: Arc::new(std::sync::atomic::AtomicI64::new(i64::MIN)),
             tantivy_census_at: Arc::new(std::sync::atomic::AtomicI64::new(i64::MIN)),

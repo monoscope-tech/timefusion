@@ -5,6 +5,14 @@
 
 use super::*;
 
+/// Nice value for maintenance runtime threads. Positive = lower priority, so the
+/// kernel schedules the pgwire runtime ahead of compaction whenever both are
+/// runnable. 5 is a clear preference without starving maintenance outright.
+const MAINTENANCE_THREAD_NICE: i32 = 5;
+
+/// Longest an idle coordinator worker parks without an enqueue signal.
+const COORDINATOR_IDLE_BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
+
 impl Database {
     pub(super) fn rollup_generation_current(source: &str, target: &str, project: &str, date: &str, coverage: &RollupCoverage) -> bool {
         let Some(spec) = get_schema(source).and_then(|schema| schema.rollups.iter().find(|spec| spec.table_name(source) == target)) else {
@@ -401,8 +409,10 @@ impl Database {
         // workers. It needs headroom beyond the job count — timers, cancellation
         // and object-store I/O run on it too, and sizing it to exactly the jobs
         // lets a blocking decode stall the timers that would cancel it.
-        let coordinator_job_workers = self.config.derived.coordinator_jobs();
-        let coordinator_runtime_workers = (self.config.derived.cores / 8).clamp(2, 4).max(coordinator_job_workers + 2);
+        let coordinator_job_workers = self.config.derived.coordinator_job_slots();
+        // Threads track the BOX, slots track the queue: tying threads to slots
+        // would spawn 50 threads for 32 cores the moment slots grew.
+        let coordinator_runtime_workers = self.config.derived.coordinator_runtime_threads();
         db.maintenance_debt_planned_at.store(crate::support::now_micros(), std::sync::atomic::Ordering::Relaxed);
         {
             let db = Arc::clone(&db);
@@ -410,6 +420,27 @@ impl Database {
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(coordinator_runtime_workers)
                 .thread_name("maintenance-worker")
+                // READS WIN. Maintenance may fill every idle core, but the kernel
+                // must prefer the pgwire runtime whenever both are runnable, or
+                // expanding the slot count would buy backlog throughput with query
+                // latency. `nice` is the cheapest expression of that: it costs
+                // nothing while the box is idle and only bites under contention.
+                // ClickHouse lowers background-merge thread priority for the same
+                // reason. The admission ceiling still backs maintenance off when
+                // `runtime_lag_ms` shows the query runtime actually starving —
+                // niceness is the fast, per-timeslice guard, admission the slow one.
+                .on_thread_start(|| {
+                    // LINUX ONLY on purpose: Linux scopes `PRIO_PROCESS` to the
+                    // calling THREAD, which is what we want. macOS scopes it to the
+                    // whole process, so running this on a dev box would quietly
+                    // deprioritise the server itself.
+                    #[cfg(target_os = "linux")]
+                    // SAFETY: sets the calling thread's nice value; a denial under a
+                    // restricted sandbox is not worth failing boot over.
+                    unsafe {
+                        libc::setpriority(libc::PRIO_PROCESS, 0, MAINTENANCE_THREAD_NICE);
+                    }
+                })
                 .enable_all()
                 .build()
                 .map_err(|error| anyhow::anyhow!("failed to build maintenance runtime: {error}"))?;
@@ -512,8 +543,21 @@ impl Database {
                                             false
                                         }
                                     };
-                                    if idle && cancel.run_until_cancelled(tokio::time::sleep(std::time::Duration::from_secs(1))).await.is_none() {
-                                        return;
+                                    if idle {
+                                        // Wake on the ENQUEUE, not on a timer. The sleep
+                                        // stays as a floor so a notify that races an idle
+                                        // worker cannot park it indefinitely.
+                                        let woken = cancel
+                                            .run_until_cancelled(async {
+                                                tokio::select! {
+                                                    () = db.maintenance_work.notified() => {}
+                                                    () = tokio::time::sleep(COORDINATOR_IDLE_BACKOFF) => {}
+                                                }
+                                            })
+                                            .await;
+                                        if woken.is_none() {
+                                            return;
+                                        }
                                     }
                                 }
                             });

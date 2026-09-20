@@ -506,6 +506,43 @@ impl DerivedBudget {
         })
     }
 
+    /// Worker TASK slots for the maintenance coordinator.
+    ///
+    /// Distinct from `coordinator_jobs`, which is the admission CPU *floor* and
+    /// the per-job memory divisor. Slots decide how many units can be IN FLIGHT;
+    /// admission decides how many may hold resources. Sizing slots to the floor
+    /// made the ceiling unreachable: prod 2026-09-20 ran 4,432 queued rollups and
+    /// 950 queued dedups at 43% of a 3200% CPU limit, because only ten worker
+    /// tasks existed to claim them. Admission allowed 24 and never saw a request
+    /// for more than 10.
+    ///
+    /// Prior art both points past the core/3 we had. ClickHouse multiplies
+    /// `background_pool_size` by `background_merges_mutations_concurrency_ratio`
+    /// (default 2) so merges outnumber threads; RocksDB sizes
+    /// `max_background_jobs` toward the core count, bounded by device throughput.
+    /// Our units are S3-bound, and an async task awaiting object storage parks
+    /// instead of holding a thread, so slots must exceed threads to keep the
+    /// cores fed.
+    ///
+    /// Memory stays bounded because admission gates `decoded_bytes` globally: an
+    /// extra slot can only ever be REFUSED, never overcommit the pool.
+    pub fn coordinator_job_slots(&self) -> usize {
+        // MORE slots than threads, deliberately. A unit holds its `cpu: 1` token
+        // across S3 reads, where it is parked and burning no CPU at all, so tokens
+        // systematically OVERCOUNT processor use. Sizing slots to the core count
+        // therefore leaves cores idle exactly in proportion to how I/O-bound the
+        // work is — and ours is very: a dedup probe is mostly object-store wait.
+        // Threads (`coordinator_runtime_threads`) remain the real CPU bound.
+        (self.cores * 3 / 2).clamp(self.coordinator_jobs(), 128)
+    }
+
+    /// OS threads for the maintenance runtime. This — not the slot count — is
+    /// what bounds maintenance CPU, so it tracks the box rather than the queue.
+    /// Reads keep priority through thread niceness, not through starving this.
+    pub fn coordinator_runtime_threads(&self) -> usize {
+        self.cores.clamp(4, 64)
+    }
+
     /// K with the project-count term removed (memory × CPU only) — sizes the
     /// light pool slice, which cannot depend on the tick's plan.
     pub fn max_light_optimize_k(&self) -> usize {
@@ -2240,6 +2277,20 @@ mod tests {
             return;
         }
         assert!(jobs.contains(&b.coordinator_jobs()), "{limit_gb} GiB/{cores}-core: expected {jobs:?} jobs, got {}", b.coordinator_jobs());
+        // Slots are what decide how many units can be IN FLIGHT, and they must be
+        // able to reach the admission CEILING — sizing them to the floor left prod
+        // at 43% CPU with thousands of units queued, because no worker existed to
+        // ask for the headroom admission was willing to grant.
+        let slots = b.coordinator_job_slots();
+        assert!(
+            slots >= b.coordinator_jobs(),
+            "{limit_gb} GiB/{cores}-core: slots must never sit below the admission floor, {slots} < {}",
+            b.coordinator_jobs()
+        );
+        assert!(
+            slots >= (cores * 3 / 4).min(64).max(b.coordinator_jobs()),
+            "{limit_gb} GiB/{cores}-core: slots must reach the admission ceiling (cores*3/4), got {slots}"
+        );
         // Every admitted unit reserves at most MAX_DECODED_BYTES, so concurrent
         // decode reservation must still fit the maintenance pool.
         assert!(

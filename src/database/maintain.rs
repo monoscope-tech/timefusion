@@ -1607,6 +1607,15 @@ impl Database {
     ) -> Option<(crate::maintenance_coordinator::MaintenanceTask, Option<tokio::sync::OwnedSemaphorePermit>)> {
         let permit = Arc::clone(&self.maintenance_quarantine_slots).try_acquire_owned().ok();
         let task = {
+            // `claim_next` makes up to three full passes over the operation's task
+            // list while holding the journal mutex, so its cost scales with the
+            // BACKLOG while its rate scales with the worker slots — the two things
+            // this change raises. It is ~0.1% of a worker today; measure it rather
+            // than assume, because the point at which it serialises is a rate we
+            // are deliberately driving up. If `max_us` climbs toward the unit
+            // runtime, move claiming to a single dispatcher feeding workers over an
+            // mpsc, which removes the shared lock by construction.
+            let _claim = crate::observability::BlockWatch::new("coordinator_claim");
             let mut journal = self.journal();
             let now = crate::support::now_micros();
             match selection {
@@ -5245,6 +5254,8 @@ impl Database {
         if self.dedup_dirty_bins.insert(key, ()).is_none() {
             crate::observability::maintenance_stats().dirty_bin_enqueued.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             info!(project_id, table_name, date, bin, event = "dirty_bin_enqueued");
+            // Wake idle workers now rather than letting them sleep out the poll.
+            self.maintenance_work.notify_waiters();
             self.persist_dirty_bins();
         }
     }
