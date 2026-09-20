@@ -5,6 +5,10 @@ on:
     branches: [master, main]
   pull_request:
     branches: [master, main]
+  # Lets `autoformat.yml` start this run for its own commit. A push made with
+  # GITHUB_TOKEN triggers nothing, so without this an autofmt commit on master is
+  # never built, tested or deployed.
+  workflow_dispatch:
 
 permissions:
   contents: write # to publish attestation refs under refs/ci-attest/*

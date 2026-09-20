@@ -58,6 +58,38 @@ class SupersedeTest(unittest.TestCase):
             lease, commits = repo(pathlib.Path(directory), ['src/main.rs'])
             self.assertFalse(only_undeployable(lease, commits[0], commits[0]), 'an empty diff must not be read as a docs-only difference')
 
+    def test_an_autofmt_commit_does_not_supersede(self):
+        """An autofmt commit changes `.rs`, so only the AUTHOR distinguishes it.
+
+        It is pushed with GITHUB_TOKEN, which triggers no workflow, so deferring
+        to it leaves production on the old image indefinitely — three hours on
+        2026-09-20, across two commits, every deploy job green.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            lease, commits = repo(pathlib.Path(directory), ['src/main.rs'], ['src/main.rs'])
+            subprocess.run(
+                ['git', '-C', str(lease.root), 'commit', '--amend', '--no-edit', '--author',
+                 'github-actions[bot] <github-actions[bot]@users.noreply.github.com>'],
+                check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            head = subprocess.run(['git', '-C', str(lease.root), 'rev-parse', 'HEAD'], check=True, text=True, stdout=subprocess.PIPE).stdout.strip()
+            subprocess.run(['git', '-C', str(lease.root), 'push', '--quiet', '--force', 'origin', 'master'], check=True)
+            self.assertTrue(only_undeployable(lease, commits[0], head), 'a bot commit starts no rollout of its own, so it must not cancel this one')
+
+    def test_a_human_commit_after_a_bot_one_still_supersedes(self):
+        """Mixed authorship means a real push followed, and that one WILL deploy."""
+        with tempfile.TemporaryDirectory() as directory:
+            lease, commits = repo(pathlib.Path(directory), ['src/main.rs'], ['src/a.rs'], ['src/b.rs'])
+            self.assertFalse(only_undeployable(lease, commits[0], commits[2]), 'a human commit in the range must still defer the rollout')
+
+    def test_the_autofmt_workflow_starts_its_own_rollout(self):
+        """The net above only exists because the dispatch can fail; both must hold."""
+        autofmt = (ROOT / '.github/workflows/autoformat.yml').read_text()
+        self.assertIn('gh workflow run', autofmt, 'autoformat must dispatch its own CI and deploy')
+        for flow in ('ci.yml', 'deploy.yml'):
+            text = (ROOT / '.github/workflows' / flow).read_text()
+            self.assertRegex(text, r'(?m)^\s*workflow_dispatch:', f'{flow} must accept the dispatch autoformat sends')
+
     def test_ignore_list_matches_the_workflow(self):
         """Drift here is silent: the workflow would skip a path this still defers on."""
         # Parsed rather than yaml-loaded so the check needs no third-party module.

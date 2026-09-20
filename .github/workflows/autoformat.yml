@@ -11,6 +11,7 @@ on:
 
 permissions:
   contents: write
+  actions: write # to dispatch CI and the deploy for our own commit
 
 # One run per branch at a time; a fix-commit superseding the triggering push
 # cancels the now-stale run instead of racing it.
@@ -73,3 +74,21 @@ jobs:
           git add -A
           git commit -m "chore(autofmt): apply cargo fmt + clippy --fix [skip autofmt]"
           git push origin "HEAD:${{ github.ref_name }}"
+          echo "pushed=true" >> "$GITHUB_OUTPUT"
+        id: push
+
+      # A push made with GITHUB_TOKEN deliberately triggers no workflow, so the
+      # commit above is never built, tested or deployed on its own. Meanwhile the
+      # rollout for the commit we just superseded sees a newer master and declines
+      # — and reports SUCCESS. On 2026-09-20 that combination held production
+      # three hours behind master across two commits with nothing reporting a gap.
+      # Dispatching explicitly is the fix; `only_undeployable` in the deploy script
+      # is the net under it.
+      - name: Start CI and the deploy for the commit we just pushed
+        if: steps.push.outputs.pushed == 'true' && github.ref_name == 'master'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          for flow in ci.yml deploy.yml; do
+            gh workflow run "$flow" --ref master || echo "could not dispatch $flow"
+          done

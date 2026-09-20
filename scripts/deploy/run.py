@@ -78,7 +78,10 @@ UNDEPLOYABLE = ('docs/', 'bench/')
 
 
 def only_undeployable(lease, current, master):
-    """Whether `master` differs from `current` by nothing that could change the image.
+    """Whether deferring to `master` would leave production on the OLD image forever.
+
+    Deferring is only correct when the newer commit runs a rollout of its own.
+    Two kinds do not, and both have taken prod down for hours:
 
     A documentation merge landing seconds after a code merge used to cancel that
     code deploy: the rollout saw a newer master and declined, while the docs push
@@ -86,16 +89,30 @@ def only_undeployable(lease, current, master):
     result was a green deploy job and a production box still running the previous
     image, with nothing reporting the gap (2026-09-10, PR #251).
 
+    An AUTOFMT commit is the same hole through a different door. It changes `.rs`
+    files, so the path test above says "deployable" and the rollout defers — but
+    it is pushed with `GITHUB_TOKEN`, which by design triggers no workflow, so
+    nothing follows. On 2026-09-20 this pinned production three hours behind
+    master across two separate commits while every deploy job reported success.
+    `autoformat.yml` now dispatches the follow-up run explicitly, which is the
+    real fix; this stays as the net, because a deploy that silently does nothing
+    is the one failure the rollout must never report as success. Deploying
+    `current` is safe even when the dispatch DID work: autofmt only rewrites
+    formatting, so the two commits build the same program.
+
     Fails CLOSED. If the newer commits cannot be fetched or inspected, the answer
     is False and the rollout defers exactly as it did before.
     """
     try:
         lease.git('fetch', '--quiet', '--depth=50', 'origin', master)
         changed = lease.git('diff', '--name-only', f'{current}..{master}').splitlines()
+        authors = lease.git('log', '--format=%ae', f'{current}..{master}').splitlines()
     except subprocess.CalledProcessError:
         return False
     if not changed:
         return False
+    if authors and all(author.endswith('github-actions[bot]@users.noreply.github.com') for author in authors):
+        return True
     return all(path.startswith(UNDEPLOYABLE) or path.endswith('.md') for path in changed)
 
 

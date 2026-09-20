@@ -21,6 +21,10 @@ on:
       - 'docs/**'
       - '**/*.md'
       - 'bench/**'
+  # Lets `autoformat.yml` start this run for its own commit. A push made with
+  # GITHUB_TOKEN triggers nothing, so without this an autofmt commit on master is
+  # never built, tested or deployed.
+  workflow_dispatch:
 
 # Serialize deploys. Keep the active build alive: GitHub concurrency already
 # retains at most one pending run and replaces older pending runs with the
