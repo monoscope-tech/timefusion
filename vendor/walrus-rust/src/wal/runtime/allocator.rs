@@ -324,9 +324,7 @@ mod tests {
         std::thread::spawn(move || {
             let _ = tx.send(unsafe { probe.get_next_available_block() }.is_err());
         });
-        let still_answers = rx
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .expect("allocator wedged: the failed rollover never released the state lock");
+        let still_answers = rx.recv_timeout(std::time::Duration::from_secs(5)).expect("allocator wedged: the failed rollover never released the state lock");
         assert!(still_answers, "the root is still a file, so this must error rather than hand out a block");
 
         let _ = std::fs::remove_file(&root);
