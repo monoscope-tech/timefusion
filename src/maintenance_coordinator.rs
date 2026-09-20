@@ -557,6 +557,10 @@ pub struct TaskJournal {
 pub struct TaskLease {
     journal: Arc<Mutex<TaskJournal>>,
     key: TaskKey,
+    /// Teardown signal. The unstarted release is scoped to SHUTDOWN and nothing
+    /// else: a unit that errors through `?` also reaches `Drop` with no recorded
+    /// failure, and refunding its attempt would retry it with no backoff at all.
+    shutdown: tokio_util::sync::CancellationToken,
     started_micros: i64,
     /// Why the unit is about to fail, when the failing path knows. Errors leave
     /// a run function through `?` and reach [`Drop`] carrying nothing, so
@@ -566,8 +570,8 @@ pub struct TaskLease {
 }
 
 impl TaskLease {
-    pub fn new(journal: Arc<Mutex<TaskJournal>>, key: TaskKey) -> Self {
-        Self { journal, key, started_micros: crate::support::now_micros(), failure: Mutex::new(None) }
+    pub fn new(journal: Arc<Mutex<TaskJournal>>, key: TaskKey, shutdown: tokio_util::sync::CancellationToken) -> Self {
+        Self { journal, key, shutdown, started_micros: crate::support::now_micros(), failure: Mutex::new(None) }
     }
 
     /// Annotate the error on its way out: `lease.note_failure(error)?`.
@@ -601,10 +605,13 @@ impl Drop for TaskLease {
             // and quarantine it at `QUARANTINE_ATTEMPTS`. The database restarts a
             // couple of times a day, so without this a unit merely UNLUCKY with
             // deploys is punished as if it had repeatedly failed.
-            // `None` means we are outside a unit scope, which is read as "it ran":
-            // never guess a unit into a free retry.
+            // SHUTDOWN ONLY, and only with nothing written. A unit that errors
+            // through `?` reaches here with no recorded failure too, so without the
+            // teardown check this would refund its attempt and re-run it with no
+            // backoff — a hot loop. `None` progress means we are outside a unit
+            // scope, read as "it ran": never guess a unit into a free retry.
             let did_no_work = crate::database::maintain::current_unit_progress() == Some(0);
-            if failure.is_none() && did_no_work {
+            if failure.is_none() && did_no_work && self.shutdown.is_cancelled() {
                 journal.release_unstarted(&self.key);
                 if let Err(error) = journal.checkpoint() {
                     tracing::error!(error = %error, task = ?self.key, "failed to checkpoint unstarted maintenance task release");
@@ -2565,6 +2572,24 @@ mod tests {
         assert!(unit.retry_reason.is_none(), "a release is not a failure and must not carry a retry reason");
     }
 
+    /// The release is scoped to TEARDOWN. A unit that errored through `?` reaches
+    /// `Drop` with no recorded failure and may also have written nothing, so
+    /// without the shutdown check it would be refunded its attempt and re-run
+    /// immediately — no backoff, a hot loop on a unit that is failing.
+    #[test]
+    fn a_unit_that_failed_without_shutdown_still_backs_off() {
+        let (_dir, mut journal) = new_journal();
+        let key = running_unit(&mut journal, task("p", 0, DAY_MICROS, Operation::BaseRollup), 1);
+        let now = 1_000_000_000;
+
+        // What `Drop` does when the process is NOT tearing down.
+        journal.abandon_running(&key, now, None);
+
+        let unit = journal.tasks().find(|candidate| candidate.key == key).expect("present");
+        assert_eq!(unit.state, TaskState::Retry, "a failure must go to Retry, not back to the queue");
+        assert!(unit.deadline_micros > now, "and must carry a backoff, got {}", unit.deadline_micros);
+    }
+
     /// Releasing is only correct for a unit that is actually claimed; anything
     /// else means a concurrent state change won the race and must be left alone.
     #[test]
@@ -3554,7 +3579,7 @@ mod tests {
         journal.checkpoint().expect("running checkpoint");
         let journal = Arc::new(Mutex::new(journal));
         let before_drop = crate::support::now_micros();
-        drop(TaskLease::new(Arc::clone(&journal), key.clone()));
+        drop(TaskLease::new(Arc::clone(&journal), key.clone(), tokio_util::sync::CancellationToken::new()));
 
         let journal_guard = journal.lock().expect("lock");
         assert_eq!(journal_guard.state(&key), Some(TaskState::Retry));
@@ -3575,7 +3600,7 @@ mod tests {
         assert!(journal.mark_running(&key));
         assert!(journal.complete(&key));
         let journal = Arc::new(Mutex::new(journal));
-        drop(TaskLease::new(Arc::clone(&journal), key.clone()));
+        drop(TaskLease::new(Arc::clone(&journal), key.clone(), tokio_util::sync::CancellationToken::new()));
 
         let guard = journal.lock().expect("lock");
         assert_eq!(guard.state(&key), Some(TaskState::Complete), "a completed unit must survive its own lease drop");

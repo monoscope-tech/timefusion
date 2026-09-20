@@ -1720,7 +1720,7 @@ impl Database {
         let Some((task, _quarantine_slot)) = self.claim_coordinator_task(selection) else { return Ok(false) };
         let key = task.key.clone();
         self.log_task_started(&task);
-        let _lease = crate::maintenance_coordinator::TaskLease::new(Arc::clone(&self.maintenance_tasks), key.clone());
+        let _lease = crate::maintenance_coordinator::TaskLease::new(Arc::clone(&self.maintenance_tasks), key.clone(), (*self.maintenance_shutdown).clone());
         // Parks the unit and reports it as "ran" — every early exit here is a retry.
         let retry = |reason: String, delay: std::time::Duration| -> Result<bool> { self.retried(&key, reason, delay) };
 
@@ -1939,7 +1939,7 @@ impl Database {
         let Some((task, _quarantine_slot)) = self.claim_coordinator_task(selection) else { return Ok(false) };
         let key = task.key.clone();
         self.log_task_started(&task);
-        let lease = crate::maintenance_coordinator::TaskLease::new(Arc::clone(&self.maintenance_tasks), key.clone());
+        let lease = crate::maintenance_coordinator::TaskLease::new(Arc::clone(&self.maintenance_tasks), key.clone(), (*self.maintenance_shutdown).clone());
         let retry = |reason: String, delay: std::time::Duration| -> Result<bool> { self.retried(&key, reason, delay) };
         let Some(source_schema) = get_schema(&key.source) else { return retry("source_schema_missing".to_owned(), std::time::Duration::from_secs(300)) };
         let Some(spec) = source_schema.rollups.iter().find(|spec| spec.table_name(&key.source) == key.physical_table) else {
@@ -3057,7 +3057,7 @@ impl Database {
         note(1);
         let key = task.key.clone();
         self.log_task_started(&task);
-        let _lease = TaskLease::new(Arc::clone(&self.maintenance_tasks), key.clone());
+        let _lease = TaskLease::new(Arc::clone(&self.maintenance_tasks), key.clone(), (*self.maintenance_shutdown).clone());
         let retry = |reason: String, seconds: u64| -> Result<bool> { self.retried(&key, reason, std::time::Duration::from_secs(seconds)) };
         // The request must be the unit's own size, or the occupancy-scaled ceiling
         // refuses everything on a busy pool.
