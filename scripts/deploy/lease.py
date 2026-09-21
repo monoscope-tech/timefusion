@@ -33,6 +33,46 @@ STALE_SECONDS = 1800
 # still refuses.
 MUTATING_DEAD_SECONDS = 7200
 
+# Clock skew allowance between the runner (which stamps `started`) and the box
+# (which stamps `boot_micros`). Applied so that only a CLEARLY older boot counts
+# as proof, since the dangerous mistake is calling a live rollout dead.
+BOOT_SKEW_SECONDS = 120
+
+
+def production_booted_before(started):
+    """Whether the process serving production now predates `started`.
+
+    Proof that a rollout never replaced anything. A mutating lease is otherwise
+    unreclaimable until `MUTATING_DEAD_SECONDS`, which blocks every later deploy
+    for two hours — and on 2026-09-21 three drain timeouts in a row meant that
+    penalty landed three times, each needing a person to check the same two facts
+    and delete the ref by hand.
+
+    Those two facts are mechanical, so this asks them instead. `boot_micros` is
+    the serving process's own boot stamp, the same value `record-boot.sh` reads,
+    so it reports the process actually answering queries rather than whatever an
+    orchestrator believes it scheduled.
+
+    Fail-safe in every direction: no `PGURL`, an unreachable database, a missing
+    row, an unparsable answer, or a boot that is merely close to `started` all
+    return False — "cannot prove it, leave the lease alone".
+    """
+    url = os.environ.get('PGURL')
+    if not url or not started:
+        return False
+    query = "SELECT value FROM timefusion_stats WHERE component = 'buffered_layer' AND key = 'boot_micros'"
+    try:
+        probe = subprocess.run(['psql', url, '-v', 'ON_ERROR_STOP=1', '-Atqc', query], capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if probe.returncode != 0:
+        return False
+    try:
+        boot_seconds = int(probe.stdout.strip()) / 1_000_000
+    except ValueError:
+        return False
+    return boot_seconds < started - BOOT_SKEW_SECONDS
+
 
 def run_is_finished(run_id):
     """True only when GitHub states this run is no longer active.
@@ -109,11 +149,21 @@ class DeploymentLease:
             record = json.loads(self.git('show', commit + ':record.json'))
         except (subprocess.CalledProcessError, ValueError):
             return False
-        age = time.time() - record.get('started', time.time())
+        started = record.get('started', time.time())
+        age = time.time() - started
         if record.get('mutating') is not False:
             # Reclaimable only once the holder is PROVABLY gone. Age alone never
             # qualifies a mutating lease, and a holder we cannot ask about never does.
-            return age >= MUTATING_DEAD_SECONDS and run_is_finished(record.get('run_id'))
+            if not run_is_finished(record.get('run_id')):
+                return False
+            # A finished run cannot still be mid-rollout, and a serving process
+            # older than the rollout was never replaced by it. Together those are
+            # conclusive, so the two-hour grace — which exists for the case where
+            # neither can be established — does not apply.
+            if production_booted_before(started):
+                print('Production still serves a process that predates lease ' + commit[:12] + '; it never replaced anything.', flush=True)
+                return True
+            return age >= MUTATING_DEAD_SECONDS
         return age >= STALE_SECONDS
 
     @contextlib.contextmanager

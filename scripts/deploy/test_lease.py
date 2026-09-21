@@ -2,6 +2,7 @@ import contextlib
 import pathlib
 import subprocess
 import tempfile
+import time
 import unittest
 from unittest import mock
 import lease as lease_module
@@ -102,6 +103,77 @@ class AbandonedLeaseTest(unittest.TestCase):
             with self.assertRaises(subprocess.CalledProcessError):
                 with b.hold('image-b', wait_seconds=0):
                     self.fail('reclaimed a lease that reached a production mutation')
+
+    @contextlib.contextmanager
+    def serving_boot(self, boot_micros):
+        """Stand in for the production `boot_micros` probe."""
+        def fake(started):
+            if boot_micros is None:
+                return False
+            return boot_micros / 1_000_000 < started - lease_module.BOOT_SKEW_SECONDS
+        previous, lease_module.production_booted_before = lease_module.production_booted_before, fake
+        try:
+            yield
+        finally:
+            lease_module.production_booted_before = previous
+
+    def test_a_mutating_lease_is_reclaimed_when_production_predates_it(self):
+        """The 2026-09-21 shape: three drain timeouts in a row, each leaving a
+        mutating lease that blocked deploys for two hours and needed a person to
+        check the same two facts by hand.
+
+        A finished run cannot still be mid-rollout, and a serving process older
+        than the rollout was never replaced by it. Together that is conclusive,
+        so the grace that exists for "we cannot establish either" does not apply.
+        """
+        started = 1_000_000
+        with repo() as (a, b), self.stale_after(0), self.serving_boot(boot_micros=(started - 3600) * 1_000_000):
+            record = {'image': 'image-a', 'mutating': True, 'started': started, 'run_id': '123'}
+            a.git('push', 'origin', a.commit(record) + ':' + LEASE_REF)
+            held = a.remote(LEASE_REF)
+            with mock.patch.object(lease_module, 'run_is_finished', return_value=True):
+                self.assertTrue(b.abandoned(held), 'a finished run whose rollout never replaced production must be reclaimable')
+            # The run being alive still outranks everything: a rollout mid-flight
+            # keeps its lease however old the serving process is.
+            with mock.patch.object(lease_module, 'run_is_finished', return_value=False):
+                self.assertFalse(b.abandoned(held), 'a live holder keeps its lease')
+
+    def test_a_lease_that_did_replace_production_is_not_reclaimed_early(self):
+        """The direction that must never be wrong.
+
+        A rollout that DID restart production leaves a serving process younger
+        than itself. That lease may have mutated, so it falls back to the
+        two-hour grace rather than being stolen.
+        """
+        started = time.time()
+        with repo() as (a, b), self.stale_after(0), self.serving_boot(boot_micros=(started + 60) * 1_000_000):
+            record = {'image': 'image-a', 'mutating': True, 'started': started, 'run_id': '123'}
+            a.git('push', 'origin', a.commit(record) + ':' + LEASE_REF)
+            held = a.remote(LEASE_REF)
+            with mock.patch.object(lease_module, 'run_is_finished', return_value=True):
+                self.assertFalse(b.abandoned(held), 'a rollout that replaced production must keep its lease until the grace expires')
+
+    def test_an_unprovable_boot_leaves_the_lease_alone(self):
+        """No PGURL, an unreachable database, a missing row: all mean "cannot
+        prove it", never "safe to steal"."""
+        started = time.time()
+        with repo() as (a, b), self.stale_after(0), self.serving_boot(boot_micros=None):
+            record = {'image': 'image-a', 'mutating': True, 'started': started, 'run_id': '123'}
+            a.git('push', 'origin', a.commit(record) + ':' + LEASE_REF)
+            held = a.remote(LEASE_REF)
+            with mock.patch.object(lease_module, 'run_is_finished', return_value=True):
+                self.assertFalse(b.abandoned(held), 'an unprovable probe must fall back to the age grace')
+
+    def test_the_boot_probe_needs_a_clear_margin(self):
+        """Runner and box clocks are independent, so a boot merely CLOSE to the
+        rollout proves nothing — and the dangerous mistake is calling a live
+        rollout dead."""
+        started = 1_000_000
+        just_inside = (started - lease_module.BOOT_SKEW_SECONDS + 1) * 1_000_000
+        with self.serving_boot(boot_micros=just_inside):
+            self.assertFalse(lease_module.production_booted_before(started), 'a boot within the skew window is not proof')
+        with self.serving_boot(boot_micros=(started - lease_module.BOOT_SKEW_SECONDS - 1) * 1_000_000):
+            self.assertTrue(lease_module.production_booted_before(started), 'a boot clearly older than the rollout is proof')
 
     def test_a_mutating_lease_whose_run_is_dead_is_reclaimed(self):
         """The 2026-09-14 wedge: a rollout died mid-flight and its lease blocked
