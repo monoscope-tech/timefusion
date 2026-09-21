@@ -2241,6 +2241,35 @@ mod exists_in_projection_tests {
         let batches = ctx().await.sql(sql).await.expect("logical planning must succeed").collect().await.map_err(|e| e.to_string())?;
         Ok(batches.iter().flat_map(|batch| datafusion::arrow::array::AsArray::as_boolean(batch.column(1)).values().iter().collect::<Vec<_>>()).collect())
     }
+
+    #[tokio::test]
+    async fn cross_join_unnest_of_a_left_column_expands_each_outer_row() {
+        let batches = ctx()
+            .await
+            .sql(
+                "WITH sp AS (SELECT id, hashes FROM outer_e)
+                 SELECT e.id, h.value
+                 FROM sp e CROSS JOIN UNNEST(e.hashes) AS h(value)
+                 ORDER BY e.id, h.value NULLS FIRST",
+            )
+            .await
+            .expect("logical planning must succeed")
+            .collect()
+            .await
+            .expect("physical planning and execution must succeed");
+        assert_eq!(
+            datafusion::arrow::util::pretty::pretty_format_batches(&batches).unwrap().to_string(),
+            "+----+--------+\n\
+             | id | value  |\n\
+             +----+--------+\n\
+             | 1  | needle |\n\
+             | 1  | other  |\n\
+             | 2  | other  |\n\
+             | 5  |        |\n\
+             | 5  | other  |\n\
+             +----+--------+"
+        );
+    }
 }
 
 // Expand `qualifier.*` inside scalar function arguments into the explicit column
