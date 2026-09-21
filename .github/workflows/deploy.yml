@@ -17,10 +17,15 @@ on:
     # script restarted prod five times in an hour, while that very script was
     # measuring how cost varies with process uptime — the measurement was
     # destroying its own precondition.
+    # `scripts/deploy/**` is sourced from the git tree by the rollout itself
+    # (`git archive <current> scripts/deploy`), never baked into the image, so it
+    # cannot change what production serves. Deploying it on its own only spends a
+    # handoff — and a failed handoff wedges the lease for two hours.
     paths-ignore:
       - 'docs/**'
       - '**/*.md'
       - 'bench/**'
+      - 'scripts/deploy/**'
   # Lets `autoformat.yml` start this run for its own commit. A push made with
   # GITHUB_TOKEN triggers nothing, so without this an autofmt commit on master is
   # never built, tested or deployed.

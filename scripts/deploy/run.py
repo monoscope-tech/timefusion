@@ -74,7 +74,14 @@ def reconcile_replacement(stage, lease, guard, image):
 
 # Paths deploy.yml refuses to deploy for, because they cannot change the image.
 # Kept in step with its `paths-ignore`; test_run.py asserts the two agree.
-UNDEPLOYABLE = ('docs/', 'bench/')
+#
+# `scripts/deploy/` is here because a rollout sources these scripts from the git
+# TREE (`git archive <current> scripts/deploy`), never from the image — so they
+# cannot change what production serves, and the next code deploy picks them up as
+# ancestors anyway. Deploying them on their own buys nothing and costs a handoff:
+# on 2026-09-21 a handoff failure wedged the lease and blocked deploys for an
+# hour, which is a poor price for editing the script that does the deploying.
+UNDEPLOYABLE = ('docs/', 'bench/', 'scripts/deploy/')
 
 
 def only_undeployable(lease, current, master):
