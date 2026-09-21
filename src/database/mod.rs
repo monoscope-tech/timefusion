@@ -5956,6 +5956,18 @@ pub(crate) enum BinOutcome<T> {
 /// * CPU: `k` bins together may use at most half the box, leaving the rest for reads.
 ///
 /// Never below `MAINTENANCE_MAX_PARTITIONS`; this only lifts that cap.
+///
+/// The CPU term divides the half-box among `k` bins and FLOORS, so aggregate
+/// width falls slightly as `k` rises: at 44 cores, k=5 gives 4 each (20 total)
+/// and k=8 gives 2 each (16). That is deliberate, and rounding up was tried and
+/// rejected — `k * parts * 2 <= cores` is a promise to READS, and breaking it to
+/// recover a few partitions starves the queries this lane exists to serve.
+///
+/// It is also not the binding term. Prod staged 431 MB in 236 s at four
+/// partitions — 1.8 MB/s, with the box nowhere near CPU-bound — so these sorts
+/// wait on S3, not on cores. More concurrent bins beat wider ones here; if that
+/// ever inverts, the evidence will be CPU saturation during staging, and the
+/// fix is the half-box fraction, not the rounding.
 fn pack_sort_partitions(pack_pool_bytes: usize, k: usize, cores: usize) -> usize {
     /// `maintenance_session_config`'s `sort_spill_reservation_bytes`.
     const DEFAULT_RESERVATION_BYTES: usize = 33_554_432;
