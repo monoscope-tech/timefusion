@@ -209,6 +209,18 @@ const UNTRACKED_PER_TRACKED_BYTE: f64 = SAFE_DECODED_PER_POOL_BYTE;
 pub struct MemorySnapshot {
     /// What the OOM killer acts on: cgroup usage less reclaimable page cache.
     pub rss_bytes: usize,
+    /// The high-water mark over the last few minutes, decayed.
+    ///
+    /// Lending is decided against THIS, not the instantaneous reading. Prod
+    /// oscillates between ~45% and ~99% on a minutes-long cycle, and at the
+    /// bottom of that cycle the free memory is not spare capacity — it is memory
+    /// the next peak is about to reclaim. Lending against the trough would grow
+    /// the ceiling exactly in time to make the following peak worse.
+    ///
+    /// The gate's own open/shut decision still uses `rss_bytes`: it must reopen
+    /// when memory has ACTUALLY fallen, or a single spike would hold the lane
+    /// shut for the whole decay window.
+    pub peak_rss_bytes: usize,
     pub limit_bytes: usize,
     /// Bytes currently reserved from the coordinator `MemoryPool`.
     pub pool_reserved_bytes: usize,
@@ -266,7 +278,7 @@ impl MemorySnapshot {
     /// A reading that grants no elastic allowance. `limit_bytes == 0` is how
     /// "we do not know" is spelled, and every consumer treats it as pressure.
     pub fn unknown() -> Self {
-        Self { rss_bytes: 0, limit_bytes: 0, pool_reserved_bytes: 0, pool_size_bytes: 0 }
+        Self { rss_bytes: 0, peak_rss_bytes: 0, limit_bytes: 0, pool_reserved_bytes: 0, pool_size_bytes: 0 }
     }
 }
 
@@ -302,14 +314,16 @@ pub fn elastic_decoded_capacity(base: u64, sample: MemorySnapshot) -> u64 {
     if sample.limit_bytes == 0 {
         return base;
     }
-    let used_fraction = sample.rss_bytes as f64 / sample.limit_bytes as f64;
+    // The PEAK, never the instantaneous reading — see the field.
+    let watermark = sample.peak_rss_bytes.max(sample.rss_bytes);
+    let used_fraction = watermark as f64 / sample.limit_bytes as f64;
     if used_fraction >= HYGIENE_GATE_SHUT {
         return base;
     }
     // Linear in how far below the shut line we sit: full growth at an empty box,
     // none at the threshold.
     let slack = ((HYGIENE_GATE_SHUT - used_fraction) / HYGIENE_GATE_SHUT).clamp(0.0, 1.0);
-    let lendable = sample.limit_bytes.saturating_sub(sample.rss_bytes).saturating_sub(HYGIENE_NON_LANE_GROWTH_BYTES);
+    let lendable = sample.limit_bytes.saturating_sub(watermark).saturating_sub(HYGIENE_NON_LANE_GROWTH_BYTES);
     base.saturating_add((lendable as f64 * slack) as u64).min(base.saturating_mul(DECODED_ELASTIC_MAX_MULTIPLE))
 }
 
@@ -2427,6 +2441,7 @@ mod tests {
             let (limit, pool) = (120 * GIB, 30 * GIB);
             MemorySnapshot {
                 rss_bytes: (limit as f64 * rss_pct) as usize,
+                peak_rss_bytes: (limit as f64 * rss_pct) as usize,
                 limit_bytes: limit,
                 pool_reserved_bytes: (pool as f64 * pool_pct) as usize,
                 pool_size_bytes: pool,
@@ -2476,6 +2491,25 @@ mod tests {
                     elastic_decoded_capacity(base, sample(high, 0.0)) <= elastic_decoded_capacity(base, sample(low, 0.0)),
                     "a fuller box must not be granted a larger ceiling"
                 );
+            }
+
+            /// A box at the bottom of an oscillation has no spare memory to lend,
+            /// whatever the instantaneous reading says. This is the property that
+            /// stops elastic admission from amplifying the cycle it sits inside.
+            #[test]
+            fn a_recent_peak_suppresses_lending_at_the_trough(base in (GIB as u64)..(16 * GIB as u64)) {
+                let (limit, pool) = (120 * GIB, 30 * GIB);
+                let trough = MemorySnapshot {
+                    rss_bytes: (limit as f64 * 0.40) as usize,
+                    peak_rss_bytes: (limit as f64 * 0.95) as usize,
+                    limit_bytes: limit,
+                    pool_reserved_bytes: 0,
+                    pool_size_bytes: pool,
+                };
+                prop_assert_eq!(elastic_decoded_capacity(base, trough), base, "a 95% peak must suppress lending even at a 40% trough");
+                // The gate itself still reopens on the CURRENT reading, or one
+                // spike would hold the lane shut for the whole decay window.
+                prop_assert!(hygiene_memory_open(trough, false), "the gate reopens on live memory, not on the watermark");
             }
 
             /// An unreadable budget is pressure, not permission.
