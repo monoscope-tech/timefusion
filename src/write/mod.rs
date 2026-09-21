@@ -2300,14 +2300,19 @@ impl BufferedWriteLayer {
         let results = if timeout.is_zero() {
             commit.await
         } else {
-            tokio::time::timeout(timeout, commit).await.unwrap_or_else(|_| {
-                crate::observability::record_flush_stalled();
-                error!(
-                    "coalesced Delta commit stalled >{:?} across {} group(s) — aborting so flush_lock releases and relief can retry; rows remain durable in MemBuffer + WAL",
-                    timeout, expected
-                );
-                Vec::new()
-            })
+            match tokio::time::timeout(timeout, commit).await {
+                Ok(results) => results,
+                Err(_) => {
+                    crate::observability::record_flush_stalled();
+                    error!(
+                        "coalesced Delta commit stalled >{:?} across {} group(s) — aborting so flush_lock releases and relief can retry; rows remain durable in MemBuffer + WAL",
+                        timeout, expected
+                    );
+                    (0..expected)
+                        .map(|_| Err(anyhow::anyhow!("coalesced commit timed out after {timeout:?}; rows remain in MemBuffer + WAL for retry")))
+                        .collect()
+                }
+            }
         };
         // A wrong-length result vector would strand groups (unsettled = leaked
         // in-flight holds). Fail them all instead: a requeue costs a duplicate
