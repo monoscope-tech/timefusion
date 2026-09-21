@@ -156,15 +156,47 @@ class DeploymentLease:
             # qualifies a mutating lease, and a holder we cannot ask about never does.
             if not run_is_finished(record.get('run_id')):
                 return False
-            # A finished run cannot still be mid-rollout, and a serving process
-            # older than the rollout was never replaced by it. Together those are
-            # conclusive, so the two-hour grace — which exists for the case where
-            # neither can be established — does not apply.
+            # A finished run cannot still be mid-rollout. What remains is whether
+            # it ever REPLACED anything, and there are two independent witnesses —
+            # either suffices, because both only say "this rollout never became
+            # production".
             if production_booted_before(started):
                 print('Production still serves a process that predates lease ' + commit[:12] + '; it never replaced anything.', flush=True)
                 return True
+            if self.receipt_image_differs(record.get('image')):
+                print('Lease ' + commit[:12] + ' never reached the completion receipt; it never became production.', flush=True)
+                return True
             return age >= MUTATING_DEAD_SECONDS
         return age >= STALE_SECONDS
+
+    def receipt_image_differs(self, image):
+        """Whether the last COMPLETED rollout served a different image than `image`.
+
+        The restart-independent half of the reclaim proof, and the reason it
+        exists: `production_booted_before` is defeated by ANY unrelated restart.
+        Bounce the container for an incident and every wedged lease suddenly
+        predates nothing, so the check declines and the two-hour grace applies
+        again. That happened three times on 2026-09-21, each time costing an hour
+        of blocked deploys during an incident — precisely when deploying matters.
+
+        The receipt moves only when a rollout actually completes, so restarts
+        cannot perturb it. If the last completed rollout is a DIFFERENT image than
+        this lease's, the lease never became production.
+
+        Fails safe: an unreadable or missing receipt, or a matching image, both
+        return False and leave the lease alone.
+        """
+        if not image:
+            return False
+        try:
+            receipt = self.remote(RECEIPT_REF)
+            if receipt is None:
+                return False
+            self.git('fetch', '--no-write-fetch-head', '--no-tags', 'origin', RECEIPT_REF)
+            served = json.loads(self.git('show', receipt + ':record.json')).get('image')
+        except (subprocess.CalledProcessError, ValueError):
+            return False
+        return bool(served) and served != image
 
     @contextlib.contextmanager
     def hold(self, image, wait_seconds=2700):

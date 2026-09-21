@@ -175,6 +175,49 @@ class AbandonedLeaseTest(unittest.TestCase):
         with self.serving_boot(boot_micros=(started - lease_module.BOOT_SKEW_SECONDS - 1) * 1_000_000):
             self.assertTrue(lease_module.production_booted_before(started), 'a boot clearly older than the rollout is proof')
 
+    def test_the_receipt_reclaims_a_lease_a_restart_would_have_stranded(self):
+        """The restart-independent witness, and why it had to exist.
+
+        `production_booted_before` is defeated by ANY unrelated restart: bounce
+        the container during an incident and a wedged lease suddenly predates
+        nothing, so the reclaim declines and deploys stay blocked for two hours.
+        That happened three times on 2026-09-21, each during an incident.
+
+        The receipt only moves when a rollout COMPLETES, so restarts cannot
+        perturb it. Here the boot stamp says nothing useful (production restarted
+        AFTER the lease) and the receipt still settles it.
+        """
+        started = time.time()
+        with repo() as (a, b), self.stale_after(0), self.serving_boot(boot_micros=(started + 60) * 1_000_000):
+            # A completed rollout of a DIFFERENT image than the wedged lease's.
+            b.git('push', 'origin', b.commit({'image': 'image-served', 'boot_micros': '1', 'completed': started}) + ':' + RECEIPT_REF)
+            a.git('push', 'origin', a.commit({'image': 'image-wedged', 'mutating': True, 'started': started, 'run_id': '123'}) + ':' + LEASE_REF)
+            held = a.remote(LEASE_REF)
+            with mock.patch.object(lease_module, 'run_is_finished', return_value=True):
+                self.assertTrue(b.abandoned(held), 'a lease whose image never reached the receipt never became production')
+
+    def test_a_lease_matching_the_receipt_is_left_alone(self):
+        """The direction that must not be wrong: if the receipt says this image
+        IS what production serves, the rollout completed and the lease is not
+        evidence of a dead one."""
+        started = time.time()
+        with repo() as (a, b), self.stale_after(0), self.serving_boot(boot_micros=(started + 60) * 1_000_000):
+            b.git('push', 'origin', b.commit({'image': 'image-same', 'boot_micros': '1', 'completed': started}) + ':' + RECEIPT_REF)
+            a.git('push', 'origin', a.commit({'image': 'image-same', 'mutating': True, 'started': started, 'run_id': '123'}) + ':' + LEASE_REF)
+            held = a.remote(LEASE_REF)
+            with mock.patch.object(lease_module, 'run_is_finished', return_value=True):
+                self.assertFalse(b.abandoned(held), 'a lease whose image IS the served one must keep its lease until the grace expires')
+
+    def test_a_missing_receipt_proves_nothing(self):
+        """No receipt at all — a fresh repo, a pruned ref — must not be read as
+        "never completed"."""
+        started = time.time()
+        with repo() as (a, b), self.stale_after(0), self.serving_boot(boot_micros=(started + 60) * 1_000_000):
+            a.git('push', 'origin', a.commit({'image': 'image-wedged', 'mutating': True, 'started': started, 'run_id': '123'}) + ':' + LEASE_REF)
+            held = a.remote(LEASE_REF)
+            with mock.patch.object(lease_module, 'run_is_finished', return_value=True):
+                self.assertFalse(b.abandoned(held), 'an absent receipt must fall back to the age grace')
+
     def test_a_mutating_lease_whose_run_is_dead_is_reclaimed(self):
         """The 2026-09-14 wedge: a rollout died mid-flight and its lease blocked
         every later deploy for 15.6 hours, because `mutating` refused reclaim at
