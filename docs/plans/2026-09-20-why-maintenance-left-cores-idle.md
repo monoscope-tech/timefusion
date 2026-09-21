@@ -1,16 +1,17 @@
 # Why maintenance left cores idle with a backlog
 
-Status: locally implemented and validated; the production image measured below
-predates these changes. Production verification therefore remains required.
+Status: the first I/O-slot fix is deployed. Its production result exposed a
+second, independent memory-accounting/quarantine failure. The follow-up fixes
+described below are implemented locally and still require deployment.
 
 ## Conclusion
 
-Maintenance did not fill the 44-core cgroup because an unrelated admission
-dimension capped the entire coordinator at 28 in-flight units. The server had
-66 coordinator workers, 44 maintenance runtime threads, and a lag-scaled CPU
-ceiling of 66, but object-read and object-write capacity were each initialized
-from `coordinator_jobs * 2`, or 28. Every unit reserves one read and one write
-token for its whole lifetime, including time parked on object storage.
+Maintenance did not fill the 44-core cgroup for two consecutive reasons. The
+original build capped the entire coordinator at 28 in-flight units because
+object-read and object-write admission were both 28. After that was raised to
+66, the startup wave overran a coordinator memory pool still sized for only 14
+jobs (7 GiB), and its allocation failures quarantined most of the apparently
+eligible rollup queue behind one permit.
 
 The live signature was exact: CPU, read, and write reservations repeatedly
 moved together and reached `28 / 28 / 28`. Runtime scheduling lag stayed near
@@ -18,9 +19,10 @@ zero, decoded reservations were about 9.1 GB, and container RSS was only
 21.5-29 GiB of 120 GiB. Neither foreground starvation nor memory pressure was
 asking maintenance to back off.
 
-This is why the expected work-conserving behavior did not occur. The CPU
-controller could raise its limit to 66, but no 29th unit could pass the I/O
-checks.
+Thus both deployed states violated work conservation: first no 29th unit could
+pass I/O admission; then admission allowed far more decoded work than the real
+DataFusion pool could hold and converted the resulting transient failures into
+long-lived scheduler exclusion.
 
 ## Production snapshot
 
@@ -100,6 +102,12 @@ from consuming coordinator and journal capacity every five seconds forever.
    and one to the open day. The cap is bypassed when sealed debt reaches zero,
    so it does not strand capacity after catch-up. Coordinator refusals and
    cron-wave waits at this gate are exported separately.
+8. Sealed hygiene now folds file-count benefit into its age score. Previously,
+   crossing the three-day starvation threshold was a strict ordering dimension:
+   a three-file old cell could outrank a newly sealed cell with hundreds of
+   files. Benefit now improves the same bounded score while age continues to
+   gain one step per day past the 31-day horizon, so large fragmentation is
+   attacked promptly without making small old cells permanently unreachable.
 
 The maintenance runtime remains isolated and lower-priority. Its 500 ms
 scheduling-lag feedback comes from the foreground Tokio runtime. With lag at or
@@ -175,12 +183,25 @@ After the UTC date boundary, version 623382 showed 2026-09-20 newly sealed at
 166 files / 2.65 GiB with six projects out of policy. Hot work had reduced that
 date from 202 files, while 2026-09-19 still had not moved.
 
+That split outcome identified an ordering problem in addition to permit
+competition. Sealed ranking compared the three-day age band before file-count
+benefit. Therefore every older out-of-policy cell, however small, could outrank
+the 1,250-file 2026-09-19 day. The new combined age/benefit score directly
+targets the physical debt that dominates scan and metadata cost.
+
 Older dates were generally 10-35 files fleet-wide. Across all four censuses,
 the 2026-09-19 row remained exactly 1,250 files and 3.28 GiB even though 165
 Delta versions committed. Thus the worst sealed day had zero physical drain in
 that interval. The 1.85 TiB `sealed_consolidation` gauge is an
 estimated decoded task cost and is inflated by durable queue state; it is not
 1.85 TiB of live parquet waiting to be compacted.
+
+A fifth census at Delta version 623487 made the result worse, not merely flat:
+2026-09-19 increased from 1,250 to 1,252 active files while 105 more Delta
+versions committed. The newly sealed 2026-09-20 day moved only 166 -> 163 files.
+The deployed build is therefore still not draining the worst sealed debt; at
+the observed net rate its ETA is infinite. The lane-fairness and benefit-rank
+fixes in this worktree are not present in that build.
 
 All five light-rewrite permits were occupied during the same investigation.
 Permit watchdogs reported sealed staging at 300, 900, 2,700, 4,500, and 6,300
@@ -215,6 +236,73 @@ spike. Admission retries now use a fixed five-second delay to remove that refill
 tail without making persistent prerequisites spin. The new per-dimension refusal
 counters are required before changing the lag controller: a high foreground lag
 is a valid reason not to saturate cores.
+
+## Post-deploy finding: the 7 GiB pool poisoned the runnable queue
+
+The 66-slot I/O fix deployed at 2026-09-20 21:48 UTC and proved that I/O
+admission had been a real cap: startup reported 44 runtime threads, 66 workers,
+and 66 read/write slots. It did not produce sustained core saturation. After
+the startup burst, only 12-16 CPU/read/write reservations were normally held
+despite a live CPU limit of 66 and hundreds of queued units.
+
+The reason was a second configuration invariant that the slot change had not
+updated:
+
+| Quantity | Deployed value |
+|---|---:|
+| worker and I/O slots | 66 |
+| admission decoded capacity | about 90 GiB |
+| actual coordinator `FairSpillPool` | 7.0 GiB |
+| coordinator errors in the post-start burst | 159 |
+| BaseRollup `worker_error` retries accumulated | 113 |
+| quarantine permits | 1 |
+
+The errors were not ambiguous. They were DataFusion allocation failures such
+as `Failed to allocate additional 16.1 MB for ExternalSorter` with only a few
+MiB left in `fair(pool_size: 7.0 GB)`. They clustered immediately after the
+new process admitted its startup wave and stopped after the wave collapsed.
+Admission reported no decoded-memory refusals because it was comparing the
+requests with 75% of the whole cgroup, not with the pool the queries actually
+allocate from.
+
+This also explains why the system stayed under-filled after memory recovered.
+The allocation wording was absent from `is_capacity_failure`, so `TaskLease`
+classified the failures as generic `worker_error`. After two attempts those
+units are quarantined and can use only the single quarantine permit. The
+existing `eligible_base_rollup` gauge counts a passed deadline even when a unit
+is quarantined, so its value of 77 overstated the work available to ordinary
+workers. Twelve running tasks plus one quarantine lane matches the observed
+13 CPU tokens much more closely than the headline queue depth does.
+
+The local follow-up restores the invariant end to end:
+
+1. The coordinator pool scales from the 66 worker slots, capped by the existing
+   maintenance share and by floors for the heavy and six-sort light lanes. On
+   the 120 GiB / 44-core production shape it grows from 7 GiB to about 13.5 GiB
+   without increasing total process memory or shrinking either sibling below
+   its established envelope.
+2. Admission's decoded capacity is derived from that coordinator pool, not 75%
+   of the entire cgroup. It uses the existing measured-safe conversion of 1.79
+   decoded input bytes per pool working byte, so it does not confuse input size
+   with resident sort state. A burst is refused before DataFusion runs out of
+   pool without needlessly serializing spillable work.
+3. Heavy compaction remains capped at the measured safe optimum of six sorts.
+   The larger pool is for narrow rollups and their S3 waits, not permission to
+   multiply memory-heavy sort fan-out.
+4. DataFusion's production `Failed to allocate additional ...` wording is now
+   a capacity failure. It retries/splits through the capacity path and never
+   marks a healthy unit as `worker_error` quarantine.
+5. New `tasks_quarantined` and `tasks_due_nonquarantined` gauges expose the
+   difference between queue depth and work ordinary workers can actually take.
+
+This is deliberately memory-bounded, not an unconditional promise of exactly
+44 busy cores. The 13.5 GiB working pool represents about 24 GiB of decoded
+input at the measured safe conversion (47 maximum-sized units in aggregate),
+although the occupancy rule deliberately stops admitting maximum-sized units
+before the pool fills; smaller units can fill all 44 runtime threads. That is
+the correct work-conserving behavior: saturate CPU when the admitted workload
+fits, and publish decoded-memory refusal when memory—not an invisible pool OOM
+and quarantine—is the reason it cannot.
 
 ## Current ETA
 
