@@ -28,6 +28,31 @@ use tracing::{Instrument, debug, field::Empty, info, instrument, warn};
 /// Align large Parquet data reads so sliding time predicates reuse the same cache entry.
 const PARQUET_RANGE_ALIGNMENT_BYTES: u64 = 1024 * 1024;
 
+/// Clip an aligned read's response offsets to the bytes actually returned.
+///
+/// `get_range_cached` widens a large read to `PARQUET_RANGE_ALIGNMENT_BYTES`
+/// and clamps the FETCH to `file_size`, but the offsets it slices back out with
+/// come from the caller's UNCLAMPED `range.end`. When the two disagree — a stale
+/// `ObjectMeta`, a file rewritten smaller between plan and scan, a short read —
+/// the slice runs past the response and `Bytes` panics:
+///
+/// ```text
+/// panicked at bytes-1.11.1/src/bytes.rs:392:
+///   range end out of bounds: 1957431 <= 1900074
+/// ```
+///
+/// That killed a maintenance worker in prod on 2026-09-21. The aligned fetch is
+/// an optimisation and must never be able to do that, so the answer is the
+/// intersection of what was asked for with what exists — exactly what the
+/// unaligned path returns via its own `range.end <= full.len()` guard. Warned,
+/// not silent: a short read means someone's view of the file is wrong.
+fn clamp_to_available(start: usize, end: usize, available: usize, location: &Path) -> std::ops::Range<usize> {
+    if end > available {
+        warn!(location = %location, requested_end = end, available, "range read ran past the end of the object; returning the bytes that exist");
+    }
+    start.min(available)..end.min(available)
+}
+
 /// Cache entry with metadata and TTL
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CacheValue {
@@ -1210,7 +1235,20 @@ impl FoyerObjectStoreCache {
             self.admit_data_range(location, range_cache_key, result.clone(), meta);
         }
         Ok(match response_slice {
-            Some((start, end)) => result.slice(start..end),
+            // The aligned fetch is an OPTIMISATION and must never turn a short
+            // read into a panic. `aligned_end` is clamped to `file_size` while
+            // these offsets come from the caller's unclamped `range.end`, so any
+            // read past the end of the object — a stale `ObjectMeta`, a file
+            // rewritten smaller between plan and scan — asks for bytes the
+            // response cannot contain. Prod killed a maintenance worker on
+            // exactly that: `range end out of bounds: 1957431 <= 1900074`.
+            //
+            // The honest answer is the intersection of what was asked for with
+            // what exists, which is what the unaligned path at `l1_max_entry_bytes`
+            // already returns via its `range.end <= full.len()` guard. Warned, not
+            // silent: a short read here means someone's view of the file is wrong,
+            // and that is worth seeing even though it is no longer fatal.
+            Some((start, end)) => result.slice(clamp_to_available(start, end, result.len(), location)),
             None => result,
         })
     }
@@ -1810,6 +1848,28 @@ mod tests {
 
         cache.shutdown().await?;
         Ok(())
+    }
+
+    /// The offsets an aligned read slices back out with must never exceed the
+    /// response. Reproduces the prod panic's exact numbers.
+    ///
+    /// Tested directly rather than through `get_range_cached`: reaching that
+    /// branch needs a >1 MiB object, a cache miss, AND metadata that disagrees
+    /// with the real file — and an `InMemory` store rejects an out-of-range read
+    /// before the slice is ever reached, so an end-to-end test passes whether or
+    /// not the bug is present. It did, which is how this test earned its shape.
+    #[test]
+    fn an_aligned_read_never_slices_past_what_came_back() {
+        let path = Path::from("tbl/part.parquet");
+        // The prod failure: asked for 1_957_431, got 1_900_074.
+        assert_eq!(clamp_to_available(0, 1_957_431, 1_900_074, &path), 0..1_900_074, "must clip to what exists");
+        // Exact fit and short-of-fit are both untouched.
+        assert_eq!(clamp_to_available(128, 4096, 4096, &path), 128..4096, "an exact response is unchanged");
+        assert_eq!(clamp_to_available(128, 1000, 4096, &path), 128..1000, "a response with room to spare is unchanged");
+        // Wholly past the end collapses to empty rather than inverting the range,
+        // which would panic in `Bytes` just as surely as overrunning it.
+        let empty = clamp_to_available(5000, 6000, 4096, &path);
+        assert!(empty.is_empty() && empty.start <= empty.end, "a range entirely past the end must be empty, never inverted");
     }
 
     // An already-elapsed deadline must abandon the foyer flush, not stall exit.
