@@ -229,8 +229,18 @@ pub struct MemorySnapshot {
 /// Admission therefore stops BEFORE `memory_brake_limit_bytes` engages, so the
 /// brake stays what it was built to be — a one-way valve for bursts already in
 /// flight — rather than the thing that routinely holds the line.
-const HYGIENE_GATE_REOPEN: f64 = 0.70;
-const HYGIENE_GATE_SHUT: f64 = 0.75;
+const HYGIENE_GATE_REOPEN: f64 = 0.65;
+const HYGIENE_GATE_SHUT: f64 = 0.70;
+
+/// The share of the gate's headroom a fully-ramped hygiene lane may claim.
+///
+/// The rest belongs to everything that allocates WITHOUT asking the gate: query
+/// decode, ingest buffers, jemalloc retention. Prod 2026-09-21 shut the gate at
+/// 75% and still peaked at **96%** — the ramp model was accurate (~2.45 GiB per
+/// sort against a predicted 2.24) but it spent the entire margin, leaving four
+/// points before the OOM killer. The model was right and the BUDGET was wrong:
+/// it assumed hygiene was the only thing growing.
+const HYGIENE_RAMP_HEADROOM_SHARE: f64 = 0.6;
 // Compile-time, not a test: a gate that reopens at or above where it shuts has
 // no hysteresis and will flap admit/refuse around a single reading.
 const _: () = assert!(HYGIENE_GATE_REOPEN < HYGIENE_GATE_SHUT);
@@ -622,7 +632,7 @@ impl DerivedBudget {
         // bounds only how far the lane may RAMP after the gate's last yes, so a
         // fully-ramped fleet still fits under the limit. Live memory decides
         // moment to moment; this decides the worst case.
-        let headroom = self.memory_limit_bytes as f64 * (1.0 - HYGIENE_GATE_SHUT);
+        let headroom = self.memory_limit_bytes as f64 * (1.0 - HYGIENE_GATE_SHUT) * HYGIENE_RAMP_HEADROOM_SHARE;
         let by_ramp = (headroom / (COORDINATOR_PER_SORT_BUDGET_BYTES as f64 * UNTRACKED_PER_TRACKED_BYTE)) as usize;
         (self.cores / 4).min(by_ramp).max(LIGHT_MIN_SLICES)
     }
@@ -2577,7 +2587,9 @@ mod tests {
         // kill the process and decode buffers can.
         let ceiling = prod.light_pool_slices();
         let worst_case = (ceiling * COORDINATOR_PER_SORT_BUDGET_BYTES) as f64 * UNTRACKED_PER_TRACKED_BYTE;
-        let headroom = prod.memory_limit_bytes as f64 * (1.0 - HYGIENE_GATE_SHUT);
+        // Only hygiene's SHARE of the headroom — the remainder is for allocators
+        // that never consult the gate, which is what the 96% peak was made of.
+        let headroom = prod.memory_limit_bytes as f64 * (1.0 - HYGIENE_GATE_SHUT) * HYGIENE_RAMP_HEADROOM_SHARE;
         assert!(
             worst_case <= headroom,
             "a fully-ramped hygiene lane ({ceiling} sorts, {:.1} GiB worst case) must fit the headroom the gate leaves ({:.1} GiB)",
@@ -3258,5 +3270,23 @@ mod bin_decode_budget_tests {
         // `+ 1` mirrors `repair_slice_want`: the slice count the staging loop uses.
         let slices = decoded / budget + 1;
         assert!(decoded / slices <= budget, "each slice must fit the sort budget: {decoded}/{slices} > {budget}");
+    }
+}
+
+#[cfg(test)]
+mod hygiene_peak_report {
+    use super::*;
+
+    /// The number that matters is where memory PEAKS after the gate shuts, not
+    /// where it shuts. Prod peaked at 96% under the first thresholds; this pins
+    /// the predicted peak so a future widening cannot quietly walk it back up.
+    #[test]
+    fn a_fully_ramped_lane_peaks_with_margin_to_spare() {
+        for (gib, cores) in [(120usize, 44usize), (120, 48), (80, 48), (120, 32)] {
+            let b = DerivedBudget::from_limits(gib * GIB, cores);
+            let ramp = (b.light_pool_slices() * COORDINATOR_PER_SORT_BUDGET_BYTES) as f64 * UNTRACKED_PER_TRACKED_BYTE;
+            let peak = HYGIENE_GATE_SHUT + ramp / (gib * GIB) as f64;
+            assert!(peak < 0.90, "{gib} GiB / {cores} cores: predicted peak {:.0}% leaves too little before the OOM killer", peak * 100.0);
+        }
     }
 }
