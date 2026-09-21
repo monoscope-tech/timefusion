@@ -2667,19 +2667,6 @@ macro_rules! resources_zip {
 }
 
 impl Resources {
-    fn fits(self, available: Self) -> bool {
-        self.cpu <= available.cpu
-            && self.decoded_bytes <= available.decoded_bytes
-            && self.object_reads <= available.object_reads
-            && self.object_writes <= available.object_writes
-    }
-
-    /// Fieldwise subtraction, `None` if any field would underflow — which is
-    /// exactly "the request does not fit".
-    fn checked_sub(self, request: Self) -> Option<Self> {
-        request.fits(self).then(|| resources_zip!(saturating_sub, self, request))
-    }
-
     fn saturating_add(self, released: Self) -> Self {
         resources_zip!(saturating_add, self, released)
     }
@@ -2688,14 +2675,23 @@ impl Resources {
 #[derive(Debug)]
 struct AdmissionState {
     capacity: Resources,
-    available: Resources,
+    /// Tracked as USED rather than available on purpose. The decoded-bytes
+    /// ceiling is recomputed from live memory on every admission, and a ceiling
+    /// that can move cannot be the basis of a running `available` — shrinking it
+    /// would retroactively un-reserve bytes that in-flight units are still
+    /// holding. Usage is a fact; the ceiling is a decision made against it.
+    used: Resources,
     /// The static reservation the adaptive ceiling falls back to under load.
     cpu_base: u32,
 }
 
 impl AdmissionState {
     fn used(&self) -> Resources {
-        resources_zip!(saturating_sub, self.capacity, self.available)
+        self.used
+    }
+
+    fn available(&self) -> Resources {
+        resources_zip!(saturating_sub, self.capacity, self.used)
     }
 }
 
@@ -2811,14 +2807,19 @@ impl AdmissionController {
         stats.maintenance_decoded_bytes_capacity.store(capacity.decoded_bytes, Relaxed);
         stats.maintenance_object_read_tokens_capacity.store(u64::from(capacity.object_reads), Relaxed);
         stats.maintenance_object_write_tokens_capacity.store(u64::from(capacity.object_writes), Relaxed);
-        Self(Arc::new(Mutex::new(AdmissionState { capacity, available: capacity, cpu_base })))
+        Self(Arc::new(Mutex::new(AdmissionState { capacity, used: Resources::default(), cpu_base })))
     }
 
+    /// Admission with NO elastic allowance — the static share only.
+    ///
+    /// For callers with no live memory reading of their own. A zero-limit
+    /// snapshot makes `elastic_decoded_capacity` return `base`, which is the
+    /// conservative direction and the pre-elastic behaviour exactly.
     pub fn try_acquire(&self, request: Resources) -> Option<AdmissionPermit> {
-        self.try_acquire_for(request, AdmissionLane::Other)
+        self.try_acquire_for(request, AdmissionLane::Other, crate::config::MemorySnapshot::unknown())
     }
 
-    pub fn try_acquire_for(&self, request: Resources, lane: AdmissionLane) -> Option<AdmissionPermit> {
+    pub fn try_acquire_for(&self, request: Resources, lane: AdmissionLane, memory: crate::config::MemorySnapshot) -> Option<AdmissionPermit> {
         use std::sync::atomic::Ordering::Relaxed;
 
         let stats = crate::observability::maintenance_stats();
@@ -2851,17 +2852,23 @@ impl AdmissionController {
             stats.maintenance_admission_refused_cpu.fetch_add(1, Relaxed);
             refused = true;
         }
-        if request.decoded_bytes > occupancy_scaled_ceiling(state.available.decoded_bytes, state.capacity.decoded_bytes)
-            || request.decoded_bytes > state.available.decoded_bytes
-        {
+        // The decoded-bytes ceiling is the one dimension that SHARES the box's
+        // spare memory. Its static share was 23 GiB on a 120 GiB machine and it
+        // refused 142,313 admissions against 11,885 for CPU while the box sat at
+        // half capacity — the same over-reservation the hygiene permits had, in
+        // the dimension that actually binds maintenance.
+        let decoded_ceiling = crate::config::elastic_decoded_capacity(state.capacity.decoded_bytes, memory);
+        let decoded_available = decoded_ceiling.saturating_sub(state.used.decoded_bytes);
+        if request.decoded_bytes > occupancy_scaled_ceiling(decoded_available, decoded_ceiling) || request.decoded_bytes > decoded_available {
             stats.maintenance_admission_refused_decoded_bytes.fetch_add(1, Relaxed);
             refused = true;
         }
-        if request.object_reads > state.available.object_reads {
+        let available = state.available();
+        if request.object_reads > available.object_reads {
             stats.maintenance_admission_refused_object_reads.fetch_add(1, Relaxed);
             refused = true;
         }
-        if request.object_writes > state.available.object_writes {
+        if request.object_writes > available.object_writes {
             stats.maintenance_admission_refused_object_writes.fetch_add(1, Relaxed);
             refused = true;
         }
@@ -2870,7 +2877,7 @@ impl AdmissionController {
         }
         // Every field was checked above; failure is now an internal invariant,
         // not an unclassified admission refusal.
-        state.available = state.available.checked_sub(request)?;
+        state.used = state.used.saturating_add(request);
         Self::publish_utilization(&state);
         Some(AdmissionPermit { controller: self.clone(), resources: request })
     }
@@ -2899,8 +2906,7 @@ pub struct AdmissionPermit {
 impl Drop for AdmissionPermit {
     fn drop(&mut self) {
         let mut state = lock(&self.controller.0);
-        state.available = state.available.saturating_add(self.resources);
-        debug_assert!(state.available.fits(state.capacity));
+        state.used = resources_zip!(saturating_sub, state.used, self.resources);
         AdmissionController::publish_utilization(&state);
     }
 }

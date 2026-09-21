@@ -2947,11 +2947,16 @@ fn rollups_keep_a_reserved_share_of_admission() {
     let admission = AdmissionController::with_cpu_ceiling(ceiling, ceiling, u64::MAX, 64, 64);
     let request = Resources { cpu: 1, decoded_bytes: MAX_DECODED_BYTES / 8, object_reads: 1, object_writes: 1 };
     // Non-rollup work fills everything EXCEPT the reservation.
-    let held: Vec<_> = std::iter::repeat_with(|| admission.try_acquire_for(request, AdmissionLane::Other)).map_while(|p| p).collect();
+    let held: Vec<_> = std::iter::repeat_with(|| admission.try_acquire_for(request, AdmissionLane::Other, crate::config::MemorySnapshot::unknown()))
+        .map_while(|p| p)
+        .collect();
     assert_eq!(held.len() as u32, ceiling - rollup_reserved_cpu(ceiling), "other lanes must stop short of the rollup reservation, took {}", held.len());
-    assert!(admission.try_acquire_for(request, AdmissionLane::Other).is_none(), "and stay stopped");
+    assert!(admission.try_acquire_for(request, AdmissionLane::Other, crate::config::MemorySnapshot::unknown()).is_none(), "and stay stopped");
     // The reserved slots are still there for a rollup.
-    assert!(admission.try_acquire_for(request, AdmissionLane::Rollup).is_some(), "a rollup must reach its reserved share");
+    assert!(
+        admission.try_acquire_for(request, AdmissionLane::Rollup, crate::config::MemorySnapshot::unknown()).is_some(),
+        "a rollup must reach its reserved share"
+    );
 }
 
 /// Maintenance admission is bounded by the configured job count, and every token is returned

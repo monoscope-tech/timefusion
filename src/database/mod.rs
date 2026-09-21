@@ -5248,6 +5248,23 @@ impl Default for HygieneGateState {
 impl HygieneGate {
     const SAMPLE_TTL: std::time::Duration = std::time::Duration::from_millis(500);
 
+    /// The cached memory reading, for callers that need the snapshot rather than
+    /// the verdict — admission sizes its decoded-bytes ceiling from the same
+    /// sample so the two decisions cannot disagree about the state of the box.
+    pub(crate) fn snapshot(&self, cfg: &crate::config::DerivedBudget, pool_reserved: usize, pool_size: usize) -> crate::config::MemorySnapshot {
+        let now = std::time::Instant::now();
+        let mut state = crate::support::lock(&self.state);
+        let rss = match state.sampled {
+            Some((at, bytes)) if now.duration_since(at) < Self::SAMPLE_TTL => bytes,
+            _ => {
+                let bytes = process_memory_bytes().unwrap_or(0);
+                state.sampled = Some((now, bytes));
+                bytes
+            }
+        };
+        crate::config::MemorySnapshot { rss_bytes: rss, limit_bytes: cfg.memory_limit_bytes, pool_reserved_bytes: pool_reserved, pool_size_bytes: pool_size }
+    }
+
     /// Whether another hygiene sort may start. A refusal is not a failure — the
     /// unit was never claimed and stays there for whoever can run it.
     ///
@@ -5286,6 +5303,16 @@ impl HygieneGate {
             stats.compaction_permits_unavailable.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         crate::config::hygiene_admits(sample, in_flight, ceiling, cfg.hygiene_floor_slices(), was_open)
+    }
+}
+
+impl Database {
+    /// The memory reading admission sizes its decoded-bytes ceiling from.
+    ///
+    /// Shares the hygiene gate's cached sample deliberately: two views of the
+    /// same box that disagree are worse than one that is 500 ms stale.
+    pub(crate) fn admission_memory(&self) -> crate::config::MemorySnapshot {
+        self.hygiene_gate.snapshot(&self.config.derived, self.coordinator_runtime_env().memory_pool.reserved(), self.config.derived.coordinator_share_bytes())
     }
 }
 

@@ -229,21 +229,89 @@ pub struct MemorySnapshot {
 /// Admission therefore stops BEFORE `memory_brake_limit_bytes` engages, so the
 /// brake stays what it was built to be — a one-way valve for bursts already in
 /// flight — rather than the thing that routinely holds the line.
-const HYGIENE_GATE_REOPEN: f64 = 0.65;
-const HYGIENE_GATE_SHUT: f64 = 0.70;
+const HYGIENE_GATE_REOPEN: f64 = 0.60;
+const HYGIENE_GATE_SHUT: f64 = 0.65;
 
-/// The share of the gate's headroom a fully-ramped hygiene lane may claim.
+/// Where a fully-ramped hygiene lane may leave memory, worst case.
 ///
-/// The rest belongs to everything that allocates WITHOUT asking the gate: query
-/// decode, ingest buffers, jemalloc retention. Prod 2026-09-21 shut the gate at
-/// 75% and still peaked at **96%** — the ramp model was accurate (~2.45 GiB per
-/// sort against a predicted 2.24) but it spent the entire margin, leaving four
-/// points before the OOM killer. The model was right and the BUDGET was wrong:
-/// it assumed hygiene was the only thing growing.
-const HYGIENE_RAMP_HEADROOM_SHARE: f64 = 0.6;
+/// Expressed as a PEAK rather than as a share of headroom, because the share
+/// form was self-defeating: it derived the backstop from the distance to the
+/// limit, so lowering the shut threshold *raised* the permitted concurrency and
+/// the peak barely moved.
+const HYGIENE_TARGET_PEAK: f64 = 0.90;
+
+/// Memory growth per admitted sort, from the gate closing to the peak.
+const HYGIENE_RAMP_PER_SORT_BYTES: f64 = COORDINATOR_PER_SORT_BUDGET_BYTES as f64 * UNTRACKED_PER_TRACKED_BYTE;
+
+/// Growth during the same window that is NOT the hygiene lane's and does not
+/// scale with its permits: query decode, ingest, jemalloc retention.
+///
+/// Budgeted as a FLAT reserve because that is its shape. Folding it into the
+/// per-sort figure — prod's two spikes imply ~3.9 GiB/permit against a derived
+/// 2.24 — makes the arithmetic say four permits, which leaves K=1, and one
+/// permit shared by HotPacking and SealedConsolidation is the wedge
+/// `LIGHT_MIN_SLICES` exists to prevent. The lane would be "safe" by being
+/// stopped.
+///
+/// The honest reading of those spikes: ~12 GiB of the ramp was never hygiene's.
+/// Re-derive before widening — `charged_pct` when `hygiene_gate_open` flips to
+/// 0 against its peak a minute later, minus `light_rewrite_permits_total` times
+/// the per-sort figure.
+const HYGIENE_NON_LANE_GROWTH_BYTES: usize = 10 * GIB;
 // Compile-time, not a test: a gate that reopens at or above where it shuts has
 // no hysteresis and will flap admit/refuse around a single reading.
 const _: () = assert!(HYGIENE_GATE_REOPEN < HYGIENE_GATE_SHUT);
+
+impl MemorySnapshot {
+    /// A reading that grants no elastic allowance. `limit_bytes == 0` is how
+    /// "we do not know" is spelled, and every consumer treats it as pressure.
+    pub fn unknown() -> Self {
+        Self { rss_bytes: 0, limit_bytes: 0, pool_reserved_bytes: 0, pool_size_bytes: 0 }
+    }
+}
+
+/// How far the decoded-bytes admission ceiling may grow above its static share
+/// when the box is measurably idle.
+///
+/// Bounded rather than unbounded because `decoded_bytes` is a RESERVATION held
+/// for a unit's whole life, so an over-grant cannot be taken back the way a
+/// refused admission can.
+const DECODED_ELASTIC_MAX_MULTIPLE: u64 = 3;
+
+/// The decoded-bytes ceiling admission may use right now.
+///
+/// `base` is the static share, and it was badly under-spent: 23 GiB on a 120 GiB
+/// box, refusing 142,313 admissions against 11,885 for CPU while RSS sat near
+/// half. Maintenance was gated on a number that had nothing to do with the
+/// memory actually available — the same defect the hygiene permits had, in the
+/// dimension that binds rollups and dedup.
+///
+/// So the ceiling grows into memory that is measurably free, and stops growing
+/// before the gate that protects the box does. Three properties make that safe:
+///
+/// * At or above [`HYGIENE_GATE_SHUT`] it is exactly `base` — under pressure the
+///   elastic behaviour vanishes and the old static share is what remains.
+/// * It never promises more than is free, less the same non-lane reserve the
+///   ramp budget keeps, so it cannot lend out memory queries are about to want.
+/// * It is capped at [`DECODED_ELASTIC_MAX_MULTIPLE`], because a reservation is
+///   held for the unit's whole life and cannot be revoked once granted.
+///
+/// Shrinking is safe by construction: the controller tracks USED, so a smaller
+/// ceiling refuses new admissions rather than un-reserving in-flight ones.
+pub fn elastic_decoded_capacity(base: u64, sample: MemorySnapshot) -> u64 {
+    if sample.limit_bytes == 0 {
+        return base;
+    }
+    let used_fraction = sample.rss_bytes as f64 / sample.limit_bytes as f64;
+    if used_fraction >= HYGIENE_GATE_SHUT {
+        return base;
+    }
+    // Linear in how far below the shut line we sit: full growth at an empty box,
+    // none at the threshold.
+    let slack = ((HYGIENE_GATE_SHUT - used_fraction) / HYGIENE_GATE_SHUT).clamp(0.0, 1.0);
+    let lendable = sample.limit_bytes.saturating_sub(sample.rss_bytes).saturating_sub(HYGIENE_NON_LANE_GROWTH_BYTES);
+    base.saturating_add((lendable as f64 * slack) as u64).min(base.saturating_mul(DECODED_ELASTIC_MAX_MULTIPLE))
+}
 
 /// May another hygiene sort start?
 ///
@@ -632,8 +700,8 @@ impl DerivedBudget {
         // bounds only how far the lane may RAMP after the gate's last yes, so a
         // fully-ramped fleet still fits under the limit. Live memory decides
         // moment to moment; this decides the worst case.
-        let headroom = self.memory_limit_bytes as f64 * (1.0 - HYGIENE_GATE_SHUT) * HYGIENE_RAMP_HEADROOM_SHARE;
-        let by_ramp = (headroom / (COORDINATOR_PER_SORT_BUDGET_BYTES as f64 * UNTRACKED_PER_TRACKED_BYTE)) as usize;
+        let ramp_budget = self.memory_limit_bytes as f64 * (HYGIENE_TARGET_PEAK - HYGIENE_GATE_SHUT) - HYGIENE_NON_LANE_GROWTH_BYTES as f64;
+        let by_ramp = (ramp_budget.max(0.0) / HYGIENE_RAMP_PER_SORT_BYTES) as usize;
         (self.cores / 4).min(by_ramp).max(LIGHT_MIN_SLICES)
     }
 
@@ -2377,6 +2445,45 @@ mod tests {
         }
 
         proptest! {
+            /// Under pressure the elastic ceiling must VANISH, leaving exactly the
+            /// static share. Otherwise "share spare memory" becomes "overcommit a
+            /// full box", and a decoded-bytes reservation cannot be revoked once
+            /// granted.
+            #[test]
+            fn a_loaded_box_gets_no_elastic_allowance(over in 0.0f64..0.3, base in 1u64..(64 * GIB as u64)) {
+                let sample = sample(HYGIENE_GATE_SHUT + over, 0.0);
+                prop_assert_eq!(elastic_decoded_capacity(base, sample), base, "at or above the shut line the ceiling is the static share");
+            }
+
+            /// An idle box must lend, or the whole point is lost — but never more
+            /// than is free, and never past the hard multiple.
+            #[test]
+            fn an_idle_box_lends_within_what_is_free(base in (GIB as u64)..(32 * GIB as u64)) {
+                let sample = sample(0.10, 0.0);
+                let grown = elastic_decoded_capacity(base, sample);
+                prop_assert!(grown > base, "an almost-empty box must lend something");
+                prop_assert!(grown <= base * DECODED_ELASTIC_MAX_MULTIPLE, "the hard multiple bounds an irrevocable reservation");
+                let free = sample.limit_bytes.saturating_sub(sample.rss_bytes) as u64;
+                prop_assert!(grown - base <= free, "it may never promise memory that does not exist");
+            }
+
+            /// Monotone in pressure, like the gate: more memory used may only ever
+            /// lend less.
+            #[test]
+            fn more_pressure_never_lends_more(low in 0.0f64..0.9, extra in 0.0f64..0.9, base in (GIB as u64)..(16 * GIB as u64)) {
+                let high = (low + extra).min(1.0);
+                prop_assert!(
+                    elastic_decoded_capacity(base, sample(high, 0.0)) <= elastic_decoded_capacity(base, sample(low, 0.0)),
+                    "a fuller box must not be granted a larger ceiling"
+                );
+            }
+
+            /// An unreadable budget is pressure, not permission.
+            #[test]
+            fn an_unknown_reading_lends_nothing(base in 1u64..(64 * GIB as u64)) {
+                prop_assert_eq!(elastic_decoded_capacity(base, MemorySnapshot::unknown()), base, "no reading means no allowance");
+            }
+
             /// A lane at zero does not drain slowly, it WEDGES — and then nothing
             /// frees the memory that closed the gate. So the floor outranks every
             /// other term, including a box that is completely out of memory.
@@ -2566,18 +2673,23 @@ mod tests {
     #[test]
     fn the_packing_permit_follows_the_coordinator_pool_not_the_light_share() {
         let prod = DerivedBudget::from_limits(80 * GIB, 48);
+        // The backstop less repair's holdback — except the holdback is itself
+        // capped so the lane always keeps `LIGHT_MIN_SLICES`, which is what binds
+        // on a box whose ramp budget is small.
+        let backstop = prod.light_pool_slices();
+        let lent = prod.repair_pool_holdback_slices().min(backstop.saturating_sub(LIGHT_MIN_SLICES));
         assert_eq!(
             prod.light_optimize_k(11),
-            prod.light_pool_slices() - prod.repair_pool_holdback_slices(),
-            "the concurrency term is the CPU backstop less repair's holdback; memory is the gate's job, not a reservation's"
+            backstop - lent,
+            "the concurrency term is the backstop less the CAPPED holdback; memory is the gate's job, not a reservation's"
         );
         assert!(prod.light_optimize_k(11) > 1, "one permit shared by HotPacking and SealedConsolidation starves packing");
         // The total is the CPU backstop; the light/repair SPLIT may move, the total
         // may not drift without someone deciding it should.
         assert_eq!(
-            prod.light_optimize_k(11) + prod.repair_pool_holdback_slices(),
-            prod.light_pool_slices(),
-            "the lane must run to its backstop — memory pressure is the gate's decision, made against live readings"
+            prod.light_optimize_k(11) + lent,
+            backstop,
+            "the lane must run to its backstop once repair's CAPPED holdback is returned — memory pressure is the gate's decision, made live"
         );
 
         // NEVER OOM, made checkable. The gate refuses above `HYGIENE_GATE_SHUT` of
@@ -2586,10 +2698,8 @@ mod tests {
         // matters: the pool SPILLS rather than failing, so tracked memory cannot
         // kill the process and decode buffers can.
         let ceiling = prod.light_pool_slices();
-        let worst_case = (ceiling * COORDINATOR_PER_SORT_BUDGET_BYTES) as f64 * UNTRACKED_PER_TRACKED_BYTE;
-        // Only hygiene's SHARE of the headroom — the remainder is for allocators
-        // that never consult the gate, which is what the 96% peak was made of.
-        let headroom = prod.memory_limit_bytes as f64 * (1.0 - HYGIENE_GATE_SHUT) * HYGIENE_RAMP_HEADROOM_SHARE;
+        let worst_case = ceiling as f64 * HYGIENE_RAMP_PER_SORT_BYTES + HYGIENE_NON_LANE_GROWTH_BYTES as f64;
+        let headroom = prod.memory_limit_bytes as f64 * (HYGIENE_TARGET_PEAK - HYGIENE_GATE_SHUT);
         assert!(
             worst_case <= headroom,
             "a fully-ramped hygiene lane ({ceiling} sorts, {:.1} GiB worst case) must fit the headroom the gate leaves ({:.1} GiB)",
@@ -3284,9 +3394,9 @@ mod hygiene_peak_report {
     fn a_fully_ramped_lane_peaks_with_margin_to_spare() {
         for (gib, cores) in [(120usize, 44usize), (120, 48), (80, 48), (120, 32)] {
             let b = DerivedBudget::from_limits(gib * GIB, cores);
-            let ramp = (b.light_pool_slices() * COORDINATOR_PER_SORT_BUDGET_BYTES) as f64 * UNTRACKED_PER_TRACKED_BYTE;
+            let ramp = b.light_pool_slices() as f64 * HYGIENE_RAMP_PER_SORT_BYTES + HYGIENE_NON_LANE_GROWTH_BYTES as f64;
             let peak = HYGIENE_GATE_SHUT + ramp / (gib * GIB) as f64;
-            assert!(peak < 0.90, "{gib} GiB / {cores} cores: predicted peak {:.0}% leaves too little before the OOM killer", peak * 100.0);
+            assert!(peak <= HYGIENE_TARGET_PEAK + 0.01, "{gib} GiB / {cores} cores: predicted peak {:.0}% exceeds the target", peak * 100.0);
         }
     }
 }

@@ -2278,6 +2278,7 @@ impl Database {
         let Some(_permit) = self.maintenance_admission.try_acquire_for(
             Resources { cpu: 1, decoded_bytes: per_shard_bytes, object_reads: 1, object_writes: 1 },
             crate::maintenance_coordinator::AdmissionLane::Rollup,
+            self.admission_memory(),
         ) else {
             // Transient, never "too big to admit": the shard count above was chosen so
             // `per_shard_bytes <= MAX_DECODED_BYTES`.
@@ -3116,7 +3117,7 @@ impl Database {
             Operation::BaseRollup | Operation::DerivedRollup => crate::maintenance_coordinator::AdmissionLane::Rollup,
             _ => crate::maintenance_coordinator::AdmissionLane::Other,
         };
-        let Some(_permit) = self.maintenance_admission.try_acquire_for(request, lane) else {
+        let Some(_permit) = self.maintenance_admission.try_acquire_for(request, lane, self.admission_memory()) else {
             return self.retried(&key, "admission_busy".to_owned(), self.admission_backoff_for(&key));
         };
         note(2);
