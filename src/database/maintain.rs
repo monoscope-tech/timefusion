@@ -1667,6 +1667,22 @@ impl Database {
         Self::add_tag(add, crate::maintenance_coordinator::TAG_PROJECT)
     }
 
+    /// The slice of `add`, when it is the same project's and STRICTLY wider than
+    /// `key`'s — the condition that makes publishing `key` a double count, since
+    /// the replace-set only removes files CONTAINED in the slice.
+    ///
+    /// One spelling for both call sites of [`Self::settle_covered_by_wider`]: a
+    /// second copy of this rule is how the pre-scan check and the post-write
+    /// safety net drift apart, and the disagreeing one double counts.
+    fn covering_slice_for(add: &deltalake::kernel::Add, key: &crate::maintenance_coordinator::TaskKey) -> Option<(i64, i64)> {
+        let (start, end) = Self::slice_tag_range(add)?;
+        (Self::tag_project(add) == Some(key.project_id.as_str())
+            && (start, end) != (key.slice.start_micros, key.slice.end_micros)
+            && start <= key.slice.start_micros
+            && end >= key.slice.end_micros)
+            .then_some((start, end))
+    }
+
     /// Decoded bytes a unit reads from one file, narrowed to the columns it
     /// projects: `(prorated to the slice, whole file)`. The unprorated figure is
     /// what a sibling slice over the same file would re-read.
@@ -2242,16 +2258,7 @@ impl Database {
         if let Ok(target_ref) = self.resolve_table(&key.project_id, &key.physical_table).await {
             let covering = {
                 let target = target_ref.read().await;
-                target.snapshot().ok().and_then(|snapshot| {
-                    snapshot.log_data().iter().map(|file| add_action(&file)).find_map(|add| {
-                        let (start, end) = Self::slice_tag_range(&add)?;
-                        (Self::tag_project(&add) == Some(key.project_id.as_str())
-                            && (start, end) != (key.slice.start_micros, key.slice.end_micros)
-                            && start <= key.slice.start_micros
-                            && end >= key.slice.end_micros)
-                            .then_some((start, end))
-                    })
-                })
+                target.snapshot().ok().and_then(|snapshot| snapshot.log_data().iter().find_map(|file| Self::covering_slice_for(&add_action(&file), &key)))
             };
             if let Some(covering) = covering {
                 self.settle_covered_by_wider(&key, covering, source_rows, &from_table, witness_table.as_ref(), date).await?;
@@ -2492,22 +2499,13 @@ impl Database {
         // `clear_untagged_cell` would drop the hole boost from an unrepaired partition.
         let retiring = replaced.iter().filter(|add| no_identity(add)).count() as u64;
         let leaves_partition_clean = !live_adds.iter().filter(|add| in_partition(add) && !replaced.iter().any(|gone| gone.path == add.path)).any(no_identity);
-        // A slice covered by a STRICTLY WIDER live file must not publish: the replace-set
-        // only removes files CONTAINED in this slice, so both would stay live and be
-        // summed. Applies to BOTH tiers.
-        let covered_by_wider = live_adds.iter().find_map(|add| {
-            let (start, end) = Self::slice_tag_range(add)?;
-            (Self::tag_project(add) == Some(key.project_id.as_str())
-                && (start, end) != (key.slice.start_micros, key.slice.end_micros)
-                && start <= key.slice.start_micros
-                && end >= key.slice.end_micros)
-                .then_some((start, end))
-        });
-        if let Some(covering) = covered_by_wider {
-            // Kept as the SAFETY NET. The same decision is made before the scan
-            // (see `settle_covered_by_wider`'s call site above), but a wider slice
-            // can be committed by another worker while this unit was aggregating,
-            // so the post-write check must stay.
+        // Applies to BOTH tiers — see `covering_slice_for` for why publishing over a
+        // wider live file double counts.
+        if let Some(covering) = live_adds.iter().find_map(|add| Self::covering_slice_for(add, &key)) {
+            // The SAFETY NET. The same decision is made before the scan (see the
+            // other `settle_covered_by_wider` call site), but a wider slice can be
+            // committed by another worker while this unit was aggregating, so the
+            // post-write check must stay.
             self.settle_covered_by_wider(&key, covering, source_rows, &from_table, witness_table.as_ref(), date).await?;
             return Ok(true);
         }
@@ -2966,15 +2964,8 @@ impl Database {
                 let available = self.light_rewrite_sem.available_permits();
                 stats.light_rewrite_permits_available.store(available as u64, std::sync::atomic::Ordering::Relaxed);
                 let ceiling = self.config.derived.max_light_optimize_k().max(1);
-                let pool = self.coordinator_runtime_env().memory_pool.reserved();
-                if !self.hygiene_gate.admits(
-                    &self.config.derived,
-                    pool,
-                    self.config.derived.coordinator_share_bytes(),
-                    ceiling.saturating_sub(available),
-                    ceiling,
-                    self.buffer_pressure_pct(),
-                ) {
+                let in_flight = ceiling.saturating_sub(available);
+                if !self.hygiene_gate.admits(self.admission_memory(), in_flight, ceiling, self.config.derived.hygiene_floor_slices()) {
                     return Ok(false);
                 }
                 match Arc::clone(&self.light_rewrite_sem).try_acquire_owned() {

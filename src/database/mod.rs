@@ -5240,17 +5240,30 @@ struct HygieneGateState {
     /// Hysteresis for the MEMORY verdict only — never the backstop. Starts open;
     /// a cold process with an empty lane has nothing to back off from.
     open: bool,
-    sampled: Option<(std::time::Instant, usize)>,
-    /// Decaying high-water mark, and when it was set. Lending is decided against
-    /// this rather than the live reading — see `MemorySnapshot::peak_rss_bytes`.
-    peak: (std::time::Instant, usize),
+    sampled: Option<Reading>,
+    /// Decaying high-water mark. Lending is decided against this rather than the
+    /// live reading — see `MemorySnapshot::peak_rss_bytes`.
+    peak: Reading,
+}
+
+/// An RSS reading and when it was taken.
+#[derive(Debug, Clone, Copy)]
+struct Reading {
+    at: std::time::Instant,
+    bytes: usize,
+}
+
+impl Reading {
+    fn age(&self, now: std::time::Instant) -> std::time::Duration {
+        now.duration_since(self.at)
+    }
 }
 
 impl Default for HygieneGateState {
     fn default() -> Self {
         // Opens with no history: a cold process has nothing to back off from,
         // and the first sample sets the watermark.
-        Self { open: true, sampled: None, peak: (std::time::Instant::now(), 0) }
+        Self { open: true, sampled: None, peak: Reading { at: std::time::Instant::now(), bytes: 0 } }
     }
 }
 
@@ -5261,39 +5274,33 @@ impl HygieneGate {
     /// spare capacity before the next peak arrives.
     const PEAK_DECAY: std::time::Duration = std::time::Duration::from_secs(600);
 
-    /// The cached memory reading, for callers that need the snapshot rather than
-    /// the verdict — admission sizes its decoded-bytes ceiling from the same
-    /// sample so the two decisions cannot disagree about the state of the box.
-    pub(crate) fn snapshot(
-        &self, cfg: &crate::config::DerivedBudget, pool_reserved: usize, pool_size: usize, buffer_pressure: u32,
-    ) -> crate::config::MemorySnapshot {
-        let mut state = crate::support::lock(&self.state);
-        self.sample_locked(&mut state, cfg, pool_reserved, pool_size, buffer_pressure)
-    }
-
     /// One cached reading, plus the decaying high-water mark lending uses.
+    ///
+    /// Admission sizes its decoded-bytes ceiling from the same sample the gate
+    /// decides on, so the two cannot disagree about the state of the box.
     ///
     /// The peak decays by expiry rather than by a moving average: the question
     /// is "has this box been near its limit RECENTLY", and an average of a
     /// 45%-to-99% cycle answers neither end of it.
-    fn sample_locked(
-        &self, state: &mut HygieneGateState, cfg: &crate::config::DerivedBudget, pool_reserved: usize, pool_size: usize, buffer_pressure: u32,
+    pub(crate) fn snapshot(
+        &self, cfg: &crate::config::DerivedBudget, pool_reserved: usize, pool_size: usize, buffer_pressure: u32,
     ) -> crate::config::MemorySnapshot {
+        let mut state = crate::support::lock(&self.state);
         let now = std::time::Instant::now();
         let rss = match state.sampled {
-            Some((at, bytes)) if now.duration_since(at) < Self::SAMPLE_TTL => bytes,
+            Some(prev) if prev.age(now) < Self::SAMPLE_TTL => prev.bytes,
             _ => {
                 let bytes = process_memory_bytes().unwrap_or(0);
-                state.sampled = Some((now, bytes));
+                state.sampled = Some(Reading { at: now, bytes });
                 bytes
             }
         };
-        if rss >= state.peak.1 || now.duration_since(state.peak.0) > Self::PEAK_DECAY {
-            state.peak = (now, rss);
+        if rss >= state.peak.bytes || state.peak.age(now) > Self::PEAK_DECAY {
+            state.peak = Reading { at: now, bytes: rss };
         }
         crate::config::MemorySnapshot {
             rss_bytes: rss,
-            peak_rss_bytes: state.peak.1,
+            peak_rss_bytes: state.peak.bytes,
             limit_bytes: cfg.memory_limit_bytes,
             pool_reserved_bytes: pool_reserved,
             pool_size_bytes: pool_size,
@@ -5309,24 +5316,30 @@ impl HygieneGate {
     /// across the moment capacity freed: a test that frees every permit and
     /// re-asks immediately got refused. The cache already bounds the syscalls,
     /// which is all the backoff was really buying.
-    fn admits(
-        &self, cfg: &crate::config::DerivedBudget, pool_reserved: usize, pool_size: usize, in_flight: usize, ceiling: usize, buffer_pressure: u32,
-    ) -> bool {
+    ///
+    /// Takes the sample rather than the four readings it is built from: the
+    /// caller already holds one (admission sizes its ceiling from it), and two
+    /// views of the same box that disagree are worse than one that is stale.
+    /// Sampling therefore happens under a SEPARATE acquisition of this lock, so
+    /// the latch below is not updated atomically with the reading — harmless,
+    /// because the latch is recomputed from whatever sample arrives and the
+    /// sample itself is a 500 ms cache every caller shares.
+    fn admits(&self, sample: crate::config::MemorySnapshot, in_flight: usize, ceiling: usize, floor: usize) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
         let mut state = crate::support::lock(&self.state);
-        let sample = self.sample_locked(&mut state, cfg, pool_reserved, pool_size, buffer_pressure);
         // The memory latch is updated from memory alone; the floor and backstop
         // are then composed on top for this caller's answer.
         let was_open = state.open;
         state.open = crate::config::hygiene_memory_open(sample, was_open);
         let stats = crate::observability::maintenance_stats();
-        stats.hygiene_gate_open.store(u64::from(state.open), std::sync::atomic::Ordering::Relaxed);
+        stats.hygiene_gate_open.store(u64::from(state.open), Relaxed);
         // Once per EPISODE — the open->shut edge — not once per asking worker.
         // Counting attempts made this read 99/sec on a lane that was merely full,
         // a number that says nothing about how long it stayed that way.
         if was_open && !state.open {
-            stats.compaction_permits_unavailable.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            stats.compaction_permits_unavailable.fetch_add(1, Relaxed);
         }
-        crate::config::hygiene_admits(sample, in_flight, ceiling, cfg.hygiene_floor_slices(), was_open)
+        crate::config::hygiene_admits(sample, in_flight, ceiling, floor, was_open)
     }
 }
 

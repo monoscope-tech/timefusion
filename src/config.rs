@@ -205,7 +205,7 @@ const UNTRACKED_PER_TRACKED_BYTE: f64 = SAFE_DECODED_PER_POOL_BYTE;
 /// testable without `/sys` — the thresholds and their hysteresis are the part
 /// that can silently OOM a box, and they deserve the same treatment the claim
 /// rank memo got.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct MemorySnapshot {
     /// What the OOM killer acts on: cgroup usage less reclaimable page cache.
     pub rss_bytes: usize,
@@ -286,8 +286,12 @@ const _: () = assert!(HYGIENE_GATE_REOPEN < HYGIENE_GATE_SHUT);
 impl MemorySnapshot {
     /// A reading that grants no elastic allowance. `limit_bytes == 0` is how
     /// "we do not know" is spelled, and every consumer treats it as pressure.
+    ///
+    /// Derived rather than spelled out: a field added later and missed here
+    /// would default to zero anyway, and zero is the safe direction for every
+    /// field in this struct.
     pub fn unknown() -> Self {
-        Self { rss_bytes: 0, peak_rss_bytes: 0, limit_bytes: 0, pool_reserved_bytes: 0, pool_size_bytes: 0, buffer_pressure_pct: 0 }
+        Self::default()
     }
 }
 
@@ -320,18 +324,19 @@ const DECODED_ELASTIC_MAX_MULTIPLE: u64 = 3;
 /// Shrinking is safe by construction: the controller tracks USED, so a smaller
 /// ceiling refuses new admissions rather than un-reserving in-flight ones.
 pub fn elastic_decoded_capacity(base: u64, sample: MemorySnapshot) -> u64 {
-    if sample.limit_bytes == 0 {
-        return base;
-    }
-    // A filling buffer means flush needs the box; lending decode budget to
-    // maintenance in that state is the opposite of the priority we want.
-    if sample.buffer_pressure_pct >= HYGIENE_BUFFER_YIELD_PCT {
-        return base;
-    }
     // The PEAK, never the instantaneous reading — see the field.
     let watermark = sample.peak_rss_bytes.max(sample.rss_bytes);
     let used_fraction = watermark as f64 / sample.limit_bytes as f64;
-    if used_fraction >= HYGIENE_GATE_SHUT {
+    // Three ways to lend nothing: we cannot measure the box, ingest needs it (a
+    // filling buffer means flush wants the memory, and lending it to maintenance
+    // is the opposite of the priority we want), or we are at the shut line.
+    //
+    // The `limit_bytes == 0` disjunct is deliberate rather than load-bearing.
+    // Drop it and an unmeasurable box still lends nothing, but only by accident:
+    // a zero limit divides 0 by 0, NaN compares false against every threshold and
+    // then propagates through `clamp` into a float cast that saturates to zero.
+    // Safety resting on NaN semantics is not safety, so the check says it.
+    if sample.limit_bytes == 0 || sample.buffer_pressure_pct >= HYGIENE_BUFFER_YIELD_PCT || used_fraction >= HYGIENE_GATE_SHUT {
         return base;
     }
     // Linear in how far below the shut line we sit: full growth at an empty box,
