@@ -3269,6 +3269,13 @@ impl Database {
 
     pub(crate) async fn run_maintenance_coordinator_once(&self) -> Result<bool> {
         use crate::maintenance_coordinator::Operation;
+        // Quiesced for a deploy handoff: claim nothing new and report idle, so
+        // workers park on `maintenance_work` instead of spinning. In-flight units
+        // are left to finish — this stops the lane GROWING while the write fence
+        // drains, it does not abandon work. See `Database::quiesce_maintenance`.
+        if self.maintenance_quiesced.load(std::sync::atomic::Ordering::Acquire) {
+            return Ok(false);
+        }
         let now = crate::support::now_micros();
         let last = self.maintenance_debt_planned_at.load(std::sync::atomic::Ordering::Relaxed);
         if now.saturating_sub(last) >= 60_000_000

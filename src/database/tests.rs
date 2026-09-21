@@ -6024,6 +6024,39 @@ async fn session_contexts_share_one_memory_pool() -> Result<()> {
     Ok(())
 }
 
+/// A deploy handoff must be able to stop the maintenance lane GROWING, and the
+/// lane must come back if the handoff fails.
+///
+/// The drain waits up to four minutes for in-flight writers; under a saturated
+/// lane ordinary ingest writes take minutes and it never finishes. Three
+/// consecutive rollouts failed that way on 2026-09-21 — each one then leaving a
+/// mutating lease that blocked the next deploy for two hours.
+///
+/// The resume-on-drop half is the part worth pinning: a handoff that times out
+/// reopens write admission, and a lane left quiesced after that would be a
+/// permanent stall dressed as a safety feature.
+#[tokio::test]
+async fn a_deploy_handoff_can_quiesce_maintenance_and_the_lane_returns() -> Result<()> {
+    let db = Database::with_config(create_test_config("handoff-quiesce")).await?;
+    assert!(!db.maintenance_quiesced.load(std::sync::atomic::Ordering::Acquire), "a fresh database claims normally");
+
+    let quiesced = db.quiesce_maintenance();
+    assert!(db.maintenance_quiesced.load(std::sync::atomic::Ordering::Acquire), "the guard suspends claiming");
+    assert!(!db.run_maintenance_coordinator_once().await?, "a quiesced coordinator must report IDLE, so its workers park instead of spinning");
+
+    drop(quiesced);
+    assert!(
+        !db.maintenance_quiesced.load(std::sync::atomic::Ordering::Acquire),
+        "a failed handoff must resume the lane, exactly as it reopens write admission"
+    );
+
+    // And the success path keeps it suspended: the replacement owns writes from
+    // that point, so this process must not compact partitions it has handed over.
+    db.quiesce_maintenance().hold_until_exit();
+    assert!(db.maintenance_quiesced.load(std::sync::atomic::Ordering::Acquire), "a completed handoff holds the lane down until exit");
+    Ok(())
+}
+
 /// A packing unit must not CLAIM a slot it has no permit to start: claiming stamps the unit
 /// `Running` and starts its 900 s deadline, which would then be spent waiting in the permit
 /// queue. The permit is taken BEFORE the claim, and a turn that cannot get one leaves the task

@@ -621,7 +621,18 @@ impl LoggingSimpleQueryHandler {
     /// and keep serving reads until the orchestrator replaces this task.
     async fn run_handoff(&self) -> PgWireResult<Vec<Response>> {
         let layer = require_available(self.db.as_ref().and_then(|d| d.buffered_layer()), "HANDOFF")?;
+        // Stop ADDING maintenance load before fencing writes. The drain waits for
+        // in-flight writers, and a saturated lane makes ordinary ingest writes
+        // take minutes — three rollouts failed this way on 2026-09-21. The guard
+        // resumes the lane if the handoff fails, mirroring how the fence reopens
+        // write admission on its own failure path.
+        let quiesced = self.db.as_ref().map(|db| db.quiesce_maintenance());
         let stats = layer.prepare_deploy_handoff().await.map_err(|e| admin_err(format!("HANDOFF: {e}")))?;
+        // Succeeded: the replacement owns writes now, so this process must not
+        // resume compacting partitions its successor has taken over.
+        if let Some(quiesced) = quiesced {
+            quiesced.hold_until_exit();
+        }
         if !crate::support::is_frozen() {
             layer.reclaim_wal_after_flush().await;
         }

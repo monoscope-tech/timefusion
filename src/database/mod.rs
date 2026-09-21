@@ -2453,6 +2453,9 @@ pub struct Database {
     light_rewrite_sem: Arc<tokio::sync::Semaphore>,
     /// Live-memory admission for the hygiene lane — see [`HygieneGate`].
     hygiene_gate: Arc<HygieneGate>,
+    /// Set while a deploy handoff drains the write fence — see
+    /// [`Database::quiesce_maintenance`].
+    maintenance_quiesced: Arc<std::sync::atomic::AtomicBool>,
     /// Caps current-day packing while sealed consolidation is pending. It is
     /// consulted only while sealed debt exists, so the full light pool remains
     /// available to hot packing after catch-up.
@@ -3025,6 +3028,7 @@ impl Database {
             maintenance_rewrite_sem: Arc::new(tokio::sync::Semaphore::new(cfg.derived.rewrite_permits().max(1))),
             light_rewrite_sem: Arc::new(tokio::sync::Semaphore::new(light_rewrite_permits)),
             hygiene_gate: Arc::new(HygieneGate::default()),
+            maintenance_quiesced: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             hot_packing_sem: Arc::new(tokio::sync::Semaphore::new(hot_packing_permits)),
             repair_holdback_lent: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             repair_rewrite_sem: Arc::new(tokio::sync::Semaphore::new(cfg.derived.repair_rewrite_budget_mib())),
@@ -5321,7 +5325,53 @@ impl HygieneGate {
     }
 }
 
+/// Suspends maintenance claiming until dropped — see
+/// [`Database::quiesce_maintenance`].
+#[must_use = "the lane resumes the moment this is dropped"]
+pub(crate) struct MaintenanceQuiesce(Arc<std::sync::atomic::AtomicBool>);
+
+impl MaintenanceQuiesce {
+    /// Keep the lane suspended for the rest of the process's life.
+    ///
+    /// Only correct once the handoff has SUCCEEDED: the replacement owns the
+    /// writes from that point and this process is waiting to be replaced, so
+    /// resuming compaction here would dirty partitions the successor has already
+    /// taken responsibility for.
+    pub(crate) fn hold_until_exit(self) {
+        std::mem::forget(self);
+    }
+}
+
+impl Drop for MaintenanceQuiesce {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
 impl Database {
+    /// Stop claiming new maintenance units until the returned guard is dropped.
+    ///
+    /// A deploy handoff fences write admission and then waits up to four minutes
+    /// for in-flight writers to drain. Under a saturated maintenance lane that
+    /// wait does not finish: prod 2026-09-21 failed three consecutive rollouts
+    /// with 59 units running and memory at 96%, because ordinary ingest writes
+    /// take minutes under that pressure. Maintenance does not hold write
+    /// admission itself — the coupling is through memory and IO — so the fix is
+    /// to stop ADDING load for the duration of the drain rather than to keep
+    /// shaving the lane's steady-state concurrency, which trades throughput
+    /// against deployability forever.
+    ///
+    /// In-flight units are deliberately left alone. Cancelling them would requeue
+    /// work and dirty partitions on every deploy; this only stops the lane
+    /// growing while the fence drains.
+    ///
+    /// RAII because the failure path matters most: a handoff that times out must
+    /// resume maintenance, exactly as it reopens write admission.
+    pub(crate) fn quiesce_maintenance(&self) -> MaintenanceQuiesce {
+        self.maintenance_quiesced.store(true, std::sync::atomic::Ordering::Release);
+        MaintenanceQuiesce(Arc::clone(&self.maintenance_quiesced))
+    }
+
     /// The memory reading admission sizes its decoded-bytes ceiling from.
     ///
     /// Shares the hygiene gate's cached sample deliberately: two views of the
