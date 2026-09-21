@@ -5,7 +5,7 @@ use anyhow::Context;
 use tap::Tap;
 
 #[derive(Clone, Copy)]
-enum TaskSelection<'a> {
+pub(crate) enum TaskSelection<'a> {
     Next(crate::maintenance_coordinator::Operation),
     Exact(&'a crate::maintenance_coordinator::TaskKey),
 }
@@ -1926,7 +1926,7 @@ impl Database {
         self.run_coordinator_rollup_selected(TaskSelection::Next(operation)).await
     }
 
-    async fn run_coordinator_rollup_selected(&self, selection: TaskSelection<'_>) -> Result<bool> {
+    pub(crate) async fn run_coordinator_rollup_selected(&self, selection: TaskSelection<'_>) -> Result<bool> {
         let operation = selection.operation();
         use crate::maintenance_coordinator::{MAX_DECODED_BYTES, Operation, Resources, TaskState};
         use deltalake::{
@@ -2229,6 +2229,35 @@ impl Database {
         if self.resume_rollup_unit(&key, source_rows.and_then(|rows| u64::try_from(rows).ok())).await? {
             return self.completed(&key);
         }
+        // So does discovering that a WIDER live file already covers this slice. That
+        // decision reads only the target tier's committed file tags, so it was always
+        // available here — but it used to be made after the scan, the aggregate AND the
+        // parquet write, all of which were then discarded. Prod 2026-09-21: 3,829 units
+        // took that path against 210 clean completions, which is most of 608
+        // worker-minutes of scanning per 25 minutes, and every one of them uploaded
+        // parquet that was never committed.
+        //
+        // Absent or unreadable target tier means "not covered": the conservative
+        // direction is to do the work, exactly as before this check existed.
+        if let Ok(target_ref) = self.resolve_table(&key.project_id, &key.physical_table).await {
+            let covering = {
+                let target = target_ref.read().await;
+                target.snapshot().ok().and_then(|snapshot| {
+                    snapshot.log_data().iter().map(|file| add_action(&file)).find_map(|add| {
+                        let (start, end) = Self::slice_tag_range(&add)?;
+                        (Self::tag_project(&add) == Some(key.project_id.as_str())
+                            && (start, end) != (key.slice.start_micros, key.slice.end_micros)
+                            && start <= key.slice.start_micros
+                            && end >= key.slice.end_micros)
+                            .then_some((start, end))
+                    })
+                })
+            };
+            if let Some(covering) = covering {
+                self.settle_covered_by_wider(&key, covering, source_rows, &from_table, witness_table.as_ref(), date).await?;
+                return Ok(true);
+            }
+        }
         // A rebuild whose INPUT is unchanged reproduces its own output, and the queue
         // re-mints such units routinely. Three conditions, all necessary:
         //   * `content_fp` — the input file set INCLUDING deletion vectors, so a DV'd
@@ -2474,71 +2503,12 @@ impl Database {
                 && end >= key.slice.end_micros)
                 .then_some((start, end))
         });
-        if let Some((covering_start, covering_end)) = covered_by_wider {
-            // The enqueue below exists because dropping the unit would leave the hour
-            // stale in the coarse tier — WHEN the coarse tier is stale. When the
-            // covering slice's witness still verifies (the same whole-or-bounded rules
-            // the read path applies), the coarse answer is current and this unit can
-            // simply complete.
-            //
-            // Without this check, a planner width that disagrees with the tier width
-            // livelocks on a maintained sealed day: the witness-moved requeue mints
-            // narrow units, each escalates here and unconditionally re-enqueues the
-            // covering unit, which re-aggregates a whale slice into a no-op republish,
-            // and source maintenance keeps the whole-partition witness moving so the
-            // requeue never stops. Prod 2026-09-15: one 3h slice ran 71 times in 90
-            // minutes (30 Complete, 37 Superseded, 34 escalations), pinned against the
-            // same 6h covering file the whole time.
-            let covering_fresh = 'fresh: {
-                let cov_key = (key.project_id.clone(), key.source.clone(), key.physical_table.clone(), covering_start, covering_end);
-                let Some(cov) = self.rollup_slice_coverage.get(&cov_key).map(|entry| entry.value().clone()) else { break 'fresh false };
-                let whole = source_rows.and_then(|rows| u64::try_from(rows).ok());
-                if witness_matches(cov.source_rows, whole) {
-                    break 'fresh true;
-                }
-                let Some(witness_below) = cov.source_rows_below else { break 'fresh false };
-                // Bounded compare at the COVERING slice's own bound — `source_rows_below`
-                // in scope was taken at THIS unit's end, which is not the covering end.
-                let table = from_table.read().await;
-                let witness_guard = match &witness_table {
-                    Some(witness) => Some(witness.read().await),
-                    None => None,
-                };
-                let witness_source: &DeltaTable = witness_guard.as_deref().unwrap_or(&table);
-                let date_string = date.to_string();
-                let below = Self::partition_stats_bounded(witness_source, tiebreak_of(&key.source), &|_, _| covering_end)
-                    .ok()
-                    .and_then(|mut stats| {
-                        stats.remove(&(key.project_id.clone(), date_string.clone())).or_else(|| stats.remove(&("default".to_string(), date_string)))
-                    })
-                    .and_then(|stats| u64::try_from(stats.rows).ok());
-                witness_matches(Some(witness_below), below)
-            };
-            if covering_fresh {
-                crate::observability::maintenance_stats().rollup_escalation_skipped_fresh.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let mut journal = self.journal();
-                journal.complete(&key);
-                journal.checkpoint()?;
-                info!(
-                    table = %key.physical_table, project_id = %key.project_id,
-                    slice_start = key.slice.start_micros, covering_start, covering_end,
-                    event = "maintenance_rollup_completed_under_fresh_covering_slice"
-                );
-                return Ok(true);
-            }
-            crate::observability::maintenance_stats().rollup_skipped_covered_by_wider.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let mut journal = self.journal();
-            if let Ok(covering) = crate::maintenance_coordinator::TimeSlice::new(covering_start, covering_end) {
-                let now = crate::support::now_micros();
-                journal.enqueue(crate::maintenance_coordinator::TaskKey { slice: covering, ..key.clone() }, now, MAX_DECODED_BYTES, unix_ms(now));
-            }
-            journal.complete(&key);
-            journal.checkpoint()?;
-            info!(
-                table = %key.physical_table, project_id = %key.project_id,
-                slice_start = key.slice.start_micros, covering_start, covering_end,
-                event = "maintenance_rollup_escalated_to_covering_slice"
-            );
+        if let Some(covering) = covered_by_wider {
+            // Kept as the SAFETY NET. The same decision is made before the scan
+            // (see `settle_covered_by_wider`'s call site above), but a wider slice
+            // can be committed by another worker while this unit was aggregating,
+            // so the post-write check must stay.
+            self.settle_covered_by_wider(&key, covering, source_rows, &from_table, witness_table.as_ref(), date).await?;
             return Ok(true);
         }
         let target_paths = replaced.iter().map(|add| add.path.clone()).collect::<Vec<_>>();
@@ -3711,6 +3681,99 @@ impl Database {
             }
             _ => Some(crate::support::test_helpers::array_get_str(array.as_ref(), row)),
         }
+    }
+
+    /// Settle a unit whose slice a strictly WIDER live file already covers.
+    ///
+    /// Publishing anyway would leave both files live and double count, because the
+    /// replace-set only removes files CONTAINED in this slice. So the unit either
+    /// completes (the covering answer is current) or hands off to the covering
+    /// slice and completes.
+    ///
+    /// Called TWICE on purpose. Before the scan it is the whole point — the
+    /// decision reads only the target tier's COMMITTED files, so paying a scan,
+    /// an aggregate and a parquet write before discovering it is pure waste. Prod
+    /// 2026-09-21 took that path 3,829 times against 210 clean completions, which
+    /// is most of 608 worker-minutes of scanning per 25 minutes. After the write
+    /// it stays as the safety net, since another worker can commit a wider slice
+    /// while this one aggregates.
+    ///
+    /// One body, two call sites: a second spelling of the freshness rule is how
+    /// the two drift and one of them starts double counting.
+    async fn settle_covered_by_wider(
+        &self, key: &crate::maintenance_coordinator::TaskKey, (covering_start, covering_end): (i64, i64), source_rows: Option<i64>,
+        from_table: &Arc<RwLock<DeltaTable>>, witness_table: Option<&Arc<RwLock<DeltaTable>>>, date: chrono::NaiveDate,
+    ) -> Result<()> {
+        // The enqueue below exists because dropping the unit would leave the hour
+        // stale in the coarse tier — WHEN the coarse tier is stale. When the
+        // covering slice's witness still verifies (the same whole-or-bounded rules
+        // the read path applies), the coarse answer is current and this unit can
+        // simply complete.
+        //
+        // Without this check, a planner width that disagrees with the tier width
+        // livelocks on a maintained sealed day: the witness-moved requeue mints
+        // narrow units, each escalates here and unconditionally re-enqueues the
+        // covering unit, which re-aggregates a whale slice into a no-op republish,
+        // and source maintenance keeps the whole-partition witness moving so the
+        // requeue never stops. Prod 2026-09-15: one 3h slice ran 71 times in 90
+        // minutes (30 Complete, 37 Superseded, 34 escalations), pinned against the
+        // same 6h covering file the whole time.
+        let covering_fresh = 'fresh: {
+            let cov_key = (key.project_id.clone(), key.source.clone(), key.physical_table.clone(), covering_start, covering_end);
+            let Some(cov) = self.rollup_slice_coverage.get(&cov_key).map(|entry| entry.value().clone()) else { break 'fresh false };
+            let whole = source_rows.and_then(|rows| u64::try_from(rows).ok());
+            if witness_matches(cov.source_rows, whole) {
+                break 'fresh true;
+            }
+            let Some(witness_below) = cov.source_rows_below else { break 'fresh false };
+            // Bounded compare at the COVERING slice's own bound — `source_rows_below`
+            // in scope was taken at THIS unit's end, which is not the covering end.
+            let table = from_table.read().await;
+            let witness_guard = match &witness_table {
+                Some(witness) => Some(witness.read().await),
+                None => None,
+            };
+            let witness_source: &DeltaTable = witness_guard.as_deref().unwrap_or(&table);
+            let date_string = date.to_string();
+            let below = Self::partition_stats_bounded(witness_source, tiebreak_of(&key.source), &|_, _| covering_end)
+                .ok()
+                .and_then(|mut stats| {
+                    stats.remove(&(key.project_id.clone(), date_string.clone())).or_else(|| stats.remove(&("default".to_string(), date_string)))
+                })
+                .and_then(|stats| u64::try_from(stats.rows).ok());
+            witness_matches(Some(witness_below), below)
+        };
+        if covering_fresh {
+            crate::observability::maintenance_stats().rollup_escalation_skipped_fresh.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let mut journal = self.journal();
+            journal.complete(key);
+            journal.checkpoint()?;
+            info!(
+            table = %key.physical_table, project_id = %key.project_id,
+            slice_start = key.slice.start_micros, covering_start, covering_end,
+            event = "maintenance_rollup_completed_under_fresh_covering_slice"
+            );
+            return Ok(());
+        }
+        crate::observability::maintenance_stats().rollup_skipped_covered_by_wider.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut journal = self.journal();
+        if let Ok(covering) = crate::maintenance_coordinator::TimeSlice::new(covering_start, covering_end) {
+            let now = crate::support::now_micros();
+            journal.enqueue(
+                crate::maintenance_coordinator::TaskKey { slice: covering, ..key.clone() },
+                now,
+                crate::maintenance_coordinator::MAX_DECODED_BYTES,
+                unix_ms(now),
+            );
+        }
+        journal.complete(key);
+        journal.checkpoint()?;
+        info!(
+            table = %key.physical_table, project_id = %key.project_id,
+            slice_start = key.slice.start_micros, covering_start, covering_end,
+            event = "maintenance_rollup_escalated_to_covering_slice"
+        );
+        Ok(())
     }
 
     pub(crate) fn partition_stats_bounded(

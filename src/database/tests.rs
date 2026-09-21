@@ -2083,6 +2083,99 @@ async fn recovery_queues_a_rebuild_for_a_partition_holding_untagged_tier_files()
 /// An untagged file already CONTAINED in a live tagged slice queues that
 /// slice, not the file's own span.
 ///
+/// A slice a wider live file already covers must settle WITHOUT scanning.
+///
+/// The decision reads only the target tier's committed file tags, so it was
+/// always available before the work — but it used to be made after the scan, the
+/// aggregate AND the parquet write, every one of which was then discarded. Prod
+/// 2026-09-21 took that path 3,829 times against 210 clean completions, most of
+/// 608 worker-minutes of scanning per 25 minutes, each leaving uncommitted
+/// parquet behind.
+///
+/// The observable proof is the ORPHAN: a unit that reached the writer uploads
+/// objects it never commits, so the tier's object count grows while its LIVE file
+/// set does not. Settling early leaves both unchanged.
+#[tokio::test]
+async fn a_slice_covered_by_a_wider_file_settles_without_scanning() -> Result<()> {
+    let (db, project, day, tier) = published_base_day(rollup_backfill_config("covered-preflight", 35), "preflight").await?;
+    let tier_ref = db.get_or_create_table(&project, &tier).await?;
+    let covering: Vec<(i64, i64)> = live_adds(&tier_ref)
+        .await
+        .into_iter()
+        .filter_map(|add| {
+            let tags = add.tags?;
+            let tag = |name: &str| tags.get(name).and_then(Option::as_deref)?.parse::<i64>().ok();
+            Some((tag(crate::maintenance_coordinator::TAG_SLICE_START)?, tag(crate::maintenance_coordinator::TAG_SLICE_END)?))
+        })
+        .collect();
+    let Some(&(covering_start, covering_end)) = covering.first() else {
+        panic!("the published day must leave a tagged live slice, or this tests the other shape");
+    };
+    assert!(covering_end > covering_start, "a covering slice must be non-empty");
+
+    // A unit STRICTLY INSIDE the covering slice, and it must CONTAIN the fixture's
+    // noon span. A narrower slice with no rows aggregates to nothing and reaches no
+    // writer, so the old code path wrote no parquet either and the orphan assertion
+    // below could not tell the two apart — which is exactly how the first cut of this
+    // test passed with the fix reverted.
+    let hour = 3_600_000_000i64;
+    let (inner_start, inner_end) = (covering_start + 11 * hour, covering_start + 13 * hour);
+    assert!(inner_start > covering_start && inner_end < covering_end, "the inner slice must be STRICTLY inside the covering one");
+    retire_all_tasks(&db);
+    let key = crate::maintenance_coordinator::TaskKey {
+        physical_table: tier.clone(),
+        source: "otel_logs_and_spans".to_owned(),
+        project_id: project.clone(),
+        slice: crate::maintenance_coordinator::TimeSlice::new(inner_start, inner_end)?,
+        operation: crate::maintenance_coordinator::Operation::BaseRollup,
+    };
+    {
+        let mut journal = db.journal();
+        journal.enqueue(key.clone(), 0, 1024, 0);
+        journal.checkpoint()?;
+    }
+
+    use std::sync::atomic::Ordering::Relaxed;
+    let escalations_before = crate::observability::maintenance_stats().rollup_skipped_covered_by_wider.load(Relaxed)
+        + crate::observability::maintenance_stats().rollup_escalation_skipped_fresh.load(Relaxed);
+    let objects_before = tier_object_count(&db, &tier_ref).await;
+    let live_before = live_adds(&tier_ref).await.len();
+    let did_work = db.run_coordinator_rollup_selected(crate::database::maintain::TaskSelection::Exact(&key)).await?;
+    assert!(did_work, "the unit must be settled, not left claimable");
+
+    // Settled: the narrow unit is gone and the COVERING slice carries the rebuild.
+    assert_eq!(db.journal().state(&key), Some(crate::maintenance_coordinator::TaskState::Complete), "the covered unit must complete");
+    let queued: Vec<(i64, i64)> = pending_tier_slices(&db, &project, &tier).into_iter().map(|slice| (slice.start_micros, slice.end_micros)).collect();
+    assert!(
+        queued.is_empty() || queued.contains(&(covering_start, covering_end)),
+        "a rebuild must target the COVERING slice, never the contained one; got {queued:?}"
+    );
+
+    // The unit must actually have TAKEN the covered-by-wider path. Without this the
+    // test passes on a fixture that never reaches it, which is exactly how the first
+    // cut of it passed with the fix reverted.
+    let escalations_after = crate::observability::maintenance_stats().rollup_skipped_covered_by_wider.load(Relaxed)
+        + crate::observability::maintenance_stats().rollup_escalation_skipped_fresh.load(Relaxed);
+    assert!(escalations_after > escalations_before, "the fixture must reach the covered-by-wider path, or this test asserts nothing");
+
+    // And the work was never done: no parquet written, committed or orphaned.
+    assert_eq!(live_adds(&tier_ref).await.len(), live_before, "a covered unit must publish nothing");
+    assert_eq!(
+        tier_object_count(&db, &tier_ref).await,
+        objects_before,
+        "a covered unit must not reach the WRITER — an uncommitted parquet upload is the orphan this check exists to avoid"
+    );
+    let _ = day;
+    Ok(())
+}
+
+/// Objects physically present under the tier, committed or not.
+async fn tier_object_count(_db: &Database, table_ref: &Arc<RwLock<DeltaTable>>) -> usize {
+    use futures::StreamExt;
+    let store = table_ref.read().await.log_store().object_store(None);
+    store.list(None).filter(|entry| futures::future::ready(entry.is_ok())).count().await
+}
+
 /// Publishing the contained span cannot land: `covered_by_wider` refuses it — two
 /// overlapping files would both stay live and a dashboard would SUM both.
 #[tokio::test]
