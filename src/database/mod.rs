@@ -5264,9 +5264,11 @@ impl HygieneGate {
     /// The cached memory reading, for callers that need the snapshot rather than
     /// the verdict — admission sizes its decoded-bytes ceiling from the same
     /// sample so the two decisions cannot disagree about the state of the box.
-    pub(crate) fn snapshot(&self, cfg: &crate::config::DerivedBudget, pool_reserved: usize, pool_size: usize) -> crate::config::MemorySnapshot {
+    pub(crate) fn snapshot(
+        &self, cfg: &crate::config::DerivedBudget, pool_reserved: usize, pool_size: usize, buffer_pressure: u32,
+    ) -> crate::config::MemorySnapshot {
         let mut state = crate::support::lock(&self.state);
-        self.sample_locked(&mut state, cfg, pool_reserved, pool_size)
+        self.sample_locked(&mut state, cfg, pool_reserved, pool_size, buffer_pressure)
     }
 
     /// One cached reading, plus the decaying high-water mark lending uses.
@@ -5275,7 +5277,7 @@ impl HygieneGate {
     /// is "has this box been near its limit RECENTLY", and an average of a
     /// 45%-to-99% cycle answers neither end of it.
     fn sample_locked(
-        &self, state: &mut HygieneGateState, cfg: &crate::config::DerivedBudget, pool_reserved: usize, pool_size: usize,
+        &self, state: &mut HygieneGateState, cfg: &crate::config::DerivedBudget, pool_reserved: usize, pool_size: usize, buffer_pressure: u32,
     ) -> crate::config::MemorySnapshot {
         let now = std::time::Instant::now();
         let rss = match state.sampled {
@@ -5295,6 +5297,7 @@ impl HygieneGate {
             limit_bytes: cfg.memory_limit_bytes,
             pool_reserved_bytes: pool_reserved,
             pool_size_bytes: pool_size,
+            buffer_pressure_pct: buffer_pressure,
         }
     }
 
@@ -5306,9 +5309,11 @@ impl HygieneGate {
     /// across the moment capacity freed: a test that frees every permit and
     /// re-asks immediately got refused. The cache already bounds the syscalls,
     /// which is all the backoff was really buying.
-    fn admits(&self, cfg: &crate::config::DerivedBudget, pool_reserved: usize, pool_size: usize, in_flight: usize, ceiling: usize) -> bool {
+    fn admits(
+        &self, cfg: &crate::config::DerivedBudget, pool_reserved: usize, pool_size: usize, in_flight: usize, ceiling: usize, buffer_pressure: u32,
+    ) -> bool {
         let mut state = crate::support::lock(&self.state);
-        let sample = self.sample_locked(&mut state, cfg, pool_reserved, pool_size);
+        let sample = self.sample_locked(&mut state, cfg, pool_reserved, pool_size, buffer_pressure);
         // The memory latch is updated from memory alone; the floor and backstop
         // are then composed on top for this caller's answer.
         let was_open = state.open;
@@ -5377,7 +5382,19 @@ impl Database {
     /// Shares the hygiene gate's cached sample deliberately: two views of the
     /// same box that disagree are worse than one that is 500 ms stale.
     pub(crate) fn admission_memory(&self) -> crate::config::MemorySnapshot {
-        self.hygiene_gate.snapshot(&self.config.derived, self.coordinator_runtime_env().memory_pool.reserved(), self.config.derived.coordinator_share_bytes())
+        self.hygiene_gate.snapshot(
+            &self.config.derived,
+            self.coordinator_runtime_env().memory_pool.reserved(),
+            self.config.derived.coordinator_share_bytes(),
+            self.buffer_pressure_pct(),
+        )
+    }
+
+    /// MemBuffer fill, or 0 when no buffered layer is wired. Zero is the
+    /// permissive direction, which is correct: an absent ingest path cannot be
+    /// under pressure.
+    pub(crate) fn buffer_pressure_pct(&self) -> u32 {
+        self.buffered_layer().map_or(0, |layer| layer.pressure_pct())
     }
 }
 

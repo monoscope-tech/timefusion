@@ -225,6 +225,9 @@ pub struct MemorySnapshot {
     /// Bytes currently reserved from the coordinator `MemoryPool`.
     pub pool_reserved_bytes: usize,
     pub pool_size_bytes: usize,
+    /// MemBuffer fill, 0..=100. The INGEST side's pressure, and it outranks the
+    /// others — see [`HYGIENE_BUFFER_YIELD_PCT`].
+    pub buffer_pressure_pct: u32,
 }
 
 /// Where the hygiene gate closes, as a fraction of each budget, and where it
@@ -284,7 +287,7 @@ impl MemorySnapshot {
     /// A reading that grants no elastic allowance. `limit_bytes == 0` is how
     /// "we do not know" is spelled, and every consumer treats it as pressure.
     pub fn unknown() -> Self {
-        Self { rss_bytes: 0, peak_rss_bytes: 0, limit_bytes: 0, pool_reserved_bytes: 0, pool_size_bytes: 0 }
+        Self { rss_bytes: 0, peak_rss_bytes: 0, limit_bytes: 0, pool_reserved_bytes: 0, pool_size_bytes: 0, buffer_pressure_pct: 0 }
     }
 }
 
@@ -318,6 +321,11 @@ const DECODED_ELASTIC_MAX_MULTIPLE: u64 = 3;
 /// ceiling refuses new admissions rather than un-reserving in-flight ones.
 pub fn elastic_decoded_capacity(base: u64, sample: MemorySnapshot) -> u64 {
     if sample.limit_bytes == 0 {
+        return base;
+    }
+    // A filling buffer means flush needs the box; lending decode budget to
+    // maintenance in that state is the opposite of the priority we want.
+    if sample.buffer_pressure_pct >= HYGIENE_BUFFER_YIELD_PCT {
         return base;
     }
     // The PEAK, never the instantaneous reading — see the field.
@@ -359,7 +367,32 @@ pub fn hygiene_admits(sample: MemorySnapshot, in_flight: usize, ceiling: usize, 
 /// backstop into the same latch would make "the lane is busy" look like "the box
 /// is under pressure", and the lane would then have to fall all the way to the
 /// reopen threshold to admit again after merely being full.
+/// MemBuffer fill above which maintenance yields to the flush path.
+///
+/// Flush is what makes ingested data DURABLE and visible, and it is the only
+/// major consumer with no reserved share of anything — queries have a pool,
+/// maintenance has a pool and an admission controller, flush has neither. So
+/// when the buffer fills, maintenance is what must give way.
+///
+/// Prod 2026-09-21 showed why this is not optional. Flush ran at 69-89% of the
+/// ingest rate against 27-60 concurrent compaction units; the buffer reached its
+/// hard limit and the insert path rejected 1,187 batches that were NOT durable,
+/// across every project, for three hours. Raising `flush_parallelism` did not
+/// close the gap — more flush threads cannot help when the S3 and CPU they need
+/// are already spoken for. The deficit was an allocation problem, not a
+/// throughput one.
+///
+/// 70 rather than something closer to the limit: the lane has to stand down
+/// while there is still headroom to drain into, not once the wall is reached.
+const HYGIENE_BUFFER_YIELD_PCT: u32 = 70;
+
 pub fn hygiene_memory_open(sample: MemorySnapshot, was_open: bool) -> bool {
+    // Ingest outranks maintenance. Checked FIRST and without hysteresis: the
+    // buffer filling is a customer-visible outage in progress, and there is no
+    // flapping concern because the lane still keeps `hygiene_floor_slices`.
+    if sample.buffer_pressure_pct >= HYGIENE_BUFFER_YIELD_PCT {
+        return false;
+    }
     let under = |used: usize, total: usize| {
         // An unreadable or unset budget must not be read as "infinite headroom".
         if total == 0 {
@@ -2473,6 +2506,7 @@ mod tests {
                 rss_bytes: (limit as f64 * rss_pct) as usize,
                 peak_rss_bytes: (limit as f64 * rss_pct) as usize,
                 limit_bytes: limit,
+                buffer_pressure_pct: 0,
                 pool_reserved_bytes: (pool as f64 * pool_pct) as usize,
                 pool_size_bytes: pool,
             }
@@ -2523,6 +2557,47 @@ mod tests {
                 );
             }
 
+            /// INGEST OUTRANKS MAINTENANCE. A filling MemBuffer means flush needs
+            /// the box, and flush is the only major consumer with no reserved
+            /// share of anything — so maintenance is what gives way.
+            ///
+            /// Unconditional on purpose: no hysteresis, and it does not matter
+            /// how much memory is free or how idle the lane looks. On 2026-09-21
+            /// the box sat at 32-53% RSS with the gate happily open while the
+            /// buffer hit its hard limit and rejected 1,187 non-durable batches.
+            /// Plenty of memory and an ongoing ingest outage are not contradictory.
+            #[test]
+            fn a_filling_buffer_stops_maintenance_however_idle_the_box_looks(
+                rss in 0.0f64..0.6, pool in 0.0f64..0.6, over in 0u32..30, was_open in any::<bool>(),
+            ) {
+                let mut s = sample(rss, pool);
+                s.buffer_pressure_pct = HYGIENE_BUFFER_YIELD_PCT + over;
+                prop_assert!(!hygiene_memory_open(s, was_open), "a filling buffer must close the gate whatever the memory says");
+                // ...and it must not lend decode budget either, or admission
+                // hands maintenance the very capacity flush is starved of.
+                prop_assert_eq!(elastic_decoded_capacity(8 * GIB as u64, s), 8 * GIB as u64, "a filling buffer must suppress lending");
+            }
+
+            /// The floor still applies: a lane at zero cannot drain the
+            /// partitions whose compaction is what lets flush commit smaller
+            /// files in the first place.
+            #[test]
+            fn the_floor_survives_buffer_pressure(floor in 1usize..4, over in 0u32..30) {
+                let mut s = sample(0.5, 0.5);
+                s.buffer_pressure_pct = HYGIENE_BUFFER_YIELD_PCT + over;
+                prop_assert!(hygiene_admits(s, floor - 1, floor + 8, floor, false), "the floor outranks even ingest pressure");
+            }
+
+            /// Below the yield point the gate behaves exactly as before, so this
+            /// is a priority rule rather than a new throttle on normal traffic.
+            #[test]
+            fn an_idle_buffer_changes_nothing(under in 0u32..HYGIENE_BUFFER_YIELD_PCT) {
+                let mut s = sample(0.10, 0.10);
+                s.buffer_pressure_pct = under;
+                prop_assert!(hygiene_memory_open(s, false), "an unpressured buffer must not close the gate");
+                prop_assert!(elastic_decoded_capacity(8 * GIB as u64, s) > 8 * GIB as u64, "and must not suppress lending");
+            }
+
             /// A box at the bottom of an oscillation has no spare memory to lend,
             /// whatever the instantaneous reading says. This is the property that
             /// stops elastic admission from amplifying the cycle it sits inside.
@@ -2533,6 +2608,7 @@ mod tests {
                     rss_bytes: (limit as f64 * 0.40) as usize,
                     peak_rss_bytes: (limit as f64 * 0.95) as usize,
                     limit_bytes: limit,
+                    buffer_pressure_pct: 0,
                     pool_reserved_bytes: 0,
                     pool_size_bytes: pool,
                 };

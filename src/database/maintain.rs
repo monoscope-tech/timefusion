@@ -3003,6 +3003,7 @@ impl Database {
                     self.config.derived.coordinator_share_bytes(),
                     ceiling.saturating_sub(available),
                     ceiling,
+                    self.buffer_pressure_pct(),
                 ) {
                     return Ok(false);
                 }
