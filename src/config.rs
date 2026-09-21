@@ -241,8 +241,14 @@ pub struct MemorySnapshot {
 /// Admission therefore stops BEFORE `memory_brake_limit_bytes` engages, so the
 /// brake stays what it was built to be — a one-way valve for bursts already in
 /// flight — rather than the thing that routinely holds the line.
-const HYGIENE_GATE_REOPEN: f64 = 0.60;
-const HYGIENE_GATE_SHUT: f64 = 0.65;
+/// Chosen so the lane runs SIX concurrent sorts on the 120 GiB / 44-core box —
+/// the concurrency it had before the ramp budget was tightened — without raising
+/// `HYGIENE_TARGET_PEAK`. Closing one point earlier buys the ninth backstop slot
+/// (K = 9 - 3 held back for repair) and lands the predicted peak at 89.1%, still
+/// inside the target. The alternative, raising the peak, spends margin instead of
+/// utilisation, and margin is what two 97% spikes already proved is thin.
+const HYGIENE_GATE_REOPEN: f64 = 0.59;
+const HYGIENE_GATE_SHUT: f64 = 0.64;
 
 /// Where a fully-ramped hygiene lane may leave memory, worst case.
 ///
@@ -1302,7 +1308,27 @@ pub struct BufferConfig {
     /// Delta table. Parquet writes still fan out `flush_parallelism`-wide; only the
     /// commit is shared. Custom-storage projects have their own `_delta_log` and are
     /// never coalesced with default storage.
-    #[serde_inline_default(true)]
+    ///
+    /// OFF by default since 2026-09-21. Batching a tick's commits into one is a
+    /// throughput win right up until that commit exceeds `adaptive_flush_timeout`
+    /// — the stall watchdog then returns an EMPTY result vector and every group
+    /// in the batch is failed together:
+    ///
+    /// ```text
+    /// Failed to flush coalesced commit: ... coalesced commit produced no result for this group
+    /// ```
+    ///
+    /// Nothing drained, the MemBuffer pinned at its hard limit, and the insert
+    /// path rejected after exhausting its backpressure budget — 1,187 rejected
+    /// batches in half an hour, across every project, NOT durable. Enabling this
+    /// by default caused that outage; raising `timefusion_dml_coalesce_secs` to
+    /// 60 at the same time made the batches large enough to reach the timeout.
+    ///
+    /// The blast radius is the problem, not the idea: one slow commit fails its
+    /// neighbours. Per-project commits are smaller and independently timed, so a
+    /// slow one costs only itself. Re-enable only with per-group timeouts, or a
+    /// partial-result path that settles the groups that did commit.
+    #[serde_inline_default(false)]
     pub timefusion_flush_coalesce_commits: bool,
     #[serde(default)]
     pub timefusion_flush_immediately: bool,
@@ -1364,7 +1390,11 @@ pub struct BufferConfig {
     /// the drain sees the assignment applied twice, and a failed drain retries
     /// whole groups. Timestamp-range conjuncts are widened to the union across
     /// coalesced statements.
-    #[serde_inline_default(60)]
+    ///
+    /// Back to 3 s from 60 on 2026-09-21. The window sizes the batch, and a
+    /// 20x window produced commits large enough to trip the flush stall
+    /// watchdog — see `timefusion_flush_coalesce_commits` for what that cost.
+    #[serde_inline_default(3)]
     pub timefusion_dml_coalesce_secs: u64,
     /// Fold same-shape coalesced groups across projects into one MERGE per
     /// unified table per drain (`project_id` becomes a join key + IN-list
@@ -2585,6 +2615,9 @@ mod tests {
         // a static 1.25 GiB reservation per permit, and prod reserved ~5x what it
         // used. Live memory decides now — see `hygiene_admits`.
         assert!(b.light_pool_slices() > LIGHT_ENVELOPE_SORTS, "the backstop must not re-impose the reservation-era ceiling");
+        // Six concurrent sorts on the prod box is a deliberate target, not a
+        // number that happens to fall out — see `HYGIENE_GATE_SHUT`.
+        assert_eq!(DerivedBudget::from_limits(120 * GIB, 44).max_light_optimize_k(), 6, "the 44-core prod box must run six concurrent hygiene sorts");
         // The envelope (permits x per-sort budget) is the invariant, not the raw
         // permit count.
         assert_eq!(
