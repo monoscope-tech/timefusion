@@ -87,7 +87,7 @@ object_store = "0.13.2"
 # path set in this crate is keyed on the decoded form, so the write side has to
 # decode to match. See `mark_written_sorted`.
 percent-encoding = "2"
-foyer = { version = "0.22.3", features = ["serde"] }
+foyer = { version = "0.22.6", features = ["serde"] }
 ahash = "0.8"
 lru = "0.16.1"
 dashmap = "6.1"

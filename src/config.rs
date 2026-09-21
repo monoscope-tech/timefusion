@@ -222,7 +222,9 @@ pub struct MemorySnapshot {
 ///
 /// The layering that keeps this safe, tightest first:
 ///
-///     gate reopens 0.70  <  gate shuts 0.75  <  wave brake 0.80  <  OOM 1.00
+/// ```text
+/// gate reopens 0.70  <  gate shuts 0.75  <  wave brake 0.80  <  OOM 1.00
+/// ```
 ///
 /// Admission therefore stops BEFORE `memory_brake_limit_bytes` engages, so the
 /// brake stays what it was built to be — a one-way valve for bursts already in
