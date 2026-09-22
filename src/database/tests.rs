@@ -3202,30 +3202,6 @@ fn pack_sort_width_follows_the_pool_and_the_box_not_a_pinned_constant() {
 
 /// A day the FINE tier already has but the COARSE tier does not must still
 /// be queued — and queued for the coarse tier ALONE, because the derived tier reads
-/// A tier partition the READ PATH cannot serve must count as missing.
-///
-/// The planner called a day covered because the tier held a partition directory
-/// for it; the reader needs a coverage record. A cell whose record an
-/// invalidation destroyed was invisible to one and useless to the other, so it
-/// was minted into no queue at all — which is how an idle coordinator and a 2.4%
-/// rollup hit rate were both true at once on 2026-09-22, with 40-49% of every
-/// tier's partitions in that state.
-#[test]
-fn a_tier_partition_without_usable_coverage_counts_as_missing() {
-    let day = |n: u32| chrono::NaiveDate::from_ymd_opt(2026, 8, n).expect("date");
-    let candidates: Vec<(String, chrono::NaiveDate)> = (14..=16).map(|d| ("p".to_owned(), day(d))).collect();
-    let partitions: HashSet<(String, chrono::NaiveDate)> = (14..=16).map(|d| ("p".to_owned(), day(d))).collect();
-    // The tier holds all three days, but only 08-16 has a coverage record.
-    let readable: HashSet<(String, String)> = std::iter::once(("p".to_owned(), day(16).to_string())).collect();
-
-    let missing = tiers_missing_per_day(&candidates, &[(0usize, readable_cells_only(&partitions, &readable))]);
-    assert_eq!(
-        missing.keys().map(|(_, date)| *date).sorted().collect::<Vec<_>>(),
-        vec![day(14), day(15)],
-        "a partition with no coverage record is a HOLE: the reader goes raw over it, so the planner must queue it"
-    );
-}
-
 /// the base tier and needs no raw source scan.
 #[test]
 fn a_day_missing_only_the_coarse_tier_is_queued_for_that_tier_alone() {

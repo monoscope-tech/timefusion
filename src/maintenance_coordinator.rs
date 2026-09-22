@@ -697,6 +697,11 @@ impl TaskJournal {
     const BOOTSTRAP_BACKLOG_LIMIT: usize = 100_000;
     const COARSE_BACKFILL_MIGRATION: &'static str = "__maintenance_coarse_backfill_v2";
     const STALE_ESTIMATE_MIGRATION: &'static str = "__maintenance_stale_estimate_v2";
+    /// Bump to re-run the orphaned-coverage repair after a future spec edit. The
+    /// cursor is persisted BEFORE the caller does the work so a crash cannot
+    /// loop; bumping is the intended recovery, since re-enqueueing is idempotent.
+    const ORPHAN_REPAIR_MIGRATION: &'static str = "__maintenance_orphan_repair_v2";
+
     /// Re-enqueue of a measured list of damaged (project, date) cells. Its
     /// cursor counts a CONSUMED PREFIX — a one-shot cursor would force the whole
     /// list into one planner pass, which truncates it and drops the tail
@@ -948,6 +953,23 @@ impl TaskJournal {
         self.snapshot.source_cursors.insert(key.clone(), consumed);
         self.dirty_cursors.insert(key);
         self.checkpoint()
+    }
+
+    /// Claim the one-shot orphaned-coverage repair; `false` if it already ran. The caller does the
+    /// work; this owns only the once-ness, and marks the migration done IMMEDIATELY so a restart
+    /// mid-repair cannot re-force every cell. Keyed PER SOURCE, or the first source processed
+    /// consumes it for all. Returns `bool`, not a cursor: this repair has no prefix to resume from.
+    pub fn repair_orphaned_coverage_once(&mut self, source: &str) -> bool {
+        let key = format!("{}:{source}", Self::ORPHAN_REPAIR_MIGRATION);
+        if self.migration_done(&key) {
+            return false;
+        }
+        self.mark_migration_done(&key);
+        // The claim is replayable from the log, so a failed checkpoint costs a redo, not the claim.
+        if let Err(e) = self.checkpoint() {
+            tracing::warn!(source, "orphan-repair claim not checkpointed; it will be replayed from the log: {e:#}");
+        }
+        true
     }
 
     pub fn migrate_fine_grained_backfill(&mut self, now_micros: i64) -> Option<usize> {
@@ -5385,13 +5407,29 @@ mod tests {
         assert_eq!(journal.state(&live), Some(TaskState::Pending));
     }
 
+    /// The orphan repair must run exactly once per source and persist that claim
+    /// BEFORE the caller does the work, so a restart cannot re-force every cell.
+    #[test]
+    fn the_orphan_repair_claims_itself_once_and_survives_a_reload() {
+        let (dir, mut journal) = new_journal();
+        assert!(journal.repair_orphaned_coverage_once("otel_logs_and_spans"), "first call claims it");
+        assert!(!journal.repair_orphaned_coverage_once("otel_logs_and_spans"), "second call in the same process must not");
+        // PER SOURCE: the caller loops over sources, so one global cursor would let
+        // whichever source runs first consume the repair the others still need.
+        assert!(journal.repair_orphaned_coverage_once("otel_metrics"), "a different source claims independently");
+        drop(journal);
+        let mut reloaded = TaskJournal::load(dir.path()).expect("reload");
+        assert!(!reloaded.repair_orphaned_coverage_once("otel_logs_and_spans"), "a restart must not re-run the repair");
+    }
+
     /// The damage repair's cursor is a consumed-PREFIX index, per source, monotonic,
-    /// and it survives a restart.
+    /// and it survives a restart; it must not share state with the orphan repair.
     #[test]
     fn the_damage_repair_cursor_is_a_per_source_prefix_that_survives_a_reload() {
         const DAMAGE: &str = TaskJournal::DAMAGE_REPAIR_MIGRATION;
         let (dir, mut journal) = new_journal();
-        assert_eq!(journal.repair_cursor(DAMAGE, "otel_logs_and_spans"), 0, "an unconsumed list starts at the beginning");
+        assert!(journal.repair_orphaned_coverage_once("otel_logs_and_spans"), "orphan repair claims");
+        assert_eq!(journal.repair_cursor(DAMAGE, "otel_logs_and_spans"), 0, "the orphan repair's cursor must not consume the damage list");
         journal.advance_repair_cursor(DAMAGE, "otel_logs_and_spans", 24).expect("advance");
         assert_eq!(journal.repair_cursor(DAMAGE, "otel_metrics"), 0, "a different source is consumed independently");
         // Monotonic: `SourceCursor` replay folds with `max()`, and a pass
