@@ -1123,6 +1123,25 @@ fn partition_file_is_empty(num_records: Option<i64>) -> bool {
     num_records == Some(0)
 }
 
+/// Narrows the cells a tier holds a PARTITION for to the ones the read path can
+/// actually serve.
+///
+/// Two definitions of "covered" used to disagree: the planner's, a Delta
+/// partition directory existing for `(project, date)`, and the reader's, a
+/// coverage record it can still prove against the source. A cell whose record an
+/// invalidation destroyed satisfied the first and failed the second, so it was
+/// invisible to the planner and useless to the reader — in no queue at all. That
+/// is how an idle coordinator and a 2.4% rollup hit rate were both true on
+/// 2026-09-22, with 40-49% of every tier's partitions in that state and a
+/// one-shot migration pinned to three weeks of August as the only repair.
+///
+/// PRESENCE, not freshness: stale coverage still reads as covered here. The
+/// reader counted 541 stale declines against 10,867 absences, and taking only
+/// the absences is the half that cannot over-enqueue.
+fn readable_cells_only(covered: &HashSet<(String, chrono::NaiveDate)>, readable: &HashSet<(String, String)>) -> HashSet<(String, chrono::NaiveDate)> {
+    covered.iter().filter(|(project, date)| readable.contains(&(project.clone(), date.to_string()))).cloned().collect()
+}
+
 /// Which declared tiers each candidate day is missing, so the caller can enqueue
 /// only the absent tier.
 fn tiers_missing_per_day(

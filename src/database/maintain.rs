@@ -39,11 +39,6 @@ fn fold_fleet_gauge(previous: u64, value: u64, seeded_by_real: bool, ramping: bo
     }
 }
 
-/// The window the one-shot orphan repair rebuilds; older orphans age out of the
-/// 35-day horizon on their own.
-const ORPHAN_REPAIR_FROM: &str = "2026-08-01";
-const ORPHAN_REPAIR_BEFORE: &str = "2026-08-22";
-
 /// The (project, date) cells a one-shot repair forces a full re-derive of.
 /// Empty in normal operation. To run a repair, refill this and bump
 /// `DAMAGE_REPAIR_MIGRATION` to a fresh key — a spent cursor is never reused.
@@ -818,6 +813,26 @@ impl Database {
         self.persist_rollup_journal_bytes(crate::rollup_journal::encode(&self.rollup_journal_entries())?, false)
     }
 
+    /// `(project, date)` this tier has coverage for by EITHER route the read path
+    /// takes: whole-day coverage, or slice coverage over any part of the day.
+    ///
+    /// Both, because either alone over-enqueues: after a restart only slice
+    /// coverage is recovered, so testing the day map would call every partition a
+    /// hole and rebuild the fleet.
+    fn readable_cells(&self, source: &str, target: &str) -> HashSet<(String, String)> {
+        let mut cells: HashSet<(String, String)> = self
+            .rollup_coverage
+            .iter()
+            .filter(|entry| entry.key().1 == source && entry.key().2 == target)
+            .map(|entry| (entry.key().0.clone(), entry.key().3.clone()))
+            .collect();
+        cells.extend(self.rollup_slice_coverage.iter().filter(|entry| entry.key().1 == source && entry.key().2 == target).flat_map(|entry| {
+            let (project, _, _, start, end) = entry.key().clone();
+            window_dates(start, end.saturating_sub(1)).unwrap_or_default().into_iter().map(move |date| (project.clone(), date.to_string()))
+        }));
+        cells
+    }
+
     /// The journal's current entry set, with the gauges it also feeds.
     fn rollup_journal_entries(&self) -> Vec<crate::rollup_journal::RollupInvalidation> {
         let entries: Vec<_> = self
@@ -1358,6 +1373,13 @@ impl Database {
             // Which TIERS each day is missing, per tier — enqueueing every tier
             // for a day that lacks only one rebuilds rollups that already exist.
             let mut covered_per_tier: Vec<(usize, HashSet<(String, chrono::NaiveDate)>)> = Vec::new();
+            // The same days, narrowed to the ones a query can actually be served from.
+            // Partition presence answers "does the tier hold this day"; only coverage
+            // answers "can a query READ it", and the enqueue decision needs the latter.
+            // Kept as a second set because `covered_per_tier` also feeds the
+            // base-tier-ready check, where a derived build reads the base TABLE and
+            // presence is the right test.
+            let mut readable_per_tier: Vec<(usize, HashSet<(String, chrono::NaiveDate)>)> = Vec::new();
 
             // A day must be covered by EVERY declared tier: a 30d panel reads the
             // coarse tier, so a hole there refuses it however complete 1m is.
@@ -1404,6 +1426,7 @@ impl Database {
                     event = "rollup_coverage_contiguity"
                 );
 
+                readable_per_tier.push((index, readable_cells_only(&covered, &self.readable_cells(&source, &target))));
                 covered_per_tier.push((index, covered));
             }
             // Which (project, date) have their BASE tier built; consulted by DAY.
@@ -1413,31 +1436,7 @@ impl Database {
                     .filter(|(index, _)| schema.rollups[*index].derive_from.is_none())
                     .flat_map(|(_, covered)| covered.iter().map(|(project, date)| (source.clone(), project.clone(), date.to_string()))),
             );
-            let mut missing_tiers = tiers_missing_per_day(&candidates, &covered_per_tier);
-            // ONE-SHOT REPAIR, bounded to `[ORPHAN_REPAIR_FROM, ORPHAN_REPAIR_BEFORE)`:
-            // a spec edit that changes `generation_id` orphans earlier slices, and
-            // coverage ignores generation, so force those days back into
-            // `missing_tiers` for the ordinary enqueue path below.
-            if self.journal().repair_orphaned_coverage_once(&source)
-                && let (Ok(from), Ok(before)) =
-                    (chrono::NaiveDate::parse_from_str(ORPHAN_REPAIR_FROM, "%Y-%m-%d"), chrono::NaiveDate::parse_from_str(ORPHAN_REPAIR_BEFORE, "%Y-%m-%d"))
-            {
-                let mut forced = 0usize;
-                for (project, date) in &candidates {
-                    if *date >= from && *date < before {
-                        missing_tiers.insert((project.clone(), *date), (0..schema.rollups.len()).collect());
-                        forced += 1;
-                    }
-                }
-                warn!(
-                    source,
-                    forced,
-                    from = ORPHAN_REPAIR_FROM,
-                    before = ORPHAN_REPAIR_BEFORE,
-                    event = "rollup_orphaned_coverage_repair",
-                    "re-enqueueing coverage a spec change orphaned and the planner cannot see"
-                );
-            }
+            let mut missing_tiers = tiers_missing_per_day(&candidates, &readable_per_tier);
             // A configured damage list, forced the same way: these cells HAVE tier
             // output, so `missing_tiers` never sees them. Offered a PREFIX per pass
             // against a durable cursor; nothing is consumed until it survives truncation.
