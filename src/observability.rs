@@ -861,7 +861,7 @@ recorders! {
     record_backpressure_engaged => backpressure_engaged,
     record_backpressure_rejected => backpressure_rejected,
     record_backpressure_force_flush => backpressure_force_flush,
-    record_flush_stalled => flush_stalled,
+    record_flush_stalled => flush_stalled mirror MAINTENANCE_STATS.flush_stalled,
     record_flush_sort_unsorted_fallback => flush_sort_unsorted_fallbacks mirror MAINTENANCE_STATS.flush_sort_unsorted_fallbacks,
     record_write_capture_skipped => write_capture_skipped,
     record_cache_confirm_timeout => cache_confirm_timeouts,
@@ -1166,6 +1166,10 @@ atomic_stats! {
         /// unsorted file disables the reader's footer ordering for every scan
         /// touching its partition (query-time SortExec, unordered MOR dedup).
         flush_sort_unsorted_fallbacks as "flush_sort_unsorted_fallbacks_total",
+        /// Flush commits that outlived the watchdog. Mirrored here so the rollup
+        /// backfill census can park its drain the pass after one happens — the
+        /// 2026-09-22 outage was the drain's S3 load pushing exactly these.
+        flush_stalled as "flush_stalled_total",
         /// Files marked verified-sorted BY THE WRITE that produced them, rather than
         /// by reading their footer back — each is a ranged read footer repair does
         /// not pay. 0 on a busy process means the marking is not reaching the commit

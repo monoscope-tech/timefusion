@@ -1142,6 +1142,55 @@ fn readable_cells_only(covered: &HashSet<(String, chrono::NaiveDate)>, readable:
     covered.iter().filter(|(project, date)| readable.contains(&(project.clone(), date.to_string()))).cloned().collect()
 }
 
+/// Why the rollup backfill must not enqueue this pass, or `None` to proceed.
+///
+/// The queue ceiling was the only brake when the 2026-09-22 drain ran: it
+/// bounded how much work QUEUED while nothing bounded what the running drain did
+/// to the box. Its S3 commits starved flush commits past the watchdog and the
+/// MemBuffer hit its hard limit twice in one day. Backfill is the one lane whose
+/// work is entirely deferrable, so it yields to every ingest-health signal:
+///
+/// - `flush_stalls_delta`: a flush commit stalled since the LAST pass. The
+///   passes run about a minute apart, so this is a one-minute-old signal that
+///   the store is contended at the exact point that rejects customer data.
+/// - `buffer_pressure_pct`: the same yield line the hygiene lane uses — flush
+///   needs the box before maintenance does.
+/// - `replay_complete`: before the tag replay finishes, coverage maps are
+///   partial and every partition reads as a hole; enqueueing then would rebuild
+///   the fleet to fix nothing.
+///
+/// Pure so the policy is testable without a box under pressure.
+///
+/// ```
+/// use timefusion::database::backfill_enqueue_deferred as deferred;
+/// // Healthy: proceed.
+/// assert_eq!(deferred(100, false, 0, 10, true), None);
+/// // One stalled flush since the last pass parks the drain.
+/// assert_eq!(deferred(100, false, 1, 10, true), Some("flush_stalled"));
+/// // Ingest filling: flush outranks backfill.
+/// assert_eq!(deferred(100, false, 0, 70, true), Some("buffer_pressure"));
+/// // Partial coverage maps: a hole is not evidence yet.
+/// assert_eq!(deferred(100, false, 0, 10, false), Some("replay_incomplete"));
+/// // The queue ceiling still binds, unless coverage is short of the window.
+/// assert_eq!(deferred(25_000, false, 0, 10, true), Some("queue_ceiling"));
+/// assert_eq!(deferred(25_000, true, 0, 10, true), None);
+/// ```
+pub fn backfill_enqueue_deferred(
+    pending: usize, coverage_short: bool, flush_stalls_delta: u64, buffer_pressure_pct: u32, replay_complete: bool,
+) -> Option<&'static str> {
+    const BACKFILL_PENDING_CEILING: usize = 25_000;
+    if flush_stalls_delta > 0 {
+        return Some("flush_stalled");
+    }
+    if buffer_pressure_pct >= crate::config::HYGIENE_BUFFER_YIELD_PCT {
+        return Some("buffer_pressure");
+    }
+    if !replay_complete {
+        return Some("replay_incomplete");
+    }
+    (pending >= BACKFILL_PENDING_CEILING && !coverage_short).then_some("queue_ceiling")
+}
+
 /// Which declared tiers each candidate day is missing, so the caller can enqueue
 /// only the absent tier.
 fn tiers_missing_per_day(
@@ -2475,6 +2524,10 @@ pub struct Database {
     /// Set while a deploy handoff drains the write fence — see
     /// [`Database::quiesce_maintenance`].
     maintenance_quiesced: Arc<std::sync::atomic::AtomicBool>,
+    /// `flush_stalled` as of the backfill census's last pass, so the pass can
+    /// tell "a flush stalled in the last minute" from the counter's history.
+    /// Arc for the struct's Clone; the census is the only reader.
+    backfill_flush_stalls_seen: Arc<std::sync::atomic::AtomicU64>,
     /// Caps current-day packing while sealed consolidation is pending. It is
     /// consulted only while sealed debt exists, so the full light pool remains
     /// available to hot packing after catch-up.
@@ -3048,6 +3101,7 @@ impl Database {
             light_rewrite_sem: Arc::new(tokio::sync::Semaphore::new(light_rewrite_permits)),
             hygiene_gate: Arc::new(HygieneGate::default()),
             maintenance_quiesced: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            backfill_flush_stalls_seen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             hot_packing_sem: Arc::new(tokio::sync::Semaphore::new(hot_packing_permits)),
             repair_holdback_lent: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             repair_rewrite_sem: Arc::new(tokio::sync::Semaphore::new(cfg.derived.repair_rewrite_budget_mib())),

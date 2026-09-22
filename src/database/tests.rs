@@ -138,7 +138,11 @@ async fn register_custom_storage(db: &Database, project_id: &str, table_name: &s
 
 /// A Database on a fresh test config with `edit` applied.
 async fn db_where(name: &str, edit: impl FnOnce(&mut AppConfig)) -> Result<Database> {
-    Database::with_config(test_config_with(name, edit)).await
+    let db = Database::with_config(test_config_with(name, edit)).await?;
+    // Tests never run the boot preload, and the backfill census defers while the
+    // replay is incomplete — the state these tests exercise is a WARM box.
+    db.mark_replay_complete();
+    Ok(db)
 }
 
 /// The 35-day backfill horizon the planning tests share; the sealed days they

@@ -1317,24 +1317,31 @@ impl Database {
         use crate::maintenance_coordinator::{MAX_DECODED_BYTES, Operation, TaskJournal, TaskKey, TaskState, TimeSlice, blocks_rollup_backfill};
         /// Cells admitted newest-first per pass.
         const BACKFILL_PARTITIONS_PER_PASS: usize = 24;
-        /// Stop queueing history while the queue is deep: every `claim_next`
-        /// scans the task set, so an over-full journal taxes the live frontier.
-        const BACKFILL_PENDING_CEILING: usize = 25_000;
-
         let horizon = i64::from(self.config.maintenance.timefusion_rollup_backfill_days);
         if horizon == 0 {
             return Ok(0);
         }
         // Defers the ENQUEUE, not the pass: the rest of this function still
         // recomputes gauges and proves base tiers, which cost the journal nothing.
+        // Policy in `backfill_enqueue_deferred`; this gathers its live inputs. The
+        // stall delta compares against the LAST pass's reading, so one stalled
+        // flush parks the drain within about a minute of it happening.
         let defer_enqueue = {
             let journal = self.journal();
             let pending = journal.tasks().filter(|task| task.state != TaskState::Complete).count();
-            let defer = pending >= BACKFILL_PENDING_CEILING && !coverage_is_short();
-            if defer {
-                debug!(pending, ceiling = BACKFILL_PENDING_CEILING, event = "rollup_backfill_enqueue_deferred");
+            let stalls = crate::observability::maintenance_stats().flush_stalled.load(std::sync::atomic::Ordering::Relaxed);
+            let stalls_delta = stalls.saturating_sub(self.backfill_flush_stalls_seen.swap(stalls, std::sync::atomic::Ordering::Relaxed));
+            let deferred = super::backfill_enqueue_deferred(
+                pending,
+                coverage_is_short(),
+                stalls_delta,
+                self.buffer_pressure_pct(),
+                self.preload_replay_complete.load(std::sync::atomic::Ordering::Acquire),
+            );
+            if let Some(reason) = deferred {
+                info!(pending, reason, event = "rollup_backfill_enqueue_deferred");
             }
-            defer
+            deferred.is_some()
         };
         let today = crate::support::today_utc();
         let earliest = today - chrono::Duration::days(horizon);
@@ -1426,7 +1433,14 @@ impl Database {
                     event = "rollup_coverage_contiguity"
                 );
 
-                readable_per_tier.push((index, readable_cells_only(&covered, &self.readable_cells(&source, &target))));
+                // Before the tag replay completes the coverage maps are partial and
+                // every partition reads as a hole; presence is the honest answer then.
+                let readable = if self.preload_replay_complete.load(std::sync::atomic::Ordering::Acquire) {
+                    readable_cells_only(&covered, &self.readable_cells(&source, &target))
+                } else {
+                    covered.clone()
+                };
+                readable_per_tier.push((index, readable));
                 covered_per_tier.push((index, covered));
             }
             // Which (project, date) have their BASE tier built; consulted by DAY.

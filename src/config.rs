@@ -389,7 +389,7 @@ pub fn hygiene_admits(sample: MemorySnapshot, in_flight: usize, ceiling: usize, 
 ///
 /// 70 rather than something closer to the limit: the lane has to stand down
 /// while there is still headroom to drain into, not once the wall is reached.
-const HYGIENE_BUFFER_YIELD_PCT: u32 = 70;
+pub(crate) const HYGIENE_BUFFER_YIELD_PCT: u32 = 70;
 
 pub fn hygiene_memory_open(sample: MemorySnapshot, was_open: bool) -> bool {
     // Ingest outranks maintenance. Checked FIRST and without hysteresis: the
