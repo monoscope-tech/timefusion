@@ -81,7 +81,7 @@ def reconcile_replacement(stage, lease, guard, image):
 # ancestors anyway. Deploying them on their own buys nothing and costs a handoff:
 # on 2026-09-21 a handoff failure wedged the lease and blocked deploys for an
 # hour, which is a poor price for editing the script that does the deploying.
-UNDEPLOYABLE = ('docs/', 'bench/', 'scripts/deploy/')
+UNDEPLOYABLE = ('docs/', 'bench/', 'scripts/deploy/', '.github/')
 
 
 def only_undeployable(lease, current, master):

@@ -12,7 +12,8 @@ on:
     # burned down by exactly zero files. `paths-ignore` skips only when EVERY
     # changed path matches, so a commit touching code still deploys.
     # `bench/` is python/shell load-gen and audit tooling — not cargo, not in
-    # the binary. A push there cannot change the running image, so deploying
+    # the binary. `.github/` edits change the NEXT run's behavior, never the
+    # shipped image, so rolling production for one is pure restart cost. A push there cannot change the running image, so deploying
     # for it only costs a restart. 2026-08-24: five pushes to ONE benchmark
     # script restarted prod five times in an hour, while that very script was
     # measuring how cost varies with process uptime — the measurement was
@@ -26,6 +27,7 @@ on:
       - '**/*.md'
       - 'bench/**'
       - 'scripts/deploy/**'
+      - '.github/**'
   # Lets `autoformat.yml` start this run for its own commit. A push made with
   # GITHUB_TOKEN triggers nothing, so without this an autofmt commit on master is
   # never built, tested or deployed.
@@ -125,4 +127,9 @@ jobs:
           CAPROVER_APP: ${{ secrets.CAPTAINROVER_APP_NAME }}
           CAPROVER_TOKEN: ${{ secrets.CAPTAINROVER_APP_TOKEN }}
           PGURL: ${{ secrets.TIMEFUSION_PG_URL }}
+          # `gh` refuses to run in Actions without a token, and lease.py's
+          # run_is_finished shells out to it. Without this line that check always
+          # answered "assume alive", so the wedged-lease auto-reclaim could never
+          # fire in CI — it only ever worked from a logged-in laptop.
+          GH_TOKEN: ${{ github.token }}
         run: python3 scripts/deploy/run.py ci
