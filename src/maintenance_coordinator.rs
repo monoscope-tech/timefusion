@@ -709,6 +709,8 @@ impl TaskJournal {
     pub const DAMAGE_REPAIR_MIGRATION: &'static str = "__maintenance_damage_repair_v2";
     /// See [`TaskJournal::reset_repair_attempts`].
     const REPAIR_SINGLE_PASS_MIGRATION: &'static str = "__maintenance_repair_single_pass_v1";
+    /// See [`TaskJournal::retire_drain_backlog`].
+    const DRAIN_INCIDENT_RETIRE_MIGRATION: &'static str = "__maintenance_drain_incident_retire_v1";
 
     pub fn load(data_dir: &Path) -> anyhow::Result<Self> {
         let path = crate::write::wal::meta_path(data_dir, "maintenance_tasks.json");
@@ -970,6 +972,31 @@ impl TaskJournal {
             tracing::warn!(source, "orphan-repair claim not checkpointed; it will be replayed from the log: {e:#}");
         }
         true
+    }
+
+    /// One-shot: retire the rollup backlog `3a44fbf3` minted before its revert.
+    ///
+    /// Those units are DURABLE, so reverting the planner does not stop them: ~2,000
+    /// day-wide Dedup/rollup scans over sealed dates kept running on the reverted
+    /// image, and their S3 traffic is what pushed fat flush commits past the
+    /// watchdog — the 2026-09-22 ingest outage, twice. Retire is safe because the
+    /// work is regenerable: when the planner change re-lands (throttled), the same
+    /// coverage census re-mints exactly the cells that are still orphaned.
+    ///
+    /// Selection is by AGE of the DATA, not by mint time: a mint-window test would
+    /// also catch frontier units minted by ordinary ingest during the incident,
+    /// and those must live. Anything Pending/Retry whose slice ended more than two
+    /// days ago is backfill by definition — the frontier re-mints itself within
+    /// minutes from live writes, sealed backfill does not.
+    pub fn retire_drain_backlog(&mut self, now_micros: i64) -> Option<usize> {
+        const SEALED_AGE_MICROS: i64 = 2 * DAY_MICROS;
+        self.run_once(Self::DRAIN_INCIDENT_RETIRE_MIGRATION, |journal| {
+            Some(journal.retain_tasks(|task| {
+                !matches!(task.state, TaskState::Pending | TaskState::Retry)
+                    || !matches!(task.key.operation, Operation::Dedup | Operation::BaseRollup | Operation::DerivedRollup)
+                    || now_micros.saturating_sub(task.key.slice.end_micros) <= SEALED_AGE_MICROS
+            }))
+        })
     }
 
     pub fn migrate_fine_grained_backfill(&mut self, now_micros: i64) -> Option<usize> {
@@ -3763,6 +3790,38 @@ mod tests {
         assert_eq!(stats.maintenance_beyond_horizon_tasks.load(Relaxed), 1, "the abandoned unit must be sized, not silently dropped");
         let age_days = stats.maintenance_oldest_task_age_secs.load(Relaxed) / 86_400;
         assert_eq!(age_days, 5, "the gauge must report the oldest unit the scheduler will still escalate, not the 85-day tail");
+    }
+
+    /// The drain retire must cancel exactly the incident's backlog: sealed-date
+    /// rollup work goes; the frontier, running units and hygiene stay. Retiring is
+    /// safe only because the coverage census re-mints orphaned cells when the
+    /// (throttled) planner change re-lands — over-reaching would cancel work
+    /// nothing regenerates.
+    #[test]
+    fn the_drain_retire_drops_only_sealed_rollup_backlog() {
+        let now = crate::support::now_micros();
+        let (_dir, mut journal) = new_journal();
+        let key = |start: i64, op| task("p", start, start + DAY_MICROS, op).key;
+        // The drain's shape: day-wide sealed-date rollup work.
+        let drained = key(now - 20 * DAY_MICROS, Operation::BaseRollup);
+        journal.enqueue(drained.clone(), now, 1, 0);
+        // Frontier work re-minted by live ingest — must survive.
+        let frontier = key(now - DAY_MICROS / 2, Operation::Dedup);
+        journal.enqueue(frontier.clone(), now, 1, 0);
+        // Hygiene is planned by DEBT, not by the drain — must survive.
+        let hygiene = key(now - 20 * DAY_MICROS, Operation::HotPacking);
+        journal.enqueue(hygiene.clone(), now, 1, 0);
+        // A RUNNING unit holds a worker's lease; only its own completion may end it.
+        let running = key(now - 30 * DAY_MICROS, Operation::DerivedRollup);
+        journal.enqueue(running.clone(), now, 1, 0);
+        assert!(journal.mark_running(&running));
+
+        assert_eq!(journal.retire_drain_backlog(now), Some(1), "exactly the sealed backlog unit");
+        assert_eq!(journal.state(&drained), None, "the drain's unit is gone");
+        assert_eq!(journal.state(&frontier), Some(TaskState::Pending), "frontier work survives");
+        assert_eq!(journal.state(&hygiene), Some(TaskState::Pending), "hygiene survives");
+        assert_eq!(journal.state(&running), Some(TaskState::Running), "a leased unit survives");
+        assert!(journal.retire_drain_backlog(now).is_none(), "one-shot: the marker holds");
     }
 
     /// The coarse-backfill migration must be narrow: fine sealed backfill goes,
