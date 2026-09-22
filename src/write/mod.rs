@@ -732,7 +732,13 @@ pub struct BufferedWriteLayer {
     /// at boot from the Delta history scan and extended as flushes land. A flush
     /// whose digest is here is provably already durable and is declined. Empty
     /// means "no proof of anything", which costs duplicates, never a loss.
-    landed_digests: DashMap<(String, String), HashSet<LandedDigest>>,
+    /// Arc, because a DETACHED commit's watcher records its identity here after
+    /// `flush_bucket` has long returned — see the watchdog there.
+    landed_digests: Arc<DashMap<(String, String), HashSet<LandedDigest>>>,
+    /// Topics with a timed-out commit still running detached. While a topic is
+    /// here, `flush_bucket` defers instead of stacking a second commit for the
+    /// same rows on the same contended store.
+    airborne_commits: Arc<dashmap::DashSet<(String, String)>>,
     /// Per-(project, table) recently-flushed content-identity index for
     /// ingest-time client-retry dedup. Arc so a probe clones the handle out
     /// instead of holding a DashMap shard guard across its per-row loop.
@@ -874,7 +880,8 @@ impl BufferedWriteLayer {
             wal_replay_rows: AtomicU64::new(0),
             wal_recovery_complete: AtomicBool::new(false),
             recovery_commit_floor: DashMap::new(),
-            landed_digests: DashMap::new(),
+            landed_digests: Arc::new(DashMap::new()),
+            airborne_commits: Arc::new(dashmap::DashSet::new()),
             ingest_dedup: DashMap::new(),
             test_drop_cursor_advance: AtomicBool::new(false),
             landed_skips_total: AtomicU64::new(0),
@@ -1272,15 +1279,23 @@ impl BufferedWriteLayer {
     /// Record batch-set identities a table's commits are known to contain, so an
     /// identical re-flush can be declined.
     pub fn note_landed_digests(&self, project_id: &str, table_name: &str, digests: impl IntoIterator<Item = LandedDigest>) {
+        let cap = self.config.buffer.delta_scan_depth().saturating_mul(LANDED_WINDOW_COMMITS);
+        Self::note_landed_digests_in(&self.landed_digests, cap, project_id, table_name, digests);
+    }
+
+    /// The map-level body of [`Self::note_landed_digests`], callable from a
+    /// detached commit's watcher, which outlives every `&self`.
+    fn note_landed_digests_in(
+        map: &DashMap<(String, String), HashSet<LandedDigest>>, cap: usize, project_id: &str, table_name: &str, digests: impl IntoIterator<Item = LandedDigest>,
+    ) {
         let mut digests = digests.into_iter().peekable();
         if digests.peek().is_none() {
             return;
         }
-        let mut known = self.landed_digests.entry((project_id.to_string(), table_name.to_string())).or_default();
+        let mut known = map.entry((project_id.to_string(), table_name.to_string())).or_default();
         known.extend(digests);
         // Cleared rather than trimmed: a HashSet has no recency order, and
         // dropping identities only costs a duplicate.
-        let cap = self.config.buffer.delta_scan_depth().saturating_mul(LANDED_WINDOW_COMMITS);
         if known.len() > cap {
             debug!("landed-identity window full for {}.{} ({} > {}) — clearing", project_id, table_name, known.len(), cap);
             known.clear();
@@ -2294,6 +2309,10 @@ impl BufferedWriteLayer {
         debug!("Coalescing {} flush group(s) into per-physical-table commit(s)", pending.len());
 
         // Stall watchdog: an un-timed-out hang would pin `flush_lock` forever.
+        // Unlike `flush_bucket`, a timeout here still CANCELS the shared commit —
+        // detaching a multi-project commit needs per-unit identity bookkeeping this
+        // path does not have. Coalescing is off in prod; model `flush_bucket`'s
+        // detach before turning it back on.
         let expected = units.len();
         let timeout = self.adaptive_flush_timeout();
         let commit = callback(units);
@@ -2442,24 +2461,63 @@ impl BufferedWriteLayer {
                 bucket.bucket_id
             ));
         };
+        let topic = (bucket.project_id.clone(), bucket.table_name.clone());
+        // A topic with a DETACHED commit still running gets no second commit: the
+        // first is still uploading the same rows to the same contended store, and
+        // stacking another multiplies the load that made it slow. The bucket
+        // stays in MemBuffer; when the airborne commit lands, `already_landed`
+        // drains it above without another upload.
+        if self.airborne_commits.contains(&topic) {
+            return Err(anyhow::anyhow!(
+                "a previous commit for {}.{} is still airborne; deferring bucket {} (rows remain durable in MemBuffer + WAL)",
+                bucket.project_id,
+                bucket.table_name,
+                bucket.bucket_id
+            ));
+        }
         let commit = callback(bucket.project_id.clone(), bucket.table_name.clone(), batches.clone(), delta_watermark);
         // Watchdog: an un-timed-out hung commit would pin `flush_lock` forever. 0 disables it.
-        // Dropping the timed-out future cancels polling but a PUT already issued to S3 can
-        // still land, so the retained bucket may commit twice — dedup collapses it.
+        //
+        // A timed-out commit DETACHES rather than being cancelled. The 2026-09-22
+        // outage: one fat commit needed more than the pressure-contracted 300s,
+        // the drop discarded its upload, and every later cycle re-uploaded the
+        // same bytes into the same budget — seven hours to the hard limit. Kept
+        // polling in a task, the work finishes once; its watcher records the
+        // landed identity so the NEXT cycle drains the bucket without a writer
+        // call, and clears the airborne marker either way.
         let timeout = self.adaptive_flush_timeout();
         let added_files = if timeout.is_zero() {
             commit.await?
         } else {
-            tokio::time::timeout(timeout, commit)
-                .await
-                .map_err(|_| {
+            let mut handle = tokio::spawn(commit);
+            match tokio::time::timeout(timeout, &mut handle).await {
+                Ok(joined) => joined.map_err(|join| anyhow::anyhow!("flush_bucket commit task panicked: {join}"))??,
+                Err(_) => {
                     crate::observability::record_flush_stalled();
                     error!(
-                        "flush_bucket Delta commit stalled >{:?} (project={}, table={}, bucket_id={}) — aborting this flush so flush_lock releases and relief can retry; rows remain durable in MemBuffer + WAL",
+                        "flush_bucket Delta commit stalled >{:?} (project={}, table={}, bucket_id={}) — detaching it to finish and freeing flush_lock; rows remain durable in MemBuffer + WAL",
                         timeout, bucket.project_id, bucket.table_name, bucket.bucket_id
                     );
-                    anyhow::anyhow!("flush_bucket commit timed out after {:?} (Delta/S3 stalled)", timeout)
-                })??
+                    self.airborne_commits.insert(topic.clone());
+                    let digest =
+                        (self.config.buffer.landed_skip_enabled() && landed_identity_applies(&bucket.table_name)).then(|| landed_digest(&batches)).flatten();
+                    let cap = self.config.buffer.delta_scan_depth().saturating_mul(LANDED_WINDOW_COMMITS);
+                    let (digests, airborne) = (Arc::clone(&self.landed_digests), Arc::clone(&self.airborne_commits));
+                    tokio::spawn(async move {
+                        let landed = handle.await;
+                        airborne.remove(&topic);
+                        match landed {
+                            Ok(Ok(_)) => {
+                                Self::note_landed_digests_in(&digests, cap, &topic.0, &topic.1, digest);
+                                info!(project_id = %topic.0, table = %topic.1, event = "flush_detached_commit_landed");
+                            }
+                            Ok(Err(e)) => warn!(project_id = %topic.0, table = %topic.1, error = %e, event = "flush_detached_commit_failed"),
+                            Err(join) => warn!(project_id = %topic.0, table = %topic.1, error = %join, event = "flush_detached_commit_panicked"),
+                        }
+                    });
+                    return Err(anyhow::anyhow!("flush_bucket commit timed out after {:?} (Delta/S3 stalled); detached to finish", timeout));
+                }
+            }
         };
         self.index_flushed_files(bucket, batches, added_files);
         Ok(())
@@ -5377,6 +5435,59 @@ mod tests {
         res.unwrap().unwrap();
 
         assert!(!layer.is_empty(), "a timed-out flush must restore the bucket, not drop it");
+    }
+
+    /// A commit that outlives the watchdog must DETACH and finish, not be
+    /// cancelled and retried from zero. The 2026-09-22 outage: one fat commit
+    /// needed more than the (pressure-contracted) 300s budget, the timeout
+    /// dropped the future — discarding the upload — and every later cycle
+    /// re-uploaded the same bytes into the same budget, forever. Rows rejected
+    /// non-durably for the last hour of it.
+    ///
+    /// Three cycles prove the three properties. Cycle 1 times out and restores
+    /// the bucket. Cycle 2, while the commit is still airborne, must NOT start a
+    /// duplicate commit for the topic. Once the detached commit completes, the
+    /// next cycle drains the bucket via the landed identity without invoking the
+    /// writer again.
+    #[serial]
+    #[tokio::test]
+    async fn a_stalled_commit_detaches_and_its_completion_drains_the_bucket() {
+        let (_dir, cfg, project, _keyless) = test_env_with("dt", |c| {
+            c.buffer.timefusion_flush_dwell_secs = 0;
+            c.buffer.timefusion_flush_bucket_timeout_secs = 1;
+            c.buffer.timefusion_landed_skip_enabled = true;
+        });
+        // Identity is only defined for a table with `dedup_keys`.
+        let table = "otel_logs_and_spans".to_string();
+        let calls = Arc::new(AtomicU64::new(0));
+        let seen = calls.clone();
+        // Slower than the watchdog, far faster than the test: models the fat
+        // commit that WOULD land if only something kept polling it.
+        let layer = layer_with(
+            cfg,
+            Arc::new(move |_p, _t, _b, _wm| {
+                seen.fetch_add(1, Ordering::Relaxed);
+                Box::pin(async {
+                    tokio::time::sleep(Duration::from_millis(2500)).await;
+                    Ok(Vec::new())
+                })
+            }),
+        );
+        layer.insert(&project, &table, vec![create_test_batch(&project)]).await.unwrap();
+
+        layer.force_flush_current_buckets().await.unwrap();
+        assert!(!layer.is_empty(), "the timed-out cycle must restore the bucket");
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+        layer.force_flush_current_buckets().await.unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 1, "a second cycle while the commit is airborne must not stack a duplicate commit");
+
+        // Past the callback's 2.5s: the detached commit has landed and recorded
+        // its identity.
+        tokio::time::sleep(Duration::from_millis(2200)).await;
+        layer.force_flush_current_buckets().await.unwrap();
+        assert!(layer.is_empty(), "the completed detached commit must drain the bucket via the landed identity");
+        assert_eq!(calls.load(Ordering::Relaxed), 1, "draining must reuse the landed commit, never re-upload");
     }
 
     #[serial]
