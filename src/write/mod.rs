@@ -299,6 +299,23 @@ pub type DeltaWatermark = Vec<Option<walrus_rust::WalPosition>>;
 pub type DeltaWriteCallback =
     Arc<dyn Fn(String, String, Vec<RecordBatch>, DeltaWatermark) -> futures::future::BoxFuture<'static, anyhow::Result<Vec<String>>> + Send + Sync>;
 
+/// Total budget a DETACHED flush commit gets before its watcher gives up.
+///
+/// A multiple of the BASE watchdog, deliberately not of the adaptive
+/// (pressure-contracted) timeout — contraction may release `flush_lock` sooner,
+/// but the background budget a fat commit needs is a property of its size and
+/// the store, not of how full the buffer happens to be.
+///
+/// ```
+/// use std::time::Duration;
+/// assert_eq!(timefusion::write::detach_ceiling(Duration::from_secs(600)), Duration::from_secs(1800));
+/// // Zero disables the watchdog entirely; the ceiling follows.
+/// assert_eq!(timefusion::write::detach_ceiling(Duration::ZERO), Duration::ZERO);
+/// ```
+pub fn detach_ceiling(base_watchdog: std::time::Duration) -> std::time::Duration {
+    base_watchdog.saturating_mul(3)
+}
+
 /// Width of a landed-batch identity; 128 bits for the few dozen identities
 /// live per topic.
 pub const DIGEST_BYTES: usize = 16;
@@ -2503,16 +2520,33 @@ impl BufferedWriteLayer {
                         (self.config.buffer.landed_skip_enabled() && landed_identity_applies(&bucket.table_name)).then(|| landed_digest(&batches)).flatten();
                     let cap = self.config.buffer.delta_scan_depth().saturating_mul(LANDED_WINDOW_COMMITS);
                     let (digests, airborne) = (Arc::clone(&self.landed_digests), Arc::clone(&self.airborne_commits));
+                    // The ceiling is derived from the BASE watchdog, never the
+                    // pressure-contracted one above: contraction decides how soon the
+                    // lock is released, and must not shrink the total budget a fat
+                    // commit gets — less time exactly when a commit needs more was
+                    // half of the 2026-09-22 outage. And a ceiling must exist at
+                    // all because the airborne marker defers the topic's flushes: a
+                    // commit that never completes would otherwise wedge the topic
+                    // until restart, a failure the cancel-retry design never had.
+                    let ceiling = detach_ceiling(self.config.buffer.flush_bucket_timeout());
                     tokio::spawn(async move {
-                        let landed = handle.await;
+                        let landed = tokio::time::timeout(ceiling, &mut handle).await;
                         airborne.remove(&topic);
                         match landed {
-                            Ok(Ok(_)) => {
+                            Ok(Ok(Ok(_))) => {
                                 Self::note_landed_digests_in(&digests, cap, &topic.0, &topic.1, digest);
                                 info!(project_id = %topic.0, table = %topic.1, event = "flush_detached_commit_landed");
                             }
-                            Ok(Err(e)) => warn!(project_id = %topic.0, table = %topic.1, error = %e, event = "flush_detached_commit_failed"),
-                            Err(join) => warn!(project_id = %topic.0, table = %topic.1, error = %join, event = "flush_detached_commit_panicked"),
+                            Ok(Ok(Err(e))) => warn!(project_id = %topic.0, table = %topic.1, error = %e, event = "flush_detached_commit_failed"),
+                            Ok(Err(join)) => warn!(project_id = %topic.0, table = %topic.1, error = %join, event = "flush_detached_commit_panicked"),
+                            Err(_) => {
+                                handle.abort();
+                                warn!(
+                                    project_id = %topic.0, table = %topic.1, ceiling_secs = ceiling.as_secs(),
+                                    event = "flush_detached_commit_hung",
+                                    "detached commit hit its ceiling without completing — aborted; the topic returns to ordinary retry"
+                                );
+                            }
                         }
                     });
                     return Err(anyhow::anyhow!("flush_bucket commit timed out after {:?} (Delta/S3 stalled); detached to finish", timeout));
@@ -5488,6 +5522,44 @@ mod tests {
         layer.force_flush_current_buckets().await.unwrap();
         assert!(layer.is_empty(), "the completed detached commit must drain the bucket via the landed identity");
         assert_eq!(calls.load(Ordering::Relaxed), 1, "draining must reuse the landed commit, never re-upload");
+    }
+
+    /// A detached commit that NEVER completes must not block its topic forever:
+    /// the airborne marker defers every later flush for that (project, table), so
+    /// a truly hung callback — as opposed to a slow one — would wedge the topic
+    /// until restart. The watcher's own ceiling aborts it and clears the marker,
+    /// restoring the retry path as the fallback.
+    #[serial]
+    #[tokio::test]
+    async fn a_hung_detached_commit_is_aborted_at_the_ceiling_and_the_topic_recovers() {
+        let (_dir, cfg, project, _keyless) = test_env_with("dh", |c| {
+            c.buffer.timefusion_flush_dwell_secs = 0;
+            c.buffer.timefusion_flush_bucket_timeout_secs = 1; // watchdog 1s → ceiling 3s
+        });
+        let table = "otel_logs_and_spans".to_string();
+        let calls = Arc::new(AtomicU64::new(0));
+        let seen = calls.clone();
+        // First commit hangs forever; any retry succeeds.
+        let layer = layer_with(
+            cfg,
+            Arc::new(
+                move |_p, _t, _b, _wm| {
+                    if seen.fetch_add(1, Ordering::Relaxed) == 0 { Box::pin(std::future::pending()) } else { Box::pin(async { Ok(Vec::new()) }) }
+                },
+            ),
+        );
+        layer.insert(&project, &table, vec![create_test_batch(&project)]).await.unwrap();
+
+        layer.force_flush_current_buckets().await.unwrap();
+        assert!(!layer.is_empty(), "the timed-out cycle restores the bucket");
+        layer.force_flush_current_buckets().await.unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 1, "airborne marker defers while the hung commit is detached");
+
+        // Past the 3× ceiling: the hung commit is aborted and the marker cleared.
+        tokio::time::sleep(Duration::from_millis(3600)).await;
+        layer.force_flush_current_buckets().await.unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 2, "after the ceiling the topic must flush again");
+        assert!(layer.is_empty(), "the retry's successful commit drains the bucket");
     }
 
     #[serial]
