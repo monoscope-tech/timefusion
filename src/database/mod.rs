@@ -2554,6 +2554,14 @@ pub struct Database {
     /// (`timefusion_max_concurrent_scan_readers`), so a burst of wide-window dashboards can't stack
     /// decode buffers into an OOM.
     heavy_scan_sem: Arc<tokio::sync::Semaphore>,
+    /// Maintenance's OWN, smaller decode gate — the reservation that keeps a
+    /// full-tilt drain from occupying the whole scan/S3 path. Queries and flush
+    /// keep `heavy_scan_sem`; a background rewrite can saturate at most this
+    /// pool, so ingest headroom exists by construction rather than by the census
+    /// reacting to stalls after the fact. The 2026-09-22 outage was maintenance
+    /// scan traffic starving flush commits; the feedback throttle bounds NEW
+    /// work, this bounds the work already running.
+    maintenance_scan_sem: Arc<tokio::sync::Semaphore>,
     /// Serializes the outer full and light maintenance jobs; rewrite permits alone let a waiting
     /// light job exhaust its table timeout before starting.
     maintenance_job_sem: Arc<tokio::sync::Semaphore>,
@@ -3113,6 +3121,7 @@ impl Database {
             maintenance_derived_reserve: Arc::new(tokio::sync::Semaphore::new(coordinator_jobs.saturating_sub(2).max(1))),
             dml_merge_sem: Arc::new(tokio::sync::Semaphore::new(cfg.maintenance.timefusion_dml_merge_concurrency.max(1))),
             heavy_scan_sem: Arc::new(tokio::sync::Semaphore::new(heavy_scan_permits)),
+            maintenance_scan_sem: Arc::new(tokio::sync::Semaphore::new(crate::config::maintenance_scan_permits(heavy_scan_permits))),
             maintenance_job_sem: Arc::new(tokio::sync::Semaphore::new(1)),
             commit_locks: Arc::new(dashmap::DashMap::new()),
             flush_waiter_counts: Arc::new(dashmap::DashMap::new()),

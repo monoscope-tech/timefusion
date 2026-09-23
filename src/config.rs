@@ -323,6 +323,25 @@ const DECODED_ELASTIC_MAX_MULTIPLE: u64 = 3;
 ///
 /// Shrinking is safe by construction: the controller tracks USED, so a smaller
 /// ceiling refuses new admissions rather than un-reserving in-flight ones.
+/// Maintenance's share of the wide-scan decode gate.
+///
+/// A QUARTER of the shared pool, floored at one reader's worth of decode
+/// units: enough for `MAINTENANCE_MAX_PARTITIONS` sorts to make steady
+/// progress, small enough that a full-tilt drain leaves three quarters of the
+/// scan/S3 path to queries and flush BY CONSTRUCTION. Derived, never
+/// configured — a sizing env var here would be the same trap the deleted
+/// overrides were.
+///
+/// ```
+/// // Prod shape: 16 readers × 16 units = 256 shared → 64 for maintenance.
+/// assert_eq!(timefusion::config::maintenance_scan_permits(256), 64);
+/// // Tiny boxes keep one reader's worth so a single sort is never starved.
+/// assert_eq!(timefusion::config::maintenance_scan_permits(16), 16);
+/// ```
+pub fn maintenance_scan_permits(heavy_scan_permits: usize) -> usize {
+    (heavy_scan_permits / 4).max(16)
+}
+
 pub fn elastic_decoded_capacity(base: u64, sample: MemorySnapshot) -> u64 {
     // The PEAK, never the instantaneous reading — see the field.
     let watermark = sample.peak_rss_bytes.max(sample.rss_bytes);

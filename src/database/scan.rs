@@ -696,13 +696,16 @@ impl ProjectRoutingTable {
             }
         }
         let bypass_cache = self.database.config.cache.cache_bypass_scan_micros().is_some_and(deeper_than);
-        Ok(Arc::new(GatedScanExec::new(
-            plan,
-            self.database.heavy_scan_sem.clone(),
-            Some(self.database.scan_metrics.clone()),
-            bypass_cache,
-            mem.timefusion_max_concurrent_scan_readers.max(1) as u32 * DECODE_UNITS_PER_READER,
-        )))
+        // Maintenance decodes against its own, smaller gate — the reservation
+        // that leaves queries and flush most of the scan/S3 path even when a
+        // drain runs at full tilt. See `Database::maintenance_scan_sem`.
+        let shared_pool = mem.timefusion_max_concurrent_scan_readers.max(1) as u32 * DECODE_UNITS_PER_READER;
+        let (sem, pool_size) = if self.database.maintenance_scan {
+            (self.database.maintenance_scan_sem.clone(), crate::config::maintenance_scan_permits(shared_pool as usize) as u32)
+        } else {
+            (self.database.heavy_scan_sem.clone(), shared_pool)
+        };
+        Ok(Arc::new(GatedScanExec::new(plan, sem, Some(self.database.scan_metrics.clone()), bypass_cache, pool_size)))
     }
 
     /// Lead sort key that makes `DedupExec`'s keep-greatest engage.
