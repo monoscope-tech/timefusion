@@ -2288,7 +2288,17 @@ impl Database {
         // DERIVED units are excluded: their correctness also depends on `base_covered`.
         // The DashMap guard must be dropped BEFORE the tier check awaits, or this
         // deadlocks against the one caller that also writes this map.
-        let reproduces = (!derived && self.config.maintenance.timefusion_rollup_noop_skip_enabled)
+        // The skip may only stand in for a rebuild the READER would not miss: its
+        // proof lives in slice coverage, but a day panel routes by the DAY map,
+        // and an invalidation destroys that map entry while leaving the slices.
+        // Skipping then completes the unit without making the cell readable, and
+        // the census re-mints it next pass — prod 2026-09-23 spun 12,255 skips
+        // against 420 real rebuilds while the hit rate sat at 1%. No day
+        // coverage, no skip: the one real rebuild republishes it and the cell
+        // leaves the queue for good.
+        let day_readable =
+            self.rollup_coverage.contains_key(&(key.project_id.to_string(), key.source.to_string(), key.physical_table.to_string(), date.to_string()));
+        let reproduces = (!derived && day_readable && self.config.maintenance.timefusion_rollup_noop_skip_enabled)
             .then(|| {
                 let coverage = self.rollup_slice_coverage.get(&(
                     key.project_id.clone(),
@@ -8852,6 +8862,36 @@ mod rollup_noop_skip_tests {
         // its coverage, so the proof is gone and the day rebuilds.
         assert!(build_day(&db, &project_id, date, "late-arrival").await? > 0, "the changed day must still produce units");
         assert!(tier_version(&db).await > Some(published_at), "a day whose source actually changed must be rebuilt, not skipped");
+        Ok(())
+    }
+
+    /// A cell whose DAY coverage an invalidation destroyed must REBUILD, not
+    /// skip: the skip's proof lives in slice coverage, but the read path routes a
+    /// day panel by the day map, so a skip that completes without recreating it
+    /// leaves the cell unreadable and the census re-mints it next pass — prod
+    /// 2026-09-23 spun 12,255 no-op skips against 420 real rebuilds while the
+    /// hit rate sat at 1%, converging on nothing.
+    #[serial]
+    #[tokio::test]
+    async fn a_skip_without_day_coverage_declines_and_the_rebuild_restores_it() -> Result<()> {
+        let (db, project_id, date) = rollup_db("rollup_noop_orphan").await?;
+        assert!(build_day(&db, &project_id, date, "seed").await? > 0, "no rollup unit ran, so nothing here says anything about the skip");
+        let published_at = tier_version(&db).await.expect("the tier must exist once published");
+
+        // The orphan state: day coverage destroyed, slice coverage (the skip's
+        // proof) intact — what an invalidation that outlives its rebuild leaves.
+        let day_keys: Vec<_> = db.rollup_coverage.iter().filter(|e| e.key().0 == project_id).map(|e| e.key().clone()).collect();
+        assert!(!day_keys.is_empty(), "the build must have published day coverage for the fixture to remove");
+        for key in &day_keys {
+            db.rollup_coverage.remove(key);
+        }
+
+        remint_and_drain(&db).await?;
+        assert!(
+            tier_version(&db).await > Some(published_at),
+            "an unreadable cell must be REBUILT, not proved redundant against coverage the reader cannot use"
+        );
+        assert!(db.rollup_coverage.iter().any(|e| e.key().0 == project_id), "the rebuild must republish the day coverage the reader routes by");
         Ok(())
     }
 
