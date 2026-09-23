@@ -261,10 +261,27 @@ pub struct FlushStats {
     pub buckets_flushed: u64,
     pub buckets_failed: u64,
     pub total_rows: u64,
+    /// Sealed buckets the byte cap pushed to the NEXT cycle. Nonzero means one
+    /// pass was not "everything": the periodic flusher just waits a tick, but
+    /// drain-everything callers (`flush_all_now`) must loop until this is zero.
+    pub buckets_deferred: u64,
 }
 
 /// MemBuffer bytes a flush reclaims. Must use the same `estimate_batch_size`
 /// as the per-bucket accounting so the totals stay comparable.
+/// Decoded-byte budget for ONE coalesced flush commit.
+///
+/// The bucket-count cap (`FLUSH_CHUNK_BUCKET_IDS`) bounds how many bucket IDS a
+/// commit spans, not how many BYTES: two Shipbubble-fat buckets are a multi-GB
+/// upload that outlives any watchdog, and 2026-09-23 spent three pressure waves
+/// re-learning that — the topic serialized behind one slow commit at a time
+/// while ingest refilled the buffer. Sized so a commit lands comfortably inside
+/// even the pressure-contracted watchdog: ~2 GiB decoded compresses to roughly
+/// 200-400 MB of parquet, under a minute of upload at a conservative contended
+/// 8 MiB/s. The overflow stays buffered (WAL-durable) for the NEXT cycle, which
+/// runs immediately — smaller commits, steady drain, no detaching needed.
+const FLUSH_COMMIT_BYTE_CAP: u64 = 2 * 1024 * 1024 * 1024;
+
 fn flushable_bytes(b: &FlushableBucket) -> u64 {
     b.batches.iter().map(estimate_batch_size).sum::<usize>() as u64
 }
@@ -661,6 +678,9 @@ pub struct BufferedWriteLayer {
     tantivy_index_callback: Option<TantivyIndexCallback>,
     background_tasks: Mutex<Vec<JoinHandle<()>>>,
     flush_lock: Mutex<()>,
+    /// `FLUSH_COMMIT_BYTE_CAP`, overridable only by tests — small fixtures
+    /// cannot reach a 2 GiB cap.
+    flush_commit_byte_cap: u64,
     // Single-flights insert-path backpressure relief: only the writer that wins
     // this try_lock drives a relief flush. Must stay distinct from `flush_lock`
     // so relief never blocks behind a routine background flush.
@@ -866,6 +886,7 @@ impl BufferedWriteLayer {
             tantivy_index_callback: None,
             background_tasks: Mutex::new(Vec::new()),
             flush_lock: Mutex::new(()),
+            flush_commit_byte_cap: FLUSH_COMMIT_BYTE_CAP,
             relief_lock: Mutex::new(()),
             reserved_bytes: AtomicUsize::new(0),
             wal_hard_backpressure: AtomicBool::new(false),
@@ -2220,11 +2241,22 @@ impl BufferedWriteLayer {
         // Coalesce per (project_id, table_name): each commit pays a fixed cost
         // (log scan + JSON write + S3 RTT + tantivy build).
         let current_bucket = MemBuffer::current_bucket_id();
+        let deferred = std::sync::atomic::AtomicU64::new(0);
         let mut groups: Vec<(CombinedBucket, u64)> = by_topic
             .into_iter()
             .filter_map(|((p, t), ids)| {
                 let token = self.register_inflight_holds(&p, &t, Vec::new()); // airborne marker
-                let group = ids.into_iter().fold(CoalescedGroup::default(), |mut group, id| {
+                // Byte-bounded, not only bucket-bounded: absorbing stops once the
+                // commit's decoded payload reaches the cap, and the leftover ids
+                // stay buffered for the next cycle. See `FLUSH_COMMIT_BYTE_CAP`.
+                let mut group = CoalescedGroup::default();
+                let mut budget = self.flush_commit_byte_cap;
+                let mut ids = ids.into_iter();
+                for id in ids.by_ref() {
+                    if budget == 0 && !group.source_buckets.is_empty() {
+                        deferred.fetch_add(1 + ids.len() as u64, Ordering::Relaxed);
+                        break;
+                    }
                     if let Some(b) = self.mem_buffer.snapshot_bucket_for_flush(&p, &t, id) {
                         // Not-yet-sealed bucket: exempt it from the Delta-scan range
                         // exclusion up front, or once the window seals the exclusion
@@ -2232,10 +2264,10 @@ impl BufferedWriteLayer {
                         if id >= current_bucket {
                             self.mem_buffer.mark_force_flushed(&p, &t, id);
                         }
+                        budget = budget.saturating_sub(flushable_bytes(&b));
                         group.absorb(b);
                     }
-                    group
-                });
+                }
                 if group.source_buckets.is_empty() {
                     self.release_inflight_holds(&p, &t, token);
                     return None;
@@ -2277,12 +2309,13 @@ impl BufferedWriteLayer {
             }
         };
 
-        let (any_ok, stats) = group_stats.into_iter().fold((false, FlushStats::default()), |(any, mut acc), (ok, s)| {
+        let (any_ok, mut stats) = group_stats.into_iter().fold((false, FlushStats::default()), |(any, mut acc), (ok, s)| {
             acc.buckets_flushed += s.buckets_flushed;
             acc.buckets_failed += s.buckets_failed;
             acc.total_rows += s.total_rows;
             (any | ok, acc)
         });
+        stats.buckets_deferred = deferred.load(Ordering::Relaxed);
         if any_ok {
             self.write_post_flush_snapshot().await;
         }
@@ -2996,7 +3029,21 @@ impl BufferedWriteLayer {
     /// Force flush all buffered data to Delta immediately (coalesced, one
     /// commit per table, `flush_parallelism`-wide).
     pub async fn flush_all_now(&self) -> anyhow::Result<FlushStats> {
-        self.flush_buckets_where(|_| true).await
+        // "All" is a loop now that one commit is byte-capped. The bound is a
+        // backstop for a bucket the cap defers but a failure keeps restoring —
+        // progress normally empties `buckets_deferred` in a handful of rounds.
+        let mut total = FlushStats::default();
+        for _ in 0..1000 {
+            let stats = self.flush_buckets_where(|_| true).await?;
+            total.buckets_flushed += stats.buckets_flushed;
+            total.buckets_failed += stats.buckets_failed;
+            total.total_rows += stats.total_rows;
+            total.buckets_deferred = stats.buckets_deferred;
+            if stats.buckets_deferred == 0 {
+                return Ok(total);
+            }
+        }
+        Ok(total)
     }
 
     /// Undo the handoff fence, but only while `generation` still owns it —
@@ -5530,6 +5577,37 @@ mod tests {
         res.unwrap().unwrap();
 
         assert!(!layer.is_empty(), "a timed-out flush must restore the bucket, not drop it");
+    }
+
+    /// A topic's sealed backlog must flush in byte-bounded commits: two fat
+    /// buckets in one commit is a multi-GB upload that outlives any watchdog,
+    /// which is how 2026-09-23 spent three pressure waves serialized behind one
+    /// slow commit. Under the cap the first cycle takes what fits and the next
+    /// cycle takes the rest — two commits, both small enough to land.
+    #[serial]
+    #[tokio::test]
+    async fn a_fat_backlog_flushes_in_byte_bounded_commits() {
+        let (_dir, cfg, project, table) = test_ids_env("bc");
+        let calls = Arc::new(AtomicU64::new(0));
+        let seen = calls.clone();
+        let mut layer = crate::support::test_helpers::test_layer(Arc::clone(&cfg)).unwrap();
+        layer.delta_write_callback = Some(Arc::new(move |_p, _t, _b, _wm| {
+            seen.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async { Ok(Vec::new()) })
+        }));
+        // Any batch overflows this, so each bucket must commit alone.
+        layer.flush_commit_byte_cap = 1;
+        let layer = Arc::new(layer);
+        // Two sealed buckets: timestamps two flush windows apart.
+        let now = crate::support::now_micros();
+        let old = now - 2 * crate::write::mem_buffer::bucket_duration_micros();
+        for ts in [old, now] {
+            let batch = json_to_batch(vec![crate::support::test_helpers::test_span_ts("s", "n", &project, ts)]).unwrap();
+            layer.insert(&project, &table, vec![batch]).await.unwrap();
+        }
+        layer.flush_all_now().await.unwrap();
+        assert!(layer.is_empty(), "both buckets must drain");
+        assert!(calls.load(Ordering::Relaxed) >= 2, "an over-cap backlog must split into more than one commit, got {}", calls.load(Ordering::Relaxed));
     }
 
     /// A commit that outlives the watchdog must DETACH and finish, not be
