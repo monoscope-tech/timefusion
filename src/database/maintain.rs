@@ -813,24 +813,23 @@ impl Database {
         self.persist_rollup_journal_bytes(crate::rollup_journal::encode(&self.rollup_journal_entries())?, false)
     }
 
-    /// `(project, date)` this tier has coverage for by EITHER route the read path
-    /// takes: whole-day coverage, or slice coverage over any part of the day.
+    /// `(project, date)` this tier has WHOLE-DAY coverage for — the set the read
+    /// path can serve a day panel from.
     ///
-    /// Both, because either alone over-enqueues: after a restart only slice
-    /// coverage is recovered, so testing the day map would call every partition a
-    /// hole and rebuild the fleet.
-    fn readable_cells(&self, source: &str, target: &str) -> HashSet<(String, String)> {
-        let mut cells: HashSet<(String, String)> = self
-            .rollup_coverage
+    /// Day coverage ONLY, not slice coverage. The first cut counted a date
+    /// readable if ANY slice touched it, and that reopened the planner/reader gap
+    /// one level down: a date with one covered hour was "readable" to the planner
+    /// (never re-minted) and `not_built` to the reader (interior incomplete) —
+    /// prod 2026-09-23 sat at 65 hits against 10,678 misses with the census
+    /// insisting only 21 cells were missing. The day map is seeded from the
+    /// coverage ledger at boot, and the census already waits for the replay, so
+    /// day-only is not the over-enqueue hazard it would have been pre-ledger.
+    pub(crate) fn readable_cells(&self, source: &str, target: &str) -> HashSet<(String, String)> {
+        self.rollup_coverage
             .iter()
             .filter(|entry| entry.key().1 == source && entry.key().2 == target)
             .map(|entry| (entry.key().0.clone(), entry.key().3.clone()))
-            .collect();
-        cells.extend(self.rollup_slice_coverage.iter().filter(|entry| entry.key().1 == source && entry.key().2 == target).flat_map(|entry| {
-            let (project, _, _, start, end) = entry.key().clone();
-            window_dates(start, end.saturating_sub(1)).unwrap_or_default().into_iter().map(move |date| (project.clone(), date.to_string()))
-        }));
-        cells
+            .collect()
     }
 
     /// The journal's current entry set, with the gauges it also feeds.

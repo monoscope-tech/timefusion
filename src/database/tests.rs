@@ -3230,6 +3230,56 @@ fn a_tier_partition_without_usable_coverage_counts_as_missing() {
     );
 }
 
+/// Slice coverage alone must NOT make a date readable to the planner: the
+/// reader needs the whole interior, so a date with one covered hour is a HOLE.
+/// The first cut of the narrowing counted it readable, and prod 2026-09-23 ran
+/// 65 hits against 10,678 misses while the census reported 21 missing cells —
+/// partially-covered days sat in the same planner/reader gap the narrowing was
+/// built to close, one level down.
+#[tokio::test]
+async fn a_date_with_only_slice_coverage_still_counts_as_missing() -> Result<()> {
+    let db = db_where("slice-not-readable", wide_backfill).await?;
+    let (project, source, target) = ("p".to_owned(), "otel_logs_and_spans".to_owned(), "otel_logs_and_spans_rollup_dashboard_1h_v2".to_owned());
+    let day = "2026-08-14";
+    let day_start = chrono::NaiveDate::parse_from_str(day, "%Y-%m-%d").unwrap().and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_micros();
+    // One covered HOUR of the day, via slice coverage only.
+    db.rollup_slice_coverage.insert(
+        (project.clone(), source.clone(), target.clone(), day_start, day_start + 3_600_000_000),
+        RollupCoverage {
+            source_fp: 1,
+            source_epoch: None,
+            covered_through: day_start + 3_600_000_000,
+            generation: "g".into(),
+            source_rows: None,
+            source_rows_below: None,
+            measures: None,
+            content_fp: None,
+            output_files: 0,
+        },
+    );
+    assert!(
+        !db.readable_cells(&source, &target).contains(&(project.clone(), day.to_string())),
+        "an hour of slice coverage must not mark the whole day readable — the reader will refuse the other 23 hours"
+    );
+    // Whole-day coverage IS readable.
+    db.rollup_coverage.insert(
+        (project.clone(), source.clone(), target.clone(), day.to_string()),
+        RollupCoverage {
+            source_fp: 1,
+            source_epoch: Some(0),
+            covered_through: day_start + 86_400_000_000,
+            generation: "g".into(),
+            source_rows: None,
+            source_rows_below: None,
+            measures: None,
+            content_fp: None,
+            output_files: 0,
+        },
+    );
+    assert!(db.readable_cells(&source, &target).contains(&(project, day.to_string())));
+    Ok(())
+}
+
 /// the base tier and needs no raw source scan.
 #[test]
 fn a_day_missing_only_the_coarse_tier_is_queued_for_that_tier_alone() {
