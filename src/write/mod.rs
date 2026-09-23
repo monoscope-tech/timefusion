@@ -2308,6 +2308,18 @@ impl BufferedWriteLayer {
                     self.note_landed_skip(&combined.combined, &batches);
                     itertools::Either::Left(self.settle_flushed_group(combined, token, Ok(())))
                 }
+                // A topic with a DETACHED commit still airborne gets no second
+                // commit — same rule as `flush_bucket`, same reason: stacking
+                // multiplies the load that made the first one slow. Fails the
+                // group; when the airborne commit lands, `already_landed` above
+                // drains it.
+                Ok(_) if self.airborne_commits.contains(&(combined.combined.project_id.clone(), combined.combined.table_name.clone())) => {
+                    itertools::Either::Left(self.settle_flushed_group(
+                        combined,
+                        token,
+                        Err(anyhow::anyhow!("a previous coalesced commit for this topic is still airborne; deferring")),
+                    ))
+                }
                 Ok((batches, watermark)) => itertools::Either::Right((combined, token, batches, watermark)),
                 Err(e) => itertools::Either::Left(self.settle_flushed_group(combined, token, Err(e))),
             });
@@ -2325,25 +2337,74 @@ impl BufferedWriteLayer {
             .collect();
         debug!("Coalescing {} flush group(s) into per-physical-table commit(s)", pending.len());
 
-        // Stall watchdog: an un-timed-out hang would pin `flush_lock` forever.
-        // Unlike `flush_bucket`, a timeout here still CANCELS the shared commit —
-        // detaching a multi-project commit needs per-unit identity bookkeeping this
-        // path does not have. Coalescing is off in prod; model `flush_bucket`'s
-        // detach before turning it back on.
+        // Stall watchdog: an un-timed-out hang would pin `flush_lock` forever. A
+        // timed-out shared commit DETACHES, exactly as in `flush_bucket`: every
+        // covered topic is marked airborne, and the watcher records each unit's
+        // landed identity positionally when the commit completes — or aborts the
+        // whole commit at the base-derived ceiling so no topic wedges behind a
+        // true hang.
+        let unit_meta: Vec<((String, String), Option<LandedDigest>)> = pending
+            .iter()
+            .map(|(combined, _, batches, _)| {
+                let bucket = &combined.combined;
+                let digest =
+                    (self.config.buffer.landed_skip_enabled() && landed_identity_applies(&bucket.table_name)).then(|| landed_digest(batches)).flatten();
+                ((bucket.project_id.clone(), bucket.table_name.clone()), digest)
+            })
+            .collect();
         let expected = units.len();
         let timeout = self.adaptive_flush_timeout();
         let commit = callback(units);
         let results = if timeout.is_zero() {
             commit.await
         } else {
-            tokio::time::timeout(timeout, commit).await.unwrap_or_else(|_| {
-                crate::observability::record_flush_stalled();
-                error!(
-                    "coalesced Delta commit stalled >{:?} across {} group(s) — aborting so flush_lock releases and relief can retry; rows remain durable in MemBuffer + WAL",
-                    timeout, expected
-                );
-                Vec::new()
-            })
+            let mut handle = tokio::spawn(commit);
+            match tokio::time::timeout(timeout, &mut handle).await {
+                // A panicked commit task must fail loudly, not read as "no results".
+                Ok(joined) => joined.unwrap_or_else(|join| {
+                    error!(error = %join, event = "flush_coalesced_commit_panicked");
+                    Vec::new()
+                }),
+                Err(_) => {
+                    crate::observability::record_flush_stalled();
+                    for (topic, _) in &unit_meta {
+                        self.airborne_commits.insert(topic.clone());
+                    }
+                    let cap = self.config.buffer.delta_scan_depth().saturating_mul(LANDED_WINDOW_COMMITS);
+                    let ceiling = detach_ceiling(self.config.buffer.flush_bucket_timeout());
+                    let (digests, airborne) = (Arc::clone(&self.landed_digests), Arc::clone(&self.airborne_commits));
+                    tokio::spawn(async move {
+                        let landed = tokio::time::timeout(ceiling, &mut handle).await;
+                        for (topic, _) in &unit_meta {
+                            airborne.remove(topic);
+                        }
+                        match landed {
+                            Ok(Ok(results)) if results.len() == unit_meta.len() => {
+                                for ((topic, digest), result) in unit_meta.iter().zip(results) {
+                                    if result.is_ok() {
+                                        Self::note_landed_digests_in(&digests, cap, &topic.0, &topic.1, *digest);
+                                        info!(project_id = %topic.0, table = %topic.1, event = "flush_detached_commit_landed");
+                                    } else {
+                                        warn!(project_id = %topic.0, table = %topic.1, event = "flush_detached_commit_failed");
+                                    }
+                                }
+                            }
+                            Ok(Ok(results)) => warn!(units = unit_meta.len(), results = results.len(), event = "flush_detached_commit_result_mismatch"),
+                            Ok(Err(join)) => warn!(error = %join, event = "flush_detached_commit_panicked"),
+                            Err(_) => {
+                                handle.abort();
+                                warn!(
+                                    units = unit_meta.len(),
+                                    ceiling_secs = ceiling.as_secs(),
+                                    event = "flush_detached_commit_hung",
+                                    "detached coalesced commit hit its ceiling — aborted; its topics return to ordinary retry"
+                                );
+                            }
+                        }
+                    });
+                    Vec::new()
+                }
+            }
         };
         // A wrong-length result vector would strand groups (unsettled = leaked
         // in-flight holds). Fail them all instead: a requeue costs a duplicate
@@ -5483,6 +5544,48 @@ mod tests {
     /// duplicate commit for the topic. Once the detached commit completes, the
     /// next cycle drains the bucket via the landed identity without invoking the
     /// writer again.
+    /// The coalesced path gets the same detach semantics as `flush_bucket`: a
+    /// timed-out SHARED commit keeps running, every covered topic is marked
+    /// airborne (no duplicate commits stack), and each unit's landed identity is
+    /// recorded on completion so the next cycle drains without a re-upload.
+    #[serial]
+    #[tokio::test]
+    async fn a_stalled_coalesced_commit_detaches_and_every_unit_drains() {
+        let (_dir, cfg, project, _keyless) = test_env_with("cd", |c| {
+            c.buffer.timefusion_flush_dwell_secs = 0;
+            c.buffer.timefusion_flush_bucket_timeout_secs = 1;
+            c.buffer.timefusion_landed_skip_enabled = true;
+            c.buffer.timefusion_flush_coalesce_commits = true;
+        });
+        let table = "otel_logs_and_spans".to_string();
+        let cotenant = format!("{project}b");
+        let calls = Arc::new(AtomicU64::new(0));
+        let seen = calls.clone();
+        let mut layer = crate::support::test_helpers::test_layer(Arc::clone(&cfg)).unwrap();
+        layer.coalesced_write_callback = Some(Arc::new(move |units: Vec<FlushUnit>| {
+            seen.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async move {
+                tokio::time::sleep(Duration::from_millis(2400)).await;
+                units.iter().map(|_| Ok(Vec::new())).collect()
+            })
+        }));
+        let layer = Arc::new(layer);
+        layer.insert(&project, &table, vec![create_test_batch(&project)]).await.unwrap();
+        layer.insert(&cotenant, &table, vec![create_test_batch(&cotenant)]).await.unwrap();
+
+        layer.flush_all_now().await.unwrap();
+        assert!(!layer.is_empty(), "the timed-out cycle restores both buckets");
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+        layer.flush_all_now().await.unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 1, "airborne topics must not enter a second shared commit");
+
+        tokio::time::sleep(Duration::from_millis(2200)).await;
+        layer.flush_all_now().await.unwrap();
+        assert!(layer.is_empty(), "both units drain via their landed identities once the detached commit completes");
+        assert_eq!(calls.load(Ordering::Relaxed), 1, "draining reuses the landed commit");
+    }
+
     #[serial]
     #[tokio::test]
     async fn a_stalled_commit_detaches_and_its_completion_drains_the_bucket() {
