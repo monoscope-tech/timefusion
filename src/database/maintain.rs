@@ -832,6 +832,28 @@ impl Database {
             .collect()
     }
 
+    /// CPU-token cost of one maintenance unit, scaled by its decoded size.
+    ///
+    /// Every unit used to cost ONE token against a ~1.5x-cores capacity, so
+    /// sixty-five day-wide rebuild scans ran at once and client queries starved
+    /// at the store: prod 2026-09-24 evening, a 24-hour count at 85 seconds and
+    /// a third of heavy queries timing out, with memory, flush and buffer all
+    /// green. Charging one token per 64 MiB of decode makes the big scans
+    /// self-limit — a fleet-maximum unit (`MAX_DECODED_BYTES`, 512 MiB) costs 8
+    /// tokens, so a ~66-token box runs at most ~8 of them — while probes and
+    /// small slices stay one token, exactly as before. No new knob: the
+    /// capacity and the sizes already existed; the PRICE was wrong.
+    ///
+    /// ```
+    /// # use timefusion::database::Database;
+    /// // A probe stays cheap; a fleet-maximum rebuild pays 8.
+    /// assert_eq!(Database::admission_cpu_cost(1), 1);
+    /// assert_eq!(Database::admission_cpu_cost(512 * 1024 * 1024), 8);
+    /// ```
+    pub fn admission_cpu_cost(decoded_bytes: u64) -> u32 {
+        u32::try_from(decoded_bytes.div_ceil(64 * 1024 * 1024)).unwrap_or(u32::MAX).clamp(1, 8)
+    }
+
     /// The journal's current entry set, with the gauges it also feeds.
     fn rollup_journal_entries(&self) -> Vec<crate::rollup_journal::RollupInvalidation> {
         let entries: Vec<_> = self
@@ -1819,7 +1841,8 @@ impl Database {
         }
         // The unit's OWN size, not the fleet maximum: admission scales its ceiling by
         // pool occupancy, so always asking for `MAX_DECODED_BYTES` starves on a busy pool.
-        let request = Resources { cpu: 1, decoded_bytes: estimated_bytes.clamp(1, MAX_DECODED_BYTES), object_reads: 1, object_writes: 1 };
+        let clamped = estimated_bytes.clamp(1, MAX_DECODED_BYTES);
+        let request = Resources { cpu: Self::admission_cpu_cost(clamped), decoded_bytes: clamped, object_reads: 1, object_writes: 1 };
         let Some(_permit) = self.maintenance_admission.try_acquire(request) else {
             // Deliberately NOT `resource_admission`: that reason makes `retry_or_split`
             // split the unit. The request is clamped, so a refusal means only "busy now".
@@ -3161,7 +3184,8 @@ impl Database {
         let retry = |reason: String, seconds: u64| -> Result<bool> { self.retried(&key, reason, std::time::Duration::from_secs(seconds)) };
         // The request must be the unit's own size, or the occupancy-scaled ceiling
         // refuses everything on a busy pool.
-        let request = Resources { cpu: 1, decoded_bytes: task.estimated_decoded_bytes.clamp(1, MAX_DECODED_BYTES), object_reads: 1, object_writes: 1 };
+        let clamped = task.estimated_decoded_bytes.clamp(1, MAX_DECODED_BYTES);
+        let request = Resources { cpu: Self::admission_cpu_cost(clamped), decoded_bytes: clamped, object_reads: 1, object_writes: 1 };
         // Rollups claim the reserved share; every other lane competes for what is
         // left, so continuous compaction cannot starve them the way it did.
         let lane = match key.operation {
