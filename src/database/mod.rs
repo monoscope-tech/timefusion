@@ -1142,6 +1142,20 @@ fn readable_cells_only(covered: &HashSet<(String, chrono::NaiveDate)>, readable:
     covered.iter().filter(|(project, date)| readable.contains(&(project.clone(), date.to_string()))).cloned().collect()
 }
 
+/// Are client queries starving in the heavy-admission queue RIGHT NOW?
+///
+/// True when the queue-timeout counter moved since `seen` (swapped to the
+/// current reading as a side effect). A timeout there is a customer query that
+/// waited its whole budget and got nothing — the one signal that says
+/// background work must stand aside, whatever memory and flush think. Prod
+/// 2026-09-24: the drain's first REAL rebuild wave (the no-op-skip fix made it
+/// real) pushed a 24-hour count from 1.7s to 84s and timed out a third of all
+/// heavy queries, while every other health signal stayed green.
+pub fn queries_starving(seen: &std::sync::atomic::AtomicU64) -> bool {
+    let now = crate::observability::counter_value("timefusion.scan.heavy_query_queue_timeout");
+    now > seen.swap(now, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Why the rollup backfill must not enqueue this pass, or `None` to proceed.
 ///
 /// The queue ceiling was the only brake when the 2026-09-22 drain ran: it
@@ -1164,23 +1178,30 @@ fn readable_cells_only(covered: &HashSet<(String, chrono::NaiveDate)>, readable:
 /// ```
 /// use timefusion::database::backfill_enqueue_deferred as deferred;
 /// // Healthy: proceed.
-/// assert_eq!(deferred(100, false, 0, 10, true), None);
+/// assert_eq!(deferred(100, false, 0, 10, true, false), None);
 /// // One stalled flush since the last pass parks the drain.
-/// assert_eq!(deferred(100, false, 1, 10, true), Some("flush_stalled"));
+/// assert_eq!(deferred(100, false, 1, 10, true, false), Some("flush_stalled"));
 /// // Ingest filling: flush outranks backfill.
-/// assert_eq!(deferred(100, false, 0, 70, true), Some("buffer_pressure"));
+/// assert_eq!(deferred(100, false, 0, 70, true, false), Some("buffer_pressure"));
+/// // A heavy-queue timeout since the last pass parks the drain for a customer.
+/// assert_eq!(deferred(100, false, 0, 10, true, true), Some("queries_starving"));
 /// // Partial coverage maps: a hole is not evidence yet.
-/// assert_eq!(deferred(100, false, 0, 10, false), Some("replay_incomplete"));
+/// assert_eq!(deferred(100, false, 0, 10, false, false), Some("replay_incomplete"));
 /// // The queue ceiling still binds, unless coverage is short of the window.
-/// assert_eq!(deferred(25_000, false, 0, 10, true), Some("queue_ceiling"));
-/// assert_eq!(deferred(25_000, true, 0, 10, true), None);
+/// assert_eq!(deferred(25_000, false, 0, 10, true, false), Some("queue_ceiling"));
+/// assert_eq!(deferred(25_000, true, 0, 10, true, false), None);
 /// ```
 pub fn backfill_enqueue_deferred(
-    pending: usize, coverage_short: bool, flush_stalls_delta: u64, buffer_pressure_pct: u32, replay_complete: bool,
+    pending: usize, coverage_short: bool, flush_stalls_delta: u64, buffer_pressure_pct: u32, replay_complete: bool, queries_starving: bool,
 ) -> Option<&'static str> {
     const BACKFILL_PENDING_CEILING: usize = 25_000;
     if flush_stalls_delta > 0 {
         return Some("flush_stalled");
+    }
+    // Client queries outrank backfill the same way flush does: a heavy-queue
+    // timeout is a customer waiting a full budget for nothing.
+    if queries_starving {
+        return Some("queries_starving");
     }
     if buffer_pressure_pct >= crate::config::HYGIENE_BUFFER_YIELD_PCT {
         return Some("buffer_pressure");
@@ -2528,6 +2549,11 @@ pub struct Database {
     /// tell "a flush stalled in the last minute" from the counter's history.
     /// Arc for the struct's Clone; the census is the only reader.
     backfill_flush_stalls_seen: Arc<std::sync::atomic::AtomicU64>,
+    /// `heavy_query_queue_timeout` as of the last starvation check, per consumer:
+    /// the census and the heavy claim path each track their own last-seen so one
+    /// does not eat the other's delta.
+    census_query_timeouts_seen: Arc<std::sync::atomic::AtomicU64>,
+    claims_query_timeouts_seen: Arc<std::sync::atomic::AtomicU64>,
     /// Caps current-day packing while sealed consolidation is pending. It is
     /// consulted only while sealed debt exists, so the full light pool remains
     /// available to hot packing after catch-up.
@@ -3110,6 +3136,8 @@ impl Database {
             hygiene_gate: Arc::new(HygieneGate::default()),
             maintenance_quiesced: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             backfill_flush_stalls_seen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            census_query_timeouts_seen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            claims_query_timeouts_seen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             hot_packing_sem: Arc::new(tokio::sync::Semaphore::new(hot_packing_permits)),
             repair_holdback_lent: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             repair_rewrite_sem: Arc::new(tokio::sync::Semaphore::new(cfg.derived.repair_rewrite_budget_mib())),

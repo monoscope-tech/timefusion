@@ -1336,6 +1336,7 @@ impl Database {
                 stalls_delta,
                 self.buffer_pressure_pct(),
                 self.preload_replay_complete.load(std::sync::atomic::Ordering::Acquire),
+                super::queries_starving(&self.census_query_timeouts_seen),
             );
             if let Some(reason) = deferred {
                 info!(pending, reason, event = "rollup_backfill_enqueue_deferred");
@@ -1955,6 +1956,15 @@ impl Database {
     }
 
     pub(crate) async fn run_coordinator_rollup_selected(&self, selection: TaskSelection<'_>) -> Result<bool> {
+        // Client queries outrank background rebuilds outright: a heavy-queue
+        // timeout means a customer waited a full budget for nothing while this
+        // lane's day-wide scans held the store. Claim nothing this tick; the
+        // signal self-clears the moment timeouts stop. Prod 2026-09-24: the first
+        // REAL rebuild wave took a 24h count from 1.7s to 84s — every other
+        // health gate (memory, flush, buffer) stayed green throughout.
+        if crate::database::queries_starving(&self.claims_query_timeouts_seen) {
+            return Ok(false);
+        }
         let operation = selection.operation();
         use crate::maintenance_coordinator::{MAX_DECODED_BYTES, Operation, Resources, TaskState};
         use deltalake::{
@@ -2997,6 +3007,11 @@ impl Database {
     }
 
     async fn run_coordinator_compaction_selected(&self, selection: TaskSelection<'_>) -> Result<bool> {
+        // Same customer-first yield as the rollup lane; one shared last-seen is
+        // fine here — either lane skipping a tick relieves the same store.
+        if crate::database::queries_starving(&self.claims_query_timeouts_seen) {
+            return Ok(false);
+        }
         let operation = selection.operation();
         use crate::maintenance_coordinator::{MAX_DECODED_BYTES, Operation, Resources, TaskLease, TaskState};
         // Current-day packing must not repeatedly win every shared light permit
