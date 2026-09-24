@@ -2931,13 +2931,65 @@ impl Database {
         self.run_coordinator_compaction_selected(TaskSelection::Next(operation)).await
     }
 
+    /// Remove-only commit for files whose every row a deletion vector masks.
+    ///
+    /// Guarded by the caller: only reached when a staging scan over the PINNED
+    /// snapshot of exactly these files returned zero live rows, which proves the
+    /// removal changes no query result. Files are immutable and DVs only grow,
+    /// so the proof cannot rot between the scan and the commit; a concurrent
+    /// rewrite that already removed a target turns this into an OCC conflict the
+    /// next re-plan absorbs.
+    async fn retire_masked_corpses(
+        &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, project_id: &str, targets: &[deltalake::kernel::Add],
+    ) -> Result<()> {
+        use deltalake::{
+            kernel::{Action, transaction::TableReference},
+            protocol::{DeltaOperation, SaveMode},
+        };
+        let actions: Vec<Action> = targets.iter().map(|add| Action::Remove(remove_for_add(add, true))).collect();
+        let commit_lock = self.commit_lock(project_id, table_name).await;
+        let guard = commit_lock.lock().await;
+        refresh_table_snapshot(table_ref, self.config.maintenance.timefusion_incremental_snapshot).await?;
+        let mut table = table_ref.read().await.clone();
+        // A target already gone means another rewrite retired it; removing the
+        // rest is still sound (each carries its own zero-row proof).
+        let live = table.snapshot()?.log_data().iter().map(|file| file.path().to_string()).collect::<HashSet<_>>();
+        let actions: Vec<Action> = actions.into_iter().filter(|action| matches!(action, Action::Remove(remove) if live.contains(&remove.path))).collect();
+        if actions.is_empty() {
+            return Ok(());
+        }
+        let schema = get_schema(table_name).ok_or_else(|| anyhow::anyhow!("corpse retire: schema missing for {table_name}"))?;
+        let removed = actions.len();
+        let op = DeltaOperation::Write { mode: SaveMode::Overwrite, partition_by: Some(schema.partitions.clone()), predicate: None };
+        let finalized = deltalake::kernel::transaction::CommitBuilder::from(incremental_commit_properties(
+            self.config.maintenance.timefusion_incremental_snapshot,
+            "retire_masked_corpses",
+        ))
+        .with_actions(actions)
+        .build(Some(table.snapshot()? as &dyn TableReference), table.log_store(), op)
+        .await?;
+        table.state = Some(finalized.snapshot());
+        drop(guard);
+        self.swap_and_refresh_cache(table_ref, table, None, &[]).await;
+        warn!(table_name, project_id, removed, event = "compaction_retired_masked_corpses", "removed fully deletion-masked files a rewrite could never retire");
+        Ok(())
+    }
+
     /// Retire a compaction unit, or requeue it immediately when its partition still
     /// holds debt — a bin is never by construction the whole cell.
-    async fn settle_compaction_unit(&self, table_ref: &Arc<RwLock<DeltaTable>>, key: &crate::maintenance_coordinator::TaskKey) -> Result<()> {
+    async fn settle_compaction_unit(
+        &self, table_ref: &Arc<RwLock<DeltaTable>>, key: &crate::maintenance_coordinator::TaskKey, made_progress: bool,
+    ) -> Result<()> {
         let remaining = !self.coordinator_compaction_files(table_ref, key).await?.is_empty();
         let mut journal = self.journal();
         if remaining {
-            journal.retry(key, "compaction_debt_remaining".to_owned(), crate::support::now_micros());
+            // A unit that retired NOTHING and still sees debt is a planner/packer
+            // disagreement; requeued at `now` it spins the claim path (prod
+            // 2026-09-24: ~7 claims/sec on one bin for hours). The delay is the
+            // class guard — whatever the next such disagreement is, it costs one
+            // unit per ten minutes, not the box.
+            let not_before = crate::support::now_micros() + if made_progress { 0 } else { 600 * 1_000_000 };
+            journal.retry(key, "compaction_debt_remaining".to_owned(), not_before);
         } else {
             journal.complete(key);
         }
@@ -3127,7 +3179,7 @@ impl Database {
         };
         note(5);
         if operation == crate::maintenance_coordinator::Operation::Repair && self.repair_bin_already_sorted(&table_ref, &files).await {
-            return self.settle_compaction_unit(&table_ref, &key).await.map(|()| true);
+            return self.settle_compaction_unit(&table_ref, &key, true).await.map(|()| true);
         }
         let Some(schema) = get_schema(&key.source) else { return retry("compaction_schema_missing".to_owned(), 300) };
         let pass = if operation == crate::maintenance_coordinator::Operation::Repair { TailPass::Repair } else { TailPass::Pack };
@@ -3142,7 +3194,7 @@ impl Database {
             let landed = result.failed.is_empty() && !result.landed.is_empty();
             info!(table_name = %key.source, project_id = %key.project_id, landed, event = "resumed_bin_committed_early");
             if landed {
-                return self.settle_compaction_unit(&table_ref, &key).await.map(|()| true);
+                return self.settle_compaction_unit(&table_ref, &key, true).await.map(|()| true);
             }
             // The resume lost its race (inputs no longer live); stage normally.
         }
@@ -3158,13 +3210,16 @@ impl Database {
                 HotStageOptions { pass, operation: Some(operation), runtime_env: Some(runtime), light_permit },
             )
             .await;
-        let completed = match outcome {
+        let (completed, made_progress) = match outcome {
             Ok(BinOutcome::Staged(unit)) => {
                 let result = self.commit_wave(&table_ref, &key.source, std::slice::from_ref(&date_marker), false, vec![unit], 0).await;
-                result.failed.is_empty() && !result.landed.is_empty()
+                let landed = result.failed.is_empty() && !result.landed.is_empty();
+                (landed, landed)
             }
-            Ok(BinOutcome::Converged) => true,
-            Ok(BinOutcome::Retry) => false,
+            // Converged committed nothing: with debt still visible below, that is
+            // a planner/packer disagreement, and it must not requeue at `now`.
+            Ok(BinOutcome::Converged) => (true, false),
+            Ok(BinOutcome::Retry) => (false, false),
             // The repair byte budget is held by another long-running rewrite; requeue
             // on that clock rather than spinning on re-claims.
             Ok(BinOutcome::BudgetBusy) => {
@@ -3200,7 +3255,14 @@ impl Database {
         let mut journal = self.journal();
         if journal.state(&key) == Some(TaskState::Running) {
             match (completed, remaining) {
-                (true, true) => journal.retry(&key, "compaction_debt_remaining".to_owned(), crate::support::now_micros()),
+                // No progress + debt remaining = the 2026-09-24 spin (7 claims/sec
+                // on one bin for hours); ten minutes per attempt bounds any such
+                // disagreement at background cost.
+                (true, true) => journal.retry(
+                    &key,
+                    "compaction_debt_remaining".to_owned(),
+                    crate::support::now_micros().saturating_add(if made_progress { 0 } else { 600 * 1_000_000 }),
+                ),
                 (true, false) => journal.complete(&key),
                 (false, _) => journal.retry(&key, "compaction_incomplete".to_owned(), crate::support::now_micros().saturating_add(30_000_000)),
             };
@@ -6653,8 +6715,9 @@ impl Database {
             }
             let _ = ctx.deregister_table(&bin_table);
             if rows_staged == 0 {
-                // The other silent exit: staging nothing and returning Ok is
-                // otherwise indistinguishable from success in the logs.
+                // Staging nothing is either an empty selection or a bin of
+                // fully-deletion-masked corpses; the OUTER exit tells them apart
+                // and retires the corpses, or this bin re-plans forever.
                 warn!(table_name, project_id, files = files.len(), event = "light_optimize_bin_no_rows");
                 return Ok(());
             }
@@ -6738,8 +6801,17 @@ impl Database {
             return Err(e);
         }
         if adds.is_empty() {
-            // Zero rows staged: nothing to commit, and retrying the same
-            // zero-row selection would loop — treat as converged for this tick.
+            // Zero rows staged over REAL files means every input row is masked by
+            // a deletion vector: the files are corpses, and "converged for this
+            // tick" is not enough — the planner re-mints from the debt they still
+            // represent, and prod 2026-09-24 spun one such bin ~7 times a second
+            // for hours (614k selected-nothing units, 3.8k queued queries timing
+            // out under the churn). A remove-only commit retires them; the scan
+            // against the pinned snapshot just proved the removal changes no
+            // query result.
+            if !targets.is_empty() {
+                self.retire_masked_corpses(table_ref, table_name, project_id, &targets).await?;
+            }
             return Ok(BinOutcome::Converged);
         }
         // Record the intent BEFORE the bin can be handed to a wave commit, so a
@@ -8892,6 +8964,53 @@ mod rollup_noop_skip_tests {
             "an unreadable cell must be REBUILT, not proved redundant against coverage the reader cannot use"
         );
         assert!(db.rollup_coverage.iter().any(|e| e.key().0 == project_id), "the rebuild must republish the day coverage the reader routes by");
+        Ok(())
+    }
+
+    /// A file whose every row a deletion vector masks can never be RETIRED by a
+    /// rewrite — it stages zero rows, commits nothing, and the debt it represents
+    /// re-mints the unit forever. Prod 2026-09-24 spun one such bin ~7 times a
+    /// second for hours while query admission timed out underneath. Staging must
+    /// retire the corpse with a remove-only commit instead.
+    #[serial]
+    #[tokio::test]
+    async fn a_fully_masked_file_is_retired_not_replanned_forever() -> Result<()> {
+        let (db, project_id, date) = rollup_db("corpse_retire").await?;
+        // The same dedup identity in two commits: after dedup, the losing file's
+        // only row is masked and the file is a corpse.
+        insert_span(&db, &project_id, date, 12, "dup", "first").await?;
+        insert_span(&db, &project_id, date, 12, "dup", "second").await?;
+        dedup_unified(&db).await?;
+
+        let table = db.resolve_table(&project_id, "otel_logs_and_spans").await?;
+        let corpse = {
+            let t = table.read().await;
+            t.snapshot()?
+                .log_data()
+                .iter()
+                .map(|f| add_action(&f))
+                .find(|add| add.path.contains(&project_id) && add.deletion_vector.is_some())
+                .map(|add| add.path.clone())
+                .expect("dedup must have masked the losing file with a deletion vector")
+        };
+
+        let schema = get_schema("otel_logs_and_spans").expect("otel schema");
+        let outcome = db
+            .stage_hot_bin(
+                &table,
+                "otel_logs_and_spans",
+                schema,
+                &project_id,
+                vec![corpse.clone()],
+                HotStageOptions { pass: TailPass::Pack, operation: None, runtime_env: Some(db.coordinator_runtime_env()), light_permit: None },
+            )
+            .await?;
+        assert!(matches!(outcome, crate::database::BinOutcome::Converged), "a corpse bin converges");
+        let still_live = {
+            let t = table.read().await;
+            t.snapshot()?.log_data().iter().any(|f| f.path().as_ref() == corpse)
+        };
+        assert!(!still_live, "the fully-masked file must be REMOVED, or the planner re-mints this bin forever");
         Ok(())
     }
 
