@@ -212,7 +212,7 @@ mod sqllogictest_tests {
             // Pinned to a tag with conditional PUT (Delta commits need it), pulled from
             // quay.io (the Docker Hub tag 404s). GenericImage because modern images
             // banner "API:" on stderr, which the testcontainers MinIO module does not expect.
-            let minio = GenericImage::new("quay.io/minio/minio", "RELEASE.2025-09-07T16-13-09Z")
+            let minio = GenericImage::new("ghcr.io/monoscope-tech/minio", "RELEASE.2025-04-22T22-12-26Z")
                 .with_wait_for(WaitFor::message_on_stderr("API:"))
                 .with_cmd(["server", "/data"])
                 .with_env_var("MINIO_ROOT_USER", "minioadmin")

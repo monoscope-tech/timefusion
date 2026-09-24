@@ -20,9 +20,13 @@ use tokio_postgres::{Client, NoTls};
 use uuid::Uuid;
 
 /// MinIO release with atomic conditional PUT support (older ones can overwrite
-/// racing Delta commits). Must come from quay.io — this tag is not on Docker Hub.
-pub const MINIO_IMAGE: &str = "quay.io/minio/minio";
-pub const MINIO_TAG: &str = "RELEASE.2025-09-07T16-13-09Z";
+/// racing Delta commits). Served from OUR registry: MinIO closed anonymous
+/// distribution everywhere in 2025 (quay.io 401s, the Docker Hub repo is
+/// deleted, dl.min.io is 410), so this is the sha256-verified GitHub-release
+/// binary repackaged under ghcr.io/monoscope-tech — a pull needs a ghcr login
+/// (`gh auth token | docker login ghcr.io -u <user> --password-stdin`).
+pub const MINIO_IMAGE: &str = "ghcr.io/monoscope-tech/minio";
+pub const MINIO_TAG: &str = "RELEASE.2025-04-22T22-12-26Z";
 
 pub fn pinned_minio_image() -> GenericImage {
     GenericImage::new(MINIO_IMAGE, MINIO_TAG).with_wait_for(WaitFor::message_on_stderr("API:"))

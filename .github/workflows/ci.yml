@@ -274,6 +274,15 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest@0.9.140
+      # MinIO closed anonymous pulls everywhere (quay 401, Docker Hub deleted,
+      # dl.min.io 410 — 2026-09-24), so the harness image lives in our GHCR and
+      # the runner must authenticate to pull it.
+      - name: Login to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GH_TOKEN }}
       # Capped at 2 concurrent: each e2e test starts its own MinIO container, and
       # more than a couple at a time swamps a 4-vCPU runner (the 2026-07-20
       # cold_start timeout). The WAL is per-test-config now, so the old
