@@ -2853,6 +2853,13 @@ impl AdmissionController {
         };
         let used = state.used();
         let mut refused = false;
+        // A unit priced above the lane's whole ceiling runs ALONE, never NEVER:
+        // size-priced CPU (one token per 64 MiB of decode) can exceed a small
+        // box's ceiling, and unclamped it would starve that unit forever — the
+        // tiny-box CI shard did exactly that, retrying admission_busy until the
+        // test gave up. Clamped HERE, after lag-scaling and the lane reserve,
+        // because those are what actually bind.
+        let request = Resources { cpu: request.cpu.min(lane_ceiling), ..request };
         if used.cpu.saturating_add(request.cpu) > lane_ceiling {
             stats.maintenance_admission_refused_cpu.fetch_add(1, Relaxed);
             refused = true;
