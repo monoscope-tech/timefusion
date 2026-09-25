@@ -49,13 +49,24 @@ pub struct ValidatorModuleResult {
 /// validate a bearer token for a specific user
 #[async_trait]
 pub trait OauthValidator: Send + Sync + Debug {
-    async fn validate(&self, token: &str, username: &str, issuer: &str, required_scopes: &str) -> PgWireResult<ValidatorModuleResult>;
+    async fn validate(
+        &self,
+        token: &str,
+        username: &str,
+        issuer: &str,
+        required_scopes: &str,
+    ) -> PgWireResult<ValidatorModuleResult>;
 }
 
 impl Oauth {
     /// initialize the oauth context.
     pub fn new(issuer: String, scope: String, validator: Arc<dyn OauthValidator>) -> Self {
-        Self { issuer, scope, validator, skip_usermap: false }
+        Self {
+            issuer,
+            scope,
+            validator,
+            skip_usermap: false,
+        }
     }
 
     /// Configures whether to skip user mapping.
@@ -70,7 +81,11 @@ impl Oauth {
     fn generate_error_response(&self) -> String {
         // * Build a default .well-known URI based on our issuer, unless the HBA has
         // * already provided one.
-        let config = if self.issuer.contains("/.well-known/") { self.issuer.clone() } else { format!("{}/.well-known/openid-configuration", self.issuer) };
+        let config = if self.issuer.contains("/.well-known/") {
+            self.issuer.clone()
+        } else {
+            format!("{}/.well-known/openid-configuration", self.issuer)
+        };
 
         let config = config.replace('\\', "\\\\").replace('"', "\\\"");
         let scope = self.scope.replace('\\', "\\\\").replace('"', "\\\"");
@@ -97,29 +112,41 @@ impl Oauth {
         let mut chars = s.chars();
 
         // so, we have to parse the GS2 header
-        let cbind_flag = chars.next().ok_or_else(|| PgWireError::InvalidOauthMessage("Empty message".to_string()))?;
+        let cbind_flag = chars
+            .next()
+            .ok_or_else(|| PgWireError::InvalidOauthMessage("Empty message".to_string()))?;
         match cbind_flag {
             'n' | 'y' => {
                 if chars.next() != Some(',') {
-                    return Err(PgWireError::InvalidOauthMessage("Expected comma after channel binding flag".to_string()));
+                    return Err(PgWireError::InvalidOauthMessage(
+                        "Expected comma after channel binding flag".to_string(),
+                    ));
                 }
             }
             'p' => {
-                return Err(PgWireError::InvalidOauthMessage("Channel binding not supported for oauth".to_string()));
+                return Err(PgWireError::InvalidOauthMessage(
+                    "Channel binding not supported for oauth".to_string(),
+                ));
             }
             _ => {
-                return Err(PgWireError::InvalidOauthMessage(format!("Invalid channel binding flag: {cbind_flag}")));
+                return Err(PgWireError::InvalidOauthMessage(format!(
+                    "Invalid channel binding flag: {cbind_flag}"
+                )));
             }
         }
 
         // get authzid, we expect it to be empty too, according to the docs
         if chars.next() != Some(',') {
-            return Err(PgWireError::InvalidOauthMessage("authzid not supported".to_string()));
+            return Err(PgWireError::InvalidOauthMessage(
+                "authzid not supported".to_string(),
+            ));
         }
 
         // then, we exoect the separator
         if chars.next() != Some('\x01') {
-            return Err(PgWireError::InvalidOauthMessage("Expected kvsep after GS2 header".to_string()));
+            return Err(PgWireError::InvalidOauthMessage(
+                "Expected kvsep after GS2 header".to_string(),
+            ));
         }
 
         let remnant = chars.as_str();
@@ -139,24 +166,35 @@ impl Oauth {
 
             let parts: Vec<&str> = kv.splitn(2, '=').collect();
             if parts.len() != 2 {
-                return Err(PgWireError::InvalidOauthMessage("Malformed key-value pair".to_owned()));
+                return Err(PgWireError::InvalidOauthMessage(
+                    "Malformed key-value pair".to_owned(),
+                ));
             }
 
             let key = parts[0];
             let value = parts[1];
 
             if !key.chars().all(|c| c.is_ascii_alphabetic()) {
-                return Err(PgWireError::InvalidOauthMessage("Invalid key name".to_owned()));
+                return Err(PgWireError::InvalidOauthMessage(
+                    "Invalid key name".to_owned(),
+                ));
             }
 
             // Validate value (VCHAR / SP / HTAB / CR / LF)
-            if !value.chars().all(|c| matches!(c, '\x21'..='\x7E' | ' ' | '\t' | '\r' | '\n')) {
-                return Err(PgWireError::InvalidOauthMessage("Invalid value characters".to_owned()));
+            if !value
+                .chars()
+                .all(|c| matches!(c, '\x21'..='\x7E' | ' ' | '\t' | '\r' | '\n'))
+            {
+                return Err(PgWireError::InvalidOauthMessage(
+                    "Invalid value characters".to_owned(),
+                ));
             }
 
             if key == AUTH_KEY {
                 if auth.is_some() {
-                    return Err(PgWireError::InvalidOauthMessage("Multiple oauth values".to_string()));
+                    return Err(PgWireError::InvalidOauthMessage(
+                        "Multiple oauth values".to_string(),
+                    ));
                 }
                 if value.is_empty() {
                     auth = None;
@@ -193,7 +231,10 @@ impl Oauth {
         }
 
         // validate case insensitive bearer scheme
-        if !value.to_ascii_lowercase().starts_with(&BEARER_SCHEME.to_ascii_lowercase()) {
+        if !value
+            .to_ascii_lowercase()
+            .starts_with(&BEARER_SCHEME.to_ascii_lowercase())
+        {
             return None;
         }
 
@@ -203,7 +244,16 @@ impl Oauth {
             return None;
         }
 
-        let valid_chars = token.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.' || c == '_' || c == '~' || c == '+' || c == '/' || c == '=');
+        let valid_chars = token.chars().all(|c| {
+            c.is_ascii_alphanumeric()
+                || c == '-'
+                || c == '.'
+                || c == '_'
+                || c == '~'
+                || c == '+'
+                || c == '/'
+                || c == '='
+        });
 
         if !valid_chars {
             return None;
@@ -213,7 +263,12 @@ impl Oauth {
     }
 
     /// Processes an incoming OAuth SASL message and returns the response and new state.
-    pub async fn process_oauth_message<C>(&self, client: &C, msg: PasswordMessageFamily, state: &SASLState) -> PgWireResult<(Option<Authentication>, SASLState)>
+    pub async fn process_oauth_message<C>(
+        &self,
+        client: &C,
+        msg: PasswordMessageFamily,
+        state: &SASLState,
+    ) -> PgWireResult<(Option<Authentication>, SASLState)>
     where
         C: ClientInfo + Unpin + Send,
     {
@@ -224,7 +279,10 @@ impl Oauth {
                 let data = match res.data.as_deref() {
                     None => {
                         // if dtata is empty, that means it is for discovery
-                        return Ok((Some(Authentication::SASLContinue(Bytes::from(""))), SASLState::OauthStateInit));
+                        return Ok((
+                            Some(Authentication::SASLContinue(Bytes::from(""))),
+                            SASLState::OauthStateInit,
+                        ));
                     }
                     Some(d) => d,
                 };
@@ -233,29 +291,44 @@ impl Oauth {
                     Ok(Some(auth)) => auth,
                     Ok(None) => {
                         let err = self.generate_error_response();
-                        return Ok((Some(Authentication::SASLContinue(Bytes::from(err))), SASLState::OauthStateError));
+                        return Ok((
+                            Some(Authentication::SASLContinue(Bytes::from(err))),
+                            SASLState::OauthStateError,
+                        ));
                     }
                     Err(err) => return Err(err),
                 };
 
                 if auth.is_empty() {
-                    return Err(PgWireError::OAuthAuthenticationFailed("validation of OAuth token requested without a auth header".to_string()));
+                    return Err(PgWireError::OAuthAuthenticationFailed(
+                        "validation of OAuth token requested without a auth header".to_string(),
+                    ));
                 }
 
                 let token = match self.validate_token_format(&auth) {
                     Some(t) => t,
                     None => {
-                        return Err(PgWireError::OAuthAuthenticationFailed("malformed OAuth bearer token".to_string()));
+                        return Err(PgWireError::OAuthAuthenticationFailed(
+                            "malformed OAuth bearer token".to_string(),
+                        ));
                     }
                 };
 
                 let login_info = LoginInfo::from_client_info(client);
-                let username = login_info.user().ok_or_else(|| PgWireError::UserNameRequired)?;
+                let username = login_info
+                    .user()
+                    .ok_or_else(|| PgWireError::UserNameRequired)?;
 
-                let validation_result = self.validator.validate(token, username, &self.issuer, &self.scope).await?;
+                let validation_result = self
+                    .validator
+                    .validate(token, username, &self.issuer, &self.scope)
+                    .await?;
 
                 if !validation_result.authorized {
-                    return Err(PgWireError::OAuthAuthenticationFailed(format!("OAuth bearer authentication failed for user: {}", username)));
+                    return Err(PgWireError::OAuthAuthenticationFailed(format!(
+                        "OAuth bearer authentication failed for user: {}",
+                        username
+                    )));
                 }
 
                 // TODO: handle user mapping with skip_usermap
@@ -265,10 +338,14 @@ impl Oauth {
             SASLState::OauthStateError => {
                 let res = msg.into_sasl_response()?;
                 if res.data.len() != 1 || res.data[0] != KVSEP {
-                    return Err(PgWireError::InvalidOauthMessage("Expected single kvsep byte in error response".to_string()));
+                    return Err(PgWireError::InvalidOauthMessage(
+                        "Expected single kvsep byte in error response".to_string(),
+                    ));
                 }
 
-                Err(PgWireError::OAuthAuthenticationFailed("OAuth authentication failed".to_string()))
+                Err(PgWireError::OAuthAuthenticationFailed(
+                    "OAuth authentication failed".to_string(),
+                ))
             }
             _ => Err(PgWireError::InvalidSASLState),
         }
@@ -283,14 +360,28 @@ mod tests {
 
     #[async_trait]
     impl OauthValidator for MockValidator {
-        async fn validate(&self, _token: &str, _username: &str, _issuer: &str, _required_scopes: &str) -> PgWireResult<ValidatorModuleResult> {
-            Ok(ValidatorModuleResult { authorized: true, authn_id: Some("test@example.com".to_string()), metadata: None })
+        async fn validate(
+            &self,
+            _token: &str,
+            _username: &str,
+            _issuer: &str,
+            _required_scopes: &str,
+        ) -> PgWireResult<ValidatorModuleResult> {
+            Ok(ValidatorModuleResult {
+                authorized: true,
+                authn_id: Some("test@example.com".to_string()),
+                metadata: None,
+            })
         }
     }
 
     #[test]
     fn test_parse_kvpairs() {
-        let oauth = Oauth::new("https://example.com".to_string(), "openid".to_string(), Arc::new(MockValidator));
+        let oauth = Oauth::new(
+            "https://example.com".to_string(),
+            "openid".to_string(),
+            Arc::new(MockValidator),
+        );
 
         // valid
         let data = "auth=Bearer token123\x01\x01";
@@ -305,10 +396,18 @@ mod tests {
 
     #[test]
     fn test_validate_token_format() {
-        let oauth = Oauth::new("https://example.com".to_string(), "openid".to_string(), Arc::new(MockValidator));
+        let oauth = Oauth::new(
+            "https://example.com".to_string(),
+            "openid".to_string(),
+            Arc::new(MockValidator),
+        );
 
         assert!(oauth.validate_token_format("Bearer abc123").is_some());
-        assert!(oauth.validate_token_format("Bearer abc.123_def-ghi+jkl/mno===").is_some());
+        assert!(
+            oauth
+                .validate_token_format("Bearer abc.123_def-ghi+jkl/mno===")
+                .is_some()
+        );
 
         assert!(oauth.validate_token_format("").is_none());
         assert!(oauth.validate_token_format("Bearer ").is_none());

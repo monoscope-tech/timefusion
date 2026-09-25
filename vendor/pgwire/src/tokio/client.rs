@@ -25,6 +25,9 @@ use crate::api::client::config::Host;
 use crate::api::client::query::{ExtendedQueryClient, ExtendedQueryHandler, SimpleQueryHandler};
 use crate::api::client::{ClientInfo, Config, ReadyState, ServerInformation};
 use crate::error::{PgWireClientError, PgWireClientResult, PgWireError};
+use crate::messages::cancel::CancelRequest;
+use crate::messages::response::TransactionStatus;
+use crate::messages::startup::SecretKey;
 use crate::messages::{
     DecodeContext, PgWireBackendMessage, PgWireFrontendMessage, ProtocolVersion,
     SslNegotiationMetaMessage,
@@ -78,6 +81,13 @@ pub struct PgWireClient {
     socket: Framed<ClientSocket, PgWireMessageClientCodec>,
     config: Arc<Config>,
     server_information: ServerInformation,
+    /// Transaction status as last reported by the server in a
+    /// `ReadyForQuery` message.
+    transaction_status: TransactionStatus,
+    /// TLS connector retained so [`PgWireClient::cancel`] can open a second
+    /// secured connection to the same server.
+    #[cfg(any(feature = "_ring", feature = "_aws-lc-rs"))]
+    tls_connector: Option<TlsConnector>,
 }
 
 impl ClientInfo for PgWireClient {
@@ -89,12 +99,32 @@ impl ClientInfo for PgWireClient {
         &self.server_information.parameters
     }
 
+    fn set_server_parameter(&mut self, name: String, value: String) {
+        self.server_information.parameters.insert(name, value);
+    }
+
     fn process_id(&self) -> i32 {
         self.server_information.process_id
     }
 
+    fn secret_key(&self) -> &SecretKey {
+        &self.server_information.secret_key
+    }
+
     fn protocol_version(&self) -> ProtocolVersion {
         self.socket.codec().decode_context.protocol_version
+    }
+
+    fn set_protocol_version(&mut self, version: ProtocolVersion) {
+        self.socket.codec_mut().decode_context.protocol_version = version;
+    }
+
+    fn transaction_status(&self) -> TransactionStatus {
+        self.transaction_status
+    }
+
+    fn set_transaction_status(&mut self, status: TransactionStatus) {
+        self.transaction_status = status;
     }
 }
 
@@ -130,32 +160,25 @@ impl PgWireClient {
     where
         S: StartupHandler,
     {
-        // tcp connect
-        let mut socket = match get_addr(&config)? {
-            PgSocketAddr::Ip(socket_addr) => {
-                ClientSocket::Plain(TcpStream::connect(socket_addr).await?)
-            }
-            PgSocketAddr::Host(socket_addr) => {
-                ClientSocket::Plain(TcpStream::connect(socket_addr).await?)
-            }
-            #[cfg(unix)]
-            PgSocketAddr::Unix(socket_addr) => {
-                ClientSocket::Unix(UnixStream::connect(socket_addr).await?)
-            }
-        };
-        if let ClientSocket::Plain(tcp_socket) = socket {
-            // perform ssl handshake based on postgres configuration
-            // if tls is not enabled, just return the socket and perform startup
-            // directly
-            socket = ssl_handshake(tcp_socket, &config, tls_connector).await?;
-        };
-        let socket = Framed::new(socket, PgWireMessageClientCodec::default());
+        // The TLS connector is retained so `cancel` can open a second secured
+        // connection later. When TLS is disabled there is no field to store.
+        #[cfg(any(feature = "_ring", feature = "_aws-lc-rs"))]
+        let tls_connector_for_cancel = tls_connector.clone();
+
+        let socket = connect_socket(&config, tls_connector).await?;
 
         let mut client = PgWireClient {
             socket,
             config: config.clone(),
             server_information: ServerInformation::default(),
+            transaction_status: TransactionStatus::Idle,
+            #[cfg(any(feature = "_ring", feature = "_aws-lc-rs"))]
+            tls_connector: tls_connector_for_cancel,
         };
+
+        // Decode backend messages with the rules of the protocol version we
+        // are about to advertise, until the server negotiates it down.
+        client.set_protocol_version(config.get_protocol_version());
 
         startup_handler.startup(&mut client).await?;
         // loop until finished
@@ -165,7 +188,19 @@ impl PgWireClient {
             if let ReadyState::Ready(server_info) =
                 startup_handler.on_message(&mut client, message).await?
             {
-                client.server_information = server_info;
+                let ServerInformation {
+                    parameters,
+                    process_id,
+                    secret_key,
+                } = server_info;
+                // Parameters reported by the handler are merged over the ones
+                // already cached as they arrived during startup (the default
+                // `on_parameter_status` stores them on the client), so the
+                // cache is complete regardless of how the handler builds its
+                // `ServerInformation`.
+                client.server_information.parameters.extend(parameters);
+                client.server_information.process_id = process_id;
+                client.server_information.secret_key = secret_key;
                 return Ok(client);
             }
         }
@@ -173,7 +208,46 @@ impl PgWireClient {
         Err(PgWireClientError::UnexpectedEOF)
     }
 
+    /// Cancel the currently running query on this connection.
+    ///
+    /// Per the PostgreSQL wire protocol, a cancel request must be sent on a
+    /// **separate** connection to the same server — it carries the `pid` and
+    /// `secret_key` from the original connection's `BackendKeyData`. This
+    /// method opens that second connection (reusing this client's [`Config`]
+    /// and TLS connector), sends the `CancelRequest`, and closes it.
+    ///
+    /// The server sends no reply on the cancel connection. Whether the cancel
+    /// succeeded is observed on the original connection: the interrupted query
+    /// returns an error (typically `57014` / `query_canceled`).
+    ///
+    /// Returns an error only if the second connection itself could not be
+    /// established or the cancel message could not be written.
+    pub async fn cancel(&self) -> PgWireClientResult<()> {
+        // TLS connector is only stored when a TLS backend is enabled; without
+        // TLS the cancel connection is always plaintext.
+        #[cfg(any(feature = "_ring", feature = "_aws-lc-rs"))]
+        let tls_connector = self.tls_connector.clone();
+        #[cfg(not(any(feature = "_ring", feature = "_aws-lc-rs")))]
+        let tls_connector: Option<TlsConnector> = None;
+
+        let mut socket = connect_socket(&self.config, tls_connector).await?;
+
+        socket
+            .send(PgWireFrontendMessage::CancelRequest(CancelRequest::new(
+                self.server_information.process_id,
+                self.server_information.secret_key.clone(),
+            )))
+            .await?;
+        socket.close().await?;
+
+        Ok(())
+    }
+
     /// Start a query with simple query subprotocol
+    ///
+    /// If the query fails, the trailing `ReadyForQuery` of the failed query
+    /// is consumed before the error is returned, so the connection remains
+    /// usable for further queries.
     pub async fn simple_query<H>(
         &mut self,
         mut simple_query_handler: H,
@@ -187,10 +261,30 @@ impl PgWireClient {
         while let Some(message_result) = self.next().await {
             let message = message_result?;
 
-            if let ReadyState::Ready(responses) =
-                simple_query_handler.on_message(self, message).await?
-            {
-                return Ok(responses);
+            match simple_query_handler.on_message(self, message).await {
+                Ok(ReadyState::Ready(responses)) => return Ok(responses),
+                Ok(ReadyState::Pending) => {}
+                Err(error) => {
+                    // drain until ReadyForQuery so the connection is left in
+                    // a reusable state; the server always sends it as the
+                    // last message of a simple query
+                    while let Some(message_result) = self.next().await {
+                        match message_result? {
+                            PgWireBackendMessage::ReadyForQuery(ready) => {
+                                self.set_transaction_status(ready.status);
+                                break;
+                            }
+                            PgWireBackendMessage::ParameterStatus(parameter_status) => {
+                                self.set_server_parameter(
+                                    parameter_status.name,
+                                    parameter_status.value,
+                                );
+                            }
+                            _ => continue,
+                        }
+                    }
+                    return Err(error);
+                }
             }
         }
 
@@ -370,6 +464,34 @@ pub(crate) async fn ssl_handshake(
     Ok(socket)
 }
 
+/// Establish a framed connection to the server: TCP (optionually upgraded to
+/// TLS) or Unix domain socket. Shared by [`PgWireClient::connect`] (which then
+/// runs startup) and [`PgWireClient::cancel`] (which sends a `CancelRequest`
+/// instead of a `Startup`).
+async fn connect_socket(
+    config: &Config,
+    tls_connector: Option<TlsConnector>,
+) -> PgWireClientResult<Framed<ClientSocket, PgWireMessageClientCodec>> {
+    let mut socket = match get_addr(config)? {
+        PgSocketAddr::Ip(socket_addr) => {
+            ClientSocket::Plain(TcpStream::connect(socket_addr).await?)
+        }
+        PgSocketAddr::Host(socket_addr) => {
+            ClientSocket::Plain(TcpStream::connect(socket_addr).await?)
+        }
+        #[cfg(unix)]
+        PgSocketAddr::Unix(socket_addr) => {
+            ClientSocket::Unix(UnixStream::connect(socket_addr).await?)
+        }
+    };
+    if let ClientSocket::Plain(tcp_socket) = socket {
+        // Perform the ssl handshake based on postgres configuration; when TLS
+        // is disabled `ssl_handshake` returns the plain socket unchanged.
+        socket = ssl_handshake(tcp_socket, config, tls_connector).await?;
+    }
+    Ok(Framed::new(socket, PgWireMessageClientCodec::default()))
+}
+
 enum PgSocketAddr {
     Ip(SocketAddr),
     Host((String, u16)),
@@ -391,4 +513,168 @@ fn get_addr(config: &Config) -> Result<PgSocketAddr, PgWireClientError> {
     }
 
     Err(PgWireClientError::InvalidConfig("host".to_string()))
+}
+
+#[cfg(all(test, feature = "server-api"))]
+mod tests {
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use tokio::net::TcpListener;
+
+    use super::PgWireClient;
+    use crate::api::PgWireServerHandlers;
+    use crate::api::client::ClientInfo;
+    use crate::api::client::auth::DefaultStartupHandler;
+    use crate::api::client::config::Config;
+    use crate::api::client::query::DefaultSimpleQueryHandler;
+    use crate::api::query::SimpleQueryHandler as ServerSimpleQueryHandler;
+    use crate::api::results::{Response, Tag};
+    use crate::api::store::PortalStore;
+    use crate::api::{ClientInfo as ServerClientInfo, ClientPortalStore};
+    use crate::error::{ErrorInfo, PgWireResult};
+    use crate::messages::ProtocolVersion;
+    use crate::messages::response::TransactionStatus;
+    use crate::messages::startup::SecretKey;
+    use crate::tokio::server::process_socket;
+
+    struct TestHandlers;
+
+    impl PgWireServerHandlers for TestHandlers {}
+
+    /// Simple-query handler that models transaction control statements the
+    /// way a real backend does, for exercising client-side status tracking.
+    struct TxHandlers;
+
+    impl PgWireServerHandlers for TxHandlers {
+        fn simple_query_handler(&self) -> Arc<impl ServerSimpleQueryHandler> {
+            Arc::new(TxSimpleQueryHandler)
+        }
+    }
+
+    struct TxSimpleQueryHandler;
+
+    #[async_trait]
+    impl ServerSimpleQueryHandler for TxSimpleQueryHandler {
+        async fn do_query<C>(&self, _client: &mut C, query: &str) -> PgWireResult<Vec<Response>>
+        where
+            C: ServerClientInfo + ClientPortalStore + Unpin + Send + Sync,
+            C::PortalStore: PortalStore,
+        {
+            match query.trim().to_uppercase().as_str() {
+                "BEGIN" => Ok(vec![Response::TransactionStart(Tag::new("BEGIN"))]),
+                "COMMIT" | "ROLLBACK" => Ok(vec![Response::TransactionEnd(Tag::new("COMMIT"))]),
+                "FAIL" => Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                    "ERROR".to_owned(),
+                    "XX000".to_owned(),
+                    "boom".to_owned(),
+                )))]),
+                _ => Ok(vec![Response::Execution(Tag::new("OK"))]),
+            }
+        }
+    }
+
+    async fn spawn_test_server<H>(handlers: Arc<H>) -> u16
+    where
+        H: PgWireServerHandlers + Send + Sync,
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let (socket, _) = listener.accept().await.unwrap();
+                let handlers = handlers.clone();
+                tokio::spawn(async move {
+                    let _ = process_socket(socket, None, handlers).await;
+                });
+            }
+        });
+        port
+    }
+
+    #[tokio::test]
+    async fn client_negotiates_3_9999_down_to_3_2() {
+        let port = spawn_test_server(Arc::new(TestHandlers)).await;
+
+        let mut config = Config::new();
+        config.host("127.0.0.1");
+        config.port(port);
+        config.user("pgwire");
+        config.protocol_version(ProtocolVersion::PROTOCOL3_9999);
+
+        let client = PgWireClient::connect(Arc::new(config), DefaultStartupHandler::new(), None)
+            .await
+            .unwrap();
+
+        // The server did not accept 3.9999 as-is; it negotiated down to its
+        // newest supported version.
+        assert_eq!(client.protocol_version(), ProtocolVersion::PROTOCOL3_2);
+        // Protocol 3.2 backend keys are 32 bytes long.
+        assert!(matches!(client.secret_key(), SecretKey::Bytes(key) if key.len() == 32));
+    }
+
+    #[tokio::test]
+    async fn client_default_3_0_keeps_i32_secret_key() {
+        let port = spawn_test_server(Arc::new(TestHandlers)).await;
+
+        let mut config = Config::new();
+        config.host("127.0.0.1");
+        config.port(port);
+        config.user("pgwire");
+
+        let client = PgWireClient::connect(Arc::new(config), DefaultStartupHandler::new(), None)
+            .await
+            .unwrap();
+
+        assert_eq!(client.protocol_version(), ProtocolVersion::PROTOCOL3_0);
+        // A protocol 3.0 cancel key is decoded as a 4-byte i32, not as bytes.
+        assert!(matches!(client.secret_key(), SecretKey::I32(_)));
+    }
+
+    #[tokio::test]
+    async fn client_tracks_transaction_status() {
+        let port = spawn_test_server(Arc::new(TxHandlers)).await;
+
+        let mut config = Config::new();
+        config.host("127.0.0.1");
+        config.port(port);
+        config.user("pgwire");
+
+        let mut client =
+            PgWireClient::connect(Arc::new(config), DefaultStartupHandler::new(), None)
+                .await
+                .unwrap();
+
+        // a fresh connection is idle
+        assert_eq!(client.transaction_status(), TransactionStatus::Idle);
+
+        client
+            .simple_query(DefaultSimpleQueryHandler::new(), "BEGIN")
+            .await
+            .unwrap();
+        assert_eq!(client.transaction_status(), TransactionStatus::Transaction);
+
+        // statements inside the transaction keep the status
+        client
+            .simple_query(DefaultSimpleQueryHandler::new(), "SELECT 1")
+            .await
+            .unwrap();
+        assert_eq!(client.transaction_status(), TransactionStatus::Transaction);
+
+        // a failed statement puts the connection into the failed-transaction
+        // state; the error is returned but the connection stays usable
+        assert!(
+            client
+                .simple_query(DefaultSimpleQueryHandler::new(), "FAIL")
+                .await
+                .is_err()
+        );
+        assert_eq!(client.transaction_status(), TransactionStatus::Error);
+
+        client
+            .simple_query(DefaultSimpleQueryHandler::new(), "ROLLBACK")
+            .await
+            .unwrap();
+        assert_eq!(client.transaction_status(), TransactionStatus::Idle);
+    }
 }

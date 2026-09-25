@@ -5,7 +5,10 @@ use async_trait::async_trait;
 use futures::sink::{Sink, SinkExt};
 use tokio::sync::Mutex;
 
-use super::{AuthSource, ClientInfo, LoginInfo, PgWireConnectionState, ServerParameterProvider, StartupHandler};
+use super::{
+    AuthSource, ClientInfo, LoginInfo, PgWireConnectionState, ServerParameterProvider,
+    StartupHandler,
+};
 use crate::api::{ConnectionManager, PidSecretKeyGenerator, RandomPidSecretKeyGenerator};
 use crate::error::{PgWireError, PgWireResult};
 use crate::messages::startup::Authentication;
@@ -33,7 +36,10 @@ impl<A, P> Md5PasswordAuthStartupHandler<A, P> {
     }
 
     /// Sets a custom PID/secret key generator.
-    pub fn with_pid_secret_key_generator(mut self, generator: Arc<dyn PidSecretKeyGenerator>) -> Self {
+    pub fn with_pid_secret_key_generator(
+        mut self,
+        generator: Arc<dyn PidSecretKeyGenerator>,
+    ) -> Self {
         self.pid_secret_key_generator = generator;
         self
     }
@@ -46,8 +52,14 @@ impl<A, P> Md5PasswordAuthStartupHandler<A, P> {
 }
 
 #[async_trait]
-impl<A: AuthSource, P: ServerParameterProvider> StartupHandler for Md5PasswordAuthStartupHandler<A, P> {
-    async fn on_startup<C>(&self, client: &mut C, message: PgWireFrontendMessage) -> PgWireResult<()>
+impl<A: AuthSource, P: ServerParameterProvider> StartupHandler
+    for Md5PasswordAuthStartupHandler<A, P>
+{
+    async fn on_startup<C>(
+        &self,
+        client: &mut C,
+        message: PgWireFrontendMessage,
+    ) -> PgWireResult<()>
     where
         C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send,
         C::Error: Debug,
@@ -62,11 +74,21 @@ impl<A: AuthSource, P: ServerParameterProvider> StartupHandler for Md5PasswordAu
                 let login_info = LoginInfo::from_client_info(client);
                 let salt_and_pass = self.auth_source.get_password(&login_info).await?;
 
-                let salt = salt_and_pass.salt.as_ref().expect("Salt is required for Md5Password authentication");
+                let salt = salt_and_pass
+                    .salt
+                    .as_ref()
+                    .expect("Salt is required for Md5Password authentication");
 
-                self.cached_password.lock().await.clone_from(&salt_and_pass.password);
+                self.cached_password
+                    .lock()
+                    .await
+                    .clone_from(&salt_and_pass.password);
 
-                client.send(PgWireBackendMessage::Authentication(Authentication::MD5Password(salt.clone()))).await?;
+                client
+                    .send(PgWireBackendMessage::Authentication(
+                        Authentication::MD5Password(salt.clone()),
+                    ))
+                    .await?;
             }
             PgWireFrontendMessage::PasswordMessageFamily(pwd) => {
                 let pwd = pwd.into_password()?;
@@ -81,7 +103,9 @@ impl<A: AuthSource, P: ServerParameterProvider> StartupHandler for Md5PasswordAu
                     super::finish_authentication(client, self.parameter_provider.as_ref()).await?;
                 } else {
                     let login_info = LoginInfo::from_client_info(client);
-                    return Err(PgWireError::InvalidPassword(login_info.user().map(|x| x.to_owned()).unwrap_or_default()));
+                    return Err(PgWireError::InvalidPassword(
+                        login_info.user().map(|x| x.to_owned()).unwrap_or_default(),
+                    ));
                 }
             }
             _ => {}

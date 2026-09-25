@@ -1,16 +1,14 @@
 [package]
 name = "pgwire"
-version = "0.40.3"
+version = "0.41.0"
 edition = "2024"
 authors = ["Ning Sun <sunng@pm.me>"]
 license = "MIT/Apache-2.0"
 description = "Postgresql wire protocol implemented as a library"
 keywords = ["database", "postgresql"]
 categories = ["database"]
-homepage = "https://github.com/sunng87/pgwire"
 repository = "https://github.com/sunng87/pgwire"
 documentation = "https://docs.rs/crate/pgwire/"
-readme = "README.md"
 rust-version = "1.89"
 
 [dependencies]
@@ -39,14 +37,14 @@ rand = { version = "0.10", optional = true }
 md5 = { version = "0.8", optional = true }
 hex = { version = "0.4", optional = true }
 ## scram libraries
-base64 = { version = "0.22", optional = true }
+base64 = { version = "0.23", optional = true }
 ring = { version = "0.17", optional = true }
 aws-lc-rs = { version = "1.7", optional = true }
 stringprep = { version = "0.1.2", optional = true }
 x509-certificate = { version = "0.25", optional = true }
 
 ## oauth
-jsonwebtoken = { version = "10", features = ["aws_lc_rs"], optional = true }
+jsonwebtoken = { version = "11", features = ["aws_lc_rs"], optional = true }
 rsa = { version = "0.9", optional = true }
 reqwest = { version = "0.13", features = ["json", "rustls-no-provider"], optional = true }
 
@@ -56,7 +54,7 @@ chrono = { version = "0.4", features = ["std"], optional = true }
 rust_decimal = { version = "1.35", features = ["db-postgres"], optional = true }
 serde = { version = "1", optional = true }
 serde_json = { version = "1", optional = true }
-pg_interval = { version = "0.5", optional = true }
+pg_interval = { version = "0.6", optional = true }
 lazy-regex = { version = "3.3", default-features = false, features = ["lite"] }
 ryu = "1"
 postgis = { version = "0.9", optional = true }
@@ -137,12 +135,12 @@ rusqlite = { version = "0.40.0", features = ["column_decltype"] }
 rustls-pemfile = "2.0"
 ## webpki-roots has mozilla's set of roots
 ## rustls-native-certs loads roots from current system
-gluesql = { version = "0.19", default-features = false, features = [
+gluesql = { version = "0.20", default-features = false, features = [
   "gluesql_memory_storage",
 ] }
 
 ## oauth
-jsonwebtoken = { version = "10", features = ["aws_lc_rs"] }
+jsonwebtoken = { version = "11", features = ["aws_lc_rs"] }
 rsa = { version = "0.9" }
 reqwest = { version = "0.13", features = ["json"] }
 
@@ -152,6 +150,7 @@ pgwire = { path = "." }
 [workspace]
 members = [
   ".",
+  "tests-integration/client-api",
   "tests-integration/rust-client",
   "tests-integration/test-server",
 ]

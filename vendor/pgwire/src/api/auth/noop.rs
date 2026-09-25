@@ -6,12 +6,15 @@ use async_trait::async_trait;
 use futures::sink::{Sink, SinkExt};
 
 use super::{ClientInfo, DefaultServerParameterProvider, StartupHandler};
-use crate::api::{ConnectionManager, PgWireConnectionState, PidSecretKeyGenerator, RandomPidSecretKeyGenerator};
+use crate::api::{
+    ConnectionManager, PgWireConnectionState, PidSecretKeyGenerator, RandomPidSecretKeyGenerator,
+};
 use crate::error::{PgWireError, PgWireResult};
 use crate::messages::response::{ReadyForQuery, TransactionStatus};
 use crate::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 
-static DEFAULT_PID_GENERATOR: LazyLock<RandomPidSecretKeyGenerator> = LazyLock::new(RandomPidSecretKeyGenerator::default);
+static DEFAULT_PID_GENERATOR: LazyLock<RandomPidSecretKeyGenerator> =
+    LazyLock::new(RandomPidSecretKeyGenerator::default);
 
 #[async_trait]
 /// A startup handler that performs no authentication.
@@ -24,7 +27,11 @@ pub trait NoopStartupHandler: StartupHandler {
         &*DEFAULT_PID_GENERATOR
     }
 
-    async fn post_startup<C>(&self, _client: &mut C, _message: PgWireFrontendMessage) -> PgWireResult<()>
+    async fn post_startup<C>(
+        &self,
+        _client: &mut C,
+        _message: PgWireFrontendMessage,
+    ) -> PgWireResult<()>
     where
         C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send,
         C::Error: Debug,
@@ -39,7 +46,11 @@ impl<H> StartupHandler for H
 where
     H: NoopStartupHandler,
 {
-    async fn on_startup<C>(&self, client: &mut C, message: PgWireFrontendMessage) -> PgWireResult<()>
+    async fn on_startup<C>(
+        &self,
+        client: &mut C,
+        message: PgWireFrontendMessage,
+    ) -> PgWireResult<()>
     where
         C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send,
         C::Error: Debug,
@@ -53,11 +64,16 @@ where
             if let Some(manager) = self.connection_manager() {
                 super::register_connection(client, &manager);
             }
-            super::finish_authentication0(client, &DefaultServerParameterProvider::default()).await?;
+            super::finish_authentication0(client, &DefaultServerParameterProvider::default())
+                .await?;
 
             self.post_startup(client, message).await?;
 
-            client.send(PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(TransactionStatus::Idle))).await?;
+            client
+                .send(PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(
+                    TransactionStatus::Idle,
+                )))
+                .await?;
             client.set_state(PgWireConnectionState::ReadyForQuery);
         }
 

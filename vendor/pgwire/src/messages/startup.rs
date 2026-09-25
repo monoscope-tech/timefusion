@@ -505,7 +505,9 @@ impl SecretKey {
         Self::validate_bytes_len(data_len)?;
 
         match ctx.protocol_version {
-            ProtocolVersion::PROTOCOL3_2 => Ok(SecretKey::Bytes(buf.split_to(data_len).freeze())),
+            ProtocolVersion::PROTOCOL3_2 | ProtocolVersion::PROTOCOL3_9999 => {
+                Ok(SecretKey::Bytes(buf.split_to(data_len).freeze()))
+            }
             ProtocolVersion::PROTOCOL3_0 => Ok(SecretKey::I32(buf.get_i32())),
         }
     }
@@ -776,6 +778,13 @@ impl Message for SASLResponse {
 #[non_exhaustive]
 #[derive(PartialEq, Eq, Debug, new)]
 pub struct NegotiateProtocolVersion {
+    /// Version number reported by the server.
+    ///
+    /// PostgreSQL 18+ (protocol 3.2) and pgwire send the **full 32-bit
+    /// protocol version number** here (e.g. `196610` for 3.2), while older
+    /// servers send only the **minor version** (e.g. `2`). The client-side
+    /// negotiation logic in `pgwire::api::client::auth` understands both
+    /// forms.
     pub newest_minor_protocol: i32,
     pub unsupported_options: Vec<String>,
 }
@@ -821,6 +830,7 @@ impl Message for NegotiateProtocolVersion {
     ) -> PgWireResult<Self> {
         let version = buf.get_i32();
         let option_count = buf.get_i32();
+        codec::ensure_count(option_count as usize, 1, buf)?;
         let mut options = Vec::with_capacity(option_count as usize);
 
         for _ in 0..option_count {

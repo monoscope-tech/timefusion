@@ -39,7 +39,10 @@ pub struct ScramAuth {
 impl ScramAuth {
     /// Creates a new SCRAM auth instance.
     pub fn new(auth_db: Arc<dyn AuthSource>) -> ScramAuth {
-        ScramAuth { auth_db, authenticator: ScramServerAuth::new() }
+        ScramAuth {
+            auth_db,
+            authenticator: ScramServerAuth::new(),
+        }
     }
 
     /// enable channel binding (SCRAM-SHA-256-PLUS) by configuring server
@@ -93,7 +96,12 @@ pub fn random_nonce() -> String {
 
 impl ScramAuth {
     /// Process incoming message and return response, new state
-    pub async fn process_scram_message<C>(&self, client: &C, msg: PasswordMessageFamily, state: &SASLState) -> PgWireResult<(Authentication, SASLState)>
+    pub async fn process_scram_message<C>(
+        &self,
+        client: &C,
+        msg: PasswordMessageFamily,
+        state: &SASLState,
+    ) -> PgWireResult<(Authentication, SASLState)>
     where
         C: ClientInfo + Unpin + Send,
     {
@@ -101,20 +109,30 @@ impl ScramAuth {
             SASLState::ScramClientFirstReceived => {
                 // initial response, client_first
                 let msg = msg.into_sasl_initial_response()?;
-                let resp = msg.data.as_ref().ok_or_else(|| PgWireError::InvalidScramMessage("Empty client-first".to_owned()))?;
+                let resp = msg.data.as_ref().ok_or_else(|| {
+                    PgWireError::InvalidScramMessage("Empty client-first".to_owned())
+                })?;
 
                 let login_info = LoginInfo::from_client_info(client);
                 let expected_password = self.auth_db.get_password(&login_info).await?;
 
-                let (server_first, authenticator) = self.authenticator.on_client_first_message(resp, expected_password)?;
+                let (server_first, authenticator) = self
+                    .authenticator
+                    .on_client_first_message(resp, expected_password)?;
 
-                Ok((Authentication::SASLContinue(server_first.into()), SASLState::ScramServerFirstSent(Box::new(authenticator))))
+                Ok((
+                    Authentication::SASLContinue(server_first.into()),
+                    SASLState::ScramServerFirstSent(Box::new(authenticator)),
+                ))
             }
             SASLState::ScramServerFirstSent(authenticator) => {
                 // second response, client_final
                 let resp = msg.into_sasl_response()?;
                 let server_final = authenticator.on_client_final_message(&resp.data)?;
-                Ok((Authentication::SASLFinal(server_final.into()), SASLState::Finished))
+                Ok((
+                    Authentication::SASLFinal(server_final.into()),
+                    SASLState::Finished,
+                ))
             }
             _ => Err(PgWireError::InvalidSASLState),
         }
@@ -139,7 +157,10 @@ impl Default for ScramServerAuth {
 impl ScramServerAuth {
     /// Creates a new SCRAM server authenticator.
     pub fn new() -> Self {
-        Self { server_cert_sig: None, iterations: SCRAM_ITERATIONS }
+        Self {
+            server_cert_sig: None,
+            iterations: SCRAM_ITERATIONS,
+        }
     }
 
     /// enable channel binding (SCRAM-SHA-256-PLUS) by configuring server
@@ -148,7 +169,9 @@ impl ScramServerAuth {
     /// Original pem data is required here. We will decode pem and use the first
     /// certificate as server certificate.
     pub fn configure_certificate(&mut self, certs_pem: &[u8]) -> PgWireResult<()> {
-        self.server_cert_sig = Some(Arc::new(STANDARD.encode(compute_cert_signature(certs_pem)?)));
+        self.server_cert_sig = Some(Arc::new(
+            STANDARD.encode(compute_cert_signature(certs_pem)?),
+        ));
         Ok(())
     }
 
@@ -166,7 +189,9 @@ impl ScramServerAuth {
 
     /// Client first message with expected username (optional) and expected password
     pub fn on_client_first_message(
-        &self, client_first_message: &[u8], expected_password: Password,
+        &self,
+        client_first_message: &[u8],
+        expected_password: Password,
     ) -> PgWireResult<(String, ScramServerAuthWaitingForClientFinal)> {
         let client_first = ClientFirst::from_str(decode_str(client_first_message)?)?;
 
@@ -174,8 +199,16 @@ impl ScramServerAuth {
         let mut new_nonce = client_first.bare.nonce.clone();
         new_nonce.push_str(random_nonce().as_str());
 
-        let server_first =
-            ServerFirst::new(new_nonce, STANDARD.encode(expected_password.salt.as_ref().expect("Salt required for SCRAM auth source")), self.iterations);
+        let server_first = ServerFirst::new(
+            new_nonce,
+            STANDARD.encode(
+                expected_password
+                    .salt
+                    .as_ref()
+                    .expect("Salt required for SCRAM auth source"),
+            ),
+            self.iterations,
+        );
 
         Ok((
             server_first.to_string(),
@@ -205,13 +238,22 @@ impl ScramServerAuthWaitingForClientFinal {
     pub fn on_client_final_message(&self, client_final_message: &[u8]) -> PgWireResult<String> {
         let client_final = ClientFinal::from_str(decode_str(client_final_message)?)?;
 
-        let channel_binding = compute_channel_binding(self.server_cert_sig.as_ref().map(|s| s.as_str()), &self.channel_binding);
+        let channel_binding = compute_channel_binding(
+            self.server_cert_sig.as_ref().map(|s| s.as_str()),
+            &self.channel_binding,
+        );
         if client_final.without_proof.channel_binding != channel_binding {
-            return Err(PgWireError::InvalidScramMessage("Channel binding mismatch".to_owned()));
+            return Err(PgWireError::InvalidScramMessage(
+                "Channel binding mismatch".to_owned(),
+            ));
         }
 
-        let computed_client_proof =
-            compute_client_proof(self.expected_password.password(), &self.client_first_message_bare, &self.server_first_message, &client_final.without_proof);
+        let computed_client_proof = compute_client_proof(
+            self.expected_password.password(),
+            &self.client_first_message_bare,
+            &self.server_first_message,
+            &client_final.without_proof,
+        );
         if computed_client_proof == client_final.proof {
             let verifier = compute_server_signature(
                 self.expected_password.password(),
@@ -221,7 +263,9 @@ impl ScramServerAuthWaitingForClientFinal {
             );
             Ok(ServerFinal::Success { verifier }.to_string())
         } else {
-            Err(PgWireError::InvalidPassword(self.client_first_message_bare.username.clone()))
+            Err(PgWireError::InvalidPassword(
+                self.client_first_message_bare.username.clone(),
+            ))
         }
     }
 }
@@ -244,16 +288,30 @@ mod client {
         }
 
         /// Starts authentication and build the client first message
-        pub fn build_client_first(&self) -> PgWireClientResult<(String, ScramClientAuthWaitingForServerFirst)> {
-            let username = stringprep::saslprep(&self.username).map_err(|e| PgWireClientError::InvalidConfig(format!("Invalid username: {e}")))?.into_owned();
+        pub fn build_client_first(
+            &self,
+        ) -> PgWireClientResult<(String, ScramClientAuthWaitingForServerFirst)> {
+            let username = stringprep::saslprep(&self.username)
+                .map_err(|e| PgWireClientError::InvalidConfig(format!("Invalid username: {e}")))?
+                .into_owned();
             let nonce = random_nonce();
             let client_first_message_bare = ClientFirstBare { username, nonce };
             let c_bind_flag = CBindFlag::N; // TODO: support channel bindings
-            let channel_binding = Gs2Header { c_bind_flag: c_bind_flag.clone(), authzid: None };
-            let client_first_message = ClientFirst { gs2header: channel_binding.clone(), bare: client_first_message_bare.clone() };
+            let channel_binding = Gs2Header {
+                c_bind_flag: c_bind_flag.clone(),
+                authzid: None,
+            };
+            let client_first_message = ClientFirst {
+                gs2header: channel_binding.clone(),
+                bare: client_first_message_bare.clone(),
+            };
             Ok((
                 client_first_message.to_string(),
-                ScramClientAuthWaitingForServerFirst { client_first_message_bare, channel_binding, password: self.password.clone() },
+                ScramClientAuthWaitingForServerFirst {
+                    client_first_message_bare,
+                    channel_binding,
+                    password: self.password.clone(),
+                },
             ))
         }
     }
@@ -267,20 +325,36 @@ mod client {
 
     impl ScramClientAuthWaitingForServerFirst {
         /// Reacts on server first message reply and build the client final message
-        pub fn build_client_final(&self, server_first_message: &[u8]) -> PgWireClientResult<(String, ScramClientAuthWaitingForServerFinal)> {
+        pub fn build_client_final(
+            &self,
+            server_first_message: &[u8],
+        ) -> PgWireClientResult<(String, ScramClientAuthWaitingForServerFinal)> {
             let server_first_message = ServerFirst::from_str(decode_str(server_first_message)?)?;
 
             let channel_binding = compute_channel_binding(None, &self.channel_binding);
-            let client_final_without_proof = ClientFinalWithoutProof { channel_binding: channel_binding.clone(), nonce: server_first_message.nonce.clone() };
+            let client_final_without_proof = ClientFinalWithoutProof {
+                channel_binding: channel_binding.clone(),
+                nonce: server_first_message.nonce.clone(),
+            };
 
             let salted_password = gen_salted_password(
                 &self.password,
-                &STANDARD.decode(&server_first_message.salt).map_err(|e| PgWireClientError::ScramError(format!("Invalid salt base64 encoding: {e}")))?,
+                &STANDARD.decode(&server_first_message.salt).map_err(|e| {
+                    PgWireClientError::ScramError(format!("Invalid salt base64 encoding: {e}"))
+                })?,
                 server_first_message.iteration_count,
             );
-            let client_proof = compute_client_proof(&salted_password, &self.client_first_message_bare, &server_first_message, &client_final_without_proof);
+            let client_proof = compute_client_proof(
+                &salted_password,
+                &self.client_first_message_bare,
+                &server_first_message,
+                &client_final_without_proof,
+            );
 
-            let client_final_message = ClientFinal { without_proof: client_final_without_proof.clone(), proof: client_proof };
+            let client_final_message = ClientFinal {
+                without_proof: client_final_without_proof.clone(),
+                proof: client_proof,
+            };
             Ok((
                 client_final_message.to_string(),
                 ScramClientAuthWaitingForServerFinal {
@@ -312,7 +386,13 @@ mod client {
                         &self.server_first_message,
                         &self.client_final_without_proof,
                     );
-                    if expected_verifier == verifier { Ok(()) } else { Err(PgWireClientError::ScramError("Invalid verifier returned by the server".into())) }
+                    if expected_verifier == verifier {
+                        Ok(())
+                    } else {
+                        Err(PgWireClientError::ScramError(
+                            "Invalid verifier returned by the server".into(),
+                        ))
+                    }
                 }
                 ServerFinal::Error { value } => Err(PgWireClientError::ScramError(value)),
             }
@@ -320,33 +400,50 @@ mod client {
     }
 }
 
-fn compute_channel_binding(server_cert_sig: Option<&str>, client_channel_binding: &Gs2Header) -> String {
+fn compute_channel_binding(
+    server_cert_sig: Option<&str>,
+    client_channel_binding: &Gs2Header,
+) -> String {
     match &client_channel_binding.c_bind_flag {
         CBindFlag::CbName(p) if p == "tls-server-end-point" => {
-            format!("{}{}", STANDARD.encode(client_channel_binding.to_string()), server_cert_sig.unwrap_or(""))
+            format!(
+                "{}{}",
+                STANDARD.encode(client_channel_binding.to_string()),
+                server_cert_sig.unwrap_or("")
+            )
         }
         _ => STANDARD.encode(client_channel_binding.to_string()),
     }
 }
 
 fn compute_client_proof(
-    salted_password: &[u8], client_first_message_bare: &ClientFirstBare, server_first_message: &ServerFirst,
+    salted_password: &[u8],
+    client_first_message_bare: &ClientFirstBare,
+    server_first_message: &ServerFirst,
     client_final_without_proof: &ClientFinalWithoutProof,
 ) -> String {
     let client_key = hmac(salted_password, b"Client Key");
     let stored_key = h(&client_key);
-    let auth_msg = format!("{},{},{}", client_first_message_bare, server_first_message, client_final_without_proof);
+    let auth_msg = format!(
+        "{},{},{}",
+        client_first_message_bare, server_first_message, client_final_without_proof
+    );
     let client_signature = hmac(&stored_key, auth_msg.as_bytes());
 
     STANDARD.encode(xor(&client_key, &client_signature))
 }
 
 fn compute_server_signature(
-    salted_password: &[u8], client_first_message_bare: &ClientFirstBare, server_first_message: &ServerFirst,
+    salted_password: &[u8],
+    client_first_message_bare: &ClientFirstBare,
+    server_first_message: &ServerFirst,
     client_final_without_proof: &ClientFinalWithoutProof,
 ) -> String {
     let server_key = hmac(salted_password, b"Server Key");
-    let auth_msg = format!("{},{},{}", client_first_message_bare, server_first_message, client_final_without_proof);
+    let auth_msg = format!(
+        "{},{},{}",
+        client_first_message_bare, server_first_message, client_final_without_proof
+    );
     STANDARD.encode(hmac(&server_key, auth_msg.as_bytes()))
 }
 
@@ -410,7 +507,16 @@ impl FromStr for ClientFirst {
             return Err(PgWireError::InvalidScramMessage(s.to_owned()));
         };
 
-        Ok(Self { gs2header: Gs2Header { c_bind_flag, authzid }, bare: ClientFirstBare { username: username.to_owned(), nonce: nonce.to_owned() } })
+        Ok(Self {
+            gs2header: Gs2Header {
+                c_bind_flag,
+                authzid,
+            },
+            bare: ClientFirstBare {
+                username: username.to_owned(),
+                nonce: nonce.to_owned(),
+            },
+        })
     }
 }
 
@@ -515,7 +621,11 @@ impl FromStr for ServerFirst {
             return Err(PgWireError::InvalidScramMessage(s.to_owned()));
         };
 
-        Ok(Self { nonce: nonce.to_owned(), salt: salt.to_owned(), iteration_count })
+        Ok(Self {
+            nonce: nonce.to_owned(),
+            salt: salt.to_owned(),
+            iteration_count,
+        })
     }
 }
 
@@ -560,7 +670,13 @@ impl FromStr for ClientFinal {
             return Err(PgWireError::InvalidScramMessage(s.to_owned()));
         };
 
-        Ok(Self { without_proof: ClientFinalWithoutProof { channel_binding: channel_binding.to_owned(), nonce: nonce.to_owned() }, proof: proof.to_owned() })
+        Ok(Self {
+            without_proof: ClientFinalWithoutProof {
+                channel_binding: channel_binding.to_owned(),
+                nonce: nonce.to_owned(),
+            },
+            proof: proof.to_owned(),
+        })
     }
 }
 
@@ -604,9 +720,13 @@ impl FromStr for ServerFinal {
         let mut parts = ScamMessageChunker::new(s);
         let next = parts.next_required()?;
         if let Some(verifier) = next.strip_prefix("v=") {
-            Ok(Self::Success { verifier: verifier.to_owned() })
+            Ok(Self::Success {
+                verifier: verifier.to_owned(),
+            })
         } else if let Some(value) = next.strip_prefix("e=") {
-            Ok(Self::Error { value: value.to_owned() })
+            Ok(Self::Error {
+                value: value.to_owned(),
+            })
         } else {
             Err(PgWireError::InvalidScramMessage(s.to_owned()))
         }
@@ -635,11 +755,16 @@ struct ScamMessageChunker<'a> {
 
 impl<'a> ScamMessageChunker<'a> {
     fn new(message: &'a str) -> Self {
-        Self { message, iter: message.split(',') }
+        Self {
+            message,
+            iter: message.split(','),
+        }
     }
 
     fn next_required(&mut self) -> PgWireResult<&'a str> {
-        self.iter.next().ok_or_else(|| PgWireError::InvalidScramMessage(self.message.to_owned()))
+        self.iter
+            .next()
+            .ok_or_else(|| PgWireError::InvalidScramMessage(self.message.to_owned()))
     }
 
     fn last_required(&mut self) -> PgWireResult<&'a str> {
@@ -654,7 +779,13 @@ impl<'a> ScamMessageChunker<'a> {
 fn hi(normalized_password: &[u8], salt: &[u8], iterations: usize) -> Vec<u8> {
     let mut buf = [0u8; 32];
 
-    pbkdf2::derive(pbkdf2::PBKDF2_HMAC_SHA256, NonZeroU32::new(iterations as u32).unwrap(), salt, normalized_password, &mut buf);
+    pbkdf2::derive(
+        pbkdf2::PBKDF2_HMAC_SHA256,
+        NonZeroU32::new(iterations as u32).unwrap(),
+        salt,
+        normalized_password,
+        &mut buf,
+    );
     buf.to_vec()
 }
 
@@ -668,7 +799,10 @@ fn h(msg: &[u8]) -> Vec<u8> {
 }
 
 fn xor(lhs: &[u8], rhs: &[u8]) -> Vec<u8> {
-    lhs.iter().zip(rhs.iter()).map(|(l, r)| l.bitxor(r)).collect()
+    lhs.iter()
+        .zip(rhs.iter())
+        .map(|(l, r)| l.bitxor(r))
+        .collect()
 }
 
 /// Compute signature of server certificate for `tls-server-end-point` channel
@@ -682,15 +816,22 @@ fn xor(lhs: &[u8], rhs: &[u8]) -> Vec<u8> {
 /// 3. if the certificate has 0 or more than 1 signature algorithm, the
 ///    behaviour is undefined at the time.
 fn compute_cert_signature(cert: &[u8]) -> PgWireResult<Vec<u8>> {
-    let certs = CapturedX509Certificate::from_pem_multiple(cert).map_err(|e| PgWireError::ApiError(Box::new(e)))?;
+    let certs = CapturedX509Certificate::from_pem_multiple(cert)
+        .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
     let x509 = &certs[0];
     let raw = x509.constructed_data();
     match x509.signature_algorithm() {
-        Some(SignatureAlgorithm::RsaSha1) | Some(SignatureAlgorithm::RsaSha256) | Some(SignatureAlgorithm::EcdsaSha256) => {
+        Some(SignatureAlgorithm::RsaSha1)
+        | Some(SignatureAlgorithm::RsaSha256)
+        | Some(SignatureAlgorithm::EcdsaSha256) => {
             Ok(digest::digest(&digest::SHA256, raw).as_ref().to_vec())
         }
-        Some(SignatureAlgorithm::RsaSha384) | Some(SignatureAlgorithm::EcdsaSha384) => Ok(digest::digest(&digest::SHA384, raw).as_ref().to_vec()),
-        Some(SignatureAlgorithm::RsaSha512) => Ok(digest::digest(&digest::SHA512, raw).as_ref().to_vec()),
+        Some(SignatureAlgorithm::RsaSha384) | Some(SignatureAlgorithm::EcdsaSha384) => {
+            Ok(digest::digest(&digest::SHA384, raw).as_ref().to_vec())
+        }
+        Some(SignatureAlgorithm::RsaSha512) => {
+            Ok(digest::digest(&digest::SHA512, raw).as_ref().to_vec())
+        }
         _ => Err(PgWireError::UnsupportedCertificateSignatureAlgorithm),
     }
 }
@@ -705,21 +846,54 @@ mod tests {
 
     #[test]
     fn test_client_first_roundtrip() {
-        assert_eq!(ClientFirst::from_str("n,,n=user,r=fyko+d2lbbFgONRv9qkxdawL").unwrap().to_string(), "n,,n=user,r=fyko+d2lbbFgONRv9qkxdawL");
-        assert_eq!(ClientFirst::from_str("y,,n=user,r=fyko+d2lbbFgONRv9qkxdawL").unwrap().to_string(), "y,,n=user,r=fyko+d2lbbFgONRv9qkxdawL");
-        assert_eq!(ClientFirst::from_str("n,,n=user,r=fyko+d2lbbFgONRv9qkxdawL").unwrap().to_string(), "n,,n=user,r=fyko+d2lbbFgONRv9qkxdawL");
-        assert_eq!(ClientFirst::from_str("p=foo,,n=user,r=fyko+d2lbbFgONRv9qkxdawL").unwrap().to_string(), "p=foo,,n=user,r=fyko+d2lbbFgONRv9qkxdawL");
-        assert_eq!(ClientFirst::from_str("n,,m=foo,n=user,r=fyko+d2lbbFgONRv9qkxdawL,foo").unwrap().to_string(), "n,,n=user,r=fyko+d2lbbFgONRv9qkxdawL");
+        assert_eq!(
+            ClientFirst::from_str("n,,n=user,r=fyko+d2lbbFgONRv9qkxdawL")
+                .unwrap()
+                .to_string(),
+            "n,,n=user,r=fyko+d2lbbFgONRv9qkxdawL"
+        );
+        assert_eq!(
+            ClientFirst::from_str("y,,n=user,r=fyko+d2lbbFgONRv9qkxdawL")
+                .unwrap()
+                .to_string(),
+            "y,,n=user,r=fyko+d2lbbFgONRv9qkxdawL"
+        );
+        assert_eq!(
+            ClientFirst::from_str("n,,n=user,r=fyko+d2lbbFgONRv9qkxdawL")
+                .unwrap()
+                .to_string(),
+            "n,,n=user,r=fyko+d2lbbFgONRv9qkxdawL"
+        );
+        assert_eq!(
+            ClientFirst::from_str("p=foo,,n=user,r=fyko+d2lbbFgONRv9qkxdawL")
+                .unwrap()
+                .to_string(),
+            "p=foo,,n=user,r=fyko+d2lbbFgONRv9qkxdawL"
+        );
+        assert_eq!(
+            ClientFirst::from_str("n,,m=foo,n=user,r=fyko+d2lbbFgONRv9qkxdawL,foo")
+                .unwrap()
+                .to_string(),
+            "n,,n=user,r=fyko+d2lbbFgONRv9qkxdawL"
+        );
     }
 
     #[test]
     fn test_server_first_roundtrip() {
         assert_eq!(
-            ServerFirst::from_str("r=fyko+d2lbbFgONRv9qkxdawL3rfcNHYJY1ZVvWVs7j,s=QSXCR+Q6sek8bf92,i=4096").unwrap().to_string(),
+            ServerFirst::from_str(
+                "r=fyko+d2lbbFgONRv9qkxdawL3rfcNHYJY1ZVvWVs7j,s=QSXCR+Q6sek8bf92,i=4096"
+            )
+            .unwrap()
+            .to_string(),
             "r=fyko+d2lbbFgONRv9qkxdawL3rfcNHYJY1ZVvWVs7j,s=QSXCR+Q6sek8bf92,i=4096"
         );
         assert_eq!(
-            ServerFirst::from_str("m=foo,r=fyko+d2lbbFgONRv9qkxdawL3rfcNHYJY1ZVvWVs7j,s=QSXCR+Q6sek8bf92,i=4096").unwrap().to_string(),
+            ServerFirst::from_str(
+                "m=foo,r=fyko+d2lbbFgONRv9qkxdawL3rfcNHYJY1ZVvWVs7j,s=QSXCR+Q6sek8bf92,i=4096"
+            )
+            .unwrap()
+            .to_string(),
             "r=fyko+d2lbbFgONRv9qkxdawL3rfcNHYJY1ZVvWVs7j,s=QSXCR+Q6sek8bf92,i=4096"
         );
     }
@@ -727,16 +901,30 @@ mod tests {
     #[test]
     fn test_client_final_roundtrip() {
         assert_eq!(
-            ClientFinal::from_str("c=biws,r=fyko+d2lbbFgONRv9qkxdawL3rfcNHYJY1ZVvWVs7j,p=v0X8v3Bz2T0CJGbJQyF0X+HI4Ts=").unwrap().to_string(),
+            ClientFinal::from_str(
+                "c=biws,r=fyko+d2lbbFgONRv9qkxdawL3rfcNHYJY1ZVvWVs7j,p=v0X8v3Bz2T0CJGbJQyF0X+HI4Ts="
+            )
+            .unwrap()
+            .to_string(),
             "c=biws,r=fyko+d2lbbFgONRv9qkxdawL3rfcNHYJY1ZVvWVs7j,p=v0X8v3Bz2T0CJGbJQyF0X+HI4Ts="
         );
     }
 
     #[test]
     fn test_server_final_roundtrip() {
-        assert_eq!(ServerFinal::from_str("v=rmF9pqV8S7suAoZWja4dJRkFsKQ=").unwrap().to_string(), "v=rmF9pqV8S7suAoZWja4dJRkFsKQ=");
+        assert_eq!(
+            ServerFinal::from_str("v=rmF9pqV8S7suAoZWja4dJRkFsKQ=")
+                .unwrap()
+                .to_string(),
+            "v=rmF9pqV8S7suAoZWja4dJRkFsKQ="
+        );
 
-        assert_eq!(ServerFinal::from_str("e=invalid-encoding").unwrap().to_string(), "e=invalid-encoding");
+        assert_eq!(
+            ServerFinal::from_str("e=invalid-encoding")
+                .unwrap()
+                .to_string(),
+            "e=invalid-encoding"
+        );
     }
 
     #[cfg(feature = "client-api")]
@@ -752,15 +940,27 @@ mod tests {
     }
 
     #[cfg(feature = "client-api")]
-    fn assert_auth_roundtrip(username: &str, password: &str, salt: &[u8], iterations: usize) -> PgWireClientResult<()> {
+    fn assert_auth_roundtrip(
+        username: &str,
+        password: &str,
+        salt: &[u8],
+        iterations: usize,
+    ) -> PgWireClientResult<()> {
         let client = ScramClientAuth::new(username.into(), password.into());
         let mut server = ScramServerAuth::new();
         server.set_iterations(iterations);
         let (client_first_message, client) = client.build_client_first()?;
-        let (server_first_message, server) = server
-            .on_client_first_message(client_first_message.as_bytes(), Password::new(Some(salt.into()), gen_salted_password(password, salt, iterations)))?;
-        let (client_final_message, client) = client.build_client_final(server_first_message.as_bytes())?;
-        let server_final_message = server.on_client_final_message(client_final_message.as_bytes())?;
+        let (server_first_message, server) = server.on_client_first_message(
+            client_first_message.as_bytes(),
+            Password::new(
+                Some(salt.into()),
+                gen_salted_password(password, salt, iterations),
+            ),
+        )?;
+        let (client_final_message, client) =
+            client.build_client_final(server_first_message.as_bytes())?;
+        let server_final_message =
+            server.on_client_final_message(client_final_message.as_bytes())?;
         client.verify_server_final(server_final_message.as_bytes())
     }
 
@@ -777,8 +977,14 @@ mod tests {
                 b"baz".into(), // Another password
             ),
         )?;
-        let (client_final_message, _) = client.build_client_final(server_first_message.as_bytes())?;
-        assert!(matches!(server.on_client_final_message(client_final_message.as_bytes()).unwrap_err(), PgWireError::InvalidPassword(_)));
+        let (client_final_message, _) =
+            client.build_client_final(server_first_message.as_bytes())?;
+        assert!(matches!(
+            server
+                .on_client_final_message(client_final_message.as_bytes())
+                .unwrap_err(),
+            PgWireError::InvalidPassword(_)
+        ));
         Ok(())
     }
 }
