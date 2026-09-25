@@ -362,12 +362,11 @@ use std::collections::HashMap;
 use datafusion::{
     arrow::datatypes::{DataType, Field, TimeUnit},
     catalog::default_table_source::DefaultTableSource,
-    common::{Column, DFSchema, DFSchemaRef},
+    common::{Column, DFSchema, DFSchemaRef, TableReference},
     logical_expr::{
         Distinct, ExprSchemable, TableScan,
         expr::{InList, Like},
     },
-    sql::TableReference,
 };
 use tracing::warn;
 

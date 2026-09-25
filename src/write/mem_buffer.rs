@@ -602,7 +602,7 @@ struct RegistryContextProvider<'a> {
 }
 
 impl datafusion::sql::planner::ContextProvider for RegistryContextProvider<'_> {
-    fn get_table_source(&self, _: datafusion::sql::TableReference) -> DFResult<std::sync::Arc<dyn datafusion::logical_expr::TableSource>> {
+    fn get_table_source(&self, _: datafusion::common::TableReference) -> DFResult<std::sync::Arc<dyn datafusion::logical_expr::TableSource>> {
         Err(datafusion::error::DataFusionError::Plan("No table context".into()))
     }
     fn get_function_meta(&self, name: &str) -> Option<std::sync::Arc<datafusion::logical_expr::ScalarUDF>> {

@@ -29,7 +29,7 @@ use datafusion::{
 };
 use datafusion_datasource::{file_scan_config::FileScanConfig, memory::MemorySourceConfig, source::DataSourceExec};
 use deltalake::{
-    DeltaTable, DeltaTableBuilder, PartitionFilter, datafusion::parquet::file::properties::WriterProperties, kernel::transaction::CommitProperties,
+    DeltaTable, DeltaTableBuilder, FilterLiteral, FilterOp, FilterValue, datafusion::parquet::file::properties::WriterProperties, kernel::transaction::CommitProperties,
     logstore::LogStore, operations::create::CreateBuilder,
 };
 use futures::{StreamExt, TryStreamExt};
@@ -700,6 +700,11 @@ struct SliceCoverage {
 ///
 /// `None` means "cannot decide, reset": a file with no span statistics overlaps
 /// everything, which is the same rule `partition_file_spans` states for readers.
+/// `column = value` over one partition column, borrowing both.
+fn eq_filter<'a>(column: &'a str, value: &'a str) -> FilterLiteral<'a> {
+    (column, FilterOp::Eq, FilterValue::Scalar(value))
+}
+
 fn retain_clean_intervals(intervals: &[(i64, i64)], new_spans: &[Option<(i64, i64)>]) -> Option<Vec<(i64, i64)>> {
     if new_spans.iter().any(Option::is_none) {
         return None;
