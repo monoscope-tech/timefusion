@@ -1862,10 +1862,7 @@ impl TableProvider for ProjectRoutingTable {
         // Build Delta filters with per-bucket exclusion so the union doesn't double-count:
         // Delta excludes the mem row ranges where those legs are authoritative
         // (`get_bucket_ranges` skips open and force-flushed buckets, whose windows legitimately
-        // straddle stores). MOR UPDATEs land at the row's ORIGINAL timestamp, inside an excluded
-        // range, so each conjunct is weakened with `OR stamp > gate`. Weakening is safe in one
-        // direction only: an over-admitted row is a duplicate DedupExec collapses, an
-        // under-admitted one is a stale read.
+        // straddle stores). MOR scans supply no exclusions: their union resolves row identities.
         let mut delta_filters = optimized_filters.clone();
         let ts_us = |t: i64| lit(ScalarValue::TimestampMicrosecond(Some(t), Some("UTC".into())));
         let ts_cmp = |op: Operator, t: i64| Expr::BinaryExpr(BinaryExpr { left: Box::new(col("timestamp")), op, right: Box::new(ts_us(t)) });

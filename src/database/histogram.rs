@@ -1050,6 +1050,80 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn captured_histograms_preserve_delta_keys_under_late_buffered_rows() -> Result<()> {
+        use crate::support::test_helpers::{json_to_batch_for, minio_test_config, test_layer};
+        use crate::tantivy::search::{TantivyIndexService, parquet_rel_of_uri};
+
+        let dir = tempfile::tempdir()?;
+        let project = format!("hist-late-{}", uuid::Uuid::new_v4());
+        let cfg = minio_test_config(&project, &dir.path().to_string_lossy());
+        let store = Arc::new(object_store::memory::InMemory::new());
+        let search = Arc::new(TantivySearchService::new(store.clone(), dir.path().join("indexes"), Arc::new(cfg.tantivy.clone())));
+        let indexer = Arc::new(TantivyIndexService::new(store, Arc::new(cfg.tantivy.clone()), dir.path().join("scratch")));
+        indexer.with_reader(&search);
+        let db = super::super::Database::with_config(cfg.clone()).await?;
+        let write = crate::server::delta_write_callback(&db);
+        let (published, mut commits) = tokio::sync::mpsc::channel(1);
+        let layer = Arc::new(test_layer(cfg)?.with_delta_writer(Arc::new(move |project, table, batches, watermark| {
+            let commit = write(project, table, batches, watermark);
+            let published = published.clone();
+            Box::pin(async move {
+                let files = commit.await?;
+                // Pause the real commit before the flush can evict its memory copy.
+                let (resume, wait) = tokio::sync::oneshot::channel::<()>();
+                published.send(resume).await?;
+                wait.await?;
+                Ok(files)
+            })
+        })));
+        let db = db.with_buffered_layer(layer.clone()).with_tantivy_search(search).with_tantivy_indexer(indexer.clone());
+        let table = "mor_versioned";
+        let ts = chrono::Utc::now().timestamp_micros() - DAY_MICROS;
+        let date = chrono::DateTime::from_timestamp_micros(ts).unwrap().date_naive().to_string();
+        let row =
+            |id: &str, deleted: bool| serde_json::json!({"project_id": project, "timestamp": ts, "date": date, "id": id, "name": "op", "deleted": deleted});
+        db.insert_records_batch(&project, table, vec![json_to_batch_for(table, vec![row("original", false)])?], true, None).await?;
+        let source = db.resolve_table(&project, table).await?;
+        let object_store = source.read().await.log_store().object_store(None);
+        for uri in db.list_file_uris(&project, table).await? {
+            indexer.build_index_for_file(table, &project, parquet_rel_of_uri(&uri).context("missing relative path")?, &uri, object_store.clone()).await?;
+        }
+        let window = HistogramWindow::new(ts, ts + 1, 1_000_000, 0, 2)?;
+        let context = Arc::new(TaskContext::default());
+        let capture = || db.capture_histogram(&project, table, window, None, 1024 * 1024, context.clone());
+        let old = capture().await?;
+        for (id, deleted, expected) in [("late", false, 2), ("original", true, 1)] {
+            db.insert_records_batch(&project, table, vec![json_to_batch_for(table, vec![row(id, deleted)])?], false, None).await?;
+            let current = capture().await?;
+            for result in [current.count().await?, current.count_streaming().await?] {
+                assert_eq!(result.counts.values().sum::<u64>(), expected, "late {id}, deleted={deleted}: retain unrelated committed identities");
+                assert_eq!(result.indexed_sources, 1, "the captured index must participate, not silently fall back to an unindexed scan");
+            }
+            assert_eq!(old.count_streaming().await?.counts.values().sum::<u64>(), 1, "later buffered writes cannot replace a captured view");
+            let (_, handoff) = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+                tokio::try_join!(layer.flush_all_now(), async {
+                    let resume = commits.recv().await.context("flush did not publish")?;
+                    let result = capture().await;
+                    let retained = !layer.is_empty();
+                    resume.send(()).map_err(|()| anyhow::anyhow!("flush stopped before capture finished"))?;
+                    let view = result?;
+                    ensure!(retained && !view.memory.batches.is_empty(), "capture must overlap committed Delta and retained memory");
+                    Ok::<_, anyhow::Error>(view)
+                })
+            })
+            .await??;
+            assert!(layer.is_empty(), "the flush must transfer ownership to Delta");
+            for view in [&current, &handoff, &capture().await?] {
+                for result in [view.count().await?, view.count_streaming().await?] {
+                    assert_eq!(result.counts.values().sum::<u64>(), expected, "flush preserves captured and fresh winner sets");
+                }
+            }
+            assert_eq!(old.count_streaming().await?.counts.values().sum::<u64>(), 1, "flush cannot change the original captured view");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn tantivy_unique_partition_uses_exact_count_proof_and_declines_new_versions() -> Result<()> {
         use crate::support::test_helpers::{json_to_batch_for, minio_test_config};
         use crate::tantivy::search::{TantivyIndexService, parquet_rel_of_uri};

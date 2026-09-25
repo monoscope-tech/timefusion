@@ -6,6 +6,35 @@ use test_case::test_case;
 use super::*;
 use crate::{config::AppConfig, schema::get_default_schema, support::test_helpers::*};
 
+#[test_case(0 => RollupOutputEvidence::Unknown; "absent files are not empty proof")]
+#[test_case(1 => RollupOutputEvidence::Files(std::num::NonZeroU32::MIN); "file backed")]
+#[test_case(u32::MAX as u64 => RollupOutputEvidence::Files(std::num::NonZeroU32::MAX); "largest exact count")]
+#[test_case(u32::MAX as u64 + 1 => RollupOutputEvidence::Unknown; "unrepresentable count cannot certify output")]
+fn rollup_output_evidence_from_file_count(files: u64) -> RollupOutputEvidence {
+    RollupOutputEvidence::from_file_count(files)
+}
+
+#[test_case(RollupOutputEvidence::Unknown, true, true => false; "unknown is not empty")]
+#[test_case(RollupOutputEvidence::Files(std::num::NonZeroU32::MIN), true, true => false; "files are not empty")]
+#[test_case(RollupOutputEvidence::Empty, false, true => false; "empty needs source evidence")]
+#[test_case(RollupOutputEvidence::Empty, true, false => false; "empty needs measure evidence")]
+#[test_case(RollupOutputEvidence::Empty, true, true => true; "verified empty publication")]
+fn rollup_output_evidence_requires_empty_publication_proof(output: RollupOutputEvidence, content: bool, measures: bool) -> bool {
+    RollupCoverage {
+        source_fp: 1,
+        source_epoch: None,
+        generation: "generation".into(),
+        source_rows: Some(1),
+        source_rows_below: None,
+        covered_through: 60_000_000,
+        measures: measures.then(HashSet::new),
+        content_fp: content.then_some(2),
+        output,
+    }
+    .empty_publication()
+    .is_some()
+}
+
 #[test_case(1 => 1; "a one-lane pool cannot reserve a lane")]
 #[test_case(2 => 1; "a two-lane pool splits hot and sealed")]
 #[test_case(5 => 1; "production leaves four of five lanes available to sealed debt")]
@@ -476,9 +505,17 @@ async fn coverage_published_for_one_source_survives_planning_the_next() -> Resul
 /// A rewrite carries the `timefusion.*` coverage identity forward only when every
 /// input agrees, and never invents it: unioning slices would claim coverage of the
 /// gap between inputs, and recovery matches `task.key.slice` exactly anyway.
-#[test]
-fn a_rewrite_carries_coverage_identity_only_when_every_input_agrees() {
+#[test_case(false ; "legacy identity")]
+#[test_case(true ; "identity and publication proof")]
+fn a_rewrite_carries_coverage_identity_only_when_every_input_agrees(with_proof: bool) {
     use crate::maintenance_coordinator::{TAG_GENERATION, TAG_PROJECT, TAG_SLICE_END, TAG_SLICE_START, TAG_SOURCE, TAG_SOURCE_FINGERPRINT};
+    let proofs = [
+        (crate::maintenance_coordinator::TAG_SOURCE_ROWS, "19"),
+        (crate::maintenance_coordinator::TAG_SOURCE_ROWS_BELOW, "11"),
+        (crate::maintenance_coordinator::TAG_CONTENT_FINGERPRINT, "123"),
+        (crate::maintenance_coordinator::TAG_MEASURES, "request_count"),
+        (crate::maintenance_coordinator::TAG_OUTPUT_ROWS, "2"),
+    ];
     let add = |slice_start: &str, generation: &str| deltalake::kernel::Add {
         path: format!("f{slice_start}.parquet"),
         partition_values: Default::default(),
@@ -495,11 +532,29 @@ fn a_rewrite_carries_coverage_identity_only_when_every_input_agrees() {
         ])),
         ..Default::default()
     };
+    let add = |slice_start, generation| {
+        let mut file = add(slice_start, generation);
+        if with_proof {
+            file.tags.as_mut().unwrap().extend(proofs.map(|(name, value)| (name.to_owned(), Some(value.to_owned()))));
+        }
+        file
+    };
 
     // One publication cut into two files by the size limit: identical tags.
     let carried = super::carried_coverage_tags(&[add("0", "g1"), add("0", "g1")]);
     assert_eq!(carried.get(TAG_SLICE_START).map(String::as_str), Some("0"), "identical inputs carry their identity forward");
-    assert_eq!(carried.len(), 6, "all six coverage tags travel together or not at all");
+    assert_eq!(carried.len(), if with_proof { 11 } else { 6 }, "agreed publication proof must survive a physical rewrite");
+    if with_proof {
+        for (tag, expected) in proofs {
+            assert_eq!(carried.get(tag).map(String::as_str), Some(expected));
+        }
+        let mut conflicting = add("0", "g1");
+        conflicting.tags.as_mut().unwrap().insert(crate::maintenance_coordinator::TAG_OUTPUT_ROWS.to_owned(), Some("3".to_owned()));
+        assert!(
+            !super::carried_coverage_tags(&[add("0", "g1"), conflicting]).contains_key(crate::maintenance_coordinator::TAG_OUTPUT_ROWS),
+            "conflicting output counts cannot become a complete publication proof"
+        );
+    }
 
     assert!(super::carried_coverage_tags(&[add("0", "g1"), add("3600000000", "g1")]).is_empty(), "differing slices must NOT be merged into a span");
     assert!(super::carried_coverage_tags(&[add("0", "g1"), add("0", "g2")]).is_empty(), "differing generations must not be conflated");
@@ -953,6 +1008,31 @@ async fn rollup_routing_rejects_legacy_materialization_generations() -> Result<(
     let plan = state.optimize(&state.create_logical_plan(&sql).await?)?;
     assert!(matches!(db.rollup_sql(&plan, &state).await, Ok(Some(_))), "fresh materializations must route");
     let schema = get_schema("otel_logs_and_spans").unwrap();
+    let target = schema.rollups.iter().find(|spec| spec.derive_from.is_none()).unwrap().table_name("otel_logs_and_spans");
+    // Settle the write path's narrower tasks through the real coverage check,
+    // so this test reaches the worker rather than the active-parent admission veto.
+    let scans = crate::observability::maintenance_stats().rollup_scan_cohorts.load(std::sync::atomic::Ordering::Relaxed);
+    let pending: Vec<_> = db
+        .journal()
+        .tasks()
+        .filter(|task| {
+            task.key.project_id == project
+                && task.key.physical_table == target
+                && task.key.operation == crate::maintenance_coordinator::Operation::BaseRollup
+                && task.state.is_active()
+        })
+        .map(|task| task.key.clone())
+        .collect();
+    for key in pending {
+        db.journal().enqueue(key.clone(), 0, crate::maintenance_coordinator::MAX_DECODED_BYTES, 0);
+        assert!(db.run_coordinator_rollup_selected(crate::database::maintain::TaskSelection::Exact(&key)).await?);
+        assert_eq!(db.journal().state(&key), Some(crate::maintenance_coordinator::TaskState::Complete), "existing output must prove the narrower task");
+    }
+    assert_eq!(
+        crate::observability::maintenance_stats().rollup_scan_cohorts.load(std::sync::atomic::Ordering::Relaxed),
+        scans,
+        "settling covered tasks must not scan raw input again"
+    );
     let legacy = |target: &str, coverage: &RollupCoverage| {
         let spec = schema.rollups.iter().find(|s| s.table_name("otel_logs_and_spans") == target).unwrap();
         let restricted = crate::schema::RollupSpec {
@@ -979,7 +1059,6 @@ async fn rollup_routing_rejects_legacy_materialization_generations() -> Result<(
         "matching source rows cannot validate a pre-fix materialization: {:?}",
         outcome.as_ref().map(|route| route.as_ref().map(|r| r.sql.as_str())).map_err(|reason| reason.label())
     );
-    let target = schema.rollups.iter().find(|spec| spec.derive_from.is_none()).unwrap().table_name("otel_logs_and_spans");
     let (key, mut publication) = db.journal().published_rollups("otel_logs_and_spans", &target).into_iter().find(|(key, _)| key.project_id == project).unwrap();
     let derived = db.run_unit_once("otel_logs_and_spans", &project, day, crate::maintenance_coordinator::Operation::DerivedRollup, 24, 0).await?;
     assert_eq!(derived.state, Some(crate::maintenance_coordinator::TaskState::Retry), "a derived unit must wait for a current base generation");
@@ -1037,8 +1116,25 @@ async fn rollup_routing_rejects_legacy_materialization_generations() -> Result<(
         "an obsolete journal-only publication must also be requeued"
     );
     db.run_unit_once("otel_logs_and_spans", &project, day, Operation::BaseRollup, 24, 0).await?;
+    let remaining: Vec<_> = db
+        .journal()
+        .tasks()
+        .filter(|task| task.key.physical_table == target && task.key.project_id == project && task.state.is_active())
+        .map(|task| task.key.clone())
+        .collect();
+    assert!(!remaining.is_empty(), "recovery must exercise the narrower repair queued from untagged output");
+    let scans = crate::observability::maintenance_stats().rollup_scan_cohorts.load(std::sync::atomic::Ordering::Relaxed);
+    for repair in remaining {
+        assert!(db.run_coordinator_rollup_selected(crate::database::maintain::TaskSelection::Exact(&repair)).await?);
+        assert_eq!(db.journal().state(&repair), Some(TaskState::Complete), "the current wider publication must settle the repair");
+    }
+    assert_eq!(
+        crate::observability::maintenance_stats().rollup_scan_cohorts.load(std::sync::atomic::Ordering::Relaxed),
+        scans,
+        "recovery repairs covered by the new publication must not scan source data again"
+    );
     let repaired = db.run_unit_once("otel_logs_and_spans", &project, day, Operation::DerivedRollup, 24, 0).await?;
-    assert_eq!(repaired.state, Some(TaskState::Complete), "base rebuilding must unblock the derived tier");
+    assert_eq!(repaired.state, Some(TaskState::Complete), "base rebuilding and metadata-only repair reconciliation must unblock the derived tier");
     let derived_table = schema.rollups.iter().find(|spec| spec.derive_from.is_some()).unwrap().table_name("otel_logs_and_spans");
     let batches = ctx.sql(&format!("SELECT SUM(request_count) FROM {derived_table} WHERE project_id='{project}'")).await?.collect().await?;
     assert_eq!(first_i64(batches[0].column(0)), Some(4));
@@ -1407,11 +1503,11 @@ async fn a_derived_unit_over_a_holey_base_tier_retries_instead_of_publishing_sho
     };
 
     const HOUR: i64 = 3_600_000_000;
-    // The bug: base covers 20:00-21:00 only, derived asks for 20:00-24:00.
+    // The bug: base covers 20:00-21:00 only, derived asks for 20:00-24:00. The hole's base
+    // units are still queued, so the derived unit must wait for them rather than publish short.
     let (state, reason, claimed) = scenario(1, 20, 4).await?;
     assert!(claimed.is_empty(), "a derived cell must not claim a range its base tier does not cover; claimed {claimed:?}");
-    assert_eq!(state, Some(TaskState::Retry), "the unit must be retried, not completed: {reason:?}");
-    assert_eq!(reason.as_deref(), Some("base_tier_incomplete"));
+    assert_eq!((state, reason), (Some(TaskState::Pending), None), "the unit must wait for the queued base work, not complete");
 
     // Base tiles the whole ask: publish.
     let (state, reason, claimed) = scenario(4, 20, 4).await?;
@@ -1542,6 +1638,7 @@ struct KilledUnit {
     key: crate::maintenance_coordinator::TaskKey,
     staged: Vec<deltalake::kernel::Add>,
     source_rows: Option<u64>,
+    source_epoch: u64,
     project: String,
     tier: String,
 }
@@ -1609,7 +1706,17 @@ async fn live_paths(db: &Database, project: &str, tier: &str) -> std::collection
 }
 
 async fn staged_but_uncommitted_rollup(label: &str) -> Result<KilledUnit> {
-    let (db, project, day, tier) = published_base_day(create_test_config(label), "resume").await?;
+    let db = Database::with_config(create_test_config(label)).await?;
+    db.cancel_maintenance();
+    let project = format!("resume_{}", uuid::Uuid::new_v4().simple());
+    let day = (Utc::now() - chrono::Duration::days(3)).date_naive();
+    let at = day.and_hms_opt(12, 0, 0).unwrap().and_utc().timestamp_micros();
+    let rows = ["keep", "victim"].into_iter().map(|id| test_span_ts(id, "op", &project, at)).collect();
+    db.insert_records_batch(&project, "otel_logs_and_spans", vec![json_to_batch(rows)?], true, None).await?;
+    let checkpoints = db.task_journal_group_commit.offered();
+    db.run_unit_once("otel_logs_and_spans", &project, day, crate::maintenance_coordinator::Operation::BaseRollup, 24, 0).await?;
+    assert_eq!(db.task_journal_group_commit.offered() - checkpoints, 1, "a fresh publication must join the shared checkpoint barrier");
+    let tier = rollup_tier(false);
     let (key, publication) = db
         .journal()
         .published_rollups("otel_logs_and_spans", &tier)
@@ -1644,10 +1751,17 @@ async fn staged_but_uncommitted_rollup(label: &str) -> Result<KilledUnit> {
         paths: staged.iter().map(|add| add.path.clone()).collect(),
         target_paths: Vec::new(),
         adds: staged.clone(),
-        rollup: Some(super::RollupResume { key: key.clone(), publication: publication.clone(), source_rows: publication.source_rows, date: day.to_string() }),
+        rollup: Some(super::RollupResume {
+            key: key.clone(),
+            publication: publication.clone(),
+            source_rows: publication.source_rows,
+            target: None,
+            date: day.to_string(),
+        }),
         instance: None,
     });
-    Ok(KilledUnit { db, key, staged, source_rows: publication.source_rows, project, tier })
+    let source_epoch = db.rollup_source_epochs.get(&(project.clone(), key.source.clone(), day.to_string())).map_or(0, |epoch| *epoch.value());
+    Ok(KilledUnit { db, key, staged, source_rows: publication.source_rows, source_epoch, project, tier })
 }
 
 /// A rollup unit killed mid-stage must be COMMITTED on the next claim, not rebuilt —
@@ -1657,21 +1771,33 @@ async fn staged_but_uncommitted_rollup(label: &str) -> Result<KilledUnit> {
 ///
 /// The repair resume path cannot cover this: `classify_resume` rests on ROW
 /// PRESERVATION and a rollup AGGREGATES, so it refuses every rollup by construction.
-#[test_case::test_case(false; "the staged output describes reality and is committed")]
-#[test_case::test_case(true; "a source that moved under it is discarded")]
+#[test_case::test_case(false, false; "the staged output describes reality and is committed")]
+#[test_case::test_case(true, false; "a source that moved under it is discarded")]
+#[test_case::test_case(false, true; "unchanged landed output restores bookkeeping without another commit")]
 #[tokio::test(flavor = "multi_thread")]
-async fn a_killed_rollup_resumes_only_while_its_source_has_not_moved(moved: bool) -> Result<()> {
+async fn a_killed_rollup_resumes_only_while_its_source_has_not_moved(moved: bool, already_landed: bool) -> Result<()> {
     use std::sync::atomic::Ordering::Relaxed;
-    let KilledUnit { db, key, staged, source_rows, project, tier } =
+    let KilledUnit { db, key, staged, source_rows, source_epoch, project, tier } =
         staged_but_uncommitted_rollup(if moved { "rollup-resume-stale" } else { "rollup-resume" }).await?;
     assert!(live_paths(&db, &project, &tier).await.is_empty(), "the reconstructed state has nothing live");
+    let target = db.get_or_create_table(&project, &tier).await?;
+    if already_landed {
+        commit_actions(&target, staged.iter().cloned().map(deltalake::kernel::Action::Add).collect()).await?;
+    }
+    let target_version = target.read().await.version();
 
     let stats = crate::observability::maintenance_stats();
-    let (resumed, declined) = (stats.rollup_resumed.load(Relaxed), stats.rollup_resume_declined.load(Relaxed));
+    let resume_counter = if already_landed { &stats.rollup_resume_already_landed } else { &stats.rollup_resumed };
+    let (resumed, declined) = (resume_counter.load(Relaxed), stats.rollup_resume_declined.load(Relaxed));
     // One more source row: the witness the build recorded no longer describes the
     // partition. Passed explicitly, as the unit passes the count it just read.
     let witness = if moved { source_rows.map(|rows| rows + 1) } else { source_rows };
-    assert_eq!(db.resume_rollup_unit(&key, witness).await?, !moved, "a staged output resumes exactly when its source is unmoved");
+    let source = db.resolve_table(&project, "otel_logs_and_spans").await?;
+    let content_fp = live_adds(&source).await.iter().fold(0, |fp, add| fp ^ super::file_content_hash(&add.path, add.deletion_vector.as_ref()));
+    assert_eq!(db.resume_rollup_unit(&key, witness, content_fp, source_epoch).await?, !moved, "a staged output resumes exactly when its source is unmoved");
+    if already_landed {
+        assert_eq!(target.read().await.version(), target_version, "bookkeeping recovery must not create a Delta commit");
+    }
 
     let live = live_paths(&db, &project, &tier).await;
     for add in &staged {
@@ -1681,13 +1807,240 @@ async fn a_killed_rollup_resumes_only_while_its_source_has_not_moved(moved: bool
         assert!(stats.rollup_resume_declined.load(Relaxed) > declined, "and the refusal is visible rather than silent");
         return Ok(());
     }
-    assert!(stats.rollup_resumed.load(Relaxed) > resumed, "and it is counted as a resume");
+    assert!(resume_counter.load(Relaxed) > resumed, "and it is counted as a resume");
     // Coverage recovery requires `rollup_slice_complete`, so a commit without the
     // publication leaves the planner seeing a hole and re-running the whole scan.
     assert!(
         db.journal().published_rollups("otel_logs_and_spans", &tier).iter().any(|(published, _)| *published == key),
         "the journal is published too, or the planner rebuilds this slice anyway"
     );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_killed_rollup_rejects_a_same_count_source_mask_change() -> Result<()> {
+    let KilledUnit { db, key, source_rows, source_epoch, project, tier, .. } = staged_but_uncommitted_rollup("resume-source-mask").await?;
+    let source = db.resolve_table(&project, "otel_logs_and_spans").await?;
+    let before = live_adds(&source).await;
+    let original = source.read().await.clone();
+    let (masked, deleted) = original.delete().with_predicate("id = 'victim'").with_deletion_vectors(true).await?;
+    assert_eq!(deleted.num_deleted_rows, Some(1));
+    *source.write().await = masked;
+    let after = live_adds(&source).await;
+    assert!(after.iter().any(|add| add.deletion_vector.is_some()), "the fixture must change a deletion vector, not rewrite the source");
+    assert_eq!(before.iter().map(|add| &add.path).collect::<Vec<_>>(), after.iter().map(|add| &add.path).collect::<Vec<_>>());
+    assert_eq!(after.iter().map(super::maintain::add_row_count).sum::<Option<u64>>(), source_rows, "physical row count cannot detect this mutation");
+    let content_fp = after.iter().fold(0, |fp, add| fp ^ super::file_content_hash(&add.path, add.deletion_vector.as_ref()));
+    assert!(!db.resume_rollup_unit(&key, source_rows, content_fp, source_epoch).await?, "a source mask change must decline stale aggregate publication");
+    assert!(live_paths(&db, &project, &tier).await.is_empty(), "refusal must not publish the staged output");
+    Ok(())
+}
+
+#[test_case::test_case(false, false; "staged output invalidated before recovery")]
+#[test_case::test_case(true, false; "staged output invalidated during recovery")]
+#[test_case::test_case(false, true; "landed output invalidated before recovery")]
+#[test_case::test_case(true, true; "landed output invalidated during recovery")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_resumed_rollup_cannot_complete_after_source_invalidation(during_recovery: bool, landed: bool) -> Result<()> {
+    use crate::maintenance_coordinator::TaskState;
+    let KilledUnit { db, key, staged, source_rows, source_epoch, project, tier } = staged_but_uncommitted_rollup("resume-invalidation-race").await?;
+    let target = db.get_or_create_table(&project, &tier).await?;
+    if landed {
+        commit_actions(&target, staged.into_iter().map(deltalake::kernel::Action::Add).collect()).await?;
+    }
+    let source = db.resolve_table(&project, &key.source).await?;
+    let content_fp = live_adds(&source).await.iter().fold(0, |fp, add| fp ^ super::file_content_hash(&add.path, add.deletion_vector.as_ref()));
+    {
+        let mut journal = db.journal();
+        journal.enqueue(key.clone(), crate::support::now_micros(), crate::maintenance_coordinator::MAX_DECODED_BYTES, 0);
+        assert!(journal.mark_running(&key));
+    }
+    let lock = db.commit_lock(&project, &tier).await;
+    let held = lock.lock().await;
+    let manifest = super::parse_staged_intents(&std::fs::read_to_string(db.staged_intent_path())?);
+    if !during_recovery {
+        insert_a_span(&db, &project, "late-before-recovery", key.slice.start_micros + 12 * 3_600_000_000).await?;
+    }
+    let mut recovery = Box::pin(db.resume_rollup_unit(&key, source_rows, content_fp, source_epoch));
+    assert!(futures::poll!(recovery.as_mut()).is_pending(), "recovery cannot finish while its target commit lock is held");
+    if during_recovery {
+        insert_a_span(&db, &project, "late-during-recovery", key.slice.start_micros + 12 * 3_600_000_000).await?;
+    }
+    drop(held);
+    assert!(!recovery.await?, "source invalidation after capture must prevent stale coverage publication");
+    assert_ne!(db.journal().state(&key), Some(TaskState::Complete), "recovery must not retire the invalidated work");
+    assert_eq!(super::parse_staged_intents(&std::fs::read_to_string(db.staged_intent_path())?), manifest, "refusal must retain staged intent evidence");
+    Ok(())
+}
+
+#[test_case::test_case(false, true; "unchanged replacement input")]
+#[test_case::test_case(true, true; "same path with changed target evidence")]
+#[test_case::test_case(false, false; "legacy replacement lacks target proof")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_resumed_rollup_rechecks_the_target_it_will_replace(changed: bool, proof: bool) -> Result<()> {
+    use object_store::ObjectStoreExt as _;
+    let KilledUnit { db, key, staged, source_rows, source_epoch, project, tier } = staged_but_uncommitted_rollup("resume-replaced-evidence").await?;
+    let target = db.get_or_create_table(&project, &tier).await?;
+    let store = target.read().await.log_store().object_store(None);
+    let mut originals = Vec::new();
+    for add in &staged {
+        let path = sibling_path(&add.path, "old-target");
+        store.copy(&object_store::path::Path::from(add.path.as_str()), &object_store::path::Path::from(path.as_str())).await?;
+        originals.push(deltalake::kernel::Add { path, ..add.clone() });
+    }
+    commit_actions(&target, originals.iter().cloned().map(deltalake::kernel::Action::Add).collect()).await?;
+    let mut intent =
+        super::parse_staged_intents(&std::fs::read_to_string(db.staged_intent_path())?).into_iter().next().expect("fixture must leave a durable intent");
+    intent.target_paths = originals.iter().map(|add| add.path.clone()).collect();
+    intent.rollup.as_mut().expect("rollup intent").target =
+        proof.then(|| super::RollupTargetProof { before: super::rollup_target_fingerprint(&originals), after: super::rollup_target_fingerprint(&staged) });
+    std::fs::write(db.staged_intent_path(), b"")?;
+    db.record_staged_intent(intent);
+    if changed {
+        let external = Arc::new(RwLock::new(target.read().await.clone()));
+        commit_actions(&external, originals.iter().map(|add| deltalake::kernel::Action::Remove(super::remove_for_add(add, true))).collect()).await?;
+        let replacements = originals
+            .iter()
+            .cloned()
+            .map(|mut add| {
+                add.tags.get_or_insert_default().insert(crate::maintenance_coordinator::TAG_GENERATION.to_owned(), Some("changed-after-staging".to_owned()));
+                deltalake::kernel::Action::Add(add)
+            })
+            .collect();
+        commit_actions(&external, replacements).await?;
+        // Make the changed metadata visible before resume's own snapshot capture.
+        // Its commit-lock recheck alone cannot detect changes that already happened.
+        super::refresh_table_snapshot(&target, true).await?;
+    }
+    let source = db.resolve_table(&project, &key.source).await?;
+    let content_fp = live_adds(&source).await.iter().fold(0, |fp, add| fp ^ super::file_content_hash(&add.path, add.deletion_vector.as_ref()));
+    let resumed = proof && !changed;
+    assert_eq!(
+        db.resume_rollup_unit(&key, source_rows, content_fp, source_epoch).await?,
+        resumed,
+        "resume must preserve externally changed or unproven replacement inputs"
+    );
+    let paths = live_paths(&db, &project, &tier).await;
+    for add in originals {
+        assert_eq!(paths.contains(&add.path), !resumed, "refusal must leave every original path live");
+    }
+    for add in staged {
+        assert_eq!(paths.contains(&add.path), resumed, "staged output must remain invisible after refusal");
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum PublicationRace {
+    Staged,
+    Landed,
+    FreshOverlap,
+    FreshOtherProject,
+    FreshMetadata,
+}
+
+/// External publication must not duplicate a range or block an unrelated project.
+#[test_case::test_case(PublicationRace::Staged; "uncommitted staged output")]
+#[test_case::test_case(PublicationRace::Landed; "already landed output replaced externally")]
+#[test_case::test_case(PublicationRace::FreshOverlap; "fresh publication over a stale empty target")]
+#[test_case::test_case(PublicationRace::FreshOtherProject; "fresh publication survives an unrelated project commit")]
+#[test_case::test_case(PublicationRace::FreshMetadata; "same path with changed publication metadata")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_resumed_rollup_does_not_publish_over_an_external_target_commit(case: PublicationRace) -> Result<()> {
+    use object_store::ObjectStoreExt as _;
+    let already_landed = matches!(case, PublicationRace::Landed | PublicationRace::FreshMetadata);
+    let fresh = matches!(case, PublicationRace::FreshOverlap | PublicationRace::FreshOtherProject | PublicationRace::FreshMetadata);
+    let unrelated = matches!(case, PublicationRace::FreshOtherProject);
+    let metadata_only = matches!(case, PublicationRace::FreshMetadata);
+    let KilledUnit { mut db, key, staged, source_rows, source_epoch, project, tier } = staged_but_uncommitted_rollup("resume-target-moved").await?;
+    if fresh {
+        Arc::make_mut(&mut db.config).maintenance.timefusion_rollup_noop_skip_enabled = false;
+    }
+    let target = db.get_or_create_table(&project, &tier).await?;
+    if already_landed {
+        commit_actions(&target, staged.iter().cloned().map(deltalake::kernel::Action::Add).collect()).await?;
+    }
+    let external = Arc::new(RwLock::new(target.read().await.clone()));
+    let store = external.read().await.log_store().object_store(None);
+    let mut replacements =
+        if already_landed { staged.iter().map(|add| deltalake::kernel::Action::Remove(super::remove_for_add(add, true))).collect() } else { Vec::new() };
+    for add in &staged {
+        let mut copy = add.clone();
+        if unrelated {
+            copy.path = copy.path.replace(&format!("project_id={project}/"), "project_id=unrelated/");
+            copy.partition_values.insert("project_id".to_owned(), Some("unrelated".to_owned()));
+            copy.tags.get_or_insert_default().insert(crate::maintenance_coordinator::TAG_PROJECT.to_owned(), Some("unrelated".to_owned()));
+        }
+        let path = if metadata_only {
+            copy.tags.get_or_insert_default().insert(crate::maintenance_coordinator::TAG_GENERATION.to_owned(), Some("external-generation".to_owned()));
+            copy.path.clone()
+        } else {
+            let path = sibling_path(&copy.path, "external");
+            store.copy(&object_store::path::Path::from(add.path.as_str()), &object_store::path::Path::from(path.as_str())).await?;
+            path
+        };
+        replacements.push(deltalake::kernel::Action::Add(deltalake::kernel::Add { path, ..copy }));
+    }
+    assert_eq!(live_adds(&target).await.len(), if already_landed { staged.len() } else { 0 }, "the local cache must still precede the external commit");
+    let source = db.resolve_table(&project, "otel_logs_and_spans").await?;
+    let content_fp = live_adds(&source).await.iter().fold(0, |fp, add| fp ^ super::file_content_hash(&add.path, add.deletion_vector.as_ref()));
+    let result = if fresh {
+        // This case exercises a new build, not the staged-output recovery path.
+        std::fs::write(db.staged_intent_path(), b"")?;
+        let day = chrono::DateTime::from_timestamp_micros(key.slice.start_micros).unwrap().date_naive();
+        let lock = db.commit_lock(&project, &tier).await;
+        let guard = lock.lock().await;
+        let (_, report) = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            tokio::try_join!(
+                async {
+                    let mut poll = tokio::time::interval(std::time::Duration::from_millis(10));
+                    while std::fs::metadata(db.staged_intent_path())?.len() == 0 {
+                        poll.tick().await;
+                    }
+                    // The durable intent proves replacement selection finished.
+                    // Only the commit lock prevents the builder from publishing.
+                    if metadata_only {
+                        // Remove and re-add in separate versions: a same-version
+                        // Remove can hide the replacement Add during replay.
+                        let adds = replacements.split_off(staged.len());
+                        commit_actions(&external, replacements).await?;
+                        replacements = adds;
+                    }
+                    commit_actions(&external, replacements).await?;
+                    assert_eq!(live_adds(&external).await.len(), staged.len(), "the external replacement must be live before publication resumes");
+                    drop(guard);
+                    Ok::<_, anyhow::Error>(())
+                },
+                db.run_unit_once(&key.source, &project, day, key.operation, 24, 0)
+            )
+        })
+        .await??;
+        assert!(report.cohorts > 0, "the fresh case must aggregate rather than take a metadata-only skip: {report}");
+        Ok(report.state == Some(crate::maintenance_coordinator::TaskState::Complete))
+    } else {
+        commit_actions(&external, replacements).await?;
+        assert_eq!(live_adds(&target).await.len(), if already_landed { staged.len() } else { 0 }, "the external writer must not refresh the local cache");
+        db.resume_rollup_unit(&key, source_rows, content_fp, source_epoch).await
+    };
+    super::refresh_table_snapshot(&external, true).await?;
+    let live = live_adds(&external).await;
+    assert_eq!(live.len(), staged.len() * if unrelated { 2 } else { 1 }, "only disjoint publications may coexist");
+    assert_eq!(matches!(result, Ok(true)), unrelated, "only an unrelated partition change permits publication");
+    if unrelated {
+        assert_eq!(live.iter().filter(|add| add.partition_values.get("project_id").and_then(Option::as_deref) == Some(project.as_str())).count(), staged.len());
+        let rows = db.query_delta_only(&format!("SELECT CAST(SUM(request_count) AS BIGINT) FROM {tier} WHERE project_id = '{project}'")).await?;
+        assert_eq!(rows[0].column(0).as_any().downcast_ref::<arrow::array::Int64Array>().unwrap().value(0), 2);
+    }
+    if metadata_only {
+        assert!(
+            live.iter().all(|add| add.tags.as_ref().and_then(|tags| tags.get(crate::maintenance_coordinator::TAG_GENERATION)).and_then(Option::as_deref)
+                == Some("external-generation")),
+            "the competing metadata must survive"
+        );
+        assert_eq!(live.iter().map(|add| &add.path).collect::<HashSet<_>>(), staged.iter().map(|add| &add.path).collect::<HashSet<_>>());
+    } else {
+        assert!(live.iter().all(|add| staged.iter().all(|stale| stale.path != add.path)), "the stale output must not enter the live snapshot");
+    }
     Ok(())
 }
 
@@ -1880,10 +2233,24 @@ async fn a_resume_whose_staged_parquet_is_gone_stages_normally() -> Result<()> {
 ///
 /// The cell's date comes from the file's PARTITION, not from `slice_start`: a file
 /// in `date=D` cannot hold rows outside `D`.
+#[test_case(false ; "one publication")]
+#[test_case(true ; "adjacent publications")]
 #[tokio::test(flavor = "multi_thread")]
-async fn the_tag_replay_records_what_it_reads_into_the_coverage_ledger() -> Result<()> {
+async fn the_tag_replay_records_what_it_reads_into_the_coverage_ledger(split: bool) -> Result<()> {
     use crate::storage::CoverageLedger as _;
-    let (db, project, day, tier) = published_base_day(create_test_config("ledger-populate"), "ledger").await?;
+    let db = Database::with_config(create_test_config("ledger-populate")).await?;
+    db.cancel_maintenance();
+    let project = format!("ledger_{}", uuid::Uuid::new_v4().simple());
+    let day = (Utc::now() - chrono::Duration::days(3)).date_naive();
+    let rows = [1, 13].map(|hour| test_span_ts(&format!("row-{hour}"), "op", &project, day.and_hms_opt(hour, 0, 0).unwrap().and_utc().timestamp_micros()));
+    db.insert_records_batch(&project, "otel_logs_and_spans", vec![json_to_batch(rows.to_vec())?], true, None).await?;
+    for offset in if split { vec![0, 12] } else { vec![0] } {
+        let report = db
+            .run_unit_once("otel_logs_and_spans", &project, day, crate::maintenance_coordinator::Operation::BaseRollup, if split { 12 } else { 24 }, offset)
+            .await?;
+        assert_eq!(report.state, Some(crate::maintenance_coordinator::TaskState::Complete), "each source interval must actually publish");
+    }
+    let tier = rollup_tier(false);
     assert!(
         db.coverage_ledger.coverage(&("otel_logs_and_spans".to_owned(), project.clone(), tier.clone(), day.to_string())).is_empty(),
         "the ledger is populated BY the replay, so it is empty until one runs"
@@ -1916,7 +2283,7 @@ async fn the_tag_replay_records_what_it_reads_into_the_coverage_ledger() -> Resu
     // serving coverage the read path deliberately refuses.
     for (lo, hi) in &ledger_ranges {
         assert!(
-            tag_ranges.iter().any(|(start, end)| start <= lo && end >= hi),
+            crate::rollup::ranges_cover(&tag_ranges.iter().copied().collect::<Vec<_>>(), (*lo, hi - 1)),
             "the ledger claims no range the read path refuses: {:?} not in {tag_ranges:?}",
             (lo, hi)
         );
@@ -1924,6 +2291,9 @@ async fn the_tag_replay_records_what_it_reads_into_the_coverage_ledger() -> Resu
 
     // Coverage without file identity could only supplement the tags, never replace them.
     assert!(recorded.iter().all(|entry| !entry.files.is_empty()), "every recorded range names the files that serve it: {recorded:?}");
+    assert_eq!(recorded.len(), 1, "adjacent publications with identical evidence must retain compact ledger coverage");
+    assert_eq!(recorded[0].source_rows, Some(2), "both publications witness the same two-row source partition");
+    assert_eq!(recorded[0].files.len(), if split { 2 } else { 1 }, "merged coverage must retain every contributing output file");
 
     // Nothing changed between these two replays, so the second must record no drift.
     let before = crate::observability::maintenance_stats().coverage_ledger_disagreements.load(std::sync::atomic::Ordering::Relaxed);
@@ -1962,6 +2332,17 @@ async fn the_tag_replay_records_what_it_reads_into_the_coverage_ledger() -> Resu
     assert_eq!(db.seed_routing_from_ledger(), 0, "an old reader's ledger cannot authorize current reads");
     db.coverage_ledger.replace(&cell, recorded);
     assert!(db.seed_routing_from_ledger() > 0, "current persisted coverage survives restart");
+    let db = Arc::new(db);
+    let mut ctx = Arc::clone(&db).create_session_context();
+    db.setup_session_context(&mut ctx)?;
+    let state = ctx.state();
+    let lo = midnight_micros(day);
+    let hi = lo + crate::maintenance_coordinator::DAY_MICROS;
+    let sql = format!(
+        "SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id='{project}' AND timestamp >= to_timestamp_micros({lo}) AND timestamp < to_timestamp_micros({hi})"
+    );
+    let plan = state.optimize(&state.create_logical_plan(&sql).await?)?;
+    assert!(matches!(db.rollup_sql(&plan, &state).await, Ok(Some(_))), "ledger seeding must restore readable output before tag replay");
 
     Ok(())
 }
@@ -2099,9 +2480,17 @@ async fn recovery_queues_a_rebuild_for_a_partition_holding_untagged_tier_files()
 /// The observable proof is the ORPHAN: a unit that reached the writer uploads
 /// objects it never commits, so the tier's object count grows while its LIVE file
 /// set does not. Settling early leaves both unchanged.
+#[test_case(false, true, true ; "current covering generation")]
+#[test_case(true, true, true ; "stale covering generation requires repair")]
+#[test_case(false, true, false ; "bounded proof enabled")]
+#[test_case(false, false, false ; "bounded proof disabled requires repair")]
 #[tokio::test]
-async fn a_slice_covered_by_a_wider_file_settles_without_scanning() -> Result<()> {
-    let (db, project, day, tier) = published_base_day(rollup_backfill_config("covered-preflight", 35), "preflight").await?;
+async fn a_slice_covered_by_a_wider_file_settles_without_scanning(stale_generation: bool, bounded_witness: bool, whole_witness: bool) -> Result<()> {
+    let cfg = test_config_with("covered-preflight", |cfg| {
+        cfg.maintenance.timefusion_rollup_backfill_days = 35;
+        cfg.maintenance.timefusion_rollup_bounded_witness = bounded_witness;
+    });
+    let (db, project, day, tier) = published_base_day(cfg, "preflight").await?;
     let tier_ref = db.get_or_create_table(&project, &tier).await?;
     let covering: Vec<(i64, i64)> = live_adds(&tier_ref)
         .await
@@ -2116,6 +2505,21 @@ async fn a_slice_covered_by_a_wider_file_settles_without_scanning() -> Result<()
         panic!("the published day must leave a tagged live slice, or this tests the other shape");
     };
     assert!(covering_end > covering_start, "a covering slice must be non-empty");
+    {
+        let mut coverage = db
+            .rollup_slice_coverage
+            .get_mut(&(project.clone(), "otel_logs_and_spans".to_owned(), tier.clone(), covering_start, covering_end))
+            .expect("the wider publication must have coverage evidence");
+        assert!(coverage.source_rows.is_some(), "the stale-generation case must retain a valid row witness");
+        assert!(Database::rollup_generation_current("otel_logs_and_spans", &tier, &project, &day.to_string(), &coverage));
+        if stale_generation {
+            coverage.generation.push_str("-obsolete");
+        }
+        if !whole_witness {
+            assert!(coverage.source_rows_below.is_some(), "the bounded cases must carry bounded evidence");
+            coverage.source_rows = None;
+        }
+    }
 
     // A unit STRICTLY INSIDE the covering slice, and it must CONTAIN the fixture's
     // noon span. A narrower slice with no rows aggregates to nothing and reaches no
@@ -2154,6 +2558,11 @@ async fn a_slice_covered_by_a_wider_file_settles_without_scanning() -> Result<()
         queued.is_empty() || queued.contains(&(covering_start, covering_end)),
         "a rebuild must target the COVERING slice, never the contained one; got {queued:?}"
     );
+    assert_eq!(
+        queued.contains(&(covering_start, covering_end)),
+        stale_generation || (!whole_witness && !bounded_witness),
+        "only a current generation with an enabled matching witness can retire the covering repair"
+    );
 
     // The unit must actually have TAKEN the covered-by-wider path. Without this the
     // test passes on a fixture that never reaches it, which is exactly how the first
@@ -2169,7 +2578,23 @@ async fn a_slice_covered_by_a_wider_file_settles_without_scanning() -> Result<()
         objects_before,
         "a covered unit must not reach the WRITER — an uncommitted parquet upload is the orphan this check exists to avoid"
     );
-    let _ = day;
+    if !stale_generation && whole_witness {
+        rewrite_tier_files(&tier_ref, "-obsolete-output", |add| {
+            add.tags
+                .as_mut()
+                .expect("published output has tags")
+                .insert(crate::maintenance_coordinator::TAG_GENERATION.to_owned(), Some("obsolete-output".to_owned()));
+        })
+        .await?;
+        let objects_after_replacement = tier_object_count(&db, &tier_ref).await;
+        db.journal().enqueue(key.clone(), 0, 1024, 0);
+        assert!(db.run_coordinator_rollup_selected(crate::database::maintain::TaskSelection::Exact(&key)).await?);
+        assert!(
+            pending_tier_slices(&db, &project, &tier).iter().any(|slice| (slice.start_micros, slice.end_micros) == (covering_start, covering_end)),
+            "current cached evidence cannot retire repair when the live output has a different generation"
+        );
+        assert_eq!(tier_object_count(&db, &tier_ref).await, objects_after_replacement, "output mismatch must queue repair without writing parquet");
+    }
     Ok(())
 }
 
@@ -2178,6 +2603,191 @@ async fn tier_object_count(_db: &Database, table_ref: &Arc<RwLock<DeltaTable>>) 
     use futures::StreamExt;
     let store = table_ref.read().await.log_store().object_store(None);
     store.list(None).filter(|entry| futures::future::ready(entry.is_ok())).count().await
+}
+
+#[derive(Clone, Copy)]
+enum RollupOutputDamage {
+    Missing,
+    ObsoleteGeneration,
+    MismatchedFingerprint(&'static str),
+    UntaggedCopy,
+    UntaggedPrefix,
+    PartialOutput,
+    PartialOutputAfterNoop,
+}
+
+#[test_case(RollupOutputDamage::Missing ; "missing output")]
+#[test_case(RollupOutputDamage::ObsoleteGeneration ; "obsolete output generation")]
+#[test_case(RollupOutputDamage::MismatchedFingerprint(crate::maintenance_coordinator::TAG_SOURCE_FINGERPRINT) ; "same generation with a different source fingerprint")]
+#[test_case(RollupOutputDamage::MismatchedFingerprint(crate::maintenance_coordinator::TAG_CONTENT_FINGERPRINT) ; "same generation with a different input content fingerprint")]
+#[test_case(RollupOutputDamage::UntaggedCopy ; "untagged copy beside valid output")]
+#[test_case(RollupOutputDamage::UntaggedPrefix ; "untagged old output before the first current source row")]
+#[test_case(RollupOutputDamage::PartialOutput ; "recovery must not certify surviving fragments of a publication")]
+#[test_case(RollupOutputDamage::PartialOutputAfterNoop ; "output completeness must survive a noop completion")]
+#[tokio::test]
+async fn the_census_repairs_missing_output_despite_unchanged_source_evidence(damage: RollupOutputDamage) -> Result<()> {
+    let (db, project, day, tier) = published_base_day(rollup_backfill_config("census-missing-output", 35), "missing-output").await?;
+    let db = Arc::new(db);
+    let mut ctx = Arc::clone(&db).create_session_context();
+    db.setup_session_context(&mut ctx)?;
+    let state = ctx.state();
+    let lo = midnight_micros(day);
+    let hi = lo + crate::maintenance_coordinator::DAY_MICROS;
+    let sql = format!(
+        "SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id='{project}' AND timestamp >= to_timestamp_micros({lo}) AND timestamp < to_timestamp_micros({hi})"
+    );
+    let plan = state.optimize(&state.create_logical_plan(&sql).await?)?;
+    let accepted = db
+        .rollup_sql(&plan, &state)
+        .await
+        .map_err(|reason| anyhow::anyhow!("fresh output did not route: {}", reason.label()))?
+        .expect("fresh output must route before the mutation");
+    assert!(db.rollup_ticket_current(&accepted.ticket).await, "the fresh route ticket must pass its execution recheck");
+    db.mark_replay_complete();
+    retire_all_tasks(&db);
+    db.plan_rollup_backfill().await?;
+    assert!(pending_tier_slices(&db, &project, &tier).is_empty(), "the freshly published base day needs no repair");
+    retire_all_tasks(&db);
+
+    let table = db.resolve_table(&project, &tier).await?;
+    let adds = live_adds(&table).await;
+    assert!(!adds.is_empty(), "the fixture must change real published output");
+    match damage {
+        RollupOutputDamage::ObsoleteGeneration => {
+            rewrite_tier_files(&table, "-obsolete-census-output", |add| {
+                add.tags
+                    .as_mut()
+                    .expect("published output has tags")
+                    .insert(crate::maintenance_coordinator::TAG_GENERATION.to_owned(), Some("obsolete-output".to_owned()));
+            })
+            .await?;
+            assert_eq!(live_adds(&table).await.len(), adds.len(), "partition presence and file count must stay unchanged");
+        }
+        RollupOutputDamage::Missing => {
+            commit_actions(&table, adds.iter().map(|add| deltalake::kernel::Action::Remove(remove_for_add(add, true))).collect()).await?;
+            assert!(live_adds(&table).await.is_empty());
+        }
+        RollupOutputDamage::MismatchedFingerprint(tag) => {
+            rewrite_tier_files(&table, "-mismatched-fingerprint", |add| {
+                let tags = add.tags.as_mut().expect("published output has tags");
+                let original = tags.get(tag).and_then(Option::as_deref).unwrap().parse::<u64>().unwrap();
+                tags.insert(tag.to_owned(), Some(original.wrapping_add(1).to_string()));
+            })
+            .await?;
+            let rewritten = live_adds(&table).await;
+            assert_eq!(rewritten.len(), adds.len(), "changed evidence must not change file count");
+            let generation = |add: &deltalake::kernel::Add| add.tags.as_ref().unwrap().get(crate::maintenance_coordinator::TAG_GENERATION).cloned().flatten();
+            assert!(rewritten.iter().all(|add| generation(add) == generation(&adds[0])), "the materialization generation must stay unchanged");
+        }
+        RollupOutputDamage::UntaggedCopy => {
+            strip_slice_tags(&table, "-untagged-census-copy", false).await?;
+            assert_eq!(live_adds(&table).await.len(), 2 * adds.len(), "both the tagged original and untagged copy must remain live");
+        }
+        RollupOutputDamage::UntaggedPrefix => {
+            strip_slice_tags(&table, "-untagged-prefix", true).await?;
+            let source = db.resolve_table(&project, "otel_logs_and_spans").await?;
+            let old_source = live_adds(&source).await;
+            commit_actions(&source, old_source.iter().map(|add| deltalake::kernel::Action::Remove(remove_for_add(add, true))).collect()).await?;
+            db.apply_rollup_hours(&project, "otel_logs_and_spans", &day.to_string(), 1 << 12)?;
+            insert_a_span(&db, &project, "later", day.and_hms_opt(18, 0, 0).unwrap().and_utc().timestamp_micros()).await?;
+            let later = db.run_unit_once("otel_logs_and_spans", &project, day, crate::maintenance_coordinator::Operation::BaseRollup, 6, 18).await?;
+            assert_eq!(later.state, Some(crate::maintenance_coordinator::TaskState::Complete));
+            assert_eq!(live_tier_files(&db, &project, &tier).await?, (2, 1), "the old noon output must remain beside the valid evening slice");
+            retire_all_tasks(&db);
+        }
+        RollupOutputDamage::PartialOutput | RollupOutputDamage::PartialOutputAfterNoop => {
+            use deltalake::writer::DeltaWriter as _;
+            insert_a_span(&db, &project, "second", day.and_hms_opt(13, 0, 0).unwrap().and_utc().timestamp_micros()).await?;
+            db.run_unit_once("otel_logs_and_spans", &project, day, crate::maintenance_coordinator::Operation::BaseRollup, 24, 0).await?;
+            let original = live_adds(&table).await;
+            let batches = ctx.sql(&format!("SELECT * FROM {tier} WHERE project_id='{project}'")).await?.collect().await?;
+            assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 2, "the publication must have two distinct aggregate rows");
+            let staging = table.read().await.clone();
+            let carried = super::carried_coverage_tags(&original).into_iter().map(|(name, value)| (name, Some(value))).collect::<HashMap<_, _>>();
+            let mut fragments = Vec::new();
+            for batch in batches {
+                for row in 0..batch.num_rows() {
+                    let mut writer = deltalake::writer::RecordBatchWriter::for_table(&staging)?;
+                    writer.write(deltalake::kernel::schema::cast_record_batch(&batch.slice(row, 1), writer.arrow_schema(), true, true)?).await?;
+                    fragments.extend(writer.flush().await?.into_iter().map(|mut add| {
+                        add.tags = Some(carried.clone());
+                        add
+                    }));
+                }
+            }
+            assert_eq!(fragments.len(), 2, "each real output file must contain one aggregate row");
+            commit_actions(
+                &table,
+                original
+                    .iter()
+                    .map(|add| deltalake::kernel::Action::Remove(remove_for_add(add, false)))
+                    .chain(fragments.iter().cloned().map(deltalake::kernel::Action::Add))
+                    .collect(),
+            )
+            .await?;
+            let immediate = db
+                .rollup_sql(&plan, &state)
+                .await
+                .map_err(|reason| anyhow::anyhow!("physical rewrite lost readable coverage: {}", reason.label()))?
+                .expect("complete physical rewrites must route before metadata recovery");
+            assert!(db.rollup_ticket_current(&immediate.ticket).await, "complete physical rewrites must pass the execution recheck");
+            let rows = ctx.sql(&immediate.sql).await?.collect().await?;
+            assert_eq!(first_i64(rows[0].column(0)), Some(2), "physical rewrites must preserve results without a recovery pass");
+            db.recover_rollup_coverage("otel_logs_and_spans").await?;
+            let healthy =
+                db.rollup_sql(&plan, &state).await.map_err(|reason| anyhow::anyhow!("{}", reason.label()))?.expect("complete split output must route");
+            let rows = ctx.sql(&healthy.sql).await?.collect().await?;
+            assert_eq!(first_i64(rows[0].column(0)), Some(2), "recovery must accept the complete physical rewrite");
+            if matches!(damage, RollupOutputDamage::PartialOutputAfterNoop) {
+                let scans = crate::observability::maintenance_stats().rollup_scan_cohorts.load(std::sync::atomic::Ordering::Relaxed);
+                let noop = db.run_unit_once("otel_logs_and_spans", &project, day, crate::maintenance_coordinator::Operation::BaseRollup, 24, 0).await?;
+                assert_eq!(noop.state, Some(crate::maintenance_coordinator::TaskState::Complete));
+                assert_eq!(
+                    crate::observability::maintenance_stats().rollup_scan_cohorts.load(std::sync::atomic::Ordering::Relaxed),
+                    scans,
+                    "the complete physical rewrite must need no source scan"
+                );
+            }
+            commit_actions(&table, vec![deltalake::kernel::Action::Remove(remove_for_add(&fragments[0], true))]).await?;
+            assert!(db.rollup_sql(&plan, &state).await.is_err(), "partial output must be rejected before recovery replaces cached proof");
+            db.rollup_coverage.clear();
+            db.rollup_slice_coverage.clear();
+            db.recover_rollup_coverage("otel_logs_and_spans").await?;
+            retire_all_tasks(&db);
+        }
+    }
+    if !matches!(damage, RollupOutputDamage::PartialOutput | RollupOutputDamage::PartialOutputAfterNoop) {
+        assert!(db.rollup_slice_coverage.iter().any(|entry| entry.key().0 == project && entry.key().2 == tier), "source evidence must remain cached");
+    }
+
+    db.plan_rollup_backfill().await?;
+    assert!(!pending_tier_slices(&db, &project, &tier).is_empty(), "unchanged source evidence cannot hide missing output from the repair queue");
+    assert!(!db.rollup_ticket_current(&accepted.ticket).await, "a previously accepted ticket cannot authorize damaged or superseded output");
+    if matches!(damage, RollupOutputDamage::UntaggedPrefix) {
+        let evening = day.and_hms_opt(18, 0, 0).unwrap().and_utc().timestamp_micros();
+        assert!(
+            pending_tier_slices(&db, &project, &tier).iter().all(|slice| !slice.overlaps(evening, hi)),
+            "repairing the old prefix must preserve valid evening coverage"
+        );
+        let rewrite =
+            db.rollup_sql(&plan, &state).await.map_err(|reason| anyhow::anyhow!("{}", reason.label()))?.expect("the valid evening slice must still route");
+        assert!(db.rollup_ticket_current(&rewrite.ticket).await, "a hybrid ticket requires only its accepted evening interval");
+        let rows = ctx.sql(&rewrite.sql).await?.collect().await?;
+        assert_eq!(first_i64(rows[0].column(0)), Some(1), "the empty source prefix must not resurrect old aggregate rows");
+    } else {
+        assert!(db.rollup_sql(&plan, &state).await.is_err(), "routing must not serve output that the census knows needs repair");
+    }
+    let repaired = db.run_unit_once("otel_logs_and_spans", &project, day, crate::maintenance_coordinator::Operation::BaseRollup, 24, 0).await?;
+    assert_eq!(repaired.state, Some(crate::maintenance_coordinator::TaskState::Complete));
+    let rewrite = db.rollup_sql(&plan, &state).await.map_err(|reason| anyhow::anyhow!("{}", reason.label()))?.expect("repaired output must route");
+    assert!(db.rollup_ticket_current(&rewrite.ticket).await, "repair must restore an executable ticket");
+    let rows = ctx.sql(&rewrite.sql).await?.collect().await?;
+    assert_eq!(
+        first_i64(rows[0].column(0)),
+        Some(if matches!(damage, RollupOutputDamage::PartialOutput | RollupOutputDamage::PartialOutputAfterNoop) { 2 } else { 1 }),
+        "repair must restore exactly the source contributions"
+    );
+    Ok(())
 }
 
 /// Publishing the contained span cannot land: `covered_by_wider` refuses it — two
@@ -3218,11 +3828,10 @@ fn pack_sort_width_follows_the_pool_and_the_box_not_a_pinned_constant() {
 fn a_tier_partition_without_usable_coverage_counts_as_missing() {
     let day = |n: u32| chrono::NaiveDate::from_ymd_opt(2026, 8, n).expect("date");
     let candidates: Vec<(String, chrono::NaiveDate)> = (14..=16).map(|d| ("p".to_owned(), day(d))).collect();
-    let partitions: HashSet<(String, chrono::NaiveDate)> = (14..=16).map(|d| ("p".to_owned(), day(d))).collect();
     // The tier holds all three days, but only 08-16 has a coverage record.
-    let readable: HashSet<(String, String)> = std::iter::once(("p".to_owned(), day(16).to_string())).collect();
+    let readable = std::iter::once(("p".to_owned(), day(16))).collect();
 
-    let missing = tiers_missing_per_day(&candidates, &[(0usize, readable_cells_only(&partitions, &readable))]);
+    let missing = tiers_missing_per_day(&candidates, &[(0usize, readable)]);
     assert_eq!(
         missing.keys().map(|(_, date)| *date).sorted().collect::<Vec<_>>(),
         vec![day(14), day(15)],
@@ -3242,6 +3851,19 @@ async fn a_date_with_only_slice_coverage_still_counts_as_missing() -> Result<()>
     let (project, source, target) = ("p".to_owned(), "otel_logs_and_spans".to_owned(), "otel_logs_and_spans_rollup_dashboard_1h_v2".to_owned());
     let day = "2026-08-14";
     let day_start = chrono::NaiveDate::parse_from_str(day, "%Y-%m-%d").unwrap().and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_micros();
+    let cell = (project.clone(), day.parse()?);
+    let spec = get_schema(&source).unwrap().rollups.iter().find(|spec| spec.table_name(&source) == target).unwrap();
+    let generation = crate::rollup::generation_id(spec, &source, &project, day, 1, None);
+    let partitions =
+        HashMap::from([((project.clone(), day.to_string()), PartitionStats { fingerprint: 1, min_ts: day_start, max_ts: day_start, rows: 1, bytes: 1 })]);
+    let gaps = || {
+        crate::rollup::uncovered(
+            day_start,
+            day_start + 86_400_000_000,
+            db.source_fresh_rollup_ranges(&source, &target, &partitions, None).remove(&cell).unwrap_or_default(),
+        )
+    };
+    assert_eq!(gaps(), [(day_start, day_start + 86_400_000_000)], "no evidence means a full-day hole");
     // One covered HOUR of the day, via slice coverage only.
     db.rollup_slice_coverage.insert(
         (project.clone(), source.clone(), target.clone(), day_start, day_start + 3_600_000_000),
@@ -3249,18 +3871,29 @@ async fn a_date_with_only_slice_coverage_still_counts_as_missing() -> Result<()>
             source_fp: 1,
             source_epoch: None,
             covered_through: day_start + 3_600_000_000,
-            generation: "g".into(),
-            source_rows: None,
+            generation: generation.clone(),
+            source_rows: Some(1),
             source_rows_below: None,
             measures: None,
             content_fp: None,
-            output_files: 0,
+            output: RollupOutputEvidence::Unknown,
         },
     );
-    assert!(
-        !db.readable_cells(&source, &target).contains(&(project.clone(), day.to_string())),
-        "an hour of slice coverage must not mark the whole day readable — the reader will refuse the other 23 hours"
-    );
+    assert_eq!(gaps(), [(day_start + 3_600_000_000, day_start + 86_400_000_000)], "one proven hour leaves 23 hours missing");
+    let (_, mut proof) = db.rollup_slice_coverage.remove(&(project.clone(), source.clone(), target.clone(), day_start, day_start + 3_600_000_000)).unwrap();
+    for (start, end) in [(day_start, day_start + 1_800_000_000), (day_start + 1_800_000_000, day_start + 3_600_000_000)] {
+        proof.covered_through = end;
+        db.rollup_slice_coverage.insert((project.clone(), source.clone(), target.clone(), start, end), proof.clone());
+        let expected_start = if start == day_start { day_start } else { end };
+        assert_eq!(gaps(), [(expected_start, day_start + 86_400_000_000)], "only a complete bucket proves coverage");
+    }
+    for rows in [None, Some(2), Some(1)] {
+        for mut slice in db.rollup_slice_coverage.iter_mut() {
+            slice.source_rows = rows;
+        }
+        let expected_start = if rows == Some(1) { day_start + 3_600_000_000 } else { day_start };
+        assert_eq!(gaps(), [(expected_start, day_start + 86_400_000_000)], "unknown or changed source rows cannot prove coverage");
+    }
     // Whole-day coverage IS readable.
     db.rollup_coverage.insert(
         (project.clone(), source.clone(), target.clone(), day.to_string()),
@@ -3268,15 +3901,17 @@ async fn a_date_with_only_slice_coverage_still_counts_as_missing() -> Result<()>
             source_fp: 1,
             source_epoch: Some(0),
             covered_through: day_start + 86_400_000_000,
-            generation: "g".into(),
+            generation,
             source_rows: None,
             source_rows_below: None,
             measures: None,
             content_fp: None,
-            output_files: 0,
+            output: RollupOutputEvidence::Unknown,
         },
     );
-    assert!(db.readable_cells(&source, &target).contains(&(project, day.to_string())));
+    assert!(gaps().is_empty(), "a current day proof covers the whole day");
+    db.rollup_source_epochs.insert((project.clone(), source.clone(), day.to_string()), 1);
+    assert_eq!(gaps(), [(day_start + 3_600_000_000, day_start + 86_400_000_000)], "a stale day proof must not hide historical holes");
     Ok(())
 }
 
@@ -5174,8 +5809,10 @@ fn a_rollup_resumes_only_when_the_source_held_still_and_nothing_else_covers_the_
             rows: 5,
             source_rows,
             source_rows_below: None,
+            evidence: Some(crate::maintenance_coordinator::PublicationEvidence { content_fp: 7, measures: Vec::new() }),
         },
         source_rows,
+        target: None,
         date: "2026-08-24".into(),
     };
     let intent = |targets: &[&str], source_rows: Option<u64>| super::StagedIntent {
@@ -5186,35 +5823,85 @@ fn a_rollup_resumes_only_when_the_source_held_still_and_nothing_else_covers_the_
     let inside = live(&[("in1", Some((1_000, 2_000)))]);
     let ok = intent(&["in1"], Some(100));
 
-    assert_eq!(super::classify_rollup_resume(&ok, "logs", 100_000, &inside, Some(100)), Commit);
+    assert_eq!(super::classify_rollup_resume(&ok, "logs", 100_000, &inside, Some(100), 7), Commit);
     // A repair/dedup entry carries no rollup evidence and must never be
     // committed by this path.
     let repair = resume_intent(&["in1"], vec![resume_add("out1", 5)]);
-    assert_eq!(super::classify_rollup_resume(&repair, "logs", 100_000, &inside, Some(100)), Skip);
+    assert_eq!(super::classify_rollup_resume(&repair, "logs", 100_000, &inside, Some(100), 7), Skip);
     // The source moved: the read path would refuse this slice as
     // `stale_coverage`, so committing it risks a wrong number for nothing.
-    assert_eq!(super::classify_rollup_resume(&ok, "logs", 100_000, &inside, Some(101)), SourceMoved);
+    assert_eq!(super::classify_rollup_resume(&ok, "logs", 100_000, &inside, Some(101), 7), SourceMoved);
     // No witness on either side is unverifiable, which is NOT the same as
     // verified — the rule the read path applies to a witness-less slice.
-    assert_eq!(super::classify_rollup_resume(&intent(&["in1"], None), "logs", 100_000, &inside, Some(100)), SourceMoved);
-    assert_eq!(super::classify_rollup_resume(&ok, "logs", 100_000, &inside, None), SourceMoved);
+    assert_eq!(super::classify_rollup_resume(&intent(&["in1"], None), "logs", 100_000, &inside, Some(100), 7), SourceMoved);
+    assert_eq!(super::classify_rollup_resume(&ok, "logs", 100_000, &inside, None, 7), SourceMoved);
     // A live file overlapping this slice that the staged output does NOT
     // replace would stay live beside it and be SUMMED with it. An untagged
     // file (`slice: None`) claims no range and cannot double-count.
     let overlapping = live(&[("in1", Some((1_000, 2_000))), ("other", Some((1_500, 2_500)))]);
-    assert_eq!(super::classify_rollup_resume(&ok, "logs", 100_000, &overlapping, Some(100)), WouldDoubleCount);
+    assert_eq!(super::classify_rollup_resume(&ok, "logs", 100_000, &overlapping, Some(100), 7), WouldDoubleCount);
     let adjacent = live(&[("in1", Some((1_000, 2_000))), ("later", Some((2_000, 3_000)))]);
-    assert_eq!(super::classify_rollup_resume(&ok, "logs", 100_000, &adjacent, Some(100)), Commit, "slice ends are exclusive; touching is not overlapping");
+    assert_eq!(super::classify_rollup_resume(&ok, "logs", 100_000, &adjacent, Some(100), 7), Commit, "slice ends are exclusive; touching is not overlapping");
     let untagged = live(&[("in1", Some((1_000, 2_000))), ("legacy", None)]);
-    assert_eq!(super::classify_rollup_resume(&ok, "logs", 100_000, &untagged, Some(100)), Commit);
+    assert_eq!(super::classify_rollup_resume(&ok, "logs", 100_000, &untagged, Some(100), 7), Commit);
     // An input that left the snapshot entirely.
-    assert_eq!(super::classify_rollup_resume(&ok, "logs", 100_000, &live(&[]), Some(100)), Stale);
+    assert_eq!(super::classify_rollup_resume(&ok, "logs", 100_000, &live(&[]), Some(100), 7), Stale);
     // Our own output is live ⇒ the commit landed and only the journal
     // publication was lost. The caller publishes; it must never re-commit.
     let landed = live(&[("out1", Some((1_000, 2_000)))]);
-    assert_eq!(super::classify_rollup_resume(&ok, "logs", 100_000, &landed, Some(100)), AlreadyLanded);
+    assert_eq!(super::classify_rollup_resume(&ok, "logs", 100_000, &landed, Some(100), 7), AlreadyLanded);
+    let mut legacy = ok.clone();
+    legacy.rollup.as_mut().unwrap().publication.evidence = None;
+    for files in [&inside, &landed] {
+        assert_eq!(super::classify_rollup_resume(&ok, "logs", 100_000, files, Some(100), 8), SourceMoved);
+        assert_eq!(super::classify_rollup_resume(&legacy, "logs", 100_000, files, Some(100), 7), SourceMoved);
+    }
     // Ownership, not age — the same ladder `classify_resume` obeys.
-    assert_ownership_ladder(&ok, |entry: &super::StagedIntent| super::classify_rollup_resume(entry, "logs", 100_000, &inside, Some(100)));
+    assert_ownership_ladder(&ok, |entry: &super::StagedIntent| super::classify_rollup_resume(entry, "logs", 100_000, &inside, Some(100), 7));
+    let mut encoded = serde_json::to_value(&ok).expect("intent serialization");
+    assert_eq!(serde_json::from_value::<super::StagedIntent>(encoded.clone()).expect("current reader"), ok);
+    assert!(
+        serde_json::from_value::<super::RollupResume>(encoded["rollup"].clone()).is_err(),
+        "the pre-versioned decoder must reject new intent evidence, not silently ignore it"
+    );
+    for unsupported in [serde_json::json!({"v3": ok.rollup}), serde_json::json!({"v2": {}})] {
+        let mut rejected = encoded.clone();
+        rejected["rollup"] = unsupported;
+        assert!(serde_json::from_value::<super::StagedIntent>(rejected.clone()).is_err(), "unknown or incomplete evidence cannot become a legacy intent");
+        let manifest = format!("{rejected}\n{encoded}\n");
+        assert_eq!(super::parse_staged_intents(&manifest), vec![ok.clone()], "a rejected record must not hide the next valid record");
+    }
+    encoded["rollup"] = serde_json::to_value(ok.rollup.as_ref().expect("rollup body")).expect("legacy layout");
+    assert_eq!(serde_json::from_value::<super::StagedIntent>(encoded).expect("legacy reader compatibility"), ok);
+}
+
+#[test]
+fn rollup_target_fingerprints_ignore_order_but_detect_metadata_changes() -> Result<()> {
+    let mut first = resume_add("a.parquet", 1);
+    first.tags = Some([("a".to_owned(), Some("1".to_owned())), ("b".to_owned(), Some("2".to_owned()))].into_iter().collect());
+    let second = resume_add("b.parquet", 2);
+    let fingerprint = super::rollup_target_fingerprint([&first, &second]);
+    let replayed = serde_json::from_slice::<deltalake::kernel::Add>(&serde_json::to_vec(&first)?)?;
+    assert_eq!(super::rollup_target_fingerprint([&second, &replayed]), fingerprint, "file and map iteration order cannot invalidate persisted evidence");
+    let changes: [fn(&mut deltalake::kernel::Add); 6] = [
+        |add| add.path.push_str("-changed"),
+        |add| add.size += 1,
+        |add| add.modification_time += 1,
+        |add| add.stats = None,
+        |add| {
+            add.partition_values.insert("project_id".to_owned(), Some("other".to_owned()));
+        },
+        |add| {
+            add.tags.get_or_insert_default().insert("a".to_owned(), Some("changed".to_owned()));
+        },
+    ];
+    for (index, change) in changes.into_iter().enumerate() {
+        let mut changed = first.clone();
+        change(&mut changed);
+        assert_ne!(super::rollup_target_fingerprint([&changed, &second]), fingerprint, "metadata change {index} must invalidate the proof");
+    }
+    assert_ne!(super::rollup_target_fingerprint([&first]), fingerprint, "file removal must invalidate the proof");
+    Ok(())
 }
 
 /// The Add stats column list must be the narrow prune set, not the whole schema, and must never
@@ -7742,10 +8429,14 @@ async fn a_clean_batch_probe_certifies_the_whole_date() -> Result<()> {
 /// A sealed date with NO queued dirty bins still gets certified — a scan only sheds
 /// `DedupExec` when EVERY date it reads is granted, so an empty queue must not make
 /// a date permanently unprovable.
+#[test_case(2 ; "recent sealed data")]
+#[test_case(21 ; "retained data beyond the old discovery window")]
+#[test_case(120 ; "older retained data uses bounded certification")]
 #[tokio::test]
-async fn a_sealed_date_with_no_queued_bins_is_still_certified() -> Result<()> {
+async fn a_sealed_date_with_no_queued_bins_is_still_certified(days_ago: i64) -> Result<()> {
     let (db, project) = dirty_bin_db("certify-sealed").await?;
-    let (day, base) = sealed_noon();
+    let day = Utc::now().date_naive() - chrono::Duration::days(days_ago);
+    let base = day.and_hms_opt(12, 0, 0).unwrap().and_utc().timestamp_micros();
     insert_otel_ts(&db, &project, "solo", "only", base, true).await?;
     let table = otel_unified_table(&db).await;
 
@@ -7753,6 +8444,15 @@ async fn a_sealed_date_with_no_queued_bins_is_still_certified() -> Result<()> {
     db.dedup_dirty_bins.clear();
     let key = (project.clone(), "otel_logs_and_spans".to_owned(), day.to_string());
     assert!(db.dedup_clean_fp.get(&key).is_none(), "and nothing is certified yet");
+    assert!(
+        db.uncertified_window_dates(&*table.read().await, "otel_logs_and_spans", std::time::Instant::now()).is_empty(),
+        "discovery must not admit retained dates after the shared maintenance deadline"
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    assert!(
+        db.uncertified_window_dates(&*table.read().await, "otel_logs_and_spans", deadline).contains(&(project.clone(), day.to_string())),
+        "every retained sealed date must remain discoverable after legacy proof rejection"
+    );
 
     drain_dirty_bins_ok(&db, &table).await?;
 
@@ -7761,7 +8461,7 @@ async fn a_sealed_date_with_no_queued_bins_is_still_certified() -> Result<()> {
     // so its fingerprint moves and the grant is refused by construction.
     let today = Utc::now().date_naive().to_string();
     assert!(
-        !db.uncertified_window_dates(&*table.read().await, "otel_logs_and_spans").iter().any(|(_, date)| *date == today),
+        !db.uncertified_window_dates(&*table.read().await, "otel_logs_and_spans", deadline).iter().any(|(_, date)| *date == today),
         "today is never a certification candidate"
     );
     Ok(())
@@ -7781,14 +8481,15 @@ async fn a_date_probed_dirty_is_not_reprobed_until_its_files_change() -> Result<
     let key = (project.clone(), "otel_logs_and_spans".to_owned(), day.to_string());
 
     let want = (project.clone(), day.to_string());
-    let candidate = async || db.uncertified_window_dates(&*table.read().await, "otel_logs_and_spans").contains(&want);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let candidate = async || db.uncertified_window_dates(&*table.read().await, "otel_logs_and_spans", deadline).contains(&want);
     assert!(candidate().await, "an unexamined dup-bearing date is a candidate");
 
-    let files = {
+    let fingerprint = {
         let guard = table.read().await;
-        Database::partition_files_by_pid(&guard, &format!("date={day}"))?.remove(&key.0).unwrap_or_default()
+        Database::logical_count_partition_snapshot(&guard, &key.0, &day.to_string())?.0
     };
-    db.dedup_probe_declined.insert(key.clone(), partition_file_fp(&files));
+    db.dedup_probe_declined.insert(key.clone(), fingerprint);
     assert!(!candidate().await, "and is skipped once declined at that exact file set");
 
     // A commit moves the fingerprint, so it must be examined again.
@@ -7805,7 +8506,7 @@ async fn certification_candidates_start_with_the_busiest_project() -> Result<()>
     let (db, _) = dirty_bin_db("certify-order").await?;
     let (busy, quiet) = (format!("busy_{}", uuid::Uuid::new_v4().simple()), format!("quiet_{}", uuid::Uuid::new_v4().simple()));
     // `quiet` has ONE date (nearest to done); `busy` has three and more files on each.
-    for (project, days) in [(&quiet, vec![2i64]), (&busy, vec![1, 3, 4])] {
+    for (project, days) in [(&quiet, vec![2i64]), (&busy, vec![1, 3, 4, 90])] {
         for back in days {
             let ts = (Utc::now() - chrono::Duration::days(back)).date_naive().and_hms_opt(12, 0, 0).unwrap().and_utc().timestamp_micros();
             // Two inserts on the busy project's dates ⇒ strictly more FILES, the
@@ -7816,13 +8517,16 @@ async fn certification_candidates_start_with_the_busiest_project() -> Result<()>
         }
     }
     let table = otel_unified_table(&db).await;
-    let got = db.uncertified_window_dates(&*table.read().await, "otel_logs_and_spans");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let got = db.uncertified_window_dates(&*table.read().await, "otel_logs_and_spans", deadline);
 
-    let ours: Vec<&String> = got.iter().map(|(project, _)| project).filter(|p| **p == busy || **p == quiet).collect();
+    let historical = (Utc::now().date_naive() - chrono::Duration::days(90)).to_string();
+    let ours: Vec<&String> = got.iter().filter(|(_, date)| *date != historical).map(|(project, _)| project).filter(|p| **p == busy || **p == quiet).collect();
     let first_quiet = ours.iter().position(|p| ***p == quiet);
     let last_busy = ours.iter().rposition(|p| ***p == busy);
     assert!(last_busy.is_some() && first_quiet.is_some(), "both projects have uncertified dates in the window");
     assert!(last_busy < first_quiet, "the BUSIEST project must be finished before a quiet one is started: {ours:?}");
+    assert_eq!(got.last(), Some(&(busy, historical)), "historical proof discovery must follow all recent candidates");
     Ok(())
 }
 

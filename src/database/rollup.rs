@@ -5,6 +5,118 @@
 
 use super::*;
 
+use datafusion::physical_plan::ExecutionPlan;
+
+/// Release oversized backing buffers before a rollup sort charges its input.
+#[derive(Debug)]
+struct CompactRollupSortInput(Arc<dyn ExecutionPlan>);
+
+impl datafusion::physical_plan::DisplayAs for CompactRollupSortInput {
+    fn fmt_as(&self, _: datafusion::physical_plan::DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "CompactRollupSortInput")
+    }
+}
+
+impl ExecutionPlan for CompactRollupSortInput {
+    fn name(&self) -> &'static str {
+        "CompactRollupSortInput"
+    }
+    fn properties(&self) -> &Arc<datafusion::physical_plan::PlanProperties> {
+        self.0.properties()
+    }
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.0]
+    }
+    fn maintains_input_order(&self) -> Vec<bool> {
+        vec![true]
+    }
+    fn with_new_children(self: Arc<Self>, children: Vec<Arc<dyn ExecutionPlan>>) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
+        let [input]: [Arc<dyn ExecutionPlan>; 1] =
+            children.try_into().map_err(|_| datafusion::common::DataFusionError::Internal("CompactRollupSortInput requires one child".into()))?;
+        Ok(Arc::new(Self(input)))
+    }
+    fn execute(
+        &self, partition: usize, context: Arc<datafusion::execution::TaskContext>,
+    ) -> datafusion::common::Result<datafusion::physical_plan::SendableRecordBatchStream> {
+        use futures::TryStreamExt;
+        let stream = self.0.execute(partition, context)?.map_ok(crate::write::mem_buffer::compact_batch);
+        Ok(datafusion::physical_plan::coop::make_cooperative(Box::pin(datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(self.schema(), stream))))
+    }
+}
+
+#[derive(Debug)]
+struct CompactRollupSortInputs;
+
+/// Keep downstream spill workspace available while the sort chooses its merge fan-in.
+#[derive(Debug)]
+struct RollupSortHeadroom(Arc<dyn ExecutionPlan>);
+
+impl datafusion::physical_plan::DisplayAs for RollupSortHeadroom {
+    fn fmt_as(&self, _: datafusion::physical_plan::DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "RollupSortHeadroom")
+    }
+}
+
+impl ExecutionPlan for RollupSortHeadroom {
+    fn name(&self) -> &'static str {
+        "RollupSortHeadroom"
+    }
+    fn properties(&self) -> &Arc<datafusion::physical_plan::PlanProperties> {
+        self.0.properties()
+    }
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.0]
+    }
+    fn maintains_input_order(&self) -> Vec<bool> {
+        vec![true]
+    }
+    fn with_new_children(self: Arc<Self>, children: Vec<Arc<dyn ExecutionPlan>>) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
+        let [input]: [Arc<dyn ExecutionPlan>; 1] =
+            children.try_into().map_err(|_| datafusion::common::DataFusionError::Internal("RollupSortHeadroom requires one child".into()))?;
+        Ok(Arc::new(Self(input)))
+    }
+    fn execute(
+        &self, partition: usize, context: Arc<datafusion::execution::TaskContext>,
+    ) -> datafusion::common::Result<datafusion::physical_plan::SendableRecordBatchStream> {
+        use datafusion::execution::memory_pool::MemoryConsumer;
+        use futures::TryStreamExt;
+        let headroom = MemoryConsumer::new("RollupSortHeadroom").register(context.memory_pool());
+        headroom.try_grow(context.session_config().options().execution.sort_spill_reservation_bytes)?;
+        let stream = self.0.execute(partition, context)?;
+        let stream = futures::stream::try_unfold((stream, Some(headroom)), |(mut stream, headroom)| async move {
+            let batch = stream.try_next().await?;
+            // The blocking sort has chosen its final merge before its first batch.
+            drop(headroom);
+            Ok(batch.map(|batch| (batch, (stream, None))))
+        });
+        Ok(Box::pin(datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(self.schema(), stream)))
+    }
+}
+
+impl datafusion::physical_optimizer::PhysicalOptimizerRule for CompactRollupSortInputs {
+    fn name(&self) -> &str {
+        "CompactRollupSortInputs"
+    }
+    fn schema_check(&self) -> bool {
+        true
+    }
+    fn optimize(&self, plan: Arc<dyn ExecutionPlan>, _: &datafusion::common::config::ConfigOptions) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
+        use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
+        plan.transform_up(|node| {
+            let Some(sort) = node.downcast_ref::<datafusion::physical_plan::sorts::sort::SortExec>() else {
+                return Ok(Transformed::no(node));
+            };
+            if sort.input().is::<CompactRollupSortInput>() {
+                return Ok(Transformed::no(node));
+            }
+            let input = Arc::new(CompactRollupSortInput(Arc::clone(sort.input())));
+            let sort = node.with_new_children(vec![input])?;
+            Ok(Transformed::yes(Arc::new(RollupSortHeadroom(sort)) as Arc<dyn ExecutionPlan>))
+        })
+        .data()
+    }
+}
+
 /// Nice value for maintenance runtime threads. Positive = lower priority, so the
 /// kernel schedules the pgwire runtime ahead of compaction whenever both are
 /// runnable. 5 is a clear preference without starving maintenance outright.
@@ -117,6 +229,12 @@ impl Database {
         if projects.is_empty() {
             return Err(crate::rollup::MissReason::NotBuilt);
         }
+        let target_table = self.resolve_table(&lookup_project, &route.target).await.map_err(|_| crate::rollup::MissReason::IncompleteCoverage)?;
+        let output = {
+            let table = target_table.read().await;
+            self.rollup_output_coverage(&route.source, (&route.target, &table, &lookup_project), &fingerprints)
+                .map_err(|_| crate::rollup::MissReason::IncompleteCoverage)?
+        };
         // Buffered rows are absent from every rollup partition; the earliest project's bound
         // governs, and everything at or above it is read raw.
         let buffered = projects
@@ -126,6 +244,7 @@ impl Database {
         let mut generations = Vec::with_capacity(dates.len());
         let mut ticket = Vec::with_capacity(dates.len());
         let mut slice_ticket = Vec::new();
+        let mut accepted_output = maintain::RollupOutputCoverage::default();
         let mut miss = None;
         // Recorded on the way out, not at the gates: `dml.rs` already counts a total decline.
         let mut measure_declined = false;
@@ -136,6 +255,7 @@ impl Database {
         for project in &projects {
             let mut covered: Vec<(i64, i64)> = Vec::new();
             for date in &dates {
+                let day = *date;
                 let date = date.to_string();
                 let key = (project.clone(), route.source.clone(), route.target.clone(), date.clone());
                 let day_start = date_start_micros(&date).ok_or(crate::rollup::MissReason::IncompleteCoverage)?;
@@ -153,7 +273,7 @@ impl Database {
                 };
                 let source_fp = stats_of(&fingerprints, project, &date).map_or(0, |stats| stats.fingerprint);
                 let source_epoch = self.rollup_source_epochs.get(&(project.clone(), route.source.clone(), date.clone())).map_or(0, |entry| *entry.value());
-                let moved = coverage.source_fp != source_fp || coverage.source_epoch != Some(source_epoch);
+                let moved = !coverage.matches_day(source_fp, source_epoch);
                 if moved {
                     match coverage.source_fp != source_fp {
                         true => metrics::counter!(crate::database::scan_metric_names::ROLLUP_STALE_FP_MOVED).increment(1),
@@ -175,8 +295,21 @@ impl Database {
                     miss = miss.or(Some(crate::rollup::MissReason::NotBuilt));
                     continue;
                 }
-                covered.push((day_start, end));
-                generations.push((project.clone(), date.clone(), coverage.generation.clone()));
+                let proven = intersect_ranges(&[(day_start, end)], output.ranges(project, day, &coverage));
+                if proven.is_empty() {
+                    miss = miss.or(Some(crate::rollup::MissReason::IncompleteCoverage));
+                    continue;
+                }
+                covered.extend(proven.iter().copied());
+                accepted_output.record(project, day, &coverage, &proven);
+                if coverage.output != RollupOutputEvidence::Empty {
+                    generations.extend(proven.into_iter().map(|range| crate::rollup::GenerationRange {
+                        project: project.clone(),
+                        date: date.clone(),
+                        generation: coverage.generation.clone(),
+                        range,
+                    }));
+                }
                 ticket.push((key, source_fp, source_epoch, coverage.generation.clone()));
             }
             // Per date: a date is readable from the tier only if every slice covering it
@@ -192,6 +325,7 @@ impl Database {
                 })
                 .into_group_map();
             for (date, slices) in by_date {
+                let day = chrono::NaiveDate::parse_from_str(&date, "%Y-%m-%d").map_err(|_| crate::rollup::MissReason::IncompleteCoverage)?;
                 let current = stats_of(&fingerprints, project, &date).and_then(|stats| u64::try_from(stats.rows).ok());
                 // Per slice, not all-or-nothing over the date: the witness states the WHOLE
                 // partition's row count, so slices agreeing with it are independently current.
@@ -200,7 +334,7 @@ impl Database {
                 let mut fresh = Vec::with_capacity(slices.len());
                 let mut stale = Vec::new();
                 for (key, coverage) in slices {
-                    if crate::rollup::slice_coverage_agrees(&[coverage.source_rows], current) {
+                    if coverage.matches_slice(current, None) {
                         fresh.push((key, coverage));
                         continue;
                     }
@@ -211,9 +345,7 @@ impl Database {
                     // move. The per-file pass is loaded at most once per route call and
                     // only on this path, so a day with no stale-looking slice never
                     // pays for it.
-                    if self.config.maintenance.timefusion_rollup_bounded_witness
-                        && let Some(witness_below) = coverage.source_rows_below
-                    {
+                    if self.config.maintenance.timefusion_rollup_bounded_witness && coverage.source_rows_below.is_some() {
                         if file_rows.is_none() {
                             let table = source_table.read().await;
                             let version = table.version().unwrap_or(u64::MAX);
@@ -229,7 +361,7 @@ impl Database {
                         let files = file_rows
                             .as_ref()
                             .and_then(|map| map.get(&(project.clone(), date.clone())).or_else(|| map.get(&("default".to_string(), date.clone()))));
-                        if files.is_some_and(|files| crate::rollup::rows_below(files, coverage.covered_through) == Some(witness_below)) {
+                        if files.is_some_and(|files| coverage.matches_slice(current, crate::rollup::rows_below(files, coverage.covered_through))) {
                             metrics::counter!(scan_metric_names::ROLLUP_WITNESS_BOUNDED_RESCUED).increment(1);
                             fresh.push((key, coverage));
                             continue;
@@ -253,8 +385,21 @@ impl Database {
                         miss = miss.or(Some(reason));
                         continue;
                     }
-                    covered.push((key.3, key.4));
-                    generations.push((project.clone(), date.clone(), coverage.generation.clone()));
+                    let proven = intersect_ranges(&[(key.3, key.4)], output.ranges(project, day, &coverage));
+                    if proven.is_empty() {
+                        miss = miss.or(Some(crate::rollup::MissReason::IncompleteCoverage));
+                        continue;
+                    }
+                    covered.extend(proven.iter().copied());
+                    accepted_output.record(project, day, &coverage, &proven);
+                    if coverage.output != RollupOutputEvidence::Empty {
+                        generations.extend(proven.into_iter().map(|range| crate::rollup::GenerationRange {
+                            project: project.clone(),
+                            date: date.clone(),
+                            generation: coverage.generation.clone(),
+                            range,
+                        }));
+                    }
                     slice_ticket.push((key, coverage.source_fp, coverage.generation.clone()));
                 }
             }
@@ -274,8 +419,7 @@ impl Database {
         };
         // A range is read from the rollup only where every covered project proved it.
         let covered = covered_projects.into_iter().map(|(_, r)| r).reduce(|left, right| intersect_ranges(&left, &right)).unwrap_or_default();
-        generations.sort_unstable();
-        generations.dedup();
+        let mut generations = crate::rollup::merge_generation_ranges(generations);
         // A buffered row is missing from EVERY rollup partition, so this caps the whole set.
         let horizon = buffered.unwrap_or(route.hi);
         if let Some(project) = raw_only.first()
@@ -316,12 +460,11 @@ impl Database {
         // Drop dates no interval actually reads: keeping them in the ticket would let an
         // unrelated partition's churn invalidate a valid plan.
         let reads = |date: &str| interiors.iter().any(|interval| date_intersects(date, *interval));
-        generations.retain(|(_, date, _)| reads(date));
+        generations.retain(|generation| interiors.iter().any(|(start, end)| generation.range.0 < *end && generation.range.1 > *start));
         ticket.retain(|((_, _, _, date), ..)| reads(date));
         slice_ticket.retain(|((_, _, _, start, end), ..)| interiors.iter().any(|(covered_start, covered_end)| *start < *covered_end && *end > *covered_start));
-        if generations.is_empty() {
-            return Err(if measure_declined { crate::rollup::MissReason::MeasureNotStored } else { miss.unwrap_or(crate::rollup::MissReason::NotBuilt) });
-        }
+        accepted_output.restrict_to(&interiors);
+        // Proven empty ranges contribute coverage and tickets, but authorize no output.
         if measure_declined {
             crate::observability::record_rollup_miss(crate::rollup::MissReason::MeasureNotStored);
         }
@@ -331,7 +474,11 @@ impl Database {
             grain: format!("{}us", route.grain),
             mode,
             matched: route.matched,
-            ticket: RollupReadTicket { dates: ticket, slices: slice_ticket },
+            ticket: RollupReadTicket {
+                dates: ticket,
+                slices: slice_ticket,
+                output: RollupOutputTicket { source: route.source, target: route.target, lookup_project, accepted: accepted_output },
+            },
         }))
     }
 
@@ -347,10 +494,23 @@ impl Database {
                 return false;
             }
         }
-        ticket
+        if !ticket
             .slices
             .iter()
             .all(|(key, source_fp, generation)| self.rollup_slice_coverage.get(key).is_some_and(|c| c.source_fp == *source_fp && c.generation == *generation))
+        {
+            return false;
+        }
+        let RollupOutputTicket { source, target, lookup_project, accepted } = &ticket.output;
+        let Ok(source_table) = self.resolve_table(lookup_project, source).await else { return false };
+        let fingerprints = {
+            let table = source_table.read().await;
+            let Ok(stats) = Self::partition_stats_bounded(&table, tiebreak_of(source), &|_, _| i64::MAX) else { return false };
+            stats
+        };
+        let Ok(target_table) = self.resolve_table(lookup_project, target).await else { return false };
+        let table = target_table.read().await;
+        self.rollup_output_coverage(source, (target, &table, lookup_project), &fingerprints).is_ok_and(|live| live.contains(accepted))
     }
 
     /// Query Delta tables directly, bypassing the in-memory buffer (for testing).
@@ -373,9 +533,11 @@ impl Database {
 
     /// Session with a private spillable pool bounded by the decoded-work ceiling.
     /// Only UDFs are registered; the caller registers its own Delta provider.
-    pub(super) fn bounded_rollup_maintenance_context(&self) -> Result<datafusion::prelude::SessionContext> {
+    pub(super) fn bounded_rollup_maintenance_context(&self, batch_rows: usize) -> Result<datafusion::prelude::SessionContext> {
         let runtime = self.coordinator_runtime_env();
-        let state = build_optimize_session_state_tuned(1, runtime, Some("256"), None);
+        let state = build_optimize_session_state_tuned(1, runtime, Some(&batch_rows.to_string()), None);
+        let state =
+            datafusion::execution::SessionStateBuilder::new_from_existing(state).with_physical_optimizer_rule(Arc::new(CompactRollupSortInputs)).build();
         let mut ctx = datafusion::prelude::SessionContext::new_with_state(state);
         datafusion_functions_json::register_all(&mut ctx)?;
         self.setup_session_udfs(&mut ctx)?;
@@ -814,5 +976,229 @@ impl Database {
                 body(db, cancel).await;
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod compact_rollup_input_tests {
+    use super::*;
+    use arrow::{
+        array::{Int64Array, StringViewBuilder},
+        compute::SortOptions,
+        datatypes::DataType,
+    };
+    use datafusion::{
+        datasource::{memory::MemorySourceConfig, source::DataSourceExec},
+        physical_expr::{LexOrdering, PhysicalSortExpr, expressions::Column},
+        physical_optimizer::PhysicalOptimizerRule,
+        physical_plan::{displayable, sorts::sort::SortExec},
+    };
+    use futures::TryStreamExt;
+
+    #[tokio::test]
+    async fn rollup_spill_reader_keeps_unread_disk_bytes_charged() -> Result<()> {
+        use datafusion::{
+            execution::runtime_env::RuntimeEnvBuilder,
+            physical_plan::{
+                metrics::{ExecutionPlanMetricsSet, SpillMetrics},
+                spill::SpillManager,
+            },
+        };
+        let dir = tempfile::tempdir()?;
+        let runtime = RuntimeEnvBuilder::new()
+            .with_disk_manager_builder(super::super::write::spill_disk_builder(dir.path().to_owned(), 1).with_max_temp_directory_size(8 * 1024 * 1024))
+            .build_arc()?;
+        let batch = RecordBatch::try_from_iter([("id", Arc::new(Int64Array::from_iter_values(0..256)) as arrow::array::ArrayRef)])?;
+        let manager = SpillManager::new(Arc::clone(&runtime), SpillMetrics::new(&ExecutionPlanMetricsSet::new(), 0), batch.schema());
+        let file = manager.spill_record_batch_and_finish(&[batch.clone(), batch.clone()], "rollup reader lifetime")?.expect("two nonempty batches");
+        let bytes = runtime.disk_manager.used_disk_space();
+        assert!(bytes > 0, "the fixture must charge its real spill file");
+        let mut stream = manager.read_spill_as_stream_unbuffered(file, None)?;
+        assert_eq!(stream.try_next().await?, Some(batch), "only the first of two batches was consumed");
+        assert_eq!(runtime.disk_manager.used_disk_space(), bytes, "an open reader with an unread batch must retain its disk charge");
+        drop(stream);
+        assert_eq!(runtime.disk_manager.used_disk_space(), 0, "cancelling the reader must release its charge");
+        for path in runtime.disk_manager.temp_dir_paths() {
+            assert!(std::fs::read_dir(path)?.next().is_none(), "cancelling the reader must remove its spill file");
+        }
+        Ok(())
+    }
+
+    #[test_case::test_case(false ; "cancel during spill preparation")]
+    #[test_case::test_case(true ; "cancel during final merge")]
+    #[tokio::test]
+    async fn rollup_sort_cancellation_releases_active_spills(after_output: bool) -> Result<()> {
+        use anyhow::Context;
+        use datafusion::execution::{
+            TaskContext,
+            memory_pool::{FairSpillPool, MemoryPool, TrackConsumersPool},
+            runtime_env::RuntimeEnvBuilder,
+        };
+        const HEADROOM: usize = 64 * 1024;
+        let pool = Arc::new(TrackConsumersPool::new(FairSpillPool::new(512 * 1024), std::num::NonZeroUsize::new(4).expect("four consumers")));
+        let dir = tempfile::tempdir()?;
+        let runtime = RuntimeEnvBuilder::new()
+            .with_memory_pool(pool.clone())
+            .with_disk_manager_builder(super::super::write::spill_disk_builder(dir.path().to_owned(), 1).with_max_temp_directory_size(8 * 1024 * 1024))
+            .build_arc()?;
+        let batches = (0..128)
+            .rev()
+            .map(|part| {
+                let mut strings = StringViewBuilder::new();
+                strings.try_append_value_n("x".repeat(32), 256)?;
+                RecordBatch::try_from_iter([
+                    ("id", Arc::new(Int64Array::from_iter_values((part * 256..(part + 1) * 256).rev())) as arrow::array::ArrayRef),
+                    ("payload", Arc::new(strings.finish()) as arrow::array::ArrayRef),
+                ])
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let schema = batches[0].schema();
+        let source = Arc::new(DataSourceExec::new(Arc::new(MemorySourceConfig::try_new(&[batches], schema, None)?)));
+        let ordering = LexOrdering::new(vec![PhysicalSortExpr::new(Arc::new(Column::new("id", 0)), SortOptions::default())]).expect("one key");
+        let plan = CompactRollupSortInputs.optimize(Arc::new(SortExec::new(ordering, source)), &Default::default())?;
+        let mut config = datafusion::prelude::SessionConfig::new().with_batch_size(256);
+        config.options_mut().execution.sort_spill_reservation_bytes = HEADROOM;
+        let context = Arc::new(TaskContext::default().with_session_config(config).with_runtime(Arc::clone(&runtime)));
+        let mut stream = plan.execute(0, context)?;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            if after_output {
+                let batch = stream.try_next().await?.context("the spilling sort must produce a batch")?;
+                assert_eq!(batch.column(0).as_any().downcast_ref::<Int64Array>().expect("id array").value(0), 0);
+            } else {
+                tokio::select! {
+                    result = stream.try_next() => {
+                        result?;
+                        anyhow::bail!("sort finished before an active spill was observed");
+                    }
+                    () = async {
+                        while runtime.disk_manager.used_disk_space() == 0 {
+                            tokio::task::yield_now().await;
+                        }
+                    } => {}
+                }
+            }
+            anyhow::Ok(())
+        })
+        .await??;
+        assert!(runtime.disk_manager.used_disk_space() > 0, "cancellation must interrupt a real spill, not an in-memory sort");
+        let headroom: usize = pool.metrics().iter().filter(|consumer| consumer.name == plan.name()).map(|consumer| consumer.reserved).sum();
+        assert_eq!(headroom, if after_output { 0 } else { HEADROOM }, "headroom must transfer only after first output");
+        drop(stream);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while pool.reserved() != 0 || runtime.disk_manager.used_disk_space() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .context("cancellation must release execution and scratch reservations")?;
+        for path in runtime.disk_manager.temp_dir_paths() {
+            assert!(std::fs::read_dir(path)?.next().is_none(), "cancellation must remove physical spill files too");
+        }
+        Ok(())
+    }
+
+    #[test_case::test_case(32, 0, 512 * 1024 ; "cancel before polling")]
+    #[test_case::test_case(32, 1, 512 * 1024 ; "cancel after first batch")]
+    #[test_case::test_case(32, 3, 512 * 1024 ; "consume sorted output")]
+    #[test_case::test_case(0, 3, 512 * 1024 ; "empty input")]
+    #[test_case::test_case(32, 0, 32 * 1024 ; "headroom exceeds budget")]
+    #[tokio::test]
+    async fn rollup_sort_headroom_releases_its_reservation(rows: i64, consumed: usize, pool_bytes: usize) -> Result<()> {
+        use datafusion::execution::{
+            TaskContext,
+            memory_pool::{FairSpillPool, MemoryPool, TrackConsumersPool},
+            runtime_env::RuntimeEnvBuilder,
+        };
+        const HEADROOM: usize = 64 * 1024;
+        let pool = Arc::new(TrackConsumersPool::new(FairSpillPool::new(pool_bytes), std::num::NonZeroUsize::new(4).expect("four consumers")));
+        let runtime = RuntimeEnvBuilder::new().with_memory_pool(pool.clone()).build_arc()?;
+        let mut config = datafusion::prelude::SessionConfig::new().with_batch_size(16);
+        config.options_mut().execution.sort_spill_reservation_bytes = HEADROOM;
+        let context = Arc::new(TaskContext::default().with_session_config(config).with_runtime(runtime));
+        let batch = RecordBatch::try_from_iter([("id", Arc::new(Int64Array::from_iter_values((0..rows).rev())) as arrow::array::ArrayRef)])?;
+        let schema = batch.schema();
+        let source = Arc::new(DataSourceExec::new(Arc::new(MemorySourceConfig::try_new(&[vec![batch]], schema, None)?)));
+        let ordering = LexOrdering::new(vec![PhysicalSortExpr::new(Arc::new(Column::new("id", 0)), SortOptions::default())]).expect("one key");
+        let plan = RollupSortHeadroom(Arc::new(SortExec::new(ordering, source)));
+        let headroom = || pool.metrics().iter().filter(|consumer| consumer.name == plan.name()).map(|consumer| consumer.reserved).sum::<usize>();
+        let result = plan.execute(0, context);
+        if pool_bytes < HEADROOM {
+            assert!(matches!(result, Err(datafusion::common::DataFusionError::ResourcesExhausted(_))), "insufficient capacity must remain a typed error");
+        } else {
+            let mut stream = result?;
+            assert_eq!(headroom(), HEADROOM, "workspace must be reserved before the sort is polled");
+            let mut output = Vec::new();
+            for _ in 0..consumed {
+                let batch = stream.try_next().await?;
+                assert_eq!(headroom(), 0, "first output or EOF must release downstream workspace");
+                let Some(batch) = batch else { break };
+                output.extend(batch.column(0).as_any().downcast_ref::<Int64Array>().expect("id array").values().iter().copied());
+            }
+            assert_eq!(output, (0..i64::try_from(output.len())?).collect::<Vec<_>>(), "sorted values must survive the wrapper");
+            if consumed == 3 {
+                assert_eq!(i64::try_from(output.len())?, rows, "full consumption must preserve every row");
+            }
+            drop(stream);
+        }
+        assert_eq!(pool.reserved(), 0, "completion, cancellation, and refusal must release every reservation");
+        Ok(())
+    }
+
+    #[test_case::test_case(0 ; "drop before polling")]
+    #[test_case::test_case(1 ; "drop after a prefix")]
+    #[test_case::test_case(2 ; "consume each partition")]
+    #[tokio::test]
+    async fn compact_rollup_input_preserves_properties_and_releases_input(consumed: usize) -> Result<()> {
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("id", DataType::Int64, false),
+            arrow::datatypes::Field::new("text", DataType::Utf8View, false),
+        ]));
+        let ordering = LexOrdering::new(vec![PhysicalSortExpr::new(Arc::new(Column::new("id", 0)), SortOptions::default())]).expect("one key");
+        let (source, input_array, retained) = {
+            let batches = (0..2)
+                .map(|part| {
+                    let mut strings = StringViewBuilder::new().with_fixed_block_size(1024 * 1024);
+                    strings.try_append_value_n("longer than an inline string", 32)?;
+                    RecordBatch::try_new(
+                        Arc::clone(&schema),
+                        vec![Arc::new(Int64Array::from_iter_values(part * 32..part * 32 + 32)), Arc::new(strings.finish())],
+                    )
+                })
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let input_array = Arc::downgrade(batches[0].column(1));
+            let retained = datafusion::common::utils::memory::get_record_batch_memory_size(&batches[0]);
+            let config = MemorySourceConfig::try_new(&[batches.clone(), batches], schema, None)?.try_with_sort_information(vec![ordering.clone()])?;
+            (Arc::new(DataSourceExec::new(Arc::new(config))) as Arc<dyn ExecutionPlan>, input_array, retained)
+        };
+        let sort = Arc::new(SortExec::new(ordering, Arc::clone(&source)).with_preserve_partitioning(true));
+        let once = CompactRollupSortInputs.optimize(sort, &Default::default())?;
+        let twice = CompactRollupSortInputs.optimize(Arc::clone(&once), &Default::default())?;
+        assert_eq!(displayable(once.as_ref()).indent(false).to_string(), displayable(twice.as_ref()).indent(false).to_string(), "rule must be idempotent");
+        assert!(once.is::<RollupSortHeadroom>(), "sort output must reserve downstream workspace");
+        let wrapper = Arc::clone(once.children()[0].children()[0]);
+        assert!(wrapper.is::<CompactRollupSortInput>(), "sort input must be compacted");
+        assert!(Arc::ptr_eq(wrapper.properties(), source.properties()), "all partition and ordering properties must stay unchanged");
+        let context = Arc::new(datafusion::execution::TaskContext::default());
+        let mut streams = (0..2).map(|partition| wrapper.execute(partition, Arc::clone(&context))).collect::<datafusion::common::Result<Vec<_>>>()?;
+        drop((source, wrapper, once, twice));
+        for stream in &mut streams {
+            for part in 0..consumed {
+                let batch = stream.try_next().await?.expect("two source batches");
+                assert!(
+                    datafusion::common::utils::memory::get_record_batch_memory_size(&batch) < retained / 4,
+                    "oversized backing allocation must be released"
+                );
+                let ids = batch.column(0).as_any().downcast_ref::<Int64Array>().expect("id array");
+                assert_eq!(ids.values().as_ref(), (part as i64 * 32..part as i64 * 32 + 32).collect::<Vec<_>>(), "partition row order must survive");
+                let strings = batch.column(1).as_any().downcast_ref::<arrow::array::StringViewArray>().expect("text array");
+                assert!(strings.iter().all(|value| value == Some("longer than an inline string")), "values must survive compaction");
+            }
+            if consumed == 2 {
+                assert!(stream.try_next().await?.is_none(), "compaction must not add rows");
+            }
+        }
+        drop(streams);
+        assert!(input_array.upgrade().is_none(), "dropping streams must release source arrays even before EOF");
+        Ok(())
     }
 }

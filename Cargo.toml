@@ -180,6 +180,10 @@ harness = false
 name = "hash_histogram_sql"
 harness = false
 
+[[bench]]
+name = "rollup_work"
+harness = false
+
 [features]
 default = []
 test = []

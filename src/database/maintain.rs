@@ -4,6 +4,8 @@ use super::*;
 use anyhow::Context;
 use tap::Tap;
 
+const ROLLUP_PROOF_RETRY_MICROS: i64 = 1_000_000;
+
 #[derive(Clone, Copy)]
 pub(crate) enum TaskSelection<'a> {
     Next(crate::maintenance_coordinator::Operation),
@@ -23,6 +25,7 @@ impl TaskSelection<'_> {
 enum RollupRebuildReason {
     MissingRowWitness,
     ObsoleteGeneration,
+    UnprovenOutput,
     /// The slice HAS a witness but the partition moved under it — verifiable,
     /// and simply lost the race with ingest or dedup.
     WitnessMoved,
@@ -46,6 +49,71 @@ const DAMAGED_CELLS: &[(&str, &str)] = &[];
 
 /// One (project, date) the rollup backfill can plan.
 pub(crate) type BackfillCell = (String, chrono::NaiveDate);
+
+#[derive(Clone, Copy, Debug)]
+struct RollupOutputProof {
+    live: Option<u64>,
+    published: Option<u64>,
+    files: usize,
+    source_fp: Option<u64>,
+    content_fp: Option<u64>,
+}
+
+impl RollupOutputProof {
+    fn from_add(add: &deltalake::kernel::Add) -> Self {
+        Self {
+            live: add.deletion_vector.is_none().then(|| add_row_count(add)).flatten(),
+            published: Database::add_tag(add, crate::maintenance_coordinator::TAG_OUTPUT_ROWS).and_then(|value| value.parse().ok()),
+            files: 1,
+            source_fp: Database::add_tag(add, crate::maintenance_coordinator::TAG_SOURCE_FINGERPRINT).and_then(|value| value.parse().ok()),
+            content_fp: Database::add_tag(add, crate::maintenance_coordinator::TAG_CONTENT_FINGERPRINT).and_then(|value| value.parse().ok()),
+        }
+    }
+
+    fn merge(self, other: Self) -> Self {
+        Self {
+            live: self.live.zip(other.live).and_then(|(left, right)| left.checked_add(right)),
+            published: self.published.filter(|count| Some(*count) == other.published),
+            files: self.files.saturating_add(other.files),
+            source_fp: self.source_fp.filter(|fingerprint| Some(*fingerprint) == other.source_fp),
+            content_fp: self.content_fp.filter(|fingerprint| Some(*fingerprint) == other.content_fp),
+        }
+    }
+}
+
+/// Ephemeral output evidence from one tier snapshot, separated by generation and kind.
+#[derive(Debug, Default)]
+pub(super) struct RollupOutputCoverage {
+    populated: HashMap<(String, chrono::NaiveDate, String), Vec<(i64, i64)>>,
+    empty: HashMap<(String, chrono::NaiveDate, String), Vec<(i64, i64)>>,
+}
+
+impl RollupOutputCoverage {
+    pub(super) fn record(&mut self, project: &str, date: chrono::NaiveDate, coverage: &RollupCoverage, ranges: &[(i64, i64)]) {
+        let index = if coverage.output == RollupOutputEvidence::Empty { &mut self.empty } else { &mut self.populated };
+        index.entry((project.to_owned(), date, coverage.generation.clone())).or_default().extend_from_slice(ranges);
+    }
+
+    pub(super) fn restrict_to(&mut self, interiors: &[(i64, i64)]) {
+        for index in [&mut self.populated, &mut self.empty] {
+            index.retain(|_, ranges| {
+                *ranges = intersect_ranges(&crate::write::mem_buffer::merge_ranges(std::mem::take(ranges)), interiors);
+                !ranges.is_empty()
+            });
+        }
+    }
+
+    pub(super) fn contains(&self, accepted: &Self) -> bool {
+        [(&self.populated, &accepted.populated), (&self.empty, &accepted.empty)]
+            .into_iter()
+            .all(|(live, expected)| expected.iter().all(|(key, ranges)| live.get(key).is_some_and(|current| intersect_ranges(ranges, current) == *ranges)))
+    }
+
+    pub(super) fn ranges(&self, project: &str, date: chrono::NaiveDate, coverage: &RollupCoverage) -> &[(i64, i64)] {
+        let ranges = if coverage.output == RollupOutputEvidence::Empty { &self.empty } else { &self.populated };
+        ranges.get(&(project.to_owned(), date, coverage.generation.clone())).map_or(&[], Vec::as_slice)
+    }
+}
 
 /// The repair list in the order the backfill consumes it — newest date first.
 /// Sorted here rather than trusted from the source list: the cursor into it is
@@ -360,6 +428,8 @@ mod batch_rows_tests {
     #[test_case(estimated_decoded_bytes(1_148_230_580), 1_035_264 => 630 ; "a mid-width bin lands between the clamps")]
     #[test_case(63_000_000, 1_000 => 256 ; "63 KB rows cannot afford more")]
     #[test_case(1_000_000_000, 0 => 256 ; "an unmeasurable bin keeps the old constant")]
+    #[test_case(0, 100 => 256 ; "unknown decoded width keeps the old constant")]
+    #[test_case(u64::MAX, 1 => 256 ; "an oversized row keeps the floor")]
     fn batch_rows_for_prices_bytes_not_rows(decoded_bytes: u64, rows: u64) -> usize {
         batch_rows_for(decoded_bytes, rows, 8 << 20)
     }
@@ -484,7 +554,7 @@ pub fn file_content_hash(path: &str, deletion_vector: Option<&deltalake::kernel:
 /// `value`'s `DefaultHasher` digest. FROZEN: `file_content_hash` writes it to a
 /// tier file's `TAG_CONTENT_FINGERPRINT`, so changing the hasher makes every
 /// already-published file's fingerprint stop matching.
-fn digest_of(value: impl std::hash::Hash) -> u64 {
+pub(super) fn digest_of(value: impl std::hash::Hash) -> u64 {
     use std::hash::Hasher;
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     std::hash::Hash::hash(&value, &mut hasher);
@@ -813,23 +883,217 @@ impl Database {
         self.persist_rollup_journal_bytes(crate::rollup_journal::encode(&self.rollup_journal_entries())?, false)
     }
 
-    /// `(project, date)` this tier has WHOLE-DAY coverage for — the set the read
-    /// path can serve a day panel from.
-    ///
-    /// Day coverage ONLY, not slice coverage. The first cut counted a date
-    /// readable if ANY slice touched it, and that reopened the planner/reader gap
-    /// one level down: a date with one covered hour was "readable" to the planner
-    /// (never re-minted) and `not_built` to the reader (interior incomplete) —
-    /// prod 2026-09-23 sat at 65 hits against 10,678 misses with the census
-    /// insisting only 21 cells were missing. The day map is seeded from the
-    /// coverage ledger at boot, and the census already waits for the replay, so
-    /// day-only is not the over-enqueue hazard it would have been pre-ledger.
-    pub(crate) fn readable_cells(&self, source: &str, target: &str) -> HashSet<(String, String)> {
-        self.rollup_coverage
-            .iter()
-            .filter(|entry| entry.key().1 == source && entry.key().2 == target)
-            .map(|entry| (entry.key().0.clone(), entry.key().3.clone()))
+    /// Source freshness alone does not prove that the output still exists.
+    pub(super) fn source_fresh_rollup_ranges(
+        &self, source: &str, target: &str, partitions: &HashMap<(String, String), PartitionStats>, file_rows: Option<&PartitionFileRows>,
+    ) -> HashMap<BackfillCell, Vec<(i64, i64)>> {
+        let Some(grain) =
+            get_schema(source).and_then(|schema| schema.rollups.iter().find(|spec| spec.table_name(source) == target)).and_then(|spec| spec.grain_micros())
+        else {
+            return HashMap::new();
+        };
+        let partition = |project: &str, date: &str| {
+            partitions.get(&(project.to_string(), date.to_string())).or_else(|| partitions.get(&("default".to_string(), date.to_string())))
+        };
+        let dates = self.rollup_coverage.iter().filter_map(|entry| {
+            let ((project, held_source, held_target, date), coverage) = (entry.key(), entry.value());
+            if held_source != source || held_target != target || !Self::rollup_generation_current(source, target, project, date, coverage) {
+                return None;
+            }
+            let epoch = self.rollup_source_epochs.get(&(project.clone(), source.to_string(), date.clone())).map_or(0, |epoch| *epoch.value());
+            if !coverage.matches_day(partition(project, date)?.fingerprint, epoch) {
+                return None;
+            }
+            let day = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").ok()?;
+            let start = day_start_micros(day)?;
+            let end = coverage.covered_through.min(start.saturating_add(DAY_MICROS));
+            (start < end).then(|| ((project.clone(), day), (start, end)))
+        });
+        let slices = self.rollup_slice_coverage.iter().filter_map(|entry| {
+            let ((project, held_source, held_target, start, end), coverage) = (entry.key(), entry.value());
+            if held_source != source || held_target != target {
+                return None;
+            }
+            let day = chrono::DateTime::from_timestamp_micros(*start)?.date_naive();
+            let date = day.to_string();
+            if !Self::rollup_generation_current(source, target, project, &date, coverage) {
+                return None;
+            }
+            let current = partition(project, &date).and_then(|stats| u64::try_from(stats.rows).ok());
+            let fresh = coverage.matches_slice(current, None)
+                || file_rows
+                    .and_then(|files| files.get(&(project.clone(), date.clone())).or_else(|| files.get(&("default".to_string(), date.clone()))))
+                    .is_some_and(|files| coverage.matches_slice(current, crate::rollup::rows_below(files, coverage.covered_through)));
+            let end = (*end).min(coverage.covered_through).min(day_start_micros(day)?.saturating_add(DAY_MICROS));
+            (fresh && *start < end).then(|| ((project.clone(), day), (*start, end)))
+        });
+        dates
+            .chain(slices)
+            .into_group_map()
+            .into_iter()
+            .map(|(cell, ranges)| {
+                // Merge first: adjacent sub-grain slices can prove a complete bucket.
+                let ranges = crate::write::mem_buffer::merge_ranges(ranges)
+                    .into_iter()
+                    .filter_map(|(start, end)| {
+                        let range = (crate::rollup::ceil_grain(start, grain), crate::rollup::floor_grain(end, grain));
+                        (range.0 < range.1).then_some(range)
+                    })
+                    .collect();
+                (cell, ranges)
+            })
             .collect()
+    }
+
+    /// Validate output once per tier snapshot, not once per coverage interval.
+    pub(super) fn rollup_output_coverage(
+        &self, source: &str, (target, table, default_project): (&str, &DeltaTable, &str), partitions: &HashMap<(String, String), PartitionStats>,
+    ) -> Result<RollupOutputCoverage> {
+        let mut counts: HashMap<_, std::collections::BTreeMap<(i64, i64), RollupOutputProof>> = HashMap::new();
+        let mut occupied: HashMap<BackfillCell, Vec<(i64, i64)>> = HashMap::new();
+        let mut unproven: HashMap<BackfillCell, Vec<(i64, i64)>> = HashMap::new();
+        let mut unknown_partition = false;
+        for file in table.snapshot()?.log_data().iter() {
+            let add = add_action(&file);
+            let tagged = if let Some((start, end)) = Self::slice_tag_range(&add)
+                && let Some(project) = Self::tag_project(&add)
+                && let Some(generation) = Self::add_tag(&add, crate::maintenance_coordinator::TAG_GENERATION)
+                && add.deletion_vector.is_none()
+            {
+                let proof = RollupOutputProof::from_add(&add);
+                counts
+                    .entry((project.to_owned(), generation.to_owned()))
+                    .or_default()
+                    .entry((start, end))
+                    .and_modify(|held| *held = held.merge(proof))
+                    .or_insert(proof);
+                true
+            } else {
+                false
+            };
+            let Some((project, date)) = Self::maintenance_partition_from_action(&add.path, Some(&add.partition_values), default_project)
+                .and_then(|(project, date)| Some((project, date.parse::<chrono::NaiveDate>().ok()?)))
+            else {
+                unknown_partition = true;
+                continue;
+            };
+            let Some(day_start) = day_start_micros(date) else {
+                unknown_partition = true;
+                continue;
+            };
+            let (lo, hi) = add_ts_bounds(&add);
+            let range = (lo.unwrap_or(day_start), hi.map_or(day_start.saturating_add(DAY_MICROS), |hi| hi.saturating_add(1)));
+            occupied.entry((project.clone(), date)).or_default().push(range);
+            if !tagged {
+                unproven.entry((project, date)).or_default().push(range);
+            }
+        }
+        counts.retain(|_, ranges| {
+            ranges.keys().all(|(start, end)| start < end) && ranges.keys().tuple_windows::<(_, _)>().all(|(left, right)| left.1 <= right.0)
+        });
+        for ranges in occupied.values_mut().chain(unproven.values_mut()) {
+            *ranges = crate::write::mem_buffer::merge_ranges(std::mem::take(ranges));
+        }
+        let mut output = self
+            .rollup_slice_coverage
+            .iter()
+            .filter_map(|entry| {
+                let ((project, held_source, held_target, start, end), coverage) = (entry.key(), entry.value());
+                if held_source != source || held_target != target {
+                    return None;
+                }
+                let day = chrono::DateTime::from_timestamp_micros(*start)?.date_naive();
+                let date = day.to_string();
+                if !Self::rollup_generation_current(source, target, project, &date, coverage) {
+                    return None;
+                }
+                let cell = (project.clone(), day);
+                let end = (*end).min(coverage.covered_through);
+                if *start >= end {
+                    return None;
+                }
+                let overlaps = |index: &HashMap<BackfillCell, Vec<(i64, i64)>>, range: (i64, i64)| {
+                    index.get(&cell).is_some_and(|ranges| {
+                        let next = ranges.partition_point(|(_, hi)| *hi <= range.0);
+                        ranges.get(next).is_some_and(|held| crate::write::mem_buffer::overlaps(*held, range))
+                    })
+                };
+                if unknown_partition || overlaps(&unproven, (*start, end)) {
+                    return None;
+                }
+                let present = match coverage.output {
+                    RollupOutputEvidence::Unknown => false,
+                    RollupOutputEvidence::Empty => coverage.empty_publication().is_some() && !overlaps(&occupied, (*start, end)),
+                    RollupOutputEvidence::Files(output_files) => counts.get(&(project.clone(), coverage.generation.clone())).is_some_and(|ranges| {
+                        ranges
+                            .range((*start, i64::MIN)..(entry.key().4, i64::MIN))
+                            .try_fold((*start, 0usize, true), |(covered, files, complete), (&(lo, hi), proof)| {
+                                (lo == covered && hi <= entry.key().4).then_some(())?;
+                                (proof.source_fp == Some(coverage.source_fp)
+                                    && coverage.content_fp.is_none_or(|held| proof.content_fp == Some(held))
+                                    && proof.published.is_none_or(|expected| proof.live == Some(expected)))
+                                .then_some(())?;
+                                Some((hi, files.checked_add(proof.files)?, complete && proof.published.is_some()))
+                            })
+                            .is_some_and(|(covered, files, complete)| {
+                                covered == entry.key().4 && (complete || u32::try_from(files).ok() == Some(output_files.get()))
+                            })
+                    }),
+                };
+                if !present {
+                    return None;
+                }
+                // Source emptiness cannot authorize old aggregate rows in the prefix.
+                let start = partitions
+                    .get(&(project.clone(), date.clone()))
+                    .or_else(|| partitions.get(&("default".to_owned(), date)))
+                    .filter(|partition| partition.min_ts >= *start)
+                    .and_then(|_| day_start_micros(day))
+                    .filter(|prefix| *prefix < *start && !overlaps(&occupied, (*prefix, *start)))
+                    .unwrap_or(*start);
+                Some(((cell.0, cell.1, coverage.generation.clone()), coverage.output == RollupOutputEvidence::Empty, (start, end)))
+            })
+            .fold(RollupOutputCoverage::default(), |mut output, (key, empty, range)| {
+                let ranges = if empty { &mut output.empty } else { &mut output.populated };
+                ranges.entry(key).or_default().push(range);
+                output
+            });
+        for ranges in output.populated.values_mut().chain(output.empty.values_mut()) {
+            *ranges = crate::write::mem_buffer::merge_ranges(std::mem::take(ranges));
+        }
+        Ok(output)
+    }
+
+    fn readable_rollup_ranges(
+        &self, source: &str, target: (&str, &DeltaTable, &str), partitions: &HashMap<(String, String), PartitionStats>, file_rows: Option<&PartitionFileRows>,
+    ) -> Result<HashMap<BackfillCell, Vec<(i64, i64)>>> {
+        let Some(grain) =
+            get_schema(source).and_then(|schema| schema.rollups.iter().find(|spec| spec.table_name(source) == target.0)).and_then(|spec| spec.grain_micros())
+        else {
+            return Ok(HashMap::new());
+        };
+        let output = self.rollup_output_coverage(source, target, partitions)?;
+        let output = output
+            .populated
+            .into_iter()
+            .chain(output.empty)
+            .flat_map(|((project, date, _), ranges)| ranges.into_iter().map(move |range| ((project.clone(), date), range)))
+            .into_group_map();
+        Ok(self
+            .source_fresh_rollup_ranges(source, target.0, partitions, file_rows)
+            .into_iter()
+            .filter_map(|(cell, ranges)| {
+                let output = crate::write::mem_buffer::merge_ranges(output.get(&cell)?.clone());
+                let ranges: Vec<_> = intersect_ranges(&ranges, &output)
+                    .into_iter()
+                    .filter_map(|(start, end)| {
+                        let range = (crate::rollup::ceil_grain(start, grain), crate::rollup::floor_grain(end, grain));
+                        (range.0 < range.1).then_some(range)
+                    })
+                    .collect();
+                (!ranges.is_empty()).then_some((cell, ranges))
+            })
+            .collect())
     }
 
     /// CPU-token cost of one maintenance unit, scaled by its decoded size.
@@ -1349,7 +1613,10 @@ impl Database {
         // flush parks the drain within about a minute of it happening.
         let defer_enqueue = {
             let journal = self.journal();
-            let pending = journal.tasks().filter(|task| task.state != TaskState::Complete).count();
+            let pending = journal
+                .tasks()
+                .filter(|task| task.state != TaskState::Complete && (task.state == TaskState::Running || journal.rollup_build_allowed(&task.key)))
+                .count();
             let stalls = crate::observability::maintenance_stats().flush_stalled.load(std::sync::atomic::Ordering::Relaxed);
             let stalls_delta = stalls.saturating_sub(self.backfill_flush_stalls_seen.swap(stalls, std::sync::atomic::Ordering::Relaxed));
             let deferred = super::backfill_enqueue_deferred(
@@ -1367,27 +1634,50 @@ impl Database {
         };
         let today = crate::support::today_utc();
         let earliest = today - chrono::Duration::days(horizon);
+        let backfill_window =
+            TimeSlice::new(day_start_micros(earliest).context("invalid backfill start")?, day_start_micros(today).context("invalid backfill end")?)?;
+        let day_window = |date| day_start_micros(date).map(|start_micros| TimeSlice { start_micros, end_micros: start_micros.saturating_add(DAY_MICROS) });
         let mut queued = 0usize;
         // The fleet gauge folds every (source, tier) into one worst case: the
         // first tier of a sweep seeds it and the rest minimise into it.
         let mut first_tier_of_sweep = true;
         // Accumulated across EVERY source, published once below — the setters
         // replace wholesale, so a per-source call keeps only the last table.
-        let mut all_base_tier_ready: HashSet<(String, String, String)> = HashSet::new();
+        let mut all_base_tier_ready = crate::maintenance_coordinator::BaseTierCoverage::new();
         let mut all_tier_holes: HashSet<(String, String, String, String)> = HashSet::new();
+        let source_epochs: HashMap<_, _> = {
+            let _guard = crate::support::lock(&self.rollup_journal_lock);
+            self.rollup_source_epochs.iter().map(|entry| (entry.key().clone(), *entry.value())).collect()
+        };
 
         for (storage_project, source, table_ref) in self.all_tables().await {
             let Some(schema) = get_schema(&source) else { continue };
             if schema.rollups.is_empty() {
                 continue;
             }
+            let enabled_tiers: HashSet<_> = {
+                let journal = self.journal();
+                schema
+                    .rollups
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, spec)| journal.rollup_build_window(&source, &spec.table_name(&source), backfill_window).map(|_| index))
+                    .collect()
+            };
+            if enabled_tiers.is_empty() {
+                continue;
+            }
             // Metadata only. A partition of EMPTY files is not coverage; missing
             // stats mean UNKNOWN and count as covered.
             let default_project = if storage_project.is_empty() { "default" } else { storage_project.as_str() };
 
-            let source_partitions = {
+            let (source_partitions, source_stats, source_file_rows) = {
                 let table = table_ref.read().await;
-                Self::maintenance_table_partitions(&table, default_project)?
+                (
+                    Self::maintenance_table_partitions(&table, default_project)?,
+                    Self::partition_stats_bounded(&table, tiebreak_of(&source), &|_, _| i64::MAX)?,
+                    self.config.maintenance.timefusion_rollup_bounded_witness.then(|| Self::partition_file_rows(&table)).transpose()?,
+                )
             };
             // Taken from the source, not the tier: asking the tier would let a
             // broken rollup hide the failure this metric exists to catch.
@@ -1401,25 +1691,23 @@ impl Database {
                 .collect();
             // Which TIERS each day is missing, per tier — enqueueing every tier
             // for a day that lacks only one rebuilds rollups that already exist.
-            let mut covered_per_tier: Vec<(usize, HashSet<(String, chrono::NaiveDate)>)> = Vec::new();
             // The same days, narrowed to the ones a query can actually be served from.
             // Partition presence answers "does the tier hold this day"; only coverage
             // answers "can a query READ it", and the enqueue decision needs the latter.
-            // Kept as a second set because `covered_per_tier` also feeds the
-            // base-tier-ready check, where a derived build reads the base TABLE and
-            // presence is the right test.
             let mut readable_per_tier: Vec<(usize, HashSet<(String, chrono::NaiveDate)>)> = Vec::new();
+            let mut ranges_per_tier = HashMap::new();
 
             // A day must be covered by EVERY declared tier: a 30d panel reads the
             // coarse tier, so a hole there refuses it however complete 1m is.
-            for (index, spec) in schema.rollups.iter().enumerate() {
+            for (index, spec) in schema.rollups.iter().enumerate().filter(|(index, _)| enabled_tiers.contains(index)) {
                 let target = spec.table_name(&source);
                 let Ok(target_ref) = self.resolve_table(&storage_project, &target).await else { continue };
-                let (covered, tier_created_ms) = {
+                let (covered, tier_created_ms, ranges) = {
                     let table = target_ref.read().await;
                     (
                         Self::maintenance_table_partitions(&table, default_project)?,
                         table.snapshot().ok().and_then(|state| state.snapshot().metadata().created_time()),
+                        self.readable_rollup_ranges(&source, (&target, &table, default_project), &source_stats, source_file_rows.as_ref())?,
                     )
                 };
                 // A tier younger than the horizon cannot hold that many days, so
@@ -1443,7 +1731,14 @@ impl Database {
                 // `contiguous_days` counts DATE PARTITIONS and ignores generation;
                 // `usable_cells` is the read path's own answer, so a gap between the
                 // two means a spec change orphaned coverage.
-                let usable_cells = self.rollup_coverage.iter().filter(|entry| entry.key().1 == source && entry.key().2 == target).count();
+                let proven_days: HashSet<_> = ranges
+                    .iter()
+                    .filter_map(|(cell, ranges)| {
+                        let start = day_start_micros(cell.1)?;
+                        crate::rollup::ranges_cover(ranges, (start, start.saturating_add(DAY_MICROS).saturating_sub(1))).then(|| cell.clone())
+                    })
+                    .collect();
+                let usable_cells = proven_days.len();
                 info!(
                     source,
                     tier = %target,
@@ -1457,22 +1752,37 @@ impl Database {
 
                 // Before the tag replay completes the coverage maps are partial and
                 // every partition reads as a hole; presence is the honest answer then.
-                let readable = if self.preload_replay_complete.load(std::sync::atomic::Ordering::Acquire) {
-                    readable_cells_only(&covered, &self.readable_cells(&source, &target))
-                } else {
-                    covered.clone()
-                };
+                let readable = if self.preload_replay_complete.load(std::sync::atomic::Ordering::Acquire) { proven_days } else { covered.clone() };
                 readable_per_tier.push((index, readable));
-                covered_per_tier.push((index, covered));
+                ranges_per_tier.insert(index, ranges);
             }
-            // Which (project, date) have their BASE tier built; consulted by DAY.
-            all_base_tier_ready.extend(
-                covered_per_tier
-                    .iter()
-                    .filter(|(index, _)| schema.rollups[*index].derive_from.is_none())
-                    .flat_map(|(_, covered)| covered.iter().map(|(project, date)| (source.clone(), project.clone(), date.to_string()))),
-            );
+            for (_, spec) in schema.rollups.iter().enumerate().filter(|(index, spec)| enabled_tiers.contains(index) && spec.derive_from.is_some()) {
+                let Some(parent) = schema.rollups.iter().position(|base| base.name.as_deref() == spec.derive_from.as_deref()) else { continue };
+                if let Some(ranges) = ranges_per_tier.get(&parent) {
+                    all_base_tier_ready.extend(
+                        ranges
+                            .iter()
+                            .map(|((project, date), ranges)| ((source.clone(), project.clone(), spec.table_name(&source), date.to_string()), ranges.clone())),
+                    );
+                }
+            }
             let mut missing_tiers = tiers_missing_per_day(&candidates, &readable_per_tier);
+            {
+                let journal = self.journal();
+                missing_tiers.retain(|(_, date), missing| {
+                    let Some(window) = day_window(*date) else { return false };
+                    missing.retain(|index| journal.rollup_build_window(&source, &schema.rollups[*index].table_name(&source), window).is_some());
+                    !missing.is_empty()
+                });
+            }
+            // Forced repair promises a whole cell. Do not consume a policy-blocked
+            // prefix or repeatedly force the permitted tiers while waiting for it.
+            let repair_allowed = |journal: &TaskJournal, cell: &BackfillCell| {
+                !candidates.contains(cell)
+                    || day_window(cell.1).is_some_and(|window| {
+                        schema.rollups.iter().all(|spec| journal.rollup_build_window(&source, &spec.table_name(&source), window) == Some(window))
+                    })
+            };
             // A configured damage list, forced the same way: these cells HAVE tier
             // output, so `missing_tiers` never sees them. Offered a PREFIX per pass
             // against a durable cursor; nothing is consumed until it survives truncation.
@@ -1482,6 +1792,14 @@ impl Database {
             // burning the cursor against it would silently drop the list.
             let damage_offered: &[BackfillCell] = if candidates.is_empty() { &[] } else { damage_repair.get(damage_from..).unwrap_or_default() };
             let damage_offered = &damage_offered[..damage_offered.len().min(BACKFILL_PARTITIONS_PER_PASS)];
+            let policy_prefix = {
+                let journal = self.journal();
+                damage_offered.iter().take_while(|cell| repair_allowed(&journal, cell)).count()
+            };
+            if policy_prefix < damage_offered.len() {
+                info!(source, deferred = damage_offered.len() - policy_prefix, event = "rollup_damage_policy_deferred");
+            }
+            let damage_offered = &damage_offered[..policy_prefix];
             // Only cells this source has candidates for: a pair outside the
             // retention horizon is not resurrectable, though it is still consumed.
             let damage_forced: HashSet<BackfillCell> = damage_offered.iter().filter(|cell| candidates.contains(cell)).cloned().collect();
@@ -1503,7 +1821,11 @@ impl Database {
                 let journal = self.journal();
                 journal
                     .tasks()
-                    .filter(|task| task.key.source == source && blocks_rollup_backfill(task))
+                    .filter(|task| {
+                        task.key.source == source
+                            && blocks_rollup_backfill(task)
+                            && (task.state == TaskState::Running || journal.rollup_build_allowed(&task.key))
+                    })
                     .filter_map(|task| {
                         chrono::DateTime::from_timestamp_micros(task.key.slice.start_micros)
                             .map(|time| (task.key.project_id.clone(), time.date_naive(), task.key.physical_table.clone()))
@@ -1517,37 +1839,6 @@ impl Database {
                     missing.iter().any(|index| !queued_tables.contains(&(project_id.clone(), *date, schema.rollups[*index].table_name(&source))))
                 })
             });
-            // The days just filtered out most need the proof: a derived unit blocked by
-            // `dependencies_complete` stays queued forever, making its day permanently
-            // ineligible above. Proving over ALL candidate days mints nothing.
-            {
-                let mut journal = self.journal();
-                let mut proven = 0usize;
-                for ((project_id, date), missing) in &missing_tiers {
-                    if *date >= today || missing.iter().any(|index| schema.rollups[*index].derive_from.is_none()) {
-                        continue;
-                    }
-                    let Some(day_start) = day_start_micros(*date) else { continue };
-                    let Ok(slice) = TimeSlice::new(day_start, day_start.saturating_add(DAY_MICROS)) else { continue };
-                    for spec in missing.iter().map(|index| &schema.rollups[*index]).filter(|spec| spec.derive_from.is_some()) {
-                        proven += journal.prove_base_tier_for_day(
-                            &TaskKey {
-                                physical_table: spec.table_name(&source),
-                                source: source.clone(),
-                                project_id: project_id.clone(),
-                                slice,
-                                operation: Operation::DerivedRollup,
-                            },
-                            day_start,
-                            day_start.saturating_add(DAY_MICROS),
-                        );
-                    }
-                }
-                if proven != 0 {
-                    journal.checkpoint()?;
-                    info!(source, proven, event = "rollup_derived_base_tier_proven");
-                }
-            }
             // `cells_missing` is what coverage says is absent, `cells_wanted` what
             // survives the already-queued veto.
             let (derived_pending, derived_sealed, derived_unproven, derived_quarantined, derived_not_due) = {
@@ -1588,8 +1879,7 @@ impl Database {
             };
             let (want, damage_consumed) = admit_backfill_pass(want, damage_offered, &damage_forced, BACKFILL_PARTITIONS_PER_PASS);
             let damage_admitted: HashSet<BackfillCell> = want.iter().filter(|cell| damage_forced.contains(*cell)).cloned().collect();
-            // DAY-sized units: `split_time_task` splits on OBSERVED bytes until each
-            // child fits MAX_DECODED_BYTES, so coarse is safe and fine is merely slow.
+            // Coalesced holes only; byte-driven splitting still bounds large repairs.
             let now = crate::support::now_micros();
             let created_unix_ms = unix_ms(now);
             // Forced cells the QUEUE refused — only measurable here.
@@ -1598,37 +1888,64 @@ impl Database {
                 let mut journal = self.journal();
                 for (project_id, date) in &want {
                     let Some(day_start) = day_start_micros(*date) else { continue };
-                    let Ok(slice) = TimeSlice::new(day_start, day_start.saturating_add(DAY_MICROS)) else { continue };
                     let mut refused = false;
-                    let mut enqueue = |physical_table: String, operation, base_tier_present| {
+                    // Only the tiers this day is actually missing.
+                    let missing = missing_tiers.get(&(project_id.clone(), *date)).cloned().unwrap_or_default();
+                    let cell = (project_id.clone(), *date);
+                    let holes: HashMap<_, _> = missing
+                        .iter()
+                        .map(|index| {
+                            let covered = if damage_forced.contains(&cell) {
+                                Vec::new()
+                            } else {
+                                ranges_per_tier.get(index).and_then(|ranges| ranges.get(&cell)).cloned().unwrap_or_default()
+                            };
+                            let target = schema.rollups[*index].table_name(&source);
+                            let ranges: Vec<_> = crate::rollup::uncovered(day_start, day_start.saturating_add(DAY_MICROS), covered)
+                                .into_iter()
+                                .filter_map(|(start_micros, end_micros)| journal.rollup_build_window(&source, &target, TimeSlice { start_micros, end_micros }))
+                                .map(|range| (range.start_micros, range.end_micros))
+                                .collect();
+                            (*index, ranges)
+                        })
+                        .collect();
+                    if holes.values().all(Vec::is_empty) {
+                        continue;
+                    }
+                    let mut enqueue = |physical_table: String, slice, operation| {
                         journal.enqueue_with_base_tier(
                             TaskKey { physical_table, source: source.clone(), project_id: project_id.clone(), slice, operation },
                             now,
                             MAX_DECODED_BYTES,
                             created_unix_ms,
-                            base_tier_present,
+                            false,
                         )
                     };
-                    // Only the tiers this day is actually missing.
-                    let missing = missing_tiers.get(&(project_id.clone(), *date)).cloned().unwrap_or_default();
-                    let needs_source_scan = missing.iter().any(|index| schema.rollups[*index].derive_from.is_none());
+                    let needs_source_scan = holes.iter().any(|(index, ranges)| !ranges.is_empty() && schema.rollups[*index].derive_from.is_none());
                     // Dedup only when something must read RAW anyway: a derived tier
                     // aggregates the base TIER, not the source.
                     if needs_source_scan && !queued_tables.contains(&(project_id.clone(), *date, source.clone())) {
-                        refused |= !enqueue(source.clone(), Operation::Dedup, false);
+                        let raw_holes = crate::write::mem_buffer::merge_ranges(
+                            holes
+                                .iter()
+                                .filter(|(index, _)| schema.rollups[**index].derive_from.is_none())
+                                .flat_map(|(_, ranges)| ranges.iter().copied())
+                                .collect(),
+                        );
+                        for (start, end) in raw_holes {
+                            refused |= !enqueue(source.clone(), TimeSlice::new(start, end)?, Operation::Dedup);
+                        }
                     }
                     for index in missing {
                         let spec = &schema.rollups[index];
                         let operation = if spec.derive_from.is_some() { Operation::DerivedRollup } else { Operation::BaseRollup };
-                        // `!needs_source_scan` means the base tier is already built.
-                        // Sealed days only: coverage reports PRESENCE, which is
-                        // misleading for a day still being written.
                         let physical_table = spec.table_name(&source);
                         if queued_tables.contains(&(project_id.clone(), *date, physical_table.clone())) {
                             continue;
                         }
-                        let base_proven = operation == Operation::DerivedRollup && !needs_source_scan && *date < today;
-                        refused |= !enqueue(physical_table, operation, base_proven);
+                        for &(start, end) in &holes[&index] {
+                            refused |= !enqueue(physical_table.clone(), TimeSlice::new(start, end)?, operation);
+                        }
                     }
                     if refused && damage_admitted.contains(&(project_id.clone(), *date)) {
                         damage_vetoed = damage_vetoed.saturating_add(1);
@@ -1639,9 +1956,16 @@ impl Database {
             }
             // AFTER the enqueue's checkpoint, and only by cells that survived
             // truncation — the other order loses cells on a crash.
-            if damage_consumed != 0 {
-                self.journal().advance_repair_cursor(TaskJournal::DAMAGE_REPAIR_MIGRATION, &source, damage_from.saturating_add(damage_consumed))?;
-            }
+            let damage_consumed = if damage_consumed == 0 {
+                0
+            } else {
+                let mut journal = self.journal();
+                let consumed = damage_offered.iter().take(damage_consumed).take_while(|cell| repair_allowed(&journal, cell)).count();
+                if consumed != 0 {
+                    journal.advance_repair_cursor(TaskJournal::DAMAGE_REPAIR_MIGRATION, &source, damage_from.saturating_add(consumed))?;
+                }
+                consumed
+            };
             if !damage_offered.is_empty() {
                 warn!(
                     source,
@@ -1662,6 +1986,11 @@ impl Database {
         }
         // Published ONCE, after every source has contributed: these setters replace wholesale.
         {
+            let _guard = crate::support::lock(&self.rollup_journal_lock);
+            all_base_tier_ready.retain(|(source, project, _, date), ranges| {
+                let key = (project.clone(), source.clone(), date.clone());
+                !ranges.is_empty() && source_epochs.get(&key).copied().unwrap_or(0) == self.rollup_source_epochs.get(&key).map_or(0, |epoch| *epoch.value())
+            });
             let mut journal = self.journal();
             journal.set_base_tier_ready(all_base_tier_ready);
             journal.set_tier_holes(all_tier_holes);
@@ -1716,6 +2045,96 @@ impl Database {
             && start <= key.slice.start_micros
             && end >= key.slice.end_micros)
             .then_some((start, end))
+    }
+
+    fn packed_rollup_repair_allowed(&self, key: &crate::maintenance_coordinator::TaskKey) -> bool {
+        self.config.maintenance.timefusion_rollup_packed_repairs
+            && get_schema(&key.source)
+                .and_then(|schema| schema.rollups.iter().find(|spec| spec.table_name(&key.source) == key.physical_table))
+                .and_then(|spec| spec.grain_micros())
+                .is_some_and(|grain| grain > 0 && key.slice.start_micros.rem_euclid(grain) == 0 && key.slice.end_micros.rem_euclid(grain) == 0)
+    }
+
+    /// Stage only the aggregate rows outside an aligned repair. The caller commits
+    /// these Adds with the repaired slice and retires every original in one transaction.
+    async fn stage_packed_rollup_remainders(
+        &self, key: &crate::maintenance_coordinator::TaskKey, table: &DeltaTable, live: &[deltalake::kernel::Add], staged: &mut Vec<deltalake::kernel::Add>,
+    ) -> Result<Vec<deltalake::kernel::Add>> {
+        use crate::maintenance_coordinator::{TAG_GENERATION, TAG_OUTPUT_ROWS, TAG_SLICE_END, TAG_SLICE_START, TAG_SOURCE_ROWS_BELOW};
+        use deltalake::writer::DeltaWriter;
+        let groups = live
+            .iter()
+            .filter_map(|add| {
+                let range = Self::slice_tag_range(add)?;
+                (Self::tag_project(add) == Some(key.project_id.as_str())
+                    && key.slice.overlaps(range.0, range.1)
+                    && (range.0 < key.slice.start_micros || range.1 > key.slice.end_micros))
+                    .then(|| ((range, Self::add_tag(add, TAG_GENERATION).map(str::to_owned)), add.clone()))
+            })
+            .into_group_map();
+        let schema = get_schema(&key.physical_table).context("packed rollup schema missing")?;
+        let mut retired = Vec::new();
+        for ((range, generation), files) in groups {
+            let coverage_tags = carried_coverage_tags(&files);
+            let proof = files.iter().map(RollupOutputProof::from_add).reduce(RollupOutputProof::merge).context("packed output proof missing")?;
+            anyhow::ensure!(
+                generation.is_some() && proof.live.is_some() && proof.live == proof.published && coverage_tags.contains_key(TAG_GENERATION),
+                "packed publication lacks complete, consistent output evidence"
+            );
+            for (start, end) in crate::rollup::uncovered(range.0, range.1, vec![(key.slice.start_micros, key.slice.end_micros)]) {
+                let ctx = self.bounded_rollup_maintenance_context(256)?;
+                let provider = Self::narrow_provider(
+                    table.log_store(),
+                    Arc::new(table.snapshot()?.snapshot().clone()),
+                    files.iter().map(|add| add.path.clone()).collect(),
+                    None,
+                    None,
+                )
+                .await?;
+                ctx.register_table("__packed_rollup", provider)?;
+                let mut stream = ctx
+                    .sql(&format!("SELECT * FROM __packed_rollup WHERE timestamp >= to_timestamp_micros({start}) AND timestamp < to_timestamp_micros({end})"))
+                    .await?
+                    .execute_stream()
+                    .await?;
+                let mut writer = deltalake::writer::RecordBatchWriter::for_table(table)?.with_writer_properties(self.create_writer_properties(
+                    schema,
+                    self.config.parquet.timefusion_zstd_compression_level,
+                    false,
+                ));
+                let arrow_schema = writer.arrow_schema();
+                let mut rows = 0u64;
+                let first_output = staged.len();
+                loop {
+                    let batch = tokio::select! {
+                        batch = stream.try_next() => batch?,
+                        () = self.maintenance_shutdown.cancelled() => anyhow::bail!("packed rollup staging cancelled"),
+                    };
+                    let Some(batch) = batch else { break };
+                    rows = rows.checked_add(u64::try_from(batch.num_rows())?).context("packed output row count overflow")?;
+                    writer.write(deltalake::kernel::schema::cast_record_batch(&batch, arrow_schema.clone(), true, true)?).await?;
+                    if writer.buffer_len() >= self.config.maintenance.timefusion_writer_max_file_bytes {
+                        staged.extend(writer.flush().await?);
+                    }
+                }
+                staged.extend(writer.flush().await?);
+                // Every cut file carries the total for this complete fragment.
+                for add in &mut staged[first_output..] {
+                    add.data_change = true;
+                    add.tags = Some(coverage_tags.iter().map(|(name, value)| (name.clone(), Some(value.clone()))).collect());
+                    let tags = add.tags.get_or_insert_default();
+                    tags.insert(TAG_SLICE_START.to_owned(), Some(start.to_string()));
+                    tags.insert(TAG_SLICE_END.to_owned(), Some(end.to_string()));
+                    tags.insert(TAG_OUTPUT_ROWS.to_owned(), Some(rows.to_string()));
+                    // A witness measured at the old bound cannot prove the new bound.
+                    if end != range.1 {
+                        tags.remove(TAG_SOURCE_ROWS_BELOW);
+                    }
+                }
+            }
+            retired.extend(files);
+        }
+        Ok(retired)
     }
 
     /// Decoded bytes a unit reads from one file, narrowed to the columns it
@@ -1860,11 +2279,12 @@ impl Database {
         // (project, table, date). Unit shape must NOT gate the grant: each clean pass
         // records its slice, and `record_clean_slice` certifies once the union covers
         // the UTC day over one unmoved file fingerprint.
-        let (pre_files, pre_dv) = {
+        let (pre_files, pre_dv, pre_visibility) = {
             let table = table.read().await;
             (
                 Self::partition_files_by_pid(&table, &format!("date={date}"))?.remove(&key.project_id).unwrap_or_default(),
                 Self::partition_dv_state(&table, &key.project_id, &format!("date={date}"))?,
+                Self::logical_count_partition_snapshot(&table, &key.project_id, &date.to_string())?.1,
             )
         };
         match self.dedup_partition_range_limited(&table, &key.source, &key.project_id, date, Some(key.slice), Some(limits)).await {
@@ -1872,7 +2292,10 @@ impl Database {
                 // Before the journal lock: `record_clean_slice` awaits and the
                 // journal guard is a std Mutex.
                 let masked = masked.as_deref().map(|attachments| (&pre_dv, attachments));
-                match self.record_clean_slice(&table, &key.physical_table, &key.project_id, date, (key.slice, dropped, masked), &pre_files).await {
+                match self
+                    .record_clean_slice(&table, &key.physical_table, &key.project_id, date, (key.slice, dropped, masked), (&pre_files, &pre_visibility))
+                    .await
+                {
                     Ok(Some(_)) => self.persist_certifications(),
                     Ok(None) => {}
                     Err(error) => warn!(%error, project_id = %key.project_id, %date, "certification bookkeeping failed after a clean dedup slice"),
@@ -2085,6 +2508,7 @@ impl Database {
         let base_generations: HashSet<String> = cells.iter().map(|(_, generation, _)| generation.clone()).collect();
         let base_evidence = crate::rollup::base_measure_evidence(spec, cells.iter().map(|(_, _, measures)| measures.as_ref()));
         let base_covered: Vec<(i64, i64)> = cells.into_iter().map(|(span, _, _)| span).collect();
+        let source_epoch = self.rollup_source_epochs.get(&(key.project_id.clone(), key.source.clone(), date.to_string())).map_or(0, |entry| *entry.value());
         let (
             snapshot,
             log_store,
@@ -2094,9 +2518,11 @@ impl Database {
             source_rows_below,
             partition_identity,
             whole_file_bytes,
+            selected_input_rows,
             content_fp,
             refused_spans,
             selected_spans,
+            certified_clean,
         ) = {
             let table = from_table.read().await;
             let witness_guard = match &witness_table {
@@ -2105,6 +2531,12 @@ impl Database {
             };
             let witness_source: &DeltaTable = witness_guard.as_deref().unwrap_or(&table);
             let snapshot = Arc::new(table.snapshot()?.snapshot().clone());
+            // Bind the proof to the same locked source view as the provider snapshot.
+            // A timestamp identity prevents versions outside the slice sharing its keys.
+            let certified_clean = !derived
+                && self.config.maintenance.timefusion_rollup_certified_clean
+                && source_schema.dedup_keys.iter().any(|key| key == "timestamp")
+                && self.dedup_window_clean(&table, &key.project_id, &key.source, (key.slice.start_micros, key.slice.end_micros.saturating_sub(1))).granted();
             let date_string = date.to_string();
             // The witness the read path re-checks this slice against. Must use the SAME
             // call and bound as the read path, over the very snapshot this build aggregates.
@@ -2131,6 +2563,10 @@ impl Database {
             let mut selected_spans: Vec<(i64, i64)> = Vec::new();
             let mut estimated = 0u64;
             let mut whole_file_bytes = 0u64;
+            // Same physical file population as whole_file_bytes, including rows
+            // outside the predicate and DV-masked rows that decoding can visit.
+            // One missing/invalid count makes the entire width unknown.
+            let mut selected_input_rows = self.config.maintenance.timefusion_rollup_adaptive_batches.then_some(0u64);
             let mut content_fp = 0u64;
             for file in snapshot.log_data().iter() {
                 let path = file.path().to_string();
@@ -2185,6 +2621,7 @@ impl Database {
                 let (share, projected) = Self::projected_slice_bytes(&add, projected_numerator, projected_denominator, key.slice);
                 estimated = estimated.saturating_add(share);
                 whole_file_bytes = whole_file_bytes.saturating_add(projected);
+                selected_input_rows = selected_input_rows.and_then(|total| add_row_count(&add).and_then(|rows| total.checked_add(rows)));
                 // XOR-folded so file order, which a snapshot does not promise, cannot
                 // change the answer.
                 content_fp ^= file_content_hash(&path, add.deletion_vector.as_ref());
@@ -2199,9 +2636,11 @@ impl Database {
                 source_rows_below,
                 partition_identity,
                 whole_file_bytes,
+                selected_input_rows,
                 content_fp,
                 refused_spans,
                 selected_spans,
+                certified_clean,
             )
         };
         let input_footprint = crate::maintenance_coordinator::InputFootprint::new(&selected, whole_file_bytes);
@@ -2287,7 +2726,7 @@ impl Database {
         }
         // Everything above is metadata; everything below is the expensive scan and
         // aggregate. Committing a previous process's staged output here skips both.
-        if self.resume_rollup_unit(&key, source_rows.and_then(|rows| u64::try_from(rows).ok())).await? {
+        if self.resume_rollup_unit(&key, source_rows.and_then(|rows| u64::try_from(rows).ok()), content_fp, source_epoch).await? {
             return self.completed(&key);
         }
         // So does discovering that a WIDER live file already covers this slice. That
@@ -2305,8 +2744,9 @@ impl Database {
                 let target = target_ref.read().await;
                 target.snapshot().ok().and_then(|snapshot| snapshot.log_data().iter().find_map(|file| Self::covering_slice_for(&add_action(&file), &key)))
             };
-            if let Some(covering) = covering {
-                self.settle_covered_by_wider(&key, covering, source_rows, &from_table, witness_table.as_ref(), date).await?;
+            if let Some(covering) = covering
+                && self.settle_covered_by_wider(&key, covering, (source_rows, source_epoch), &from_table, witness_table.as_ref(), date).await?
+            {
                 return Ok(true);
             }
         }
@@ -2314,24 +2754,17 @@ impl Database {
         // re-mints such units routinely. Three conditions, all necessary:
         //   * `content_fp` — the input file set INCLUDING deletion vectors, so a DV'd
         //     file (path-identical, row-different) is not taken for unchanged. `None`
-        //     (coverage recovered from tags at boot) declines the skip.
+        //     (legacy coverage without this tag) declines the skip.
         //   * the generation is still current, so a spec or measure change rebuilds.
         //   * the OUTPUT still stands (`tier_still_holds_slice`) — an input-only proof is
         //     one-sided, since coverage is in-memory and outlives the files it describes.
         // DERIVED units are excluded: their correctness also depends on `base_covered`.
         // The DashMap guard must be dropped BEFORE the tier check awaits, or this
         // deadlocks against the one caller that also writes this map.
-        // The skip may only stand in for a rebuild the READER would not miss: its
-        // proof lives in slice coverage, but a day panel routes by the DAY map,
-        // and an invalidation destroys that map entry while leaving the slices.
-        // Skipping then completes the unit without making the cell readable, and
-        // the census re-mints it next pass — prod 2026-09-23 spun 12,255 skips
-        // against 420 real rebuilds while the hit rate sat at 1%. No day
-        // coverage, no skip: the one real rebuild republishes it and the cell
-        // leaves the queue for good.
-        let day_readable =
-            self.rollup_coverage.contains_key(&(key.project_id.to_string(), key.source.to_string(), key.physical_table.to_string(), date.to_string()));
-        let reproduces = (!derived && day_readable && self.config.maintenance.timefusion_rollup_noop_skip_enabled)
+        // A valid slice needs no synthetic day record. Require the router's
+        // row proof as well as unchanged physical input and output. This skips
+        // only this unit; it does not certify other hours for the census.
+        let reproduces = (!derived && self.config.maintenance.timefusion_rollup_noop_skip_enabled)
             .then(|| {
                 let coverage = self.rollup_slice_coverage.get(&(
                     key.project_id.clone(),
@@ -2341,20 +2774,30 @@ impl Database {
                     key.slice.end_micros,
                 ))?;
                 let current = Self::rollup_generation_current(&key.source, &key.physical_table, &key.project_id, &date.to_string(), coverage.value());
-                (current && coverage.content_fp == Some(content_fp) && coverage.output_files > 0).then(|| (coverage.generation.clone(), coverage.output_files))
+                (current
+                    && coverage.matches_slice(source_rows.and_then(|rows| u64::try_from(rows).ok()), None)
+                    && coverage.content_fp == Some(content_fp)
+                    && (matches!(coverage.output, RollupOutputEvidence::Files(_)) || coverage.empty_publication().is_some()))
+                .then(|| coverage.value().clone())
             })
             .flatten();
-        if let Some((generation, output_files)) = reproduces
-            && self.tier_still_holds_slice(&key, &generation, output_files).await
+        if let Some(coverage) = reproduces
+            && (match coverage.output {
+                RollupOutputEvidence::Unknown => false,
+                RollupOutputEvidence::Empty => self.empty_rollup_output_current(&key, &date.to_string()).await?,
+                RollupOutputEvidence::Files(files) => self.tier_still_holds_slice(&key, &coverage.generation, files).await,
+            })
         {
-            crate::observability::maintenance_stats().rollup_noop_rebuild_skipped.fetch_add(1, Relaxed);
-            info!(
-                table = %key.physical_table, project_id = %key.project_id,
-                slice_start = key.slice.start_micros, slice_end = key.slice.end_micros, content_fp,
-                event = "maintenance_rollup_noop_skipped",
-                "input unchanged since the live coverage was published; completing without rebuilding"
-            );
-            return self.completed(&key);
+            if self.complete_rollup_noop(&key, &date.to_string(), source_epoch, (key.slice, &coverage))? {
+                crate::observability::maintenance_stats().rollup_noop_rebuild_skipped.fetch_add(1, Relaxed);
+                info!(
+                    table = %key.physical_table, project_id = %key.project_id,
+                    slice_start = key.slice.start_micros, slice_end = key.slice.end_micros, content_fp,
+                    event = "maintenance_rollup_noop_skipped",
+                    "input unchanged since the live coverage was published; completing without rebuilding"
+                );
+            }
+            return Ok(true);
         }
         if estimated_bytes > MAX_DECODED_BYTES && key.slice.width() > crate::maintenance_coordinator::MIN_SLICE_MICROS {
             let mut journal = self.journal();
@@ -2382,7 +2825,12 @@ impl Database {
         let source_fp = fingerprint.finish();
 
         let unit_started = std::time::Instant::now();
-        let ctx = self.bounded_rollup_maintenance_context()?;
+        let batch_rows = if self.config.maintenance.timefusion_rollup_adaptive_batches {
+            batch_rows_for(whole_file_bytes, selected_input_rows.unwrap_or(0), self.config.maintenance.timefusion_maintenance_batch_target_bytes)
+        } else {
+            256
+        };
+        let ctx = self.bounded_rollup_maintenance_context(batch_rows)?;
         let provider = Self::narrow_provider(log_store, snapshot, selected, None, None).await.map_err(|error| anyhow::anyhow!("slice provider: {error}"))?;
         const RAW: &str = "__maintenance_slice_raw";
         // What the PHYSICAL table has, which is not what the spec declares.
@@ -2440,7 +2888,11 @@ impl Database {
             };
             let input_sql = crate::rollup::slice_input_sql(
                 input_schema,
-                dedup,
+                if certified_clean {
+                    crate::rollup::SliceInput::Certified { tombstone: source_schema.tombstone_column.as_deref() }
+                } else {
+                    dedup.map_or(crate::rollup::SliceInput::Unversioned, crate::rollup::SliceInput::Deduplicate)
+                },
                 RAW,
                 &key.project_id,
                 (key.slice.start_micros, key.slice.end_micros),
@@ -2452,6 +2904,12 @@ impl Database {
             let frame = ctx.sql(&input_sql).await.map_err(|error| lease.note_failure(error))?;
             ctx.register_table(&input, Arc::new(datafusion::datasource::ViewTable::new(frame.logical_plan().clone(), Some(input_sql))))?;
             let aggregate_sql = cohort_sql(&input, derived)?;
+            // Count attempts, including failures and repeated shard passes. Time
+            // predicates do not make a selected file's projected footprint smaller.
+            let stats = crate::observability::maintenance_stats();
+            stats.rollup_scan_cohorts.fetch_add(1, Relaxed);
+            stats.rollup_scan_projects.fetch_add(1, Relaxed);
+            stats.rollup_scan_estimated_bytes.fetch_add(whole_file_bytes, Relaxed);
             let shard_aggregate = collect_watched(&ctx, &aggregate_sql).await.map_err(|error| lease.note_failure(error))?;
             if hash_shards == 1 {
                 aggregate = shard_aggregate;
@@ -2488,8 +2946,6 @@ impl Database {
             writer.write(deltalake::kernel::schema::cast_record_batch(&batch?, arrow_schema.clone(), true, true)?).await?;
         }
         let mut adds = writer.flush().await?;
-        let stage_ms = stage_started.elapsed().as_millis() as u64;
-        let commit_started = std::time::Instant::now();
         for add in &mut adds {
             add.data_change = true;
             add.tags.get_or_insert_default().extend(
@@ -2502,6 +2958,7 @@ impl Database {
                     // Persisted so the no-op skip survives a restart.
                     (crate::maintenance_coordinator::TAG_CONTENT_FINGERPRINT, content_fp.to_string()),
                     (crate::maintenance_coordinator::TAG_GENERATION, generation.clone()),
+                    (crate::maintenance_coordinator::TAG_OUTPUT_ROWS, rows.to_string()),
                     // Absent means the read path must refuse this slice, so write the `-1`
                     // sentinel rather than omitting the tag when the source reports no count.
                     (crate::maintenance_coordinator::TAG_SOURCE_ROWS, source_rows.unwrap_or(-1).to_string()),
@@ -2532,7 +2989,7 @@ impl Database {
             rows,
             covered: &covered,
         };
-        let replaced = live_adds
+        let mut replaced = live_adds
             .iter()
             .filter(|add| {
                 let partition = Self::maintenance_partition_from_action(&add.path, Some(&add.partition_values), "default");
@@ -2556,14 +3013,29 @@ impl Database {
         let leaves_partition_clean = !live_adds.iter().filter(|add| in_partition(add) && !replaced.iter().any(|gone| gone.path == add.path)).any(no_identity);
         // Applies to BOTH tiers — see `covering_slice_for` for why publishing over a
         // wider live file double counts.
-        if let Some(covering) = live_adds.iter().find_map(|add| Self::covering_slice_for(add, &key)) {
+        if !self.packed_rollup_repair_allowed(&key)
+            && let Some(covering) = live_adds.iter().find_map(|add| Self::covering_slice_for(add, &key))
+        {
             // The SAFETY NET. The same decision is made before the scan (see the
             // other `settle_covered_by_wider` call site), but a wider slice can be
             // committed by another worker while this unit was aggregating, so the
             // post-write check must stay.
-            self.settle_covered_by_wider(&key, covering, source_rows, &from_table, witness_table.as_ref(), date).await?;
+            self.settle_covered_by_wider(&key, covering, (source_rows, source_epoch), &from_table, witness_table.as_ref(), date).await?;
+            Self::cleanup_orphaned_parquet(&stage_store, &adds.iter().cloned().map(Action::Add).collect::<Vec<_>>()).await;
             return Ok(true);
         }
+        let slice_output_files = adds.len() as u64;
+        if self.packed_rollup_repair_allowed(&key) {
+            match self.stage_packed_rollup_remainders(&key, &staging_table, &live_adds, &mut adds).await {
+                Ok(packed) => replaced.extend(packed),
+                Err(error) => {
+                    Self::cleanup_orphaned_parquet(&stage_store, &adds.iter().cloned().map(Action::Add).collect::<Vec<_>>()).await;
+                    return Err(error);
+                }
+            }
+        }
+        let stage_ms = stage_started.elapsed().as_millis() as u64;
+        let commit_started = std::time::Instant::now();
         let target_paths = replaced.iter().map(|add| add.path.clone()).collect::<Vec<_>>();
         // Record the intent HERE — after the tags are stamped and the replace-set is
         // decided, before anything commits — so the next boot can finish this unit
@@ -2576,6 +3048,7 @@ impl Database {
             rows,
             source_rows: source_rows.and_then(|rows| u64::try_from(rows).ok()),
             source_rows_below: source_rows_below.and_then(|rows| u64::try_from(rows).ok()),
+            evidence: Some(crate::maintenance_coordinator::PublicationEvidence { content_fp, measures: materialized.clone() }),
         };
         let actions = replaced.iter().map(|add| Action::Remove(remove_for_add(add, true))).chain(adds.iter().cloned().map(Action::Add)).collect::<Vec<_>>();
         // The staged parquet as commit actions — only the abandon paths need this shape.
@@ -2588,6 +3061,11 @@ impl Database {
             Self::cleanup_orphaned_parquet(&stage_store, &staged_actions()).await;
             return Ok(true);
         }
+        let retired_paths: HashSet<_> = target_paths.iter().map(String::as_str).collect();
+        let target_proof = RollupTargetProof {
+            before: rollup_target_fingerprint(live_adds.iter().filter(|add| in_partition(add))),
+            after: rollup_target_fingerprint(live_adds.iter().filter(|add| in_partition(add) && !retired_paths.contains(add.path.as_str())).chain(adds.iter())),
+        };
         self.record_staged_intent(StagedIntent {
             wave_id: resume_wave.clone(),
             table_name: key.physical_table.clone(),
@@ -2600,6 +3078,7 @@ impl Database {
                 key: key.clone(),
                 publication: publication.clone(),
                 source_rows: publication.source_rows,
+                target: Some(target_proof),
                 date: date_string.clone(),
             }),
             instance: None,
@@ -2610,7 +3089,23 @@ impl Database {
             refresh_table_snapshot(&target_ref, self.config.maintenance.timefusion_incremental_snapshot).await?;
             let mut table = target_ref.read().await.clone();
             let live = table.snapshot()?.log_data().iter().map(|file| file.path().to_string()).collect::<HashSet<_>>();
-            if !target_paths.iter().all(|path| live.contains(path)) {
+            // Retained replacement paths alone do not detect a new overlapping
+            // publication. Revalidate the partition that informed retirement.
+            // Other projects/dates can commit without invalidating this decision.
+            let partition_unchanged = table.version() == staging_table.version() || {
+                let expected = live_adds.iter().filter(|add| in_partition(add)).map(|add| (add.path.as_str(), add)).collect::<HashMap<_, _>>();
+                table.snapshot()?.log_data().iter().map(|file| add_action(&file)).filter(&in_partition).try_fold(0usize, |count, add| {
+                    let old = expected.get(add.path.as_str())?;
+                    (old.tags == add.tags
+                        && old.partition_values == add.partition_values
+                        && old.stats == add.stats
+                        && old.deletion_vector == add.deletion_vector
+                        && old.size == add.size
+                        && old.modification_time == add.modification_time)
+                        .then_some(count + 1)
+                }) == Some(expected.len())
+            };
+            if !partition_unchanged || !target_paths.iter().all(|path| live.contains(path)) {
                 drop(guard);
                 Self::cleanup_orphaned_parquet(&stage_store, &staged_actions()).await;
                 // The staged objects are gone; leaving the intent would have the next
@@ -2619,10 +3114,9 @@ impl Database {
                 return retry("slice_occ_stale".to_owned(), std::time::Duration::from_secs(1));
             }
             let op = DeltaOperation::Write { mode: SaveMode::Overwrite, partition_by: Some(target_schema.partitions.clone()), predicate: None };
-            let finalized = deltalake::kernel::transaction::CommitBuilder::from(incremental_commit_properties(
-                self.config.maintenance.timefusion_incremental_snapshot,
-                "rollup_publish",
-            ))
+            let finalized = deltalake::kernel::transaction::CommitBuilder::from(
+                incremental_commit_properties(self.config.maintenance.timefusion_incremental_snapshot, "rollup_publish").with_max_retries(0),
+            )
             .with_actions(actions)
             .build(Some(table.snapshot()? as &dyn TableReference), table.log_store(), op)
             .await?;
@@ -2653,7 +3147,11 @@ impl Database {
                 covered_through: key.slice.end_micros,
                 measures: Some(materialized.iter().cloned().collect()),
                 content_fp: Some(content_fp),
-                output_files: u32::try_from(output_files).unwrap_or(u32::MAX),
+                output: match (rows, slice_output_files) {
+                    (0, 0) => RollupOutputEvidence::Empty,
+                    (0, _) => RollupOutputEvidence::Unknown,
+                    (_, files) => RollupOutputEvidence::from_file_count(files),
+                },
             };
             self.rollup_slice_coverage.insert(
                 (key.project_id.clone(), key.source.clone(), key.physical_table.clone(), key.slice.start_micros, key.slice.end_micros),
@@ -2675,7 +3173,7 @@ impl Database {
                             self.rollup_source_epochs.get(&(key.project_id.clone(), key.source.clone(), date.to_string())).map_or(0, |epoch| *epoch.value()),
                         ),
                         content_fp: None,
-                        output_files: 0,
+                        output: if slice_coverage.output == RollupOutputEvidence::Empty { RollupOutputEvidence::Empty } else { RollupOutputEvidence::Unknown },
                         ..slice_coverage
                     },
                 );
@@ -2716,7 +3214,9 @@ impl Database {
                     "published zero rows although the base tier holds rows in this slice"
                 );
             }
-            journal.checkpoint()?;
+            drop(journal);
+            drop(_journal_guard);
+            self.checkpoint_task_journal()?;
             // Cleared AFTER the checkpoint, never before: an intent that outlives its
             // unit is harmlessly retried, while one cleared early and lost to a crash
             // costs the whole scan again.
@@ -2730,6 +3230,10 @@ impl Database {
                 rows,
                 output_files,
                 estimated_decoded_bytes = estimated_bytes,
+                hash_shards,
+                batch_rows,
+                selected_input_rows,
+                certified_clean,
                 event = "maintenance_rollup_published"
             );
             let stats = crate::observability::maintenance_stats();
@@ -2778,24 +3282,111 @@ impl Database {
         journal.checkpoint().map(|()| true)
     }
 
-    /// Whether the rollup tier still holds exactly the files a cell published.
+    /// Completion boundary after the no-op output check releases its snapshot.
+    fn complete_rollup_noop(
+        &self, key: &crate::maintenance_coordinator::TaskKey, date: &str, source_epoch: u64,
+        (slice, coverage): (crate::maintenance_coordinator::TimeSlice, &RollupCoverage),
+    ) -> Result<bool> {
+        use crate::maintenance_coordinator::TaskState;
+
+        let empty_publication = (slice == key.slice).then(|| coverage.empty_publication()).flatten();
+        let completed = {
+            let _guard = crate::support::lock(&self.rollup_journal_lock);
+            let mut journal = self.journal();
+            // An invalidation can already have requeued this task with a new deadline.
+            if journal.state(key) != Some(TaskState::Running) {
+                return Ok(false);
+            }
+            let unchanged = self.rollup_source_epochs.get(&(key.project_id.clone(), key.source.clone(), date.to_string())).map_or(0, |entry| *entry.value())
+                == source_epoch
+                && (coverage.output != RollupOutputEvidence::Empty || empty_publication.is_some())
+                && self
+                    .rollup_slice_coverage
+                    .get(&(key.project_id.clone(), key.source.clone(), key.physical_table.clone(), slice.start_micros, slice.end_micros))
+                    .is_some_and(|current| current.value() == coverage);
+            if unchanged {
+                if let Some(publication) = empty_publication {
+                    // Re-enqueue clears the journal proof; empty output has no Add tags.
+                    journal.publish(key, publication);
+                } else {
+                    journal.complete(key);
+                }
+            } else {
+                // A changed proof is not a resource failure and must not split the unit.
+                journal.retry(key, "noop_proof_changed".to_owned(), crate::support::now_micros().saturating_add(ROLLUP_PROOF_RETRY_MICROS));
+            }
+            unchanged
+        };
+        // Do not hold the invalidation lock across checkpoint I/O.
+        self.checkpoint_task_journal()?;
+        Ok(completed)
+    }
+
+    /// Whether the rollup tier retains the cell's complete publication, including physical rewrites.
     ///
     /// Metadata only; an unresolvable tier declines rather than erroring.
-    async fn tier_still_holds_slice(&self, key: &crate::maintenance_coordinator::TaskKey, generation: &str, output_files: u32) -> bool {
+    async fn tier_still_holds_slice(&self, key: &crate::maintenance_coordinator::TaskKey, generation: &str, output_files: std::num::NonZeroU32) -> bool {
+        let Some(coverage) = self
+            .rollup_slice_coverage
+            .get(&(key.project_id.clone(), key.source.clone(), key.physical_table.clone(), key.slice.start_micros, key.slice.end_micros))
+            .map(|entry| entry.value().clone())
+            .filter(|coverage| coverage.generation == generation && coverage.output == RollupOutputEvidence::Files(output_files))
+        else {
+            return false;
+        };
+        let Some(date) = chrono::DateTime::from_timestamp_micros(key.slice.start_micros).map(|time| time.date_naive()) else { return false };
         let Ok(target) = self.resolve_table(&key.project_id, &key.physical_table).await else { return false };
         let table = target.read().await;
-        let Ok(snapshot) = table.snapshot() else { return false };
-        let live = snapshot
-            .log_data()
-            .iter()
-            .map(|file| add_action(&file))
-            .filter(|add| {
-                Self::tag_project(add) == Some(key.project_id.as_str())
-                    && Self::add_tag(add, crate::maintenance_coordinator::TAG_GENERATION) == Some(generation)
-                    && Self::slice_tag_range(add) == Some((key.slice.start_micros, key.slice.end_micros))
-            })
-            .count();
-        u32::try_from(live).is_ok_and(|live| live == output_files)
+        let Ok(output) = self.rollup_output_coverage(&key.source, (&key.physical_table, &table, &key.project_id), &HashMap::new()) else { return false };
+        output.ranges(&key.project_id, date, &coverage).iter().any(|&(start, end)| start <= key.slice.start_micros && end >= key.slice.end_micros)
+    }
+
+    /// Empty base output has no Add tags: prove unchanged input and no old output.
+    async fn empty_base_rollup_current(
+        &self, key: &crate::maintenance_coordinator::TaskKey, publication: &crate::maintenance_coordinator::Publication,
+    ) -> Result<bool> {
+        use crate::maintenance_coordinator::Operation;
+        let Some(proof) = publication.evidence.as_ref().filter(|_| publication.rows == 0 && key.operation == Operation::BaseRollup) else {
+            return Ok(false);
+        };
+        let Some(date) = chrono::DateTime::from_timestamp_micros(key.slice.start_micros).map(|time| time.date_naive().to_string()) else {
+            return Ok(false);
+        };
+        let source = self.resolve_table(&key.project_id, &key.source).await?;
+        let current = {
+            let table = source.read().await;
+            let snapshot = table.snapshot()?;
+            let paths: HashSet<_> =
+                dedup_partition_paths(snapshot.log_data().iter().map(|file| file.path().to_string()), &key.project_id, &date).into_iter().collect();
+            snapshot
+                .log_data()
+                .iter()
+                .map(|file| add_action(&file))
+                .filter(|add| paths.contains(&add.path) && !stats_disjoint_from(add, key.slice))
+                .fold(0, |fp, add| fp ^ file_content_hash(&add.path, add.deletion_vector.as_ref()))
+        };
+        if current != proof.content_fp {
+            return Ok(false);
+        }
+        self.empty_rollup_output_current(key, &date).await
+    }
+
+    /// Unknown timestamp bounds can overlap the bucket and cannot prove emptiness.
+    async fn empty_rollup_output_current(&self, key: &crate::maintenance_coordinator::TaskKey, date: &str) -> Result<bool> {
+        use crate::maintenance_coordinator::TimeSlice;
+        let Some(grain) = get_schema(&key.source)
+            .and_then(|schema| schema.rollups.iter().find(|spec| spec.table_name(&key.source) == key.physical_table))
+            .and_then(|spec| spec.grain_micros())
+        else {
+            return Ok(false);
+        };
+        let buckets = TimeSlice::new(key.slice.start_micros.div_euclid(grain) * grain, key.slice.end_micros)?;
+        let target = self.resolve_table(&key.project_id, &key.physical_table).await?;
+        let table = target.read().await;
+        let snapshot = table.snapshot()?;
+        let paths: HashSet<_> =
+            dedup_partition_paths(snapshot.log_data().iter().map(|file| file.path().to_string()), &key.project_id, date).into_iter().collect();
+        Ok(!snapshot.log_data().iter().map(|file| add_action(&file)).any(|add| paths.contains(&add.path) && !stats_disjoint_from(&add, buckets)))
     }
 
     /// The `RuntimeEnv` a coordinator compaction unit stages under. Repair gets its own
@@ -3182,19 +3773,6 @@ impl Database {
         self.log_task_started(&task);
         let _lease = TaskLease::new(Arc::clone(&self.maintenance_tasks), key.clone(), (*self.maintenance_shutdown).clone());
         let retry = |reason: String, seconds: u64| -> Result<bool> { self.retried(&key, reason, std::time::Duration::from_secs(seconds)) };
-        // The request must be the unit's own size, or the occupancy-scaled ceiling
-        // refuses everything on a busy pool.
-        let clamped = task.estimated_decoded_bytes.clamp(1, MAX_DECODED_BYTES);
-        let request = Resources { cpu: Self::admission_cpu_cost(clamped), decoded_bytes: clamped, object_reads: 1, object_writes: 1 };
-        // Rollups claim the reserved share; every other lane competes for what is
-        // left, so continuous compaction cannot starve them the way it did.
-        let lane = match key.operation {
-            Operation::BaseRollup | Operation::DerivedRollup => crate::maintenance_coordinator::AdmissionLane::Rollup,
-            _ => crate::maintenance_coordinator::AdmissionLane::Other,
-        };
-        let Some(_permit) = self.maintenance_admission.try_acquire_for(request, lane, self.admission_memory()) else {
-            return self.retried(&key, "admission_busy".to_owned(), self.admission_backoff_for(&key));
-        };
         note(2);
         let table_ref = match self.resolve_table(&key.project_id, &key.source).await {
             Ok(table) => table,
@@ -3217,6 +3795,14 @@ impl Database {
                 .fold(0u64, |bytes, file| bytes.saturating_add(estimated_decoded_bytes(file.size())))
         };
         note(5);
+        // Price the selected files, not a stale queue estimate. Otherwise a tiny
+        // bin queued at MAX_DECODED_BYTES asks for eight CPU tokens indefinitely.
+        let clamped = processed_bytes.clamp(1, MAX_DECODED_BYTES);
+        let request = Resources { cpu: Self::admission_cpu_cost(clamped), decoded_bytes: clamped, object_reads: 1, object_writes: 1 };
+        let Some(_permit) = self.maintenance_admission.try_acquire_for(request, crate::maintenance_coordinator::AdmissionLane::Other, self.admission_memory())
+        else {
+            return self.retried(&key, "admission_busy".to_owned(), self.admission_backoff_for(&key));
+        };
         if operation == crate::maintenance_coordinator::Operation::Repair && self.repair_bin_already_sorted(&table_ref, &files).await {
             return self.settle_compaction_unit(&table_ref, &key, true).await.map(|()| true);
         }
@@ -3538,7 +4124,7 @@ impl Database {
         let wait = crate::observability::BlockWatch::new("journal_commit_wait");
         crate::support::without_blocking_the_worker(|| {
             self.journal_group_commit.commit(|| {
-                self.journal().checkpoint().map_err(std::io::Error::other)?;
+                self.checkpoint_task_journal().map_err(std::io::Error::other)?;
                 self.persist_rollup_journal()
             })
         })?;
@@ -3547,6 +4133,16 @@ impl Database {
         let stats = crate::observability::maintenance_stats();
         stats.journal_commits.store(performed, std::sync::atomic::Ordering::Relaxed);
         stats.journal_commits_coalesced.store(coalesced, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Mutations precede the ticket; neither journal lock can remain held here.
+    fn checkpoint_task_journal(&self) -> Result<()> {
+        crate::support::without_blocking_the_worker(|| self.task_journal_group_commit.commit(|| self.journal().checkpoint()))?;
+        let (performed, coalesced) = self.task_journal_group_commit.counts();
+        let stats = crate::observability::maintenance_stats();
+        stats.task_journal_checkpoints.store(performed, std::sync::atomic::Ordering::Relaxed);
+        stats.task_journal_checkpoints_coalesced.store(coalesced, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 
@@ -3706,7 +4302,8 @@ impl Database {
         let Ok(spans) = Self::partition_file_spans(table, &format!("date={date}")) else { return HashSet::new() };
         // A path the certification names but that `spans` no longer holds was compacted
         // away; it cannot vouch for its replacement, so it drops out of the certified side.
-        let proved: HashSet<&str> = cert.files.iter().filter_map(|uri| crate::tantivy::search::parquet_rel_of_uri(uri)).collect();
+        let Ok((_, visibility)) = Self::logical_count_partition_snapshot(table, project_id, date) else { return HashSet::new() };
+        let proved: HashSet<&str> = cert.files.iter().filter(|(path, dv)| visibility.get(*path) == Some(*dv)).map(|(path, _)| path.as_str()).collect();
         let (certified, uncertified): (Vec<(&str, crate::read::FileSpan)>, Vec<crate::read::FileSpan>) = spans.iter().partition_map(|(rel, span)| {
             if proved.contains(rel.as_str()) { itertools::Either::Left((rel.as_str(), *span)) } else { itertools::Either::Right(*span) }
         });
@@ -3815,9 +4412,9 @@ impl Database {
     /// One body, two call sites: a second spelling of the freshness rule is how
     /// the two drift and one of them starts double counting.
     async fn settle_covered_by_wider(
-        &self, key: &crate::maintenance_coordinator::TaskKey, (covering_start, covering_end): (i64, i64), source_rows: Option<i64>,
+        &self, key: &crate::maintenance_coordinator::TaskKey, (covering_start, covering_end): (i64, i64), (source_rows, source_epoch): (Option<i64>, u64),
         from_table: &Arc<RwLock<DeltaTable>>, witness_table: Option<&Arc<RwLock<DeltaTable>>>, date: chrono::NaiveDate,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         // The enqueue below exists because dropping the unit would leave the hour
         // stale in the coarse tier — WHEN the coarse tier is stale. When the
         // covering slice's witness still verifies (the same whole-or-bounded rules
@@ -3832,14 +4429,25 @@ impl Database {
         // requeue never stops. Prod 2026-09-15: one 3h slice ran 71 times in 90
         // minutes (30 Complete, 37 Superseded, 34 escalations), pinned against the
         // same 6h covering file the whole time.
-        let covering_fresh = 'fresh: {
+        let covering_key =
+            crate::maintenance_coordinator::TaskKey { slice: crate::maintenance_coordinator::TimeSlice::new(covering_start, covering_end)?, ..key.clone() };
+        let covering_proof = 'fresh: {
             let cov_key = (key.project_id.clone(), key.source.clone(), key.physical_table.clone(), covering_start, covering_end);
-            let Some(cov) = self.rollup_slice_coverage.get(&cov_key).map(|entry| entry.value().clone()) else { break 'fresh false };
+            let Some(cov) = self.rollup_slice_coverage.get(&cov_key).map(|entry| entry.value().clone()) else { break 'fresh None };
+            if !Self::rollup_generation_current(&key.source, &key.physical_table, &key.project_id, &date.to_string(), &cov) {
+                break 'fresh None;
+            }
+            let RollupOutputEvidence::Files(files) = cov.output else { break 'fresh None };
+            if !self.tier_still_holds_slice(&covering_key, &cov.generation, files).await {
+                break 'fresh None;
+            }
             let whole = source_rows.and_then(|rows| u64::try_from(rows).ok());
             if witness_matches(cov.source_rows, whole) {
-                break 'fresh true;
+                break 'fresh Some(cov);
             }
-            let Some(witness_below) = cov.source_rows_below else { break 'fresh false };
+            let Some(witness_below) = cov.source_rows_below.filter(|_| self.config.maintenance.timefusion_rollup_bounded_witness) else {
+                break 'fresh None;
+            };
             // Bounded compare at the COVERING slice's own bound — `source_rows_below`
             // in scope was taken at THIS unit's end, which is not the covering end.
             let table = from_table.read().await;
@@ -3855,39 +4463,48 @@ impl Database {
                     stats.remove(&(key.project_id.clone(), date_string.clone())).or_else(|| stats.remove(&("default".to_string(), date_string)))
                 })
                 .and_then(|stats| u64::try_from(stats.rows).ok());
-            witness_matches(Some(witness_below), below)
+            witness_matches(Some(witness_below), below).then_some(cov)
         };
-        if covering_fresh {
-            crate::observability::maintenance_stats().rollup_escalation_skipped_fresh.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let Some(coverage) = covering_proof {
+            if self.complete_rollup_noop(key, &date.to_string(), source_epoch, (covering_key.slice, &coverage))? {
+                crate::observability::maintenance_stats().rollup_escalation_skipped_fresh.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                info!(
+                    table = %key.physical_table, project_id = %key.project_id,
+                    slice_start = key.slice.start_micros, covering_start, covering_end,
+                    event = "maintenance_rollup_completed_under_fresh_covering_slice"
+                );
+            }
+            return Ok(true);
+        }
+        if self.packed_rollup_repair_allowed(key) {
+            return Ok(false);
+        }
+        let escalated = {
+            let _guard = crate::support::lock(&self.rollup_journal_lock);
             let mut journal = self.journal();
-            journal.complete(key);
-            journal.checkpoint()?;
-            info!(
-            table = %key.physical_table, project_id = %key.project_id,
-            slice_start = key.slice.start_micros, covering_start, covering_end,
-            event = "maintenance_rollup_completed_under_fresh_covering_slice"
-            );
-            return Ok(());
-        }
-        crate::observability::maintenance_stats().rollup_skipped_covered_by_wider.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let mut journal = self.journal();
-        if let Ok(covering) = crate::maintenance_coordinator::TimeSlice::new(covering_start, covering_end) {
+            if journal.state(key) != Some(crate::maintenance_coordinator::TaskState::Running) {
+                return Ok(true);
+            }
             let now = crate::support::now_micros();
-            journal.enqueue(
-                crate::maintenance_coordinator::TaskKey { slice: covering, ..key.clone() },
-                now,
-                crate::maintenance_coordinator::MAX_DECODED_BYTES,
-                unix_ms(now),
+            let current = self.rollup_source_epochs.get(&(key.project_id.clone(), key.source.clone(), date.to_string())).map_or(0, |entry| *entry.value());
+            if current == source_epoch {
+                journal.enqueue(covering_key, now, crate::maintenance_coordinator::MAX_DECODED_BYTES, unix_ms(now));
+                journal.complete(key);
+            } else {
+                journal.retry(key, "noop_proof_changed".to_owned(), now.saturating_add(ROLLUP_PROOF_RETRY_MICROS));
+            }
+            current == source_epoch
+        };
+        self.journal().checkpoint()?;
+        if escalated {
+            crate::observability::maintenance_stats().rollup_skipped_covered_by_wider.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            info!(
+                table = %key.physical_table, project_id = %key.project_id,
+                slice_start = key.slice.start_micros, covering_start, covering_end,
+                event = "maintenance_rollup_escalated_to_covering_slice"
             );
         }
-        journal.complete(key);
-        journal.checkpoint()?;
-        info!(
-            table = %key.physical_table, project_id = %key.project_id,
-            slice_start = key.slice.start_micros, covering_start, covering_end,
-            event = "maintenance_rollup_escalated_to_covering_slice"
-        );
-        Ok(())
+        Ok(true)
     }
 
     pub(crate) fn partition_stats_bounded(
@@ -4092,14 +4709,10 @@ impl Database {
         }
     }
 
-    async fn recover_date_coverage(&self, source: &str, target: &str) {
-        let Ok(table_ref) = self.resolve_table("default", source).await else { return };
-        let Ok(stats) = ({
-            let table = table_ref.read().await;
-            Self::partition_stats_bounded(&table, tiebreak_of(source), &|_, _| i64::MAX)
-        }) else {
-            return;
-        };
+    async fn recover_date_coverage(&self, source: &str, target: &str) -> Result<()> {
+        let Ok(table_ref) = self.resolve_table("default", source).await else { return Ok(()) };
+        let table = table_ref.read().await.clone();
+        let stats = Self::partition_stats_bounded(&table, tiebreak_of(source), &|_, _| i64::MAX)?;
         let by_date: HashMap<(String, String), Vec<(i64, RollupCoverage)>> = self
             .rollup_slice_coverage
             .iter()
@@ -4110,16 +4723,31 @@ impl Database {
                 Some(((project.clone(), date), (*start, coverage.clone())))
             })
             .into_group_map();
+        let partition =
+            |project: &str, date: &str| stats.get(&(project.to_owned(), date.to_owned())).or_else(|| stats.get(&("default".to_owned(), date.to_owned())));
+        let needs_bounded = self.config.maintenance.timefusion_rollup_bounded_witness
+            && by_date.iter().any(|((project, date), slices)| {
+                let current = partition(project, date).and_then(|stats| u64::try_from(stats.rows).ok());
+                slices.iter().any(|(_, coverage)| coverage.source_rows_below.is_some() && !coverage.matches_slice(current, None))
+            });
+        let file_rows = needs_bounded.then(|| Self::partition_file_rows(&table)).transpose()?;
         let mut recovered = 0u64;
         let mut moved: Vec<(String, crate::maintenance_coordinator::TimeSlice)> = Vec::new();
         for ((project, date), slices) in by_date {
-            let Some(partition) = stats.get(&(project.clone(), date.clone())).or_else(|| stats.get(&("default".to_string(), date.clone()))) else {
+            let Some(partition) = partition(&project, &date) else {
                 continue;
             };
             let Ok(current_rows) = u64::try_from(partition.rows) else { continue };
+            let agrees = |coverage: &RollupCoverage| {
+                coverage.matches_slice(Some(current_rows), None)
+                    || file_rows
+                        .as_ref()
+                        .and_then(|files| files.get(&(project.clone(), date.clone())).or_else(|| files.get(&("default".to_owned(), date.clone()))))
+                        .is_some_and(|files| coverage.matches_slice(Some(current_rows), crate::rollup::rows_below(files, coverage.covered_through)))
+            };
             // Every slice must be verifiable AND agree: one unverifiable slice means the
             // date cannot be proven current, and an unproven date must not be stamped.
-            if !slices.iter().all(|(_, coverage)| coverage.source_rows == Some(current_rows)) {
+            if !slices.iter().all(|(_, coverage)| agrees(coverage)) {
                 // STALE UNTIL REBUILT, not stale forever: the read path refuses an
                 // overtaken slice, so queue the disagreeing ones rather than leaving them
                 // with no path back to `proven`. `enqueue_unverifiable_rebuilds` is
@@ -4132,7 +4760,7 @@ impl Database {
                 // predicate is the dedup certification, so a partition still taking late
                 // arrivals for yesterday reads as sealed here and can be requeued twice.
                 if date < chrono::Utc::now().date_naive().to_string() {
-                    moved.extend(slices.iter().filter(|(_, coverage)| coverage.source_rows != Some(current_rows)).map(|(start, coverage)| {
+                    moved.extend(slices.iter().filter(|(_, coverage)| !agrees(coverage)).map(|(start, coverage)| {
                         (project.clone(), crate::maintenance_coordinator::TimeSlice { start_micros: *start, end_micros: coverage.covered_through })
                     }));
                 }
@@ -4141,6 +4769,13 @@ impl Database {
             let mut spans: Vec<(i64, i64)> = slices.iter().map(|(start, coverage)| (*start, coverage.covered_through)).collect();
             let Some(covered_through) = Self::contiguous_coverage_end(partition.min_ts, &mut spans) else { continue };
             let newest = slices.iter().map(|(_, coverage)| coverage).max_by_key(|coverage| coverage.covered_through).expect("non-empty");
+            // A date record has only one generation and one output kind. Mixed
+            // slices remain independently readable, never widened into that record.
+            if slices.iter().any(|(_, coverage)| {
+                coverage.generation != newest.generation || (coverage.output == RollupOutputEvidence::Empty) != (newest.output == RollupOutputEvidence::Empty)
+            }) {
+                continue;
+            }
             // A date can be read for a measure only if EVERY slice covering it
             // materialized it: the date route never consults the slices again, so it
             // cannot be more optimistic than the weakest one.
@@ -4159,7 +4794,7 @@ impl Database {
                     covered_through,
                     measures: measures.flatten(),
                     content_fp: None,
-                    output_files: 0,
+                    output: if newest.output == RollupOutputEvidence::Empty { RollupOutputEvidence::Empty } else { RollupOutputEvidence::Unknown },
                 },
             );
             recovered += 1;
@@ -4174,6 +4809,7 @@ impl Database {
         if recovered != 0 {
             info!(source, target, recovered, event = "rollup_date_coverage_recovered", "date-level coverage rebuilt from witnessed slices");
         }
+        Ok(())
     }
 
     /// Republish the slices whose coverage can never be verified.
@@ -4250,7 +4886,7 @@ impl Database {
                     covered_through: entry.end_micros,
                     measures: entry.measures.as_ref().map(|names| names.iter().cloned().collect()),
                     content_fp: None,
-                    output_files: 0,
+                    output: RollupOutputEvidence::from_file_count(entry.files.len()),
                 };
                 if !Self::rollup_generation_current(&source, &table_name, &project_id, &date, &coverage) {
                     crate::observability::maintenance_stats().rollup_ledger_seed_rejected_generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -4360,132 +4996,150 @@ impl Database {
             let mut untagged_files = 0u64;
             // Recovery reads only the Delta transaction log (coverage identity lives
             // in Add tags); no rollup data scan competes with startup queries.
-            let (tagged, paths_by_identity, measures_by_identity, content_fp_by_identity, bounded_by_identity, witness_reasons, witnessed) =
-                match self.resolve_table("default", &target).await {
-                    Ok(table) => {
-                        let table = table.read().await;
-                        // `source_rows` is part of the KEY so a partition rebuilt against a
-                        // different source count cannot merge with the older evidence.
-                        let mut groups: std::collections::HashSet<TaggedSliceIdentity> = std::collections::HashSet::new();
-                        // Paths per tagged identity, keyed exactly like `groups`. The ledger
-                        // must be written only from the FILTERED loop below: the filters
-                        // there decide whether a slice is READABLE, and a ledger written
-                        // before them claims coverage the read path refuses.
-                        let mut paths_by_identity: HashMap<TaggedSliceIdentity, (String, Vec<String>)> = HashMap::new();
-                        // Keyed WITHOUT `source_rows`, so a slice whose files disagree (a
-                        // rewrite that stripped the tag off some of them) stays
-                        // distinguishable from one that never had it — different repair.
-                        let mut witness_reasons: HashMap<SliceKey, UnverifiableReason> = HashMap::new();
-                        let mut witnessed: std::collections::HashSet<SliceKey> = std::collections::HashSet::new();
-                        // Not part of the identity: two files of one slice that
-                        // disagree about their measures are still the same slice,
-                        // and folding measures into the key would instead make them
-                        // two entries racing for one coverage slot.
-                        let mut measures_by_identity: HashMap<TaggedSliceIdentity, Option<BTreeSet<String>>> = HashMap::new();
-                        // The input set each identity was aggregated from: a property of
-                        // the unit, so all its files carry the same value and any
-                        // disagreement collapses to `None`, declining the skip.
-                        let mut content_fp_by_identity: HashMap<TaggedSliceIdentity, Option<u64>> = HashMap::new();
-                        // The bounded witness, merged like `content_fp`: every file of a
-                        // slice was stamped by the same build, so a disagreement means a
-                        // partial strip and collapses to `None` (fall back to the
-                        // whole-partition compare) rather than picking a side.
-                        let mut bounded_by_identity: HashMap<TaggedSliceIdentity, Option<u64>> = HashMap::new();
-                        for add in table.snapshot()?.log_data().iter() {
-                            let action = add_action(&add);
-                            // An untagged file proves no coverage; remember its partition
-                            // so a rebuild can be enqueued below (a sealed day that
-                            // already has coverage is otherwise never republished).
-                            // Both arms feed `uncovered_gaps`. `hi + 1` because
-                            // statistics bounds are inclusive while a slice end is not.
-                            let file_partition = Self::maintenance_partition_from_action(&action.path, Some(&action.partition_values), "default");
-                            if let Some(partition) = file_partition.clone() {
-                                let tags = action.tags.as_ref();
-                                let tag = |name: &str| tags?.get(name).and_then(Option::as_deref)?.parse::<i64>().ok();
-                                match (tag(crate::maintenance_coordinator::TAG_SLICE_START), tag(crate::maintenance_coordinator::TAG_SLICE_END)) {
-                                    (Some(start), Some(end)) => tagged_spans.entry(partition).or_default().push((start, end)),
-                                    _ => {
-                                        untagged_files = untagged_files.saturating_add(1);
-                                        untagged_spans.entry(partition).or_default().extend(
-                                            action.stats.as_deref().and_then(crate::rollup::stats_time_range).map(|(lo, hi)| (lo, hi.saturating_add(1))),
-                                        );
-                                    }
+            let (
+                tagged,
+                paths_by_identity,
+                measures_by_identity,
+                content_fp_by_identity,
+                bounded_by_identity,
+                output_rows_by_identity,
+                witness_reasons,
+                witnessed,
+            ) = match self.resolve_table("default", &target).await {
+                Ok(table) => {
+                    let table = table.read().await;
+                    // `source_rows` is part of the KEY so a partition rebuilt against a
+                    // different source count cannot merge with the older evidence.
+                    let mut groups: std::collections::HashSet<TaggedSliceIdentity> = std::collections::HashSet::new();
+                    // Paths per tagged identity, keyed exactly like `groups`. The ledger
+                    // must be written only from the FILTERED loop below: the filters
+                    // there decide whether a slice is READABLE, and a ledger written
+                    // before them claims coverage the read path refuses.
+                    let mut paths_by_identity: HashMap<TaggedSliceIdentity, (String, Vec<String>)> = HashMap::new();
+                    // Keyed WITHOUT `source_rows`, so a slice whose files disagree (a
+                    // rewrite that stripped the tag off some of them) stays
+                    // distinguishable from one that never had it — different repair.
+                    let mut witness_reasons: HashMap<SliceKey, UnverifiableReason> = HashMap::new();
+                    let mut witnessed: std::collections::HashSet<SliceKey> = std::collections::HashSet::new();
+                    // Not part of the identity: two files of one slice that
+                    // disagree about their measures are still the same slice,
+                    // and folding measures into the key would instead make them
+                    // two entries racing for one coverage slot.
+                    let mut measures_by_identity: HashMap<TaggedSliceIdentity, Option<BTreeSet<String>>> = HashMap::new();
+                    // The input set each identity was aggregated from: a property of
+                    // the unit, so all its files carry the same value and any
+                    // disagreement collapses to `None`, declining the skip.
+                    let mut content_fp_by_identity: HashMap<TaggedSliceIdentity, Option<u64>> = HashMap::new();
+                    // The bounded witness, merged like `content_fp`: every file of a
+                    // slice was stamped by the same build, so a disagreement means a
+                    // partial strip and collapses to `None` (fall back to the
+                    // whole-partition compare) rather than picking a side.
+                    let mut bounded_by_identity: HashMap<TaggedSliceIdentity, Option<u64>> = HashMap::new();
+                    let mut output_rows_by_identity: HashMap<TaggedSliceIdentity, RollupOutputProof> = HashMap::new();
+                    for add in table.snapshot()?.log_data().iter() {
+                        let action = add_action(&add);
+                        // An untagged file proves no coverage; remember its partition
+                        // so a rebuild can be enqueued below (a sealed day that
+                        // already has coverage is otherwise never republished).
+                        // Both arms feed `uncovered_gaps`. `hi + 1` because
+                        // statistics bounds are inclusive while a slice end is not.
+                        let file_partition = Self::maintenance_partition_from_action(&action.path, Some(&action.partition_values), "default");
+                        if let Some(partition) = file_partition.clone() {
+                            let tags = action.tags.as_ref();
+                            let tag = |name: &str| tags?.get(name).and_then(Option::as_deref)?.parse::<i64>().ok();
+                            match (tag(crate::maintenance_coordinator::TAG_SLICE_START), tag(crate::maintenance_coordinator::TAG_SLICE_END)) {
+                                (Some(start), Some(end)) => tagged_spans.entry(partition).or_default().push((start, end)),
+                                _ => {
+                                    untagged_files = untagged_files.saturating_add(1);
+                                    untagged_spans
+                                        .entry(partition)
+                                        .or_default()
+                                        .extend(action.stats.as_deref().and_then(crate::rollup::stats_time_range).map(|(lo, hi)| (lo, hi.saturating_add(1))));
                                 }
-                            }
-                            let Some(tags) = action.tags.as_ref() else { continue };
-                            let tag = |name: &str| tags.get(name).and_then(Option::as_deref);
-                            if tag(crate::maintenance_coordinator::TAG_SOURCE) != Some(source) {
-                                continue;
-                            }
-                            let (Some(project), Some(generation), Some(source_fp), Some(slice_start), Some(slice_end)) = (
-                                tag(crate::maintenance_coordinator::TAG_PROJECT),
-                                tag(crate::maintenance_coordinator::TAG_GENERATION),
-                                tag(crate::maintenance_coordinator::TAG_SOURCE_FINGERPRINT).and_then(|value| value.parse::<u64>().ok()),
-                                tag(crate::maintenance_coordinator::TAG_SLICE_START).and_then(|value| value.parse::<i64>().ok()),
-                                tag(crate::maintenance_coordinator::TAG_SLICE_END).and_then(|value| value.parse::<i64>().ok()),
-                            ) else {
-                                // Tagged for THIS source, yet not identifiable: the file
-                                // is dropped from the tagged set and counted nowhere
-                                // else, so without this it is an invisible population.
-                                crate::database::rollup_unverifiable::IDENTITY_TAG_INCOMPLETE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                continue;
-                            };
-                            // Absent on pre-tag generations; `-1` is the sentinel for "source
-                            // reported no count". Both become `None`, which the read path
-                            // refuses to verify.
-                            let witness = crate::database::rollup_unverifiable::classify_witness(tag(crate::maintenance_coordinator::TAG_SOURCE_ROWS));
-                            // REACHABILITY, before the read side is built on it. #298 writes
-                            // TAG_SOURCE_ROWS_BELOW; nothing reads it yet, so without this
-                            // there is no way to know whether the bounded witness is
-                            // actually present on recovered slices. Three read-path changes
-                            // tonight were each sound and each fired ~never, and every one
-                            // was caught by a counter rather than by argument — so the
-                            // counter comes BEFORE the change that would depend on it.
-                            let bounded_witness = tag(crate::maintenance_coordinator::TAG_SOURCE_ROWS_BELOW)
-                                .and_then(|raw| raw.parse::<i64>().ok())
-                                .filter(|rows| *rows >= 0)
-                                .and_then(|rows| u64::try_from(rows).ok());
-                            match bounded_witness {
-                                Some(_) => metrics::counter!(scan_metric_names::ROLLUP_WITNESS_BOUNDED_PRESENT).increment(1),
-                                None => metrics::counter!(scan_metric_names::ROLLUP_WITNESS_BOUNDED_ABSENT).increment(1),
-                            }
-                            let source_rows = witness.ok();
-                            let slice_key = (project.to_owned(), slice_start, slice_end, generation.to_owned(), source_fp);
-                            match witness {
-                                Ok(_) => {
-                                    witnessed.insert(slice_key);
-                                }
-                                // Lowest variant wins, so a slice seen under two
-                                // reasons attributes deterministically whatever order
-                                // the log lists its files in.
-                                Err(reason) => {
-                                    witness_reasons.entry(slice_key).and_modify(|held| *held = (*held).min(reason)).or_insert(reason);
-                                }
-                            }
-                            // Absent means "no evidence", NOT "no measures": an empty tag
-                            // value must still parse as `Some(∅)`. A slice can only be
-                            // read for a measure ALL its files carry, hence the intersection.
-                            let measures = tag(crate::maintenance_coordinator::TAG_MEASURES)
-                                .map(|value| value.split(',').filter(|name| !name.is_empty()).map(str::to_owned).collect::<BTreeSet<String>>());
-                            let identity = (project.to_owned(), slice_start, slice_end, generation.to_owned(), source_fp, source_rows);
-                            Self::merge_at(&mut measures_by_identity, identity.clone(), measures, |seen, new| {
-                                seen.zip(new).map(|(left, right)| &left & &right)
-                            });
-                            let content_fp = tag(crate::maintenance_coordinator::TAG_CONTENT_FINGERPRINT).and_then(|value| value.parse::<u64>().ok());
-                            Self::merge_at(&mut content_fp_by_identity, identity.clone(), content_fp, |seen, new| (seen == new).then_some(seen).flatten());
-                            Self::merge_at(&mut bounded_by_identity, identity.clone(), bounded_witness, |seen, new| (seen == new).then_some(seen).flatten());
-                            groups.insert(identity.clone());
-                            // The date comes from the file's own partition, not from
-                            // `slice_start`: a file in `date=D` cannot hold rows outside
-                            // `D`, which is the stronger statement.
-                            if let Some((partition_project, _date)) = file_partition.as_ref() {
-                                paths_by_identity.entry(identity).or_insert_with(|| ((*partition_project).to_owned(), Vec::new())).1.push(action.path.clone());
                             }
                         }
-                        (groups, paths_by_identity, measures_by_identity, content_fp_by_identity, bounded_by_identity, witness_reasons, witnessed)
+                        let Some(tags) = action.tags.as_ref() else { continue };
+                        let tag = |name: &str| tags.get(name).and_then(Option::as_deref);
+                        if tag(crate::maintenance_coordinator::TAG_SOURCE) != Some(source) {
+                            continue;
+                        }
+                        let (Some(project), Some(generation), Some(source_fp), Some(slice_start), Some(slice_end)) = (
+                            tag(crate::maintenance_coordinator::TAG_PROJECT),
+                            tag(crate::maintenance_coordinator::TAG_GENERATION),
+                            tag(crate::maintenance_coordinator::TAG_SOURCE_FINGERPRINT).and_then(|value| value.parse::<u64>().ok()),
+                            tag(crate::maintenance_coordinator::TAG_SLICE_START).and_then(|value| value.parse::<i64>().ok()),
+                            tag(crate::maintenance_coordinator::TAG_SLICE_END).and_then(|value| value.parse::<i64>().ok()),
+                        ) else {
+                            // Tagged for THIS source, yet not identifiable: the file
+                            // is dropped from the tagged set and counted nowhere
+                            // else, so without this it is an invisible population.
+                            crate::database::rollup_unverifiable::IDENTITY_TAG_INCOMPLETE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            continue;
+                        };
+                        // Absent on pre-tag generations; `-1` is the sentinel for "source
+                        // reported no count". Both become `None`, which the read path
+                        // refuses to verify.
+                        let witness = crate::database::rollup_unverifiable::classify_witness(tag(crate::maintenance_coordinator::TAG_SOURCE_ROWS));
+                        // REACHABILITY, before the read side is built on it. #298 writes
+                        // TAG_SOURCE_ROWS_BELOW; nothing reads it yet, so without this
+                        // there is no way to know whether the bounded witness is
+                        // actually present on recovered slices. Three read-path changes
+                        // tonight were each sound and each fired ~never, and every one
+                        // was caught by a counter rather than by argument — so the
+                        // counter comes BEFORE the change that would depend on it.
+                        let bounded_witness = tag(crate::maintenance_coordinator::TAG_SOURCE_ROWS_BELOW)
+                            .and_then(|raw| raw.parse::<i64>().ok())
+                            .filter(|rows| *rows >= 0)
+                            .and_then(|rows| u64::try_from(rows).ok());
+                        match bounded_witness {
+                            Some(_) => metrics::counter!(scan_metric_names::ROLLUP_WITNESS_BOUNDED_PRESENT).increment(1),
+                            None => metrics::counter!(scan_metric_names::ROLLUP_WITNESS_BOUNDED_ABSENT).increment(1),
+                        }
+                        let source_rows = witness.ok();
+                        let slice_key = (project.to_owned(), slice_start, slice_end, generation.to_owned(), source_fp);
+                        match witness {
+                            Ok(_) => {
+                                witnessed.insert(slice_key);
+                            }
+                            // Lowest variant wins, so a slice seen under two
+                            // reasons attributes deterministically whatever order
+                            // the log lists its files in.
+                            Err(reason) => {
+                                witness_reasons.entry(slice_key).and_modify(|held| *held = (*held).min(reason)).or_insert(reason);
+                            }
+                        }
+                        // Absent means "no evidence", NOT "no measures": an empty tag
+                        // value must still parse as `Some(∅)`. A slice can only be
+                        // read for a measure ALL its files carry, hence the intersection.
+                        let measures = tag(crate::maintenance_coordinator::TAG_MEASURES)
+                            .map(|value| value.split(',').filter(|name| !name.is_empty()).map(str::to_owned).collect::<BTreeSet<String>>());
+                        let identity = (project.to_owned(), slice_start, slice_end, generation.to_owned(), source_fp, source_rows);
+                        Self::merge_at(&mut measures_by_identity, identity.clone(), measures, |seen, new| seen.zip(new).map(|(left, right)| &left & &right));
+                        let content_fp = tag(crate::maintenance_coordinator::TAG_CONTENT_FINGERPRINT).and_then(|value| value.parse::<u64>().ok());
+                        Self::merge_at(&mut content_fp_by_identity, identity.clone(), content_fp, |seen, new| (seen == new).then_some(seen).flatten());
+                        Self::merge_at(&mut bounded_by_identity, identity.clone(), bounded_witness, |seen, new| (seen == new).then_some(seen).flatten());
+                        Self::merge_at(&mut output_rows_by_identity, identity.clone(), RollupOutputProof::from_add(&action), RollupOutputProof::merge);
+                        groups.insert(identity.clone());
+                        // The date comes from the file's own partition, not from
+                        // `slice_start`: a file in `date=D` cannot hold rows outside
+                        // `D`, which is the stronger statement.
+                        if let Some((partition_project, _date)) = file_partition.as_ref() {
+                            paths_by_identity.entry(identity).or_insert_with(|| ((*partition_project).to_owned(), Vec::new())).1.push(action.path.clone());
+                        }
                     }
-                    Err(_) => Default::default(),
-                };
+                    (
+                        groups,
+                        paths_by_identity,
+                        measures_by_identity,
+                        content_fp_by_identity,
+                        bounded_by_identity,
+                        output_rows_by_identity,
+                        witness_reasons,
+                        witnessed,
+                    )
+                }
+                Err(_) => Default::default(),
+            };
             // Filled by the FILTERED loop below, then written once per tier. Nothing
             // is recorded for a slice the read path would refuse: the ledger is the
             // authority, and one that over-claims serves wrong results.
@@ -4507,6 +5161,7 @@ impl Database {
             // to compete in the general queue.
             let mut witnessless: Vec<(String, crate::maintenance_coordinator::TimeSlice)> = Vec::new();
             let mut obsolete_generations = Vec::new();
+            let mut incomplete_output = Vec::new();
             // Counted from the durable Delta tags, NOT from `published_rollups`:
             // enqueueing a slice flips its task off Complete, so a journal-derived
             // count reads zero exactly when the backlog is being worked.
@@ -4548,19 +5203,38 @@ impl Database {
             }
             unverifiable += spec_unverifiable;
             let published = self.journal().published_rollups(source, &target);
+            let publications: HashMap<_, _> = published.iter().map(|(key, publication)| ((key.project_id.as_str(), key.slice), publication)).collect();
             for (key, publication) in &published {
                 if publication.source_rows.is_none() {
                     witnessless.push((key.project_id.clone(), key.slice));
                 }
                 let Some(date) = chrono::DateTime::from_timestamp_micros(key.slice.start_micros).map(|time| time.date_naive().to_string()) else { continue };
-                let identity = (
-                    key.project_id.clone(),
-                    key.slice.start_micros,
-                    key.slice.end_micros,
-                    publication.generation.clone(),
-                    publication.source_fingerprint,
-                    publication.source_rows,
-                );
+                // Journal evidence can prove an obsolete generation even when all Add tags are gone.
+                // Legacy nonempty publications without measure evidence still need the tag checks.
+                if publication.evidence.as_ref().is_some_and(|evidence| {
+                    publication.generation
+                        != crate::rollup::generation_id(spec, source, &key.project_id, &date, publication.source_fingerprint, Some(&evidence.measures))
+                }) {
+                    obsolete_generations.push((key.project_id.clone(), key.slice));
+                    continue;
+                }
+                // Nonempty publications recover only from the live tagged output below.
+                if publication.rows != 0 {
+                    continue;
+                }
+                let source_key = (key.project_id.clone(), source.to_string(), date.clone());
+                let epoch = || self.rollup_source_epochs.get(&source_key).map_or(0, |entry| *entry.value());
+                let before = epoch();
+                if !self.empty_base_rollup_current(key, publication).await? {
+                    let _guard = crate::support::lock(&self.rollup_journal_lock);
+                    self.rollup_slice_coverage
+                        .remove_if(&(key.project_id.clone(), source.to_string(), target.clone(), key.slice.start_micros, key.slice.end_micros), |_, held| {
+                            held.output == RollupOutputEvidence::Empty && held.generation == publication.generation
+                        });
+                    self.rollup_coverage
+                        .remove_if(&(key.project_id.clone(), source.to_string(), target.clone(), date), |_, held| held.output == RollupOutputEvidence::Empty);
+                    continue;
+                }
                 let coverage = RollupCoverage {
                     source_fp: publication.source_fingerprint,
                     source_epoch: None,
@@ -4568,18 +5242,20 @@ impl Database {
                     source_rows: publication.source_rows,
                     source_rows_below: publication.source_rows_below,
                     covered_through: key.slice.end_micros,
-                    // The journal alone has no measure proof. Use matching file
-                    // evidence when available, including partial measure sets.
-                    measures: measures_by_identity.get(&identity).and_then(Option::as_ref).map(|names| names.iter().cloned().collect()),
-                    content_fp: None,
-                    output_files: 0,
+                    measures: publication.evidence.as_ref().map(|proof| proof.measures.iter().cloned().collect()),
+                    content_fp: publication.evidence.as_ref().map(|proof| proof.content_fp),
+                    output: RollupOutputEvidence::Empty,
                 };
                 if !Self::rollup_generation_current(source, &target, &key.project_id, &date, &coverage) {
-                    // The tagged loop queues identities it sees. A journal-only
-                    // publication still needs rebuilding when the tags are absent.
-                    if !measures_by_identity.contains_key(&identity) {
-                        obsolete_generations.push((key.project_id.clone(), key.slice));
-                    }
+                    obsolete_generations.push((key.project_id.clone(), key.slice));
+                    continue;
+                }
+                let _guard = crate::support::lock(&self.rollup_journal_lock);
+                if epoch() != before
+                    || !self.journal().tasks().any(|task| {
+                        task.key == *key && task.state == crate::maintenance_coordinator::TaskState::Complete && task.publication.as_ref() == Some(publication)
+                    })
+                {
                     continue;
                 }
                 self.rollup_slice_coverage
@@ -4599,7 +5275,8 @@ impl Database {
                         fate(UnverifiableFate::InvalidSlice);
                         continue;
                     };
-                    let complete = self.journal().rollup_slice_complete(source, &project_id, &target, slice);
+                    let complete = self.journal().rollup_slice_complete(source, &project_id, &target, slice)
+                        && !publications.get(&(project_id.as_str(), slice)).is_some_and(|publication| publication.rows == 0);
                     let Some(date) = chrono::DateTime::from_timestamp_micros(slice_start).map(|time| time.date_naive().to_string()) else {
                         fate(UnverifiableFate::InvalidSlice);
                         continue;
@@ -4613,6 +5290,25 @@ impl Database {
                         continue;
                     }
                     let identity = (project_id.clone(), slice_start, slice_end, generation.clone(), source_fp, source_rows);
+                    let publication = publications.get(&(project_id.as_str(), slice)).filter(|publication| {
+                        publication.generation == generation && publication.source_fingerprint == source_fp && publication.source_rows == source_rows
+                    });
+                    // Tags retain the expected count after a no-op clears the task publication.
+                    // Legacy output can use an independent matching journal record instead.
+                    let complete_output = output_rows_by_identity.get(&identity).is_some_and(|rows| {
+                        let expected = rows.published.or_else(|| publication.map(|publication| publication.rows));
+                        expected.is_some() && rows.live == expected && publication.is_none_or(|publication| expected == Some(publication.rows))
+                    });
+                    if !complete_output {
+                        fate(UnverifiableFate::QueuedForRepublish);
+                        self.rollup_slice_coverage.remove_if(&(project_id.clone(), source.to_owned(), target.clone(), slice_start, slice_end), |_, held| {
+                            held.generation == generation
+                        });
+                        self.rollup_coverage
+                            .remove_if(&(project_id.clone(), source.to_owned(), target.clone(), date.clone()), |_, held| held.generation == generation);
+                        incomplete_output.push((project_id, slice));
+                        continue;
+                    }
                     let measures = measures_by_identity.get(&identity).cloned().flatten();
                     let restrict = measures.as_ref().map(|names| names.iter().cloned().collect::<Vec<_>>());
                     if crate::rollup::generation_id(spec, source, &project_id, &date, source_fp, restrict.as_deref()) != generation {
@@ -4645,7 +5341,8 @@ impl Database {
                     // rebuild rather than freezing.
                     let content_fp = content_fp_by_identity.get(&identity).copied().flatten();
                     let source_rows_below = bounded_by_identity.get(&identity).copied().flatten();
-                    let output_files = paths_by_identity.get(&identity).map_or(0, |(_, paths)| u32::try_from(paths.len()).unwrap_or(u32::MAX));
+                    let output =
+                        paths_by_identity.get(&identity).map_or(RollupOutputEvidence::Unknown, |(_, paths)| RollupOutputEvidence::from_file_count(paths.len()));
                     self.rollup_slice_coverage.insert(
                         (project_id, source.to_string(), target.clone(), slice_start, slice_end),
                         RollupCoverage {
@@ -4657,7 +5354,7 @@ impl Database {
                             covered_through: slice_end,
                             measures: measures.map(|names| names.into_iter().collect()),
                             content_fp,
-                            output_files,
+                            output,
                         },
                     );
                     recovered += 1;
@@ -4669,7 +5366,8 @@ impl Database {
             }
             self.enqueue_unverifiable_rebuilds(source, spec, &target, RollupRebuildReason::MissingRowWitness, &witnessless);
             self.enqueue_unverifiable_rebuilds(source, spec, &target, RollupRebuildReason::ObsoleteGeneration, &obsolete_generations);
-            self.recover_date_coverage(source, &target).await;
+            self.enqueue_unverifiable_rebuilds(source, spec, &target, RollupRebuildReason::UnprovenOutput, &incomplete_output);
+            self.recover_date_coverage(source, &target).await?;
             // Untagged legacy generations are left uncovered: recovering them needs a
             // rollup data scan, which starves pgwire at startup. Reads fall back to
             // raw data until the coordinator republishes them with tags.
@@ -4704,7 +5402,8 @@ impl Database {
     /// from the sweep/backfill paths.
     async fn record_clean_slice(
         &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, project_id: &str, date: chrono::NaiveDate,
-        (slice, dropped, masked): (crate::maintenance_coordinator::TimeSlice, u64, Option<MaskedPass<'_>>), pre: &[String],
+        (slice, dropped, masked): (crate::maintenance_coordinator::TimeSlice, u64, Option<MaskedPass<'_>>),
+        (pre, pre_visibility): (&[String], &crate::read::CountFiles),
     ) -> Result<Option<u64>> {
         let day_start = day_start_micros(date).unwrap_or_default();
         let day_end = day_start.saturating_add(crate::maintenance_coordinator::DAY_MICROS);
@@ -4714,18 +5413,21 @@ impl Database {
             return Ok(None); // a slice outside the day proves nothing about it
         }
         let key = (project_id.to_string(), table_name.to_string(), date.to_string());
-        let (post, post_dv) = {
+        let (post, post_dv, post_visibility) = {
             let table = table_ref.read().await;
             (
                 Self::partition_files_by_pid(&table, &format!("date={date}"))?.remove(project_id).unwrap_or_default(),
                 masked.map(|_| Self::partition_dv_state(&table, project_id, &format!("date={date}"))).transpose()?,
+                Self::logical_count_partition_snapshot(&table, project_id, &date.to_string())?.1,
             )
         };
         let fp = partition_file_fp(&post);
-        // DV-visibility guard, masked arm only: the URI fp cannot see a foreign
-        // same-path DV commit (DML DELETE/UPDATE write DVs too), so compare the
-        // live (path, dv_unique_id) set instead — fail-closed, like fp_moved.
-        let dv_moved = masked.zip(post_dv.as_ref()).is_some_and(|((pre_dv, attachments), live)| dv_visibility_moved(pre_dv, attachments, live));
+        // Paths alone cannot see a same-path DV mutation. A masked pass must
+        // account for its own attachments; an unmasked pass cannot change masks.
+        let dv_moved = masked.zip(post_dv.as_ref()).map_or_else(
+            || pre_visibility.iter().any(|(path, dv)| post_visibility.get(path).is_some_and(|current| current != dv)),
+            |((pre_dv, attachments), live)| dv_visibility_moved(pre_dv, attachments, live),
+        );
         if dv_moved {
             metrics::counter!(scan_metric_names::CERT_SLICE_DV_MOVED).increment(1);
         }
@@ -4734,7 +5436,7 @@ impl Database {
             if self.dedup_slice_coverage.remove(&key).is_some() {
                 self.persist_slice_coverage();
             }
-            return self.record_certification(table_ref, table_name, project_id, date, pre, (dropped, true)).await;
+            return self.record_certification(table_ref, table_name, project_id, date, pre_visibility, (dropped, true)).await;
         }
         // What survives a fingerprint move, computed BEFORE taking the DashMap entry
         // so the read lock on the table is not held across it.
@@ -4750,48 +5452,51 @@ impl Database {
         // Sound only where `timestamp` is a dedup key — a duplicate group then
         // shares one timestamp, so a new file cannot mint duplicates outside its own
         // span. Everything else resets, as before.
-        let retained: Option<Vec<(i64, i64)>> = if !self.config.maintenance.timefusion_dedup_coverage_retention
-            || !schema_or_default(table_name).dedup_keys.iter().any(|key| key == "timestamp")
-        {
-            None
-        } else {
-            let prior = self.dedup_slice_coverage.get(&key).map(|e| e.value().clone()).filter(|cov| cov.fp != fp && !cov.files.is_empty());
-            match prior {
-                None => None,
-                Some(cov) => {
-                    let known: HashSet<&str> = cov.files.iter().filter_map(|uri| crate::tantivy::search::parquet_rel_of_uri(uri)).collect();
-                    let spans = {
-                        let table = table_ref.read().await;
-                        Self::partition_file_spans(&table, &format!("date={date}"))
-                    };
-                    // A partition we cannot read spans for proves nothing new.
-                    spans.ok().and_then(|spans| {
-                        let arrived: Vec<Option<(i64, i64)>> = spans.iter().filter(|(rel, _)| !known.contains(rel.as_str())).map(|(_, span)| *span).collect();
-                        crate::database::retain_clean_intervals(&cov.intervals, &arrived)
-                    })
+        let retained: Option<Vec<(i64, i64)>> =
+            if !self.config.maintenance.timefusion_dedup_coverage_retention || !schema_or_default(table_name).dedup_keys.iter().any(|key| key == "timestamp") {
+                None
+            } else {
+                let prior = self.dedup_slice_coverage.get(&key).map(|e| e.value().clone()).filter(|cov| cov.files != post_visibility && !cov.files.is_empty());
+                match prior {
+                    None => None,
+                    Some(cov) => {
+                        let spans = {
+                            let table = table_ref.read().await;
+                            Self::partition_file_spans(&table, &format!("date={date}"))
+                        };
+                        // A partition we cannot read spans for proves nothing new.
+                        spans.ok().and_then(|spans| {
+                            let arrived: Vec<Option<(i64, i64)>> = post_visibility
+                                .iter()
+                                .filter(|(path, dv)| cov.files.get(*path) != Some(*dv))
+                                .map(|(path, _)| spans.get(path).copied().flatten())
+                                .collect();
+                            crate::database::retain_clean_intervals(&cov.intervals, &arrived)
+                        })
+                    }
                 }
-            }
-        };
+            };
         // Bind in its own block: the RefMut must drop before the remove/await below
         // (DashMap-shard self-deadlock).
         let (covered, intervals) = {
-            let mut entry = self.dedup_slice_coverage.entry(key.clone()).or_insert_with(|| SliceCoverage { fp, intervals: Vec::new(), files: Vec::new() });
-            if entry.fp != fp {
+            let mut entry =
+                self.dedup_slice_coverage.entry(key.clone()).or_insert_with(|| SliceCoverage { fp, intervals: Vec::new(), files: Default::default() });
+            if entry.fp != fp || entry.files != post_visibility {
                 match retained {
                     Some(keep) => {
                         metrics::counter!(scan_metric_names::CERT_COVERAGE_RETAINED).increment(1);
-                        *entry = SliceCoverage { fp, intervals: keep, files: Vec::new() };
+                        *entry = SliceCoverage { fp, intervals: keep, files: Default::default() };
                         merge_clean_interval(&mut entry.intervals, (start, end));
                     }
                     None => {
                         metrics::counter!(scan_metric_names::CERT_COVERAGE_RESET).increment(1);
-                        *entry = SliceCoverage { fp, intervals: vec![(start, end)], files: Vec::new() };
+                        *entry = SliceCoverage { fp, intervals: vec![(start, end)], files: Default::default() };
                     }
                 }
             } else {
                 merge_clean_interval(&mut entry.intervals, (start, end));
             }
-            entry.files = post.clone();
+            entry.files = post_visibility.clone();
             (entry.intervals.iter().any(|&(s, e)| s <= day_start && e >= day_end), entry.intervals.clone())
         };
         // Write-through on every mutation: the journal durably marks this slice
@@ -4804,13 +5509,13 @@ impl Database {
             // the files whose whole span lies inside it. Banking it is what makes the
             // per-FILE skip reachable: whole-day coverage under an unchanged
             // fingerprint essentially never happens on a live table.
-            self.certify_files_within_slice(table_ref, table_name, project_id, date, &intervals).await;
+            self.certify_files_within_slice(table_ref, table_name, project_id, date, &intervals, &post_visibility).await;
             return Ok(None);
         }
         metrics::counter!(scan_metric_names::CERT_SLICE_DAY_COVERED).increment(1);
         self.dedup_slice_coverage.remove(&key);
         self.persist_slice_coverage();
-        self.record_certification(table_ref, table_name, project_id, date, &post, (0, true)).await
+        self.record_certification(table_ref, table_name, project_id, date, &post_visibility, (0, true)).await
     }
 
     /// Bank the files a clean slice proved, as evidence for the per-FILE skip.
@@ -4829,6 +5534,7 @@ impl Database {
     /// NEVER grant the whole-partition skip.
     async fn certify_files_within_slice(
         &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, project_id: &str, date: chrono::NaiveDate, intervals: &[(i64, i64)],
+        visibility: &crate::read::CountFiles,
     ) {
         if !schema_or_default(table_name).dedup_keys.iter().any(|key| key == "timestamp") {
             return;
@@ -4838,13 +5544,15 @@ impl Database {
             Self::partition_file_spans(&table, &format!("date={date}"))
         };
         let Ok(spans) = spans else { return };
-        let (proved, unproven): (Vec<_>, Vec<_>) =
-            spans.into_iter().partition(|&(_, span)| span.is_some_and(|(min, max)| intervals.iter().any(|&(start, end)| min >= start && max < end)));
+        let (proved, unproven): (Vec<_>, Vec<_>) = spans.into_iter().partition(|(path, span)| {
+            visibility.contains_key(path) && span.is_some_and(|(min, max)| intervals.iter().any(|&(start, end)| min >= start && max < end))
+        });
         metrics::counter!(scan_metric_names::CERT_SLICE_FILES_UNPROVEN).increment(unproven.len() as u64);
         if proved.is_empty() {
             return;
         }
         metrics::counter!(scan_metric_names::CERT_SLICE_FILES_PROVED).increment(proved.len() as u64);
+        let files: crate::read::CountFiles = proved.into_iter().filter_map(|(path, _)| Some((path.clone(), visibility.get(&path)?.clone()))).collect();
         let key = (project_id.to_string(), table_name.to_string(), date.to_string());
         // Never DOWNGRADE: a live whole-day grant outranks anything a slice can say.
         // Bound in a `let`, NOT inlined as the scrutinee: a DashMap `Ref` temporary in
@@ -4854,11 +5562,13 @@ impl Database {
         match existing {
             Some(false) => return,
             Some(true) => self.dedup_clean_fp.alter(&key, |_, mut live| {
-                live.files = live.files.iter().chain(proved.iter().map(|(rel, _)| rel)).cloned().sorted_unstable().dedup().collect();
+                let held = Arc::make_mut(&mut live.files);
+                held.retain(|path, dv| visibility.get(path) == Some(&*dv));
+                held.extend(files.clone());
                 live
             }),
             None => {
-                let files: Arc<[String]> = proved.into_iter().map(|(rel, _)| rel).collect();
+                let files = Arc::new(files);
                 self.dedup_clean_fp.insert(key, Certification { fp: 0, since: std::time::Instant::now(), files, stale: true });
             }
         }
@@ -4888,23 +5598,26 @@ impl Database {
     /// over-budget chunks proves nothing; any concurrent commit changes the set and must not certify.
     /// Both the sweep and the backfill go through here so the rule cannot drift.
     async fn record_certification(
-        &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, project_id: &str, date: chrono::NaiveDate, pre: &[String],
+        &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, project_id: &str, date: chrono::NaiveDate, pre: &crate::read::CountFiles,
         (dropped, complete): (u64, bool),
     ) -> Result<Option<u64>> {
         let key = (project_id.to_string(), table_name.to_string(), date.to_string());
-        let post = {
+        let (post, post_visibility) = {
             let table = table_ref.read().await;
-            Self::partition_files_by_pid(&table, &format!("date={date}"))?.remove(project_id).unwrap_or_default()
+            (
+                Self::partition_files_by_pid(&table, &format!("date={date}"))?.remove(project_id).unwrap_or_default(),
+                Self::logical_count_partition_snapshot(&table, project_id, &date.to_string())?.1,
+            )
         };
         let fp_post = partition_file_fp(&post);
-        if dropped == 0 && complete && !post.is_empty() && partition_file_fp(pre) == fp_post {
+        if dropped == 0 && complete && !post.is_empty() && pre == &post_visibility {
             // Re-certifying at the SAME fingerprint continues the existing
             // certification: keeping the original `since` stops the sweep cadence from
             // capping every dwell at one tick.
-            let prior = self.dedup_clean_fp.get(&key).map(|e| e.value().clone()).filter(|prev| prev.fp == fp_post);
+            let prior = self.dedup_clean_fp.get(&key).map(|e| e.value().clone()).filter(|prev| prev.fp == fp_post && *prev.files == post_visibility);
             // The file list the pass proved clean, kept so the per-FILE skip can ask
             // which of them are still live after the partition gains one.
-            let files: Arc<[String]> = Arc::from(post.clone());
+            let files = Arc::new(post_visibility);
             if let Some(prev) = self
                 .dedup_clean_fp
                 .insert(key, Certification { fp: fp_post, since: prior.as_ref().map_or_else(std::time::Instant::now, |p| p.since), files, stale: false })
@@ -4993,6 +5706,9 @@ impl Database {
                 continue; // no Delta files for this date → nothing to dedup
             };
             let fp_key = (key_pid, table_name.to_string(), date.to_string());
+            let Ok((_, visibility)) = Self::logical_count_partition_snapshot(table, &fp_key.0, &date.to_string()) else {
+                return (DedupSkipVerdict::Unresolved, HashSet::new());
+            };
             // Bound in a `let`, NOT inlined as the match scrutinee: the `Ref` would live
             // until the end of the match while the stale arm removes from the same
             // shard — a self-deadlock.
@@ -5014,7 +5730,7 @@ impl Database {
                 && !cov.files.is_empty()
                 && let Some(day_window) = clip_to_day(date, (lo, hi))
                 && clean_intervals_cover(&cov.intervals, day_window)
-                && Self::added_paths_miss_window(table, &date.to_string(), &cov.files, &files, day_window)
+                && Self::added_paths_miss_window(table, &date.to_string(), &cov.files, &visibility, day_window)
             {
                 metrics::counter!(scan_metric_names::CERT_WINDOW_FROM_SLICE_COVERAGE).increment(1);
                 certified_any = true;
@@ -5026,7 +5742,7 @@ impl Database {
                 // `!cert.stale` is required, not decorative: a slice-derived
                 // certification proves one time window, never the day, and its
                 // fingerprint can still match the live partition.
-                Some(cert) if !cert.stale && cert.fp == partition_file_fp(&files) => {
+                Some(cert) if !cert.stale && cert.fp == partition_file_fp(&files) && *cert.files == visibility => {
                     certified_any = true;
                     certified_dates.insert(date.to_string());
                     continue;
@@ -5052,7 +5768,7 @@ impl Database {
                         && !cert.stale
                         && !cert.files.is_empty()
                         && schema_or_default(table_name).dedup_keys.iter().any(|key| key == "timestamp")
-                        && Self::added_files_miss_window(table, &date.to_string(), cert, &files, (lo, hi)) =>
+                        && Self::added_files_miss_window(table, &date.to_string(), cert, &visibility, (lo, hi)) =>
                 {
                     metrics::counter!(scan_metric_names::CERT_WINDOW_SURVIVED_FP_MOVE).increment(1);
                     certified_any = true;
@@ -5102,19 +5818,29 @@ impl Database {
     /// added file with no statistics (which overlaps everything, the rule
     /// `partition_file_spans` already states for readers). Fails closed, so the
     /// caller falls through to the ordinary fp-moved handling.
-    fn added_files_miss_window(table: &DeltaTable, date: &str, cert: &Certification, live: &[String], (lo, hi): (i64, i64)) -> bool {
+    fn added_files_miss_window(table: &DeltaTable, date: &str, cert: &Certification, live: &crate::read::CountFiles, (lo, hi): (i64, i64)) -> bool {
         Self::added_paths_miss_window(table, date, &cert.files, live, (lo, hi))
     }
 
-    /// As `added_files_miss_window`, over a bare proved-file list.
-    fn added_paths_miss_window(table: &DeltaTable, date: &str, proved_files: &[String], live: &[String], (lo, hi): (i64, i64)) -> bool {
-        let proved: HashSet<&str> = proved_files.iter().filter_map(|uri| crate::tantivy::search::parquet_rel_of_uri(uri)).collect();
-        let added: HashSet<&str> = live.iter().filter_map(|uri| crate::tantivy::search::parquet_rel_of_uri(uri)).filter(|rel| !proved.contains(rel)).collect();
+    /// New paths and changed deletion vectors both need a disjoint timestamp span.
+    fn added_paths_miss_window(
+        table: &DeltaTable, date: &str, proved_files: &crate::read::CountFiles, live: &crate::read::CountFiles, (lo, hi): (i64, i64),
+    ) -> bool {
+        if live == proved_files {
+            return true;
+        }
+        let added: Vec<&str> = live.iter().filter(|(path, dv)| proved_files.get(*path) != Some(*dv)).map(|(path, _)| path.as_str()).collect();
         if added.is_empty() {
             return false; // nothing added, yet the fingerprint moved: a REMOVAL, which this cannot reason about
         }
         let Ok(spans) = Self::partition_file_spans(table, &format!("date={date}")) else { return false };
         added_spans_miss_window(added.iter().map(|rel| spans.get(*rel).copied().flatten()), (lo, hi))
+    }
+
+    fn file_visibility_fingerprint(files: &crate::read::CountFiles) -> Result<u64> {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hash::hash(&serde_json::to_vec(files)?, &mut hasher);
+        Ok(std::hash::Hasher::finish(&hasher))
     }
 
     pub(crate) fn logical_count_partition_snapshot(table: &DeltaTable, project_id: &str, date: &str) -> Result<(u64, crate::read::CountFiles)> {
@@ -5127,9 +5853,7 @@ impl Database {
                 "logical-count snapshot has multiple active entries for one Parquet path"
             );
         }
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        std::hash::Hash::hash(&serde_json::to_vec(&files)?, &mut hasher);
-        Ok((std::hash::Hasher::finish(&hasher), files))
+        Ok((Self::file_visibility_fingerprint(&files)?, files))
     }
 
     /// Memory-only lookup for a base whose files are all present in the table
@@ -5392,7 +6116,13 @@ impl Database {
             // version guard above cannot do under continuous ingest.
             let fp_key = (pid.clone(), table_name.to_string(), date.to_string());
             let current_fp = partition_file_fp(cur_files);
-            if !cur_files.is_empty() && self.dedup_clean_fp.get(&fp_key).map(|entry| entry.value().fp) == Some(current_fp) {
+            let pre_visibility = {
+                let table = table_ref.read().await;
+                Self::logical_count_partition_snapshot(&table, pid, &date.to_string())?.1
+            };
+            if !cur_files.is_empty()
+                && self.dedup_clean_fp.get(&fp_key).is_some_and(|entry| !entry.stale && entry.fp == current_fp && *entry.files == pre_visibility)
+            {
                 continue;
             }
             let backoff_key = format!("{dedup_key}:{pid}:{date}");
@@ -5424,7 +6154,7 @@ impl Database {
                     // pass over a file set that is STILL live proves the partition
                     // duplicate-free. A >0 pass marks nothing; the next 0-drop pass
                     // confirms the rewrite held.
-                    self.record_certification(table_ref, table_name, pid, date, cur_files, (d, complete)).await?;
+                    self.record_certification(table_ref, table_name, pid, date, &pre_visibility, (d, complete)).await?;
                 }
                 Err(e) => {
                     // Exponential backoff, 10min doubling to a 6h cap, so a failing
@@ -5479,7 +6209,7 @@ impl Database {
             .map(|entry| {
                 let ((project_id, table_name, date), cov) = (entry.key().clone(), entry.value().clone());
                 crate::storage::StoredSliceCoverage {
-                    proof_version: crate::storage::DedupProofVersion::PhysicalRowOrderV1,
+                    proof_version: crate::storage::DedupProofVersion::PhysicalVisibilityV2,
                     files: cov.files.clone(),
                     project_id,
                     table_name,
@@ -5508,13 +6238,13 @@ impl Database {
             .map(|entry| {
                 let ((project_id, table_name, date), cert) = (entry.key().clone(), entry.value().clone());
                 crate::storage::StoredCertification {
-                    proof_version: crate::storage::DedupProofVersion::PhysicalRowOrderV1,
+                    proof_version: crate::storage::DedupProofVersion::PhysicalVisibilityV2,
                     project_id,
                     table_name,
                     date,
                     fp: cert.fp,
                     granted_unix_ms: now_ms.saturating_sub(cert.since.elapsed().as_millis() as u64),
-                    files: cert.files.to_vec(),
+                    files: (*cert.files).clone(),
                     stale: cert.stale,
                 }
             })
@@ -5659,7 +6389,7 @@ impl Database {
         // NOT an early return on an empty queue: the certification probes below exist
         // precisely for dates nothing enqueues.
         let has_timestamp_key = schema.dedup_keys.iter().any(|k| k == "timestamp");
-        let certify_only = if has_timestamp_key { self.uncertified_window_dates(&*table.read().await, table_name) } else { Vec::new() };
+        let certify_only = if has_timestamp_key { self.uncertified_window_dates(&*table.read().await, table_name, pass_deadline) } else { Vec::new() };
         if ready.is_empty() && certify_only.is_empty() {
             return Ok(());
         }
@@ -5820,28 +6550,67 @@ impl Database {
     /// only visits groups with queued bins, so fully-processed sealed dates need this path.
     /// TODAY is excluded: a live partition's fingerprint moves under ingest, so
     /// `record_certification` would refuse by construction.
-    pub(crate) fn uncertified_window_dates(&self, table: &DeltaTable, table_name: &str) -> Vec<(String, String)> {
+    pub(crate) fn uncertified_window_dates(&self, table: &DeltaTable, table_name: &str, deadline: std::time::Instant) -> Vec<(String, String)> {
         const CERTIFY_WINDOW_DAYS: i64 = 14;
         // Each probe is a whole-date key-only scan sharing the pass deadline, and a group
         // reached with no budget left returns without probing.
         const CERTIFY_PROBES_PER_PASS: usize = 64;
+        let expired = || std::time::Instant::now() >= deadline;
+        if expired() {
+            return Vec::new();
+        }
         let today = Utc::now().date_naive();
-        let mut by_project: HashMap<String, (usize, Vec<String>)> = Default::default();
-        for back in 1..=CERTIFY_WINDOW_DAYS {
-            let date = (today - chrono::Duration::days(back)).to_string();
-            for (project, files) in Self::partition_files_by_pid(table, &format!("date={date}")).into_iter().flatten().filter(|(_, files)| !files.is_empty()) {
-                let key = (project.clone(), table_name.to_string(), date.clone());
-                // Stale entries ARE re-probed: staleness means per-file evidence
-                // outlived its fingerprint, not that the date is dirty.
-                let uncertified = self.dedup_clean_fp.get(&key).is_none_or(|entry| entry.value().stale);
-                // A date already probed dirty at THIS exact file set cannot become clean
-                // without a commit, and a commit moves the fingerprint — re-probing is waste.
-                let known_dirty = self.dedup_probe_declined.get(&key).is_some_and(|entry| *entry.value() == partition_file_fp(&files));
-                if uncertified && !known_dirty {
-                    let entry = by_project.entry(project).or_default();
-                    entry.0 += files.len();
-                    entry.1.push(date.clone());
-                }
+        let Ok(snapshot) = table.snapshot() else {
+            warn!(table_name, event = "certification_discovery_no_snapshot");
+            return Vec::new();
+        };
+        // Read partition scalars and masks once, without materializing Parquet statistics.
+        let partitions = snapshot
+            .log_data()
+            .iter()
+            .take_while(|_| !expired())
+            .filter_map(|file| {
+                let path = file.path().into_owned();
+                let values = file.partition_values().map(|values| {
+                    values
+                        .fields()
+                        .iter()
+                        .zip(values.values())
+                        .map(|(field, value)| (field.name().to_owned(), (!value.is_null()).then(|| deltalake::kernel::scalars::ScalarExt::serialize(value))))
+                        .collect::<HashMap<_, _>>()
+                });
+                let Some((project, date)) = Self::maintenance_partition_from_action(&path, values.as_ref(), "default")
+                    .and_then(|(project, date)| Some((project, chrono::NaiveDate::parse_from_str(&date, "%Y-%m-%d").ok()?)))
+                else {
+                    warn!(table_name, path, event = "certification_discovery_unknown_partition");
+                    return None;
+                };
+                (date < today).then(|| ((project, date), (path, file.deletion_vector_descriptor())))
+            })
+            .into_group_map();
+        // An interrupted metadata pass cannot establish complete partition visibility.
+        if expired() {
+            return Vec::new();
+        }
+        let recent_start = today - chrono::Duration::days(CERTIFY_WINDOW_DAYS);
+        let mut by_project: HashMap<(bool, String), (usize, Vec<chrono::NaiveDate>)> = Default::default();
+        for ((project, date), actions) in partitions {
+            if expired() {
+                return Vec::new();
+            }
+            let file_count = actions.len();
+            let files: crate::read::CountFiles = actions.into_iter().collect();
+            if files.len() != file_count {
+                warn!(table_name, project, %date, event = "certification_discovery_ambiguous_visibility");
+                continue;
+            }
+            let key = (project.clone(), table_name.to_owned(), date.to_string());
+            let uncertified = self.dedup_clean_fp.get(&key).is_none_or(|entry| entry.stale || *entry.files != files);
+            let known_dirty = self.dedup_probe_declined.get(&key).is_some_and(|entry| Self::file_visibility_fingerprint(&files).is_ok_and(|fp| *entry == fp));
+            if uncertified && !known_dirty {
+                let entry = by_project.entry((date < recent_start, project)).or_default();
+                entry.0 += file_count;
+                entry.1.push(date);
             }
         }
         // PROJECT-MAJOR, busiest first by file count: a scan sheds `DedupExec` only when EVERY
@@ -5849,12 +6618,19 @@ impl Database {
         // Sorting by fewest-remaining-dates instead starves exactly the busy projects whose
         // queries hurt, because more data looks further from done.
         let mut projects: Vec<_> = by_project.into_iter().collect();
-        projects.sort_by(|(a_project, (a_files, _)), (b_project, (b_files, _))| b_files.cmp(a_files).then(a_project.cmp(b_project)));
-        projects
+        projects.sort_by(|((a_historical, a_project), (a_files, _)), ((b_historical, b_project), (b_files, _))| {
+            a_historical.cmp(b_historical).then(b_files.cmp(a_files)).then(a_project.cmp(b_project))
+        });
+        let candidates = projects
             .into_iter()
-            .flat_map(|(project, (_, dates))| dates.into_iter().map(move |date| (project.clone(), date)))
+            .take_while(|_| !expired())
+            .flat_map(|((_, project), (_, mut dates))| {
+                dates.sort_unstable_by(|a, b| b.cmp(a));
+                dates.into_iter().map(move |date| (project.clone(), date.to_string()))
+            })
             .take(CERTIFY_PROBES_PER_PASS)
-            .collect()
+            .collect();
+        if expired() { Vec::new() } else { candidates }
     }
 
     /// Certification-only pass: probe uncertified window dates and grant, with no
@@ -5867,7 +6643,7 @@ impl Database {
         if !schema_or_default(table_name).dedup_keys.iter().any(|key| key == "timestamp") {
             return;
         }
-        let candidates = self.uncertified_window_dates(&*table.read().await, table_name);
+        let candidates = self.uncertified_window_dates(&*table.read().await, table_name, deadline);
         if candidates.is_empty() {
             return;
         }
@@ -5946,7 +6722,11 @@ impl Database {
             // afterwards would compare the new set against itself and agree unconditionally.
             let pre = {
                 let table = table.read().await;
-                Self::partition_files_by_pid(&table, &format!("date={date}")).ok().and_then(|mut by_pid| by_pid.remove(&project)).unwrap_or_default()
+                let visibility = Self::logical_count_partition_snapshot(&table, &project, &date);
+                if let Err(error) = &visibility {
+                    warn!(project, table_name, date, %error, event = "dedup_batch_probe_visibility_unavailable");
+                }
+                visibility.ok()
             };
             let started = std::time::Instant::now();
             match tokio::time::timeout(remaining, self.probe_dup_bins(table, table_name, &project, &date)).await {
@@ -5963,20 +6743,24 @@ impl Database {
                     // second rule that could drift from it.
                     if dup_bins.is_empty()
                         && let Ok(parsed) = chrono::NaiveDate::parse_from_str(&date, "%Y-%m-%d")
+                        && let Some((_, pre_visibility)) = &pre
                     {
-                        match self.record_certification(table, table_name, &project, parsed, &pre, (0, true)).await {
+                        match self.record_certification(table, table_name, &project, parsed, pre_visibility, (0, true)).await {
                             // Debounced: up to BATCH_PROBE_GROUPS grants land per pass and
                             // `store_sidecar` re-serializes the whole ledger each time.
                             Ok(Some(_)) => self.persist_certifications_debounced(),
                             Ok(None) => {}
                             Err(error) => warn!(project, table_name, date, %error, event = "dedup_batch_probe_certify_failed"),
                         }
-                    } else if !dup_bins.is_empty() && !pre.is_empty() {
+                    } else if !dup_bins.is_empty()
+                        && let Some((fp, files)) = &pre
+                        && !files.is_empty()
+                    {
                         // Memoise the DECLINE against the file set that produced it: the date
                         // cannot become clean without a commit, and a commit moves the
                         // fingerprint, so re-probing before then would crowd out unexamined
                         // candidates.
-                        self.dedup_probe_declined.insert((project.clone(), table_name.to_string(), date.clone()), partition_file_fp(&pre));
+                        self.dedup_probe_declined.insert((project.clone(), table_name.to_string(), date.clone()), *fp);
                         metrics::counter!(scan_metric_names::CERT_PROBE_DECLINED).increment(1);
                         // HOW dirty, not just that it is dirty: this decides the removal
                         // mechanism and cannot be measured from outside, because a psql probe
@@ -7451,13 +8235,35 @@ impl Database {
 
     /// Publish a resumed rollup and retire its intent — the bookkeeping both
     /// success arms owe, and which the commit alone does not satisfy.
-    fn publish_resumed_rollup(&self, rollup: &crate::database::RollupResume, wave_id: &str) -> Result<()> {
-        let mut journal = self.journal();
-        journal.publish(&rollup.key, rollup.publication.clone());
-        journal.checkpoint()?;
-        drop(journal);
-        self.clear_staged_intent(&[wave_id]);
-        Ok(())
+    fn publish_resumed_rollup(&self, rollup: &crate::database::RollupResume, wave_id: &str, source_epoch: u64) -> Result<bool> {
+        use crate::maintenance_coordinator::TaskState;
+        let published = {
+            let _guard = crate::support::lock(&self.rollup_journal_lock);
+            let mut journal = self.journal();
+            let current = self
+                .rollup_source_epochs
+                .get(&(rollup.key.project_id.clone(), rollup.key.source.clone(), rollup.date.clone()))
+                .map_or(0, |epoch| *epoch.value());
+            if current != source_epoch {
+                if journal.state(&rollup.key) == Some(TaskState::Running) {
+                    journal.retry(&rollup.key, "resume_source_changed".to_owned(), crate::support::now_micros().saturating_add(ROLLUP_PROOF_RETRY_MICROS));
+                }
+                false
+            } else if matches!(journal.state(&rollup.key), Some(TaskState::Running | TaskState::Complete)) {
+                journal.publish(&rollup.key, rollup.publication.clone())
+            } else {
+                false
+            }
+        };
+        // Preserve any invalidation's task/deadline, and never hold its lock during fsync.
+        self.checkpoint_task_journal()?;
+        if published {
+            self.clear_staged_intent(&[wave_id]);
+        } else {
+            crate::observability::maintenance_stats().rollup_resume_declined.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            info!(table = %rollup.key.physical_table, wave_id, event = "rollup_resume_source_changed");
+        }
+        Ok(published)
     }
 
     /// Commit a rollup unit whose output was staged before a restart, instead of
@@ -7469,7 +8275,9 @@ impl Database {
     ///
     /// Every refusal path leaves the intent alone: the orphan sweep already collects unowned
     /// staged parquet, and deleting on a transient read failure would discard good output.
-    pub(crate) async fn resume_rollup_unit(&self, key: &crate::maintenance_coordinator::TaskKey, current_source_rows: Option<u64>) -> Result<bool> {
+    pub(crate) async fn resume_rollup_unit(
+        &self, key: &crate::maintenance_coordinator::TaskKey, current_source_rows: Option<u64>, current_content_fp: u64, source_epoch: u64,
+    ) -> Result<bool> {
         use deltalake::protocol::{DeltaOperation, SaveMode};
         use std::sync::atomic::Ordering::Relaxed;
         let stats = crate::observability::maintenance_stats();
@@ -7491,7 +8299,7 @@ impl Database {
         // covers this slice, and a file the intent never heard of is the
         // dangerous case. Slice range and Add travel together — the verdict
         // needs the first, the commit the second.
-        let (partition, store) = {
+        let (partition, store, target_version) = {
             let table = target_ref.read().await;
             let partition: HashMap<String, (Option<(i64, i64)>, deltalake::kernel::Add)> = table
                 .snapshot()?
@@ -7508,12 +8316,28 @@ impl Database {
                     (add.path.clone(), (slice, add))
                 })
                 .collect();
-            (partition, table.log_store().object_store(None))
+            (partition, table.log_store().object_store(None), table.version())
         };
         let live_view: HashMap<&str, Option<(i64, i64)>> = partition.iter().map(|(path, (slice, _))| (path.as_str(), *slice)).collect();
         let now_secs = crate::support::now_secs();
+        let target_fingerprint = rollup_target_fingerprint(partition.values().map(|(_, add)| add));
         for (entry, rollup) in &candidates {
-            let verdict = classify_rollup_resume(entry, &key.physical_table, now_secs, &live_view, current_source_rows);
+            let verdict = classify_rollup_resume(entry, &key.physical_table, now_secs, &live_view, current_source_rows, current_content_fp);
+            let target_matches = match (&rollup.target, &verdict) {
+                (Some(proof), ResumeVerdict::Commit) => proof.before == target_fingerprint,
+                (Some(proof), ResumeVerdict::AlreadyLanded) => proof.after == target_fingerprint,
+                (None, ResumeVerdict::Commit) => entry.target_paths.is_empty(),
+                (None, ResumeVerdict::AlreadyLanded) => entry
+                    .adds
+                    .iter()
+                    .all(|add| partition.get(&add.path).is_some_and(|(_, live)| rollup_target_fingerprint([add]) == rollup_target_fingerprint([live]))),
+                _ => true,
+            };
+            if !target_matches {
+                stats.rollup_resume_declined.fetch_add(1, Relaxed);
+                info!(table = %key.physical_table, wave_id = %entry.wave_id, event = "rollup_resume_target_proof_changed");
+                continue;
+            }
             match verdict {
                 // `classify_rollup_resume` cannot return RowMismatch — a rollup
                 // aggregates — so this arm is the ownership guard and nothing else.
@@ -7522,11 +8346,25 @@ impl Database {
                     continue;
                 }
                 ResumeVerdict::AlreadyLanded => {
+                    let commit_lock = self.commit_lock(&key.project_id, &key.physical_table).await;
+                    let _guard = commit_lock.lock().await;
+                    refresh_table_snapshot(&target_ref, self.config.maintenance.timefusion_incremental_snapshot).await?;
+                    if target_ref.read().await.version() != target_version {
+                        stats.rollup_resume_declined.fetch_add(1, Relaxed);
+                        info!(
+                            table = %key.physical_table, project_id = %key.project_id, wave_id = %entry.wave_id,
+                            event = "rollup_resume_target_changed",
+                            "target changed before coverage recovery; retaining the intent for a fresh decision"
+                        );
+                        return Ok(false);
+                    }
                     // The Delta commit landed and only the bookkeeping was lost.
                     // PUBLISH anyway: without a journal publication the coverage
                     // replay refuses the slice and the planner re-enqueues the
                     // whole scan.
-                    self.publish_resumed_rollup(rollup, &entry.wave_id)?;
+                    if !self.publish_resumed_rollup(rollup, &entry.wave_id, source_epoch)? {
+                        return Ok(false);
+                    }
                     stats.rollup_resume_already_landed.fetch_add(1, Relaxed);
                     info!(table = %key.physical_table, project_id = %key.project_id, wave_id = %entry.wave_id, event = "rollup_resume_already_landed");
                     return Ok(true);
@@ -7554,20 +8392,34 @@ impl Database {
                         .collect();
                     let commit_lock = self.commit_lock(&key.project_id, &key.physical_table).await;
                     let guard = commit_lock.lock().await;
+                    refresh_table_snapshot(&target_ref, self.config.maintenance.timefusion_incremental_snapshot).await?;
                     let mut table = target_ref.read().await.clone();
+                    if table.version() != target_version {
+                        stats.rollup_resume_declined.fetch_add(1, Relaxed);
+                        info!(
+                            table = %key.physical_table, project_id = %key.project_id, wave_id = %entry.wave_id,
+                            event = "rollup_resume_target_changed",
+                            "target changed after replacement validation; retaining staged output for a fresh decision"
+                        );
+                        return Ok(false);
+                    }
                     let target_schema = get_schema(&key.physical_table).ok_or_else(|| anyhow::anyhow!("rollup target schema missing"))?;
                     let op = DeltaOperation::Write { mode: SaveMode::Overwrite, partition_by: Some(target_schema.partitions.clone()), predicate: None };
-                    let finalized = deltalake::kernel::transaction::CommitBuilder::from(incremental_commit_properties(
-                        self.config.maintenance.timefusion_incremental_snapshot,
-                        "rollup_resume",
-                    ))
+                    let finalized = deltalake::kernel::transaction::CommitBuilder::from(
+                        incremental_commit_properties(self.config.maintenance.timefusion_incremental_snapshot, "rollup_resume")
+                            // The replacement proof belongs to this exact target snapshot.
+                            // An external writer can still commit after our local lock/refresh.
+                            .with_max_retries(0),
+                    )
                     .with_actions(actions)
                     .build(Some(table.snapshot()? as &dyn deltalake::kernel::transaction::TableReference), table.log_store(), op)
                     .await?;
                     table.state = Some(finalized.snapshot());
                     drop(guard);
                     self.swap_and_refresh_cache(&target_ref, table, None, &[&format!("date={}", rollup.date)]).await;
-                    self.publish_resumed_rollup(rollup, &entry.wave_id)?;
+                    if !self.publish_resumed_rollup(rollup, &entry.wave_id, source_epoch)? {
+                        return Ok(false);
+                    }
                     stats.rollup_resumed.fetch_add(1, Relaxed);
                     info!(
                         table = %key.physical_table, project_id = %key.project_id, wave_id = %entry.wave_id,
@@ -8546,20 +9398,19 @@ mod date_coverage_recovery_tests {
     /// source-level guard because the failure is the ABSENCE of a call.
     #[test]
     fn maintenance_aggregates_are_collected_watched() {
-        let source = include_str!("maintain.rs");
-        let unwatched: Vec<_> = source
-            .lines()
-            .enumerate()
-            // Built by `concat!` so this line does not match itself; `expect(` excludes test
-            // code, since production maintenance SQL uses `?`/`map_err`, never `expect`.
-            .filter(|(_, line)| line.contains(concat!("ctx.sql", "(")) && line.contains(concat!(".collect", "().await")) && !line.contains("expect("))
-            .map(|(n, line)| format!("{}: {}", n + 1, line.trim()))
-            .collect();
-        assert!(
-            unwatched.is_empty(),
-            "these run a maintenance SQL to completion without a liveness watcher — use `collect_watched`:\n{}",
-            unwatched.join("\n")
-        );
+        let unwatched = unwatched_maintenance_sql(include_str!("maintain.rs"));
+        assert!(unwatched.is_empty(), "unwatched maintenance SQL at lines {unwatched:?} — use `collect_watched`");
+    }
+
+    #[test_case::test_case("ctx.sql(query).await?.collect().await?;" => vec![1]; "production collect is rejected")]
+    #[test_case::test_case("ctx.sql(query).await.expect(\"plan\").collect().await?;" => vec![1]; "expect cannot bypass the guard")]
+    #[test_case::test_case("collect_watched(ctx, query).await?;" => Vec::<usize>::new(); "watched production collect")]
+    #[test_case::test_case("fn production() {}\n#[cfg(test)]\nmod tests {\nctx.sql(query).await?.collect().await?;\n}" => Vec::<usize>::new(); "foreground test query")]
+    #[test_case::test_case("ctx.sql(query).await?.collect().await?;\n#[cfg(test)]\nmod tests {\nctx.sql(query).await?.collect().await?;\n}" => vec![1]; "test boundary preserves production checks")]
+    fn unwatched_maintenance_sql(source: &str) -> Vec<usize> {
+        // items_after_test_module requires production items to precede these modules.
+        let production = source.split_once("\n#[cfg(test)]\nmod ").map_or(source, |(production, _)| production);
+        production.lines().enumerate().filter(|(_, line)| line.contains("ctx.sql(") && line.contains(".collect().await")).map(|(n, _)| n + 1).collect()
     }
 }
 
@@ -8609,6 +9460,7 @@ mod certify_on_completion_tests {
         date: chrono::NaiveDate,
         pre_files: Vec<String>,
         pre_dv: HashSet<DvEntry>,
+        pre_visibility: crate::read::CountFiles,
         dropped: u64,
         masked: Option<Vec<DvEntry>>,
     }
@@ -8634,21 +9486,36 @@ mod certify_on_completion_tests {
     /// is distinct.
     async fn dedup_pass(cfg: Arc<crate::config::AppConfig>) -> Result<Pass> {
         let (db, project_id, date, table_ref) = seed_dup_day(cfg, &[]).await?;
-        let (pre_files, pre_dv) = {
+        let morning = date.and_hms_opt(1, 0, 0).unwrap().and_utc().timestamp_micros();
+        db.insert_records_batch(&project_id, TABLE, vec![json_to_batch(vec![test_span_ts("morning", "only", &project_id, morning)])?], true, None).await?;
+        let (pre_files, pre_dv, pre_visibility) = {
             let (table, marker) = (table_ref.read().await, format!("date={date}"));
             let files = Database::partition_files_by_pid(&table, &marker)?.remove(&project_id).unwrap_or_default();
-            (files, Database::partition_dv_state(&table, &project_id, &marker)?)
+            (
+                files,
+                Database::partition_dv_state(&table, &project_id, &marker)?,
+                Database::logical_count_partition_snapshot(&table, &project_id, &date.to_string())?.1,
+            )
         };
         let (dropped, complete, masked) = db.dedup_partition_range_limited(&table_ref, TABLE, &project_id, date, None, None).await?;
         assert_eq!((dropped, complete), (1, true), "expected one duplicate dropped in a complete pass");
-        Ok(Pass { db, table_ref, project_id, date, pre_files, pre_dv, dropped, masked })
+        Ok(Pass { db, table_ref, project_id, date, pre_files, pre_dv, pre_visibility, dropped, masked })
     }
 
     impl Pass {
         /// `None` is a CoW pass (no masked arm); `Some(a)` is a masked pass declaring `a` as the DV attachments it committed.
         async fn certify(&self, attachments: Option<&[DvEntry]>) -> Result<Option<u64>> {
             let masked: Option<MaskedPass<'_>> = attachments.map(|a| (&self.pre_dv, a));
-            self.db.record_clean_slice(&self.table_ref, TABLE, &self.project_id, self.date, (day_slice(self.date), self.dropped, masked), &self.pre_files).await
+            self.db
+                .record_clean_slice(
+                    &self.table_ref,
+                    TABLE,
+                    &self.project_id,
+                    self.date,
+                    (day_slice(self.date), self.dropped, masked),
+                    (&self.pre_files, &self.pre_visibility),
+                )
+                .await
         }
 
         /// Is a LIVE (non-stale) whole-day certification recorded for the day?
@@ -8664,11 +9531,15 @@ mod certify_on_completion_tests {
 
     /// A masked (DV) pass that dropped a duplicate, completed, and left the URI set unmoved
     /// GRANTS certification in the SAME pass, and the read-side gate turns Granted.
+    #[test_case::test_case(false ; "changed visibility refuses certificate reuse")]
+    #[test_case::test_case(true ; "changed visibility refuses certificate republication")]
     #[serial]
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_masked_dv_pass_certifies_the_day_in_the_same_pass() -> Result<()> {
+    async fn a_masked_dv_pass_certifies_only_its_proven_visibility(republish: bool) -> Result<()> {
         let mut cfg = (*TestConfigBuilder::new("certify_same_pass").build()).clone();
         cfg.maintenance.timefusion_read_dedup_skip_swept = true;
+        cfg.maintenance.timefusion_dedup_certification_persist = true;
+        cfg.maintenance.timefusion_dedup_window_scoped_certification = true;
         let pass = dedup_pass(Arc::new(cfg)).await?;
         let atts = pass.masked.as_deref().expect("a DV-dedup pass must report its masked attachments");
 
@@ -8682,6 +9553,69 @@ mod certify_on_completion_tests {
             pass.db.dedup_window_clean(&table, &pass.project_id, TABLE, (slice.start_micros, slice.end_micros - 1))
         };
         assert_eq!(verdict, DedupSkipVerdict::Granted, "the same-pass certification must reach the read-side skip");
+
+        let Pass { db, table_ref, project_id, date, .. } = pass;
+        let key = (project_id.clone(), TABLE.to_owned(), date.to_string());
+        let proved = db.dedup_clean_fp.get(&key).unwrap().files.clone();
+        assert!(proved.values().any(Option::is_some), "the persisted proof must include an actual deletion vector");
+        db.persist_certifications();
+        let cfg = Arc::clone(&db.config);
+        drop(table_ref);
+        drop(db);
+        let db = Database::with_config(cfg).await?;
+        let table_ref = db.resolve_table(&project_id, TABLE).await?;
+        assert_eq!(db.dedup_clean_fp.get(&key).unwrap().files, proved, "restart must retain exact mask evidence");
+
+        // Removing the mask exposes the loser again without changing any Parquet path.
+        // A path-only certificate must not authorize winner-free aggregation afterward.
+        let mut table = table_ref.read().await.clone();
+        assert_eq!(
+            db.dedup_window_clean(&table, &project_id, TABLE, (slice.start_micros, slice.end_micros - 1)),
+            DedupSkipVerdict::Granted,
+            "unchanged persisted visibility must remain usable"
+        );
+        let before: HashSet<_> = table.get_file_uris()?.collect();
+        let checked_visibility = Database::logical_count_partition_snapshot(&table, &project_id, &date.to_string())?.1;
+        let masked: Vec<_> = table.snapshot()?.log_data().iter().map(|file| add_action(&file)).filter(|add| add.deletion_vector.is_some()).collect();
+        assert!(!masked.is_empty(), "the real dedup pass must leave a visibility mask");
+        let actions = masked
+            .into_iter()
+            .flat_map(|mut add| {
+                let remove = deltalake::kernel::Action::Remove(remove_for_add(&add, true));
+                add.deletion_vector = None;
+                [remove, deltalake::kernel::Action::Add(add)]
+            })
+            .collect();
+        let committed = deltalake::kernel::transaction::CommitBuilder::default()
+            .with_actions(actions)
+            .build(
+                Some(table.snapshot()? as &dyn deltalake::kernel::transaction::TableReference),
+                table.log_store(),
+                deltalake::protocol::DeltaOperation::Write {
+                    mode: deltalake::protocol::SaveMode::Append,
+                    partition_by: Some(get_schema(TABLE).expect("source schema").partitions.clone()),
+                    predicate: None,
+                },
+            )
+            .await?;
+        table.state = Some(committed.snapshot());
+        assert_eq!(table.get_file_uris()?.collect::<HashSet<_>>(), before, "Parquet paths must stay unchanged");
+        assert_eq!(
+            db.dedup_window_clean(&table, &project_id, TABLE, (slice.start_micros, slice.start_micros + 2 * 3_600_000_000)),
+            DedupSkipVerdict::Granted,
+            "a noon mask change must preserve the distinct morning row's clean window"
+        );
+        let verdict = db.dedup_window_clean(&table, &project_id, TABLE, (slice.start_micros, slice.end_micros - 1));
+        *table_ref.write().await = table;
+        assert_eq!(delta_physical_row_count(&table_ref).await?, 3, "removing the mask must expose both noon versions beside the morning row");
+        if republish {
+            assert!(
+                db.record_certification(&table_ref, TABLE, &project_id, date, &checked_visibility, (0, true)).await?.is_none(),
+                "publication must retain the checked visibility, not certify the current state by path alone"
+            );
+        } else {
+            assert_ne!(verdict, DedupSkipVerdict::Granted, "changed visibility cannot reuse a path-only clean certificate");
+        }
         Ok(())
     }
 
@@ -8760,11 +9694,261 @@ mod rollup_noop_skip_tests {
 
     use super::*;
     use crate::{
-        maintenance_coordinator::{MAX_DECODED_BYTES, TaskState},
+        maintenance_coordinator::{MAX_DECODED_BYTES, Operation, TaskState},
         support::test_helpers::{BufferMode, TestConfigBuilder, json_to_batch, test_span_ts},
     };
 
     const TIER: &str = "otel_logs_and_spans_rollup_dashboard_1m_v3";
+
+    /// Mechanism experiment, not a production capacity benchmark. Every arm reads
+    /// the same two Parquet files through the production slice SQL and bounded session.
+    #[test_case::test_case(None, 4096, 8 ; "ordinary pool")]
+    #[test_case::test_case(Some(2 * 1024 * 1024), 4096, 8 ; "bounded spill pool")]
+    #[test_case::test_case(Some(1024 * 1024), 4096, 8 ; "one MiB spill pool")]
+    #[test_case::test_case(Some(512 * 1024), 4096, 8 ; "half MiB spill pool")]
+    #[test_case::test_case(None, 65_536, 8 ; "larger input")]
+    #[test_case::test_case(None, 4096, 512 ; "many aggregate groups")]
+    #[test_case::test_case(Some(2 * 1024 * 1024), 4096, 512 ; "many groups bounded pool")]
+    #[tokio::test]
+    async fn rollup_shard_scan_experiment(pool_bytes: Option<usize>, identities: i64, services: i64) -> Result<()> {
+        use crate::support::test_helpers::process_cpu;
+        use arrow::array::AsArray;
+        use datafusion::{datasource::MemTable, prelude::ParquetReadOptions};
+
+        const SOURCE: &str = "otel_logs_and_spans";
+        const PROJECT: &str = "shard-experiment";
+        const HASH_BUCKETS: u64 = 65_536;
+        let date = "2026-09-01";
+        let start = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")?.and_hms_opt(12, 0, 0).expect("valid hour").and_utc().timestamp_micros();
+        let range = (start, start + 60_000_000);
+        let source = get_schema(SOURCE).expect("source schema");
+        let spec = source.rollups.iter().find(|spec| spec.table_name(SOURCE) == TIER).expect("dashboard spec");
+        let dir = tempfile::tempdir()?;
+        // Separate files force winner selection across physical inputs. The newest
+        // version changes both the measure and tombstone, not the dedup identity.
+        for version in 0..2 {
+            let records = (0..identities)
+                .map(|row| {
+                    let mut record = test_span_ts(&format!("id-{row}"), "op", PROJECT, start);
+                    record["updated_at"] = serde_json::json!(start + version);
+                    record["deleted"] = serde_json::json!(version == 1 && row % 7 == 0);
+                    record["duration"] = serde_json::json!(if version == 0 { 1_000_000 } else { row + 1 });
+                    record["resource___service___name"] = serde_json::json!(format!("service-{}", row % services));
+                    record
+                })
+                .collect();
+            let batch = json_to_batch(records)?;
+            let mut writer =
+                datafusion::parquet::arrow::ArrowWriter::try_new(std::fs::File::create(dir.path().join(format!("v{version}.parquet")))?, batch.schema(), None)?;
+            writer.write(&batch)?;
+            writer.close()?;
+        }
+        let db = Database::with_config(rollup_cfg("rollup_shard_scan_experiment")).await?;
+        let ctx = db.bounded_rollup_maintenance_context(256)?;
+        let spill_dir = tempfile::tempdir()?;
+        let ctx = if let Some(bytes) = pool_bytes {
+            use datafusion::execution::{
+                SessionStateBuilder,
+                memory_pool::{FairSpillPool, TrackConsumersPool},
+                runtime_env::RuntimeEnvBuilder,
+            };
+            let runtime = Arc::new(
+                RuntimeEnvBuilder::new()
+                    .with_memory_pool(Arc::new(TrackConsumersPool::new(FairSpillPool::new(bytes), std::num::NonZeroUsize::new(10).expect("ten consumers"))))
+                    .with_disk_manager_builder(
+                        crate::database::write::spill_disk_builder(spill_dir.path().to_owned(), 1).with_max_temp_directory_size(8 * 1024 * 1024),
+                    )
+                    .build()?,
+            );
+            let mut state = ctx.state();
+            // The production 32 MiB sort reservation cannot fit these deliberate
+            // stress pools. This is a feasibility setting, not a rollout knob.
+            state.config_mut().options_mut().execution.sort_spill_reservation_bytes = 64 * 1024;
+            SessionContext::new_with_state(SessionStateBuilder::new_from_existing(state).with_runtime_env(runtime).build())
+        } else {
+            ctx
+        };
+        ctx.register_parquet("shard_raw", dir.path().to_str().expect("UTF8 temporary path"), ParquetReadOptions::default()).await?;
+        let keys = source.dedup_keys.iter().map(|key| format!("CAST({} AS VARCHAR)", crate::rollup::quoted(key))).join(", ");
+        let hash = format!("hash_bucket(arrow_cast(concat_ws(chr(31), {keys}), 'Utf8View'), {HASH_BUCKETS})");
+        let cohort = |from: &str, derived| crate::rollup::build_cohort_sql_range_mode(spec, SOURCE, from, &[PROJECT.to_owned()], date, range, derived);
+        async fn measured(ctx: &SessionContext, sql: &str) -> Result<(Vec<RecordBatch>, u64, u64, u64)> {
+            let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+            let _watch = PlanProgress::watch(Arc::clone(&plan));
+            let result = datafusion::physical_plan::collect(Arc::clone(&plan), ctx.task_ctx()).await.with_context(|| {
+                format!(
+                    "failed shard experiment plan:\n{}",
+                    datafusion::physical_plan::display::DisplayableExecutionPlan::with_metrics(plan.as_ref()).indent(true)
+                )
+            });
+            if result.is_err() {
+                use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+                use futures::TryStreamExt;
+
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    while ctx.runtime_env().memory_pool.reserved() != 0 || ctx.runtime_env().disk_manager.used_disk_space() != 0 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .context("failed query must release execution and scratch reservations")?;
+                let diagnostic_plan = ctx.sql(sql).await?.create_physical_plan().await?;
+                let mut sort_inputs = Vec::new();
+                diagnostic_plan.apply(|node| {
+                    if let Some(sort) = node.downcast_ref::<datafusion::physical_plan::sorts::sort::SortExec>() {
+                        sort_inputs.push(Arc::clone(sort.input()));
+                    }
+                    Ok(TreeNodeRecursion::Continue)
+                })?;
+                // Re-read only the synthetic fixture to separate retained buffers
+                // from sort workspace. This diagnostic is outside timed samples.
+                for input in sort_inputs {
+                    let mut stream = datafusion::physical_plan::execute_stream(input, ctx.task_ctx())?;
+                    let mut peaks = (0, 0);
+                    while let Some(batch) = stream.try_next().await? {
+                        let retained = datafusion::common::utils::memory::get_record_batch_memory_size(&batch);
+                        let compacted = crate::write::mem_buffer::compact_batch(batch.clone());
+                        assert_eq!(batch, compacted, "buffer compaction must preserve every input value");
+                        peaks.0 = peaks.0.max(retained);
+                        peaks.1 = peaks.1.max(datafusion::common::utils::memory::get_record_batch_memory_size(&compacted));
+                    }
+                    tracing::subscriber::with_default(tracing_subscriber::fmt().with_ansi(false).without_time().finish(), || {
+                        tracing::info!(retained_peak = peaks.0, compacted_peak = peaks.1, event = "rollup_sort_input_buffers");
+                    });
+                }
+            }
+            let batches = result?;
+            Ok((
+                batches,
+                plan_metric_sum(plan.as_ref(), "bytes_scanned"),
+                plan_metric_fold(plan.as_ref(), |metrics| metrics.spill_count().unwrap_or(0) as u64),
+                plan_metric_fold(plan.as_ref(), |metrics| metrics.spilled_bytes().unwrap_or(0) as u64),
+            ))
+        }
+        let winners: std::collections::BTreeMap<_, Vec<_>> = (0..services)
+            .map(|service| (format!("service-{service}"), (0..identities).filter(|row| row % 7 != 0 && row % services == service).map(|row| row + 1).collect()))
+            .collect();
+        let expected: std::collections::BTreeMap<_, _> = winners
+            .iter()
+            .map(|(service, values)| {
+                let (min, max) = values.iter().copied().minmax().into_option().expect("nonempty service");
+                (service.clone(), (i64::try_from(values.len()).expect("fixture fits"), values.iter().sum::<i64>(), min, max))
+            })
+            .collect();
+        let mut samples = Vec::new();
+        // Forward/reverse order exposes warm-cache effects; this is not the
+        // hour-long ABBA/BAAB acceptance protocol. CPU includes all process threads.
+        for shards in [1, 2, 4, 8, 8, 4, 2, 1] {
+            let cpu_started = process_cpu()?;
+            let started = std::time::Instant::now();
+            let mut scanned = 0;
+            let mut spills = 0;
+            let mut spilled_bytes = 0;
+            let mut states = Vec::new();
+            for shard in 0..shards {
+                let predicate = if shards == 1 {
+                    String::new()
+                } else {
+                    let lo = shard * HASH_BUCKETS / shards;
+                    let hi = (shard + 1) * HASH_BUCKETS / shards;
+                    let upper = if hi < HASH_BUCKETS { format!(" AND {hash} < {hi}") } else { String::new() };
+                    format!(" AND {hash} >= {lo}{upper}")
+                };
+                let input = crate::rollup::slice_input_sql(
+                    source,
+                    crate::rollup::SliceInput::Deduplicate(crate::rollup::SliceDedup {
+                        keys: &source.dedup_keys,
+                        tiebreak: source.dedup_tiebreak.as_deref(),
+                        tombstone: source.tombstone_column.as_deref(),
+                    }),
+                    "shard_raw",
+                    PROJECT,
+                    range,
+                    &predicate,
+                    None,
+                );
+                let frame = ctx.sql(&input).await?;
+                ctx.register_table("shard_input", Arc::new(datafusion::datasource::ViewTable::new(frame.logical_plan().clone(), Some(input))))?;
+                let (batches, bytes, spill_count, spill_bytes) = measured(&ctx, &cohort("shard_input", false)?).await?;
+                ctx.deregister_table("shard_input")?;
+                scanned += bytes;
+                spills += spill_count;
+                spilled_bytes += spill_bytes;
+                states.extend(crate::rollup::to_rollup_batches(spec, SOURCE, PROJECT, date, "experiment", &batches)?);
+            }
+            ctx.register_table("shard_states", Arc::new(MemTable::try_new(get_schema(TIER).expect("tier schema").schema_ref(), vec![states])?))?;
+            let (merged, _, merge_spills, merge_spilled_bytes) = measured(&ctx, &cohort("shard_states", true)?).await?;
+            spills += merge_spills;
+            spilled_bytes += merge_spilled_bytes;
+            ctx.deregister_table("shard_states")?;
+            let elapsed_seconds = started.elapsed().as_secs_f64();
+            let cpu_seconds = process_cpu()?.checked_sub(cpu_started).context("process CPU clock moved backward")?.as_secs_f64();
+            let actual: std::collections::BTreeMap<_, _> = merged
+                .iter()
+                .flat_map(|batch| {
+                    (0..batch.num_rows()).map(move |row| {
+                        let value = |name| batch.column_by_name(name).expect("measure").as_primitive::<arrow::datatypes::Int64Type>().value(row);
+                        (
+                            crate::support::test_helpers::array_get_str(batch.column_by_name("resource___service___name").expect("service").as_ref(), row),
+                            (value("request_count"), value("duration_sum"), value("duration_min"), value("duration_max")),
+                        )
+                    })
+                })
+                .collect();
+            assert_eq!(merged.iter().map(RecordBatch::num_rows).sum::<usize>(), expected.len(), "exactly one aggregate per service");
+            assert_eq!(actual, expected, "winner/tombstone semantics at {shards} shards");
+            ctx.register_table("shard_merged", Arc::new(MemTable::try_new(merged[0].schema(), vec![merged])?))?;
+            let sketches = ctx.sql("SELECT resource___service___name, hll_count(service_name_hll) AS cardinality, approx_percentile(0.50, duration_digest) AS p50, approx_percentile(0.95, duration_digest) AS p95 FROM shard_merged").await?.collect().await?;
+            for batch in sketches {
+                for row in 0..batch.num_rows() {
+                    let service = crate::support::test_helpers::array_get_str(batch.column(0).as_ref(), row);
+                    let values = &winners[&service];
+                    assert_eq!(batch.column(1).as_primitive::<arrow::datatypes::Int64Type>().value(row), 1, "each service group has one distinct service");
+                    for (column, percentile) in [(2, 0.50), (3, 0.95)] {
+                        let estimate = batch.column(column).as_primitive::<arrow::datatypes::Float64Type>().value(row);
+                        assert!(estimate.is_finite(), "a nonempty digest must produce a finite percentile");
+                        let rank = values.partition_point(|value| (*value as f64) < estimate);
+                        assert!(
+                            (rank as f64 - percentile * values.len() as f64).abs() <= values.len().div_ceil(100) as f64,
+                            "percentile rank error exceeds 1% for {service}, p={percentile}, shards={shards}"
+                        );
+                    }
+                }
+            }
+            let distinct = ctx.sql("SELECT hll_count(hll_merge(service_name_hll)) FROM shard_merged").await?.collect().await?;
+            let cardinality = distinct[0].column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0);
+            assert_eq!(cardinality, services, "these cardinalities remain exact in the sparse HLL representation");
+            ctx.deregister_table("shard_merged")?;
+            assert!(scanned > 0, "Parquet must publish actual scan metrics");
+            assert_eq!(ctx.runtime_env().memory_pool.reserved(), 0, "completed arm must release execution reservations");
+            assert_eq!(ctx.runtime_env().disk_manager.used_disk_space(), 0, "completed arm must release scratch reservations");
+            tracing::subscriber::with_default(tracing_subscriber::fmt().with_ansi(false).without_time().finish(), || {
+                tracing::info!(
+                    shards,
+                    identities,
+                    services,
+                    bytes_scanned = scanned,
+                    elapsed_seconds,
+                    cpu_seconds,
+                    spills,
+                    spilled_bytes,
+                    ?pool_bytes,
+                    event = "rollup_shard_scan_experiment"
+                );
+            });
+            if pool_bytes.is_some() && shards == 1 {
+                assert!(spills > 0, "the single-pass arm must actually spill under its bounded pool");
+            }
+            samples.push((shards, scanned, elapsed_seconds, spills, spilled_bytes));
+        }
+        let single = samples[0].1;
+        for &(shards, bytes, ..) in &samples {
+            if shards > 1 {
+                assert!(bytes > single, "the current shard filters must demonstrate repeated input before a replacement is justified");
+            }
+        }
+        Ok(())
+    }
 
     fn skips() -> u64 {
         crate::observability::maintenance_stats().rollup_noop_rebuild_skipped.load(std::sync::atomic::Ordering::Relaxed)
@@ -8847,6 +10031,60 @@ mod rollup_noop_skip_tests {
         advance_and_drain(db).await
     }
 
+    #[serial]
+    #[tokio::test]
+    async fn paused_backfill_creates_no_raw_work_and_resume_bounds_its_scan() -> Result<()> {
+        use crate::maintenance_coordinator::{Operation, RollupBuildPolicy, TaskJournal};
+        let source = "otel_logs_and_spans";
+        let session_tier = "otel_logs_and_spans_rollup_sessions_1h_v1";
+        let project = format!("pause_{}", uuid::Uuid::new_v4());
+        let date = crate::support::today_utc() - chrono::Duration::days(3);
+        let mut cfg = (*rollup_cfg("paused_backfill_admission")).clone();
+        cfg.maintenance.timefusion_damage_repair_cells = vec![format!("{project}:{date}")];
+        let db = Arc::new(Database::with_config(Arc::new(cfg)).await?);
+        for (day, id) in [(date, "recent"), (date - chrono::Duration::days(1), "older")] {
+            insert_span(&db, &project, day, 12, id, "op").await?;
+        }
+        {
+            let mut journal = db.journal();
+            // Isolate census admission from the tasks the real inserts already minted.
+            // No publication evidence is added by completing these fixture tasks.
+            let inserted: Vec<_> = journal.tasks().map(|task| task.key.clone()).collect();
+            for key in inserted {
+                assert!(journal.complete(&key));
+            }
+            for spec in get_schema(source).expect("source schema").rollups.iter().filter(|spec| spec.derive_from.is_none()) {
+                journal.set_rollup_build_policy(source, &spec.table_name(source), RollupBuildPolicy::Paused)?;
+            }
+        }
+        db.preload_replay_complete.store(true, std::sync::atomic::Ordering::Release);
+        assert_eq!(db.plan_rollup_backfill().await?, 0, "paused tiers must not manufacture raw dedup work");
+        assert!(db.journal().tasks().all(|task| !task.state.is_active()));
+        assert!(
+            db.unified_tables().read().await.keys().all(|table| !table.starts_with("otel_logs_and_spans_rollup_")),
+            "a fully paused source needs no tier-table inspection"
+        );
+        let start = date.and_hms_opt(12, 0, 0).expect("noon").and_utc().timestamp_micros();
+        let end = day_start_micros(date).expect("valid day") + DAY_MICROS;
+        db.journal().set_rollup_build_policy(source, session_tier, RollupBuildPolicy::ResumeFrom { start_micros: start })?;
+        assert!(db.plan_rollup_backfill().await? > 0, "the permitted suffix must still get built");
+        let journal = db.journal();
+        let work: Vec<_> = journal.tasks().filter(|task| task.state.is_active()).collect();
+        assert!(work.iter().any(|task| task.key.operation == Operation::Dedup));
+        assert!(work.iter().any(|task| task.key.physical_table == session_tier));
+        assert!(
+            work.iter().all(|task| {
+                task.key.project_id == project
+                    && (task.key.physical_table == source || task.key.physical_table == session_tier)
+                    && task.key.slice.start_micros >= start
+                    && task.key.slice.end_micros <= end
+            }),
+            "neither a paused tier nor pre-resume history may expand the source scan"
+        );
+        assert_eq!(journal.repair_cursor(TaskJournal::DAMAGE_REPAIR_MIGRATION, source), 0, "policy-blocked forced repair must remain pending");
+        Ok(())
+    }
+
     /// The skip must survive a restart: coverage rebuilt from tier tags at boot must carry a
     /// `content_fp` and a nonzero `output_files`, or nothing can be skipped until a slice has
     /// published once more in the new process. The restart is a second `Database` over the
@@ -8872,6 +10110,129 @@ mod rollup_noop_skip_tests {
         remint_and_drain(&db).await?;
         assert!(skips() > before, "a slice re-minted after a restart must still be proved redundant from its tags");
         assert_eq!(tier_version(&db).await, Some(published_at), "and must not write to the tier");
+        Ok(())
+    }
+
+    #[test_case::test_case(true ; "changed source")]
+    #[test_case::test_case(false ; "overlapping old output")]
+    #[serial]
+    #[tokio::test]
+    async fn an_empty_publication_recovers_its_evidence_without_output_files(source_changed: bool) -> Result<()> {
+        use datafusion::arrow::{array::AsArray, datatypes::Int64Type};
+
+        let cfg = rollup_cfg("rollup_empty_restart");
+        let project = format!("empty-{}", uuid::Uuid::new_v4());
+        let date = chrono::Utc::now().date_naive() - chrono::Duration::days(3);
+        let (key, before) = {
+            let db = Arc::new(Database::with_config(cfg.clone()).await?);
+            let ts = date.and_hms_opt(12, 0, 0).unwrap().and_utc().timestamp_micros();
+            let mut row = test_span_ts("gone", "op", &project, ts);
+            row["deleted"] = serde_json::json!(true);
+            db.insert_records_batch(&project, "otel_logs_and_spans", vec![json_to_batch(vec![row])?], true, None).await?;
+            db.plan_rollup_backfill().await?;
+            assert!(advance_and_drain(&db).await? > 0, "the empty aggregate must actually publish");
+            let held = db
+                .rollup_slice_coverage
+                .iter()
+                .find(|entry| entry.key().0 == project && entry.key().2 == TIER && entry.key().3 <= ts && entry.key().4 > ts)
+                .expect("published slice containing the tombstone");
+            assert_eq!(held.output, RollupOutputEvidence::Empty, "recovery must not depend on an Add tag");
+            assert!(held.measures.is_some() && held.content_fp.is_some(), "the build must establish both halves of the proof");
+            (held.key().clone(), held.value().clone())
+        };
+        let db = Arc::new(Database::with_config(cfg).await?);
+        let version = tier_version(&db).await;
+        db.recover_rollup_coverage("otel_logs_and_spans").await?;
+        let recovered = db.rollup_slice_coverage.get(&key).expect("empty publication must survive restart");
+        assert_eq!((&recovered.measures, recovered.content_fp), (&before.measures, before.content_fp), "recovery must preserve the empty range's proof");
+        assert_eq!(recovered.output, RollupOutputEvidence::Empty, "an empty publication authorizes no generation rows");
+        drop(recovered);
+        let source_table = db.resolve_table(&project, "otel_logs_and_spans").await?;
+        let source_stats = Database::partition_stats_bounded(&*source_table.read().await, tiebreak_of("otel_logs_and_spans"), &|_, _| i64::MAX)?;
+        let target_table = db.resolve_table(&project, TIER).await?;
+        let covered = db.readable_rollup_ranges("otel_logs_and_spans", (TIER, &*target_table.read().await, &project), &source_stats, None)?;
+        assert!(
+            covered.get(&(project.clone(), date)).is_some_and(|ranges| crate::rollup::ranges_cover(ranges, (key.3, key.4 - 1))),
+            "the census must preserve explicit empty coverage without requiring output files"
+        );
+        assert_eq!(tier_version(&db).await, version, "metadata recovery cannot publish replacement Parquet");
+        let mut ctx = db.clone().create_session_context();
+        db.setup_session_context(&mut ctx)?;
+        let sql = format!(
+            "SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = '{project}' AND timestamp >= to_timestamp_micros({}) AND timestamp < to_timestamp_micros({})",
+            key.3, key.4
+        );
+        let state = ctx.state();
+        let plan = state.optimize(&state.create_logical_plan(&sql).await?)?;
+        let route = db.rollup_sql(&plan, &state).await.expect("empty coverage must be routable").expect("rollup route");
+        assert!(route.sql.contains("AND (FALSE)"), "a proven empty tier must not authorize same-generation leftovers");
+        for query in [&sql, &route.sql] {
+            let rows = ctx.sql(query).await?.collect().await?;
+            assert_eq!(rows[0].column(0).as_primitive::<Int64Type>().value(0), 0, "raw and rewritten queries must agree on the recovered empty range");
+        }
+
+        let publication = db
+            .journal()
+            .published_rollups("otel_logs_and_spans", TIER)
+            .into_iter()
+            .find(|(task, _)| task.project_id == project && (task.slice.start_micros, task.slice.end_micros) == (key.3, key.4))
+            .expect("durable empty publication");
+        let stats = crate::observability::maintenance_stats();
+        let builds = stats.rollup_rebuilds_full.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(builds > 0, "the fixture must complete a real base build before the no-op comparison");
+        let scan_work = || {
+            [
+                stats.rollup_scan_cohorts.load(std::sync::atomic::Ordering::Relaxed),
+                stats.rollup_scan_projects.load(std::sync::atomic::Ordering::Relaxed),
+                stats.rollup_scan_estimated_bytes.load(std::sync::atomic::Ordering::Relaxed),
+            ]
+        };
+        let scanned = scan_work();
+        assert!(
+            scanned.into_iter().all(|value| value > 0),
+            "a real source build must increment scan-attempt, project, and estimated-byte counters: {scanned:?}"
+        );
+        let skipped = skips();
+        db.journal().enqueue(publication.0.clone(), crate::support::now_micros(), MAX_DECODED_BYTES, 0);
+        assert!(db.run_coordinator_rollup_selected(TaskSelection::Exact(&publication.0)).await?, "the reminted empty slice must run");
+        assert_eq!(skips(), skipped + 1, "a proven empty publication must skip the raw aggregate scan");
+        assert_eq!(stats.rollup_rebuilds_full.load(std::sync::atomic::Ordering::Relaxed), builds, "empty proof repair must not rebuild");
+        assert_eq!(scan_work(), scanned, "metadata-only proof repair cannot report another source scan");
+        assert_eq!(tier_version(&db).await, version, "a no-op cannot change the tier");
+        db.rollup_slice_coverage.clear();
+        db.rollup_coverage.clear();
+        db.recover_rollup_coverage("otel_logs_and_spans").await?;
+        assert!(
+            db.rollup_slice_coverage.get(&key).is_some_and(|proof| proof.output == RollupOutputEvidence::Empty),
+            "no-op completion must restore durable empty evidence"
+        );
+        db.rollup_slice_coverage.clear();
+        db.rollup_coverage.clear();
+        db.journal().publish(&publication.0, crate::maintenance_coordinator::Publication { evidence: None, ..publication.1.clone() });
+        db.recover_rollup_coverage("otel_logs_and_spans").await?;
+        assert!(!db.rollup_slice_coverage.contains_key(&key), "legacy absence of evidence must stay unknown");
+
+        if source_changed {
+            insert_span(&db, &project, date, 12, "now-live", "op").await?;
+        } else {
+            let mut old = serde_json::json!({
+                "project_id": project, "date": date.to_string(), "timestamp": key.3, "updated_at": key.3,
+                "id": "old-output", "rollup_generation": before.generation, "request_count": 100
+            });
+            old.as_object_mut().expect("object literal").extend(
+                get_schema(TIER)
+                    .expect("generated tier")
+                    .fields
+                    .iter()
+                    .filter(|field| !field.nullable && field.data_type == "Int64" && field.name != "request_count")
+                    .map(|field| (field.name.clone(), serde_json::json!(0))),
+            );
+            let old = crate::support::test_helpers::json_to_batch_for(TIER, vec![old])?;
+            db.insert_records_batch(&project, TIER, vec![old], true, None).await?;
+        }
+        db.journal().publish(&publication.0, publication.1);
+        db.recover_rollup_coverage("otel_logs_and_spans").await?;
+        assert!(!db.rollup_slice_coverage.contains_key(&key), "empty recovery must refuse changed source or overlapping old output");
         Ok(())
     }
 
@@ -8915,23 +10276,50 @@ mod rollup_noop_skip_tests {
     /// count; on disagreement the read path independently refuses the slice
     /// (`rollup_stale_moved`), so unless recovery also QUEUES it the cell stays unreadable
     /// until some unrelated invalidation happens along.
+    #[test_case::test_case(true ; "a write inside the covered prefix requires repair")]
+    #[test_case::test_case(false ; "an append beyond the covered prefix preserves proof")]
     #[serial]
     #[tokio::test]
-    async fn an_overtaken_slice_is_queued_to_be_re_proven() -> Result<()> {
+    async fn recovery_requeues_only_slices_without_current_source_evidence(within_coverage: bool) -> Result<()> {
         let (db, project_id, date) = rollup_db("rollup_moved_requeue").await?;
         assert!(build_day(&db, &project_id, date, "seed").await? > 0, "no rollup unit ran, so there is no witnessed slice to overtake");
         db.recover_rollup_coverage("otel_logs_and_spans").await?;
-        assert!(db.rollup_slice_coverage.iter().next().is_some(), "precondition: recovery must have stamped slice coverage to overtake");
-
-        // OVERTAKE it WITHOUT rebuilding: a second row moves the partition's live
-        // `num_records` past every stamped witness. Deliberately not `build_day`, which ends in
-        // `drain_coordinator_rollups` and would re-publish the slice, restamping the witness.
-        insert_span(&db, &project_id, date, 13, "overtakes-the-witness", "op").await?;
-        dedup_unified(&db).await?;
+        let (lo, hi) = db
+            .rollup_slice_coverage
+            .iter()
+            .find(|entry| entry.key().0 == project_id && entry.key().2 == TIER && entry.output != RollupOutputEvidence::Empty)
+            .map(|entry| (entry.key().3, entry.key().4))
+            .expect("the fixture needs populated base coverage");
+        let noon = date.and_hms_opt(12, 0, 0).unwrap().and_utc().timestamp_micros();
+        assert!(lo <= noon && noon < hi && hi <= noon + 3_600_000_000, "the published prefix must exclude the later append");
+        let mut ctx = Arc::clone(&db).create_session_context();
+        db.setup_session_context(&mut ctx)?;
+        let state = ctx.state();
+        let sql = format!(
+            "SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id='{project_id}' AND timestamp >= to_timestamp_micros({lo}) AND timestamp < to_timestamp_micros({hi})"
+        );
+        let plan = state.optimize(&state.create_logical_plan(&sql).await?)?;
+        assert!(matches!(db.rollup_sql(&plan, &state).await, Ok(Some(_))), "the prefix must route before the append");
+        insert_span(&db, &project_id, date, if within_coverage { 12 } else { 13 }, "later-row", "op").await?;
 
         let before = pending_base_rollups(&db);
         db.recover_rollup_coverage("otel_logs_and_spans").await?;
-        assert!(pending_base_rollups(&db) > before, "an overtaken slice must be queued to be re-proven; before={before} after={}", pending_base_rollups(&db));
+        let after = pending_base_rollups(&db);
+        if within_coverage {
+            assert!(
+                db.journal().tasks().any(|task| {
+                    task.key.project_id == project_id
+                        && task.key.physical_table == TIER
+                        && task.key.slice.overlaps(lo, hi)
+                        && matches!(task.state, crate::maintenance_coordinator::TaskState::Pending | crate::maintenance_coordinator::TaskState::Retry)
+                }),
+                "changed covered input must retain a pending repair"
+            );
+            assert!(db.rollup_sql(&plan, &state).await.is_err(), "recovery cannot resurrect stale coverage");
+        } else {
+            assert_eq!(after, before, "a valid bounded witness must not acquire new repair debt during recovery");
+            assert!(matches!(db.rollup_sql(&plan, &state).await, Ok(Some(_))), "the unaffected prefix must remain readable");
+        }
         Ok(())
     }
 
@@ -8955,36 +10343,203 @@ mod rollup_noop_skip_tests {
     /// `content_fp` by the deletion-vector test below (this one's rebuild case clears coverage
     /// outright, so it cannot reach the fingerprint), and `tier_still_holds_slice` by
     /// `rollup_routing_rejects_legacy_materialization_generations`.
+    #[test_case::test_case(false ; "fixed batches")]
+    #[test_case::test_case(true ; "adaptive batches")]
     #[serial]
     #[tokio::test]
-    async fn a_rollup_whose_input_has_not_moved_completes_without_rebuilding() -> Result<()> {
-        let (db, project_id, date) = rollup_db("rollup_noop_skip").await?;
+    async fn a_rollup_whose_input_has_not_moved_completes_without_rebuilding(adaptive: bool) -> Result<()> {
+        tracing_subscriber::fmt()
+            .with_env_filter(concat!("off,", module_path!(), "=info"))
+            .with_test_writer()
+            .try_init()
+            .expect("install isolated lifecycle test tracing");
+        let started = std::time::Instant::now();
+        let phase = |phase: &str| info!(event = "rollup_noop_lifecycle_phase", phase, adaptive, elapsed_seconds = started.elapsed().as_secs_f64());
+        let mut cfg = (*rollup_cfg("rollup_noop_skip")).clone();
+        cfg.maintenance.timefusion_rollup_adaptive_batches = adaptive;
+        let db = Arc::new(Database::with_config(Arc::new(cfg)).await?);
+        let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+        let date = chrono::Utc::now().date_naive() - chrono::Duration::days(3);
+
+        // Cross both the fixed (256) and maximum adaptive (8192) batch boundaries.
+        let ts = date.and_hms_opt(12, 0, 0).unwrap().and_utc().timestamp_micros();
+        let batch = json_to_batch((0..8193).map(|i| test_span_ts(&format!("seed-{i}"), "op", &project_id, ts)).collect())?;
+        db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch], true, None).await?;
+        phase("seed_inserted");
 
         // A drain of zero units would make every assertion below vacuous.
         assert!(build_day(&db, &project_id, date, "seed").await? > 0, "no rollup unit ran, so nothing here says anything about rebuilding");
+        phase("initial_build_complete");
         let published_at = tier_version(&db).await.expect("the rollup tier must exist once a unit has published into it");
 
         let before = skips();
         remint_and_drain(&db).await?;
         assert!(skips() > before, "a re-pended unit over an unmoved input must be proved redundant, not rebuilt");
         assert_eq!(tier_version(&db).await, Some(published_at), "the skip must not write to the tier at all");
+        phase("noop_verified");
 
         // The other direction: a real row lands, the write path invalidates the hour and drops
         // its coverage, so the proof is gone and the day rebuilds.
         assert!(build_day(&db, &project_id, date, "late-arrival").await? > 0, "the changed day must still produce units");
+        phase("late_rebuild_complete");
         assert!(tier_version(&db).await > Some(published_at), "a day whose source actually changed must be rebuilt, not skipped");
+        let counts = db.query_delta_only(&format!("SELECT CAST(SUM(request_count) AS BIGINT) FROM {TIER} WHERE project_id = '{project_id}'")).await?;
+        use datafusion::arrow::array::AsArray;
+        assert_eq!(
+            counts[0].column(0).as_primitive::<datafusion::arrow::datatypes::Int64Type>().value(0),
+            8195,
+            "batch boundaries must not lose or repeat contributions"
+        );
+        phase("result_verified");
         Ok(())
     }
 
-    /// A cell whose DAY coverage an invalidation destroyed must REBUILD, not
-    /// skip: the skip's proof lives in slice coverage, but the read path routes a
-    /// day panel by the day map, so a skip that completes without recreating it
-    /// leaves the cell unreadable and the census re-mints it next pass — prod
-    /// 2026-09-23 spun 12,255 no-op skips against 420 real rebuilds while the
-    /// hit rate sat at 1%, converging on nothing.
+    #[test_case::test_case(false ; "ordinary winner selection")]
+    #[test_case::test_case(true ; "certified clean input with stale fallback")]
     #[serial]
     #[tokio::test]
-    async fn a_skip_without_day_coverage_declines_and_the_rebuild_restores_it() -> Result<()> {
+    async fn rollup_clean_input_preserves_tombstones_and_late_versions(certified: bool) -> Result<()> {
+        use datafusion::arrow::{array::AsArray, datatypes::Int64Type};
+        let mut cfg = (*rollup_cfg("rollup_clean_input")).clone();
+        cfg.maintenance.timefusion_rollup_certified_clean = certified;
+        cfg.maintenance.timefusion_dedup_certification_persist = true;
+        let cfg = Arc::new(cfg);
+        let db = Arc::new(Database::with_config(Arc::clone(&cfg)).await?);
+        let project = format!("clean-{}", uuid::Uuid::new_v4());
+        let date = chrono::Utc::now().date_naive() - chrono::Duration::days(3);
+        let ts = date.and_hms_opt(12, 0, 0).unwrap().and_utc().timestamp_micros();
+        let rows = ["live", "other", "gone", "masked"]
+            .into_iter()
+            .map(|id| {
+                let mut row = test_span_ts(id, "op", &project, ts);
+                row["deleted"] = serde_json::json!(id == "gone");
+                row
+            })
+            .collect();
+        db.insert_records_batch(&project, "otel_logs_and_spans", vec![json_to_batch(rows)?], true, None).await?;
+        let table = db.resolve_table(&project, "otel_logs_and_spans").await?;
+        let original = table.read().await.clone();
+        let (masked, deleted) = original.delete().with_predicate(format!("project_id = '{project}' AND id = 'masked'")).with_deletion_vectors(true).await?;
+        assert_eq!(deleted.num_deleted_rows, Some(1), "the fixture must mask an actual source row");
+        *table.write().await = masked;
+        let visibility = Database::logical_count_partition_snapshot(&*table.read().await, &project, &date.to_string())?.1;
+        assert!(visibility.values().any(Option::is_some), "the source must retain a live deletion vector rather than rewrite the row away");
+        db.run_certification_pass(&table, "otel_logs_and_spans", std::time::Instant::now() + std::time::Duration::from_secs(60)).await;
+        assert!(db.dedup_window_clean(&*table.read().await, &project, "otel_logs_and_spans", (ts, ts)).granted(), "a real clean probe must supply the proof");
+        db.persist_certifications();
+        drop(table);
+        drop(db);
+        let db = Arc::new(Database::with_config(cfg).await?);
+        let table = db.resolve_table(&project, "otel_logs_and_spans").await?;
+        assert_eq!(
+            Database::logical_count_partition_snapshot(&*table.read().await, &project, &date.to_string())?.1,
+            visibility,
+            "restart must retain the masked source view"
+        );
+        assert!(
+            db.dedup_window_clean(&*table.read().await, &project, "otel_logs_and_spans", (ts, ts)).granted(),
+            "the recovered certificate must prove this exact source view"
+        );
+
+        let count = async || -> Result<i64> {
+            let rows = db.query_delta_only(&format!("SELECT CAST(SUM(request_count) AS BIGINT) FROM {TIER} WHERE project_id = '{project}'")).await?;
+            Ok(rows[0].column(0).as_primitive::<Int64Type>().value(0))
+        };
+        db.plan_rollup_backfill().await?;
+        assert!(advance_and_drain(&db).await? > 0, "the certified build must run");
+        assert_eq!(count().await?, 2, "neither a winning tombstone nor a DV-masked row contributes to the aggregate");
+
+        insert_span(&db, &project, date, 12, "gone", "op").await?;
+        assert!(!db.dedup_window_clean(&*table.read().await, &project, "otel_logs_and_spans", (ts, ts)).granted(), "a late version must invalidate the proof");
+        db.plan_rollup_backfill().await?;
+        assert!(advance_and_drain(&db).await? > 0, "the changed input must rebuild");
+        assert_eq!(count().await?, 3, "fallback must select the newer live version rather than its older tombstone");
+        let mut tombstone = test_span_ts("live", "op", &project, ts);
+        tombstone["deleted"] = serde_json::json!(true);
+        db.insert_records_batch(&project, "otel_logs_and_spans", vec![json_to_batch(vec![tombstone])?], true, None).await?;
+        db.plan_rollup_backfill().await?;
+        assert!(advance_and_drain(&db).await? > 0, "the new tombstone must rebuild");
+        assert_eq!(count().await?, 2, "winner selection must suppress the older live row before tombstone filtering");
+        Ok(())
+    }
+
+    /// Late keys share timestamps with committed keys, not ownership of those keys.
+    #[tokio::test]
+    async fn late_buffered_rows_do_not_hide_other_delta_keys() -> Result<()> {
+        let (db, project, date) = rollup_db("late_buffer_keys").await?;
+        let layer = Arc::new(crate::support::test_helpers::test_layer(Arc::clone(&db.config))?);
+        let db = Arc::new((*db).clone().with_buffered_layer(layer));
+        insert_span(&db, &project, date, 12, "original", "op").await?;
+        let ts = date.and_hms_opt(12, 0, 0).unwrap().and_utc().timestamp_micros();
+        let mut ctx = Arc::clone(&db).create_session_context();
+        db.setup_session_context(&mut ctx)?;
+        let query = format!("SELECT id FROM otel_logs_and_spans WHERE project_id = '{project}' AND timestamp = to_timestamp_micros({ts}) ORDER BY id");
+
+        // An unseen key must not mask the committed key at the same instant.
+        // Its later tombstone must still remove only the matching committed key.
+        for (id, deleted, expected) in [("late", false, vec!["late", "original"]), ("original", true, vec!["late"])] {
+            let mut row = test_span_ts(id, "op", &project, ts);
+            row["deleted"] = serde_json::json!(deleted);
+            db.insert_records_batch(&project, "otel_logs_and_spans", vec![json_to_batch(vec![row])?], false, None).await?;
+            let rows = ctx.sql(&query).await?.collect().await?;
+            let ids: Vec<_> =
+                rows.iter().flat_map(|b| (0..b.num_rows()).map(|r| crate::support::test_helpers::array_get_str(b.column(0).as_ref(), r))).collect();
+            assert_eq!(ids, expected, "late row {id}, deleted={deleted}: resolve identities, not ownership of a timestamp range");
+        }
+        Ok(())
+    }
+
+    /// Writes after physical-plan acceptance cannot change either captured branch.
+    /// This covers the post-ticket boundary, not mutations during provider capture.
+    #[test_case::test_case(false ; "direct delta writes")]
+    #[test_case::test_case(true ; "buffered writes")]
+    #[serial]
+    #[tokio::test]
+    async fn an_accepted_hybrid_plan_keeps_its_source_view(buffered: bool) -> Result<()> {
+        use datafusion::arrow::array::AsArray;
+
+        let (db, project, date) = rollup_db("hybrid_pinned_view").await?;
+        let layer = Arc::new(crate::support::test_helpers::test_layer(Arc::clone(&db.config))?);
+        let db = Arc::new((*db).clone().with_buffered_layer(layer));
+        assert!(build_day(&db, &project, date, "covered").await? > 0);
+        let raw_date = date.succ_opt().unwrap();
+        insert_span(&db, &project, raw_date, 12, "raw", "op").await?;
+        let lo = date.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_micros();
+        let hi = raw_date.and_hms_opt(13, 0, 0).unwrap().and_utc().timestamp_micros();
+        let window = format!("project_id = '{project}' AND timestamp >= to_timestamp_micros({lo}) AND timestamp < to_timestamp_micros({hi})");
+        let query = format!("SELECT COUNT(*) FROM otel_logs_and_spans WHERE {window} GROUP BY resource___service___name");
+        let mut ctx = Arc::clone(&db).create_session_context();
+        db.setup_session_context(&mut ctx)?;
+        let hits = || crate::observability::maintenance_stats().rollup_hits_hybrid.load(std::sync::atomic::Ordering::Relaxed);
+        let before = hits();
+        let plan = ctx.sql(&query).await?.create_physical_plan().await?;
+        assert_eq!(hits(), before + 1, "the captured plan must actually use both raw and rollup branches");
+
+        // Both mutations happen AFTER the router's ticket check, BEFORE execution.
+        for (date, id) in [(date, "late-covered"), (raw_date, "late-raw")] {
+            let ts = date.and_hms_opt(12, 0, 0).unwrap().and_utc().timestamp_micros();
+            let batch = json_to_batch(vec![test_span_ts(id, "op", &project, ts)])?;
+            db.insert_records_batch(&project, "otel_logs_and_spans", vec![batch], !buffered, None).await?;
+        }
+        let old = datafusion::physical_plan::collect(plan, ctx.task_ctx()).await?;
+        let new = ctx.sql(&query).await?.collect().await?;
+        let count = |b: &[RecordBatch]| {
+            b.iter().flat_map(|b| b.column(0).as_primitive::<datafusion::arrow::datatypes::Int64Type>().values().iter().copied()).sum::<i64>()
+        };
+        let rows = ctx.sql(&format!("SELECT id FROM otel_logs_and_spans WHERE {window} ORDER BY id")).await?.collect().await?;
+        let ids: Vec<_> = rows.iter().flat_map(|b| (0..b.num_rows()).map(|r| crate::support::test_helpers::array_get_str(b.column(0).as_ref(), r))).collect();
+        assert_eq!(ids, ["covered", "late-covered", "late-raw", "raw"], "fresh raw rows must include both committed and buffered identities");
+        assert_eq!((count(&old), count(&new)), (2, 4), "accepted plans retain their view, while new queries include both later writes");
+        Ok(())
+    }
+
+    /// A witnessed slice routes without day metadata and must not rewrite data
+    /// merely to recreate that summary. Unknown hours still use raw input.
+    #[serial]
+    #[tokio::test]
+    async fn a_valid_slice_does_not_rebuild_to_restore_day_metadata() -> Result<()> {
+        use datafusion::arrow::{array::AsArray, datatypes::Int64Type};
+
         let (db, project_id, date) = rollup_db("rollup_noop_orphan").await?;
         assert!(build_day(&db, &project_id, date, "seed").await? > 0, "no rollup unit ran, so nothing here says anything about the skip");
         let published_at = tier_version(&db).await.expect("the tier must exist once published");
@@ -8997,12 +10552,321 @@ mod rollup_noop_skip_tests {
             db.rollup_coverage.remove(key);
         }
 
+        let day_start = date.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_micros();
+        let query = |lo, hi| {
+            format!(
+                "SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = '{project_id}' AND timestamp >= to_timestamp_micros({lo}) AND timestamp < to_timestamp_micros({})",
+                hi
+            )
+        };
+        let hour = 3_600_000_000;
+        let sql = query(day_start + 12 * hour, day_start + 13 * hour);
+        let day_sql = query(day_start, day_start + DAY_MICROS);
+        let mut ctx = Arc::clone(&db).create_session_context();
+        db.setup_session_context(&mut ctx)?;
+        let state = ctx.state();
+        let plan = state.optimize(&state.create_logical_plan(&sql).await?)?;
+        let route = db.rollup_sql(&plan, &state).await.expect("slice coverage is readable").expect("rollup route");
+        // One proven hour is below the day query's 20% routing threshold.
+        // Require the slice route without claiming the other 23 hours covered.
+        for query in [&sql, &route.sql, &day_sql] {
+            let rows = ctx.sql(query).await?.collect().await?;
+            assert_eq!(rows[0].column(0).as_primitive::<Int64Type>().value(0), 1, "raw and slice-backed queries agree without a day record");
+        }
+        let before = skips();
         remint_and_drain(&db).await?;
+        assert!(skips() > before, "the existing readable proof must permit a metadata-only skip");
+        assert_eq!(tier_version(&db).await, Some(published_at), "restoring a day summary must not rewrite proven slice output");
+
+        db.preload_replay_complete.store(true, std::sync::atomic::Ordering::Release);
+        db.plan_rollup_backfill().await?;
+        let repairs: Vec<_> = db
+            .journal()
+            .tasks()
+            .filter(|task| {
+                task.key.project_id == project_id
+                    && task.key.physical_table == TIER
+                    && matches!(task.state, TaskState::Pending | TaskState::Retry | TaskState::Running)
+            })
+            .map(|task| task.key.slice)
+            .collect();
+        assert!(!repairs.is_empty(), "the census must still queue genuinely unproven hours");
         assert!(
-            tier_version(&db).await > Some(published_at),
-            "an unreadable cell must be REBUILT, not proved redundant against coverage the reader cannot use"
+            repairs.iter().all(|slice| !slice.overlaps(day_start + 12 * hour, day_start + 13 * hour)),
+            "missing day metadata cannot schedule a scan of the proven hour: {repairs:?}"
         );
-        assert!(db.rollup_coverage.iter().any(|e| e.key().0 == project_id), "the rebuild must republish the day coverage the reader routes by");
+
+        let (slice, proof) = db
+            .rollup_slice_coverage
+            .iter()
+            .find(|entry| entry.key().0 == project_id && entry.key().2 == TIER && matches!(entry.output, RollupOutputEvidence::Files(_)))
+            .map(|entry| (entry.key().clone(), entry.value().clone()))
+            .expect("the unchanged nonempty slice remains proven");
+        let key = crate::maintenance_coordinator::TaskKey {
+            project_id: project_id.clone(),
+            source: slice.1,
+            physical_table: slice.2,
+            slice: crate::maintenance_coordinator::TimeSlice::new(slice.3, slice.4)?,
+            operation: Operation::BaseRollup,
+        };
+        let source_key = (project_id.clone(), key.source.clone(), date.to_string());
+        for dirty_hour in [13, 12] {
+            let epoch = db.rollup_source_epochs.get(&source_key).map_or(0, |entry| *entry.value());
+            {
+                let mut journal = db.journal();
+                journal.enqueue(key.clone(), crate::support::now_micros(), MAX_DECODED_BYTES, 0);
+                assert!(journal.mark_running(&key));
+            }
+            db.apply_rollup_hours(&project_id, &key.source, &date.to_string(), 1 << dirty_hour)?;
+            let before = db.journal().tasks().find(|task| task.key == key).cloned().expect("the invalidated task remains queued");
+            assert_eq!(before.state, if dirty_hour == 13 { TaskState::Running } else { TaskState::Pending });
+            assert!(!db.complete_rollup_noop(&key, &date.to_string(), epoch, (key.slice, &proof))?, "invalidation after proof capture must prevent completion");
+            let after = db.journal().tasks().find(|task| task.key == key).cloned().expect("completion cannot discard the repair");
+            assert_eq!(after.state, if dirty_hour == 13 { TaskState::Retry } else { TaskState::Pending });
+            assert_eq!(after.attempts, before.attempts, "a stale proof is not a failed build");
+            if dirty_hour == 12 {
+                assert_eq!(after.deadline_micros, before.deadline_micros, "completion must preserve the invalidation's quiet period");
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn packed_rollup_remainders_cut_files_at_the_writer_limit() -> Result<()> {
+        use crate::maintenance_coordinator::{TAG_OUTPUT_ROWS, TaskKey, TimeSlice};
+        let mut cfg = (*rollup_cfg("packed_writer_limit")).clone();
+        cfg.maintenance.timefusion_rollup_packed_repairs = true;
+        cfg.maintenance.timefusion_writer_max_file_bytes = 1;
+        let db = Database::with_config(Arc::new(cfg)).await?;
+        let project = format!("packed_limit_{}", uuid::Uuid::new_v4());
+        let date = chrono::Utc::now().date_naive() - chrono::Duration::days(3);
+        let start = date.and_hms_opt(11, 0, 0).expect("valid hour").and_utc().timestamp_micros();
+        let hour = 3_600_000_000;
+        let rows = (0i64..900)
+            .map(|index| {
+                let mut row = test_span_ts(&format!("row-{index}"), "op", &project, start + (index / 300) * hour);
+                row["resource___service___name"] = serde_json::json!(format!("service-{}", index % 300));
+                row
+            })
+            .collect();
+        db.insert_records_batch(&project, "otel_logs_and_spans", vec![json_to_batch(rows)?], true, None).await?;
+        let built = db.run_unit_once("otel_logs_and_spans", &project, date, Operation::BaseRollup, 3, 11).await?;
+        assert_eq!(built.state, Some(TaskState::Complete), "fixture must build real aggregate states: {built}");
+        let target = db.resolve_table(&project, TIER).await?.read().await.clone();
+        let live: Vec<_> = target.snapshot()?.log_data().iter().map(|file| add_action(&file)).collect();
+        assert_eq!(live.iter().map(add_row_count).sum::<Option<u64>>(), Some(900), "each retained hour must exceed the 256-row scan batch");
+        let key = TaskKey {
+            project_id: project,
+            source: "otel_logs_and_spans".to_owned(),
+            physical_table: TIER.to_owned(),
+            slice: TimeSlice::new(start + hour, start + 2 * hour)?,
+            operation: Operation::BaseRollup,
+        };
+        let mut staged = Vec::new();
+        let retired = db.stage_packed_rollup_remainders(&key, &target, &live, &mut staged).await?;
+        Database::cleanup_orphaned_parquet(
+            &target.log_store().object_store(None),
+            &staged.iter().cloned().map(deltalake::kernel::Action::Add).collect::<Vec<_>>(),
+        )
+        .await;
+        assert_eq!(retired.len(), live.len(), "the original packed publication remains the replacement set");
+        assert_eq!(staged.iter().map(add_row_count).sum::<Option<u64>>(), Some(600), "file cuts must preserve both neighboring hours");
+        assert!(staged.iter().all(|add| Database::add_tag(add, TAG_OUTPUT_ROWS) == Some("300")), "each fragment records its total across all cut files");
+        assert!(staged.len() > 2, "each multi-batch fragment must flush before its end at a one-byte cutoff");
+        Ok(())
+    }
+
+    #[test_case::test_case(false, false ; "nonempty middle replacement")]
+    #[test_case::test_case(true, false ; "empty middle replacement")]
+    #[test_case::test_case(false, true ; "interrupted nonempty replacement")]
+    #[test_case::test_case(true, true ; "interrupted empty replacement")]
+    #[serial]
+    #[tokio::test]
+    async fn a_scoped_repair_preserves_packed_output_without_widening_raw_work(empty: bool, interrupted: bool) -> Result<()> {
+        use datafusion::arrow::{array::AsArray, datatypes::Int64Type};
+        let mut cfg = (*rollup_cfg("packed_rollup_repair")).clone();
+        cfg.maintenance.timefusion_rollup_packed_repairs = true;
+        let cfg = Arc::new(cfg);
+        let mut db = Arc::new(Database::with_config(Arc::clone(&cfg)).await?);
+        let project = format!("packed_{}", uuid::Uuid::new_v4());
+        let date = chrono::Utc::now().date_naive() - chrono::Duration::days(3);
+        for hour in [11, 12, 13] {
+            insert_span(&db, &project, date, hour, &format!("seed-{hour}"), "op").await?;
+        }
+        dedup_unified(&db).await?;
+        advance_and_drain(&db).await?;
+        let packed = db.run_unit_once("otel_logs_and_spans", &project, date, Operation::BaseRollup, 3, 11).await?;
+        assert_eq!(packed.state, Some(TaskState::Complete), "the fixture requires a real three-hour publication");
+        let start = date.and_hms_opt(11, 0, 0).expect("valid hour").and_utc().timestamp_micros();
+        let hour = 3_600_000_000;
+        let mut target = db.resolve_table(&project, TIER).await?;
+        assert!(
+            target.read().await.snapshot()?.log_data().iter().any(|file| Database::slice_tag_range(&add_action(&file)) == Some((start, start + 3 * hour))),
+            "the fixture must retain a file spanning both unchanged hours and the repair"
+        );
+        let mut changed = test_span_ts(if empty { "seed-12" } else { "late-middle" }, "op", &project, start + hour);
+        changed["deleted"] = serde_json::json!(empty);
+        db.insert_records_batch(&project, "otel_logs_and_spans", vec![json_to_batch(vec![changed])?], true, None).await?;
+        dedup_unified(&db).await?;
+        if interrupted {
+            let version = target.read().await.version();
+            let lock = db.commit_lock(&project, TIER).await;
+            let held = lock.lock().await;
+            let mut intent = {
+                let build = db.run_unit_once("otel_logs_and_spans", &project, date, Operation::BaseRollup, 1, 12);
+                tokio::pin!(build);
+                tokio::time::timeout(std::time::Duration::from_secs(60), async {
+                    let mut poll = tokio::time::interval(std::time::Duration::from_millis(10));
+                    loop {
+                        tokio::select! {
+                            result = &mut build => {
+                                let report = result?;
+                                anyhow::bail!("repair finished before its held commit lock: {report}");
+                            },
+                            _ = poll.tick() => {
+                                if let Some(intent) = db.staged_intents().into_iter().find(|intent| {
+                                    intent.project_id == project && intent.rollup.as_ref().is_some_and(|rollup| {
+                                        rollup.key.physical_table == TIER && rollup.key.slice.start_micros == start + hour
+                                            && rollup.key.slice.end_micros == start + 2 * hour
+                                    })
+                                }) {
+                                    break Ok::<_, anyhow::Error>(intent);
+                                }
+                            }
+                        }
+                    }
+                })
+                .await??
+            }; // Dropping the builder here simulates interruption before publication.
+            drop(held);
+            assert_eq!(target.read().await.version(), version, "staging must not publish any replacement files");
+            let rollup = intent.rollup.clone().expect("real builder must record recovery evidence");
+            assert!(rollup.target.is_some(), "packed replacement needs the captured target proof");
+            let staged_paths: HashSet<_> = intent.adds.iter().map(|add| add.path.clone()).collect();
+            assert!(!staged_paths.is_empty(), "even an empty middle repair must stage its retained neighbors");
+            // The fixture restarts in one process, so age the old instance's record.
+            intent.recorded_at = crate::support::now_secs() - (STAGED_INTENT_MIN_AGE_SECS + 1);
+            db.clear_staged_intent(&[&intent.wave_id]);
+            db.record_staged_intent(intent);
+            db.shutdown_by(tokio::time::Instant::now() + std::time::Duration::from_secs(10)).await?;
+            db = Arc::new(Database::with_config(Arc::clone(&cfg)).await?);
+            target = db.resolve_table(&project, TIER).await?;
+            let deadline = {
+                let journal = db.journal();
+                let retry = journal.tasks().find(|task| task.key == rollup.key).expect("interrupted task survives restart");
+                assert_eq!(retry.retry_reason.as_deref(), Some(crate::maintenance_coordinator::TaskJournal::WORKER_FAILURE_REASON));
+                retry.deadline_micros
+            };
+            // Dropping the future runs lease cleanup; respect its persisted backoff.
+            crate::support::advance_micros(deadline.saturating_sub(crate::support::now_micros()).max(0));
+            let resumed = db.run_unit_once("otel_logs_and_spans", &project, date, Operation::BaseRollup, 1, 12).await?;
+            assert_eq!(resumed.state, Some(TaskState::Complete), "the worker must resume the staged packed replacement: {resumed}");
+            assert_eq!(resumed.cohorts, 0, "recovery must not repeat raw aggregation");
+            assert_eq!(target.read().await.version(), version.map(|version| version + 1), "resume needs exactly one atomic publication");
+            let live: HashSet<_> = target.read().await.snapshot()?.log_data().iter().map(|file| file.path().to_string()).collect();
+            assert!(staged_paths.is_subset(&live), "resume must reuse the staged paths, not rebuild the aggregates");
+            db.recover_rollup_coverage("otel_logs_and_spans").await?;
+        } else {
+            let repair = db.run_unit_once("otel_logs_and_spans", &project, date, Operation::BaseRollup, 1, 12).await?;
+            assert_eq!(repair.state, Some(TaskState::Complete));
+            assert!(repair.cohorts > 0, "the dirty hour must actually rebuild, not complete by queuing the packed interval");
+        }
+        let unfinished: Vec<_> = db
+            .journal()
+            .tasks()
+            .filter(|task| task.key.project_id == project && task.key.physical_table == TIER && task.state != TaskState::Complete)
+            .map(|task| (task.key.slice, task.state, task.retry_reason.clone()))
+            .collect();
+        assert!(
+            unfinished.iter().all(|(slice, _, _)| slice.start_micros >= start + hour && slice.end_micros <= start + 2 * hour),
+            "a one-hour correction must not queue raw aggregation of unchanged neighboring hours: {unfinished:?}"
+        );
+        let mut ctx = Arc::clone(&db).create_session_context();
+        db.setup_session_context(&mut ctx)?;
+        let query = format!("SELECT SUM(request_count) FROM {TIER} WHERE project_id = '{project}'");
+        let expected = if empty { 2 } else { 4 };
+        let rows = ctx.sql(&query).await?.collect().await?;
+        assert_eq!(rows[0].column(0).as_primitive::<Int64Type>().value(0), expected, "retained neighbors and replacement must contribute exactly once");
+        let key = (project.clone(), "otel_logs_and_spans".to_owned(), TIER.to_owned(), start + hour, start + 2 * hour);
+        let evidence = db.rollup_slice_coverage.get(&key).expect("repaired hour must publish coverage").output;
+        assert_eq!(evidence == RollupOutputEvidence::Empty, empty, "retained output files do not make an empty repair nonempty");
+        let version = target.read().await.version();
+        drop(ctx);
+        drop(target);
+        db.shutdown_by(tokio::time::Instant::now() + std::time::Duration::from_secs(10)).await?;
+        drop(db);
+
+        let db = Arc::new(Database::with_config(cfg).await?);
+        db.recover_rollup_coverage("otel_logs_and_spans").await?;
+        assert_eq!(db.rollup_slice_coverage.get(&key).expect("restart must recover the repaired hour").output, evidence);
+        assert_eq!(tier_version(&db).await, version, "coverage recovery must not rewrite aggregate files");
+        let mut ctx = Arc::clone(&db).create_session_context();
+        db.setup_session_context(&mut ctx)?;
+        let rows = ctx.sql(&query).await?.collect().await?;
+        assert_eq!(rows[0].column(0).as_primitive::<Int64Type>().value(0), expected, "restart cannot resurrect the replaced middle-hour rows");
+        Ok(())
+    }
+
+    #[test_case::test_case(false ; "changed proof retries a still-running task")]
+    #[test_case::test_case(true ; "invalidation retains its requeued task and deadline")]
+    #[serial]
+    #[tokio::test]
+    async fn a_covering_proof_cannot_complete_after_source_invalidation(requeued: bool) -> Result<()> {
+        let (db, project, date) = rollup_db("covering_proof_race").await?;
+        assert!(build_day(&db, &project, date, "seed").await? > 0);
+        let wider = db.run_unit_once("otel_logs_and_spans", &project, date, Operation::BaseRollup, 1, 12).await?;
+        assert_eq!(wider.state, Some(TaskState::Complete), "the fixture needs a real publication wider than a normal invalidation unit");
+        let start = date.and_hms_opt(12, 0, 0).unwrap().and_utc().timestamp_micros();
+        let (covering, proof) = db
+            .rollup_slice_coverage
+            .iter()
+            .find(|entry| entry.key().0 == project && entry.key().2 == TIER && entry.key().3 == start && entry.key().4 == start + 3_600_000_000)
+            .map(|entry| (entry.key().clone(), entry.value().clone()))
+            .expect("the build must publish nonempty base coverage");
+        let key = crate::maintenance_coordinator::TaskKey {
+            project_id: project.clone(),
+            source: covering.1.clone(),
+            physical_table: covering.2.clone(),
+            slice: if requeued {
+                crate::maintenance_coordinator::TimeSlice::normal_units(covering.3, covering.4)?
+                    .into_iter()
+                    .find(|slice| slice.start_micros > covering.3 && slice.end_micros < covering.4)
+                    .expect("the wider proof must contain a normal invalidation unit")
+            } else {
+                crate::maintenance_coordinator::TimeSlice::new(covering.3 + 1, covering.4 - 1)?
+            },
+            operation: Operation::BaseRollup,
+        };
+        {
+            let mut journal = db.journal();
+            journal.enqueue(key.clone(), 0, MAX_DECODED_BYTES, 0);
+            assert!(journal.mark_running(&key));
+        }
+        let source = db.resolve_table(&project, &key.source).await?;
+        let target = db.resolve_table(&project, TIER).await?;
+        let epoch = db.rollup_source_epochs.get(&(project.clone(), key.source.clone(), date.to_string())).map_or(0, |entry| *entry.value());
+        let held = target.write().await;
+        let mut settling = Box::pin(db.settle_covered_by_wider(
+            &key,
+            (covering.3, covering.4),
+            (proof.source_rows.map(i64::try_from).transpose()?, epoch),
+            &source,
+            None,
+            date,
+        ));
+        assert!(futures::poll!(settling.as_mut()).is_pending(), "the target lock must stop completion after proof capture");
+        db.apply_rollup_hours(&project, &key.source, &date.to_string(), 1 << 12)?;
+        assert!(!db.rollup_slice_coverage.contains_key(&covering), "the mutation must invalidate the captured proof");
+        let invalidated = db.journal().tasks().find(|task| task.key == key).cloned().expect("the invalidated unit remains queued");
+        assert_eq!(invalidated.state, if requeued { TaskState::Pending } else { TaskState::Running });
+        drop(held);
+        settling.await?;
+        let settled = db.journal().tasks().find(|task| task.key == key).cloned().expect("settlement cannot discard the repair");
+        assert_eq!(settled.state, if requeued { TaskState::Pending } else { TaskState::Retry }, "invalid proof cannot complete a task");
+        assert_eq!(settled.attempts, invalidated.attempts, "proof invalidation is not another build attempt");
+        if requeued {
+            assert_eq!(settled.deadline_micros, invalidated.deadline_micros, "the invalidation's quiet period must survive settlement");
+        }
         Ok(())
     }
 
@@ -9095,6 +10959,88 @@ mod rollup_journal_persist_tests {
         use std::sync::atomic::Ordering::Relaxed;
         let s = crate::observability::maintenance_stats();
         (s.rollup_journal_persists.load(Relaxed), s.rollup_journal_persist_skipped.load(Relaxed), s.rollup_journal_persist_deferred.load(Relaxed))
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_rollup_publications_share_a_recoverable_checkpoint() -> Result<()> {
+        use crate::maintenance_coordinator::{Operation, Publication, PublicationEvidence, TaskJournal, TaskKey, TimeSlice};
+
+        let db = Database::with_config(TestConfigBuilder::new("rollup_shared_checkpoint").with_rollups().build()).await?;
+        db.cancel_maintenance();
+        let date = (chrono::Utc::now() - chrono::Duration::days(3)).date_naive();
+        let start = date.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_micros();
+        let publications = (0..3i64)
+            .map(|hour| {
+                let key = TaskKey {
+                    source: "otel_logs_and_spans".to_owned(),
+                    physical_table: "otel_logs_and_spans__dashboard_1m_v2".to_owned(),
+                    project_id: format!("checkpoint-{hour}"),
+                    slice: TimeSlice::new(start + hour * 3_600_000_000, start + (hour + 1) * 3_600_000_000)?,
+                    operation: Operation::BaseRollup,
+                };
+                db.journal().enqueue(key.clone(), 0, 1, 0);
+                assert!(db.journal().mark_running(&key));
+                let rollup = crate::database::RollupResume {
+                    key,
+                    publication: Publication {
+                        source_fingerprint: 0,
+                        generation: format!("empty-{hour}"),
+                        rows: 0,
+                        source_rows: Some(0),
+                        source_rows_below: Some(0),
+                        evidence: Some(PublicationEvidence { content_fp: 0, measures: vec!["request_count".to_owned()] }),
+                    },
+                    source_rows: Some(0),
+                    target: None,
+                    date: date.to_string(),
+                };
+                db.record_staged_intent(StagedIntent {
+                    wave_id: rollup.key.project_id.clone(),
+                    table_name: rollup.key.physical_table.clone(),
+                    project_id: rollup.key.project_id.clone(),
+                    recorded_at: crate::support::now_secs(),
+                    paths: Vec::new(),
+                    target_paths: Vec::new(),
+                    adds: Vec::new(),
+                    rollup: Some(rollup.clone()),
+                    instance: None,
+                });
+                Ok(rollup)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let before = db.task_journal_group_commit.counts();
+        let offered = db.task_journal_group_commit.offered();
+        let (started, ready) = std::sync::mpsc::sync_channel(1);
+        std::thread::scope(|scope| -> Result<()> {
+            let leader = scope.spawn(|| {
+                db.task_journal_group_commit.commit(|| -> Result<()> {
+                    started.send(())?;
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                    while db.task_journal_group_commit.offered() < offered + 1 + publications.len() as u64 {
+                        anyhow::ensure!(std::time::Instant::now() < deadline, "publication completions did not join the shared checkpoint barrier");
+                        std::thread::yield_now();
+                    }
+                    assert_eq!(db.staged_intents().len(), publications.len(), "intents must survive until the publication checkpoint completes");
+                    assert!(db.rollup_journal_lock.try_lock().is_ok(), "checkpoint waiters must release the invalidation lock");
+                    db.journal().checkpoint()
+                })
+            });
+            ready.recv_timeout(std::time::Duration::from_secs(10))?;
+            let followers = publications.iter().map(|rollup| scope.spawn(|| db.publish_resumed_rollup(rollup, &rollup.key.project_id, 0))).collect::<Vec<_>>();
+            leader.join().expect("checkpoint leader panicked")?;
+            for follower in followers {
+                assert!(follower.join().expect("publication waiter panicked")?, "unchanged running tasks must publish");
+            }
+            Ok(())
+        })?;
+        let after = db.task_journal_group_commit.counts();
+        assert_eq!((after.0 - before.0, after.1 - before.1), (2, 2), "three queued publications must share the next checkpoint");
+        assert!(db.staged_intents().is_empty(), "durable publications retire their intents");
+        let recovered = TaskJournal::load(&db.config.core.timefusion_data_dir)?;
+        for rollup in publications {
+            assert!(recovered.published_rollups(&rollup.key.source, &rollup.key.physical_table).contains(&(rollup.key, rollup.publication)));
+        }
+        Ok(())
     }
 
     /// `store` costs TWO `fsync`s (temp file, then the parent directory after the rename) and
@@ -9263,7 +11209,12 @@ mod window_scoped_certification_tests {
     use super::*;
 
     fn cert(files: &[&str]) -> Certification {
-        Certification { fp: 1, since: std::time::Instant::now(), files: files.iter().map(|f| (*f).to_string()).collect::<Vec<_>>().into(), stale: false }
+        Certification {
+            fp: 1,
+            since: std::time::Instant::now(),
+            files: Arc::new(files.iter().map(|path| (crate::tantivy::search::parquet_rel_of_uri(path).unwrap().to_owned(), None)).collect()),
+            stale: false,
+        }
     }
 
     /// The read asks about a WINDOW, not the whole partition. A tail append
@@ -9294,7 +11245,7 @@ mod window_scoped_certification_tests {
     fn a_removal_is_never_waved_through() {
         let c = cert(&["s3://b/date=2026-09-15/project_id=p/a.parquet", "s3://b/date=2026-09-15/project_id=p/b.parquet"]);
         let live = ["s3://b/date=2026-09-15/project_id=p/a.parquet".to_string()];
-        let proved: HashSet<&str> = c.files.iter().filter_map(|u| crate::tantivy::search::parquet_rel_of_uri(u)).collect();
+        let proved: HashSet<&str> = c.files.keys().map(String::as_str).collect();
         let added = live.iter().filter_map(|u| crate::tantivy::search::parquet_rel_of_uri(u)).filter(|r| !proved.contains(r)).count();
         assert_eq!(added, 0, "a removal adds nothing, so the helper returns false and the caller denies");
         let _ = Arc::new(());

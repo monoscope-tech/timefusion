@@ -17,6 +17,8 @@ use crate::support::lock;
 
 pub const NORMAL_SLICE_MICROS: i64 = 10 * 60 * 1_000_000;
 pub const DAY_MICROS: i64 = 24 * 60 * 60 * 1_000_000;
+/// Proven base ranges keyed by (source, project, derived table, UTC date).
+pub(crate) type BaseTierCoverage = HashMap<(String, String, String, String), Vec<(i64, i64)>>;
 /// Widths `coarsen_sealed_slices` fuses sealed units to, widest first. Each
 /// divides the one above, so an aligned unit at any width sits inside exactly
 /// one bucket at every coarser width.
@@ -82,7 +84,8 @@ pub const fn operation_deadline_secs(operation: Operation) -> u64 {
 /// Matched on the message, not the type: these errors arrive type-erased across
 /// the delta-rs and `anyhow` boundaries.
 pub fn is_capacity_failure(message: &str) -> bool {
-    message.contains("Resources exhausted")
+    message == "resource_exhausted"
+        || message.contains("Resources exhausted")
         || message.contains("Failed to allocate additional")
         || message.contains("Not enough memory to continue external sort")
         || message.contains("resource_admission")
@@ -136,12 +139,16 @@ pub const TAG_SOURCE_ROWS: &str = "timefusion.source_rows";
 /// this is a separate tag rather than a redefinition of the old one.
 pub const TAG_SOURCE_ROWS_BELOW: &str = "timefusion.source_rows_below";
 pub const TAG_GENERATION: &str = "timefusion.generation";
+/// Total aggregate rows in this publication, repeated on every output file.
+/// Unlike a count of surviving files, this survives task retirement and file splitting.
+pub const TAG_OUTPUT_ROWS: &str = "timefusion.output_rows";
 /// Which declared measures this slice's files actually MATERIALIZED, comma
 /// separated — NOT what the spec declares. A measure added after a slice was
 /// written null-fills on scan and merges skip the nulls, so the read path
 /// refuses a cell that cannot prove the measure a query needs.
 pub const TAG_MEASURES: &str = "timefusion.measures";
 const JOURNAL_VERSION: u32 = 1;
+const ROLLUP_POLICY_VERSION: u32 = 2;
 const JOURNAL_COMPACT_BYTES: u64 = 64 * 1024 * 1024;
 static THROUGHPUT_SAMPLE: std::sync::OnceLock<Mutex<(i64, u64)>> = std::sync::OnceLock::new();
 
@@ -351,6 +358,12 @@ impl InputFootprint {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub struct PublicationEvidence {
+    pub content_fp: u64,
+    pub measures: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 pub struct Publication {
     pub source_fingerprint: u64,
     pub generation: String,
@@ -365,6 +378,9 @@ pub struct Publication {
     /// field deserialize as `None` and fall back to the whole-partition compare.
     #[serde(default)]
     pub source_rows_below: Option<u64>,
+    /// Also recorded for zero-row output, where no Add tags can carry the proof.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<PublicationEvidence>,
 }
 
 /// What one fusion bucket would cost to scan, accumulated member by member.
@@ -487,11 +503,36 @@ enum SplitTrigger {
     RepeatedFailure,
 }
 
+/// Admission policy only: neither state certifies stored rollup output.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RollupBuildPolicy {
+    Paused,
+    ResumeFrom { start_micros: i64 },
+}
+
+/// Operator-visible local override. Parent policies still apply to every state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "state", content = "policy", rename_all = "snake_case")]
+pub(crate) enum RollupPolicyStatus {
+    NoOverride,
+    Pending(RollupBuildPolicy),
+    Durable(RollupBuildPolicy),
+}
+
+pub(crate) struct RollupPolicyView {
+    pub table: String,
+    pub parent: Option<String>,
+    pub status: RollupPolicyStatus,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 struct Snapshot {
     version: u32,
     tasks: Vec<MaintenanceTask>,
     source_cursors: BTreeMap<String, u64>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    rollup_policies: BTreeMap<String, RollupBuildPolicy>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -508,6 +549,10 @@ enum JournalRecord {
     /// This task no longer exists. Without a tombstone the WAL is upsert-only,
     /// so a removal would be undone by the next restart.
     Removed(TaskKey),
+    RollupPolicy {
+        table: String,
+        policy: RollupBuildPolicy,
+    },
 }
 
 /// Crash-safe task journal. `checkpoint` uses fsync + atomic rename, so a failed
@@ -516,11 +561,15 @@ enum JournalRecord {
 pub struct TaskJournal {
     path: PathBuf,
     wal_path: PathBuf,
+    /// Start of a failed append, retained until retry removes its partial bytes.
+    /// Complete records awaiting fsync do not need rollback.
+    incomplete_append: Option<u64>,
     snapshot: Snapshot,
     /// Stable indices into `snapshot.tasks`. Tasks are never removed, so point
     /// updates and WAL replay stay O(1) even with a production-sized backlog.
     task_indices: HashMap<TaskKey, usize>,
-    /// Keys that MIGHT be claimable, so `claim_next` does not walk the dead.
+    /// Unfinished keys and possible claim candidates, so checks do not walk the dead.
+    /// Running base work must remain indexed until its dependency is complete.
     ///
     /// Prod 2026-09-20 held 93,326 Complete tasks against 857 Pending, and
     /// `claim_next` filtered all 94,349 of them on every pass — three passes, 219
@@ -550,16 +599,14 @@ pub struct TaskJournal {
     /// Keys removed since the last write, pending a `Removed` tombstone.
     removed_tasks: HashSet<TaskKey>,
     dirty_cursors: HashSet<String>,
+    dirty_rollup_policies: HashSet<String>,
     /// When the gauges were last recomputed, so `checkpoint` does not rescan the
     /// whole task list on every claim and completion.
     stats_published_at: Option<std::time::Instant>,
     fair_cursors: HashMap<Operation, String>,
-    /// `(source, project_id, date)` whose BASE tier is already built, read from
-    /// real rollup coverage. `dependencies_complete` consults this instead of
-    /// requiring COMPLETE `BaseRollup` TASKS, which a historical day does not
-    /// have. Keyed by DAY so it cannot miss a task whatever slice it covers.
-    /// Runtime only, never journalled — a restart costs one planner pass.
-    base_tier_ready: HashSet<(String, String, String)>,
+    /// Required-parent coverage, reconstructed by the census rather than journalled.
+    /// Ranges are merged on publication and narrowed by source invalidation.
+    base_tier_ready: BaseTierCoverage,
     /// `(source, project_id, physical_table, date)` where the tier is MISSING.
     /// `scheduling_class` ranks a hole ahead of a re-derive; otherwise sealed
     /// rollup work is strictly newest-first and the claim never walks back far
@@ -715,43 +762,72 @@ impl TaskJournal {
             Err(error) if error.kind() == ErrorKind::NotFound => Snapshot { version: JOURNAL_VERSION, ..Snapshot::default() },
             Err(error) => return Err(error.into()),
         };
-        anyhow::ensure!(snapshot.version == JOURNAL_VERSION, "unsupported maintenance task journal version {}", snapshot.version);
-        // Every record ends in a newline. Ignore only a torn final record; all
+        anyhow::ensure!(
+            matches!(snapshot.version, JOURNAL_VERSION | ROLLUP_POLICY_VERSION),
+            "unsupported maintenance task journal version {}",
+            snapshot.version
+        );
+        // Every record ends in a newline. Discard only a torn final record; all
         // earlier records were fsynced before the caller acknowledged the
         // invalidation or publication that produced them.
         let mut task_indices = snapshot.tasks.iter().enumerate().map(|(index, task)| (task.key.clone(), index)).collect::<HashMap<_, _>>();
-        if let Ok(bytes) = fs::read(&wal_path) {
-            for line in bytes.split_inclusive(|byte| *byte == b'\n').take_while(|line| line.ends_with(b"\n")) {
-                let record = serde_json::from_slice::<JournalRecord>(&line[..line.len() - 1])?;
-                match record {
-                    JournalRecord::Task(task) => insert_task(&mut snapshot.tasks, &mut task_indices, *task),
-                    JournalRecord::SourceCursor { source, delta_version } => {
-                        snapshot.source_cursors.entry(source).and_modify(|cursor| *cursor = (*cursor).max(delta_version)).or_insert(delta_version);
-                    }
-                    // `swap_remove` keeps this O(1); snapshot ORDER carries no
-                    // meaning, since every consumer sorts or filters.
-                    JournalRecord::Removed(key) => {
-                        if let Some(index) = task_indices.remove(&key) {
-                            snapshot.tasks.swap_remove(index);
-                            if let Some(moved) = snapshot.tasks.get(index) {
-                                task_indices.insert(moved.key.clone(), index);
-                            }
+        let bytes = match fs::read(&wal_path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == ErrorKind::NotFound => Vec::new(),
+            Err(error) => return Err(error.into()),
+        };
+        let valid_end = bytes.iter().rposition(|byte| *byte == b'\n').map_or(0, |index| index + 1);
+        for line in bytes[..valid_end].split_inclusive(|byte| *byte == b'\n') {
+            let record = serde_json::from_slice::<JournalRecord>(&line[..line.len() - 1])?;
+            match record {
+                JournalRecord::RollupPolicy { table, policy } => {
+                    snapshot.rollup_policies.insert(table, policy);
+                    snapshot.version = ROLLUP_POLICY_VERSION;
+                }
+                JournalRecord::Task(task) => insert_task(&mut snapshot.tasks, &mut task_indices, *task),
+                JournalRecord::SourceCursor { source, delta_version } => {
+                    snapshot.source_cursors.entry(source).and_modify(|cursor| *cursor = (*cursor).max(delta_version)).or_insert(delta_version);
+                }
+                // `swap_remove` keeps this O(1); snapshot ORDER carries no
+                // meaning, since every consumer sorts or filters.
+                JournalRecord::Removed(key) => {
+                    if let Some(index) = task_indices.remove(&key) {
+                        snapshot.tasks.swap_remove(index);
+                        if let Some(moved) = snapshot.tasks.get(index) {
+                            task_indices.insert(moved.key.clone(), index);
                         }
                     }
                 }
             }
         }
+        if valid_end < bytes.len() {
+            // Only after the complete prefix validates: otherwise preserve the
+            // corrupt evidence. Appending to this tail would corrupt the next record.
+            let len = u64::try_from(valid_end)?;
+            crate::support::without_blocking_the_worker(|| -> std::io::Result<()> {
+                let wal = OpenOptions::new().write(true).open(&wal_path)?;
+                wal.set_len(len)?;
+                wal.sync_all()
+            })?;
+            tracing::warn!(
+                discarded_bytes = bytes.len() - valid_end,
+                path = %wal_path.display(),
+                event = "maintenance_journal_torn_tail_discarded"
+            );
+        }
         let mut journal = Self {
             path,
             wal_path,
+            incomplete_append: None,
             snapshot,
             task_indices,
             dirty_tasks: HashSet::new(),
             removed_tasks: HashSet::new(),
             dirty_cursors: HashSet::new(),
+            dirty_rollup_policies: HashSet::new(),
             stats_published_at: None,
             fair_cursors: HashMap::new(),
-            base_tier_ready: HashSet::new(),
+            base_tier_ready: HashMap::new(),
             tier_holes: HashSet::new(),
             untagged_cells: HashSet::new(),
             claimable: std::collections::BTreeMap::new(),
@@ -1189,19 +1265,21 @@ impl TaskJournal {
     /// Work of `operation` still waiting to run — every state `claim_next` can
     /// select from.
     fn queued(&self, operation: Operation) -> impl Iterator<Item = &MaintenanceTask> {
-        self.snapshot.tasks.iter().filter(move |task| task.key.operation == operation && matches!(task.state, TaskState::Pending | TaskState::Retry))
+        self.snapshot.tasks.iter().filter(move |task| {
+            task.key.operation == operation && matches!(task.state, TaskState::Pending | TaskState::Retry) && self.rollup_build_allowed(&task.key)
+        })
     }
 
     /// Why queued work for `operation` is not being claimed: `(pending, sealed,
-    /// unproven, quarantined, not_yet_due)`. `unproven` counts
-    /// `!base_tier_present` rather than calling `dependencies_complete`, which
-    /// would make this census O(n^2) under the journal lock.
+    /// unproven, quarantined, not_yet_due)`. `unproven` counts missing cached
+    /// proof, not full dependency eligibility: active repairs can veto proof.
+    /// It excludes completed-task searches to avoid O(n^2) under the journal lock.
     pub fn claimability_census(&self, operation: Operation, now_micros: i64) -> (usize, usize, usize, usize, usize) {
         self.queued(operation).fold((0, 0, 0, 0, 0), |(pending, sealed, unproven, quarantined, not_due), task| {
             (
                 pending + 1,
                 sealed + usize::from(!is_frontier_task(task, now_micros)),
-                unproven + usize::from(!task.base_tier_present),
+                unproven + usize::from(!self.cached_base_tier_proven(task)),
                 quarantined + usize::from(Self::is_quarantined(task)),
                 not_due + usize::from(task.deadline_micros > now_micros),
             )
@@ -1328,10 +1406,9 @@ impl TaskJournal {
             })
     }
 
-    /// Publish which `(source, project, date)` have their BASE tier built. Replaces the set
-    /// wholesale: coverage can go backwards, and a stale "ready" derives from a missing tier.
-    pub fn set_base_tier_ready(&mut self, ready: HashSet<(String, String, String)>) {
-        self.base_tier_ready = ready;
+    /// Replace required-parent evidence without widening holes between proven ranges.
+    pub(crate) fn set_base_tier_ready(&mut self, ready: BaseTierCoverage) {
+        self.base_tier_ready = ready.into_iter().map(|(cell, ranges)| (cell, crate::write::mem_buffer::merge_ranges(ranges))).collect();
     }
 
     pub fn base_tier_ready_len(&self) -> usize {
@@ -1422,8 +1499,10 @@ impl TaskJournal {
     /// the only thing that bounds the permissive set's growth.
     fn rebuild_claimable(&mut self) {
         self.claimable.clear();
-        for task in self.snapshot.tasks.iter().filter(|task| matches!(task.state, TaskState::Pending | TaskState::Retry)) {
-            self.claimable.entry(task.key.operation).or_default().insert(task.key.clone());
+        for task in self.snapshot.tasks.iter().filter(|task| matches!(task.state, TaskState::Pending | TaskState::Retry | TaskState::Running)) {
+            if self.rollup_build_allowed(&task.key) {
+                self.claimable.entry(task.key.operation).or_default().insert(task.key.clone());
+            }
         }
     }
 
@@ -1463,7 +1542,9 @@ impl TaskJournal {
     /// filtered on the way past and pruned lazily, so the set errs toward
     /// holding too much rather than too little.
     fn mark_dirty(&mut self, key: TaskKey) {
-        if self.task(&key).is_some_and(|task| matches!(task.state, TaskState::Pending | TaskState::Retry)) {
+        if self.rollup_build_allowed(&key)
+            && self.task(&key).is_some_and(|task| matches!(task.state, TaskState::Pending | TaskState::Retry | TaskState::Running))
+        {
             self.claimable.entry(key.operation).or_default().insert(key.clone());
         }
         self.dirty_tasks.insert(key);
@@ -1482,21 +1563,6 @@ impl TaskJournal {
     fn task_mut(&mut self, key: &TaskKey) -> Option<&mut MaintenanceTask> {
         let index = *self.task_indices.get(key)?;
         self.snapshot.tasks.get_mut(index)
-    }
-
-    pub fn prove_base_tier_for_day(&mut self, key: &TaskKey, day_start: i64, day_end: i64) -> usize {
-        // Only work that can still run: proving a completed task is a no-op that would
-        // make the returned count read as progress.
-        self.edit_tasks(
-            |task| {
-                matches!(task.state, TaskState::Pending | TaskState::Retry)
-                    && !task.base_tier_present
-                    && Self::same_cell(&task.key, key)
-                    && task.key.slice.start_micros >= day_start
-                    && task.key.slice.end_micros <= day_end
-            },
-            |task| task.base_tier_present = true,
-        )
     }
 
     /// Remember what a unit reads, measured by the claim-time preflight. Must be recorded on
@@ -1526,6 +1592,9 @@ impl TaskJournal {
     }
 
     pub fn upsert(&mut self, task: MaintenanceTask) {
+        if !self.rollup_build_allowed(&task.key) && !self.task_indices.contains_key(&task.key) && task.state != TaskState::Complete {
+            return;
+        }
         // A key removed earlier in this write window and re-created now must drop its tombstone.
         self.removed_tasks.remove(&task.key);
         let key = task.key.clone();
@@ -1570,6 +1639,9 @@ impl TaskJournal {
         &mut self, key: TaskKey, deadline_micros: i64, estimated_decoded_bytes: u64, created_unix_ms: u64, base_tier_present: bool,
         input: Option<InputFootprint>,
     ) -> bool {
+        if !self.rollup_build_allowed(&key) {
+            return false;
+        }
         // Same rule as `upsert`: a key removed earlier in this write window and enqueued
         // again is CREATED, not removed (`coarsen_to_width` does both in one pass).
         self.removed_tasks.remove(&key);
@@ -1691,7 +1763,23 @@ impl TaskJournal {
     }
 
     fn invalidate_slices(&mut self, invalidation: Invalidation<'_>, normal_slices: &[TimeSlice], rollup_slices: &[TimeSlice]) -> anyhow::Result<()> {
-        let Invalidation { source_table, rollup_table, source, project_id, observed_at_micros, derived, mint_dedup, mint_rollup, .. } = invalidation;
+        let Invalidation { source_table, rollup_table, source, project_id, start_micros, end_micros, observed_at_micros, derived, mint_dedup, mint_rollup } =
+            invalidation;
+        if derived && mint_rollup {
+            if let Some(days) = crate::database::window_hour_masks(start_micros, end_micros) {
+                for (date, _) in days {
+                    let cell = (source.to_owned(), project_id.to_owned(), rollup_table.to_owned(), date);
+                    if let Some(ranges) = self.base_tier_ready.get_mut(&cell) {
+                        *ranges = ranges.iter().flat_map(|&(start, end)| crate::rollup::uncovered(start, end, vec![(start_micros, end_micros)])).collect();
+                        if ranges.is_empty() {
+                            self.base_tier_ready.remove(&cell);
+                        }
+                    }
+                }
+            } else {
+                self.base_tier_ready.retain(|(held_source, project, table, _), _| held_source != source || project != project_id || table != rollup_table);
+            }
+        }
         // Round up, never down: a bucket may delay eligibility but must never publish before
         // the full quiet period.
         let deadline = observed_at_micros.saturating_add(FINALIZATION_DELAY_MICROS);
@@ -1725,16 +1813,23 @@ impl TaskJournal {
                     slice,
                     operation,
                 };
+                if !self.rollup_build_allowed(&key) && !self.task_indices.contains_key(&key) {
+                    continue;
+                }
                 if let Some(index) = self.task_indices.get(&key).copied() {
                     let task = &mut self.snapshot.tasks[index];
                     let new_deadline = task.deadline_micros.max(deadline_micros);
-                    let changed =
-                        task.state != TaskState::Pending || task.deadline_micros != new_deadline || task.retry_reason.is_some() || task.publication.is_some();
+                    let changed = task.state != TaskState::Pending
+                        || task.deadline_micros != new_deadline
+                        || task.retry_reason.is_some()
+                        || task.publication.is_some()
+                        || task.base_tier_present;
                     if changed {
                         task.state = TaskState::Pending;
                         task.deadline_micros = new_deadline;
                         task.retry_reason = None;
                         task.publication = None;
+                        task.base_tier_present = false;
                         self.mark_dirty(key);
                     }
                 } else {
@@ -1748,6 +1843,9 @@ impl TaskJournal {
     }
 
     pub fn mark_running(&mut self, key: &TaskKey) -> bool {
+        if !self.rollup_build_allowed(key) {
+            return false;
+        }
         let Some(task) = self.task_mut(key) else { return false };
         if !matches!(task.state, TaskState::Pending | TaskState::Retry) {
             return false;
@@ -1755,7 +1853,33 @@ impl TaskJournal {
         task.state = TaskState::Running;
         task.preflight_decoded_bytes = None;
         task.attempts = task.attempts.saturating_add(1);
+        if key.operation == Operation::BaseRollup {
+            self.supersede_contained_base_units(key);
+        }
         true
+    }
+
+    /// A base unit reads all current source for its slice, so queued base units strictly inside
+    /// it are redundant; left queued they block derived claims over work already being done. If
+    /// the covering unit fails it retries (or splits) as the superset, and dirt landing after the
+    /// claim re-pends through invalidation.
+    fn supersede_contained_base_units(&mut self, key: &TaskKey) {
+        self.edit_tasks(
+            |task| {
+                task.key != *key
+                    && task.key.operation == Operation::BaseRollup
+                    && matches!(task.state, TaskState::Pending | TaskState::Retry)
+                    && task.key.physical_table == key.physical_table
+                    && task.key.source == key.source
+                    && task.key.project_id == key.project_id
+                    && key.slice.start_micros <= task.key.slice.start_micros
+                    && task.key.slice.end_micros <= key.slice.end_micros
+            },
+            |task| {
+                task.state = TaskState::Superseded;
+                task.retry_reason = Some("covered_by_running_base_unit".to_owned());
+            },
+        );
     }
 
     /// Attempts after which a unit has PROVEN it does not fit its deadline: one timeout is a
@@ -1835,7 +1959,7 @@ impl TaskJournal {
         let mut ranked = std::mem::take(&mut self.claim_scratch);
         ranked.clear();
         for (index, task) in self.claim_candidates(operation) {
-            if !Self::task_can_be_claimed(task, now_micros, allow_quarantined) {
+            if !self.task_can_be_claimed(task, now_micros, allow_quarantined) {
                 continue;
             }
             let waited = now_micros.saturating_sub(task.key.slice.end_micros);
@@ -1909,54 +2033,68 @@ impl TaskJournal {
     /// Manual selection changes ordering, not eligibility or dependency proofs.
     pub fn claim_exact(&mut self, key: &TaskKey, now_micros: i64, allow_quarantined: bool) -> Option<MaintenanceTask> {
         let task = self.task(key)?;
-        if !Self::task_can_be_claimed(task, now_micros, allow_quarantined) || !self.dependencies_complete(task) {
+        if !self.task_can_be_claimed(task, now_micros, allow_quarantined) || !self.dependencies_complete(task) {
             return None;
         }
         self.mark_running(key);
         self.task(key).cloned()
     }
 
-    fn task_can_be_claimed(task: &MaintenanceTask, now_micros: i64, allow_quarantined: bool) -> bool {
-        matches!(task.state, TaskState::Pending | TaskState::Retry) && task.deadline_micros <= now_micros && (allow_quarantined || !Self::is_quarantined(task))
+    fn task_can_be_claimed(&self, task: &MaintenanceTask, now_micros: i64, allow_quarantined: bool) -> bool {
+        self.rollup_build_allowed(&task.key)
+            && matches!(task.state, TaskState::Pending | TaskState::Retry)
+            && task.deadline_micros <= now_micros
+            && (allow_quarantined || !Self::is_quarantined(task))
+    }
+
+    fn cached_base_tier_proven(&self, task: &MaintenanceTask) -> bool {
+        task.base_tier_present
+            || Self::cell_of(task)
+                .and_then(|cell| self.base_tier_ready.get(&cell))
+                .is_some_and(|ranges| ranges.iter().any(|&(start, end)| start <= task.key.slice.start_micros && end >= task.key.slice.end_micros))
     }
 
     fn dependencies_complete(&self, task: &MaintenanceTask) -> bool {
-        // Only a DERIVED unit has a dependency at all.
-        let required = matches!(task.key.operation, Operation::DerivedRollup).then_some(Operation::BaseRollup);
-        // Either witness of a present base tier short-circuits; the day-keyed set is the
-        // reliable one, since the per-task flag must land on exactly the right `TaskKey`.
-        if task.base_tier_present {
+        if task.key.operation != Operation::DerivedRollup {
             return true;
         }
-        if let Some(date) = task_date(task)
-            && self.base_tier_ready.contains(&(task.key.source.clone(), task.key.project_id.clone(), date))
+        let base_table = crate::schema::get_schema(&task.key.source).and_then(|schema| {
+            let parent = schema.rollups.iter().find(|spec| spec.table_name(&task.key.source) == task.key.physical_table)?.derive_from.as_deref()?;
+            schema.rollups.iter().find(|spec| spec.name.as_deref() == Some(parent)).map(|spec| spec.table_name(&task.key.source))
+        });
+        let overlaps_parent = |candidate: &MaintenanceTask| {
+            base_table.as_deref() == Some(candidate.key.physical_table.as_str())
+                && candidate.key.source == task.key.source
+                && candidate.key.project_id == task.key.project_id
+                && candidate.key.operation == Operation::BaseRollup
+                && task.key.slice.overlaps(candidate.key.slice.start_micros, candidate.key.slice.end_micros)
+        };
+        if self
+            .claim_candidates(Operation::BaseRollup)
+            .any(|(_, candidate)| matches!(candidate.state, TaskState::Pending | TaskState::Retry | TaskState::Running) && overlaps_parent(candidate))
         {
+            return false;
+        }
+        // Historical coverage need not have retained completed build tasks.
+        if self.cached_base_tier_proven(task) {
             return true;
         }
         // Contiguous coverage of the slice by COMPLETE units of the required operation: the
         // `scan` walks sorted intervals and stops dead at the first gap.
-        required.is_none_or(|required| {
-            use itertools::Itertools;
-            self.snapshot
-                .tasks
-                .iter()
-                .filter(|candidate| {
-                    candidate.key.source == task.key.source
-                        && candidate.key.project_id == task.key.project_id
-                        && candidate.key.operation == required
-                        && candidate.state == TaskState::Complete
-                        && task.key.slice.overlaps(candidate.key.slice.start_micros, candidate.key.slice.end_micros)
+        use itertools::Itertools;
+        self.snapshot
+            .tasks
+            .iter()
+            .filter(|candidate| candidate.state == TaskState::Complete && overlaps_parent(candidate))
+            .map(|candidate| candidate.key.slice)
+            .sorted_unstable()
+            .scan(task.key.slice.start_micros, |covered, interval| {
+                (interval.start_micros <= *covered).then(|| {
+                    *covered = (*covered).max(interval.end_micros);
+                    *covered
                 })
-                .map(|candidate| candidate.key.slice)
-                .sorted_unstable()
-                .scan(task.key.slice.start_micros, |covered, interval| {
-                    (interval.start_micros <= *covered).then(|| {
-                        *covered = (*covered).max(interval.end_micros);
-                        *covered
-                    })
-                })
-                .any(|covered| covered >= task.key.slice.end_micros)
-        })
+            })
+            .any(|covered| covered >= task.key.slice.end_micros)
     }
 
     pub fn attempts(&self, key: &TaskKey) -> u32 {
@@ -2211,6 +2349,74 @@ impl TaskJournal {
         )
     }
 
+    pub(crate) fn rollup_policy_status(&self, table: &str) -> RollupPolicyStatus {
+        match self.snapshot.rollup_policies.get(table).copied() {
+            None => RollupPolicyStatus::NoOverride,
+            Some(policy) if self.dirty_rollup_policies.contains(table) => RollupPolicyStatus::Pending(policy),
+            Some(policy) => RollupPolicyStatus::Durable(policy),
+        }
+    }
+
+    /// Persist an explicit policy change. Old binaries reject its record or v2 snapshot.
+    pub fn set_rollup_build_policy(&mut self, source: &str, table: &str, policy: RollupBuildPolicy) -> anyhow::Result<()> {
+        let schema = crate::schema::get_schema(source).ok_or_else(|| anyhow::anyhow!("unknown rollup source {source}"))?;
+        let spec = schema.rollups.iter().find(|spec| spec.table_name(source) == table).ok_or_else(|| anyhow::anyhow!("unknown rollup tier {table}"))?;
+        if let RollupBuildPolicy::ResumeFrom { start_micros } = policy {
+            let grain = spec.grain_micros().filter(|grain| *grain > 0).ok_or_else(|| anyhow::anyhow!("invalid rollup grain for {table}"))?;
+            anyhow::ensure!(start_micros.rem_euclid(grain) == 0, "resume boundary must align to the rollup grain");
+        }
+        if self.snapshot.rollup_policies.get(table) != Some(&policy) {
+            self.snapshot.rollup_policies.insert(table.to_owned(), policy);
+            self.snapshot.version = ROLLUP_POLICY_VERSION;
+            self.dirty_rollup_policies.insert(table.to_owned());
+            self.rebuild_claimable();
+        }
+        self.checkpoint()
+    }
+
+    /// A paused parent also suspends derived builds; no policy means legacy admission.
+    pub fn rollup_build_allowed(&self, key: &TaskKey) -> bool {
+        !matches!(key.operation, Operation::BaseRollup | Operation::DerivedRollup)
+            || self.rollup_build_window(&key.source, &key.physical_table, key.slice) == Some(key.slice)
+    }
+
+    /// Narrow planning to the permitted interval. Existing claims must fit it completely.
+    pub(crate) fn rollup_build_window(&self, source: &str, target: &str, mut range: TimeSlice) -> Option<TimeSlice> {
+        if self.snapshot.rollup_policies.is_empty() {
+            return Some(range);
+        }
+        let schema = crate::schema::get_schema(source);
+        let grain = schema.and_then(|schema| schema.rollups.iter().find(|spec| spec.table_name(source) == target)).and_then(|spec| spec.grain_micros());
+        let mut table = target.to_owned();
+        // A schema cycle must fail closed rather than loop in the scheduler.
+        for _ in 0..=schema.as_ref().map_or(0, |schema| schema.rollups.len()) {
+            // A failed policy write must not make an unpersisted resume executable.
+            if self.dirty_rollup_policies.contains(&table) {
+                return None;
+            }
+            match self.snapshot.rollup_policies.get(&table) {
+                Some(RollupBuildPolicy::Paused) => return None,
+                Some(RollupBuildPolicy::ResumeFrom { start_micros }) if range.start_micros < *start_micros => {
+                    let grain = grain.filter(|grain| *grain > 0)?;
+                    let remainder = start_micros.rem_euclid(grain);
+                    // A finer parent boundary cannot authorize a partial child bucket.
+                    range.start_micros = if remainder == 0 { *start_micros } else { start_micros.checked_add(grain - remainder)? };
+                    if range.start_micros >= range.end_micros {
+                        return None;
+                    }
+                }
+                Some(RollupBuildPolicy::ResumeFrom { .. }) | None => {}
+            }
+            let Some(schema) = &schema else { return Some(range) };
+            let Some(parent) = schema.rollups.iter().find(|spec| spec.table_name(source) == table).and_then(|spec| spec.derive_from.as_deref()) else {
+                return Some(range);
+            };
+            let parent = schema.rollups.iter().find(|spec| spec.name.as_deref() == Some(parent))?;
+            table = parent.table_name(source);
+        }
+        None
+    }
+
     pub fn source_cursor(&self, source: &str) -> Option<u64> {
         self.snapshot.source_cursors.get(source).copied()
     }
@@ -2227,35 +2433,69 @@ impl TaskJournal {
     /// the shared runtime, so the blocking `fsync` must go through
     /// `without_blocking_the_worker`; the mutex stays held across it for durability ordering.
     pub fn checkpoint(&mut self) -> anyhow::Result<()> {
+        let policies_changed = !self.dirty_rollup_policies.is_empty();
         if let Some(parent) = self.wal_path.parent() {
             fs::create_dir_all(parent)?;
         }
-        if !self.dirty_tasks.is_empty() || !self.dirty_cursors.is_empty() || !self.removed_tasks.is_empty() {
-            let Self { wal_path, dirty_tasks, dirty_cursors, removed_tasks, task_indices, snapshot, .. } = self;
-            let (task_indices, snapshot) = (&*task_indices, &*snapshot);
-            let mut wal = OpenOptions::new().create(true).append(true).open(&*wal_path)?;
-            let durable = |key: &TaskKey| !is_derived_operation(key.operation);
-            let records = dirty_tasks
-                .drain()
-                .filter(durable)
-                .filter_map(|key| task_indices.get(&key).map(|&index| JournalRecord::Task(Box::new(snapshot.tasks[index].clone()))))
-                .chain(dirty_cursors.drain().filter_map(|source| {
-                    (snapshot.source_cursors.get(&source).copied()).map(|delta_version| JournalRecord::SourceCursor { source, delta_version })
-                }))
-                // AFTER the upserts, so a key removed and re-created in the same window keeps
-                // the re-creation.
-                .chain(removed_tasks.drain().filter(durable).map(JournalRecord::Removed))
-                .try_fold(Vec::new(), |mut records, record| {
-                    serde_json::to_writer(&mut records, &record)?;
-                    records.push(b'\n');
-                    anyhow::Ok(records)
+        let wal_len =
+            if !self.dirty_tasks.is_empty() || !self.dirty_cursors.is_empty() || !self.removed_tasks.is_empty() || !self.dirty_rollup_policies.is_empty() {
+                let Self { wal_path, incomplete_append, dirty_tasks, dirty_cursors, removed_tasks, dirty_rollup_policies, task_indices, snapshot, .. } = self;
+                let (task_indices, snapshot) = (&*task_indices, &*snapshot);
+                let mut wal = OpenOptions::new().create(true).append(true).open(&*wal_path)?;
+                let durable = |key: &TaskKey| !is_derived_operation(key.operation);
+                let records =
+                    dirty_tasks
+                        .iter()
+                        .filter(|key| durable(key))
+                        .filter_map(|key| task_indices.get(key).map(|&index| JournalRecord::Task(Box::new(snapshot.tasks[index].clone()))))
+                        .chain(dirty_cursors.iter().filter_map(|source| {
+                            (snapshot.source_cursors.get(source).copied())
+                                .map(|delta_version| JournalRecord::SourceCursor { source: source.clone(), delta_version })
+                        }))
+                        // AFTER the upserts, so a key removed and re-created in the same window keeps
+                        // the re-creation.
+                        .chain(removed_tasks.iter().filter(|key| durable(key)).cloned().map(JournalRecord::Removed))
+                        .chain(dirty_rollup_policies.iter().filter_map(|table| {
+                            snapshot.rollup_policies.get(table).map(|&policy| JournalRecord::RollupPolicy { table: table.clone(), policy })
+                        }))
+                        .try_fold(Vec::new(), |mut records, record| {
+                            serde_json::to_writer(&mut records, &record)?;
+                            records.push(b'\n');
+                            anyhow::Ok(records)
+                        })?;
+                let record_bytes = u64::try_from(records.len())?;
+                let len = crate::support::without_blocking_the_worker(|| -> std::io::Result<u64> {
+                    let len = wal.metadata()?.len();
+                    let start = incomplete_append.unwrap_or(len);
+                    if start > len {
+                        return Err(std::io::Error::new(ErrorKind::InvalidData, "maintenance journal shrank after a failed append"));
+                    }
+                    if start < len {
+                        wal.set_len(start)?;
+                        tracing::warn!(
+                            discarded_bytes = len - start,
+                            path = %wal_path.display(),
+                            event = "maintenance_journal_failed_append_repaired"
+                        );
+                    }
+                    *incomplete_append = Some(start);
+                    wal.write_all(&records)?;
+                    *incomplete_append = None;
+                    wal.sync_all()?;
+                    Ok(start.saturating_add(record_bytes))
                 })?;
-            crate::support::without_blocking_the_worker(|| {
-                wal.write_all(&records)?;
-                wal.sync_all()
-            })?;
+                dirty_tasks.clear();
+                dirty_cursors.clear();
+                dirty_rollup_policies.clear();
+                removed_tasks.clear();
+                Some(len)
+            } else {
+                fs::metadata(&self.wal_path).ok().map(|metadata| metadata.len())
+            };
+        if policies_changed {
+            self.rebuild_claimable();
         }
-        if fs::metadata(&self.wal_path).is_ok_and(|metadata| metadata.len() >= JOURNAL_COMPACT_BYTES) {
+        if wal_len.is_some_and(|len| len >= JOURNAL_COMPACT_BYTES) {
             self.compact()?;
         }
         self.publish_statistics_throttled();
@@ -2300,6 +2540,7 @@ impl TaskJournal {
     }
 
     pub fn compact(&mut self) -> anyhow::Result<()> {
+        let policies_changed = !self.dirty_rollup_policies.is_empty();
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -2310,6 +2551,7 @@ impl TaskJournal {
             version: self.snapshot.version,
             tasks: self.snapshot.tasks.iter().filter(|task| !is_derived_operation(task.key.operation)).cloned().collect(),
             source_cursors: self.snapshot.source_cursors.clone(),
+            rollup_policies: self.snapshot.rollup_policies.clone(),
         };
         // Serialize AND write off the worker: the `to_vec` over every live task is as costly
         // as the fsync, and both hold the journal mutex.
@@ -2317,12 +2559,17 @@ impl TaskJournal {
             let bytes = serde_json::to_vec(&durable)?;
             crate::write::wal::write_atomic_with(&self.path, true, |file| file.write_all(&bytes))?;
             let wal = OpenOptions::new().create(true).write(true).truncate(true).open(&self.wal_path)?;
+            self.incomplete_append = None;
             wal.sync_all()?;
             Ok(())
         })?;
         self.dirty_tasks.clear();
         self.removed_tasks.clear();
         self.dirty_cursors.clear();
+        self.dirty_rollup_policies.clear();
+        if policies_changed {
+            self.rebuild_claimable();
+        }
         Ok(())
     }
 
@@ -2341,6 +2588,7 @@ impl TaskJournal {
         let (mut quarantined, mut due_nonquarantined) = (0u64, 0u64);
         let now_micros = crate::support::now_micros();
         for task in &self.snapshot.tasks {
+            let scheduled = task.state == TaskState::Running || self.rollup_build_allowed(&task.key);
             counts[task.state as usize] = counts[task.state as usize].saturating_add(1);
             if task.state.is_active() {
                 backlog_bytes = backlog_bytes.saturating_add(task.estimated_decoded_bytes);
@@ -2348,7 +2596,7 @@ impl TaskJournal {
                 // horizon a task is abandoned and counted separately.
                 if now_micros.saturating_sub(task.key.slice.end_micros) > STARVATION_HORIZON_MICROS {
                     beyond_horizon = beyond_horizon.saturating_add(1);
-                } else {
+                } else if scheduled {
                     oldest_created = oldest_created.min(task.created_unix_ms);
                 }
                 if task.key.operation == Operation::SealedConsolidation {
@@ -2360,7 +2608,7 @@ impl TaskJournal {
                 if matches!(task.state, TaskState::Pending | TaskState::Retry) && Self::is_quarantined(task) {
                     quarantined = quarantined.saturating_add(1);
                 }
-                if matches!(task.state, TaskState::Pending | TaskState::Retry) && task.deadline_micros <= now_micros {
+                if scheduled && matches!(task.state, TaskState::Pending | TaskState::Retry) && task.deadline_micros <= now_micros {
                     if !Self::is_quarantined(task) {
                         due_nonquarantined = due_nonquarantined.saturating_add(1);
                     }
@@ -2372,7 +2620,9 @@ impl TaskJournal {
                     }
                 }
             }
-            track_latest_frontier_rollup(&mut latest_frontier_rollup, task, now_micros);
+            if scheduled {
+                track_latest_frontier_rollup(&mut latest_frontier_rollup, task, now_micros);
+            }
         }
         stats.pending_dedup.store(per_operation[Operation::Dedup as usize], Relaxed);
         stats.pending_base_rollup.store(per_operation[Operation::BaseRollup as usize], Relaxed);
@@ -2925,6 +3175,17 @@ impl Drop for AdmissionPermit {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn publication_evidence_preserves_legacy_json_compatibility() -> anyhow::Result<()> {
+        let legacy = serde_json::json!({"source_fingerprint": 7, "generation": "g", "rows": 0, "source_rows": 1, "source_rows_below": null});
+        let old: super::Publication = serde_json::from_value(legacy.clone())?;
+        assert!(old.evidence.is_none(), "legacy absence must not manufacture a proof");
+        assert_eq!(serde_json::to_value(&old)?, legacy);
+        let new = super::Publication { evidence: Some(super::PublicationEvidence { content_fp: 9, measures: vec!["request_count".into()] }), ..old };
+        assert_eq!(serde_json::from_slice::<super::Publication>(&serde_json::to_vec(&new)?)?, new);
+        Ok(())
+    }
+
     use tap::Tap;
 
     use super::*;
@@ -2963,14 +3224,15 @@ mod tests {
         for key in &derived {
             assert!(journal.is_indexed_claimable(key), "claimable unit missing from the index: {key:?}");
         }
-        // A unit that was NEVER claimable must never have been added.
-        assert!(!journal.is_indexed_claimable(&running), "a unit upserted as Running was never claimable");
+        assert!(journal.is_indexed_claimable(&running), "running work remains indexed for dependency checks");
+        assert!(journal.claim_exact(&running, now, true).is_none(), "index membership cannot permit a second claim");
         // `done` WAS claimable before it completed, so a stale entry is expected and
         // correct: the set is permissive and sheds on rebuild, because holding too
         // much costs a lookup while holding too little strands a unit.
         assert!(journal.is_indexed_claimable(&done), "the permissive set keeps a completed unit until the next rebuild");
         journal.rebuild_claimable();
         assert!(!journal.is_indexed_claimable(&done), "and the rebuild sheds it");
+        assert!(journal.is_indexed_claimable(&running), "a rebuild cannot hide a running dependency");
         for key in &derived {
             assert!(journal.is_indexed_claimable(key), "a rebuild must not drop a claimable unit: {key:?}");
         }
@@ -3191,6 +3453,36 @@ mod tests {
         );
     }
 
+    #[test_case::test_case(DAY_MICROS => Some(TaskState::Superseded) ; "worker OOM splits a large unit")]
+    #[test_case::test_case(MIN_SLICE_MICROS => Some(TaskState::Retry) ; "worker OOM backs off an indivisible unit")]
+    fn repeated_worker_capacity_failure_keeps_its_classification(width: i64) -> Option<TaskState> {
+        use itertools::Itertools;
+
+        let (dir, mut journal) = new_journal();
+        let key = running_unit(&mut journal, task("p", 0, width, Operation::BaseRollup), 6);
+        let now = crate::support::now_micros();
+        journal.abandon_running(&key, now, Some("Resources exhausted: Failed to reserve memory for sort during spill"));
+        journal.checkpoint().expect("persist worker capacity decision");
+        drop(journal);
+        let journal = TaskJournal::load(dir.path()).expect("reload worker capacity decision");
+        if width == MIN_SLICE_MICROS {
+            assert!(requeued_deadline(&journal, &key) >= now + 64_000_000, "six worker OOMs must escalate beyond the transient 30-second delay");
+            assert_eq!(journal.tasks().count(), 1, "an indivisible failure must retain one pending unit, not multiply work");
+        } else {
+            assert_eq!(
+                journal
+                    .tasks()
+                    .filter(|unit| unit.state == TaskState::Pending)
+                    .map(|unit| (unit.key.slice.start_micros, unit.key.slice.end_micros))
+                    .sorted()
+                    .collect::<Vec<_>>(),
+                [(0, width / 2), (width / 2, width)],
+                "recovered children must cover the parent exactly once"
+            );
+        }
+        journal.state(&key)
+    }
+
     /// The planner re-derives file debt every 60s and enqueues the same day-wide
     /// key while a partition stays out of policy. That re-mint must not resurrect
     /// a parent `split_time_task` superseded, or its live children never start.
@@ -3369,6 +3661,146 @@ mod tests {
         (dir, journal)
     }
 
+    #[test_case::test_case(false; "wal replay")]
+    #[test_case::test_case(true; "compacted snapshot")]
+    fn rollup_pause_survives_restart_and_resume_bounds_history(compacted: bool) -> anyhow::Result<()> {
+        let (dir, mut journal) = new_journal();
+        let source = "otel_logs_and_spans";
+        let table = "otel_logs_and_spans_rollup_sessions_1h_v1";
+        let hour = DERIVED_SLICE_MICROS;
+        let unit = |start| {
+            let mut unit = task_in(table, "p", start, start + hour, Operation::BaseRollup);
+            unit.key.source = source.to_owned();
+            unit
+        };
+        let old = upserted(&mut journal, unit(0));
+        assert_eq!(journal.rollup_policy_status(table), RollupPolicyStatus::NoOverride);
+        let flying = upserted(&mut journal, unit(hour));
+        let recent = upserted(&mut journal, unit(2 * hour));
+        assert!(journal.mark_running(&flying));
+        assert!(journal.mark_running(&recent));
+        journal.set_rollup_build_policy(source, table, RollupBuildPolicy::Paused)?;
+        assert!(!journal.mark_running(&old));
+        assert!(journal.claim_exact(&old, i64::MAX, true).is_none());
+        assert!(journal.claim_next(Operation::BaseRollup, i64::MAX, true).is_none());
+        let pending = journal.tasks().count();
+        journal.enqueue_planned(&unit(3 * hour));
+        journal.invalidate(Invalidation {
+            source_table: source,
+            rollup_table: table,
+            source,
+            project_id: "p",
+            start_micros: 3 * hour,
+            end_micros: 4 * hour,
+            observed_at_micros: 0,
+            derived: false,
+            mint_dedup: false,
+            mint_rollup: true,
+        })?;
+        assert_eq!(journal.tasks().count(), pending, "pause must not manufacture a backlog");
+        assert!(journal.complete(&flying), "already-running work can finish safely");
+        journal.checkpoint()?;
+        if compacted {
+            journal.compact()?;
+        }
+        let mut journal = TaskJournal::load(dir.path())?;
+        assert_eq!(journal.snapshot.version, ROLLUP_POLICY_VERSION, "older readers must reject a compacted policy");
+        assert_eq!(journal.requeue_running(0), 1);
+        assert!(!journal.is_indexed_claimable(&recent));
+        assert!(journal.claim_next(Operation::BaseRollup, i64::MAX, true).is_none());
+        journal.set_rollup_build_policy(source, table, RollupBuildPolicy::ResumeFrom { start_micros: 2 * hour })?;
+        assert!(journal.claim_exact(&old, i64::MAX, true).is_none(), "resume does not authorize earlier history");
+        assert!(journal.claim_exact(&recent, i64::MAX, true).is_some(), "explicitly resumed work is eligible");
+        journal.checkpoint()?;
+        let journal = TaskJournal::load(dir.path())?;
+        assert!(!journal.rollup_build_allowed(&old));
+        assert!(journal.rollup_build_allowed(&recent));
+        Ok(())
+    }
+
+    #[test_case::test_case(false, (0, 120) => Some((30, 120)); "base clips at its resume minute")]
+    #[test_case::test_case(true, (0, 120) => Some((60, 120)); "child starts at the next complete hour")]
+    #[test_case::test_case(true, (0, 60) => None; "partial child bucket is not admitted")]
+    #[test_case::test_case(false, (0, 30) => None; "history before resume stays excluded")]
+    #[test_case::test_case(true, (60, 120) => Some((60, 120)); "allowed child range stays unchanged")]
+    fn rollup_resume_clips_planning_without_widening_claims(derived: bool, minutes: (i64, i64)) -> Option<(i64, i64)> {
+        let (_dir, mut journal) = new_journal();
+        let source = "otel_logs_and_spans";
+        let parent = "otel_logs_and_spans_rollup_dashboard_1m_v3";
+        let target = if derived { "otel_logs_and_spans_rollup_dashboard_1h_v2" } else { parent };
+        let minute = 60_000_000;
+        journal.set_rollup_build_policy(source, parent, RollupBuildPolicy::ResumeFrom { start_micros: 30 * minute }).expect("persist resume");
+        let range = TimeSlice::new(minutes.0 * minute, minutes.1 * minute).expect("nonempty planning window");
+        let admitted = journal.rollup_build_window(source, target, range);
+        let key = TaskKey {
+            source: source.to_owned(),
+            physical_table: target.to_owned(),
+            project_id: "p".to_owned(),
+            slice: range,
+            operation: if derived { Operation::DerivedRollup } else { Operation::BaseRollup },
+        };
+        assert_eq!(journal.rollup_build_allowed(&key), admitted == Some(range), "claims cannot silently narrow their input");
+        admitted.map(|range| (range.start_micros / minute, range.end_micros / minute))
+    }
+
+    #[cfg(unix)]
+    #[test_case::test_case(false, false; "open failure then checkpoint")]
+    #[test_case::test_case(true, false; "fsync failure then checkpoint")]
+    #[test_case::test_case(false, true; "open failure then compaction")]
+    #[test_case::test_case(true, true; "fsync failure then compaction")]
+    fn failed_rollup_resume_stays_unclaimable_until_persistence_succeeds(fails_fsync: bool, compacted: bool) -> anyhow::Result<()> {
+        let (dir, mut journal) = new_journal();
+        let source = "otel_logs_and_spans";
+        let table = "otel_logs_and_spans_rollup_sessions_1h_v1";
+        let mut unit = task_in(table, "p", 0, DERIVED_SLICE_MICROS, Operation::BaseRollup);
+        unit.key.source = source.to_owned();
+        let key = upserted(&mut journal, unit);
+        journal.set_rollup_build_policy(source, table, RollupBuildPolicy::Paused)?;
+        let wal_path = journal.wal_path.clone();
+        let fault = dir.path().join("rejects-policy-write");
+        if fails_fsync {
+            std::os::unix::fs::symlink("/dev/null", &fault)?;
+        } else {
+            fs::create_dir(&fault)?;
+        }
+        journal.wal_path = fault;
+        let failure = journal.set_rollup_build_policy(source, table, RollupBuildPolicy::ResumeFrom { start_micros: 0 });
+        journal.wal_path = wal_path;
+        assert!(failure.unwrap_err().downcast_ref::<std::io::Error>().is_some(), "exercise a real persistence failure");
+        assert_eq!(journal.rollup_policy_status(table), RollupPolicyStatus::Pending(RollupBuildPolicy::ResumeFrom { start_micros: 0 }));
+        assert!(!journal.mark_running(&key), "an unacknowledged resume cannot authorize work");
+        assert!(journal.claim_exact(&key, i64::MAX, true).is_none());
+        assert!(journal.claim_next(Operation::BaseRollup, i64::MAX, true).is_none());
+        assert!(!TaskJournal::load(dir.path())?.rollup_build_allowed(&key), "the durable pause remains intact");
+        if compacted {
+            journal.compact()?;
+        } else {
+            journal.checkpoint()?;
+        }
+        assert!(journal.claim_next(Operation::BaseRollup, i64::MAX, true).is_some(), "a successful retry must restore claimability");
+        assert_eq!(journal.rollup_policy_status(table), RollupPolicyStatus::Durable(RollupBuildPolicy::ResumeFrom { start_micros: 0 }));
+        assert!(TaskJournal::load(dir.path())?.rollup_build_allowed(&key));
+        Ok(())
+    }
+
+    #[test]
+    fn rollup_policy_validates_identity_and_applies_to_derived_dependencies() -> anyhow::Result<()> {
+        let (_dir, mut journal) = new_journal();
+        let source = "otel_logs_and_spans";
+        let parent = "otel_logs_and_spans_rollup_dashboard_1m_v3";
+        assert!(journal.set_rollup_build_policy(source, "missing", RollupBuildPolicy::Paused).is_err());
+        assert!(journal.set_rollup_build_policy(source, parent, RollupBuildPolicy::ResumeFrom { start_micros: 1 }).is_err());
+        assert!(journal.snapshot.rollup_policies.is_empty());
+        journal.set_rollup_build_policy(source, parent, RollupBuildPolicy::Paused)?;
+        let mut derived = task_in("otel_logs_and_spans_rollup_dashboard_1h_v2", "p", 0, DERIVED_SLICE_MICROS, Operation::DerivedRollup);
+        derived.key.source = source.to_owned();
+        assert!(!journal.rollup_build_allowed(&derived.key));
+        derived.key.operation = Operation::Dedup;
+        derived.key.physical_table = source.to_owned();
+        assert!(journal.rollup_build_allowed(&derived.key), "pausing a rollup must not stop source maintenance");
+        Ok(())
+    }
+
     /// Upserts a unit and hands back its key — the clone-then-upsert every
     /// fixture below repeats. Field overrides ride in on `tap_mut`.
     fn upserted(journal: &mut TaskJournal, unit: MaintenanceTask) -> TaskKey {
@@ -3407,6 +3839,35 @@ mod tests {
         }
     }
 
+    #[test_case::test_case(false; "paused pending debt")]
+    #[test_case::test_case(true; "paused in-flight work still drains")]
+    fn paused_rollup_debt_is_visible_without_consuming_scheduler_priority(running: bool) -> anyhow::Result<()> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let (_dir, mut journal) = new_journal();
+        let source = "otel_logs_and_spans";
+        let table = "otel_logs_and_spans_rollup_sessions_1h_v1";
+        let now = crate::support::now_micros();
+        let mut unit = task_in(table, "p", now - DERIVED_SLICE_MICROS, now, Operation::BaseRollup);
+        unit.key.source = source.to_owned();
+        unit.deadline_micros = now - 600_000_000;
+        unit.estimated_decoded_bytes = 64;
+        let key = upserted(&mut journal, unit);
+        if running {
+            assert!(journal.mark_running(&key));
+        }
+        journal.set_rollup_build_policy(source, table, RollupBuildPolicy::Paused)?;
+        journal.publish_statistics();
+        let stats = crate::observability::maintenance_stats();
+        assert_eq!(stats.pending_base_rollup.load(Relaxed), 1, "paused debt remains visible");
+        assert_eq!(stats.maintenance_backlog_bytes.load(Relaxed), 64, "pausing does not erase stored debt");
+        assert_eq!(stats.eligible_base_rollup.load(Relaxed), 0);
+        assert_eq!(stats.maintenance_tasks_due_nonquarantined.load(Relaxed), 0);
+        assert_eq!(stats.maintenance_oldest_task_age_secs.load(Relaxed) > 0, running);
+        assert_eq!(stats.maintenance_eligible_watermark_lag_secs.load(Relaxed) > 0, running);
+        assert_eq!(journal.frontier_lag_secs.load(Relaxed) > 0, running, "only in-flight paused work can affect sealed-work allocation");
+        Ok(())
+    }
+
     /// The operation's own deadline, in micros — the floor a burned unit waits.
     fn floor_micros(operation: Operation) -> i64 {
         i64::try_from(operation_deadline_secs(operation) * 1_000_000).expect("fits")
@@ -3426,6 +3887,90 @@ mod tests {
 
     /// (project, slice start, slice end, deadline, completed) — offsets from `ORDER_NOW`.
     type Stream = (&'static str, i64, i64, i64, bool);
+
+    #[cfg(unix)]
+    #[test]
+    fn a_partial_checkpoint_append_can_retry_without_restart() -> anyhow::Result<()> {
+        const CHILD: &str = "TIMEFUSION_CHECKPOINT_FILE_LIMIT_TEST";
+        const TEST: &str = "maintenance_coordinator::tests::a_partial_checkpoint_append_can_retry_without_restart";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe()?).args(["--exact", TEST, "--nocapture"]).env(CHILD, "1").output()?;
+            assert!(
+                output.status.success() && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                "isolated file-limit test failed: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return Ok(());
+        }
+
+        let (dir, mut journal) = new_journal();
+        let existing = upserted(&mut journal, task("existing", 0, 1, Operation::BaseRollup));
+        journal.checkpoint()?;
+        let durable = fs::read(&journal.wal_path)?;
+        let pending = upserted(&mut journal, task("pending", 1, 2, Operation::BaseRollup));
+        journal.set_source_cursor("source".to_owned(), 42);
+        let mut original = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        // SAFETY: the child owns this initialized output, and getrlimit does not retain its pointer.
+        anyhow::ensure!(unsafe { libc::getrlimit(libc::RLIMIT_FSIZE, &mut original) } == 0, "getrlimit: {}", std::io::Error::last_os_error());
+        // SAFETY: SIG_IGN is a valid handler. This dedicated child runs only this test.
+        let previous_signal = unsafe { libc::signal(libc::SIGXFSZ, libc::SIG_IGN) };
+        anyhow::ensure!(previous_signal != libc::SIG_ERR, "signal: {}", std::io::Error::last_os_error());
+        let signal_guard = scopeguard::guard(previous_signal, |handler| {
+            // SAFETY: restore the handler returned by signal for this same signal number.
+            assert_ne!(unsafe { libc::signal(libc::SIGXFSZ, handler) }, libc::SIG_ERR);
+        });
+        let limit_guard = scopeguard::guard(original, |limit| {
+            // SAFETY: this is the original limit; the hard limit never changed, and the pointer remains valid for the call.
+            assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_FSIZE, &limit) }, 0);
+        });
+        let cap = u64::try_from(durable.len())? + 17;
+        let limited = libc::rlimit { rlim_cur: cap, rlim_max: original.rlim_max };
+        // SAFETY: limited is initialized and remains live for the call; only this child's soft limit changes.
+        anyhow::ensure!(unsafe { libc::setrlimit(libc::RLIMIT_FSIZE, &limited) } == 0, "setrlimit: {}", std::io::Error::last_os_error());
+        let failed = journal.checkpoint();
+        drop(limit_guard);
+        drop(signal_guard);
+        assert_eq!(failed.unwrap_err().downcast_ref::<std::io::Error>().and_then(std::io::Error::raw_os_error), Some(libc::EFBIG));
+        let partial = fs::read(&journal.wal_path)?;
+        assert!(
+            partial.starts_with(&durable) && partial.len() > durable.len() && !partial.ends_with(b"\n"),
+            "the fault must leave an unterminated append after the durable prefix"
+        );
+
+        journal.checkpoint()?;
+        assert!(fs::read(&journal.wal_path)?.starts_with(&durable), "retry must preserve the acknowledged prefix");
+        let recovered = TaskJournal::load(dir.path())?;
+        assert_eq!((recovered.state(&existing), recovered.state(&pending)), (Some(TaskState::Pending), Some(TaskState::Pending)));
+        assert_eq!(recovered.source_cursor("source"), Some(42));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_fsync_retains_records_for_the_next_checkpoint() -> anyhow::Result<()> {
+        let (dir, mut journal) = new_journal();
+        let retired = upserted(&mut journal, task("retired", 0, 1, Operation::BaseRollup));
+        journal.checkpoint()?;
+        let wal_path = journal.wal_path.clone();
+        let rejects_fsync = dir.path().join("rejects-fsync");
+        std::os::unix::fs::symlink("/dev/null", &rejects_fsync)?;
+        journal.wal_path = rejects_fsync;
+        let pending = upserted(&mut journal, task("pending", 1, 2, Operation::BaseRollup));
+        journal.set_source_cursor("source".to_owned(), 42);
+        assert_eq!(journal.retain_tasks(|task| task.key != retired), 1);
+        assert!(journal.checkpoint().is_err(), "the device accepts writes but cannot fsync a durable journal");
+
+        journal.wal_path = wal_path;
+        journal.checkpoint()?;
+        let recovered = TaskJournal::load(dir.path())?;
+        assert_eq!(
+            (recovered.state(&pending), recovered.source_cursor("source"), recovered.state(&retired)),
+            (Some(TaskState::Pending), Some(42), None),
+            "a successful retry must preserve task upserts, source cursors, and removals"
+        );
+        Ok(())
+    }
 
     /// `checkpoint` must not rescan the whole journal every time it is called:
     /// `publish_statistics` is O(tasks) and runs under the global journal mutex.
@@ -3852,7 +4397,10 @@ mod tests {
         let publish = |journal: &mut TaskJournal, project: &str, table: &str, hour: i64, rows: u64| {
             let key = key(project, table, hour);
             journal.enqueue(key.clone(), 0, 1, 1);
-            journal.publish(&key, Publication { source_fingerprint: 0, generation: "g".into(), rows, source_rows: Some(1_000_000), source_rows_below: None });
+            journal.publish(
+                &key,
+                Publication { source_fingerprint: 0, generation: "g".into(), rows, source_rows: Some(1_000_000), source_rows_below: None, evidence: None },
+            );
         };
         publish(&mut journal, "p", "base", 1, 10);
         publish(&mut journal, "p", "base", 2, 0); // an hour the base itself left empty
@@ -3984,7 +4532,8 @@ mod tests {
         let (_dir, mut journal) = new_journal();
         const HOUR: i64 = DERIVED_SLICE_MICROS;
         let derived = |start: i64, end: i64| task_in("derived", "p", start, end, Operation::DerivedRollup).key;
-        let publication = || Publication { source_fingerprint: 7, generation: "g".into(), rows: 5, source_rows: Some(9), source_rows_below: None };
+        let publication =
+            || Publication { source_fingerprint: 7, generation: "g".into(), rows: 5, source_rows: Some(9), source_rows_below: None, evidence: None };
         for (start, end) in [(0, HOUR), (HOUR, 2 * HOUR), (5 * HOUR, 6 * HOUR)] {
             let key = derived(start, end);
             journal.enqueue(key.clone(), 0, 1, 1);
@@ -4023,6 +4572,62 @@ mod tests {
         assert_eq!(loaded.source_cursor("source"), Some(9));
     }
 
+    #[test_case::test_case(false; "WAL only")]
+    #[test_case::test_case(true; "snapshot plus WAL")]
+    fn torn_journal_tail_cannot_corrupt_the_next_checkpoint(compacted: bool) -> anyhow::Result<()> {
+        let interrupted = serde_json::to_vec(&JournalRecord::SourceCursor { source: "interrupted-β".to_owned(), delta_version: 99 })?;
+        // Every byte boundary includes a split UTF-8 character and complete JSON
+        // without its terminating newline. Neither is a committed record.
+        for cut in 0..=interrupted.len() {
+            let (dir, mut journal) = new_journal();
+            let existing = upserted(&mut journal, task("existing", 0, 1, Operation::BaseRollup));
+            journal.set_source_cursor("source".to_owned(), 7);
+            journal.checkpoint()?;
+            if compacted {
+                journal.compact()?;
+            }
+            let mut wal = OpenOptions::new().create(true).append(true).open(&journal.wal_path)?;
+            wal.write_all(&interrupted[..cut])?;
+            wal.sync_all()?;
+            drop(wal);
+            drop(journal);
+
+            let mut recovered = TaskJournal::load(dir.path())?;
+            assert_eq!(recovered.state(&existing), Some(TaskState::Pending), "durable prefix at cut {cut}");
+            assert_eq!(recovered.source_cursor("source"), Some(7));
+            assert_eq!(recovered.source_cursor("interrupted-β"), None, "uncommitted tail at cut {cut}");
+            let next = upserted(&mut recovered, task("next", 1, 2, Operation::BaseRollup));
+            recovered.set_source_cursor("source".to_owned(), 8);
+            recovered.checkpoint()?;
+            let again = TaskJournal::load(dir.path())?;
+            assert_eq!((again.state(&existing), again.state(&next)), (Some(TaskState::Pending), Some(TaskState::Pending)));
+            assert_eq!((again.source_cursor("source"), again.source_cursor("interrupted-β")), (Some(8), None));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn complete_corrupt_journal_records_are_not_discarded_as_a_torn_tail() -> anyhow::Result<()> {
+        let (dir, mut journal) = new_journal();
+        journal.upsert(task("existing", 0, 1, Operation::BaseRollup));
+        journal.checkpoint()?;
+        let mut wal = OpenOptions::new().append(true).open(&journal.wal_path)?;
+        wal.write_all(b"{broken}\n{")?;
+        wal.sync_all()?;
+        let damaged = fs::read(&journal.wal_path)?;
+        assert!(TaskJournal::load(dir.path()).is_err(), "a complete corrupt record must stop recovery");
+        assert_eq!(fs::read(&journal.wal_path)?, damaged, "failed validation must leave the evidence intact");
+        Ok(())
+    }
+
+    #[test]
+    fn an_unreadable_journal_is_not_an_absent_journal() -> anyhow::Result<()> {
+        let (dir, journal) = new_journal();
+        fs::create_dir_all(&journal.wal_path)?;
+        assert!(TaskJournal::load(dir.path()).is_err(), "a WAL read error must not produce an empty recovered journal");
+        Ok(())
+    }
+
     #[test]
     fn production_sized_wal_replay_updates_tasks_without_quadratic_scans() {
         const TASKS: i64 = 20_000;
@@ -4047,9 +4652,10 @@ mod tests {
     fn empty_rollup_publication_survives_restart() {
         let (dir, mut journal) = new_journal();
         let key = upserted(&mut journal, task("p", 0, MIN_SLICE_MICROS, Operation::BaseRollup));
-        assert!(
-            journal.publish(&key, Publication { source_fingerprint: 7, generation: "stable".to_owned(), rows: 0, source_rows: None, source_rows_below: None })
-        );
+        assert!(journal.publish(
+            &key,
+            Publication { source_fingerprint: 7, generation: "stable".to_owned(), rows: 0, source_rows: None, source_rows_below: None, evidence: None }
+        ));
         journal.checkpoint().expect("checkpoint");
 
         let loaded = TaskJournal::load(dir.path()).expect("load checkpoint");
@@ -4115,9 +4721,10 @@ mod tests {
 
         // Coverage checkpoint is the only boundary that makes the slice
         // readable after restart, including an empty output.
-        assert!(
-            recovered.publish(&key, Publication { source_fingerprint: 9, generation: "g".to_owned(), rows: 0, source_rows: None, source_rows_below: None })
-        );
+        assert!(recovered.publish(
+            &key,
+            Publication { source_fingerprint: 9, generation: "g".to_owned(), rows: 0, source_rows: None, source_rows_below: None, evidence: None }
+        ));
         recovered.checkpoint().expect("coverage checkpoint");
         let recovered = TaskJournal::load(dir.path()).expect("recover publication");
         let published = recovered.published_rollups("source", "table");
@@ -4231,13 +4838,11 @@ mod tests {
 
     /// A derived unit whose base TIER already exists must be claimable, even when
     /// no `BaseRollup` journal task records that it was built — through BOTH paths
-    /// that carry the proof. `prove_base_tier_for_day` is the one that reaches a
-    /// unit `enqueue` can no longer touch: a blocked derived unit stays queued,
-    /// which makes its day ineligible for backfill admission.
+    /// that carry the proof. Runtime range evidence also reaches already queued work.
     #[test_case::test_case(true ; "the backfill planner re-enqueues with the proof")]
     #[test_case::test_case(false ; "an already-queued unit is told its base tier exists")]
     fn a_derived_unit_runs_once_its_base_tier_is_proven(via_enqueue: bool) {
-        let (_dir, mut journal) = new_journal();
+        let (dir, mut journal) = new_journal();
         let key = derived_key("historical", 0, 3_600_000_000);
 
         // No completed base task covers this slice, so the unit is refused.
@@ -4248,11 +4853,23 @@ mod tests {
             // The backfill planner reads real tier coverage; that proof must be enough.
             journal.enqueue_with_base_tier(key.clone(), 0, 1, 0, true);
         } else {
-            let day = (0, 24 * 3_600_000_000i64);
-            assert_eq!(journal.prove_base_tier_for_day(&key, day.0, day.1), 1, "the proof lands on an existing task");
-            assert_eq!(journal.prove_base_tier_for_day(&key, day.0, day.1), 0, "and is idempotent");
+            journal
+                .set_base_tier_ready(HashMap::from([(("source".into(), "historical".into(), "rollup_1h".into(), "1970-01-01".into()), vec![(0, DAY_MICROS)])]));
         }
+        journal
+            .invalidate(Invalidation { project_id: "historical", mint_rollup: false, ..invalidation("rollup_1h", 0, 3_600_000_000, 0, true) })
+            .expect("physical-only change preserves the proof");
         assert_eq!(journal.claim_next(Operation::DerivedRollup, 0, true).expect("proven base tier makes the unit claimable").key.project_id, "historical");
+        let unaffected = derived_key("historical", 3_600_000_000, 3_600_000_000);
+        journal.enqueue_with_base_tier(unaffected.clone(), 0, 1, 0, true);
+        journal
+            .invalidate(Invalidation { project_id: "historical", ..invalidation("rollup_1h", 0, 3_600_000_000, 0, true) })
+            .expect("invalidate the proven range");
+        assert!(journal.claim_exact(&key, DAY_MICROS, true).is_none(), "source invalidation must retire the task's old base proof");
+        assert!(journal.claim_exact(&unaffected, DAY_MICROS, true).is_some(), "another hour keeps its proof");
+        journal.checkpoint().expect("persist retired proof");
+        let mut recovered = TaskJournal::load(dir.path()).expect("recover retired proof");
+        assert!(recovered.claim_exact(&key, DAY_MICROS, true).is_none(), "restart cannot restore the retired proof");
     }
 
     /// The hygiene benefit band must separate cells at the sizes that exist, while
@@ -4291,8 +4908,9 @@ mod tests {
 
     /// The claimability census must name each reason `claim_next` skips a task —
     /// the skips happen inside filter predicates that otherwise leave no trace.
-    #[test]
-    fn the_claimability_census_separates_the_reasons_a_task_is_skipped() {
+    #[test_case::test_case(false ; "per-task proof")]
+    #[test_case::test_case(true ; "runtime range proof")]
+    fn the_claimability_census_separates_the_reasons_a_task_is_skipped(runtime_proof: bool) {
         let (_dir, mut journal) = new_journal();
         const HOUR: i64 = 3_600_000_000;
         let now = 40 * 24 * HOUR;
@@ -4302,12 +4920,18 @@ mod tests {
         journal.enqueue(at("blocked", now - 10 * 24 * HOUR), 0, 1, 0);
         // Sealed, proven, but not due yet.
         let later = at("not_due", now - 10 * 24 * HOUR);
-        journal.enqueue(later.clone(), now + HOUR, 1, 0);
-        journal.prove_base_tier_for_day(&later, now - 10 * 24 * HOUR, now - 9 * 24 * HOUR);
+        journal.enqueue_with_base_tier(later.clone(), now + HOUR, 1, 0, !runtime_proof);
         // Sealed, proven, due, but has burned its attempts.
         let doomed = at("doomed", now - 11 * 24 * HOUR);
-        journal.enqueue(doomed.clone(), 0, 1, 0);
-        journal.prove_base_tier_for_day(&doomed, now - 11 * 24 * HOUR, now - 10 * 24 * HOUR);
+        journal.enqueue_with_base_tier(doomed.clone(), 0, 1, 0, !runtime_proof);
+        if runtime_proof {
+            journal.set_base_tier_ready(
+                [&later, &doomed]
+                    .into_iter()
+                    .map(|key| (TaskJournal::cell_of(journal.task(key).unwrap()).unwrap(), vec![(key.slice.start_micros, key.slice.end_micros)]))
+                    .collect(),
+            );
+        }
         for _ in 0..TaskJournal::QUARANTINE_ATTEMPTS {
             assert!(journal.mark_running(&doomed));
             journal.retry(&doomed, TaskJournal::WORKER_FAILURE_REASON.to_owned(), 0);
@@ -4316,7 +4940,7 @@ mod tests {
         let (pending, sealed, unproven, quarantined, not_due) = journal.claimability_census(Operation::DerivedRollup, now);
         assert_eq!(pending, 3, "every pending derived task is counted");
         assert_eq!(sealed, 3, "all three are older than the live frontier window");
-        assert_eq!(unproven, 1, "only the one without a base-tier proof is dependency-blocked");
+        assert_eq!(unproven, 1, "only the one without cached base-tier proof counts as unproven");
         assert_eq!(quarantined, 1, "only the one that burned its attempts is quarantined");
         assert_eq!(not_due, 1, "only the one with a future deadline is not yet due");
     }
@@ -4563,9 +5187,9 @@ mod tests {
         let seed = |journal: &mut TaskJournal| {
             journal.upsert(at("recent", 35));
             journal.upsert(at("oldhole", 20));
-            journal.set_base_tier_ready(HashSet::from([
-                ("source".to_owned(), "recent".to_owned(), "1970-02-05".to_owned()),
-                ("source".to_owned(), "oldhole".to_owned(), "1970-01-21".to_owned()),
+            journal.set_base_tier_ready(HashMap::from([
+                (("source".into(), "recent".into(), "rollup_1h".into(), "1970-02-05".into()), vec![(35 * DAY_MICROS, 36 * DAY_MICROS)]),
+                (("source".into(), "oldhole".into(), "rollup_1h".into(), "1970-01-21".into()), vec![(20 * DAY_MICROS, 21 * DAY_MICROS)]),
             ]));
         };
 
@@ -4740,14 +5364,24 @@ mod tests {
         journal.enqueue(at(5 * HOUR, HOUR), 0, 1, 0);
         assert!(journal.claim_next(Operation::DerivedRollup, 0, true).is_none(), "precondition: dependency-blocked");
 
-        journal.set_base_tier_ready(HashSet::from([("source".to_owned(), "p".to_owned(), "1970-01-01".to_owned())]));
+        journal.set_base_tier_ready(HashMap::from([(("source".into(), "p".into(), "rollup_1h".into(), "1970-01-01".into()), vec![(0, DAY_MICROS)])]));
         assert_eq!(journal.base_tier_ready_len(), 1);
         assert!(journal.claim_next(Operation::DerivedRollup, 0, true).is_some(), "an hour-wide task is unblocked by a DAY-keyed fact");
 
+        let key = at(5 * HOUR, HOUR);
+        journal.invalidate(invalidation("rollup_1h", 5 * HOUR, 6 * HOUR, 0, true)).expect("invalidate one proven hour");
+        assert!(journal.claim_exact(&key, DAY_MICROS, true).is_none(), "a day-level readiness hint cannot certify a newly invalidated hour");
+        journal.enqueue(at(6 * HOUR, HOUR), 0, 1, 0);
+        assert!(journal.claim_exact(&at(6 * HOUR, HOUR), DAY_MICROS, true).is_some(), "the adjacent clean hour keeps its proof");
+        journal.enqueue(at(4 * HOUR, 3 * HOUR), 0, 1, 0);
+        assert!(journal.claim_exact(&at(4 * HOUR, 3 * HOUR), DAY_MICROS, true).is_none(), "a wider unit cannot bridge the dirty hour");
+        let other_tier = TaskKey { physical_table: "another_derived_tier".into(), ..at(6 * HOUR, HOUR) };
+        journal.enqueue(other_tier.clone(), 0, 1, 0);
+        assert!(journal.claim_exact(&other_tier, DAY_MICROS, true).is_none(), "another tier cannot borrow this proof");
+
         // Wholesale replacement: coverage can go backwards, and a stale "ready"
         // would derive from a tier that is no longer there.
-        journal.set_base_tier_ready(HashSet::new());
-        let key = at(5 * HOUR, HOUR);
+        journal.set_base_tier_ready(HashMap::new());
         journal.retry(&key, "requeue".to_owned(), 0);
         assert!(journal.claim_next(Operation::DerivedRollup, 0, true).is_none(), "clearing the set re-blocks the work");
     }
@@ -4769,11 +5403,11 @@ mod tests {
         journal.enqueue(at(HOUR, HOUR), 0, 1, 0);
         assert!(journal.claim_next(Operation::DerivedRollup, 0, true).is_none(), "precondition: the hour units are dependency-blocked");
 
-        assert_eq!(journal.prove_base_tier_for_day(&day_unit, 0, DAY_MICROS), 2, "both pending hour units are proven");
+        journal.set_base_tier_ready(HashMap::from([(("source".into(), "p".into(), "rollup_1h".into(), "1970-01-01".into()), vec![(0, DAY_MICROS)])]));
         assert!(journal.claim_next(Operation::DerivedRollup, 0, true).is_some(), "an hour unit becomes claimable");
 
         journal.enqueue(at(DAY_MICROS, HOUR), 0, 1, 0);
-        assert_eq!(journal.prove_base_tier_for_day(&day_unit, 0, DAY_MICROS), 0, "the following day is a different fact and stays unproven");
+        assert!(journal.claim_exact(&at(DAY_MICROS, HOUR), 0, true).is_none(), "the following day is a different fact and stays unproven");
     }
 
     /// The proof latches. The frontier re-enqueues the same key without it, and
@@ -5582,6 +6216,7 @@ mod tests {
     /// pool is not an oversized unit: splitting on a transient refusal multiplies
     /// the queue into shards that are each refused in turn.
     #[test_case::test_case("resource_admission" => true ; "a static over-budget estimate still splits")]
+    #[test_case::test_case("resource_exhausted" => true ; "the worker canonical reason retains capacity semantics")]
     #[test_case::test_case("admission_busy" => false ; "a transient busy pool must back off, not multiply the queue")]
     #[test_case::test_case(
         "dedup: Not enough memory to continue external sort. Consider increasing the memory limit config: \
@@ -5727,19 +6362,51 @@ mod tests {
         assert_eq!(tasks[0].estimated_decoded_bytes, 30);
     }
 
-    #[test]
-    fn derived_rollup_claim_waits_for_complete_base_hour() {
+    #[test_case::test_case(false; "completed wide proof cannot override a pending repair")]
+    #[test_case::test_case(true; "late census proof cannot override a pending repair")]
+    fn derived_rollup_claim_waits_for_complete_base_hour(cached_ranges: bool) {
         let (_dir, mut journal) = new_journal();
+        let unit = |table, start, end, operation| task_in(table, "p", start, end, operation).tap_mut(|task| task.key.source = "otel_logs_and_spans".into());
         let base_keys: Vec<_> = (0..DERIVED_SLICE_MICROS)
             .step_by(NORMAL_SLICE_MICROS as usize)
-            .map(|start| upserted(&mut journal, task("p", start, start + NORMAL_SLICE_MICROS, Operation::BaseRollup)))
+            .map(|start| upserted(&mut journal, unit("otel_logs_and_spans_rollup_dashboard_1m_v3", start, start + NORMAL_SLICE_MICROS, Operation::BaseRollup)))
             .collect();
-        journal.upsert(task("p", 0, DERIVED_SLICE_MICROS, Operation::DerivedRollup));
+        journal.upsert(unit("otel_logs_and_spans_rollup_dashboard_1h_v2", 0, DERIVED_SLICE_MICROS, Operation::DerivedRollup));
         assert!(journal.claim_next(Operation::DerivedRollup, 0, true).is_none());
-        for key in base_keys {
-            journal.complete(&key);
+        let unrelated = upserted(&mut journal, unit("otel_logs_and_spans_rollup_sessions_1h_v1", 0, DERIVED_SLICE_MICROS, Operation::BaseRollup));
+        journal.complete(&unrelated);
+        assert!(
+            journal.claim_next(Operation::DerivedRollup, 0, true).is_none(),
+            "completed session output cannot satisfy the dashboard's minute-tier dependency"
+        );
+        for key in &base_keys {
+            journal.complete(key);
         }
         assert!(journal.claim_next(Operation::DerivedRollup, 0, true).is_some());
+
+        let wide = upserted(&mut journal, unit("otel_logs_and_spans_rollup_dashboard_1m_v3", 0, DERIVED_SLICE_MICROS, Operation::BaseRollup));
+        journal.complete(&wide);
+        for (table, derived) in [("otel_logs_and_spans_rollup_dashboard_1m_v3", false), ("otel_logs_and_spans_rollup_dashboard_1h_v2", true)] {
+            journal
+                .invalidate(Invalidation {
+                    source_table: "otel_logs_and_spans",
+                    source: "otel_logs_and_spans",
+                    ..invalidation(table, 0, NORMAL_SLICE_MICROS, 0, derived)
+                })
+                .expect("reconcile one changed base interval");
+        }
+        if cached_ranges {
+            journal.set_base_tier_ready(HashMap::from([(
+                ("otel_logs_and_spans".into(), "p".into(), "otel_logs_and_spans_rollup_dashboard_1h_v2".into(), "1970-01-01".into()),
+                vec![(0, DERIVED_SLICE_MICROS)],
+            )]));
+        }
+        assert!(journal.claim_next(Operation::DerivedRollup, DAY_MICROS, true).is_none(), "stale evidence cannot override a pending base repair");
+        assert!(journal.mark_running(&base_keys[0]));
+        journal.rebuild_claimable();
+        assert!(journal.claim_next(Operation::DerivedRollup, DAY_MICROS, true).is_none(), "running the repair does not make its output current");
+        journal.complete(&base_keys[0]);
+        assert!(journal.claim_next(Operation::DerivedRollup, DAY_MICROS, true).is_some(), "completed repair restores eligibility");
     }
 
     #[test]
@@ -5764,8 +6431,9 @@ mod tests {
     #[test]
     fn completed_children_satisfy_a_larger_derived_dependency() {
         let (_dir, mut journal) = new_journal();
-        let base_key = upserted(&mut journal, task("p", 0, NORMAL_SLICE_MICROS, Operation::BaseRollup));
-        journal.upsert(task("p", 0, NORMAL_SLICE_MICROS, Operation::DerivedRollup));
+        let unit = |table, operation| task_in(table, "p", 0, NORMAL_SLICE_MICROS, operation).tap_mut(|task| task.key.source = "otel_logs_and_spans".into());
+        let base_key = upserted(&mut journal, unit("otel_logs_and_spans_rollup_dashboard_1m_v3", Operation::BaseRollup));
+        journal.upsert(unit("otel_logs_and_spans_rollup_dashboard_1h_v2", Operation::DerivedRollup));
         assert!(journal.split_time_task(&base_key, 2 * MAX_DECODED_BYTES, None));
         let children = journal
             .tasks()
