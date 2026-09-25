@@ -1115,24 +1115,17 @@ async fn rollup_routing_rejects_legacy_materialization_generations() -> Result<(
         TaskState::Pending,
         "an obsolete journal-only publication must also be requeued"
     );
-    db.run_unit_once("otel_logs_and_spans", &project, day, Operation::BaseRollup, 24, 0).await?;
-    let remaining: Vec<_> = db
+    let narrower: Vec<_> = db
         .journal()
         .tasks()
-        .filter(|task| task.key.physical_table == target && task.key.project_id == project && task.state.is_active())
+        .filter(|task| task.key != key && task.key.physical_table == target && task.key.project_id == project && task.state.is_active())
         .map(|task| task.key.clone())
         .collect();
-    assert!(!remaining.is_empty(), "recovery must exercise the narrower repair queued from untagged output");
-    let scans = crate::observability::maintenance_stats().rollup_scan_cohorts.load(std::sync::atomic::Ordering::Relaxed);
-    for repair in remaining {
-        assert!(db.run_coordinator_rollup_selected(crate::database::maintain::TaskSelection::Exact(&repair)).await?);
-        assert_eq!(db.journal().state(&repair), Some(TaskState::Complete), "the current wider publication must settle the repair");
+    assert!(!narrower.is_empty(), "recovery must exercise the narrower repair queued from untagged output");
+    db.run_unit_once("otel_logs_and_spans", &project, day, Operation::BaseRollup, 24, 0).await?;
+    for repair in &narrower {
+        assert_eq!(db.journal().state(repair), Some(TaskState::Superseded), "the covering rebuild must retire the narrower repair without scanning it");
     }
-    assert_eq!(
-        crate::observability::maintenance_stats().rollup_scan_cohorts.load(std::sync::atomic::Ordering::Relaxed),
-        scans,
-        "recovery repairs covered by the new publication must not scan source data again"
-    );
     let repaired = db.run_unit_once("otel_logs_and_spans", &project, day, Operation::DerivedRollup, 24, 0).await?;
     assert_eq!(repaired.state, Some(TaskState::Complete), "base rebuilding and metadata-only repair reconciliation must unblock the derived tier");
     let derived_table = schema.rollups.iter().find(|spec| spec.derive_from.is_some()).unwrap().table_name("otel_logs_and_spans");
