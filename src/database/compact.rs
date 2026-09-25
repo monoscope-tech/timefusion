@@ -73,8 +73,8 @@ impl Database {
             window_hours
         );
 
-        let partition_filters: Vec<PartitionFilter> =
-            kept_dates.iter().filter_map(|d| PartitionFilter::try_from(("date", "=", d.to_string().as_str())).ok()).collect();
+        let kept_date_strs: Vec<String> = kept_dates.iter().map(ToString::to_string).collect();
+        let partition_filters: Vec<FilterLiteral> = kept_date_strs.iter().map(|d| eq_filter("date", d)).collect();
 
         let schema = schema_or_default(table_name);
         // Sorting keeps rewritten files timestamp-local, so short ranges can
@@ -303,7 +303,7 @@ impl Database {
     /// run per tick. Files >= 7/8 target are excluded as converged — re-selecting one alone would
     /// rewrite it 1→1 forever.
     async fn light_optimize_tail(
-        table: &DeltaTable, filters: &[PartitionFilter], target_size: i64, min_files: usize, sorted_run_cap: i64,
+        table: &DeltaTable, filters: &[FilterLiteral<'_>], target_size: i64, min_files: usize, sorted_run_cap: i64,
     ) -> Result<Vec<String>> {
         let adds: Vec<_> = table.get_active_add_actions_by_partitions(filters).try_collect::<Vec<_>>().await?;
         let tail: Vec<TailAdd> = adds
@@ -434,11 +434,12 @@ impl Database {
         let max_concurrent = concurrency.unwrap_or_else(|| self.config.derived.optimize_merge_tasks()).max(1);
         let target_size = self.optimize_target_for_date(date);
         let schema = schema_or_default(table_name);
-        let mut partition_filters = vec![PartitionFilter::try_from(("date", "=", date.to_string().as_str()))?];
+        let date_str = date.to_string();
+        let mut partition_filters = vec![eq_filter("date", &date_str)];
         // Scope to one tenant when asked: a whole date spans every project's files
         // and may not fit in-process; one (project, date) partition does.
         if let Some(pid) = project_id {
-            partition_filters.push(PartitionFilter::try_from(("project_id", "=", pid))?);
+            partition_filters.push(eq_filter("project_id", pid));
         }
         // Retry OCC/transient S3 errors; reset the no-progress budget only when
         // committed bins reduce the scoped file count.
@@ -740,8 +741,7 @@ impl Database {
         // keeps losing OCC); a normal day converges in partition_bytes/target passes.
         let max_passes = max_passes.clamp(1, 128);
         for project_id in Self::hot_project_ids(&uris, date).into_iter().filter(|p| only_project.is_none_or(|only| only == p)) {
-            let partition_filters =
-                vec![PartitionFilter::try_from(("project_id", "=", project_id.as_str()))?, PartitionFilter::try_from(("date", "=", date_str.as_str()))?];
+            let partition_filters = vec![eq_filter("project_id", &project_id), eq_filter("date", &date_str)];
             for _ in 0..max_passes {
                 let selected_files = {
                     // Clone out from under the guard rather than enumerating beneath it:

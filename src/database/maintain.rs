@@ -8805,7 +8805,7 @@ impl Database {
     /// bursts from `flush_all_now` or shutdown flushes.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn optimize_table_light_inner(
-        &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, today: chrono::NaiveDate, project_id: &str, partition_filters: &[PartitionFilter],
+        &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, today: chrono::NaiveDate, project_id: &str, partition_filters: &[FilterLiteral<'_>],
         selected_files: &[String], target_size: i64, writer_properties: &WriterProperties, optimize_type: deltalake::operations::optimize::OptimizeType,
         min_files: usize, start_time: std::time::Instant,
     ) -> Result<()> {
