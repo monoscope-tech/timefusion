@@ -1114,6 +1114,7 @@ trait Sketch: Default + std::fmt::Debug + Send + Sync + 'static {
     /// Fold one serialized sketch in.
     fn merge_bytes(&mut self, bytes: &[u8]) -> datafusion::error::Result<()>;
     fn encode(&self) -> datafusion::error::Result<Vec<u8>>;
+    /// Allocated bytes, including the sketch value itself and retained heap capacity.
     fn heap_size(&self) -> usize;
 }
 
@@ -1151,7 +1152,7 @@ impl<S: Sketch> Accumulator for SketchAccumulator<S> {
     }
 
     fn size(&self) -> usize {
-        self.sketch.heap_size()
+        std::mem::size_of::<Self>() - std::mem::size_of::<S>() + self.sketch.heap_size()
     }
 
     fn state(&mut self) -> datafusion::error::Result<Vec<ScalarValue>> {
@@ -1169,7 +1170,24 @@ const TDIGEST_MAX_CENTROIDS: usize = 200;
 /// centroids, never the raw input values.
 #[derive(Debug, Default)]
 struct TDigestWrapper {
-    digest: Option<TDigest>,
+    digest: Option<AccountedDigest>,
+}
+
+#[derive(Debug)]
+struct AccountedDigest {
+    value: TDigest,
+    centroid_capacity: usize,
+}
+
+impl AccountedDigest {
+    fn from_centroids(centroids: Vec<tdigests::Centroid>) -> Self {
+        let capacity = centroids.capacity();
+        let mut value = TDigest::from_centroids(centroids);
+        // tdigests 1.0.1 replaces the vector with max_centroids slots only when compression runs.
+        let centroid_capacity = if value.centroids().len() > TDIGEST_MAX_CENTROIDS { TDIGEST_MAX_CENTROIDS } else { capacity };
+        value.compress(TDIGEST_MAX_CENTROIDS);
+        Self { value, centroid_capacity }
+    }
 }
 
 impl TDigestWrapper {
@@ -1185,18 +1203,17 @@ impl TDigestWrapper {
 
     fn merge(&mut self, other: &TDigestWrapper) {
         if let Some(digest) = &other.digest {
-            self.merge_digest(digest);
+            self.merge_digest(&digest.value);
         }
     }
 
     fn merge_digest(&mut self, digest: &TDigest) {
-        let mut merged = self.digest.as_ref().map_or_else(|| digest.clone(), |current| current.merge(digest));
-        merged.compress(TDIGEST_MAX_CENTROIDS);
-        self.digest = Some(merged);
+        let centroids = self.digest.as_ref().map_or_else(|| digest.centroids().to_vec(), |current| [current.value.centroids(), digest.centroids()].concat());
+        self.digest = Some(AccountedDigest::from_centroids(centroids));
     }
 
     fn to_bytes(&self) -> datafusion::error::Result<Vec<u8>> {
-        let centroids: Vec<(f64, f64)> = self.digest.iter().flat_map(|d| d.centroids().iter().map(|c| (c.mean, c.weight))).collect();
+        let centroids: Vec<(f64, f64)> = self.digest.iter().flat_map(|d| d.value.centroids().iter().map(|c| (c.mean, c.weight))).collect();
         // Never swallow the encode failure: an empty payload decodes as an empty digest.
         bincode::encode_to_vec(centroids, bincode::config::standard()).map_err(|e| DataFusionError::Execution(format!("Failed to serialize t-digest: {e}")))
     }
@@ -1213,9 +1230,7 @@ impl TDigestWrapper {
         if centroids.is_empty() {
             return Ok(Self::default());
         }
-        let mut digest = TDigest::from_centroids(centroids);
-        digest.compress(TDIGEST_MAX_CENTROIDS);
-        Ok(Self { digest: Some(digest) })
+        Ok(Self { digest: Some(AccountedDigest::from_centroids(centroids)) })
     }
 }
 
@@ -1239,7 +1254,7 @@ impl Sketch for TDigestWrapper {
     }
 
     fn heap_size(&self) -> usize {
-        std::mem::size_of::<Self>() + self.digest.as_ref().map_or(0, |digest| std::mem::size_of_val(digest.centroids()))
+        std::mem::size_of::<Self>() + self.digest.as_ref().map_or(0, |digest| digest.centroid_capacity * std::mem::size_of::<tdigests::Centroid>())
     }
 }
 
@@ -1271,7 +1286,7 @@ impl ScalarUDFImpl for ApproxPercentileUDF {
                     if !(0.0..=1.0).contains(&pct) {
                         return Err(DataFusionError::Execution(format!("Percentile must be between 0 and 1, got {pct}")));
                     }
-                    Ok(TDigestWrapper::from_bytes(bytes)?.digest.map(|d| d.estimate_quantile(pct)))
+                    Ok(TDigestWrapper::from_bytes(bytes)?.digest.map(|d| d.value.estimate_quantile(pct)))
                 }
                 _ => Ok(None),
             })
@@ -1803,6 +1818,33 @@ mod tests {
     }
 
     #[test]
+    fn tdigest_accounts_for_reserved_centroid_capacity() {
+        let centroids: Vec<_> = (0..=TDIGEST_MAX_CENTROIDS).map(|value| (value as f64, if value == 100 { 1e9 } else { 1.0 })).collect();
+        let bytes = bincode::encode_to_vec(centroids, bincode::config::standard()).unwrap();
+        let mut wrapper = TDigestWrapper::from_bytes(&bytes).unwrap();
+        assert!(wrapper.digest.as_ref().unwrap().value.centroids().len() < TDIGEST_MAX_CENTROIDS, "skew must leave unused capacity after compression");
+        // The pinned tdigests compressor allocates max_centroids slots, even when fewer remain live.
+        let allocated = std::mem::size_of::<TDigestWrapper>() + TDIGEST_MAX_CENTROIDS * std::mem::size_of::<tdigests::Centroid>();
+        assert!(wrapper.heap_size() >= allocated, "reported {} bytes for at least {allocated} allocated bytes", wrapper.heap_size());
+        let tiny = digest([1.0, 2.0]);
+        assert_eq!(
+            tiny.heap_size(),
+            std::mem::size_of::<TDigestWrapper>() + 2 * std::mem::size_of::<tdigests::Centroid>(),
+            "small states need no maximum reservation"
+        );
+        wrapper.merge(&tiny);
+        let retained = std::mem::size_of_val(wrapper.digest.as_ref().unwrap().value.centroids());
+        assert_eq!(wrapper.heap_size(), std::mem::size_of::<TDigestWrapper>() + retained, "merge must replace the old larger allocation charge");
+    }
+
+    #[test_case::test_case(Box::<SketchAccumulator<TDigestWrapper>>::default() ; "tdigest")]
+    #[test_case::test_case(Box::<SketchAccumulator<crate::read::Hll>>::default() ; "hll")]
+    fn sketch_accumulator_accounts_for_own_storage(accumulator: Box<dyn Accumulator>) {
+        let allocated = std::mem::size_of_val(accumulator.as_ref());
+        assert!(accumulator.size() >= allocated, "reported {} bytes for a {allocated}-byte accumulator", accumulator.size());
+    }
+
+    #[test]
     fn percentile_agg_state_is_bounded_and_merge_preserves_the_tail() {
         assert!(TDigestWrapper::default().digest.is_none(), "no digest until a batch arrives");
         assert!(digest(vec![10.0, 20.0]).digest.is_some(), "a batch creates the digest");
@@ -1811,7 +1853,7 @@ mod tests {
         let mut left = digest((0..50_000).map(|value| value as f64));
         left.merge(&digest((50_000..100_000).map(|value| value as f64)));
         assert!(left.to_bytes().unwrap().len() < 10_000, "a merged state stays bounded too");
-        assert!((left.digest.as_ref().unwrap().estimate_quantile(0.95) - 95_000.0).abs() < 1_000.0, "merge preserves the p95 tail estimate");
+        assert!((left.digest.as_ref().unwrap().value.estimate_quantile(0.95) - 95_000.0).abs() < 1_000.0, "merge preserves the p95 tail estimate");
     }
 
     #[tokio::test]
