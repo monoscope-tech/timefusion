@@ -339,6 +339,19 @@ pub mod test_helpers {
 
     use crate::{config::AppConfig, schema::get_default_schema};
 
+    /// Process CPU across all threads, for isolated work measurements.
+    pub fn process_cpu() -> anyhow::Result<std::time::Duration> {
+        let mut time = std::mem::MaybeUninit::<libc::timespec>::uninit();
+        // SAFETY: the pointer is aligned, writable, and valid for one timespec. The
+        // syscall initializes it on success; the error path never reads its contents.
+        if unsafe { libc::clock_gettime(libc::CLOCK_PROCESS_CPUTIME_ID, time.as_mut_ptr()) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        // SAFETY: successful clock_gettime initialized both timespec fields.
+        let time = unsafe { time.assume_init() };
+        Ok(std::time::Duration::from_secs(u64::try_from(time.tv_sec)?) + std::time::Duration::from_nanos(u64::try_from(time.tv_nsec)?))
+    }
+
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum BufferMode {
         Enabled,

@@ -32,6 +32,13 @@ final-status-level = "slow"
 filter = 'binary(e2e)'
 slow-timeout = { period = "30s", terminate-after = 8 }
 
+# The rollup no-op/packed-repair fixtures each build real multi-hour rollups
+# (~150s alone). Run together they multiply each other's wall time past the
+# cap, so they share two slots rather than a longer timeout.
+[[profile.default.overrides]]
+filter = 'test(/rollup_noop_skip_tests::/)'
+test-group = 'rollup-heavy'
+
 # `cargo nextest run --profile ci`
 [profile.ci]
 test-threads = "num-cpus"
@@ -55,6 +62,13 @@ retries = 1
 [[profile.ci.overrides]]
 filter = 'test(/dedup_compaction/)'
 slow-timeout = { period = "60s", terminate-after = 20 }
+
+[[profile.ci.overrides]]
+filter = 'test(/rollup_noop_skip_tests::/)'
+test-group = 'rollup-heavy'
+
+[test-groups]
+rollup-heavy = { max-threads = 2 }
 
 # Ad-hoc profiling of the tail: flags every test over 4s.
 [profile.timings]

@@ -1042,6 +1042,10 @@ atomic_stats! {
         /// barrier that costs no IO.
         journal_commits,
         journal_commits_coalesced,
+        /// Task-checkpoint barrier attempts and coalesced callers (gauges),
+        /// including rollup publications. An empty checkpoint need not fsync.
+        task_journal_checkpoints,
+        task_journal_checkpoints_coalesced,
         checkpoint_failed,
         /// Checkpoints that wrote OK but failed post-write footer verification.
         /// Log cleanup is withheld so the JSON log stays recoverable. PAGE if > 0.
@@ -1323,8 +1327,12 @@ atomic_stats! {
         rollup_min_contiguous_days,
         rollup_median_contiguous_days,
         rollup_oldest_invalidation_age_secs as "rollup_oldest_invalidation_age_seconds",
+        /// Started source-aggregate attempts, including retries and each hash shard.
         rollup_scan_cohorts as "rollup_scan_cohorts_total",
+        /// Project participations in those attempts, not distinct projects.
         rollup_scan_projects as "rollup_scan_projects_total",
+        /// Full projected input-file estimate per attempt, not time-prorated or
+        /// measured decoded bytes. Repeated shard passes repeat the estimate.
         rollup_scan_estimated_bytes as "rollup_scan_estimated_bytes_total",
         rollup_cohort_splits as "rollup_cohort_splits_total",
         rollup_singleton_failures as "rollup_singleton_failures_total",

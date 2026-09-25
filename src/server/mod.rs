@@ -565,6 +565,26 @@ impl LoggingSimpleQueryHandler {
         Ok((db, table_ref))
     }
 
+    async fn run_rollup_policy(&self, cmd: RollupPolicyCmd) -> PgWireResult<Vec<Response>> {
+        let db = require_available(self.db.as_ref(), "ROLLUP")?;
+        let source = match cmd {
+            RollupPolicyCmd::Policies { source } => source,
+            RollupPolicyCmd::SetPolicy { source, table, policy } => {
+                db.set_rollup_build_policy(&source, &table, policy).map_err(|error| admin_err(format!("ROLLUP: {error}")))?;
+                info!(source, table, ?policy, event = "rollup_build_policy_changed");
+                source
+            }
+        };
+        let policies = db.rollup_build_policies(&source).map_err(|error| admin_err(format!("ROLLUP: {error}")))?;
+        Ok(text_response(
+            ["table", "parent", "policy"],
+            policies.into_iter().map(|view| {
+                let policy = serde_json::to_string(&view.status).map_err(|error| admin_err(format!("encode rollup policy: {error}")))?;
+                Ok(vec![view.table, view.parent.unwrap_or_default(), policy])
+            }),
+        ))
+    }
+
     /// Execute an intercepted `OPTIMIZE <table> WHERE date = '...'`.
     async fn run_optimize(&self, cmd: OptimizeCmd) -> PgWireResult<Vec<Response>> {
         let (db, table_ref) = self.admin_table("OPTIMIZE", &cmd.table).await?;
@@ -861,6 +881,40 @@ fn filter_value(rest: &str) -> Result<&str, String> {
     Ok(rest.trim().strip_prefix('=').ok_or("expected: <col> = '<value>'")?.trim().trim_matches(['\'', '"']).trim())
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum RollupPolicyCmd {
+    Policies { source: String },
+    SetPolicy { source: String, table: String, policy: crate::maintenance_coordinator::RollupBuildPolicy },
+}
+
+/// Parse explicit policy commands. Resume never defaults to all retained history.
+pub(crate) fn parse_rollup_policy(query: &str) -> Result<Option<RollupPolicyCmd>, String> {
+    use crate::maintenance_coordinator::RollupBuildPolicy;
+    let Some(rest) = strip_command(query, "rollup") else { return Ok(None) };
+    let tokens: Vec<_> = rest.split_whitespace().collect();
+    let cmd = match tokens.as_slice() {
+        [action, source] if action.eq_ignore_ascii_case("policies") => RollupPolicyCmd::Policies { source: (*source).to_owned() },
+        [action, source, table] if action.eq_ignore_ascii_case("pause") => {
+            RollupPolicyCmd::SetPolicy { source: (*source).to_owned(), table: (*table).to_owned(), policy: RollupBuildPolicy::Paused }
+        }
+        [action, source, table, from, timestamp] if action.eq_ignore_ascii_case("resume") && from.eq_ignore_ascii_case("from") => {
+            let timestamp =
+                timestamp.strip_prefix('\'').and_then(|value| value.strip_suffix('\'')).ok_or("ROLLUP RESUME requires a single-quoted RFC3339 timestamp")?;
+            let timestamp = chrono::DateTime::parse_from_rfc3339(timestamp).map_err(|error| format!("invalid rollup resume timestamp: {error}"))?;
+            if !timestamp.timestamp_subsec_nanos().is_multiple_of(1_000) {
+                return Err("rollup resume timestamp must have exact microsecond precision".to_owned());
+            }
+            RollupPolicyCmd::SetPolicy {
+                source: (*source).to_owned(),
+                table: (*table).to_owned(),
+                policy: RollupBuildPolicy::ResumeFrom { start_micros: timestamp.timestamp_micros() },
+            }
+        }
+        _ => return Err("expected ROLLUP POLICIES <source>, ROLLUP PAUSE <source> <tier>, or ROLLUP RESUME <source> <tier> FROM '<RFC3339>'".to_owned()),
+    };
+    Ok(Some(cmd))
+}
+
 /// Parse `OPTIMIZE <table> WHERE date = 'YYYY-MM-DD'`.
 ///
 /// - `Ok(None)`: not an OPTIMIZE statement — fall through to DataFusion.
@@ -1152,6 +1206,7 @@ impl SimpleQueryHandler for LoggingSimpleQueryHandler {
                 }
             };
         }
+        admin!(parse_rollup_policy => run_rollup_policy);
         admin!(parse_optimize => run_optimize);
         admin!(parse_vacuum => run_vacuum);
         admin!(parse_delta_recovery_audit => run_delta_recovery_audit);
@@ -1469,6 +1524,104 @@ mod pgwire_handlers_tests {
             .await
             .expect("a non-yielding future outruns the deadline instead of being cancelled");
         assert_eq!(value, 42, "it completed, which is precisely the failure mode");
+    }
+
+    #[test_case("ROLLUP POLICIES s" => Ok(Some(crate::server::RollupPolicyCmd::Policies { source: "s".into() })); "inspect policies")]
+    #[test_case(" rollup pause s t; " => Ok(Some(crate::server::RollupPolicyCmd::SetPolicy { source: "s".into(), table: "t".into(), policy: crate::maintenance_coordinator::RollupBuildPolicy::Paused })); "pause one tier")]
+    #[test_case("ROLLUP RESUME s t FROM '1970-01-01T01:00:00+01:00'" => Ok(Some(crate::server::RollupPolicyCmd::SetPolicy { source: "s".into(), table: "t".into(), policy: crate::maintenance_coordinator::RollupBuildPolicy::ResumeFrom { start_micros: 0 } })); "resume preserves timezone")]
+    #[test_case("ROLLUP RESUME s t" => Err(()); "resume must name a boundary")]
+    #[test_case("ROLLUP RESUME s t FROM '1970-01-01T00:00:00.0000001Z'" => Err(()); "never truncate submicrosecond input")]
+    #[test_case("ROLLUP RESUME s t FROM 1970-01-01T00:00:00Z" => Err(()); "timestamp is a quoted literal")]
+    #[test_case("ROLLUP PAUSE s t extra" => Err(()); "reject trailing input")]
+    #[test_case("ROLLUP UNKNOWN s" => Err(()); "reject unknown action")]
+    #[test_case("SELECT 1" => Ok(None); "ordinary SQL falls through")]
+    #[test_case("ROLLUP_STATS s" => Ok(None); "keyword boundary")]
+    fn rollup_policy_commands_require_explicit_scope(query: &str) -> Result<Option<super::RollupPolicyCmd>, ()> {
+        super::parse_rollup_policy(query).map_err(|_| ())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rollup_policy_commands_survive_real_pgwire_restarts() -> anyhow::Result<()> {
+        use crate::{database::Database, maintenance_coordinator::TaskJournal, support::test_helpers::TestConfigBuilder};
+        use anyhow::Context;
+        use tokio_postgres::{NoTls, SimpleQueryMessage};
+        const SOURCE: &str = "otel_logs_and_spans";
+        const TIER: &str = "otel_logs_and_spans_rollup_sessions_1h_v1";
+
+        fn policy(messages: &[SimpleQueryMessage]) -> anyhow::Result<serde_json::Value> {
+            let value = messages
+                .iter()
+                .find_map(|message| match message {
+                    SimpleQueryMessage::Row(row) if row.get("table") == Some(TIER) => row.get("policy"),
+                    _ => None,
+                })
+                .context("session policy row missing")?;
+            Ok(serde_json::from_str(value)?)
+        }
+
+        let dir = tempfile::tempdir()?;
+        let mut cfg = (*TestConfigBuilder::new("pgwire-rollup-policy").build()).clone();
+        cfg.core.timefusion_data_dir = dir.path().to_owned();
+        let cfg = Arc::new(cfg);
+        let inspect = format!("ROLLUP POLICIES {SOURCE}");
+        let pause = format!("ROLLUP PAUSE {SOURCE} {TIER}");
+        let resume = format!("ROLLUP RESUME {SOURCE} {TIER} FROM '1970-01-01T00:00:00Z'");
+        let no_override = serde_json::json!({"state": "no_override"});
+        let paused = serde_json::json!({"state": "durable", "policy": "paused"});
+        let resumed = serde_json::json!({"state": "durable", "policy": {"resume_from": {"start_micros": 0}}});
+        for (before, command, after) in [(&no_override, Some(&pause), &paused), (&paused, Some(&resume), &resumed), (&resumed, None, &resumed)] {
+            let db = Arc::new(Database::with_config(Arc::clone(&cfg)).await?);
+            db.cancel_maintenance();
+            let mut ctx = Arc::clone(&db).create_session_context_for(true);
+            db.setup_session_context(&mut ctx)?;
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let port = listener.local_addr()?.port();
+            let shutdown = tokio_util::sync::CancellationToken::new();
+            let stop = shutdown.clone().cancelled_owned();
+            let server_db = Arc::clone(&db);
+            let mut tasks = tokio::task::JoinSet::new();
+            tasks.spawn(async move {
+                super::serve_with_listener(
+                    listener,
+                    Arc::new(ctx),
+                    &datafusion_postgres::ServerOptions::new(),
+                    super::AuthConfig { username: "postgres".into(), password: Some("test".into()) },
+                    None,
+                    Some(server_db),
+                    stop,
+                )
+                .await
+                .map_err(|error| anyhow::anyhow!("{error}"))
+            });
+            let (client, connection) = tokio_postgres::connect(&format!("host=127.0.0.1 port={port} user=postgres password=test"), NoTls).await?;
+            tasks.spawn(async move { connection.await.map_err(anyhow::Error::from) });
+            assert_eq!(&policy(&client.simple_query(&inspect).await?)?, before, "restart restores the acknowledged policy");
+            for invalid in [
+                format!("ROLLUP PAUSE {SOURCE} missing"),
+                format!("ROLLUP RESUME {SOURCE} {TIER} FROM '1970-01-01T00:00:01Z'"),
+                format!("ROLLUP RESUME {SOURCE} {TIER}"),
+            ] {
+                assert!(client.simple_query(&invalid).await.is_err(), "invalid policy command must fail: {invalid}");
+            }
+            assert_eq!(&policy(&client.simple_query(&inspect).await?)?, before, "rejected commands must not mutate policy");
+            if let Some(command) = command {
+                assert_eq!(&policy(&client.simple_query(command).await?)?, after);
+            }
+            let recovered = TaskJournal::load(&cfg.core.timefusion_data_dir)?;
+            assert_eq!(&serde_json::to_value(recovered.rollup_policy_status(TIER))?, after, "command acknowledgement precedes shutdown and proves durability");
+            assert_eq!(client.query_one("SELECT 42::BIGINT", &[]).await?.get::<_, i64>(0), 42);
+            drop(client);
+            shutdown.cancel();
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while let Some(result) = tasks.join_next().await {
+                    result??;
+                }
+                anyhow::Ok(())
+            })
+            .await??;
+            db.shutdown_by(tokio::time::Instant::now() + Duration::from_secs(10)).await?;
+        }
+        Ok(())
     }
 
     // Case/spacing/quote/semicolon tolerance; bare OPTIMIZE (no date) is rejected — it would compact all history in-process.

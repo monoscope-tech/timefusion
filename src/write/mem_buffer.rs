@@ -1191,9 +1191,11 @@ impl MemBuffer {
     /// Rows are NOT predicate-filtered: version resolution must see nonmatching
     /// replacements too. Callers apply the half-open window after resolving
     /// versions, and must retain exclusions even when a DELETE emptied a bucket.
+    /// Version-append tables supply no exclusions: tombstones retire keys, not ranges.
     pub fn snapshot_for_merge(&self, project_id: &str, table_name: &str, lo: i64, hi: i64) -> anyhow::Result<MemSnapshot> {
         anyhow::ensure!(lo < hi, "memory snapshot requires a nonempty time window");
         let Some(table) = self.get_table(project_id, table_name) else { return Ok(MemSnapshot::default()) };
+        let version_append = crate::schema::get_schema(table_name).is_some_and(|schema| schema.version_append);
         let key = table_key(project_id, table_name);
         let current = Self::current_bucket_id();
         let bucket_ids = table.buckets.iter().map(|bucket| *bucket.key()).sorted_unstable().collect_vec();
@@ -1205,7 +1207,7 @@ impl MemBuffer {
                 continue;
             }
             snapshot.batches.extend(batches.iter().cloned());
-            if bucket_id == current || self.force_flushed.get(&key).is_some_and(|set| set.contains(&bucket_id)) {
+            if version_append || bucket_id == current || self.force_flushed.get(&key).is_some_and(|set| set.contains(&bucket_id)) {
                 continue;
             }
             // Use the authority range, not the surviving rows' range: a DELETE
@@ -1294,7 +1296,13 @@ impl MemBuffer {
     /// bucket can't mask unrelated Delta rows. The current (open) bucket,
     /// force-flushed buckets and empty shells are skipped — their windows hold
     /// rows in both stores, so excluding them would hide the Delta share.
+    /// Version-append tables return no ranges and require row-version resolution.
     pub fn get_bucket_ranges(&self, project_id: &str, table_name: &str) -> Vec<(i64, i64)> {
+        // Late MOR rows own individual keys, not every Delta key at their timestamp.
+        // All readers must resolve versions and tombstones instead of masking the range.
+        if crate::schema::get_schema(table_name).is_some_and(|schema| schema.version_append) {
+            return Vec::new();
+        }
         let Some(table) = self.get_table(project_id, table_name) else {
             return Vec::new();
         };

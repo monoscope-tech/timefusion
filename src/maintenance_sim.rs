@@ -979,9 +979,7 @@ mod tests {
         TaskJournal::load(dir.path()).unwrap()
     }
 
-    /// One completed frontier task per project, so stream extraction sees the
-    /// requested number of streams. The derived twin deliberately keeps the
-    /// BASE physical table; only the operation is flipped.
+    /// One completed task per tier and project seeds both frontier streams.
     fn journal_with_streams(projects: usize) -> TaskJournal {
         let mut journal = empty_journal();
         for i in 0..projects {
@@ -990,7 +988,7 @@ mod tests {
             let mut task = journal.tasks().find(|task| task.key == base).cloned().expect("enqueued frontier task");
             task.state = TaskState::Complete;
             journal.upsert(task.clone());
-            task.key.operation = Operation::DerivedRollup;
+            task.key = key(&task.key.project_id, Operation::DerivedRollup, 60 * DAY_MICROS, NORMAL_SLICE_MICROS);
             journal.upsert(task);
         }
         journal
@@ -1016,6 +1014,7 @@ mod tests {
         // Pins the SHAPE, not a level: 13 projects already exceed the lag
         // budget, and more load is strictly worse.
         let report_13 = run(journal_with_streams(13), &cfg(6), START).unwrap();
+        assert!(report_13.completions.get("DerivedRollup").copied().unwrap_or_default() > 0, "the workload must actually execute its derived stream");
         let pending_13 = report_13.pending_end;
         assert!(
             report_13.frontier_lag_secs_max > FRONTIER_LAG_BUDGET_SECS,

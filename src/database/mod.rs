@@ -672,10 +672,8 @@ impl ScanMetrics {
 struct Certification {
     fp: u64,
     since: std::time::Instant,
-    /// The file paths the certifying pass proved clean. `fp` answers "is the
-    /// partition UNCHANGED"; this answers "which still-live files were proved".
-    /// Empty when restored from an older store; the per-file skip then can't use it.
-    files: Arc<[String]>,
+    /// Exact file visibility proved clean, using table-relative paths.
+    files: Arc<crate::read::CountFiles>,
     /// The partition has MOVED, so this can never again grant the whole-partition
     /// skip — but its file list is still true of the files it names, which the
     /// per-FILE skip needs. Do not delete a certification on fingerprint move.
@@ -690,11 +688,8 @@ struct Certification {
 struct SliceCoverage {
     fp: u64,
     intervals: Vec<(i64, i64)>,
-    /// The partition's file set when this coverage was last written, so a later
-    /// fingerprint move can ask WHICH files are new instead of discarding
-    /// everything. Empty means "written before this was recorded" — such an entry
-    /// cannot be diffed and must reset, which is how legacy sidecars load.
-    files: Vec<String>,
+    /// Exact file visibility when these intervals were proved.
+    files: crate::read::CountFiles,
 }
 
 /// Which clean intervals survive a set of newly-arrived files.
@@ -742,7 +737,22 @@ type RollupSourceKey = (String, String, String);
 type RollupCoverageKey = (String, String, String, String);
 type RollupSliceCoverageKey = (String, String, String, i64, i64);
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RollupOutputEvidence {
+    /// No publication count. Date summaries still require independent slice output proof.
+    Unknown,
+    /// Verified zero-row output, subject to source and publication evidence checks.
+    Empty,
+    Files(std::num::NonZeroU32),
+}
+
+impl RollupOutputEvidence {
+    fn from_file_count(files: impl TryInto<u32>) -> Self {
+        files.try_into().ok().and_then(std::num::NonZeroU32::new).map_or(Self::Unknown, Self::Files)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct RollupCoverage {
     source_fp: u64,
     /// The source partition's invalidation epoch when this was built; `None` for
@@ -773,10 +783,34 @@ struct RollupCoverage {
     /// cannot see a deletion vector superseding an `Add` under an unchanged path.
     /// `None` only ever DECLINES the no-op-rebuild skip.
     content_fp: Option<u64>,
-    /// How many files this cell published, so the no-op skip can confirm the
-    /// OUTPUT still stands and not only that the INPUT has not moved. `0` never
-    /// skips.
-    output_files: u32,
+    /// Output evidence is independent of input freshness; zero files alone prove nothing.
+    output: RollupOutputEvidence,
+}
+
+impl RollupCoverage {
+    fn matches_day(&self, fingerprint: u64, epoch: u64) -> bool {
+        self.source_fp == fingerprint && self.source_epoch == Some(epoch)
+    }
+
+    fn matches_slice(&self, rows: Option<u64>, rows_below: Option<u64>) -> bool {
+        crate::rollup::slice_coverage_agrees(&[self.source_rows], rows)
+            || self.source_rows_below.zip(rows_below).is_some_and(|(built, current)| built == current)
+    }
+
+    fn empty_publication(&self) -> Option<crate::maintenance_coordinator::Publication> {
+        (self.output == RollupOutputEvidence::Empty).then_some(())?;
+        Some(crate::maintenance_coordinator::Publication {
+            source_fingerprint: self.source_fp,
+            generation: self.generation.clone(),
+            rows: 0,
+            source_rows: self.source_rows,
+            source_rows_below: self.source_rows_below,
+            evidence: Some(crate::maintenance_coordinator::PublicationEvidence {
+                content_fp: self.content_fp?,
+                measures: self.measures.as_ref()?.iter().cloned().sorted_unstable().collect(),
+            }),
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -788,6 +822,15 @@ pub(crate) struct RollupReadTicket {
     /// the date fingerprint is re-checked over the WHOLE partition.
     dates: Vec<(RollupCoverageKey, u64, u64, String)>,
     slices: Vec<(RollupSliceCoverageKey, u64, String)>,
+    output: RollupOutputTicket,
+}
+
+#[derive(Debug)]
+struct RollupOutputTicket {
+    source: String,
+    target: String,
+    lookup_project: String,
+    accepted: maintain::RollupOutputCoverage,
 }
 
 /// A matched query's rollup substitute: the SQL to plan, the `Aggregate` node it
@@ -1121,25 +1164,6 @@ pub(crate) fn min_contiguous_days<'a>(
 /// missing stats is unknown and must read as non-empty.
 fn partition_file_is_empty(num_records: Option<i64>) -> bool {
     num_records == Some(0)
-}
-
-/// Narrows the cells a tier holds a PARTITION for to the ones the read path can
-/// actually serve.
-///
-/// Two definitions of "covered" used to disagree: the planner's, a Delta
-/// partition directory existing for `(project, date)`, and the reader's, a
-/// coverage record it can still prove against the source. A cell whose record an
-/// invalidation destroyed satisfied the first and failed the second, so it was
-/// invisible to the planner and useless to the reader — in no queue at all. That
-/// is how an idle coordinator and a 2.4% rollup hit rate were both true on
-/// 2026-09-22, with 40-49% of every tier's partitions in that state and a
-/// one-shot migration pinned to three weeks of August as the only repair.
-///
-/// PRESENCE, not freshness: stale coverage still reads as covered here. The
-/// reader counted 541 stale declines against 10,867 absences, and taking only
-/// the absences is the half that cannot over-enqueue.
-fn readable_cells_only(covered: &HashSet<(String, chrono::NaiveDate)>, readable: &HashSet<(String, String)>) -> HashSet<(String, chrono::NaiveDate)> {
-    covered.iter().filter(|(project, date)| readable.contains(&(project.clone(), date.to_string()))).cloned().collect()
 }
 
 /// Are client queries starving in the heavy-admission queue RIGHT NOW?
@@ -1942,7 +1966,7 @@ fn date_intersects(date: &str, (start, end): (i64, i64)) -> bool {
     date_start_micros(date).is_some_and(|day| day < end && day.saturating_add(DAY_MICROS) > start)
 }
 
-fn window_hour_masks(lo: i64, hi: i64) -> Option<Vec<(String, u32)>> {
+pub(crate) fn window_hour_masks(lo: i64, hi: i64) -> Option<Vec<(String, u32)>> {
     if lo >= hi {
         return None;
     }
@@ -2487,6 +2511,9 @@ pub struct Database {
     /// Coalesces the durable half of that path (see [`Self::commit_journal`]); the lock above
     /// covers only the in-memory mutation.
     journal_group_commit: Arc<crate::support::GroupCommit>,
+    /// Task checkpoints shared by invalidations and rollup publications, without
+    /// making a publication serialize the separate dirty-range map.
+    task_journal_group_commit: Arc<crate::support::GroupCommit>,
     /// Durable slice work from the same pre-ack invalidation path as `rollup_dirty`; the
     /// finer-grained source of truth coordinator workers consume.
     maintenance_tasks: Arc<std::sync::Mutex<crate::maintenance_coordinator::TaskJournal>>,
@@ -2738,6 +2765,25 @@ impl Database {
         crate::observability::Watched::new("journal_hold", guard)
     }
 
+    /// Change admission through the live journal, never a second journal writer.
+    pub(crate) fn set_rollup_build_policy(&self, source: &str, table: &str, policy: crate::maintenance_coordinator::RollupBuildPolicy) -> Result<()> {
+        self.journal().set_rollup_build_policy(source, table, policy)
+    }
+
+    pub(crate) fn rollup_build_policies(&self, source: &str) -> Result<Vec<crate::maintenance_coordinator::RollupPolicyView>> {
+        let schema = get_schema(source).ok_or_else(|| anyhow::anyhow!("unknown rollup source {source}"))?;
+        let journal = self.journal();
+        Ok(schema
+            .rollups
+            .iter()
+            .map(|spec| {
+                let table = spec.table_name(source);
+                let status = journal.rollup_policy_status(&table);
+                crate::maintenance_coordinator::RollupPolicyView { table, parent: spec.derive_from.clone(), status }
+            })
+            .collect())
+    }
+
     pub async fn perform_delta_update(
         &self, table_name: &str, project_id: &str, predicate: Option<datafusion::logical_expr::Expr>,
         assignments: Vec<(String, datafusion::logical_expr::Expr)>, session: Arc<dyn datafusion::catalog::Session>,
@@ -2984,7 +3030,7 @@ impl Database {
                 let since = crate::storage::age_since(entry.granted_unix_ms).and_then(|age| now.checked_sub(age)).unwrap_or(now);
                 dedup_clean_fp.insert(
                     (entry.project_id, entry.table_name, entry.date),
-                    Certification { fp: entry.fp, since, files: Arc::from(entry.files), stale: entry.stale },
+                    Certification { fp: entry.fp, since, files: Arc::new(entry.files), stale: entry.stale },
                 );
             }
             info!(loaded = dedup_clean_fp.len(), event = "dedup_certifications_loaded");
@@ -3112,6 +3158,7 @@ impl Database {
             rollup_journal_lock: Arc::new(std::sync::Mutex::new(())),
             rollup_journal_persisted: Arc::new(std::sync::Mutex::new(PersistedRollupJournal::default())),
             journal_group_commit: Arc::new(crate::support::GroupCommit::default()),
+            task_journal_group_commit: Arc::new(crate::support::GroupCommit::default()),
             maintenance_tasks: Arc::new(std::sync::Mutex::new(maintenance_tasks)),
             maintenance_work: Arc::new(tokio::sync::Notify::new()),
             maintenance_admission,
@@ -4907,7 +4954,7 @@ pub(crate) struct StagedIntent {
     /// Present ONLY on a rollup unit's staged output. Absence is structural, not
     /// a sentinel: repair, dedup and pre-upgrade entries all decode to `None`,
     /// which is never committable as a rollup.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none", serialize_with = "serialize_rollup_resume", deserialize_with = "deserialize_rollup_resume")]
     rollup: Option<RollupResume>,
     /// WHICH instance staged this (`crate::observability::instance_id`). A
     /// different id proves some other process staged it and this one is not
@@ -4927,7 +4974,7 @@ pub(crate) struct StagedIntent {
 ///   requiring the live files overlapping the slice to be exactly the replace
 ///   set recorded at staging;
 /// - the SOURCE side asks "is this output still what a read would be served?",
-///   answered by the same two-sided row witness the read path itself uses.
+///   answered by the source row witness and the selected input's content fingerprint.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct RollupResume {
     /// The journal unit this output belongs to. A resumed Delta commit MUST also
@@ -4939,7 +4986,55 @@ pub(crate) struct RollupResume {
     /// an unverifiable build and must never resume — same rule the read path
     /// applies to a witness-less slice.
     source_rows: Option<u64>,
+    /// Exact target-partition metadata around the atomic publication. Legacy
+    /// replacement intents without this proof cannot safely resume a removal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    target: Option<RollupTargetProof>,
     date: String,
+}
+
+// Older readers must reject new evidence, not silently resume without checking it.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(untagged)]
+enum RollupResumeWire<T> {
+    V2 { v2: T },
+    Legacy(T),
+}
+
+fn serialize_rollup_resume<S: serde::Serializer>(value: &Option<RollupResume>, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+    serde::Serialize::serialize(&value.as_ref().map(|v2| RollupResumeWire::V2 { v2 }), serializer)
+}
+
+fn deserialize_rollup_resume<'de, D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<Option<RollupResume>, D::Error> {
+    let value: Option<RollupResumeWire<RollupResume>> = serde::Deserialize::deserialize(deserializer)?;
+    Ok(value.map(|wire| match wire {
+        RollupResumeWire::V2 { v2 } => v2,
+        RollupResumeWire::Legacy(body) => body,
+    }))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct RollupTargetProof {
+    before: u64,
+    after: u64,
+}
+
+/// Frozen persisted digest; ordering of files and map entries carries no meaning.
+fn rollup_target_fingerprint<'a>(files: impl IntoIterator<Item = &'a deltalake::kernel::Add>) -> u64 {
+    use itertools::Itertools;
+    let summary = files.into_iter().fold((0u64, 0u64), |(count, fingerprint), add| {
+        let identity = (
+            maintain::file_content_hash(&add.path, add.deletion_vector.as_ref()),
+            add.deletion_vector.as_ref().map(|dv| dv.storage_type.as_ref()),
+            add.size,
+            add.modification_time,
+            &add.stats,
+            add.partition_values.iter().sorted_unstable().collect::<Vec<_>>(),
+            add.tags.as_ref().into_iter().flat_map(|tags| tags.iter()).sorted_unstable().collect::<Vec<_>>(),
+        );
+        (count.saturating_add(1), fingerprint ^ maintain::digest_of(identity))
+    });
+    maintain::digest_of(summary)
 }
 
 /// Parse the append-only manifest, SKIPPING any line that doesn't decode. The
@@ -5026,15 +5121,15 @@ fn resume_precheck<V>(entry: &StagedIntent, table_name: &str, now_secs: u64, liv
 ///
 /// IO-free, like [`classify_resume`], so every branch is unit-testable; the
 /// caller supplies the target tier's live files and the source partition's
-/// CURRENT row count.
+/// CURRENT row count and selected input content fingerprint.
 ///
 /// A rollup aggregates, so the repair path's row-preservation test does not
 /// apply. Two checks stand in for it, both refusals by default:
 ///
 /// 1. **Source witness.** The build recorded the source partition's
-///    `num_records`; if it differs now, discard. Deliberately pessimistic — a
-///    benign compaction also changes it — because the read path would refuse
-///    the slice as `stale_coverage` anyway.
+///    `num_records` and input content fingerprint must both match. File paths
+///    alone miss deletion-vector changes; row counts miss same-count mutations.
+///    Missing fingerprint evidence declines legacy intents conservatively.
 /// 2. **No double-count.** Every live file whose tagged range overlaps this
 ///    slice must be one the staged output replaces, or both stay live and their
 ///    rows get summed.
@@ -5043,15 +5138,23 @@ fn resume_precheck<V>(entry: &StagedIntent, table_name: &str, now_secs: u64, liv
 /// claim, `None` for an untagged file — which claims no range and therefore
 /// cannot double-count.
 fn classify_rollup_resume(
-    entry: &StagedIntent, table_name: &str, now_secs: u64, live: &HashMap<&str, Option<(i64, i64)>>, current_source_rows: Option<u64>,
+    entry: &StagedIntent, table_name: &str, now_secs: u64, live: &HashMap<&str, Option<(i64, i64)>>, current_source_rows: Option<u64>, current_content_fp: u64,
 ) -> ResumeVerdict {
     let Some(rollup) = entry.rollup.as_ref() else { return ResumeVerdict::Skip };
-    if let Some(verdict) = resume_precheck(entry, table_name, now_secs, live) {
-        return verdict;
+    let precheck = resume_precheck(entry, table_name, now_secs, live);
+    match precheck {
+        Some(ResumeVerdict::AlreadyLanded) | None => {}
+        Some(verdict) => return verdict,
     }
     // No witness ⇒ unverifiable; a witness that no longer matches ⇒ the source moved.
-    if !matches!((rollup.source_rows, current_source_rows), (Some(built_from), Some(current)) if built_from == current) {
+    if !matches!((rollup.source_rows, current_source_rows), (Some(built_from), Some(current)) if built_from == current)
+        || rollup.publication.evidence.as_ref().is_none_or(|evidence| evidence.content_fp != current_content_fp)
+    {
         return ResumeVerdict::SourceMoved;
+    }
+    // A landed artifact is not permission to reactivate stale coverage.
+    if let Some(verdict) = precheck {
+        return verdict;
     }
     let replaced: HashSet<&str> = entry.target_paths.iter().map(String::as_str).collect();
     let (start, end) = (rollup.key.slice.start_micros, rollup.key.slice.end_micros);
@@ -5597,18 +5700,21 @@ const SORTED_RUN_TAG: &str = "delta-rs.optimize.sort_by";
 /// requires an exact slice match. Dropping them silently erases rollup tier
 /// coverage, which `recover_rollup_coverage` reads from exactly these tags.
 fn carried_coverage_tags(targets: &[deltalake::kernel::Add]) -> HashMap<String, String> {
-    use crate::maintenance_coordinator::{TAG_GENERATION, TAG_PROJECT, TAG_SLICE_END, TAG_SLICE_START, TAG_SOURCE, TAG_SOURCE_FINGERPRINT};
+    use crate::maintenance_coordinator::{
+        TAG_CONTENT_FINGERPRINT, TAG_GENERATION, TAG_MEASURES, TAG_OUTPUT_ROWS, TAG_PROJECT, TAG_SLICE_END, TAG_SLICE_START, TAG_SOURCE,
+        TAG_SOURCE_FINGERPRINT, TAG_SOURCE_ROWS, TAG_SOURCE_ROWS_BELOW,
+    };
     const COVERAGE_TAGS: [&str; 6] = [TAG_SOURCE, TAG_PROJECT, TAG_SLICE_START, TAG_SLICE_END, TAG_SOURCE_FINGERPRINT, TAG_GENERATION];
+    const PROOF_TAGS: [&str; 5] = [TAG_SOURCE_ROWS, TAG_SOURCE_ROWS_BELOW, TAG_CONTENT_FINGERPRINT, TAG_MEASURES, TAG_OUTPUT_ROWS];
     let Some(first) = targets.first() else { return HashMap::new() };
     let value = |add: &deltalake::kernel::Add, tag: &str| add.tags.as_ref().and_then(|tags| tags.get(tag).cloned().flatten());
-    COVERAGE_TAGS
-        .into_iter()
-        .map(|tag| {
-            let expected = value(first, tag)?;
-            targets.iter().all(|add| value(add, tag).as_deref() == Some(expected.as_str())).then_some((tag.to_owned(), expected))
-        })
-        .collect::<Option<HashMap<_, _>>>()
-        .unwrap_or_default()
+    let agreed = |tag| {
+        let expected = value(first, tag)?;
+        targets.iter().all(|add| value(add, tag).as_deref() == Some(expected.as_str())).then_some((tag.to_owned(), expected))
+    };
+    let Some(mut tags) = COVERAGE_TAGS.into_iter().map(agreed).collect::<Option<HashMap<_, _>>>() else { return HashMap::new() };
+    tags.extend(PROOF_TAGS.into_iter().filter_map(agreed));
+    tags
 }
 
 fn is_sorted_run(tags: &HashMap<String, Option<String>>) -> bool {

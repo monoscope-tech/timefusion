@@ -1271,7 +1271,7 @@ mod tantivy_rewriter_tests {
 
 // Rewrite Postgres array literals (`'{}'`, `'{a,b}'`) into typed list literals
 // where an array type is expected, e.g. `COALESCE(hashes, '{}')`. Must run
-// before `TypeCoercion`. Only string element types are handled.
+// before `TypeCoercion`. Explicit array casts use their declared element type.
 
 use std::mem::take;
 
@@ -1382,6 +1382,11 @@ fn rewrite_in_plan(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
 }
 
 fn rewrite_in_expr(expr: Expr, input_schemas: &[Arc<DFSchema>]) -> Result<Transformed<Expr>> {
+    if let Expr::Cast(cast) = &expr
+        && let Some(list) = list_elem_type(cast.field.data_type()).and_then(|element| pg_list_literal(&cast.expr, element))
+    {
+        return Ok(Transformed::yes(Expr::Cast(Cast::new_from_field(Box::new(Expr::Literal(list, None)), Arc::clone(&cast.field)))));
+    }
     let Expr::ScalarFunction(ScalarFunction { func, args }) = expr else {
         return Ok(Transformed::no(expr));
     };
@@ -1481,6 +1486,9 @@ mod pg_array_literal_rewriter_tests {
     #[test_case::test_case("SELECT cardinality(COALESCE(CAST(NULL AS VARCHAR[]), '{}')) AS n FROM (SELECT 1)", "| 0 " ; "coalesce_empty_pg_array_literal")]
     #[test_case::test_case("SELECT COALESCE(CAST(NULL AS VARCHAR[]), '{a, b, \"c,d\", NULL}') AS v FROM (SELECT 1)", "[a, b, c,d, ]" ; "coalesce_nonempty_pg_array_literal")]
     #[test_case::test_case("SELECT COALESCE(CAST(NULL AS VARCHAR), '{}') AS v FROM (SELECT 1)", "{}" ; "non_array_string_untouched")]
+    #[test_case::test_case("SELECT cardinality(COALESCE(CAST(NULL AS BIGINT[]), '{}'::BIGINT[])) AS n FROM (SELECT 1)", "| 0 " ; "explicit_empty_bigint_array")]
+    #[test_case::test_case("SELECT '{1,2,NULL}'::BIGINT[] AS v FROM (SELECT 1)", "[1, 2, ]" ; "explicit_bigint_array_values")]
+    #[test_case::test_case("SELECT '{}'::VARCHAR[] AS v FROM (SELECT 1)", "[]" ; "explicit_empty_text_array")]
     #[tokio::test]
     async fn coalesce_evaluates_to(sql: &str, want: &str) {
         let batches = ctx_with_rule().sql(sql).await.expect("plan ok").collect().await.expect("exec ok");

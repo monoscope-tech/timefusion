@@ -2763,7 +2763,7 @@ pub const PERSIST_CAP: usize = 20_000;
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DedupProofVersion {
-    PhysicalRowOrderV1,
+    PhysicalVisibilityV2,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -2777,9 +2777,8 @@ pub struct StoredCertification {
     /// Wall-clock ms since the epoch — not a monotonic instant, because it must
     /// survive the process.
     pub granted_unix_ms: u64,
-    /// The file paths the certifying pass proved clean, for the per-FILE skip.
-    #[serde(default)]
-    pub files: Vec<String>,
+    /// Exact file visibility proved clean. Path-only records cannot restore this proof.
+    pub files: crate::read::CountFiles,
     /// When true the certification only vouches for the files it names, never
     /// the WHOLE partition. Slice-derived certifications are stale by
     /// construction: they proved one time window, not a day.
@@ -2890,12 +2889,8 @@ pub struct StoredSliceCoverage {
     pub date: String,
     pub fp: u64,
     pub intervals: Vec<(i64, i64)>,
-    /// The file set the coverage was proved over. `default` so a sidecar written
-    /// before this field loads as empty, which the reader treats as
-    /// "undiffable, reset on the next fingerprint move" rather than as coverage
-    /// it may retain.
-    #[serde(default)]
-    pub files: Vec<String>,
+    /// Exact file visibility proved clean. Missing evidence must not become an empty map.
+    pub files: crate::read::CountFiles,
 }
 pub const DIRTY_BINS: (&str, &str) = ("dedup_dirty_bins.json", "dirty-bin queue");
 
@@ -2955,20 +2950,20 @@ pub trait CoverageLedger: Send + Sync {
     fn cells(&self) -> Vec<CoverageCell>;
 }
 
-/// Merge entries of the SAME generation whose slices touch or overlap.
-/// Generations are kept apart: differing generations were built from different
-/// source content, so merging would invent a range no single build produced.
+/// Merge touching or overlapping entries with identical generation, source evidence, and measures.
+/// Whole-partition row witnesses remain unchanged when their ranges merge.
 pub fn merge_coverage(mut entries: Vec<CoverageEntry>) -> Vec<CoverageEntry> {
     entries.sort_by(|a, b| (&a.generation, a.start_micros).cmp(&(&b.generation, b.start_micros)));
     entries.into_iter().fold(Vec::new(), |mut merged: Vec<CoverageEntry>, entry| {
         match merged.last_mut() {
-            Some(last) if last.generation == entry.generation && entry.start_micros <= last.end_micros => {
+            Some(last)
+                if last.generation == entry.generation
+                    && last.source_fingerprint == entry.source_fingerprint
+                    && last.source_rows == entry.source_rows
+                    && last.measures == entry.measures
+                    && entry.start_micros <= last.end_micros =>
+            {
                 last.end_micros = last.end_micros.max(entry.end_micros);
-                // One witness-less contributor makes the whole span unverifiable.
-                last.source_rows = match (last.source_rows, entry.source_rows) {
-                    (Some(a), Some(b)) => Some(a.saturating_add(b)),
-                    _ => None,
-                };
                 // Union, not replace: a merged range is served by every file that
                 // served any part of it.
                 last.files.extend(entry.files);
@@ -2992,6 +2987,15 @@ pub struct StoredCoverage {
     pub entries: Vec<CoverageEntry>,
 }
 
+// Nest the payload so older readers also reject the changed witness semantics.
+// Incompatible caches recover from Delta tags, not guessed source row counts.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(tag = "version", content = "coverage")]
+enum VersionedStoredCoverage {
+    #[serde(rename = "1")]
+    V1(StoredCoverage),
+}
+
 /// `CoverageLedger` backed by an in-memory map written through to a JSON
 /// sidecar on every mutation (never only on shutdown).
 #[derive(Debug)]
@@ -3003,9 +3007,9 @@ pub struct JsonCoverageLedger {
 impl JsonCoverageLedger {
     pub fn load(data_dir: impl Into<std::path::PathBuf>) -> Self {
         let data_dir = data_dir.into();
-        let cells = load_sidecar::<StoredCoverage>(&data_dir, ROLLUP_COVERAGE)
+        let cells = load_sidecar::<VersionedStoredCoverage>(&data_dir, ROLLUP_COVERAGE)
             .into_iter()
-            .map(|row| ((row.source, row.project_id, row.table_name, row.date), row.entries))
+            .map(|VersionedStoredCoverage::V1(row)| ((row.source, row.project_id, row.table_name, row.date), row.entries))
             .collect();
         Self { data_dir, cells }
     }
@@ -3014,12 +3018,12 @@ impl JsonCoverageLedger {
     /// must be counted: a ledger that silently stopped persisting reads exactly
     /// like one with nothing to say.
     fn persist(&self) {
-        let rows: Vec<StoredCoverage> = self
+        let rows: Vec<_> = self
             .cells
             .iter()
             .map(|cell| {
                 let (source, project_id, table_name, date) = cell.key().clone();
-                StoredCoverage { source, project_id, table_name, date, entries: cell.value().clone() }
+                VersionedStoredCoverage::V1(StoredCoverage { source, project_id, table_name, date, entries: cell.value().clone() })
             })
             .collect();
         if !store_sidecar(&self.data_dir, ROLLUP_COVERAGE, &rows) {
@@ -3159,25 +3163,38 @@ mod coverage_ledger_tests {
 
     /// Merging `(0,10,"g1",Some(3))` with a second slice, summarised as
     /// `(start, end, rows, file count)` per surviving range.
-    #[test_case::test_case("g1", Some(4) => vec![(0, 20, Some(7), 2)] ; "touching slices of one generation merge")]
-    #[test_case::test_case("g2", Some(4) => vec![(0, 10, Some(3), 1), (10, 20, Some(4), 1)] ; "different generations never merge")]
-    #[test_case::test_case("g1", None => vec![(0, 20, None, 2)] ; "a witnessless slice poisons the witness of the range it merges into")]
-    fn merge_coverage_joins_only_what_one_generation_proved(generation: &str, rows: Option<i64>) -> Vec<(i64, i64, Option<i64>, usize)> {
-        merge_coverage(vec![entry(0, 10, "g1", Some(3)), entry(10, 20, generation, rows)])
-            .into_iter()
-            .map(|e| (e.start_micros, e.end_micros, e.source_rows, e.files.len()))
-            .collect()
+    #[test_case::test_case("g1", Some(3), 7, None => vec![(0, 20, Some(3), 2)] ; "equal whole-partition witnesses are not added")]
+    #[test_case::test_case("g1", Some(4), 7, None => vec![(0, 10, Some(3), 1), (10, 20, Some(4), 1)] ; "different source witnesses retain separate proofs")]
+    #[test_case::test_case("g2", Some(4), 7, None => vec![(0, 10, Some(3), 1), (10, 20, Some(4), 1)] ; "different generations never merge")]
+    #[test_case::test_case("g1", None, 7, None => vec![(0, 10, Some(3), 1), (10, 20, None, 1)] ; "unknown coverage does not erase a neighboring proof")]
+    #[test_case::test_case("g1", Some(3), 8, None => vec![(0, 10, Some(3), 1), (10, 20, Some(3), 1)] ; "different fingerprints retain separate proofs")]
+    #[test_case::test_case("g1", Some(3), 7, Some("count") => vec![(0, 10, Some(3), 1), (10, 20, Some(3), 1)] ; "different measure evidence retains separate proofs")]
+    fn merge_coverage_joins_only_what_one_generation_proved(
+        generation: &str, rows: Option<i64>, fingerprint: u64, measure: Option<&str>,
+    ) -> Vec<(i64, i64, Option<i64>, usize)> {
+        let next = CoverageEntry { source_fingerprint: fingerprint, measures: measure.map(|name| vec![name.to_owned()]), ..entry(10, 20, generation, rows) };
+        merge_coverage(vec![entry(0, 10, "g1", Some(3)), next]).into_iter().map(|e| (e.start_micros, e.end_micros, e.source_rows, e.files.len())).collect()
     }
 
     /// One cell's whole life: record → restart → supersede → retire.
-    #[test]
-    fn a_cells_coverage_is_written_through_superseded_then_retired() {
+    #[test_case::test_case(true ; "old readers reject corrected witness semantics")]
+    #[test_case::test_case(false ; "old summed witnesses require metadata replay")]
+    fn a_cells_coverage_is_written_through_superseded_then_retired(old_reader: bool) {
         let (dir, ledger) = ledger();
         ledger.record(&cell(), entry(0, 10, "g1", Some(5)));
 
         // Write-through, not on shutdown.
         let reloaded = JsonCoverageLedger::load(dir.path());
         assert_eq!(reloaded.coverage(&cell()), vec![entry(0, 10, "g1", Some(5))], "a recorded slice is on disk before the process ends");
+
+        if old_reader {
+            assert!(load_sidecar::<StoredCoverage>(dir.path(), ROLLUP_COVERAGE).is_empty(), "rollback must not reinterpret corrected witnesses");
+        } else {
+            let (source, project_id, table_name, date) = cell();
+            let legacy = StoredCoverage { source, project_id, table_name, date, entries: vec![entry(0, 20, "g1", Some(10))] };
+            assert!(store_sidecar(dir.path(), ROLLUP_COVERAGE, &[legacy]));
+            assert!(JsonCoverageLedger::load(dir.path()).cells().is_empty(), "unversioned summed witnesses cannot seed routing");
+        }
 
         ledger.record(&cell(), entry(20, 30, "g1", Some(5)));
         assert_eq!(ledger.coverage(&cell()).len(), 2, "two disjoint ranges are two entries");
@@ -3246,10 +3263,12 @@ mod dedup_proof_version_tests {
     use super::{StoredCertification, StoredSliceCoverage};
 
     /// Returns whether the proof is still usable; both stored shapes must agree.
-    #[test_case::test_case(None => false ; "a legacy proof carrying no version must be rebuilt")]
-    #[test_case::test_case(Some("physical_row_order_v1") => true ; "the current proof version is accepted")]
-    #[test_case::test_case(Some("unknown_future_version") => false ; "a version this build does not know must be rebuilt")]
-    fn legacy_and_unknown_proofs_require_rebuilding(version: Option<&str>) -> bool {
+    #[test_case::test_case(None, false => false ; "a legacy proof carrying no version must be rebuilt")]
+    #[test_case::test_case(Some("physical_row_order_v1"), false => false ; "path-only evidence cannot prove visibility")]
+    #[test_case::test_case(Some("physical_visibility_v2"), true => true ; "the current proof version is accepted")]
+    #[test_case::test_case(Some("physical_visibility_v2"), false => false ; "a version stamp cannot upgrade path-only evidence")]
+    #[test_case::test_case(Some("unknown_future_version"), true => false ; "a version this build does not know must be rebuilt")]
+    fn legacy_and_unknown_proofs_require_rebuilding(version: Option<&str>, visibility: bool) -> bool {
         let mut proof = serde_json::json!({
             "project_id": "p", "table_name": "otel", "date": "2026-08-14",
             "fp": 7, "granted_unix_ms": 1, "files": ["a.parquet"], "stale": false,
@@ -3257,6 +3276,9 @@ mod dedup_proof_version_tests {
         });
         if let Some(version) = version {
             proof["proof_version"] = version.into();
+        }
+        if visibility {
+            proof["files"] = serde_json::json!({"a.parquet": null});
         }
         let certification = serde_json::from_value::<StoredCertification>(proof.clone()).is_ok();
         assert_eq!(serde_json::from_value::<StoredSliceCoverage>(proof).is_ok(), certification, "both stored shapes must accept or reject alike");

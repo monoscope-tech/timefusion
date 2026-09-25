@@ -469,11 +469,11 @@ struct RoutedMeasure {
 const MIN_INTERIOR_FRACTION: i64 = 5;
 const MIN_INTERIOR_BUCKETS: i64 = 2;
 
-const fn floor_grain(value: i64, grain: i64) -> i64 {
+pub(crate) const fn floor_grain(value: i64, grain: i64) -> i64 {
     value - value.rem_euclid(grain)
 }
 
-const fn ceil_grain(value: i64, grain: i64) -> i64 {
+pub(crate) const fn ceil_grain(value: i64, grain: i64) -> i64 {
     let remainder = value.rem_euclid(grain);
     if remainder == 0 { value } else { value + (grain - remainder) }
 }
@@ -650,6 +650,10 @@ pub(crate) fn complement(lo: i64, hi: i64, ranges: &[(i64, i64)]) -> Vec<(i64, i
 /// [`complement`] for a coverage set that is neither sorted nor disjoint —
 /// slice coverage arrives in hash order and its ranges overlap freely.
 pub(crate) fn uncovered(lo: i64, hi: i64, mut ranges: Vec<(i64, i64)>) -> Vec<(i64, i64)> {
+    ranges.retain_mut(|range| {
+        *range = (range.0.max(lo), range.1.min(hi));
+        range.0 < range.1
+    });
     ranges.sort_unstable();
     complement(lo, hi, &ranges)
 }
@@ -669,6 +673,30 @@ pub(crate) struct ProjectSplit {
     pub covered: Option<Vec<String>>,
     /// Read raw over the WHOLE window. Disjoint from `covered` by construction.
     pub raw_only: Vec<String>,
+}
+
+/// A generation may supply states only for the source interval that proved it.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct GenerationRange {
+    pub project: String,
+    pub date: String,
+    pub generation: String,
+    pub range: (i64, i64),
+}
+
+/// Coalesce proof fragments without granting coverage across a hole or identity.
+pub(crate) fn merge_generation_ranges(mut ranges: Vec<GenerationRange>) -> Vec<GenerationRange> {
+    ranges.sort_unstable();
+    // dedup_by passes the later element first; extend the retained range in place.
+    ranges.dedup_by(|right, left| {
+        if left.project == right.project && left.date == right.date && left.generation == right.generation && right.range.0 <= left.range.1 {
+            left.range.1 = left.range.1.max(right.range.1);
+            true
+        } else {
+            false
+        }
+    });
+    ranges
 }
 
 #[derive(Debug)]
@@ -711,6 +739,13 @@ pub(crate) struct SliceDedup<'a> {
     pub keys: &'a [String],
     pub tiebreak: Option<&'a str>,
     pub tombstone: Option<&'a str>,
+}
+
+/// Certified input still contains winning tombstones, unlike unversioned input.
+pub(crate) enum SliceInput<'a> {
+    Unversioned,
+    Deduplicate(SliceDedup<'a>),
+    Certified { tombstone: Option<&'a str> },
 }
 
 /// The identity a generated rollup tier is physically written with.
@@ -916,16 +951,16 @@ pub(crate) fn base_measure_evidence<'a>(spec: &RollupSpec, cells: impl Iterator<
 }
 
 /// The SELECT a rollup slice reads its input through, collapsing duplicates
-/// when `dedup` says how.
+/// when `input` requires winner selection.
 ///
 /// `schema` describes whatever is registered as `raw` — for a DERIVED tier that
-/// is the BASE TIER, not the raw source. `dedup = None` emits a bare
+/// is the BASE TIER, not the raw source. Unversioned input emits a bare
 /// `SELECT *`, so the aggregate above would SUM a tier's superseded versions.
 ///
 /// `present` is the PHYSICAL column set of the registered provider, not the
 /// synthesized schema; a column it lacks is projected NULL.
 pub(crate) fn slice_input_sql(
-    schema: &crate::schema::TableSchema, dedup: Option<SliceDedup<'_>>, raw: &str, project_id: &str, (start, end): (i64, i64), shard_predicate: &str,
+    schema: &crate::schema::TableSchema, input: SliceInput<'_>, raw: &str, project_id: &str, (start, end): (i64, i64), shard_predicate: &str,
     present: Option<&HashSet<String>>,
 ) -> String {
     let window = format!(
@@ -937,12 +972,21 @@ pub(crate) fn slice_input_sql(
         _ => quoted(&field.name),
     };
     let missing = |name: &str| present.is_some_and(|present| !present.contains(name));
+    let (dedup, clean_tombstone) = match input {
+        SliceInput::Unversioned => (None, None),
+        SliceInput::Deduplicate(dedup) => (Some(dedup), None),
+        SliceInput::Certified { tombstone } => (None, tombstone),
+    };
     let Some(dedup) = dedup.filter(|dedup| !dedup.keys.is_empty()) else {
         // `SELECT *` returns only what the provider has, so it cannot stand in
         // once anything is missing.
-        return match schema.fields.iter().any(|field| missing(&field.name)) {
+        let sql = match schema.fields.iter().any(|field| missing(&field.name)) {
             true => format!("SELECT {} FROM {raw} {window}", schema.fields.iter().map(&projected).join(", ")),
             false => format!("SELECT * FROM {raw} {window}"),
+        };
+        return match clean_tombstone.filter(|field| !missing(field)) {
+            Some(field) => format!("SELECT * FROM ({sql}) WHERE COALESCE({}, false) = false", quoted(field)),
+            None => sql,
         };
     };
     let inner = schema.fields.iter().map(&projected).join(", ");
@@ -1040,19 +1084,18 @@ impl RoutedRollup {
     /// The rewrite. `interiors` are the grain-aligned ranges the rollup leg owns;
     /// the raw leg owns their complement, so together they partition `[lo, hi)`
     /// with no gap and no overlap.
-    pub fn sql(&self, generations: &[(String, String, String)], interiors: &[(i64, i64)], split: &ProjectSplit) -> String {
-        let generations = format!(
-            " AND ({})",
-            generations
-                .iter()
-                // A generation id hashes the project, so a cross-project rewrite
-                // names one per (project, date).
-                .map(|(project, date, generation)| {
-                    let prefix = if self.project_id.is_none() { format!("project_id = {} AND ", sql_literal(project)) } else { String::new() };
-                    format!("({prefix}date = {} AND rollup_generation = {})", sql_literal(date), sql_literal(generation))
-                })
-                .join(" OR ")
-        );
+    pub fn sql(&self, generations: &[GenerationRange], interiors: &[(i64, i64)], split: &ProjectSplit) -> String {
+        let predicate = generations
+            .iter()
+            .map(|GenerationRange { project, date, generation, range }| {
+                let prefix = if self.project_id.is_none() { format!("project_id = {} AND ", sql_literal(project)) } else { String::new() };
+                // States use bucket starts, even when a source slice starts
+                // inside a bucket. `interiors` still excludes incomplete buckets.
+                let buckets = Self::range_sql(&(floor_grain(range.0, self.grain), range.1));
+                format!("({prefix}date = {} AND rollup_generation = {} AND {buckets})", sql_literal(date), sql_literal(generation))
+            })
+            .join(" OR ");
+        let generations = format!(" AND ({})", if generations.is_empty() { "FALSE" } else { &predicate });
         // An open-ended window's raw leg must run to the sentinel, not the
         // stand-in `hi`, or the rewrite answers without the newest rows.
         let end = if self.open_end { OPEN_END } else { self.hi };
@@ -2041,6 +2084,10 @@ mod tests {
             (vec![(50, 100), (0, 60)], vec![]),
             (vec![(0, 25)], vec![(25, 100)]),
             (vec![(25, 50), (75, 100)], vec![(0, 25), (50, 75)]),
+            (vec![(-30, -10)], vec![(0, 100)]),
+            (vec![(150, 200)], vec![(0, 100)]),
+            (vec![(-10, 25), (75, 120)], vec![(25, 75)]),
+            (vec![(150, 200), (0, 100)], vec![]),
         ] {
             assert_eq!(uncovered(0, 100, covered.clone()), want, "coverage {covered:?}");
         }
@@ -2502,7 +2549,7 @@ mod tests {
         let (keys, tiebreak, tombstone) = rollup_tier_dedup(base).expect("a generated tier carries timestamp/id/updated_at");
 
         let dedup = SliceDedup { keys: &keys, tiebreak: Some(tiebreak), tombstone };
-        let sql = slice_input_sql(base, Some(dedup), "__raw", "p", (0, 60_000_000), "", None);
+        let sql = slice_input_sql(base, SliceInput::Deduplicate(dedup), "__raw", "p", (0, 60_000_000), "", None);
         assert!(sql.contains("ROW_NUMBER() OVER (PARTITION BY"), "a merge-on-read input must be collapsed to one row per key, got: {sql}");
         assert!(sql.contains("__tf_rn = 1"), "the collapse must keep exactly one version per key, got: {sql}");
         assert!(
@@ -2511,8 +2558,46 @@ mod tests {
         );
 
         // No dedup means the aggregate above sums every version; kept as contrast.
-        let undeduped = slice_input_sql(base, None, "__raw", "p", (0, 60_000_000), "", None);
+        let undeduped = slice_input_sql(base, SliceInput::Unversioned, "__raw", "p", (0, 60_000_000), "", None);
         assert!(!undeduped.contains("__tf_rn"), "no dedup means a bare SELECT; this is the shape that over-counted");
+    }
+
+    #[test_case::test_case(true ; "winning tombstones remain filtered")]
+    #[test_case::test_case(false ; "legacy input without tombstone column")]
+    #[tokio::test]
+    async fn certified_slice_input_filters_tombstones_without_winner_selection(has_tombstone: bool) -> anyhow::Result<()> {
+        let schema = crate::schema::get_schema(SOURCE).expect("source schema");
+        let ctx = datafusion::prelude::SessionContext::new();
+        let deleted = if has_tombstone { ", deleted" } else { "" };
+        let rows = ctx
+            .sql(&format!(
+                "SELECT project_id, id, to_timestamp_micros(ts) AS timestamp{deleted} FROM \
+             (VALUES ('p', 'live', 1, false), ('p', 'null', 2, NULL), ('p', 'gone', 3, true), \
+             ('q', 'foreign', 4, false), ('p', 'end', 60000000, false), ('p', 'before', -1, false), \
+             ('p', 'shard', 4, false)) AS rows(project_id, id, ts, deleted)"
+            ))
+            .await?
+            .collect()
+            .await?;
+        let present = rows[0].schema().fields().iter().map(|field| field.name().clone()).collect();
+        ctx.register_table("__raw", std::sync::Arc::new(datafusion::datasource::MemTable::try_new(rows[0].schema(), vec![rows])?))?;
+        let sql = slice_input_sql(
+            schema,
+            SliceInput::Certified { tombstone: schema.tombstone_column.as_deref() },
+            "__raw",
+            "p",
+            (0, 60_000_000),
+            " AND id <> 'shard'",
+            Some(&present),
+        );
+        assert!(!sql.contains("ROW_NUMBER"), "certified input must not repeat winner selection");
+        let result = ctx.sql(&format!("SELECT id FROM ({sql}) ORDER BY id")).await?.collect().await?;
+        let ids = result
+            .iter()
+            .flat_map(|batch| (0..batch.num_rows()).map(|row| arrow::util::display::array_value_to_string(batch.column(0), row)))
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(ids, if has_tombstone { vec!["live", "null"] } else { vec!["gone", "live", "null"] });
+        Ok(())
     }
 
     /// A measure the SPEC declares but the physical table lacks must project
@@ -2527,7 +2612,7 @@ mod tests {
         let present: std::collections::HashSet<String> = base.fields.iter().map(|field| field.name.clone()).filter(|name| name != "duration_digest").collect();
         assert!(base.fields.iter().any(|field| field.name == "duration_digest"), "precondition: the spec declares it");
 
-        let sql = slice_input_sql(base, Some(dedup()), "__raw", "p", (0, 60_000_000), "", Some(&present));
+        let sql = slice_input_sql(base, SliceInput::Deduplicate(dedup()), "__raw", "p", (0, 60_000_000), "", Some(&present));
         assert!(sql.contains("NULL AS \"duration_digest\""), "the absent measure must be projected NULL, got: {sql}");
         assert!(sql.contains("\"server_duration_digest\", ") || sql.contains(", \"server_duration_digest\""), "present columns must still be read, got: {sql}");
         assert!(!sql.contains("NULL AS \"server_duration_digest\""), "a column the table HAS must not be nulled, got: {sql}");
@@ -2536,13 +2621,13 @@ mod tests {
 
         // Same for the undeduped path — `SELECT *` returns only physical columns,
         // so it cannot stand in once anything is missing.
-        let undeduped = slice_input_sql(base, None, "__raw", "p", (0, 60_000_000), "", Some(&present));
+        let undeduped = slice_input_sql(base, SliceInput::Unversioned, "__raw", "p", (0, 60_000_000), "", Some(&present));
         assert!(undeduped.contains("NULL AS \"duration_digest\""), "the bare-select path must project too, got: {undeduped}");
 
         // And when nothing is missing, the shape is unchanged.
         let all: std::collections::HashSet<String> = base.fields.iter().map(|field| field.name.clone()).collect();
-        assert!(!slice_input_sql(base, None, "__raw", "p", (0, 60_000_000), "", Some(&all)).contains("NULL AS"));
-        assert!(!slice_input_sql(base, Some(dedup()), "__raw", "p", (0, 60_000_000), "", Some(&all)).contains("NULL AS"));
+        assert!(!slice_input_sql(base, SliceInput::Unversioned, "__raw", "p", (0, 60_000_000), "", Some(&all)).contains("NULL AS"));
+        assert!(!slice_input_sql(base, SliceInput::Deduplicate(dedup()), "__raw", "p", (0, 60_000_000), "", Some(&all)).contains("NULL AS"));
     }
 
     #[test]
@@ -2706,7 +2791,42 @@ mod tests {
 
     /// The rewrite when the rollup owns the whole window — the single-leg shape.
     fn generated_sql(route: &RoutedRollup) -> String {
-        route.sql(&[("project".into(), "1970-01-01".into(), "generation".into())], &[(route.lo, route.hi)], &ProjectSplit::default())
+        route.sql(&[generation_range("project", "generation", (route.lo, route.hi))], &[(route.lo, route.hi)], &ProjectSplit::default())
+    }
+
+    fn generation_range(project: &str, generation: &str, range: (i64, i64)) -> GenerationRange {
+        GenerationRange { project: project.into(), date: "1970-01-01".into(), generation: generation.into(), range }
+    }
+
+    #[test]
+    fn generation_ranges_merge_adjacency_but_preserve_holes_and_identities() {
+        let ranges = [
+            ("p", "g", (2, 3)),
+            ("p", "g", (0, 1)),
+            ("p", "g", (1, 2)),
+            ("p", "g", (0, 3)),
+            ("p", "g", (0, 3)),
+            ("p", "g", (4, 5)),
+            ("q", "g", (0, 5)),
+            ("p", "h", (0, 5)),
+        ];
+        let mut input: Vec<_> = ranges.into_iter().map(|(project, generation, range)| generation_range(project, generation, range)).collect();
+        let mut other_date = generation_range("p", "g", (0, 5));
+        other_date.date = "1970-01-02".into();
+        input.push(other_date);
+        let allocation = (input.as_ptr(), input.capacity());
+        let merged = merge_generation_ranges(input);
+        assert_eq!((merged.as_ptr(), merged.capacity()), allocation, "reuse the input allocation");
+        assert_eq!(
+            merged.iter().map(|scope| (scope.project.as_str(), scope.date.as_str(), scope.generation.as_str(), scope.range)).collect::<Vec<_>>(),
+            vec![
+                ("p", "1970-01-01", "g", (0, 3)),
+                ("p", "1970-01-01", "g", (4, 5)),
+                ("p", "1970-01-01", "h", (0, 5)),
+                ("p", "1970-01-02", "g", (0, 5)),
+                ("q", "1970-01-01", "g", (0, 5)),
+            ]
+        );
     }
 
     /// Route `sql` — which must route — and return that single-leg rewrite.
@@ -2728,7 +2848,7 @@ mod tests {
     /// a live tail are unioned in.
     fn hybrid_sql(route: &RoutedRollup, horizon: i64) -> String {
         let interior = interior(route.lo, route.hi, route.grain, horizon).expect("a routable interior");
-        route.sql(&[("project".into(), "1970-01-01".into(), "generation".into())], &[interior], &ProjectSplit::default())
+        route.sql(&[generation_range("project", "generation", interior)], &[interior], &ProjectSplit::default())
     }
 
     /// An unfiltered percentile must read the unfiltered digest, never the
@@ -3118,6 +3238,49 @@ mod tests {
         assert!(matches!(route, Err(_) | Ok(None)), "must not route, got {route:?} for: {sql}");
     }
 
+    // Isolate requirements from Monoscope LogQueries.fetchSessions (8f1aaa2fe).
+    // These are routing probes, not a full-client-query or consumer-frequency test.
+    #[test_case::test_case("attributes___session___id", "COUNT(*)"
+        => Some("otel_logs_and_spans_rollup_sessions_1h_v1".to_owned()); "declared session count routes")]
+    #[test_case::test_case(
+        "COALESCE(NULLIF(attributes___session___id, ''), NULLIF(attributes___user___id, ''), NULLIF(attributes___user___email, ''))", "COUNT(*)"
+        => None; "fallback session identity is not stored")]
+    #[test_case::test_case("attributes___session___id", "MAX(COALESCE(end_time, timestamp))"
+        => None; "session end expression is not stored")]
+    #[test_case::test_case("attributes___session___id",
+        "(ARRAY_AGG(attributes___url___path ORDER BY timestamp) FILTER (WHERE attributes___url___path IS NOT NULL AND attributes___url___path <> ''))[1]"
+        => None; "ordered landing context cannot use current states")]
+    #[test_case::test_case("attributes___session___id", "distinct_count(approx_count_distinct(context___trace_id))"
+        => None; "session trace sketch is not stored")]
+    #[test_case::test_case("attributes___session___id",
+        "MAX(COALESCE(NULLIF(attributes___user___full_name, ''), NULLIF(attributes___user___name, '')))"
+        => None; "user name fallback is not stored")]
+    #[tokio::test]
+    async fn current_session_requirements_have_explicit_routing_eligibility(group: &str, aggregate: &str) -> Option<String> {
+        route_alone(&format!(
+            "SELECT {group}, {aggregate} FROM {SOURCE} WHERE project_id = 'project' \
+             AND timestamp >= to_timestamp_micros(0) AND timestamp < to_timestamp_micros(86400000000) GROUP BY 1"
+        ))
+        .await
+        .ok()
+        .flatten()
+        .map(|route| route.target)
+    }
+
+    #[tokio::test]
+    async fn current_full_session_list_plans_but_has_no_rollup_route() -> anyhow::Result<()> {
+        let db = Arc::new(crate::database::Database::with_config(crate::support::test_helpers::TestConfigBuilder::new("session-list-routing").build()).await?);
+        db.cancel_maintenance();
+        let mut ctx = Arc::clone(&db).create_session_context_for(true);
+        db.setup_session_context(&mut ctx)?;
+        let state = ctx.state();
+        let plan = optimized(&state, include_str!("../tests/fixtures/session_list_rollup.sql")).await;
+        assert!(outermost_aggregate(&plan).is_some(), "the client fixture must exercise aggregate matching");
+        let routes = match_aggregates(&plan, &state).await.expect("diagnose the nested client query");
+        assert!(routes.is_empty(), "the current session-list query must use raw fallback: {routes:?}");
+        Ok(())
+    }
+
     #[tokio::test]
     async fn matcher_rewrites_a_certifiable_count_aggregate() {
         let state = session().await;
@@ -3128,6 +3291,49 @@ mod tests {
         assert!(route.target.contains("_1m_"), "a minute-bucketed count must route to a 1m tier, got {}", route.target);
         assert_eq!(route.project_id.as_deref(), Some("project"));
         assert!(generated_sql(&route).contains("COALESCE(SUM(request_count), 0)"));
+    }
+
+    #[test_case::test_case(false, 2 ; "full rollup")]
+    #[test_case::test_case(true, 2 ; "raw fringe")]
+    #[test_case::test_case(false, 0 ; "empty replacement")]
+    #[test_case::test_case(true, 0 ; "empty replacement with raw fringe")]
+    #[tokio::test]
+    async fn a_generation_cannot_authorize_rows_outside_its_covered_range(hybrid: bool, replacement: i64) -> anyhow::Result<()> {
+        use datafusion::{arrow::array::AsArray, prelude::SessionContext};
+
+        let minute = 60_000_000;
+        let state = session().await;
+        let hi = if hybrid { 3 * minute } else { 2 * minute };
+        let route = route_for(
+            &state,
+            &format!(
+                "SELECT COUNT(*) FROM {SOURCE} WHERE project_id = 'project' AND timestamp >= to_timestamp_micros(0) AND timestamp < to_timestamp_micros({hi})"
+            ),
+        )
+        .await
+        .expect("match")
+        .expect("route");
+        let ctx = SessionContext::new_with_state(state);
+        let rows = ctx.sql(&format!(
+            "SELECT 'project' AS project_id, '1970-01-01' AS date, to_timestamp_micros(ts) AS timestamp, generation AS rollup_generation, n AS request_count \
+             FROM (VALUES (0, 'old', 1::BIGINT), ({minute}, 'old', 100::BIGINT), ({minute}, 'new', {replacement}::BIGINT)) AS states(ts, generation, n) WHERE n > 0"
+        )).await?.collect().await?;
+        ctx.deregister_table(&route.target)?;
+        ctx.register_table(&route.target, std::sync::Arc::new(datafusion::datasource::MemTable::try_new(rows[0].schema(), vec![rows])?))?;
+        // Only the first minute still belongs to old. Its second-minute output
+        // remains physically present but cannot join the new generation there.
+        let generations: Vec<_> = std::iter::once(generation_range("project", "old", (0, minute)))
+            .chain((replacement != 0).then(|| generation_range("project", "new", (minute, 2 * minute))))
+            .collect();
+        let sql = route.sql(&generations, &[(0, 2 * minute)], &ProjectSplit::default());
+        assert_eq!(sql.contains("UNION ALL"), hybrid, "exercise both physical query shapes");
+        let result = ctx.sql(&sql).await?.collect().await?;
+        assert_eq!(
+            result[0].column(0).as_primitive::<datafusion::arrow::datatypes::Int64Type>().value(0),
+            1 + replacement,
+            "obsolete output cannot cross a generation's range"
+        );
+        Ok(())
     }
 
     /// A cross-project overview GROUPS BY project_id instead of filtering on it.
@@ -3177,7 +3383,7 @@ mod tests {
         let sql = format!("SELECT project_id, COUNT(*) FROM {SOURCE} WHERE {WINDOW} GROUP BY 1");
         let route = route_for(&state, &sql).await.expect("match").expect("route");
         let split = ProjectSplit { covered: Some(vec!["good".into(), "fine".into()]), raw_only: vec!["lagging".into()] };
-        let generated = route.sql(&[("good".into(), "1970-01-01".into(), "generation".into())], &[(route.lo, route.hi)], &split);
+        let generated = route.sql(&[generation_range("good", "generation", (route.lo, route.hi))], &[(route.lo, route.hi)], &split);
 
         // The rollup leg answers only for the projects that proved coverage...
         assert!(
@@ -3197,7 +3403,7 @@ mod tests {
         let state = session().await;
         let sql = format!("SELECT project_id, COUNT(*) FROM {SOURCE} WHERE {WINDOW} GROUP BY 1");
         let route = route_for(&state, &sql).await.expect("match").expect("route");
-        let generations = [("p".to_string(), "1970-01-01".to_string(), "generation".to_string())];
+        let generations = [generation_range("p", "generation", (route.lo, route.hi))];
         let unsplit = route.sql(&generations, &[(route.lo, route.hi)], &ProjectSplit::default());
         let all_covered = route.sql(&generations, &[(route.lo, route.hi)], &ProjectSplit { covered: None, raw_only: Vec::new() });
         assert_eq!(unsplit, all_covered);
