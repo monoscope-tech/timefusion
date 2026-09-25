@@ -13,7 +13,7 @@
 edition = "2024"
 rust-version = "1.89"
 name = "pgwire"
-version = "0.40.3"
+version = "0.41.0"
 authors = ["Ning Sun <sunng@pm.me>"]
 build = false
 autolib = false
@@ -22,7 +22,6 @@ autoexamples = false
 autotests = false
 autobenches = false
 description = "Postgresql wire protocol implemented as a library"
-homepage = "https://github.com/sunng87/pgwire"
 documentation = "https://docs.rs/crate/pgwire/"
 readme = "README.md"
 keywords = [
@@ -203,7 +202,7 @@ version = "1.7"
 optional = true
 
 [dependencies.base64]
-version = "0.22"
+version = "0.23"
 optional = true
 
 [dependencies.bytes]
@@ -226,7 +225,7 @@ version = "0.4"
 optional = true
 
 [dependencies.jsonwebtoken]
-version = "10"
+version = "11"
 features = ["aws_lc_rs"]
 optional = true
 
@@ -244,7 +243,7 @@ version = "2.0"
 optional = true
 
 [dependencies.pg_interval]
-version = "0.5"
+version = "0.6"
 optional = true
 
 [dependencies.pin-project]
@@ -346,12 +345,12 @@ optional = true
 version = "0.10"
 
 [dev-dependencies.gluesql]
-version = "0.19"
+version = "0.20"
 features = ["gluesql_memory_storage"]
 default-features = false
 
 [dev-dependencies.jsonwebtoken]
-version = "10"
+version = "11"
 features = ["aws_lc_rs"]
 
 [dev-dependencies.reqwest]

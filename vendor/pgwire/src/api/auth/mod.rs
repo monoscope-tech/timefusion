@@ -6,11 +6,14 @@ use async_trait::async_trait;
 use futures::sink::{Sink, SinkExt};
 
 use super::{
-    ClientInfo, ConnectionGuard, ConnectionHandle, METADATA_APPLICATION_NAME, METADATA_CLIENT_ENCODING, METADATA_DATABASE, METADATA_USER, PgWireConnectionState,
+    ClientInfo, ConnectionGuard, ConnectionHandle, METADATA_APPLICATION_NAME,
+    METADATA_CLIENT_ENCODING, METADATA_DATABASE, METADATA_USER, PgWireConnectionState,
 };
 use crate::error::{PgWireError, PgWireResult};
 use crate::messages::response::{ReadyForQuery, TransactionStatus};
-use crate::messages::startup::{Authentication, BackendKeyData, NegotiateProtocolVersion, ParameterStatus, Startup};
+use crate::messages::startup::{
+    Authentication, BackendKeyData, NegotiateProtocolVersion, ParameterStatus, Startup,
+};
 use crate::messages::{PgWireBackendMessage, PgWireFrontendMessage, ProtocolVersion};
 use crate::types::format::FormatOptions;
 
@@ -18,7 +21,11 @@ use crate::types::format::FormatOptions;
 #[async_trait]
 pub trait StartupHandler: Send + Sync {
     /// A generic frontend message callback during startup phase.
-    async fn on_startup<C>(&self, client: &mut C, message: PgWireFrontendMessage) -> PgWireResult<()>
+    async fn on_startup<C>(
+        &self,
+        client: &mut C,
+        message: PgWireFrontendMessage,
+    ) -> PgWireResult<()>
     where
         C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
         C::Error: Debug,
@@ -107,7 +114,11 @@ impl Default for DefaultServerParameterProvider {
 }
 
 fn bool_to_string(v: bool) -> String {
-    if v { "on".to_string() } else { "off".to_string() }
+    if v {
+        "on".to_string()
+    } else {
+        "off".to_string()
+    }
 }
 
 impl ServerParameterProvider for DefaultServerParameterProvider {
@@ -118,26 +129,56 @@ impl ServerParameterProvider for DefaultServerParameterProvider {
         let mut params = HashMap::with_capacity(16);
         params.insert("server_version".to_owned(), self.server_version.clone());
         params.insert("server_encoding".to_owned(), self.server_encoding.clone());
-        params.insert("integer_datetimes".to_owned(), bool_to_string(self.integer_datetimes));
-        params.insert("in_hot_standby".to_owned(), bool_to_string(self.in_hot_standby));
+        params.insert(
+            "integer_datetimes".to_owned(),
+            bool_to_string(self.integer_datetimes),
+        );
+        params.insert(
+            "in_hot_standby".to_owned(),
+            bool_to_string(self.in_hot_standby),
+        );
         params.insert("search_path".to_owned(), self.search_path.clone());
         params.insert("is_superuser".to_owned(), bool_to_string(self.is_superuser));
-        params.insert("default_transaction_read_only".to_owned(), bool_to_string(self.default_transaction_read_only));
+        params.insert(
+            "default_transaction_read_only".to_owned(),
+            bool_to_string(self.default_transaction_read_only),
+        );
         #[cfg(any(feature = "_aws-lc-rs", feature = "_ring"))]
-        params.insert("scram_iterations".to_owned(), self.scram_iterations.to_string());
+        params.insert(
+            "scram_iterations".to_owned(),
+            self.scram_iterations.to_string(),
+        );
 
         params.insert("TimeZone".to_owned(), self.time_zone.clone());
         params.insert("DateStyle".to_owned(), self.date_style.clone());
         params.insert("IntervalStyle".to_owned(), self.interval_style.clone());
-        params.insert("standard_conforming_strings".to_owned(), bool_to_string(self.standard_conforming_strings));
+        params.insert(
+            "standard_conforming_strings".to_owned(),
+            bool_to_string(self.standard_conforming_strings),
+        );
 
-        if let Some(client_encoding) = self.client_encoding.as_ref().or_else(|| client.metadata().get(METADATA_CLIENT_ENCODING)) {
+        if let Some(client_encoding) = self
+            .client_encoding
+            .as_ref()
+            .or_else(|| client.metadata().get(METADATA_CLIENT_ENCODING))
+        {
             params.insert(METADATA_CLIENT_ENCODING.to_owned(), client_encoding.clone());
         }
-        if let Some(application_name) = self.application_name.as_ref().or_else(|| client.metadata().get(METADATA_APPLICATION_NAME)) {
-            params.insert(METADATA_APPLICATION_NAME.to_owned(), application_name.clone());
+        if let Some(application_name) = self
+            .application_name
+            .as_ref()
+            .or_else(|| client.metadata().get(METADATA_APPLICATION_NAME))
+        {
+            params.insert(
+                METADATA_APPLICATION_NAME.to_owned(),
+                application_name.clone(),
+            );
         }
-        if let Some(user) = self.session_authorization.as_ref().or_else(|| client.metadata().get(METADATA_USER)) {
+        if let Some(user) = self
+            .session_authorization
+            .as_ref()
+            .or_else(|| client.metadata().get(METADATA_USER))
+        {
             params.insert("session_authorization".to_owned(), user.clone());
         }
 
@@ -223,10 +264,20 @@ where
     C::Error: Debug,
     PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
 {
-    let unsupported_options = startup_message.parameters.keys().filter(|name| name.starts_with("_pq_.")).cloned().collect::<Vec<_>>();
-    if let Some(protocol_version) = ProtocolVersion::from_version_number(startup_message.protocol_number_major, startup_message.protocol_number_minor) {
+    // libpq 18 requires every unsupported `_pq_.*` option to be reported, even when the version itself matches.
+    let unsupported_options =
+        startup_message.parameters.keys().filter(|name| name.starts_with("_pq_.")).cloned().collect::<Vec<_>>();
+    if let Some(protocol_version) = ProtocolVersion::from_version_number(
+        startup_message.protocol_number_major,
+        startup_message.protocol_number_minor,
+    ) {
         if !unsupported_options.is_empty() {
-            client.send(PgWireBackendMessage::NegotiateProtocolVersion(NegotiateProtocolVersion::new(protocol_version.into(), unsupported_options))).await?;
+            client
+                .send(PgWireBackendMessage::NegotiateProtocolVersion(NegotiateProtocolVersion::new(
+                    protocol_version.into(),
+                    unsupported_options,
+                )))
+                .await?;
         }
         client.set_protocol_version(protocol_version);
         Ok(())
@@ -235,12 +286,17 @@ where
         let (newest_major_version, _newest_minor_version) = newest_server_version.version_number();
         if newest_major_version == startup_message.protocol_number_major {
             client
-                .send(PgWireBackendMessage::NegotiateProtocolVersion(NegotiateProtocolVersion::new(newest_server_version.into(), unsupported_options)))
+                .send(PgWireBackendMessage::NegotiateProtocolVersion(
+                    NegotiateProtocolVersion::new(newest_server_version.into(), unsupported_options),
+                ))
                 .await?;
             client.set_protocol_version(newest_server_version);
             Ok(())
         } else {
-            Err(PgWireError::UnsupportedProtocolVersion(startup_message.protocol_number_major, startup_message.protocol_number_minor))
+            Err(PgWireError::UnsupportedProtocolVersion(
+                startup_message.protocol_number_major,
+                startup_message.protocol_number_minor,
+            ))
         }
     }
 }
@@ -250,7 +306,12 @@ pub fn save_startup_parameters_to_metadata<C>(client: &mut C, startup_message: &
 where
     C: ClientInfo,
 {
-    client.metadata_mut().extend(startup_message.parameters.iter().map(|(k, v)| (k.to_owned(), v.to_owned())));
+    client.metadata_mut().extend(
+        startup_message
+            .parameters
+            .iter()
+            .map(|(k, v)| (k.to_owned(), v.to_owned())),
+    );
 }
 
 pub(crate) fn register_connection<C>(client: &C, manager: &Arc<super::ConnectionManager>)
@@ -259,33 +320,51 @@ where
 {
     let (pid, secret_key) = client.pid_and_secret_key();
     let (handle, guard) = manager.register(pid, secret_key);
-    client.session_extensions().insert::<Arc<ConnectionHandle>>(handle);
+    client
+        .session_extensions()
+        .insert::<Arc<ConnectionHandle>>(handle);
     client.session_extensions().insert::<ConnectionGuard>(guard);
 }
 
-pub(crate) async fn finish_authentication0<C, P>(client: &mut C, server_parameter_provider: &P) -> PgWireResult<()>
+pub(crate) async fn finish_authentication0<C, P>(
+    client: &mut C,
+    server_parameter_provider: &P,
+) -> PgWireResult<()>
 where
     C: ClientInfo + Sink<PgWireBackendMessage> + Unpin,
     C::Error: Debug,
     PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     P: ServerParameterProvider,
 {
-    client.feed(PgWireBackendMessage::Authentication(Authentication::Ok)).await?;
+    client
+        .feed(PgWireBackendMessage::Authentication(Authentication::Ok))
+        .await?;
 
     if let Some(parameters) = server_parameter_provider.server_parameters(client) {
         for (k, v) in parameters {
-            client.feed(PgWireBackendMessage::ParameterStatus(ParameterStatus::new(k, v))).await?;
+            client
+                .feed(PgWireBackendMessage::ParameterStatus(ParameterStatus::new(
+                    k, v,
+                )))
+                .await?;
         }
     }
 
     let (pid, secret_key) = client.pid_and_secret_key();
-    client.feed(PgWireBackendMessage::BackendKeyData(BackendKeyData::new(pid, secret_key))).await?;
+    client
+        .feed(PgWireBackendMessage::BackendKeyData(BackendKeyData::new(
+            pid, secret_key,
+        )))
+        .await?;
 
     Ok(())
 }
 
 /// Completes authentication by sending `AuthenticationOk`, parameter status, backend key data, and `ReadyForQuery`.
-pub async fn finish_authentication<C, P>(client: &mut C, server_parameter_provider: &P) -> PgWireResult<()>
+pub async fn finish_authentication<C, P>(
+    client: &mut C,
+    server_parameter_provider: &P,
+) -> PgWireResult<()>
 where
     C: ClientInfo + Sink<PgWireBackendMessage> + Unpin,
     C::Error: Debug,
@@ -294,7 +373,11 @@ where
 {
     finish_authentication0(client, server_parameter_provider).await?;
 
-    client.send(PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(TransactionStatus::Idle))).await?;
+    client
+        .send(PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(
+            TransactionStatus::Idle,
+        )))
+        .await?;
 
     client.set_state(PgWireConnectionState::ReadyForQuery);
     Ok(())

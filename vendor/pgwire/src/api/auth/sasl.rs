@@ -6,7 +6,10 @@ use futures::{Sink, SinkExt};
 use tokio::sync::Mutex;
 
 use crate::api::auth::sasl::scram::ScramServerAuthWaitingForClientFinal;
-use crate::api::{ClientInfo, ConnectionManager, PgWireConnectionState, PidSecretKeyGenerator, RandomPidSecretKeyGenerator};
+use crate::api::{
+    ClientInfo, ConnectionManager, PgWireConnectionState, PidSecretKeyGenerator,
+    RandomPidSecretKeyGenerator,
+};
 use crate::error::{PgWireError, PgWireResult};
 use crate::messages::startup::{Authentication, PasswordMessageFamily};
 use crate::messages::{PgWireBackendMessage, PgWireFrontendMessage};
@@ -41,7 +44,10 @@ pub enum SASLState {
 
 impl SASLState {
     fn is_scram(&self) -> bool {
-        matches!(self, SASLState::ScramClientFirstReceived | SASLState::ScramServerFirstSent(_))
+        matches!(
+            self,
+            SASLState::ScramClientFirstReceived | SASLState::ScramServerFirstSent(_)
+        )
     }
 
     fn is_oauth(&self) -> bool {
@@ -88,7 +94,10 @@ impl<P> SASLAuthStartupHandler<P> {
     }
 
     /// Sets a custom PID/secret key generator.
-    pub fn with_pid_secret_key_generator(mut self, generator: Arc<dyn PidSecretKeyGenerator>) -> Self {
+    pub fn with_pid_secret_key_generator(
+        mut self,
+        generator: Arc<dyn PidSecretKeyGenerator>,
+    ) -> Self {
         self.pid_secret_key_generator = generator;
         self
     }
@@ -120,7 +129,11 @@ impl<P> SASLAuthStartupHandler<P> {
 
 #[async_trait]
 impl<P: ServerParameterProvider> StartupHandler for SASLAuthStartupHandler<P> {
-    async fn on_startup<C>(&self, client: &mut C, message: PgWireFrontendMessage) -> PgWireResult<()>
+    async fn on_startup<C>(
+        &self,
+        client: &mut C,
+        message: PgWireFrontendMessage,
+    ) -> PgWireResult<()>
     where
         C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
         C::Error: Debug,
@@ -132,7 +145,11 @@ impl<P: ServerParameterProvider> StartupHandler for SASLAuthStartupHandler<P> {
                 super::save_startup_parameters_to_metadata(client, startup);
                 client.set_state(PgWireConnectionState::AuthenticationInProgress);
                 let supported_mechanisms = self.supported_mechanisms();
-                client.send(PgWireBackendMessage::Authentication(Authentication::SASL(supported_mechanisms))).await?;
+                client
+                    .send(PgWireBackendMessage::Authentication(Authentication::SASL(
+                        supported_mechanisms,
+                    )))
+                    .await?;
             }
             PgWireFrontendMessage::PasswordMessageFamily(mut msg) => {
                 let mut state = self.state.lock().await;
@@ -141,12 +158,16 @@ impl<P: ServerParameterProvider> StartupHandler for SASLAuthStartupHandler<P> {
                     let sasl_initial_response = msg.into_sasl_initial_response()?;
                     let selected_mechanism = sasl_initial_response.auth_method.as_str();
 
-                    *state = if [SCRAM_SHA_256_METHOD, SCRAM_SHA_256_PLUS_METHOD].contains(&selected_mechanism) {
+                    *state = if [SCRAM_SHA_256_METHOD, SCRAM_SHA_256_PLUS_METHOD]
+                        .contains(&selected_mechanism)
+                    {
                         SASLState::ScramClientFirstReceived
                     } else if OAUTHBEARER_METHOD == selected_mechanism {
                         SASLState::OauthStateInit
                     } else {
-                        return Err(PgWireError::UnsupportedSASLAuthMethod(selected_mechanism.to_string()));
+                        return Err(PgWireError::UnsupportedSASLAuthMethod(
+                            selected_mechanism.to_string(),
+                        ));
                     };
 
                     PasswordMessageFamily::SASLInitialResponse(sasl_initial_response)
@@ -156,15 +177,23 @@ impl<P: ServerParameterProvider> StartupHandler for SASLAuthStartupHandler<P> {
                 };
 
                 if state.is_scram() {
-                    let scram = self.scram.as_ref().ok_or_else(|| PgWireError::UnsupportedSASLAuthMethod("SCRAM".to_string()))?;
+                    let scram = self.scram.as_ref().ok_or_else(|| {
+                        PgWireError::UnsupportedSASLAuthMethod("SCRAM".to_string())
+                    })?;
                     let (res, new_state) = scram.process_scram_message(client, msg, &state).await?;
-                    client.send(PgWireBackendMessage::Authentication(res)).await?;
+                    client
+                        .send(PgWireBackendMessage::Authentication(res))
+                        .await?;
                     *state = new_state;
                 } else if state.is_oauth() {
-                    let oauth = self.oauth.as_ref().ok_or_else(|| PgWireError::UnsupportedSASLAuthMethod("OAUTHBEARER".to_string()))?;
+                    let oauth = self.oauth.as_ref().ok_or_else(|| {
+                        PgWireError::UnsupportedSASLAuthMethod("OAUTHBEARER".to_string())
+                    })?;
                     let (res, new_state) = oauth.process_oauth_message(client, msg, &state).await?;
                     if let Some(res) = res {
-                        client.send(PgWireBackendMessage::Authentication(res)).await?;
+                        client
+                            .send(PgWireBackendMessage::Authentication(res))
+                            .await?;
                     }
                     *state = new_state;
                 } else {

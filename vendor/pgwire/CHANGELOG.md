@@ -6,6 +6,90 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic
 Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.41.0] - 2026-09-04
+
+### Added
+
+- Client API: transaction status tracking. `ClientInfo::transaction_status`
+  reports the status carried by the last `ReadyForQuery` message (idle, in
+  transaction, or in a failed transaction), updated automatically on every
+  code path: startup, simple and extended query, and the error-recovery
+  drains.
+- Client API: protocol version negotiation. `Config::protocol_version`
+  selects the version to advertise in the startup message, defaulting to 3.0.
+  Following libpq, a test version `3.9999` is available to request the newest
+  minor version a server supports: the client handles the server's
+  `NegotiateProtocolVersion` response (both the full 32-bit version form used
+  by PostgreSQL 18+ and the minor-only form used by older servers) and adopts
+  the negotiated version for the rest of the connection.
+
+### Changed
+
+- Breaking: `QueryParser::parse_sql` now returns
+  `PgWireResult<Option<Self::Statement>>`, and `StoredStatement::parse`
+  correspondingly returns `Option<StoredStatement<S>>`. `None` denotes an
+  empty query: it is stored as an empty statement and executes to
+  `EmptyQueryResponse`. This allows a query parser to report its own notion
+  of empty query; syntactically empty queries (semicolons and whitespace
+  only) are still never passed to the parser.
+- Breaking: `PortalStore` now represents empty statements and portals.
+  `get_statement` returns `Option<Entry<StoredStatement<S>>>` and
+  `get_portal` returns `Option<Entry<Portal<S>>>`: the new `Entry::Empty`
+  variant marks a name under which an empty prepared statement or portal is
+  stored, alongside the new `put_empty_statement`/`put_empty_portal`
+  methods. Like every `put_*`, storing an empty entry replaces whatever was
+  previously stored under that name, and `rm_*`/`clear_portals` remove
+  empty entries along with regular ones. `StoredStatement` and `Portal`
+  themselves are unchanged — the impact is limited to `PortalStore`
+  implementors and code calling `get_statement`/`get_portal` directly
+  (`Entry::value` helps with the migration).
+- Updated pg_interval to 0.6
+
+### Fixed
+
+- Extended query protocol: empty queries (a query string without any
+  statement, such as `""` or `";;"`) are now handled like PostgreSQL instead
+  of being dispatched to the query parser: `Parse` succeeds without calling
+  `QueryParser` and stores an empty statement, `Describe` answers
+  `ParameterDescription` (no parameters) + `NoData`, `Bind` succeeds
+  (rejecting bound parameters with `08P01`) and stores an empty portal, and
+  `Execute` returns `EmptyQueryResponse` without reaching `do_query`. An
+  empty `Parse` replaces any statement previously stored under the same
+  name, and `Close`/`Sync` drop empty statements and the unnamed empty
+  portal like real ones. Behavior verified message-for-message against
+  PostgreSQL 18.
+- Client API: backend messages are now decoded with the rules of the protocol
+  version the client actually advertised, instead of always 3.2. Previously a
+  4-byte protocol 3.0 cancel key was decoded as `SecretKey::Bytes` instead of
+  `SecretKey::I32`.
+
+## [0.40.7] - 2026-08-12
+
+### Fixed
+
+- Treat semicolons-only query strings (e.g. `;;`, `;;;`, `; ;`) as empty queries
+  in the simple query protocol, returning `EmptyQueryResponse` like PostgreSQL.
+  Previously only the empty string and a single `;` were recognized as empty.
+
+## [0.40.6] - 2026-08-09
+
+### Changed
+
+- Add strict check for count based decoding [#451]
+- Combine a few socket writes into batch [#452]
+
+## [0.40.5] - 2026-07-26
+
+### Fixed
+
+- Customisible type size and modifier for RowDescription [#449]
+
+## [0.40.4] - 2026-06-29
+
+### Fixed
+
+- Panic when retrieve mTLS client ceritificates [#446]
+
 ## [0.40.3] - 2026-06-18
 
 ### Changed
