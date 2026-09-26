@@ -2482,6 +2482,8 @@ async fn a_slice_covered_by_a_wider_file_settles_without_scanning(stale_generati
     let cfg = test_config_with("covered-preflight", |cfg| {
         cfg.maintenance.timefusion_rollup_backfill_days = 35;
         cfg.maintenance.timefusion_rollup_bounded_witness = bounded_witness;
+        // Packed repairs rebuild the inner slice in place instead of escalating.
+        cfg.maintenance.timefusion_rollup_packed_repairs = false;
     });
     let (db, project, day, tier) = published_base_day(cfg, "preflight").await?;
     let tier_ref = db.get_or_create_table(&project, &tier).await?;
