@@ -48,10 +48,11 @@ Status: ⬜ open · 🟡 in progress · ✅ done. Priority is the plan's executi
 | W6 | `multi_scan_source` shapes | analysis → build (lane 2) | Rollup misses | Classify the 192/h self-join/UNION declines (service-edges); decide: route per-leg, rewrite in monoscope, or leave raw; then implement the chosen matcher change with a case-table test | `src/rollup.rs` matcher (`source_and_filters`, `match_aggregates`) | — | agent (Claude) | ✅ |
 | W7 | Stage 1 build measurement harness | build (lane 2) | Stage 1 | For representative units via `timefusion run-unit`: physical plan, scan count, hash shards, dedup ops, decoded bytes, aggregate-state memory, CPU; publication economics (commits/actions/latency incl. failures) | `src/main.rs` `run-unit`, `benches/rollup_work.rs`, report under `docs/plans/` | W3 for unit choice | | ⬜ |
 | W8 | 1D dependency classification — design + fixtures | analysis → build (lane 2) | Stage 1D | Per-spec dependency map (dims, measures, filters, identity, ts, version, delete); mutation fixture table proving zero missed relevant invalidations; then the classifier | new test module; `apply_rollup_hours` call sites in `database/rollup.rs` | W2 (which mutations dominate) | | ⬜ |
-| W9 | Stage 3 publication batching — design | analysis | Stage 3 | Concrete design mapped to existing staged publication / journal group-commit; WAL-compat decision (does the payload change?); queue limits; test list | design doc only | — | agent (Claude) | 🟡 |
+| W9 | Stage 3 publication batching — design | analysis | Stage 3 | Concrete design mapped to existing staged publication / journal group-commit; WAL-compat decision (does the payload change?); queue limits; test list | design doc only | — | agent (Claude) | ✅ |
 | W10 | Capacity replay harness | build (lane 2) | Shared gates | `timefusion sim` replay of a prod journal at 1x/2x/4x rows and 1x/2x/4x projects; report backlog stability and work per accepted row | `src/maintenance_sim.rs`, `src/main.rs` | W2 | | ⬜ |
 | W11 | OpenTelemetry 0.32 upgrade | build (lane 2) | Housekeeping | Closes the `opentelemetry_sdk` advisory (unbounded baggage alloc) | `Cargo.toml`, `src/observability.rs` | — | Claude (timefusion-2e) | 🟡 |
 | W12 | `dcount(name)` measure decision | analysis | Rollup misses | Cost/benefit for a `name` HLL + 2-way server-scope count guard on `dashboard_1m_v3` (schema comment ~L501 declines it on purpose); owner decides | `schemas/otel_logs_and_spans.yaml` (proposal only) | W2 | | ⬜ |
+| W13 | Narrow the slice OCC gate (Stage 3 step 1) | build (lane 2) | Stage 3 | A non-overlapping sibling slice no longer makes a staged unit `slice_occ_stale`; a unit may retire narrower contained slices; target proof re-recorded under the commit lock; cause logging; tests 1, 3, 3b of the W9 design failing-first | `maintain.rs` `run_coordinator_rollup_selected` OCC check | W9 | | ⬜ |
 
 Later stages (2, 4, 5, 6, 1C, certified-clean activation, adaptive batches) stay **conditional** on W2/W7
 numbers, per the plan; do not start them without a measured residual cost.
@@ -96,3 +97,13 @@ name `sessions_1h`, all dashboard server-scope filters sharing the `name` column
 for RUM; (b) `service_name_hll` (dashboard tiers) is computed on every build but never served
 (`MEASURES_NOT_YET_SERVABLE`, `rollup.rs:1017`, pre-08-26 sketches empty) — audit stored sketches and unblock, or drop it.
 **Follow-ups (optional):** demote the sessions near-miss warn to debug; per-tier hit counters.
+
+### W9 result — 2026-09-26 — agent (Claude)
+**Design:** [`2026-09-26-stage3-publication-design.md`](2026-09-26-stage3-publication-design.md) — no WAL change.
+**Numbers (provisional; process 24–34 min old):** each rollup unit is one Delta commit + one journal fsync; ≈10.8k rollup
+commits/day, 2.1 actions/commit; publications are <1% of journal checkpoints. `rollup_shared_commits_total` is dead
+(its incrementer was deleted in `032d64bc`). `slice_occ_stale` discarded 17 of 78 publications in a 10-min window
+(243/405 since boot) — each throws away staged output and rescans (≤3% of base-rollup time, ≈0.6 workers).
+**Estimated batching saving:** 10 s linger → ≈6.1k commits/day, 60 s → ≈2.7k; ≤1 worker-hour/day of commit time.
+**Decision:** ship step 1 (W13: narrow the OCC gate) now; build the batched queue (steps 2–3) only when Stage 4 is
+approved or publication volume grows. Re-measure rates on a ≥1h process.
