@@ -40,9 +40,11 @@ tables + observability (W15) · ~22:30 OCC narrowing (W13), **packed repairs OFF
 Deploy image build 21–31 → 4–8 min (Blacksmith); CI E2E 15 → 7 min.
 
 **Open (priority order)**
-- [ ] Confirm rollup hits recover on today's windows (synthetic probe `scratchpad/probe.sh`; hits collapsed at the 12:10
-      packed-repairs deploy because remainders carry an overtaken row witness — packed now off). Sealed days already hit.
-- [ ] Heavy-query admission: every probe on project 87576849 failed after 30 s ("too many concurrent heavy queries").
+- [ ] **Today's windows still miss `stale_grew` after packed-off** (probe 22:56 UTC; sealed days hit). Cause: monoscope's
+      hashes-only UPDATEs append MoR version rows into recent hours (262k in 17 min), moving both the whole-partition and the
+      rows-below witness (bounded rescue 8 vs stale_too 164). Fix = W20: carry the witness across spec-irrelevant version
+      appends/retractions (W17 design, mirror of `carry_dedup_witness`) — with the other session.
+- [x] Heavy-query admission: small whale merges no longer take heavy slots (`187a2811`); probe shows no more 30 s rejections.
 - [ ] Packed remainders need a witness that survives the repair before packed repairs can be re-enabled.
 - [ ] W7 Stage 1 measurement harness; W17 Stage 1D shadow classifier; W12 `dcount(name)` measure (owner decision).
 - [ ] Owner decisions: remove `sessions_1h_v1` or spec a browser-scoped v2; `service_name_hll` unblock or drop.
