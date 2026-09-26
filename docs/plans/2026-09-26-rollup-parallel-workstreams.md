@@ -59,6 +59,7 @@ Status: ⬜ open · 🟡 in progress · ✅ done. Priority is the plan's executi
 | W17 | W8 design: dependency classification | analysis | Stage 1D | Per-spec dependency map + mutation fixture table + where the classifier hooks in | design doc | — | agent (Claude) | ✅ design |
 | W18 | W10 design: capacity replay | analysis | Shared gates | How to drive `timefusion sim` at 1x/2x/4x rows and projects; what it can/can't prove; code plan | design doc | — | agent (Claude) | ✅ design |
 | W19 | Export per-lane work as OTel counters | build (lane 2) | W16 gap | Lease ms by operation/outcome, processed bytes by operation, rollup publications / published input bytes / scan bytes by tier; no stats-key changes | `src/observability.rs`, `maintenance_coordinator.rs` lease drop, `maintain.rs` byte sites | W16 | Claude (timefusion-2e) | ✅ handed off `ws/w19-lane-counters` |
+| W20 | Heavy-query admission starves the largest project | analysis → build (lane 2) | Read path | Why every 87576849 dashboard query timed out waiting for a heavy slot; fix + holder attribution | `src/read/admission.rs` | — | Claude (timefusion-2e) | ✅ handed off `ws/admission-narrow-merge` |
 
 Later stages (2, 4, 5, 6, 1C, certified-clean activation, adaptive batches) stay **conditional** on W2/W7
 numbers, per the plan; do not start them without a measured residual cost.
@@ -215,4 +216,26 @@ keys unchanged:
 `experimental_metrics_custom_reader`, which adds no crates) goes red when one export is removed.
 **Branch:** `ws/w19-lane-counters` @ `4e89c823` on `cf05ac93`. **Integrator next:** batch it; after the deploy,
 compare the wasted-scan share per tier on a ≥1 h process.
+
+### W20 result — 2026-09-27 — Claude (timefusion-2e)
+**Question:** at 21:46 UTC every query on project 87576849 failed after 30 s with "too many concurrent heavy
+queries". The same shapes on other projects took 0.3–25 s.
+**Numbers (prod, image `6667af57`, read-only):**
+- Every whale dashboard shape plans `AdmissionExec class=ordered_mor_merge`, fan-in 26 (1 h/6 h) or 7 (24 h),
+  over a 5-column merge. Other projects' fan-in is 1, so they are never gated.
+- K = `query_pool / (64 MiB × partitions × 2)` = 24,576 / (64 × 24 × 2) = **8**. The queue wait is 30 s.
+- The gate is saturated in steady state: ~190 admissions per ~25 s against 8 slots, and timeouts went
+  176 → 192 while measuring. Only 18% of admissions are ordered merges; 82% are unbounded sorts.
+
+The slot holders cannot be named from existing logs. `record_statement_latency` runs when `do_query` returns,
+before rows stream, so `slow_statement` excludes execution time: a 5.1 s whale probe left no line.
+**Fix:** `ws/admission-narrow-merge` @ `5a4a7667`.
+- (A) A merge is gated only when fan-in × batch × estimated row bytes exceeds a 64 MiB sort reservation.
+  The whale count (~15 MB) is ungated. The full-width table at fan-in 7 and batch 4096 (~383 MB) stays gated.
+- (B) A permit held over 5 s logs `heavy_query_held` inside its own statement span, whether completed or cancelled.
+
+Guards: `a_narrow_whale_count_merge_is_not_heavy` (red on old code) and `a_full_width_log_explorer_merge_stays_heavy`.
+Lint is clean and 30/30 admission tests pass, including e2e.
+**Integrator next:** batch it. After the deploy, `EXPLAIN` of a whale count shows no `AdmissionExec`, and
+`heavy_query_queue_timeout` flattens on a ≥1 h process. `heavy_query_held` then attributes the unbounded-sort share.
 
