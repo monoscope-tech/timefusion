@@ -216,26 +216,27 @@ fn init_cli_tracing() {
 
 /// `timefusion sim <journal.json | data-dir | synth:whale> [--hours N]
 /// [--workers N] [--streams N] [--scale F] [--seed N] [--no-mint]
-/// [--floorless] [--guard-off] [--json]`
+/// [--floorless] [--guard-off] [--rows K] [--projects K] [--now UNIX_SECS] [--json]`
 ///
 /// Replay a maintenance journal through the real scheduler on virtual time
 /// (`timefusion::maintenance_sim`), to answer "does this policy keep up"
 /// without deploying.
 fn run_sim_cli() -> anyhow::Result<()> {
-    use timefusion::maintenance_sim::{SimConfig, load_sandboxed, run};
+    use timefusion::maintenance_sim::{ByteModel, SimConfig, load_sandboxed, run};
     // The sim is config-free by default; install the config only when a rank()
     // kill switch is explicitly set, so an A/B arm can exercise that ordering.
     if std::env::var_os("TIMEFUSION_DEDUP_CONTIGUITY_RANK").is_some() {
         timefusion::config::init_config().map_err(|e| anyhow::anyhow!("kill-switch env set but config failed to load: {e}"))?;
     }
     let mut it = Args::new();
-    let usage = "usage: timefusion sim <journal.json|data-dir|synth:whale> [--hours N] [--workers N] [--streams N] [--scale F] [--seed N] [--no-mint] [--mint] [--debris-slice-minutes N] [--floorless] [--guard-off] [--json]";
+    let usage = "usage: timefusion sim <journal.json|data-dir|synth:whale> [--hours N] [--workers N] [--streams N] [--scale F] [--seed N] [--no-mint] [--mint] [--debris-slice-minutes N] [--floorless] [--guard-off] [--rows K] [--projects K] [--now UNIX_SECS] [--json]";
     let input = it.next().context(usage)?;
     let mut cfg = SimConfig::default();
     let mut json = false;
     let mut floorless = false;
     let mut mint = false;
     let mut debris_slice = 1i64;
+    let mut now = support::now_micros();
     cli_args!(it, usage, {
         "--hours" => cfg.horizon_micros = it.hours_micros("--hours")?,
         "--workers" => cfg.workers = it.parse("--workers", "an integer")?,
@@ -252,11 +253,13 @@ fn run_sim_cli() -> anyhow::Result<()> {
         "--debris-slice-minutes" => debris_slice = it.parse("--debris-slice-minutes", "an integer")?,
         "--floorless" => floorless = true,
         "--guard-off" => cfg.split_guard = timefusion::maintenance_sim::SplitGuard::Off,
+        "--rows" => cfg.rows = it.parse("--rows", "a number")?,
+        "--projects" => cfg.projects = it.parse("--projects", "an integer")?,
+        // The journal's deadlines are real time: replay from its fetch time.
+        "--now" => now = it.parse::<i64>("--now", "unix seconds")? * 1_000_000,
         "--json" => json = true,
     });
-    let now = support::now_micros();
-    // `synth:whale` needs no journal, and is the only input that exercises the
-    // byte preflight (a real journal carries estimates the sim never reads).
+    // A real journal gets its byte model from its own per-unit estimates.
     let report = if let Some(shape) = input.strip_prefix("synth:") {
         anyhow::ensure!(shape == "whale", "the only synthetic queue is `synth:whale`");
         // `--streams` scales ingesting streams, which a synthetic queue only has
@@ -271,6 +274,7 @@ fn run_sim_cli() -> anyhow::Result<()> {
         run(queue.journal, &cfg, now)?
     } else {
         let (journal, _sandbox) = load_sandboxed(std::path::Path::new(&input))?;
+        cfg.byte_model = Some(ByteModel::from_journal(&journal));
         run(journal, &cfg, now)?
     };
     if json {
@@ -286,6 +290,18 @@ fn run_sim_cli() -> anyhow::Result<()> {
         cfg.seed
     );
     println!("pending: {} -> {} | executions: {} | splits: {}", report.pending_start, report.pending_end, report.executions, report.splits);
+    let per_row = |v: Option<f64>| v.map_or("n/a".to_owned(), |v| format!("{v:.3e}"));
+    println!(
+        "rows x{} projects x{} | accepted rows {} (minted {} units) | worker-secs/row {} | decoded bytes/row {} | expensive units {}",
+        cfg.rows,
+        cfg.projects,
+        report.accepted_rows,
+        report.minted_units,
+        per_row(report.worker_secs_per_accepted_row),
+        per_row(report.decoded_bytes_per_accepted_row),
+        report.expensive_units
+    );
+    println!("backlog slope (last quarter): {:+.1} units/h, {:+.3} GB/h", report.pending_slope_per_hour, report.pending_bytes_slope_per_hour / 1e9);
     println!(
         "coarsen: subsumed {} fused {} | candidates {} blocked {} over_budget {}",
         report.coarsen_subsumed, report.coarsen_fused, report.coarsen_candidates, report.coarsen_blocked, report.coarsen_over_budget
@@ -307,7 +323,14 @@ fn run_sim_cli() -> anyhow::Result<()> {
         report.hours_to_contiguous_30.map_or("never".to_owned(), |h| format!("{h:.1}h"))
     );
     for sample in &report.samples {
-        println!("  h={:5.1} pending={:>7} lag={:>6}s contiguous={}", sample.hour, sample.pending, sample.frontier_lag_secs, sample.min_contiguous_days);
+        println!(
+            "  h={:5.1} pending={:>7} pending_gb={:>8.1} lag={:>6}s contiguous={}",
+            sample.hour,
+            sample.pending,
+            sample.pending_bytes as f64 / 1e9,
+            sample.frontier_lag_secs,
+            sample.min_contiguous_days
+        );
     }
     Ok(())
 }

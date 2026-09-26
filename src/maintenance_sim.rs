@@ -31,6 +31,9 @@ const COARSEN_INTERVAL_MICROS: i64 = 60 * MICROS;
 /// splits or dispatches, so a bisection ladder costs throughput in the model.
 const PREFLIGHT_COST_MICROS: i64 = MICROS;
 
+/// `timefusion_dedup_bytes_per_row`'s default: decoded Arrow bytes per row.
+const ROW_DECODED_BYTES: u64 = 4096;
+
 /// Decoded bytes of one parquet file, and the least a slice can read of a file
 /// it overlaps (row groups are the pruning unit — a slice cannot read less than
 /// one).
@@ -91,6 +94,44 @@ pub struct ByteModel {
 impl ByteModel {
     pub fn insert(&mut self, project_id: &str, day_start_micros: i64, decoded_bytes: u64) {
         self.days.insert((project_id.to_owned(), day_start_micros), DayShape::new(decoded_bytes));
+    }
+
+    /// Per (project, day), the day-wide bytes implied by that day's widest unit,
+    /// a claim-time measurement beating a planner estimate. Floorless: journal
+    /// numbers already are what the real preflight read. `retry_or_split`'s
+    /// `MAX_DECODED_BYTES + 1` stamp means "did not fit", not a size.
+    pub fn from_journal(journal: &TaskJournal) -> Self {
+        let days = journal
+            .tasks()
+            .filter_map(|task| {
+                let bytes = task.preflight_decoded_bytes.unwrap_or(task.estimated_decoded_bytes);
+                let width = task.key.slice.width().clamp(1, DAY_MICROS);
+                let per_day = (u128::from(bytes) * DAY_MICROS as u128 / width as u128) as u64;
+                (bytes > 0 && bytes != MAX_DECODED_BYTES + 1).then(|| {
+                    ((task.key.project_id.clone(), day_start(task.key.slice.start_micros)), ((width, task.preflight_decoded_bytes.is_some()), per_day))
+                })
+            })
+            .into_grouping_map()
+            .max_by_key(|_, (rank, _)| *rank)
+            .into_iter()
+            .map(|(day, (_, bytes))| (day, DayShape::new(bytes)))
+            .collect();
+        Self { floored: false, days }
+    }
+
+    /// Every day's bytes times `k`: the `--rows` axis.
+    fn scaled(self, k: f64) -> Self {
+        Self { days: self.days.into_iter().map(|(day, shape)| (day, DayShape::new((shape.decoded_bytes as f64 * k) as u64))).collect(), ..self }
+    }
+
+    /// The day's shape, carrying the project's latest earlier day forward so
+    /// frontier ingest past the journal's last day keeps its rate.
+    fn ensure_day(&mut self, project_id: &str, day_start_micros: i64) -> Option<DayShape> {
+        let shape = self.shape(project_id, day_start_micros).or_else(|| {
+            self.days.iter().filter(|((project, day), _)| project == project_id && *day < day_start_micros).max_by_key(|((_, day), _)| *day).map(|(_, s)| *s)
+        })?;
+        self.days.insert((project_id.to_owned(), day_start_micros), shape);
+        Some(shape)
     }
 
     fn shape(&self, project_id: &str, day_start_micros: i64) -> Option<DayShape> {
@@ -164,6 +205,13 @@ pub struct SimConfig {
     /// against it. Without one the sim never splits on bytes.
     pub byte_model: Option<ByteModel>,
     pub split_guard: SplitGuard,
+    /// Multiplies every modelled day's bytes (the ROWS axis).
+    #[educe(Default = 1.0)]
+    pub rows: f64,
+    /// Every ingesting stream runs as this many projects, clones keeping the
+    /// original's day shapes (the PROJECTS axis).
+    #[educe(Default = 1)]
+    pub projects: usize,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -175,6 +223,7 @@ pub struct SimSample {
     /// Cumulative, and the live unit count of the worst cell beside it.
     pub split_declined_at_floor: u64,
     pub max_cell_pending: usize,
+    pub pending_bytes: u64,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -245,33 +294,66 @@ pub struct SimReport {
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub min_slice_units_per_cell: BTreeMap<String, usize>,
     pub samples: Vec<SimSample>,
+    /// Worker time over finished executions, a timeout charged its burned
+    /// deadline; decoded bytes over the same executions.
+    pub worker_secs: u64,
+    pub decoded_bytes: u64,
+    /// Dispatches drawn in their operation's expensive mode, and the sum of
+    /// their byte-priced terms (the part the ROWS axis moves).
+    pub expensive_units: u64,
+    pub expensive_byte_secs: f64,
+    /// Journal rows ingest minted, and the rows it accepted
+    /// (`ROW_DECODED_BYTES` per row of modelled ingest).
+    pub minted_units: u64,
+    pub accepted_bytes: u64,
+    pub accepted_rows: u64,
+    pub worker_secs_per_accepted_row: Option<f64>,
+    pub decoded_bytes_per_accepted_row: Option<f64>,
+    /// Least-squares slope over the last quarter of samples, per hour.
+    pub pending_slope_per_hour: f64,
+    pub pending_bytes_slope_per_hour: f64,
 }
 
-/// Measured duration ranges in seconds, per operation and width class.
+/// Measured duration ranges in seconds, per operation and width class, and
+/// whether the range is the operation's expensive mode.
 ///
 /// The distributions are deliberately BIMODAL: most units find no work and
 /// finish at ~0s, and the rest are very expensive. A single uniform range
 /// cannot express that, and the mean alone hides the shape that sets capacity.
-fn duration_range_secs(operation: Operation, width_micros: i64, rng: &mut Rng) -> u64 {
+///
+/// With `bytes`, an expensive draw is priced `lo + (hi - lo) × bytes /
+/// MAX_DECODED_BYTES` instead, assuming the calibration's expensive units
+/// decoded anywhere up to the preflight budget. The uniform draw is still
+/// taken so the rng stream, and so every mode choice, is independent of bytes.
+/// Returns the seconds and, for an expensive unit, its byte-priced term.
+fn unit_secs(operation: Operation, width_micros: i64, bytes: Option<u64>, rng: &mut Rng) -> (u64, Option<f64>) {
     let frontier = width_micros < DAY_MICROS;
     let pct = rng.next() % 100;
-    let (lo, hi) = match (operation, frontier, pct) {
+    let ((lo, hi), expensive) = match (operation, frontier, pct) {
         // 70% no-op, 20% cheap, 10% the long tail that actually costs.
-        (Operation::Dedup, _, ..70) => (0, 6),
-        (Operation::Dedup, _, ..90) => (6, 300),
-        (Operation::Dedup, ..) => (1_910, 7_203),
+        (Operation::Dedup, _, ..70) => ((0, 6), false),
+        (Operation::Dedup, _, ..90) => ((6, 300), false),
+        (Operation::Dedup, ..) => ((1_910, 7_203), true),
         // 65% no-op, then a wide and frequent expensive mode.
-        (Operation::BaseRollup, true, ..65) => (0, 5),
-        (Operation::BaseRollup, true, _) => (1_227, 2_368),
-        (Operation::BaseRollup, false, _) => (0, 11),
-        (Operation::DerivedRollup, ..) => (0, 3),
-        (Operation::HotPacking, ..) => (0, 13),
-        (Operation::SealedConsolidation, ..) => (0, 26),
+        (Operation::BaseRollup, true, ..65) => ((0, 5), false),
+        (Operation::BaseRollup, true, _) => ((1_227, 2_368), true),
+        (Operation::BaseRollup, false, _) => ((0, 11), false),
+        (Operation::DerivedRollup, ..) => ((0, 3), false),
+        (Operation::HotPacking, ..) => ((0, 13), false),
+        (Operation::SealedConsolidation, ..) => ((0, 26), false),
         // Half no-op, half a long tail.
-        (Operation::Repair, _, ..50) => (0, 49),
-        (Operation::Repair, ..) => (49, 5_678),
+        (Operation::Repair, _, ..50) => ((0, 49), false),
+        (Operation::Repair, ..) => ((49, 5_678), true),
     };
-    rng.uniform_secs(lo, hi)
+    let drawn = rng.uniform_secs(lo, hi);
+    match (expensive, bytes) {
+        (false, _) => (drawn, None),
+        (true, None) => (drawn, Some((drawn - lo) as f64)),
+        (true, Some(bytes)) => {
+            let term = (hi - lo) as f64 * bytes as f64 / MAX_DECODED_BYTES as f64;
+            (lo + term as u64, Some(term))
+        }
+    }
 }
 
 /// Debt work = file rewrites that cannot advance rollup coverage: the
@@ -577,6 +659,23 @@ pub fn run(mut journal: TaskJournal, cfg: &SimConfig, start_micros: i64) -> anyh
             ..template.clone()
         }));
     }
+    let mut model = cfg.byte_model.clone().map(|model| model.scaled(cfg.rows));
+    let clones = streams
+        .iter()
+        .filter(|s| s.last_created_ms >= idle_cutoff_ms)
+        .flat_map(|s| (1..cfg.projects).map(move |i| Stream { project_id: format!("{}+{i}", s.project_id), ..s.clone() }))
+        .collect_vec();
+    if let Some(model) = model.as_mut() {
+        let copied = clones
+            .iter()
+            .flat_map(|clone| {
+                let original = clone.project_id.rsplit_once('+').map_or("", |(original, _)| original);
+                model.days.iter().filter(move |((project, _), _)| project == original).map(|((_, day), shape)| ((clone.project_id.clone(), *day), *shape))
+            })
+            .collect_vec();
+        model.days.extend(copied);
+    }
+    streams.extend(clones);
     let ingesting = streams.iter().filter(|s| s.last_created_ms >= idle_cutoff_ms).count();
 
     if cfg.mint_frontier {
@@ -623,9 +722,15 @@ pub fn run(mut journal: TaskJournal, cfg: &SimConfig, start_micros: i64) -> anyh
 
         if now >= next_mint {
             if cfg.mint_frontier {
+                let before = journal.tasks().count();
                 for stream in streams.iter().filter(|s| s.last_created_ms >= idle_cutoff_ms) {
-                    mint_stream(&mut journal, stream, next_mint - MINT_INTERVAL_MICROS, next_mint, next_mint);
+                    let from = next_mint - MINT_INTERVAL_MICROS;
+                    if let Some(day) = model.as_mut().and_then(|model| model.ensure_day(&stream.project_id, day_start(from))) {
+                        report.accepted_bytes += day.bytes(MINT_INTERVAL_MICROS, false);
+                    }
+                    mint_stream(&mut journal, stream, from, next_mint, next_mint);
                 }
+                report.minted_units += (journal.tasks().count() - before) as u64;
             }
             none_until.fill(0);
             // The cadence advances whether or not minting is on — otherwise
@@ -637,7 +742,7 @@ pub fn run(mut journal: TaskJournal, cfg: &SimConfig, start_micros: i64) -> anyh
             // With a byte model the CAPPED variant is the one prod runs:
             // footprint-less debris carrying an inflated estimate only fuses
             // once the partition ceiling bounds what that day can decode.
-            let coarsen = match cfg.byte_model.as_ref() {
+            let coarsen = match model.as_ref() {
                 Some(model) => journal.coarsen_sealed_slices_capped(now, &|project, _source, date| model.partition_ceiling(project, date)),
                 None => journal.coarsen_sealed_slices_reporting(now),
             };
@@ -668,6 +773,8 @@ pub fn run(mut journal: TaskJournal, cfg: &SimConfig, start_micros: i64) -> anyh
                     debt_busy -= 1;
                 }
                 let deadline_secs = operation_deadline_secs(key.operation);
+                report.worker_secs += duration_secs.min(deadline_secs);
+                report.decoded_bytes += model.as_ref().map_or(0, |model| model.bytes(&key));
                 if duration_secs <= deadline_secs {
                     journal.complete(&key);
                     none_until.fill(0);
@@ -738,7 +845,7 @@ pub fn run(mut journal: TaskJournal, cfg: &SimConfig, start_micros: i64) -> anyh
             // The byte preflight runs between the claim and the dispatch, where
             // prod runs it. A split leaves the worker free after the cost of the
             // measurement — no unit ran, so the debt slot goes back too.
-            if let (Some(model), Some(task)) = (cfg.byte_model.as_ref(), claimed.as_ref()) {
+            if let (Some(model), Some(task)) = (model.as_ref(), claimed.as_ref()) {
                 let Some(observed) = preflight(&mut journal, model, cfg.split_guard, task, &mut report) else {
                     if is_debt_op(task.key.operation) {
                         debt_busy -= 1;
@@ -759,7 +866,13 @@ pub fn run(mut journal: TaskJournal, cfg: &SimConfig, start_micros: i64) -> anyh
             }
             match claimed {
                 Some(task) => {
-                    let duration_secs = (duration_range_secs(task.key.operation, task.key.slice.width(), &mut rng) as f64 * cfg.duration_scale) as u64;
+                    let bytes = model.as_ref().map(|model| model.bytes(&task.key));
+                    let (secs, byte_secs) = unit_secs(task.key.operation, task.key.slice.width(), bytes, &mut rng);
+                    if let Some(byte_secs) = byte_secs {
+                        report.expensive_units += 1;
+                        report.expensive_byte_secs += byte_secs * cfg.duration_scale;
+                    }
+                    let duration_secs = (secs as f64 * cfg.duration_scale) as u64;
                     let burn_secs = duration_secs.min(operation_deadline_secs(task.key.operation));
                     worker.current = Some((task.key, duration_secs));
                     worker.busy_until = now + (burn_secs as i64) * MICROS;
@@ -784,12 +897,23 @@ pub fn run(mut journal: TaskJournal, cfg: &SimConfig, start_micros: i64) -> anyh
                 min_contiguous_days: contiguous,
                 split_declined_at_floor: report.split_declined_at_floor,
                 max_cell_pending: max_cell_pending(&journal),
+                pending_bytes: journal
+                    .tasks()
+                    .filter(|t| is_open(t.state))
+                    .map(|t| model.as_ref().map_or(t.estimated_decoded_bytes, |m| m.bytes(&t.key)))
+                    .sum(),
             });
             next_tick += tick;
         }
     }
 
     report.min_contiguous_days_end = coverage.min_contiguous_days(now);
+    let tail = &report.samples[report.samples.len() * 3 / 4..];
+    report.pending_slope_per_hour = slope_per_hour(tail, |s| s.pending as f64);
+    report.pending_bytes_slope_per_hour = slope_per_hour(tail, |s| s.pending_bytes as f64);
+    report.accepted_rows = report.accepted_bytes / ROW_DECODED_BYTES;
+    let per_row = |total: u64| (report.accepted_rows > 0).then(|| total as f64 / report.accepted_rows as f64);
+    (report.worker_secs_per_accepted_row, report.decoded_bytes_per_accepted_row) = (per_row(report.worker_secs), per_row(report.decoded_bytes));
     report.pending_end = journal.tasks().filter(|t| is_open(t.state)).count();
     report.tasks_end = journal.tasks().map(|task| format!("{:?}/{:?}", task.key.operation, task.state)).counts();
     report.units_per_cell = journal.tasks().map(|task| cell_of(&task.key)).counts().into_iter().collect();
@@ -828,6 +952,14 @@ pub fn run(mut journal: TaskJournal, cfg: &SimConfig, start_micros: i64) -> anyh
             .fold((0, 0), |(islands, covered), (runs, day_covered)| (islands + runs, covered + day_covered));
     }
     Ok(report)
+}
+
+/// Least-squares slope of `value` against sample hour; 0 below two samples.
+fn slope_per_hour(samples: &[SimSample], value: impl Fn(&SimSample) -> f64) -> f64 {
+    let n = samples.len() as f64;
+    let (mean_h, mean_v) = (samples.iter().map(|s| s.hour).sum::<f64>() / n, samples.iter().map(&value).sum::<f64>() / n);
+    let (cov, var) = samples.iter().fold((0.0, 0.0), |(cov, var), s| (cov + (s.hour - mean_h) * (value(s) - mean_v), var + (s.hour - mean_h).powi(2)));
+    if var > 0.0 { cov / var } else { 0.0 }
 }
 
 /// `eligible_watermark_lag_seconds`, simplified: the oldest eligible,
@@ -1295,6 +1427,80 @@ mod tests {
         for (floored, guard) in [(true, SplitGuard::Off), (false, SplitGuard::Off), (false, SplitGuard::Shipped), (true, SplitGuard::Shipped)] {
             sweep_row(floored, guard, 100);
         }
+    }
+
+    /// Each case is (width, bytes, measured) units over one day; the model must
+    /// report the day the widest (then measured) unit implies.
+    #[test_case::test_case(&[(DAY_MICROS, 3_000_000_000, false)] => 3_000_000_000; "day-wide round-trips")]
+    #[test_case::test_case(&[(NORMAL_SLICE_MICROS, 1_000_000, false)] => 144_000_000; "a slice extrapolates to its day")]
+    #[test_case::test_case(&[(NORMAL_SLICE_MICROS, 9_000_000_000, false), (DAY_MICROS, 3_000_000_000, false)] => 3_000_000_000; "the widest unit wins")]
+    #[test_case::test_case(&[(DAY_MICROS, 5_000_000_000, false), (DAY_MICROS, 3_000_000_000, true)] => 3_000_000_000; "a measurement beats an estimate")]
+    #[test_case::test_case(&[(DAY_MICROS, MAX_DECODED_BYTES + 1, true)] => 0; "the does-not-fit stamp is not a measurement")]
+    fn from_journal_folds_bytes_per_day(units: &[(i64, u64, bool)]) -> u64 {
+        let mut journal = empty_journal();
+        let day = START - DAY_MICROS;
+        for (index, &(width, bytes, measured)) in units.iter().enumerate() {
+            let op = [Operation::Dedup, Operation::BaseRollup, Operation::Repair][index];
+            let key = key("a", op, day, width);
+            journal.enqueue(key.clone(), START, if measured { 1 } else { bytes }, 0);
+            if measured {
+                journal.record_preflight(&key, None, bytes);
+            }
+        }
+        ByteModel::from_journal(&journal).bytes(&key("a", Operation::BaseRollup, day, DAY_MICROS))
+    }
+
+    /// `units` sealed day-wide Dedup units of `bytes` each, and frontier
+    /// streams whose day 60 holds `bytes`; nothing mints unless `mint`.
+    fn byte_run(streams: usize, units: i64, bytes: u64, cfg: SimConfig) -> SimReport {
+        let mut journal = journal_with_streams(streams);
+        let mut model = ByteModel::default();
+        (0..streams).for_each(|i| model.insert(&format!("p{i}"), 60 * DAY_MICROS, bytes));
+        for day in (1..=units).map(|back| START - back * DAY_MICROS) {
+            journal.enqueue(key("a", Operation::Dedup, day, DAY_MICROS), START, bytes, 0);
+            model.insert("a", day, bytes);
+        }
+        run(journal, &SimConfig { byte_model: Some(model), ..cfg }, START).unwrap()
+    }
+
+    #[test_case::test_case(1.0, 1; "baseline")]
+    #[test_case::test_case(2.0, 1; "rows x2")]
+    #[test_case::test_case(1.0, 2; "projects x2")]
+    #[test_case::test_case(4.0, 4; "rows x4 projects x4")]
+    fn the_rows_and_projects_axes_scale_their_own_quantity(rows: f64, projects: usize) {
+        // Every unit is claimed at once, so scheduling cannot differ between arms.
+        let sealed = |rows| SimConfig { rows, mint_frontier: false, workers: 100, horizon_micros: 600 * MICROS, ..Default::default() };
+        let (base, scaled) = (byte_run(0, 40, 100_000_000, sealed(1.0)), byte_run(0, 40, 100_000_000, sealed(rows)));
+        let claims = |r: &SimReport| r.claims_frontier + r.claims_mid_band + r.claims_privileged;
+        assert_eq!((claims(&scaled), scaled.executions, scaled.expensive_units), (claims(&base), base.executions, base.expensive_units), "rows keeps the mix");
+        assert!(base.expensive_units > 0);
+        assert!((scaled.expensive_byte_secs / base.expensive_byte_secs - rows).abs() < 1e-9, "rows scales expensive seconds");
+
+        let minting = |projects| SimConfig { projects, rows, horizon_micros: 2 * HOUR_MICROS, ..cfg(0) };
+        let (base, cloned) = (byte_run(2, 0, 1_000_000_000, minting(1)), byte_run(2, 0, 1_000_000_000, minting(projects)));
+        assert!(base.minted_units > 0);
+        assert_eq!(
+            (cloned.minted_units, cloned.accepted_bytes),
+            (base.minted_units * projects as u64, base.accepted_bytes * projects as u64),
+            "bytes per unit hold"
+        );
+    }
+
+    #[test]
+    fn a_timeout_is_charged_its_burned_deadline() {
+        // Seed 4 draws no 0s no-op first, so the scaled unit must time out.
+        let cfg = SimConfig { mint_frontier: false, workers: 1, duration_scale: 1_000.0, horizon_micros: 16 * 60 * MICROS, seed: 4, ..Default::default() };
+        let report = byte_run(0, 1, 100_000_000, cfg);
+        assert!(report.completions.is_empty(), "{report:#?}");
+        assert_eq!((report.executions, report.worker_secs, report.decoded_bytes), (1, operation_deadline_secs(Operation::Dedup), 100_000_000));
+    }
+
+    #[test]
+    fn the_report_is_deterministic_per_seed_and_flags() {
+        let cfg = || SimConfig { rows: 2.0, projects: 3, ..cfg(3) };
+        let (a, b) = (byte_run(3, 5, 800_000_000, cfg()), byte_run(3, 5, 800_000_000, cfg()));
+        assert!(a.worker_secs_per_accepted_row.is_some() && a.samples.iter().any(|s| s.pending_bytes > 0));
+        assert_eq!(serde_json::to_value(a).unwrap(), serde_json::to_value(b).unwrap());
     }
 
     #[test]
