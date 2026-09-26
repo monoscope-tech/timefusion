@@ -155,7 +155,7 @@ reopens the 1h derived tier (97 repeated 1440-min `dashboard_1h_v2` publications
 **Fix:** `slice_retires` also retires a tagged file WITHOUT the `output_rows` proof when it overlaps the published slice
 and the other live slices tile its range (guarded against a gap and against proven files); case-table test shown red
 without the rule. Current publications always stamp `output_rows`, so no new straddlers are created.
-**Verify after deploy:** repeated publications per slice/hour → ~1; `rollup_backfill_census` `cells_wanted` for those days → 0.
+**Verified (image `2c97a1b5`, 20:02 deploy, 25 min window):** no sealed-day slice repeats; top repeats are today's live 10-min slices (ingest churn); census `cells_wanted` 1–2/tick (was 2–6); publications ≈530/h vs ≈708/h in W3's window.
 
 ### W18 result — 2026-09-26 — agent (Claude)
 **Finding:** `timefusion sim` cannot measure a ROWS axis yet: unit duration (`duration_range_secs`, calibrated 09-03 from
