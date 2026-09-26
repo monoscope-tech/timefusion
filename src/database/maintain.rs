@@ -3027,6 +3027,7 @@ impl Database {
                     project: Self::tag_project(add),
                     partition: partition.as_ref().map(|(project, date)| (project.as_str(), date.as_str())),
                     stats: add.stats.as_deref().and_then(crate::rollup::stats_time_range),
+                    unproven: Self::add_tag(add, crate::maintenance_coordinator::TAG_OUTPUT_ROWS).is_none(),
                 };
                 crate::rollup::slice_retires(&file, &publish)
             })
