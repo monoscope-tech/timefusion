@@ -1,0 +1,73 @@
+# Rollup plan: parallel workstreams
+
+Coordination sheet for working through
+[`2026-09-24-rollups-on-a-fixed-server.md`](2026-09-24-rollups-on-a-fixed-server.md)
+with several people or agents at once. The plan is the requirements source; the
+[handover](2026-09-25-rollup-handover.md) holds current production state and the open-items checklist.
+Claim a stream by putting your name in its **Owner** cell in one commit, before you start.
+
+## Ground rules (read before touching anything)
+
+- **A push to `master` is a deploy.** Every non-docs push rebuilds and redeploys prod.
+  Docs-only pushes (`docs/**`) do not deploy. Only the integrator (see below) pushes code to `master`;
+  everyone else pushes a branch `ws/<stream>-<topic>` and hands it over.
+- **Sign off locally first:** `make ci-signoff CHECKS="fmt clippy test"` must be green for the exact tree.
+  Tests: `cargo nextest run`, never `cargo test`. Lint: `cargo lint`, never bare clippy.
+- **One cargo process per build cache.** Each build lane uses its own worktree under
+  `~/Projects/apitoolkit/tf-<stream>` (NOT `/tmp`: a reboot wipes it) with its own `target/`.
+  This machine (10 cores, 32 GB) sustains **two** build lanes; analysis-only streams need no build.
+- **Production is read-only.** `ssh ubuntu@captain.s.past3.tech`: logs, `ps`, `inspect` only; never restart,
+  exec-mutate, scale or touch volumes. Prod pgwire (`TIMEFUSION_PG_URL` in `../monoscope/.env`):
+  `timefusion_stats` and tightly time-bounded SELECTs only; a broad scan can OOM the instance.
+- **Measure on a mature process:** ≥1h since the last deploy (`docker service ps srv-captain--timefusion`),
+  ≥3 samples, difference counters over a window. `timefusion_stats` resets on every deploy.
+- **Bug fixes start with a failing test**, and the guard must be shown to fail with the fix reverted.
+- **Stay in your files.** The ownership column below is the conflict boundary; if you must edit another
+  stream's file, note it in the stream row first. `src/database/maintain.rs` and `src/rollup.rs` are large
+  and shared: keep edits to the functions your stream names, and rebase often.
+
+## Roles
+
+| Role | Who | Responsibility |
+| --- | --- | --- |
+| Integrator | Claude (main session) | Owns build lane 1, merges `ws/*` branches, runs sign-off, pushes to `master`, watches deploys, keeps the handover checklist current |
+| Build lane 2 | one developer or agent at a time | Code streams that need compiling (marked **build**) |
+| Analysis | any number | Streams marked **analysis**: no cargo, no code on `master`; output is a findings section appended to this file or a plan doc |
+
+## Streams
+
+Status: ⬜ open · 🟡 in progress · ✅ done. Priority is the plan's execution order.
+
+| # | Stream | Kind | Plan § | Deliverable | Files / area | Depends on | Owner | Status |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| W1 | Release batch + `now()` hit-rate re-measure | build (lane 1) | Execution priorities | Batch on `master`; hit rate / miss mix on a ≥1h process vs the pre-fix sample (0 hits / 1530 misses per h on `e1da854c`) | Integrator | — | Claude | 🟡 |
+| W2 | Attribution baseline | analysis | "Before changes: attribution" | One-hour CPU by lane/spec reconciled with whole-process CPU; tier-usage inventory (queries per tier, routing eligibility, maintenance cost) | prod read-only, monoscope query shapes | W1 deployed + 1h | | ⬜ |
+| W3 | 1B shard-count inventory | analysis | Stage 1B | Executed-unit shard-count distribution (1, 2, 3–4, 5–8, >8) weighted by estimated input bytes, from publication logs / journal — no new scans | `scripts/rollup_work_inventory.py` (+ its test), prod logs, `maintenance_tasks.json` | — | | ⬜ |
+| W4 | Session-tier consumer inventory | analysis | First deliverable (B1) | Every reader of `*_rollup_sessions_1h_v1` (monoscope code paths, direct SQL, infrequent jobs) and a keep/pause/remove recommendation; unserved HLL review | monoscope repo (read-only), prod pgwire logs | — | | ⬜ |
+| W5 | Per-range witness (restart recovery) | build (lane 1) | Stage 0 | Recovery stops re-queuing slices above a changed hour: a range-scoped witness (rows in `[start, covered_through)`), written at publish, read in `recover_date_coverage` | `maintenance_coordinator.rs` tags, `maintain.rs` recovery + publish, `database/mod.rs` `RollupCoverage` | W1 | Claude | ⬜ |
+| W6 | `multi_scan_source` shapes | analysis → build (lane 2) | Rollup misses | Classify the 192/h self-join/UNION declines (service-edges); decide: route per-leg, rewrite in monoscope, or leave raw; then implement the chosen matcher change with a case-table test | `src/rollup.rs` matcher (`source_and_filters`, `match_aggregates`) | — | | ⬜ |
+| W7 | Stage 1 build measurement harness | build (lane 2) | Stage 1 | For representative units via `timefusion run-unit`: physical plan, scan count, hash shards, dedup ops, decoded bytes, aggregate-state memory, CPU; publication economics (commits/actions/latency incl. failures) | `src/main.rs` `run-unit`, `benches/rollup_work.rs`, report under `docs/plans/` | W3 for unit choice | | ⬜ |
+| W8 | 1D dependency classification — design + fixtures | analysis → build (lane 2) | Stage 1D | Per-spec dependency map (dims, measures, filters, identity, ts, version, delete); mutation fixture table proving zero missed relevant invalidations; then the classifier | new test module; `apply_rollup_hours` call sites in `database/rollup.rs` | W2 (which mutations dominate) | | ⬜ |
+| W9 | Stage 3 publication batching — design | analysis | Stage 3 | Concrete design mapped to existing staged publication / journal group-commit; WAL-compat decision (does the payload change?); queue limits; test list | design doc only | — | | ⬜ |
+| W10 | Capacity replay harness | build (lane 2) | Shared gates | `timefusion sim` replay of a prod journal at 1x/2x/4x rows and 1x/2x/4x projects; report backlog stability and work per accepted row | `src/maintenance_sim.rs`, `src/main.rs` | W2 | | ⬜ |
+| W11 | OpenTelemetry 0.32 upgrade | build (lane 2) | Housekeeping | Closes the `opentelemetry_sdk` advisory (unbounded baggage alloc) | `Cargo.toml`, `src/observability.rs` | — | | ⬜ |
+| W12 | `dcount(name)` measure decision | analysis | Rollup misses | Cost/benefit for a `name` HLL + 2-way server-scope count guard on `dashboard_1m_v3` (schema comment ~L501 declines it on purpose); owner decides | `schemas/otel_logs_and_spans.yaml` (proposal only) | W2 | | ⬜ |
+
+Later stages (2, 4, 5, 6, 1C, certified-clean activation, adaptive batches) stay **conditional** on W2/W7
+numbers, per the plan; do not start them without a measured residual cost.
+
+## Handoff format
+
+Append a section per finished stream:
+
+```
+### W<n> result — <date> — <owner>
+Question · Method (commands, windows, commit/image) · Numbers (with units and sample counts) ·
+Decision/recommendation · Branch (if code) · What the integrator must do next
+```
+
+Code handoffs: branch `ws/<stream>-<topic>` rebased on current `master`, `cargo lint` clean, the stream's
+targeted tests green, and the failing-first test named. The integrator batches compatible branches into one
+sign-off + deploy (the plan's "deploy fewer, coherent releases").
+
+## Results
