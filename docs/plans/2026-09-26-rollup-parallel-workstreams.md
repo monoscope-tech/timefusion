@@ -42,7 +42,7 @@ Status: ⬜ open · 🟡 in progress · ✅ done. Priority is the plan's executi
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | W1 | Release batch + `now()` hit-rate re-measure | build (lane 1) | Execution priorities | Batch on `master`; hit rate / miss mix on a ≥1h process vs the pre-fix sample (0 hits / 1530 misses per h on `e1da854c`) | Integrator | — | Claude | 🟡 |
 | W2 | Attribution baseline | analysis | "Before changes: attribution" | One-hour CPU by lane/spec reconciled with whole-process CPU; tier-usage inventory (queries per tier, routing eligibility, maintenance cost) | prod read-only, monoscope query shapes | W1 deployed + 1h | | ⬜ |
-| W3 | 1B shard-count inventory | analysis | Stage 1B | Executed-unit shard-count distribution (1, 2, 3–4, 5–8, >8) weighted by estimated input bytes, from publication logs / journal — no new scans | `scripts/rollup_work_inventory.py` (+ its test), prod logs, `maintenance_tasks.json` | — | agent (Claude) | 🟡 |
+| W3 | 1B shard-count inventory | analysis | Stage 1B | Executed-unit shard-count distribution (1, 2, 3–4, 5–8, >8) weighted by estimated input bytes, from publication logs / journal — no new scans | `scripts/rollup_work_inventory.py` (+ its test), prod logs, `maintenance_tasks.json` | — | agent (Claude) | ✅ |
 | W4 | Session-tier consumer inventory | analysis | First deliverable (B1) | Every reader of `*_rollup_sessions_1h_v1` (monoscope code paths, direct SQL, infrequent jobs) and a keep/pause/remove recommendation; unserved HLL review | monoscope repo (read-only), prod pgwire logs | — | agent (Claude) | ✅ |
 | W5 | Per-range witness (restart recovery) | build | Stage 0 | **Deprioritized by measurement**: the 18:05 restart re-queued 26 `WitnessMoved` slices, all in the paused `sessions_1h_v1`, zero in dashboard tiers (`rollup_unverifiable_rebuild_queued` log). Revisit only if a dashboard tier shows it | — | W1 | Claude | ✅ measured |
 | W6 | `multi_scan_source` shapes | analysis → build (lane 2) | Rollup misses | Classify the 192/h self-join/UNION declines (service-edges); decide: route per-leg, rewrite in monoscope, or leave raw; then implement the chosen matcher change with a case-table test | `src/rollup.rs` matcher (`source_and_filters`, `match_aggregates`) | — | agent (Claude) | ✅ |
@@ -52,7 +52,8 @@ Status: ⬜ open · 🟡 in progress · ✅ done. Priority is the plan's executi
 | W10 | Capacity replay harness | build (lane 2) | Shared gates | `timefusion sim` replay of a prod journal at 1x/2x/4x rows and 1x/2x/4x projects; report backlog stability and work per accepted row | `src/maintenance_sim.rs`, `src/main.rs` | W2 | | ⬜ |
 | W11 | OpenTelemetry 0.33 upgrade | build (lane 2) | Housekeeping | Closes the `opentelemetry_sdk` advisory (unbounded baggage alloc) | `Cargo.toml`, `src/observability.rs` | — | Claude (timefusion-2e) | ✅ handed off |
 | W12 | `dcount(name)` measure decision | analysis | Rollup misses | Cost/benefit for a `name` HLL + 2-way server-scope count guard on `dashboard_1m_v3` (schema comment ~L501 declines it on purpose); owner decides | `schemas/otel_logs_and_spans.yaml` (proposal only) | W2 | | ⬜ |
-| W13 | Narrow the slice OCC gate (Stage 3 step 1) | build (lane 2) | Stage 3 | A non-overlapping sibling slice no longer makes a staged unit `slice_occ_stale`; a unit may retire narrower contained slices; target proof re-recorded under the commit lock; cause logging; tests 1, 3, 3b of the W9 design failing-first | `maintain.rs` `run_coordinator_rollup_selected` OCC check | W9 | | ⬜ |
+| W13 | Narrow the slice OCC gate (Stage 3 step 1) | build (lane 2) | Stage 3 | A non-overlapping sibling slice no longer makes a staged unit `slice_occ_stale`; a unit may retire narrower contained slices; target proof re-recorded under the commit lock; cause logging; tests 1, 3, 3b of the W9 design failing-first | `maintain.rs` `run_coordinator_rollup_selected` OCC check | W9 | Claude | 🟡 branch `ws/w13-occ-narrow` (842617b9), **top priority per W3** |
+| W14 | 720-minute republication loop | analysis → build | Stage 0 / 1 | Why 58 slices (mostly 720-min `dashboard_1m_v3`) republished 431 times in 65 min (56% of publications, 228/361 GB); fix the re-mint source (census / witness moved / no-op skip miss); log the retry reason on `maintenance_task_finished` | `maintain.rs` census + no-op decision, `database/rollup.rs` | W3 | | ⬜ |
 
 Later stages (2, 4, 5, 6, 1C, certified-clean activation, adaptive batches) stay **conditional** on W2/W7
 numbers, per the plan; do not start them without a measured residual cost.
@@ -126,3 +127,15 @@ Clean shutdown, no panic.
 `src/observability.rs`).
 **Integrator next:** batch into the next sign-off. Swap the git pin for a crates.io release when upstream publishes
 one (> 0.2.1).
+
+### W3 result — 2026-09-26 — agent (Claude)
+**Question:** executed hash-shard distribution (Stage 1B exposure).
+**Method:** 65 min of prod logs (18:05–19:10, young process), executed `hash_shards` from publication events, units
+paired start/publish/finish; reconciles with `rollup_scan_cohorts_total` to 0.4%.
+**Numbers:** 2,230 executed units / 3,670 shard passes: 1 shard 820 units, 2 shards 1,380, 3–4 shards 30, >4 none.
+73% of published input ran >1 shard (each pass re-reads ~1.7 GB of whole files).
+**Bigger findings:** (1) **69% of scan passes (2,528/3,670) belong to units that scanned and then did not publish** —
+1–10 min `dashboard_1m_v3` slices retrying after 1–4 s, cause inferred as `slice_occ_stale` → W13 is top priority.
+(2) **58 slices republished 431 times** (56% of publications, 228/361 GB), mostly 720-min slices → W14.
+(3) 62% of published units were a 2nd+ attempt.
+**Decision:** 1B shard capping is a small lever; do W13 and W14 first; log the retry reason on `maintenance_task_finished`.
