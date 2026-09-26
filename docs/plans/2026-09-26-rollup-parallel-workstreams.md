@@ -43,7 +43,7 @@ Status: ⬜ open · 🟡 in progress · ✅ done. Priority is the plan's executi
 | W1 | Release batch + `now()` hit-rate re-measure | build (lane 1) | Execution priorities | Batch on `master`; hit rate / miss mix on a ≥1h process vs the pre-fix sample (0 hits / 1530 misses per h on `e1da854c`) | Integrator | — | Claude | 🟡 |
 | W2 | Attribution baseline | analysis | "Before changes: attribution" | One-hour CPU by lane/spec reconciled with whole-process CPU; tier-usage inventory (queries per tier, routing eligibility, maintenance cost) | prod read-only, monoscope query shapes | W1 deployed + 1h | | ⬜ |
 | W3 | 1B shard-count inventory | analysis | Stage 1B | Executed-unit shard-count distribution (1, 2, 3–4, 5–8, >8) weighted by estimated input bytes, from publication logs / journal — no new scans | `scripts/rollup_work_inventory.py` (+ its test), prod logs, `maintenance_tasks.json` | — | agent (Claude) | 🟡 |
-| W4 | Session-tier consumer inventory | analysis | First deliverable (B1) | Every reader of `*_rollup_sessions_1h_v1` (monoscope code paths, direct SQL, infrequent jobs) and a keep/pause/remove recommendation; unserved HLL review | monoscope repo (read-only), prod pgwire logs | — | agent (Claude) | 🟡 |
+| W4 | Session-tier consumer inventory | analysis | First deliverable (B1) | Every reader of `*_rollup_sessions_1h_v1` (monoscope code paths, direct SQL, infrequent jobs) and a keep/pause/remove recommendation; unserved HLL review | monoscope repo (read-only), prod pgwire logs | — | agent (Claude) | ✅ |
 | W5 | Per-range witness (restart recovery) | build | Stage 0 | **Deprioritized by measurement**: the 18:05 restart re-queued 26 `WitnessMoved` slices, all in the paused `sessions_1h_v1`, zero in dashboard tiers (`rollup_unverifiable_rebuild_queued` log). Revisit only if a dashboard tier shows it | — | W1 | Claude | ✅ measured |
 | W6 | `multi_scan_source` shapes | analysis → build (lane 2) | Rollup misses | Classify the 192/h self-join/UNION declines (service-edges); decide: route per-leg, rewrite in monoscope, or leave raw; then implement the chosen matcher change with a case-table test | `src/rollup.rs` matcher (`source_and_filters`, `match_aggregates`) | — | agent (Claude) | ✅ |
 | W7 | Stage 1 build measurement harness | build (lane 2) | Stage 1 | For representative units via `timefusion run-unit`: physical plan, scan count, hash shards, dedup ops, decoded bytes, aggregate-state memory, CPU; publication economics (commits/actions/latency incl. failures) | `src/main.rs` `run-unit`, `benches/rollup_work.rs`, report under `docs/plans/` | W3 for unit choice | | ⬜ |
@@ -84,3 +84,15 @@ hit-rate denominator, and their per-query 2–3 KB warn is sampled: branch `ws/w
 with the test asserting `rollup_misses_total` does not move for a multi-scan plan.
 **Follow-ups:** (1) monoscope could compute `trace_count` without referencing `bucketed` twice (12 → 6 scans; unmeasured, W2/W7).
 (2) 21 of 26 `unwalkable_source` are `autoAckProvenEndpoints`' `unnest(hashes)` query (`BackgroundJobs.hs:3709`), also raw-only.
+
+### W4 result — 2026-09-26 — agent (Claude)
+**Question:** does `sessions_1h_v1` have a consumer; is there an unserved HLL?
+**Method:** full monoscope inventory (deployed `fb0cac263`), router eligibility per shape, 25 min prod logs, `ROLLUP POLICIES`.
+**Numbers:** 0 deployed query shapes can route to v1. The one query written for it (RUM `otelSessionCoreRows`,
+`RealUserMonitoring.hs:369`) needs a browser-only filter no measure stores, plus `MAX(service_name)` and an env filter.
+`fetchSessions` (Log Explorer) is pinned unroutable by TF tests. 0 direct reads of the table. 232/284 near-miss warns
+name `sessions_1h`, all dashboard server-scope filters sharing the `name` column — noise, not demand.
+**Decisions:** keep `sessions_1h_v1` **paused** (it is; durable). Owner decisions: (a) remove v1, or spec a browser-scoped v2
+for RUM; (b) `service_name_hll` (dashboard tiers) is computed on every build but never served
+(`MEASURES_NOT_YET_SERVABLE`, `rollup.rs:1017`, pre-08-26 sketches empty) — audit stored sketches and unblock, or drop it.
+**Follow-ups (optional):** demote the sessions near-miss warn to debug; per-tier hit counters.
