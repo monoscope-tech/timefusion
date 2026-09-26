@@ -616,9 +616,9 @@ fn parameterize_statement(stmt: &Statement, base: usize, include_strings: bool) 
         }
     }
     // Capture "now" once so every now()/current_timestamp substitutes to the same
-    // instant (SQL's single-evaluation semantics). Tz-aware nanoseconds mirrors
-    // DataFusion's native now().
-    let now_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+    // instant (SQL's single-evaluation semantics). Microseconds, the timestamp
+    // columns' precision: a finer instant makes coercion cast the column instead.
+    let now_us = chrono::Utc::now().timestamp_micros();
     let _: ControlFlow<()> = visit_expressions_mut(&mut stmt, |e: &mut SqlExpr| {
         match e {
             // PG array literals ('{}', '{a,b}') must stay inline: PgArrayLiteralRewriter
@@ -634,14 +634,14 @@ fn parameterize_statement(stmt: &Statement, base: usize, include_strings: bool) 
             // now()/current_timestamp/… → placeholder bound to the captured instant,
             // so the optimized plan is reusable while the time window stays fresh.
             SqlExpr::Function(f) if fn_name_is_one_of(f, PARAMETERIZABLE_TIME_FNS) => {
-                let value = placeholder_for(&mut values, base, ScalarValue::TimestampNanosecond(Some(now_ns), Some("+00:00".into())));
+                let value = placeholder_for(&mut values, base, ScalarValue::TimestampMicrosecond(Some(now_us), Some("+00:00".into())));
                 let placeholder = SqlExpr::Value(ValueWithSpan { value, span: Span::empty() });
                 // The CAST is required: a bare placeholder is untyped, so
                 // `now() - INTERVAL '1h'` cannot infer a common argument type.
                 *e = SqlExpr::Cast {
                     kind: CastKind::Cast,
                     expr: Box::new(placeholder),
-                    data_type: SqlDataType::Timestamp(None, TimezoneInfo::Tz),
+                    data_type: SqlDataType::Timestamp(Some(6), TimezoneInfo::Tz),
                     format: None,
                     array: false,
                 };
@@ -970,14 +970,14 @@ mod tests {
         ScalarValue::Utf8(Some(s.into()))
     }
 
-    /// A lifted time fn may only ever be a tz-aware nanosecond timestamp.
-    fn ts_nanos(v: &ScalarValue) -> i64 {
-        ts_nanos_opt(v).unwrap_or_else(|| panic!("expected tz-aware nanosecond timestamp, got {v:?}"))
+    /// A lifted time fn may only ever be a tz-aware microsecond timestamp.
+    fn ts_micros(v: &ScalarValue) -> i64 {
+        ts_micros_opt(v).unwrap_or_else(|| panic!("expected tz-aware microsecond timestamp, got {v:?}"))
     }
 
-    fn ts_nanos_opt(v: &ScalarValue) -> Option<i64> {
+    fn ts_micros_opt(v: &ScalarValue) -> Option<i64> {
         match v {
-            ScalarValue::TimestampNanosecond(Some(ns), Some(_)) => Some(*ns),
+            ScalarValue::TimestampMicrosecond(Some(us), Some(_)) => Some(*us),
             _ => None,
         }
     }
@@ -1111,13 +1111,13 @@ mod tests {
         None::<&str> => 1 ; "mixed parameterizes time fns above client binds only")]
     fn now_lifts_to_a_fresh_timestamp_placeholder(sql: &str, base: usize, include_strings: bool, contains: &[&str], twin: Option<&str>) -> usize {
         let render = |sql: &str| {
-            let before = chrono::Utc::now().timestamp_nanos_opt().unwrap();
+            let before = chrono::Utc::now().timestamp_micros();
             let (param, values) = parameterize_statement(&parse(sql), base, include_strings).expect("now() parameterizes");
-            let after = chrono::Utc::now().timestamp_nanos_opt().unwrap();
+            let after = chrono::Utc::now().timestamp_micros();
             // Find the lifted instant by TYPE, not position: with `include_strings`
             // the INTERVAL literal lifts after the time fn, so it is not always last.
-            let ns = values.iter().find_map(ts_nanos_opt).expect("a tz-aware instant was lifted");
-            assert!(before <= ns && ns <= after, "the lifted instant is fresh, not frozen");
+            let us = values.iter().find_map(ts_micros_opt).expect("a tz-aware instant was lifted");
+            assert!(before <= us && us <= after, "the lifted instant is fresh, not frozen");
             (param.to_string(), values)
         };
         let (text, values) = render(sql);
@@ -1131,6 +1131,18 @@ mod tests {
         values.len()
     }
 
+    /// The lifted instant must share the column's precision: a nanosecond one makes
+    /// coercion cast the COLUMN, which CSE then hoists into a projection that the
+    /// rollup matcher cannot walk, so no now()-relative query could route.
+    #[tokio::test]
+    async fn a_lifted_now_does_not_cast_the_timestamp_column() {
+        let hook = PlanCacheHook::new(64, true);
+        let sql = "SELECT count(*) FROM t WHERE project_id = 'p' AND ts >= now() - INTERVAL '4 hours' AND ts < now() - INTERVAL '3 hours'";
+        let plan = hook.cached_plan(&parse(sql), &test_ctx()).await.expect("cacheable").expect("plans");
+        let text = plan.display_indent().to_string();
+        assert!(!text.contains("CAST(t.ts"), "the column must not be cast to the bound instant's type:\n{text}");
+    }
+
     #[test]
     fn extra_execute_params_supplies_fresh_instant_for_mixed_only() {
         let hook = PlanCacheHook::new(64, true);
@@ -1139,7 +1151,7 @@ mod tests {
         let a = hook.extra_execute_params(Some(&mixed));
         let b = hook.extra_execute_params(Some(&mixed));
         assert_eq!(a.len(), 1);
-        assert!(ts_nanos(&b[0]) >= ts_nanos(&a[0]), "monotonic fresh instant");
+        assert!(ts_micros(&b[0]) >= ts_micros(&a[0]), "monotonic fresh instant");
         // Pure path (no client bind) substitutes at parse → no execute-time extras.
         assert!(hook.extra_execute_params(Some(&parse("SELECT id FROM t WHERE project_id = 'p' AND ts > now()"))).is_empty());
         // No time fn → nothing to inject.
@@ -1158,7 +1170,11 @@ mod tests {
             arrow::datatypes::{DataType, Field},
             datasource::MemTable,
         };
-        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true), Field::new("project_id", DataType::Utf8, true)]));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("project_id", DataType::Utf8, true),
+            Field::new("ts", DataType::Timestamp(datafusion::arrow::datatypes::TimeUnit::Microsecond, Some("UTC".into())), true),
+        ]));
         let ctx = SessionContext::new();
         ctx.register_table("t", Arc::new(MemTable::try_new(schema, vec![vec![]]).unwrap())).unwrap();
         ctx
