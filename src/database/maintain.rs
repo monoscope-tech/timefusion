@@ -589,6 +589,9 @@ tokio::task_local! {
     /// Which operation the current unit is, for attributing what its queries
     /// cost. Set at the one dispatch site, alongside the progress counter.
     static UNIT_OPERATION: &'static str;
+
+    /// Every scan pass of the unit `run-unit` is executing, with its plan metrics.
+    static SCAN_CAPTURE: std::cell::RefCell<Vec<super::ScanPass>>;
 }
 
 /// Rows the current unit has written, or `None` outside a unit scope.
@@ -711,6 +714,16 @@ fn plan_metric_sum(plan: &dyn datafusion::physical_plan::ExecutionPlan, name: &s
 /// `files_processed` is PER PARTITION so it grows with repartitioning.
 fn log_scan_pruning(plan: &dyn datafusion::physical_plan::ExecutionPlan, elapsed: std::time::Duration) {
     let bytes_scanned = plan_metric_sum(plan, "bytes_scanned");
+    let _ = SCAN_CAPTURE.try_with(|passes| {
+        passes.borrow_mut().push(super::ScanPass {
+            bytes_scanned,
+            row_groups_pruned: plan_metric_sum(plan, "row_groups_pruned_statistics") + plan_metric_sum(plan, "row_groups_pruned_bloom_filter"),
+            output_rows: plan_output_rows(plan),
+            peak_mem_bytes: plan_metric_sum(plan, "peak_mem_used"),
+            elapsed_ms: elapsed.as_millis() as u64,
+            plan: datafusion::physical_plan::display::DisplayableExecutionPlan::with_metrics(plan).indent(true).to_string(),
+        })
+    });
     if bytes_scanned == 0 {
         return;
     }
@@ -2393,18 +2406,26 @@ impl Database {
                 stats.rollup_commit_duration_ms.load(Relaxed),
                 stats.rollup_end_to_end_duration_ms.load(Relaxed),
                 stats.rollup_scan_cohorts.load(Relaxed),
+                stats.rollup_output_rows.load(Relaxed),
+                stats.rollup_output_files.load(Relaxed),
+                stats.rollup_commit_actions.load(Relaxed),
             ]
         };
         let counters = snapshot();
-        let started = std::time::Instant::now();
-        match operation {
-            Operation::Dedup => self.run_coordinator_dedup_selected(TaskSelection::Exact(&key)).await?,
-            Operation::BaseRollup | Operation::DerivedRollup => self.run_coordinator_rollup_selected(TaskSelection::Exact(&key)).await?,
-            Operation::HotPacking | Operation::SealedConsolidation | Operation::Repair => {
-                self.run_coordinator_compaction_selected(TaskSelection::Exact(&key)).await?
-            }
-        };
-        let wall = started.elapsed();
+        let (started, cpu) = (std::time::Instant::now(), crate::support::test_helpers::process_cpu()?);
+        let passes = SCAN_CAPTURE
+            .scope(std::cell::RefCell::new(Vec::new()), async {
+                match operation {
+                    Operation::Dedup => self.run_coordinator_dedup_selected(TaskSelection::Exact(&key)).await?,
+                    Operation::BaseRollup | Operation::DerivedRollup => self.run_coordinator_rollup_selected(TaskSelection::Exact(&key)).await?,
+                    Operation::HotPacking | Operation::SealedConsolidation | Operation::Repair => {
+                        self.run_coordinator_compaction_selected(TaskSelection::Exact(&key)).await?
+                    }
+                };
+                anyhow::Ok(SCAN_CAPTURE.with(std::cell::RefCell::take))
+            })
+            .await?;
+        let (wall, cpu) = (started.elapsed(), crate::support::test_helpers::process_cpu()?.saturating_sub(cpu));
         let after = snapshot();
         let (state, retry_reason) = {
             let journal = self.journal();
@@ -2420,6 +2441,11 @@ impl Database {
             commit_ms: after[2] - counters[2],
             end_to_end_ms: after[3] - counters[3],
             cohorts: after[4] - counters[4],
+            output_rows: after[5] - counters[5],
+            output_files: after[6] - counters[6],
+            commit_actions: after[7] - counters[7],
+            cpu_ms: u64::try_from(cpu.as_millis()).unwrap_or(u64::MAX),
+            passes,
             state,
             retry_reason,
         })
@@ -10781,6 +10807,12 @@ mod rollup_noop_skip_tests {
         advance_and_drain(&db).await?;
         let sibling = db.run_unit_once("otel_logs_and_spans", &project, date, Operation::BaseRollup, 1, 15).await?;
         assert_eq!(sibling.state, Some(TaskState::Complete), "the fixture needs a published sibling slice");
+        assert!(sibling.cpu_ms > 0 && sibling.output_files > 0, "run-unit reports the unit's CPU and output: {sibling}");
+        assert!(
+            sibling.passes.iter().any(|pass| pass.bytes_scanned > 0 && pass.plan.contains("AggregateExec")),
+            "run-unit captures each scan pass with its executed plan: {:?}",
+            sibling.passes
+        );
         let start = date.and_hms_opt(11, 0, 0).expect("valid hour").and_utc().timestamp_micros();
         let hour = 3_600_000_000;
         let target = db.resolve_table(&project, TIER).await?;

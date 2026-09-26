@@ -2727,11 +2727,27 @@ fn slice_share_of_file(file_min: Option<i64>, file_max: Option<i64>, slice: crat
     (u64::try_from(overlap.max(floor).min(span)).unwrap_or(1), u64::try_from(span).unwrap_or(1))
 }
 
+/// One scan pass of a `run-unit` execution, from DataFusion's own plan metrics.
+/// `peak_mem_bytes` sums each operator's peak, an upper bound on concurrent state.
+#[derive(Debug, derive_more::Display)]
+#[display("{bytes_scanned}B scanned, {row_groups_pruned} row groups pruned, {output_rows} rows, peak {peak_mem_bytes}B, {elapsed_ms}ms")]
+pub struct ScanPass {
+    pub bytes_scanned: u64,
+    pub row_groups_pruned: u64,
+    pub output_rows: u64,
+    pub peak_mem_bytes: u64,
+    pub elapsed_ms: u64,
+    pub plan: String,
+}
+
 /// What a single `run-unit` execution produced. Phase counters are deltas of the global
 /// `maintenance_stats` atomics, valid only because the CLI owns the process.
 #[derive(derive_more::Display)]
 #[display(
-    "run-unit: {operation:?} {project_id} {date} | wall {wall_ms}ms | scan {scan_ms}ms staging {staging_ms}ms commit {commit_ms}ms e2e {end_to_end_ms}ms | cohorts {cohorts} | state {state:?}{}",
+    "run-unit: {operation:?} {project_id} {date} | wall {wall_ms}ms cpu {cpu_ms}ms | scan {scan_ms}ms staging {staging_ms}ms commit {commit_ms}ms e2e {end_to_end_ms}ms | cohorts {cohorts} passes {} scanned {}B peak {}B | out {output_rows} rows {output_files} files {commit_actions} actions | state {state:?}{}",
+    passes.len(),
+    passes.iter().map(|pass| pass.bytes_scanned).sum::<u64>(),
+    passes.iter().map(|pass| pass.peak_mem_bytes).max().unwrap_or(0),
     retry_reason.as_deref().map_or_else(String::new, |reason| format!(" | retry_reason {reason}"))
 )]
 pub struct UnitRunReport {
@@ -2744,6 +2760,11 @@ pub struct UnitRunReport {
     pub commit_ms: u64,
     pub end_to_end_ms: u64,
     pub cohorts: u64,
+    pub output_rows: u64,
+    pub output_files: u64,
+    pub commit_actions: u64,
+    pub cpu_ms: u64,
+    pub passes: Vec<ScanPass>,
     pub state: Option<crate::maintenance_coordinator::TaskState>,
     pub retry_reason: Option<String>,
 }

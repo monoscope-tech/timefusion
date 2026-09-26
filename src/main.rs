@@ -336,12 +336,13 @@ fn run_sim_cli() -> anyhow::Result<()> {
 }
 
 /// `timefusion run-unit --project ID [--source TABLE] [--date YYYY-MM-DD]
-/// [--op base|derived|dedup|hot|sealed|repair] [--slice-hours N] [--offset-hours N]`
+/// [--op base|derived|dedup|hot|sealed|repair] [--slice-hours N] [--offset-hours N] [--explain]`
 ///
 /// Execute ONE maintenance unit against the configured storage and print where
 /// its time went (scan/stage/commit deltas + wall). Claims only the requested
 /// task and preserves unrelated journal entries; normal admission and dependency
-/// checks still apply.
+/// checks still apply. Each scan pass prints its DataFusion metrics; `--explain`
+/// adds the executed physical plan.
 async fn run_unit_cli(cfg: &'static AppConfig) -> anyhow::Result<()> {
     init_cli_tracing();
     let mut source = "otel_logs_and_spans".to_string();
@@ -350,8 +351,10 @@ async fn run_unit_cli(cfg: &'static AppConfig) -> anyhow::Result<()> {
     let mut operation = timefusion::maintenance_coordinator::Operation::BaseRollup;
     let mut slice_hours: i64 = 24;
     let mut offset_hours: i64 = 0;
+    let mut explain = false;
     let mut it = Args::new();
-    cli_args!(it, "usage: timefusion run-unit --project ID [--source T] [--date D] [--op OP] [--slice-hours N] [--offset-hours N]", {
+    cli_args!(it, "usage: timefusion run-unit --project ID [--source T] [--date D] [--op OP] [--slice-hours N] [--offset-hours N] [--explain]", {
+        "--explain" => explain = true,
         "--source" => source = it.value("--source")?,
         "--project" => project = Some(it.value("--project")?),
         "--date" => date = Some(it.parse("--date", "YYYY-MM-DD")?),
@@ -378,6 +381,12 @@ async fn run_unit_cli(cfg: &'static AppConfig) -> anyhow::Result<()> {
     db.load_verified_sorted();
     let report = db.run_unit_once(&source, &project, date, operation, slice_hours, offset_hours).await?;
     println!("{report}");
+    for (n, pass) in report.passes.iter().enumerate() {
+        println!("pass {n}: {pass}");
+        if explain {
+            println!("{}", pass.plan);
+        }
+    }
     Ok(())
 }
 
