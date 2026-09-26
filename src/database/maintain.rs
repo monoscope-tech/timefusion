@@ -2055,32 +2055,50 @@ impl Database {
                 .is_some_and(|grain| grain > 0 && key.slice.start_micros.rem_euclid(grain) == 0 && key.slice.end_micros.rem_euclid(grain) == 0)
     }
 
-    /// Stage only the aggregate rows outside an aligned repair. The caller commits
-    /// these Adds with the repaired slice and retires every original in one transaction.
-    async fn stage_packed_rollup_remainders(
-        &self, key: &crate::maintenance_coordinator::TaskKey, table: &DeltaTable, live: &[deltalake::kernel::Add], staged: &mut Vec<deltalake::kernel::Add>,
-    ) -> Result<Vec<deltalake::kernel::Add>> {
-        use crate::maintenance_coordinator::{TAG_GENERATION, TAG_OUTPUT_ROWS, TAG_SLICE_END, TAG_SLICE_START, TAG_SOURCE_ROWS_BELOW};
-        use deltalake::writer::DeltaWriter;
-        let groups = live
-            .iter()
+    /// Live files of `key`'s project that straddle its slice, grouped by publication.
+    fn packed_groups(
+        key: &crate::maintenance_coordinator::TaskKey, live: &[deltalake::kernel::Add],
+    ) -> HashMap<((i64, i64), Option<String>), Vec<deltalake::kernel::Add>> {
+        live.iter()
             .filter_map(|add| {
                 let range = Self::slice_tag_range(add)?;
                 (Self::tag_project(add) == Some(key.project_id.as_str())
                     && key.slice.overlaps(range.0, range.1)
                     && (range.0 < key.slice.start_micros || range.1 > key.slice.end_micros))
-                    .then(|| ((range, Self::add_tag(add, TAG_GENERATION).map(str::to_owned)), add.clone()))
+                    .then(|| ((range, Self::add_tag(add, crate::maintenance_coordinator::TAG_GENERATION).map(str::to_owned)), add.clone()))
             })
-            .into_group_map();
+            .into_group_map()
+    }
+
+    /// Publications that predate per-file output proofs cannot be split; their
+    /// repairs escalate to the covering slice as unpacked repairs do.
+    fn packed_evidence_complete(groups: &HashMap<((i64, i64), Option<String>), Vec<deltalake::kernel::Add>>) -> bool {
+        groups.iter().all(|((_, generation), files)| {
+            let proof = files.iter().map(RollupOutputProof::from_add).reduce(RollupOutputProof::merge);
+            generation.is_some()
+                && proof.is_some_and(|proof| proof.live.is_some() && proof.live == proof.published)
+                && carried_coverage_tags(files).contains_key(crate::maintenance_coordinator::TAG_GENERATION)
+        })
+    }
+
+    /// Packed repair applies to `key` against this live set.
+    fn packed_repair_applies(&self, key: &crate::maintenance_coordinator::TaskKey, live: &[deltalake::kernel::Add]) -> bool {
+        self.packed_rollup_repair_allowed(key) && Self::packed_evidence_complete(&Self::packed_groups(key, live))
+    }
+
+    /// Stage only the aggregate rows outside an aligned repair. The caller commits
+    /// these Adds with the repaired slice and retires every original in one transaction.
+    async fn stage_packed_rollup_remainders(
+        &self, key: &crate::maintenance_coordinator::TaskKey, table: &DeltaTable, live: &[deltalake::kernel::Add], staged: &mut Vec<deltalake::kernel::Add>,
+    ) -> Result<Vec<deltalake::kernel::Add>> {
+        use crate::maintenance_coordinator::{TAG_OUTPUT_ROWS, TAG_SLICE_END, TAG_SLICE_START, TAG_SOURCE_ROWS_BELOW};
+        use deltalake::writer::DeltaWriter;
+        let groups = Self::packed_groups(key, live);
+        anyhow::ensure!(Self::packed_evidence_complete(&groups), "packed publication lacks complete, consistent output evidence");
         let schema = get_schema(&key.physical_table).context("packed rollup schema missing")?;
         let mut retired = Vec::new();
-        for ((range, generation), files) in groups {
+        for ((range, _), files) in groups {
             let coverage_tags = carried_coverage_tags(&files);
-            let proof = files.iter().map(RollupOutputProof::from_add).reduce(RollupOutputProof::merge).context("packed output proof missing")?;
-            anyhow::ensure!(
-                generation.is_some() && proof.live.is_some() && proof.live == proof.published && coverage_tags.contains_key(TAG_GENERATION),
-                "packed publication lacks complete, consistent output evidence"
-            );
             for (start, end) in crate::rollup::uncovered(range.0, range.1, vec![(key.slice.start_micros, key.slice.end_micros)]) {
                 let ctx = self.bounded_rollup_maintenance_context(256)?;
                 let provider = Self::narrow_provider(
@@ -3013,9 +3031,8 @@ impl Database {
         let leaves_partition_clean = !live_adds.iter().filter(|add| in_partition(add) && !replaced.iter().any(|gone| gone.path == add.path)).any(no_identity);
         // Applies to BOTH tiers — see `covering_slice_for` for why publishing over a
         // wider live file double counts.
-        if !self.packed_rollup_repair_allowed(&key)
-            && let Some(covering) = live_adds.iter().find_map(|add| Self::covering_slice_for(add, &key))
-        {
+        let packed = self.packed_repair_applies(&key, &live_adds);
+        if !packed && let Some(covering) = live_adds.iter().find_map(|add| Self::covering_slice_for(add, &key)) {
             // The SAFETY NET. The same decision is made before the scan (see the
             // other `settle_covered_by_wider` call site), but a wider slice can be
             // committed by another worker while this unit was aggregating, so the
@@ -3025,7 +3042,7 @@ impl Database {
             return Ok(true);
         }
         let slice_output_files = adds.len() as u64;
-        if self.packed_rollup_repair_allowed(&key) {
+        if packed {
             match self.stage_packed_rollup_remainders(&key, &staging_table, &live_adds, &mut adds).await {
                 Ok(packed) => replaced.extend(packed),
                 Err(error) => {
@@ -4477,7 +4494,11 @@ impl Database {
             }
             return Ok(true);
         }
-        if self.packed_rollup_repair_allowed(key) {
+        if self.packed_rollup_repair_allowed(key)
+            && let Ok(target) = self.resolve_table(&key.project_id, &key.physical_table).await
+            && let Ok(snapshot) = target.read().await.snapshot().cloned()
+            && self.packed_repair_applies(key, &snapshot.log_data().iter().map(|file| add_action(&file)).collect::<Vec<_>>())
+        {
             return Ok(false);
         }
         let escalated = {
@@ -10630,6 +10651,40 @@ mod rollup_noop_skip_tests {
             }
         }
         Ok(())
+    }
+
+    #[test_case::test_case(Some("3"), Some("gen"), true ; "complete publication packs")]
+    #[test_case::test_case(None, Some("gen"), false ; "missing output rows escalates")]
+    #[test_case::test_case(Some("2"), Some("gen"), false ; "disagreeing output rows escalates")]
+    #[test_case::test_case(Some("3"), None, false ; "missing generation escalates")]
+    fn packed_repair_needs_complete_output_evidence(output_rows: Option<&str>, generation: Option<&str>, packs: bool) {
+        use crate::maintenance_coordinator::{
+            TAG_GENERATION, TAG_OUTPUT_ROWS, TAG_PROJECT, TAG_SLICE_END, TAG_SLICE_START, TAG_SOURCE, TAG_SOURCE_FINGERPRINT, TaskKey, TimeSlice,
+        };
+        let hour = 3_600_000_000i64;
+        let tags = [
+            (TAG_SOURCE, Some("otel_logs_and_spans")),
+            (TAG_SOURCE_FINGERPRINT, Some("1")),
+            (TAG_PROJECT, Some("p")),
+            (TAG_SLICE_START, Some("0")),
+            (TAG_SLICE_END, Some("10800000000")),
+            (TAG_OUTPUT_ROWS, output_rows),
+            (TAG_GENERATION, generation),
+        ];
+        let live = vec![deltalake::kernel::Add {
+            path: "packed.parquet".into(),
+            stats: Some(r#"{"numRecords":3}"#.into()),
+            tags: Some(tags.iter().filter_map(|(name, value)| Some(((*name).to_owned(), Some((*value)?.to_owned())))).collect()),
+            ..Default::default()
+        }];
+        let key = TaskKey {
+            project_id: "p".into(),
+            source: "otel_logs_and_spans".into(),
+            physical_table: TIER.into(),
+            slice: TimeSlice::new(hour, 2 * hour).expect("valid slice"),
+            operation: Operation::BaseRollup,
+        };
+        assert_eq!(Database::packed_evidence_complete(&Database::packed_groups(&key, &live)), packs);
     }
 
     #[tokio::test]
