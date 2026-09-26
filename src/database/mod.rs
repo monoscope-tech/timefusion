@@ -830,6 +830,13 @@ pub(crate) struct RollupReadTicket {
     output: RollupOutputTicket,
 }
 
+impl RollupReadTicket {
+    /// The rollup table serving the read — the per-tier hit attribute.
+    pub(crate) fn tier(&self) -> &str {
+        &self.output.target
+    }
+}
+
 #[derive(Debug)]
 struct RollupOutputTicket {
     source: String,

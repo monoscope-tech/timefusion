@@ -914,11 +914,11 @@ sum_recorders! {
 }
 
 /// One dashboard aggregate answered from a configured rollup.
-pub fn record_rollup_hit(mode: &'static str, grain: &str) {
+pub fn record_rollup_hit(mode: &'static str, grain: &str, tier: &str) {
     let stats = maintenance_stats();
     if mode == "hybrid" { &stats.rollup_hits_hybrid } else { &stats.rollup_hits_full }.fetch_add(1, Relaxed);
     if let Some(m) = METRICS.get() {
-        m.rollup_hits.add(1, &[KeyValue::new("mode", mode), KeyValue::new("grain", grain.to_string())]);
+        m.rollup_hits.add(1, &[KeyValue::new("mode", mode), KeyValue::new("grain", grain.to_string()), KeyValue::new("tier", tier.to_string())]);
     }
 }
 

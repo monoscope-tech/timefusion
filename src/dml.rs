@@ -209,7 +209,7 @@ impl QueryPlanner for DmlQueryPlanner {
                 .await;
                 match planned {
                     Ok(exec) if self.database.rollup_ticket_current(&ticket).await => {
-                        crate::observability::record_rollup_hit(mode, &grain);
+                        crate::observability::record_rollup_hit(mode, &grain, ticket.tier());
                         return Ok(exec);
                     }
                     Ok(_) => {
