@@ -421,7 +421,7 @@ dependencies = [
 [[package]]
 name = "arrow-pg"
 version = "0.15.0"
-source = "git+https://github.com/apitoolkit/datafusion-postgres.git?rev=dc185ea9ea87c889a68acc30b2b348f24fc8bbb7#dc185ea9ea87c889a68acc30b2b348f24fc8bbb7"
+source = "git+https://github.com/apitoolkit/datafusion-postgres.git?rev=68fdc80d4a136e7ff0b02eb3755a3418141b9952#68fdc80d4a136e7ff0b02eb3755a3418141b9952"
 dependencies = [
  "arrow-schema",
  "bytes",
@@ -2696,7 +2696,7 @@ dependencies = [
 [[package]]
 name = "datafusion-pg-catalog"
 version = "0.18.3"
-source = "git+https://github.com/apitoolkit/datafusion-postgres.git?rev=dc185ea9ea87c889a68acc30b2b348f24fc8bbb7#dc185ea9ea87c889a68acc30b2b348f24fc8bbb7"
+source = "git+https://github.com/apitoolkit/datafusion-postgres.git?rev=68fdc80d4a136e7ff0b02eb3755a3418141b9952#68fdc80d4a136e7ff0b02eb3755a3418141b9952"
 dependencies = [
  "arrow-pg",
  "async-trait",
@@ -2710,7 +2710,7 @@ dependencies = [
 [[package]]
 name = "datafusion-pg-functions"
 version = "0.1.0"
-source = "git+https://github.com/apitoolkit/datafusion-postgres.git?rev=dc185ea9ea87c889a68acc30b2b348f24fc8bbb7#dc185ea9ea87c889a68acc30b2b348f24fc8bbb7"
+source = "git+https://github.com/apitoolkit/datafusion-postgres.git?rev=68fdc80d4a136e7ff0b02eb3755a3418141b9952#68fdc80d4a136e7ff0b02eb3755a3418141b9952"
 dependencies = [
  "datafusion",
  "libm",
@@ -2829,7 +2829,7 @@ dependencies = [
 [[package]]
 name = "datafusion-postgres"
 version = "0.18.0"
-source = "git+https://github.com/apitoolkit/datafusion-postgres.git?rev=dc185ea9ea87c889a68acc30b2b348f24fc8bbb7#dc185ea9ea87c889a68acc30b2b348f24fc8bbb7"
+source = "git+https://github.com/apitoolkit/datafusion-postgres.git?rev=68fdc80d4a136e7ff0b02eb3755a3418141b9952#68fdc80d4a136e7ff0b02eb3755a3418141b9952"
 dependencies = [
  "arrow-pg",
  "async-trait",
