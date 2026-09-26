@@ -18,6 +18,7 @@ impl datafusion::physical_plan::DisplayAs for CompactRollupSortInput {
 }
 
 impl ExecutionPlan for CompactRollupSortInput {
+    no_physical_exprs!();
     fn name(&self) -> &'static str {
         "CompactRollupSortInput"
     }
@@ -58,6 +59,7 @@ impl datafusion::physical_plan::DisplayAs for RollupSortHeadroom {
 }
 
 impl ExecutionPlan for RollupSortHeadroom {
+    no_physical_exprs!();
     fn name(&self) -> &'static str {
         "RollupSortHeadroom"
     }
@@ -110,7 +112,7 @@ impl datafusion::physical_optimizer::PhysicalOptimizerRule for CompactRollupSort
                 return Ok(Transformed::no(node));
             }
             let input = Arc::new(CompactRollupSortInput(Arc::clone(sort.input())));
-            let sort = node.with_new_children(vec![input])?;
+            let sort = datafusion::physical_plan::replace_children_if_necessary(node, vec![input])?;
             Ok(Transformed::yes(Arc::new(RollupSortHeadroom(sort)) as Arc<dyn ExecutionPlan>))
         })
         .data()
