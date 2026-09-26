@@ -127,9 +127,10 @@ jobs:
         shard: [1, 2]
     # A Cargo.lock change busts the rust-cache key and forces a full cold
     # recompile, which alone can approach the old 25m cap and starve the
-    # (S3-integration-heavy) test run — the 2026-07-10/11 timeouts. 45m gives
-    # cold builds headroom.
-    timeout-minutes: 45
+    # (S3-integration-heavy) test run — the 2026-07-10/11 timeouts. The rollup
+    # fixtures took a shard to 27m of tests plus doctests; 60m keeps cold builds
+    # headroom on top.
+    timeout-minutes: 60
     env:
       AWS_SDK_LOAD_CONFIG: "false"
       AWS_ENDPOINT_URL: http://127.0.0.1:9000
