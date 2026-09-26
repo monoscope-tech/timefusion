@@ -48,17 +48,20 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-24.04
+    # 32 vCPU: the release image (thin LTO) took 21-31 min on the 4-vCPU hosted runner,
+    # and 40+ when Cargo.lock moved and cargo-chef re-cooked every dependency.
+    runs-on: blacksmith-32vcpu-ubuntu-2404
 
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+      # BuildKit on a sticky disk: layers (incl. the cargo-chef dependency cook) persist
+      # across runs instead of round-tripping through the GHA cache.
+      - name: Set up Docker builder
+        uses: useblacksmith/setup-docker-builder@v2
         with:
-          # Use a container-based driver (using BuildKit) to enable cache export.
-          driver-opts: image=moby/buildkit:master
+          cache-key: timefusion/production-image
 
       - name: Login to Container Registry
         uses: docker/login-action@v3
@@ -87,7 +90,7 @@ jobs:
 
       - name: Build and Push Docker Image
         if: steps.candidate.outputs.image == ''
-        uses: docker/build-push-action@v5
+        uses: useblacksmith/build-push-action@v2
         with:
           context: .
           file: ./Dockerfile
@@ -95,8 +98,6 @@ jobs:
           tags: |
             ${{ env.IMAGE_URL }}
             ${{ env.IMAGE_LATEST }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
 
       - name: Promote locally built image
         if: steps.candidate.outputs.image != ''
