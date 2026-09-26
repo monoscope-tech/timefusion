@@ -1640,18 +1640,20 @@ pub(crate) async fn match_aggregates(
             if let Some(table) = scans.iter().find(|table| crate::schema::get_schema(table).is_some_and(|schema| !schema.rollups.is_empty())) {
                 let reason = if scans.len() == 1 { MissReason::UnwalkableSource } else { MissReason::MultiScanSource };
                 crate::observability::record_rollup_miss(reason);
-                // Unconditional warn, not sampled: this class is too rare to
-                // survive 1-in-64 sampling.
-                tracing::warn!(
-                    event = "rollup_declined_shape",
-                    source = %table,
-                    reason = reason.label(),
-                    scans = scans.len(),
-                    node,
-                    inlined_cse = inlined.is_some(),
-                    plan = %shape(),
-                    "the matcher could not walk from the aggregate down to the scan"
-                );
+                // An unwalkable shape is rare and actionable, so it always warns; a
+                // multi-scan one is a recurring raw-only job, so it samples.
+                if reason == MissReason::UnwalkableSource || crate::observability::sample_rollup_miss(reason.label()) {
+                    tracing::warn!(
+                        event = "rollup_declined_shape",
+                        source = %table,
+                        reason = reason.label(),
+                        scans = scans.len(),
+                        node,
+                        inlined_cse = inlined.is_some(),
+                        plan = %shape(),
+                        "the matcher could not walk from the aggregate down to the scan"
+                    );
+                }
             }
             return Ok(Vec::new());
         }
@@ -3083,7 +3085,7 @@ mod tests {
                ON b.context___trace_id = t.context___trace_id \
              GROUP BY b.status_code"
         ),
-        "Join", MissReason::MultiScanSource; "a SELF-JOIN — monoscope rollupServiceEdges, 39% of prod declines")]
+        "Join", MissReason::MultiScanSource; "a SELF-JOIN — monoscope rollUpServiceMap edges, every prod multi-scan decline")]
     #[test_case::test_case(
         &format!("SELECT count(DISTINCT status_code) FROM (SELECT DISTINCT status_code FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW}) d"),
         "Aggregate", MissReason::UnwalkableSource; "an inner DISTINCT, which plans as a second Aggregate")]
@@ -3098,6 +3100,7 @@ mod tests {
             _ => &stats.rollup_miss_unwalkable_source,
         };
         let before = counter.load(std::sync::atomic::Ordering::Relaxed);
+        let misses_before = stats.rollup_misses_total.load(std::sync::atomic::Ordering::Relaxed);
         let plan = optimized(&state, sql).await;
 
         assert_eq!(
@@ -3110,6 +3113,11 @@ mod tests {
             1,
             "the miss must be counted exactly once — it leaves through Ok(Vec::new()), so nothing else records it: {}",
             plan.display_indent()
+        );
+        assert_eq!(
+            stats.rollup_misses_total.load(std::sync::atomic::Ordering::Relaxed) - misses_before,
+            u64::from(expected_reason != MissReason::MultiScanSource),
+            "a multi-scan plan no rollup can serve must stay out of the hit-rate denominator"
         );
 
         // Read off the same walk the matcher runs, so a test-only re-derivation

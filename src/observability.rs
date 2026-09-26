@@ -938,7 +938,11 @@ pub fn sample_rollup_miss(key: &'static str) -> bool {
 pub fn record_rollup_miss(reason: crate::rollup::MissReason) {
     use crate::rollup::MissReason as R;
     let stats = maintenance_stats();
-    stats.rollup_misses_total.fetch_add(1, Relaxed);
+    // A plan that scans the source more than once (raw self-joins, UNIONs) is outside
+    // what any rollup can serve, so it stays out of the hit-rate denominator.
+    if reason != R::MultiScanSource {
+        stats.rollup_misses_total.fetch_add(1, Relaxed);
+    }
     match reason {
         R::NotBuilt => &stats.rollup_miss_not_built,
         R::StaleCoverage => &stats.rollup_miss_stale_coverage,
