@@ -46,7 +46,7 @@ Status: ⬜ open · 🟡 in progress · ✅ done. Priority is the plan's executi
 | W4 | Session-tier consumer inventory | analysis | First deliverable (B1) | Every reader of `*_rollup_sessions_1h_v1` (monoscope code paths, direct SQL, infrequent jobs) and a keep/pause/remove recommendation; unserved HLL review | monoscope repo (read-only), prod pgwire logs | — | agent (Claude) | ✅ |
 | W5 | Per-range witness (restart recovery) | build | Stage 0 | **Deprioritized by measurement**: the 18:05 restart re-queued 26 `WitnessMoved` slices, all in the paused `sessions_1h_v1`, zero in dashboard tiers (`rollup_unverifiable_rebuild_queued` log). Revisit only if a dashboard tier shows it | — | W1 | Claude | ✅ measured |
 | W6 | `multi_scan_source` shapes | analysis → build (lane 2) | Rollup misses | Classify the 192/h self-join/UNION declines (service-edges); decide: route per-leg, rewrite in monoscope, or leave raw; then implement the chosen matcher change with a case-table test | `src/rollup.rs` matcher (`source_and_filters`, `match_aggregates`) | — | agent (Claude) | ✅ |
-| W7 | Stage 1 build measurement harness | build (lane 2) | Stage 1 | For representative units via `timefusion run-unit`: physical plan, scan count, hash shards, dedup ops, decoded bytes, aggregate-state memory, CPU; publication economics (commits/actions/latency incl. failures) | `src/main.rs` `run-unit`, `benches/rollup_work.rs`, report under `docs/plans/` | W3 for unit choice | | ⬜ |
+| W7 | Stage 1 build measurement harness | build (lane 2) | Stage 1 | For representative units via `timefusion run-unit`: physical plan, scan count, hash shards, dedup ops, decoded bytes, aggregate-state memory, CPU; publication economics (commits/actions/latency incl. failures) | `src/main.rs` `run-unit`, `benches/rollup_work.rs`, report under `docs/plans/` | W3 for unit choice | Claude (timefusion-2e) | 🟡 |
 | W8 | 1D dependency classification — design + fixtures | analysis → build (lane 2) | Stage 1D | Per-spec dependency map (dims, measures, filters, identity, ts, version, delete); mutation fixture table proving zero missed relevant invalidations; then the classifier | new test module; `apply_rollup_hours` call sites in `database/rollup.rs` | W2 (which mutations dominate) | | ⬜ |
 | W9 | Stage 3 publication batching — design | analysis | Stage 3 | Concrete design mapped to existing staged publication / journal group-commit; WAL-compat decision (does the payload change?); queue limits; test list | design doc only | — | agent (Claude) | ✅ |
 | W10 | Capacity replay harness | build (lane 2) | Shared gates | `timefusion sim` replay of a prod journal at 1x/2x/4x rows and 1x/2x/4x projects; report backlog stability and work per accepted row | `src/maintenance_sim.rs`, `src/main.rs` | W2 | | ⬜ |
@@ -58,6 +58,7 @@ Status: ⬜ open · 🟡 in progress · ✅ done. Priority is the plan's executi
 | W16 | W2 via exported metric history | analysis | Attribution | Multi-day rollup/maintenance CPU and work attribution from OTel metrics in monoscope (`monoscope chart --source metrics`), not young-process counters | monoscope CLI, prod read-only | — | agent (Claude) | ✅ |
 | W17 | W8 design: dependency classification | analysis | Stage 1D | Per-spec dependency map + mutation fixture table + where the classifier hooks in | design doc | — | agent (Claude) | ✅ design |
 | W18 | W10 design: capacity replay | analysis | Shared gates | How to drive `timefusion sim` at 1x/2x/4x rows and projects; what it can/can't prove; code plan | design doc | — | agent (Claude) | ✅ design |
+| W19 | Export per-lane work as OTel counters | build (lane 2) | W16 gap | Lease ms by operation/outcome, processed bytes by operation, rollup publications / published input bytes / scan bytes by tier; no stats-key changes | `src/observability.rs`, `maintenance_coordinator.rs` lease drop, `maintain.rs` byte sites | W16 | Claude (timefusion-2e) | ✅ handed off `ws/w19-lane-counters` |
 
 Later stages (2, 4, 5, 6, 1C, certified-clean activation, adaptive batches) stay **conditional** on W2/W7
 numbers, per the plan; do not start them without a measured residual cost.
@@ -196,3 +197,22 @@ scan-side ≈7x, not exported); 96% of leases ended in Retry; hit rate 5.3% outs
 the 18:05 `now()` fix — consistent with W14's unreadable overlapping cells; being re-measured after the W14 fix.
 **Gaps:** no per-lane CPU metric; `work.*`, `rollup_scan_*`, `processed_bytes` are stats-only (not exported);
 `worker_secs` never recorded → export per-operation `ran_secs` and per-tier publications/bytes as OTel counters.
+
+### W19 result — 2026-09-27 — Claude (timefusion-2e)
+**Question:** W16 could not show that W13/W14 saved work, because per-lane work lived only in logs and in
+stats keys that reset on deploy. **Method:** five OTel counters wired like `rollup_hits`, with `timefusion_stats`
+keys unchanged:
+- `timefusion.maintenance.lease_ms{operation,outcome}`, recorded in `TaskLease::drop` beside `maintenance_task_finished`.
+- `maintenance.processed_bytes{operation}`: all three existing byte sites go through one helper that still bumps the stats atomic.
+- `rollup.publications{tier}` and `rollup.published_input_bytes{tier}`.
+- `rollup.scan_estimated_bytes{tier}`: every pass, including failed and repeated shard passes.
+
+`tier` is the rollup table, the same label as the hit counter; there is no `project_id`.
+**Read it as:** `scan_estimated_bytes / published_input_bytes` per tier is the wasted-scan share W13 should move;
+`lease_ms{outcome=Retry}` is the lease time spent on units that did not complete.
+**Numbers:** `cargo lint` clean. `nextest --lib observability|maintenance_coordinator|rollup` 456/456. The guard
+`lane_work_is_exported_per_operation_and_tier` (SDK `ManualReader`; dev-dependency feature
+`experimental_metrics_custom_reader`, which adds no crates) goes red when one export is removed.
+**Branch:** `ws/w19-lane-counters` @ `4e89c823` on `cf05ac93`. **Integrator next:** batch it; after the deploy,
+compare the wasted-scan share per tier on a ≥1 h process.
+
