@@ -3367,8 +3367,6 @@ impl Database {
             ("datafusion.optimizer.enable_topk_aggregation", "true"),
             ("datafusion.execution.coalesce_batches", "true"),
             ("datafusion.optimizer.max_passes", "5"),
-            // The per-query share of the (already tree-sized) pool.
-            ("datafusion.execution.memory_fraction", "0.9"),
         ] {
             set_or_warn(&mut options, key, value);
         }
