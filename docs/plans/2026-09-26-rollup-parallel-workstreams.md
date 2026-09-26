@@ -53,7 +53,7 @@ Status: ⬜ open · 🟡 in progress · ✅ done. Priority is the plan's executi
 | W11 | OpenTelemetry 0.33 upgrade | build (lane 2) | Housekeeping | Closes the `opentelemetry_sdk` advisory (unbounded baggage alloc) | `Cargo.toml`, `src/observability.rs` | — | Claude (timefusion-2e) | ✅ handed off |
 | W12 | `dcount(name)` measure decision | analysis | Rollup misses | Cost/benefit for a `name` HLL + 2-way server-scope count guard on `dashboard_1m_v3` (schema comment ~L501 declines it on purpose); owner decides | `schemas/otel_logs_and_spans.yaml` (proposal only) | W2 | | ⬜ |
 | W13 | Narrow the slice OCC gate (Stage 3 step 1) | build (lane 2) | Stage 3 | A non-overlapping sibling slice no longer makes a staged unit `slice_occ_stale`; a unit may retire narrower contained slices; target proof re-recorded under the commit lock; cause logging; tests 1, 3, 3b of the W9 design failing-first | `maintain.rs` `run_coordinator_rollup_selected` OCC check | W9 | Claude | 🟡 branch `ws/w13-occ-narrow` (842617b9), **top priority per W3** |
-| W14 | 720-minute republication loop | analysis → build | Stage 0 / 1 | Why 58 slices (mostly 720-min `dashboard_1m_v3`) republished 431 times in 65 min (56% of publications, 228/361 GB); fix the re-mint source (census / witness moved / no-op skip miss); log the retry reason on `maintenance_task_finished` | `maintain.rs` census + no-op decision, `database/rollup.rs` | W3 | | ⬜ |
+| W14 | 720-minute republication loop | analysis → build | Stage 0 / 1 | Why 58 slices (mostly 720-min `dashboard_1m_v3`) republished 431 times in 65 min (56% of publications, 228/361 GB); fix the re-mint source (census / witness moved / no-op skip miss); log the retry reason on `maintenance_task_finished` | `maintain.rs` census + no-op decision, `database/rollup.rs` | W3 | Claude | 🟡 fix committed, testing |
 
 Later stages (2, 4, 5, 6, 1C, certified-clean activation, adaptive batches) stay **conditional** on W2/W7
 numbers, per the plan; do not start them without a measured residual cost.
@@ -139,3 +139,16 @@ paired start/publish/finish; reconciles with `rollup_scan_cohorts_total` to 0.4%
 (2) **58 slices republished 431 times** (56% of publications, 228/361 GB), mostly 720-min slices → W14.
 (3) 62% of published units were a 2nd+ attempt.
 **Decision:** 1B shard capping is a small lever; do W13 and W14 first; log the retry reason on `maintenance_task_finished`.
+
+### W14 result — 2026-09-26 — agent (Claude) + integrator
+**Question:** why 58 slices republished 431 times in 65 min.
+**Root cause (defect):** sealed days (09-05…09-17) holding one pre-`output_rows` tier file that straddles the new half-day
+split (e.g. 28f62f01/09-14 has a 04:00–14:00 file). Overlapping tagged ranges in one (project, generation) make
+`rollup_output_coverage` drop the group (`counts.retain`), so the census sees a whole-day hole every 1–2 min; the 837 MB
+day splits into two 720-min halves (`split_time_task`); each half republishes identical rows; `slice_retires` retires only
+CONTAINED files, so the straddler survives; the no-op skip uses the same coverage and declines. Each republish also
+reopens the 1h derived tier (97 repeated 1440-min `dashboard_1h_v2` publications). Not ingest, not source maintenance.
+**Fix:** `slice_retires` also retires a tagged file WITHOUT the `output_rows` proof when it overlaps the published slice
+and the other live slices tile its range (guarded against a gap and against proven files); case-table test shown red
+without the rule. Current publications always stamp `output_rows`, so no new straddlers are created.
+**Verify after deploy:** repeated publications per slice/hour → ~1; `rollup_backfill_census` `cells_wanted` for those days → 0.
