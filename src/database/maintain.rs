@@ -503,6 +503,9 @@ pub fn note_probe_cost_into(costs: &dashmap::DashMap<String, u64>, table_name: &
 }
 
 /// Rows an `Add` declares in its Delta statistics, when it declares any.
+/// Packed publications keyed by `(slice range, generation)`.
+type PackedGroups = HashMap<((i64, i64), Option<String>), Vec<deltalake::kernel::Add>>;
+
 pub(crate) fn add_row_count(add: &deltalake::kernel::Add) -> Option<u64> {
     serde_json::from_str::<serde_json::Value>(add.stats.as_deref()?).ok()?.get("numRecords")?.as_u64()
 }
@@ -2056,9 +2059,7 @@ impl Database {
     }
 
     /// Live files of `key`'s project that straddle its slice, grouped by publication.
-    fn packed_groups(
-        key: &crate::maintenance_coordinator::TaskKey, live: &[deltalake::kernel::Add],
-    ) -> HashMap<((i64, i64), Option<String>), Vec<deltalake::kernel::Add>> {
+    fn packed_groups(key: &crate::maintenance_coordinator::TaskKey, live: &[deltalake::kernel::Add]) -> PackedGroups {
         live.iter()
             .filter_map(|add| {
                 let range = Self::slice_tag_range(add)?;
@@ -2072,7 +2073,7 @@ impl Database {
 
     /// Publications that predate per-file output proofs cannot be split; their
     /// repairs escalate to the covering slice as unpacked repairs do.
-    fn packed_evidence_complete(groups: &HashMap<((i64, i64), Option<String>), Vec<deltalake::kernel::Add>>) -> bool {
+    fn packed_evidence_complete(groups: &PackedGroups) -> bool {
         groups.iter().all(|((_, generation), files)| {
             let proof = files.iter().map(RollupOutputProof::from_add).reduce(RollupOutputProof::merge);
             generation.is_some()
