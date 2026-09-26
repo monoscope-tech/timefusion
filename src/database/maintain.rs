@@ -2071,20 +2071,30 @@ impl Database {
             .into_group_map()
     }
 
-    /// Publications that predate per-file output proofs cannot be split; their
-    /// repairs escalate to the covering slice as unpacked repairs do.
-    fn packed_evidence_complete(groups: &PackedGroups) -> bool {
-        groups.iter().all(|((_, generation), files)| {
+    /// Publications that predate per-file output proofs, or whose generation is no
+    /// longer current, cannot be split: carrying their remainders forward would keep
+    /// stale rows. Their repairs escalate to the covering slice as unpacked ones do.
+    fn packed_evidence_complete(key: &crate::maintenance_coordinator::TaskKey, groups: &PackedGroups) -> bool {
+        let spec = get_schema(&key.source).and_then(|schema| schema.rollups.iter().find(|spec| spec.table_name(&key.source) == key.physical_table));
+        groups.iter().all(|(((start, _), generation), files)| {
             let proof = files.iter().map(RollupOutputProof::from_add).reduce(RollupOutputProof::merge);
-            generation.is_some()
+            let tags = carried_coverage_tags(files);
+            let measures = tags
+                .get(crate::maintenance_coordinator::TAG_MEASURES)
+                .map(|names| names.split(',').filter(|name| !name.is_empty()).map(str::to_owned).collect::<Vec<_>>());
+            let current = spec.zip(chrono::DateTime::from_timestamp_micros(*start)).is_some_and(|(spec, day)| {
+                generation.as_deref()
+                    == Some(crate::rollup::generation_id(spec, &key.source, &key.project_id, &day.date_naive().to_string(), 0, measures.as_deref()).as_str())
+            });
+            current
                 && proof.is_some_and(|proof| proof.live.is_some() && proof.live == proof.published)
-                && carried_coverage_tags(files).contains_key(crate::maintenance_coordinator::TAG_GENERATION)
+                && tags.contains_key(crate::maintenance_coordinator::TAG_GENERATION)
         })
     }
 
     /// Packed repair applies to `key` against this live set.
     fn packed_repair_applies(&self, key: &crate::maintenance_coordinator::TaskKey, live: &[deltalake::kernel::Add]) -> bool {
-        self.packed_rollup_repair_allowed(key) && Self::packed_evidence_complete(&Self::packed_groups(key, live))
+        self.packed_rollup_repair_allowed(key) && Self::packed_evidence_complete(key, &Self::packed_groups(key, live))
     }
 
     /// Stage only the aggregate rows outside an aligned repair. The caller commits
@@ -2095,7 +2105,7 @@ impl Database {
         use crate::maintenance_coordinator::{TAG_OUTPUT_ROWS, TAG_SLICE_END, TAG_SLICE_START, TAG_SOURCE_ROWS_BELOW};
         use deltalake::writer::DeltaWriter;
         let groups = Self::packed_groups(key, live);
-        anyhow::ensure!(Self::packed_evidence_complete(&groups), "packed publication lacks complete, consistent output evidence");
+        anyhow::ensure!(Self::packed_evidence_complete(key, &groups), "packed publication lacks complete, consistent output evidence");
         let schema = get_schema(&key.physical_table).context("packed rollup schema missing")?;
         let mut retired = Vec::new();
         for ((range, _), files) in groups {
@@ -10654,15 +10664,21 @@ mod rollup_noop_skip_tests {
         Ok(())
     }
 
-    #[test_case::test_case(Some("3"), Some("gen"), true ; "complete publication packs")]
-    #[test_case::test_case(None, Some("gen"), false ; "missing output rows escalates")]
-    #[test_case::test_case(Some("2"), Some("gen"), false ; "disagreeing output rows escalates")]
+    #[test_case::test_case(Some("3"), Some(true), true ; "complete publication packs")]
+    #[test_case::test_case(None, Some(true), false ; "missing output rows escalates")]
+    #[test_case::test_case(Some("2"), Some(true), false ; "disagreeing output rows escalates")]
     #[test_case::test_case(Some("3"), None, false ; "missing generation escalates")]
-    fn packed_repair_needs_complete_output_evidence(output_rows: Option<&str>, generation: Option<&str>, packs: bool) {
+    #[test_case::test_case(Some("3"), Some(false), false ; "obsolete generation escalates")]
+    fn packed_repair_needs_complete_output_evidence(output_rows: Option<&str>, current: Option<bool>, packs: bool) {
         use crate::maintenance_coordinator::{
             TAG_GENERATION, TAG_OUTPUT_ROWS, TAG_PROJECT, TAG_SLICE_END, TAG_SLICE_START, TAG_SOURCE, TAG_SOURCE_FINGERPRINT, TaskKey, TimeSlice,
         };
         let hour = 3_600_000_000i64;
+        let spec = get_schema("otel_logs_and_spans")
+            .and_then(|schema| schema.rollups.iter().find(|spec| spec.table_name("otel_logs_and_spans") == TIER))
+            .expect("tier spec");
+        let generation = current
+            .map(|current| if current { crate::rollup::generation_id(spec, "otel_logs_and_spans", "p", "1970-01-01", 1, None) } else { "obsolete".into() });
         let tags = [
             (TAG_SOURCE, Some("otel_logs_and_spans")),
             (TAG_SOURCE_FINGERPRINT, Some("1")),
@@ -10670,7 +10686,7 @@ mod rollup_noop_skip_tests {
             (TAG_SLICE_START, Some("0")),
             (TAG_SLICE_END, Some("10800000000")),
             (TAG_OUTPUT_ROWS, output_rows),
-            (TAG_GENERATION, generation),
+            (TAG_GENERATION, generation.as_deref()),
         ];
         let live = vec![deltalake::kernel::Add {
             path: "packed.parquet".into(),
@@ -10685,7 +10701,7 @@ mod rollup_noop_skip_tests {
             slice: TimeSlice::new(hour, 2 * hour).expect("valid slice"),
             operation: Operation::BaseRollup,
         };
-        assert_eq!(Database::packed_evidence_complete(&Database::packed_groups(&key, &live)), packs);
+        assert_eq!(Database::packed_evidence_complete(&key, &Database::packed_groups(&key, &live)), packs);
     }
 
     #[tokio::test]
