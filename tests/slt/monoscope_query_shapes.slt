@@ -685,3 +685,16 @@ WHERE project_id = 'mono_shapes'
   AND timestamp BETWEEN TIMESTAMP '2026-01-15T09:00:00Z' AND TIMESTAMP '2026-01-15T11:00:00Z'
 ----
 1.0 16.67 0.75 600.0
+
+# ---------------------------------------------------------------------------
+# §17. The explorer row's timestamp. Every list row, detail link and trace link
+# is keyed by this text; when DataFusion's chrono `to_char` shadowed ours after
+# the catalog's session rebuild, it echoed the format and blanked all three.
+# ---------------------------------------------------------------------------
+
+query TT
+SELECT id, to_char(timestamp at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') as timestamp
+FROM otel_logs_and_spans
+WHERE project_id = 'mono_shapes' AND id = 'ms_1'
+----
+ms_1 2026-01-15T10:00:00.000000Z
