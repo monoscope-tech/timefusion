@@ -3773,6 +3773,15 @@ impl Database {
         self.log_task_started(&task);
         let _lease = TaskLease::new(Arc::clone(&self.maintenance_tasks), key.clone(), (*self.maintenance_shutdown).clone());
         let retry = |reason: String, seconds: u64| -> Result<bool> { self.retried(&key, reason, std::time::Duration::from_secs(seconds)) };
+        // Admit on the queued estimate BEFORE selecting files. Pricing only the selected
+        // files' decoded estimate admitted far more concurrent sorts than their real
+        // footprint allowed (prod OOM 2026-09-26: 55 running units, anon 123.8 GB).
+        let clamped = task.estimated_decoded_bytes.clamp(1, MAX_DECODED_BYTES);
+        let request = Resources { cpu: Self::admission_cpu_cost(clamped), decoded_bytes: clamped, object_reads: 1, object_writes: 1 };
+        let Some(_permit) = self.maintenance_admission.try_acquire_for(request, crate::maintenance_coordinator::AdmissionLane::Other, self.admission_memory())
+        else {
+            return self.retried(&key, "admission_busy".to_owned(), self.admission_backoff_for(&key));
+        };
         note(2);
         let table_ref = match self.resolve_table(&key.project_id, &key.source).await {
             Ok(table) => table,
@@ -3795,14 +3804,6 @@ impl Database {
                 .fold(0u64, |bytes, file| bytes.saturating_add(estimated_decoded_bytes(file.size())))
         };
         note(5);
-        // Price the selected files, not a stale queue estimate. Otherwise a tiny
-        // bin queued at MAX_DECODED_BYTES asks for eight CPU tokens indefinitely.
-        let clamped = processed_bytes.clamp(1, MAX_DECODED_BYTES);
-        let request = Resources { cpu: Self::admission_cpu_cost(clamped), decoded_bytes: clamped, object_reads: 1, object_writes: 1 };
-        let Some(_permit) = self.maintenance_admission.try_acquire_for(request, crate::maintenance_coordinator::AdmissionLane::Other, self.admission_memory())
-        else {
-            return self.retried(&key, "admission_busy".to_owned(), self.admission_backoff_for(&key));
-        };
         if operation == crate::maintenance_coordinator::Operation::Repair && self.repair_bin_already_sorted(&table_ref, &files).await {
             return self.settle_compaction_unit(&table_ref, &key, true).await.map(|()| true);
         }
