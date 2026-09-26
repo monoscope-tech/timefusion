@@ -77,6 +77,14 @@ impl PgCatalogContextProvider for PgCatalogContext {
 
 pub fn setup_catalog(ctx: &SessionContext, role: &str, max_statement_secs: u64) -> DFResult<()> {
     setup_pg_catalog(ctx, "datafusion", PgCatalogContext::new(role)).map_err(|err| *err)?;
+    // `setup_pg_catalog` installs its own type planner; ours wraps it and adds jsonpath/regproc.
+    {
+        let state = ctx.state_ref();
+        let existing = state.read().clone();
+        *state.write() = datafusion::execution::session_state::SessionStateBuilder::new_from_existing(existing)
+            .with_type_planner(Arc::new(crate::read::functions::PostgresTypePlanner))
+            .build();
+    }
     register_identity_udfs(ctx, role, max_statement_secs);
     overlay_runtime_stat_views(ctx)
 }

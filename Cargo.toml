@@ -33,7 +33,7 @@ regex = "1.11.1"
 # push, which busts cargo-chef's recipe.json and forces a full dependency
 # recompile in CI. Bump deliberately to pick up fork changes:
 #   cargo update -p deltalake --precise <new-sha>   (then update this rev)
-deltalake = { git = "https://github.com/tonyalaribe/delta-rs-timefusion.git", rev = "ca1976608526df7aa0a2c093990faa6fea544ba1", features = [
+deltalake = { git = "https://github.com/tonyalaribe/delta-rs-timefusion.git", rev = "d10646f57f6729d47ecfc80a24c13b3295a8aa21", features = [
   "datafusion",
   "s3",
 ] }
@@ -262,7 +262,7 @@ pgwire = { path = "vendor/pgwire" }
 # Patching datafusion-postgres alone pulls its sibling
 # arrow-pg/datafusion-pg-catalog from the same git workspace, so those need no
 # separate patch.
-datafusion-postgres = { git = "https://github.com/apitoolkit/datafusion-postgres.git", rev = "3c1a29bdcb6ea9cd5c1f171bc3287c4f29b8afd5" }
+datafusion-postgres = { git = "https://github.com/apitoolkit/datafusion-postgres.git", rev = "dc185ea9ea87c889a68acc30b2b348f24fc8bbb7" }
 # DataFusion 54.1 with shared sort-buffer reservations, positional Parquet scan protection, SQL DEALLOCATE ALL,
 # and the existing UPDATE FROM support.
 # Keep the workspace crates on one source so their public Rust types agree.
@@ -307,5 +307,6 @@ datafusion-sql = { git = "https://github.com/tonyalaribe/datafusion.git", rev = 
 # frame (2026-07-31). Re-vendor from the registry on upgrade; see the PATCH
 # comment in vendor/tikv-jemalloc-sys/build.rs.
 tikv-jemalloc-sys = { path = "vendor/tikv-jemalloc-sys" }
+
 
 

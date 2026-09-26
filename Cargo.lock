@@ -421,7 +421,7 @@ dependencies = [
 [[package]]
 name = "arrow-pg"
 version = "0.15.0"
-source = "git+https://github.com/apitoolkit/datafusion-postgres.git?rev=3c1a29bdcb6ea9cd5c1f171bc3287c4f29b8afd5#3c1a29bdcb6ea9cd5c1f171bc3287c4f29b8afd5"
+source = "git+https://github.com/apitoolkit/datafusion-postgres.git?rev=dc185ea9ea87c889a68acc30b2b348f24fc8bbb7#dc185ea9ea87c889a68acc30b2b348f24fc8bbb7"
 dependencies = [
  "arrow-schema",
  "bytes",
@@ -2696,7 +2696,7 @@ dependencies = [
 [[package]]
 name = "datafusion-pg-catalog"
 version = "0.18.3"
-source = "git+https://github.com/apitoolkit/datafusion-postgres.git?rev=3c1a29bdcb6ea9cd5c1f171bc3287c4f29b8afd5#3c1a29bdcb6ea9cd5c1f171bc3287c4f29b8afd5"
+source = "git+https://github.com/apitoolkit/datafusion-postgres.git?rev=dc185ea9ea87c889a68acc30b2b348f24fc8bbb7#dc185ea9ea87c889a68acc30b2b348f24fc8bbb7"
 dependencies = [
  "arrow-pg",
  "async-trait",
@@ -2710,7 +2710,7 @@ dependencies = [
 [[package]]
 name = "datafusion-pg-functions"
 version = "0.1.0"
-source = "git+https://github.com/apitoolkit/datafusion-postgres.git?rev=3c1a29bdcb6ea9cd5c1f171bc3287c4f29b8afd5#3c1a29bdcb6ea9cd5c1f171bc3287c4f29b8afd5"
+source = "git+https://github.com/apitoolkit/datafusion-postgres.git?rev=dc185ea9ea87c889a68acc30b2b348f24fc8bbb7#dc185ea9ea87c889a68acc30b2b348f24fc8bbb7"
 dependencies = [
  "datafusion",
  "libm",
@@ -2829,7 +2829,7 @@ dependencies = [
 [[package]]
 name = "datafusion-postgres"
 version = "0.18.0"
-source = "git+https://github.com/apitoolkit/datafusion-postgres.git?rev=3c1a29bdcb6ea9cd5c1f171bc3287c4f29b8afd5#3c1a29bdcb6ea9cd5c1f171bc3287c4f29b8afd5"
+source = "git+https://github.com/apitoolkit/datafusion-postgres.git?rev=dc185ea9ea87c889a68acc30b2b348f24fc8bbb7#dc185ea9ea87c889a68acc30b2b348f24fc8bbb7"
 dependencies = [
  "arrow-pg",
  "async-trait",
@@ -3004,7 +3004,7 @@ dependencies = [
 [[package]]
 name = "deltalake"
 version = "2.0.0"
-source = "git+https://github.com/tonyalaribe/delta-rs-timefusion.git?rev=ca1976608526df7aa0a2c093990faa6fea544ba1#ca1976608526df7aa0a2c093990faa6fea544ba1"
+source = "git+https://github.com/tonyalaribe/delta-rs-timefusion.git?rev=d10646f57f6729d47ecfc80a24c13b3295a8aa21#d10646f57f6729d47ecfc80a24c13b3295a8aa21"
 dependencies = [
  "buoyant_kernel",
  "ctor",
@@ -3015,7 +3015,7 @@ dependencies = [
 [[package]]
 name = "deltalake-aws"
 version = "2.0.0"
-source = "git+https://github.com/tonyalaribe/delta-rs-timefusion.git?rev=ca1976608526df7aa0a2c093990faa6fea544ba1#ca1976608526df7aa0a2c093990faa6fea544ba1"
+source = "git+https://github.com/tonyalaribe/delta-rs-timefusion.git?rev=d10646f57f6729d47ecfc80a24c13b3295a8aa21#d10646f57f6729d47ecfc80a24c13b3295a8aa21"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -3038,7 +3038,7 @@ dependencies = [
 [[package]]
 name = "deltalake-core"
 version = "2.0.0"
-source = "git+https://github.com/tonyalaribe/delta-rs-timefusion.git?rev=ca1976608526df7aa0a2c093990faa6fea544ba1#ca1976608526df7aa0a2c093990faa6fea544ba1"
+source = "git+https://github.com/tonyalaribe/delta-rs-timefusion.git?rev=d10646f57f6729d47ecfc80a24c13b3295a8aa21#d10646f57f6729d47ecfc80a24c13b3295a8aa21"
 dependencies = [
  "alloc-stdlib 0.2.2",
  "arrow",
@@ -3097,7 +3097,7 @@ dependencies = [
 [[package]]
 name = "deltalake-derive"
 version = "1.0.0"
-source = "git+https://github.com/tonyalaribe/delta-rs-timefusion.git?rev=ca1976608526df7aa0a2c093990faa6fea544ba1#ca1976608526df7aa0a2c093990faa6fea544ba1"
+source = "git+https://github.com/tonyalaribe/delta-rs-timefusion.git?rev=d10646f57f6729d47ecfc80a24c13b3295a8aa21#d10646f57f6729d47ecfc80a24c13b3295a8aa21"
 dependencies = [
  "convert_case 0.9.0",
  "itertools 0.14.0",

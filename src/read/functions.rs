@@ -129,18 +129,20 @@ fn udf_call(func: Arc<ScalarUDF>, args: Vec<Expr>) -> Expr {
     Expr::ScalarFunction(ScalarFunction { func, args })
 }
 
-/// Resolves PostgreSQL types that DataFusion does not model natively as text.
+/// Resolves PostgreSQL types that DataFusion does not model natively as text, delegating
+/// the oid-alias and `pg_catalog`-qualified types to the catalog's planner. A session holds
+/// one type planner, so this one must also cover what `setup_pg_catalog` installs.
 #[derive(Debug, Default)]
 pub struct PostgresTypePlanner;
 
 impl TypePlanner for PostgresTypePlanner {
     fn plan_type_field(&self, sql_type: &SqlDataType) -> datafusion::error::Result<Option<FieldRef>> {
-        Ok(match sql_type {
+        match sql_type {
             SqlDataType::Custom(name, _) if matches!(name.to_string().to_ascii_lowercase().as_str(), "jsonpath" | "regproc" | "pg_catalog.regproc") => {
-                Some(Arc::new(Field::new("", DataType::Utf8, true)))
+                Ok(Some(Arc::new(Field::new("", DataType::Utf8, true))))
             }
-            _ => None,
-        })
+            _ => datafusion_postgres::datafusion_pg_catalog::pg_catalog::oid_type_planner::PgOidTypePlanner.plan_type_field(sql_type),
+        }
     }
 }
 
@@ -987,6 +989,10 @@ fn array_to_json_values_inner(array: &ArrayRef, sniff_json: bool) -> datafusion:
                 .zip(columns.columns())
                 .map(|(field, column)| array_to_json_values_inner(column, false).map(|values| (field.name().clone(), values)))
                 .collect::<datafusion::error::Result<Vec<_>>>()?;
+            // Keys render sorted; DataFusion 55 enables serde_json's `preserve_order`, which
+            // would otherwise switch output to field order.
+            let mut per_field = per_field;
+            per_field.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
             (0..array.len())
                 .map(|row| {
                     if columns.is_null(row) {
@@ -1088,6 +1094,8 @@ pub(crate) fn parse_interval_to_micros(interval_str: &str) -> datafusion::error:
         "hour" | "hours" | "hr" | "hrs" | "h" => 3_600_000_000,
         "day" | "days" | "d" => 86_400_000_000,
         "week" | "weeks" | "w" => 604_800_000_000,
+        // DataFusion 55 renders `INTERVAL '1 month'` as text (`1 mons`); same refusal as the typed path.
+        "mon" | "mons" | "month" | "months" | "year" | "years" => return interval_to_micros(1, 0, 0),
         unit => {
             return Err(DataFusionError::Execution(format!("Unsupported time unit: {unit}. Supported units: second(s), minute(s), hour(s), day(s), week(s)")));
         }
