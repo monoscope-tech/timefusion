@@ -10767,6 +10767,11 @@ mod rollup_noop_skip_tests {
     #[serial]
     #[tokio::test]
     async fn a_sibling_slice_commit_does_not_discard_a_staged_publication() -> Result<()> {
+        use deltalake::{
+            kernel::{Action, transaction::TableReference},
+            protocol::{DeltaOperation, SaveMode},
+        };
+        use object_store::ObjectStoreExt;
         let db = Arc::new(Database::with_config(rollup_cfg("occ_sibling")).await?);
         let project = format!("occ_{}", uuid::Uuid::new_v4());
         let date = chrono::Utc::now().date_naive() - chrono::Duration::days(3);
@@ -10809,7 +10814,11 @@ mod rollup_noop_skip_tests {
             store.copy(&object_store::path::Path::from(original.path.as_str()), &object_store::path::Path::from(copy.as_str())).await?;
             deltalake::kernel::transaction::CommitBuilder::default()
                 .with_actions(vec![Action::Add(deltalake::kernel::Add { path: copy, ..original })])
-                .build(Some(table.snapshot()? as &dyn TableReference), table.log_store(), DeltaOperation::Write { mode: SaveMode::Append, partition_by: None, predicate: None })
+                .build(
+                    Some(table.snapshot()? as &dyn TableReference),
+                    table.log_store(),
+                    DeltaOperation::Write { mode: SaveMode::Append, partition_by: None, predicate: None },
+                )
                 .await?;
         }
         drop(held);
