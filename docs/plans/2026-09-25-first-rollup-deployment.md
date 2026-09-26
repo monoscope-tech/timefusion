@@ -363,3 +363,22 @@ Reuse a passing result only while its inputs remain unchanged. Missing terminal 
 Publish the spill revision, then update all 33 DataFusion references together. Regenerate the lockfile before the combined release checks.
 Run one integrated `make ci-signoff` against that frozen artifact. Do not run concurrent Cargo jobs against the shared target directory.
 Keep correctness, resource limits, persisted-data rollback, and deployment observation as separate acceptance gates.
+
+## Release 2 (rollup pause policy + Stage 0 coverage): 2026-09-26
+
+Merged as PR #323 (`1824a7ca`), deployed 02:11 UTC via `deploy.yml` (CI-built image
+`sha256:79aa71e5…`; GitHub CI green on both shards, E2E, clippy — run locally only in part
+because the laptop was on the DataFusion 55 port).
+
+- `ROLLUP PAUSE otel_logs_and_spans otel_logs_and_spans_rollup_sessions_1h_v1` at 02:27:59 UTC
+  (no direct readers in monoscope; client session queries unroutable — see plan §8.3).
+- **Incident:** OOM kills at 02:30:40, 02:43:27 and 02:58:00 (anon ≈ 124 GB of 128.8 GB;
+  release 1 held ≈ 35 GB). Cause: release 2 moved compaction admission after file selection
+  and priced it by the selected files' decoded estimate, so ~25 SealedConsolidation/HotPacking
+  sorts were admitted in the same second (55 running units). `dashboard_1m_v3` was also paused
+  at 02:33:57 as a diagnostic; memory kept spiking, which ruled out the rollup tiers.
+- **Fix forward:** `96b093f5` restores release 1's admission (queued estimate, before
+  selection). Pushed straight to master because prod was crash-looping; lint green, targeted
+  tests green except MinIO-storage-full failures on the laptop (disk, not code).
+- After recovery: `ROLLUP RESUME otel_logs_and_spans otel_logs_and_spans_rollup_dashboard_1m_v3
+  FROM '<hour boundary>'` to restore the dashboard tier; sessions stays paused.
