@@ -1662,7 +1662,7 @@ pub fn init_telemetry(config: &TelemetryConfig) -> anyhow::Result<()> {
         .build();
 
     // Span export honors the standard OTEL_TRACES_EXPORTER=none switch. The batch
-    // is capped at EXPORT_BATCH because opentelemetry-otlp 0.31 cannot raise the
+    // is capped at EXPORT_BATCH because opentelemetry-otlp (0.33) cannot raise the
     // gRPC message-size limit through the public API.
     let telemetry_layer = if config.otel_traces_exporter.as_deref() == Some("none") {
         None

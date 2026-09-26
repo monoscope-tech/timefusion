@@ -62,13 +62,14 @@ tokio-util = { version = "0.7.17", features = ["rt"] }
 tokio-stream = { version = "0.1.17", features = ["net"] }
 tracing-subscriber = { version = "0.3.19", features = ["env-filter", "json"] }
 tracing = "0.1.44"
-tracing-opentelemetry = "0.32"
-opentelemetry = "0.31"
-opentelemetry-otlp = { version = "0.31", features = ["grpc-tonic", "metrics", "logs"] }
-opentelemetry_sdk = { version = "0.31", features = ["rt-tokio", "metrics", "logs"] }
-opentelemetry-appender-tracing = "0.31"
+tracing-opentelemetry = "0.34"
+opentelemetry = "0.33"
+opentelemetry-otlp = { version = "0.33", features = ["grpc-tonic", "metrics", "logs"] }
+opentelemetry_sdk = { version = "0.33", features = ["rt-tokio", "metrics", "logs"] }
+opentelemetry-appender-tracing = "0.33"
 metrics = "0.24"
-metrics-exporter-opentelemetry = "0.2"
+# 0.2.1 (latest release) pins opentelemetry 0.31; upstream main is on 0.33.
+metrics-exporter-opentelemetry = { git = "https://github.com/Noelware/metrics-exporter-opentelemetry.git", rev = "b93abba878a51cd9e2ce62df554142be6f02764d" }
 metrics-util = "0.20"
 datafusion-tracing = "55.0.0"
 instrumented-object-store = "54.0.0"
