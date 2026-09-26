@@ -1601,6 +1601,14 @@ fn resolve_ordering(req: &LexOrdering, schema: &Schema) -> Option<LexOrdering> {
         .and_then(LexOrdering::new)
 }
 
+/// A node whose rows are consumed positionally below it (deletion-vector masks, retained row
+/// ordinals): it forbids sort pushdown AND needs its input as one physical stream. Sorting any
+/// leg beneath it would misalign those positions.
+fn is_positional_boundary(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    !plan.supports_sort_pushdown()
+        && matches!(plan.input_distribution_requirements().child_distribution(0), Some(datafusion::physical_expr::Distribution::SinglePartition))
+}
+
 /// `children` with every child that does not already satisfy `req` wrapped in
 /// `SortExec(req)` (carrying `fetch`), so a union over them advertises `req`.
 ///
@@ -1647,9 +1655,11 @@ fn order_union(plan: &Arc<dyn ExecutionPlan>, req: &LexOrdering, fetch: Option<u
     }
     // Never descend through a DedupExec: its survivors are decided across ALL
     // input rows, so a `with_fetch` cut below it can drop a row's newer version.
+    // Nor through a positional boundary (deletion-vector masks, row ordinals).
     let children = plan.children();
     if children.len() == 1
         && downcast::<crate::read::DedupExec>(plan.as_ref()).is_none()
+        && !is_positional_boundary(plan)
         && plan.maintains_input_order().first() == Some(&true)
         && let Some(new_child) = order_union(children[0], req, fetch)?
     {
@@ -1696,10 +1706,14 @@ impl PhysicalOptimizerRule for OrderedUnionForTopK {
 /// No fetch is pushed: a top-n cut on a leg under `DedupExec` would truncate
 /// row versions.
 pub(crate) fn repair_isolated_scan_ordering(plan: Arc<dyn ExecutionPlan>, max_bytes: u64) -> Result<Arc<dyn ExecutionPlan>> {
-    // Bottom-up so a rewritten union's new ordering propagates through the
-    // `DeltaScanExec` wrapping it as the parents are rebuilt.
+    // Parents are rebuilt after their children, so a rewritten union's new ordering still
+    // propagates through the `DeltaScanExec` wrapping it. Never sort below a positional
+    // boundary (deletion-vector masks, row ordinals).
     Ok(plan
-        .transform_up(|node| {
+        .transform_down(|node| {
+            if is_positional_boundary(&node) {
+                return Ok(Transformed::new(node, false, datafusion::common::tree_node::TreeNodeRecursion::Jump));
+            }
             let Some(union) = downcast::<UnionExec>(node.as_ref()) else {
                 return Ok(Transformed::no(node));
             };
