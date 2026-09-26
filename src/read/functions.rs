@@ -154,6 +154,8 @@ pub struct VariantAwareExprPlanner;
 pub(super) enum PathComponent {
     Field(String),
     Index(i64),
+    /// A bind parameter: one key (text) or array index (integer), resolved at execution.
+    Param(Expr),
 }
 
 impl ExprPlanner for VariantAwareExprPlanner {
@@ -197,9 +199,8 @@ impl ExprPlanner for VariantAwareExprPlanner {
 
         // `variant_get` cannot stringify numeric/boolean leaves. Compose through
         // JSON text to preserve PostgreSQL `->>` semantics.
-        let path_literal = Expr::Literal(ScalarValue::Utf8(Some(build_variant_path(&path_parts))), None);
         let base_repr = expr_repr(&base_expr);
-        let variant_leaf = udf_call(variant_get_udf(), vec![base_expr, path_literal]);
+        let variant_leaf = variant_get_path(base_expr, &path_parts);
         let result = if is_long_arrow { udf_call(json_to_pg_text_udf(), vec![udf_call(variant_to_json_udf(), vec![variant_leaf])]) } else { variant_leaf };
 
         let op_str = match (path_is_array, is_long_arrow) {
@@ -283,7 +284,11 @@ pub(super) fn extract_path_component(expr: &Expr) -> Option<PathComponent> {
     // on the PATH literal. A cast cannot change which field is addressed: unwrap it,
     // else this returns None and the expr falls through to datafusion-functions-json,
     // which cannot plan against a Variant column.
-    let Expr::Literal(v, _) = uncast(expr) else { return None };
+    let inner = uncast(expr);
+    if matches!(inner, Expr::Placeholder(_)) {
+        return Some(PathComponent::Param(inner.clone()));
+    }
+    let Expr::Literal(v, _) = inner else { return None };
     extract_utf8_string(v).map(PathComponent::Field).or_else(|| {
         Some(PathComponent::Index(match v {
             ScalarValue::Int64(Some(i)) => *i,
@@ -297,8 +302,16 @@ pub(super) fn extract_path_component(expr: &Expr) -> Option<PathComponent> {
 
 /// UDFs whose result is a Variant, so `->`/`->>` applied to one must route to
 /// `variant_get` rather than fall through to datafusion-functions-json.
-const VARIANT_PRODUCING_UDFS: [&str; 7] =
-    ["json_to_variant", "variant_get", "cast_to_variant", "variant_object_construct", "variant_list_construct", "variant_object_insert", "variant_list_insert"];
+const VARIANT_PRODUCING_UDFS: [&str; 8] = [
+    "json_to_variant",
+    "variant_get",
+    "variant_get_step",
+    "cast_to_variant",
+    "variant_object_construct",
+    "variant_list_construct",
+    "variant_object_insert",
+    "variant_list_insert",
+];
 
 /// Check if expression evaluates to a Variant type
 fn is_variant_column(expr: &Expr, schema: &DFSchema) -> bool {
@@ -328,8 +341,23 @@ pub(super) fn build_variant_path(parts: &[PathComponent]) -> String {
         .map(|part| match part {
             PathComponent::Field(name) => format!("['{}']", name.replace('\\', "\\\\").replace(']', "\\]")),
             PathComponent::Index(idx) => format!("[{idx}]"),
+            PathComponent::Param(_) => unreachable!("parameter steps are resolved by variant_get_path"),
         })
         .collect()
+}
+
+/// `base` addressed by `parts`: literal runs become one `variant_get` path, each bind
+/// parameter one `variant_get_step` (a single key or index, decided by the bound value).
+pub(super) fn variant_get_path(base: Expr, parts: &[PathComponent]) -> Expr {
+    let literal =
+        |run: &[PathComponent], base: Expr| udf_call(variant_get_udf(), vec![base, Expr::Literal(ScalarValue::Utf8(Some(build_variant_path(run))), None)]);
+    parts.split_inclusive(|part| matches!(part, PathComponent::Param(_))).fold(base, |acc, chunk| match chunk.split_last() {
+        Some((PathComponent::Param(param), run)) => {
+            let acc = if run.is_empty() { acc } else { literal(run, acc) };
+            udf_call(variant_get_step_udf(), vec![acc, param.clone()])
+        }
+        _ => literal(chunk, acc),
+    })
 }
 
 /// Generate SQL-like representation for expression (for alias)
@@ -348,6 +376,7 @@ fn path_repr(parts: &[PathComponent]) -> String {
         .map(|p| match p {
             PathComponent::Field(s) => format!("'{s}'"),
             PathComponent::Index(i) => i.to_string(),
+            PathComponent::Param(p) => p.to_string(),
         })
         .collect::<Vec<_>>()
         .join("->")
@@ -463,6 +492,50 @@ impl<U: ScalarUDFImpl + Default + Hash + PartialEq + Eq + 'static, const JSONB_O
 
 pub type VariantToJsonExtUdf = VariantExtWrapper<datafusion_variant::VariantToJsonUdf, true>;
 pub type VariantGetExtUdf = VariantExtWrapper<datafusion_variant::VariantGetUdf>;
+/// `variant_get_step(variant, key)`: one path step whose kind comes from the bound value —
+/// a string addresses a single key (never split on dots), an integer an array index.
+#[derive(Debug, Hash, PartialEq, Eq)]
+pub struct VariantGetStepUdf {
+    signature: Signature,
+}
+
+impl Default for VariantGetStepUdf {
+    fn default() -> Self {
+        Self { signature: Signature::any(2, Volatility::Immutable) }
+    }
+}
+
+impl ScalarUDFImpl for VariantGetStepUdf {
+    fn name(&self) -> &str {
+        "variant_get_step"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> datafusion::error::Result<DataType> {
+        datafusion::common::internal_err!("variant_get_step computes its field in return_field_from_args")
+    }
+    fn return_field_from_args(&self, args: datafusion::logical_expr::ReturnFieldArgs) -> datafusion::error::Result<FieldRef> {
+        let arg_fields = [args.arg_fields[0].clone(), Arc::new(Field::new("path", DataType::Utf8, true))];
+        variant_get_udf().inner().return_field_from_args(datafusion::logical_expr::ReturnFieldArgs { arg_fields: &arg_fields, scalar_arguments: &[] })
+    }
+    fn invoke_with_args(&self, mut args: ScalarFunctionArgs) -> datafusion::error::Result<ColumnarValue> {
+        let ColumnarValue::Scalar(step) = &args.args[1] else {
+            return datafusion::common::exec_err!("variant_get_step needs a scalar key");
+        };
+        let part = match step {
+            ScalarValue::Int64(Some(i)) => PathComponent::Index(*i),
+            ScalarValue::Int32(Some(i)) => PathComponent::Index((*i).into()),
+            other => match extract_utf8_string(other) {
+                Some(key) => PathComponent::Field(key),
+                None => return datafusion::common::exec_err!("variant_get_step key must be text or an integer, got {other:?}"),
+            },
+        };
+        args.args[1] = ColumnarValue::Scalar(ScalarValue::Utf8(Some(build_variant_path(&[part]))));
+        args.arg_fields[1] = Arc::new(Field::new("path", DataType::Utf8, true));
+        variant_get_udf().inner().invoke_with_args(args)
+    }
+}
 
 /// Process-wide singleton accessor for a stateless UDF, so analyzer rules clone
 /// one `Arc` instead of allocating a `ScalarUDF` per rewritten expression.
@@ -478,6 +551,7 @@ macro_rules! shared_udf {
 
 shared_udf!(pub variant_to_json_udf: VariantToJsonExtUdf);
 shared_udf!(pub variant_get_udf: VariantGetExtUdf);
+shared_udf!(pub variant_get_step_udf: VariantGetStepUdf);
 shared_udf!(pub json_to_variant_udf: datafusion_variant::JsonToVariantUdf);
 shared_udf!(pub json_to_pg_text_udf: JsonToPgTextUdf);
 
@@ -2037,6 +2111,17 @@ mod tests {
     #[tokio::test]
     async fn json_rendering_matches_postgres(sql: &str) -> String {
         text(sql).await
+    }
+
+    /// Extended-protocol clients bind `->` keys as untyped parameters: each one is a single
+    /// key (never split on dots), and a missing key still types as a NULL Variant.
+    #[tokio::test]
+    async fn arrow_paths_accept_bind_parameters() {
+        let sql = r#"SELECT coalesce(v -> $1 -> $2 ->> $3, v -> 'a' ->> $4, $5) AS r FROM (VALUES (json_to_variant('{"a": {"b.c": {"d": "x"}}}')), (json_to_variant('{"a": {"zz": "y"}}'))) t(v) ORDER BY 1"#;
+        let params: Vec<ScalarValue> = ["a", "b.c", "d", "zz", "none"].into_iter().map(ScalarValue::from).collect();
+        let batches = udf_ctx().sql(sql).await.unwrap().with_param_values(params).unwrap().collect().await.unwrap();
+        let rows = datafusion::arrow::util::pretty::pretty_format_batches(&batches).unwrap().to_string();
+        assert!(rows.contains("| x |") && rows.contains("| y |"), "{rows}");
     }
 
     /// Documented limitation: PG lets `row_to_json(t)` name a whole row, but

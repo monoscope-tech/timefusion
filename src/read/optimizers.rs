@@ -707,6 +707,9 @@ fn variant_native_extraction(expr: &Expr) -> Option<Expr> {
         return None;
     }
 
+    if path.iter().any(|p| matches!(p, PathComponent::Param(_))) {
+        return None;
+    }
     let leaf = call_udf(&variant_get_udf(), vec![variant.clone(), Expr::Literal(ScalarValue::Utf8(Some(build_variant_path(&path))), None)]);
     // `variant_get` cannot stringify numeric/boolean leaves, so reuse the
     // composition `VariantAwareExprPlanner` emits for `->>`.
