@@ -22,8 +22,8 @@ Fixed (`c9b4e809`): a `->` path step bound as an extended-protocol parameter pla
 Still open from the full plan (not started or not activated): Stage 1B single-pass execution,
 Stage 1C shared scans, Stage 1D dependencies, Stage 3 batched publication, Stage 4 flush
 aggregation, Stage 5 dedup fusion, Stage 6; adaptive batches / certified-clean
-stay off; packed repairs are ON (release 4). The fork's own DBeaver test still casts to regproc and
-needs updating in the datafusion-postgres fork.
+stay off; packed repairs are ON (release 4). The datafusion-postgres fork's DBeaver startup test
+passes at `68fdc80` (regproc casts plan as text).
 
 ---
 
