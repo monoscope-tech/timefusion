@@ -1931,15 +1931,17 @@ async fn route_with_spec(
             }
             // A near-miss: the residual names the same columns a declared measure
             // filters on, yet did not match.
-            tracing::warn!(
-                event = "rollup_promotion_unmatched",
-                source,
-                spec = spec.name.as_deref().unwrap_or_default(),
-                promoted = promoted.unwrap_or_default(),
-                null_guard = column.unwrap_or_default(),
-                declared = %declared(),
-                "a residual row filter matched no declared count measure"
-            );
+            if crate::observability::sample_rollup_miss("promotion_unmatched") {
+                tracing::warn!(
+                    event = "rollup_promotion_unmatched",
+                    source,
+                    spec = spec.name.as_deref().unwrap_or_default(),
+                    promoted = promoted.unwrap_or_default(),
+                    null_guard = column.unwrap_or_default(),
+                    declared = %declared(),
+                    "a residual row filter matched no declared count measure"
+                );
+            }
             MissReason::UnknownFilter
         })?),
     };
