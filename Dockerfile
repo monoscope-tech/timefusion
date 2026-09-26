@@ -3,7 +3,7 @@
 ##############################
 #         Chef base          #
 ##############################
-FROM --platform=$BUILDPLATFORM rust:1.91-slim-bookworm AS chef
+FROM --platform=$BUILDPLATFORM rust:1.98-slim-bookworm AS chef
 ARG TARGETARCH
 WORKDIR /app
 # make is required by tikv-jemalloc-sys (jemalloc compiles from C source under --features
