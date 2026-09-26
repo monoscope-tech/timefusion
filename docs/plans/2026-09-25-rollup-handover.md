@@ -29,6 +29,31 @@ aggregation, Stage 5 dedup fusion, Stage 6; adaptive batches / certified-clean
 stay off; packed repairs are ON (release 4). The datafusion-postgres fork's DBeaver startup test
 passes at `68fdc80` (regproc casts plan as text).
 
+## Open items (checklist, kept current)
+
+**In flight**
+- [ ] `eb17f52a` `now()` bound at µs precision (rollup routing for every `now()`-relative query) — deploying; then re-measure hit rate on a ≥1h process
+- [ ] Batch: patch-level advisory bumps, drop `memory_fraction`, grain-miss outranks filter-miss, packed repair requires current generation — full-suite sign-off running, then push
+
+**Loose ends**
+- [x] Packed repairs on; fallback for publications without output proofs (`ee2ea352`)
+- [x] `tier_still_holds_slice` "false negative" — not a bug (the test's obsolete-generation phase); exposed the packed/obsolete-generation gap, fixed in the batch
+- [x] Kernel-executor shutdown panic — known, bounded by the shutdown grace (`maintenance_tasks_outlived_shutdown`), cannot abort; accepted
+- [ ] Restart recovery re-queues slices above a changed hour (whole-date / rows-below witnesses) — needs a per-range witness
+- [ ] Advisories a patch bump cannot close: `rustls-webpki` 0.101 (AWS SDK legacy rustls 0.21), `opentelemetry_sdk` (fix is 0.32, major), `tokio-tar` (no fix)
+
+**Rollup misses after the `now()` fix** (per hour, prod `e1da854c`)
+- [ ] `unknown_filter` 462 → mostly relabelled as grain misses by the batch; the `dcount(name)` share needs a schema measure (owner decision)
+- [ ] `multi_scan_source` 192 (service-edges self-join / UNION)
+- [ ] `stale_coverage` 168, `not_built` 84 (restart/maintenance invalidation)
+- [ ] `null_guard_mismatch`, `tiny_interior`, `unaligned_bucket` (~110 each)
+
+**Plan stages (not started; conditional on measured residual cost)**
+- [ ] 1B single-pass execution · [ ] 1C shared scans · [ ] 1D dependencies · [ ] 3 batched publication · [ ] 4 flush aggregation · [ ] 5 dedup fusion · [ ] 6 fine-grained tracking / hierarchy+HLL · [ ] logical-revision source view
+
+**Kept off pending evidence**
+- [ ] adaptive batches (failed 10% CPU gate) · [ ] certified-clean path · [ ] resume `sessions_1h_v1` (needs consumer inventory)
+
 ---
 
 
