@@ -71,7 +71,7 @@ SELECT variant_to_json(variant_get(json_to_variant('{"items": [10, 20, 30]}'), '
 query T
 SELECT variant_to_json(variant_get(json_to_variant('{"a": 1}'), 'nonexistent'));
 ----
-null
+NULL
 
 # === is_variant_null ===
 
@@ -206,7 +206,7 @@ true
 query T
 SELECT variant_to_json(json_to_variant('{"a": 1}')->'nonexistent');
 ----
-null
+NULL
 
 # Test array with mixed types
 query T
