@@ -45,7 +45,7 @@ Status: ⬜ open · 🟡 in progress · ✅ done. Priority is the plan's executi
 | W3 | 1B shard-count inventory | analysis | Stage 1B | Executed-unit shard-count distribution (1, 2, 3–4, 5–8, >8) weighted by estimated input bytes, from publication logs / journal — no new scans | `scripts/rollup_work_inventory.py` (+ its test), prod logs, `maintenance_tasks.json` | — | agent (Claude) | 🟡 |
 | W4 | Session-tier consumer inventory | analysis | First deliverable (B1) | Every reader of `*_rollup_sessions_1h_v1` (monoscope code paths, direct SQL, infrequent jobs) and a keep/pause/remove recommendation; unserved HLL review | monoscope repo (read-only), prod pgwire logs | — | agent (Claude) | 🟡 |
 | W5 | Per-range witness (restart recovery) | build | Stage 0 | **Deprioritized by measurement**: the 18:05 restart re-queued 26 `WitnessMoved` slices, all in the paused `sessions_1h_v1`, zero in dashboard tiers (`rollup_unverifiable_rebuild_queued` log). Revisit only if a dashboard tier shows it | — | W1 | Claude | ✅ measured |
-| W6 | `multi_scan_source` shapes | analysis → build (lane 2) | Rollup misses | Classify the 192/h self-join/UNION declines (service-edges); decide: route per-leg, rewrite in monoscope, or leave raw; then implement the chosen matcher change with a case-table test | `src/rollup.rs` matcher (`source_and_filters`, `match_aggregates`) | — | agent (Claude) | 🟡 |
+| W6 | `multi_scan_source` shapes | analysis → build (lane 2) | Rollup misses | Classify the 192/h self-join/UNION declines (service-edges); decide: route per-leg, rewrite in monoscope, or leave raw; then implement the chosen matcher change with a case-table test | `src/rollup.rs` matcher (`source_and_filters`, `match_aggregates`) | — | agent (Claude) | ✅ |
 | W7 | Stage 1 build measurement harness | build (lane 2) | Stage 1 | For representative units via `timefusion run-unit`: physical plan, scan count, hash shards, dedup ops, decoded bytes, aggregate-state memory, CPU; publication economics (commits/actions/latency incl. failures) | `src/main.rs` `run-unit`, `benches/rollup_work.rs`, report under `docs/plans/` | W3 for unit choice | | ⬜ |
 | W8 | 1D dependency classification — design + fixtures | analysis → build (lane 2) | Stage 1D | Per-spec dependency map (dims, measures, filters, identity, ts, version, delete); mutation fixture table proving zero missed relevant invalidations; then the classifier | new test module; `apply_rollup_hours` call sites in `database/rollup.rs` | W2 (which mutations dominate) | | ⬜ |
 | W9 | Stage 3 publication batching — design | analysis | Stage 3 | Concrete design mapped to existing staged publication / journal group-commit; WAL-compat decision (does the payload change?); queue limits; test list | design doc only | — | agent (Claude) | 🟡 |
@@ -71,3 +71,16 @@ targeted tests green, and the failing-first test named. The integrator batches c
 sign-off + deploy (the plan's "deploy fewer, coherent releases").
 
 ## Results
+
+### W6 result — 2026-09-26 — agent (Claude)
+**Question:** what are the ~190/h `multi_scan_source` declines, and can any route?
+**Method:** 22 min of prod logs (18:05–18:25, image `eb17f52a`), 70 declines; plans traced to monoscope.
+**Numbers:** all 70 come from `rollUpServiceMap` (`monoscope/src/BackgroundJobs.hs:4951`), one run per project per 5-minute slice:
+`rollupServiceEdges` (`ServiceGraph.hs:719`, 6 scans, refused at `Projection: CAST(floor`) and
+`rollupEndpointDependencyEdges` (`ServiceGraph.hs:785`, 12 scans, refused at `Inner Join`). They build parent→child
+edges from raw `trace_id`/`span_id` joins and write Postgres tables, so no user waits on them.
+**Decision:** they cannot route (every aggregate sits above a raw identity join). Leave them raw. They stay out of the
+hit-rate denominator, and their per-query 2–3 KB warn is sampled: branch `ws/w6-eligible-misses` (`c36be3d8`),
+with the test asserting `rollup_misses_total` does not move for a multi-scan plan.
+**Follow-ups:** (1) monoscope could compute `trace_count` without referencing `bucketed` twice (12 → 6 scans; unmeasured, W2/W7).
+(2) 21 of 26 `unwalkable_source` are `autoAckProvenEndpoints`' `unnest(hashes)` query (`BackgroundJobs.hs:3709`), also raw-only.
