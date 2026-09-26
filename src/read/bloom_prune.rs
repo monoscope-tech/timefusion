@@ -22,10 +22,7 @@ use datafusion::{
     logical_expr::{Expr, Operator, utils::split_conjunction},
     scalar::ScalarValue,
 };
-use deltalake::datafusion::parquet::{
-    arrow::async_reader::ParquetRecordBatchStreamBuilder,
-    bloom_filter::Sbbf,
-};
+use deltalake::datafusion::parquet::{arrow::async_reader::ParquetRecordBatchStreamBuilder, bloom_filter::Sbbf};
 use itertools::Itertools;
 use object_store::{ObjectStore, ObjectStoreExt, path::Path};
 use tokio::time::Instant;

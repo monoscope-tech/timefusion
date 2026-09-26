@@ -124,7 +124,8 @@ impl HistogramWindow {
             let predicate = membership
                 .map(|predicate| -> Result<BooleanArray> {
                     let expression = predicate.expression(&schema)?;
-                    let physical = create_physical_expr(&expression, &DFSchema::try_from(schema.as_ref().clone())?, &ExecutionProps::new(), &Default::default())?;
+                    let physical =
+                        create_physical_expr(&expression, &DFSchema::try_from(schema.as_ref().clone())?, &ExecutionProps::new(), &Default::default())?;
                     let array = physical.evaluate(batch)?.into_array(batch.num_rows())?;
                     Ok(array.as_any().downcast_ref::<BooleanArray>().context("membership result is not Boolean")?.clone())
                 })

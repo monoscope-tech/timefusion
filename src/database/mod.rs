@@ -29,8 +29,8 @@ use datafusion::{
 };
 use datafusion_datasource::{file_scan_config::FileScanConfig, memory::MemorySourceConfig, source::DataSourceExec};
 use deltalake::{
-    DeltaTable, DeltaTableBuilder, FilterLiteral, FilterOp, FilterValue, datafusion::parquet::file::properties::WriterProperties, kernel::transaction::CommitProperties,
-    logstore::LogStore, operations::create::CreateBuilder,
+    DeltaTable, DeltaTableBuilder, FilterLiteral, FilterOp, FilterValue, datafusion::parquet::file::properties::WriterProperties,
+    kernel::transaction::CommitProperties, logstore::LogStore, operations::create::CreateBuilder,
 };
 use futures::{StreamExt, TryStreamExt};
 use instrumented_object_store::instrument_object_store;

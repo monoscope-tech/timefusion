@@ -3304,19 +3304,26 @@ impl ObjectStoreReader {
 impl deltalake::datafusion::parquet::arrow::async_reader::AsyncFileReader for ObjectStoreReader {
     fn get_bytes(&mut self, range: std::ops::Range<u64>) -> futures::future::BoxFuture<'_, deltalake::datafusion::parquet::errors::Result<bytes::Bytes>> {
         use futures::FutureExt;
-        async move { object_store::ObjectStoreExt::get_range(self.store.as_ref(), &self.path, range).await.map_err(|e| deltalake::datafusion::parquet::errors::ParquetError::External(Box::new(e))) }.boxed()
+        async move {
+            object_store::ObjectStoreExt::get_range(self.store.as_ref(), &self.path, range)
+                .await
+                .map_err(|e| deltalake::datafusion::parquet::errors::ParquetError::External(Box::new(e)))
+        }
+        .boxed()
     }
 
     fn get_byte_ranges(
         &mut self, ranges: Vec<std::ops::Range<u64>>,
     ) -> futures::future::BoxFuture<'_, deltalake::datafusion::parquet::errors::Result<Vec<bytes::Bytes>>> {
         use futures::FutureExt;
-        async move { self.store.get_ranges(&self.path, &ranges).await.map_err(|e| deltalake::datafusion::parquet::errors::ParquetError::External(Box::new(e))) }.boxed()
+        async move { self.store.get_ranges(&self.path, &ranges).await.map_err(|e| deltalake::datafusion::parquet::errors::ParquetError::External(Box::new(e))) }
+            .boxed()
     }
 
     fn get_metadata<'a>(
         &'a mut self, options: Option<&'a deltalake::datafusion::parquet::arrow::arrow_reader::ArrowReaderOptions>,
-    ) -> futures::future::BoxFuture<'a, deltalake::datafusion::parquet::errors::Result<Arc<deltalake::datafusion::parquet::file::metadata::ParquetMetaData>>> {
+    ) -> futures::future::BoxFuture<'a, deltalake::datafusion::parquet::errors::Result<Arc<deltalake::datafusion::parquet::file::metadata::ParquetMetaData>>>
+    {
         use deltalake::datafusion::parquet::file::metadata::ParquetMetaDataReader;
         use futures::FutureExt;
         async move {

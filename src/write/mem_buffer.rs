@@ -1683,7 +1683,8 @@ impl MemBuffer {
         let df_schema = DFSchema::try_from(schema.as_ref().clone())?;
         let props = ExecutionProps::new();
 
-        let physical_predicate = predicate.map(|p| create_physical_expr(&strip_column_qualifiers(p.clone())?, &df_schema, &props, &Default::default())).transpose()?;
+        let physical_predicate =
+            predicate.map(|p| create_physical_expr(&strip_column_qualifiers(p.clone())?, &df_schema, &props, &Default::default())).transpose()?;
 
         let (total_deleted, total_freed) = table.buckets.iter_mut().try_fold((0u64, 0usize), |(deleted, freed), mut bucket_entry| -> DFResult<_> {
             let bucket = bucket_entry.value_mut();
@@ -1831,7 +1832,8 @@ impl MemBuffer {
         let df_schema = DFSchema::try_from(schema.as_ref().clone())?;
         let props = ExecutionProps::new();
 
-        let physical_predicate = predicate.map(|p| create_physical_expr(&strip_column_qualifiers(p.clone())?, &df_schema, &props, &Default::default())).transpose()?;
+        let physical_predicate =
+            predicate.map(|p| create_physical_expr(&strip_column_qualifiers(p.clone())?, &df_schema, &props, &Default::default())).transpose()?;
 
         let physical_assignments = Self::compile_assignments(assignments, &schema, &df_schema, &props, Ok)?;
 
@@ -1932,8 +1934,9 @@ impl MemBuffer {
             .map_err(|e| datafusion::error::DataFusionError::Execution(format!("update_with_source: rewrite failed: {e}")))
         };
 
-        let physical_predicate =
-            predicate.map(|p| create_physical_expr(&rewrite(strip_column_qualifiers(p.clone())?)?, &widened_df_schema, &props, &Default::default())).transpose()?;
+        let physical_predicate = predicate
+            .map(|p| create_physical_expr(&rewrite(strip_column_qualifiers(p.clone())?)?, &widened_df_schema, &props, &Default::default()))
+            .transpose()?;
 
         let physical_assignments = Self::compile_assignments(assignments, &target_schema, &widened_df_schema, &props, rewrite)?;
 
