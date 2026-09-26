@@ -6,7 +6,7 @@
 | --- | --- | --- |
 | 1 — resource safety | DataFusion 54 fork `be42f6a9` (spill-reader ownership, quota-rejection cleanup) + sketch memory accounting | Merged #322, deployed 2026-09-25 21:49 UTC. Rollback drill and constrained comparison passed; see `2026-09-25-first-rollup-deployment.md` |
 | 2 — rollup pause policy + Stage 0 range coverage | Durable `ROLLUP PAUSE/RESUME/POLICIES`, range coverage, derived claims wait for queued parents, a running base unit supersedes the queued base units inside it | Merged #323, deployed 02:11 UTC. Caused OOM kills (compaction admission priced after file selection); **hotfix `96b093f5` deployed ~04:20 UTC**, memory back to 15–34 GB, PSI 0 |
-| 3 — DataFusion 55.1 / Arrow 59.3 upgrade | All forks ported: DataFusion `2f17a238`; Delta on upstream `29db7587` + DV writers, append-tolerant conflicts, OPTIMIZE isolation downgrade, footer ordering through `DeltaScanExec`, row-ordinal selections, conjunct-split pushdown, scan metrics; datafusion-postgres fork; pgwire 0.41 re-vendored; datafusion-variant bumped; JSON 0.55.4; tracing 55.0.0 | Merged #324 (`8343dcd7`); deploying |
+| 3 — DataFusion 55.1 / Arrow 59.3 upgrade | All forks ported: DataFusion `2f17a238`; Delta on upstream `29db7587` + DV writers, append-tolerant conflicts, OPTIMIZE isolation downgrade, footer ordering through `DeltaScanExec`, row-ordinal selections, conjunct-split pushdown, scan metrics; datafusion-postgres fork; pgwire 0.41 re-vendored; datafusion-variant bumped; JSON 0.55.4; tracing 55.0.0 | Merged #324 (`8343dcd7`), deployed ~05:18 UTC (Dockerfile moved to Rust 1.98 for DataFusion's MSRV). Follow-up `8645be45` fixed `variant_get` returning an untyped NULL for missing paths (broke COALESCE over sparse `->` keys); deployed, no errors since |
 
 Production rollup policy: `sessions_1h_v1` **paused** (no consumers; §8.3). `dashboard_1m_v3` was paused
 during the incident and resumed from 2026-01-01.
@@ -15,6 +15,8 @@ Behaviour changes in release 3: `variant_get`/`->` on a missing key returns SQL 
 jsonb semantics, upstream datafusion-variant); struct→JSON keys still render sorted; `regproc`
 casts stay text (our datafusion-postgres fork drops the upstream regproc lookup rewrite, whose
 unknown names nulled a non-nullable oid).
+
+Known gap: a `->` path bound as an untyped extended-protocol parameter fails at planning (reproduced locally, not seen in prod).
 
 Still open from the full plan (not started or not activated): Stage 1B single-pass execution,
 Stage 1C shared scans, Stage 1D dependencies, Stage 3 batched publication, Stage 4 flush
