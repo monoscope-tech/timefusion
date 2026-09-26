@@ -389,6 +389,18 @@ impl Database {
         }
     }
 
+    /// A table builder over the Foyer-cached, request-class-routed store. Every
+    /// table handle must come from here, or its reads bypass the cache.
+    pub(crate) fn cached_table_builder(
+        storage_uri: &str, storage_options: &HashMap<String, String>, cached_store: &Arc<dyn object_store::ObjectStore>,
+    ) -> Result<DeltaTableBuilder> {
+        let url = Url::parse(storage_uri)?;
+        Ok(DeltaTableBuilder::from_url(url.clone())?
+            .with_storage_backend(cached_store.clone(), url)
+            .with_storage_options(storage_options.clone())
+            .with_allow_http(true))
+    }
+
     /// Creates or loads a DeltaTable with proper configuration. Prefers the
     /// locally persisted snapshot (restore at version V + incremental replay
     /// of commits > V) over a full checkpoint + log-tail rebuild from S3;
@@ -396,13 +408,7 @@ impl Database {
     pub(crate) async fn create_or_load_delta_table(
         &self, storage_uri: &str, storage_options: HashMap<String, String>, cached_store: Arc<dyn object_store::ObjectStore>,
     ) -> Result<DeltaTable> {
-        let url = Url::parse(storage_uri)?;
-        let builder = || -> Result<DeltaTableBuilder> {
-            Ok(DeltaTableBuilder::from_url(url.clone())?
-                .with_storage_backend(cached_store.clone(), url.clone())
-                .with_storage_options(storage_options.clone())
-                .with_allow_http(true))
-        };
+        let builder = || Self::cached_table_builder(storage_uri, &storage_options, &cached_store);
         // `spawn_blocking`: this zstd-decodes and deserializes a whole
         // `DeltaTableState`, seconds of CPU on large tables, and boot preload runs
         // many concurrently on the coordinator's runtime.

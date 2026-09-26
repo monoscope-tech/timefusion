@@ -3949,7 +3949,7 @@ impl Database {
                         .collect();
 
                     match CreateBuilder::new()
-                        .with_location(storage_uri)
+                        .with_log_store(Self::cached_table_builder(storage_uri, storage_options, &cached_store)?.build()?.log_store())
                         .with_columns(schema.columns().unwrap_or_default())
                         .with_partition_columns(schema.partitions.clone())
                         .with_storage_options(storage_options.clone())
