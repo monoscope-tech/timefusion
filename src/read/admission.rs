@@ -13,7 +13,8 @@
 //! spilling `SortExec`, or a multi-partition ordered merge feeding merge-on-read
 //! dedup, in [`AdmissionExec`], which holds ONE permit for the stream's lifetime.
 //! The latter buffers one decoded batch per input partition and can consume close
-//! to a GiB before a small outer `LIMIT` emits anything. Cheap queries —
+//! to a GiB before a small outer `LIMIT` emits anything, but only for wide rows:
+//! a merge is gated when its estimated buffer exceeds one sort reservation. Cheap queries —
 //! rollup-routed aggregates, point lookups, bounded `TopK`, and one-partition
 //! ordered scans — are never gated, so the read hit rate is untouched. The
 //! scan-level [`crate::database::scan::GatedScanExec`] permits
@@ -28,6 +29,7 @@ use std::{
 };
 
 use datafusion::{
+    arrow::datatypes::{DataType, Schema},
     error::{DataFusionError, Result as DFResult},
     execution::TaskContext,
     physical_optimizer::PhysicalOptimizerRule,
@@ -47,6 +49,11 @@ use crate::{
 /// How long a queued heavy query waits for a permit before failing with an
 /// orderly error rather than blocking a client forever.
 const HEAVY_QUEUE_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// A permit held longer than this is logged from inside its own query span when
+/// released, completed or cancelled alike. Statement logs stop timing at the
+/// first batch, so without this the queries that fill the gate are invisible.
+const HEAVY_HELD_LOG_AFTER: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// The process-wide heavy-sort permit pool, sized once at first use from the
 /// query-pool geometry.
@@ -74,7 +81,7 @@ fn heavy_sem() -> &'static Arc<tokio::sync::Semaphore> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum HeavyClass {
     SpillingSort,
-    OrderedMorMerge { fan_in: usize },
+    OrderedMorMerge { fan_in: usize, buffered_bytes: usize },
 }
 
 impl HeavyClass {
@@ -92,10 +99,25 @@ fn ordered_merge_fan_in(plan: &Arc<dyn ExecutionPlan>) -> Option<usize> {
     plan.children().into_iter().filter_map(ordered_merge_fan_in).chain(here).max()
 }
 
+/// Decoded bytes per row, biased UP: an underestimate would un-gate a wide merge,
+/// an overestimate only keeps a narrow one waiting.
+fn estimated_row_bytes(schema: &Schema) -> usize {
+    schema
+        .fields()
+        .iter()
+        .map(|field| match field.data_type() {
+            DataType::Boolean => 1,
+            t if t.is_nested() => 1024,
+            t => t.primitive_width().unwrap_or(64),
+        })
+        .sum()
+}
+
 /// Classify only shapes whose per-query memory is large enough to share the
 /// heavy-query gate. An ordered merge is heavy only below an order-dependent
-/// `DedupExec`; incidental merges elsewhere keep their existing concurrency.
-fn heavy_class(plan: &Arc<dyn ExecutionPlan>) -> Option<HeavyClass> {
+/// `DedupExec`, and only when one batch per input exceeds a sort reservation;
+/// incidental merges elsewhere keep their existing concurrency.
+fn heavy_class(plan: &Arc<dyn ExecutionPlan>, batch_rows: usize) -> Option<HeavyClass> {
     if downcast::<SortExec>(plan.as_ref()).is_some_and(|sort| sort.fetch().is_none()) {
         return Some(HeavyClass::SpillingSort);
     }
@@ -103,9 +125,10 @@ fn heavy_class(plan: &Arc<dyn ExecutionPlan>) -> Option<HeavyClass> {
         && dedup.required_ordering().is_some()
         && let Some(fan_in) = plan.children().into_iter().filter_map(ordered_merge_fan_in).max()
     {
-        return Some(HeavyClass::OrderedMorMerge { fan_in });
+        let buffered_bytes = fan_in * batch_rows * estimated_row_bytes(&plan.children()[0].schema());
+        return (buffered_bytes > crate::config::DEFAULT_SORT_SPILL_RESERVATION_BYTES).then_some(HeavyClass::OrderedMorMerge { fan_in, buffered_bytes });
     }
-    plan.children().into_iter().find_map(heavy_class)
+    plan.children().into_iter().find_map(|child| heavy_class(child, batch_rows))
 }
 
 /// Wrap a heavy plan's root so its execution holds one heavy-query permit.
@@ -123,8 +146,8 @@ impl PhysicalOptimizerRule for HeavyQueryAdmission {
     fn schema_check(&self) -> bool {
         true
     }
-    fn optimize(&self, plan: Arc<dyn ExecutionPlan>, _config: &datafusion::config::ConfigOptions) -> DFResult<Arc<dyn ExecutionPlan>> {
-        match heavy_class(&plan) {
+    fn optimize(&self, plan: Arc<dyn ExecutionPlan>, config: &datafusion::config::ConfigOptions) -> DFResult<Arc<dyn ExecutionPlan>> {
+        match heavy_class(&plan, config.execution.batch_size.get()) {
             Some(class) => Ok(Arc::new(AdmissionExec::new(plan, class))),
             None => Ok(plan),
         }
@@ -155,9 +178,13 @@ impl DisplayAs for AdmissionExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => match self.class {
-                HeavyClass::OrderedMorMerge { fan_in } => {
-                    write!(f, "AdmissionExec: class={}, fan_in={fan_in}, available={}", self.class.label(), heavy_sem().available_permits())
-                }
+                HeavyClass::OrderedMorMerge { fan_in, buffered_bytes } => write!(
+                    f,
+                    "AdmissionExec: class={}, fan_in={fan_in}, buffered_mb={}, available={}",
+                    self.class.label(),
+                    buffered_bytes >> 20,
+                    heavy_sem().available_permits()
+                ),
                 HeavyClass::SpillingSort => write!(f, "AdmissionExec: class={}, available={}", self.class.label(), heavy_sem().available_permits()),
             },
             _ => write!(f, "AdmissionExec"),
@@ -169,9 +196,27 @@ impl DisplayAs for AdmissionExec {
 /// child holding it. A three-state unfold avoids `async-stream` (not a
 /// dependency) while keeping the permit's drop tied to the stream's.
 enum Admit {
-    Pending(Arc<dyn ExecutionPlan>, usize, Arc<TaskContext>),
-    Running(SendableRecordBatchStream, OwnedSemaphorePermit),
+    Pending(Arc<dyn ExecutionPlan>, usize, Arc<TaskContext>, tracing::Span),
+    Running(SendableRecordBatchStream, HeldPermit),
     Done,
+}
+
+/// A permit plus who holds it, reported on release if held long.
+struct HeldPermit {
+    _permit: OwnedSemaphorePermit,
+    span: tracing::Span,
+    since: std::time::Instant,
+    class: HeavyClass,
+}
+
+impl Drop for HeldPermit {
+    fn drop(&mut self) {
+        let held = self.since.elapsed();
+        if held >= HEAVY_HELD_LOG_AFTER {
+            let (class, held_ms) = (self.class.label(), held.as_millis() as u64);
+            self.span.in_scope(|| tracing::warn!(event = "heavy_query_held", class, held_ms, "heavy-query permit held long"));
+        }
+    }
 }
 
 impl ExecutionPlan for AdmissionExec {
@@ -191,10 +236,12 @@ impl ExecutionPlan for AdmissionExec {
     fn execute(&self, partition: usize, context: Arc<TaskContext>) -> DFResult<SendableRecordBatchStream> {
         let schema = self.input.schema();
         let class = self.class;
-        let start = Admit::Pending(Arc::clone(&self.input), partition, context);
+        // Captured here, synchronously inside the statement's span, so a long hold
+        // is reported with the query that caused it.
+        let start = Admit::Pending(Arc::clone(&self.input), partition, context, tracing::Span::current());
         let stream = futures::stream::unfold(start, move |state| async move {
             match state {
-                Admit::Pending(input, partition, context) => {
+                Admit::Pending(input, partition, context, span) => {
                     // Acquire BEFORE executing the child, so no scan starts until this
                     // query is admitted. The owned permit lives in the Running state and
                     // releases when the stream ends or is dropped (client disconnect /
@@ -202,7 +249,7 @@ impl ExecutionPlan for AdmissionExec {
                     let sem = Arc::clone(heavy_sem());
                     let queued = sem.available_permits() == 0;
                     let permit = match tokio::time::timeout(HEAVY_QUEUE_WAIT, sem.acquire_owned()).await {
-                        Ok(Ok(permit)) => permit,
+                        Ok(Ok(permit)) => HeldPermit { _permit: permit, span, since: std::time::Instant::now(), class },
                         // Semaphore closed only at shutdown: end the stream cleanly.
                         Ok(Err(_closed)) => return None,
                         Err(_elapsed) => {
@@ -269,6 +316,9 @@ mod tests {
 
     use super::{AdmissionExec, HeavyClass, heavy_class};
 
+    /// DataFusion's default `batch_size`.
+    const BATCH: usize = 8192;
+
     fn empty() -> Arc<dyn ExecutionPlan> {
         Arc::new(EmptyExec::new(Arc::new(Schema::new(vec![Field::new("t", DataType::Int64, false)]))))
     }
@@ -278,46 +328,83 @@ mod tests {
     fn ordering() -> LexOrdering {
         LexOrdering::new(vec![PhysicalSortExpr::new(Arc::new(Column::new("t", 0)), SortOptions::default())]).unwrap()
     }
+    /// The whale dashboard count's merge columns: key, version and tombstone only.
+    fn narrow() -> Arc<Schema> {
+        let ts = || DataType::Timestamp(datafusion::arrow::datatypes::TimeUnit::Microsecond, Some("UTC".into()));
+        Arc::new(Schema::new(vec![
+            Field::new("t", ts(), true),
+            Field::new("service", DataType::Utf8View, true),
+            Field::new("id", DataType::Utf8View, true),
+            Field::new("updated_at", ts(), true),
+            Field::new("deleted", DataType::Boolean, true),
+        ]))
+    }
+    /// A log-explorer row: the same key plus wide text and a Variant-like struct.
+    fn wide() -> Arc<Schema> {
+        let variant = DataType::Struct(vec![Field::new("metadata", DataType::Binary, true), Field::new("value", DataType::Binary, true)].into());
+        let mut fields: Vec<Field> = narrow().fields().iter().map(|f| f.as_ref().clone()).collect();
+        fields.extend([Field::new("body", DataType::Utf8View, true), Field::new("attributes", variant, true)]);
+        Arc::new(Schema::new(fields))
+    }
     fn ordered_mor(fan_in: usize, probe: bool) -> Arc<dyn ExecutionPlan> {
-        let input = Arc::new(EmptyExec::new(empty().schema()).with_partitions(fan_in));
+        ordered_mor_over(wide(), fan_in, probe)
+    }
+    fn ordered_mor_over(schema: Arc<Schema>, fan_in: usize, probe: bool) -> Arc<dyn ExecutionPlan> {
+        let key = schema.field(0).name().clone();
+        let input = Arc::new(EmptyExec::new(schema).with_partitions(fan_in));
         let merge = Arc::new(SortPreservingMergeExec::new(ordering(), input)) as Arc<dyn ExecutionPlan>;
         let input = if probe { Arc::new(OrderingProbeExec::new(merge, LegKind::Delta)) as Arc<dyn ExecutionPlan> } else { merge };
-        Arc::new(DedupExec::new(input, vec!["t".into()], None).unwrap().requiring(Some(ordering())))
+        Arc::new(DedupExec::new(input, vec![key], None).unwrap().requiring(Some(ordering())))
     }
 
     /// The pool-exhausting shape — an unbounded sort — is gated.
     #[test]
     fn an_unbounded_sort_is_heavy() {
-        assert_eq!(heavy_class(&sort(empty(), None)), Some(HeavyClass::SpillingSort));
+        assert_eq!(heavy_class(&sort(empty(), None), BATCH), Some(HeavyClass::SpillingSort));
     }
 
     /// A bounded TopK holds only `n` rows and never spills, so it is NOT gated —
     /// gating it would throttle the fast dashboard path that earned the hit rate.
     #[test]
     fn a_bounded_topk_is_not_heavy() {
-        assert_eq!(heavy_class(&sort(empty(), Some(100))), None);
+        assert_eq!(heavy_class(&sort(empty(), Some(100)), BATCH), None);
     }
 
     /// A plan with no sort at all — a rollup-routed aggregate, a point lookup — is
     /// never gated.
     #[test]
     fn a_sortless_plan_is_not_heavy() {
-        assert_eq!(heavy_class(&empty()), None);
+        assert_eq!(heavy_class(&empty(), BATCH), None);
     }
 
     #[test]
     fn a_multi_partition_ordered_mor_merge_is_heavy() {
-        assert_eq!(heavy_class(&ordered_mor(8, false)), Some(HeavyClass::OrderedMorMerge { fan_in: 8 }));
+        assert_eq!(heavy_class(&ordered_mor(8, false), BATCH).map(|c| c.label()), Some("ordered_mor_merge"));
+    }
+
+    /// A narrow merge buffers a few MB even at a whale's fan-in, so gating it made
+    /// every raw dashboard count of the largest project queue behind 8 slots.
+    #[test]
+    fn a_narrow_whale_count_merge_is_not_heavy() {
+        assert_eq!(heavy_class(&ordered_mor_over(narrow(), 26, false), BATCH), None);
+    }
+
+    /// The shape the gate exists for, at prod's batch size and the smallest whale
+    /// fan-in seen: every column of the real table must stay gated.
+    #[test]
+    fn a_full_width_log_explorer_merge_stays_heavy() {
+        let schema = crate::schema::get_schema("otel_logs_and_spans").unwrap().schema_ref();
+        assert_eq!(heavy_class(&ordered_mor_over(schema, 7, false), 4096).map(|c| c.label()), Some("ordered_mor_merge"));
     }
 
     #[test]
     fn a_single_partition_ordered_mor_merge_is_not_heavy() {
-        assert_eq!(heavy_class(&ordered_mor(1, false)), None);
+        assert_eq!(heavy_class(&ordered_mor(1, false), BATCH), None);
     }
 
     #[test]
     fn an_ordering_probe_does_not_hide_an_ordered_mor_merge() {
-        assert_eq!(heavy_class(&ordered_mor(8, true)), Some(HeavyClass::OrderedMorMerge { fan_in: 8 }));
+        assert_eq!(heavy_class(&ordered_mor(8, true), BATCH).map(|c| c.label()), Some("ordered_mor_merge"));
     }
 
     /// The wrapper is transparent to the optimizer contract: same schema, one

@@ -520,7 +520,7 @@ pub const fn client_sort_concurrency() -> usize {
     CONCURRENT_SORT_QUERIES
 }
 
-const DEFAULT_SORT_SPILL_RESERVATION_BYTES: usize = 64 * MIB;
+pub(crate) const DEFAULT_SORT_SPILL_RESERVATION_BYTES: usize = 64 * MIB;
 /// Floor, so a small box (or a large `target_partitions`) cannot clamp the
 /// reservation to nothing and push sorts back into dying mid-merge.
 const MIN_SORT_SPILL_RESERVATION_BYTES: usize = 8 * MIB;
