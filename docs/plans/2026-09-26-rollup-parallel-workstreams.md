@@ -55,7 +55,7 @@ Status: ⬜ open · 🟡 in progress · ✅ done. Priority is the plan's executi
 | W13 | Narrow the slice OCC gate (Stage 3 step 1) | build (lane 2) | Stage 3 | A non-overlapping sibling slice no longer makes a staged unit `slice_occ_stale`; a unit may retire narrower contained slices; target proof re-recorded under the commit lock; cause logging; tests 1, 3, 3b of the W9 design failing-first | `maintain.rs` `run_coordinator_rollup_selected` OCC check | W9 | Claude | 🟡 branch `ws/w13-occ-narrow` (842617b9), **top priority per W3** |
 | W14 | 720-minute republication loop | analysis → build | Stage 0 / 1 | Why 58 slices (mostly 720-min `dashboard_1m_v3`) republished 431 times in 65 min (56% of publications, 228/361 GB); fix the re-mint source (census / witness moved / no-op skip miss); log the retry reason on `maintenance_task_finished` | `maintain.rs` census + no-op decision, `database/rollup.rs` | W3 | Claude | ✅ deployed `2b8c46d4` |
 | W15 | Observability batch: retry reason on `maintenance_task_finished`, per-tier rollup hit counters, sessions near-miss warn → debug | build (lane 3, niced) | Attribution | Confirms W3's post-scan retry cause; per-tier hit rate | `observability.rs`, stats key lists (`server/pg_compat.rs`), finish log in `maintenance_coordinator.rs`/`maintain.rs`, one warn in `rollup.rs` | — | agent (Claude) | 🟡 |
-| W16 | W2 via exported metric history | analysis | Attribution | Multi-day rollup/maintenance CPU and work attribution from OTel metrics in monoscope (`monoscope chart --source metrics`), not young-process counters | monoscope CLI, prod read-only | — | agent (Claude) | 🟡 |
+| W16 | W2 via exported metric history | analysis | Attribution | Multi-day rollup/maintenance CPU and work attribution from OTel metrics in monoscope (`monoscope chart --source metrics`), not young-process counters | monoscope CLI, prod read-only | — | agent (Claude) | ✅ |
 | W17 | W8 design: dependency classification | analysis | Stage 1D | Per-spec dependency map + mutation fixture table + where the classifier hooks in | design doc | — | agent (Claude) | ✅ design |
 | W18 | W10 design: capacity replay | analysis | Shared gates | How to drive `timefusion sim` at 1x/2x/4x rows and projects; what it can/can't prove; code plan | design doc | — | agent (Claude) | ✅ design |
 
@@ -181,3 +181,18 @@ guard (per-hour last-relevant sequence vs the statement's `read_seq`); shadow co
 session backfill (irrelevant to dashboard tiers, relevant to the paused sessions tier). Epoch keying is per
 (project, source, date) across all specs — per-target epochs needed for the session backfill case.
 **Fixtures:** 25-case table (tombstones, stale full-row re-sends, guard trips, mixed statements, replay, reconcile …).
+
+### W16 result — 2026-09-26 — agent (Claude)
+**Source:** TF metrics/logs live in monoscope project `87576849-4941-49d3-a15d-680fef88a1a8`; counters differenced per
+process (max per 5 min, drop = restart); CPU from `container.cpu.usage.total`; per-lane work from
+`maintenance_task_finished` / `maintenance_rollup_published` logs (match host counts exactly).
+**Baseline "before" (window B, process `ihftpuuf`, 09-24 23:00–09-25 20:00, 22 h):** 33.6 cores; 14.1 queries/s;
+maintenance 125.5k lease-s/h (~35 busy workers; wall time, not CPU), 83% BaseRollup; 511 publications/h
+(sessions 208, dashboard_1m 136, dashboard_1h 78, metrics_1m 65, metrics_1h 24); 195.6 GB/h processed (71% sessions;
+scan-side ≈7x, not exported); 96% of leases ended in Retry; hit rate 5.3% outside the midnight `not_built` burst.
+**Churn:** 65 process starts in 7.8 days; a 02:10–04:15 crash loop today (9 starts).
+**Sessions pause** freed capacity that dashboard_1m immediately consumed (136 → 352–387 publications/h) — W14's loop.
+**Hit collapse:** 40–72 hits/h until 11:00 today, near 0 from the **12:10** deploy (packed repairs on), not fixed by
+the 18:05 `now()` fix — consistent with W14's unreadable overlapping cells; being re-measured after the W14 fix.
+**Gaps:** no per-lane CPU metric; `work.*`, `rollup_scan_*`, `processed_bytes` are stats-only (not exported);
+`worker_secs` never recorded → export per-operation `ran_secs` and per-tier publications/bytes as OTel counters.
