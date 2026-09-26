@@ -56,7 +56,7 @@ Status: ⬜ open · 🟡 in progress · ✅ done. Priority is the plan's executi
 | W14 | 720-minute republication loop | analysis → build | Stage 0 / 1 | Why 58 slices (mostly 720-min `dashboard_1m_v3`) republished 431 times in 65 min (56% of publications, 228/361 GB); fix the re-mint source (census / witness moved / no-op skip miss); log the retry reason on `maintenance_task_finished` | `maintain.rs` census + no-op decision, `database/rollup.rs` | W3 | Claude | ✅ deployed `2b8c46d4` |
 | W15 | Observability batch: retry reason on `maintenance_task_finished`, per-tier rollup hit counters, sessions near-miss warn → debug | build (lane 3, niced) | Attribution | Confirms W3's post-scan retry cause; per-tier hit rate | `observability.rs`, stats key lists (`server/pg_compat.rs`), finish log in `maintenance_coordinator.rs`/`maintain.rs`, one warn in `rollup.rs` | — | agent (Claude) | 🟡 |
 | W16 | W2 via exported metric history | analysis | Attribution | Multi-day rollup/maintenance CPU and work attribution from OTel metrics in monoscope (`monoscope chart --source metrics`), not young-process counters | monoscope CLI, prod read-only | — | agent (Claude) | 🟡 |
-| W17 | W8 design: dependency classification | analysis | Stage 1D | Per-spec dependency map + mutation fixture table + where the classifier hooks in | design doc | — | agent (Claude) | 🟡 |
+| W17 | W8 design: dependency classification | analysis | Stage 1D | Per-spec dependency map + mutation fixture table + where the classifier hooks in | design doc | — | agent (Claude) | ✅ design |
 | W18 | W10 design: capacity replay | analysis | Shared gates | How to drive `timefusion sim` at 1x/2x/4x rows and projects; what it can/can't prove; code plan | design doc | — | agent (Claude) | ✅ design |
 
 Later stages (2, 4, 5, 6, 1C, certified-clean activation, adaptive batches) stay **conditional** on W2/W7
@@ -168,3 +168,16 @@ bytes); `--rows K` scales bytes per day, `--projects K` clones every ingesting s
 **Limits:** IO-free — proves backlog stability/fairness/lag, not CPU contention, latency, memory or object requests; recent
 admission changes (CPU-token pricing, client-query yield) are not in `SimConfig`. 1x must reproduce prod executions/h first.
 **Journal fetch (read-only):** `docker cp <cid>:/app/data/timefusion/.timefusion_meta/maintenance_tasks.json` (+ `.wal`, ~1.5h newer).
+
+### W17 result — 2026-09-26 — agent (Claude)
+**Finding:** a classifier at the DML append alone saves ~nothing today: MoR version rows keep their timestamp, so the flush
+moves the partition fingerprint + row witness below `covered_through`, and `reconcile_maintenance_task_cursors`
+(60 s loop) re-mints BaseRollup for every spec from the untagged Add. Acting on the verdict needs Stage 2 (witness carry
++ read path accepting fingerprints moved only by irrelevant commits).
+**Ship now (shadow):** carry assigned-column evidence (`WriteOrigin::VersionAppend`) through the bucket to the flush
+commitInfo; `RollupSpec::dependencies` at schema load; pure `classify(mutation, deps, hour_seq)` with a stale-replacement
+guard (per-hour last-relevant sequence vs the statement's `read_seq`); shadow counters per spec. Suppresses nothing.
+**Traffic:** TF's UPDATEs are monoscope `updateHashesSql`/`update2Sql` (`hashes` only → irrelevant to every spec) and the
+session backfill (irrelevant to dashboard tiers, relevant to the paused sessions tier). Epoch keying is per
+(project, source, date) across all specs — per-target epochs needed for the session backfill case.
+**Fixtures:** 25-case table (tombstones, stale full-row re-sends, guard trips, mixed statements, replay, reconcile …).
