@@ -76,6 +76,7 @@ impl PgCatalogContextProvider for PgCatalogContext {
 }
 
 pub fn setup_catalog(ctx: &SessionContext, role: &str, max_statement_secs: u64) -> DFResult<()> {
+    let before = ctx.state().scalar_functions().clone();
     setup_pg_catalog(ctx, "datafusion", PgCatalogContext::new(role)).map_err(|err| *err)?;
     // `setup_pg_catalog` installs its own type planner; ours wraps it and adds jsonpath/regproc.
     {
@@ -84,6 +85,18 @@ pub fn setup_catalog(ctx: &SessionContext, role: &str, max_statement_secs: u64) 
         *state.write() = datafusion::execution::session_state::SessionStateBuilder::new_from_existing(existing)
             .with_type_planner(Arc::new(crate::read::functions::PostgresTypePlanner))
             .build();
+    }
+    // Both rebuilds re-register a flattened name map in hash order, so a builtin still
+    // keyed by an alias (`to_char` via `date_format`) can re-claim a name we overrode.
+    // Hand such names back; ones the catalog itself installed stay its own.
+    let after = ctx.state().scalar_functions().clone();
+    for (name, owner) in &before {
+        if let Some(now) = after.get(name)
+            && !Arc::ptr_eq(now, owner)
+            && before.values().any(|f| Arc::ptr_eq(f, now))
+        {
+            ctx.register_udf(owner.as_ref().clone());
+        }
     }
     register_identity_udfs(ctx, role, max_statement_secs);
     overlay_runtime_stat_views(ctx)
@@ -671,6 +684,29 @@ mod tests {
         }
         // The overlay must not shadow what the crate already provides.
         ctx.sql("SELECT oid FROM pg_catalog.pg_database LIMIT 1").await.unwrap().collect().await.unwrap();
+    }
+
+    /// The catalog's state rebuilds re-register every function in HashMap order,
+    /// and the builtin `to_char` rides back in under its `date_format` alias:
+    /// prod echoed `YYYY-MM-DD` for every monoscope timestamp. Many sessions,
+    /// because a single one can win the shuffle.
+    #[tokio::test]
+    async fn custom_functions_survive_catalog_setup() {
+        for _ in 0..32 {
+            let mut ctx = SessionContext::new();
+            crate::read::functions::register_custom_functions(&mut ctx).unwrap();
+            setup_catalog(&ctx, "operator", 60).unwrap();
+            let batch = ctx
+                .sql(r#"SELECT to_char(TIMESTAMP '2026-09-26 09:41:57.694', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'), date_format(TIMESTAMP '2026-09-26 00:00:00', '%Y')"#)
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap()
+                .remove(0);
+            let cell = |col| datafusion::arrow::util::display::array_value_to_string(batch.column(col), 0).unwrap();
+            assert_eq!((cell(0), cell(1)), ("2026-09-26T09:41:57.694000Z".into(), "2026".into()));
+        }
     }
 
     /// Every name in the row set must resolve, or the table function silently
