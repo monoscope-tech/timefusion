@@ -669,16 +669,18 @@ impl Drop for TaskLease {
         // recording anything and is abandoned below.
         let outcome = journal.state(&self.key);
         let ran_micros = crate::support::now_micros().saturating_sub(self.started_micros);
+        let failure = self.failure.get_mut().unwrap_or_else(std::sync::PoisonError::into_inner).take();
         tracing::info!(
             operation = ?self.key.operation, table = %self.key.physical_table, project_id = %self.key.project_id,
             slice_start = self.key.slice.start_micros, slice_end = self.key.slice.end_micros,
             outcome = ?outcome, ran_secs = ran_micros / 1_000_000,
             // What the unit READ, not what it changed.
             input_files = journal.input_files(&self.key),
+            // A unit that died through `?` is still Running; its noted failure is the reason.
+            retry_reason = journal.task(&self.key).and_then(|task| task.retry_reason.as_deref()).or(failure.as_deref()),
             event = "maintenance_task_finished"
         );
         if outcome == Some(TaskState::Running) {
-            let failure = self.failure.get_mut().unwrap_or_else(std::sync::PoisonError::into_inner).take();
             // A unit that never started is not a worker failure. `mark_running`
             // already charged it an attempt and `abandon_running` would charge a
             // `worker_error` and a backoff on top — then SPLIT it at two attempts
@@ -4686,6 +4688,19 @@ mod tests {
 
     /// A completed unit must NOT be requeued by its lease: `maintenance_task_finished`
     /// is emitted from `Drop` and reports whatever `state` says at that moment.
+    /// Post-scan retries (`slice_occ_stale`, `admission_busy`, …) are only
+    /// attributable in prod logs if the finish event names them.
+    #[test]
+    #[tracing_test::traced_test]
+    fn a_retried_lease_logs_its_retry_reason() {
+        let (_dir, mut journal) = new_journal();
+        let key = upserted(&mut journal, task("p", 0, MIN_SLICE_MICROS, Operation::BaseRollup));
+        assert!(journal.mark_running(&key));
+        assert!(journal.retry(&key, "slice_occ_stale".to_owned(), 0));
+        drop(TaskLease::new(Arc::new(Mutex::new(journal)), key, tokio_util::sync::CancellationToken::new()));
+        assert!(logs_contain("maintenance_task_finished") && logs_contain(r#"retry_reason="slice_occ_stale""#));
+    }
+
     #[test]
     fn a_completed_lease_reports_complete_and_is_not_requeued() {
         let (_dir, mut journal) = new_journal();
