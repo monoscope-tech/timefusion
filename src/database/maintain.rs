@@ -3119,11 +3119,22 @@ impl Database {
             let mut table = target_ref.read().await.clone();
             let live = table.snapshot()?.log_data().iter().map(|file| file.path().to_string()).collect::<HashSet<_>>();
             // Retained replacement paths alone do not detect a new overlapping
-            // publication. Revalidate the partition that informed retirement.
-            // Other projects/dates can commit without invalidating this decision.
+            // publication. Revalidate the files that informed retirement: those in this
+            // partition that can hold rows of this slice. A sibling slice elsewhere in the
+            // day cannot, so it no longer discards the staged output.
+            let overlaps_slice = |add: &deltalake::kernel::Add| {
+                in_partition(add)
+                    && Self::slice_tag_range(add).map_or_else(
+                        || match add_ts_bounds(add) {
+                            (Some(lo), Some(hi)) => key.slice.overlaps(lo, hi.saturating_add(1)),
+                            _ => true,
+                        },
+                        |(start, end)| key.slice.overlaps(start, end),
+                    )
+            };
             let partition_unchanged = table.version() == staging_table.version() || {
-                let expected = live_adds.iter().filter(|add| in_partition(add)).map(|add| (add.path.as_str(), add)).collect::<HashMap<_, _>>();
-                table.snapshot()?.log_data().iter().map(|file| add_action(&file)).filter(&in_partition).try_fold(0usize, |count, add| {
+                let expected = live_adds.iter().filter(|add| overlaps_slice(add)).map(|add| (add.path.as_str(), add)).collect::<HashMap<_, _>>();
+                table.snapshot()?.log_data().iter().map(|file| add_action(&file)).filter(&overlaps_slice).try_fold(0usize, |count, add| {
                     let old = expected.get(add.path.as_str())?;
                     (old.tags == add.tags
                         && old.partition_values == add.partition_values
@@ -10747,6 +10758,63 @@ mod rollup_noop_skip_tests {
         assert_eq!(staged.iter().map(add_row_count).sum::<Option<u64>>(), Some(600), "file cuts must preserve both neighboring hours");
         assert!(staged.iter().all(|add| Database::add_tag(add, TAG_OUTPUT_ROWS) == Some("300")), "each fragment records its total across all cut files");
         assert!(staged.len() > 2, "each multi-batch fragment must flush before its end at a one-byte cutoff");
+        Ok(())
+    }
+
+    /// A sibling publication elsewhere in the day cannot hold rows of this slice, so it
+    /// must not discard the staged output (`slice_occ_stale` threw away ~30% of prod
+    /// publications and rescanned them).
+    #[serial]
+    #[tokio::test]
+    async fn a_sibling_slice_commit_does_not_discard_a_staged_publication() -> Result<()> {
+        let db = Arc::new(Database::with_config(rollup_cfg("occ_sibling")).await?);
+        let project = format!("occ_{}", uuid::Uuid::new_v4());
+        let date = chrono::Utc::now().date_naive() - chrono::Duration::days(3);
+        for hour in [11, 15] {
+            insert_span(&db, &project, date, hour, &format!("seed-{hour}"), "op").await?;
+        }
+        dedup_unified(&db).await?;
+        advance_and_drain(&db).await?;
+        let sibling = db.run_unit_once("otel_logs_and_spans", &project, date, Operation::BaseRollup, 1, 15).await?;
+        assert_eq!(sibling.state, Some(TaskState::Complete), "the fixture needs a published sibling slice");
+        let start = date.and_hms_opt(11, 0, 0).expect("valid hour").and_utc().timestamp_micros();
+        let hour = 3_600_000_000;
+        let target = db.resolve_table(&project, TIER).await?;
+        let lock = db.commit_lock(&project, TIER).await;
+        let held = lock.lock().await;
+        let build = db.run_unit_once("otel_logs_and_spans", &project, date, Operation::BaseRollup, 1, 11);
+        tokio::pin!(build);
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            let mut poll = tokio::time::interval(std::time::Duration::from_millis(10));
+            loop {
+                tokio::select! {
+                    result = &mut build => anyhow::bail!("the unit finished before its held commit lock: {}", result?),
+                    _ = poll.tick() => if db.staged_intents().iter().any(|intent| intent.rollup.as_ref().is_some_and(|rollup| rollup.key.slice.start_micros == start)) { break Ok(()) },
+                }
+            }
+        })
+        .await??;
+        // While the unit waits on the lock, the sibling slice's file is republished at a new path.
+        {
+            let table = target.read().await.clone();
+            let original = table
+                .snapshot()?
+                .log_data()
+                .iter()
+                .map(|file| add_action(&file))
+                .find(|add| Database::slice_tag_range(add) == Some((start + 4 * hour, start + 5 * hour)))
+                .expect("the sibling slice is live");
+            let store = table.log_store().object_store(None);
+            let copy = original.path.replace(".parquet", "-sibling.parquet");
+            store.copy(&object_store::path::Path::from(original.path.as_str()), &object_store::path::Path::from(copy.as_str())).await?;
+            deltalake::kernel::transaction::CommitBuilder::default()
+                .with_actions(vec![Action::Add(deltalake::kernel::Add { path: copy, ..original })])
+                .build(Some(table.snapshot()? as &dyn TableReference), table.log_store(), DeltaOperation::Write { mode: SaveMode::Append, partition_by: None, predicate: None })
+                .await?;
+        }
+        drop(held);
+        let report = build.await?;
+        assert_eq!(report.state, Some(TaskState::Complete), "a non-overlapping sibling commit must not make the unit stale: {report}");
         Ok(())
     }
 
