@@ -1760,9 +1760,9 @@ pub struct MaintenanceConfig {
     /// paired CPU, memory, cancellation, and foreground latency gates pass.
     #[serde_inline_default(false)]
     pub timefusion_rollup_adaptive_batches: bool,
-    /// Experiment: replace aligned subranges of packed aggregate files in one
-    /// commit, preserving their remaining states without widening raw scans.
-    #[serde_inline_default(false)]
+    /// Replace aligned subranges of packed aggregate files in one commit,
+    /// preserving their remaining states without widening raw scans.
+    #[serde_inline_default(true)]
     pub timefusion_rollup_packed_repairs: bool,
     /// Experiment: omit winner selection only for snapshot-certified raw input.
     /// Tombstones and deletion vectors remain active. Requires paired resource gates.
@@ -2338,7 +2338,7 @@ mod tests {
         assert!(config.rollup_read_enabled_for("a-project-created-tomorrow"));
         assert_eq!(config.timefusion_rollup_backfill_days, 31, "the shipped default is the value prod exercises");
         assert!(!config.timefusion_rollup_adaptive_batches, "adaptive batches need the paired resource experiment before activation");
-        assert!(!config.timefusion_rollup_packed_repairs, "packed repairs need recovery, race, and resource gates before activation");
+        assert!(config.timefusion_rollup_packed_repairs, "packed repairs keep a one-hour correction from re-aggregating its whole packed interval");
         assert!(!config.timefusion_rollup_certified_clean, "certified aggregation needs the paired resource experiment before activation");
 
         // The canary still narrows the READ side when it is set, and only then.
