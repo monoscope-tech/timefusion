@@ -131,6 +131,8 @@ serde-inline-default = "1.0.2"
 bon = "3.9.3"
 
 [dev-dependencies]
+# ManualReader, to read exported OTel counters back in tests. Adds no crates.
+opentelemetry_sdk = { version = "0.33", features = ["experimental_metrics_custom_reader"] }
 sqllogictest = { git = "https://github.com/risinglightdb/sqllogictest-rs.git" }
 serial_test = "3.2.0"
 tokio = { version = "1.48", features = ["test-util"] }

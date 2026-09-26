@@ -2217,7 +2217,6 @@ impl Database {
 
     async fn run_coordinator_dedup_selected(&self, selection: TaskSelection<'_>) -> Result<bool> {
         use crate::maintenance_coordinator::{MAX_DECODED_BYTES, Resources};
-        use std::sync::atomic::Ordering::Relaxed;
 
         let Some((task, _quarantine_slot)) = self.claim_coordinator_task(selection) else { return Ok(false) };
         let key = task.key.clone();
@@ -2332,7 +2331,7 @@ impl Database {
                 let mut journal = self.journal();
                 journal.complete(&key);
                 journal.checkpoint()?;
-                crate::observability::maintenance_stats().maintenance_processed_bytes.fetch_add(task.estimated_decoded_bytes, Relaxed);
+                crate::observability::record_processed_bytes(key.operation, task.estimated_decoded_bytes);
             }
             Ok((_, false, _)) => {
                 retry("dedup_incomplete".to_owned(), std::time::Duration::from_secs(30))?;
@@ -2938,7 +2937,7 @@ impl Database {
             let stats = crate::observability::maintenance_stats();
             stats.rollup_scan_cohorts.fetch_add(1, Relaxed);
             stats.rollup_scan_projects.fetch_add(1, Relaxed);
-            stats.rollup_scan_estimated_bytes.fetch_add(whole_file_bytes, Relaxed);
+            crate::observability::record_rollup_scan_bytes(&key.physical_table, whole_file_bytes);
             let shard_aggregate = collect_watched(&ctx, &aggregate_sql).await.map_err(|error| lease.note_failure(error))?;
             if hash_shards == 1 {
                 aggregate = shard_aggregate;
@@ -3277,7 +3276,7 @@ impl Database {
                 event = "maintenance_rollup_published"
             );
             let stats = crate::observability::maintenance_stats();
-            stats.maintenance_processed_bytes.fetch_add(estimated_bytes, Relaxed);
+            crate::observability::record_rollup_published(key.operation, &key.physical_table, estimated_bytes);
             stats.rollup_output_rows.fetch_add(rows, Relaxed);
             stats.rollup_output_files.fetch_add(output_files, Relaxed);
             stats.rollup_commit_actions.fetch_add(action_count, Relaxed);
@@ -3904,7 +3903,7 @@ impl Database {
         let remaining = if completed { !self.coordinator_compaction_files(&table_ref, &key).await?.is_empty() } else { false };
         if completed {
             let stats = crate::observability::maintenance_stats();
-            stats.maintenance_processed_bytes.fetch_add(processed_bytes, std::sync::atomic::Ordering::Relaxed);
+            crate::observability::record_processed_bytes(key.operation, processed_bytes);
             // FRESHNESS, PER LANE. A rate counter cannot tell "nothing needed
             // compacting" from "this lane has been dead since Tuesday", and a
             // SHARED stamp is worse than none: through the 2026-09-15 wedge the

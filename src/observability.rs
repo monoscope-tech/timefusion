@@ -146,6 +146,11 @@ counter_registry! {
     cache_confirm_warmed       => "timefusion.cache.confirm_warmed": "Files the pre-drain confirm had to fetch because write-capture skipped them. Sustained ~= confirm_attempts means the write-capture caps are too tight — every flush output is being re-read from S3",
     cache_confirm_timeouts     => "timefusion.cache.confirm_timeouts": "Pre-drain cache confirms that hit their bound and gave up. Best-effort — the commit and the drain proceed; the next query on those files just pays an S3 round-trip",
     rollup_hits                => "timefusion.rollup.hits": "Dashboard aggregates served from the pre-aggregated rollup instead of raw spans",
+    maintenance_lease_ms       => "timefusion.maintenance.lease_ms": "Wall milliseconds maintenance units held a lease, by operation and outcome. Per-lane work that survives deploys (the stats keys reset)",
+    maintenance_processed_bytes => "timefusion.maintenance.processed_bytes": "Estimated decoded input bytes of completed maintenance units, by operation",
+    rollup_publications        => "timefusion.rollup.publications": "Rollup units published, by tier",
+    rollup_published_input_bytes => "timefusion.rollup.published_input_bytes": "Estimated decoded input bytes of published rollup units, by tier",
+    rollup_scan_estimated_bytes => "timefusion.rollup.scan_estimated_bytes": "Projected bytes of every rollup scan pass, including failed and repeated shard passes, by tier. Against published_input_bytes this is the wasted-scan share",
     rollup_misses              => "timefusion.rollup.misses": "Dashboard aggregates that fell through to a raw scan, labelled by REASON. Without the reason breakdown there is no feedback loop telling us which dimension to add next — a rollup silently serving 20% of traffic looks identical to one serving 90%",
     cache_insert_bypassed    => "timefusion.cache.insert_bypassed": "Cache populations suppressed because the read ran inside a large-scan bypass scope (scan-resistant admission — a wide historical scan must not evict the hot tail)",
     dedup_chunk_skipped        => "timefusion.dedup.chunk_skipped": "Dedup chunk rewrites skipped (over the rewrite-byte budget, or partition in failure backoff). Duplicates persist in Delta — read-side dedup keeps queries correct — until a later sweep or manual compaction clears them. WARN if sustained",
@@ -920,6 +925,38 @@ pub fn record_rollup_hit(mode: &'static str, grain: &str, tier: &str) {
     if let Some(m) = METRICS.get() {
         m.rollup_hits.add(1, &[KeyValue::new("mode", mode), KeyValue::new("grain", grain.to_string()), KeyValue::new("tier", tier.to_string())]);
     }
+}
+
+fn otel_add(counter: impl FnOnce(&MetricsRegistry) -> &opentelemetry::metrics::Counter<u64>, n: u64, attrs: &[KeyValue]) {
+    if let Some(m) = METRICS.get() {
+        counter(m).add(n, attrs);
+    }
+}
+
+/// One maintenance lease released, whatever its outcome.
+pub fn record_maintenance_lease(operation: crate::maintenance_coordinator::Operation, outcome: Option<crate::maintenance_coordinator::TaskState>, ran_ms: u64) {
+    let outcome: &'static str = outcome.map_or("none", Into::into);
+    otel_add(|m| &m.maintenance_lease_ms, ran_ms, &[KeyValue::new("operation", <&'static str>::from(operation)), KeyValue::new("outcome", outcome)]);
+}
+
+/// Input bytes of a completed maintenance unit.
+pub fn record_processed_bytes(operation: crate::maintenance_coordinator::Operation, bytes: u64) {
+    maintenance_stats().maintenance_processed_bytes.fetch_add(bytes, Relaxed);
+    otel_add(|m| &m.maintenance_processed_bytes, bytes, &[KeyValue::new("operation", <&'static str>::from(operation))]);
+}
+
+/// A published rollup unit: counted per tier on top of the per-operation bytes.
+pub fn record_rollup_published(operation: crate::maintenance_coordinator::Operation, tier: &str, bytes: u64) {
+    record_processed_bytes(operation, bytes);
+    let tier = [KeyValue::new("tier", tier.to_string())];
+    otel_add(|m| &m.rollup_publications, 1, &tier);
+    otel_add(|m| &m.rollup_published_input_bytes, bytes, &tier);
+}
+
+/// One rollup scan pass over `bytes` of projected input.
+pub fn record_rollup_scan_bytes(tier: &str, bytes: u64) {
+    maintenance_stats().rollup_scan_estimated_bytes.fetch_add(bytes, Relaxed);
+    otel_add(|m| &m.rollup_scan_estimated_bytes, bytes, &[KeyValue::new("tier", tier.to_string())]);
 }
 
 /// True on the first, and then every `ROLLUP_MISS_SAMPLE`th, miss under `key` —
@@ -1769,6 +1806,83 @@ mod tests {
     };
 
     use super::*;
+
+    /// Per-lane work reaches OTel with its low-cardinality labels, and the
+    /// `timefusion_stats` atomics keep counting as before.
+    #[test]
+    fn lane_work_is_exported_per_operation_and_tier() {
+        use crate::maintenance_coordinator::{Operation, TaskState};
+        use opentelemetry::metrics::MeterProvider;
+        use opentelemetry_sdk::metrics::{
+            ManualReader,
+            data::{AggregatedMetrics, MetricData, ResourceMetrics},
+            reader::MetricReader,
+        };
+        #[derive(Clone, Debug)]
+        struct Shared(Arc<ManualReader>);
+        impl MetricReader for Shared {
+            fn register_pipeline(&self, pipeline: std::sync::Weak<opentelemetry_sdk::metrics::Pipeline>) {
+                self.0.register_pipeline(pipeline)
+            }
+            fn collect(&self, rm: &mut ResourceMetrics) -> opentelemetry_sdk::error::OTelSdkResult {
+                self.0.collect(rm)
+            }
+            fn force_flush(&self) -> opentelemetry_sdk::error::OTelSdkResult {
+                self.0.force_flush()
+            }
+            fn shutdown_with_timeout(&self, timeout: Duration) -> opentelemetry_sdk::error::OTelSdkResult {
+                self.0.shutdown_with_timeout(timeout)
+            }
+            fn temporality(&self, kind: opentelemetry_sdk::metrics::InstrumentKind) -> opentelemetry_sdk::metrics::Temporality {
+                self.0.temporality(kind)
+            }
+        }
+        let reader = Shared(Arc::new(ManualReader::builder().build()));
+        let provider = SdkMeterProvider::builder().with_reader(reader.clone()).build();
+        assert!(METRICS.set(MetricsRegistry::new(&provider.meter("test"))).is_ok());
+        let (processed, scanned) =
+            (maintenance_stats().maintenance_processed_bytes.load(Relaxed), maintenance_stats().rollup_scan_estimated_bytes.load(Relaxed));
+
+        record_maintenance_lease(Operation::BaseRollup, Some(TaskState::Complete), 1_500);
+        record_maintenance_lease(Operation::Dedup, None, 7);
+        record_rollup_scan_bytes("dash_1m", 30);
+        record_rollup_published(Operation::BaseRollup, "dash_1m", 10);
+        record_processed_bytes(Operation::HotPacking, 5);
+
+        let mut rm = ResourceMetrics::default();
+        reader.collect(&mut rm).unwrap();
+        let mut sums: Vec<String> = rm
+            .scope_metrics()
+            .flat_map(|scope| scope.metrics())
+            .filter_map(|metric| match metric.data() {
+                AggregatedMetrics::U64(MetricData::Sum(sum)) => Some(
+                    sum.data_points()
+                        .map(|point| {
+                            let labels: Vec<String> = point.attributes().map(|kv| format!("{}={}", kv.key, kv.value)).collect();
+                            format!("{} {} {}", metric.name(), labels.join(","), point.value())
+                        })
+                        .collect::<Vec<_>>(),
+                ),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        sums.sort();
+        assert_eq!(
+            sums,
+            [
+                "timefusion.maintenance.lease_ms operation=BaseRollup,outcome=Complete 1500",
+                "timefusion.maintenance.lease_ms operation=Dedup,outcome=none 7",
+                "timefusion.maintenance.processed_bytes operation=BaseRollup 10",
+                "timefusion.maintenance.processed_bytes operation=HotPacking 5",
+                "timefusion.rollup.publications tier=dash_1m 1",
+                "timefusion.rollup.published_input_bytes tier=dash_1m 10",
+                "timefusion.rollup.scan_estimated_bytes tier=dash_1m 30",
+            ]
+        );
+        assert_eq!(maintenance_stats().maintenance_processed_bytes.load(Relaxed) - processed, 15);
+        assert_eq!(maintenance_stats().rollup_scan_estimated_bytes.load(Relaxed) - scanned, 30);
+    }
 
     /// The two maps share one bounded adder; a key collision would mix retry
     /// counts into work counts.

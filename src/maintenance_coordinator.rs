@@ -240,7 +240,7 @@ pub struct TaskKey {
     pub operation: Operation,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize, strum::IntoStaticStr)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskState {
     Pending,
@@ -680,6 +680,7 @@ impl Drop for TaskLease {
             retry_reason = journal.task(&self.key).and_then(|task| task.retry_reason.as_deref()).or(failure.as_deref()),
             event = "maintenance_task_finished"
         );
+        crate::observability::record_maintenance_lease(self.key.operation, outcome, (ran_micros / 1_000).max(0) as u64);
         if outcome == Some(TaskState::Running) {
             // A unit that never started is not a worker failure. `mark_running`
             // already charged it an attempt and `abandon_running` would charge a
