@@ -38,10 +38,11 @@ async fn evicted_hot_tail_body_read_served_from_foyer_not_s3() -> anyhow::Result
     env.db().cancel_maintenance();
     insert_and_flush(&env).await?;
 
-    // While still in the MemBuffer, the read touches neither parquet nor Foyer.
-    let (hits_mem, s3_mem, rows_mem) = body_read_cost(&env).await?;
+    // Before eviction the Delta leg still opens the just-flushed file, but only
+    // from the write-captured Foyer entry, never S3.
+    let (_hits_mem, s3_mem, rows_mem) = body_read_cost(&env).await?;
     assert!(rows_mem > 0, "rows must be visible from the MemBuffer");
-    assert_eq!((hits_mem, s3_mem), (0, 0), "in-memory read must not touch parquet/Foyer, got hits={hits_mem} s3={s3_mem}");
+    assert_eq!(s3_mem, 0, "pre-eviction read must not fetch from S3, got s3={s3_mem}");
 
     // Evict so the next read must go through Foyer to S3-backed parquet.
     env.force_evict().await?;

@@ -8234,6 +8234,27 @@ async fn test_concurrent_table_creation() -> Result<()> {
     within(180, concurrent_inserts_all_land("concurrent-table-creation", 5, |i| format!("project_create_test_{i}"))).await
 }
 
+/// Two processes creating the same tables at once on the Foyer-cached store: for
+/// each table one wins version 0 and the other must load it, never error.
+#[tokio::test(flavor = "multi_thread")]
+async fn racing_creators_of_one_table_both_get_it() -> Result<()> {
+    let base = create_test_config("create-race");
+    let process = |n: &str| {
+        let mut c = (*base).clone();
+        c.cache.timefusion_foyer_disabled = false;
+        c.core.timefusion_data_dir = PathBuf::from(format!("{}-{n}", base.core.timefusion_data_dir.display()));
+        Database::with_config(Arc::new(c))
+    };
+    let (a, b) = tokio::try_join!(process("a"), process("b"))?;
+    let tables = crate::schema::registry().list_tables();
+    let created = futures::future::join_all(tables.iter().flat_map(|t| [a.get_or_create_unified_table(t), b.get_or_create_unified_table(t)])).await;
+    for (table, result) in tables.iter().flat_map(|t| [t, t]).zip(created) {
+        assert!(result.map_err(|e| anyhow::anyhow!("{table}: {e}"))?.read().await.version().is_some(), "{table} has no version");
+    }
+    a.shutdown().await?;
+    b.shutdown().await
+}
+
 #[serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_batch_queue_under_load() -> Result<()> {
