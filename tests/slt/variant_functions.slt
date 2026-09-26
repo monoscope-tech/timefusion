@@ -318,3 +318,10 @@ query T
 SELECT '{"items": [10, 20, 30]}'->>'items';
 ----
 [10, 20, 30]
+
+# A missing nested path is a typed NULL, so COALESCE over sparse keys plans and runs.
+query T
+SELECT coalesce(v -> 'b' -> 'c' ->> 'd', v ->> 'a', 'none') FROM (VALUES (json_to_variant('{"a": 1}')), (json_to_variant('{"b": {"c": {"d": "x"}}}'))) t(v) ORDER BY 1;
+----
+1
+x

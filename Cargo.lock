@@ -2965,7 +2965,7 @@ dependencies = [
 [[package]]
 name = "datafusion-variant"
 version = "0.1.0"
-source = "git+https://github.com/tonyalaribe/datafusion-variant.git?rev=f20ae4fb56903033a1342c850175669dbe8bd09d#f20ae4fb56903033a1342c850175669dbe8bd09d"
+source = "git+https://github.com/tonyalaribe/datafusion-variant.git?rev=2928998edca981ad0c2152e79757c0d6ab3555a1#2928998edca981ad0c2152e79757c0d6ab3555a1"
 dependencies = [
  "arrow",
  "arrow-schema",
