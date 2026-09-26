@@ -449,7 +449,10 @@ fn privatize_sliced(arr: &ArrayRef) -> ArrayRef {
         return arr.clone();
     }
     let mut m = MutableArrayData::new(vec![&data], false, data.len());
-    m.extend(0, 0, data.len());
+    // Re-copying an array into itself cannot overflow; on failure keep the shared buffer.
+    if m.try_extend(0, 0, data.len()).is_err() {
+        return arr.clone();
+    }
     make_array(m.freeze())
 }
 
@@ -676,7 +679,7 @@ fn extract_timestamp_range(filters: &[Expr]) -> (Option<i64>, Option<i64>) {
 pub fn compile_filter_conjunction(filters: &[Expr], schema: &SchemaRef) -> DFResult<Option<Arc<dyn datafusion::physical_expr::PhysicalExpr>>> {
     let Some(conjunction) = filters.iter().cloned().reduce(datafusion::logical_expr::and) else { return Ok(None) };
     let df_schema = DFSchema::try_from(schema.as_ref().clone())?;
-    Ok(Some(create_physical_expr(&conjunction, &df_schema, &ExecutionProps::new())?))
+    Ok(Some(create_physical_expr(&conjunction, &df_schema, &ExecutionProps::new(), &Default::default())?))
 }
 
 /// Filter a batch to rows whose `id` is in `ids` (Utf8View/Utf8/LargeUtf8).
@@ -1680,7 +1683,7 @@ impl MemBuffer {
         let df_schema = DFSchema::try_from(schema.as_ref().clone())?;
         let props = ExecutionProps::new();
 
-        let physical_predicate = predicate.map(|p| create_physical_expr(&strip_column_qualifiers(p.clone())?, &df_schema, &props)).transpose()?;
+        let physical_predicate = predicate.map(|p| create_physical_expr(&strip_column_qualifiers(p.clone())?, &df_schema, &props, &Default::default())).transpose()?;
 
         let (total_deleted, total_freed) = table.buckets.iter_mut().try_fold((0u64, 0usize), |(deleted, freed), mut bucket_entry| -> DFResult<_> {
             let bucket = bucket_entry.value_mut();
@@ -1803,7 +1806,7 @@ impl MemBuffer {
         assignments
             .iter()
             .map(|(col, expr)| {
-                let phys_expr = create_physical_expr(&rewrite(strip_column_qualifiers(expr.clone())?)?, df_schema, props)?;
+                let phys_expr = create_physical_expr(&rewrite(strip_column_qualifiers(expr.clone())?)?, df_schema, props, &Default::default())?;
                 let col_idx = target.index_of(col).map_err(|_| datafusion::error::DataFusionError::Execution(format!("Column '{}' not found", col)))?;
                 Ok((col_idx, phys_expr))
             })
@@ -1828,7 +1831,7 @@ impl MemBuffer {
         let df_schema = DFSchema::try_from(schema.as_ref().clone())?;
         let props = ExecutionProps::new();
 
-        let physical_predicate = predicate.map(|p| create_physical_expr(&strip_column_qualifiers(p.clone())?, &df_schema, &props)).transpose()?;
+        let physical_predicate = predicate.map(|p| create_physical_expr(&strip_column_qualifiers(p.clone())?, &df_schema, &props, &Default::default())).transpose()?;
 
         let physical_assignments = Self::compile_assignments(assignments, &schema, &df_schema, &props, Ok)?;
 
@@ -1930,7 +1933,7 @@ impl MemBuffer {
         };
 
         let physical_predicate =
-            predicate.map(|p| create_physical_expr(&rewrite(strip_column_qualifiers(p.clone())?)?, &widened_df_schema, &props)).transpose()?;
+            predicate.map(|p| create_physical_expr(&rewrite(strip_column_qualifiers(p.clone())?)?, &widened_df_schema, &props, &Default::default())).transpose()?;
 
         let physical_assignments = Self::compile_assignments(assignments, &target_schema, &widened_df_schema, &props, rewrite)?;
 

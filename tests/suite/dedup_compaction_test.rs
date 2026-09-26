@@ -603,7 +603,7 @@ async fn cold_consolidate_produces_event_time_disjoint_runs() -> Result<()> {
     /// The partition's live files' (min,max) event-time ranges, sorted. A run
     /// without readable stats is mapped to (MIN, MAX) so it fails disjointness —
     /// unreadable stats are as fatal for pruning as an overlap.
-    async fn sorted_ranges(table: &Arc<tokio::sync::RwLock<deltalake::DeltaTable>>, filters: &[deltalake::PartitionFilter]) -> Result<Vec<(i64, i64)>> {
+    async fn sorted_ranges(table: &Arc<tokio::sync::RwLock<deltalake::DeltaTable>>, filters: &[deltalake::FilterLiteral<'_>]) -> Result<Vec<(i64, i64)>> {
         use futures::TryStreamExt;
         let guard = table.read().await;
         let adds: Vec<_> = guard.get_active_add_actions_by_partitions(filters).try_collect().await?;
@@ -647,9 +647,10 @@ async fn cold_consolidate_produces_event_time_disjoint_runs() -> Result<()> {
     let table_ref = db.get_or_create_unified_table("otel_logs_and_spans").await?;
     db.consolidate_date_binned(&table_ref, "otel_logs_and_spans", date, cold_target, None, usize::MAX).await?;
 
+    let date_str = date.to_string();
     let filters = vec![
-        deltalake::PartitionFilter::try_from(("project_id", "=", project_id.as_str()))?,
-        deltalake::PartitionFilter::try_from(("date", "=", date.to_string().as_str()))?,
+        ("project_id", deltalake::FilterOp::Eq, deltalake::FilterValue::Scalar(project_id.as_str())),
+        ("date", deltalake::FilterOp::Eq, deltalake::FilterValue::Scalar(date_str.as_str())),
     ];
     let sorted = sorted_ranges(&table_ref, &filters).await?;
     assert!(sorted.len() < 6, "consolidation must merge files (got {} of 6)", sorted.len());

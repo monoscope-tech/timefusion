@@ -3226,7 +3226,7 @@ async fn query_session_sizing() -> Result<()> {
     let query_partitions = config.memory.timefusion_query_partitions;
     let db = Database::with_config(config).await?;
     let exec_of = |db: Database| Arc::new(db).create_session_context().state().config().options().execution.clone();
-    assert_eq!(exec_of(db.clone()).batch_size, 2048, "wide otel rows: one 8192-row batch measured 63MB");
+    assert_eq!(exec_of(db.clone()).batch_size.get(), 2048, "wide otel rows: one 8192-row batch measured 63MB");
 
     let query = exec_of(db.clone()).target_partitions;
     let mut maintenance = db.clone();
@@ -3765,7 +3765,7 @@ fn repair_session_reserves_merge_memory_up_front_over_the_shared_default() {
     let exec_of = |cpus| build_optimize_session_state(cpus, Arc::clone(&env)).config().options().execution.clone();
     let plain = exec_of(0);
     assert_eq!(plain.sort_spill_reservation_bytes, 33_554_432);
-    assert_eq!(plain.batch_size, 2048, "merge memory ≈ fan-in × batch; 8192-row otel batches measured up to 145MB");
+    assert_eq!(plain.batch_size.get(), 2048, "merge memory ≈ fan-in × batch; 8192-row otel batches measured up to 145MB");
     // Parallelism capped so per-partition spill reservations fit the bounded pool.
     assert_eq!(plain.target_partitions, 2, "0 (all cores) must cap to the maintenance limit");
     assert_eq!(exec_of(64).target_partitions, 2);
@@ -7695,7 +7695,7 @@ async fn coalesced_commit_spans_projects_in_one_delta_version() -> Result<()> {
     }
 
     // The single commit carries EVERY project's watermark (crash-recovery invariant).
-    let history: Vec<_> = table_ref.read().await.history(Some(1)).await?.collect();
+    let history: Vec<_> = table_ref.read().await.history(Some(1)).try_collect().await?;
     assert_eq!(history.len(), 1);
     let shards = 8;
     for (i, project) in projects.iter().enumerate() {

@@ -308,3 +308,7 @@ datafusion-sql = { git = "https://github.com/tonyalaribe/datafusion.git", rev = 
 # comment in vendor/tikv-jemalloc-sys/build.rs.
 tikv-jemalloc-sys = { path = "vendor/tikv-jemalloc-sys" }
 
+
+# LOCAL-DEV-ONLY: remove before pinning
+[patch."https://github.com/tonyalaribe/delta-rs-timefusion.git"]
+deltalake = { path = "/tmp/timefusion-dependency-upgrade.VYaIwA/delta-rs-55/crates/deltalake" }

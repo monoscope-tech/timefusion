@@ -208,6 +208,7 @@ impl DisplayAs for OrderingProbeExec {
 }
 
 impl ExecutionPlan for OrderingProbeExec {
+    no_physical_exprs!();
     fn name(&self) -> &'static str {
         "OrderingProbeExec"
     }
@@ -224,8 +225,14 @@ impl ExecutionPlan for OrderingProbeExec {
         Ok(Arc::new(Self::new(children.swap_remove(0), self.leg)))
     }
 
-    fn partition_statistics(&self, partition: Option<usize>) -> DFResult<Arc<datafusion::common::Statistics>> {
-        self.inner.partition_statistics(partition)
+    fn child_stats_requests(&self, partition: Option<usize>) -> Vec<datafusion::physical_plan::ChildStats> {
+        vec![datafusion::physical_plan::ChildStats::At(partition)]
+    }
+
+    fn statistics_from_inputs(
+        &self, input_stats: &[Arc<datafusion::common::Statistics>], _args: &datafusion::physical_plan::StatisticsArgs,
+    ) -> DFResult<Arc<datafusion::common::Statistics>> {
+        Ok(Arc::clone(&input_stats[0]))
     }
 
     fn execute(&self, partition: usize, context: Arc<TaskContext>) -> DFResult<SendableRecordBatchStream> {
@@ -438,6 +445,7 @@ impl DisplayAs for DedupExec {
 
 #[async_trait::async_trait]
 impl ExecutionPlan for DedupExec {
+    no_physical_exprs!();
     fn name(&self) -> &'static str {
         "DedupExec"
     }
@@ -446,8 +454,8 @@ impl ExecutionPlan for DedupExec {
         &self.properties
     }
 
-    fn required_input_distribution(&self) -> Vec<Distribution> {
-        vec![Distribution::SinglePartition]
+    fn input_distribution_requirements(&self) -> datafusion::physical_plan::distribution_requirements::InputDistributionRequirements {
+        datafusion::physical_plan::distribution_requirements::InputDistributionRequirements::new(vec![Distribution::SinglePartition])
     }
 
     fn required_input_ordering(&self) -> Vec<Option<datafusion::physical_expr::OrderingRequirements>> {
@@ -1433,7 +1441,7 @@ mod tests {
         let ser = DedupExec::new(source(&data, Some(col_asc("id", 0))), vec!["id".into()], None).unwrap();
         assert_eq!(ser.properties().output_partitioning().partition_count(), 1);
         assert!(ser.properties().output_ordering().is_some());
-        assert!(matches!(ser.required_input_distribution()[0], Distribution::SinglePartition));
+        assert!(matches!(ser.input_distribution_requirements().child_distribution(0), Some(Distribution::SinglePartition)));
         assert_eq!(ser.maintains_input_order(), vec![true]);
     }
 
@@ -1466,6 +1474,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ExecutionPlan for CountingExec {
+        no_physical_exprs!();
         fn name(&self) -> &'static str {
             "CountingExec"
         }
@@ -1676,6 +1685,7 @@ mod ordering_probe_tests {
         }
     }
     impl ExecutionPlan for LyingOrder {
+        no_physical_exprs!();
         fn name(&self) -> &'static str {
             "LyingOrder"
         }

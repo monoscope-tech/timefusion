@@ -941,13 +941,13 @@ pub async fn build_parquet_and_pack(
 ) -> Result<(Bytes, IndexBuildStats)> {
     use deltalake::datafusion::parquet::arrow::{
         ProjectionMask,
-        async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder},
+        async_reader::ParquetRecordBatchStreamBuilder,
     };
     use futures::TryStreamExt;
 
     let path = ObjPath::from(parquet_rel);
     let meta = store.head(&path).await.with_context(|| format!("head {parquet_rel}"))?;
-    let reader = ParquetObjectReader::new(store, path).with_file_size(meta.size);
+    let reader = crate::storage::ObjectStoreReader::new(store, path, meta.size);
     // Decode exactly the columns the index consumes — same index schema and
     // every physical row, without reading unrelated column chunks.
     let fields: std::collections::HashSet<&str> = indexed_fields(table).map(|(f, _)| f.name.as_str()).chain(["timestamp", "id"]).collect();

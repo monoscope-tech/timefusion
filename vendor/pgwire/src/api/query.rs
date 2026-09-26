@@ -29,7 +29,6 @@ use crate::messages::extendedquery::{
 };
 use crate::messages::response::{EmptyQueryResponse, ReadyForQuery, TransactionStatus};
 use crate::messages::simplequery::Query;
-use crate::messages::PgWireBackendMessage;
 
 pub(crate) fn is_empty_query(q: &str) -> bool {
     // A query string that contains only semicolons and whitespace parses to no

@@ -568,7 +568,7 @@ impl Database {
         object_store: &Arc<dyn object_store::ObjectStore>, table_prefix: &str, uri: &str,
         extract: impl FnOnce(&deltalake::datafusion::parquet::file::metadata::ParquetMetaData) -> Option<T>,
     ) -> Result<Option<T>, String> {
-        use deltalake::datafusion::parquet::arrow::async_reader::{AsyncFileReader, ParquetObjectReader};
+        use deltalake::datafusion::parquet::arrow::async_reader::AsyncFileReader;
         use object_store::{ObjectStoreExt, path::Path as OsPath};
         let Some(rel) = uri.strip_prefix(table_prefix).map(|s| s.strip_prefix('/').unwrap_or(s)) else {
             return Err(format!("could not relativize {uri} against {table_prefix}"));
@@ -576,7 +576,7 @@ impl Database {
         let path = OsPath::from(rel);
         // Pass our own `path`, not `meta.location`: the latter is bucket-relative and would double-prefix.
         let meta = object_store.head(&path).await.map_err(|e| format!("head failed for {uri}: {e}"))?;
-        let mut reader = ParquetObjectReader::new(object_store.clone(), path).with_file_size(meta.size);
+        let mut reader = crate::storage::ObjectStoreReader::new(object_store.clone(), path, meta.size);
         Ok(reader.get_metadata(None).await.ok().and_then(|pq| extract(&pq)))
     }
 

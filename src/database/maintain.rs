@@ -8704,11 +8704,11 @@ impl Database {
     /// True if every row group of this object carries a non-empty `sorting_columns` footer.
     /// An unreadable footer returns false (a needless rewrite beats a silent wrong answer).
     async fn footer_declares_sorted(object_store: &Arc<dyn object_store::ObjectStore>, path: &str) -> bool {
-        use deltalake::datafusion::parquet::arrow::async_reader::{AsyncFileReader, ParquetObjectReader};
+        use deltalake::datafusion::parquet::arrow::async_reader::AsyncFileReader;
         use object_store::{ObjectStoreExt, path::Path as OsPath};
         let os_path = OsPath::from(path);
         let Ok(meta) = object_store.head(&os_path).await else { return false };
-        let mut reader = ParquetObjectReader::new(object_store.clone(), os_path).with_file_size(meta.size);
+        let mut reader = crate::storage::ObjectStoreReader::new(object_store.clone(), os_path, meta.size);
         let Ok(pq) = reader.get_metadata(None).await else { return false };
         !pq.row_groups().iter().any(|rg| rg.sorting_columns().is_none_or(|sc| sc.is_empty()))
     }

@@ -79,7 +79,7 @@ fn writer_props() -> WriterProperties {
         .set_statistics_enabled(EnabledStatistics::Page)
         .set_bloom_filter_enabled(true)
         .set_bloom_filter_fpp(0.01)
-        .set_bloom_filter_ndv(100_000)
+        .set_bloom_filter_max_ndv(100_000)
         .build()
 }
 

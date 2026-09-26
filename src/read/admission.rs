@@ -175,6 +175,7 @@ enum Admit {
 }
 
 impl ExecutionPlan for AdmissionExec {
+    no_physical_exprs!();
     fn name(&self) -> &'static str {
         "AdmissionExec"
     }
@@ -327,7 +328,7 @@ mod tests {
         let wrapped = Arc::new(AdmissionExec::new(Arc::clone(&inner), HeavyClass::SpillingSort));
         assert_eq!(wrapped.schema(), inner.schema());
         assert_eq!(wrapped.children().len(), 1);
-        assert!(Arc::clone(&wrapped).with_new_children(vec![inner]).is_ok());
+        assert!(datafusion::physical_plan::replace_children_if_necessary(wrapped, vec![inner]).is_ok());
     }
 
     /// The whole point: a permit is HELD across the wrapped stream and RELEASED

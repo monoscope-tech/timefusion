@@ -6193,7 +6193,7 @@ mod repair_batch_tests {
     #[test]
     fn repair_sorts_with_smaller_batches_than_packing() {
         use datafusion::execution::runtime_env::RuntimeEnv;
-        let batch = |state: &datafusion::execution::session_state::SessionState| state.config().options().execution.batch_size;
+        let batch = |state: &datafusion::execution::session_state::SessionState| state.config().options().execution.batch_size.get();
         let pack = super::build_optimize_session_state(0, std::sync::Arc::new(RuntimeEnv::default()));
         let repair = super::build_optimize_session_state_tuned(
             0,
@@ -6578,7 +6578,7 @@ fn build_writer_properties(
             if field.bloom_filter && !parquet_cfg.timefusion_bloom_filter_disabled {
                 builder
                     .set_column_bloom_filter_enabled(col.clone(), true)
-                    .set_column_bloom_filter_ndv(col.clone(), BLOOM_NDV)
+                    .set_column_bloom_filter_max_ndv(col.clone(), BLOOM_NDV)
                     .set_column_bloom_filter_fpp(col, 0.01)
             } else {
                 builder

@@ -1077,6 +1077,7 @@ impl DisplayAs for GatedScanExec {
 }
 
 impl ExecutionPlan for GatedScanExec {
+    no_physical_exprs!();
     fn name(&self) -> &'static str {
         "GatedScanExec"
     }
