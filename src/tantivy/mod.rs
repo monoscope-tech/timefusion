@@ -939,10 +939,7 @@ pub fn index_to_parquet_rel(table: &str, blob_path: &str) -> Option<String> {
 pub async fn build_parquet_and_pack(
     store: Arc<dyn ObjectStore>, parquet_rel: &str, table: &'static TableSchema, level: i32, merge: MergeMode, scratch: &Path,
 ) -> Result<(Bytes, IndexBuildStats)> {
-    use deltalake::datafusion::parquet::arrow::{
-        ProjectionMask,
-        async_reader::ParquetRecordBatchStreamBuilder,
-    };
+    use deltalake::datafusion::parquet::arrow::{ProjectionMask, async_reader::ParquetRecordBatchStreamBuilder};
     use futures::TryStreamExt;
 
     let path = ObjPath::from(parquet_rel);

@@ -249,10 +249,7 @@ impl PreparedFileRows {
 
     /// The DV mask in `live` never filters this stream or changes physical ordinals.
     pub fn stream(&self, schema: arrow::datatypes::SchemaRef) -> Result<futures::stream::BoxStream<'static, Result<RecordBatch>>> {
-        use deltalake::datafusion::parquet::arrow::{
-            ProjectionMask,
-            async_reader::ParquetRecordBatchStreamBuilder,
-        };
+        use deltalake::datafusion::parquet::arrow::{ProjectionMask, async_reader::ParquetRecordBatchStreamBuilder};
         use futures::TryStreamExt;
 
         let reader = crate::storage::ObjectStoreReader::new(self.store.clone(), self.path.clone(), self.size);
