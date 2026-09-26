@@ -1670,7 +1670,8 @@ pub(crate) async fn match_aggregates(
             Ok(route) => routes.push(RoutedRollup { matched: matched.clone(), ..route }),
             // Grain-only disqualifications are held back so they cannot mask an
             // actionable declared-schema gap; still reported if every spec
-            // declined that way.
+            // declined that way. A grain miss is only reached AFTER the filter was
+            // accepted, so it outranks another spec's filter miss.
             Err(reason @ (MissReason::PartialBucket | MissReason::TinyInterior)) => grain_miss = Some(reason),
             Err(reason) => miss = Some(reason),
         }
@@ -1680,7 +1681,10 @@ pub(crate) async fn match_aggregates(
     if !routes.is_empty() {
         return Ok(routes);
     }
-    let reason = miss.or(grain_miss).unwrap_or(MissReason::UnsupportedShape);
+    let reason = match (miss, grain_miss) {
+        (Some(MissReason::UnknownFilter | MissReason::FilterNotEligible), Some(grain)) => grain,
+        (miss, grain) => miss.or(grain).unwrap_or(MissReason::UnsupportedShape),
+    };
     let shape = shape();
     match reason {
         MissReason::UnsupportedShape => {
@@ -3199,6 +3203,14 @@ mod tests {
     #[test_case::test_case(
         &format!("SELECT COUNT(*) FROM {SOURCE} WHERE project_id = 'project' AND name = 'monoscope.http' AND {WINDOW}"),
         MissReason::UnknownFilter ; "a residual row filter refuses the route rather than inventing zero rows")]
+    // Sub-grain server-scope panels: the dashboard tiers accept the scope and decline on
+    // bucket size; the sessions tier's filter miss must not relabel that.
+    #[test_case::test_case(
+        &format!(
+            "SELECT time_bucket('10 seconds', timestamp), COUNT(*) FROM {SOURCE} WHERE project_id = 'project' AND {SERVER} \
+             AND timestamp >= to_timestamp_micros(0) AND timestamp < to_timestamp_micros(960000000) GROUP BY 1"
+        ),
+        MissReason::PartialBucket ; "a grain decline is not masked by a tier that cannot serve the scope")]
     #[tokio::test]
     async fn a_shape_the_matcher_refuses_names_its_reason(sql: &str, reason: MissReason) {
         let miss = route_alone(sql).await.err();
