@@ -50,7 +50,7 @@ Status: ⬜ open · 🟡 in progress · ✅ done. Priority is the plan's executi
 | W8 | 1D dependency classification — design + fixtures | analysis → build (lane 2) | Stage 1D | Per-spec dependency map (dims, measures, filters, identity, ts, version, delete); mutation fixture table proving zero missed relevant invalidations; then the classifier | new test module; `apply_rollup_hours` call sites in `database/rollup.rs` | W2 (which mutations dominate) | | ⬜ |
 | W9 | Stage 3 publication batching — design | analysis | Stage 3 | Concrete design mapped to existing staged publication / journal group-commit; WAL-compat decision (does the payload change?); queue limits; test list | design doc only | — | agent (Claude) | ✅ |
 | W10 | Capacity replay harness | build (lane 2) | Shared gates | `timefusion sim` replay of a prod journal at 1x/2x/4x rows and 1x/2x/4x projects; report backlog stability and work per accepted row | `src/maintenance_sim.rs`, `src/main.rs` | W2 | | ⬜ |
-| W11 | OpenTelemetry 0.32 upgrade | build (lane 2) | Housekeeping | Closes the `opentelemetry_sdk` advisory (unbounded baggage alloc) | `Cargo.toml`, `src/observability.rs` | — | Claude (timefusion-2e) | 🟡 |
+| W11 | OpenTelemetry 0.33 upgrade | build (lane 2) | Housekeeping | Closes the `opentelemetry_sdk` advisory (unbounded baggage alloc) | `Cargo.toml`, `src/observability.rs` | — | Claude (timefusion-2e) | ✅ handed off |
 | W12 | `dcount(name)` measure decision | analysis | Rollup misses | Cost/benefit for a `name` HLL + 2-way server-scope count guard on `dashboard_1m_v3` (schema comment ~L501 declines it on purpose); owner decides | `schemas/otel_logs_and_spans.yaml` (proposal only) | W2 | | ⬜ |
 | W13 | Narrow the slice OCC gate (Stage 3 step 1) | build (lane 2) | Stage 3 | A non-overlapping sibling slice no longer makes a staged unit `slice_occ_stale`; a unit may retire narrower contained slices; target proof re-recorded under the commit lock; cause logging; tests 1, 3, 3b of the W9 design failing-first | `maintain.rs` `run_coordinator_rollup_selected` OCC check | W9 | | ⬜ |
 
@@ -107,3 +107,22 @@ commits/day, 2.1 actions/commit; publications are <1% of journal checkpoints. `r
 **Estimated batching saving:** 10 s linger → ≈6.1k commits/day, 60 s → ≈2.7k; ≤1 worker-hour/day of commit time.
 **Decision:** ship step 1 (W13: narrow the OCC gate) now; build the batched queue (steps 2–3) only when Stage 4 is
 approved or publication volume grows. Re-measure rates on a ≥1h process.
+
+### W11 result — 2026-09-26 — Claude (timefusion-2e)
+**Question:** close the `opentelemetry_sdk` advisory. GHSA-w9wp-h8wv-79jx (unbounded W3C Baggage allocation)
+affects `<= 0.32.0`; first patched release is **0.32.1**, so bare 0.32.0 would not close it.
+**Method:** `metrics-exporter-opentelemetry` 0.2.1 (its latest release) pins opentelemetry 0.31, so the stack cannot
+move without it. Upstream main is already on 0.33 with `Recorder::with_meter` unchanged, so it is pinned by git rev
+(`b93abba8`) instead of vendored. The whole family went to **0.33** (`opentelemetry`/`_sdk`/`-otlp`/`-appender-tracing`
+0.33, `tracing-opentelemetry` 0.34) via `cargo update -p` on those crates only. Lock delta: the OTel family plus
+`prost-types`/`tonic-types` 0.14 (no second tonic/prost major); `tokio-postgres` 0.7.16 / `postgres-types` 0.2.12
+unchanged. No source change needed; only a comment's version number. Metric names unchanged.
+**Numbers:** `cargo lint` clean; `cargo nextest run observability stats telemetry` 25/25. No test calls
+`init_metrics`/`init_telemetry`, so runtime was smoke-tested: the dev binary against local MinIO and a throwaway
+`otel/opentelemetry-collector` (debug exporter) received 510 spans, 329 log records and 57 metric data points in
+~2 min. Names included facade-recorded `timefusion.scan.pgwire_total`, which proves the git-pinned bridge.
+Clean shutdown, no panic.
+**Branch:** `ws/w11-otel-032` @ `8e3d65b4`, one commit on `30cd0c59` (touches `Cargo.toml`, `Cargo.lock`,
+`src/observability.rs`).
+**Integrator next:** batch into the next sign-off. Swap the git pin for a crates.io release when upstream publishes
+one (> 0.2.1).
