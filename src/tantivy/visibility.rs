@@ -219,14 +219,14 @@ pub(crate) struct PreparedFileRows {
 
 impl PreparedFileRows {
     pub async fn open(log_store: deltalake::logstore::LogStoreRef, add: &SnapshotFile) -> Result<Self> {
-        use deltalake::datafusion::parquet::arrow::{arrow_reader::ArrowReaderMetadata, async_reader::ParquetObjectReader};
+        use deltalake::datafusion::parquet::arrow::arrow_reader::ArrowReaderMetadata;
         use object_store::ObjectStoreExt;
 
         let store = log_store.object_store(None);
         let path = object_store::path::Path::from(add.path.as_str());
         let meta = store.head(&path).await?;
         ensure!(i64::try_from(meta.size)? == add.size, "Parquet object size differs from snapshot Add");
-        let mut reader = ParquetObjectReader::new(store.clone(), path.clone()).with_file_size(meta.size);
+        let mut reader = crate::storage::ObjectStoreReader::new(store.clone(), path.clone(), meta.size);
         let metadata = ArrowReaderMetadata::load_async(&mut reader, Default::default()).await?;
         let rows = usize::try_from(metadata.metadata().file_metadata().num_rows())?;
         let live = deletion_vector_mask(log_store, add.deletion_vector.as_ref(), rows).await?;
@@ -251,11 +251,11 @@ impl PreparedFileRows {
     pub fn stream(&self, schema: arrow::datatypes::SchemaRef) -> Result<futures::stream::BoxStream<'static, Result<RecordBatch>>> {
         use deltalake::datafusion::parquet::arrow::{
             ProjectionMask,
-            async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder},
+            async_reader::ParquetRecordBatchStreamBuilder,
         };
         use futures::TryStreamExt;
 
-        let reader = ParquetObjectReader::new(self.store.clone(), self.path.clone()).with_file_size(self.size);
+        let reader = crate::storage::ObjectStoreReader::new(self.store.clone(), self.path.clone(), self.size);
         let builder = ParquetRecordBatchStreamBuilder::new_with_metadata(reader, self.metadata.clone());
         let rows = self.live.len();
         let mut projection = Vec::new();

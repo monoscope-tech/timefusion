@@ -1183,8 +1183,8 @@ impl Database {
             return Ok(0);
         };
         let table = table_ref.read().await;
-        let commits: Vec<_> = match table.history(Some(self.config.buffer.delta_scan_depth())).await {
-            Ok(it) => it.collect(),
+        let commits: Vec<_> = match table.history(Some(self.config.buffer.delta_scan_depth())).try_collect().await {
+            Ok(commits) => commits,
             Err(e) => {
                 debug!("derive_wal_cursor: history unavailable for {}/{}: {}", representative_project, representative_table, e);
                 return Ok(0);

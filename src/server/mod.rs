@@ -663,7 +663,7 @@ impl LoggingSimpleQueryHandler {
     async fn run_delta_history(&self, cmd: DeltaHistoryCmd) -> PgWireResult<Vec<Response>> {
         let (_, table_ref) = self.admin_table("DELTA HISTORY", &cmd.table).await?;
         let commits: Vec<_> =
-            table_ref.read().await.history(Some(cmd.limit)).await.map_err(|e| admin_err(format!("DELTA HISTORY '{}': {e}", cmd.table)))?.collect();
+            table_ref.read().await.history(Some(cmd.limit)).try_collect().await.map_err(|e| admin_err(format!("DELTA HISTORY '{}': {e}", cmd.table)))?;
         let rows = commits.into_iter().map(|commit| {
             let timestamp = commit.timestamp.and_then(chrono::DateTime::from_timestamp_millis).map(|v| v.to_rfc3339()).unwrap_or_default();
             let read_version = commit.read_version.map(|v| v.to_string()).unwrap_or_default();
@@ -1264,7 +1264,7 @@ pub struct RewritingQueryParser {
 impl datafusion_postgres::pgwire::api::stmt::QueryParser for RewritingQueryParser {
     type Statement = <DfSessionService as ExtendedQueryHandler>::Statement;
 
-    async fn parse_sql<C>(&self, client: &C, sql: &str, types: &[Option<Type>]) -> PgWireResult<Self::Statement>
+    async fn parse_sql<C>(&self, client: &C, sql: &str, types: &[Option<Type>]) -> PgWireResult<Option<Self::Statement>>
     where
         C: ClientInfo + Unpin + Send + Sync,
     {

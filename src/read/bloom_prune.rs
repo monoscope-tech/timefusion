@@ -23,7 +23,7 @@ use datafusion::{
     scalar::ScalarValue,
 };
 use deltalake::datafusion::parquet::{
-    arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder},
+    arrow::async_reader::ParquetRecordBatchStreamBuilder,
     bloom_filter::Sbbf,
 };
 use itertools::Itertools;
@@ -321,7 +321,7 @@ impl BloomPruneRegistry {
 /// only, no row decode. `no_bloom` when the file has no usable blooms or its
 /// payload exceeds `PER_FILE_BLOOM_CAP_BYTES`.
 pub async fn build_file_blooms(store: Arc<dyn ObjectStore>, rel: &str, file_size: u64, cols: &[String]) -> Result<FileBlooms> {
-    let reader = ParquetObjectReader::new(store, Path::from(rel)).with_file_size(file_size);
+    let reader = crate::storage::ObjectStoreReader::new(store, Path::from(rel), file_size);
     let mut builder = ParquetRecordBatchStreamBuilder::new(reader).await.context("parquet footer")?;
     let n_rg = builder.metadata().num_row_groups();
     // Leaf indices are resolved up front because reading a bloom borrows the builder mutably.

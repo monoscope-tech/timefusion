@@ -171,7 +171,11 @@ impl QueryPlanner for DmlQueryPlanner {
     }
 
     #[instrument(name = "dml.create_physical_plan", skip_all, fields(operation = Empty, table.name = Empty, project_id = Empty))]
-    async fn create_physical_plan(&self, logical_plan: &LogicalPlan, session_state: &SessionState) -> Result<Arc<dyn ExecutionPlan>> {
+    async fn create_physical_plan(&self, logical_plan: &LogicalPlan, session: &dyn datafusion::catalog::Session) -> Result<Arc<dyn ExecutionPlan>> {
+        let session_state = session
+            .as_any()
+            .downcast_ref::<SessionState>()
+            .ok_or_else(|| datafusion::common::DataFusionError::Internal("DmlQueryPlanner requires a SessionState".into()))?;
         // COUNT(*) from Delta add-action stats; declines unless provably exact.
         if let Some(exec) = crate::read::try_count_pushdown(logical_plan, &self.database).await? {
             return Ok(exec);
@@ -596,6 +600,7 @@ impl DisplayAs for DmlExec {
 
 #[async_trait]
 impl ExecutionPlan for DmlExec {
+    no_physical_exprs!();
     fn name(&self) -> &'static str {
         match self.op_type {
             DmlOperation::Update => "DeltaUpdateExec",
@@ -607,8 +612,8 @@ impl ExecutionPlan for DmlExec {
         &self.properties
     }
 
-    fn required_input_distribution(&self) -> Vec<Distribution> {
-        vec![Distribution::SinglePartition]
+    fn input_distribution_requirements(&self) -> datafusion::physical_plan::distribution_requirements::InputDistributionRequirements {
+        datafusion::physical_plan::distribution_requirements::InputDistributionRequirements::new(vec![Distribution::SinglePartition])
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -3052,9 +3057,9 @@ mod tests {
         let want: usize = crate::database::WIDE_ROW_DECODE_BATCH_SIZE.parse().expect("the shared constant is a number");
         // Assert the session actually moves off the inherited default, so this
         // cannot pass by coincidence if DataFusion's default ever equals ours.
-        assert!(base.config().options().execution.batch_size > want, "DataFusion's default is the wider batch this fix exists to override");
+        assert!(base.config().options().execution.batch_size.get() > want, "DataFusion's default is the wider batch this fix exists to override");
         let session = super::delta_session_from(&base);
-        assert_eq!(session.config().options().execution.batch_size, want, "a DML rewrite must not decode at a wider batch than a query does");
+        assert_eq!(session.config().options().execution.batch_size.get(), want, "a DML rewrite must not decode at a wider batch than a query does");
     }
 
     #[test]

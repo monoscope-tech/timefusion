@@ -1289,7 +1289,7 @@ pub struct PgCoalesceUdf {
 /// DataFusion version `PgCoalesceUdf`'s method forwarding was last audited
 /// against. A datafusion bump breaks the build here on purpose: re-audit
 /// `ScalarUDFImpl` for new methods, forward them above, then bump this.
-const AUDITED_DATAFUSION_VERSION: &str = "54.1.0";
+const AUDITED_DATAFUSION_VERSION: &str = "55.1.0";
 // Byte loop because `&str` equality isn't const-callable on stable.
 const _: () = {
     let (a, b) = (datafusion::DATAFUSION_VERSION.as_bytes(), AUDITED_DATAFUSION_VERSION.as_bytes());
@@ -1336,6 +1336,12 @@ impl datafusion::logical_expr::ScalarUDFImpl for PgCoalesceUdf {
     }
     fn short_circuits(&self) -> bool {
         self.inner.inner().short_circuits()
+    }
+    fn is_strict(&self) -> bool {
+        self.inner.inner().is_strict()
+    }
+    fn strictly_order_preserving(&self, inputs: &[datafusion::logical_expr::sort_properties::ExprProperties]) -> Result<bool> {
+        self.inner.inner().strictly_order_preserving(inputs)
     }
     fn documentation(&self) -> Option<&datafusion::logical_expr::Documentation> {
         self.inner.inner().documentation()
@@ -1573,7 +1579,7 @@ use datafusion::{
 /// `node` with its only child replaced, or `node` untouched when `child` is None.
 fn swap_child(node: Arc<dyn ExecutionPlan>, child: Option<Arc<dyn ExecutionPlan>>) -> Result<Transformed<Arc<dyn ExecutionPlan>>> {
     match child {
-        Some(child) => Ok(Transformed::yes(node.with_new_children(vec![child])?)),
+        Some(child) => Ok(Transformed::yes(datafusion::physical_plan::replace_children_if_necessary(node, vec![child])?)),
         None => Ok(Transformed::no(node)),
     }
 }
@@ -1647,7 +1653,7 @@ fn order_union(plan: &Arc<dyn ExecutionPlan>, req: &LexOrdering, fetch: Option<u
         && plan.maintains_input_order().first() == Some(&true)
         && let Some(new_child) = order_union(children[0], req, fetch)?
     {
-        return Ok(Some(Arc::clone(plan).with_new_children(vec![new_child])?));
+        return Ok(Some(datafusion::physical_plan::replace_children_if_necessary(Arc::clone(plan), vec![new_child])?));
     }
     Ok(None)
 }
@@ -1785,6 +1791,7 @@ mod ordered_union_for_topk_tests {
     }
 
     impl ExecutionPlan for MockLeaf {
+        no_physical_exprs!();
         fn name(&self) -> &'static str {
             "MockLeaf"
         }
@@ -3026,6 +3033,7 @@ impl datafusion::physical_plan::DisplayAs for UnorderedAggregateInput {
 }
 
 impl ExecutionPlan for UnorderedAggregateInput {
+    no_physical_exprs!();
     fn name(&self) -> &'static str {
         "UnorderedAggregateInput"
     }

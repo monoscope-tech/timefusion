@@ -1388,7 +1388,7 @@ mod tests {
         tombstone["deleted"] = serde_json::json!(true);
         insert(vec![tombstone]).await?;
         assert_eq!(db.build_histogram_count_proof(&partition).await?, None, "physical tombstones cannot be certified as live rows");
-        let batch_rows = super::super::build_optimize_session_state(1, db.maintenance_runtime_env()).config().options().execution.batch_size;
+        let batch_rows = super::super::build_optimize_session_state(1, db.maintenance_runtime_env()).config().options().execution.batch_size.get();
         let dense_timestamp = timestamp - DAY_MICROS;
         let dense_date = date_of(dense_timestamp);
         let dense_row = |id: usize| serde_json::json!({"project_id": project, "timestamp": dense_timestamp, "date": dense_date, "id": format!("{id:08}")});
