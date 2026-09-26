@@ -57,7 +57,7 @@ Status: ⬜ open · 🟡 in progress · ✅ done. Priority is the plan's executi
 | W15 | Observability batch: retry reason on `maintenance_task_finished`, per-tier rollup hit counters, sessions near-miss warn → debug | build (lane 3, niced) | Attribution | Confirms W3's post-scan retry cause; per-tier hit rate | `observability.rs`, stats key lists (`server/pg_compat.rs`), finish log in `maintenance_coordinator.rs`/`maintain.rs`, one warn in `rollup.rs` | — | agent (Claude) | 🟡 |
 | W16 | W2 via exported metric history | analysis | Attribution | Multi-day rollup/maintenance CPU and work attribution from OTel metrics in monoscope (`monoscope chart --source metrics`), not young-process counters | monoscope CLI, prod read-only | — | agent (Claude) | 🟡 |
 | W17 | W8 design: dependency classification | analysis | Stage 1D | Per-spec dependency map + mutation fixture table + where the classifier hooks in | design doc | — | agent (Claude) | 🟡 |
-| W18 | W10 design: capacity replay | analysis | Shared gates | How to drive `timefusion sim` at 1x/2x/4x rows and projects; what it can/can't prove; code plan | design doc | — | agent (Claude) | 🟡 |
+| W18 | W10 design: capacity replay | analysis | Shared gates | How to drive `timefusion sim` at 1x/2x/4x rows and projects; what it can/can't prove; code plan | design doc | — | agent (Claude) | ✅ design |
 
 Later stages (2, 4, 5, 6, 1C, certified-clean activation, adaptive batches) stay **conditional** on W2/W7
 numbers, per the plan; do not start them without a measured residual cost.
@@ -156,3 +156,15 @@ reopens the 1h derived tier (97 repeated 1440-min `dashboard_1h_v2` publications
 and the other live slices tile its range (guarded against a gap and against proven files); case-table test shown red
 without the rule. Current publications always stamp `output_rows`, so no new straddlers are created.
 **Verify after deploy:** repeated publications per slice/hour → ~1; `rollup_backfill_census` `cells_wanted` for those days → 0.
+
+### W18 result — 2026-09-26 — agent (Claude)
+**Finding:** `timefusion sim` cannot measure a ROWS axis yet: unit duration (`duration_range_secs`, calibrated 09-03 from
+676 prod units) depends only on operation and width, and a real journal runs with `byte_model = None`.
+**Design (W10 code, ~1 lane-day):** `ByteModel::from_journal` + byte-priced `unit_secs` (keep each operation's no-op share;
+expensive mode = `fixed + secs_per_byte × bytes`, slope from prod `maintenance_task_finished.ran_secs` joined to journal
+bytes); `--rows K` scales bytes per day, `--projects K` clones every ingesting stream (keeps the whale/small mix);
+`--matrix`, `--drain-hours`, `--now <fetch time>`; metrics: pending bytes, worker-secs and bytes per accepted row
+(timeouts charged), backlog slope, drain hours; 5 case-table tests.
+**Limits:** IO-free — proves backlog stability/fairness/lag, not CPU contention, latency, memory or object requests; recent
+admission changes (CPU-token pricing, client-query yield) are not in `SimConfig`. 1x must reproduce prod executions/h first.
+**Journal fetch (read-only):** `docker cp <cid>:/app/data/timefusion/.timefusion_meta/maintenance_tasks.json` (+ `.wal`, ~1.5h newer).
