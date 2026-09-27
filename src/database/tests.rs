@@ -1232,6 +1232,60 @@ async fn insert_hourly_spans(db: &Database, project: &str, day_start: i64, hours
     Ok(())
 }
 
+/// A replacement tier is preferred once it covers the window, and a replacement
+/// still backfilling never sends days its predecessor covers to the raw fringe.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_replacement_tier_serves_only_once_it_covers_as_much_as_the_tier_it_replaces() -> Result<()> {
+    use crate::maintenance_coordinator::{MAX_DECODED_BYTES, Operation, TaskKey, TimeSlice};
+    const SOURCE: &str = "otel_logs_and_spans";
+    let db = Arc::new(Database::with_config(rollup_backfill_config("replacement-tier", 35)).await?);
+    db.cancel_maintenance();
+    let project = format!("replace_{}", uuid::Uuid::new_v4().simple());
+    let days: Vec<chrono::NaiveDate> = (3..=4).rev().map(|back| (Utc::now() - chrono::Duration::days(back)).date_naive()).collect();
+    for day in &days {
+        for hour in [1, 7, 13, 19] {
+            insert_a_span(&db, &project, &format!("{day}-{hour}"), day.and_hms_opt(hour, 0, 0).unwrap().and_utc().timestamp_micros()).await?;
+        }
+    }
+    let build = async |tier: &str, day: chrono::NaiveDate| -> Result<()> {
+        let start = midnight_micros(day);
+        let key = TaskKey {
+            physical_table: format!("{SOURCE}_rollup_{tier}"),
+            source: SOURCE.to_owned(),
+            project_id: project.clone(),
+            slice: TimeSlice::new(start, start + crate::maintenance_coordinator::DAY_MICROS)?,
+            operation: Operation::BaseRollup,
+        };
+        db.journal().enqueue(key.clone(), 0, MAX_DECODED_BYTES, 0);
+        anyhow::ensure!(db.run_coordinator_rollup_selected(super::maintain::TaskSelection::Exact(&key)).await?, "{tier} {day} must build");
+        Ok(())
+    };
+    let mut ctx = Arc::clone(&db).create_session_context();
+    db.setup_session_context(&mut ctx)?;
+    let state = ctx.state();
+    let (lo, hi) = (midnight_micros(days[0]), midnight_micros(days[1]) + crate::maintenance_coordinator::DAY_MICROS);
+    // A 1m bucket, so only the 1m tiers compete.
+    let sql = format!(
+        "SELECT time_bucket('1 minutes', timestamp) AS tb, status_code, COUNT(*) FROM {SOURCE} \
+         WHERE project_id = '{project}' AND timestamp >= to_timestamp_micros({lo}) AND timestamp < to_timestamp_micros({hi}) GROUP BY 1, 2"
+    );
+    let plan = state.optimize(&state.create_logical_plan(&sql).await?)?;
+    let routed = async || -> Result<String> {
+        let rewrite = db.rollup_sql(&plan, &state).await.map_err(|reason| anyhow::anyhow!("declined: {}", reason.label()))?.expect("a route");
+        Ok(rewrite.ticket.output.target.trim_start_matches(&format!("{SOURCE}_rollup_")).to_owned())
+    };
+
+    for day in &days {
+        build("dashboard_1m_v3", *day).await?;
+    }
+    assert_eq!(routed().await?, "dashboard_1m_v3", "with no v4 coverage the replaced tier serves");
+    build("dashboard_1m_v4", days[1]).await?;
+    assert_eq!(routed().await?, "dashboard_1m_v3", "a v4 covering one of two days must not send the other raw");
+    build("dashboard_1m_v4", days[0]).await?;
+    assert_eq!(routed().await?, "dashboard_1m_v4", "a v4 covering the window is preferred");
+    Ok(())
+}
+
 /// The measure evidence every published slice-coverage cell of `project` carries,
 /// for one tier or across all of them.
 fn slice_measures(db: &Database, project: &str, tier: Option<&str>) -> Vec<Option<HashSet<String>>> {

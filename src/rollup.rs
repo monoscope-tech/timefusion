@@ -1163,27 +1163,6 @@ fn unaliased(expr: &datafusion::logical_expr::Expr) -> &datafusion::logical_expr
     }
 }
 
-/// `COALESCE(<column>, '<literal>')`, returning the column and the literal.
-///
-/// Two spellings, because DataFusion's simplifier rewrites `coalesce` into a
-/// `CASE` before the matcher sees it. Narrow on purpose: exactly one `WHEN`,
-/// whose predicate and result are the SAME column, and a string-literal
-/// fallback. Anything else yields `None`.
-fn coalesced_column(expr: &datafusion::logical_expr::Expr) -> Option<(&str, &str)> {
-    use datafusion::logical_expr::Expr;
-    match unaliased(expr) {
-        Expr::ScalarFunction(function) if function.name().eq_ignore_ascii_case("coalesce") && function.args.len() == 2 => {
-            Some((column_name(&function.args[0])?, string_literal(&function.args[1])?))
-        }
-        Expr::Case(case) => {
-            let (probed, then) = null_guard_case(case)?;
-            let column = column_name(probed)?;
-            (column_name(then)? == column).then_some((column, string_literal(case.else_expr.as_ref()?)?))
-        }
-        _ => None,
-    }
-}
-
 /// The `CASE WHEN <probed> IS NOT NULL THEN <then> …` shape DataFusion's
 /// simplifier leaves where the query said `coalesce`, as `(<probed>, <then>)`.
 /// The single spelling of the shape; how narrowly `probed` is accepted is the
@@ -1691,9 +1670,19 @@ pub(crate) async fn match_aggregates(
     };
     let Some(schema) = crate::schema::get_schema(&source).filter(|schema| !schema.rollups.is_empty()) else { return Ok(Vec::new()) };
 
-    // Coarsest grain first (strictly fewer rows for the same answer); ties break
+    // Coarsest grain first (strictly fewer rows for the same answer). At one grain a
+    // tier whose dimensions strictly contain another's is its replacement, so it goes
+    // first and the replaced tier serves only when it declines; other ties break
     // toward the narrower dimension set.
-    let candidates = schema.rollups.iter().sorted_by_key(|spec| (std::cmp::Reverse(spec.grain_micros().unwrap_or(0)), spec.dimensions.len()));
+    let supersedes = |spec: &crate::schema::RollupSpec| {
+        schema.rollups.iter().any(|other| {
+            other.grain_micros() == spec.grain_micros()
+                && other.dimensions.len() < spec.dimensions.len()
+                && other.dimensions.iter().all(|d| spec.dimensions.contains(d))
+        })
+    };
+    let candidates =
+        schema.rollups.iter().sorted_by_key(|spec| (std::cmp::Reverse(spec.grain_micros().unwrap_or(0)), !supersedes(spec), spec.dimensions.len()));
     let (mut miss, mut grain_miss) = (None, None);
     let mut routes = Vec::new();
     for spec in candidates {
@@ -1998,17 +1987,18 @@ async fn route_with_spec(
                     }
                     format!("time_bucket({}, timestamp)", sql_literal(interval))
                 }
-                // `COALESCE(dim, lit)` is a function of `dim`, so partitioning by
-                // `dim` refines it and re-aggregating decomposable states over a
+                // A deterministic expression over declared dimensions only (say
+                // `COALESCE(dim, lit)`) is a function of them, so partitioning by
+                // them refines it and re-aggregating decomposable states over a
                 // refinement equals aggregating the raw rows.
-                other => {
-                    // A bare column that is not a declared dimension keeps its own
-                    // reason — it is the one shape an operator can act on.
-                    let Some((column, fallback)) = coalesced_column(other).filter(|(column, _)| is_dimension(column)) else {
-                        return Err(if matches!(other, Expr::Column(_)) { MissReason::UnknownGroupBy } else { MissReason::UnsupportedShape });
-                    };
-                    format!("COALESCE({column}, {})", sql_literal(fallback))
+                // A bare column that is not a declared dimension keeps its own
+                // reason — it is the one shape an operator can act on.
+                Expr::Column(_) => return Err(MissReason::UnknownGroupBy),
+                other if !other.is_volatile() && other.column_refs().iter().all(|column| is_dimension(&column.name)) => {
+                    let bare = crate::write::mem_buffer::strip_column_qualifiers(other.clone()).map_err(|_| MissReason::UnsupportedShape)?;
+                    datafusion::sql::unparser::expr_to_sql(&bare).map_err(|_| MissReason::UnsupportedShape)?.to_string()
                 }
+                _ => return Err(MissReason::UnsupportedShape),
             };
             // Only the bucket may wear the epoch wrapper; a dimension grouped by
             // `extract(epoch …)` is nonsense and must not be silently accepted.
@@ -2784,7 +2774,7 @@ mod tests {
         assert_eq!(Merge::Hll.sql(&["__s0_0".to_string()]), "hll_merge(__s0_0)");
     }
 
-    const TARGET: &str = "otel_logs_and_spans_rollup_dashboard_1m_v3";
+    const TARGET: &str = "otel_logs_and_spans_rollup_dashboard_1m_v4";
     /// Ten grains wide: a window narrower than `MIN_INTERIOR_BUCKETS` grains can
     /// never route, so it would exercise the rejection path, not the matcher.
     const WINDOW: &str = "timestamp >= to_timestamp_micros(60000000) AND timestamp < to_timestamp_micros(660000000)";
@@ -2984,21 +2974,21 @@ mod tests {
             "SELECT time_bucket('1 hours', timestamp) AS tb, COALESCE(resource___service___name, 'null') AS svc, COUNT(*) \
              FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW} GROUP BY 1, 2"
         ),
-        &["COALESCE(resource___service___name, 'null')"] ; "a grouped chart coalescing its dimension routes")]
+        &["CASE WHEN resource___service___name IS NOT NULL THEN resource___service___name ELSE 'null' END"] ; "a grouped chart coalescing its dimension routes")]
     // A bare-column coalesce is left alone by CSE; the `::text` cast repeats a COMPUTATION and gets lifted into `__common_expr_1`.
     #[test_case::test_case(
         &format!(
             "SELECT time_bucket('1 hours', timestamp) AS tb, COALESCE(status_code::text, 'null') AS sc, COUNT(*) \
              FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW} GROUP BY 1, 2"
         ),
-        &["COALESCE(status_code, 'null')"] ; "a grouped chart casting its dimension routes despite cse")]
+        &["CASE WHEN CAST(status_code AS VARCHAR) IS NOT NULL THEN CAST(status_code AS VARCHAR) ELSE 'null' END"] ; "a grouped chart casting its dimension routes despite cse")]
     // A real log-explorer count chart verbatim: `extract(epoch …)` over the bucket, the `::text` coalesce, `count(*)::float`.
     #[test_case::test_case(
         &format!(
             "SELECT extract(epoch from time_bucket('1 hours', timestamp))::integer, COALESCE(status_code::text, 'null'), count(*)::float AS count_ \
              FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW} GROUP BY time_bucket('1 hours', timestamp), COALESCE(status_code::text, 'null')"
         ),
-        &["COALESCE(status_code, 'null')"] ; "the log explorer count chart routes verbatim")]
+        &["CASE WHEN CAST(status_code AS VARCHAR) IS NOT NULL THEN CAST(status_code AS VARCHAR) ELSE 'null' END"] ; "the log explorer count chart routes verbatim")]
     // A bare `count(*)` reads Delta statistics, so the benchmark spells it `count(1) FROM (SELECT id …) t`; the walker must descend that `SubqueryAlias`.
     #[test_case::test_case(
         &format!("SELECT count(1) FROM (SELECT id FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW}) t"),
@@ -3097,24 +3087,39 @@ mod tests {
         assert_eq!(route.target, "otel_logs_and_spans_rollup_sessions_1h_v2");
     }
 
-    /// A group expression the matcher cannot serve must DECLINE, not vanish.
-    /// `coalesce(status_code, level)` needs `level`, which no spec declares. The
-    /// distinction under test is `Err(_)` versus a silent `Ok(None)`.
-    #[tokio::test]
-    async fn an_unservable_group_expression_is_counted_rather_than_silent() {
-        let sql = format!(
-            "SELECT time_bucket('1 hours', timestamp) AS tb, COALESCE(coalesce(status_code, level)::text, 'null') AS sc, COUNT(*) \
-             FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW} GROUP BY 1, 2"
-        );
-        assert!(route_alone(&sql).await.is_err(), "an unservable group-by must report a reason, not fall through silently");
+    /// The tiers `sql` routes to, best first, without the table prefix.
+    async fn targets(state: &datafusion::execution::context::SessionState, sql: &str) -> Result<Vec<String>, MissReason> {
+        let routes = match_aggregates(&optimized(state, sql).await, state).await?;
+        Ok(routes.iter().map(|route| route.target.trim_start_matches("otel_logs_and_spans_rollup_").to_owned()).collect())
     }
 
-    #[test_case::test_case("status_code = 'pickup_accepted'", true)]
-    #[test_case::test_case("status_code IS NOT NULL", true)]
-    #[test_case::test_case("status_code IS NULL", false)]
-    #[test_case::test_case("status_code = 'pickup_accepted' OR status_code IS NULL", false)]
+    /// A group expression routes only to the tiers declaring every column it reads,
+    /// best first. One reading an undeclared column must DECLINE, not vanish as a
+    /// silent `Ok(empty)`.
+    #[test_case::test_case("coalesce(status_code, level)", Ok(&["dashboard_1h_v3", "dashboard_1m_v4"]) ; "monoscope's status chart needs level, which only v4 declares")]
+    #[test_case::test_case("status_code", Ok(&["dashboard_1h_v3", "dashboard_1h_v2", "dashboard_1m_v4", "dashboard_1m_v3"]) ; "v4 is preferred and the v3 it replaces is the fall through")]
+    #[test_case::test_case("coalesce(status_code, name)", Err(MissReason::UnsupportedShape) ; "an unservable group expression is counted rather than silent")]
     #[tokio::test]
-    async fn filtered_chart_only_drops_an_unreachable_level_fallback(predicate: &str, routes: bool) {
+    async fn a_group_expression_routes_to_the_tiers_declaring_its_columns(key: &str, expected: Result<&[&str], MissReason>) {
+        let sql = format!(
+            "SELECT time_bucket('1 hours', timestamp) AS tb, COALESCE({key}::text, 'null') AS sc, COUNT(*) FROM {SOURCE} \
+             WHERE project_id = 'project' AND timestamp >= to_timestamp_micros(0) AND timestamp < to_timestamp_micros(7200000000) GROUP BY 1, 2"
+        );
+        let state = session().await;
+        let targets = targets(&state, &sql).await;
+        assert_eq!(targets, expected.map(|names| names.iter().map(|name| (*name).to_owned()).collect()));
+        if targets.is_ok() {
+            assert_substitutes(&state, &sql, None).await;
+        }
+    }
+
+    /// A filter proving the `level` fallback unreachable lets the v3 tier serve too.
+    #[test_case::test_case("status_code = 'pickup_accepted'", &["dashboard_1m_v4", "dashboard_1m_v3"])]
+    #[test_case::test_case("status_code IS NOT NULL", &["dashboard_1m_v4", "dashboard_1m_v3"])]
+    #[test_case::test_case("status_code IS NULL", &["dashboard_1m_v4"])]
+    #[test_case::test_case("status_code = 'pickup_accepted' OR status_code IS NULL", &["dashboard_1m_v4"])]
+    #[tokio::test]
+    async fn only_a_filter_that_drops_the_level_fallback_lets_v3_serve(predicate: &str, expected: &[&str]) {
         let state = session().await;
         let sql = format!(
             "SELECT extract(epoch from time_bucket('2 hours', timestamp))::integer, \
@@ -3122,11 +3127,8 @@ mod tests {
             FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW} AND ({predicate}) \
             GROUP BY time_bucket('2 hours', timestamp), COALESCE(coalesce(status_code, level)::text, 'null')"
         );
-        let route = route_for(&state, &sql).await;
-        assert_eq!(matches!(route, Ok(Some(_))), routes, "{route:?}");
-        if routes {
-            assert_substitutes(&state, &sql, None).await;
-        }
+        assert_eq!(targets(&state, &sql).await, Ok(expected.iter().map(|name| (*name).to_owned()).collect()));
+        assert_substitutes(&state, &sql, None).await;
     }
 
     /// The shapes that make `source_and_filters` refuse. Each case asserts both
@@ -3311,18 +3313,13 @@ mod tests {
             "SELECT t.status_code, count(*) \
              FROM (SELECT kind AS status_code, timestamp, project_id FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW}) t GROUP BY 1"
         ) ; "a derived table that renames a column still declines")]
-    // The coalesce arm is deliberately narrow.
+    // A group expression may read declared dimensions only.
     #[test_case::test_case(
         &format!("SELECT COALESCE(status_message, 'null') AS g, COUNT(*) FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW} GROUP BY 1")
         ; "a column that is not a declared dimension")]
     #[test_case::test_case(
         &format!("SELECT COALESCE(resource___service___name, name, 'null') AS g, COUNT(*) FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW} GROUP BY 1")
         ; "three-argument coalesce")]
-    #[test_case::test_case(
-        &format!(
-            "SELECT COALESCE(CONCAT(resource___service___name, 'x'), 'null') AS g, COUNT(*) FROM {SOURCE} \
-             WHERE project_id = 'project' AND {WINDOW} GROUP BY 1"
-        ) ; "coalesce over an expression, not a column")]
     // `extract(epoch …)` is accepted because it is 1:1 over buckets; every other field is many-to-one and would merge groups the raw path keeps apart.
     #[test_case::test_case(
         &format!(

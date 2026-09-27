@@ -131,12 +131,18 @@ impl Database {
         if !enabled {
             return Ok(None);
         }
-        // Try every viable tier, best first, taking the first actually built across the window.
-        let mut best_miss = None;
+        // Try every viable tier, best first. Within the first grain that serves, the tier
+        // covering most of the window wins (the earlier on a tie), so a replacement tier
+        // still backfilling cannot send days its predecessor covers to the raw fringe.
+        let (mut best, mut best_miss) = (None::<(i64, RollupRewrite)>, None);
         for route in routes {
+            if best.as_ref().is_some_and(|(grain, held)| *grain != route.grain || held.saturated) {
+                break;
+            }
+            let grain = route.grain;
             match self.rollup_rewrite_for(route, session).await {
-                Ok(Some(rewrite)) => return Ok(Some(rewrite)),
-                Ok(None) => return Ok(None),
+                Ok(rewrite) if best.as_ref().is_none_or(|(_, held)| rewrite.covered_micros > held.covered_micros) => best = Some((grain, rewrite)),
+                Ok(_) => {}
                 // A measure decline outranks whatever an earlier spec reported; a sub-grain
                 // refusal is structural, so it must not mask a finer tier's actual gap.
                 Err(reason) => {
@@ -149,13 +155,13 @@ impl Database {
                 }
             }
         }
-        Err(best_miss.unwrap_or(crate::rollup::MissReason::NotBuilt))
+        best.map(|(_, rewrite)| Some(rewrite)).ok_or(best_miss.unwrap_or(crate::rollup::MissReason::NotBuilt))
     }
 
     /// Resolve ONE candidate tier against its coverage, or say why it cannot serve.
     async fn rollup_rewrite_for(
         &self, route: crate::rollup::RoutedRollup, _session: &datafusion::execution::context::SessionState,
-    ) -> std::result::Result<Option<RollupRewrite>, crate::rollup::MissReason> {
+    ) -> std::result::Result<RollupRewrite, crate::rollup::MissReason> {
         // A base unit may bisect down to `MIN_SLICE_MICROS`; a coarser base tier then holds
         // several partial states per bucket under one `(timestamp, id)`, which its read dedups.
         let base = get_schema(&route.source)
@@ -456,7 +462,9 @@ impl Database {
             crate::observability::record_rollup_miss(crate::rollup::MissReason::MeasureNotStored);
         }
         let mode = if interiors == [(route.lo, route.hi)] { "full" } else { "hybrid" };
-        Ok(Some(RollupRewrite {
+        Ok(RollupRewrite {
+            covered_micros: interiors.iter().map(|(start, end)| end - start).sum(),
+            saturated: interiors == crate::rollup::interiors(route.lo, route.hi, route.grain, horizon, &[(route.lo, route.hi)]),
             sql: route.sql(&generations, &interiors, &split),
             grain: format!("{}us", route.grain),
             mode,
@@ -466,7 +474,7 @@ impl Database {
                 slices: slice_ticket,
                 output: RollupOutputTicket { source: route.source, target: route.target, lookup_project, accepted: accepted_output },
             },
-        }))
+        })
     }
 
     pub(crate) async fn rollup_ticket_current(&self, ticket: &RollupReadTicket) -> bool {

@@ -6864,16 +6864,18 @@ mod tests {
         assert_eq!(tasks[0].estimated_decoded_bytes, 30);
     }
 
-    #[test_case::test_case(false; "completed wide proof cannot override a pending repair")]
-    #[test_case::test_case(true; "late census proof cannot override a pending repair")]
-    fn derived_rollup_claim_waits_for_complete_base_hour(cached_ranges: bool) {
+    #[test_case::test_case(false, "otel_logs_and_spans_rollup_dashboard_1m_v3", "otel_logs_and_spans_rollup_dashboard_1h_v2"; "completed wide proof cannot override a pending repair")]
+    #[test_case::test_case(true, "otel_logs_and_spans_rollup_dashboard_1m_v3", "otel_logs_and_spans_rollup_dashboard_1h_v2"; "late census proof cannot override a pending repair")]
+    #[test_case::test_case(false, "otel_logs_and_spans_rollup_dashboard_1m_v4", "otel_logs_and_spans_rollup_dashboard_1h_v3"; "the v4 pair waits for its own base")]
+    fn derived_rollup_claim_waits_for_complete_base_hour(cached_ranges: bool, base: &'static str, derived: &'static str) {
         let (_dir, mut journal) = new_journal();
-        let unit = |table, start, end, operation| task_in(table, "p", start, end, operation).tap_mut(|task| task.key.source = "otel_logs_and_spans".into());
+        let unit =
+            |table: &str, start, end, operation| task_in(table, "p", start, end, operation).tap_mut(|task| task.key.source = "otel_logs_and_spans".into());
         let base_keys: Vec<_> = (0..DERIVED_SLICE_MICROS)
             .step_by(NORMAL_SLICE_MICROS as usize)
-            .map(|start| upserted(&mut journal, unit("otel_logs_and_spans_rollup_dashboard_1m_v3", start, start + NORMAL_SLICE_MICROS, Operation::BaseRollup)))
+            .map(|start| upserted(&mut journal, unit(base, start, start + NORMAL_SLICE_MICROS, Operation::BaseRollup)))
             .collect();
-        journal.upsert(unit("otel_logs_and_spans_rollup_dashboard_1h_v2", 0, DERIVED_SLICE_MICROS, Operation::DerivedRollup));
+        journal.upsert(unit(derived, 0, DERIVED_SLICE_MICROS, Operation::DerivedRollup));
         assert!(journal.claim_next(Operation::DerivedRollup, 0, true).is_none());
         let unrelated = upserted(&mut journal, unit("otel_logs_and_spans_rollup_sessions_1h_v1", 0, DERIVED_SLICE_MICROS, Operation::BaseRollup));
         journal.complete(&unrelated);
@@ -6886,9 +6888,9 @@ mod tests {
         }
         assert!(journal.claim_next(Operation::DerivedRollup, 0, true).is_some());
 
-        let wide = upserted(&mut journal, unit("otel_logs_and_spans_rollup_dashboard_1m_v3", 0, DERIVED_SLICE_MICROS, Operation::BaseRollup));
+        let wide = upserted(&mut journal, unit(base, 0, DERIVED_SLICE_MICROS, Operation::BaseRollup));
         journal.complete(&wide);
-        for (table, derived) in [("otel_logs_and_spans_rollup_dashboard_1m_v3", false), ("otel_logs_and_spans_rollup_dashboard_1h_v2", true)] {
+        for (table, derived) in [(base, false), (derived, true)] {
             journal
                 .invalidate(Invalidation {
                     source_table: "otel_logs_and_spans",
@@ -6899,7 +6901,7 @@ mod tests {
         }
         if cached_ranges {
             journal.set_base_tier_ready(HashMap::from([(
-                ("otel_logs_and_spans".into(), "p".into(), "otel_logs_and_spans_rollup_dashboard_1h_v2".into(), "1970-01-01".into()),
+                ("otel_logs_and_spans".into(), "p".into(), derived.into(), "1970-01-01".into()),
                 vec![(0, DERIVED_SLICE_MICROS)],
             )]));
         }

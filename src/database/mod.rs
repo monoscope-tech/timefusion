@@ -876,6 +876,10 @@ pub(crate) struct RollupRewrite {
     /// `"full"` when the rollup answered the whole window, `"hybrid"` when raw
     /// fringes or a live tail were unioned in.
     pub mode: &'static str,
+    /// How much of the window the rollup answers; the rest is read raw.
+    pub covered_micros: i64,
+    /// No tier can cover more: the rest is fringe or the buffered tail.
+    pub saturated: bool,
     /// The `Aggregate` this rewrite replaces, verbatim, so the caller can swap it
     /// in place.
     pub matched: datafusion::logical_expr::LogicalPlan,

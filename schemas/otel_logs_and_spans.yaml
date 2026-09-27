@@ -438,7 +438,7 @@ rollups:
   - grain: 1m
     name: dashboard_1m_v3
     dimensions: [resource___service___name, kind, status_code]
-    measures:
+    measures: &dashboard_measures
       - { name: request_count, agg: count }
       - { name: duration_count, agg: count, column: duration }
       - {
@@ -574,35 +574,21 @@ rollups:
       # coarse grain would silently decline every wide dcount window.
       - { name: service_name_hll, agg: hll, column: resource___service___name }
 
-  # NO `level` TIER. Tried and withdrawn on 2026-08-24, after pricing three costs
-  # against zero measured benefit:
-  #
-  #   * it doubled enqueued rollup work (work scales with the declared spec count);
-  #   * its derived half published 489 rollups of which 3 had rows, because a
-  #     derived tier whose base is unbuilt is still claimable;
-  #   * and — the one that decided it, SINCE FIXED — a young tier pinned the
-  #     fleet. Both `rollup_min_contiguous_days` and `rollup_median_contiguous_days`
-  #     folded every (source, tier) with `.min()`, so a tier at 2 days made the
-  #     fleet gauge read 2 and `coverage_is_short()` (median vs
-  #     `COVERAGE_SHORT_DAYS = 14`) held the whole cluster in coverage-short mode
-  #     for an auxiliary tier nobody queries. `fold_fleet_gauge` in
-  #     `database/maintain.rs` now has a tier younger than the horizon ABSTAIN,
-  #     while the cross-tier `.min()` stays — it is what arms the backfill-ceiling
-  #     override, so a genuinely starved `dashboard_1h_v2` must still trigger it.
-  #
-  # Read that third bullet as closed, NOT as re-authorisation: the first two are
-  # untouched and remain grounds on their own. And ZERO of the misses observed in
-  # production are `level`-shaped — they are endpoint-hash-scoped status-CLASS
-  # charts, which `level` does not touch (docs/plans/2026-08-22-query-latency-matrix.md).
-  #
-  # Adding a spec is still safe by construction (`route_for` tries every declared
-  # rollup and one that cannot serve declines). `status_class` — expressible as
-  # declared count MEASURES with no new dimension — remains the one actually worth
-  # having. Note a measure addition is not free either: it lands NULL in every
-  # already-written cell, which is what `MissReason::MeasureNotStored` now refuses.
-  #
-  # The one case the fold fix does NOT cover, and it is untested: a long-lived tier
-  # REBUILT from scratch under the same table name reads old, so it still pins.
+  # v4 adds `level`, so monoscope's status chart (grouped by
+  # `coalesce(status_code, level)`) routes; `level` added no tier rows in a
+  # measured prod hour. It REPLACES v3: the router prefers it, and v3 keeps
+  # serving only until v4 covers the backfill horizon, then is dropped (move the
+  # measures anchor with it).
+  - grain: 1m
+    name: dashboard_1m_v4
+    dimensions: [resource___service___name, kind, status_code, level]
+    measures: *dashboard_measures
+  - grain: 1h
+    name: dashboard_1h_v3
+    derive_from: dashboard_1m_v4
+    dimensions: [resource___service___name, kind, status_code, level]
+    measures: *dashboard_measures
+
   # Session analytics. The session-list query (GROUP BY attributes___session___id
   # with filtered error/pageview counts and user-field maxes) is 25% of all
   # rollup misses AND one of the heavy raw-scan classes exhausting the query

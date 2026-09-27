@@ -186,7 +186,7 @@ impl QueryPlanner for DmlQueryPlanner {
             Err(error) => tracing::warn!(%error, "indexed histogram declined; using ordinary planning"),
         }
         match self.database.rollup_sql(logical_plan, session_state).await {
-            Ok(Some(crate::database::RollupRewrite { sql, grain, mode, matched, ticket })) => {
+            Ok(Some(crate::database::RollupRewrite { sql, grain, mode, matched, ticket, .. })) => {
                 // Each failure carries its own stage label, log message and miss reason.
                 type RewriteFailure = (DataFusionError, &'static str, &'static str, crate::rollup::MissReason);
                 let planned: std::result::Result<Arc<dyn ExecutionPlan>, RewriteFailure> = async {
