@@ -41,7 +41,7 @@ Status: ⬜ open · 🟡 in progress · ✅ done. Priority is the plan's executi
 | # | Stream | Kind | Plan § | Deliverable | Files / area | Depends on | Owner | Status |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | W1 | Release batch + `now()` hit-rate re-measure | build (lane 1) | Execution priorities | Batch on `master`; hit rate / miss mix on a ≥1h process vs the pre-fix sample (0 hits / 1530 misses per h on `e1da854c`) | Integrator | — | Claude | 🟡 |
-| W2 | Attribution baseline | analysis | "Before changes: attribution" | One-hour CPU by lane/spec reconciled with whole-process CPU; tier-usage inventory (queries per tier, routing eligibility, maintenance cost) | prod read-only, monoscope query shapes | W1 deployed + 1h | | ⬜ |
+| W2 | Attribution baseline | analysis | "Before changes: attribution" | One-hour CPU by lane/spec reconciled with whole-process CPU; tier-usage inventory (queries per tier, routing eligibility, maintenance cost) | prod read-only, monoscope query shapes | W1 deployed + 1h | | ✅ covered by W16 + W19 counters |
 | W3 | 1B shard-count inventory | analysis | Stage 1B | Executed-unit shard-count distribution (1, 2, 3–4, 5–8, >8) weighted by estimated input bytes, from publication logs / journal — no new scans | `scripts/rollup_work_inventory.py` (+ its test), prod logs, `maintenance_tasks.json` | — | agent (Claude) | ✅ |
 | W4 | Session-tier consumer inventory | analysis | First deliverable (B1) | Every reader of `*_rollup_sessions_1h_v1` (monoscope code paths, direct SQL, infrequent jobs) and a keep/pause/remove recommendation; unserved HLL review | monoscope repo (read-only), prod pgwire logs | — | agent (Claude) | ✅ |
 | W5 | Per-range witness (restart recovery) | build | Stage 0 | **Deprioritized by measurement**: the 18:05 restart re-queued 26 `WitnessMoved` slices, all in the paused `sessions_1h_v1`, zero in dashboard tiers (`rollup_unverifiable_rebuild_queued` log). Revisit only if a dashboard tier shows it | — | W1 | Claude | ✅ measured |
@@ -49,9 +49,9 @@ Status: ⬜ open · 🟡 in progress · ✅ done. Priority is the plan's executi
 | W7 | Stage 1 build measurement harness | build (lane 2) | Stage 1 | For representative units via `timefusion run-unit`: physical plan, scan count, hash shards, dedup ops, decoded bytes, aggregate-state memory, CPU; publication economics (commits/actions/latency incl. failures) | `src/main.rs` `run-unit`, `benches/rollup_work.rs`, report under `docs/plans/` | W3 for unit choice | Claude (timefusion-2e) | 🟡 harness handed off `ws/w7-run-unit-passes`; prod economics ✅ [report](2026-09-27-stage1-unit-economics.md); **real-S3 unit cost blocked on staging** (owner decision) |
 | W8 | 1D dependency classification — design + fixtures | analysis → build (lane 2) | Stage 1D | Per-spec dependency map (dims, measures, filters, identity, ts, version, delete); mutation fixture table proving zero missed relevant invalidations; then the classifier | new test module; `apply_rollup_hours` call sites in `database/rollup.rs` | W2 (which mutations dominate) | | ⬜ |
 | W9 | Stage 3 publication batching — design | analysis | Stage 3 | Concrete design mapped to existing staged publication / journal group-commit; WAL-compat decision (does the payload change?); queue limits; test list | design doc only | — | agent (Claude) | ✅ |
-| W10 | Capacity replay harness | build (lane 2) | Shared gates | `timefusion sim` replay of a prod journal at 1x/2x/4x rows and 1x/2x/4x projects; report backlog stability and work per accepted row | `src/maintenance_sim.rs`, `src/main.rs` | W2 | | ⬜ |
+| W10 | Capacity replay harness | build (lane 2) | Shared gates | `timefusion sim` replay of a prod journal at 1x/2x/4x rows and 1x/2x/4x projects; report backlog stability and work per accepted row | `src/maintenance_sim.rs`, `src/main.rs` | W2 | | ✅ `e9ce6dc3` (ws/w10-sim-rows); open: check a 1x replay against prod executions/h before trusting any multiplier |
 | W11 | OpenTelemetry 0.33 upgrade | build (lane 2) | Housekeeping | Closes the `opentelemetry_sdk` advisory (unbounded baggage alloc) | `Cargo.toml`, `src/observability.rs` | — | Claude (timefusion-2e) | ✅ handed off |
-| W12 | `dcount(name)` measure decision | analysis | Rollup misses | Cost/benefit for a `name` HLL + 2-way server-scope count guard on `dashboard_1m_v3` (schema comment ~L501 declines it on purpose); owner decides | `schemas/otel_logs_and_spans.yaml` (proposal only) | W2 | | ⬜ |
+| W12 | `dcount(name)` measure decision | analysis | Rollup misses | Cost/benefit for a `name` HLL + 2-way server-scope count guard on `dashboard_1m_v3` (schema comment ~L501 declines it on purpose); owner decides | `schemas/otel_logs_and_spans.yaml` (proposal only) | W2 | Claude (timefusion-2e) | ✅ analysis — owner decides (see result) |
 | W13 | Narrow the slice OCC gate (Stage 3 step 1) | build (lane 2) | Stage 3 | A non-overlapping sibling slice no longer makes a staged unit `slice_occ_stale`; a unit may retire narrower contained slices; target proof re-recorded under the commit lock; cause logging; tests 1, 3, 3b of the W9 design failing-first | `maintain.rs` `run_coordinator_rollup_selected` OCC check | W9 | Claude | 🟡 branch `ws/w13-occ-narrow` (842617b9), **top priority per W3** |
 | W14 | 720-minute republication loop | analysis → build | Stage 0 / 1 | Why 58 slices (mostly 720-min `dashboard_1m_v3`) republished 431 times in 65 min (56% of publications, 228/361 GB); fix the re-mint source (census / witness moved / no-op skip miss); log the retry reason on `maintenance_task_finished` | `maintain.rs` census + no-op decision, `database/rollup.rs` | W3 | Claude | ✅ deployed `2b8c46d4` |
 | W15 | Observability batch: retry reason on `maintenance_task_finished`, per-tier rollup hit counters, sessions near-miss warn → debug | build (lane 3, niced) | Attribution | Confirms W3's post-scan retry cause; per-tier hit rate | `observability.rs`, stats key lists (`server/pg_compat.rs`), finish log in `maintenance_coordinator.rs`/`maintain.rs`, one warn in `rollup.rs` | — | agent (Claude) | 🟡 |
@@ -279,4 +279,30 @@ Two cases are structural; the test says so.
 
 **Next:** deploy it dark and read `rollup_carry_eligible_rows_total` against `mor_version_rows_appended_total`.
 Enabling needs gap 1 closed and an owner decision.
+
+### W12 result — 2026-09-27 — Claude (timefusion-2e)
+**Question:** should `dashboard_1m_v3` gain a `name` HLL so monoscope's `dcount(name)` panels route? monoscope renders
+`dcount(x)` as `distinct_count(approx_count_distinct(x))`. Three panels use it:
+
+| Panel | Filter | What routing it needs |
+| --- | --- | --- |
+| Overview "Unique Endpoints" | `(kind == server or name == apitoolkit-http-span) and name != null` | A **filtered** name HLL. The scope is two-way, and `name` is not a dimension. This is the filter-variant kind the tier deliberately does not declare. |
+| Service tab "Endpoints" | `service == X and kind == server and name != null` | An **unfiltered** name HLL (service and kind are dimensions), plus matcher acceptance of `name IS NOT NULL` on the HLL's own column. |
+| Endpoint Analytics "Distinct Operations" | `hashes[*] == X` | **Never routable**: `hashes` is not a dimension. |
+
+**Cost:** storage is negligible.
+- The tier has about 15.5k rows/day for the largest project (09-26).
+- Its busiest measured hour has about 1.2 distinct names per tier row (max 10), so a sparse HLL is tens of bytes per row,
+  about 0.3 MB/day for that project.
+- The existing `service_name_hll` is 9 B/row.
+
+Build CPU is one sketch update per row, small next to the scan. Adding a measure does not orphan history: older slices
+decline only for queries that need it (`MeasureNotStored`) until they are rebuilt.
+**Benefit: unmeasured.** In 60 min of a mature process (00:00–01:00 UTC, night), there were zero `approx_count_distinct(name)`
+statements over 1 s and zero sampled misses for that shape. A 24 h search would be a broad scan of prod TF, so it was not run.
+**Recommendation (owner decides):** don't add it yet.
+- Take one daytime window of `rollup_miss_sampled` or `pgwire.slow_statement` for `approx_count_distinct(name)`.
+- If the service-tab panel misses at a material rate, add the **unfiltered** `name_hll` only. It is cheap, needs no new
+  filter variant, and needs a matcher check for the `IS NOT NULL` guard.
+- Keep declining the two-way-scope Overview panel unless its own rate justifies a filter variant.
 
