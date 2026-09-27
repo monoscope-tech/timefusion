@@ -47,7 +47,7 @@ Status: ⬜ open · 🟡 in progress · ✅ done. Priority is the plan's executi
 | W5 | Per-range witness (restart recovery) | build | Stage 0 | **Deprioritized by measurement**: the 18:05 restart re-queued 26 `WitnessMoved` slices, all in the paused `sessions_1h_v1`, zero in dashboard tiers (`rollup_unverifiable_rebuild_queued` log). Revisit only if a dashboard tier shows it | — | W1 | Claude | ✅ measured |
 | W6 | `multi_scan_source` shapes | analysis → build (lane 2) | Rollup misses | Classify the 192/h self-join/UNION declines (service-edges); decide: route per-leg, rewrite in monoscope, or leave raw; then implement the chosen matcher change with a case-table test | `src/rollup.rs` matcher (`source_and_filters`, `match_aggregates`) | — | agent (Claude) | ✅ |
 | W7 | Stage 1 build measurement harness | build (lane 2) | Stage 1 | For representative units via `timefusion run-unit`: physical plan, scan count, hash shards, dedup ops, decoded bytes, aggregate-state memory, CPU; publication economics (commits/actions/latency incl. failures) | `src/main.rs` `run-unit`, `benches/rollup_work.rs`, report under `docs/plans/` | W3 for unit choice | Claude (timefusion-2e) | 🟡 harness handed off `ws/w7-run-unit-passes`; prod economics ✅ [report](2026-09-27-stage1-unit-economics.md); **real-S3 unit cost blocked on staging** (owner decision) |
-| W8 | 1D dependency classification — design + fixtures | analysis → build (lane 2) | Stage 1D | Per-spec dependency map (dims, measures, filters, identity, ts, version, delete); mutation fixture table proving zero missed relevant invalidations; then the classifier | new test module; `apply_rollup_hours` call sites in `database/rollup.rs` | W2 (which mutations dominate) | Claude (timefusion-2e) | 🟡 shadow classifier in progress (lane 2) |
+| W8 | 1D dependency classification — design + fixtures | analysis → build (lane 2) | Stage 1D | Per-spec dependency map (dims, measures, filters, identity, ts, version, delete); mutation fixture table proving zero missed relevant invalidations; then the classifier | new test module; `apply_rollup_hours` call sites in `database/rollup.rs` | W2 (which mutations dominate) | Claude (timefusion-2e) | ✅ shadow classifier handed off `ws/w8-shadow-classifier` |
 | W9 | Stage 3 publication batching — design | analysis | Stage 3 | Concrete design mapped to existing staged publication / journal group-commit; WAL-compat decision (does the payload change?); queue limits; test list | design doc only | — | agent (Claude) | ✅ |
 | W10 | Capacity replay harness | build (lane 2) | Shared gates | `timefusion sim` replay of a prod journal at 1x/2x/4x rows and 1x/2x/4x projects; report backlog stability and work per accepted row | `src/maintenance_sim.rs`, `src/main.rs` | W2 | | ✅ `e9ce6dc3` (ws/w10-sim-rows); open: check a 1x replay against prod executions/h before trusting any multiplier |
 | W11 | OpenTelemetry 0.33 upgrade | build (lane 2) | Housekeeping | Closes the `opentelemetry_sdk` advisory (unbounded baggage alloc) | `Cargo.toml`, `src/observability.rs` | — | Claude (timefusion-2e) | ✅ handed off |
@@ -356,4 +356,20 @@ step (cheap, dark-safe): a sampled `dedup_skip_denied` log per `(date age, reaso
 removed)`. Then decide between two levers: (a) narrowing the read check so a DV mask that only removed *losers*
 does not un-match windows it cannot affect, or (b) certifying days faster in their first 4 days. The compaction
 carry stays unbuilt unless sealed-day compaction volume grows.
+
+### W8 result — 2026-09-27 — Claude (timefusion-2e)
+**Built (shadow only, per W17):** `rollup_tiers_reading(source, columns)` gives a per-tier verdict from W21's
+`spec_source_columns`; a derived tier also reads what its base reads. After each merge-on-read statement,
+its version rows are counted in OTel `timefusion.rollup.version_append_rows{tier, relevant}`. A tombstone is
+relevant to every tier. Nothing acts on the verdict.
+**Tests:** `rollup_relevance_tests` pins the real schema:
+- `hashes` touches no tier.
+- `attributes___user___id` touches only `sessions_1h_v1`.
+- A measure-filter column touches both dashboard tiers.
+- `timestamp` touches every tier.
+
+Breaking the classifier turns 3 of the 4 red. The base-inheritance rule cannot be isolated on this schema,
+because `dashboard_1h_v2` restates every base column; the test says so.
+**Read it as:** after deploy, the `relevant=false` share per tier is the volume that per-tier invalidation could
+keep readable, beyond W21's all-tiers rule (session enrichment on the dashboard tiers, for example).
 
