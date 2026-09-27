@@ -53,6 +53,18 @@ Measured waste, ranked, with owner:
 7. Owner-decision builds: W28 HLL audit (agent), W29 v4 `level` (branch ready, own window), W27 sessions v2, W30 staging.
 8. Stage 3 batched publication build, Stage 1B single pass: after 1–5 land and the scorecard shows the residual.
 
+**21:55 update.** 20:50 deployed (fix A, SPM, W36, fix B, master `0e6b3ac7`): re-mint loop GONE (escalations and
+ledger disagreements 100/15 min -> 0; base-rollup completions now today's cells), oldest pending 9.8 d -> 4.5 d, all three
+probe projects' 6h windows route hybrid. Pending base/derived/dedup flat (424/404/190): capacity freed, census not yet
+draining old debt. Closed: Stage 1D (0% irrelevant churn), W28 (already on master `e0e27dbe`).
+Ready: W37 cert per-project spans (2e, `aa0b3205`, CI green) and the derived-requeue fix (`edit_tasks` bypassed the claim
+index, so reopened derived cells were unclaimable until reboot) join the 22:50 batch `batch/memory-claim`.
+W31 `ws/w31-today-hybrid` `df2b862c` CI green: content-fingerprint slice proof (root cause: the bounded witness counts
+from midnight, so one late file stales every later slice; packed cut files carry no bounded tag). Own window next.
+W33 `0c72d19b` CI green, after W31. W38 census guard (7c) building. W40 sessions partial-slice undercount (2e) gates any
+sessions v2 resume. Recovery-adopt v2 deprioritized (4 requeues per restart). Next Stage 2 gap: today's base cells
+land in hourly batches, so the newest 18-80 min are uncovered.
+
 Deploy queue: 20:50 read-path + fix B · ~22:50 memory batch (7c `ws/batch-memory`) · then claim fast path, W38, W33, W31
 one window each, CI green on the branch first.
 
