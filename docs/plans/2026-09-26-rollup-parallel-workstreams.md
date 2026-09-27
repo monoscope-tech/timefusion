@@ -61,6 +61,7 @@ Status: ⬜ open · 🟡 in progress · ✅ done. Priority is the plan's executi
 | W19 | Export per-lane work as OTel counters | build (lane 2) | W16 gap | Lease ms by operation/outcome, processed bytes by operation, rollup publications / published input bytes / scan bytes by tier; no stats-key changes | `src/observability.rs`, `maintenance_coordinator.rs` lease drop, `maintain.rs` byte sites | W16 | Claude (timefusion-2e) | ✅ handed off `ws/w19-lane-counters` |
 | W20 | Heavy-query admission starves the largest project | analysis → build (lane 2) | Read path | Why every 87576849 dashboard query timed out waiting for a heavy slot; fix + holder attribution | `src/read/admission.rs` | — | Claude (timefusion-2e) | ✅ handed off `ws/admission-narrow-merge` |
 | W21 | Carry the rollup witness across rollup-irrelevant version appends | build (lane 2) | Stage 0/2 | hashes-only MoR UPDATEs keep today's slices readable; dark flag + shadow counter; failing-first + guard tests | `dml.rs` append, `database/write.rs` flush commit, `maintain.rs` WitnessCarry | W17 | Claude (timefusion-2e) | ✅ handed off `ws/w21-witness-carry` (dark; enablement blocked, see result) |
+| W22 | Dedup scan share: steady state or backlog? (Stage 5 input) | analysis | Stage 5 | Is dedup's ~12x larger physical scan a draining backlog or recurring work | prod logs, exported `pending_dedup` | W7 | Claude (timefusion-2e) | ✅ steady state (see result) |
 
 Later stages (2, 4, 5, 6, 1C, certified-clean activation, adaptive batches) stay **conditional** on W2/W7
 numbers, per the plan; do not start them without a measured residual cost.
@@ -305,4 +306,26 @@ statements over 1 s and zero sampled misses for that shape. A 24 h search would 
 - If the service-tab panel misses at a material rate, add the **unfiltered** `name_hll` only. It is cheap, needs no new
   filter variant, and needs a matcher check for the `IS NOT NULL` guard.
 - Keep declining the two-way-scope Overview panel unless its own rate justifies a filter variant.
+
+### W22 result — 2026-09-27 — Claude (timefusion-2e)
+**Question:** W7 measured dedup scanning 899 GB/h against 75 GB/h for BaseRollup. Is that a backlog draining
+or steady-state work?
+**Numbers:**
+- Same 60 min window, process `cc6bfa40`. Dedup completions by partition age: yesterday to 4 d old held about
+  12.2k lease-s (2 d: 14 units at ~355 s each; 3 d: 123 units, 4.9k s). A tail of 24–26 d-old partitions held
+  110 units and ~1.5k s. Today had none.
+- Retries were 6,531 × `admission_busy`, mostly costing seconds each. The exception was yesterday's partitions,
+  where retries held 4.6k s.
+- The skip-proof almost never fires: `dedup_skipped_pct` is 1.3%, and 60.8% of denials are never-certified
+  partitions. `dedup_denied_fp_moved` is 3,418.
+- The exported `timefusion.maintenance.pending_dedup` over 7 days (max per 6 h, monoscope metrics) oscillates
+  between ~270 and ~1,400. Each daily spike returns to ~300 within 6–12 h, and there is **no downward trend**.
+
+**Conclusion:** mostly **steady state**. Each newly sealed day is re-deduplicated for several days, plus
+restart re-inflation (65 starts in 7.8 d per W16). It is not a finite backlog that will drain on its own; only
+the 24–26 d sweep looks like backfill. The Stage 5 lever is fewer repeat dedups of the same sealed day. That
+means certification that survives fingerprint moves, since 98.7% of eligible slices are denied the skip, rather
+than faster dedup.
+**Not measured:** bytes per dedup unit (`maintenance_scan_pruning` carries no unit key), so the
+per-age split is by lease time, not by bytes.
 
