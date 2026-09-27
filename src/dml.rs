@@ -996,6 +996,10 @@ async fn perform_version_append(
         // A batch that superseded a still-buffered row is that row's first flush: new
         // data, which no witness may absorb. Only a batch whose predecessors are all
         // already flushed can be carried.
+        crate::observability::record_witness_moving_rows(
+            if irrelevant && dropped == 0 { "transparent" } else { "base_version" },
+            database.rows_below_live_coverage(project_id, table_name, &batches[0]),
+        );
         if irrelevant && dropped == 0 {
             crate::observability::dml_stats().rollup_carry_eligible_rows.fetch_add(batches[0].num_rows() as u64, std::sync::atomic::Ordering::Relaxed);
         }

@@ -4918,6 +4918,56 @@ impl Database {
 
     /// After a flush commit lands: carry each date's eligible rows, bounded by the
     /// latest timestamp of every file the commit wrote to that date.
+    /// Highest live slice `covered_through` per date of `project_id`'s `source` (W31 step 0).
+    fn live_coverage_bounds(&self, project_id: &str, source: &str) -> HashMap<String, i64> {
+        self.rollup_slice_coverage
+            .iter()
+            .filter(|entry| entry.key().0 == project_id && entry.key().1 == source)
+            .filter_map(|entry| Some((chrono::DateTime::from_timestamp_micros(entry.key().3)?.date_naive().to_string(), entry.value().covered_through)))
+            .fold(HashMap::new(), |mut bounds, (date, through)| {
+                bounds.entry(date).and_modify(|held: &mut i64| *held = (*held).max(through)).or_insert(through);
+                bounds
+            })
+    }
+
+    /// Rows of `batch` below their date's live coverage bound: they move a slice's bounded witness.
+    pub(crate) fn rows_below_live_coverage(&self, project_id: &str, source: &str, batch: &RecordBatch) -> u64 {
+        use arrow::array::AsArray;
+        let bounds = self.live_coverage_bounds(project_id, source);
+        let (Some(ts), Some(date)) = (batch.column_by_name("timestamp"), batch.column_by_name("date")) else { return 0 };
+        let (Ok(ts), Ok(date)) = (arrow::compute::cast(ts, &arrow::datatypes::DataType::Int64), arrow::compute::cast(date, &arrow::datatypes::DataType::Utf8))
+        else {
+            return 0;
+        };
+        ts.as_primitive::<arrow::datatypes::Int64Type>()
+            .iter()
+            .zip(date.as_string::<i32>().iter())
+            .filter(|(ts, date)| ts.zip(date.and_then(|date| bounds.get(date))).is_some_and(|(ts, bound)| ts < *bound))
+            .count() as u64
+    }
+
+    /// Flushed rows in files wholly below their date's live coverage bound (W31 step 0).
+    pub(crate) fn record_flushed_witness_movers(&self, project_id: &str, source: &str, adds: &[deltalake::kernel::Action]) {
+        let bounds = self.live_coverage_bounds(project_id, source);
+        let rows = adds
+            .iter()
+            .filter_map(|action| match action {
+                deltalake::kernel::Action::Add(add) => Some(add),
+                _ => None,
+            })
+            .filter(|add| {
+                add.partition_values
+                    .get("date")
+                    .and_then(Option::as_deref)
+                    .and_then(|date| bounds.get(date))
+                    .zip(add_ts_bounds(add).1)
+                    .is_some_and(|(bound, hi)| hi < *bound)
+            })
+            .filter_map(add_row_count)
+            .sum();
+        crate::observability::record_witness_moving_rows("flushed", rows);
+    }
+
     pub(crate) fn carry_committed_versions(&self, project_id: &str, source: &str, carry: HashMap<String, u64>, adds: &[deltalake::kernel::Action]) {
         for (date, rows) in carry {
             let max_ts = adds

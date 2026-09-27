@@ -151,6 +151,7 @@ counter_registry! {
     rollup_publications        => "timefusion.rollup.publications": "Rollup units published, by tier",
     rollup_published_input_bytes => "timefusion.rollup.published_input_bytes": "Estimated decoded input bytes of published rollup units, by tier",
     rollup_version_append_rows => "timefusion.rollup.version_append_rows": "Merge-on-read version rows by rollup tier and whether that tier reads an assigned column (shadow: nothing acts on it). Irrelevant rows are what per-tier invalidation could keep readable",
+    rollup_witness_moving_rows => "timefusion.rollup.witness_moving_rows": "Rows landing below a live rollup slice's covered_through, which moves its bounded witness (W31 step 0), by class: flushed = every flushed row; transparent = merge-on-read versions no rollup reads whose predecessor already flushed; base_version = the other version rows. Ingest is flushed minus both version classes",
     rollup_scan_estimated_bytes => "timefusion.rollup.scan_estimated_bytes": "Projected bytes of every rollup scan pass, including failed and repeated shard passes, by tier. Against published_input_bytes this is the wasted-scan share",
     rollup_misses              => "timefusion.rollup.misses": "Dashboard aggregates that fell through to a raw scan, labelled by REASON. Without the reason breakdown there is no feedback loop telling us which dimension to add next — a rollup silently serving 20% of traffic looks identical to one serving 90%",
     cache_insert_bypassed    => "timefusion.cache.insert_bypassed": "Cache populations suppressed because the read ran inside a large-scan bypass scope (scan-resistant admission — a wide historical scan must not evict the hot tail)",
@@ -958,6 +959,13 @@ pub fn record_rollup_published(operation: crate::maintenance_coordinator::Operat
 pub fn record_version_append_relevance(tiers: &[(String, bool)], rows: u64) {
     for (tier, relevant) in tiers {
         otel_add(|m| &m.rollup_version_append_rows, rows, &[KeyValue::new("tier", tier.clone()), KeyValue::new("relevant", *relevant)]);
+    }
+}
+
+/// Rows that move a live slice's bounded witness, by class (W31 step 0).
+pub fn record_witness_moving_rows(class: &'static str, rows: u64) {
+    if rows > 0 {
+        otel_add(|m| &m.rollup_witness_moving_rows, rows, &[KeyValue::new("class", class)]);
     }
 }
 

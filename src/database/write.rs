@@ -678,6 +678,7 @@ impl Database {
                 Ok(committed) => {
                     self.mark_written_sorted(schema, sorted, &adds);
                     self.carry_committed_versions(&project_id, &table_name, carry, &adds);
+                    self.record_flushed_witness_movers(&project_id, &table_name, &adds);
                     Ok(committed)
                 }
                 Err(e) => {
