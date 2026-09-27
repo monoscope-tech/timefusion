@@ -64,6 +64,7 @@ Status: ⬜ open · 🟡 in progress · ✅ done. Priority is the plan's executi
 | W22 | Dedup scan share: steady state or backlog? (Stage 5 input) | analysis | Stage 5 | Is dedup's ~12x larger physical scan a draining backlog or recurring work | prod logs, exported `pending_dedup` | W7 | Claude (timefusion-2e) | ✅ steady state (see result) |
 | W23 | Dedup certification that survives fingerprint moves (W22 lever) | analysis → build | Stage 5 | Step 1: what moves sealed-day certification, and which moves are dedup-preserving; step 2 (dark carry) only if step 1 finds the volume | `maintain.rs` certification, `commit_wave` | W22 | Claude (timefusion-2e) | 🟡 step 1 done; denial attribution handed off `ws/w23-deny-attribution` (measure 1 h after deploy, then pick lever a/b) |
 | W24 | 24 h status-breakdown shape misses as `unsupported` | analysis | Rollup misses | Why `COALESCE(coalesce(status_code, level)::text, 'null')` never routes | `src/rollup.rs` matcher (test ~3059) | — | Claude (timefusion-2e) | ✅ by design; routing it needs `level` as a dimension (owner decision, see result) |
+| W25 | Deploy rollout availability (32 s unready vs 30 s budget) | analysis | Deploys | Where the client-visible unready interval goes, and fixes | `scripts/deploy/rollout.sh`, swarm spec, `src/main.rs` shutdown | — | Claude (timefusion-2e) | ✅ analysis (proposals need sign-off, see result) |
 
 Later stages (2, 4, 5, 6, 1C, certified-clean activation, adaptive batches) stay **conditional** on W2/W7
 numbers, per the plan; do not start them without a measured residual cost.
@@ -386,4 +387,38 @@ a new tier version (`dashboard_1m_v4` / `1h_v3`) plus a re-backfill.
 1. Add `level` in a v4, batched with any other dimension change.
 2. monoscope splits the chart: the `status_code IS NOT NULL` part routes, and the remainder stays raw.
 3. Leave it.
+
+### W25 result — 2026-09-27 — Claude (timefusion-2e)
+**Measured.** Rollout lines from 13 deploy runs (09-26 15:40 → 09-27 01:55): unready was 9.5–15.3 s, apart from
+23.5 s (20:46) and 32.1 s (21:31). The `HANDOFF` row count did not track it (407 k → 23.5 s, 339 k → 12.3 s,
+321 k → 14.3 s). **The interval does not grow with buffered data.** The write fence drains before SIGTERM (shutdown
+logs "flush skipped: already drained"), and reads stay available until SIGTERM.
+**Decomposition of the 01:55 deploy (14.3 s),** from container timestamps and both processes' logs. The swarm
+order is `stop-first` (`start-first` deadlocks on the WAL lock, 08-10), so these steps run in series:
+
+| Step | Duration |
+| --- | --- |
+| SIGTERM → PGWire stops accepting → TimeFusion "Shutdown complete" | 1.0 s |
+| "Shutdown complete" → container exit (`async_main` drops db, buffers and caches before `process::exit`) | **2.4 s** |
+| Old exit → new task created (every deploy's first new-image task fails with `No such container`: CapRover updates the service twice) | 1.6 s |
+| New container created → started, image already pulled | **4.9 s** |
+| Process start → early-bind 57P03 → real PGWire | 2.0 s |
+| Probe slop (1 s timeouts) and first answers | ~2.4 s |
+
+**21:31 (32.1 s), from TimeFusion's own logs in monoscope (2.5 min window).** SIGTERM 21:31:24.8, shutdown done
+in 1 s, new process started 21:31:44.6, ready 21:31:46.2. So "old shutdown → new start" took **19.8 s against
+10.4 s**, and the new process first answered the probe about **10 s after** "startup complete" (inferred from the
+interval's end, 2.3 s normally). TimeFusion's own shutdown and boot did not grow; the container lifecycle and the
+first seconds after start did. A burst of slow statements completes from 21:32:01, consistent with reconnecting
+clients swamping the new process.
+**Proposals (need sign-off, not built):**
+1. `process::exit(0)` right after "Shutdown complete", skipping the heap teardown. That saves ~2.4 s, and more on a
+   larger heap. Caveat: `TaskLease::drop` checkpoints an unstarted-unit release, so the exit must come after
+   `db.shutdown_by` has released the leases.
+2. Find the 4.9 s create → start. It happens with the image cached, so the cause is container setup (mounts or
+   network).
+3. Stop CapRover's double service update: deploy with a single `docker service update --image`, or accept the
+   1.6 s it costs.
+4. Keep the 30 s budget, but have the rollout log old-exit / new-start / first-answer timestamps, so the next miss
+   is attributable without a log search.
 
