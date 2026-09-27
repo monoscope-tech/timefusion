@@ -1003,7 +1003,16 @@ pub(crate) fn slice_input_sql(
             None => sql,
         };
     };
-    let inner = schema.fields.iter().map(&projected).join(", ");
+    // The WHERE pins `project_id`, and the provider serves it dictionary-encoded:
+    // read through the sort, every merge re-interleaves its dictionaries.
+    let inner = schema
+        .fields
+        .iter()
+        .map(|field| match field.name == "project_id" {
+            true => format!("{} AS {}", sql_literal(project_id), quoted(&field.name)),
+            false => projected(field),
+        })
+        .join(", ");
     let columns = schema.fields.iter().map(|field| quoted(&field.name)).join(", ");
     let keys = dedup.keys.iter().map(|field| quoted(field)).join(", ");
     let order = dedup.tiebreak.map_or_else(|| keys.clone(), |field| format!("{} DESC NULLS LAST", quoted(field)));

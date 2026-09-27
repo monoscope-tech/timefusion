@@ -1166,3 +1166,119 @@ mod compact_rollup_input_tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod rollup_window_memory_tests {
+    use super::*;
+    use arrow::array::{ArrayRef, BooleanArray, Date32Array, Int64Array, StringArray};
+
+    const SOURCE: &str = "otel_metrics";
+
+    fn wide_metrics(project: &str, identities: i64, version: i64, start: i64, date: i32) -> Result<RecordBatch> {
+        let schema = get_schema(SOURCE).expect("otel_metrics schema").schema_ref();
+        let rows = 0..identities;
+        let columns = schema
+            .fields()
+            .iter()
+            .map(|field| {
+                let text = |value: &dyn Fn(i64) -> String| StringArray::from_iter_values(rows.clone().map(value));
+                let int = |value: &dyn Fn(i64) -> i64| Int64Array::from_iter_values(rows.clone().map(value));
+                let array: ArrayRef = match field.name().as_str() {
+                    "project_id" => Arc::new(text(&|_| project.to_owned())),
+                    "id" => Arc::new(text(&|row| format!("id-{row}"))),
+                    "metric_name" => Arc::new(text(&|row| format!("metric-{}", row % 5))),
+                    "resource___service___name" => Arc::new(text(&|row| format!("service-{}", row % 3))),
+                    "timestamp" => Arc::new(int(&|row| start + (row % 60) * 60_000_000 + row)),
+                    "updated_at" => Arc::new(int(&|_| start + version)),
+                    "value" => Arc::new(int(&|row| if version == 0 { 1_000_000 } else { row + 1 })),
+                    "deleted" => Arc::new(BooleanArray::from_iter(rows.clone().map(|row| Some(version == 1 && row % 7 == 0)))),
+                    "date" => Arc::new(Date32Array::from(vec![date; identities as usize])),
+                    _ if matches!(field.data_type(), arrow::datatypes::DataType::Utf8 | arrow::datatypes::DataType::Utf8View) => {
+                        Arc::new(text(&|row| format!("x{row}")))
+                    }
+                    _ if field.data_type().is_primitive() || field.data_type() == &arrow::datatypes::DataType::Boolean => Arc::new(int(&|row| row)),
+                    _ => arrow::array::new_null_array(field.data_type(), identities as usize),
+                };
+                Ok(arrow::compute::cast(&array, field.data_type())?)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(RecordBatch::try_new(schema, columns)?)
+    }
+
+    /// Prod 2026-09-27: otel_metrics units drove jemalloc ~29 → ~125 GB inside the
+    /// winner-selection sort, in `interleave_dictionaries`. The provider serves
+    /// `project_id` dictionary-encoded, and every merge of N sorted batches rebuilds a
+    /// dictionary over all N inputs per output batch; the slice pins the column anyway.
+    #[tokio::test]
+    async fn rollup_winner_sort_carries_no_dictionary_column() -> Result<()> {
+        use arrow::{
+            array::AsArray,
+            datatypes::{DataType, Float64Type, Int64Type},
+        };
+        use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+        const IDENTITIES: i64 = 20_000;
+        let db = Database::with_config(crate::support::test_helpers::TestConfigBuilder::new("rollup_winner_sort").with_rollups().build()).await?;
+        db.mark_replay_complete();
+        db.cancel_maintenance();
+        let source = get_schema(SOURCE).expect("otel_metrics schema");
+        let spec = source.rollups.iter().find(|spec| spec.derive_from.is_none()).expect("base spec");
+        let project = format!("sort_{}", uuid::Uuid::new_v4().simple());
+        let day = (chrono::Utc::now() - chrono::Duration::days(3)).date_naive();
+        let start = day.and_hms_opt(12, 0, 0).expect("noon").and_utc().timestamp_micros();
+        for version in 0..2 {
+            let batch = wide_metrics(&project, IDENTITIES, version, start, (day - chrono::NaiveDate::default()).num_days() as i32)?;
+            db.insert_records_batch(&project, SOURCE, vec![batch], true, None).await?;
+        }
+
+        let ctx = db.bounded_rollup_maintenance_context(256)?;
+        let provider = {
+            let table_ref = db.resolve_table(&project, SOURCE).await?;
+            let table = table_ref.read().await;
+            let snapshot = Arc::new(table.snapshot()?.snapshot().clone());
+            let files = snapshot.log_data().iter().map(|file| file.path().to_string()).collect();
+            Database::narrow_provider(table.log_store(), snapshot, files, None, None).await?
+        };
+        assert!(
+            matches!(provider.schema().field_with_name("project_id")?.data_type(), DataType::Dictionary(..)),
+            "precondition: the Delta provider serves the partition column dictionary-encoded"
+        );
+        let present = provider.schema().fields().iter().map(|field| field.name().clone()).collect();
+        ctx.register_table("raw", provider)?;
+        let dedup =
+            crate::rollup::SliceDedup { keys: &source.dedup_keys, tiebreak: source.dedup_tiebreak.as_deref(), tombstone: source.tombstone_column.as_deref() };
+        let range = (start, start + 3_600_000_000);
+        let input = crate::rollup::slice_input_sql(source, crate::rollup::SliceInput::Deduplicate(dedup), "raw", &project, range, "", Some(&present));
+        let frame = ctx.sql(&input).await?;
+        ctx.register_table("input", Arc::new(datafusion::datasource::ViewTable::new(frame.logical_plan().clone(), Some(input))))?;
+        let cohort = crate::rollup::build_cohort_sql_range_mode(spec, SOURCE, "input", std::slice::from_ref(&project), &day.to_string(), range, false)?;
+        let plan = ctx.sql(&cohort).await?.create_physical_plan().await?;
+        let mut sorted = Vec::new();
+        plan.apply(|node| {
+            if let Some(sort) = node.downcast_ref::<datafusion::physical_plan::sorts::sort::SortExec>() {
+                sorted.extend(sort.input().schema().fields().iter().map(|field| (field.name().clone(), field.data_type().clone())));
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })?;
+        assert!(!sorted.is_empty(), "the slice must still select winners through a sort");
+        assert!(
+            !sorted.iter().any(|(_, data_type)| matches!(data_type, DataType::Dictionary(..))),
+            "the winner sort must not buffer a dictionary column: {sorted:?}"
+        );
+
+        let report = db.run_unit_once(SOURCE, &project, day, crate::maintenance_coordinator::Operation::BaseRollup, 1, 12).await?;
+        assert_eq!(report.state, Some(crate::maintenance_coordinator::TaskState::Complete));
+        let totals = db
+            .query_delta_only(&format!(
+                "SELECT sum(point_count), sum(value_sum), min(project_id) FROM {} WHERE project_id = '{project}'",
+                spec.table_name(SOURCE)
+            ))
+            .await?;
+        let winners = (0..IDENTITIES).filter(|row| row % 7 != 0);
+        assert_eq!(
+            (totals[0].column(0).as_primitive::<Int64Type>().value(0), totals[0].column(1).as_primitive::<Float64Type>().value(0)),
+            (winners.clone().count() as i64, winners.map(|row| row + 1).sum::<i64>() as f64),
+            "the tier must aggregate exactly the live newest version of each identity"
+        );
+        Ok(())
+    }
+}

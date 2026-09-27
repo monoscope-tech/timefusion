@@ -3111,8 +3111,11 @@ impl Database {
             ctx.register_table(STATES, Arc::new(datafusion::datasource::MemTable::try_new(target_schema.schema_ref(), vec![shard_states])?))?;
             let merge_sql = cohort_sql(STATES, true)?;
             aggregate = collect_watched(&ctx, &merge_sql).await?;
+            // The MemTable owns the per-shard states; they must not outlive the merge.
+            ctx.deregister_table(STATES)?;
         }
         let batches = shaped_for_project(&aggregate)?;
+        drop(aggregate);
         let rows = batches.iter().map(RecordBatch::num_rows).sum::<usize>() as u64;
         // Everything above is read + aggregate; everything below is write.
         let scan_ms = unit_started.elapsed().as_millis() as u64;
