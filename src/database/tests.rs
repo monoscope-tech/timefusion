@@ -688,6 +688,38 @@ async fn a_clean_slice_certifies_only_the_files_it_wholly_covered() -> Result<()
     Ok(())
 }
 
+/// On the unified table another project's files share every date partition and
+/// always overlap in time, but the dedup key includes `project_id`, so they can
+/// never hold a duplicate of this project's rows and must not block its per-file
+/// skip. The same project's overlapping unproven file still must.
+#[tokio::test]
+#[serial]
+async fn per_file_skip_ignores_other_projects_but_not_its_own_overlaps() -> Result<()> {
+    crate::observability::init_local_metrics_for_test();
+    let db = Database::with_config(create_test_config("perfile-per-project")).await?;
+    let day = cert_day();
+    let other = format!("cert_{}", uuid::Uuid::new_v4().simple());
+    let (t1, t2) = (day.start + 3_600_000_000, day.start + 7_200_000_000);
+    insert_a_span(&db, &day.project, "a1", t1).await?;
+    insert_a_span(&db, &day.project, "a3", t2).await?;
+    insert_a_span(&db, &other, "b1", t1).await?;
+
+    let unproven = crate::observability::counter_value(scan_metric_names::CERT_SLICE_FILES_UNPROVEN);
+    assert!(run_dedup_slice(&db, &day.project, day.start, day.half).await?, "the first-half unit must run");
+    let unproven = crate::observability::counter_value(scan_metric_names::CERT_SLICE_FILES_UNPROVEN) - unproven;
+    insert_a_span(&db, &day.project, "a2", t2).await?;
+
+    let table = db.resolve_table(&day.project, "otel_logs_and_spans").await?;
+    let table = table.read().await;
+    let spans = Database::partition_file_spans(&table, &day.project, &format!("date={}", day.date))?;
+    let skips = crate::observability::counter_value(scan_metric_names::CERT_SKIP_FILES);
+    let skippable = db.certified_files_in_partition(&table, &day.project, "otel_logs_and_spans", &day.date.to_string());
+    assert_eq!(skippable.iter().map(|rel| spans[rel]).collect::<Vec<_>>(), vec![Some((t1, t1))], "a1 must skip despite b1; a3 must not despite a2");
+    assert_eq!(crate::observability::counter_value(scan_metric_names::CERT_SKIP_FILES) - skips, 1);
+    assert_eq!(unproven, 0, "another project's file is not this slice's to prove");
+    Ok(())
+}
+
 /// Restored slice evidence must stay `stale`, or a proof about ten minutes comes
 /// back indistinguishable from a proof about a whole day.
 #[tokio::test]

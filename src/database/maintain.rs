@@ -4501,7 +4501,7 @@ impl Database {
         let (mut certified, mut uncertified) = (HashSet::new(), HashSet::new());
         for date in dates {
             let date = date.to_string();
-            let Ok(spans) = Self::partition_file_spans(table, &format!("date={date}")) else { return empty };
+            let Ok(spans) = Self::partition_file_spans(table, project_id, &format!("date={date}")) else { return empty };
             let skippable = self.certified_files_in_partition(table, project_id, table_name, &date);
             for rel in spans.into_keys() {
                 (if skippable.contains(&rel) { &mut certified } else { &mut uncertified }).insert(rel);
@@ -4523,7 +4523,7 @@ impl Database {
     pub(crate) fn certified_files_in_partition(&self, table: &DeltaTable, project_id: &str, table_name: &str, date: &str) -> HashSet<String> {
         let key = (project_id.to_string(), table_name.to_string(), date.to_string());
         let Some(cert) = self.dedup_clean_fp.get(&key).map(|entry| entry.value().clone()) else { return HashSet::new() };
-        let Ok(spans) = Self::partition_file_spans(table, &format!("date={date}")) else { return HashSet::new() };
+        let Ok(spans) = Self::partition_file_spans(table, project_id, &format!("date={date}")) else { return HashSet::new() };
         // A path the certification names but that `spans` no longer holds was compacted
         // away; it cannot vouch for its replacement, so it drops out of the certified side.
         let Ok((_, visibility)) = Self::logical_count_partition_snapshot(table, project_id, date) else { return HashSet::new() };
@@ -4534,8 +4534,12 @@ impl Database {
         crate::read::skippable_certified_files(certified, &uncertified).into_iter().map(str::to_string).collect()
     }
 
-    /// Per-FILE row-timestamp spans for one date partition, keyed by the
+    /// Per-FILE row-timestamp spans for one project's date partition, keyed by the
     /// `project_id=…/…parquet` RELATIVE path.
+    ///
+    /// Scoped to `project_id` because the dedup key includes it: another tenant's
+    /// file in the same unified `date=` can never hold a duplicate, so letting it
+    /// in only manufactures overlaps that block the per-file skip.
     ///
     /// Relative because the two sides of the join spell files differently: a
     /// certification's stored list holds full object-store URIs while the add-actions
@@ -4544,7 +4548,8 @@ impl Database {
     ///
     /// A file with missing statistics maps to `None`, which callers must treat as
     /// overlapping everything — never as empty.
-    pub(crate) fn partition_file_spans(table: &DeltaTable, date_marker: &str) -> Result<HashMap<String, crate::read::FileSpan>> {
+    pub(crate) fn partition_file_spans(table: &DeltaTable, project_id: &str, date_marker: &str) -> Result<HashMap<String, crate::read::FileSpan>> {
+        let project_prefix = format!("project_id={project_id}/");
         let snapshot = table.snapshot()?.snapshot();
         let actions = snapshot.add_actions_table(true)?;
         let Some(paths) = actions.column_by_name("path").cloned() else { return Ok(HashMap::new()) };
@@ -4554,7 +4559,7 @@ impl Database {
             .filter_map(|row| {
                 let path = crate::support::test_helpers::array_get_str(paths.as_ref(), row);
                 let rel = crate::tantivy::search::parquet_rel_of_uri(&path)?.to_string();
-                rel.contains(date_marker).then(|| (rel, Self::valid_at(&min_ts, row).zip(Self::valid_at(&max_ts, row))))
+                (rel.starts_with(&project_prefix) && rel.contains(date_marker)).then(|| (rel, Self::valid_at(&min_ts, row).zip(Self::valid_at(&max_ts, row))))
             })
             .collect())
     }
@@ -5808,7 +5813,7 @@ impl Database {
                     Some(cov) => {
                         let spans = {
                             let table = table_ref.read().await;
-                            Self::partition_file_spans(&table, &format!("date={date}"))
+                            Self::partition_file_spans(&table, project_id, &format!("date={date}"))
                         };
                         // A partition we cannot read spans for proves nothing new.
                         spans.ok().and_then(|spans| {
@@ -5887,7 +5892,7 @@ impl Database {
         }
         let spans = {
             let table = table_ref.read().await;
-            Self::partition_file_spans(&table, &format!("date={date}"))
+            Self::partition_file_spans(&table, project_id, &format!("date={date}"))
         };
         let Ok(spans) = spans else { return };
         let (proved, unproven): (Vec<_>, Vec<_>) = spans.into_iter().partition(|(path, span)| {
@@ -6076,7 +6081,7 @@ impl Database {
                 && !cov.files.is_empty()
                 && let Some(day_window) = clip_to_day(date, (lo, hi))
                 && clean_intervals_cover(&cov.intervals, day_window)
-                && Self::added_paths_miss_window(table, &date.to_string(), &cov.files, &visibility, day_window)
+                && Self::added_paths_miss_window(table, &fp_key.0, &date.to_string(), &cov.files, &visibility, day_window)
             {
                 metrics::counter!(scan_metric_names::CERT_WINDOW_FROM_SLICE_COVERAGE).increment(1);
                 certified_any = true;
@@ -6114,7 +6119,7 @@ impl Database {
                         && !cert.stale
                         && !cert.files.is_empty()
                         && schema_or_default(table_name).dedup_keys.iter().any(|key| key == "timestamp")
-                        && Self::added_files_miss_window(table, &date.to_string(), cert, &visibility, (lo, hi)) =>
+                        && Self::added_files_miss_window(table, &fp_key.0, &date.to_string(), cert, &visibility, (lo, hi)) =>
                 {
                     metrics::counter!(scan_metric_names::CERT_WINDOW_SURVIVED_FP_MOVE).increment(1);
                     certified_any = true;
@@ -6176,13 +6181,15 @@ impl Database {
     /// added file with no statistics (which overlaps everything, the rule
     /// `partition_file_spans` already states for readers). Fails closed, so the
     /// caller falls through to the ordinary fp-moved handling.
-    fn added_files_miss_window(table: &DeltaTable, date: &str, cert: &Certification, live: &crate::read::CountFiles, (lo, hi): (i64, i64)) -> bool {
-        Self::added_paths_miss_window(table, date, &cert.files, live, (lo, hi))
+    fn added_files_miss_window(
+        table: &DeltaTable, project_id: &str, date: &str, cert: &Certification, live: &crate::read::CountFiles, (lo, hi): (i64, i64),
+    ) -> bool {
+        Self::added_paths_miss_window(table, project_id, date, &cert.files, live, (lo, hi))
     }
 
     /// New paths and changed deletion vectors both need a disjoint timestamp span.
     fn added_paths_miss_window(
-        table: &DeltaTable, date: &str, proved_files: &crate::read::CountFiles, live: &crate::read::CountFiles, (lo, hi): (i64, i64),
+        table: &DeltaTable, project_id: &str, date: &str, proved_files: &crate::read::CountFiles, live: &crate::read::CountFiles, (lo, hi): (i64, i64),
     ) -> bool {
         if live == proved_files {
             return true;
@@ -6191,7 +6198,7 @@ impl Database {
         if added.is_empty() {
             return false; // nothing added, yet the fingerprint moved: a REMOVAL, which this cannot reason about
         }
-        let Ok(spans) = Self::partition_file_spans(table, &format!("date={date}")) else { return false };
+        let Ok(spans) = Self::partition_file_spans(table, project_id, &format!("date={date}")) else { return false };
         added_spans_miss_window(added.iter().map(|rel| spans.get(*rel).copied().flatten()), (lo, hi))
     }
 
