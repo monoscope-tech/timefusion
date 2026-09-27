@@ -2341,6 +2341,10 @@ pub struct TelemetryConfig {
     /// Standard OTel var; `none` disables span export (logs/metrics unaffected).
     #[serde(default)]
     pub otel_traces_exporter: Option<String>,
+    /// Sets jemalloc `prof.active` at boot (`--features profiling` builds only),
+    /// which is what makes the baked interval heap dumps write at all.
+    #[serde(default)]
+    pub timefusion_heap_profile_active: bool,
 }
 
 impl TelemetryConfig {
@@ -2396,6 +2400,12 @@ mod tests {
         // zero concurrency would stall the per-index fan-out.
         assert_eq!(derived.search_concurrency(), 1);
         assert_eq!(derived.reader_cache_entries().get(), 1);
+    }
+
+    #[test_case::test_case(&[] => false; "off by default")]
+    #[test_case::test_case(&[("TIMEFUSION_HEAP_PROFILE_ACTIVE", "true")] => true; "env name matches the field")]
+    fn heap_profile_knob(env: &[(&str, &str)]) -> bool {
+        envy::from_iter::<_, TelemetryConfig>(env.iter().map(|(k, v)| (k.to_string(), v.to_string()))).unwrap().timefusion_heap_profile_active
     }
 
     /// A once-hourly drain schedule is never reached by a box that restarts more

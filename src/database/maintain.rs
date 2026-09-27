@@ -3014,6 +3014,8 @@ impl Database {
         let source_fp = fingerprint.finish();
 
         let unit_started = std::time::Instant::now();
+        let heap = crate::observability::HeapPhases::start(|| crate::observability::jemalloc_bytes().map(|bytes| bytes.0));
+        let tasks_running_at_start = crate::observability::maintenance_stats().maintenance_tasks_running.load(Relaxed);
         let batch_rows = if self.config.maintenance.timefusion_rollup_adaptive_batches {
             batch_rows_for(whole_file_bytes, selected_input_rows.unwrap_or(0), self.config.maintenance.timefusion_maintenance_batch_target_bytes)
         } else {
@@ -3100,6 +3102,7 @@ impl Database {
             stats.rollup_scan_projects.fetch_add(1, Relaxed);
             crate::observability::record_rollup_scan_bytes(&key.physical_table, whole_file_bytes);
             let shard_aggregate = collect_watched(&ctx, &aggregate_sql).await.map_err(|error| lease.note_failure(error))?;
+            heap.mark(format!("s{shard}"));
             if hash_shards == 1 {
                 aggregate = shard_aggregate;
             } else {
@@ -3114,6 +3117,7 @@ impl Database {
             // The MemTable owns the per-shard states; they must not outlive the merge.
             ctx.deregister_table(STATES)?;
         }
+        heap.mark("merge");
         let batches = shaped_for_project(&aggregate)?;
         drop(aggregate);
         let rows = batches.iter().map(RecordBatch::num_rows).sum::<usize>() as u64;
@@ -3226,6 +3230,7 @@ impl Database {
             }
         }
         let stage_ms = stage_started.elapsed().as_millis() as u64;
+        heap.mark("stage");
         let commit_started = std::time::Instant::now();
         let target_paths = replaced.iter().map(|add| add.path.clone()).collect::<Vec<_>>();
         // Record the intent HERE — after the tags are stamped and the replace-set is
@@ -3423,6 +3428,7 @@ impl Database {
             // unit is harmlessly retried, while one cleared early and lost to a crash
             // costs the whole scan again.
             self.clear_staged_intent(&[resume_wave.as_str()]);
+            let (heap_peak_delta_mb, heap_phase_deltas_mb) = (heap.peak_delta_mb(), heap.phase_deltas_mb());
             info!(
                 operation = ?key.operation,
                 table = %key.physical_table,
@@ -3436,6 +3442,9 @@ impl Database {
                 batch_rows,
                 selected_input_rows,
                 certified_clean,
+                heap_peak_delta_mb,
+                heap_phase_deltas_mb = %heap_phase_deltas_mb,
+                tasks_running_at_start,
                 event = "maintenance_rollup_published"
             );
             let stats = crate::observability::maintenance_stats();
@@ -3460,6 +3469,9 @@ impl Database {
                     stage_ms,
                     commit_ms,
                     unit_ms,
+                    heap_peak_delta_mb,
+                    heap_phase_deltas_mb = %heap_phase_deltas_mb,
+                    tasks_running_at_start,
                     event = "maintenance_rollup_slow_unit",
                     "a rollup unit took over a minute; phase split attached"
                 );

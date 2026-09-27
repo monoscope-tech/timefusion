@@ -8,7 +8,7 @@ static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 // jemalloc reads this symbol at startup, so the profiler config is baked into the
 // binary (no MALLOC_CONF env; the host is read-only). Sampling is compiled in but
-// inactive — re-arm at runtime via the `prof.active` mallctl.
+// inactive — `TIMEFUSION_HEAP_PROFILE_ACTIVE=true` arms it at boot via `prof.active`.
 // `dirty_decay_ms` must stay non-zero: decay 0 madvises every freed page back to
 // the kernel, which costs significant CPU in page-fault churn under scan load.
 #[cfg(all(feature = "profiling", target_os = "linux"))]
@@ -423,7 +423,7 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
 
     // Start heap+CPU profiling (no-op unless --features profiling on Linux).
     // Early, so the profiles dir exists before jemalloc's first interval dump.
-    timefusion::observability::start(cfg.core.timefusion_data_dir.clone());
+    timefusion::observability::start(cfg.core.timefusion_data_dir.clone(), cfg.telemetry.timefusion_heap_profile_active);
 
     info!("Starting TimeFusion application");
 

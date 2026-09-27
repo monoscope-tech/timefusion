@@ -902,6 +902,63 @@ pub fn jemalloc_bytes() -> Option<(u64, u64, u64, u64, u64)> {
     None
 }
 
+/// jemalloc `allocated` across one unit's phases: per phase, the net change and
+/// the peak above the unit's start. A 1s sampler runs while this lives, so a
+/// burst freed before its phase ends still shows. PROCESS-wide: concurrent work
+/// pollutes it. Inert when `sample` yields `None` (no jemalloc).
+pub struct HeapPhases {
+    sample: fn() -> Option<u64>,
+    state: Option<Arc<Mutex<HeapPhaseState>>>,
+}
+
+struct HeapPhaseState {
+    base: u64,
+    last: u64,
+    peak: u64,
+    phases: Vec<(String, i64, i64)>,
+}
+
+impl HeapPhases {
+    pub fn start(sample: fn() -> Option<u64>) -> Self {
+        let state = sample().map(|now| Arc::new(Mutex::new(HeapPhaseState { base: now, last: now, peak: now, phases: Vec::new() })));
+        if let (Some(state), Ok(runtime)) = (&state, tokio::runtime::Handle::try_current()) {
+            let weak = Arc::downgrade(state);
+            runtime.spawn(async move {
+                let mut tick = tokio::time::interval(Duration::from_secs(1));
+                while let (_, Some(state)) = (tick.tick().await, weak.upgrade()) {
+                    if let Some(now) = sample() {
+                        let mut state = state.lock();
+                        state.peak = state.peak.max(now);
+                    }
+                }
+            });
+        }
+        Self { sample, state }
+    }
+
+    pub fn mark(&self, phase: impl Into<String>) {
+        let (Some(state), Some(now)) = (&self.state, (self.sample)()) else { return };
+        let mut state = state.lock();
+        let mb = |bytes: u64, from: u64| (bytes as i64 - from as i64) >> 20;
+        let entry = (phase.into(), mb(now, state.last), mb(state.peak.max(now), state.base));
+        state.phases.push(entry);
+        (state.last, state.peak) = (now, now);
+    }
+
+    /// Highest `allocated` above the unit's start seen in any phase, in MB.
+    pub fn peak_delta_mb(&self) -> Option<i64> {
+        self.state.as_ref()?.lock().phases.iter().map(|(_, _, peak)| *peak).max()
+    }
+
+    /// `phase:net/peak` in MB, e.g. `s0:+120/+4100,merge:-80/+9000`.
+    pub fn phase_deltas_mb(&self) -> String {
+        self.state.as_ref().map_or_else(
+            || "n/a".to_owned(),
+            |state| state.lock().phases.iter().map(|(phase, net, peak)| format!("{phase}:{net:+}/{peak:+}")).collect::<Vec<_>>().join(","),
+        )
+    }
+}
+
 /// `((component, section), count, total_us, max_us)` for every timed section
 /// entered this process. Unsorted; the caller orders it.
 pub fn section_stats() -> Vec<((&'static str, &'static str), u64, u64, u64)> {
@@ -1950,6 +2007,24 @@ mod tests {
 
     use super::*;
 
+    fn no_jemalloc() -> Option<u64> {
+        None
+    }
+
+    fn scripted_mb() -> Option<u64> {
+        static CALL: AtomicU64 = AtomicU64::new(0);
+        [100, 300, 200].get(CALL.fetch_add(1, Relaxed) as usize).map(|mb| mb << 20)
+    }
+
+    #[test_case::test_case(no_jemalloc => ("n/a".to_owned(), None); "system allocator is inert")]
+    #[test_case::test_case(scripted_mb => ("s0:+200/+200,merge:-100/+200".to_owned(), Some(200)); "net and peak per phase")]
+    fn heap_phases_report(sample: fn() -> Option<u64>) -> (String, Option<i64>) {
+        let phases = HeapPhases::start(sample);
+        phases.mark("s0");
+        phases.mark("merge");
+        (phases.phase_deltas_mb(), phases.peak_delta_mb())
+    }
+
     #[test_case::test_case(3; "exact below four")]
     #[test_case::test_case(1_000; "one ms")]
     #[test_case::test_case(1_000_000; "one second")]
@@ -2118,9 +2193,10 @@ mod imp {
 
     use tracing::{info, warn};
 
-    /// Ensure the artifact dir exists and spawn the pruner + CPU sampler. Call
-    /// once at boot; heap profiling is already active via the baked `malloc_conf`.
-    pub fn start(data_dir: PathBuf) {
+    /// Ensure the artifact dir exists, spawn the pruner + CPU sampler, and arm the
+    /// heap profiler if asked. Call once at boot. The baked `malloc_conf` leaves
+    /// `prof_active:false`, and jemalloc skips interval dumps while inactive.
+    pub fn start(data_dir: PathBuf, heap_profile_active: bool) {
         // MUST equal the parent of the baked jemalloc `prof_prefix` in main.rs:
         // jemalloc does not mkdir its prefix, and silently drops every dump if
         // the directory is missing.
@@ -2133,11 +2209,17 @@ mod imp {
         // env rather than by a rebuild. Heap-dump pruning must stay OUTSIDE it:
         // the sampler can be off while jemalloc is still dumping.
         spawn_heap_pruner(dir.clone());
+        // SAFETY: `prof.active` is a `bool` mallctl and the name is NUL-terminated.
+        let heap = match heap_profile_active.then(|| unsafe { tikv_jemalloc_ctl::raw::write(b"prof.active\0", true) }) {
+            None => "heap profiling inactive (TIMEFUSION_HEAP_PROFILE_ACTIVE unset)".to_owned(),
+            Some(Ok(())) => "heap profiling ACTIVE (interval dumps every 2^lg_prof_interval allocated bytes)".to_owned(),
+            Some(Err(e)) => format!("heap profiling requested but prof.active failed: {e}"),
+        };
         if std::env::var("TIMEFUSION_CPU_PROFILE").is_ok_and(|v| v.eq_ignore_ascii_case("false") || v == "0") {
-            info!("profiling: jemalloc heap auto-dump only — CPU sampler disabled by TIMEFUSION_CPU_PROFILE → {dir:?}");
+            info!("profiling: {heap}; CPU sampler disabled by TIMEFUSION_CPU_PROFILE → {dir:?}");
             return;
         }
-        info!("profiling: enabled (jemalloc heap auto-dump + rolling CPU flamegraph) → {dir:?}");
+        info!("profiling: {heap}; rolling CPU flamegraph enabled → {dir:?}");
         spawn_cpu_sampler(dir);
     }
 
@@ -2253,7 +2335,7 @@ pub use imp::start;
 
 /// No-op without the `profiling` feature (Linux) — callers wire it unconditionally at boot.
 #[cfg(not(all(feature = "profiling", target_os = "linux")))]
-pub fn start(_data_dir: std::path::PathBuf) {}
+pub fn start(_data_dir: std::path::PathBuf, _heap_profile_active: bool) {}
 
 // ===== errors =====
 // Shared `.map_err` helpers; each preserves the original variant and message.
