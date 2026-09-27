@@ -520,6 +520,20 @@ fn add_ts_bounds(add: &deltalake::kernel::Add) -> (Option<i64>, Option<i64>) {
     })
 }
 
+/// Drop empty ranges and every range overlapping another: only overlapping
+/// members can double count, so disjoint neighbours keep their proof.
+fn drop_overlapping_ranges<V>(ranges: &mut std::collections::BTreeMap<(i64, i64), V>) {
+    ranges.retain(|(start, end), _| start < end);
+    let keys: Vec<_> = ranges.keys().copied().collect();
+    let mut reach = i64::MIN;
+    for (index, &(start, end)) in keys.iter().enumerate() {
+        if reach > start || keys.get(index + 1).is_some_and(|next| next.0 < end) {
+            ranges.remove(&(start, end));
+        }
+        reach = reach.max(end);
+    }
+}
+
 /// True when the `Add`'s timestamp statistics PROVE it disjoint from `slice`.
 /// Missing bounds prove nothing, so the file stays a candidate.
 fn stats_disjoint_from(add: &deltalake::kernel::Add, slice: crate::maintenance_coordinator::TimeSlice) -> bool {
@@ -1125,9 +1139,7 @@ impl Database {
                 unproven.entry((project, date)).or_default().push(range);
             }
         }
-        counts.retain(|_, ranges| {
-            ranges.keys().all(|(start, end)| start < end) && ranges.keys().tuple_windows::<(_, _)>().all(|(left, right)| left.1 <= right.0)
-        });
+        counts.values_mut().for_each(drop_overlapping_ranges);
         for ranges in occupied.values_mut().chain(unproven.values_mut()) {
             *ranges = crate::write::mem_buffer::merge_ranges(std::mem::take(ranges));
         }
@@ -9654,6 +9666,17 @@ mod pressure_scaling_tests {
 #[cfg(test)]
 mod date_coverage_recovery_tests {
     use super::*;
+
+    #[test_case::test_case(vec![(0, 8), (6, 12), (12, 24)] => vec![(12, 24)] ; "an overlapping pair drops, its clean neighbour survives")]
+    #[test_case::test_case(vec![(0, 24), (1, 2), (12, 15)] => Vec::<(i64, i64)>::new() ; "overlap with a non-adjacent earlier range")]
+    #[test_case::test_case(vec![(0, 6), (6, 12), (12, 24)] => vec![(0, 6), (6, 12), (12, 24)] ; "touching is not overlapping")]
+    #[test_case::test_case(vec![(0, 6), (6, 6), (9, 7), (12, 24)] => vec![(0, 6), (12, 24)] ; "only the degenerate ranges drop")]
+    #[test_case::test_case(vec![(0, 8), (0, 12), (15, 18)] => vec![(15, 18)] ; "a shared start overlaps")]
+    fn only_overlapping_tier_ranges_lose_their_proof(ranges: Vec<(i64, i64)>) -> Vec<(i64, i64)> {
+        let mut ranges: std::collections::BTreeMap<_, _> = ranges.into_iter().map(|range| (range, ())).collect();
+        drop_overlapping_ranges(&mut ranges);
+        ranges.into_keys().collect()
+    }
 
     /// The read path serves `[day_start, covered_through)` from a date entry, so a hole
     /// anywhere in the run would claim hours no build aggregated: a gap must refuse outright

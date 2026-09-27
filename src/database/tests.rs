@@ -1600,6 +1600,59 @@ async fn recovery_queues_an_interior_gap_between_live_tagged_slices() -> Result<
     Ok(())
 }
 
+/// One overlapping chain in a tier cell must void only its own members: the
+/// cell's disjoint slices stay proven, no-op-skippable and routed, and every
+/// window still answers exactly as raw does.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_overlapping_chain_leaves_its_disjoint_slices_proven() -> Result<()> {
+    use crate::maintenance_coordinator::Operation;
+    const HOUR: i64 = 3_600_000_000;
+    let db = Arc::new(Database::with_config(rollup_backfill_config("overlap-neighbours", 35)).await?);
+    db.cancel_maintenance();
+    let project = format!("ovl_{}", uuid::Uuid::new_v4().simple());
+    let day = (Utc::now() - chrono::Duration::days(3)).date_naive();
+    let day_start = midnight_micros(day);
+    insert_hourly_spans(&db, &project, day_start, 0..24).await?;
+    // (10,13) overlaps (6,12) and (12,18) without containing either, so its publish retires neither.
+    for (hours, offset) in [(6, 0), (6, 6), (6, 12), (6, 18), (3, 10)] {
+        db.run_unit_once("otel_logs_and_spans", &project, day, Operation::BaseRollup, hours, offset).await?;
+    }
+    let tier = rollup_tier(false);
+    let proven = {
+        let table_ref = db.get_or_create_table(&project, &tier).await?;
+        let table = table_ref.read().await;
+        let output = db.rollup_output_coverage("otel_logs_and_spans", (&tier, &table, &project), &HashMap::new())?;
+        let coverage =
+            db.rollup_slice_coverage.iter().find(|entry| entry.key().0 == project && entry.key().2 == tier).expect("published coverage").value().clone();
+        output.ranges(&project, day, &coverage).to_vec()
+    };
+    assert_eq!(proven, [(day_start, day_start + 6 * HOUR), (day_start + 18 * HOUR, day_start + 24 * HOUR)], "only the chain's members lose their proof");
+
+    let mut ctx = Arc::clone(&db).create_session_context();
+    db.setup_session_context(&mut ctx)?;
+    for (lo, hi, mode) in [(0, 6, "full"), (0, 24, "hybrid")] {
+        let sql = format!(
+            "SELECT time_bucket('1 hours', timestamp) AS tb, COUNT(*) AS c FROM otel_logs_and_spans WHERE project_id = '{project}' \
+             AND timestamp >= to_timestamp_micros({}) AND timestamp < to_timestamp_micros({}) GROUP BY 1 ORDER BY 1",
+            day_start + lo * HOUR,
+            day_start + hi * HOUR
+        );
+        let state = ctx.state();
+        let plan = state.optimize(&state.create_logical_plan(&sql).await?)?;
+        let rewrite = db.rollup_sql(&plan, &state).await.map_err(|reason| anyhow::anyhow!("[{lo},{hi}) declined: {}", reason.label()))?;
+        assert_eq!(rewrite.map(|rewrite| rewrite.mode), Some(mode), "[{lo},{hi}) must route from the disjoint slices");
+        // Not a guard for the drop itself: it stays green with overlaps KEPT, since tier reads
+        // collapse a bucket's states on `(timestamp, id)` and `id` ignores the slice.
+        let render = |batches: &[RecordBatch]| arrow::util::pretty::pretty_format_batches(batches).map(|table| table.to_string());
+        assert_eq!(render(&ctx.sql(&sql).await?.collect().await?)?, render(&db.query_delta_only(&sql).await?)?, "[{lo},{hi}) must answer exactly as raw");
+    }
+
+    let rebuilt = async |offset| anyhow::Ok(db.run_unit_once("otel_logs_and_spans", &project, day, Operation::BaseRollup, 6, offset).await?.output_files);
+    assert_eq!(rebuilt(18).await?, 0, "an unchanged disjoint slice completes as a no-op");
+    assert!(rebuilt(6).await? > 0, "a chain member cannot prove its output, so it rebuilds");
+    Ok(())
+}
+
 /// A fresh process must route from the durable coverage ledger at boot: until
 /// `recover_rollup_coverage` replays every tier's Delta log, routing is not attempted
 /// at all, and that replay window is a large share of a short-lived process's uptime.
