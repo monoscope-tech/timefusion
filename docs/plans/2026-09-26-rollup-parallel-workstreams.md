@@ -75,7 +75,7 @@ Status: ⬜ open · 🟡 in progress · ✅ done. Priority is the plan's executi
 | W23 | Dedup certification that survives fingerprint moves (W22 lever) | analysis → build | Stage 5 | Step 1: what moves sealed-day certification, and which moves are dedup-preserving; step 2 (dark carry) only if step 1 finds the volume | `maintain.rs` certification, `commit_wave` | W22 | Claude (timefusion-2e) | 🟡 step 1 done; denial attribution handed off `ws/w23-deny-attribution` (measure 1 h after deploy, then pick lever a/b) |
 | W24 | 24 h status-breakdown shape misses as `unsupported` | analysis | Rollup misses | Why `COALESCE(coalesce(status_code, level)::text, 'null')` never routes | `src/rollup.rs` matcher (test ~3059) | — | Claude (timefusion-2e) | ✅ by design; routing it needs `level` as a dimension (owner decision, see result) |
 | W25 | Deploy rollout availability (32 s unready vs 30 s budget) | analysis | Deploys | Where the client-visible unready interval goes, and fixes | `scripts/deploy/rollout.sh`, swarm spec, `src/main.rs` shutdown | — | Claude (timefusion-2e) | ✅ (4) handed off `ws/w25-rollout-timing`; (1) skipped (unprovable locally); (2)/(3) open |
-| W26 | Capacity matrix: calibrated sim at rows/projects 1/2/4 | analysis | Shared gates | First saturating lane and stability threshold per cell | `maintenance_sim.rs`, prod journal copy | W10 | Claude (timefusion-2e) | ✅ partial: 1x stable; >1x blocked by claim-path cost (see result) |
+| W26 | Capacity matrix: calibrated sim at rows/projects 1/2/4 | analysis | Shared gates | First saturating lane and stability threshold per cell | `maintenance_sim.rs`, prod journal copy | W10 | Claude (timefusion-2e) | ✅ headroom ~2x on 66 workers; saturates at 4x (part 2) |
 | W32 | Maintenance CPU-token cap vs idle cores | analysis → build | Shared gates | With ≥300 tasks due: median 26/48 cores while `cpu_tokens_used` = 66/66; `admission_refused_cpu` 24–83k/day → ~1.5M/day after `d9f00cce` (1 token/64 MiB decoded). Find the resource that binds (store vs cap); staging experiment at a higher cap | `maintenance_coordinator.rs` `AdmissionController::try_acquire_for` / `lag_scaled_cpu_ceiling`; token pricing in `maintain.rs` | W30 | Claude (timefusion-7c) | 🟡 analysis |
 | W33 | Stage 5: fewer repeat dedups of sealed days | analysis → build | Stage 5 | Dedup scans 899 GB/h vs 75 GB/h for BaseRollup (W7) and is steady state (W22); 98.7% of eligible scans denied the skip. Build W23 lever (a) or (b) from a daytime denial sample | `maintain.rs` certification, read-side cert check | W23 | Claude (timefusion-7c) | ⬜ |
 
@@ -566,4 +566,44 @@ python3 bench/staging_seed.py plan   # replay only
 python3 bench/staging_seed.py apply  # copy + commit
 ```
 Edit `DATES` in the script to seed other days.
+
+### W26 part 2 — 2026-09-27 — Claude (timefusion-2e)
+Rerun with the claim index (`ws/w26-claim-index` `d3b6b579`). A cell now takes 3–10 min, where the projects ×2 and ×4
+cells previously did not finish. r1p1 reproduces part 1 exactly, so the index does not change behaviour.
+Same method: prod journal, `--calibrated`, 6 h, 66 workers. These are **scheduler** numbers, not server CPU, memory or IO.
+Unit cost is W10's calibrated mean unit seconds, scaled by rows. Drain is pending ÷ completions/h.
+
+| rows × projects | busy | pending end | slope/h | pending Base / Dedup / Derived | drain |
+| --- | --- | --- | --- | --- | --- |
+| 1 × 1 | 29% | 658 | +64 | 348 / 82 / 228 | 0.25 h |
+| 1 × 2 | 59% | 1,409 | −56 | 723 / 215 / 471 | 0.29 h |
+| 2 × 1 | 63% | 784 | −25 | 462 / 82 / 240 | 0.28 h |
+| 1 × 4 | 93% | 6,054 | +299 | 2,123 / 2,909 / 1,022 | 0.78 h |
+| 2 × 2 | 94% | 3,219 | +123 | 1,138 / 1,566 / 515 | 0.79 h |
+| 4 × 1 | 95% | 1,258 | +96 | 857 / 105 / 296 | 0.59 h |
+| 2 × 4 | 94% | 13,848 | +1,731 | 5,653 / 5,398 / 1,361 (+1,436 Hot) | 3.2 h |
+| 4 × 2 | 95% | 7,423 | +1,080 | 3,242 / 2,657 / 768 (+756 Hot) | 3.2 h |
+| 4 × 4 | still running at the time of writing | | | | |
+
+**Findings:**
+1. **Stability threshold: about 2x today's load.** Every 2x cell (rows or projects) is stable at about 60% busy with
+   a flat or falling queue. Every 4x cell pins the 66 workers at 93–95% and the queue grows. 8x runs away
+   (+1–1.7k/h, drain more than 3 h). So the maintenance scheduler has about 2x headroom, not 4x.
+2. **The first saturating lane depends on the axis.**
+   - Growing **projects** saturates **Dedup** first: 1 × 4 has 2,909 pending Dedup, more than Base.
+   - Growing **rows** saturates **BaseRollup**: 4 × 1 has 857 pending Base against 105 Dedup, because unit seconds
+     scale with rows.
+   - HotPacking backs up only at 8x.
+3. **DerivedRollup does not scale with load (the dependency scaling risk).** Derived completions go 542 → 630 → 820/h
+   at projects 1/2/4, while BaseRollup nearly doubles per step. Derived pending grows 228 → 1,022. Derived units wait on
+   pending base slices (`dependencies_complete`), so derived freshness degrades with pending BaseRollup. Pending base per
+   cell goes 348 → 2,123 (1 × 4) → 5,653 (2 × 4). This is the risk to watch on 1h/1d tiers as tenants grow. The claim
+   index removed the CPU cost of that check, not the waiting.
+4. **Levers, in order:**
+   - Dedup volume per project-day (W33).
+   - Base unit cost per row (Stage 1B/1C, W7's `run-unit` on staging).
+   - More workers only after those two, because at 95% busy the queue grows by work count, not by claim cost.
+
+**Caveats:** mean-cost units, with no stragglers or memory or IO contention. The rows axis scales unit seconds
+linearly. Numbers are relative to the 02:21Z journal's load.
 
