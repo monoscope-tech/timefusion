@@ -552,3 +552,18 @@ finishing (more than 13x), so I stopped the matrix. A 5 s sample of the 4x cell:
 - Then rerun the matrix. Rows × projects 2x/4x cells are then minutes each.
 - Artifacts: `scratchpad/matrix/{run.sh,report.py,r1_p1.json}`, `r1p4.sample`.
 
+### Staging seed — 2026-09-27 — Claude (timefusion-7c)
+`s3://timefusion-eu/timefusion-staging/otel_logs_and_spans` is a version-0 Delta table holding prod's active files for
+2026-09-25 and 2026-09-26 at prod version 686219: 35 data files and 18 DV files, 8.13 GB. The add actions are
+byte-identical to prod's (tags, stats, DVs); the table id is new. Rollup tables and sidecars start empty, so a staging
+process rebuilds them, which is the W32 step-2 workload.
+Reproduce (server-side copies; every write is asserted to sit under `timefusion-staging/`; it refuses a non-empty
+staging `_delta_log`):
+```
+set -a; source .env.prod; set +a
+export AWS_REGION=de AWS_REQUEST_CHECKSUM_CALCULATION=when_required AWS_RESPONSE_CHECKSUM_VALIDATION=when_required
+python3 bench/staging_seed.py plan   # replay only
+python3 bench/staging_seed.py apply  # copy + commit
+```
+Edit `DATES` in the script to seed other days.
+
