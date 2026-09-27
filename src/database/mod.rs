@@ -634,6 +634,7 @@ impl ScanMetrics {
             metrics::counter!(name).increment(1);
         }
         metrics::histogram!("timefusion.scan.latency_seconds").record(duration_us as f64 / 1_000_000.0);
+        crate::observability::SCAN_LATENCY.record(std::time::Duration::from_micros(duration_us));
     }
 
     /// A certification ended: record its survival in the dwell histogram. The end
@@ -655,6 +656,7 @@ impl ScanMetrics {
     pub fn record_pgwire_query(&self, duration_us: u64) {
         metrics::counter!(scan_metric_names::PGWIRE_TOTAL).increment(1);
         metrics::histogram!("timefusion.pgwire.query_latency_seconds").record(duration_us as f64 / 1_000_000.0);
+        crate::observability::PGWIRE_LATENCY.record(std::time::Duration::from_micros(duration_us));
     }
 
     /// Percentile of the full `ProjectRoutingTable::scan` call, in microseconds.
@@ -1191,6 +1193,17 @@ pub fn queries_starving(seen: &std::sync::atomic::AtomicU64) -> bool {
     let now = crate::observability::counter_value("timefusion.scan.heavy_query_queue_timeout");
     now > seen.swap(now, std::sync::atomic::Ordering::Relaxed)
 }
+
+/// `queries_starving` for a heavy claim path: a yielded claim tick is counted.
+pub fn claim_yields_to_queries(seen: &std::sync::atomic::AtomicU64) -> bool {
+    let starving = queries_starving(seen);
+    if starving {
+        metrics::counter!(CLAIMS_YIELDED_TO_QUERIES).increment(1);
+    }
+    starving
+}
+
+pub const CLAIMS_YIELDED_TO_QUERIES: &str = "timefusion.maintenance.claims_yielded_to_queries";
 
 /// Why the rollup backfill must not enqueue this pass, or `None` to proceed.
 ///

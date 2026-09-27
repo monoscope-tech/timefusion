@@ -1691,46 +1691,117 @@ impl RequestClassRouter {
     }
 }
 
+#[derive(Clone, Copy)]
+enum StoreOp {
+    Get,
+    GetRange,
+    Head,
+    Put,
+    Multipart,
+    Delete,
+    List,
+    Copy,
+}
+
+pub struct StoreOpStats {
+    pub inflight: AtomicU64,
+    pub latency: crate::observability::LatencyHistogram,
+}
+
+const fn op_stats(name: &'static str) -> (&'static str, StoreOpStats) {
+    (name, StoreOpStats { inflight: AtomicU64::new(0), latency: crate::observability::LatencyHistogram::new() })
+}
+
+/// Requests that reach the real store, indexed by `StoreOp`.
+pub static STORE_OPS: [(&str, StoreOpStats); 8] = [
+    op_stats("get"),
+    op_stats("get_range"),
+    op_stats("head"),
+    op_stats("put"),
+    op_stats("put_multipart"),
+    op_stats("delete"),
+    op_stats("list"),
+    op_stats("copy"),
+];
+
+/// Holds a real-store request in flight until dropped, then records its latency,
+/// so a cancelled request cannot leak the in-flight count.
+struct StoreRequest(&'static StoreOpStats, std::time::Instant);
+
+impl StoreRequest {
+    fn start(op: StoreOp) -> Self {
+        let stats = &STORE_OPS[op as usize].1;
+        stats.inflight.fetch_add(1, Ordering::Relaxed);
+        Self(stats, std::time::Instant::now())
+    }
+
+    fn stream<T: Send + 'static>(op: StoreOp, stream: BoxStream<'static, T>) -> BoxStream<'static, T> {
+        use futures::StreamExt;
+        let request = Self::start(op);
+        stream.inspect(move |_| _ = &request).boxed()
+    }
+}
+
+impl Drop for StoreRequest {
+    fn drop(&mut self) {
+        self.0.inflight.fetch_sub(1, Ordering::Relaxed);
+        self.0.latency.record(self.1.elapsed());
+    }
+}
+
 #[async_trait]
 impl ObjectStore for RequestClassRouter {
     async fn put_opts(&self, location: &Path, payload: PutPayload, opts: PutOptions) -> ObjectStoreResult<PutResult> {
+        let _request = StoreRequest::start(StoreOp::Put);
         self.route(location).put_opts(location, payload, opts).await
     }
 
     async fn put_multipart_opts(&self, location: &Path, opts: PutMultipartOptions) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
         // Multipart is bulk by definition — never log class, whatever the path.
+        let _request = StoreRequest::start(StoreOp::Multipart);
         self.data.put_multipart_opts(location, opts).await
     }
 
     async fn get_opts(&self, location: &Path, options: GetOptions) -> ObjectStoreResult<GetResult> {
+        let op = if options.head {
+            StoreOp::Head
+        } else if options.range.is_some() {
+            StoreOp::GetRange
+        } else {
+            StoreOp::Get
+        };
+        let _request = StoreRequest::start(op);
         self.route(location).get_opts(location, options).await
     }
 
     async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> ObjectStoreResult<Vec<Bytes>> {
+        let _request = StoreRequest::start(StoreOp::GetRange);
         self.route(location).get_ranges(location, ranges).await
     }
 
     fn delete_stream(&self, locations: BoxStream<'static, ObjectStoreResult<Path>>) -> BoxStream<'static, ObjectStoreResult<Path>> {
         // A mixed-class stream can't be split without buffering it; log cleanup
         // is off the commit lock and already bounded by CHECKPOINT_OP_TIMEOUT.
-        self.data.delete_stream(locations)
+        StoreRequest::stream(StoreOp::Delete, self.data.delete_stream(locations))
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
-        self.route_prefix(prefix).list(prefix)
+        StoreRequest::stream(StoreOp::List, self.route_prefix(prefix).list(prefix))
     }
 
     fn list_with_offset(&self, prefix: Option<&Path>, offset: &Path) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
-        self.route_prefix(prefix).list_with_offset(prefix, offset)
+        StoreRequest::stream(StoreOp::List, self.route_prefix(prefix).list_with_offset(prefix, offset))
     }
 
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> ObjectStoreResult<ListResult> {
+        let _request = StoreRequest::start(StoreOp::List);
         self.route_prefix(prefix).list_with_delimiter(prefix).await
     }
 
     async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> ObjectStoreResult<()> {
         // Route on the DESTINATION: `rename_if_not_exists` into `_delta_log` is
         // the commit-entry write on non-conditional-put stores.
+        let _request = StoreRequest::start(StoreOp::Copy);
         self.route(to).copy_opts(from, to, options).await
     }
 }
@@ -1740,6 +1811,27 @@ mod tests {
     use object_store::{ObjectStoreExt, memory::InMemory};
 
     use super::*;
+
+    /// The in-flight guard is released and the latency recorded whether a
+    /// real-store request completes or is cancelled mid-flight.
+    #[tokio::test]
+    async fn store_request_guard_survives_cancellation() {
+        let mem = Arc::new(InMemory::new());
+        let path = Path::from("a.parquet");
+        mem.put(&path, Bytes::from_static(b"x").into()).await.unwrap();
+        let (slow, _, _) = counting_store(&mem, Duration::from_secs(3600));
+        let router = Arc::new(RequestClassRouter::new(slow.clone(), slow));
+        let [(_, get), _, (_, head), ..] = &STORE_OPS;
+        router.head(&path).await.unwrap();
+        assert_eq!((head.inflight.load(Ordering::Relaxed), head.latency.total()), (0, 1));
+        let task = tokio::spawn(async move { router.get(&path).await.map(|_| ()) });
+        while get.inflight.load(Ordering::Relaxed) == 0 {
+            tokio::task::yield_now().await;
+        }
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!((get.inflight.load(Ordering::Relaxed), get.latency.total()), (0, 1));
+    }
 
     /// Removes a test's cache dir when the test ends, including on panic.
     struct CacheDirGuard(PathBuf);

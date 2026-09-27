@@ -2591,7 +2591,7 @@ impl Database {
         // signal self-clears the moment timeouts stop. Prod 2026-09-24: the first
         // REAL rebuild wave took a 24h count from 1.7s to 84s — every other
         // health gate (memory, flush, buffer) stayed green throughout.
-        if crate::database::queries_starving(&self.claims_query_timeouts_seen) {
+        if crate::database::claim_yields_to_queries(&self.claims_query_timeouts_seen) {
             return Ok(false);
         }
         let operation = selection.operation();
@@ -3811,7 +3811,7 @@ impl Database {
     async fn run_coordinator_compaction_selected(&self, selection: TaskSelection<'_>) -> Result<bool> {
         // Same customer-first yield as the rollup lane; one shared last-seen is
         // fine here — either lane skipping a tick relieves the same store.
-        if crate::database::queries_starving(&self.claims_query_timeouts_seen) {
+        if crate::database::claim_yields_to_queries(&self.claims_query_timeouts_seen) {
             return Ok(false);
         }
         let operation = selection.operation();

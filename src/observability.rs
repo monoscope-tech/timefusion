@@ -7,7 +7,7 @@ use std::{
         Arc, LazyLock, OnceLock, Weak,
         atomic::{AtomicU64, Ordering::Relaxed},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use parking_lot::Mutex;
@@ -236,6 +236,71 @@ fn publish_local(local: LocalRecorder, recorder: impl metrics::Recorder + Sync +
 /// `None` if metrics weren't initialized or the name has never recorded a value.
 pub fn histogram_quantile(name: &str, p: f64) -> Option<f64> {
     LOCAL_HISTOGRAMS.get()?.0.get(name)?.lock().quantile(p)
+}
+
+const LATENCY_BUCKETS: usize = 160;
+const LATENCY_WINDOW: Duration = Duration::from_secs(60);
+
+/// Lock-free log-linear histogram of microseconds, four buckets per power of two.
+/// Unlike `histogram_quantile` (since boot), `recent_ms` reads only the last one
+/// to two `LATENCY_WINDOW`s, so an exported p95 tracks the present.
+pub struct LatencyHistogram {
+    counts: [AtomicU64; LATENCY_BUCKETS],
+    /// (current window start, snapshot at previous rotation, snapshot at current rotation)
+    window: Mutex<Option<(Instant, [u64; LATENCY_BUCKETS], [u64; LATENCY_BUCKETS])>>,
+}
+
+pub static PGWIRE_LATENCY: LatencyHistogram = LatencyHistogram::new();
+pub static SCAN_LATENCY: LatencyHistogram = LatencyHistogram::new();
+
+fn latency_bucket(us: u64) -> usize {
+    let bucket = if us < 4 {
+        us
+    } else {
+        let o = 63 - us.leading_zeros() as u64;
+        ((o - 1) << 2) | ((us >> (o - 2)) & 3)
+    };
+    (bucket as usize).min(LATENCY_BUCKETS - 1)
+}
+
+fn latency_bucket_floor_us(b: usize) -> u64 {
+    if b < 4 { b as u64 } else { (4 + (b as u64 & 3)) << ((b >> 2) - 1) }
+}
+
+impl LatencyHistogram {
+    pub const fn new() -> Self {
+        Self { counts: [const { AtomicU64::new(0) }; LATENCY_BUCKETS], window: parking_lot::const_mutex(None) }
+    }
+
+    pub fn record(&self, elapsed: Duration) {
+        self.counts[latency_bucket(elapsed.as_micros() as u64)].fetch_add(1, Relaxed);
+    }
+
+    pub fn total(&self) -> u64 {
+        self.counts.iter().map(|c| c.load(Relaxed)).sum()
+    }
+
+    /// Quantile in ms over the recent window; `None` if the window saw no samples.
+    pub fn recent_ms(&self, p: f64) -> Option<f64> {
+        self.recent_ms_at(p, Instant::now())
+    }
+
+    fn recent_ms_at(&self, p: f64, now: Instant) -> Option<f64> {
+        let snap: [u64; LATENCY_BUCKETS] = std::array::from_fn(|i| self.counts[i].load(Relaxed));
+        let mut window = self.window.lock();
+        let (start, prev, cur) = window.get_or_insert((now, [0; LATENCY_BUCKETS], [0; LATENCY_BUCKETS]));
+        if now.saturating_duration_since(*start) >= LATENCY_WINDOW {
+            (*start, *prev, *cur) = (now, *cur, snap);
+        }
+        let delta: Vec<u64> = snap.iter().zip(prev.iter()).map(|(s, p)| s - p).collect();
+        let rank = (p * delta.iter().sum::<u64>() as f64).ceil().max(1.0) as u64;
+        let mut seen = 0;
+        let b = delta.iter().position(|c| {
+            seen += c;
+            seen >= rank
+        })?;
+        Some((latency_bucket_floor_us(b) + latency_bucket_floor_us(b + 1)) as f64 / 2_000.0)
+    }
 }
 
 /// Read back the current value of a name recorded via `metrics::counter!()`.
@@ -584,17 +649,46 @@ pub fn init_metrics(
     // `timefusion_stats`; these publish the same numbers so they get a history.
     // Milliseconds, not seconds: an integer gauge truncates every sub-second
     // query to 0.
+    // Windowed (last 1-2 minutes), not since boot: a since-boot p95 cannot show a
+    // regression or its recovery.
     macro_rules! latency_gauge {
-        ($id:literal, $desc:literal, $hist:literal, $p:expr) => {
-            observe!(gauge $id, $desc, (histogram_quantile($hist, $p).unwrap_or(0.0) * 1_000.0) as u64);
+        ($id:literal, $desc:literal, $hist:expr, $p:expr) => {
+            observe!(gauge $id, $desc, $hist.recent_ms($p).unwrap_or(0.0) as u64);
         };
     }
-    latency_gauge!("timefusion.pgwire.query_latency_p50_ms", "Median pgwire end-to-end query latency", "timefusion.pgwire.query_latency_seconds", 0.5);
-    latency_gauge!("timefusion.pgwire.query_latency_p95_ms", "p95 pgwire end-to-end query latency", "timefusion.pgwire.query_latency_seconds", 0.95);
-    latency_gauge!("timefusion.pgwire.query_latency_p99_ms", "p99 pgwire end-to-end query latency", "timefusion.pgwire.query_latency_seconds", 0.99);
-    latency_gauge!("timefusion.scan.latency_p50_ms", "Median ProjectRoutingTable::scan duration", "timefusion.scan.latency_seconds", 0.5);
-    latency_gauge!("timefusion.scan.latency_p95_ms", "p95 ProjectRoutingTable::scan duration", "timefusion.scan.latency_seconds", 0.95);
-    latency_gauge!("timefusion.scan.latency_p99_ms", "p99 ProjectRoutingTable::scan duration", "timefusion.scan.latency_seconds", 0.99);
+    latency_gauge!("timefusion.pgwire.query_latency_p50_ms", "Median pgwire end-to-end query latency", PGWIRE_LATENCY, 0.5);
+    latency_gauge!("timefusion.pgwire.query_latency_p95_ms", "p95 pgwire end-to-end query latency", PGWIRE_LATENCY, 0.95);
+    latency_gauge!("timefusion.pgwire.query_latency_p99_ms", "p99 pgwire end-to-end query latency", PGWIRE_LATENCY, 0.99);
+    latency_gauge!("timefusion.scan.latency_p50_ms", "Median ProjectRoutingTable::scan duration", SCAN_LATENCY, 0.5);
+    latency_gauge!("timefusion.scan.latency_p95_ms", "p95 ProjectRoutingTable::scan duration", SCAN_LATENCY, 0.95);
+    latency_gauge!("timefusion.scan.latency_p99_ms", "p99 ProjectRoutingTable::scan duration", SCAN_LATENCY, 0.99);
+    // Requests that reached the real object store (below the foyer cache).
+    let store_ops = || crate::storage::STORE_OPS.iter().map(|(op, s)| (s, [KeyValue::new("op", *op)]));
+    meter
+        .u64_observable_gauge("timefusion.store.inflight_requests")
+        .with_description("Object-store requests in flight below the cache, by op")
+        .with_callback(move |obs| store_ops().for_each(|(s, attrs)| obs.observe(s.inflight.load(Relaxed), &attrs)))
+        .build();
+    meter
+        .u64_observable_counter("timefusion.store.requests")
+        .with_description("Object-store requests completed or cancelled below the cache, by op")
+        .with_callback(move |obs| store_ops().for_each(|(s, attrs)| obs.observe(s.latency.total(), &attrs)))
+        .build();
+    meter
+        .f64_observable_gauge("timefusion.store.request_ms")
+        .with_description(
+            "Object-store request latency below the cache over the last 1-2 minutes, by op and quantile (p50/p95/p99). Absent when the op saw no requests",
+        )
+        .with_callback(move |obs| {
+            for (op, s) in crate::storage::STORE_OPS.iter() {
+                for (q, p) in [("p50", 0.5), ("p95", 0.95), ("p99", 0.99)] {
+                    if let Some(ms) = s.latency.recent_ms(p) {
+                        obs.observe(ms, &[KeyValue::new("op", *op), KeyValue::new("quantile", q)]);
+                    }
+                }
+            }
+        })
+        .build();
 
     observe!(gauge
         "timefusion.maintenance.sealed_compaction_debt_bytes",
@@ -1842,6 +1936,31 @@ mod tests {
     };
 
     use super::*;
+
+    #[test_case::test_case(3; "exact below four")]
+    #[test_case::test_case(1_000; "one ms")]
+    #[test_case::test_case(1_000_000; "one second")]
+    #[test_case::test_case(123_456_789; "two minutes")]
+    fn latency_bucket_brackets_its_value(us: u64) {
+        let b = latency_bucket(us);
+        assert!(latency_bucket_floor_us(b) <= us && us < latency_bucket_floor_us(b + 1));
+    }
+
+    /// A burst of slow requests stops dominating the p95 once it ages out of the
+    /// window: step = (windows advanced before recording, ms recorded ×100, expected p95 ms).
+    #[test]
+    fn recent_quantile_forgets_a_burst_after_it_ages_out() {
+        let (h, t0) = (LatencyHistogram::new(), Instant::now());
+        let cases = [(0, 1_000, Some(1_000.0)), (1, 0, Some(1_000.0)), (2, 2, Some(2.0)), (3, 0, None)];
+        for (windows, ms, expected) in cases {
+            (0..if ms > 0 { 100 } else { 0 }).for_each(|_| h.record(Duration::from_millis(ms)));
+            let got = h.recent_ms_at(0.95, t0 + LATENCY_WINDOW * windows);
+            assert_eq!(got.is_some(), expected.is_some(), "window {windows}: {got:?}");
+            if let (Some(g), Some(e)) = (got, expected) {
+                assert!((g - e).abs() / e < 0.25, "window {windows}: p95 {g} vs {e}");
+            }
+        }
+    }
 
     /// Per-lane work reaches OTel with its low-cardinality labels, and the
     /// `timefusion_stats` atomics keep counting as before.

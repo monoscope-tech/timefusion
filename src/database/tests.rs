@@ -8834,3 +8834,17 @@ fn a_date_partition_or_between_predicate_counts_as_bounded(predicate: Expr) -> b
 fn bounded_otel_scan_requires_a_project_and_bound(table: &str, filters: Vec<Expr>, limit: Option<usize>, lower_bound: bool) -> Option<&'static str> {
     ProjectRoutingTable::raw_otel_scan_reason(table, &filters, limit, lower_bound)
 }
+
+/// A heavy claim tick skipped for starving queries is counted once per skip.
+#[test]
+fn claims_yielded_to_queries_counts_each_skipped_tick() {
+    crate::observability::init_local_metrics_for_test();
+    let seen = std::sync::atomic::AtomicU64::new(0);
+    let yielded = || crate::observability::counter_value(CLAIMS_YIELDED_TO_QUERIES);
+    assert!(!claim_yields_to_queries(&seen));
+    metrics::counter!(scan_metric_names::HEAVY_QUERY_QUEUE_TIMEOUT).increment(1);
+    assert!(claim_yields_to_queries(&seen));
+    assert_eq!(yielded(), 1);
+    assert!(!claim_yields_to_queries(&seen), "no new timeout, no yield");
+    assert_eq!(yielded(), 1);
+}
