@@ -70,6 +70,7 @@ Status: ⬜ open · 🟡 in progress · ✅ done. Priority is the plan's executi
 | W23 | Dedup certification that survives fingerprint moves (W22 lever) | analysis → build | Stage 5 | Step 1: what moves sealed-day certification, and which moves are dedup-preserving; step 2 (dark carry) only if step 1 finds the volume | `maintain.rs` certification, `commit_wave` | W22 | Claude (timefusion-2e) | 🟡 step 1 done; denial attribution handed off `ws/w23-deny-attribution` (measure 1 h after deploy, then pick lever a/b) |
 | W24 | 24 h status-breakdown shape misses as `unsupported` | analysis | Rollup misses | Why `COALESCE(coalesce(status_code, level)::text, 'null')` never routes | `src/rollup.rs` matcher (test ~3059) | — | Claude (timefusion-2e) | ✅ by design; routing it needs `level` as a dimension (owner decision, see result) |
 | W25 | Deploy rollout availability (32 s unready vs 30 s budget) | analysis | Deploys | Where the client-visible unready interval goes, and fixes | `scripts/deploy/rollout.sh`, swarm spec, `src/main.rs` shutdown | — | Claude (timefusion-2e) | ✅ (4) handed off `ws/w25-rollout-timing`; (1) skipped (unprovable locally); (2)/(3) open |
+| W26 | Capacity matrix: calibrated sim at rows/projects 1/2/4 | analysis | Shared gates | First saturating lane and stability threshold per cell | `maintenance_sim.rs`, prod journal copy | W10 | Claude (timefusion-2e) | ✅ partial: 1x stable; >1x blocked by claim-path cost (see result) |
 
 Later stages (2, 4, 5, 6, 1C, certified-clean activation, adaptive batches) stay **conditional** on W2/W7
 numbers, per the plan; do not start them without a measured residual cost.
@@ -503,4 +504,44 @@ targets scaled by 3/21, and a week of built base slices. It asserts every operat
 ≤10%/h of its level, and runs in ~6 s. `cargo lint` is clean and the sim tests pass 33/33.
 **Use:** 2x/4x deltas via `--rows` / `--projects` / `--streams` on top of `--calibrated`. Refit the rates when prod's
 operation mix moves.
+
+### W26 result — 2026-09-27 — Claude (timefusion-2e)
+**Method:** `timefusion sim <prod journal> --calibrated --hours 6 --workers 66 --now 02:21Z` over a matrix of
+`--rows` 1/2/4 × `--projects` 1/2/4. Built on `ws/w26-sim-base-tier` (`74de5bee`), which makes the sim publish
+`base_tier_ready` as prod's planner does. Before that fix, 98% of sim CPU was in `dependencies_complete`.
+These are **scheduler** numbers: unit costs are W10's calibrated means, not server resources. Drain is an estimate.
+
+| cell | pending end | slope | util | worker-s/row | pending BaseRollup | drain |
+| --- | --- | --- | --- | --- | --- | --- |
+| rows 1x, projects 1x | 658 | +64/h | 29% | 0.074 | 348 | ~0.25 h |
+
+Per hour at 1x: Base 1,358, Dedup 465, Derived 542, Hot 220, Sealed 28, matching W10's calibration.
+
+**Only the 1x cell finished.** It ran for about 9 min. The `projects 2x` and `4x` cells each passed 2 h of CPU without
+finishing (more than 13x), so I stopped the matrix. A 5 s sample of the 4x cell:
+
+- About 95% of samples are in `TaskJournal::dependencies_complete`, reached from `claim_candidates`.
+- Within that: SipHash of `TaskKey`, the scan of active BaseRollup candidates, and the fallback walk over **every**
+  task (`snapshot.tasks`, 127,242 in the prod journal, 53,331 of them complete BaseRollup) for each DerivedRollup
+  candidate not covered by `cached_base_tier_proven`.
+- Each claim therefore costs O(derived candidates × journal size). Both factors scale with projects, and so does
+  the number of claims.
+
+**Findings:**
+1. **At 1x the scheduler is stable, with headroom.** Utilization is 29% of 66 workers and pending grows slowly
+   (+64/h). The drain estimate is under an hour.
+2. **The first thing to saturate as projects grow is the coordinator's claim path, not a worker lane.** Claim cost
+   is superlinear in projects. No per-lane threshold for 2x/4x can be read until this is fixed, because the sim
+   spends its time claiming.
+3. **Prod exposure is real but unmeasured.** Prod runs the same `claim_next`. It short-circuits whenever
+   `cached_base_tier_proven` hits, and the planner refreshes that cache every pass. The fallback is also a full
+   journal walk per derived candidate, so prod's cost grows with journal size (127k tasks) × derived pending.
+   There is no claim-latency metric to check this.
+
+**Next (proposed, not built):**
+- (a) Export claim-pass duration from `claim_next`, so prod's exposure is measured rather than inferred.
+- (b) Index complete BaseRollup slices by (source, project, base table), so the fallback reads only its own
+  slices instead of the journal.
+- Then rerun the matrix. Rows × projects 2x/4x cells are then minutes each.
+- Artifacts: `scratchpad/matrix/{run.sh,report.py,r1_p1.json}`, `r1p4.sample`.
 
