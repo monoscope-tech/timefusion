@@ -63,6 +63,7 @@ Status: ⬜ open · 🟡 in progress · ✅ done. Priority is the plan's executi
 | W21 | Carry the rollup witness across rollup-irrelevant version appends | build (lane 2) | Stage 0/2 | hashes-only MoR UPDATEs keep today's slices readable; dark flag + shadow counter; failing-first + guard tests | `dml.rs` append, `database/write.rs` flush commit, `maintain.rs` WitnessCarry | W17 | Claude (timefusion-2e) | ✅ on master `54327594` (dark) |
 | W22 | Dedup scan share: steady state or backlog? (Stage 5 input) | analysis | Stage 5 | Is dedup's ~12x larger physical scan a draining backlog or recurring work | prod logs, exported `pending_dedup` | W7 | Claude (timefusion-2e) | ✅ steady state (see result) |
 | W23 | Dedup certification that survives fingerprint moves (W22 lever) | analysis → build | Stage 5 | Step 1: what moves sealed-day certification, and which moves are dedup-preserving; step 2 (dark carry) only if step 1 finds the volume | `maintain.rs` certification, `commit_wave` | W22 | Claude (timefusion-2e) | 🟡 step 1 done; denial attribution handed off `ws/w23-deny-attribution` (measure 1 h after deploy, then pick lever a/b) |
+| W24 | 24 h status-breakdown shape misses as `unsupported` | analysis | Rollup misses | Why `COALESCE(coalesce(status_code, level)::text, 'null')` never routes | `src/rollup.rs` matcher (test ~3059) | — | Claude (timefusion-2e) | ✅ by design; routing it needs `level` as a dimension (owner decision, see result) |
 
 Later stages (2, 4, 5, 6, 1C, certified-clean activation, adaptive batches) stay **conditional** on W2/W7
 numbers, per the plan; do not start them without a measured residual cost.
@@ -372,4 +373,17 @@ Breaking the classifier turns 3 of the 4 red. The base-inheritance rule cannot b
 because `dashboard_1h_v2` restates every base column; the test says so.
 **Read it as:** after deploy, the `relevant=false` share per tier is the volume that per-tier invalidation could
 keep readable, beyond W21's all-tiers rule (session enrichment on the dashboard tiers, for example).
+
+### W24 result — 2026-09-27 — Claude (timefusion-2e)
+**Finding:** this is not a matcher bug. `an_unservable_group_expression_is_counted_rather_than_silent`
+(`rollup.rs` ~3059) asserts this exact shape declines. When `status_code` is NULL, the group key falls back to
+`level`, and no tier declares `level`. Only a variant whose predicate makes the fallback unreachable
+(`status_code IS NOT NULL`) routes. The `now()` placeholder, bucket spelling and pgwire path play no part.
+**Cost of routing it:** in 12:00–13:00 on 09-26, 505,652 raw rows (44% with null `status_code`) formed 774 tier
+groups whether or not `level` was a dimension. So `level` adds no tier rows. The cost is the spec change itself:
+a new tier version (`dashboard_1m_v4` / `1h_v3`) plus a re-backfill.
+**Options (owner):**
+1. Add `level` in a v4, batched with any other dimension change.
+2. monoscope splits the chart: the `status_code IS NOT NULL` part routes, and the remainder stays raw.
+3. Leave it.
 
