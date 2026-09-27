@@ -2181,15 +2181,12 @@ impl Database {
     /// second copy of this rule is how the pre-scan check and the post-write
     /// safety net drift apart, and the disagreeing one double counts.
     fn covering_slice_for(add: &deltalake::kernel::Add, key: &crate::maintenance_coordinator::TaskKey) -> Option<(i64, i64)> {
-        Self::containing_slice_for(add, key).filter(|&range| range != (key.slice.start_micros, key.slice.end_micros))
-    }
-
-    /// The slice of `add` when it is the same project's and contains `key`'s, EQUAL
-    /// included. Such a file strands every child of a split: each sees it as strictly
-    /// wider and escalates back to the parent, and only a whole-width publish retires it.
-    fn containing_slice_for(add: &deltalake::kernel::Add, key: &crate::maintenance_coordinator::TaskKey) -> Option<(i64, i64)> {
         let (start, end) = Self::slice_tag_range(add)?;
-        (Self::tag_project(add) == Some(key.project_id.as_str()) && start <= key.slice.start_micros && end >= key.slice.end_micros).then_some((start, end))
+        (Self::tag_project(add) == Some(key.project_id.as_str())
+            && (start, end) != (key.slice.start_micros, key.slice.end_micros)
+            && start <= key.slice.start_micros
+            && end >= key.slice.end_micros)
+            .then_some((start, end))
     }
 
     fn packed_rollup_repair_allowed(&self, key: &crate::maintenance_coordinator::TaskKey) -> bool {
@@ -2908,31 +2905,15 @@ impl Database {
         //
         // Absent or unreadable target tier means "not covered": the conservative
         // direction is to do the work, exactly as before this check existed.
-        let mut split_strands_children = false;
         if let Ok(target_ref) = self.resolve_table(&key.project_id, &key.physical_table).await {
-            let containing = {
+            let covering = {
                 let target = target_ref.read().await;
-                target
-                    .snapshot()
-                    .ok()
-                    .map(|snapshot| snapshot.log_data().iter().filter_map(|file| Self::containing_slice_for(&add_action(&file), &key)).collect::<Vec<_>>())
-                    .unwrap_or_default()
+                target.snapshot().ok().and_then(|snapshot| snapshot.log_data().iter().find_map(|file| Self::covering_slice_for(&add_action(&file), &key)))
             };
-            let exact = (key.slice.start_micros, key.slice.end_micros);
-            if let Some(covering) = containing.iter().copied().find(|&range| range != exact)
+            if let Some(covering) = covering
                 && self.settle_covered_by_wider(&key, covering, (source_rows, source_epoch), &from_table, witness_table.as_ref(), date).await?
             {
                 return Ok(true);
-            }
-            // An equal-width file is what a split's halves would each escalate to. When it
-            // is fresh they would all complete as no-ops, so this unit does; when it is
-            // stale only a whole-width publish retires it, so the split is refused.
-            if containing.contains(&exact) {
-                if let Some(coverage) = self.fresh_covering_proof(&key, source_rows, &from_table, witness_table.as_ref(), date).await {
-                    self.complete_rollup_noop(&key, &date.to_string(), source_epoch, (key.slice, &coverage))?;
-                    return Ok(true);
-                }
-                split_strands_children = true;
             }
         }
         // A rebuild whose INPUT is unchanged reproduces its own output, and the queue
@@ -2984,17 +2965,16 @@ impl Database {
             }
             return Ok(true);
         }
-        // Prod 2026-09-27: splitting under a live file of exactly this width livelocked
-        // five sealed cells, re-minted every census tick. Hash shards bound the whole unit.
-        if !split_strands_children && estimated_bytes > MAX_DECODED_BYTES && key.slice.width() > crate::maintenance_coordinator::MIN_SLICE_MICROS {
+        if estimated_bytes > MAX_DECODED_BYTES && key.slice.width() > crate::maintenance_coordinator::MIN_SLICE_MICROS {
             let mut journal = self.journal();
             if journal.split_time_task(&key, estimated_bytes, Some(input_footprint)) {
                 journal.checkpoint()?;
                 return Ok(true);
             }
         }
-        let (hash_shards, per_shard_bytes) = rollup_shard_plan(estimated_bytes);
+        let hash_shards = estimated_bytes.div_ceil(MAX_DECODED_BYTES).max(1);
         anyhow::ensure!(hash_shards <= 65_536, "one-minute slice needs {hash_shards} hash shards; maximum is 65536");
+        let per_shard_bytes = estimated_bytes.div_ceil(hash_shards).max(1);
         let Some(_permit) = self.maintenance_admission.try_acquire_for(
             Resources { cpu: 1, decoded_bytes: per_shard_bytes, object_reads: 1, object_writes: 1 },
             crate::maintenance_coordinator::AdmissionLane::Rollup,
@@ -4591,45 +4571,6 @@ impl Database {
         }
     }
 
-    /// The live coverage of `covering_key`'s slice when its witness still verifies — the
-    /// same whole-or-bounded rules the read path applies. One spelling for every caller.
-    async fn fresh_covering_proof(
-        &self, covering_key: &crate::maintenance_coordinator::TaskKey, source_rows: Option<i64>, from_table: &Arc<RwLock<DeltaTable>>,
-        witness_table: Option<&Arc<RwLock<DeltaTable>>>, date: chrono::NaiveDate,
-    ) -> Option<RollupCoverage> {
-        let (covering_start, covering_end) = (covering_key.slice.start_micros, covering_key.slice.end_micros);
-        let cov_key = (covering_key.project_id.clone(), covering_key.source.clone(), covering_key.physical_table.clone(), covering_start, covering_end);
-        let cov = self.rollup_slice_coverage.get(&cov_key).map(|entry| entry.value().clone())?;
-        if !Self::rollup_generation_current(&covering_key.source, &covering_key.physical_table, &covering_key.project_id, &date.to_string(), &cov) {
-            return None;
-        }
-        let RollupOutputEvidence::Files(files) = cov.output else { return None };
-        if !self.tier_still_holds_slice(covering_key, &cov.generation, files).await {
-            return None;
-        }
-        let whole = source_rows.and_then(|rows| u64::try_from(rows).ok());
-        if witness_matches(cov.source_rows, whole) {
-            return Some(cov);
-        }
-        let witness_below = cov.source_rows_below.filter(|_| self.config.maintenance.timefusion_rollup_bounded_witness)?;
-        // Bounded compare at the COVERING slice's own bound — `source_rows_below`
-        // in scope was taken at THIS unit's end, which is not the covering end.
-        let table = from_table.read().await;
-        let witness_guard = match &witness_table {
-            Some(witness) => Some(witness.read().await),
-            None => None,
-        };
-        let witness_source: &DeltaTable = witness_guard.as_deref().unwrap_or(&table);
-        let date_string = date.to_string();
-        let below = Self::partition_stats_bounded(witness_source, tiebreak_of(&covering_key.source), &|_, _| covering_end)
-            .ok()
-            .and_then(|mut stats| {
-                stats.remove(&(covering_key.project_id.clone(), date_string.clone())).or_else(|| stats.remove(&("default".to_string(), date_string)))
-            })
-            .and_then(|stats| u64::try_from(stats.rows).ok());
-        witness_matches(Some(witness_below), below).then_some(cov)
-    }
-
     /// Settle a unit whose slice a strictly WIDER live file already covers.
     ///
     /// Publishing anyway would leave both files live and double count, because the
@@ -4667,7 +4608,40 @@ impl Database {
         // same 6h covering file the whole time.
         let covering_key =
             crate::maintenance_coordinator::TaskKey { slice: crate::maintenance_coordinator::TimeSlice::new(covering_start, covering_end)?, ..key.clone() };
-        let covering_proof = self.fresh_covering_proof(&covering_key, source_rows, from_table, witness_table, date).await;
+        let covering_proof = 'fresh: {
+            let cov_key = (key.project_id.clone(), key.source.clone(), key.physical_table.clone(), covering_start, covering_end);
+            let Some(cov) = self.rollup_slice_coverage.get(&cov_key).map(|entry| entry.value().clone()) else { break 'fresh None };
+            if !Self::rollup_generation_current(&key.source, &key.physical_table, &key.project_id, &date.to_string(), &cov) {
+                break 'fresh None;
+            }
+            let RollupOutputEvidence::Files(files) = cov.output else { break 'fresh None };
+            if !self.tier_still_holds_slice(&covering_key, &cov.generation, files).await {
+                break 'fresh None;
+            }
+            let whole = source_rows.and_then(|rows| u64::try_from(rows).ok());
+            if witness_matches(cov.source_rows, whole) {
+                break 'fresh Some(cov);
+            }
+            let Some(witness_below) = cov.source_rows_below.filter(|_| self.config.maintenance.timefusion_rollup_bounded_witness) else {
+                break 'fresh None;
+            };
+            // Bounded compare at the COVERING slice's own bound — `source_rows_below`
+            // in scope was taken at THIS unit's end, which is not the covering end.
+            let table = from_table.read().await;
+            let witness_guard = match &witness_table {
+                Some(witness) => Some(witness.read().await),
+                None => None,
+            };
+            let witness_source: &DeltaTable = witness_guard.as_deref().unwrap_or(&table);
+            let date_string = date.to_string();
+            let below = Self::partition_stats_bounded(witness_source, tiebreak_of(&key.source), &|_, _| covering_end)
+                .ok()
+                .and_then(|mut stats| {
+                    stats.remove(&(key.project_id.clone(), date_string.clone())).or_else(|| stats.remove(&("default".to_string(), date_string)))
+                })
+                .and_then(|stats| u64::try_from(stats.rows).ok());
+            witness_matches(Some(witness_below), below).then_some(cov)
+        };
         if let Some(coverage) = covering_proof {
             if self.complete_rollup_noop(key, &date.to_string(), source_epoch, (covering_key.slice, &coverage))? {
                 crate::observability::maintenance_stats().rollup_escalation_skipped_fresh.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -4686,7 +4660,7 @@ impl Database {
         {
             return Ok(false);
         }
-        let (escalated, requeued) = {
+        let escalated = {
             let _guard = crate::support::lock(&self.rollup_journal_lock);
             let mut journal = self.journal();
             if journal.state(key) != Some(crate::maintenance_coordinator::TaskState::Running) {
@@ -4694,23 +4668,20 @@ impl Database {
             }
             let now = crate::support::now_micros();
             let current = self.rollup_source_epochs.get(&(key.project_id.clone(), key.source.clone(), date.to_string())).map_or(0, |entry| *entry.value());
-            // `requeued` is false when `enqueue_inner` vetoes a Superseded parent with a
-            // live descendant: the covering slice then waits for the planner, not for us.
-            let requeued = current == source_epoch
-                && journal.enqueue_with_base_tier(covering_key, now, crate::maintenance_coordinator::MAX_DECODED_BYTES, unix_ms(now), false);
             if current == source_epoch {
+                journal.enqueue(covering_key, now, crate::maintenance_coordinator::MAX_DECODED_BYTES, unix_ms(now));
                 journal.complete(key);
             } else {
                 journal.retry(key, "noop_proof_changed".to_owned(), now.saturating_add(ROLLUP_PROOF_RETRY_MICROS));
             }
-            (current == source_epoch, requeued)
+            current == source_epoch
         };
         self.journal().checkpoint()?;
         if escalated {
             crate::observability::maintenance_stats().rollup_skipped_covered_by_wider.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             info!(
                 table = %key.physical_table, project_id = %key.project_id,
-                slice_start = key.slice.start_micros, covering_start, covering_end, requeued,
+                slice_start = key.slice.start_micros, covering_start, covering_end,
                 event = "maintenance_rollup_escalated_to_covering_slice"
             );
         }
@@ -10483,32 +10454,6 @@ mod rollup_noop_skip_tests {
         Ok(())
     }
 
-    /// An equal-width live file whose witness verifies answers the unit, as it answered
-    /// each half of a split before: prod 2026-09-27 OOM'd when such units rebuilt whole
-    /// days instead. The no-op skip is defeated here so only the freshness rule can hold.
-    #[serial]
-    #[tokio::test]
-    async fn a_fresh_equal_width_file_completes_the_unit_without_rebuilding() -> Result<()> {
-        let (db, project, date) = rollup_db("fresh_equal_width").await?;
-        assert!(build_day(&db, &project, date, "seed").await? > 0);
-        let first = db.run_unit_once("otel_logs_and_spans", &project, date, Operation::BaseRollup, 1, 12).await?;
-        assert_eq!(first.state, Some(TaskState::Complete), "the fixture needs a live 12:00-13:00 publication");
-        let start = date.and_hms_opt(12, 0, 0).unwrap().and_utc().timestamp_micros();
-        {
-            let mut entry = db
-                .rollup_slice_coverage
-                .get_mut(&(project.clone(), "otel_logs_and_spans".to_owned(), TIER.to_owned(), start, start + 3_600_000_000))
-                .expect("the 1h publication's coverage");
-            assert!(matches!(entry.value().output, RollupOutputEvidence::Files(_)), "a nonempty publication");
-            entry.value_mut().content_fp = None;
-        }
-        let published_at = tier_version(&db).await;
-        let report = db.run_unit_once("otel_logs_and_spans", &project, date, Operation::BaseRollup, 1, 12).await?;
-        assert_eq!(report.state, Some(TaskState::Complete));
-        assert_eq!(tier_version(&db).await, published_at, "a fresh equal-width file must answer the unit, not be rebuilt");
-        Ok(())
-    }
-
     /// Prod 2026-09-27: a published slice whose task was re-queued (never Complete again)
     /// was dropped by every restart's recovery, and the census re-minted it each tick.
     /// Its own `output_rows` proof must adopt it regardless of journal state.
@@ -10580,6 +10525,33 @@ mod rollup_noop_skip_tests {
                 && task.key.slice.end_micros > day
         });
         assert!(!reminted, "a readable day must not be re-minted");
+        Ok(())
+    }
+
+||||||| 2a126d1a (Settle a rollup unit under an equal-width live file by its freshness)
+    /// An equal-width live file whose witness verifies answers the unit, as it answered
+    /// each half of a split before: prod 2026-09-27 OOM'd when such units rebuilt whole
+    /// days instead. The no-op skip is defeated here so only the freshness rule can hold.
+    #[serial]
+    #[tokio::test]
+    async fn a_fresh_equal_width_file_completes_the_unit_without_rebuilding() -> Result<()> {
+        let (db, project, date) = rollup_db("fresh_equal_width").await?;
+        assert!(build_day(&db, &project, date, "seed").await? > 0);
+        let first = db.run_unit_once("otel_logs_and_spans", &project, date, Operation::BaseRollup, 1, 12).await?;
+        assert_eq!(first.state, Some(TaskState::Complete), "the fixture needs a live 12:00-13:00 publication");
+        let start = date.and_hms_opt(12, 0, 0).unwrap().and_utc().timestamp_micros();
+        {
+            let mut entry = db
+                .rollup_slice_coverage
+                .get_mut(&(project.clone(), "otel_logs_and_spans".to_owned(), TIER.to_owned(), start, start + 3_600_000_000))
+                .expect("the 1h publication's coverage");
+            assert!(matches!(entry.value().output, RollupOutputEvidence::Files(_)), "a nonempty publication");
+            entry.value_mut().content_fp = None;
+        }
+        let published_at = tier_version(&db).await;
+        let report = db.run_unit_once("otel_logs_and_spans", &project, date, Operation::BaseRollup, 1, 12).await?;
+        assert_eq!(report.state, Some(TaskState::Complete));
+        assert_eq!(tier_version(&db).await, published_at, "a fresh equal-width file must answer the unit, not be rebuilt");
         Ok(())
     }
 
@@ -12045,61 +12017,6 @@ mod bounded_witness_tests {
     #[test]
     fn a_straddling_file_is_excluded_wholesale_not_split() {
         assert!(!counted(1_500, 1_000), "min below and max above still excludes — never a partial count");
-    }
-}
-
-/// Hash shards run SEQUENTIALLY under one permit priced at `per_shard_bytes`, so an
-/// unsplit unit of any width reserves at most one shard's decode.
-fn rollup_shard_plan(estimated_bytes: u64) -> (u64, u64) {
-    let shards = estimated_bytes.div_ceil(crate::maintenance_coordinator::MAX_DECODED_BYTES).max(1);
-    (shards, estimated_bytes.div_ceil(shards).max(1))
-}
-
-#[cfg(test)]
-mod split_stranding_tests {
-    use crate::database::Database;
-    use crate::maintenance_coordinator::{Operation, TAG_PROJECT, TAG_SLICE_END, TAG_SLICE_START, TaskKey, TimeSlice};
-
-    const H: i64 = 3_600_000_000;
-
-    /// A split is safe only when no live file of the project contains the unit; the
-    /// equal-width case is the prod livelock (children escalate to a parent that splits).
-    /// This pins the predicate only: the split-site wiring has no DB-level guard, and
-    /// prod's `split_into_smaller_slices` count on sealed cells is what shows it holds.
-    #[test_case::test_case("p", (12, 24) => true ; "equal width strands the children")]
-    #[test_case::test_case("p", (0, 24) => true ; "a wider file strands them too")]
-    #[test_case::test_case("p", (18, 24) => false ; "a narrower file leaves no child under it")]
-    #[test_case::test_case("p", (6, 18) => false ; "an overlapping file does not contain the unit")]
-    #[test_case::test_case("other", (12, 24) => false ; "another project's file")]
-    fn a_containing_file_strands_a_split(project: &str, (start, end): (i64, i64)) -> bool {
-        let add = deltalake::kernel::Add {
-            tags: Some(
-                [(TAG_PROJECT, project.to_owned()), (TAG_SLICE_START, (start * H).to_string()), (TAG_SLICE_END, (end * H).to_string())]
-                    .into_iter()
-                    .map(|(name, value)| (name.to_owned(), Some(value)))
-                    .collect(),
-            ),
-            ..Default::default()
-        };
-        let key = TaskKey {
-            project_id: "p".into(),
-            source: "otel_logs_and_spans".into(),
-            physical_table: "t".into(),
-            slice: TimeSlice::new(12 * H, 24 * H).expect("valid slice"),
-            operation: Operation::BaseRollup,
-        };
-        Database::containing_slice_for(&add, &key).is_some()
-    }
-
-    /// An unsplit whole-width unit must still reserve no more than one shard's decode.
-    #[test_case::test_case(0 ; "empty")]
-    #[test_case::test_case(crate::maintenance_coordinator::MAX_DECODED_BYTES ; "exactly one shard")]
-    #[test_case::test_case(crate::maintenance_coordinator::MAX_DECODED_BYTES + 1 ; "just over")]
-    #[test_case::test_case(40 * crate::maintenance_coordinator::MAX_DECODED_BYTES + 7 ; "a whale day")]
-    fn a_whole_width_unit_reserves_one_shard(estimated: u64) {
-        let (shards, per_shard) = super::rollup_shard_plan(estimated);
-        assert!(per_shard <= crate::maintenance_coordinator::MAX_DECODED_BYTES.max(1));
-        assert!(shards * per_shard >= estimated, "the shards must cover the estimate");
     }
 }
 
