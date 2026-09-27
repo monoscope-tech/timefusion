@@ -2090,12 +2090,8 @@ async fn a_distinct_count_over_services_routes_and_matches_the_raw_sketch() -> R
         let query = format!("SELECT {}", select.replace("{window}", &window));
         let before = any_rollup_hits();
         let routed = show(ctx.sql(&query).await?.collect().await?);
-        // `service_name_hll` is declared but on `MEASURES_NOT_YET_SERVABLE`:
-        // `distinct_count` of an EMPTY sketch is 0, not NULL, so a routed widget
-        // over cells missing the state would silently render 0 services. Until
-        // the guard is lifted the query must fall back to raw and still be exact.
-        assert_eq!(any_rollup_hits(), before, "the hll measure is on the not-yet-servable list, so this must NOT route: {query}");
-        assert_eq!(routed, show(db.query_delta_only(&query).await?), "and the raw answer must still be exact: {query}");
+        assert!(any_rollup_hits() > before, "the dcount widget must route, or this proves nothing about the hll measure: {query}");
+        assert_eq!(routed, show(db.query_delta_only(&query).await?), "the routed sketch must equal the raw one: {query}");
     }
     Ok(())
 }

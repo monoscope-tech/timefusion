@@ -1022,15 +1022,6 @@ pub(crate) fn slice_input_sql(
 /// rebuilt; delete the constant once every cell carries the tag.
 const MEASURES_ABSENT_FROM_LEGACY_CELLS: [&str; 2] = ["duration_digest", "service_name_hll"];
 
-/// Measures refused on EVERY cell, tagged or not, because their stored state is
-/// known empty and a merge over an empty state answers with a NUMBER rather than
-/// declining (`distinct_count` of an empty HLL sketch is 0, not NULL).
-///
-/// Stronger than the list above: a tag proves the COLUMN was present, not that a
-/// VALUE was written. Delete an entry only once an audit shows the measure reads
-/// back over the window being served.
-const MEASURES_NOT_YET_SERVABLE: [&str; 1] = ["service_name_hll"];
-
 impl RoutedRollup {
     /// Every tier column this rewrite reads a state out of, the `HAVING` guard
     /// included — a cell missing the guard drops groups, not just a column.
@@ -1041,10 +1032,6 @@ impl RoutedRollup {
     /// Whether a cell whose materialized measures are `have` may serve this
     /// query. `None` is a legacy cell carrying no `TAG_MEASURES`.
     pub(crate) fn measures_available(&self, have: Option<&HashSet<String>>) -> bool {
-        // Both arms: a tag cannot vouch for a state never written.
-        if self.needed_measure_columns().any(|column| MEASURES_NOT_YET_SERVABLE.contains(&column)) {
-            return false;
-        }
         match have {
             Some(have) => self.needed_measure_columns().all(|column| have.contains(column)),
             None => self.needed_measure_columns().all(|column| !MEASURES_ABSENT_FROM_LEGACY_CELLS.contains(&column)),
@@ -3031,23 +3018,22 @@ mod tests {
         assert_rewrite_contains(sql, wants).await;
     }
 
-    /// A measure on the not-yet-servable list is refused on a TAGGED cell, not
-    /// merely an untagged one. The tag proves the COLUMN existed; it cannot prove
-    /// a VALUE was written, and `distinct_count` of an empty sketch is 0 — so a
-    /// merge over empty states answers with a number instead of declining.
+    /// An Active Services chart routes to `service_name_hll` only on a cell whose
+    /// tag proves the sketch. Cells written before the measure was declared hold
+    /// NULL for it — `distinct_count` over those would answer 0 — and must decline.
+    #[test_case::test_case(Some(&["service_name_hll"]), true ; "a cell that tags the sketch serves it")]
+    #[test_case::test_case(Some(&["request_count"]), false ; "a cell built before the measure was declared declines")]
+    #[test_case::test_case(None, false ; "a legacy untagged cell declines")]
     #[tokio::test]
-    async fn a_not_yet_servable_measure_is_refused_even_when_the_cell_tags_it() {
+    async fn an_active_services_chart_routes_only_to_cells_that_prove_the_sketch(tag: Option<&[&str]>, serves: bool) {
         let state = session().await;
         let sql = format!(
             "SELECT time_bucket('1 hours', timestamp) AS tb, distinct_count(approx_count_distinct(resource___service___name)) \
              FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW} GROUP BY 1"
         );
-        // Required, not optional: an early return would make the assertions below
-        // vacuous.
         let route = route_for(&state, &sql).await.expect("match dcount").expect("the hll measure is declared, so it must route");
-        let tagged: std::collections::HashSet<String> = ["service_name_hll".to_owned()].into_iter().collect();
-        assert!(!route.measures_available(Some(&tagged)), "a TAGGED cell must not serve a measure whose stored state is known empty");
-        assert!(!route.measures_available(None), "and an untagged cell must not either");
+        let tag = tag.map(|names| names.iter().map(|name| (*name).to_owned()).collect::<HashSet<_>>());
+        assert_eq!(route.measures_available(tag.as_ref()), serves);
     }
 
     /// A group expression the matcher cannot serve must DECLINE, not vanish.
