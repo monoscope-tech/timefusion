@@ -2081,6 +2081,13 @@ pub struct MaintenanceConfig {
     /// rolled up (or vice versa).
     #[serde_inline_default(31)]
     pub timefusion_rollup_backfill_days: u16,
+    /// Most outstanding sealed-day rollup units the backfill lets one tier hold;
+    /// it tops each tier up to this and no further. Without it a newly declared
+    /// tier queues its whole horizon at once (3,496 unit starts in 9 minutes on
+    /// 2026-09-27). 16 keeps every tier several units ahead of the maintenance
+    /// workers while bounding the journal to tiers × 16. 0 pauses new backfill.
+    #[serde_inline_default(16)]
+    pub timefusion_rollup_backfill_tier_inflight: usize,
     /// `(project_id, date)` cells a one-shot repair forces a full re-derive of,
     /// as `project:YYYY-MM-DD`. Empty means "use `DAMAGED_CELLS`". Non-empty
     /// REPLACES that const rather than extending it. Malformed entries are dropped
@@ -2434,6 +2441,7 @@ mod tests {
         assert!(config.rollup_read_enabled_for("project-a"), "an unconfigured deployment must still route");
         assert!(config.rollup_read_enabled_for("a-project-created-tomorrow"));
         assert_eq!(config.timefusion_rollup_backfill_days, 31, "the shipped default is the value prod exercises");
+        assert_eq!(config.timefusion_rollup_backfill_tier_inflight, 16, "a new tier must not queue its whole horizon at once");
         assert!(!config.timefusion_rollup_adaptive_batches, "adaptive batches need the paired resource experiment before activation");
         assert!(!config.timefusion_rollup_packed_repairs, "packed remainders need a witness that survives the repair before activation");
         assert!(!config.timefusion_rollup_certified_clean, "certified aggregation needs the paired resource experiment before activation");

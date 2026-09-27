@@ -2110,11 +2110,36 @@ impl Database {
             if !defer_enqueue {
                 metrics::counter!(CENSUS_READMIT_DECLINED).increment(readmit_declined);
             }
-            // A cell is still wanted while ANY of its missing tiers is unqueued;
-            // the per-table tests at the enqueue sites decide which to mint.
+            // The guard declines first; the cap then tops up what is left.
+            // Each tier's outstanding SEALED-day units, topped up to the cap and no
+            // further. Today's invalidation units are minted elsewhere and would
+            // otherwise starve a busy tier's backfill, so they do not count.
+            let backfill_cap = self.config.maintenance.timefusion_rollup_backfill_tier_inflight;
+            let mut tier_inflight: HashMap<String, usize> = {
+                let journal = self.journal();
+                journal
+                    .tasks()
+                    .filter(|task| {
+                        task.key.source == source
+                            && matches!(task.key.operation, Operation::BaseRollup | Operation::DerivedRollup)
+                            && task.key.slice.start_micros < backfill_window.end_micros
+                            && blocks_rollup_backfill(task)
+                            && (task.state == TaskState::Running || journal.rollup_build_allowed(&task.key))
+                    })
+                    .counts_by(|task| task.key.physical_table.clone())
+            };
+            let has_room =
+                |inflight: &HashMap<String, usize>, index: usize| inflight.get(&schema.rollups[index].table_name(&source)).copied().unwrap_or(0) < backfill_cap;
+            let tiers_capped = enabled_tiers.iter().filter(|index| !has_room(&tier_inflight, **index)).count();
+            // A cell is still wanted while ANY of its missing tiers is unqueued and
+            // has room; the per-table tests at the enqueue sites decide which to mint.
             want.retain(|(project_id, date)| {
-                missing_tiers.get(&(project_id.clone(), *date)).is_some_and(|missing| {
-                    missing.iter().any(|index| !queued_tables.contains(&(project_id.clone(), *date, schema.rollups[*index].table_name(&source))))
+                let cell = (project_id.clone(), *date);
+                missing_tiers.get(&cell).is_some_and(|missing| {
+                    missing.iter().any(|index| {
+                        !queued_tables.contains(&(project_id.clone(), *date, schema.rollups[*index].table_name(&source)))
+                            && (damage_forced.contains(&cell) || has_room(&tier_inflight, *index))
+                    })
                 })
             });
             // `cells_missing` is what coverage says is absent, `cells_wanted` what
@@ -2141,6 +2166,7 @@ impl Database {
                         .map_or_else(|| "none_pending".to_owned(), |(project, date, reason)| format!("{reason}:{project:.8}:{date}"))
                 },
                 cells_admitted = want.len().min(BACKFILL_PARTITIONS_PER_PASS),
+                tiers_capped,
                 defer_enqueue,
                 event = "rollup_backfill_census"
             );
@@ -2186,16 +2212,17 @@ impl Database {
                     let Some(day_start) = day_start_micros(*date) else { continue };
                     let mut refused = false;
                     // Only the tiers this day is actually missing.
-                    let missing = missing_tiers.get(&(project_id.clone(), *date)).cloned().unwrap_or_default();
                     let cell = (project_id.clone(), *date);
+                    // Forced repair bypasses the cap: its cursor is consumed once the
+                    // cell is admitted, so skipping here would drop it for good.
+                    let forced = damage_forced.contains(&cell);
+                    let mut missing = missing_tiers.get(&cell).cloned().unwrap_or_default();
+                    missing.retain(|index| forced || has_room(&tier_inflight, *index));
                     let holes: HashMap<_, _> = missing
                         .iter()
                         .map(|index| {
-                            let covered = if damage_forced.contains(&cell) {
-                                Vec::new()
-                            } else {
-                                ranges_per_tier.get(index).and_then(|ranges| ranges.get(&cell)).cloned().unwrap_or_default()
-                            };
+                            let covered =
+                                if forced { Vec::new() } else { ranges_per_tier.get(index).and_then(|ranges| ranges.get(&cell)).cloned().unwrap_or_default() };
                             let target = schema.rollups[*index].table_name(&source);
                             let ranges: Vec<_> = crate::rollup::uncovered(day_start, day_start.saturating_add(DAY_MICROS), covered)
                                 .into_iter()
@@ -2239,12 +2266,19 @@ impl Database {
                         if queued_tables.contains(&(project_id.clone(), *date, physical_table.clone())) {
                             continue;
                         }
-                        let mut tier_refused = false;
+                        let (mut tier_refused, mut tier_capped) = (false, false);
                         for &(start, end) in &holes[&index] {
-                            tier_refused |= !enqueue(physical_table.clone(), TimeSlice::new(start, end)?, operation);
+                            if !forced && !has_room(&tier_inflight, index) {
+                                tier_capped = true;
+                                break;
+                            }
+                            let accepted = enqueue(physical_table.clone(), TimeSlice::new(start, end)?, operation);
+                            tier_refused |= !accepted;
+                            *tier_inflight.entry(physical_table.clone()).or_default() += usize::from(accepted);
                         }
                         refused |= tier_refused;
-                        if !holes[&index].is_empty() && !tier_refused {
+                        // A capped tier was not admitted, so the guard must not remember it.
+                        if !holes[&index].is_empty() && !tier_refused && !tier_capped {
                             self.census_admitted.insert(admitted_key(&cell, index), admitted_fp(&cell, index));
                         }
                     }
@@ -10825,6 +10859,62 @@ mod rollup_noop_skip_tests {
             .expect("a full-horizon tier")
             .table_name(source);
         assert!(dates(&full_tier).contains(&old), "the other tiers still backfill the whole global horizon");
+        Ok(())
+    }
+
+    /// A tier missing its whole horizon is topped up to the in-flight cap and no
+    /// further, and each tier holds its own cap.
+    #[serial]
+    #[tokio::test]
+    async fn backfill_tops_each_tier_up_to_its_inflight_cap() -> Result<()> {
+        use crate::maintenance_coordinator::Operation;
+        const CAP: usize = 3;
+        let source = "otel_logs_and_spans";
+        let project = format!("cap_{}", uuid::Uuid::new_v4());
+        let mut cfg = (*rollup_cfg("backfill_tier_cap")).clone();
+        cfg.maintenance.timefusion_rollup_backfill_tier_inflight = CAP;
+        let db = Arc::new(Database::with_config(Arc::new(cfg)).await?);
+        for back in 1..=6 {
+            insert_span(&db, &project, crate::support::today_utc() - chrono::Duration::days(back), 12, &format!("d{back}"), "op").await?;
+        }
+        {
+            let mut journal = db.journal();
+            let inserted: Vec<_> = journal.tasks().map(|task| task.key.clone()).collect();
+            for key in inserted {
+                assert!(journal.complete(&key));
+            }
+        }
+        db.preload_replay_complete.store(true, std::sync::atomic::Ordering::Release);
+        let inflight = || -> HashMap<String, Vec<crate::maintenance_coordinator::TaskKey>> {
+            db.journal()
+                .tasks()
+                .filter(|task| task.state.is_active() && matches!(task.key.operation, Operation::BaseRollup | Operation::DerivedRollup))
+                .map(|task| (task.key.physical_table.clone(), task.key.clone()))
+                .into_group_map()
+        };
+        let tier = get_schema(source)
+            .expect("source schema")
+            .rollups
+            .iter()
+            .find(|spec| spec.backfill_days.is_none() && spec.derive_from.is_none())
+            .expect("a full-horizon tier")
+            .table_name(source);
+        db.plan_rollup_backfill().await?;
+        let first = inflight();
+        assert_eq!(first[&tier].len(), CAP, "six missing days fill the tier exactly to its cap: {first:?}");
+        assert!(first.len() > 1 && first.values().all(|units| units.len() <= CAP), "every tier holds its own cap: {first:?}");
+        {
+            let mut journal = db.journal();
+            for key in &first[&tier][..2] {
+                assert!(journal.complete(key));
+            }
+        }
+        db.plan_rollup_backfill().await?;
+        let second = inflight();
+        assert_eq!(second[&tier].len(), CAP, "the next pass tops the tier back up to its cap, not past it");
+        for (other, units) in first.iter().filter(|(other, _)| **other != tier) {
+            assert_eq!(second[other].len(), units.len(), "{other} is unaffected by the capped tier draining");
+        }
         Ok(())
     }
 
