@@ -1630,12 +1630,22 @@ impl RollupEnv {
 
     /// As `insert`, with `status_code` varied too — the second grouped dimension.
     async fn insert_row(&self, id: &str, ts: i64, service: Option<&str>, duration: Option<i64>, status: &str, summary: &str) -> Result<()> {
-        let batch = json_to_batch(vec![serde_json::json!({
-            "timestamp": ts, "id": id, "name": "op", "project_id": self.project_id, "hashes": [], "summary": [summary],
-            "date": date_of(ts).to_string(),
-            "duration": duration, "kind": "server", "status_code": status, "resource___service___name": service,
-        })])?;
-        self.db.insert_records_batch(&self.project_id, "otel_logs_and_spans", vec![batch], true, None).await?;
+        self.insert_fields(
+            id,
+            ts,
+            serde_json::json!({ "summary": [summary], "duration": duration, "status_code": status, "resource___service___name": service }),
+        )
+        .await
+    }
+
+    /// One row with `fields` laid over the fixture's defaults.
+    async fn insert_fields(&self, id: &str, ts: i64, fields: serde_json::Value) -> Result<()> {
+        let mut row = serde_json::json!({
+            "timestamp": ts, "id": id, "name": "op", "project_id": self.project_id, "hashes": [], "summary": ["fixture"],
+            "date": date_of(ts).to_string(), "kind": "server",
+        });
+        row.as_object_mut().expect("object").extend(fields.as_object().expect("object").clone());
+        self.db.insert_records_batch(&self.project_id, "otel_logs_and_spans", vec![json_to_batch(vec![row])?], true, None).await?;
         Ok(())
     }
 
@@ -2093,6 +2103,76 @@ async fn a_distinct_count_over_services_routes_and_matches_the_raw_sketch() -> R
         assert!(any_rollup_hits() > before, "the dcount widget must route, or this proves nothing about the hll measure: {query}");
         assert_eq!(routed, show(db.query_delta_only(&query).await?), "the routed sketch must equal the raw one: {query}");
     }
+    Ok(())
+}
+
+/// A GROUP BY expression over declared dimensions routes, and every stored measure
+/// kind re-aggregates to exactly the raw answer: each tier row falls in ONE
+/// expression group, so merging decomposable states per group is exact. The
+/// fixture puts NULLs in every grouped dimension, in both legs of the hybrid. An
+/// aggregate with no mergeable state must still decline under the same group.
+#[serial]
+#[tokio::test]
+async fn an_expression_group_over_dimensions_matches_raw_for_every_measure_kind() -> Result<()> {
+    let env = rollup_env("rollup_expression_group").await?;
+    let db = Arc::clone(&env.db);
+    db.cancel_maintenance();
+    let fixture = [
+        ("server", Some("OK"), None, Some("cart")),
+        ("server", Some("ERROR"), Some("error"), Some("cart")),
+        ("client", None, Some("info"), Some("checkout")),
+        ("client", None, None, None),
+        ("server", None, Some("error"), Some("cart")),
+        ("internal", Some("OK"), Some("info"), None),
+        ("server", Some("ERROR"), None, Some("search")),
+        ("client", Some("OK"), Some("info"), Some("checkout")),
+    ];
+    let row = |(kind, status, level, service): (&str, Option<&str>, Option<&str>, Option<&str>), duration: i64| serde_json::json!({ "kind": kind, "status_code": status, "level": level, "resource___service___name": service, "duration": duration });
+    for (i, fields) in fixture.iter().enumerate() {
+        env.insert_fields(&format!("y{i}"), env.yesterday_noon + 17 + i as i64 * 1_000_000_000, row(*fields, 100 * (i as i64 + 1))).await?;
+    }
+    assert!(env.certify_and_drain().await? > 0, "eligible yesterday slices must be drained");
+    // After certification, so these reach the query only through the raw leg.
+    for (i, fields) in fixture.iter().take(4).enumerate() {
+        env.insert_fields(&format!("t{i}"), env.midnight + 5_000_000 + i as i64 * 1_500_000_000, row(*fields, 50 * (i as i64 + 1))).await?;
+    }
+
+    let (window, ctx) = (env.window(), ctx_for(&db)?);
+    let show = |batches: Vec<RecordBatch>| {
+        let kept = batches.into_iter().filter(|b| b.num_rows() > 0).collect::<Vec<_>>();
+        assert!(!kept.is_empty(), "an empty answer makes the parity assertion vacuous");
+        datafusion::arrow::util::pretty::pretty_format_batches(&kept).expect("format").to_string()
+    };
+    let groups = [
+        "COALESCE(coalesce(status_code, level)::text, 'null')",
+        "concat(kind, status_code)",
+        "CASE WHEN status_code = 'ERROR' THEN 'bad' WHEN level IS NULL THEN 'unleveled' ELSE kind END",
+        "CAST(status_code IS NULL AS INT)",
+        "level || ':' || resource___service___name",
+    ];
+    // count, sum, min/max; tdigest; HLL, whose measure is filtered to a non-null service.
+    let measures = [
+        ("COUNT(*) AS c, SUM(duration) AS s, MIN(duration) AS lo, MAX(duration) AS hi", ""),
+        ("round(approx_percentile(0.95, percentile_agg(CAST(duration AS DOUBLE PRECISION)))) AS p95", ""),
+        ("distinct_count(approx_count_distinct(resource___service___name))::float AS dcount", " AND resource___service___name IS NOT NULL"),
+    ];
+    for group in groups {
+        for (select, filter) in measures {
+            let query = format!(
+                "SELECT time_bucket('1 hours', timestamp) AS tb, {group} AS g, {select} FROM otel_logs_and_spans WHERE {window}{filter} GROUP BY 1, 2 ORDER BY 1, 2"
+            );
+            let routed = show(routed_any(&ctx, &query, "an expression over declared dimensions must route").await?);
+            assert_eq!(routed, show(db.query_delta_only(&query).await?), "the routed answer must equal raw: {query}");
+        }
+    }
+
+    let misses_total = || timefusion::observability::maintenance_stats().rollup_misses_total.load(std::sync::atomic::Ordering::Relaxed);
+    let query = format!("SELECT {} AS g, median(duration) AS m FROM otel_logs_and_spans WHERE {window} GROUP BY 1 ORDER BY 1", groups[0]);
+    let (hits, declines) = (any_rollup_hits(), misses_total());
+    let answer = show(ctx.sql(&query).await?.collect().await?);
+    assert_eq!(any_rollup_hits(), hits, "an exact median has no mergeable state and must not route");
+    assert!(misses_total() > declines, "the decline must be counted");
+    assert_eq!(answer, show(db.query_delta_only(&query).await?));
     Ok(())
 }
 

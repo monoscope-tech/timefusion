@@ -1995,7 +1995,8 @@ async fn route_with_spec(
                 // reason — it is the one shape an operator can act on.
                 Expr::Column(_) => return Err(MissReason::UnknownGroupBy),
                 other if !other.is_volatile() && other.column_refs().iter().all(|column| is_dimension(&column.name)) => {
-                    let bare = crate::write::mem_buffer::strip_column_qualifiers(other.clone()).map_err(|_| MissReason::UnsupportedShape)?;
+                    // Rendered with its outer cast, which `unaliased` peeled but the schema keeps.
+                    let bare = crate::write::mem_buffer::strip_column_qualifiers(expression.clone().unalias()).map_err(|_| MissReason::UnsupportedShape)?;
                     datafusion::sql::unparser::expr_to_sql(&bare).map_err(|_| MissReason::UnsupportedShape)?.to_string()
                 }
                 _ => return Err(MissReason::UnsupportedShape),

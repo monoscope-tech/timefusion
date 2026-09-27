@@ -155,7 +155,12 @@ impl Database {
                 }
             }
         }
-        best.map(|(_, rewrite)| Some(rewrite)).ok_or(best_miss.unwrap_or(crate::rollup::MissReason::NotBuilt))
+        let (_, rewrite) = best.ok_or(best_miss.unwrap_or(crate::rollup::MissReason::NotBuilt))?;
+        // Counted for the tier that serves only: every tier tried may have declined the same cells.
+        if rewrite.measure_declined {
+            crate::observability::record_rollup_miss(crate::rollup::MissReason::MeasureNotStored);
+        }
+        Ok(Some(rewrite))
     }
 
     /// Resolve ONE candidate tier against its coverage, or say why it cannot serve.
@@ -458,13 +463,11 @@ impl Database {
         slice_ticket.retain(|((_, _, _, start, end), ..)| interiors.iter().any(|(covered_start, covered_end)| *start < *covered_end && *end > *covered_start));
         accepted_output.restrict_to(&interiors);
         // Proven empty ranges contribute coverage and tickets, but authorize no output.
-        if measure_declined {
-            crate::observability::record_rollup_miss(crate::rollup::MissReason::MeasureNotStored);
-        }
         let mode = if interiors == [(route.lo, route.hi)] { "full" } else { "hybrid" };
         Ok(RollupRewrite {
             covered_micros: interiors.iter().map(|(start, end)| end - start).sum(),
             saturated: interiors == crate::rollup::interiors(route.lo, route.hi, route.grain, horizon, &[(route.lo, route.hi)]),
+            measure_declined,
             sql: route.sql(&generations, &interiors, &split),
             grain: format!("{}us", route.grain),
             mode,

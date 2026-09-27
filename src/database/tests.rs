@@ -1232,57 +1232,113 @@ async fn insert_hourly_spans(db: &Database, project: &str, day_start: i64, hours
     Ok(())
 }
 
+/// A rollup-enabled db holding spans (with durations) at four hours of each of
+/// `days_back`'s days, oldest first, with no tier built yet.
+async fn unbuilt_days(label: &str, days_back: std::ops::RangeInclusive<i64>) -> Result<(Arc<Database>, String, Vec<chrono::NaiveDate>)> {
+    let db = Arc::new(Database::with_config(rollup_backfill_config(label, 35)).await?);
+    db.cancel_maintenance();
+    let project = format!("{label}_{}", uuid::Uuid::new_v4().simple());
+    let days: Vec<chrono::NaiveDate> = days_back.rev().map(|back| (Utc::now() - chrono::Duration::days(back)).date_naive()).collect();
+    for day in &days {
+        for hour in [1, 7, 13, 19] {
+            let mut span = test_span_ts(&format!("{day}-{hour}"), "op", &project, day.and_hms_opt(hour, 0, 0).unwrap().and_utc().timestamp_micros());
+            (span["duration"], span["kind"], span["status_code"]) = (serde_json::json!(100 * hour), "server".into(), "OK".into());
+            db.insert_records_batch(&project, "otel_logs_and_spans", vec![json_to_batch(vec![span])?], true, None).await?;
+        }
+    }
+    Ok((db, project, days))
+}
+
+/// Build one base `tier` of `otel_logs_and_spans` for one whole day.
+async fn build_base_tier(db: &Database, project: &str, tier: &str, day: chrono::NaiveDate) -> Result<()> {
+    use crate::maintenance_coordinator::{DAY_MICROS, MAX_DECODED_BYTES, Operation, TaskKey, TimeSlice};
+    let start = midnight_micros(day);
+    let key = TaskKey {
+        physical_table: format!("otel_logs_and_spans_rollup_{tier}"),
+        source: "otel_logs_and_spans".to_owned(),
+        project_id: project.to_owned(),
+        slice: TimeSlice::new(start, start + DAY_MICROS)?,
+        operation: Operation::BaseRollup,
+    };
+    db.journal().enqueue(key.clone(), 0, MAX_DECODED_BYTES, 0);
+    anyhow::ensure!(db.run_coordinator_rollup_selected(super::maintain::TaskSelection::Exact(&key)).await?, "{tier} {day} must build");
+    Ok(())
+}
+
+/// `[midnight of the first day, midnight after the last)` for `project`.
+fn days_window(project: &str, days: &[chrono::NaiveDate]) -> String {
+    let (lo, hi) = (midnight_micros(days[0]), midnight_micros(days[days.len() - 1]) + crate::maintenance_coordinator::DAY_MICROS);
+    format!("project_id = '{project}' AND timestamp >= to_timestamp_micros({lo}) AND timestamp < to_timestamp_micros({hi})")
+}
+
 /// A replacement tier is preferred once it covers the window, and a replacement
 /// still backfilling never sends days its predecessor covers to the raw fringe.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_replacement_tier_serves_only_once_it_covers_as_much_as_the_tier_it_replaces() -> Result<()> {
-    use crate::maintenance_coordinator::{MAX_DECODED_BYTES, Operation, TaskKey, TimeSlice};
-    const SOURCE: &str = "otel_logs_and_spans";
-    let db = Arc::new(Database::with_config(rollup_backfill_config("replacement-tier", 35)).await?);
-    db.cancel_maintenance();
-    let project = format!("replace_{}", uuid::Uuid::new_v4().simple());
-    let days: Vec<chrono::NaiveDate> = (3..=4).rev().map(|back| (Utc::now() - chrono::Duration::days(back)).date_naive()).collect();
-    for day in &days {
-        for hour in [1, 7, 13, 19] {
-            insert_a_span(&db, &project, &format!("{day}-{hour}"), day.and_hms_opt(hour, 0, 0).unwrap().and_utc().timestamp_micros()).await?;
-        }
-    }
-    let build = async |tier: &str, day: chrono::NaiveDate| -> Result<()> {
-        let start = midnight_micros(day);
-        let key = TaskKey {
-            physical_table: format!("{SOURCE}_rollup_{tier}"),
-            source: SOURCE.to_owned(),
-            project_id: project.clone(),
-            slice: TimeSlice::new(start, start + crate::maintenance_coordinator::DAY_MICROS)?,
-            operation: Operation::BaseRollup,
-        };
-        db.journal().enqueue(key.clone(), 0, MAX_DECODED_BYTES, 0);
-        anyhow::ensure!(db.run_coordinator_rollup_selected(super::maintain::TaskSelection::Exact(&key)).await?, "{tier} {day} must build");
-        Ok(())
-    };
+    let (db, project, days) = unbuilt_days("replace", 3..=4).await?;
     let mut ctx = Arc::clone(&db).create_session_context();
     db.setup_session_context(&mut ctx)?;
     let state = ctx.state();
-    let (lo, hi) = (midnight_micros(days[0]), midnight_micros(days[1]) + crate::maintenance_coordinator::DAY_MICROS);
     // A 1m bucket, so only the 1m tiers compete.
     let sql = format!(
-        "SELECT time_bucket('1 minutes', timestamp) AS tb, status_code, COUNT(*) FROM {SOURCE} \
-         WHERE project_id = '{project}' AND timestamp >= to_timestamp_micros({lo}) AND timestamp < to_timestamp_micros({hi}) GROUP BY 1, 2"
+        "SELECT time_bucket('1 minutes', timestamp) AS tb, status_code, COUNT(*) FROM otel_logs_and_spans WHERE {} GROUP BY 1, 2",
+        days_window(&project, &days)
     );
     let plan = state.optimize(&state.create_logical_plan(&sql).await?)?;
     let routed = async || -> Result<String> {
         let rewrite = db.rollup_sql(&plan, &state).await.map_err(|reason| anyhow::anyhow!("declined: {}", reason.label()))?.expect("a route");
-        Ok(rewrite.ticket.output.target.trim_start_matches(&format!("{SOURCE}_rollup_")).to_owned())
+        Ok(rewrite.ticket.output.target.trim_start_matches("otel_logs_and_spans_rollup_").to_owned())
     };
 
     for day in &days {
-        build("dashboard_1m_v3", *day).await?;
+        build_base_tier(&db, &project, "dashboard_1m_v3", *day).await?;
     }
     assert_eq!(routed().await?, "dashboard_1m_v3", "with no v4 coverage the replaced tier serves");
-    build("dashboard_1m_v4", days[1]).await?;
+    build_base_tier(&db, &project, "dashboard_1m_v4", days[1]).await?;
     assert_eq!(routed().await?, "dashboard_1m_v3", "a v4 covering one of two days must not send the other raw");
-    build("dashboard_1m_v4", days[0]).await?;
+    build_base_tier(&db, &project, "dashboard_1m_v4", days[0]).await?;
     assert_eq!(routed().await?, "dashboard_1m_v4", "a v4 covering the window is preferred");
+    Ok(())
+}
+
+/// Dual run: v3 covers the first two days and v4 the last two, so neither covers the
+/// window and the answer is a hybrid that must equal raw. Then each tier loses the
+/// digest on its unshared day: the partial measure decline is counted once per
+/// query, not once per tier tried.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dual_run_window_is_exact_and_counts_a_measure_decline_once() -> Result<()> {
+    let (db, project, days) = unbuilt_days("dualrun", 3..=5).await?;
+    let tiers = [("otel_logs_and_spans_rollup_dashboard_1m_v3", &days[..2], days[0]), ("otel_logs_and_spans_rollup_dashboard_1m_v4", &days[1..], days[2])];
+    for (tier, built, _) in tiers {
+        for day in built {
+            build_base_tier(&db, &project, tier.trim_start_matches("otel_logs_and_spans_rollup_"), *day).await?;
+        }
+    }
+    let mut ctx = Arc::clone(&db).create_session_context();
+    db.setup_session_context(&mut ctx)?;
+    let window = days_window(&project, &days);
+    let stats = crate::observability::maintenance_stats;
+    let load = |counter: &std::sync::atomic::AtomicU64| counter.load(std::sync::atomic::Ordering::Relaxed);
+    let hits = || load(&stats().rollup_hits_hybrid) + load(&stats().rollup_hits_full);
+    let show = |batches: Vec<RecordBatch>| datafusion::arrow::util::pretty::pretty_format_batches(&batches).expect("format").to_string();
+    for (select, declines) in [
+        ("COUNT(*) AS c, SUM(duration) AS s, MIN(duration) AS lo, MAX(duration) AS hi", 0),
+        ("round(approx_percentile(0.95, percentile_agg(CAST(duration AS DOUBLE PRECISION)))) AS p95", 1),
+    ] {
+        // The strip retags files without rewriting their generation column, so a stripped
+        // cell must never be read: it happens only before the query whose measure it strips.
+        if declines > 0 {
+            for (tier, _, stripped) in tiers {
+                strip_rollup_measure(&db, &project, stripped, "duration_digest", Some(tier)).await?;
+            }
+        }
+        let sql = format!("SELECT time_bucket('1 hours', timestamp) AS tb, {select} FROM otel_logs_and_spans WHERE {window} GROUP BY 1 ORDER BY 1");
+        let (hits_before, declines_before) = (hits(), load(&stats().rollup_miss_measure_not_stored));
+        let routed = show(ctx.sql(&sql).await?.collect().await?);
+        assert_eq!(hits(), hits_before + 1, "must route, or equality proves nothing: {sql}");
+        assert_eq!(load(&stats().rollup_miss_measure_not_stored) - declines_before, declines, "one query, one decline: {sql}");
+        assert_eq!(routed, show(db.query_delta_only(&sql).await?), "routed must equal raw: {sql}");
+    }
     Ok(())
 }
 
@@ -1332,12 +1388,12 @@ fn append_op(partitioned: bool) -> deltalake::protocol::DeltaOperation {
 
 /// Model a materialization that predates `measure`: drop it from the tier's measure
 /// tags, restamp the generation to match, and recover through the real tag path.
-async fn strip_rollup_measure(db: &Database, project: &str, day: chrono::NaiveDate, measure: &str) -> Result<()> {
+async fn strip_rollup_measure(db: &Database, project: &str, day: chrono::NaiveDate, measure: &str, tier: Option<&str>) -> Result<()> {
     use crate::maintenance_coordinator::{TAG_GENERATION, TAG_MEASURES, TAG_PROJECT, TAG_SLICE_START};
     use deltalake::kernel::Action;
     use object_store::ObjectStoreExt as _;
     let source = "otel_logs_and_spans";
-    for spec in &get_schema(source).expect("source schema").rollups {
+    for spec in get_schema(source).expect("source schema").rollups.iter().filter(|spec| tier.is_none_or(|tier| spec.table_name(source) == tier)) {
         let tier = db.get_or_create_table(project, &spec.table_name(source)).await?;
         let store = { tier.read().await.log_store().object_store(None) };
         let adds = live_adds(&tier).await;
@@ -1440,7 +1496,7 @@ async fn a_date_that_cannot_prove_its_digest_falls_to_the_raw_fringe() -> Result
 
     // The older day's cells lose their proof: the column declared before any file carried it.
     let stripped = days[0].to_string();
-    strip_rollup_measure(&db, &project, days[0], DIGEST).await?;
+    strip_rollup_measure(&db, &project, days[0], DIGEST, None).await?;
 
     let misses = || crate::observability::maintenance_stats().rollup_miss_measure_not_stored.load(std::sync::atomic::Ordering::Relaxed);
     for (index, select) in shapes.iter().enumerate() {
@@ -1455,7 +1511,7 @@ async fn a_date_that_cannot_prove_its_digest_falls_to_the_raw_fringe() -> Result
 
     // TOTAL decline: strip the digest from the sibling day too, so NO date can prove it.
     {
-        strip_rollup_measure(&db, &project, days[1], DIGEST).await?;
+        strip_rollup_measure(&db, &project, days[1], DIGEST, None).await?;
         let total = route(&db, sql(&shapes[1], true)).await;
         let reason = total.expect_err("no date can prove the digest, so nothing may route").to_string();
         assert!(reason.contains(crate::rollup::MissReason::MeasureNotStored.label()), "a TOTAL measure decline must report measure_not_stored — got {reason}");
@@ -1713,7 +1769,7 @@ async fn a_derived_cell_cannot_claim_a_measure_its_base_never_proved() -> Result
         slice_measures(&db, &project, Some(base_tier.as_str())).iter().all(|held| held.as_ref().is_some_and(|held| held.contains(DIGEST))),
         "fresh base proves the digest"
     );
-    strip_rollup_measure(&db, &project, day, DIGEST).await?;
+    strip_rollup_measure(&db, &project, day, DIGEST, None).await?;
     db.run_unit_once("otel_logs_and_spans", &project, day, Operation::DerivedRollup, 4, 20).await?;
 
     let published = slice_measures(&db, &project, Some(derived_tier.as_str()));

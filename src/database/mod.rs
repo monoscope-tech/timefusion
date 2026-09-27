@@ -880,6 +880,8 @@ pub(crate) struct RollupRewrite {
     pub covered_micros: i64,
     /// No tier can cover more: the rest is fringe or the buffered tail.
     pub saturated: bool,
+    /// Some cells could not prove a measure and went raw.
+    pub measure_declined: bool,
     /// The `Aggregate` this rewrite replaces, verbatim, so the caller can swap it
     /// in place.
     pub matched: datafusion::logical_expr::LogicalPlan,
