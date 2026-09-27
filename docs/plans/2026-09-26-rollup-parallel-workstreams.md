@@ -49,10 +49,10 @@ Status: ⬜ open · 🟡 in progress · ✅ done. Priority is the plan's executi
 | W7 | Stage 1 build measurement harness | build (lane 2) | Stage 1 | For representative units via `timefusion run-unit`: physical plan, scan count, hash shards, dedup ops, decoded bytes, aggregate-state memory, CPU; publication economics (commits/actions/latency incl. failures) | `src/main.rs` `run-unit`, `benches/rollup_work.rs`, report under `docs/plans/` | W3 for unit choice | Claude (timefusion-2e) | 🟡 harness handed off `ws/w7-run-unit-passes`; prod economics ✅ [report](2026-09-27-stage1-unit-economics.md); **real-S3 unit cost blocked on staging** (owner decision) |
 | W8 | 1D dependency classification — design + fixtures | analysis → build (lane 2) | Stage 1D | Per-spec dependency map (dims, measures, filters, identity, ts, version, delete); mutation fixture table proving zero missed relevant invalidations; then the classifier | new test module; `apply_rollup_hours` call sites in `database/rollup.rs` | W2 (which mutations dominate) | Claude (timefusion-2e) | ✅ shadow classifier handed off `ws/w8-shadow-classifier` |
 | W9 | Stage 3 publication batching — design | analysis | Stage 3 | Concrete design mapped to existing staged publication / journal group-commit; WAL-compat decision (does the payload change?); queue limits; test list | design doc only | — | agent (Claude) | ✅ |
-| W10 | Capacity replay harness | build (lane 2) | Shared gates | `timefusion sim` replay of a prod journal at 1x/2x/4x rows and 1x/2x/4x projects; report backlog stability and work per accepted row | `src/maintenance_sim.rs`, `src/main.rs` | W2 | | ✅ `e9ce6dc3` (ws/w10-sim-rows); open: check a 1x replay against prod executions/h before trusting any multiplier |
+| W10 | Capacity replay harness | build (lane 2) | Shared gates | `timefusion sim` replay of a prod journal at 1x/2x/4x rows and 1x/2x/4x projects; report backlog stability and work per accepted row | `src/maintenance_sim.rs`, `src/main.rs` | W2 | | ⚠️ `e9ce6dc3` built; **1x replay NOT calibrated** vs prod executions/h (see W10 calibration) — multipliers untrusted until minting + compaction ops are modelled |
 | W11 | OpenTelemetry 0.33 upgrade | build (lane 2) | Housekeeping | Closes the `opentelemetry_sdk` advisory (unbounded baggage alloc) | `Cargo.toml`, `src/observability.rs` | — | Claude (timefusion-2e) | ✅ handed off |
 | W12 | `dcount(name)` measure decision | analysis | Rollup misses | Cost/benefit for a `name` HLL + 2-way server-scope count guard on `dashboard_1m_v3` (schema comment ~L501 declines it on purpose); owner decides | `schemas/otel_logs_and_spans.yaml` (proposal only) | W2 | Claude (timefusion-2e) | ✅ analysis — owner decides (see result) |
-| W13 | Narrow the slice OCC gate (Stage 3 step 1) | build (lane 2) | Stage 3 | A non-overlapping sibling slice no longer makes a staged unit `slice_occ_stale`; a unit may retire narrower contained slices; target proof re-recorded under the commit lock; cause logging; tests 1, 3, 3b of the W9 design failing-first | `maintain.rs` `run_coordinator_rollup_selected` OCC check | W9 | Claude | 🟡 branch `ws/w13-occ-narrow` (842617b9), **top priority per W3** |
+| W13 | Narrow the slice OCC gate (Stage 3 step 1) | build (lane 2) | Stage 3 | A non-overlapping sibling slice no longer makes a staged unit `slice_occ_stale`; a unit may retire narrower contained slices; target proof re-recorded under the commit lock; cause logging; tests 1, 3, 3b of the W9 design failing-first | `maintain.rs` `run_coordinator_rollup_selected` OCC check | W9 | Claude | ✅ on master (`7e03e0e6` + `202b10b0`) |
 | W14 | 720-minute republication loop | analysis → build | Stage 0 / 1 | Why 58 slices (mostly 720-min `dashboard_1m_v3`) republished 431 times in 65 min (56% of publications, 228/361 GB); fix the re-mint source (census / witness moved / no-op skip miss); log the retry reason on `maintenance_task_finished` | `maintain.rs` census + no-op decision, `database/rollup.rs` | W3 | Claude | ✅ deployed `2b8c46d4` |
 | W15 | Observability batch: retry reason on `maintenance_task_finished`, per-tier rollup hit counters, sessions near-miss warn → debug | build (lane 3, niced) | Attribution | Confirms W3's post-scan retry cause; per-tier hit rate | `observability.rs`, stats key lists (`server/pg_compat.rs`), finish log in `maintenance_coordinator.rs`/`maintain.rs`, one warn in `rollup.rs` | — | agent (Claude) | 🟡 |
 | W16 | W2 via exported metric history | analysis | Attribution | Multi-day rollup/maintenance CPU and work attribution from OTel metrics in monoscope (`monoscope chart --source metrics`), not young-process counters | monoscope CLI, prod read-only | — | agent (Claude) | ✅ |
@@ -432,4 +432,30 @@ clients swamping the new process.
   explicit close is abandoned at its budget). The 2.4 s is also not what broke either outlier: at 21:31 the
   container lifecycle doubled and the first answer came ~10 s late.
 - **Next if (4) shows the lifecycle phase dominating:** (2), the 4.9 s container create → start.
+
+### W10 calibration — 2026-09-27 — Claude (timefusion-2e)
+**Question:** does `timefusion sim` at 1x reproduce prod's executions per hour? The sheet required this before any
+2x/4x multiplier is trusted.
+**Method:** the prod journal (`maintenance_tasks.json` 82 MB plus `.wal` 56 MB, copied read-only with `docker cp`,
+state 02:23 UTC plus WAL to 04:21) replayed with `timefusion sim <dir> --hours 1 --now 02:21Z` at master
+`e9ce6dc3`+, with 44 and 66 workers (prod runs `job_workers=66`, `runtime_workers=44`). Prod baseline: W7's mature
+60 min window.
+
+| per hour | sim 1x (66 workers) | prod |
+| --- | --- | --- |
+| BaseRollup completions | 152 | 1,342 |
+| Dedup completions | 156 | 444 |
+| DerivedRollup completions | 7 | 572 |
+| HotPacking / SealedConsolidation | not simulated | 229 / 31 |
+| pending over the hour | 8,097 → 248 (drains) | steady (stock does not drain) |
+
+**Findings:**
+- The 44 and 66 worker runs give identical results, so the sim is not worker-bound. It **runs out of work**: minting
+  from the journal's 21 ingesting streams replenishes far below prod's continuous re-mint of rollup hours on ingest
+  invalidation, which drives roughly 9x more BaseRollup and 80x more DerivedRollup work.
+- Compaction lanes are absent.
+
+**Conclusion:** the 1x baseline is uncalibrated, so no capacity multiplier from the sim is trustworthy yet.
+**Next:** model per-stream re-mint from invalidations at prod's measured rate. W19's `lease_ms`/`publications`
+counters give the target. Add the compaction lanes, then re-check 1x against a fresh mature-window baseline.
 
