@@ -5582,6 +5582,29 @@ fn dedup_wave_drops_only_the_stale_unit_and_counts_only_landed_rows() {
     assert_eq!(super::wave_dropped_rows(&[staged_unit("delta", &["f9"], None)]), 0);
 }
 
+/// A DV dedup masks rows in place and Delta's `num_records` still counts them, so only a
+/// rewritten bin moves the rollup witness; carrying a masked bin's drops staled every slice.
+#[test]
+fn only_rewritten_bins_carry_the_rollup_witness() {
+    let rewritten = staged_unit("alpha", &["f1"], Some(dedup_unit("2026-07-28", 10, 6)));
+    let mut masked = staged_unit("beta", &["f2"], Some(dedup_unit("2026-07-28", 5, 3)));
+    for action in &mut masked.adds {
+        if let deltalake::kernel::Action::Add(add) = action {
+            add.deletion_vector = Some(deltalake::kernel::DeletionVectorDescriptor {
+                storage_type: deltalake::kernel::StorageType::UuidRelativePath,
+                path_or_inline_dv: "dv".into(),
+                offset: Some(1),
+                size_in_bytes: 10,
+                cardinality: 2,
+            });
+        }
+    }
+    assert!(masked.masked_in_place() && !rewritten.masked_in_place());
+    let bins = [rewritten, masked];
+    assert_eq!(super::wave_dropped_rows(&bins), 6, "the metric still counts every dropped row");
+    assert_eq!(super::wave_rewritten_rows(&bins), 4, "only the rewritten bin moved num_records");
+}
+
 /// "Targets gone" has two causes needing opposite handling: another writer
 /// rewrote them (staged parquet is garbage → delete), or our own earlier
 /// attempt landed then errored (staged parquet is live → never delete,

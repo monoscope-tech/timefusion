@@ -5425,6 +5425,12 @@ fn wave_dropped_rows(bins: &[StagedBin]) -> u64 {
     bins.iter().filter_map(|b| b.dedup.as_ref()).map(DedupUnit::dropped).sum()
 }
 
+/// Rows a wave PHYSICALLY removed: a deletion-vector bin masks rows in place, and Delta's
+/// `num_records` (what the rollup witness sums) still counts them.
+fn wave_rewritten_rows(bins: &[StagedBin]) -> u64 {
+    bins.iter().filter(|bin| !bin.masked_in_place()).filter_map(|bin| bin.dedup.as_ref()).map(DedupUnit::dropped).sum()
+}
+
 /// Assemble one staged unit's Remove+Add actions.
 ///
 /// `data_change` distinguishes hot compaction from dedup. `false` (compaction) preserves every row,
