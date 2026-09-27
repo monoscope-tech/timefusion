@@ -46,7 +46,7 @@ Status: ⬜ open · 🟡 in progress · ✅ done. Priority is the plan's executi
 | W4 | Session-tier consumer inventory | analysis | First deliverable (B1) | Every reader of `*_rollup_sessions_1h_v1` (monoscope code paths, direct SQL, infrequent jobs) and a keep/pause/remove recommendation; unserved HLL review | monoscope repo (read-only), prod pgwire logs | — | agent (Claude) | ✅ |
 | W5 | Per-range witness (restart recovery) | build | Stage 0 | **Deprioritized by measurement**: the 18:05 restart re-queued 26 `WitnessMoved` slices, all in the paused `sessions_1h_v1`, zero in dashboard tiers (`rollup_unverifiable_rebuild_queued` log). Revisit only if a dashboard tier shows it | — | W1 | Claude | ✅ measured |
 | W6 | `multi_scan_source` shapes | analysis → build (lane 2) | Rollup misses | Classify the 192/h self-join/UNION declines (service-edges); decide: route per-leg, rewrite in monoscope, or leave raw; then implement the chosen matcher change with a case-table test | `src/rollup.rs` matcher (`source_and_filters`, `match_aggregates`) | — | agent (Claude) | ✅ |
-| W7 | Stage 1 build measurement harness | build (lane 2) | Stage 1 | For representative units via `timefusion run-unit`: physical plan, scan count, hash shards, dedup ops, decoded bytes, aggregate-state memory, CPU; publication economics (commits/actions/latency incl. failures) | `src/main.rs` `run-unit`, `benches/rollup_work.rs`, report under `docs/plans/` | W3 for unit choice | Claude (timefusion-2e) | 🟡 harness handed off `ws/w7-run-unit-passes`; prod-log economics pending a ≥1 h process; **real-S3 unit cost blocked on staging** (no seeded prefix; owner decision) |
+| W7 | Stage 1 build measurement harness | build (lane 2) | Stage 1 | For representative units via `timefusion run-unit`: physical plan, scan count, hash shards, dedup ops, decoded bytes, aggregate-state memory, CPU; publication economics (commits/actions/latency incl. failures) | `src/main.rs` `run-unit`, `benches/rollup_work.rs`, report under `docs/plans/` | W3 for unit choice | Claude (timefusion-2e) | 🟡 harness handed off `ws/w7-run-unit-passes`; prod economics ✅ [report](2026-09-27-stage1-unit-economics.md); **real-S3 unit cost blocked on staging** (owner decision) |
 | W8 | 1D dependency classification — design + fixtures | analysis → build (lane 2) | Stage 1D | Per-spec dependency map (dims, measures, filters, identity, ts, version, delete); mutation fixture table proving zero missed relevant invalidations; then the classifier | new test module; `apply_rollup_hours` call sites in `database/rollup.rs` | W2 (which mutations dominate) | | ⬜ |
 | W9 | Stage 3 publication batching — design | analysis | Stage 3 | Concrete design mapped to existing staged publication / journal group-commit; WAL-compat decision (does the payload change?); queue limits; test list | design doc only | — | agent (Claude) | ✅ |
 | W10 | Capacity replay harness | build (lane 2) | Shared gates | `timefusion sim` replay of a prod journal at 1x/2x/4x rows and 1x/2x/4x projects; report backlog stability and work per accepted row | `src/maintenance_sim.rs`, `src/main.rs` | W2 | | ⬜ |
@@ -238,4 +238,18 @@ Guards: `a_narrow_whale_count_merge_is_not_heavy` (red on old code) and `a_full_
 Lint is clean and 30/30 admission tests pass, including e2e.
 **Integrator next:** batch it. After the deploy, `EXPLAIN` of a whale count shows no `AdmissionExec`, and
 `heavy_query_queue_timeout` flattens on a ≥1 h process. `heavy_query_held` then attributes the unbounded-sort share.
+
+### W7 result (part) — 2026-09-27 — Claude (timefusion-2e)
+**Report:** [`2026-09-27-stage1-unit-economics.md`](2026-09-27-stage1-unit-economics.md). It covers 60 min of process `cc6bfa40`
+(42–102 min uptime), read-only.
+**Numbers:**
+- BaseRollup completions held 48,812 lease-s/h (about 13.6 workers) but scanned only 75 GB/h physical.
+  Dedup scanned 899 GB/h.
+- Failed rollup attempts are now cheap: Retry plus Superseded held 270 s/h, against W16's 96%-retry baseline.
+- `slice_occ_stale` is down to 8/h.
+- Top shapes: `metrics_1m_v2` 180 m (30,009 s/h, 128 units, one third at 2 shards) and `dashboard_1m_v3`
+  720 m (about 410 s per unit).
+
+**Next:** those two shapes are the staging `run-unit --explain` units. Real-S3 per-unit cost is blocked until an
+owner creates a staging prefix.
 
