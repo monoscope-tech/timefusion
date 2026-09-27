@@ -1702,6 +1702,7 @@ async fn a_subgrain_sliced_tier_is_not_routed_over_its_partial_states() -> Resul
         insert_a_span(&db, &project, &format!("s{i}"), noon + offset * 60_000_000).await?;
     }
     db.run_unit_once("otel_logs_and_spans", &project, day, Operation::BaseRollup, 24, 0).await?;
+    db.run_unit_once("otel_logs_and_spans", &project, day, Operation::DerivedRollup, 24, 0).await?;
     let sessions = get_schema("otel_logs_and_spans")
         .expect("schema")
         .rollups
@@ -1723,31 +1724,34 @@ async fn a_subgrain_sliced_tier_is_not_routed_over_its_partial_states() -> Resul
 
     let mut ctx = Arc::clone(&db).create_session_context();
     db.setup_session_context(&mut ctx)?;
-    let window =
-        format!("project_id = '{project}' AND timestamp >= to_timestamp_micros({}) AND timestamp < to_timestamp_micros({})", noon - 2 * HOUR, noon + 2 * HOUR);
-    // The session tier is the only one carrying the session dimension; the second shape is the 1m tier's.
-    for (group, routes) in [("attributes___session___id", false), ("status_code", true)] {
+    use crate::rollup::MissReason::{NotBuilt, SubGrainSlices};
+    let render = |batches: &[RecordBatch]| arrow::util::pretty::pretty_format_batches(batches).map(|table| table.to_string());
+    let refusals = || crate::observability::maintenance_stats().rollup_miss_sub_grain_slices.load(std::sync::atomic::Ordering::Relaxed);
+    // Only the session tiers carry the session dimension; the others still route, and on
+    // an unbuilt day the refusal must not mask the finer tier's own reason.
+    for (group, bucket, lo, want) in [
+        ("attributes___session___id", "1 hours", noon, Err(SubGrainSlices)),
+        ("status_code", "1 hours", noon, Ok(Some("3600000000us".to_string()))),
+        ("status_code", "10 minutes", noon, Ok(Some("60000000us".to_string()))),
+        ("resource___service___name", "1 hours", noon - 24 * HOUR, Err(NotBuilt)),
+    ] {
         let sql = format!(
-            "SELECT time_bucket('1 hours', timestamp) AS tb, {group}, COUNT(*) AS c FROM otel_logs_and_spans WHERE {window} GROUP BY 1, 2 ORDER BY 1, 2"
+            "SELECT time_bucket('{bucket}', timestamp) AS tb, {group}, COUNT(*) AS c FROM otel_logs_and_spans WHERE project_id = '{project}' \
+             AND timestamp >= to_timestamp_micros({}) AND timestamp < to_timestamp_micros({}) GROUP BY 1, 2 ORDER BY 1, 2",
+            lo - 2 * HOUR,
+            lo + 2 * HOUR
         );
         let state = ctx.state();
         let plan = state.optimize(&state.create_logical_plan(&sql).await?)?;
         let routed = db.rollup_sql(&plan, &state).await.map(|rewrite| rewrite.map(|rewrite| rewrite.grain));
-        let render = |batches: &[RecordBatch]| arrow::util::pretty::pretty_format_batches(batches).map(|table| table.to_string());
-        let refusals = || crate::observability::maintenance_stats().rollup_miss_sub_grain_slices.load(std::sync::atomic::Ordering::Relaxed);
         let before = refusals();
         assert_eq!(
             render(&ctx.sql(&sql).await?.collect().await?)?,
             render(&db.query_delta_only(&sql).await?)?,
-            "{group}: must answer exactly as raw ({routed:?})"
+            "{group}/{bucket}: must answer exactly as raw ({routed:?})"
         );
-        match routes {
-            true => assert!(matches!(routed, Ok(Some(_))), "{group}: the 1m tier still routes, got {routed:?}"),
-            false => {
-                assert_eq!(routed, Err(crate::rollup::MissReason::SubGrainSlices), "{group}: the sub-grain-sliced tier must be refused");
-                assert!(refusals() > before, "{group}: the refusal is counted");
-            }
-        }
+        assert_eq!(routed, want, "{group}/{bucket}");
+        assert_eq!(refusals() > before, want == Err(SubGrainSlices), "{group}/{bucket}: only the refusal is counted as one");
     }
     Ok(())
 }

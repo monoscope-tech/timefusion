@@ -137,10 +137,15 @@ impl Database {
             match self.rollup_rewrite_for(route, session).await {
                 Ok(Some(rewrite)) => return Ok(Some(rewrite)),
                 Ok(None) => return Ok(None),
-                // A measure decline outranks whatever an earlier spec reported; plain `.or()`
-                // keeps the first reason and masks it.
+                // A measure decline outranks whatever an earlier spec reported; a sub-grain
+                // refusal is structural, so it must not mask a finer tier's actual gap.
                 Err(reason) => {
-                    best_miss = if matches!(reason, crate::rollup::MissReason::MeasureNotStored) { Some(reason) } else { best_miss.or(Some(reason)) }
+                    use crate::rollup::MissReason::{MeasureNotStored, SubGrainSlices};
+                    best_miss = match best_miss {
+                        None | Some(SubGrainSlices) => Some(reason),
+                        _ if reason == MeasureNotStored => Some(reason),
+                        kept => kept,
+                    }
                 }
             }
         }
