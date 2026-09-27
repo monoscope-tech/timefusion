@@ -14,8 +14,9 @@ use serde::Serialize;
 
 use crate::database::{coverage_is_short_for, median_contiguous_days};
 use crate::maintenance_coordinator::{
-    DAY_MICROS, InputFootprint, Invalidation, LIVE_FRONTIER_WINDOW_MICROS, MAX_DECODED_BYTES, MIN_SLICE_MICROS, MaintenanceTask, NORMAL_SLICE_MICROS,
-    Operation, STARVATION_HORIZON_MICROS, TaskJournal, TaskKey, TaskState, TimeSlice, operation_cycle, operation_deadline_secs, split_sheds_enough_at,
+    DAY_MICROS, DERIVED_SLICE_MICROS, InputFootprint, Invalidation, LIVE_FRONTIER_WINDOW_MICROS, MAX_DECODED_BYTES, MIN_SLICE_MICROS, MaintenanceTask,
+    NORMAL_SLICE_MICROS, Operation, STARVATION_HORIZON_MICROS, TaskJournal, TaskKey, TaskState, TimeSlice, operation_cycle, operation_deadline_secs,
+    split_sheds_enough_at,
 };
 
 const MICROS: i64 = 1_000_000;
@@ -212,6 +213,48 @@ pub struct SimConfig {
     /// original's day shapes (the PROJECTS axis).
     #[educe(Default = 1)]
     pub projects: usize,
+    /// Work the frontier does not produce, as units per ingesting stream per hour:
+    /// prod re-mints rollup and dedup slices whenever a flush, merge-on-read append
+    /// or rebuild lands in them, and plans compaction on its own schedule. Empty
+    /// replays only the frontier. See [`calibrated_remint`].
+    pub remint: Vec<(Operation, f64)>,
+    /// Measured mean seconds per unit, overriding the byte-priced table for the
+    /// operations listed; drawn uniformly on `[0, 2 * mean]` and scaled by `rows`.
+    pub mean_unit_secs: Vec<(Operation, u64)>,
+}
+
+/// Injection rates FITTED so a 1x replay of prod's journal reproduces prod's completions
+/// per operation within 20%. They are not raw mint counts: they net out what the frontier
+/// already mints and what an already-pending slice absorbs. Target: 2026-09-27 00:00-01:00 UTC on a 42-102 min process, Base 1,342, Derived
+/// 572, Dedup 444, HotPacking 229, SealedConsolidation 31 completions/h, over the
+/// journal's 21 ingesting streams. Without them a 1x replay ran out of work at a tenth of
+/// prod's rollup rate, so no 2x/4x delta was meaningful. Refit when prod's mix moves.
+pub fn calibrated_remint() -> Vec<(Operation, f64)> {
+    const PROD_INGESTING_STREAMS: f64 = 21.0;
+    [
+        (Operation::BaseRollup, 1_850.0),
+        (Operation::DerivedRollup, 745.0),
+        (Operation::Dedup, 360.0),
+        (Operation::HotPacking, 229.0),
+        (Operation::SealedConsolidation, 31.0),
+    ]
+    .map(|(operation, per_hour)| (operation, per_hour / PROD_INGESTING_STREAMS))
+    .to_vec()
+}
+
+/// Prod's completions per hour in the calibration window, the targets
+/// [`calibrated_remint`] was fitted to.
+pub const PROD_COMPLETIONS_PER_HOUR: [(Operation, f64); 5] = [
+    (Operation::BaseRollup, 1_342.0),
+    (Operation::DerivedRollup, 572.0),
+    (Operation::Dedup, 444.0),
+    (Operation::HotPacking, 229.0),
+    (Operation::SealedConsolidation, 31.0),
+];
+
+/// Prod's mean lease seconds per COMPLETED unit over the same window.
+pub fn calibrated_unit_secs() -> Vec<(Operation, u64)> {
+    vec![(Operation::BaseRollup, 36), (Operation::DerivedRollup, 8), (Operation::Dedup, 31), (Operation::HotPacking, 4), (Operation::SealedConsolidation, 38)]
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -495,6 +538,41 @@ fn mint_stream(journal: &mut TaskJournal, stream: &Stream, start_micros: i64, en
     }
 }
 
+/// One re-minted unit for `stream`: a single aligned slice of the last day (a day
+/// earlier, to consolidate). Derived slices are hourly, so they spread over a week, as
+/// prod's derived work does, or 24 keys per stream would cap their rate. A slice
+/// already pending absorbs the unit, as in prod.
+fn remint_one(journal: &mut TaskJournal, stream: &Stream, operation: Operation, now: i64, rng: &mut Rng) {
+    let derived = operation == Operation::DerivedRollup;
+    let (width, window) = if derived { (DERIVED_SLICE_MICROS, 7 * DAY_MICROS) } else { (NORMAL_SLICE_MICROS, DAY_MICROS) };
+    let start = now.div_euclid(width) * width - (1 + (rng.next() % (window / width) as u64) as i64) * width;
+    match operation {
+        Operation::Dedup | Operation::BaseRollup | Operation::DerivedRollup => {
+            let rollup_table = if derived { stream.derived_rollup_table.as_deref() } else { Some(stream.base_rollup_table.as_str()) };
+            let Some(rollup_table) = rollup_table else { return };
+            let _ = journal.invalidate(Invalidation {
+                source_table: &stream.source_table,
+                rollup_table,
+                source: &stream.source,
+                project_id: &stream.project_id,
+                start_micros: start,
+                end_micros: start + width,
+                observed_at_micros: now,
+                derived,
+                mint_dedup: operation == Operation::Dedup,
+                mint_rollup: operation != Operation::Dedup,
+            });
+        }
+        Operation::HotPacking | Operation::SealedConsolidation | Operation::Repair => {
+            let start = if operation == Operation::HotPacking { start } else { start - DAY_MICROS };
+            let Ok(slice) = TimeSlice::new(start, start + width) else { return };
+            let key =
+                TaskKey { physical_table: stream.source_table.clone(), source: stream.source.clone(), project_id: stream.project_id.clone(), slice, operation };
+            journal.enqueue(key, now, 0, u64::try_from(now / 1_000).unwrap_or_default());
+        }
+    }
+}
+
 fn streams_from_journal(journal: &TaskJournal) -> Vec<Stream> {
     // Dedup tasks name the source table, rollup tasks name the tier tables.
     let mut streams: Vec<Stream> = Vec::new();
@@ -691,6 +769,7 @@ pub fn run(mut journal: TaskJournal, cfg: &SimConfig, start_micros: i64) -> anyh
         SimReport { hours: hours(cfg.horizon_micros), pending_start: journal.tasks().filter(|t| t.state != TaskState::Complete).count(), ..Default::default() };
     let mut workers = (0..cfg.workers).map(|_| Worker { busy_until: start_micros, current: None, cycle_pos: 0 }).collect::<Vec<_>>();
     let mut next_mint = start_micros + MINT_INTERVAL_MICROS;
+    let mut remint_owed: HashMap<(usize, usize), f64> = HashMap::new();
     let mut next_restart = match (cfg.restart_at_micros, cfg.restart_every_micros) {
         (Some(at), _) => start_micros + at,
         (None, every) if every > 0 => start_micros + every,
@@ -731,6 +810,16 @@ pub fn run(mut journal: TaskJournal, cfg: &SimConfig, start_micros: i64) -> anyh
                     mint_stream(&mut journal, stream, from, next_mint, next_mint);
                 }
                 report.minted_units += (journal.tasks().count() - before) as u64;
+            }
+            for (index, stream) in streams.iter().enumerate().filter(|(_, s)| s.last_created_ms >= idle_cutoff_ms) {
+                for (lane, (operation, per_hour)) in cfg.remint.iter().enumerate() {
+                    let owed = remint_owed.entry((index, lane)).or_default();
+                    *owed += per_hour * MINT_INTERVAL_MICROS as f64 / HOUR_MICROS as f64;
+                    while *owed >= 1.0 {
+                        *owed -= 1.0;
+                        remint_one(&mut journal, stream, *operation, now, &mut rng);
+                    }
+                }
             }
             none_until.fill(0);
             // The cadence advances whether or not minting is on — otherwise
@@ -867,7 +956,10 @@ pub fn run(mut journal: TaskJournal, cfg: &SimConfig, start_micros: i64) -> anyh
             match claimed {
                 Some(task) => {
                     let bytes = model.as_ref().map(|model| model.bytes(&task.key));
-                    let (secs, byte_secs) = unit_secs(task.key.operation, task.key.slice.width(), bytes, &mut rng);
+                    let (secs, byte_secs) = match cfg.mean_unit_secs.iter().find(|(operation, _)| *operation == task.key.operation) {
+                        Some((_, mean)) => (((rng.uniform_secs(0, 2 * mean)) as f64 * cfg.rows) as u64, None),
+                        None => unit_secs(task.key.operation, task.key.slice.width(), bytes, &mut rng),
+                    };
                     if let Some(byte_secs) = byte_secs {
                         report.expensive_units += 1;
                         report.expensive_byte_secs += byte_secs * cfg.duration_scale;
@@ -1128,6 +1220,37 @@ mod tests {
 
     fn cfg(hours: i64) -> SimConfig {
         SimConfig { horizon_micros: hours * HOUR_MICROS, ..Default::default() }
+    }
+
+    /// A 1x replay must do prod's work, or a 2x/4x delta scales the wrong baseline:
+    /// before calibration the replay ran out of work at a tenth of prod's rollup rate
+    /// and drained its whole queue within the hour.
+    #[test]
+    fn a_calibrated_replay_does_prods_work_at_a_steady_stock() {
+        // Rates are per stream, so 3 of prod's 21 streams must do 3/21 of its work.
+        const STREAMS: usize = 3;
+        let calibrated = SimConfig { workers: 66 * STREAMS / 21, remint: calibrated_remint(), mean_unit_secs: calibrated_unit_secs(), ..cfg(3) };
+        // Prod's journal holds a week of built base slices; derived units wait on them.
+        let mut journal = journal_with_streams(STREAMS);
+        for project in (0..STREAMS).map(|i| format!("p{i}")) {
+            for slice in (START - 7 * DAY_MICROS..START).step_by(NORMAL_SLICE_MICROS as usize) {
+                let base = key(&project, Operation::BaseRollup, slice, NORMAL_SLICE_MICROS);
+                journal.enqueue(base.clone(), 0, 0, 0);
+                let mut task = journal.tasks().find(|task| task.key == base).cloned().expect("enqueued base slice");
+                task.state = TaskState::Complete;
+                journal.upsert(task);
+            }
+        }
+        let report = run(journal, &calibrated, START).unwrap();
+        for (operation, prod) in PROD_COMPLETIONS_PER_HOUR {
+            let target = prod * STREAMS as f64 / 21.0;
+            let done = report.completions.get(&format!("{operation:?}")).copied().unwrap_or_default() as f64 / report.hours;
+            assert!((done / target - 1.0).abs() <= 0.2, "{operation:?}: {done:.0}/h against prod's {target:.0}/h");
+        }
+        let second_half = &report.samples[report.samples.len() / 2..];
+        let level = second_half.iter().map(|sample| sample.pending as f64).sum::<f64>() / second_half.len() as f64;
+        let drift = slope_per_hour(second_half, |sample| sample.pending as f64);
+        assert!(drift.abs() <= 0.1 * level, "the stock must hold, not drain or grow: {drift:.0}/h around {level:.0}");
     }
 
     #[test]

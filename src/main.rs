@@ -229,7 +229,7 @@ fn run_sim_cli() -> anyhow::Result<()> {
         timefusion::config::init_config().map_err(|e| anyhow::anyhow!("kill-switch env set but config failed to load: {e}"))?;
     }
     let mut it = Args::new();
-    let usage = "usage: timefusion sim <journal.json|data-dir|synth:whale> [--hours N] [--workers N] [--streams N] [--scale F] [--seed N] [--no-mint] [--mint] [--debris-slice-minutes N] [--floorless] [--guard-off] [--rows K] [--projects K] [--now UNIX_SECS] [--json]";
+    let usage = "usage: timefusion sim <journal.json|data-dir|synth:whale> [--hours N] [--workers N] [--streams N] [--scale F] [--seed N] [--no-mint] [--mint] [--debris-slice-minutes N] [--floorless] [--guard-off] [--rows K] [--projects K] [--calibrated] [--now UNIX_SECS] [--json]";
     let input = it.next().context(usage)?;
     let mut cfg = SimConfig::default();
     let mut json = false;
@@ -255,6 +255,8 @@ fn run_sim_cli() -> anyhow::Result<()> {
         "--guard-off" => cfg.split_guard = timefusion::maintenance_sim::SplitGuard::Off,
         "--rows" => cfg.rows = it.parse("--rows", "a number")?,
         "--projects" => cfg.projects = it.parse("--projects", "an integer")?,
+        // Add prod's measured re-mint and compaction rates to the frontier.
+        "--calibrated" => (cfg.remint, cfg.mean_unit_secs) = (timefusion::maintenance_sim::calibrated_remint(), timefusion::maintenance_sim::calibrated_unit_secs()),
         // The journal's deadlines are real time: replay from its fetch time.
         "--now" => now = it.parse::<i64>("--now", "unix seconds")? * 1_000_000,
         "--json" => json = true,
