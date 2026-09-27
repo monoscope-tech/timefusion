@@ -49,7 +49,7 @@ Status: ⬜ open · 🟡 in progress · ✅ done. Priority is the plan's executi
 | W7 | Stage 1 build measurement harness | build (lane 2) | Stage 1 | For representative units via `timefusion run-unit`: physical plan, scan count, hash shards, dedup ops, decoded bytes, aggregate-state memory, CPU; publication economics (commits/actions/latency incl. failures) | `src/main.rs` `run-unit`, `benches/rollup_work.rs`, report under `docs/plans/` | W3 for unit choice | Claude (timefusion-2e) | 🟡 harness handed off `ws/w7-run-unit-passes`; prod economics ✅ [report](2026-09-27-stage1-unit-economics.md); **real-S3 unit cost blocked on staging** (owner decision) |
 | W8 | 1D dependency classification — design + fixtures | analysis → build (lane 2) | Stage 1D | Per-spec dependency map (dims, measures, filters, identity, ts, version, delete); mutation fixture table proving zero missed relevant invalidations; then the classifier | new test module; `apply_rollup_hours` call sites in `database/rollup.rs` | W2 (which mutations dominate) | Claude (timefusion-2e) | ✅ shadow classifier handed off `ws/w8-shadow-classifier` |
 | W9 | Stage 3 publication batching — design | analysis | Stage 3 | Concrete design mapped to existing staged publication / journal group-commit; WAL-compat decision (does the payload change?); queue limits; test list | design doc only | — | agent (Claude) | ✅ |
-| W10 | Capacity replay harness | build (lane 2) | Shared gates | `timefusion sim` replay of a prod journal at 1x/2x/4x rows and 1x/2x/4x projects; report backlog stability and work per accepted row | `src/maintenance_sim.rs`, `src/main.rs` | W2 | | ⚠️ `e9ce6dc3` built; **1x replay NOT calibrated** vs prod executions/h (see W10 calibration) — multipliers untrusted until minting + compaction ops are modelled |
+| W10 | Capacity replay harness | build (lane 2) | Shared gates | `timefusion sim` replay of a prod journal at 1x/2x/4x rows and 1x/2x/4x projects; report backlog stability and work per accepted row | `src/maintenance_sim.rs`, `src/main.rs` | W2 | | ✅ `e9ce6dc3`; calibrated 1x replay handed off `ws/w10-calibrate` (all ops within ±20% of prod, steady stock; see W10 calibration) |
 | W11 | OpenTelemetry 0.33 upgrade | build (lane 2) | Housekeeping | Closes the `opentelemetry_sdk` advisory (unbounded baggage alloc) | `Cargo.toml`, `src/observability.rs` | — | Claude (timefusion-2e) | ✅ handed off |
 | W12 | `dcount(name)` measure decision | analysis | Rollup misses | Cost/benefit for a `name` HLL + 2-way server-scope count guard on `dashboard_1m_v3` (schema comment ~L501 declines it on purpose); owner decides | `schemas/otel_logs_and_spans.yaml` (proposal only) | W2 | Claude (timefusion-2e) | ✅ analysis — owner decides (see result) |
 | W13 | Narrow the slice OCC gate (Stage 3 step 1) | build (lane 2) | Stage 3 | A non-overlapping sibling slice no longer makes a staged unit `slice_occ_stale`; a unit may retire narrower contained slices; target proof re-recorded under the commit lock; cause logging; tests 1, 3, 3b of the W9 design failing-first | `maintain.rs` `run_coordinator_rollup_selected` OCC check | W9 | Claude | ✅ on master (`7e03e0e6` + `202b10b0`) |
@@ -471,3 +471,31 @@ not a carry.
 Sealed-day denials were rare this hour — neither (a) narrowing nor (b) faster certification has a case yet; re-sample
 during a daytime backlog before building either.
 **Also:** `heavy_query_queue_timeout` 0 over the hour (admission fix holds); `flush_failed` 0.
+
+**W10 calibration, built — 2026-09-27 — Claude (timefusion-2e).** Branch `ws/w10-calibrate`, one commit, touching only
+`maintenance_sim.rs` and the sim CLI.
+- `timefusion sim <journal> --calibrated` adds per-stream re-mint at rates **fitted** to prod's completions (not raw
+  mint counts; they net out frontier mints and absorption on pending slices). It also adds the missing HotPacking and
+  SealedConsolidation lanes.
+- Measured mean unit seconds (Base 36, Derived 8, Dedup 31, Hot 4, Sealed 38) replace the pre-W13/W14 duration table
+  and are scaled by the rows axis.
+- Derived re-mint spans a week, as prod's does. Otherwise each stream would have only 24 hourly keys.
+- Without `--calibrated`, existing runs and tests are unchanged.
+
+Prod journal, 3 h at 66 workers (`--now` 02:21Z):
+
+| per hour | sim | prod | ratio |
+| --- | --- | --- | --- |
+| BaseRollup | 1,279 | 1,342 | 0.95 |
+| Dedup | 448 | 444 | 1.01 |
+| DerivedRollup | 524 | 572 | 0.92 |
+| HotPacking | 209 | 229 | 0.91 |
+| SealedConsolidation | 28 | 31 | 0.90 |
+| pending | 326 → 1,038 → ~1,076–1,110 plateau | steady | — |
+
+**Test:** `a_calibrated_replay_does_prods_work_at_a_steady_stock` uses a synthetic journal: 3 of 21 streams, 10 workers,
+targets scaled by 3/21, and a week of built base slices. It asserts every operation is within 20% and pending drift is
+≤10%/h of its level, and runs in ~6 s. `cargo lint` is clean and the sim tests pass 33/33.
+**Use:** 2x/4x deltas via `--rows` / `--projects` / `--streams` on top of `--calibrated`. Refit the rates when prod's
+operation mix moves.
+
