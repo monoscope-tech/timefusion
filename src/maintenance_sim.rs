@@ -14,9 +14,9 @@ use serde::Serialize;
 
 use crate::database::{coverage_is_short_for, median_contiguous_days};
 use crate::maintenance_coordinator::{
-    DAY_MICROS, DERIVED_SLICE_MICROS, InputFootprint, Invalidation, LIVE_FRONTIER_WINDOW_MICROS, MAX_DECODED_BYTES, MIN_SLICE_MICROS, MaintenanceTask,
-    NORMAL_SLICE_MICROS, Operation, STARVATION_HORIZON_MICROS, TaskJournal, TaskKey, TaskState, TimeSlice, operation_cycle, operation_deadline_secs,
-    split_sheds_enough_at,
+    BaseTierCoverage, DAY_MICROS, DERIVED_SLICE_MICROS, InputFootprint, Invalidation, LIVE_FRONTIER_WINDOW_MICROS, MAX_DECODED_BYTES, MIN_SLICE_MICROS,
+    MaintenanceTask, NORMAL_SLICE_MICROS, Operation, STARVATION_HORIZON_MICROS, TaskJournal, TaskKey, TaskState, TimeSlice, operation_cycle,
+    operation_deadline_secs, split_sheds_enough_at,
 };
 
 const MICROS: i64 = 1_000_000;
@@ -573,6 +573,30 @@ fn remint_one(journal: &mut TaskJournal, stream: &Stream, operation: Operation, 
     }
 }
 
+/// What prod's backfill planner publishes from the tier files: per derived cell, the
+/// base slices already built. Without it every derived candidate rescans the whole
+/// journal on every claim, which prod never does, and the sim slows superlinearly.
+fn base_tier_ready(journal: &TaskJournal, streams: &[Stream]) -> BaseTierCoverage {
+    let derived: HashMap<(&str, &str), &str> = streams
+        .iter()
+        .filter_map(|stream| stream.derived_rollup_table.as_deref().map(|table| ((stream.project_id.as_str(), stream.base_rollup_table.as_str()), table)))
+        .collect();
+    let mut ready = BaseTierCoverage::new();
+    for task in journal.tasks().filter(|task| task.state == TaskState::Complete && task.key.operation == Operation::BaseRollup) {
+        let (Some(table), Some(date)) = (
+            derived.get(&(task.key.project_id.as_str(), task.key.physical_table.as_str())),
+            chrono::DateTime::from_timestamp_micros(task.key.slice.start_micros).map(|time| time.date_naive().to_string()),
+        ) else {
+            continue;
+        };
+        ready
+            .entry((task.key.source.clone(), task.key.project_id.clone(), (*table).to_owned(), date))
+            .or_default()
+            .push((task.key.slice.start_micros, task.key.slice.end_micros));
+    }
+    ready
+}
+
 fn streams_from_journal(journal: &TaskJournal) -> Vec<Stream> {
     // Dedup tasks name the source table, rollup tasks name the tier tables.
     let mut streams: Vec<Stream> = Vec::new();
@@ -840,6 +864,7 @@ pub fn run(mut journal: TaskJournal, cfg: &SimConfig, start_micros: i64) -> anyh
             report.coarsen_candidates += coarsen.candidates;
             report.coarsen_blocked += coarsen.blocked;
             report.coarsen_over_budget += coarsen.over_budget;
+            journal.set_base_tier_ready(base_tier_ready(&journal, &streams));
             if coarsen.total() != 0 {
                 none_until.fill(0);
             }
