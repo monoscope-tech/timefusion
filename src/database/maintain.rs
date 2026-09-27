@@ -2181,12 +2181,15 @@ impl Database {
     /// second copy of this rule is how the pre-scan check and the post-write
     /// safety net drift apart, and the disagreeing one double counts.
     fn covering_slice_for(add: &deltalake::kernel::Add, key: &crate::maintenance_coordinator::TaskKey) -> Option<(i64, i64)> {
+        Self::containing_slice_for(add, key).filter(|&range| range != (key.slice.start_micros, key.slice.end_micros))
+    }
+
+    /// The slice of `add` when it is the same project's and contains `key`'s, EQUAL
+    /// included. Such a file strands every child of a split: each sees it as strictly
+    /// wider and escalates back to the parent, and only a whole-width publish retires it.
+    fn containing_slice_for(add: &deltalake::kernel::Add, key: &crate::maintenance_coordinator::TaskKey) -> Option<(i64, i64)> {
         let (start, end) = Self::slice_tag_range(add)?;
-        (Self::tag_project(add) == Some(key.project_id.as_str())
-            && (start, end) != (key.slice.start_micros, key.slice.end_micros)
-            && start <= key.slice.start_micros
-            && end >= key.slice.end_micros)
-            .then_some((start, end))
+        (Self::tag_project(add) == Some(key.project_id.as_str()) && start <= key.slice.start_micros && end >= key.slice.end_micros).then_some((start, end))
     }
 
     fn packed_rollup_repair_allowed(&self, key: &crate::maintenance_coordinator::TaskKey) -> bool {
@@ -2905,12 +2908,18 @@ impl Database {
         //
         // Absent or unreadable target tier means "not covered": the conservative
         // direction is to do the work, exactly as before this check existed.
+        let mut split_strands_children = false;
         if let Ok(target_ref) = self.resolve_table(&key.project_id, &key.physical_table).await {
-            let covering = {
+            let containing = {
                 let target = target_ref.read().await;
-                target.snapshot().ok().and_then(|snapshot| snapshot.log_data().iter().find_map(|file| Self::covering_slice_for(&add_action(&file), &key)))
+                target
+                    .snapshot()
+                    .ok()
+                    .map(|snapshot| snapshot.log_data().iter().filter_map(|file| Self::containing_slice_for(&add_action(&file), &key)).collect::<Vec<_>>())
+                    .unwrap_or_default()
             };
-            if let Some(covering) = covering
+            split_strands_children = !containing.is_empty();
+            if let Some(covering) = containing.into_iter().find(|&range| range != (key.slice.start_micros, key.slice.end_micros))
                 && self.settle_covered_by_wider(&key, covering, (source_rows, source_epoch), &from_table, witness_table.as_ref(), date).await?
             {
                 return Ok(true);
@@ -2965,7 +2974,9 @@ impl Database {
             }
             return Ok(true);
         }
-        if estimated_bytes > MAX_DECODED_BYTES && key.slice.width() > crate::maintenance_coordinator::MIN_SLICE_MICROS {
+        // Prod 2026-09-27: splitting under a live file of exactly this width livelocked
+        // five sealed cells, re-minted every census tick. Hash shards bound the whole unit.
+        if !split_strands_children && estimated_bytes > MAX_DECODED_BYTES && key.slice.width() > crate::maintenance_coordinator::MIN_SLICE_MICROS {
             let mut journal = self.journal();
             if journal.split_time_task(&key, estimated_bytes, Some(input_footprint)) {
                 journal.checkpoint()?;
@@ -4661,7 +4672,7 @@ impl Database {
         {
             return Ok(false);
         }
-        let escalated = {
+        let (escalated, requeued) = {
             let _guard = crate::support::lock(&self.rollup_journal_lock);
             let mut journal = self.journal();
             if journal.state(key) != Some(crate::maintenance_coordinator::TaskState::Running) {
@@ -4669,20 +4680,23 @@ impl Database {
             }
             let now = crate::support::now_micros();
             let current = self.rollup_source_epochs.get(&(key.project_id.clone(), key.source.clone(), date.to_string())).map_or(0, |entry| *entry.value());
+            // `requeued` is false when `enqueue_inner` vetoes a Superseded parent with a
+            // live descendant: the covering slice then waits for the planner, not for us.
+            let requeued = current == source_epoch
+                && journal.enqueue_with_base_tier(covering_key, now, crate::maintenance_coordinator::MAX_DECODED_BYTES, unix_ms(now), false);
             if current == source_epoch {
-                journal.enqueue(covering_key, now, crate::maintenance_coordinator::MAX_DECODED_BYTES, unix_ms(now));
                 journal.complete(key);
             } else {
                 journal.retry(key, "noop_proof_changed".to_owned(), now.saturating_add(ROLLUP_PROOF_RETRY_MICROS));
             }
-            current == source_epoch
+            (current == source_epoch, requeued)
         };
         self.journal().checkpoint()?;
         if escalated {
             crate::observability::maintenance_stats().rollup_skipped_covered_by_wider.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             info!(
                 table = %key.physical_table, project_id = %key.project_id,
-                slice_start = key.slice.start_micros, covering_start, covering_end,
+                slice_start = key.slice.start_micros, covering_start, covering_end, requeued,
                 event = "maintenance_rollup_escalated_to_covering_slice"
             );
         }
@@ -11910,6 +11924,43 @@ mod bounded_witness_tests {
     #[test]
     fn a_straddling_file_is_excluded_wholesale_not_split() {
         assert!(!counted(1_500, 1_000), "min below and max above still excludes — never a partial count");
+    }
+}
+
+#[cfg(test)]
+mod split_stranding_tests {
+    use crate::database::Database;
+    use crate::maintenance_coordinator::{Operation, TAG_PROJECT, TAG_SLICE_END, TAG_SLICE_START, TaskKey, TimeSlice};
+
+    const H: i64 = 3_600_000_000;
+
+    /// A split is safe only when no live file of the project contains the unit; the
+    /// equal-width case is the prod livelock (children escalate to a parent that splits).
+    /// This pins the predicate only: the split-site wiring has no DB-level guard, and
+    /// prod's `split_into_smaller_slices` count on sealed cells is what shows it holds.
+    #[test_case::test_case("p", (12, 24) => true ; "equal width strands the children")]
+    #[test_case::test_case("p", (0, 24) => true ; "a wider file strands them too")]
+    #[test_case::test_case("p", (18, 24) => false ; "a narrower file leaves no child under it")]
+    #[test_case::test_case("p", (6, 18) => false ; "an overlapping file does not contain the unit")]
+    #[test_case::test_case("other", (12, 24) => false ; "another project's file")]
+    fn a_containing_file_strands_a_split(project: &str, (start, end): (i64, i64)) -> bool {
+        let add = deltalake::kernel::Add {
+            tags: Some(
+                [(TAG_PROJECT, project.to_owned()), (TAG_SLICE_START, (start * H).to_string()), (TAG_SLICE_END, (end * H).to_string())]
+                    .into_iter()
+                    .map(|(name, value)| (name.to_owned(), Some(value)))
+                    .collect(),
+            ),
+            ..Default::default()
+        };
+        let key = TaskKey {
+            project_id: "p".into(),
+            source: "otel_logs_and_spans".into(),
+            physical_table: "t".into(),
+            slice: TimeSlice::new(12 * H, 24 * H).expect("valid slice"),
+            operation: Operation::BaseRollup,
+        };
+        Database::containing_slice_for(&add, &key).is_some()
     }
 }
 
