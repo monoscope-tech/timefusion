@@ -5313,26 +5313,39 @@ impl Database {
     fn enqueue_unverifiable_rebuilds(
         &self, source: &str, spec: &crate::schema::RollupSpec, target: &str, reason: RollupRebuildReason,
         slices: &[(String, crate::maintenance_coordinator::TimeSlice)],
-    ) {
+    ) -> usize {
         use crate::maintenance_coordinator::{MAX_DECODED_BYTES, Operation, TaskKey};
         if slices.is_empty() {
-            return;
+            return 0;
         }
         let operation = if spec.derive_from.is_some() { Operation::DerivedRollup } else { Operation::BaseRollup };
         let now = crate::support::now_micros();
         let created = unix_ms(now);
+        let mut journal = self.journal();
         // NEWEST FIRST, and bounded: queueing these flat produces a backlog that cannot
         // drain and makes the coordinator's ranking meaningless. Re-running hourly
         // advances the frontier — a republished slice carries a witness, leaves this
-        // list, and the next pass takes the next `BOUND`.
-        let ordered =
-            slices.iter().collect::<HashSet<_>>().into_iter().sorted_unstable_by_key(|(_, slice)| std::cmp::Reverse(slice.start_micros)).collect_vec();
+        // list, and the next pass takes the next `BOUND`. Slices the build policy
+        // forbids are refused at enqueue anyway; dropping them first keeps them out of
+        // the bound and out of the count.
+        let ordered = slices
+            .iter()
+            .map(|(project_id, slice)| TaskKey {
+                physical_table: target.to_owned(),
+                source: source.to_owned(),
+                project_id: project_id.clone(),
+                slice: *slice,
+                operation,
+            })
+            .filter(|key| journal.rollup_build_allowed(key))
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .sorted_unstable_by_key(|key| std::cmp::Reverse(key.slice.start_micros))
+            .collect_vec();
         const BOUND: usize = 512;
         let total = ordered.len();
         let queued = total.min(BOUND);
-        let mut journal = self.journal();
-        for (project_id, slice) in ordered.into_iter().take(BOUND) {
-            let key = TaskKey { physical_table: target.to_owned(), source: source.to_owned(), project_id: project_id.clone(), slice: *slice, operation };
+        for key in ordered.into_iter().take(BOUND) {
             journal.enqueue(key, now, MAX_DECODED_BYTES, created);
         }
         // The enqueue is replayable from the log, so a failed checkpoint costs a redo, not the
@@ -5345,10 +5358,12 @@ impl Database {
             target,
             queued,
             deferred = total.saturating_sub(queued),
+            policy_blocked = slices.len().saturating_sub(total),
             ?reason,
             event = "rollup_unverifiable_rebuild_queued",
             "unverifiable slices queued for republish, newest first"
         );
+        queued
     }
 
     /// How many DATE-level coverage entries exist.
@@ -10656,6 +10671,31 @@ mod rollup_noop_skip_tests {
             "neither a paused tier nor pre-resume history may expand the source scan"
         );
         assert_eq!(journal.repair_cursor(TaskJournal::DAMAGE_REPAIR_MIGRATION, source), 0, "policy-blocked forced repair must remain pending");
+        Ok(())
+    }
+
+    /// Prod 2026-09-27 boot: coverage recovery reported 512 ObsoleteGeneration rebuilds
+    /// queued for the PAUSED sessions tier, every boot. A paused tier's rebuilds must
+    /// reach neither the queue nor the count.
+    #[serial]
+    #[tokio::test]
+    async fn unverifiable_rebuilds_skip_a_paused_tier() -> Result<()> {
+        use crate::maintenance_coordinator::{RollupBuildPolicy, TimeSlice};
+        let source = "otel_logs_and_spans";
+        let target = "otel_logs_and_spans_rollup_sessions_1h_v1";
+        let spec = get_schema(source).expect("source schema").rollups.iter().find(|spec| spec.table_name(source) == target).expect("sessions tier").clone();
+        let (db, project, date) = rollup_db("paused_rebuilds").await?;
+        db.journal().set_rollup_build_policy(source, target, RollupBuildPolicy::Paused)?;
+        let day = day_start_micros(date).expect("valid day");
+        let slices: Vec<_> = (0..3)
+            .map(|hour| (project.clone(), TimeSlice { start_micros: day + hour * 3_600_000_000, end_micros: day + (hour + 1) * 3_600_000_000 }))
+            .collect();
+        assert_eq!(
+            db.enqueue_unverifiable_rebuilds(source, &spec, target, RollupRebuildReason::ObsoleteGeneration, &slices),
+            0,
+            "a paused tier queues nothing"
+        );
+        assert!(db.journal().tasks().all(|task| task.key.physical_table != target), "and leaves nothing in the journal");
         Ok(())
     }
 
