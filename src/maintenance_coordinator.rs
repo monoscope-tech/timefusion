@@ -64,6 +64,10 @@ pub const MAX_DECODED_BYTES: u64 = 512 * 1024 * 1024;
 /// work. One `NORMAL_SLICE_MICROS` — a frontier a whole slice behind is not
 /// keeping up.
 pub const FRONTIER_LAG_BUDGET_SECS: u64 = 600;
+/// Longest an idle claim answer is reused. Queue and dependency changes clear it
+/// at once; this bounds only the inputs that do not pass through `mark_dirty`
+/// (the reservation turn, the frontier lag).
+const IDLE_CLAIM_MEMO_MICROS: i64 = 200_000;
 
 /// The longest per-unit idle window any operation gets. `COORDINATOR_LOOP_TIMEOUT`
 /// is derived from this so the outer guard cannot become the real deadline.
@@ -635,6 +639,11 @@ pub struct TaskJournal {
     /// Runtime only. Nested maps (not a tuple key) so the lookup in `rank`
     /// borrows `&str`.
     dedup_complete_edges: HashMap<String, HashMap<String, HashSet<i64>>>,
+    /// `(operation, allow_quarantined)` whose last claim found nothing, until when.
+    /// Every idle worker polls every lane each second under the journal mutex, and
+    /// a walk that finds nothing finds nothing again until the queue or the clock
+    /// moves. Runtime only.
+    idle_claims: HashMap<(Operation, bool), i64>,
 }
 
 /// Ensures a claimed task cannot remain stuck in `Running` when its worker
@@ -738,6 +747,8 @@ pub struct Invalidation<'a> {
 thread_local! {
     /// Tasks `dependencies_complete` examined — pins its cost shape in tests.
     static DEPENDENCY_VISITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Claimable lists `claim_next` walked — pins that an idle claim is O(1).
+    static CLAIM_WALKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// Insert or replace a task by key, keeping `indices` in step with `tasks`.
@@ -853,6 +864,7 @@ impl TaskJournal {
             claim_tick: 0,
             frontier_lag_secs: std::sync::atomic::AtomicU64::new(0),
             dedup_complete_edges: HashMap::new(),
+            idle_claims: HashMap::new(),
         };
         journal.rebuild_dedup_edges();
         journal.rebuild_claimable();
@@ -887,6 +899,7 @@ impl TaskJournal {
     /// Apply `edit` to every task `select` accepts, marking each dirty and
     /// returning how many changed.
     fn edit_tasks(&mut self, select: impl Fn(&MaintenanceTask) -> bool, mut edit: impl FnMut(&mut MaintenanceTask)) -> usize {
+        self.idle_claims.clear();
         let dirty = &mut self.dirty_tasks;
         self.snapshot.tasks.iter_mut().filter(|task| select(task)).fold(0usize, |changed, task| {
             edit(task);
@@ -1427,6 +1440,7 @@ impl TaskJournal {
 
     /// Replace required-parent evidence without widening holes between proven ranges.
     pub(crate) fn set_base_tier_ready(&mut self, ready: BaseTierCoverage) {
+        self.idle_claims.clear();
         self.base_tier_ready = ready.into_iter().map(|(cell, ranges)| (cell, crate::write::mem_buffer::merge_ranges(ranges))).collect();
     }
 
@@ -1518,6 +1532,7 @@ impl TaskJournal {
     /// the only thing that bounds the permissive set's growth.
     fn rebuild_claimable(&mut self) {
         self.claimable.clear();
+        self.idle_claims.clear();
         for task in self.snapshot.tasks.iter().filter(|task| matches!(task.state, TaskState::Pending | TaskState::Retry | TaskState::Running)) {
             if self.rollup_build_allowed(&task.key) {
                 self.claimable.entry(task.key.operation).or_default().insert(task.key.clone());
@@ -1561,6 +1576,7 @@ impl TaskJournal {
     /// filtered on the way past and pruned lazily, so the set errs toward
     /// holding too much rather than too little.
     fn mark_dirty(&mut self, key: TaskKey) {
+        self.idle_claims.clear();
         if self.rollup_build_allowed(&key)
             && self.task(&key).is_some_and(|task| matches!(task.state, TaskState::Pending | TaskState::Retry | TaskState::Running))
         {
@@ -1952,6 +1968,11 @@ impl TaskJournal {
     }
 
     fn claim_next_timed(&mut self, operation: Operation, now_micros: i64, allow_quarantined: bool) -> Option<MaintenanceTask> {
+        if self.idle_claims.get(&(operation, allow_quarantined)).is_some_and(|&until| now_micros < until) {
+            return None;
+        }
+        #[cfg(test)]
+        CLAIM_WALKS.set(CLAIM_WALKS.get() + 1);
         self.claim_tick = self.claim_tick.wrapping_add(1);
         // Class is strict priority and ingest regenerates frontier work continuously, so one
         // claim in two is RESERVED for sealed work — one in four while the frontier is behind
@@ -1993,8 +2014,12 @@ impl TaskJournal {
         // can live on `self` while the walk borrows `self.snapshot.tasks`.
         let mut ranked = std::mem::take(&mut self.claim_scratch);
         ranked.clear();
+        let mut idle_until = now_micros.saturating_add(IDLE_CLAIM_MEMO_MICROS);
         for (index, task) in self.claim_candidates(operation) {
             if !self.task_can_be_claimed(task, now_micros, allow_quarantined) {
+                if task.deadline_micros > now_micros {
+                    idle_until = idle_until.min(task.deadline_micros);
+                }
                 continue;
             }
             let waited = now_micros.saturating_sub(task.key.slice.end_micros);
@@ -2012,7 +2037,10 @@ impl TaskJournal {
         let selected = self.select_claim(&ranked, operation);
         ranked.clear();
         self.claim_scratch = ranked;
-        let key = selected?;
+        let Some(key) = selected else {
+            self.idle_claims.insert((operation, allow_quarantined), idle_until);
+            return None;
+        };
         self.fair_cursors.insert(operation, key.project_id.clone());
         self.mark_running(&key);
         self.task(&key).cloned()
@@ -6545,6 +6573,23 @@ mod tests {
         assert!(journal.claim_next(Operation::DerivedRollup, 0, true).is_some(), "complete parents admit the derived unit");
         let visits = DEPENDENCY_VISITS.get();
         assert!(visits <= 4 * u64::try_from(parents).unwrap(), "visited {visits} tasks for {parents} overlapping parent slices");
+    }
+
+    /// Prod 2026-09-27: ~72 idle workers re-walked the claim list ~365 times a second
+    /// under the journal mutex, and INSERTs committing the journal waited ~300 ms
+    /// behind claims that found nothing.
+    #[test]
+    fn an_idle_claim_does_not_rewalk_until_the_queue_or_the_clock_changes() {
+        let (_dir, mut journal) = new_journal();
+        upserted(&mut journal, task("p", 0, 1, Operation::Dedup).tap_mut(|t| t.deadline_micros = 1_000));
+        CLAIM_WALKS.set(0);
+        assert!(journal.claim_next(Operation::Dedup, 0, true).is_none());
+        assert!(journal.claim_next(Operation::Dedup, 999, true).is_none());
+        assert_eq!(CLAIM_WALKS.get(), 1, "nothing changed, so nothing is re-walked");
+        assert_eq!(journal.claim_next(Operation::Dedup, 1_000, true).expect("claimed the moment it is due").key.project_id, "p");
+        assert!(journal.claim_next(Operation::Dedup, 1_001, true).is_none());
+        upserted(&mut journal, task("q", 0, 1, Operation::Dedup));
+        assert_eq!(journal.claim_next(Operation::Dedup, 1_002, true).expect("new work is claimed at once").key.project_id, "q");
     }
 
     #[test]
