@@ -671,6 +671,15 @@ impl WitnessCarry {
     }
 }
 
+/// How a partition's live visibility moved from a proved one, as
+/// `(added paths, changed deletion vectors, removed paths)`: which kind of commit
+/// voided a certification.
+fn visibility_moves(proved: &crate::read::CountFiles, live: &crate::read::CountFiles) -> (usize, usize, usize) {
+    let added = live.keys().filter(|path| !proved.contains_key(*path)).count();
+    let dv_changed = live.iter().filter(|(path, dv)| proved.get(*path).is_some_and(|held| held != *dv)).count();
+    (added, dv_changed, proved.keys().filter(|path| !live.contains_key(*path)).count())
+}
+
 /// `LogicalFileView::add_action()`, centralizing its `#[allow(deprecated)]` call site.
 pub(super) fn add_action(file: &deltalake::kernel::LogicalFileView) -> deltalake::kernel::Add {
     #[allow(deprecated)]
@@ -5993,9 +6002,21 @@ impl Database {
                         }
                         true => {}
                     }
+                    if crate::observability::sample_rollup_miss("dedup_skip_denied_fp_moved") {
+                        let (added, dv_changed, removed) = visibility_moves(&cert.files, &visibility);
+                        let date_age_days = (crate::support::today_utc() - date).num_days();
+                        info!(table_name, project_id = %fp_key.0, %date, date_age_days, reason = "fp_moved", added, dv_changed, removed, stale = cert.stale, event = "dedup_skip_denied");
+                    }
                     saw_fp_moved = true;
                 }
-                None => verdict = DedupSkipVerdict::NeverCertified,
+                None => {
+                    if crate::observability::sample_rollup_miss("dedup_skip_denied_never_certified") {
+                        let date_age_days = (crate::support::today_utc() - date).num_days();
+                        let slice_coverage = self.dedup_slice_coverage.contains_key(&fp_key);
+                        info!(table_name, project_id = %fp_key.0, %date, date_age_days, reason = "never_certified", slice_coverage, event = "dedup_skip_denied");
+                    }
+                    verdict = DedupSkipVerdict::NeverCertified
+                }
             }
         }
         // `FpMoved` outranks `NeverCertified` INCLUDING the no-evidence fallback below;
@@ -11653,6 +11674,32 @@ mod window_scoped_certification_tests {
         let added = live.iter().filter_map(|u| crate::tantivy::search::parquet_rel_of_uri(u)).filter(|r| !proved.contains(r)).count();
         assert_eq!(added, 0, "a removal adds nothing, so the helper returns false and the caller denies");
         let _ = Arc::new(());
+    }
+
+    /// A denied skip names what moved: an added path, a new mask on a proved path, or
+    /// a proved path gone. Each column moves alone.
+    #[test_case::test_case(&["a"], &["a", "b"] => (1, 0, 0) ; "an appended file")]
+    #[test_case::test_case(&["a"], &["a*"] => (0, 1, 0) ; "a new deletion vector on a proved file")]
+    #[test_case::test_case(&["a", "b"], &["a"] => (0, 0, 1) ; "a removed file")]
+    #[test_case::test_case(&["a", "b"], &["a*", "c"] => (1, 1, 1) ; "a rewrite")]
+    fn a_denial_names_what_moved(proved: &[&str], live: &[&str]) -> (usize, usize, usize) {
+        let files = |paths: &[&str]| -> crate::read::CountFiles {
+            paths
+                .iter()
+                .map(|path| {
+                    let masked = path.strip_suffix('*');
+                    let dv = masked.map(|_| deltalake::kernel::DeletionVectorDescriptor {
+                        storage_type: deltalake::kernel::StorageType::UuidRelativePath,
+                        path_or_inline_dv: "u1".to_owned(),
+                        offset: Some(1),
+                        size_in_bytes: 32,
+                        cardinality: 1,
+                    });
+                    (masked.unwrap_or(path).to_owned(), dv)
+                })
+                .collect()
+        };
+        super::visibility_moves(&files(proved), &files(live))
     }
 }
 
