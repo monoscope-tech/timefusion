@@ -1931,16 +1931,20 @@ fn window_dates(lo: i64, hi: i64) -> Option<Vec<chrono::NaiveDate>> {
     (0..=366).contains(&span).then(|| (0..=span).map(|d| lo_d + chrono::Duration::days(d)).collect())
 }
 
-/// The partition dates (and a 24-bit hour mask) a write batch's rows land in. `None` costs the
-/// whole table its rollup coverage, so it is returned only when BOTH `timestamp` and the `date`
-/// partition column are unreadable.
-fn batch_hours(batch: &RecordBatch) -> Option<HashMap<String, u32>> {
+/// The partition dates a write batch's rows land in, each with the merged ranges it dirties:
+/// the 10-minute cells its rows fall in, or the whole day when the rows carry no timestamp.
+/// Cell-precise so a write re-arms only its own cells' quiet period, not its hour's.
+/// `None` costs the whole table its rollup coverage, so it is returned only when BOTH
+/// `timestamp` and the `date` partition column are unreadable.
+fn batch_dirty_ranges(batch: &RecordBatch) -> Option<HashMap<String, Vec<(i64, i64)>>> {
+    use crate::maintenance_coordinator::NORMAL_SLICE_MICROS;
     use datafusion::arrow::{
         array::AsArray,
         compute::cast,
         datatypes::{DataType, TimeUnit, TimestampMicrosecondType},
     };
-    let micros = batch.column_by_name("timestamp").and_then(|column| {
+    let date_of = |micros: i64| chrono::DateTime::from_timestamp_micros(micros).map(|time| time.date_naive().to_string());
+    let cells = batch.column_by_name("timestamp").and_then(|column| {
         let wanted = DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
         let column = if column.data_type() == &wanted { column.clone() } else { cast(column, &wanted).ok()? };
         Some(
@@ -1948,21 +1952,34 @@ fn batch_hours(batch: &RecordBatch) -> Option<HashMap<String, u32>> {
                 .as_primitive_opt::<TimestampMicrosecondType>()?
                 .iter()
                 .flatten()
-                .map(|micros| (micros.div_euclid(DAY_MICROS), micros.rem_euclid(DAY_MICROS) / 3_600_000_000))
+                .map(|micros| micros.div_euclid(NORMAL_SLICE_MICROS))
                 .collect::<HashSet<_>>(),
         )
     });
-    if let Some(hours) = micros {
-        return Some(hours.into_iter().fold(HashMap::new(), |mut dates, (day, hour)| {
-            if let Some(day_start) = chrono::DateTime::from_timestamp_micros(day * DAY_MICROS) {
-                *dates.entry(day_start.date_naive().to_string()).or_default() |= 1 << hour;
+    if let Some(cells) = cells {
+        return Some(cells.into_iter().fold(HashMap::<String, Vec<(i64, i64)>>::new(), |mut dates, cell| {
+            let start = cell * NORMAL_SLICE_MICROS;
+            if let Some(date) = date_of(start) {
+                dates.entry(date).or_default().push((start, start + NORMAL_SLICE_MICROS));
             }
             dates
         }));
     }
-    // Without a timestamp there is no hour to name, so the whole day is dirty.
+    // Without a timestamp there is no cell to name, so the whole day is dirty.
     let text = cast(batch.column_by_name("date")?, &DataType::Utf8).ok()?;
-    Some(text.as_string::<i32>().iter().flatten().map(|date| (date.to_string(), crate::rollup::ALL_HOURS)).collect())
+    Some(
+        text.as_string::<i32>()
+            .iter()
+            .flatten()
+            .filter_map(|date| Some((date.to_string(), vec![(date_start_micros(date)?, date_start_micros(date)? + DAY_MICROS)])))
+            .collect(),
+    )
+}
+
+/// The 24-bit hour mask a day's dirty ranges touch.
+fn hours_of_ranges(day_start: i64, ranges: &[(i64, i64)]) -> u32 {
+    let hour = |micros: i64| (micros - day_start).div_euclid(3_600_000_000).clamp(0, 23);
+    ranges.iter().filter(|(start, end)| start < end).fold(0, |mask, &(start, end)| (hour(start)..=hour(end - 1)).fold(mask, |mask, h| mask | 1 << h))
 }
 
 const DAY_MICROS: i64 = 86_400_000_000;

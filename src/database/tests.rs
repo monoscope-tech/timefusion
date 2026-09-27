@@ -3714,6 +3714,67 @@ async fn a_multi_partition_invalidation_costs_one_journal_commit() -> Result<()>
     Ok(())
 }
 
+/// A write re-arms only the 10-minute cells its rows fall in. Minting at hour resolution
+/// pushed every cell's quiet-period deadline to the hour's LAST write, so prod published an
+/// hour's six cells together at H+1:17-1:23 (today's newest 18-80 min never covered), and a
+/// row landing anywhere in the hour re-pended the hour's completed cells for a rebuild.
+#[tokio::test]
+async fn a_write_rearms_only_its_own_cells() -> Result<()> {
+    use crate::maintenance_coordinator::{NORMAL_SLICE_MICROS as CELL, Operation, TaskState};
+    use datafusion::arrow::{
+        array::TimestampMicrosecondArray,
+        datatypes::{DataType, Field, Schema, TimeUnit},
+    };
+
+    let db = Database::with_config(create_test_config("write-rearms-own-cells")).await?;
+    let hour = chrono::NaiveDate::from_ymd_opt(2026, 8, 16).unwrap().and_hms_opt(9, 0, 0).unwrap().and_utc().timestamp_micros();
+    let schema = Arc::new(Schema::new(vec![Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), false)]));
+    let write = |micros: i64| -> Result<()> {
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(TimestampMicrosecondArray::from(vec![micros]).with_timezone("UTC"))])?;
+        Ok(db.invalidate_rollup_batches("customer-a", "otel_logs_and_spans", &[batch])?)
+    };
+    let base_cells = || {
+        db.journal()
+            .tasks()
+            .filter(|task| task.key.physical_table.ends_with("dashboard_1m_v3") && task.key.operation == Operation::BaseRollup)
+            .filter(|task| task.key.slice.overlaps(hour, hour + 6 * CELL))
+            .map(|task| (task.key.slice.start_micros - hour, task.state))
+            .sorted_by_key(|(offset, _)| *offset)
+            .collect::<Vec<_>>()
+    };
+
+    write(hour + 3 * CELL + 1)?;
+    let due = |offset: i64| {
+        db.journal()
+            .tasks()
+            .find(|task| {
+                task.key.physical_table.ends_with("dashboard_1m_v3")
+                    && task.key.operation == Operation::BaseRollup
+                    && task.key.slice.start_micros == hour + offset
+            })
+            .map(|task| task.deadline_micros)
+    };
+    let written_due = due(3 * CELL).expect("the written cell is queued");
+    assert_eq!(base_cells().len(), 6, "the hour's cells are all queued, so an empty one is proved empty rather than left a hole");
+    assert!(due(5 * CELL).expect("a later cell is queued") >= hour + 6 * CELL, "an untouched cell is not due before its own end");
+
+    write(hour + 1)?;
+    let first = db
+        .journal()
+        .tasks()
+        .filter(|task| task.key.operation == Operation::BaseRollup && task.key.slice.start_micros == hour)
+        .map(|task| task.key.clone())
+        .collect::<Vec<_>>();
+    assert!(!first.is_empty(), "the 09:00 cell is queued");
+    first.iter().for_each(|key| _ = db.journal().complete(key));
+    let untouched_due = due(CELL);
+    write(hour + 3 * CELL + 2)?;
+    assert_eq!(base_cells()[0], (0, TaskState::Complete), "a later write elsewhere in the hour must not re-pend a completed cell");
+    assert_eq!(due(CELL), untouched_due, "a write elsewhere must not push back a cell it did not touch");
+    assert!(due(3 * CELL) >= Some(written_due), "the written cell's own quiet period still moves with its writes");
+    Ok(())
+}
+
 /// A tenant's first write must not manufacture a full day of empty and future
 /// maintenance debt. File hygiene is planned by debt in `plan_compaction_debt` (one
 /// day-wide unit per project, only for partitions with small or unsorted files),

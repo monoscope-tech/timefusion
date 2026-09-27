@@ -1403,7 +1403,8 @@ impl Database {
     /// Mint the slice work without making it durable — see
     /// [`Self::commit_journal`] for who pays for the `fsync` and when.
     fn mint_maintenance_hours(&self, project_id: &str, source: &str, date: &str, hours: u32, mint_dedup: bool) -> std::io::Result<()> {
-        self.mint_invalidations(project_id, source, date, Some(hours), mint_dedup).map_err(std::io::Error::other)
+        let Some(day_start) = date_start_micros(date) else { return Ok(()) };
+        self.mint_invalidations(project_id, source, date, Some(&crate::rollup::dirty_ranges(day_start, hours)), mint_dedup).map_err(std::io::Error::other)
     }
 
     fn enqueue_maintenance_partition(&self, project_id: &str, source: &str, date: &str) -> Result<()> {
@@ -1411,12 +1412,13 @@ impl Database {
         self.journal().checkpoint()
     }
 
-    /// Invalidate every rollup spec of `source` over `date`: `Some(hours)` mints
-    /// the dirty hour ranges precisely, `None` the whole day coarsely. Durability
+    /// Invalidate every rollup spec of `source` over `date`: `Some(ranges)` mints the hours
+    /// the dirty ranges touch and re-arms only the slices inside them, `None` the whole day
+    /// coarsely. Durability
     /// is the caller's — see [`Self::commit_journal`].
-    fn mint_invalidations(&self, project_id: &str, source: &str, date: &str, hours: Option<u32>, mint: bool) -> Result<()> {
+    fn mint_invalidations(&self, project_id: &str, source: &str, date: &str, scope: Option<&[(i64, i64)]>, mint: bool) -> Result<()> {
         let Some(schema) = get_schema(source) else { return Ok(()) };
-        if schema.rollups.is_empty() || hours == Some(0) {
+        if schema.rollups.is_empty() || scope.is_some_and(<[_]>::is_empty) {
             return Ok(());
         }
         let day = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")?;
@@ -1425,7 +1427,10 @@ impl Database {
         let mut journal = self.journal();
         for spec in &schema.rollups {
             let target = spec.table_name(source);
-            let ranges = hours.map_or_else(|| vec![(day_start, day_start.saturating_add(DAY_MICROS))], |hours| crate::rollup::dirty_ranges(day_start, hours));
+            let ranges = scope.map_or_else(
+                || vec![(day_start, day_start.saturating_add(DAY_MICROS))],
+                |ranges| crate::rollup::dirty_ranges(day_start, hours_of_ranges(day_start, ranges)),
+            );
             for (start_micros, end_micros) in ranges {
                 let invalidation = crate::maintenance_coordinator::Invalidation {
                     source_table: source,
@@ -1441,8 +1446,8 @@ impl Database {
                     // the two flags move together.
                     mint_rollup: mint,
                 };
-                if hours.is_some() {
-                    journal.invalidate(invalidation)?
+                if let Some(touched) = scope {
+                    journal.invalidate_touched(invalidation, touched)?
                 } else {
                     journal.invalidate_coarse(invalidation)?
                 };
@@ -4507,6 +4512,18 @@ impl Database {
     /// before acknowledging the write that caused it. Split out so a caller
     /// touching several partitions pays for ONE commit rather than one per partition.
     pub(crate) fn apply_rollup_hours(&self, project_id: &str, source: &str, date: &str, hours: u32) -> std::io::Result<()> {
+        let Some(day_start) = date_start_micros(date) else { return Ok(()) };
+        self.apply_rollup_ranges(project_id, source, date, crate::rollup::dirty_ranges(day_start, hours))
+    }
+
+    /// `apply_rollup_hours` for arbitrary merged ranges within `date`: coverage and minted
+    /// work are narrowed to them, while the dirty ledger keeps its hour resolution.
+    pub(crate) fn apply_rollup_ranges(&self, project_id: &str, source: &str, date: &str, ranges: Vec<(i64, i64)>) -> std::io::Result<()> {
+        let Some(day_start) = date_start_micros(date) else { return Ok(()) };
+        let hours = hours_of_ranges(day_start, &ranges);
+        if hours == 0 {
+            return Ok(());
+        }
         let _journal_guard = crate::support::lock(&self.rollup_journal_lock);
         let source_key = (project_id.to_string(), source.to_string(), date.to_string());
         // Only the hours the mutation actually touched: expanding to a full day mints
@@ -4522,15 +4539,12 @@ impl Database {
                 self.rollup_backoff.remove(&key);
             }
         }
-        if let Some(day_start) = date_start_micros(date) {
-            let ranges = crate::rollup::dirty_ranges(day_start, hours);
-            self.rollup_slice_coverage.retain(|(project, table, _, start, end), _| {
-                project != project_id || table != source || !ranges.iter().any(|(dirty_start, dirty_end)| *start < *dirty_end && *end > *dirty_start)
-            });
-        }
+        self.rollup_slice_coverage.retain(|(project, table, _, start, end), _| {
+            project != project_id || table != source || !ranges.iter().any(|(dirty_start, dirty_end)| *start < *dirty_end && *end > *dirty_start)
+        });
         // Becomes durable in `commit_journal`, which the caller MUST reach before
         // acknowledging the write.
-        self.mint_maintenance_hours(project_id, source, date, hours, true)
+        self.mint_invalidations(project_id, source, date, Some(&ranges), true).map_err(std::io::Error::other)
     }
 
     /// Invalidate only the partitions a non-MOR UPDATE/DELETE statement can have changed.
@@ -4577,9 +4591,9 @@ impl Database {
         if get_schema(source).is_none_or(|schema| schema.rollups.is_empty()) {
             return Ok(());
         }
-        let mut dates: HashMap<String, u32> = HashMap::new();
+        let mut dates: HashMap<String, Vec<(i64, i64)>> = HashMap::new();
         for batch in batches {
-            let Some(batch_dates) = batch_hours(batch) else {
+            let Some(batch_dates) = batch_dirty_ranges(batch) else {
                 // A batch that cannot say which partitions it touches forces the
                 // source-wide wipe; warn loudly rather than doing it silently.
                 warn!(
@@ -4590,13 +4604,13 @@ impl Database {
                 );
                 return self.invalidate_rollup_source(project_id, source);
             };
-            for (date, hours) in batch_dates {
-                *dates.entry(date).or_default() |= hours;
+            for (date, ranges) in batch_dates {
+                dates.entry(date).or_default().extend(ranges);
             }
         }
         // ONE commit for the whole batch, not one per date.
-        for (date, hours) in dates {
-            self.apply_rollup_hours(project_id, source, &date, hours)?;
+        for (date, ranges) in dates {
+            self.apply_rollup_ranges(project_id, source, &date, crate::write::mem_buffer::merge_ranges(ranges))?;
         }
         self.commit_journal()
     }

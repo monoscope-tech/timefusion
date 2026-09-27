@@ -1819,6 +1819,17 @@ impl TaskJournal {
     /// invalidations are idempotent by `TaskKey`; an already-complete slice is
     /// made pending again and its quiet-period deadline moves forward.
     pub fn invalidate(&mut self, invalidation: Invalidation<'_>) -> anyhow::Result<()> {
+        let touched = [(invalidation.start_micros, invalidation.end_micros)];
+        self.invalidate_touched(invalidation, &touched)
+    }
+
+    /// [`Self::invalidate`] where only `touched` ranges actually changed. A slice ending at or
+    /// before the first touched instant keeps its state and deadline (created if absent): its
+    /// rows and its rows-below witness are unchanged. Every other untouched slice still reopens,
+    /// because the witness counts from midnight, but is not due before its own end. Re-arming a
+    /// whole hour on every write held its six cells until the hour went quiet, and re-pended
+    /// closed cells the write never reached.
+    pub fn invalidate_touched(&mut self, invalidation: Invalidation<'_>, touched: &[(i64, i64)]) -> anyhow::Result<()> {
         let Invalidation { start_micros, end_micros, derived, .. } = invalidation;
         let normal_slices = TimeSlice::normal_units(start_micros, end_micros)?;
         let rollup_slices = if derived {
@@ -1828,17 +1839,19 @@ impl TaskJournal {
         } else {
             normal_slices.clone()
         };
-        self.invalidate_slices(invalidation, &normal_slices, &rollup_slices)
+        self.invalidate_slices(invalidation, &normal_slices, &rollup_slices, touched)
     }
 
     /// A history gap has no trustworthy per-hour change bounds. Requeue the
     /// complete range as coarse work; ordinary capacity splitting still applies.
     pub(crate) fn invalidate_coarse(&mut self, invalidation: Invalidation<'_>) -> anyhow::Result<()> {
         let slice = TimeSlice::new(invalidation.start_micros, invalidation.end_micros)?;
-        self.invalidate_slices(invalidation, &[slice], &[slice])
+        self.invalidate_slices(invalidation, &[slice], &[slice], &[(slice.start_micros, slice.end_micros)])
     }
 
-    fn invalidate_slices(&mut self, invalidation: Invalidation<'_>, normal_slices: &[TimeSlice], rollup_slices: &[TimeSlice]) -> anyhow::Result<()> {
+    fn invalidate_slices(
+        &mut self, invalidation: Invalidation<'_>, normal_slices: &[TimeSlice], rollup_slices: &[TimeSlice], touched: &[(i64, i64)],
+    ) -> anyhow::Result<()> {
         let Invalidation { source_table, rollup_table, source, project_id, start_micros, end_micros, observed_at_micros, derived, mint_dedup, mint_rollup } =
             invalidation;
         if derived && mint_rollup {
@@ -1858,11 +1871,15 @@ impl TaskJournal {
         }
         // Round up, never down: a bucket may delay eligibility but must never publish before
         // the full quiet period.
-        let deadline = observed_at_micros.saturating_add(FINALIZATION_DELAY_MICROS);
-        let deadline_micros = deadline
-            .saturating_add(INVALIDATION_DEADLINE_BUCKET_MICROS - 1)
-            .div_euclid(INVALIDATION_DEADLINE_BUCKET_MICROS)
-            .saturating_mul(INVALIDATION_DEADLINE_BUCKET_MICROS);
+        let quiet_after = |observed: i64| {
+            observed
+                .saturating_add(FINALIZATION_DELAY_MICROS)
+                .saturating_add(INVALIDATION_DEADLINE_BUCKET_MICROS - 1)
+                .div_euclid(INVALIDATION_DEADLINE_BUCKET_MICROS)
+                .saturating_mul(INVALIDATION_DEADLINE_BUCKET_MICROS)
+        };
+        let deadline_micros = quiet_after(observed_at_micros);
+        let first_touch = touched.iter().map(|&(start, _)| start).min().unwrap_or(i64::MIN);
         let created_unix_ms = u64::try_from(observed_at_micros.div_euclid(1_000)).unwrap_or_default();
         // HotPacking is deliberately NOT minted here: file hygiene is planned by DEBT, not by
         // the calendar — see `plan_compaction_debt`.
@@ -1890,6 +1907,11 @@ impl TaskJournal {
                     operation,
                 };
                 if !self.rollup_build_allowed(&key) && !self.task_indices.contains_key(&key) {
+                    continue;
+                }
+                let untouched = !touched.iter().any(|&(start, end)| slice.overlaps(start, end));
+                let deadline_micros = if untouched { quiet_after(observed_at_micros.max(slice.end_micros)) } else { deadline_micros };
+                if untouched && slice.end_micros <= first_touch && self.task_indices.contains_key(&key) {
                     continue;
                 }
                 if let Some(index) = self.task_indices.get(&key).copied() {

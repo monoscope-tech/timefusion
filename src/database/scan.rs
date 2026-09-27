@@ -1973,7 +1973,7 @@ mod decode_tests {
             RecordBatch::try_new(Arc::new(Schema::new(vec![Field::new(name, column.data_type().clone(), true)])), vec![column]).expect("batch")
         };
         let expect = |batch: RecordBatch| {
-            let mut dates = super::batch_hours(&batch).expect("the batch names its partitions").into_keys().collect::<Vec<_>>();
+            let mut dates = super::batch_dirty_ranges(&batch).expect("the batch names its partitions").into_keys().collect::<Vec<_>>();
             dates.sort();
             dates
         };
@@ -1990,14 +1990,17 @@ mod decode_tests {
 
         // Only a batch that carries neither may force the source-wide wipe.
         let opaque = batch("name", Arc::new(StringArray::from(vec!["x"])));
-        assert!(super::batch_hours(&opaque).is_none(), "a batch with no date and no timestamp must still fall back");
+        assert!(super::batch_dirty_ranges(&opaque).is_none(), "a batch with no date and no timestamp must still fall back");
 
-        // A batch confined to 14:00 marks one hour, not the day; a batch with only
-        // a `date` cannot name an hour and must mark all of them.
-        let at = |hours: i64| TimestampMicrosecondArray::from(vec![hours * 3_600_000_000]).with_timezone("UTC");
-        let hours = |batch: RecordBatch| super::batch_hours(&batch).expect("hours").into_values().fold(0u32, |mask, hour| mask | hour);
-        assert_eq!(hours(batch("timestamp", Arc::new(at(14)))), 1 << 14, "one hour of enrichment must mark one hour");
-        assert_eq!(hours(batch("date", Arc::new(Date32Array::from(vec![0])))), crate::rollup::ALL_HOURS, "no timestamp means no hour to name");
+        // A batch confined to 14:00 marks its one 10-minute cell, not the hour or the day; a
+        // batch with only a `date` cannot name a cell and must mark the whole day.
+        const CELL: i64 = crate::maintenance_coordinator::NORMAL_SLICE_MICROS;
+        let at = |micros: Vec<i64>| TimestampMicrosecondArray::from(micros).with_timezone("UTC");
+        let ranges = |batch: RecordBatch| super::batch_dirty_ranges(&batch).expect("ranges").into_values().flatten().collect::<Vec<_>>();
+        let two = 14 * 3_600_000_000;
+        assert_eq!(ranges(batch("timestamp", Arc::new(at(vec![two, two + 1])))), [(two, two + CELL)], "one cell of enrichment must mark one cell");
+        assert_eq!(ranges(batch("date", Arc::new(Date32Array::from(vec![0])))), [(0, day)], "no timestamp means no cell to name");
+        assert_eq!(super::hours_of_ranges(0, &[(two, two + CELL), (two + 3_600_000_000 - 1, two + 3_600_000_000 + 1)]), 1 << 14 | 1 << 15);
     }
 
     #[test]
