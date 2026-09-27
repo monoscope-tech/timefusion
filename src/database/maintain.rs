@@ -5582,8 +5582,16 @@ impl Database {
                         fate(UnverifiableFate::InvalidSlice);
                         continue;
                     };
-                    let complete = self.journal().rollup_slice_complete(source, &project_id, &target, slice)
-                        && !publications.get(&(project_id.as_str(), slice)).is_some_and(|publication| publication.rows == 0);
+                    let identity = (project_id.clone(), slice_start, slice_end, generation.clone(), source_fp, source_rows);
+                    // Journal state is scheduling, not evidence: a re-queue after publishing must
+                    // not orphan a file whose own output_rows proves it is a complete publication.
+                    let journal_complete = self.journal().rollup_slice_complete(source, &project_id, &target, slice);
+                    let self_proven = output_rows_by_identity.get(&identity).is_some_and(|rows| rows.published.is_some() && rows.live == rows.published);
+                    if !journal_complete && source_rows.is_some() {
+                        crate::observability::record_recovery_journal_incomplete(&target, self_proven);
+                    }
+                    let complete =
+                        (journal_complete || self_proven) && !publications.get(&(project_id.as_str(), slice)).is_some_and(|publication| publication.rows == 0);
                     let Some(date) = chrono::DateTime::from_timestamp_micros(slice_start).map(|time| time.date_naive().to_string()) else {
                         fate(UnverifiableFate::InvalidSlice);
                         continue;
@@ -5596,7 +5604,6 @@ impl Database {
                         fate(UnverifiableFate::JournalIncomplete);
                         continue;
                     }
-                    let identity = (project_id.clone(), slice_start, slice_end, generation.clone(), source_fp, source_rows);
                     let publication = publications.get(&(project_id.as_str(), slice)).filter(|publication| {
                         publication.generation == generation && publication.source_fingerprint == source_fp && publication.source_rows == source_rows
                     });
@@ -10500,6 +10507,43 @@ mod rollup_noop_skip_tests {
         let report = db.run_unit_once("otel_logs_and_spans", &project, date, Operation::BaseRollup, 1, 12).await?;
         assert_eq!(report.state, Some(TaskState::Complete));
         assert_eq!(tier_version(&db).await, published_at, "a fresh equal-width file must answer the unit, not be rebuilt");
+        Ok(())
+    }
+
+    /// Prod 2026-09-27: a published slice whose task was re-queued (never Complete again)
+    /// was dropped by every restart's recovery, and the census re-minted it each tick.
+    /// Its own `output_rows` proof must adopt it regardless of journal state.
+    #[serial]
+    #[tokio::test]
+    async fn a_requeued_slice_survives_restart_on_its_output_proof() -> Result<()> {
+        let cfg = rollup_cfg("rollup_requeued_restart");
+        let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+        let date = chrono::Utc::now().date_naive() - chrono::Duration::days(3);
+        let covered = {
+            let db = Arc::new(Database::with_config(Arc::clone(&cfg)).await?);
+            assert!(build_day(&db, &project_id, date, "seed").await? > 0, "the fixture needs a real publication");
+            let covered = db
+                .rollup_slice_coverage
+                .iter()
+                .find(|entry| entry.key().0 == project_id && entry.key().2 == TIER && matches!(entry.value().output, RollupOutputEvidence::Files(_)))
+                .map(|entry| entry.key().clone())
+                .expect("a nonempty publication");
+            let key = crate::maintenance_coordinator::TaskKey {
+                project_id: project_id.clone(),
+                source: covered.1.clone(),
+                physical_table: covered.2.clone(),
+                slice: crate::maintenance_coordinator::TimeSlice::new(covered.3, covered.4)?,
+                operation: Operation::BaseRollup,
+            };
+            let mut journal = db.journal();
+            journal.enqueue(key.clone(), 0, MAX_DECODED_BYTES, 0);
+            assert_ne!(journal.state(&key), Some(crate::maintenance_coordinator::TaskState::Complete), "the re-queue must leave the task not Complete");
+            journal.checkpoint()?;
+            covered
+        };
+        let db = Arc::new(Database::with_config(cfg).await?);
+        db.recover_rollup_coverage("otel_logs_and_spans").await?;
+        assert!(db.rollup_slice_coverage.contains_key(&covered), "a file proving its own output must be adopted after restart");
         Ok(())
     }
 

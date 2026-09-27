@@ -152,6 +152,7 @@ counter_registry! {
     maintenance_dependency_fallbacks => "timefusion.maintenance.dependency_fallbacks": "DerivedRollup dependency checks that missed the cached base-tier proof and fell back to proving coverage from completed base tasks",
     maintenance_processed_bytes => "timefusion.maintenance.processed_bytes": "Estimated decoded input bytes of completed maintenance units, by operation",
     rollup_publications        => "timefusion.rollup.publications": "Rollup units published, by tier",
+    rollup_recovery_journal_incomplete => "timefusion.rollup.recovery_journal_incomplete": "Tier slices recovery found with no Complete journal task (re-queued since publishing), by tier and whether their own output_rows proof adopted them anyway. adopted=false slices are republished",
     rollup_published_input_bytes => "timefusion.rollup.published_input_bytes": "Estimated decoded input bytes of published rollup units, by tier",
     rollup_version_append_rows => "timefusion.rollup.version_append_rows": "Merge-on-read version rows by rollup tier and whether that tier reads an assigned column (shadow: nothing acts on it). Irrelevant rows are what per-tier invalidation could keep readable",
     rollup_witness_moving_rows => "timefusion.rollup.witness_moving_rows": "Rows landing below a live rollup slice's covered_through, which moves its bounded witness (W31 step 0), by class: flushed = every flushed row; transparent = merge-on-read versions no rollup reads whose predecessor already flushed; base_version = the other version rows. Ingest is flushed minus both version classes",
@@ -1069,6 +1070,11 @@ pub fn record_rollup_published(operation: crate::maintenance_coordinator::Operat
     let tier = [KeyValue::new("tier", tier.to_string())];
     otel_add(|m| &m.rollup_publications, 1, &tier);
     otel_add(|m| &m.rollup_published_input_bytes, bytes, &tier);
+}
+
+/// A recovered tier slice whose journal task is no longer Complete.
+pub fn record_recovery_journal_incomplete(tier: &str, adopted: bool) {
+    otel_add(|m| &m.rollup_recovery_journal_incomplete, 1, &[KeyValue::new("tier", tier.to_string()), KeyValue::new("adopted", adopted)]);
 }
 
 /// One merge-on-read statement's version rows, classified per rollup tier.
