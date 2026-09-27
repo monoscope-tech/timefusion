@@ -2135,7 +2135,25 @@ impl Database {
                 defer_enqueue,
                 event = "rollup_backfill_census"
             );
+            // Persists how far the damage list got; `consumed` is a prefix of `damage_offered`.
+            let advance_damage = |consumed: usize| -> Result<usize> {
+                if consumed == 0 {
+                    return Ok(0);
+                }
+                let mut journal = self.journal();
+                let consumed = damage_offered.iter().take(consumed).take_while(|cell| repair_allowed(&journal, cell)).count();
+                if consumed != 0 {
+                    journal.advance_repair_cursor(TaskJournal::DAMAGE_REPAIR_MIGRATION, &source, damage_from.saturating_add(consumed))?;
+                }
+                Ok(consumed)
+            };
             if want.is_empty() || defer_enqueue {
+                // Nothing wanted means no offered cell is pending, so the whole offer is
+                // consumed; skipping that stalled the list once finished no-ops stopped
+                // being re-admitted and emptied `want`.
+                if !defer_enqueue {
+                    advance_damage(damage_offered.len())?;
+                }
                 continue;
             }
             // Newest first; damage-repair cells outrank that.
@@ -2230,16 +2248,7 @@ impl Database {
             }
             // AFTER the enqueue's checkpoint, and only by cells that survived
             // truncation — the other order loses cells on a crash.
-            let damage_consumed = if damage_consumed == 0 {
-                0
-            } else {
-                let mut journal = self.journal();
-                let consumed = damage_offered.iter().take(damage_consumed).take_while(|cell| repair_allowed(&journal, cell)).count();
-                if consumed != 0 {
-                    journal.advance_repair_cursor(TaskJournal::DAMAGE_REPAIR_MIGRATION, &source, damage_from.saturating_add(consumed))?;
-                }
-                consumed
-            };
+            let damage_consumed = advance_damage(damage_consumed)?;
             if !damage_offered.is_empty() {
                 warn!(
                     source,
