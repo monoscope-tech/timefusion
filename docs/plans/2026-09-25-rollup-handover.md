@@ -48,6 +48,11 @@ Deploy image build 21–31 → 4–8 min (Blacksmith); CI E2E 15 → 7 min.
 - [ ] Packed remainders need a witness that survives the repair before packed repairs can be re-enabled.
 - [ ] W7 Stage 1 measurement harness; W17 Stage 1D shadow classifier; W12 `dcount(name)` measure (owner decision).
 - [ ] Owner decisions: remove `sessions_1h_v1` or spec a browser-scoped v2; `service_name_hll` unblock or drop.
+- [ ] Owner decision: add `level` as a dashboard dimension (v4 tier + re-backfill). The status chart
+      `COALESCE(coalesce(status_code, level)::text,'null')` is unroutable without it; measured cost 0 extra tier rows
+      (never splits a group). Alternatives: monoscope splits the query (status_code IS NOT NULL routes), or leave it.
+- [ ] Owner decision: W12 `name` HLL — deferred until a daytime sample shows service-tab misses.
+- [ ] Owner decision: staging bucket/prefix for real-S3 per-unit cost (W7).
 - [ ] Deploy rollout missed the 30 s availability budget once (32 s, old-container drain); watch.
 - [ ] Advisories not closable by patch bumps: rustls-webpki 0.101 (AWS SDK), tokio-tar, tokio-postgres/postgres-types (client-side; 0.2.14 breaks arrow-pg wire encoding).
 - [ ] Plan stages 2–6 remain conditional on measured residual cost (W16 baseline + W19 counters).
