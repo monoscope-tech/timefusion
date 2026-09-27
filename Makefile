@@ -1,4 +1,4 @@
-.PHONY: ci ci-signoff ci-status ci-down ci-selftest fmt lint lint-fix test test-unit prepush test-all test-ovh test-minio test-minio-all test-prod test-integration test-integration-minio test-e2e run-prod run-minio build-prod minio-start minio-stop minio-clean tf-start tf-stop
+.PHONY: ci ci-signoff ci-status ci-down ci-selftest fmt lint lint-fix test test-unit prepush test-all test-ovh test-minio test-minio-all test-prod test-integration test-integration-minio test-e2e run-prod run-staging run-unit-staging run-minio build-prod minio-start minio-stop minio-clean tf-start tf-stop
 
 # THE inner-loop command: the whole suite, every time you change something.
 #
@@ -107,6 +107,17 @@ run-prod:
 build-prod:
 	@echo "Building release with PRODUCTION configuration..."
 	@export $$(cat .env.prod | grep -v '^#' | xargs) && cargo build --release
+
+# Staging: prod credentials, but every object root under s3://<bucket>/timefusion-staging/
+# and the data dir under ./data/timefusion-staging. Overrides come AFTER .env.prod so they
+# win; TIMEFUSION_STAGING_ENTRY makes a lost prefix refuse to boot. ARGS go to run-unit.
+STAGING_ENV = export $$(cat .env.prod $$(test -f .env.staging && echo .env.staging) | grep -v '^\#' | xargs) && \
+	TIMEFUSION_STAGING_PREFIX=timefusion-staging TIMEFUSION_STAGING_ENTRY=true TIMEFUSION_DATA_DIR=./data
+run-staging:
+	@$(STAGING_ENV) cargo run
+
+run-unit-staging:
+	@$(STAGING_ENV) cargo run --release -- run-unit $${ARGS}
 
 # Run with MinIO configuration (local development with prod-like settings)
 run-minio:

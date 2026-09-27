@@ -409,9 +409,9 @@ async fn run_redrive_dml_cli(cfg: &'static AppConfig) -> anyhow::Result<()> {
     db.shutdown().await
 }
 
-/// `s3://<bucket>/<table_prefix>/<kind>` — the tantivy and bloom sidecar roots.
+/// The tantivy and bloom sidecar stores.
 async fn sidecar_store(db: &Database, cfg: &AppConfig, bucket: &str, kind: &str) -> anyhow::Result<Arc<dyn object_store::ObjectStore>> {
-    db.create_object_store(&format!("s3://{bucket}/{}/{kind}", cfg.core.timefusion_table_prefix), &cfg.aws.build_storage_options(None)).await
+    db.create_object_store(&cfg.core.object_root(bucket, kind), &cfg.aws.build_storage_options(None)).await
 }
 
 async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {

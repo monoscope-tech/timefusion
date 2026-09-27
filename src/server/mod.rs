@@ -70,7 +70,7 @@ pub async fn bootstrap(cfg: Arc<AppConfig>) -> Result<Bootstrapped> {
     // The sidecar requires both indexed tables and object storage.
     let bucket = cfg.aws.aws_s3_bucket.as_deref().unwrap_or_default();
     if !cfg.tantivy.indexed_tables().is_empty() && !bucket.is_empty() {
-        let storage_uri = format!("s3://{}/{}/tantivy", bucket, cfg.core.timefusion_table_prefix);
+        let storage_uri = cfg.core.object_root(bucket, "tantivy");
         let obj_store = db.create_object_store(&storage_uri, &cfg.aws.build_storage_options(None)).await?;
         let tcfg = Arc::new(cfg.tantivy.clone());
         let svc = Arc::new(crate::tantivy::search::TantivyIndexService::new(obj_store.clone(), tcfg.clone(), cfg.core.timefusion_data_dir.clone()));
@@ -82,7 +82,7 @@ pub async fn bootstrap(cfg: Arc<AppConfig>) -> Result<Bootstrapped> {
         db = db.with_tantivy_search(search).with_tantivy_indexer(svc);
     }
     if cfg.maintenance.timefusion_file_bloom_pruning && !bucket.is_empty() {
-        let storage_uri = format!("s3://{}/{}/bloom_sidecars", bucket, cfg.core.timefusion_table_prefix);
+        let storage_uri = cfg.core.object_root(bucket, "bloom_sidecars");
         let store = db.create_object_store(&storage_uri, &cfg.aws.build_storage_options(None)).await?;
         db = db.with_bloom_prune(Arc::new(crate::read::bloom_prune::BloomPruneRegistry::new(
             store,

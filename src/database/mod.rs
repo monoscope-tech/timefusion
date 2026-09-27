@@ -2467,7 +2467,6 @@ pub struct Database {
     /// once every 30s, so a hot SQL path doesn't hit PG per statement.
     storage_configs_next_refresh_ns: Arc<std::sync::atomic::AtomicU64>,
     default_s3_bucket: Option<String>,
-    default_s3_prefix: Option<String>,
     default_s3_endpoint: Option<String>,
     object_store_cache: Option<Arc<SharedFoyerCache>>,
     statistics_extractor: Arc<DeltaStatisticsExtractor>,
@@ -3170,7 +3169,6 @@ impl Database {
             storage_configs: Arc::new(RwLock::new(storage_configs)),
             storage_configs_next_refresh_ns: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             default_s3_bucket: cfg.aws.aws_s3_bucket.clone(),
-            default_s3_prefix: Some(cfg.core.timefusion_table_prefix.clone()),
             default_s3_endpoint: Some(aws_endpoint.clone()),
             object_store_cache,
             statistics_extractor,
@@ -3850,10 +3848,9 @@ impl Database {
     pub async fn get_or_create_unified_table(&self, table_name: &str) -> Result<Arc<RwLock<DeltaTable>>> {
         let missing = |what: &str| anyhow::anyhow!("No default S3 {} configured for unified table '{}'", what, table_name);
         let bucket = self.default_s3_bucket.as_ref().ok_or_else(|| missing("bucket"))?;
-        let prefix = self.default_s3_prefix.as_ref().ok_or_else(|| missing("prefix"))?;
         let endpoint = self.default_s3_endpoint.as_ref().ok_or_else(|| missing("endpoint"))?;
         // Unified table path: s3://{bucket}/{prefix}/{table_name}/ (NO project_id subdirectory)
-        let storage_uri = format!("s3://{}/{}/{}/?endpoint={}", bucket, prefix, table_name, endpoint);
+        let storage_uri = format!("{}/?endpoint={endpoint}", self.config.core.object_root(bucket, table_name));
         let storage_options = self.build_storage_options();
 
         info!("Creating or loading unified table '{}' at: {}", table_name, storage_uri);
@@ -4373,6 +4370,7 @@ impl Database {
 
         use object_store::{BackoffConfig, ClientConfigKey, ClientOptions, RetryConfig, aws::AmazonS3Builder};
 
+        self.config.check_object_root(storage_uri)?;
         let url = Url::parse(storage_uri)?;
         let bucket = url.host_str().ok_or_else(|| anyhow::anyhow!("Invalid S3 URI: missing bucket"))?;
 

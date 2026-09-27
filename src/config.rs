@@ -963,6 +963,7 @@ pub fn init_config() -> Result<&'static AppConfig, envy::Error> {
         return Ok(cfg);
     }
     let mut cfg = load_config_from_env()?;
+    cfg.enter_staging().map_err(envy::Error::Custom)?;
     apply(&mut cfg);
     let _ = CONFIG.set(cfg);
     Ok(config())
@@ -1322,12 +1323,62 @@ pub struct CoreConfig {
     pub timefusion_pgwire_batch_statement_secs: u64,
     #[serde(default)]
     pub timefusion_otel_scan_guard: OtelScanGuard,
+    /// Staging mode: every object root moves to `s3://<bucket>/<prefix>/`, the data dir to `<data_dir>/<prefix>`.
+    #[serde(default)]
+    pub timefusion_staging_prefix: Option<String>,
+    /// Set by the `*-staging` make targets so a lost prefix refuses to boot instead of running against prod roots.
+    #[serde(default)]
+    pub timefusion_staging_entry: bool,
 }
 
 impl CoreConfig {
     getters! {
         wal_dir: PathBuf = (timefusion_data_dir.join("wal"));
         cache_dir: PathBuf = (timefusion_data_dir.join("cache"));
+    }
+
+    /// `s3://<bucket>/<table_prefix>/<kind>` — the root of every unified table and sidecar store.
+    pub fn object_root(&self, bucket: &str, kind: &str) -> String {
+        format!("s3://{bucket}/{}/{kind}", self.timefusion_table_prefix)
+    }
+
+    fn staging_prefix(&self) -> Option<&str> {
+        self.timefusion_staging_prefix.as_deref().filter(|p| !p.is_empty())
+    }
+}
+
+impl AppConfig {
+    /// Applies staging mode, refusing configurations that could resolve a prod path.
+    pub fn enter_staging(&mut self) -> Result<(), String> {
+        let Some(prefix) = self.core.staging_prefix().map(str::to_owned) else {
+            return match self.core.timefusion_staging_entry {
+                true => Err("started via a staging entry but TIMEFUSION_STAGING_PREFIX is unset; refusing to run against prod roots".into()),
+                false => Ok(()),
+            };
+        };
+        let refuse = |why: &str| Err(format!("staging prefix {prefix:?}: {why}"));
+        if prefix.contains('/') || prefix == "timefusion" {
+            return refuse("must be one path segment other than the prod prefix `timefusion`");
+        }
+        if self.aws.aws_s3_bucket.is_none() {
+            return refuse("AWS_S3_BUCKET is unset");
+        }
+        // Custom project tables carry their own bucket/prefix from the config DB, i.e. prod roots.
+        if self.core.timefusion_config_database_url.is_some() {
+            return refuse("TIMEFUSION_CONFIG_DATABASE_URL must be unset (custom project tables resolve to their own roots)");
+        }
+        self.core.timefusion_data_dir = self.core.timefusion_data_dir.join(&prefix);
+        self.core.timefusion_table_prefix = prefix;
+        Ok(())
+    }
+
+    /// Staging guard at the object-store funnel: `uri` must sit under `s3://<bucket>/<staging_prefix>/`.
+    pub fn check_object_root(&self, uri: &str) -> anyhow::Result<()> {
+        let Some(prefix) = self.core.staging_prefix() else { return Ok(()) };
+        let url = url::Url::parse(uri)?;
+        let inside = url.host_str() == self.aws.aws_s3_bucket.as_deref() && url.path().starts_with(&format!("/{prefix}/"));
+        anyhow::ensure!(inside, "staging guard: {uri} is outside s3://{}/{prefix}/", self.aws.aws_s3_bucket.as_deref().unwrap_or_default());
+        Ok(())
     }
 }
 
@@ -2404,6 +2455,54 @@ mod tests {
         assert_eq!(effective_limit(80 * GIB, Some(200 * GIB)), 80 * GIB);
         assert_eq!(effective_limit(80 * GIB, Some(40 * GIB)), 40 * GIB);
         assert_eq!(effective_limit(80 * GIB, None), 80 * GIB);
+    }
+
+    /// A prod-shaped config (`.env.prod` values) with the given staging knobs.
+    fn staging_cfg(prefix: Option<&str>, entry: bool, config_db: bool) -> Result<AppConfig, String> {
+        let mut c = AppConfig::default();
+        c.aws.aws_s3_bucket = Some("prod-bucket".into());
+        c.core.timefusion_data_dir = PathBuf::from("./data/prod");
+        c.core.timefusion_staging_prefix = prefix.map(Into::into);
+        c.core.timefusion_staging_entry = entry;
+        c.core.timefusion_config_database_url = config_db.then(|| "postgres://x".into());
+        c.enter_staging().map(|()| c)
+    }
+
+    #[test_case::test_case(None, false, false => true ; "prod mode boots")]
+    #[test_case::test_case(Some("timefusion-staging"), true, false => true ; "staging entry with prefix boots")]
+    #[test_case::test_case(None, true, false => false ; "staging entry without prefix refuses")]
+    #[test_case::test_case(Some(""), true, false => false ; "empty prefix is no prefix")]
+    #[test_case::test_case(Some("timefusion"), false, false => false ; "prod prefix refused")]
+    #[test_case::test_case(Some("timefusion/default"), false, false => false ; "nested prod path refused")]
+    #[test_case::test_case(Some("timefusion-staging"), false, true => false ; "config db refused")]
+    fn staging_boot_guard(prefix: Option<&str>, entry: bool, config_db: bool) -> bool {
+        staging_cfg(prefix, entry, config_db).is_ok()
+    }
+
+    #[test]
+    fn staging_moves_every_resolver_under_the_prefix() {
+        let c = staging_cfg(Some("timefusion-staging"), true, false).unwrap();
+        let roots = crate::schema::registry().list_tables().into_iter().chain(["tantivy".into(), "bloom_sidecars".into()]);
+        for root in roots.map(|k| c.core.object_root("prod-bucket", &k)) {
+            assert!(root.starts_with("s3://prod-bucket/timefusion-staging/"), "{root}");
+            c.check_object_root(&format!("{root}/?endpoint=https://x")).unwrap();
+        }
+        for dir in [c.core.timefusion_data_dir.clone(), c.core.wal_dir(), c.core.cache_dir()] {
+            assert!(dir.starts_with("./data/prod/timefusion-staging"), "{dir:?}");
+        }
+    }
+
+    #[test_case::test_case("s3://prod-bucket/timefusion-staging/otel_logs_and_spans/?endpoint=x" => true ; "staging root")]
+    #[test_case::test_case("s3://prod-bucket/timefusion/otel_logs_and_spans/" => false ; "prod unified table")]
+    #[test_case::test_case("s3://prod-bucket/timefusion/default/otel_logs_and_spans/" => false ; "prod default table")]
+    #[test_case::test_case("s3://prod-bucket/projects/p1/otel_logs_and_spans/" => false ; "prod custom project table")]
+    #[test_case::test_case("s3://prod-bucket/timefusion-staging-x/tantivy" => false ; "sibling prefix does not alias")]
+    #[test_case::test_case("s3://prod-bucket/timefusion-staging" => false ; "bare prefix is not a root")]
+    #[test_case::test_case("s3://other/timefusion-staging/tantivy" => false ; "other bucket")]
+    fn staging_object_root_guard(uri: &str) -> bool {
+        let staged = staging_cfg(Some("timefusion-staging"), false, false).unwrap();
+        assert!(staging_cfg(None, false, false).unwrap().check_object_root(uri).is_ok(), "prod mode never refuses");
+        staged.check_object_root(uri).is_ok()
     }
 
     // Bare numbers must coerce to seconds (a unitless value panics
