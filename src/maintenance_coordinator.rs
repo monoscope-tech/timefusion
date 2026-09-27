@@ -3190,6 +3190,10 @@ impl AdmissionController {
             stats.maintenance_admission_refused_object_writes.fetch_add(1, Relaxed);
             refused = true;
         }
+        if lane == AdmissionLane::Rollup && !crate::config::rollup_memory_admits(memory) {
+            crate::observability::record_rollup_memory_refusal();
+            refused = true;
+        }
         if refused {
             return None;
         }
@@ -6573,6 +6577,20 @@ mod tests {
         assert_eq!(admission.utilization(), Resources::default());
         assert!(admission.try_acquire(Resources { decoded_bytes: 751, ..Resources::default() }).is_none());
         assert!(admission.try_acquire(Resources { decoded_bytes: MAX_DECODED_BYTES + 1, ..Resources::default() }).is_none());
+    }
+
+    /// Rollup units allocate 20-30 GiB outside every pool; a new one must not
+    /// start while the heap is already near the limit.
+    #[test_case::test_case(AdmissionLane::Rollup, -1, 100 => true ; "rollup_below_the_threshold_admits")]
+    #[test_case::test_case(AdmissionLane::Rollup, 0, 100 => false ; "rollup_at_the_threshold_refuses")]
+    #[test_case::test_case(AdmissionLane::Rollup, 30, 100 => false ; "rollup_above_the_threshold_refuses")]
+    #[test_case::test_case(AdmissionLane::Other, 30, 100 => true ; "other_lane_ignores_allocated_memory")]
+    #[test_case::test_case(AdmissionLane::Rollup, 30, 0 => true ; "unmeasurable_limit_admits")]
+    fn rollup_admission_refuses_above_allocated_memory_threshold(lane: AdmissionLane, offset: isize, limit_bytes: usize) -> bool {
+        let at = (crate::config::ROLLUP_ALLOCATED_SHUT * 100.0).ceil() as usize;
+        let memory = crate::config::MemorySnapshot { limit_bytes, jemalloc_allocated_bytes: at.saturating_add_signed(offset), ..Default::default() };
+        let request = Resources { cpu: 1, decoded_bytes: 100, object_reads: 1, object_writes: 1 };
+        AdmissionController::new(4, 1_000, 8, 2).try_acquire_for(request, lane, memory).is_some()
     }
 
     #[test]

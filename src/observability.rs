@@ -150,6 +150,7 @@ counter_registry! {
     maintenance_claims         => "timefusion.maintenance.claims": "claim_next passes, by operation, whether or not they claimed. claim_us / claims is the mean claim cost",
     maintenance_claim_us       => "timefusion.maintenance.claim_us": "Wall microseconds inside claim_next (journal lock held), by operation",
     maintenance_dependency_fallbacks => "timefusion.maintenance.dependency_fallbacks": "DerivedRollup dependency checks that missed the cached base-tier proof and fell back to proving coverage from completed base tasks",
+    maintenance_admission_refused_rollup_memory => "timefusion.maintenance.admission_refused_rollup_memory": "Rollup-lane reservations refused because jemalloc allocated was at or above ROLLUP_ALLOCATED_SHUT of the memory limit. Rollup units allocate 20-30 GiB outside every pool, so a new one must not start on top of those in flight",
     maintenance_processed_bytes => "timefusion.maintenance.processed_bytes": "Estimated decoded input bytes of completed maintenance units, by operation",
     rollup_publications        => "timefusion.rollup.publications": "Rollup units published, by tier",
     rollup_published_input_bytes => "timefusion.rollup.published_input_bytes": "Estimated decoded input bytes of published rollup units, by tier",
@@ -1051,6 +1052,10 @@ pub fn record_maintenance_claim(operation: crate::maintenance_coordinator::Opera
     let operation = [KeyValue::new("operation", <&'static str>::from(operation))];
     otel_add(|m| &m.maintenance_claims, 1, &operation);
     otel_add(|m| &m.maintenance_claim_us, elapsed_us, &operation);
+}
+
+pub fn record_rollup_memory_refusal() {
+    otel_add(|m| &m.maintenance_admission_refused_rollup_memory, 1, &[]);
 }
 
 pub fn record_dependency_fallback() {

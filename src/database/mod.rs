@@ -5501,7 +5501,8 @@ struct HygieneGateState {
     /// Hysteresis for the MEMORY verdict only — never the backstop. Starts open;
     /// a cold process with an empty lane has nothing to back off from.
     open: bool,
-    sampled: Option<Reading>,
+    /// The cached RSS reading and jemalloc allocated bytes taken with it.
+    sampled: Option<(Reading, usize)>,
     /// Decaying high-water mark. Lending is decided against this rather than the
     /// live reading — see `MemorySnapshot::peak_rss_bytes`.
     peak: Reading,
@@ -5548,12 +5549,13 @@ impl HygieneGate {
     ) -> crate::config::MemorySnapshot {
         let mut state = crate::support::lock(&self.state);
         let now = std::time::Instant::now();
-        let rss = match state.sampled {
-            Some(prev) if prev.age(now) < Self::SAMPLE_TTL => prev.bytes,
+        let (rss, allocated) = match state.sampled {
+            Some((prev, allocated)) if prev.age(now) < Self::SAMPLE_TTL => (prev.bytes, allocated),
             _ => {
                 let bytes = process_memory_bytes().unwrap_or(0);
-                state.sampled = Some(Reading { at: now, bytes });
-                bytes
+                let allocated = crate::observability::jemalloc_bytes().map_or(0, |(allocated, ..)| usize::try_from(allocated).unwrap_or(usize::MAX));
+                state.sampled = Some((Reading { at: now, bytes }, allocated));
+                (bytes, allocated)
             }
         };
         if rss >= state.peak.bytes || state.peak.age(now) > Self::PEAK_DECAY {
@@ -5566,6 +5568,7 @@ impl HygieneGate {
             pool_reserved_bytes: pool_reserved,
             pool_size_bytes: pool_size,
             buffer_pressure_pct: buffer_pressure,
+            jemalloc_allocated_bytes: allocated,
         }
     }
 

@@ -228,6 +228,9 @@ pub struct MemorySnapshot {
     /// MemBuffer fill, 0..=100. The INGEST side's pressure, and it outranks the
     /// others — see [`HYGIENE_BUFFER_YIELD_PCT`].
     pub buffer_pressure_pct: u32,
+    /// jemalloc's live `allocated` bytes, which counts heap no pool reserves.
+    /// 0 when unmeasured (off Linux or without `profiling`), which admits.
+    pub jemalloc_allocated_bytes: usize,
 }
 
 /// Where the hygiene gate closes, as a fraction of each budget, and where it
@@ -252,6 +255,12 @@ pub struct MemorySnapshot {
 /// utilisation, and margin is what two 97% spikes already proved is thin.
 const HYGIENE_GATE_REOPEN: f64 = 0.59;
 const HYGIENE_GATE_SHUT: f64 = 0.64;
+
+/// jemalloc allocated, as a fraction of the limit, at which new Rollup units stop
+/// being admitted. A metrics rollup unit allocates 20-30 GiB outside every pool,
+/// ramping over 1-2 minutes, so 0.60 x 120 GiB = 72 GiB leaves room for exactly
+/// one more ~28 GiB burst (peak ~0.83) under `HYGIENE_TARGET_PEAK`.
+pub(crate) const ROLLUP_ALLOCATED_SHUT: f64 = 0.60;
 
 /// Where a fully-ramped hygiene lane may leave memory, worst case.
 ///
@@ -282,14 +291,18 @@ const HYGIENE_NON_LANE_GROWTH_BYTES: usize = 10 * GIB;
 // Compile-time, not a test: a gate that reopens at or above where it shuts has
 // no hysteresis and will flap admit/refuse around a single reading.
 const _: () = assert!(HYGIENE_GATE_REOPEN < HYGIENE_GATE_SHUT);
+const _: () = assert!(ROLLUP_ALLOCATED_SHUT <= HYGIENE_GATE_SHUT);
 
 impl MemorySnapshot {
     /// A reading that grants no elastic allowance. `limit_bytes == 0` is how
-    /// "we do not know" is spelled, and every consumer treats it as pressure.
+    /// "we do not know" is spelled, and every consumer treats it as pressure
+    /// except the rollup memory backstop, which admits and leaves the other
+    /// admission dimensions to bind.
     ///
     /// Derived rather than spelled out: a field added later and missed here
     /// would default to zero anyway, and zero is the safe direction for every
-    /// field in this struct.
+    /// field except `jemalloc_allocated_bytes`, which is harmless here because
+    /// the zero limit already admits.
     pub fn unknown() -> Self {
         Self::default()
     }
@@ -409,6 +422,12 @@ pub fn hygiene_admits(sample: MemorySnapshot, in_flight: usize, ceiling: usize, 
 /// 70 rather than something closer to the limit: the lane has to stand down
 /// while there is still headroom to drain into, not once the wall is reached.
 pub(crate) const HYGIENE_BUFFER_YIELD_PCT: u32 = 70;
+
+/// Whether a new Rollup unit may start on top of the heap already allocated.
+/// An unknown limit admits: the other admission dimensions still bind.
+pub fn rollup_memory_admits(sample: MemorySnapshot) -> bool {
+    sample.limit_bytes == 0 || (sample.jemalloc_allocated_bytes as f64 / sample.limit_bytes as f64) < ROLLUP_ALLOCATED_SHUT
+}
 
 pub fn hygiene_memory_open(sample: MemorySnapshot, was_open: bool) -> bool {
     // Ingest outranks maintenance. Checked FIRST and without hysteresis: the
@@ -2656,6 +2675,7 @@ mod tests {
                 buffer_pressure_pct: 0,
                 pool_reserved_bytes: (pool as f64 * pool_pct) as usize,
                 pool_size_bytes: pool,
+                ..MemorySnapshot::default()
             }
         }
 
@@ -2758,6 +2778,7 @@ mod tests {
                     buffer_pressure_pct: 0,
                     pool_reserved_bytes: 0,
                     pool_size_bytes: pool,
+                    ..MemorySnapshot::default()
                 };
                 prop_assert_eq!(elastic_decoded_capacity(base, trough), base, "a 95% peak must suppress lending even at a 40% trough");
                 // The gate itself still reopens on the CURRENT reading, or one
