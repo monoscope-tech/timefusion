@@ -79,6 +79,7 @@ Status: ⬜ open · 🟡 in progress · ✅ done. Priority is the plan's executi
 | W32 | Maintenance CPU-token cap vs idle cores | analysis → build | Shared gates | With ≥300 tasks due: median 26/48 cores while `cpu_tokens_used` = 66/66; `admission_refused_cpu` 24–83k/day → ~1.5M/day after `d9f00cce` (1 token/64 MiB decoded). Find the resource that binds (store vs cap); staging experiment at a higher cap | `maintenance_coordinator.rs` `AdmissionController::try_acquire_for` / `lag_scaled_cpu_ceiling`; token pricing in `maintain.rs` | W30 | Claude (timefusion-7c) | 🟡 analysis |
 | W33 | Stage 5: fewer repeat dedups of sealed days | analysis → build | Stage 5 | Dedup scans 899 GB/h vs 75 GB/h for BaseRollup (W7) and is steady state (W22); 98.7% of eligible scans denied the skip. Build W23 lever (a) or (b) from a daytime denial sample | `maintain.rs` certification, read-side cert check | W23 | Claude (timefusion-7c) | ⬜ |
 | W36 | MemBuffer-leg SortExec memory blowup | analysis → build | Read path | With more in-memory buckets than target partitions, DataFusion adds a full SortExec over the mem leg feeding the ordered MoR merge; ExternalSorter peaked ~7.6 GB for 44 MB locally. Fix: order-preserving mem leg (time buckets are disjoint) and/or compaction before the sort; cost test | `write/mem_buffer.rs`, mem-leg scan, `read/optimizers.rs` | ws/spm-query-memory (e85e7054) | Claude (timefusion-7c) | 🟡 ws/memleg-sort-memory |
+| W37 | Certification backlog: why today is never dedup-certified | analysis → build | Stage 1A/5 | Decompose cert blockers per blocker weighted by scans; build the dominant fix | `maintain.rs` certification, `read.rs` per-file skip | W33 | Claude (timefusion-2e) | 🟡 step 1 done; fix = cross-project span filter (building) |
 
 Later stages (2, 4, 5, 6, 1C, certified-clean activation, adaptive batches) stay **conditional** on W2/W7
 numbers, per the plan; do not start them without a measured residual cost.
@@ -607,4 +608,58 @@ Unit cost is W10's calibrated mean unit seconds, scaled by rows. Drain is pendin
 
 **Caveats:** mean-cost units, with no stragglers or memory or IO contention. The rows axis scales unit seconds
 linearly. Numbers are relative to the 02:21Z journal's load.
+
+### W37 step 1 — 2026-09-27 — Claude (timefusion-2e)
+**Window:** image `730e2fcf`, up since 18:55Z. Rates are counter deltas over 20:04–20:19Z; there are log events for all 84 min.
+Code refs are `origin/master` `b029d7e8`.
+
+**Every denial is today's partition.** 409 sampled `dedup_skip_denied`: 100% date age 0, across 11 cells, 407 of them
+`otel_logs_and_spans`. Sealed days are not the problem: 4,573 certifications were loaded at boot and none were denied.
+
+| per hour | rate |
+| --- | --- |
+| Delta-reading eligible scans | 6,300 |
+| skip granted | 86 (1.4%) |
+| denied `fp_moved` | 5,455 (86.6%), every sample `stale=true` |
+| denied `never_certified` | 593 (9.4%) |
+| new day certifications / window grants | 0 / 0 |
+| files proved / unproven | 939 / 21,659 |
+| `cert_skip_blocked_overlap` | 2,358 |
+| `cert_skip_files` (per-file skip actually used) | **0** |
+
+**Mechanism (code map):**
+- **A live day can't be certified by design.** A day grant needs 00–24 proved. Coordinator dedup slices are 10 min
+  wide and trail by about an hour. Window-scoped proof never covers the newest ~15 min, where queries land. So today
+  is served only by the **per-file skip**: files wholly inside proved intervals skip `DedupExec`.
+- **The per-file skip never fires because of a bug.** `certified_files_in_partition` (maintain.rs ~4492) builds the
+  "uncertified" span set from `partition_file_spans` (~4516), which filters on `date=` only. On the unified table
+  that is **every project's** files for the date, and they always overlap in time, so `skippable_certified_files`
+  (read.rs ~168) blocks everything. This gives `cert_skip_blocked_overlap` 2,358/h and `cert_skip_files` 0.
+  - The same bug inflates `cert_slice_files_unproven`: 23 unproven per proved file.
+  - It is sound to filter per project: the dedup key cannot match across projects.
+- **The labels mislead:**
+  - `fp_moved` here means only a stale partial-slice proof exists (`certify_files_within_slice`, `fp:0, stale:true`).
+    It does not mean a certificate moved.
+  - `never_certified` and `fp_moved` are the same state before and after the first file is proved. The label flip is
+    measured per project at 19:18–19:20.
+  - Partial (per-date or per-file) skips still count as denials (`record_scan` keys on `skip_dedup`).
+- **Dirty bins don't block certification.** All 462/84 min were retired, because rollup tables' bins have no drain.
+  The 810 `cert_declined_dirty_bins` are the probe finding **real duplicates**, 45 of 48 declines on rollup tier
+  tables. Nothing mints a dedup unit for them: a policy gap, ranked below.
+- **Coverage is destroyed by row-preserving commits:**
+  - Dedup's own DV masks count as arrivals against the previous pass.
+  - A foreign commit mid-pass wipes the whole day's coverage.
+  - A hot-pack output overlapping proved intervals drops them.
+  - W34's cell-aligned packing narrows this; existing whole-day straddlers still overlap everything until seal.
+
+**Ranked fixes:**
+1. **(building)** Cross-project filter: per-project spans in `certified_files_in_partition` and
+   `certify_files_within_slice`. Target metric: `cert_skip_files` > 0.
+2. Honest counters: a separate verdict for stale-only slice evidence, and count partial skips as partial.
+3. Mint coordinator Dedup units for probe-declined bins, so real duplicates on sealed rollup-tier days get removed.
+4. Carry slice coverage across own DV masks, foreign moves and row-preserving packs.
+5. Split the Delta leg by time at the proved edge (larger; after 1–4 are measured).
+
+The W33 branch only spends existing day grants, so there is no overlap with these fixes.
+Raw data: `scratchpad/w37/tables.txt` and the stats deltas.
 
