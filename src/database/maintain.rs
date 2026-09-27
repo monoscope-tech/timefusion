@@ -3184,7 +3184,6 @@ impl Database {
                     project: Self::tag_project(add),
                     partition: partition.as_ref().map(|(project, date)| (project.as_str(), date.as_str())),
                     stats: add.stats.as_deref().and_then(crate::rollup::stats_time_range),
-                    unproven: Self::add_tag(add, crate::maintenance_coordinator::TAG_OUTPUT_ROWS).is_none(),
                 };
                 crate::rollup::slice_retires(&file, &publish)
             })
@@ -10544,6 +10543,43 @@ mod rollup_noop_skip_tests {
         let db = Arc::new(Database::with_config(cfg).await?);
         db.recover_rollup_coverage("otel_logs_and_spans").await?;
         assert!(db.rollup_slice_coverage.contains_key(&covered), "a file proving its own output must be adopted after restart");
+        Ok(())
+    }
+
+    /// Prod 2026-09-27: a PROVEN 09:00-18:00 slice under two half-day slices made seven
+    /// days unreadable, so the census re-minted each day every tick and both halves
+    /// rebuilt identical rows. A half's publish must retire the straddler once tiled.
+    #[serial]
+    #[tokio::test]
+    async fn a_proven_straddler_is_retired_and_the_day_stops_reminting() -> Result<()> {
+        let (db, project, date) = rollup_db("proven_straddler").await?;
+        insert_span(&db, &project, date, 3, "early", "op").await?;
+        insert_span(&db, &project, date, 20, "late", "op").await?;
+        assert!(build_day(&db, &project, date, "seed").await? > 0);
+        let run = |hours, offset| db.run_unit_once("otel_logs_and_spans", &project, date, Operation::BaseRollup, hours, offset);
+        for (hours, offset) in [(12, 0), (12, 12), (9, 9)] {
+            assert_eq!(run(hours, offset).await?.state, Some(TaskState::Complete), "{hours}h at {offset}");
+        }
+        let day = date.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_micros();
+        // Prod's overlap made the half unprovable, so it rebuilt; drop its coverage to match.
+        db.rollup_slice_coverage.retain(|key, _| !(key.0 == project && key.2 == TIER && key.3 == day + 12 * 3_600_000_000));
+        assert_eq!(run(12, 12).await?.state, Some(TaskState::Complete));
+        let straddler = (day + 9 * 3_600_000_000, day + 18 * 3_600_000_000);
+        let live: Vec<(i64, i64)> = {
+            let table = db.resolve_table(&project, TIER).await?;
+            let table = table.read().await;
+            table.snapshot()?.log_data().iter().filter_map(|file| Database::slice_tag_range(&add_action(&file))).collect()
+        };
+        assert!(!live.contains(&straddler), "the half's publish must retire the tiled straddler: {live:?}");
+        db.plan_rollup_backfill().await?;
+        let reminted = db.journal().tasks().any(|task| {
+            task.key.project_id == project
+                && task.key.physical_table == TIER
+                && task.state != TaskState::Complete
+                && task.key.slice.start_micros < day + DAY_MICROS
+                && task.key.slice.end_micros > day
+        });
+        assert!(!reminted, "a readable day must not be re-minted");
         Ok(())
     }
 

@@ -770,8 +770,6 @@ pub(crate) struct LiveFile<'a> {
     /// Inclusive timestamp bounds from the file's own Delta statistics, which
     /// survive tag loss.
     pub stats: Option<(i64, i64)>,
-    /// Tagged, but without the output-row proof current publications stamp.
-    pub unproven: bool,
 }
 
 /// The publication a replace-set is being computed for.
@@ -802,14 +800,15 @@ pub(crate) struct SlicePublish<'a> {
 pub(crate) fn slice_retires(file: &LiveFile<'_>, publish: &SlicePublish<'_>) -> bool {
     let (start, end) = publish.slice;
     match file.slice {
-        // A pre-proof file straddling the slice boundaries would otherwise stay live forever:
-        // its overlap makes the cell unreadable, so the census re-mints the day, and
-        // neither half contains it. It goes once the other live slices reproduce its range.
+        // A file straddling the slice boundaries would otherwise stay live forever: its
+        // overlap makes the cell unreadable, so the census re-mints the day, and neither
+        // half contains it. Its own output proof does not change that (prod 2026-09-27:
+        // proven 09-18 files looped seven days). It goes once the other live slices
+        // reproduce its range.
         Some((file_start, file_end)) => {
             file.project == Some(publish.project_id)
                 && ((file_start >= start && file_end <= end)
-                    || (file.unproven
-                        && file_start < end
+                    || (file_start < end
                         && file_end > start
                         && ranges_cover(
                             &publish.covered.iter().copied().filter(|range| *range != (file_start, file_end)).collect_vec(),
@@ -2172,21 +2171,20 @@ mod tests {
     fn slice_retires_only_what_the_partition_provably_reproduces(
         slice: Option<(i64, i64)>, stats: Option<(i64, i64)>, published: (i64, i64), covered: &[(i64, i64)], rows: u64, expected: bool,
     ) {
-        let file = LiveFile { slice, project: slice.map(|_| "p"), partition: Some(("p", "2026-08-18")), stats, unproven: false };
+        let file = LiveFile { slice, project: slice.map(|_| "p"), partition: Some(("p", "2026-08-18")), stats };
         let publish = SlicePublish { project_id: "p", date: "2026-08-18", slice: published, rows, covered };
         assert_eq!(slice_retires(&file, &publish), expected);
     }
 
-    /// A pre-proof straddler (prod: a 04:00–14:00 file under two half-day slices) is
-    /// retired once the other live slices reproduce it — and only then.
-    #[test_case::test_case(true, "p", &[(DAY, DAY + 12 * HOUR), (DAY + 12 * HOUR, DAY + DAY_MICROS)] => true ; "unproven straddler the halves tile")]
-    #[test_case::test_case(false, "p", &[(DAY, DAY + 12 * HOUR), (DAY + 12 * HOUR, DAY + DAY_MICROS)] => false ; "a proven straddler stays")]
-    #[test_case::test_case(true, "p", &[(DAY + 12 * HOUR, DAY + DAY_MICROS)] => false ; "a gap before the boundary keeps it")]
-    #[test_case::test_case(true, "other", &[(DAY, DAY + 12 * HOUR), (DAY + 12 * HOUR, DAY + DAY_MICROS)] => false ; "another project's file")]
-    fn an_unproven_straddler_retires_once_tiled(unproven: bool, project: &str, halves: &[(i64, i64)]) -> bool {
+    /// A straddler (prod: a 04:00–14:00 file under two half-day slices), with or without
+    /// an output proof, is retired once the other live slices reproduce it — and only then.
+    #[test_case::test_case("p", &[(DAY, DAY + 12 * HOUR), (DAY + 12 * HOUR, DAY + DAY_MICROS)] => true ; "a straddler the halves tile")]
+    #[test_case::test_case("p", &[(DAY + 12 * HOUR, DAY + DAY_MICROS)] => false ; "a gap before the boundary keeps it")]
+    #[test_case::test_case("other", &[(DAY, DAY + 12 * HOUR), (DAY + 12 * HOUR, DAY + DAY_MICROS)] => false ; "another project's file")]
+    fn a_straddler_retires_once_tiled(project: &str, halves: &[(i64, i64)]) -> bool {
         let straddler = (DAY + 4 * HOUR, DAY + 14 * HOUR);
         let covered = halves.iter().copied().chain(std::iter::once(straddler)).collect_vec();
-        let file = LiveFile { slice: Some(straddler), project: Some(project), partition: Some(("p", "2026-08-18")), stats: None, unproven };
+        let file = LiveFile { slice: Some(straddler), project: Some(project), partition: Some(("p", "2026-08-18")), stats: None };
         slice_retires(&file, &SlicePublish { project_id: "p", date: "2026-08-18", slice: (DAY + 12 * HOUR, DAY + DAY_MICROS), rows: 9, covered: &covered })
     }
 
@@ -2196,7 +2194,7 @@ mod tests {
     #[test_case::test_case(Some(("p", "2026-08-17")); "another day")]
     #[test_case::test_case(None; "no readable partition")]
     fn slice_never_retires_an_untagged_file_outside_its_own_partition(partition: Option<(&str, &str)>) {
-        let file = LiveFile { slice: None, project: None, partition, stats: Some((DAY, DAY + HOUR)), unproven: false };
+        let file = LiveFile { slice: None, project: None, partition, stats: Some((DAY, DAY + HOUR)) };
         let publish = SlicePublish { project_id: "p", date: "2026-08-18", slice: (DAY, DAY + DAY_MICROS), rows: 9, covered: &[] };
         assert!(!slice_retires(&file, &publish));
     }
