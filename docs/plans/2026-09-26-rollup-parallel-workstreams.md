@@ -64,7 +64,7 @@ Status: ⬜ open · 🟡 in progress · ✅ done. Priority is the plan's executi
 | W22 | Dedup scan share: steady state or backlog? (Stage 5 input) | analysis | Stage 5 | Is dedup's ~12x larger physical scan a draining backlog or recurring work | prod logs, exported `pending_dedup` | W7 | Claude (timefusion-2e) | ✅ steady state (see result) |
 | W23 | Dedup certification that survives fingerprint moves (W22 lever) | analysis → build | Stage 5 | Step 1: what moves sealed-day certification, and which moves are dedup-preserving; step 2 (dark carry) only if step 1 finds the volume | `maintain.rs` certification, `commit_wave` | W22 | Claude (timefusion-2e) | 🟡 step 1 done; denial attribution handed off `ws/w23-deny-attribution` (measure 1 h after deploy, then pick lever a/b) |
 | W24 | 24 h status-breakdown shape misses as `unsupported` | analysis | Rollup misses | Why `COALESCE(coalesce(status_code, level)::text, 'null')` never routes | `src/rollup.rs` matcher (test ~3059) | — | Claude (timefusion-2e) | ✅ by design; routing it needs `level` as a dimension (owner decision, see result) |
-| W25 | Deploy rollout availability (32 s unready vs 30 s budget) | analysis | Deploys | Where the client-visible unready interval goes, and fixes | `scripts/deploy/rollout.sh`, swarm spec, `src/main.rs` shutdown | — | Claude (timefusion-2e) | ✅ analysis (proposals need sign-off, see result) |
+| W25 | Deploy rollout availability (32 s unready vs 30 s budget) | analysis | Deploys | Where the client-visible unready interval goes, and fixes | `scripts/deploy/rollout.sh`, swarm spec, `src/main.rs` shutdown | — | Claude (timefusion-2e) | ✅ (4) handed off `ws/w25-rollout-timing`; (1) skipped (unprovable locally); (2)/(3) open |
 
 Later stages (2, 4, 5, 6, 1C, certified-clean activation, adaptive batches) stay **conditional** on W2/W7
 numbers, per the plan; do not start them without a measured residual cost.
@@ -421,4 +421,15 @@ clients swamping the new process.
    1.6 s it costs.
 4. Keep the 30 s budget, but have the rollout log old-exit / new-start / first-answer timestamps, so the next miss
    is attributable without a log search.
+
+**W25 follow-up — 2026-09-27.**
+- **(4) Built:** `ws/w25-rollout-timing` @ `8d3726a3`. The rollout measurement line now adds `handoff phases`:
+  last-old-answer → new-boot (container lifecycle) and new-boot → first-answer (boot plus first answer). Both come
+  from the replacement's `boot_micros`, which the probe already reads. Deploy-script tests pass 31/31. A dry run on
+  the 01:55 numbers gives 11.7 s / 2.6 s.
+- **(1) Early exit: skipped.** The integrator's bar is a demonstrated clean reopen of the Foyer disk cache after
+  skipping destructors. A local run cannot reproduce what fills prod's 2.4 s (6 GB of in-memory entries whose
+  explicit close is abandoned at its budget). The 2.4 s is also not what broke either outlier: at 21:31 the
+  container lifecycle doubled and the first answer came ~10 s late.
+- **Next if (4) shows the lifecycle phase dominating:** (2), the 4.9 s container create → start.
 
