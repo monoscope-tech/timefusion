@@ -900,12 +900,19 @@ impl TaskJournal {
     /// returning how many changed.
     fn edit_tasks(&mut self, select: impl Fn(&MaintenanceTask) -> bool, mut edit: impl FnMut(&mut MaintenanceTask)) -> usize {
         self.idle_claims.clear();
-        let dirty = &mut self.dirty_tasks;
-        self.snapshot.tasks.iter_mut().filter(|task| select(task)).fold(0usize, |changed, task| {
-            edit(task);
-            dirty.insert(task.key.clone());
-            changed + 1
-        })
+        let edited: Vec<TaskKey> = self
+            .snapshot
+            .tasks
+            .iter_mut()
+            .filter(|task| select(task))
+            .map(|task| {
+                edit(task);
+                task.key.clone()
+            })
+            .collect();
+        let changed = edited.len();
+        edited.into_iter().for_each(|key| self.mark_dirty(key));
+        changed
     }
 
     /// Rebuild the completed-dedup boundary index from the snapshot. Called
@@ -4647,6 +4654,8 @@ mod tests {
             journal.complete(&key);
         }
         let before = journal.tasks().count();
+        // As at boot: the index is re-derived and holds no Complete task.
+        journal.rebuild_claimable();
 
         // A base unit republishes 00:00-02:00 — two of the three derived cells.
         let reopened = journal.reopen_derived_over("p", "derived", 0, 2 * HOUR);
@@ -4662,6 +4671,7 @@ mod tests {
         assert_eq!(state_of(&journal, 0), Some((TaskState::Pending, false)), "reopened, and its stale publication dropped");
         assert_eq!(state_of(&journal, HOUR), Some((TaskState::Pending, false)), "reopened, and its stale publication dropped");
         assert_eq!(state_of(&journal, 5 * HOUR), Some((TaskState::Complete, true)), "a cell outside the republished range must be untouched");
+        assert!(journal.is_indexed_claimable(&derived(0, HOUR)), "a reopened cell must be claimable without a restart");
 
         assert_eq!(journal.reopen_derived_over("p", "derived", 0, 2 * HOUR), 0, "reopening is idempotent");
     }
