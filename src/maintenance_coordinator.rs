@@ -2219,7 +2219,7 @@ impl TaskJournal {
             self.retry_or_split(key, "resource_exhausted".to_owned(), now_micros.saturating_add(30_000_000), attempts);
             return;
         }
-        if attempts >= 2 && self.split_task(key, SplitTrigger::RepeatedFailure, None) {
+        if attempts >= 2 && self.split_task(key, SplitTrigger::RepeatedFailure, None, &[]) {
             return;
         }
         // Floored at this operation's OWN deadline, otherwise an unsplittable unit burns the
@@ -2246,7 +2246,7 @@ impl TaskJournal {
             return;
         }
         let repeated_capacity = attempts >= 2 && is_capacity_failure(&reason);
-        if repeated_capacity && self.split_task(key, SplitTrigger::RepeatedFailure, None) {
+        if repeated_capacity && self.split_task(key, SplitTrigger::RepeatedFailure, None, &[]) {
             return;
         }
         // Split refused on a REPEATED capacity failure: the caller's delay is tuned for
@@ -2255,11 +2255,13 @@ impl TaskJournal {
         self.retry(key, reason, if repeated_capacity { when_micros.max(escalated) } else { when_micros });
     }
 
-    pub fn split_time_task(&mut self, key: &TaskKey, observed_bytes: u64, input: Option<InputFootprint>) -> bool {
-        self.split_task(key, SplitTrigger::Preflight(observed_bytes), input)
+    /// `live` are the target's live slice ranges: a child boundary strictly inside one
+    /// would leave that file uncontained by every child, so no publish could retire it.
+    pub fn split_time_task(&mut self, key: &TaskKey, observed_bytes: u64, input: Option<InputFootprint>, live: &[(i64, i64)]) -> bool {
+        self.split_task(key, SplitTrigger::Preflight(observed_bytes), input, live)
     }
 
-    fn split_task(&mut self, key: &TaskKey, trigger: SplitTrigger, input: Option<InputFootprint>) -> bool {
+    fn split_task(&mut self, key: &TaskKey, trigger: SplitTrigger, input: Option<InputFootprint>, live: &[(i64, i64)]) -> bool {
         // A Repair unit's cost is the FILE it rewrites; time-bisection cannot shrink a file
         // set, so every child would fight over the same file.
         if key.operation == Operation::Repair {
@@ -2290,6 +2292,13 @@ impl TaskJournal {
         };
         if children.len() <= 1 || children.iter().any(|child| child.hash_shards > 1) {
             crate::observability::maintenance_stats().split_declined_no_width.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return false;
+        }
+        let crosses_live = |child: &MaintenanceTask| {
+            let boundary = child.key.slice.end_micros;
+            boundary < key.slice.end_micros && live.iter().any(|&(start, end)| start < boundary && boundary < end)
+        };
+        if children.iter().any(crosses_live) {
             return false;
         }
         let task = &mut self.snapshot.tasks[index];
@@ -3578,6 +3587,24 @@ mod tests {
         assert_eq!(after.retry_reason.as_deref(), Some(TaskJournal::WORKER_FAILURE_REASON), "the quarantine tag survives the planner tick");
     }
 
+    /// A split must not cut a live slice: no child would contain it, so no publish could
+    /// retire it (prod 2026-09-27: 28f62f01 09-18 held the five-file chain below and
+    /// re-minted every census tick). Aligned halves still split.
+    #[test_case::test_case(&[(0.0, 7.5), (6.0, 12.0), (11.25, 15.0), (15.0, 18.0), (16.5, 24.0)] => false ; "a five file overlapping chain")]
+    #[test_case::test_case(&[(9.0, 18.0)] => false ; "a straddler across the midpoint")]
+    #[test_case::test_case(&[(0.0, 24.0)] => false ; "an equal width file")]
+    #[test_case::test_case(&[(0.0, 12.0), (12.0, 24.0)] => true ; "aligned halves")]
+    #[test_case::test_case(&[] => true ; "an empty tier")]
+    fn a_split_never_cuts_a_live_slice(hours: &[(f64, f64)]) -> bool {
+        let now = 60 * DAY_MICROS;
+        let start = now - 10 * DAY_MICROS;
+        let (_dir, mut journal) = new_journal();
+        let key = upserted(&mut journal, task("chain", start, start + DAY_MICROS, Operation::BaseRollup));
+        let hour = |h: f64| start + (h * 3_600_000_000.0) as i64;
+        let live: Vec<(i64, i64)> = hours.iter().map(|&(from, to)| (hour(from), hour(to))).collect();
+        journal.split_time_task(&key, 2 * MAX_DECODED_BYTES, None, &live)
+    }
+
     /// Splitting a backfill unit must narrow the WORK, not the priority.
     ///
     /// Sealed ordering ranks wide units first because width PROXIES backfill
@@ -3594,7 +3621,7 @@ mod tests {
         let (_dir, mut journal) = new_journal();
 
         let key = upserted(&mut journal, task("split", start, end, Operation::BaseRollup));
-        assert!(journal.split_time_task(&key, 2 * MAX_DECODED_BYTES, None), "the day unit splits");
+        assert!(journal.split_time_task(&key, 2 * MAX_DECODED_BYTES, None, &[]), "the day unit splits");
 
         // The same day, same seal time, never split — what the children must not
         // be demoted below.
@@ -4156,7 +4183,7 @@ mod tests {
         let now = crate::support::now_micros();
 
         assert!(
-            !journal.split_time_task(&key, 96 * MAX_DECODED_BYTES, None),
+            !journal.split_time_task(&key, 96 * MAX_DECODED_BYTES, None, &[]),
             "halving the width bought 4% — the row-group floor dominates, so bisecting again only mints units"
         );
         assert_eq!(journal.state(&key), Some(TaskState::Pending), "a declined split must leave the unit runnable, not superseded");
@@ -4196,11 +4223,11 @@ mod tests {
 
         // Floor: the unit came back costing nearly what its parent cost.
         let floor_key = floored_child(&mut journal);
-        assert!(!journal.split_time_task(&floor_key, 96 * MAX_DECODED_BYTES, None), "floor declines");
+        assert!(!journal.split_time_task(&floor_key, 96 * MAX_DECODED_BYTES, None, &[]), "floor declines");
 
         // No width: already at the minimum slice, so bisection yields no children.
         let narrow_key = upserted(&mut journal, task("whale", DAY_MICROS, DAY_MICROS + MIN_SLICE_MICROS, Operation::BaseRollup));
-        assert!(!journal.split_time_task(&narrow_key, 96 * MAX_DECODED_BYTES, None), "a minimum-width unit has nothing to split into");
+        assert!(!journal.split_time_task(&narrow_key, 96 * MAX_DECODED_BYTES, None, &[]), "a minimum-width unit has nothing to split into");
 
         assert_eq!(stats.split_declined_at_floor.load(Relaxed), floor0 + 1, "the floor decline is counted");
         assert_eq!(stats.split_declined_no_width.load(Relaxed), width0 + 1, "the no-width decline must be counted too — this is the branch that was silent");
@@ -4215,7 +4242,7 @@ mod tests {
         let key = upserted(&mut journal, task("whale", 0, DAY_MICROS, Operation::BaseRollup));
 
         let measured = 4 * MAX_DECODED_BYTES;
-        assert!(journal.split_time_task(&key, measured, None), "a day-wide unit with no floor evidence still bisects");
+        assert!(journal.split_time_task(&key, measured, None, &[]), "a day-wide unit with no floor evidence still bisects");
 
         let children: Vec<_> = journal.tasks().filter(|t| t.state == TaskState::Pending).collect();
         assert!(!children.is_empty(), "the split produced children");
@@ -4235,14 +4262,14 @@ mod tests {
         let key = upserted(&mut journal, task("whale", 0, DAY_MICROS, Operation::BaseRollup));
 
         // The retry path's synthetic value, verbatim.
-        assert!(journal.split_time_task(&key, MAX_DECODED_BYTES.saturating_add(1), None));
+        assert!(journal.split_time_task(&key, MAX_DECODED_BYTES.saturating_add(1), None, &[]));
         let child = journal.tasks().find(|t| t.state == TaskState::Pending).expect("a child").clone();
         assert_eq!(child.parent_measured_bytes, Some(MAX_DECODED_BYTES + 1));
 
         // A real preflight measuring far more than the synthetic seed is not the
         // row-group floor, so the child must still be splittable.
         assert!(
-            journal.split_time_task(&child.key, 8 * MAX_DECODED_BYTES, None),
+            journal.split_time_task(&child.key, 8 * MAX_DECODED_BYTES, None, &[]),
             "a measurement ABOVE the parent's stamp is evidence the stamp was never a measurement"
         );
     }
@@ -5768,7 +5795,7 @@ mod tests {
         let parent = task("p", day, day + DAY_MICROS, Operation::BaseRollup).key;
         journal.enqueue(parent.clone(), 0, if superseded { 0 } else { 16 }, 0);
         let expected = if superseded {
-            journal.split_time_task(&parent, MAX_DECODED_BYTES.saturating_add(1), None);
+            journal.split_time_task(&parent, MAX_DECODED_BYTES.saturating_add(1), None, &[]);
             TaskState::Superseded
         } else {
             journal.complete(&parent);
@@ -5823,7 +5850,7 @@ mod tests {
         enqueue_run(&mut journal, "p", 5 * DAY_MICROS, NORMAL_SLICE_MICROS, 6, 10, Operation::BaseRollup);
         let parent = task("p", 5 * DAY_MICROS, 6 * DAY_MICROS, Operation::BaseRollup).key;
         journal.enqueue(parent.clone(), 0, 0, 0);
-        journal.split_time_task(&parent, MAX_DECODED_BYTES.saturating_add(1), None);
+        journal.split_time_task(&parent, MAX_DECODED_BYTES.saturating_add(1), None, &[]);
         assert_eq!(journal.state(&parent), Some(TaskState::Superseded), "the parent must be superseded for the guard to be exercised");
 
         let collapsed = journal.coarsen_sealed_slices(now);
@@ -5959,7 +5986,7 @@ mod tests {
         let before = journal.snapshot.tasks.len();
 
         // Day-wide, and measured far over budget: every condition a split needs.
-        assert!(!journal.split_time_task(&repair, MAX_DECODED_BYTES * 8, None), "repair must decline to split");
+        assert!(!journal.split_time_task(&repair, MAX_DECODED_BYTES * 8, None, &[]), "repair must decline to split");
         assert_eq!(journal.snapshot.tasks.len(), before, "a declined split must mint no children");
         assert_eq!(journal.state(&repair), Some(TaskState::Pending), "and must not supersede the parent");
     }
@@ -6039,7 +6066,7 @@ mod tests {
         // which would collapse it by covering rather than by fusion.
         let parent = task("p", 3 * DAY_MICROS, 4 * DAY_MICROS, Operation::BaseRollup).key;
         journal.enqueue(parent.clone(), 0, 0, 0);
-        assert!(journal.split_time_task(&parent, 391 * 1024 * 1024 * 1024, Some(footprint)));
+        assert!(journal.split_time_task(&parent, 391 * 1024 * 1024 * 1024, Some(footprint), &[]));
         assert!(journal.tasks().filter(|t| t.state == TaskState::Pending).all(|t| t.input == Some(footprint)), "children inherit what they read");
 
         // 1,440 contiguous one-minute units over the same file set, nothing wider.
@@ -6183,7 +6210,7 @@ mod tests {
         // collapse, or the split is undone and the two fight forever.
         let parent = task("p", 6 * DAY_MICROS, 7 * DAY_MICROS, Operation::BaseRollup).key;
         journal.enqueue(parent.clone(), 0, 0, 0);
-        journal.split_time_task(&parent, MAX_DECODED_BYTES.saturating_add(1), None);
+        journal.split_time_task(&parent, MAX_DECODED_BYTES.saturating_add(1), None, &[]);
         assert_eq!(journal.state(&parent), Some(TaskState::Superseded), "precondition");
 
         journal.coarsen_sealed_slices(now);
@@ -6473,7 +6500,7 @@ mod tests {
     fn oversized_task_is_replaced_by_durable_time_children() {
         let (_dir, mut journal) = new_journal();
         let key = upserted(&mut journal, task("p", 0, NORMAL_SLICE_MICROS, Operation::BaseRollup));
-        assert!(journal.split_time_task(&key, 2 * MAX_DECODED_BYTES, None));
+        assert!(journal.split_time_task(&key, 2 * MAX_DECODED_BYTES, None, &[]));
         assert_eq!(journal.tasks().filter(|task| task.state == TaskState::Pending).count(), 2);
         assert_eq!(journal.state(&key), Some(TaskState::Superseded));
     }
@@ -6484,7 +6511,7 @@ mod tests {
         let (_dir, mut journal) = new_journal();
         let input = task("p", now - NORMAL_SLICE_MICROS, now, Operation::BaseRollup).tap_mut(|unit| unit.deadline_micros = now - 2 * 60 * 1_000_000);
         let key = upserted(&mut journal, input);
-        assert!(journal.split_time_task(&key, 2 * MAX_DECODED_BYTES, None));
+        assert!(journal.split_time_task(&key, 2 * MAX_DECODED_BYTES, None, &[]));
         assert_eq!(live_frontier_lag_secs(journal.tasks(), now), 2 * 60);
     }
 
@@ -6522,7 +6549,7 @@ mod tests {
         let unit = |table, operation| task_in(table, "p", 0, NORMAL_SLICE_MICROS, operation).tap_mut(|task| task.key.source = "otel_logs_and_spans".into());
         let base_key = upserted(&mut journal, unit("otel_logs_and_spans_rollup_dashboard_1m_v3", Operation::BaseRollup));
         journal.upsert(unit("otel_logs_and_spans_rollup_dashboard_1h_v2", Operation::DerivedRollup));
-        assert!(journal.split_time_task(&base_key, 2 * MAX_DECODED_BYTES, None));
+        assert!(journal.split_time_task(&base_key, 2 * MAX_DECODED_BYTES, None, &[]));
         let children = journal
             .tasks()
             .filter(|task| task.key.operation == Operation::BaseRollup && task.state == TaskState::Pending)

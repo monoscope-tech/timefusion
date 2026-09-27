@@ -2431,7 +2431,7 @@ impl Database {
         }
         if estimated_bytes > MAX_DECODED_BYTES && key.slice.width() > crate::maintenance_coordinator::MIN_SLICE_MICROS {
             let mut journal = self.journal();
-            if journal.split_time_task(&key, estimated_bytes, Some(input_footprint)) {
+            if journal.split_time_task(&key, estimated_bytes, Some(input_footprint), &[]) {
                 journal.checkpoint()?;
                 info!(
                     table = %key.physical_table,
@@ -2924,12 +2924,16 @@ impl Database {
         //
         // Absent or unreadable target tier means "not covered": the conservative
         // direction is to do the work, exactly as before this check existed.
+        // The project's live slices also bound the split below: a child boundary inside one
+        // leaves that file contained by no child, so no publish could ever retire it.
+        let mut live_slices = Vec::new();
         if let Ok(target_ref) = self.resolve_table(&key.project_id, &key.physical_table).await {
-            let covering = {
+            let live_adds: Vec<_> = {
                 let target = target_ref.read().await;
-                target.snapshot().ok().and_then(|snapshot| snapshot.log_data().iter().find_map(|file| Self::covering_slice_for(&add_action(&file), &key)))
+                target.snapshot().ok().map(|snapshot| snapshot.log_data().iter().map(|file| add_action(&file)).collect()).unwrap_or_default()
             };
-            if let Some(covering) = covering
+            live_slices = live_adds.iter().filter(|add| Self::tag_project(add) == Some(key.project_id.as_str())).filter_map(Self::slice_tag_range).collect();
+            if let Some(covering) = live_adds.iter().find_map(|add| Self::covering_slice_for(add, &key))
                 && self.settle_covered_by_wider(&key, covering, (source_rows, source_epoch), &from_table, witness_table.as_ref(), date).await?
             {
                 return Ok(true);
@@ -2986,7 +2990,7 @@ impl Database {
         }
         if estimated_bytes > MAX_DECODED_BYTES && key.slice.width() > crate::maintenance_coordinator::MIN_SLICE_MICROS {
             let mut journal = self.journal();
-            if journal.split_time_task(&key, estimated_bytes, Some(input_footprint)) {
+            if journal.split_time_task(&key, estimated_bytes, Some(input_footprint), &live_slices) {
                 journal.checkpoint()?;
                 return Ok(true);
             }

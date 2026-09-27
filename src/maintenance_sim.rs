@@ -661,7 +661,7 @@ fn preflight(journal: &mut TaskJournal, model: &ByteModel, guard: SplitGuard, ta
     }
     let stats = crate::observability::maintenance_stats();
     let declined_before = stats.split_declined_at_floor.load(Relaxed);
-    let split = journal.split_time_task(key, observed, footprint);
+    let split = journal.split_time_task(key, observed, footprint, &[]);
     report.split_declined_at_floor += stats.split_declined_at_floor.load(Relaxed) - declined_before;
     if split {
         report.byte_splits += 1;
