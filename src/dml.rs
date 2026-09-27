@@ -1008,6 +1008,12 @@ async fn perform_version_append(
             }
         }
     }
+    if rows > 0 {
+        let assigned: Vec<&str> = assignments.iter().map(|(column, _)| column.as_str()).collect();
+        let tiers = crate::database::maintain::rollup_tiers_reading(table_name, &assigned);
+        let tiers: Vec<(String, bool)> = tiers.into_iter().map(|(tier, reads)| (tier, reads || tombstone)).collect();
+        crate::observability::record_version_append_relevance(&tiers, rows);
+    }
     let stats = crate::observability::dml_stats();
     stats.mor_version_rows_appended.fetch_add(rows, std::sync::atomic::Ordering::Relaxed);
     stats.mor_noop_rows_suppressed.fetch_add(suppressed, std::sync::atomic::Ordering::Relaxed);

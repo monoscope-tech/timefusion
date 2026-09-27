@@ -150,6 +150,7 @@ counter_registry! {
     maintenance_processed_bytes => "timefusion.maintenance.processed_bytes": "Estimated decoded input bytes of completed maintenance units, by operation",
     rollup_publications        => "timefusion.rollup.publications": "Rollup units published, by tier",
     rollup_published_input_bytes => "timefusion.rollup.published_input_bytes": "Estimated decoded input bytes of published rollup units, by tier",
+    rollup_version_append_rows => "timefusion.rollup.version_append_rows": "Merge-on-read version rows by rollup tier and whether that tier reads an assigned column (shadow: nothing acts on it). Irrelevant rows are what per-tier invalidation could keep readable",
     rollup_scan_estimated_bytes => "timefusion.rollup.scan_estimated_bytes": "Projected bytes of every rollup scan pass, including failed and repeated shard passes, by tier. Against published_input_bytes this is the wasted-scan share",
     rollup_misses              => "timefusion.rollup.misses": "Dashboard aggregates that fell through to a raw scan, labelled by REASON. Without the reason breakdown there is no feedback loop telling us which dimension to add next — a rollup silently serving 20% of traffic looks identical to one serving 90%",
     cache_insert_bypassed    => "timefusion.cache.insert_bypassed": "Cache populations suppressed because the read ran inside a large-scan bypass scope (scan-resistant admission — a wide historical scan must not evict the hot tail)",
@@ -951,6 +952,13 @@ pub fn record_rollup_published(operation: crate::maintenance_coordinator::Operat
     let tier = [KeyValue::new("tier", tier.to_string())];
     otel_add(|m| &m.rollup_publications, 1, &tier);
     otel_add(|m| &m.rollup_published_input_bytes, bytes, &tier);
+}
+
+/// One merge-on-read statement's version rows, classified per rollup tier.
+pub fn record_version_append_relevance(tiers: &[(String, bool)], rows: u64) {
+    for (tier, relevant) in tiers {
+        otel_add(|m| &m.rollup_version_append_rows, rows, &[KeyValue::new("tier", tier.clone()), KeyValue::new("relevant", *relevant)]);
+    }
 }
 
 /// One rollup scan pass over `bytes` of projected input.

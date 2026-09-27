@@ -603,6 +603,21 @@ pub(crate) fn rollups_read_any(source: &str, mut columns: impl Iterator<Item = i
     })
 }
 
+/// Per rollup tier of `source`, whether it reads any of `columns`. A derived tier
+/// reads what its base reads: it aggregates the base's rows.
+pub(crate) fn rollup_tiers_reading(source: &str, columns: &[&str]) -> Vec<(String, bool)> {
+    let Some(schema) = get_schema(source) else { return Vec::new() };
+    let reads = |spec: &crate::schema::RollupSpec| spec_source_columns(schema, spec).iter().any(|column| columns.contains(column));
+    schema
+        .rollups
+        .iter()
+        .map(|spec| {
+            let base = spec.derive_from.as_deref().and_then(|base| schema.rollups.iter().find(|held| held.name.as_deref() == Some(base)));
+            (spec.table_name(source), reads(spec) || base.is_some_and(reads))
+        })
+        .collect()
+}
+
 /// Version appends whose rows may be carried into rollup slice witnesses at flush,
 /// instead of invalidating the slices at write time. IN-MEMORY like the dedup carry:
 /// a restart forgets every ledger entry, which only forfeits carries.
@@ -11814,5 +11829,26 @@ mod escalation_freshness_tests {
     #[test_case::test_case(Some(100), None => false ; "no live count refuses")]
     fn a_witness_verifies_only_on_real_evidence(stored: Option<u64>, live: Option<u64>) -> bool {
         witness_matches(stored, live)
+    }
+}
+
+#[cfg(test)]
+mod rollup_relevance_tests {
+    use itertools::Itertools;
+
+    /// The tiers each assigned column can change, on the real schema. The derived
+    /// tier's inheritance of its base's reads cannot be isolated here: `dashboard_1h_v2`
+    /// restates every column its base reads.
+    #[test_case::test_case(&["hashes"] => Vec::<String>::new() ; "monoscope's hashes enrichment touches no tier")]
+    #[test_case::test_case(&["attributes___user___id"] => vec!["sessions_1h_v1"] ; "user enrichment touches only the session tier")]
+    #[test_case::test_case(&["attributes___http___response___status_code"] => vec!["dashboard_1h_v2", "dashboard_1m_v3"] ; "a measure filter column touches both dashboard tiers")]
+    #[test_case::test_case(&["timestamp"] => vec!["dashboard_1h_v2", "dashboard_1m_v3", "sessions_1h_v1"] ; "moving a row touches every tier")]
+    fn tiers_reading(columns: &[&str]) -> Vec<String> {
+        super::rollup_tiers_reading("otel_logs_and_spans", columns)
+            .into_iter()
+            .filter(|(_, reads)| *reads)
+            .map(|(tier, _)| tier.trim_start_matches("otel_logs_and_spans_rollup_").to_owned())
+            .sorted()
+            .collect()
     }
 }
