@@ -1597,7 +1597,7 @@ impl Database {
             let schema = schema_or_default(&source);
             // The file count IS the benefit for hygiene: `scheduling_class` ranks
             // sealed hygiene on it, not on which cell sealed first.
-            let mk_task = |project_id: &str, slice, operation, files: &[&CompactionDebtFile], created_unix_ms| {
+            let mk_task = |project_id: &str, slice, operation, files: &[&TailAdd], created_unix_ms| {
                 let estimate = files.iter().fold(0u64, |bytes, file| bytes.saturating_add(estimated_decoded_bytes(file.size)));
                 MaintenanceTask {
                     key: TaskKey { physical_table: source.clone(), source: source.clone(), project_id: project_id.to_owned(), slice, operation },
@@ -1618,7 +1618,7 @@ impl Database {
                     rank_cache: Default::default(),
                 }
             };
-            let mut partitions: HashMap<(String, chrono::NaiveDate), Vec<CompactionDebtFile>> = HashMap::new();
+            let mut partitions: HashMap<(String, chrono::NaiveDate), Vec<TailAdd>> = HashMap::new();
             {
                 let table = table_ref.read().await;
                 let default_project = if storage_project.is_empty() { "default" } else { storage_project.as_str() };
@@ -1629,7 +1629,9 @@ impl Database {
                     else {
                         continue;
                     };
-                    partitions.entry((project, date)).or_default().push(CompactionDebtFile { size: file.size(), path: path.to_string() });
+                    // Event ranges for TODAY only: they place a file in its slice cell.
+                    let stats = (date == today).then(|| file.stats()).flatten();
+                    partitions.entry((project, date)).or_default().push(TailAdd::from_stats(path.to_string(), file.size(), false, false, stats.as_deref()));
                 }
             }
             // Anything seen-but-not-planned is COMPLIANT, which is what retires
@@ -1649,7 +1651,11 @@ impl Database {
                 // SIZE only. Sortedness belongs to Repair below: an untagged file
                 // is only a *suspect*, and admitting on that would put every
                 // flush-written partition permanently out of policy.
-                let small = files.iter().filter(|file| file.size < small_target).sorted_by_key(|file| file.size).collect_vec();
+                let small = files.iter().filter(|file| file.size < small_target).sorted_by_key(|file| file.size).cloned();
+                // Today, only files sharing a rollup slice cell may pair — the
+                // packer groups by the SAME `slice_cells` over the same bounds.
+                let bounds = if date == today { self.packing_bounds(&project_id, &source, day_start) } else { Vec::new() };
+                let small = cells_with_pair(slice_cells(small, &bounds));
                 // TWO under-target files ARE the admission test. The packer's byte
                 // budget carries `pair_floor`, so it bins any two of these; a
                 // second, separately-derived predicate here is exactly how planner
@@ -1661,7 +1667,7 @@ impl Database {
                     // survives the restarts that re-derive this queue.
                     let sealed_at_ms = unix_ms(slice.end_micros.max(0));
                     let created_unix_ms = if date == today { created_unix_ms } else { sealed_at_ms.min(created_unix_ms) };
-                    planned.push(mk_task(&project_id, slice, operation, &small, created_unix_ms));
+                    planned.push(mk_task(&project_id, slice, operation, &small.iter().collect_vec(), created_unix_ms));
                 }
                 if date < today && !schema.sorting_columns.is_empty() {
                     let suspects = files.iter().filter(|file| !self.repair_verified_sorted.contains(&file.path)).collect::<Vec<_>>();
@@ -3632,30 +3638,28 @@ impl Database {
             _ => return Ok(Vec::new()),
         };
         // The pair floor is taken from THIS cell's own two smallest files, not
-        // from a constant, because that is exactly what `packer_admits_pair`
-        // (the planner/packer agreement test) measures when it decides to queue
+        // from a constant, because that is exactly what
+        // `the_packer_bins_every_pair_the_planner_queues` measures when it decides to queue
         // the cell. Deriving it any other way lets the planner enqueue work this
         // packer must refuse — which is the wedge, not a hypothetical.
         let smallest_pair = candidates.iter().map(|add| add.size).k_smallest(2).sum::<i64>();
         let target = declared_target.min(crate::config::coordinator_packing_cap_bytes(smallest_pair));
         let unsorted_candidates = candidates.iter().filter(|add| !add.is_sorted_run).count();
         let under_target_candidates = candidates.iter().filter(|add| add.size < target).count();
-        // PACKABLE, which is narrower than under-target: the packer also skips a
-        // sorted run while any L0 file is present (L0 is sorted into runs first),
-        // and a lone L0 file is legitimate work rather than a refusal. Only this
-        // count may drive the invariant — `under_target_candidates` includes files
-        // the packer is right to pass over, and asserting on it reports a healthy
-        // L0 pass as a wedge.
-        let packable_candidates = candidates.iter().filter(|add| (add.size < target || add.has_dv) && !(unsorted_candidates > 0 && add.is_sorted_run)).count();
         // A pair that does not fit means planner and packer see different candidate sets
         // (the planner does not apply the packer's range filter).
         let two_smallest = candidates.iter().map(|add| add.size).filter(|size| *size < target).k_smallest(2).collect_tuple();
         let smallest_pair = two_smallest.map_or(-1, |(smaller, larger): (i64, i64)| smaller.saturating_add(larger));
         // Captured before the move: the packer takes `candidates` by value.
         let ranges_by_path: HashMap<String, (i64, i64)> = candidates.iter().filter_map(|add| add.event_range.map(|range| (add.path.clone(), range))).collect();
-        let selected = crate::database::select_bin(
-            &candidates,
-            crate::database::BinPolicy {
+        // Today, a bin stays inside ONE rollup slice cell, so packing never moves a
+        // slice's bounded witness. Sealed dates pack across cells as before.
+        let bounds =
+            if key.operation == Operation::HotPacking { self.packing_bounds(&key.project_id, &key.source, key.slice.start_micros) } else { Vec::new() };
+        let cells = slice_cells(candidates, &bounds);
+        let selected = select_cell_bin(
+            &cells,
+            BinPolicy {
                 target_size: target,
                 // NO row cap. It was a SECOND bound in a different unit from the
                 // byte budget, and once the byte cap stopped collapsing it simply
@@ -3671,7 +3675,8 @@ impl Database {
             },
         );
         // Span of the output: merging unions the inputs' ranges and dedup reads a file
-        // once per 10-minute bin it touches. Reported only — deliberately not enforced.
+        // once per 10-minute bin it touches. Bounded by one slice cell today; reported only
+        // for sealed dates.
         if selected.len() >= 2 {
             let ranges: Vec<(i64, i64)> = selected.iter().filter_map(|path| ranges_by_path.get(path).copied()).collect();
             if let Some((lo, hi)) = ranges.iter().copied().reduce(|(lo, hi), (start, end)| (lo.min(start), hi.max(end))) {
@@ -3700,10 +3705,17 @@ impl Database {
             // queues on, so the packer declining them is a planner/packer
             // disagreement — the 2026-09-15 wedge. It cannot happen through the
             // shared rule, and if a future rule reintroduces one, this is the
-            // alertable signal rather than three silent days.
-            if packable_candidates >= 2 && unsorted_candidates == 0 {
+            // alertable signal rather than three silent days. Counted PER CELL: the
+            // planner pairs only within one. PACKABLE, narrower than under-target: a
+            // cell with any L0 file sorts it first, and a lone L0 file is legitimate
+            // work rather than a refusal.
+            let wedged_cells = cells
+                .iter()
+                .filter(|cell| cell.iter().all(|add| add.is_sorted_run) && cell.iter().filter(|add| add.size < target || add.has_dv).count() >= 2)
+                .count();
+            if wedged_cells > 0 {
                 stats.compaction_invariant_violations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                debug_assert!(false, "packer refused {packable_candidates} packable files the planner would queue");
+                debug_assert!(false, "packer refused {wedged_cells} cells of packable files the planner would queue");
             }
             warn!(
                 operation = ?key.operation,
@@ -3714,6 +3726,8 @@ impl Database {
                 after_date_filter = after_date,
                 after_project_filter = after_project,
                 after_range_filter = after_range,
+                cells = cells.len(),
+                outside_cells = after_range - cells.iter().map(Vec::len).sum::<usize>(),
                 unsorted_candidates,
                 under_target = under_target_candidates,
                 selected = selected.len(),
@@ -4932,6 +4946,22 @@ impl Database {
                 bounds.entry(date).and_modify(|held: &mut i64| *held = (*held).max(through)).or_insert(through);
                 bounds
             })
+    }
+
+    /// `slice_bounds` over every live slice of `project_id`'s `source` on the day
+    /// starting at `day_start`, all tiers. Empty for a source declaring no
+    /// rollups: it has no witness to protect.
+    fn packing_bounds(&self, project_id: &str, source: &str, day_start: i64) -> Vec<i64> {
+        if get_schema(source).is_none_or(|schema| schema.rollups.is_empty()) {
+            return Vec::new();
+        }
+        let day = day_start..day_start.saturating_add(DAY_MICROS);
+        let covered = self
+            .rollup_slice_coverage
+            .iter()
+            .filter(|entry| entry.key().0 == project_id && entry.key().1 == source && day.contains(&entry.key().3))
+            .map(|entry| entry.value().covered_through);
+        slice_bounds(covered, day_start)
     }
 
     /// Rows of `batch` below their date's live coverage bound: they move a slice's bounded witness.

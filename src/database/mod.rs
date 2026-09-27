@@ -4476,11 +4476,6 @@ pub(crate) struct HotStageOptions {
     light_permit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
-struct CompactionDebtFile {
-    size: i64,
-    path: String,
-}
-
 /// Arrow ONE dedup bin may hold across all its concurrent shards. Shard
 /// concurrency is funded by shrinking the shard, never by raising this, so peak
 /// Arrow per bin stays what `maintenance_rewrite_sem` was sized against.
@@ -5931,6 +5926,46 @@ pub(crate) fn select_bin(candidates: &[TailAdd], policy: BinPolicy) -> Vec<Strin
         return Vec::new();
     }
     selected.into_iter().map(|add| add.path.clone()).collect()
+}
+
+/// Bounds a pack of today's partition must not straddle: every live rollup
+/// slice's `covered_through`, then the 10-minute grid above the highest (slices
+/// not yet built). A bin mixing files on both sides of a bound moves that
+/// slice's bounded witness (`rollup::rows_below`), which stales the slice.
+pub(crate) fn slice_bounds(covered: impl IntoIterator<Item = i64>, day_start: i64) -> Vec<i64> {
+    use crate::maintenance_coordinator::NORMAL_SLICE_MICROS;
+    let covered: BTreeSet<i64> = covered.into_iter().collect();
+    let top = covered.last().copied().unwrap_or(day_start);
+    let grid = (1..DAY_MICROS / NORMAL_SLICE_MICROS).map(|k| day_start + k * NORMAL_SLICE_MICROS).filter(|mark| *mark > top);
+    covered.into_iter().chain(grid).collect()
+}
+
+/// `adds` grouped by the cell between consecutive sorted `bounds` each lies
+/// wholly inside. A straddler or a file without an event range joins no cell.
+/// THE one grouping the planner and the packer share; no bounds is one cell.
+pub(crate) fn slice_cells(adds: impl IntoIterator<Item = TailAdd>, bounds: &[i64]) -> Vec<Vec<TailAdd>> {
+    let cell = |t: i64| bounds.partition_point(|bound| *bound <= t);
+    adds.into_iter()
+        .filter_map(|add| match add.event_range {
+            _ if bounds.is_empty() => Some((0, add)),
+            Some((min, max)) if cell(min) == cell(max) => Some((cell(min), add)),
+            _ => None,
+        })
+        .into_group_map()
+        .into_iter()
+        .sorted_unstable_by_key(|(cell, _)| *cell)
+        .map(|(_, cell)| cell)
+        .collect()
+}
+
+/// What the planner may queue: the files of every cell holding a pair.
+pub(crate) fn cells_with_pair(cells: Vec<Vec<TailAdd>>) -> Vec<TailAdd> {
+    cells.into_iter().filter(|cell| cell.len() >= 2).flatten().collect()
+}
+
+/// What the packer takes: the fullest bin any single cell yields.
+pub(crate) fn select_cell_bin(cells: &[Vec<TailAdd>], policy: BinPolicy) -> Vec<String> {
+    cells.iter().map(|cell| select_bin(cell, policy)).min_by_key(|bin| std::cmp::Reverse(bin.len())).unwrap_or_default()
 }
 
 /// Per-slice budget, in **DECODED** bytes — the unit the sort actually allocates.
