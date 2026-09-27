@@ -459,3 +459,15 @@ state 02:23 UTC plus WAL to 04:21) replayed with `timefusion sim <dir> --hours 1
 **Next:** model per-stream re-mint from invalidations at prod's measured rate. W19's `lease_ms`/`publications`
 counters give the target. Add the compaction lanes, then re-check 1x against a fresh mature-window baseline.
 
+
+### W21 / W23 measurement — 2026-09-27 — integrator
+**Window:** image `3ecb066b` (W21 + W23 instrumentation), ~75 min uptime.
+**W21 shadow:** `rollup_carry_eligible_rows_total` 6,585 of `mor_version_rows_appended_total` 920,323 (**0.7%**).
+Most hashes UPDATEs hit rows still in the MemBuffer (retracted, never carryable by the false-hit rule), so enabling the
+carry would barely move today-window hits. **Recommendation: leave it off.** Today-window staleness is structural —
+the physical witness moves with every version append; the real fix is Stage 2 (captured source view / logical witness),
+not a carry.
+**W23 denials (sampled):** ~160 `never_certified` at date_age 0 (today, expected while ingesting), 1 `fp_moved` at age 1.
+Sealed-day denials were rare this hour — neither (a) narrowing nor (b) faster certification has a case yet; re-sample
+during a daytime backlog before building either.
+**Also:** `heavy_query_queue_timeout` 0 over the hour (admission fix holds); `flush_failed` 0.
