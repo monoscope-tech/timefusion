@@ -9056,3 +9056,57 @@ async fn ordered_mor_merge_inputs_are_charged_only_their_own_bytes() -> Result<(
     })
     .await
 }
+
+/// DataFusion splits an in-memory source with fewer partitions than
+/// `target_partitions` and rebuilds it without its declared ordering, so
+/// `EnforceSorting` re-sorted the whole mem leg under the MoR merge: a blocking
+/// `ExternalSorter` over every buffered row, reported at 7.6 GB for 44 MB.
+#[test_case("DESC", "m0", 29_999, -1 ; "newest first reads the mem leg")]
+#[test_case("ASC", "d", 0, 1 ; "oldest first reads the delta leg")]
+#[serial]
+#[tokio::test(flavor = "multi_thread")]
+async fn mem_leg_with_fewer_buckets_than_partitions_is_merged_not_resorted(dir: &str, tag: &str, first: i64, step: i64) -> Result<()> {
+    use datafusion::{
+        arrow::util::display::array_value_to_string,
+        execution::{
+            TaskContext,
+            memory_pool::{PeakRecordingPool, UnboundedMemoryPool},
+            runtime_env::RuntimeEnvBuilder,
+        },
+        physical_plan::sorts::sort::SortExec,
+    };
+    let prefix = uuid::Uuid::new_v4().to_string()[..8].to_string();
+    let mut cfg = (*create_test_config(&prefix)).clone();
+    cfg.memory.timefusion_query_partitions = 4;
+    let b = crate::server::bootstrap(Arc::new(cfg)).await?;
+    within(90, async {
+        let project = format!("memleg_{prefix}");
+        let now = crate::support::now_micros();
+        let rows = |tag: &str, n: i64, base: i64| {
+            json_to_batch((0..n).map(|i| test_span_ts(&format!("{tag}-{i:05}"), &format!("{tag}-{i}-{}", "x".repeat(40)), &project, base + i * 10)).collect())
+        };
+        b.db.insert_records_batch(&project, "otel_logs_and_spans", vec![rows("d", 2000, now - 7_000_000_000)?], true, None).await?;
+        for k in 0..2 {
+            b.db.insert_records_batch(&project, "otel_logs_and_spans", vec![rows(&format!("m{k}"), 30_000, now - (k + 1) * 300_000_000)?], false, None).await?;
+        }
+        let sql = format!(
+            "SELECT id FROM otel_logs_and_spans WHERE project_id = '{project}' AND timestamp BETWEEN to_timestamp_micros({}) AND to_timestamp_micros({}) ORDER BY timestamp {dir} LIMIT 200",
+            now - 7_200_000_000,
+            now + 60_000_000
+        );
+        let plan = b.session_ctx.sql(&sql).await?.create_physical_plan().await?;
+        let full_sorts = plan_nodes(&plan).into_iter().filter(|n| n.downcast_ref::<SortExec>().is_some_and(|s| s.fetch().is_none())).count();
+        let pool = Arc::new(PeakRecordingPool::new(Arc::new(UnboundedMemoryPool::default())));
+        let task = TaskContext::from(&b.session_ctx.state()).with_runtime(RuntimeEnvBuilder::from_runtime_env(&b.session_ctx.runtime_env()).with_memory_pool(pool.clone()).build_arc()?);
+        let out = datafusion::physical_plan::collect(plan, Arc::new(task)).await?;
+        let ids: Vec<String> = out.iter().flat_map(|b| (0..b.num_rows()).map(|i| array_value_to_string(b.column(0), i).unwrap())).collect();
+        assert_eq!(ids, (0..200).map(|i| format!("{tag}-{:05}", first + step * i)).collect::<Vec<_>>());
+        assert_eq!(full_sorts, 0, "no blocking sort may sit over the mem leg");
+        // Measured: 59-72 MB with the re-sort, 9 MB without it (1 MB once merge
+        // inputs own their bytes), for the same 62k rows.
+        assert!(pool.peak_reserved() < 16 << 20, "peak pool reservation {} B", pool.peak_reserved());
+        b.shutdown.cancel();
+        Ok(())
+    })
+    .await
+}

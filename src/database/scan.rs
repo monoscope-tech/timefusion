@@ -12,6 +12,24 @@ pub struct ProjectRoutingTable {
     skip_queue: bool,
 }
 
+/// Splits sorted partitions at batch boundaries until there are `target` of them
+/// or every one is a single batch. DataFusion splits an in-memory source with
+/// fewer partitions than `target_partitions` itself, but rebuilds it WITHOUT its
+/// declared ordering, and `EnforceSorting` then re-sorts the whole leg under the
+/// MoR merge. Here either count leaves it nothing to split. Sound because each
+/// partition's batches are in sort order, so any consecutive run of them is too.
+fn split_sorted_runs(mut parts: Vec<Vec<RecordBatch>>, target: usize) -> Vec<Vec<RecordBatch>> {
+    while parts.len() < target
+        && let Some(i) = parts.iter().position_max_by_key(|p| p.len())
+        && parts[i].len() > 1
+    {
+        let half = parts[i].len() / 2;
+        let tail = parts[i].split_off(half);
+        parts.insert(i + 1, tail);
+    }
+    parts
+}
+
 impl ProjectRoutingTable {
     pub fn new(
         default_project: String, database: Arc<Database>, schema: SchemaRef, batch_queue: Option<Arc<crate::write::BatchQueue>>, table_name: String,
@@ -1841,7 +1859,10 @@ impl TableProvider for ProjectRoutingTable {
         });
         metrics::counter!(scan_metric_names::MEM_PLAN_TOTAL).increment(1);
         metrics::counter!(scan_metric_names::MEM_PLAN_US_TOTAL).increment(mem_plan_started.elapsed().as_micros() as u64);
-        let mem_partitions = mem_leg.partitions;
+        let mem_partitions = match mem_leg.sorted {
+            true => split_sorted_runs(mem_leg.partitions, state.config().target_partitions()),
+            false => mem_leg.partitions,
+        };
 
         let mem_ranges = layer.get_bucket_ranges(&project_id, &self.table_name);
 
