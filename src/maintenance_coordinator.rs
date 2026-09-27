@@ -585,6 +585,12 @@ pub struct TaskJournal {
     /// Keyed by operation because a claim only ever wants one of them: a single
     /// set made every claim walk all six lanes' keys to use a sixth of them.
     claimable: std::collections::BTreeMap<Operation, std::collections::BTreeSet<TaskKey>>,
+    /// Every `BaseRollup` slice per `(source, project_id, physical_table)`, with the
+    /// widest seen, so a derived unit's dependency check reads only overlapping
+    /// parents rather than the journal. Sound because every new key reaches
+    /// `mark_dirty` and load rebuilds it; removal is lazy — a stale slice
+    /// resolves to no task and is skipped.
+    base_slices: HashMap<(String, String, String), (i64, std::collections::BTreeSet<TimeSlice>)>,
     /// Bumped when a BULK rank input changes (`tier_holes`, `untagged_cells`),
     /// invalidating every memoised [`Rank`] at once. Those sets are replaced
     /// WHOLESALE, so there is nothing finer to track, and a counter cannot be
@@ -728,6 +734,12 @@ pub struct Invalidation<'a> {
     pub mint_rollup: bool,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Tasks `dependencies_complete` examined — pins its cost shape in tests.
+    static DEPENDENCY_VISITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 /// Insert or replace a task by key, keeping `indices` in step with `tasks`.
 /// A free function so WAL replay in [`TaskJournal::load`], which runs before
 /// there is a `Self`, shares one definition with every other insert site.
@@ -834,6 +846,7 @@ impl TaskJournal {
             tier_holes: HashSet::new(),
             untagged_cells: HashSet::new(),
             claimable: std::collections::BTreeMap::new(),
+            base_slices: HashMap::new(),
             rank_generation: 0,
             dedup_generation: 0,
             claim_scratch: Vec::new(),
@@ -843,6 +856,9 @@ impl TaskJournal {
         };
         journal.rebuild_dedup_edges();
         journal.rebuild_claimable();
+        for task in &journal.snapshot.tasks {
+            Self::index_base_slice(&mut journal.base_slices, &task.key);
+        }
         Ok(journal)
     }
 
@@ -1550,7 +1566,16 @@ impl TaskJournal {
         {
             self.claimable.entry(key.operation).or_default().insert(key.clone());
         }
+        Self::index_base_slice(&mut self.base_slices, &key);
         self.dirty_tasks.insert(key);
+    }
+
+    fn index_base_slice(index: &mut HashMap<(String, String, String), (i64, std::collections::BTreeSet<TimeSlice>)>, key: &TaskKey) {
+        if key.operation == Operation::BaseRollup {
+            let (widest, slices) = index.entry((key.source.clone(), key.project_id.clone(), key.physical_table.clone())).or_default();
+            *widest = (*widest).max(key.slice.width());
+            slices.insert(key.slice);
+        }
     }
 
     /// Everything memoised from `tier_holes` / `untagged_cells` is now suspect.
@@ -1920,6 +1945,13 @@ impl TaskJournal {
     /// [`Self::QUARANTINE_ATTEMPTS`] times; the caller must gate it on a small occupancy
     /// permit so proven-unfittable work cannot hold the whole pool.
     pub fn claim_next(&mut self, operation: Operation, now_micros: i64, allow_quarantined: bool) -> Option<MaintenanceTask> {
+        let started = std::time::Instant::now();
+        let claimed = self.claim_next_timed(operation, now_micros, allow_quarantined);
+        crate::observability::record_maintenance_claim(operation, u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX));
+        claimed
+    }
+
+    fn claim_next_timed(&mut self, operation: Operation, now_micros: i64, allow_quarantined: bool) -> Option<MaintenanceTask> {
         self.claim_tick = self.claim_tick.wrapping_add(1);
         // Class is strict priority and ingest regenerates frontier work continuously, so one
         // claim in two is RESERVED for sealed work — one in four while the frontier is behind
@@ -2065,39 +2097,51 @@ impl TaskJournal {
             let parent = schema.rollups.iter().find(|spec| spec.table_name(&task.key.source) == task.key.physical_table)?.derive_from.as_deref()?;
             schema.rollups.iter().find(|spec| spec.name.as_deref() == Some(parent)).map(|spec| spec.table_name(&task.key.source))
         });
-        let overlaps_parent = |candidate: &MaintenanceTask| {
-            base_table.as_deref() == Some(candidate.key.physical_table.as_str())
-                && candidate.key.source == task.key.source
-                && candidate.key.project_id == task.key.project_id
-                && candidate.key.operation == Operation::BaseRollup
-                && task.key.slice.overlaps(candidate.key.slice.start_micros, candidate.key.slice.end_micros)
-        };
-        if self
-            .claim_candidates(Operation::BaseRollup)
-            .any(|(_, candidate)| matches!(candidate.state, TaskState::Pending | TaskState::Retry | TaskState::Running) && overlaps_parent(candidate))
-        {
-            return false;
-        }
         // Historical coverage need not have retained completed build tasks.
-        if self.cached_base_tier_proven(task) {
-            return true;
+        let proven = |coverage: bool| {
+            self.cached_base_tier_proven(task) || {
+                crate::observability::record_dependency_fallback();
+                coverage
+            }
+        };
+        let Some(physical_table) = base_table else { return proven(false) };
+        let (slice, stream) = (task.key.slice, (task.key.source.clone(), task.key.project_id.clone(), physical_table));
+        let Some((widest, slices)) = self.base_slices.get(&stream) else { return proven(false) };
+        let (source, project_id, physical_table) = stream;
+        let mut parent = TaskKey { physical_table, source, project_id, slice, operation: Operation::BaseRollup };
+        let claimable = self.claimable.get(&Operation::BaseRollup);
+        // Slices sort by start, so every overlap starts within `widest` before this one ends.
+        let window = (
+            std::ops::Bound::Excluded(TimeSlice { start_micros: slice.start_micros.saturating_sub(*widest), end_micros: i64::MAX }),
+            std::ops::Bound::Excluded(TimeSlice { start_micros: slice.end_micros, end_micros: i64::MIN }),
+        );
+        let mut complete = Vec::new();
+        for &candidate in slices.range(window) {
+            #[cfg(test)]
+            DEPENDENCY_VISITS.set(DEPENDENCY_VISITS.get() + 1);
+            if !slice.overlaps(candidate.start_micros, candidate.end_micros) {
+                continue;
+            }
+            parent.slice = candidate;
+            match self.task(&parent).map(|parent| parent.state) {
+                Some(TaskState::Pending | TaskState::Retry | TaskState::Running) if claimable.is_some_and(|keys| keys.contains(&parent)) => return false,
+                Some(TaskState::Complete) => complete.push(candidate),
+                _ => {}
+            }
         }
         // Contiguous coverage of the slice by COMPLETE units of the required operation: the
-        // `scan` walks sorted intervals and stops dead at the first gap.
-        use itertools::Itertools;
-        self.snapshot
-            .tasks
-            .iter()
-            .filter(|candidate| candidate.state == TaskState::Complete && overlaps_parent(candidate))
-            .map(|candidate| candidate.key.slice)
-            .sorted_unstable()
-            .scan(task.key.slice.start_micros, |covered, interval| {
-                (interval.start_micros <= *covered).then(|| {
-                    *covered = (*covered).max(interval.end_micros);
-                    *covered
+        // `scan` walks start-sorted intervals and stops dead at the first gap.
+        proven(
+            complete
+                .into_iter()
+                .scan(slice.start_micros, |covered, interval| {
+                    (interval.start_micros <= *covered).then(|| {
+                        *covered = (*covered).max(interval.end_micros);
+                        *covered
+                    })
                 })
-            })
-            .any(|covered| covered >= task.key.slice.end_micros)
+                .any(|covered| covered >= slice.end_micros),
+        )
     }
 
     pub fn attempts(&self, key: &TaskKey) -> u32 {
@@ -6442,6 +6486,34 @@ mod tests {
         let key = upserted(&mut journal, input);
         assert!(journal.split_time_task(&key, 2 * MAX_DECODED_BYTES, None));
         assert_eq!(live_frontier_lag_secs(journal.tasks(), now), 2 * 60);
+    }
+
+    /// The dependency check reads only the parent slices that overlap, not the
+    /// journal: the sim at 2x projects spent ~95% of its time walking every
+    /// Complete and claimable BaseRollup task once per derived candidate.
+    #[test]
+    fn derived_dependency_check_visits_overlapping_parent_slices_only() {
+        let (_dir, mut journal) = new_journal();
+        let unit = |table: &str, project: &str, start, end, operation| {
+            task_in(table, project, start, end, operation).tap_mut(|task| task.key.source = "otel_logs_and_spans".into())
+        };
+        let parent = "otel_logs_and_spans_rollup_dashboard_1m_v3";
+        for n in 0..2_000i64 {
+            let (project, start) = (format!("other{}", n % 50), (n / 50 + 2) * DAY_MICROS);
+            journal
+                .upsert(unit(parent, project.as_str(), start, start + NORMAL_SLICE_MICROS, Operation::BaseRollup).tap_mut(|t| t.state = TaskState::Complete));
+            journal.upsert(unit(parent, project.as_str(), start + NORMAL_SLICE_MICROS, start + 2 * NORMAL_SLICE_MICROS, Operation::BaseRollup));
+            journal.upsert(unit(parent, "p", start, start + NORMAL_SLICE_MICROS, Operation::BaseRollup).tap_mut(|t| t.state = TaskState::Complete));
+        }
+        let parents = DERIVED_SLICE_MICROS / NORMAL_SLICE_MICROS;
+        for start in (0..DERIVED_SLICE_MICROS).step_by(NORMAL_SLICE_MICROS as usize) {
+            journal.upsert(unit(parent, "p", start, start + NORMAL_SLICE_MICROS, Operation::BaseRollup).tap_mut(|t| t.state = TaskState::Complete));
+        }
+        journal.upsert(unit("otel_logs_and_spans_rollup_dashboard_1h_v2", "p", 0, DERIVED_SLICE_MICROS, Operation::DerivedRollup));
+        DEPENDENCY_VISITS.set(0);
+        assert!(journal.claim_next(Operation::DerivedRollup, 0, true).is_some(), "complete parents admit the derived unit");
+        let visits = DEPENDENCY_VISITS.get();
+        assert!(visits <= 4 * u64::try_from(parents).unwrap(), "visited {visits} tasks for {parents} overlapping parent slices");
     }
 
     #[test]

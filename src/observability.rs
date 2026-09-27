@@ -147,6 +147,9 @@ counter_registry! {
     cache_confirm_timeouts     => "timefusion.cache.confirm_timeouts": "Pre-drain cache confirms that hit their bound and gave up. Best-effort — the commit and the drain proceed; the next query on those files just pays an S3 round-trip",
     rollup_hits                => "timefusion.rollup.hits": "Dashboard aggregates served from the pre-aggregated rollup instead of raw spans",
     maintenance_lease_ms       => "timefusion.maintenance.lease_ms": "Wall milliseconds maintenance units held a lease, by operation and outcome. Per-lane work that survives deploys (the stats keys reset)",
+    maintenance_claims         => "timefusion.maintenance.claims": "claim_next passes, by operation, whether or not they claimed. claim_us / claims is the mean claim cost",
+    maintenance_claim_us       => "timefusion.maintenance.claim_us": "Wall microseconds inside claim_next (journal lock held), by operation",
+    maintenance_dependency_fallbacks => "timefusion.maintenance.dependency_fallbacks": "DerivedRollup dependency checks that missed the cached base-tier proof and fell back to proving coverage from completed base tasks",
     maintenance_processed_bytes => "timefusion.maintenance.processed_bytes": "Estimated decoded input bytes of completed maintenance units, by operation",
     rollup_publications        => "timefusion.rollup.publications": "Rollup units published, by tier",
     rollup_published_input_bytes => "timefusion.rollup.published_input_bytes": "Estimated decoded input bytes of published rollup units, by tier",
@@ -939,6 +942,17 @@ fn otel_add(counter: impl FnOnce(&MetricsRegistry) -> &opentelemetry::metrics::C
 pub fn record_maintenance_lease(operation: crate::maintenance_coordinator::Operation, outcome: Option<crate::maintenance_coordinator::TaskState>, ran_ms: u64) {
     let outcome: &'static str = outcome.map_or("none", Into::into);
     otel_add(|m| &m.maintenance_lease_ms, ran_ms, &[KeyValue::new("operation", <&'static str>::from(operation)), KeyValue::new("outcome", outcome)]);
+}
+
+/// One `claim_next` pass and the wall time it held the journal.
+pub fn record_maintenance_claim(operation: crate::maintenance_coordinator::Operation, elapsed_us: u64) {
+    let operation = [KeyValue::new("operation", <&'static str>::from(operation))];
+    otel_add(|m| &m.maintenance_claims, 1, &operation);
+    otel_add(|m| &m.maintenance_claim_us, elapsed_us, &operation);
+}
+
+pub fn record_dependency_fallback() {
+    otel_add(|m| &m.maintenance_dependency_fallbacks, 1, &[]);
 }
 
 /// Input bytes of a completed maintenance unit.
@@ -1870,6 +1884,9 @@ mod tests {
         record_rollup_scan_bytes("dash_1m", 30);
         record_rollup_published(Operation::BaseRollup, "dash_1m", 10);
         record_processed_bytes(Operation::HotPacking, 5);
+        record_maintenance_claim(Operation::DerivedRollup, 40);
+        record_maintenance_claim(Operation::DerivedRollup, 2);
+        record_dependency_fallback();
 
         let mut rm = ResourceMetrics::default();
         reader.collect(&mut rm).unwrap();
@@ -1893,6 +1910,9 @@ mod tests {
         assert_eq!(
             sums,
             [
+                "timefusion.maintenance.claim_us operation=DerivedRollup 42",
+                "timefusion.maintenance.claims operation=DerivedRollup 2",
+                "timefusion.maintenance.dependency_fallbacks  1",
                 "timefusion.maintenance.lease_ms operation=BaseRollup,outcome=Complete 1500",
                 "timefusion.maintenance.lease_ms operation=Dedup,outcome=none 7",
                 "timefusion.maintenance.processed_bytes operation=BaseRollup 10",
