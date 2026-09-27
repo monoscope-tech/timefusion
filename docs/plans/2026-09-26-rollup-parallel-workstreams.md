@@ -26,6 +26,11 @@ Claim a stream by putting your name in its **Owner** cell in one commit, before 
   stream's file, note it in the stream row first. `src/database/maintain.rs` and `src/rollup.rs` are large
   and shared: keep edits to the functions your stream names, and rebase often.
 
+- **Deploy windows (from 2026-09-27):** every code push restarts prod and resets the counters measurements depend on
+  (dedup waves take >40 min; mature-process reads need ≥1–2 h). The integrator batches code into windows with a
+  **≥2 h quiet gap** between deploys. Current window: quiet until **10:20 UTC** (last deploy `d56a02d6` at 08:17).
+  Docs-only and `scripts/deploy/**` pushes are always fine.
+
 ## Roles
 
 | Role | Who | Responsibility |
