@@ -42,7 +42,7 @@ Deploy image build 21–31 → 4–8 min (Blacksmith); CI E2E 15 → 7 min.
 **Owner decisions (2026-09-27):**
 - Sessions: build a browser-scoped `sessions_1h_v2` aimed at the RUM sessions query (W27). v1 stays paused until v2 serves.
 - `service_name_hll`: audit stored sketches over the served window, then unblock (W28).
-- `level`: add as a dashboard dimension now — `dashboard_1m_v4` / derived `1h_v3` (W29).
+- `level`: `dashboard_1m_v4` / derived `1h_v3` as a SUPERSET that REPLACES v3 (31-day backfill; dual-run only until v4 covers, then drop v3/1h_v2). A parallel `level` tier was withdrawn 2026-08-24 for doubling build work (W29).
 - Backfill for both spec changes: **7 days**.
 - Staging: scratch prefix in R2 (`timefusion-staging/`) using the prod credentials, with a startup guard refusing prod table paths (W30).
 - Stage 2 (logical/snapshot source view for today-window hits): build ASAP (W31).
