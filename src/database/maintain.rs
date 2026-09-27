@@ -10528,33 +10528,6 @@ mod rollup_noop_skip_tests {
         Ok(())
     }
 
-||||||| 2a126d1a (Settle a rollup unit under an equal-width live file by its freshness)
-    /// An equal-width live file whose witness verifies answers the unit, as it answered
-    /// each half of a split before: prod 2026-09-27 OOM'd when such units rebuilt whole
-    /// days instead. The no-op skip is defeated here so only the freshness rule can hold.
-    #[serial]
-    #[tokio::test]
-    async fn a_fresh_equal_width_file_completes_the_unit_without_rebuilding() -> Result<()> {
-        let (db, project, date) = rollup_db("fresh_equal_width").await?;
-        assert!(build_day(&db, &project, date, "seed").await? > 0);
-        let first = db.run_unit_once("otel_logs_and_spans", &project, date, Operation::BaseRollup, 1, 12).await?;
-        assert_eq!(first.state, Some(TaskState::Complete), "the fixture needs a live 12:00-13:00 publication");
-        let start = date.and_hms_opt(12, 0, 0).unwrap().and_utc().timestamp_micros();
-        {
-            let mut entry = db
-                .rollup_slice_coverage
-                .get_mut(&(project.clone(), "otel_logs_and_spans".to_owned(), TIER.to_owned(), start, start + 3_600_000_000))
-                .expect("the 1h publication's coverage");
-            assert!(matches!(entry.value().output, RollupOutputEvidence::Files(_)), "a nonempty publication");
-            entry.value_mut().content_fp = None;
-        }
-        let published_at = tier_version(&db).await;
-        let report = db.run_unit_once("otel_logs_and_spans", &project, date, Operation::BaseRollup, 1, 12).await?;
-        assert_eq!(report.state, Some(TaskState::Complete));
-        assert_eq!(tier_version(&db).await, published_at, "a fresh equal-width file must answer the unit, not be rebuilt");
-        Ok(())
-    }
-
     #[test_case::test_case(true ; "changed source")]
     #[test_case::test_case(false ; "overlapping old output")]
     #[serial]
