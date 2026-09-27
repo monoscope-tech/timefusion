@@ -1685,6 +1685,73 @@ async fn an_overlapping_chain_leaves_its_disjoint_slices_proven() -> Result<()> 
     Ok(())
 }
 
+/// A non-derived 1h tier is built from 10-minute slices, and each slice stamps its
+/// PARTIAL state with the bucket start under a slice-blind `id`, so the tier read's
+/// `(timestamp, id)` dedup keeps one partial per bucket. Routing it undercounts.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_subgrain_sliced_tier_is_not_routed_over_its_partial_states() -> Result<()> {
+    use crate::maintenance_coordinator::{NORMAL_SLICE_MICROS, Operation, TaskKey, TimeSlice};
+    const HOUR: i64 = 3_600_000_000;
+    let db = Arc::new(Database::with_config(rollup_backfill_config("subgrain-partials", 35)).await?);
+    db.cancel_maintenance();
+    let project = format!("subgrain_{}", uuid::Uuid::new_v4().simple());
+    let day = (Utc::now() - chrono::Duration::days(3)).date_naive();
+    let day_start = midnight_micros(day);
+    let noon = day_start + 12 * HOUR;
+    for (i, offset) in [0, 25, 35, 55].into_iter().enumerate() {
+        insert_a_span(&db, &project, &format!("s{i}"), noon + offset * 60_000_000).await?;
+    }
+    db.run_unit_once("otel_logs_and_spans", &project, day, Operation::BaseRollup, 24, 0).await?;
+    let sessions = get_schema("otel_logs_and_spans")
+        .expect("schema")
+        .rollups
+        .iter()
+        .find(|spec| spec.name.as_deref() == Some("sessions_1h_v1"))
+        .expect("tier")
+        .table_name("otel_logs_and_spans");
+    for start in (noon..noon + HOUR).step_by(NORMAL_SLICE_MICROS as usize) {
+        let key = TaskKey {
+            physical_table: sessions.clone(),
+            source: "otel_logs_and_spans".into(),
+            project_id: project.clone(),
+            slice: TimeSlice::new(start, start + NORMAL_SLICE_MICROS)?,
+            operation: Operation::BaseRollup,
+        };
+        db.journal().enqueue(key.clone(), 0, crate::maintenance_coordinator::MAX_DECODED_BYTES, 0);
+        assert!(db.run_coordinator_rollup_selected(crate::database::maintain::TaskSelection::Exact(&key)).await?);
+    }
+
+    let mut ctx = Arc::clone(&db).create_session_context();
+    db.setup_session_context(&mut ctx)?;
+    let window =
+        format!("project_id = '{project}' AND timestamp >= to_timestamp_micros({}) AND timestamp < to_timestamp_micros({})", noon - 2 * HOUR, noon + 2 * HOUR);
+    // The session tier is the only one carrying the session dimension; the second shape is the 1m tier's.
+    for (group, routes) in [("attributes___session___id", false), ("status_code", true)] {
+        let sql = format!(
+            "SELECT time_bucket('1 hours', timestamp) AS tb, {group}, COUNT(*) AS c FROM otel_logs_and_spans WHERE {window} GROUP BY 1, 2 ORDER BY 1, 2"
+        );
+        let state = ctx.state();
+        let plan = state.optimize(&state.create_logical_plan(&sql).await?)?;
+        let routed = db.rollup_sql(&plan, &state).await.map(|rewrite| rewrite.map(|rewrite| rewrite.grain));
+        let render = |batches: &[RecordBatch]| arrow::util::pretty::pretty_format_batches(batches).map(|table| table.to_string());
+        let refusals = || crate::observability::maintenance_stats().rollup_miss_sub_grain_slices.load(std::sync::atomic::Ordering::Relaxed);
+        let before = refusals();
+        assert_eq!(
+            render(&ctx.sql(&sql).await?.collect().await?)?,
+            render(&db.query_delta_only(&sql).await?)?,
+            "{group}: must answer exactly as raw ({routed:?})"
+        );
+        match routes {
+            true => assert!(matches!(routed, Ok(Some(_))), "{group}: the 1m tier still routes, got {routed:?}"),
+            false => {
+                assert_eq!(routed, Err(crate::rollup::MissReason::SubGrainSlices), "{group}: the sub-grain-sliced tier must be refused");
+                assert!(refusals() > before, "{group}: the refusal is counted");
+            }
+        }
+    }
+    Ok(())
+}
+
 /// A fresh process must route from the durable coverage ledger at boot: until
 /// `recover_rollup_coverage` replays every tier's Delta log, routing is not attempted
 /// at all, and that replay window is a large share of a short-lived process's uptime.

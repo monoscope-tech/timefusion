@@ -151,6 +151,13 @@ impl Database {
     async fn rollup_rewrite_for(
         &self, route: crate::rollup::RoutedRollup, _session: &datafusion::execution::context::SessionState,
     ) -> std::result::Result<Option<RollupRewrite>, crate::rollup::MissReason> {
+        // A base unit may bisect down to `MIN_SLICE_MICROS`; a coarser base tier then holds
+        // several partial states per bucket under one `(timestamp, id)`, which its read dedups.
+        let base = get_schema(&route.source)
+            .is_some_and(|schema| schema.rollups.iter().any(|spec| spec.table_name(&route.source) == route.target && spec.derive_from.is_none()));
+        if base && route.grain > crate::maintenance_coordinator::MIN_SLICE_MICROS {
+            return Err(crate::rollup::MissReason::SubGrainSlices);
+        }
         let end = route.hi.checked_sub(1).ok_or(crate::rollup::MissReason::UnboundedTime)?;
         let dates = window_dates(route.lo, end).ok_or(crate::rollup::MissReason::IncompleteCoverage)?;
         // A cross-project route cannot see a custom-storage project's table, so its coverage

@@ -1197,6 +1197,7 @@ pub fn record_rollup_miss(reason: crate::rollup::MissReason) {
         R::UnwalkableSource => &stats.rollup_miss_unwalkable_source,
         R::MultiScanSource => &stats.rollup_miss_multi_scan_source,
         R::MeasureNotStored => &stats.rollup_miss_measure_not_stored,
+        R::SubGrainSlices => &stats.rollup_miss_sub_grain_slices,
     }
     .fetch_add(1, Relaxed);
     if let Some(m) = METRICS.get() {
@@ -1687,6 +1688,7 @@ atomic_stats! {
         rollup_miss_incomplete_coverage as "rollup_miss_incomplete_coverage_total",
         rollup_miss_unknown_filter as "rollup_miss_unknown_filter_total",
         rollup_miss_measure_not_stored as "rollup_miss_measure_not_stored_total",
+        rollup_miss_sub_grain_slices as "rollup_miss_sub_grain_slices_total",
         rollup_miss_filter_not_eligible as "rollup_miss_filter_not_eligible_total",
         rollup_miss_filter_multiple_null_guards as "rollup_miss_filter_multiple_null_guards_total",
         rollup_miss_filter_null_guard_mismatch as "rollup_miss_filter_null_guard_mismatch_total",
