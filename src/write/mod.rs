@@ -6091,6 +6091,14 @@ fn stamp_column(table: &str) -> Option<(FieldRef, Option<Arc<str>>)> {
     Some((Arc::new(Field::new(name, dt.clone(), nullable)), tz.clone()))
 }
 
+/// The single version stamp [`stamp_version`] gave `batch`.
+pub fn version_stamp_of(table: &str, batch: &RecordBatch) -> Option<i64> {
+    use arrow::array::AsArray;
+    let (field, _) = stamp_column(table)?;
+    let column = batch.column_by_name(field.name())?.as_primitive_opt::<arrow::datatypes::TimestampMicrosecondType>()?;
+    (column.null_count() == 0 && !column.is_empty()).then(|| column.value(0))
+}
+
 /// Stamp every batch's version column with a fresh monotonic value.
 ///
 /// One stamp per batch, not per row: a batch is one write, and rows inside it

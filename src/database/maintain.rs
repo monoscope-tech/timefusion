@@ -574,6 +574,103 @@ fn day_start_micros(date: chrono::NaiveDate) -> Option<i64> {
     Some(date.and_hms_opt(0, 0, 0)?.and_utc().timestamp_micros())
 }
 
+/// Every source column a rollup spec's build reads: identity, version, tombstone,
+/// dimensions, measure inputs and the columns its measure filters name.
+fn spec_source_columns<'a>(source: &'a crate::schema::TableSchema, spec: &'a crate::schema::RollupSpec) -> HashSet<&'a str> {
+    ["project_id", "date", "timestamp"]
+        .into_iter()
+        .chain(source.dedup_keys.iter().map(String::as_str))
+        .chain(source.dedup_tiebreak.iter().map(String::as_str))
+        .chain(source.tombstone_column.iter().map(String::as_str))
+        .chain(spec.dimensions.iter().map(String::as_str))
+        .chain(spec.measures.iter().filter_map(|measure| measure.column.as_deref()))
+        .chain(
+            spec.measures
+                .iter()
+                .filter_map(|measure| measure.filter.as_deref())
+                .flat_map(|filter| filter.split(|character: char| !(character.is_ascii_alphanumeric() || character == '_')))
+                .filter(|token| source.fields.iter().any(|field| field.name == *token)),
+        )
+        .collect()
+}
+
+/// Can assigning `columns` change what ANY rollup of `source` aggregates? Paused
+/// specs count: their coverage is kept, so it must stay true.
+pub(crate) fn rollups_read_any(source: &str, mut columns: impl Iterator<Item = impl AsRef<str>>) -> bool {
+    get_schema(source).is_none_or(|schema| {
+        let read: HashSet<&str> = schema.rollups.iter().flat_map(|spec| spec_source_columns(schema, spec)).collect();
+        columns.any(|column| read.contains(column.as_ref()))
+    })
+}
+
+/// Version appends whose rows may be carried into rollup slice witnesses at flush,
+/// instead of invalidating the slices at write time. IN-MEMORY like the dedup carry:
+/// a restart forgets every ledger entry, which only forfeits carries.
+#[derive(Debug, Default)]
+pub(crate) struct WitnessCarry {
+    /// Orders statement reads against relevant appends.
+    seq: std::sync::atomic::AtomicU64,
+    /// Per `(project, table)`, the sequence of the latest version append that a
+    /// rollup reads, tombstones included.
+    relevant: dashmap::DashMap<(String, String), u64>,
+    /// Per `(project, table)`, carry-eligible version stamps: stamp → (sequence at the
+    /// appending statement's read, when admitted).
+    eligible: dashmap::DashMap<(String, String), std::collections::BTreeMap<i64, (u64, std::time::Instant)>>,
+}
+
+/// Unflushed eligible stamps older than this are forgotten; their rows go stale.
+const WITNESS_CARRY_TTL: std::time::Duration = std::time::Duration::from_secs(2 * 3600);
+
+impl WitnessCarry {
+    /// Taken before a statement reads the rows it re-appends.
+    pub(crate) fn begin(&self) -> u64 {
+        self.seq.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1
+    }
+
+    /// A version append some rollup reads: it may have been built on after a
+    /// concurrent irrelevant statement read the older row, so that statement's
+    /// full-row version would revert it. Refuses every carry read before now.
+    pub(crate) fn relevant(&self, project_id: &str, table: &str) {
+        self.relevant.insert((project_id.to_owned(), table.to_owned()), self.begin());
+    }
+
+    pub(crate) fn admit(&self, project_id: &str, table: &str, stamp: i64, read_seq: u64) {
+        let now = std::time::Instant::now();
+        let mut stamps = self.eligible.entry((project_id.to_owned(), table.to_owned())).or_default();
+        stamps.retain(|_, (_, admitted)| now.duration_since(*admitted) < WITNESS_CARRY_TTL);
+        stamps.insert(stamp, (read_seq, now));
+    }
+
+    /// Carry-eligible rows per date in a batch set about to be committed. A stamp read
+    /// before the latest relevant append is not eligible (the stale-replacement guard).
+    pub(crate) fn eligible_rows_by_date(&self, project_id: &str, table: &str, batches: &[RecordBatch]) -> HashMap<String, u64> {
+        use arrow::array::AsArray;
+        let key = (project_id.to_owned(), table.to_owned());
+        let (Some(stamps), Some(stamp_column)) = (self.eligible.get(&key), get_schema(table).and_then(|schema| schema.dedup_tiebreak.clone())) else {
+            return HashMap::new();
+        };
+        let floor = self.relevant.get(&key).map_or(0, |seq| *seq);
+        let mut rows: HashMap<String, u64> = HashMap::new();
+        for batch in batches {
+            let (Some(stamp), Some(date)) = (batch.column_by_name(&stamp_column), batch.column_by_name("date")) else { continue };
+            let (Ok(stamp), Ok(date)) =
+                (arrow::compute::cast(stamp, &arrow::datatypes::DataType::Int64), arrow::compute::cast(date, &arrow::datatypes::DataType::Utf8))
+            else {
+                continue;
+            };
+            let (stamp, date) = (stamp.as_primitive::<arrow::datatypes::Int64Type>(), date.as_string::<i32>());
+            for (stamp, date) in stamp.iter().zip(date.iter()) {
+                if let (Some(stamp), Some(date)) = (stamp, date)
+                    && stamps.get(&stamp).is_some_and(|(read_seq, _)| *read_seq >= floor)
+                {
+                    *rows.entry(date.to_owned()).or_default() += 1;
+                }
+            }
+        }
+        rows
+    }
+}
+
 /// `LogicalFileView::add_action()`, centralizing its `#[allow(deprecated)]` call site.
 pub(super) fn add_action(file: &deltalake::kernel::LogicalFileView) -> deltalake::kernel::Add {
     #[allow(deprecated)]
@@ -2518,21 +2615,7 @@ impl Database {
             Ok(table) => table,
             Err(error) => return retry(format!("resolve_input: {error:#}"), std::time::Duration::from_secs(30)),
         };
-        let required_columns: HashSet<&str> = ["project_id", "date", "timestamp"]
-            .into_iter()
-            .chain(source_schema.dedup_keys.iter().map(String::as_str))
-            .chain(source_schema.dedup_tiebreak.iter().map(String::as_str))
-            .chain(source_schema.tombstone_column.iter().map(String::as_str))
-            .chain(spec.dimensions.iter().map(String::as_str))
-            .chain(spec.measures.iter().filter_map(|measure| measure.column.as_deref()))
-            .chain(
-                spec.measures
-                    .iter()
-                    .filter_map(|measure| measure.filter.as_deref())
-                    .flat_map(|filter| filter.split(|character: char| !(character.is_ascii_alphanumeric() || character == '_')))
-                    .filter(|token| source_schema.fields.iter().any(|field| field.name == *token)),
-            )
-            .collect();
+        let required_columns = spec_source_columns(source_schema, spec);
         let projected_numerator = u64::try_from(required_columns.len()).unwrap_or(u64::MAX);
         let projected_denominator = u64::try_from(source_schema.fields.len().max(1)).unwrap_or(u64::MAX);
         let mut untagged_inputs = 0u64;
@@ -4776,6 +4859,52 @@ impl Database {
         if carried > 0 {
             crate::observability::maintenance_stats().rollup_witness_carried.fetch_add(carried, std::sync::atomic::Ordering::Relaxed);
             debug!(table_name, project_id, date, dropped, carried, event = "rollup_witness_carried_across_dedup");
+        }
+    }
+
+    /// Add a flush's carry-eligible version rows to every rollup slice witness over
+    /// that partition. The whole-date witness always grows by `rows`; a bounded witness
+    /// only when every file the commit wrote to the date lies wholly below its bound,
+    /// the rule `rows_below` counts by. `max_ts` is `None` when a file had no
+    /// timestamp statistic, which leaves bounded witnesses alone.
+    ///
+    /// NOT RACE-FREE: coverage records no source version, so a slice whose witness was
+    /// taken after this commit landed is carried twice. That reads as stale, unless a
+    /// later relevant change of exactly `rows` rows re-aligns it. `carry_dedup_witness`
+    /// has the same exposure. This must be closed before the flag is enabled.
+    pub(crate) fn carry_version_witness(&self, project_id: &str, source: &str, date: &str, rows: u64, max_ts: Option<i64>) {
+        let Some(day_start) = date_start_micros(date) else { return };
+        let day_end = day_start.saturating_add(DAY_MICROS);
+        let mut carried = 0u64;
+        self.rollup_slice_coverage.iter_mut().for_each(|mut entry| {
+            let (project, held_source, _, start, _) = entry.key();
+            if project != project_id || held_source != source || *start < day_start || *start >= day_end {
+                return;
+            }
+            let coverage = entry.value_mut();
+            coverage.source_rows = coverage.source_rows.map(|held| held.saturating_add(rows));
+            if max_ts.is_some_and(|hi| hi < coverage.covered_through) {
+                coverage.source_rows_below = coverage.source_rows_below.map(|held| held.saturating_add(rows));
+            }
+            carried = carried.saturating_add(1);
+        });
+        crate::observability::dml_stats().rollup_carry_applied_rows.fetch_add(rows, std::sync::atomic::Ordering::Relaxed);
+        debug!(project_id, source, date, rows, carried, event = "rollup_witness_carried_across_version_append");
+    }
+
+    /// After a flush commit lands: carry each date's eligible rows, bounded by the
+    /// latest timestamp of every file the commit wrote to that date.
+    pub(crate) fn carry_committed_versions(&self, project_id: &str, source: &str, carry: HashMap<String, u64>, adds: &[deltalake::kernel::Action]) {
+        for (date, rows) in carry {
+            let max_ts = adds
+                .iter()
+                .filter_map(|action| match action {
+                    deltalake::kernel::Action::Add(add) => Some(add),
+                    _ => None,
+                })
+                .filter(|add| add.partition_values.get("date").and_then(Option::as_deref) == Some(date.as_str()))
+                .try_fold(i64::MIN, |max, add| add_ts_bounds(add).1.map(|hi| max.max(hi)));
+            self.carry_version_witness(project_id, source, &date, rows, max_ts);
         }
     }
 
@@ -10304,6 +10433,84 @@ mod rollup_noop_skip_tests {
         db.recover_rollup_coverage("otel_logs_and_spans").await?;
         assert!(!db.rollup_slice_coverage.contains_key(&key), "empty recovery must refuse changed source or overlapping old output");
         Ok(())
+    }
+
+    /// Merge-on-read UPDATEs that assign only columns no rollup spec reads (monoscope's
+    /// `hashes` enrichment) appended version rows that went stale every slice they touched.
+    /// Each case names the statements run, then whether the slice still routes after the flush.
+    #[test_case::test_case(true, &[Stmt::Hashes], true ; "hashes only on flushed rows routes")]
+    #[test_case::test_case(false, &[Stmt::Hashes], false ; "flag off keeps today's staleness")]
+    #[test_case::test_case(true, &[Stmt::User], false ; "a spec-relevant column goes stale")]
+    #[test_case::test_case(true, &[Stmt::Ingest, Stmt::Hashes], false ; "a version of a still-buffered row is new data")]
+    // Relevant appends invalidate at write time, so this outcome is structural too.
+    #[test_case::test_case(true, &[Stmt::Hashes, Stmt::User], false ; "a relevant version retracting a carryable one goes stale")]
+    #[test_case::test_case(true, &[Stmt::Hashes, Stmt::UserElsewhere], false ; "a relevant append after the read refuses the carry")]
+    #[serial]
+    #[tokio::test]
+    async fn a_version_append_carries_the_witness_only_when_no_spec_reads_it(carry: bool, statements: &[Stmt], routes: bool) -> Result<()> {
+        let mut cfg = (*rollup_cfg("witness_carry")).clone();
+        cfg.maintenance.timefusion_rollup_witness_carry = carry;
+        let cfg = Arc::new(cfg);
+        let db = Database::with_config(Arc::clone(&cfg)).await?;
+        let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+        let date = chrono::Utc::now().date_naive() - chrono::Duration::days(3);
+        insert_span(&db, &project_id, date - chrono::Duration::days(1), 12, "elsewhere", "op").await?;
+        assert!(build_day(&db, &project_id, date, "seed").await? > 0, "the fixture needs a built slice");
+        db.recover_rollup_coverage("otel_logs_and_spans").await?;
+        let layer = Arc::new(crate::support::test_helpers::test_layer(Arc::clone(&cfg))?.with_delta_writer(crate::server::delta_write_callback(&db)));
+        let db = Arc::new(db.with_buffered_layer(Arc::clone(&layer)));
+        let mut ctx = Arc::clone(&db).create_session_context();
+        db.setup_session_context(&mut ctx)?;
+        let noon = date.and_hms_opt(12, 0, 0).expect("valid hour").and_utc().timestamp_micros();
+        let (lo, hi) = db
+            .rollup_slice_coverage
+            .iter()
+            .find(|entry| entry.key().0 == project_id && entry.key().2 == TIER && entry.key().3 <= noon && noon < entry.key().4)
+            .map(|entry| (entry.key().3, entry.key().4))
+            .expect("the fixture needs the base slice holding the seed row");
+        let routes_now = || async {
+            let state = ctx.state();
+            let sql = format!(
+                "SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id='{project_id}' AND timestamp >= to_timestamp_micros({lo}) AND timestamp < to_timestamp_micros({hi})"
+            );
+            let plan = state.optimize(&state.create_logical_plan(&sql).await?)?;
+            Ok::<_, anyhow::Error>(matches!(db.rollup_sql(&plan, &state).await, Ok(Some(_))))
+        };
+        assert!(routes_now().await?, "the slice must route before any update");
+        for statement in statements {
+            let sql = match statement {
+                Stmt::Hashes => format!("UPDATE otel_logs_and_spans SET hashes = make_array('h') WHERE project_id = '{project_id}' AND id = 'seed'"),
+                Stmt::User => format!("UPDATE otel_logs_and_spans SET attributes___user___id = 'u' WHERE project_id = '{project_id}' AND id = 'seed'"),
+                Stmt::UserElsewhere => {
+                    format!("UPDATE otel_logs_and_spans SET attributes___user___id = 'u' WHERE project_id = '{project_id}' AND id = 'elsewhere'")
+                }
+                Stmt::Ingest => {
+                    // Through the buffer: the original is unflushed when the UPDATE lands, so
+                    // its version is new data. This cannot isolate the `dropped == 0` rule: the
+                    // ingest already invalidated the slice, and a rebuild defers while the hour
+                    // is buffered. The rule is defense in depth; this pins the outcome.
+                    let batch = json_to_batch(vec![test_span_ts("buffered", "op", &project_id, noon + 1)])?;
+                    db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch], false, None).await?;
+                    format!("UPDATE otel_logs_and_spans SET hashes = make_array('h') WHERE project_id = '{project_id}' AND id = 'buffered'")
+                }
+            };
+            ctx.sql(&sql).await?.collect().await?;
+        }
+        if !carry {
+            let kept = db.rollup_slice_coverage.iter().any(|entry| entry.key().0 == project_id && entry.key().3 <= noon && noon < entry.key().4);
+            assert!(!kept, "with the carry off, a version append must still invalidate at write time");
+        }
+        layer.flush_all_now().await?;
+        assert_eq!(routes_now().await?, routes, "statements {statements:?} with carry={carry}");
+        Ok(())
+    }
+
+    #[derive(Debug)]
+    enum Stmt {
+        Hashes,
+        User,
+        UserElsewhere,
+        Ingest,
     }
 
     /// A landed dedup must CARRY the rollup witness, not invalidate it.

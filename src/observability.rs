@@ -1068,6 +1068,12 @@ atomic_stats! {
         /// each one a row the flush no longer writes and packing no longer
         /// re-collapses.
         mor_versions_retracted as "mor_versions_retracted_total",
+        /// Version rows that assigned only columns no rollup reads and superseded a
+        /// flushed row, so their flush could keep rollup slices readable. Counted with
+        /// the carry off too: the shadow measure for enabling it.
+        rollup_carry_eligible_rows as "rollup_carry_eligible_rows_total",
+        /// Of those, rows actually carried into slice witnesses at a flush commit.
+        rollup_carry_applied_rows as "rollup_carry_applied_rows_total",
     }
 }
 

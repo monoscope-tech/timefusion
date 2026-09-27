@@ -561,13 +561,17 @@ impl Database {
     pub async fn insert_records_batch(
         &self, project_id: &str, table_name: &str, batches: Vec<RecordBatch>, skip_queue: bool, watermark: Option<&crate::write::DeltaWatermark>,
     ) -> Result<Vec<String>> {
-        self.insert_records_batch_bounded(project_id, table_name, batches, skip_queue, watermark, true).await
+        self.insert_records_batch_bounded(project_id, table_name, batches, skip_queue, watermark, true, false).await
     }
 
     /// `bound: false` is for DML re-appends only — see
-    /// [`crate::write::BufferedWriteLayer::insert_bounded`].
+    /// [`crate::write::BufferedWriteLayer::insert_bounded`]. `carried` marks an
+    /// already-stamped version append whose rows the flush carries into rollup
+    /// witnesses, so it neither invalidates rollups nor re-stamps.
+    #[allow(clippy::too_many_arguments)]
     pub async fn insert_records_batch_bounded(
         &self, project_id: &str, table_name: &str, batches: Vec<RecordBatch>, skip_queue: bool, watermark: Option<&crate::write::DeltaWatermark>, bound: bool,
+        carried: bool,
     ) -> Result<Vec<String>> {
         let span = tracing::Span::current();
         // Delta-rs' Arrow→Delta schema conversion only accepts the IANA `"UTC"`
@@ -591,7 +595,7 @@ impl Database {
 
         let table_name = if table_name.is_empty() { "otel_logs_and_spans" } else { table_name }.to_string();
 
-        if watermark.is_none() {
+        if watermark.is_none() && !carried {
             self.invalidate_rollup_batches(&project_id, &table_name, &batches)?;
         }
 
@@ -600,7 +604,7 @@ impl Database {
         // durable record carries the value. A `watermark` marks the one non-inbound
         // caller — a flush of already-stamped buffered rows — which must keep the
         // original value, or a crash-retried flush would disagree with the WAL.
-        let batches = if watermark.is_none() { crate::write::stamp_version(&table_name, batches) } else { batches };
+        let batches = if watermark.is_none() && !carried { crate::write::stamp_version(&table_name, batches) } else { batches };
 
         // Buffered layer (WAL → MemBuffer): nothing is written synchronously, so an
         // empty URI list is correct.
@@ -626,6 +630,11 @@ impl Database {
         // OVER — before `prepare_staged_write` coerces or sorts — because that is
         // what the flush side hashes when it checks.
         let landed = watermark.is_some().then(|| self.landed_digest_for(&table_name, &batches)).flatten();
+        let carry = if watermark.is_some() && self.config.maintenance.timefusion_rollup_witness_carry {
+            self.witness_carry.eligible_rows_by_date(&project_id, &table_name, &batches)
+        } else {
+            HashMap::new()
+        };
 
         let PreparedWrite { table_ref, schema, dirty_bins, batches, writer_properties, stage_store, staged_writer, sorted } =
             self.prepare_staged_write(&project_id, &table_name, batches).await?;
@@ -668,6 +677,7 @@ impl Database {
                 // committed would be a permanent lie.
                 Ok(committed) => {
                     self.mark_written_sorted(schema, sorted, &adds);
+                    self.carry_committed_versions(&project_id, &table_name, carry, &adds);
                     Ok(committed)
                 }
                 Err(e) => {

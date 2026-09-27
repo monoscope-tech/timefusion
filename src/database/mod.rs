@@ -2502,6 +2502,7 @@ pub struct Database {
     /// that is every call until recovery catches up, and the planning drag keeps
     /// queries in flight longer, which is pool pressure by another name.
     rollup_file_rows_cache: dashmap::DashMap<String, (u64, std::sync::Arc<crate::database::maintain::PartitionFileRows>)>,
+    pub(crate) witness_carry: Arc<crate::database::maintain::WitnessCarry>,
     /// Untagged live files per tier TABLE (tiers publish independently, so one shared slot would
     /// read clean while another tier still held damage). The exported gauge is the SUM over tiers.
     rollup_tier_untagged: Arc<dashmap::DashMap<String, u64>>,
@@ -3184,6 +3185,7 @@ impl Database {
             rollup_coverage: Arc::new(dashmap::DashMap::new()),
             rollup_slice_coverage: Arc::new(dashmap::DashMap::new()),
             rollup_file_rows_cache: dashmap::DashMap::new(),
+            witness_carry: Arc::default(),
             rollup_tier_untagged: Arc::new(dashmap::DashMap::new()),
             coverage_ledger: Arc::new(crate::storage::JsonCoverageLedger::load(&cfg.core.timefusion_data_dir)),
             rollup_dirty,
