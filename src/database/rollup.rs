@@ -313,19 +313,18 @@ impl Database {
                     if file_content.is_none() {
                         file_content = self.witness_content(&*source_table.read().await, [date.clone()]).unwrap_or_default();
                     }
-                    if self.config.maintenance.timefusion_rollup_bounded_witness && coverage.source_rows_below.is_some()
-                        && file_rows.is_none() {
-                            let table = source_table.read().await;
-                            let version = table.version().unwrap_or(u64::MAX);
-                            file_rows = Some(match self.rollup_file_rows_cache.get(&route.source).filter(|hit| hit.0 == version) {
-                                Some(hit) => std::sync::Arc::clone(&hit.1),
-                                None => {
-                                    let fresh = std::sync::Arc::new(Self::partition_file_rows(&table).unwrap_or_default());
-                                    self.rollup_file_rows_cache.insert(route.source.clone(), (version, std::sync::Arc::clone(&fresh)));
-                                    fresh
-                                }
-                            });
-                        }
+                    if self.config.maintenance.timefusion_rollup_bounded_witness && coverage.source_rows_below.is_some() && file_rows.is_none() {
+                        let table = source_table.read().await;
+                        let version = table.version().unwrap_or(u64::MAX);
+                        file_rows = Some(match self.rollup_file_rows_cache.get(&route.source).filter(|hit| hit.0 == version) {
+                            Some(hit) => std::sync::Arc::clone(&hit.1),
+                            None => {
+                                let fresh = std::sync::Arc::new(Self::partition_file_rows(&table).unwrap_or_default());
+                                self.rollup_file_rows_cache.insert(route.source.clone(), (version, std::sync::Arc::clone(&fresh)));
+                                fresh
+                            }
+                        });
+                    }
                     use crate::database::maintain::{SliceProof, SourceFiles};
                     let slice = crate::maintenance_coordinator::TimeSlice { start_micros: key.3, end_micros: key.4 };
                     let files = SourceFiles { rows: file_rows.as_deref(), content: file_content.as_ref() };
