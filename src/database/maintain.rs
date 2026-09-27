@@ -2451,6 +2451,25 @@ impl Database {
             Ok(table) => table,
             Err(error) => return retry(format!("resolve_source: {error:#}"), std::time::Duration::from_secs(30)),
         };
+        // Certification is a property of the whole PARTITION, keyed on
+        // (project, table, date). Unit shape must NOT gate the grant: each clean pass
+        // records its slice, and `record_clean_slice` certifies once the union covers
+        // the UTC day over one unmoved file fingerprint.
+        let (pre_files, pre_dv, pre_visibility) = {
+            let table = table.read().await;
+            (
+                Self::partition_files_by_pid(&table, &format!("date={date}"))?.remove(&key.project_id).unwrap_or_default(),
+                Self::partition_dv_state(&table, &key.project_id, &format!("date={date}"))?,
+                Self::logical_count_partition_snapshot(&table, &key.project_id, &date.to_string())?.1,
+            )
+        };
+        if self.partition_certified_clean(&(key.project_id.clone(), key.physical_table.clone(), date.to_string()), &pre_files, &pre_visibility) {
+            let mut journal = self.journal();
+            journal.complete(&key);
+            journal.checkpoint()?;
+            crate::observability::record_dedup_unit_skipped_certified();
+            return Ok(true);
+        }
         // Journal invalidations start with no byte estimate, so estimate the narrow
         // dedup projection from files whose statistics overlap this exact slice.
         let (estimated_bytes, whole_file_bytes, selected_paths, dedup_rows) = {
@@ -2518,18 +2537,6 @@ impl Database {
             probe_hash_shards,
             sort_partitions: dedup_sort_partitions(task.attempts),
             batch_rows: batch_rows_for(estimated_bytes, dedup_rows, self.config.maintenance.timefusion_maintenance_batch_target_bytes),
-        };
-        // Certification is a property of the whole PARTITION, keyed on
-        // (project, table, date). Unit shape must NOT gate the grant: each clean pass
-        // records its slice, and `record_clean_slice` certifies once the union covers
-        // the UTC day over one unmoved file fingerprint.
-        let (pre_files, pre_dv, pre_visibility) = {
-            let table = table.read().await;
-            (
-                Self::partition_files_by_pid(&table, &format!("date={date}"))?.remove(&key.project_id).unwrap_or_default(),
-                Self::partition_dv_state(&table, &key.project_id, &format!("date={date}"))?,
-                Self::logical_count_partition_snapshot(&table, &key.project_id, &date.to_string())?.1,
-            )
         };
         match self.dedup_partition_range_limited(&table, &key.source, &key.project_id, date, Some(key.slice), Some(limits)).await {
             Ok((dropped, true, masked)) => {
@@ -6025,6 +6032,13 @@ impl Database {
         self.persist_certifications();
     }
 
+    /// The partition's live files AND per-file deletion vectors equal a live whole-day
+    /// certification, so it cannot have gained duplicates since that zero-drop pass.
+    /// Shared by the sweep and the coordinator Dedup unit so the two skips cannot drift.
+    fn partition_certified_clean(&self, key: &(String, String, String), files: &[String], visibility: &crate::read::CountFiles) -> bool {
+        !files.is_empty() && self.dedup_clean_fp.get(key).is_some_and(|cert| !cert.stale && cert.fp == partition_file_fp(files) && *cert.files == *visibility)
+    }
+
     /// Apply the certification rule to one finished dedup pass and record the verdict.
     ///
     /// Returns the clean fingerprint when a zero-drop pass over the still-live file set proves the
@@ -6563,14 +6577,11 @@ impl Database {
             // NEW files. Keeps the sweep O(partitions-changed), which the whole-table
             // version guard above cannot do under continuous ingest.
             let fp_key = (pid.clone(), table_name.to_string(), date.to_string());
-            let current_fp = partition_file_fp(cur_files);
             let pre_visibility = {
                 let table = table_ref.read().await;
                 Self::logical_count_partition_snapshot(&table, pid, &date.to_string())?.1
             };
-            if !cur_files.is_empty()
-                && self.dedup_clean_fp.get(&fp_key).is_some_and(|entry| !entry.stale && entry.fp == current_fp && *entry.files == pre_visibility)
-            {
+            if self.partition_certified_clean(&fp_key, cur_files, &pre_visibility) {
                 continue;
             }
             let backoff_key = format!("{dedup_key}:{pid}:{date}");
@@ -10035,29 +10046,7 @@ mod certify_on_completion_tests {
         );
         let before: HashSet<_> = table.get_file_uris()?.collect();
         let checked_visibility = Database::logical_count_partition_snapshot(&table, &project_id, &date.to_string())?.1;
-        let masked: Vec<_> = table.snapshot()?.log_data().iter().map(|file| add_action(&file)).filter(|add| add.deletion_vector.is_some()).collect();
-        assert!(!masked.is_empty(), "the real dedup pass must leave a visibility mask");
-        let actions = masked
-            .into_iter()
-            .flat_map(|mut add| {
-                let remove = deltalake::kernel::Action::Remove(remove_for_add(&add, true));
-                add.deletion_vector = None;
-                [remove, deltalake::kernel::Action::Add(add)]
-            })
-            .collect();
-        let committed = deltalake::kernel::transaction::CommitBuilder::default()
-            .with_actions(actions)
-            .build(
-                Some(table.snapshot()? as &dyn deltalake::kernel::transaction::TableReference),
-                table.log_store(),
-                deltalake::protocol::DeltaOperation::Write {
-                    mode: deltalake::protocol::SaveMode::Append,
-                    partition_by: Some(get_schema(TABLE).expect("source schema").partitions.clone()),
-                    predicate: None,
-                },
-            )
-            .await?;
-        table.state = Some(committed.snapshot());
+        strip_deletion_vectors(&mut table).await?;
         assert_eq!(table.get_file_uris()?.collect::<HashSet<_>>(), before, "Parquet paths must stay unchanged");
         assert_eq!(
             db.dedup_window_clean(&table, &project_id, TABLE, (slice.start_micros, slice.start_micros + 2 * 3_600_000_000)),
@@ -10098,6 +10087,79 @@ mod certify_on_completion_tests {
         assert!(pass.certify(atts).await?.is_none(), "a pass whose post-state it cannot account for must not certify");
         assert!(!pass.certified(), "no live certification may survive the decline");
         Ok(())
+    }
+
+    /// Re-adds every masked file without its deletion vector: the Parquet paths stay put while
+    /// the losers the mask hid become visible again.
+    async fn strip_deletion_vectors(table: &mut DeltaTable) -> Result<()> {
+        let masked: Vec<_> = table.snapshot()?.log_data().iter().map(|file| add_action(&file)).filter(|add| add.deletion_vector.is_some()).collect();
+        assert!(!masked.is_empty(), "the real dedup pass must leave a visibility mask");
+        let actions = masked
+            .into_iter()
+            .flat_map(|mut add| {
+                let remove = deltalake::kernel::Action::Remove(remove_for_add(&add, true));
+                add.deletion_vector = None;
+                [remove, deltalake::kernel::Action::Add(add)]
+            })
+            .collect();
+        let committed = deltalake::kernel::transaction::CommitBuilder::default()
+            .with_actions(actions)
+            .build(
+                Some(table.snapshot()? as &dyn deltalake::kernel::transaction::TableReference),
+                table.log_store(),
+                deltalake::protocol::DeltaOperation::Write {
+                    mode: deltalake::protocol::SaveMode::Append,
+                    partition_by: Some(get_schema(TABLE).expect("source schema").partitions.clone()),
+                    predicate: None,
+                },
+            )
+            .await?;
+        table.state = Some(committed.snapshot());
+        Ok(())
+    }
+
+    #[derive(Debug)]
+    enum AfterCert {
+        Nothing,
+        AppendedDup,
+        DvChanged,
+        StaleSlice,
+        StaleFlag,
+    }
+
+    /// A coordinator Dedup unit over a certified partition completes without scanning. Any
+    /// change to the proved files or masks, or a stale certificate, must fall through to the
+    /// scan: a false skip returns duplicate rows to users. Returns (scanned, live rows after).
+    #[test_case::test_case(AfterCert::Nothing => matches Ok((false, 2)) ; "a certified partition completes unscanned")]
+    #[test_case::test_case(AfterCert::AppendedDup => matches Ok((true, 2)) ; "an appended duplicate is scanned and dropped")]
+    #[test_case::test_case(AfterCert::DvChanged => matches Ok((true, 2)) ; "a changed mask on a proved file is scanned and dropped")]
+    #[test_case::test_case(AfterCert::StaleSlice => matches Ok((true, 2)) ; "a slice derived certificate never skips")]
+    #[test_case::test_case(AfterCert::StaleFlag => matches Ok((true, 2)) ; "a demoted certificate with matching evidence never skips")]
+    #[serial]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dedup_unit_skips_only_an_exactly_certified_partition(after: AfterCert) -> Result<(bool, i64)> {
+        use crate::maintenance_coordinator::{Operation, TaskState};
+        let pass = dedup_pass(TestConfigBuilder::new("dedup_unit_certified_skip").build()).await?;
+        assert!(pass.certify(pass.masked.as_deref()).await?.is_some() && pass.certified(), "precondition: the day is certified");
+        let Pass { db, table_ref, project_id, date, .. } = pass;
+        let key = (project_id.clone(), TABLE.to_owned(), date.to_string());
+        match after {
+            AfterCert::Nothing => {}
+            AfterCert::AppendedDup => {
+                let noon = date.and_hms_opt(12, 0, 0).unwrap().and_utc().timestamp_micros();
+                db.insert_records_batch(&project_id, TABLE, vec![json_to_batch(vec![test_span_ts("dup_id", "third", &project_id, noon)])?], true, None).await?;
+            }
+            AfterCert::DvChanged => {
+                let mut table = table_ref.read().await.clone();
+                strip_deletion_vectors(&mut table).await?;
+                *table_ref.write().await = table;
+            }
+            AfterCert::StaleSlice => db.dedup_clean_fp.alter(&key, |_, cert| Certification { fp: 0, stale: true, ..cert }),
+            AfterCert::StaleFlag => db.dedup_clean_fp.alter(&key, |_, cert| Certification { stale: true, ..cert }),
+        }
+        let report = db.run_unit_once(TABLE, &project_id, date, Operation::Dedup, 24, 0).await?;
+        assert_eq!(report.state, Some(TaskState::Complete), "retry: {:?}", report.retry_reason);
+        Ok((!report.passes.is_empty(), delta_physical_row_count(&table_ref).await?))
     }
 
     /// The concurrent-DML race: a DML DELETE writes a DV to the same file BETWEEN dedup's DV

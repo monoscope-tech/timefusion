@@ -159,6 +159,7 @@ counter_registry! {
     rollup_scan_estimated_bytes => "timefusion.rollup.scan_estimated_bytes": "Projected bytes of every rollup scan pass, including failed and repeated shard passes, by tier. Against published_input_bytes this is the wasted-scan share",
     rollup_misses              => "timefusion.rollup.misses": "Dashboard aggregates that fell through to a raw scan, labelled by REASON. Without the reason breakdown there is no feedback loop telling us which dimension to add next — a rollup silently serving 20% of traffic looks identical to one serving 90%",
     cache_insert_bypassed    => "timefusion.cache.insert_bypassed": "Cache populations suppressed because the read ran inside a large-scan bypass scope (scan-resistant admission — a wide historical scan must not evict the hot tail)",
+    dedup_unit_skipped_certified => "timefusion.dedup.unit_skipped_certified": "Coordinator Dedup units completed without scanning because the partition's live files and deletion vectors equal a live whole-day certification",
     dedup_chunk_skipped        => "timefusion.dedup.chunk_skipped": "Dedup chunk rewrites skipped (over the rewrite-byte budget, or partition in failure backoff). Duplicates persist in Delta — read-side dedup keeps queries correct — until a later sweep or manual compaction clears them. WARN if sustained",
     maintenance_checkpoint_failed => "timefusion.maintenance.checkpoint_failed": "Out-of-band checkpoint attempts that errored (e.g. R2 500 on the checkpoint PUT). Retried next tick; ingest is unaffected. WARN if sustained — checkpoints falling behind slows boot replay and blocks log cleanup",
     maintenance_log_cleanup_failed => "timefusion.maintenance.log_cleanup_failed": "Out-of-band expired-log-cleanup attempts that errored. Retried next tick; the _delta_log grows until it succeeds. WARN if sustained (a growing log slows every commit's version LIST)",
@@ -1059,6 +1060,7 @@ recorders! {
     record_dml_coalesce_dropped => dml_coalesce_dropped,
     /// One dedup chunk rewrite skipped (over budget or in failure backoff).
     record_dedup_chunk_skipped => dedup_chunk_skipped,
+    record_dedup_unit_skipped_certified => dedup_unit_skipped_certified,
     /// One cron maintenance run that exceeded the long-running warning threshold.
     record_cron_long_running => maintenance_cron_long_running mirror MAINTENANCE_STATS.cron_long_running,
     /// One out-of-band checkpoint failure (also mirrors to OTel for alerting).
