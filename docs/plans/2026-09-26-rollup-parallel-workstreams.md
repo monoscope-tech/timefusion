@@ -60,6 +60,7 @@ Status: ⬜ open · 🟡 in progress · ✅ done. Priority is the plan's executi
 | W18 | W10 design: capacity replay | analysis | Shared gates | How to drive `timefusion sim` at 1x/2x/4x rows and projects; what it can/can't prove; code plan | design doc | — | agent (Claude) | ✅ design |
 | W19 | Export per-lane work as OTel counters | build (lane 2) | W16 gap | Lease ms by operation/outcome, processed bytes by operation, rollup publications / published input bytes / scan bytes by tier; no stats-key changes | `src/observability.rs`, `maintenance_coordinator.rs` lease drop, `maintain.rs` byte sites | W16 | Claude (timefusion-2e) | ✅ handed off `ws/w19-lane-counters` |
 | W20 | Heavy-query admission starves the largest project | analysis → build (lane 2) | Read path | Why every 87576849 dashboard query timed out waiting for a heavy slot; fix + holder attribution | `src/read/admission.rs` | — | Claude (timefusion-2e) | ✅ handed off `ws/admission-narrow-merge` |
+| W21 | Carry the rollup witness across rollup-irrelevant version appends | build (lane 2) | Stage 0/2 | hashes-only MoR UPDATEs keep today's slices readable; dark flag + shadow counter; failing-first + guard tests | `dml.rs` append, `database/write.rs` flush commit, `maintain.rs` WitnessCarry | W17 | Claude (timefusion-2e) | ✅ handed off `ws/w21-witness-carry` (dark; enablement blocked, see result) |
 
 Later stages (2, 4, 5, 6, 1C, certified-clean activation, adaptive batches) stay **conditional** on W2/W7
 numbers, per the plan; do not start them without a measured residual cost.
@@ -252,4 +253,30 @@ Lint is clean and 30/30 admission tests pass, including e2e.
 
 **Next:** those two shapes are the staging `run-unit --explain` units. Real-S3 per-unit cost is blocked until an
 owner creates a staging prefix.
+
+### W21 result — 2026-09-27 — Claude (timefusion-2e)
+**Finding:** carrying at the flush alone yields nothing. A hashes-only version append already deletes the
+overlapping slice coverage at write time (`insert_records_batch_bounded` → `invalidate_rollup_batches` →
+`apply_rollup_hours`). So the change also skips that invalidation for appends that no spec reads.
+
+`appended − retracted` arithmetic is a false-hit hole: a relevant v2 retracting an irrelevant buffered v1
+leaves a +1 carry. The design therefore uses per-batch stamps instead.
+**Design** (`ws/w21-witness-carry` @ `48bd61b6`, dark behind `timefusion_rollup_witness_carry`):
+- Relevance is the union of every spec's source columns, paused specs included.
+- An irrelevant, non-tombstone batch that retracted nothing is admitted to an in-memory ledger by version stamp.
+- A relevant or tombstone append refuses the carry for every earlier read of that table (guard a).
+- At the staged flush commit, the rows written with ledger stamps are added to that date's slice witnesses.
+  The bounded witness moves only when every written file lies below its bound.
+- Shadow counters: `rollup_carry_eligible_rows_total` and `rollup_carry_applied_rows_total`.
+
+**Tests:** a 6-case table, red before the implementation. The guard, relevance and flag mutations each go red.
+Two cases are structural; the test says so.
+**Blocks enablement:**
+1. Coverage records no source version, so a slice built after a carried commit is carried twice.
+   `carry_dedup_witness` has the same gap.
+2. The ledger is in-memory only, so a restart forfeits pending carries.
+3. Reconcile still re-mints the slice from the untagged Add.
+
+**Next:** deploy it dark and read `rollup_carry_eligible_rows_total` against `mor_version_rows_appended_total`.
+Enabling needs gap 1 closed and an owner decision.
 
