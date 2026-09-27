@@ -537,7 +537,11 @@ fn drop_overlapping_ranges<V>(ranges: &mut std::collections::BTreeMap<(i64, i64)
 /// True when the `Add`'s timestamp statistics PROVE it disjoint from `slice`.
 /// Missing bounds prove nothing, so the file stays a candidate.
 fn stats_disjoint_from(add: &deltalake::kernel::Add, slice: crate::maintenance_coordinator::TimeSlice) -> bool {
-    matches!(add_ts_bounds(add), (Some(min), Some(max)) if min >= slice.end_micros || max < slice.start_micros)
+    bounds_disjoint(add_ts_bounds(add), slice)
+}
+
+fn bounds_disjoint(bounds: (Option<i64>, Option<i64>), slice: crate::maintenance_coordinator::TimeSlice) -> bool {
+    matches!(bounds, (Some(min), Some(max)) if min >= slice.end_micros || max < slice.start_micros)
 }
 
 /// One live file's contribution to a rollup unit's CONTENT fingerprint.
@@ -955,6 +959,54 @@ fn added_spans_miss_window(added: impl IntoIterator<Item = crate::read::FileSpan
 /// inputs `rollup::rows_below` re-proves a bounded witness against.
 pub(crate) type PartitionFileRows = HashMap<(String, String), Vec<(Option<i64>, i64)>>;
 
+/// A live file's timestamp span and [`file_content_hash`], keyed like [`PartitionFileRows`].
+pub(crate) type PartitionFileContent = HashMap<(String, String), Vec<((Option<i64>, Option<i64>), u64)>>;
+
+/// What a stale-looking slice is re-proved from; each half is `None` while its
+/// witness is off or was not loaded.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct SourceFiles<'a> {
+    pub rows: Option<&'a PartitionFileRows>,
+    pub content: Option<&'a PartitionFileContent>,
+}
+
+fn partition_of<'a, T>(map: &'a HashMap<(String, String), Vec<T>>, project: &str, date: &str) -> Option<&'a [T]> {
+    map.get(&(project.to_owned(), date.to_owned())).or_else(|| map.get(&("default".to_owned(), date.to_owned()))).map(Vec::as_slice)
+}
+
+/// Which witness still proves a slice current.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SliceProof {
+    Partition,
+    Bounded,
+    Content,
+}
+
+impl RollupCoverage {
+    /// THE slice freshness rule the census, the read path and recovery share: the
+    /// whole partition's rows, else the rows below `covered_through`, else the
+    /// exact input file set. The last is local to `slice`, so a late file in
+    /// another cell, which moves both row witnesses, cannot stale this one.
+    pub(crate) fn slice_proof(
+        &self, slice: crate::maintenance_coordinator::TimeSlice, current: Option<u64>, files: SourceFiles<'_>, project: &str, date: &str,
+    ) -> Option<SliceProof> {
+        if self.matches_slice(current, None) {
+            return Some(SliceProof::Partition);
+        }
+        if files
+            .rows
+            .and_then(|rows| partition_of(rows, project, date))
+            .is_some_and(|rows| self.matches_slice(current, crate::rollup::rows_below(rows, self.covered_through)))
+        {
+            return Some(SliceProof::Bounded);
+        }
+        // The build's selection: every file not PROVEN disjoint. No files is the empty XOR.
+        let content = partition_of(files.content?, project, date).unwrap_or_default();
+        let current_fp = content.iter().filter(|(bounds, _)| !bounds_disjoint(*bounds, slice)).fold(0, |fp, (_, hash)| fp ^ hash);
+        (self.content_fp? == current_fp).then_some(SliceProof::Content)
+    }
+}
+
 /// (project, slice_start, slice_end, generation, source_fp, source_rows) — the
 /// coverage identity `recover_rollup_coverage` reads back off a tier file's tags.
 type TaggedSliceIdentity = (String, i64, i64, String, u64, Option<u64>);
@@ -1036,7 +1088,7 @@ impl Database {
 
     /// Source freshness alone does not prove that the output still exists.
     pub(super) fn source_fresh_rollup_ranges(
-        &self, source: &str, target: &str, partitions: &HashMap<(String, String), PartitionStats>, file_rows: Option<&PartitionFileRows>,
+        &self, source: &str, target: &str, partitions: &HashMap<(String, String), PartitionStats>, files: SourceFiles<'_>,
     ) -> HashMap<BackfillCell, Vec<(i64, i64)>> {
         let Some(grain) =
             get_schema(source).and_then(|schema| schema.rollups.iter().find(|spec| spec.table_name(source) == target)).and_then(|spec| spec.grain_micros())
@@ -1071,10 +1123,8 @@ impl Database {
                 return None;
             }
             let current = partition(project, &date).and_then(|stats| u64::try_from(stats.rows).ok());
-            let fresh = coverage.matches_slice(current, None)
-                || file_rows
-                    .and_then(|files| files.get(&(project.clone(), date.clone())).or_else(|| files.get(&("default".to_string(), date.clone()))))
-                    .is_some_and(|files| coverage.matches_slice(current, crate::rollup::rows_below(files, coverage.covered_through)));
+            let slice = crate::maintenance_coordinator::TimeSlice { start_micros: *start, end_micros: *end };
+            let fresh = coverage.slice_proof(slice, current, files, project, &date).is_some();
             let end = (*end).min(coverage.covered_through).min(day_start_micros(day)?.saturating_add(DAY_MICROS));
             (fresh && *start < end).then(|| ((project.clone(), day), (*start, end)))
         });
@@ -1214,7 +1264,7 @@ impl Database {
     }
 
     fn readable_rollup_ranges(
-        &self, source: &str, target: (&str, &DeltaTable, &str), partitions: &HashMap<(String, String), PartitionStats>, file_rows: Option<&PartitionFileRows>,
+        &self, source: &str, target: (&str, &DeltaTable, &str), partitions: &HashMap<(String, String), PartitionStats>, files: SourceFiles<'_>,
     ) -> Result<HashMap<BackfillCell, Vec<(i64, i64)>>> {
         let Some(grain) =
             get_schema(source).and_then(|schema| schema.rollups.iter().find(|spec| spec.table_name(source) == target.0)).and_then(|spec| spec.grain_micros())
@@ -1229,7 +1279,7 @@ impl Database {
             .flat_map(|((project, date, _), ranges)| ranges.into_iter().map(move |range| ((project.clone(), date), range)))
             .into_group_map();
         Ok(self
-            .source_fresh_rollup_ranges(source, target.0, partitions, file_rows)
+            .source_fresh_rollup_ranges(source, target.0, partitions, files)
             .into_iter()
             .filter_map(|(cell, ranges)| {
                 let output = crate::write::mem_buffer::merge_ranges(output.get(&cell)?.clone());
@@ -1827,12 +1877,15 @@ impl Database {
             // stats mean UNKNOWN and count as covered.
             let default_project = if storage_project.is_empty() { "default" } else { storage_project.as_str() };
 
-            let (source_partitions, source_stats, source_file_rows) = {
+            let (source_partitions, source_stats, source_file_rows, source_file_content) = {
                 let table = table_ref.read().await;
+                // Content only for the days late files still reach: sealed history keeps the row witnesses.
+                let recent = (0..=2).map(|back| (today - chrono::Duration::days(back)).to_string());
                 (
                     Self::maintenance_table_partitions(&table, default_project)?,
                     Self::partition_stats_bounded(&table, tiebreak_of(&source), &|_, _| i64::MAX)?,
                     self.config.maintenance.timefusion_rollup_bounded_witness.then(|| Self::partition_file_rows(&table)).transpose()?,
+                    self.witness_content(&table, recent)?,
                 )
             };
             // Taken from the source, not the tier: asking the tier would let a
@@ -1863,7 +1916,12 @@ impl Database {
                     (
                         Self::maintenance_table_partitions(&table, default_project)?,
                         table.snapshot().ok().and_then(|state| state.snapshot().metadata().created_time()),
-                        self.readable_rollup_ranges(&source, (&target, &table, default_project), &source_stats, source_file_rows.as_ref())?,
+                        self.readable_rollup_ranges(
+                            &source,
+                            (&target, &table, default_project),
+                            &source_stats,
+                            SourceFiles { rows: source_file_rows.as_ref(), content: source_file_content.as_ref() },
+                        )?,
                     )
                 };
                 // A tier younger than the horizon cannot hold that many days, so
@@ -4587,6 +4645,28 @@ impl Database {
     /// Extracted lazily by the rollup route, and only when a slice has already
     /// failed the whole-partition compare while carrying a bounded witness, so
     /// the happy path never pays for the second add-actions pass.
+    /// [`PartitionFileContent`] for the partitions dated in `dates`, keyed by path
+    /// segments as `dedup_partition_paths` selects a build's files. Statistics are
+    /// parsed only for those dates, so a caller pays for the days it proves.
+    pub(crate) fn partition_file_content(table: &DeltaTable, dates: &HashSet<String>) -> Result<PartitionFileContent> {
+        Ok(table.snapshot()?.log_data().iter().fold(PartitionFileContent::new(), |mut acc, file| {
+            let path = file.path().to_string();
+            let segment = |key: &str| path.split('/').find_map(|segment| segment.strip_prefix(key)).map(str::to_owned);
+            if let Some(date) = segment("date=").filter(|date| dates.contains(date)) {
+                let add = add_action(&file);
+                acc.entry((segment("project_id=").unwrap_or_else(|| "default".to_owned()), date))
+                    .or_default()
+                    .push((add_ts_bounds(&add), file_content_hash(&path, add.deletion_vector.as_ref())));
+            }
+            acc
+        }))
+    }
+
+    /// [`Self::partition_file_content`] when the content witness is on.
+    pub(super) fn witness_content(&self, table: &DeltaTable, dates: impl IntoIterator<Item = String>) -> Result<Option<PartitionFileContent>> {
+        self.config.maintenance.timefusion_rollup_content_witness.then(|| Self::partition_file_content(table, &dates.into_iter().collect())).transpose()
+    }
+
     pub(crate) fn partition_file_rows(table: &DeltaTable) -> Result<PartitionFileRows> {
         let snapshot = table.snapshot()?.snapshot();
         let actions = snapshot.add_actions_table(true)?;
@@ -5075,12 +5155,18 @@ impl Database {
             .into_group_map();
         let partition =
             |project: &str, date: &str| stats.get(&(project.to_owned(), date.to_owned())).or_else(|| stats.get(&("default".to_owned(), date.to_owned())));
-        let needs_bounded = self.config.maintenance.timefusion_rollup_bounded_witness
-            && by_date.iter().any(|((project, date), slices)| {
+        let moved_dates: HashSet<String> = by_date
+            .iter()
+            .filter(|((project, date), slices)| {
                 let current = partition(project, date).and_then(|stats| u64::try_from(stats.rows).ok());
-                slices.iter().any(|(_, coverage)| coverage.source_rows_below.is_some() && !coverage.matches_slice(current, None))
-            });
-        let file_rows = needs_bounded.then(|| Self::partition_file_rows(&table)).transpose()?;
+                slices.iter().any(|(_, coverage)| !coverage.matches_slice(current, None))
+            })
+            .map(|((_, date), _)| date.clone())
+            .collect();
+        let needs_files = !moved_dates.is_empty();
+        let file_rows = (needs_files && self.config.maintenance.timefusion_rollup_bounded_witness).then(|| Self::partition_file_rows(&table)).transpose()?;
+        let file_content = if needs_files { self.witness_content(&table, moved_dates)? } else { None };
+        let files = SourceFiles { rows: file_rows.as_ref(), content: file_content.as_ref() };
         let mut recovered = 0u64;
         let mut moved: Vec<(String, crate::maintenance_coordinator::TimeSlice)> = Vec::new();
         for ((project, date), slices) in by_date {
@@ -5088,16 +5174,13 @@ impl Database {
                 continue;
             };
             let Ok(current_rows) = u64::try_from(partition.rows) else { continue };
-            let agrees = |coverage: &RollupCoverage| {
-                coverage.matches_slice(Some(current_rows), None)
-                    || file_rows
-                        .as_ref()
-                        .and_then(|files| files.get(&(project.clone(), date.clone())).or_else(|| files.get(&("default".to_owned(), date.clone()))))
-                        .is_some_and(|files| coverage.matches_slice(Some(current_rows), crate::rollup::rows_below(files, coverage.covered_through)))
+            let agrees = |start: i64, coverage: &RollupCoverage| {
+                let slice = crate::maintenance_coordinator::TimeSlice { start_micros: start, end_micros: coverage.covered_through };
+                coverage.slice_proof(slice, Some(current_rows), files, &project, &date).is_some()
             };
             // Every slice must be verifiable AND agree: one unverifiable slice means the
             // date cannot be proven current, and an unproven date must not be stamped.
-            if !slices.iter().all(|(_, coverage)| agrees(coverage)) {
+            if !slices.iter().all(|(start, coverage)| agrees(*start, coverage)) {
                 // STALE UNTIL REBUILT, not stale forever: the read path refuses an
                 // overtaken slice, so queue the disagreeing ones rather than leaving them
                 // with no path back to `proven`. `enqueue_unverifiable_rebuilds` is
@@ -5110,7 +5193,7 @@ impl Database {
                 // predicate is the dedup certification, so a partition still taking late
                 // arrivals for yesterday reads as sealed here and can be requeued twice.
                 if date < chrono::Utc::now().date_naive().to_string() {
-                    moved.extend(slices.iter().filter(|(_, coverage)| !agrees(coverage)).map(|(start, coverage)| {
+                    moved.extend(slices.iter().filter(|(start, coverage)| !agrees(*start, coverage)).map(|(start, coverage)| {
                         (project.clone(), crate::maintenance_coordinator::TimeSlice { start_micros: *start, end_micros: coverage.covered_through })
                     }));
                 }
@@ -10608,7 +10691,7 @@ mod rollup_noop_skip_tests {
         let source_table = db.resolve_table(&project, "otel_logs_and_spans").await?;
         let source_stats = Database::partition_stats_bounded(&*source_table.read().await, tiebreak_of("otel_logs_and_spans"), &|_, _| i64::MAX)?;
         let target_table = db.resolve_table(&project, TIER).await?;
-        let covered = db.readable_rollup_ranges("otel_logs_and_spans", (TIER, &*target_table.read().await, &project), &source_stats, None)?;
+        let covered = db.readable_rollup_ranges("otel_logs_and_spans", (TIER, &*target_table.read().await, &project), &source_stats, Default::default())?;
         assert!(
             covered.get(&(project.clone(), date)).is_some_and(|ranges| crate::rollup::ranges_cover(ranges, (key.3, key.4 - 1))),
             "the census must preserve explicit empty coverage without requiring output files"

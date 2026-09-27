@@ -2138,6 +2138,12 @@ pub struct MaintenanceConfig {
     /// AGGREGATES, so it reverts in one env var.
     #[serde_inline_default(true)]
     pub timefusion_rollup_bounded_witness: bool,
+    /// Re-prove a stale-looking rollup slice by recomputing its `content_fp` (the
+    /// exact input file set, deletion vectors included) over the live files. The
+    /// rescue that stops a late file in ANOTHER cell from staling this one; a
+    /// defect serves stale AGGREGATES, so it reverts in one env var.
+    #[serde_inline_default(true)]
+    pub timefusion_rollup_content_witness: bool,
 
     /// Let a whole-day certification survive a fingerprint move for windows the
     /// newly-added files cannot have touched. Read-side dedup skip: a defect is

@@ -297,6 +297,8 @@ impl Database {
                 // only that slice's files, so it can never equal the whole-partition value.
                 let mut fresh = Vec::with_capacity(slices.len());
                 let mut stale = Vec::new();
+                // Loaded for this date only once a slice fails the whole-partition compare.
+                let mut file_content: Option<crate::database::maintain::PartitionFileContent> = None;
                 for (key, coverage) in slices {
                     if coverage.matches_slice(current, None) {
                         fresh.push((key, coverage));
@@ -304,11 +306,13 @@ impl Database {
                     }
                     // The whole-partition witness disagreed — which any ingest anywhere
                     // in the day causes, and 96.8% of measured staleness is exactly that.
-                    // Re-prove against the BOUNDED witness before refusing: rows in
-                    // files wholly below `covered_through`, which a tail append cannot
-                    // move. The per-file pass is loaded at most once per route call and
-                    // only on this path, so a day with no stale-looking slice never
-                    // pays for it.
+                    // Re-prove against the BOUNDED witness, rows in files wholly below
+                    // `covered_through`, then the slice's exact input file set. The
+                    // per-file passes are loaded at most once per route call and only
+                    // on this path, so a day with no stale-looking slice never pays.
+                    if file_content.is_none() {
+                        file_content = self.witness_content(&*source_table.read().await, [date.clone()]).unwrap_or_default();
+                    }
                     if self.config.maintenance.timefusion_rollup_bounded_witness && coverage.source_rows_below.is_some() {
                         if file_rows.is_none() {
                             let table = source_table.read().await;
@@ -322,17 +326,26 @@ impl Database {
                                 }
                             });
                         }
-                        let files = file_rows
-                            .as_ref()
-                            .and_then(|map| map.get(&(project.clone(), date.clone())).or_else(|| map.get(&("default".to_string(), date.clone()))));
-                        if files.is_some_and(|files| coverage.matches_slice(current, crate::rollup::rows_below(files, coverage.covered_through))) {
+                    }
+                    use crate::database::maintain::{SliceProof, SourceFiles};
+                    let slice = crate::maintenance_coordinator::TimeSlice { start_micros: key.3, end_micros: key.4 };
+                    let files = SourceFiles { rows: file_rows.as_deref(), content: file_content.as_ref() };
+                    match coverage.slice_proof(slice, current, files, project, &date) {
+                        Some(SliceProof::Content) => {
+                            metrics::counter!(scan_metric_names::ROLLUP_WITNESS_CONTENT_RESCUED).increment(1);
+                            fresh.push((key, coverage));
+                        }
+                        Some(SliceProof::Bounded | SliceProof::Partition) => {
                             metrics::counter!(scan_metric_names::ROLLUP_WITNESS_BOUNDED_RESCUED).increment(1);
                             fresh.push((key, coverage));
-                            continue;
                         }
-                        metrics::counter!(scan_metric_names::ROLLUP_WITNESS_BOUNDED_STALE_TOO).increment(1);
+                        None => {
+                            if files.rows.is_some() && coverage.source_rows_below.is_some() {
+                                metrics::counter!(scan_metric_names::ROLLUP_WITNESS_BOUNDED_STALE_TOO).increment(1);
+                            }
+                            stale.push((key, coverage));
+                        }
                     }
-                    stale.push((key, coverage));
                 }
                 if !stale.is_empty() {
                     miss = miss.or(Some(crate::rollup::MissReason::StaleCoverage));

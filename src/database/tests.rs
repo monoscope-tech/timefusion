@@ -3940,7 +3940,7 @@ async fn a_date_with_only_slice_coverage_still_counts_as_missing() -> Result<()>
         crate::rollup::uncovered(
             day_start,
             day_start + 86_400_000_000,
-            db.source_fresh_rollup_ranges(&source, &target, &partitions, None).remove(&cell).unwrap_or_default(),
+            db.source_fresh_rollup_ranges(&source, &target, &partitions, Default::default()).remove(&cell).unwrap_or_default(),
         )
     };
     assert_eq!(gaps(), [(day_start, day_start + 86_400_000_000)], "no evidence means a full-day hole");
@@ -9141,4 +9141,59 @@ async fn mem_leg_with_fewer_buckets_than_partitions_is_merged_not_resorted(dir: 
         Ok(())
     })
     .await
+}
+
+/// A late file lands wholly below a LATER slice's `covered_through` but outside
+/// its range. The bounded witness counts every file below the bound from the
+/// start of the day, so it moves for the untouched slice too; prod: one late
+/// row staled every later 10-minute cell of today (`stale_grew+30` on a 6h window).
+/// The slice's input file set is unchanged, so its `content_fp` re-proves it.
+#[test_case(3, true; "a late row outside the slice keeps it routing")]
+#[test_case(15, false; "a late row inside the slice stops it routing")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_late_file_outside_a_slice_leaves_it_readable(late_hour: u32, routes: bool) -> Result<()> {
+    use crate::maintenance_coordinator::Operation;
+    use arrow::array::AsArray;
+    let db = std::sync::Arc::new(Database::with_config(rollup_backfill_config("late-file", 35)).await?);
+    db.cancel_maintenance();
+    let project = format!("late_{}", uuid::Uuid::new_v4().simple());
+    let day = (Utc::now() - chrono::Duration::days(3)).date_naive();
+    let at = |hour: u32, minute: u32| day.and_hms_opt(hour, minute, 0).expect("hour").and_utc().timestamp_micros();
+    let insert = async |hour: u32, minute: u32| {
+        let row = serde_json::json!({
+            "timestamp": at(hour, minute), "id": format!("h{hour}m{minute}"), "name": "op", "project_id": project, "hashes": [],
+            "summary": ["late fixture"], "date": day.to_string(), "duration": 100, "kind": "server", "status_code": "OK",
+        });
+        db.insert_records_batch(&project, "otel_logs_and_spans", vec![json_to_batch(vec![row])?], true, None).await
+    };
+    for hour in [1, 7, 13, 19] {
+        insert(hour, 0).await?;
+    }
+    for offset in [0, 12] {
+        db.run_unit_once("otel_logs_and_spans", &project, day, Operation::BaseRollup, 12, offset).await?;
+    }
+    let sql = format!(
+        "SELECT time_bucket('1 hours', timestamp) AS tb, COUNT(*) AS c FROM otel_logs_and_spans WHERE project_id = '{project}' \
+             AND timestamp >= to_timestamp_micros({}) AND timestamp < to_timestamp_micros({}) GROUP BY 1",
+        at(12, 0),
+        at(23, 0)
+    );
+    let mut ctx = std::sync::Arc::clone(&db).create_session_context();
+    db.setup_session_context(&mut ctx)?;
+    let state = ctx.state();
+    let route = async || {
+        let plan = state.optimize(&state.create_logical_plan(&sql).await.expect("parse")).expect("optimize");
+        db.rollup_sql(&plan, &state).await.map(|rewrite| rewrite.map(|rewrite| rewrite.mode)).map_err(|reason| reason.label())
+    };
+    assert_eq!(route().await, Ok(Some("full")), "the built afternoon slice must route before the late row");
+
+    insert(late_hour, 30).await?;
+    assert_eq!(route().await.is_ok_and(|mode| mode == Some("full")), routes, "late row at {late_hour}:30");
+    let total = |batches: Vec<RecordBatch>| -> i64 {
+        batches.iter().map(|batch| arrow::compute::sum(batch.column_by_name("c").expect("c").as_primitive::<arrow::datatypes::Int64Type>()).unwrap_or(0)).sum()
+    };
+    let served = total(ctx.sql(&sql).await?.collect().await?);
+    assert_eq!(served, total(db.query_delta_only(&sql).await?), "the routed answer must equal the raw one");
+    assert_eq!(served, 2 + i64::from(late_hour >= 12), "late row at {late_hour}:30");
+    Ok(())
 }

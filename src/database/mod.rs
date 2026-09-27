@@ -311,6 +311,8 @@ pub mod scan_metric_names {
         // changed (dedup, compaction across the bound) and a rebuild is right.
         ROLLUP_WITNESS_BOUNDED_RESCUED = "timefusion.scan.rollup_witness_bounded_rescued" as scan.rollup_witness_bounded_rescued;
         ROLLUP_WITNESS_BOUNDED_STALE_TOO = "timefusion.scan.rollup_witness_bounded_stale_too" as scan.rollup_witness_bounded_stale_too;
+        // Slices whose exact input file set still matches after both row witnesses moved.
+        ROLLUP_WITNESS_CONTENT_RESCUED = "timefusion.scan.rollup_witness_content_rescued" as scan.rollup_witness_content_rescued;
         // WHY a day's rollup coverage was not usable, split the way the cert-side
         // split paid off: `stale_coverage` and `not_built` each conflate a
         // structural cause with a churn cause, and the fix differs per cause.
