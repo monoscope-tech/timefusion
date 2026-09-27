@@ -2613,17 +2613,17 @@ impl TaskJournal {
     /// horizon stays — `beyond_horizon_tasks` is how the abandoned debt is sized.
     ///
     /// Goes through `retain_tasks` so each drop leaves a tombstone and survives a restart.
-    pub fn prune_retired_history(&mut self, now_micros: i64) -> usize {
+    pub fn prune_retired_history(&mut self, now_micros: i64, horizon_days: u16) -> usize {
         // The claimable set is permissive — it keeps whatever was mutated — so it
         // is re-derived on this same minute-scale sweep. Without it the set drifts
         // toward the journal's full size and the claim scan slowly gets its cost
         // back.
         self.rebuild_claimable();
         crate::observability::maintenance_stats().claimable_tasks.store(self.claimable_len() as u64, std::sync::atomic::Ordering::Relaxed);
-        // Day-aligned like the backfill census, which still wants the WHOLE edge day: an
-        // instant cutoff drops the edge day's early Complete slices while the census still
-        // enumerates the day, and the coverage replay needs those records to prove them.
-        let cutoff = now_micros.div_euclid(DAY_MICROS).saturating_mul(DAY_MICROS).saturating_sub(STARVATION_HORIZON_MICROS);
+        // The census's own edge: an instant or differently-sized cutoff drops the edge day's
+        // early Complete slices while the census still enumerates the day, and the coverage
+        // replay needs those records to prove them.
+        let cutoff = backfill_horizon_start_micros(now_micros, horizon_days);
         let dropped = self.retain_tasks(|task| !matches!(task.state, TaskState::Complete | TaskState::Superseded) || task.key.slice.end_micros > cutoff);
         if dropped != 0 {
             crate::observability::maintenance_stats().journal_retired_tasks_pruned.fetch_add(dropped as u64, std::sync::atomic::Ordering::Relaxed);
@@ -2848,6 +2848,14 @@ const QUERY_WINDOW_MICROS: i64 = 14 * DAY_MICROS;
 /// further day (the graded term in `scheduling_class`) rather than hitting a hard cut-off,
 /// which would make the far tail unreachable.
 pub(crate) const STARVATION_HORIZON_MICROS: i64 = 31 * DAY_MICROS;
+
+/// Midnight `days` whole days before today: the edge of the rollup backfill horizon. The
+/// census and the journal prune both use it, so a finished slice's proof outlives the day
+/// the census still enumerates. `0` (backfill off) falls back to the starvation horizon.
+pub(crate) fn backfill_horizon_start_micros(now_micros: i64, days: u16) -> i64 {
+    let horizon = if days == 0 { STARVATION_HORIZON_MICROS } else { i64::from(days) * DAY_MICROS };
+    now_micros.div_euclid(DAY_MICROS).saturating_mul(DAY_MICROS).saturating_sub(horizon)
+}
 
 #[cfg(test)]
 fn scheduling_class(task: &MaintenanceTask, now_micros: i64) -> (u8, u8, i64, i64, i64) {
@@ -3645,6 +3653,17 @@ mod tests {
         journal.split_time_task(&key, 2 * MAX_DECODED_BYTES, None, &live)
     }
 
+    /// The census and the prune share one horizon edge: midnight `days` days ago, whatever
+    /// the time of day, so neither can drop what the other still wants.
+    #[test_case::test_case(7, 0.5 => 7 * DAY_MICROS ; "noon seven days out is exactly seven days")]
+    #[test_case::test_case(7, 23.9 => 7 * DAY_MICROS ; "late evening is the same edge")]
+    #[test_case::test_case(31, 12.0 => 31 * DAY_MICROS ; "the prod horizon")]
+    #[test_case::test_case(0, 12.0 => STARVATION_HORIZON_MICROS ; "backfill off keeps the starvation horizon")]
+    fn the_backfill_horizon_is_midnight_aligned(days: u16, hour: f64) -> i64 {
+        let today = 90 * DAY_MICROS;
+        today - backfill_horizon_start_micros(today + (hour * 3_600_000_000.0) as i64, days)
+    }
+
     /// Splitting a backfill unit must narrow the WORK, not the priority.
     ///
     /// Sealed ordering ranks wide units first because width PROXIES backfill
@@ -4144,7 +4163,7 @@ mod tests {
         // what kept it gone.
         journal.checkpoint().expect("persist the whole set before pruning any of it");
 
-        assert_eq!(journal.prune_retired_history(now), 2, "exactly the two finished-and-past-the-horizon tasks");
+        assert_eq!(journal.prune_retired_history(now, 31), 2, "exactly the two finished-and-past-the-horizon tasks");
         let survivors: Vec<&str> = journal.tasks().map(|t| t.key.project_id.as_str()).collect();
         assert!(!survivors.contains(&"old-complete") && !survivors.contains(&"old-superseded"));
         assert!(
@@ -4159,7 +4178,7 @@ mod tests {
             let (start, end) = at(days_ago);
             assert_eq!(journal.state(&task(name, start, end, Operation::BaseRollup).key), Some(state), "{name} must still be indexed");
         }
-        assert_eq!(journal.prune_retired_history(now), 0, "a second pass has nothing left to drop");
+        assert_eq!(journal.prune_retired_history(now, 31), 0, "a second pass has nothing left to drop");
 
         // The drop must be DURABLE on the cheap append: going through
         // `retain_tasks` is what leaves the `Removed` tombstone, without which

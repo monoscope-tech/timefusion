@@ -1842,7 +1842,12 @@ impl Database {
             deferred.is_some()
         };
         let today = crate::support::today_utc();
-        let earliest = today - chrono::Duration::days(horizon);
+        let earliest = chrono::DateTime::from_timestamp_micros(crate::maintenance_coordinator::backfill_horizon_start_micros(
+            crate::support::now_micros(),
+            self.config.maintenance.timefusion_rollup_backfill_days,
+        ))
+        .context("invalid backfill horizon")?
+        .date_naive();
         let backfill_window =
             TimeSlice::new(day_start_micros(earliest).context("invalid backfill start")?, day_start_micros(today).context("invalid backfill end")?)?;
         let day_window = |date| day_start_micros(date).map(|start_micros| TimeSlice { start_micros, end_micros: start_micros.saturating_add(DAY_MICROS) });
@@ -4318,7 +4323,7 @@ impl Database {
                 let mut journal = self.journal();
                 // Shed finished work whose slice the scheduler has abandoned;
                 // every commit serializes the whole task set.
-                journal.prune_retired_history(crate::support::now_micros());
+                journal.prune_retired_history(crate::support::now_micros(), self.config.maintenance.timefusion_rollup_backfill_days);
                 let report = journal.coarsen_sealed_slices_capped(crate::support::now_micros(), &|project, _source, date| {
                     ceilings.get(&(project.to_string(), date.to_string())).or_else(|| ceilings.get(&("default".to_string(), date.to_string()))).copied()
                 });
@@ -10871,7 +10876,7 @@ mod rollup_noop_skip_tests {
                 assert_eq!(report.state, Some(TaskState::Complete), "the {offset}h half publishes");
             }
             let mut journal = db.journal();
-            journal.prune_retired_history(crate::support::now_micros());
+            journal.prune_retired_history(crate::support::now_micros(), db.config.maintenance.timefusion_rollup_backfill_days);
             journal.checkpoint()?;
         }
         let db = Arc::new(Database::with_config(cfg).await?);
