@@ -2599,7 +2599,25 @@ impl PhysicalOptimizerRule for DedupNeedsOrderedInput {
         })
         .data()
         .and_then(unblock_ordered_legs)
+        .and_then(compact_merge_inputs)
     }
+}
+
+/// The merge holds one batch per input and charges each for every buffer it
+/// references, so an input pinning its sources' buffers is charged for them all.
+fn compact_merge_inputs(plan: Arc<dyn ExecutionPlan>) -> Result<Arc<dyn ExecutionPlan>> {
+    plan.transform_up(|node| {
+        let merge = downcast::<DedupExec>(node.as_ref()).filter(|dedup| dedup.required_ordering().is_some()).map(|_| Arc::clone(node.children()[0]));
+        let compacted = merge
+            .filter(|merge| downcast::<SortPreservingMergeExec>(merge.as_ref()).is_some_and(|m| !m.input().is::<crate::read::CompactBatchesExec>()))
+            .map(|merge| {
+                let input = Arc::clone(merge.children()[0]);
+                datafusion::physical_plan::replace_children_if_necessary(merge, vec![Arc::new(crate::read::CompactBatchesExec(input))])
+            })
+            .transpose()?;
+        swap_child(node, compacted)
+    })
+    .data()
 }
 
 /// Turn a leg's blocking re-sort back into the streaming merge its own data
@@ -2761,6 +2779,46 @@ mod dedup_needs_ordered_input_tests {
         let sorted = Arc::new(SortExec::new(ts_ordering(), coalesced).with_fetch(Some(10))) as Arc<dyn ExecutionPlan>;
         let out = DedupNeedsOrderedInput.optimize(dedup_over(sorted, Some(ts_ordering())), &ConfigOptions::default()).unwrap();
         assert_eq!(count_sorts(&out), 1, "a TopK must survive the rewrite");
+    }
+
+    /// A sparse filter keeps every source batch's `List(Utf8View)` buffers alive
+    /// in its coalesced output, and the merge is charged for all of them: here
+    /// ~25 MB for 100 rows of ~250 B each.
+    #[tokio::test]
+    async fn a_merge_input_is_charged_only_the_rows_it_holds() {
+        use datafusion::{
+            arrow::array::{ListBuilder, StringViewBuilder},
+            common::{ScalarValue, utils::memory::get_record_batch_memory_size},
+            logical_expr::Operator,
+            physical_expr::expressions::{BinaryExpr, Literal, binary},
+            physical_plan::filter::FilterExec,
+        };
+        let item = Arc::new(Field::new("item", DataType::Utf8View, true));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("ts", DataType::Int64, false),
+            Field::new("id", DataType::Int64, false),
+            Field::new("s", DataType::List(item), true),
+        ]));
+        let batch = |b: i64| {
+            let mut summary = ListBuilder::new(StringViewBuilder::new());
+            (0..1000).for_each(|i| summary.append_value([Some(format!("{b}-{i}-{}", "y".repeat(240)))]));
+            let ts = Arc::new(Int64Array::from_iter_values((0..1000).map(|i| -(b * 1000 + i))));
+            RecordBatch::try_new(schema.clone(), vec![ts, Arc::new(Int64Array::from_iter_values(0..1000)), Arc::new(summary.finish())]).unwrap()
+        };
+        let partitions: Vec<Vec<RecordBatch>> = (0..2).map(|p| (0..100).map(|b| batch(p * 100 + b)).collect()).collect();
+        let source = Arc::new(DataSourceExec::new(Arc::new(MemorySourceConfig::try_new(&partitions, Arc::clone(&schema), None).unwrap())));
+        let id_mod = Arc::new(BinaryExpr::new(Arc::new(PhysColumn::new("id", 1)), Operator::Modulo, Arc::new(Literal::new(ScalarValue::Int64(Some(1000))))));
+        let one_row_per_batch = binary(id_mod, Operator::Eq, Arc::new(Literal::new(ScalarValue::Int64(Some(7)))), &schema).unwrap();
+        let filtered = Arc::new(FilterExec::try_new(one_row_per_batch, source).unwrap());
+        let plan = dedup_over(Arc::new(SortPreservingMergeExec::new(ts_ordering(), filtered)), Some(ts_ordering()));
+
+        let out = DedupNeedsOrderedInput.optimize(plan, &ConfigOptions::default()).unwrap();
+        let merge_input = Arc::clone(out.children()[0].children()[0]);
+        let batches =
+            datafusion::physical_plan::common::collect(merge_input.execute(0, Arc::new(datafusion::execution::TaskContext::default())).unwrap()).await.unwrap();
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 100, "one row per source batch");
+        let charged: usize = batches.iter().map(get_record_batch_memory_size).sum();
+        assert!(charged < 1 << 20, "100 rows of ~250 B charged {charged} B");
     }
 }
 

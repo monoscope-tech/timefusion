@@ -7,44 +7,6 @@ use super::*;
 
 use datafusion::physical_plan::ExecutionPlan;
 
-/// Release oversized backing buffers before a rollup sort charges its input.
-#[derive(Debug)]
-struct CompactRollupSortInput(Arc<dyn ExecutionPlan>);
-
-impl datafusion::physical_plan::DisplayAs for CompactRollupSortInput {
-    fn fmt_as(&self, _: datafusion::physical_plan::DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "CompactRollupSortInput")
-    }
-}
-
-impl ExecutionPlan for CompactRollupSortInput {
-    no_physical_exprs!();
-    fn name(&self) -> &'static str {
-        "CompactRollupSortInput"
-    }
-    fn properties(&self) -> &Arc<datafusion::physical_plan::PlanProperties> {
-        self.0.properties()
-    }
-    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        vec![&self.0]
-    }
-    fn maintains_input_order(&self) -> Vec<bool> {
-        vec![true]
-    }
-    fn with_new_children(self: Arc<Self>, children: Vec<Arc<dyn ExecutionPlan>>) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
-        let [input]: [Arc<dyn ExecutionPlan>; 1] =
-            children.try_into().map_err(|_| datafusion::common::DataFusionError::Internal("CompactRollupSortInput requires one child".into()))?;
-        Ok(Arc::new(Self(input)))
-    }
-    fn execute(
-        &self, partition: usize, context: Arc<datafusion::execution::TaskContext>,
-    ) -> datafusion::common::Result<datafusion::physical_plan::SendableRecordBatchStream> {
-        use futures::TryStreamExt;
-        let stream = self.0.execute(partition, context)?.map_ok(crate::write::mem_buffer::compact_batch);
-        Ok(datafusion::physical_plan::coop::make_cooperative(Box::pin(datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(self.schema(), stream))))
-    }
-}
-
 #[derive(Debug)]
 struct CompactRollupSortInputs;
 
@@ -108,10 +70,10 @@ impl datafusion::physical_optimizer::PhysicalOptimizerRule for CompactRollupSort
             let Some(sort) = node.downcast_ref::<datafusion::physical_plan::sorts::sort::SortExec>() else {
                 return Ok(Transformed::no(node));
             };
-            if sort.input().is::<CompactRollupSortInput>() {
+            if sort.input().is::<crate::read::CompactBatchesExec>() {
                 return Ok(Transformed::no(node));
             }
-            let input = Arc::new(CompactRollupSortInput(Arc::clone(sort.input())));
+            let input = Arc::new(crate::read::CompactBatchesExec(Arc::clone(sort.input())));
             let sort = datafusion::physical_plan::replace_children_if_necessary(node, vec![input])?;
             Ok(Transformed::yes(Arc::new(RollupSortHeadroom(sort)) as Arc<dyn ExecutionPlan>))
         })
@@ -1178,7 +1140,7 @@ mod compact_rollup_input_tests {
         assert_eq!(displayable(once.as_ref()).indent(false).to_string(), displayable(twice.as_ref()).indent(false).to_string(), "rule must be idempotent");
         assert!(once.is::<RollupSortHeadroom>(), "sort output must reserve downstream workspace");
         let wrapper = Arc::clone(once.children()[0].children()[0]);
-        assert!(wrapper.is::<CompactRollupSortInput>(), "sort input must be compacted");
+        assert!(wrapper.is::<crate::read::CompactBatchesExec>(), "sort input must be compacted");
         assert!(Arc::ptr_eq(wrapper.properties(), source.properties()), "all partition and ordering properties must stay unchanged");
         let context = Arc::new(datafusion::execution::TaskContext::default());
         let mut streams = (0..2).map(|partition| wrapper.execute(partition, Arc::clone(&context))).collect::<datafusion::common::Result<Vec<_>>>()?;

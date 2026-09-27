@@ -761,15 +761,20 @@ pub fn sort_partition(schema: &crate::schema::TableSchema, batches: Vec<RecordBa
     };
     let sort_cols: Vec<SortColumn> = spec.into_iter().map(|(i, options)| SortColumn { values: combined.column(i).clone(), options: Some(options) }).collect();
     let indices = lexsort_to_indices(&sort_cols, None).ok()?;
-    let already_ordered = indices.values().iter().enumerate().all(|(i, &v)| v as usize == i);
-    let sorted = if already_ordered { combined } else { take_record_batch(&combined, &indices).ok()? };
-    // Hand back BATCHES, not the concatenated monolith, so nothing downstream
-    // holds the whole partition as one value. Slicing is zero-copy.
-    Some((0..sorted.num_rows()).step_by(SORT_CHUNK_ROWS).map(|off| sorted.slice(off, SORT_CHUNK_ROWS.min(sorted.num_rows() - off))).collect())
+    // Take each chunk on its own, never slice one sorted monolith: a slice pins
+    // every buffer of the partition, and a merge holding it is charged them all.
+    let chunk = sort_chunk_rows();
+    (0..indices.len())
+        .step_by(chunk)
+        .map(|off| take_record_batch(&combined, &indices.slice(off, chunk.min(indices.len() - off))).ok().map(compact_batch))
+        .collect()
 }
 
-/// Rows per batch handed back by [`sort_partition`]; not load-bearing.
-const SORT_CHUNK_ROWS: usize = 8192;
+/// Rows per batch handed back by [`sort_partition`]: the query batch size, so
+/// the scan's batch split never re-slices (and so re-pins) a chunk.
+fn sort_chunk_rows() -> usize {
+    crate::config::try_config().map_or(2048, |cfg| cfg.memory.timefusion_query_batch_size).max(1)
+}
 
 /// The DISTINCT bucket ids `batch`'s rows land in, keyed off `time_col`.
 /// Empty when the column is absent or is not an i64-backed time type, so only
@@ -2553,13 +2558,13 @@ mod tests {
 
         // Scrambled event-time order: an arrival-ordered fixture would come out
         // sorted even if nothing sorted.
-        const N: i64 = SORT_CHUNK_ROWS as i64 * 2 + 17;
-        let batches: Vec<RecordBatch> = (0..N).map(|i| create_test_batch((i * 7919) % N)).collect();
+        let n = sort_chunk_rows() as i64 * 2 + 17;
+        let batches: Vec<RecordBatch> = (0..n).map(|i| create_test_batch((i * 7919) % n)).collect();
         let sorted = sort_partition(schema, batches).expect("a partition with the sorting column must sort");
 
         assert!(sorted.len() > 1, "the result must be chunked, got {} batch(es)", sorted.len());
-        assert!(sorted.iter().all(|b| b.num_rows() <= SORT_CHUNK_ROWS), "no chunk may exceed the bound");
-        assert_eq!(sorted.iter().map(|b| b.num_rows()).sum::<usize>(), N as usize, "sorting must not lose or duplicate rows");
+        assert!(sorted.iter().all(|b| b.num_rows() <= sort_chunk_rows()), "no chunk may exceed the bound");
+        assert_eq!(sorted.iter().map(|b| b.num_rows()).sum::<usize>(), n as usize, "sorting must not lose or duplicate rows");
 
         let ts: Vec<i64> = sorted
             .iter()
@@ -2569,7 +2574,7 @@ mod tests {
             })
             .collect();
         assert!(ts.windows(2).all(|w| w[0] >= w[1]), "rows must be ordered timestamp DESC across chunk boundaries");
-        assert_eq!(ts.first().copied(), Some(N - 1), "greatest timestamp first");
+        assert_eq!(ts.first().copied(), Some(n - 1), "greatest timestamp first");
         assert_eq!(ts.last().copied(), Some(0), "least timestamp last");
     }
 

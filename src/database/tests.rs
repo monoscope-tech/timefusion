@@ -8993,3 +8993,66 @@ fn claims_yielded_to_queries_counts_each_skipped_tick() {
     assert!(!claim_yields_to_queries(&seen), "no new timeout, no yield");
     assert_eq!(yielded(), 1);
 }
+
+/// The ordered merge under `DedupExec` holds one batch per input and charges the
+/// pool for every buffer a batch references. The mem leg handed it zero-copy
+/// slices of one sorted partition, so every slice was charged the whole
+/// partition; a sparse filter over `List(Utf8View)` pins its sources the same
+/// way. Prod: one merge input batch charged 17.2 GB against a 24 GB pool.
+#[serial]
+#[tokio::test(flavor = "multi_thread")]
+async fn ordered_mor_merge_inputs_are_charged_only_their_own_bytes() -> Result<()> {
+    use datafusion::common::utils::memory::{RecordBatchMemoryCounter, get_record_batch_memory_size};
+    use futures::TryStreamExt;
+    let prefix = uuid::Uuid::new_v4().to_string()[..8].to_string();
+    let b = crate::server::bootstrap(create_test_config(&prefix)).await?;
+    within(90, async {
+        let project = format!("merge_bytes_{prefix}");
+        let now = crate::support::now_micros();
+        let rows = |tag: String, n: i64, base: i64| {
+            json_to_batch((0..n).map(|i| test_span_ts(&format!("{tag}-{i:05}"), &format!("{tag}-{i}-{}", "x".repeat(40)), &project, base + i)).collect())
+        };
+        for f in 0..2 {
+            b.db.insert_records_batch(&project, "otel_logs_and_spans", vec![rows(format!("d{f}"), 5000, now - 3_600_000_000 + f * 10_000_000)?], true, None)
+                .await?;
+        }
+        for k in 0..30 {
+            b.db.insert_records_batch(&project, "otel_logs_and_spans", vec![rows(format!("m{k}"), 1000, now - 60_000_000 + k * 1000)?], false, None).await?;
+        }
+        // The failing log-explorer shape: oldest-first over a DESC-sorted table.
+        let sql = format!(
+            "SELECT jsonb_build_array(id, name, to_jsonb(summary), coalesce(errors IS NOT NULL, false)) FROM otel_logs_and_spans \
+             WHERE project_id = '{project}' AND timestamp BETWEEN to_timestamp_micros({}) AND to_timestamp_micros({}) ORDER BY timestamp ASC LIMIT 500",
+            now - 7_200_000_000,
+            now + 60_000_000
+        );
+        let plan = b.session_ctx.sql(&sql).await?.create_physical_plan().await?;
+        let merge = plan_nodes(&plan)
+            .into_iter()
+            .find(|n| n.downcast_ref::<crate::read::DedupExec>().is_some())
+            .map(|dedup| Arc::clone(dedup.children()[0]))
+            .filter(|m| m.is::<datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec>())
+            .expect("the failing shape plans an ordered merge under DedupExec");
+        let input = Arc::clone(merge.children()[0]);
+        let mut rows_in = 0;
+        for partition in 0..input.properties().partitioning.partition_count() {
+            let batches: Vec<RecordBatch> = input.execute(partition, b.session_ctx.task_ctx())?.try_collect().await?;
+            let charged: usize = batches.iter().map(get_record_batch_memory_size).sum();
+            let owned = batches.iter().fold(RecordBatchMemoryCounter::new(), |mut owned, batch| {
+                owned.count_batch(batch);
+                owned
+            });
+            rows_in += batches.iter().map(RecordBatch::num_rows).sum::<usize>();
+            assert!(
+                charged <= 2 * owned.memory_usage(),
+                "merge input {partition}: {} batches charged {charged} B for {} B they own",
+                batches.len(),
+                owned.memory_usage()
+            );
+        }
+        assert_eq!(rows_in, 40_000, "both legs must feed the merge, or this proves nothing");
+        b.shutdown.cancel();
+        Ok(())
+    })
+    .await
+}

@@ -183,6 +183,41 @@ pub(crate) fn skippable_certified_files<'a>(certified: impl IntoIterator<Item = 
     skippable.into_iter().map(|(path, _)| path).collect()
 }
 
+/// Re-owns each batch's buffers (`compact_batch`) before an operator that holds
+/// batches charges the pool for every buffer they reference. Zero-copy slices,
+/// view casts and sparse filters hand on batches pinning their sources' buffers.
+#[derive(Debug)]
+pub struct CompactBatchesExec(pub Arc<dyn ExecutionPlan>);
+
+impl DisplayAs for CompactBatchesExec {
+    fn fmt_as(&self, _: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "CompactBatchesExec")
+    }
+}
+
+impl ExecutionPlan for CompactBatchesExec {
+    no_physical_exprs!();
+    fn name(&self) -> &'static str {
+        "CompactBatchesExec"
+    }
+    fn properties(&self) -> &Arc<PlanProperties> {
+        self.0.properties()
+    }
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.0]
+    }
+    fn maintains_input_order(&self) -> Vec<bool> {
+        vec![true]
+    }
+    fn with_new_children(self: Arc<Self>, mut children: Vec<Arc<dyn ExecutionPlan>>) -> DFResult<Arc<dyn ExecutionPlan>> {
+        Ok(Arc::new(Self(children.swap_remove(0))))
+    }
+    fn execute(&self, partition: usize, context: Arc<TaskContext>) -> DFResult<SendableRecordBatchStream> {
+        let stream = futures::TryStreamExt::map_ok(self.0.execute(partition, context)?, crate::write::mem_buffer::compact_batch);
+        Ok(datafusion::physical_plan::coop::make_cooperative(Box::pin(RecordBatchStreamAdapter::new(self.schema(), stream))))
+    }
+}
+
 /// Checks one union leg against its OWN declared ordering, so a nonzero counter
 /// names which leg lied (`DedupExec` sits above the union and cannot).
 ///
