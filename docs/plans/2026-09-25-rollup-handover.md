@@ -29,6 +29,33 @@ aggregation, Stage 5 dedup fusion, Stage 6; adaptive batches / certified-clean
 stay off; packed repairs are ON (release 4). The datafusion-postgres fork's DBeaver startup test
 passes at `68fdc80` (regproc casts plan as text).
 
+## Scorecard and plan position 2026-09-27 20:10 UTC (supersedes the checklist below)
+
+The plan is judged by its own gates: less total work per accepted event, fewer remints, more eligible hits, falling backlog.
+Every deploy records `scratchpad scorecard.sh` before and after (pending rollups/dedup, dirty partitions, oldest invalidation,
+never-certified share, certification dwell, probe hit shapes).
+
+Baseline (image `730e2fc`, W34 live): pending base 425 / derived 386 / dedup 189 (rising ~50 per 15 min), 888 dirty
+partitions (726 older than 7 days, oldest invalidation 43 days), 61% of scans never certified, 126 of 9,548 files proved,
+rollup hits: sealed days full, today hybrid or stale, 6h window stale_coverage. Journal lock: `coordinator_claim` ~365/s,
+INSERTs wait ~300 ms on pgwire workers (this is the query-latency cause of 2026-09-27 evening).
+
+Measured waste, ranked, with owner:
+1. **Stage 0 re-mint loops = ~75% of BaseRollup inflow** (4 cells: 28f62f01 09-18 and 08-27, metrics 08-27 x2; split,
+   escalate, ledger disagreement, census re-mint about once a minute). Fix B `c042fc06` ships 20:50 with the read-path
+   batch (`batch/readpath-fixb`). Census re-admit guard + 08-27 horizon clip = W38 (timefusion-7c).
+2. **Journal claim polling** (Stage 3 input): O(1) nothing-due fast path, `ws/claim-poll-fastpath` (agent).
+3. **Stage 5 dedup** (~899 GB/h scanned): W33 `ws/w33-dedup-certified-skip` rebased (agent).
+4. **Certification backlog**: W37 decomposition + dominant fix (timefusion-2e).
+5. **Stage 2 today-window hits**: W31; witness movers are `class=flushed` only (agent).
+6. **Stage 1D closed by measurement**: irrelevant (hashes-only) updates cause ~0% of dirty partitions and re-mints;
+   DML already skips invalidation for them; W21 carry covers the residue (kept dark).
+7. Owner-decision builds: W28 HLL audit (agent), W29 v4 `level` (branch ready, own window), W27 sessions v2, W30 staging.
+8. Stage 3 batched publication build, Stage 1B single pass: after 1–5 land and the scorecard shows the residual.
+
+Deploy queue: 20:50 read-path + fix B · ~22:50 memory batch (7c `ws/batch-memory`) · then claim fast path, W38, W33, W31
+one window each, CI green on the branch first.
+
 ## Open items (checklist, kept current)
 
 Live detail and per-stream results: [`2026-09-26-rollup-parallel-workstreams.md`](2026-09-26-rollup-parallel-workstreams.md).
