@@ -208,7 +208,8 @@ def main():
                       HANDOFF_STARTED_EPOCH_MS=previous['handoff_started_epoch_ms'],
                       PREFLUSHED_HANDOFF=handoff['drained'])
         rollout = stage('rollout')
-        values.update(OBSERVED_UNREADY_MS=rollout['observed_unready_ms'], QUERY_HANDOFF_MS=rollout['query_handoff_ms'])
+        values.update(OBSERVED_UNREADY_MS=rollout['observed_unready_ms'], QUERY_HANDOFF_MS=rollout['query_handoff_ms'],
+                      HANDOFF_PHASES=rollout.get('handoff_phases', 'unknown'))
         reconcile_replacement(stage, lease, guard, image)
         print('Production deployment and recovery verification completed.')
 

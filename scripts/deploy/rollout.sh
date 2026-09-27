@@ -16,6 +16,7 @@ probe_stop="$probe_dir/stop"
 probe_result="$probe_dir/max_unready_ms"
 handoff_result="$probe_dir/query_handoff_ms"
 handoff_observed="$probe_dir/handoff-observed"
+phases_result="$probe_dir/phases"
 (
   unready_started_ms=0
   max_unready_ms=0
@@ -24,6 +25,7 @@ handoff_observed="$probe_dir/handoff-observed"
   # measurable even when the first concurrent sample hits 57P03.
   last_old_response_ms="$LAST_OLD_RESPONSE_EPOCH_MS"
   query_handoff_ms=0
+  phases="unknown"
   while [ ! -e "$probe_stop" ]; do
     attempt_started_ms="$(date +%s%3N)"
     responding_boot="$(timeout 1 psql "$PGURL" -v ON_ERROR_STOP=1 -Atqc "SELECT value FROM timefusion_stats WHERE component = 'buffered_layer' AND key = 'boot_micros'" 2>/dev/null || true)"
@@ -36,7 +38,13 @@ handoff_observed="$probe_dir/handoff-observed"
       if [ "$responding_boot" = "$PREVIOUS_BOOT_MICROS" ]; then
         last_old_response_ms="$(date +%s%3N)"
       elif (( query_handoff_ms == 0 )); then
-        query_handoff_ms=$(( $(date +%s%3N) - last_old_response_ms ))
+        first_new_ms="$(date +%s%3N)"
+        query_handoff_ms=$(( first_new_ms - last_old_response_ms ))
+        # The new process's own boot stamp splits the handoff: before it is the
+        # container lifecycle (old exit, reschedule, create), after it the boot
+        # and first answer.
+        new_boot_ms=$(( responding_boot / 1000 ))
+        phases="old-last-answer to new-boot $(( new_boot_ms - last_old_response_ms ))ms; new-boot to first-answer $(( first_new_ms - new_boot_ms ))ms"
         touch "$handoff_observed"
       fi
     elif (( unready_started_ms == 0 )); then
@@ -50,6 +58,7 @@ handoff_observed="$probe_dir/handoff-observed"
   fi
   echo "$max_unready_ms" > "$probe_result"
   echo "$query_handoff_ms" > "$handoff_result"
+  echo "$phases" > "$phases_result"
 ) &
 probe_pid=$!
 stop_probe() {
@@ -94,5 +103,6 @@ observed_unready_ms="$(cat "$probe_result")"
 query_handoff_ms="$(cat "$handoff_result")"
 echo "observed_unready_ms=$observed_unready_ms" >> "$GITHUB_OUTPUT"
 echo "query_handoff_ms=$query_handoff_ms" >> "$GITHUB_OUTPUT"
+echo "handoff_phases=$(cat "$phases_result")" >> "$GITHUB_OUTPUT"
 cat caprover-deploy.log
 (( deploy_status == 0 )) || exit "$deploy_status"

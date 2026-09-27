@@ -17,7 +17,7 @@ while (( SECONDS < deadline )); do
   if [ -n "$boot_micros" ] && [ "$boot_micros" != "$PREVIOUS_BOOT_MICROS" ] && [ "$recovery_complete" = true ] && [[ "$recovery_ms" =~ ^[0-9]+$ ]]; then
     ready_elapsed_ms=$(( $(date +%s%3N) - HANDOFF_STARTED_EPOCH_MS ))
     ready_wait=$(( (ready_elapsed_ms + 999) / 1000 ))
-    echo "rollout measurement: total ${ready_elapsed_ms}ms; last-old-query to first-new-query ${QUERY_HANDOFF_MS}ms; longest client-visible unready interval ${OBSERVED_UNREADY_MS}ms; WAL recovery ${recovery_ms}ms"
+    echo "rollout measurement: total ${ready_elapsed_ms}ms; last-old-query to first-new-query ${QUERY_HANDOFF_MS}ms; longest client-visible unready interval ${OBSERVED_UNREADY_MS}ms; WAL recovery ${recovery_ms}ms; handoff phases: ${HANDOFF_PHASES:-unknown}"
     [[ "$QUERY_HANDOFF_MS" =~ ^[1-9][0-9]*$ ]] || { echo "::error::rollout probe did not observe the old-to-new query handoff: '$QUERY_HANDOFF_MS'"; exit 1; }
     [[ "$OBSERVED_UNREADY_MS" =~ ^[0-9]+$ ]] || { echo "::error::rollout readiness probe did not produce a valid downtime measurement: '$OBSERVED_UNREADY_MS'"; exit 1; }
     availability_slo_met=true
