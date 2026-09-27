@@ -36,6 +36,10 @@ pub struct RollupSpec {
     /// associative.
     #[serde(default)]
     pub derive_from: Option<String>,
+    /// Days of sealed history the backfill builds, when shorter than the global
+    /// `timefusion_rollup_backfill_days`. For a tier only recent windows read.
+    #[serde(default)]
+    pub backfill_days: Option<u16>,
 }
 
 /// One stored measure. Only DECOMPOSABLE aggregates are expressible, so they
@@ -728,7 +732,7 @@ mod tests {
 
     /// A 1m rollup over `kind` — the shape every spec test varies.
     fn spec(name: &str, measures: Vec<RollupMeasure>) -> RollupSpec {
-        RollupSpec { grain: "1m".into(), name: Some(name.into()), dimensions: vec!["kind".into()], measures, derive_from: None }
+        RollupSpec { grain: "1m".into(), name: Some(name.into()), dimensions: vec!["kind".into()], measures, derive_from: None, backfill_days: None }
     }
 
     /// The merge-on-read triple every tombstoned table must declare identically.

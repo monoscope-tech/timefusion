@@ -1859,12 +1859,13 @@ impl Database {
                     (&crate::observability::maintenance_stats().rollup_min_contiguous_days, contiguous),
                 ] {
                     let previous = gauge.load(std::sync::atomic::Ordering::Relaxed);
-                    if let Some(folded) = fold_fleet_gauge(previous, value, !first_tier_of_sweep, tier_is_ramping) {
+                    // A short-horizon tier can never reach the fleet horizon, so it abstains.
+                    if let Some(folded) = fold_fleet_gauge(previous, value, !first_tier_of_sweep, tier_is_ramping || spec.backfill_days.is_some()) {
                         gauge.store(folded, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
                 // Only a REAL tier consumes the seed; a ramping tier's value is provisional.
-                first_tier_of_sweep &= tier_is_ramping;
+                first_tier_of_sweep &= tier_is_ramping || spec.backfill_days.is_some();
                 // `contiguous_days` counts DATE PARTITIONS and ignores generation;
                 // `usable_cells` is the read path's own answer, so a gap between the
                 // two means a spec change orphaned coverage.
@@ -1908,7 +1909,11 @@ impl Database {
                 let journal = self.journal();
                 missing_tiers.retain(|(_, date), missing| {
                     let Some(window) = day_window(*date) else { return false };
-                    missing.retain(|index| journal.rollup_build_window(&source, &schema.rollups[*index].table_name(&source), window).is_some());
+                    missing.retain(|index| {
+                        let spec = &schema.rollups[*index];
+                        spec.backfill_days.is_none_or(|days| *date >= today - chrono::Duration::days(i64::from(days)))
+                            && journal.rollup_build_window(&source, &spec.table_name(&source), window).is_some()
+                    });
                     !missing.is_empty()
                 });
             }
@@ -10370,6 +10375,51 @@ mod rollup_noop_skip_tests {
         Ok(())
     }
 
+    /// A tier's own `backfill_days` bounds its backfill below the global horizon;
+    /// the other tiers still reach back the whole global horizon.
+    #[serial]
+    #[tokio::test]
+    async fn a_short_horizon_tier_backfills_only_its_own_days() -> Result<()> {
+        let source = "otel_logs_and_spans";
+        let short = get_schema(source).expect("source schema").rollups.iter().find(|spec| spec.backfill_days.is_some()).expect("a short-horizon tier").clone();
+        let (short_tier, horizon) = (short.table_name(source), i64::from(short.backfill_days.expect("checked")));
+        let project = format!("horizon_{}", uuid::Uuid::new_v4());
+        let (recent, old) = (crate::support::today_utc() - chrono::Duration::days(2), crate::support::today_utc() - chrono::Duration::days(horizon + 3));
+        let mut cfg = (*rollup_cfg("short_horizon_backfill")).clone();
+        cfg.maintenance.timefusion_rollup_backfill_days = u16::try_from(horizon + 7)?;
+        let db = Arc::new(Database::with_config(Arc::new(cfg)).await?);
+        for (day, id) in [(recent, "recent"), (old, "old")] {
+            insert_span(&db, &project, day, 12, id, "op").await?;
+        }
+        {
+            let mut journal = db.journal();
+            let inserted: Vec<_> = journal.tasks().map(|task| task.key.clone()).collect();
+            for key in inserted {
+                assert!(journal.complete(&key));
+            }
+        }
+        db.preload_replay_complete.store(true, std::sync::atomic::Ordering::Release);
+        db.plan_rollup_backfill().await?;
+        let journal = db.journal();
+        let dates = |table: &str| -> HashSet<chrono::NaiveDate> {
+            journal
+                .tasks()
+                .filter(|task| task.state.is_active() && task.key.project_id == project && task.key.physical_table == table)
+                .filter_map(|task| chrono::DateTime::from_timestamp_micros(task.key.slice.start_micros).map(|time| time.date_naive()))
+                .collect()
+        };
+        assert_eq!(dates(&short_tier), HashSet::from([recent]), "the short-horizon tier must not backfill past its own days");
+        let full_tier = get_schema(source)
+            .expect("source schema")
+            .rollups
+            .iter()
+            .find(|spec| spec.backfill_days.is_none() && spec.derive_from.is_none())
+            .expect("a full-horizon tier")
+            .table_name(source);
+        assert!(dates(&full_tier).contains(&old), "the other tiers still backfill the whole global horizon");
+        Ok(())
+    }
+
     /// The skip must survive a restart: coverage rebuilt from tier tags at boot must carry a
     /// `content_fp` and a nonzero `output_files`, or nothing can be skipped until a slice has
     /// published once more in the new process. The restart is a second `Database` over the
@@ -11890,9 +11940,9 @@ mod rollup_relevance_tests {
     /// tier's inheritance of its base's reads cannot be isolated here: `dashboard_1h_v2`
     /// restates every column its base reads.
     #[test_case::test_case(&["hashes"] => Vec::<String>::new() ; "monoscope's hashes enrichment touches no tier")]
-    #[test_case::test_case(&["attributes___user___id"] => vec!["sessions_1h_v1"] ; "user enrichment touches only the session tier")]
+    #[test_case::test_case(&["attributes___user___id"] => vec!["sessions_1h_v1", "sessions_1h_v2"] ; "user enrichment touches only the session tiers")]
     #[test_case::test_case(&["attributes___http___response___status_code"] => vec!["dashboard_1h_v2", "dashboard_1m_v3"] ; "a measure filter column touches both dashboard tiers")]
-    #[test_case::test_case(&["timestamp"] => vec!["dashboard_1h_v2", "dashboard_1m_v3", "sessions_1h_v1"] ; "moving a row touches every tier")]
+    #[test_case::test_case(&["timestamp"] => vec!["dashboard_1h_v2", "dashboard_1m_v3", "sessions_1h_v1", "sessions_1h_v2"] ; "moving a row touches every tier")]
     fn tiers_reading(columns: &[&str]) -> Vec<String> {
         super::rollup_tiers_reading("otel_logs_and_spans", columns)
             .into_iter()

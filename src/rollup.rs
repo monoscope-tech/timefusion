@@ -1417,9 +1417,27 @@ fn strip_index_hints(operands: &mut Vec<&datafusion::logical_expr::Expr>) {
 }
 
 fn canonical_and<'a>(expressions: impl IntoIterator<Item = &'a datafusion::logical_expr::Expr>) -> String {
+    use datafusion::logical_expr::{Expr, Operator, utils::split_binary};
     // `X AND X` must canonicalize to `X`: a pushed-down predicate is collected
-    // both from the Filter node and from the TableScan.
-    expressions.into_iter().map(canonical).sorted().dedup().join(" AND ")
+    // both from the Filter node and from the TableScan. Absorption too: when one
+    // conjunct's disjuncts are a subset of another's, it implies the other, which
+    // drops out, as the optimizer drops it from a declared filter. A measure
+    // counting pageviews under a browser scope that already admits every pageview
+    // is otherwise unmatchable.
+    let conjuncts: Vec<(String, std::collections::BTreeSet<String>)> = expressions
+        .into_iter()
+        .map(|expr| {
+            let disjuncts = match unaliased(expr) {
+                Expr::BinaryExpr(binary) if binary.op == Operator::Or => split_binary(expr, Operator::Or).into_iter().map(canonical).collect(),
+                _ => std::collections::BTreeSet::from([canonical(expr)]),
+            };
+            (canonical(expr), disjuncts)
+        })
+        .collect();
+    let implied = |(canonical, disjuncts): &(String, std::collections::BTreeSet<String>)| {
+        conjuncts.iter().any(|(other, stronger)| stronger.is_subset(disjuncts) && (stronger != disjuncts || other < canonical))
+    };
+    conjuncts.iter().filter(|conjunct| !implied(conjunct)).map(|(canonical, _)| canonical).sorted().dedup().join(" AND ")
 }
 
 fn parse_bucket_micros(value: &str) -> Option<i64> {
@@ -2340,6 +2358,7 @@ mod tests {
                 RollupMeasure { name: "hi".into(), agg: "max".into(), column: Some("duration".into()), filter: None },
             ],
             derive_from: None,
+            backfill_days: None,
         };
         let ctx = datafusion::prelude::SessionContext::new();
         let (first, second) = (rows(0, 9), rows(0, 7));
@@ -2408,6 +2427,7 @@ mod tests {
                 RollupMeasure { name: "landing_at".into(), agg: "min".into(), column: Some("timestamp".into()), filter },
             ],
             derive_from: None,
+            backfill_days: None,
         }
     }
 
@@ -2732,6 +2752,7 @@ mod tests {
                 filter: Some("kind = 'server'".into()),
             }],
             derive_from: derive_from.map(str::to_string),
+            backfill_days: None,
         };
         let raw = build_partition_sql(&spec(None), SOURCE, "project", "2026-08-01").expect("valid SQL");
         assert!(raw.contains("hll_agg(context___trace_id) FILTER (WHERE kind = 'server') AS traces"), "{raw}");
@@ -3034,6 +3055,35 @@ mod tests {
         let route = route_for(&state, &sql).await.expect("match dcount").expect("the hll measure is declared, so it must route");
         let tag = tag.map(|names| names.iter().map(|name| (*name).to_owned()).collect::<HashSet<_>>());
         assert_eq!(route.measures_available(tag.as_ref()), serves);
+    }
+
+    /// monoscope RUM's session list (`otelSessionCoreRows`), as sent with its bound
+    /// environment and service parameters. The browser scope is not a dimension: it
+    /// promotes to the guard count and every measure is declared under it.
+    #[test_case::test_case("NULL", "NULL", "" ; "unscoped")]
+    #[test_case::test_case("'production'", "NULL", "" ; "one environment")]
+    #[test_case::test_case("NULL", "'web'", "" ; "one service")]
+    #[test_case::test_case("NULL", "NULL", " AND COUNT(*) FILTER (WHERE (status_code = 'ERROR' OR lower(COALESCE(level, '')) = 'error' OR attributes___exception___type IS NOT NULL)) > 0" ; "errored sessions only")]
+    #[tokio::test]
+    async fn rum_session_list_routes_to_the_browser_session_tier(environment: &str, service: &str, having: &str) {
+        let error = "(status_code = 'ERROR' OR lower(COALESCE(level, '')) = 'error' OR attributes___exception___type IS NOT NULL)";
+        let pageview = "(name LIKE 'Pageview %' OR name = 'documentLoad')";
+        let sql = format!(
+            "SELECT attributes___session___id, MIN(timestamp), MAX(timestamp), COUNT(*)::bigint, \
+             COUNT(*) FILTER (WHERE {error})::bigint, COUNT(*) FILTER (WHERE {pageview})::bigint, \
+             MAX(attributes___user___id), MAX(attributes___user___full_name), MAX(attributes___user___email), MAX(resource___service___name), \
+             NULL::text AS last_page, NULL::text AS user_agent, false AS has_replay \
+             FROM {SOURCE} WHERE project_id = 'project' \
+             AND timestamp >= to_timestamp_micros(0) AND timestamp <= to_timestamp_micros(172800000000) \
+             AND ({environment}::text IS NULL OR resource___deployment___environment___name = {environment}) \
+             AND ({service}::text IS NULL OR resource___service___name = {service}) \
+             AND (resource___telemetry___sdk___language IN ('webjs', 'javascript', 'js') OR resource___user_agent___original IS NOT NULL \
+                  OR name IN ('documentLoad', 'documentFetch') OR {pageview}) \
+             AND attributes___session___id IS NOT NULL AND attributes___session___id <> '' \
+             GROUP BY attributes___session___id HAVING true{having} ORDER BY MAX(timestamp) DESC LIMIT 200"
+        );
+        let route = route_alone(&sql).await.expect("the RUM session list must route").expect("a route");
+        assert_eq!(route.target, "otel_logs_and_spans_rollup_sessions_1h_v2");
     }
 
     /// A group expression the matcher cannot serve must DECLINE, not vanish.
