@@ -1631,7 +1631,8 @@ impl Database {
                     };
                     // Event ranges for TODAY only: they place a file in its slice cell.
                     let stats = (date == today).then(|| file.stats()).flatten();
-                    partitions.entry((project, date)).or_default().push(TailAdd::from_stats(path.to_string(), file.size(), false, false, stats.as_deref()));
+                    let has_dv = file.deletion_vector_descriptor().is_some();
+                    partitions.entry((project, date)).or_default().push(TailAdd::from_stats(path.to_string(), file.size(), false, has_dv, stats.as_deref()));
                 }
             }
             // Anything seen-but-not-planned is COMPLIANT, which is what retires
@@ -1654,8 +1655,8 @@ impl Database {
                 let small = files.iter().filter(|file| file.size < small_target).sorted_by_key(|file| file.size).cloned();
                 // Today, only files sharing a rollup slice cell may pair — the
                 // packer groups by the SAME `slice_cells` over the same bounds.
-                let bounds = if date == today { self.packing_bounds(&project_id, &source, day_start) } else { Vec::new() };
-                let small = cells_with_pair(slice_cells(small, &bounds));
+                let bounds = if date == today { self.packing_bounds(&project_id, &source, day_start) } else { Some(Vec::new()) };
+                let small = bounds.map_or_else(Vec::new, |bounds| cells_with_pair(slice_cells(small, &bounds)));
                 // TWO under-target files ARE the admission test. The packer's byte
                 // budget carries `pair_floor`, so it bins any two of these; a
                 // second, separately-derived predicate here is exactly how planner
@@ -3655,7 +3656,8 @@ impl Database {
         // Today, a bin stays inside ONE rollup slice cell, so packing never moves a
         // slice's bounded witness. Sealed dates pack across cells as before.
         let bounds =
-            if key.operation == Operation::HotPacking { self.packing_bounds(&key.project_id, &key.source, key.slice.start_micros) } else { Vec::new() };
+            if key.operation == Operation::HotPacking { self.packing_bounds(&key.project_id, &key.source, key.slice.start_micros) } else { Some(Vec::new()) };
+        let Some(bounds) = bounds else { return Ok(Vec::new()) };
         let cells = slice_cells(candidates, &bounds);
         let selected = select_cell_bin(
             &cells,
@@ -4950,10 +4952,15 @@ impl Database {
 
     /// `slice_bounds` over every live slice of `project_id`'s `source` on the day
     /// starting at `day_start`, all tiers. Empty for a source declaring no
-    /// rollups: it has no witness to protect.
-    fn packing_bounds(&self, project_id: &str, source: &str, day_start: i64) -> Vec<i64> {
+    /// rollups: it has no witness to protect. `None` until this process has
+    /// recovered the source's coverage — before that the bounds are incomplete,
+    /// and planner and packer both skip today rather than pack across them.
+    fn packing_bounds(&self, project_id: &str, source: &str, day_start: i64) -> Option<Vec<i64>> {
         if get_schema(source).is_none_or(|schema| schema.rollups.is_empty()) {
-            return Vec::new();
+            return Some(Vec::new());
+        }
+        if !self.rollup_coverage_recovered.contains(source) {
+            return None;
         }
         let day = day_start..day_start.saturating_add(DAY_MICROS);
         let covered = self
@@ -4961,7 +4968,7 @@ impl Database {
             .iter()
             .filter(|entry| entry.key().0 == project_id && entry.key().1 == source && day.contains(&entry.key().3))
             .map(|entry| entry.value().covered_through);
-        slice_bounds(covered, day_start)
+        Some(slice_bounds(covered, day_start))
     }
 
     /// Rows of `batch` below their date's live coverage bound: they move a slice's bounded witness.
@@ -5694,6 +5701,7 @@ impl Database {
             by_fate = %UnverifiableFate::render(&fates),
             event = "rollup_coverage_recovered"
         );
+        self.rollup_coverage_recovered.insert(source.to_owned());
         Ok(recovered)
     }
 

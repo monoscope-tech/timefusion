@@ -2507,6 +2507,8 @@ pub struct Database {
     /// `rollup_slice_coverage`.
     rollup_coverage: Arc<dashmap::DashMap<RollupCoverageKey, RollupCoverage>>,
     rollup_slice_coverage: Arc<dashmap::DashMap<RollupSliceCoverageKey, RollupCoverage>>,
+    /// Sources whose `recover_rollup_coverage` has completed in this process.
+    rollup_coverage_recovered: Arc<dashmap::DashSet<String>>,
     /// `partition_file_rows` memoized per source table, keyed by the Delta
     /// version it was computed from — a new commit invalidates it naturally.
     /// Without this the bounded-witness rescue re-materialized the add-actions
@@ -3195,6 +3197,7 @@ impl Database {
             rollup_source_epochs,
             rollup_coverage: Arc::new(dashmap::DashMap::new()),
             rollup_slice_coverage: Arc::new(dashmap::DashMap::new()),
+            rollup_coverage_recovered: Arc::new(dashmap::DashSet::new()),
             rollup_file_rows_cache: dashmap::DashMap::new(),
             witness_carry: Arc::default(),
             rollup_tier_untagged: Arc::new(dashmap::DashMap::new()),
@@ -5941,13 +5944,15 @@ pub(crate) fn slice_bounds(covered: impl IntoIterator<Item = i64>, day_start: i6
 }
 
 /// `adds` grouped by the cell between consecutive sorted `bounds` each lies
-/// wholly inside. A straddler or a file without an event range joins no cell.
+/// wholly inside. A straddler, a file without an event range, or a DV'd file
+/// (packing drops its masked rows, moving every bound above) joins no cell.
 /// THE one grouping the planner and the packer share; no bounds is one cell.
 pub(crate) fn slice_cells(adds: impl IntoIterator<Item = TailAdd>, bounds: &[i64]) -> Vec<Vec<TailAdd>> {
     let cell = |t: i64| bounds.partition_point(|bound| *bound <= t);
     adds.into_iter()
         .filter_map(|add| match add.event_range {
             _ if bounds.is_empty() => Some((0, add)),
+            _ if add.has_dv => None,
             Some((min, max)) if cell(min) == cell(max) => Some((cell(min), add)),
             _ => None,
         })

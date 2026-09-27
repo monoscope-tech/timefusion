@@ -5193,20 +5193,22 @@ fn the_packer_bins_every_pair_the_planner_queues() {
 /// Today the planner and the packer pair files only inside ONE rollup slice
 /// cell, through the same `slice_cells`: a bin mixing files on both sides of a
 /// live `covered_through` moves `rollup::rows_below` and stales that slice.
-/// Minutes past midnight; `covered: None` is a source declaring no rollups.
+/// Minutes past midnight; `dv` indexes files carrying a deletion vector;
+/// `covered: None` is a source declaring no rollups.
 /// Returns (planner queues, files packed).
-#[test_case(&[Some((1, 4)), Some((5, 9))], Some(vec![10]) => (true, 2) ; "a pair inside one cell packs")]
-#[test_case(&[Some((1, 4)), Some((11, 14))], Some(vec![10]) => (false, 0) ; "a pair split by a live bound is not queued")]
-#[test_case(&[Some((1, 4)), Some((5, 9)), Some((8, 12))], Some(vec![10]) => (true, 2) ; "a straddler joins no bin and the pair still packs")]
-#[test_case(&[Some((1, 4)), None], Some(vec![10]) => (false, 0) ; "a file without an event range joins no cell")]
-#[test_case(&[Some((11, 14)), Some((16, 19))], Some(vec![10, 15]) => (false, 0) ; "an off-grid bisected bound is respected")]
-#[test_case(&[Some((1, 4)), Some((11, 14))], Some(vec![]) => (false, 0) ; "the unbuilt tail is cut on the 10-minute grid")]
-#[test_case(&[Some((0, 560)), Some((561, 565)), Some((566, 569))], Some((1..=56).map(|k| k * 10).collect()) => (true, 2) ; "the whole-day straddler stops growing")]
-#[test_case(&[Some((1, 4)), Some((11, 14))], None => (true, 2) ; "a source without rollups packs across cells")]
-fn planner_and_packer_pair_only_within_a_slice_cell(ranges: &[Option<(i64, i64)>], covered: Option<Vec<i64>>) -> (bool, usize) {
+#[test_case(&[Some((1, 4)), Some((5, 9))], &[], Some(vec![10]) => (true, 2) ; "a pair inside one cell packs")]
+#[test_case(&[Some((1, 4)), Some((11, 14))], &[], Some(vec![10]) => (false, 0) ; "a pair split by a live bound is not queued")]
+#[test_case(&[Some((1, 4)), Some((5, 9)), Some((8, 12))], &[], Some(vec![10]) => (true, 2) ; "a straddler joins no bin and the pair still packs")]
+#[test_case(&[Some((1, 4)), None], &[], Some(vec![10]) => (false, 0) ; "a file without an event range joins no cell")]
+#[test_case(&[Some((11, 14)), Some((16, 19))], &[], Some(vec![10, 15]) => (false, 0) ; "an off-grid bisected bound is respected")]
+#[test_case(&[Some((1, 4)), Some((11, 14))], &[], Some(vec![]) => (false, 0) ; "the unbuilt tail is cut on the 10-minute grid")]
+#[test_case(&[Some((0, 560)), Some((561, 565)), Some((566, 569))], &[], Some((1..=56).map(|k| k * 10).collect()) => (true, 2) ; "the whole-day straddler stops growing")]
+#[test_case(&[Some((1, 4)), Some((11, 14))], &[], None => (true, 2) ; "a source without rollups packs across cells")]
+#[test_case(&[Some((1, 4)), Some((5, 9))], &[0], Some(vec![10]) => (false, 0) ; "a DV file joins no cell, so its cellmate is no pair")]
+fn planner_and_packer_pair_only_within_a_slice_cell(ranges: &[Option<(i64, i64)>], dv: &[usize], covered: Option<Vec<i64>>) -> (bool, usize) {
     const MINUTE: i64 = 60_000_000;
     let minutes = |(lo, hi): (i64, i64)| (lo * MINUTE, hi * MINUTE);
-    let adds = ranges.iter().enumerate().map(|(i, range)| tail_file(&format!("f{i}"), 10 * MB, true, range.map(minutes), false, None)).collect_vec();
+    let adds = ranges.iter().enumerate().map(|(i, range)| tail_file(&format!("f{i}"), 10 * MB, true, range.map(minutes), dv.contains(&i), None)).collect_vec();
     let bounds = covered.map_or_else(Vec::new, |covered| super::slice_bounds(covered.into_iter().map(|minute| minute * MINUTE), 0));
     let queued = super::cells_with_pair(super::slice_cells(adds.clone(), &bounds)).len() >= 2;
     let policy = super::BinPolicy {
@@ -5225,28 +5227,35 @@ fn planner_and_packer_pair_only_within_a_slice_cell(ranges: &[Option<(i64, i64)>
     (queued, packed.len())
 }
 
-/// The wiring of the above: with no slice built yet the 10-minute grid bounds
-/// today's cells, so 00:01 and 00:15 are no pair; a 00:03 cellmate makes one,
-/// and only that pair merges.
+/// The wiring of the above. Until this process has recovered the source's
+/// coverage its bounds are incomplete, so today is neither queued nor packed.
+/// After, the 10-minute grid bounds the cells: 00:01 and 00:03 pair, 00:15 does not.
 #[tokio::test]
 async fn hot_packing_pairs_only_within_a_slice_cell() -> Result<()> {
-    use crate::maintenance_coordinator::Operation;
+    use crate::maintenance_coordinator::{DAY_MICROS, Operation, TaskKey, TimeSlice};
     let db = Database::with_config(create_test_config("hot-pack-cells")).await?;
     let project = format!("cells_{}", uuid::Uuid::new_v4().simple());
-    let at = |minute: i64| midnight_micros(crate::support::today_utc()) + minute * 60_000_000;
+    let midnight = midnight_micros(crate::support::today_utc());
     let queued =
         |db: &Database| db.maintenance_tasks.lock().unwrap().tasks().any(|task| task.key.project_id == project && task.key.operation == Operation::HotPacking);
-    for (id, minute) in [("a", 1), ("b", 15)] {
-        insert_a_span(&db, &project, id, at(minute)).await?;
+    let files = async |db: &Database| live_paths(db, &project, "otel_logs_and_spans").await.into_iter().filter(|path| path.contains(&project)).count();
+    for (id, minute) in [("a", 1), ("b", 15), ("c", 3)] {
+        insert_a_span(&db, &project, id, midnight + minute * 60_000_000).await?;
     }
     db.plan_compaction_debt().await?;
-    assert!(!queued(&db), "two files in different slice cells are not HotPacking debt");
-    insert_a_span(&db, &project, "c", at(3)).await?;
+    assert!(!queued(&db), "before coverage recovery the bounds are unknown, so today is not HotPacking debt");
+    let source = "otel_logs_and_spans".to_owned();
+    let slice = TimeSlice::new(midnight, midnight + DAY_MICROS)?;
+    let key = TaskKey { physical_table: source.clone(), source, project_id: project.clone(), slice, operation: Operation::HotPacking };
+    db.maintenance_tasks.lock().unwrap().enqueue(key, 0, 1024, 0);
+    db.run_coordinator_compaction_once(Operation::HotPacking).await?;
+    assert_eq!(files(&db).await, 3, "and the packer refuses it too");
+
+    db.recover_rollup_coverage("otel_logs_and_spans").await?;
     db.plan_compaction_debt().await?;
-    assert!(queued(&db), "a cellmate makes a pair");
+    assert!(queued(&db), "recovered: 00:01 and 00:03 share a cell");
     assert!(db.run_coordinator_compaction_once(Operation::HotPacking).await?, "the queued pair is claimed");
-    let files = live_paths(&db, &project, "otel_logs_and_spans").await.into_iter().filter(|path| path.contains(&project)).count();
-    assert_eq!(files, 2, "the pair merged; the file in the other cell did not");
+    assert_eq!(files(&db).await, 2, "the pair merged; the file in the other cell did not");
     Ok(())
 }
 
