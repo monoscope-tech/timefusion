@@ -583,7 +583,7 @@ Unit cost is W10's calibrated mean unit seconds, scaled by rows. Drain is pendin
 | 4 × 1 | 95% | 1,258 | +96 | 857 / 105 / 296 | 0.59 h |
 | 2 × 4 | 94% | 13,848 | +1,731 | 5,653 / 5,398 / 1,361 (+1,436 Hot) | 3.2 h |
 | 4 × 2 | 95% | 7,423 | +1,080 | 3,242 / 2,657 / 768 (+756 Hot) | 3.2 h |
-| 4 × 4 | still running at the time of writing | | | | |
+| 4 × 4 | 95% | 21,610 | +1,504 | 9,983 / 6,836 / 2,002 (+2,789 Hot) | 9.6 h |
 
 **Findings:**
 1. **Stability threshold: about 2x today's load.** Every 2x cell (rows or projects) is stable at about 60% busy with
