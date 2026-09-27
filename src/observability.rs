@@ -246,9 +246,11 @@ const LATENCY_WINDOW: Duration = Duration::from_secs(60);
 /// to two `LATENCY_WINDOW`s, so an exported p95 tracks the present.
 pub struct LatencyHistogram {
     counts: [AtomicU64; LATENCY_BUCKETS],
-    /// (current window start, snapshot at previous rotation, snapshot at current rotation)
-    window: Mutex<Option<(Instant, [u64; LATENCY_BUCKETS], [u64; LATENCY_BUCKETS])>>,
+    window: Mutex<Option<LatencyWindow>>,
 }
+
+/// (current window start, snapshot at previous rotation, snapshot at current rotation)
+type LatencyWindow = (Instant, [u64; LATENCY_BUCKETS], [u64; LATENCY_BUCKETS]);
 
 pub static PGWIRE_LATENCY: LatencyHistogram = LatencyHistogram::new();
 pub static SCAN_LATENCY: LatencyHistogram = LatencyHistogram::new();
@@ -265,6 +267,12 @@ fn latency_bucket(us: u64) -> usize {
 
 fn latency_bucket_floor_us(b: usize) -> u64 {
     if b < 4 { b as u64 } else { (4 + (b as u64 & 3)) << ((b >> 2) - 1) }
+}
+
+impl Default for LatencyHistogram {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl LatencyHistogram {
