@@ -62,6 +62,7 @@ Status: ⬜ open · 🟡 in progress · ✅ done. Priority is the plan's executi
 | W20 | Heavy-query admission starves the largest project | analysis → build (lane 2) | Read path | Why every 87576849 dashboard query timed out waiting for a heavy slot; fix + holder attribution | `src/read/admission.rs` | — | Claude (timefusion-2e) | ✅ handed off `ws/admission-narrow-merge` |
 | W21 | Carry the rollup witness across rollup-irrelevant version appends | build (lane 2) | Stage 0/2 | hashes-only MoR UPDATEs keep today's slices readable; dark flag + shadow counter; failing-first + guard tests | `dml.rs` append, `database/write.rs` flush commit, `maintain.rs` WitnessCarry | W17 | Claude (timefusion-2e) | ✅ handed off `ws/w21-witness-carry` (dark; enablement blocked, see result) |
 | W22 | Dedup scan share: steady state or backlog? (Stage 5 input) | analysis | Stage 5 | Is dedup's ~12x larger physical scan a draining backlog or recurring work | prod logs, exported `pending_dedup` | W7 | Claude (timefusion-2e) | ✅ steady state (see result) |
+| W23 | Dedup certification that survives fingerprint moves (W22 lever) | analysis → build | Stage 5 | Step 1: what moves sealed-day certification, and which moves are dedup-preserving; step 2 (dark carry) only if step 1 finds the volume | `maintain.rs` certification, `commit_wave` | W22 | Claude (timefusion-2e) | 🟡 step 1 done: carry across compaction has little to recover (see result); instrument denials before building |
 
 Later stages (2, 4, 5, 6, 1C, certified-clean activation, adaptive batches) stay **conditional** on W2/W7
 numbers, per the plan; do not start them without a measured residual cost.
@@ -328,4 +329,31 @@ means certification that survives fingerprint moves, since 98.7% of eligible sli
 than faster dedup.
 **Not measured:** bytes per dedup unit (`maintenance_scan_pruning` carries no unit key), so the
 per-age split is by lease time, not by bytes.
+
+### W23 step 1 result — 2026-09-27 — Claude (timefusion-2e)
+**Mechanism** (code map, `tf-w11` @ master):
+- The certification is `(project, table, date)` → `fp` (hash of the sorted full URIs, paths only) plus `files`
+  (`(path, DV)` visibility map). Slice coverage keeps proved intervals.
+- **No certification carry exists anywhere.** Every commit that changes the file set moves `fp`, including
+  compaction, which is row-preserving. The read path survives only when every added `(path, DV)` misses the
+  query window. A removal is never waved through. The only same-path rule is the dedup pass's own masked arm.
+- The best hook for a carry would be `commit_wave`'s landed paths (beside `reindex_wave_outputs`), which
+  already verify each input's exact `(path, DV)` under the lock.
+
+**Numbers:**
+- The hash-update version rows do not reach sealed days. `dirty_bin_enqueued`: 368 today, 2 yesterday, 0 on
+  days 2–4.
+- Compaction on sealed days is 6 SealedConsolidation units, on yesterday only. HotPacking (525) is all today.
+- Dedup wave commits: 47 in-place DV masks (bytes_in == bytes_out) plus 2 CoW drops.
+
+So on days 2–4, dedup's own progressive cleaning is essentially the only mover.
+**Conclusion:** carrying a certification across dedup-preserving rewrites (compaction) has **little to recover
+today**: the carryable class hardly touches sealed days. The 43% `never_certified` and the fp-moved denials come
+from days still being cleaned slice by slice in their first ~4 days. Each DV mask changes a file's visibility,
+which un-matches the whole day's `files` for any window overlapping that file.
+**Before building:** the fp-moved denials cannot be attributed to a date or mover from counters. Proposed next
+step (cheap, dark-safe): a sampled `dedup_skip_denied` log per `(date age, reason, mover: added | dv_changed |
+removed)`. Then decide between two levers: (a) narrowing the read check so a DV mask that only removed *losers*
+does not un-match windows it cannot affect, or (b) certifying days faster in their first 4 days. The compaction
+carry stays unbuilt unless sealed-day compaction volume grows.
 
