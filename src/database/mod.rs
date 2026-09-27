@@ -2605,6 +2605,9 @@ pub struct Database {
     /// tell "a flush stalled in the last minute" from the counter's history.
     /// Arc for the struct's Clone; the census is the only reader.
     backfill_flush_stalls_seen: Arc<std::sync::atomic::AtomicU64>,
+    /// The inputs each census admission saw, per `(source, project, tier, date)`; see
+    /// `census_readmit_declined` in `plan_rollup_backfill`.
+    census_admitted: Arc<dashmap::DashMap<(String, String, String, chrono::NaiveDate), u64>>,
     /// `heavy_query_queue_timeout` as of the last starvation check, per consumer:
     /// the census and the heavy claim path each track their own last-seen so one
     /// does not eat the other's delta.
@@ -3234,6 +3237,7 @@ impl Database {
             hygiene_gate: Arc::new(HygieneGate::default()),
             maintenance_quiesced: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             backfill_flush_stalls_seen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            census_admitted: Arc::new(dashmap::DashMap::new()),
             census_query_timeouts_seen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             claims_query_timeouts_seen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             hot_packing_sem: Arc::new(tokio::sync::Semaphore::new(hot_packing_permits)),

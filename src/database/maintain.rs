@@ -2,9 +2,12 @@
 //! hot-tail packing/repair passes, vacuum, checkpoint/reconcile, shutdown.
 use super::*;
 use anyhow::Context;
+use std::hash::BuildHasher;
 use tap::Tap;
 
 const ROLLUP_PROOF_RETRY_MICROS: i64 = 1_000_000;
+/// Census re-admissions declined as a finished no-op; OTel only, no stats row.
+pub(crate) const CENSUS_READMIT_DECLINED: &str = "timefusion.rollup.census_readmit_declined";
 
 #[derive(Clone, Copy)]
 pub(crate) enum TaskSelection<'a> {
@@ -1905,6 +1908,9 @@ impl Database {
             // answers "can a query READ it", and the enqueue decision needs the latter.
             let mut readable_per_tier: Vec<(usize, HashSet<(String, chrono::NaiveDate)>)> = Vec::new();
             let mut ranges_per_tier = HashMap::new();
+            // Every enabled tier's live file set per cell, order-free: a derived tier's
+            // input is its parent's files, so any tier moving re-admits the whole cell.
+            let mut tier_files: HashMap<BackfillCell, u64> = HashMap::new();
 
             // A day must be covered by EVERY declared tier: a 30d panel reads the
             // coarse tier, so a hole there refuses it however complete 1m is.
@@ -1913,6 +1919,15 @@ impl Database {
                 let Ok(target_ref) = self.resolve_table(&storage_project, &target).await else { continue };
                 let (covered, tier_created_ms, ranges) = {
                     let table = target_ref.read().await;
+                    for file in table.snapshot()?.log_data().iter() {
+                        let add = add_action(&file);
+                        if let Some((project, date)) = Self::maintenance_partition_from_action(&add.path, Some(&add.partition_values), default_project)
+                            && let Ok(date) = date.parse::<chrono::NaiveDate>()
+                        {
+                            let path = fnv::FnvBuildHasher::default().hash_one(&add.path);
+                            tier_files.entry((project, date)).and_modify(|held| *held = held.wrapping_add(path)).or_insert(path);
+                        }
+                    }
                     (
                         Self::maintenance_table_partitions(&table, default_project)?,
                         table.snapshot().ok().and_then(|state| state.snapshot().metadata().created_time()),
@@ -2051,6 +2066,36 @@ impl Database {
                     })
                     .collect()
             };
+            // A tier whose last admission finished yet left the hole standing, under the
+            // same source fingerprint, epoch, tier files and coverage, would rebuild the
+            // same output and leave the same hole: re-admitting it is a loop, not work.
+            // Anything that could fill the hole moves one of those inputs, and queued
+            // work never reaches here, so only a finished no-op is declined.
+            let admitted_key =
+                |(project, date): &BackfillCell, index: usize| (source.clone(), project.clone(), schema.rollups[index].table_name(&source), *date);
+            let admitted_fp = |cell: &BackfillCell, index: usize| {
+                let (project, date) = (cell.0.clone(), cell.1.to_string());
+                let source_fp = source_stats
+                    .get(&(project.clone(), date.clone()))
+                    .or_else(|| source_stats.get(&("default".to_owned(), date.clone())))
+                    .map(|stats| stats.fingerprint);
+                let epoch = source_epochs.get(&(project, source.clone(), date)).copied();
+                let covered = ranges_per_tier.get(&index).and_then(|ranges| ranges.get(cell));
+                fnv::FnvBuildHasher::default().hash_one((source_fp, epoch, tier_files.get(cell), covered))
+            };
+            let mut readmit_declined = 0u64;
+            for (cell, missing) in missing_tiers.iter_mut().filter(|(cell, _)| !damage_forced.contains(*cell)) {
+                missing.retain(|index| {
+                    let key = admitted_key(cell, *index);
+                    let declined = !queued_tables.contains(&(cell.0.clone(), cell.1, key.2.clone()))
+                        && self.census_admitted.get(&key).is_some_and(|held| *held == admitted_fp(cell, *index));
+                    readmit_declined += u64::from(declined);
+                    !declined
+                });
+            }
+            if !defer_enqueue {
+                metrics::counter!(CENSUS_READMIT_DECLINED).increment(readmit_declined);
+            }
             // A cell is still wanted while ANY of its missing tiers is unqueued;
             // the per-table tests at the enqueue sites decide which to mint.
             want.retain(|(project_id, date)| {
@@ -2162,8 +2207,13 @@ impl Database {
                         if queued_tables.contains(&(project_id.clone(), *date, physical_table.clone())) {
                             continue;
                         }
+                        let mut tier_refused = false;
                         for &(start, end) in &holes[&index] {
-                            refused |= !enqueue(physical_table.clone(), TimeSlice::new(start, end)?, operation);
+                            tier_refused |= !enqueue(physical_table.clone(), TimeSlice::new(start, end)?, operation);
+                        }
+                        refused |= tier_refused;
+                        if !holes[&index].is_empty() && !tier_refused {
+                            self.census_admitted.insert(admitted_key(&cell, index), admitted_fp(&cell, index));
                         }
                     }
                     if refused && damage_admitted.contains(&(project_id.clone(), *date)) {
@@ -2210,6 +2260,9 @@ impl Database {
                 let key = (project.clone(), source.clone(), date.clone());
                 !ranges.is_empty() && source_epochs.get(&key).copied().unwrap_or(0) == self.rollup_source_epochs.get(&key).map_or(0, |epoch| *epoch.value())
             });
+            // Across every storage table at once: a custom-project table shares its source name.
+            self.census_admitted
+                .retain(|(source, project, tier, date), _| all_tier_holes.contains(&(source.clone(), project.clone(), tier.clone(), date.to_string())));
             let mut journal = self.journal();
             journal.set_base_tier_ready(all_base_tier_ready);
             journal.set_tier_holes(all_tier_holes);
@@ -10713,6 +10766,84 @@ mod rollup_noop_skip_tests {
                 && task.key.slice.end_micros > day
         });
         assert!(!reminted, "a readable day must not be re-minted");
+        Ok(())
+    }
+
+    /// Every active task of `project`, then completes them: the fate of a unit that
+    /// finishes without filling its hole, and fixture isolation from insert-minted work.
+    fn finish_active(db: &Database, project: &str) -> Vec<crate::maintenance_coordinator::TaskKey> {
+        let mut journal = db.journal();
+        let active: Vec<_> = journal.tasks().filter(|task| task.key.project_id == project && task.state.is_active()).map(|task| task.key.clone()).collect();
+        active.iter().for_each(|key| assert!(journal.complete(key)));
+        active
+    }
+
+    /// Prod 2026-09-27: four cells were re-minted every census pass (75% of BaseRollup
+    /// journal entries) by units that finished without filling their hole. Under
+    /// unchanged inputs the census must decline; a source write must re-admit.
+    #[serial]
+    #[tokio::test]
+    async fn a_finished_noop_admission_is_readmitted_only_after_its_source_moves() -> Result<()> {
+        crate::observability::init_local_metrics_for_test();
+        let (db, project, date) = rollup_db("census_readmit").await?;
+        db.preload_replay_complete.store(true, std::sync::atomic::Ordering::Release);
+        let tier_admitted = |keys: Vec<crate::maintenance_coordinator::TaskKey>| keys.iter().any(|key| key.physical_table == TIER);
+        let declined = || crate::observability::counter_value(CENSUS_READMIT_DECLINED);
+        insert_span(&db, &project, date, 3, "early", "op").await?;
+        finish_active(&db, &project);
+        db.plan_rollup_backfill().await?;
+        assert!(tier_admitted(finish_active(&db, &project)), "the hole is admitted once");
+
+        let before = declined();
+        db.plan_rollup_backfill().await?;
+        assert!(finish_active(&db, &project).is_empty(), "unchanged inputs must mint nothing for the cell");
+        assert!(declined() > before, "the decline must be counted");
+
+        insert_span(&db, &project, date, 20, "late", "op").await?;
+        finish_active(&db, &project);
+        let before = declined();
+        db.plan_rollup_backfill().await?;
+        assert!(tier_admitted(finish_active(&db, &project)), "a moved source must re-admit the cell");
+        assert_eq!(declined(), before, "nor count a decline for it");
+        Ok(())
+    }
+
+    /// Prod 2026-09-27: journal hygiene pruned a Complete slice once its END passed
+    /// now - 31 d, while the census still wanted the whole edge day. After a restart the
+    /// replay could not prove 08-27 00-12h, and the census re-minted it every pass.
+    #[serial]
+    #[tokio::test]
+    async fn the_edge_day_keeps_its_proof_until_the_census_drops_it() -> Result<()> {
+        let tomorrow = crate::support::today_utc() + chrono::Duration::days(1);
+        crate::support::set_micros(day_start_micros(tomorrow).expect("valid day") + 20 * 3_600_000_000);
+        let mut cfg = (*rollup_cfg("edge_day_proof")).clone();
+        cfg.maintenance.timefusion_rollup_backfill_days = 31;
+        let cfg = Arc::new(cfg);
+        let project = format!("edge_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+        let date = crate::support::today_utc() - chrono::Duration::days(31);
+        {
+            let db = Arc::new(Database::with_config(Arc::clone(&cfg)).await?);
+            insert_span(&db, &project, date, 3, "early", "op").await?;
+            insert_span(&db, &project, date, 20, "late", "op").await?;
+            finish_active(&db, &project);
+            for offset in [0, 12] {
+                let report = db.run_unit_once("otel_logs_and_spans", &project, date, Operation::BaseRollup, 12, offset).await?;
+                assert_eq!(report.state, Some(TaskState::Complete), "the {offset}h half publishes");
+            }
+            let mut journal = db.journal();
+            journal.prune_retired_history(crate::support::now_micros());
+            journal.checkpoint()?;
+        }
+        let db = Arc::new(Database::with_config(cfg).await?);
+        db.recover_rollup_coverage("otel_logs_and_spans").await?;
+        db.preload_replay_complete.store(true, std::sync::atomic::Ordering::Release);
+        let published = tier_version(&db).await;
+        db.plan_rollup_backfill().await?;
+        let reminted: Vec<_> =
+            db.journal().tasks().filter(|task| task.key.physical_table == TIER && task.state.is_active()).map(|task| task.key.slice).collect();
+        assert!(reminted.is_empty(), "the edge day is still proven, so nothing is re-minted: {reminted:?}");
+        advance_and_drain(&db).await?;
+        assert_eq!(tier_version(&db).await, published, "and the tier is not rewritten");
         Ok(())
     }
 

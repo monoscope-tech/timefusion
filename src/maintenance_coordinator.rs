@@ -2620,10 +2620,11 @@ impl TaskJournal {
         // back.
         self.rebuild_claimable();
         crate::observability::maintenance_stats().claimable_tasks.store(self.claimable_len() as u64, std::sync::atomic::Ordering::Relaxed);
-        let dropped = self.retain_tasks(|task| {
-            !matches!(task.state, TaskState::Complete | TaskState::Superseded)
-                || now_micros.saturating_sub(task.key.slice.end_micros) <= STARVATION_HORIZON_MICROS
-        });
+        // Day-aligned like the backfill census, which still wants the WHOLE edge day: an
+        // instant cutoff drops the edge day's early Complete slices while the census still
+        // enumerates the day, and the coverage replay needs those records to prove them.
+        let cutoff = now_micros.div_euclid(DAY_MICROS).saturating_mul(DAY_MICROS).saturating_sub(STARVATION_HORIZON_MICROS);
+        let dropped = self.retain_tasks(|task| !matches!(task.state, TaskState::Complete | TaskState::Superseded) || task.key.slice.end_micros > cutoff);
         if dropped != 0 {
             crate::observability::maintenance_stats().journal_retired_tasks_pruned.fetch_add(dropped as u64, std::sync::atomic::Ordering::Relaxed);
         }
