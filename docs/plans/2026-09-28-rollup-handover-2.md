@@ -100,8 +100,8 @@ All shipped with CI green on the exact commit. Names match the workstream sheet.
 ## 7. Tools and locations
 
 - Prod pgwire: `grep TIMEFUSION_PG_URL ../monoscope/.env`. Host: `ssh ubuntu@captain.s.past3.tech`, service `srv-captain--timefusion`.
-- Probe script (18 shapes × 3 projects, with rollup counter deltas): `/private/tmp/claude-501/-Users-tonyalaribe-Projects-apitoolkit-timefusion/b143aa08-537f-4b4f-ac75-4672e7af6a39/scratchpad/probe.sh`.
-- Scorecard and gated push: `…/ca5458e8-fb13-4404-be05-f6ba3c85c244/scratchpad/{scorecard.sh,gated_push.sh,gated_push_b.sh}`. Usage: `gated_push.sh <branch> <worktree> "YYYY-MM-DD HH:MM"`; the `_b` variant reads CI from `$CIB`. These are in `/private/tmp`, which does not survive a reboot. Copy them if you rely on them.
+- Probe script (18 shapes × 3 projects, with rollup counter deltas): `~/Projects/apitoolkit/tf-ops-scripts/probe.sh`.
+- Scorecard and gated push: `~/Projects/apitoolkit/tf-ops-scripts/{scorecard.sh,gated_push.sh,gated_push_b.sh}` (outside the repo; `scorecard.log` holds past readings). Usage: `gated_push.sh <branch> <worktree> "YYYY-MM-DD HH:MM"`; the `_b` variant reads CI from `$CIB`.
 - Collaborating sessions:
   - timefusion-2e: certification, read path, W47, W46.
   - timefusion-7c: pricing, waiter, W29, drop-v3, v4 fallback.
