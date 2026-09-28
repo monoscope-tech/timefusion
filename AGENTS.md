@@ -5,6 +5,10 @@ Use `make ci-signoff` to run checks and publish passing results for GitHub to re
 For a limited change, use `make ci-signoff CHECKS="..."` with the relevant checks from `ci/checks.tsv`.
 The final status output lists every check that still needs GitHub.
 
+**Use local signoff as much as possible, not remote CI.** Local runs are fast; remote CI is slow and is not a feedback loop.
+Gate every master push (which is a deploy) on `make ci-signoff` for the exact tree being pushed.
+Dispatch remote CI only for checks that cannot run locally, and do not wait on it when a local signoff already covers the change.
+
 Record the local commands, results, and outstanding checks in the PR description.
 If a required service or tool is unavailable, record that limitation and let GitHub run the affected checks.
 Never publish an attestation for a check that did not pass.
