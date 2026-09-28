@@ -1715,6 +1715,8 @@ impl TableProvider for ProjectRoutingTable {
                 // certified side carries every row (file-level pruning removes the uncertified
                 // dates' files entirely). Everything below indexes `plans[0]`, so without this
                 // the scan panics. The certified legs need no dedup, only the projection debt.
+                let shape = ScanShape { partial_skip: !skip_legs.is_empty(), ..*scan_state.lock() };
+                scan_metrics.record_scan(scan_start.elapsed().as_micros() as u64, shape, skip_verdict);
                 if legs.is_empty() && !skip_legs.is_empty() {
                     return finish(union_or_single(skip_legs.into_iter().map(&pay_projection).collect::<DFResult<Vec<_>>>()?)?);
                 }
@@ -1726,9 +1728,6 @@ impl TableProvider for ProjectRoutingTable {
                         false => plan,
                     })
                     .collect();
-                let shape = *scan_state.lock();
-                let us = scan_start.elapsed().as_micros() as u64;
-                scan_metrics.record_scan(us, shape, skip_verdict);
                 let dedup_on = !dedup_keys.is_empty() && !shape.skip_dedup;
                 let mut plans = legs;
                 // Merge-on-read prerequisite: keep-greatest only engages while the input still

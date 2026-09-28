@@ -153,6 +153,8 @@ pub(crate) struct ScanShape {
     fast_resolve_hit: Option<bool>,
     /// Read-side dedup skip engaged (all window partitions sweep-verified clean).
     skip_dedup: bool,
+    /// The per-date or per-file skip took part of the window around `DedupExec`.
+    partial_skip: bool,
 }
 
 /// Why the swept-partition dedup skip was granted or refused, decided once per scan.
@@ -171,6 +173,9 @@ pub enum DedupSkipVerdict {
     NeverCertified,
     /// Some in-window partition was certified and has been committed to since.
     FpMoved,
+    /// Some in-window partition holds only slice-scoped evidence, which proves
+    /// windows but never the day, and no partition moved.
+    SliceOnly,
 }
 
 impl DedupSkipVerdict {
@@ -223,6 +228,7 @@ pub mod scan_metric_names {
         DEDUP_DENIED_BY_LEG = "timefusion.scan.dedup_denied_by_leg" as scan.dedup_denied_by_leg;
         DEDUP_DENIED_NEVER_CERTIFIED = "timefusion.scan.dedup_denied_never_certified" as scan.dedup_denied_never_certified;
         DEDUP_DENIED_FP_MOVED = "timefusion.scan.dedup_denied_fp_moved" as scan.dedup_denied_fp_moved;
+        DEDUP_DENIED_SLICE_ONLY = "timefusion.scan.dedup_denied_slice_only" as scan.dedup_denied_slice_only;
         DEDUP_DENIED_NO_WINDOW = "timefusion.scan.dedup_denied_no_window" as scan.dedup_denied_no_window;
         DEDUP_DENIED_UNRESOLVED = "timefusion.scan.dedup_denied_unresolved" as scan.dedup_denied_unresolved;
         DEDUP_DENIED_DISABLED = "timefusion.scan.dedup_denied_disabled" as scan.dedup_denied_disabled;
@@ -234,6 +240,9 @@ pub mod scan_metric_names {
         /// Scans where the per-FILE skip fired: some files of an UNCERTIFIED date
         /// were proved clean and isolated, so they bypassed DedupExec.
         DEDUP_SKIPPED_PER_FILE = "timefusion.scan.dedup_skipped_per_file" as scan.dedup_skipped_per_file;
+        /// Scans where the per-date or per-file skip fired. Counted instead of a
+        /// denial: part of the window did skip `DedupExec`.
+        DEDUP_PARTIAL_SKIPPED = "timefusion.scan.dedup_partial_skipped" as scan.dedup_partial_skipped;
         // The single-provider fast path needs `raw.is_empty() && !bloom_pruned &&
         // date_restrict.is_none()`; the three `split_*` counters say which
         // conjunct refused it.
@@ -608,13 +617,15 @@ impl ScanMetrics {
     /// one that was.
     pub(crate) fn record_scan(&self, duration_us: u64, shape: ScanShape, verdict: DedupSkipVerdict) {
         use scan_metric_names::*;
-        let ScanShape { skipped_delta, has_mem, has_delta, fast_resolve_hit, skip_dedup: dedup_skip } = shape;
+        let ScanShape { skipped_delta, has_mem, has_delta, fast_resolve_hit, skip_dedup: dedup_skip, partial_skip } = shape;
         metrics::counter!(SCANS_TOTAL).increment(1);
         // Counted only where a Delta leg was actually read.
         if has_delta {
             metrics::counter!(DEDUP_ELIGIBLE_SCANS).increment(1);
             if dedup_skip {
                 metrics::counter!(DEDUP_SKIPPED).increment(1);
+            } else if partial_skip {
+                metrics::counter!(DEDUP_PARTIAL_SKIPPED).increment(1);
             } else if verdict.granted() {
                 metrics::counter!(DEDUP_DENIED_BY_LEG).increment(1);
             } else {
@@ -622,6 +633,7 @@ impl ScanMetrics {
                 let name = match verdict {
                     DedupSkipVerdict::NeverCertified => DEDUP_DENIED_NEVER_CERTIFIED,
                     DedupSkipVerdict::FpMoved => DEDUP_DENIED_FP_MOVED,
+                    DedupSkipVerdict::SliceOnly => DEDUP_DENIED_SLICE_ONLY,
                     DedupSkipVerdict::NoWindow => DEDUP_DENIED_NO_WINDOW,
                     DedupSkipVerdict::Unresolved => DEDUP_DENIED_UNRESOLVED,
                     // `Granted` is excluded by the branch above; it shares an arm

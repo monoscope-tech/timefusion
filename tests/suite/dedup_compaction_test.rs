@@ -2129,8 +2129,8 @@ async fn delta_row_count(db: &Arc<Database>, sql: &str) -> Result<usize> {
 /// bare count is answered by `count_pushdown` from Delta statistics without ever
 /// building a scan, so it exercises neither `DedupExec` nor the skip.
 async fn dedup_skip_parity_arm(
-    tag: &'static str, configure: impl FnOnce(&mut timefusion::config::AppConfig), duplicated: usize, unique: usize, churn: usize, metric: &'static str,
-) -> Result<(i64, u64)> {
+    tag: &'static str, configure: impl FnOnce(&mut timefusion::config::AppConfig), duplicated: usize, unique: usize, churn: usize, metrics: &[&'static str],
+) -> Result<(i64, Vec<u64>)> {
     // A second apart, so the churn batch's file span cannot touch the certified
     // band's; overlapping bands would (correctly) refuse the skip.
     const CHURN_OFFSET: i64 = 1_000_000;
@@ -2163,9 +2163,9 @@ async fn dedup_skip_parity_arm(
     // Warm the fast-resolve cache: `pre_skip_dedup` consults `try_fast_resolve`
     // and a miss declines outright, so a cold first query never reaches the skip.
     db.query_delta_only(&sql).await?;
-    let before = counter_value(metric);
+    let before: Vec<_> = metrics.iter().map(|metric| counter_value(metric)).collect();
     let rows = delta_row_count(&db, &sql).await? as i64;
-    Ok((rows, counter_value(metric) - before))
+    Ok((rows, metrics.iter().zip(before).map(|(metric, before)| counter_value(metric) - before).collect()))
 }
 
 /// The same chart wrapped in a derived table ROUTES, and answers what raw does.
@@ -2684,11 +2684,14 @@ async fn count_is_identical_with_and_without_the_per_file_dedup_skip() -> Result
             DUPLICATED,
             UNIQUE,
             CHURN,
-            scan_metric_names::DEDUP_SKIPPED_PER_FILE,
+            &[scan_metric_names::DEDUP_SKIPPED_PER_FILE, scan_metric_names::DEDUP_PARTIAL_SKIPPED, scan_metric_names::DEDUP_DENIED_UNCERTIFIED],
         )
     };
-    let (authoritative, control_skips) = arm(false, "per_file_parity_off").await?;
-    let (with_skip, skips) = arm(true, "per_file_parity_on").await?;
+    let (authoritative, control) = arm(false, "per_file_parity_off").await?;
+    let (with_skip, on) = arm(true, "per_file_parity_on").await?;
+    let (control_skips, skips) = (control[0], on[0]);
+    // A partly skipped window is not a denial, or the denial counters over-report.
+    assert_eq!((on[1], on[2]), (skips, 0), "every per-file skip counts as a partial skip, never as an uncertified denial");
 
     assert_eq!(authoritative, (DUPLICATED + UNIQUE + CHURN) as i64, "the control itself must be right: every key counted exactly once");
     assert_eq!(control_skips, 0, "the control must run with the per-file skip genuinely off");
@@ -2716,10 +2719,17 @@ async fn count_is_identical_with_and_without_the_dedup_skip() -> Result<()> {
 
     // One dataset, two engines: skip disabled (the authority) and enabled.
     let arm = |skip: bool, tag: &'static str| {
-        dedup_skip_parity_arm(tag, move |cfg| cfg.maintenance.timefusion_read_dedup_skip_swept = skip, DUPLICATED, UNIQUE, 0, scan_metric_names::DEDUP_SKIPPED)
+        dedup_skip_parity_arm(
+            tag,
+            move |cfg| cfg.maintenance.timefusion_read_dedup_skip_swept = skip,
+            DUPLICATED,
+            UNIQUE,
+            0,
+            &[scan_metric_names::DEDUP_SKIPPED],
+        )
     };
-    let (authoritative, control_skips) = arm(false, "count_parity_dedup_on").await?;
-    let (skipped, skips) = arm(true, "count_parity_skip_on").await?;
+    let (authoritative, control_skips) = arm(false, "count_parity_dedup_on").await.map(|(rows, skips)| (rows, skips[0]))?;
+    let (skipped, skips) = arm(true, "count_parity_skip_on").await.map(|(rows, skips)| (rows, skips[0]))?;
 
     assert_eq!(authoritative, (DUPLICATED + UNIQUE) as i64, "the control itself must be right: every key counted exactly once");
     assert_eq!(control_skips, 0, "the control must run with the skip genuinely off");

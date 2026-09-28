@@ -6235,7 +6235,7 @@ impl Database {
         let mut certified_dates: HashSet<String> = HashSet::new();
         let Some(dates) = window_dates(lo, hi) else { return (DedupSkipVerdict::NoWindow, certified_dates) };
         let mut verdict = DedupSkipVerdict::Granted;
-        let mut saw_fp_moved = false;
+        let (mut saw_fp_moved, mut saw_slice_only) = (false, false);
         // Did any partition actually produce evidence? `Granted` is the loop's seed and
         // every `continue` leaves it untouched, so without this a window where EVERY
         // date is skipped would grant from an absence of evidence — and the skip it
@@ -6342,12 +6342,16 @@ impl Database {
                         }
                         true => {}
                     }
+                    // `certify_files_within_slice` evidence never had a day fingerprint to move.
+                    let slice_only = cert.stale && cert.fp == 0;
                     if crate::observability::sample_rollup_miss("dedup_skip_denied_fp_moved") {
                         let (added, dv_changed, removed) = visibility_moves(&cert.files, &visibility);
                         let date_age_days = (crate::support::today_utc() - date).num_days();
-                        info!(table_name, project_id = %fp_key.0, %date, date_age_days, reason = "fp_moved", added, dv_changed, removed, stale = cert.stale, event = "dedup_skip_denied");
+                        let reason = if slice_only { "slice_only" } else { "fp_moved" };
+                        info!(table_name, project_id = %fp_key.0, %date, date_age_days, reason, added, dv_changed, removed, stale = cert.stale, event = "dedup_skip_denied");
                     }
-                    saw_fp_moved = true;
+                    saw_slice_only |= slice_only;
+                    saw_fp_moved |= !slice_only;
                 }
                 None => {
                     if crate::observability::sample_rollup_miss("dedup_skip_denied_never_certified") {
@@ -6365,6 +6369,9 @@ impl Database {
         // never-certified.
         if saw_fp_moved {
             return (DedupSkipVerdict::FpMoved, certified_dates);
+        }
+        if saw_slice_only {
+            return (DedupSkipVerdict::SliceOnly, certified_dates);
         }
         match certified_any {
             true => (verdict, certified_dates),

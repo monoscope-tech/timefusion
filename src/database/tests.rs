@@ -8880,6 +8880,21 @@ async fn a_probe_declined_sealed_date_is_deduped_then_certified() -> Result<()> 
     Ok(())
 }
 
+/// Slice-scoped evidence (`certify_files_within_slice`: `fp: 0`, stale) never had a
+/// day fingerprint, so a window it cannot prove is denied as slice-only, not fp-moved.
+#[tokio::test]
+async fn slice_only_evidence_is_denied_as_slice_only_not_fp_moved() -> Result<()> {
+    let (db, project) = dirty_bin_db("slice-only-label").await?;
+    let (day, base) = sealed_noon();
+    insert_otel_ts(&db, &project, "only", "only", base, true).await?;
+    let table = otel_unified_table(&db).await;
+    let files = Database::logical_count_partition_snapshot(&*table.read().await, &project, &day.to_string())?.1;
+    let key = (project.clone(), "otel_logs_and_spans".to_owned(), day.to_string());
+    db.dedup_clean_fp.insert(key, Certification { fp: 0, since: std::time::Instant::now(), files: Arc::new(files), stale: true });
+    assert_eq!(db.dedup_window_clean(&*table.read().await, &project, "otel_logs_and_spans", (base, base)), DedupSkipVerdict::SliceOnly);
+    Ok(())
+}
+
 /// Tier duplicates are legitimate sub-grain partial states the tier read collapses, and
 /// nothing reads a tier's certification, so the certification pass must not probe tiers.
 #[tokio::test]
