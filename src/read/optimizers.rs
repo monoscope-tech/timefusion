@@ -1605,11 +1605,12 @@ fn resolve_ordering(req: &LexOrdering, schema: &Schema) -> Option<LexOrdering> {
 }
 
 /// A node whose rows are consumed positionally below it (deletion-vector masks, retained row
-/// ordinals): it forbids sort pushdown AND needs its input as one physical stream. Sorting any
-/// leg beneath it would misalign those positions.
+/// ordinals). Sorting any leg beneath it would misalign those positions. A DV scan keeps one
+/// stream per file group, so it no longer shows up as a single-partition requirement.
 fn is_positional_boundary(plan: &Arc<dyn ExecutionPlan>) -> bool {
-    !plan.supports_sort_pushdown()
-        && matches!(plan.input_distribution_requirements().child_distribution(0), Some(datafusion::physical_expr::Distribution::SinglePartition))
+    downcast::<deltalake::delta_datafusion::DeltaScanExec>(plan.as_ref()).is_some_and(|scan| scan.consumes_row_positions())
+        || (!plan.supports_sort_pushdown()
+            && matches!(plan.input_distribution_requirements().child_distribution(0), Some(datafusion::physical_expr::Distribution::SinglePartition)))
 }
 
 /// `children` with every child that does not already satisfy `req` wrapped in

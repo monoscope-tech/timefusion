@@ -37,6 +37,37 @@ fn scan_metric(plan: &str, name: &str) -> Option<i64> {
     plan[i + name.len()..].split(|c: char| !c.is_ascii_digit()).find(|s| !s.is_empty())?.parse().ok()
 }
 
+/// A past partition, so `dedup_partition` clears its sealed-chunk guard.
+const PAST: i64 = 1_735_689_600_000_000;
+
+/// Insert span `r-{idx}` at `PAST + idx` seconds; every tenth is a server span.
+async fn insert_past_span(client: &tokio_postgres::Client, idx: i64, name: &str) -> Result<u64, tokio_postgres::Error> {
+    let dt = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(PAST + idx * SEC).unwrap();
+    let kind = if idx % 10 == 0 { "server" } else { "internal" };
+    client
+        .execute(
+            &format!(
+                "INSERT INTO otel_logs_and_spans (project_id, date, timestamp, id, name, kind, status_code, status_message, level, hashes, summary) \
+                 VALUES ('e2e_project', '{}', '{}', $1, $2, $3, 'OK', 'm', 'INFO', ARRAY[]::text[], $4)",
+                dt.date_naive(),
+                dt.format("%Y-%m-%d %H:%M:%S%.f"),
+            ),
+            &[&format!("r-{idx:04}"), &name, &kind, &vec!["s"]],
+        )
+        .await
+}
+
+/// Dedup the `PAST` partition, expecting exactly one masked row; returns (files, DV-bearing files).
+async fn dedup_past_partition(env: &E2eEnv) -> anyhow::Result<(usize, usize)> {
+    let table_ref = env.db().resolve_table("e2e_project", "otel_logs_and_spans").await?;
+    let date = chrono::DateTime::from_timestamp_micros(PAST).unwrap().date_naive();
+    let (dropped, _) = env.db().dedup_partition(&table_ref, "otel_logs_and_spans", "e2e_project", date).await?;
+    assert_eq!(dropped, 1);
+    let t = table_ref.read().await;
+    let files: Vec<_> = t.snapshot()?.snapshot().log_data().iter().map(|f| f.deletion_vector_descriptor().is_some()).collect();
+    Ok((files.len(), files.iter().filter(|d| **d).count()))
+}
+
 async fn explain_analyze(client: &tokio_postgres::Client, sql: &str) -> anyhow::Result<String> {
     flat_rows(client, &format!("EXPLAIN ANALYZE {sql}")).await
 }
@@ -141,23 +172,7 @@ async fn dv_bearing_file_keeps_parquet_pushdown_on_its_siblings() -> anyhow::Res
     env.db().cancel_maintenance();
     let client = env.pg_client().await?;
 
-    // A past partition, so `dedup_partition` clears its sealed-chunk guard.
-    let past = 1_735_689_600_000_000i64;
-    let insert = async |idx: i64, name: &str| {
-        let dt = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(past + idx * SEC).unwrap();
-        let kind = if idx % 10 == 0 { "server" } else { "internal" };
-        client
-            .execute(
-                &format!(
-                    "INSERT INTO otel_logs_and_spans (project_id, date, timestamp, id, name, kind, status_code, status_message, level, hashes, summary) \
-                     VALUES ('e2e_project', '{}', '{}', $1, $2, $3, 'OK', 'm', 'INFO', ARRAY[]::text[], $4)",
-                    dt.date_naive(),
-                    dt.format("%Y-%m-%d %H:%M:%S%.f"),
-                ),
-                &[&format!("r-{idx:04}"), &name, &kind, &vec!["s"]],
-            )
-            .await
-    };
+    let insert = async |idx: i64, name: &str| insert_past_span(&client, idx, name).await;
     // Two files of 100 rows; the first also holds a same-key, different-content copy of
     // a row in the second, which dedup then masks with a deletion vector.
     for idx in 0..100 {
@@ -170,22 +185,14 @@ async fn dv_bearing_file_keeps_parquet_pushdown_on_its_siblings() -> anyhow::Res
     }
     env.force_flush().await?;
 
-    let table_ref = env.db().resolve_table("e2e_project", "otel_logs_and_spans").await?;
-    let date = chrono::DateTime::from_timestamp_micros(past).unwrap().date_naive();
-    let (dropped, _) = env.db().dedup_partition(&table_ref, "otel_logs_and_spans", "e2e_project", date).await?;
-    assert_eq!(dropped, 1);
-    let (files, dv_files) = {
-        let t = table_ref.read().await;
-        let files: Vec<_> = t.snapshot()?.snapshot().log_data().iter().map(|f| f.deletion_vector_descriptor().is_some()).collect();
-        (files.len(), files.iter().filter(|d| **d).count())
-    };
+    let (files, dv_files) = dedup_past_partition(&env).await?;
     assert!(files >= 2 && dv_files == 1, "fixture needs one DV-bearing file among DV-free ones: {dv_files}/{files}");
 
     let sql = format!(
         "SELECT time_bucket('10 minutes', timestamp) AS b, COUNT(*) FROM otel_logs_and_spans \
          WHERE project_id = 'e2e_project' AND (kind = 'server' OR name = 'apitoolkit-http-span' OR name = 'monoscope.http') \
          AND timestamp >= '{}' GROUP BY 1",
-        ts(past + 50 * SEC)
+        ts(PAST + 50 * SEC)
     );
     let total: i64 = client.query(&sql, &[]).await?.iter().map(|r| r.get::<_, i64>(1)).sum();
     assert_eq!(total, 15, "server spans at idx 50,60,..,190");
@@ -205,5 +212,69 @@ async fn dv_bearing_file_keeps_parquet_pushdown_on_its_siblings() -> anyhow::Res
     // declared ordering or DedupExec falls to full-set.
     let dedup_line = plan.lines().find(|l| l.contains("DedupExec")).unwrap_or_default();
     assert!(dedup_line.contains("bounded["), "DedupExec fell to full-set over the split DV leg.\nplan:\n{plan}");
+    Ok(())
+}
+
+/// One DV-masked file used to force the whole Delta leg into ONE stream: a merge sat below
+/// `DeltaScanExec`, so the transform, casts and filters ran on one core, and because the merge
+/// interleaves overlapping files the per-file mask split shredded every batch (prod 2026-09-28:
+/// 2.57K parquet batches became 332.5K, ~14 rows each, ~7s of an 8.4s 6h query). Masks are
+/// positional per file, so each whole file masks correctly in whichever partition owns it.
+#[serial_test::serial]
+#[tokio::test(flavor = "multi_thread")]
+async fn dv_masked_scan_keeps_one_stream_per_file_group() -> anyhow::Result<()> {
+    const FILES: i64 = 4;
+    const PER_FILE: i64 = 100;
+    let env = hot_partition_builder().with_deletion_vectors().with_flush_interval(Duration::from_secs(3600)).with_tantivy_prefilter(false).start().await?;
+    env.db().cancel_maintenance();
+    let client = env.pg_client().await?;
+
+    // Round-robin timestamps across files so every file overlaps every other: an ordered merge
+    // over them alternates files row by row. File 0 also holds a changed copy of `r-0001`
+    // (file 1), which dedup masks with a deletion vector.
+    for f in 0..FILES {
+        for k in 0..PER_FILE {
+            insert_past_span(&client, k * FILES + f, "span").await?;
+        }
+        if f == 0 {
+            insert_past_span(&client, 1, "span-v2").await?;
+        }
+        env.force_flush().await?;
+    }
+    let (files, dv_files) = dedup_past_partition(&env).await?;
+    assert!(files >= FILES as usize && dv_files == 1, "fixture needs one DV-bearing file among DV-free ones: {dv_files}/{files}");
+
+    let sql = format!(
+        "SELECT time_bucket('10 minutes', timestamp) AS b, COUNT(*) FROM otel_logs_and_spans \
+         WHERE project_id = 'e2e_project' AND timestamp >= '{}' GROUP BY 1",
+        ts(PAST)
+    );
+    let count = async || -> anyhow::Result<i64> { Ok(client.query(&sql, &[]).await?.iter().map(|r| r.get::<_, i64>(1)).sum()) };
+    assert_eq!(count().await?, FILES * PER_FILE, "the masked copy of r-0001 must not be counted");
+
+    let plan = explain_analyze(&client, &sql).await?;
+    let lines: Vec<&str> = plan.lines().collect();
+    let delta = lines.iter().position(|l| l.contains("DeltaScanExec")).unwrap_or_else(|| panic!("no Delta leg.\nplan:\n{plan}"));
+    assert!(
+        !["SortPreservingMergeExec", "CoalescePartitionsExec"].iter().any(|m| lines[delta + 1].contains(m)),
+        "the DV-masked Delta leg is merged into one stream below DeltaScanExec.\nplan:\n{plan}"
+    );
+    // Cost: each parquet batch comes from one file, so masking may split it at most once.
+    let source_batches: i64 =
+        lines.iter().filter(|l| l.contains("DataSourceExec") && l.contains("file_type=parquet")).filter_map(|l| scan_metric(l, "output_batches=")).sum();
+    let delta_batches = scan_metric(lines[delta], "output_batches=").unwrap_or(i64::MAX);
+    assert!(
+        source_batches > 0 && delta_batches <= 2 * source_batches,
+        "DeltaScanExec emitted {delta_batches} batches from {source_batches} parquet batches — files were interleaved before masking.\nplan:\n{plan}"
+    );
+    let dedup_line = lines.iter().find(|l| l.contains("DedupExec")).copied().unwrap_or_default();
+    assert!(dedup_line.contains("bounded["), "DedupExec fell to full-set over the per-group DV leg.\nplan:\n{plan}");
+
+    // Invite byte-range splitting of every file, the masked one included: a mask is positional
+    // over the whole file, so it must still hide exactly the one stale row.
+    client.batch_execute("SET datafusion.optimizer.repartition_file_min_size = 1").await?;
+    assert_eq!(count().await?, FILES * PER_FILE, "a split DV-masked file re-exposed or hid rows");
+    let stale: i64 = client.query_one("SELECT count(*) FROM otel_logs_and_spans WHERE project_id = 'e2e_project' AND id = 'r-0001'", &[]).await?.get(0);
+    assert_eq!(stale, 1, "the masked copy of r-0001 reappeared");
     Ok(())
 }
