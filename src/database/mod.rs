@@ -68,9 +68,9 @@ pub use index::truncate_to_byte_budget;
 #[cfg(test)]
 pub(crate) use index::{TantivyBackfillWork, fair_tantivy_backfill_work, fair_tantivy_backfill_work_split, sort_backfill_uris_newest_first};
 pub use scan::ProjectRoutingTable;
-pub(crate) use scan::{DECODE_UNITS_PER_READER, scan_pressure_permits, selected_file_work, stale_coverage_metric};
+pub(crate) use scan::{DECODE_UNITS_PER_READER, GatedScanExec, scan_pressure_permits, selected_file_work, stale_coverage_metric};
 #[cfg(test)]
-pub(crate) use scan::{GatedScanExec, NOMINAL_DECODE_BATCH_BYTES, date_partition_window, pressure_permit_claim_at};
+pub(crate) use scan::{NOMINAL_DECODE_BATCH_BYTES, date_partition_window, pressure_permit_claim_at};
 
 /// The decode ratio every sort budget is denominated in; `config` derives the
 /// repair budget from it.
@@ -414,6 +414,11 @@ pub mod scan_metric_names {
         HEAVY_QUERY_ORDERED_MOR_ADMITTED = "timefusion.scan.heavy_query_ordered_mor_admitted" as scan.heavy_query_ordered_mor_admitted;
         HEAVY_QUERY_QUEUED = "timefusion.scan.heavy_query_queued" as scan.heavy_query_queued;
         HEAVY_QUERY_QUEUE_TIMEOUT = "timefusion.scan.heavy_query_queue_timeout" as scan.heavy_query_queue_timeout;
+        // The same three for wide-scan byte admission, plus scans refused by the byte cap.
+        SCAN_BYTES_ADMITTED = "timefusion.scan.scan_bytes_admitted" as scan.scan_bytes_admitted;
+        SCAN_BYTES_QUEUED = "timefusion.scan.scan_bytes_queued" as scan.scan_bytes_queued;
+        SCAN_BYTES_QUEUE_TIMEOUT = "timefusion.scan.scan_bytes_queue_timeout" as scan.scan_bytes_queue_timeout;
+        SCAN_BYTES_CAP_REFUSED = "timefusion.scan.scan_bytes_cap_refused" as scan.scan_bytes_cap_refused;
     }
     // Per-reason breakdown of `PREFILTER_SKIPPED`.
     reasons {
@@ -2816,6 +2821,8 @@ pub struct Database {
     /// (`timefusion_max_concurrent_scan_readers`), so a burst of wide-window dashboards can't stack
     /// decode buffers into an OOM.
     heavy_scan_sem: Arc<tokio::sync::Semaphore>,
+    /// Wide-scan byte budget for pgwire query admission, sized to the query pool.
+    scan_byte_gate: crate::read::admission::ScanByteGate,
     /// Maintenance's OWN, smaller decode gate — the reservation that keeps a
     /// full-tilt drain from occupying the whole scan/S3 path. Queries and flush
     /// keep `heavy_scan_sem`; a background rewrite can saturate at most this
@@ -3432,6 +3439,7 @@ impl Database {
             maintenance_derived_reserve: Arc::new(tokio::sync::Semaphore::new(coordinator_jobs.saturating_sub(2).max(1))),
             dml_merge_sem: Arc::new(tokio::sync::Semaphore::new(cfg.maintenance.timefusion_dml_merge_concurrency.max(1))),
             heavy_scan_sem: Arc::new(tokio::sync::Semaphore::new(heavy_scan_permits)),
+            scan_byte_gate: crate::read::admission::ScanByteGate::new(cfg.derived.query_pool_bytes()),
             maintenance_scan_sem: Arc::new(tokio::sync::Semaphore::new(crate::config::maintenance_scan_permits(heavy_scan_permits))),
             maintenance_job_sem: Arc::new(tokio::sync::Semaphore::new(1)),
             commit_locks: Arc::new(dashmap::DashMap::new()),
@@ -3710,7 +3718,11 @@ impl Database {
                 // (executed once) of a heavy plan. Internal SQL contexts (maintenance,
                 // rollup) have their own pool and are never gated.
                 if for_pgwire {
-                    rules.push(Arc::new(crate::read::admission::HeavyQueryAdmission));
+                    let mem = &self.config.memory;
+                    rules.push(Arc::new(crate::read::admission::HeavyQueryAdmission {
+                        scan_bytes: mem.timefusion_query_scan_byte_admission.then(|| self.scan_byte_gate.clone()),
+                        scan_cap_bytes: mem.timefusion_query_scan_byte_cap_bytes,
+                    }));
                 }
                 rules.push(instrument_rule);
                 rules

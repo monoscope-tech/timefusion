@@ -2402,6 +2402,15 @@ pub struct MemoryConfig {
     // of magnitude on OTel data.
     #[serde_inline_default(64)]
     pub timefusion_wide_scan_max_mb: u64,
+    /// Admit a pgwire query only once its wide scans' selected bytes × 1.5 fit
+    /// in a byte budget the size of the query pool, queuing the rest. The fetch
+    /// and decode heap of a wide scan is outside that pool.
+    #[serde_inline_default(false)]
+    pub timefusion_query_scan_byte_admission: bool,
+    /// Refuse a pgwire query whose single wide scan selects more compressed
+    /// bytes than this. 0 = off.
+    #[serde_inline_default(0)]
+    pub timefusion_query_scan_byte_cap_bytes: u64,
     /// Largest isolated non-conforming Delta leg that `repair_isolated_scan_ordering`
     /// will sort at read time so the conforming majority keeps its `[timestamp DESC]`
     /// claim. 0 disables the repair.
@@ -2675,6 +2684,8 @@ mod tests {
         let day = CacheConfig { timefusion_cache_bypass_scan_hours: 24, ..config.cache.clone() };
         assert!(day.cache_bypass_scan_micros().unwrap() > 24 * 3_600_000_000 + 1_000_000, "a 24h window re-measured at scan time must still admit");
         assert_eq!(config.memory.timefusion_wide_scan_max_mb, 64);
+        assert!(!config.memory.timefusion_query_scan_byte_admission);
+        assert_eq!(config.memory.timefusion_query_scan_byte_cap_bytes, 0);
         assert!(config.maintenance.timefusion_warm_after_compaction);
         assert!(config.maintenance.timefusion_evict_after_compaction);
         // Merge-on-read DV is the default write path.

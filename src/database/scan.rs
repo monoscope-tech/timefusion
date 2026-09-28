@@ -770,10 +770,9 @@ impl ProjectRoutingTable {
         {
             return Ok(plan);
         }
-        // Record every gated scan's size; nothing is refused on it. The gate below
-        // bounds how MANY wide scans decode at once, never how much any one of
-        // them decodes, so this is the only place that sees a single query large
-        // enough to take the process down.
+        // Record every gated scan's size. The gate below bounds how MANY wide scans
+        // decode at once, never how much any one of them decodes; the byte charge
+        // and cap on the selected size live in `read::admission`.
         if let Some((files, bytes)) = selected {
             metrics::histogram!(scan_metric_names::WIDE_SCAN_SELECTED_MB).record((bytes / (1 << 20)) as f64);
             if bytes > Self::WIDE_SCAN_OVERSIZE_BYTES {
@@ -798,7 +797,10 @@ impl ProjectRoutingTable {
         } else {
             (self.database.heavy_scan_sem.clone(), shared_pool)
         };
-        Ok(Arc::new(GatedScanExec::new(plan, sem, Some(self.database.scan_metrics.clone()), bypass_cache, pool_size)))
+        Ok(Arc::new(
+            GatedScanExec::new(plan, sem, Some(self.database.scan_metrics.clone()), bypass_cache, pool_size)
+                .with_selected_bytes(selected.map(|(_, bytes)| bytes)),
+        ))
     }
 
     /// Lead sort key that makes `DedupExec`'s keep-greatest engage.
@@ -1160,6 +1162,8 @@ pub(crate) struct GatedScanExec {
     /// Size of `sem`'s pool — `scan_pressure_permits` scales its claim off it
     /// (tokio semaphores don't expose their initial size).
     pool_size: u32,
+    /// Compressed bytes the pruned scan selected, charged by query admission.
+    selected_bytes: Option<u64>,
 }
 
 impl GatedScanExec {
@@ -1167,7 +1171,15 @@ impl GatedScanExec {
         input: Arc<dyn ExecutionPlan>, sem: Arc<tokio::sync::Semaphore>, metrics: Option<Arc<ScanMetrics>>, bypass_cache: bool, pool_size: u32,
     ) -> Self {
         let properties = input.properties().clone();
-        Self { input, sem, properties, metrics, bypass_cache, pool_size }
+        Self { input, sem, properties, metrics, bypass_cache, pool_size, selected_bytes: None }
+    }
+
+    fn with_selected_bytes(self, selected_bytes: Option<u64>) -> Self {
+        Self { selected_bytes, ..self }
+    }
+
+    pub(crate) fn selected_bytes(&self) -> Option<u64> {
+        self.selected_bytes
     }
 }
 
@@ -1192,7 +1204,9 @@ impl ExecutionPlan for GatedScanExec {
         vec![&self.input]
     }
     fn with_new_children(self: Arc<Self>, children: Vec<Arc<dyn ExecutionPlan>>) -> DFResult<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(Self::new(children[0].clone(), self.sem.clone(), self.metrics.clone(), self.bypass_cache, self.pool_size)))
+        Ok(Arc::new(
+            Self::new(children[0].clone(), self.sem.clone(), self.metrics.clone(), self.bypass_cache, self.pool_size).with_selected_bytes(self.selected_bytes),
+        ))
     }
     fn execute(&self, partition: usize, context: Arc<TaskContext>) -> DFResult<SendableRecordBatchStream> {
         let inner = self.input.execute(partition, context)?;

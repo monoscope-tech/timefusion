@@ -10113,3 +10113,110 @@ async fn a_late_file_outside_a_slice_leaves_it_readable(late_hour: u32, routes: 
     assert_eq!(served, 2 + i64::from(late_hour >= 12), "late row at {late_hour}:30");
     Ok(())
 }
+
+/// A pgwire session over four three-day-old spans, where every deep scan is wide,
+/// and the project and query that scans them all.
+async fn wide_scan_session(label: &str, edit: impl FnOnce(&mut AppConfig)) -> Result<(Arc<Database>, SessionContext, String, String)> {
+    let db = Arc::new(
+        db_where(label, |cfg| {
+            cfg.memory.timefusion_wide_scan_max_files = 0;
+            cfg.memory.timefusion_wide_scan_max_mb = 0;
+            edit(cfg)
+        })
+        .await?,
+    );
+    db.cancel_maintenance();
+    let project = format!("{}_{}", label.replace('-', "_"), uuid::Uuid::new_v4().simple());
+    let at = crate::support::now_micros() - 3 * 86_400_000_000;
+    for i in 0..4 {
+        insert_a_span(&db, &project, &format!("s{i}"), at + i * 1_000_000).await?;
+    }
+    let mut ctx = Arc::clone(&db).create_session_context_for(true);
+    db.setup_session_context(&mut ctx)?;
+    let sql = format!("SELECT id FROM otel_logs_and_spans WHERE project_id = '{project}' AND timestamp >= to_timestamp_micros({})", at - 3_600_000_000);
+    Ok((db, ctx, project, sql))
+}
+
+async fn physical(ctx: &SessionContext, sql: &str) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+    ctx.sql(sql).await?.create_physical_plan().await
+}
+
+async fn row_count(stream: SendableRecordBatchStream) -> datafusion::error::Result<usize> {
+    let batches: Vec<RecordBatch> = futures::TryStreamExt::try_collect(stream).await?;
+    Ok(batches.iter().map(RecordBatch::num_rows).sum())
+}
+
+/// Wide queries are admitted while their selected bytes × 1.5 fit the budget and
+/// queue past it, then all complete — the prod burst of 7-8 wide queries that
+/// grew jemalloc 17-26 GB with the query pool idle. Scaled down by holding all
+/// of the budget but room for two charges.
+#[tokio::test(flavor = "multi_thread")]
+async fn scan_byte_admission_admits_what_the_budget_holds_and_queues_the_rest() -> Result<()> {
+    let (db, ctx, project, sql) = wide_scan_session("scan-bytes", |cfg| cfg.memory.timefusion_query_scan_byte_admission = true).await?;
+    let probe = physical(&ctx, &sql).await?;
+    // Every file in this test's own storage prefix is selected.
+    let table = db.resolve_table(&project, "otel_logs_and_spans").await?;
+    let selected: u64 = table.read().await.snapshot()?.log_data().iter().map(|f| f.size() as u64).sum();
+    let charge = u32::try_from((selected * 3).div_ceil(2 << 10))?;
+    let shown = datafusion::physical_plan::displayable(probe.as_ref()).indent(true).to_string();
+    assert!(shown.contains(&format!("scan_kib={charge},")), "the charge is the selected bytes × 1.5:\n{shown}");
+
+    let sem = Arc::clone(db.scan_byte_gate.sem());
+    let capacity = sem.available_permits();
+    let room = charge * 5 / 2;
+    let held = Arc::clone(&sem).acquire_many_owned(u32::try_from(sem.available_permits())? - room).await?;
+    let mut streams = Vec::new();
+    for _ in 0..8 {
+        let mut stream = datafusion::physical_plan::execute_stream(physical(&ctx, &sql).await?, ctx.task_ctx())?;
+        // One poll takes the charge when it fits and joins the queue when not.
+        let first = tokio::time::timeout(std::time::Duration::from_millis(20), futures::StreamExt::next(&mut stream)).await.ok().flatten().transpose()?;
+        streams.push((first.map_or(0, |batch| batch.num_rows()), stream));
+    }
+    assert_eq!((room as usize - sem.available_permits()) / charge as usize, 2, "exactly two charges fit the budget; the other six queue");
+
+    let rows =
+        futures::future::try_join_all(streams.into_iter().map(async |(first, stream)| Ok::<_, DataFusionError>(first + row_count(stream).await?))).await?;
+    drop(held);
+    assert_eq!(rows.len(), 8);
+    assert!(rows.iter().all(|&n| n == 4), "every queued query completes with the full result: {rows:?}");
+    assert_eq!(sem.available_permits(), capacity, "every charge is returned");
+    Ok(())
+}
+
+/// With the whole budget held, a query with no wide scan (the shallow dashboard
+/// path) and any query with the flag off run as before: no charge, no wait.
+#[test_case(true, "timestamp >= now() - interval '1 hour'" ; "a shallow query never waits on the byte budget")]
+#[test_case(false, "true" ; "the flag off leaves wide scans uncharged")]
+#[tokio::test(flavor = "multi_thread")]
+async fn the_byte_budget_never_holds_back_an_uncharged_query(admission: bool, narrow: &str) -> Result<()> {
+    let (db, ctx, _, sql) = wide_scan_session("scan-bytes-free", |cfg| cfg.memory.timefusion_query_scan_byte_admission = admission).await?;
+    let sql = format!("{sql} AND {narrow}");
+    let sem = Arc::clone(db.scan_byte_gate.sem());
+    let _held = Arc::clone(&sem).acquire_many_owned(u32::try_from(sem.available_permits())?).await?;
+    let plan = physical(&ctx, &sql).await?;
+    let shown = datafusion::physical_plan::displayable(plan.as_ref()).indent(true).to_string();
+    assert_eq!(shown.contains("GatedScanExec"), !admission, "only the flag-off case scans wide:\n{shown}");
+    assert!(!shown.contains("scan_kib"), "nothing is charged:\n{shown}");
+    tokio::time::timeout(std::time::Duration::from_secs(30), row_count(datafusion::physical_plan::execute_stream(plan, ctx.task_ctx())?)).await??;
+    Ok(())
+}
+
+/// A single scan over the cap is refused at plan time with a clear error; the
+/// same scan runs when the cap is off.
+#[test_case(1 => true ; "a scan over the cap is refused")]
+#[test_case(0 => false ; "no cap refuses nothing")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_scan_over_the_byte_cap_is_refused(cap: u64) -> bool {
+    let (_db, ctx, _, sql) = wide_scan_session("scan-bytes-cap", |cfg| cfg.memory.timefusion_query_scan_byte_cap_bytes = cap).await.unwrap();
+    match physical(&ctx, &sql).await {
+        Err(err) => {
+            let msg = err.to_string();
+            assert!(msg.contains("parquet bytes, over the single-scan cap of 1 — narrow the time range or add filters"), "{msg}");
+            true
+        }
+        Ok(plan) => {
+            assert_eq!(row_count(datafusion::physical_plan::execute_stream(plan, ctx.task_ctx()).unwrap()).await.unwrap(), 4);
+            false
+        }
+    }
+}
