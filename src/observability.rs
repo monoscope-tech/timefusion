@@ -1877,6 +1877,13 @@ atomic_stats! {
         /// Gauge: live identity entries across every per-table index (both epochs).
         ingest_dedup_index_entries,
         ingest_dedup_epoch_rotations as "ingest_dedup_epoch_rotations_total",
+        /// Boot hot-body preload: bodies fetched (files, bytes), files already
+        /// cached, files left out by a byte cap, and passes cut by the wall budget.
+        hot_body_preload_files as "hot_body_preload_files_total",
+        hot_body_preload_bytes as "hot_body_preload_bytes_total",
+        hot_body_preload_cached as "hot_body_preload_cached_total",
+        hot_body_preload_capped as "hot_body_preload_capped_total",
+        hot_body_preload_budget_stops as "hot_body_preload_budget_stops_total",
     }
 }
 

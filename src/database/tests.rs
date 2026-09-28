@@ -3298,6 +3298,84 @@ async fn maintenance_waits_for_the_replay_phase_not_the_body_warm() -> Result<()
     Ok(())
 }
 
+/// After a restart the first 24h dashboard read waited on parquet BODIES from
+/// object storage. With the boot hot-body preload, a cold-cache process reads the
+/// busiest project's recent files without fetching a byte, while a non-top project
+/// and bytes past the per-project cap stay cold.
+#[tokio::test(flavor = "multi_thread")]
+async fn hot_body_preload_makes_the_first_24h_read_free() -> Result<()> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let base = create_test_config("hot-body-preload");
+    let tag = uuid::Uuid::new_v4().simple();
+    let (big, small) = (format!("hot_big_{tag}"), format!("hot_small_{tag}"));
+    let now = Utc::now().timestamp_micros();
+    // Written by a cache-less process, so no body was captured on upload.
+    let writer = Database::with_config(Arc::clone(&base)).await?;
+    for i in 0..3 {
+        insert_a_span(&writer, &big, &format!("b{i}"), now - (i + 1) * 60_000_000).await?;
+    }
+    insert_a_span(&writer, &small, "s", now - 60_000_000).await?;
+    let cold_reader = async |n: &str, tweak: fn(&mut AppConfig)| {
+        let mut c = (*base).clone();
+        (c.cache.timefusion_foyer_disabled, c.cache.timefusion_foyer_disk_mb, c.cache.timefusion_foyer_memory_mb) = (false, Some(512), 64);
+        c.core.timefusion_data_dir = PathBuf::from(format!("{}-{n}", base.core.timefusion_data_dir.display()));
+        tweak(&mut c);
+        Database::with_config(Arc::new(c)).await.map(Arc::new)
+    };
+    // Bytes, not GET count: the read's snapshot refresh probes the next `_delta_log`
+    // commit, a counted miss that returns nothing.
+    let fetched = |db: &Database| {
+        db.object_store_cache.as_ref().map(|c| c.get_stats()).map_or(0, |s| s.main.inner_bytes_read + s.main.range_bytes_read + s.metadata.inner_bytes_read)
+    };
+    let read_24h = async |db: &Arc<Database>, project: &str| -> Result<(usize, u64)> {
+        let before = fetched(db);
+        let mut ctx = Arc::clone(db).create_session_context();
+        db.setup_session_context(&mut ctx)?;
+        let sql = format!("SELECT id, name FROM otel_logs_and_spans WHERE project_id = '{project}' AND timestamp >= now() - interval '24 hours'");
+        let rows = ctx.sql(&sql).await?.collect().await?.iter().map(|b| b.num_rows()).sum();
+        Ok((rows, fetched(db) - before))
+    };
+    let caps = HotBodyCaps {
+        projects: 1,
+        total_bytes: u64::MAX,
+        project_bytes: u64::MAX,
+        budget: std::time::Duration::from_secs(60),
+        pace: std::time::Duration::ZERO,
+    };
+
+    let reader = cold_reader("warm", |_| {}).await?;
+    let warmed = reader.preload_hot_bodies_with(caps).await;
+    assert_eq!((warmed.files, warmed.cached, warmed.capped, warmed.budget_stopped), (3, 0, 0, false), "{warmed:?}");
+    assert_eq!(read_24h(&reader, &big).await?, (3, 0), "the top project's first 24h read must not fetch from object storage");
+    assert!(read_24h(&reader, &small).await?.1 > 0, "a non-top project is not preloaded");
+    assert_eq!(reader.preload_hot_bodies_with(caps).await, HotBodyReport { cached: 3, ..Default::default() }, "a second pass fetches nothing");
+
+    let capped = cold_reader("capped", |_| {}).await?.preload_hot_bodies_with(HotBodyCaps { project_bytes: warmed.bytes - 1, ..caps }).await;
+    assert!(capped.bytes < warmed.bytes && capped.files < 3 && capped.capped >= 1, "the per-project cap bounds fetched bytes: {capped:?}");
+
+    // The boot hook: runs after the replay gate opens, in the background, at the pace.
+    // A size hint below the file size keeps the boot footer warm a ranged read (a
+    // file within the hint is fetched whole), as it is for prod-sized files.
+    let booted = cold_reader("boot", |c| {
+        (c.maintenance.timefusion_warm_body_boot_files_per_sec, c.maintenance.timefusion_coordinator_preload_wait_secs) = (1, 60);
+        c.cache.timefusion_parquet_metadata_size_hint = 4096;
+    })
+    .await?;
+    booted.preload_tables();
+    assert!(booted.wait_for_preload(&CancellationToken::new()).await);
+    let stats = crate::observability::maintenance_stats();
+    assert_eq!(stats.hot_body_preload_files.load(Relaxed), 0, "the replay gate must not wait on the paced body pass");
+    within(60, async {
+        while stats.hot_body_preload_files.load(Relaxed) < 4 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        Ok(())
+    })
+    .await?;
+    assert_eq!(read_24h(&booted, &big).await?, (3, 0), "the boot pass warms the configured top projects");
+    Ok(())
+}
+
 /// An untagged tier file must not be immortal.
 ///
 /// A replace-set matching on slice tags alone can never remove a file that lost them

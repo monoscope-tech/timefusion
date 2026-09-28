@@ -1066,6 +1066,44 @@ fn select_warm_paths(
     (paths, dropped.len())
 }
 
+/// Files on `dates` grouped by project: the `top` projects by bytes (ties by
+/// id), each project's `(path, size)` newest date first.
+fn rank_hot_bodies(files: impl IntoIterator<Item = (String, u64)>, dates: &[chrono::NaiveDate], top: usize) -> Vec<(String, Vec<(String, u64)>)> {
+    files
+        .into_iter()
+        .filter_map(|(path, size)| {
+            let date = crate::storage::date_partition_of(&path).filter(|d| dates.contains(d))?;
+            Some((crate::tantivy::search::project_id_of_uri(&path)?.to_string(), (std::cmp::Reverse(date), path, size)))
+        })
+        .into_group_map()
+        .into_iter()
+        .map(|(project, files)| (std::cmp::Reverse(files.iter().map(|f| f.2).sum::<u64>()), project, files))
+        .sorted_unstable()
+        .take(top)
+        .map(|(_, project, files)| (project, files.into_iter().sorted_unstable().map(|(_, path, size)| (path, size)).collect()))
+        .collect()
+}
+
+/// Bounds of one [`Database::preload_hot_bodies_with`] pass. Byte caps count
+/// fetched bytes only, so already-cached files are free.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct HotBodyCaps {
+    pub projects: usize,
+    pub total_bytes: u64,
+    pub project_bytes: u64,
+    pub budget: std::time::Duration,
+    pub pace: std::time::Duration,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HotBodyReport {
+    pub files: u64,
+    pub bytes: u64,
+    pub cached: u64,
+    pub capped: u64,
+    pub budget_stopped: bool,
+}
+
 /// Row values of a Utf8View/Utf8 column, or `None` if it is neither.
 fn str_col_rows(column: &datafusion::arrow::array::ArrayRef) -> Option<Box<dyn Iterator<Item = Option<&str>> + '_>> {
     use datafusion::arrow::array::{StringArray, StringViewArray};
@@ -4260,6 +4298,78 @@ impl Database {
         });
     }
 
+    /// One bounded, sequential pass fetching the bodies of the busiest projects'
+    /// today+yesterday `otel_logs_and_spans` files into the cache. Sequential so
+    /// the pace is a true files/sec and peak heap is one file body.
+    pub(crate) async fn preload_hot_bodies_with(&self, caps: HotBodyCaps) -> HotBodyReport {
+        let mut report = HotBodyReport::default();
+        let (Some(shared), true) = (self.object_store_cache.as_ref(), caps.projects > 0) else { return report };
+        let Ok(table_ref) = self.resolve_table("default", "otel_logs_and_spans").await else { return report };
+        let (ranked, store, table_uri) = {
+            let t = table_ref.read().await;
+            let today = Utc::now().date_naive();
+            let files = t.snapshot().map(|s| s.log_data().iter().map(|f| (f.path().into_owned(), f.size() as u64)).collect_vec()).unwrap_or_default();
+            (rank_hot_bodies(files, &[today, today - chrono::Days::new(1)], caps.projects), t.log_store().object_store(None), t.table_url().to_string())
+        };
+        let table_path = table_path_in_bucket(table_cache_prefix(&table_uri));
+        let t0 = std::time::Instant::now();
+        'pass: for (_, files) in ranked {
+            let mut project_bytes = 0;
+            for (rel, size) in files {
+                let path = object_store::path::Path::parse(&rel).unwrap_or_else(|_| object_store::path::Path::from(rel.as_str()));
+                if shared.contains_data(&bucket_cache_key(table_path, &path)) {
+                    report.cached += 1;
+                    continue;
+                }
+                if project_bytes + size > caps.project_bytes || report.bytes + size > caps.total_bytes {
+                    report.capped += 1;
+                    continue;
+                }
+                match tokio::time::timeout(caps.budget.saturating_sub(t0.elapsed()), crate::storage::warm_full(store.as_ref(), &path)).await {
+                    Err(_) => {
+                        report.budget_stopped = true;
+                        break 'pass;
+                    }
+                    Ok(false) => {}
+                    Ok(true) => {
+                        (project_bytes, report.files, report.bytes) = (project_bytes + size, report.files + 1, report.bytes + size);
+                        tokio::time::sleep(caps.pace).await;
+                    }
+                }
+            }
+        }
+        report
+    }
+
+    /// [`Self::preload_hot_bodies_with`] under the configured caps, at the boot
+    /// body pace (0 = no boot body warms, this one included).
+    async fn preload_hot_bodies(&self) {
+        let m = &self.config.maintenance;
+        if m.timefusion_warm_body_boot_files_per_sec == 0 {
+            return;
+        }
+        let r = self
+            .preload_hot_bodies_with(HotBodyCaps {
+                projects: m.timefusion_hot_body_preload_projects,
+                total_bytes: m.timefusion_hot_body_preload_total_mb << 20,
+                project_bytes: m.timefusion_hot_body_preload_project_mb << 20,
+                budget: std::time::Duration::from_secs(m.timefusion_hot_body_preload_budget_secs),
+                pace: std::time::Duration::from_secs_f64(1.0 / f64::from(m.timefusion_warm_body_boot_files_per_sec)),
+            })
+            .await;
+        let s = crate::observability::maintenance_stats();
+        for (counter, n) in [
+            (&s.hot_body_preload_files, r.files),
+            (&s.hot_body_preload_bytes, r.bytes),
+            (&s.hot_body_preload_cached, r.cached),
+            (&s.hot_body_preload_capped, r.capped),
+            (&s.hot_body_preload_budget_stops, u64::from(r.budget_stopped)),
+        ] {
+            counter.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+        }
+        info!(event = "hot_body_preload_complete", files = r.files, bytes = r.bytes, cached = r.cached, capped = r.capped, budget_stopped = r.budget_stopped);
+    }
+
     /// Resolve every registry table and warm parquet footers in the background
     /// (ALL live files by default; recency-bounded when
     /// `TIMEFUSION_WARM_ALL_FOOTERS=false`), so the first query after a deploy
@@ -4311,6 +4421,10 @@ impl Database {
                 // The only thing that releases the gate when the registry is empty.
                 db.mark_replay_complete();
                 info!(event = "table_preload_complete");
+                tokio::select! {
+                    _ = shutdown.cancelled() => {}
+                    _ = db.preload_hot_bodies() => {}
+                }
             }
         };
         if let Some(executor) = self.maintenance_executor.get() {
@@ -7156,6 +7270,17 @@ mod writer_properties_tests {
         let (paths, _) = select_warm_paths(uris, prefix, false, cutoff);
         assert_eq!(paths.len(), 1, "warm_all_footers=false drops non-recent files");
         assert!(paths[0].0.as_ref().contains("date=2099-01-01"));
+    }
+
+    /// Ranked by bytes on the window only (b's old-date whale doesn't count),
+    /// cut to the top N, each project's files newest date first.
+    #[test]
+    fn rank_hot_bodies_ranks_window_bytes_and_orders_newest_first() {
+        let day = |d| chrono::NaiveDate::from_ymd_opt(2026, 9, d).unwrap();
+        let f = |p: &str, d: u32, n: &str, size| (format!("project_id={p}/date=2026-09-{d:02}/{n}.parquet"), size);
+        let files = [f("a", 27, "y", 5), f("a", 28, "t", 5), f("b", 28, "t", 4), f("b", 1, "old", 99), f("c", 28, "t", 1)];
+        let ranked = rank_hot_bodies(files, &[day(28), day(27)], 2);
+        assert_eq!(ranked, vec![("a".into(), vec![f("a", 28, "t", 5), f("a", 27, "y", 5)]), ("b".into(), vec![f("b", 28, "t", 4)])]);
     }
 
     /// Bloom filters are opt-in per column, and the global kill switch wins over the opt-in.

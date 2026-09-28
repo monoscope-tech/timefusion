@@ -2022,6 +2022,18 @@ pub struct MaintenanceConfig {
     /// bandwidth. 0 = footer-only boot warm.
     #[serde_inline_default(16)]
     pub timefusion_warm_body_boot_files_per_sec: u32,
+    /// Boot-time body preload of `otel_logs_and_spans` today+yesterday for this
+    /// many projects, ranked by their bytes there; one sequential pass at the boot
+    /// body pace, after the table preload, skipping cached files. 0 = off.
+    #[serde_inline_default(10)]
+    pub timefusion_hot_body_preload_projects: usize,
+    /// Byte caps (fetched bytes) and wall budget for that pass.
+    #[serde_inline_default(8192)]
+    pub timefusion_hot_body_preload_total_mb: u64,
+    #[serde_inline_default(2048)]
+    pub timefusion_hot_body_preload_project_mb: u64,
+    #[serde_inline_default(300)]
+    pub timefusion_hot_body_preload_budget_secs: u64,
     /// Warm parquet footers for EVERY live file, not just recency-window ones.
     /// Disable to fall back to recency-bounded footer warming when the boot-time
     /// GET burst matters.
