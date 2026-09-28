@@ -1495,6 +1495,62 @@ async fn rollup_unit_waits_for_output_state_room_then_runs_alone() -> Result<()>
     Ok(())
 }
 
+/// A unit priced above half the state pool splits into halves re-priced by their
+/// own slice, which then co-run instead of each holding the whole pool alone.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_oversized_state_unit_splits_into_children_that_co_run() -> Result<()> {
+    use crate::maintenance_coordinator::{AdmissionController, AdmissionLane, Operation, Resources, TAG_OUTPUT_ROWS, TaskState, rollup_state_bytes};
+    let mut db = Database::with_config(test_config_with("rollup-state-split", |cfg| cfg.maintenance.timefusion_rollup_noop_skip_enabled = false)).await?;
+    db.cancel_maintenance();
+    db.maintenance_admission = AdmissionController::with_decoded_capacity(64, 64, u64::MAX, u64::MAX, 64, 64);
+    let day = (Utc::now() - chrono::Duration::days(3)).date_naive();
+    let project = format!("split_{}", uuid::Uuid::new_v4().simple());
+    insert_hourly_spans(&db, &project, midnight_micros(day), 20..24).await?;
+    for hour in 20..24 {
+        assert_eq!(db.run_unit_once("otel_logs_and_spans", &project, day, Operation::BaseRollup, 1, hour).await?.state, Some(TaskState::Complete));
+    }
+    // Hour-wide priors, so the 22:00 midpoint cuts no live slice.
+    let tier = db.resolve_table(&project, &rollup_tier(false)).await?;
+    rewrite_tier_files(&tier, "-rows", |add| {
+        add.tags.as_mut().expect("published output has tags").insert(TAG_OUTPUT_ROWS.to_owned(), Some("1000".to_owned()));
+    })
+    .await?;
+    let sketches = get_schema("otel_logs_and_spans")
+        .and_then(|schema| schema.rollups.iter().find(|spec| spec.derive_from.is_none()).map(|spec| spec.sketches()))
+        .expect("a base tier");
+    let child_price = rollup_state_bytes(sketches, Some(2_000), 0);
+    // 4h = 2 × child > cap/2, a 2h child ≤ cap/2, and two children fit together.
+    db.maintenance_admission = AdmissionController::with_decoded_capacity(64, 64, u64::MAX, 3 * child_price, 64, 64);
+    let run = |hours, offset| db.run_unit_once("otel_logs_and_spans", &project, day, Operation::BaseRollup, hours, offset);
+
+    let parent = run(4, 20).await?;
+    assert_eq!((parent.state, parent.retry_reason.as_deref()), (Some(TaskState::Superseded), Some("split_into_smaller_slices")));
+    let hour = |h: i64| midnight_micros(day) + h * 3_600_000_000;
+    let mut children: Vec<_> = db
+        .journal()
+        .tasks()
+        .filter(|task| {
+            task.key.project_id == project
+                && task.key.operation == Operation::BaseRollup
+                && task.state == TaskState::Pending
+                && task.key.slice.width() > 3_600_000_000
+        })
+        .map(|task| (task.key.slice.start_micros, task.key.slice.end_micros))
+        .collect();
+    children.sort_unstable();
+    assert_eq!(children, vec![(hour(20), hour(22)), (hour(22), hour(24))], "two halves, beside the ingest-minted ten-minute units");
+
+    let sibling = db.maintenance_admission.try_acquire_for(
+        Resources { state_bytes: child_price, ..Resources::default() },
+        AdmissionLane::Rollup,
+        crate::config::MemorySnapshot::unknown(),
+    );
+    assert!(sibling.is_some(), "one child's price is admitted");
+    let child = run(2, 20).await?;
+    assert_eq!(child.state, Some(TaskState::Complete), "and the other runs beside it: {:?}", child.retry_reason);
+    Ok(())
+}
+
 /// The publish site must actually CALL `reopen_derived_over` with the right child
 /// tier name: a wrong name matches nothing SILENTLY, leaving a derived cell built
 /// before its base was rebuilt serving stale rows forever.

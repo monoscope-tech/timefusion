@@ -77,6 +77,11 @@ const IDENTITY_FIELDS: [(&str, &str, bool); 7] = [
 ];
 
 impl RollupSpec {
+    /// Sketch (t-digest/HLL) measures, the ones that dominate aggregate state.
+    pub fn sketches(&self) -> usize {
+        self.measures.iter().filter(|measure| matches!(measure.agg.as_str(), "tdigest" | "hll")).count()
+    }
+
     /// `{source}_rollup_{name|grain}`.
     pub fn table_name(&self, source: &str) -> String {
         format!("{source}_rollup_{}", self.name.as_deref().unwrap_or(&self.grain))

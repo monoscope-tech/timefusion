@@ -3169,9 +3169,13 @@ impl Database {
             }
             return Ok(true);
         }
-        if estimated_bytes > MAX_DECODED_BYTES && key.slice.width() > crate::maintenance_coordinator::MIN_SLICE_MICROS {
+        let state_bytes = crate::maintenance_coordinator::rollup_state_bytes(spec.sketches(), prior_rows, estimated_bytes);
+        if key.slice.width() > crate::maintenance_coordinator::MIN_SLICE_MICROS {
             let mut journal = self.journal();
-            if journal.split_time_task(&key, estimated_bytes, Some(input_footprint), &live_slices) {
+            let row_priced = prior_rows.map(|_| state_bytes);
+            if (estimated_bytes > MAX_DECODED_BYTES && journal.split_time_task(&key, estimated_bytes, Some(input_footprint), &live_slices))
+                || journal.split_state_task(&key, row_priced, self.maintenance_admission.state_capacity(), estimated_bytes, Some(input_footprint), &live_slices)
+            {
                 journal.checkpoint()?;
                 return Ok(true);
             }
@@ -3179,8 +3183,6 @@ impl Database {
         let hash_shards = estimated_bytes.div_ceil(MAX_DECODED_BYTES).max(1);
         anyhow::ensure!(hash_shards <= 65_536, "one-minute slice needs {hash_shards} hash shards; maximum is 65536");
         let per_shard_bytes = estimated_bytes.div_ceil(hash_shards).max(1);
-        let sketches = spec.measures.iter().filter(|measure| matches!(measure.agg.as_str(), "tdigest" | "hll")).count();
-        let state_bytes = crate::maintenance_coordinator::rollup_state_bytes(sketches, prior_rows, estimated_bytes);
         let Some(_permit) = self.maintenance_admission.try_acquire_for(
             Resources { cpu: 1, decoded_bytes: per_shard_bytes, state_bytes, object_reads: 1, object_writes: 1 },
             crate::maintenance_coordinator::AdmissionLane::Rollup,

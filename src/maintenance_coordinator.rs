@@ -512,6 +512,9 @@ fn bisect_time_unit(task: &MaintenanceTask, observed_or_estimated_bytes: u64) ->
 #[derive(Clone, Copy)]
 enum SplitTrigger {
     Preflight(u64),
+    /// Rollup aggregate state priced from a prior publication's rows: it halves with
+    /// the width whether or not the input sheds files. Carries the input bytes.
+    State(u64),
     RepeatedFailure,
 }
 
@@ -2343,6 +2346,16 @@ impl TaskJournal {
         self.split_task(key, SplitTrigger::Preflight(observed_bytes), input, live)
     }
 
+    /// Bisect a rollup unit whose row-priced state is over half the state pool, so at
+    /// least two such units co-run instead of each clamping to the pool alone. An
+    /// input-priced unit (no prior rows) never splits here: that proxy over-prices
+    /// sparse tiers several-fold, and big inputs already split on decode.
+    pub fn split_state_task(
+        &mut self, key: &TaskKey, row_priced_state: Option<u64>, state_capacity: u64, input_bytes: u64, input: Option<InputFootprint>, live: &[(i64, i64)],
+    ) -> bool {
+        row_priced_state.is_some_and(|state| state > state_capacity / 2) && self.split_task(key, SplitTrigger::State(input_bytes), input, live)
+    }
+
     fn split_task(&mut self, key: &TaskKey, trigger: SplitTrigger, input: Option<InputFootprint>, live: &[(i64, i64)]) -> bool {
         // A Repair unit's cost is the FILE it rewrites; time-bisection cannot shrink a file
         // set, so every child would fight over the same file.
@@ -2360,17 +2373,19 @@ impl TaskJournal {
         // "fit" on paper forever. Decline once a child costs most of its parent and let it
         // RUN — the runner hash-shards internally at any width.
         let observed_bytes = match trigger {
-            SplitTrigger::Preflight(bytes) => Some(bytes),
+            SplitTrigger::Preflight(bytes) | SplitTrigger::State(bytes) => Some(bytes),
             SplitTrigger::RepeatedFailure => parent.preflight_decoded_bytes,
         };
-        if observed_bytes.is_some_and(|bytes| !split_sheds_enough(parent.parent_measured_bytes, bytes)) {
+        // A state split sheds by construction; the input shed test would hold it at
+        // the file floor, where the state is still too big.
+        if !matches!(trigger, SplitTrigger::State(_)) && observed_bytes.is_some_and(|bytes| !split_sheds_enough(parent.parent_measured_bytes, bytes)) {
             crate::observability::maintenance_stats().split_declined_at_floor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return false;
         }
         let cost = observed_bytes.unwrap_or(parent.estimated_decoded_bytes);
         let children = match trigger {
             SplitTrigger::Preflight(_) => byte_bounded_units(&parent, cost),
-            SplitTrigger::RepeatedFailure => bisect_time_unit(&parent, cost).map(Vec::from).unwrap_or_default(),
+            SplitTrigger::State(_) | SplitTrigger::RepeatedFailure => bisect_time_unit(&parent, cost).map(Vec::from).unwrap_or_default(),
         };
         if children.len() <= 1 || children.iter().any(|child| child.hash_shards > 1) {
             crate::observability::maintenance_stats().split_declined_no_width.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -3420,6 +3435,10 @@ impl AdmissionController {
         Some(AdmissionPermit { controller: self.clone(), resources: request })
     }
 
+    pub fn state_capacity(&self) -> u64 {
+        lock(&self.0).capacity.state_bytes
+    }
+
     pub fn utilization(&self) -> Resources {
         lock(&self.0).used()
     }
@@ -3845,6 +3864,30 @@ mod tests {
         let hour = |h: f64| start + (h * 3_600_000_000.0) as i64;
         let live: Vec<(i64, i64)> = hours.iter().map(|&(from, to)| (hour(from), hour(to))).collect();
         journal.split_time_task(&key, 2 * MAX_DECODED_BYTES, None, &live)
+    }
+
+    /// A rollup unit priced above half the state pool bisects, so two co-run; it
+    /// still stops at the live-slice rule and the width floor. `shed`: the parent
+    /// already split on this input, which the input shed test would refuse.
+    #[test_case::test_case(720, Operation::BaseRollup, Some(101), &[], false => true ; "above half the pool splits")]
+    #[test_case::test_case(720, Operation::BaseRollup, Some(100), &[], false => false ; "at half the pool runs whole")]
+    #[test_case::test_case(720, Operation::BaseRollup, None, &[], false => false ; "an input priced unit never splits on state")]
+    #[test_case::test_case(720, Operation::BaseRollup, Some(101), &[(0, 720)], false => false ; "a live slice across the midpoint declines")]
+    #[test_case::test_case(720, Operation::BaseRollup, Some(101), &[(0, 360), (360, 720)], false => true ; "aligned live halves allow it")]
+    #[test_case::test_case(1, Operation::BaseRollup, Some(101), &[], false => false ; "a base unit at the minute floor")]
+    #[test_case::test_case(60, Operation::DerivedRollup, Some(101), &[], false => false ; "a derived unit at the hour floor")]
+    #[test_case::test_case(120, Operation::DerivedRollup, Some(101), &[], false => true ; "a derived unit above the hour floor")]
+    #[test_case::test_case(720, Operation::BaseRollup, Some(101), &[], true => true ; "state ignores the input shed test")]
+    fn a_rollup_unit_splits_on_its_priced_state(minutes: i64, operation: Operation, state: Option<u64>, live: &[(i64, i64)], shed: bool) -> bool {
+        let start = 50 * DAY_MICROS;
+        let minute = |m: i64| start + m * MIN_SLICE_MICROS;
+        let (_dir, mut journal) = new_journal();
+        let key = upserted(&mut journal, task("state", start, minute(minutes), operation).tap_mut(|unit| unit.parent_measured_bytes = shed.then_some(1_000)));
+        let live: Vec<(i64, i64)> = live.iter().map(|&(from, to)| (minute(from), minute(to))).collect();
+        let split = journal.split_state_task(&key, state, 200, 1_000, None, &live);
+        let children = journal.tasks().filter(|child| child.state == TaskState::Pending && child.key.slice.width() * 2 == key.slice.width()).count();
+        assert_eq!(children, if split { 2 } else { 0 }, "a split mints two time halves");
+        split
     }
 
     /// The census and the prune share one horizon edge: midnight `days` days ago, whatever
