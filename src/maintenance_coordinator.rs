@@ -2671,7 +2671,13 @@ impl TaskJournal {
         // early Complete slices while the census still enumerates the day, and the coverage
         // replay needs those records to prove them.
         let cutoff = backfill_horizon_start_micros(now_micros, horizon_days);
-        let dropped = self.retain_tasks(|task| !matches!(task.state, TaskState::Complete | TaskState::Superseded) || task.key.slice.end_micros > cutoff);
+        // A derived unit past the horizon can never prove its base (the census no longer
+        // builds it), so it would stay queued forever; pending BASE work stays as the debt gauge.
+        let dropped = self.retain_tasks(|task| {
+            task.key.slice.end_micros > cutoff
+                || !(matches!(task.state, TaskState::Complete | TaskState::Superseded)
+                    || (task.key.operation == Operation::DerivedRollup && matches!(task.state, TaskState::Pending | TaskState::Retry)))
+        });
         if dropped != 0 {
             crate::observability::maintenance_stats().journal_retired_tasks_pruned.fetch_add(dropped as u64, std::sync::atomic::Ordering::Relaxed);
         }
@@ -4224,10 +4230,14 @@ mod tests {
             let end = now - days_ago * DAY_MICROS;
             (end - DAY_MICROS, end)
         };
-        let mut add = |name: &str, days_ago: i64, state: TaskState| {
+        let mut add_op = |name: &str, days_ago: i64, state: TaskState, operation: Operation| {
             let (start, end) = at(days_ago);
-            journal.upsert(task(name, start, end, Operation::BaseRollup).tap_mut(|t| t.state = state));
+            journal.upsert(task(name, start, end, operation).tap_mut(|t| t.state = state));
         };
+        add_op("old-derived-pending", 40, TaskState::Pending, Operation::DerivedRollup);
+        add_op("old-derived-retry", 40, TaskState::Retry, Operation::DerivedRollup);
+        add_op("fresh-derived-pending", 2, TaskState::Pending, Operation::DerivedRollup);
+        let mut add = |name: &str, days_ago: i64, state: TaskState| add_op(name, days_ago, state, Operation::BaseRollup);
         add("old-complete", 40, TaskState::Complete);
         add("old-superseded", 40, TaskState::Superseded);
         add("old-pending", 40, TaskState::Pending);
@@ -4239,7 +4249,7 @@ mod tests {
         // what kept it gone.
         journal.checkpoint().expect("persist the whole set before pruning any of it");
 
-        assert_eq!(journal.prune_retired_history(now, 31), 2, "exactly the two finished-and-past-the-horizon tasks");
+        assert_eq!(journal.prune_retired_history(now, 31), 4, "the two finished tasks and the two unprovable derived ones past the horizon");
         let survivors: Vec<&str> = journal.tasks().map(|t| t.key.project_id.as_str()).collect();
         assert!(!survivors.contains(&"old-complete") && !survivors.contains(&"old-superseded"));
         assert!(
@@ -4247,6 +4257,11 @@ mod tests {
             "abandoned work past the horizon is the debt gauge and must survive: {survivors:?}"
         );
         assert!(survivors.contains(&"fresh-complete") && survivors.contains(&"fresh-pending"), "work inside the horizon must survive: {survivors:?}");
+        assert!(
+            !survivors.contains(&"old-derived-pending") && !survivors.contains(&"old-derived-retry"),
+            "a derived unit past the horizon can never prove its base"
+        );
+        assert!(survivors.contains(&"fresh-derived-pending"), "a derived unit inside the horizon must survive: {survivors:?}");
 
         // The index must still find what is left, or every later lookup silently
         // misses — the failure a bare `retain` on the vector would have caused.
@@ -4263,7 +4278,7 @@ mod tests {
         let reloaded = TaskJournal::load(dir.path()).expect("reload");
         let names: Vec<&str> = reloaded.tasks().map(|t| t.key.project_id.as_str()).collect();
         assert!(!names.contains(&"old-complete") && !names.contains(&"old-superseded"), "pruned tasks must not resurrect after a restart: {names:?}");
-        assert_eq!(names.len(), 4, "and nothing else may vanish with them: {names:?}");
+        assert_eq!(names.len(), 5, "and nothing else may vanish with them: {names:?}");
     }
 
     /// Only outstanding ROLLUP work may veto a rollup backfill — unrelated file
