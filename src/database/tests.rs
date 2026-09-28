@@ -1583,7 +1583,7 @@ async fn rollup_unit_waits_for_output_state_room_then_runs_alone() -> Result<()>
     let day = (Utc::now() - chrono::Duration::days(3)).date_naive();
     let project = format!("state_{}", uuid::Uuid::new_v4().simple());
     insert_hourly_spans(&db, &project, midnight_micros(day), [20, 21]).await?;
-    let run = || db.run_unit_once("otel_logs_and_spans", &project, day, Operation::BaseRollup, 4, 20);
+    let run = || db.run_unit_once("otel_logs_and_spans", &project, day, Operation::BaseRollup, 4, 20, None);
     assert_eq!(run().await?.state, Some(TaskState::Complete));
     // A whale-sized prior publication: tens of GiB of state against a 1 GiB capacity.
     let tier = db.resolve_table(&project, &rollup_tier(false)).await?;
@@ -1617,7 +1617,7 @@ async fn an_oversized_state_unit_splits_into_children_that_co_run() -> Result<()
     let project = format!("split_{}", uuid::Uuid::new_v4().simple());
     insert_hourly_spans(&db, &project, midnight_micros(day), 20..24).await?;
     for hour in 20..24 {
-        assert_eq!(db.run_unit_once("otel_logs_and_spans", &project, day, Operation::BaseRollup, 1, hour).await?.state, Some(TaskState::Complete));
+        assert_eq!(db.run_unit_once("otel_logs_and_spans", &project, day, Operation::BaseRollup, 1, hour, None).await?.state, Some(TaskState::Complete));
     }
     // Hour-wide priors, so the 22:00 midpoint cuts no live slice.
     let tier = db.resolve_table(&project, &rollup_tier(false)).await?;
@@ -1631,7 +1631,7 @@ async fn an_oversized_state_unit_splits_into_children_that_co_run() -> Result<()
     let child_price = rollup_state_bytes(sketches, Some(2_000), 0);
     // 4h = 2 × child > cap/2, a 2h child ≤ cap/2, and two children fit together.
     db.maintenance_admission = AdmissionController::with_decoded_capacity(64, 64, u64::MAX, 3 * child_price, 64, 64);
-    let run = |hours, offset| db.run_unit_once("otel_logs_and_spans", &project, day, Operation::BaseRollup, hours, offset);
+    let run = |hours, offset| db.run_unit_once("otel_logs_and_spans", &project, day, Operation::BaseRollup, hours, offset, None);
 
     let parent = run(4, 20).await?;
     assert_eq!((parent.state, parent.retry_reason.as_deref()), (Some(TaskState::Superseded), Some("split_into_smaller_slices")));
