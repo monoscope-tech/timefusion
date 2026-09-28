@@ -183,6 +183,38 @@ pub(crate) fn skippable_certified_files<'a>(certified: impl IntoIterator<Item = 
     skippable.into_iter().map(|(path, _)| path).collect()
 }
 
+/// Why an uncertified file holds back a certified file's per-file dedup skip.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+pub(crate) enum BlockerClass {
+    NoStats,
+    DvChanged,
+    PackedOutput,
+    AddedSinceProof,
+    LateArrival,
+}
+
+/// Classify one blocking file; the first rule that matches wins.
+///
+/// - `no_stats`: no span, so it overlaps everything.
+/// - `dv_changed`: the proof names this path, but its deletion vector moved since.
+/// - `packed_output`: a path the proof does not name, written by a packing or
+///   consolidation rewrite (sorted-run tag). The commit-level `timefusion.lane` tag
+///   is not in the snapshot, so the per-file tag stands in for it.
+/// - `late_arrival`: any other new path whose span lies WHOLLY inside `proved`, the
+///   union span of the proved files: it landed on ground the proof already covered.
+/// - `added_since_proof`: a new path whose span reaches outside `proved` (or `proved`
+///   is unknown): it overlaps a proved file but straddles the proof's edge.
+pub(crate) fn classify_blocker(span: FileSpan, path_proved: bool, sorted_run: bool, proved: FileSpan) -> BlockerClass {
+    match (span, proved) {
+        (None, _) => BlockerClass::NoStats,
+        _ if path_proved => BlockerClass::DvChanged,
+        _ if sorted_run => BlockerClass::PackedOutput,
+        (Some((lo, hi)), Some((plo, phi))) if plo <= lo && hi <= phi => BlockerClass::LateArrival,
+        _ => BlockerClass::AddedSinceProof,
+    }
+}
+
 /// Re-owns each batch's buffers (`compact_batch`) before an operator that holds
 /// batches charges the pool for every buffer they reference. Zero-copy slices,
 /// view casts and sparse filters hand on batches pinning their sources' buffers.
@@ -1083,6 +1115,23 @@ mod tests {
         let mut got: Vec<&str> = skippable_certified_files(certified.iter().copied(), uncertified).into_iter().collect();
         got.sort_unstable();
         assert_eq!(got, skippable.to_vec());
+    }
+
+    /// `(span, path_proved, sorted_run)` of the blocker, against a proof covering [10, 50].
+    #[test_case::test_case(None, true, true, "no_stats" ; "no span wins over every other signal")]
+    #[test_case::test_case(Some((20, 30)), true, true, "dv_changed" ; "a proved path is a DV move, whatever its tags")]
+    #[test_case::test_case(Some((0, 99)), false, true, "packed_output" ; "a new sorted-run file is packing output")]
+    #[test_case::test_case(Some((20, 30)), false, false, "late_arrival" ; "wholly inside the proved interval")]
+    #[test_case::test_case(Some((10, 50)), false, false, "late_arrival" ; "bounds are inclusive")]
+    #[test_case::test_case(Some((5, 30)), false, false, "added_since_proof" ; "starts before the proof")]
+    #[test_case::test_case(Some((40, 60)), false, false, "added_since_proof" ; "runs past the proof")]
+    fn classify_blocker_labels_each_class(span: FileSpan, path_proved: bool, sorted_run: bool, class: &str) {
+        assert_eq!(<&str>::from(classify_blocker(span, path_proved, sorted_run, Some((10, 50)))), class);
+    }
+
+    #[test]
+    fn an_unknown_proof_span_makes_any_new_file_added_since_proof() {
+        assert_eq!(classify_blocker(Some((20, 30)), false, false, None), BlockerClass::AddedSinceProof);
     }
 
     use datafusion::{

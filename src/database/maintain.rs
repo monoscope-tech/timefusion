@@ -4712,10 +4712,48 @@ impl Database {
         // away; it cannot vouch for its replacement, so it drops out of the certified side.
         let Ok((_, visibility)) = Self::logical_count_partition_snapshot(table, project_id, date) else { return HashSet::new() };
         let proved: HashSet<&str> = cert.files.iter().filter(|(path, dv)| visibility.get(*path) == Some(*dv)).map(|(path, _)| path.as_str()).collect();
-        let (certified, uncertified): (Vec<(&str, crate::read::FileSpan)>, Vec<crate::read::FileSpan>) = spans.iter().partition_map(|(rel, span)| {
-            if proved.contains(rel.as_str()) { itertools::Either::Left((rel.as_str(), *span)) } else { itertools::Either::Right(*span) }
-        });
-        crate::read::skippable_certified_files(certified, &uncertified).into_iter().map(str::to_string).collect()
+        let (certified, uncertified): (Vec<_>, Vec<_>) = spans.iter().map(|(rel, span)| (rel.as_str(), *span)).partition(|(rel, _)| proved.contains(rel));
+        let skippable = crate::read::skippable_certified_files(certified.iter().copied(), &uncertified.iter().map(|(_, span)| *span).collect::<Vec<_>>());
+        Self::attribute_skip_blockers(table, &cert.files, &certified, &skippable, &uncertified, [project_id, table_name, date]);
+        skippable.into_iter().map(str::to_string).collect()
+    }
+
+    /// Classify every uncertified file that holds back a certified one (see
+    /// [`crate::read::classify_blocker`]): count each, and log a 1-in-64 sample per class.
+    fn attribute_skip_blockers(
+        table: &DeltaTable, proof: &crate::read::CountFiles, certified: &[(&str, crate::read::FileSpan)], skippable: &HashSet<&str>,
+        uncertified: &[(&str, crate::read::FileSpan)], [project_id, table_name, date]: [&str; 3],
+    ) {
+        let overlaps = |a: crate::read::FileSpan, b: crate::read::FileSpan| a.zip(b).is_none_or(|((alo, ahi), (blo, bhi))| alo <= bhi && blo <= ahi);
+        let blocked: Vec<crate::read::FileSpan> = certified.iter().filter(|(path, _)| !skippable.contains(path)).map(|(_, span)| *span).collect();
+        let blockers: HashMap<&str, crate::read::FileSpan> =
+            uncertified.iter().filter(|(_, span)| blocked.iter().any(|b| overlaps(*span, *b))).copied().collect();
+        if blockers.is_empty() {
+            return;
+        }
+        let Ok(snapshot) = table.snapshot().map(|s| s.snapshot()) else { return };
+        let proved = certified.iter().map(|(_, span)| *span).reduce(|a, b| a.zip(b).map(|((alo, ahi), (blo, bhi))| (alo.min(blo), ahi.max(bhi)))).flatten();
+        for file in snapshot.log_data().iter() {
+            let path = file.path();
+            let Some(&span) = blockers.get(path.as_ref()) else { continue };
+            let class: &'static str = crate::read::classify_blocker(span, proof.contains_key(path.as_ref()), is_sorted_run(&file.tags()), proved).into();
+            crate::observability::record_cert_skip_blocked(class);
+            if crate::observability::sample_rollup_miss(class) {
+                let mtime_ms = file.modification_time();
+                info!(
+                    event = "cert_skip_blocked_sample",
+                    class,
+                    span_min = span.map(|(lo, _)| lo),
+                    span_max = span.map(|(_, hi)| hi),
+                    age_secs = (mtime_ms > 0).then(|| crate::support::now_micros() / 1_000_000 - mtime_ms / 1_000),
+                    bytes = file.size(),
+                    project_id,
+                    table_name,
+                    date,
+                    "a certified file's per-file dedup skip is blocked by an overlapping uncertified file"
+                );
+            }
+        }
     }
 
     /// Per-FILE row-timestamp spans for one project's date partition, keyed by the

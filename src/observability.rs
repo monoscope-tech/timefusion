@@ -145,6 +145,7 @@ counter_registry! {
     cache_confirm_attempts     => "timefusion.cache.confirm_attempts": "Files probed by the pre-drain cache confirm on the flush path (Influx oracle ordering). Files captured during upload cost only this probe",
     cache_confirm_warmed       => "timefusion.cache.confirm_warmed": "Files the pre-drain confirm had to fetch because write-capture skipped them. Sustained ~= confirm_attempts means the write-capture caps are too tight — every flush output is being re-read from S3",
     cache_confirm_timeouts     => "timefusion.cache.confirm_timeouts": "Pre-drain cache confirms that hit their bound and gave up. Best-effort — the commit and the drain proceed; the next query on those files just pays an S3 round-trip",
+    cert_skip_blocked          => "timefusion.cert.skip_blocked": "Uncertified files holding back a certified file's per-file dedup skip, one per blocking file per scan decision, by `class` (no_stats, dv_changed, packed_output, added_since_proof, late_arrival)",
     rollup_hits                => "timefusion.rollup.hits": "Dashboard aggregates served from the pre-aggregated rollup instead of raw spans",
     maintenance_lease_ms       => "timefusion.maintenance.lease_ms": "Wall milliseconds maintenance units held a lease, by operation and outcome. Per-lane work that survives deploys (the stats keys reset)",
     maintenance_claims         => "timefusion.maintenance.claims": "claim_next passes, by operation, whether or not they claimed. claim_us / claims is the mean claim cost",
@@ -1123,6 +1124,11 @@ pub fn record_maintenance_claim(operation: crate::maintenance_coordinator::Opera
     let operation = [KeyValue::new("operation", <&'static str>::from(operation))];
     otel_add(|m| &m.maintenance_claims, 1, &operation);
     otel_add(|m| &m.maintenance_claim_us, elapsed_us, &operation);
+}
+
+/// One file blocking a certified file's per-file dedup skip.
+pub fn record_cert_skip_blocked(class: &'static str) {
+    otel_add(|m| &m.cert_skip_blocked, 1, &[KeyValue::new("class", class)]);
 }
 
 pub fn record_rollup_memory_refusal() {
