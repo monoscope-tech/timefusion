@@ -49,6 +49,8 @@ const HARD_LIMIT_HEADROOM_DIVISOR: usize = 5;
 /// Bucket-id time slices one flush cycle commits before releasing `flush_lock`,
 /// so a deep backlog drains as many small commits that each finish.
 const FLUSH_CHUNK_BUCKET_IDS: usize = 2;
+/// Consecutive dirty snapshot flushes before a bucket is taken destructively.
+const DIRTY_FLUSHES_BEFORE_TAKE: u32 = 2;
 /// The reservation ceiling live writers are rejected at.
 fn hard_limit(max_bytes: usize) -> usize {
     max_bytes.saturating_add(max_bytes / HARD_LIMIT_HEADROOM_DIVISOR)
@@ -192,6 +194,7 @@ pub struct StatsSnapshot {
     pub backpressure_rejected_total: u64,
     /// Open-bucket force-flush escalations.
     pub backpressure_force_flush_total: u64,
+    pub dirty_livelock_takes_total: u64,
     pub rows_ingested_total: u64,
     pub rows_flushed_total: u64,
     pub flush_freed_bytes_total: u64,
@@ -701,6 +704,7 @@ pub struct BufferedWriteLayer {
     backpressure_engaged_total: AtomicU64,
     backpressure_rejected_total: AtomicU64,
     backpressure_force_flush_total: AtomicU64,
+    dirty_livelock_takes_total: AtomicU64,
     /// Set by the flush loop when on-disk WAL bytes exceed the HARD limit
     /// (`wal_hard_limit_bytes`); while set, `insert` rejects instead of acking
     /// into an unbounded backlog (the upstream DLQ absorbs + replays). Cleared
@@ -899,6 +903,7 @@ impl BufferedWriteLayer {
             backpressure_engaged_total: AtomicU64::new(0),
             backpressure_rejected_total: AtomicU64::new(0),
             backpressure_force_flush_total: AtomicU64::new(0),
+            dirty_livelock_takes_total: AtomicU64::new(0),
             rows_ingested_total: AtomicU64::new(0),
             rows_flushed_total: AtomicU64::new(0),
             flush_freed_bytes_total: AtomicU64::new(0),
@@ -1164,20 +1169,27 @@ impl BufferedWriteLayer {
     /// taken atomically under the insert lock and restored on commit failure;
     /// durability never depends on this (the WAL holds them).
     pub(crate) async fn force_flush_current_buckets(&self) -> anyhow::Result<()> {
-        let _flush_guard = self.flush_lock.lock().await;
         let current = MemBuffer::current_bucket_id();
-        let mut attempted = false;
         // No stuck-older-bucket gate needed: an unflushed older bucket pins the
         // cursor via its holds, so force-flushing the open window can never move
         // the cursor past it.
-        for (project_id, table_name, bucket_id) in self.mem_buffer.bucket_keys(|id| id >= current) {
+        if self.force_flush_buckets(self.mem_buffer.bucket_keys(|id| id >= current)).await > 0 {
+            crate::observability::record_backpressure_force_flush();
+            self.backpressure_force_flush_total.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
+    /// Take-flush `keys` (rows removed under the insert lock, restored on commit
+    /// failure), returning how many buckets were taken.
+    async fn force_flush_buckets(&self, keys: Vec<(String, String, i64)>) -> usize {
+        let _flush_guard = self.flush_lock.lock().await;
+        let mut taken = 0;
+        for (project_id, table_name, bucket_id) in keys {
             let Some(bucket) = self.mem_buffer.take_bucket_for_flush(&project_id, &table_name, bucket_id) else {
                 continue;
             };
-            if !std::mem::replace(&mut attempted, true) {
-                crate::observability::record_backpressure_force_flush();
-                self.backpressure_force_flush_total.fetch_add(1, Ordering::Relaxed);
-            }
+            taken += 1;
             match self.flush_taken_bucket(&bucket).await {
                 Ok(()) => {
                     self.rows_flushed_total.fetch_add(bucket.row_count as u64, Ordering::Relaxed);
@@ -1190,7 +1202,7 @@ impl BufferedWriteLayer {
                 }
             }
         }
-        Ok(())
+        taken
     }
 
     /// Exempt the buckets a merge-on-read version append lands in from the
@@ -2184,6 +2196,14 @@ impl BufferedWriteLayer {
     /// with buffer occupancy against a fixed watchdog, and an aborted commit
     /// frees nothing, so the next cycle retries the same too-big commit.
     async fn flush_completed_buckets(&self) -> anyhow::Result<()> {
+        // Continuous DML can dirty every snapshot of a bucket, which then never
+        // drains and fills the buffer until inserts are rejected. Take those
+        // destructively: the take is atomic with inserts and DML, so no race.
+        let livelocked = self.mem_buffer.dirty_livelocked_keys(DIRTY_FLUSHES_BEFORE_TAKE);
+        if !livelocked.is_empty() {
+            let taken = self.force_flush_buckets(livelocked).await;
+            self.dirty_livelock_takes_total.fetch_add(taken as u64, Ordering::Relaxed);
+        }
         let current_bucket = MemBuffer::current_bucket_id();
         // Snapshot the bucket list ONCE: re-deriving the remaining set each pass
         // would immediately re-flush a bucket dirty-kept because a DML mutated it
@@ -3243,6 +3263,7 @@ impl BufferedWriteLayer {
             backpressure_engaged_total: self.backpressure_engaged_total.load(Ordering::Relaxed),
             backpressure_rejected_total: self.backpressure_rejected_total.load(Ordering::Relaxed),
             backpressure_force_flush_total: self.backpressure_force_flush_total.load(Ordering::Relaxed),
+            dirty_livelock_takes_total: self.dirty_livelock_takes_total.load(Ordering::Relaxed),
             rows_ingested_total: self.rows_ingested_total.load(Ordering::Relaxed),
             rows_flushed_total: self.rows_flushed_total.load(Ordering::Relaxed),
             flush_freed_bytes_total: self.flush_freed_bytes_total.load(Ordering::Relaxed),
@@ -4496,6 +4517,55 @@ mod tests {
         let ids = recovered_col(cfg, &project, &table, "id").await;
         assert!(!ids.contains(&"doomed".to_string()), "acked DELETE resurrected after crash+replay (got {ids:?})");
         assert!(ids.contains(&"keeper".to_string()), "surviving row lost across crash (got {ids:?})");
+    }
+
+    /// Prod 2026-09-28: continuous UPDATEs dirtied every snapshot of the same
+    /// buckets, none ever drained, and the full buffer rejected inserts. After
+    /// `DIRTY_FLUSHES_BEFORE_TAKE` dirty finishes the bucket must be taken and
+    /// land its post-UPDATE rows.
+    #[serial]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_bucket_dirtied_by_every_flush_is_taken_not_livelocked() {
+        let (_dir, cfg, project, table) = test_ids_env("lv");
+        let old_ts = crate::support::now_micros() - 2 * crate::write::mem_buffer::bucket_duration_micros();
+        let committed = Arc::new(parking_lot::Mutex::new(Vec::<RecordBatch>::new()));
+        let (entered, release) = (Arc::new(Notify::new()), Arc::new(tokio::sync::Semaphore::new(0)));
+        let cb: DeltaWriteCallback = {
+            let (committed, entered, release) = (committed.clone(), entered.clone(), release.clone());
+            Arc::new(move |_p, _t, batches: Vec<RecordBatch>, _wm| {
+                let (committed, entered, release) = (committed.clone(), entered.clone(), release.clone());
+                Box::pin(async move {
+                    entered.notify_one();
+                    let _ = release.acquire().await;
+                    committed.lock().extend(batches);
+                    Ok(Vec::new())
+                })
+            })
+        };
+        let layer = layer_with(cfg, cb);
+        layer.insert(&project, &table, vec![span_batch("a", "v0", &project, old_ts)]).await.unwrap();
+
+        for round in 1..=DIRTY_FLUSHES_BEFORE_TAKE {
+            let entered_wait = entered.notified();
+            let flusher = {
+                let layer = layer.clone();
+                tokio::spawn(async move { layer.flush_completed_buckets().await })
+            };
+            entered_wait.await;
+            let assignments = vec![("name".to_string(), datafusion::logical_expr::lit(format!("v{round}")))];
+            assert_eq!(layer.update(&project, &table, None, &assignments).unwrap(), 1);
+            release.add_permits(1);
+            flusher.await.unwrap().unwrap();
+            assert!(!layer.is_empty(), "round {round}: a dirty finish keeps the rows");
+        }
+
+        release.add_permits(1);
+        layer.flush_completed_buckets().await.unwrap();
+        assert!(layer.is_empty(), "a bucket dirtied by every snapshot flush must be taken, not re-flushed forever");
+        assert_eq!(layer.snapshot_stats().dirty_livelock_takes_total, 1);
+        let last = committed.lock().last().cloned().expect("the take committed");
+        let names = last.column_by_name("name").map(|c| arrow::util::display::array_value_to_string(c, 0).unwrap());
+        assert_eq!(names.as_deref(), Some(format!("v{DIRTY_FLUSHES_BEFORE_TAKE}").as_str()), "the take must land the post-UPDATE row");
     }
 
     /// Sealed rows must stay queryable while their Delta commit is airborne —

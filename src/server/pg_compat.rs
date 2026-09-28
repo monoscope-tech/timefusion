@@ -906,6 +906,7 @@ impl StatsTableProvider {
                         "backpressure_engaged_total" => s.backpressure_engaged_total,
                         "backpressure_rejected_total" => s.backpressure_rejected_total,
                         "backpressure_force_flush_total" => s.backpressure_force_flush_total,
+                        "dirty_livelock_takes_total" => s.dirty_livelock_takes_total,
                         "flush_completed_total" => s.flush_completed_total,
                         "flush_failed_total" => s.flush_failed_total,
                         // Ingest-vs-drain; `rows_in_buffer_lag` ≈ rows currently buffered.

@@ -1,6 +1,6 @@
 use std::sync::{
     Arc,
-    atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering},
+    atomic::{AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering},
 };
 
 use arrow::{
@@ -275,6 +275,10 @@ pub struct TimeBucket {
     /// time the commit landed pre-DML values and prefix indices may have
     /// shifted, so `finish_flushed_snapshot` must NOT drain.
     mutation_gen: AtomicU64,
+    /// Consecutive snapshot flushes this bucket finished dirty. Continuous DML
+    /// (MoR version appends, pattern-tag UPDATEs) can dirty every snapshot, so
+    /// the flush cycle takes such a bucket destructively instead.
+    dirty_flushes: AtomicU32,
     /// Wall-clock micros of the newest WAL entry pinned here (append time, so
     /// ARRIVAL time). Drives [`MemBuffer::reap_expired_empty_buckets`]'s grace
     /// period.
@@ -1085,6 +1089,19 @@ impl MemBuffer {
         self.buckets_where(filter, |_, id, b| (id, b.created_micros, b.memory_bytes.load(Ordering::Relaxed)))
     }
 
+    /// Buckets whose last `min_dirty` snapshot flushes all finished dirty.
+    pub fn dirty_livelocked_keys(&self, min_dirty: u32) -> Vec<(String, String, i64)> {
+        self.buckets_where(
+            |_| true,
+            |(project_id, table_name), id, b| {
+                (b.dirty_flushes.load(Ordering::Relaxed) >= min_dirty).then(|| (project_id.to_string(), table_name.to_string(), id))
+            },
+        )
+        .into_iter()
+        .flatten()
+        .collect()
+    }
+
     /// (project_id, table_name, bucket_id) for every bucket whose id passes `filter`.
     pub fn bucket_keys(&self, filter: impl Fn(i64) -> bool) -> Vec<(String, String, i64)> {
         self.buckets_where(filter, |(project_id, table_name), id, _| (project_id.to_string(), table_name.to_string(), id))
@@ -1393,9 +1410,11 @@ impl MemBuffer {
             if bucket.mutation_gen.load(Ordering::Relaxed) != b.snapshot_gen {
                 // Dirty: re-pin and re-flush next cycle.
                 bucket.restore_holds(&b.wal_first_positions);
+                bucket.dirty_flushes.fetch_add(1, Ordering::Relaxed);
                 info!("finish_flushed_snapshot: bucket {}.{}/{} mutated mid-flight — keeping rows for re-flush", b.project_id, b.table_name, b.bucket_id);
                 return false;
             }
+            bucket.dirty_flushes.store(0, Ordering::Relaxed);
             let n = b.batches.len().min(g.len());
             let (freed, rows): (usize, usize) =
                 g.drain(..n).map(|batch| (estimate_batch_size(&batch), batch.num_rows())).fold((0, 0), |a, x| (a.0 + x.0, a.1 + x.1));
@@ -1522,6 +1541,7 @@ impl MemBuffer {
         let batches: Vec<RecordBatch> = std::mem::take(&mut *batches_g);
         let wal_state = std::mem::take(&mut *wal_g);
         bucket.flush_pinned_prefix.store(0, Ordering::Relaxed);
+        bucket.dirty_flushes.store(0, Ordering::Relaxed);
         let freed = bucket.memory_bytes.swap(0, Ordering::Relaxed);
         let row_count = bucket.row_count.swap(0, Ordering::Relaxed);
         // Capture the real range as the sentinels reset, so a restore (on Delta
@@ -2351,6 +2371,7 @@ impl TimeBucket {
             wal_shard_state: Mutex::new(WalShardState::default()),
             flush_pinned_prefix: AtomicUsize::new(0),
             mutation_gen: AtomicU64::new(0),
+            dirty_flushes: AtomicU32::new(0),
             last_wal_pin_micros: AtomicI64::new(crate::support::now_micros()),
             first_wal_pin_micros: AtomicI64::new(i64::MAX),
         }
