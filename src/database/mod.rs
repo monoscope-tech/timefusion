@@ -2681,6 +2681,8 @@ pub struct Database {
     rollup_slice_coverage: Arc<dashmap::DashMap<RollupSliceCoverageKey, RollupCoverage>>,
     /// Sources whose `recover_rollup_coverage` has completed in this process.
     rollup_coverage_recovered: Arc<dashmap::DashSet<String>>,
+    /// `(window start, DV-bearing rewrites landed in it)` per `(project, source, date)`.
+    dv_strips_landed: dashmap::DashMap<(String, String, String), (i64, u32)>,
     /// `partition_file_rows` memoized per source table, keyed by the Delta
     /// version it was computed from — a new commit invalidates it naturally.
     /// Without this the bounded-witness rescue re-materialized the add-actions
@@ -3374,6 +3376,7 @@ impl Database {
             rollup_coverage: Arc::new(dashmap::DashMap::new()),
             rollup_slice_coverage: Arc::new(dashmap::DashMap::new()),
             rollup_coverage_recovered: Arc::new(dashmap::DashSet::new()),
+            dv_strips_landed: dashmap::DashMap::new(),
             rollup_file_rows_cache: dashmap::DashMap::new(),
             witness_carry: Arc::default(),
             rollup_tier_untagged: Arc::new(dashmap::DashMap::new()),
@@ -6081,6 +6084,8 @@ pub(crate) struct BinPolicy {
     /// Exclude sorted runs while any unsorted file is present, so L0 arrivals are
     /// sorted into runs before runs are merged with each other.
     pub level_unsorted_first: bool,
+    /// A lone DV-bearing file is work: rewriting it retires its masked rows.
+    pub strip_dv: bool,
 }
 
 /// THE bin packer. One implementation, both callers.
@@ -6156,9 +6161,10 @@ pub(crate) fn select_bin(candidates: &[TailAdd], policy: BinPolicy) -> Vec<Strin
         rows = rows.saturating_add(add.rows.unwrap_or(0));
         selected.push(add);
     }
-    // A lone UNSORTED file is real work: sorting it into a run is the L0 pass.
-    // Everywhere else a one-file bin is a 1:1 rewrite that retires nothing.
-    if selected.len() < 2 && !has_unsorted {
+    // A lone UNSORTED file is real work: sorting it into a run is the L0 pass, and
+    // so is a lone DV file under `strip_dv`. Everywhere else a one-file bin is a
+    // 1:1 rewrite that retires nothing.
+    if selected.len() < 2 && !has_unsorted && !(policy.strip_dv && selected.iter().any(|add| add.has_dv)) {
         return Vec::new();
     }
     selected.into_iter().map(|add| add.path.clone()).collect()
@@ -6177,16 +6183,20 @@ pub(crate) fn slice_bounds(covered: impl IntoIterator<Item = i64>, day_start: i6
 }
 
 /// `adds` grouped by the cell between consecutive sorted `bounds` each lies
-/// wholly inside. A straddler, a file without an event range, or a DV'd file
-/// (packing drops its masked rows, moving every bound above) joins no cell.
+/// wholly inside. A straddler or a file without an event range joins no cell.
+/// Nor does a DV'd file unless `strip_dv`: packing drops its masked rows, moving
+/// every bound above, which only `carry_rewrite_witness` repairs. Under it a DV
+/// file outside every cell is a cell of its own — a rewrite of it ALONE keeps
+/// its output inside its input's range, so it crosses no bound it did not.
 /// THE one grouping the planner and the packer share; no bounds is one cell.
-pub(crate) fn slice_cells(adds: impl IntoIterator<Item = TailAdd>, bounds: &[i64]) -> Vec<Vec<TailAdd>> {
+pub(crate) fn slice_cells(adds: impl IntoIterator<Item = TailAdd>, bounds: &[i64], strip_dv: bool) -> Vec<Vec<TailAdd>> {
     let cell = |t: i64| bounds.partition_point(|bound| *bound <= t);
     adds.into_iter()
-        .filter_map(|add| match add.event_range {
+        .enumerate()
+        .filter_map(|(i, add)| match add.event_range {
             _ if bounds.is_empty() => Some((0, add)),
-            _ if add.has_dv => None,
-            Some((min, max)) if cell(min) == cell(max) => Some((cell(min), add)),
+            Some((min, max)) if cell(min) == cell(max) && (strip_dv || !add.has_dv) => Some((cell(min), add)),
+            _ if strip_dv && add.has_dv => Some((bounds.len() + 1 + i, add)),
             _ => None,
         })
         .into_group_map()
@@ -6196,9 +6206,12 @@ pub(crate) fn slice_cells(adds: impl IntoIterator<Item = TailAdd>, bounds: &[i64
         .collect()
 }
 
-/// What the planner may queue: the files of every cell holding a pair.
-pub(crate) fn cells_with_pair(cells: Vec<Vec<TailAdd>>) -> Vec<TailAdd> {
-    cells.into_iter().filter(|cell| cell.len() >= 2).flatten().collect()
+/// What the planner queues a partition on: the under-`target` files — and under
+/// `strip_dv` every DV file — of each cell holding a pair or a DV file. Empty
+/// means compliant. The packer bins exactly these through `select_cell_bin`.
+pub(crate) fn hygiene_debt(files: impl IntoIterator<Item = TailAdd>, target: i64, bounds: &[i64], strip_dv: bool) -> Vec<TailAdd> {
+    let small = files.into_iter().filter(|add| add.size < target || (strip_dv && add.has_dv)).sorted_by_key(|add| add.size);
+    slice_cells(small, bounds, strip_dv).into_iter().filter(|cell| cell.len() >= 2 || (strip_dv && cell.iter().any(|add| add.has_dv))).flatten().collect()
 }
 
 /// What the packer takes: the fullest bin any single cell yields.
@@ -6489,6 +6502,7 @@ pub(crate) fn select_tail_bin(adds: &[TailAdd], target_size: i64, min_files: usi
             order: BinOrder::EventTime,
             // Sortedness is handled by `sorted_run_cap` above, not by levelling.
             level_unsorted_first: false,
+            strip_dv: false,
         },
     );
     // Gap rule, for TODAY only: once a project has no packable slice left, spend

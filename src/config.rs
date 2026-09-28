@@ -2296,6 +2296,17 @@ pub struct MaintenanceConfig {
     /// of the source keys. Sound: a bloom filter never false-negatives.
     #[serde_inline_default(true)]
     pub timefusion_dml_merge_key_prune: bool,
+    /// Rewrite deletion-vector files DV-free, alone if need be: a DV'd file
+    /// decodes every masked row on every read, and nothing else removes one.
+    /// Dark: enabling it releases the stranded backlog as one burst.
+    #[serde_inline_default(false)]
+    pub timefusion_dv_strip_enabled: bool,
+    /// DV-bearing rewrites one partition may land per `timefusion_dv_strip_interval_secs`.
+    /// Today's DVs keep arriving while dedup runs, so this bounds the re-strip churn.
+    #[serde_inline_default(4)]
+    pub timefusion_dv_strip_per_interval: u32,
+    #[serde_inline_default(600)]
+    pub timefusion_dv_strip_interval_secs: u64,
 }
 
 impl MaintenanceConfig {
@@ -2647,6 +2658,7 @@ mod tests {
         assert!(config.maintenance.timefusion_evict_after_compaction);
         // Merge-on-read DV is the default write path.
         assert!(config.maintenance.timefusion_use_deletion_vectors);
+        assert!(!config.maintenance.timefusion_dv_strip_enabled, "the DV strip releases a stranded backlog as a burst, so it ships dark");
         assert!(!config.maintenance.timefusion_warm_full_files);
         assert_eq!(config.maintenance.timefusion_warm_recency_days, 35);
         assert_eq!(config.maintenance.timefusion_warm_concurrency, 16);

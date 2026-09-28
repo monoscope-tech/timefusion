@@ -1727,16 +1727,19 @@ impl Database {
                 // SIZE only. Sortedness belongs to Repair below: an untagged file
                 // is only a *suspect*, and admitting on that would put every
                 // flush-written partition permanently out of policy.
-                let small = files.iter().filter(|file| file.size < small_target).sorted_by_key(|file| file.size).cloned();
+                // A DV file is debt at any size while the strip lane admits it.
+                let strip = self.dv_strip_admits(&project_id, &source, &date.to_string());
                 // Today, only files sharing a rollup slice cell may pair — the
                 // packer groups by the SAME `slice_cells` over the same bounds.
                 let bounds = if date == today { self.packing_bounds(&project_id, &source, day_start) } else { Some(Vec::new()) };
-                let small = bounds.map_or_else(Vec::new, |bounds| cells_with_pair(slice_cells(small, &bounds)));
-                // TWO under-target files ARE the admission test. The packer's byte
-                // budget carries `pair_floor`, so it bins any two of these; a
-                // second, separately-derived predicate here is exactly how planner
-                // and packer drifted apart into a three-day spin (2026-09-15).
-                if small.len() >= 2 {
+                let small = bounds.map_or_else(Vec::new, |bounds| hygiene_debt(files.iter().cloned(), small_target, &bounds, strip));
+                // TWO under-target files, or one DV file under `strip`, ARE the
+                // admission test. The packer's byte budget carries `pair_floor`, so
+                // it bins any two of these, and `strip_dv` lifts its lone-file veto
+                // for a DV file; a second, separately-derived predicate here is
+                // exactly how planner and packer drifted apart into a three-day
+                // spin (2026-09-15).
+                if !small.is_empty() {
                     let operation = if date == today { Operation::HotPacking } else { Operation::SealedConsolidation };
                     planned_keys.insert((project_id.clone(), date, operation));
                     // Age from when the partition SEALED, so starvation escalation
@@ -3900,7 +3903,8 @@ impl Database {
         let bounds =
             if key.operation == Operation::HotPacking { self.packing_bounds(&key.project_id, &key.source, key.slice.start_micros) } else { Some(Vec::new()) };
         let Some(bounds) = bounds else { return Ok(Vec::new()) };
-        let cells = slice_cells(candidates, &bounds);
+        let strip = self.dv_strip_admits(&key.project_id, &key.source, &date);
+        let cells = slice_cells(candidates, &bounds, strip);
         let selected = select_cell_bin(
             &cells,
             BinPolicy {
@@ -3916,6 +3920,7 @@ impl Database {
                 // runs merge with each other.
                 order: crate::database::BinOrder::SmallestFirst,
                 level_unsorted_first: true,
+                strip_dv: strip,
             },
         );
         // Span of the output: merging unions the inputs' ranges and dedup reads a file
@@ -4016,6 +4021,7 @@ impl Database {
         if actions.is_empty() {
             return Ok(());
         }
+        let retired = targets.iter().filter(|add| live.contains(&add.path)).cloned().collect_vec();
         let schema = get_schema(table_name).ok_or_else(|| anyhow::anyhow!("corpse retire: schema missing for {table_name}"))?;
         let removed = actions.len();
         let op = DeltaOperation::Write { mode: SaveMode::Overwrite, partition_by: Some(schema.partitions.clone()), predicate: None };
@@ -4028,6 +4034,7 @@ impl Database {
         .await?;
         table.state = Some(finalized.snapshot());
         drop(guard);
+        self.carry_rewrite_witness(&table, table_name, project_id, &retired, &[]);
         self.swap_and_refresh_cache(table_ref, table, None, &[]).await;
         warn!(table_name, project_id, removed, event = "compaction_retired_masked_corpses", "removed fully deletion-masked files a rewrite could never retire");
         Ok(())
@@ -4252,6 +4259,7 @@ impl Database {
         note(6);
         if let Some(bin) = self.resumable_staged_bin(&table_ref, &key.source, &key.project_id, &files).await {
             let result = self.commit_wave(&table_ref, &key.source, std::slice::from_ref(&date_marker), false, vec![bin], 0).await;
+            self.note_masked_rewrites_landed(&table_ref, &key, &result.landed).await;
             let landed = result.failed.is_empty() && !result.landed.is_empty();
             info!(table_name = %key.source, project_id = %key.project_id, landed, event = "resumed_bin_committed_early");
             if landed {
@@ -4274,6 +4282,7 @@ impl Database {
         let (completed, made_progress) = match outcome {
             Ok(BinOutcome::Staged(unit)) => {
                 let result = self.commit_wave(&table_ref, &key.source, std::slice::from_ref(&date_marker), false, vec![unit], 0).await;
+                self.note_masked_rewrites_landed(&table_ref, &key, &result.landed).await;
                 let landed = result.failed.is_empty() && !result.landed.is_empty();
                 (landed, landed)
             }
@@ -5301,6 +5310,99 @@ impl Database {
         });
         crate::observability::dml_stats().rollup_carry_applied_rows.fetch_add(rows, std::sync::atomic::Ordering::Relaxed);
         debug!(project_id, source, date, rows, carried, event = "rollup_witness_carried_across_version_append");
+    }
+
+    /// Re-stamp the rollup slice witnesses of a partition across a landed rewrite
+    /// that dropped deletion-masked rows (`inputs` replaced by `outputs`).
+    ///
+    /// Such a rewrite is a LOGICAL identity: every reader already applies the DV,
+    /// and staging checks the outputs hold exactly the live rows. So each slice
+    /// still aggregates the input it did and only the physical `num_records`
+    /// witnesses moved. That holds whoever wrote the DV. On a rollup source it is
+    /// always DV-dedup, masking keep-greatest losers the build's own dedup never
+    /// counted: both sources are `version_append`, whose DML appends versions and
+    /// tombstones instead of masking. Any other source's DML invalidates the hours
+    /// it touches (`invalidate_rollup_dml`) before its DV lands.
+    /// A change the physical witness was already blind to stays exactly as blind:
+    /// only a witness that proved the pre-rewrite state is carried
+    /// (`rollup::carried_witness`), which also makes a race with a concurrent
+    /// build harmless.
+    ///
+    /// In-memory, like the other carries: a restart re-reads `TAG_SOURCE_ROWS`,
+    /// so a carried slice is rebuilt once after one.
+    pub(crate) fn carry_rewrite_witness(
+        &self, table: &DeltaTable, source: &str, project_id: &str, inputs: &[deltalake::kernel::Add], outputs: &[deltalake::kernel::Add],
+    ) {
+        let side = |adds: &[deltalake::kernel::Add]| {
+            adds.iter().map(|add| (add_ts_bounds(add).1, add_row_count(add).and_then(|rows| i64::try_from(rows).ok()).unwrap_or(0))).collect_vec()
+        };
+        let Some(date) = inputs.first().and_then(|add| add.partition_values.get("date").cloned().flatten()) else { return };
+        let (Some(day_start), Ok(files)) = (date_start_micros(&date), Self::partition_file_rows(table)) else { return };
+        let (live, inputs, outputs) = (partition_of(&files, project_id, &date).unwrap_or_default(), side(inputs), side(outputs));
+        let day = day_start..day_start.saturating_add(DAY_MICROS);
+        let mut carried = 0u64;
+        for mut entry in self.rollup_slice_coverage.iter_mut() {
+            let (project, held_source, _, start, _) = entry.key();
+            if project != project_id || held_source != source || !day.contains(start) {
+                continue;
+            }
+            let coverage = entry.value_mut();
+            let bound = coverage.covered_through;
+            for (held, bound) in [(&mut coverage.source_rows, i64::MAX), (&mut coverage.source_rows_below, bound)] {
+                if let Some(rows) =
+                    held.and_then(|held| crate::rollup::carried_witness(held, live, &inputs, &outputs, bound)).filter(|rows| Some(*rows) != *held)
+                {
+                    *held = Some(rows);
+                    carried += 1;
+                }
+            }
+        }
+        crate::observability::maintenance_stats().rollup_witness_carried.fetch_add(carried, std::sync::atomic::Ordering::Relaxed);
+        debug!(source, project_id, date, carried, event = "rollup_witness_carried_across_rewrite");
+    }
+
+    /// THE strip-lane admission, one predicate for planner and packer so they
+    /// cannot disagree: the flag, the source's slice coverage recovered (before
+    /// that the rewrite's carry finds nothing to carry and every slice of the day
+    /// goes stale), and the partition's landing budget.
+    fn dv_strip_admits(&self, project_id: &str, source: &str, date: &str) -> bool {
+        let (cfg, interval) = (&self.config.maintenance, self.dv_strip_interval_micros());
+        cfg.timefusion_dv_strip_enabled
+            && (get_schema(source).is_none_or(|schema| schema.rollups.is_empty()) || self.rollup_coverage_recovered.contains(source))
+            && self.dv_strips_landed.get(&(project_id.to_owned(), source.to_owned(), date.to_owned())).is_none_or(|entry| {
+                let (since, landed) = *entry;
+                crate::support::now_micros().saturating_sub(since) >= interval || landed < cfg.timefusion_dv_strip_per_interval
+            })
+    }
+
+    fn dv_strip_interval_micros(&self) -> i64 {
+        i64::try_from(self.config.maintenance.timefusion_dv_strip_interval_secs).unwrap_or(i64::MAX).saturating_mul(1_000_000)
+    }
+
+    /// Bookkeeping for landed compaction bins whose inputs carried a DV: they
+    /// dropped the masked rows, so carry the witness and spend the strip budget.
+    async fn note_masked_rewrites_landed(&self, table_ref: &Arc<RwLock<DeltaTable>>, key: &crate::maintenance_coordinator::TaskKey, landed: &[StagedBin]) {
+        let masked = landed.iter().filter(|bin| bin.targets.iter().any(|add| add.deletion_vector.is_some())).collect_vec();
+        if masked.is_empty() {
+            return;
+        }
+        let table = table_ref.read().await;
+        let stats = crate::observability::maintenance_stats();
+        for bin in &masked {
+            let outputs =
+                bin.adds.iter().filter_map(|action| if let deltalake::kernel::Action::Add(add) = action { Some(add.clone()) } else { None }).collect_vec();
+            self.carry_rewrite_witness(&table, &key.source, &bin.project_id, &bin.targets, &outputs);
+            let retired = bin.targets.iter().filter_map(|add| add.deletion_vector.as_ref()).map(|dv| u64::try_from(dv.cardinality).unwrap_or(0)).sum::<u64>();
+            stats.dv_rewrite_rows_retired.fetch_add(retired, std::sync::atomic::Ordering::Relaxed);
+        }
+        stats.dv_rewrites_landed.fetch_add(masked.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        let Some(date) = chrono::DateTime::from_timestamp_micros(key.slice.start_micros).map(|time| time.date_naive().to_string()) else { return };
+        let (now, interval) = (crate::support::now_micros(), self.dv_strip_interval_micros());
+        let mut entry = self.dv_strips_landed.entry((key.project_id.clone(), key.source.clone(), date)).or_insert((now, 0));
+        if now.saturating_sub(entry.0) >= interval {
+            *entry = (now, 0);
+        }
+        entry.1 = entry.1.saturating_add(masked.len() as u32);
     }
 
     /// After a flush commit lands: carry each date's eligible rows, bounded by the
@@ -8159,6 +8261,14 @@ impl Database {
         // the predicate that decides the footer.
         let order_by = schema_order_by_clause(schema);
         let sorted = !order_by.is_empty();
+        let dv_strip = pass == TailPass::Pack && matches!(&targets[..], [add] if add.deletion_vector.is_some() && add.tags.as_ref().is_some_and(is_sorted_run));
+        // Rows the inputs hold that no reader sees; a rewrite must drop exactly
+        // these, which is what lets `carry_rewrite_witness` treat it as an identity.
+        let live_in: Option<u64> = targets
+            .iter()
+            .map(|add| add_row_count(add)?.checked_sub(add.deletion_vector.as_ref().map_or(Some(0), |dv| u64::try_from(dv.cardinality).ok())?))
+            .sum();
+        let masked_in = targets.iter().any(|add| add.deletion_vector.is_some());
         let staged: Result<()> = async {
             // File-scoped provider over the pinned snapshot: reads exactly this
             // bin's files, so no predicate and no per-file stats parsing.
@@ -8205,7 +8315,9 @@ impl Database {
             // has a usable non-null range — a NULL would sort outside every
             // slice and be silently dropped.
             let lead = schema.sorting_columns.first();
-            let slice_target = coordinator_slice_target(pass, targets.len(), bytes_in);
+            // A lone SORTED DV file is a strip: an order-preserving filter copy whose
+            // footer ordering carries the ORDER BY, so it is never re-cut like an L0 file.
+            let slice_target = if dv_strip { None } else { coordinator_slice_target(pass, targets.len(), bytes_in) };
             let slice_col = lead.filter(|_| sorted).and_then(|c| slice_target.map(|target| (c.name.clone(), target)));
             let slices: Vec<String> = match slice_col {
                 None => Vec::new(),
@@ -8287,6 +8399,9 @@ impl Database {
                 let planned_at = std::time::Instant::now();
                 let plan = ctx.sql(&format!("SELECT * FROM {bin_table}{predicate}{order_by}")).await?.create_physical_plan().await?;
                 t_plan += planned_at.elapsed();
+                if dv_strip && datafusion::physical_plan::displayable(plan.as_ref()).indent(false).to_string().contains("SortExec") {
+                    crate::observability::maintenance_stats().dv_strip_plan_sorts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 // Held for the life of the stream: the sort below it can run for
                 // most of the unit without emitting a row.
                 let _progress = PlanProgress::watch(Arc::clone(&plan));
@@ -8320,6 +8435,9 @@ impl Database {
                 }
             }
             let _ = ctx.deregister_table(&bin_table);
+            if masked_in && live_in.is_some_and(|live| live != rows_staged as u64) {
+                anyhow::bail!("masked rewrite staged {rows_staged} rows but the inputs hold {live_in:?} live — refusing to commit a lossy rewrite");
+            }
             if rows_staged == 0 {
                 // Staging nothing is either an empty selection or a bin of
                 // fully-deletion-masked corpses; the OUTER exit tells them apart
@@ -11415,6 +11533,79 @@ mod rollup_noop_skip_tests {
         User,
         UserElsewhere,
         Ingest,
+    }
+
+    /// A deletion-vector file rewritten ALONE and DV-free keeps its rollup slice
+    /// routed. The strip retires only rows no reader sees, so the carry re-stamps
+    /// the physical witness; without it every slice of the day reads as moved.
+    /// Also the COST claim: afterwards a scan decodes only the live rows, and the
+    /// strip's own plan paid no sort.
+    #[serial]
+    #[tokio::test]
+    async fn a_dv_strip_retires_masked_rows_and_keeps_the_slice_routed() -> Result<()> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut cfg = (*rollup_cfg("dv_strip")).clone();
+        cfg.maintenance.timefusion_dv_strip_enabled = true;
+        let db = Arc::new(Database::with_config(Arc::new(cfg)).await?);
+        let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+        let date = chrono::Utc::now().date_naive() - chrono::Duration::days(3);
+        let noon = date.and_hms_opt(12, 0, 0).expect("valid hour").and_utc().timestamp_micros();
+        // Prod's DV files are sorted runs, i.e. compaction outputs: pack two flush
+        // files into one, then dedup masks one row of its three.
+        for rows in [
+            vec![test_span_ts("dup", "first", &project_id, noon), test_span_ts("other", "op", &project_id, noon + 1)],
+            vec![test_span_ts("dup", "second", &project_id, noon)],
+        ] {
+            db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![json_to_batch(rows)?], true, None).await?;
+        }
+        let table = db.resolve_table(&project_id, "otel_logs_and_spans").await?;
+        let partition = || async {
+            let t = table.read().await;
+            let adds = t.snapshot()?.log_data().iter().map(|f| add_action(&f)).filter(|add| add.path.contains(&project_id)).collect_vec();
+            anyhow::Ok((adds.len(), adds.iter().filter(|add| add.deletion_vector.is_some()).count(), adds.iter().filter_map(add_row_count).sum::<u64>()))
+        };
+        db.plan_compaction_debt().await?;
+        assert!(db.run_coordinator_compaction_once(Operation::SealedConsolidation).await?);
+        assert_eq!(partition().await?, (1, 0, 3), "precondition: one sorted run");
+        dedup_unified(&db).await?;
+        assert_eq!(partition().await?, (1, 1, 3), "precondition: one deletion vector over three physical rows");
+        db.plan_rollup_backfill().await?;
+        assert!(advance_and_drain(&db).await? > 0, "the fixture needs a built slice");
+        db.recover_rollup_coverage("otel_logs_and_spans").await?;
+
+        let mut ctx = Arc::clone(&db).create_session_context();
+        db.setup_session_context(&mut ctx)?;
+        let (lo, hi) = db
+            .rollup_slice_coverage
+            .iter()
+            .find(|entry| entry.key().0 == project_id && entry.key().2 == TIER && entry.key().3 <= noon && noon < entry.key().4)
+            .map(|entry| (entry.key().3, entry.key().4))
+            .expect("the base slice holding the rows");
+        let sql = format!(
+            "SELECT COUNT(*) AS c FROM otel_logs_and_spans WHERE project_id='{project_id}' AND timestamp >= to_timestamp_micros({lo}) AND timestamp < to_timestamp_micros({hi})"
+        );
+        let answer = || async {
+            let state = ctx.state();
+            let plan = state.optimize(&state.create_logical_plan(&sql).await?)?;
+            let routed = matches!(db.rollup_sql(&plan, &state).await, Ok(Some(_)));
+            let render = |batches: Vec<RecordBatch>| arrow::util::pretty::pretty_format_batches(&batches).map(|table| table.to_string());
+            anyhow::Ok((routed, render(ctx.sql(&sql).await?.collect().await?)?, render(db.query_delta_only(&sql).await?)?))
+        };
+        let (routed, served, raw) = answer().await?;
+        assert!(routed, "the slice must route before the strip");
+        assert_eq!(served, raw);
+
+        let stats = crate::observability::maintenance_stats();
+        let sorts = stats.dv_strip_plan_sorts.load(Relaxed);
+        db.plan_compaction_debt().await?;
+        assert!(db.run_coordinator_compaction_once(Operation::SealedConsolidation).await?, "a lone DV file is sealed-consolidation debt");
+        assert_eq!(partition().await?, (1, 0, 2), "rewritten DV-free, physical rows = the two live rows");
+        assert_eq!(stats.dv_strip_plan_sorts.load(Relaxed), sorts, "a strip is a filter copy: the footer ordering carries the ORDER BY");
+
+        let (routed, served, after) = answer().await?;
+        assert!(routed, "the carried witness keeps the slice routed across the strip");
+        assert_eq!((served, after), (raw.clone(), raw), "and it answers exactly as before, and as raw");
+        Ok(())
     }
 
     /// A landed dedup must CARRY the rollup witness, not invalidate it.

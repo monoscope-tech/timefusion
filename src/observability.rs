@@ -1692,6 +1692,13 @@ atomic_stats! {
         /// queues the cell on. Structurally impossible now that both sides share
         /// one rule; any non-zero value is a regression of the 2026-09-15 wedge.
         compaction_invariant_violations as "compaction_invariant_violations",
+        /// Landed compaction bins whose inputs carried a deletion vector, and the
+        /// masked rows they retired — what `timefusion_dv_strip_enabled` buys.
+        dv_rewrites_landed as "dv_rewrites_landed_total",
+        dv_rewrite_rows_retired as "dv_rewrite_rows_retired_total",
+        /// Strip plans that still paid a sort: the footer ordering did not carry
+        /// the ORDER BY. Should stay 0; each one is a whole-file sort.
+        dv_strip_plan_sorts as "dv_strip_plan_sorts_total",
         /// Admission capacities and the live lag-scaled CPU limit. Without these,
         /// a used-token gauge pinned at 28 cannot distinguish saturation from an
         /// accidental 28-token configuration ceiling.

@@ -5092,7 +5092,10 @@ fn rows_file(path: &str, bytes: i64, rows: u64) -> super::TailAdd {
 /// The coordinator's own policy through the SHARED packer, so these tests
 /// exercise the exact call `coordinator_compaction_files` makes.
 fn coordinator_bin(files: Vec<super::TailAdd>, target: i64) -> Vec<String> {
-    super::select_bin(&files, super::BinPolicy { target_size: target, max_rows: u64::MAX, order: super::BinOrder::SmallestFirst, level_unsorted_first: true })
+    super::select_bin(
+        &files,
+        super::BinPolicy { target_size: target, max_rows: u64::MAX, order: super::BinOrder::SmallestFirst, level_unsorted_first: true, strip_dv: false },
+    )
 }
 
 /// One coordinator selection pass at the sealed byte target.
@@ -5535,8 +5538,10 @@ fn both_compaction_paths_pack_to_the_same_budget() {
     let target = 256 * MB;
 
     let coordinator = coordinator_bin(adds.clone(), target);
-    let offbox =
-        super::select_bin(&adds, super::BinPolicy { target_size: target, max_rows: u64::MAX, order: super::BinOrder::EventTime, level_unsorted_first: false });
+    let offbox = super::select_bin(
+        &adds,
+        super::BinPolicy { target_size: target, max_rows: u64::MAX, order: super::BinOrder::EventTime, level_unsorted_first: false, strip_dv: false },
+    );
 
     let bytes = |bin: &[String]| bin.len() as i64 * 40 * MB;
     assert_eq!(bytes(&coordinator), bytes(&offbox), "the two paths packed different BYTES: coordinator {:?}, offbox {:?}", coordinator, offbox);
@@ -5815,35 +5820,58 @@ fn the_packer_bins_every_pair_the_planner_queues() {
 /// Minutes past midnight; `dv` indexes files carrying a deletion vector;
 /// `covered: None` is a source declaring no rollups.
 /// Returns (planner queues, files packed).
-#[test_case(&[Some((1, 4)), Some((5, 9))], &[], Some(vec![10]) => (true, 2) ; "a pair inside one cell packs")]
-#[test_case(&[Some((1, 4)), Some((11, 14))], &[], Some(vec![10]) => (false, 0) ; "a pair split by a live bound is not queued")]
-#[test_case(&[Some((1, 4)), Some((5, 9)), Some((8, 12))], &[], Some(vec![10]) => (true, 2) ; "a straddler joins no bin and the pair still packs")]
-#[test_case(&[Some((1, 4)), None], &[], Some(vec![10]) => (false, 0) ; "a file without an event range joins no cell")]
-#[test_case(&[Some((11, 14)), Some((16, 19))], &[], Some(vec![10, 15]) => (false, 0) ; "an off-grid bisected bound is respected")]
-#[test_case(&[Some((1, 4)), Some((11, 14))], &[], Some(vec![]) => (false, 0) ; "the unbuilt tail is cut on the 10-minute grid")]
-#[test_case(&[Some((0, 560)), Some((561, 565)), Some((566, 569))], &[], Some((1..=56).map(|k| k * 10).collect()) => (true, 2) ; "the whole-day straddler stops growing")]
-#[test_case(&[Some((1, 4)), Some((11, 14))], &[], None => (true, 2) ; "a source without rollups packs across cells")]
-#[test_case(&[Some((1, 4)), Some((5, 9))], &[0], Some(vec![10]) => (false, 0) ; "a DV file joins no cell, so its cellmate is no pair")]
-fn planner_and_packer_pair_only_within_a_slice_cell(ranges: &[Option<(i64, i64)>], dv: &[usize], covered: Option<Vec<i64>>) -> (bool, usize) {
+#[test_case(&[Some((1, 4)), Some((5, 9))], &[], Some(vec![10]), false => (true, 2) ; "a pair inside one cell packs")]
+#[test_case(&[Some((1, 4)), Some((11, 14))], &[], Some(vec![10]), false => (false, 0) ; "a pair split by a live bound is not queued")]
+#[test_case(&[Some((1, 4)), Some((5, 9)), Some((8, 12))], &[], Some(vec![10]), false => (true, 2) ; "a straddler joins no bin and the pair still packs")]
+#[test_case(&[Some((1, 4)), None], &[], Some(vec![10]), false => (false, 0) ; "a file without an event range joins no cell")]
+#[test_case(&[Some((11, 14)), Some((16, 19))], &[], Some(vec![10, 15]), false => (false, 0) ; "an off-grid bisected bound is respected")]
+#[test_case(&[Some((1, 4)), Some((11, 14))], &[], Some(vec![]), false => (false, 0) ; "the unbuilt tail is cut on the 10-minute grid")]
+#[test_case(&[Some((0, 560)), Some((561, 565)), Some((566, 569))], &[], Some((1..=56).map(|k| k * 10).collect()), false => (true, 2) ; "the whole-day straddler stops growing")]
+#[test_case(&[Some((1, 4)), Some((11, 14))], &[], None, false => (true, 2) ; "a source without rollups packs across cells")]
+#[test_case(&[Some((1, 4)), Some((5, 9))], &[0], Some(vec![10]), false => (false, 0) ; "a DV file joins no cell, so its cellmate is no pair")]
+#[test_case(&[Some((1, 4)), Some((5, 9))], &[0], Some(vec![10]), true => (true, 2) ; "under the strip a DV file packs with its cellmate")]
+#[test_case(&[Some((8, 12))], &[0], Some(vec![10]), false => (false, 0) ; "a straddling DV file is stranded without the strip")]
+#[test_case(&[Some((8, 12))], &[0], Some(vec![10]), true => (true, 1) ; "a straddling DV file is stripped alone")]
+#[test_case(&[Some((8, 12)), Some((1, 4))], &[0], Some(vec![10]), true => (true, 1) ; "a DV straddler beside a lone clean file is stripped alone")]
+#[test_case(&[Some((1, 4)), Some((11, 14))], &[0, 1], Some(vec![10]), true => (true, 1) ; "DV-only cells are stripped one file at a time")]
+fn planner_and_packer_pair_only_within_a_slice_cell(ranges: &[Option<(i64, i64)>], dv: &[usize], covered: Option<Vec<i64>>, strip: bool) -> (bool, usize) {
     const MINUTE: i64 = 60_000_000;
     let minutes = |(lo, hi): (i64, i64)| (lo * MINUTE, hi * MINUTE);
     let adds = ranges.iter().enumerate().map(|(i, range)| tail_file(&format!("f{i}"), 10 * MB, true, range.map(minutes), dv.contains(&i), None)).collect_vec();
     let bounds = covered.map_or_else(Vec::new, |covered| super::slice_bounds(covered.into_iter().map(|minute| minute * MINUTE), 0));
-    let queued = super::cells_with_pair(super::slice_cells(adds.clone(), &bounds)).len() >= 2;
-    let policy = super::BinPolicy {
-        target_size: super::COORDINATOR_HOT_TARGET_BYTES,
-        max_rows: u64::MAX,
-        order: super::BinOrder::SmallestFirst,
-        level_unsorted_first: true,
-    };
-    let packed = super::select_cell_bin(&super::slice_cells(adds.clone(), &bounds), policy);
+    let queued = !super::hygiene_debt(adds.clone(), super::COORDINATOR_HOT_TARGET_BYTES, &bounds, strip).is_empty();
+    let packed = super::select_cell_bin(&super::slice_cells(adds.clone(), &bounds, strip), hygiene_policy(super::COORDINATOR_HOT_TARGET_BYTES, strip));
     // `rows_below`'s own rule: a file is below a bound unless its max is known and reaches it.
     for bound in &bounds {
         let sides = packed.iter().filter_map(|path| adds.iter().find(|add| &add.path == path)).map(|add| !add.event_range.is_some_and(|(_, hi)| hi >= *bound));
         assert!(sides.unique().count() <= 1, "bin {packed:?} straddles live bound {}", bound / MINUTE);
     }
-    assert_eq!(queued, packed.len() >= 2, "the planner queues exactly what the packer bins");
+    assert_eq!(queued, !packed.is_empty(), "the planner queues exactly what the packer bins");
     (queued, packed.len())
+}
+
+/// The coordinator packer's policy, `strip_dv` as the strip lane admits it.
+fn hygiene_policy(target_size: i64, strip_dv: bool) -> super::BinPolicy {
+    super::BinPolicy { target_size, max_rows: u64::MAX, order: super::BinOrder::SmallestFirst, level_unsorted_first: true, strip_dv }
+}
+
+/// Sealed dates have no bounds, so every file shares one cell. A DV file was
+/// never debt there: the planner queued only under-target pairs, and the
+/// packer's lone-file veto refused a single sorted DV file — 56 stranded files
+/// on prod's sealed week. Returns what the packer rewrites; the planner must
+/// queue exactly when that is non-empty.
+#[test_case(&[300, 400], &[0], true => vec!["f0"] ; "a DV file beside an oversized clean file is stripped alone")]
+#[test_case(&[300, 400], &[0], false => Vec::<String>::new() ; "without the strip the lone-file veto strands it")]
+#[test_case(&[100], &[0], true => vec!["f0"] ; "a lone DV file is stripped")]
+#[test_case(&[300, 500], &[0, 1], true => vec!["f0", "f1"] ; "two DV files pack together")]
+#[test_case(&[300, 500], &[], true => Vec::<String>::new() ; "oversized clean files stay converged")]
+fn a_sealed_dv_file_is_rewritten_even_alone(sizes_mb: &[i64], dv: &[usize], strip: bool) -> Vec<String> {
+    let adds = sizes_mb.iter().enumerate().map(|(i, size)| tail_file(&format!("f{i}"), size * MB, true, None, dv.contains(&i), None)).collect_vec();
+    let target = super::COORDINATOR_SEALED_TARGET_BYTES;
+    let queued = !super::hygiene_debt(adds.clone(), target, &[], strip).is_empty();
+    let packed = super::select_cell_bin(&super::slice_cells(adds, &[], strip), hygiene_policy(target, strip));
+    assert_eq!(queued, !packed.is_empty(), "the planner queues exactly what the packer rewrites");
+    packed.into_iter().sorted().collect()
 }
 
 /// The wiring of the above. Until this process has recovered the source's

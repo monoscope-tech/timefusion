@@ -533,6 +533,19 @@ pub(crate) fn rows_below(files: &[(Option<i64>, i64)], bound: i64) -> Option<u64
     u64::try_from(files.iter().filter(|(max_ts, _)| !max_ts.is_some_and(|hi| hi >= bound)).map(|(_, rows)| rows).sum::<i64>()).ok()
 }
 
+/// A row witness re-stamped across a landed rewrite of `inputs` into `outputs`,
+/// over the partition as it now stands (`live`), all counted by [`rows_below`]
+/// (`bound = i64::MAX` is the whole partition). `Some` only when `held` proves
+/// the state WITHOUT the rewrite — `live` minus `outputs` plus `inputs` — so a
+/// witness taken after the commit is never carried twice and a stale one never
+/// turns valid.
+pub(crate) fn carried_witness(
+    held: u64, live: &[(Option<i64>, i64)], inputs: &[(Option<i64>, i64)], outputs: &[(Option<i64>, i64)], bound: i64,
+) -> Option<u64> {
+    let [now, inputs, outputs] = [live, inputs, outputs].map(|files| rows_below(files, bound));
+    (i128::from(held) == i128::from(now?) + i128::from(inputs?) - i128::from(outputs?)).then_some(now?)
+}
+
 /// May a date's slice coverage be read from the tier at all?
 ///
 /// `witnesses` is each covering slice's record of how many rows the DATE
@@ -4162,7 +4175,19 @@ mod tests {
 
 #[cfg(test)]
 mod rows_below_tests {
-    use super::rows_below;
+    use super::{carried_witness, rows_below};
+
+    /// A strip of one file holding 10 physical rows, 4 of them masked, now live as
+    /// a 6-row output beside a 5-row neighbour. Returns the carried witness.
+    #[test_case::test_case(15, (Some(500), Some(500)), 1_000 => Some(11) ; "below the bound: carried by the masked rows")]
+    #[test_case::test_case(11, (Some(500), Some(500)), 1_000 => None ; "a witness taken after the commit is not carried twice")]
+    #[test_case::test_case(16, (Some(500), Some(500)), 1_000 => None ; "a stale witness is never made valid")]
+    #[test_case::test_case(5, (Some(1_500), Some(1_500)), 1_000 => Some(5) ; "above the bound: the bounded witness does not move")]
+    #[test_case::test_case(5, (Some(1_500), Some(900)), 1_000 => Some(11) ; "a straddler's output that shrank below the bound joins it")]
+    #[test_case::test_case(15, (Some(1_500), Some(900)), i64::MAX => Some(11) ; "the whole-partition witness falls by exactly the masked rows")]
+    fn a_rewrite_carries_only_the_witness_it_proved(held: u64, (input_max, output_max): (Option<i64>, Option<i64>), bound: i64) -> Option<u64> {
+        carried_witness(held, &[(output_max, 6), (Some(100), 5)], &[(input_max, 10)], &[(output_max, 6)], bound)
+    }
 
     /// The rescue's whole soundness argument is that this rule matches
     /// `partition_stats_bounded` exactly: excluded iff the max timestamp is KNOWN
