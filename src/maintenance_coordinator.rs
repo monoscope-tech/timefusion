@@ -305,6 +305,11 @@ pub struct MaintenanceTask {
     /// would otherwise break that proxy.
     #[serde(default)]
     pub backfill_priority_micros: Option<i64>,
+    /// When a finished (Complete/Superseded) unit was last reopened as new debt; `None`
+    /// means since creation. Persisted so the age gauge survives a restart. Only the gauge
+    /// reads it: scheduling escalates on `created_unix_ms`.
+    #[serde(default)]
+    pub pended_unix_ms: Option<u64>,
     /// Memoised claim rank — see [`TaskJournal::rank`]. Runtime only.
     #[serde(skip)]
     pub(crate) rank_cache: RankCache,
@@ -334,8 +339,18 @@ impl MaintenanceTask {
             parent_measured_bytes: None,
             preflight_decoded_bytes: None,
             backfill_priority_micros: None,
+            pended_unix_ms: None,
             rank_cache: RankCache::default(),
         }
+    }
+
+    /// Move to `state`, stamping `pended_unix_ms` only when this REOPENS a finished unit.
+    /// Failures and restart requeues keep the stamp, so a unit stuck in them keeps aging.
+    fn set_state(&mut self, state: TaskState) {
+        if state.is_active() && !self.state.is_active() {
+            self.pended_unix_ms = Some(u64::try_from(crate::support::now_micros().div_euclid(1_000)).unwrap_or_default());
+        }
+        self.state = state;
     }
 }
 
@@ -1756,7 +1771,7 @@ impl TaskJournal {
         // Re-pend an existing entry. `attempts` restarts only for a superseded parent, which
         // is fresh debt rather than a retry of the same unit.
         let repend = |task: &mut MaintenanceTask, deadline: i64, reset_attempts: bool| {
-            task.state = TaskState::Pending;
+            task.set_state(TaskState::Pending);
             task.deadline_micros = deadline;
             task.estimated_decoded_bytes = estimated_decoded_bytes;
             task.attempts = if reset_attempts { 0 } else { task.attempts };
@@ -1955,7 +1970,7 @@ impl TaskJournal {
                         || task.publication.is_some()
                         || task.base_tier_present;
                     if changed {
-                        task.state = TaskState::Pending;
+                        task.set_state(TaskState::Pending);
                         task.deadline_micros = new_deadline;
                         task.retry_reason = None;
                         task.publication = None;
@@ -2522,7 +2537,7 @@ impl TaskJournal {
                     && task.key.slice.overlaps(start_micros, end_micros)
             },
             |task| {
-                task.state = TaskState::Pending;
+                task.set_state(TaskState::Pending);
                 task.retry_reason = None;
                 // `Publication` is what coverage is recovered from at boot; leaving it would
                 // have the next process re-adopt the cell being replaced.
@@ -2769,7 +2784,7 @@ impl TaskJournal {
         let mut counts = [0u64; 5];
         let mut backlog_bytes = 0u64;
         let mut sealed_debt_bytes = 0u64;
-        let mut oldest_created = u64::MAX;
+        let mut oldest_pended = u64::MAX;
         let mut beyond_horizon = 0u64;
         let mut latest_frontier_rollup: HashMap<(&str, &str, &str), &MaintenanceTask> = HashMap::new();
         let mut per_operation = [0u64; <Operation as strum::EnumCount>::COUNT];
@@ -2786,7 +2801,7 @@ impl TaskJournal {
                 if now_micros.saturating_sub(task.key.slice.end_micros) > STARVATION_HORIZON_MICROS {
                     beyond_horizon = beyond_horizon.saturating_add(1);
                 } else if scheduled {
-                    oldest_created = oldest_created.min(task.created_unix_ms);
+                    oldest_pended = oldest_pended.min(task.pended_unix_ms.unwrap_or(task.created_unix_ms));
                 }
                 if task.key.operation == Operation::SealedConsolidation {
                     sealed_debt_bytes = sealed_debt_bytes.saturating_add(task.estimated_decoded_bytes);
@@ -2844,7 +2859,7 @@ impl TaskJournal {
             *sample = (now_micros, processed);
         }
         let now = u64::try_from(now_micros.div_euclid(1_000)).unwrap_or_default();
-        let oldest_age_secs = if oldest_created != u64::MAX { now.saturating_sub(oldest_created) / 1_000 } else { 0 };
+        let oldest_age_secs = if oldest_pended != u64::MAX { now.saturating_sub(oldest_pended) / 1_000 } else { 0 };
         stats.maintenance_oldest_task_age_secs.store(oldest_age_secs, Relaxed);
         stats.maintenance_beyond_horizon_tasks.store(beyond_horizon, Relaxed);
     }
@@ -4826,6 +4841,32 @@ mod tests {
         assert_eq!(stats.maintenance_beyond_horizon_tasks.load(Relaxed), 1, "the abandoned unit must be sized, not silently dropped");
         let age_days = stats.maintenance_oldest_task_age_secs.load(Relaxed) / 86_400;
         assert_eq!(age_days, 5, "the gauge must report the oldest unit the scheduler will still escalate, not the 85-day tail");
+    }
+
+    /// A cell completed and re-pended is fresh debt: aging it from first creation makes a
+    /// busy, healthy cell read as starved. A cell that only fails or is requeued is not.
+    #[test]
+    fn the_age_gauge_counts_from_the_last_repend_not_first_creation() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let now = crate::support::now_micros();
+        let (_dir, mut journal) = new_journal();
+        let key = task("p", now - 2 * DAY_MICROS, now - DAY_MICROS, Operation::SealedConsolidation).key;
+        let age_days = |journal: &TaskJournal| {
+            journal.publish_statistics();
+            crate::observability::maintenance_stats().maintenance_oldest_task_age_secs.load(Relaxed) / 86_400
+        };
+        journal.enqueue(key.clone(), now, 1, u64::try_from((now - 5 * DAY_MICROS).div_euclid(1_000)).unwrap_or_default());
+        assert_eq!(age_days(&journal), 5, "never completed: aged from creation");
+        // Failing and restart-killed units must keep aging: that is what the gauge exposes.
+        for _ in 0..3 {
+            assert!(journal.mark_running(&key) && journal.retry(&key, "boom".to_owned(), now));
+        }
+        assert!(journal.mark_running(&key));
+        assert_eq!(journal.requeue_running(now), 1);
+        assert_eq!(age_days(&journal), 5, "retries and boot requeues keep the original age");
+        assert!(journal.complete(&key));
+        journal.enqueue(key, now, 1, u64::try_from(now.div_euclid(1_000)).unwrap_or_default());
+        assert_eq!(age_days(&journal), 0, "re-pended: aged from the re-pend");
     }
 
     /// The drain retire must cancel exactly the incident's backlog: sealed-date

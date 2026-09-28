@@ -1689,6 +1689,7 @@ impl Database {
                     parent_measured_bytes: None,
                     preflight_decoded_bytes: None,
                     backfill_priority_micros: None,
+                    pended_unix_ms: None,
                     rank_cache: Default::default(),
                 }
             };
