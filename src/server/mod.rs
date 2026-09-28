@@ -432,6 +432,31 @@ struct StreamFailureContext {
     protocol: &'static str,
     deadline_ms: Option<u64>,
     started_at: std::time::Instant,
+    latency: Option<Arc<StatementLatency>>,
+}
+
+/// Records a statement's latency when its last row stream ends or is dropped.
+/// `do_query` returns before any row is produced, so timing its return would
+/// miss all streamed execution.
+struct StatementLatency {
+    metrics: Option<Arc<crate::database::ScanMetrics>>,
+    query: String,
+    protocol: &'static str,
+    started_at: std::time::Instant,
+    rows: std::sync::atomic::AtomicU64,
+    stream_failed: std::sync::atomic::AtomicBool,
+}
+
+impl Drop for StatementLatency {
+    fn drop(&mut self) {
+        let duration_us = self.started_at.elapsed().as_micros() as u64;
+        // A failed stream already logged `pgwire.stream_failed` with its duration.
+        if self.stream_failed.load(std::sync::atomic::Ordering::Relaxed) {
+            self.metrics.iter().for_each(|m| m.record_pgwire_query(duration_us));
+        } else {
+            record_statement_latency(self.metrics.as_deref(), &self.query, self.protocol, duration_us, *self.rows.get_mut(), None);
+        }
+    }
 }
 
 impl StreamFailureContext {
@@ -445,6 +470,7 @@ impl StreamFailureContext {
             protocol,
             deadline_ms: timeout.map(|timeout| timeout.as_millis().min(u128::from(u64::MAX)) as u64),
             started_at,
+            latency: None,
         }
     }
 }
@@ -487,6 +513,13 @@ fn with_response_deadline(response: Response, deadline: Option<tokio::time::Inst
                         },
                         None => rows.next().await.map(|row| (row, Some(rows))),
                     };
+                    if let (Some(latency), Some((row, _))) = (&context.latency, &next) {
+                        use std::sync::atomic::Ordering::Relaxed;
+                        match row {
+                            Ok(_) => drop(latency.rows.fetch_add(1, Relaxed)),
+                            Err(_) => latency.stream_failed.store(true, Relaxed),
+                        }
+                    }
                     if let Some((Err(error), _)) = &next {
                         // `?` escapes multiline causes so line-based collectors keep the full error on one line.
                         crate::observability::maintenance_stats().pgwire_stream_failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -519,10 +552,10 @@ fn with_response_deadline(response: Response, deadline: Option<tokio::time::Inst
 /// The shared tail of both protocol handlers: the giant-statement gate, the
 /// `datafusion.execute` span, the statement deadline, and the latency/failure
 /// events. `finish` applies the deadline to whatever shape of response the
-/// protocol returns. Failures are logged from INSIDE the query span so the
+/// protocol returns, and its row streams carry the latency record to their end. Failures are logged from INSIDE the query span so the
 /// span's `query.text` lands on the same line as the error.
 async fn run_statement<T, R>(
-    scan_metrics: Option<&crate::database::ScanMetrics>, max_statement_secs: u64, client_timeout: Option<std::time::Duration>, query: &str,
+    scan_metrics: Option<Arc<crate::database::ScanMetrics>>, max_statement_secs: u64, client_timeout: Option<std::time::Duration>, query: &str,
     protocol: &'static str, execute: impl std::future::Future<Output = PgWireResult<T>>,
     finish: impl FnOnce(T, Option<tokio::time::Instant>, StreamFailureContext) -> R,
 ) -> PgWireResult<R> {
@@ -531,12 +564,18 @@ async fn run_statement<T, R>(
     let t0 = std::time::Instant::now();
     let timeout = effective_statement_timeout(client_timeout, max_statement_secs, batch_statement_secs()).filter(|_| statement_timeout_applies(query));
     let context = StreamFailureContext::new(query, protocol, timeout, t0);
-    let result = run_with_statement_timeout(timeout, execute.instrument(execute_span)).await.map(|(value, deadline)| finish(value, deadline, context));
-    record_statement_latency(scan_metrics, query, protocol, t0.elapsed().as_micros() as u64, result.as_ref().err());
-    if let Err(error) = &result {
-        warn!(protocol, error = %error, "statement failed");
+    match run_with_statement_timeout(timeout, execute.instrument(execute_span)).await {
+        Ok((value, deadline)) => {
+            let latency =
+                StatementLatency { metrics: scan_metrics, query: query.to_owned(), protocol, started_at: t0, rows: 0.into(), stream_failed: false.into() };
+            Ok(finish(value, deadline, StreamFailureContext { latency: Some(Arc::new(latency)), ..context }))
+        }
+        Err(error) => {
+            record_statement_latency(scan_metrics.as_deref(), query, protocol, t0.elapsed().as_micros() as u64, 0, Some(&error));
+            warn!(protocol, error = %error, "statement failed");
+            Err(error)
+        }
     }
-    result
 }
 
 /// Simple query handler with tracing
@@ -1115,7 +1154,7 @@ fn record_query_span(span: &tracing::Span, query: &str) {
 /// and project dimensions are extracted only for diagnosis; raw SQL is never
 /// included in this event.
 fn record_statement_latency(
-    metrics: Option<&crate::database::ScanMetrics>, query: &str, protocol: &'static str, duration_us: u64, failure: Option<&PgWireError>,
+    metrics: Option<&crate::database::ScanMetrics>, query: &str, protocol: &'static str, duration_us: u64, rows: u64, failure: Option<&PgWireError>,
 ) {
     if let Some(metrics) = metrics {
         metrics.record_pgwire_query(duration_us);
@@ -1163,7 +1202,7 @@ fn record_statement_latency(
         );
     }
     if slow {
-        statement_event!(info, "pgwire.slow_statement", "slow PostgreSQL statement", success = success);
+        statement_event!(info, "pgwire.slow_statement", "slow PostgreSQL statement", success = success, rows = rows);
     }
 }
 
@@ -1218,7 +1257,7 @@ impl SimpleQueryHandler for LoggingSimpleQueryHandler {
         record_query_span(&tracing::Span::current(), query);
         let client_timeout = client_statement_timeout(client);
         run_statement(
-            self.scan_metrics.as_deref(),
+            self.scan_metrics.clone(),
             self.max_statement_secs,
             client_timeout,
             query,
@@ -1328,7 +1367,7 @@ impl ExtendedQueryHandler for LoggingExtendedQueryHandler {
         record_query_span(&tracing::Span::current(), query);
         let client_timeout = client_statement_timeout(client);
         run_statement(
-            self.scan_metrics.as_deref(),
+            self.scan_metrics.clone(),
             self.max_statement_secs,
             client_timeout,
             query,
@@ -1455,7 +1494,7 @@ mod pgwire_handlers_tests {
                 assert!(response.data_rows.next().await.is_none(), "{case}");
             }
             let failure = crate::server::pg_compat::statement_timeout_error();
-            super::record_statement_latency(None, "SELECT 'private-literal-canary' FROM otel_logs_and_spans", "simple", 10, Some(&failure));
+            super::record_statement_latency(None, "SELECT 'private-literal-canary' FROM otel_logs_and_spans", "simple", 10, 0, Some(&failure));
         }
         let output = std::fs::read_to_string(log.path())?;
         let failures: Vec<_> = output.lines().filter(|line| line.contains("pgwire.stream_failed")).collect();
@@ -1489,6 +1528,44 @@ mod pgwire_handlers_tests {
             "pre-stream failure must carry the same attribution: {failed_statement}"
         );
         assert!(!output.contains("private-literal-canary"));
+        Ok(())
+    }
+
+    /// Latency must cover the rows' streaming, not just `do_query` returning: users
+    /// waited 15 s on streamed results while `pgwire|lat_p99` read milliseconds.
+    #[tokio::test(flavor = "current_thread")]
+    async fn statement_latency_includes_streamed_execution() -> anyhow::Result<()> {
+        const ROW_DELAY: Duration = Duration::from_millis(400);
+        let log = tempfile::NamedTempFile::new()?;
+        let subscriber = tracing_subscriber::fmt().without_time().with_ansi(false).with_writer(std::sync::Mutex::new(log.reopen()?)).finish();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+        let rows = futures::stream::iter(0..3)
+            .then(|_| async {
+                tokio::time::sleep(ROW_DELAY).await;
+                Ok(DataRow::new(bytes::BytesMut::new(), 0))
+            })
+            .boxed();
+        let responses = super::run_statement(
+            None,
+            crate::server::pg_compat::DEFAULT_MAX_STATEMENT_SECS,
+            None,
+            "SELECT id FROM otel_logs_and_spans",
+            "simple",
+            async { Ok(vec![Response::Query(QueryResponse::new(Arc::new(vec![]), rows))]) },
+            |responses: Vec<Response>, deadline, context| {
+                responses.into_iter().map(|r| with_response_deadline(r, deadline, context.clone())).collect::<Vec<_>>()
+            },
+        )
+        .await?;
+        for response in responses {
+            let Response::Query(mut response) = response else { panic!("expected query response") };
+            while response.data_rows.next().await.is_some() {}
+        }
+        let output = std::fs::read_to_string(log.path())?;
+        let slow = output.lines().find(|line| line.contains("pgwire.slow_statement")).unwrap_or_else(|| panic!("streamed 1.2 s but not slow: {output}"));
+        let duration_us: u64 = slow.split("duration_us=").nth(1).and_then(|v| v.split_whitespace().next()).expect("duration_us").parse()?;
+        assert!(duration_us >= 3 * ROW_DELAY.as_micros() as u64, "latency must include the streamed rows: {slow}");
+        assert!(slow.contains("rows=3"), "{slow}");
         Ok(())
     }
 
