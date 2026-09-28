@@ -3114,6 +3114,16 @@ mod tests {
         }
     }
 
+    /// Prod's `1h_by_1m` probe verbatim: v3 stays a fall-through behind v4.
+    #[tokio::test]
+    async fn the_last_hour_probe_keeps_v3_behind_v4() {
+        let sql = format!(
+            "SELECT time_bucket('1 minute', timestamp), COUNT(*) FROM {SOURCE} \
+             WHERE project_id = 'project' AND timestamp >= now() - interval '1 hour' GROUP BY 1"
+        );
+        assert_eq!(targets(&session().await, &sql).await, Ok(vec!["dashboard_1m_v4".to_owned(), "dashboard_1m_v3".to_owned()]));
+    }
+
     /// A filter proving the `level` fallback unreachable lets the v3 tier serve too.
     #[test_case::test_case("status_code = 'pickup_accepted'", &["dashboard_1m_v4", "dashboard_1m_v3"])]
     #[test_case::test_case("status_code IS NOT NULL", &["dashboard_1m_v4", "dashboard_1m_v3"])]

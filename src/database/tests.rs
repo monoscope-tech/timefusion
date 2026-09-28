@@ -1301,6 +1301,45 @@ async fn a_replacement_tier_serves_only_once_it_covers_as_much_as_the_tier_it_re
     Ok(())
 }
 
+/// Prod's `1h_by_1m` probe with v3 built and v4 not: v3 serves a hybrid and no miss is
+/// counted. Once v3 declines too, the miss must name v3's reason, not the `not_built`
+/// of the replacement still backfilling — which, tried first, masked every decline.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_last_hour_probe_falls_back_to_v3_and_counts_its_own_decline() -> Result<()> {
+    let db = Arc::new(Database::with_config(rollup_backfill_config("probe", 35)).await?);
+    db.cancel_maintenance();
+    let project = format!("probe_{}", uuid::Uuid::new_v4().simple());
+    let now = Utc::now().timestamp_micros();
+    for minute in 5..55 {
+        insert_a_span(&db, &project, &format!("m{minute}"), now - minute * 60_000_000).await?;
+    }
+    let day = |micros: i64| chrono::DateTime::from_timestamp_micros(micros).expect("in range").date_naive();
+    for date in [day(now - 3_600_000_000), day(now)].into_iter().dedup() {
+        build_base_tier(&db, &project, "dashboard_1m_v3", date).await?;
+    }
+    let mut ctx = Arc::clone(&db).create_session_context();
+    db.setup_session_context(&mut ctx)?;
+    let sql = format!(
+        "SELECT time_bucket('1 minute', timestamp), COUNT(*) FROM otel_logs_and_spans \
+         WHERE project_id = '{project}' AND timestamp >= now() - interval '1 hour' GROUP BY 1"
+    );
+    let stats = crate::observability::maintenance_stats;
+    let load = |counter: &std::sync::atomic::AtomicU64| counter.load(std::sync::atomic::Ordering::Relaxed);
+    let counters = || (load(&stats().rollup_hits_hybrid), load(&stats().rollup_miss_not_built), load(&stats().rollup_miss_stale_coverage));
+    let delta = async || -> Result<(u64, u64, u64)> {
+        let before = counters();
+        ctx.sql(&sql).await?.collect().await?;
+        let after = counters();
+        Ok((after.0 - before.0, after.1 - before.1, after.2 - before.2))
+    };
+    assert_eq!(delta().await?, (1, 0, 0), "v3 serves the probe as a hybrid while v4 has no cells");
+    let v3 = "otel_logs_and_spans_rollup_dashboard_1m_v3";
+    db.rollup_coverage.iter_mut().filter(|entry| entry.key().0 == project && entry.key().2 == v3).for_each(|mut entry| entry.generation = "stale".into());
+    db.rollup_slice_coverage.iter_mut().filter(|entry| entry.key().0 == project && entry.key().2 == v3).for_each(|mut entry| entry.generation = "stale".into());
+    assert_eq!(delta().await?, (0, 0, 1), "a stale v3 is counted as stale, not as v4's not_built");
+    Ok(())
+}
+
 /// Dual run: v3 covers the first two days and v4 the last two, so neither covers the
 /// window and the answer is a hybrid that must equal raw. Then each tier loses the
 /// digest on its unshared day: the partial measure decline is counted once per

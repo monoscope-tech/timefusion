@@ -144,12 +144,14 @@ impl Database {
                 Ok(rewrite) if best.as_ref().is_none_or(|(_, held)| rewrite.covered_micros > held.covered_micros) => best = Some((grain, rewrite)),
                 Ok(_) => {}
                 // A measure decline outranks whatever an earlier spec reported; a sub-grain
-                // refusal is structural, so it must not mask a finer tier's actual gap.
+                // refusal is structural, so it must not mask a finer tier's actual gap; and a
+                // replacement tier with no cells yet must not mask why the tier it replaces declined.
                 Err(reason) => {
-                    use crate::rollup::MissReason::{MeasureNotStored, SubGrainSlices};
+                    use crate::rollup::MissReason::{MeasureNotStored, NotBuilt, SubGrainSlices};
                     best_miss = match best_miss {
                         None | Some(SubGrainSlices) => Some(reason),
                         _ if reason == MeasureNotStored => Some(reason),
+                        Some(NotBuilt) if reason != SubGrainSlices => Some(reason),
                         kept => kept,
                     }
                 }
