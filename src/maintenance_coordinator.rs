@@ -487,9 +487,17 @@ fn bisect_time_unit(task: &MaintenanceTask, observed_or_estimated_bytes: u64) ->
     // Bisection stops at the width where a slice stops shedding FILES. A dedup
     // unit's cost is its whole PARTITION, so halving time below a slice sheds
     // nothing; below the floor, shard by KEY instead.
-    let bisect_floor = if task.key.operation == Operation::Dedup { NORMAL_SLICE_MICROS } else { MIN_SLICE_MICROS };
+    //
+    // A derived tier's rows are its grain's FINAL states under one (timestamp, id), and the
+    // tier read keeps one per key, so a sub-grain child would publish a partial that
+    // undercounts. Its floor and cut alignment are the grain; at the floor it runs whole.
+    let (bisect_floor, align) = match task.key.operation {
+        Operation::Dedup => (NORMAL_SLICE_MICROS, MIN_SLICE_MICROS),
+        Operation::DerivedRollup => (DERIVED_SLICE_MICROS, DERIVED_SLICE_MICROS),
+        _ => (MIN_SLICE_MICROS, MIN_SLICE_MICROS),
+    };
     let (start, end, width) = (task.key.slice.start_micros, task.key.slice.end_micros, task.key.slice.width());
-    let midpoint = (start.saturating_add(width / 2) / MIN_SLICE_MICROS) * MIN_SLICE_MICROS;
+    let midpoint = (start.saturating_add(width / 2) / align) * align;
     if width <= bisect_floor || midpoint <= start || midpoint >= end {
         return None;
     }
@@ -3557,19 +3565,23 @@ mod tests {
         );
     }
 
-    #[test_case::test_case(DAY_MICROS => Some(TaskState::Superseded) ; "worker OOM splits a large unit")]
-    #[test_case::test_case(MIN_SLICE_MICROS => Some(TaskState::Retry) ; "worker OOM backs off an indivisible unit")]
-    fn repeated_worker_capacity_failure_keeps_its_classification(width: i64) -> Option<TaskState> {
+    #[test_case::test_case(DAY_MICROS, Operation::BaseRollup => Some(TaskState::Superseded) ; "worker OOM splits a large unit")]
+    #[test_case::test_case(MIN_SLICE_MICROS, Operation::BaseRollup => Some(TaskState::Retry) ; "worker OOM backs off an indivisible unit")]
+    #[test_case::test_case(DERIVED_SLICE_MICROS, Operation::DerivedRollup => Some(TaskState::Retry) ; "worker OOM backs off a derived hour instead of splitting it")]
+    fn repeated_worker_capacity_failure_keeps_its_classification(width: i64, operation: Operation) -> Option<TaskState> {
         use itertools::Itertools;
+        use std::sync::atomic::Ordering::Relaxed;
 
         let (dir, mut journal) = new_journal();
-        let key = running_unit(&mut journal, task("p", 0, width, Operation::BaseRollup), 6);
+        let key = running_unit(&mut journal, task("p", 0, width, operation), 6);
         let now = crate::support::now_micros();
+        let no_width = crate::observability::maintenance_stats().split_declined_no_width.load(Relaxed);
         journal.abandon_running(&key, now, Some("Resources exhausted: Failed to reserve memory for sort during spill"));
         journal.checkpoint().expect("persist worker capacity decision");
         drop(journal);
         let journal = TaskJournal::load(dir.path()).expect("reload worker capacity decision");
-        if width == MIN_SLICE_MICROS {
+        if width != DAY_MICROS {
+            assert_eq!(crate::observability::maintenance_stats().split_declined_no_width.load(Relaxed), no_width + 1, "the limit must be reported");
             assert!(requeued_deadline(&journal, &key) >= now + 64_000_000, "six worker OOMs must escalate beyond the transient 30-second delay");
             assert_eq!(journal.tasks().count(), 1, "an indivisible failure must retain one pending unit, not multiply work");
         } else {
@@ -3585,6 +3597,23 @@ mod tests {
             );
         }
         journal.state(&key)
+    }
+
+    /// Bisected to exhaustion, a derived unit bottoms out at its tier's grain: a narrower
+    /// child would publish a partial hour the keep-one tier read undercounts.
+    #[test_case::test_case(Operation::BaseRollup => MIN_SLICE_MICROS ; "base units bisect to the minute")]
+    #[test_case::test_case(Operation::DerivedRollup => DERIVED_SLICE_MICROS ; "derived units stop at the hour")]
+    fn bisection_leaves_never_go_below_the_operation_floor(operation: Operation) -> i64 {
+        let mut pending = vec![task("p", 0, DAY_MICROS, operation)];
+        let mut leaves = Vec::new();
+        while let Some(unit) = pending.pop() {
+            match bisect_time_unit(&unit, 2 * MAX_DECODED_BYTES) {
+                Some(children) => pending.extend(children),
+                None => leaves.push(unit.key.slice),
+            }
+        }
+        assert_eq!(leaves.iter().map(|slice| slice.width()).sum::<i64>(), DAY_MICROS, "leaves must tile the parent");
+        leaves.iter().map(|slice| slice.width()).min().unwrap()
     }
 
     /// The planner re-derives file debt every 60s and enqueues the same day-wide
