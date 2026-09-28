@@ -5092,10 +5092,7 @@ fn rows_file(path: &str, bytes: i64, rows: u64) -> super::TailAdd {
 /// The coordinator's own policy through the SHARED packer, so these tests
 /// exercise the exact call `coordinator_compaction_files` makes.
 fn coordinator_bin(files: Vec<super::TailAdd>, target: i64) -> Vec<String> {
-    super::select_bin(
-        &files,
-        super::BinPolicy { target_size: target, max_rows: u64::MAX, order: super::BinOrder::SmallestFirst, level_unsorted_first: true, strip_dv: false },
-    )
+    super::select_bin(&files, hygiene_policy(target, false))
 }
 
 /// One coordinator selection pass at the sealed byte target.
