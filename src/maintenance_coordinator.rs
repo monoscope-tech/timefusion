@@ -787,6 +787,8 @@ impl TaskJournal {
     const REPAIR_SINGLE_PASS_MIGRATION: &'static str = "__maintenance_repair_single_pass_v1";
     /// See [`TaskJournal::retire_drain_backlog`].
     const DRAIN_INCIDENT_RETIRE_MIGRATION: &'static str = "__maintenance_drain_incident_retire_v1";
+    /// See [`TaskJournal::retire_unfinished_fusions`].
+    const UNFINISHED_FUSION_RETIRE_MIGRATION: &'static str = "__maintenance_unfinished_fusion_retire_v1";
 
     pub fn load(data_dir: &Path) -> anyhow::Result<Self> {
         let path = crate::write::wal::meta_path(data_dir, "maintenance_tasks.json");
@@ -1100,12 +1102,27 @@ impl TaskJournal {
         })
     }
 
+    /// Drop the wide Dedup/BaseRollup units fused from not-yet-started cells (see
+    /// [`is_sealed`]): each spans a day still being written, retries until it ends,
+    /// and blocks every derived hour it overlaps. Writes re-arm the cells they touch,
+    /// so nothing is lost.
+    pub fn retire_unfinished_fusions(&mut self, now_micros: i64) -> Option<usize> {
+        self.run_once(Self::UNFINISHED_FUSION_RETIRE_MIGRATION, |journal| {
+            Some(journal.retain_tasks(|task| {
+                !matches!(task.state, TaskState::Pending | TaskState::Retry)
+                    || !matches!(task.key.operation, Operation::Dedup | Operation::BaseRollup)
+                    || task.key.slice.width() <= NORMAL_SLICE_MICROS
+                    || task.key.slice.end_micros <= now_micros
+            }))
+        })
+    }
+
     pub fn migrate_fine_grained_backfill(&mut self, now_micros: i64) -> Option<usize> {
         self.run_once(Self::COARSE_BACKFILL_MIGRATION, |journal| {
             Some(journal.retain_tasks(|task| {
                 task.state == TaskState::Complete
                     || !matches!(task.key.operation, Operation::Dedup | Operation::BaseRollup | Operation::DerivedRollup | Operation::HotPacking)
-                    || is_live_frontier(task.key.slice, now_micros)
+                    || !is_sealed(task.key.slice, now_micros)
                     // A day-sized unit is what replaces these; anything already that
                     // wide came from the coarse planner and must survive.
                     || task.key.slice.width() >= DAY_MICROS
@@ -1188,7 +1205,7 @@ impl TaskJournal {
         let is_damage = |task: &MaintenanceTask| Self::cell_of(task).is_some_and(|cell| damaged.contains(&cell));
         self.retain_tasks(|task| {
             // A covering task does not carry this retry's failure history or deadline.
-            if task.state != TaskState::Pending || is_live_frontier(task.key.slice, now_micros) || is_damage(task) {
+            if task.state != TaskState::Pending || !is_sealed(task.key.slice, now_micros) || is_damage(task) {
                 return true;
             }
             // The NARROWEST ladder width this unit fits inside, so every unit
@@ -1220,7 +1237,7 @@ impl TaskJournal {
         let coarsenable = |task: &MaintenanceTask| {
             matches!(task.key.operation, Operation::Dedup | Operation::BaseRollup | Operation::DerivedRollup | Operation::HotPacking)
                 && task.state == TaskState::Pending
-                && !is_live_frontier(task.key.slice, now_micros)
+                && is_sealed(task.key.slice, now_micros)
                 && task.key.slice.width() < width
                 && !Self::cell_of(task).is_some_and(|cell| untagged_cells.contains(&cell))
         };
@@ -2966,6 +2983,14 @@ fn is_live_frontier(slice: TimeSlice, now_micros: i64) -> bool {
     slice.end_micros >= now_micros.saturating_sub(LIVE_FRONTIER_WINDOW_MICROS) && slice.start_micros <= now_micros
 }
 
+/// Past the frontier window, so the slice can no longer gain rows. NOT `!is_live_frontier`:
+/// that also holds for a slice that has not STARTED, and fusing the future cells a write
+/// minted produced a day-wide unit that retries until the day ends and blocks every
+/// derived hour inside it.
+fn is_sealed(slice: TimeSlice, now_micros: i64) -> bool {
+    slice.end_micros < now_micros.saturating_sub(LIVE_FRONTIER_WINDOW_MICROS)
+}
+
 /// Whether a TASK is live-frontier work — not the same question as whether its slice is
 /// inside the frontier window. `SealedConsolidation` never is, whatever its slice says, since
 /// `is_live_frontier` stays true for 24 h after a slice ENDS and class is STRICT priority.
@@ -4514,6 +4539,59 @@ mod tests {
         assert_eq!(journal.state(&hygiene), Some(TaskState::Pending), "hygiene survives");
         assert_eq!(journal.state(&running), Some(TaskState::Running), "a leased unit survives");
         assert!(journal.retire_drain_backlog(now).is_none(), "one-shot: the marker holds");
+    }
+
+    /// Prod 2026-09-27/28: a project's first write of the day minted hour 0's six cells,
+    /// five not yet started; coarsening fused those into a day-wide unit that retried
+    /// until midnight and held every derived hour of the day (398 queued).
+    #[test]
+    fn cells_minted_ahead_of_the_clock_are_never_fused_into_the_day() {
+        let (_dir, mut journal) = new_journal();
+        let (day, base, derived) = (10 * DAY_MICROS, "otel_logs_and_spans_rollup_dashboard_1m_v3", "otel_logs_and_spans_rollup_dashboard_1h_v2");
+        let first_write = day + 60_000_000;
+        for (table, is_derived) in [(base, false), (derived, true)] {
+            let hour = invalidation(table, day, day + DERIVED_SLICE_MICROS, first_write, is_derived);
+            journal.invalidate(Invalidation { source_table: "otel_logs_and_spans", source: "otel_logs_and_spans", ..hour }).expect("invalidate");
+        }
+        journal.coarsen_sealed_slices(first_write);
+        assert!(journal.tasks().all(|task| task.key.slice.width() <= DERIVED_SLICE_MICROS), "no unit may outgrow the hour the write touched");
+        let cells = itertools::Itertools::sorted(journal.tasks().filter(|task| task.key.operation == Operation::BaseRollup).map(|task| task.key.clone()))
+            .collect::<Vec<_>>();
+        assert_eq!(cells.len(), 6);
+
+        let later = day + 2 * DERIVED_SLICE_MICROS;
+        cells[1..].iter().for_each(|key| assert!(journal.complete(key)));
+        assert!(journal.claim_next(Operation::DerivedRollup, later, true).is_none(), "a pending cell inside the hour still holds it");
+        assert!(journal.complete(&cells[0]));
+        assert!(journal.claim_next(Operation::DerivedRollup, later, true).is_some(), "six complete cells release the derived hour");
+    }
+
+    /// Only a wide Dedup/BaseRollup unit over a range still being written is a fusion
+    /// artefact; frontier cells, derived hours, sealed wide units and leases survive.
+    #[test]
+    fn retiring_unfinished_fusions_spares_everything_else() {
+        let now = 10 * DAY_MICROS + DAY_MICROS / 2;
+        let (_dir, mut journal) = new_journal();
+        let today = 10 * DAY_MICROS;
+        let queued = |journal: &mut TaskJournal, start, end, operation| {
+            let key = task("p", start, end, operation).key;
+            journal.enqueue(key.clone(), now, 1, 0);
+            key
+        };
+        let fused = [Operation::BaseRollup, Operation::Dedup].map(|operation| queued(&mut journal, today, today + DAY_MICROS, operation));
+        let survivors = [
+            queued(&mut journal, now, now + NORMAL_SLICE_MICROS, Operation::BaseRollup),
+            queued(&mut journal, now, now + DERIVED_SLICE_MICROS, Operation::DerivedRollup),
+            queued(&mut journal, today - DAY_MICROS, today, Operation::BaseRollup),
+        ];
+        let leased = queued(&mut journal, today, today + DAY_MICROS / 2, Operation::BaseRollup);
+        assert!(journal.mark_running(&leased));
+
+        assert_eq!(journal.retire_unfinished_fusions(now), Some(2));
+        assert!(fused.iter().all(|key| journal.state(key).is_none()));
+        assert!(survivors.iter().all(|key| journal.state(key) == Some(TaskState::Pending)));
+        assert_eq!(journal.state(&leased), Some(TaskState::Running));
+        assert!(journal.retire_unfinished_fusions(now).is_none(), "one-shot");
     }
 
     /// The coarse-backfill migration must be narrow: fine sealed backfill goes,

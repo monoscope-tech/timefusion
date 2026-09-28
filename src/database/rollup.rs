@@ -618,11 +618,15 @@ impl Database {
                             if retired != 0 {
                                 info!(retired, event = "maintenance_drain_backlog_retired");
                             }
+                            let fusions = journal.retire_unfinished_fusions(crate::support::now_micros()).unwrap_or_default();
+                            if fusions != 0 {
+                                info!(fusions, event = "maintenance_unfinished_fusions_retired");
+                            }
                             let coarsened = journal.migrate_fine_grained_backfill(crate::support::now_micros()).unwrap_or_default();
                             if coarsened != 0 {
                                 info!(coarsened, event = "maintenance_coarse_backfill_migrated");
                             }
-                            if discarded.is_some_and(|count| count != 0) || coarsened != 0 || retired != 0 {
+                            if discarded.is_some_and(|count| count != 0) || coarsened != 0 || retired != 0 || fusions != 0 {
                                 journal.compact()?;
                             } else if discarded.is_some() || migrated != 0 {
                                 journal.checkpoint()?;
