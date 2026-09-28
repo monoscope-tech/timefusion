@@ -1173,19 +1173,19 @@ impl BufferedWriteLayer {
         // No stuck-older-bucket gate needed: an unflushed older bucket pins the
         // cursor via its holds, so force-flushing the open window can never move
         // the cursor past it.
-        if self.force_flush_buckets(self.mem_buffer.bucket_keys(|id| id >= current)).await > 0 {
+        if self.force_flush_buckets(|mem| mem.bucket_keys(|id| id >= current)).await > 0 {
             crate::observability::record_backpressure_force_flush();
             self.backpressure_force_flush_total.fetch_add(1, Ordering::Relaxed);
         }
         Ok(())
     }
 
-    /// Take-flush `keys` (rows removed under the insert lock, restored on commit
-    /// failure), returning how many buckets were taken.
-    async fn force_flush_buckets(&self, keys: Vec<(String, String, i64)>) -> usize {
+    /// Take-flush the buckets `keys` selects UNDER the flush lock (rows removed
+    /// under the insert lock, restored on commit failure); returns how many were taken.
+    async fn force_flush_buckets(&self, keys: impl FnOnce(&MemBuffer) -> Vec<(String, String, i64)>) -> usize {
         let _flush_guard = self.flush_lock.lock().await;
         let mut taken = 0;
-        for (project_id, table_name, bucket_id) in keys {
+        for (project_id, table_name, bucket_id) in keys(&self.mem_buffer) {
             let Some(bucket) = self.mem_buffer.take_bucket_for_flush(&project_id, &table_name, bucket_id) else {
                 continue;
             };
@@ -2199,9 +2199,8 @@ impl BufferedWriteLayer {
         // Continuous DML can dirty every snapshot of a bucket, which then never
         // drains and fills the buffer until inserts are rejected. Take those
         // destructively: the take is atomic with inserts and DML, so no race.
-        let livelocked = self.mem_buffer.dirty_livelocked_keys(DIRTY_FLUSHES_BEFORE_TAKE);
-        if !livelocked.is_empty() {
-            let taken = self.force_flush_buckets(livelocked).await;
+        if !self.mem_buffer.dirty_livelocked_keys(DIRTY_FLUSHES_BEFORE_TAKE).is_empty() {
+            let taken = self.force_flush_buckets(|mem| mem.dirty_livelocked_keys(DIRTY_FLUSHES_BEFORE_TAKE)).await;
             self.dirty_livelock_takes_total.fetch_add(taken as u64, Ordering::Relaxed);
         }
         let current_bucket = MemBuffer::current_bucket_id();
@@ -4536,7 +4535,8 @@ mod tests {
                 let (committed, entered, release) = (committed.clone(), entered.clone(), release.clone());
                 Box::pin(async move {
                     entered.notify_one();
-                    let _ = release.acquire().await;
+                    // Consume the permit, or the next round's commit never parks.
+                    release.acquire().await.map(tokio::sync::SemaphorePermit::forget).ok();
                     committed.lock().extend(batches);
                     Ok(Vec::new())
                 })
@@ -4553,7 +4553,7 @@ mod tests {
             };
             entered_wait.await;
             let assignments = vec![("name".to_string(), datafusion::logical_expr::lit(format!("v{round}")))];
-            assert_eq!(layer.update(&project, &table, None, &assignments).unwrap(), 1);
+            assert_eq!(layer.update(&project, &table, None, &assignments).unwrap(), 1, "round {round}: the UPDATE lands mid-flight");
             release.add_permits(1);
             flusher.await.unwrap().unwrap();
             assert!(!layer.is_empty(), "round {round}: a dirty finish keeps the rows");
