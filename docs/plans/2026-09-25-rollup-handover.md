@@ -646,6 +646,13 @@ The intended compatible family is DataFusion 55.1 and Arrow/Parquet 59, with mat
 Do not independently upgrade packages across incompatible Arrow/DataFusion families.
 No final Timefusion manifest or lockfile exists for the complete upgraded stack.
 
+### 9.0 Parked for the next DataFusion fork bump
+
+- `MemorySourceConfig::repartitioned` (`datafusion/datasource/src/memory.rs`, about lines 151–178) splits partitions in order-preserving fashion. It then rebuilds the source with `Self::try_new(..)` and never calls `try_with_sort_information`, so the declared output ordering is lost.
+- The effect: a sorted MemBuffer leg with fewer buckets than `target_partitions` gets a full `SortExec` from `EnforceSorting` (W36).
+- W36 (`split_sorted_runs` in `src/database/scan.rs`) works around it on our side.
+- The upstream fix is to carry the sort information through `repartitioned`. Do it in the fork at the next revision bump, then delete `split_sorted_runs`.
+
 ### 9.1 DataFusion 55.1
 
 The candidate ports existing fork behavior for output metrics, positional Parquet reads, sort pushdown, shared sort-buffer accounting, UPDATE FROM, DEALLOCATE ALL, and correlated UNNEST.
