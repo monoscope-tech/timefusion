@@ -3065,8 +3065,42 @@ fn live_frontier_lag_secs<'a>(tasks: impl IntoIterator<Item = &'a MaintenanceTas
 pub struct Resources {
     pub cpu: u32,
     pub decoded_bytes: u64,
+    /// Rollup aggregate state: heap the unit allocates OUTSIDE every pool, so
+    /// `decoded_bytes` cannot see it. Priced by [`rollup_state_bytes`].
+    pub state_bytes: u64,
     pub object_reads: u32,
     pub object_writes: u32,
+}
+
+/// Measured prod 2026-09-27, `metrics_1m_v2` (one t-digest): 43.5 GB for a 1.06M-row
+/// unit run alone, ~30 GB for three co-running units totalling 720k rows, 4.2 GB
+/// for six totalling 89k — 43-50 KB per output row across slice widths and shard
+/// counts. Shards do NOT divide it: every shard holds ~every group.
+pub const ROLLUP_STATE_BYTES_PER_ROW_SKETCH: u64 = 48 << 10;
+/// With no prior publication to count: the same units' peak was 24-31x their
+/// decoded input. Over-prices sparse tiers several-fold, which only serializes them.
+pub const ROLLUP_STATE_PER_INPUT_BYTE: u64 = 32;
+
+/// Heap a rollup unit's aggregate state will reach, from the rows its slice
+/// published last time (scaled to this slice by [`prior_output_rows`]), else from
+/// its decoded input. Linear in `sketches` (t-digest/HLL measures) — inferred:
+/// only single-sketch tiers have a clean measurement.
+pub fn rollup_state_bytes(sketches: usize, prior_output_rows: Option<u64>, input_decoded_bytes: u64) -> u64 {
+    prior_output_rows.map_or(input_decoded_bytes.saturating_mul(ROLLUP_STATE_PER_INPUT_BYTE), |rows| {
+        rows.saturating_mul(ROLLUP_STATE_BYTES_PER_ROW_SKETCH).saturating_mul(sketches.max(1) as u64)
+    })
+}
+
+/// Rows a unit over `slice` will publish, extrapolated from the published
+/// `((start, end), rows)` slices it overlaps at their row density. Each file of a
+/// slice carries the slice's total, hence the dedupe by range.
+pub fn prior_output_rows(published: impl IntoIterator<Item = ((i64, i64), u64)>, slice: TimeSlice) -> Option<u64> {
+    let ranges: HashMap<(i64, i64), u64> = published.into_iter().filter(|((start, end), _)| start < end).collect();
+    let (rows, covered) = ranges.into_iter().fold((0f64, 0i64), |(rows, covered), ((start, end), count)| {
+        let overlap = end.min(slice.end_micros) - start.max(slice.start_micros);
+        if overlap <= 0 { (rows, covered) } else { (rows + count as f64 * overlap as f64 / (end - start) as f64, covered + overlap) }
+    });
+    (covered > 0).then(|| (rows * slice.width() as f64 / covered as f64).ceil() as u64)
 }
 
 /// Apply one integer method fieldwise; the field list lives here, not in every op.
@@ -3076,6 +3110,7 @@ macro_rules! resources_zip {
         Resources {
             cpu: a.cpu.$op(b.cpu),
             decoded_bytes: a.decoded_bytes.$op(b.decoded_bytes),
+            state_bytes: a.state_bytes.$op(b.state_bytes),
             object_reads: a.object_reads.$op(b.object_reads),
             object_writes: a.object_writes.$op(b.object_writes),
         }
@@ -3253,21 +3288,22 @@ impl AdmissionController {
         // At most 75% is trackable maintenance decode. The remainder is an
         // unconditional foreground/untracked-allocation reserve.
         let decoded_bytes = cgroup_memory_bytes.saturating_mul(3) / 4;
-        Self::with_decoded_capacity(cpu_base, cpu_max, decoded_bytes, object_reads, object_writes)
+        Self::with_decoded_capacity(cpu_base, cpu_max, decoded_bytes, u64::MAX, object_reads, object_writes)
     }
 
     /// Construct admission against the memory pool these jobs really allocate
     /// from. Unlike [`Self::with_cpu_ceiling`], `decoded_bytes` is already a
     /// carved-out capacity and must not receive another cgroup reserve haircut.
-    pub fn with_decoded_capacity(cpu_base: u32, cpu_max: u32, decoded_bytes: u64, object_reads: u32, object_writes: u32) -> Self {
+    pub fn with_decoded_capacity(cpu_base: u32, cpu_max: u32, decoded_bytes: u64, state_bytes: u64, object_reads: u32, object_writes: u32) -> Self {
         use std::sync::atomic::Ordering::Relaxed;
 
-        let capacity = Resources { cpu: cpu_max.max(cpu_base), decoded_bytes, object_reads, object_writes };
+        let capacity = Resources { cpu: cpu_max.max(cpu_base), decoded_bytes, state_bytes, object_reads, object_writes };
         let stats = crate::observability::maintenance_stats();
         stats.maintenance_cpu_tokens_capacity.store(u64::from(capacity.cpu), Relaxed);
         stats.maintenance_cpu_tokens_limit.store(u64::from(cpu_base.min(capacity.cpu)), Relaxed);
         stats.maintenance_rollup_reserved_cpu_tokens.store(u64::from(rollup_reserved_cpu(cpu_base.min(capacity.cpu))), Relaxed);
         stats.maintenance_decoded_bytes_capacity.store(capacity.decoded_bytes, Relaxed);
+        stats.maintenance_state_bytes_capacity.store(capacity.state_bytes, Relaxed);
         stats.maintenance_object_read_tokens_capacity.store(u64::from(capacity.object_reads), Relaxed);
         stats.maintenance_object_write_tokens_capacity.store(u64::from(capacity.object_writes), Relaxed);
         Self(Arc::new(Mutex::new(AdmissionState { capacity, used: Resources::default(), cpu_base, query_yield: None })))
@@ -3338,7 +3374,9 @@ impl AdmissionController {
         // tiny-box CI shard did exactly that, retrying admission_busy until the
         // test gave up. Clamped HERE, after lag-scaling and the lane reserve,
         // because those are what actually bind.
-        let request = Resources { cpu: request.cpu.min(lane_ceiling), ..request };
+        // Rollup state likewise: a unit priced above the whole state capacity
+        // waits until nothing else holds state, then runs alone.
+        let request = Resources { cpu: request.cpu.min(lane_ceiling), state_bytes: request.state_bytes.min(state.capacity.state_bytes), ..request };
         if used.cpu.saturating_add(request.cpu) > lane_ceiling {
             stats.maintenance_admission_refused_cpu.fetch_add(1, Relaxed);
             refused = true;
@@ -3355,6 +3393,10 @@ impl AdmissionController {
             refused = true;
         }
         let available = state.available();
+        if request.state_bytes > available.state_bytes {
+            stats.maintenance_admission_refused_state_bytes.fetch_add(1, Relaxed);
+            refused = true;
+        }
         let yielded = lane != AdmissionLane::Hot && state.query_yield.is_some_and(|y| used.object_reads.saturating_add(request.object_reads) > y.ceiling);
         if request.object_reads > available.object_reads || yielded {
             stats.maintenance_admission_refused_object_reads.fetch_add(1, Relaxed);
@@ -3388,6 +3430,7 @@ impl AdmissionController {
         let stats = crate::observability::maintenance_stats();
         stats.maintenance_cpu_tokens_used.store(u64::from(used.cpu), Relaxed);
         stats.maintenance_decoded_bytes_used.store(used.decoded_bytes, Relaxed);
+        stats.maintenance_state_bytes_used.store(used.state_bytes, Relaxed);
         stats.maintenance_object_read_tokens_used.store(u64::from(used.object_reads), Relaxed);
         stats.maintenance_object_write_tokens_used.store(u64::from(used.object_writes), Relaxed);
     }
@@ -6857,7 +6900,7 @@ mod tests {
     #[test]
     fn admission_is_all_or_nothing_and_keeps_memory_headroom() {
         let admission = AdmissionController::new(4, 1_000, 8, 2);
-        let request = Resources { cpu: 2, decoded_bytes: 600, object_reads: 4, object_writes: 1 };
+        let request = Resources { cpu: 2, decoded_bytes: 600, object_reads: 4, object_writes: 1, ..Resources::default() };
         let permit = admission.try_acquire(request).expect("first reservation");
         assert!(admission.try_acquire(request).is_none());
         assert_eq!(admission.utilization(), request);
@@ -6877,7 +6920,7 @@ mod tests {
     fn rollup_admission_refuses_above_allocated_memory_threshold(lane: AdmissionLane, offset: isize, limit_bytes: usize) -> bool {
         let at = (crate::config::ROLLUP_ALLOCATED_SHUT * 100.0).ceil() as usize;
         let memory = crate::config::MemorySnapshot { limit_bytes, jemalloc_allocated_bytes: at.saturating_add_signed(offset), ..Default::default() };
-        let request = Resources { cpu: 1, decoded_bytes: 100, object_reads: 1, object_writes: 1 };
+        let request = Resources { cpu: 1, decoded_bytes: 100, object_reads: 1, object_writes: 1, ..Resources::default() };
         AdmissionController::new(4, 1_000, 8, 2).try_acquire_for(request, lane, memory).is_some()
     }
 
@@ -6906,13 +6949,13 @@ mod tests {
     #[test_case::test_case(false => (true, true) ; "yield_off_admits_the_ninth_rollup")]
     fn query_yield_caps_object_reads_except_hot_packing(enabled: bool) -> (bool, bool) {
         use std::sync::atomic::Ordering::Relaxed;
-        let admission = AdmissionController::with_decoded_capacity(32, 32, MAX_DECODED_BYTES * 64, 16, 16);
+        let admission = AdmissionController::with_decoded_capacity(32, 32, MAX_DECODED_BYTES * 64, u64::MAX, 16, 16);
         if enabled {
             admission.enable_query_yield();
         }
         (0..4).for_each(|_| admission.tick_query_yield(HI.0, HI.1));
         assert_eq!(lock(&admission.0).query_yield.map(|y| y.ceiling), enabled.then_some(8));
-        let request = Resources { cpu: 1, decoded_bytes: 1, object_reads: 1, object_writes: 1 };
+        let request = Resources { cpu: 1, decoded_bytes: 1, object_reads: 1, object_writes: 1, ..Resources::default() };
         let admit = |lane| admission.try_acquire_for(request, lane, crate::config::MemorySnapshot::unknown());
         let _held: Vec<_> = (0..8).map(|_| admit(AdmissionLane::Rollup).expect("under the ceiling")).collect();
         let refused_reads = || crate::observability::maintenance_stats().maintenance_admission_refused_object_reads.load(Relaxed);
@@ -6924,8 +6967,48 @@ mod tests {
 
     #[test]
     fn pool_scoped_admission_uses_the_exact_pool_capacity() {
-        let admission = AdmissionController::with_decoded_capacity(1, 4, 1_234, 4, 4);
+        let admission = AdmissionController::with_decoded_capacity(1, 4, 1_234, u64::MAX, 4, 4);
         assert_eq!(lock(&admission.0).capacity.decoded_bytes, 1_234, "a carved-out pool must not receive the cgroup constructor's second 25% haircut");
+    }
+
+    /// Priced against the prod 2026-09-27 `metrics_1m_v2` peaks (`heap_peak_delta_mb`,
+    /// MiB); co-running units are summed, since the reading is process-wide.
+    #[test_case::test_case(Some(1_058_336), 0, 43_474 ; "12h slice run alone")]
+    #[test_case::test_case(Some(161_558 + 235_485 + 323_311), 0, 30_204 ; "three co-running slices")]
+    #[test_case::test_case(Some(6 * 14_780), 0, 4_252 ; "six co-running ten-minute slices")]
+    #[test_case::test_case(None, 1_448 << 20, 43_474 ; "12h slice with no prior publication")]
+    #[test_case::test_case(None, (211 + 367 + 410) << 20, 30_204 ; "three slices with no prior publication")]
+    fn rollup_state_price_tracks_measured_peaks(prior_rows: Option<u64>, input_bytes: u64, measured_mib: u64) {
+        let ratio = rollup_state_bytes(1, prior_rows, input_bytes) as f64 / (measured_mib << 20) as f64;
+        assert!((0.9..=1.5).contains(&ratio), "priced {ratio:.2}x the measured peak");
+    }
+
+    #[test_case::test_case(&[] => None ; "nothing published")]
+    #[test_case::test_case(&[((-20, -10), 5)] => None ; "nothing overlapping")]
+    #[test_case::test_case(&[((0, 12), 120), ((0, 12), 120)] => Some(120) ; "fragments of one slice count once")]
+    #[test_case::test_case(&[((0, 6), 100)] => Some(200) ; "a half-covering prior extrapolates")]
+    #[test_case::test_case(&[((0, 24), 240)] => Some(120) ; "a wider prior prorates")]
+    fn prior_output_rows_extrapolates_by_density(published: &[((i64, i64), u64)]) -> Option<u64> {
+        prior_output_rows(published.iter().copied(), TimeSlice::new(0, 12).unwrap())
+    }
+
+    /// Output state no pool tracks: big units must not be admitted together, one
+    /// alone must not starve, and state-free units must not notice.
+    #[test]
+    fn rollup_state_admission_serializes_big_units_without_starving_them() {
+        let admission = AdmissionController::with_decoded_capacity(8, 8, u64::MAX, 100, 8, 8);
+        let unit = |state_bytes| Resources { cpu: 1, state_bytes, ..Resources::default() };
+        let acquire = |state_bytes| admission.try_acquire_for(unit(state_bytes), AdmissionLane::Rollup, crate::config::MemorySnapshot::unknown());
+        let first = acquire(60).expect("an empty pool admits");
+        assert!(acquire(60).is_none(), "two units whose state exceeds capacity must not run together");
+        assert!(acquire(0).is_some(), "a unit with no state is unaffected");
+        assert!(acquire(500).is_none(), "an over-capacity unit waits while others hold state");
+        drop(first);
+        let alone = acquire(500).expect("and then runs alone rather than never");
+        assert_eq!(admission.utilization().state_bytes, 100, "clamped to capacity, so it holds the whole pool");
+        assert!(acquire(1).is_none());
+        drop(alone);
+        assert_eq!(admission.utilization(), Resources::default(), "the clamped charge is what is released");
     }
 
     /// THE correctness argument for `rank`'s memo, as one property.

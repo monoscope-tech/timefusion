@@ -3187,6 +3187,7 @@ impl Database {
             cpu_base,
             cpu_max,
             cfg.derived.coordinator_decoded_capacity_bytes(),
+            cfg.derived.rollup_state_capacity_bytes(),
             coordinator_io_slots,
             coordinator_io_slots,
         );

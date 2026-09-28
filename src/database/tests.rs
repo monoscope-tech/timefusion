@@ -1461,6 +1461,40 @@ fn the_republish_bound_keeps_the_newest_slices() {
     assert_eq!(*kept.last().expect("bounded"), 88 * day, "the bound must cut from the OLD end, not the new one");
 }
 
+/// A rollup unit is charged the output state its slice published last time, so a
+/// big unit waits for room instead of growing beside another one past every pool.
+#[tokio::test(flavor = "multi_thread")]
+async fn rollup_unit_waits_for_output_state_room_then_runs_alone() -> Result<()> {
+    use crate::maintenance_coordinator::{AdmissionController, AdmissionLane, Operation, Resources, TAG_OUTPUT_ROWS, TaskState};
+    // A republish over an unmoved source is the vehicle; the no-op skip would decline it.
+    let mut db = Database::with_config(test_config_with("rollup-state-admission", |cfg| cfg.maintenance.timefusion_rollup_noop_skip_enabled = false)).await?;
+    db.cancel_maintenance();
+    db.maintenance_admission = AdmissionController::with_decoded_capacity(64, 64, u64::MAX, 1 << 30, 64, 64);
+    let day = (Utc::now() - chrono::Duration::days(3)).date_naive();
+    let project = format!("state_{}", uuid::Uuid::new_v4().simple());
+    insert_hourly_spans(&db, &project, midnight_micros(day), [20, 21]).await?;
+    let run = || db.run_unit_once("otel_logs_and_spans", &project, day, Operation::BaseRollup, 4, 20);
+    assert_eq!(run().await?.state, Some(TaskState::Complete));
+    // A whale-sized prior publication: tens of GiB of state against a 1 GiB capacity.
+    let tier = db.resolve_table(&project, &rollup_tier(false)).await?;
+    rewrite_tier_files(&tier, "-whale", |add| {
+        add.tags.as_mut().expect("published output has tags").insert(TAG_OUTPUT_ROWS.to_owned(), Some("1000000".to_owned()));
+    })
+    .await?;
+
+    let held = db.maintenance_admission.try_acquire_for(
+        Resources { state_bytes: 1, ..Resources::default() },
+        AdmissionLane::Rollup,
+        crate::config::MemorySnapshot::unknown(),
+    );
+    let blocked = run().await?;
+    assert_eq!((blocked.state, blocked.retry_reason.as_deref()), (Some(TaskState::Retry), Some("admission_busy")), "must wait while other state is held");
+    drop(held);
+    let alone = run().await?;
+    assert_eq!(alone.state, Some(TaskState::Complete), "and run alone once it is not: {:?}", alone.retry_reason);
+    Ok(())
+}
+
 /// The publish site must actually CALL `reopen_derived_over` with the right child
 /// tier name: a wrong name matches nothing SILENTLY, leaving a derived cell built
 /// before its base was rebuilt serving stale rows forever.
@@ -3864,7 +3898,7 @@ fn rollups_keep_a_reserved_share_of_admission() {
     // test fail for the reservation being RETUNED, which is not a regression.
     let ceiling = 24;
     let admission = AdmissionController::with_cpu_ceiling(ceiling, ceiling, u64::MAX, 64, 64);
-    let request = Resources { cpu: 1, decoded_bytes: MAX_DECODED_BYTES / 8, object_reads: 1, object_writes: 1 };
+    let request = Resources { cpu: 1, decoded_bytes: MAX_DECODED_BYTES / 8, object_reads: 1, object_writes: 1, ..Resources::default() };
     // Non-rollup work fills everything EXCEPT the reservation.
     let held: Vec<_> = std::iter::repeat_with(|| admission.try_acquire_for(request, AdmissionLane::Other, crate::config::MemorySnapshot::unknown()))
         .map_while(|p| p)
@@ -3887,7 +3921,7 @@ async fn database_bounds_concurrent_maintenance_jobs() -> Result<()> {
     let db = Database::with_config(create_test_config("bounded-maintenance-jobs")).await?;
     let jobs = db.config.derived.coordinator_jobs();
 
-    let request = Resources { cpu: 1, decoded_bytes: MAX_DECODED_BYTES, object_reads: 1, object_writes: 1 };
+    let request = Resources { cpu: 1, decoded_bytes: MAX_DECODED_BYTES, object_reads: 1, object_writes: 1, ..Resources::default() };
 
     // `coordinator_jobs` is the FLOOR of the ceiling, not its cap: the ceiling is
     // lag-scaled, so an idle runtime may exceed the thread count to cover I/O wait

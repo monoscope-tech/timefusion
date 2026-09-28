@@ -557,6 +557,11 @@ pub fn init_metrics(
         maintenance_stats().maintenance_admission_refused_decoded_bytes.load(Relaxed)
     );
     observe!(counter
+        "timefusion.maintenance.admission_refused_state_bytes",
+        "Rollup reservations refused because admitted aggregate state would exceed its capacity",
+        maintenance_stats().maintenance_admission_refused_state_bytes.load(Relaxed)
+    );
+    observe!(counter
         "timefusion.maintenance.admission_refused_object_reads",
         "Maintenance reservations refused because object-read tokens were exhausted",
         maintenance_stats().maintenance_admission_refused_object_reads.load(Relaxed)
@@ -1689,10 +1694,12 @@ atomic_stats! {
         maintenance_cpu_tokens_limit as "cpu_tokens_limit",
         maintenance_rollup_reserved_cpu_tokens as "rollup_reserved_cpu_tokens",
         maintenance_decoded_bytes_capacity as "decoded_bytes_capacity",
+        maintenance_state_bytes_capacity as "state_bytes_capacity",
         maintenance_object_read_tokens_capacity as "object_read_tokens_capacity",
         maintenance_object_write_tokens_capacity as "object_write_tokens_capacity",
         maintenance_cpu_tokens_used as "cpu_tokens_used",
         maintenance_decoded_bytes_used as "decoded_bytes_used",
+        maintenance_state_bytes_used as "state_bytes_used",
         maintenance_object_read_tokens_used as "object_read_tokens_used",
         maintenance_object_write_tokens_used as "object_write_tokens_used",
         /// Refused reservations by binding dimension. Several counters may rise
@@ -1701,6 +1708,7 @@ atomic_stats! {
         maintenance_admission_refused_decoded_bytes as "admission_refused_decoded_bytes_total",
         maintenance_admission_refused_object_reads as "admission_refused_object_reads_total",
         maintenance_admission_refused_object_writes as "admission_refused_object_writes_total",
+        maintenance_admission_refused_state_bytes as "admission_refused_state_bytes_total",
         /// Aggregates that fell through to a raw scan, plus the breakdown by reason —
         /// the reason is the only thing that distinguishes "never built" from "the
         /// source moved under it" from "unsupported shape".

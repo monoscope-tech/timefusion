@@ -2634,7 +2634,7 @@ impl Database {
         // The unit's OWN size, not the fleet maximum: admission scales its ceiling by
         // pool occupancy, so always asking for `MAX_DECODED_BYTES` starves on a busy pool.
         let clamped = estimated_bytes.clamp(1, MAX_DECODED_BYTES);
-        let request = Resources { cpu: Self::admission_cpu_cost(clamped), decoded_bytes: clamped, object_reads: 1, object_writes: 1 };
+        let request = Resources { cpu: Self::admission_cpu_cost(clamped), decoded_bytes: clamped, object_reads: 1, object_writes: 1, ..Resources::default() };
         let Some(_permit) = self.maintenance_admission.try_acquire(request) else {
             // Deliberately NOT `resource_admission`: that reason makes `retry_or_split`
             // split the unit. The request is clamped, so a refusal means only "busy now".
@@ -3101,13 +3101,19 @@ impl Database {
         // direction is to do the work, exactly as before this check existed.
         // The project's live slices also bound the split below: a child boundary inside one
         // leaves that file contained by no child, so no publish could ever retire it.
-        let mut live_slices = Vec::new();
+        let (mut live_slices, mut prior_rows) = (Vec::new(), None);
         if let Ok(target_ref) = self.resolve_table(&key.project_id, &key.physical_table).await {
             let live_adds: Vec<_> = {
                 let target = target_ref.read().await;
                 target.snapshot().ok().map(|snapshot| snapshot.log_data().iter().map(|file| add_action(&file)).collect()).unwrap_or_default()
             };
-            live_slices = live_adds.iter().filter(|add| Self::tag_project(add) == Some(key.project_id.as_str())).filter_map(Self::slice_tag_range).collect();
+            let project_adds = || live_adds.iter().filter(|add| Self::tag_project(add) == Some(key.project_id.as_str()));
+            live_slices = project_adds().filter_map(Self::slice_tag_range).collect();
+            prior_rows = crate::maintenance_coordinator::prior_output_rows(
+                project_adds()
+                    .filter_map(|add| Some((Self::slice_tag_range(add)?, Self::add_tag(add, crate::maintenance_coordinator::TAG_OUTPUT_ROWS)?.parse().ok()?))),
+                key.slice,
+            );
             if let Some(covering) = live_adds.iter().find_map(|add| Self::covering_slice_for(add, &key))
                 && self.settle_covered_by_wider(&key, covering, (source_rows, source_epoch), &from_table, witness_table.as_ref(), date).await?
             {
@@ -3173,13 +3179,15 @@ impl Database {
         let hash_shards = estimated_bytes.div_ceil(MAX_DECODED_BYTES).max(1);
         anyhow::ensure!(hash_shards <= 65_536, "one-minute slice needs {hash_shards} hash shards; maximum is 65536");
         let per_shard_bytes = estimated_bytes.div_ceil(hash_shards).max(1);
+        let sketches = spec.measures.iter().filter(|measure| matches!(measure.agg.as_str(), "tdigest" | "hll")).count();
+        let state_bytes = crate::maintenance_coordinator::rollup_state_bytes(sketches, prior_rows, estimated_bytes);
         let Some(_permit) = self.maintenance_admission.try_acquire_for(
-            Resources { cpu: 1, decoded_bytes: per_shard_bytes, object_reads: 1, object_writes: 1 },
+            Resources { cpu: 1, decoded_bytes: per_shard_bytes, state_bytes, object_reads: 1, object_writes: 1 },
             crate::maintenance_coordinator::AdmissionLane::Rollup,
             self.admission_memory(),
         ) else {
             // Transient, never "too big to admit": the shard count above was chosen so
-            // `per_shard_bytes <= MAX_DECODED_BYTES`.
+            // `per_shard_bytes <= MAX_DECODED_BYTES`, and state clamps to its capacity.
             return retry("admission_busy".to_owned(), self.admission_backoff_for(&key));
         };
         let mut fingerprint_items = selected.clone();
@@ -4175,7 +4183,7 @@ impl Database {
         // files' decoded estimate admitted far more concurrent sorts than their real
         // footprint allowed (prod OOM 2026-09-26: 55 running units, anon 123.8 GB).
         let clamped = task.estimated_decoded_bytes.clamp(1, MAX_DECODED_BYTES);
-        let request = Resources { cpu: Self::admission_cpu_cost(clamped), decoded_bytes: clamped, object_reads: 1, object_writes: 1 };
+        let request = Resources { cpu: Self::admission_cpu_cost(clamped), decoded_bytes: clamped, object_reads: 1, object_writes: 1, ..Resources::default() };
         let lane = if operation == Operation::HotPacking { AdmissionLane::Hot } else { AdmissionLane::Other };
         let Some(_permit) = self.maintenance_admission.try_acquire_for(request, lane, self.admission_memory()) else {
             return self.retried(&key, "admission_busy".to_owned(), self.admission_backoff_for(&key));

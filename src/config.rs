@@ -701,6 +701,15 @@ impl DerivedBudget {
         (self.coordinator_share_bytes() as f64 * SAFE_DECODED_PER_POOL_BYTE) as u64
     }
 
+    /// Rollup aggregate state admission may reserve. Rollups start below
+    /// `ROLLUP_ALLOCATED_SHUT`, so everything admitted must grow into what is left
+    /// under `HYGIENE_TARGET_PEAK` beside the non-lane reserve. Floored so a small
+    /// box still serializes its biggest units instead of charging nothing.
+    pub fn rollup_state_capacity_bytes(&self) -> u64 {
+        let headroom = self.memory_limit_bytes as f64 * (HYGIENE_TARGET_PEAK - ROLLUP_ALLOCATED_SHUT) - HYGIENE_NON_LANE_GROWTH_BYTES as f64;
+        (headroom.max(0.0) as u64).max(crate::maintenance_coordinator::MAX_DECODED_BYTES)
+    }
+
     /// The decoded-bytes budget shared by concurrent repair rewrites. Priced in
     /// BYTES, not permits: a bin larger than the budget takes all of it and runs
     /// alone, while small bins share. Derived from the compaction target file
@@ -3055,6 +3064,12 @@ mod tests {
             SAFE_DECODED_PER_POOL_BYTE,
         );
         assert!(prod.light_optimize_k(11) < prod.cores / 4, "and the CPU term is not what binds on a big box");
+        let rollup_peak =
+            prod.memory_limit_bytes as f64 * ROLLUP_ALLOCATED_SHUT + (prod.rollup_state_capacity_bytes() + HYGIENE_NON_LANE_GROWTH_BYTES as u64) as f64;
+        assert!(
+            rollup_peak <= prod.memory_limit_bytes as f64 * HYGIENE_TARGET_PEAK,
+            "fully-grown rollup state admitted at the shut line must fit the target peak"
+        );
     }
 
     // Small box (16 GiB / 4 cores): degrades to K=1, nothing underflows/zeroes.
@@ -3068,6 +3083,7 @@ mod tests {
         assert!(b.heavy_share_bytes() > 0);
         assert!(b.tick_budget(Duration::from_secs(300)) < Duration::from_secs(300));
         assert!(b.memory_brake_limit_bytes() < b.memory_limit_bytes());
+        assert!(b.rollup_state_capacity_bytes() > 0, "a zero state capacity would charge nothing");
     }
 
     /// The brake must stay well clear of the cgroup the OOM killer watches, and
