@@ -1067,8 +1067,10 @@ pub struct TantivyConfig {
     /// (`<timefusion_data_dir>/tantivy_cache`), enforced LRU-first by the
     /// "Tantivy cache reap" cron — the only thing that deletes from that tree.
     /// Shares a volume with the WAL. Must exceed the query working set with
-    /// headroom, or the reaper evicts what the prefetch cron re-downloads.
-    #[serde_inline_default(200)]
+    /// headroom, or the reaper evicts what the prefetch cron re-downloads:
+    /// prod's prefetch refills ~300–350 GB each cycle, so 200 thrashed ~100 GB
+    /// every 10 minutes and point lookups paid S3 index downloads at planning.
+    #[serde_inline_default(400)]
     pub timefusion_tantivy_cache_disk_gb: u64,
     /// How often to enforce `timefusion_tantivy_cache_disk_gb`. Each sweep
     /// walks the whole cache tree; empty disables the reap (and the bound).
@@ -2629,6 +2631,7 @@ mod tests {
         // Unset WAL byte-threshold = derive (AppConfig::effective_wal_max_unflushed_bytes).
         assert_eq!(config.buffer.wal_max_unflushed_bytes(), None);
         assert_eq!(config.cache.timefusion_foyer_memory_mb, 1024);
+        assert_eq!(config.tantivy.timefusion_tantivy_cache_disk_gb, 400, "must exceed the prefetch working set");
         assert_eq!(config.cache.timefusion_foyer_disk_gb, 500);
         assert_eq!(config.cache.disk_size_bytes(), 500 * GIB);
         assert_eq!(config.cache.timefusion_warm_inline_max_mb, 0);
