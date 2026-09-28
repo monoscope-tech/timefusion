@@ -773,6 +773,17 @@ impl Database {
             });
         }
 
+        if self.config.maintenance.timefusion_maintenance_query_yield {
+            let (admission, cancel) = (self.maintenance_admission.clone(), cancel.clone());
+            admission.enable_query_yield();
+            tokio::spawn(async move {
+                while cancel.run_until_cancelled(tokio::time::sleep(crate::maintenance_coordinator::QUERY_YIELD_TICK)).await.is_some() {
+                    let (p95, samples) = crate::observability::PGWIRE_LATENCY.recent(0.95);
+                    admission.tick_query_yield(p95, samples);
+                }
+            });
+        }
+
         // Delete staged parquet left by an interrupted wave. Best-effort and
         // after readiness, so serial DELETE latency cannot hold PGWire in 57P03.
         {

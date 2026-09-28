@@ -2038,6 +2038,10 @@ pub struct MaintenanceConfig {
     /// cleanup-only.
     #[serde_inline_default(true)]
     pub timefusion_repair_resume_enabled: bool,
+    /// Shrink the maintenance admission ceiling while pgwire p95 stays high and
+    /// regrow it once p95 recovers. Today's HotPacking is exempt.
+    #[serde_inline_default(false)]
+    pub timefusion_maintenance_query_yield: bool,
 
     /// Complete a rollup unit without rebuilding when its input file set —
     /// deletion vectors included — is unchanged since the live slice coverage

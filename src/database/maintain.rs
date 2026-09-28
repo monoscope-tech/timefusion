@@ -3987,7 +3987,7 @@ impl Database {
             return Ok(false);
         }
         let operation = selection.operation();
-        use crate::maintenance_coordinator::{MAX_DECODED_BYTES, Operation, Resources, TaskLease, TaskState};
+        use crate::maintenance_coordinator::{AdmissionLane, MAX_DECODED_BYTES, Operation, Resources, TaskLease, TaskState};
         // Current-day packing must not repeatedly win every shared light permit
         // while an older sealed day is waiting. This cap is conditional: once
         // sealed debt reaches zero, hot packing may use the whole pool again.
@@ -4138,8 +4138,8 @@ impl Database {
         // footprint allowed (prod OOM 2026-09-26: 55 running units, anon 123.8 GB).
         let clamped = task.estimated_decoded_bytes.clamp(1, MAX_DECODED_BYTES);
         let request = Resources { cpu: Self::admission_cpu_cost(clamped), decoded_bytes: clamped, object_reads: 1, object_writes: 1 };
-        let Some(_permit) = self.maintenance_admission.try_acquire_for(request, crate::maintenance_coordinator::AdmissionLane::Other, self.admission_memory())
-        else {
+        let lane = if operation == Operation::HotPacking { AdmissionLane::Hot } else { AdmissionLane::Other };
+        let Some(_permit) = self.maintenance_admission.try_acquire_for(request, lane, self.admission_memory()) else {
             return self.retried(&key, "admission_busy".to_owned(), self.admission_backoff_for(&key));
         };
         note(2);

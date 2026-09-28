@@ -3099,6 +3099,8 @@ struct AdmissionState {
     used: Resources,
     /// The static reservation the adaptive ceiling falls back to under load.
     cpu_base: u32,
+    /// `None` while `timefusion_maintenance_query_yield` is off.
+    query_yield: Option<QueryYield>,
 }
 
 impl AdmissionState {
@@ -3137,6 +3139,8 @@ fn occupancy_scaled_ceiling(available: u64, capacity: u64) -> u64 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdmissionLane {
     Rollup,
+    /// Today's HotPacking: freshness outranks query latency, so the query yield skips it.
+    Hot,
     Other,
 }
 
@@ -3170,6 +3174,49 @@ pub(crate) fn rollup_reserved_cpu(ceiling: u32) -> u32 {
 #[cfg(test)]
 pub fn lag_scaled_cpu_ceiling_for_test(base: u32, capacity: u32, lag_ms: u64) -> u32 {
     lag_scaled_cpu_ceiling_inner(base, capacity, lag_ms)
+}
+
+const QUERY_YIELD_SHUT_MS: f64 = 800.0;
+const QUERY_YIELD_REOPEN_MS: f64 = 400.0;
+const QUERY_YIELD_TICKS: u8 = 2;
+const QUERY_YIELD_FLOOR: u32 = 8;
+const QUERY_YIELD_STEP_UP: u32 = 2;
+const QUERY_YIELD_MIN_SAMPLES: u64 = 50;
+pub const QUERY_YIELD_TICK: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The maintenance units admitted, plus how many ticks in a row p95 sat above
+/// the shut threshold or below the reopen one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct QueryYield {
+    pub ceiling: u32,
+    high: u8,
+    low: u8,
+}
+
+impl QueryYield {
+    pub const fn open(ceiling: u32) -> Self {
+        Self { ceiling, high: 0, low: 0 }
+    }
+}
+
+/// AIMD on units in flight: ×3/4 per tick once p95 has been high for
+/// `QUERY_YIELD_TICKS` ticks, +2 per tick once it has been low as long. A window
+/// too quiet to trust leaves the state, streaks included, exactly as it was.
+pub fn query_scaled_ceiling(prev: QueryYield, p95_ms: Option<f64>, samples: u64, max: u32) -> QueryYield {
+    let Some(p95) = p95_ms.filter(|_| samples >= QUERY_YIELD_MIN_SAMPLES) else { return prev };
+    let (high, low) = match p95 {
+        p if p >= QUERY_YIELD_SHUT_MS => (prev.high.saturating_add(1), 0),
+        p if p <= QUERY_YIELD_REOPEN_MS => (0, prev.low.saturating_add(1)),
+        _ => (0, 0),
+    };
+    let ceiling = if high >= QUERY_YIELD_TICKS {
+        (prev.ceiling * 3 / 4).max(QUERY_YIELD_FLOOR)
+    } else if low >= QUERY_YIELD_TICKS {
+        prev.ceiling.saturating_add(QUERY_YIELD_STEP_UP).min(max)
+    } else {
+        prev.ceiling
+    };
+    QueryYield { ceiling, high, low }
 }
 
 fn lag_scaled_cpu_ceiling(base: u32, capacity: u32) -> u32 {
@@ -3223,7 +3270,28 @@ impl AdmissionController {
         stats.maintenance_decoded_bytes_capacity.store(capacity.decoded_bytes, Relaxed);
         stats.maintenance_object_read_tokens_capacity.store(u64::from(capacity.object_reads), Relaxed);
         stats.maintenance_object_write_tokens_capacity.store(u64::from(capacity.object_writes), Relaxed);
-        Self(Arc::new(Mutex::new(AdmissionState { capacity, used: Resources::default(), cpu_base })))
+        Self(Arc::new(Mutex::new(AdmissionState { capacity, used: Resources::default(), cpu_base, query_yield: None })))
+    }
+
+    pub fn enable_query_yield(&self) {
+        let mut state = lock(&self.0);
+        state.query_yield = Some(QueryYield::open(state.capacity.object_reads));
+        crate::observability::QUERY_YIELD_CEILING.store(u64::from(state.capacity.object_reads), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// One control tick against the recent pgwire p95; a no-op until enabled.
+    pub fn tick_query_yield(&self, p95_ms: Option<f64>, samples: u64) {
+        let mut state = lock(&self.0);
+        let max = state.capacity.object_reads;
+        let Some(prev) = state.query_yield else { return };
+        let next = query_scaled_ceiling(prev, p95_ms, samples, max);
+        state.query_yield = Some(next);
+        crate::observability::QUERY_YIELD_CEILING.store(u64::from(next.ceiling), std::sync::atomic::Ordering::Relaxed);
+        match next.ceiling.cmp(&prev.ceiling) {
+            std::cmp::Ordering::Less => crate::observability::record_query_yield_transition("shut"),
+            std::cmp::Ordering::Greater => crate::observability::record_query_yield_transition("reopen"),
+            std::cmp::Ordering::Equal => {}
+        }
     }
 
     /// Admission with NO elastic allowance — the static share only.
@@ -3260,7 +3328,7 @@ impl AdmissionController {
         }
         let lane_ceiling = match lane {
             AdmissionLane::Rollup => global_ceiling,
-            AdmissionLane::Other => global_ceiling.saturating_sub(reserved).max(1),
+            AdmissionLane::Hot | AdmissionLane::Other => global_ceiling.saturating_sub(reserved).max(1),
         };
         let used = state.used();
         let mut refused = false;
@@ -3287,7 +3355,8 @@ impl AdmissionController {
             refused = true;
         }
         let available = state.available();
-        if request.object_reads > available.object_reads {
+        let yielded = lane != AdmissionLane::Hot && state.query_yield.is_some_and(|y| used.object_reads.saturating_add(request.object_reads) > y.ceiling);
+        if request.object_reads > available.object_reads || yielded {
             stats.maintenance_admission_refused_object_reads.fetch_add(1, Relaxed);
             refused = true;
         }
@@ -6810,6 +6879,47 @@ mod tests {
         let memory = crate::config::MemorySnapshot { limit_bytes, jemalloc_allocated_bytes: at.saturating_add_signed(offset), ..Default::default() };
         let request = Resources { cpu: 1, decoded_bytes: 100, object_reads: 1, object_writes: 1 };
         AdmissionController::new(4, 1_000, 8, 2).try_acquire_for(request, lane, memory).is_some()
+    }
+
+    const HI: (Option<f64>, u64) = (Some(800.0), 50);
+    const LO: (Option<f64>, u64) = (Some(400.0), 50);
+    const MID: (Option<f64>, u64) = (Some(600.0), 500);
+
+    /// Each tick is a (p95, samples) window, starting fully open at `max`.
+    #[test_case::test_case(16, &[HI] => 16 ; "one_high_tick_holds")]
+    #[test_case::test_case(16, &[HI, HI] => 12 ; "two_high_ticks_shut_by_a_quarter")]
+    #[test_case::test_case(16, &[HI; 6] => 8 ; "repeated_shuts_floor_at_eight")]
+    #[test_case::test_case(16, &[HI, MID, HI] => 16 ; "the_band_breaks_a_high_streak")]
+    #[test_case::test_case(16, &[HI, HI, MID, MID, MID] => 12 ; "the_band_holds")]
+    #[test_case::test_case(16, &[HI, HI, HI, LO] => 9 ; "one_low_tick_holds")]
+    #[test_case::test_case(16, &[HI, HI, HI, LO, LO] => 11 ; "two_low_ticks_reopen_by_two")]
+    #[test_case::test_case(16, &[HI, HI, LO, LO, LO, LO] => 16 ; "reopen_stops_at_max")]
+    #[test_case::test_case(16, &[HI, (Some(5_000.0), 49), (None, 0), HI] => 12 ; "an_under_sample_window_keeps_the_streak")]
+    #[test_case::test_case(16, &[(Some(5_000.0), 49); 4] => 16 ; "under_sample_windows_never_shut")]
+    fn query_scaled_ceiling_is_aimd_with_hysteresis(max: u32, ticks: &[(Option<f64>, u64)]) -> u32 {
+        ticks.iter().fold(QueryYield::open(max), |state, &(p95, samples)| query_scaled_ceiling(state, p95, samples, max)).ceiling
+    }
+
+    /// With the ceiling at its floor of 8, the 9th Rollup unit waits on object
+    /// reads while today's HotPacking still runs.
+    #[test_case::test_case(true => (false, true) ; "yield_on_refuses_the_ninth_rollup_not_hot_packing")]
+    #[test_case::test_case(false => (true, true) ; "yield_off_admits_the_ninth_rollup")]
+    fn query_yield_caps_object_reads_except_hot_packing(enabled: bool) -> (bool, bool) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let admission = AdmissionController::with_decoded_capacity(32, 32, MAX_DECODED_BYTES * 64, 16, 16);
+        if enabled {
+            admission.enable_query_yield();
+        }
+        (0..4).for_each(|_| admission.tick_query_yield(HI.0, HI.1));
+        assert_eq!(lock(&admission.0).query_yield.map(|y| y.ceiling), enabled.then_some(8));
+        let request = Resources { cpu: 1, decoded_bytes: 1, object_reads: 1, object_writes: 1 };
+        let admit = |lane| admission.try_acquire_for(request, lane, crate::config::MemorySnapshot::unknown());
+        let _held: Vec<_> = (0..8).map(|_| admit(AdmissionLane::Rollup).expect("under the ceiling")).collect();
+        let refused_reads = || crate::observability::maintenance_stats().maintenance_admission_refused_object_reads.load(Relaxed);
+        let before = refused_reads();
+        let ninth = admit(AdmissionLane::Rollup).is_some();
+        assert_eq!(refused_reads() - before, u64::from(!ninth), "a refusal is charged to object reads");
+        (ninth, admit(AdmissionLane::Hot).is_some())
     }
 
     #[test]
