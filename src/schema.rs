@@ -324,6 +324,23 @@ impl TableSchema {
         self.fields.iter().find(|f| f.name == name)
     }
 
+    /// The base (or derived) rollup tier `name` picks — by spec name or physical
+    /// table — else the first one declared.
+    pub fn rollup_tier(&self, name: Option<&str>, derived: bool) -> anyhow::Result<&RollupSpec> {
+        let source = &self.table_name;
+        let kind = if derived { "derived" } else { "base" };
+        let Some(name) = name else {
+            return self.rollups.iter().find(|spec| spec.derive_from.is_some() == derived).ok_or_else(|| anyhow::anyhow!("{source} declares no {kind} rollup"));
+        };
+        let spec =
+            self.rollups.iter().find(|spec| [name.to_owned(), format!("{source}_rollup_{name}")].contains(&spec.table_name(source))).ok_or_else(|| {
+                let declared: Vec<_> = self.rollups.iter().map(|spec| spec.table_name(source)).collect();
+                anyhow::anyhow!("unknown rollup tier {name}; {source} declares: {}", declared.join(", "))
+            })?;
+        anyhow::ensure!(spec.derive_from.is_some() == derived, "rollup tier {name} is not a {kind} tier");
+        Ok(spec)
+    }
+
     /// Arrow type + nullability of one declared field, without building the
     /// whole `schema_ref()` (which allocates ~100 fields per call).
     pub fn field_def(&self, name: &str) -> Option<(ArrowDataType, bool)> {
@@ -744,6 +761,22 @@ mod tests {
     /// The tiebreak MUST name the TF-owned column: `insert_coerce::stamp_version`
     /// overwrites whatever it names, so pointing it at a client column would
     /// destroy client data on every write.
+    #[test_case(None, false => Ok("otel_logs_and_spans_rollup_dashboard_1m_v3".into()) ; "default base is the first declared")]
+    #[test_case(None, true => Ok("otel_logs_and_spans_rollup_dashboard_1h_v2".into()) ; "default derived is the first declared")]
+    #[test_case(Some("dashboard_1m_v4"), false => Ok("otel_logs_and_spans_rollup_dashboard_1m_v4".into()) ; "spec name")]
+    #[test_case(Some("otel_logs_and_spans_rollup_dashboard_1h_v3"), true => Ok("otel_logs_and_spans_rollup_dashboard_1h_v3".into()) ; "table name")]
+    #[test_case(Some("dashboard_1h_v3"), false => Err("rollup tier dashboard_1h_v3 is not a base tier".into()) ; "wrong kind")]
+    fn rollup_tier_resolves(name: Option<&str>, derived: bool) -> Result<String, String> {
+        source().rollup_tier(name, derived).map(|spec| spec.table_name("otel_logs_and_spans")).map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn rollup_tier_unknown_lists_declared_tiers() {
+        let err = source().rollup_tier(Some("dashboard_1m_v9"), false).unwrap_err().to_string();
+        assert!(err.starts_with("unknown rollup tier dashboard_1m_v9; otel_logs_and_spans declares: "), "{err}");
+        assert!(["dashboard_1m_v3", "dashboard_1h_v2", "dashboard_1m_v4", "dashboard_1h_v3"].iter().all(|tier| err.contains(tier)), "{err}");
+    }
+
     #[test_case("mor_versioned")]
     fn assert_tombstone_shape(name: &str) {
         let schema = get_schema(name).unwrap_or_else(|| panic!("{name} registered"));

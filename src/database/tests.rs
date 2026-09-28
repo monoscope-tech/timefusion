@@ -62,13 +62,13 @@ async fn run_unit_preserves_unrelated_journal_tasks() -> Result<()> {
         journal.enqueue(unrelated.clone(), 0, 1024, 0);
         serde_json::to_value(journal.tasks().find(|task| task.key == unrelated).unwrap())?
     };
-    db.run_unit_once("otel_logs_and_spans", "requested-unit-project", day, Operation::Dedup, 1, 0).await?;
+    db.run_unit_once("otel_logs_and_spans", "requested-unit-project", day, Operation::Dedup, 1, 0, None).await?;
     let journal = db.journal();
     let after = serde_json::to_value(journal.tasks().find(|task| task.key == unrelated).unwrap())?;
     assert_eq!(before, after, "running one unit must not rewrite another task");
     drop(journal);
 
-    let report = db.run_unit_once("otel_logs_and_spans", "requested-unit-project", day, Operation::DerivedRollup, 1, 0).await?;
+    let report = db.run_unit_once("otel_logs_and_spans", "requested-unit-project", day, Operation::DerivedRollup, 1, 0, None).await?;
     assert_eq!(report.state, Some(TaskState::Pending), "missing base coverage must block a derived claim");
     assert!(!db.journal().tasks().any(|task| task.key.operation == Operation::BaseRollup), "a CLI run must not fabricate base completion");
 
@@ -80,7 +80,7 @@ async fn run_unit_preserves_unrelated_journal_tasks() -> Result<()> {
         let task = journal.claim_exact(&running, 0, false).unwrap();
         serde_json::to_value(task)?
     };
-    db.run_unit_once("otel_logs_and_spans", "running-unit-project", day, Operation::Dedup, 1, 0).await?;
+    db.run_unit_once("otel_logs_and_spans", "running-unit-project", day, Operation::Dedup, 1, 0, None).await?;
     let journal = db.journal();
     assert_eq!(running_before, serde_json::to_value(journal.tasks().find(|task| task.key == running).unwrap())?, "a running task cannot be claimed twice");
     Ok(())
@@ -952,7 +952,7 @@ async fn run_unit_runs_the_requested_project_and_not_another() -> Result<()> {
         journal.enqueue(decoy, 0, crate::maintenance_coordinator::MAX_DECODED_BYTES, 0);
     }
 
-    let report = db.run_unit_once("otel_logs_and_spans", &wanted, day, Operation::BaseRollup, 24, 0).await?;
+    let report = db.run_unit_once("otel_logs_and_spans", &wanted, day, Operation::BaseRollup, 24, 0, None).await?;
     assert_eq!(report.state, Some(crate::maintenance_coordinator::TaskState::Complete), "the REQUESTED unit must be the one that ran");
 
     // A publication, not `state`, is what proves work was actually done for the decoy.
@@ -977,7 +977,7 @@ async fn a_built_rollup_routes_and_stops_routing_once_its_source_grows() -> Resu
     let day = (Utc::now() - chrono::Duration::days(3)).date_naive();
     let at = day.and_hms_opt(12, 0, 0).expect("noon").and_utc().timestamp_micros();
     insert_a_span(&db, &project, "a", at).await?;
-    db.run_unit_once("otel_logs_and_spans", &project, day, Operation::BaseRollup, 24, 0).await?;
+    db.run_unit_once("otel_logs_and_spans", &project, day, Operation::BaseRollup, 24, 0, None).await?;
 
     let covered = |db: &Database| {
         db.rollup_slice_coverage
@@ -1028,7 +1028,7 @@ async fn rollup_routing_rejects_legacy_materialization_generations() -> Result<(
         )
         .await?;
     }
-    db.run_unit_once("otel_logs_and_spans", &project, day, crate::maintenance_coordinator::Operation::BaseRollup, 24, 0).await?;
+    db.run_unit_once("otel_logs_and_spans", &project, day, crate::maintenance_coordinator::Operation::BaseRollup, 24, 0, None).await?;
     let mut ctx = Arc::clone(&db).create_session_context();
     db.setup_session_context(&mut ctx)?;
     let state = ctx.state();
@@ -1092,7 +1092,7 @@ async fn rollup_routing_rejects_legacy_materialization_generations() -> Result<(
         outcome.as_ref().map(|route| route.as_ref().map(|r| r.sql.as_str())).map_err(|reason| reason.label())
     );
     let (key, mut publication) = db.journal().published_rollups("otel_logs_and_spans", &target).into_iter().find(|(key, _)| key.project_id == project).unwrap();
-    let derived = db.run_unit_once("otel_logs_and_spans", &project, day, crate::maintenance_coordinator::Operation::DerivedRollup, 24, 0).await?;
+    let derived = db.run_unit_once("otel_logs_and_spans", &project, day, crate::maintenance_coordinator::Operation::DerivedRollup, 24, 0, None).await?;
     assert_eq!(derived.state, Some(crate::maintenance_coordinator::TaskState::Retry), "a derived unit must wait for a current base generation");
 
     // Persist the obsolete identity too. Recovery must requeue a completed
@@ -1125,7 +1125,7 @@ async fn rollup_routing_rejects_legacy_materialization_generations() -> Result<(
         db.rollup_slice_coverage.iter().map(|entry| (entry.key().clone(), entry.value().clone())).collect::<Vec<_>>()
     );
     assert!(!matches!(db.rollup_sql(&plan, &state).await, Ok(Some(_))), "recovery must not restore an obsolete publication");
-    let rebuilt = db.run_unit_once("otel_logs_and_spans", &project, day, Operation::BaseRollup, 24, 0).await?;
+    let rebuilt = db.run_unit_once("otel_logs_and_spans", &project, day, Operation::BaseRollup, 24, 0, None).await?;
     assert_eq!(rebuilt.state, Some(TaskState::Complete));
     let live = live_paths(&db, &project, &target).await;
     assert!(obsolete_paths.iter().all(|path| !live.contains(path)), "the rebuild retires the obsolete files");
@@ -1136,7 +1136,7 @@ async fn rollup_routing_rejects_legacy_materialization_generations() -> Result<(
     // A rewrite that loses all tags cannot turn a nonempty base into a
     // trusted empty derived publication. It must request a base rebuild.
     rewrite_tier_files(&tier, "-untagged", |add| add.tags = None).await?;
-    let missing_tags = db.run_unit_once("otel_logs_and_spans", &project, day, Operation::DerivedRollup, 24, 0).await?;
+    let missing_tags = db.run_unit_once("otel_logs_and_spans", &project, day, Operation::DerivedRollup, 24, 0, None).await?;
     assert_eq!(missing_tags.state, Some(TaskState::Retry), "missing generation evidence must not silently drop base rows");
     assert_eq!(db.journal().tasks().find(|task| task.key == key).unwrap().state, TaskState::Pending, "the refused input must trigger base rebuilding");
     assert!(db.journal().publish(&key, publication));
@@ -1154,11 +1154,11 @@ async fn rollup_routing_rejects_legacy_materialization_generations() -> Result<(
         .map(|task| task.key.clone())
         .collect();
     assert!(!narrower.is_empty(), "recovery must exercise the narrower repair queued from untagged output");
-    db.run_unit_once("otel_logs_and_spans", &project, day, Operation::BaseRollup, 24, 0).await?;
+    db.run_unit_once("otel_logs_and_spans", &project, day, Operation::BaseRollup, 24, 0, None).await?;
     for repair in &narrower {
         assert_eq!(db.journal().state(repair), Some(TaskState::Superseded), "the covering rebuild must retire the narrower repair without scanning it");
     }
-    let repaired = db.run_unit_once("otel_logs_and_spans", &project, day, Operation::DerivedRollup, 24, 0).await?;
+    let repaired = db.run_unit_once("otel_logs_and_spans", &project, day, Operation::DerivedRollup, 24, 0, None).await?;
     assert_eq!(repaired.state, Some(TaskState::Complete), "base rebuilding and metadata-only repair reconciliation must unblock the derived tier");
     let derived_table = schema.rollups.iter().find(|spec| spec.derive_from.is_some()).unwrap().table_name("otel_logs_and_spans");
     let batches = ctx.sql(&format!("SELECT SUM(request_count) FROM {derived_table} WHERE project_id='{project}'")).await?.collect().await?;
@@ -1219,7 +1219,7 @@ async fn one_rolled_up_day(db: &Database, prefix: &str) -> Result<(String, chron
     let project = format!("{prefix}_{}", uuid::Uuid::new_v4().simple());
     let day = (Utc::now() - chrono::Duration::days(3)).date_naive();
     insert_a_span(db, &project, "a", day.and_hms_opt(12, 0, 0).expect("noon").and_utc().timestamp_micros()).await?;
-    let report = db.run_unit_once("otel_logs_and_spans", &project, day, crate::maintenance_coordinator::Operation::BaseRollup, 24, 0).await?;
+    let report = db.run_unit_once("otel_logs_and_spans", &project, day, crate::maintenance_coordinator::Operation::BaseRollup, 24, 0, None).await?;
     assert_eq!(report.date, day);
     Ok((project, day))
 }
@@ -1451,7 +1451,7 @@ async fn a_date_that_cannot_prove_its_digest_falls_to_the_raw_fringe() -> Result
             });
             db.insert_records_batch(&project, "otel_logs_and_spans", vec![json_to_batch(vec![row])?], true, None).await?;
         }
-        db.run_unit_once("otel_logs_and_spans", &project, *day, Operation::BaseRollup, 24, 0).await?;
+        db.run_unit_once("otel_logs_and_spans", &project, *day, Operation::BaseRollup, 24, 0, None).await?;
     }
 
     // The build must record what it materialized, or stripping it below proves nothing.
@@ -1677,15 +1677,15 @@ async fn republishing_a_base_slice_reopens_the_derived_cell_from_the_publish_sit
     let derived_tier = rollup_tier(true);
 
     insert_hourly_spans(&db, &project, day_start, [20, 21]).await?;
-    db.run_unit_once("otel_logs_and_spans", &project, day, Operation::BaseRollup, 4, 20).await?;
-    let derived = db.run_unit_once("otel_logs_and_spans", &project, day, Operation::DerivedRollup, 4, 20).await?;
+    db.run_unit_once("otel_logs_and_spans", &project, day, Operation::BaseRollup, 4, 20, None).await?;
+    let derived = db.run_unit_once("otel_logs_and_spans", &project, day, Operation::DerivedRollup, 4, 20, None).await?;
     assert_eq!(derived.state, Some(TaskState::Complete), "the derived unit must publish first: {:?}", derived.retry_reason);
     let covered = || db.rollup_slice_coverage.iter().filter(|entry| entry.key().0 == project && entry.key().2 == derived_tier).count();
     assert!(covered() > 0, "the derived cell must hold coverage before the base is rebuilt");
 
     // The base republishes the SAME range: without the edge the derived unit stays
     // Complete and serves the old rows.
-    db.run_unit_once("otel_logs_and_spans", &project, day, Operation::BaseRollup, 4, 20).await?;
+    db.run_unit_once("otel_logs_and_spans", &project, day, Operation::BaseRollup, 4, 20, None).await?;
 
     let derived_state = db
         .journal()
@@ -1716,8 +1716,8 @@ async fn a_derived_unit_over_a_holey_base_tier_retries_instead_of_publishing_sho
     let scenario = |base_hours: i64, derived_from: i64, derived_hours: i64| async move {
         let project = format!("holey_{}", uuid::Uuid::new_v4().simple());
         insert_hourly_spans(db, &project, day_start, [20, 21, 22, 23]).await?;
-        db.run_unit_once("otel_logs_and_spans", &project, day, Operation::BaseRollup, base_hours, 20).await?;
-        let report = db.run_unit_once("otel_logs_and_spans", &project, day, Operation::DerivedRollup, derived_hours, derived_from).await?;
+        db.run_unit_once("otel_logs_and_spans", &project, day, Operation::BaseRollup, base_hours, 20, None).await?;
+        let report = db.run_unit_once("otel_logs_and_spans", &project, day, Operation::DerivedRollup, derived_hours, derived_from, None).await?;
         let claimed: Vec<(i64, i64)> = db
             .rollup_slice_coverage
             .iter()
@@ -1762,7 +1762,7 @@ async fn a_derived_cell_cannot_claim_a_measure_its_base_never_proved() -> Result
     let day_start = midnight_micros(day);
     let (base_tier, derived_tier) = (rollup_tier(false), rollup_tier(true));
     insert_hourly_spans(&db, &project, day_start, [20, 21, 22, 23]).await?;
-    db.run_unit_once("otel_logs_and_spans", &project, day, Operation::BaseRollup, 4, 20).await?;
+    db.run_unit_once("otel_logs_and_spans", &project, day, Operation::BaseRollup, 4, 20, None).await?;
 
     // The base cells lose their digest proof while the base tier's SCHEMA keeps it.
     assert!(
@@ -1770,7 +1770,7 @@ async fn a_derived_cell_cannot_claim_a_measure_its_base_never_proved() -> Result
         "fresh base proves the digest"
     );
     strip_rollup_measure(&db, &project, day, DIGEST, None).await?;
-    db.run_unit_once("otel_logs_and_spans", &project, day, Operation::DerivedRollup, 4, 20).await?;
+    db.run_unit_once("otel_logs_and_spans", &project, day, Operation::DerivedRollup, 4, 20, None).await?;
 
     let published = slice_measures(&db, &project, Some(derived_tier.as_str()));
     assert!(!published.is_empty(), "the derived unit must publish over a fully covered base");
@@ -1795,7 +1795,7 @@ async fn recovery_queues_an_interior_gap_between_live_tagged_slices() -> Result<
     let day_start = midnight_micros(day);
     // Rows at both ends of the day, so the untagged file's statistics span it.
     insert_hourly_spans(&db, &project, day_start, [1, 23]).await?;
-    db.run_unit_once("otel_logs_and_spans", &project, day, Operation::BaseRollup, 24, 0).await?;
+    db.run_unit_once("otel_logs_and_spans", &project, day, Operation::BaseRollup, 24, 0, None).await?;
 
     let tier = rollup_tier(false);
     let tier_ref = db.get_or_create_table(&project, &tier).await?;
@@ -1847,7 +1847,7 @@ async fn an_overlapping_chain_leaves_its_disjoint_slices_proven() -> Result<()> 
     insert_hourly_spans(&db, &project, day_start, 0..24).await?;
     // (10,13) overlaps (6,12) and (12,18) without containing either, so its publish retires neither.
     for (hours, offset) in [(6, 0), (6, 6), (6, 12), (6, 18), (3, 10)] {
-        db.run_unit_once("otel_logs_and_spans", &project, day, Operation::BaseRollup, hours, offset).await?;
+        db.run_unit_once("otel_logs_and_spans", &project, day, Operation::BaseRollup, hours, offset, None).await?;
     }
     let tier = rollup_tier(false);
     let proven = {
@@ -1879,7 +1879,7 @@ async fn an_overlapping_chain_leaves_its_disjoint_slices_proven() -> Result<()> 
         assert_eq!(render(&ctx.sql(&sql).await?.collect().await?)?, render(&db.query_delta_only(&sql).await?)?, "[{lo},{hi}) must answer exactly as raw");
     }
 
-    let rebuilt = async |offset| anyhow::Ok(db.run_unit_once("otel_logs_and_spans", &project, day, Operation::BaseRollup, 6, offset).await?.output_files);
+    let rebuilt = async |offset| anyhow::Ok(db.run_unit_once("otel_logs_and_spans", &project, day, Operation::BaseRollup, 6, offset, None).await?.output_files);
     assert_eq!(rebuilt(18).await?, 0, "an unchanged disjoint slice completes as a no-op");
     assert!(rebuilt(6).await? > 0, "a chain member cannot prove its output, so it rebuilds");
     Ok(())
@@ -1901,8 +1901,8 @@ async fn a_subgrain_sliced_tier_is_not_routed_over_its_partial_states() -> Resul
     for (i, offset) in [0, 25, 35, 55].into_iter().enumerate() {
         insert_a_span(&db, &project, &format!("s{i}"), noon + offset * 60_000_000).await?;
     }
-    db.run_unit_once("otel_logs_and_spans", &project, day, Operation::BaseRollup, 24, 0).await?;
-    db.run_unit_once("otel_logs_and_spans", &project, day, Operation::DerivedRollup, 24, 0).await?;
+    db.run_unit_once("otel_logs_and_spans", &project, day, Operation::BaseRollup, 24, 0, None).await?;
+    db.run_unit_once("otel_logs_and_spans", &project, day, Operation::DerivedRollup, 24, 0, None).await?;
     let sessions = get_schema("otel_logs_and_spans")
         .expect("schema")
         .rollups
@@ -2007,7 +2007,7 @@ async fn a_stale_base_file_the_current_generation_reproduces_does_not_wedge_the_
         insert_a_span(&db, &project, &format!("row-{hour}"), midnight_micros(day) + hour * 3_600_000_000).await?;
     }
     let base_tier = rollup_tier(false);
-    db.run_unit_once("otel_logs_and_spans", &project, day, Operation::BaseRollup, 24, 0).await?;
+    db.run_unit_once("otel_logs_and_spans", &project, day, Operation::BaseRollup, 24, 0, None).await?;
 
     // A second copy of every base file, same slice tags, GENERATION mangled — what a
     // spec change leaves behind. The originals stay live, so the current generation
@@ -2025,7 +2025,7 @@ async fn a_stale_base_file_the_current_generation_reproduces_does_not_wedge_the_
         .await?;
     }
 
-    let derived = db.run_unit_once("otel_logs_and_spans", &project, day, Operation::DerivedRollup, 24, 0).await?;
+    let derived = db.run_unit_once("otel_logs_and_spans", &project, day, Operation::DerivedRollup, 24, 0, None).await?;
     assert_eq!(
         derived.state,
         Some(TaskState::Complete),
@@ -2063,7 +2063,7 @@ async fn staged_but_uncommitted_rollup(label: &str) -> Result<KilledUnit> {
     let rows = ["keep", "victim"].into_iter().map(|id| test_span_ts(id, "op", &project, at)).collect();
     db.insert_records_batch(&project, "otel_logs_and_spans", vec![json_to_batch(rows)?], true, None).await?;
     let checkpoints = db.task_journal_group_commit.offered();
-    db.run_unit_once("otel_logs_and_spans", &project, day, crate::maintenance_coordinator::Operation::BaseRollup, 24, 0).await?;
+    db.run_unit_once("otel_logs_and_spans", &project, day, crate::maintenance_coordinator::Operation::BaseRollup, 24, 0, None).await?;
     assert_eq!(db.task_journal_group_commit.offered() - checkpoints, 1, "a fresh publication must join the shared checkpoint barrier");
     let tier = rollup_tier(false);
     let (key, publication) = db
@@ -2360,7 +2360,7 @@ async fn a_resumed_rollup_does_not_publish_over_an_external_target_commit(case: 
                     drop(guard);
                     Ok::<_, anyhow::Error>(())
                 },
-                db.run_unit_once(&key.source, &project, day, key.operation, 24, 0)
+                db.run_unit_once(&key.source, &project, day, key.operation, 24, 0, None)
             )
         })
         .await??;
@@ -2446,7 +2446,7 @@ impl KilledBin {
 }
 
 async fn run_consolidation(db: &Database, project: &str, day: chrono::NaiveDate) -> Result<UnitRunReport> {
-    db.run_unit_once("otel_logs_and_spans", project, day, crate::maintenance_coordinator::Operation::SealedConsolidation, 24, 0).await
+    db.run_unit_once("otel_logs_and_spans", project, day, crate::maintenance_coordinator::Operation::SealedConsolidation, 24, 0, None).await
 }
 
 /// One metadata-only Delta commit on a partitioned table; touches no object storage.
@@ -2595,7 +2595,15 @@ async fn the_tag_replay_records_what_it_reads_into_the_coverage_ledger(split: bo
     db.insert_records_batch(&project, "otel_logs_and_spans", vec![json_to_batch(rows.to_vec())?], true, None).await?;
     for offset in if split { vec![0, 12] } else { vec![0] } {
         let report = db
-            .run_unit_once("otel_logs_and_spans", &project, day, crate::maintenance_coordinator::Operation::BaseRollup, if split { 12 } else { 24 }, offset)
+            .run_unit_once(
+                "otel_logs_and_spans",
+                &project,
+                day,
+                crate::maintenance_coordinator::Operation::BaseRollup,
+                if split { 12 } else { 24 },
+                offset,
+                None,
+            )
             .await?;
         assert_eq!(report.state, Some(crate::maintenance_coordinator::TaskState::Complete), "each source interval must actually publish");
     }
@@ -2805,7 +2813,7 @@ async fn recovery_queues_a_rebuild_for_a_partition_holding_untagged_tier_files()
     assert!(before > 0, "the stripped copies must be live for this to prove anything");
     let counter = || crate::observability::maintenance_stats().rollup_tier_untagged_retired.load(std::sync::atomic::Ordering::Relaxed);
     let counted_before = counter();
-    db.run_unit_once("otel_logs_and_spans", &project, day, Operation::BaseRollup, 24, 0).await?;
+    db.run_unit_once("otel_logs_and_spans", &project, day, Operation::BaseRollup, 24, 0, None).await?;
     assert_eq!(
         u64::try_from(before - live_tier_files(&db, &project, &tier).await?.1).unwrap_or_default(),
         counter() - counted_before,
@@ -3041,7 +3049,7 @@ async fn the_census_repairs_missing_output_despite_unchanged_source_evidence(dam
             commit_actions(&source, old_source.iter().map(|add| deltalake::kernel::Action::Remove(remove_for_add(add, true))).collect()).await?;
             db.apply_rollup_hours(&project, "otel_logs_and_spans", &day.to_string(), 1 << 12)?;
             insert_a_span(&db, &project, "later", day.and_hms_opt(18, 0, 0).unwrap().and_utc().timestamp_micros()).await?;
-            let later = db.run_unit_once("otel_logs_and_spans", &project, day, crate::maintenance_coordinator::Operation::BaseRollup, 6, 18).await?;
+            let later = db.run_unit_once("otel_logs_and_spans", &project, day, crate::maintenance_coordinator::Operation::BaseRollup, 6, 18, None).await?;
             assert_eq!(later.state, Some(crate::maintenance_coordinator::TaskState::Complete));
             assert_eq!(live_tier_files(&db, &project, &tier).await?, (2, 1), "the old noon output must remain beside the valid evening slice");
             retire_all_tasks(&db);
@@ -3049,7 +3057,7 @@ async fn the_census_repairs_missing_output_despite_unchanged_source_evidence(dam
         RollupOutputDamage::PartialOutput | RollupOutputDamage::PartialOutputAfterNoop => {
             use deltalake::writer::DeltaWriter as _;
             insert_a_span(&db, &project, "second", day.and_hms_opt(13, 0, 0).unwrap().and_utc().timestamp_micros()).await?;
-            db.run_unit_once("otel_logs_and_spans", &project, day, crate::maintenance_coordinator::Operation::BaseRollup, 24, 0).await?;
+            db.run_unit_once("otel_logs_and_spans", &project, day, crate::maintenance_coordinator::Operation::BaseRollup, 24, 0, None).await?;
             let original = live_adds(&table).await;
             let batches = ctx.sql(&format!("SELECT * FROM {tier} WHERE project_id='{project}'")).await?.collect().await?;
             assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 2, "the publication must have two distinct aggregate rows");
@@ -3091,7 +3099,7 @@ async fn the_census_repairs_missing_output_despite_unchanged_source_evidence(dam
             assert_eq!(first_i64(rows[0].column(0)), Some(2), "recovery must accept the complete physical rewrite");
             if matches!(damage, RollupOutputDamage::PartialOutputAfterNoop) {
                 let scans = crate::observability::maintenance_stats().rollup_scan_cohorts.load(std::sync::atomic::Ordering::Relaxed);
-                let noop = db.run_unit_once("otel_logs_and_spans", &project, day, crate::maintenance_coordinator::Operation::BaseRollup, 24, 0).await?;
+                let noop = db.run_unit_once("otel_logs_and_spans", &project, day, crate::maintenance_coordinator::Operation::BaseRollup, 24, 0, None).await?;
                 assert_eq!(noop.state, Some(crate::maintenance_coordinator::TaskState::Complete));
                 assert_eq!(
                     crate::observability::maintenance_stats().rollup_scan_cohorts.load(std::sync::atomic::Ordering::Relaxed),
@@ -3128,7 +3136,7 @@ async fn the_census_repairs_missing_output_despite_unchanged_source_evidence(dam
     } else {
         assert!(db.rollup_sql(&plan, &state).await.is_err(), "routing must not serve output that the census knows needs repair");
     }
-    let repaired = db.run_unit_once("otel_logs_and_spans", &project, day, crate::maintenance_coordinator::Operation::BaseRollup, 24, 0).await?;
+    let repaired = db.run_unit_once("otel_logs_and_spans", &project, day, crate::maintenance_coordinator::Operation::BaseRollup, 24, 0, None).await?;
     assert_eq!(repaired.state, Some(crate::maintenance_coordinator::TaskState::Complete));
     let rewrite = db.rollup_sql(&plan, &state).await.map_err(|reason| anyhow::anyhow!("{}", reason.label()))?.expect("repaired output must route");
     assert!(db.rollup_ticket_current(&rewrite.ticket).await, "repair must restore an executable ticket");
@@ -9612,7 +9620,7 @@ async fn a_late_file_outside_a_slice_leaves_it_readable(late_hour: u32, routes: 
         insert(hour, 0).await?;
     }
     for offset in [0, 12] {
-        db.run_unit_once("otel_logs_and_spans", &project, day, Operation::BaseRollup, 12, offset).await?;
+        db.run_unit_once("otel_logs_and_spans", &project, day, Operation::BaseRollup, 12, offset, None).await?;
     }
     let sql = format!(
         "SELECT time_bucket('1 hours', timestamp) AS tb, COUNT(*) AS c FROM otel_logs_and_spans WHERE project_id = '{project}' \

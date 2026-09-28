@@ -1314,7 +1314,7 @@ mod rollup_window_memory_tests {
             "the winner sort must not buffer a dictionary column: {sorted:?}"
         );
 
-        let report = db.run_unit_once(SOURCE, &project, day, crate::maintenance_coordinator::Operation::BaseRollup, 1, 12).await?;
+        let report = db.run_unit_once(SOURCE, &project, day, crate::maintenance_coordinator::Operation::BaseRollup, 1, 12, None).await?;
         assert_eq!(report.state, Some(crate::maintenance_coordinator::TaskState::Complete));
         let totals = db
             .query_delta_only(&format!(

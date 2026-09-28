@@ -1120,7 +1120,18 @@ pub struct SynthQueue {
 ///
 /// Not usable for bin-width questions: widening a bin pays off in READ BYTES,
 /// and this IO-free model cannot see bytes.
-pub fn synthetic_whale_queue(start_micros: i64, floored: bool, whale_x_max: u64, debris_slice_minutes: i64) -> SynthQueue {
+///
+/// `tier` names the base rollup tier the units build; `None` is the first declared.
+pub fn synthetic_whale_queue(start_micros: i64, floored: bool, whale_x_max: u64, debris_slice_minutes: i64, tier: Option<&str>) -> anyhow::Result<SynthQueue> {
+    const SOURCE: &str = "otel_logs_and_spans";
+    let table = crate::schema::get_schema(SOURCE).context("source schema")?.rollup_tier(tier, false)?.table_name(SOURCE);
+    let rollup_key = |project_id: &str, start_micros: i64, width_micros: i64| TaskKey {
+        physical_table: table.clone(),
+        source: SOURCE.to_owned(),
+        project_id: project_id.to_owned(),
+        slice: TimeSlice::new(start_micros, start_micros + width_micros).expect("fixture slice"),
+        operation: Operation::BaseRollup,
+    };
     let dir = tempfile::tempdir().expect("sim fixture tempdir");
     let mut journal = TaskJournal::load(dir.path()).expect("sim fixture journal");
     let mut model = ByteModel { floored, ..Default::default() };
@@ -1166,17 +1177,7 @@ pub fn synthetic_whale_queue(start_micros: i64, floored: bool, whale_x_max: u64,
             0,
         );
     }
-    SynthQueue { journal, model, whale_cell, stamped_cell, dir }
-}
-
-fn rollup_key(project_id: &str, start_micros: i64, width_micros: i64) -> TaskKey {
-    TaskKey {
-        physical_table: "otel_logs_and_spans_rollup_dashboard_1m_v3".to_owned(),
-        source: "otel_logs_and_spans".to_owned(),
-        project_id: project_id.to_owned(),
-        slice: TimeSlice::new(start_micros, start_micros + width_micros).expect("fixture slice"),
-        operation: Operation::BaseRollup,
-    }
+    Ok(SynthQueue { journal, model, whale_cell, stamped_cell, dir })
 }
 
 /// Load a journal from a copied-out prod file or data dir WITHOUT ever being
@@ -1409,7 +1410,7 @@ mod tests {
     }
 
     fn synth_run_at(floored: bool, guard: SplitGuard, whale_x_max: u64, duration_scale: f64) -> (SimReport, String, String) {
-        let queue = synthetic_whale_queue(START, floored, whale_x_max, 1);
+        let queue = synthetic_whale_queue(START, floored, whale_x_max, 1, None).unwrap();
         let cfg = SimConfig {
             mint_frontier: false,
             workers: 16,
@@ -1453,7 +1454,7 @@ mod tests {
     /// measured against what its parent measured.
     #[test]
     fn whale_lineage_trace() {
-        let queue = synthetic_whale_queue(START, true, 100, 1);
+        let queue = synthetic_whale_queue(START, true, 100, 1, None).unwrap();
         let (mut journal, model) = (queue.journal, queue.model);
         let mut report = SimReport::default();
         // Deep enough to reach the DECLINE, not just the splits above it.

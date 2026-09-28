@@ -2688,20 +2688,24 @@ impl Database {
 
     /// Execute ONE maintenance unit end-to-end and report where its time went
     /// (backs the `run-unit` CLI). Claims only the requested key; dependency
-    /// coverage and admission limits still apply.
+    /// coverage and admission limits still apply. `tier` names the rollup tier
+    /// (`TableSchema::rollup_tier`); `None` is the first declared.
+    #[allow(clippy::too_many_arguments)]
     pub async fn run_unit_once(
         &self, source: &str, project_id: &str, date: chrono::NaiveDate, operation: crate::maintenance_coordinator::Operation, slice_hours: i64,
-        offset_hours: i64,
+        offset_hours: i64, tier: Option<&str>,
     ) -> Result<UnitRunReport> {
         use crate::maintenance_coordinator::{MAX_DECODED_BYTES, Operation, TaskKey, TimeSlice};
         use std::sync::atomic::Ordering::Relaxed;
         let schema = get_schema(source).ok_or_else(|| anyhow::anyhow!("unknown source table {source}"))?;
-        let tier = |want_derived| schema.rollups.iter().find(|spec| spec.derive_from.is_some() == want_derived).map(|spec| spec.table_name(source));
-        let physical_table = match operation {
-            Operation::BaseRollup => tier(false).ok_or_else(|| anyhow::anyhow!("{source} declares no base rollup"))?,
-            Operation::DerivedRollup => tier(true).ok_or_else(|| anyhow::anyhow!("{source} declares no derived rollup"))?,
-            _ => source.to_owned(),
+        let spec = match operation {
+            Operation::BaseRollup | Operation::DerivedRollup => Some(schema.rollup_tier(tier, operation == Operation::DerivedRollup)?),
+            _ => {
+                anyhow::ensure!(tier.is_none(), "a rollup tier applies only to base/derived units");
+                None
+            }
         };
+        let physical_table = spec.map_or_else(|| source.to_owned(), |spec| spec.table_name(source));
         let day_start = date.and_hms_opt(0, 0, 0).ok_or_else(|| anyhow::anyhow!("invalid date {date}"))?.and_utc().timestamp_micros();
         // Offset from midnight so a day can be TILED; without it the late hours of
         // an oversized day are unreachable.
@@ -2711,7 +2715,7 @@ impl Database {
         // Presence permits inspection; the worker still validates generation and
         // coverage. Today's base tier can still grow, so it needs journal proof.
         let base_tier_present = if operation == Operation::DerivedRollup && date < Utc::now().date_naive() {
-            let base = tier(false).ok_or_else(|| anyhow::anyhow!("{source} declares no base rollup"))?;
+            let base = schema.rollup_tier(spec.and_then(|spec| spec.derive_from.as_deref()), false)?.table_name(source);
             let table = self.resolve_table(project_id, &base).await?;
             let table = table.read().await;
             Self::maintenance_table_partitions(&table, project_id)?.contains(&(project_id.to_owned(), date))
@@ -10421,7 +10425,7 @@ mod certify_on_completion_tests {
             AfterCert::StaleSlice => db.dedup_clean_fp.alter(&key, |_, cert| Certification { fp: 0, stale: true, ..cert }),
             AfterCert::StaleFlag => db.dedup_clean_fp.alter(&key, |_, cert| Certification { stale: true, ..cert }),
         }
-        let report = db.run_unit_once(TABLE, &project_id, date, Operation::Dedup, 24, 0).await?;
+        let report = db.run_unit_once(TABLE, &project_id, date, Operation::Dedup, 24, 0, None).await?;
         assert_eq!(report.state, Some(TaskState::Complete), "retry: {:?}", report.retry_reason);
         Ok((!report.passes.is_empty(), delta_physical_row_count(&table_ref).await?))
     }
@@ -11034,7 +11038,7 @@ mod rollup_noop_skip_tests {
         insert_span(&db, &project, date, 3, "early", "op").await?;
         insert_span(&db, &project, date, 20, "late", "op").await?;
         assert!(build_day(&db, &project, date, "seed").await? > 0);
-        let run = |hours, offset| db.run_unit_once("otel_logs_and_spans", &project, date, Operation::BaseRollup, hours, offset);
+        let run = |hours, offset| db.run_unit_once("otel_logs_and_spans", &project, date, Operation::BaseRollup, hours, offset, None);
         for (hours, offset) in [(12, 0), (12, 12), (9, 9)] {
             assert_eq!(run(hours, offset).await?.state, Some(TaskState::Complete), "{hours}h at {offset}");
         }
@@ -11119,7 +11123,7 @@ mod rollup_noop_skip_tests {
             insert_span(&db, &project, date, 20, "late", "op").await?;
             finish_active(&db, &project);
             for offset in [0, 12] {
-                let report = db.run_unit_once("otel_logs_and_spans", &project, date, Operation::BaseRollup, 12, offset).await?;
+                let report = db.run_unit_once("otel_logs_and_spans", &project, date, Operation::BaseRollup, 12, offset, None).await?;
                 assert_eq!(report.state, Some(TaskState::Complete), "the {offset}h half publishes");
             }
             let mut journal = db.journal();
@@ -11136,6 +11140,23 @@ mod rollup_noop_skip_tests {
         assert!(reminted.is_empty(), "the edge day is still proven, so nothing is re-minted: {reminted:?}");
         advance_and_drain(&db).await?;
         assert_eq!(tier_version(&db).await, published, "and the tier is not rewritten");
+        Ok(())
+    }
+
+    #[serial]
+    #[tokio::test]
+    async fn run_unit_once_builds_the_requested_tier() -> Result<()> {
+        let (db, project, date) = rollup_db("run_unit_tier").await?;
+        insert_span(&db, &project, date, 12, "a", "op").await?;
+        let report = db.run_unit_once("otel_logs_and_spans", &project, date, Operation::BaseRollup, 24, 0, Some("dashboard_1m_v4")).await?;
+        assert_eq!(report.state, Some(TaskState::Complete));
+        let requests = async |tier: &str| -> Result<Option<i64>> {
+            let batches = db.query_delta_only(&format!("SELECT CAST(SUM(request_count) AS BIGINT) FROM {tier} WHERE project_id = '{project}'")).await?;
+            use datafusion::arrow::array::AsArray;
+            Ok(batches[0].column(0).as_primitive::<datafusion::arrow::datatypes::Int64Type>().iter().next().flatten())
+        };
+        assert_eq!(requests("otel_logs_and_spans_rollup_dashboard_1m_v4").await?, Some(1), "the named tier is built");
+        assert_eq!(requests(TIER).await?, None, "the first-declared tier is not");
         Ok(())
     }
 
@@ -11794,7 +11815,7 @@ mod rollup_noop_skip_tests {
             })
             .collect();
         db.insert_records_batch(&project, "otel_logs_and_spans", vec![json_to_batch(rows)?], true, None).await?;
-        let built = db.run_unit_once("otel_logs_and_spans", &project, date, Operation::BaseRollup, 3, 11).await?;
+        let built = db.run_unit_once("otel_logs_and_spans", &project, date, Operation::BaseRollup, 3, 11, None).await?;
         assert_eq!(built.state, Some(TaskState::Complete), "fixture must build real aggregate states: {built}");
         let target = db.resolve_table(&project, TIER).await?.read().await.clone();
         let live: Vec<_> = target.snapshot()?.log_data().iter().map(|file| add_action(&file)).collect();
@@ -11839,7 +11860,7 @@ mod rollup_noop_skip_tests {
         }
         dedup_unified(&db).await?;
         advance_and_drain(&db).await?;
-        let sibling = db.run_unit_once("otel_logs_and_spans", &project, date, Operation::BaseRollup, 1, 15).await?;
+        let sibling = db.run_unit_once("otel_logs_and_spans", &project, date, Operation::BaseRollup, 1, 15, None).await?;
         assert_eq!(sibling.state, Some(TaskState::Complete), "the fixture needs a published sibling slice");
         assert!(sibling.cpu_ms > 0 && sibling.output_files > 0, "run-unit reports the unit's CPU and output: {sibling}");
         assert!(
@@ -11852,7 +11873,7 @@ mod rollup_noop_skip_tests {
         let target = db.resolve_table(&project, TIER).await?;
         let lock = db.commit_lock(&project, TIER).await;
         let held = lock.lock().await;
-        let build = db.run_unit_once("otel_logs_and_spans", &project, date, Operation::BaseRollup, 1, 11);
+        let build = db.run_unit_once("otel_logs_and_spans", &project, date, Operation::BaseRollup, 1, 11, None);
         tokio::pin!(build);
         tokio::time::timeout(std::time::Duration::from_secs(60), async {
             let mut poll = tokio::time::interval(std::time::Duration::from_millis(10));
@@ -11911,7 +11932,7 @@ mod rollup_noop_skip_tests {
         }
         dedup_unified(&db).await?;
         advance_and_drain(&db).await?;
-        let packed = db.run_unit_once("otel_logs_and_spans", &project, date, Operation::BaseRollup, 3, 11).await?;
+        let packed = db.run_unit_once("otel_logs_and_spans", &project, date, Operation::BaseRollup, 3, 11, None).await?;
         assert_eq!(packed.state, Some(TaskState::Complete), "the fixture requires a real three-hour publication");
         let start = date.and_hms_opt(11, 0, 0).expect("valid hour").and_utc().timestamp_micros();
         let hour = 3_600_000_000;
@@ -11929,7 +11950,7 @@ mod rollup_noop_skip_tests {
             let lock = db.commit_lock(&project, TIER).await;
             let held = lock.lock().await;
             let mut intent = {
-                let build = db.run_unit_once("otel_logs_and_spans", &project, date, Operation::BaseRollup, 1, 12);
+                let build = db.run_unit_once("otel_logs_and_spans", &project, date, Operation::BaseRollup, 1, 12, None);
                 tokio::pin!(build);
                 tokio::time::timeout(std::time::Duration::from_secs(60), async {
                     let mut poll = tokio::time::interval(std::time::Duration::from_millis(10));
@@ -11975,7 +11996,7 @@ mod rollup_noop_skip_tests {
             };
             // Dropping the future runs lease cleanup; respect its persisted backoff.
             crate::support::advance_micros(deadline.saturating_sub(crate::support::now_micros()).max(0));
-            let resumed = db.run_unit_once("otel_logs_and_spans", &project, date, Operation::BaseRollup, 1, 12).await?;
+            let resumed = db.run_unit_once("otel_logs_and_spans", &project, date, Operation::BaseRollup, 1, 12, None).await?;
             assert_eq!(resumed.state, Some(TaskState::Complete), "the worker must resume the staged packed replacement: {resumed}");
             assert_eq!(resumed.cohorts, 0, "recovery must not repeat raw aggregation");
             assert_eq!(target.read().await.version(), version.map(|version| version + 1), "resume needs exactly one atomic publication");
@@ -11987,7 +12008,7 @@ mod rollup_noop_skip_tests {
             );
             db.recover_rollup_coverage("otel_logs_and_spans").await?;
         } else {
-            let repair = db.run_unit_once("otel_logs_and_spans", &project, date, Operation::BaseRollup, 1, 12).await?;
+            let repair = db.run_unit_once("otel_logs_and_spans", &project, date, Operation::BaseRollup, 1, 12, None).await?;
             assert_eq!(repair.state, Some(TaskState::Complete));
             assert!(repair.cohorts > 0, "the dirty hour must actually rebuild, not complete by queuing the packed interval");
         }
@@ -12045,7 +12066,7 @@ mod rollup_noop_skip_tests {
     async fn a_covering_proof_cannot_complete_after_source_invalidation(requeued: bool) -> Result<()> {
         let (db, project, date) = rollup_db("covering_proof_race").await?;
         assert!(build_day(&db, &project, date, "seed").await? > 0);
-        let wider = db.run_unit_once("otel_logs_and_spans", &project, date, Operation::BaseRollup, 1, 12).await?;
+        let wider = db.run_unit_once("otel_logs_and_spans", &project, date, Operation::BaseRollup, 1, 12, None).await?;
         assert_eq!(wider.state, Some(TaskState::Complete), "the fixture needs a real publication wider than a normal invalidation unit");
         let start = date.and_hms_opt(12, 0, 0).unwrap().and_utc().timestamp_micros();
         let (covering, proof) = db

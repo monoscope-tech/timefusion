@@ -216,7 +216,7 @@ fn init_cli_tracing() {
 
 /// `timefusion sim <journal.json | data-dir | synth:whale> [--hours N]
 /// [--workers N] [--streams N] [--scale F] [--seed N] [--no-mint]
-/// [--floorless] [--guard-off] [--rows K] [--projects K] [--now UNIX_SECS] [--json]`
+/// [--floorless] [--guard-off] [--tier NAME] [--rows K] [--projects K] [--now UNIX_SECS] [--json]`
 ///
 /// Replay a maintenance journal through the real scheduler on virtual time
 /// (`timefusion::maintenance_sim`), to answer "does this policy keep up"
@@ -229,13 +229,14 @@ fn run_sim_cli() -> anyhow::Result<()> {
         timefusion::config::init_config().map_err(|e| anyhow::anyhow!("kill-switch env set but config failed to load: {e}"))?;
     }
     let mut it = Args::new();
-    let usage = "usage: timefusion sim <journal.json|data-dir|synth:whale> [--hours N] [--workers N] [--streams N] [--scale F] [--seed N] [--no-mint] [--mint] [--debris-slice-minutes N] [--floorless] [--guard-off] [--rows K] [--projects K] [--calibrated] [--now UNIX_SECS] [--json]";
+    let usage = "usage: timefusion sim <journal.json|data-dir|synth:whale> [--hours N] [--workers N] [--streams N] [--scale F] [--seed N] [--no-mint] [--mint] [--debris-slice-minutes N] [--floorless] [--guard-off] [--tier NAME] [--rows K] [--projects K] [--calibrated] [--now UNIX_SECS] [--json]";
     let input = it.next().context(usage)?;
     let mut cfg = SimConfig::default();
     let mut json = false;
     let mut floorless = false;
     let mut mint = false;
     let mut debris_slice = 1i64;
+    let mut tier: Option<String> = None;
     let mut now = support::now_micros();
     cli_args!(it, usage, {
         "--hours" => cfg.horizon_micros = it.hours_micros("--hours")?,
@@ -252,6 +253,7 @@ fn run_sim_cli() -> anyhow::Result<()> {
         // Bin-width axis: same total debris work as `600 / n` units of `n` minutes.
         "--debris-slice-minutes" => debris_slice = it.parse("--debris-slice-minutes", "an integer")?,
         "--floorless" => floorless = true,
+        "--tier" => tier = Some(it.value("--tier")?),
         "--guard-off" => cfg.split_guard = timefusion::maintenance_sim::SplitGuard::Off,
         "--rows" => cfg.rows = it.parse("--rows", "a number")?,
         "--projects" => cfg.projects = it.parse("--projects", "an integer")?,
@@ -271,10 +273,11 @@ fn run_sim_cli() -> anyhow::Result<()> {
             "--streams needs arrivals to scale: pass --mint (a synthetic queue disables minting by default), or use a real journal."
         );
         cfg.mint_frontier = mint;
-        let queue = timefusion::maintenance_sim::synthetic_whale_queue(now, !floorless, 100, debris_slice);
+        let queue = timefusion::maintenance_sim::synthetic_whale_queue(now, !floorless, 100, debris_slice, tier.as_deref())?;
         cfg.byte_model = Some(queue.model);
         run(queue.journal, &cfg, now)?
     } else {
+        anyhow::ensure!(tier.is_none(), "--tier applies to `synth:whale`; a real journal names its own tiers.");
         let (journal, _sandbox) = load_sandboxed(std::path::Path::new(&input))?;
         cfg.byte_model = Some(ByteModel::from_journal(&journal));
         run(journal, &cfg, now)?
@@ -338,7 +341,7 @@ fn run_sim_cli() -> anyhow::Result<()> {
 }
 
 /// `timefusion run-unit --project ID [--source TABLE] [--date YYYY-MM-DD]
-/// [--op base|derived|dedup|hot|sealed|repair] [--slice-hours N] [--offset-hours N] [--explain]`
+/// [--op base|derived|dedup|hot|sealed|repair] [--tier NAME] [--slice-hours N] [--offset-hours N] [--explain]`
 ///
 /// Execute ONE maintenance unit against the configured storage and print where
 /// its time went (scan/stage/commit deltas + wall). Claims only the requested
@@ -353,12 +356,14 @@ async fn run_unit_cli(cfg: &'static AppConfig) -> anyhow::Result<()> {
     let mut operation = timefusion::maintenance_coordinator::Operation::BaseRollup;
     let mut slice_hours: i64 = 24;
     let mut offset_hours: i64 = 0;
+    let mut tier: Option<String> = None;
     let mut explain = false;
     let mut it = Args::new();
-    cli_args!(it, "usage: timefusion run-unit --project ID [--source T] [--date D] [--op OP] [--slice-hours N] [--offset-hours N] [--explain]", {
+    cli_args!(it, "usage: timefusion run-unit --project ID [--source T] [--date D] [--op OP] [--tier NAME] [--slice-hours N] [--offset-hours N] [--explain]", {
         "--explain" => explain = true,
         "--source" => source = it.value("--source")?,
         "--project" => project = Some(it.value("--project")?),
+        "--tier" => tier = Some(it.value("--tier")?),
         "--date" => date = Some(it.parse("--date", "YYYY-MM-DD")?),
         "--slice-hours" => slice_hours = it.parse("--slice-hours", "an integer")?,
         "--offset-hours" => offset_hours = it.parse("--offset-hours", "an integer")?,
@@ -381,7 +386,7 @@ async fn run_unit_cli(cfg: &'static AppConfig) -> anyhow::Result<()> {
     // run-unit skips `start_maintenance_schedulers`, so load this explicitly or
     // every invocation re-selects the same already-probed file and never advances.
     db.load_verified_sorted();
-    let report = db.run_unit_once(&source, &project, date, operation, slice_hours, offset_hours).await?;
+    let report = db.run_unit_once(&source, &project, date, operation, slice_hours, offset_hours, tier.as_deref()).await?;
     println!("{report}");
     for (n, pass) in report.passes.iter().enumerate() {
         println!("pass {n}: {pass}");
