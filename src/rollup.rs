@@ -3649,6 +3649,37 @@ mod tests {
         assert_substitutes(&state, &sql, Some(WIDE_HORIZON)).await;
     }
 
+    /// `::float` is Float32 in DataFusion while `value_max` is stored Float64, so
+    /// the rewrite must be cast back to the query's own output type or the schema
+    /// gate discards it (`rewrite_schema_mismatch`, the TF self-metrics dashboard).
+    #[test_case::test_case("(value)::float", DataType::Float32; "float is float32")]
+    #[test_case::test_case("value::real", DataType::Float32; "real")]
+    #[test_case::test_case("value::float8", DataType::Float64; "float8")]
+    #[test_case::test_case("value::double precision", DataType::Float64; "double precision")]
+    #[test_case::test_case("value", DataType::Float64; "no cast")]
+    #[tokio::test]
+    async fn a_float_cast_measure_substitutes_with_the_querys_type(measure: &str, want: DataType) {
+        let state = session_over(["otel_metrics", "otel_metrics_rollup_metrics_1m_v2"].map(str::to_owned));
+        let sql =
+            format!("SELECT time_bucket('1 minute', timestamp) AS b, max({measure}) FROM otel_metrics WHERE project_id = 'project' AND {WINDOW} GROUP BY 1");
+        assert_eq!(optimized(&state, &sql).await.schema().field(1).data_type(), &want, "precondition: the query's own output type");
+        assert_substitutes(&state, &sql, Some(WIDE_HORIZON)).await;
+    }
+
+    /// Only a cast to float commutes with every merge; `max(CAST(value AS VARCHAR))`
+    /// is a lexicographic max, so it must keep failing the schema gate.
+    #[tokio::test]
+    async fn a_non_float_cast_measure_still_fails_the_schema_gate() {
+        let state = session_over(["otel_metrics", "otel_metrics_rollup_metrics_1m_v2"].map(str::to_owned));
+        let sql = format!("SELECT max(value::varchar) FROM otel_metrics WHERE project_id = 'project' AND {WINDOW}");
+        let original = optimized(&state, &sql).await;
+        let route = match_aggregates(&original, &state).await.expect("match").into_iter().next().expect("route");
+        let rewrite = state.create_logical_plan(&hybrid_sql(&route, WIDE_HORIZON)).await.expect("parse rewrite");
+        let rewrite = crate::dml::requalified(rewrite, route.matched.schema()).expect("requalify");
+        let rebuilt = crate::dml::substitute(&original, &route.matched, rewrite).expect("substitute");
+        assert!(rebuilt.schema().has_equivalent_names_and_types(original.schema()).is_err(), "a string max must not be served from a numeric max");
+    }
+
     /// `now()` folds to a NANOSECOND literal, so a microsecond-only matcher would
     /// refuse every `timestamp < now()` window.
     #[test]

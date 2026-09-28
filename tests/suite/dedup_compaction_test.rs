@@ -6,7 +6,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use datafusion::arrow::{
     array::{Array, AsArray, RecordBatch},
-    datatypes::{Float64Type, Int64Type, TimestampMicrosecondType},
+    datatypes::{DataType, Float64Type, Int64Type, TimestampMicrosecondType},
 };
 use serial_test::serial;
 use test_case::test_case;
@@ -2036,6 +2036,43 @@ async fn a_count_star_under_a_null_guard_routes_via_duration_count() -> Result<(
         total(&db.query_delta_only(&query).await?),
         "the ROUTED answer must equal raw — this is what proves duration_count is the right measure"
     );
+    Ok(())
+}
+
+/// `max(x::float)` casts to Float32 while the stored max is not, so the rewrite
+/// failed the schema gate (`rewrite_schema_mismatch`) and fell back to raw. It
+/// must route, and answer with the raw plan's rows AND column type.
+#[serial]
+#[tokio::test]
+async fn a_float_cast_max_routes_with_the_raw_column_type() -> Result<()> {
+    let env = rollup_env("rollup_float_cast_max").await?;
+    let (db, project_id) = (Arc::clone(&env.db), env.project_id.clone());
+    db.cancel_maintenance();
+    for (i, (duration, offset)) in [(100i64, 17i64), (300, 3_661_000_000), (400, 7_261_000_000), (16_777_217, 14_461_000_000)].iter().enumerate() {
+        env.insert(&format!("y{i}"), env.yesterday_noon + offset, Some("cart"), Some(*duration), "float cast fixture").await?;
+    }
+    env.certify_and_drain().await?;
+    let (lo, hi) = (env.yesterday_noon + 17, env.midnight);
+    let ctx = ctx_for(&db)?;
+    for (cast, want) in [("::float", DataType::Float32), ("::float8", DataType::Float64), ("::double precision", DataType::Float64), ("", DataType::Int64)] {
+        let query = format!(
+            "SELECT time_bucket('1 hours', timestamp) AS tb, max((duration){cast}) AS hi \
+             FROM otel_logs_and_spans WHERE project_id = '{project_id}' \
+               AND timestamp >= to_timestamp_micros({lo}) AND timestamp < to_timestamp_micros({hi}) GROUP BY 1 ORDER BY 1"
+        );
+        let routed = routed_any(&ctx, &query, &format!("max(duration{cast}) must route")).await?;
+        let raw = db.query_delta_only(&query).await?;
+        let rendered = |batches: &[RecordBatch]| {
+            let as_f64 = |b: &RecordBatch, r: usize| {
+                datafusion::arrow::compute::cast(b.column(1), &DataType::Float64).expect("numeric").as_primitive::<Float64Type>().value(r)
+            };
+            (batches.iter().find(|b| b.num_rows() > 0).map(|b| b.column(1).data_type().clone()), rows_of(batches, |b, r| (ts_at(b, 0, r), as_f64(b, r))))
+        };
+        let (routed, raw) = (rendered(&routed), rendered(&raw));
+        assert_eq!(routed.0, Some(want), "max(duration{cast}) must keep the query's own column type");
+        assert_eq!(routed, raw, "max(duration{cast}): routed must equal raw row for row");
+        assert_eq!(raw.1.len(), 4, "the fixture must produce buckets, or equality is vacuous");
+    }
     Ok(())
 }
 

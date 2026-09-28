@@ -123,14 +123,24 @@ impl DmlQueryPlanner {
 /// Give `plan`'s columns the qualifiers `target` carries, field for field.
 /// Column references resolve on `(qualifier, name)`, so a substituted subplan
 /// whose aliases are unqualified would not resolve in the nodes above it.
+///
+/// A numeric column is also cast to the float type `target` asks for: the
+/// matcher peels an aggregate argument's cast, so `max(value::float)` (Float32)
+/// is served by a Float64 measure. A cast to float commutes with every merge —
+/// monotone for min/max/first, additive up to rounding for sum — so this is the
+/// raw answer. Any other type mismatch is left for the schema gate to refuse.
 pub(crate) fn requalified(plan: LogicalPlan, target: &datafusion::common::DFSchemaRef) -> Result<LogicalPlan> {
     let expr = target
         .iter()
         .map(|(qualifier, field)| {
+            let want = field.data_type();
+            let cast = matches!(plan.schema().field_with_unqualified_name(field.name()).map(|have| have.data_type()),
+                Ok(have) if have != want && have.is_numeric() && want.is_floating());
             let column = Expr::Column(Column::new_unqualified(field.name()));
-            match qualifier {
-                Some(qualifier) => column.alias_qualified(Some(qualifier.clone()), field.name()),
-                None => column,
+            let column = if cast { Expr::Cast(datafusion::logical_expr::Cast::new(Box::new(column), want.clone())) } else { column };
+            match (qualifier, cast) {
+                (None, false) => column,
+                _ => column.alias_qualified(qualifier.cloned(), field.name()),
             }
         })
         .collect();
