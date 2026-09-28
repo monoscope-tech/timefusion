@@ -2128,8 +2128,9 @@ async fn an_expression_group_over_dimensions_matches_raw_for_every_measure_kind(
         ("client", Some("OK"), Some("info"), Some("checkout")),
     ];
     let row = |(kind, status, level, service): (&str, Option<&str>, Option<&str>, Option<&str>), duration: i64| serde_json::json!({ "kind": kind, "status_code": status, "level": level, "resource___service___name": service, "duration": duration });
+    // Spread over five hours: a tier interior under a fifth of the 14h window declines as tiny.
     for (i, fields) in fixture.iter().enumerate() {
-        env.insert_fields(&format!("y{i}"), env.yesterday_noon + 17 + i as i64 * 1_000_000_000, row(*fields, 100 * (i as i64 + 1))).await?;
+        env.insert_fields(&format!("y{i}"), env.yesterday_noon + 17 + i as i64 * 2_500_000_000, row(*fields, 100 * (i as i64 + 1))).await?;
     }
     assert!(env.certify_and_drain().await? > 0, "eligible yesterday slices must be drained");
     // After certification, so these reach the query only through the raw leg.
