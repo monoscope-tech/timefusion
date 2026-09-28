@@ -585,6 +585,10 @@ pub(super) fn digest_of(value: impl std::hash::Hash) -> u64 {
     hasher.finish()
 }
 
+fn is_rollup_tier(table_name: &str) -> bool {
+    get_schema(table_name).is_some_and(|schema| schema.fields.iter().any(|field| field.name == "rollup_generation"))
+}
+
 /// `micros` truncated to unix milliseconds, as the u64 the journal stores.
 fn unix_ms(micros: i64) -> u64 {
     u64::try_from(micros.div_euclid(1_000)).unwrap_or_default()
@@ -7194,8 +7198,11 @@ impl Database {
     /// Separate from the drain because the drain's cron skips every rollup-declaring table.
     /// Certification is read-only and key-only, so it is safe for coordinator-owned tables
     /// even though their rewrites are not this cron's business.
+    ///
+    /// Rollup tiers are not probed: their duplicate keys are legitimate sub-grain partial
+    /// states the tier read collapses, and no consumer reads a tier's certification.
     pub(crate) async fn run_certification_pass(&self, table: &Arc<RwLock<DeltaTable>>, table_name: &str, deadline: std::time::Instant) {
-        if !schema_or_default(table_name).dedup_keys.iter().any(|key| key == "timestamp") {
+        if !schema_or_default(table_name).dedup_keys.iter().any(|key| key == "timestamp") || is_rollup_tier(table_name) {
             return;
         }
         let candidates = self.uncertified_window_dates(&*table.read().await, table_name, deadline);
@@ -7203,6 +7210,41 @@ impl Database {
             return;
         }
         self.batch_probe_classify(table, table_name, Vec::new(), candidates, deadline).await;
+    }
+
+    /// Queue removal of a declined date's duplicate bins. Nothing else removes them on a
+    /// rollup-declaring table: its cron drain is skipped and its dirty bins retired, so
+    /// only a coordinator Dedup unit rewrites it. Bins a drain group already holds are
+    /// excluded by the caller; they go back through that drain.
+    fn mint_declined_bins(&self, table_name: &str, project: &str, date: &str, bins: impl Iterator<Item = i64>) {
+        use crate::maintenance_coordinator::{Operation, TaskKey, TimeSlice};
+        let width = crate::database::compact::bin_micros();
+        let minted = match get_schema(table_name) {
+            _ if is_rollup_tier(table_name) => 0,
+            Some(schema) if !schema.rollups.is_empty() => {
+                let now = crate::support::now_micros();
+                let mut journal = self.journal();
+                let minted = bins
+                    .filter(|&bin| {
+                        let slice = TimeSlice { start_micros: bin * width, end_micros: (bin + 1) * width };
+                        let key = TaskKey {
+                            physical_table: table_name.to_owned(),
+                            source: table_name.to_owned(),
+                            project_id: project.to_owned(),
+                            slice,
+                            operation: Operation::Dedup,
+                        };
+                        journal.enqueue_with_base_tier(key, now, 0, unix_ms(now), false)
+                    })
+                    .count();
+                if let Err(error) = journal.checkpoint() {
+                    warn!(table_name, project, date, %error, event = "dedup_certify_declined_checkpoint_failed");
+                }
+                minted
+            }
+            _ => bins.map(|bin| self.enqueue_dirty_bin(project, table_name, date, bin)).count(),
+        };
+        metrics::counter!(scan_metric_names::CERT_DECLINE_UNITS_MINTED).increment(minted as u64);
     }
 
     fn note_probe_cost(&self, table_name: &str, elapsed: std::time::Duration) {
@@ -7315,7 +7357,14 @@ impl Database {
                         // cannot become clean without a commit, and a commit moves the
                         // fingerprint, so re-probing before then would crowd out unexamined
                         // candidates.
-                        self.dedup_probe_declined.insert((project.clone(), table_name.to_string(), date.clone()), *fp);
+                        // A first decline of this file set mints the removal; the memo keeps
+                        // the date unprobed until a commit (the removal's own) moves it. Only a
+                        // drain group (`bins` non-empty) may legitimately re-probe a memoised date.
+                        if self.dedup_probe_declined.insert((project.clone(), table_name.to_string(), date.clone()), *fp) != Some(*fp) {
+                            self.mint_declined_bins(table_name, &project, &date, dup_bins.iter().copied().filter(|bin| !bins.contains(bin)));
+                        } else if bins.is_empty() {
+                            metrics::counter!(scan_metric_names::CERT_DECLINE_REMINT_SAME_FP).increment(1);
+                        }
                         metrics::counter!(scan_metric_names::CERT_PROBE_DECLINED).increment(1);
                         // HOW dirty, not just that it is dirty: this decides the removal
                         // mechanism and cannot be measured from outside, because a psql probe

@@ -8823,6 +8823,101 @@ async fn a_date_probed_dirty_is_not_reprobed_until_its_files_change() -> Result<
     Ok(())
 }
 
+/// A sealed date the certification probe declines is also REMOVED: on a table with rollups
+/// the cron drain is skipped and its dirty bins retired, so without a minted coordinator
+/// Dedup unit the duplicates stay and the date is never certified.
+#[tokio::test]
+async fn a_probe_declined_sealed_date_is_deduped_then_certified() -> Result<()> {
+    use crate::maintenance_coordinator::{Operation, TaskState};
+    use crate::observability::counter_value;
+    crate::observability::init_local_metrics_for_test();
+    let (db, project) = dirty_bin_db("certify-declined-dedup").await?;
+    db.cancel_maintenance();
+    let (day, base) = sealed_noon();
+    for observed in ["first", "second"] {
+        insert_otel_ts(&db, &project, "dup", observed, base, true).await?;
+    }
+    let pending_dedup = || {
+        db.journal()
+            .tasks()
+            .filter(|task| task.key.project_id == project && task.key.operation == Operation::Dedup && task.state == TaskState::Pending)
+            .map(|task| task.key.clone())
+            .collect::<Vec<_>>()
+    };
+    // The prod shape: ingest's own units and dirty bins are gone, the duplicates are not.
+    pending_dedup().iter().for_each(|key| assert!(db.journal().complete(key)));
+    db.dedup_dirty_bins.clear();
+    let table = otel_unified_table(&db).await;
+    let key = (project.clone(), "otel_logs_and_spans".to_owned(), day.to_string());
+    let pass = async || db.run_certification_pass(&table, "otel_logs_and_spans", std::time::Instant::now() + std::time::Duration::from_secs(60)).await;
+    let [declined, minted, remint] =
+        [scan_metric_names::CERT_PROBE_DECLINED, scan_metric_names::CERT_DECLINE_UNITS_MINTED, scan_metric_names::CERT_DECLINE_REMINT_SAME_FP]
+            .map(counter_value);
+
+    pass().await;
+    let units = pending_dedup();
+    let width = crate::database::compact::bin_micros();
+    let bin = base.div_euclid(width) * width;
+    assert_eq!(
+        units.iter().map(|unit| (unit.slice.start_micros, unit.slice.end_micros)).collect::<Vec<_>>(),
+        [(bin, bin + width)],
+        "a decline mints exactly one Dedup unit, one bin wide"
+    );
+    assert_eq!(counter_value(scan_metric_names::CERT_PROBE_DECLINED), declined + 1);
+    assert_eq!(counter_value(scan_metric_names::CERT_DECLINE_UNITS_MINTED), minted + 1);
+
+    assert!(db.run_coordinator_dedup_once().await?, "the minted unit is claimable");
+    assert_eq!(db.journal().state(&units[0]), Some(TaskState::Complete));
+    assert_eq!(delta_physical_row_count(&table).await?, 1, "the duplicate is physically removed");
+
+    pass().await;
+    assert!(db.dedup_clean_fp.get(&key).is_some_and(|entry| !entry.stale), "the removal's commit moves the fingerprint, so the date is re-probed and granted");
+    assert!(db.dedup_window_clean(&*table.read().await, &project, "otel_logs_and_spans", (base, base)).granted());
+
+    pass().await;
+    assert!(pending_dedup().is_empty(), "a certified date mints nothing more");
+    assert_eq!(counter_value(scan_metric_names::CERT_DECLINE_REMINT_SAME_FP), remint);
+    Ok(())
+}
+
+/// Tier duplicates are legitimate sub-grain partial states the tier read collapses, and
+/// nothing reads a tier's certification, so the certification pass must not probe tiers.
+#[tokio::test]
+async fn certification_does_not_probe_rollup_tiers() -> Result<()> {
+    const TIER: &str = "otel_logs_and_spans_rollup_dashboard_1m_v3";
+    crate::observability::init_local_metrics_for_test();
+    let (db, project) = dirty_bin_db("certify-tier").await?;
+    db.cancel_maintenance();
+    let (day, base) = sealed_noon();
+    let rows = (0..2)
+        .map(|_| {
+            let mut row = serde_json::json!({
+                "project_id": project, "date": day.to_string(), "timestamp": base, "updated_at": base,
+                "id": "partial", "rollup_generation": "g", "request_count": 1
+            });
+            row.as_object_mut().expect("object literal").extend(
+                get_schema(TIER)
+                    .expect("generated tier")
+                    .fields
+                    .iter()
+                    .filter(|field| !field.nullable && field.data_type == "Int64" && field.name != "request_count")
+                    .map(|field| (field.name.clone(), serde_json::json!(0))),
+            );
+            row
+        })
+        .collect();
+    db.insert_records_batch(&project, TIER, vec![crate::support::test_helpers::json_to_batch_for(TIER, rows)?], true, None).await?;
+    let table = db.resolve_table(&project, TIER).await?;
+    assert_eq!(delta_physical_row_count(&table).await?, 2, "precondition: a seeded (timestamp, id) duplicate");
+    let declined = crate::observability::counter_value(scan_metric_names::CERT_PROBE_DECLINED);
+
+    db.run_certification_pass(&table, TIER, std::time::Instant::now() + std::time::Duration::from_secs(60)).await;
+
+    assert!(db.dedup_probe_cost_ms.get(TIER).is_none(), "the tier must not be probed");
+    assert_eq!(crate::observability::counter_value(scan_metric_names::CERT_PROBE_DECLINED), declined);
+    Ok(())
+}
+
 /// Candidates come out PROJECT-MAJOR (a scan sheds `DedupExec` only when every date
 /// in its window is granted, so grants scattered one-per-project buy nothing) and
 /// BUSIEST first (fewest-remaining-dates ordering never reaches the slow tenants).

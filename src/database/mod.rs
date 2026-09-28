@@ -289,6 +289,12 @@ pub mod scan_metric_names {
         CERT_PROBE_DECLINED = "timefusion.scan.cert_probe_declined" as scan.cert_probe_declined;
         // Summed dirty bins across declined dates, out of 144 per date.
         CERT_DECLINED_DIRTY_BINS = "timefusion.scan.cert_declined_dirty_bins" as scan.cert_declined_dirty_bins;
+        // Removal units minted for a decline's dirty bins (coordinator Dedup units, or
+        // dirty-bin queue entries on tables without rollups).
+        CERT_DECLINE_UNITS_MINTED = "timefusion.scan.cert_decline_units_minted" as scan.cert_decline_units_minted;
+        // A certify-only decline re-probed against the fingerprint it was memoised under.
+        // Must stay 0: `known_dirty` filters those dates out before the probe.
+        CERT_DECLINE_REMINT_SAME_FP = "timefusion.scan.cert_decline_remint_same_fp" as scan.cert_decline_remint_same_fp;
         CERT_SLICE_FILES_UNPROVEN = "timefusion.scan.cert_slice_files_unproven" as scan.cert_slice_files_unproven;
         // A whole-day proof that survived a fingerprint move because every file
         // added since sits outside the query window. Read against
