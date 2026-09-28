@@ -4300,7 +4300,8 @@ impl Database {
 
     /// One bounded, sequential pass fetching the bodies of the busiest projects'
     /// today+yesterday `otel_logs_and_spans` files into the cache. Sequential so
-    /// the pace is a true files/sec and peak heap is one file body.
+    /// the pace is a true files/sec and peak heap is one file body. The stats
+    /// counters move per file, so a pass cut short by a restart still shows.
     pub(crate) async fn preload_hot_bodies_with(&self, caps: HotBodyCaps) -> HotBodyReport {
         let mut report = HotBodyReport::default();
         let (Some(shared), true) = (self.object_store_cache.as_ref(), caps.projects > 0) else { return report };
@@ -4312,6 +4313,8 @@ impl Database {
             (rank_hot_bodies(files, &[today, today - chrono::Days::new(1)], caps.projects), t.log_store().object_store(None), t.table_url().to_string())
         };
         let table_path = table_path_in_bucket(table_cache_prefix(&table_uri));
+        let stats = crate::observability::maintenance_stats();
+        let tally = |counter: &std::sync::atomic::AtomicU64, n: u64| counter.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
         let t0 = std::time::Instant::now();
         'pass: for (_, files) in ranked {
             let mut project_bytes = 0;
@@ -4319,20 +4322,25 @@ impl Database {
                 let path = object_store::path::Path::parse(&rel).unwrap_or_else(|_| object_store::path::Path::from(rel.as_str()));
                 if shared.contains_data(&bucket_cache_key(table_path, &path)) {
                     report.cached += 1;
+                    tally(&stats.hot_body_preload_cached, 1);
                     continue;
                 }
                 if project_bytes + size > caps.project_bytes || report.bytes + size > caps.total_bytes {
                     report.capped += 1;
+                    tally(&stats.hot_body_preload_capped, 1);
                     continue;
                 }
                 match tokio::time::timeout(caps.budget.saturating_sub(t0.elapsed()), crate::storage::warm_full(store.as_ref(), &path)).await {
                     Err(_) => {
                         report.budget_stopped = true;
+                        tally(&stats.hot_body_preload_budget_stops, 1);
                         break 'pass;
                     }
                     Ok(false) => {}
                     Ok(true) => {
                         (project_bytes, report.files, report.bytes) = (project_bytes + size, report.files + 1, report.bytes + size);
+                        tally(&stats.hot_body_preload_files, 1);
+                        tally(&stats.hot_body_preload_bytes, size);
                         tokio::time::sleep(caps.pace).await;
                     }
                 }
@@ -4357,16 +4365,6 @@ impl Database {
                 pace: std::time::Duration::from_secs_f64(1.0 / f64::from(m.timefusion_warm_body_boot_files_per_sec)),
             })
             .await;
-        let s = crate::observability::maintenance_stats();
-        for (counter, n) in [
-            (&s.hot_body_preload_files, r.files),
-            (&s.hot_body_preload_bytes, r.bytes),
-            (&s.hot_body_preload_cached, r.cached),
-            (&s.hot_body_preload_capped, r.capped),
-            (&s.hot_body_preload_budget_stops, u64::from(r.budget_stopped)),
-        ] {
-            counter.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
-        }
         info!(event = "hot_body_preload_complete", files = r.files, bytes = r.bytes, cached = r.cached, capped = r.capped, budget_stopped = r.budget_stopped);
     }
 

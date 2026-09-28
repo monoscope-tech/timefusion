@@ -3346,6 +3346,7 @@ async fn hot_body_preload_makes_the_first_24h_read_free() -> Result<()> {
     let reader = cold_reader("warm", |_| {}).await?;
     let warmed = reader.preload_hot_bodies_with(caps).await;
     assert_eq!((warmed.files, warmed.cached, warmed.capped, warmed.budget_stopped), (3, 0, 0, false), "{warmed:?}");
+    assert_eq!(crate::observability::maintenance_stats().hot_body_preload_bytes.load(Relaxed), warmed.bytes, "the stats counters move with the pass");
     assert_eq!(read_24h(&reader, &big).await?, (3, 0), "the top project's first 24h read must not fetch from object storage");
     assert!(read_24h(&reader, &small).await?.1 > 0, "a non-top project is not preloaded");
     assert_eq!(reader.preload_hot_bodies_with(caps).await, HotBodyReport { cached: 3, ..Default::default() }, "a second pass fetches nothing");
@@ -3361,12 +3362,14 @@ async fn hot_body_preload_makes_the_first_24h_read_free() -> Result<()> {
         c.cache.timefusion_parquet_metadata_size_hint = 4096;
     })
     .await?;
+    // The counters are process-global and the passes above already moved them.
+    let stats = crate::observability::maintenance_stats();
+    let booted_files = || stats.hot_body_preload_files.load(Relaxed) - (warmed.files + capped.files);
     booted.preload_tables();
     assert!(booted.wait_for_preload(&CancellationToken::new()).await);
-    let stats = crate::observability::maintenance_stats();
-    assert_eq!(stats.hot_body_preload_files.load(Relaxed), 0, "the replay gate must not wait on the paced body pass");
+    assert!(booted_files() < 4, "the replay gate must not wait on the paced body pass");
     within(180, async {
-        while stats.hot_body_preload_files.load(Relaxed) < 4 {
+        while booted_files() < 4 {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
         Ok(())
