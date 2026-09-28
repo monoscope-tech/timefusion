@@ -1173,23 +1173,30 @@ impl BufferedWriteLayer {
         // No stuck-older-bucket gate needed: an unflushed older bucket pins the
         // cursor via its holds, so force-flushing the open window can never move
         // the cursor past it.
-        if self.force_flush_buckets(|mem| mem.bucket_keys(|id| id >= current)).await > 0 {
-            crate::observability::record_backpressure_force_flush();
-            self.backpressure_force_flush_total.fetch_add(1, Ordering::Relaxed);
-        }
+        let mut first = true;
+        self.force_flush_buckets(
+            |mem| mem.bucket_keys(|id| id >= current),
+            || {
+                if std::mem::take(&mut first) {
+                    crate::observability::record_backpressure_force_flush();
+                    self.backpressure_force_flush_total.fetch_add(1, Ordering::Relaxed);
+                }
+            },
+        )
+        .await;
         Ok(())
     }
 
     /// Take-flush the buckets `keys` selects UNDER the flush lock (rows removed
-    /// under the insert lock, restored on commit failure); returns how many were taken.
-    async fn force_flush_buckets(&self, keys: impl FnOnce(&MemBuffer) -> Vec<(String, String, i64)>) -> usize {
+    /// under the insert lock, restored on commit failure). `on_take` runs as each
+    /// bucket is taken, before its commit.
+    async fn force_flush_buckets(&self, keys: impl FnOnce(&MemBuffer) -> Vec<(String, String, i64)>, mut on_take: impl FnMut()) {
         let _flush_guard = self.flush_lock.lock().await;
-        let mut taken = 0;
         for (project_id, table_name, bucket_id) in keys(&self.mem_buffer) {
             let Some(bucket) = self.mem_buffer.take_bucket_for_flush(&project_id, &table_name, bucket_id) else {
                 continue;
             };
-            taken += 1;
+            on_take();
             match self.flush_taken_bucket(&bucket).await {
                 Ok(()) => {
                     self.rows_flushed_total.fetch_add(bucket.row_count as u64, Ordering::Relaxed);
@@ -1202,7 +1209,6 @@ impl BufferedWriteLayer {
                 }
             }
         }
-        taken
     }
 
     /// Exempt the buckets a merge-on-read version append lands in from the
@@ -2200,8 +2206,13 @@ impl BufferedWriteLayer {
         // drains and fills the buffer until inserts are rejected. Take those
         // destructively: the take is atomic with inserts and DML, so no race.
         if !self.mem_buffer.dirty_livelocked_keys(DIRTY_FLUSHES_BEFORE_TAKE).is_empty() {
-            let taken = self.force_flush_buckets(|mem| mem.dirty_livelocked_keys(DIRTY_FLUSHES_BEFORE_TAKE)).await;
-            self.dirty_livelock_takes_total.fetch_add(taken as u64, Ordering::Relaxed);
+            self.force_flush_buckets(
+                |mem| mem.dirty_livelocked_keys(DIRTY_FLUSHES_BEFORE_TAKE),
+                || {
+                    self.dirty_livelock_takes_total.fetch_add(1, Ordering::Relaxed);
+                },
+            )
+            .await;
         }
         let current_bucket = MemBuffer::current_bucket_id();
         // Snapshot the bucket list ONCE: re-deriving the remaining set each pass
