@@ -1728,10 +1728,14 @@ pub struct CacheConfig {
     pub timefusion_foyer_disabled: bool,
     /// Scan-resistant admission: a scan reaching further back than this many
     /// hours runs with cache population BYPASSED, so a wide sweep can't flush the
-    /// hot tail out. Reads still HIT what's already cached. 0 disables.
-    #[serde_inline_default(24)]
+    /// hot tail out. Reads still HIT what's already cached. 0 disables. Above a
+    /// day so day-long dashboards admit on first view.
+    #[serde_inline_default(26)]
     pub timefusion_cache_bypass_scan_hours: u64,
 }
+
+/// Clock drift between planning and scanning that the cache-bypass depth absorbs.
+pub const CACHE_BYPASS_SLACK_MICROS: i64 = 5 * 60 * 1_000_000;
 
 impl CacheConfig {
     getters! {
@@ -1762,9 +1766,11 @@ impl CacheConfig {
         Duration::from_secs(self.timefusion_provider_cache_ttl_seconds.max(1))
     }
     /// Scan lookback depth past which cache population is bypassed, in micros.
-    /// `None` = never bypass.
+    /// `None` = never bypass. Includes [`CACHE_BYPASS_SLACK_MICROS`]: SQL `now()`
+    /// folds at plan time but the scan re-reads the clock, so an `N hours` window
+    /// always measures slightly deeper than N hours.
     pub fn cache_bypass_scan_micros(&self) -> Option<i64> {
-        (self.timefusion_cache_bypass_scan_hours > 0).then(|| self.timefusion_cache_bypass_scan_hours as i64 * 3_600 * 1_000_000)
+        (self.timefusion_cache_bypass_scan_hours > 0).then(|| self.timefusion_cache_bypass_scan_hours as i64 * 3_600 * 1_000_000 + CACHE_BYPASS_SLACK_MICROS)
     }
 }
 
@@ -2614,6 +2620,9 @@ mod tests {
         assert_eq!(config.cache.block_size_bytes(), 256 * MIB);
         assert_eq!(config.cache.timefusion_foyer_l1_max_entry_mb, 16);
         assert_eq!(config.cache.timefusion_cache_recent_days, 35);
+        assert_eq!(config.cache.timefusion_cache_bypass_scan_hours, 26, "day-long dashboards must admit");
+        let day = CacheConfig { timefusion_cache_bypass_scan_hours: 24, ..config.cache.clone() };
+        assert!(day.cache_bypass_scan_micros().unwrap() > 24 * 3_600_000_000 + 1_000_000, "a 24h window re-measured at scan time must still admit");
         assert_eq!(config.memory.timefusion_wide_scan_max_mb, 64);
         assert!(config.maintenance.timefusion_warm_after_compaction);
         assert!(config.maintenance.timefusion_evict_after_compaction);

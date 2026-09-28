@@ -8802,6 +8802,53 @@ async fn racing_creators_of_one_table_both_get_it() -> Result<()> {
     b.shutdown().await
 }
 
+/// A dashboard's `now() - INTERVAL '24 hours'` scan must admit its files on the FIRST view.
+/// `now()` folds at plan time but the bypass gate re-reads the clock at scan time, so a 24h
+/// window measured 24h+ε, bypassed admission, and only a third view read warm. A week-deep
+/// scan must still bypass so a historical sweep cannot evict the hot tail.
+#[tokio::test(flavor = "multi_thread")]
+async fn day_dashboard_scan_admits_to_cache_on_first_view() -> Result<()> {
+    let base = create_test_config("day-dashboard-admit");
+    // Written by a cacheless process, so no write-capture pre-warms the reader's cache.
+    let writer = Database::with_config(base.clone()).await?;
+    writer.cancel_maintenance();
+    let (day, week) = (format!("day_{}", uuid::Uuid::new_v4().simple()), format!("week_{}", uuid::Uuid::new_v4().simple()));
+    let at = Utc::now().timestamp_micros() - 3_600_000_000;
+    for project in [&day, &week] {
+        insert_a_span(&writer, project, &format!("{project}-row"), at).await?;
+    }
+    let mut cfg = (*base).clone();
+    cfg.cache.timefusion_foyer_disabled = false;
+    cfg.core.timefusion_data_dir = PathBuf::from(format!("{}-reader", base.core.timefusion_data_dir.display()));
+    // Any selected file makes the scan wide, as a day of prod files does.
+    cfg.memory.timefusion_wide_scan_max_mb = 0;
+    // Read by range as prod's large files are; a small file is otherwise fetched whole by planning's footer read.
+    cfg.cache.timefusion_foyer_l1_max_entry_mb = 0;
+    let db = Arc::new(Database::with_config(Arc::new(cfg)).await?);
+    db.cancel_maintenance();
+    let mut ctx = Arc::clone(&db).create_session_context();
+    db.setup_session_context(&mut ctx)?;
+    let cache = db.object_store_cache().expect("foyer enabled").clone();
+    let read = async |project: &str, lookback: &str| -> Result<(u64, u64)> {
+        let before = cache.runtime_stats();
+        let rows = ctx
+            .sql(&format!("SELECT id FROM otel_logs_and_spans WHERE project_id = '{project}' AND timestamp >= now() - INTERVAL '{lookback}'"))
+            .await?
+            .collect()
+            .await?;
+        assert_eq!(rows.iter().map(|b| b.num_rows()).sum::<usize>(), 1, "{project} over {lookback}");
+        let after = cache.runtime_stats();
+        Ok((after.stats.main.inner_bytes_read - before.stats.main.inner_bytes_read, after.insert_bypassed - before.insert_bypassed))
+    };
+    // Bytes, not GETs: every scan also probes the next, absent `_delta_log` version.
+    let (first_bytes, first_bypassed) = read(&day, "24 hours").await?;
+    assert!(first_bytes > 0, "the first view must fetch from the store, or it proves nothing");
+    assert_eq!(first_bypassed, 0, "a 24h dashboard scan must admit what it fetched");
+    assert_eq!(read(&day, "24 hours").await?.0, 0, "the second view of a 24h dashboard must be served entirely from cache");
+    assert!(read(&week, "7 days").await?.1 > 0, "a week-deep scan must still bypass admission");
+    Ok(())
+}
+
 #[serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_batch_queue_under_load() -> Result<()> {

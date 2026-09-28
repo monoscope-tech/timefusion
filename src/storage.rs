@@ -311,6 +311,7 @@ pub struct FoyerRuntimeStats {
     pub admit_read_miss_bytes: u64,
     pub admit_refresh_bytes: u64,
     pub write_capture_admitted: u64,
+    pub insert_bypassed: u64,
     pub memory_size_bytes: usize,
     pub disk_size_bytes: usize,
     pub ttl_seconds: u64,
@@ -446,6 +447,8 @@ pub struct AdmissionStats {
     pub read_miss_bytes: AtomicU64,
     pub refresh_bytes: AtomicU64,
     pub write_capture_admitted: AtomicU64,
+    /// Populations a scan-bypass scope declined (see [`FoyerObjectStoreCache::admit`]).
+    pub insert_bypassed: AtomicU64,
 }
 
 impl AdmissionStats {
@@ -562,6 +565,7 @@ impl SharedFoyerCache {
             admit_read_miss_bytes: self.admission.read_miss_bytes.load(Ordering::Relaxed),
             admit_refresh_bytes: self.admission.refresh_bytes.load(Ordering::Relaxed),
             write_capture_admitted: self.admission.write_capture_admitted.load(Ordering::Relaxed),
+            insert_bypassed: self.admission.insert_bypassed.load(Ordering::Relaxed),
         }
     }
 
@@ -1354,6 +1358,7 @@ impl FoyerObjectStoreCache {
     fn admit(&self, cache: &FoyerCache, key: String, value: CacheValue, l1_max_entry_bytes: usize) -> bool {
         if bypass_active() && !self.repeat_sighting(&key) {
             crate::observability::record_cache_insert_bypassed();
+            self.admission.insert_bypassed.fetch_add(1, Ordering::Relaxed);
             return false;
         }
         insert_main(cache, key, value, l1_max_entry_bytes);

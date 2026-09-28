@@ -1103,6 +1103,7 @@ impl StatsTableProvider {
                     "admit_read_miss_bytes" => s.admit_read_miss_bytes,
                     "admit_refresh_bytes" => s.admit_refresh_bytes,
                     "write_capture_admitted" => s.write_capture_admitted,
+                    "insert_bypassed" => s.insert_bypassed,
                 ])
                 .collect()
         });
@@ -1351,7 +1352,7 @@ mod stats_table_tests {
         expect(
             "foyer",
             "memory_mb disk_gb ttl_seconds l1_max_entry_mb block_size_mb cache_recent_days cache_dir metadata_memory_mb metadata_disk_gb l1_used_bytes \
-             l2_used_bytes entry_count evictions",
+             l2_used_bytes entry_count evictions insert_bypassed",
         );
         expect("memory", "maintenance_pool_used_bytes maintenance_pool_pct coordinator_pool_used_bytes coordinator_pool_pct");
         expect("logical_count", "resident_partitions resident_bytes_estimated resident_mb_estimated resident_limit_bytes resident_limit_mb active_builds");
