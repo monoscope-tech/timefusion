@@ -4373,7 +4373,8 @@ impl Database {
     /// Resolve every registry table and warm parquet footers in the background
     /// (ALL live files by default; recency-bounded when
     /// `TIMEFUSION_WARM_ALL_FOOTERS=false`), so the first query after a deploy
-    /// doesn't pay Delta log replay + footer reads inline.
+    /// doesn't pay Delta log replay + footer reads inline, then run the bounded
+    /// hot-body preload.
     pub fn preload_tables(self: &Arc<Self>) {
         // Idempotent: a second call must not double the boot-time S3 warm burst.
         if self.preload_started.swap(true, std::sync::atomic::Ordering::Relaxed) {

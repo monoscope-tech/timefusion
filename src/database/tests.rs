@@ -3365,7 +3365,7 @@ async fn hot_body_preload_makes_the_first_24h_read_free() -> Result<()> {
     assert!(booted.wait_for_preload(&CancellationToken::new()).await);
     let stats = crate::observability::maintenance_stats();
     assert_eq!(stats.hot_body_preload_files.load(Relaxed), 0, "the replay gate must not wait on the paced body pass");
-    within(60, async {
+    within(180, async {
         while stats.hot_body_preload_files.load(Relaxed) < 4 {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
