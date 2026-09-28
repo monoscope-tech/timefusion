@@ -11053,7 +11053,7 @@ mod rollup_noop_skip_tests {
         let reminted = db.journal().tasks().any(|task| {
             task.key.project_id == project
                 && task.key.physical_table == TIER
-                && task.state != TaskState::Complete
+                && task.state.is_active()
                 && task.key.slice.start_micros < day + DAY_MICROS
                 && task.key.slice.end_micros > day
         });
