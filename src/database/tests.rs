@@ -3380,6 +3380,7 @@ async fn hot_body_preload_makes_the_first_24h_read_free() -> Result<()> {
         project_bytes: u64::MAX,
         budget: std::time::Duration::from_secs(60),
         pace: std::time::Duration::ZERO,
+        concurrency: 8,
     };
 
     let reader = cold_reader("warm", |_| {}).await?;

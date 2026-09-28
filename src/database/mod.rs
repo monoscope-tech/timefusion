@@ -1084,6 +1084,27 @@ fn rank_hot_bodies(files: impl IntoIterator<Item = (String, u64)>, dates: &[chro
         .collect()
 }
 
+/// The pass order over [`rank_hot_bodies`]: newest date first, and within a
+/// date round-robin across projects by each file's index within its date, so every top
+/// project's today is claimed before any project's yesterday.
+fn hot_body_queue(ranked: Vec<(String, Vec<(String, u64)>)>) -> Vec<(usize, String, u64)> {
+    ranked
+        .into_iter()
+        .enumerate()
+        .flat_map(|(project, (_, files))| {
+            // The project's files arrive newest date first; `i` restarts at each date.
+            files.into_iter().scan((None, 0), move |(prev, i), (path, size)| {
+                let date = crate::storage::date_partition_of(&path);
+                *i = if *prev == Some(date) { *i + 1 } else { 0 };
+                *prev = Some(date);
+                Some(((std::cmp::Reverse(date), *i, project), path, size))
+            })
+        })
+        .sorted_by(|a, b| a.0.cmp(&b.0))
+        .map(|((_, _, project), path, size)| (project, path, size))
+        .collect()
+}
+
 /// Bounds of one [`Database::preload_hot_bodies_with`] pass. Byte caps count
 /// fetched bytes only, so already-cached files are free.
 #[derive(Debug, Clone, Copy)]
@@ -1092,7 +1113,69 @@ pub(crate) struct HotBodyCaps {
     pub total_bytes: u64,
     pub project_bytes: u64,
     pub budget: std::time::Duration,
+    /// Minimum spacing between fetch STARTS across all workers.
     pub pace: std::time::Duration,
+    pub concurrency: usize,
+}
+
+/// Fetch `queue` (`(project, path, size)`) with up to `caps.concurrency` bodies
+/// in flight. Bytes are reserved when a file is claimed and released only if its
+/// fetch fails, so bytes fetched or in flight never exceed either cap, even
+/// under concurrency. Stats counters move per file.
+async fn run_hot_body_pass<Fut: std::future::Future<Output = bool>>(
+    queue: Vec<(usize, object_store::path::Path, u64)>, caps: HotBodyCaps, cached: impl Fn(&object_store::path::Path) -> bool,
+    fetch: impl Fn(object_store::path::Path) -> Fut,
+) -> HotBodyReport {
+    #[derive(Default)]
+    struct Pass {
+        report: HotBodyReport,
+        reserved: u64,
+        per_project: HashMap<usize, u64>,
+        next_start: Option<tokio::time::Instant>,
+    }
+    let stats = crate::observability::maintenance_stats();
+    let tally = |counter: &std::sync::atomic::AtomicU64, n: u64| counter.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+    let state = parking_lot::Mutex::new(Pass::default());
+    let (state, cached, fetch, tally) = (&state, &cached, &fetch, &tally);
+    let pass = futures::stream::iter(queue).for_each_concurrent(caps.concurrency.max(1), |(project, path, size)| async move {
+        let start = {
+            let mut s = state.lock();
+            if cached(&path) {
+                s.report.cached += 1;
+                tally(&stats.hot_body_preload_cached, 1);
+                return;
+            }
+            let project_bytes = s.per_project.get(&project).copied().unwrap_or(0);
+            if project_bytes + size > caps.project_bytes || s.reserved + size > caps.total_bytes {
+                s.report.capped += 1;
+                tally(&stats.hot_body_preload_capped, 1);
+                return;
+            }
+            s.reserved += size;
+            *s.per_project.entry(project).or_default() += size;
+            let start = s.next_start.map_or_else(tokio::time::Instant::now, |t| t.max(tokio::time::Instant::now()));
+            s.next_start = Some(start + caps.pace);
+            start
+        };
+        tokio::time::sleep_until(start).await;
+        let ok = fetch(path).await;
+        let mut s = state.lock();
+        if ok {
+            (s.report.files, s.report.bytes) = (s.report.files + 1, s.report.bytes + size);
+            tally(&stats.hot_body_preload_files, 1);
+            tally(&stats.hot_body_preload_bytes, size);
+        } else {
+            s.reserved -= size;
+            *s.per_project.entry(project).or_default() -= size;
+        }
+    });
+    let stopped = tokio::time::timeout(caps.budget, pass).await.is_err();
+    let mut report = state.lock().report;
+    if stopped {
+        report.budget_stopped = true;
+        tally(&stats.hot_body_preload_budget_stops, 1);
+    }
+    report
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -4298,14 +4381,13 @@ impl Database {
         });
     }
 
-    /// One bounded, sequential pass fetching the bodies of the busiest projects'
-    /// today+yesterday `otel_logs_and_spans` files into the cache. Sequential so
-    /// the pace is a true files/sec and peak heap is one file body. The stats
-    /// counters move per file, so a pass cut short by a restart still shows.
+    /// One bounded pass fetching the bodies of the busiest projects'
+    /// today+yesterday `otel_logs_and_spans` files into the cache, in
+    /// [`hot_body_queue`] order via [`run_hot_body_pass`]. Peak heap is
+    /// `caps.concurrency` x the largest file body.
     pub(crate) async fn preload_hot_bodies_with(&self, caps: HotBodyCaps) -> HotBodyReport {
-        let mut report = HotBodyReport::default();
-        let (Some(shared), true) = (self.object_store_cache.as_ref(), caps.projects > 0) else { return report };
-        let Ok(table_ref) = self.resolve_table("default", "otel_logs_and_spans").await else { return report };
+        let (Some(shared), true) = (self.object_store_cache.as_ref(), caps.projects > 0) else { return HotBodyReport::default() };
+        let Ok(table_ref) = self.resolve_table("default", "otel_logs_and_spans").await else { return HotBodyReport::default() };
         let (ranked, store, table_uri) = {
             let t = table_ref.read().await;
             let today = Utc::now().date_naive();
@@ -4313,40 +4395,18 @@ impl Database {
             (rank_hot_bodies(files, &[today, today - chrono::Days::new(1)], caps.projects), t.log_store().object_store(None), t.table_url().to_string())
         };
         let table_path = table_path_in_bucket(table_cache_prefix(&table_uri));
-        let stats = crate::observability::maintenance_stats();
-        let tally = |counter: &std::sync::atomic::AtomicU64, n: u64| counter.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
-        let t0 = std::time::Instant::now();
-        'pass: for (_, files) in ranked {
-            let mut project_bytes = 0;
-            for (rel, size) in files {
-                let path = object_store::path::Path::parse(&rel).unwrap_or_else(|_| object_store::path::Path::from(rel.as_str()));
-                if shared.contains_data(&bucket_cache_key(table_path, &path)) {
-                    report.cached += 1;
-                    tally(&stats.hot_body_preload_cached, 1);
-                    continue;
-                }
-                if project_bytes + size > caps.project_bytes || report.bytes + size > caps.total_bytes {
-                    report.capped += 1;
-                    tally(&stats.hot_body_preload_capped, 1);
-                    continue;
-                }
-                match tokio::time::timeout(caps.budget.saturating_sub(t0.elapsed()), crate::storage::warm_full(store.as_ref(), &path)).await {
-                    Err(_) => {
-                        report.budget_stopped = true;
-                        tally(&stats.hot_body_preload_budget_stops, 1);
-                        break 'pass;
-                    }
-                    Ok(false) => {}
-                    Ok(true) => {
-                        (project_bytes, report.files, report.bytes) = (project_bytes + size, report.files + 1, report.bytes + size);
-                        tally(&stats.hot_body_preload_files, 1);
-                        tally(&stats.hot_body_preload_bytes, size);
-                        tokio::time::sleep(caps.pace).await;
-                    }
-                }
-            }
-        }
-        report
+        let queue = hot_body_queue(ranked)
+            .into_iter()
+            .map(|(project, rel, size)| (project, object_store::path::Path::parse(&rel).unwrap_or_else(|_| object_store::path::Path::from(rel.as_str())), size))
+            .collect();
+        let store = store.as_ref();
+        run_hot_body_pass(
+            queue,
+            caps,
+            |path| shared.contains_data(&bucket_cache_key(table_path, path)),
+            |path| async move { crate::storage::warm_full(store, &path).await },
+        )
+        .await
     }
 
     /// [`Self::preload_hot_bodies_with`] under the configured caps, at the boot
@@ -4363,6 +4423,7 @@ impl Database {
                 project_bytes: m.timefusion_hot_body_preload_project_mb << 20,
                 budget: std::time::Duration::from_secs(m.timefusion_hot_body_preload_budget_secs),
                 pace: std::time::Duration::from_secs_f64(1.0 / f64::from(m.timefusion_warm_body_boot_files_per_sec)),
+                concurrency: m.timefusion_hot_body_preload_concurrency,
             })
             .await;
         info!(event = "hot_body_preload_complete", files = r.files, bytes = r.bytes, cached = r.cached, capped = r.capped, budget_stopped = r.budget_stopped);
@@ -7280,6 +7341,88 @@ mod writer_properties_tests {
         let files = [f("a", 27, "y", 5), f("a", 28, "t", 5), f("b", 28, "t", 4), f("b", 1, "old", 99), f("c", 28, "t", 1)];
         let ranked = rank_hot_bodies(files, &[day(28), day(27)], 2);
         assert_eq!(ranked, vec![("a".into(), vec![f("a", 28, "t", 5), f("a", 27, "y", 5)]), ("b".into(), vec![f("b", 28, "t", 4)])]);
+    }
+
+    /// Per project `(today, yesterday)` file counts, 10 bytes each, in pass order.
+    fn hot_queue_of(counts: &[(usize, usize)]) -> Vec<(usize, object_store::path::Path, u64)> {
+        let files = counts
+            .iter()
+            .enumerate()
+            .flat_map(|(p, &(t, y))| (0..t + y).map(move |i| (format!("project_id=p{p}/date=2026-09-{}/f{i}.parquet", if i < t { 28 } else { 27 }), 10)));
+        let day = |d| chrono::NaiveDate::from_ymd_opt(2026, 9, d).unwrap();
+        hot_body_queue(rank_hot_bodies(files, &[day(28), day(27)], counts.len())).into_iter().map(|(p, path, size)| (p, path.into(), size)).collect()
+    }
+
+    fn hot_queue(projects: usize) -> Vec<(usize, object_store::path::Path, u64)> {
+        hot_queue_of(&vec![(2, 2); projects])
+    }
+
+    /// Round-robin restarts per date: a project with a long today must not push
+    /// its first yesterday file behind another project's second.
+    #[test]
+    fn hot_body_queue_round_robins_each_date() {
+        let order = hot_queue_of(&[(3, 1), (1, 2)]).into_iter().map(|(_, p, _)| p.to_string()).collect_vec();
+        let want = [
+            "p0/date=2026-09-28/f0",
+            "p1/date=2026-09-28/f0",
+            "p0/date=2026-09-28/f1",
+            "p0/date=2026-09-28/f2",
+            "p0/date=2026-09-27/f3",
+            "p1/date=2026-09-27/f1",
+            "p1/date=2026-09-27/f2",
+        ];
+        assert_eq!(order, want.map(|f| format!("project_id={f}.parquet")));
+    }
+
+    fn hot_caps(concurrency: usize, budget_ms: u64, pace_ms: u64) -> HotBodyCaps {
+        let ms = std::time::Duration::from_millis;
+        HotBodyCaps { projects: 4, total_bytes: u64::MAX, project_bytes: u64::MAX, budget: ms(budget_ms), pace: ms(pace_ms), concurrency }
+    }
+
+    /// 16 one-second fetches: workers overlap them, the pace spaces their starts,
+    /// and the budget stops the pass mid-flight. `(whole seconds, files, stopped)`.
+    #[test_case(1, 60_000, 0 => (16, 16, false) ; "one worker is sequential")]
+    #[test_case(8, 60_000, 0 => (2, 16, false) ; "eight workers overlap")]
+    #[test_case(8, 60_000, 500 => (8, 16, false) ; "pace limits starts across workers")]
+    #[test_case(8, 1_500, 0 => (1, 8, true) ; "budget stops in flight")]
+    #[tokio::test(start_paused = true)]
+    async fn hot_body_pass_concurrency_pace_and_budget(concurrency: usize, budget_ms: u64, pace_ms: u64) -> (u64, u64, bool) {
+        let t0 = tokio::time::Instant::now();
+        let r = run_hot_body_pass(
+            hot_queue(4),
+            hot_caps(concurrency, budget_ms, pace_ms),
+            |_| false,
+            |_| async {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                true
+            },
+        )
+        .await;
+        (t0.elapsed().as_secs(), r.files, r.budget_stopped)
+    }
+
+    /// Under 8 workers the caps are exact (bytes reserved at claim), and the order
+    /// gives every project its newest file before any project its second.
+    #[tokio::test(start_paused = true)]
+    async fn hot_body_pass_caps_are_exact_and_round_robin() {
+        let started = parking_lot::Mutex::new(vec![]);
+        let caps = HotBodyCaps { total_bytes: 55, project_bytes: 25, ..hot_caps(8, 60_000, 0) };
+        let r = run_hot_body_pass(
+            hot_queue(4),
+            caps,
+            |p| p.as_ref().ends_with("p3/date=2026-09-28/f1.parquet"),
+            |p| {
+                started.lock().push(p.to_string());
+                async {
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    true
+                }
+            },
+        )
+        .await;
+        assert_eq!((r.files, r.bytes, r.cached, r.capped), (5, 50, 1, 10));
+        let want = ["p0/date=2026-09-28/f0", "p1/date=2026-09-28/f0", "p2/date=2026-09-28/f0", "p3/date=2026-09-28/f0", "p0/date=2026-09-28/f1"];
+        assert_eq!(started.into_inner(), want.map(|f| format!("project_id={f}.parquet")));
     }
 
     /// Bloom filters are opt-in per column, and the global kill switch wins over the opt-in.

@@ -2023,10 +2023,14 @@ pub struct MaintenanceConfig {
     #[serde_inline_default(16)]
     pub timefusion_warm_body_boot_files_per_sec: u32,
     /// Boot-time body preload of `otel_logs_and_spans` today+yesterday for this
-    /// many projects, ranked by their bytes there; one sequential pass at the boot
-    /// body pace, after the table preload, skipping cached files. 0 = off.
+    /// many projects, ranked by their bytes there; newest day first, round-robin
+    /// across projects, at the boot body pace, after the table preload, skipping
+    /// cached files. 0 = off.
     #[serde_inline_default(10)]
     pub timefusion_hot_body_preload_projects: usize,
+    /// Bodies in flight in that pass. Peak heap is this x the largest file body.
+    #[serde_inline_default(8)]
+    pub timefusion_hot_body_preload_concurrency: usize,
     /// Byte caps (fetched bytes) and wall budget for that pass.
     #[serde_inline_default(8192)]
     pub timefusion_hot_body_preload_total_mb: u64,
