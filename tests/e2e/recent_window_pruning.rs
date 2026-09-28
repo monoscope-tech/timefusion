@@ -201,5 +201,9 @@ async fn dv_bearing_file_keeps_parquet_pushdown_on_its_siblings() -> anyhow::Res
     // never leave the parquet reader.
     let pruned: i64 = scans.iter().filter_map(|l| scan_metric(l, "pushdown_rows_pruned=")).sum();
     assert!(pruned >= 90, "pushdown pruned {pruned} rows — the DV-free file was decoded in full.\nplan:\n{plan}");
+    // Splitting masked from DV-free files unions two sources; the merge must keep the
+    // declared ordering or DedupExec falls to full-set.
+    let dedup_line = plan.lines().find(|l| l.contains("DedupExec")).unwrap_or_default();
+    assert!(dedup_line.contains("bounded["), "DedupExec fell to full-set over the split DV leg.\nplan:\n{plan}");
     Ok(())
 }
