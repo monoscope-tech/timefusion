@@ -128,3 +128,78 @@ async fn recent_window_prunes_within_compacted_file() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+/// One DV-bearing file in a scan used to strip the parquet predicate from EVERY file
+/// in it, the timestamp bound included: DV keep-masks are positional, so the fork
+/// withheld pushdown scan-wide instead of only from the masked files. Prod (2026-09-28)
+/// decoded 4.94M rows to keep 2.18K on a 6h window once dedup had masked a file in
+/// today's partition. The query is the prod probe, `text_match`-inside-OR included.
+#[serial_test::serial]
+#[tokio::test(flavor = "multi_thread")]
+async fn dv_bearing_file_keeps_parquet_pushdown_on_its_siblings() -> anyhow::Result<()> {
+    let env = hot_partition_builder().with_deletion_vectors().with_flush_interval(Duration::from_secs(3600)).with_tantivy_prefilter(false).start().await?;
+    env.db().cancel_maintenance();
+    let client = env.pg_client().await?;
+
+    // A past partition, so `dedup_partition` clears its sealed-chunk guard.
+    let past = 1_735_689_600_000_000i64;
+    let insert = async |idx: i64, name: &str| {
+        let dt = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(past + idx * SEC).unwrap();
+        let kind = if idx % 10 == 0 { "server" } else { "internal" };
+        client
+            .execute(
+                &format!(
+                    "INSERT INTO otel_logs_and_spans (project_id, date, timestamp, id, name, kind, status_code, status_message, level, hashes, summary) \
+                     VALUES ('e2e_project', '{}', '{}', $1, $2, $3, 'OK', 'm', 'INFO', ARRAY[]::text[], $4)",
+                    dt.date_naive(),
+                    dt.format("%Y-%m-%d %H:%M:%S%.f"),
+                ),
+                &[&format!("r-{idx:04}"), &name, &kind, &vec!["s"]],
+            )
+            .await
+    };
+    // Two files of 100 rows; the first also holds a same-key, different-content copy of
+    // a row in the second, which dedup then masks with a deletion vector.
+    for idx in 0..100 {
+        insert(idx, "span").await?;
+    }
+    insert(150, "span-v2").await?;
+    env.force_flush().await?;
+    for idx in 100..200 {
+        insert(idx, "span").await?;
+    }
+    env.force_flush().await?;
+
+    let table_ref = env.db().resolve_table("e2e_project", "otel_logs_and_spans").await?;
+    let date = chrono::DateTime::from_timestamp_micros(past).unwrap().date_naive();
+    let (dropped, _) = env.db().dedup_partition(&table_ref, "otel_logs_and_spans", "e2e_project", date).await?;
+    assert_eq!(dropped, 1);
+    let (files, dv_files) = {
+        let t = table_ref.read().await;
+        let files: Vec<_> = t.snapshot()?.snapshot().log_data().iter().map(|f| f.deletion_vector_descriptor().is_some()).collect();
+        (files.len(), files.iter().filter(|d| **d).count())
+    };
+    assert!(files >= 2 && dv_files == 1, "fixture needs one DV-bearing file among DV-free ones: {dv_files}/{files}");
+
+    let sql = format!(
+        "SELECT time_bucket('10 minutes', timestamp) AS b, COUNT(*) FROM otel_logs_and_spans \
+         WHERE project_id = 'e2e_project' AND (kind = 'server' OR name = 'apitoolkit-http-span' OR name = 'monoscope.http') \
+         AND timestamp >= '{}' GROUP BY 1",
+        ts(past + 50 * SEC)
+    );
+    let total: i64 = client.query(&sql, &[]).await?.iter().map(|r| r.get::<_, i64>(1)).sum();
+    assert_eq!(total, 15, "server spans at idx 50,60,..,190");
+
+    let plan = explain_analyze(&client, &sql).await?;
+    assert!(plan.contains("text_match(kind"), "the tantivy rewrite did not inject text_match, so this is not the prod shape.\nplan:\n{plan}");
+    let scans: Vec<&str> = plan.lines().filter(|l| l.contains("DataSourceExec") && l.contains("file_type=parquet")).collect();
+    assert!(
+        scans.iter().any(|l| l.contains("predicate=timestamp@")),
+        "no parquet scan carries the timestamp predicate — one DV-bearing file stripped pushdown scan-wide.\nplan:\n{plan}"
+    );
+    // Cost: the DV-free file's 100 rows hold 10 server spans; pushed down, the rest
+    // never leave the parquet reader.
+    let pruned: i64 = scans.iter().filter_map(|l| scan_metric(l, "pushdown_rows_pruned=")).sum();
+    assert!(pruned >= 90, "pushdown pruned {pruned} rows — the DV-free file was decoded in full.\nplan:\n{plan}");
+    Ok(())
+}
