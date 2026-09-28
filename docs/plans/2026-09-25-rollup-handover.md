@@ -53,6 +53,19 @@ Measured waste, ranked, with owner:
 7. Owner-decision builds: W28 HLL audit (agent), W29 v4 `level` (branch ready, own window), W27 sessions v2, W30 staging.
 8. Stage 3 batched publication build, Stage 1B single pass: after 1–5 land and the scorecard shows the residual.
 
+**2026-09-28 03:45 update.** Deployed: 22:50 (memory fixes, claim fast path, derived requeue, W37 per-project cert
+spans), 00:50 (W31 content-fingerprint slice proof), 02:50 (W33 dedup certified skip, W38 census guard + edge-day
+proofs, W40 sub-grain refusal + derived hour floor, W42 no fusion of unended cells). Measured on the 02:50 process at
+43 min: today's 6h/1h/24h-service windows route hybrid with 0 stale cells; derived drains (37 done/45 min, 21 pending,
+was 435 deadlocked); pgwire p95/p99/p999 315 ms / 0.69 s / 1.6 s (was 0.5 / 1.8 / 5.3 s); per-file cert skips live
+(unproven:proved 23:1 -> 2:1); journal lock wait ~7 s/min (was ~75); oldest pending 2.7 h (was 9.8 d).
+Correction: `rollup_dirty_partitions` is OR-only and never read, so it is not a backlog signal.
+Queue: 04:50 `batch/0450` (W41 per-cell re-arm, orphan-derived prune, dark query-latency yield, W39 declined-bin dedup
++ counter honesty, tier cap; CI green) -> W43 (delta-rs fork `79e98104`: parquet predicate withheld only from DV-masked
+files, not the whole scan; fork integration branch fast-forwarded) + cert blocker sample -> output-state pricing
+(~48 KB per output row) + state-driven time split -> W29 v4 `level` (newest-first RESUME stepping, drop release gated on
+contiguity). In flight: W44 DV single-partition forcing (measure first).
+
 **21:55 update.** 20:50 deployed (fix A, SPM, W36, fix B, master `0e6b3ac7`): re-mint loop GONE (escalations and
 ledger disagreements 100/15 min -> 0; base-rollup completions now today's cells), oldest pending 9.8 d -> 4.5 d, all three
 probe projects' 6h windows route hybrid. Pending base/derived/dedup flat (424/404/190): capacity freed, census not yet
