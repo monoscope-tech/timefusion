@@ -3126,6 +3126,21 @@ impl Database {
                 return Ok(true);
             }
         }
+        // A tier with no output of its own yet (a new tier's backfill) borrows a lower-bound
+        // prior from a subset sibling, or the input proxy prices it several-fold high.
+        if prior_rows.is_none() {
+            for sibling in spec.prior_siblings(&source_schema.rollups) {
+                let Ok(table) = self.resolve_table(&key.project_id, &sibling.table_name(&key.source)).await else { continue };
+                let adds: Vec<_> = table.read().await.snapshot().ok().map(|s| s.log_data().iter().map(|file| add_action(&file)).collect()).unwrap_or_default();
+                prior_rows = crate::maintenance_coordinator::prior_output_rows(
+                    adds.iter().filter(|add| Self::tag_project(add) == Some(key.project_id.as_str())).filter_map(Self::published_rows),
+                    key.slice,
+                );
+                if prior_rows.is_some() {
+                    break;
+                }
+            }
+        }
         // A rebuild whose INPUT is unchanged reproduces its own output, and the queue
         // re-mints such units routinely. Three conditions, all necessary:
         //   * `content_fp` — the input file set INCLUDING deletion vectors, so a DV'd

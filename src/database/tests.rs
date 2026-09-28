@@ -1605,6 +1605,36 @@ async fn rollup_unit_waits_for_output_state_room_then_runs_alone() -> Result<()>
     Ok(())
 }
 
+/// A tier with no output yet (W29's v4 backfill) prices from its subset sibling's rows
+/// (v3), not the input proxy: here that prior is large enough to split the unit.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_new_tier_prices_from_its_subset_siblings_output() -> Result<()> {
+    use crate::maintenance_coordinator::{AdmissionController, Operation, TAG_OUTPUT_ROWS, TaskState, rollup_state_bytes};
+    let mut db = Database::with_config(test_config_with("rollup-sibling-prior", |cfg| cfg.maintenance.timefusion_rollup_noop_skip_enabled = false)).await?;
+    db.cancel_maintenance();
+    db.maintenance_admission = AdmissionController::with_decoded_capacity(64, 64, u64::MAX, u64::MAX, 64, 64);
+    let day = (Utc::now() - chrono::Duration::days(3)).date_naive();
+    let project = format!("sibling_{}", uuid::Uuid::new_v4().simple());
+    insert_hourly_spans(&db, &project, midnight_micros(day), 20..24).await?;
+    for hour in 20..24 {
+        let report = db.run_unit_once("otel_logs_and_spans", &project, day, Operation::BaseRollup, 1, hour, Some("dashboard_1m_v3")).await?;
+        assert_eq!(report.state, Some(TaskState::Complete));
+    }
+    let v3 = db.resolve_table(&project, "otel_logs_and_spans_rollup_dashboard_1m_v3").await?;
+    rewrite_tier_files(&v3, "-rows", |add| {
+        add.tags.as_mut().expect("published output has tags").insert(TAG_OUTPUT_ROWS.to_owned(), Some("1000".to_owned()));
+    })
+    .await?;
+    let v4_sketches = get_schema("otel_logs_and_spans")
+        .and_then(|schema| schema.rollups.iter().find(|spec| spec.name.as_deref() == Some("dashboard_1m_v4")).map(|spec| spec.sketches()))
+        .expect("the v4 tier");
+    // Borrowed 4h prior = 4000 rows; above half the pool, so v4 splits instead of running whole.
+    db.maintenance_admission = AdmissionController::with_decoded_capacity(64, 64, u64::MAX, rollup_state_bytes(v4_sketches, Some(4_000), 0), 64, 64);
+    let unit = db.run_unit_once("otel_logs_and_spans", &project, day, Operation::BaseRollup, 4, 20, Some("dashboard_1m_v4")).await?;
+    assert_eq!((unit.state, unit.retry_reason.as_deref()), (Some(TaskState::Superseded), Some("split_into_smaller_slices")), "v4 must price from v3's rows");
+    Ok(())
+}
+
 /// A unit priced above half the state pool splits into halves re-priced by their
 /// own slice, which then co-run instead of each holding the whole pool alone.
 #[tokio::test(flavor = "multi_thread")]

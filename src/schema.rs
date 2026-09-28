@@ -82,6 +82,19 @@ impl RollupSpec {
         self.measures.iter().filter(|measure| matches!(measure.agg.as_str(), "tdigest" | "hll")).count()
     }
 
+    /// Tiers whose published rows lower-bound this one's, for pricing a tier with no output
+    /// yet: same grain and build kind, dimensions a SUBSET of ours. Adding dimensions only
+    /// splits groups, so the subset tier's rows are a lower bound; W24 measured that `level`
+    /// adds none, which makes v3's rows an accurate prior for v4.
+    pub fn prior_siblings<'a>(&'a self, all: &'a [RollupSpec]) -> impl Iterator<Item = &'a RollupSpec> {
+        all.iter().filter(move |other| {
+            !std::ptr::eq(*other, self)
+                && other.grain == self.grain
+                && other.derive_from.is_some() == self.derive_from.is_some()
+                && other.dimensions.iter().all(|dimension| self.dimensions.contains(dimension))
+        })
+    }
+
     /// `{source}_rollup_{name|grain}`.
     pub fn table_name(&self, source: &str) -> String {
         format!("{source}_rollup_{}", self.name.as_deref().unwrap_or(&self.grain))
@@ -734,6 +747,17 @@ pub fn create_insert_compatible_schema(schema: &SchemaRef) -> SchemaRef {
 
 #[cfg(test)]
 mod tests {
+    /// Only a same-grain, same-kind tier whose dimensions are a subset lends its rows:
+    /// never across grains, never from a superset.
+    #[test_case::test_case("dashboard_1m_v4" => vec!["dashboard_1m_v3"] ; "v4 borrows from v3")]
+    #[test_case::test_case("dashboard_1h_v3" => vec!["dashboard_1h_v2"] ; "the derived v4 borrows from the derived v3, not a 1m tier")]
+    #[test_case::test_case("dashboard_1m_v3" => Vec::<String>::new() ; "v3 never borrows from its superset v4")]
+    fn a_tier_borrows_only_from_a_subset_sibling(name: &str) -> Vec<String> {
+        let schema = super::get_schema("otel_logs_and_spans").expect("schema");
+        let spec = schema.rollups.iter().find(|spec| spec.name.as_deref() == Some(name)).expect("declared tier");
+        spec.prior_siblings(&schema.rollups).filter_map(|sibling| sibling.name.clone()).collect()
+    }
+
     use super::*;
     use test_case::test_case;
 
