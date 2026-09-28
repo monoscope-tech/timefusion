@@ -9271,9 +9271,14 @@ async fn a_probe_declined_sealed_date_is_deduped_then_certified() -> Result<()> 
     assert_eq!(counter_value(scan_metric_names::CERT_PROBE_DECLINED), declined + 1);
     assert_eq!(counter_value(scan_metric_names::CERT_DECLINE_UNITS_MINTED), minted + 1);
 
+    // The mint carries no byte estimate; completion must report what the unit measured.
+    assert!(db.journal().tasks().any(|task| task.key == units[0] && task.estimated_decoded_bytes == 0));
+    let processed = || crate::observability::maintenance_stats().maintenance_processed_bytes.load(std::sync::atomic::Ordering::Relaxed);
+    let processed_before = processed();
     assert!(db.run_coordinator_dedup_once().await?, "the minted unit is claimable");
     assert_eq!(db.journal().state(&units[0]), Some(TaskState::Complete));
     assert_eq!(delta_physical_row_count(&table).await?, 1, "the duplicate is physically removed");
+    assert!(processed() > processed_before, "a dedup that scanned a partition records its processed bytes");
 
     pass().await;
     assert!(db.dedup_clean_fp.get(&key).is_some_and(|entry| !entry.stale), "the removal's commit moves the fingerprint, so the date is re-probed and granted");

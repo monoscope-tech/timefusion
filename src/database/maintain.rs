@@ -2671,7 +2671,7 @@ impl Database {
                 let mut journal = self.journal();
                 journal.complete(&key);
                 journal.checkpoint()?;
-                crate::observability::record_processed_bytes(key.operation, task.estimated_decoded_bytes);
+                crate::observability::record_processed_bytes(key.operation, estimated_bytes);
             }
             Ok((_, false, _)) => {
                 retry("dedup_incomplete".to_owned(), std::time::Duration::from_secs(30))?;
