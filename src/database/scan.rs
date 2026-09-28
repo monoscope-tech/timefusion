@@ -472,8 +472,9 @@ impl ProjectRoutingTable {
             }
         }
         // Complete coverage keeps the single-provider fast path; the split is only
-        // needed when the snapshot has raw debt.
-        if raw.is_empty() && !indexed.is_empty() && !bloom_pruned_any && date_restrict.is_none() {
+        // needed when the snapshot has raw debt. Never under a date or file split: the
+        // fast path reads every live file, so both sides would read everything.
+        if raw.is_empty() && !indexed.is_empty() && !bloom_pruned_any && date_restrict.is_none() && file_restrict.is_none() {
             let narrowed = narrow(filters);
             metrics::counter!(scan_metric_names::TANTIVY_FASTPATH).increment(1);
             let plan = self.scan_delta_table(table, state, projection, &narrowed, limit, None, zero_hit_files, row_selections).await?;
@@ -492,9 +493,9 @@ impl ProjectRoutingTable {
         if !raw.is_empty() {
             plans.push(self.scan_delta_table(table, state, projection, filters, limit, Some(&raw), None, None).await?);
         }
-        // Under a date split an empty side is a real empty side; the
+        // Under a date or file split an empty side is a real empty side; the
         // unrestricted fallback below would read the OTHER side's files.
-        if plans.is_empty() && date_restrict.is_some() {
+        if plans.is_empty() && (date_restrict.is_some() || file_restrict.is_some()) {
             metrics::counter!(scan_metric_names::TANTIVY_SCAN_US).increment(scan_started.elapsed().as_micros() as u64);
             return Ok(Vec::new());
         }
@@ -586,7 +587,8 @@ impl ProjectRoutingTable {
                 )
             };
         }
-        let plans = scan_side!((!per_date_dates.is_empty()).then_some(&uncertified_dates), (!certified_files.is_empty()).then_some(&uncertified_files)).await?;
+        let mut plans =
+            scan_side!((!per_date_dates.is_empty()).then_some(&uncertified_dates), (!certified_files.is_empty()).then_some(&uncertified_files)).await?;
         // Returned separately so the caller can union the certified side ABOVE
         // DedupExec instead of feeding it through.
         let certified_plans = match (per_date_dates.is_empty(), certified_files.is_empty()) {
@@ -596,6 +598,15 @@ impl ProjectRoutingTable {
         if !certified_plans.is_empty() {
             let metric = if certified_files.is_empty() { scan_metric_names::DEDUP_SKIPPED_PER_DATE } else { scan_metric_names::DEDUP_SKIPPED_PER_FILE };
             metrics::counter!(metric).increment(1);
+        }
+        // Both sides of a split can prune to nothing (e.g. every file a zero-hit under the
+        // tantivy prefilter); the caller needs a leg to plan over.
+        if plans.is_empty() && certified_plans.is_empty() {
+            let schema = match projection {
+                Some(proj) => Arc::new(self.schema.project(proj)?),
+                None => self.schema.clone(),
+            };
+            plans.push(Arc::new(datafusion::physical_plan::empty::EmptyExec::new(schema)));
         }
         Ok((skip_dedup, plans, certified_plans))
     }

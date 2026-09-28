@@ -21,6 +21,7 @@ mod multi_tenant_isolation;
 mod or_utf8view_delta;
 mod ordering_pushdown;
 mod partition_pruning;
+mod per_file_split;
 mod postcommit_hooks;
 mod pressure_flush;
 mod recent_window_pruning;
