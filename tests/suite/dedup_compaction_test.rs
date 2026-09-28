@@ -2111,12 +2111,19 @@ async fn a_distinct_count_over_services_routes_and_matches_the_raw_sketch() -> R
 /// expression group, so merging decomposable states per group is exact. The
 /// fixture puts NULLs in every grouped dimension, in both legs of the hybrid. An
 /// aggregate with no mergeable state must still decline under the same group.
+///
+/// Covers the hybrid case: a rollup interior over yesterday plus the raw fringe
+/// (yesterday's uncovered edges and today). Coverage extent is a function of `now`,
+/// so the clock is pinned, once just after the date flip and once mid-day.
+#[test_case(30 ; "just after midnight")]
+#[test_case(13 * 60 ; "early afternoon")]
 #[serial]
 #[tokio::test]
-async fn an_expression_group_over_dimensions_matches_raw_for_every_measure_kind() -> Result<()> {
+async fn an_expression_group_over_dimensions_matches_raw_for_every_measure_kind(now_minutes: i64) -> Result<()> {
     let env = rollup_env("rollup_expression_group").await?;
     let db = Arc::clone(&env.db);
     db.cancel_maintenance();
+    timefusion::support::set_micros(env.midnight + now_minutes * 60_000_000);
     let fixture = [
         ("server", Some("OK"), None, Some("cart")),
         ("server", Some("ERROR"), Some("error"), Some("cart")),
@@ -2128,7 +2135,8 @@ async fn an_expression_group_over_dimensions_matches_raw_for_every_measure_kind(
         ("client", Some("OK"), Some("info"), Some("checkout")),
     ];
     let row = |(kind, status, level, service): (&str, Option<&str>, Option<&str>, Option<&str>), duration: i64| serde_json::json!({ "kind": kind, "status_code": status, "level": level, "resource___service___name": service, "duration": duration });
-    // Spread over five hours: a tier interior under a fifth of the 14h window declines as tiny.
+    // Spread over five hours: just after midnight the tier covers only through the last row's hour,
+    // and an interior under a fifth of the 14h window declines as tiny.
     for (i, fields) in fixture.iter().enumerate() {
         env.insert_fields(&format!("y{i}"), env.yesterday_noon + 17 + i as i64 * 2_500_000_000, row(*fields, 100 * (i as i64 + 1))).await?;
     }
