@@ -51,11 +51,11 @@ impl ProjectRoutingTable {
     fn bounded_otel_scan_reason(&self, filters: &[Expr], limit: Option<usize>) -> Option<&'static str> {
         let conjuncts: Vec<&Expr> = filters.iter().flat_map(datafusion::logical_expr::utils::split_conjunction).collect();
         let bounded = conjuncts.iter().any(|expr| Self::is_bounding_predicate(expr))
-            || self.extract_time_range_from_filters(&conjuncts.into_iter().cloned().collect::<Vec<_>>()).is_some_and(|(lower, _)| lower != i64::MIN);
+            || filters_time_range(&conjuncts.into_iter().cloned().collect::<Vec<_>>()).is_some_and(|(lower, _)| lower != i64::MIN);
         Self::raw_otel_scan_reason(&self.table_name, filters, limit, bounded)
     }
 
-    /// Predicates that bound a scan but that `extract_time_range_from_filters`
+    /// Predicates that bound a scan but that `filters_time_range`
     /// does not decompose: `date = '…'` (one partition) and `BETWEEN`.
     pub(crate) fn is_bounding_predicate(expr: &Expr) -> bool {
         matches!(expr, Expr::Between(between) if !between.negated && matches!(between.expr.as_ref(), Expr::Column(c) if c.name == "timestamp"))
@@ -738,7 +738,7 @@ impl ProjectRoutingTable {
     /// the hot one-sided `>= now()-1h` dashboard (whose max is open-ended)
     /// reads as shallow while a `[30d ago, 29d ago]` history slice does not.
     fn scan_lookback_micros(&self, filters: &[Expr]) -> Option<i64> {
-        self.extract_time_range_from_filters(filters).and_then(|(min, _)| (min != i64::MIN).then(|| crate::support::now_micros().saturating_sub(min)))
+        filters_time_range(filters).and_then(|(min, _)| (min != i64::MIN).then(|| crate::support::now_micros().saturating_sub(min)))
     }
 
     /// Selected file bytes above which a scan is recorded as a process-risk candidate. Not a
@@ -946,50 +946,61 @@ impl ProjectRoutingTable {
     fn dedup_skip_allowed(&self, table: &DeltaTable, project_id: &str, window: Option<(i64, i64)>, dedup_keys: &[String]) -> DedupSkipVerdict {
         self.dedup_skip_certified(table, project_id, window, dedup_keys).0
     }
+}
 
-    /// Extract time range (min, max) from query filters.
-    /// Returns None if no time constraints found.
-    fn extract_time_range_from_filters(&self, filters: &[Expr]) -> Option<(i64, i64)> {
-        use crate::read::optimizers::{is_col_through_cast, swap_comparison};
-        // Literal bound → microseconds. Strict (no Cast unwrap) so a cast-to-a-
-        // different-unit literal yields None (→ widest window) rather than a
-        // wrong-narrow one that could prune indexes holding matching rows.
-        fn literal_micros(e: &Expr) -> Option<i64> {
-            match e {
-                Expr::Literal(ScalarValue::TimestampMicrosecond(Some(ts), _), _) => Some(*ts),
-                Expr::Literal(ScalarValue::TimestampNanosecond(Some(ts), _), _) => Some(*ts / 1000),
-                Expr::Literal(ScalarValue::TimestampMillisecond(Some(ts), _), _) => Some(*ts * 1000),
-                Expr::Literal(ScalarValue::TimestampSecond(Some(ts), _), _) => Some(*ts * 1_000_000),
-                _ => None,
-            }
+/// The `(min, max)` window the filters admit, `None` when nothing bounds it.
+/// Always a superset of the true range: conjuncts intersect, disjuncts take
+/// their hull (a side any disjunct leaves open stays open), and any other
+/// expression — `NOT` included — bounds nothing.
+pub(crate) fn filters_time_range(filters: &[Expr]) -> Option<(i64, i64)> {
+    use crate::read::optimizers::{is_col_through_cast, swap_comparison};
+    type Bounds = (Option<i64>, Option<i64>);
+    // Literal bound → microseconds. Strict (no Cast unwrap) so a cast-to-a-
+    // different-unit literal yields None (→ widest window) rather than a
+    // wrong-narrow one that could prune indexes holding matching rows.
+    fn literal_micros(e: &Expr) -> Option<i64> {
+        match e {
+            Expr::Literal(ScalarValue::TimestampMicrosecond(Some(ts), _), _) => Some(*ts),
+            Expr::Literal(ScalarValue::TimestampNanosecond(Some(ts), _), _) => Some(*ts / 1000),
+            Expr::Literal(ScalarValue::TimestampMillisecond(Some(ts), _), _) => Some(*ts * 1000),
+            Expr::Literal(ScalarValue::TimestampSecond(Some(ts), _), _) => Some(*ts * 1_000_000),
+            _ => None,
         }
-
-        let (min_ts, max_ts) = filters.iter().fold((None::<i64>, None::<i64>), |acc @ (min_ts, max_ts), filter| {
-            let Expr::BinaryExpr(BinaryExpr { left, op, right }) = filter else { return acc };
-            // Accept `timestamp <op> lit`, `lit <op> timestamp` (operands
-            // reversed → flip the comparison), and a Cast-wrapped column.
-            let (ts_value, op) = if is_col_through_cast(left, "timestamp") {
-                (literal_micros(right), *op)
-            } else if is_col_through_cast(right, "timestamp") {
-                (literal_micros(left), swap_comparison(*op))
-            } else {
-                return acc;
-            };
-            let Some(ts) = ts_value else { return acc };
-            match op {
-                Operator::Gt | Operator::GtEq => (Some(min_ts.map_or(ts, |m| m.max(ts))), max_ts),
-                Operator::Lt | Operator::LtEq => (min_ts, Some(max_ts.map_or(ts, |m| m.min(ts)))),
-                Operator::Eq => (Some(ts), Some(ts)),
-                _ => acc,
+    }
+    fn intersect((a0, a1): Bounds, (b0, b1): Bounds) -> Bounds {
+        (a0.into_iter().chain(b0).max(), a1.into_iter().chain(b1).min())
+    }
+    fn bounds(e: &Expr) -> Bounds {
+        let Expr::BinaryExpr(BinaryExpr { left, op, right }) = e else { return (None, None) };
+        let ((a0, a1), (b0, b1)) = match op {
+            Operator::And => return intersect(bounds(left), bounds(right)),
+            Operator::Or => (bounds(left), bounds(right)),
+            _ => {
+                // Accept `timestamp <op> lit`, `lit <op> timestamp` (operands
+                // reversed → flip the comparison), and a Cast-wrapped column.
+                let (ts, op) = if is_col_through_cast(left, "timestamp") {
+                    (literal_micros(right), *op)
+                } else if is_col_through_cast(right, "timestamp") {
+                    (literal_micros(left), swap_comparison(*op))
+                } else {
+                    return (None, None);
+                };
+                return match op {
+                    Operator::Gt | Operator::GtEq => (ts, None),
+                    Operator::Lt | Operator::LtEq => (None, ts),
+                    Operator::Eq => (ts, ts),
+                    _ => (None, None),
+                };
             }
-        });
+        };
+        (a0.zip(b0).map(|(a, b)| a.min(b)), a1.zip(b1).map(|(a, b)| a.max(b)))
+    }
 
-        if min_ts.is_some() || max_ts.is_some() {
-            return Some((min_ts.unwrap_or(i64::MIN), max_ts.unwrap_or(i64::MAX)));
-        }
+    match filters.iter().map(bounds).fold((None, None), intersect) {
         // No timestamp bound — fall back to a `date = X` partition equality
         // (exactly one day). Sound because certification is keyed by (project, date).
-        date_partition_window(filters)
+        (None, None) => date_partition_window(filters),
+        (min, max) => Some((min.unwrap_or(i64::MIN), max.unwrap_or(i64::MAX))),
     }
 }
 
@@ -1608,7 +1619,7 @@ impl TableProvider for ProjectRoutingTable {
         };
         // Query [lo,hi] timestamp window, shared by the tantivy prefilter and the skip-delta
         // watermark check below.
-        let query_time_range = self.extract_time_range_from_filters(&optimized_filters);
+        let query_time_range = filters_time_range(&optimized_filters);
         let mut tantivy_id_filter: Option<Expr> = None;
         // When index coverage is partial, indexed and raw files are read as separate Delta legs.
         // Only the indexed leg receives the narrowing id-set; uncovered files retain the
@@ -2170,5 +2181,40 @@ mod decode_tests {
             vec![("old".into(), bin("2026-05-30")), ("blocking".into(), bin("2026-07-30")), ("older".into(), bin("2026-06-09"))];
         planned.sort_by(|a, b| super::repair_bin_date(&b.1).cmp(super::repair_bin_date(&a.1)));
         assert_eq!(planned.iter().map(|(p, _)| p.as_str()).collect::<Vec<_>>(), vec!["blocking", "older", "old"]);
+    }
+}
+
+#[cfg(test)]
+mod time_range_tests {
+    use datafusion::{
+        arrow::datatypes::{DataType, TimeUnit},
+        prelude::{cast, col, lit},
+    };
+    use test_case::test_case;
+
+    use super::*;
+
+    fn ts(micros: i64) -> Expr {
+        lit(ScalarValue::TimestampMicrosecond(Some(micros), None))
+    }
+    fn range(lo: i64, hi: i64) -> Expr {
+        col("timestamp").gt_eq(ts(lo)).and(col("timestamp").lt(ts(hi)))
+    }
+
+    /// The window must be a superset of the rows the filters admit: a hull over
+    /// disjuncts, an intersection over conjuncts, unbounded where any disjunct is.
+    #[test_case(vec![col("timestamp").gt_eq(ts(10)), col("timestamp").lt(ts(20))] => Some((10, 20)) ; "top-level conjuncts")]
+    #[test_case(vec![ts(20).gt(col("timestamp"))] => Some((i64::MIN, 20)) ; "swapped operands flip")]
+    #[test_case(vec![col("timestamp").eq(ts(7))] => Some((7, 7)) ; "equality")]
+    #[test_case(vec![col("timestamp").gt_eq(cast(lit(10i64), DataType::Timestamp(TimeUnit::Microsecond, None)))] => None ; "a cast literal is not trusted")]
+    #[test_case(vec![range(10, 20).or(range(30, 40))] => Some((10, 40)) ; "the hybrid raw leg's fringes hull")]
+    #[test_case(vec![range(10, 20).or(col("timestamp").gt_eq(ts(30)))] => Some((10, i64::MAX)) ; "an open-ended fringe leaves the top open")]
+    #[test_case(vec![range(10, 20).or(col("name").eq(lit("x")))] => None ; "an unbounded disjunct unbounds the hull")]
+    #[test_case(vec![col("name").eq(lit("x")).and(range(10, 40).and(col("timestamp").lt(ts(30))))] => Some((10, 30)) ; "nested conjuncts intersect")]
+    #[test_case(vec![range(0, 100).and(range(10, 20).or(range(30, 40)))] => Some((10, 40)) ; "a hull inside a conjunction intersects")]
+    #[test_case(vec![range(10, 20).or(range(30, 40)).and(col("timestamp").gt(ts(35)))] => Some((35, 40)) ; "a conjunction narrows a hull")]
+    #[test_case(vec![Expr::Not(Box::new(range(10, 20)))] => None ; "a negated range bounds nothing")]
+    fn filters_bound_the_window(filters: Vec<Expr>) -> Option<(i64, i64)> {
+        filters_time_range(&filters)
     }
 }

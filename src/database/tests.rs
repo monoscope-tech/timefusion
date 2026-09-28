@@ -8969,6 +8969,56 @@ async fn day_dashboard_scan_admits_to_cache_on_first_view() -> Result<()> {
     Ok(())
 }
 
+/// A hybrid rollup rewrite reads its raw fringes as `(range) OR (range)`. The window
+/// extraction saw only top-level comparisons, so that leg read as infinitely deep and
+/// bypassed cache admission: every first dashboard view stayed cold.
+#[tokio::test(flavor = "multi_thread")]
+async fn hybrid_dashboard_raw_leg_admits_to_cache_on_first_view() -> Result<()> {
+    let base = rollup_backfill_config("hybrid-admit", 35);
+    let writer = Database::with_config(base.clone()).await?;
+    writer.cancel_maintenance();
+    let project = format!("hybrid_{}", uuid::Uuid::new_v4().simple());
+    let now = Utc::now().timestamp_micros();
+    // One file per minute; minute 0 lands in the open-ended fringe, so the raw leg selects a file.
+    for minute in 0..55 {
+        insert_a_span(&writer, &project, &format!("m{minute}"), now - minute * 60_000_000).await?;
+    }
+    let day = |micros: i64| chrono::DateTime::from_timestamp_micros(micros).expect("in range").date_naive();
+    for date in [day(now - 3_600_000_000), day(now)].into_iter().dedup() {
+        build_base_tier(&writer, &project, "dashboard_1m_v3", date).await?;
+    }
+    let mut cfg = (*base).clone();
+    cfg.cache.timefusion_foyer_disabled = false;
+    cfg.core.timefusion_data_dir = PathBuf::from(format!("{}-reader", base.core.timefusion_data_dir.display()));
+    cfg.memory.timefusion_wide_scan_max_mb = 0;
+    cfg.cache.timefusion_foyer_l1_max_entry_mb = 0;
+    let db = Arc::new(Database::with_config(Arc::new(cfg)).await?);
+    db.cancel_maintenance();
+    // The reader has the writer's routing coverage, as a recovered process would.
+    writer.rollup_coverage.iter().for_each(|entry| drop(db.rollup_coverage.insert(entry.key().clone(), entry.value().clone())));
+    writer.rollup_slice_coverage.iter().for_each(|entry| drop(db.rollup_slice_coverage.insert(entry.key().clone(), entry.value().clone())));
+    let mut ctx = Arc::clone(&db).create_session_context();
+    db.setup_session_context(&mut ctx)?;
+    let cache = db.object_store_cache().expect("foyer enabled").clone();
+    let hybrids = || crate::observability::maintenance_stats().rollup_hits_hybrid.load(std::sync::atomic::Ordering::Relaxed);
+    let sql = format!(
+        "SELECT time_bucket('1 minute', timestamp), COUNT(*) FROM otel_logs_and_spans \
+         WHERE project_id = '{project}' AND timestamp >= now() - interval '1 hour' GROUP BY 1"
+    );
+    let read = async || -> Result<(u64, u64, u64)> {
+        let (before, hits) = (cache.runtime_stats(), hybrids());
+        ctx.sql(&sql).await?.collect().await?;
+        let after = cache.runtime_stats();
+        Ok((hybrids() - hits, after.stats.main.inner_bytes_read - before.stats.main.inner_bytes_read, after.insert_bypassed - before.insert_bypassed))
+    };
+    let (hybrid, first_bytes, first_bypassed) = read().await?;
+    assert_eq!(hybrid, 1, "the dashboard must route as a hybrid, or it proves nothing");
+    assert!(first_bytes > 0, "the first view must fetch from the store");
+    assert_eq!(first_bypassed, 0, "a 1h hybrid's raw fringes must admit what they fetched");
+    assert_eq!(read().await?.1, 0, "the second view of a hybrid dashboard must be served entirely from cache");
+    Ok(())
+}
+
 #[serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_batch_queue_under_load() -> Result<()> {
@@ -9682,7 +9732,7 @@ async fn dirty_dedup_drain_yields_to_unhealthy_flush() -> Result<()> {
 }
 
 /// `date = '…'` and `BETWEEN` bound a scan even though
-/// `extract_time_range_from_filters` cannot see them, so enforce mode must accept them.
+/// `filters_time_range` cannot see them, so enforce mode must accept them.
 #[test_case(col("date").eq(lit("2026-08-10")) => true ; "a date partition equality bounds the scan")]
 #[test_case(col("timestamp").between(lit(1_i64), lit(2_i64)) => true ; "BETWEEN on timestamp bounds the scan")]
 #[test_case(col("timestamp").not_between(lit(1_i64), lit(2_i64)) => false ; "NOT BETWEEN reaches outside the range")]
