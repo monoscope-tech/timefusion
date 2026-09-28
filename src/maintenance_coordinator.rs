@@ -38,6 +38,18 @@ pub struct CoarsenReport {
     pub over_budget: usize,
     /// Buckets that fit ONLY because members sharing a file set were charged once.
     pub priced_by_footprint: usize,
+    /// Rollup candidates whose fused unit's priced state would exceed half the pool.
+    pub over_state: usize,
+}
+
+/// A fused rollup unit's row-priced state (`None`: no prior output) and the pool it
+/// must leave room in.
+pub type StatePricing<'a> = (&'a dyn Fn(&TaskKey) -> Option<u64>, u64);
+
+/// Room for no sibling: the bound [`TaskJournal::split_state_task`] splits above and
+/// coarsening never fuses above. `None` (no prior output) never exceeds it.
+fn state_over_half(row_priced_state: Option<u64>, state_capacity: u64) -> bool {
+    row_priced_state.is_some_and(|state| state > state_capacity / 2)
 }
 
 impl CoarsenReport {
@@ -1159,18 +1171,27 @@ impl TaskJournal {
     /// holds; `None` keeps the plain summed behaviour, for callers without
     /// storage access.
     pub fn coarsen_sealed_slices_capped(&mut self, now_micros: i64, partition_bytes: &dyn Fn(&str, &str, &str) -> Option<u64>) -> CoarsenReport {
+        self.coarsen_sealed_slices_priced(now_micros, partition_bytes, (&|_| None, u64::MAX))
+    }
+
+    /// `coarsen_sealed_slices_capped`, also refusing a rollup fusion that its
+    /// priced state would split again.
+    pub fn coarsen_sealed_slices_priced(
+        &mut self, now_micros: i64, partition_bytes: &dyn Fn(&str, &str, &str) -> Option<u64>, state: StatePricing<'_>,
+    ) -> CoarsenReport {
         // SUBSUME before fusing: fusion cannot touch a bucket a wider pending
         // unit already covers, so on its own it leaves exactly the redundancy it
         // exists to remove.
         let subsumed = self.subsume_covered_units(now_micros);
         let mut report = CoarsenReport { subsumed, ..Default::default() };
         for &width in COARSEN_WIDTHS.iter() {
-            let stage = self.coarsen_to_width_reporting(width, now_micros, partition_bytes);
+            let stage = self.coarsen_to_width_reporting(width, now_micros, partition_bytes, state);
             report.fused += stage.fused;
             report.candidates += stage.candidates;
             report.blocked += stage.blocked;
             report.over_budget += stage.over_budget;
             report.priced_by_footprint += stage.priced_by_footprint;
+            report.over_state += stage.over_state;
         }
         report
     }
@@ -1231,7 +1252,9 @@ impl TaskJournal {
     /// strictly-narrower sealed unit in a bucket into one unit of `width`, when
     /// the bucket's estimate fits `MAX_DECODED_BYTES` and nothing at least that
     /// wide already covers it.
-    fn coarsen_to_width_reporting(&mut self, width: i64, now_micros: i64, partition_bytes: &dyn Fn(&str, &str, &str) -> Option<u64>) -> CoarsenReport {
+    fn coarsen_to_width_reporting(
+        &mut self, width: i64, now_micros: i64, partition_bytes: &dyn Fn(&str, &str, &str) -> Option<u64>, (state_price, state_capacity): StatePricing<'_>,
+    ) -> CoarsenReport {
         let bucket_of = |start: i64| start.div_euclid(width) * width;
         // DAMAGE REPAIR IS NEVER COARSENED: a repair unit is sized to one file's
         // uncovered span, so fusing it destroys the only work that can close
@@ -1306,8 +1329,14 @@ impl TaskJournal {
             report.priced_by_footprint += usize::from(fits && price.summed_bytes > MAX_DECODED_BYTES);
             if !fits {
                 report.over_budget += price.members;
+                return false;
             }
-            fits
+            let (physical_table, source, project_id, operation, bucket) = group.clone();
+            let over_state = matches!(operation, Operation::BaseRollup | Operation::DerivedRollup)
+                && TimeSlice::new(bucket, bucket.saturating_add(width))
+                    .is_ok_and(|slice| state_over_half(state_price(&TaskKey { physical_table, source, project_id, slice, operation }), state_capacity));
+            report.over_state += if over_state { price.members } else { 0 };
+            !over_state
         });
         if groups.is_empty() {
             return report;
@@ -2353,7 +2382,7 @@ impl TaskJournal {
     pub fn split_state_task(
         &mut self, key: &TaskKey, row_priced_state: Option<u64>, state_capacity: u64, input_bytes: u64, input: Option<InputFootprint>, live: &[(i64, i64)],
     ) -> bool {
-        row_priced_state.is_some_and(|state| state > state_capacity / 2) && self.split_task(key, SplitTrigger::State(input_bytes), input, live)
+        state_over_half(row_priced_state, state_capacity) && self.split_task(key, SplitTrigger::State(input_bytes), input, live)
     }
 
     fn split_task(&mut self, key: &TaskKey, trigger: SplitTrigger, input: Option<InputFootprint>, live: &[(i64, i64)]) -> bool {
@@ -5910,6 +5939,31 @@ mod tests {
         // Deprioritised, never abandoned: with a slot it still takes its turn, or a
         // partition whose rollup is genuinely expensive never gains coverage at all.
         assert_eq!(journal.claim_next(Operation::BaseRollup, 0, true).expect("quarantined work still runs").key, key);
+    }
+
+    /// Coarsening never fuses a rollup unit its priced state would split again: the
+    /// widest fusion whose state fits half the pool wins, and with no prior output
+    /// nothing blocks. Capacity is in hours of prior output; returns (units, minutes).
+    #[test_case::test_case(None, true => (1, 24 * 60) ; "unbounded fuses the day")]
+    #[test_case::test_case(Some(12), true => (4, 6 * 60) ; "a day over half the pool stops at six hours")]
+    #[test_case::test_case(Some(2), true => (24, 60) ; "six hours over half the pool stops at an hour")]
+    #[test_case::test_case(Some(1), true => (144, 10) ; "nothing fits so nothing fuses")]
+    #[test_case::test_case(Some(1), false => (1, 24 * 60) ; "no prior output never blocks")]
+    fn coarsening_never_fuses_past_half_the_state_pool(capacity_hours: Option<u64>, prior: bool) -> (usize, i64) {
+        let (_dir, mut journal) = new_journal();
+        let day = 3 * DAY_MICROS;
+        for slot in 0..144 {
+            let start = day + slot * NORMAL_SLICE_MICROS;
+            journal.upsert(task("p", start, start + NORMAL_SLICE_MICROS, Operation::BaseRollup).tap_mut(|unit| unit.estimated_decoded_bytes = 1));
+        }
+        let hour = 3_600_000_000;
+        let published: Vec<_> = (0..24).map(|h| ((day + h * hour, day + (h + 1) * hour), 1_000)).collect();
+        let price = |key: &TaskKey| prior.then(|| rollup_state_bytes(1, prior_output_rows(published.iter().copied(), key.slice), 0));
+        let capacity = capacity_hours.map_or(u64::MAX, |hours| hours * rollup_state_bytes(1, Some(1_000), 0));
+        journal.coarsen_sealed_slices_priced(10 * DAY_MICROS, &|_, _, _| None, (&price, capacity));
+        let widths = live_widths(&journal, Operation::BaseRollup);
+        assert!(widths.iter().all(|&width| width == widths[0]), "one width per case: {widths:?}");
+        (widths.len(), widths[0] / MIN_SLICE_MICROS)
     }
 
     /// Footprint-less shred debris carries WHOLE-FILE estimates, so its sum grows

@@ -2360,6 +2360,12 @@ impl Database {
         Self::add_tag(add, crate::maintenance_coordinator::TAG_PROJECT)
     }
 
+    /// The `(slice, output rows)` a published rollup file carries, which is what
+    /// [`crate::maintenance_coordinator::prior_output_rows`] prices from.
+    fn published_rows(add: &deltalake::kernel::Add) -> Option<((i64, i64), u64)> {
+        Some((Self::slice_tag_range(add)?, Self::add_tag(add, crate::maintenance_coordinator::TAG_OUTPUT_ROWS)?.parse().ok()?))
+    }
+
     /// The slice of `add`, when it is the same project's and STRICTLY wider than
     /// `key`'s — the condition that makes publishing `key` a double count, since
     /// the replace-set only removes files CONTAINED in the slice.
@@ -3109,11 +3115,7 @@ impl Database {
             };
             let project_adds = || live_adds.iter().filter(|add| Self::tag_project(add) == Some(key.project_id.as_str()));
             live_slices = project_adds().filter_map(Self::slice_tag_range).collect();
-            prior_rows = crate::maintenance_coordinator::prior_output_rows(
-                project_adds()
-                    .filter_map(|add| Some((Self::slice_tag_range(add)?, Self::add_tag(add, crate::maintenance_coordinator::TAG_OUTPUT_ROWS)?.parse().ok()?))),
-                key.slice,
-            );
+            prior_rows = crate::maintenance_coordinator::prior_output_rows(project_adds().filter_map(Self::published_rows), key.slice);
             if let Some(covering) = live_adds.iter().find_map(|add| Self::covering_slice_for(add, &key))
                 && self.settle_covered_by_wider(&key, covering, (source_rows, source_epoch), &from_table, witness_table.as_ref(), date).await?
             {
@@ -4381,14 +4383,41 @@ impl Database {
                 let Ok(stats) = Self::partition_stats_bounded(&table, tiebreak_of(&source), &|_, _| i64::MAX) else { continue };
                 ceilings.extend(stats.into_iter().map(|(partition, stat)| (partition, stat.bytes)));
             }
+            // Each tier's prior output per project, from its live tags, so a fusion is
+            // priced exactly as the runner will price the fused unit.
+            // (sketches, [(slice, output rows)]) per (tier, project).
+            type Published = (usize, Vec<((i64, i64), u64)>);
+            let mut published: HashMap<(String, String), Published> = HashMap::new();
+            for source in crate::schema::registry().list_tables() {
+                for spec in get_schema(&source).map(|schema| schema.rollups.clone()).unwrap_or_default() {
+                    let tier = spec.table_name(&source);
+                    let Ok(table_ref) = self.resolve_table("default", &tier).await else { continue };
+                    let table = table_ref.read().await;
+                    let Ok(snapshot) = table.snapshot() else { continue };
+                    for add in snapshot.log_data().iter().map(|file| add_action(&file)) {
+                        if let (Some(project), Some(rows)) = (Self::tag_project(&add), Self::published_rows(&add)) {
+                            published.entry((tier.clone(), project.to_owned())).or_insert_with(|| (spec.sketches(), Vec::new())).1.push(rows);
+                        }
+                    }
+                }
+            }
+            let state_price = |key: &crate::maintenance_coordinator::TaskKey| {
+                let (sketches, rows) = published.get(&(key.physical_table.clone(), key.project_id.clone()))?;
+                let prior = crate::maintenance_coordinator::prior_output_rows(rows.iter().copied(), key.slice)?;
+                Some(crate::maintenance_coordinator::rollup_state_bytes(*sketches, Some(prior), 0))
+            };
             let report = {
                 let mut journal = self.journal();
                 // Shed finished work whose slice the scheduler has abandoned;
                 // every commit serializes the whole task set.
                 journal.prune_retired_history(crate::support::now_micros(), self.config.maintenance.timefusion_rollup_backfill_days);
-                let report = journal.coarsen_sealed_slices_capped(crate::support::now_micros(), &|project, _source, date| {
-                    ceilings.get(&(project.to_string(), date.to_string())).or_else(|| ceilings.get(&("default".to_string(), date.to_string()))).copied()
-                });
+                let report = journal.coarsen_sealed_slices_priced(
+                    crate::support::now_micros(),
+                    &|project, _source, date| {
+                        ceilings.get(&(project.to_string(), date.to_string())).or_else(|| ceilings.get(&("default".to_string(), date.to_string()))).copied()
+                    },
+                    (&state_price, self.maintenance_admission.state_capacity()),
+                );
                 if report.total() != 0 {
                     // `checkpoint`, not `compact`: `JournalRecord::Removed` lets the
                     // cheap append express a deletion.
@@ -4402,6 +4431,7 @@ impl Database {
                 candidates = report.candidates,
                 blocked = report.blocked,
                 over_budget = report.over_budget,
+                over_state = report.over_state,
                 priced_by_footprint = report.priced_by_footprint,
                 event = "maintenance_sealed_slices_coarsened"
             );
