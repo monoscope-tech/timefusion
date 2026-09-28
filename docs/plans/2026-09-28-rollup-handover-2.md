@@ -100,8 +100,8 @@ All shipped with CI green on the exact commit. Names match the workstream sheet.
 ## 7. Tools and locations
 
 - Prod pgwire: `grep TIMEFUSION_PG_URL ../monoscope/.env`. Host: `ssh ubuntu@captain.s.past3.tech`, service `srv-captain--timefusion`.
-- Probe script (18 shapes × 3 projects, with rollup counter deltas): `~/Projects/apitoolkit/tf-ops-scripts/probe.sh`.
-- Scorecard and gated push: `~/Projects/apitoolkit/tf-ops-scripts/{scorecard.sh,gated_push.sh,gated_push_b.sh}` (outside the repo; `scorecard.log` holds past readings). Usage: `gated_push.sh <branch> <worktree> "YYYY-MM-DD HH:MM"`; the `_b` variant reads CI from `$CIB`.
+- Probe script (18 shapes × 3 projects, with rollup counter deltas): `~/Projects/apitoolkit/tf-helper-scripts/probe.sh`.
+- Scorecard and gated push: `~/Projects/apitoolkit/tf-helper-scripts/{scorecard.sh,gated_push.sh,gated_push_b.sh}`; scorecard history is in `scorecard.log`. Usage: `gated_push.sh <branch> <worktree> "YYYY-MM-DD HH:MM"`; the `_b` variant reads CI from `$CIB`.
 - Collaborating sessions:
   - timefusion-2e: certification, read path, W47, W46.
   - timefusion-7c: pricing, waiter, W29, drop-v3, v4 fallback.
