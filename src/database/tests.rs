@@ -1954,6 +1954,49 @@ async fn an_overlapping_chain_leaves_its_disjoint_slices_proven() -> Result<()> 
     Ok(())
 }
 
+/// `count(<expr>)` skips the rows where `<expr>` is NULL, so only `count(*)`/`count(<non-null
+/// literal>)` may read the stored row count; any other non-column argument must decline.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_count_of_a_nullable_expression_is_not_served_as_the_row_count() -> Result<()> {
+    const HOUR: i64 = 3_600_000_000;
+    let db = Arc::new(Database::with_config(rollup_backfill_config("count-expr", 35)).await?);
+    db.cancel_maintenance();
+    let project = format!("cnt_{}", uuid::Uuid::new_v4().simple());
+    let day = (Utc::now() - chrono::Duration::days(3)).date_naive();
+    let day_start = midnight_micros(day);
+    insert_hourly_spans(&db, &project, day_start, 0..24).await?;
+    db.run_unit_once("otel_logs_and_spans", &project, day, crate::maintenance_coordinator::Operation::BaseRollup, 24, 0, None).await?;
+
+    let mut ctx = Arc::clone(&db).create_session_context();
+    db.setup_session_context(&mut ctx)?;
+    let noon = day_start + 12 * HOUR;
+    let render = |batches: &[RecordBatch]| arrow::util::pretty::pretty_format_batches(batches).map(|table| table.to_string());
+    use crate::rollup::MissReason::MissingMeasure;
+    for (arg, want) in [
+        ("*", Ok(true)),
+        ("1", Ok(true)),
+        ("duration", Ok(true)),
+        (&*format!("CASE WHEN timestamp < to_timestamp_micros({noon}) THEN 1 END"), Err(MissingMeasure)),
+        ("nullif(name, 'op')", Err(MissingMeasure)),
+        ("CAST(NULL AS INT)", Err(MissingMeasure)),
+        ("status_code", Err(MissingMeasure)),
+        // The optimizer rewrites a lone DISTINCT into a GROUP BY the matcher never claims.
+        ("DISTINCT name", Ok(false)),
+    ] {
+        let sql = format!(
+            "SELECT count({arg}) AS c FROM otel_logs_and_spans WHERE project_id = '{project}' \
+             AND timestamp >= to_timestamp_micros({day_start}) AND timestamp < to_timestamp_micros({})",
+            day_start + 24 * HOUR
+        );
+        let state = ctx.state();
+        let plan = state.optimize(&state.create_logical_plan(&sql).await?)?;
+        let routed = db.rollup_sql(&plan, &state).await.map(|rewrite| rewrite.is_some());
+        assert_eq!(render(&ctx.sql(&sql).await?.collect().await?)?, render(&db.query_delta_only(&sql).await?)?, "count({arg}) must answer as raw");
+        assert_eq!(routed, want, "count({arg})");
+    }
+    Ok(())
+}
+
 /// A non-derived 1h tier is built from 10-minute slices, and each slice stamps its
 /// PARTIAL state with the bucket start under a slice-blind `id`, so the tier read's
 /// `(timestamp, id)` dedup keeps one partial per bucket. Routing it undercounts.

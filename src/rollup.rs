@@ -2038,7 +2038,14 @@ async fn route_with_spec(
             // to the measure declared as exactly that conjunction.
             let filter = canonical_and(function.params.filter.iter().flat_map(|filter| split_conjunction(filter.as_ref())).chain(promotable.iter().copied()));
             let name = function.func.name().to_ascii_lowercase();
-            let column = function.params.args.first().and_then(column_name).map(str::to_string);
+            // Measures are declared over a bare column or none; `count(<expr>)`
+            // skips the rows where `<expr>` is NULL, so only a non-null literal
+            // (`count(*)`) may read the row count.
+            let column = match function.params.args.first().map(unaliased) {
+                None => None,
+                Some(Expr::Literal(value, _)) if !value.is_null() => None,
+                Some(arg) => Some(column_name(arg).ok_or(MissReason::MissingMeasure)?.to_string()),
+            };
             // Under `col IS NOT NULL`, `count(*) ≡ count(col)`. The guard is set
             // aside rather than pushed, so neither leg re-applies it and the
             // rewritten measure skips exactly the rows the predicate excluded.
