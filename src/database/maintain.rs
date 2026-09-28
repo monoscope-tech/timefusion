@@ -7359,11 +7359,24 @@ impl Database {
     /// rollup-declaring table: its cron drain is skipped and its dirty bins retired, so
     /// only a coordinator Dedup unit rewrites it. Bins a drain group already holds are
     /// excluded by the caller; they go back through that drain.
+    ///
+    /// A date wholly before the backfill horizon mints nothing: no rollup is built there, so
+    /// its removal is lease time nothing needs. It is still probed (a clean one earns a grant
+    /// reads can use), and the decline memo keeps it from being re-probed until a commit.
     fn mint_declined_bins(&self, table_name: &str, project: &str, date: &str, bins: impl Iterator<Item = i64>) {
-        use crate::maintenance_coordinator::{Operation, TaskKey, TimeSlice};
+        use crate::maintenance_coordinator::{DAY_MICROS, Operation, TaskKey, TimeSlice, backfill_horizon_start_micros};
         let width = crate::database::compact::bin_micros();
+        let horizon = backfill_horizon_start_micros(crate::support::now_micros(), self.config.maintenance.timefusion_rollup_backfill_days);
+        let out_of_horizon = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
+            .ok()
+            .and_then(day_start_micros)
+            .is_some_and(|start| start.saturating_add(DAY_MICROS) <= horizon);
         let minted = match get_schema(table_name) {
             _ if is_rollup_tier(table_name) => 0,
+            _ if out_of_horizon => {
+                metrics::counter!(scan_metric_names::CERT_DECLINE_OUT_OF_HORIZON).increment(1);
+                0
+            }
             Some(schema) if !schema.rollups.is_empty() => {
                 let now = crate::support::now_micros();
                 let mut journal = self.journal();

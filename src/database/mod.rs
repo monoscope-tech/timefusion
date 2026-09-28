@@ -301,6 +301,8 @@ pub mod scan_metric_names {
         // Removal units minted for a decline's dirty bins (coordinator Dedup units, or
         // dirty-bin queue entries on tables without rollups).
         CERT_DECLINE_UNITS_MINTED = "timefusion.scan.cert_decline_units_minted" as scan.cert_decline_units_minted;
+        // Declined dates older than the rollup backfill horizon, which mint no removal.
+        CERT_DECLINE_OUT_OF_HORIZON = "timefusion.scan.cert_decline_out_of_horizon" as scan.cert_decline_out_of_horizon;
         // A certify-only decline re-probed against the fingerprint it was memoised under.
         // Must stay 0: `known_dirty` filters those dates out before the probe.
         CERT_DECLINE_REMINT_SAME_FP = "timefusion.scan.cert_decline_remint_same_fp" as scan.cert_decline_remint_same_fp;

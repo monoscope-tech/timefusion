@@ -9118,6 +9118,46 @@ async fn a_probe_declined_sealed_date_is_deduped_then_certified() -> Result<()> 
     Ok(())
 }
 
+/// A decline older than the backfill horizon mints no removal: nothing reads a rollup
+/// there, so its units are lease time spent on nothing. In-horizon declines still mint.
+#[tokio::test]
+async fn a_probe_declined_date_past_the_backfill_horizon_mints_nothing() -> Result<()> {
+    use crate::maintenance_coordinator::{Operation, TaskState};
+    use crate::observability::counter_value;
+    crate::observability::init_local_metrics_for_test();
+    let (db, project) = dirty_bin_db("certify-declined-horizon").await?;
+    db.cancel_maintenance();
+    let (_, recent) = sealed_noon();
+    let old = recent - i64::from(db.config.maintenance.timefusion_rollup_backfill_days + 9) * 86_400_000_000;
+    for ts in [recent, old] {
+        for observed in ["first", "second"] {
+            insert_otel_ts(&db, &project, "dup", observed, ts, true).await?;
+        }
+    }
+    let pending_dedup = || {
+        db.journal()
+            .tasks()
+            .filter(|task| task.key.project_id == project && task.key.operation == Operation::Dedup && task.state == TaskState::Pending)
+            .map(|task| (task.key.slice.start_micros, task.key.slice.end_micros))
+            .collect::<Vec<_>>()
+    };
+    let pending: Vec<_> =
+        db.journal().tasks().filter(|task| task.key.project_id == project && task.state == TaskState::Pending).map(|task| task.key.clone()).collect();
+    pending.iter().for_each(|key| assert!(db.journal().complete(key)));
+    db.dedup_dirty_bins.clear();
+    let table = otel_unified_table(&db).await;
+    let names = [scan_metric_names::CERT_PROBE_DECLINED, scan_metric_names::CERT_DECLINE_UNITS_MINTED, scan_metric_names::CERT_DECLINE_OUT_OF_HORIZON];
+    let before = names.map(counter_value);
+
+    db.run_certification_pass(&table, "otel_logs_and_spans", std::time::Instant::now() + std::time::Duration::from_secs(60)).await;
+
+    let width = crate::database::compact::bin_micros();
+    let bin = recent.div_euclid(width) * width;
+    assert_eq!(pending_dedup(), [(bin, bin + width)], "only the in-horizon decline mints, one unit per bin");
+    assert_eq!(names.map(counter_value), [before[0] + 2, before[1] + 1, before[2] + 1], "both dates are probed and declined; one mints");
+    Ok(())
+}
+
 /// Slice-scoped evidence (`certify_files_within_slice`: `fp: 0`, stale) never had a
 /// day fingerprint, so a window it cannot prove is denied as slice-only, not fp-moved.
 #[tokio::test]
