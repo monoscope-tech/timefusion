@@ -552,9 +552,19 @@ impl ProjectRoutingTable {
         // Per-FILE split, tried only where the per-DATE one did not claim the
         // window: within an uncertified date, files a sweep proved clean can still
         // skip when no uncertified file overlaps them.
-        let (certified_files, uncertified_files) = query_time_range
+        let split = query_time_range
             .filter(|_| !skip_dedup && per_date_dates.is_empty() && !dedup_keys.is_empty())
             .map_or_else(Default::default, |window| self.database.certified_file_split(&table, project_id, &self.table_name, window));
+        // Key-level restriction: `blocked` proved files leave the dedup side, and only their
+        // rows whose key a blocker holds re-enter it. `None` = today's per-file split.
+        let key_set = match split.blocked.is_empty() {
+            true => None,
+            false => self.blocker_key_set(&table, state, &split.blockers, dedup_keys).await?,
+        };
+        let (certified_files, uncertified_files) = match &key_set {
+            Some(_) => (split.skip, &split.dedup - &split.blocked),
+            None => (split.skip, split.dedup),
+        };
         if skip_dedup && readmit_mutable_filters {
             let mutable = Self::version_mutable_columns(&self.table_name);
             let leg_safe = |f: &Expr| {
@@ -570,11 +580,14 @@ impl ProjectRoutingTable {
         // over the borrowed restriction sets.
         macro_rules! scan_side {
             ($dates:expr, $files:expr) => {
+                scan_side!(&delta_only_filters, $dates, $files)
+            };
+            ($filters:expr, $dates:expr, $files:expr) => {
                 self.scan_delta_with_tantivy(
                     &table,
                     state,
                     projection,
-                    &delta_only_filters,
+                    $filters,
                     eff_limit,
                     tantivy_id_filter,
                     tantivy_covered_files,
@@ -587,16 +600,29 @@ impl ProjectRoutingTable {
                 )
             };
         }
-        let mut plans =
-            scan_side!((!per_date_dates.is_empty()).then_some(&uncertified_dates), (!certified_files.is_empty()).then_some(&uncertified_files)).await?;
+        let restrict_dedup_side = !certified_files.is_empty() || key_set.is_some();
+        let mut plans = scan_side!((!per_date_dates.is_empty()).then_some(&uncertified_dates), restrict_dedup_side.then_some(&uncertified_files)).await?;
         // Returned separately so the caller can union the certified side ABOVE
         // DedupExec instead of feeding it through.
-        let certified_plans = match (per_date_dates.is_empty(), certified_files.is_empty()) {
+        let mut certified_plans = match (per_date_dates.is_empty(), certified_files.is_empty()) {
             (true, true) => Vec::new(),
             (by_date_empty, _) => scan_side!((!by_date_empty).then_some(&per_date_dates), (!certified_files.is_empty()).then_some(&certified_files)).await?,
         };
+        if let Some(keys) = key_set {
+            let keyed = |plans: Vec<Arc<dyn ExecutionPlan>>, members: bool| {
+                plans.into_iter().map(|p| Arc::new(crate::read::KeyFilterExec::new(p, keys.clone(), members)) as Arc<dyn ExecutionPlan>).collect::<Vec<_>>()
+            };
+            // The member half can only hold rows inside a blocker's span; bounding the
+            // re-read by those spans keeps it from decoding the blocked files twice.
+            if !keys.is_empty() {
+                let narrowed: Vec<Expr> = delta_only_filters.iter().cloned().chain(blocker_span_filter(split.blockers.values().copied())).collect();
+                plans.extend(keyed(scan_side!(&narrowed, None, Some(&split.blocked)).await?, true));
+            }
+            certified_plans.extend(keyed(scan_side!(None, Some(&split.blocked)).await?, false));
+            metrics::counter!(scan_metric_names::DEDUP_KEY_RESTRICT_SCANS).increment(1);
+        }
         if !certified_plans.is_empty() {
-            let metric = if certified_files.is_empty() { scan_metric_names::DEDUP_SKIPPED_PER_DATE } else { scan_metric_names::DEDUP_SKIPPED_PER_FILE };
+            let metric = if per_date_dates.is_empty() { scan_metric_names::DEDUP_SKIPPED_PER_FILE } else { scan_metric_names::DEDUP_SKIPPED_PER_DATE };
             metrics::counter!(metric).increment(1);
         }
         // Both sides of a split can prune to nothing (e.g. every file a zero-hit under the
@@ -609,6 +635,44 @@ impl ProjectRoutingTable {
             plans.push(Arc::new(datafusion::physical_plan::empty::EmptyExec::new(schema)));
         }
         Ok((skip_dedup, plans, certified_plans))
+    }
+
+    /// The dedup keys the blocker files hold, read at plan time with no filters: a superset
+    /// of the keys any blocker row reaching `DedupExec` can carry, which is all soundness
+    /// needs. `None` (counted) when more than `max_keys` rows would have to be read, or a
+    /// blocker cannot be located; the caller then keeps today's per-file split.
+    async fn blocker_key_set(
+        &self, table: &DeltaTable, state: &dyn Session, blockers: &HashMap<String, crate::read::FileSpan>, dedup_keys: &[String],
+    ) -> DFResult<Option<Arc<crate::read::KeySet>>> {
+        let fallback = || {
+            metrics::counter!(scan_metric_names::DEDUP_KEY_RESTRICT_FALLBACKS).increment(1);
+            Ok(None)
+        };
+        let cap = self.database.config.maintenance.timefusion_read_dedup_key_restrict_max_keys;
+        let uris: HashSet<String> = table
+            .get_file_uris()
+            .map_err(|e| DataFusionError::External(Box::new(e)))?
+            .filter(|u| crate::tantivy::search::parquet_rel_of_uri(u).is_some_and(|rel| blockers.contains_key(rel)))
+            .collect();
+        if uris.len() != blockers.len() {
+            return fallback();
+        }
+        let mut batches = Vec::new();
+        if !uris.is_empty() {
+            let projection = dedup_keys.iter().map(|k| self.schema.index_of(k)).collect::<Result<Vec<_>, _>>()?;
+            let plan = self.scan_delta_table(table, state, Some(&projection), &[], Some(cap.saturating_add(1)), Some(&uris), None, None).await?;
+            let mut stream = datafusion::physical_plan::execute_stream(plan, state.task_ctx())?;
+            let mut rows = 0usize;
+            while let Some(batch) = futures::StreamExt::next(&mut stream).await {
+                let batch = batch?;
+                rows += batch.num_rows();
+                if rows > cap {
+                    return fallback();
+                }
+                batches.push(batch);
+            }
+        }
+        Ok(Some(Arc::new(crate::read::KeySet::from_batches(dedup_keys.to_vec(), &batches)?)))
     }
 
     /// Shared tail of the Delta scan: projection-index translation into the
@@ -1938,6 +2002,27 @@ impl TableProvider for ProjectRoutingTable {
         use crate::read::LegKind;
         wrap_result(std::iter::once((mem_plan, LegKind::Mem)).chain(delta_plans.into_iter().map(|p| (p, LegKind::Delta))).collect())
     }
+}
+
+/// `timestamp` bounded to the union of `spans` (inclusive), or `None` when a span is
+/// unknown. Past `MAX_RANGES` disjoint ranges it widens to their hull, keeping the
+/// predicate small; wider only means more rows reach the exact key filter.
+fn blocker_span_filter(spans: impl IntoIterator<Item = crate::read::FileSpan>) -> Option<Expr> {
+    const MAX_RANGES: usize = 16;
+    let mut spans = spans.into_iter().collect::<Option<Vec<(i64, i64)>>>()?;
+    spans.sort_unstable();
+    let mut merged: Vec<(i64, i64)> = Vec::with_capacity(spans.len());
+    for (lo, hi) in spans {
+        match merged.last_mut() {
+            Some(last) if lo <= last.1 => last.1 = last.1.max(hi),
+            _ => merged.push((lo, hi)),
+        }
+    }
+    if merged.len() > MAX_RANGES {
+        merged = vec![(merged[0].0, merged.iter().map(|r| r.1).max()?)];
+    }
+    let ts = |t: i64| lit(ScalarValue::TimestampMicrosecond(Some(t), Some("UTC".into())));
+    merged.into_iter().map(|(lo, hi)| col("timestamp").gt_eq(ts(lo)).and(col("timestamp").lt_eq(ts(hi)))).reduce(Expr::or)
 }
 
 #[cfg(test)]

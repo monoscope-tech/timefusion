@@ -183,6 +183,11 @@ pub(crate) fn skippable_certified_files<'a>(certified: impl IntoIterator<Item = 
     skippable.into_iter().map(|(path, _)| path).collect()
 }
 
+/// Could two files share a row timestamp? Spans are inclusive; a missing span overlaps everything.
+pub(crate) fn spans_overlap(a: FileSpan, b: FileSpan) -> bool {
+    a.zip(b).is_none_or(|((alo, ahi), (blo, bhi))| alo <= bhi && blo <= ahi)
+}
+
 /// Why an uncertified file holds back a certified file's per-file dedup skip.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, strum::IntoStaticStr)]
 #[strum(serialize_all = "snake_case")]
@@ -247,6 +252,124 @@ impl ExecutionPlan for CompactBatchesExec {
     fn execute(&self, partition: usize, context: Arc<TaskContext>) -> DFResult<SendableRecordBatchStream> {
         let stream = futures::TryStreamExt::map_ok(self.0.execute(partition, context)?, crate::write::mem_buffer::compact_batch);
         Ok(datafusion::physical_plan::coop::make_cooperative(Box::pin(RecordBatchStreamAdapter::new(self.schema(), stream))))
+    }
+}
+
+/// The dedup keys held by a scan's blocker files, order-encoded with the column types
+/// they were read as.
+#[derive(Debug)]
+pub struct KeySet {
+    keys: Vec<String>,
+    types: Vec<DataType>,
+    set: SeenSet,
+}
+
+impl KeySet {
+    /// Encode every row of `batches`, whose columns are exactly `keys` in order.
+    pub fn from_batches(keys: Vec<String>, batches: &[RecordBatch]) -> DFResult<Self> {
+        let Some(first) = batches.first() else { return Ok(Self { keys, types: Vec::new(), set: SeenSet::default() }) };
+        let types: Vec<DataType> = first.schema().fields().iter().map(|f| f.data_type().clone()).collect();
+        let conv = key_converter(&types)?;
+        let mut set = SeenSet::default();
+        for batch in batches {
+            let rows = conv.convert_columns(batch.columns()).map_err(arrow_err)?;
+            set.extend(rows.iter().map(|row| row.data().into()));
+        }
+        Ok(Self { keys, types, set })
+    }
+
+    pub fn len(&self) -> usize {
+        self.set.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.set.is_empty()
+    }
+}
+
+fn key_converter(types: &[DataType]) -> DFResult<RowConverter> {
+    RowConverter::new(types.iter().map(|t| SortField::new(t.clone())).collect()).map_err(arrow_err)
+}
+
+/// Keeps the rows of a PROVED file whose dedup key is (`members`) or is not (`!members`)
+/// in a [`KeySet`] — the two halves of the key-level dedup restriction.
+///
+/// A proved file holds at most one row per key and every other version of its rows lies
+/// in an overlapping unproved file (the per-file skip's span argument), so a proved row
+/// whose key no such file holds is its own dedup winner and may bypass `DedupExec`. The
+/// member half goes through `DedupExec` with the unproved files. Equality is the
+/// row-encoded equality `DedupExec` itself groups by, so the halves partition the input.
+#[derive(derive_more::Debug)]
+#[debug("KeyFilterExec: keys={} members={members}", keys.len())]
+pub struct KeyFilterExec {
+    input: Arc<dyn ExecutionPlan>,
+    keys: Arc<KeySet>,
+    members: bool,
+    metrics: ExecutionPlanMetricsSet,
+}
+
+impl KeyFilterExec {
+    pub fn new(input: Arc<dyn ExecutionPlan>, keys: Arc<KeySet>, members: bool) -> Self {
+        Self { input, keys, members, metrics: ExecutionPlanMetricsSet::new() }
+    }
+}
+
+impl DisplayAs for KeyFilterExec {
+    fn fmt_as(&self, _: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "KeyFilterExec: keys={}, keep={}", self.keys.len(), if self.members { "members" } else { "non-members" })
+    }
+}
+
+impl ExecutionPlan for KeyFilterExec {
+    no_physical_exprs!();
+    fn name(&self) -> &'static str {
+        "KeyFilterExec"
+    }
+    fn properties(&self) -> &Arc<PlanProperties> {
+        self.input.properties()
+    }
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
+    }
+    fn maintains_input_order(&self) -> Vec<bool> {
+        vec![true]
+    }
+    fn with_new_children(self: Arc<Self>, mut children: Vec<Arc<dyn ExecutionPlan>>) -> DFResult<Arc<dyn ExecutionPlan>> {
+        Ok(Arc::new(Self::new(children.swap_remove(0), self.keys.clone(), self.members)))
+    }
+    fn execute(&self, partition: usize, context: Arc<TaskContext>) -> DFResult<SendableRecordBatchStream> {
+        let schema = self.input.schema();
+        let idxs = self.keys.keys.iter().map(|k| schema.index_of(k)).collect::<Result<Vec<_>, _>>()?;
+        let conv = key_converter(&self.keys.types)?;
+        let (keys, members) = (self.keys.clone(), self.members);
+        let baseline = BaselineMetrics::new(&self.metrics, partition);
+        let stream = self.input.execute(partition, context)?.map(move |batch| {
+            let batch = batch?;
+            let _timer = baseline.elapsed_compute().timer();
+            // An empty key set was read with no columns to type it by: nothing is a member.
+            let mask: BooleanArray = match keys.types.is_empty() {
+                true => std::iter::repeat_n(Some(!members), batch.num_rows()).collect(),
+                false => {
+                    let cols = idxs
+                        .iter()
+                        .zip(&keys.types)
+                        .map(|(&i, t)| datafusion::arrow::compute::cast(batch.column(i), t))
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(arrow_err)?;
+                    let rows = conv.convert_columns(&cols).map_err(arrow_err)?;
+                    rows.iter().map(|row| Some(keys.set.contains(row.data()) == members)).collect()
+                }
+            };
+            let out = filter_record_batch(&batch, &mask).map_err(arrow_err)?;
+            if !members {
+                metrics::counter!(scan_metric_names::DEDUP_KEY_RESTRICT_PASSTHROUGH_ROWS).increment(out.num_rows() as u64);
+            }
+            Ok(out.record_output(&baseline))
+        });
+        Ok(datafusion::physical_plan::coop::make_cooperative(Box::pin(RecordBatchStreamAdapter::new(schema, stream))))
+    }
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
     }
 }
 

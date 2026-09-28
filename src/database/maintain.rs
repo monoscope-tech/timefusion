@@ -4732,32 +4732,42 @@ impl Database {
     /// Split a window's live Delta files into the ones that may skip
     /// `DedupExec` and the ones that may not.
     ///
-    /// The two sets partition the window's in-window files exactly once, letting the
-    /// caller union the certified leg ABOVE the dedup. Both are RELATIVE paths
-    /// (`parquet_rel_of_uri`).
+    /// `skip` and `dedup` partition the window's in-window files exactly once, letting the
+    /// caller union the skip leg ABOVE the dedup. All paths are RELATIVE (`parquet_rel_of_uri`).
     ///
-    /// Returns `(empty, empty)` when the feature is off or the window cannot be
-    /// enumerated; the caller must read that as "no split", never as "nothing
-    /// certified".
-    pub(crate) fn certified_file_split(
-        &self, table: &DeltaTable, project_id: &str, table_name: &str, (lo, hi): (i64, i64),
-    ) -> (HashSet<String>, HashSet<String>) {
-        let empty = (HashSet::new(), HashSet::new());
-        if !self.config.maintenance.timefusion_read_dedup_skip_per_file {
-            return empty;
+    /// With `timefusion_read_dedup_key_restrict` on, `blocked` names the proved files held
+    /// in `dedup` only by an overlapping unproved file, and `blockers` those unproved files:
+    /// the only files that can hold another version of a `blocked` row (see
+    /// [`crate::read::KeyFilterExec`]). Both are empty with the flag off.
+    ///
+    /// Returns the default (all empty) when the feature is off or the window cannot be
+    /// enumerated; the caller must read that as "no split", never as "nothing certified".
+    pub(crate) fn certified_file_split(&self, table: &DeltaTable, project_id: &str, table_name: &str, (lo, hi): (i64, i64)) -> FileSplit {
+        let maint = &self.config.maintenance;
+        if !maint.timefusion_read_dedup_skip_per_file {
+            return FileSplit::default();
         }
-        let Some(dates) = window_dates(lo, hi) else { return empty };
-        let (mut certified, mut uncertified) = (HashSet::new(), HashSet::new());
+        // The blocker argument is a SPAN argument: sound only while every version of a row
+        // shares its timestamp.
+        let restrict = maint.timefusion_read_dedup_key_restrict && schema_or_default(table_name).dedup_keys.iter().any(|k| k == "timestamp");
+        let Some(dates) = window_dates(lo, hi) else { return FileSplit::default() };
+        let mut split = FileSplit::default();
         for date in dates {
             let date = date.to_string();
-            let Ok(spans) = Self::partition_file_spans(table, project_id, &format!("date={date}")) else { return empty };
-            let skippable = self.certified_files_in_partition(table, project_id, table_name, &date);
-            for rel in spans.into_keys() {
-                (if skippable.contains(&rel) { &mut certified } else { &mut uncertified }).insert(rel);
+            let Some((skippable, certified, uncertified)) = self.per_file_skip_partition(table, project_id, table_name, &date) else {
+                return FileSplit::default();
+            };
+            if restrict {
+                let blocked: Vec<crate::read::FileSpan> = certified.iter().filter(|(rel, _)| !skippable.contains(rel)).map(|(_, span)| *span).collect();
+                split.blocked.extend(certified.iter().filter(|(rel, _)| !skippable.contains(rel)).map(|(rel, _)| rel.clone()));
+                split.blockers.extend(uncertified.iter().filter(|(_, span)| blocked.iter().any(|b| crate::read::spans_overlap(*span, *b))).cloned());
+            }
+            for (rel, _) in certified.into_iter().chain(uncertified) {
+                (if skippable.contains(&rel) { &mut split.skip } else { &mut split.dedup }).insert(rel);
             }
         }
-        // A populated `uncertified` alone would be read as a restriction.
-        if certified.is_empty() { empty } else { (certified, uncertified) }
+        // A populated `dedup` alone would be read as a restriction.
+        if split.skip.is_empty() && split.blocked.is_empty() { FileSplit::default() } else { split }
     }
 
     /// The live files of one date partition that a certification still vouches
@@ -4769,18 +4779,31 @@ impl Database {
     ///
     /// Returns the RELATIVE paths (`parquet_rel_of_uri`) that may skip, or an empty set
     /// when nothing qualifies. Soundness lives in `read::skippable_certified_files`.
+    #[cfg(test)]
     pub(crate) fn certified_files_in_partition(&self, table: &DeltaTable, project_id: &str, table_name: &str, date: &str) -> HashSet<String> {
+        self.per_file_skip_partition(table, project_id, table_name, date).map(|(skippable, ..)| skippable).unwrap_or_default()
+    }
+
+    /// `certified_files_in_partition` plus the partition's live files, with spans, split
+    /// into proved (`certified`) and unproved. `None` when uncertified or unreadable.
+    #[allow(clippy::type_complexity)]
+    fn per_file_skip_partition(
+        &self, table: &DeltaTable, project_id: &str, table_name: &str, date: &str,
+    ) -> Option<(HashSet<String>, Vec<(String, crate::read::FileSpan)>, Vec<(String, crate::read::FileSpan)>)> {
         let key = (project_id.to_string(), table_name.to_string(), date.to_string());
-        let Some(cert) = self.dedup_clean_fp.get(&key).map(|entry| entry.value().clone()) else { return HashSet::new() };
-        let Ok(spans) = Self::partition_file_spans(table, project_id, &format!("date={date}")) else { return HashSet::new() };
+        let spans = Self::partition_file_spans(table, project_id, &format!("date={date}")).ok()?;
+        let Some(cert) = self.dedup_clean_fp.get(&key).map(|entry| entry.value().clone()) else {
+            return Some((HashSet::new(), Vec::new(), spans.into_iter().collect()));
+        };
         // A path the certification names but that `spans` no longer holds was compacted
         // away; it cannot vouch for its replacement, so it drops out of the certified side.
-        let Ok((_, visibility)) = Self::logical_count_partition_snapshot(table, project_id, date) else { return HashSet::new() };
+        let (_, visibility) = Self::logical_count_partition_snapshot(table, project_id, date).ok()?;
         let proved: HashSet<&str> = cert.files.iter().filter(|(path, dv)| visibility.get(*path) == Some(*dv)).map(|(path, _)| path.as_str()).collect();
         let (certified, uncertified): (Vec<_>, Vec<_>) = spans.iter().map(|(rel, span)| (rel.as_str(), *span)).partition(|(rel, _)| proved.contains(rel));
         let skippable = crate::read::skippable_certified_files(certified.iter().copied(), &uncertified.iter().map(|(_, span)| *span).collect::<Vec<_>>());
         Self::attribute_skip_blockers(table, &cert.files, &certified, &skippable, &uncertified, [project_id, table_name, date]);
-        skippable.into_iter().map(str::to_string).collect()
+        let owned = |files: Vec<(&str, crate::read::FileSpan)>| files.into_iter().map(|(rel, span)| (rel.to_string(), span)).collect::<Vec<_>>();
+        Some((skippable.into_iter().map(str::to_string).collect(), owned(certified), owned(uncertified)))
     }
 
     /// Classify every uncertified file that holds back a certified one (see
@@ -4789,10 +4812,9 @@ impl Database {
         table: &DeltaTable, proof: &crate::read::CountFiles, certified: &[(&str, crate::read::FileSpan)], skippable: &HashSet<&str>,
         uncertified: &[(&str, crate::read::FileSpan)], [project_id, table_name, date]: [&str; 3],
     ) {
-        let overlaps = |a: crate::read::FileSpan, b: crate::read::FileSpan| a.zip(b).is_none_or(|((alo, ahi), (blo, bhi))| alo <= bhi && blo <= ahi);
         let blocked: Vec<crate::read::FileSpan> = certified.iter().filter(|(path, _)| !skippable.contains(path)).map(|(_, span)| *span).collect();
         let blockers: HashMap<&str, crate::read::FileSpan> =
-            uncertified.iter().filter(|(_, span)| blocked.iter().any(|b| overlaps(*span, *b))).copied().collect();
+            uncertified.iter().filter(|(_, span)| blocked.iter().any(|b| crate::read::spans_overlap(*span, *b))).copied().collect();
         if blockers.is_empty() {
             return;
         }
@@ -12698,4 +12720,13 @@ mod rollup_relevance_tests {
             .sorted()
             .collect()
     }
+}
+
+/// One scan window's per-file dedup split; see [`Database::certified_file_split`].
+#[derive(Debug, Default)]
+pub(crate) struct FileSplit {
+    pub skip: HashSet<String>,
+    pub dedup: HashSet<String>,
+    pub blocked: HashSet<String>,
+    pub blockers: HashMap<String, crate::read::FileSpan>,
 }

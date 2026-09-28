@@ -2135,6 +2135,19 @@ pub struct MaintenanceConfig {
     /// touching.
     #[serde_inline_default(true)]
     pub timefusion_read_dedup_skip_per_file: bool,
+    /// KEY-level refinement of the per-file skip (DARK). A proved file blocked only by
+    /// overlapping unproved files sends through `DedupExec` just the rows whose dedup key
+    /// occurs in those files; the rest bypass it.
+    ///
+    /// SOUNDNESS: the proved set holds at most one row per key, and every other version
+    /// of a proved row lies in an overlapping unproved file, so a proved row whose key is
+    /// in none of them is its own dedup winner.
+    #[serde(default)]
+    pub timefusion_read_dedup_key_restrict: bool,
+    /// Upper bound on blocker rows read to build a scan's key set; above it the scan
+    /// falls back to the plain per-file split (`dedup_key_restrict_fallbacks`).
+    #[serde_inline_default(200_000)]
+    pub timefusion_read_dedup_key_restrict_max_keys: usize,
     /// Dedup-as-you-compact: the on-demand compaction path (`compact_date`)
     /// upgrades its SortBy rewrite to SortByDedup, collapsing superseded
     /// merge-on-read versions. No-op while `timefusion_optimize_sort_by` is off
