@@ -3204,14 +3204,18 @@ impl Database {
         let hash_shards = estimated_bytes.div_ceil(MAX_DECODED_BYTES).max(1);
         anyhow::ensure!(hash_shards <= 65_536, "one-minute slice needs {hash_shards} hash shards; maximum is 65536");
         let per_shard_bytes = estimated_bytes.div_ceil(hash_shards).max(1);
-        let Some(_permit) = self.maintenance_admission.try_acquire_for(
+        let now = crate::support::now_micros();
+        let _permit = match self.maintenance_admission.acquire(
             Resources { cpu: 1, decoded_bytes: per_shard_bytes, state_bytes, object_reads: 1, object_writes: 1 },
             crate::maintenance_coordinator::AdmissionLane::Rollup,
             self.admission_memory(),
-        ) else {
+            Some(crate::maintenance_coordinator::StateRequester::for_task(&key, now)),
+            now,
+        ) {
+            Ok(permit) => permit,
             // Transient, never "too big to admit": the shard count above was chosen so
             // `per_shard_bytes <= MAX_DECODED_BYTES`, and state clamps to its capacity.
-            return retry("admission_busy".to_owned(), self.admission_backoff_for(&key));
+            Err(refused) => return retry(format!("admission_busy:{refused}"), self.admission_backoff_for(&key)),
         };
         let mut fingerprint_items = selected.clone();
         fingerprint_items.sort_unstable();
@@ -4208,8 +4212,9 @@ impl Database {
         let clamped = task.estimated_decoded_bytes.clamp(1, MAX_DECODED_BYTES);
         let request = Resources { cpu: Self::admission_cpu_cost(clamped), decoded_bytes: clamped, object_reads: 1, object_writes: 1, ..Resources::default() };
         let lane = if operation == Operation::HotPacking { AdmissionLane::Hot } else { AdmissionLane::Other };
-        let Some(_permit) = self.maintenance_admission.try_acquire_for(request, lane, self.admission_memory()) else {
-            return self.retried(&key, "admission_busy".to_owned(), self.admission_backoff_for(&key));
+        let _permit = match self.maintenance_admission.acquire(request, lane, self.admission_memory(), None, crate::support::now_micros()) {
+            Ok(permit) => permit,
+            Err(refused) => return self.retried(&key, format!("admission_busy:{refused}"), self.admission_backoff_for(&key)),
         };
         note(2);
         let table_ref = match self.resolve_table(&key.project_id, &key.source).await {

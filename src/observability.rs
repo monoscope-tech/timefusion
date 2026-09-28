@@ -562,6 +562,11 @@ pub fn init_metrics(
         maintenance_stats().maintenance_admission_refused_state_bytes.load(Relaxed)
     );
     observe!(counter
+        "timefusion.maintenance.admission_refused_state_waiter",
+        "Rollup reservations refused because another unit holds the state waiter reservation",
+        maintenance_stats().maintenance_admission_refused_state_waiter.load(Relaxed)
+    );
+    observe!(counter
         "timefusion.maintenance.admission_refused_object_reads",
         "Maintenance reservations refused because object-read tokens were exhausted",
         maintenance_stats().maintenance_admission_refused_object_reads.load(Relaxed)
@@ -1709,6 +1714,8 @@ atomic_stats! {
         maintenance_admission_refused_object_reads as "admission_refused_object_reads_total",
         maintenance_admission_refused_object_writes as "admission_refused_object_writes_total",
         maintenance_admission_refused_state_bytes as "admission_refused_state_bytes_total",
+        /// Refused only because another unit holds the state waiter reservation.
+        maintenance_admission_refused_state_waiter as "admission_refused_state_waiter_total",
         /// Aggregates that fell through to a raw scan, plus the breakdown by reason —
         /// the reason is the only thing that distinguishes "never built" from "the
         /// source moved under it" from "unsupported shape".

@@ -3180,6 +3180,70 @@ struct AdmissionState {
     cpu_base: u32,
     /// `None` while `timefusion_maintenance_query_yield` is off.
     query_yield: Option<QueryYield>,
+    /// The part of `used.state_bytes` held by frontier units, which alone may use the reserve.
+    frontier_state: u64,
+    waiter: Option<StateWaiter>,
+}
+
+/// A rollup unit refused state, holding a claim on the pool as it drains: small
+/// units always fit in what is left, so without one a whale is admitted only when
+/// the pool happens to empty (prod: a 24h slice retried ~19 times, never ran).
+#[derive(Clone, Copy, Debug)]
+struct StateWaiter {
+    id: u64,
+    state_bytes: u64,
+    last_seen_micros: i64,
+}
+
+/// A waiter that stopped retrying (completed elsewhere, cancelled, restarted) lapses
+/// after this; live ones retry every few seconds via `admission_backoff_for`.
+pub const STATE_WAITER_STALE_MICROS: i64 = 120 * 1_000_000;
+
+/// Share of the state pool (1/N) only frontier units may use, so a waiting or running
+/// whale never stalls dashboard freshness. A tenth of prod's ~26 GiB is ~3.7 of the
+/// ~0.7 GiB ten-minute cells measured 2026-09-27.
+const FRONTIER_STATE_RESERVE_DIVISOR: u64 = 10;
+
+/// Who is asking for rollup state: an identity to hold the waiter reservation, and
+/// whether it is live-frontier work entitled to the reserve.
+#[derive(Clone, Copy, Debug)]
+pub struct StateRequester {
+    pub id: u64,
+    pub frontier: bool,
+}
+
+impl StateRequester {
+    pub fn for_task(key: &TaskKey, now_micros: i64) -> Self {
+        use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
+        Self { id: BuildHasherDefault::<DefaultHasher>::default().hash_one(key), frontier: is_live_frontier(key.slice, now_micros) }
+    }
+}
+
+/// The dimensions that refused an admission, for the `admission_busy:<dims>` retry reason.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Refused(u8);
+
+impl Refused {
+    const NAMES: [&str; 7] = ["cpu", "decoded", "state", "state_waiter", "reads", "writes", "memory"];
+    pub const CPU: Self = Self(1);
+    pub const DECODED: Self = Self(1 << 1);
+    pub const STATE: Self = Self(1 << 2);
+    pub const STATE_WAITER: Self = Self(1 << 3);
+    pub const READS: Self = Self(1 << 4);
+    pub const WRITES: Self = Self(1 << 5);
+    pub const MEMORY: Self = Self(1 << 6);
+
+    fn add(&mut self, dim: Self, stat: Option<&std::sync::atomic::AtomicU64>) {
+        self.0 |= dim.0;
+        stat.map(|stat| stat.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+    }
+}
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let names: Vec<_> = Self::NAMES.iter().enumerate().filter(|(bit, _)| self.0 & (1 << bit) != 0).map(|(_, name)| *name).collect();
+        f.write_str(&names.join("+"))
+    }
 }
 
 impl AdmissionState {
@@ -3350,7 +3414,7 @@ impl AdmissionController {
         stats.maintenance_state_bytes_capacity.store(capacity.state_bytes, Relaxed);
         stats.maintenance_object_read_tokens_capacity.store(u64::from(capacity.object_reads), Relaxed);
         stats.maintenance_object_write_tokens_capacity.store(u64::from(capacity.object_writes), Relaxed);
-        Self(Arc::new(Mutex::new(AdmissionState { capacity, used: Resources::default(), cpu_base, query_yield: None })))
+        Self(Arc::new(Mutex::new(AdmissionState { capacity, used: Resources::default(), cpu_base, query_yield: None, frontier_state: 0, waiter: None })))
     }
 
     pub fn enable_query_yield(&self) {
@@ -3384,12 +3448,20 @@ impl AdmissionController {
     }
 
     pub fn try_acquire_for(&self, request: Resources, lane: AdmissionLane, memory: crate::config::MemorySnapshot) -> Option<AdmissionPermit> {
+        self.acquire(request, lane, memory, None, crate::support::now_micros()).ok()
+    }
+
+    /// [`Self::try_acquire_for`] naming what refused; a `requester` may hold the state waiter.
+    pub fn acquire(
+        &self, request: Resources, lane: AdmissionLane, memory: crate::config::MemorySnapshot, requester: Option<StateRequester>, now_micros: i64,
+    ) -> Result<AdmissionPermit, Refused> {
         use std::sync::atomic::Ordering::Relaxed;
 
         let stats = crate::observability::maintenance_stats();
+        let mut refused = Refused::default();
         if request.decoded_bytes > MAX_DECODED_BYTES {
-            stats.maintenance_admission_refused_decoded_bytes.fetch_add(1, Relaxed);
-            return None;
+            refused.add(Refused::DECODED, Some(&stats.maintenance_admission_refused_decoded_bytes));
+            return Err(refused);
         }
         let mut state = lock(&self.0);
         // Scale the CPU dimension by measured starvation, and hold back a slice
@@ -3411,19 +3483,18 @@ impl AdmissionController {
             AdmissionLane::Hot | AdmissionLane::Other => global_ceiling.saturating_sub(reserved).max(1),
         };
         let used = state.used();
-        let mut refused = false;
         // A unit priced above the lane's whole ceiling runs ALONE, never NEVER:
         // size-priced CPU (one token per 64 MiB of decode) can exceed a small
         // box's ceiling, and unclamped it would starve that unit forever — the
         // tiny-box CI shard did exactly that, retrying admission_busy until the
         // test gave up. Clamped HERE, after lag-scaling and the lane reserve,
         // because those are what actually bind.
-        // Rollup state likewise: a unit priced above the whole state capacity
-        // waits until nothing else holds state, then runs alone.
-        let request = Resources { cpu: request.cpu.min(lane_ceiling), state_bytes: request.state_bytes.min(state.capacity.state_bytes), ..request };
+        // Rollup state likewise: a unit priced above everything outside the frontier
+        // reserve waits for the rest of the pool to drain, then runs beside the frontier.
+        let reserve = state.capacity.state_bytes / FRONTIER_STATE_RESERVE_DIVISOR;
+        let request = Resources { cpu: request.cpu.min(lane_ceiling), state_bytes: request.state_bytes.min(state.capacity.state_bytes - reserve), ..request };
         if used.cpu.saturating_add(request.cpu) > lane_ceiling {
-            stats.maintenance_admission_refused_cpu.fetch_add(1, Relaxed);
-            refused = true;
+            refused.add(Refused::CPU, Some(&stats.maintenance_admission_refused_cpu));
         }
         // The decoded-bytes ceiling is the one dimension that SHARES the box's
         // spare memory. Its static share was 23 GiB on a 120 GiB machine and it
@@ -3433,35 +3504,60 @@ impl AdmissionController {
         let decoded_ceiling = crate::config::elastic_decoded_capacity(state.capacity.decoded_bytes, memory);
         let decoded_available = decoded_ceiling.saturating_sub(state.used.decoded_bytes);
         if request.decoded_bytes > occupancy_scaled_ceiling(decoded_available, decoded_ceiling) || request.decoded_bytes > decoded_available {
-            stats.maintenance_admission_refused_decoded_bytes.fetch_add(1, Relaxed);
-            refused = true;
+            refused.add(Refused::DECODED, Some(&stats.maintenance_admission_refused_decoded_bytes));
         }
         let available = state.available();
-        if request.state_bytes > available.state_bytes {
-            stats.maintenance_admission_refused_state_bytes.fetch_add(1, Relaxed);
-            refused = true;
+        let frontier = requester.is_some_and(|r| r.frontier);
+        let (id, wants_state) = (requester.map(|r| r.id), request.state_bytes > 0);
+        state.waiter = state.waiter.filter(|w| now_micros.saturating_sub(w.last_seen_micros) <= STATE_WAITER_STALE_MICROS);
+        let other_waiter = state.waiter.as_mut().filter(|_| wants_state).and_then(|w| {
+            if Some(w.id) == id {
+                w.last_seen_micros = now_micros;
+                None
+            } else {
+                Some(w.state_bytes)
+            }
+        });
+        // While another unit waits, frontier units may use only what its claim leaves
+        // and everything else is refused, so the pool drains down to that claim.
+        match other_waiter {
+            Some(claim) if !frontier || state.frontier_state.saturating_add(request.state_bytes).saturating_add(claim) > state.capacity.state_bytes => {
+                refused.add(Refused::STATE_WAITER, Some(&stats.maintenance_admission_refused_state_waiter));
+            }
+            _ => {}
+        }
+        let class_room =
+            if frontier { available.state_bytes } else { (state.capacity.state_bytes - reserve).saturating_sub(used.state_bytes - state.frontier_state) };
+        if request.state_bytes > available.state_bytes.min(class_room) {
+            refused.add(Refused::STATE, Some(&stats.maintenance_admission_refused_state_bytes));
+            if let Some(id) = id.filter(|_| !frontier && used.state_bytes > 0 && state.waiter.is_none()) {
+                state.waiter = Some(StateWaiter { id, state_bytes: request.state_bytes, last_seen_micros: now_micros });
+            }
         }
         let yielded = lane != AdmissionLane::Hot && state.query_yield.is_some_and(|y| used.object_reads.saturating_add(request.object_reads) > y.ceiling);
         if request.object_reads > available.object_reads || yielded {
-            stats.maintenance_admission_refused_object_reads.fetch_add(1, Relaxed);
-            refused = true;
+            refused.add(Refused::READS, Some(&stats.maintenance_admission_refused_object_reads));
         }
         if request.object_writes > available.object_writes {
-            stats.maintenance_admission_refused_object_writes.fetch_add(1, Relaxed);
-            refused = true;
+            refused.add(Refused::WRITES, Some(&stats.maintenance_admission_refused_object_writes));
         }
         if lane == AdmissionLane::Rollup && !crate::config::rollup_memory_admits(memory) {
             crate::observability::record_rollup_memory_refusal();
-            refused = true;
+            refused.add(Refused::MEMORY, None);
         }
-        if refused {
-            return None;
+        if refused != Refused::default() {
+            return Err(refused);
+        }
+        if state.waiter.is_some_and(|w| Some(w.id) == id) {
+            state.waiter = None;
         }
         // Every field was checked above; failure is now an internal invariant,
         // not an unclassified admission refusal.
         state.used = state.used.saturating_add(request);
+        let frontier_state = if frontier { request.state_bytes } else { 0 };
+        state.frontier_state += frontier_state;
         Self::publish_utilization(&state);
-        Some(AdmissionPermit { controller: self.clone(), resources: request })
+        Ok(AdmissionPermit { controller: self.clone(), resources: request, frontier_state })
     }
 
     pub fn state_capacity(&self) -> u64 {
@@ -3488,12 +3584,14 @@ impl AdmissionController {
 pub struct AdmissionPermit {
     controller: AdmissionController,
     resources: Resources,
+    frontier_state: u64,
 }
 
 impl Drop for AdmissionPermit {
     fn drop(&mut self) {
         let mut state = lock(&self.controller.0);
         state.used = resources_zip!(saturating_sub, state.used, self.resources);
+        state.frontier_state -= self.frontier_state;
         AdmissionController::publish_utilization(&state);
     }
 }
@@ -6720,6 +6818,7 @@ mod tests {
     #[test_case::test_case("resource_admission" => true ; "a static over-budget estimate still splits")]
     #[test_case::test_case("resource_exhausted" => true ; "the worker canonical reason retains capacity semantics")]
     #[test_case::test_case("admission_busy" => false ; "a transient busy pool must back off, not multiply the queue")]
+    #[test_case::test_case("admission_busy:state+state_waiter" => false ; "naming the refusing dimension keeps it transient")]
     #[test_case::test_case(
         "dedup: Not enough memory to continue external sort. Consider increasing the memory limit config: \
          'datafusion.runtime.memory_limit', or decreasing the config: 'datafusion.execution.sort_spill_reservation_bytes'."
@@ -7104,10 +7203,57 @@ mod tests {
         assert!(acquire(500).is_none(), "an over-capacity unit waits while others hold state");
         drop(first);
         let alone = acquire(500).expect("and then runs alone rather than never");
-        assert_eq!(admission.utilization().state_bytes, 100, "clamped to capacity, so it holds the whole pool");
+        assert_eq!(admission.utilization().state_bytes, 90, "clamped to all but the frontier reserve");
         assert!(acquire(1).is_none());
         drop(alone);
         assert_eq!(admission.utilization(), Resources::default(), "the clamped charge is what is released");
+    }
+
+    /// Capacity 100, frontier reserve 10; `id` names the unit, `frontier` its class.
+    fn state_pool() -> impl Fn(u64, u64, bool, i64) -> Result<AdmissionPermit, Refused> {
+        let admission = AdmissionController::with_decoded_capacity(64, 64, u64::MAX, 100, 64, 64);
+        move |state_bytes, id, frontier, now| {
+            let unit = Resources { cpu: 1, state_bytes, ..Resources::default() };
+            admission.acquire(unit, AdmissionLane::Rollup, crate::config::MemorySnapshot::unknown(), Some(StateRequester { id, frontier }), now)
+        }
+    }
+
+    /// Small backfill units always fit in what is left, so without a claim the whale
+    /// is admitted only when the pool happens to empty — in prod, never.
+    #[test]
+    fn a_state_waiter_drains_backfill_while_the_frontier_keeps_flowing() {
+        let ask = state_pool();
+        let held = ask(20, 1, false, 0).expect("an empty pool admits");
+        assert_eq!(ask(500, 99, false, 0).err(), Some(Refused::STATE), "the whale waits, and claims the pool as it drains");
+        assert_eq!(ask(20, 2, false, 1).err(), Some(Refused::STATE_WAITER), "backfill that fits still queues behind the claim");
+        assert!(ask(0, 3, false, 1).is_ok(), "state-free units never notice");
+        let frontier: Vec<_> = (10..12).map(|id| ask(5, id, true, 1).expect("frontier cells use what the claim leaves")).collect();
+        assert_eq!(ask(5, 12, true, 1).err(), Some(Refused::STATE_WAITER), "but not the claim itself");
+        drop(held);
+        let _whale = ask(500, 99, false, 2).expect("the whale runs beside the frontier trickle");
+        drop(frontier);
+        assert!(ask(5, 13, true, 3).is_ok(), "the reservation cleared on admission and the reserve still serves the frontier");
+        assert_eq!(ask(5, 4, false, 3).err(), Some(Refused::STATE), "while backfill cannot touch the reserve");
+    }
+
+    #[test]
+    fn a_state_waiter_that_stops_retrying_lapses() {
+        let ask = state_pool();
+        let _held = ask(20, 1, false, 0).expect("an empty pool admits");
+        assert_eq!(ask(500, 99, false, 0).err(), Some(Refused::STATE));
+        assert_eq!(ask(500, 99, false, STATE_WAITER_STALE_MICROS).err(), Some(Refused::STATE), "a retry refreshes the claim");
+        assert_eq!(ask(20, 2, false, STATE_WAITER_STALE_MICROS + 1).err(), Some(Refused::STATE_WAITER));
+        assert!(ask(20, 2, false, 2 * STATE_WAITER_STALE_MICROS + 1).is_ok(), "a vanished waiter cannot block the lane");
+    }
+
+    #[test]
+    fn a_refusal_names_its_dimensions() {
+        let admission = AdmissionController::with_decoded_capacity(1, 1, u64::MAX, 100, 64, 64);
+        let unit = |cpu, state_bytes| Resources { cpu, state_bytes, ..Resources::default() };
+        let acquire = |resources| admission.acquire(resources, AdmissionLane::Rollup, crate::config::MemorySnapshot::unknown(), None, 0);
+        let _held = acquire(unit(1, 50)).expect("an empty pool admits");
+        let refusals = [unit(1, 0), unit(0, 50), unit(1, 50)].map(|r| acquire(r).err().map(|refused| refused.to_string()));
+        assert_eq!(refusals, [Some("cpu".into()), Some("state".into()), Some("cpu+state".into())]);
     }
 
     /// THE correctness argument for `rank`'s memo, as one property.

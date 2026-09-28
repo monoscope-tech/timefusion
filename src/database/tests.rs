@@ -1598,7 +1598,7 @@ async fn rollup_unit_waits_for_output_state_room_then_runs_alone() -> Result<()>
         crate::config::MemorySnapshot::unknown(),
     );
     let blocked = run().await?;
-    assert_eq!((blocked.state, blocked.retry_reason.as_deref()), (Some(TaskState::Retry), Some("admission_busy")), "must wait while other state is held");
+    assert_eq!((blocked.state, blocked.retry_reason.as_deref()), (Some(TaskState::Retry), Some("admission_busy:state")), "must wait while other state is held");
     drop(held);
     let alone = run().await?;
     assert_eq!(alone.state, Some(TaskState::Complete), "and run alone once it is not: {:?}", alone.retry_reason);
