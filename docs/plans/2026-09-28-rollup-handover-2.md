@@ -112,3 +112,26 @@ All shipped with CI green on the exact commit. Names match the workstream sheet.
   - `ws/drop-v3`
   - `ws/sessions` work (none)
   - `ws/w28-service-hll` (a duplicate of `e0e27dbe`; delete it)
+
+## 8. Update 2026-09-28 ~21:30 UTC (timefusion-21)
+
+**Plan gate, measured (indicative, not an accepted pass).** The 09-27 12:00–18:00 baseline has 3 deploys inside it, and the maintenance counters (added 09-26 22:28) have no clean ≥2 h window before 09-28. "After" window: 09-28 14:00–18:00 on image `59af0721` (started 11:38, no deploy). Query volume matched (~52.7k/h).
+
+| Per million ingested rows | Before | After | Change | Baseline |
+|---|---|---|---|---|
+| Whole-container CPU-seconds | 21,723 (09-25 14–18, image `2f2df90c`) | 4,137 | 5.3x lower (32.8 → 5.8 cores) | clean |
+| Maintenance processed bytes | 133.5 GB (09-27) | 9.9 GB | ~13x lower (11x without Dedup) | restarts inside |
+| Maintenance lease-seconds | 16,189 (09-27) | 963 | ~17x lower | restarts inside |
+
+- The "about 127x" in section 2 came from a young process; the matched-hours figure is ~11–13x.
+- The backlog did not fall in the window (pending base 350 → 386). Part of the CPU drop is deferred scope: the v4 week cap, the per-tier backfill cap (16), and the paused sessions tiers. So "less work per accepted event" is not yet shown.
+- `maintenance.processed_bytes{operation=Dedup}` reads 0 since ~08:00 while Dedup still holds lease time: a recording gap. Fix it before a bytes gate can cover Dedup.
+- For a valid gate: keep 09-25 14:00–18:00 as the CPU baseline and re-run "after" on a day with no deploys, the process ≥2 h old by 14:00, and v4 widened.
+- Raw data: `scratchpad/gate/` of session 66d75f9a.
+
+**Rollup misses.** ~88% of `rollup_misses_total` are shapes no tier can serve by design: TF self-alerts on `otel_metrics`, `unnest(hashes)` jobs, `hashes`/`body`-regex filters. On dashboard shapes the hit rate is ~30–35%. Issue 4.1 no longer shows: a 1h window is served from the MemBuffer tail (`tiny_interior`), so `0e003824` only relabels. New bug: `rollup_rewrite_failed stage="schema"` for `max((value)::float)` on `otel_metrics` (Float32 vs Float64), which falls back to raw.
+
+**Shipbubble (28f62f01) 24h dashboards, 3 alternating runs, all hybrid hits:** status breakdown 9.8 s cold, then 1.6 s and 1.4 s; by-service 1.8 s, 1.0 s, 1.0 s. The cold first query is still ~10 s on a 9 h old process, so the remaining cold cost is not the W47 2a bypass. Likely cause (not measured): today's files are rewritten and the new files are cold. W47 2b only warms at boot.
+
+**In flight:** `batch/2b-v4fallback` (`22895ce9` = W47 2b `6e4e9a6e` + `0e003824`), CI run 36481759922. It pushes via `gated_push.sh` when green. v4 widening to 09-14 is due ≥ 2026-09-29 10:00 UTC. Status at 20:48: 7 contiguous days, 104/116 usable; memory 18/120 GiB; `admission_refused_state_bytes_total` 2,143 in 9 h.
+
