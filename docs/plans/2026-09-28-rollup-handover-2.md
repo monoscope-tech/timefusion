@@ -191,3 +191,18 @@ All routed hybrid; `foyer.insert_bypassed` did not move. Script: `scratchpad/shi
 - **Pending:** base 243, derived 39, dedup 108 (was 253 at boot).
 - **Journal lock wait ≈ 18 s/min** on this process against the 9 h pre-deploy process's ≈ 14 s/min. It is not a regression from tonight's batch: `coordinator_claim` runs ~371 claims/s on both (≈ 381/s before), `journal_hold` is only ~7% duty (255 s in 58 min), and the wait total is workers queueing behind the claim path. Worth a look alongside the claim fast path (`ws/claim-poll-fastpath` in the earlier queue).
 
+**Summary for the owner.** The data did not support "the scheduler is not keeping up": shipbubble's slowness came from cache-admission policy (W51), preload throughput (W52) and index-cache sizing (W53), now fixed. But it did find a **missing maintenance operation**: nothing ever strips deletion vectors, so masked rows accumulate (Talstack 74.6% of today's rows, shipbubble 17.5%). Shipbubble's remaining slow case is a lookup into a 2-day-old DV-bearing day: 11 s cold, 2.3 s warm. W54 fixes that class.
+
+**Post-deploy checks at 1 h:**
+- `rollup_misses_total` jumped to ~21/min on the new process. W55 is **not** the cause: `missing_measure` = 8. It is `unknown_filter` (855), the `hashes` issue charts (>1,000 such queries in the hour), plausibly counted more on a young process whose plan cache is cold. Recheck the rate on a mature process.
+- Shipbubble log explorer: 1h listing 0.29 s cold / 0.31 s warm; 24h 0.85 s / 0.34 s. The slow log-explorer statements in the old container were 93/97 Talstack (mostly `hashes`-filtered).
+
+**Morning plan (clock times UTC, 2026-09-29):**
+1. **≥ 10:00:** widen v4 to 09-14 (`ROLLUP RESUME otel_logs_and_spans dashboard_1m_v4 FROM '2026-09-14T00:00:00Z'`), only if `admission_refused_state_bytes_total` is not growing faster than yesterday's ~2,143 per 9 h and memory is < ~40 GiB.
+2. **W54 go/no-go** (owner; review notes in session scratchpad `w54review.md`). If go, deploy the flag-off build **before 11:30**, so the process is ≥ 2 h old by 14:00. Enabling the flag is a separate, later step.
+3. **No code pushes 12:00–18:00** (docs are fine). This protects the plan gate's clean window.
+4. **18:05:** run the gate on 14:00–18:00: CPU against 09-25 14:00–18:00 (clean baseline); processed bytes and lease against 09-27, with the restart caveat stated. Dedup bytes are now real (W50).
+5. After any W54 deploy: re-time shipbubble cold→warm, including a 2-day-old trace lookup. After 2 h, if the flag is enabled, check `dv_strip_plan_sorts_total` = 0 and `dv_rewrite_rows_retired_total` climbing.
+
+**Leave alone:** the claim rate (~371/s is the pre-deploy baseline; commit wait averages 5 ms); the `ordering_pushdown::one_unsorted_file_does_not_cost_the_majority_its_ordering` e2e flake (flaky under load in 4 independent runs; passes alone). Monoscope-side items remain owner decisions: `array_has` lowering, backing off issue-chart auto-refresh after a timeout, and the missing timeout on the issue-page session lookup.
+
