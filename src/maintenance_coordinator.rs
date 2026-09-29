@@ -342,6 +342,11 @@ pub struct MaintenanceTask {
     /// reads it: scheduling escalates on `created_unix_ms`.
     #[serde(default)]
     pub pended_unix_ms: Option<u64>,
+    /// Source ranges whose invalidation armed this rollup unit since it last finished,
+    /// merged. The rest of the slice is rebuilt only because the unit is wider. Empty means
+    /// not invalidation-driven (census hole, backfill): the whole slice is required.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dirty: Vec<(i64, i64)>,
     /// Memoised claim rank — see [`TaskJournal::rank`]. Runtime only.
     #[serde(skip)]
     pub(crate) rank_cache: RankCache,
@@ -372,8 +377,22 @@ impl MaintenanceTask {
             preflight_decoded_bytes: None,
             backfill_priority_micros: None,
             pended_unix_ms: None,
+            dirty: Vec::new(),
             rank_cache: RankCache::default(),
         }
+    }
+
+    /// What this unit must rebuild: its dirt, or the whole slice when it has none.
+    fn required(&self) -> Vec<(i64, i64)> {
+        if self.dirty.is_empty() { vec![(self.key.slice.start_micros, self.key.slice.end_micros)] } else { self.dirty.clone() }
+    }
+
+    /// Merge `ranges`, clipped to the slice, into `dirty`; `true` when it grew.
+    fn add_dirty(&mut self, ranges: impl IntoIterator<Item = (i64, i64)>) -> bool {
+        let slice = self.key.slice;
+        let clipped = ranges.into_iter().map(|(start, end)| (start.max(slice.start_micros), end.min(slice.end_micros))).filter(|(start, end)| start < end);
+        let merged = crate::write::mem_buffer::merge_ranges(self.dirty.iter().copied().chain(clipped).collect());
+        std::mem::replace(&mut self.dirty, merged) != self.dirty
     }
 
     /// Move to `state`, stamping `pended_unix_ms` only when this REOPENS a finished unit.
@@ -466,6 +485,8 @@ struct GroupPrice {
     /// `Default` of 0 would min-fold to the epoch and make every fused unit
     /// permanently the oldest thing in the queue.
     oldest: Option<u64>,
+    /// Every member's [`MaintenanceTask::required`] span.
+    required: Vec<(i64, i64)>,
 }
 
 impl GroupPrice {
@@ -473,6 +494,7 @@ impl GroupPrice {
         self.summed_bytes = self.summed_bytes.saturating_add(task.estimated_decoded_bytes);
         self.members += 1;
         self.oldest = Some(self.oldest.unwrap_or(u64::MAX).min(task.created_unix_ms));
+        self.required.extend(task.required());
         if let Some(input) = task.input {
             self.distinct.insert(input.fp, input);
         } else {
@@ -1390,6 +1412,12 @@ impl TaskJournal {
                 // Only when every member agreed: a fused unit over several file
                 // sets reads their union, which no scalar here can state.
                 input: price.unanimous_input(),
+                // The members' union: whatever the fused width adds is escalation.
+                dirty: if matches!(operation, Operation::BaseRollup | Operation::DerivedRollup) {
+                    crate::write::mem_buffer::merge_ranges(price.required.clone())
+                } else {
+                    Vec::new()
+                },
                 // Inherit the OLDEST member's age, not `now` — `scheduling_class`
                 // escalates on wait time, so a fresh stamp would keep the fused
                 // unit permanently outranked.
@@ -2001,10 +2029,12 @@ impl TaskJournal {
                 if untouched && slice.end_micros <= first_touch && self.task_indices.contains_key(&key) {
                     continue;
                 }
+                let dirt = if untouched || operation == Operation::Dedup { &[][..] } else { touched };
                 if let Some(index) = self.task_indices.get(&key).copied() {
                     let task = &mut self.snapshot.tasks[index];
                     let new_deadline = task.deadline_micros.max(deadline_micros);
-                    let changed = task.state != TaskState::Pending
+                    let changed = task.add_dirty(dirt.iter().copied())
+                        || task.state != TaskState::Pending
                         || task.deadline_micros != new_deadline
                         || task.retry_reason.is_some()
                         || task.publication.is_some()
@@ -2018,7 +2048,8 @@ impl TaskJournal {
                         self.mark_dirty(key);
                     }
                 } else {
-                    let task = MaintenanceTask::pending(key.clone(), deadline_micros, 0, created_unix_ms);
+                    let mut task = MaintenanceTask::pending(key.clone(), deadline_micros, 0, created_unix_ms);
+                    task.add_dirty(dirt.iter().copied());
                     insert_task(&mut self.snapshot.tasks, &mut self.task_indices, task);
                     self.mark_dirty(key);
                 }
@@ -2049,6 +2080,7 @@ impl TaskJournal {
     /// the covering unit fails it retries (or splits) as the superset, and dirt landing after the
     /// claim re-pends through invalidation.
     fn supersede_contained_base_units(&mut self, key: &TaskKey) {
+        let mut absorbed = Vec::new();
         self.edit_tasks(
             |task| {
                 task.key != *key
@@ -2061,10 +2093,18 @@ impl TaskJournal {
                     && task.key.slice.end_micros <= key.slice.end_micros
             },
             |task| {
+                absorbed.extend(task.required());
+                task.dirty.clear();
                 task.state = TaskState::Superseded;
                 task.retry_reason = Some("covered_by_running_base_unit".to_owned());
             },
         );
+        // Only a covering unit that knows its own dirt: an empty one already requires all of it.
+        if let Some(task) = self.task_mut(key).filter(|task| !task.dirty.is_empty())
+            && task.add_dirty(absorbed)
+        {
+            self.mark_dirty(key.clone());
+        }
     }
 
     /// Attempts after which a unit has PROVEN it does not fit its deadline: one timeout is a
@@ -2329,6 +2369,24 @@ impl TaskJournal {
         true
     }
 
+    /// Count a rebuild of `key` as escalated when its slice is wider than the dirt that armed
+    /// it. Rows and bytes outside the dirt are ESTIMATED as the input's time share: the
+    /// input is time-prorated per file, not measured per range.
+    pub fn note_escalation(&self, key: &TaskKey, input_rows: u64, input_bytes: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let Some(task) = self.task(key).filter(|task| !task.dirty.is_empty()) else { return };
+        let (start, end) = (key.slice.start_micros, key.slice.end_micros);
+        let outside: i64 = crate::rollup::uncovered(start, end, task.dirty.clone()).iter().map(|(lo, hi)| hi - lo).sum();
+        if outside <= 0 {
+            return;
+        }
+        let share = |total: u64| (u128::from(total) * outside as u128 / (end - start) as u128) as u64;
+        let stats = crate::observability::maintenance_stats();
+        stats.rollup_escalations.fetch_add(1, Relaxed);
+        stats.rollup_escalated_rows.fetch_add(share(input_rows), Relaxed);
+        stats.rollup_escalated_bytes.fetch_add(share(input_bytes), Relaxed);
+    }
+
     pub fn complete(&mut self, key: &TaskKey) -> bool {
         self.finish(key, None)
     }
@@ -2342,6 +2400,7 @@ impl TaskJournal {
         let Some(task) = self.task_mut(key) else { return false };
         task.state = TaskState::Complete;
         task.retry_reason = None;
+        task.dirty.clear();
         if let Some(publication) = publication {
             task.publication = Some(publication);
         }
@@ -5196,6 +5255,37 @@ mod tests {
         assert_eq!(derived.key.slice.width(), DERIVED_SLICE_MICROS);
         assert_eq!(derived.key.slice.start_micros % DERIVED_SLICE_MICROS, 0);
         assert!(journal.tasks().filter(|task| task.key.operation == Operation::Dedup).all(|task| task.key.slice.width() == NORMAL_SLICE_MICROS));
+    }
+
+    /// A ten-minute write escalates to the derived hour; the unit remembers only the ten minutes,
+    /// and a second write merges into them.
+    #[test]
+    fn a_derived_unit_records_the_dirt_that_armed_it() -> anyhow::Result<()> {
+        let (_dir, mut journal) = new_journal();
+        journal.invalidate(invalidation("derived", NORMAL_SLICE_MICROS, 2 * NORMAL_SLICE_MICROS, 0, true))?;
+        journal.invalidate(invalidation("derived", 2 * NORMAL_SLICE_MICROS, 3 * NORMAL_SLICE_MICROS, 0, true))?;
+        let derived = journal.tasks().find(|task| task.key.operation == Operation::DerivedRollup).expect("derived task");
+        assert_eq!((derived.key.slice.width(), derived.dirty.clone()), (DERIVED_SLICE_MICROS, vec![(NORMAL_SLICE_MICROS, 3 * NORMAL_SLICE_MICROS)]));
+        Ok(())
+    }
+
+    /// Rows and bytes outside the dirt are the input's time share; unknown dirt counts nothing.
+    #[test_case::test_case(&[(3_600, 7_200)], (1, 2_300, 23_000); "one dirty hour in a day")]
+    #[test_case::test_case(&[(0, 86_400)], (0, 0, 0); "the whole day dirty")]
+    #[test_case::test_case(&[], (0, 0, 0); "not invalidation driven")]
+    fn escalation_counts_input_outside_the_dirty_ranges(dirty_secs: &[(i64, i64)], expected: (u64, u64, u64)) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let (_dir, mut journal) = new_journal();
+        let dirty = dirty_secs.iter().map(|&(start, end)| (start * 1_000_000, end * 1_000_000)).collect();
+        let key = upserted(&mut journal, task_in("rollup", "p", 0, 24 * DERIVED_SLICE_MICROS, Operation::BaseRollup).tap_mut(|unit| unit.dirty = dirty));
+        let stats = crate::observability::maintenance_stats();
+        let read = || (stats.rollup_escalations.load(Relaxed), stats.rollup_escalated_rows.load(Relaxed), stats.rollup_escalated_bytes.load(Relaxed));
+        let before = read();
+        journal.note_escalation(&key, 2_400, 24_000);
+        let after = read();
+        assert_eq!((after.0 - before.0, after.1 - before.1, after.2 - before.2), expected);
+        journal.complete(&key);
+        assert!(journal.task(&key).expect("task").dirty.is_empty(), "finishing retires the dirt");
     }
 
     /// The hour migration must not touch a slice WIDER than an hour: its

@@ -657,6 +657,21 @@ pub fn init_metrics(
         "Queued units whose deadline passed and which are not quarantined; derived dependencies may still block some",
         maintenance_stats().maintenance_tasks_due_nonquarantined.load(Relaxed)
     );
+    observe!(counter
+        "timefusion.maintenance.rollup_escalations",
+        "Published rollup rebuilds wider than the invalidated ranges that armed them",
+        maintenance_stats().rollup_escalations.load(Relaxed)
+    );
+    observe!(counter
+        "timefusion.maintenance.rollup_escalated_rows",
+        "Estimated input rows rebuilt outside invalidated ranges (time share of the unit's input)",
+        maintenance_stats().rollup_escalated_rows.load(Relaxed)
+    );
+    observe!(counter
+        "timefusion.maintenance.rollup_escalated_bytes",
+        "Estimated input bytes rebuilt outside invalidated ranges (time share of the unit's input)",
+        maintenance_stats().rollup_escalated_bytes.load(Relaxed)
+    );
     observe!(gauge
         "timefusion.maintenance.oldest_due_unclaimed_age_seconds",
         "Wait of the oldest due, unclaimed, non-quarantined unit since its deadline (reset by every re-arm)",
@@ -1631,6 +1646,14 @@ atomic_stats! {
         rollup_end_to_end_duration_ms as "rollup_end_to_end_duration_ms_total",
         rollup_output_rows as "rollup_output_rows_total",
         rollup_output_files as "rollup_output_files_total",
+        /// Published rebuilds whose slice was wider than the invalidated ranges that armed
+        /// it, and the input rows/bytes outside those ranges. Rows and bytes are ESTIMATED
+        /// as the unit's time-prorated input times the outside share of its width. Units not
+        /// armed by an invalidation (census holes, backfill), resumed publications, and
+        /// witness-only reopens are not counted.
+        rollup_escalations as "rollup_escalations_total",
+        rollup_escalated_rows as "rollup_escalated_rows_total",
+        rollup_escalated_bytes as "rollup_escalated_bytes_total",
         /// Live parquet files the Tantivy manifest does NOT cover, as of the last
         /// reconcile pass, plus the ones skipped for exceeding
         /// TIMEFUSION_TANTIVY_BACKFILL_MAX_FILE_MB. Gauges: each pass overwrites

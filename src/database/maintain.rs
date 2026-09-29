@@ -1668,6 +1668,7 @@ impl Database {
                 preflight_decoded_bytes: None,
                 backfill_priority_micros: None,
                 pended_unix_ms: None,
+                dirty: Vec::new(),
                 rank_cache: Default::default(),
             };
             let mut partitions: HashMap<(String, chrono::NaiveDate), Vec<TailAdd>> = HashMap::new();
@@ -2815,6 +2816,7 @@ impl Database {
             log_store,
             selected,
             estimated_bytes,
+            estimated_rows,
             source_rows,
             source_rows_below,
             partition_identity,
@@ -2862,6 +2864,7 @@ impl Database {
             let mut refused_spans: Vec<Option<(i64, i64)>> = Vec::new();
             let mut selected_spans: Vec<(i64, i64)> = Vec::new();
             let mut estimated = 0u64;
+            let mut estimated_rows = 0u64;
             let mut whole_file_bytes = 0u64;
             let mut content_fp = 0u64;
             for file in snapshot.log_data().iter() {
@@ -2916,6 +2919,7 @@ impl Database {
                 }
                 let (share, projected) = Self::projected_slice_bytes(&add, projected_numerator, projected_denominator, key.slice);
                 estimated = estimated.saturating_add(share);
+                estimated_rows = estimated_rows.saturating_add(add_row_count(&add).map_or(0, |rows| rows.saturating_mul(share) / projected.max(1)));
                 whole_file_bytes = whole_file_bytes.saturating_add(projected);
                 // XOR-folded so file order, which a snapshot does not promise, cannot
                 // change the answer.
@@ -2927,6 +2931,7 @@ impl Database {
                 table.log_store(),
                 selected,
                 estimated,
+                estimated_rows,
                 source_rows,
                 source_rows_below,
                 partition_identity,
@@ -3509,6 +3514,7 @@ impl Database {
                     },
                 );
             }
+            journal.note_escalation(&key, estimated_rows, estimated_bytes);
             journal.publish(&key, publication.clone());
             // A BASE slice just changed under the derived cells built over it, whose
             // witness (the RAW partition) agrees forever on a sealed day. The COVERAGE
