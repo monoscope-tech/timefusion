@@ -301,3 +301,86 @@ All routed hybrid; `foyer.insert_bypassed` did not move. Script: `scratchpad/shi
 - **Revised deploy order:** cap hotfix → nothing 12:00–18:00 → W58 (today strip, must include the global cap; after the sealed burst is measured) → W59 (dirty re-flush), both after 18:05.
 - **Follow-ups:** prefer 1:1 strips when every file in a bin carries a DV; warm stripped outputs' bodies for top projects (now measured as needed).
 
+
+## 10. Plan status checklist (2026-09-29 17:10 UTC)
+
+Evidence is `origin/master` at `8bea392b`; a branch counts as merged when its patch or its distinctive lines are on master. Handover 2 wins over the older docs where they disagree.
+
+### Gates
+
+- [ ] **Plan gate** (CPU-seconds and processed bytes per million ingested rows, matched hours). 09-28 was only an indication (CPU 5.3x lower, bytes ~13x lower) and is not accepted. Today's last code push was `8bea392b` at 11:28, so 14:00–18:00 is a clean window: run it at 18:05. Compare CPU against 09-25 14:00–18:00, and bytes and lease against 09-27 (restart caveat). Dedup bytes are real since W50.
+- [ ] **Falling backlog / less work per accepted event.** Not shown. Pending base rose 350 → 386 in the 09-28 window, then to 396 after today's v4 widening. Part of the CPU drop is deferred scope (v4 week cap, backfill cap 16, paused sessions).
+- [ ] **Paired ABBA/BAAB protocol with 95% bounds** (goal doc): never run for any gate.
+- [x] Capacity replay 1x/2x/4x (W26 `5610c94e`, `d19631fb`): ~2x headroom. Scheduler only; CPU and IO not measured.
+- [x] Stage 0 rollout gates: release 2 (#323).
+- [ ] Byte-aware batches (≥ 10% build CPU): missed its gate; stays off.
+- [ ] Stage 1A certified-clean (≥ 20% CPU): not run; off by default.
+- [ ] **drop-v3 gate**: blocked until v4 is resumed for all 31 days and its contiguity matches v3 for 3 censuses.
+
+### Done
+
+- **Stage 0 loops and throughput.**
+  - Loops: W13, W14, fix A, fix B, W38, W41, W42, orphan-derived prune.
+  - Throughput: claim fast path, edit → `mark_dirty`, tier backfill cap, output-state pricing, state split, v4 sibling prior, state waiter.
+- **Stage 1 measurement.** W7 `run-unit` harness and unit economics. 1B closed by measurement (shard amplification 1.00x). 1D closed (~0% irrelevant churn; W8 classifier shipped).
+- **Stage 2.** W31 content-fingerprint slice proof (`682179d0`) and step-0 attribution.
+- **Stage 3.** W9 design and step 1 (W13).
+- **Stage 5 prerequisites.** W33, W37, W39, the mint horizon, and the W22/W23 analyses.
+- **Read path.**
+  - W20, W36, W43, W44, the per-file dedup split fix, W47 2a, W47 2b (`310636d4`).
+  - The `1e79a30b` batch: W49, W50, W51, W52, W53, W55.
+  - W48: resolved by W44 and W51; no commit of its own.
+- **DV strip.** W54 hardened (`ecc2483f`), W57 sealed dates (`43af26a4`), W58 today plus fleet cap 12 per 10 min (`99e0b314`). Strip is on for all dates.
+- **W59** dirty re-flush drain (`ed59a3dd`, on by default).
+- **Tiers.**
+  - W29 v4 / `1h_v3` with `level`; v4-fallback relabel.
+  - W56 hour-grain session tiers (the W40 proper fix).
+  - RUM rollup measures on the v4 tiers, plus the tantivy LIKE edge-space fix (`180ced63`, `8bea392b`).
+- **Scheduler, sim and ops.** W10, W18, W26, W11 (OTel 0.33), W15, the ingest incident fix, the task-age metric, W25 part 4, W28.
+
+### To do (next action or blocker)
+
+- **v4 widening.** Resumed from 09-14 at 05:57. Next: 09-07, then 08-31, then all 31 days, one week per day. Check memory and `admission_refused_state_bytes_total` between steps.
+- **drop-v3.** `ws/drop-v3` (`7d9033cd`) is not on master. Blocked on the v4 gate above.
+- **W27 sessions v2.** v1 and v2 are both paused. Resume after `rollup_miss_sub_grain_slices_total` drains.
+- **RUM measures history.** Cells built before 11:32 today decline with `measure_not_stored`, and nothing rebuilds a cell just to add a measure. Needs a low-priority backfill, or accept that windows older than today stay raw.
+- **DV strip follow-ups:**
+  - split `dv_strip_plan_sorts_total` into 1:1 strip vs pack; prefer 1:1 strips;
+  - warm stripped outputs' bodies;
+  - parks are in-memory;
+  - re-measure the 2-day-old shipbubble trace lookup;
+  - watch latency against the 12-per-10-min cap.
+- **DARK, awaiting evaluation:**
+  - W46 key-level dedup restriction (owner decision after a dark evaluation);
+  - query-latency yield (A/B at matched hours);
+  - W21 witness carry (recommendation: leave off).
+- **Unmerged branches to decide:**
+  - `ws/scan-byte-admission` (`11aedc2b`): byte admission for wide scans, and one heavy slot at the root. It fixes the bug `tf-heavyslot` reproduces. Flags off.
+  - `ws/w47-cache-admit-stream-latency` (`b74f6c2e`): pgwire latency recorded at stream end. Master still records at `do_query` return, so p99 excludes streaming time. Handover 2 §1 assumed this had shipped.
+  - `ws/w31-transparent-witness` (2 WIP commits, paused): finish or drop.
+  - `ws/recovery-adopt-v2` (`3ff9bb66`): deprioritized (~4 requeues per restart).
+- **Not started (conditional):** Stage 2 captured source view, Stage 3 batched publication, Stage 4 flush-time aggregation, Stage 5 dedup fusion, Stage 6 minute revisions, 1C shared scans, packed repairs (need a packed-remainder witness).
+- **Unknown, check:** W7 real-S3 unit cost on staging; the W32 staging experiment (token cap vs idle cores).
+- **Ops:** journal lock wait on a process at least 1 h old; W25 parts 2–3 (container start, double service update); dependency advisories (rustls-webpki 0.101, tokio-tar, tokio-postgres).
+- **Owner decisions (monoscope):**
+  - the pattern-tag `update2Sql` source fix (~40% of today's masked rows);
+  - `array_has` lowering;
+  - backing off issue-chart auto-refresh after a timeout;
+  - a timeout on the `Issues.hs` session lookup;
+  - W12 `name` HLL.
+
+### Uncommitted and unmerged work (inventory 2026-09-29)
+
+- **Main checkout** (`timefusion`, on master `2f2df90c`, 229 commits behind):
+  - **`AGENTS.md`**: the full ~790-line project guide. It has never been committed; master's `AGENTS.md` is the 32-line CI note. Save this first.
+  - The `src/` diff in 11 files: already on master.
+  - Untracked plans and scripts: already on master or older than master's copies, except `docs/plans/2026-09-28-residual-cost-ranking.md`.
+  - After saving those two files, the checkout can be reset to master.
+- **Uncommitted elsewhere:**
+  - `timefusion-overnight-rum-session-rollup-29-09`: a new e2e test (`prepared_rum_sessions_use_browser_rollups_and_raw_edges`).
+  - `tf-heavyslot`: a reproduction test for the heavy-slot bug; the fix is in `ws/scan-byte-admission`.
+- **Do not commit:** `tf-w29` has a staged reverse diff (2,638 lines deleted) from an aborted operation. `tf-w54` has a DV-strip grant superseded by `d1313093`.
+- **Safe to delete:**
+  - 65 worktrees and 94 remote branches whose content is on master.
+  - 12 stale worktrees (August experiments, the distill sweep, the old fork bump).
+  - Remote branches `heavy-admission-e2e`, `timefusion-deploy-completed`, `timefusion-deploy-lease`, `ws/w28-service-hll`.
