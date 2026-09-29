@@ -177,8 +177,8 @@ def footer_sorted(source: str, path: str) -> bool | None:
 def tier_dates(url: str, source: str, project: str) -> dict[str, set[str]]:
     """Dates present in each rollup tier of `source`, for one project."""
     tiers = {
-        "1m": f"{source}_rollup_dashboard_1m_v3",
-        "1h": f"{source}_rollup_dashboard_1h_v2",
+        "1m": f"{source}_rollup_dashboard_1m_v4",
+        "1h": f"{source}_rollup_dashboard_1h_v3",
     }
     if source == "otel_metrics":
         tiers = {"1m": "otel_metrics_rollup_metrics_1m_v2", "1h": "otel_metrics_rollup_metrics_1h_v2"}

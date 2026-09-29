@@ -40,9 +40,9 @@ class QueryRoutingMatrixTest(unittest.TestCase):
         delta = stats_delta(before, after)
         self.assertEqual(ambient_miss_reasons(delta), ["unknown_filter"])
         self.assertEqual(explain_route_hint(["logical raw", "DataSourceExec table=otel_logs_and_spans"]), "raw")
-        self.assertEqual(explain_route_hint(["logical raw", "DataSourceExec table=otel_logs_and_spans_rollup_dashboard_1h_v2"]), "full")
+        self.assertEqual(explain_route_hint(["logical raw", "DataSourceExec table=otel_logs_and_spans_rollup_dashboard_1h_v3"]), "full")
         self.assertEqual(
-            explain_route_hint(["logical raw", "otel_logs_and_spans otel_logs_and_spans_rollup_dashboard_1h_v2"]),
+            explain_route_hint(["logical raw", "otel_logs_and_spans otel_logs_and_spans_rollup_dashboard_1h_v3"]),
             "hybrid",
         )
         self.assertIsNone(attributed_route({"maintenance.rollup_hits_full_total": 1}, isolated=False))

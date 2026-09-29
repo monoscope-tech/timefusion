@@ -40,14 +40,24 @@ enum RollupRebuildReason {
     WitnessMoved,
 }
 
+/// How a tier's contiguity may move the fleet gauge.
+#[derive(Clone, Copy, Debug)]
+enum FleetTier {
+    Real,
+    /// Younger than the horizon: its low reading is ramp-up, so only provisional.
+    Ramping,
+    /// Declares `backfill_days` below the horizon, so it can never reach it.
+    ShortHorizon,
+}
+
 /// One tier's contribution to a fleet contiguity gauge, or `None` to abstain.
 /// A real tier OVERWRITES a ramping tier's provisional seed rather than
 /// minimising into it, which makes the fold order-independent.
-fn fold_fleet_gauge(previous: u64, value: u64, seeded_by_real: bool, ramping: bool) -> Option<u64> {
-    match (ramping, seeded_by_real) {
-        (true, true) => None,
-        (true, false) | (false, false) => Some(value),
-        (false, true) => Some(previous.min(value)),
+fn fold_fleet_gauge(previous: u64, value: u64, seeded_by_real: bool, tier: FleetTier) -> Option<u64> {
+    match (tier, seeded_by_real) {
+        (FleetTier::ShortHorizon, _) | (FleetTier::Ramping, true) => None,
+        (_, false) => Some(value),
+        (FleetTier::Real, true) => Some(previous.min(value)),
     }
 }
 
@@ -2013,8 +2023,13 @@ impl Database {
                 // A tier younger than the horizon cannot hold that many days, so
                 // a low number from it is ramp-up and must not move the gauges.
                 let horizon_ms = horizon.saturating_mul(24 * 60 * 60 * 1_000);
-                let tier_is_ramping =
-                    tier_created_ms.is_some_and(|created| crate::support::now_micros().div_euclid(1_000).saturating_sub(created) < horizon_ms);
+                let tier_kind = match spec.backfill_days {
+                    Some(_) => FleetTier::ShortHorizon,
+                    None if tier_created_ms.is_some_and(|created| crate::support::now_micros().div_euclid(1_000).saturating_sub(created) < horizon_ms) => {
+                        FleetTier::Ramping
+                    }
+                    None => FleetTier::Real,
+                };
                 // Days back from yesterday covered with NO hole, minimised over projects.
                 let (contiguous, worst_project, median_contiguous) = min_contiguous_days(&covered, &source_partitions, today, &active_projects);
                 for (gauge, value) in [
@@ -2022,13 +2037,12 @@ impl Database {
                     (&crate::observability::maintenance_stats().rollup_min_contiguous_days, contiguous),
                 ] {
                     let previous = gauge.load(std::sync::atomic::Ordering::Relaxed);
-                    // A short-horizon tier can never reach the fleet horizon, so it abstains.
-                    if let Some(folded) = fold_fleet_gauge(previous, value, !first_tier_of_sweep, tier_is_ramping || spec.backfill_days.is_some()) {
+                    if let Some(folded) = fold_fleet_gauge(previous, value, !first_tier_of_sweep, tier_kind) {
                         gauge.store(folded, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
                 // Only a REAL tier consumes the seed; a ramping tier's value is provisional.
-                first_tier_of_sweep &= tier_is_ramping || spec.backfill_days.is_some();
+                first_tier_of_sweep &= !matches!(tier_kind, FleetTier::Real);
                 // `contiguous_days` counts DATE PARTITIONS and ignores generation;
                 // `usable_cells` is the read path's own answer, so a gap between the
                 // two means a spec change orphaned coverage.
@@ -5847,6 +5861,14 @@ impl Database {
     /// the Delta tag recovery still runs and replaces the restored evidence.
     pub fn seed_routing_from_ledger(&self) -> usize {
         use crate::storage::CoverageLedger as _;
+        // A dropped tier's cells can never serve, and would fail the generation check
+        // below on every boot until they aged out of the horizon.
+        let undeclared = self
+            .coverage_ledger
+            .retire_where(|(source, _, table, _)| get_schema(source).is_none_or(|schema| !schema.rollups.iter().any(|spec| spec.table_name(source) == *table)));
+        if undeclared > 0 {
+            info!(undeclared, event = "rollup_coverage_ledger_retired_undeclared", "coverage cells of a tier no longer declared dropped from the ledger");
+        }
         let mut seeded = 0usize;
         for cell in self.coverage_ledger.cells() {
             let (source, project_id, table_name, date) = cell.clone();
@@ -5935,7 +5957,8 @@ impl Database {
         }
         let Some(now) = chrono::DateTime::from_timestamp_micros(crate::support::now_micros()) else { return 0 };
         let keep_from = (now.date_naive() - chrono::Duration::days(i64::from(horizon))).to_string();
-        let retired = self.coverage_ledger.retire_before(&keep_from);
+        // Dates compare as strings: `keep_from` is zero-padded `YYYY-MM-DD`.
+        let retired = self.coverage_ledger.retire_where(|cell| cell.3 < keep_from);
         if retired > 0 {
             info!(retired, keep_from, event = "rollup_coverage_ledger_retired", "coverage cells past the rollup horizon dropped from the ledger");
         }
@@ -10454,15 +10477,16 @@ mod date_coverage_recovery_tests {
     /// The fold must also be ORDER-INDEPENDENT — a ramping tier seen first seeds only
     /// provisionally and a real tier OVERWRITES it — and an all-ramping fresh deployment must
     /// still publish something rather than leave the gauge at its start value.
-    #[test_case::test_case(0, 30, false, false => Some(30) ; "a real tier always counts and seeds the gauge")]
-    #[test_case::test_case(30, 2, true, true => None ; "a ramping tier must not drag an established fleet value down")]
-    #[test_case::test_case(0, 2, false, true => Some(2) ; "with nothing real yet, even a ramping tier is better than no gauge")]
-    #[test_case::test_case(2, 30, false, false => Some(30) ; "the first real tier REPLACES a provisional value")]
-    #[test_case::test_case(u64::MAX, 3, false, true => Some(3) ; "an all-ramping fresh deployment still publishes something")]
-    #[test_case::test_case(30, 5, true, false => Some(5) ; "a genuinely starved tier still pins the fleet")]
-    #[test_case::test_case(5, 30, true, false => Some(5) ; "min, not last-writer")]
-    fn a_ramping_tier_abstains_from_the_fleet_gauge_but_a_starved_one_pins_it(previous: u64, value: u64, seeded_by_real: bool, ramping: bool) -> Option<u64> {
-        fold_fleet_gauge(previous, value, seeded_by_real, ramping)
+    #[test_case::test_case(0, 30, false, FleetTier::Real => Some(30) ; "a real tier always counts and seeds the gauge")]
+    #[test_case::test_case(30, 2, true, FleetTier::Ramping => None ; "a ramping tier must not drag an established fleet value down")]
+    #[test_case::test_case(0, 2, false, FleetTier::Ramping => Some(2) ; "with nothing real yet, even a ramping tier is better than no gauge")]
+    #[test_case::test_case(2, 30, false, FleetTier::Real => Some(30) ; "the first real tier REPLACES a provisional value")]
+    #[test_case::test_case(u64::MAX, 3, false, FleetTier::Ramping => Some(3) ; "an all-ramping fresh deployment still publishes something")]
+    #[test_case::test_case(30, 5, true, FleetTier::Real => Some(5) ; "a genuinely starved tier still pins the fleet")]
+    #[test_case::test_case(5, 30, true, FleetTier::Real => Some(5) ; "min, not last-writer")]
+    #[test_case::test_case(30, 7, false, FleetTier::ShortHorizon => None ; "a short-horizon tier never overwrites a ramping seed with its capped reading")]
+    fn a_ramping_tier_abstains_from_the_fleet_gauge_but_a_starved_one_pins_it(previous: u64, value: u64, seeded_by_real: bool, tier: FleetTier) -> Option<u64> {
+        fold_fleet_gauge(previous, value, seeded_by_real, tier)
     }
 
     /// The probe phase must not queue the only groups that can GRANT behind the
@@ -10850,7 +10874,7 @@ mod rollup_noop_skip_tests {
         support::test_helpers::{BufferMode, TestConfigBuilder, json_to_batch, test_span_ts},
     };
 
-    const TIER: &str = "otel_logs_and_spans_rollup_dashboard_1m_v3";
+    const TIER: &str = "otel_logs_and_spans_rollup_dashboard_1m_v4";
 
     /// Mechanism experiment, not a production capacity benchmark. Every arm reads
     /// the same two Parquet files through the production slice SQL and bounded session.
@@ -11511,15 +11535,15 @@ mod rollup_noop_skip_tests {
     async fn run_unit_once_builds_the_requested_tier() -> Result<()> {
         let (db, project, date) = rollup_db("run_unit_tier").await?;
         insert_span(&db, &project, date, 12, "a", "op").await?;
-        let report = db.run_unit_once("otel_logs_and_spans", &project, date, Operation::BaseRollup, 24, 0, Some("dashboard_1m_v4")).await?;
+        let report = db.run_unit_once("otel_logs_and_spans", &project, date, Operation::BaseRollup, 24, 0, Some("sessions_1h_v1")).await?;
         assert_eq!(report.state, Some(TaskState::Complete));
-        let requests = async |tier: &str| -> Result<Option<i64>> {
-            let batches = db.query_delta_only(&format!("SELECT CAST(SUM(request_count) AS BIGINT) FROM {tier} WHERE project_id = '{project}'")).await?;
+        let rows = async |tier: &str, measure: &str| -> Result<Option<i64>> {
+            let batches = db.query_delta_only(&format!("SELECT CAST(SUM({measure}) AS BIGINT) FROM {tier} WHERE project_id = '{project}'")).await?;
             use datafusion::arrow::array::AsArray;
             Ok(batches[0].column(0).as_primitive::<datafusion::arrow::datatypes::Int64Type>().iter().next().flatten())
         };
-        assert_eq!(requests("otel_logs_and_spans_rollup_dashboard_1m_v4").await?, Some(1), "the named tier is built");
-        assert_eq!(requests(TIER).await?, None, "the first-declared tier is not");
+        assert_eq!(rows("otel_logs_and_spans_rollup_sessions_1h_v1", "event_count").await?, Some(1), "the named tier is built");
+        assert_eq!(rows(TIER, "request_count").await?, None, "the first-declared tier is not");
         Ok(())
     }
 
@@ -13369,13 +13393,13 @@ mod rollup_relevance_tests {
     use itertools::Itertools;
 
     /// The tiers each assigned column can change, on the real schema. The derived
-    /// tier's inheritance of its base's reads cannot be isolated here: `dashboard_1h_v2`
+    /// tier's inheritance of its base's reads cannot be isolated here: `dashboard_1h_v3`
     /// restates every column its base reads.
     #[test_case::test_case(&["hashes"] => Vec::<String>::new() ; "monoscope's hashes enrichment touches no tier")]
     #[test_case::test_case(&["attributes___user___id"] => vec!["sessions_1h_v1", "sessions_1h_v2"] ; "user enrichment touches only the session tiers")]
-    #[test_case::test_case(&["attributes___http___response___status_code"] => vec!["dashboard_1h_v2", "dashboard_1h_v3", "dashboard_1m_v3", "dashboard_1m_v4"] ; "a measure filter column touches every dashboard tier")]
-    #[test_case::test_case(&["level"] => vec!["dashboard_1h_v3", "dashboard_1m_v4", "sessions_1h_v1", "sessions_1h_v2"] ; "a level change leaves the v3 tiers alone")]
-    #[test_case::test_case(&["timestamp"] => vec!["dashboard_1h_v2", "dashboard_1h_v3", "dashboard_1m_v3", "dashboard_1m_v4", "sessions_1h_v1", "sessions_1h_v2"] ; "moving a row touches every tier")]
+    #[test_case::test_case(&["attributes___http___response___status_code"] => vec!["dashboard_1h_v3", "dashboard_1m_v4"] ; "a measure filter column touches every dashboard tier")]
+    #[test_case::test_case(&["level"] => vec!["dashboard_1h_v3", "dashboard_1m_v4", "sessions_1h_v1", "sessions_1h_v2"] ; "a level change touches every tier that reads level")]
+    #[test_case::test_case(&["timestamp"] => vec!["dashboard_1h_v3", "dashboard_1m_v4", "sessions_1h_v1", "sessions_1h_v2"] ; "moving a row touches every tier")]
     fn tiers_reading(columns: &[&str]) -> Vec<String> {
         super::rollup_tiers_reading("otel_logs_and_spans", columns)
             .into_iter()

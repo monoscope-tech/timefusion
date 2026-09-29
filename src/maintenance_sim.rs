@@ -1211,8 +1211,8 @@ mod tests {
 
     fn key(project: &str, op: Operation, start: i64, width: i64) -> TaskKey {
         let table = match op {
-            Operation::BaseRollup => "otel_logs_and_spans_rollup_dashboard_1m_v3",
-            Operation::DerivedRollup => "otel_logs_and_spans_rollup_dashboard_1h_v2",
+            Operation::BaseRollup => "otel_logs_and_spans_rollup_dashboard_1m_v4",
+            Operation::DerivedRollup => "otel_logs_and_spans_rollup_dashboard_1h_v3",
             _ => "otel_logs_and_spans",
         };
         TaskKey {

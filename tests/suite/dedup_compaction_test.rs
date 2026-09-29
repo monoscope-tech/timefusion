@@ -229,7 +229,7 @@ async fn a_rollup_built_over_an_uncertified_duplicated_partition_matches_the_ded
 
     let rolled = delta_scalar(
         &db,
-        &format!("SELECT COALESCE(SUM(request_count), 0)::BIGINT FROM otel_logs_and_spans_rollup_dashboard_1m_v3 WHERE project_id = '{project_id}'"),
+        &format!("SELECT COALESCE(SUM(request_count), 0)::BIGINT FROM otel_logs_and_spans_rollup_dashboard_1m_v4 WHERE project_id = '{project_id}'"),
     )
     .await?;
     assert_eq!(rolled, deduped_raw, "the rollup must count the DEDUPLICATED rows; counting the physical 4 is the silent-wrong-number failure");
@@ -309,7 +309,7 @@ async fn today_is_rolled_up_to_the_buffer_boundary_and_still_matches_the_raw_ans
     assert!(plan_and_drain_backfill(&db).await? > 0, "the backfill must claim TODAY — otherwise this test proves nothing about partial-day coverage");
 
     let rollup_rows =
-        delta_scalar(&db, &format!("SELECT COUNT(*)::BIGINT FROM otel_logs_and_spans_rollup_dashboard_1m_v3 WHERE project_id = '{project_id}'")).await?;
+        delta_scalar(&db, &format!("SELECT COUNT(*)::BIGINT FROM otel_logs_and_spans_rollup_dashboard_1m_v4 WHERE project_id = '{project_id}'")).await?;
     assert!(rollup_rows > 0, "today must actually have rollup buckets, not just an empty partition");
 
     // The whole of today, through the routed path (rollup interior + raw tail).
@@ -1817,7 +1817,7 @@ async fn certifying_a_partition_builds_rollup_buckets_that_match_the_raw_aggrega
     assert!(env.certify_and_drain().await? > 0, "eligible slice tasks must be drained");
 
     let rollup_total =
-        format!("SELECT COALESCE(SUM(request_count), 0)::BIGINT FROM otel_logs_and_spans_rollup_dashboard_1m_v3 WHERE project_id = '{project_id}'");
+        format!("SELECT COALESCE(SUM(request_count), 0)::BIGINT FROM otel_logs_and_spans_rollup_dashboard_1m_v4 WHERE project_id = '{project_id}'");
     let raw_total = delta_scalar(&db, &format!("SELECT COUNT(*)::BIGINT FROM otel_logs_and_spans WHERE project_id = '{project_id}'")).await?;
 
     assert_eq!(
@@ -2284,8 +2284,8 @@ async fn an_expression_group_over_dimensions_matches_raw_for_every_measure_kind(
 }
 
 /// The base (1-minute) and derived (1-hour) dashboard tiers.
-const TIER_1M: &str = "otel_logs_and_spans_rollup_dashboard_1m_v3";
-const TIER_1H: &str = "otel_logs_and_spans_rollup_dashboard_1h_v2";
+const TIER_1M: &str = "otel_logs_and_spans_rollup_dashboard_1m_v4";
+const TIER_1H: &str = "otel_logs_and_spans_rollup_dashboard_1h_v3";
 
 /// ONE dedup pass over `otel_logs_and_spans`. The pass COUNT is load-bearing —
 /// only a 0-drop pass over an unmoved file set certifies — so callers repeat it
@@ -2447,7 +2447,7 @@ async fn a_partly_covered_window_unions_the_rollup_with_raw_and_matches_the_raw_
         let rows = db
             .query_delta_only(&format!(
                 "SELECT CAST(date AS VARCHAR), CAST(timestamp AS VARCHAR), request_count, rollup_generation \
-                 FROM otel_logs_and_spans_rollup_dashboard_1m_v3 WHERE project_id = '{project_id}' ORDER BY 2"
+                 FROM otel_logs_and_spans_rollup_dashboard_1m_v4 WHERE project_id = '{project_id}' ORDER BY 2"
             ))
             .await?;
         println!("rollup tier contents at the failing assertion:\n{}", datafusion::arrow::util::pretty::pretty_format_batches(&rows).unwrap());

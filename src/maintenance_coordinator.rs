@@ -4310,8 +4310,8 @@ mod tests {
     fn rollup_resume_clips_planning_without_widening_claims(derived: bool, minutes: (i64, i64)) -> Option<(i64, i64)> {
         let (_dir, mut journal) = new_journal();
         let source = "otel_logs_and_spans";
-        let parent = "otel_logs_and_spans_rollup_dashboard_1m_v3";
-        let target = if derived { "otel_logs_and_spans_rollup_dashboard_1h_v2" } else { parent };
+        let parent = "otel_logs_and_spans_rollup_dashboard_1m_v4";
+        let target = if derived { "otel_logs_and_spans_rollup_dashboard_1h_v3" } else { parent };
         let minute = 60_000_000;
         journal.set_rollup_build_policy(source, parent, RollupBuildPolicy::ResumeFrom { start_micros: 30 * minute }).expect("persist resume");
         let range = TimeSlice::new(minutes.0 * minute, minutes.1 * minute).expect("nonempty planning window");
@@ -4371,12 +4371,12 @@ mod tests {
     fn rollup_policy_validates_identity_and_applies_to_derived_dependencies() -> anyhow::Result<()> {
         let (_dir, mut journal) = new_journal();
         let source = "otel_logs_and_spans";
-        let parent = "otel_logs_and_spans_rollup_dashboard_1m_v3";
+        let parent = "otel_logs_and_spans_rollup_dashboard_1m_v4";
         assert!(journal.set_rollup_build_policy(source, "missing", RollupBuildPolicy::Paused).is_err());
         assert!(journal.set_rollup_build_policy(source, parent, RollupBuildPolicy::ResumeFrom { start_micros: 1 }).is_err());
         assert!(journal.snapshot.rollup_policies.is_empty());
         journal.set_rollup_build_policy(source, parent, RollupBuildPolicy::Paused)?;
-        let mut derived = task_in("otel_logs_and_spans_rollup_dashboard_1h_v2", "p", 0, DERIVED_SLICE_MICROS, Operation::DerivedRollup);
+        let mut derived = task_in("otel_logs_and_spans_rollup_dashboard_1h_v3", "p", 0, DERIVED_SLICE_MICROS, Operation::DerivedRollup);
         derived.key.source = source.to_owned();
         assert!(!journal.rollup_build_allowed(&derived.key));
         derived.key.operation = Operation::Dedup;
@@ -4980,7 +4980,7 @@ mod tests {
     #[test]
     fn cells_minted_ahead_of_the_clock_are_never_fused_into_the_day() {
         let (_dir, mut journal) = new_journal();
-        let (day, base, derived) = (10 * DAY_MICROS, "otel_logs_and_spans_rollup_dashboard_1m_v3", "otel_logs_and_spans_rollup_dashboard_1h_v2");
+        let (day, base, derived) = (10 * DAY_MICROS, "otel_logs_and_spans_rollup_dashboard_1m_v4", "otel_logs_and_spans_rollup_dashboard_1h_v3");
         let first_write = day + 60_000_000;
         for (table, is_derived) in [(base, false), (derived, true)] {
             let hour = invalidation(table, day, day + DERIVED_SLICE_MICROS, first_write, is_derived);
@@ -7094,9 +7094,8 @@ mod tests {
         assert_eq!(tasks[0].estimated_decoded_bytes, 30);
     }
 
-    #[test_case::test_case(false, "otel_logs_and_spans_rollup_dashboard_1m_v3", "otel_logs_and_spans_rollup_dashboard_1h_v2"; "completed wide proof cannot override a pending repair")]
-    #[test_case::test_case(true, "otel_logs_and_spans_rollup_dashboard_1m_v3", "otel_logs_and_spans_rollup_dashboard_1h_v2"; "late census proof cannot override a pending repair")]
-    #[test_case::test_case(false, "otel_logs_and_spans_rollup_dashboard_1m_v4", "otel_logs_and_spans_rollup_dashboard_1h_v3"; "the v4 pair waits for its own base")]
+    #[test_case::test_case(false, "otel_logs_and_spans_rollup_dashboard_1m_v4", "otel_logs_and_spans_rollup_dashboard_1h_v3"; "completed wide proof cannot override a pending repair")]
+    #[test_case::test_case(true, "otel_logs_and_spans_rollup_dashboard_1m_v4", "otel_logs_and_spans_rollup_dashboard_1h_v3"; "late census proof cannot override a pending repair")]
     fn derived_rollup_claim_waits_for_complete_base_hour(cached_ranges: bool, base: &'static str, derived: &'static str) {
         let (_dir, mut journal) = new_journal();
         let unit =
@@ -7171,7 +7170,7 @@ mod tests {
         let unit = |table: &str, project: &str, start, end, operation| {
             task_in(table, project, start, end, operation).tap_mut(|task| task.key.source = "otel_logs_and_spans".into())
         };
-        let parent = "otel_logs_and_spans_rollup_dashboard_1m_v3";
+        let parent = "otel_logs_and_spans_rollup_dashboard_1m_v4";
         for n in 0..2_000i64 {
             let (project, start) = (format!("other{}", n % 50), (n / 50 + 2) * DAY_MICROS);
             journal
@@ -7183,7 +7182,7 @@ mod tests {
         for start in (0..DERIVED_SLICE_MICROS).step_by(NORMAL_SLICE_MICROS as usize) {
             journal.upsert(unit(parent, "p", start, start + NORMAL_SLICE_MICROS, Operation::BaseRollup).tap_mut(|t| t.state = TaskState::Complete));
         }
-        journal.upsert(unit("otel_logs_and_spans_rollup_dashboard_1h_v2", "p", 0, DERIVED_SLICE_MICROS, Operation::DerivedRollup));
+        journal.upsert(unit("otel_logs_and_spans_rollup_dashboard_1h_v3", "p", 0, DERIVED_SLICE_MICROS, Operation::DerivedRollup));
         DEPENDENCY_VISITS.set(0);
         assert!(journal.claim_next(Operation::DerivedRollup, 0, true).is_some(), "complete parents admit the derived unit");
         let visits = DEPENDENCY_VISITS.get();
@@ -7211,8 +7210,8 @@ mod tests {
     fn completed_children_satisfy_a_larger_derived_dependency() {
         let (_dir, mut journal) = new_journal();
         let unit = |table, operation| task_in(table, "p", 0, NORMAL_SLICE_MICROS, operation).tap_mut(|task| task.key.source = "otel_logs_and_spans".into());
-        let base_key = upserted(&mut journal, unit("otel_logs_and_spans_rollup_dashboard_1m_v3", Operation::BaseRollup));
-        journal.upsert(unit("otel_logs_and_spans_rollup_dashboard_1h_v2", Operation::DerivedRollup));
+        let base_key = upserted(&mut journal, unit("otel_logs_and_spans_rollup_dashboard_1m_v4", Operation::BaseRollup));
+        journal.upsert(unit("otel_logs_and_spans_rollup_dashboard_1h_v3", Operation::DerivedRollup));
         assert!(journal.split_time_task(&base_key, 2 * MAX_DECODED_BYTES, None, &[]));
         let children = journal
             .tasks()

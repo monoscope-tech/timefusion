@@ -35,7 +35,7 @@ use tracing::{
 use tracing_subscriber::{Layer, layer::Context, prelude::*};
 
 const SOURCE: &str = "otel_logs_and_spans";
-const TIER: &str = "otel_logs_and_spans_rollup_dashboard_1m_v3";
+const TIER: &str = "otel_logs_and_spans_rollup_dashboard_1m_v4";
 const PROJECT: &str = "rollup-work-benchmark";
 const COUNTERS: [&str; 5] =
     ["rollup_scan_cohorts_total", "rollup_scan_estimated_bytes_total", "rollup_output_rows_total", "rollup_output_files_total", "rollup_commit_actions_total"];

@@ -3141,10 +3141,9 @@ impl JsonCoverageLedger {
             .collect()
     }
 
-    /// Drop cells whose date is older than `keep_from`, returning how many went.
-    /// Dates compare as strings, so `keep_from` must be zero-padded `YYYY-MM-DD`.
-    pub fn retire_before(&self, keep_from: &str) -> usize {
-        let stale: Vec<CoverageCell> = self.cells.iter().filter(|e| e.key().3.as_str() < keep_from).map(|e| e.key().clone()).collect();
+    /// Drop the cells `is_stale` selects, returning how many went.
+    pub fn retire_where(&self, is_stale: impl Fn(&CoverageCell) -> bool) -> usize {
+        let stale: Vec<CoverageCell> = self.cells.iter().filter(|e| is_stale(e.key())).map(|e| e.key().clone()).collect();
         for cell in &stale {
             self.cells.remove(cell);
         }
@@ -3348,7 +3347,7 @@ mod coverage_ledger_tests {
         ledger.record(&old, entry(0, 10, "g1", Some(1)));
         ledger.record(&cell(), entry(0, 10, "g1", Some(1)));
 
-        assert_eq!(ledger.retire_before("2026-08-01"), 1, "only the July cell is past retention");
+        assert_eq!(ledger.retire_where(|cell| cell.3.as_str() < "2026-08-01"), 1, "only the July cell is past retention");
         assert!(ledger.coverage(&old).is_empty(), "the retired cell is gone");
         assert_eq!(ledger.coverage(&cell()).len(), 1, "the in-retention cell is untouched");
         assert!(JsonCoverageLedger::load(dir.path()).coverage(&old).is_empty(), "retirement is durable, not in-memory only");

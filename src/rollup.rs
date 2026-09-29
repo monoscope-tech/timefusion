@@ -2249,14 +2249,14 @@ mod tests {
         let per_tier: dashmap::DashMap<String, u64> = dashmap::DashMap::new();
         let exported = || -> u64 { per_tier.iter().map(|entry| *entry.value()).sum() };
 
-        per_tier.insert("otel_logs_and_spans_rollup_dashboard_1m_v3".to_owned(), 67);
+        per_tier.insert("otel_logs_and_spans_rollup_dashboard_1m_v4".to_owned(), 67);
         assert_eq!(exported(), 67);
 
-        per_tier.insert("otel_logs_and_spans_rollup_dashboard_1h_v2".to_owned(), 0);
+        per_tier.insert("otel_logs_and_spans_rollup_dashboard_1h_v3".to_owned(), 0);
         assert_eq!(exported(), 67, "a clean tier's publish must not hide another tier's damage");
 
         // Zero only when EVERY tier is clean, which is what makes "alarm on > 0" sound.
-        per_tier.insert("otel_logs_and_spans_rollup_dashboard_1m_v3".to_owned(), 0);
+        per_tier.insert("otel_logs_and_spans_rollup_dashboard_1m_v4".to_owned(), 0);
         assert_eq!(exported(), 0);
     }
 
@@ -2625,7 +2625,7 @@ mod tests {
     /// version and the tier is permanently wrong until the day is rebuilt.
     #[test]
     fn a_merge_on_read_input_is_deduped_before_the_rollup_aggregate() {
-        let base = crate::schema::get_schema("otel_logs_and_spans_rollup_dashboard_1m_v3").expect("the 1m tier is a declared rollup target");
+        let base = crate::schema::get_schema("otel_logs_and_spans_rollup_dashboard_1m_v4").expect("the 1m tier is a declared rollup target");
         // `rollup_tier_dedup` exists because the maintenance read registers the
         // tier directly rather than through the routing table, so it cannot rely
         // on the planner having inserted a `DedupExec`.
@@ -2689,7 +2689,7 @@ mod tests {
     /// existing rollup table, and no file holds a value for it anyway.
     #[test]
     fn a_measure_the_physical_table_lacks_projects_null_instead_of_failing() {
-        let base = crate::schema::get_schema("otel_logs_and_spans_rollup_dashboard_1m_v3").expect("the 1m tier is a declared rollup target");
+        let base = crate::schema::get_schema("otel_logs_and_spans_rollup_dashboard_1m_v4").expect("the 1m tier is a declared rollup target");
         let (keys, tiebreak, tombstone) = rollup_tier_dedup(base).expect("a generated tier carries timestamp/id/updated_at");
         let dedup = || SliceDedup { keys: &keys, tiebreak: Some(tiebreak), tombstone };
         // Everything except the measure added later.
@@ -3136,8 +3136,8 @@ mod tests {
     /// A group expression routes only to the tiers declaring every column it reads,
     /// best first. One reading an undeclared column must DECLINE, not vanish as a
     /// silent `Ok(empty)`.
-    #[test_case::test_case("coalesce(status_code, level)", Ok(&["dashboard_1h_v3", "dashboard_1m_v4"]) ; "monoscope's status chart needs level, which only v4 declares")]
-    #[test_case::test_case("status_code", Ok(&["dashboard_1h_v3", "dashboard_1h_v2", "dashboard_1m_v4", "dashboard_1m_v3"]) ; "v4 is preferred and the v3 it replaces is the fall through")]
+    #[test_case::test_case("coalesce(status_code, level)", Ok(&["dashboard_1h_v3", "dashboard_1m_v4"]) ; "monoscope's status chart reads level")]
+    #[test_case::test_case("status_code", Ok(&["dashboard_1h_v3", "dashboard_1m_v4"]) ; "a plain status group")]
     #[test_case::test_case("coalesce(status_code, name)", Err(MissReason::UnsupportedShape) ; "an unservable group expression is counted rather than silent")]
     #[tokio::test]
     async fn a_group_expression_routes_to_the_tiers_declaring_its_columns(key: &str, expected: Result<&[&str], MissReason>) {
@@ -3153,23 +3153,23 @@ mod tests {
         }
     }
 
-    /// Prod's `1h_by_1m` probe verbatim: v3 stays a fall-through behind v4.
+    /// Prod's `1h_by_1m` probe verbatim.
     #[tokio::test]
-    async fn the_last_hour_probe_keeps_v3_behind_v4() {
+    async fn the_last_hour_probe_routes_to_v4() {
         let sql = format!(
             "SELECT time_bucket('1 minute', timestamp), COUNT(*) FROM {SOURCE} \
              WHERE project_id = 'project' AND timestamp >= now() - interval '1 hour' GROUP BY 1"
         );
-        assert_eq!(targets(&session().await, &sql).await, Ok(vec!["dashboard_1m_v4".to_owned(), "dashboard_1m_v3".to_owned()]));
+        assert_eq!(targets(&session().await, &sql).await, Ok(vec!["dashboard_1m_v4".to_owned()]));
     }
 
-    /// A filter proving the `level` fallback unreachable lets the v3 tier serve too.
-    #[test_case::test_case("status_code = 'pickup_accepted'", &["dashboard_1m_v4", "dashboard_1m_v3"])]
-    #[test_case::test_case("status_code IS NOT NULL", &["dashboard_1m_v4", "dashboard_1m_v3"])]
-    #[test_case::test_case("status_code IS NULL", &["dashboard_1m_v4"])]
-    #[test_case::test_case("status_code = 'pickup_accepted' OR status_code IS NULL", &["dashboard_1m_v4"])]
+    /// The status chart routes under any status filter, whether or not it leaves the `level` fallback reachable.
+    #[test_case::test_case("status_code = 'pickup_accepted'")]
+    #[test_case::test_case("status_code IS NOT NULL")]
+    #[test_case::test_case("status_code IS NULL")]
+    #[test_case::test_case("status_code = 'pickup_accepted' OR status_code IS NULL")]
     #[tokio::test]
-    async fn only_a_filter_that_drops_the_level_fallback_lets_v3_serve(predicate: &str, expected: &[&str]) {
+    async fn a_status_filtered_status_chart_routes(predicate: &str) {
         let state = session().await;
         let sql = format!(
             "SELECT extract(epoch from time_bucket('2 hours', timestamp))::integer, \
@@ -3177,7 +3177,7 @@ mod tests {
             FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW} AND ({predicate}) \
             GROUP BY time_bucket('2 hours', timestamp), COALESCE(coalesce(status_code, level)::text, 'null')"
         );
-        assert_eq!(targets(&state, &sql).await, Ok(expected.iter().map(|name| (*name).to_owned()).collect()));
+        assert_eq!(targets(&state, &sql).await, Ok(vec!["dashboard_1m_v4".to_owned()]));
         assert_substitutes(&state, &sql, None).await;
     }
 

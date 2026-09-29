@@ -84,8 +84,7 @@ impl RollupSpec {
 
     /// Tiers whose published rows lower-bound this one's, for pricing a tier with no output
     /// yet: same grain and build kind, dimensions a SUBSET of ours. Adding dimensions only
-    /// splits groups, so the subset tier's rows are a lower bound; W24 measured that `level`
-    /// adds none, which makes v3's rows an accurate prior for v4.
+    /// splits groups, so the subset tier's rows are a lower bound.
     pub fn prior_siblings<'a>(&'a self, all: &'a [RollupSpec]) -> impl Iterator<Item = &'a RollupSpec> {
         all.iter().filter(move |other| {
             !std::ptr::eq(*other, self)
@@ -649,8 +648,6 @@ impl SchemaRegistry {
         // the new ones shadow-build: source declarations point only at the new
         // targets, so maintenance never writes the retired generations.
         for (current, legacy) in [
-            ("otel_logs_and_spans_rollup_dashboard_1m_v3", "otel_logs_and_spans_rollup_dashboard_1m_v2"),
-            ("otel_logs_and_spans_rollup_dashboard_1h_v2", "otel_logs_and_spans_rollup_dashboard_1h_v1"),
             ("otel_metrics_rollup_metrics_1m_v2", "otel_metrics_rollup_metrics_1m_v1"),
             ("otel_metrics_rollup_metrics_1h_v2", "otel_metrics_rollup_metrics_1h_v1"),
         ] {
@@ -749,9 +746,9 @@ pub fn create_insert_compatible_schema(schema: &SchemaRef) -> SchemaRef {
 mod tests {
     /// Only a same-grain, same-kind tier whose dimensions are a subset lends its rows:
     /// never across grains, never from a superset.
-    #[test_case::test_case("dashboard_1m_v4" => vec!["dashboard_1m_v3"] ; "v4 borrows from v3")]
-    #[test_case::test_case("dashboard_1h_v3" => vec!["dashboard_1h_v2"] ; "the derived v4 borrows from the derived v3, not a 1m tier")]
-    #[test_case::test_case("dashboard_1m_v3" => Vec::<String>::new() ; "v3 never borrows from its superset v4")]
+    #[test_case::test_case("sessions_1h_v2" => vec!["sessions_1h_v1"] ; "a superset borrows from its subset")]
+    #[test_case::test_case("sessions_1h_v1" => Vec::<String>::new() ; "never from a superset")]
+    #[test_case::test_case("dashboard_1h_v3" => Vec::<String>::new() ; "a derived tier never borrows from a base tier or another grain")]
     fn a_tier_borrows_only_from_a_subset_sibling(name: &str) -> Vec<String> {
         let schema = super::get_schema("otel_logs_and_spans").expect("schema");
         let spec = schema.rollups.iter().find(|spec| spec.name.as_deref() == Some(name)).expect("declared tier");
@@ -785,8 +782,8 @@ mod tests {
     /// The tiebreak MUST name the TF-owned column: `insert_coerce::stamp_version`
     /// overwrites whatever it names, so pointing it at a client column would
     /// destroy client data on every write.
-    #[test_case(None, false => Ok("otel_logs_and_spans_rollup_dashboard_1m_v3".into()) ; "default base is the first declared")]
-    #[test_case(None, true => Ok("otel_logs_and_spans_rollup_dashboard_1h_v2".into()) ; "default derived is the first declared")]
+    #[test_case(None, false => Ok("otel_logs_and_spans_rollup_dashboard_1m_v4".into()) ; "default base is the first declared")]
+    #[test_case(None, true => Ok("otel_logs_and_spans_rollup_dashboard_1h_v3".into()) ; "default derived is the first declared")]
     #[test_case(Some("dashboard_1m_v4"), false => Ok("otel_logs_and_spans_rollup_dashboard_1m_v4".into()) ; "spec name")]
     #[test_case(Some("otel_logs_and_spans_rollup_dashboard_1h_v3"), true => Ok("otel_logs_and_spans_rollup_dashboard_1h_v3".into()) ; "table name")]
     #[test_case(Some("dashboard_1h_v3"), false => Err("rollup tier dashboard_1h_v3 is not a base tier".into()) ; "wrong kind")]
@@ -798,7 +795,7 @@ mod tests {
     fn rollup_tier_unknown_lists_declared_tiers() {
         let err = source().rollup_tier(Some("dashboard_1m_v9"), false).unwrap_err().to_string();
         assert!(err.starts_with("unknown rollup tier dashboard_1m_v9; otel_logs_and_spans declares: "), "{err}");
-        assert!(["dashboard_1m_v3", "dashboard_1h_v2", "dashboard_1m_v4", "dashboard_1h_v3"].iter().all(|tier| err.contains(tier)), "{err}");
+        assert!(["dashboard_1m_v4", "dashboard_1h_v3", "sessions_1h_v1", "sessions_1h_v2"].iter().all(|tier| err.contains(tier)), "{err}");
     }
 
     #[test_case("mor_versioned")]
@@ -873,8 +870,6 @@ mod tests {
         assert!(unknown.synthesize(source()).is_err(), "an unknown column must still be rejected");
     }
 
-    #[test_case("otel_logs_and_spans_rollup_dashboard_1m_v2")]
-    #[test_case("otel_logs_and_spans_rollup_dashboard_1h_v1")]
     #[test_case("otel_metrics_rollup_metrics_1m_v1")]
     #[test_case("otel_metrics_rollup_metrics_1h_v1")]
     fn legacy_rollup_generations_remain_readable_during_migration(name: &str) {
