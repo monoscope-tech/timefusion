@@ -438,7 +438,8 @@ rollups:
   - grain: 1m
     name: dashboard_1m_v3
     dimensions: [resource___service___name, kind, status_code]
-    measures: &dashboard_measures
+    # Frozen: v3 is retired once v4 covers the horizon, so it gains no measures.
+    measures:
       - { name: request_count, agg: count }
       - { name: duration_count, agg: count, column: duration }
       - {
@@ -577,12 +578,101 @@ rollups:
   # v4 adds `level`, so monoscope's status chart (grouped by
   # `coalesce(status_code, level)`) routes; `level` added no tier rows in a
   # measured prod hour. It REPLACES v3: the router prefers it, and v3 keeps
-  # serving only until v4 covers the backfill horizon, then is dropped (move the
-  # measures anchor with it).
+  # serving only until v4 covers the backfill horizon, then is dropped. It owns
+  # the measures anchor; v3's list is frozen.
   - grain: 1m
     name: dashboard_1m_v4
     dimensions: [resource___service___name, kind, status_code, level]
-    measures: *dashboard_measures
+    measures: &dashboard_measures
+      - { name: request_count, agg: count }
+      - { name: duration_count, agg: count, column: duration }
+      - {
+          name: error_count,
+          agg: count,
+          filter: "status_code = 'ERROR' OR COALESCE(attributes___http___response___status_code, 0) >= 500",
+        }
+      - { name: duration_sum, agg: sum, column: duration }
+      - { name: duration_min, agg: min, column: duration }
+      - { name: duration_max, agg: max, column: duration }
+      - {
+          name: server_request_count,
+          agg: count,
+          filter: "kind = 'server' OR name = 'apitoolkit-http-span' OR name = 'monoscope.http'",
+        }
+      - {
+          name: server_duration_count,
+          agg: count,
+          column: duration,
+          filter: "kind = 'server' OR name = 'apitoolkit-http-span' OR name = 'monoscope.http'",
+        }
+      - {
+          name: server_duration_sum,
+          agg: sum,
+          column: duration,
+          filter: "kind = 'server' OR name = 'apitoolkit-http-span' OR name = 'monoscope.http'",
+        }
+      - {
+          name: server_duration_min,
+          agg: min,
+          column: duration,
+          filter: "kind = 'server' OR name = 'apitoolkit-http-span' OR name = 'monoscope.http'",
+        }
+      - {
+          name: server_duration_max,
+          agg: max,
+          column: duration,
+          filter: "kind = 'server' OR name = 'apitoolkit-http-span' OR name = 'monoscope.http'",
+        }
+      - {
+          name: server_error_scope_count,
+          agg: count,
+          filter: "kind = 'server' OR name = 'apitoolkit-http-span' OR name = 'monoscope.http'",
+        }
+      - {
+          name: server_error_count,
+          agg: count,
+          filter: "(kind = 'server' OR name = 'apitoolkit-http-span' OR name = 'monoscope.http') AND (status_code = 'ERROR' OR COALESCE(attributes___http___response___status_code, 0) >= 500)",
+        }
+      - {
+          name: server_duration_digest,
+          agg: tdigest,
+          column: duration,
+          filter: "kind = 'server' OR name = 'apitoolkit-http-span' OR name = 'monoscope.http'",
+        }
+      - { name: duration_digest, agg: tdigest, column: duration }
+      # monoscope's *Active Services* stat, `dcount(resource.service.name)`. It is
+      # the ONE dcount column that routes on a measure alone: the column is a
+      # declared dimension, so the widget's `IS NOT NULL` becomes a row filter.
+      # The other dcount panels guard on a NON-dimension (`name`, `body`,
+      # `context___trace_id`) and would each also need a `count` guard measure —
+      # *Unique Endpoints* additionally promotes a two-way `server` scope, which is
+      # a filter variant the tier deliberately does not declare.
+      - { name: service_name_hll, agg: hll, column: resource___service___name }
+      # monoscope RUM summary widgets. The filters are `browserScope`,
+      # `pageViewPredicate` and `errorPredicate` verbatim and must stay in lockstep
+      # with them. Each `count` with a column is the guard for its widget's
+      # `IS NOT NULL`. An environment-scoped view still misses: that column is not
+      # a dimension.
+      - { name: rum_pageview_count, agg: count, filter: "name LIKE 'Pageview %' OR name = 'documentLoad'" }
+      - {
+          name: rum_error_count,
+          agg: count,
+          filter: "(resource___telemetry___sdk___language IN ('webjs', 'javascript', 'js') OR resource___user_agent___original IS NOT NULL OR name IN ('documentLoad', 'documentFetch') OR (name LIKE 'Pageview %' OR name = 'documentLoad')) AND (status_code = 'ERROR' OR lower(COALESCE(level, '')) = 'error' OR attributes___exception___type IS NOT NULL)",
+        }
+      - {
+          name: rum_session_count,
+          agg: count,
+          column: attributes___session___id,
+          filter: "resource___telemetry___sdk___language IN ('webjs', 'javascript', 'js') OR resource___user_agent___original IS NOT NULL OR name IN ('documentLoad', 'documentFetch') OR (name LIKE 'Pageview %' OR name = 'documentLoad')",
+        }
+      - {
+          name: rum_session_hll,
+          agg: hll,
+          column: attributes___session___id,
+          filter: "resource___telemetry___sdk___language IN ('webjs', 'javascript', 'js') OR resource___user_agent___original IS NOT NULL OR name IN ('documentLoad', 'documentFetch') OR (name LIKE 'Pageview %' OR name = 'documentLoad')",
+        }
+      - { name: rum_pageview_duration_count, agg: count, column: duration, filter: "name LIKE 'Pageview %' OR name = 'documentLoad'" }
+      - { name: rum_pageview_duration_digest, agg: tdigest, column: duration, filter: "name LIKE 'Pageview %' OR name = 'documentLoad'" }
   - grain: 1h
     name: dashboard_1h_v3
     derive_from: dashboard_1m_v4

@@ -2152,6 +2152,67 @@ async fn a_distinct_count_over_services_routes_and_matches_the_raw_sketch() -> R
 /// Covers the hybrid case: a rollup interior over yesterday plus the raw fringe
 /// (yesterday's uncovered edges and today). Coverage extent is a function of `now`,
 /// so the clock is pinned, once just after the date flip and once mid-day.
+/// monoscope's RUM summary widgets, as its SQL sends them, must route to the
+/// `rum_*` measures and agree with raw. The fixture mixes rows each predicate
+/// must keep apart: backend spans, browser rows found only by user agent, page
+/// views of both spellings, errors found by status, level and exception, and
+/// null sessions and durations under the `IS NOT NULL` guards.
+#[serial]
+#[tokio::test]
+async fn rum_widgets_route_and_match_raw() -> Result<()> {
+    let env = rollup_env("rollup_rum_widgets").await?;
+    let db = Arc::clone(&env.db);
+    db.cancel_maintenance();
+    let fixture = [
+        serde_json::json!({ "name": "Pageview · /home", "resource___telemetry___sdk___language": "webjs", "attributes___session___id": "s1", "duration": 1200 }),
+        serde_json::json!({ "name": "documentLoad", "resource___user_agent___original": "Mozilla", "attributes___session___id": "s2", "duration": 900 }),
+        serde_json::json!({ "name": "documentFetch", "resource___user_agent___original": "Mozilla", "attributes___session___id": "s2", "status_code": "ERROR" }),
+        serde_json::json!({ "name": "click", "resource___telemetry___sdk___language": "js", "attributes___session___id": "s3", "attributes___exception___type": "TypeError" }),
+        serde_json::json!({ "name": "log", "resource___user_agent___original": "Mozilla", "level": "ERROR", "attributes___session___id": "s1" }),
+        serde_json::json!({ "name": "Pageview · /cart", "resource___telemetry___sdk___language": "webjs" }),
+        serde_json::json!({ "name": "GET /api", "status_code": "ERROR", "attributes___session___id": "s9", "duration": 50 }),
+        serde_json::json!({ "name": "GET /api", "duration": 70 }),
+    ];
+    for (i, fields) in fixture.iter().enumerate() {
+        // Spread over five hours: an interior under a fifth of the 14h window declines as tiny.
+        env.insert_fields(&format!("y{i}"), env.yesterday_noon + 17 + i as i64 * 2_500_000_000, fields.clone()).await?;
+    }
+    assert!(env.certify_and_drain().await? > 0, "eligible yesterday slices must be drained");
+    for (i, fields) in fixture.iter().take(4).enumerate() {
+        env.insert_fields(&format!("t{i}"), env.midnight + 5_000_000 + i as i64 * 1_000_000_000, fields.clone()).await?;
+    }
+
+    let browser = "(resource___telemetry___sdk___language IN ('webjs', 'javascript', 'js') OR resource___user_agent___original IS NOT NULL \
+                   OR name IN ('documentLoad', 'documentFetch') OR (name LIKE 'Pageview %' OR name = 'documentLoad'))";
+    let pageview = "(name LIKE 'Pageview %' OR name = 'documentLoad')";
+    let error = "(status_code = 'ERROR' OR lower(COALESCE(level, '')) = 'error' OR attributes___exception___type IS NOT NULL)";
+    let (window, ctx) = (env.window(), ctx_for(&db)?);
+    let show = |batches: Vec<RecordBatch>| datafusion::arrow::util::pretty::pretty_format_batches(&batches).expect("format").to_string();
+    for query in [
+        format!(
+            "SELECT distinct_count(approx_count_distinct(attributes___session___id))::float AS v FROM otel_logs_and_spans WHERE {window} AND {browser} AND attributes___session___id IS NOT NULL"
+        ),
+        format!(
+            "SELECT time_bucket('1 hours', timestamp) AS tb, count(*)::float AS v FROM otel_logs_and_spans WHERE {window} AND {pageview} GROUP BY 1 ORDER BY 1"
+        ),
+        format!(
+            "SELECT time_bucket('1 hours', timestamp) AS tb, count(*)::float AS v FROM otel_logs_and_spans WHERE {window} AND {browser} AND {error} GROUP BY 1 ORDER BY 1"
+        ),
+        format!(
+            "SELECT round(approx_percentile(0.75, percentile_agg(duration))) AS v FROM otel_logs_and_spans WHERE {window} AND {pageview} AND duration IS NOT NULL"
+        ),
+        format!(
+            "SELECT time_bucket('1 hours', timestamp) AS tb, count(*) FILTER (WHERE {pageview})::float AS pv, \
+             count(*) FILTER (WHERE {browser} AND {error})::float AS err FROM otel_logs_and_spans WHERE {window} GROUP BY 1 ORDER BY 1"
+        ),
+    ] {
+        let raw = show(db.query_delta_only(&query).await?);
+        assert!(raw.lines().count() > 4, "an empty answer makes the parity assertion vacuous: {query}");
+        assert_eq!(show(routed_any(&ctx, &query, "a RUM widget must route").await?), raw, "the routed answer must equal raw: {query}");
+    }
+    Ok(())
+}
+
 #[test_case(30 ; "just after midnight")]
 #[test_case(13 * 60 ; "early afternoon")]
 #[serial]

@@ -1045,7 +1045,16 @@ pub(crate) fn slice_input_sql(
 /// A bridge for cells written before `TAG_MEASURES` existed. ADD AN ENTRY
 /// whenever a measure is declared on a spec before the cells predating it are
 /// rebuilt; delete the constant once every cell carries the tag.
-const MEASURES_ABSENT_FROM_LEGACY_CELLS: [&str; 2] = ["duration_digest", "service_name_hll"];
+const MEASURES_ABSENT_FROM_LEGACY_CELLS: [&str; 8] = [
+    "duration_digest",
+    "service_name_hll",
+    "rum_pageview_count",
+    "rum_error_count",
+    "rum_session_count",
+    "rum_session_hll",
+    "rum_pageview_duration_count",
+    "rum_pageview_duration_digest",
+];
 
 impl RoutedRollup {
     /// Every tier column this rewrite reads a state out of, the `HAVING` guard
@@ -3280,6 +3289,45 @@ mod tests {
         assert!(generated.contains("duration_digest"), "the percentile must read the digest state: {generated}");
         assert!(generated.contains("duration_count"), "the guarded count(*) must resolve to count(duration): {generated}");
         assert!(!generated.contains("request_count"), "request_count counts null-duration rows the guard excluded: {generated}");
+    }
+
+    /// monoscope's RUM predicates (`browserScope`, `pageViewPredicate`, `errorPredicate`)
+    /// and the widget scope `{{query_ast_filters}}` expands to, byte for byte.
+    const RUM_SCOPE: &str = "project_id = 'project' AND timestamp BETWEEN '1970-01-01T00:00:00Z' AND '1970-01-02T00:00:00Z' AND TRUE";
+    const RUM_BROWSER: &str = "(resource___telemetry___sdk___language IN ('webjs', 'javascript', 'js') OR resource___user_agent___original IS NOT NULL \
+                               OR name IN ('documentLoad', 'documentFetch') OR (name LIKE 'Pageview %' OR name = 'documentLoad'))";
+    const RUM_PAGEVIEW: &str = "(name LIKE 'Pageview %' OR name = 'documentLoad')";
+    const RUM_ERROR: &str = "(status_code = 'ERROR' OR lower(COALESCE(level, '')) = 'error' OR attributes___exception___type IS NOT NULL)";
+
+    /// Every RUM summary widget routes and reads the measures declared for it —
+    /// the promoted scope resolves to its guard, the aggregate to its state.
+    #[test_case::test_case(
+        &format!("SELECT distinct_count(approx_count_distinct(attributes___session___id))::float FROM {SOURCE} \
+                  WHERE {RUM_SCOPE} AND {RUM_BROWSER} AND attributes___session___id IS NOT NULL"),
+        &["rum_session_hll", "rum_session_count"] ; "sessions")]
+    #[test_case::test_case(
+        &format!("SELECT extract(epoch from time_bucket('5 minutes', timestamp))::integer, 'value', count(*)::float FROM {SOURCE} \
+                  WHERE {RUM_SCOPE} AND {RUM_PAGEVIEW} GROUP BY time_bucket('5 minutes', timestamp)"),
+        &["rum_pageview_count"] ; "page views")]
+    #[test_case::test_case(
+        &format!("SELECT extract(epoch from time_bucket('5 minutes', timestamp))::integer, 'value', count(*)::float FROM {SOURCE} \
+                  WHERE {RUM_SCOPE} AND {RUM_BROWSER} AND {RUM_ERROR} GROUP BY time_bucket('5 minutes', timestamp)"),
+        &["rum_error_count"] ; "browser errors")]
+    #[test_case::test_case(
+        &format!("SELECT approx_percentile(0.75, percentile_agg(duration)) / 1000000.0 FROM {SOURCE} \
+                  WHERE {RUM_SCOPE} AND {RUM_PAGEVIEW} AND duration IS NOT NULL"),
+        &["rum_pageview_duration_digest", "rum_pageview_duration_count"] ; "p75 page load")]
+    #[test_case::test_case(
+        &format!("SELECT extract(epoch from time_bucket('5 minutes', timestamp))::integer AS time, \
+                  count(*) FILTER (WHERE {RUM_PAGEVIEW})::float AS page_views, count(*) FILTER (WHERE {RUM_BROWSER} AND {RUM_ERROR})::float AS errors \
+                  FROM {SOURCE} WHERE {RUM_SCOPE} AND resource___service___name = 'web' GROUP BY time_bucket('5 minutes', timestamp)"),
+        &["rum_pageview_count", "rum_error_count"] ; "page views and errors chart under a service scope")]
+    #[tokio::test]
+    async fn rum_widgets_route_to_their_declared_measures(sql: &str, measures: &[&str]) {
+        let (_, generated) = assert_substitutes(&session().await, sql, None).await;
+        for measure in measures {
+            assert!(generated.contains(measure), "{measure} must be read: {generated}");
+        }
     }
 
     /// Shapes that must decline with exactly the reason named — the reason IS the

@@ -1169,6 +1169,8 @@ mod tantivy_rewriter_tests {
     #[test_case("fo_", None, true => None ; "_ never accelerates")]
     #[test_case("foo+bar", None, true => None ; "query-syntax metachar")]
     #[test_case("svc.user-api", None, false => Some("svc.user-api".to_string()) ; "dots and dashes survive")]
+    #[test_case("Pageview %", None, true => None ; "a space before the wildcard would leave a lone star term")]
+    #[test_case("% Pageview", None, true => None ; "a space after a leading wildcard")]
     #[test_case("foo\\%", Some('\\'), false => None ; "escaped metachar: bail conservatively")]
     fn like_classifier_cases(pat: &str, esc: Option<char>, substring: bool) -> Option<String> {
         classify_like_pattern(pat, esc, substring)

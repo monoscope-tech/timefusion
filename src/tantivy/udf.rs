@@ -67,7 +67,9 @@ pub fn classify_like_pattern(pat: &str, escape: Option<char>, allow_substring: b
         }
         out.push(lit);
     }
-    if out.is_empty() {
+    // The query parser splits on whitespace, so an edge space leaves a lone `*`
+    // or empty term that matches nothing: `'Pageview %'` dropped every row.
+    if out.is_empty() || out.starts_with(' ') || out.ends_with(' ') {
         return None;
     }
     Some(match (leading_wildcard, trailing_wildcard) {
@@ -105,7 +107,7 @@ pub fn regex_literal_substring(pat: &str) -> Option<String> {
         )
     })
     .collect::<Option<String>>()?;
-    (!out.is_empty()).then_some(out)
+    (!out.is_empty() && !out.starts_with(' ') && !out.ends_with(' ')).then_some(out)
 }
 
 /// Classify a deferred (placeholder-routed) `text_match` once the `$N` has been
