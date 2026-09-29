@@ -524,9 +524,6 @@ pub fn note_probe_cost_into(costs: &dashmap::DashMap<String, u64>, table_name: &
 }
 
 /// Rows an `Add` declares in its Delta statistics, when it declares any.
-/// Packed publications keyed by `(slice range, generation)`.
-type PackedGroups = HashMap<((i64, i64), Option<String>), Vec<deltalake::kernel::Add>>;
-
 pub(crate) fn add_row_count(add: &deltalake::kernel::Add) -> Option<u64> {
     serde_json::from_str::<serde_json::Value>(add.stats.as_deref()?).ok()?.get("numRecords")?.as_u64()
 }
@@ -2500,122 +2497,6 @@ impl Database {
             .then_some((start, end))
     }
 
-    fn packed_rollup_repair_allowed(&self, key: &crate::maintenance_coordinator::TaskKey) -> bool {
-        self.config.maintenance.timefusion_rollup_packed_repairs
-            && get_schema(&key.source)
-                .and_then(|schema| schema.rollups.iter().find(|spec| spec.table_name(&key.source) == key.physical_table))
-                .and_then(|spec| spec.grain_micros())
-                .is_some_and(|grain| grain > 0 && key.slice.start_micros.rem_euclid(grain) == 0 && key.slice.end_micros.rem_euclid(grain) == 0)
-    }
-
-    /// Live files of `key`'s project that straddle its slice, grouped by publication.
-    fn packed_groups(key: &crate::maintenance_coordinator::TaskKey, live: &[deltalake::kernel::Add]) -> PackedGroups {
-        live.iter()
-            .filter_map(|add| {
-                let range = Self::slice_tag_range(add)?;
-                (Self::tag_project(add) == Some(key.project_id.as_str())
-                    && key.slice.overlaps(range.0, range.1)
-                    && (range.0 < key.slice.start_micros || range.1 > key.slice.end_micros))
-                    .then(|| ((range, Self::add_tag(add, crate::maintenance_coordinator::TAG_GENERATION).map(str::to_owned)), add.clone()))
-            })
-            .into_group_map()
-    }
-
-    /// Publications that predate per-file output proofs, or whose generation is no
-    /// longer current, cannot be split: carrying their remainders forward would keep
-    /// stale rows. Their repairs escalate to the covering slice as unpacked ones do.
-    fn packed_evidence_complete(key: &crate::maintenance_coordinator::TaskKey, groups: &PackedGroups) -> bool {
-        let spec = get_schema(&key.source).and_then(|schema| schema.rollups.iter().find(|spec| spec.table_name(&key.source) == key.physical_table));
-        groups.iter().all(|(((start, _), generation), files)| {
-            let proof = files.iter().map(RollupOutputProof::from_add).reduce(RollupOutputProof::merge);
-            let tags = carried_coverage_tags(files);
-            let measures = tags
-                .get(crate::maintenance_coordinator::TAG_MEASURES)
-                .map(|names| names.split(',').filter(|name| !name.is_empty()).map(str::to_owned).collect::<Vec<_>>());
-            let current = spec.zip(chrono::DateTime::from_timestamp_micros(*start)).is_some_and(|(spec, day)| {
-                generation.as_deref()
-                    == Some(crate::rollup::generation_id(spec, &key.source, &key.project_id, &day.date_naive().to_string(), 0, measures.as_deref()).as_str())
-            });
-            current
-                && proof.is_some_and(|proof| proof.live.is_some() && proof.live == proof.published)
-                && tags.contains_key(crate::maintenance_coordinator::TAG_GENERATION)
-        })
-    }
-
-    /// Packed repair applies to `key` against this live set.
-    fn packed_repair_applies(&self, key: &crate::maintenance_coordinator::TaskKey, live: &[deltalake::kernel::Add]) -> bool {
-        self.packed_rollup_repair_allowed(key) && Self::packed_evidence_complete(key, &Self::packed_groups(key, live))
-    }
-
-    /// Stage only the aggregate rows outside an aligned repair. The caller commits
-    /// these Adds with the repaired slice and retires every original in one transaction.
-    async fn stage_packed_rollup_remainders(
-        &self, key: &crate::maintenance_coordinator::TaskKey, table: &DeltaTable, live: &[deltalake::kernel::Add], staged: &mut Vec<deltalake::kernel::Add>,
-    ) -> Result<Vec<deltalake::kernel::Add>> {
-        use crate::maintenance_coordinator::{TAG_OUTPUT_ROWS, TAG_SLICE_END, TAG_SLICE_START, TAG_SOURCE_ROWS_BELOW};
-        use deltalake::writer::DeltaWriter;
-        let groups = Self::packed_groups(key, live);
-        anyhow::ensure!(Self::packed_evidence_complete(key, &groups), "packed publication lacks complete, consistent output evidence");
-        let schema = get_schema(&key.physical_table).context("packed rollup schema missing")?;
-        let mut retired = Vec::new();
-        for ((range, _), files) in groups {
-            let coverage_tags = carried_coverage_tags(&files);
-            for (start, end) in crate::rollup::uncovered(range.0, range.1, vec![(key.slice.start_micros, key.slice.end_micros)]) {
-                let ctx = self.bounded_rollup_maintenance_context(256)?;
-                let provider = Self::narrow_provider(
-                    table.log_store(),
-                    Arc::new(table.snapshot()?.snapshot().clone()),
-                    files.iter().map(|add| add.path.clone()).collect(),
-                    None,
-                    None,
-                )
-                .await?;
-                ctx.register_table("__packed_rollup", provider)?;
-                let mut stream = ctx
-                    .sql(&format!("SELECT * FROM __packed_rollup WHERE timestamp >= to_timestamp_micros({start}) AND timestamp < to_timestamp_micros({end})"))
-                    .await?
-                    .execute_stream()
-                    .await?;
-                let mut writer = deltalake::writer::RecordBatchWriter::for_table(table)?.with_writer_properties(self.create_writer_properties(
-                    schema,
-                    self.config.parquet.timefusion_zstd_compression_level,
-                    false,
-                ));
-                let arrow_schema = writer.arrow_schema();
-                let mut rows = 0u64;
-                let first_output = staged.len();
-                loop {
-                    let batch = tokio::select! {
-                        batch = stream.try_next() => batch?,
-                        () = self.maintenance_shutdown.cancelled() => anyhow::bail!("packed rollup staging cancelled"),
-                    };
-                    let Some(batch) = batch else { break };
-                    rows = rows.checked_add(u64::try_from(batch.num_rows())?).context("packed output row count overflow")?;
-                    writer.write(deltalake::kernel::schema::cast_record_batch(&batch, arrow_schema.clone(), true, true)?).await?;
-                    if writer.buffer_len() >= self.config.maintenance.timefusion_writer_max_file_bytes {
-                        staged.extend(writer.flush().await?);
-                    }
-                }
-                staged.extend(writer.flush().await?);
-                // Every cut file carries the total for this complete fragment.
-                for add in &mut staged[first_output..] {
-                    add.data_change = true;
-                    add.tags = Some(coverage_tags.iter().map(|(name, value)| (name.clone(), Some(value.clone()))).collect());
-                    let tags = add.tags.get_or_insert_default();
-                    tags.insert(TAG_SLICE_START.to_owned(), Some(start.to_string()));
-                    tags.insert(TAG_SLICE_END.to_owned(), Some(end.to_string()));
-                    tags.insert(TAG_OUTPUT_ROWS.to_owned(), Some(rows.to_string()));
-                    // A witness measured at the old bound cannot prove the new bound.
-                    if end != range.1 {
-                        tags.remove(TAG_SOURCE_ROWS_BELOW);
-                    }
-                }
-            }
-            retired.extend(files);
-        }
-        Ok(retired)
-    }
-
     /// Decoded bytes a unit reads from one file, narrowed to the columns it
     /// projects: `(prorated to the slice, whole file)`. The unprorated figure is
     /// what a sibling slice over the same file would re-read.
@@ -3518,7 +3399,7 @@ impl Database {
             rows,
             covered: &covered,
         };
-        let mut replaced = live_adds
+        let replaced = live_adds
             .iter()
             .filter(|add| {
                 let partition = Self::maintenance_partition_from_action(&add.path, Some(&add.partition_values), "default");
@@ -3542,8 +3423,7 @@ impl Database {
         let leaves_partition_clean = !live_adds.iter().filter(|add| in_partition(add) && !replaced.iter().any(|gone| gone.path == add.path)).any(no_identity);
         // Applies to BOTH tiers — see `covering_slice_for` for why publishing over a
         // wider live file double counts.
-        let packed = self.packed_repair_applies(&key, &live_adds);
-        if !packed && let Some(covering) = live_adds.iter().find_map(|add| Self::covering_slice_for(add, &key)) {
+        if let Some(covering) = live_adds.iter().find_map(|add| Self::covering_slice_for(add, &key)) {
             // The SAFETY NET. The same decision is made before the scan (see the
             // other `settle_covered_by_wider` call site), but a wider slice can be
             // committed by another worker while this unit was aggregating, so the
@@ -3553,15 +3433,6 @@ impl Database {
             return Ok(true);
         }
         let slice_output_files = adds.len() as u64;
-        if packed {
-            match self.stage_packed_rollup_remainders(&key, &staging_table, &live_adds, &mut adds).await {
-                Ok(packed) => replaced.extend(packed),
-                Err(error) => {
-                    Self::cleanup_orphaned_parquet(&stage_store, &adds.iter().cloned().map(Action::Add).collect::<Vec<_>>()).await;
-                    return Err(error);
-                }
-            }
-        }
         let stage_ms = stage_started.elapsed().as_millis() as u64;
         heap.mark("stage");
         let commit_started = std::time::Instant::now();
@@ -5186,13 +5057,6 @@ impl Database {
                 );
             }
             return Ok(true);
-        }
-        if self.packed_rollup_repair_allowed(key)
-            && let Ok(target) = self.resolve_table(&key.project_id, &key.physical_table).await
-            && let Ok(snapshot) = target.read().await.snapshot().cloned()
-            && self.packed_repair_applies(key, &snapshot.log_data().iter().map(|file| add_action(&file)).collect::<Vec<_>>())
-        {
-            return Ok(false);
         }
         let escalated = {
             let _guard = crate::support::lock(&self.rollup_journal_lock);
@@ -12500,91 +12364,6 @@ mod rollup_noop_skip_tests {
         Ok(())
     }
 
-    #[test_case::test_case(Some("3"), Some(true), true ; "complete publication packs")]
-    #[test_case::test_case(None, Some(true), false ; "missing output rows escalates")]
-    #[test_case::test_case(Some("2"), Some(true), false ; "disagreeing output rows escalates")]
-    #[test_case::test_case(Some("3"), None, false ; "missing generation escalates")]
-    #[test_case::test_case(Some("3"), Some(false), false ; "obsolete generation escalates")]
-    fn packed_repair_needs_complete_output_evidence(output_rows: Option<&str>, current: Option<bool>, packs: bool) {
-        use crate::maintenance_coordinator::{
-            TAG_GENERATION, TAG_OUTPUT_ROWS, TAG_PROJECT, TAG_SLICE_END, TAG_SLICE_START, TAG_SOURCE, TAG_SOURCE_FINGERPRINT, TaskKey, TimeSlice,
-        };
-        let hour = 3_600_000_000i64;
-        let spec = get_schema("otel_logs_and_spans")
-            .and_then(|schema| schema.rollups.iter().find(|spec| spec.table_name("otel_logs_and_spans") == TIER))
-            .expect("tier spec");
-        let generation = current
-            .map(|current| if current { crate::rollup::generation_id(spec, "otel_logs_and_spans", "p", "1970-01-01", 1, None) } else { "obsolete".into() });
-        let tags = [
-            (TAG_SOURCE, Some("otel_logs_and_spans")),
-            (TAG_SOURCE_FINGERPRINT, Some("1")),
-            (TAG_PROJECT, Some("p")),
-            (TAG_SLICE_START, Some("0")),
-            (TAG_SLICE_END, Some("10800000000")),
-            (TAG_OUTPUT_ROWS, output_rows),
-            (TAG_GENERATION, generation.as_deref()),
-        ];
-        let live = vec![deltalake::kernel::Add {
-            path: "packed.parquet".into(),
-            stats: Some(r#"{"numRecords":3}"#.into()),
-            tags: Some(tags.iter().filter_map(|(name, value)| Some(((*name).to_owned(), Some((*value)?.to_owned())))).collect()),
-            ..Default::default()
-        }];
-        let key = TaskKey {
-            project_id: "p".into(),
-            source: "otel_logs_and_spans".into(),
-            physical_table: TIER.into(),
-            slice: TimeSlice::new(hour, 2 * hour).expect("valid slice"),
-            operation: Operation::BaseRollup,
-        };
-        assert_eq!(Database::packed_evidence_complete(&key, &Database::packed_groups(&key, &live)), packs);
-    }
-
-    #[tokio::test]
-    async fn packed_rollup_remainders_cut_files_at_the_writer_limit() -> Result<()> {
-        use crate::maintenance_coordinator::{TAG_OUTPUT_ROWS, TaskKey, TimeSlice};
-        let mut cfg = (*rollup_cfg("packed_writer_limit")).clone();
-        cfg.maintenance.timefusion_rollup_packed_repairs = true;
-        cfg.maintenance.timefusion_writer_max_file_bytes = 1;
-        let db = Database::with_config(Arc::new(cfg)).await?;
-        let project = format!("packed_limit_{}", uuid::Uuid::new_v4());
-        let date = chrono::Utc::now().date_naive() - chrono::Duration::days(3);
-        let start = date.and_hms_opt(11, 0, 0).expect("valid hour").and_utc().timestamp_micros();
-        let hour = 3_600_000_000;
-        let rows = (0i64..900)
-            .map(|index| {
-                let mut row = test_span_ts(&format!("row-{index}"), "op", &project, start + (index / 300) * hour);
-                row["resource___service___name"] = serde_json::json!(format!("service-{}", index % 300));
-                row
-            })
-            .collect();
-        db.insert_records_batch(&project, "otel_logs_and_spans", vec![json_to_batch(rows)?], true, None).await?;
-        let built = db.run_unit_once("otel_logs_and_spans", &project, date, Operation::BaseRollup, 3, 11, None).await?;
-        assert_eq!(built.state, Some(TaskState::Complete), "fixture must build real aggregate states: {built}");
-        let target = db.resolve_table(&project, TIER).await?.read().await.clone();
-        let live: Vec<_> = target.snapshot()?.log_data().iter().map(|file| add_action(&file)).collect();
-        assert_eq!(live.iter().map(add_row_count).sum::<Option<u64>>(), Some(900), "each retained hour must exceed the 256-row scan batch");
-        let key = TaskKey {
-            project_id: project,
-            source: "otel_logs_and_spans".to_owned(),
-            physical_table: TIER.to_owned(),
-            slice: TimeSlice::new(start + hour, start + 2 * hour)?,
-            operation: Operation::BaseRollup,
-        };
-        let mut staged = Vec::new();
-        let retired = db.stage_packed_rollup_remainders(&key, &target, &live, &mut staged).await?;
-        Database::cleanup_orphaned_parquet(
-            &target.log_store().object_store(None),
-            &staged.iter().cloned().map(deltalake::kernel::Action::Add).collect::<Vec<_>>(),
-        )
-        .await;
-        assert_eq!(retired.len(), live.len(), "the original packed publication remains the replacement set");
-        assert_eq!(staged.iter().map(add_row_count).sum::<Option<u64>>(), Some(600), "file cuts must preserve both neighboring hours");
-        assert!(staged.iter().all(|add| Database::add_tag(add, TAG_OUTPUT_ROWS) == Some("300")), "each fragment records its total across all cut files");
-        assert!(staged.len() > 2, "each multi-batch fragment must flush before its end at a one-byte cutoff");
-        Ok(())
-    }
-
     /// A sibling publication elsewhere in the day cannot hold rows of this slice, so it
     /// must not discard the staged output (`slice_occ_stale` threw away ~30% of prod
     /// publications and rescanned them).
@@ -12654,152 +12433,6 @@ mod rollup_noop_skip_tests {
         drop(held);
         let report = build.await?;
         assert_eq!(report.state, Some(TaskState::Complete), "a non-overlapping sibling commit must not make the unit stale: {report}");
-        Ok(())
-    }
-
-    #[test_case::test_case(false, false ; "nonempty middle replacement")]
-    #[test_case::test_case(true, false ; "empty middle replacement")]
-    #[test_case::test_case(false, true ; "interrupted nonempty replacement")]
-    #[test_case::test_case(true, true ; "interrupted empty replacement")]
-    #[serial]
-    #[tokio::test]
-    async fn a_scoped_repair_preserves_packed_output_without_widening_raw_work(empty: bool, interrupted: bool) -> Result<()> {
-        use datafusion::arrow::{array::AsArray, datatypes::Int64Type};
-        let mut cfg = (*rollup_cfg("packed_rollup_repair")).clone();
-        cfg.maintenance.timefusion_rollup_packed_repairs = true;
-        let cfg = Arc::new(cfg);
-        let mut db = Arc::new(Database::with_config(Arc::clone(&cfg)).await?);
-        let project = format!("packed_{}", uuid::Uuid::new_v4());
-        let date = chrono::Utc::now().date_naive() - chrono::Duration::days(3);
-        for hour in [11, 12, 13] {
-            insert_span(&db, &project, date, hour, &format!("seed-{hour}"), "op").await?;
-        }
-        dedup_unified(&db).await?;
-        advance_and_drain(&db).await?;
-        let packed = db.run_unit_once("otel_logs_and_spans", &project, date, Operation::BaseRollup, 3, 11, None).await?;
-        assert_eq!(packed.state, Some(TaskState::Complete), "the fixture requires a real three-hour publication");
-        let start = date.and_hms_opt(11, 0, 0).expect("valid hour").and_utc().timestamp_micros();
-        let hour = 3_600_000_000;
-        let mut target = db.resolve_table(&project, TIER).await?;
-        assert!(
-            target.read().await.snapshot()?.log_data().iter().any(|file| Database::slice_tag_range(&add_action(&file)) == Some((start, start + 3 * hour))),
-            "the fixture must retain a file spanning both unchanged hours and the repair"
-        );
-        let mut changed = test_span_ts(if empty { "seed-12" } else { "late-middle" }, "op", &project, start + hour);
-        changed["deleted"] = serde_json::json!(empty);
-        db.insert_records_batch(&project, "otel_logs_and_spans", vec![json_to_batch(vec![changed])?], true, None).await?;
-        dedup_unified(&db).await?;
-        if interrupted {
-            let version = target.read().await.version();
-            let lock = db.commit_lock(&project, TIER).await;
-            let held = lock.lock().await;
-            let mut intent = {
-                let build = db.run_unit_once("otel_logs_and_spans", &project, date, Operation::BaseRollup, 1, 12, None);
-                tokio::pin!(build);
-                tokio::time::timeout(std::time::Duration::from_secs(60), async {
-                    let mut poll = tokio::time::interval(std::time::Duration::from_millis(10));
-                    loop {
-                        tokio::select! {
-                            result = &mut build => {
-                                let report = result?;
-                                anyhow::bail!("repair finished before its held commit lock: {report}");
-                            },
-                            _ = poll.tick() => {
-                                if let Some(intent) = db.staged_intents().into_iter().find(|intent| {
-                                    intent.project_id == project && intent.rollup.as_ref().is_some_and(|rollup| {
-                                        rollup.key.physical_table == TIER && rollup.key.slice.start_micros == start + hour
-                                            && rollup.key.slice.end_micros == start + 2 * hour
-                                    })
-                                }) {
-                                    break Ok::<_, anyhow::Error>(intent);
-                                }
-                            }
-                        }
-                    }
-                })
-                .await??
-            }; // Dropping the builder here simulates interruption before publication.
-            drop(held);
-            assert_eq!(target.read().await.version(), version, "staging must not publish any replacement files");
-            let rollup = intent.rollup.clone().expect("real builder must record recovery evidence");
-            assert!(rollup.target.is_some(), "packed replacement needs the captured target proof");
-            let staged_paths: HashSet<_> = intent.adds.iter().map(|add| add.path.clone()).collect();
-            assert!(!staged_paths.is_empty(), "even an empty middle repair must stage its retained neighbors");
-            // The fixture restarts in one process, so age the old instance's record.
-            intent.recorded_at = crate::support::now_secs() - (STAGED_INTENT_MIN_AGE_SECS + 1);
-            db.clear_staged_intent(&[&intent.wave_id]);
-            db.record_staged_intent(intent);
-            db.shutdown_by(tokio::time::Instant::now() + std::time::Duration::from_secs(10)).await?;
-            db = Arc::new(Database::with_config(Arc::clone(&cfg)).await?);
-            target = db.resolve_table(&project, TIER).await?;
-            let deadline = {
-                let journal = db.journal();
-                let retry = journal.tasks().find(|task| task.key == rollup.key).expect("interrupted task survives restart");
-                assert_eq!(retry.retry_reason.as_deref(), Some(crate::maintenance_coordinator::TaskJournal::WORKER_FAILURE_REASON));
-                retry.deadline_micros
-            };
-            // Dropping the future runs lease cleanup; respect its persisted backoff.
-            crate::support::advance_micros(deadline.saturating_sub(crate::support::now_micros()).max(0));
-            let resumed = db.run_unit_once("otel_logs_and_spans", &project, date, Operation::BaseRollup, 1, 12, None).await?;
-            assert_eq!(resumed.state, Some(TaskState::Complete), "the worker must resume the staged packed replacement: {resumed}");
-            assert_eq!(resumed.cohorts, 0, "recovery must not repeat raw aggregation");
-            assert_eq!(target.read().await.version(), version.map(|version| version + 1), "resume needs exactly one atomic publication");
-            let live: HashSet<_> = target.read().await.snapshot()?.log_data().iter().map(|file| file.path().to_string()).collect();
-            assert!(staged_paths.is_subset(&live), "resume must reuse the staged paths, not rebuild the aggregates");
-            assert!(
-                db.journal().tasks().all(|task| task.key.project_id != project || task.key.physical_table != TIER || !task.state.is_active()),
-                "resume must not queue raw aggregation"
-            );
-            db.recover_rollup_coverage("otel_logs_and_spans").await?;
-        } else {
-            let repair = db.run_unit_once("otel_logs_and_spans", &project, date, Operation::BaseRollup, 1, 12, None).await?;
-            assert_eq!(repair.state, Some(TaskState::Complete));
-            assert!(repair.cohorts > 0, "the dirty hour must actually rebuild, not complete by queuing the packed interval");
-        }
-        let unfinished: Vec<_> = db
-            .journal()
-            .tasks()
-            .filter(|task| task.key.project_id == project && task.key.physical_table == TIER && task.state.is_active())
-            .map(|task| (task.key.slice, task.state, task.retry_reason.clone()))
-            .collect();
-        assert!(
-            // Row witnesses count the whole date or the rows below a slice's end, so after a
-            // restart the middle-hour change re-queues slices above it, packed or not.
-            unfinished
-                .iter()
-                .all(|(slice, _, _)| slice.start_micros >= start + hour && (slice.end_micros <= start + 2 * hour || slice.start_micros >= start + 2 * hour)),
-            "a one-hour correction must not queue raw aggregation of unchanged neighboring hours: {unfinished:?}"
-        );
-        let mut ctx = Arc::clone(&db).create_session_context();
-        db.setup_session_context(&mut ctx)?;
-        let query = format!("SELECT SUM(request_count) FROM {TIER} WHERE project_id = '{project}'");
-        let expected = if empty { 2 } else { 4 };
-        let rows = ctx.sql(&query).await?.collect().await?;
-        assert_eq!(rows[0].column(0).as_primitive::<Int64Type>().value(0), expected, "retained neighbors and replacement must contribute exactly once");
-        let key = (project.clone(), "otel_logs_and_spans".to_owned(), TIER.to_owned(), start + hour, start + 2 * hour);
-        let evidence = db.rollup_slice_coverage.get(&key).expect("repaired hour must publish coverage").output;
-        assert_eq!(evidence == RollupOutputEvidence::Empty, empty, "retained output files do not make an empty repair nonempty");
-        let version = target.read().await.version();
-        drop(ctx);
-        drop(target);
-        db.shutdown_by(tokio::time::Instant::now() + std::time::Duration::from_secs(10)).await?;
-        drop(db);
-
-        let db = Arc::new(Database::with_config(cfg).await?);
-        db.recover_rollup_coverage("otel_logs_and_spans").await?;
-        let requeued: Vec<_> = db
-            .journal()
-            .tasks()
-            .filter(|task| task.key.project_id == project && task.key.physical_table == TIER && task.state.is_active())
-            .map(|task| task.key.slice)
-            .collect();
-        assert!(requeued.iter().all(|slice| slice.start_micros >= start + 2 * hour), "restart re-queued hours at or below the repair: {requeued:?}");
-        assert_eq!(db.rollup_slice_coverage.get(&key).expect("restart must recover the repaired hour").output, evidence);
-        assert_eq!(tier_version(&db).await, version, "coverage recovery must not rewrite aggregate files");
-        let mut ctx = Arc::clone(&db).create_session_context();
-        db.setup_session_context(&mut ctx)?;
-        let rows = ctx.sql(&query).await?.collect().await?;
-        assert_eq!(rows[0].column(0).as_primitive::<Int64Type>().value(0), expected, "restart cannot resurrect the replaced middle-hour rows");
         Ok(())
     }
 

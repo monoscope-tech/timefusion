@@ -1853,12 +1853,6 @@ pub struct MaintenanceConfig {
     /// paired CPU, memory, cancellation, and foreground latency gates pass.
     #[serde_inline_default(false)]
     pub timefusion_rollup_adaptive_batches: bool,
-    /// Replace aligned subranges of packed aggregate files in one commit,
-    /// preserving their remaining states without widening raw scans. Off: a remainder
-    /// carries the original build's row witness, which the repair's own source change
-    /// has already overtaken, so both neighbours read stale until rebuilt.
-    #[serde_inline_default(false)]
-    pub timefusion_rollup_packed_repairs: bool,
     /// Keep rollup slices readable across merge-on-read UPDATEs that assign only columns
     /// no rollup spec reads, by carrying the flushed rows into the slice witnesses.
     /// Dark until the shadow counter (`rollup_carry_eligible_rows`) is validated on prod.
@@ -2604,7 +2598,6 @@ mod tests {
         assert_eq!(config.timefusion_rollup_backfill_tier_inflight, 16, "a new tier must not queue its whole horizon at once");
         assert_eq!(config.timefusion_rollup_measure_remints_per_pass, 2, "a newly declared measure must not re-mint its whole horizon at once");
         assert!(!config.timefusion_rollup_adaptive_batches, "adaptive batches need the paired resource experiment before activation");
-        assert!(!config.timefusion_rollup_packed_repairs, "packed remainders need a witness that survives the repair before activation");
         assert!(!config.timefusion_rollup_certified_clean, "certified aggregation needs the paired resource experiment before activation");
         assert!(!config.timefusion_rollup_witness_carry, "the witness carry stays dark until its shadow counter is validated");
 
