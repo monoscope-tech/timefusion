@@ -274,7 +274,9 @@ test_env() {
          TIMEFUSION_FOYER_MEMORY_MB=10 TIMEFUSION_FOYER_DISK_MB=50 \
          TIMEFUSION_FOYER_METADATA_MEMORY_MB=10 TIMEFUSION_FOYER_METADATA_DISK_MB=50 \
          TIMEFUSION_FOYER_SHARDS=2 \
-         CARGO_TERM_COLOR=always RUST_BACKTRACE=1 CARGO_INCREMENTAL=0
+         CARGO_TERM_COLOR=always RUST_BACKTRACE=1
+  # CARGO_INCREMENTAL is left to the caller (ci.yml sets 0): forcing it here
+  # flipped a developer's mode and rebuilt the whole crate against their build.
   # Pin the harnesses to a local MinIO ONLY when one actually answers.
   #
   # `TIMEFUSION_TEST_S3_ENDPOINT` is the FIRST branch of `ensure_local_minio`, so
@@ -302,6 +304,13 @@ test_env() {
   if [ -z "${SSL_CERT_FILE:-}" ] && [ -f /etc/ssl/cert.pem ]; then export SSL_CERT_FILE=/etc/ssl/cert.pem; fi
 }
 
+# One feature set for every check that builds the crate, so test, doctest,
+# pg-smoke and e2e share one build. `e2e` adds only test hooks (cfg(any(test,
+# feature = "e2e"))) and the e2e target; without it here, e2e recompiled the
+# whole crate and pg-smoke's plain `cargo build` recompiled most of the
+# dependency graph (dev-dependencies change tokio's features).
+BUILD='--locked --features e2e'
+
 run_body() { # <check>
   case "$1" in
     fmt)    cargo fmt --all --check ;;
@@ -319,15 +328,17 @@ run_body() { # <check>
       # shellcheck disable=SC2086
       # nextest excludes doctests. Include them before publishing a test result,
       # so local signoff proves the same suite as the remote shards.
-      cargo nextest run --profile ci --locked ${CI_PARTITION:+--partition "$CI_PARTITION"} &&
-        cargo test --doc --locked
+      cargo nextest run --profile ci $BUILD -E 'not binary(e2e)' ${CI_PARTITION:+--partition "$CI_PARTITION"} &&
+        cargo test --doc $BUILD
       ;;
     pg-smoke) run_pg_smoke ;;
-    # Default features elsewhere: --all-features would pull `e2e` into the main
-    # suite, and 40 tests each spinning their own MinIO container swamps the box.
+    # Two threads even against a shared MinIO: at four or more, different
+    # ordering_pushdown/pressure_flush/hash_enrichment tests fail each run
+    # (2026-09-29), so the suite is not isolated beyond that.
     e2e)
       test_env
-      cargo nextest run --profile ci --features e2e --locked -E 'binary(e2e)' --test-threads 2
+      # shellcheck disable=SC2086
+      cargo nextest run --profile ci $BUILD -E 'binary(e2e)' --test-threads 2
       ;;
     *) die "no body for check '$1'" ;;
   esac
@@ -340,12 +351,15 @@ run_pg_smoke() {
   test_env
   data_dir=$(mktemp -d)
   log=$(mktemp -t tf-pg-smoke.XXXXXX)
-  # Build BEFORE backgrounding. `cargo run &` would compile inside the background
-  # job while the readiness loop is already counting, so any run whose build
-  # exceeds the timeout fails here regardless of what the code does.
-  cargo build --locked --quiet --bin timefusion
+  # The server binary the test build already produced (integration tests build
+  # it), so this is a no-op after `test` rather than a second build. Built
+  # before backgrounding, so a slow build cannot eat the readiness timeout.
+  # Explicit return: errexit is off in a condition, and a stale binary must not
+  # stand in for one that failed to build.
+  # shellcheck disable=SC2086
+  cargo test $BUILD --quiet --no-run --test suite || return 1
   TIMEFUSION_DATA_DIR="$data_dir" TIMEFUSION_ALLOW_INSECURE_AUTH=true PGWIRE_PASSWORD=postgres \
-    cargo run --locked --quiet --bin timefusion >"$log" 2>&1 &
+    "${CARGO_TARGET_DIR:-target}/debug/timefusion" >"$log" 2>&1 &
   pid=$!
   # shellcheck disable=SC2317
   # Guarded, and always returns 0. `cleanup` is a GLOBAL name (bash functions are
@@ -415,8 +429,33 @@ cmd_gate() {
   echo "skip_all=$skip_all" >> "$out"
 }
 
+# Every check's wall time, so the signoff's cost is measured rather than guessed.
+timing() { # <check> <start> <result>
+  local secs=$(( $(date +%s) - $2 ))
+  mkdir -p .ci && printf '%s\t%s\t%s\t%s\n' "$(date -u +%FT%TZ)" "$1" "$secs" "$3" >> .ci/timings.tsv
+  note "$1 $3 in ${secs}s"
+}
+
+# Compile-only checks run beside the rest in their own target dir, so they
+# neither wait on nor hold the build lock the test build needs.
+BACKGROUND=' clippy '
+
+finish() { # <check> <status> <start>
+  if [ "$2" -eq 0 ]; then
+    timing "$1" "$3" pass
+    # A green check stays green even if we cannot record it. Publishing touches
+    # the network and the object store; neither is part of what the check proved.
+    case " $degraded " in *" $1 "*) ;; *) [ "${CI_NO_ATTEST:-}" = "true" ] \
+      || record_result "$1" || note "could not record $1 — it still passed, just isn't cached" ;; esac
+  else
+    timing "$1" "$3" FAIL
+    note "FAILED $1"
+    return 1
+  fi
+}
+
 cmd_run() {
-  local c req ref rc=0 unrunnable='' degraded=''
+  local c req ref rc=0 t0 st unrunnable='' degraded='' todo='' bg=''
   CAPS=$(detect_caps)
   note "capabilities: ${CAPS:-none}"
   # shellcheck disable=SC2046
@@ -439,17 +478,29 @@ cmd_run() {
       note "$c already proven ($ref) — skipping (CI_FORCE=true to override)"
       continue
     fi
+    todo="$todo $c"
+  done
+  mkdir -p .ci
+  for c in $todo; do
+    # Alone (GitHub's one-check jobs) a check streams its output as before.
+    case "$BACKGROUND" in *" $c "*) if [ "$todo" != " $c" ]; then
+      note "running $c in the background → .ci/$c.log"
+      ( t0=$(date +%s); st=0
+        CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target}/$c" run_body "$c" >".ci/$c.log" 2>&1 || st=$?
+        echo "$st $t0" >".ci/$c.status" ) &
+      bg="$bg $c"; continue
+    fi ;; esac
     note "running $c"
-    if run_body "$c"; then
-      # A green check stays green even if we cannot record it. Publishing touches
-      # the network and the object store; neither is part of what the check proved.
-      case " $degraded " in *" $c "*) ;; *) [ "${CI_NO_ATTEST:-}" = "true" ] \
-        || record_result "$c" || note "could not record $c — it still passed, just isn't cached" ;; esac
-    else
-      rc=1
-      note "FAILED $c"
-      [ "${CI_KEEP_GOING:-}" = "true" ] || return 1
-    fi
+    t0=$(date +%s)
+    st=0; run_body "$c" || st=$?
+    finish "$c" "$st" "$t0" && continue
+    rc=1
+    [ "${CI_KEEP_GOING:-}" = "true" ] || break
+  done
+  wait
+  for c in $bg; do
+    # shellcheck disable=SC2046
+    finish "$c" $(cat ".ci/$c.status" 2>/dev/null || echo "1 $(date +%s)") || { rc=1; tail -n 200 ".ci/$c.log" >&2; }
   done
   [ -z "$unrunnable" ] || note "not run here (CI will still have to):$unrunnable"
   [ -z "$degraded" ] || note "run degraded, NOT attested (CI will still run these):$degraded"
@@ -493,6 +544,7 @@ compose() { docker compose -f "$COMPOSE_FILE" --project-name timefusion-ci "$@";
 cmd_local() {
   command -v docker >/dev/null 2>&1 || die "docker is required for the MinIO service"
   docker compose version >/dev/null 2>&1 || die "docker compose v2 is required"
+  python3 scripts/ci/warm_target.py
   note "starting CI services (minio)…"
   compose up -d --wait minio
   # Buckets, the way CI seeds them. The bitnami image that auto-created them via

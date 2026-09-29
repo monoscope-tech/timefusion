@@ -1,4 +1,4 @@
-.PHONY: ci ci-signoff ci-status ci-down ci-selftest fmt lint lint-fix test test-unit prepush test-all test-ovh test-minio test-minio-all test-prod test-integration test-integration-minio test-e2e run-prod run-staging run-unit-staging run-minio build-prod minio-start minio-stop minio-clean tf-start tf-stop
+.PHONY: warm ci ci-signoff ci-status ci-down ci-selftest fmt lint lint-fix test test-unit prepush test-all test-ovh test-minio test-minio-all test-prod test-integration test-integration-minio test-e2e run-prod run-staging run-unit-staging run-minio build-prod minio-start minio-stop minio-clean tf-start tf-stop
 
 # THE inner-loop command: the whole suite, every time you change something.
 #
@@ -207,6 +207,11 @@ CHECKS ?=
 
 ci:
 	./scripts/ci/ci.sh local $(CHECKS)
+
+# Seed a fresh worktree's target/ from an idle sibling's (copy-on-write), so the
+# first build compiles this crate, not ~900 dependencies.
+warm:
+	python3 scripts/ci/warm_target.py
 
 # Run local checks, publish passing results, then show what GitHub still needs.
 ci-signoff:

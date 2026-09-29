@@ -16,6 +16,10 @@ Never publish an attestation for a check that did not pass.
 Use standard GitHub-hosted runners for remote jobs. Do not add Blacksmith runners or actions without an explicit user request.
 See [the local CI guide](docs/local-ci.md) for setup, capabilities, and cache controls.
 
+In a fresh worktree, run `make warm` before the first build: it clones an idle sibling's `target/` copy-on-write, so you compile this crate rather than ~900 dependencies (`make ci` does it too).
+Leave `CARGO_INCREMENTAL` unset; `0` makes every edit rebuild the whole crate (~3 min instead of ~40s).
+Per-check wall times land in `.ci/timings.tsv` and per-test times in `target/nextest/ci/junit.xml`; read them before guessing where signoff time goes.
+
 ## Batch work and release validation
 
 - **Freeze the release batch.** Do not apply optional refactors while release checks run. Change the frozen batch only to fix a required gate failure.

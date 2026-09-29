@@ -88,9 +88,40 @@ Two differences worth knowing:
   wall-clock. Locally you get the whole suite. A partitioned run proves only its
   slice, so CI records the check once, from a job that runs only after **both**
   shards are green — a half-passing run can never let a later run skip the suite.
-- **`e2e` starts a MinIO container per test** via testcontainers, so it needs
-  Docker and is capped at two threads. It is the slowest check by far; `make ci
-  CHECKS="fmt clippy test"` is the usual pre-push sweep.
+- **`e2e` on GitHub starts a MinIO container per test** via testcontainers, so
+  it needs Docker. It runs at two threads everywhere: locally, against the
+  shared MinIO, four or more threads made different tests fail on each run.
+
+## Where the time goes, and what keeps it short
+
+Every run appends each check's wall time to `.ci/timings.tsv`, and nextest
+writes per-test durations to `target/nextest/ci/junit.xml`. Read those before
+guessing. What they showed on 2026-09-29 (a 65-minute signoff) and what fixed it:
+
+- **Unoptimized dependencies.** The long suite tests are single-threaded
+  DataFusion/Delta planning; in debug builds of those crates one fixture took
+  172s. `[profile.dev.package."*"] opt-level = 1` makes it 46s. This crate
+  stays unoptimized, so its edit-compile loop is unchanged; debug assertions
+  stay on everywhere.
+- **A two-slot test group** held the ~40 `rollup_noop_skip_tests` fixtures to
+  two at a time: a 28-minute tail with 16 cores idle. They are now
+  `priority = 100` (with `dedup_compaction`), so the longest start first.
+- **The same crate compiled four ways.** `e2e` recompiled the crate with its
+  feature, and pg-smoke's `cargo build` recompiled most dependencies, because
+  dev-dependencies change tokio's features. Every check that builds now uses
+  one feature set (`BUILD` in `ci.sh`), and pg-smoke runs the server binary the
+  test build produced.
+- **Cold worktrees.** sccache cannot share dependencies across worktrees:
+  proc-macro dylibs are uncacheable and build-script `OUT_DIR`s are per target
+  dir, so the misses cascade to nearly every crate. `make ci` first runs
+  `scripts/ci/warm_target.py`, which clones an idle sibling worktree's
+  `target/debug` copy-on-write (seconds, no disk) when this one has none.
+  Run `make warm` in a fresh worktree to get the same before your first build.
+- **`CARGO_INCREMENTAL=0`.** sccache rejects only `=1`; leave the variable
+  unset and cargo builds just this crate incrementally, which sccache passes
+  through. A one-line change then rebuilds in ~40s instead of ~3 minutes.
+  `ci.sh` no longer forces it locally, since switching modes rebuilds the
+  whole crate.
 
 ## PostgreSQL smoke networking
 

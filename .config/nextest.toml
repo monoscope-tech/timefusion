@@ -32,12 +32,13 @@ final-status-level = "slow"
 filter = 'binary(e2e)'
 slow-timeout = { period = "30s", terminate-after = 8 }
 
-# The rollup no-op/packed-repair fixtures each build real multi-hour rollups
-# (~150s alone). Run together they multiply each other's wall time past the
-# cap, so they share two slots rather than a longer timeout.
+# The longest fixtures start first, so the suite's tail is the slowest test
+# rather than whichever long test happened to be scheduled last. Each is one
+# CPU-bound thread (~170 MB), so they run alongside everything else: capping
+# them at two slots (09-26) made them a 28-minute serial tail on an idle box.
 [[profile.default.overrides]]
-filter = 'test(/rollup_noop_skip_tests::/)'
-test-group = 'rollup-heavy'
+filter = 'test(/rollup_noop_skip_tests::|dedup_compaction/)'
+priority = 100
 
 # `cargo nextest run --profile ci`
 [profile.ci]
@@ -63,15 +64,12 @@ retries = 1
 filter = 'test(/dedup_compaction/)'
 slow-timeout = { period = "60s", terminate-after = 20 }
 
-[[profile.ci.overrides]]
-filter = 'test(/rollup_noop_skip_tests::/)'
-test-group = 'rollup-heavy'
-
-[test-groups]
-rollup-heavy = { max-threads = 2 }
-
 # Ad-hoc profiling of the tail: flags every test over 4s.
 [profile.timings]
 slow-timeout = { period = "4s", terminate-after = 100 }
 status-level = "slow"
 final-status-level = "slow"
+
+# Per-test durations for every signoff: target/nextest/ci/junit.xml.
+[profile.ci.junit]
+path = "junit.xml"

@@ -214,13 +214,9 @@ jobs:
         with:
           tool: cargo-nextest@0.9.140
 
-      # Default features only. `--all-features` would enable `e2e`, which runs
-      # the testcontainers e2e suite here in parallel — 40 tests each spinning a
-      # per-test MinIO container swamps the 4-vCPU box and hangs
-      # (restart_recovery::cold_start_under_five_seconds timed out the job,
-      # 2026-07-20). The e2e suite is owned by the `e2e` job below (single-
-      # threaded); the only other features are `test` (unused) and `profiling`
-      # (prod-only, already lint-covered by the Clippy step's --all-features).
+      # `--features e2e` (BUILD in ci.sh) so test, pg-smoke and e2e share one
+      # build; the e2e binary itself is filtered out here and owned by the
+      # `e2e` job below, where each test starts its own MinIO container.
       # CI_NO_ATTEST: a partitioned run proves only its slice. The test-attest
       # job below records the check once both shards are green.
       - name: Test

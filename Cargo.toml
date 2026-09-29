@@ -232,13 +232,13 @@ required-features = ["e2e"]
 # bulk of debuginfo, cutting codegen + link time on this large crate.
 [profile.dev]
 debug = "line-tables-only"
-# Deliberately NOT `[profile.dev.package."*"] opt-level = 2`. Measured
-# 2026-08-02: it takes the suite from 72s to 63s (11%) — the tail is
-# `kill_recovery` spawning server processes, which is startup- and S3-bound, not
-# CPU-bound — and costs a 13-minute dependency rebuild (4800s of CPU, so ~20min
-# on a 4-vCPU CI runner) every time Cargo.lock moves. It also broke
-# `test_update_from_does_not_block_readers_or_writers`, whose merge got too fast
-# to observe. Not worth it; don't re-run the experiment.
+# Dependencies optimized, this crate not: its edit-compile loop stays as fast,
+# and the suite stops spending its time in unoptimized DataFusion/Delta planning.
+# Measured 2026-09-29: a rollup fixture 172s -> 46s, the whole suite ~36 min of
+# CPU-bound tail. Debug assertions stay on. The one-off dependency rebuild is
+# shared across worktrees by scripts/ci/warm_target.py.
+[profile.dev.package."*"]
+opt-level = 1
 
 [profile.release]
 lto = "thin"

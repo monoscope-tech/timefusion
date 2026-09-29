@@ -389,11 +389,11 @@ mod tests {
         // observe concurrent operations overlapping it.
         let now = chrono::Utc::now();
         const FILES: usize = 24;
-        const ROWS_PER_FILE: usize = 400;
-        // Rows per file the merge rewrites. Enough work that the merge outlasts
-        // the concurrent reader; growing the table instead would slow the reader
-        // just as much.
-        const MATCHED_PER_FILE: usize = 200;
+        // Rows, not files: COUNT(*) is answered from file stats, so the reader's
+        // cost follows the file count while the merge's follows the rows. With
+        // optimized dependencies this merges in ~2s against ~0.6s of observing.
+        const ROWS_PER_FILE: usize = 8000;
+        const MATCHED_PER_FILE: usize = 4000;
         for f in 0..FILES {
             let names: Vec<(String, String)> =
                 (0..ROWS_PER_FILE).map(|r| (format!("f{f}_r{r}"), if r == 0 { format!("T{f}") } else { format!("f{f}_r{r}") })).collect();
