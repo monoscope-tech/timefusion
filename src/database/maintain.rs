@@ -2041,6 +2041,9 @@ impl Database {
                 let mut readable = if replayed { proven_days } else { covered.clone() };
                 // Such a cell reads as missing so the pass re-mints it whole. After the
                 // gauges above: it still serves every measure it holds.
+                // A derived cell waits for its base's re-mint: queued first it would park
+                // on base readiness and hold the tier's in-flight room.
+                let parent = spec.derive_from.as_deref().and_then(|name| schema.rollups.iter().position(|base| base.name.as_deref() == Some(name)));
                 if replayed && self.config.maintenance.timefusion_rollup_measure_remints_per_pass > 0 {
                     let short: HashSet<BackfillCell> = self
                         .rollup_slice_coverage
@@ -2051,10 +2054,12 @@ impl Database {
                                 && *held_target == target
                                 && chrono::DateTime::from_timestamp_micros(*start)
                                     .is_some_and(|time| Self::rollup_generation_current(&source, &target, project, &time.date_naive().to_string(), coverage))
+                                // Untagged legacy cells predate the horizon; guessing theirs would rebuild frozen tiers.
+                                && coverage.measures.is_some()
                                 && crate::rollup::measures_short(spec, coverage.measures.as_ref(), spec.measures.iter().map(|measure| &measure.name))
                         })
                         .filter_map(|entry| Some((entry.key().0.clone(), chrono::DateTime::from_timestamp_micros(entry.key().3)?.date_naive())))
-                        .filter(|cell| readable.contains(cell))
+                        .filter(|cell| readable.contains(cell) && parent.is_none_or(|parent| !remint.contains(&(cell.clone(), parent))))
                         .collect();
                     readable.retain(|cell| !short.contains(cell));
                     ranges.retain(|cell, _| !short.contains(cell));
