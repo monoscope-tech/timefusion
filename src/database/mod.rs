@@ -2742,7 +2742,6 @@ pub struct Database {
     /// Exact merge-on-read count partitions. Query threads use only the process-local front;
     /// disk/Delta loads are single-flight and bounded in the background.
     logical_count_cache: Arc<crate::read::LogicalCountCache>,
-    logical_count_building: Arc<dashmap::DashSet<crate::read::CountPartition>>,
     logical_count_build_sem: Arc<tokio::sync::Semaphore>,
     /// Dirty `(project, table, date, 10-minute bin)` keys recorded only after a Delta append
     /// commits. In-memory by design: after restart the read-side DedupExec is the backstop.
@@ -3405,7 +3404,6 @@ impl Database {
             maintenance_schedule_cursor: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             rollup_backoff: Arc::new(dashmap::DashMap::new()),
             logical_count_cache,
-            logical_count_building: Arc::new(dashmap::DashSet::new()),
             // Serial by design: a build retains one winner per logical key.
             logical_count_build_sem: Arc::new(tokio::sync::Semaphore::new(1)),
             dedup_dirty_bins,
@@ -3793,11 +3791,7 @@ impl Database {
                     .with_foyer_stats(foyer_stats)
                     .with_logical_count({
                         let cache = Arc::clone(&self.logical_count_cache);
-                        let building = Arc::clone(&self.logical_count_building);
-                        Arc::new(move || {
-                            let (entries, resident, limit) = cache.stats();
-                            (entries, resident, limit, building.len())
-                        })
+                        Arc::new(move || cache.stats())
                     })
                     .with_query_pool(pool_snapshot(self.shared_runtime_env(), self.config.derived.query_pool_bytes()))
                     // `heavy_pool_bytes`, NOT `maintenance_pool_bytes`: the maintenance

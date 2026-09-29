@@ -2206,17 +2206,6 @@ pub struct MaintenanceConfig {
     /// filter pushdown that the pgwire path does not.
     #[serde_inline_default(1)]
     pub timefusion_query_range_split_branches: usize,
-    /// Answer gate-eligible `SELECT COUNT(*) ... WHERE project_id AND
-    /// timestamp range` from Delta add-action stats (zero parquet IO). Only
-    /// fires when the window is fully flushed, dedup-provably-clean, and
-    /// every overlapping file lies entirely inside the window — otherwise
-    /// the normal scan runs. See the `count_pushdown` section of `read/mod.rs`.
-    ///
-    /// DEFAULT false: it returns SILENTLY WRONG COUNTS (undercounts against the
-    /// scan on a `tombstones_possible()` table). Re-enable only once the
-    /// logical-count index is fixed and pinned against a scan by a test.
-    #[serde_inline_default(false)]
-    pub timefusion_count_pushdown: bool,
     /// Per-shard COMPRESSED-bytes target for a dedup chunk rewrite (`sum(add.size)`).
     /// The rewrite is split into `ceil(compressed_bytes / this)` hash-bucketed passes
     /// so each pass reads ~this much. 0 disables this ceiling's contribution to the

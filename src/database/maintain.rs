@@ -6629,42 +6629,9 @@ impl Database {
         self.logical_count_cache.get_memory_appendable(&key, files)
     }
 
-    pub(crate) async fn logical_count_overlay_batches(
-        &self, snapshot: Arc<deltalake::kernel::EagerSnapshot>, log_store: deltalake::logstore::LogStoreRef, files: Vec<String>,
-        columns: crate::read::LogicalCountColumns<'_>,
-    ) -> Result<Vec<RecordBatch>> {
-        if files.is_empty() {
-            return Ok(Vec::new());
-        }
-        let provider =
-            Self::narrow_provider(log_store, snapshot, files, None, None).await.map_err(|error| anyhow::anyhow!("logical-count overlay provider: {error}"))?;
-        let context = SessionContext::new_with_state(build_optimize_session_state(self.config.memory.timefusion_query_partitions, self.shared_runtime_env()));
-        context.register_table("__logical_count_overlay", provider)?;
-        Ok(context
-            .table("__logical_count_overlay")
-            .await?
-            .select_columns(&[&[columns.timestamp], columns.keys, &[columns.tiebreak, columns.deleted]].concat())?
-            .collect()
-            .await?)
-    }
-
-    /// Schedule one exact partition build. Concurrent misses share the same
-    /// single-flight key and the global semaphore bounds winner-map memory.
-    pub(crate) fn schedule_logical_count_build(self: &Arc<Self>, project_id: &str, table_name: &str, date: &str, force_refresh: bool) {
-        let key = crate::read::CountPartition { project_id: project_id.to_string(), table_name: table_name.to_string(), date: date.to_string() };
-        if !self.logical_count_building.insert(key.clone()) {
-            return;
-        }
-        let database = Arc::clone(self);
-        tokio::spawn(async move {
-            let result = database.build_logical_count_partition(&key, force_refresh).await;
-            database.logical_count_building.remove(&key);
-            if let Err(error) = result {
-                warn!(project_id = key.project_id, table_name = key.table_name, date = key.date, %error, "logical-count background build failed");
-            }
-        });
-    }
-
+    /// Nothing in the server builds winner indexes; the
+    /// histogram tests use this to fill the cache.
+    #[cfg(test)]
     pub(crate) async fn build_logical_count_partition(&self, key: &crate::read::CountPartition, force_refresh: bool) -> Result<()> {
         let _permit = tokio::select! {
             permit = self.logical_count_build_sem.acquire() => permit?,

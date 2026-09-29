@@ -1948,336 +1948,16 @@ mod ordering_probe_tests {
     }
 }
 
-// ===== count_pushdown =====
-// COUNT(*) pushdown from Delta add-action statistics: `Σ stats.numRecords`
-// over the project's files lying FULLY inside the window, with zero parquet IO.
-//
-// This module may only ever *decline* (`Ok(None)` → normal scan), never
-// approximate. Every gate below must hold: the recognized plan shape; a
-// `project_id` equality plus a timestamp window; no MemBuffer rows in the
-// window; no duplicates possible; no boundary-straddling file; no deletion
-// vector (numRecords is pre-DV); no merge-on-read tombstones.
-
-use datafusion::{
-    arrow::array::Int64Array,
-    datasource::{DefaultTableSource, memory::MemorySourceConfig, source::DataSourceExec},
-    logical_expr::{BinaryExpr, Expr, LogicalPlan, Operator, utils::split_conjunction},
-    scalar::ScalarValue,
-};
+use datafusion::arrow::array::Int64Array;
 use tracing::debug;
-
-use crate::database::Database;
-
-fn count_result(plan: &LogicalPlan, total: u64) -> DFResult<Option<Arc<dyn ExecutionPlan>>> {
-    let total = i64::try_from(total).map_err(|_| datafusion::error::DataFusionError::Execution("COUNT(*) exceeds Int64".to_string()))?;
-    let out_schema: SchemaRef = Arc::new(plan.schema().as_arrow().clone());
-    if out_schema.fields().len() != 1 || out_schema.field(0).data_type() != &DataType::Int64 {
-        return Ok(None);
-    }
-    let batch = RecordBatch::try_new(out_schema.clone(), vec![Arc::new(Int64Array::from(vec![total]))])?;
-    let source = MemorySourceConfig::try_new(&[vec![batch]], out_schema, None)?;
-    Ok(Some(Arc::new(DataSourceExec::new(Arc::new(source)))))
-}
-
-/// Predicate classification for one conjunct.
-enum Conjunct {
-    ProjectId(String),
-    TsLow(i64),
-    TsHigh(i64),
-    True,
-}
-
-fn literal_micros(e: &Expr) -> Option<i64> {
-    match e {
-        Expr::Literal(ScalarValue::TimestampMicrosecond(Some(ts), _), _) => Some(*ts),
-        Expr::Literal(ScalarValue::TimestampNanosecond(Some(ts), _), _) => Some(*ts / 1000),
-        Expr::Literal(ScalarValue::TimestampMillisecond(Some(ts), _), _) => ts.checked_mul(1000),
-        Expr::Literal(ScalarValue::TimestampSecond(Some(ts), _), _) => ts.checked_mul(1_000_000),
-        Expr::Cast(c) => literal_micros(&c.expr),
-        _ => None,
-    }
-}
-
-fn classify_conjunct(e: &Expr) -> Option<Conjunct> {
-    use crate::read::optimizers::{extract_utf8_string, is_col_through_cast, swap_comparison};
-    match e {
-        Expr::Literal(ScalarValue::Boolean(Some(true)), _) => Some(Conjunct::True),
-        Expr::BinaryExpr(BinaryExpr { left, op, right }) => {
-            // project_id = 'lit'
-            if *op == Operator::Eq {
-                return match (left.as_ref(), right.as_ref()) {
-                    (Expr::Column(c), Expr::Literal(v, _)) | (Expr::Literal(v, _), Expr::Column(c)) if c.name == "project_id" => {
-                        extract_utf8_string(v).map(Conjunct::ProjectId)
-                    }
-                    _ => None,
-                };
-            }
-            // timestamp bound (either operand order, cast-wrapped column ok)
-            let (lit, op) = if is_col_through_cast(left, "timestamp") {
-                (literal_micros(right)?, *op)
-            } else if is_col_through_cast(right, "timestamp") {
-                (literal_micros(left)?, swap_comparison(*op))
-            } else {
-                return None;
-            };
-            match op {
-                // Normalize to an INCLUSIVE window: `>`/`<` shrink by 1µs, or a
-                // file sitting exactly on a strict bound is counted whole while
-                // the predicate excludes its boundary rows.
-                Operator::GtEq => Some(Conjunct::TsLow(lit)),
-                Operator::Gt => Some(Conjunct::TsLow(lit.checked_add(1)?)),
-                Operator::LtEq => Some(Conjunct::TsHigh(lit)),
-                Operator::Lt => Some(Conjunct::TsHigh(lit.checked_sub(1)?)),
-                _ => None,
-            }
-        }
-        _ => None,
-    }
-}
-
-/// Peel one alias layer, so `count(*) AS n` matches like `count(*)`.
-fn unalias(e: &Expr) -> &Expr {
-    match e {
-        Expr::Alias(a) => a.expr.as_ref(),
-        _ => e,
-    }
-}
-
-/// The matched query shape: table + project + inclusive window.
-struct CountQuery {
-    table_name: String,
-    project_id: String,
-    lo: i64,
-    hi: i64,
-}
-
-/// Match the COUNT(*) shape and extract the (table, project, window).
-fn match_count_plan(plan: &LogicalPlan) -> Option<CountQuery> {
-    use datafusion::logical_expr::expr::AggregateFunction;
-    // Root: optional Projection whose exprs are pass-through columns/aliases.
-    let agg_plan = match plan {
-        LogicalPlan::Projection(p) if p.expr.iter().all(|e| matches!(unalias(e), Expr::Column(_))) => p.input.as_ref(),
-        LogicalPlan::Projection(_) => return None,
-        _ => plan,
-    };
-    let LogicalPlan::Aggregate(agg) = agg_plan else { return None };
-    if !agg.group_expr.is_empty() || agg.aggr_expr.len() != 1 {
-        return None;
-    }
-    // count(*) / count(1) / count(non-null literal); no DISTINCT, no FILTER.
-    let Expr::AggregateFunction(AggregateFunction { func, params }) = unalias(&agg.aggr_expr[0]) else { return None };
-    let args_ok = match params.args.as_slice() {
-        [] => true,
-        [Expr::Literal(v, _)] => !v.is_null(),
-        _ => false,
-    };
-    if func.name() != "count" || params.distinct || params.filter.is_some() || !args_ok {
-        return None;
-    }
-
-    // Walk down: row count is invariant under Projection/SubqueryAlias.
-    // Collect Filter predicates and (below) the TableScan's pushed filters.
-    let mut node = agg.input.as_ref();
-    let mut preds: Vec<&Expr> = Vec::new();
-    let scan = loop {
-        match node {
-            LogicalPlan::Projection(p) => node = p.input.as_ref(),
-            LogicalPlan::SubqueryAlias(a) => node = a.input.as_ref(),
-            LogicalPlan::Filter(f) => {
-                preds.extend(split_conjunction(&f.predicate));
-                node = f.input.as_ref();
-            }
-            LogicalPlan::TableScan(scan) => break scan,
-            _ => return None, // Limit/Join/Union/... change or gate row count
-        }
-    };
-    if scan.fetch.is_some() {
-        return None;
-    }
-    // The provider must BE the routing table: a bare-name match would let a
-    // name-colliding session table be answered from the real Delta stats.
-    scan.source.downcast_ref::<DefaultTableSource>().and_then(|src| src.table_provider.downcast_ref::<crate::database::ProjectRoutingTable>())?;
-
-    // The same conjunct commonly appears in both the Filter node and the scan's
-    // pushed filters; every fold step below is idempotent, so no dedup needed.
-    let (project_id, lo, hi) = preds.into_iter().chain(scan.filters.iter().flat_map(split_conjunction)).try_fold(
-        (None::<String>, None::<i64>, None::<i64>),
-        |(project_id, lo, hi), p| {
-            Some(match classify_conjunct(p)? {
-                Conjunct::ProjectId(v) if project_id.as_ref().is_none_or(|prev| *prev == v) => (Some(v), lo, hi),
-                Conjunct::TsLow(v) => (project_id, Some(lo.map_or(v, |prev| prev.max(v))), hi),
-                Conjunct::TsHigh(v) => (project_id, lo, Some(hi.map_or(v, |prev| prev.min(v)))),
-                Conjunct::True => (project_id, lo, hi),
-                _ => return None,
-            })
-        },
-    )?;
-    let (lo, hi) = finalize_window(lo, hi, chrono::Utc::now().timestamp_micros())?;
-    Some(CountQuery { table_name: scan.table_name.table().to_string(), project_id: project_id?, lo, hi })
-}
-
-/// Resolve the count window's bounds. A lower bound is required (an unbounded
-/// count would scan everything); a missing upper bound becomes `now`, which
-/// keeps the window bounded for the downstream dedup-clean check. Returns
-/// `None` when there is no lower bound or the window is empty (`lo > hi`).
-fn finalize_window(lo: Option<i64>, hi: Option<i64>, now: i64) -> Option<(i64, i64)> {
-    let lo = lo?;
-    let hi = hi.unwrap_or(now);
-    (lo <= hi).then_some((lo, hi))
-}
-
-/// Pure summing logic over per-file `(min_ts, max_ts, num_records)` stats:
-/// `Some(total)` when every window-overlapping file is FULLY inside `[lo,hi]`,
-/// `None` when a boundary file straddles (or stats are missing → caller
-/// passes `None` fields → bail).
-fn sum_fully_contained(files: impl IntoIterator<Item = (Option<i64>, Option<i64>, Option<i64>)>, lo: i64, hi: i64) -> Option<u64> {
-    files.into_iter().try_fold(0u64, |total, (min, max, records)| {
-        let (min, max, records) = (min?, max?, records?);
-        if max < lo || min > hi {
-            Some(total) // fully outside — contributes nothing
-        } else if min >= lo && max <= hi {
-            total.checked_add(u64::try_from(records).ok()?)
-        } else {
-            None // straddles the boundary — needs a real scan
-        }
-    })
-}
-
-/// Attempt the pushdown. `Ok(None)` = not applicable, plan normally.
-pub async fn try_count_pushdown(plan: &LogicalPlan, database: &Arc<Database>) -> DFResult<Option<Arc<dyn ExecutionPlan>>> {
-    if !database.config().maintenance.timefusion_count_pushdown {
-        return Ok(None);
-    }
-    let Some(q) = match_count_plan(plan) else { return Ok(None) };
-    let Some(schema) = crate::schema::get_schema(&q.table_name) else { return Ok(None) };
-    // A merge-on-read DELETE is an APPEND, so file stats count both the
-    // tombstone and the live version it retires and no per-file statistic can
-    // correct for it. Gated on tombstones being *possible*, not merely
-    // declared. The logical-count index is the one exact answer for such a
-    // table, so try it first and decline when it has no covering partition.
-    if schema.tombstones_possible() {
-        let Some(total) = try_logical_count(database, &q, schema).await else { return Ok(None) };
-        debug!("count_pushdown: answered {}/{} [{}, {}] = {} from logical-count index", q.project_id, q.table_name, q.lo, q.hi, total);
-        crate::observability::record_logical_count_pushdown_used();
-        return count_result(plan, total);
-    }
-
-    // Gate: window fully flushed (no MemBuffer rows in range).
-    if let Some(layer) = database.buffered_layer()
-        && layer.mem_buffer().has_rows_in_range(&q.project_id, &q.table_name, q.lo, q.hi)
-    {
-        return Ok(None);
-    }
-
-    // Hold ONE read guard across the dedup-clean gate and the stats sum, so the
-    // verdict applies to exactly the snapshot being summed. The MemBuffer gate
-    // must precede this: rows leave the buffer only after their commit swapped
-    // the shared table, so anything missing from mem is in this later snapshot.
-    let Ok(table_ref) = database.resolve_table(&q.project_id, &q.table_name).await else {
-        return Ok(None);
-    };
-    let total = {
-        let table = table_ref.read().await;
-        // Gate: duplicates provably absent for the window, in THIS snapshot.
-        if !schema.dedup_keys.is_empty() && !database.dedup_window_clean(&table, &q.project_id, &q.table_name, (q.lo, q.hi)).granted() {
-            return Ok(None);
-        }
-        let Ok(snapshot) = table.snapshot() else { return Ok(None) };
-        let Ok(actions) = snapshot.add_actions_table(true) else { return Ok(None) };
-        let Some(total) = sum_from_actions(&actions, &q) else {
-            debug!("count_pushdown: bailed for {}/{} (stats gaps or boundary files)", q.project_id, q.table_name);
-            return Ok(None);
-        };
-        total
-    };
-
-    debug!("count_pushdown: answered {}/{} [{}, {}] = {} from add-action stats", q.project_id, q.table_name, q.lo, q.hi, total);
-    crate::observability::record_count_pushdown_used();
-    count_result(plan, total)
-}
 
 /// The dedup keys after `timestamp`. `None` when the key does not lead with
 /// `timestamp`: the index buckets winners by timestamp, so a key that does not
 /// start there cannot be grouped by it.
+#[cfg(test)]
 pub fn logical_count_keys(schema: &crate::schema::TableSchema) -> Option<Vec<&str>> {
     let (first, rest) = schema.dedup_keys.split_first()?;
     (first == "timestamp" && !rest.is_empty()).then(|| rest.iter().map(String::as_str).collect())
-}
-
-async fn try_logical_count(database: &Arc<Database>, q: &CountQuery, schema: &crate::schema::TableSchema) -> Option<u64> {
-    let keys = logical_count_keys(schema)?;
-    let tiebreak = schema.dedup_tiebreak.as_deref()?;
-    let deleted = schema.tombstone_column.as_deref()?;
-    let hi = q.hi.checked_add(1)?;
-    let lo_date = chrono::DateTime::from_timestamp_micros(q.lo)?.date_naive();
-    let hi_date = chrono::DateTime::from_timestamp_micros(q.hi)?.date_naive();
-    let days = (hi_date - lo_date).num_days();
-    // The resident budget guarantees four daily indexes at once, i.e. a
-    // three-day window crossing four UTC dates. Deeper scans keep the
-    // authoritative plan rather than churning the cache.
-    if !(0..=3).contains(&days) {
-        return None;
-    }
-    let dates: Vec<_> = (0..=days).map(|offset| lo_date + chrono::Duration::days(offset)).collect();
-
-    // Snapshot the unflushed tail before the Delta snapshot. Flush removes a
-    // batch only after publishing its table snapshot, so a transitioning row
-    // appears in at least one leg; an equal winner in both is a no-op overlay.
-    let (mem_batches, mem_ranges) = match database.buffered_layer() {
-        Some(layer) => {
-            let snapshot = layer.snapshot_for_merge(&q.project_id, &q.table_name, q.lo, hi).ok()?;
-            (snapshot.batches, snapshot.covered_ranges)
-        }
-        None => (Vec::new(), Vec::new()),
-    };
-    let table_ref = database.resolve_table(&q.project_id, &q.table_name).await.ok()?;
-    let (indexes, missing, added_files, stale_dates, delta_snapshot, log_store) = {
-        let table = table_ref.read().await;
-        let delta_snapshot = Arc::new(table.snapshot().ok()?.snapshot().clone());
-        let mut indexes = Vec::with_capacity(dates.len());
-        let mut missing = Vec::new();
-        let mut added_files = Vec::new();
-        let mut stale_dates = Vec::new();
-        for date in &dates {
-            let date_string = date.to_string();
-            let (_, files) = Database::logical_count_partition_snapshot(&table, &q.project_id, &date_string).ok()?;
-            let Some((index, mut added)) = database.logical_count_memory_for_files(&q.project_id, &q.table_name, &date_string, &files) else {
-                missing.push(date_string);
-                continue;
-            };
-            indexes.push((*date, index));
-            if !added.is_empty() {
-                stale_dates.push(date_string);
-            }
-            added_files.append(&mut added);
-        }
-        (indexes, missing, added_files, stale_dates, delta_snapshot, table.log_store())
-    };
-    if !missing.is_empty() {
-        for date in missing {
-            database.schedule_logical_count_build(&q.project_id, &q.table_name, &date, false);
-        }
-        return None;
-    }
-
-    let columns = crate::read::LogicalCountColumns { timestamp: "timestamp", keys: &keys, tiebreak, deleted };
-    // Keep the synchronous append delta small: a large gap falls back to the
-    // authoritative DedupExec until the rebuilt base is ready.
-    if added_files.len() > crate::read::MAX_APPEND_OVERLAY_FILES {
-        for date in stale_dates {
-            database.schedule_logical_count_build(&q.project_id, &q.table_name, &date, true);
-        }
-        return None;
-    }
-    let covered_ranges = crate::write::mem_buffer::merge_ranges(mem_ranges);
-    let delta_batches = database.logical_count_overlay_batches(delta_snapshot, log_store, added_files, columns).await.ok()?;
-    indexes.into_iter().try_fold(0u64, |total, (date, index)| {
-        let day_lo = date.and_hms_opt(0, 0, 0)?.and_utc().timestamp_micros();
-        let day_hi = date.succ_opt()?.and_hms_opt(0, 0, 0)?.and_utc().timestamp_micros();
-        let input = crate::read::LogicalCountOverlay { authoritative_batches: &mem_batches, delta_batches: &delta_batches, covered_ranges: &covered_ranges };
-        let count = index.count_with_covered_overlay(input, q.lo.max(day_lo), hi.min(day_hi), columns).ok()?;
-        total.checked_add(count)
-    })
 }
 
 /// A timestamp stats column as microseconds, or `None` when it is absent or not
@@ -2288,53 +1968,6 @@ pub(crate) fn ts_micros_column(b: &RecordBatch, name: &str) -> Option<Int64Array
     matches!(c.data_type(), DataType::Timestamp(_, _)).then_some(())?;
     let c = cast(c, &DataType::Timestamp(TimeUnit::Microsecond, None)).ok()?;
     Some(c.as_any().downcast_ref::<TimestampMicrosecondArray>()?.reinterpret_cast())
-}
-
-/// Extract `(min_ts, max_ts, numRecords)` for this project's files from the
-/// flattened add-actions batch and sum the fully-contained ones. `None` on
-/// any missing column/stat, DV presence, or boundary straddle.
-fn sum_from_actions(actions: &RecordBatch, q: &CountQuery) -> Option<u64> {
-    // Deletion vectors make numRecords an over-count — bail if ANY file has one
-    // (column families vary by writer, so check every dv-prefixed column).
-    if actions.schema().fields().iter().zip(actions.columns()).any(|(f, c)| f.name().starts_with("deletionVector") && c.null_count() < actions.num_rows()) {
-        return None;
-    }
-    let pid = actions.column_by_name("partition.project_id")?.as_any().downcast_ref::<StringArray>()?;
-    let records = actions.column_by_name("stats.numRecords")?.as_any().downcast_ref::<Int64Array>()?;
-    let min_ts = ts_micros_column(actions, "stats.minValues.timestamp")?;
-    let max_ts = ts_micros_column(actions, "stats.maxValues.timestamp")?;
-    let rows = (0..actions.num_rows())
-        .filter(|&i| pid.is_valid(i) && pid.value(i) == q.project_id)
-        .map(|i| (min_ts.is_valid(i).then(|| min_ts.value(i)), max_ts.is_valid(i).then(|| max_ts.value(i)), records.is_valid(i).then(|| records.value(i))));
-    sum_fully_contained(rows, q.lo, q.hi)
-}
-
-#[cfg(test)]
-mod count_pushdown_tests {
-    use super::*;
-
-    #[test]
-    fn fully_contained_sums_and_boundary_bails() {
-        // two inside, one outside → sum of inside
-        let f = |min, max, n| (Some(min), Some(max), Some(n));
-        assert_eq!(sum_fully_contained([f(10, 20, 5), f(30, 40, 7), f(100, 200, 9)], 0, 50), Some(12));
-        // straddling file → None
-        assert_eq!(sum_fully_contained([f(10, 20, 5), f(45, 60, 7)], 0, 50), None);
-        // missing stats on an overlapping file → None
-        assert_eq!(sum_fully_contained([(Some(10), None, Some(5))], 0, 50), None);
-        // missing stats on a file we can't even place → None (conservative)
-        assert_eq!(sum_fully_contained([(None, Some(5), Some(1))], 100, 200), None);
-        // empty file set → 0
-        assert_eq!(sum_fully_contained([], 0, 50), Some(0));
-    }
-
-    #[test_case::test_case(Some(10), Some(50) => Some((10, 50)) ; "a two-sided window passes through unchanged")]
-    #[test_case::test_case(Some(10), None => Some((10, 999)) ; "one-sided timestamp > cutoff takes now as the upper bound")]
-    #[test_case::test_case(None, Some(50) => None ; "no lower bound is ineligible - it would scan everything")]
-    #[test_case::test_case(Some(60), Some(50) => None ; "an empty window lo > hi is ineligible")]
-    fn finalize_window_defaults_open_upper_bound_to_now(lo: Option<i64>, hi: Option<i64>) -> Option<(i64, i64)> {
-        finalize_window(lo, hi, 999)
-    }
 }
 
 // ===== logical_count_index =====
@@ -2362,6 +1995,7 @@ const FORMAT_VERSION: &str = "3";
 const META_VERSION: &str = "tf.logical_count.version";
 const META_FINGERPRINT: &str = "tf.logical_count.fingerprint";
 const META_FILES: &str = "tf.logical_count.files";
+#[cfg(test)]
 pub(crate) const MAX_APPEND_OVERLAY_FILES: usize = 16;
 const DISK_PARTITIONS_PER_PROJECT: usize = 8;
 
@@ -2412,13 +2046,6 @@ pub struct LogicalCountColumns<'a> {
     pub keys: &'a [&'a str],
     pub tiebreak: &'a str,
     pub deleted: &'a str,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct LogicalCountOverlay<'a> {
-    pub authoritative_batches: &'a [RecordBatch],
-    pub delta_batches: &'a [RecordBatch],
-    pub covered_ranges: &'a [(i64, i64)],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -2755,18 +2382,6 @@ impl LogicalCountIndex {
         Ok(())
     }
 
-    fn winner(&self, timestamp: i64, id: &str) -> Option<Winner> {
-        if let Some(packed) = &self.packed {
-            let pos = packed
-                .winners
-                .binary_search_by(|candidate| candidate.timestamp.cmp(&timestamp).then_with(|| packed_id(&packed.ids, candidate).cmp(id.as_bytes())))
-                .ok()?;
-            Some(packed.winners[pos].winner())
-        } else {
-            self.winners.get(key(timestamp, id).as_ref()).copied()
-        }
-    }
-
     /// Apply the four-column narrow form emitted by a count-index build:
     /// `timestamp`, `id`, version tiebreak, tombstone marker.
     pub fn apply_batch(&mut self, batch: &RecordBatch, columns: LogicalCountColumns<'_>) -> Result<usize> {
@@ -2780,57 +2395,6 @@ impl LogicalCountIndex {
             }
         }
         Ok(changed)
-    }
-
-    /// Count under the same coverage contract as the `mem ∪ Delta` scan: rows in
-    /// `authoritative_batches` replace covered Delta rows; `delta_batches` are
-    /// newly appended files, gated by the same range as the indexed base.
-    /// The base index is never cloned or mutated.
-    pub fn count_with_covered_overlay(&self, input: LogicalCountOverlay<'_>, lo: i64, hi: i64, columns: LogicalCountColumns<'_>) -> Result<u64> {
-        use std::collections::hash_map::Entry;
-        let LogicalCountOverlay { authoritative_batches, delta_batches, covered_ranges } = input;
-        #[derive(Clone, Copy)]
-        struct Overlay {
-            base: Option<Winner>,
-            current: Winner,
-            timestamp: i64,
-        }
-
-        let base_visible = |timestamp: i64| !covered_ranges.iter().any(|&(start, end)| (start..end).contains(&timestamp));
-        let mut overlay: HashMap<Box<[u8]>, Overlay, ahash::RandomState> = HashMap::default();
-        let mut buffer = String::new();
-        for (batches, authoritative) in [(authoritative_batches, true), (delta_batches, false)] {
-            for batch in batches {
-                let narrow = CountColumns::new(batch, columns)?;
-                for row in 0..batch.num_rows() {
-                    let Some((timestamp, id, candidate)) = narrow.row(row, &mut buffer) else { continue };
-                    if !authoritative && !base_visible(timestamp) {
-                        continue;
-                    }
-                    match overlay.entry(key(timestamp, id)) {
-                        Entry::Occupied(mut entry) => {
-                            if candidate.tiebreak > entry.get().current.tiebreak {
-                                entry.get_mut().current = candidate;
-                            }
-                        }
-                        Entry::Vacant(entry) => {
-                            let base = self.winner(timestamp, id).filter(|_| base_visible(timestamp));
-                            let current = base.filter(|winner| winner.tiebreak >= candidate.tiebreak).unwrap_or(candidate);
-                            entry.insert(Overlay { base, current, timestamp });
-                        }
-                    }
-                }
-            }
-        }
-
-        let mut count = i128::from(self.count(lo, hi));
-        if !covered_ranges.is_empty() {
-            count -= i128::from(self.count_where(|timestamp, winner| !winner.deleted && (lo..hi).contains(&timestamp) && !base_visible(timestamp)));
-        }
-        for state in overlay.values().filter(|state| (lo..hi).contains(&state.timestamp)) {
-            count += i128::from(!state.current.deleted) - i128::from(state.base.is_some_and(|winner| !winner.deleted));
-        }
-        u64::try_from(count).context("logical-count overlay produced an invalid negative/overflow count")
     }
 
     /// Exact live row count in the half-open interval `[lo, hi)`.
@@ -3021,8 +2585,6 @@ impl<'a> StringValues<'a> {
 
 #[cfg(test)]
 mod logical_count_index_tests {
-    use arrow::datatypes::TimeUnit;
-
     use super::*;
 
     fn unmasked(paths: &[&str]) -> super::CountFiles {
@@ -3031,29 +2593,6 @@ mod logical_count_index_tests {
 
     fn part(project_id: &str, date: &str) -> CountPartition {
         CountPartition { project_id: project_id.into(), table_name: "otel".into(), date: date.into() }
-    }
-
-    fn cols() -> LogicalCountColumns<'static> {
-        LogicalCountColumns { timestamp: "timestamp", keys: &["id"], tiebreak: "updated_at", deleted: "deleted" }
-    }
-
-    fn versions(rows: &[(i64, &str, Option<i64>, Option<bool>)]) -> RecordBatch {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), true),
-            Field::new("id", DataType::Utf8View, true),
-            Field::new("updated_at", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), true),
-            Field::new("deleted", DataType::Boolean, true),
-        ]));
-        RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(TimestampMicrosecondArray::from(rows.iter().map(|row| Some(row.0)).collect::<Vec<_>>()).with_timezone("UTC")),
-                Arc::new(StringViewArray::from(rows.iter().map(|row| Some(row.1)).collect::<Vec<_>>())),
-                Arc::new(TimestampMicrosecondArray::from(rows.iter().map(|row| row.2).collect::<Vec<_>>()).with_timezone("UTC")),
-                Arc::new(BooleanArray::from(rows.iter().map(|row| row.3).collect::<Vec<_>>())),
-            ],
-        )
-        .unwrap()
     }
 
     fn index_of(rows: &[(i64, &str, Option<i64>, bool)]) -> LogicalCountIndex {
@@ -3141,38 +2680,6 @@ mod logical_count_index_tests {
         assert_eq!(index.count(25_000, 75_000), 45_454);
         assert!(index.winners.is_empty(), "the allocation-heavy build map must be released");
         assert!(index.estimated_heap_bytes() < 7_000_000, "packed 36-byte IDs should stay below 70 bytes/key");
-    }
-
-    #[test]
-    fn narrow_batches_build_and_overlay_unflushed_versions_exactly() {
-        let columns = cols();
-        let mut index = LogicalCountIndex::new();
-        index.apply_batch(&versions(&[(10, "a", Some(1), Some(false)), (20, "b", Some(1), None), (30, "gone", Some(2), Some(true))]), columns).unwrap();
-        assert_eq!(index.count(0, 100), 2);
-
-        // a tombstoned, b a stale no-op then a repeat with an equal tiebreak, gone resurrected, c new and unflushed.
-        let tail = [versions(&[
-            (10, "a", Some(3), Some(true)),
-            (20, "b", Some(0), Some(true)),
-            (20, "b", Some(1), Some(false)),
-            (30, "gone", Some(4), Some(false)),
-            (40, "c", Some(1), None),
-        ])];
-        let overlay = LogicalCountOverlay { authoritative_batches: &tail, delta_batches: &[], covered_ranges: &[] };
-        assert_eq!(index.count_with_covered_overlay(overlay, 0, 100, columns).unwrap(), 3);
-        assert_eq!(index.logical_rows(), 2, "overlay must not mutate the persistent base");
-    }
-
-    #[test]
-    fn covered_overlay_replaces_delta_rows_like_the_union_scan() {
-        let columns = cols();
-        let mut index = index_of(&[(10, "old", Some(1), false), (20, "newer-delta", Some(5), false)]);
-        index.finalize().unwrap();
-        let mem = [versions(&[(10, "old", Some(2), Some(true)), (20, "newer-delta", Some(3), Some(true))])];
-
-        let ranges = [(0, 50)];
-        let input = LogicalCountOverlay { authoritative_batches: &mem, delta_batches: &[], covered_ranges: &ranges };
-        assert_eq!(index.count_with_covered_overlay(input, 0, 100, columns).unwrap(), 0);
     }
 
     #[test]

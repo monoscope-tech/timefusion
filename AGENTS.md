@@ -372,7 +372,7 @@ src/
 │   ├── mem_buffer.rs      #   In-memory storage with time-bucketed batches (5 min default)
 │   └── wal.rs             #   Write-ahead log (walrus-rust)
 ├── read/
-│   ├── mod.rs             #   Read-side dedup, count pushdown, logical-count index, HLL
+│   ├── mod.rs             #   Read-side dedup, logical-count index, HLL
 │   ├── admission.rs       #   Heavy-query admission (concurrent unbounded sorts vs the pool)
 │   ├── bloom_prune.rs     #   Per-(project,date) bloom sidecars for file-level needle pruning
 │   ├── functions.rs       #   Custom SQL functions + VariantAwareExprPlanner

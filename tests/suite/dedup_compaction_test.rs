@@ -706,7 +706,7 @@ fn mor_row(id: &str, name: &str, project_id: &str, ts: i64, deleted: Option<bool
 }
 
 /// Sweep until the window's partitions carry a clean fingerprint — the
-/// precondition the read-side dedup skip and `count_pushdown` gate on. Only a
+/// precondition the read-side dedup skip gates on. Only a
 /// 0-drop pass over an UNCHANGED file set certifies, so two passes are needed.
 async fn sweep_clean(db: &Arc<Database>, table: &str) -> Result<()> {
     let table_ref = table_of(db, table).await;
@@ -837,14 +837,13 @@ async fn tombstoned_row_hidden_from_select_and_count() -> Result<()> {
     Ok(())
 }
 
-/// `COUNT(*)` over a Delta-only, flushed, timestamp-bounded window — the shape
-/// `count_pushdown` answers from add-action `numRecords`. Those stats count a
-/// tombstone and the live version it retires as two rows, so the pushdown must
-/// decline wherever tombstones can exist; the answer here is 0, not 2.
+/// `COUNT(*)` over a Delta-only, flushed, timestamp-bounded window whose file
+/// holds a tombstone and the live version it retires: add-action `numRecords`
+/// says 2, the answer is 0.
 #[serial]
 #[tokio::test]
-async fn count_pushdown_declines_where_tombstones_are_possible() -> Result<()> {
-    let (db, project_id) = buffered_db("mor_count_pushdown").await?;
+async fn count_star_excludes_a_flushed_tombstone() -> Result<()> {
+    let (db, project_id) = buffered_db("mor_count_tombstone").await?;
     let ts = hours_ago(3);
     let iso = |t: i64| chrono::DateTime::<chrono::Utc>::from_timestamp_micros(t).unwrap().to_rfc3339();
     // Both versions in ONE Delta file (so the footer ordering is declared and
@@ -858,11 +857,7 @@ async fn count_pushdown_declines_where_tombstones_are_possible() -> Result<()> {
         iso(ts - 60_000_000),
         iso(ts + 60_000_000)
     );
-    // A successful pushdown replaces the whole plan with a one-row in-memory
-    // exec; declining leaves the real scan standing. Assert on the scan, NOT on
-    // `DedupExec` — a certified partition legitimately drops the dedup.
     let text = rendered(&physical_plan(&db, &sql).await?);
-    assert!(text.contains("DeltaScanExec"), "count_pushdown must decline where tombstones can exist — it answered from add-action stats:\n{text}");
     assert!(text.contains("IS DISTINCT FROM true"), "the tombstone filter must be part of the counted plan:\n{text}");
 
     assert_eq!(routed_scalar(&db, &sql).await?, 0, "the tombstone wins its key and removes the row — stats would have said 2");
@@ -2312,9 +2307,7 @@ async fn delta_row_count(db: &Arc<Database>, sql: &str) -> Result<usize> {
 /// fingerprint so an all-or-nothing skip must decline while a per-file skip may
 /// still fire for the certified band.
 ///
-/// Returns the scanned rows and how far `metric` moved. Rows, NOT `count(*)`: a
-/// bare count is answered by `count_pushdown` from Delta statistics without ever
-/// building a scan, so it exercises neither `DedupExec` nor the skip.
+/// Returns the scanned rows and how far `metric` moved.
 async fn dedup_skip_parity_arm(
     tag: &'static str, configure: impl FnOnce(&mut timefusion::config::AppConfig), duplicated: usize, unique: usize, churn: usize, metrics: &[&'static str],
 ) -> Result<(i64, Vec<u64>)> {
@@ -2928,10 +2921,7 @@ async fn count_is_identical_with_and_without_the_dedup_skip() -> Result<()> {
 /// `count(*)` itself must agree with the rows a scan returns, over a window
 /// spanning several days.
 ///
-/// The parity test above deliberately counts SCAN ROWS rather than `count(*)`,
-/// because a bare count is answered by `count_pushdown` from Delta statistics
-/// without building a scan — so nothing in this file ever asserted that the
-/// pushdown's answer is right. Prod 2026-08-20 (project 94c5dc1f, measured
+/// Prod 2026-08-20 (project 94c5dc1f, measured
 /// against `count(distinct id)` as the authority):
 ///
 /// | span   | `count(*)` | truth  |
@@ -2963,11 +2953,8 @@ async fn count_star_matches_the_scan_over_a_multi_day_window() -> Result<()> {
         db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch()?], true, None).await?;
     }
 
-    // BOTH branches of `try_count_pushdown`. The logical-count index only
-    // answers spans of at most 3 days; a wider span declines and falls back to
-    // a real scan. Prod disagreed at 3 days AND at 10, so covering one branch
-    // would leave the other free to regress.
-    for (label, back) in [("within the logical-count span", 3), ("wider than the logical-count span", DAYS)] {
+    // Prod disagreed at 3 days AND at 10, so both spans are covered.
+    for (label, back) in [("three days", 3), ("four days", DAYS)] {
         let (lo, hi) = (noon_days_ago(back) - 1, noon_days_ago(1) + PER_DAY as i64 + 1);
 
         // The authority is the scan: the rows `SELECT id` actually returns,

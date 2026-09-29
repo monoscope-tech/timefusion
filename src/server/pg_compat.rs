@@ -745,7 +745,7 @@ pub type FoyerStatsSnapshot = Arc<dyn Fn() -> FoyerRuntimeStats + Send + Sync>;
 /// (used_bytes, pool_size) of the shared query memory pool, live.
 pub type PoolSnapshot = Arc<dyn Fn() -> (usize, usize) + Send + Sync>;
 /// (resident partitions, estimated bytes, byte limit, active builders).
-pub type LogicalCountSnapshot = Arc<dyn Fn() -> (usize, usize, usize, usize) + Send + Sync>;
+pub type LogicalCountSnapshot = Arc<dyn Fn() -> (usize, usize, usize) + Send + Sync>;
 
 type Row = (&'static str, String, String);
 
@@ -1128,14 +1128,13 @@ impl StatsTableProvider {
         });
 
         let logical_count = self.logical_count.as_ref().map_or_else(Vec::new, |snap| {
-            let (entries, resident, limit, building) = snap();
+            let (entries, resident, limit) = snap();
             rows!["logical_count";
                 "resident_partitions" => entries,
                 "resident_bytes_estimated" => resident,
                 "resident_mb_estimated" => mib(resident),
                 "resident_limit_bytes" => limit,
                 "resident_limit_mb" => mib(limit),
-                "active_builds" => building,
             ]
         });
 
@@ -1343,7 +1342,7 @@ mod stats_table_tests {
                 .with_scan_metrics(Arc::new(ScanMetrics::default()))
                 .with_foyer_stats(Arc::new(move || snapshot.clone()))
                 .with_maintenance_pools(Arc::new(|| (25, 100)), Arc::new(|| (3, 4)))
-                .with_logical_count(Arc::new(|| (3, 42, 100, 1))),
+                .with_logical_count(Arc::new(|| (3, 42, 100))),
         )
     }
 
@@ -1370,7 +1369,7 @@ mod stats_table_tests {
              l2_used_bytes entry_count evictions insert_bypassed",
         );
         expect("memory", "maintenance_pool_used_bytes maintenance_pool_pct coordinator_pool_used_bytes coordinator_pool_pct");
-        expect("logical_count", "resident_partitions resident_bytes_estimated resident_mb_estimated resident_limit_bytes resident_limit_mb active_builds");
+        expect("logical_count", "resident_partitions resident_bytes_estimated resident_mb_estimated resident_limit_bytes resident_limit_mb");
         expect("runtime", "uptime_seconds scheduling_lag_ms scheduling_lag_max_ms worker_threads");
         // Same section name under both kinds must stay two distinct rows: one
         // claims worker occupancy, the other only wall time.
@@ -1383,12 +1382,7 @@ mod stats_table_tests {
         }
 
         // Rows whose VALUE, not mere presence, is the assertion.
-        for (component, key, value) in [
-            ("foyer", "cache_dir", "/cache"),
-            ("memory", "maintenance_pool_pct", "25"),
-            ("memory", "coordinator_pool_pct", "75"),
-            ("logical_count", "active_builds", "1"),
-        ] {
+        for (component, key, value) in [("foyer", "cache_dir", "/cache"), ("memory", "maintenance_pool_pct", "25"), ("memory", "coordinator_pool_pct", "75")] {
             assert!(rows.contains(&(component.into(), key.into(), value.into())), "{component}.{key} must read {value}");
         }
     }

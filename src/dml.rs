@@ -186,10 +186,6 @@ impl QueryPlanner for DmlQueryPlanner {
             .as_any()
             .downcast_ref::<SessionState>()
             .ok_or_else(|| datafusion::common::DataFusionError::Internal("DmlQueryPlanner requires a SessionState".into()))?;
-        // COUNT(*) from Delta add-action stats; declines unless provably exact.
-        if let Some(exec) = crate::read::try_count_pushdown(logical_plan, &self.database).await? {
-            return Ok(exec);
-        }
         match self.database.histogram_plan(logical_plan, session_state).await {
             Ok(Some(plan)) => return self.planner.create_physical_plan(&plan, session_state).await,
             Ok(None) => {}
