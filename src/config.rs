@@ -1860,12 +1860,6 @@ pub struct MaintenanceConfig {
     #[serde_inline_default(256 * MIB as i64)]
     pub timefusion_light_optimize_target_size: i64,
 
-    /// Shrink a maintenance unit's target as its lane's memory pool fills, so a
-    /// few large units cannot monopolise it. Off by default; the reduction is
-    /// computed and counted either way (`maintenance.pressure_scale_*`) and only
-    /// applied when true. Taper: full target at <=50% occupancy, half at 100%.
-    #[serde_inline_default(false)]
-    pub timefusion_maintenance_pressure_scaling: bool,
     /// Per-runtime-env spill ceiling in GiB for the maintenance-family
     /// `RuntimeEnv`s (`build_spill_runtime_env`). Must exceed the largest single
     /// rewrite's spill or the unit can never complete. PER ENV, not global —

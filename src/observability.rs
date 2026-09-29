@@ -1668,12 +1668,6 @@ atomic_stats! {
         maintenance_processed_bytes_per_sec as "processed_bytes_per_second",
         maintenance_raw_tail_duration_secs as "raw_tail_duration_seconds",
         sealed_compaction_debt_bytes,
-        /// How often a unit target WOULD be (or was) shrunk because its lane's pool
-        /// was over half full, and how many bytes that withheld. Emitted even when
-        /// `timefusion_maintenance_pressure_scaling` is off, so the flag can be
-        /// decided from data.
-        pressure_scale_engaged as "pressure_scale_engaged",
-        pressure_scale_bytes_withheld as "pressure_scale_bytes_withheld",
         /// Compaction units that claimed a cell and selected NOTHING. The packer's
         /// invariant says this can only happen on a converged cell, so a rising
         /// count against non-zero `sealed_compaction_debt_bytes` means the lane is
