@@ -8,6 +8,7 @@ The final status output lists every check that still needs GitHub.
 **Use local signoff as much as possible, not remote CI.** Local runs are fast; remote CI is slow and is not a feedback loop.
 Gate every master push (which is a deploy) on `make ci-signoff` for the exact tree being pushed.
 Dispatch remote CI only for checks that cannot run locally, and do not wait on it when a local signoff already covers the change.
+A full `make ci-signoff` takes about 11 minutes on an idle machine (measured 2026-09-29). Run one signoff at a time: several in parallel took 69–90 minutes each.
 
 Record the local commands, results, and outstanding checks in the PR description.
 If a required service or tool is unavailable, record that limitation and let GitHub run the affected checks.
