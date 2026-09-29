@@ -2819,7 +2819,6 @@ impl Database {
             source_rows_below,
             partition_identity,
             whole_file_bytes,
-            selected_input_rows,
             content_fp,
             refused_spans,
             selected_spans,
@@ -2864,10 +2863,6 @@ impl Database {
             let mut selected_spans: Vec<(i64, i64)> = Vec::new();
             let mut estimated = 0u64;
             let mut whole_file_bytes = 0u64;
-            // Same physical file population as whole_file_bytes, including rows
-            // outside the predicate and DV-masked rows that decoding can visit.
-            // One missing/invalid count makes the entire width unknown.
-            let mut selected_input_rows = self.config.maintenance.timefusion_rollup_adaptive_batches.then_some(0u64);
             let mut content_fp = 0u64;
             for file in snapshot.log_data().iter() {
                 let path = file.path().to_string();
@@ -2922,7 +2917,6 @@ impl Database {
                 let (share, projected) = Self::projected_slice_bytes(&add, projected_numerator, projected_denominator, key.slice);
                 estimated = estimated.saturating_add(share);
                 whole_file_bytes = whole_file_bytes.saturating_add(projected);
-                selected_input_rows = selected_input_rows.and_then(|total| add_row_count(&add).and_then(|rows| total.checked_add(rows)));
                 // XOR-folded so file order, which a snapshot does not promise, cannot
                 // change the answer.
                 content_fp ^= file_content_hash(&path, add.deletion_vector.as_ref());
@@ -2937,7 +2931,6 @@ impl Database {
                 source_rows_below,
                 partition_identity,
                 whole_file_bytes,
-                selected_input_rows,
                 content_fp,
                 refused_spans,
                 selected_spans,
@@ -3162,12 +3155,7 @@ impl Database {
         let unit_started = std::time::Instant::now();
         let heap = crate::observability::HeapPhases::start(|| crate::observability::jemalloc_bytes().map(|bytes| bytes.0));
         let tasks_running_at_start = crate::observability::maintenance_stats().maintenance_tasks_running.load(Relaxed);
-        let batch_rows = if self.config.maintenance.timefusion_rollup_adaptive_batches {
-            batch_rows_for(whole_file_bytes, selected_input_rows.unwrap_or(0), self.config.maintenance.timefusion_maintenance_batch_target_bytes)
-        } else {
-            256
-        };
-        let ctx = self.bounded_rollup_maintenance_context(batch_rows)?;
+        let ctx = self.bounded_rollup_maintenance_context()?;
         let provider = Self::narrow_provider(log_store, snapshot, selected, None, None).await.map_err(|error| anyhow::anyhow!("slice provider: {error}"))?;
         const RAW: &str = "__maintenance_slice_raw";
         // What the PHYSICAL table has, which is not what the spec declares.
@@ -3575,8 +3563,6 @@ impl Database {
                 output_files,
                 estimated_decoded_bytes = estimated_bytes,
                 hash_shards,
-                batch_rows,
-                selected_input_rows,
                 certified_clean,
                 heap_peak_delta_mb,
                 heap_phase_deltas_mb = %heap_phase_deltas_mb,
@@ -10670,7 +10656,7 @@ mod rollup_noop_skip_tests {
             writer.close()?;
         }
         let db = Database::with_config(rollup_cfg("rollup_shard_scan_experiment")).await?;
-        let ctx = db.bounded_rollup_maintenance_context(256)?;
+        let ctx = db.bounded_rollup_maintenance_context()?;
         let spill_dir = tempfile::tempdir()?;
         let ctx = if let Some(bytes) = pool_bytes {
             use datafusion::execution::{
@@ -11884,25 +11870,21 @@ mod rollup_noop_skip_tests {
     /// `content_fp` by the deletion-vector test below (this one's rebuild case clears coverage
     /// outright, so it cannot reach the fingerprint), and `tier_still_holds_slice` by
     /// `rollup_routing_rejects_legacy_materialization_generations`.
-    #[test_case::test_case(false ; "fixed batches")]
-    #[test_case::test_case(true ; "adaptive batches")]
     #[serial]
     #[tokio::test]
-    async fn a_rollup_whose_input_has_not_moved_completes_without_rebuilding(adaptive: bool) -> Result<()> {
+    async fn a_rollup_whose_input_has_not_moved_completes_without_rebuilding() -> Result<()> {
         tracing_subscriber::fmt()
             .with_env_filter(concat!("off,", module_path!(), "=info"))
             .with_test_writer()
             .try_init()
             .expect("install isolated lifecycle test tracing");
         let started = std::time::Instant::now();
-        let phase = |phase: &str| info!(event = "rollup_noop_lifecycle_phase", phase, adaptive, elapsed_seconds = started.elapsed().as_secs_f64());
-        let mut cfg = (*rollup_cfg("rollup_noop_skip")).clone();
-        cfg.maintenance.timefusion_rollup_adaptive_batches = adaptive;
-        let db = Arc::new(Database::with_config(Arc::new(cfg)).await?);
+        let phase = |phase: &str| info!(event = "rollup_noop_lifecycle_phase", phase, elapsed_seconds = started.elapsed().as_secs_f64());
+        let db = Arc::new(Database::with_config(rollup_cfg("rollup_noop_skip")).await?);
         let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
         let date = chrono::Utc::now().date_naive() - chrono::Duration::days(3);
 
-        // Cross both the fixed (256) and maximum adaptive (8192) batch boundaries.
+        // Cross the 256-row scan batch boundary many times over.
         let ts = date.and_hms_opt(12, 0, 0).unwrap().and_utc().timestamp_micros();
         let batch = json_to_batch((0..8193).map(|i| test_span_ts(&format!("seed-{i}"), "op", &project_id, ts)).collect())?;
         db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch], true, None).await?;

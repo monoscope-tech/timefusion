@@ -1848,11 +1848,6 @@ pub struct MaintenanceConfig {
     /// per-worker pool share.
     #[serde_inline_default(8 * MIB as u64)]
     pub timefusion_maintenance_batch_target_bytes: u64,
-    /// Experiment: size rollup scan batches from the selected files' decoded
-    /// width, using the maintenance byte target. Off retains 256 rows until
-    /// paired CPU, memory, cancellation, and foreground latency gates pass.
-    #[serde_inline_default(false)]
-    pub timefusion_rollup_adaptive_batches: bool,
     /// Experiment: omit winner selection only for snapshot-certified raw input.
     /// Tombstones and deletion vectors remain active. Requires paired resource gates.
     #[serde_inline_default(false)]
@@ -2592,7 +2587,6 @@ mod tests {
         assert_eq!(config.timefusion_rollup_backfill_days, 31, "the shipped default is the value prod exercises");
         assert_eq!(config.timefusion_rollup_backfill_tier_inflight, 16, "a new tier must not queue its whole horizon at once");
         assert_eq!(config.timefusion_rollup_measure_remints_per_pass, 2, "a newly declared measure must not re-mint its whole horizon at once");
-        assert!(!config.timefusion_rollup_adaptive_batches, "adaptive batches need the paired resource experiment before activation");
         assert!(!config.timefusion_rollup_certified_clean, "certified aggregation needs the paired resource experiment before activation");
 
         // The canary still narrows the READ side when it is set, and only then.

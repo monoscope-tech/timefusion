@@ -527,11 +527,11 @@ impl Database {
         Ok(ctx)
     }
 
-    /// Session with a private spillable pool bounded by the decoded-work ceiling.
+    /// Session with a private spillable pool bounded by the decoded-work ceiling, scanning 256-row batches.
     /// Only UDFs are registered; the caller registers its own Delta provider.
-    pub(super) fn bounded_rollup_maintenance_context(&self, batch_rows: usize) -> Result<datafusion::prelude::SessionContext> {
+    pub(super) fn bounded_rollup_maintenance_context(&self) -> Result<datafusion::prelude::SessionContext> {
         let runtime = self.coordinator_runtime_env();
-        let state = build_optimize_session_state_tuned(1, runtime, Some(&batch_rows.to_string()), None);
+        let state = build_optimize_session_state_tuned(1, runtime, Some("256"), None);
         let state =
             datafusion::execution::SessionStateBuilder::new_from_existing(state).with_physical_optimizer_rule(Arc::new(CompactRollupSortInputs)).build();
         let mut ctx = datafusion::prelude::SessionContext::new_with_state(state);
@@ -1276,7 +1276,7 @@ mod rollup_window_memory_tests {
             db.insert_records_batch(&project, SOURCE, vec![batch], true, None).await?;
         }
 
-        let ctx = db.bounded_rollup_maintenance_context(256)?;
+        let ctx = db.bounded_rollup_maintenance_context()?;
         let provider = {
             let table_ref = db.resolve_table(&project, SOURCE).await?;
             let table = table_ref.read().await;

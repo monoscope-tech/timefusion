@@ -1,6 +1,5 @@
 //! Local mechanism experiment over the real rollup coordinator, in ABBA/BAAB order.
-//! `cargo bench --bench rollup_work -- 32768 certified` compares winner selection.
-//! Replace `certified` with `batches` to compare fixed and byte-aware batches independently.
+//! `cargo bench --bench rollup_work -- 32768` compares winner selection.
 //! Requires local MinIO's timefusion-tests bucket.
 //! Each arm receives the same logical records in a separate test prefix. File IDs and
 //! write stamps differ: this is not an identical-snapshot or production acceptance test.
@@ -40,18 +39,9 @@ const PROJECT: &str = "rollup-work-benchmark";
 const COUNTERS: [&str; 5] =
     ["rollup_scan_cohorts_total", "rollup_scan_estimated_bytes_total", "rollup_output_rows_total", "rollup_output_files_total", "rollup_commit_actions_total"];
 
-#[derive(Clone, Copy, Serialize, strum::EnumString)]
-#[serde(rename_all = "snake_case")]
-#[strum(serialize_all = "snake_case")]
-enum Experiment {
-    Certified,
-    Batches,
-}
-
 #[derive(Default)]
 struct PublicationCounts {
     certified: AtomicU64,
-    larger_batches: AtomicU64,
 }
 
 #[derive(Clone, Default)]
@@ -62,17 +52,11 @@ impl<S: Subscriber> Layer<S> for Publications {
         #[derive(Default)]
         struct Build {
             clean: bool,
-            larger_batch: bool,
         }
         impl Visit for Build {
             fn record_bool(&mut self, field: &Field, value: bool) {
                 if field.name() == "certified_clean" {
                     self.clean = value;
-                }
-            }
-            fn record_u64(&mut self, field: &Field, value: u64) {
-                if field.name() == "batch_rows" {
-                    self.larger_batch = value > 256;
                 }
             }
             fn record_debug(&mut self, _: &Field, _: &dyn std::fmt::Debug) {}
@@ -81,7 +65,6 @@ impl<S: Subscriber> Layer<S> for Publications {
             let mut build = Build::default();
             event.record(&mut build);
             self.0.certified.fetch_add(u64::from(build.clean), Relaxed);
-            self.0.larger_batches.fetch_add(u64::from(build.larger_batch), Relaxed);
         }
     }
 }
@@ -111,7 +94,6 @@ async fn measured<T>(work: impl Future<Output = Result<T>>) -> Result<(T, Measur
 #[derive(Serialize)]
 struct Sample {
     repetition: usize,
-    experiment: Experiment,
     candidate: bool,
     debug_assertions: bool,
     input_rows: usize,
@@ -121,18 +103,14 @@ struct Sample {
     build: Measurement,
     claimed_units: usize,
     certified_publications: u64,
-    larger_batch_publications: u64,
     work: BTreeMap<&'static str, u64>,
 }
 
-async fn sample(repetition: usize, candidate: bool, rows: usize, experiment: Experiment, publications: &Publications) -> Result<Sample> {
+async fn sample(repetition: usize, candidate: bool, rows: usize, publications: &Publications) -> Result<Sample> {
     let dir = tempfile::tempdir()?;
     let id = format!("rollup-work-{}", uuid::Uuid::new_v4());
     let mut config = (*minio_test_config(&id, dir.path().to_str().ok_or_else(|| anyhow::anyhow!("non-UTF8 temporary path"))?)).clone();
-    let certified = candidate && matches!(experiment, Experiment::Certified);
-    let adaptive = candidate && matches!(experiment, Experiment::Batches);
-    config.maintenance.timefusion_rollup_certified_clean = certified;
-    config.maintenance.timefusion_rollup_adaptive_batches = adaptive;
+    config.maintenance.timefusion_rollup_certified_clean = candidate;
     config.maintenance.timefusion_rollup_backfill_days = 7;
     config.maintenance.timefusion_dedup_lookback_days = 7;
     let fixture_prefix = config.core.timefusion_table_prefix.clone();
@@ -155,7 +133,6 @@ async fn sample(repetition: usize, candidate: bool, rows: usize, experiment: Exp
     let (_, preparation) = measured(db.dedup_today_partitions(&table, SOURCE, SOURCE)).await?;
     let before = counters();
     let clean_before = publications.0.certified.load(Relaxed);
-    let batches_before = publications.0.larger_batches.load(Relaxed);
     let (claimed_units, build) = measured(async {
         db.plan_rollup_backfill().await?;
         advance_micros(16 * 60 * 1_000_000);
@@ -164,16 +141,13 @@ async fn sample(repetition: usize, candidate: bool, rows: usize, experiment: Exp
     .await?;
     let work = counters().into_iter().map(|(key, value)| (key, value - before[key])).collect::<BTreeMap<_, _>>();
     let certified_publications = publications.0.certified.load(Relaxed) - clean_before;
-    let larger_batch_publications = publications.0.larger_batches.load(Relaxed) - batches_before;
     ensure!(claimed_units > 0 && work.get("rollup_scan_cohorts_total").is_some_and(|count| *count > 0), "the benchmark performed no source aggregation");
-    ensure!((certified_publications > 0) == certified, "the requested certified path was not exercised as expected");
-    ensure!((larger_batch_publications > 0) == adaptive, "the requested batch-size path was not exercised as expected");
+    ensure!((certified_publications > 0) == candidate, "the requested certified path was not exercised as expected");
     let actual = db.query_delta_only(&format!("SELECT CAST(SUM(request_count) AS BIGINT) FROM {TIER} WHERE project_id = '{PROJECT}'")).await?;
     let live_rows = actual[0].column(0).as_primitive::<Int64Type>().value(0);
     ensure!(live_rows == i64::try_from(rows - rows.div_ceil(17))?, "rollup result differs from the deterministic input oracle");
     Ok(Sample {
         repetition,
-        experiment,
         candidate,
         debug_assertions: cfg!(debug_assertions),
         input_rows: rows,
@@ -183,7 +157,6 @@ async fn sample(repetition: usize, candidate: bool, rows: usize, experiment: Exp
         build,
         claimed_units,
         certified_publications,
-        larger_batch_publications,
         work,
     })
 }
@@ -192,14 +165,13 @@ async fn sample(repetition: usize, candidate: bool, rows: usize, experiment: Exp
 async fn main() -> Result<()> {
     let mut args = std::env::args().skip(1).filter(|arg| arg != "--bench");
     let rows = args.next().map(|value| value.parse::<usize>()).transpose()?.unwrap_or(32_768);
-    let experiment = args.next().map(|value| value.parse::<Experiment>()).transpose()?.unwrap_or(Experiment::Certified);
-    ensure!(args.next().is_none(), "usage: rollup_work [rows] [certified|batches]");
+    ensure!(args.next().is_none(), "usage: rollup_work [rows]");
     ensure!((1..=1_000_000).contains(&rows), "rows must be between 1 and 1000000");
     let publications = Publications::default();
     let filter = tracing_subscriber::filter::Targets::new().with_target("timefusion::database::maintain", tracing::Level::INFO);
     tracing_subscriber::registry().with(publications.clone().with_filter(filter)).try_init()?;
     for (repetition, candidate) in [false, true, true, false, true, false, false, true].into_iter().enumerate() {
-        println!("{}", serde_json::to_string(&sample(repetition, candidate, rows, experiment, &publications).await?)?);
+        println!("{}", serde_json::to_string(&sample(repetition, candidate, rows, &publications).await?)?);
     }
     Ok(())
 }
