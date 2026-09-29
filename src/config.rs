@@ -2319,10 +2319,12 @@ pub struct MaintenanceConfig {
     #[serde_inline_default(4)]
     pub timefusion_dv_strip_per_interval: u32,
     /// DV-bearing rewrites the whole process may land per interval, so per-span
-    /// budgets cannot flood the hygiene lane. 60 per 10 min drains a ~1.1k-file
-    /// day (the three largest tenants' today) in ~3 h. Soft: checked at claim,
-    /// charged at landing, so units already in flight may overshoot it.
-    #[serde_inline_default(60)]
+    /// budgets cannot flood the hygiene lane. Each landed strip is a new cold file
+    /// (no cache, no tantivy index yet) and a commit that refreshes query snapshots:
+    /// ~53 per 10 min regressed prod p99 0.45→2 s (2026-09-29), so the default is
+    /// 12 — a ~1.1k-file day drains in ~15 h. Soft: checked at claim, charged at
+    /// landing, so units already in flight may overshoot it.
+    #[serde_inline_default(12)]
     pub timefusion_dv_strip_global_per_interval: u32,
     #[serde_inline_default(600)]
     pub timefusion_dv_strip_interval_secs: u64,
