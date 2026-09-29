@@ -130,7 +130,8 @@ async fn order_by_ts_desc_limit_merges_mem_and_delta() -> anyhow::Result<()> {
 #[serial_test::serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn optimized_partition_still_advertises_desc_ordering() -> anyhow::Result<()> {
-    let env = hot_partition_builder().with_optimize_sort_by().start().await?;
+    // No background packing: it races `compact_date` over the same files.
+    let env = hot_partition_builder().with_optimize_sort_by().without_light_optimize().start().await?;
     let client = env.pg_client().await?;
 
     // Flush one bucket at a time: a single force_flush would coalesce into one
@@ -174,6 +175,9 @@ async fn isolated_union_plan(budget_mb: u64) -> anyhow::Result<(String, Vec<Stri
         // The fixture must own its flushes: a periodic flush firing mid-fixture
         // splits the last file, so no union child carries the ordering claim.
         .with_flush_interval(Duration::from_secs(3600))
+        // And its compaction: background packing of the same two files races
+        // `compact_date`, and both rewrites commit (two copies of the rows).
+        .without_light_optimize()
         .with_unordered_leg_sort_max_mb(budget_mb)
         .start()
         .await?;
