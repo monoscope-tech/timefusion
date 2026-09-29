@@ -88,31 +88,44 @@ pub fn project_date_of_rel(rel: &str) -> Option<(&str, &str)> {
 /// column merge value lists — weaker, but always safe.
 pub fn extract_needles(filters: &[Expr], schema: &crate::schema::TableSchema, mutable: Option<&HashSet<String>>) -> Vec<(String, Vec<String>)> {
     let eligible = |name: &str| schema.fields.iter().any(|f| f.name == name && f.bloom_filter) && !mutable.is_some_and(|m| m.contains(name));
-    let lit_str = |e: &Expr| match e {
-        Expr::Literal(ScalarValue::Utf8(Some(s)) | ScalarValue::LargeUtf8(Some(s)) | ScalarValue::Utf8View(Some(s)), _) => Some(s.clone()),
-        _ => None,
-    };
     filters
         .iter()
         .flat_map(|f| split_conjunction(f))
-        .filter_map(|conjunct| {
-            let (col, values) = match conjunct {
-                Expr::BinaryExpr(b) if b.op == Operator::Eq => match (&*b.left, &*b.right) {
-                    (Expr::Column(c), other) | (other, Expr::Column(c)) => (c.name.clone(), lit_str(other).map(|v| vec![v])),
-                    _ => return None,
-                },
-                Expr::InList(l) if !l.negated && l.list.len() <= MAX_NEEDLE_VALUES => match &*l.expr {
-                    Expr::Column(c) => (c.name.clone(), l.list.iter().map(lit_str).collect::<Option<Vec<_>>>()),
-                    _ => return None,
-                },
-                _ => return None,
-            };
-            values.filter(|_| eligible(&col)).map(|values| (col, values))
-        })
+        .filter_map(|conjunct| needle(conjunct, &eligible).filter(|(_, values)| values.len() <= MAX_NEEDLE_VALUES))
         .into_group_map()
         .into_iter()
         .map(|(col, groups)| (col, groups.concat()))
         .collect()
+}
+
+/// `col = 'v'`, `col IN (...)`, or an OR of those over one column — DataFusion
+/// lowers IN lists / `= ANY(array)` of up to 3 items to such an OR chain. An
+/// AND implies either side, so it yields whichever side is a needle.
+fn needle(e: &Expr, eligible: &impl Fn(&str) -> bool) -> Option<(String, Vec<String>)> {
+    let lit_str = |e: &Expr| match e {
+        Expr::Literal(ScalarValue::Utf8(Some(s)) | ScalarValue::LargeUtf8(Some(s)) | ScalarValue::Utf8View(Some(s)), _) => Some(s.clone()),
+        _ => None,
+    };
+    let on = |c: &datafusion::common::Column, values: Option<Vec<String>>| values.filter(|_| eligible(&c.name)).map(|v| (c.name.clone(), v));
+    match e {
+        Expr::BinaryExpr(b) => match (b.op, &*b.left, &*b.right) {
+            (Operator::Eq, Expr::Column(c), v) | (Operator::Eq, v, Expr::Column(c)) => on(c, lit_str(v).map(|v| vec![v])),
+            (Operator::Or, l, r) => {
+                let ((lc, mut lv), (rc, rv)) = (needle(l, eligible)?, needle(r, eligible)?);
+                (lc == rc).then(|| {
+                    lv.extend(rv);
+                    (lc, lv)
+                })
+            }
+            (Operator::And, l, r) => needle(l, eligible).or_else(|| needle(r, eligible)),
+            _ => None,
+        },
+        Expr::InList(l) if !l.negated => match &*l.expr {
+            Expr::Column(c) => on(c, l.list.iter().map(lit_str).collect()),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 /// Dates (YYYY-MM-DD, UTC) covered by a micros time range; `None` when the
@@ -382,5 +395,23 @@ mod tests {
     fn probe_semantics(file: &str, col: &str, values: &[&str]) -> Option<bool> {
         let needles: Vec<(String, Vec<String>)> = vec![(col.to_string(), values.iter().map(|v| v.to_string()).collect())];
         fixture().files.get(&format!("project_id=p/date=2026-08-22/{file}.parquet")).map(|probe| probe.rejects(&needles))
+    }
+
+    #[test_case("context___trace_id = 'a' OR context___trace_id = 'b' OR context___trace_id = 'c'", Some(vec!["a", "b", "c"]) ; "short IN / ANY lowered to an OR chain")]
+    #[test_case("(context___trace_id = 'a' AND name = 'x') OR context___trace_id = 'b'", Some(vec!["a", "b"]) ; "AND legs yield their needle")]
+    #[test_case("context___trace_id = 'a' OR name = 'b'", None ; "OR across columns proves nothing")]
+    #[test_case("context___trace_id = 'a' OR attributes___session___id = 'b'", None ; "a mutable leg poisons the OR")]
+    #[test_case("context___trace_id NOT IN ('a')", None ; "NOT IN is never a needle")]
+    fn needles_from_or_chains(sql: &str, want: Option<Vec<&str>>) {
+        use datafusion::{
+            arrow::datatypes::{DataType, Field, Schema},
+            common::DFSchema,
+            prelude::SessionContext,
+        };
+        let fields = ["context___trace_id", "attributes___session___id", "name"].map(|n| Field::new(n, DataType::Utf8, true));
+        let expr = SessionContext::new().parse_sql_expr(sql, &DFSchema::try_from(Schema::new(fields.to_vec())).unwrap()).unwrap();
+        let mutable: HashSet<String> = ["attributes___session___id".to_string()].into();
+        let got = extract_needles(&[expr], crate::schema::get_schema("otel_logs_and_spans").unwrap(), Some(&mutable));
+        assert_eq!(got, want.map(|v| vec![("context___trace_id".to_string(), v.into_iter().map(String::from).collect())]).unwrap_or_default());
     }
 }

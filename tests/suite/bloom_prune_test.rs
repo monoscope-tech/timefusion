@@ -173,3 +173,49 @@ async fn split_path_bloom_prunes_indexed_and_raw_legs() -> Result<()> {
     assert!(stats.files_rejected.load(Relaxed) >= before + 2, "an all-absent needle must reject every file on the split path");
     Ok(())
 }
+
+/// monoscope's session cross-lookup binds `col = ANY($1)`. DataFusion lowers an array or IN list
+/// of up to 3 items to an OR chain of equalities, which the needle extractor did not read, so a
+/// 3-id lookup scanned the whole window. It must prune like the union of three single-id lookups.
+#[tokio::test(flavor = "multi_thread")]
+async fn pgwire_bound_any_array_prunes_like_in_list() -> Result<()> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let (db, project_id) = setup("bloom_any").await?;
+    let ts = ts();
+    for i in 0..6 {
+        insert(&db, &project_id, vec![row(&format!("r{i}"), &project_id, ts, &format!("trace-{i}"))]).await?;
+    }
+    db.bloom_sidecar_reconcile().await?;
+
+    let port = std::net::TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
+    let mut ctx = Arc::clone(&db).create_session_context();
+    db.setup_session_context(&mut ctx)?;
+    let opts = datafusion_postgres::ServerOptions::new().with_port(port).with_host("127.0.0.1".into());
+    let auth = timefusion::server::AuthConfig { username: "postgres".into(), password: Some("postgres".into()) };
+    tokio::spawn(async move { timefusion::server::serve_with_logging(Arc::new(ctx), &opts, auth, None, None, std::future::pending::<()>()).await.ok() });
+    let client = loop {
+        if let Ok((client, conn)) = tokio_postgres::connect(&format!("host=127.0.0.1 port={port} user=postgres password=postgres"), tokio_postgres::NoTls).await
+        {
+            tokio::spawn(conn);
+            break client;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    let (lo, hi) = (ts - 3_600_000_000, ts + 3_600_000_000);
+    let sql = format!(
+        "SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = '{project_id}' AND context___trace_id = ANY($1) \
+         AND timestamp >= to_timestamp_micros({lo}) AND timestamp <= to_timestamp_micros({hi})"
+    );
+    let stats = &db.bloom_prune().unwrap().stats;
+    let before = stats.files_rejected.load(Relaxed);
+    let n: i64 = client.query_one(&sql.replace("= ANY($1)", "IN ('trace-0', 'trace-2', 'trace-4')"), &[]).await?.get(0);
+    assert_eq!((n, stats.files_rejected.load(Relaxed) - before), (3, 3), "control: the IN-list form prunes");
+    let before = stats.files_rejected.load(Relaxed);
+    let ids = vec!["trace-0", "trace-2", "trace-4"];
+    // Typed like hasql's `#{ids}` bind: the client declares text[].
+    let stmt = client.prepare_typed(&sql, &[tokio_postgres::types::Type::TEXT_ARRAY]).await?;
+    let n: i64 = client.query_one(&stmt, &[&ids]).await?.get(0);
+    assert_eq!(n, 3, "every bound id must be found");
+    assert_eq!(stats.files_rejected.load(Relaxed) - before, 3, "the three files holding none of the ids must be bloom-rejected");
+    Ok(())
+}
