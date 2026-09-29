@@ -853,7 +853,6 @@ impl BufferedWriteLayer {
         // Must precede MemBuffer construction, which reads the bucket duration.
         crate::write::mem_buffer::set_bucket_duration_micros((cfg.buffer.bucket_duration_secs() as i64) * 1_000_000);
         crate::read::set_bounded_dedup_enabled(cfg.maintenance.timefusion_read_dedup_bounded);
-        crate::read::optimizers::set_range_split_branches(cfg.maintenance.timefusion_query_range_split_branches);
         // Text-index cache budget: 25% of the MemBuffer budget, enforced by LRU.
         let text_index_max_bytes = (cfg.buffer.max_memory_mb() / 4).max(16) * 1024 * 1024;
         let mem_buffer = Arc::new(MemBuffer::new_with_max_index_bytes_and_shards(text_index_max_bytes, wal.shards_per_topic()));

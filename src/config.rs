@@ -2153,20 +2153,6 @@ pub struct MaintenanceConfig {
     /// early termination, so "top N" queries then scan the whole window.
     #[serde_inline_default(true)]
     pub timefusion_read_dedup_bounded: bool,
-    /// Branches a wide AGGREGATE window is split into, so each range's
-    /// `DedupExec` runs on its own thread. `0`/`1` disables the split.
-    ///
-    /// `DedupExec` is `SinglePartition`, so one query otherwise gets one core.
-    /// Splitting is exact because `timestamp` leads the dedup key, so no row's
-    /// versions can straddle a boundary. Applies only under an aggregate; an
-    /// `ORDER BY … LIMIT` keeps its streaming TopK. Each branch re-opens the files
-    /// its range touches, so raising this trades file opens for parallelism.
-    ///
-    /// DEFAULT OFF: measured slower than no split. Do not re-enable without
-    /// measuring against a real deployment — the local `ctx.sql` path re-runs
-    /// filter pushdown that the pgwire path does not.
-    #[serde_inline_default(1)]
-    pub timefusion_query_range_split_branches: usize,
     /// Per-shard COMPRESSED-bytes target for a dedup chunk rewrite (`sum(add.size)`).
     /// The rewrite is split into `ceil(compressed_bytes / this)` hash-bucketed passes
     /// so each pass reads ~this much. 0 disables this ceiling's contribution to the
