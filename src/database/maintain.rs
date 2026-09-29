@@ -5417,12 +5417,13 @@ impl Database {
     }
 
     /// THE strip-lane admission, one predicate for planner and packer so they
-    /// cannot disagree: the flag, the source's slice coverage recovered (before
+    /// cannot disagree: the flag, a sealed date unless `sealed_only` is off, the source's slice coverage recovered (before
     /// that the rewrite's carry finds nothing to carry and every slice of the day
     /// goes stale), and the partition's landing budget.
     fn dv_strip_admits(&self, project_id: &str, source: &str, date: &str) -> bool {
         let (cfg, interval) = (&self.config.maintenance, self.dv_strip_interval_micros());
         cfg.timefusion_dv_strip_enabled
+            && (!cfg.timefusion_dv_strip_sealed_only || date < crate::support::today_utc().to_string().as_str())
             && (get_schema(source).is_none_or(|schema| schema.rollups.is_empty()) || self.rollup_coverage_recovered.contains(source))
             && self.dv_strips_landed.get(&(project_id.to_owned(), source.to_owned(), date.to_owned())).is_none_or(|entry| {
                 let (since, landed) = *entry;
@@ -11593,6 +11594,24 @@ mod rollup_noop_skip_tests {
         User,
         UserElsewhere,
         Ingest,
+    }
+
+    /// Out of the box the strip lane admits only sealed dates: today's partition
+    /// prices a strip unit over every DV file it holds and races dedup commits.
+    #[test_case::test_case(1, None, true ; "sealed date admitted by default")]
+    #[test_case::test_case(0, None, false ; "today excluded by default")]
+    #[test_case::test_case(0, Some(false), true ; "today admitted once sealed_only is off")]
+    #[tokio::test]
+    async fn dv_strip_admits_sealed_dates_by_default(days_back: i64, sealed_only: Option<bool>, admitted: bool) -> Result<()> {
+        let mut cfg = (*rollup_cfg("dv_strip_sealed")).clone();
+        if let Some(sealed_only) = sealed_only {
+            cfg.maintenance.timefusion_dv_strip_sealed_only = sealed_only;
+        }
+        let db = Database::with_config(Arc::new(cfg)).await?;
+        db.rollup_coverage_recovered.insert("otel_logs_and_spans".to_owned());
+        let date = (crate::support::today_utc() - chrono::Duration::days(days_back)).to_string();
+        assert_eq!(db.dv_strip_admits("proj", "otel_logs_and_spans", &date), admitted);
+        Ok(())
     }
 
     /// A rewrite that retires deletion-masked rows keeps its rollup slice routed:

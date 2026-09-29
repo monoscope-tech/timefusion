@@ -2298,9 +2298,13 @@ pub struct MaintenanceConfig {
     pub timefusion_dml_merge_key_prune: bool,
     /// Rewrite deletion-vector files DV-free, alone if need be: a DV'd file
     /// decodes every masked row on every read, and nothing else removes one.
-    /// Dark: enabling it releases the stranded backlog as one burst.
-    #[serde_inline_default(false)]
+    #[serde_inline_default(true)]
     pub timefusion_dv_strip_enabled: bool,
+    /// Strip only dates before today (UTC). Today's partition prices a strip unit
+    /// over every DV file it holds (hundreds, tens of GiB decoded) and races dedup
+    /// commits; a sealed date holds a few DV files and nothing writes to it.
+    #[serde_inline_default(true)]
+    pub timefusion_dv_strip_sealed_only: bool,
     /// DV-bearing rewrites one partition may land per `timefusion_dv_strip_interval_secs`.
     /// Today's DVs keep arriving while dedup runs, so this bounds the re-strip churn.
     #[serde_inline_default(4)]
@@ -2658,7 +2662,10 @@ mod tests {
         assert!(config.maintenance.timefusion_evict_after_compaction);
         // Merge-on-read DV is the default write path.
         assert!(config.maintenance.timefusion_use_deletion_vectors);
-        assert!(!config.maintenance.timefusion_dv_strip_enabled, "the DV strip releases a stranded backlog as a burst, so it ships dark");
+        assert!(
+            config.maintenance.timefusion_dv_strip_enabled && config.maintenance.timefusion_dv_strip_sealed_only,
+            "the DV strip runs, but only on sealed dates"
+        );
         assert!(!config.maintenance.timefusion_warm_full_files);
         assert_eq!(config.maintenance.timefusion_warm_recency_days, 35);
         assert_eq!(config.maintenance.timefusion_warm_concurrency, 16);
