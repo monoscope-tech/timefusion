@@ -643,6 +643,98 @@ pub(crate) fn rollups_read_any(source: &str, mut columns: impl Iterator<Item = i
     })
 }
 
+/// Add-action tag naming the columns a flushed file's merge-on-read versions assigned.
+/// Only the flush writes it, and only for versions `VersionOnlyLedger` admitted.
+pub(crate) const VERSION_ONLY_TAG: &str = "timefusion.version_only_columns";
+
+/// A file of version rows that copy already-witnessed winners and differ only in
+/// columns no rollup of `source` reads. Every row witness skips it, on the recording
+/// and the re-proving side alike; builds still read it. Re-checked against the live
+/// specs, so a tier that starts reading one of those columns counts the file again.
+pub(crate) fn version_only(tags: Option<&HashMap<String, Option<String>>>, source: &str) -> bool {
+    tags.and_then(|tags| tags.get(VERSION_ONLY_TAG)?.as_deref()).is_some_and(|columns| !rollups_read_any(source, columns.split(',')))
+}
+
+/// Paths of `table`'s [`version_only`] files. Empty for a source no rollup reads.
+fn version_only_paths(table: &DeltaTable, source: &str) -> Result<HashSet<String>> {
+    if get_schema(source).is_none_or(|schema| schema.rollups.is_empty() || !schema.version_append) {
+        return Ok(HashSet::new());
+    }
+    Ok(table.snapshot()?.log_data().iter().filter(|file| version_only(Some(&file.tags()), source)).map(|file| file.path().to_string()).collect())
+}
+
+/// Version-append batches admitted as version-only, until a flush tags their rows.
+///
+/// IN MEMORY by design: an entry lost to a restart or the TTL only flushes its rows
+/// untagged, which moves the witnesses and costs one rebuild. Nothing here can make a
+/// witness match that should not.
+#[derive(Debug, Default)]
+pub(crate) struct VersionOnlyLedger {
+    /// Delta commits begun per `(project, table)`. A commit that begins after a
+    /// statement's read may land a version the statement did not copy, so its
+    /// append could revert it: the statement then admits nothing.
+    commits: dashmap::DashMap<(String, String), u64>,
+    /// Per `(project, table)`: admitted version stamp → the columns it assigned.
+    stamps: dashmap::DashMap<(String, String), std::collections::BTreeMap<i64, String>>,
+}
+
+/// Admitted stamps a flush has not tagged by then are forgotten (untagged, not wrong).
+const VERSION_ONLY_TTL_MICROS: i64 = 2 * 3600 * 1_000_000;
+
+impl VersionOnlyLedger {
+    fn key(project_id: &str, table: &str) -> (String, String) {
+        (project_id.to_owned(), table.to_owned())
+    }
+
+    pub(crate) fn commits(&self, project_id: &str, table: &str) -> u64 {
+        self.commits.get(&Self::key(project_id, table)).map_or(0, |seq| *seq)
+    }
+
+    /// Called BEFORE a Delta write of `(project, table)` stages anything.
+    pub(crate) fn begin_commit(&self, project_id: &str, table: &str) {
+        *self.commits.entry(Self::key(project_id, table)).or_default() += 1;
+    }
+
+    pub(crate) fn admit(&self, project_id: &str, table: &str, stamp: i64, columns: String) {
+        let mut stamps = self.stamps.entry(Self::key(project_id, table)).or_default();
+        stamps.retain(|held, _| *held >= crate::support::now_micros().saturating_sub(VERSION_ONLY_TTL_MICROS));
+        stamps.insert(stamp, columns);
+    }
+
+    /// Split a flush's rows into `(rest, version-only rows, their columns)`. Row-level:
+    /// admitted versions share a bucket with ingest.
+    pub(crate) fn split(&self, project_id: &str, table: &str, batches: Vec<RecordBatch>) -> Result<(Vec<RecordBatch>, Vec<RecordBatch>, String)> {
+        use arrow::array::AsArray;
+        let stamps = self.stamps.get(&Self::key(project_id, table));
+        let (Some(stamps), Some(column)) = (stamps.filter(|stamps| !stamps.is_empty()), tiebreak_of(table)) else {
+            return Ok((batches, Vec::new(), String::new()));
+        };
+        let (mut rest, mut tagged, mut columns) = (Vec::new(), Vec::new(), std::collections::BTreeSet::new());
+        for batch in batches {
+            let Some(stamp) = batch.column_by_name(column).and_then(|array| array.as_primitive_opt::<arrow::datatypes::TimestampMicrosecondType>().cloned())
+            else {
+                rest.push(batch);
+                continue;
+            };
+            let admitted: arrow::array::BooleanArray = stamp.iter().map(|stamp| Some(stamp.is_some_and(|stamp| stamps.contains_key(&stamp)))).collect();
+            columns.extend(stamp.iter().flatten().filter_map(|stamp| stamps.get(&stamp)).flat_map(|held| held.split(',')));
+            tagged.push(arrow::compute::filter_record_batch(&batch, &admitted)?);
+            rest.push(arrow::compute::filter_record_batch(&batch, &arrow::compute::not(&admitted)?)?);
+        }
+        let keep = |batches: Vec<RecordBatch>| batches.into_iter().filter(|batch| batch.num_rows() > 0).collect_vec();
+        Ok((keep(rest), keep(tagged), columns.into_iter().join(",")))
+    }
+
+    /// Drop the stamps a landed commit tagged.
+    pub(crate) fn forget(&self, project_id: &str, table: &str, tagged: &[RecordBatch]) {
+        use arrow::array::AsArray;
+        let (Some(mut stamps), Some(column)) = (self.stamps.get_mut(&Self::key(project_id, table)), tiebreak_of(table)) else { return };
+        for stamp in tagged.iter().filter_map(|batch| batch.column_by_name(column)?.as_primitive_opt::<arrow::datatypes::TimestampMicrosecondType>().cloned()) {
+            stamp.iter().flatten().for_each(|stamp| drop(stamps.remove(&stamp)));
+        }
+    }
+}
+
 /// Per rollup tier of `source`, whether it reads any of `columns`. A derived tier
 /// reads what its base reads: it aggregates the base's rows.
 pub(crate) fn rollup_tiers_reading(source: &str, columns: &[&str]) -> Vec<(String, bool)> {
@@ -1045,7 +1137,7 @@ impl Database {
     pub(crate) async fn rollup_source_fingerprint(&self, project_id: &str, source: &str, date: &str) -> Result<u64> {
         let table = self.resolve_table(project_id, source).await?;
         let table = table.read().await;
-        let mut fingerprints = Self::partition_fingerprints_bounded(&table, tiebreak_of(source), &|_, _| i64::MAX)?;
+        let mut fingerprints = Self::partition_fingerprints_bounded(&table, source, &|_, _| i64::MAX)?;
         Ok(fingerprints
             .remove(&(project_id.to_string(), date.to_string()))
             .or_else(|| fingerprints.remove(&("default".to_string(), date.to_string())))
@@ -1895,9 +1987,9 @@ impl Database {
                 let recent = (0..=2).map(|back| (today - chrono::Duration::days(back)).to_string());
                 (
                     Self::maintenance_table_partitions(&table, default_project)?,
-                    Self::partition_stats_bounded(&table, tiebreak_of(&source), &|_, _| i64::MAX)?,
-                    self.config.maintenance.timefusion_rollup_bounded_witness.then(|| Self::partition_file_rows(&table)).transpose()?,
-                    self.witness_content(&table, recent)?,
+                    Self::partition_stats_bounded(&table, &source, &|_, _| i64::MAX)?,
+                    self.config.maintenance.timefusion_rollup_bounded_witness.then(|| Self::partition_file_rows(&table, &source)).transpose()?,
+                    self.witness_content(&table, &source, recent)?,
                 )
             };
             // Taken from the source, not the tier: asking the tier would let a
@@ -2842,14 +2934,14 @@ impl Database {
             let date_string = date.to_string();
             // The witness the read path re-checks this slice against. Must use the SAME
             // call and bound as the read path, over the very snapshot this build aggregates.
-            let partition_stats = Self::partition_stats_bounded(witness_source, tiebreak_of(&key.source), &|_, _| i64::MAX).ok().and_then(|mut stats| {
+            let partition_stats = Self::partition_stats_bounded(witness_source, &key.source, &|_, _| i64::MAX).ok().and_then(|mut stats| {
                 stats.remove(&(key.project_id.clone(), date_string.clone())).or_else(|| stats.remove(&("default".to_string(), date_string.clone())))
             });
             let source_rows = partition_stats.map(|stats| stats.rows);
             // The same count bounded by THIS slice's end. Written alongside the
             // unbounded one and not yet read, so the flip can happen later against
             // data that already exists rather than waiting a full rebuild cycle.
-            let source_rows_below = Self::partition_stats_bounded(witness_source, tiebreak_of(&key.source), &|_, _| key.slice.end_micros)
+            let source_rows_below = Self::partition_stats_bounded(witness_source, &key.source, &|_, _| key.slice.end_micros)
                 .ok()
                 .and_then(|mut stats| {
                     stats.remove(&(key.project_id.clone(), date_string.clone())).or_else(|| stats.remove(&("default".to_string(), date_string.clone())))
@@ -2922,8 +3014,11 @@ impl Database {
                 estimated_rows = estimated_rows.saturating_add(add_row_count(&add).map_or(0, |rows| rows.saturating_mul(share) / projected.max(1)));
                 whole_file_bytes = whole_file_bytes.saturating_add(projected);
                 // XOR-folded so file order, which a snapshot does not promise, cannot
-                // change the answer.
-                content_fp ^= file_content_hash(&path, add.deletion_vector.as_ref());
+                // change the answer. A version-only file is read but, as in
+                // `partition_file_content`, is no part of the identity.
+                if !version_only(add.tags.as_ref(), &key.source) {
+                    content_fp ^= file_content_hash(&path, add.deletion_vector.as_ref());
+                }
                 selected.push(path);
             }
             (
@@ -4349,7 +4444,7 @@ impl Database {
             for source in crate::schema::registry().list_tables() {
                 let Ok(table_ref) = self.resolve_table("default", &source).await else { continue };
                 let table = table_ref.read().await;
-                let Ok(stats) = Self::partition_stats_bounded(&table, tiebreak_of(&source), &|_, _| i64::MAX) else { continue };
+                let Ok(stats) = Self::partition_stats_bounded(&table, &source, &|_, _| i64::MAX) else { continue };
                 ceilings.extend(stats.into_iter().map(|(partition, stat)| (partition, stat.bytes)));
             }
             // Each tier's prior output per project, from its live tags, so a fusion is
@@ -4667,10 +4762,8 @@ impl Database {
     /// Bounding to the part the build actually read lets a day still being written hold stable
     /// coverage: files landing above the bound change nothing, while a rewrite or late file
     /// below it moves the fingerprint and correctly invalidates.
-    fn partition_fingerprints_bounded(
-        table: &DeltaTable, tiebreak: Option<&str>, bound_for: &dyn Fn(&str, &str) -> i64,
-    ) -> Result<HashMap<(String, String), u64>> {
-        Ok(Self::partition_stats_bounded(table, tiebreak, bound_for)?.into_iter().map(|(key, stats)| (key, stats.fingerprint)).collect())
+    fn partition_fingerprints_bounded(table: &DeltaTable, source: &str, bound_for: &dyn Fn(&str, &str) -> i64) -> Result<HashMap<(String, String), u64>> {
+        Ok(Self::partition_stats_bounded(table, source, bound_for)?.into_iter().map(|(key, stats)| (key, stats.fingerprint)).collect())
     }
 
     /// Split a window's live Delta files into the ones that may skip
@@ -4844,12 +4937,15 @@ impl Database {
     /// [`PartitionFileContent`] for the partitions dated in `dates`, keyed by path
     /// segments as `dedup_partition_paths` selects a build's files. Statistics are
     /// parsed only for those dates, so a caller pays for the days it proves.
-    pub(crate) fn partition_file_content(table: &DeltaTable, dates: &HashSet<String>) -> Result<PartitionFileContent> {
+    pub(crate) fn partition_file_content(table: &DeltaTable, source: &str, dates: &HashSet<String>) -> Result<PartitionFileContent> {
         Ok(table.snapshot()?.log_data().iter().fold(PartitionFileContent::new(), |mut acc, file| {
             let path = file.path().to_string();
             let segment = |key: &str| path.split('/').find_map(|segment| segment.strip_prefix(key)).map(str::to_owned);
             if let Some(date) = segment("date=").filter(|date| dates.contains(date)) {
                 let add = add_action(&file);
+                if version_only(add.tags.as_ref(), source) {
+                    return acc;
+                }
                 acc.entry((segment("project_id=").unwrap_or_else(|| "default".to_owned()), date))
                     .or_default()
                     .push((add_ts_bounds(&add), file_content_hash(&path, add.deletion_vector.as_ref())));
@@ -4859,13 +4955,21 @@ impl Database {
     }
 
     /// [`Self::partition_file_content`] when the content witness is on.
-    pub(super) fn witness_content(&self, table: &DeltaTable, dates: impl IntoIterator<Item = String>) -> Result<Option<PartitionFileContent>> {
-        self.config.maintenance.timefusion_rollup_content_witness.then(|| Self::partition_file_content(table, &dates.into_iter().collect())).transpose()
+    pub(super) fn witness_content(&self, table: &DeltaTable, source: &str, dates: impl IntoIterator<Item = String>) -> Result<Option<PartitionFileContent>> {
+        self.config.maintenance.timefusion_rollup_content_witness.then(|| Self::partition_file_content(table, source, &dates.into_iter().collect())).transpose()
     }
 
-    pub(crate) fn partition_file_rows(table: &DeltaTable) -> Result<PartitionFileRows> {
+    /// Per row of `actions`, `table`'s add-actions batch, whether the file is [`version_only`].
+    fn version_only_rows(table: &DeltaTable, actions: &RecordBatch, source: &str) -> Result<Vec<bool>> {
+        let paths = version_only_paths(table, source)?;
+        let path = actions.column_by_name("path").filter(|_| !paths.is_empty());
+        Ok((0..actions.num_rows()).map(|row| path.is_some_and(|path| paths.contains(&crate::support::test_helpers::array_get_str(path, row)))).collect())
+    }
+
+    pub(crate) fn partition_file_rows(table: &DeltaTable, source: &str) -> Result<PartitionFileRows> {
         let snapshot = table.snapshot()?.snapshot();
         let actions = snapshot.add_actions_table(true)?;
+        let skipped = Self::version_only_rows(table, &actions, source)?;
         let (Some(records), Some(dates)) = (actions.column_by_name("num_records").cloned(), actions.column_by_name("partition.date").cloned()) else {
             return Ok(HashMap::new());
         };
@@ -4873,7 +4977,7 @@ impl Database {
         let projects = actions.column_by_name("partition.project_id").cloned();
         let max_ts = crate::read::ts_micros_column(&actions, "max.timestamp");
         Ok((0..actions.num_rows()).fold(PartitionFileRows::new(), |mut acc, row| {
-            let Some(date) = Self::partition_string_at(Some(&dates), row) else { return acc };
+            let Some(date) = Self::partition_string_at(Some(&dates), row).filter(|_| !skipped[row]) else { return acc };
             let project = Self::partition_string_at(projects.as_ref(), row).unwrap_or_else(|| "default".to_string());
             // The SAME row rule as `partition_stats_bounded`: an invalid
             // `num_records` counts 0, and the max timestamp stays `None` when the
@@ -4962,7 +5066,7 @@ impl Database {
             };
             let witness_source: &DeltaTable = witness_guard.as_deref().unwrap_or(&table);
             let date_string = date.to_string();
-            let below = Self::partition_stats_bounded(witness_source, tiebreak_of(&key.source), &|_, _| covering_end)
+            let below = Self::partition_stats_bounded(witness_source, &key.source, &|_, _| covering_end)
                 .ok()
                 .and_then(|mut stats| {
                     stats.remove(&(key.project_id.clone(), date_string.clone())).or_else(|| stats.remove(&("default".to_string(), date_string)))
@@ -5010,11 +5114,13 @@ impl Database {
     }
 
     pub(crate) fn partition_stats_bounded(
-        table: &DeltaTable, tiebreak: Option<&str>, bound_for: &dyn Fn(&str, &str) -> i64,
+        table: &DeltaTable, source: &str, bound_for: &dyn Fn(&str, &str) -> i64,
     ) -> Result<HashMap<(String, String), PartitionStats>> {
         use std::hash::{Hash, Hasher};
+        let tiebreak = tiebreak_of(source);
         let snapshot = table.snapshot()?.snapshot();
         let actions = snapshot.add_actions_table(true)?;
+        let skipped = Self::version_only_rows(table, &actions, source)?;
         let column = |name: &str| actions.column_by_name(name).cloned();
         // A table without `numRecords` stats cannot be fingerprinted; returning empty
         // leaves every partition uncovered, which costs a raw scan rather than a wrong one.
@@ -5050,8 +5156,12 @@ impl Database {
                 return acc;
             }
             let entry = acc.entry((project, date)).or_insert((0, i64::MAX, i64::MIN, i64::MIN, 0));
-            entry.0 += if records.is_valid(row) { records.value(row) } else { 0 };
+            // Bytes still count: callers price decode work from them.
             entry.4 += Self::valid_at(&sizes, row).unwrap_or(0);
+            if skipped[row] {
+                return acc;
+            }
+            entry.0 += if records.is_valid(row) { records.value(row) } else { 0 };
             entry.1 = entry.1.min(Self::valid_at(&min_ts, row).unwrap_or(i64::MAX));
             entry.2 = entry.2.max(Self::valid_at(&max_ts, row).unwrap_or(i64::MIN));
             entry.3 = entry.3.max(Self::valid_at(&stamp, row).unwrap_or(i64::MIN));
@@ -5238,10 +5348,13 @@ impl Database {
             return;
         }
         let side = |adds: &[deltalake::kernel::Add]| {
-            adds.iter().map(|add| (add_ts_bounds(add).1, add_row_count(add).and_then(|rows| i64::try_from(rows).ok()).unwrap_or(0))).collect_vec()
+            adds.iter()
+                .filter(|add| !version_only(add.tags.as_ref(), source))
+                .map(|add| (add_ts_bounds(add).1, add_row_count(add).and_then(|rows| i64::try_from(rows).ok()).unwrap_or(0)))
+                .collect_vec()
         };
         let Some(date) = inputs.first().and_then(|add| add.partition_values.get("date").cloned().flatten()) else { return };
-        let (Some(day_start), Ok(files)) = (date_start_micros(&date), Self::partition_file_rows(table)) else { return };
+        let (Some(day_start), Ok(files)) = (date_start_micros(&date), Self::partition_file_rows(table, source)) else { return };
         let (live, inputs, outputs) = (partition_of(&files, project_id, &date).unwrap_or_default(), side(inputs), side(outputs));
         let day = day_start..day_start.saturating_add(DAY_MICROS);
         let mut carried = 0u64;
@@ -5320,8 +5433,19 @@ impl Database {
     /// Bookkeeping for landed compaction bins whose inputs carried a DV: they
     /// dropped the masked rows, so carry the witness and spend the strip budget
     /// of the span the bin covered.
+    ///
+    /// An unmasked bin packing a `version_only` file is carried too: its output is
+    /// untagged, so the witnesses now count rows the tag hid, for the same identity.
     async fn note_masked_rewrites_landed(&self, table_ref: &Arc<RwLock<DeltaTable>>, key: &crate::maintenance_coordinator::TaskKey, landed: &[StagedBin]) {
-        let masked = landed.iter().filter(|bin| bin.targets.iter().any(|add| add.deletion_vector.is_some())).collect_vec();
+        let (masked, unmasked): (Vec<_>, Vec<_>) = landed.iter().partition(|bin| bin.targets.iter().any(|add| add.deletion_vector.is_some()));
+        let untagged = unmasked.into_iter().filter(|bin| bin.targets.iter().any(|add| version_only(add.tags.as_ref(), &key.source))).collect_vec();
+        if !untagged.is_empty() {
+            let table = table_ref.read().await;
+            for bin in untagged {
+                let outputs = bin.adds.iter().filter_map(|action| if let deltalake::kernel::Action::Add(add) = action { Some(add.clone()) } else { None });
+                self.carry_rewrite_witness(&table, &key.source, &bin.project_id, &bin.targets, &outputs.collect_vec());
+            }
+        }
         if masked.is_empty() {
             return;
         }
@@ -5423,7 +5547,7 @@ impl Database {
     async fn recover_date_coverage(&self, source: &str, target: &str) -> Result<()> {
         let Ok(table_ref) = self.resolve_table("default", source).await else { return Ok(()) };
         let table = table_ref.read().await.clone();
-        let stats = Self::partition_stats_bounded(&table, tiebreak_of(source), &|_, _| i64::MAX)?;
+        let stats = Self::partition_stats_bounded(&table, source, &|_, _| i64::MAX)?;
         let by_date: HashMap<(String, String), Vec<(i64, RollupCoverage)>> = self
             .rollup_slice_coverage
             .iter()
@@ -5445,8 +5569,9 @@ impl Database {
             .map(|((_, date), _)| date.clone())
             .collect();
         let needs_files = !moved_dates.is_empty();
-        let file_rows = (needs_files && self.config.maintenance.timefusion_rollup_bounded_witness).then(|| Self::partition_file_rows(&table)).transpose()?;
-        let file_content = if needs_files { self.witness_content(&table, moved_dates)? } else { None };
+        let file_rows =
+            (needs_files && self.config.maintenance.timefusion_rollup_bounded_witness).then(|| Self::partition_file_rows(&table, source)).transpose()?;
+        let file_content = if needs_files { self.witness_content(&table, source, moved_dates)? } else { None };
         let files = SourceFiles { rows: file_rows.as_ref(), content: file_content.as_ref() };
         let mut recovered = 0u64;
         let mut moved: Vec<(String, crate::maintenance_coordinator::TimeSlice)> = Vec::new();
@@ -11181,7 +11306,7 @@ mod rollup_noop_skip_tests {
         assert_eq!(recovered.output, RollupOutputEvidence::Empty, "an empty publication authorizes no generation rows");
         drop(recovered);
         let source_table = db.resolve_table(&project, "otel_logs_and_spans").await?;
-        let source_stats = Database::partition_stats_bounded(&*source_table.read().await, tiebreak_of("otel_logs_and_spans"), &|_, _| i64::MAX)?;
+        let source_stats = Database::partition_stats_bounded(&*source_table.read().await, "otel_logs_and_spans", &|_, _| i64::MAX)?;
         let target_table = db.resolve_table(&project, TIER).await?;
         let covered = db.readable_rollup_ranges("otel_logs_and_spans", (TIER, &*target_table.read().await, &project), &source_stats, Default::default())?;
         assert!(
@@ -11267,6 +11392,93 @@ mod rollup_noop_skip_tests {
         db.recover_rollup_coverage("otel_logs_and_spans").await?;
         assert!(!db.rollup_slice_coverage.contains_key(&key), "empty recovery must refuse changed source or overlapping old output");
         Ok(())
+    }
+
+    /// Monoscope's pattern-tag UPDATE (`SET hashes = …`) appends versions of already
+    /// flushed rows; no tier reads `hashes`, so today's slice must stay provable across
+    /// it, a restart included, while a tier-read column must still refute it. Each case
+    /// names the statements (each flushed), whether the process restarts, then whether
+    /// the slice still routes.
+    #[test_case::test_case(&[Stmt::Hashes], false, true ; "hashes only routes")]
+    #[test_case::test_case(&[Stmt::User], false, false ; "a tier-read column refutes")]
+    #[test_case::test_case(&[Stmt::Hashes], true, true ; "hashes only routes after a restart")]
+    #[test_case::test_case(&[Stmt::Hashes, Stmt::Hashes], false, true ; "repeated versions of one row route")]
+    #[serial]
+    #[tokio::test]
+    async fn a_version_only_update_keeps_todays_slice_provable(statements: &[Stmt], restart: bool, routes: bool) -> Result<()> {
+        let cfg = rollup_cfg("version_only");
+        let db = Database::with_config(Arc::clone(&cfg)).await?;
+        let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+        let date = crate::support::today_utc();
+        assert!(build_day(&db, &project_id, date, "seed").await? > 0, "the fixture needs today's built slice");
+        db.recover_rollup_coverage("otel_logs_and_spans").await?;
+        let layer = Arc::new(crate::support::test_helpers::test_layer(Arc::clone(&cfg))?.with_delta_writer(crate::server::delta_write_callback(&db)));
+        let db = Arc::new(db.with_buffered_layer(Arc::clone(&layer)));
+        let noon = date.and_hms_opt(12, 0, 0).expect("valid hour").and_utc().timestamp_micros();
+        let (lo, hi) = db
+            .rollup_slice_coverage
+            .iter()
+            .find(|entry| entry.key().0 == project_id && entry.key().2 == TIER && entry.key().3 <= noon && noon < entry.key().4)
+            .map(|entry| (entry.key().3, entry.key().4))
+            .expect("the base slice holding the seed row");
+        let window = format!("project_id='{project_id}' AND timestamp >= to_timestamp_micros({lo}) AND timestamp < to_timestamp_micros({hi})");
+        let by_status = format!("SELECT status_code, COUNT(*) AS n FROM otel_logs_and_spans WHERE {window} GROUP BY status_code ORDER BY status_code");
+        // (routes, routed answer, raw answer) on `db`.
+        let probe = |db: Arc<Database>| {
+            let by_status = by_status.clone();
+            async move {
+                let mut ctx = Arc::clone(&db).create_session_context();
+                db.setup_session_context(&mut ctx)?;
+                let state = ctx.state();
+                let plan = state.optimize(&state.create_logical_plan(&by_status).await?)?;
+                let routes = matches!(db.rollup_sql(&plan, &state).await, Ok(Some(_)));
+                let render = |batches: Vec<RecordBatch>| arrow::util::pretty::pretty_format_batches(&batches).map(|table| table.to_string());
+                Ok::<_, anyhow::Error>((routes, render(ctx.sql(&by_status).await?.collect().await?)?, render(db.query_delta_only(&by_status).await?)?))
+            }
+        };
+        assert!(probe(Arc::clone(&db)).await?.0, "the slice must route before any update");
+        let mut ctx = Arc::clone(&db).create_session_context();
+        db.setup_session_context(&mut ctx)?;
+        for statement in statements {
+            let set = match statement {
+                Stmt::Hashes => "hashes = make_array('tag')",
+                Stmt::User => "attributes___user___id = 'u'",
+            };
+            ctx.sql(&format!("UPDATE otel_logs_and_spans SET {set} WHERE project_id = '{project_id}' AND id = 'seed'")).await?.collect().await?;
+            layer.flush_all_now().await?;
+        }
+        let db = if restart {
+            let reopened = Arc::new(Database::with_config(Arc::clone(&cfg)).await?);
+            reopened.recover_rollup_coverage("otel_logs_and_spans").await?;
+            reopened
+        } else {
+            db
+        };
+        let (routed, answer, raw) = probe(Arc::clone(&db)).await?;
+        assert_eq!(routed, routes, "statements {statements:?}, restart={restart}");
+        assert_eq!(answer, raw, "the routed answer must equal the raw one");
+        let expected = "|             | 1 |";
+        assert!(answer.contains(expected), "one logical row:\n{answer}");
+        if statements.contains(&Stmt::User) {
+            let written = format!("SELECT COUNT(*) FROM otel_logs_and_spans WHERE {window} AND attributes___user___id = 'u'");
+            let mut ctx = Arc::clone(&db).create_session_context();
+            db.setup_session_context(&mut ctx)?;
+            let batches = ctx.sql(&written).await?.collect().await?;
+            assert_eq!(batches[0].column(0).as_any().downcast_ref::<arrow::array::Int64Array>().map(|a| a.value(0)), Some(1), "the update is visible");
+        }
+        if statements.len() > 1 {
+            // A republish over the versions must count the row once.
+            remint_and_drain(&db).await?;
+            let (routed, answer, raw) = probe(Arc::clone(&db)).await?;
+            assert!(routed && answer == raw && answer.contains(expected), "after a republish:\n{answer}");
+        }
+        Ok(())
+    }
+
+    #[derive(Debug, PartialEq)]
+    enum Stmt {
+        Hashes,
+        User,
     }
 
     /// Out of the box the strip lane admits today too: that is where the masked

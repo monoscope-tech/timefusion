@@ -858,6 +858,11 @@ async fn perform_version_append(
     }
     let table_schema = schema.schema_ref();
     let irrelevant = !tombstone && !crate::database::maintain::rollups_read_any(table_name, assignments.iter().map(|(column, _)| column));
+    // Taken BEFORE the read: a commit begun after it may land a version this statement
+    // never saw, which its append would silently revert.
+    let commits = database.version_only.commits(project_id, table_name);
+    let candidate = irrelevant && layer.is_some() && database.config().maintenance.timefusion_rollup_version_only_witness;
+    let columns = assignments.iter().map(|(column, _)| column.as_str()).sorted().join(",");
 
     // The routing provider IS the logical table: it unions MemBuffer, the hot
     // tier and Delta and runs DedupExec, so the rows read are current versions.
@@ -976,12 +981,13 @@ async fn perform_version_append(
         // version. Appending via `BufferedWriteLayer::insert` directly skips the
         // stamp, and every version then ties on the tiebreak, which
         // keep-greatest resolves arbitrarily.
-        let batches = vec![batch];
+        // A candidate is stamped here, so the ledger can name its rows at the flush.
+        let batches = if candidate { crate::write::stamp_version(table_name, vec![batch]) } else { vec![batch] };
         if let Some(l) = layer {
             l.mark_version_buckets(project_id, table_name, &batches);
         }
         database
-            .insert_records_batch_bounded(project_id, table_name, batches.clone(), false, None, false)
+            .insert_records_batch_bounded(project_id, table_name, batches.clone(), false, None, false, candidate)
             .await
             .map_err(|e| DataFusionError::Execution(format!("merge-on-read append failed for {project_id}/{table_name}: {e}")))?;
         // AFTER the stamped append is in the buffer: drop the buffered rows it
@@ -999,6 +1005,28 @@ async fn perform_version_append(
             if irrelevant && dropped == 0 { "transparent" } else { "base_version" },
             database.rows_below_live_coverage(project_id, table_name, &batches[0]),
         );
+        if candidate {
+            // Version-only iff every predecessor was already flushed (`dropped == 0`:
+            // a buffered one, including any newer version raced in since the read, was
+            // just retracted) and no commit began since the read.
+            let stats = crate::observability::dml_stats();
+            let stamp = (dropped == 0 && database.version_only.commits(project_id, table_name) == commits)
+                .then(|| crate::write::version_stamp_of(table_name, &batches[0]))
+                .flatten();
+            let rows = batches[0].num_rows() as u64;
+            match stamp {
+                Some(stamp) => {
+                    database.version_only.admit(project_id, table_name, stamp, columns.clone());
+                    stats.rollup_version_only_rows.fetch_add(rows, std::sync::atomic::Ordering::Relaxed);
+                }
+                None => {
+                    stats.rollup_version_only_declined_rows.fetch_add(rows, std::sync::atomic::Ordering::Relaxed);
+                    database
+                        .invalidate_rollup_batches(project_id, table_name, &batches)
+                        .map_err(|e| DataFusionError::Execution(format!("rollup invalidation failed for {project_id}/{table_name}: {e}")))?;
+                }
+            }
+        }
     }
     if rows > 0 {
         let assigned: Vec<&str> = assignments.iter().map(|(column, _)| column.as_str()).collect();

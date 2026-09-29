@@ -1297,6 +1297,14 @@ atomic_stats! {
         /// each one a row the flush no longer writes and packing no longer
         /// re-collapses.
         mor_versions_retracted as "mor_versions_retracted_total",
+        /// Version rows admitted as version-only: assigned no column a rollup reads,
+        /// superseded only flushed rows, and raced no commit.
+        rollup_version_only_rows as "rollup_version_only_rows_total",
+        /// Candidates refused (a buffered predecessor or a commit since the read); they
+        /// invalidate their slices as any other version append does.
+        rollup_version_only_declined_rows as "rollup_version_only_declined_rows_total",
+        /// Admitted rows a flush committed in tagged files.
+        rollup_version_only_flushed_rows as "rollup_version_only_flushed_rows_total",
     }
 }
 

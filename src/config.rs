@@ -1820,6 +1820,11 @@ pub struct MaintenanceConfig {
     /// counts/sums/sketches, t-digest error within 1.14x of the dedup path.
     #[serde_inline_default(true)]
     pub timefusion_rollup_certified_clean: bool,
+    /// Tag flushed merge-on-read versions that assign only columns no rollup reads, so
+    /// slice witnesses skip them and today's slices stay provable. `false` stops new
+    /// tags; files already tagged stay skipped.
+    #[serde_inline_default(true)]
+    pub timefusion_rollup_version_only_witness: bool,
     /// Decoded bytes per event-time slice of a REPAIR rewrite. 0 (default)
     /// disables slicing; any non-zero value costs one full re-read and re-decode
     /// of the input file per slice.

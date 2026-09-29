@@ -184,7 +184,7 @@ impl Database {
             let table = source_table.read().await;
             // Unbounded (`i64::MAX`) to match how the write side stamps `source_rows` and the
             // date-level `source_fp`; the computation must stay identical on both sides.
-            Self::partition_stats_bounded(&table, tiebreak_of(&route.source), &|_, _| i64::MAX).map_err(|_| crate::rollup::MissReason::IncompleteCoverage)?
+            Self::partition_stats_bounded(&table, &route.source, &|_, _| i64::MAX).map_err(|_| crate::rollup::MissReason::IncompleteCoverage)?
         };
         // A project's own live stats for a date, falling back to the unified table's row (a
         // project on "default" storage has no row of its own).
@@ -332,7 +332,7 @@ impl Database {
                     // per-file passes are loaded at most once per route call and only
                     // on this path, so a day with no stale-looking slice never pays.
                     if file_content.is_none() {
-                        file_content = self.witness_content(&*source_table.read().await, [date.clone()]).unwrap_or_default();
+                        file_content = self.witness_content(&*source_table.read().await, &route.source, [date.clone()]).unwrap_or_default();
                     }
                     if self.config.maintenance.timefusion_rollup_bounded_witness && coverage.source_rows_below.is_some() && file_rows.is_none() {
                         let table = source_table.read().await;
@@ -340,7 +340,7 @@ impl Database {
                         file_rows = Some(match self.rollup_file_rows_cache.get(&route.source).filter(|hit| hit.0 == version) {
                             Some(hit) => std::sync::Arc::clone(&hit.1),
                             None => {
-                                let fresh = std::sync::Arc::new(Self::partition_file_rows(&table).unwrap_or_default());
+                                let fresh = std::sync::Arc::new(Self::partition_file_rows(&table, &route.source).unwrap_or_default());
                                 self.rollup_file_rows_cache.insert(route.source.clone(), (version, std::sync::Arc::clone(&fresh)));
                                 fresh
                             }
@@ -501,7 +501,7 @@ impl Database {
         let Ok(source_table) = self.resolve_table(lookup_project, source).await else { return false };
         let fingerprints = {
             let table = source_table.read().await;
-            let Ok(stats) = Self::partition_stats_bounded(&table, tiebreak_of(source), &|_, _| i64::MAX) else { return false };
+            let Ok(stats) = Self::partition_stats_bounded(&table, source, &|_, _| i64::MAX) else { return false };
             stats
         };
         let Ok(target_table) = self.resolve_table(lookup_project, target).await else { return false };

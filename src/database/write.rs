@@ -528,13 +528,16 @@ impl Database {
     pub async fn insert_records_batch(
         &self, project_id: &str, table_name: &str, batches: Vec<RecordBatch>, skip_queue: bool, watermark: Option<&crate::write::DeltaWatermark>,
     ) -> Result<Vec<String>> {
-        self.insert_records_batch_bounded(project_id, table_name, batches, skip_queue, watermark, true).await
+        self.insert_records_batch_bounded(project_id, table_name, batches, skip_queue, watermark, true, false).await
     }
 
     /// `bound: false` is for DML re-appends only — see
-    /// [`crate::write::BufferedWriteLayer::insert_bounded`].
+    /// [`crate::write::BufferedWriteLayer::insert_bounded`]. `stamped` marks a version
+    /// append its caller already stamped and will admit or invalidate itself.
+    #[allow(clippy::too_many_arguments)]
     pub async fn insert_records_batch_bounded(
         &self, project_id: &str, table_name: &str, batches: Vec<RecordBatch>, skip_queue: bool, watermark: Option<&crate::write::DeltaWatermark>, bound: bool,
+        stamped: bool,
     ) -> Result<Vec<String>> {
         let span = tracing::Span::current();
         // Delta-rs' Arrow→Delta schema conversion only accepts the IANA `"UTC"`
@@ -558,7 +561,7 @@ impl Database {
 
         let table_name = if table_name.is_empty() { "otel_logs_and_spans" } else { table_name }.to_string();
 
-        if watermark.is_none() {
+        if watermark.is_none() && !stamped {
             self.invalidate_rollup_batches(&project_id, &table_name, &batches)?;
         }
 
@@ -567,7 +570,7 @@ impl Database {
         // durable record carries the value. A `watermark` marks the one non-inbound
         // caller — a flush of already-stamped buffered rows — which must keep the
         // original value, or a crash-retried flush would disagree with the WAL.
-        let batches = if watermark.is_none() { crate::write::stamp_version(&table_name, batches) } else { batches };
+        let batches = if watermark.is_none() && !stamped { crate::write::stamp_version(&table_name, batches) } else { batches };
 
         // Buffered layer (WAL → MemBuffer): nothing is written synchronously, so an
         // empty URI list is correct.
@@ -594,8 +597,23 @@ impl Database {
         // what the flush side hashes when it checks.
         let landed = watermark.is_some().then(|| self.landed_digest_for(&table_name, &batches)).flatten();
 
-        let PreparedWrite { table_ref, schema, dirty_bins, batches, writer_properties, stage_store, staged_writer, sorted } =
-            self.prepare_staged_write(&project_id, &table_name, batches).await?;
+        self.version_only.begin_commit(&project_id, &table_name);
+        // Admitted version-only rows stage into their own tagged files of this commit.
+        let (rest, versions, columns) = if watermark.is_some() && self.config.maintenance.timefusion_rollup_version_only_witness {
+            self.version_only.split(&project_id, &table_name, batches.clone())?
+        } else {
+            (batches.clone(), Vec::new(), String::new())
+        };
+        let tagged = if versions.is_empty() { None } else { Some(self.prepare_staged_write(&project_id, &table_name, versions.clone()).await?) };
+        let PreparedWrite { table_ref, schema, mut dirty_bins, batches: sorted_batches, writer_properties, stage_store, staged_writer, sorted } =
+            self.prepare_staged_write(&project_id, &table_name, rest).await?;
+        if tagged.as_ref().is_some_and(|tagged| tagged.staged_writer.is_none() || staged_writer.is_none()) {
+            // No staged path for one group: write everything untagged, which only costs
+            // the slices a rebuild.
+            self.version_only.forget(&project_id, &table_name, &versions);
+            return Box::pin(self.insert_records_batch_bounded(&project_id, &table_name, batches, skip_queue, watermark, bound, stamped)).await;
+        }
+        let batches = sorted_batches;
 
         // Base properties (hooks off) when there is no watermark: leaving this unset
         // lets WriteBuilder's own default re-enable the checkpoint hook.
@@ -613,10 +631,30 @@ impl Database {
         if let Some(mut writer) = staged_writer {
             let stage_span = tracing::trace_span!(parent: &span, "delta.stage_parquet");
             let max_file_bytes = self.config.maintenance.timefusion_writer_max_file_bytes;
-            let adds = Self::stage_batches(&mut writer, batches, max_file_bytes)
+            let mut adds = Self::stage_batches(&mut writer, batches, max_file_bytes)
                 .instrument(stage_span)
                 .await
                 .map_err(|e| anyhow::anyhow!("staged parquet flush failed: {}", e))?;
+            let untagged = adds.len();
+            let mut tagged_sorted = false;
+            if let Some(PreparedWrite { staged_writer: Some(mut writer), batches, dirty_bins: bins, sorted, .. }) = tagged {
+                let staged = Self::stage_batches(&mut writer, batches, max_file_bytes).await.map_err(|e| anyhow::anyhow!("staged parquet flush failed: {}", e));
+                let staged = match staged {
+                    Ok(staged) => staged,
+                    Err(e) => {
+                        Self::cleanup_orphaned_parquet(&stage_store, &adds).await;
+                        return Err(e);
+                    }
+                };
+                adds.extend(staged.into_iter().map(|mut action| {
+                    if let deltalake::kernel::Action::Add(add) = &mut action {
+                        add.tags.get_or_insert_default().insert(crate::database::maintain::VERSION_ONLY_TAG.to_owned(), Some(columns.clone()));
+                    }
+                    action
+                }));
+                dirty_bins.extend(bins);
+                tagged_sorted = sorted;
+            }
             if adds.is_empty() {
                 return Ok(Vec::new());
             }
@@ -634,8 +672,15 @@ impl Database {
                 // Only AFTER the commit lands: a path marked sorted that never
                 // committed would be a permanent lie.
                 Ok(committed) => {
-                    self.mark_written_sorted(schema, sorted, &adds);
+                    let (plain, tagged) = adds.split_at(untagged);
+                    self.mark_written_sorted(schema, sorted, plain);
+                    self.mark_written_sorted(schema, tagged_sorted, tagged);
                     self.record_flushed_witness_movers(&project_id, &table_name, &adds);
+                    if !tagged.is_empty() {
+                        self.version_only.forget(&project_id, &table_name, &versions);
+                        let rows = versions.iter().map(|batch| batch.num_rows() as u64).sum();
+                        crate::observability::dml_stats().rollup_version_only_flushed_rows.fetch_add(rows, std::sync::atomic::Ordering::Relaxed);
+                    }
                     Ok(committed)
                 }
                 Err(e) => {

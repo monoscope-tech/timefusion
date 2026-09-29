@@ -1006,7 +1006,7 @@ async fn a_built_rollup_routes_and_stops_routing_once_its_source_grows() -> Resu
     let source = db.resolve_table(&project, "otel_logs_and_spans").await?;
     let partition_rows = async || -> Result<Option<u64>> {
         let table = source.read().await;
-        Ok(Database::partition_stats_bounded(&table, tiebreak_of("otel_logs_and_spans"), &|_, _| i64::MAX)?
+        Ok(Database::partition_stats_bounded(&table, "otel_logs_and_spans", &|_, _| i64::MAX)?
             .remove(&(project.clone(), day.to_string()))
             .and_then(|stats| u64::try_from(stats.rows).ok()))
     };
