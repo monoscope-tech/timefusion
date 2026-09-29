@@ -286,3 +286,18 @@ All routed hybrid; `foyer.insert_bypassed` did not move. Script: `scratchpad/shi
 - **W58 (DV strip for today):** prices strip units by the bin they rewrite; a lost race with dedup is a plain retry, not a park; per-cell rate limit, most-masked files first.
 - **W59 (stop the dirty re-flush from re-committing the whole bucket):** drain the unchanged snapshotted batches, re-flush only what changed; kill switch; counters `flush.dirty_reflush_rows_{drained,reflushed}`. It is on the write path, so its worst case is lost or duplicated acked rows. **Deploy decision for the owner:** hold W59 until after 18:05 (recommended), or accept that a problem between 12:00 and 18:00 means pushing a fix into the gate window and re-running the gate tomorrow.
 
+**INCIDENT 07:31 UTC — W57's sealed strip burst regressed query latency for other tenants.** (Deployed 06:43; shipbubble itself was unaffected: 24h status 1.6 s.)
+- **Symptoms, cumulative on the process since 06:45:**
+  - p95 0.20 → 0.48 s; p99 0.45 → 1.98 s; p999 3.6 → 15.7 s.
+  - Slow statements in the last 30 min: service-map `with sp as` p50 4.2 s, max 43 s (was p50 2.7 s); 87576849 log explorer three ~93 s timeouts; Demo/Talstack charts up to 32–37 s; session lookups 27–32 s.
+- **Scale:** 238 strips landed and 51M masked rows retired in 45 min, using 22–29 cores and 26 GiB. 09-28 sealed at midnight with ~1,100+ DV files in the top 3 projects alone, far more than the 56-file pre-midnight census. `dv_strip_plan_sorts_total` 63: large DV-only sealed partitions are being packed and merge-sorted instead of filter-copied 1:1.
+- **Attribution (2-min rates):**
+  - `foyer.inner_bytes_read` +6.1 GB (~50 MB/s) with +3,029 misses: stripped outputs are new, cold files, and the post-commit warm is footers only.
+  - `prefilter_skipped` +83 vs `prefilter_used` +99: new files have no tantivy index yet, so lookups fall back to raw scans.
+  - `delta_snapshot_refresh` +23 s per 2 min: one commit every ~12 s pushes a refresh into query planning.
+  - Rollups are fine: 0 stale-coverage misses, 2,063 witness carries.
+- **Cause:** W57's rate limit is per partition, not fleet-wide. The W57 agent flagged this, and the W58 brief already contained a global cap.
+- **Action:** hotfix `ws/w57b-dv-strip-global-cap` is building (fleet-wide in-flight cap, default 2), to deploy by ~10:30 after one signoff. **Fallback** if it slips past ~10:45: flip `timefusion_dv_strip_enabled` default to false and redeploy, then re-enable with the cap after 18:05.
+- **Revised deploy order:** cap hotfix → nothing 12:00–18:00 → W58 (today strip, must include the global cap; after the sealed burst is measured) → W59 (dirty re-flush), both after 18:05.
+- **Follow-ups:** prefer 1:1 strips when every file in a bin carries a DV; warm stripped outputs' bodies for top projects (now measured as needed).
+
