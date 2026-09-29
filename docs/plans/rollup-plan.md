@@ -24,7 +24,7 @@ A lower visible load with growing debt fails the plan.
 | Gate | Definition | Status |
 | --- | --- | --- |
 | Plan gate | CPU-seconds and maintenance processed bytes per million ingested rows, matched hours (14:00–18:00 UTC), process ≥2 h old, no deploy inside the window. CPU baseline: 09-25 14:00–18:00 (clean). Bytes and lease baseline: 09-27 (restarts inside, state the caveat) | **Not accepted.** 09-29: 9,676 CPU-s/M rows (14.0 cores), 2.2x below the 21,723 baseline; 12.8 GB/M rows (HotPacking 6.2, BaseRollup 5.0, Dedup 1.3); lease 1,079 s/M rows. The backlog grew, so it fails |
-| Falling backlog | Pending base / dedup falls over the gate window | **Not shown.** 09-29: base 303 → 394, dedup 161 → 206. Causes: W58 strip of today's DV files runs continuously (HotPacking 6.2 vs 0.8 GB/M on 09-28), and the v4 backfill |
+| Falling backlog | Pending base / dedup falls over the gate window | **Not shown in a gate window yet.** 09-29 14–18: base 303 → 394, dedup 161 → 206 (W58 strip of today's DV files, v4 backfill). By 23:43 after drop-v3: backlog bytes 33 GB (morning 171–309 GB), pending base 189, dedup 126. Confirm in the next 14:00–18:00 window |
 | Paired protocol | Every percentage gate uses counterbalanced ABBA then BAAB blocks, same hours, 95% bounds that account for time correlation. A savings gate passes on its lower bound, a regression gate on its upper bound. Inconclusive means extend, not pass | **First runs in progress** tonight via runtime `FLAG` (no restarts). Never yet used for an accepted gate |
 | Capacity replay | `timefusion sim --calibrated` at rows/projects 1/2/4 | **Done** (W26). About 2x headroom. Scheduler only; CPU and I/O not modelled |
 
@@ -111,9 +111,10 @@ Done items carry evidence (commit or number). Open items carry the next action, 
       Success = pgwire p95 at high maintenance load drops below ~500 ms AND `maintenance.processed_bytes`/h
       stays within 10%. If bytes drop >10%, raise the floor (8 units) before tuning thresholds (shut ≥800 ms,
       reopen ≤400 ms, ×0.75 / +2 per 30 s tick, ≥50 samples per window).
-- [ ] **Experiment: CPU-token cap 66 vs 128** (`FLAG SET timefusion_maintenance_cpu_tokens`; W32). Record
-      result / decide default. Question: does the store or the cap bind (median 26/48 cores busy while
-      tokens sat at 66/66)? Read store latency and client query latency, not only throughput.
+- [x] **Experiment: CPU-token cap 66 vs 128** (W32), paired ABBA/BAAB on prod 09-29 21:57–23:43, 16-worker load.
+      Inconclusive and not binding: p95 B−A −0.66 s (CI −3.7…+2.4), GB/h −11% (CI −70…+59); tokens read 0/66 while
+      `admission_refused_state_bytes_total` was 29,201 — state memory binds, not the token cap. Default stays 66;
+      the `FLAG SET timefusion_maintenance_cpu_tokens` override stays as an ops knob.
 - [ ] **Experiment: W46 key-level dedup restriction** (`FLAG SET timefusion_read_dedup_key_restrict ON`).
       Record result / decide enable (owner).
 - [x] Capacity replay 1x/2x/4x: W10 calibration within ±10% per lane; W26 (`5610c94e`, `d19631fb`); ~2x headroom.
