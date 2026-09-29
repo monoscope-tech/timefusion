@@ -1249,7 +1249,10 @@ impl StatsTableProvider {
                 .iter()
                 .flat_map(|&flag| {
                     let name: &str = flag.into();
-                    [("flags", name.to_owned(), cfg.maintenance.flag(flag).to_string()), ("flags", format!("{name}.override"), or_null(flag.override_value()))]
+                    [
+                        ("flags", name.to_owned(), flag.render(cfg.flag_value(flag))),
+                        ("flags", format!("{name}.override"), or_null(flag.override_value().map(|v| flag.render(v)))),
+                    ]
                 })
                 .collect()
         });
@@ -1392,14 +1395,20 @@ mod stats_table_tests {
 
     #[test]
     fn flags_component_reports_effective_value_and_override() {
-        use crate::config::RuntimeFlag::{TimefusionMaintenanceQueryYield as Yield, TimefusionReadDedupKeyRestrict as Restrict};
+        use crate::config::RuntimeFlag::{
+            TimefusionMaintenanceCpuTokens as Cpu, TimefusionMaintenanceQueryYield as Yield, TimefusionReadDedupKeyRestrict as Restrict,
+        };
         crate::config::set_config_for_test(crate::config::AppConfig::default());
-        Restrict.set_override(Some(true));
+        Restrict.set_override(Some(1));
+        Cpu.set_override(Some(96));
         let rows = snapshot_rows(&StatsTableProvider::new(None));
-        Restrict.set_override(None);
+        [Restrict, Cpu].into_iter().for_each(|f| f.set_override(None));
         let flags: Vec<_> = rows.iter().filter(|(c, ..)| c == "flags").map(|(_, k, v)| (k.as_str(), v.as_str())).collect();
-        let (y, r): (&str, &str) = (Yield.into(), Restrict.into());
-        assert_eq!(flags, [(y, "false"), (&*format!("{y}.override"), "null"), (r, "true"), (&*format!("{r}.override"), "true")]);
+        let (y, r, c): (&str, &str, &str) = (Yield.into(), Restrict.into(), Cpu.into());
+        assert_eq!(
+            flags,
+            [(y, "false"), (&*format!("{y}.override"), "null"), (r, "true"), (&*format!("{r}.override"), "true"), (c, "96"), (&*format!("{c}.override"), "96")]
+        );
     }
 
     /// Scan metrics wired and nothing else: an unwired pool reports 0 rather than dividing by zero, and every counter

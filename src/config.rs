@@ -2335,45 +2335,62 @@ pub struct MaintenanceConfig {
     pub timefusion_dv_strip_interval_secs: u64,
 }
 
-/// Boolean flags `FLAG SET` may override in memory; a restart returns to config.
-/// Names are the config field names.
+/// Flags `FLAG SET` may override in memory; a restart returns to config.
+/// Names are the config field names; booleans are the values 0/1.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, strum::EnumString, strum::IntoStaticStr, strum::VariantArray, strum::VariantNames)]
 #[strum(serialize_all = "snake_case", ascii_case_insensitive)]
 pub enum RuntimeFlag {
     TimefusionMaintenanceQueryYield,
     TimefusionReadDedupKeyRestrict,
+    /// Maintenance admission's CPU-token capacity; config is `coordinator_job_slots`.
+    TimefusionMaintenanceCpuTokens,
 }
 
-/// Per-flag tri-state: 0 = config, 1 = off, 2 = on.
-static FLAG_OVERRIDES: [std::sync::atomic::AtomicU8; 2] = [const { std::sync::atomic::AtomicU8::new(0) }; 2];
+/// Per-flag override: 0 = config, else value + 1.
+static FLAG_OVERRIDES: [std::sync::atomic::AtomicU32; 3] = [const { std::sync::atomic::AtomicU32::new(0) }; 3];
 
 impl RuntimeFlag {
-    fn slot(self) -> &'static std::sync::atomic::AtomicU8 {
+    fn slot(self) -> &'static std::sync::atomic::AtomicU32 {
         &FLAG_OVERRIDES[self as usize]
     }
 
-    pub fn override_value(self) -> Option<bool> {
-        match self.slot().load(std::sync::atomic::Ordering::Relaxed) {
-            0 => None,
-            v => Some(v == 2),
+    pub fn range(self) -> std::ops::RangeInclusive<u32> {
+        match self {
+            Self::TimefusionMaintenanceCpuTokens => 8..=256,
+            _ => 0..=1,
         }
     }
 
+    pub fn render(self, value: u32) -> String {
+        if self.range() == (0..=1) { (value == 1).to_string() } else { value.to_string() }
+    }
+
+    pub fn override_value(self) -> Option<u32> {
+        self.slot().load(std::sync::atomic::Ordering::Relaxed).checked_sub(1)
+    }
+
     /// `None` returns to the config value.
-    pub fn set_override(self, value: Option<bool>) {
-        self.slot().store(value.map_or(0, |on| 1 + u8::from(on)), std::sync::atomic::Ordering::Relaxed);
+    pub fn set_override(self, value: Option<u32>) {
+        self.slot().store(value.map_or(0, |v| v + 1), std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl AppConfig {
+    /// THE read for a [`RuntimeFlag`]: the runtime override, else config.
+    pub fn flag_value(&self, flag: RuntimeFlag) -> u32 {
+        flag.override_value().unwrap_or_else(|| match flag {
+            RuntimeFlag::TimefusionMaintenanceQueryYield => self.maintenance.timefusion_maintenance_query_yield.into(),
+            RuntimeFlag::TimefusionReadDedupKeyRestrict => self.maintenance.timefusion_read_dedup_key_restrict.into(),
+            RuntimeFlag::TimefusionMaintenanceCpuTokens => u32::try_from(self.derived.coordinator_job_slots()).unwrap_or(u32::MAX),
+        })
+    }
+
+    pub fn flag(&self, flag: RuntimeFlag) -> bool {
+        self.flag_value(flag) != 0
     }
 }
 
 impl MaintenanceConfig {
-    /// THE read for a [`RuntimeFlag`]: the runtime override, else this config's field.
-    pub fn flag(&self, flag: RuntimeFlag) -> bool {
-        flag.override_value().unwrap_or(match flag {
-            RuntimeFlag::TimefusionMaintenanceQueryYield => self.timefusion_maintenance_query_yield,
-            RuntimeFlag::TimefusionReadDedupKeyRestrict => self.timefusion_read_dedup_key_restrict,
-        })
-    }
-
     /// Reads honour the canary allow-list (empty/unset = every project);
     /// rollup BUILDS are unconditional and have no allow-list.
     pub fn rollup_read_enabled_for(&self, project_id: &str) -> bool {
@@ -2526,9 +2543,9 @@ mod tests {
     #[test_case::test_case(true, Some(false) => false ; "off_over_config_on")]
     #[test_case::test_case(true, None => true ; "reset_reads_config")]
     fn runtime_flag_override_is_what_read_sites_see(configured: bool, runtime: Option<bool>) -> bool {
-        let mut cfg = AppConfig::default().maintenance;
-        cfg.timefusion_read_dedup_key_restrict = configured;
-        RuntimeFlag::TimefusionReadDedupKeyRestrict.set_override(runtime);
+        let mut cfg = AppConfig::default();
+        cfg.maintenance.timefusion_read_dedup_key_restrict = configured;
+        RuntimeFlag::TimefusionReadDedupKeyRestrict.set_override(runtime.map(u32::from));
         let seen = cfg.flag(RuntimeFlag::TimefusionReadDedupKeyRestrict);
         RuntimeFlag::TimefusionReadDedupKeyRestrict.set_override(None);
         seen

@@ -628,19 +628,19 @@ impl LoggingSimpleQueryHandler {
     async fn run_flag(&self, cmd: FlagCmd) -> PgWireResult<Vec<Response>> {
         use strum::VariantArray;
         let db = require_available(self.db.as_ref(), "FLAG")?;
-        let maint = &db.config().maintenance;
+        let cfg = db.config();
         if let FlagCmd::Set(flag, value) = cmd {
-            let old = maint.flag(flag);
+            let old = cfg.flag_value(flag);
             flag.set_override(value);
-            info!(flag = <&str>::from(flag), old, new = maint.flag(flag), override_value = ?value, event = "runtime_flag_changed");
+            info!(flag = <&str>::from(flag), old, new = cfg.flag_value(flag), override_value = ?value, event = "runtime_flag_changed");
         }
         let rows: Vec<_> = crate::config::RuntimeFlag::VARIANTS
             .iter()
             .map(|&flag| {
                 Ok(vec![
                     <&str>::from(flag).to_owned(),
-                    maint.flag(flag).to_string(),
-                    flag.override_value().map_or_else(|| "null".to_owned(), |v| v.to_string()),
+                    flag.render(cfg.flag_value(flag)),
+                    flag.override_value().map_or_else(|| "null".to_owned(), |v| flag.render(v)),
                 ])
             })
             .collect();
@@ -981,10 +981,10 @@ pub(crate) fn parse_rollup_policy(query: &str) -> Result<Option<RollupPolicyCmd>
 pub(crate) enum FlagCmd {
     Show,
     /// `None` resets to the config value.
-    Set(crate::config::RuntimeFlag, Option<bool>),
+    Set(crate::config::RuntimeFlag, Option<u32>),
 }
 
-/// `FLAG SHOW`, `FLAG SET <name> ON|OFF`, `FLAG RESET <name>`.
+/// `FLAG SHOW`, `FLAG SET <name> ON|OFF|<n>`, `FLAG RESET <name>`; the value must lie in the flag's range.
 pub(crate) fn parse_flag(query: &str) -> Result<Option<FlagCmd>, String> {
     let Some(rest) = strip_command(query, "flag") else { return Ok(None) };
     let flag = |name: &str| {
@@ -993,9 +993,16 @@ pub(crate) fn parse_flag(query: &str) -> Result<Option<FlagCmd>, String> {
     let is = |token: &str, word: &str| token.eq_ignore_ascii_case(word);
     Ok(Some(match rest.split_whitespace().collect::<Vec<_>>().as_slice() {
         [action] if is(action, "show") => FlagCmd::Show,
-        [action, name, value] if is(action, "set") && (is(value, "on") || is(value, "off")) => FlagCmd::Set(flag(name)?, Some(is(value, "on"))),
+        [action, name, value] if is(action, "set") => {
+            let flag: crate::config::RuntimeFlag = flag(name)?;
+            let v = if is(value, "on") || is(value, "off") { Some(u32::from(is(value, "on"))) } else { value.parse().ok() };
+            match v.filter(|v| flag.range().contains(v)) {
+                Some(v) => FlagCmd::Set(flag, Some(v)),
+                None => return Err(format!("{name} accepts {:?} (booleans ON|OFF), got '{value}'", flag.range())),
+            }
+        }
         [action, name] if is(action, "reset") => FlagCmd::Set(flag(name)?, None),
-        _ => return Err("expected FLAG SHOW, FLAG SET <name> ON|OFF, or FLAG RESET <name>".to_owned()),
+        _ => return Err("expected FLAG SHOW, FLAG SET <name> ON|OFF|<n>, or FLAG RESET <name>".to_owned()),
     }))
 }
 
@@ -1650,11 +1657,20 @@ mod pgwire_handlers_tests {
     }
 
     #[test_case(" flag show; " => Ok(Some(crate::server::FlagCmd::Show)); "show")]
-    #[test_case("FLAG SET timefusion_maintenance_query_yield ON" => Ok(Some(crate::server::FlagCmd::Set(crate::config::RuntimeFlag::TimefusionMaintenanceQueryYield, Some(true)))); "set on")]
-    #[test_case("flag set TIMEFUSION_READ_DEDUP_KEY_RESTRICT off" => Ok(Some(crate::server::FlagCmd::Set(crate::config::RuntimeFlag::TimefusionReadDedupKeyRestrict, Some(false)))); "set off, any case")]
+    #[test_case("FLAG SET timefusion_maintenance_query_yield ON" => Ok(Some(crate::server::FlagCmd::Set(crate::config::RuntimeFlag::TimefusionMaintenanceQueryYield, Some(1)))); "set on")]
+    #[test_case("flag set TIMEFUSION_READ_DEDUP_KEY_RESTRICT off" => Ok(Some(crate::server::FlagCmd::Set(crate::config::RuntimeFlag::TimefusionReadDedupKeyRestrict, Some(0)))); "set off, any case")]
     #[test_case("FLAG RESET timefusion_read_dedup_key_restrict" => Ok(Some(crate::server::FlagCmd::Set(crate::config::RuntimeFlag::TimefusionReadDedupKeyRestrict, None))); "reset")]
     #[test_case("FLAG SET timefusion_read_dedup_skip_per_file ON" => Err(()); "only registered flags are overridable")]
     #[test_case("FLAG SET timefusion_maintenance_query_yield MAYBE" => Err(()); "value is ON or OFF")]
+    #[test_case("FLAG SET timefusion_maintenance_cpu_tokens 96" => Ok(Some(crate::server::FlagCmd::Set(crate::config::RuntimeFlag::TimefusionMaintenanceCpuTokens, Some(96)))); "numeric")]
+    #[test_case("FLAG SET timefusion_maintenance_cpu_tokens 8" => Ok(Some(crate::server::FlagCmd::Set(crate::config::RuntimeFlag::TimefusionMaintenanceCpuTokens, Some(8)))); "numeric lower bound")]
+    #[test_case("FLAG SET timefusion_maintenance_cpu_tokens 256" => Ok(Some(crate::server::FlagCmd::Set(crate::config::RuntimeFlag::TimefusionMaintenanceCpuTokens, Some(256)))); "numeric upper bound")]
+    #[test_case("FLAG SET timefusion_maintenance_cpu_tokens 7" => Err(()); "below range")]
+    #[test_case("FLAG SET timefusion_maintenance_cpu_tokens 257" => Err(()); "above range")]
+    #[test_case("FLAG SET timefusion_maintenance_cpu_tokens -1" => Err(()); "negative")]
+    #[test_case("FLAG SET timefusion_maintenance_cpu_tokens ON" => Err(()); "numeric flag is not boolean")]
+    #[test_case("FLAG SET timefusion_maintenance_query_yield 2" => Err(()); "boolean flag rejects numbers above 1")]
+    #[test_case("FLAG RESET timefusion_maintenance_cpu_tokens" => Ok(Some(crate::server::FlagCmd::Set(crate::config::RuntimeFlag::TimefusionMaintenanceCpuTokens, None))); "numeric reset")]
     #[test_case("FLAG SHOW extra" => Err(()); "reject trailing input")]
     #[test_case("FLAG SET timefusion_maintenance_query_yield" => Err(()); "set needs a value")]
     #[test_case("SELECT 1" => Ok(None); "ordinary SQL falls through")]

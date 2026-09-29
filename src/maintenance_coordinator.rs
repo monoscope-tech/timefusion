@@ -3523,7 +3523,13 @@ impl AdmissionController {
         // so rollups cannot be crowded out by continuous compaction work. Every
         // resource remains independently binding; publish refusals below so a
         // smaller I/O or memory capacity cannot masquerade as CPU saturation.
-        let global_ceiling = lag_scaled_cpu_ceiling(state.cpu_base, state.capacity.cpu);
+        // A `FLAG SET` capacity takes effect at the next admission; permits already
+        // held keep their tokens, and usage above a lowered ceiling only refuses.
+        let cpu_capacity = crate::config::RuntimeFlag::TimefusionMaintenanceCpuTokens.override_value().unwrap_or(state.capacity.cpu);
+        if stats.maintenance_cpu_tokens_capacity.load(Relaxed) != u64::from(cpu_capacity) {
+            stats.maintenance_cpu_tokens_capacity.store(u64::from(cpu_capacity), Relaxed);
+        }
+        let global_ceiling = lag_scaled_cpu_ceiling(state.cpu_base.min(cpu_capacity), cpu_capacity);
         let reserved = rollup_reserved_cpu(global_ceiling);
         let published_ceiling = u64::from(global_ceiling);
         if stats.maintenance_cpu_tokens_limit.load(Relaxed) != published_ceiling {
@@ -7271,6 +7277,31 @@ mod tests {
         ticks.iter().fold(QueryYield::open(max), |state, &(p95, samples)| query_scaled_ceiling(state, p95, samples, max)).ceiling
     }
 
+    /// A `FLAG SET` CPU-token capacity binds at the next admission in both directions,
+    /// even below the static base. Lowering it under the tokens already held keeps those
+    /// permits and refuses new ones until usage drains beneath it.
+    #[test]
+    fn cpu_token_override_resizes_admission_at_runtime() {
+        use crate::config::RuntimeFlag::TimefusionMaintenanceCpuTokens as Flag;
+        let admission = AdmissionController::with_decoded_capacity(12, 16, MAX_DECODED_BYTES * 64, u64::MAX, 256, 256);
+        let request = Resources { cpu: 1, decoded_bytes: 1, object_reads: 1, object_writes: 1, ..Resources::default() };
+        let capacity = || crate::observability::maintenance_stats().maintenance_cpu_tokens_capacity.load(std::sync::atomic::Ordering::Relaxed);
+        let mut held = Vec::new();
+        let fill = |held: &mut Vec<AdmissionPermit>| {
+            held.extend(std::iter::from_fn(|| admission.try_acquire_for(request, AdmissionLane::Rollup, crate::config::MemorySnapshot::unknown())));
+            (held.len(), capacity())
+        };
+        assert_eq!(fill(&mut held), (16, 16));
+        Flag.set_override(Some(40));
+        assert_eq!(fill(&mut held), (40, 40));
+        Flag.set_override(Some(8));
+        assert_eq!(fill(&mut held), (40, 8), "held permits survive, nothing new is admitted");
+        held.truncate(5);
+        assert_eq!(fill(&mut held), (8, 8), "refills only up to the lowered capacity, below the static base of 12");
+        Flag.set_override(None);
+        assert_eq!(fill(&mut held), (16, 16));
+    }
+
     /// With the ceiling at its floor of 8, the 9th Rollup unit waits on object
     /// reads while today's HotPacking still runs. A `FLAG SET` override taking
     /// effect after four ticks under the config value wins at the next tick.
@@ -7281,11 +7312,11 @@ mod tests {
     fn query_yield_caps_object_reads_except_hot_packing(configured: bool, runtime: Option<bool>) -> (bool, bool) {
         use crate::config::RuntimeFlag::TimefusionMaintenanceQueryYield as Flag;
         use std::sync::atomic::Ordering::Relaxed;
-        let mut cfg = crate::config::AppConfig::default().maintenance;
-        cfg.timefusion_maintenance_query_yield = configured;
+        let mut cfg = crate::config::AppConfig::default();
+        cfg.maintenance.timefusion_maintenance_query_yield = configured;
         let admission = AdmissionController::with_decoded_capacity(32, 32, MAX_DECODED_BYTES * 64, u64::MAX, 16, 16);
         (0..4).for_each(|_| admission.tick_query_yield(cfg.flag(Flag), HI.0, HI.1));
-        Flag.set_override(runtime);
+        Flag.set_override(runtime.map(u32::from));
         (0..4).for_each(|_| admission.tick_query_yield(cfg.flag(Flag), HI.0, HI.1));
         assert_eq!(lock(&admission.0).query_yield.map(|y| y.ceiling), runtime.unwrap_or(configured).then_some(8));
         Flag.set_override(None);

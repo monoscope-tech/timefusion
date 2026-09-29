@@ -787,7 +787,7 @@ impl Database {
             tokio::spawn(async move {
                 while cancel.run_until_cancelled(tokio::time::sleep(crate::maintenance_coordinator::QUERY_YIELD_TICK)).await.is_some() {
                     let (p95, samples) = crate::observability::PGWIRE_LATENCY.recent(0.95);
-                    admission.tick_query_yield(config.maintenance.flag(crate::config::RuntimeFlag::TimefusionMaintenanceQueryYield), p95, samples);
+                    admission.tick_query_yield(config.flag(crate::config::RuntimeFlag::TimefusionMaintenanceQueryYield), p95, samples);
                 }
             });
         }
