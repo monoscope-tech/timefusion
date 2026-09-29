@@ -414,11 +414,10 @@ pub mod scan_metric_names {
         HEAVY_QUERY_ORDERED_MOR_ADMITTED = "timefusion.scan.heavy_query_ordered_mor_admitted" as scan.heavy_query_ordered_mor_admitted;
         HEAVY_QUERY_QUEUED = "timefusion.scan.heavy_query_queued" as scan.heavy_query_queued;
         HEAVY_QUERY_QUEUE_TIMEOUT = "timefusion.scan.heavy_query_queue_timeout" as scan.heavy_query_queue_timeout;
-        // The same three for wide-scan byte admission, plus scans refused by the byte cap.
+        // The same three for wide-scan byte admission.
         SCAN_BYTES_ADMITTED = "timefusion.scan.scan_bytes_admitted" as scan.scan_bytes_admitted;
         SCAN_BYTES_QUEUED = "timefusion.scan.scan_bytes_queued" as scan.scan_bytes_queued;
         SCAN_BYTES_QUEUE_TIMEOUT = "timefusion.scan.scan_bytes_queue_timeout" as scan.scan_bytes_queue_timeout;
-        SCAN_BYTES_CAP_REFUSED = "timefusion.scan.scan_bytes_cap_refused" as scan.scan_bytes_cap_refused;
     }
     // Per-reason breakdown of `PREFILTER_SKIPPED`.
     reasons {
@@ -3676,7 +3675,6 @@ impl Database {
                     let mem = &self.config.memory;
                     rules.push(Arc::new(crate::read::admission::HeavyQueryAdmission {
                         scan_bytes: mem.timefusion_query_scan_byte_admission.then(|| self.scan_byte_gate.clone()),
-                        scan_cap_bytes: mem.timefusion_query_scan_byte_cap_bytes,
                     }));
                 }
                 rules.push(instrument_rule);

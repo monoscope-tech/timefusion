@@ -178,8 +178,6 @@ fn gated_scan_bytes(plan: &Arc<dyn ExecutionPlan>) -> Vec<u64> {
 #[derive(Debug)]
 pub struct HeavyQueryAdmission {
     pub(crate) scan_bytes: Option<ScanByteGate>,
-    /// Largest compressed bytes one wide scan may select. 0 = off.
-    pub(crate) scan_cap_bytes: u64,
 }
 
 impl PhysicalOptimizerRule for HeavyQueryAdmission {
@@ -190,15 +188,7 @@ impl PhysicalOptimizerRule for HeavyQueryAdmission {
         true
     }
     fn optimize(&self, plan: Arc<dyn ExecutionPlan>, config: &datafusion::config::ConfigOptions) -> DFResult<Arc<dyn ExecutionPlan>> {
-        let scans = gated_scan_bytes(&plan);
-        let cap = self.scan_cap_bytes;
-        if let Some(&over) = scans.iter().find(|&&bytes| cap > 0 && bytes > cap) {
-            metrics::counter!(scan_metric_names::SCAN_BYTES_CAP_REFUSED).increment(1);
-            return Err(DataFusionError::ResourcesExhausted(format!(
-                "a scan selects {over} parquet bytes, over the single-scan cap of {cap} — narrow the time range or add filters"
-            )));
-        }
-        let selected: u64 = scans.iter().sum();
+        let selected: u64 = gated_scan_bytes(&plan).iter().sum();
         let bytes = self.scan_bytes.as_ref().filter(|_| selected > 0).map(|gate| (gate.clone(), gate.charge_kib(selected)));
         let class = heavy_class(&plan, config.execution.batch_size.get());
         if class.is_none() && bytes.is_none() {

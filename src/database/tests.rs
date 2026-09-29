@@ -9949,26 +9949,6 @@ async fn the_byte_budget_never_holds_back_an_uncharged_query(admission: bool, na
     Ok(())
 }
 
-/// A single scan over the cap is refused at plan time with a clear error; the
-/// same scan runs when the cap is off.
-#[test_case(1 => true ; "a scan over the cap is refused")]
-#[test_case(0 => false ; "no cap refuses nothing")]
-#[tokio::test(flavor = "multi_thread")]
-async fn a_scan_over_the_byte_cap_is_refused(cap: u64) -> bool {
-    let (_db, ctx, _, sql) = wide_scan_session("scan-bytes-cap", |cfg| cfg.memory.timefusion_query_scan_byte_cap_bytes = cap).await.unwrap();
-    match physical(&ctx, &sql).await {
-        Err(err) => {
-            let msg = err.to_string();
-            assert!(msg.contains("parquet bytes, over the single-scan cap of 1 — narrow the time range or add filters"), "{msg}");
-            true
-        }
-        Ok(plan) => {
-            assert_eq!(row_count(datafusion::physical_plan::execute_stream(plan, ctx.task_ctx()).unwrap()).await.unwrap(), 4);
-            false
-        }
-    }
-}
-
 /// A heavy query whose root has several output partitions holds ONE heavy slot
 /// while it runs, not one per partition. Prod: monoscope's hash-partitioned
 /// `served` GROUP BY took all eight slots at once.
