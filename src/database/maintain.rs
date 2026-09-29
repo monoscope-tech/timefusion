@@ -728,6 +728,22 @@ fn visibility_moves(proved: &crate::read::CountFiles, live: &crate::read::CountF
     (added, dv_changed, proved.keys().filter(|path| !live.contains_key(*path)).count())
 }
 
+/// Whether every scan under `plan` declares `schema`'s full sort order.
+fn scans_declare_order(plan: &Arc<dyn datafusion::physical_plan::ExecutionPlan>, schema: &crate::schema::TableSchema) -> bool {
+    use datafusion::physical_expr::expressions::Column;
+    let declares = |ordering: &datafusion::physical_expr::LexOrdering| {
+        schema.sorting_columns.len() <= ordering.len()
+            && schema.sorting_columns.iter().zip(ordering.iter()).all(|(want, have)| {
+                have.expr.downcast_ref::<Column>().is_some_and(|column| column.name() == want.name)
+                    && (have.options.descending, have.options.nulls_first) == (want.descending, want.nulls_first)
+            })
+    };
+    match plan.children()[..] {
+        [] => plan.properties().equivalence_properties().oeq_class().iter().any(declares),
+        ref children => children.iter().all(|child| scans_declare_order(child, schema)),
+    }
+}
+
 /// `LogicalFileView::add_action()`, centralizing its `#[allow(deprecated)]` call site.
 pub(super) fn add_action(file: &deltalake::kernel::LogicalFileView) -> deltalake::kernel::Add {
     #[allow(deprecated)]
@@ -8556,8 +8572,17 @@ impl Database {
                 let planned_at = std::time::Instant::now();
                 let plan = ctx.sql(&format!("SELECT * FROM {bin_table}{predicate}{order_by}")).await?.create_physical_plan().await?;
                 t_plan += planned_at.elapsed();
-                if dv_strip && datafusion::physical_plan::displayable(plan.as_ref()).indent(false).to_string().contains("SortExec") {
-                    crate::observability::maintenance_stats().dv_strip_plan_sorts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let rendered = dv_strip.then(|| datafusion::physical_plan::displayable(plan.as_ref()).indent(false).to_string());
+                if let Some(rendered) = rendered.filter(|rendered| rendered.contains("SortExec")) {
+                    let stats = crate::observability::maintenance_stats();
+                    // An input whose footer never declared the table order (an older
+                    // writer's) must re-sort; one that did and still sorts is a bug.
+                    if scans_declare_order(&plan, schema) {
+                        stats.dv_strip_plan_sorts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        warn!(table_name, project_id, date, file = %files[0], plan = %rendered, event = "dv_strip_plan_sort", "a strip of a sorted footer planned a sort");
+                    } else {
+                        stats.dv_strip_resorts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                 }
                 // Held for the life of the stream: the sort below it can run for
                 // most of the unit without emitting a row.
@@ -11818,11 +11843,12 @@ mod rollup_noop_skip_tests {
         assert_eq!(served, raw);
 
         let stats = crate::observability::maintenance_stats();
-        let sorts = stats.dv_strip_plan_sorts.load(Relaxed);
+        let sorts = || stats.dv_strip_plan_sorts.load(Relaxed) + stats.dv_strip_resorts.load(Relaxed);
+        let before = sorts();
         db.plan_compaction_debt().await?;
         assert!(db.run_coordinator_compaction_once(Operation::SealedConsolidation).await?, "a DV file is sealed-consolidation debt");
         assert_eq!(partition().await?, (1, 0, 2), "rewritten DV-free, physical rows = the two live rows");
-        assert_eq!(stats.dv_strip_plan_sorts.load(Relaxed), sorts, "a strip is a filter copy: the footer ordering carries the ORDER BY");
+        assert_eq!(sorts(), before, "a strip is a filter copy: the footer ordering carries the ORDER BY");
 
         let (routed, served, after) = answer().await?;
         assert!(routed, "the carried witness keeps the slice routed across the strip");

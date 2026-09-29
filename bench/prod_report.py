@@ -408,7 +408,7 @@ SECTIONS: list[tuple[str, list[tuple[str, str, str]]]] = [
         ("DV-dedup bins staged", "maintenance.dv_dedup_bins_staged_total", ""),
         ("DV strips landed", "maintenance.dv_rewrites_landed_total", "/h"),
         ("DV strip rows retired", "maintenance.dv_rewrite_rows_retired_total", "/h"),
-        ("DV strip plan sorts / lossy refusals", "maintenance.dv_strip_plan_sorts_total|maintenance.lossy_rewrite_refusals_total", ""),
+        ("DV strip plan sorts / re-sorts / lossy refusals", "maintenance.dv_strip_plan_sorts_total|maintenance.dv_strip_resorts_total|maintenance.lossy_rewrite_refusals_total", ""),
         ("MoR versions appended / retracted", "dml.mor_version_rows_appended_total|dml.mor_versions_retracted_total", ""),
         ("read-side dedup skipped", "scan.dedup_skipped_pct", "%"),
         ("read-side denied: never certified", "scan.dedup_denied_never_certified_pct", "%"),

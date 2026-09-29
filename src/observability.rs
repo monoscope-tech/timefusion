@@ -1706,9 +1706,13 @@ atomic_stats! {
         /// masked rows they retired — what `timefusion_dv_strip_enabled` buys.
         dv_rewrites_landed as "dv_rewrites_landed_total",
         dv_rewrite_rows_retired as "dv_rewrite_rows_retired_total",
-        /// Strip plans that still paid a sort: the footer ordering did not carry
-        /// the ORDER BY. Should stay 0; each one is a whole-file sort.
+        /// 1:1 strips of a file whose footer declares the table order that still
+        /// planned a sort. Should stay 0; each one is a whole-file sort, logged
+        /// with its plan as `dv_strip_plan_sort`.
         dv_strip_plan_sorts as "dv_strip_plan_sorts_total",
+        /// 1:1 strips that re-sorted because the input's footer never declared the
+        /// table order (an older writer's). Expected; each is a whole-file sort.
+        dv_strip_resorts as "dv_strip_resorts_total",
         /// Rewrites the exact-count guard refused as lossy; their inputs are
         /// parked (`Database::lossy_parked`) instead of re-staged. Should stay 0.
         lossy_rewrite_refusals as "lossy_rewrite_refusals_total",

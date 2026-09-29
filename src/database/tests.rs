@@ -10322,3 +10322,45 @@ async fn a_multi_partition_heavy_query_takes_one_heavy_slot() -> Result<()> {
     assert_eq!(sem.available_permits(), before, "the query returns its slot");
     Ok(())
 }
+
+/// `dv_strip_plan_sorts_total` must read 0 in prod, so it may count only a strip
+/// whose input footer already declares the table's order (a real regression). A
+/// sorted-run-tagged DV file whose footer declares none — an older writer's —
+/// legitimately re-sorts, and is counted as a re-sort instead.
+#[serial]
+#[tokio::test]
+async fn a_strip_of_a_file_without_a_sorted_footer_counts_as_a_resort() -> Result<()> {
+    use deltalake::writer::DeltaWriter as _;
+    use std::sync::atomic::Ordering::Relaxed;
+    let db = Database::with_config(create_test_config("dv_strip_resort")).await?;
+    let project = format!("proj_{}", uuid::Uuid::new_v4().simple());
+    let noon = midnight_micros(Utc::now().date_naive() - chrono::Duration::days(3)) + 12 * 3_600 * 1_000_000;
+    let table_ref = db.get_or_create_table(&project, "otel_logs_and_spans").await?;
+    // Default writer properties: a footer declaring no sort order, as older writers left.
+    for rows in [
+        vec![test_span_ts("dup", "first", &project, noon), test_span_ts("other", "op", &project, noon + 1)],
+        vec![test_span_ts("dup", "second", &project, noon)],
+    ] {
+        let mut writer = deltalake::writer::RecordBatchWriter::for_table(&*table_ref.read().await)?;
+        writer.write(deltalake::kernel::schema::cast_record_batch(&json_to_batch(rows)?, writer.arrow_schema(), true, true)?).await?;
+        commit_actions(&table_ref, writer.flush().await?.into_iter().map(deltalake::kernel::Action::Add).collect()).await?;
+    }
+    db.dedup_today_partitions(&table_ref, "otel_logs_and_spans", "otel_logs_and_spans").await?;
+    let (masked, clean): (Vec<_>, Vec<_>) = live_adds(&table_ref).await.into_iter().partition(|add| add.deletion_vector.is_some());
+    let [mut held] = <[_; 1]>::try_from(masked).expect("precondition: dedup masked one file");
+    // Leave the masked file alone in its partition, tagged a sorted run.
+    let removes = clean.iter().chain([&held]).map(|add| deltalake::kernel::Action::Remove(super::remove_for_add(add, false))).collect();
+    commit_actions(&table_ref, removes).await?;
+    held.tags.get_or_insert_with(Default::default).insert(super::SORTED_RUN_TAG.to_owned(), Some("true".to_owned()));
+    commit_actions(&table_ref, vec![deltalake::kernel::Action::Add(held)]).await?;
+
+    let stats = crate::observability::maintenance_stats();
+    let counts = || (stats.dv_strip_plan_sorts.load(Relaxed), stats.dv_strip_resorts.load(Relaxed));
+    let (sorts, resorts) = counts();
+    db.recover_rollup_coverage("otel_logs_and_spans").await?;
+    db.plan_compaction_debt().await?;
+    assert!(db.run_coordinator_compaction_once(crate::maintenance_coordinator::Operation::SealedConsolidation).await?, "the lone DV file is strip debt");
+    assert!(live_adds(&table_ref).await.iter().all(|add| add.deletion_vector.is_none()), "stripped");
+    assert_eq!(counts(), (sorts, resorts + 1), "an unsorted footer's re-sort is not a strip regression");
+    Ok(())
+}
