@@ -2156,12 +2156,6 @@ pub struct MaintenanceConfig {
     /// falls back to the plain per-file split (`dedup_key_restrict_fallbacks`).
     #[serde_inline_default(200_000)]
     pub timefusion_read_dedup_key_restrict_max_keys: usize,
-    /// Dedup-as-you-compact: the on-demand compaction path (`compact_date`)
-    /// upgrades its SortBy rewrite to SortByDedup, collapsing superseded
-    /// merge-on-read versions. No-op while `timefusion_optimize_sort_by` is off
-    /// (dedup needs the sorted stream).
-    #[serde(default)]
-    pub timefusion_compact_dedup_merge: bool,
     /// Persist sweep certifications to the data dir and reload at boot, so the
     /// read-side dedup skip doesn't restart cold. It cannot widen certification:
     /// a reloaded entry faces the same fingerprint-equality check, so a stale

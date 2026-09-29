@@ -1459,7 +1459,7 @@ async fn dedup_skip_on_a_swept_mor_partition_returns_the_updated_row() -> Result
     Ok(())
 }
 
-/// With `timefusion_compact_dedup_merge` on, `compact_date` must collapse
+/// `compact_date` must collapse
 /// merge-on-read versions while merging files — one physical row per
 /// (timestamp, id), greatest `updated_at` winning — and must RETAIN tombstones
 /// (dropping a `deleted=true` winner would resurrect the base row).
@@ -1469,7 +1469,7 @@ async fn dedup_skip_on_a_swept_mor_partition_returns_the_updated_row() -> Result
 #[serial]
 #[tokio::test]
 async fn compact_dedup_merge_collapses_versions_and_retains_tombstones() -> Result<()> {
-    let (db, project_id) = tuned_db("compact_dedup_merge", |c| c.maintenance.timefusion_compact_dedup_merge = true).await?;
+    let (db, project_id) = plain_db("compact_dedup_merge").await?;
     let ts = yesterday_noon();
 
     commit_two_hash_versions(&db, &project_id, ts).await?;

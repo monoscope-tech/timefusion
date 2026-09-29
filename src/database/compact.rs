@@ -465,17 +465,13 @@ impl Database {
             // legacy pre-sort files pays a one-time blocking sort, which is why the
             // SortBy path is forced to concurrency 1 below.
             //
-            // `timefusion_compact_dedup_merge` upgrades SortBy to SortByDedup so the
-            // merge also collapses merge-on-read versions, keeping the greatest
+            // SortBy is upgraded to SortByDedup so the merge also collapses
+            // merge-on-read versions, keeping the greatest
             // `dedup_tiebreak` (appended DESC NULLS LAST, so a NULL tiebreak always
             // loses). This REQUIRES the sort to lead with the dedup keys, so all
             // versions of a key are consecutive. Tombstones survive because >= 1 row
             // per key is always emitted.
-            let (optimize_type, declare_sorted) = if self.config.maintenance.timefusion_compact_dedup_merge {
-                consolidate_optimize_type(schema, self.config.maintenance.timefusion_optimize_sort_by)
-            } else {
-                choose_optimize_type(schema, false, self.config.maintenance.timefusion_optimize_sort_by)
-            };
+            let (optimize_type, declare_sorted) = consolidate_optimize_type(schema, self.config.maintenance.timefusion_optimize_sort_by);
             let writer_properties = self.create_writer_properties(schema, self.config.parquet.timefusion_zstd_level_warm, declare_sorted);
             // Serialise SortBy at in-server concurrency; explicit off-box
             // concurrency opts into parallel transition sorts.
