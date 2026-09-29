@@ -229,10 +229,11 @@ x86-64 code with target C libraries; amd64 container execution is required
 for the final smoke test. ARM64 Docker hosts automatically use a native QEMU
 emulator with an x86-64 guest address offset. The unchanged production image
 must stay running and pass its PGWire protocol probe. Measured 2026-09-29 on
-an 18-CPU laptop: a source-only change rebuilds the crate in ~9 minutes; a
-`Cargo.toml` or `Cargo.lock` change re-cooks every dependency first (~5 more,
-from the persisted registry/git caches). `CARGO_BUILD_JOBS=8` peaked at 10 GB
-of the 16 GB Docker VM; at 2 the same build took 15 + 11 minutes.
+an 18-CPU laptop with a 96 GB Docker VM and `CARGO_BUILD_JOBS=16`: a
+source-only change rebuilds the crate in ~6 minutes; a `Cargo.toml` or
+`Cargo.lock` change re-cooks every dependency first (~6.5 more, from the
+persisted registry/git caches). Peak VM memory was 10.6 GB. At the old 2 jobs
+the same two steps took 15 and 11 minutes.
 Local cross-compilation, image publication, CI reuse, and production rollout
 have passed verification. After the checked change is merged,
 `make deploy` runs the shared handoff, rollout, recovery, and readiness soak
