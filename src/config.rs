@@ -2127,6 +2127,11 @@ pub struct MaintenanceConfig {
     /// workers while bounding the journal to tiers × 16. 0 pauses new backfill.
     #[serde_inline_default(16)]
     pub timefusion_rollup_backfill_tier_inflight: usize,
+    /// Cells a census pass re-mints because they predate a measure their tier now
+    /// declares. Holes are admitted first and these still count against the tier
+    /// in-flight cap, so the re-mint only fills idle room. 0 disables it.
+    #[serde_inline_default(2)]
+    pub timefusion_rollup_measure_remints_per_pass: usize,
     /// `(project_id, date)` cells a one-shot repair forces a full re-derive of,
     /// as `project:YYYY-MM-DD`. Empty means "use `DAMAGED_CELLS`". Non-empty
     /// REPLACES that const rather than extending it. Malformed entries are dropped
@@ -2529,6 +2534,7 @@ mod tests {
         assert!(config.rollup_read_enabled_for("a-project-created-tomorrow"));
         assert_eq!(config.timefusion_rollup_backfill_days, 31, "the shipped default is the value prod exercises");
         assert_eq!(config.timefusion_rollup_backfill_tier_inflight, 16, "a new tier must not queue its whole horizon at once");
+        assert_eq!(config.timefusion_rollup_measure_remints_per_pass, 2, "a newly declared measure must not re-mint its whole horizon at once");
         assert!(!config.timefusion_rollup_adaptive_batches, "adaptive batches need the paired resource experiment before activation");
         assert!(!config.timefusion_rollup_packed_repairs, "packed remainders need a witness that survives the repair before activation");
         assert!(!config.timefusion_rollup_certified_clean, "certified aggregation needs the paired resource experiment before activation");

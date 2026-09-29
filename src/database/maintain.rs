@@ -12,6 +12,8 @@ const ROLLUP_PROOF_RETRY_MICROS: i64 = 1_000_000;
 static FORCE_LOSSY_REWRITE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Census re-admissions declined as a finished no-op; OTel only, no stats row.
 pub(crate) const CENSUS_READMIT_DECLINED: &str = "timefusion.rollup.census_readmit_declined";
+/// Tier units the census queued to re-mint a cell lacking a declared measure.
+pub(crate) const MEASURE_REMINTS_QUEUED: &str = "timefusion.rollup.measure_remints_queued";
 
 #[derive(Clone, Copy)]
 pub(crate) enum TaskSelection<'a> {
@@ -1904,6 +1906,7 @@ impl Database {
         // replace wholesale, so a per-source call keeps only the last table.
         let mut all_base_tier_ready = crate::maintenance_coordinator::BaseTierCoverage::new();
         let mut all_tier_holes: HashSet<(String, String, String, String)> = HashSet::new();
+        let mut all_remints: HashSet<(String, String, String, String)> = HashSet::new();
         let source_epochs: HashMap<_, _> = {
             let _guard = crate::support::lock(&self.rollup_journal_lock);
             self.rollup_source_epochs.iter().map(|entry| (entry.key().clone(), *entry.value())).collect()
@@ -1961,13 +1964,15 @@ impl Database {
             // Every enabled tier's live file set per cell, order-free: a derived tier's
             // input is its parent's files, so any tier moving re-admits the whole cell.
             let mut tier_files: HashMap<BackfillCell, u64> = HashMap::new();
+            // Tiers of cells that are covered but predate a measure their tier now declares.
+            let mut remint: HashSet<(BackfillCell, usize)> = HashSet::new();
 
             // A day must be covered by EVERY declared tier: a 30d panel reads the
             // coarse tier, so a hole there refuses it however complete 1m is.
             for (index, spec) in schema.rollups.iter().enumerate().filter(|(index, _)| enabled_tiers.contains(index)) {
                 let target = spec.table_name(&source);
                 let Ok(target_ref) = self.resolve_table(&storage_project, &target).await else { continue };
-                let (covered, tier_created_ms, ranges) = {
+                let (covered, tier_created_ms, mut ranges) = {
                     let table = target_ref.read().await;
                     for file in table.snapshot()?.log_data().iter() {
                         let add = add_action(&file);
@@ -2032,7 +2037,29 @@ impl Database {
 
                 // Before the tag replay completes the coverage maps are partial and
                 // every partition reads as a hole; presence is the honest answer then.
-                let readable = if self.preload_replay_complete.load(std::sync::atomic::Ordering::Acquire) { proven_days } else { covered.clone() };
+                let replayed = self.preload_replay_complete.load(std::sync::atomic::Ordering::Acquire);
+                let mut readable = if replayed { proven_days } else { covered.clone() };
+                // Such a cell reads as missing so the pass re-mints it whole. After the
+                // gauges above: it still serves every measure it holds.
+                if replayed && self.config.maintenance.timefusion_rollup_measure_remints_per_pass > 0 {
+                    let short: HashSet<BackfillCell> = self
+                        .rollup_slice_coverage
+                        .iter()
+                        .filter(|entry| {
+                            let ((project, held_source, held_target, start, _), coverage) = (entry.key(), entry.value());
+                            *held_source == source
+                                && *held_target == target
+                                && chrono::DateTime::from_timestamp_micros(*start)
+                                    .is_some_and(|time| Self::rollup_generation_current(&source, &target, project, &time.date_naive().to_string(), coverage))
+                                && crate::rollup::measures_short(spec, coverage.measures.as_ref(), spec.measures.iter().map(|measure| &measure.name))
+                        })
+                        .filter_map(|entry| Some((entry.key().0.clone(), chrono::DateTime::from_timestamp_micros(entry.key().3)?.date_naive())))
+                        .filter(|cell| readable.contains(cell))
+                        .collect();
+                    readable.retain(|cell| !short.contains(cell));
+                    ranges.retain(|cell, _| !short.contains(cell));
+                    remint.extend(short.into_iter().map(|cell| (cell, index)));
+                }
                 readable_per_tier.push((index, readable));
                 ranges_per_tier.insert(index, ranges);
             }
@@ -2093,9 +2120,13 @@ impl Database {
             // Publish the holes so `claim_next` ranks them ahead of days that
             // already have tier output.
             let (source_ref, rollups) = (&source, &schema.rollups);
-            all_tier_holes.extend(missing_tiers.iter().flat_map(|((project, date), missing)| {
-                missing.iter().map(move |index| (source_ref.clone(), project.clone(), rollups[*index].table_name(source_ref), date.to_string()))
-            }));
+            for (cell, missing) in &missing_tiers {
+                for index in missing {
+                    let key = (source_ref.clone(), cell.0.clone(), rollups[*index].table_name(source_ref), cell.1.to_string());
+                    // A re-mint is not a hole: ranking it with them would put it first.
+                    if remint.contains(&(cell.clone(), *index)) { &mut all_remints } else { &mut all_tier_holes }.insert(key);
+                }
+            }
             let mut want: Vec<(String, chrono::NaiveDate)> = missing_tiers.keys().cloned().collect();
             let cells_missing = want.len();
             // Skip work already queued, keyed on (project, date, TABLE) and scoped to
@@ -2178,6 +2209,16 @@ impl Database {
                     })
                 })
             });
+            // Re-mint-only cells fill what room the holes leave, newest first.
+            let remint_only = |cell: &BackfillCell| {
+                !damage_forced.contains(cell)
+                    && missing_tiers.get(cell).is_some_and(|missing| missing.iter().all(|index| remint.contains(&(cell.clone(), *index))))
+            };
+            let (mut reminted, holes): (Vec<_>, Vec<_>) = want.into_iter().partition(|cell| remint_only(cell));
+            reminted.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            reminted.truncate(self.config.maintenance.timefusion_rollup_measure_remints_per_pass.min(BACKFILL_PARTITIONS_PER_PASS.saturating_sub(holes.len())));
+            let cells_remint = reminted.len();
+            let want: Vec<_> = holes.into_iter().chain(reminted).collect();
             // `cells_missing` is what coverage says is absent, `cells_wanted` what
             // survives the already-queued veto.
             let (derived_pending, derived_sealed, derived_unproven, derived_quarantined, derived_not_due) = {
@@ -2202,6 +2243,7 @@ impl Database {
                         .map_or_else(|| "none_pending".to_owned(), |(project, date, reason)| format!("{reason}:{project:.8}:{date}"))
                 },
                 cells_admitted = want.len().min(BACKFILL_PARTITIONS_PER_PASS),
+                cells_remint,
                 tiers_capped,
                 defer_enqueue,
                 event = "rollup_backfill_census"
@@ -2235,13 +2277,16 @@ impl Database {
                 let wanted: HashSet<&BackfillCell> = want.iter().collect();
                 damage_forced.iter().filter(|cell| !wanted.contains(cell)).count()
             };
-            let (want, damage_consumed) = admit_backfill_pass(want, damage_offered, &damage_forced, BACKFILL_PARTITIONS_PER_PASS);
+            let (mut want, damage_consumed) = admit_backfill_pass(want, damage_offered, &damage_forced, BACKFILL_PARTITIONS_PER_PASS);
+            // Holes claim the tier in-flight room first.
+            want.sort_by_key(|cell| remint_only(cell));
             let damage_admitted: HashSet<BackfillCell> = want.iter().filter(|cell| damage_forced.contains(*cell)).cloned().collect();
             // Coalesced holes only; byte-driven splitting still bounds large repairs.
             let now = crate::support::now_micros();
             let created_unix_ms = unix_ms(now);
             // Forced cells the QUEUE refused — only measurable here.
             let mut damage_vetoed = 0usize;
+            let mut remints_queued = 0u64;
             {
                 let mut journal = self.journal();
                 for (project_id, date) in &want {
@@ -2280,16 +2325,14 @@ impl Database {
                             false,
                         )
                     };
-                    let needs_source_scan = holes.iter().any(|(index, ranges)| !ranges.is_empty() && schema.rollups[*index].derive_from.is_none());
+                    // A re-mint rebuilds a day that was already deduplicated for its first build.
+                    let raw_hole = |index: usize| schema.rollups[index].derive_from.is_none() && !remint.contains(&(cell.clone(), index));
+                    let needs_source_scan = holes.iter().any(|(index, ranges)| !ranges.is_empty() && raw_hole(*index));
                     // Dedup only when something must read RAW anyway: a derived tier
                     // aggregates the base TIER, not the source.
                     if needs_source_scan && !queued_tables.contains(&(project_id.clone(), *date, source.clone())) {
                         let raw_holes = crate::write::mem_buffer::merge_ranges(
-                            holes
-                                .iter()
-                                .filter(|(index, _)| schema.rollups[**index].derive_from.is_none())
-                                .flat_map(|(_, ranges)| ranges.iter().copied())
-                                .collect(),
+                            holes.iter().filter(|(index, _)| raw_hole(**index)).flat_map(|(_, ranges)| ranges.iter().copied()).collect(),
                         );
                         for (start, end) in raw_holes {
                             refused |= !enqueue(source.clone(), TimeSlice::new(start, end)?, Operation::Dedup);
@@ -2311,6 +2354,7 @@ impl Database {
                             let accepted = enqueue(physical_table.clone(), TimeSlice::new(start, end)?, operation);
                             tier_refused |= !accepted;
                             *tier_inflight.entry(physical_table.clone()).or_default() += usize::from(accepted);
+                            remints_queued += u64::from(accepted && remint.contains(&(cell.clone(), index)));
                         }
                         refused |= tier_refused;
                         // A capped tier was not admitted, so the guard must not remember it.
@@ -2325,6 +2369,7 @@ impl Database {
                 }
                 journal.checkpoint()?;
             }
+            metrics::counter!(MEASURE_REMINTS_QUEUED).increment(remints_queued);
             // AFTER the enqueue's checkpoint, and only by cells that survived
             // truncation — the other order loses cells on a crash.
             let damage_consumed = advance_damage(damage_consumed)?;
@@ -2354,8 +2399,10 @@ impl Database {
                 !ranges.is_empty() && source_epochs.get(&key).copied().unwrap_or(0) == self.rollup_source_epochs.get(&key).map_or(0, |epoch| *epoch.value())
             });
             // Across every storage table at once: a custom-project table shares its source name.
-            self.census_admitted
-                .retain(|(source, project, tier, date), _| all_tier_holes.contains(&(source.clone(), project.clone(), tier.clone(), date.to_string())));
+            self.census_admitted.retain(|(source, project, tier, date), _| {
+                let key = (source.clone(), project.clone(), tier.clone(), date.to_string());
+                all_tier_holes.contains(&key) || all_remints.contains(&key)
+            });
             let mut journal = self.journal();
             journal.set_base_tier_ready(all_base_tier_ready);
             journal.set_tier_holes(all_tier_holes);
@@ -3201,7 +3248,12 @@ impl Database {
                     key.slice.end_micros,
                 ))?;
                 let current = Self::rollup_generation_current(&key.source, &key.physical_table, &key.project_id, &date.to_string(), coverage.value());
+                // A cell predating a measure this build would materialize reads current
+                // too: its generation covers only what it holds.
+                let present = snapshot.schema().fields().map(|field| field.name().clone()).collect();
+                let materializable = crate::rollup::materialized_measures(spec, false, &present, &get_schema(&key.physical_table)?.schema_ref(), None);
                 (current
+                    && !crate::rollup::measures_short(spec, coverage.measures.as_ref(), materializable.iter())
                     && coverage.matches_slice(source_rows.and_then(|rows| u64::try_from(rows).ok()), None)
                     && coverage.content_fp == Some(content_fp)
                     && (matches!(coverage.output, RollupOutputEvidence::Files(_)) || coverage.empty_publication().is_some()))

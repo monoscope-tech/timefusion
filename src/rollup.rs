@@ -972,13 +972,22 @@ pub(crate) fn materialized_measures(
 /// `None` overall means no base cell overlapped the slice; vacuously permissive
 /// because the base-coverage gate already retries on a real hole.
 pub(crate) fn base_measure_evidence<'a>(spec: &RollupSpec, cells: impl Iterator<Item = Option<&'a HashSet<String>>>) -> Option<HashSet<String>> {
-    cells
-        .map(|held| {
-            held.cloned().unwrap_or_else(|| {
-                spec.measures.iter().map(|measure| measure.name.clone()).filter(|name| !MEASURES_ABSENT_FROM_LEGACY_CELLS.contains(&name.as_str())).collect()
-            })
-        })
-        .reduce(|left, right| &left & &right)
+    cells.map(|held| held_measures(spec, held)).reduce(|left, right| &left & &right)
+}
+
+/// What a cell's evidence proves it holds; `None` is a legacy cell, resolved as
+/// `measures_available(None)` does.
+fn held_measures(spec: &RollupSpec, held: Option<&HashSet<String>>) -> HashSet<String> {
+    held.cloned().unwrap_or_else(|| {
+        spec.measures.iter().map(|measure| measure.name.clone()).filter(|name| !MEASURES_ABSENT_FROM_LEGACY_CELLS.contains(&name.as_str())).collect()
+    })
+}
+
+/// Whether a cell lacks any of `wanted` — the census re-mints such a cell,
+/// since nothing else rebuilds one whose input never moves.
+pub(crate) fn measures_short<'a>(spec: &RollupSpec, held: Option<&HashSet<String>>, mut wanted: impl Iterator<Item = &'a String>) -> bool {
+    let held = held_measures(spec, held);
+    wanted.any(|name| !held.contains(name))
 }
 
 /// The SELECT a rollup slice reads its input through, collapsing duplicates

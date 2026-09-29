@@ -1558,6 +1558,67 @@ async fn a_date_that_cannot_prove_its_digest_falls_to_the_raw_fringe() -> Result
     Ok(())
 }
 
+/// A cell published before a measure was declared is re-minted by the census and
+/// then serves it. Nothing else rebuilds it: its generation, taken over what it
+/// materialized, reads current, so the no-op skip would also complete it unchanged.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_census_remints_a_cell_published_before_a_measure_was_declared() -> Result<()> {
+    use crate::maintenance_coordinator::Operation;
+    const MEASURE: &str = "rum_pageview_count";
+    const TIER: &str = "otel_logs_and_spans_rollup_dashboard_1m_v4";
+    crate::observability::init_local_metrics_for_test();
+    let db = Arc::new(Database::with_config(rollup_backfill_config("measure-remint", 35)).await?);
+    db.cancel_maintenance();
+    let project = format!("remint_{}", uuid::Uuid::new_v4().simple());
+    let day = (Utc::now() - chrono::Duration::days(3)).date_naive();
+    for hour in [1, 7, 13, 19] {
+        let at = day.and_hms_opt(hour, 0, 0).expect("hour").and_utc().timestamp_micros();
+        let row = serde_json::json!({
+            "timestamp": at, "id": format!("h{hour}"), "name": "Pageview /home", "project_id": project, "hashes": [],
+            "summary": ["remint fixture"], "date": day.to_string(), "duration": 100 + hour, "kind": "client", "status_code": "OK",
+        });
+        db.insert_records_batch(&project, "otel_logs_and_spans", vec![json_to_batch(vec![row])?], true, None).await?;
+    }
+    db.run_unit_once("otel_logs_and_spans", &project, day, Operation::BaseRollup, 24, 0, Some(TIER)).await?;
+    strip_rollup_measure(&db, &project, day, MEASURE, Some(TIER)).await?;
+    db.mark_replay_complete();
+    retire_all_tasks(&db);
+
+    let lo = midnight_micros(day);
+    let sql = format!(
+        "SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = '{project}' AND timestamp >= to_timestamp_micros({lo}) \
+         AND timestamp < to_timestamp_micros({}) AND (name LIKE 'Pageview %' OR name = 'documentLoad')",
+        lo + crate::maintenance_coordinator::DAY_MICROS
+    );
+    let mut ctx = Arc::clone(&db).create_session_context();
+    db.setup_session_context(&mut ctx)?;
+    let state = ctx.state();
+    let plan = state.optimize(&state.create_logical_plan(&sql).await?)?;
+    let declined = db.rollup_sql(&plan, &state).await.err().map(|reason| reason.label());
+    assert_eq!(declined, Some(crate::rollup::MissReason::MeasureNotStored.label()), "the stripped cell must not serve the measure");
+
+    let queued = || crate::observability::counter_value(super::maintain::MEASURE_REMINTS_QUEUED);
+    let before = queued();
+    db.plan_rollup_backfill().await?;
+    assert_eq!(
+        pending_tier_slices(&db, &project, TIER),
+        vec![crate::maintenance_coordinator::TimeSlice::new(lo, lo + crate::maintenance_coordinator::DAY_MICROS)?],
+        "a cell lacking a declared measure must be re-minted whole"
+    );
+    assert!(queued() > before, "the re-mint must be counted");
+
+    let report = db.run_unit_once("otel_logs_and_spans", &project, day, Operation::BaseRollup, 24, 0, Some(TIER)).await?;
+    assert_eq!(report.state, Some(crate::maintenance_coordinator::TaskState::Complete));
+    let published = slice_measures(&db, &project, Some(TIER));
+    assert!(
+        !published.is_empty() && published.iter().all(|held| held.as_ref().is_some_and(|names| names.contains(MEASURE))),
+        "the rebuild must materialize the measure rather than complete as a no-op: {published:?}"
+    );
+    let routed = db.rollup_sql(&plan, &state).await.map_err(|reason| anyhow::anyhow!("declined: {}", reason.label()))?.expect("the re-minted cell routes");
+    assert!(routed_days(&routed.ticket).contains(&day.to_string()), "the re-minted day must be read from the tier");
+    Ok(())
+}
+
 /// A slice with no ROW WITNESS must be queued for republish: it is not damaged and
 /// not missing but UNVERIFIABLE, so every read refuses it `stale_coverage` forever
 /// and nothing else about a sealed, fully-covered day would republish it.
