@@ -11535,23 +11535,24 @@ mod rollup_noop_skip_tests {
         Ingest,
     }
 
-    /// A deletion-vector file rewritten ALONE and DV-free keeps its rollup slice
-    /// routed. The strip retires only rows no reader sees, so the carry re-stamps
-    /// the physical witness; without it every slice of the day reads as moved.
-    /// Also the COST claim: afterwards a scan decodes only the live rows, and the
-    /// strip's own plan paid no sort.
+    /// A rewrite that retires deletion-masked rows keeps its rollup slice routed:
+    /// it drops only rows no reader sees, so the carry re-stamps the physical
+    /// witness; without it every slice of the day reads as moved. `strip` rewrites
+    /// a lone sorted DV file (the dark lane); without it, the live sealed pack of a
+    /// DV file with its neighbour carries the same way. Also the COST claim:
+    /// afterwards a scan decodes only the live rows, and a strip paid no sort.
+    #[test_case::test_case(true ; "a lone DV file stripped under the flag")]
+    #[test_case::test_case(false ; "a DV file packed with its neighbour, flag off")]
     #[serial]
     #[tokio::test]
-    async fn a_dv_strip_retires_masked_rows_and_keeps_the_slice_routed() -> Result<()> {
+    async fn a_masked_rewrite_retires_masked_rows_and_keeps_the_slice_routed(strip: bool) -> Result<()> {
         use std::sync::atomic::Ordering::Relaxed;
         let mut cfg = (*rollup_cfg("dv_strip")).clone();
-        cfg.maintenance.timefusion_dv_strip_enabled = true;
+        cfg.maintenance.timefusion_dv_strip_enabled = strip;
         let db = Arc::new(Database::with_config(Arc::new(cfg)).await?);
         let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
         let date = chrono::Utc::now().date_naive() - chrono::Duration::days(3);
         let noon = date.and_hms_opt(12, 0, 0).expect("valid hour").and_utc().timestamp_micros();
-        // Prod's DV files are sorted runs, i.e. compaction outputs: pack two flush
-        // files into one, then dedup masks one row of its three.
         for rows in [
             vec![test_span_ts("dup", "first", &project_id, noon), test_span_ts("other", "op", &project_id, noon + 1)],
             vec![test_span_ts("dup", "second", &project_id, noon)],
@@ -11564,11 +11565,14 @@ mod rollup_noop_skip_tests {
             let adds = t.snapshot()?.log_data().iter().map(|f| add_action(&f)).filter(|add| add.path.contains(&project_id)).collect_vec();
             anyhow::Ok((adds.len(), adds.iter().filter(|add| add.deletion_vector.is_some()).count(), adds.iter().filter_map(add_row_count).sum::<u64>()))
         };
-        db.plan_compaction_debt().await?;
-        assert!(db.run_coordinator_compaction_once(Operation::SealedConsolidation).await?);
-        assert_eq!(partition().await?, (1, 0, 3), "precondition: one sorted run");
+        // Prod's DV files are sorted runs, i.e. compaction outputs: for the strip,
+        // pack the two flush files first so dedup masks one row of ONE file.
+        if strip {
+            db.plan_compaction_debt().await?;
+            assert!(db.run_coordinator_compaction_once(Operation::SealedConsolidation).await?);
+        }
         dedup_unified(&db).await?;
-        assert_eq!(partition().await?, (1, 1, 3), "precondition: one deletion vector over three physical rows");
+        assert_eq!(partition().await?, (if strip { 1 } else { 2 }, 1, 3), "precondition: one deletion vector over three physical rows");
         db.plan_rollup_backfill().await?;
         assert!(advance_and_drain(&db).await? > 0, "the fixture needs a built slice");
         db.recover_rollup_coverage("otel_logs_and_spans").await?;
@@ -11598,7 +11602,7 @@ mod rollup_noop_skip_tests {
         let stats = crate::observability::maintenance_stats();
         let sorts = stats.dv_strip_plan_sorts.load(Relaxed);
         db.plan_compaction_debt().await?;
-        assert!(db.run_coordinator_compaction_once(Operation::SealedConsolidation).await?, "a lone DV file is sealed-consolidation debt");
+        assert!(db.run_coordinator_compaction_once(Operation::SealedConsolidation).await?, "a DV file is sealed-consolidation debt");
         assert_eq!(partition().await?, (1, 0, 2), "rewritten DV-free, physical rows = the two live rows");
         assert_eq!(stats.dv_strip_plan_sorts.load(Relaxed), sorts, "a strip is a filter copy: the footer ordering carries the ORDER BY");
 
