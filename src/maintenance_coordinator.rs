@@ -3233,7 +3233,7 @@ struct AdmissionState {
     used: Resources,
     /// The static reservation the adaptive ceiling falls back to under load.
     cpu_base: u32,
-    /// `None` while `timefusion_maintenance_query_yield` is off.
+    /// `None` while [`crate::config::RuntimeFlag::TimefusionMaintenanceQueryYield`] is off.
     query_yield: Option<QueryYield>,
     /// The part of `used.state_bytes` held by frontier units, which alone may use the reserve.
     frontier_state: u64,
@@ -3472,17 +3472,17 @@ impl AdmissionController {
         Self(Arc::new(Mutex::new(AdmissionState { capacity, used: Resources::default(), cpu_base, query_yield: None, frontier_state: 0, waiter: None })))
     }
 
-    pub fn enable_query_yield(&self) {
-        let mut state = lock(&self.0);
-        state.query_yield = Some(QueryYield::open(state.capacity.object_reads));
-        crate::observability::QUERY_YIELD_CEILING.store(u64::from(state.capacity.object_reads), std::sync::atomic::Ordering::Relaxed);
-    }
-
-    /// One control tick against the recent pgwire p95; a no-op until enabled.
-    pub fn tick_query_yield(&self, p95_ms: Option<f64>, samples: u64) {
+    /// One control tick against the recent pgwire p95. Off drops the yield state,
+    /// so re-enabling starts fully open.
+    pub fn tick_query_yield(&self, enabled: bool, p95_ms: Option<f64>, samples: u64) {
         let mut state = lock(&self.0);
         let max = state.capacity.object_reads;
-        let Some(prev) = state.query_yield else { return };
+        if !enabled {
+            state.query_yield = None;
+            crate::observability::QUERY_YIELD_CEILING.store(0, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
+        let prev = state.query_yield.unwrap_or(QueryYield::open(max));
         let next = query_scaled_ceiling(prev, p95_ms, samples, max);
         state.query_yield = Some(next);
         crate::observability::QUERY_YIELD_CEILING.store(u64::from(next.ceiling), std::sync::atomic::Ordering::Relaxed);
@@ -7273,17 +7273,23 @@ mod tests {
     }
 
     /// With the ceiling at its floor of 8, the 9th Rollup unit waits on object
-    /// reads while today's HotPacking still runs.
-    #[test_case::test_case(true => (false, true) ; "yield_on_refuses_the_ninth_rollup_not_hot_packing")]
-    #[test_case::test_case(false => (true, true) ; "yield_off_admits_the_ninth_rollup")]
-    fn query_yield_caps_object_reads_except_hot_packing(enabled: bool) -> (bool, bool) {
+    /// reads while today's HotPacking still runs. A `FLAG SET` override taking
+    /// effect after four ticks under the config value wins at the next tick.
+    #[test_case::test_case(true, None => (false, true) ; "yield_on_refuses_the_ninth_rollup_not_hot_packing")]
+    #[test_case::test_case(false, None => (true, true) ; "yield_off_admits_the_ninth_rollup")]
+    #[test_case::test_case(false, Some(true) => (false, true) ; "runtime_on_overrides_config_off")]
+    #[test_case::test_case(true, Some(false) => (true, true) ; "runtime_off_drops_a_shut_yield")]
+    fn query_yield_caps_object_reads_except_hot_packing(configured: bool, runtime: Option<bool>) -> (bool, bool) {
+        use crate::config::RuntimeFlag::TimefusionMaintenanceQueryYield as Flag;
         use std::sync::atomic::Ordering::Relaxed;
+        let mut cfg = crate::config::AppConfig::default().maintenance;
+        cfg.timefusion_maintenance_query_yield = configured;
         let admission = AdmissionController::with_decoded_capacity(32, 32, MAX_DECODED_BYTES * 64, u64::MAX, 16, 16);
-        if enabled {
-            admission.enable_query_yield();
-        }
-        (0..4).for_each(|_| admission.tick_query_yield(HI.0, HI.1));
-        assert_eq!(lock(&admission.0).query_yield.map(|y| y.ceiling), enabled.then_some(8));
+        (0..4).for_each(|_| admission.tick_query_yield(cfg.flag(Flag), HI.0, HI.1));
+        Flag.set_override(runtime);
+        (0..4).for_each(|_| admission.tick_query_yield(cfg.flag(Flag), HI.0, HI.1));
+        assert_eq!(lock(&admission.0).query_yield.map(|y| y.ceiling), runtime.unwrap_or(configured).then_some(8));
+        Flag.set_override(None);
         let request = Resources { cpu: 1, decoded_bytes: 1, object_reads: 1, object_writes: 1, ..Resources::default() };
         let admit = |lane| admission.try_acquire_for(request, lane, crate::config::MemorySnapshot::unknown());
         let _held: Vec<_> = (0..8).map(|_| admit(AdmissionLane::Rollup).expect("under the ceiling")).collect();

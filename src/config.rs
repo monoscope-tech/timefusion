@@ -2335,7 +2335,45 @@ pub struct MaintenanceConfig {
     pub timefusion_dv_strip_interval_secs: u64,
 }
 
+/// Boolean flags `FLAG SET` may override in memory; a restart returns to config.
+/// Names are the config field names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, strum::EnumString, strum::IntoStaticStr, strum::VariantArray, strum::VariantNames)]
+#[strum(serialize_all = "snake_case", ascii_case_insensitive)]
+pub enum RuntimeFlag {
+    TimefusionMaintenanceQueryYield,
+    TimefusionReadDedupKeyRestrict,
+}
+
+/// Per-flag tri-state: 0 = config, 1 = off, 2 = on.
+static FLAG_OVERRIDES: [std::sync::atomic::AtomicU8; 2] = [const { std::sync::atomic::AtomicU8::new(0) }; 2];
+
+impl RuntimeFlag {
+    fn slot(self) -> &'static std::sync::atomic::AtomicU8 {
+        &FLAG_OVERRIDES[self as usize]
+    }
+
+    pub fn override_value(self) -> Option<bool> {
+        match self.slot().load(std::sync::atomic::Ordering::Relaxed) {
+            0 => None,
+            v => Some(v == 2),
+        }
+    }
+
+    /// `None` returns to the config value.
+    pub fn set_override(self, value: Option<bool>) {
+        self.slot().store(value.map_or(0, |on| 1 + u8::from(on)), std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 impl MaintenanceConfig {
+    /// THE read for a [`RuntimeFlag`]: the runtime override, else this config's field.
+    pub fn flag(&self, flag: RuntimeFlag) -> bool {
+        flag.override_value().unwrap_or(match flag {
+            RuntimeFlag::TimefusionMaintenanceQueryYield => self.timefusion_maintenance_query_yield,
+            RuntimeFlag::TimefusionReadDedupKeyRestrict => self.timefusion_read_dedup_key_restrict,
+        })
+    }
+
     /// Reads honour the canary allow-list (empty/unset = every project);
     /// rollup BUILDS are unconditional and have no allow-list.
     pub fn rollup_read_enabled_for(&self, project_id: &str) -> bool {
@@ -2482,6 +2520,19 @@ impl AppConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The override wins over the config field in either direction; `None` returns to it.
+    #[test_case::test_case(false, Some(true) => true ; "on_over_config_off")]
+    #[test_case::test_case(true, Some(false) => false ; "off_over_config_on")]
+    #[test_case::test_case(true, None => true ; "reset_reads_config")]
+    fn runtime_flag_override_is_what_read_sites_see(configured: bool, runtime: Option<bool>) -> bool {
+        let mut cfg = AppConfig::default().maintenance;
+        cfg.timefusion_read_dedup_key_restrict = configured;
+        RuntimeFlag::TimefusionReadDedupKeyRestrict.set_override(runtime);
+        let seen = cfg.flag(RuntimeFlag::TimefusionReadDedupKeyRestrict);
+        RuntimeFlag::TimefusionReadDedupKeyRestrict.set_override(None);
+        seen
+    }
 
     /// Pins the DESERIALIZED tantivy defaults. Trap: `TantivyConfig::default()`
     /// is the derived `Default`, which bypasses every `#[serde_inline_default]`

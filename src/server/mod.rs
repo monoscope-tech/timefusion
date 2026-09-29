@@ -624,6 +624,29 @@ impl LoggingSimpleQueryHandler {
         ))
     }
 
+    /// `FLAG SET/RESET` changes one in-memory override; every form answers with the flag table.
+    async fn run_flag(&self, cmd: FlagCmd) -> PgWireResult<Vec<Response>> {
+        use strum::VariantArray;
+        let db = require_available(self.db.as_ref(), "FLAG")?;
+        let maint = &db.config().maintenance;
+        if let FlagCmd::Set(flag, value) = cmd {
+            let old = maint.flag(flag);
+            flag.set_override(value);
+            info!(flag = <&str>::from(flag), old, new = maint.flag(flag), override_value = ?value, event = "runtime_flag_changed");
+        }
+        let rows: Vec<_> = crate::config::RuntimeFlag::VARIANTS
+            .iter()
+            .map(|&flag| {
+                Ok(vec![
+                    <&str>::from(flag).to_owned(),
+                    maint.flag(flag).to_string(),
+                    flag.override_value().map_or_else(|| "null".to_owned(), |v| v.to_string()),
+                ])
+            })
+            .collect();
+        Ok(text_response(["flag", "effective", "override"], rows.into_iter()))
+    }
+
     /// Execute an intercepted `OPTIMIZE <table> WHERE date = '...'`.
     async fn run_optimize(&self, cmd: OptimizeCmd) -> PgWireResult<Vec<Response>> {
         let (db, table_ref) = self.admin_table("OPTIMIZE", &cmd.table).await?;
@@ -954,6 +977,28 @@ pub(crate) fn parse_rollup_policy(query: &str) -> Result<Option<RollupPolicyCmd>
     Ok(Some(cmd))
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum FlagCmd {
+    Show,
+    /// `None` resets to the config value.
+    Set(crate::config::RuntimeFlag, Option<bool>),
+}
+
+/// `FLAG SHOW`, `FLAG SET <name> ON|OFF`, `FLAG RESET <name>`.
+pub(crate) fn parse_flag(query: &str) -> Result<Option<FlagCmd>, String> {
+    let Some(rest) = strip_command(query, "flag") else { return Ok(None) };
+    let flag = |name: &str| {
+        name.parse().map_err(|_| format!("unknown flag '{name}'; overridable: {}", <crate::config::RuntimeFlag as strum::VariantNames>::VARIANTS.join(", ")))
+    };
+    let is = |token: &str, word: &str| token.eq_ignore_ascii_case(word);
+    Ok(Some(match rest.split_whitespace().collect::<Vec<_>>().as_slice() {
+        [action] if is(action, "show") => FlagCmd::Show,
+        [action, name, value] if is(action, "set") && (is(value, "on") || is(value, "off")) => FlagCmd::Set(flag(name)?, Some(is(value, "on"))),
+        [action, name] if is(action, "reset") => FlagCmd::Set(flag(name)?, None),
+        _ => return Err("expected FLAG SHOW, FLAG SET <name> ON|OFF, or FLAG RESET <name>".to_owned()),
+    }))
+}
+
 /// Parse `OPTIMIZE <table> WHERE date = 'YYYY-MM-DD'`.
 ///
 /// - `Ok(None)`: not an OPTIMIZE statement — fall through to DataFusion.
@@ -1246,6 +1291,7 @@ impl SimpleQueryHandler for LoggingSimpleQueryHandler {
             };
         }
         admin!(parse_rollup_policy => run_rollup_policy);
+        admin!(parse_flag => run_flag);
         admin!(parse_optimize => run_optimize);
         admin!(parse_vacuum => run_vacuum);
         admin!(parse_delta_recovery_audit => run_delta_recovery_audit);
@@ -1601,6 +1647,20 @@ mod pgwire_handlers_tests {
             .await
             .expect("a non-yielding future outruns the deadline instead of being cancelled");
         assert_eq!(value, 42, "it completed, which is precisely the failure mode");
+    }
+
+    #[test_case(" flag show; " => Ok(Some(crate::server::FlagCmd::Show)); "show")]
+    #[test_case("FLAG SET timefusion_maintenance_query_yield ON" => Ok(Some(crate::server::FlagCmd::Set(crate::config::RuntimeFlag::TimefusionMaintenanceQueryYield, Some(true)))); "set on")]
+    #[test_case("flag set TIMEFUSION_READ_DEDUP_KEY_RESTRICT off" => Ok(Some(crate::server::FlagCmd::Set(crate::config::RuntimeFlag::TimefusionReadDedupKeyRestrict, Some(false)))); "set off, any case")]
+    #[test_case("FLAG RESET timefusion_read_dedup_key_restrict" => Ok(Some(crate::server::FlagCmd::Set(crate::config::RuntimeFlag::TimefusionReadDedupKeyRestrict, None))); "reset")]
+    #[test_case("FLAG SET timefusion_read_dedup_skip_per_file ON" => Err(()); "only registered flags are overridable")]
+    #[test_case("FLAG SET timefusion_maintenance_query_yield MAYBE" => Err(()); "value is ON or OFF")]
+    #[test_case("FLAG SHOW extra" => Err(()); "reject trailing input")]
+    #[test_case("FLAG SET timefusion_maintenance_query_yield" => Err(()); "set needs a value")]
+    #[test_case("SELECT 1" => Ok(None); "ordinary SQL falls through")]
+    #[test_case("flags_x" => Ok(None); "keyword boundary")]
+    fn flag_commands_parse(query: &str) -> Result<Option<super::FlagCmd>, ()> {
+        super::parse_flag(query).map_err(|_| ())
     }
 
     #[test_case("ROLLUP POLICIES s" => Ok(Some(crate::server::RollupPolicyCmd::Policies { source: "s".into() })); "inspect policies")]

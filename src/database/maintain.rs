@@ -4869,7 +4869,8 @@ impl Database {
         }
         // The blocker argument is a SPAN argument: sound only while every version of a row
         // shares its timestamp.
-        let restrict = maint.timefusion_read_dedup_key_restrict && schema_or_default(table_name).dedup_keys.iter().any(|k| k == "timestamp");
+        let restrict =
+            maint.flag(crate::config::RuntimeFlag::TimefusionReadDedupKeyRestrict) && schema_or_default(table_name).dedup_keys.iter().any(|k| k == "timestamp");
         let Some(dates) = window_dates(lo, hi) else { return FileSplit::default() };
         let mut split = FileSplit::default();
         for date in dates {
