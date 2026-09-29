@@ -144,7 +144,7 @@ impl Database {
                 Ok(rewrite) if best.as_ref().is_none_or(|(_, held)| rewrite.covered_micros > held.covered_micros) => best = Some((grain, rewrite)),
                 Ok(_) => {}
                 // A measure decline outranks whatever an earlier spec reported; a sub-grain
-                // refusal is structural, so it must not mask a finer tier's actual gap; and a
+                // refusal awaits a rebuild, so it must not mask a finer tier's actual gap; and a
                 // replacement tier with no cells yet must not mask why the tier it replaces declined.
                 Err(reason) => {
                     use crate::rollup::MissReason::{MeasureNotStored, NotBuilt, SubGrainSlices};
@@ -169,13 +169,6 @@ impl Database {
     async fn rollup_rewrite_for(
         &self, route: crate::rollup::RoutedRollup, _session: &datafusion::execution::context::SessionState,
     ) -> std::result::Result<RollupRewrite, crate::rollup::MissReason> {
-        // A base unit may bisect down to `MIN_SLICE_MICROS`; a coarser base tier then holds
-        // several partial states per bucket under one `(timestamp, id)`, which its read dedups.
-        let base = get_schema(&route.source)
-            .is_some_and(|schema| schema.rollups.iter().any(|spec| spec.table_name(&route.source) == route.target && spec.derive_from.is_none()));
-        if base && route.grain > crate::maintenance_coordinator::MIN_SLICE_MICROS {
-            return Err(crate::rollup::MissReason::SubGrainSlices);
-        }
         let end = route.hi.checked_sub(1).ok_or(crate::rollup::MissReason::UnboundedTime)?;
         let dates = window_dates(route.lo, end).ok_or(crate::rollup::MissReason::IncompleteCoverage)?;
         // A cross-project route cannot see a custom-storage project's table, so its coverage
@@ -248,6 +241,9 @@ impl Database {
                 let date = date.to_string();
                 let key = (project.clone(), route.source.clone(), route.target.clone(), date.clone());
                 let day_start = date_start_micros(&date).ok_or(crate::rollup::MissReason::IncompleteCoverage)?;
+                if output.sub_grain.contains(&(project.clone(), day)) {
+                    miss = miss.or(Some(crate::rollup::MissReason::SubGrainSlices));
+                }
                 let Some(coverage) = self.rollup_coverage.get(&key) else {
                     // Deliberately does NOT set `miss`: after a restart only slice coverage is
                     // recovered, and the slice loop below may still cover the window whole.
@@ -618,7 +614,7 @@ impl Database {
                         let migration = tokio::task::spawn_blocking(move || -> Result<(usize, usize)> {
                             let mut journal = crate::support::lock(&journal);
                             let discarded = journal.migrate_bootstrap_backlog();
-                            let migrated = journal.migrate_derived_slices();
+                            let migrated = journal.migrate_sub_grain_slices();
                             if let Some(cleared) = journal.clear_stale_estimates() {
                                 journal.compact()?;
                                 info!(cleared, event = "maintenance_stale_estimates_cleared");

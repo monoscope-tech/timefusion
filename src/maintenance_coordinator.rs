@@ -256,6 +256,38 @@ pub struct TaskKey {
     pub operation: Operation,
 }
 
+/// The narrowest slice a rollup unit may publish, and the boundary its cuts align to: the
+/// tier's grain. A narrower unit stamps a PARTIAL bucket state under the bucket's
+/// `(timestamp, id)`, which the tier read's keep-one dedup cannot combine.
+pub(crate) fn rollup_unit_grain(source: &str, table: &str, operation: Operation) -> i64 {
+    let declared = || crate::schema::get_schema(source)?.rollups.iter().find(|spec| spec.table_name(source) == table)?.grain_micros();
+    match operation {
+        Operation::BaseRollup => declared().unwrap_or(MIN_SLICE_MICROS).max(MIN_SLICE_MICROS),
+        Operation::DerivedRollup => declared().unwrap_or(DERIVED_SLICE_MICROS).max(MIN_SLICE_MICROS),
+        _ => MIN_SLICE_MICROS,
+    }
+}
+
+impl TaskKey {
+    fn rollup_grain(&self) -> i64 {
+        rollup_unit_grain(&self.source, &self.physical_table, self.operation)
+    }
+
+    /// Widened outward to whole grains of an hour-grain tier; minute tiers and every
+    /// other operation are left as minted.
+    fn grain_aligned(&self) -> Self {
+        let grain = self.rollup_grain();
+        let slice = match grain > MIN_SLICE_MICROS {
+            true => TimeSlice {
+                start_micros: self.slice.start_micros.div_euclid(grain) * grain,
+                end_micros: self.slice.end_micros.saturating_add(grain - 1).div_euclid(grain) * grain,
+            },
+            false => self.slice,
+        };
+        Self { slice, ..self.clone() }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize, strum::IntoStaticStr)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskState {
@@ -322,7 +354,7 @@ impl MaintenanceTask {
     }
 
     /// A freshly minted Pending unit with no history.
-    fn pending(key: TaskKey, deadline_micros: i64, estimated_decoded_bytes: u64, created_unix_ms: u64) -> Self {
+    pub(crate) fn pending(key: TaskKey, deadline_micros: i64, estimated_decoded_bytes: u64, created_unix_ms: u64) -> Self {
         Self {
             key,
             state: TaskState::Pending,
@@ -515,13 +547,12 @@ fn bisect_time_unit(task: &MaintenanceTask, observed_or_estimated_bytes: u64) ->
     // unit's cost is its whole PARTITION, so halving time below a slice sheds
     // nothing; below the floor, shard by KEY instead.
     //
-    // A derived tier's rows are its grain's FINAL states under one (timestamp, id), and the
+    // A rollup tier's rows are its grain's FINAL states under one (timestamp, id), and the
     // tier read keeps one per key, so a sub-grain child would publish a partial that
     // undercounts. Its floor and cut alignment are the grain; at the floor it runs whole.
     let (bisect_floor, align) = match task.key.operation {
         Operation::Dedup => (NORMAL_SLICE_MICROS, MIN_SLICE_MICROS),
-        Operation::DerivedRollup => (DERIVED_SLICE_MICROS, DERIVED_SLICE_MICROS),
-        _ => (MIN_SLICE_MICROS, MIN_SLICE_MICROS),
+        _ => (task.key.rollup_grain(), task.key.rollup_grain()),
     };
     let (start, end, width) = (task.key.slice.start_micros, task.key.slice.end_micros, task.key.slice.width());
     let midpoint = (start.saturating_add(width / 2) / align) * align;
@@ -983,9 +1014,10 @@ impl TaskJournal {
         edges.extend([key.slice.start_micros, key.slice.end_micros]);
     }
 
-    /// Supersede unpublished sub-hour `DerivedRollup` fragments and replace them
-    /// with one aligned hour task. Completed publications are not rewritten.
-    pub fn migrate_derived_slices(&mut self) -> usize {
+    /// Supersede unpublished rollup units that do not span whole grains (the sub-hour
+    /// fragments of an hour tier) and replace them with the aligned units containing them.
+    /// Completed publications are not rewritten.
+    pub fn migrate_sub_grain_slices(&mut self) -> usize {
         let mut replacements: HashMap<TaskKey, (i64, u64, u64)> = HashMap::new();
         let migrated = self.edit_tasks(
             |task| {
@@ -994,18 +1026,12 @@ impl TaskJournal {
                 // which `enqueue_inner` resurrects to Pending — an endless loop.
                 // `parent_measured_bytes` is set only by `split_time_task`, so it is
                 // the exact discriminator.
-                //
-                // NARROWER than an hour, not merely "not an hour": the replacement
-                // key below is the single hour containing the slice START, so `!=`
-                // would collapse a day-wide unit to hour 00 and drop the other 23.
-                task.key.operation == Operation::DerivedRollup
-                    && task.key.slice.width() < DERIVED_SLICE_MICROS
+                task.key.grain_aligned() != task.key
                     && task.parent_measured_bytes.is_none()
                     && !matches!(task.state, TaskState::Complete | TaskState::Superseded)
             },
             |task| {
-                let start = task.key.slice.start_micros.div_euclid(DERIVED_SLICE_MICROS) * DERIVED_SLICE_MICROS;
-                let key = TaskKey { slice: TimeSlice { start_micros: start, end_micros: start.saturating_add(DERIVED_SLICE_MICROS) }, ..task.key.clone() };
+                let key = task.key.grain_aligned();
                 replacements
                     .entry(key)
                     .and_modify(|(deadline, estimate, created)| {
@@ -1762,6 +1788,9 @@ impl TaskJournal {
         &mut self, key: TaskKey, deadline_micros: i64, estimated_decoded_bytes: u64, created_unix_ms: u64, base_tier_present: bool,
         input: Option<InputFootprint>,
     ) -> bool {
+        // Every minting path lands here (census holes, untagged rebuilds, migrations), and a
+        // hole's edge need not fall on the grain.
+        let key = key.grain_aligned();
         if !self.rollup_build_allowed(&key) {
             return false;
         }
@@ -1887,12 +1916,13 @@ impl TaskJournal {
     /// whole hour on every write held its six cells until the hour went quiet, and re-pended
     /// closed cells the write never reached.
     pub fn invalidate_touched(&mut self, invalidation: Invalidation<'_>, touched: &[(i64, i64)]) -> anyhow::Result<()> {
-        let Invalidation { start_micros, end_micros, derived, .. } = invalidation;
+        let Invalidation { source, rollup_table, start_micros, end_micros, derived, .. } = invalidation;
         let normal_slices = TimeSlice::normal_units(start_micros, end_micros)?;
-        let rollup_slices = if derived {
-            let aligned_start = start_micros.div_euclid(DERIVED_SLICE_MICROS) * DERIVED_SLICE_MICROS;
-            let aligned_end = end_micros.saturating_add(DERIVED_SLICE_MICROS - 1).div_euclid(DERIVED_SLICE_MICROS) * DERIVED_SLICE_MICROS;
-            TimeSlice::fixed_units(aligned_start, aligned_end, DERIVED_SLICE_MICROS)?
+        let grain = rollup_unit_grain(source, rollup_table, if derived { Operation::DerivedRollup } else { Operation::BaseRollup });
+        let rollup_slices = if grain > NORMAL_SLICE_MICROS {
+            let aligned_start = start_micros.div_euclid(grain) * grain;
+            let aligned_end = end_micros.saturating_add(grain - 1).div_euclid(grain) * grain;
+            TimeSlice::fixed_units(aligned_start, aligned_end, grain)?
         } else {
             normal_slices.clone()
         };
@@ -3935,12 +3965,13 @@ mod tests {
         journal.state(&key)
     }
 
-    /// Bisected to exhaustion, a derived unit bottoms out at its tier's grain: a narrower
-    /// child would publish a partial hour the keep-one tier read undercounts.
-    #[test_case::test_case(Operation::BaseRollup => MIN_SLICE_MICROS ; "base units bisect to the minute")]
-    #[test_case::test_case(Operation::DerivedRollup => DERIVED_SLICE_MICROS ; "derived units stop at the hour")]
-    fn bisection_leaves_never_go_below_the_operation_floor(operation: Operation) -> i64 {
-        let mut pending = vec![task("p", 0, DAY_MICROS, operation)];
+    /// Bisected to exhaustion, a rollup unit bottoms out at its tier's grain: a narrower
+    /// child would publish a partial bucket the keep-one tier read undercounts.
+    #[test_case::test_case("table", Operation::BaseRollup => MIN_SLICE_MICROS ; "base units bisect to the minute")]
+    #[test_case::test_case("table", Operation::DerivedRollup => DERIVED_SLICE_MICROS ; "derived units stop at the hour")]
+    #[test_case::test_case(SESSIONS, Operation::BaseRollup => DERIVED_SLICE_MICROS ; "an hour base tier stops at its grain")]
+    fn bisection_leaves_never_go_below_the_operation_floor(table: &str, operation: Operation) -> i64 {
+        let mut pending = vec![in_logs(task_in(table, "p", 0, DAY_MICROS, operation))];
         let mut leaves = Vec::new();
         while let Some(unit) = pending.pop() {
             match bisect_time_unit(&unit, 2 * MAX_DECODED_BYTES) {
@@ -4161,6 +4192,37 @@ mod tests {
 
     fn task(project: &str, start: i64, end: i64, operation: Operation) -> MaintenanceTask {
         task_in("table", project, start, end, operation)
+    }
+
+    const SESSIONS: &str = "otel_logs_and_spans_rollup_sessions_1h_v2";
+
+    /// A unit of a real source, so its tier's declared grain applies.
+    fn in_logs(mut unit: MaintenanceTask) -> MaintenanceTask {
+        unit.key.source = "otel_logs_and_spans".into();
+        unit
+    }
+
+    /// Every way a unit of an hour base tier is minted lands on whole hours: a write's
+    /// invalidation, an arbitrary enqueued hole, and a legacy 10-minute fragment at boot.
+    #[test]
+    fn an_hour_base_tier_is_only_ever_minted_in_whole_hours() {
+        const HOUR: i64 = DERIVED_SLICE_MICROS;
+        let (_dir, mut journal) = new_journal();
+        journal
+            .invalidate(Invalidation {
+                source: "otel_logs_and_spans",
+                ..invalidation(SESSIONS, HOUR + NORMAL_SLICE_MICROS, HOUR + 2 * NORMAL_SLICE_MICROS, 0, false)
+            })
+            .expect("invalidate");
+        journal.enqueue(in_logs(task_in(SESSIONS, "p", 3 * HOUR + 7, 4 * HOUR + 1, Operation::BaseRollup)).key, 0, 1, 0);
+        journal.upsert(in_logs(task_in(SESSIONS, "p", 6 * HOUR + NORMAL_SLICE_MICROS, 6 * HOUR + 2 * NORMAL_SLICE_MICROS, Operation::BaseRollup)));
+        assert_eq!(journal.migrate_sub_grain_slices(), 1, "only the legacy fragment migrates");
+        let live = journal
+            .tasks()
+            .filter(|task| task.key.operation == Operation::BaseRollup && task.state == TaskState::Pending)
+            .map(|task| (task.key.slice.start_micros, task.key.slice.end_micros))
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(live, std::collections::BTreeSet::from([(HOUR, 2 * HOUR), (3 * HOUR, 5 * HOUR), (6 * HOUR, 7 * HOUR)]));
     }
 
     /// `task`, with the physical table named — a few assertions turn on the tier.
@@ -4886,7 +4948,8 @@ mod tests {
     /// nothing regenerates.
     #[test]
     fn the_drain_retire_drops_only_sealed_rollup_backlog() {
-        let now = crate::support::now_micros();
+        // Day-aligned, so the derived unit below is whole hours.
+        let now = crate::support::now_micros().div_euclid(DAY_MICROS) * DAY_MICROS;
         let (_dir, mut journal) = new_journal();
         let key = |start: i64, op| task("p", start, start + DAY_MICROS, op).key;
         // The drain's shape: day-wide sealed-date rollup work.
@@ -5107,7 +5170,7 @@ mod tests {
         journal.checkpoint().expect("checkpoint");
 
         let mut journal = TaskJournal::load(dir.path()).expect("journal to migrate");
-        assert_eq!(journal.migrate_derived_slices(), 1, "only the sub-hour fragment may migrate");
+        assert_eq!(journal.migrate_sub_grain_slices(), 1, "only the sub-hour fragment may migrate");
         journal.checkpoint().expect("migration checkpoint");
 
         // The migration must SURVIVE a restart, so assertions read the reloaded journal.
@@ -6577,9 +6640,11 @@ mod tests {
         let now = 10 * DAY_MICROS;
         for deadline in [now - 1, now + 60_000_000] {
             let (dir, mut journal) = new_journal();
-            let retry = task("p", DAY_MICROS, DAY_MICROS + NORMAL_SLICE_MICROS, operation).key;
-            let neighbour = task("p", DAY_MICROS + NORMAL_SLICE_MICROS, DAY_MICROS + 2 * NORMAL_SLICE_MICROS, operation).key;
-            let other = task("q", DAY_MICROS, DAY_MICROS + NORMAL_SLICE_MICROS, operation).key;
+            // A derived unit is minted in whole hours.
+            let width = if operation == Operation::DerivedRollup { DERIVED_SLICE_MICROS } else { NORMAL_SLICE_MICROS };
+            let retry = task("p", DAY_MICROS, DAY_MICROS + width, operation).key;
+            let neighbour = task("p", DAY_MICROS + width, DAY_MICROS + 2 * width, operation).key;
+            let other = task("q", DAY_MICROS, DAY_MICROS + width, operation).key;
             for key in [&retry, &neighbour, &other] {
                 journal.enqueue(key.clone(), 0, 1, 0);
             }
@@ -6594,7 +6659,7 @@ mod tests {
             let expected = (TaskState::Retry, 1, deadline, Some(reason.to_owned()));
             let loaded = TaskJournal::load(dir.path()).expect("reload");
             assert_eq!(retry_state(&loaded, "coarsening must retain the retry"), expected);
-            assert!(loaded.tasks().any(|t| t.key.project_id == "q" && t.key.slice.width() > NORMAL_SLICE_MICROS), "unrelated pending work still coarsens");
+            assert!(loaded.tasks().any(|t| t.key.project_id == "q" && t.key.slice.width() > width), "unrelated pending work still coarsens");
             assert!(
                 !loaded.tasks().any(|t| t.key.project_id == "p"
                     && t.key != retry

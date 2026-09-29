@@ -1997,12 +1997,14 @@ async fn a_count_of_a_nullable_expression_is_not_served_as_the_row_count() -> Re
     Ok(())
 }
 
-/// A non-derived 1h tier is built from 10-minute slices, and each slice stamps its
-/// PARTIAL state with the bucket start under a slice-blind `id`, so the tier read's
-/// `(timestamp, id)` dedup keeps one partial per bucket. Routing it undercounts.
+/// A non-derived 1h tier is built at its grain: its 10-minute mints land as ONE hour unit,
+/// and a republished hour retires the file it replaces, so the tier read's `(timestamp, id)`
+/// dedup never sees two states of one bucket. Slices cut below the grain before that rule
+/// (W40: routed 1 vs raw 4) are refused as proof until a whole-hour rebuild replaces them.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_subgrain_sliced_tier_is_not_routed_over_its_partial_states() -> Result<()> {
-    use crate::maintenance_coordinator::{NORMAL_SLICE_MICROS, Operation, TaskKey, TimeSlice};
+async fn a_sub_grain_tier_routes_only_over_whole_grain_slices() -> Result<()> {
+    use crate::maintenance_coordinator::{MaintenanceTask, NORMAL_SLICE_MICROS, Operation, TAG_SLICE_END, TAG_SLICE_START, TaskKey, TaskState, TimeSlice};
+    use crate::rollup::MissReason::{NotBuilt, SubGrainSlices};
     const HOUR: i64 = 3_600_000_000;
     let db = Arc::new(Database::with_config(rollup_backfill_config("subgrain-partials", 35)).await?);
     db.cancel_maintenance();
@@ -2010,7 +2012,7 @@ async fn a_subgrain_sliced_tier_is_not_routed_over_its_partial_states() -> Resul
     let day = (Utc::now() - chrono::Duration::days(3)).date_naive();
     let day_start = midnight_micros(day);
     let noon = day_start + 12 * HOUR;
-    for (i, offset) in [0, 25, 35, 55].into_iter().enumerate() {
+    for (i, offset) in [0, 25].into_iter().enumerate() {
         insert_a_span(&db, &project, &format!("s{i}"), noon + offset * 60_000_000).await?;
     }
     db.run_unit_once("otel_logs_and_spans", &project, day, Operation::BaseRollup, 24, 0, None).await?;
@@ -2022,49 +2024,114 @@ async fn a_subgrain_sliced_tier_is_not_routed_over_its_partial_states() -> Resul
         .find(|spec| spec.name.as_deref() == Some("sessions_1h_v1"))
         .expect("tier")
         .table_name("otel_logs_and_spans");
-    for start in (noon..noon + HOUR).step_by(NORMAL_SLICE_MICROS as usize) {
-        let key = TaskKey {
+    let key = |start: i64, width: i64| -> Result<TaskKey> {
+        Ok(TaskKey {
             physical_table: sessions.clone(),
             source: "otel_logs_and_spans".into(),
             project_id: project.clone(),
-            slice: TimeSlice::new(start, start + NORMAL_SLICE_MICROS)?,
+            slice: TimeSlice::new(start, start + width)?,
             operation: Operation::BaseRollup,
-        };
-        db.journal().enqueue(key.clone(), 0, crate::maintenance_coordinator::MAX_DECODED_BYTES, 0);
-        assert!(db.run_coordinator_rollup_selected(crate::database::maintain::TaskSelection::Exact(&key)).await?);
-    }
+        })
+    };
+    let run = |key: TaskKey| {
+        let db = Arc::clone(&db);
+        async move {
+            assert!(db.run_coordinator_rollup_selected(crate::database::maintain::TaskSelection::Exact(&key)).await?);
+            assert_eq!(db.journal().state(&key), Some(TaskState::Complete), "{:?} published", key.slice);
+            Result::<()>::Ok(())
+        }
+    };
+    // The six 10-minute mints of one hour become the hour itself.
+    let publish_hour = |hour: i64| {
+        let (key, run, sessions) = (&key, &run, &sessions);
+        let db = Arc::clone(&db);
+        async move {
+            for start in (hour..hour + HOUR).step_by(NORMAL_SLICE_MICROS as usize) {
+                db.journal().enqueue(key(start, NORMAL_SLICE_MICROS)?, 0, crate::maintenance_coordinator::MAX_DECODED_BYTES, 0);
+            }
+            let queued = db
+                .journal()
+                .tasks()
+                .filter(|task| &task.key.physical_table == sessions && task.state == TaskState::Pending)
+                .map(|task| task.key.slice)
+                .collect::<Vec<_>>();
+            assert_eq!(queued, [key(hour, HOUR)?.slice], "one whole-hour unit, never a sub-grain one");
+            run(key(hour, HOUR)?).await
+        }
+    };
+    let live_slices = || {
+        let db = Arc::clone(&db);
+        let (project, sessions) = (project.clone(), sessions.clone());
+        async move {
+            let adds = live_adds(&db.resolve_table(&project, &sessions).await?).await;
+            let tag = |add: &deltalake::kernel::Add, name: &str| add.tags.as_ref()?.get(name)?.as_deref()?.parse::<i64>().ok();
+            Result::<Vec<_>>::Ok(adds.iter().filter_map(|add| Some((tag(add, TAG_SLICE_START)?, tag(add, TAG_SLICE_END)?))).sorted().collect())
+        }
+    };
 
     let mut ctx = Arc::clone(&db).create_session_context();
     db.setup_session_context(&mut ctx)?;
-    use crate::rollup::MissReason::{NotBuilt, SubGrainSlices};
     let render = |batches: &[RecordBatch]| arrow::util::pretty::pretty_format_batches(batches).map(|table| table.to_string());
     let refusals = || crate::observability::maintenance_stats().rollup_miss_sub_grain_slices.load(std::sync::atomic::Ordering::Relaxed);
-    // Only the session tiers carry the session dimension; the others still route, and on
-    // an unbuilt day the refusal must not mask the finer tier's own reason.
-    for (group, bucket, lo, want) in [
-        ("attributes___session___id", "1 hours", noon, Err(SubGrainSlices)),
-        ("status_code", "1 hours", noon, Ok(Some("3600000000us".to_string()))),
-        ("status_code", "10 minutes", noon, Ok(Some("60000000us".to_string()))),
-        ("resource___service___name", "1 hours", noon - 24 * HOUR, Err(NotBuilt)),
-    ] {
-        let sql = format!(
-            "SELECT time_bucket('{bucket}', timestamp) AS tb, {group}, COUNT(*) AS c FROM otel_logs_and_spans WHERE project_id = '{project}' \
-             AND timestamp >= to_timestamp_micros({}) AND timestamp < to_timestamp_micros({}) GROUP BY 1, 2 ORDER BY 1, 2",
-            lo - 2 * HOUR,
-            lo + 2 * HOUR
-        );
-        let state = ctx.state();
-        let plan = state.optimize(&state.create_logical_plan(&sql).await?)?;
-        let routed = db.rollup_sql(&plan, &state).await.map(|rewrite| rewrite.map(|rewrite| rewrite.grain));
-        let before = refusals();
-        assert_eq!(
-            render(&ctx.sql(&sql).await?.collect().await?)?,
-            render(&db.query_delta_only(&sql).await?)?,
-            "{group}/{bucket}: must answer exactly as raw ({routed:?})"
-        );
-        assert_eq!(routed, want, "{group}/{bucket}");
-        assert_eq!(refusals() > before, want == Err(SubGrainSlices), "{group}/{bucket}: only the refusal is counted as one");
+    type Case = (&'static str, &'static str, (i64, i64), std::result::Result<Option<String>, crate::rollup::MissReason>);
+    let check = |cases: Vec<Case>| {
+        let (db, ctx, project) = (Arc::clone(&db), ctx.clone(), project.clone());
+        async move {
+            for (group, bucket, (lo, hi), want) in cases {
+                let sql = format!(
+                    "SELECT time_bucket('{bucket}', timestamp) AS tb, {group}, COUNT(*) AS c FROM otel_logs_and_spans WHERE project_id = '{project}' \
+                     AND timestamp >= to_timestamp_micros({lo}) AND timestamp < to_timestamp_micros({hi}) GROUP BY 1, 2 ORDER BY 1, 2"
+                );
+                let state = ctx.state();
+                let plan = state.optimize(&state.create_logical_plan(&sql).await?)?;
+                let routed = db.rollup_sql(&plan, &state).await.map(|rewrite| rewrite.map(|rewrite| rewrite.grain));
+                let before = refusals();
+                assert_eq!(
+                    render(&ctx.sql(&sql).await?.collect().await?)?,
+                    render(&db.query_delta_only(&sql).await?)?,
+                    "{group}/{bucket}: must answer exactly as raw ({routed:?})"
+                );
+                assert_eq!(routed, want, "{group}/{bucket}");
+                assert_eq!(refusals() > before, want == Err(SubGrainSlices), "{group}/{bucket}: only the refusal is counted as one");
+            }
+            Result::<()>::Ok(())
+        }
+    };
+    let hourly = || Ok(Some("3600000000us".to_string()));
+    let around = |at: i64| (at - 2 * HOUR, at + 2 * HOUR);
+
+    // An hour published before all its rows landed, then republished complete: exact at
+    // both points, and the republish REPLACES the earlier file rather than joining it.
+    publish_hour(noon).await?;
+    check(vec![("attributes___session___id", "1 hours", around(noon), hourly())]).await?;
+    for (i, offset) in [35, 55].into_iter().enumerate() {
+        insert_a_span(&db, &project, &format!("late{i}"), noon + offset * 60_000_000).await?;
     }
+    db.run_unit_once("otel_logs_and_spans", &project, day, Operation::BaseRollup, 24, 0, None).await?;
+    db.run_unit_once("otel_logs_and_spans", &project, day, Operation::DerivedRollup, 24, 0, None).await?;
+    publish_hour(noon).await?;
+    assert_eq!(live_slices().await?, [(noon, noon + HOUR)], "the republished hour retired the file it supersedes");
+    check(vec![
+        ("attributes___session___id", "1 hours", around(noon), hourly()),
+        ("status_code", "1 hours", around(noon), hourly()),
+        ("status_code", "10 minutes", around(noon), Ok(Some("60000000us".to_string()))),
+        ("resource___service___name", "1 hours", around(noon - 24 * HOUR), Err(NotBuilt)),
+    ])
+    .await?;
+
+    // Partials a pre-fix build left behind, as a legacy journal still holds them.
+    let one = noon + HOUR;
+    for (i, offset) in [0, 25, 35, 55].into_iter().enumerate() {
+        insert_a_span(&db, &project, &format!("old{i}"), one + offset * 60_000_000).await?;
+    }
+    for start in (one..one + HOUR).step_by(NORMAL_SLICE_MICROS as usize) {
+        db.journal().upsert(MaintenanceTask::pending(key(start, NORMAL_SLICE_MICROS)?, 0, 0, 0));
+        run(key(start, NORMAL_SLICE_MICROS)?).await?;
+    }
+    check(vec![("attributes___session___id", "1 hours", (noon, one + HOUR), Err(SubGrainSlices))]).await?;
+    publish_hour(one).await?;
+    assert_eq!(live_slices().await?, [(noon, noon + HOUR), (one, one + HOUR)], "the hour retired every partial inside it");
+    check(vec![("attributes___session___id", "1 hours", (noon, one + HOUR), hourly())]).await?;
     Ok(())
 }
 
@@ -3954,10 +4021,13 @@ async fn maintenance_reconciliation_recovers_expired_history(valid_partition_met
 /// `(base tiers, derived tiers)` DECLARED for `otel_logs_and_spans`. Task-count
 /// expectations derive from this rather than a literal, so adding a tier is not a
 /// spurious failure.
-fn declared_rollup_tiers() -> (usize, usize) {
+/// `(minute base, hour base, derived)` tiers: an hour tier mints one unit per hour, a
+/// minute tier one per 10-minute cell.
+fn declared_rollup_tiers() -> (usize, usize, usize) {
     let rollups = &crate::schema::get_schema("otel_logs_and_spans").expect("schema").rollups;
     let derived = rollups.iter().filter(|spec| spec.derive_from.is_some()).count();
-    (rollups.len() - derived, derived)
+    let hourly = rollups.iter().filter(|spec| spec.derive_from.is_none() && spec.grain_micros() > Some(60_000_000)).count();
+    (rollups.len() - derived - hourly, hourly, derived)
 }
 
 /// Reconciling a missed commit must invalidate only the hours the commit's files
@@ -3982,13 +4052,13 @@ async fn reconcile_enqueues_only_the_hours_a_missed_commit_touched() -> Result<(
 
     let journal = db.maintenance_tasks.lock().unwrap();
     let tasks = journal.tasks().filter(|task| task.key.project_id == project).collect::<Vec<_>>();
-    let (base, derived) = declared_rollup_tiers();
-    assert_eq!(tasks.len(), 6 + 6 * base + derived, "one touched hour: 6 dedup + 6 per base tier + 1 per derived tier, not 312 for the whole day");
+    let (base, hourly, derived) = declared_rollup_tiers();
+    assert_eq!(tasks.len(), 6 + 6 * base + hourly + derived, "one touched hour: 6 dedup + 6 per minute tier + 1 per hour tier, not 312 for the whole day");
     assert!(
         tasks.iter().all(|task| task.key.slice.start_micros >= hour_start && task.key.slice.end_micros <= hour_start + 3_600_000_000),
         "every reconciled task must lie inside the touched hour; day {day} starts {day_start}"
     );
-    assert_eq!(queued, base + derived, "one dirty hour x one enqueue per declared rollup spec");
+    assert_eq!(queued, base + hourly + derived, "one dirty hour x one enqueue per declared rollup spec");
     Ok(())
 }
 
@@ -4191,12 +4261,12 @@ async fn first_rollup_invalidation_enqueues_only_the_touched_hour() -> Result<()
 
     let journal = db.maintenance_tasks.lock().unwrap();
     let counts = journal.tasks().counts_by(|task| task.key.operation);
-    let (base, derived) = declared_rollup_tiers();
+    let (base, hourly, derived) = declared_rollup_tiers();
     assert_eq!(counts.get(&Operation::Dedup), Some(&6));
-    assert_eq!(counts.get(&Operation::BaseRollup), Some(&(6 * base)));
+    assert_eq!(counts.get(&Operation::BaseRollup), Some(&(6 * base + hourly)));
     assert_eq!(counts.get(&Operation::DerivedRollup), Some(&derived));
     assert_eq!(counts.get(&Operation::HotPacking), None, "ingest must not mint file-hygiene work; the debt planner owns it");
-    assert_eq!(journal.tasks().count(), 6 + 6 * base + derived, "one touched hour, not 456 full-day tasks");
+    assert_eq!(journal.tasks().count(), 6 + 6 * base + hourly + derived, "one touched hour, not 456 full-day tasks");
     Ok(())
 }
 

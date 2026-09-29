@@ -93,6 +93,8 @@ impl RollupOutputProof {
 pub(super) struct RollupOutputCoverage {
     populated: HashMap<(String, chrono::NaiveDate, String), Vec<(i64, i64)>>,
     empty: HashMap<(String, chrono::NaiveDate, String), Vec<(i64, i64)>>,
+    /// Cells whose sub-grain slices were refused as proof.
+    pub(super) sub_grain: HashSet<BackfillCell>,
 }
 
 impl RollupOutputCoverage {
@@ -1204,6 +1206,13 @@ impl Database {
         for ranges in occupied.values_mut().chain(unproven.values_mut()) {
             *ranges = crate::write::mem_buffer::merge_ranges(std::mem::take(ranges));
         }
+        // A base tier coarser than a minute once cut its units below the grain; each such
+        // slice holds a PARTIAL state under the bucket's `(timestamp, id)`.
+        let grain = get_schema(source)
+            .and_then(|schema| schema.rollups.iter().find(|spec| spec.table_name(source) == target && spec.derive_from.is_none()))
+            .and_then(|spec| spec.grain_micros())
+            .filter(|grain| *grain > crate::maintenance_coordinator::MIN_SLICE_MICROS);
+        let mut sub_grain = HashSet::new();
         let mut output = self
             .rollup_slice_coverage
             .iter()
@@ -1253,6 +1262,14 @@ impl Database {
                 if !present {
                     return None;
                 }
+                // Only LIVE, populated output can be a partial: a retired partial's entry
+                // outlives its files, and an empty slice holds no state at all.
+                if coverage.output != RollupOutputEvidence::Empty
+                    && grain.is_some_and(|grain| entry.key().3.rem_euclid(grain) != 0 || entry.key().4.rem_euclid(grain) != 0)
+                {
+                    sub_grain.insert(cell);
+                    return None;
+                }
                 // Source emptiness cannot authorize old aggregate rows in the prefix.
                 let start = partitions
                     .get(&(project.clone(), date.clone()))
@@ -1271,6 +1288,7 @@ impl Database {
         for ranges in output.populated.values_mut().chain(output.empty.values_mut()) {
             *ranges = crate::write::mem_buffer::merge_ranges(std::mem::take(ranges));
         }
+        output.sub_grain = sub_grain;
         Ok(output)
     }
 

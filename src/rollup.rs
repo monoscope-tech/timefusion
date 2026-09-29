@@ -54,8 +54,9 @@ pub enum MissReason {
     /// The cell is fresh, but its FILES do not carry a measure the query needs.
     /// Distinct from `StaleCoverage`: nothing moved, the build never wrote the column.
     MeasureNotStored,
-    /// A base tier coarser than the finest slice its units may be cut to: slices
-    /// write partial states the tier read's `(timestamp, id)` dedup cannot combine.
+    /// A base tier cell holding slices narrower than its grain, cut before units were
+    /// held to the grain: each is a partial state the tier read's `(timestamp, id)`
+    /// dedup cannot combine, so none proves coverage until a whole-grain rebuild.
     SubGrainSlices,
 }
 
