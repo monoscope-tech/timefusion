@@ -135,3 +135,39 @@ All shipped with CI green on the exact commit. Names match the workstream sheet.
 
 **In flight:** `batch/2b-v4fallback` (`22895ce9` = W47 2b `6e4e9a6e` + `0e003824`), CI run 36481759922. It pushes via `gated_push.sh` when green. v4 widening to 09-14 is due ≥ 2026-09-29 10:00 UTC. Status at 20:48: 7 contiguous days, 104/116 usable; memory 18/120 GiB; `admission_refused_state_bytes_total` 2,143 in 9 h.
 
+## 9. Night of 2026-09-28/29 (timefusion-21) — shipbubble focus
+
+**Shipbubble (28f62f01) now, fresh process (image `4d314718`, ~2 min after boot):**
+
+| Query | Before tonight (fresh boot, 21:30) | After `1e79a30b` (00:57): cold → warm |
+|---|---|---|
+| 24h status breakdown | 15.2 s → 7.2 s → 1.2 s | **1.4 s → 0.3 s → 0.3 s** |
+| 24h by service | 5.9 s → 1.3 s → 1.0 s | **0.3 s → 0.3 s → 0.4 s** |
+| 6h window | 0.8 s → 0.6 s → 0.5 s | 0.9 s → 0.5 s → 0.5 s |
+
+All routed hybrid; `foyer.insert_bypassed` did not move. Script: `scratchpad/ship/` of session 66d75f9a (psql loop with rollup-counter deltas).
+
+**What was actually making shipbubble slow (measured; it was not "maintenance not keeping up" in the scheduling sense):**
+1. **Every hybrid dashboard skipped the cache on first view (W51).** The raw leg of a hybrid rewrite filters `(range) OR (range)`; `extract_time_range_from_filters` only understood top-level comparisons, so the lookback was "unbounded" and `gate_if_wide` set `bypass_cache`. Only the second sighting was admitted. Fixed by bounding AND/OR recursively (hull for OR, sound for every caller).
+2. **The boot preload fetched one file at a time** (~11 MB/s) and hit its 5-minute budget before reaching shipbubble (W52: 8-way concurrency, exact byte reservation, newest-day round-robin). New boot: 5.17 GB in ~1 min, no budget stop.
+3. **Tantivy index cache thrash (W53):** the prefetch working set is ~300–350 GB against a 200 GB budget, so the reaper freed ~100–135 GB every 10 min and point lookups paid S3 index downloads at planning (12–16 s cold for trace lookups). Default raised to 400 GB.
+4. **Files with deletion vectors are never rewritten (open, W54).** Nothing in prod strips DVs. Today's partition: Talstack 74.6% masked rows (queries decode ~4x live rows), shipbubble 17.5%, 87576849 41.7%; 56 stranded DV files (11.7 GiB) on sealed days. Point lookups into DV files read whole files (the W43 design).
+
+**Shipped tonight:**
+- 21:15 `310636d4`: W47 2b boot preload + v4-fallback relabel.
+- 00:54 `1e79a30b`: W49 (rollup rewrite cast: `max(value::float)` Float32 vs Float64 no longer falls back to raw), W50 (Dedup `processed_bytes` records measured bytes, not the 0 creation estimate), W51, W52, W53, **W55 (wrong-answer fix: `count(<expr>)` was served from the stored row count — 24 vs raw 12 in the test; now declines unless the argument is `*`, a non-null literal, or a column with a stored non-null count)**.
+- `AGENTS.md`: prefer local signoff (`make ci-signoff`) over remote CI.
+
+**Local signoff timings (for planning):** a full `make ci-signoff` took 69–90 min tonight, but under heavy contention (3–5 builds/signoffs in parallel, load 70–157). Test ≈ 25 min, e2e ≈ 4 min, pg-smoke dominated by its release image build. Run one signoff at a time. `make ci-signoff` also pushes the production image, so the deploy that follows reuses it (~1 min to Ready).
+
+**Other findings (not shipbubble):**
+- **Issue/pattern charts time out (Talstack 6297304f):** `jsonb_path_exists(to_jsonb(hashes), …)` charts hit the 90 s timeout ~150 times in 10 h (one auto-refreshing tab). Cause: today's partition is 133.6M rows in 574 time-overlapping files with 74.6% DV-masked rows, so nothing prunes. Memory correction: `readmit_mutable_filters` does not run on prod's buffered path, so the `hashes` predicate is never pushed down. Levers: W54 (strip DVs), monoscope `array_has` lowering (`monoscope/plans/array-has-lowering.md`, ~40x cheaper predicate), and monoscope backing off auto-refresh after a timeout (owner's call).
+- **Issue page stalls up to 77 s:** monoscope `Issues.hs:488-497` looks up the session id by trace with `tryWithin Nothing` (no timeout); sibling lookups use 5 s. Mostly the Demo project. Owner's call.
+- **Rollup hit rate** reads ~5%, but ~88% of misses are shapes no tier can serve (TF self-alerts, `unnest(hashes)` jobs, `hashes`/`body`-regex filters). Dashboard shapes hit ~30–35%.
+
+**Open for the morning:**
+1. **W54 DV-strip** (`ws/w54-dv-strip`, DARK flag, building/signing off): 1:1 rewrite of DV files with an exact rollup-witness carry and one planner/packer admission rule. It changes maintenance behaviour (burst ≈ 11.7 GiB sealed + ~5.4 GiB today), so enabling it is the owner's decision. Review the DML-DELETE question in its report first.
+2. **v4 widen to 09-14** (handover 2 §2) is due ≥ 10:00 UTC; check `admission_refused_state_bytes_total` first (2,143 in 9 h yesterday).
+3. **Recheck `journal_lock_wait`** on a ≥1 h process (handover mature figure ~7 s/min; tonight's 9 h process implied ~14 s/min).
+4. W48 (be87ebc1 single-partition skew), drop-v3, the W40 proper fix and the gate on a clean day remain as in §5.
+
