@@ -175,3 +175,19 @@ All routed hybrid; `foyer.insert_bypassed` did not move. Script: `scratchpad/shi
 3. **Recheck `journal_lock_wait`** on a ≥1 h process (handover mature figure ~7 s/min; tonight's 9 h process implied ~14 s/min).
 4. **W48 appears resolved** by W44/W51: be87ebc1 24h status now 6.1 s cold → 0.8 s → 0.7 s warm (was 7.6 s warm). drop-v3, the W40 proper fix and the gate on a clean day remain as in §5.
 
+**1 h check on `4d314718` (01:54 UTC, process 58 min old):**
+- Shipbubble: 24h status 1.0 s, 24h by service 0.4 s.
+- Shipbubble trace session lookups (issue-page shape, ±300 s window):
+
+  | Trace age | First run | Second run |
+  |---|---|---|
+  | 30 min | 0.29 s | 0.28 s |
+  | 20 h | 0.27 s | 0.25 s |
+  | 2 days | 11.1 s | 2.3 s |
+
+  - Before tonight these took 12–45 s cold. The 2-day case still reads whole DV-bearing files: 09-26 and 09-27 are stranded DV days, which W54 would strip.
+- **W53 works:** no tantivy reap has fired on the new container in 57 min (the reap only logs when it removes something), so the prefetch set (~286 GB) now fits the 400 GB budget. The old container freed ~100 GB every 10 min.
+- **Latency:** p50 55 ms, p95 0.17 s (was 0.49 s on the 9 h pre-deploy process), p99 1.4 s.
+- **Pending:** base 243, derived 39, dedup 108 (was 253 at boot).
+- **Journal lock wait ≈ 18 s/min** on this process against the 9 h pre-deploy process's ≈ 14 s/min. It is not a regression from tonight's batch: `coordinator_claim` runs ~371 claims/s on both (≈ 381/s before), `journal_hold` is only ~7% duty (255 s in 58 min), and the wait total is workers queueing behind the claim path. Worth a look alongside the claim fast path (`ws/claim-poll-fastpath` in the earlier queue).
+
