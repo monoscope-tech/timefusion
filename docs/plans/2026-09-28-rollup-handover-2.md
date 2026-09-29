@@ -166,8 +166,12 @@ All routed hybrid; `foyer.insert_bypassed` did not move. Script: `scratchpad/shi
 - **Rollup hit rate** reads ~5%, but ~88% of misses are shapes no tier can serve (TF self-alerts, `unnest(hashes)` jobs, `hashes`/`body`-regex filters). Dashboard shapes hit ~30–35%.
 
 **Open for the morning:**
-1. **W54 DV-strip** (`ws/w54-dv-strip`, DARK flag, building/signing off): 1:1 rewrite of DV files with an exact rollup-witness carry and one planner/packer admission rule. It changes maintenance behaviour (burst ≈ 11.7 GiB sealed + ~5.4 GiB today), so enabling it is the owner's decision. Review the DML-DELETE question in its report first.
+1. **W54 DV-strip — built, signed off, NOT deployed** (`ws/w54-dv-strip` @ `af08d77e`; local `make ci-signoff` all 5 green, test 2451/2451). Flags: `timefusion_dv_strip_enabled` (default false), `_per_interval` 4, `_interval_secs` 600.
+   - **Always on after deploy, even with the flag off:** `carry_rewrite_witness` on every landed compaction with a DV input (incl. fully-masked-file removal), and an exact-count guard that refuses a DV rewrite whose written rows ≠ inputs' physical rows − DV cardinality. Review these before deploying.
+   - **DML question, answered:** both rollup sources are version-append tables; DELETE/UPDATE write tombstones/versions, never DVs (`dml.rs` ~1050/~1132), so every DV on a rollup source is a dedup mask the rollup never counted. Non-version-append sources invalidate hours before their DV lands.
+   - When enabled, watch `dv_rewrites_landed_total`, `dv_rewrite_rows_retired_total`, `rollup_witness_carried_total`, and `dv_strip_plan_sorts_total` (must stay 0). Known limits: carries don't survive a restart; the planner's size estimate sums all DV files in a partition (Talstack: 465), so huge partitions only run when the lane is idle; fully-masked files drain ~1 per tick.
+   - Enabling it is the owner's decision (burst ≈ 11.7 GiB sealed + ~5.4 GiB today).
 2. **v4 widen to 09-14** (handover 2 §2) is due ≥ 10:00 UTC; check `admission_refused_state_bytes_total` first (2,143 in 9 h yesterday).
 3. **Recheck `journal_lock_wait`** on a ≥1 h process (handover mature figure ~7 s/min; tonight's 9 h process implied ~14 s/min).
-4. W48 (be87ebc1 single-partition skew), drop-v3, the W40 proper fix and the gate on a clean day remain as in §5.
+4. **W48 appears resolved** by W44/W51: be87ebc1 24h status now 6.1 s cold → 0.8 s → 0.7 s warm (was 7.6 s warm). drop-v3, the W40 proper fix and the gate on a clean day remain as in §5.
 
