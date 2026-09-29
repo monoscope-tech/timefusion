@@ -5107,26 +5107,6 @@ fn watermark_json_format_invariants() {
     assert!(parsed[1..].iter().all(|p| p.is_none()));
 }
 
-/// Files are written under `project_id=<id>/`, so the path IS the per-project attribution
-/// for a commit that spanned projects. A single-project group returns the list unfiltered.
-#[test]
-fn added_files_attribute_to_their_own_project() {
-    let added = vec![
-        "s3://b/t/project_id=alpha/date=2026-07-29/a.parquet".to_string(),
-        "s3://b/t/project_id=beta/date=2026-07-29/b.parquet".to_string(),
-        "s3://b/t/project_id=alpha/date=2026-07-29/c.parquet".to_string(),
-    ];
-    let split = attribute_added_files(added.clone(), &["alpha", "beta", "gamma"]);
-    assert_eq!(split[0], vec![added[0].clone(), added[2].clone()]);
-    assert_eq!(split[1], vec![added[1].clone()]);
-    assert!(split[2].is_empty(), "a project that added no files gets none of its co-tenants'");
-    // Single project → unfiltered, even without a project_id partition segment.
-    assert_eq!(
-        attribute_added_files(vec!["s3://b/t/date=2026-07-29/x.parquet".to_string()], &["alpha"]),
-        vec![vec!["s3://b/t/date=2026-07-29/x.parquet".to_string()]]
-    );
-}
-
 /// `filesets_for_dates` buckets URIs by their `date=` partition and
 /// pre-seeds every requested date (so the guard can tell "empty" from
 /// "absent"). URIs outside the requested dates are dropped.
@@ -7889,17 +7869,6 @@ async fn count_of(ctx: &SessionContext, sql: &str) -> Result<i64> {
     Ok(batches[0].column(0).as_any().downcast_ref::<arrow::array::Int64Array>().expect("an Int64 aggregate").value(0))
 }
 
-/// One `CoalescedWriteUnit` carrying `batch` plus its own watermark.
-fn coalesced_unit(project: &str, table: &str, batch: RecordBatch, block_id: u64, offset: u64) -> CoalescedWriteUnit {
-    use walrus_rust::WalPosition;
-    CoalescedWriteUnit {
-        project_id: project.to_owned(),
-        table_name: table.to_owned(),
-        batches: vec![batch],
-        watermark: vec![Some(WalPosition { block_id, offset })],
-    }
-}
-
 #[tokio::test]
 async fn dv_scan_preserves_physical_positions_under_file_repartitioning() -> Result<()> {
     use deltalake::delta_datafusion::TableProviderBuilder;
@@ -8385,24 +8354,13 @@ async fn test_delta_has_files_sticky_bit() -> Result<()> {
 /// The write MARKS a path; admission LOOKS ONE UP — if the two strings differ the
 /// feature fails silently. Asserted against what `plan_compaction_debt` reads, the
 /// snapshot's `LogicalFile::path()` (delta-rs stores `Add.path` URL-encoded and
-/// decodes it there), for both the solo and the coalesced commit path.
+/// decodes it there).
 #[serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn write_time_marks_use_the_same_path_strings_admission_reads() -> Result<()> {
     let (db, _ctx, prefix) = setup_test_database().await?;
     let t = "otel_logs_and_spans";
-    let solo = format!("mark-solo-{prefix}");
-    let group: Vec<String> = (0..2).map(|i| format!("mark-grp{i}-{prefix}")).collect();
-
-    insert_span(&db, &solo, t, "s", true).await?;
-    let units: Vec<CoalescedWriteUnit> = group
-        .iter()
-        .enumerate()
-        .map(|(i, p)| coalesced_unit(p, t, json_to_batch(vec![test_span(&format!("g{i}"), "span", p)]).unwrap(), 700 + i as u64, i as u64))
-        .collect();
-    for result in db.insert_records_batches_coalesced(units).await {
-        result.expect("coalesced commit failed");
-    }
+    insert_span(&db, &format!("mark-solo-{prefix}"), t, "s", true).await?;
 
     let table_ref = get_unified_delta_table(db.unified_tables(), t).await.expect("table created");
     let live: HashSet<String> = table_ref.read().await.snapshot()?.log_data().iter().map(|f| f.path().into_owned()).collect();
@@ -8440,124 +8398,19 @@ async fn the_seeding_sweep_reaches_files_that_predate_write_time_marking() -> Re
     Ok(())
 }
 
-/// N default-storage projects flushed in one tick must produce EXACTLY ONE Delta
-/// commit carrying every project's files and watermark, with each project's result
-/// listing only its own files, and every project's rows queryable from that commit.
+/// A custom-storage project has its OWN `_delta_log`, so it must never share the
+/// unified table's commit lock: same `table_lock_key` ⇒ same physical log.
 #[serial]
 #[tokio::test(flavor = "multi_thread")]
-async fn coalesced_commit_spans_projects_in_one_delta_version() -> Result<()> {
-    use walrus_rust::WalPosition;
-    let (db, _ctx, prefix) = setup_test_database().await?;
-    let t = "otel_logs_and_spans";
-    let projects: Vec<String> = (0..3).map(|i| format!("coal{i}-{prefix}")).collect();
-
-    // Create the table first so the version delta measures the coalesced commit alone.
-    db.insert_records_batch(&projects[0], t, vec![json_to_batch(vec![test_span("warm", "warm", &projects[0])])?], true, None).await?;
-    let table_ref = get_unified_delta_table(db.unified_tables(), t).await.expect("table created");
-    let before = table_ref.read().await.version().unwrap_or(0);
-
-    let units: Vec<CoalescedWriteUnit> = projects
-        .iter()
-        .enumerate()
-        .map(|(i, p)| coalesced_unit(p, t, json_to_batch(vec![test_span(&format!("c{i}"), "span", p)]).unwrap(), 100 + i as u64, i as u64))
-        .collect();
-    let results = db.insert_records_batches_coalesced(units).await;
-
-    assert_eq!(results.len(), projects.len(), "one result per unit, in input order");
-    let added: Vec<Vec<String>> = results.into_iter().map(|r| r.expect("coalesced commit failed")).collect();
-
-    let after = table_ref.read().await.version().unwrap_or(0);
-    assert_eq!(after, before + 1, "N default-storage projects must land in ONE Delta commit, got {} commits", after - before);
-
-    // Files are attributed to their own partition path (tantivy/warming inputs stay per project).
-    for (i, project) in projects.iter().enumerate() {
-        assert!(!added[i].is_empty(), "project {project} contributed no files to the coalesced commit");
-        assert!(added[i].iter().all(|u| u.contains(&format!("project_id={project}/"))), "project {project} was handed a co-tenant's files: {:?}", added[i]);
-    }
-
-    // The single commit carries EVERY project's watermark (crash-recovery invariant).
-    let history: Vec<_> = table_ref.read().await.history(Some(1)).try_collect().await?;
-    assert_eq!(history.len(), 1);
-    let shards = 8;
-    for (i, project) in projects.iter().enumerate() {
-        let parsed = parse_watermark_from_json(&history[0].info, shards, project, t);
-        assert_eq!(parsed[0], Some(WalPosition { block_id: 100 + i as u64, offset: i as u64 }), "project {project} lost/mixed up its watermark");
-    }
-    // A project not in the commit inherits nothing.
-    assert!(parse_watermark_from_json(&history[0].info, shards, "outsider", t).iter().all(Option::is_none));
-
-    let files = table_ref.read().await.get_file_uris().map(|it| it.collect::<Vec<_>>()).unwrap_or_default();
-    for project in &projects {
-        assert!(files.iter().any(|u| u.contains(&format!("project_id={project}/"))), "project {project} has no active file after the coalesced commit");
-    }
-    Ok(())
-}
-
-/// A project whose batches need a schema merge must be split OUT of the coalesced
-/// group and committed on its own, not drag every co-tenant through the slow path:
-/// two default projects + one evolving project ⇒ exactly TWO commits.
-#[serial]
-#[tokio::test(flavor = "multi_thread")]
-async fn schema_evolution_project_splits_out_of_the_coalesced_group() -> Result<()> {
-    use datafusion::arrow::{
-        array::{Array, StringArray},
-        datatypes::{DataType, Field, Schema},
-    };
-    let (db, _ctx, prefix) = setup_test_database().await?;
-    let t = "otel_logs_and_spans";
-    let (p1, p2, evolving) = (format!("se1-{prefix}"), format!("se2-{prefix}"), format!("se3-{prefix}"));
-
-    db.insert_records_batch(&p1, t, vec![json_to_batch(vec![test_span("warm", "warm", &p1)])?], true, None).await?;
-    let before = unified_version(&db, t).await;
-
-    // delta-rs' Default-mode RecordBatchWriter cannot evolve schema on a partitioned
-    // table, so a batch with an unknown column has no staged writer and goes solo.
-    let base = json_to_batch(vec![test_span("e1", "span", &evolving)])?;
-    let mut fields: Vec<Field> = base.schema().fields().iter().map(|f| f.as_ref().clone()).collect();
-    fields.push(Field::new("c3_brand_new_column", DataType::Utf8, true));
-    let mut columns: Vec<Arc<dyn Array>> = base.columns().to_vec();
-    columns.push(Arc::new(StringArray::from(vec![Some("evolved")])));
-    let evolved_batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)?;
-
-    let units = vec![
-        coalesced_unit(&p1, t, json_to_batch(vec![test_span("s1", "span", &p1)])?, 1, 0),
-        coalesced_unit(&evolving, t, evolved_batch, 2, 0),
-        coalesced_unit(&p2, t, json_to_batch(vec![test_span("s2", "span", &p2)])?, 3, 0),
-    ];
-    let results = db.insert_records_batches_coalesced(units).await;
-    for (i, r) in results.iter().enumerate() {
-        assert!(r.is_ok(), "unit {i} failed: {:?}", r.as_ref().err());
-    }
-    // Results stay in INPUT order even though the evolving unit committed last.
-    assert!(results[0].as_ref().unwrap().iter().all(|u| u.contains(&format!("project_id={p1}/"))));
-    assert!(results[1].as_ref().unwrap().iter().all(|u| u.contains(&format!("project_id={evolving}/"))));
-    assert!(results[2].as_ref().unwrap().iter().all(|u| u.contains(&format!("project_id={p2}/"))));
-
-    // Three commits would mean no coalescing; one, that the merge path swallowed the co-tenants.
-    let after = unified_version(&db, t).await;
-    assert_eq!(after, before + 2, "expected 1 coalesced + 1 solo schema-evolution commit");
-
-    let table = get_unified_delta_table(db.unified_tables(), t).await.expect("table");
-    let guard = table.read().await;
-    assert!(guard.snapshot()?.schema().fields().any(|f| f.name() == "c3_brand_new_column"), "schema merge never landed");
-    Ok(())
-}
-
-/// A custom-storage project has its OWN `_delta_log` and must never be
-/// coalesced into the shared unified-table commit. The grouping key IS
-/// `table_lock_key`, so isolation is structural: same key ⇒ same physical
-/// log ⇒ safe to share a commit; different key ⇒ separate commit.
-#[serial]
-#[tokio::test(flavor = "multi_thread")]
-async fn custom_storage_project_is_not_coalesced_with_default_storage() -> Result<()> {
+async fn custom_storage_project_gets_its_own_commit_lock() -> Result<()> {
     let (db, _ctx, prefix) = setup_test_database().await?;
     let t = "otel_logs_and_spans";
     let custom = format!("cust-{prefix}");
     register_custom_storage(&db, &custom, t, &format!("custom-{prefix}")).await;
 
     let (a, b) = (db.table_lock_key("proj_a", t).await, db.table_lock_key("proj_b", t).await);
-    assert_eq!(a, b, "default-storage projects share a physical log → one coalesced commit");
-    assert_ne!(db.table_lock_key(&custom, t).await, a, "custom-storage project must group (and commit) separately");
+    assert_eq!(a, b, "default-storage projects share a physical log → one commit lock");
+    assert_ne!(db.table_lock_key(&custom, t).await, a, "custom-storage project must commit under its own lock");
     // Same project on a different table is also a different physical log.
     assert_ne!(db.table_lock_key("proj_a", "otel_metrics").await, a);
     Ok(())
@@ -8626,48 +8479,6 @@ fn provider_versions_retains_recent_and_expires() {
     assert!(ring.get(4, zero).is_none(), "expired versions are not served");
     assert_eq!(ring.prune(zero), PROVIDER_VERSION_RETENTION);
     assert_eq!(ring.len(), 0);
-}
-
-/// Commit coalescing end-to-end through the real stack (bootstrap → WAL → MemBuffer
-/// → flush → Delta → SQL): one commit per tick, every project queryable immediately.
-#[serial]
-#[tokio::test(flavor = "multi_thread")]
-async fn coalesced_flush_e2e_keeps_every_project_queryable() -> Result<()> {
-    // SAFETY: walrus reads WALRUS_DATA_DIR from process env; #[serial] protects it.
-    let prefix = uuid::Uuid::new_v4().to_string()[..8].to_string();
-    let mut cfg = (*create_test_config(&prefix)).clone();
-    cfg.buffer.timefusion_flush_coalesce_commits = true;
-    let cfg = Arc::new(cfg);
-    within(50, async {
-        let b = crate::server::bootstrap(Arc::clone(&cfg)).await?;
-        let t = "otel_logs_and_spans";
-        let projects: Vec<String> = (0..3).map(|i| format!("e2e{i}_{prefix}")).collect();
-
-        // Create the table first so the version delta measures only the flush commit.
-        b.db.insert_records_batch(&projects[0], t, vec![json_to_batch(vec![test_span("warm", "warm", &projects[0])])?], true, None).await?;
-        let before = unified_version(&b.db, t).await;
-
-        // skip_queue=false → WAL + MemBuffer, so the flush tick owns these rows.
-        for (i, project) in projects.iter().enumerate() {
-            insert_span(&b.db, project, t, &format!("row{i}"), false).await?;
-        }
-        let stats = b.buffered_layer.flush_all_now().await?;
-        assert_eq!(stats.buckets_failed, 0, "coalesced e2e flush failed");
-        assert_eq!(stats.buckets_flushed, projects.len() as u64);
-
-        let after = unified_version(&b.db, t).await;
-        assert_eq!(after, before + 1, "three projects flushed in one tick must produce ONE Delta commit");
-
-        for project in &projects {
-            let n = count_of(&b.session_ctx, &format!("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = '{project}'")).await?;
-            let expected = if project == &projects[0] { 2 } else { 1 }; // p0 also has its warm-up row
-            assert_eq!(n, expected, "{project} rows are not queryable after the coalesced commit");
-        }
-
-        b.shutdown.cancel();
-        Ok(())
-    })
-    .await
 }
 
 /// When `force_flush_current_buckets` commits the open bucket to Delta and later

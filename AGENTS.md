@@ -359,7 +359,7 @@ src/
 ├── rollup_journal.rs      # Crash-safe dirty-range journal for rollup maintenance
 ├── database/              # The DB engine — slices of ONE module (`use super::*`)
 │   ├── mod.rs             #   Database, types, construction, session + table resolution
-│   ├── write.rs           #   insert path, coalesced commits, watermarks
+│   ├── write.rs           #   insert path, staged commits, watermarks
 │   ├── compact.rs         #   OPTIMIZE, hot-tail packing, dedup rewrites, sort machinery
 │   ├── rollup.rs          #   maintenance planning, coordinator ticks, rollup waves
 │   ├── maintain.rs        #   dedup sweeps, footer repair, vacuum, shutdown

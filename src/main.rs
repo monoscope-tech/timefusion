@@ -495,9 +495,7 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
     timefusion::write::wal::boot_wal_gc(&cfg.core.wal_dir());
 
     let t_layer = std::time::Instant::now();
-    let mut layer = BufferedWriteLayer::with_config(cfg_arc.clone(), registry)?
-        .with_delta_writer(delta_write_callback)
-        .with_coalesced_delta_writer(timefusion::server::coalesced_delta_write_callback(&db));
+    let mut layer = BufferedWriteLayer::with_config(cfg_arc.clone(), registry)?.with_delta_writer(delta_write_callback);
     info!("bootstrap.phase=buffered_write_layer_init elapsed_ms={}", t_layer.elapsed().as_millis());
     let indexed_tables = cfg.tantivy.indexed_tables();
     let bucket = cfg.aws.aws_s3_bucket.as_deref().unwrap_or_default();

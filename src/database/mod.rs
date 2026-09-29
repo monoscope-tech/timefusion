@@ -2196,25 +2196,6 @@ pub(crate) enum CommitProbe {
     Inconclusive,
 }
 
-/// One (project, table) flush unit handed to [`Database::insert_records_batches_coalesced`].
-pub struct CoalescedWriteUnit {
-    pub project_id: String,
-    pub table_name: String,
-    pub batches: Vec<RecordBatch>,
-    pub watermark: crate::write::DeltaWatermark,
-}
-
-/// A unit whose parquet is uploaded and whose `Add` actions await the shared commit.
-struct StagedUnit {
-    table_ref: Arc<RwLock<DeltaTable>>,
-    schema: &'static crate::schema::TableSchema,
-    dirty_bins: Vec<(String, i64)>,
-    adds: Vec<deltalake::kernel::Action>,
-    stage_store: Arc<dyn object_store::ObjectStore>,
-    /// Lets the coalesced commit mark its output verified-sorted.
-    sorted: bool,
-}
-
 /// Attached to a commit error where landing could not be confirmed. The staged parquet must be left
 /// in place; deleting files a landed commit references creates dangling Adds. A typed marker, not a
 /// message substring: callers test it with `err.chain().any(|c| c.is::<InconclusiveCommit>())`, so a
@@ -2278,25 +2259,6 @@ fn probe_after_timeout(probe: CommitProbe, timed_out: bool) -> CommitProbe {
         (probe, _) => probe,
     }
 }
-
-/// Split a coalesced commit's newly-added file URIs per project — the `project_id=<id>/` path
-/// segment IS the attribution. Single-project groups pass through unfiltered.
-fn attribute_added_files(added: Vec<String>, projects: &[&str]) -> Vec<Vec<String>> {
-    if projects.len() == 1 {
-        return vec![added];
-    }
-    projects
-        .iter()
-        .map(|p| {
-            let marker = format!("project_id={p}/");
-            added.iter().filter(|u| u.contains(&marker)).cloned().collect()
-        })
-        .collect()
-}
-
-/// A prepared write plus the PHYSICAL-table key (`table_lock_key`) it must be
-/// coalesced under.
-type PreparedForPhysicalTable = (PreparedWrite, (String, String));
 
 /// Output of [`Database::prepare_staged_write`] — see its doc comment.
 struct PreparedWrite {

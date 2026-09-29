@@ -565,21 +565,6 @@ impl IngestDedupIndex {
     }
 }
 
-/// One (project, table) group of a flush tick, handed to the coalescing writer
-/// so all of them share ONE Delta commit per physical table.
-pub struct FlushUnit {
-    pub project_id: String,
-    pub table_name: String,
-    pub batches: Vec<RecordBatch>,
-    pub watermark: DeltaWatermark,
-}
-
-/// Cross-project flush commit coalescing: writes every unit's parquet but
-/// emits ONE commit per physical Delta table. MUST return exactly one result
-/// per input unit, in input order — each drives that project's own
-/// settle/requeue, so a short or reordered vector would strand buckets.
-pub type DeltaCoalescedWriteCallback = Arc<dyn Fn(Vec<FlushUnit>) -> futures::future::BoxFuture<'static, Vec<anyhow::Result<Vec<String>>>> + Send + Sync>;
-
 /// Folds every per-bucket `FlushableBucket` for one (project_id, table_name)
 /// into a single combined commit.
 #[derive(Default)]
@@ -677,9 +662,6 @@ pub struct BufferedWriteLayer {
     /// ask this process to relinquish the single-writer WAL lock.
     deploy_handoff_ready: AtomicBool,
     delta_write_callback: Option<DeltaWriteCallback>,
-    /// Used instead of `delta_write_callback` when
-    /// `TIMEFUSION_FLUSH_COALESCE_COMMITS` is on.
-    coalesced_write_callback: Option<DeltaCoalescedWriteCallback>,
     tantivy_index_callback: Option<TantivyIndexCallback>,
     background_tasks: Mutex<Vec<JoinHandle<()>>>,
     flush_lock: Mutex<()>,
@@ -888,7 +870,6 @@ impl BufferedWriteLayer {
             handoff_generation: AtomicU64::new(0),
             deploy_handoff_ready: AtomicBool::new(false),
             delta_write_callback: None,
-            coalesced_write_callback: None,
             tantivy_index_callback: None,
             background_tasks: Mutex::new(Vec::new()),
             flush_lock: Mutex::new(()),
@@ -940,11 +921,6 @@ impl BufferedWriteLayer {
 
     pub fn with_delta_writer(mut self, callback: DeltaWriteCallback) -> Self {
         self.delta_write_callback = Some(callback);
-        self
-    }
-
-    pub fn with_coalesced_delta_writer(mut self, callback: DeltaCoalescedWriteCallback) -> Self {
-        self.coalesced_write_callback = Some(callback);
         self
     }
 
@@ -2327,19 +2303,14 @@ impl BufferedWriteLayer {
         // collect() barrier: the shutdown flush DROPS this call on deadline, so
         // behind a barrier an already-landed commit would lose its
         // drain/hold-release/cursor advance and re-replay as duplicates.
-        let group_stats: Vec<(bool, FlushStats)> = match self.coalesced_write_callback.clone().filter(|_| self.config.buffer.flush_coalesce_commits()) {
-            Some(callback) => self.flush_groups_coalesced(groups, callback).await,
-            None => {
-                stream::iter(groups)
-                    .map(|(combined, token)| async move {
-                        let result = self.flush_bucket(&combined.combined).await;
-                        self.settle_flushed_group(combined, token, result)
-                    })
-                    .buffer_unordered(parallelism)
-                    .collect()
-                    .await
-            }
-        };
+        let group_stats: Vec<(bool, FlushStats)> = stream::iter(groups)
+            .map(|(combined, token)| async move {
+                let result = self.flush_bucket(&combined.combined).await;
+                self.settle_flushed_group(combined, token, result)
+            })
+            .buffer_unordered(parallelism)
+            .collect()
+            .await;
 
         let (any_ok, mut stats) = group_stats.into_iter().fold((false, FlushStats::default()), |(any, mut acc), (ok, s)| {
             acc.buckets_flushed += s.buckets_flushed;
@@ -2353,140 +2324,6 @@ impl BufferedWriteLayer {
         }
 
         Ok(stats)
-    }
-
-    /// Cross-project flush commit coalescing: prepare every group, hand them all
-    /// to the coalescing writer, then settle each with its own result.
-    ///
-    /// Required semantics: a group that fails to PREPARE never reaches the writer
-    /// and settles as its own failure; the writer returns one result per unit, so
-    /// one project's failed parquet write does not block its co-tenants; a failed
-    /// shared commit fails EVERY project it covered (no partial settle).
-    async fn flush_groups_coalesced(&self, groups: Vec<(CombinedBucket, u64)>, callback: DeltaCoalescedWriteCallback) -> Vec<(bool, FlushStats)> {
-        // Pairs stay in input order — the writer contract is positional.
-        type Pending = (CombinedBucket, u64, Vec<RecordBatch>, DeltaWatermark);
-        let (mut settled, pending): (Vec<(bool, FlushStats)>, Vec<Pending>) =
-            groups.into_iter().partition_map(|(combined, token)| match self.prepare_flush(&combined.combined) {
-                // Already landed: drop out of the shared commit but settle as a
-                // success — the rows are in Delta, so draining is correct.
-                Ok((batches, _)) if self.already_landed(&combined.combined.project_id, &combined.combined.table_name, &batches) => {
-                    self.note_landed_skip(&combined.combined, &batches);
-                    itertools::Either::Left(self.settle_flushed_group(combined, token, Ok(())))
-                }
-                // A topic with a DETACHED commit still airborne gets no second
-                // commit — same rule as `flush_bucket`, same reason: stacking
-                // multiplies the load that made the first one slow. Fails the
-                // group; when the airborne commit lands, `already_landed` above
-                // drains it.
-                Ok(_) if self.airborne_commits.contains(&(combined.combined.project_id.clone(), combined.combined.table_name.clone())) => {
-                    itertools::Either::Left(self.settle_flushed_group(
-                        combined,
-                        token,
-                        Err(anyhow::anyhow!("a previous coalesced commit for this topic is still airborne; deferring")),
-                    ))
-                }
-                Ok((batches, watermark)) => itertools::Either::Right((combined, token, batches, watermark)),
-                Err(e) => itertools::Either::Left(self.settle_flushed_group(combined, token, Err(e))),
-            });
-        if pending.is_empty() {
-            return settled;
-        }
-        let units: Vec<FlushUnit> = pending
-            .iter()
-            .map(|(combined, _, batches, watermark)| FlushUnit {
-                project_id: combined.combined.project_id.clone(),
-                table_name: combined.combined.table_name.clone(),
-                batches: batches.clone(),
-                watermark: watermark.clone(),
-            })
-            .collect();
-        debug!("Coalescing {} flush group(s) into per-physical-table commit(s)", pending.len());
-
-        // Stall watchdog: an un-timed-out hang would pin `flush_lock` forever. A
-        // timed-out shared commit DETACHES, exactly as in `flush_bucket`: every
-        // covered topic is marked airborne, and the watcher records each unit's
-        // landed identity positionally when the commit completes — or aborts the
-        // whole commit at the base-derived ceiling so no topic wedges behind a
-        // true hang.
-        let unit_meta: Vec<((String, String), Option<LandedDigest>)> = pending
-            .iter()
-            .map(|(combined, _, batches, _)| {
-                let bucket = &combined.combined;
-                let digest =
-                    (self.config.buffer.landed_skip_enabled() && landed_identity_applies(&bucket.table_name)).then(|| landed_digest(batches)).flatten();
-                ((bucket.project_id.clone(), bucket.table_name.clone()), digest)
-            })
-            .collect();
-        let expected = units.len();
-        let timeout = self.adaptive_flush_timeout();
-        let commit = callback(units);
-        let results = if timeout.is_zero() {
-            commit.await
-        } else {
-            let mut handle = tokio::spawn(commit);
-            match tokio::time::timeout(timeout, &mut handle).await {
-                // A panicked commit task must fail loudly, not read as "no results".
-                Ok(joined) => joined.unwrap_or_else(|join| {
-                    error!(error = %join, event = "flush_coalesced_commit_panicked");
-                    Vec::new()
-                }),
-                Err(_) => {
-                    crate::observability::record_flush_stalled();
-                    for (topic, _) in &unit_meta {
-                        self.airborne_commits.insert(topic.clone());
-                    }
-                    let cap = self.config.buffer.delta_scan_depth().saturating_mul(LANDED_WINDOW_COMMITS);
-                    let ceiling = detach_ceiling(self.config.buffer.flush_bucket_timeout());
-                    let (digests, airborne) = (Arc::clone(&self.landed_digests), Arc::clone(&self.airborne_commits));
-                    tokio::spawn(async move {
-                        let landed = tokio::time::timeout(ceiling, &mut handle).await;
-                        for (topic, _) in &unit_meta {
-                            airborne.remove(topic);
-                        }
-                        match landed {
-                            Ok(Ok(results)) if results.len() == unit_meta.len() => {
-                                for ((topic, digest), result) in unit_meta.iter().zip(results) {
-                                    if result.is_ok() {
-                                        Self::note_landed_digests_in(&digests, cap, &topic.0, &topic.1, *digest);
-                                        info!(project_id = %topic.0, table = %topic.1, event = "flush_detached_commit_landed");
-                                    } else {
-                                        warn!(project_id = %topic.0, table = %topic.1, event = "flush_detached_commit_failed");
-                                    }
-                                }
-                            }
-                            Ok(Ok(results)) => warn!(units = unit_meta.len(), results = results.len(), event = "flush_detached_commit_result_mismatch"),
-                            Ok(Err(join)) => warn!(error = %join, event = "flush_detached_commit_panicked"),
-                            Err(_) => {
-                                handle.abort();
-                                warn!(
-                                    units = unit_meta.len(),
-                                    ceiling_secs = ceiling.as_secs(),
-                                    event = "flush_detached_commit_hung",
-                                    "detached coalesced commit hit its ceiling — aborted; its topics return to ordinary retry"
-                                );
-                            }
-                        }
-                    });
-                    Vec::new()
-                }
-            }
-        };
-        // A wrong-length result vector would strand groups (unsettled = leaked
-        // in-flight holds). Fail them all instead: a requeue costs a duplicate
-        // replay, a strand costs the WAL floor.
-        let results = if results.len() == expected {
-            results
-        } else {
-            if !results.is_empty() {
-                error!("coalesced writer returned {} results for {} units — failing all groups", results.len(), expected);
-            }
-            (0..expected).map(|_| Err(anyhow::anyhow!("coalesced commit produced no result for this group"))).collect()
-        };
-        settled.extend(pending.into_iter().zip(results).map(|((combined, token, batches, _), result)| {
-            let outcome = result.map(|added_files| self.index_flushed_files(&combined.combined, batches, added_files));
-            self.settle_flushed_group(combined, token, outcome)
-        }));
-        settled
     }
 
     /// Apply one commit's post-flush effects — drain/restore, hold
@@ -2701,8 +2538,7 @@ impl BufferedWriteLayer {
     }
 
     /// Post-commit half of a bucket flush: hand the committed rows + the files this bucket's
-    /// project added to the tantivy sidecar. `added_files` is already attributed per project by
-    /// the writer, so a coalesced commit feeds each project only its own files.
+    /// project added to the tantivy sidecar.
     ///
     /// The tantivy index build is best-effort and never fails the flush; it is spawned detached
     /// and the semaphore bounds fan-out when many tables flush at once.
@@ -3822,165 +3658,6 @@ mod tests {
         assert_eq!(results[0].num_rows(), 3);
     }
 
-    /// One tick's groups for several projects on the same table must reach the
-    /// writer as ONE call carrying every project's unit and its own watermark,
-    /// with each project's buckets drained and its OWN files handed to tantivy.
-    #[serial]
-    #[tokio::test(flavor = "multi_thread")]
-    async fn coalesced_flush_hands_every_project_to_one_writer_call() {
-        let (_dir, cfg, table, projects) = cotenant_env("cc", 3, |c| c.buffer.timefusion_flush_coalesce_commits = true);
-
-        type WatermarkCalls = Arc<std::sync::Mutex<Vec<Vec<(String, String, DeltaWatermark)>>>>;
-        let calls: WatermarkCalls = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let seen = calls.clone();
-        let mut layer = crate::support::test_helpers::test_layer(Arc::clone(&cfg)).unwrap();
-        layer.coalesced_write_callback = Some(Arc::new(move |units: Vec<FlushUnit>| {
-            let seen = seen.clone();
-            Box::pin(async move {
-                seen.lock().unwrap().push(units.iter().map(|u| (u.project_id.clone(), u.table_name.clone(), u.watermark.clone())).collect());
-                units.iter().map(|u| Ok(vec![format!("s3://test/{}/project_id={}/date=2026-07-29/part.parquet", u.table_name, u.project_id)])).collect()
-            })
-        }));
-        type IndexedFiles = Arc<std::sync::Mutex<Vec<(String, Vec<String>)>>>;
-        let indexed: IndexedFiles = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let idx = indexed.clone();
-        layer.tantivy_index_callback = Some(Arc::new(move |p: String, _t, _b, files: Vec<String>| {
-            let idx = idx.clone();
-            Box::pin(async move {
-                idx.lock().unwrap().push((p, files));
-                Ok(())
-            })
-        }));
-        let layer = Arc::new(layer);
-
-        for project in &projects {
-            layer.insert(project, &table, vec![create_test_batch(project)]).await.unwrap();
-        }
-        let stats = layer.flush_all_now().await.unwrap();
-
-        let calls = calls.lock().unwrap().clone();
-        assert_eq!(calls.len(), 1, "coalescing must produce ONE writer call per tick, got {}", calls.len());
-        assert_eq!(calls[0].len(), projects.len(), "every project's group must ride the same call");
-        for project in &projects {
-            let unit = calls[0].iter().find(|(p, _, _)| p == project).unwrap_or_else(|| panic!("{project} missing from the coalesced call"));
-            assert_eq!(unit.1, table);
-            assert!(unit.2.iter().any(Option::is_some), "{project} unit carried no watermark position");
-        }
-
-        assert_eq!(stats.buckets_flushed, projects.len() as u64, "every project's bucket must settle on the shared commit");
-        assert_eq!(stats.buckets_failed, 0);
-        for project in &projects {
-            assert_eq!(rows_in(&layer, project, &table), 0, "{project} rows were not drained after its coalesced commit landed");
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        let indexed = indexed.lock().unwrap().clone();
-        for project in &projects {
-            let files = &indexed.iter().find(|(p, _)| p == project).unwrap_or_else(|| panic!("{project} never reached the indexer")).1;
-            assert!(files.iter().all(|f| f.contains(&format!("project_id={project}/"))), "{project} was indexed with a co-tenant's files: {files:?}");
-        }
-    }
-
-    /// A FAILED shared commit must fail-and-requeue EVERY project it covered —
-    /// no partial settle; rows stay in MemBuffer + WAL and re-flush next cycle.
-    #[serial]
-    #[tokio::test(flavor = "multi_thread")]
-    async fn coalesced_commit_failure_requeues_every_project() {
-        let (_dir, cfg, table, projects) = cotenant_env("cf", 3, |c| c.buffer.timefusion_flush_coalesce_commits = true);
-
-        let fail = Arc::new(AtomicBool::new(true));
-        let f = fail.clone();
-        let mut layer = crate::support::test_helpers::test_layer(Arc::clone(&cfg)).unwrap();
-        layer.coalesced_write_callback = Some(Arc::new(move |units: Vec<FlushUnit>| {
-            let f = f.clone();
-            Box::pin(async move {
-                let failing = f.load(Ordering::Relaxed);
-                let files = |u: &FlushUnit| vec![format!("s3://t/project_id={}/p.parquet", u.project_id)];
-                units.iter().map(|u| if failing { Err(anyhow::anyhow!("shared commit failed")) } else { Ok(files(u)) }).collect()
-            })
-        }));
-        let layer = Arc::new(layer);
-
-        let mut expected: Vec<usize> = Vec::new();
-        for project in &projects {
-            layer.insert(project, &table, vec![create_test_batch(project)]).await.unwrap();
-            expected.push(rows_in(&layer, project, &table));
-        }
-
-        let stats = layer.flush_all_now().await.unwrap();
-        assert_eq!(stats.buckets_flushed, 0, "a failed shared commit must settle NO project as flushed");
-        assert_eq!(stats.buckets_failed, projects.len() as u64, "every project covered by the failed commit must be counted failed");
-        for (project, rows) in projects.iter().zip(&expected) {
-            assert_eq!(rows_in(&layer, project, &table), *rows, "{project} lost rows on a failed shared commit — they must stay queued for re-flush");
-        }
-
-        fail.store(false, Ordering::Relaxed);
-        let stats = layer.flush_all_now().await.unwrap();
-        assert_eq!(stats.buckets_flushed, projects.len() as u64, "requeued groups must re-flush on the next cycle");
-        for project in &projects {
-            assert_eq!(rows_in(&layer, project, &table), 0, "{project} did not drain on the successful retry");
-        }
-    }
-
-    /// A writer that returns fewer results than units must not strand the
-    /// un-answered groups — an unsettled group leaks its in-flight WAL hold and
-    /// pins the GC floor until restart. All groups fail instead.
-    #[serial]
-    #[tokio::test(flavor = "multi_thread")]
-    async fn coalesced_writer_short_result_vector_fails_every_group() {
-        let (_dir, cfg, table, projects) = cotenant_env("cs", 2, |c| c.buffer.timefusion_flush_coalesce_commits = true);
-
-        let mut layer = crate::support::test_helpers::test_layer(Arc::clone(&cfg)).unwrap();
-        layer.coalesced_write_callback = Some(Arc::new(move |_units: Vec<FlushUnit>| Box::pin(async move { vec![Ok(Vec::new())] })));
-        let layer = Arc::new(layer);
-        for project in &projects {
-            layer.insert(project, &table, vec![create_test_batch(project)]).await.unwrap();
-        }
-        let stats = layer.flush_all_now().await.unwrap();
-        assert_eq!(stats.buckets_flushed, 0);
-        assert_eq!(stats.buckets_failed, projects.len() as u64, "every group must be settled (as failed), never left stranded");
-        for project in &projects {
-            assert!(rows_in(&layer, project, &table) > 0, "{project} rows must survive for re-flush");
-        }
-    }
-
-    /// With coalescing explicitly OFF the per-project writer is used and the
-    /// coalescing writer is never called, even when both are wired.
-    #[serial]
-    #[tokio::test(flavor = "multi_thread")]
-    async fn coalescing_disabled_uses_the_per_project_writer() {
-        let (_dir, cfg, table, projects) = cotenant_env("cd", 2, |c| {
-            c.buffer.timefusion_flush_dwell_secs = 0;
-            // Coalescing ships ON now, so this path must be asked for explicitly.
-            c.buffer.timefusion_flush_coalesce_commits = false;
-        });
-        assert!(!cfg.buffer.flush_coalesce_commits(), "this test exercises the per-project writer");
-
-        let (per_project, coalesced) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
-        let (pp, cc) = (per_project.clone(), coalesced.clone());
-        let mut layer = crate::support::test_helpers::test_layer(Arc::clone(&cfg)).unwrap();
-        layer.delta_write_callback = Some(Arc::new(move |p: String, _t, _b, _w| {
-            let pp = pp.clone();
-            Box::pin(async move {
-                pp.fetch_add(1, Ordering::Relaxed);
-                Ok(vec![format!("s3://t/project_id={p}/p.parquet")])
-            })
-        }));
-        layer.coalesced_write_callback = Some(Arc::new(move |units: Vec<FlushUnit>| {
-            let cc = cc.clone();
-            Box::pin(async move {
-                cc.fetch_add(1, Ordering::Relaxed);
-                units.iter().map(|_| Ok(Vec::new())).collect()
-            })
-        }));
-        let layer = Arc::new(layer);
-        for project in &projects {
-            layer.insert(project, &table, vec![create_test_batch(project)]).await.unwrap();
-        }
-        layer.flush_all_now().await.unwrap();
-        assert_eq!(coalesced.load(Ordering::Relaxed), 0, "coalescing writer must not run while the flag is off");
-        assert_eq!(per_project.load(Ordering::Relaxed), projects.len() as u64, "each project keeps its own commit while the flag is off");
-    }
-
     #[serial]
     #[tokio::test]
     async fn test_recovery() {
@@ -4753,13 +4430,6 @@ mod tests {
     /// [`test_env_with`] on the default (dwell-off) config.
     fn test_ids_env(prefix: &str) -> (TempDir, Arc<AppConfig>, String, String) {
         test_env_with(prefix, |c| c.buffer.timefusion_flush_dwell_secs = 0)
-    }
-
-    /// [`test_env_with`] plus `n` co-tenant projects sharing the one table.
-    fn cotenant_env(prefix: &str, n: usize, tweak: impl FnOnce(&mut AppConfig)) -> (TempDir, Arc<AppConfig>, String, Vec<String>) {
-        let (dir, cfg, table, _) = test_env_with(prefix, tweak);
-        let projects = (0..n).map(|i| format!("{table}{i}")).collect();
-        (dir, cfg, table, projects)
     }
 
     /// Rows currently visible for `(project, table)`.
@@ -5803,48 +5473,6 @@ mod tests {
     /// duplicate commit for the topic. Once the detached commit completes, the
     /// next cycle drains the bucket via the landed identity without invoking the
     /// writer again.
-    /// The coalesced path gets the same detach semantics as `flush_bucket`: a
-    /// timed-out SHARED commit keeps running, every covered topic is marked
-    /// airborne (no duplicate commits stack), and each unit's landed identity is
-    /// recorded on completion so the next cycle drains without a re-upload.
-    #[serial]
-    #[tokio::test]
-    async fn a_stalled_coalesced_commit_detaches_and_every_unit_drains() {
-        let (_dir, cfg, project, _keyless) = test_env_with("cd", |c| {
-            c.buffer.timefusion_flush_dwell_secs = 0;
-            c.buffer.timefusion_flush_bucket_timeout_secs = 1;
-            c.buffer.timefusion_landed_skip_enabled = true;
-            c.buffer.timefusion_flush_coalesce_commits = true;
-        });
-        let table = "otel_logs_and_spans".to_string();
-        let cotenant = format!("{project}b");
-        let calls = Arc::new(AtomicU64::new(0));
-        let seen = calls.clone();
-        let mut layer = crate::support::test_helpers::test_layer(Arc::clone(&cfg)).unwrap();
-        layer.coalesced_write_callback = Some(Arc::new(move |units: Vec<FlushUnit>| {
-            seen.fetch_add(1, Ordering::Relaxed);
-            Box::pin(async move {
-                tokio::time::sleep(Duration::from_millis(2400)).await;
-                units.iter().map(|_| Ok(Vec::new())).collect()
-            })
-        }));
-        let layer = Arc::new(layer);
-        layer.insert(&project, &table, vec![create_test_batch(&project)]).await.unwrap();
-        layer.insert(&cotenant, &table, vec![create_test_batch(&cotenant)]).await.unwrap();
-
-        layer.flush_all_now().await.unwrap();
-        assert!(!layer.is_empty(), "the timed-out cycle restores both buckets");
-        assert_eq!(calls.load(Ordering::Relaxed), 1);
-
-        layer.flush_all_now().await.unwrap();
-        assert_eq!(calls.load(Ordering::Relaxed), 1, "airborne topics must not enter a second shared commit");
-
-        tokio::time::sleep(Duration::from_millis(2200)).await;
-        layer.flush_all_now().await.unwrap();
-        assert!(layer.is_empty(), "both units drain via their landed identities once the detached commit completes");
-        assert_eq!(calls.load(Ordering::Relaxed), 1, "draining reuses the landed commit");
-    }
-
     #[serial]
     #[tokio::test]
     async fn a_stalled_commit_detaches_and_its_completion_drains_the_bucket() {

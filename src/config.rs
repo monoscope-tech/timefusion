@@ -1442,32 +1442,6 @@ pub struct BufferConfig {
     // bounding in-flight encode memory.
     #[serde_inline_default(8)]
     pub timefusion_flush_parallelism: usize,
-    /// Coalesce one tick's per-project flush commits into one commit per PHYSICAL
-    /// Delta table. Parquet writes still fan out `flush_parallelism`-wide; only the
-    /// commit is shared. Custom-storage projects have their own `_delta_log` and are
-    /// never coalesced with default storage.
-    ///
-    /// OFF by default since 2026-09-21. Batching a tick's commits into one is a
-    /// throughput win right up until that commit exceeds `adaptive_flush_timeout`
-    /// — the stall watchdog then returns an EMPTY result vector and every group
-    /// in the batch is failed together:
-    ///
-    /// ```text
-    /// Failed to flush coalesced commit: ... coalesced commit produced no result for this group
-    /// ```
-    ///
-    /// Nothing drained, the MemBuffer pinned at its hard limit, and the insert
-    /// path rejected after exhausting its backpressure budget — 1,187 rejected
-    /// batches in half an hour, across every project, NOT durable. Enabling this
-    /// by default caused that outage; raising `timefusion_dml_coalesce_secs` to
-    /// 60 at the same time made the batches large enough to reach the timeout.
-    ///
-    /// The blast radius is the problem, not the idea: one slow commit fails its
-    /// neighbours. Per-project commits are smaller and independently timed, so a
-    /// slow one costs only itself. Re-enable only with per-group timeouts, or a
-    /// partial-result path that settles the groups that did commit.
-    #[serde_inline_default(false)]
-    pub timefusion_flush_coalesce_commits: bool,
     #[serde(default)]
     pub timefusion_flush_immediately: bool,
     /// `insert()` admits over the memory hard limit instead of rejecting a write
@@ -1531,7 +1505,7 @@ pub struct BufferConfig {
     ///
     /// Back to 3 s from 60 on 2026-09-21. The window sizes the batch, and a
     /// 20x window produced commits large enough to trip the flush stall
-    /// watchdog — see `timefusion_flush_coalesce_commits` for what that cost.
+    /// watchdog, which failed every group in the batch together.
     #[serde_inline_default(3)]
     pub timefusion_dml_coalesce_secs: u64,
     /// Fold same-shape coalesced groups across projects into one MERGE per
@@ -1597,7 +1571,6 @@ impl BufferConfig {
         wal_shards_per_topic: usize = (timefusion_wal_shards_per_topic.max(1));
         wal_corruption_threshold: usize = (timefusion_wal_corruption_threshold);
         flush_parallelism: usize = (timefusion_flush_parallelism.max(1));
-        flush_coalesce_commits: bool = (timefusion_flush_coalesce_commits);
         dml_coalesce_secs: u64 = (timefusion_dml_coalesce_secs);
         dml_coalesce_fold: bool = (timefusion_dml_coalesce_fold);
         delta_scan_concurrency: usize = (timefusion_delta_scan_concurrency.max(1));

@@ -1,8 +1,8 @@
-//! Write path: insert/coalesced-commit machinery, flush-time sort, runtime envs,
+//! Write path: insert/staged-commit machinery, flush-time sort, runtime envs,
 //! per-table locks, staged writes, watermark reconciliation.
 use super::*;
 
-/// Shared OCC retry budget for the staged single-unit and coalesced commit loops.
+/// Shared OCC retry budget for the staged and merge commit loops.
 const MAX_COMMIT_RETRIES: u32 = 5;
 
 /// How many top memory-pool consumers to name when a pool is exhausted.
@@ -24,39 +24,6 @@ fn spawn_until_shutdown(shutdown: Arc<CancellationToken>, work: impl std::future
             _ = work => {}
         }
     });
-}
-
-/// Which path is driving [`Database::commit_staged_group`].
-#[derive(Clone, Copy)]
-enum StagedCommitKind {
-    /// One project's unit. `warm` is the caller's `watermark.is_some()`: only
-    /// the BufferedWriteLayer flush path warms the cache.
-    Flush { warm: bool },
-    /// One physical table's coalesced group — always a flush, always warms.
-    Coalesced,
-}
-
-impl StagedCommitKind {
-    /// `(refresh, commit)` labels for the commit-lock timeout metric; they must
-    /// match the values documented in `observability.rs`.
-    fn ops(self) -> (&'static str, &'static str) {
-        match self {
-            Self::Flush { .. } => ("flush_refresh", "flush_commit"),
-            Self::Coalesced => ("coalesced_refresh", "coalesced_commit"),
-        }
-    }
-
-    /// Subject of the failure messages this path returns.
-    fn what(self) -> &'static str {
-        match self {
-            Self::Flush { .. } => "staged commit",
-            Self::Coalesced => "coalesced staged commit",
-        }
-    }
-
-    fn warm(self) -> bool {
-        matches!(self, Self::Flush { warm: true } | Self::Coalesced)
-    }
 }
 
 /// What a staged commit appends: the already-uploaded parquet's actions, the
@@ -656,7 +623,7 @@ impl Database {
 
             return match self
                 .commit_staged_group(
-                    StagedCommitKind::Flush { warm: watermark.is_some() },
+                    watermark.is_some(),
                     &table_ref,
                     &[(project_id.as_str(), dirty_bins.as_slice())],
                     &table_name,
@@ -747,143 +714,15 @@ impl Database {
         Err(anyhow::anyhow!("Delta write failed after {} retries: {}", MAX_COMMIT_RETRIES, last_error))
     }
 
-    /// Cross-project flush commit coalescing: one tick's per-project flush units become a single
-    /// Delta commit per physical table. Parquet encode/upload still run in parallel outside the
-    /// lock; only the commit-log append is shared. A staging failure excludes only that unit; a
-    /// shared commit failure fails every unit in the physical group; schema-evolving units are
-    /// committed alone. Returns one result per input unit, in input order.
-    pub async fn insert_records_batches_coalesced(&self, units: Vec<CoalescedWriteUnit>) -> Vec<Result<Vec<String>>> {
-        use deltalake::kernel::Action;
-        use futures::stream::{self, StreamExt};
-        let parallelism = self.config.buffer.flush_parallelism();
-        let mut results: Vec<Result<Vec<String>>> = units.iter().map(|_| Ok(Vec::new())).collect();
-        // Shared by every phase's futures; all three streams are collected in this
-        // scope, so a borrow suffices — nothing here is spawned.
-        let units = &units;
-
-        // ---- Phase 1: prepare (bounded-concurrent; table resolution + casts).
-        let prepared: Vec<(usize, Result<PreparedForPhysicalTable>)> = stream::iter(0..units.len())
-            .map(move |i| async move {
-                let u = &units[i];
-                let prep = self.prepare_staged_write(&u.project_id, &u.table_name, u.batches.clone()).await;
-                let key = self.table_lock_key(&u.project_id, &u.table_name).await;
-                (i, prep.map(|p| (p, key)))
-            })
-            .buffer_unordered(parallelism)
-            .collect()
-            .await;
-
-        // ---- Phase 2: stage parquet OUTSIDE any lock, `flush_parallelism`-wide.
-        // Schema-evolution units never reach here: they are split out to the solo
-        // (locked WriteBuilder) path so one project's merge can't stall the rest.
-        let mut solo: Vec<usize> = Vec::new();
-        let mut stageable: Vec<(usize, PreparedWrite, deltalake::writer::RecordBatchWriter, (String, String))> = Vec::new();
-        for (i, prep) in prepared {
-            match prep {
-                Err(e) => results[i] = Err(e),
-                Ok((mut p, key)) => match p.staged_writer.take() {
-                    Some(writer) => stageable.push((i, p, writer, key)),
-                    None => {
-                        debug!("coalesced flush: {}/{} needs schema evolution — splitting out of the shared commit", units[i].project_id, units[i].table_name);
-                        solo.push(i);
-                    }
-                },
-            }
-        }
-
-        let max_file_bytes = self.config.maintenance.timefusion_writer_max_file_bytes;
-        let staged: Vec<(usize, (String, String), Result<StagedUnit>)> = stream::iter(stageable)
-            .map(|(i, prep, mut writer, key)| async move {
-                let PreparedWrite { table_ref, schema, dirty_bins, batches, stage_store, sorted, .. } = prep;
-                let adds: Result<Vec<Action>> =
-                    Self::stage_batches(&mut writer, batches, max_file_bytes).await.map_err(|e| anyhow::anyhow!("staged parquet flush failed: {}", e));
-                (i, key, adds.map(|adds| StagedUnit { table_ref, schema, dirty_bins, adds, stage_store, sorted }))
-            })
-            .buffer_unordered(parallelism)
-            .collect()
-            .await;
-
-        // ---- Phase 3: one commit per PHYSICAL table.
-        let mut by_physical: HashMap<(String, String), Vec<(usize, StagedUnit)>> = HashMap::new();
-        for (i, key, unit) in staged {
-            match unit {
-                Err(e) => results[i] = Err(e),
-                // Nothing was written (all rows filtered out) — no Add to commit.
-                Ok(u) if u.adds.is_empty() => results[i] = Ok(Vec::new()),
-                Ok(u) => by_physical.entry(key).or_default().push((i, u)),
-            }
-        }
-
-        let committed: Vec<Vec<(usize, Result<Vec<String>>)>> = stream::iter(by_physical.into_values())
-            .map(move |group| async move {
-                let indices: Vec<usize> = group.iter().map(|(i, _)| *i).collect();
-                let table_name = units[indices[0]].table_name.clone();
-                let projects: Vec<&str> = indices.iter().map(|i| units[*i].project_id.as_str()).collect();
-                let table_ref = group[0].1.table_ref.clone();
-                let adds: Vec<Action> = group.iter().flat_map(|(_, u)| u.adds.iter().cloned()).collect();
-                let watermarks = indices.iter().map(|i| (units[*i].project_id.clone(), units[*i].table_name.clone(), units[*i].watermark.clone()));
-                // Per-unit landed identity, scoped to its own topic, so one
-                // tenant's identity can never decline another's write.
-                let digests: Vec<(String, String, crate::write::LandedDigest)> = indices
-                    .iter()
-                    .map(|i| &units[*i])
-                    .filter_map(|u| self.landed_digest_for(&u.table_name, &u.batches).map(|d| (u.project_id.clone(), u.table_name.clone(), d)))
-                    .collect();
-                let commit_properties = self.with_incremental_advance(build_watermark_commit_properties(watermarks, digests));
-                let per_project: Vec<(&str, &[(String, i64)])> = group.iter().map(|(i, u)| (units[*i].project_id.as_str(), u.dirty_bins.as_slice())).collect();
-                let commit = StagedCommit { adds: &adds, schema: group[0].1.schema, properties: commit_properties };
-                let outcome = self
-                    .commit_staged_group(StagedCommitKind::Coalesced, &table_ref, &per_project, &table_name, commit)
-                    .await
-                    .map(|added| attribute_added_files(added, &projects));
-                match outcome {
-                    Ok(per_project_added) => {
-                        // Per unit, not per group: one unit degrading to an
-                        // unsorted write must not tar or exonerate its neighbours.
-                        for (_, unit) in &group {
-                            self.mark_written_sorted(unit.schema, unit.sorted, &unit.adds);
-                        }
-                        indices.into_iter().zip(per_project_added).map(|(i, a)| (i, Ok(a))).collect::<Vec<_>>()
-                    }
-                    Err(e) => {
-                        // Fail EVERY project in the group identically — no partial
-                        // settle; the caller requeues each one's buckets.
-                        if !InconclusiveCommit::marks(&e) {
-                            // Every unit in a physical group stages into the same
-                            // store, so one store deletes all.
-                            Self::cleanup_orphaned_parquet(&group[0].1.stage_store, &adds).await;
-                        }
-                        indices.into_iter().map(|i| (i, Err(anyhow::anyhow!("coalesced commit failed for {}: {}", table_name, e)))).collect()
-                    }
-                }
-            })
-            .buffer_unordered(parallelism)
-            .collect()
-            .await;
-        // ---- Phase 4: schema-evolution units, each on its own (locked merge path).
-        let solo_results: Vec<(usize, Result<Vec<String>>)> = stream::iter(solo)
-            .map(move |i| async move {
-                let u = &units[i];
-                (i, self.insert_records_batch(&u.project_id, &u.table_name, u.batches.clone(), true, Some(&u.watermark)).await)
-            })
-            .buffer_unordered(parallelism)
-            .collect()
-            .await;
-        // Phase-3 and phase-4 outcomes cover disjoint units, so order is irrelevant.
-        for (i, r) in committed.into_iter().flatten().chain(solo_results) {
-            results[i] = r;
-        }
-        results
-    }
-
-    /// The shared commit-log append for a staged (parquet already uploaded) write: one project's
-    /// flush unit, or one physical table's coalesced group spanning several projects.
+    /// The commit-log append for a staged (parquet already uploaded) write of one project's
+    /// flush unit. `warm` is the caller's `watermark.is_some()`: only the BufferedWriteLayer
+    /// flush path warms the cache.
     ///
     /// Staged parquet is the CALLER's to clean up: on `Err`, delete it unless the error carries
     /// [`InconclusiveCommit`], where landing could not be confirmed and deleting would risk a
     /// dangling Add.
     async fn commit_staged_group(
-        &self, kind: StagedCommitKind, table_ref: &Arc<RwLock<DeltaTable>>, projects: &[(&str, &[(String, i64)])], table_name: &str, commit: StagedCommit<'_>,
+        &self, warm: bool, table_ref: &Arc<RwLock<DeltaTable>>, projects: &[(&str, &[(String, i64)])], table_name: &str, commit: StagedCommit<'_>,
     ) -> Result<Vec<String>> {
         use deltalake::kernel::transaction::TableReference;
         let StagedCommit { adds, schema, properties } = commit;
@@ -892,10 +731,8 @@ impl Database {
             partition_by: (!schema.partitions.is_empty()).then(|| schema.partitions.clone()),
             predicate: None,
         };
-        // Any member resolves to the same physical lock (a coalesced group's key IS
-        // `table_lock_key`), so serialization is identical on both paths.
         let (commit_lock, flush_waiters) = self.commit_lock_and_waiters(projects[0].0, table_name).await;
-        let (refresh_op, commit_op) = kind.ops();
+        let (refresh_op, commit_op) = ("flush_refresh", "flush_commit");
         let mut retry_count = 0u32;
         loop {
             // Refresh UNDER the lock: the per-table commit lock serializes all in-process
@@ -934,21 +771,16 @@ impl Database {
                     new_table.state = Some(finalized.snapshot());
                     drop(commit_guard);
                     let t_record = std::time::Instant::now();
-                    let added = self.record_committed_write(table_ref, projects, table_name, new_table, &pre_uris, kind.warm()).await;
-                    match kind {
-                        StagedCommitKind::Flush { .. } => info!(
-                            "commit_timing project={} table={} refresh_ms={} build_ms={} record_ms={} files={}",
-                            projects[0].0,
-                            table_name,
-                            refresh_ms,
-                            build_ms,
-                            t_record.elapsed().as_millis(),
-                            adds.len()
-                        ),
-                        StagedCommitKind::Coalesced => {
-                            debug!("coalesced commit landed: table={} projects={} files={}", table_name, projects.len(), adds.len())
-                        }
-                    }
+                    let added = self.record_committed_write(table_ref, projects, table_name, new_table, &pre_uris, warm).await;
+                    info!(
+                        "commit_timing project={} table={} refresh_ms={} build_ms={} record_ms={} files={}",
+                        projects[0].0,
+                        table_name,
+                        refresh_ms,
+                        build_ms,
+                        t_record.elapsed().as_millis(),
+                        adds.len()
+                    );
                     return Ok(added);
                 }
                 Err(CommitFailure { message: e, timed_out }) => {
@@ -956,9 +788,9 @@ impl Database {
                     if !timed_out && is_occ_conflict_err(&e) {
                         retry_count += 1;
                         if retry_count >= MAX_COMMIT_RETRIES {
-                            return Err(anyhow::anyhow!("{} failed after {} retries: {}", kind.what(), MAX_COMMIT_RETRIES, e));
+                            return Err(anyhow::anyhow!("staged commit failed after {} retries: {}", MAX_COMMIT_RETRIES, e));
                         }
-                        debug!("{} conflict, retrying ({}/{}): {}", kind.what(), retry_count, MAX_COMMIT_RETRIES, e);
+                        debug!("staged commit conflict, retrying ({}/{}): {}", retry_count, MAX_COMMIT_RETRIES, e);
                         tokio::time::sleep(occ_backoff(retry_count as usize)).await;
                         continue;
                     }
@@ -966,27 +798,20 @@ impl Database {
                     // can fail after N.json is written), so probe before letting the
                     // caller delete parquet a landed commit references.
                     let pre_uris: HashSet<String> = file_uris(&new_table);
-                    let (subject, draining, unconfirmed) = match kind {
-                        StagedCommitKind::Flush { .. } => (
-                            format!("staged commit for {}/{}", projects[0].0, table_name),
-                            "draining bucket",
-                            "UNCONFIRMED (snapshot read failed) — leaving staged parquet in place to avoid a dangling Add",
-                        ),
-                        StagedCommitKind::Coalesced => {
-                            (format!("coalesced commit for {table_name}"), "draining", "UNCONFIRMED — leaving staged parquet in place")
-                        }
-                    };
+                    let subject = format!("staged commit for {}/{}", projects[0].0, table_name);
                     return match probe_after_timeout(self.probe_commit_landed_bounded(table_ref, adds).await, timed_out) {
                         CommitProbe::Landed => {
-                            warn!("{subject} reported an error but LANDED (post-commit hook failed) — {draining}: {e}");
+                            warn!("{subject} reported an error but LANDED (post-commit hook failed) — draining bucket: {e}");
                             let post = { table_ref.read().await.clone() };
-                            Ok(self.record_committed_write(table_ref, projects, table_name, post, &pre_uris, kind.warm()).await)
+                            Ok(self.record_committed_write(table_ref, projects, table_name, post, &pre_uris, warm).await)
                         }
-                        CommitProbe::NotLanded => Err(anyhow::anyhow!("{} failed: {}", kind.what(), e)),
+                        CommitProbe::NotLanded => Err(anyhow::anyhow!("staged commit failed: {}", e)),
                         CommitProbe::Inconclusive => {
-                            warn!("{subject} errored and landing is {unconfirmed}: {e}");
+                            warn!(
+                                "{subject} errored and landing is UNCONFIRMED (snapshot read failed) — leaving staged parquet in place to avoid a dangling Add: {e}"
+                            );
                             // Marker error: tells the caller not to delete the parquet.
-                            Err(anyhow::Error::new(InconclusiveCommit).context(format!("{} failed (landing unconfirmed): {}", kind.what(), e)))
+                            Err(anyhow::Error::new(InconclusiveCommit).context(format!("staged commit failed (landing unconfirmed): {}", e)))
                         }
                     };
                 }

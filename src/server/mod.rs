@@ -62,9 +62,7 @@ pub async fn bootstrap(cfg: Arc<AppConfig>) -> Result<Bootstrapped> {
     crate::write::wal::boot_wal_gc(&cfg.core.wal_dir());
 
     let t_layer = std::time::Instant::now();
-    let mut layer = BufferedWriteLayer::with_config(Arc::clone(&cfg), registry)?
-        .with_delta_writer(delta_write_callback)
-        .with_coalesced_delta_writer(coalesced_delta_write_callback(&db));
+    let mut layer = BufferedWriteLayer::with_config(Arc::clone(&cfg), registry)?.with_delta_writer(delta_write_callback);
     tracing::info!("bootstrap.phase=buffered_write_layer_init elapsed_ms={}", t_layer.elapsed().as_millis());
 
     // The sidecar requires both indexed tables and object storage.
@@ -161,34 +159,6 @@ pub fn delta_write_callback(db: &crate::database::Database) -> crate::write::Del
     Arc::new(move |project_id: String, table_name: String, batches: Vec<RecordBatch>, wal_watermark: DeltaWatermark| {
         let db = db.clone();
         Box::pin(async move { db.insert_records_batch(&project_id, &table_name, batches, true, Some(&wal_watermark)).await })
-    })
-}
-
-/// Creates the optional one-commit-per-physical-table flush writer.
-pub fn coalesced_delta_write_callback(db: &crate::database::Database) -> crate::write::DeltaCoalescedWriteCallback {
-    let db = db.clone();
-    Arc::new(move |units: Vec<crate::write::FlushUnit>| {
-        let db = db.clone();
-        Box::pin(async move {
-            let (topics, units): (Vec<(String, String)>, Vec<_>) = units
-                .into_iter()
-                .map(|u| {
-                    (
-                        (u.project_id.clone(), u.table_name.clone()),
-                        crate::database::CoalescedWriteUnit { project_id: u.project_id, table_name: u.table_name, batches: u.batches, watermark: u.watermark },
-                    )
-                })
-                .unzip();
-            let results = db.insert_records_batches_coalesced(units).await;
-            // A successful commit proves this topic has Delta files even when
-            // concurrent snapshot attribution returns an empty added-file list.
-            topics
-                .iter()
-                .zip(&results)
-                .filter(|(_, result)| result.is_ok())
-                .for_each(|((project_id, table_name), _)| db.mark_delta_has_files(project_id, table_name));
-            results
-        })
     })
 }
 
