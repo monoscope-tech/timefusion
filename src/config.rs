@@ -2082,26 +2082,15 @@ pub struct MaintenanceConfig {
     /// `rm <data_dir>/repair_verified_sorted.txt` and a restart.
     #[serde_inline_default(true)]
     pub timefusion_repair_mark_sorted_at_write: bool,
-    /// Days back (plus today) the dedup sweep scans.
-    //
-    // This sweep is the ONLY caller of `record_certification`, and rollup routing
-    // needs a contiguous certified prefix across the query window — so the horizon
-    // must cover the widest query or no wide query can route to a rollup. Do NOT
-    // raise it without matching coordinator job concurrency. Keep in step with
-    // `timefusion_light_optimize_repair_days`.
+    /// Days back (plus today) `dedup_today_partitions` scans. The server never runs
+    /// that sweep (dirty bins and the certification pass replaced it); it only sizes
+    /// the sweep tests and benches run over their fixtures.
     #[serde_inline_default(35)]
     pub timefusion_dedup_lookback_days: u64,
-    /// Run the legacy partition-wide dedup probe as an audit/fallback. Dirty
-    /// sealed bins are the normal maintenance path.
-    #[serde(default)]
-    pub timefusion_dedup_sweep_fallback: bool,
     /// Optional comma-separated read canary projects.
     #[serde(default)]
     pub timefusion_rollup_read_projects: Option<String>,
     /// Sealed days back the backfill will build rollups for. 0 disables it.
-    /// Keep in step with `timefusion_dedup_lookback_days`: certification and
-    /// rollup coverage need the same horizon, or a day is certified but never
-    /// rolled up (or vice versa).
     #[serde_inline_default(31)]
     pub timefusion_rollup_backfill_days: u16,
     /// Most outstanding sealed-day rollup units the backfill lets one tier hold;
@@ -3087,12 +3076,11 @@ mod tests {
         );
     }
 
-    /// Both maintenance lookbacks must reach far enough back to serve a 30d query.
-    /// The repair lookback IS the suspect-set size, so it is bounded on both sides.
+    /// The repair lookback must reach far enough back to serve a 30d query, and it
+    /// IS the suspect-set size, so it is bounded on both sides.
     #[test]
     fn lookback_windows_cover_a_thirty_day_query_without_flooding() {
         let m = &AppConfig::default().maintenance;
-        assert!(m.timefusion_dedup_lookback_days >= 30, "the dedup sweep is what certifies partitions; below 30d no 30d query can ever route to a rollup");
         let d = m.timefusion_light_optimize_repair_days;
         assert!(d >= 30, "must cover the 30-day window users actually query, got {d}");
         assert!(d <= 45, "must not balloon the suspect set beyond the query window, got {d}");

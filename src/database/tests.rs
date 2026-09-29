@@ -4314,29 +4314,6 @@ fn maintenance_reconciliation_extracts_only_the_changed_partition(values: &[(&st
     Database::maintenance_partition_from_action(path, (!values.is_empty()).then_some(&values), default_project)
 }
 
-/// Today is swept on every tick; only the sealed tail rotates.
-#[test]
-fn sweep_rotation_never_rotates_today_out() {
-    // [today_a, today_b, sealed0, sealed1, sealed2, sealed3]
-    let sealed_from = 2;
-    for cursor in 0..12 {
-        let mut work = vec![100, 101, 0, 1, 2, 3];
-        super::rotate_sealed_tail(&mut work, sealed_from, cursor);
-        assert_eq!(&work[..2], &[100, 101], "today must stay at the front at cursor {cursor}");
-        let mut tail = work[2..].to_vec();
-        tail.sort_unstable();
-        assert_eq!(tail, vec![0, 1, 2, 3], "rotation must preserve the sealed set at cursor {cursor}");
-        assert_eq!(work[2], cursor % 4, "the sealed tail must resume at the cursor");
-    }
-    // Degenerate shapes must not panic.
-    let mut only_today = vec![1, 2];
-    super::rotate_sealed_tail(&mut only_today, 5, 3);
-    assert_eq!(only_today, vec![1, 2]);
-    let mut empty: Vec<i32> = vec![];
-    super::rotate_sealed_tail(&mut empty, 0, 7);
-    assert!(empty.is_empty());
-}
-
 /// The CPU ceiling is MEASURED, not pinned at `cores/3`.
 ///
 /// Prod 2026-09-19 sat at 10 of 10 cpu tokens with ~2,500 units eligible, 3 of 4
@@ -9313,7 +9290,6 @@ async fn dirty_dedup_bins_survive_restart() -> Result<()> {
 #[tokio::test]
 async fn dirty_dedup_bins_enqueue_seal_and_requeue() -> Result<()> {
     let (db, project) = dirty_bin_db("dirty-dedup-bins").await?;
-    assert!(!db.config.maintenance.timefusion_dedup_sweep_fallback, "the broad fallback sweep must default off");
     // 26h is well beyond the seal lag and keeps the test deterministic around midnight.
     let old = (Utc::now() - chrono::Duration::hours(26)).timestamp_micros();
 

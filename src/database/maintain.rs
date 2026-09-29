@@ -6803,16 +6803,6 @@ impl Database {
     /// last sweep, and skips partitions in failure backoff. Best-effort:
     /// per-partition errors are logged and back the partition off.
     pub async fn dedup_today_partitions(&self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, dedup_key: &str) -> Result<()> {
-        self.dedup_sweep(table_ref, table_name, dedup_key, None).await
-    }
-
-    /// `dedup_today_partitions` with a wall-clock bound on the tick.
-    ///
-    /// The sweep is O(dates × projects) with real IO per item; without a deadline it holds
-    /// `maintenance_job_sem` past its schedule and starves the dirty-bin drain. Items are
-    /// independent and idempotent, so truncation is safe, and the cursor rotates so the next
-    /// tick resumes where this one stopped.
-    async fn dedup_sweep(&self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, dedup_key: &str, deadline: Option<std::time::Instant>) -> Result<()> {
         let schema = schema_or_default(table_name);
         if schema.dedup_keys.is_empty() {
             return Ok(());
@@ -6833,8 +6823,6 @@ impl Database {
 
         let mut total_dropped = 0u64;
         let mut any_ok = false;
-        // One (date, project) work list, so the deadline can cut the pass at any point
-        // and the cursor can resume there.
         let mut work: Vec<(chrono::NaiveDate, String, Vec<String>)> = Vec::new();
         for date in dates {
             // Per-project live file lists for this date. Custom-project tables
@@ -6848,29 +6836,14 @@ impl Database {
                 false => work.extend(files_by_pid.into_iter().map(|(pid, files)| (date, pid, files))),
             }
         }
-        // Stable order (newest date first), then rotate: a truncated tick must not
-        // re-serve the same prefix on the next one.
         work.sort_by(|(da, pa, _), (db, pb, _)| db.cmp(da).then_with(|| pa.cmp(pb)));
-        let total_work = work.len();
-        // Today never rotates out: rotation exists so a truncated tick resumes into
-        // UNSEEN sealed work, but today is re-dirtied by every flush and is what the
-        // hot queries read, so it must be swept on every tick.
-        let sealed_from = work.partition_point(|(date, _, _)| *date >= today);
-        rotate_sealed_tail(&mut work, sealed_from, self.dedup_sweep_cursor.load(std::sync::atomic::Ordering::Relaxed));
-        for (swept, (date, pid, cur_files)) in work.iter().enumerate() {
+        for (date, pid, cur_files) in &work {
             let (date, pid) = (*date, pid);
             // A mid-sweep tick must not run against a closing Foyer cache and hang the
             // graceful drain.
             if self.maintenance_shutdown.is_cancelled() {
                 debug!("dedup sweep: shutdown requested, aborting table={}", table_name);
                 return Ok(());
-            }
-            if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
-                // Advance by the SEALED items covered, since only the sealed tail
-                // rotates; counting today's prefix would skip never-swept sealed work.
-                self.dedup_sweep_cursor.fetch_add(swept.saturating_sub(sealed_from), std::sync::atomic::Ordering::Relaxed);
-                info!(table_name, swept, remaining = total_work - swept, event = "dedup_sweep_truncated");
-                break;
             }
             // Incremental skip: a partition certified clean whose live file set is
             // unchanged since that pass cannot have gained dupes — they only arrive in
@@ -6892,19 +6865,7 @@ impl Database {
                 debug!("dedup sweep: {} in failure backoff, skipping", backoff_key);
                 continue;
             }
-            // BOUND the partition by what is left of the sweep. The deadline check
-            // above only gates ADMISSION: without this a single slow partition runs
-            // unbounded past it, and since `spawn_cron_job` drops overlapping ticks
-            // that wedges the whole dedup job, dirty-bin drain included. A partition
-            // abandoned here is re-swept next tick — the pass is idempotent and a
-            // truncated one certifies nothing.
-            let swept = match deadline.map(|d| d.saturating_duration_since(std::time::Instant::now())) {
-                Some(budget) => tokio::time::timeout(budget, self.dedup_partition(table_ref, table_name, pid, date))
-                    .await
-                    .unwrap_or_else(|_| Err(anyhow::anyhow!("dedup of {pid}/{date} exceeded the sweep's remaining {budget:?}"))),
-                None => self.dedup_partition(table_ref, table_name, pid, date).await,
-            };
-            match swept {
+            match self.dedup_partition(table_ref, table_name, pid, date).await {
                 Ok((d, complete)) => {
                     self.dedup_backoff.remove(&backoff_key);
                     total_dropped += d;
@@ -7671,13 +7632,9 @@ impl Database {
         self.persist_dirty_bins();
     }
 
-    /// One table's dedup of sealed partitions (dirty-bin rewrite + optional
-    /// fallback sweep). The 90s deadline is a warning threshold, not a
+    /// One table's dirty-bin dedup of sealed partitions. The 90s deadline is a warning threshold, not a
     /// cancellation: a slow-but-healthy table is allowed to finish.
-    pub(crate) async fn run_dedup_for_table(
-        &self, table: &Arc<RwLock<DeltaTable>>, table_name: &str, dedup_key: &str, label: &str, drain_deadline: std::time::Instant,
-        sweep_deadline: std::time::Instant,
-    ) {
+    pub(crate) async fn run_dedup_for_table(&self, table: &Arc<RwLock<DeltaTable>>, table_name: &str, label: &str, drain_deadline: std::time::Instant) {
         if !self.config.maintenance.timefusion_dirty_bin_dedup_enabled {
             debug!(table_name, event = "dirty_bin_dedup_paused", "physical dirty-bin dedup is disabled; read-side dedup remains active");
             return;
@@ -7704,13 +7661,6 @@ impl Database {
         };
         let drained = self.dedup_dirty_bins_for_table(table, table_name, &|| self.dedup_flush_healthy(), DEDUP_BIN_STAGE_DEADLINE, drain_deadline).await;
         note("Dirty-bin dedup", t0.elapsed(), drained);
-        if self.config.maintenance.timefusion_dedup_sweep_fallback {
-            let t0 = std::time::Instant::now();
-            // The sweep is the pass's unbounded half (see `dedup_sweep`); the
-            // drain above is bounded per bin and is the work worth finishing.
-            let swept = self.dedup_sweep(table, table_name, dedup_key, Some(sweep_deadline)).await;
-            note("Dedup fallback sweep", t0.elapsed(), swept);
-        }
     }
 
     /// Sealed dates a REPAIR pass scans for footer repair (yesterday backwards).

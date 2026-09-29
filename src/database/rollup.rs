@@ -817,14 +817,12 @@ impl Database {
                         return;
                     };
                     info!("Running scheduled dedup on sealed partitions");
-                    // One budget for the whole pass, split between its two
-                    // sequential halves so the drain cannot starve the sweep.
+                    // One budget for the whole pass; the dirty-bin drain stops
+                    // admitting bins at 60% of it, certification may use the rest.
                     let budget = db.config.derived.tick_budget(cron_period(&db.config.maintenance.timefusion_dedup_schedule));
                     let now = std::time::Instant::now();
-                    // The drain gets the larger share: the sweep resumes at a
-                    // cursor, a half-drained bin does not.
                     let drain_deadline = now + budget.mul_f64(0.6);
-                    let sweep_deadline = now + budget;
+                    let pass_deadline = now + budget;
                     // Rotate the table order: a fixed order lets the first table
                     // spend the shared budget and starve the rest forever.
                     let mut tables = db.all_tables().await;
@@ -840,14 +838,11 @@ impl Database {
                         // `drain_deadline` bounds admission only, so one admitted
                         // bin can hold `maintenance_job_sem` for its full stage
                         // deadline and wedge every other job.
-                        db.run_certification_pass(&table, &table_name, sweep_deadline).await;
+                        db.run_certification_pass(&table, &table_name, pass_deadline).await;
                         if get_schema(&table_name).is_some_and(|schema| !schema.rollups.is_empty()) {
                             continue;
                         }
-                        // Dedup key: bare table name for unified tables, tenant-scoped
-                        // for custom-storage ones (they are separate Delta logs).
-                        let key = if project_id.is_empty() { table_name.clone() } else { format!("{project_id}:{table_name}") };
-                        db.run_dedup_for_table(&table, &table_name, &key, &Self::table_label(&project_id, &table_name), drain_deadline, sweep_deadline).await;
+                        db.run_dedup_for_table(&table, &table_name, &Self::table_label(&project_id, &table_name), drain_deadline).await;
                     }
                 }
             }

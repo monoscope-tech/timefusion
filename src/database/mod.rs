@@ -2889,8 +2889,6 @@ pub struct Database {
     // start point the tail would never be reached.
     /// Index into the light-optimize tick's debt-ordered project list.
     light_optimize_cursor: Arc<std::sync::atomic::AtomicUsize>,
-    /// Count of (date, project) items served by the last truncated dedup sweep.
-    dedup_sweep_cursor: Arc<std::sync::atomic::AtomicUsize>,
     /// Which table a dedup tick starts with.
     dedup_table_cursor: Arc<std::sync::atomic::AtomicUsize>,
     /// One repair pass process-wide: the light pool is shared by every table, and two tables
@@ -3459,7 +3457,6 @@ impl Database {
             zorder_filesets: Arc::new(RwLock::new(HashMap::new())),
             checkpoint_versions: Arc::new(dashmap::DashMap::new()),
             light_optimize_cursor: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            dedup_sweep_cursor: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             dedup_table_cursor: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             repair_pass_permit: Arc::new(tokio::sync::Semaphore::new(1)),
             staged_intent_manifest_lock: Arc::new(std::sync::Mutex::new(())),
@@ -6781,25 +6778,11 @@ fn pack_sort_partitions(pack_pool_bytes: usize, k: usize, cores: usize) -> usize
     memory_bound.min(cpu_bound).max(MAINTENANCE_MAX_PARTITIONS)
 }
 
-/// Where a deadline-truncated dedup sweep resumes: the served-item cursor
-/// wrapped into the current work list. The cursor only ever grows (each tick
-/// adds what it served), so the modulo is what makes successive short ticks walk
-/// the whole list instead of re-serving its head.
+/// Where a rotated dedup tick starts: the cursor wrapped into the current table
+/// list. The cursor only ever grows, so the modulo is what makes successive ticks
+/// walk the whole list instead of re-serving its head.
 fn sweep_resume_offset(len: usize, cursor: usize) -> usize {
     if len == 0 { 0 } else { cursor % len }
-}
-
-/// Rotate only the sealed tail of a sweep work list, leaving the first
-/// `sealed_from` items (today) pinned at the front.
-///
-/// Rotation exists so a deadline-truncated tick resumes into sealed work it has
-/// not seen. Today must be exempt: it is re-dirtied by every flush and is what
-/// the hot queries read, so it has to be swept on every tick.
-fn rotate_sealed_tail<T>(work: &mut Vec<T>, sealed_from: usize, cursor: usize) {
-    let mut sealed = work.split_off(sealed_from.min(work.len()));
-    let offset = sweep_resume_offset(sealed.len(), cursor);
-    sealed.rotate_left(offset);
-    work.append(&mut sealed);
 }
 
 /// Decrement-on-drop gauge, so a bin that times out or panics still clears its
