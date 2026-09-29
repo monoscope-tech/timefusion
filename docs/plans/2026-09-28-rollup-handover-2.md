@@ -234,3 +234,11 @@ All routed hybrid; `foyer.insert_bypassed` did not move. Script: `scratchpad/shi
   - **Deploy anytime; sessions stay paused either way.** Before resuming sessions v2 (W27), watch `rollup_miss_sub_grain_slices_total` drain.
 - **Batching:** W54 and W56 can go out as one deploy (one restart) after combining them on a branch and running one combined `make ci-signoff`. Run nothing else in parallel; tonight's parallel signoffs took 69–90 min under contention.
 
+**`batch/morning` (W54 hardened + W56) is signed off and ready to deploy: `c57b6dcd`** on master `40ada60e`. The combined `make ci-signoff` passed all 5 checks: test 2483/2483, e2e 73/73, pg-smoke, fmt, clippy.
+- **To deploy, if the owner says go:**
+  1. `cd ~/Projects/apitoolkit/tf-w54 && git fetch origin`.
+  2. If `origin/master` moved with code, rebase and re-run `make ci-signoff`; docs-only moves are fine.
+  3. `git push origin batch/morning:master`.
+  4. After it lands, re-time shipbubble (including a 2-day-old trace lookup) and watch `lossy_rewrite_refusals_total`.
+- **Signoff timing, uncontended (load ~6): 11 min total.** test 6.3 min (nextest 4.1 min), clippy 8.8 min (runs in the background in parallel), e2e 2.1 min, pg-smoke 9 s (image cached). The same signoff took 69–90 min last night with 3–5 builds competing. **Run one signoff at a time.**
+
