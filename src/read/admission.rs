@@ -67,7 +67,7 @@ const HEAVY_HELD_LOG_AFTER: std::time::Duration = std::time::Duration::from_secs
 /// query-pool geometry.
 static HEAVY_SEM: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
 
-fn heavy_sem() -> &'static Arc<tokio::sync::Semaphore> {
+pub(crate) fn heavy_sem() -> &'static Arc<tokio::sync::Semaphore> {
     HEAVY_SEM.get_or_init(|| {
         let k = crate::config::try_config().map_or(8, |cfg| {
             let partitions = match cfg.memory.timefusion_query_partitions {
@@ -204,9 +204,9 @@ impl PhysicalOptimizerRule for HeavyQueryAdmission {
         if class.is_none() && bytes.is_none() {
             return Ok(plan);
         }
-        // `execute_stream` runs each partition of a multi-partition root under its
-        // own coalesce; coalescing here, as it would, keeps the charge once per query.
-        let plan = match bytes.is_some() && plan.properties().partitioning.partition_count() > 1 {
+        // A multi-partition root is executed once per partition (`execute_stream`
+        // coalesces over it); coalescing here keeps one slot and charge per query.
+        let plan = match plan.properties().partitioning.partition_count() > 1 {
             true => Arc::new(CoalescePartitionsExec::new(plan)),
             false => plan,
         };

@@ -10220,3 +10220,44 @@ async fn a_scan_over_the_byte_cap_is_refused(cap: u64) -> bool {
         }
     }
 }
+
+/// A heavy query whose root has several output partitions holds ONE heavy slot
+/// while it runs, not one per partition. Prod: monoscope's hash-partitioned
+/// `served` GROUP BY took all eight slots at once.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_multi_partition_heavy_query_takes_one_heavy_slot() -> Result<()> {
+    let db = Arc::new(db_where("heavy-slot-once", |_| {}).await?);
+    db.cancel_maintenance();
+    let project = format!("heavy_slot_{}", uuid::Uuid::new_v4().simple());
+    let at = crate::support::now_micros();
+    // Enough distinct ids that several hash partitions are nonempty.
+    for i in 0..32 {
+        insert_a_span(&db, &project, &format!("s{i}"), at + i * 1_000_000).await?;
+    }
+    let session = |pgwire| -> Result<SessionContext> {
+        let mut ctx = Arc::clone(&db).create_session_context_for(pgwire);
+        db.setup_session_context(&mut ctx)?;
+        Ok(ctx)
+    };
+    let sql = format!("SELECT id, row_number() OVER (PARTITION BY id ORDER BY timestamp) FROM otel_logs_and_spans WHERE project_id = '{project}'");
+    let ungated = session(false)?.sql(&sql).await?.create_physical_plan().await?;
+    let shown = datafusion::physical_plan::displayable(ungated.as_ref()).indent(true).to_string();
+    assert!(ungated.properties().partitioning.partition_count() > 1, "the root must have several partitions:\n{shown}");
+    let ctx = session(true)?;
+    let plan = ctx.sql(&sql).await?.create_physical_plan().await?;
+    let shown = datafusion::physical_plan::displayable(plan.as_ref()).indent(true).to_string();
+    assert!(shown.starts_with("AdmissionExec"), "the root must be gated:\n{shown}");
+
+    // Every root partition executed and held open, as `collect_partitioned` and
+    // `execute_stream`'s coalesce do; a partition that yields a batch keeps its slot.
+    let sem = crate::read::admission::heavy_sem();
+    let before = sem.available_permits();
+    let mut streams = (0..plan.properties().partitioning.partition_count()).map(|p| plan.execute(p, ctx.task_ctx())).collect::<DFResult<Vec<_>>>()?;
+    for stream in &mut streams {
+        futures::StreamExt::next(stream).await.transpose()?;
+    }
+    assert_eq!(before - sem.available_permits(), 1, "one running query holds one heavy slot:\n{shown}");
+    drop(streams);
+    assert_eq!(sem.available_permits(), before, "the query returns its slot");
+    Ok(())
+}
