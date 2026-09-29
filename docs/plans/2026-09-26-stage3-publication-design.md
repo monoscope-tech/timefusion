@@ -1,5 +1,7 @@
 # W9: Stage 3 publication batching — implementable design
 
+Status: reference for rollup-plan.md task "Stage 3 steps 2–3: StagedRollup split and batched queue".
+
 Status: analysis/design only. Code references are to `~/Projects/apitoolkit/tf-packed` at `77ab1518`.
 Plan: `docs/plans/2026-09-24-rollups-on-a-fixed-server.md` § "Stage 3: batch publication and reuse
 existing durability", § "Local checkpoint-sharing candidate", § "Dependencies, not a serial rewrite".

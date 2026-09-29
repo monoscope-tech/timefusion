@@ -92,4 +92,4 @@ This review does not establish behavior outside the selected patch or replace th
 - Update every affected workspace dependency reference consistently.
 - Build and check the release from its committed manifest and lockfile.
 
-The [deployment checklist](../../docs/plans/2026-09-25-first-rollup-deployment.md) defines the remaining release gates.
+The [rollup plan](../../docs/plans/rollup-plan.md) tracks the remaining release gates.

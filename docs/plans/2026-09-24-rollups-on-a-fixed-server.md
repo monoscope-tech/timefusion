@@ -1,6 +1,6 @@
 # Rollups on a fixed server: incremental implementation plan
 
-The [first-deployment checklist](2026-09-25-first-rollup-deployment.md) defines the initial release scope, validation gates, canary, and rollback requirements.
+Status: reference for rollup-plan.md tasks "Stage 1C", "Captured source view" and "Stages 4–6 (conditional)". Current status and task list: [rollup-plan.md](rollup-plan.md).
 
 Date: 2026-09-24. Status: implementation in progress, not deployed. Code baseline: `08d34190`. This revision incorporates review of the existing coverage work and recent production incidents.
 
@@ -51,7 +51,7 @@ Those results precede an additional required quota-error fix. A real-file regres
 The candidate now records the file charge before returning the quota error. All 114 selected execution and spill tests passed.
 Strict Clippy and the full lint suite remain pending for this expanded patch.
 The remaining dependency checks exposed a local license-tool mismatch, not a Rust defect. The CI-pinned tool passed without source changes.
-The [deployment checklist](2026-09-25-first-rollup-deployment.md#batched-release-validation) records the remaining checks and the combined validation boundary.
+The [rollup plan](rollup-plan.md) records the release outcome.
 
 1. Capture steady-state attribution and the executed shard-count inventory without additional production source scans.
 2. Record each tier's current query consumers, routing eligibility, and maintenance cost.

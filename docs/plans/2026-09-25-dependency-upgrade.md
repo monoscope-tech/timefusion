@@ -8,7 +8,7 @@ Existing results for DataFusion 54 do not establish correctness or performance f
 
 Deployment priority: keep this upgrade in a separate commit, but combine compatible ready changes into one checked release artifact.
 The user requested fewer production deployments, not weaker checks.
-The [deployment checklist](2026-09-25-first-rollup-deployment.md) defines the release gates and authorization.
+The [rollup plan](rollup-plan.md) records the release gates and their outcome.
 An unfinished upgrade does not automatically delay independently releasable fixes.
 
 ## Candidate stack
