@@ -1699,6 +1699,9 @@ atomic_stats! {
         /// Strip plans that still paid a sort: the footer ordering did not carry
         /// the ORDER BY. Should stay 0; each one is a whole-file sort.
         dv_strip_plan_sorts as "dv_strip_plan_sorts_total",
+        /// Rewrites the exact-count guard refused as lossy; their inputs are
+        /// parked (`Database::lossy_parked`) instead of re-staged. Should stay 0.
+        lossy_rewrite_refusals as "lossy_rewrite_refusals_total",
         /// Admission capacities and the live lag-scaled CPU limit. Without these,
         /// a used-token gauge pinned at 28 cannot distinguish saturation from an
         /// accidental 28-token configuration ceiling.

@@ -1808,6 +1808,16 @@ impl TaskJournal {
                 return false;
             }
             let task = &mut self.snapshot.tasks[index];
+            // File hygiene is re-planned from the SAME debt every tick, which is no new
+            // information: re-pending at the planner's `now` would erase the backoff the
+            // last attempt earned (the 600 s disagreement guard, a refused rewrite).
+            // Rollups are exempt: an invalidation or flush must re-mint them at once.
+            if task.state == TaskState::Retry
+                && matches!(key.operation, Operation::HotPacking | Operation::SealedConsolidation | Operation::Repair)
+                && task.deadline_micros > deadline_micros
+            {
+                return true;
+            }
             if task.state != TaskState::Running {
                 let new_deadline = task.deadline_micros.min(deadline_micros);
                 let changed = task.state != TaskState::Pending
@@ -6543,6 +6553,21 @@ mod tests {
         assert!(!journal.split_time_task(&repair, MAX_DECODED_BYTES * 8, None, &[]), "repair must decline to split");
         assert_eq!(journal.snapshot.tasks.len(), before, "a declined split must mint no children");
         assert_eq!(journal.state(&repair), Some(TaskState::Pending), "and must not supersede the parent");
+    }
+
+    /// The planner re-derives a hygiene cell's debt every tick; re-queueing it must not
+    /// erase the backoff the last attempt earned, or a refused rewrite re-stages every
+    /// tick. A rollup re-mint is new data and still pulls the unit forward.
+    #[test_case::test_case(Operation::SealedConsolidation => 600 ; "a hygiene retry keeps its backoff")]
+    #[test_case::test_case(Operation::Repair => 600 ; "a repair retry keeps its backoff")]
+    #[test_case::test_case(Operation::BaseRollup => 0 ; "a rollup re-mint is pulled forward")]
+    fn a_planner_tick_keeps_a_hygiene_retry_backoff(operation: Operation) -> i64 {
+        let (_dir, mut journal) = new_journal();
+        let now = 10 * DAY_MICROS;
+        let key = running_unit(&mut journal, task("p", DAY_MICROS, 2 * DAY_MICROS, operation), 1);
+        journal.retry(&key, "compaction_debt_remaining".to_owned(), now + 600_000_000);
+        journal.enqueue(key.clone(), now, 1, 0);
+        (requeued_deadline(&journal, &key) - now) / 1_000_000
     }
 
     #[test_case::test_case(Operation::Dedup, "worker_error")]

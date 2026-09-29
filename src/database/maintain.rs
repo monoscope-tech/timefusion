@@ -6,6 +6,10 @@ use std::hash::BuildHasher;
 use tap::Tap;
 
 const ROLLUP_PROOF_RETRY_MICROS: i64 = 1_000_000;
+/// Test hook: rows added to the exact-count guard's expected live count, so a
+/// rewrite reads as lossy and is refused.
+#[cfg(test)]
+static FORCE_LOSSY_REWRITE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Census re-admissions declined as a finished no-op; OTel only, no stats row.
 pub(crate) const CENSUS_READMIT_DECLINED: &str = "timefusion.rollup.census_readmit_declined";
 
@@ -1705,8 +1709,13 @@ impl Database {
                         continue;
                     };
                     // Event ranges for TODAY only: they place a file in its slice cell.
+                    let dv = file.deletion_vector_descriptor();
+                    // The packer's own exclusion: debt it will not rewrite is not queued.
+                    if self.lossy_parked(&path, dv.as_ref().map_or(0, |dv| dv.cardinality)) {
+                        continue;
+                    }
                     let stats = (date == today).then(|| file.stats()).flatten();
-                    let has_dv = file.deletion_vector_descriptor().is_some();
+                    let has_dv = dv.is_some();
                     partitions.entry((project, date)).or_default().push(TailAdd::from_stats(path.to_string(), file.size(), false, has_dv, stats.as_deref()));
                 }
             }
@@ -3829,6 +3838,31 @@ impl Database {
         }
     }
 
+    /// Whether a lossy-rewrite refusal parks `path`: only while its deletion vector
+    /// is the one refused, since a changed DV is a changed input.
+    pub(crate) fn lossy_parked(&self, path: &str, dv_cardinality: i64) -> bool {
+        self.lossy_refusals.get(path).is_some_and(|park| park.0 == dv_cardinality && park.2 > crate::support::now_micros())
+    }
+
+    /// Park every input of a refused rewrite, so neither planner nor packer offers
+    /// the set again until the park lapses or an input's DV changes.
+    fn park_lossy_refusal(&self, table_name: &str, project_id: &str, targets: &[deltalake::kernel::Add]) {
+        crate::observability::maintenance_stats().lossy_rewrite_refusals.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let now = crate::support::now_micros();
+        let parks = targets
+            .iter()
+            .map(|add| {
+                let cardinality = add.deletion_vector.as_ref().map_or(0, |dv| dv.cardinality);
+                let mut park = self.lossy_refusals.entry(add.path.clone()).or_insert((cardinality, 0, 0));
+                let strikes = park.1 + 1;
+                *park = (cardinality, strikes, now.saturating_add(LOSSY_PARK_MICROS << (strikes - 1).min(4)));
+                strikes
+            })
+            .collect_vec();
+        let files = targets.iter().map(|add| add.path.as_str()).collect_vec();
+        warn!(table_name, project_id, ?files, ?parks, event = "lossy_rewrite_parked", "the exact-count guard refused a rewrite; parking its inputs");
+    }
+
     async fn coordinator_compaction_files(&self, table_ref: &Arc<RwLock<DeltaTable>>, key: &crate::maintenance_coordinator::TaskKey) -> Result<Vec<String>> {
         use crate::maintenance_coordinator::Operation;
         let date = chrono::DateTime::from_timestamp_micros(key.slice.start_micros)
@@ -3856,13 +3890,11 @@ impl Database {
                         return None;
                     }
                     after_project += 1;
-                    let add = TailAdd::from_stats(
-                        path.to_string(),
-                        file.size(),
-                        is_sorted_run(&file.tags()),
-                        file.deletion_vector_descriptor().is_some(),
-                        file.stats().as_deref(),
-                    );
+                    let dv = file.deletion_vector_descriptor();
+                    if self.lossy_parked(&path, dv.as_ref().map_or(0, |dv| dv.cardinality)) {
+                        return None;
+                    }
+                    let add = TailAdd::from_stats(path.to_string(), file.size(), is_sorted_run(&file.tags()), dv.is_some(), file.stats().as_deref());
                     if add.event_range.is_some_and(|(start, end)| start >= key.slice.end_micros || end < key.slice.start_micros) {
                         return None;
                     }
@@ -5333,6 +5365,11 @@ impl Database {
     pub(crate) fn carry_rewrite_witness(
         &self, table: &DeltaTable, source: &str, project_id: &str, inputs: &[deltalake::kernel::Add], outputs: &[deltalake::kernel::Add],
     ) {
+        // Masked rows are keep-greatest losers the tier never counted only on a
+        // version-append source with a declared tiebreak.
+        if get_schema(source).is_none_or(|schema| !schema.version_append || schema.dedup_tiebreak.is_none()) {
+            return;
+        }
         let side = |adds: &[deltalake::kernel::Add]| {
             adds.iter().map(|add| (add_ts_bounds(add).1, add_row_count(add).and_then(|rows| i64::try_from(rows).ok()).unwrap_or(0))).collect_vec()
         };
@@ -8435,8 +8472,10 @@ impl Database {
                 }
             }
             let _ = ctx.deregister_table(&bin_table);
+            #[cfg(test)]
+            let live_in = live_in.map(|live| live + FORCE_LOSSY_REWRITE.load(std::sync::atomic::Ordering::Relaxed));
             if masked_in && live_in.is_some_and(|live| live != rows_staged as u64) {
-                anyhow::bail!("masked rewrite staged {rows_staged} rows but the inputs hold {live_in:?} live — refusing to commit a lossy rewrite");
+                anyhow::bail!("masked rewrite staged {rows_staged} rows but the inputs hold {live_in:?} live — {LOSSY_REWRITE_REFUSAL}");
             }
             if rows_staged == 0 {
                 // Staging nothing is either an empty selection or a bin of
@@ -8451,7 +8490,7 @@ impl Database {
             // deletion vector, since a DV makes the scan return fewer rows than
             // `numRecords`; declining to check is safe, falsely aborting is not.
             if passes.len() > 1 && targets.iter().all(|a| a.deletion_vector.is_none()) && rows_in > 0 && rows_staged != rows_in as usize {
-                anyhow::bail!("sliced repair staged {rows_staged} rows but the inputs hold {rows_in} — refusing to commit a lossy rewrite");
+                anyhow::bail!("sliced repair staged {rows_staged} rows but the inputs hold {rows_in} — {LOSSY_REWRITE_REFUSAL}");
             }
             let final_flush_at = std::time::Instant::now();
             adds.extend(writer.flush().await.map_err(|e| anyhow::anyhow!("hot bin flush: {e}"))?.into_iter().map(tag_sorted));
@@ -8490,6 +8529,9 @@ impl Database {
             // classifier: a spilling sort dies with "Not enough memory to
             // continue external sort", which a "Resources exhausted" match misses.
             let exhausted = crate::maintenance_coordinator::is_capacity_failure(&e.to_string());
+            if e.to_string().contains(LOSSY_REWRITE_REFUSAL) {
+                self.park_lossy_refusal(table_name, project_id, &targets);
+            }
             if pass == TailPass::Repair {
                 let level = self.repair_level(&files);
                 let (retry_at, step) = repair_failure_action(exhausted, level);
@@ -11609,6 +11651,46 @@ mod rollup_noop_skip_tests {
         let (routed, served, after) = answer().await?;
         assert!(routed, "the carried witness keeps the slice routed across the strip");
         assert_eq!((served, after), (raw.clone(), raw), "and it answers exactly as before, and as raw");
+        Ok(())
+    }
+
+    /// A rewrite the exact-count guard refuses must not re-stage on the next planner
+    /// tick — prod would pay a full rewrite every ~minute forever. Its inputs park,
+    /// the refusal is counted, and once the park lapses the pack lands normally.
+    #[serial]
+    #[tokio::test]
+    async fn a_refused_lossy_rewrite_parks_its_inputs_instead_of_restaging() -> Result<()> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let db = Arc::new(Database::with_config(rollup_cfg("dv_refusal")).await?);
+        let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+        let noon = (chrono::Utc::now().date_naive() - chrono::Duration::days(3)).and_hms_opt(12, 0, 0).expect("valid hour").and_utc().timestamp_micros();
+        for rows in [
+            vec![test_span_ts("dup", "first", &project_id, noon), test_span_ts("other", "op", &project_id, noon + 1)],
+            vec![test_span_ts("dup", "second", &project_id, noon)],
+        ] {
+            db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![json_to_batch(rows)?], true, None).await?;
+        }
+        dedup_unified(&db).await?;
+        let table = db.resolve_table(&project_id, "otel_logs_and_spans").await?;
+        let partition = || async {
+            let t = table.read().await;
+            let adds = t.snapshot()?.log_data().iter().map(|f| add_action(&f)).filter(|add| add.path.contains(&project_id)).collect_vec();
+            anyhow::Ok((adds.len(), adds.iter().filter(|add| add.deletion_vector.is_some()).count()))
+        };
+        let stats = crate::observability::maintenance_stats();
+        let before = stats.lossy_rewrite_refusals.load(Relaxed);
+        let tick = || async {
+            db.plan_compaction_debt().await?;
+            db.run_coordinator_compaction_once(Operation::SealedConsolidation).await?;
+            anyhow::Ok((stats.lossy_rewrite_refusals.load(Relaxed) - before, partition().await?))
+        };
+        FORCE_LOSSY_REWRITE.store(1, Relaxed);
+        assert_eq!(tick().await?, (1, (2, 1)), "the guard refuses and nothing commits");
+        crate::support::advance_micros(60 * 1_000_000);
+        assert_eq!(tick().await?, (1, (2, 1)), "past the unit's retry and a planner tick, the refused set must not re-stage");
+        FORCE_LOSSY_REWRITE.store(0, Relaxed);
+        crate::support::advance_micros(LOSSY_PARK_MICROS);
+        assert_eq!(tick().await?, (1, (1, 0)), "once the park lapses the pack lands");
         Ok(())
     }
 

@@ -2758,6 +2758,9 @@ pub struct Database {
     /// Consecutive staging failures per repair candidate — an always-failing file starves every
     /// candidate behind it; see `REPAIR_QUARANTINE_AFTER`.
     repair_failures: Arc<dashmap::DashMap<String, u32>>,
+    /// Inputs of a rewrite the exact-count guard refused: path -> (DV cardinality
+    /// at refusal, strikes, parked until µs). See `Database::lossy_parked`.
+    lossy_refusals: Arc<dashmap::DashMap<String, (i64, u32, i64)>>,
     /// Index into [`REPAIR_SORT_PARTITION_LADDER`] for candidates that exhausted the pool at higher
     /// parallelism; cleared on success.
     repair_degradation: Arc<dashmap::DashMap<String, usize>>,
@@ -3405,6 +3408,7 @@ impl Database {
             repair_verified_lock: Arc::new(std::sync::Mutex::new(())),
             repair_verified_appends: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             repair_failures: Arc::new(dashmap::DashMap::new()),
+            lossy_refusals: Arc::new(dashmap::DashMap::new()),
             repair_degradation: Arc::new(dashmap::DashMap::new()),
             maintenance_rewrite_sem: Arc::new(tokio::sync::Semaphore::new(cfg.derived.rewrite_permits().max(1))),
             light_rewrite_sem: Arc::new(tokio::sync::Semaphore::new(light_rewrite_permits)),
@@ -6353,6 +6357,15 @@ pub(crate) fn pack_target_bytes(configured: i64, budget: std::time::Duration) ->
 /// deterministically and would otherwise be re-selected every pass. Three, not one, because
 /// staging also fails transiently (OCC race, restart mid-stage). A success clears the count.
 const REPAIR_QUARANTINE_AFTER: u32 = 3;
+
+/// Suffix every exact-count rewrite guard ends its error with, so a refusal is
+/// told apart from a transient failure across the `anyhow` boundary.
+pub(crate) const LOSSY_REWRITE_REFUSAL: &str = "refusing to commit a lossy rewrite";
+
+/// First park of a refused rewrite's inputs, doubling per strike up to 16x. The
+/// refusal is deterministic for an unchanged file set, so without a park the
+/// planner re-queues it every tick at full rewrite cost.
+const LOSSY_PARK_MICROS: i64 = 3_600 * 1_000_000;
 
 /// Sort parallelism ladder a repair bin is retried at before its pool exhaustion is believed.
 ///
