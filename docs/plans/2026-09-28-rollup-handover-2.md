@@ -267,3 +267,22 @@ All routed hybrid; `foyer.insert_bypassed` did not move. Script: `scratchpad/shi
 - **W57, building:** DV strip on by default for sealed dates only (`date < today` inside `dv_strip_admits`). This avoids the review's two today-partition risks (whole-partition pricing, racing dedup). **Owner decision:** deploy it (one more restart, before 11:30 or after 18:05)? The alternative, setting `TIMEFUSION_DV_STRIP_ENABLED=true` on the CapRover service, also enables today's partitions, which the review advised against.
 - **Gate window:** asked timefusion-65 (it deployed twice overnight) to make no code pushes 12:00–18:00 UTC.
 
+**06:43 UTC: W57 deployed (`43af26a4`, owner-approved): DV strip on by default for sealed dates only.** Image `e71cbf2b`, up 06:45. At 06:58 (13 min in):
+- `dv_rewrites_landed_total` 62; `dv_rewrite_rows_retired_total` 4.99M masked rows removed.
+- `rollup_witness_carried_total` 466: rollups stayed routed through the strips.
+- `lossy_rewrite_refusals_total` 0; `admission_refused_state_bytes_total` 0.
+- Container: ~29 cores during the burst (normal maintenance ~17), memory 18 GiB.
+- Query latency held: p95 0.21 s, p99 0.49 s. Shipbubble 24h status 0.84 s.
+- Shipbubble 2-day-old trace lookup mid-burst: 30 s → 15.9 s cold, 8.5 s → 3.1 s warm. Re-measure once 09-26/27 are fully stripped.
+- **Watch:** `dv_strip_plan_sorts_total` = 17. The counter fires for any strip-flagged pass whose plan has a `SortExec`, including multi-file sealed packs that legitimately merge-sort and files without a sorted-run footer, not only 1:1 strips. Memory and latency are fine. Follow-up: split the counter by 1:1 strip vs pack, and confirm 1:1 strips never sort.
+
+**Today's partition — where the masks come from** (measured over every live 09-29 file for Talstack (131) and shipbubble (77); all 214 DV bitmaps decoded; details in scratchpad `maskorigin/results.md`):
+- **~57% (Talstack) / 62% (shipbubble) of masked rows are EXACT duplicates TF manufactures.** When an UPDATE/DELETE lands on a bucket during its flush commit, `finish_flushed_snapshot` (mem_buffer.rs ~1395) finishes "dirty", keeps ALL of the bucket's rows and re-flushes the whole bucket, re-committing the prefix that already landed. Signature: two commits of the same bucket 1.8–62 s apart. Talstack had 12 events over 10 of ~70 buckets.
+- **Table-wide, re-flush copies are ≥ 21% of all rows flushed today.** The landed-batch skip can't catch this: 0 repeated digests across 1,206 commits.
+- **The other ~40%** are real MoR versions from monoscope's pattern-tag `hashes` UPDATE (differ only in `hashes` and `updated_at`).
+- Same class as the 09-02 "we manufacture the duplicates" finding, at a different seam: the dirty-flush re-commit rather than WAL replay.
+
+**In progress:**
+- **W58 (DV strip for today):** prices strip units by the bin they rewrite; a lost race with dedup is a plain retry, not a park; per-cell rate limit, most-masked files first.
+- **W59 (stop the dirty re-flush from re-committing the whole bucket):** drain the unchanged snapshotted batches, re-flush only what changed; kill switch; counters `flush.dirty_reflush_rows_{drained,reflushed}`. It is on the write path, so its worst case is lost or duplicated acked rows. **Deploy decision for the owner:** hold W59 until after 18:05 (recommended), or accept that a problem between 12:00 and 18:00 means pushing a fix into the gate window and re-running the gate tomorrow.
+
