@@ -4403,6 +4403,63 @@ impl Database {
         });
     }
 
+    /// Fetch the bodies of landed DV strips' outputs dated today or yesterday. A
+    /// strip swaps a cached file for a new one, which write capture skips above
+    /// its cap and the post-commit warm fetches only the footer of, so the first
+    /// query paid the whole body. Detached, under the hot-body preload's gates,
+    /// per-project cap and pace; one body in flight, and none past the cache's
+    /// block size, which it cannot hold.
+    fn warm_strip_bodies(&self, table_ref: &Arc<RwLock<DeltaTable>>, landed: &[StagedBin]) {
+        let m = &self.config.maintenance;
+        let Some(shared) = self.object_store_cache.clone() else { return };
+        if !m.timefusion_warm_after_compaction || m.timefusion_hot_body_preload_projects == 0 || m.timefusion_warm_body_boot_files_per_sec == 0 {
+            return;
+        }
+        let today = Utc::now().date_naive();
+        let max_bytes = self.config.cache.block_size_bytes() as u64;
+        let queue: Vec<(usize, object_store::path::Path, u64)> = landed
+            .iter()
+            .filter(|bin| !bin.data_change() && bin.targets.iter().any(|add| add.deletion_vector.is_some()))
+            .flat_map(|bin| &bin.adds)
+            .filter_map(|action| match action {
+                deltalake::kernel::Action::Add(add)
+                    if crate::storage::date_partition_of(&add.path).is_some_and(|date| date >= today - chrono::Days::new(1)) =>
+                {
+                    Some((0, object_store::path::Path::parse(&add.path).unwrap_or_else(|_| add.path.as_str().into()), u64::try_from(add.size).ok()?))
+                }
+                _ => None,
+            })
+            .filter(|(_, _, size)| *size <= max_bytes)
+            .collect();
+        if queue.is_empty() {
+            return;
+        }
+        let caps = HotBodyCaps {
+            projects: 1,
+            total_bytes: m.timefusion_hot_body_preload_project_mb << 20,
+            project_bytes: m.timefusion_hot_body_preload_project_mb << 20,
+            budget: std::time::Duration::from_secs(m.timefusion_hot_body_preload_budget_secs),
+            pace: std::time::Duration::from_secs_f64(1.0 / f64::from(m.timefusion_warm_body_boot_files_per_sec)),
+            concurrency: 1,
+        };
+        let table_ref = Arc::clone(table_ref);
+        tokio::spawn(async move {
+            let (store, table_uri) = {
+                let t = table_ref.read().await;
+                (t.log_store().object_store(None), t.table_url().to_string())
+            };
+            let table_path = table_path_in_bucket(table_cache_prefix(&table_uri));
+            let store = store.as_ref();
+            run_hot_body_pass(
+                queue,
+                caps,
+                |path| shared.contains_data(&bucket_cache_key(table_path, path)),
+                |path| async move { crate::storage::warm_full(store, &path).await },
+            )
+            .await;
+        });
+    }
+
     /// One bounded pass fetching the bodies of the busiest projects'
     /// today+yesterday `otel_logs_and_spans` files into the cache, in
     /// [`hot_body_queue`] order via [`run_hot_body_pass`]. Peak heap is

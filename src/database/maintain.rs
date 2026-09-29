@@ -8968,6 +8968,7 @@ impl Database {
                     let live_uris = self.swap_and_refresh_cache(table_ref, new_table, pre_uris.as_ref(), &markers).await;
                     self.reindex_wave_outputs(table_ref, table_name, &fresh, &live_uris).await;
                     self.record_wave_landed(&fresh, data_change, table_name);
+                    self.warm_strip_bodies(table_ref, &fresh);
                     return WaveResult { landed: carried.tap_mut(|landed| landed.extend(fresh)), failed };
                 }
                 Err(CommitFailure { message: e, timed_out }) => {
@@ -8996,6 +8997,7 @@ impl Database {
                             self.reindex_wave_outputs(table_ref, table_name, &fresh, &live_uris).await;
                             self.clear_bin_intents(&fresh);
                             self.record_wave_landed(&fresh, data_change, table_name);
+                            self.warm_strip_bodies(table_ref, &fresh);
                             return WaveResult { landed: carried.tap_mut(|landed| landed.extend(fresh)), failed };
                         }
                         CommitProbe::NotLanded => {
