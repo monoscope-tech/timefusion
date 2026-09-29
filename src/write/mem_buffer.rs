@@ -273,10 +273,16 @@ pub struct TimeBucket {
     /// Bumped by every in-place DML mutation of this bucket's batches (under
     /// the batches lock). A flush snapshot captures it; if it moved by commit
     /// time the commit landed pre-DML values and prefix indices may have
-    /// shifted, so `finish_flushed_snapshot` must NOT drain.
+    /// shifted, so `finish_flushed_snapshot` must NOT drain — unless only
+    /// retraction moved it (see `rewrite_gen`).
     mutation_gen: AtomicU64,
-    /// Consecutive snapshot flushes this bucket finished dirty. Continuous DML
-    /// (MoR version appends, pattern-tag UPDATEs) can dirty every snapshot, so
+    /// Bumped by every in-place mutation EXCEPT [`MemBuffer::retract_superseded`].
+    /// Retraction only removes rows and keeps `flush_pinned_prefix` exact, so
+    /// if only it moved `mutation_gen`, the prefix still holds nothing but
+    /// committed rows and the dirty finish can drain it like a clean one.
+    rewrite_gen: AtomicU64,
+    /// Consecutive snapshot flushes this bucket finished dirty. Continuous
+    /// in-place DML (or any DML with the drain kill switch off) can dirty every snapshot, so
     /// the flush cycle takes such a bucket destructively instead.
     dirty_flushes: AtomicU32,
     /// Wall-clock micros of the newest WAL entry pinned here (append time, so
@@ -331,6 +337,8 @@ pub struct FlushableBucket {
     /// by commit time a DML mutated the bucket mid-flight, so
     /// `finish_flushed_snapshot` must keep the rows and re-flush.
     pub snapshot_gen: u64,
+    /// `rewrite_gen` at snapshot time, captured with `snapshot_gen`.
+    pub snapshot_rewrite_gen: u64,
     /// True min/max of the taken rows, captured before the source bucket's
     /// atomics were reset, so `restore_taken_bucket` can replay them.
     pub min_timestamp: i64,
@@ -1364,7 +1372,7 @@ impl MemBuffer {
         bucket.flush_pinned_prefix.store(batches.len(), Ordering::Relaxed);
         // Capture the DML generation under the same lock as the batch clones,
         // so a mutation can't slip between clone and capture.
-        let snapshot_gen = bucket.mutation_gen.load(Ordering::Relaxed);
+        let (snapshot_gen, snapshot_rewrite_gen) = (bucket.mutation_gen.load(Ordering::Relaxed), bucket.rewrite_gen.load(Ordering::Relaxed));
         drop(wal_g);
         drop(batches_g);
         Some(FlushableBucket {
@@ -1375,6 +1383,7 @@ impl MemBuffer {
             batches,
             wal_first_positions: pad_positions(&wal_state.first_positions, self.shards_per_topic),
             snapshot_gen,
+            snapshot_rewrite_gen,
             min_timestamp: bucket.min_timestamp.load(Ordering::Relaxed),
             max_timestamp: bucket.max_timestamp.load(Ordering::Relaxed),
             first_wal_pin_micros: bucket.first_wal_pin_micros.load(Ordering::Relaxed),
@@ -1389,10 +1398,13 @@ impl MemBuffer {
     /// the snapshotted prefix batches and drop the bucket when nothing remains.
     /// Dirty case (a DML mutated the bucket mid-flight): the commit landed
     /// PRE-DML values and the prefix indices may have shifted, so keep all rows,
-    /// merge the snapshot's holds back and re-flush next cycle.
+    /// merge the snapshot's holds back and re-flush next cycle — unless
+    /// `drain_clean` and only retraction moved it (see `rewrite_gen`): then the
+    /// prefix is still exactly committed rows and drains as in the clean case,
+    /// instead of re-committing the whole bucket.
     ///
-    /// Returns true when the prefix was drained (clean case).
-    pub fn finish_flushed_snapshot(&self, b: &FlushableBucket) -> bool {
+    /// Returns true when the prefix was drained.
+    pub fn finish_flushed_snapshot(&self, b: &FlushableBucket, drain_clean: bool) -> bool {
         let key = table_key(&b.project_id, &b.table_name);
         // Source evaporated while airborne (evicted/reaped): the rows are
         // durably in Delta, so count as drained.
@@ -1407,17 +1419,23 @@ impl MemBuffer {
         if let Some(bucket_ref) = table.buckets.get(&b.bucket_id) {
             let bucket = bucket_ref.value();
             let mut g = bucket.batches.lock();
-            if bucket.mutation_gen.load(Ordering::Relaxed) != b.snapshot_gen {
+            let dirty = bucket.mutation_gen.load(Ordering::Relaxed) != b.snapshot_gen;
+            if dirty && !(drain_clean && bucket.rewrite_gen.load(Ordering::Relaxed) == b.snapshot_rewrite_gen) {
                 // Dirty: re-pin and re-flush next cycle.
                 bucket.restore_holds(&b.wal_first_positions);
                 bucket.dirty_flushes.fetch_add(1, Ordering::Relaxed);
+                crate::observability::flush_dirty_stats().dirty_reflush_rows_reflushed.fetch_add(b.row_count as u64, Ordering::Relaxed);
                 info!("finish_flushed_snapshot: bucket {}.{}/{} mutated mid-flight — keeping rows for re-flush", b.project_id, b.table_name, b.bucket_id);
                 return false;
             }
             bucket.dirty_flushes.store(0, Ordering::Relaxed);
-            let n = b.batches.len().min(g.len());
+            // Dirty or not, `flush_pinned_prefix` counts the snapshot's surviving batches.
+            let n = if dirty { bucket.flush_pinned_prefix.load(Ordering::Relaxed) } else { b.batches.len() }.min(g.len());
             let (freed, rows): (usize, usize) =
                 g.drain(..n).map(|batch| (estimate_batch_size(&batch), batch.num_rows())).fold((0, 0), |a, x| (a.0 + x.0, a.1 + x.1));
+            if dirty {
+                crate::observability::flush_dirty_stats().dirty_reflush_rows_drained.fetch_add(rows as u64, Ordering::Relaxed);
+            }
             emptied = g.is_empty();
             // Recorded whether or not anything survived: a bucket drained clean
             // still takes later inserts, and the branch below never runs for it.
@@ -1584,6 +1602,7 @@ impl MemBuffer {
             row_count,
             wal_first_positions: pad_positions(&wal_state.first_positions, self.shards_per_topic),
             snapshot_gen: 0, // take removes rows; the gen check is snapshot-path-only
+            snapshot_rewrite_gen: 0,
             min_timestamp,
             max_timestamp,
             first_wal_pin_micros,
@@ -1735,7 +1754,7 @@ impl MemBuffer {
 
             *batches = new_batches;
             if rows_removed > 0 {
-                bucket.note_dml_mutation(wal_hold);
+                bucket.note_dml_mutation(wal_hold, true);
                 bucket.row_count.fetch_sub(rows_removed, Ordering::Relaxed);
             }
             Ok((deleted + rows_removed as u64, freed + sub_saturating(&bucket.memory_bytes, bucket_freed)))
@@ -1811,8 +1830,11 @@ impl MemBuffer {
                 .collect::<anyhow::Result<_>>()
                 .unwrap_or_else(|_| batches.clone());
             if removed > 0 {
+                // Filtering is 1:1 by index, so the prefix shrinks only by the batches it empties.
+                let pinned = bucket.flush_pinned_prefix.load(Ordering::Relaxed).min(new_batches.len());
+                bucket.flush_pinned_prefix.store(new_batches[..pinned].iter().filter(|b| b.num_rows() > 0).count(), Ordering::Relaxed);
                 *batches = new_batches.into_iter().filter(|b| b.num_rows() > 0).collect();
-                bucket.note_dml_mutation(None);
+                bucket.note_dml_mutation(None, false);
                 bucket.row_count.fetch_sub(removed, Ordering::Relaxed);
                 sub_saturating(&bucket.memory_bytes, freed);
                 total_removed += removed;
@@ -1907,7 +1929,7 @@ impl MemBuffer {
 
             *batches = new_batches;
             if total_updated > updated_before {
-                bucket.note_dml_mutation(wal_hold);
+                bucket.note_dml_mutation(wal_hold, true);
             }
             apply_signed_delta(&bucket.memory_bytes, bucket_delta);
             total_delta += bucket_delta;
@@ -2115,7 +2137,7 @@ impl MemBuffer {
 
             *batches = new_batches;
             if total_updated > updated_before {
-                bucket.note_dml_mutation(wal_hold);
+                bucket.note_dml_mutation(wal_hold, true);
             }
             apply_signed_delta(&bucket.memory_bytes, bucket_delta);
             total_delta += bucket_delta;
@@ -2371,17 +2393,21 @@ impl TimeBucket {
             wal_shard_state: Mutex::new(WalShardState::default()),
             flush_pinned_prefix: AtomicUsize::new(0),
             mutation_gen: AtomicU64::new(0),
+            rewrite_gen: AtomicU64::new(0),
             dirty_flushes: AtomicU32::new(0),
             last_wal_pin_micros: AtomicI64::new(crate::support::now_micros()),
             first_wal_pin_micros: AtomicI64::new(i64::MAX),
         }
     }
 
-    /// Note an in-place DML mutation: bump the generation and pin the DML's
+    /// Note an in-place DML mutation: bump the generation(s) and pin the DML's
     /// WAL entry on this bucket. Call while holding the `batches` lock so
     /// snapshot/drain observe a consistent (rows, gen, holds) triple.
-    fn note_dml_mutation(&self, wal_hold: Option<(usize, walrus_rust::WalPosition)>) {
+    fn note_dml_mutation(&self, wal_hold: Option<(usize, walrus_rust::WalPosition)>, rewrites: bool) {
         self.mutation_gen.fetch_add(1, Ordering::Relaxed);
+        if rewrites {
+            self.rewrite_gen.fetch_add(1, Ordering::Relaxed);
+        }
         if let Some((shard, pos)) = wal_hold {
             self.record_wal_append(shard, Some(pos));
         }
@@ -3084,7 +3110,7 @@ mod tests {
         let deleted = buffer.snapshot_for_merge("p", "table1", ts, ts + 1).unwrap();
         assert!(deleted.batches.is_empty());
         assert_eq!(deleted.covered_ranges, before.covered_ranges, "deleted rows must still suppress the in-flight Delta copy");
-        assert!(!buffer.finish_flushed_snapshot(&flush), "a deleted bucket must invalidate its older flush snapshot");
+        assert!(!buffer.finish_flushed_snapshot(&flush, true), "a deleted bucket must invalidate its older flush snapshot");
         assert_eq!(before.batches.iter().map(RecordBatch::num_rows).sum::<usize>(), rows, "later deletes must not alter captured rows");
         buffer.mark_force_flushed("p", "table1", bucket_id);
         assert!(buffer.snapshot_for_merge("p", "table1", ts, ts + 1).unwrap().covered_ranges.is_empty());
@@ -3109,7 +3135,7 @@ mod tests {
 
         buffer.insert_with_hold("project1", "table1", create_test_batch(ts), ts, Some((0, walrus_rust::WalPosition { block_id: 9, offset: 9 }))).unwrap();
 
-        assert!(buffer.finish_flushed_snapshot(&snap), "clean (non-dirty) snapshot must report drained");
+        assert!(buffer.finish_flushed_snapshot(&snap, true), "clean (non-dirty) snapshot must report drained");
         let remaining = n_rows(&buffer.query("project1", "table1", &[]).unwrap());
         assert_eq!(remaining, create_test_batch(ts).num_rows(), "late rows must survive the prefix drain");
         let holds = buffer.wal_holds("project1", "table1", 4);
@@ -3133,7 +3159,7 @@ mod tests {
         let late_ts = ts + 60_000_000;
         assert_eq!(MemBuffer::compute_bucket_id(late_ts), bucket_id, "late row must land in the same bucket");
         buffer.insert("project1", "table1", create_test_batch(late_ts), late_ts).unwrap();
-        assert!(buffer.finish_flushed_snapshot(&snap));
+        assert!(buffer.finish_flushed_snapshot(&snap, true));
 
         let ranges = buffer.get_bucket_ranges("project1", "table1");
         assert_eq!(ranges, vec![(late_ts, late_ts + 1)], "survivor's mask must cover only the late rows so the drained rows' Delta copies stay visible");
@@ -3164,20 +3190,20 @@ mod tests {
             "survivor_at_same_instant" => {
                 let snap = buffer.snapshot_bucket_for_flush("project1", "table1", bucket_id).unwrap();
                 buffer.insert("project1", "table1", create_test_batch(ts), ts).unwrap();
-                assert!(buffer.finish_flushed_snapshot(&snap));
+                assert!(buffer.finish_flushed_snapshot(&snap, true));
             }
             "take" => {
                 buffer.take_bucket_for_flush("project1", "table1", bucket_id).expect("bucket has rows");
             }
             "drain_to_empty" => {
                 let snap = buffer.snapshot_bucket_for_flush("project1", "table1", bucket_id).unwrap();
-                assert!(buffer.finish_flushed_snapshot(&snap), "nothing arrived mid-flight, so the bucket drains clean");
+                assert!(buffer.finish_flushed_snapshot(&snap, true), "nothing arrived mid-flight, so the bucket drains clean");
             }
             "narrow_then_insert" => {
                 let snap = buffer.snapshot_bucket_for_flush("project1", "table1", bucket_id).unwrap();
                 // A late arrival keeps the bucket alive so the narrowing runs.
                 buffer.insert("project1", "table1", create_test_batch(ts + 60_000_000), ts + 60_000_000).unwrap();
-                assert!(buffer.finish_flushed_snapshot(&snap));
+                assert!(buffer.finish_flushed_snapshot(&snap, true));
             }
             other => unreachable!("unknown mode {other}"),
         }

@@ -637,7 +637,9 @@ impl CoalescedGroup {
             batches,
             row_count,
             wal_first_positions,
-            snapshot_gen: 0, // per-source-bucket gens are checked via source_buckets
+            // Per-source-bucket gens are checked via source_buckets.
+            snapshot_gen: 0,
+            snapshot_rewrite_gen: 0,
             min_timestamp: min_timestamp.unwrap_or(i64::MAX),
             max_timestamp: max_timestamp.unwrap_or(i64::MIN),
             first_wal_pin_micros: first_wal_pin.unwrap_or(i64::MAX),
@@ -2497,10 +2499,11 @@ impl BufferedWriteLayer {
         match result {
             Ok(()) => {
                 // Rows are in Delta: remove exactly the snapshotted prefix from each source
-                // bucket (late arrivals stay; gen-dirty buckets keep everything for re-flush),
+                // bucket (late arrivals stay; rewrite-dirty buckets keep everything for re-flush),
                 // release the holds, then advance. A failed advance is benign — the next boot
                 // re-replays rows already in Delta and dedup collapses them.
-                let drained: Vec<_> = source_buckets.iter().filter(|b| self.mem_buffer.finish_flushed_snapshot(b)).collect();
+                let drained: Vec<_> =
+                    source_buckets.iter().filter(|b| self.mem_buffer.finish_flushed_snapshot(b, self.config.buffer.flush_dirty_drain_clean())).collect();
                 if self.test_drop_cursor_advance.load(Ordering::Relaxed) {
                     warn!("test hook: dropping the cursor advance after a landed commit for {}.{}", combined.project_id, combined.table_name);
                 } else {
@@ -4577,6 +4580,103 @@ mod tests {
         let last = committed.lock().last().cloned().expect("the take committed");
         let names = last.column_by_name("name").map(|c| arrow::util::display::array_value_to_string(c, 0).unwrap());
         assert_eq!(names.as_deref(), Some(format!("v{DIRTY_FLUSHES_BEFORE_TAKE}").as_str()), "the take must land the post-UPDATE row");
+    }
+
+    /// Prod 2026-09-29: a merge-on-read UPDATE retracting a buffered row while
+    /// the bucket's snapshot commit was airborne made the finish dirty, and the
+    /// next flush re-committed the whole bucket — ≥21% of all flushed rows were
+    /// such copies. Mid-flight: UPDATE r1 (version + retraction inside a
+    /// 1,000-row batch), UPDATE `solo` (retraction EMPTIES its batch, shifting
+    /// every later index), DELETE r2 (tombstone), insert `late`. The re-flush must
+    /// carry only those four rows; `drain_clean = false` is the old full re-flush.
+    #[test_case::test_case(true; "drains_the_committed_prefix")]
+    #[test_case::test_case(false; "kill_switch_reflushes_the_whole_bucket")]
+    #[serial]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn retraction_mid_flight_does_not_reflush_the_committed_bucket(drain_clean: bool) {
+        const T: &str = "otel_logs_and_spans";
+        let (_dir, cfg, project, _) = test_env_with("rf", |c| {
+            c.buffer.timefusion_flush_dwell_secs = 0;
+            c.buffer.timefusion_flush_dirty_drain_clean = drain_clean;
+        });
+        let ts = crate::support::now_micros() - 2 * crate::write::mem_buffer::bucket_duration_micros();
+        let span = |id: &str, name: &str, deleted: bool| {
+            let mut v = crate::support::test_helpers::test_span_ts(id, name, &project, ts);
+            v["deleted"] = serde_json::json!(deleted);
+            v
+        };
+        let stamped = |rows: Vec<serde_json::Value>| stamp_version(T, vec![json_to_batch(rows).unwrap()]);
+        let commits = Arc::new(parking_lot::Mutex::new(Vec::<Vec<RecordBatch>>::new()));
+        let (entered, release) = (Arc::new(Notify::new()), Arc::new(tokio::sync::Semaphore::new(0)));
+        let cb: DeltaWriteCallback = {
+            let (commits, entered, release) = (commits.clone(), entered.clone(), release.clone());
+            Arc::new(move |_p, _t, batches: Vec<RecordBatch>, _wm| {
+                let (commits, entered, release) = (commits.clone(), entered.clone(), release.clone());
+                Box::pin(async move {
+                    entered.notify_one();
+                    release.acquire().await.map(tokio::sync::SemaphorePermit::forget).ok();
+                    commits.lock().push(batches);
+                    Ok(Vec::new())
+                })
+            })
+        };
+        let layer = layer_with(cfg, cb);
+        layer.insert(&project, T, stamped((0..1000).map(|i| span(&format!("r{i}"), "v1", false)).collect())).await.unwrap();
+        layer.insert(&project, T, stamped(vec![span("solo", "v1", false)])).await.unwrap();
+
+        let entered_wait = entered.notified();
+        let flusher = {
+            let layer = layer.clone();
+            tokio::spawn(async move { layer.flush_completed_buckets().await })
+        };
+        entered_wait.await;
+        // perform_version_append's sequence: mark, stamped append, then retract (UPDATE only).
+        let keys = crate::schema::get_schema(T).unwrap().dedup_keys.clone();
+        for (row, retract) in [(span("r1", "v2", false), true), (span("solo", "v2", false), true), (span("r2", "v1", true), false)] {
+            let version = stamped(vec![row]);
+            layer.mark_version_buckets(&project, T, &version);
+            layer.insert_bounded(&project, T, version.clone(), false).await.unwrap();
+            if retract {
+                assert_eq!(layer.retract_superseded(&project, T, &version[0], &keys, "updated_at"), 1, "the UPDATE retracts the buffered row");
+            }
+        }
+        layer.insert(&project, T, stamped(vec![span("late", "v1", false)])).await.unwrap();
+        release.add_permits(1);
+        flusher.await.unwrap().unwrap();
+        release.add_permits(1);
+        layer.flush_completed_buckets().await.unwrap();
+
+        let commits = commits.lock().clone();
+        assert_eq!(commits.len(), 2);
+        let ids = |batches: &[RecordBatch]| -> Vec<String> {
+            batches.iter().flat_map(|b| (0..b.num_rows()).map(|i| crate::support::test_helpers::array_get_str(b.column_by_name("id").unwrap(), i))).collect()
+        };
+        let reflushed = ids(&commits[1]);
+        let count = |id: &str| commits.iter().map(|c| ids(c).iter().filter(|x| *x == id).count()).sum::<usize>();
+        if drain_clean {
+            assert_eq!(reflushed.iter().sorted().collect_vec(), ["late", "r1", "r2", "solo"], "only the versions, the tombstone and the late row re-flush");
+            assert_eq!(count("r0"), 1, "an untouched row lands exactly once");
+        } else {
+            assert_eq!(reflushed.len(), 1002, "the kill switch re-flushes the committed bucket (998 untouched + 4)");
+            assert_eq!(count("r0"), 2);
+        }
+        assert_eq!(count("late"), 1, "a row inserted mid-flight lands once");
+        let logical = crate::write::mem_buffer::dedup_batches(commits.concat(), &keys, Some("updated_at"), Some("deleted")).unwrap();
+        let (live, names): (Vec<String>, Vec<String>) = logical
+            .iter()
+            .flat_map(|b| {
+                (0..b.num_rows()).map(|i| {
+                    let s = |c: &str| crate::support::test_helpers::array_get_str(b.column_by_name(c).unwrap(), i);
+                    (s("id"), s("name"))
+                })
+            })
+            .unzip();
+        assert_eq!(live.len(), 1001, "1,001 base rows − r2 + late");
+        assert!(!live.contains(&"r2".to_string()), "the deleted row is gone from a read");
+        for id in ["r1", "solo"] {
+            assert_eq!(names[live.iter().position(|x| x == id).unwrap()], "v2", "the UPDATE of {id} wins");
+        }
+        assert!(layer.is_empty());
     }
 
     /// Sealed rows must stay queryable while their Delta commit is airborne —

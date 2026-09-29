@@ -1573,6 +1573,11 @@ pub struct BufferConfig {
     /// on a DIRTY boot, so `wal.landed_skips` reading 0 is dormancy, not failure.
     #[serde_inline_default(true)]
     pub timefusion_landed_skip_enabled: bool,
+    /// A snapshot flush dirtied only by merge-on-read retraction drains its
+    /// committed prefix instead of re-committing the whole bucket. `false`
+    /// restores the full re-flush.
+    #[serde_inline_default(true)]
+    pub timefusion_flush_dirty_drain_clean: bool,
 }
 
 /// WAL durability mode. See `d_wal_fsync_mode` for the env-var encoding.
@@ -1597,6 +1602,7 @@ impl BufferConfig {
         dml_coalesce_fold: bool = (timefusion_dml_coalesce_fold);
         delta_scan_concurrency: usize = (timefusion_delta_scan_concurrency.max(1));
         landed_skip_enabled: bool = (timefusion_landed_skip_enabled);
+        flush_dirty_drain_clean: bool = (timefusion_flush_dirty_drain_clean);
         delta_scan_depth: usize = (timefusion_delta_scan_depth.max(1));
         flush_immediately: bool = (timefusion_flush_immediately);
         wal_admit_decouple: bool = (timefusion_wal_admit_decouple);

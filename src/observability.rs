@@ -1310,6 +1310,16 @@ atomic_stats! {
 }
 
 atomic_stats! {
+    FlushDirtyStats => FLUSH_DIRTY_STATS / flush_dirty_stats as "flush" {
+        /// Committed rows a snapshot flush dirtied only by retraction drained
+        /// instead of re-committing, vs. snapshot rows a dirty finish kept for a
+        /// whole-bucket re-flush (each one a duplicate the next commit lands).
+        dirty_reflush_rows_drained,
+        dirty_reflush_rows_reflushed,
+    }
+}
+
+atomic_stats! {
     /// Maintenance counters for the `timefusion_stats` view — the OTel counters
     /// above can't be read back in-process. Monotonic unless noted as a gauge.
     #[derive(Default)]

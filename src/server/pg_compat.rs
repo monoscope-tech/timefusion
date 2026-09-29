@@ -954,7 +954,7 @@ impl StatsTableProvider {
             },
         );
 
-        let dml = atomic_rows(crate::observability::dml_stats().stats_rows());
+        let dml = atomic_rows([crate::observability::dml_stats().stats_rows(), crate::observability::flush_dirty_stats().stats_rows()].concat());
 
         // Nonzero = a scan advertised an ordering its data does not honour (a
         // parquet footer's `sorting_columns` is lying). Drives hot-tail repair.
