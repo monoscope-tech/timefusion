@@ -251,3 +251,19 @@ All routed hybrid; `foyer.insert_bypassed` did not move. Script: `scratchpad/shi
 
 `batch/morning` was built on `40ada60e`, so rebase it onto current master and re-run `make ci-signoff` (now ~5–11 min) before pushing.
 
+**06:00 UTC: the owner said "do everything now".**
+- **v4 widened to 09-14 at 05:57** (`resume_from` 2026-09-14). Preconditions: `admission_refused_state_bytes_total` = 0 over the prior process's 3 h, memory 14 GiB.
+- **Deployed `ecc2483f` at 05:58:** W54 with the DV-strip flag off (park-on-refusal, backoff kept, carry gated) and W56 (hour-grain session tiers). The signoff reused all 5 attestations: the rebase only added docs. New image `46451938` was Ready at ~06:00; preload 202 files / 5.25 GB, no budget stop.
+- **Shipbubble on the fresh process (~1 min up), first → second run:**
+  - 24h status: 2.6 s → 0.65 s.
+  - 24h by service: 0.76 s → 0.64 s.
+  - Log explorer 24h: 0.85 s → 0.54 s.
+  - Trace lookup, 30 min old: 0.42 s → 0.43 s.
+  - Trace lookup, 2 days old: 30.2 s → 8.5 s. This is latent for shipbubble and measured by a synthetic probe; the 10 h of slow-statement logs had no shipbubble instance of that shape. It reads the stranded DV files of 09-26/27 whole. Re-measure at 1 h before quoting.
+- **Counters at ~3 min:**
+  - `lossy_rewrite_refusals_total` 0; `dv_rewrites_landed_total` 0; `rollup_witness_carried_total` 0 (too young).
+  - `admission_refused_state_bytes_total` 64.
+  - Pending: base 396 (after the v4 widening), derived 68.
+- **W57, building:** DV strip on by default for sealed dates only (`date < today` inside `dv_strip_admits`). This avoids the review's two today-partition risks (whole-partition pricing, racing dedup). **Owner decision:** deploy it (one more restart, before 11:30 or after 18:05)? The alternative, setting `TIMEFUSION_DV_STRIP_ENABLED=true` on the CapRover service, also enables today's partitions, which the review advised against.
+- **Gate window:** asked timefusion-65 (it deployed twice overnight) to make no code pushes 12:00–18:00 UTC.
+
