@@ -3322,6 +3322,14 @@ mod tests {
                   count(*) FILTER (WHERE {RUM_PAGEVIEW})::float AS page_views, count(*) FILTER (WHERE {RUM_BROWSER} AND {RUM_ERROR})::float AS errors \
                   FROM {SOURCE} WHERE {RUM_SCOPE} AND resource___service___name = 'web' GROUP BY time_bucket('5 minutes', timestamp)"),
         &["rum_pageview_count", "rum_error_count"] ; "page views and errors chart under a service scope")]
+    // The chart as monoscope sends it: one aggregate, unpivoted to (time, series, value) above it.
+    #[test_case::test_case(
+        &format!("SELECT a.time, s.series, CASE s.series WHEN 'Page views' THEN a.page_views ELSE a.errors END AS value FROM (\
+                  SELECT extract(epoch from time_bucket('5 minutes', timestamp))::integer AS time, \
+                  count(*) FILTER (WHERE {RUM_PAGEVIEW})::float AS page_views, count(*) FILTER (WHERE {RUM_BROWSER} AND {RUM_ERROR})::float AS errors \
+                  FROM {SOURCE} WHERE {RUM_SCOPE} GROUP BY time_bucket('5 minutes', timestamp)) a \
+                  CROSS JOIN (VALUES ('Page views'), ('Errors')) AS s(series) ORDER BY a.time DESC"),
+        &["rum_pageview_count", "rum_error_count"] ; "the activity chart unpivoted to long form")]
     #[tokio::test]
     async fn rum_widgets_route_to_their_declared_measures(sql: &str, measures: &[&str]) {
         let (_, generated) = assert_substitutes(&session().await, sql, None).await;
