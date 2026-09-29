@@ -155,7 +155,14 @@ Done items carry evidence (commit or number). Open items carry the next action, 
 
 ### Stage 2: source visibility and today-window hits
 
-- [x] W31 content-fingerprint slice proof (`682179d0`): today's windows route hybrid with 0 stale cells.
+- [x] W31 content-fingerprint slice proof (`682179d0`).
+- [ ] **Today's slices go stale under `hashes`-only MoR UPDATEs** (measured 09-29 night): ~90% of today's slices
+      refuted wherever monoscope's pattern-tag UPDATE lands (~7/min on 6297304f); a 24h window keeps ~1 h of
+      provable today coverage, falls under the 1/5 interior floor and runs raw (RUM page views 23–45 s). Every
+      sealed-day window routes fine. Fix built: `ws/version-append-witness` (version-only files tagged
+      `timefusion.version_only_columns`, skipped by the row-count and content witnesses when no tier reads those
+      columns; kill switch `timefusion_rollup_version_only_witness`). Deploy separately from `batch/overnight`;
+      verify the 6297304f 24h page-view query flips to a hybrid hit and `scan.rollup_stale_grew` falls.
 - [x] W21 witness carry: closed, stays off. Recovers ~0.7%; blockers: double count, ledger lost on restart.
 - [ ] `ws/w31-transparent-witness` (2 WIP commits, paused): finish or drop.
 - [ ] **Captured source view** (goal doc Stage 2 protocol) — trigger: a reproduced hybrid snapshot race, or
@@ -245,6 +252,11 @@ Done items carry evidence (commit or number). Open items carry the next action, 
       Harmless at handoff; not fixed.
 
 ### Monoscope-owner decisions
+
+- [ ] **Session lookup by `attributes___session___id = ANY($ids)`** (~34 s over 16 h): the column is `mutable: true`,
+      so bloom, tantivy and stats pruning all refuse it (correctness gate). Options: (a) look up by an immutable key
+      (`id`, `context___trace_id`); (b) add an "enrichment-only" column class (values only go NULL → set) that the
+      pruners may trust; (c) two-phase key lookup. TF side shipped only OR-chain bloom pruning for immutable columns.
 
 - [ ] Pattern-tag `update2Sql` source fix (`BackgroundJobs.hs` ~2944): ~40% of today's masked rows are its
       MoR versions, and it blocks certification.
