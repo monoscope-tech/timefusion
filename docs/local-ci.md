@@ -115,8 +115,11 @@ guessing. What they showed on 2026-09-29 (a 65-minute signoff) and what fixed it
   proc-macro dylibs are uncacheable and build-script `OUT_DIR`s are per target
   dir, so the misses cascade to nearly every crate. `make ci` first runs
   `scripts/ci/warm_target.py`, which clones an idle sibling worktree's
-  `target/debug` copy-on-write (seconds, no disk) when this one has none.
-  Run `make warm` in a fresh worktree to get the same before your first build.
+  `target/debug` copy-on-write (seconds, no disk) when this one has none, and
+  otherwise merges in the dependencies an identically configured sibling
+  (same `Cargo.lock` and `Cargo.toml`) already built. So a lock or profile
+  change is compiled by the first worktree and copied by the rest. Run
+  `make warm` before your first build in a worktree to get the same.
 - **`CARGO_INCREMENTAL=0`.** sccache rejects only `=1`; leave the variable
   unset and cargo builds just this crate incrementally, which sccache passes
   through. A one-line change then rebuilds in ~40s instead of ~3 minutes.

@@ -338,7 +338,7 @@ run_body() { # <check>
     e2e)
       test_env
       # shellcheck disable=SC2086
-      cargo nextest run --profile ci $BUILD -E 'binary(e2e)' --test-threads 2
+      cargo nextest run --profile ci-e2e $BUILD -E 'binary(e2e)' --test-threads 2
       ;;
     *) die "no body for check '$1'" ;;
   esac
