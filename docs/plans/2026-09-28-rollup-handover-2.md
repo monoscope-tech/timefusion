@@ -206,3 +206,14 @@ All routed hybrid; `foyer.insert_bypassed` did not move. Script: `scratchpad/shi
 
 **Leave alone:** the claim rate (~371/s is the pre-deploy baseline; commit wait averages 5 ms); the `ordering_pushdown::one_unsorted_file_does_not_cost_the_majority_its_ordering` e2e flake (flaky under load in 4 independent runs; passes alone). Monoscope-side items remain owner decisions: `array_has` lowering, backing off issue-chart auto-refresh after a timeout, and the missing timeout on the issue-page session lookup.
 
+**W54 review (02:40 UTC; full notes in session scratchpad `w54review.md`): `af08d77e` was NO-GO as built. A hardening follow-up is in progress on the same branch.**
+- **Blocker:** when the always-on exact-count guard refuses a rewrite, the unit gets a flat 30 s retry, and the 60 s planner tick re-pends it to Pending at `now` (`enqueue_inner`). A refused bin would re-stage every ~35–65 s, forever, at full rewrite cost: the 09-15 wedge shape. The re-pend overriding a backoff is a pre-existing master gap; it also cancels the 09-24 600 s backoff.
+- **With the flag off, the carry and guard still fire nightly,** not rarely. After midnight, yesterday's partition is sealed-consolidated with its DV files (~25–40 DV-bearing bins per night, inferred). The intended effect is good: yesterday's rollup slices are carried across the nightly pack instead of going stale and being rebuilt.
+- **Correct:** the carry fires only when the held witness equals the pre-rewrite physical count (no stale → valid, double carry is a no-op) and uses the read path's `rows_below` rule. DV metadata is sound: all 3,480 DV files in the snapshot have `numRecords` and `1 ≤ cardinality ≤ numRecords`, and the dedup oracle logged 0 validation failures in 10 h.
+- **The follow-up (`ws/w54-dv-strip`):**
+  - Park a refused file set, with growing backoff, a counter and a WARN.
+  - Stop the planner re-pend from pulling a Retry deadline earlier.
+  - Gate the carry on `version_append` + `dedup_tiebreak` sources.
+  - Rebase onto master and run one full local signoff.
+- **Before enabling the flag (later):** one clean night on the flag-off build; strip units priced by the bin they rewrite, not the whole partition (Talstack's estimate sums ~48 GiB decoded); sealed dates first; large DV files stripped alone; today's files only after dedup settles; `dv_strip_plan_sorts_total` = 0.
+
