@@ -6226,7 +6226,9 @@ pub(crate) fn slice_bounds(covered: impl IntoIterator<Item = i64>, day_start: i6
 /// rows, moving every bound above, which only `carry_rewrite_witness` repairs.
 /// An admitted DV file outside every cell is a cell of its own — a rewrite of it
 /// ALONE keeps its output inside its input's range, so it crosses no bound it did
-/// not. THE one grouping the planner and the packer share; no bounds is one cell.
+/// not. A cell whose every file carries a DV splits into one cell per file: a
+/// pack of them merge-sorts what 1:1 strips filter-copy, and it bypasses the
+/// strip budget. THE one grouping the planner and the packer share; no bounds is one cell.
 pub(crate) fn slice_cells(adds: impl IntoIterator<Item = TailAdd>, bounds: &[i64]) -> Vec<Vec<TailAdd>> {
     let cell = |t: i64| bounds.partition_point(|bound| *bound <= t);
     adds.into_iter()
@@ -6240,7 +6242,7 @@ pub(crate) fn slice_cells(adds: impl IntoIterator<Item = TailAdd>, bounds: &[i64
         .into_group_map()
         .into_iter()
         .sorted_unstable_by_key(|(cell, _)| *cell)
-        .map(|(_, cell)| cell)
+        .flat_map(|(_, cell)| if cell.iter().all(|add| add.has_dv) { cell.into_iter().map(|add| vec![add]).collect() } else { vec![cell] })
         .collect()
 }
 

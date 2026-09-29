@@ -5960,6 +5960,7 @@ fn the_packer_bins_every_pair_the_planner_queues() {
 #[test_case(&[Some((8, 12))], &[0], Some(vec![10]), true => (true, 1) ; "a straddling DV file is stripped alone")]
 #[test_case(&[Some((8, 12)), Some((1, 4))], &[0], Some(vec![10]), true => (true, 1) ; "a DV straddler beside a lone clean file is stripped alone")]
 #[test_case(&[Some((1, 4)), Some((11, 14))], &[0, 1], Some(vec![10]), true => (true, 1) ; "DV-only cells are stripped one file at a time")]
+#[test_case(&[Some((1, 4)), Some((5, 9))], &[0, 1], Some(vec![10]), true => (true, 1) ; "a cell of DV files strips one at a time, never packs")]
 fn planner_and_packer_pair_only_within_a_slice_cell(ranges: &[Option<(i64, i64)>], dv: &[usize], covered: Option<Vec<i64>>, strip: bool) -> (bool, usize) {
     const MINUTE: i64 = 60_000_000;
     let minutes = |(lo, hi): (i64, i64)| (lo * MINUTE, hi * MINUTE);
@@ -5998,7 +5999,8 @@ fn stripped(add: super::TailAdd, strip: bool) -> super::TailAdd {
 #[test_case(&[300, 400], &[0], true => vec!["f0"] ; "a DV file beside an oversized clean file is stripped alone")]
 #[test_case(&[300, 400], &[0], false => Vec::<String>::new() ; "without the strip the lone-file veto strands it")]
 #[test_case(&[100], &[0], true => vec!["f0"] ; "a lone DV file is stripped")]
-#[test_case(&[300, 500], &[0, 1], true => vec!["f0", "f1"] ; "two DV files pack together")]
+#[test_case(&[300, 500], &[0, 1], true => vec!["f0"] ; "DV files strip one at a time instead of merge-sorting as a pack")]
+#[test_case(&[30, 50], &[0, 1], false => Vec::<String>::new() ; "unadmitted DV files wait for the strip budget instead of packing")]
 #[test_case(&[300, 500], &[], true => Vec::<String>::new() ; "oversized clean files stay converged")]
 fn a_sealed_dv_file_is_rewritten_even_alone(sizes_mb: &[i64], dv: &[usize], strip: bool) -> Vec<String> {
     let adds =
