@@ -9949,6 +9949,22 @@ async fn the_byte_budget_never_holds_back_an_uncharged_query(admission: bool, na
     Ok(())
 }
 
+/// `FLAG SET timefusion_query_scan_byte_admission` reaches an existing session's
+/// next plan: the charge follows the override, and RESET returns to config (off).
+#[tokio::test(flavor = "multi_thread")]
+async fn scan_byte_admission_runtime_flag_toggles_the_charge_per_plan() -> Result<()> {
+    use crate::config::RuntimeFlag::TimefusionQueryScanByteAdmission as Flag;
+    let (_db, ctx, _, sql) = wide_scan_session("scan-bytes-flag", |_| {}).await?;
+    let mut charged = Vec::new();
+    for value in [None, Some(1), Some(0), None] {
+        Flag.set_override(value);
+        charged.push(datafusion::physical_plan::displayable(physical(&ctx, &sql).await?.as_ref()).indent(true).to_string().contains("scan_kib="));
+    }
+    Flag.set_override(None);
+    assert_eq!(charged, [false, true, false, false]);
+    Ok(())
+}
+
 /// A heavy query whose root has several output partitions holds ONE heavy slot
 /// while it runs, not one per partition. Prod: monoscope's hash-partitioned
 /// `served` GROUP BY took all eight slots at once.

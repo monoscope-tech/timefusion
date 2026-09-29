@@ -1390,7 +1390,8 @@ mod stats_table_tests {
     #[test]
     fn flags_component_reports_effective_value_and_override() {
         use crate::config::RuntimeFlag::{
-            TimefusionMaintenanceCpuTokens as Cpu, TimefusionMaintenanceQueryYield as Yield, TimefusionReadDedupKeyRestrict as Restrict,
+            TimefusionMaintenanceCpuTokens as Cpu, TimefusionMaintenanceQueryYield as Yield, TimefusionQueryScanByteAdmission as Bytes,
+            TimefusionReadDedupKeyRestrict as Restrict,
         };
         crate::config::set_config_for_test(crate::config::AppConfig::default());
         Restrict.set_override(Some(1));
@@ -1398,10 +1399,19 @@ mod stats_table_tests {
         let rows = snapshot_rows(&StatsTableProvider::new(None));
         [Restrict, Cpu].into_iter().for_each(|f| f.set_override(None));
         let flags: Vec<_> = rows.iter().filter(|(c, ..)| c == "flags").map(|(_, k, v)| (k.as_str(), v.as_str())).collect();
-        let (y, r, c): (&str, &str, &str) = (Yield.into(), Restrict.into(), Cpu.into());
+        let (y, r, c, b): (&str, &str, &str, &str) = (Yield.into(), Restrict.into(), Cpu.into(), Bytes.into());
         assert_eq!(
             flags,
-            [(y, "false"), (&*format!("{y}.override"), "null"), (r, "true"), (&*format!("{r}.override"), "true"), (c, "96"), (&*format!("{c}.override"), "96")]
+            [
+                (y, "false"),
+                (&*format!("{y}.override"), "null"),
+                (r, "true"),
+                (&*format!("{r}.override"), "true"),
+                (c, "96"),
+                (&*format!("{c}.override"), "96"),
+                (b, "false"),
+                (&*format!("{b}.override"), "null")
+            ]
         );
     }
 

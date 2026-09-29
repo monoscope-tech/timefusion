@@ -3668,9 +3668,9 @@ impl Database {
                 // (executed once) of a heavy plan. Internal SQL contexts (maintenance,
                 // rollup) have their own pool and are never gated.
                 if for_pgwire {
-                    let mem = &self.config.memory;
                     rules.push(Arc::new(crate::read::admission::HeavyQueryAdmission {
-                        scan_bytes: mem.timefusion_query_scan_byte_admission.then(|| self.scan_byte_gate.clone()),
+                        scan_bytes: self.scan_byte_gate.clone(),
+                        config: Arc::clone(&self.config),
                     }));
                 }
                 rules.push(instrument_rule);

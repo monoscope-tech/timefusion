@@ -2247,10 +2247,11 @@ pub enum RuntimeFlag {
     TimefusionReadDedupKeyRestrict,
     /// Maintenance admission's CPU-token capacity; config is `coordinator_job_slots`.
     TimefusionMaintenanceCpuTokens,
+    TimefusionQueryScanByteAdmission,
 }
 
 /// Per-flag override: 0 = config, else value + 1.
-static FLAG_OVERRIDES: [std::sync::atomic::AtomicU32; 3] = [const { std::sync::atomic::AtomicU32::new(0) }; 3];
+static FLAG_OVERRIDES: [std::sync::atomic::AtomicU32; 4] = [const { std::sync::atomic::AtomicU32::new(0) }; 4];
 
 impl RuntimeFlag {
     fn slot(self) -> &'static std::sync::atomic::AtomicU32 {
@@ -2285,6 +2286,7 @@ impl AppConfig {
             RuntimeFlag::TimefusionMaintenanceQueryYield => self.maintenance.timefusion_maintenance_query_yield.into(),
             RuntimeFlag::TimefusionReadDedupKeyRestrict => self.maintenance.timefusion_read_dedup_key_restrict.into(),
             RuntimeFlag::TimefusionMaintenanceCpuTokens => u32::try_from(self.derived.coordinator_job_slots()).unwrap_or(u32::MAX),
+            RuntimeFlag::TimefusionQueryScanByteAdmission => self.memory.timefusion_query_scan_byte_admission.into(),
         })
     }
 

@@ -1641,6 +1641,7 @@ mod pgwire_handlers_tests {
     #[test_case("FLAG SET timefusion_maintenance_cpu_tokens ON" => Err(()); "numeric flag is not boolean")]
     #[test_case("FLAG SET timefusion_maintenance_query_yield 2" => Err(()); "boolean flag rejects numbers above 1")]
     #[test_case("FLAG RESET timefusion_maintenance_cpu_tokens" => Ok(Some(crate::server::FlagCmd::Set(crate::config::RuntimeFlag::TimefusionMaintenanceCpuTokens, None))); "numeric reset")]
+    #[test_case("FLAG SET timefusion_query_scan_byte_admission on" => Ok(Some(crate::server::FlagCmd::Set(crate::config::RuntimeFlag::TimefusionQueryScanByteAdmission, Some(1)))); "byte admission")]
     #[test_case("FLAG SHOW extra" => Err(()); "reject trailing input")]
     #[test_case("FLAG SET timefusion_maintenance_query_yield" => Err(()); "set needs a value")]
     #[test_case("SELECT 1" => Ok(None); "ordinary SQL falls through")]

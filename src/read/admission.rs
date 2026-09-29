@@ -177,7 +177,9 @@ fn gated_scan_bytes(plan: &Arc<dyn ExecutionPlan>) -> Vec<u64> {
 /// result reader calls exactly once.
 #[derive(Debug)]
 pub struct HeavyQueryAdmission {
-    pub(crate) scan_bytes: Option<ScanByteGate>,
+    pub(crate) scan_bytes: ScanByteGate,
+    /// Read per plan, so `FLAG SET timefusion_query_scan_byte_admission` applies to the next query.
+    pub(crate) config: Arc<crate::config::AppConfig>,
 }
 
 impl PhysicalOptimizerRule for HeavyQueryAdmission {
@@ -188,8 +190,10 @@ impl PhysicalOptimizerRule for HeavyQueryAdmission {
         true
     }
     fn optimize(&self, plan: Arc<dyn ExecutionPlan>, config: &datafusion::config::ConfigOptions) -> DFResult<Arc<dyn ExecutionPlan>> {
-        let selected: u64 = gated_scan_bytes(&plan).iter().sum();
-        let bytes = self.scan_bytes.as_ref().filter(|_| selected > 0).map(|gate| (gate.clone(), gate.charge_kib(selected)));
+        let scans = gated_scan_bytes(&plan);
+        let selected: u64 = scans.iter().sum();
+        let bytes = (selected > 0 && self.config.flag(crate::config::RuntimeFlag::TimefusionQueryScanByteAdmission))
+            .then(|| (self.scan_bytes.clone(), self.scan_bytes.charge_kib(selected)));
         let class = heavy_class(&plan, config.execution.batch_size.get());
         if class.is_none() && bytes.is_none() {
             return Ok(plan);
