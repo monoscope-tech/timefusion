@@ -656,11 +656,23 @@ pub(crate) fn version_only(tags: Option<&HashMap<String, Option<String>>>, sourc
 }
 
 /// Paths of `table`'s [`version_only`] files. Empty for a source no rollup reads.
-fn version_only_paths(table: &DeltaTable, source: &str) -> Result<HashSet<String>> {
+/// Memoized per table version: the rollup route asks on every query.
+fn version_only_paths(table: &DeltaTable, source: &str) -> Result<Arc<HashSet<String>>> {
+    type Memo = dashmap::DashMap<(String, String), (u64, Arc<HashSet<String>>)>;
+    static MEMO: std::sync::LazyLock<Memo> = std::sync::LazyLock::new(Memo::new);
     if get_schema(source).is_none_or(|schema| schema.rollups.is_empty() || !schema.version_append) {
-        return Ok(HashSet::new());
+        return Ok(Arc::default());
     }
-    Ok(table.snapshot()?.log_data().iter().filter(|file| version_only(Some(&file.tags()), source)).map(|file| file.path().to_string()).collect())
+    let (key, version) = ((table.table_url().to_string(), source.to_owned()), table.version());
+    if let Some(hit) = MEMO.get(&key).filter(|hit| Some(hit.0) == version) {
+        return Ok(Arc::clone(&hit.1));
+    }
+    let paths: Arc<HashSet<String>> =
+        Arc::new(table.snapshot()?.log_data().iter().filter(|file| version_only(Some(&file.tags()), source)).map(|file| file.path().to_string()).collect());
+    if let Some(version) = version {
+        MEMO.insert(key, (version, Arc::clone(&paths)));
+    }
+    Ok(paths)
 }
 
 /// Version-append batches admitted as version-only, until a flush tags their rows.
