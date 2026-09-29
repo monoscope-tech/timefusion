@@ -36,6 +36,11 @@ Reading it — traps the numbers carry:
 - **Counters reset at boot.** The header prints uptime; `/h since boot` on a
   <1h process is noise (the report flags it). Use `--window`.
   `tasks_complete` is journal-lifetime, not per boot.
+- **DV strips land in bursts** when the fleet budget's 10-minute window reopens,
+  so a `--window` under 10 min swings from 0 to ~400/h. To check the cap, count
+  DV-retiring OPTIMIZE commits per 10 min in the Delta log (should be ≈12–14),
+  and remember `dv_rewrites_landed_total` also counts ordinary packing bins that
+  merely had a DV input.
 - **Latency percentiles are since boot too** — a fresh deploy's p99 includes
   cold caches. Wait ≥10 min after a deploy before quoting them.
 - **Rollup hit rate** is per query; don't compare it with stale-coverage or
