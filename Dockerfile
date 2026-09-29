@@ -112,14 +112,23 @@ ENV RUSTFLAGS="-C force-frame-pointers=yes -C target-cpu=${TARGET_CPU}"
 # `--enable-prof-libunwind`. Fallback needing no libs: `gcc` (uses the frame
 # pointers above). Verify with scripts/verify-jemalloc-prof.sh.
 ENV JEMALLOC_SYS_PROF_BACKTRACE=libunwind
-RUN target-cargo chef cook --release --locked --features profiling --recipe-path recipe.json
+# Registry and git checkouts persist across builds (download caches only, no
+# artifacts, and cargo never judges a registry or git dependency by mtime): a
+# re-cook otherwise re-clones every git dependency, including DataFusion's
+# test-data submodule, before compiling anything. Locked because two builds
+# would share the directory without sharing cargo's package lock.
+RUN --mount=type=cache,id=tf-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=tf-cargo-git,target=/usr/local/cargo/git,sharing=locked \
+    target-cargo chef cook --release --locked --features profiling --recipe-path recipe.json
 
 # Now compile the real binary. Deps are already built, so this only rebuilds
 # the crate itself when src/ changes.
 COPY Cargo.toml Cargo.lock ./
 COPY src/ src/
 COPY schemas/ schemas/
-RUN target-cargo build --release --locked --features profiling && \
+RUN --mount=type=cache,id=tf-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=tf-cargo-git,target=/usr/local/cargo/git,sharing=locked \
+    target-cargo build --release --locked --features profiling && \
     mkdir -p /output && cp "target/$(cat /rust-target)/release/timefusion" /output/timefusion
 
 # App state dirs (distroless runtime has no shell to mkdir at runtime).

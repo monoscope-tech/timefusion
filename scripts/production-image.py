@@ -120,18 +120,12 @@ def signed_off():
     return passed == expected
 
 
-def publish():
-    tree, fingerprint = snapshot()
-    if not signed_off() or snapshot()[1] != fingerprint:
-        raise RuntimeError('Matching local signoff is required; run make ci-signoff with stable inputs')
+def build(tree, fingerprint):
+    """Build and smoke-test the candidate from the frozen tree. Only a smoked
+    image ever carries the candidate tag, so an interrupted or failed build
+    can never be pushed."""
     image = REGISTRY + ':input-' + fingerprint
-    try:
-        existing = digest(image)
-    except subprocess.CalledProcessError:
-        existing = None
-    if existing:
-        print('Reusing previously published image: ' + existing)
-        return
+    staging = image + '-unsmoked'
     with tempfile.TemporaryDirectory(prefix='tf-image-context-') as directory:
         archive = Path(directory) / 'context.tar'
         run('git', 'archive', '--format=tar', '-o', str(archive), tree, '--', *INPUTS)
@@ -139,9 +133,43 @@ def publish():
             source.extractall(directory, filter='data')
         archive.unlink()
         run('docker', 'buildx', 'build', '--load', '--platform', 'linux/amd64',
-            '--build-arg', 'CARGO_BUILD_JOBS=2', '--label', 'io.timefusion.source-fingerprint=' + fingerprint,
-            '-t', image, directory)
-        smoke(image, Path(directory) / 'ci/smoke.Dockerfile')
+            '--build-arg', 'CARGO_BUILD_JOBS=8', '--label', 'io.timefusion.source-fingerprint=' + fingerprint,
+            '-t', staging, directory)
+        try:
+            smoke(staging, Path(directory) / 'ci/smoke.Dockerfile')
+            run('docker', 'tag', staging, image)
+        finally:
+            subprocess.run(['docker', 'rmi', staging], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return image
+
+
+def available(image):
+    """Published already (digest), or built and smoked here (tag present)."""
+    try:
+        return digest(image)
+    except subprocess.CalledProcessError:
+        return subprocess.run(['docker', 'image', 'inspect', image], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+
+
+def prebuild():
+    # Runs beside the checks: the build is mostly one rustc front end, so it
+    # costs the checks little and takes the image off the signoff's critical path.
+    tree, fingerprint = snapshot()
+    if not available(REGISTRY + ':input-' + fingerprint):
+        build(tree, fingerprint)
+
+
+def publish():
+    tree, fingerprint = snapshot()
+    if not signed_off() or snapshot()[1] != fingerprint:
+        raise RuntimeError('Matching local signoff is required; run make ci-signoff with stable inputs')
+    image = REGISTRY + ':input-' + fingerprint
+    found = available(image)
+    if isinstance(found, str):
+        print('Reusing previously published image: ' + found)
+        return
+    if not found:
+        build(tree, fingerprint)
     run('docker', 'push', image)
     pushed = json.loads(output('docker', 'image', 'inspect', image, '--format', '{{json .RepoDigests}}'))
     print(next(value for value in pushed if value.startswith(REGISTRY + '@')))
@@ -149,13 +177,15 @@ def publish():
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', choices=('fingerprint', 'resolve', 'publish', 'signoff', 'smoke', 'digest'))
+    parser.add_argument('command', choices=('fingerprint', 'resolve', 'prebuild', 'publish', 'signoff', 'smoke', 'digest'))
     parser.add_argument('image', nargs='?')
     args = parser.parse_args()
     if args.command == 'fingerprint':
         print(snapshot()[1])
     elif args.command == 'resolve':
         print(digest(REGISTRY + ':input-' + snapshot()[1]))
+    elif args.command == 'prebuild':
+        prebuild()
     elif args.command == 'publish':
         publish()
     elif args.command == 'signoff':

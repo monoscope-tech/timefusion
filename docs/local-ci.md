@@ -211,6 +211,9 @@ rustfmt reads `.rs` files and `rustfmt.toml`, not `Cargo.lock` and not `proto/`.
 
 `make ci-signoff` runs local checks, cross-compiles the production Linux
 amd64 image, checks that it reaches PGWire, and publishes a candidate to GHCR.
+The image is built and smoke-tested beside the checks (log in `.ci/image.log`)
+and pushed only after every check passes; only a smoked image carries the
+candidate tag, so an interrupted build is never published.
 Docker must have registry push access. This command does not update `latest`
 or restart production. The build uses an archived source snapshot, so edits
 during compilation cannot change the published candidate.
@@ -225,8 +228,11 @@ The compiler runs on the builder CPU. On an ARM64 laptop it produces Linux
 x86-64 code with target C libraries; amd64 container execution is required
 for the final smoke test. ARM64 Docker hosts automatically use a native QEMU
 emulator with an x86-64 guest address offset. The unchanged production image
-must stay running and pass its PGWire protocol probe. The first cross-build
-took about 40 minutes; warm rebuild speed is not yet measured.
+must stay running and pass its PGWire protocol probe. Measured 2026-09-29 on
+an 18-CPU laptop: a source-only change rebuilds the crate in ~9 minutes; a
+`Cargo.toml` or `Cargo.lock` change re-cooks every dependency first (~5 more,
+from the persisted registry/git caches). `CARGO_BUILD_JOBS=8` peaked at 10 GB
+of the 16 GB Docker VM; at 2 the same build took 15 + 11 minutes.
 Local cross-compilation, image publication, CI reuse, and production rollout
 have passed verification. After the checked change is merged,
 `make deploy` runs the shared handoff, rollout, recovery, and readiness soak

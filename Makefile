@@ -214,10 +214,16 @@ warm:
 	python3 scripts/ci/warm_target.py
 
 # Run local checks, publish passing results, then show what GitHub still needs.
+# A full signoff builds and smoke-tests the production image beside the checks
+# (.ci/image.log); it is pushed only once every check has passed.
 ci-signoff:
-	@result=0; \
+	@mkdir -p .ci; image=; \
+	if [ -z "$(CHECKS)" ]; then python3 scripts/production-image.py prebuild >.ci/image.log 2>&1 & image=$$!; fi; \
+	result=0; \
 	./scripts/ci/ci.sh local $(CHECKS) || result=$$?; \
-	./scripts/ci/ci.sh gate || exit $$?; \
+	./scripts/ci/ci.sh gate || result=$$?; \
+	if [ "$$result" -ne 0 ] && [ -n "$$image" ]; then pkill -P $$image; kill $$image; fi; \
+	[ -z "$$image" ] || wait $$image || [ "$$result" -ne 0 ] || { tail -n 40 .ci/image.log; exit 1; }; \
 	exit $$result
 	PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-production-image.py
 	PYTHONDONTWRITEBYTECODE=1 python3 scripts/deploy/test_prepare.py
