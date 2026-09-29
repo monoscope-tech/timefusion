@@ -242,3 +242,12 @@ All routed hybrid; `foyer.insert_bypassed` did not move. Script: `scratchpad/shi
   4. After it lands, re-time shipbubble (including a 2-day-old trace lookup) and watch `lossy_rewrite_refusals_total`.
 - **Signoff timing, uncontended (load ~6): 11 min total.** test 6.3 min (nextest 4.1 min), clippy 8.8 min (runs in the background in parallel), e2e 2.1 min, pg-smoke 9 s (image cached). The same signoff took 69–90 min last night with 3–5 builds competing. **Run one signoff at a time.**
 
+**04:48 UTC watch:** another session deployed twice (02:15 `5f370b60`, 03:08 `37538d9e`; code change `1ddc2a59` "Cut local signoff from ~65 to ~5-10 minutes"). Prod is on image `f7697fd2`, up ~1.6 h. It is healthy:
+- Latency: p50 44 ms, p95 0.16 s, p99 0.49 s.
+- Journal lock wait: ~6.8 s/min, back to the handover's ~7.
+- Memory: 12 GiB.
+- Pending: base 278, derived 44, dedup 126.
+- Shipbubble 24h status: 1.5 s.
+
+`batch/morning` was built on `40ada60e`, so rebase it onto current master and re-run `make ci-signoff` (now ~5–11 min) before pushing.
+
