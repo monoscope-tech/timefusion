@@ -1853,11 +1853,6 @@ pub struct MaintenanceConfig {
     /// paired CPU, memory, cancellation, and foreground latency gates pass.
     #[serde_inline_default(false)]
     pub timefusion_rollup_adaptive_batches: bool,
-    /// Keep rollup slices readable across merge-on-read UPDATEs that assign only columns
-    /// no rollup spec reads, by carrying the flushed rows into the slice witnesses.
-    /// Dark until the shadow counter (`rollup_carry_eligible_rows`) is validated on prod.
-    #[serde_inline_default(false)]
-    pub timefusion_rollup_witness_carry: bool,
     /// Experiment: omit winner selection only for snapshot-certified raw input.
     /// Tombstones and deletion vectors remain active. Requires paired resource gates.
     #[serde_inline_default(false)]
@@ -2599,7 +2594,6 @@ mod tests {
         assert_eq!(config.timefusion_rollup_measure_remints_per_pass, 2, "a newly declared measure must not re-mint its whole horizon at once");
         assert!(!config.timefusion_rollup_adaptive_batches, "adaptive batches need the paired resource experiment before activation");
         assert!(!config.timefusion_rollup_certified_clean, "certified aggregation needs the paired resource experiment before activation");
-        assert!(!config.timefusion_rollup_witness_carry, "the witness carry stays dark until its shadow counter is validated");
 
         // The canary still narrows the READ side when it is set, and only then.
         config.timefusion_rollup_read_projects = Some("project-b".into());

@@ -861,13 +861,7 @@ async fn perform_version_append(
         return Ok(0);
     }
     let table_schema = schema.schema_ref();
-    // Taken BEFORE the read below: a relevant append after this point refuses the carry.
-    let read_seq = database.witness_carry.begin();
     let irrelevant = !tombstone && !crate::database::maintain::rollups_read_any(table_name, assignments.iter().map(|(column, _)| column));
-    if !irrelevant {
-        database.witness_carry.relevant(project_id, table_name);
-    }
-    let carry = irrelevant && database.config().maintenance.timefusion_rollup_witness_carry;
 
     // The routing provider IS the logical table: it unions MemBuffer, the hot
     // tier and Delta and runs DedupExec, so the rows read are current versions.
@@ -986,13 +980,12 @@ async fn perform_version_append(
         // version. Appending via `BufferedWriteLayer::insert` directly skips the
         // stamp, and every version then ties on the tiebreak, which
         // keep-greatest resolves arbitrarily.
-        // A carried batch is stamped here so its stamp is known to the ledger.
-        let batches = if carry { crate::write::stamp_version(table_name, vec![batch]) } else { vec![batch] };
+        let batches = vec![batch];
         if let Some(l) = layer {
             l.mark_version_buckets(project_id, table_name, &batches);
         }
         database
-            .insert_records_batch_bounded(project_id, table_name, batches.clone(), false, None, false, carry)
+            .insert_records_batch_bounded(project_id, table_name, batches.clone(), false, None, false)
             .await
             .map_err(|e| DataFusionError::Execution(format!("merge-on-read append failed for {project_id}/{table_name}: {e}")))?;
         // AFTER the stamped append is in the buffer: drop the buffered rows it
@@ -1005,22 +998,11 @@ async fn perform_version_append(
         retracted += dropped;
         // A batch that superseded a still-buffered row is that row's first flush: new
         // data, which no witness may absorb. Only a batch whose predecessors are all
-        // already flushed can be carried.
+        // already flushed is transparent.
         crate::observability::record_witness_moving_rows(
             if irrelevant && dropped == 0 { "transparent" } else { "base_version" },
             database.rows_below_live_coverage(project_id, table_name, &batches[0]),
         );
-        if irrelevant && dropped == 0 {
-            crate::observability::dml_stats().rollup_carry_eligible_rows.fetch_add(batches[0].num_rows() as u64, std::sync::atomic::Ordering::Relaxed);
-        }
-        if carry {
-            match (dropped, crate::write::version_stamp_of(table_name, &batches[0])) {
-                (0, Some(stamp)) => database.witness_carry.admit(project_id, table_name, stamp, read_seq),
-                _ => database
-                    .invalidate_rollup_batches(project_id, table_name, &batches)
-                    .map_err(|e| DataFusionError::Execution(format!("rollup invalidation failed for {project_id}/{table_name}: {e}")))?,
-            }
-        }
     }
     if rows > 0 {
         let assigned: Vec<&str> = assignments.iter().map(|(column, _)| column.as_str()).collect();

@@ -37,7 +37,9 @@ async fn land_stale_version(env: &E2eEnv, project: &str, (at, id): &(i64, String
         "date": ts(*at).date_naive().to_string(), "updated_at": 1, "hashes": [],
     });
     let batch = timefusion::support::test_helpers::json_to_batch_for("mor_versioned", vec![row])?;
-    env.db().insert_records_batch_bounded(project, "mor_versioned", vec![batch], true, None, true, true).await?;
+    let handle = env.db().resolve_table(project, "mor_versioned").await?;
+    let mut table = handle.write().await;
+    *table = table.clone().write(vec![batch]).await?;
     Ok(())
 }
 
