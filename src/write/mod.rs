@@ -1062,16 +1062,6 @@ impl BufferedWriteLayer {
         self.reserved_bytes.fetch_sub(size, Ordering::Release);
     }
 
-    /// Reserve memory unconditionally, even past the hard limit. Only for the
-    /// `wal_admit_decouple` path once backpressure is exhausted: admitting
-    /// over-budget is safe there because the WAL already holds the batch.
-    fn force_reserve(&self, batches: &[RecordBatch]) -> usize {
-        let estimated_size = estimate_reservation(batches);
-        self.reserved_bytes.fetch_add(estimated_size, Ordering::AcqRel);
-        self.pressure_notify.notify_one();
-        estimated_size
-    }
-
     /// Reserve memory, applying backpressure instead of dropping the write when
     /// the hard limit is hit: flush MemBuffer → Delta to make room, retrying
     /// after each drain, failing only after `write_backpressure_timeout` with no
@@ -1260,15 +1250,7 @@ impl BufferedWriteLayer {
         }
         let row_count: usize = batches.iter().map(|b| b.num_rows()).sum();
 
-        let reserved_size = match self.reserve_with_backpressure(&batches).await {
-            Ok(sz) => sz,
-            // Opt-in: admit over-budget rather than drop the write.
-            Err(e) if self.config.buffer.wal_admit_decouple() => {
-                warn!("wal_admit_decouple: admitting over-budget instead of rejecting (WAL is durable): {}", e);
-                self.force_reserve(&batches)
-            }
-            Err(e) => return Err(e),
-        };
+        let reserved_size = self.reserve_with_backpressure(&batches).await?;
 
         // WAL append + MemBuffer apply share one pin lifecycle (`with_wal_pin`):
         // the pending hold covers the append→apply window, then each destination
@@ -5287,21 +5269,13 @@ mod tests {
         (layer, dir, make_batch)
     }
 
-    /// Same rig with `backpressure_secs = 0`, so the exhaustion path is
-    /// deterministic instead of depending on flush timing.
-    fn decouple_test_layer(decouple: bool) -> (Arc<BufferedWriteLayer>, TempDir, impl Fn() -> RecordBatch) {
-        over_limit_layer(noop_delta(), true, move |c| {
-            c.buffer.timefusion_write_backpressure_secs = 0; // exhaust immediately
-            c.buffer.timefusion_wal_admit_decouple = decouple;
-        })
-    }
-
-    /// Baseline: with the decouple flag OFF and backpressure exhausted, an
-    /// over-hard-limit insert is rejected (and never WAL-appended).
+    /// With backpressure exhausted, an over-hard-limit insert is rejected (and
+    /// never WAL-appended). `backpressure_secs = 0` makes the exhaustion path
+    /// deterministic instead of dependent on flush timing.
     #[serial]
     #[tokio::test]
-    async fn wal_admit_decouple_off_rejects_when_backpressure_exhausted() {
-        let (layer, _dir, make_batch) = decouple_test_layer(false);
+    async fn over_limit_insert_is_rejected_when_backpressure_is_exhausted() {
+        let (layer, _dir, make_batch) = over_limit_layer(noop_delta(), true, |c| c.buffer.timefusion_write_backpressure_secs = 0);
         let mut rejected = false;
         for _ in 0..8 {
             if layer.insert("d", "d", vec![make_batch()]).await.is_err() {
@@ -5309,29 +5283,7 @@ mod tests {
                 break;
             }
         }
-        assert!(rejected, "flag OFF: an over-hard-limit insert must be rejected once backpressure is exhausted");
-    }
-
-    /// With the flag ON the same scenario must not drop: inserts are admitted
-    /// over-budget (the WAL append is the durability boundary) and retained.
-    #[serial]
-    #[tokio::test]
-    async fn wal_admit_decouple_on_never_drops_over_budget() {
-        let (layer, _dir, make_batch) = decouple_test_layer(true);
-        for i in 0..8 {
-            layer
-                .insert("d", "d", vec![make_batch()])
-                .await
-                .unwrap_or_else(|e| panic!("flag ON: insert {i} must be admitted over-budget, not dropped; got {e}"));
-        }
-        assert!(!layer.is_empty(), "admitted rows must be retained (durable), not dropped");
-        let max = layer.max_memory_bytes();
-        assert!(
-            layer.effective_memory_bytes() > max,
-            "decouple must admit past the hard limit ({}MB), got {}MB",
-            max / (1024 * 1024),
-            layer.effective_memory_bytes() / (1024 * 1024)
-        );
+        assert!(rejected, "an over-hard-limit insert must be rejected once backpressure is exhausted");
     }
 
     /// The open bucket is excluded from normal flushing; only

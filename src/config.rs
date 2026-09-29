@@ -1444,11 +1444,6 @@ pub struct BufferConfig {
     pub timefusion_flush_parallelism: usize,
     #[serde(default)]
     pub timefusion_flush_immediately: bool,
-    /// `insert()` admits over the memory hard limit instead of rejecting a write
-    /// whose backpressure budget is exhausted — trades a reject for unbounded
-    /// growth if flush can't keep up.
-    #[serde(default)]
-    pub timefusion_wal_admit_decouple: bool,
     #[serde_inline_default(200)]
     pub timefusion_wal_fsync_ms: u64,
     // Durability mode for the WAL. One of:
@@ -1578,7 +1573,6 @@ impl BufferConfig {
         flush_dirty_drain_clean: bool = (timefusion_flush_dirty_drain_clean);
         delta_scan_depth: usize = (timefusion_delta_scan_depth.max(1));
         flush_immediately: bool = (timefusion_flush_immediately);
-        wal_admit_decouple: bool = (timefusion_wal_admit_decouple);
         wal_fsync_ms: u64 = (timefusion_wal_fsync_ms.max(1));
         wal_ack_fsync: bool = (timefusion_wal_ack_fsync);
         wal_max_file_count: usize = (timefusion_wal_max_file_count);
