@@ -2306,15 +2306,24 @@ pub struct MaintenanceConfig {
     /// decodes every masked row on every read, and nothing else removes one.
     #[serde_inline_default(true)]
     pub timefusion_dv_strip_enabled: bool,
-    /// Strip only dates before today (UTC). Today's partition prices a strip unit
-    /// over every DV file it holds (hundreds, tens of GiB decoded) and races dedup
-    /// commits; a sealed date holds a few DV files and nothing writes to it.
-    #[serde_inline_default(true)]
+    /// Strip only dates before today (UTC) — the kill switch for today's lane.
+    /// Off by default: today is where the masked rows are (the largest tenant's
+    /// partition is ~75% masked), and a today strip is priced by the one bin it
+    /// rewrites, loses a race with dedup as an ordinary retry, and is rate-bound below.
+    #[serde_inline_default(false)]
     pub timefusion_dv_strip_sealed_only: bool,
-    /// DV-bearing rewrites one partition may land per `timefusion_dv_strip_interval_secs`.
-    /// Today's DVs keep arriving while dedup runs, so this bounds the re-strip churn.
+    /// DV-bearing rewrites one span may land per `timefusion_dv_strip_interval_secs`:
+    /// a rollup slice cell today (or a straddler's span of cells), the whole
+    /// partition on a sealed date. Today's DVs keep arriving while dedup runs, so
+    /// this bounds re-stripping one span while leaving the rest of the day free.
     #[serde_inline_default(4)]
     pub timefusion_dv_strip_per_interval: u32,
+    /// DV-bearing rewrites the whole process may land per interval, so per-span
+    /// budgets cannot flood the hygiene lane. 60 per 10 min drains a ~1.1k-file
+    /// day (the three largest tenants' today) in ~3 h. Soft: checked at claim,
+    /// charged at landing, so units already in flight may overshoot it.
+    #[serde_inline_default(60)]
+    pub timefusion_dv_strip_global_per_interval: u32,
     #[serde_inline_default(600)]
     pub timefusion_dv_strip_interval_secs: u64,
 }
@@ -2668,10 +2677,7 @@ mod tests {
         assert!(config.maintenance.timefusion_evict_after_compaction);
         // Merge-on-read DV is the default write path.
         assert!(config.maintenance.timefusion_use_deletion_vectors);
-        assert!(
-            config.maintenance.timefusion_dv_strip_enabled && config.maintenance.timefusion_dv_strip_sealed_only,
-            "the DV strip runs, but only on sealed dates"
-        );
+        assert!(config.maintenance.timefusion_dv_strip_enabled && !config.maintenance.timefusion_dv_strip_sealed_only, "the DV strip runs, today included");
         assert!(!config.maintenance.timefusion_warm_full_files);
         assert_eq!(config.maintenance.timefusion_warm_recency_days, 35);
         assert_eq!(config.maintenance.timefusion_warm_concurrency, 16);

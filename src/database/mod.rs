@@ -2681,8 +2681,10 @@ pub struct Database {
     rollup_slice_coverage: Arc<dashmap::DashMap<RollupSliceCoverageKey, RollupCoverage>>,
     /// Sources whose `recover_rollup_coverage` has completed in this process.
     rollup_coverage_recovered: Arc<dashmap::DashSet<String>>,
-    /// `(window start, DV-bearing rewrites landed in it)` per `(project, source, date)`.
-    dv_strips_landed: dashmap::DashMap<(String, String, String), (i64, u32)>,
+    /// A `StripWindow` per `StripKey`.
+    dv_strips_landed: Arc<dashmap::DashMap<StripKey, StripWindow>>,
+    /// The same window over every span: `timefusion_dv_strip_global_per_interval`.
+    dv_strips_global: Arc<parking_lot::Mutex<StripWindow>>,
     /// `partition_file_rows` memoized per source table, keyed by the Delta
     /// version it was computed from — a new commit invalidates it naturally.
     /// Without this the bounded-witness rescue re-materialized the add-actions
@@ -3379,7 +3381,8 @@ impl Database {
             rollup_coverage: Arc::new(dashmap::DashMap::new()),
             rollup_slice_coverage: Arc::new(dashmap::DashMap::new()),
             rollup_coverage_recovered: Arc::new(dashmap::DashSet::new()),
-            dv_strips_landed: dashmap::DashMap::new(),
+            dv_strips_landed: Arc::new(dashmap::DashMap::new()),
+            dv_strips_global: Arc::new(parking_lot::Mutex::new((0, 0))),
             rollup_file_rows_cache: dashmap::DashMap::new(),
             witness_carry: Arc::default(),
             rollup_tier_untagged: Arc::new(dashmap::DashMap::new()),
@@ -6034,18 +6037,39 @@ pub(crate) struct TailAdd {
     /// even at target size: reading it disables per-file parquet predicate
     /// pushdown, so it must be rewritten DV-free to restore the read fast path.
     pub has_dv: bool,
+    /// Rows the deletion vector masks (its cardinality); 0 without one.
+    pub masked: u64,
+    /// The strip lane admits rewriting this DV file now (`Database::admit_strips`).
+    pub strip: bool,
 }
 
 impl TailAdd {
     /// Parse the raw Add stats JSON. The snapshot's parsed-stats column is not
     /// materialized on this path, so the kernel `stat_min_i64`/`stat_max_i64`
     /// accessors return `None` for every file and cannot be used here.
-    fn from_stats(path: String, size: i64, is_sorted_run: bool, has_dv: bool, stats: Option<&str>) -> Self {
+    fn from_stats(path: String, size: i64, is_sorted_run: bool, dv: Option<&deltalake::kernel::DeletionVectorDescriptor>, stats: Option<&str>) -> Self {
         let stats = stats.and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok());
         let event_range = stats.as_ref().and_then(Database::event_time_range_from_stats);
         let rows = stats.as_ref().and_then(|v| v.get("numRecords").and_then(serde_json::Value::as_u64));
-        Self { path, size, is_sorted_run, event_range, rows, has_dv }
+        let masked = dv.map_or(0, |dv| u64::try_from(dv.cardinality).unwrap_or(0));
+        Self { path, size, is_sorted_run, event_range, rows, has_dv: dv.is_some(), masked, strip: false }
     }
+}
+
+/// `(window start, DV-bearing rewrites landed in it)`.
+pub(crate) type StripWindow = (i64, u32);
+/// `(project, source, date, strip_span)`.
+type StripKey = (String, String, String, (i64, i64));
+
+/// The span of `bounds` enclosing `range` — the strip lane's rate-budget key.
+/// Equal-cell ends for a file inside one cell, wider for a straddler; a strip's
+/// output lies inside its input's range, so re-masked output keeps its key.
+/// No bounds (a sealed date) or no range is the whole partition.
+pub(crate) fn strip_span(bounds: &[i64], range: Option<(i64, i64)>) -> (i64, i64) {
+    range.filter(|_| !bounds.is_empty()).map_or((i64::MIN, i64::MAX), |(lo, hi)| {
+        let cell = |t: i64| bounds.partition_point(|bound| *bound <= t);
+        (cell(lo).checked_sub(1).map_or(i64::MIN, |i| bounds[i]), bounds.get(cell(hi)).copied().unwrap_or(i64::MAX))
+    })
 }
 
 /// DECODED working set one bin-of-unsorted-files may sort.
@@ -6088,8 +6112,6 @@ pub(crate) struct BinPolicy {
     /// Exclude sorted runs while any unsorted file is present, so L0 arrivals are
     /// sorted into runs before runs are merged with each other.
     pub level_unsorted_first: bool,
-    /// A lone DV-bearing file is work: rewriting it retires its masked rows.
-    pub strip_dv: bool,
 }
 
 /// THE bin packer. One implementation, both callers.
@@ -6166,9 +6188,9 @@ pub(crate) fn select_bin(candidates: &[TailAdd], policy: BinPolicy) -> Vec<Strin
         selected.push(add);
     }
     // A lone UNSORTED file is real work: sorting it into a run is the L0 pass, and
-    // so is a lone DV file under `strip_dv`. Everywhere else a one-file bin is a
-    // 1:1 rewrite that retires nothing.
-    if selected.len() < 2 && !has_unsorted && !(policy.strip_dv && selected.iter().any(|add| add.has_dv)) {
+    // so is a lone DV file the strip lane admits. Everywhere else a one-file bin
+    // is a 1:1 rewrite that retires nothing.
+    if selected.len() < 2 && !has_unsorted && !selected.iter().any(|add| add.strip) {
         return Vec::new();
     }
     selected.into_iter().map(|add| add.path.clone()).collect()
@@ -6188,19 +6210,19 @@ pub(crate) fn slice_bounds(covered: impl IntoIterator<Item = i64>, day_start: i6
 
 /// `adds` grouped by the cell between consecutive sorted `bounds` each lies
 /// wholly inside. A straddler or a file without an event range joins no cell.
-/// Nor does a DV'd file unless `strip_dv`: packing drops its masked rows, moving
-/// every bound above, which only `carry_rewrite_witness` repairs. Under it a DV
-/// file outside every cell is a cell of its own — a rewrite of it ALONE keeps
-/// its output inside its input's range, so it crosses no bound it did not.
-/// THE one grouping the planner and the packer share; no bounds is one cell.
-pub(crate) fn slice_cells(adds: impl IntoIterator<Item = TailAdd>, bounds: &[i64], strip_dv: bool) -> Vec<Vec<TailAdd>> {
+/// Nor does a DV'd file unless its `strip` is admitted: packing drops its masked
+/// rows, moving every bound above, which only `carry_rewrite_witness` repairs.
+/// An admitted DV file outside every cell is a cell of its own — a rewrite of it
+/// ALONE keeps its output inside its input's range, so it crosses no bound it did
+/// not. THE one grouping the planner and the packer share; no bounds is one cell.
+pub(crate) fn slice_cells(adds: impl IntoIterator<Item = TailAdd>, bounds: &[i64]) -> Vec<Vec<TailAdd>> {
     let cell = |t: i64| bounds.partition_point(|bound| *bound <= t);
     adds.into_iter()
         .enumerate()
         .filter_map(|(i, add)| match add.event_range {
             _ if bounds.is_empty() => Some((0, add)),
-            Some((min, max)) if cell(min) == cell(max) && (strip_dv || !add.has_dv) => Some((cell(min), add)),
-            _ if strip_dv && add.has_dv => Some((bounds.len() + 1 + i, add)),
+            Some((min, max)) if cell(min) == cell(max) && (add.strip || !add.has_dv) => Some((cell(min), add)),
+            _ if add.strip => Some((bounds.len() + 1 + i, add)),
             _ => None,
         })
         .into_group_map()
@@ -6210,17 +6232,43 @@ pub(crate) fn slice_cells(adds: impl IntoIterator<Item = TailAdd>, bounds: &[i64
         .collect()
 }
 
-/// What the planner queues a partition on: the under-`target` files — and under
-/// `strip_dv` every DV file — of each cell holding a pair or a DV file. Empty
+/// What the planner queues a partition on: the cells holding a pair of
+/// under-`target` files or an admitted DV file, each cut to those files. Empty
 /// means compliant. The packer bins exactly these through `select_cell_bin`.
-pub(crate) fn hygiene_debt(files: impl IntoIterator<Item = TailAdd>, target: i64, bounds: &[i64], strip_dv: bool) -> Vec<TailAdd> {
-    let small = files.into_iter().filter(|add| add.size < target || (strip_dv && add.has_dv)).sorted_by_key(|add| add.size);
-    slice_cells(small, bounds, strip_dv).into_iter().filter(|cell| cell.len() >= 2 || (strip_dv && cell.iter().any(|add| add.has_dv))).flatten().collect()
+pub(crate) fn hygiene_debt(files: impl IntoIterator<Item = TailAdd>, target: i64, bounds: &[i64]) -> Vec<Vec<TailAdd>> {
+    let small = files.into_iter().filter(|add| add.size < target || add.strip).sorted_by_key(|add| add.size);
+    slice_cells(small, bounds).into_iter().filter(|cell| cell.len() >= 2 || cell.iter().any(|add| add.strip)).collect()
 }
 
-/// What the packer takes: the fullest bin any single cell yields.
+/// What the packer takes: the bin with the highest masked-row fraction, so
+/// fully-masked corpses retire first and the most-masked files strip next;
+/// among equals (every clean bin) the fullest. The path breaks the remaining
+/// ties so planner and packer, which order candidates differently, pick alike.
 pub(crate) fn select_cell_bin(cells: &[Vec<TailAdd>], policy: BinPolicy) -> Vec<String> {
-    cells.iter().map(|cell| select_bin(cell, policy)).min_by_key(|bin| std::cmp::Reverse(bin.len())).unwrap_or_default()
+    cells
+        .iter()
+        .map(|cell| (cell, select_bin(cell, policy)))
+        .filter(|(_, bin)| !bin.is_empty())
+        .max_by_key(|(cell, bin)| {
+            let (masked, rows) = cell
+                .iter()
+                .filter(|add| bin.contains(&add.path))
+                .filter_map(|add| Some((add.masked, add.rows?)))
+                .fold((0u64, 0u64), |(masked, rows), (m, r)| (masked.saturating_add(m), rows.saturating_add(r)));
+            (masked.saturating_mul(1_000_000).checked_div(rows).unwrap_or(0), bin.len(), std::cmp::Reverse(bin.iter().min().cloned()))
+        })
+        .map(|(_, bin)| bin)
+        .unwrap_or_default()
+}
+
+/// Decoded bytes of the bin ONE unit takes from `debt`, through the packer's own
+/// selection — what a hygiene unit is priced at. The whole debt is the benefit,
+/// not the cost: summing it priced a today unit over hundreds of DV files and
+/// pinned it to the CPU-token cap. The declared `target` and no L0 levelling
+/// (the planner reads no tags) make it an upper bound on the packer's bin.
+pub(crate) fn hygiene_bin_decoded_bytes(debt: &[Vec<TailAdd>], target: i64) -> u64 {
+    let bin = select_cell_bin(debt, BinPolicy { target_size: target, max_rows: u64::MAX, order: BinOrder::SmallestFirst, level_unsorted_first: false });
+    debt.iter().flatten().filter(|add| bin.contains(&add.path)).map(|add| crate::database::maintain::estimated_decoded_bytes(add.size)).sum()
 }
 
 /// Per-slice budget, in **DECODED** bytes — the unit the sort actually allocates.
@@ -6515,7 +6563,6 @@ pub(crate) fn select_tail_bin(adds: &[TailAdd], target_size: i64, min_files: usi
             order: BinOrder::EventTime,
             // Sortedness is handled by `sorted_run_cap` above, not by levelling.
             level_unsorted_first: false,
-            strip_dv: false,
         },
     );
     // Gap rule, for TODAY only: once a project has no packable slice left, spend

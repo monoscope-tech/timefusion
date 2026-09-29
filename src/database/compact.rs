@@ -316,7 +316,7 @@ impl Database {
                     add.path().to_string(),
                     add.size(),
                     is_sorted_run(&add.tags()),
-                    add.deletion_vector_descriptor().is_some(),
+                    add.deletion_vector_descriptor().as_ref(),
                     add.stats().as_deref(),
                 )
             })
@@ -351,7 +351,7 @@ impl Database {
                 let project_id = path_partition_value(&path, "project_id").filter(|p| !p.is_empty()).map(str::to_owned)?;
                 Some((
                     project_id,
-                    TailAdd::from_stats(path.into_owned(), size, sorted_run, file.deletion_vector_descriptor().is_some(), file.stats().as_deref()),
+                    TailAdd::from_stats(path.into_owned(), size, sorted_run, file.deletion_vector_descriptor().as_ref(), file.stats().as_deref()),
                 ))
             })
             .into_group_map();

@@ -1693,27 +1693,25 @@ impl Database {
             let schema = schema_or_default(&source);
             // The file count IS the benefit for hygiene: `scheduling_class` ranks
             // sealed hygiene on it, not on which cell sealed first.
-            let mk_task = |project_id: &str, slice, operation, files: &[&TailAdd], created_unix_ms| {
-                let estimate = files.iter().fold(0u64, |bytes, file| bytes.saturating_add(estimated_decoded_bytes(file.size)));
-                MaintenanceTask {
-                    key: TaskKey { physical_table: source.clone(), source: source.clone(), project_id: project_id.to_owned(), slice, operation },
-                    state: TaskState::Pending,
-                    deadline_micros: now,
-                    estimated_decoded_bytes: estimate.max(1),
-                    hash_shard: 0,
-                    hash_shards: 1,
-                    attempts: 0,
-                    created_unix_ms,
-                    retry_reason: None,
-                    publication: None,
-                    base_tier_present: false,
-                    input: Some(crate::maintenance_coordinator::InputFootprint::new(files.iter().map(|file| &file.path), estimate)),
-                    parent_measured_bytes: None,
-                    preflight_decoded_bytes: None,
-                    backfill_priority_micros: None,
-                    pended_unix_ms: None,
-                    rank_cache: Default::default(),
-                }
+            let decoded = |files: &mut dyn Iterator<Item = &TailAdd>| files.fold(0u64, |bytes, file| bytes.saturating_add(estimated_decoded_bytes(file.size)));
+            let mk_task = |project_id: &str, slice, operation, files: &[&TailAdd], estimate: u64, created_unix_ms| MaintenanceTask {
+                key: TaskKey { physical_table: source.clone(), source: source.clone(), project_id: project_id.to_owned(), slice, operation },
+                state: TaskState::Pending,
+                deadline_micros: now,
+                estimated_decoded_bytes: estimate.max(1),
+                hash_shard: 0,
+                hash_shards: 1,
+                attempts: 0,
+                created_unix_ms,
+                retry_reason: None,
+                publication: None,
+                base_tier_present: false,
+                input: Some(crate::maintenance_coordinator::InputFootprint::new(files.iter().map(|file| &file.path), estimate)),
+                parent_measured_bytes: None,
+                preflight_decoded_bytes: None,
+                backfill_priority_micros: None,
+                pended_unix_ms: None,
+                rank_cache: Default::default(),
             };
             let mut partitions: HashMap<(String, chrono::NaiveDate), Vec<TailAdd>> = HashMap::new();
             {
@@ -1733,8 +1731,13 @@ impl Database {
                         continue;
                     }
                     let stats = (date == today).then(|| file.stats()).flatten();
-                    let has_dv = dv.is_some();
-                    partitions.entry((project, date)).or_default().push(TailAdd::from_stats(path.to_string(), file.size(), false, has_dv, stats.as_deref()));
+                    partitions.entry((project, date)).or_default().push(TailAdd::from_stats(
+                        path.to_string(),
+                        file.size(),
+                        false,
+                        dv.as_ref(),
+                        stats.as_deref(),
+                    ));
                 }
             }
             // Anything seen-but-not-planned is COMPLIANT, which is what retires
@@ -1755,31 +1758,33 @@ impl Database {
                 // is only a *suspect*, and admitting on that would put every
                 // flush-written partition permanently out of policy.
                 // A DV file is debt at any size while the strip lane admits it.
-                let strip = self.dv_strip_admits(&project_id, &source, &date.to_string());
                 // Today, only files sharing a rollup slice cell may pair — the
                 // packer groups by the SAME `slice_cells` over the same bounds.
                 let bounds = if date == today { self.packing_bounds(&project_id, &source, day_start) } else { Some(Vec::new()) };
-                let small = bounds.map_or_else(Vec::new, |bounds| hygiene_debt(files.iter().cloned(), small_target, &bounds, strip));
-                // TWO under-target files, or one DV file under `strip`, ARE the
+                let debt = bounds.map_or_else(Vec::new, |bounds| {
+                    hygiene_debt(self.admit_strips(&project_id, &source, &date.to_string(), &bounds, files.iter().cloned()), small_target, &bounds)
+                });
+                // TWO under-target files, or one admitted DV file, ARE the
                 // admission test. The packer's byte budget carries `pair_floor`, so
-                // it bins any two of these, and `strip_dv` lifts its lone-file veto
-                // for a DV file; a second, separately-derived predicate here is
+                // it bins any two of these, and an admitted strip lifts its
+                // lone-file veto; a second, separately-derived predicate here is
                 // exactly how planner and packer drifted apart into a three-day
                 // spin (2026-09-15).
-                if !small.is_empty() {
+                if !debt.is_empty() {
                     let operation = if date == today { Operation::HotPacking } else { Operation::SealedConsolidation };
                     planned_keys.insert((project_id.clone(), date, operation));
                     // Age from when the partition SEALED, so starvation escalation
                     // survives the restarts that re-derive this queue.
                     let sealed_at_ms = unix_ms(slice.end_micros.max(0));
                     let created_unix_ms = if date == today { created_unix_ms } else { sealed_at_ms.min(created_unix_ms) };
-                    planned.push(mk_task(&project_id, slice, operation, &small.iter().collect_vec(), created_unix_ms));
+                    let estimate = hygiene_bin_decoded_bytes(&debt, small_target);
+                    planned.push(mk_task(&project_id, slice, operation, &debt.iter().flatten().collect_vec(), estimate, created_unix_ms));
                 }
                 if date < today && !schema.sorting_columns.is_empty() {
                     let suspects = files.iter().filter(|file| !self.repair_verified_sorted.contains(&file.path)).collect::<Vec<_>>();
                     if !suspects.is_empty() {
                         planned_keys.insert((project_id.clone(), date, Operation::Repair));
-                        planned.push(mk_task(&project_id, slice, Operation::Repair, &suspects, created_unix_ms));
+                        planned.push(mk_task(&project_id, slice, Operation::Repair, &suspects, decoded(&mut suspects.iter().copied()), created_unix_ms));
                     }
                 }
             }
@@ -3912,7 +3917,7 @@ impl Database {
                     if self.lossy_parked(&path, dv.as_ref().map_or(0, |dv| dv.cardinality)) {
                         return None;
                     }
-                    let add = TailAdd::from_stats(path.to_string(), file.size(), is_sorted_run(&file.tags()), dv.is_some(), file.stats().as_deref());
+                    let add = TailAdd::from_stats(path.to_string(), file.size(), is_sorted_run(&file.tags()), dv.as_ref(), file.stats().as_deref());
                     if add.event_range.is_some_and(|(start, end)| start >= key.slice.end_micros || end < key.slice.start_micros) {
                         return None;
                     }
@@ -3953,8 +3958,7 @@ impl Database {
         let bounds =
             if key.operation == Operation::HotPacking { self.packing_bounds(&key.project_id, &key.source, key.slice.start_micros) } else { Some(Vec::new()) };
         let Some(bounds) = bounds else { return Ok(Vec::new()) };
-        let strip = self.dv_strip_admits(&key.project_id, &key.source, &date);
-        let cells = slice_cells(candidates, &bounds, strip);
+        let cells = slice_cells(self.admit_strips(&key.project_id, &key.source, &date, &bounds, candidates), &bounds);
         let selected = select_cell_bin(
             &cells,
             BinPolicy {
@@ -3970,7 +3974,6 @@ impl Database {
                 // runs merge with each other.
                 order: crate::database::BinOrder::SmallestFirst,
                 level_unsorted_first: true,
-                strip_dv: strip,
             },
         );
         // Span of the output: merging unions the inputs' ranges and dedup reads a file
@@ -4336,9 +4339,10 @@ impl Database {
                 let landed = result.failed.is_empty() && !result.landed.is_empty();
                 (landed, landed)
             }
-            // Converged committed nothing: with debt still visible below, that is
-            // a planner/packer disagreement, and it must not requeue at `now`.
-            Ok(BinOutcome::Converged) => (true, false),
+            // Converged here means the bin staged no rows: its files were
+            // fully-masked corpses, now retired — progress, as the strip lane
+            // retires them first and the rest of the partition's debt follows.
+            Ok(BinOutcome::Converged) => (true, true),
             Ok(BinOutcome::Retry) => (false, false),
             // The repair byte budget is held by another long-running rewrite; requeue
             // on that clock rather than spinning on re-claims.
@@ -5417,18 +5421,51 @@ impl Database {
     }
 
     /// THE strip-lane admission, one predicate for planner and packer so they
-    /// cannot disagree: the flag, a sealed date unless `sealed_only` is off, the source's slice coverage recovered (before
-    /// that the rewrite's carry finds nothing to carry and every slice of the day
-    /// goes stale), and the partition's landing budget.
-    fn dv_strip_admits(&self, project_id: &str, source: &str, date: &str) -> bool {
-        let (cfg, interval) = (&self.config.maintenance, self.dv_strip_interval_micros());
+    /// cannot disagree: the flag, a sealed date unless `sealed_only`, the source's
+    /// slice coverage recovered (before that the rewrite's carry finds nothing to
+    /// carry and every slice of the day goes stale), and the process-wide budget.
+    fn dv_strip_admits(&self, source: &str, date: &str) -> bool {
+        let cfg = &self.config.maintenance;
         cfg.timefusion_dv_strip_enabled
             && (!cfg.timefusion_dv_strip_sealed_only || date < crate::support::today_utc().to_string().as_str())
             && (get_schema(source).is_none_or(|schema| schema.rollups.is_empty()) || self.rollup_coverage_recovered.contains(source))
-            && self.dv_strips_landed.get(&(project_id.to_owned(), source.to_owned(), date.to_owned())).is_none_or(|entry| {
-                let (since, landed) = *entry;
-                crate::support::now_micros().saturating_sub(since) >= interval || landed < cfg.timefusion_dv_strip_per_interval
-            })
+            && self.dv_strip_window_open(*self.dv_strips_global.lock(), cfg.timefusion_dv_strip_global_per_interval)
+    }
+
+    /// `adds` with `strip` set on each DV file the lane admits now: the partition
+    /// is admitted and the file's `strip_span` has budget left.
+    pub(crate) fn admit_strips(&self, project_id: &str, source: &str, date: &str, bounds: &[i64], adds: impl IntoIterator<Item = TailAdd>) -> Vec<TailAdd> {
+        let partition = self.dv_strip_admits(source, date);
+        let per_span = self.config.maintenance.timefusion_dv_strip_per_interval;
+        let span_open = |add: &TailAdd| {
+            let key = (project_id.to_owned(), source.to_owned(), date.to_owned(), strip_span(bounds, add.event_range));
+            self.dv_strips_landed.get(&key).is_none_or(|window| self.dv_strip_window_open(*window, per_span))
+        };
+        adds.into_iter().map(|add| TailAdd { strip: partition && add.has_dv && span_open(&add), ..add }).collect()
+    }
+
+    /// A `(start, landed)` window still admits a rewrite: it expired, or `cap` isn't reached.
+    fn dv_strip_window_open(&self, (since, landed): StripWindow, cap: u32) -> bool {
+        crate::support::now_micros().saturating_sub(since) >= self.dv_strip_interval_micros() || landed < cap
+    }
+
+    /// Charge one landed DV-bearing rewrite to its span's window and the global one.
+    fn spend_dv_strip(&self, project_id: &str, source: &str, date: &str, span: (i64, i64)) {
+        let (now, interval) = (crate::support::now_micros(), self.dv_strip_interval_micros());
+        let expired = |window: &StripWindow| now.saturating_sub(window.0) >= interval;
+        let spend = |window: &mut StripWindow| {
+            if expired(window) {
+                *window = (now, 0);
+            }
+            window.1 = window.1.saturating_add(1);
+        };
+        // An expired window admits exactly like an absent one, so each global
+        // rollover drops them; per-span keys would otherwise accrue for ever.
+        if expired(&self.dv_strips_global.lock()) {
+            self.dv_strips_landed.retain(|_, window| !expired(window));
+        }
+        spend(&mut self.dv_strips_landed.entry((project_id.to_owned(), source.to_owned(), date.to_owned(), span)).or_insert((now, 0)));
+        spend(&mut self.dv_strips_global.lock());
     }
 
     fn dv_strip_interval_micros(&self) -> i64 {
@@ -5436,12 +5473,19 @@ impl Database {
     }
 
     /// Bookkeeping for landed compaction bins whose inputs carried a DV: they
-    /// dropped the masked rows, so carry the witness and spend the strip budget.
+    /// dropped the masked rows, so carry the witness and spend the strip budget
+    /// of the span the bin covered.
     async fn note_masked_rewrites_landed(&self, table_ref: &Arc<RwLock<DeltaTable>>, key: &crate::maintenance_coordinator::TaskKey, landed: &[StagedBin]) {
         let masked = landed.iter().filter(|bin| bin.targets.iter().any(|add| add.deletion_vector.is_some())).collect_vec();
         if masked.is_empty() {
             return;
         }
+        let Some(date) = chrono::DateTime::from_timestamp_micros(key.slice.start_micros).map(|time| time.date_naive().to_string()) else { return };
+        let bounds = if key.operation == crate::maintenance_coordinator::Operation::HotPacking {
+            self.packing_bounds(&key.project_id, &key.source, key.slice.start_micros).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         let table = table_ref.read().await;
         let stats = crate::observability::maintenance_stats();
         for bin in &masked {
@@ -5450,15 +5494,14 @@ impl Database {
             self.carry_rewrite_witness(&table, &key.source, &bin.project_id, &bin.targets, &outputs);
             let retired = bin.targets.iter().filter_map(|add| add.deletion_vector.as_ref()).map(|dv| u64::try_from(dv.cardinality).unwrap_or(0)).sum::<u64>();
             stats.dv_rewrite_rows_retired.fetch_add(retired, std::sync::atomic::Ordering::Relaxed);
+            let range = bin.targets.iter().map(|add| match add_ts_bounds(add) {
+                (Some(lo), Some(hi)) => Some((lo, hi)),
+                _ => None,
+            });
+            let range = range.reduce(|a, b| a.zip(b).map(|((lo, hi), (start, end))| (lo.min(start), hi.max(end)))).flatten();
+            self.spend_dv_strip(&key.project_id, &key.source, &date, strip_span(&bounds, range));
         }
         stats.dv_rewrites_landed.fetch_add(masked.len() as u64, std::sync::atomic::Ordering::Relaxed);
-        let Some(date) = chrono::DateTime::from_timestamp_micros(key.slice.start_micros).map(|time| time.date_naive().to_string()) else { return };
-        let (now, interval) = (crate::support::now_micros(), self.dv_strip_interval_micros());
-        let mut entry = self.dv_strips_landed.entry((key.project_id.clone(), key.source.clone(), date)).or_insert((now, 0));
-        if now.saturating_sub(entry.0) >= interval {
-            *entry = (now, 0);
-        }
-        entry.1 = entry.1.saturating_add(masked.len() as u32);
     }
 
     /// After a flush commit lands: carry each date's eligible rows, bounded by the
@@ -11596,13 +11639,13 @@ mod rollup_noop_skip_tests {
         Ingest,
     }
 
-    /// Out of the box the strip lane admits only sealed dates: today's partition
-    /// prices a strip unit over every DV file it holds and races dedup commits.
+    /// Out of the box the strip lane admits today too: that is where the masked
+    /// rows are. `sealed_only` is the kill switch that keeps today out.
     #[test_case::test_case(1, None, true ; "sealed date admitted by default")]
-    #[test_case::test_case(0, None, false ; "today excluded by default")]
-    #[test_case::test_case(0, Some(false), true ; "today admitted once sealed_only is off")]
+    #[test_case::test_case(0, None, true ; "today admitted by default")]
+    #[test_case::test_case(0, Some(true), false ; "sealed_only keeps today out")]
     #[tokio::test]
-    async fn dv_strip_admits_sealed_dates_by_default(days_back: i64, sealed_only: Option<bool>, admitted: bool) -> Result<()> {
+    async fn dv_strip_admits_today_by_default(days_back: i64, sealed_only: Option<bool>, admitted: bool) -> Result<()> {
         let mut cfg = (*rollup_cfg("dv_strip_sealed")).clone();
         if let Some(sealed_only) = sealed_only {
             cfg.maintenance.timefusion_dv_strip_sealed_only = sealed_only;
@@ -11610,7 +11653,45 @@ mod rollup_noop_skip_tests {
         let db = Database::with_config(Arc::new(cfg)).await?;
         db.rollup_coverage_recovered.insert("otel_logs_and_spans".to_owned());
         let date = (crate::support::today_utc() - chrono::Duration::days(days_back)).to_string();
-        assert_eq!(db.dv_strip_admits("proj", "otel_logs_and_spans", &date), admitted);
+        assert_eq!(db.dv_strip_admits("otel_logs_and_spans", &date), admitted);
+        Ok(())
+    }
+
+    /// The strip budget is per SPAN (a slice cell, or the cells a straddler
+    /// crosses), not per partition: at 4 per 10 min per partition Talstack's ~465
+    /// DV files took ~19 h, longer than the day. A spent span leaves the rest of
+    /// the day stripping; the process-wide cap stops everything; the window lapses.
+    #[tokio::test]
+    async fn the_strip_budget_is_per_span_under_a_global_cap() -> Result<()> {
+        const MINUTE: i64 = 60_000_000;
+        let mut cfg = (*rollup_cfg("dv_strip_budget")).clone();
+        cfg.maintenance.timefusion_dv_strip_global_per_interval = 6;
+        let db = Database::with_config(Arc::new(cfg)).await?;
+        let source = "otel_logs_and_spans";
+        db.rollup_coverage_recovered.insert(source.to_owned());
+        let (date, bounds) = (crate::support::today_utc().to_string(), crate::database::slice_bounds([], 0));
+        let file = |path: &str, lo: i64, hi: i64| TailAdd {
+            path: path.into(),
+            size: 1,
+            is_sorted_run: true,
+            event_range: Some((lo * MINUTE, hi * MINUTE)),
+            rows: Some(2),
+            has_dv: true,
+            masked: 1,
+            strip: false,
+        };
+        let adds = [file("straddler", 8, 12), file("other_straddler", 28, 32), file("in_cell", 41, 42)];
+        let admitted = || db.admit_strips("proj", source, &date, &bounds, adds.clone()).into_iter().filter(|add| add.strip).map(|add| add.path).collect_vec();
+        assert_eq!(admitted(), ["straddler", "other_straddler", "in_cell"]);
+        for _ in 0..db.config.maintenance.timefusion_dv_strip_per_interval {
+            db.spend_dv_strip("proj", source, &date, crate::database::strip_span(&bounds, adds[0].event_range));
+        }
+        assert_eq!(admitted(), ["other_straddler", "in_cell"], "a spent span stops only itself");
+        db.spend_dv_strip("proj", source, &date, crate::database::strip_span(&bounds, adds[2].event_range));
+        db.spend_dv_strip("other_proj", source, &date, (0, 1));
+        assert!(admitted().is_empty(), "the global cap stops every span");
+        crate::support::advance_micros(db.dv_strip_interval_micros());
+        assert_eq!(admitted().len(), 3, "and the window lapses");
         Ok(())
     }
 
@@ -11728,6 +11809,189 @@ mod rollup_noop_skip_tests {
         FORCE_LOSSY_REWRITE.store(0, Relaxed);
         crate::support::advance_micros(LOSSY_PARK_MICROS);
         assert_eq!(tick().await?, (1, (1, 0)), "once the park lapses the pack lands");
+        Ok(())
+    }
+
+    /// Today's files are still being masked by dedup while a strip stages, so a
+    /// strip sometimes loses that race. The loss must be an ordinary stale bin —
+    /// the commit re-verifies each input's DV and drops the bin, the unit retries —
+    /// never the exact-count guard's 1-16 h park: the guard counts against the
+    /// pinned snapshot the scan read, and a changed DV is a changed input.
+    #[serial]
+    #[tokio::test]
+    async fn a_strip_whose_input_is_remasked_before_commit_retries_and_lands() -> Result<()> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let db = Arc::new(Database::with_config(rollup_cfg("dv_strip_race")).await?);
+        let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+        let date = chrono::Utc::now().date_naive() - chrono::Duration::days(3);
+        let noon = date.and_hms_opt(12, 0, 0).expect("valid hour").and_utc().timestamp_micros();
+        let insert = async |rows| db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![json_to_batch(rows)?], true, None).await;
+        insert(vec![test_span_ts("dup", "first", &project_id, noon), test_span_ts("other", "op", &project_id, noon + 1)]).await?;
+        insert(vec![test_span_ts("dup", "second", &project_id, noon)]).await?;
+        // A sorted run, as prod's DV files are, so the lone DV file is a strip.
+        db.plan_compaction_debt().await?;
+        assert!(db.run_coordinator_compaction_once(Operation::SealedConsolidation).await?);
+        dedup_unified(&db).await?;
+        let table = db.resolve_table(&project_id, "otel_logs_and_spans").await?;
+        let adds = || async {
+            let t = table.read().await;
+            anyhow::Ok(t.snapshot()?.log_data().iter().map(|f| add_action(&f)).filter(|add| add.path.contains(&project_id)).collect_vec())
+        };
+        let masked = adds().await?.into_iter().find(|add| add.deletion_vector.is_some()).expect("one DV file");
+        let options = HotStageOptions {
+            pass: TailPass::Pack,
+            operation: Some(Operation::SealedConsolidation),
+            runtime_env: Some(db.coordinator_runtime_env()),
+            light_permit: None,
+        };
+        let schema = get_schema("otel_logs_and_spans").expect("schema");
+        let BinOutcome::Staged(bin) = db.stage_hot_bin(&table, "otel_logs_and_spans", schema, &project_id, vec![masked.path.clone()], options).await? else {
+            panic!("the strip must stage");
+        };
+        // Dedup lands a newer `other` meanwhile, masking a second row of the input.
+        insert(vec![test_span_ts("other", "newer", &project_id, noon + 1)]).await?;
+        dedup_unified(&db).await?;
+        let remasked = adds().await?.into_iter().find(|add| add.path == masked.path).and_then(|add| add.deletion_vector).expect("still masked");
+        assert_eq!(remasked.cardinality, 2, "precondition: the input's DV changed after staging");
+
+        let refusals = crate::observability::maintenance_stats().lossy_rewrite_refusals.load(Relaxed);
+        let result = db.commit_wave(&table, "otel_logs_and_spans", &[format!("date={date}/")], false, vec![bin], 0).await;
+        assert_eq!((result.landed.len(), result.failed.len()), (0, 1), "a re-masked input makes the bin stale; it must not land");
+        assert!(!db.lossy_parked(&masked.path, remasked.cardinality), "the new DV version is not parked");
+
+        // The newer `other` is an unsorted flush file: one unit levels it, the next packs.
+        for _ in 0..2 {
+            db.plan_compaction_debt().await?;
+            assert!(db.run_coordinator_compaction_once(Operation::SealedConsolidation).await?);
+        }
+        let after = adds().await?;
+        assert_eq!((after.len(), after.iter().filter(|add| add.deletion_vector.is_some()).count()), (1, 0), "a later attempt lands DV-free");
+        assert_eq!(after.iter().filter_map(add_row_count).sum::<u64>(), 2, "physical rows are the two live rows");
+        let count = db.query_delta_only(&format!("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = '{project_id}'")).await?;
+        assert_eq!(arrow::util::pretty::pretty_format_batches(&count)?.to_string().matches(" 2 ").count(), 1, "and logical rows agree");
+        assert_eq!(crate::observability::maintenance_stats().lossy_rewrite_refusals.load(Relaxed), refusals, "the race never reached the guard");
+        Ok(())
+    }
+
+    /// Today's partition, DV-deduped under a LIVE rollup slice, is the strip
+    /// lane's main job. Out of the box the lane packs the masked file with its
+    /// cellmate; the answer is unchanged, the slice still routes (the witness was
+    /// carried), and afterwards the partition holds exactly its live rows.
+    #[serial]
+    #[tokio::test]
+    async fn todays_dv_files_strip_under_a_live_rollup_slice() -> Result<()> {
+        let db = Arc::new(Database::with_config(rollup_cfg("dv_strip_today")).await?);
+        db.get_or_create_unified_table("otel_logs_and_spans").await?;
+        db.reconcile_maintenance_task_cursors().await?;
+        let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+        let today = crate::support::today_utc();
+        let at = today.and_hms_opt(0, 1, 0).expect("valid minute").and_utc().timestamp_micros();
+        assert!(chrono::Utc::now().timestamp_micros() - at > 3 * 3_600_000_000, "precondition: dedup masks only bins sealed 2 h; run after 03:00 UTC");
+        for rows in [
+            vec![test_span_ts("dup", "first", &project_id, at), test_span_ts("other", "op", &project_id, at + 1)],
+            vec![test_span_ts("dup", "second", &project_id, at)],
+        ] {
+            db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![json_to_batch(rows)?], true, None).await?;
+        }
+        dedup_unified(&db).await?;
+        let table = db.resolve_table(&project_id, "otel_logs_and_spans").await?;
+        let partition = || async {
+            let t = table.read().await;
+            let adds = t.snapshot()?.log_data().iter().map(|f| add_action(&f)).filter(|add| add.path.contains(&project_id)).collect_vec();
+            anyhow::Ok((adds.len(), adds.iter().filter(|add| add.deletion_vector.is_some()).count(), adds.iter().filter_map(add_row_count).sum::<u64>()))
+        };
+        assert_eq!(partition().await?, (2, 1, 3), "precondition: one deletion vector over three physical rows");
+        db.reconcile_maintenance_task_cursors().await?;
+        assert!(advance_and_drain(&db).await? > 0, "today's slice must build");
+        assert_eq!(crate::support::today_utc(), today, "precondition: the clock advance stayed on today");
+        db.recover_rollup_coverage("otel_logs_and_spans").await?;
+
+        let mut ctx = Arc::clone(&db).create_session_context();
+        db.setup_session_context(&mut ctx)?;
+        let (lo, hi) = db
+            .rollup_slice_coverage
+            .iter()
+            .find(|entry| entry.key().0 == project_id && entry.key().2 == TIER && entry.key().3 <= at && at < entry.key().4)
+            .map(|entry| (entry.key().3, entry.key().4))
+            .expect("the live base slice holding the rows");
+        let sql = format!(
+            "SELECT COUNT(*) AS c FROM otel_logs_and_spans WHERE project_id='{project_id}' AND timestamp >= to_timestamp_micros({lo}) AND timestamp < to_timestamp_micros({hi})"
+        );
+        let answer = || async {
+            let state = ctx.state();
+            let plan = state.optimize(&state.create_logical_plan(&sql).await?)?;
+            let routed = matches!(db.rollup_sql(&plan, &state).await, Ok(Some(_)));
+            let render = |batches: Vec<RecordBatch>| arrow::util::pretty::pretty_format_batches(&batches).map(|table| table.to_string());
+            anyhow::Ok((routed, render(ctx.sql(&sql).await?.collect().await?)?, render(db.query_delta_only(&sql).await?)?))
+        };
+        let (routed, served, raw) = answer().await?;
+        assert!(routed, "the slice must route before the strip");
+        assert_eq!(served, raw);
+
+        db.plan_compaction_debt().await?;
+        assert!(db.run_coordinator_compaction_once(Operation::HotPacking).await?, "today's DV file is hot-packing debt");
+        assert_eq!(partition().await?, (1, 0, 2), "packed DV-free: physical rows = the two live rows");
+        let bounds = db
+            .packing_bounds(&project_id, "otel_logs_and_spans", today.and_hms_opt(0, 0, 0).expect("midnight").and_utc().timestamp_micros())
+            .expect("recovered");
+        let span = (project_id.clone(), "otel_logs_and_spans".to_owned(), today.to_string(), crate::database::strip_span(&bounds, Some((at, at))));
+        assert_eq!(db.dv_strips_landed.get(&span).map(|window| window.1), Some(1), "the landing charges the span admission checks");
+        let (routed, served, after) = answer().await?;
+        assert!(routed, "the carried witness keeps today's slice routed");
+        assert_eq!((served, after), (raw.clone(), raw), "and it answers exactly as before, and as raw");
+        Ok(())
+    }
+
+    /// The strip lane takes the most-masked bin first, so a fully-masked straddler
+    /// (a corpse) goes before a half-masked file — and retiring it IS progress:
+    /// counted as none, the unit would sleep 600 s with the rest of the day's
+    /// debt still queued behind it.
+    #[serial]
+    #[tokio::test]
+    async fn a_retired_corpse_goes_first_and_counts_as_progress() -> Result<()> {
+        use crate::maintenance_coordinator::TaskState;
+        const MINUTE: i64 = 60_000_000;
+        let db = Arc::new(Database::with_config(rollup_cfg("dv_strip_corpse_first")).await?);
+        let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+        let midnight = crate::support::today_utc().and_hms_opt(0, 0, 0).expect("midnight").and_utc().timestamp_micros();
+        assert!(chrono::Utc::now().timestamp_micros() - midnight > 3 * 3_600_000_000, "precondition: dedup masks only bins sealed 2 h; run after 03:00 UTC");
+        let span = |id: &str, op: &str, minute: i64| test_span_ts(id, op, &project_id, midnight + minute * MINUTE);
+        // Every row of the 00:09-00:11 straddler is superseded; half of the 00:21-00:25 file is.
+        for rows in [
+            vec![span("a", "first", 9), span("b", "first", 11)],
+            vec![span("a", "second", 9), span("b", "second", 11)],
+            vec![span("c", "first", 21), span("d", "op", 25)],
+            vec![span("c", "second", 21)],
+        ] {
+            db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![json_to_batch(rows)?], true, None).await?;
+        }
+        // Two dup bins mask the same file; a wave lands one DV per file, so sweep twice.
+        for _ in 0..2 {
+            dedup_unified(&db).await?;
+        }
+        db.recover_rollup_coverage("otel_logs_and_spans").await?;
+        let table = db.resolve_table(&project_id, "otel_logs_and_spans").await?;
+        let masked = || async {
+            let t = table.read().await;
+            let adds = t.snapshot()?.log_data().iter().map(|f| add_action(&f)).filter(|add| add.path.contains(&project_id)).collect_vec();
+            anyhow::Ok(adds.iter().filter_map(|add| Some((add.deletion_vector.as_ref()?.cardinality, add_row_count(add)?))).sorted().collect_vec())
+        };
+        assert_eq!(masked().await?, [(1, 2), (2, 2)], "precondition: one corpse and one half-masked file");
+        db.plan_compaction_debt().await?;
+        assert!(db.run_coordinator_compaction_once(Operation::HotPacking).await?);
+        assert_eq!(masked().await?, [(1, 2)], "the corpse retires first");
+        let task = db
+            .journal()
+            .tasks()
+            .find(|task| task.key.project_id == project_id && task.key.operation == Operation::HotPacking)
+            .cloned()
+            .expect("the partition's unit");
+        assert!(
+            task.state == TaskState::Retry && task.deadline_micros <= crate::support::now_micros(),
+            "debt remains, so the unit requeues at once: {:?} at {}",
+            task.state,
+            task.deadline_micros
+        );
         Ok(())
     }
 

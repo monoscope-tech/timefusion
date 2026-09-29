@@ -5143,7 +5143,7 @@ fn filesets_for_dates_groups_by_partition() {
 
 /// One candidate file for the tail-packer tests.
 fn tail_file(path: &str, size: i64, is_sorted_run: bool, event_range: Option<(i64, i64)>, has_dv: bool, rows: Option<u64>) -> super::TailAdd {
-    super::TailAdd { path: path.into(), size, is_sorted_run, event_range, rows, has_dv }
+    super::TailAdd { path: path.into(), size, is_sorted_run, event_range, rows, has_dv, masked: u64::from(has_dv), strip: false }
 }
 
 const MB: i64 = 1024 * 1024;
@@ -5162,7 +5162,7 @@ fn rows_file(path: &str, bytes: i64, rows: u64) -> super::TailAdd {
 /// The coordinator's own policy through the SHARED packer, so these tests
 /// exercise the exact call `coordinator_compaction_files` makes.
 fn coordinator_bin(files: Vec<super::TailAdd>, target: i64) -> Vec<String> {
-    super::select_bin(&files, hygiene_policy(target, false))
+    super::select_bin(&files, hygiene_policy(target))
 }
 
 /// One coordinator selection pass at the sealed byte target.
@@ -5605,10 +5605,8 @@ fn both_compaction_paths_pack_to_the_same_budget() {
     let target = 256 * MB;
 
     let coordinator = coordinator_bin(adds.clone(), target);
-    let offbox = super::select_bin(
-        &adds,
-        super::BinPolicy { target_size: target, max_rows: u64::MAX, order: super::BinOrder::EventTime, level_unsorted_first: false, strip_dv: false },
-    );
+    let offbox =
+        super::select_bin(&adds, super::BinPolicy { target_size: target, max_rows: u64::MAX, order: super::BinOrder::EventTime, level_unsorted_first: false });
 
     let bytes = |bin: &[String]| bin.len() as i64 * 40 * MB;
     assert_eq!(bytes(&coordinator), bytes(&offbox), "the two paths packed different BYTES: coordinator {:?}, offbox {:?}", coordinator, offbox);
@@ -5904,10 +5902,14 @@ fn the_packer_bins_every_pair_the_planner_queues() {
 fn planner_and_packer_pair_only_within_a_slice_cell(ranges: &[Option<(i64, i64)>], dv: &[usize], covered: Option<Vec<i64>>, strip: bool) -> (bool, usize) {
     const MINUTE: i64 = 60_000_000;
     let minutes = |(lo, hi): (i64, i64)| (lo * MINUTE, hi * MINUTE);
-    let adds = ranges.iter().enumerate().map(|(i, range)| tail_file(&format!("f{i}"), 10 * MB, true, range.map(minutes), dv.contains(&i), None)).collect_vec();
+    let adds = ranges
+        .iter()
+        .enumerate()
+        .map(|(i, range)| stripped(tail_file(&format!("f{i}"), 10 * MB, true, range.map(minutes), dv.contains(&i), None), strip))
+        .collect_vec();
     let bounds = covered.map_or_else(Vec::new, |covered| super::slice_bounds(covered.into_iter().map(|minute| minute * MINUTE), 0));
-    let queued = !super::hygiene_debt(adds.clone(), super::COORDINATOR_HOT_TARGET_BYTES, &bounds, strip).is_empty();
-    let packed = super::select_cell_bin(&super::slice_cells(adds.clone(), &bounds, strip), hygiene_policy(super::COORDINATOR_HOT_TARGET_BYTES, strip));
+    let queued = !super::hygiene_debt(adds.clone(), super::COORDINATOR_HOT_TARGET_BYTES, &bounds).is_empty();
+    let packed = super::select_cell_bin(&super::slice_cells(adds.clone(), &bounds), hygiene_policy(super::COORDINATOR_HOT_TARGET_BYTES));
     // `rows_below`'s own rule: a file is below a bound unless its max is known and reaches it.
     for bound in &bounds {
         let sides = packed.iter().filter_map(|path| adds.iter().find(|add| &add.path == path)).map(|add| !add.event_range.is_some_and(|(_, hi)| hi >= *bound));
@@ -5917,9 +5919,14 @@ fn planner_and_packer_pair_only_within_a_slice_cell(ranges: &[Option<(i64, i64)>
     (queued, packed.len())
 }
 
-/// The coordinator packer's policy, `strip_dv` as the strip lane admits it.
-fn hygiene_policy(target_size: i64, strip_dv: bool) -> super::BinPolicy {
-    super::BinPolicy { target_size, max_rows: u64::MAX, order: super::BinOrder::SmallestFirst, level_unsorted_first: true, strip_dv }
+/// The coordinator packer's policy.
+fn hygiene_policy(target_size: i64) -> super::BinPolicy {
+    super::BinPolicy { target_size, max_rows: u64::MAX, order: super::BinOrder::SmallestFirst, level_unsorted_first: true }
+}
+
+/// `add` as `admit_strips` leaves it when the lane admits (`strip`) a DV file.
+fn stripped(add: super::TailAdd, strip: bool) -> super::TailAdd {
+    super::TailAdd { strip: strip && add.has_dv, ..add }
 }
 
 /// Sealed dates have no bounds, so every file shares one cell. A DV file was
@@ -5933,12 +5940,38 @@ fn hygiene_policy(target_size: i64, strip_dv: bool) -> super::BinPolicy {
 #[test_case(&[300, 500], &[0, 1], true => vec!["f0", "f1"] ; "two DV files pack together")]
 #[test_case(&[300, 500], &[], true => Vec::<String>::new() ; "oversized clean files stay converged")]
 fn a_sealed_dv_file_is_rewritten_even_alone(sizes_mb: &[i64], dv: &[usize], strip: bool) -> Vec<String> {
-    let adds = sizes_mb.iter().enumerate().map(|(i, size)| tail_file(&format!("f{i}"), size * MB, true, None, dv.contains(&i), None)).collect_vec();
+    let adds =
+        sizes_mb.iter().enumerate().map(|(i, size)| stripped(tail_file(&format!("f{i}"), size * MB, true, None, dv.contains(&i), None), strip)).collect_vec();
     let target = super::COORDINATOR_SEALED_TARGET_BYTES;
-    let queued = !super::hygiene_debt(adds.clone(), target, &[], strip).is_empty();
-    let packed = super::select_cell_bin(&super::slice_cells(adds, &[], strip), hygiene_policy(target, strip));
+    let queued = !super::hygiene_debt(adds.clone(), target, &[]).is_empty();
+    let packed = super::select_cell_bin(&super::slice_cells(adds, &[]), hygiene_policy(target));
     assert_eq!(queued, !packed.is_empty(), "the planner queues exactly what the packer rewrites");
     packed.into_iter().sorted().collect()
+}
+
+/// A hygiene unit is priced by the ONE bin it rewrites, and the strip lane
+/// takes the most-masked bin first. Talstack's today held ~400 DV straddlers:
+/// summed, the unit priced at ~48 GiB decoded, maxed the CPU-token cap and ran
+/// only when the lane was idle. `(size MiB, masked, rows)` per file, each DV
+/// file its own straddler cell; `clean` adds that many 20 MiB files to one cell.
+/// Returns (the bin's first path, its priced MiB compressed).
+#[test_case(&[(10, 5, 10); 400], 0 => ("f0".to_string(), 10) ; "400 straddlers price one file, not the partition")]
+#[test_case(&[(10, 1, 10), (10, 9, 10), (5, 10, 10)], 0 => ("f2".to_string(), 5) ; "a fully-masked corpse retires first, then the most-masked")]
+#[test_case(&[(10, 1, 10), (10, 9, 10)], 0 => ("f1".to_string(), 10) ; "the most-masked strips first")]
+#[test_case(&[(10, 1, 10)], 40 => ("f0".to_string(), 10) ; "a masked strip outranks a clean pack")]
+#[test_case(&[], 40 => ("c00".to_string(), 240) ; "a clean cell prices one target-bounded bin")]
+fn a_hygiene_unit_is_priced_by_its_bin_and_most_masked_first(dv: &[(i64, u64, u64)], clean: usize) -> (String, u64) {
+    const MINUTE: i64 = 60_000_000;
+    let bounds = super::slice_bounds([], 0);
+    let straddlers = dv.iter().enumerate().map(|(i, &(size, masked, rows))| {
+        let at = (i as i64 % 100) * 10 + 9;
+        super::TailAdd { masked, strip: true, ..tail_file(&format!("f{i}"), size * MB, true, Some((at * MINUTE, (at + 2) * MINUTE)), true, Some(rows)) }
+    });
+    let cellmates = (0..clean).map(|i| tail_file(&format!("c{i:02}"), 20 * MB, true, Some((MINUTE, 2 * MINUTE)), false, Some(10)));
+    let debt = super::hygiene_debt(straddlers.chain(cellmates), super::COORDINATOR_HOT_TARGET_BYTES, &bounds);
+    let packed = super::select_cell_bin(&super::slice_cells(debt.iter().flatten().cloned(), &bounds), hygiene_policy(super::COORDINATOR_HOT_TARGET_BYTES));
+    let priced = super::hygiene_bin_decoded_bytes(&debt, super::COORDINATOR_HOT_TARGET_BYTES);
+    (packed.into_iter().min().unwrap_or_default(), priced / crate::database::maintain::estimated_decoded_bytes(MB))
 }
 
 /// The wiring of the above. Until this process has recovered the source's
@@ -7165,6 +7198,8 @@ fn converged_sorted_runs_are_a_counterexample_to_compaction_dedup_convergence() 
         event_range: Some((min, min + 1)),
         rows: None,
         has_dv: false,
+        masked: 0,
+        strip: false,
     };
     let versions_in_different_runs = vec![run("older-version", 1), run("newer-version", 1)];
 
