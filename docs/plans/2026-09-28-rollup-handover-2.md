@@ -419,3 +419,30 @@ Evidence is `origin/master` at `8bea392b`; a branch counts as merged when its pa
 - `ws/measure-backfill`: re-mint cells that predate a declared measure. Low priority: 2 cells per pass, after v4 gaps; knob `TIMEFUSION_ROLLUP_MEASURE_REMINTS_PER_PASS`.
 - `ws/runtime-flag-toggle`: `FLAG SET|RESET|SHOW` for `timefusion_maintenance_query_yield` and `timefusion_read_dedup_key_restrict`, in memory only; effective values under `timefusion_stats` component `flags`.
 - **Pending:** `ws/dv-strip-followups` (strip-sort counter split, 1:1 strips preferred, body warm).
+
+**Evening deploys (both after a full green local signoff):**
+- **18:09 `8184a638` (`batch/evening`):**
+  - latency recorded at stream end;
+  - one heavy slot per query;
+  - measure re-mint backfill;
+  - runtime `FLAG` switch.
+- **19:13 `4319b951` (`batch/night`):**
+  - **drop-v3** (`dashboard_1m_v3` and `dashboard_1h_v2` removed; owner's call, since queries older than 14 days are rare);
+  - DV-strip follow-ups:
+    - `dv_strip_plan_sorts_total` now counts only unexpected 1:1 sorts; `dv_strip_resorts_total` counts footers without a declared order (the incident's 63);
+    - all-DV cells strip one file at a time;
+    - bodies of today's and yesterday's strip outputs up to 256 MB are warmed within the boot-preload budget.
+  - The sigkill drill flaked once under load and passed 3/3 in isolation.
+
+**v4:** `RESUME FROM 2026-08-29` (the full 31 days) at 19:02, owner's call. At 18:51 v4 had 15 contiguous days; v3/1h_v2 had 30. Windows older than about 15 days read raw until the v4 backfill fills them. The backfill is bound by state memory: 19,273 `admission_refused_state_bytes_total` in the first ~50 min after widening to 09-07. Dropping v3 frees that budget.
+
+**W7 real-object-store unit cost** (local dev build against the staging prefix `timefusion-eu/timefusion-staging`, which lives on OVH, not R2; notes in session 66d75f9a):
+- Large units are CPU-bound. 6297304f 12h: 229 MB / 122.6M rows, ~70 s CPU ≈ wall.
+- Small units are bound by object-store fetches (28f62f01 6h: 11–25 s cold, 5–9 s warm).
+- Staging plus commit is ≤ ~4 s per unit.
+- The whale's 2 hash shards each re-read the same 267 MB, a direct measure of the Stage 1B shard cost (units of this size only).
+- An isolated whale 12h unit costs ~150 s against ~410 s of prod lease per slice, so most prod lease time is contention, not work.
+
+**W32 staging experiment: no staging host exists** (only the seeded prefix). It moves to prod instead: a runtime `FLAG` override for the CPU-token cap is being built, then the same ABBA/BAAB method, with no restarts.
+
+**Paired protocol, first run:** query-latency yield (A off, B on) under synthetic load (16 workers, dashboard and explorer shapes, p95 ~3 s). Windows are 2 min warmup + 12 min measured, ABBA then BAAB. The 18:48 run was aborted by the drop-v3 deploy and restarts at 19:35.
