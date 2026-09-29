@@ -2825,6 +2825,7 @@ impl TaskJournal {
         let mut backlog_bytes = 0u64;
         let mut sealed_debt_bytes = 0u64;
         let mut oldest_pended = u64::MAX;
+        let mut oldest_due = i64::MAX;
         let mut beyond_horizon = 0u64;
         let mut latest_frontier_rollup: HashMap<(&str, &str, &str), &MaintenanceTask> = HashMap::new();
         let mut per_operation = [0u64; <Operation as strum::EnumCount>::COUNT];
@@ -2855,6 +2856,7 @@ impl TaskJournal {
                 if scheduled && matches!(task.state, TaskState::Pending | TaskState::Retry) && task.deadline_micros <= now_micros {
                     if !Self::is_quarantined(task) {
                         due_nonquarantined = due_nonquarantined.saturating_add(1);
+                        oldest_due = oldest_due.min(task.deadline_micros);
                     }
                     if task.key.operation == Operation::BaseRollup {
                         eligible_base_rollup = eligible_base_rollup.saturating_add(1);
@@ -2901,6 +2903,8 @@ impl TaskJournal {
         let now = u64::try_from(now_micros.div_euclid(1_000)).unwrap_or_default();
         let oldest_age_secs = if oldest_pended != u64::MAX { now.saturating_sub(oldest_pended) / 1_000 } else { 0 };
         stats.maintenance_oldest_task_age_secs.store(oldest_age_secs, Relaxed);
+        let oldest_due_secs = if oldest_due == i64::MAX { 0 } else { u64::try_from(now_micros.saturating_sub(oldest_due) / 1_000_000).unwrap_or_default() };
+        stats.maintenance_oldest_due_unclaimed_age_secs.store(oldest_due_secs, Relaxed);
         stats.maintenance_beyond_horizon_tasks.store(beyond_horizon, Relaxed);
     }
 }
@@ -4455,6 +4459,37 @@ mod tests {
         assert_eq!(stats.maintenance_oldest_task_age_secs.load(Relaxed) > 0, running);
         assert_eq!(stats.maintenance_eligible_watermark_lag_secs.load(Relaxed) > 0, running);
         assert_eq!(journal.frontier_lag_secs.load(Relaxed) > 0, running, "only in-flight paused work can affect sealed-work allocation");
+        Ok(())
+    }
+
+    /// A cell that keeps being re-armed is not starved: the due gauge restarts at every
+    /// re-arm, while `oldest_task_age` keeps counting from creation.
+    #[test]
+    fn a_rearmed_task_is_not_reported_as_waiting_since_creation() -> anyhow::Result<()> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let (_dir, mut journal) = new_journal();
+        let now = crate::support::now_micros();
+        let start = (now - 3 * 3_600_000_000).div_euclid(NORMAL_SLICE_MICROS) * NORMAL_SLICE_MICROS;
+        let key = upserted(
+            &mut journal,
+            task_in("source", "p", start, start + NORMAL_SLICE_MICROS, Operation::Dedup).tap_mut(|unit| {
+                unit.created_unix_ms = u64::try_from((now - 2 * 3_600_000_000) / 1_000).unwrap_or_default();
+                unit.deadline_micros = now - 600_000_000;
+            }),
+        );
+        let stats = crate::observability::maintenance_stats();
+        let gauges = |journal: &TaskJournal| {
+            journal.publish_statistics();
+            (stats.maintenance_oldest_due_unclaimed_age_secs.load(Relaxed), stats.maintenance_oldest_task_age_secs.load(Relaxed))
+        };
+        let (due, oldest) = gauges(&journal);
+        assert!((600..660).contains(&due), "due for ~600 s, got {due}");
+        assert!(oldest >= 7_200);
+        journal.invalidate(invalidation("rollup", start, start + NORMAL_SLICE_MICROS, now, false))?;
+        assert_eq!(journal.state(&key), Some(TaskState::Pending));
+        let (due, oldest) = gauges(&journal);
+        assert_eq!(due, 0, "re-armed into the future: nothing is due");
+        assert!(oldest >= 7_200, "the creation-age gauge is unchanged");
         Ok(())
     }
 

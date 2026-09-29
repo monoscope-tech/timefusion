@@ -657,6 +657,11 @@ pub fn init_metrics(
         "Queued units whose deadline passed and which are not quarantined; derived dependencies may still block some",
         maintenance_stats().maintenance_tasks_due_nonquarantined.load(Relaxed)
     );
+    observe!(gauge
+        "timefusion.maintenance.oldest_due_unclaimed_age_seconds",
+        "Wait of the oldest due, unclaimed, non-quarantined unit since its deadline (reset by every re-arm)",
+        maintenance_stats().maintenance_oldest_due_unclaimed_age_secs.load(Relaxed)
+    );
     // INDEX COVERAGE. Live parquet with no tantivy index: those files fall back
     // to UDF scan, so queries over them are slow while every compaction metric
     // looks healthy. It had no metric at all until 2026-09-19, when an off-box
@@ -1662,6 +1667,10 @@ atomic_stats! {
         /// the deliberately-abandoned remainder; without it, narrowing the age gauge
         /// is indistinguishable from hiding the debt.
         maintenance_oldest_task_age_secs as "oldest_task_age_seconds",
+        /// Oldest wait among due, unclaimed, non-quarantined tasks, measured from the
+        /// deadline — which every re-arm moves forward. Unlike `oldest_task_age_seconds`,
+        /// a cell re-armed and completed over and over does not read as starved.
+        maintenance_oldest_due_unclaimed_age_secs as "oldest_due_unclaimed_age_seconds",
         maintenance_beyond_horizon_tasks as "beyond_horizon_tasks",
         maintenance_eligible_watermark_lag_secs as "eligible_watermark_lag_seconds",
         maintenance_processed_bytes as "processed_bytes_total",
