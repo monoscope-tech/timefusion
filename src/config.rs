@@ -1815,9 +1815,10 @@ pub struct MaintenanceConfig {
     /// per-worker pool share.
     #[serde_inline_default(8 * MIB as u64)]
     pub timefusion_maintenance_batch_target_bytes: u64,
-    /// Experiment: omit winner selection only for snapshot-certified raw input.
-    /// Tombstones and deletion vectors remain active. Requires paired resource gates.
-    #[serde_inline_default(false)]
+    /// Omit winner selection for snapshot-certified raw input. Tombstones and deletion
+    /// vectors remain active. Staging A/B (2026-09-29): 34-71% less build CPU, identical
+    /// counts/sums/sketches, t-digest error within 1.14x of the dedup path.
+    #[serde_inline_default(true)]
     pub timefusion_rollup_certified_clean: bool,
     /// Decoded bytes per event-time slice of a REPAIR rewrite. 0 (default)
     /// disables slicing; any non-zero value costs one full re-read and re-decode
@@ -2504,7 +2505,7 @@ mod tests {
         assert_eq!(config.timefusion_rollup_backfill_days, 31, "the shipped default is the value prod exercises");
         assert_eq!(config.timefusion_rollup_backfill_tier_inflight, 16, "a new tier must not queue its whole horizon at once");
         assert_eq!(config.timefusion_rollup_measure_remints_per_pass, 2, "a newly declared measure must not re-mint its whole horizon at once");
-        assert!(!config.timefusion_rollup_certified_clean, "certified aggregation needs the paired resource experiment before activation");
+        assert!(config.timefusion_rollup_certified_clean, "certified-clean input skips winner selection by default");
 
         // The canary still narrows the READ side when it is set, and only then.
         config.timefusion_rollup_read_projects = Some("project-b".into());
