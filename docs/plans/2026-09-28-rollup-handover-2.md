@@ -384,3 +384,38 @@ Evidence is `origin/master` at `8bea392b`; a branch counts as merged when its pa
   - 65 worktrees and 94 remote branches whose content is on master.
   - 12 stale worktrees (August experiments, the distill sweep, the old fork bump).
   - Remote branches `heavy-admission-e2e`, `timefusion-deploy-completed`, `timefusion-deploy-lease`, `ws/w28-service-hll`.
+
+## 11. 2026-09-29 evening
+
+**Plan gate, 14:00–18:00** (image `8bea392b`, process started 11:32, no code deploy in the window; scripts in session 66d75f9a `scratchpad/gate/gate0929.py`):
+
+| Per million ingested rows | 09-25 14–18 (clean baseline) | 09-28 14–18 | **09-29 14–18** |
+|---|---|---|---|
+| CPU-seconds (avg cores) | 21,723 (32.8) | 4,137 (5.8) | **9,676 (14.0)**: 2.2x below baseline |
+| Maintenance GB processed | 133.5 (09-27, restarts inside) | 9.9 | **12.8**: HotPacking 6.2, BaseRollup 5.0, Dedup 1.3 |
+| Lease-seconds | 16,189 (09-27) | 963 | 1,079 |
+| Pending base / dedup, first hour → last hour | | 350 → 386 / 170 → 190 | **303 → 394 / 161 → 206** |
+
+- **Verdict: not accepted.** Work per event is still well below the clean baseline, but the backlog grew again.
+- Today costs 2.3x more CPU than 09-28, mostly HotPacking (6.2 against 0.8 GB per M rows): the W58 strip of today's DV files runs continuously.
+- This morning's v4 widening to 09-14 also adds BaseRollup backfill.
+- The paired ABBA/BAAB protocol is still not run; the runtime `FLAG` switch in `batch/evening` exists to make it possible without restarts.
+
+**Prod steps at 18:08** (the only prod writes; both allowed by §6):
+- `ROLLUP RESUME … dashboard_1m_v4 FROM '2026-09-07'`. Refusals were 416 in 6 h (yesterday 2,143 in 9 h); memory 21 GB. Next step is 08-31, then all 31 days.
+- `ROLLUP RESUME … sessions_1h_v2 FROM '2026-09-22'` (W27; its 7-day horizon). `rollup_miss_sub_grain_slices_total` read 0 on a 6 h process after W56. `sessions_1h_v1` stays paused.
+
+**W21 witness carry: closed, stays off.** It recovers ~0.7% and has two open enable blockers (double count, ledger lost on restart).
+
+**Cleanup done:**
+- The full `AGENTS.md` guide and the residual ranking are committed (`d6cec8ce`).
+- 44 landed worktrees were removed (~200 GB freed).
+- 368 remote branches were deleted: no unique patches and older than 24 h. 174 heads remain.
+- Worktrees with uncommitted or unmerged work, and those touched in the last 6 h, were left alone.
+
+**`batch/evening`** (signing off; deploy when green):
+- `land/stream-latency` (`ce965e21`): pgwire latency recorded at stream end.
+- `land/scan-byte-admission`: one heavy slot per query, on by default. Byte admission stays behind flags.
+- `ws/measure-backfill`: re-mint cells that predate a declared measure. Low priority: 2 cells per pass, after v4 gaps; knob `TIMEFUSION_ROLLUP_MEASURE_REMINTS_PER_PASS`.
+- `ws/runtime-flag-toggle`: `FLAG SET|RESET|SHOW` for `timefusion_maintenance_query_yield` and `timefusion_read_dedup_key_restrict`, in memory only; effective values under `timefusion_stats` component `flags`.
+- **Pending:** `ws/dv-strip-followups` (strip-sort counter split, 1:1 strips preferred, body warm).
