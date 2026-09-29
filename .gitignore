@@ -23,3 +23,4 @@ scripts/local/
 # Local-CI attestation staging (scripts/ci/ci.sh)
 .ci/
 /target-*
+__pycache__/
