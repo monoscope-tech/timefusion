@@ -4154,8 +4154,7 @@ impl Database {
         // footprint allowed (prod OOM 2026-09-26: 55 running units, anon 123.8 GB).
         let clamped = task.estimated_decoded_bytes.clamp(1, MAX_DECODED_BYTES);
         let request = Resources { cpu: Self::admission_cpu_cost(clamped), decoded_bytes: clamped, object_reads: 1, object_writes: 1, ..Resources::default() };
-        let lane = if operation == Operation::HotPacking { AdmissionLane::Hot } else { AdmissionLane::Other };
-        let _permit = match self.maintenance_admission.acquire(request, lane, self.admission_memory(), None, crate::support::now_micros()) {
+        let _permit = match self.maintenance_admission.acquire(request, AdmissionLane::Other, self.admission_memory(), None, crate::support::now_micros()) {
             Ok(permit) => permit,
             Err(refused) => return self.retried(&key, format!("admission_busy:{refused}"), self.admission_backoff_for(&key)),
         };

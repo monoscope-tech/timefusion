@@ -90,7 +90,7 @@ Engineering:
   - Metrics tiers `metrics_1m_v2` / `metrics_1h_v2` unchanged.
 - **On by default:** DV strip for all dates (fleet cap 12 per 10 min), W59 dirty re-flush drain, one heavy
   slot per query, measure re-mint backfill (2 cells per pass).
-- **Dark flags (FLAG-switchable):** `timefusion_maintenance_query_yield`, `timefusion_read_dedup_key_restrict`
+- **Dark flags (FLAG-switchable):** `timefusion_read_dedup_key_restrict`
   (W46), `timefusion_maintenance_cpu_tokens` (8..256; prod runs 66). Byte admission for wide scans
   stays behind config flags. W21 witness carry stays off.
 - **Latency:** p95/p99 are recorded at stream end since 18:09. Values before that excluded streaming time
@@ -106,11 +106,10 @@ Done items carry evidence (commit or number). Open items carry the next action, 
 
 - [ ] **Plan gate on a clean day.** Re-run after the v4 backfill settles and W58's strip debt drains.
       No code push 12:00–18:00; run `gate0929.py`-style at 18:05. Must show the backlog falling.
-- [ ] **Experiment: query-latency yield** (`FLAG SET timefusion_maintenance_query_yield ON` vs OFF), ABBA/BAAB,
-      16-worker synthetic load, 2 min warmup + 12 min per window. Record result / decide enable.
-      Success = pgwire p95 at high maintenance load drops below ~500 ms AND `maintenance.processed_bytes`/h
-      stays within 10%. If bytes drop >10%, raise the floor (8 units) before tuning thresholds (shut ≥800 ms,
-      reopen ≤400 ms, ×0.75 / +2 per 30 s tick, ≥50 samples per window).
+- [x] **Experiment: query-latency yield** — deleted: A/B showed no benefit. ABBA/BAAB on prod 09-29
+      20:01–21:55 UTC, 16 workers, ~57k queries: the yield engaged (ceiling 66 → 8) yet p95 B−A +0.24 s
+      (CI −0.52…+1.00) and p99 +0.53 s (CI −0.28…+1.34) on a 4.95 s baseline. Query latency under load is
+      not driven by maintenance concurrency.
 - [x] **Experiment: CPU-token cap 66 vs 128** (W32), paired ABBA/BAAB on prod 09-29 21:57–23:43, 16-worker load.
       Inconclusive and not binding: p95 B−A −0.66 s (CI −3.7…+2.4), GB/h −11% (CI −70…+59); tokens read 0/66 while
       `admission_refused_state_bytes_total` was 29,201 — state memory binds, not the token cap. Default stays 66;
@@ -361,7 +360,7 @@ ROLLUP POLICIES otel_logs_and_spans
 ROLLUP PAUSE  otel_logs_and_spans otel_logs_and_spans_rollup_sessions_1h_v1
 ROLLUP RESUME otel_logs_and_spans otel_logs_and_spans_rollup_dashboard_1m_v4 FROM '2026-08-29T00:00:00Z'
 FLAG SHOW
-FLAG SET timefusion_maintenance_query_yield ON        -- ON|OFF
+FLAG SET timefusion_read_dedup_key_restrict ON       -- ON|OFF
 FLAG SET timefusion_maintenance_cpu_tokens 128        -- 8..256
 FLAG RESET timefusion_read_dedup_key_restrict
 ```

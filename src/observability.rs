@@ -149,7 +149,6 @@ counter_registry! {
     maintenance_claims         => "timefusion.maintenance.claims": "claim_next passes, by operation, whether or not they claimed. claim_us / claims is the mean claim cost",
     maintenance_claim_us       => "timefusion.maintenance.claim_us": "Wall microseconds inside claim_next (journal lock held), by operation",
     maintenance_dependency_fallbacks => "timefusion.maintenance.dependency_fallbacks": "DerivedRollup dependency checks that missed the cached base-tier proof and fell back to proving coverage from completed base tasks",
-    maintenance_query_yield_transitions => "timefusion.maintenance.query_yield_transitions": "Moves of the query-latency maintenance ceiling, by direction: shut when pgwire p95 stayed high, reopen when it stayed low",
     maintenance_admission_refused_rollup_memory => "timefusion.maintenance.admission_refused_rollup_memory": "Rollup-lane reservations refused because jemalloc allocated was at or above ROLLUP_ALLOCATED_SHUT of the memory limit. Rollup units allocate 20-30 GiB outside every pool, so a new one must not start on top of those in flight",
     maintenance_processed_bytes => "timefusion.maintenance.processed_bytes": "Estimated decoded input bytes of completed maintenance units, by operation",
     rollup_publications        => "timefusion.rollup.publications": "Rollup units published, by tier",
@@ -292,15 +291,10 @@ impl LatencyHistogram {
 
     /// Quantile in ms over the recent window; `None` if the window saw no samples.
     pub fn recent_ms(&self, p: f64) -> Option<f64> {
-        self.recent(p).0
-    }
-
-    /// `recent_ms` plus the number of samples in the window it read.
-    pub fn recent(&self, p: f64) -> (Option<f64>, u64) {
         self.recent_ms_at(p, Instant::now())
     }
 
-    fn recent_ms_at(&self, p: f64, now: Instant) -> (Option<f64>, u64) {
+    fn recent_ms_at(&self, p: f64, now: Instant) -> Option<f64> {
         let snap: [u64; LATENCY_BUCKETS] = std::array::from_fn(|i| self.counts[i].load(Relaxed));
         let mut window = self.window.lock();
         let (start, prev, cur) = window.get_or_insert((now, [0; LATENCY_BUCKETS], [0; LATENCY_BUCKETS]));
@@ -308,14 +302,13 @@ impl LatencyHistogram {
             (*start, *prev, *cur) = (now, *cur, snap);
         }
         let delta: Vec<u64> = snap.iter().zip(prev.iter()).map(|(s, p)| s - p).collect();
-        let samples = delta.iter().sum::<u64>();
-        let rank = (p * samples as f64).ceil().max(1.0) as u64;
+        let rank = (p * delta.iter().sum::<u64>() as f64).ceil().max(1.0) as u64;
         let mut seen = 0;
-        let ms = delta.iter().position(|c| {
+        let b = delta.iter().position(|c| {
             seen += c;
             seen >= rank
-        });
-        (ms.map(|b| (latency_bucket_floor_us(b) + latency_bucket_floor_us(b + 1)) as f64 / 2_000.0), samples)
+        })?;
+        Some((latency_bucket_floor_us(b) + latency_bucket_floor_us(b + 1)) as f64 / 2_000.0)
     }
 }
 
@@ -440,11 +433,6 @@ pub fn init_metrics(
         "timefusion.runtime.scheduling_lag_ms",
         "How late a 500ms timer task actually woke — nonzero means workers are starved, which is what a missed health probe looks like from inside",
         RUNTIME_LAG_LAST_MS.load(Relaxed)
-    );
-    observe!(gauge
-        "timefusion.maintenance.query_yield_ceiling",
-        "Maintenance units admitted while client query latency is high; 0 while the yield is off",
-        QUERY_YIELD_CEILING.load(Relaxed)
     );
     observe!(gauge
         "timefusion.runtime.scheduling_lag_max_ms",
@@ -1159,13 +1147,6 @@ pub fn record_cert_skip_blocked(class: &'static str) {
 
 pub fn record_rollup_memory_refusal() {
     otel_add(|m| &m.maintenance_admission_refused_rollup_memory, 1, &[]);
-}
-
-/// Maintenance units the query-latency yield currently admits (object reads).
-pub static QUERY_YIELD_CEILING: AtomicU64 = AtomicU64::new(0);
-
-pub fn record_query_yield_transition(direction: &'static str) {
-    otel_add(|m| &m.maintenance_query_yield_transitions, 1, &[KeyValue::new("direction", direction)]);
 }
 
 pub fn record_dependency_fallback() {
@@ -2133,7 +2114,7 @@ mod tests {
         let cases = [(0, 1_000, Some(1_000.0)), (1, 0, Some(1_000.0)), (2, 2, Some(2.0)), (3, 0, None)];
         for (windows, ms, expected) in cases {
             (0..if ms > 0 { 100 } else { 0 }).for_each(|_| h.record(Duration::from_millis(ms)));
-            let got = h.recent_ms_at(0.95, t0 + LATENCY_WINDOW * windows).0;
+            let got = h.recent_ms_at(0.95, t0 + LATENCY_WINDOW * windows);
             assert_eq!(got.is_some(), expected.is_some(), "window {windows}: {got:?}");
             if let (Some(g), Some(e)) = (got, expected) {
                 assert!((g - e).abs() / e < 0.25, "window {windows}: p95 {g} vs {e}");

@@ -2023,10 +2023,6 @@ pub struct MaintenanceConfig {
     /// cleanup-only.
     #[serde_inline_default(true)]
     pub timefusion_repair_resume_enabled: bool,
-    /// Shrink the maintenance admission ceiling while pgwire p95 stays high and
-    /// regrow it once p95 recovers. Today's HotPacking is exempt.
-    #[serde_inline_default(false)]
-    pub timefusion_maintenance_query_yield: bool,
 
     /// Complete a rollup unit without rebuilding when its input file set —
     /// deletion vectors included — is unchanged since the live slice coverage
@@ -2244,7 +2240,6 @@ pub struct MaintenanceConfig {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, strum::EnumString, strum::IntoStaticStr, strum::VariantArray, strum::VariantNames)]
 #[strum(serialize_all = "snake_case", ascii_case_insensitive)]
 pub enum RuntimeFlag {
-    TimefusionMaintenanceQueryYield,
     TimefusionReadDedupKeyRestrict,
     /// Maintenance admission's CPU-token capacity; config is `coordinator_job_slots`.
     TimefusionMaintenanceCpuTokens,
@@ -2252,7 +2247,7 @@ pub enum RuntimeFlag {
 }
 
 /// Per-flag override: 0 = config, else value + 1.
-static FLAG_OVERRIDES: [std::sync::atomic::AtomicU32; 4] = [const { std::sync::atomic::AtomicU32::new(0) }; 4];
+static FLAG_OVERRIDES: [std::sync::atomic::AtomicU32; 3] = [const { std::sync::atomic::AtomicU32::new(0) }; 3];
 
 impl RuntimeFlag {
     fn slot(self) -> &'static std::sync::atomic::AtomicU32 {
@@ -2284,7 +2279,6 @@ impl AppConfig {
     /// THE read for a [`RuntimeFlag`]: the runtime override, else config.
     pub fn flag_value(&self, flag: RuntimeFlag) -> u32 {
         flag.override_value().unwrap_or_else(|| match flag {
-            RuntimeFlag::TimefusionMaintenanceQueryYield => self.maintenance.timefusion_maintenance_query_yield.into(),
             RuntimeFlag::TimefusionReadDedupKeyRestrict => self.maintenance.timefusion_read_dedup_key_restrict.into(),
             RuntimeFlag::TimefusionMaintenanceCpuTokens => u32::try_from(self.derived.coordinator_job_slots()).unwrap_or(u32::MAX),
             RuntimeFlag::TimefusionQueryScanByteAdmission => self.memory.timefusion_query_scan_byte_admission.into(),
