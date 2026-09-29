@@ -217,3 +217,20 @@ All routed hybrid; `foyer.insert_bypassed` did not move. Script: `scratchpad/shi
   - Rebase onto master and run one full local signoff.
 - **Before enabling the flag (later):** one clean night on the flag-off build; strip units priced by the bin they rewrite, not the whole partition (Talstack's estimate sums ~48 GiB decoded); sealed dates first; large DV files stripped alone; today's files only after dedup settles; `dv_strip_plan_sorts_total` = 0.
 
+**Ready for the morning decision (both signed off locally, all 5 checks; NOT deployed):**
+- **W54 hardened: `ws/w54-dv-strip` @ `de4ce84c`** (rebased on master `37538d9e`; test 2481/2481, e2e 73/73). It resolves the review blocker:
+  - **Park on refusal:** a lossy-rewrite refusal parks its input files (keyed on path plus deletion-vector size; 1 h, doubling to 16 h). The planner and packer both skip parked files, so they still agree on the debt.
+  - **Backoff kept:** the planner's re-pend keeps a hygiene retry's backoff. This also fixes master's cancelling of the 09-24 600 s backoff. Rollups still re-mint immediately.
+  - **Monitoring:** counter `lossy_rewrite_refusals_total` and WARN `lossy_rewrite_parked`.
+  - **Carry gated:** only sources with `version_append` + `dedup_tiebreak`.
+  - **Known gaps:** the older light-optimize/`hot_bin_admits` paths don't skip parked files (dead in prod); parks are in-memory, so each restart retries once.
+  - **Recommendation:** deploy flag-off before 11:30 if the owner agrees. On the first 00:00–02:00 rollover, watch `lossy_rewrite_refusals_total` (expect 0), `dv_rewrites_landed_total` and `rollup_witness_carried_total` (> 0), and yesterday's rollup hit rate.
+- **W56 sessions proper fix: `ws/w56-subgrain-sessions` @ `66e0f29d`** (test 2461 passed, e2e 73/73). Option (a): hour-grain base tiers are minted and bisected only in whole hours.
+  - **Where the rule applies:** `rollup_unit_grain`, used in `invalidate_touched`, `bisect_time_unit`, `enqueue_inner` and the boot migration.
+  - **Old 10-min partials:** recognised by slice width. They are not served (`SubGrainSlices`), and the census rebuilds the hour, retiring them.
+  - **Routing refusal:** the blanket W40 refusal is removed.
+  - **Test:** `a_sub_grain_tier_routes_only_over_whole_grain_slices` covers publish, republish, old partials and rebuild, exact against raw. It fails with either half of the fix off.
+  - **Also changes derived dashboard hour tiers:** misaligned queue entries are widened to whole hours. Review before deploying.
+  - **Deploy anytime; sessions stay paused either way.** Before resuming sessions v2 (W27), watch `rollup_miss_sub_grain_slices_total` drain.
+- **Batching:** W54 and W56 can go out as one deploy (one restart) after combining them on a branch and running one combined `make ci-signoff`. Run nothing else in parallel; tonight's parallel signoffs took 69–90 min under contention.
+
