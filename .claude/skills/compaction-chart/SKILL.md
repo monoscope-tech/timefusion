@@ -1,59 +1,61 @@
 ---
 name: compaction-chart
-description: Refresh and republish the historical-compaction dashboard (per-project/per-day Delta file counts, before/after bars) at its permanent artifact URL. Use when asked for compaction status, file-count charts, or "update the compaction chart".
+description: Prod status in one command (query latency, maintenance backlog, rollups, dedup/DVs, certification, light/major compaction, vacuum, memory, per-day Delta files) and refresh the compaction dashboard at its permanent artifact URL. Use for "how is prod", "look at prod and share the numbers", compaction status, file-count charts, or "update the compaction chart".
 ---
 
-Refresh `docs/dashboards/compaction-chart.html` with live data and republish it
-to the permanent artifact URL below (pass it as the `url` parameter of the
-Artifact tool from any session — never mint a new URL).
-
 **Artifact URL (stable):** https://claude.ai/code/artifact/896a7eb9-2c29-4ca0-98ab-4ca02fb8d671 · favicon `🗜️`
+(pass it as `url` to the Artifact tool from any session — never mint a new URL).
 
-## 1. Pull live per-(project, date) active file counts
-
-Counts must come from the Delta snapshot (S3 listing overcounts tombstones).
-Python `deltalake` is installed; creds in `.env.prod`:
-
-Two OVH quirks are load-bearing — both are in the snippet, don't "simplify" them away:
-
-- `AWS_REGION` must be **`de`**, not `auto`. OVH rejects `auto` with
-  `AuthorizationHeaderMalformed … expecting 'de'`.
-- Export `AWS_REQUEST_CHECKSUM_CALCULATION` / `AWS_RESPONSE_CHECKSUM_VALIDATION`
-  as `when_required`, or the client sends `x-amz-checksum-mode`, OVH rejects it
-  and reads fail — the failure that once made a probe report shipbubble as 0/14
-  days sorted when it was 9/9.
+## 1. One command
 
 ```bash
-set -a; source .env.prod; set +a
-export AWS_REQUEST_CHECKSUM_CALCULATION=when_required AWS_RESPONSE_CHECKSUM_VALIDATION=when_required
-python3 - <<'EOF'
-from deltalake import DeltaTable
-import os, collections
-st={"AWS_ACCESS_KEY_ID":os.environ["AWS_ACCESS_KEY_ID"],"AWS_SECRET_ACCESS_KEY":os.environ["AWS_SECRET_ACCESS_KEY"],
-    "AWS_ENDPOINT_URL":os.environ["AWS_S3_ENDPOINT"],"AWS_REGION":"de"}
-dt=DeltaTable(f"s3://{os.environ['AWS_S3_BUCKET']}/timefusion/otel_logs_and_spans", storage_options=st)
-c=collections.Counter(); b=collections.Counter()
-for a in dt.get_add_actions(flatten=True).to_struct_array().to_pylist():
-    d=str(a.get("partition.date"))
-    if d>="2026-07-20":   # adjust window to the question at hand
-        k=((a.get("partition.project_id") or "NULL")[:8],d)
-        c[k]+=1; b[k]+=a.get("size_bytes",0)
-for p in sorted({p for p,_ in c}):
-    print(p, {d:(n, round(b[(p,d)]/1e9,2)) for (q,d),n in sorted(c.items()) if q==p})
-print("version:",dt.version())
-EOF
+bench/prod_report.py                     # ~10 s: text report, every section
+bench/prod_report.py --window 120        # + rates over a 2-minute window (use on a young process)
+bench/prod_report.py --json > snap.json  # everything, machine-readable (chart input)
+bench/prod_report.py --no-delta --no-ssh # stats only, ~2 s
 ```
 
-Pull `size_bytes` in the same pass: the chart's yield column is
-`(files − ceil(GB)) / GB`, the return on rewriting a cell at the 1 GB target,
-and it is what distinguishes real debt from near-converged partitions.
+It is read-only and needs no setup beyond what is already on this laptop:
+`psql` + `TIMEFUSION_PG_URL` (read from `../monoscope/.env`), key-based ssh to the
+CapRover host, `gh` (names the deployed commit — the image carries only a
+digest), and `.env.prod` (falls back to the main checkout's copy from a
+worktree). Each source fails independently: a dead ssh or S3 prints
+`host: unavailable (...)` and the rest of the report still renders.
 
-Rollup tables live at `timefusion/<table>`, **not** `timefusion/default/<table>`.
+What it reads:
+- `timefusion_stats` → latency, ingest/flush, maintenance backlog, rollups,
+  dedup/DV strip, certification, light/major compaction, checkpoints, memory.
+- ssh → deployed image digest + state, container mem/CPU, recent task failures.
+- Delta logs (checkpoint parquet + JSON replay, not `deltalake`, because the
+  python API does not expose deletion vectors) → per table: version, files,
+  bytes, DV files, masked rows, last-commit age; for `otel_logs_and_spans`: the
+  commit lane mix over the retained log, retained tombstones (vacuum health),
+  a per-date table, and `per_project_date` in the JSON.
+
+Reading it — traps the numbers carry:
+- **Counters reset at boot.** The header prints uptime; `/h since boot` on a
+  <1h process is noise (the report flags it). Use `--window`.
+  `tasks_complete` is journal-lifetime, not per boot.
+- **Latency percentiles are since boot too** — a fresh deploy's p99 includes
+  cold caches. Wait ≥10 min after a deploy before quoting them.
+- **Rollup hit rate** is per query; don't compare it with stale-coverage or
+  witness percentages (different denominators).
+- **Today's partition** always shows hundreds of files and most DV files; judge
+  compaction on sealed days (files ≈ `ideal` = ceil(GB) at the 1 GB target).
+- **Vacuum** has no counter: the report shows its schedule/retention (config
+  defaults, prod does not override) and retained tombstones; `past retention > 0`
+  means vacuum is lagging.
+- Dormant tiers (no commit in 2 days) are listed on one line — old spec
+  versions, not a stuck builder, unless a current tier appears there.
+
+The OVH quirks from the old snippet live in the script (`region=de`, checksum
+env set to `when_required`); keep them if you touch it.
 
 ## 2. Update the template
 
 Edit `docs/dashboards/compaction-chart.html`:
-- the `const rows=[...]` array: `[proj8, tag, before29, now29, before28, now28, now30, status]`
+- the `const rows=[...]` array, from `delta.otel_logs_and_spans.per_project_date`
+  in `--json` (`{project8: {date: [files, GB]}}`): `[proj8, tag, before29, now29, before28, now28, now30, status]`
   (status chips: `done` / `done29` / `run` / `q`); keep the historical "before"
   baselines unless the comparison period changes.
 - the four `.tile` numbers, the `.sub` snapshot version/time, and the `.note`.
@@ -63,6 +65,8 @@ Edit `docs/dashboards/compaction-chart.html`:
 
 Artifact tool with `file_path: docs/dashboards/compaction-chart.html`,
 `url: <the stable URL above>`, favicon `🗜️`.
+
+Rollup tables live at `timefusion/<table>`, **not** `timefusion/default/<table>`.
 
 ## Context that stays true
 
