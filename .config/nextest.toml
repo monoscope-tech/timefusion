@@ -37,8 +37,12 @@ slow-timeout = { period = "30s", terminate-after = 8 }
 # CPU-bound thread (~170 MB), so they run alongside everything else: capping
 # them at two slots (09-26) made them a 28-minute serial tail on an idle box.
 [[profile.default.overrides]]
-filter = 'test(/rollup_noop_skip_tests::|dedup_compaction/)'
+filter = 'test(/dedup_compaction/)'
 priority = 100
+
+[[profile.default.overrides]]
+filter = 'test(/rollup_noop_skip_tests::/)'
+priority = 90
 
 # `cargo nextest run --profile ci`
 [profile.ci]

@@ -133,7 +133,7 @@ def build(tree, fingerprint):
             source.extractall(directory, filter='data')
         archive.unlink()
         run('docker', 'buildx', 'build', '--load', '--platform', 'linux/amd64',
-            '--build-arg', 'CARGO_BUILD_JOBS=8', '--label', 'io.timefusion.source-fingerprint=' + fingerprint,
+            '--build-arg', 'CARGO_BUILD_JOBS=16', '--label', 'io.timefusion.source-fingerprint=' + fingerprint,
             '-t', staging, directory)
         try:
             smoke(staging, Path(directory) / 'ci/smoke.Dockerfile')

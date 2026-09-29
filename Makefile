@@ -214,21 +214,21 @@ warm:
 	python3 scripts/ci/warm_target.py
 
 # Run local checks, publish passing results, then show what GitHub still needs.
-# A full signoff builds and smoke-tests the production image beside the checks
-# (.ci/image.log); it is pushed only once every check has passed.
+# The image helpers' own tests and, for a full signoff, the production image
+# build + smoke test run beside the checks (.ci/helpers.log, .ci/image.log);
+# the image is pushed only once every check has passed.
+HELPER_TESTS = scripts/test-production-image.py scripts/deploy/test_prepare.py scripts/deploy/test_lease.py scripts/deploy/test_run.py
 ci-signoff:
 	@mkdir -p .ci; image=; \
+	(for t in $(HELPER_TESTS); do PYTHONDONTWRITEBYTECODE=1 python3 $$t || exit 1; done) >.ci/helpers.log 2>&1 & helpers=$$!; \
 	if [ -z "$(CHECKS)" ]; then python3 scripts/production-image.py prebuild >.ci/image.log 2>&1 & image=$$!; fi; \
 	result=0; \
 	./scripts/ci/ci.sh local $(CHECKS) || result=$$?; \
 	./scripts/ci/ci.sh gate || result=$$?; \
 	if [ "$$result" -ne 0 ] && [ -n "$$image" ]; then pkill -P $$image; kill $$image; fi; \
+	wait $$helpers || { tail -n 40 .ci/helpers.log; result=1; }; \
 	[ -z "$$image" ] || wait $$image || [ "$$result" -ne 0 ] || { tail -n 40 .ci/image.log; exit 1; }; \
 	exit $$result
-	PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-production-image.py
-	PYTHONDONTWRITEBYTECODE=1 python3 scripts/deploy/test_prepare.py
-	PYTHONDONTWRITEBYTECODE=1 python3 scripts/deploy/test_lease.py
-	PYTHONDONTWRITEBYTECODE=1 python3 scripts/deploy/test_run.py
 	python3 scripts/production-image.py signoff
 
 # What CI would run right now, without running any of it.
