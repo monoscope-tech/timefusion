@@ -56,20 +56,37 @@ Reading it — traps the numbers carry:
 The OVH quirks from the old snippet live in the script (`region=de`, checksum
 env set to `when_required`); keep them if you touch it.
 
-## 2. Update the template
+## 2. Refresh the dashboard — one command, then publish
 
-Edit `docs/dashboards/compaction-chart.html`:
-- the `const rows=[...]` array, from `delta.otel_logs_and_spans.per_project_date`
-  in `--json` (`{project8: {date: [files, GB]}}`): `[proj8, tag, before29, now29, before28, now28, now30, status]`
-  (status chips: `done` / `done29` / `run` / `q`); keep the historical "before"
-  baselines unless the comparison period changes.
-- the four `.tile` numbers, the `.sub` snapshot version/time, and the `.note`.
-- Healthy = ~file count ≈ partition GB (1 GB target) on sealed days.
+```bash
+bench/prod_report.py --html docs/dashboards/compaction-chart.html   # ~15 s warm, ~1 min cold
+```
 
-## 3. Republish
+`--html` implies `--history 8` and regenerates **every data block** of the
+page in place, between `<!--gen:NAME-->` / `/*gen:data*/` markers:
 
-Artifact tool with `file_path: docs/dashboards/compaction-chart.html`,
-`url: <the stable URL above>`, favicon `🗜️`.
+| block | source |
+|---|---|
+| `sub` (snapshot line), `tiles` (compaction) | Delta replay + deployed commit |
+| project × day grid, then/now row (`gen:data`) | Delta replay (`per_project_date`, `per_date`) |
+| `live` (maintenance now) | `timefusion_stats` |
+| `hist` + hourly charts + daily table | monoscope OTel metrics, 8 days hourly |
+
+Monoscope history is fetched **one UTC day per query** (a 7-day query times out
+server-side after 3 min; a day returns in under a second) and closed days are
+cached in `~/.cache/tf_prod_report/`. Counters are differenced per series with
+restarts handled; latency is the worst one-minute p99 window in each hour.
+
+Nothing outside the markers is generated: the two `.note` paragraphs are
+number-free reading guides on purpose, so they never go stale. Put new numbers
+in a generated tile (edit `html_compaction` / `html_live` / `html_history` in
+the script), not in prose. If a source fails, its block keeps the previous
+values and the text report names the failed source — say so when sharing.
+
+Then republish: Artifact tool with `file_path: docs/dashboards/compaction-chart.html`,
+`url: <the stable URL above>`. If the publish is refused because another
+session published, read the artifact, confirm your file contains its content,
+and publish again.
 
 Rollup tables live at `timefusion/<table>`, **not** `timefusion/default/<table>`.
 
