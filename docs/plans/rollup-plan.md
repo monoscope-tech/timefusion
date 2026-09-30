@@ -252,7 +252,7 @@ Done items carry evidence (commit or number). Open items carry the next action, 
       shipbubble 0.7 s. 09-30 04:20: the 7-day sealed Talstack
       page-view query still runs raw (3.4–4.2 s, `measure_not_stored`). Re-mints run at 2 per pass, about 25–44
       per hour, so expect several more hours.
-- [ ] W12 `name` HLL (owner): add the unfiltered `name_hll` only if a daytime sample shows service-tab misses.
+- [ ] W12 `name` HLL (owner): add the unfiltered `name_hll` only if a daytime sample shows service-tab misses. 09-30: owner OK with sampling first — do it during the day.
 
 ### Sessions
 
@@ -272,6 +272,11 @@ Done items carry evidence (commit or number). Open items carry the next action, 
       `coordinator_claim` ~371/s is the baseline, not a regression.
 - [x] `oldest_due_unclaimed_age_seconds` added (`f62fb4ae`).
 - [ ] W25 parts 2–3: the 4.9 s container create → start; CapRover's double service update (1.6 s per deploy).
+- [ ] **Look at tomorrow (owner, 09-30 decision): CapRover config.** Needs someone with CapRover access; TF sessions
+      must not change prod config. (1) Remove the stale env var `TIMEFUSION_FLUSH_COALESCE_COMMITS=false` — the flag was
+      deleted in `f62fb4ae`, so it is ignored but misleading. (2) W25: container create → start takes 4.9 s, and CapRover
+      issues a double service update per deploy (+1.6 s). Also note: heap profiling is armed with
+      `docker service update --env-add TIMEFUSION_HEAP_PROFILE_ACTIVE=true` and is cleared by every CapRover deploy (off now).
 - [ ] Dependency advisories not closable by patch bumps: rustls-webpki 0.101 (AWS SDK), tokio-tar,
       tokio-postgres/postgres-types (0.2.14 breaks arrow-pg encoding).
 - [x] HotPacking "selected nothing" / 9 invariant violations were false alarms (a strip outranking a pair); now
@@ -331,12 +336,12 @@ Done items carry evidence (commit or number). Open items carry the next action, 
 
 ### Monoscope-owner decisions
 
-- [ ] **Session lookup by `attributes___session___id = ANY($ids)`** (~34 s over 16 h): the column is `mutable: true`,
+- [ ] **Session lookup by `attributes___session___id = ANY($ids)`** — 09-30 owner decision: add an ENRICHMENT-ONLY column class (updates may only fill NULL/'' → value; monoscope only fills late session ids across a trace); 34 s is not acceptable. In progress (`schema/enrich-only-columns`). (~34 s over 16 h): the column is `mutable: true`,
       so bloom, tantivy and stats pruning all refuse it (correctness gate). Options: (a) look up by an immutable key
       (`id`, `context___trace_id`); (b) add an "enrichment-only" column class (values only go NULL → set) that the
       pruners may trust; (c) two-phase key lookup. TF side shipped only OR-chain bloom pruning for immutable columns.
 
-- [ ] Pattern-tag `update2Sql` source fix (`BackgroundJobs.hs` ~2944): ~40% of today's masked rows are its
+- [ ] Pattern-tag `update2Sql` source fix (09-30: owner approved; being done on monoscope branch `tf/update2sql-and-edges`, PR, no deploy) (`BackgroundJobs.hs` ~2944): ~40% of today's masked rows are its
       MoR versions, and it blocks certification.
 - [x] `array_has` lowering for `hashes` predicates (`monoscope/plans/array-has-lowering.md`, ~40x cheaper).
       Implemented on monoscope `tf-followups` (09-30); PR pending on the monoscope side.
