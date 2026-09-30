@@ -4133,19 +4133,18 @@ impl Database {
                         .await
                     {
                         Ok(table) => break Ok(table),
+                        // A concurrent creator's win surfaces as any of several errors
+                        // ("already exists", "Protocol changed" from the conflict checker,
+                        // ...), so adopt whatever table now loads rather than match on text.
                         Err(create_err) => {
-                            let err_str = create_err.to_string();
-                            let conflict = ["already exists", "version 0", "ConditionalCheckFailedException"].iter().any(|m| err_str.contains(m));
-                            if !(conflict && create_attempts < 3) {
-                                break Err(anyhow::anyhow!("Failed to create table: {}", create_err));
-                            }
-                            debug!("Table creation conflict, attempting to load existing table (attempt {})", create_attempts);
+                            debug!("Table creation failed, attempting to load existing table (attempt {}): {}", create_attempts, create_err);
                             let backoff_ms = 100 * (2_u64.pow(create_attempts.min(5)));
                             tokio::time::sleep(tokio::time::Duration::from_millis(backoff_ms)).await;
 
                             match self.create_or_load_delta_table(storage_uri, storage_options.clone(), cached_store.clone()).await {
                                 Ok(table) => break Ok(table),
-                                Err(reload_err) => debug!("Failed to load table after creation conflict: {:?}", reload_err),
+                                Err(_) if create_attempts >= 3 => break Err(anyhow::anyhow!("Failed to create table: {}", create_err)),
+                                Err(reload_err) => debug!("Failed to load table after creation failure: {:?}", reload_err),
                             }
                         }
                     }

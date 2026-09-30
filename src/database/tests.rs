@@ -10102,3 +10102,32 @@ async fn cancelling_maintenance_keeps_its_runtime_until_tracked_work_drains() ->
     assert_eq!(kernel_call.await?, Ok(1), "the maintenance runtime was dropped under an in-flight kernel call");
     Ok(())
 }
+
+/// Concurrent first resolutions of one table each run CREATE. A loser is
+/// conflict-checked against the winner's version 0 and fails with "Protocol
+/// changed", which must resolve to loading the winner's table, not an error.
+/// Separate `Database` instances on purpose: one instance serializes its loads,
+/// so its resolvers rarely reach CREATE concurrently and the guard goes vacuous.
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_first_create_of_a_table_all_resolve() -> Result<()> {
+    let cfg = create_test_config("concurrent-create");
+    let dbs = futures::future::try_join_all((0..8).map(|_| Database::with_config(Arc::clone(&cfg)))).await?;
+    let dbs: Vec<_> = dbs
+        .into_iter()
+        .map(|db| {
+            db.cancel_maintenance();
+            Arc::new(db)
+        })
+        .collect();
+    let names: Vec<_> = (0..4).map(|_| format!("race_{}", uuid::Uuid::new_v4().simple())).collect();
+    let results = futures::future::join_all(
+        names
+            .iter()
+            .flat_map(|name| dbs.iter().map(move |db| (Arc::clone(db), name.clone())))
+            .map(|(db, name)| tokio::spawn(async move { db.get_or_create_unified_table(&name).await.map(|_| ()) })),
+    )
+    .await;
+    let errs: Vec<String> = results.into_iter().filter_map(|r| r.expect("join").err().map(|e| e.to_string())).collect();
+    assert!(errs.is_empty(), "concurrent creates failed: {errs:?}");
+    Ok(())
+}
