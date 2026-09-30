@@ -240,7 +240,7 @@ Done items carry evidence (commit or number). Open items carry the next action, 
 - [x] W27 `sessions_1h_v2` resumed from 2026-09-22 (18:08).
 - [x] Land `test/rum-sessions-e2e` (`prepared_rum_sessions_use_browser_rollups_and_raw_edges`, passes) with the next deploy.
 - [ ] Confirm the RUM sessions query routes to `sessions_1h_v2` in prod on a mature process.
-- [ ] Decide whether to drop `sessions_1h_v1`.
+- [x] Dropped `sessions_1h_v1` (`drop/sessions-1h-v1`); its durable pause is retired at boot with its queued work.
 
 ### Scheduler and ops
 

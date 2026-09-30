@@ -1119,8 +1119,9 @@ impl TaskJournal {
         })
     }
 
-    /// Drop queued work for a rollup tier that is no longer DECLARED — otherwise
-    /// tasks queued against a removed or renamed spec stay claimable forever.
+    /// Drop queued work and build policies for a rollup tier that is no longer
+    /// DECLARED — otherwise tasks queued against a removed or renamed spec stay
+    /// claimable forever, and its durable pause outlives it.
     ///
     /// Conservative on purpose, since a false positive deletes live work: only
     /// `_rollup_` table names, only non-Complete tasks, and NOTHING at all when
@@ -1129,9 +1130,13 @@ impl TaskJournal {
         if declared.is_empty() {
             return 0;
         }
-        self.retain_tasks(|task| {
-            !(task.key.physical_table.contains("_rollup_") && task.state != TaskState::Complete && !declared.contains(&task.key.physical_table))
-        })
+        let policies = self.snapshot.rollup_policies.len();
+        self.snapshot.rollup_policies.retain(|table, _| declared.contains(table));
+        let policies = policies - self.snapshot.rollup_policies.len();
+        policies
+            + self.retain_tasks(|task| {
+                !(task.key.physical_table.contains("_rollup_") && task.state != TaskState::Complete && !declared.contains(&task.key.physical_table))
+            })
     }
 
     /// How much of `migration`'s ordered repair list `source` has CONSUMED.
@@ -4250,7 +4255,7 @@ mod tests {
     fn rollup_pause_survives_restart_and_resume_bounds_history(compacted: bool) -> anyhow::Result<()> {
         let (dir, mut journal) = new_journal();
         let source = "otel_logs_and_spans";
-        let table = "otel_logs_and_spans_rollup_sessions_1h_v1";
+        let table = "otel_logs_and_spans_rollup_sessions_1h_v2";
         let hour = DERIVED_SLICE_MICROS;
         let unit = |start| {
             let mut unit = task_in(table, "p", start, start + hour, Operation::BaseRollup);
@@ -4335,7 +4340,7 @@ mod tests {
     fn failed_rollup_resume_stays_unclaimable_until_persistence_succeeds(fails_fsync: bool, compacted: bool) -> anyhow::Result<()> {
         let (dir, mut journal) = new_journal();
         let source = "otel_logs_and_spans";
-        let table = "otel_logs_and_spans_rollup_sessions_1h_v1";
+        let table = "otel_logs_and_spans_rollup_sessions_1h_v2";
         let mut unit = task_in(table, "p", 0, DERIVED_SLICE_MICROS, Operation::BaseRollup);
         unit.key.source = source.to_owned();
         let key = upserted(&mut journal, unit);
@@ -4429,7 +4434,7 @@ mod tests {
         use std::sync::atomic::Ordering::Relaxed;
         let (_dir, mut journal) = new_journal();
         let source = "otel_logs_and_spans";
-        let table = "otel_logs_and_spans_rollup_sessions_1h_v1";
+        let table = "otel_logs_and_spans_rollup_sessions_1h_v2";
         let now = crate::support::now_micros();
         let mut unit = task_in(table, "p", now - DERIVED_SLICE_MICROS, now, Operation::BaseRollup);
         unit.key.source = source.to_owned();
@@ -6852,8 +6857,8 @@ mod tests {
     /// Removing a rollup spec must retire its queued work and touch nothing else;
     /// every `_v2` -> `_v3` rename otherwise leaves claimable no-op residue.
     #[test]
-    fn removing_a_spec_retires_its_queued_work_and_nothing_else() {
-        let (_dir, mut journal) = new_journal();
+    fn removing_a_spec_retires_its_queued_work_and_nothing_else() -> anyhow::Result<()> {
+        let (dir, mut journal) = new_journal();
         let tiered = |table: &str, slot: i64, operation| task_in(table, "p", slot * DAY_MICROS, (slot + 1) * DAY_MICROS, operation).key;
         let gone = tiered("src_rollup_dead_1h_v1", 1, Operation::DerivedRollup);
         let live = tiered("src_rollup_live_1m_v3", 2, Operation::BaseRollup);
@@ -6863,9 +6868,16 @@ mod tests {
             journal.enqueue(key.clone(), 0, 1, 0);
         }
         journal.complete(&done);
+        journal.checkpoint()?;
+        // A durable pause of the dropped tier, as a boot replays it from the WAL.
+        let paused = serde_json::to_string(&JournalRecord::RollupPolicy { table: "src_rollup_dead_1h_v1".into(), policy: RollupBuildPolicy::Paused })?;
+        fs::write(&journal.wal_path, format!("{}{paused}\n", String::from_utf8(fs::read(&journal.wal_path)?)?))?;
+        let mut journal = TaskJournal::load(dir.path())?;
 
         let declared: HashSet<String> = ["src_rollup_live_1m_v3".to_owned()].into_iter().collect();
-        assert_eq!(journal.retire_undeclared_tiers(&declared), 1, "exactly the undeclared tier's live work");
+        assert_eq!(journal.retire_undeclared_tiers(&declared), 2, "exactly the undeclared tier's live work and its pause");
+        journal.compact()?;
+        assert!(TaskJournal::load(dir.path())?.snapshot.rollup_policies.is_empty(), "the dropped tier's pause is gone for good");
         assert_eq!(journal.state(&gone), None, "the undeclared tier's queued unit is gone");
         assert_eq!(journal.state(&live), Some(TaskState::Pending), "a declared tier is untouched");
         assert_eq!(journal.state(&raw), Some(TaskState::Pending), "a non-tier table is never considered");
@@ -6876,6 +6888,7 @@ mod tests {
         // deletes the whole queue.
         assert_eq!(journal.retire_undeclared_tiers(&HashSet::new()), 0, "an empty registry must never retire anything");
         assert_eq!(journal.state(&live), Some(TaskState::Pending));
+        Ok(())
     }
 
     /// The damage repair's cursor is a consumed-PREFIX index, per source, monotonic,
@@ -7168,7 +7181,7 @@ mod tests {
             .collect();
         journal.upsert(unit(derived, 0, DERIVED_SLICE_MICROS, Operation::DerivedRollup));
         assert!(journal.claim_next(Operation::DerivedRollup, 0, true).is_none());
-        let unrelated = upserted(&mut journal, unit("otel_logs_and_spans_rollup_sessions_1h_v1", 0, DERIVED_SLICE_MICROS, Operation::BaseRollup));
+        let unrelated = upserted(&mut journal, unit("otel_logs_and_spans_rollup_sessions_1h_v2", 0, DERIVED_SLICE_MICROS, Operation::BaseRollup));
         journal.complete(&unrelated);
         assert!(
             journal.claim_next(Operation::DerivedRollup, 0, true).is_none(),

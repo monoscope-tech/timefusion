@@ -748,13 +748,19 @@ pub fn create_insert_compatible_schema(schema: &SchemaRef) -> SchemaRef {
 mod tests {
     /// Only a same-grain, same-kind tier whose dimensions are a subset lends its rows:
     /// never across grains, never from a superset.
-    #[test_case::test_case("sessions_1h_v2" => vec!["sessions_1h_v1"] ; "a superset borrows from its subset")]
-    #[test_case::test_case("sessions_1h_v1" => Vec::<String>::new() ; "never from a superset")]
-    #[test_case::test_case("dashboard_1h_v3" => Vec::<String>::new() ; "a derived tier never borrows from a base tier or another grain")]
+    #[test_case::test_case("wide" => vec!["narrow"] ; "a superset borrows from its subset")]
+    #[test_case::test_case("narrow" => Vec::<String>::new() ; "never from a superset")]
+    #[test_case::test_case("derived" => Vec::<String>::new() ; "a derived tier never borrows from a base tier or another grain")]
     fn a_tier_borrows_only_from_a_subset_sibling(name: &str) -> Vec<String> {
-        let schema = super::get_schema("otel_logs_and_spans").expect("schema");
-        let spec = schema.rollups.iter().find(|spec| spec.name.as_deref() == Some(name)).expect("declared tier");
-        spec.prior_siblings(&schema.rollups).filter_map(|sibling| sibling.name.clone()).collect()
+        let wide = |name: &str| RollupSpec { dimensions: vec!["kind".into(), "level".into()], ..spec(name, vec![]) };
+        let all = [
+            spec("narrow", vec![]),
+            wide("wide"),
+            RollupSpec { grain: "1h".into(), ..spec("coarse", vec![]) },
+            RollupSpec { derive_from: Some("narrow".into()), ..wide("derived") },
+        ];
+        let tier = all.iter().find(|spec| spec.name.as_deref() == Some(name)).expect("declared tier");
+        tier.prior_siblings(&all).filter_map(|sibling| sibling.name.clone()).collect()
     }
 
     use super::*;
@@ -797,7 +803,7 @@ mod tests {
     fn rollup_tier_unknown_lists_declared_tiers() {
         let err = source().rollup_tier(Some("dashboard_1m_v9"), false).unwrap_err().to_string();
         assert!(err.starts_with("unknown rollup tier dashboard_1m_v9; otel_logs_and_spans declares: "), "{err}");
-        assert!(["dashboard_1m_v4", "dashboard_1h_v3", "sessions_1h_v1", "sessions_1h_v2"].iter().all(|tier| err.contains(tier)), "{err}");
+        assert!(["dashboard_1m_v4", "dashboard_1h_v3", "sessions_1h_v2"].iter().all(|tier| err.contains(tier)), "{err}");
     }
 
     #[test_case("mor_versioned")]

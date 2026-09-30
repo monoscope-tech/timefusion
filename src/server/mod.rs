@@ -1670,7 +1670,7 @@ mod pgwire_handlers_tests {
         use anyhow::Context;
         use tokio_postgres::{NoTls, SimpleQueryMessage};
         const SOURCE: &str = "otel_logs_and_spans";
-        const TIER: &str = "otel_logs_and_spans_rollup_sessions_1h_v1";
+        const TIER: &str = "otel_logs_and_spans_rollup_sessions_1h_v2";
 
         fn policy(messages: &[SimpleQueryMessage]) -> anyhow::Result<serde_json::Value> {
             let value = messages

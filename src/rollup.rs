@@ -3432,7 +3432,7 @@ mod tests {
     // Isolate requirements from Monoscope LogQueries.fetchSessions (8f1aaa2fe).
     // These are routing probes, not a full-client-query or consumer-frequency test.
     #[test_case::test_case("attributes___session___id", "COUNT(*)"
-        => Some("otel_logs_and_spans_rollup_sessions_1h_v1".to_owned()); "declared session count routes")]
+        => Some("otel_logs_and_spans_rollup_sessions_1h_v2".to_owned()); "declared session count routes")]
     #[test_case::test_case(
         "COALESCE(NULLIF(attributes___session___id, ''), NULLIF(attributes___user___id, ''), NULLIF(attributes___user___email, ''))", "COUNT(*)"
         => None; "fallback session identity is not stored")]
@@ -3450,7 +3450,9 @@ mod tests {
     async fn current_session_requirements_have_explicit_routing_eligibility(group: &str, aggregate: &str) -> Option<String> {
         route_alone(&format!(
             "SELECT {group}, {aggregate} FROM {SOURCE} WHERE project_id = 'project' \
-             AND timestamp >= to_timestamp_micros(0) AND timestamp < to_timestamp_micros(86400000000) GROUP BY 1"
+             AND timestamp >= to_timestamp_micros(0) AND timestamp < to_timestamp_micros(86400000000) \
+             AND (resource___telemetry___sdk___language IN ('webjs', 'javascript', 'js') OR resource___user_agent___original IS NOT NULL \
+                  OR name IN ('documentLoad', 'documentFetch') OR (name LIKE 'Pageview %' OR name = 'documentLoad')) GROUP BY 1"
         ))
         .await
         .ok()

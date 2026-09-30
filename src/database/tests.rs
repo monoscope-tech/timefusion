@@ -1772,40 +1772,6 @@ async fn rollup_unit_waits_for_output_state_room_then_runs_alone() -> Result<()>
     Ok(())
 }
 
-/// A tier with no output yet prices from its subset sibling's rows, not the input proxy:
-/// here that prior is large enough to split the unit.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_new_tier_prices_from_its_subset_siblings_output() -> Result<()> {
-    use crate::maintenance_coordinator::{AdmissionController, Operation, TAG_OUTPUT_ROWS, TaskState, rollup_state_bytes};
-    let mut db = Database::with_config(test_config_with("rollup-sibling-prior", |cfg| cfg.maintenance.timefusion_rollup_noop_skip_enabled = false)).await?;
-    db.cancel_maintenance();
-    db.maintenance_admission = AdmissionController::with_decoded_capacity(64, 64, u64::MAX, u64::MAX, 64, 64);
-    let day = (Utc::now() - chrono::Duration::days(3)).date_naive();
-    let project = format!("sibling_{}", uuid::Uuid::new_v4().simple());
-    insert_hourly_spans(&db, &project, midnight_micros(day), 20..24).await?;
-    for hour in 20..24 {
-        let report = db.run_unit_once("otel_logs_and_spans", &project, day, Operation::BaseRollup, 1, hour, Some("sessions_1h_v1")).await?;
-        assert_eq!(report.state, Some(TaskState::Complete));
-    }
-    let subset = db.resolve_table(&project, "otel_logs_and_spans_rollup_sessions_1h_v1").await?;
-    rewrite_tier_files(&subset, "-rows", |add| {
-        add.tags.as_mut().expect("published output has tags").insert(TAG_OUTPUT_ROWS.to_owned(), Some("1000".to_owned()));
-    })
-    .await?;
-    let superset_sketches = get_schema("otel_logs_and_spans")
-        .and_then(|schema| schema.rollups.iter().find(|spec| spec.name.as_deref() == Some("sessions_1h_v2")).map(|spec| spec.sketches()))
-        .expect("the superset tier");
-    // Borrowed 4h prior = 4000 rows; above half the pool, so the superset splits instead of running whole.
-    db.maintenance_admission = AdmissionController::with_decoded_capacity(64, 64, u64::MAX, rollup_state_bytes(superset_sketches, Some(4_000), 0), 64, 64);
-    let unit = db.run_unit_once("otel_logs_and_spans", &project, day, Operation::BaseRollup, 4, 20, Some("sessions_1h_v2")).await?;
-    assert_eq!(
-        (unit.state, unit.retry_reason.as_deref()),
-        (Some(TaskState::Superseded), Some("split_into_smaller_slices")),
-        "must price from the subset's rows"
-    );
-    Ok(())
-}
-
 /// A unit priced above half the state pool splits into halves re-priced by their
 /// own slice, which then co-run instead of each holding the whole pool alone.
 #[tokio::test(flavor = "multi_thread")]
@@ -2144,6 +2110,14 @@ async fn a_sub_grain_tier_routes_only_over_whole_grain_slices() -> Result<()> {
     let day = (Utc::now() - chrono::Duration::days(3)).date_naive();
     let day_start = midnight_micros(day);
     let noon = day_start + 12 * HOUR;
+    // The session tier counts only browser rows, and routes only a query scoped to them.
+    let insert_a_span = async |db: &Database, project: &str, id: &str, ts: i64| -> Result<()> {
+        db.insert_records_batch(project, "otel_logs_and_spans", vec![json_to_batch(vec![test_span_ts(id, "documentLoad", project, ts)])?], true, None)
+            .await
+            .map(|_| ())
+    };
+    let browser = "AND (resource___telemetry___sdk___language IN ('webjs', 'javascript', 'js') OR resource___user_agent___original IS NOT NULL \
+                   OR name IN ('documentLoad', 'documentFetch') OR (name LIKE 'Pageview %' OR name = 'documentLoad'))";
     for (i, offset) in [0, 25].into_iter().enumerate() {
         insert_a_span(&db, &project, &format!("s{i}"), noon + offset * 60_000_000).await?;
     }
@@ -2153,7 +2127,7 @@ async fn a_sub_grain_tier_routes_only_over_whole_grain_slices() -> Result<()> {
         .expect("schema")
         .rollups
         .iter()
-        .find(|spec| spec.name.as_deref() == Some("sessions_1h_v1"))
+        .find(|spec| spec.name.as_deref() == Some("sessions_1h_v2"))
         .expect("tier")
         .table_name("otel_logs_and_spans");
     let key = |start: i64, width: i64| -> Result<TaskKey> {
@@ -2210,9 +2184,10 @@ async fn a_sub_grain_tier_routes_only_over_whole_grain_slices() -> Result<()> {
         let (db, ctx, project) = (Arc::clone(&db), ctx.clone(), project.clone());
         async move {
             for (group, bucket, (lo, hi), want) in cases {
+                let scope = if group == "attributes___session___id" { browser } else { "" };
                 let sql = format!(
                     "SELECT time_bucket('{bucket}', timestamp) AS tb, {group}, COUNT(*) AS c FROM otel_logs_and_spans WHERE project_id = '{project}' \
-                     AND timestamp >= to_timestamp_micros({lo}) AND timestamp < to_timestamp_micros({hi}) GROUP BY 1, 2 ORDER BY 1, 2"
+                     AND timestamp >= to_timestamp_micros({lo}) AND timestamp < to_timestamp_micros({hi}) {scope} GROUP BY 1, 2 ORDER BY 1, 2"
                 );
                 let state = ctx.state();
                 let plan = state.optimize(&state.create_logical_plan(&sql).await?)?;
