@@ -1627,11 +1627,7 @@ mod pgwire_handlers_tests {
     }
 
     #[test_case(" flag show; " => Ok(Some(crate::server::FlagCmd::Show)); "show")]
-    #[test_case("FLAG SET timefusion_query_scan_byte_admission ON" => Ok(Some(crate::server::FlagCmd::Set(crate::config::RuntimeFlag::TimefusionQueryScanByteAdmission, Some(1)))); "set on")]
-    #[test_case("flag set TIMEFUSION_QUERY_SCAN_BYTE_ADMISSION off" => Ok(Some(crate::server::FlagCmd::Set(crate::config::RuntimeFlag::TimefusionQueryScanByteAdmission, Some(0)))); "set off, any case")]
-    #[test_case("FLAG RESET timefusion_query_scan_byte_admission" => Ok(Some(crate::server::FlagCmd::Set(crate::config::RuntimeFlag::TimefusionQueryScanByteAdmission, None))); "reset")]
     #[test_case("FLAG SET timefusion_read_dedup_skip_per_file ON" => Err(()); "only registered flags are overridable")]
-    #[test_case("FLAG SET timefusion_query_scan_byte_admission MAYBE" => Err(()); "value is ON or OFF")]
     #[test_case("FLAG SET timefusion_maintenance_cpu_tokens 96" => Ok(Some(crate::server::FlagCmd::Set(crate::config::RuntimeFlag::TimefusionMaintenanceCpuTokens, Some(96)))); "numeric")]
     #[test_case("FLAG SET timefusion_maintenance_cpu_tokens 8" => Ok(Some(crate::server::FlagCmd::Set(crate::config::RuntimeFlag::TimefusionMaintenanceCpuTokens, Some(8)))); "numeric lower bound")]
     #[test_case("FLAG SET timefusion_maintenance_cpu_tokens 256" => Ok(Some(crate::server::FlagCmd::Set(crate::config::RuntimeFlag::TimefusionMaintenanceCpuTokens, Some(256)))); "numeric upper bound")]
@@ -1639,10 +1635,9 @@ mod pgwire_handlers_tests {
     #[test_case("FLAG SET timefusion_maintenance_cpu_tokens 257" => Err(()); "above range")]
     #[test_case("FLAG SET timefusion_maintenance_cpu_tokens -1" => Err(()); "negative")]
     #[test_case("FLAG SET timefusion_maintenance_cpu_tokens ON" => Err(()); "numeric flag is not boolean")]
-    #[test_case("FLAG SET timefusion_query_scan_byte_admission 2" => Err(()); "boolean flag rejects numbers above 1")]
-    #[test_case("FLAG RESET timefusion_maintenance_cpu_tokens" => Ok(Some(crate::server::FlagCmd::Set(crate::config::RuntimeFlag::TimefusionMaintenanceCpuTokens, None))); "numeric reset")]
+    #[test_case("flag reset TIMEFUSION_MAINTENANCE_CPU_TOKENS" => Ok(Some(crate::server::FlagCmd::Set(crate::config::RuntimeFlag::TimefusionMaintenanceCpuTokens, None))); "reset, any case")]
     #[test_case("FLAG SHOW extra" => Err(()); "reject trailing input")]
-    #[test_case("FLAG SET timefusion_query_scan_byte_admission" => Err(()); "set needs a value")]
+    #[test_case("FLAG SET timefusion_maintenance_cpu_tokens" => Err(()); "set needs a value")]
     #[test_case("SELECT 1" => Ok(None); "ordinary SQL falls through")]
     #[test_case("flags_x" => Ok(None); "keyword boundary")]
     fn flag_commands_parse(query: &str) -> Result<Option<super::FlagCmd>, ()> {

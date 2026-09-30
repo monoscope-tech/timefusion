@@ -90,8 +90,7 @@ Engineering:
   - Metrics tiers `metrics_1m_v2` / `metrics_1h_v2` unchanged.
 - **On by default:** DV strip for all dates (fleet cap 12 per 10 min), W59 dirty re-flush drain, one heavy
   slot per query, measure re-mint backfill (2 cells per pass).
-- **Dark flags (FLAG-switchable):** `timefusion_maintenance_cpu_tokens` (8..256; prod runs 66). Byte admission for wide scans
-  stays behind config flags. W21 witness carry stays off.
+- **Dark flags (FLAG-switchable):** `timefusion_maintenance_cpu_tokens` (8..256; prod runs 66). W21 witness carry stays off.
 - **Latency:** p95/p99 are recorded at stream end since 18:09. Values before that excluded streaming time
   and are not comparable.
 - **Last clean numbers (09-29 14:00–18:00, image `8bea392b`):** see the gate table. Shipbubble 24h status
@@ -200,13 +199,11 @@ Done items carry evidence (commit or number). Open items carry the next action, 
       W53 tantivy cache 400 GB, W55 `count(<expr>)` wrong-answer fix.
 - [x] W48 be87ebc1 slow warm: resolved by W44 + W51 (6.1 s cold → 0.7 s warm).
 - [x] `8184a638`: pgwire latency at stream end; one heavy slot per query; FLAG switch.
-- [ ] Byte admission for wide scans (FLAG `timefusion_query_scan_byte_admission`). 09-30: the memory it was meant to
-      bound turned out to be tantivy installs, not scan decode (see Memory spikes). Decide after the fix is verified;
-      default is delete. ABBA 09-30 04:05–04:43 on the
-      mixed sealed-day load (4 workers): the gate never queued (12,646 admitted, 0 queued; ~10 GB/h scanned, peak
-      23.5 GiB), p99 0.78 s ON vs 0.83 s OFF. So it costs nothing when idle, but this load cannot show what it
-      is for. Next: a ramp with the gate ON, 8/12/16 raw-scan workers under a 60 GiB watchdog (`abba/ramp`). Turn
-      it on by default if memory stays bounded and `scan_bytes_queued` rises; delete it if it never binds.
+- [x] Byte admission for wide scans (FLAG `timefusion_query_scan_byte_admission`) — deleted. ABBA 09-30 04:05–04:43
+      on the mixed sealed-day load (4 workers): the gate never queued (12,646 admitted, 0 queued; ~10 GB/h scanned,
+      peak 23.5 GiB), p99 0.78 s ON vs 0.83 s OFF. The memory it was meant to bound was tantivy installs, not scan
+      decode (see Memory spikes), fixed separately. Flag, `ScanByteGate` and `scan_bytes_*` counters removed; the
+      heavy-query (sort) admission stays.
 - [ ] Remove W36 `split_sorted_runs` at the next DataFusion fork bump, after carrying sort info through
       `MemorySourceConfig::repartitioned` in the fork.
 
@@ -418,9 +415,8 @@ ROLLUP POLICIES otel_logs_and_spans
 ROLLUP PAUSE  otel_logs_and_spans otel_logs_and_spans_rollup_sessions_1h_v1
 ROLLUP RESUME otel_logs_and_spans otel_logs_and_spans_rollup_dashboard_1m_v4 FROM '2026-08-29T00:00:00Z'
 FLAG SHOW
-FLAG SET timefusion_query_scan_byte_admission ON     -- ON|OFF
 FLAG SET timefusion_maintenance_cpu_tokens 128        -- 8..256
-FLAG RESET timefusion_query_scan_byte_admission
+FLAG RESET timefusion_maintenance_cpu_tokens
 ```
 
 Scripts:

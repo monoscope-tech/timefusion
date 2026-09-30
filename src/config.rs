@@ -2235,11 +2235,10 @@ pub struct MaintenanceConfig {
 pub enum RuntimeFlag {
     /// Maintenance admission's CPU-token capacity; config is `coordinator_job_slots`.
     TimefusionMaintenanceCpuTokens,
-    TimefusionQueryScanByteAdmission,
 }
 
 /// Per-flag override: 0 = config, else value + 1.
-static FLAG_OVERRIDES: [std::sync::atomic::AtomicU32; 2] = [const { std::sync::atomic::AtomicU32::new(0) }; 2];
+static FLAG_OVERRIDES: [std::sync::atomic::AtomicU32; 1] = [const { std::sync::atomic::AtomicU32::new(0) }; 1];
 
 impl RuntimeFlag {
     fn slot(self) -> &'static std::sync::atomic::AtomicU32 {
@@ -2249,7 +2248,6 @@ impl RuntimeFlag {
     pub fn range(self) -> std::ops::RangeInclusive<u32> {
         match self {
             Self::TimefusionMaintenanceCpuTokens => 8..=256,
-            _ => 0..=1,
         }
     }
 
@@ -2272,12 +2270,7 @@ impl AppConfig {
     pub fn flag_value(&self, flag: RuntimeFlag) -> u32 {
         flag.override_value().unwrap_or_else(|| match flag {
             RuntimeFlag::TimefusionMaintenanceCpuTokens => u32::try_from(self.derived.coordinator_job_slots()).unwrap_or(u32::MAX),
-            RuntimeFlag::TimefusionQueryScanByteAdmission => self.memory.timefusion_query_scan_byte_admission.into(),
         })
-    }
-
-    pub fn flag(&self, flag: RuntimeFlag) -> bool {
-        self.flag_value(flag) != 0
     }
 }
 
@@ -2353,11 +2346,6 @@ pub struct MemoryConfig {
     // of magnitude on OTel data.
     #[serde_inline_default(64)]
     pub timefusion_wide_scan_max_mb: u64,
-    /// Admit a pgwire query only once its wide scans' selected bytes × 1.5 fit
-    /// in a byte budget the size of the query pool, queuing the rest. The fetch
-    /// and decode heap of a wide scan is outside that pool.
-    #[serde_inline_default(false)]
-    pub timefusion_query_scan_byte_admission: bool,
     /// Largest isolated non-conforming Delta leg that `repair_isolated_scan_ordering`
     /// will sort at read time so the conforming majority keeps its `[timestamp DESC]`
     /// claim. 0 disables the repair.
@@ -2425,17 +2413,16 @@ impl AppConfig {
 mod tests {
     use super::*;
 
-    /// The override wins over the config field in either direction; `None` returns to it.
-    #[test_case::test_case(false, Some(true) => true ; "on_over_config_off")]
-    #[test_case::test_case(true, Some(false) => false ; "off_over_config_on")]
-    #[test_case::test_case(true, None => true ; "reset_reads_config")]
-    fn runtime_flag_override_is_what_read_sites_see(configured: bool, runtime: Option<bool>) -> bool {
-        let mut cfg = AppConfig::default();
-        cfg.memory.timefusion_query_scan_byte_admission = configured;
-        RuntimeFlag::TimefusionQueryScanByteAdmission.set_override(runtime.map(u32::from));
-        let seen = cfg.flag(RuntimeFlag::TimefusionQueryScanByteAdmission);
-        RuntimeFlag::TimefusionQueryScanByteAdmission.set_override(None);
-        seen
+    /// The override wins over the config value; `None` returns to it.
+    #[test]
+    fn runtime_flag_override_is_what_read_sites_see() {
+        use RuntimeFlag::TimefusionMaintenanceCpuTokens as Cpu;
+        let cfg = AppConfig::default();
+        let configured = cfg.flag_value(Cpu);
+        Cpu.set_override(Some(configured + 1));
+        assert_eq!(cfg.flag_value(Cpu), configured + 1);
+        Cpu.set_override(None);
+        assert_eq!(cfg.flag_value(Cpu), configured);
     }
 
     /// Pins the DESERIALIZED tantivy defaults. Trap: `TantivyConfig::default()`
@@ -2642,7 +2629,6 @@ mod tests {
         let day = CacheConfig { timefusion_cache_bypass_scan_hours: 24, ..config.cache.clone() };
         assert!(day.cache_bypass_scan_micros().unwrap() > 24 * 3_600_000_000 + 1_000_000, "a 24h window re-measured at scan time must still admit");
         assert_eq!(config.memory.timefusion_wide_scan_max_mb, 64);
-        assert!(!config.memory.timefusion_query_scan_byte_admission);
         assert!(config.maintenance.timefusion_warm_after_compaction);
         assert!(config.maintenance.timefusion_evict_after_compaction);
         // Merge-on-read DV is the default write path.

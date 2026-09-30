@@ -1391,14 +1391,14 @@ mod stats_table_tests {
 
     #[test]
     fn flags_component_reports_effective_value_and_override() {
-        use crate::config::RuntimeFlag::{TimefusionMaintenanceCpuTokens as Cpu, TimefusionQueryScanByteAdmission as Bytes};
+        use crate::config::RuntimeFlag::TimefusionMaintenanceCpuTokens as Cpu;
         crate::config::set_config_for_test(crate::config::AppConfig::default());
         Cpu.set_override(Some(96));
         let rows = snapshot_rows(&StatsTableProvider::new(None));
         Cpu.set_override(None);
         let flags: Vec<_> = rows.iter().filter(|(c, ..)| c == "flags").map(|(_, k, v)| (k.as_str(), v.as_str())).collect();
-        let (c, b): (&str, &str) = (Cpu.into(), Bytes.into());
-        assert_eq!(flags, [(c, "96"), (&*format!("{c}.override"), "96"), (b, "false"), (&*format!("{b}.override"), "null")]);
+        let c: &str = Cpu.into();
+        assert_eq!(flags, [(c, "96"), (&*format!("{c}.override"), "96")]);
     }
 
     /// Scan metrics wired and nothing else: an unwired pool reports 0 rather than dividing by zero, and every counter
