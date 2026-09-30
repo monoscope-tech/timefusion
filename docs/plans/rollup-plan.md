@@ -108,6 +108,11 @@ Done items carry evidence (commit or number). Open items carry the next action, 
       (09-29 10.6, 09-27 127); lease-s/M 706 (995). Backlog first→last hour: base rollup 227→222, dedup 204→200,
       due tasks 3→2 — FALLING (09-29 same hours: 303→328, 161→171 rising). Passed on direction; the decline is small
       (4–5 tasks/2 h) and pending dedup is higher in absolute terms than 09-29. Re-check the evening trend on `f2017216`.
+      **Evening re-check (`36bbbe6a`, 18:45–20:50):** no whole-day re-arm waves (0 corpse removals; largest reconcile
+      73 units vs 314 before); pending base rollup sawtooths hourly (top-of-hour bump = new-hour work for every
+      tenant, e.g. 74→159 at 20:08) and drains within the hour (159→84 by 20:48); peaks ~155–160 vs 250–370
+      earlier. Hourly troughs 55 → 74 → 84 (last still draining). Verdict: the backlog is bounded and kept up with at
+      a much lower level; "falling" held for the daytime gate, flat this evening.
 - [x] **Experiment: query-latency yield** — deleted: A/B showed no benefit. ABBA/BAAB on prod 09-29
       20:01–21:55 UTC, 16 workers, ~57k queries: the yield engaged (ceiling 66 → 8) yet p95 B−A +0.24 s
       (CI −0.52…+1.00) and p99 +0.53 s (CI −0.28…+1.34) on a 4.95 s baseline. Query latency under load is
@@ -315,7 +320,8 @@ Done items carry evidence (commit or number). Open items carry the next action, 
       Done: sealed-day rebuilds ≤1/h (`bfd17aed`; deadline NOT enforced — owner: long whale rebuilds are fine if progressing); byte admission deleted (`24929428`); monoscope items shipped on its `tf-followups` branch.
 - [x] Flaky: `kill_recovery::acked_rows_survive_sigkill_*` (multi_tenant, concurrent_writers) each retried once 09-30.
       Root cause: concurrent first CREATE of a table failed on "protocol changed"; fixed `45d02461` (adopt the winner's table on any CREATE failure).
-- [ ] Flaky e2e: `recent_window_pruning::dv_bearing_file_keeps_parquet_pushdown_on_its_siblings` (1 retry in 0930e signoff).
+- [x] Flaky e2e: `recent_window_pruning::dv_bearing_file_keeps_parquet_pushdown_on_its_siblings` (1 retry in 0930e signoff). Fixed (`16de4ec8`): the harness 1 s eviction tick split the fixture's files; the test now owns its flushes.
+- [x] Flaky e2e `postcommit_hooks::commit_path_does_not_checkpoint`: the harness left the wall-clock checkpoint cron on (even minutes); disabled in e2e (`90004268`).
 - [x] Late RUM rows void a whole sealed day slice (09-29 day slice rebuilt 256×; one rebuild took 2,461 s while a sealed
       consolidation overlapped). Fixed on `rollup/batch-sealed-rebuilds`: a built rollup slice over a date before today
       is rebuilt at most once per `SEALED_REBUILD_INTERVAL_MICROS` (1 h); the re-arm stays queued and reads use the raw
