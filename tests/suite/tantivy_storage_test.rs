@@ -41,7 +41,7 @@ async fn pack_upload_download_unpack_query_roundtrip() {
     assert_eq!(dl, blob);
 
     let dir = TempDir::new().unwrap();
-    unpack_to_dir(&dl, dir.path()).expect("unpack");
+    unpack_to_dir(&dl[..], dir.path()).expect("unpack");
     let idx = timefusion::tantivy::open_index(dir.path()).expect("open");
     let built = build_for_table(&table);
     let level_field = built.user_fields.get("level").unwrap().field;

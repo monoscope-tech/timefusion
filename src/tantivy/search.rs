@@ -22,7 +22,7 @@ use dashmap::DashMap;
 use futures::{StreamExt, TryStreamExt};
 use itertools::Itertools;
 use lru::LruCache;
-use object_store::{ObjectStore, path::Path as ObjPath};
+use object_store::{ObjectStore, ObjectStoreExt, path::Path as ObjPath};
 use parking_lot::Mutex;
 use tantivy::{Index, IndexReader};
 
@@ -153,7 +153,14 @@ pub struct TantivySearchService {
     /// signal, since mmap reads don't reliably move a directory's atime. Dirs
     /// absent here fall back to dir mtime, which is their unpack time.
     last_used: DashMap<PathBuf, SystemTime>,
+    /// Bounds cold-cache installs independently of `search_concurrency`, so a
+    /// wide cold search cannot hold dozens of downloads + unpacks at once.
+    install_permits: Arc<tokio::sync::Semaphore>,
+    /// Per-dir install lock: concurrent misses on one blob fetch it once.
+    installing: DashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>,
 }
+
+const MAX_CONCURRENT_INSTALLS: usize = 4;
 
 /// Outcome of one [`TantivySearchService::reap_disk_cache`] sweep.
 #[derive(Debug, Default, Clone, Copy)]
@@ -222,6 +229,8 @@ impl TantivySearchService {
             stats: SearchStats::default(),
             manifests: DashMap::new(),
             last_used: DashMap::new(),
+            install_permits: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_INSTALLS)),
+            installing: DashMap::new(),
         }
     }
 
@@ -538,14 +547,31 @@ impl TantivySearchService {
         if has_any_segment(&dir) {
             return Ok(dir);
         }
-        let started = Instant::now();
-        let blob = super::download(self.object_store.as_ref(), &ObjPath::from(blob_path)).await?;
-        // `spawn_blocking`: zstd-decoding and untarring a whole blob is CPU+IO
-        // bound and yields nowhere, so inline it would hold a runtime worker.
-        let (target, bytes) = (dir.clone(), blob.clone());
-        tokio::task::spawn_blocking(move || install_blob_into_cache(&target, &bytes)).await??;
-        SearchStats::timed(&self.stats.blob_fetches, &self.stats.blob_fetch_us, started);
-        Ok(dir)
+        let lock = self.installing.entry(dir.clone()).or_default().clone();
+        let result = async {
+            let _installing = lock.lock().await;
+            if has_any_segment(&dir) {
+                return Ok(());
+            }
+            let permit = Arc::clone(&self.install_permits).acquire_owned().await?;
+            let started = Instant::now();
+            let path = ObjPath::from(blob_path);
+            let stream = self.object_store.get(&path).await.with_context(|| format!("get {path}"))?.into_stream().map_err(std::io::Error::other);
+            // Streamed end to end (object store -> zstd -> tar -> disk) on a
+            // blocking thread: buffering a blob whole cost ~100 GB of heap in prod.
+            // The permit moves in so a cancelled query frees it only when the unpack ends.
+            let target = dir.clone();
+            tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                install_blob_into_cache(&target, tokio_util::io::SyncIoBridge::new(tokio_util::io::StreamReader::new(stream)))
+            })
+            .await??;
+            SearchStats::timed(&self.stats.blob_fetches, &self.stats.blob_fetch_us, started);
+            anyhow::Ok(())
+        }
+        .await;
+        self.installing.remove(&dir);
+        result.map(|()| dir)
     }
 
     /// Bound the extracted-index disk tree at `budget_bytes`, evicting
@@ -671,7 +697,7 @@ fn cache_generation_key(key: &str, blob: &str) -> String {
 ///
 /// Deliberately does NOT stamp `last_used` — a seeded dir's mtime is its unpack
 /// time, which already sorts it as newest for the reaper.
-fn install_blob_into_cache(dir: &Path, blob: &bytes::Bytes) -> Result<()> {
+fn install_blob_into_cache(dir: &Path, blob: impl std::io::Read) -> Result<()> {
     let parent = dir.parent().ok_or_else(|| anyhow!("cache path has no parent"))?;
     std::fs::create_dir_all(parent).context("mkdir cache parent")?;
     let tmp = tempfile::TempDir::new_in(parent).context("tempdir for unpack")?;
@@ -758,6 +784,73 @@ mod tests {
         let dir = seed.then(|| fake_index(tmp.path(), "tbl/p/only", 1000));
         let report = service(tmp.path()).reap_disk_cache(budget);
         (report.dirs_scanned, report.dirs_removed, report.bytes_removed, dir.is_some_and(|d| d.exists()))
+    }
+
+    /// A packed fake index whose segment is `bytes` of incompressible data.
+    fn packed_blob(bytes: usize) -> bytes::Bytes {
+        let src = tempfile::tempdir().unwrap();
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        let noise: Vec<u8> = (0..bytes).map(|_| (x ^= x << 13, x ^= x >> 7, x ^= x << 17, x as u8).3).collect();
+        std::fs::write(src.path().join("seg0.store"), noise).unwrap();
+        std::fs::write(src.path().join("meta.json"), "{}").unwrap();
+        crate::tantivy::pack_dir(src.path(), 1).unwrap()
+    }
+
+    fn disk_bytes(p: &std::path::Path) -> u64 {
+        std::fs::read_dir(p)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| if e.path().is_dir() { disk_bytes(&e.path()) } else { e.metadata().map_or(0, |m| m.len()) })
+            .sum()
+    }
+
+    /// Prod OOM 2026-09-30: installs held the whole blob AND its decompressed tar
+    /// in memory (~112 GB live). Streaming means output reaches disk while input
+    /// is still unread; decode-then-unpack writes nothing until input is exhausted.
+    #[test]
+    fn install_streams_to_disk_before_the_blob_is_consumed() {
+        struct Probe<'a> {
+            inner: &'a [u8],
+            root: &'a std::path::Path,
+            streamed: bool,
+        }
+        impl std::io::Read for Probe<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.streamed |= !self.inner.is_empty() && disk_bytes(self.root) > 0;
+                self.inner.read(buf)
+            }
+        }
+        let (tmp, blob) = (tempfile::tempdir().unwrap(), packed_blob(8 << 20));
+        let dir = tmp.path().join("idx");
+        let mut probe = Probe { inner: &blob[..], root: tmp.path(), streamed: false };
+        super::install_blob_into_cache(&dir, &mut probe).unwrap();
+        assert!(probe.streamed, "unpack must write while the blob is still being read");
+        assert_eq!(std::fs::metadata(dir.join("seg0.store")).unwrap().len(), 8 << 20);
+    }
+
+    /// 16 concurrent misses over 8 blobs: each blob is fetched once, and no more
+    /// than `MAX_CONCURRENT_INSTALLS` fetches overlap (each `get` stalls 100ms).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cold_installs_are_deduped_and_bounded() {
+        use object_store::{ObjectStoreExt, throttle::*};
+        let (tmp, blob, mem) = (tempfile::tempdir().unwrap(), packed_blob(1024), object_store::memory::InMemory::new());
+        for i in 0..8 {
+            mem.put(&format!("b{i}").into(), blob.clone().into()).await.unwrap();
+        }
+        let wait = std::time::Duration::from_millis(100);
+        let store = ThrottledStore::new(mem, ThrottleConfig { wait_get_per_call: wait, ..Default::default() });
+        let svc = TantivySearchService::new(Arc::new(store), tmp.path().to_path_buf(), Arc::new(crate::config::TantivyConfig::default()));
+        let started = std::time::Instant::now();
+        let dirs = futures::future::try_join_all((0..16).map(|i| {
+            let svc = &svc;
+            async move { svc.ensure_cached("t", "p", &format!("f{}", i % 8), &format!("b{}", i % 8)).await }
+        }))
+        .await
+        .unwrap();
+        assert!(dirs.iter().all(|d| d.join("seg0.store").exists()));
+        assert_eq!(svc.stats.blob_fetches.load(std::sync::atomic::Ordering::Relaxed), 8, "concurrent misses on one blob fetch it once");
+        assert!(started.elapsed() >= wait * (8 / super::MAX_CONCURRENT_INSTALLS) as u32, "installs exceeded the concurrency bound");
     }
 
     /// An unknown bound is treated permissively (won't wrongly prune), but a
@@ -1259,7 +1352,7 @@ impl TantivyIndexService {
         }
         let Some(reader) = self.reader() else { return };
         let dir = super::local_cache_path(&reader.cache_root, table, project_id, &cache_generation_key(file_uuid(manifest_key), blob_path));
-        let failure = match tokio::task::spawn_blocking(move || install_blob_into_cache(&dir, &blob)).await {
+        let failure = match tokio::task::spawn_blocking(move || install_blob_into_cache(&dir, &blob[..])).await {
             Ok(Ok(())) => return SearchStats::add(&reader.stats.cache_seeded, 1),
             Ok(Err(e)) => format!("tantivy cache seed failed for {project_id}/{table}: {e:#}"),
             Err(e) => format!("tantivy cache seed join failed for {project_id}/{table}: {e}"),

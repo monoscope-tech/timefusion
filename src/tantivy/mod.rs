@@ -1050,11 +1050,11 @@ pub fn pack_dir(dir: &Path, level: i32) -> Result<Bytes> {
     zstd::encode_all(&tar_buf[..], level).map(Bytes::from).context("zstd encode")
 }
 
-/// Unpack a tar.zst blob into a fresh directory under `dest`.
-pub fn unpack_to_dir(blob: &[u8], dest: &Path) -> Result<()> {
+/// Stream-unpack a tar.zst blob into `dest`: peak memory is the decoder's
+/// buffers, never the blob or its decompressed tar.
+pub fn unpack_to_dir(blob: impl std::io::Read, dest: &Path) -> Result<()> {
     std::fs::create_dir_all(dest).context("mkdir dest")?;
-    let tar_bytes = zstd::decode_all(blob).context("zstd decode")?;
-    tar::Archive::new(&tar_bytes[..]).unpack(dest).context("tar unpack")
+    tar::Archive::new(zstd::Decoder::new(blob).context("zstd decoder")?).unpack(dest).context("tar unpack")
 }
 
 /// Round-trip a freshly packed blob (decode every entry + open it) before
