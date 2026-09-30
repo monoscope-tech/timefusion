@@ -150,11 +150,14 @@ Done items carry evidence (commit or number). Open items carry the next action, 
 - [x] 1B closed by measurement: byte-weighted shard amplification 1.00x (all units single-shard).
       Reopen only if large units return (v4 31-day backfill of the whale).
 - [x] 1D closed by measurement: ~0% irrelevant churn; W8 shadow classifier and W17 design shipped.
-- [ ] **Stage 1C shared scans** — trigger: two useful consumers of one source scan and measured duplicate
-      preparation; gate ≥20% lower combined CPU. The 09-28 ranking put today's cells (Dedup + BaseRollup
-      reading the same 10-min cells) at ~800 lease-s/h, a small saving. **Now measurable:** with
-      `sessions_1h_v2` resumed, dashboard and session tiers both read the same source. Measure duplicate
-      preparation once the v4 and sessions backfills settle, then decide.
+- [x] **Stage 1C closed by measurement (09-30 14:00–16:00 UTC, process abe49d09, no deploy in window).** Evidence:
+      `tf-helper-scripts/stage1c/` (units.json, parse.py, window log). Trigger met in shape: 59/59 `sessions_1h_v2`
+      hours ran in the same coordinator wave as their six v4 cells (same `input_fp`); Dedup ran on the same cell as
+      v4 in 407/409 units. But lease (7,631 s) is HotPacking 41%, v4 30%, Dedup 12%, sessions 7%, metrics_1m 6%;
+      the sharing ceiling (all of the cheaper side of each pair) is 387 s = 14% of the pair (5% of maintenance),
+      ≤12% with Dedup; realistic ~5% (a whole-hour sessions unit costs 1.7 s median vs 33 s for its six v4
+      cells). Lease is wall time: maintenance averaged 1.06 concurrent units on 5.1 cores, so the bounded saving
+      is ~1% of container CPU. Below the ≥20% gate → no build (as 1B, 1D). Reopen only if multi-hour units return.
 
 ### Stage 2: source visibility and today-window hits
 
@@ -341,6 +344,10 @@ Done items carry evidence (commit or number). Open items carry the next action, 
 ## 5. Key findings worth keeping
 
 Where cost and slowness come from:
+- **v4 / sessions cost is re-arm churn and aggregation, not cross-tier duplicate preparation (09-30).** Whole-day
+  rebuild waves of 6297304f ran 59 min apart (14:29: 49 units, 15:28: 67). Lease on cells built ≥2× in 2 h: v4 874
+  of 2,267 s, sessions 458 of 564 s; the whale's 12:00 hour alone was 63% of sessions lease. Next levers: the
+  re-arm source and per-cell v4 cost (131/409 v4 cell reads repeat another cell's `(input_fp, hour)`) — unmeasured.
 
 - **Masks on today's partition** (all 214 DV bitmaps decoded): ~57–62% of masked rows are exact duplicates TF
   made. An UPDATE/DELETE during a flush commit left the bucket dirty, and the whole bucket was re-flushed
