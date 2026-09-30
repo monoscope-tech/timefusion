@@ -10183,3 +10183,32 @@ async fn a_recent_strip_output_lands_with_its_body_cached(days_back: i64, warmed
     assert_eq!(passed() - before, warmed);
     Ok(())
 }
+
+/// delta-kernel's `TokioMultiThreadExecutor::block_on` spawns its IO onto the ambient
+/// runtime and blocks on a std channel, `expect`ing a reply. Cancelling maintenance used
+/// to drop the maintenance runtime at once, dropping that IO mid-flight: the old process
+/// panicked `TokioMultiThreadExecutor has crashed: RecvError` at deploy handoff.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelling_maintenance_keeps_its_runtime_until_tracked_work_drains() -> Result<()> {
+    let db = Database::with_config(create_test_config("maintenance-runtime-drain")).await?.start_maintenance_schedulers().await?;
+    let executor = db.maintenance_executor.get().expect("scheduler installs the isolated runtime").clone();
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let kernel_call = db.maintenance_tasks_tracker.spawn_on(
+        async move {
+            tokio::task::block_in_place(|| {
+                let (tx, rx) = std::sync::mpsc::channel();
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                    tx.send(1).ok();
+                });
+                let _ = started_tx.send(());
+                rx.recv()
+            })
+        },
+        &executor,
+    );
+    started_rx.await.expect("kernel-shaped call started");
+    db.cancel_maintenance();
+    assert_eq!(kernel_call.await?, Ok(1), "the maintenance runtime was dropped under an in-flight kernel call");
+    Ok(())
+}

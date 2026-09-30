@@ -4514,7 +4514,7 @@ impl Database {
             }
         };
         if let Some(executor) = self.maintenance_executor.get() {
-            executor.spawn(preload);
+            self.maintenance_tasks_tracker.spawn_on(preload, executor);
         } else {
             // Test/CLI callers can preload without starting schedulers.
             tokio::spawn(preload);

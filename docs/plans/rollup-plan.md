@@ -254,8 +254,9 @@ Done items carry evidence (commit or number). Open items carry the next action, 
       tokio-postgres/postgres-types (0.2.14 breaks arrow-pg encoding).
 - [ ] `ordering_pushdown::one_unsorted_file_does_not_cost_the_majority_its_ordering` e2e flakes under load
       (passes alone). Leave unless it blocks signoff.
-- [ ] Old-process shutdown can panic in `buoyant_kernel_engine` executor (`RecvError`) after the WAL drained.
-      Harmless at handoff; not fixed.
+- [x] Old-process shutdown can panic in `buoyant_kernel_engine` executor (`RecvError`) after the WAL drained.
+      Cause: cancelling maintenance dropped the maintenance runtime at once, under in-flight kernel IO. Fixed:
+      that runtime now outlives `maintenance_tasks_tracker` (preload + dedup cron now tracked).
 
 - [ ] **Two DV-strip tests fail by design 00:00–03:00 UTC** (`rollup_noop_skip_tests::todays_dv_files_strip_under_a_live_rollup_slice`,
       `a_retired_corpse_goes_first_and_counts_as_progress`: "dedup masks only bins sealed 2 h; run after 03:00 UTC"),

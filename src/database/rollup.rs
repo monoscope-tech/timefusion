@@ -763,7 +763,13 @@ impl Database {
                             }
                         });
 
+                        // Dropping the runtime drops every task on it, including IO that
+                        // delta-kernel's `block_on` is blocked waiting for (it panics with
+                        // `RecvError`). So outlive tracked work; the server `process::exit`s
+                        // rather than waiting on a unit that ignores cancellation.
                         cancel.cancelled().await;
+                        db.maintenance_tasks_tracker.close();
+                        db.maintenance_tasks_tracker.wait().await;
                     });
                 })
                 .map_err(|error| anyhow::anyhow!("failed to start maintenance runtime: {error}"))?;
@@ -802,7 +808,7 @@ impl Database {
             let db = db.clone();
             move || {
                 let db = db.clone();
-                async move {
+                db.maintenance_tasks_tracker.clone().track_future(async move {
                     let Ok(_maintenance_job) = db.maintenance_job_sem.clone().acquire_owned().await else {
                         return;
                     };
@@ -834,7 +840,7 @@ impl Database {
                         }
                         db.run_dedup_for_table(&table, &table_name, &Self::table_label(&project_id, &table_name), drain_deadline).await;
                     }
-                }
+                })
             }
         });
 
