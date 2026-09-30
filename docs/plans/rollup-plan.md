@@ -223,7 +223,8 @@ Done items carry evidence (commit or number). Open items carry the next action, 
 - [x] Follow-ups in `4319b951`: `dv_strip_plan_sorts_total` counts only unexpected 1:1 sorts
       (`dv_strip_resorts_total` counts undeclared footers); all-DV cells strip one file at a time;
       bodies of today's/yesterday's outputs ≤256 MB warmed within the preload budget.
-- [ ] Parks are in-memory: each restart retries a refused set once. Decide if persistence is worth it.
+- [x] Parks persist in the `lossy_rewrite_parks.json` sidecar, so a restart does not retry a refused set.
+      A changed DV or a lapsed deadline still unparks; a missing or corrupt file loads as no parks.
 - [x] Re-measure the 2-day-old shipbubble trace lookup once 09-26/27 are fully stripped (last: 15.9 s cold, 3.1 s warm).
       09-30 20:00: 2.64 s cold / 0.61 s warm (was 15.9 s / 3.1 s).
 - [x] Watch query latency against the 12-per-10-min cap while today's strip debt drains (it dominates 09-29 HotPacking).

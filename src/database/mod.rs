@@ -3365,7 +3365,7 @@ impl Database {
             repair_verified_lock: Arc::new(std::sync::Mutex::new(())),
             repair_verified_appends: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             repair_failures: Arc::new(dashmap::DashMap::new()),
-            lossy_refusals: Arc::new(dashmap::DashMap::new()),
+            lossy_refusals: Arc::new(crate::storage::load_sidecar(&cfg.core.timefusion_data_dir, crate::storage::LOSSY_PARKS).into_iter().collect()),
             repair_degradation: Arc::new(dashmap::DashMap::new()),
             maintenance_rewrite_sem: Arc::new(tokio::sync::Semaphore::new(cfg.derived.rewrite_permits().max(1))),
             light_rewrite_sem: Arc::new(tokio::sync::Semaphore::new(light_rewrite_permits)),

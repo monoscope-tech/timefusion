@@ -2984,6 +2984,8 @@ pub fn store_sidecar<T: Serialize>(data_dir: &std::path::Path, (file, what): (&s
 pub const CERTIFICATIONS: (&str, &str) = ("dedup_certifications.json", "certification store");
 pub const SLICE_COVERAGE: (&str, &str) = ("dedup_slice_coverage.json", "slice coverage store");
 pub const UNTAGGED_CELLS: (&str, &str) = ("rollup_untagged_cells.json", "untagged tier cell store");
+/// `Database::lossy_refusals` as `(path, (dv cardinality, strikes, parked until µs))`.
+pub const LOSSY_PARKS: (&str, &str) = ("lossy_rewrite_parks.json", "lossy rewrite park store");
 
 /// A `(source, project, tier table, date)` partition holding tier files with no
 /// identity tags, persisted so the repair damage rank survives a restart.

@@ -3889,6 +3889,9 @@ impl Database {
                 strikes
             })
             .collect_vec();
+        // Persisted so a restart does not re-stage a set the guard already refused.
+        let stored = self.lossy_refusals.iter().map(|park| (park.key().clone(), *park.value())).collect_vec();
+        crate::storage::store_sidecar(&self.config.core.timefusion_data_dir, crate::storage::LOSSY_PARKS, &stored);
         let files = targets.iter().map(|add| add.path.as_str()).collect_vec();
         warn!(table_name, project_id, ?files, ?parks, event = "lossy_rewrite_parked", "the exact-count guard refused a rewrite; parking its inputs");
     }
@@ -11757,36 +11760,51 @@ mod rollup_noop_skip_tests {
     #[tokio::test]
     async fn a_refused_lossy_rewrite_parks_its_inputs_instead_of_restaging() -> Result<()> {
         use std::sync::atomic::Ordering::Relaxed;
-        let db = Arc::new(Database::with_config(rollup_cfg("dv_refusal")).await?);
+        let cfg = rollup_cfg("dv_refusal");
+        let db = Arc::new(Database::with_config(Arc::clone(&cfg)).await?);
         let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
         let noon = (chrono::Utc::now().date_naive() - chrono::Duration::days(3)).and_hms_opt(12, 0, 0).expect("valid hour").and_utc().timestamp_micros();
-        for rows in [
-            vec![test_span_ts("dup", "first", &project_id, noon), test_span_ts("other", "op", &project_id, noon + 1)],
-            vec![test_span_ts("dup", "second", &project_id, noon)],
-        ] {
-            db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![json_to_batch(rows)?], true, None).await?;
-        }
+        let insert = async |db: &Database, rows| db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![json_to_batch(rows)?], true, None).await;
+        insert(&db, vec![test_span_ts("dup", "first", &project_id, noon), test_span_ts("other", "op", &project_id, noon + 1)]).await?;
+        insert(&db, vec![test_span_ts("dup", "second", &project_id, noon)]).await?;
         dedup_unified(&db).await?;
-        let table = db.resolve_table(&project_id, "otel_logs_and_spans").await?;
-        let partition = || async {
-            let t = table.read().await;
-            let adds = t.snapshot()?.log_data().iter().map(|f| add_action(&f)).filter(|add| add.path.contains(&project_id)).collect_vec();
-            anyhow::Ok((adds.len(), adds.iter().filter(|add| add.deletion_vector.is_some()).count()))
-        };
         let stats = crate::observability::maintenance_stats();
         let before = stats.lossy_rewrite_refusals.load(Relaxed);
-        let tick = || async {
+        let tick = async |db: &Database| {
+            // Resolved first: a reopened db plans only the tables it has loaded.
+            let table = db.resolve_table(&project_id, "otel_logs_and_spans").await?;
             db.plan_compaction_debt().await?;
             db.run_coordinator_compaction_once(Operation::SealedConsolidation).await?;
-            anyhow::Ok((stats.lossy_rewrite_refusals.load(Relaxed) - before, partition().await?))
+            let t = table.read().await;
+            let adds = t.snapshot()?.log_data().iter().map(|f| add_action(&f)).filter(|add| add.path.contains(&project_id)).collect_vec();
+            anyhow::Ok((stats.lossy_rewrite_refusals.load(Relaxed) - before, (adds.len(), adds.iter().filter(|add| add.deletion_vector.is_some()).count())))
         };
         FORCE_LOSSY_REWRITE.store(1, Relaxed);
-        assert_eq!(tick().await?, (1, (2, 1)), "the guard refuses and nothing commits");
+        assert_eq!(tick(&db).await?, (1, (2, 1)), "the guard refuses and nothing commits");
         crate::support::advance_micros(60 * 1_000_000);
-        assert_eq!(tick().await?, (1, (2, 1)), "past the unit's retry and a planner tick, the refused set must not re-stage");
+        assert_eq!(tick(&db).await?, (1, (2, 1)), "past the unit's retry and a planner tick, the refused set must not re-stage");
+
+        let parks = crate::write::wal::meta_path(&cfg.core.timefusion_data_dir, crate::storage::LOSSY_PARKS.0);
+        let stored = std::fs::read(&parks)?;
+        std::fs::write(&parks, b"not json")?;
+        assert!(Database::with_config(Arc::clone(&cfg)).await?.lossy_refusals.is_empty(), "a corrupt park record loads as no park");
+        std::fs::write(&parks, stored)?;
+        let db = Arc::new(Database::with_config(Arc::clone(&cfg)).await?);
+        // Past the unit's journaled retry backoff, inside the 1 h park: only the park holds it.
+        crate::support::advance_micros(LOSSY_PARK_MICROS / 2);
+        assert_eq!(tick(&db).await?, (1, (2, 1)), "a restart must not re-stage the refused set");
+
+        // Re-masking an input changes it, so the persisted park no longer holds it back.
+        insert(&db, vec![test_span_ts("other", "newer", &project_id, noon + 1)]).await?;
+        dedup_unified(&db).await?;
+        assert_eq!(tick(&db).await?.0, 2, "the changed set is attempted (and refused again)");
         FORCE_LOSSY_REWRITE.store(0, Relaxed);
-        crate::support::advance_micros(LOSSY_PARK_MICROS);
-        assert_eq!(tick().await?, (1, (1, 0)), "once the park lapses the pack lands");
+        crate::support::advance_micros(LOSSY_PARK_MICROS << 1);
+        let mut last = (0, (0, 0));
+        for _ in 0..4 {
+            last = tick(&db).await?;
+        }
+        assert_eq!(last, (2, (1, 0)), "once the parks lapse the pack lands");
         Ok(())
     }
 
