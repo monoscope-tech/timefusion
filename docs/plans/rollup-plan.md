@@ -137,7 +137,7 @@ Done items carry evidence (commit or number). Open items carry the next action, 
       (~48 KB per output row), state split, coarsening cap, v4 sibling prior, state waiter (`06727291`).
 - [x] Packed repairs: deleted (`f62fb4ae`, on-or-delete policy). `rollup_escalated_*` counters measure what
       the escalations cost; revisit only if they show a large lane.
-- [ ] `ws/recovery-adopt-v2` (`3ff9bb66`): deprioritized (~4 requeues per restart). Decide finish or drop.
+- [x] `ws/recovery-adopt-v2`: dropped 09-30 (~4 requeues per restart, not worth the code); kept in `tf-helper-scripts/timefusion-sweep-2026-09-30.bundle`.
 
 ### Stage 1: measurement and repeated work
 
