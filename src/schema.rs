@@ -242,8 +242,10 @@ impl RollupSpec {
                     (_, Some(c)) => src_field(c)?.data_type,
                     (a, None) => anyhow::bail!("rollup {target}: `{a}` measure `{}` needs a source column", m.name),
                 };
-                // A measure over an empty group is NULL, and count is never NULL.
-                Ok(plain(&m.name, &ty, m.agg != "count"))
+                // Nullable even for count: a derived tier SUMs a base count column
+                // that cells predating the measure lack, and NULL (unproven, and
+                // excluded from `TAG_MEASURES`) is the only honest value there.
+                Ok(plain(&m.name, &ty, true))
             }))
             .collect::<anyhow::Result<Vec<_>>>()?;
         Ok(TableSchema {

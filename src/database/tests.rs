@@ -95,7 +95,16 @@ async fn a_tier_that_predates_a_measure_is_widened_to_hold_it() {
     let spec = source.rollups.first().expect("declared rollup");
     const MEASURE: &str = "duration_digest";
     let declared = get_schema(&spec.table_name("otel_logs_and_spans")).expect("tier schema");
-    let narrow: Vec<_> = declared.columns().expect("tier columns").into_iter().filter(|column| column.name() != MEASURE).collect();
+    // `request_count` NOT NULL, as every count measure was declared before a derived
+    // SUM over cells predating a measure could make one NULL.
+    const COUNT: &str = "request_count";
+    let narrow: Vec<_> = declared
+        .columns()
+        .expect("tier columns")
+        .into_iter()
+        .filter(|column| column.name() != MEASURE)
+        .map(|column| if column.name() == COUNT { deltalake::kernel::StructField::new(COUNT, column.data_type().clone(), false) } else { column })
+        .collect();
 
     let dir = tempfile::tempdir().expect("tempdir");
     let table = deltalake::operations::create::CreateBuilder::new()
@@ -118,8 +127,11 @@ async fn a_tier_that_predates_a_measure_is_widened_to_hold_it() {
         "a measure the physical tier lacks is not materializable"
     );
 
-    assert_eq!(evolve_table_columns(&table, &fields).await.expect("widen"), vec![MEASURE.to_owned()]);
+    let count_nullable = |table: &DeltaTable| table.snapshot().expect("snapshot").schema().field(COUNT).expect("count column").is_nullable();
+    assert!(!count_nullable(&*table.read().await));
+    assert_eq!(evolve_table_columns(&table, &fields).await.expect("widen"), vec![COUNT.to_owned(), MEASURE.to_owned()]);
     assert!(stored(&*table.read().await), "the tier must gain the declared measure");
+    assert!(count_nullable(&*table.read().await), "a stored NOT NULL measure must be relaxed, or the writer refuses a derived NULL");
     assert!(
         crate::rollup::materialized_measures(spec, false, &present, declared.schema_ref().as_ref(), None).contains(&MEASURE.to_owned()),
         "once the column exists the measure is materializable, so TAG_MEASURES records it"
@@ -1294,7 +1306,7 @@ async fn a_partly_covered_window_is_exact_and_counts_a_measure_decline_once() ->
         // The strip retags files without rewriting their generation column, so a stripped
         // cell must never be read: it happens only before the query whose measure it strips.
         if declines > 0 {
-            strip_rollup_measure(&db, &project, days[2], "duration_digest", Some("otel_logs_and_spans_rollup_dashboard_1m_v4")).await?;
+            strip_rollup_measure(&db, &project, days[2], "duration_digest", Some("otel_logs_and_spans_rollup_dashboard_1m_v4"), false).await?;
         }
         let sql = format!("SELECT time_bucket('1 hours', timestamp) AS tb, {select} FROM otel_logs_and_spans WHERE {window} GROUP BY 1 ORDER BY 1");
         let (hits_before, declines_before) = (hits(), load(&stats().rollup_miss_measure_not_stored));
@@ -1393,7 +1405,9 @@ fn append_op(partitioned: bool) -> deltalake::protocol::DeltaOperation {
 
 /// Model a materialization that predates `measure`: drop it from the tier's measure
 /// tags, restamp the generation to match, and recover through the real tag path.
-async fn strip_rollup_measure(db: &Database, project: &str, day: chrono::NaiveDate, measure: &str, tier: Option<&str>) -> Result<()> {
+/// `drop_column` also removes it from the files, the tier column made nullable as
+/// `evolve_table_columns` adds it — so Delta null-fills it on read, as for a real legacy cell.
+async fn strip_rollup_measure(db: &Database, project: &str, day: chrono::NaiveDate, measure: &str, tier: Option<&str>, drop_column: bool) -> Result<()> {
     use crate::maintenance_coordinator::{TAG_GENERATION, TAG_MEASURES, TAG_PROJECT, TAG_SLICE_START};
     use deltalake::kernel::Action;
     use object_store::ObjectStoreExt as _;
@@ -1418,13 +1432,44 @@ async fn strip_rollup_measure(db: &Database, project: &str, day: chrono::NaiveDa
             actions.push(Action::Remove(remove_for_add(&add, false)));
             // A distinct path: a Remove/Add pair for one path can be replayed as a removal.
             let path = format!("{}-fixture.parquet", add.path.trim_end_matches(".parquet"));
-            store.copy(&deltalake::Path::from(add.path.clone()), &deltalake::Path::from(path.clone())).await?;
+            if drop_column {
+                use datafusion::parquet::arrow::{ArrowWriter, ProjectionMask, arrow_reader::ParquetRecordBatchReaderBuilder};
+                let bytes = store.get(&deltalake::Path::from(add.path.clone())).await?.bytes().await?;
+                let reader = ParquetRecordBatchReaderBuilder::try_new(bytes)?;
+                let keep = reader.schema().fields().iter().enumerate().filter(|(_, field)| field.name() != measure).map(|(index, _)| index);
+                let mask = ProjectionMask::roots(reader.parquet_schema(), keep);
+                let reader = reader.with_projection(mask).build()?;
+                let mut writer = ArrowWriter::try_new(Vec::new(), arrow::record_batch::RecordBatchReader::schema(&reader), None)?;
+                for batch in reader {
+                    writer.write(&batch?)?;
+                }
+                let rewritten = writer.into_inner()?;
+                add.size = i64::try_from(rewritten.len())?;
+                store.put(&deltalake::Path::from(path.clone()), rewritten.into()).await?;
+                let mut stats: serde_json::Value = serde_json::from_str(add.stats.as_deref().expect("fixture stats"))?;
+                stats.as_object_mut().expect("stats object").values_mut().filter_map(serde_json::Value::as_object_mut).for_each(|per_column| {
+                    per_column.remove(measure);
+                });
+                add.stats = Some(stats.to_string());
+            } else {
+                store.copy(&deltalake::Path::from(add.path.clone()), &deltalake::Path::from(path.clone())).await?;
+            }
             add.path = path;
             add.data_change = false;
             actions.push(Action::Add(add));
         }
         if actions.is_empty() {
             continue;
+        }
+        if drop_column {
+            let field = get_schema(&spec.table_name(source)).expect("tier schema").schema_ref().field_with_name(measure)?.clone().with_nullable(true);
+            let relaxed = tier.read().await.clone();
+            let relaxed = relaxed
+                .write(vec![RecordBatch::new_empty(Arc::new(arrow_schema::Schema::new(vec![field])))])
+                .with_save_mode(deltalake::protocol::SaveMode::Append)
+                .with_schema_mode(deltalake::operations::write::SchemaMode::Merge)
+                .await?;
+            *tier.write().await = relaxed;
         }
         commit_to(&tier, actions, append_op(false)).await?;
         assert_eq!(live_adds(&tier).await.len(), file_count, "retagging preserves every fixture file");
@@ -1501,7 +1546,7 @@ async fn a_date_that_cannot_prove_its_digest_falls_to_the_raw_fringe() -> Result
 
     // The older day's cells lose their proof: the column declared before any file carried it.
     let stripped = days[0].to_string();
-    strip_rollup_measure(&db, &project, days[0], DIGEST, None).await?;
+    strip_rollup_measure(&db, &project, days[0], DIGEST, None, false).await?;
 
     let misses = || crate::observability::maintenance_stats().rollup_miss_measure_not_stored.load(std::sync::atomic::Ordering::Relaxed);
     for (index, select) in shapes.iter().enumerate() {
@@ -1516,7 +1561,7 @@ async fn a_date_that_cannot_prove_its_digest_falls_to_the_raw_fringe() -> Result
 
     // TOTAL decline: strip the digest from the sibling day too, so NO date can prove it.
     {
-        strip_rollup_measure(&db, &project, days[1], DIGEST, None).await?;
+        strip_rollup_measure(&db, &project, days[1], DIGEST, None, false).await?;
         let total = route(&db, sql(&shapes[1], true)).await;
         let reason = total.expect_err("no date can prove the digest, so nothing may route").to_string();
         assert!(reason.contains(crate::rollup::MissReason::MeasureNotStored.label()), "a TOTAL measure decline must report measure_not_stored — got {reason}");
@@ -1546,7 +1591,7 @@ async fn the_census_remints_a_cell_published_before_a_measure_was_declared() -> 
         db.insert_records_batch(&project, "otel_logs_and_spans", vec![json_to_batch(vec![row])?], true, None).await?;
     }
     db.run_unit_once("otel_logs_and_spans", &project, day, Operation::BaseRollup, 24, 0, Some(TIER)).await?;
-    strip_rollup_measure(&db, &project, day, MEASURE, Some(TIER)).await?;
+    strip_rollup_measure(&db, &project, day, MEASURE, Some(TIER), false).await?;
     db.mark_replay_complete();
     retire_all_tasks(&db);
 
@@ -1582,6 +1627,62 @@ async fn the_census_remints_a_cell_published_before_a_measure_was_declared() -> 
     );
     let routed = db.rollup_sql(&plan, &state).await.map_err(|reason| anyhow::anyhow!("declined: {}", reason.label()))?.expect("the re-minted cell routes");
     assert!(routed_days(&routed.ticket).contains(&day.to_string()), "the re-minted day must be read from the tier");
+    Ok(())
+}
+
+/// A derived cell over base cells whose files predate a COUNT measure SUMs a
+/// null-filled column to NULL. It must publish WITHOUT the measure — not fail the
+/// unit (prod quarantined 66 `dashboard_1h_v3` units on "Column 'rum_pageview_count'
+/// is declared as non-nullable but contains null values"), and not claim a 0.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_derived_cell_over_base_cells_predating_a_count_measure_publishes_without_it() -> Result<()> {
+    use crate::maintenance_coordinator::{Operation, TaskState};
+    const MEASURE: &str = "rum_pageview_count";
+    const BASE: &str = "otel_logs_and_spans_rollup_dashboard_1m_v4";
+    const DERIVED: &str = "otel_logs_and_spans_rollup_dashboard_1h_v3";
+    let db = Arc::new(Database::with_config(rollup_backfill_config("derived-null-measure", 35)).await?);
+    db.cancel_maintenance();
+    let project = format!("nullmeas_{}", uuid::Uuid::new_v4().simple());
+    let day = (Utc::now() - chrono::Duration::days(3)).date_naive();
+    for (hour, name) in [(1, "Pageview /home"), (7, "op"), (13, "Pageview /cart"), (19, "op")] {
+        let at = day.and_hms_opt(hour, 0, 0).expect("hour").and_utc().timestamp_micros();
+        let row = serde_json::json!({
+            "timestamp": at, "id": format!("h{hour}"), "name": name, "project_id": project, "hashes": [],
+            "summary": ["null measure fixture"], "date": day.to_string(), "duration": 100 + hour, "kind": "client", "status_code": "OK",
+        });
+        db.insert_records_batch(&project, "otel_logs_and_spans", vec![json_to_batch(vec![row])?], true, None).await?;
+    }
+    db.run_unit_once("otel_logs_and_spans", &project, day, Operation::BaseRollup, 24, 0, Some(BASE)).await?;
+    strip_rollup_measure(&db, &project, day, MEASURE, Some(BASE), true).await?;
+
+    let derived = db.run_unit_once("otel_logs_and_spans", &project, day, Operation::DerivedRollup, 24, 0, Some(DERIVED)).await?;
+    assert_eq!(derived.state, Some(TaskState::Complete), "a base cell lacking a measure must not fail the derived unit: {:?}", derived.retry_reason);
+    let published = slice_measures(&db, &project, Some(DERIVED));
+    assert!(
+        !published.is_empty() && published.iter().all(|held| held.as_ref().is_some_and(|names| !names.contains(MEASURE) && names.contains("request_count"))),
+        "the derived cell holds only what every base cell proved: {published:?}"
+    );
+
+    let lo = midnight_micros(day);
+    let sql = |filter: &str| {
+        format!(
+            "SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = '{project}' AND timestamp >= to_timestamp_micros({lo}) \
+             AND timestamp < to_timestamp_micros({}){filter}",
+            lo + crate::maintenance_coordinator::DAY_MICROS
+        )
+    };
+    let mut ctx = Arc::clone(&db).create_session_context();
+    db.setup_session_context(&mut ctx)?;
+    let state = ctx.state();
+    let route = async |sql: &str| db.rollup_sql(&state.optimize(&state.create_logical_plan(sql).await.expect("parse")).expect("optimize"), &state).await;
+    let count = async |sql: &str| anyhow::Ok(first_i64(ctx.sql(sql).await?.collect().await?[0].column(0)));
+
+    let rum = sql(" AND (name LIKE 'Pageview %' OR name = 'documentLoad')");
+    assert_eq!(route(&rum).await.err(), Some(crate::rollup::MissReason::MeasureNotStored), "no cell proves the measure, so the RUM count must decline");
+    assert_eq!(count(&rum).await?, Some(2), "and its raw fallback counts the two pageviews");
+    let all = route(&sql("")).await.map_err(|reason| anyhow::anyhow!("declined: {}", reason.label()))?.expect("a count needing no RUM measure keeps routing");
+    assert_eq!(all.ticket.tier(), DERIVED, "the derived cell must serve it");
+    assert_eq!(count(&all.sql).await?, Some(4), "and agree with the four raw rows");
     Ok(())
 }
 
@@ -1869,7 +1970,7 @@ async fn a_derived_cell_cannot_claim_a_measure_its_base_never_proved() -> Result
         slice_measures(&db, &project, Some(base_tier.as_str())).iter().all(|held| held.as_ref().is_some_and(|held| held.contains(DIGEST))),
         "fresh base proves the digest"
     );
-    strip_rollup_measure(&db, &project, day, DIGEST, None).await?;
+    strip_rollup_measure(&db, &project, day, DIGEST, None, false).await?;
     db.run_unit_once("otel_logs_and_spans", &project, day, Operation::DerivedRollup, 4, 20, None).await?;
 
     let published = slice_measures(&db, &project, Some(derived_tier.as_str()));

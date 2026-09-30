@@ -7014,9 +7014,13 @@ pub(crate) fn table_ordering(table_name: &str, out: &SchemaRef, sorted: bool) ->
 /// Added fields are forced NULLABLE: `Merge` cannot add a NOT NULL column to a
 /// table that already has rows, and readers null-fill a column a file lacks.
 pub(crate) async fn evolve_table_columns(table_ref: &Arc<RwLock<DeltaTable>>, want: &arrow_schema::Fields) -> Result<Vec<String>> {
-    let stored: HashSet<String> = { table_ref.read().await.snapshot()?.schema().fields().map(|f| f.name().to_string()).collect() };
-    let missing: Vec<arrow_schema::FieldRef> =
-        want.iter().filter(|f| !stored.contains(f.name())).map(|f| Arc::new(f.as_ref().clone().with_nullable(true))).collect();
+    let stored: HashMap<String, bool> = { table_ref.read().await.snapshot()?.schema().fields().map(|f| (f.name().to_string(), f.is_nullable())).collect() };
+    // Also relaxes a stored NOT NULL the declaration made nullable: Merge ORs nullability.
+    let missing: Vec<arrow_schema::FieldRef> = want
+        .iter()
+        .filter(|f| stored.get(f.name()).is_none_or(|&nullable| !nullable && f.is_nullable()))
+        .map(|f| Arc::new(f.as_ref().clone().with_nullable(true)))
+        .collect();
     if missing.is_empty() {
         return Ok(Vec::new());
     }
@@ -7031,14 +7035,14 @@ pub(crate) async fn evolve_table_columns(table_ref: &Arc<RwLock<DeltaTable>>, wa
         .map_err(|e| anyhow::anyhow!("schema-merge commit failed: {e}"))?;
 
     // Re-read from the log rather than trusting the write.
-    let after: HashSet<String> = {
+    let after: HashMap<String, bool> = {
         let mut guard = table_ref.write().await;
         guard.load().await?;
-        guard.snapshot()?.schema().fields().map(|f| f.name().to_string()).collect()
+        guard.snapshot()?.schema().fields().map(|f| (f.name().to_string(), f.is_nullable())).collect()
     };
     let added: Vec<String> = missing.iter().map(|f| f.name().clone()).collect();
-    let still: Vec<&String> = added.iter().filter(|name| !after.contains(*name)).collect();
-    anyhow::ensure!(still.is_empty(), "schema merge committed but columns are still absent from the stored schema: {still:?}");
+    let still: Vec<&String> = added.iter().filter(|name| after.get(*name) != Some(&true)).collect();
+    anyhow::ensure!(still.is_empty(), "schema merge committed but columns are still absent or NOT NULL in the stored schema: {still:?}");
     Ok(added)
 }
 
