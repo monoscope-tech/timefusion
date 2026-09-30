@@ -200,7 +200,9 @@ Done items carry evidence (commit or number). Open items carry the next action, 
       W53 tantivy cache 400 GB, W55 `count(<expr>)` wrong-answer fix.
 - [x] W48 be87ebc1 slow warm: resolved by W44 + W51 (6.1 s cold → 0.7 s warm).
 - [x] `8184a638`: pgwire latency at stream end; one heavy slot per query; FLAG switch.
-- [ ] Byte admission for wide scans (FLAG `timefusion_query_scan_byte_admission`). ABBA 09-30 04:05–04:43 on the
+- [ ] Byte admission for wide scans (FLAG `timefusion_query_scan_byte_admission`). 09-30: the memory it was meant to
+      bound turned out to be tantivy installs, not scan decode (see Memory spikes). Decide after the fix is verified;
+      default is delete. ABBA 09-30 04:05–04:43 on the
       mixed sealed-day load (4 workers): the gate never queued (12,646 admitted, 0 queued; ~10 GB/h scanned, peak
       23.5 GiB), p99 0.78 s ON vs 0.83 s OFF. So it costs nothing when idle, but this load cannot show what it
       is for. Next: a ramp with the gate ON, 8/12/16 raw-scan workers under a 60 GiB watchdog (`abba/ramp`). Turn
@@ -269,9 +271,16 @@ Done items carry evidence (commit or number). Open items carry the next action, 
       `a_retired_corpse_goes_first_and_counts_as_progress`: "dedup masks only bins sealed 2 h; run after 03:00 UTC"),
       which blocks every signoff for 3 h a day. Pinning `support::set_micros` alone is not enough: some part of the dedup
       path still judges "sealed 2 h" by wall time. Find it, route it through the virtual clock, then pin the tests.
-- [ ] **Synthetic prod load OOM'd prod** (09-29 23:47, 16 workers of raw sealed-day scans; wide-scan decode memory is
-      outside the query pool). Before any heavy raw-scan experiment: enable `timefusion_query_scan_byte_admission` (FLAG)
-      and cap raw-shape workers at ≤4. Byte admission's A/B is next.
+- [ ] **Memory spikes / OOM — root cause found by a prod heap profile (09-30).** The 09-29 OOM and 09-30 spikes of
+      41–106 GB (also with no synthetic load, 07:00–07:07) were tantivy `ensure_cached` installing whole index blobs
+      in memory: `zstd::decode_all` 83.7 GB + `GetResult::bytes` 28.3 GB live, up to 32 installs at once, outside every
+      pool. Fixed in `fa75bbd3` (stream download → zstd → tar to disk, ≤4 installs, one download per blob), deployed
+      `7a259c3c` 07:53. Verify: realistic-mix load (60% today, 25% 7/14/30 d, 15% sealed; 4 workers) with no spike
+      past ~30 GB. Recipe: `TIMEFUSION_HEAP_PROFILE_ACTIVE=true` via `docker service update --env-add` (owner-approved;
+      a CapRover deploy resets it), `scratchpad/heapcatch/catch.sh`, `scratchpad/heapsym/sym.sh`.
+      Not the cause, all ruled out: DedupExec (absent from these plans), the deploy drain (178k rows, 1 s), byte admission.
+- [x] Whole-file GET on a bypassed miss of a ≤16 MB parquet file (`7a259c3c`): real but small (+3.5 → +1.5 GB locally).
+- [x] Realistic 4-min baseline before the fix (09-30 06:45): 330 queries, p50 0.69 s, p95 6.8 s, p99 15.1 s, 7 errors.
 
 ### Monoscope-owner decisions
 
