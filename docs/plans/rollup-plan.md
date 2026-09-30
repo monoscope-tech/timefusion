@@ -233,7 +233,8 @@ Done items carry evidence (commit or number). Open items carry the next action, 
 - [x] W28 `service_name_hll` unblocked (`e0e27dbe`).
 - [x] RUM measures on v4 (`180ced63`, `8bea392b`); measure re-mint backfill for older cells (`8184a638`, in progress).
 - [ ] RUM widgets (monoscope branch merged into `overnight-exploration-29-09`) route to v4 `rum_*` measures:
-      confirm hits in prod once the backfill re-mints historical cells. 09-30 04:20: the 7-day sealed Talstack
+      confirm hits in prod once the backfill re-mints historical cells. 09-30 09:15: after re-mint at 8/pass
+      (`dadf3311`, ~480/h) sealed Talstack page views route: 7d 0.88 s, 28d 2.2 s (were 3.4–4.2 s raw / 90 s timeout). 09-30 04:20: the 7-day sealed Talstack
       page-view query still runs raw (3.4–4.2 s, `measure_not_stored`). Re-mints run at 2 per pass, about 25–44
       per hour, so expect several more hours.
 - [ ] W12 `name` HLL (owner): add the unfiltered `name_hll` only if a daytime sample shows service-tab misses.
@@ -281,6 +282,14 @@ Done items carry evidence (commit or number). Open items carry the next action, 
       Not the cause, all ruled out: DedupExec (absent from these plans), the deploy drain (178k rows, 1 s), byte admission.
 - [x] Whole-file GET on a bypassed miss of a ≤16 MB parquet file (`7a259c3c`): real but small (+3.5 → +1.5 GB locally).
 - [x] Realistic 4-min baseline before the fix (09-30 06:45): 330 queries, p50 0.69 s, p95 6.8 s, p99 15.1 s, 7 errors.
+- [x] **Tantivy install fix verified** (`7a259c3c`, 09-30 08:04–08:34, 2,086 queries): anon peak 23.6 GB (was 41–106 GB spikes).
+- [x] **Hybrid raw legs ORed every gap into one scan** whose pruning hull spanned the whole window: Talstack 7d opened
+      2,500–4,150 tantivy indexes. One leg per gap (`dd89735c`): 110 indexes, 0.9–1.95 s warm (was 5.9–10.4 s).
+      Realistic mix (4 workers, 12 min) before → after: 898 → 2,556 queries, p95 7.3 → 2.2 s, p99 48 → 8.7 s,
+      timeouts 10 → 1, anon peak 24.8 GB.
+- [ ] Remaining tail: `count(*) … status_code='ERROR'` has 20–90 s outliers (p50 0.6–2 s), mostly sealed 24h windows.
+- [ ] Late RUM rows void a whole sealed day slice (09-29 day slice rebuilt 256×; one rebuild took 2,461 s while a sealed
+      consolidation overlapped; the 15-min rebuild deadline is not enforced). Options: hourly sealed slices, or accept.
 
 ### Monoscope-owner decisions
 
