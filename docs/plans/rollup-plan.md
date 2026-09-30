@@ -292,8 +292,13 @@ Done items carry evidence (commit or number). Open items carry the next action, 
       realistic mix p95 1.8 s, p99 2.6 s, 3,779 queries/12 min, anon peak 19.5 GB.
 - [x] Window-aware cap deployed (`3b8d42b2`, 11:04): in-window hits only. Did NOT remove the cold first-query cost:
       whale sealed 24h 7 d back 88.9 s cold / 1.85 s warm (8 d back 10.3 s / 1.95 s); unfiltered ~1 s.
-- [ ] Never block a query on cold index installs: skip the prefilter when its blobs are not local, warm them in the
-      background (`fix/prefilter-cold-skip`, in progress). Deploy after the 18:05 gate.
+- [x] Never block a query on cold index installs (`abe49d09`, deployed 11:51): cold → prefilter skipped, scan runs the
+      predicate, bounded background warm (≤2 permits, 64-deep queue). Whale sealed 24h ERROR count on untouched days:
+      1.97 s / 1.44 s cold (was 88.9 s / 10.3 s). First hour: 107 warms spawned, 155 dropped (queue full, by design).
+      Histogram readers (`histogram_reader`) still install cold indexes synchronously — not covered.
+- [ ] 09-30 decisions (owner): batch sealed-day rebuilds to ≤1/h per cell + enforce the rebuild deadline (in progress);
+      delete byte admission (in progress); heap profiling left OFF (recipe in memory); monoscope items handed to the
+      monoscope session (array_has lowering, issue-chart backoff, 10 s session-lookup timeout; hashes cadence unchanged).
 - [ ] Flaky: `kill_recovery::acked_rows_survive_sigkill_*` (multi_tenant, concurrent_writers) each retried once 09-30.
 - [ ] Flaky e2e: `recent_window_pruning::dv_bearing_file_keeps_parquet_pushdown_on_its_siblings` (1 retry in 0930e signoff).
 - [ ] Late RUM rows void a whole sealed day slice (09-29 day slice rebuilt 256×; one rebuild took 2,461 s while a sealed
