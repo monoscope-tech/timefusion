@@ -2278,6 +2278,66 @@ async fn an_expression_group_over_dimensions_matches_raw_for_every_measure_kind(
     Ok(())
 }
 
+/// A distinct count over a declared DIMENSION routes and equals raw, both as
+/// `count(DISTINCT d)` (DataFusion plans it as an aggregate over a group-by on
+/// `d`, and the inner group-by is what routes) and as an HLL sketch built from
+/// the tier's dimension values. NULLs sit in every dimension and rows in both
+/// legs of the hybrid; a non-dimension must still decline.
+#[serial]
+#[tokio::test]
+async fn a_distinct_count_over_a_dimension_routes_and_matches_raw() -> Result<()> {
+    let env = rollup_env("rollup_distinct_dims").await?;
+    let db = Arc::clone(&env.db);
+    db.cancel_maintenance();
+    timefusion::support::set_micros(env.midnight + 13 * 60 * 60_000_000);
+    let fixture = [
+        ("server", Some("OK"), None, Some("cart")),
+        ("server", Some("ERROR"), Some("error"), Some("cart")),
+        ("client", None, Some("info"), Some("checkout")),
+        ("client", None, None, None),
+        ("server", None, Some("error"), Some("cart")),
+        ("internal", Some("OK"), Some("info"), None),
+    ];
+    let row = |(kind, status, level, service): (&str, Option<&str>, Option<&str>, Option<&str>), i: usize| serde_json::json!({ "kind": kind, "status_code": status, "level": level, "resource___service___name": service, "name": format!("n{}", i % 2) });
+    for (i, fields) in fixture.iter().enumerate() {
+        env.insert_fields(&format!("y{i}"), env.yesterday_noon + 17 + i as i64 * 2_500_000_000, row(*fields, i)).await?;
+    }
+    assert!(env.certify_and_drain().await? > 0, "eligible yesterday slices must be drained");
+    // Only the raw leg sees these; `payments` and `warn` exist nowhere in the tier.
+    for (i, fields) in [("client", Some("ERROR"), Some("warn"), Some("payments")), fixture[3]].into_iter().enumerate() {
+        env.insert_fields(&format!("t{i}"), env.midnight + 5_000_000 + i as i64 * 1_500_000_000, row(fields, i)).await?;
+    }
+
+    let (window, ctx) = (env.window(), ctx_for(&db)?);
+    let (rows, services) =
+        delta_pair(&db, &format!("SELECT COUNT(*)::BIGINT, COUNT(DISTINCT resource___service___name)::BIGINT FROM otel_logs_and_spans WHERE {window}")).await?;
+    assert!(services > 1 && services < rows, "the fixture must repeat services, got {services} distinct over {rows} rows");
+    let show = |batches: Vec<RecordBatch>| {
+        let kept = batches.into_iter().filter(|b| b.num_rows() > 0).collect::<Vec<_>>();
+        assert!(!kept.is_empty(), "an empty answer makes the parity assertion vacuous");
+        datafusion::arrow::util::pretty::pretty_format_batches(&kept).expect("format").to_string()
+    };
+    for select in [
+        "count(DISTINCT resource___service___name) AS v FROM otel_logs_and_spans WHERE {window}",
+        "status_code, count(DISTINCT kind) AS v FROM otel_logs_and_spans WHERE {window} GROUP BY 1 ORDER BY 1",
+        "count(DISTINCT level) AS v FROM otel_logs_and_spans WHERE {window} AND kind = 'server'",
+        "time_bucket('1 hours', timestamp) AS tb, count(DISTINCT status_code) AS v FROM otel_logs_and_spans WHERE {window} GROUP BY 1 ORDER BY 1",
+        "distinct_count(approx_count_distinct(level)) AS v FROM otel_logs_and_spans WHERE {window}",
+        "kind, distinct_count(approx_count_distinct(status_code)) AS v FROM otel_logs_and_spans WHERE {window} GROUP BY 1 ORDER BY 1",
+    ] {
+        let query = format!("SELECT {}", select.replace("{window}", &window));
+        let routed = show(routed_any(&ctx, &query, "a distinct count over a dimension must route").await?);
+        assert_eq!(routed, show(db.query_delta_only(&query).await?), "the routed answer must equal raw: {query}");
+    }
+
+    let query = format!("SELECT count(DISTINCT name) AS v FROM otel_logs_and_spans WHERE {window}");
+    let hits = any_rollup_hits();
+    let answer = show(ctx.sql(&query).await?.collect().await?);
+    assert_eq!(any_rollup_hits(), hits, "a distinct count over a non-dimension must not route");
+    assert_eq!(answer, show(db.query_delta_only(&query).await?));
+    Ok(())
+}
+
 /// The base (1-minute) and derived (1-hour) dashboard tiers.
 const TIER_1M: &str = "otel_logs_and_spans_rollup_dashboard_1m_v4";
 const TIER_1H: &str = "otel_logs_and_spans_rollup_dashboard_1h_v3";

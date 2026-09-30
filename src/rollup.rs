@@ -399,6 +399,10 @@ pub(crate) enum Merge {
     /// A distinct-count sketch. Like `TDigest`, the query's output IS the folded
     /// state; `distinct_count` reads the number out of it above the aggregate.
     Hll,
+    /// A sketch built on the tier's copy of a DIMENSION rather than read from a
+    /// stored measure. A sketch ignores multiplicity, so the tier's rows (one per
+    /// value present) sketch to exactly the raw one.
+    DimensionHll,
     /// Earliest value in the window. Two states — value and the timestamp of the
     /// row it came from — since "earliest" is not recoverable from the value alone.
     First,
@@ -417,7 +421,7 @@ impl Merge {
             Self::Min => "MIN",
             Self::Max => "MAX",
             Self::TDigest => "tdigest_merge",
-            Self::Hll => "hll_merge",
+            Self::Hll | Self::DimensionHll => "hll_merge",
             // Exhaustive on purpose: a new state-carrying variant must name its
             // operator rather than silently folding with SUM.
             Self::Count | Self::Sum | Self::Avg | Self::First => "SUM",
@@ -433,6 +437,7 @@ impl Merge {
             // Same `arity()` contract `sql` enforces: folding a mis-arity First into SUM would
             // silently produce a different aggregate.
             (Self::First, _) => unreachable!("first needs (value, companion), got {}", columns.len()),
+            (Self::DimensionHll, _) => columns.iter().map(|column| format!("hll_agg({column})")).collect(),
             _ => columns.iter().map(|column| format!("{}({column})", self.partial_op())).collect(),
         }
     }
@@ -447,13 +452,18 @@ impl Merge {
                 format!("CASE WHEN COALESCE(SUM({count}), 0) = 0 THEN CAST(NULL AS DOUBLE) ELSE CAST(SUM({sum}) AS DOUBLE) / CAST(SUM({count}) AS DOUBLE) END")
             }
             // Single-state variants fold with the same operator the rollup leg used.
-            (Self::Sum | Self::Min | Self::Max | Self::TDigest | Self::Hll, [state]) => format!("{}({state})", self.partial_op()),
+            (Self::Sum | Self::Min | Self::Max | Self::TDigest | Self::Hll | Self::DimensionHll, [state]) => format!("{}({state})", self.partial_op()),
             // `NULLS LAST`: a leg that matched nothing contributes a NULL pair
             // and must lose to any leg that matched something.
             (Self::First, [value, at]) => format!("first_value({value} ORDER BY {at} NULLS LAST)"),
             // `arity()` fixes the state count per variant.
             _ => unreachable!("merge {self:?} built with {} states", states.len()),
         }
+    }
+
+    /// The answer straight off tier rows, when the rollup owns the whole window.
+    fn rollup_sql(self, columns: &[String]) -> String {
+        if self == Self::DimensionHll { self.partial_states(columns).concat() } else { self.sql(columns) }
     }
 }
 
@@ -1069,7 +1079,11 @@ impl RoutedRollup {
     /// Every tier column this rewrite reads a state out of, the `HAVING` guard
     /// included — a cell missing the guard drops groups, not just a column.
     pub(crate) fn needed_measure_columns(&self) -> impl Iterator<Item = &str> {
-        self.measures.iter().chain(self.guard.iter()).flat_map(|measure| measure.measures.iter().map(String::as_str))
+        self.measures
+            .iter()
+            .chain(self.guard.iter())
+            .filter(|measure| measure.merge != Merge::DimensionHll)
+            .flat_map(|measure| measure.measures.iter().map(String::as_str))
     }
 
     /// Whether a cell whose materialized measures are `have` may serve this
@@ -1155,7 +1169,7 @@ impl RoutedRollup {
                 .groups
                 .iter()
                 .map(|(expression, alias)| format!("{expression} AS {}", quoted(alias)))
-                .chain(self.measures.iter().map(|measure| format!("{} AS {}", measure.merge.sql(&measure.measures), quoted(&measure.alias))))
+                .chain(self.measures.iter().map(|measure| format!("{} AS {}", measure.merge.rollup_sql(&measure.measures), quoted(&measure.alias))))
                 .join(", ");
             let row_filters = self.row_filters.iter().map(|filter| format!(" AND ({filter})")).collect::<String>();
             let group_by = self.group_by();
@@ -1643,9 +1657,15 @@ async fn measure_filters<'a>(
 /// The outermost `Aggregate`, wherever the optimizer put it. Nothing above it is
 /// inspected or rebuilt — the rewrite is substituted in place. Do not match a
 /// fixed grammar of parent nodes; the shape above depends on the analyzer rules.
+///
+/// An aggregate directly over another never reaches the scan, so the inner one is
+/// matched: that is how `count(DISTINCT d)` plans (an outer `count` over a
+/// group-by on `d`), and the group-by is what the rollup can answer.
 fn outermost_aggregate(plan: &datafusion::logical_expr::LogicalPlan) -> Option<&datafusion::logical_expr::LogicalPlan> {
+    use datafusion::logical_expr::LogicalPlan;
     match plan {
-        datafusion::logical_expr::LogicalPlan::Aggregate(_) => Some(plan),
+        LogicalPlan::Aggregate(aggregate) if matches!(aggregate.input.as_ref(), LogicalPlan::Aggregate(_)) => outermost_aggregate(&aggregate.input),
+        LogicalPlan::Aggregate(_) => Some(plan),
         plan => plan.inputs().into_iter().find_map(outermost_aggregate),
     }
 }
@@ -2096,7 +2116,13 @@ async fn route_with_spec(
                 "percentile_agg" => (Merge::TDigest, one("tdigest")),
                 // Like `percentile_agg`: the aggregate yields the STATE and the
                 // scalar reading a number out of it sits above, untouched.
-                "hll_agg" => (Merge::Hll, one("hll")),
+                "hll_agg" => match (one("hll"), column) {
+                    // No stored sketch, but over an unfiltered dimension the tier's values rebuild it.
+                    (None, Some(column)) if filter.is_empty() && is_dimension(&column) => {
+                        return Ok(RoutedMeasure { alias, merge: Merge::DimensionHll, raw: vec![format!("hll_agg({column})")], measures: vec![column] });
+                    }
+                    (resolved, _) => (Merge::Hll, resolved),
+                },
                 // A PAIR like `avg`: the stored value plus the companion
                 // `min(timestamp)` saying which row it came from. Declines under a
                 // null guard — the guard reaches neither leg and `first_value`
@@ -3283,6 +3309,23 @@ mod tests {
         for unwanted in absent {
             assert!(!generated.contains(unwanted), "`{unwanted}` must not reach the rewrite: {generated}");
         }
+    }
+
+    /// A distinct count over a dimension reads the tier's dimension values and no
+    /// stored measure, in both rewrite shapes: `count(DISTINCT)` through the inner
+    /// group-by DataFusion plans it as, the sketch rebuilt with `hll_agg`.
+    #[test_case::test_case("status_code, count(DISTINCT kind)", "SELECT status_code AS \"status_code\", kind AS \"alias1\" FROM" ; "count distinct")]
+    #[test_case::test_case("status_code, distinct_count(approx_count_distinct(level))", "hll_agg(level) AS" ; "dimension sketch")]
+    #[tokio::test]
+    async fn a_distinct_count_over_a_dimension_reads_the_tier_without_a_measure(select: &str, want: &str) {
+        let state = session().await;
+        let sql = format!("SELECT {select} FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW} GROUP BY 1");
+        let route = route_for(&state, &sql).await.expect("match").expect("a dimension's distinct count must route");
+        assert!(route.measures_available(Some(&HashSet::new())), "no stored measure may be required: {:?}", route.measures);
+        let (_, single) = assert_substitutes(&state, &sql, None).await;
+        assert!(single.contains(want) && single.contains("_rollup_dashboard_1m_v4"), "`{want}` must read the tier: {single}");
+        let (_, hybrid) = assert_substitutes(&state, &sql, Some(WIDE_HORIZON)).await;
+        assert!(hybrid.contains("UNION ALL"), "the hybrid shape must union a raw leg: {hybrid}");
     }
 
     /// A guarded count beside a percentile: the match level resolves both states
