@@ -348,6 +348,11 @@ Where cost and slowness come from:
   rebuild waves of 6297304f ran 59 min apart (14:29: 49 units, 15:28: 67). Lease on cells built ≥2× in 2 h: v4 874
   of 2,267 s, sessions 458 of 564 s; the whale's 12:00 hour alone was 63% of sessions lease. Next levers: the
   re-arm source and per-cell v4 cost (131/409 v4 cell reads repeat another cell's `(input_fp, hour)`) — unmeasured.
+  **Re-arm source found and fixed (`dfb0701a`, deployed 16:56):** each wave was ONE late row. A flush writing a late
+  row with current rows produces a file whose min/max stats span every hour between them; the per-minute cursor
+  reconcile turned that span into a re-arm of every cell in it (~6 of 42 cells actually held rows). The two waves
+  were 70% of Talstack's v4 run time in the window. Flushed files now carry `timefusion.dirty_cells` (the cells
+  their rows occupy) and the reconcile re-arms only those; untagged/rewrite files keep the old behaviour.
 
 - **Masks on today's partition** (all 214 DV bitmaps decoded): ~57–62% of masked rows are exact duplicates TF
   made. An UPDATE/DELETE during a flush commit left the bucket dirty, and the whole bucket was re-flushed
