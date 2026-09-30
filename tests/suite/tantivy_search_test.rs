@@ -741,3 +741,24 @@ async fn an_over_cap_predicate_is_refused_without_searching_again() {
     let node = timefusion::tantivy::udf::PredNode::Leaf(TextMatchPred { column: "id".into(), query: "id-7".into() });
     assert_eq!(env.search.search_with_stats(env.table, env.project, &node, 10, None).await.unwrap().expect("usable").hits.len(), 1);
 }
+
+/// Prod 2026-09-30: a sealed-day index spans the whole day, so a fringe leg over a few hours
+/// of a busy project overflowed the cap on the DAY's matches and discarded the search after
+/// downloading every blob. The cap must count only in-window matches.
+#[tokio::test]
+async fn a_busy_day_index_answers_a_window_whose_matches_fit_the_cap() {
+    let env = Env::prod("otel_logs_and_spans", "p-window-cap");
+    let rows: Vec<(i64, String, &str)> = (0..60).map(|i| (1_000_000 + i * 1_000, format!("id-{i}"), if i % 2 == 0 { "ERROR" } else { "INFO" })).collect();
+    let rows_ref: Vec<(i64, &str, &str)> = rows.iter().map(|(t, id, l)| (*t, id.as_str(), *l)).collect();
+    env.publish(&rows_ref, &["busy-uri"]).await;
+    let error = level_error_node();
+    let search = |range| env.search.search_detailed(env.table, env.project, &error, 10, range);
+
+    assert_eq!(search(None).await.unwrap().err(), Some("delta_cap_exceeded_one_index"), "30 whole-day matches overflow a cap of 10");
+    let (lo, hi) = (1_010_000, 1_019_000);
+    let r = search(Some((lo, hi))).await.unwrap().expect("the window holds 5 matches, under the cap");
+    let mut hits: Vec<_> = r.hits.iter().map(|h| (h.timestamp_micros, h.id.clone())).collect();
+    hits.sort();
+    assert_eq!(hits, [10, 12, 14, 16, 18].map(|i| (1_000_000 + i * 1_000, format!("id-{i}"))), "exactly the window's matches");
+    assert_eq!(r.indexed_rows, 10, "selectivity must be judged against the window's rows, not the day's");
+}

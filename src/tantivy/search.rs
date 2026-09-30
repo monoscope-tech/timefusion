@@ -9,6 +9,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
+    ops::Bound,
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -101,7 +102,7 @@ impl Drop for TimedPhase<'_> {
 #[derive(Debug)]
 pub struct SearchResult {
     pub hits: Vec<Hit>,
-    /// Rows covered by queried manifest entries.
+    /// In-window rows covered by queried manifest entries.
     pub indexed_rows: u64,
     /// Files covered by every successful entry, including time-pruned entries.
     pub covered_files: HashSet<String>,
@@ -158,10 +159,11 @@ pub struct TantivySearchService {
     install_permits: Arc<tokio::sync::Semaphore>,
     /// Per-dir install lock: concurrent misses on one blob fetch it once.
     installing: DashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>,
-    /// Predicates whose search recently overflowed `max_hits`. The cap counts whole-index
-    /// hits, so a common value (`status_code = 'ERROR'`) overflows on every query of a
-    /// busy project — after paying for every cold blob download in the window.
-    cap_exceeded: DashMap<CapKey, Instant>,
+    /// Predicates whose search recently overflowed `max_hits`, with the narrowest window width
+    /// that did. A common value (`status_code = 'ERROR'`) overflows on every wide query of a
+    /// busy project — after paying for every cold blob download in the window — while a
+    /// narrower fringe window of the same predicate may still fit.
+    cap_exceeded: DashMap<CapKey, (Instant, u64)>,
 }
 
 type CapKey = (String, String, PredNode, usize);
@@ -304,6 +306,7 @@ impl TantivySearchService {
 
     /// Search every usable in-window index with ONE combined boolean query
     /// per index and union the hits (indexes cover disjoint row sets).
+    /// Hits, the cap and `indexed_rows` count only in-window docs.
     /// Aborts (returns `Ok(None)`) once cumulative hits exceed `max_hits` —
     /// the caller treats the result as "too noisy to push down" and falls
     /// back to full scan.
@@ -328,14 +331,16 @@ impl TantivySearchService {
         &self, table: &str, project_id: &str, node: &PredNode, max_hits: usize, time_range: Option<(i64, i64)>,
     ) -> Result<std::result::Result<SearchResult, &'static str>> {
         let cap_key: CapKey = (table.to_string(), project_id.to_string(), node.clone(), max_hits);
-        if self.cap_exceeded.get(&cap_key).is_some_and(|at| at.elapsed() < CAP_EXCEEDED_TTL) {
+        let width = time_range.map_or(u64::MAX, |(lo, hi)| hi.abs_diff(lo));
+        if self.cap_exceeded.get(&cap_key).is_some_and(|e| e.0.elapsed() < CAP_EXCEEDED_TTL && width >= e.1) {
             return Ok(Err("delta_cap_exceeded_memo"));
         }
         let cap_exceeded = |reason: &'static str| {
             if self.cap_exceeded.len() >= 4096 {
-                self.cap_exceeded.retain(|_, at| at.elapsed() < CAP_EXCEEDED_TTL);
+                self.cap_exceeded.retain(|_, e| e.0.elapsed() < CAP_EXCEEDED_TTL);
             }
-            self.cap_exceeded.insert(cap_key.clone(), Instant::now());
+            let mut e = self.cap_exceeded.entry(cap_key.clone()).or_insert((Instant::now(), width));
+            *e = (Instant::now(), if e.0.elapsed() < CAP_EXCEEDED_TTL { e.1.min(width) } else { width });
             Ok(Err(reason))
         };
         let m = self.load_manifest_cached(table, project_id).await?;
@@ -356,11 +361,14 @@ impl TantivySearchService {
         let covered_files: HashSet<String> = current().filter(|(_, e)| usable_entry(e)).flat_map(|(_, e)| e.covered_files.iter().cloned()).collect();
         // Time-prune: skip indexes whose timestamp span can't overlap the query
         // window (no blob download). Conservative on unknown bounds.
-        // Work item: (file_uuid, blob_path, rows, entry covered_files, ordinals_valid).
+        // Work item: (file_uuid, blob_path, rows, entry covered_files, ordinals_valid, window).
+        // `window` is set only when the entry's span sticks out of the query window.
         let work: Vec<_> = current()
             .filter_map(|(key, e)| {
                 let blob_path = e.index.as_ref().filter(|_| entry_overlaps(e.min_timestamp_micros, e.max_timestamp_micros, time_range))?;
-                Some((file_uuid(key).to_string(), blob_path.clone(), e.rows, e.covered_files.clone(), e.ordinals_valid && e.covered_files.len() == 1))
+                let window =
+                    time_range.filter(|&(lo, hi)| !(e.min_timestamp_micros.is_some_and(|m| m >= lo) && e.max_timestamp_micros.is_some_and(|m| m <= hi)));
+                Some((file_uuid(key).to_string(), blob_path.clone(), e.rows, e.covered_files.clone(), e.ordinals_valid && e.covered_files.len() == 1, window))
             })
             .collect();
 
@@ -370,7 +378,7 @@ impl TantivySearchService {
         SearchStats::add(&self.stats.indexes_searched, work.len() as u64);
         SearchStats::timed(&self.stats.plans, &self.stats.plan_us, plan_started);
         let _fanout = TimedPhase { count: &self.stats.fanouts, micros: &self.stats.fanout_us, started: Instant::now() };
-        let mut tasks = futures::stream::iter(work.into_iter().map(|(file_uuid, blob_path, rows, entry_covered, ordinals_valid)| async move {
+        let mut tasks = futures::stream::iter(work.into_iter().map(|(file_uuid, blob_path, rows, entry_covered, ordinals_valid, window)| async move {
             let prepare_started = Instant::now();
             let dir = self.ensure_cached(table, project_id, &file_uuid, &blob_path).await?;
             // The rest is synchronous, CPU-bound tantivy work that yields
@@ -383,6 +391,19 @@ impl TantivySearchService {
                     PredsQuery::MissingField => Some((None, rows, entry_covered, ordinals_valid)),
                     PredsQuery::Query(q) => {
                         let searcher = reader.searcher();
+                        // Match and count only in-window docs: a sealed-day index spans the whole
+                        // day, so its whole-index count overflows the cap for a few-hour fringe
+                        // of a busy project. Sound for the zero-hit/row-selection sets because
+                        // the window is a superset of the scan's own timestamp filter, and
+                        // merge-on-read versions share their row's timestamp.
+                        let (q, rows): (Box<dyn Query>, u64) = match window {
+                            None => (q, rows),
+                            Some((lo, hi)) => {
+                                let range: Box<dyn Query> = Box::new(RangeQuery::new_i64_bounds(TS_FIELD.into(), Bound::Included(lo), Bound::Included(hi)));
+                                let in_window = searcher.search(&*range, &tantivy::collector::Count).map_err(|e| anyhow!("window count: {e}"))?;
+                                (Box::new(BooleanQuery::new(vec![(Occur::Must, q), (Occur::Must, range)])), in_window as u64)
+                            }
+                        };
                         // Count-first: a per-index count over `max_hits` already
                         // forces the abort, so establish it with the cheap Count
                         // collector rather than materializing hits we'd discard.
@@ -910,7 +931,7 @@ mod tests {
 use tantivy::{
     Searcher, TantivyDocument, Term,
     collector::TopDocs,
-    query::{BooleanQuery, Occur, Query, QueryParser, TermQuery},
+    query::{BooleanQuery, Occur, Query, QueryParser, RangeQuery, TermQuery},
     schema::{Field, FieldType, IndexRecordOption, Value},
 };
 
