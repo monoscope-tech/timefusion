@@ -202,8 +202,11 @@ Done items carry evidence (commit or number). Open items carry the next action, 
       W53 tantivy cache 400 GB, W55 `count(<expr>)` wrong-answer fix.
 - [x] W48 be87ebc1 slow warm: resolved by W44 + W51 (6.1 s cold → 0.7 s warm).
 - [x] `8184a638`: pgwire latency at stream end; one heavy slot per query; FLAG switch.
-- [ ] Byte admission for wide scans (FLAG `timefusion_query_scan_byte_admission`): A/B running 09-30 04:05
-      (4 sealed-day workers, ABBA A=ON, watchdog stops at 80 GiB of 120). Verdict: on or delete.
+- [ ] Byte admission for wide scans (FLAG `timefusion_query_scan_byte_admission`). ABBA 09-30 04:05–04:43 on the
+      mixed sealed-day load (4 workers): the gate never queued (12,646 admitted, 0 queued; ~10 GB/h scanned, peak
+      23.5 GiB), p99 0.78 s ON vs 0.83 s OFF. So it costs nothing when idle, but this load cannot show what it
+      is for. Next: a ramp with the gate ON, 8/12/16 raw-scan workers under a 60 GiB watchdog (`abba/ramp`). Turn
+      it on by default if memory stays bounded and `scan_bytes_queued` rises; delete it if it never binds.
 - [ ] Remove W36 `split_sorted_runs` at the next DataFusion fork bump, after carrying sort info through
       `MemorySourceConfig::repartitioned` in the fork.
 
@@ -225,12 +228,14 @@ Done items carry evidence (commit or number). Open items carry the next action, 
 - [x] W29 v4 / `1h_v3` with `level`; v4-fallback relabel; `run-unit --tier`.
 - [x] v4 widening: 09-21 → 09-14 → 09-07 → `RESUME FROM 2026-08-29` (19:02, all 31 days).
 - [x] drop-v3 (`4319b951`): owner overrode the contiguity gate (queries older than 14 days are rare).
-- [ ] Confirm the v4 backfill completes: v4 contiguous days reach ~31 and `admission_refused_state_bytes_total` flattens.
+- [x] v4 backfill: contiguous days min/median 30/30 (09-30 04:07).
 - [ ] Re-rank residual cost once the backfill finishes (1B and 1C may matter for large units).
 - [x] W28 `service_name_hll` unblocked (`e0e27dbe`).
 - [x] RUM measures on v4 (`180ced63`, `8bea392b`); measure re-mint backfill for older cells (`8184a638`, in progress).
 - [ ] RUM widgets (monoscope branch merged into `overnight-exploration-29-09`) route to v4 `rum_*` measures:
-      confirm hits in prod once the backfill re-mints historical cells.
+      confirm hits in prod once the backfill re-mints historical cells. 09-30 04:20: the 7-day sealed Talstack
+      page-view query still runs raw (3.4–4.2 s, `measure_not_stored`). Re-mints run at 2 per pass, about 25–44
+      per hour, so expect several more hours.
 - [ ] W12 `name` HLL (owner): add the unfiltered `name_hll` only if a daytime sample shows service-tab misses.
 
 ### Sessions
@@ -240,7 +245,7 @@ Done items carry evidence (commit or number). Open items carry the next action, 
 - [x] W27 `sessions_1h_v2` resumed from 2026-09-22 (18:08).
 - [x] Land `test/rum-sessions-e2e` (`prepared_rum_sessions_use_browser_rollups_and_raw_edges`, passes) with the next deploy.
 - [ ] Confirm the RUM sessions query routes to `sessions_1h_v2` in prod on a mature process.
-- [x] Dropped `sessions_1h_v1` (`drop/sessions-1h-v1`); its durable pause is retired at boot with its queued work.
+- [x] Dropped `sessions_1h_v1` (`6c3e8b3b`, deployed 09-30 04:45); its durable pause is retired at boot with its queued work.
 
 ### Scheduler and ops
 
@@ -252,13 +257,17 @@ Done items carry evidence (commit or number). Open items carry the next action, 
 - [ ] W25 parts 2–3: the 4.9 s container create → start; CapRover's double service update (1.6 s per deploy).
 - [ ] Dependency advisories not closable by patch bumps: rustls-webpki 0.101 (AWS SDK), tokio-tar,
       tokio-postgres/postgres-types (0.2.14 breaks arrow-pg encoding).
+- [x] HotPacking "selected nothing" / 9 invariant violations were false alarms (a strip outranking a pair); now
+      `refused_cells` via `select_bin`, WARN only on a real refusal (`02f9f0a1`, `27440d30`). Ledger
+      disagreements are a boot burst (the ledger is written only at replay); seeded coverage is gated by the
+      same output + row checks as replay.
 - [ ] `ordering_pushdown::one_unsorted_file_does_not_cost_the_majority_its_ordering` e2e flakes under load
       (passes alone). Leave unless it blocks signoff.
 - [x] Old-process shutdown can panic in `buoyant_kernel_engine` executor (`RecvError`) after the WAL drained.
       Cause: cancelling maintenance dropped the maintenance runtime at once, under in-flight kernel IO. Fixed:
       that runtime now outlives `maintenance_tasks_tracker` (preload + dedup cron now tracked).
 
-- [ ] **Two DV-strip tests fail by design 00:00–03:00 UTC** (`rollup_noop_skip_tests::todays_dv_files_strip_under_a_live_rollup_slice`,
+- [x] **Two DV-strip tests fail by design 00:00–03:00 UTC** — fixed (`c2464d2a`): `compact.rs` seal gate + sweep dates read the virtual clock; tests pin tomorrow noon. (`rollup_noop_skip_tests::todays_dv_files_strip_under_a_live_rollup_slice`,
       `a_retired_corpse_goes_first_and_counts_as_progress`: "dedup masks only bins sealed 2 h; run after 03:00 UTC"),
       which blocks every signoff for 3 h a day. Pinning `support::set_micros` alone is not enough: some part of the dedup
       path still judges "sealed 2 h" by wall time. Find it, route it through the virtual clock, then pin the tests.
