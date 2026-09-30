@@ -252,6 +252,8 @@ Done items carry evidence (commit or number). Open items carry the next action, 
       shipbubble 0.7 s. 09-30 04:20: the 7-day sealed Talstack
       page-view query still runs raw (3.4–4.2 s, `measure_not_stored`). Re-mints run at 2 per pass, about 25–44
       per hour, so expect several more hours.
+- [x] `otel_metrics` dedup key widened to `[timestamp, metric_name, series_id]` (`132b98e7`; owner-approved; logical-count FORMAT_VERSION 3→4 rebuilds once).
+- [x] `log(x)` / `log(b,x)` returned NULL through pgwire: the plan cache lifted literals into untyped placeholders that DataFusion's `log` simplifier folded to NULL. Shapes whose placeholders fold away are now declined (`132b98e7`); prod now returns 12.2877… / 2.
 - [ ] W12 `name` HLL (owner): add the unfiltered `name_hll` only if a daytime sample shows service-tab misses. 09-30: owner OK with sampling first — do it during the day.
 
 ### Sessions
@@ -337,12 +339,12 @@ Done items carry evidence (commit or number). Open items carry the next action, 
 
 ### Monoscope-owner decisions
 
-- [ ] **Session lookup by `attributes___session___id = ANY($ids)`** — 09-30 owner decision: add an ENRICHMENT-ONLY column class (updates may only fill NULL/'' → value; monoscope only fills late session ids across a trace); 34 s is not acceptable. In progress (`schema/enrich-only-columns`). (~34 s over 16 h): the column is `mutable: true`,
+- [ ] **Session lookup by `attributes___session___id = ANY($ids)`** — 09-30 owner decision: add an ENRICHMENT-ONLY column class (updates may only fill NULL/'' → value; monoscope only fills late session ids across a trace); 34 s is not acceptable. Deployed `132b98e7` (23:00 UTC 09-30): `enrich_only` column class, UPDATEs may only fill NULL→value (others refused). First prod read: 16 h IN-lookup 10–22 s (was ~34 s); a sealed-day lookup still 9.8 s → pruning not yet effective on real data (being diagnosed). Known edge: span re-delivery or a hashes UPDATE racing the backfill can append an empty-session version — pruned and unpruned answers then differ (pre-existing lost update). (~34 s over 16 h): the column is `mutable: true`,
       so bloom, tantivy and stats pruning all refuse it (correctness gate). Options: (a) look up by an immutable key
       (`id`, `context___trace_id`); (b) add an "enrichment-only" column class (values only go NULL → set) that the
       pruners may trust; (c) two-phase key lookup. TF side shipped only OR-chain bloom pruning for immutable columns.
 
-- [ ] Pattern-tag `update2Sql` source fix (09-30: owner approved; being done on monoscope branch `tf/update2sql-and-edges`, PR, no deploy) (`BackgroundJobs.hs` ~2944): ~40% of today's masked rows are its
+- [x] Pattern-tag `update2Sql` source fix: measured on prod 09-30 — the statement already guards re-tagging (0 re-tags, 0 duplicates, 0 identity writes). Masked rows come from the one legit tag append landing AFTER its bucket flushed (92.5% of appends are retracted in memory). Lever proposed to owner: a ~90 s flush grace after a bucket closes. (`BackgroundJobs.hs` ~2944): ~40% of today's masked rows are its
       MoR versions, and it blocks certification.
 - [x] `array_has` lowering for `hashes` predicates (`monoscope/plans/array-has-lowering.md`, ~40x cheaper).
       Implemented on monoscope `tf-followups` (09-30); PR pending on the monoscope side.
@@ -350,7 +352,7 @@ Done items carry evidence (commit or number). Open items carry the next action, 
       Implemented on monoscope `tf-followups` (09-30); PR pending on the monoscope side.
 - [x] Add a timeout to the `Issues.hs:488-497` session lookup (`tryWithin Nothing`; stalls up to 77 s).
       Implemented on monoscope `tf-followups` (09-30); PR pending on the monoscope side.
-- [ ] Optional: compute `trace_count` in `rollupServiceEdges` without referencing `bucketed` twice (12 → 6 scans).
+- [x] Optional: compute `trace_count` in `rollupServiceEdges` (done in `rollupEndpointDependencyEdges`, monoscope PR #620: 48 → 24 scans, identical results) without referencing `bucketed` twice (12 → 6 scans).
 
 ### 2026-09-29/30 overnight log (condensed)
 
