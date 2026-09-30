@@ -252,6 +252,14 @@ Done items carry evidence (commit or number). Open items carry the next action, 
 - [ ] Old-process shutdown can panic in `buoyant_kernel_engine` executor (`RecvError`) after the WAL drained.
       Harmless at handoff; not fixed.
 
+- [ ] **Two DV-strip tests fail by design 00:00–03:00 UTC** (`rollup_noop_skip_tests::todays_dv_files_strip_under_a_live_rollup_slice`,
+      `a_retired_corpse_goes_first_and_counts_as_progress`: "dedup masks only bins sealed 2 h; run after 03:00 UTC"),
+      which blocks every signoff for 3 h a day. Pinning `support::set_micros` alone is not enough: some part of the dedup
+      path still judges "sealed 2 h" by wall time. Find it, route it through the virtual clock, then pin the tests.
+- [ ] **Synthetic prod load OOM'd prod** (09-29 23:47, 16 workers of raw sealed-day scans; wide-scan decode memory is
+      outside the query pool). Before any heavy raw-scan experiment: enable `timefusion_query_scan_byte_admission` (FLAG)
+      and cap raw-shape workers at ≤4. Byte admission's A/B is next.
+
 ### Monoscope-owner decisions
 
 - [ ] **Session lookup by `attributes___session___id = ANY($ids)`** (~34 s over 16 h): the column is `mutable: true`,
