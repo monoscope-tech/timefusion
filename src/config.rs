@@ -1955,8 +1955,9 @@ pub struct MaintenanceConfig {
     #[serde_inline_default(512)]
     pub timefusion_bloom_sidecar_files_per_pass: usize,
     /// Resident registry cap; sidecars beyond it are re-fetched on demand
-    /// (off the plan path — a miss only skips pruning for that query).
-    #[serde_inline_default(256)]
+    /// (off the plan path — a miss only skips pruning for that query). Sized for
+    /// compacted files carrying up to 4 MB of blooms each across a 30-day window.
+    #[serde_inline_default(768)]
     pub timefusion_bloom_registry_cap_mb: usize,
     /// Re-fetch a resident sidecar this often so entries built since the
     /// last load start pruning without a restart.
