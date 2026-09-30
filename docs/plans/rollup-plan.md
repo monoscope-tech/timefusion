@@ -287,7 +287,12 @@ Done items carry evidence (commit or number). Open items carry the next action, 
       2,500–4,150 tantivy indexes. One leg per gap (`dd89735c`): 110 indexes, 0.9–1.95 s warm (was 5.9–10.4 s).
       Realistic mix (4 workers, 12 min) before → after: 898 → 2,556 queries, p95 7.3 → 2.2 s, p99 48 → 8.7 s,
       timeouts 10 → 1, anon peak 24.8 GB.
-- [ ] Remaining tail: `count(*) … status_code='ERROR'` has 20–90 s outliers (p50 0.6–2 s), mostly sealed 24h windows.
+- [x] ERROR-count tail: the `status_code` tantivy prefilter overflowed its 2,000-hit cap on busy sealed-day indexes AFTER
+      downloading every cold blob (cold whale sealed 24h: 14.8 s vs 1.05 s unfiltered). Over-cap memo (`c122952c`):
+      realistic mix p95 1.8 s, p99 2.6 s, 3,779 queries/12 min, anon peak 19.5 GB.
+- [ ] Window-aware cap (`fix/prefilter-window-cap` `87ad5e49`, ready): count only in-window hits so fringe legs succeed;
+      removes the first-query cold cost. Deploy after the 18:05 gate.
+- [ ] Flaky e2e: `recent_window_pruning::dv_bearing_file_keeps_parquet_pushdown_on_its_siblings` (1 retry in 0930e signoff).
 - [ ] Late RUM rows void a whole sealed day slice (09-29 day slice rebuilt 256×; one rebuild took 2,461 s while a sealed
       consolidation overlapped; the 15-min rebuild deadline is not enforced). Options: hourly sealed slices, or accept.
 
