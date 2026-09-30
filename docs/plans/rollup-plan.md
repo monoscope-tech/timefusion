@@ -102,8 +102,12 @@ Done items carry evidence (commit or number). Open items carry the next action, 
 
 ### Gates and experiments
 
-- [ ] **Plan gate on a clean day.** Re-run after the v4 backfill settles and W58's strip debt drains.
-      No code push 12:00–18:00; run `gate0929.py`-style at 18:05. Must show the backlog falling.
+- [x] **Plan gate 09-30, 14:00–16:00** (`tf-helper-scripts/gate/gate0930.py`, every day compared over the same hours;
+      process `abe49d09`, last push 11:51). CPU-s per M rows: 21,079 (09-25) · 21,152 (09-27) · 4,629 (09-28) ·
+      8,555 (09-29) · **3,409** (09-30) — 2.5× below yesterday, 6.2× below baseline; cores 5.1; GB rewritten/M 7.9
+      (09-29 10.6, 09-27 127); lease-s/M 706 (995). Backlog first→last hour: base rollup 227→222, dedup 204→200,
+      due tasks 3→2 — FALLING (09-29 same hours: 303→328, 161→171 rising). Passed on direction; the decline is small
+      (4–5 tasks/2 h) and pending dedup is higher in absolute terms than 09-29. Re-check the evening trend on `f2017216`.
 - [x] **Experiment: query-latency yield** — deleted: A/B showed no benefit. ABBA/BAAB on prod 09-29
       20:01–21:55 UTC, 16 workers, ~57k queries: the yield engaged (ceiling 66 → 8) yet p95 B−A +0.24 s
       (CI −0.52…+1.00) and p99 +0.53 s (CI −0.28…+1.34) on a 4.95 s baseline. Query latency under load is
