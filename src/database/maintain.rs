@@ -4062,7 +4062,9 @@ impl Database {
             kernel::{Action, transaction::TableReference},
             protocol::{DeltaOperation, SaveMode},
         };
-        let actions: Vec<Action> = targets.iter().map(|add| Action::Remove(remove_for_add(add, true))).collect();
+        // data_change=false: no live row leaves, so the task reconcile must not read this
+        // span-less remove as "the whole day changed" and re-arm every cell of it.
+        let actions: Vec<Action> = targets.iter().map(|add| Action::Remove(remove_for_add(add, false))).collect();
         let commit_lock = self.commit_lock(project_id, table_name).await;
         let guard = commit_lock.lock().await;
         refresh_table_snapshot(table_ref, self.config.maintenance.timefusion_incremental_snapshot).await?;
@@ -12568,6 +12570,20 @@ mod rollup_noop_skip_tests {
                 .map(|add| add.path.clone())
                 .expect("dedup must have masked the losing file with a deletion vector")
         };
+        let live_rows = async || -> Result<i64> {
+            use datafusion::arrow::array::AsArray;
+            let batches = db.query_delta_only(&format!("SELECT count(*) FROM otel_logs_and_spans WHERE project_id = '{project_id}'")).await?;
+            Ok(batches[0].column(0).as_primitive::<datafusion::arrow::datatypes::Int64Type>().value(0))
+        };
+        let rows_before = live_rows().await?;
+        // Baseline the reconcile cursor and settle what ingest and dedup minted, so only
+        // what the retirement re-arms is measured.
+        db.reconcile_maintenance_task_cursors().await?;
+        {
+            let mut journal = db.journal();
+            let keys = journal.tasks().filter(|task| task.key.project_id == project_id).map(|task| task.key.clone()).collect_vec();
+            keys.iter().for_each(|key| _ = journal.complete(key));
+        }
 
         let schema = get_schema("otel_logs_and_spans").expect("otel schema");
         let outcome = db
@@ -12586,6 +12602,18 @@ mod rollup_noop_skip_tests {
             t.snapshot()?.log_data().iter().any(|f| f.path().as_ref() == corpse)
         };
         assert!(!still_live, "the fully-masked file must be REMOVED, or the planner re-mints this bin forever");
+        assert_eq!(live_rows().await?, rows_before, "retiring a corpse changes no answer");
+        // Prod 09-30 17:48: one Talstack corpse re-armed the whole day — 157 BaseRollup,
+        // 135 Dedup and 22 DerivedRollup units — because the reconcile read the
+        // remove-only commit as a data change of unknown span.
+        db.reconcile_maintenance_task_cursors().await?;
+        let rearmed = db
+            .journal()
+            .tasks()
+            .filter(|task| task.key.project_id == project_id && task.state != TaskState::Complete)
+            .map(|task| task.key.clone())
+            .collect_vec();
+        assert!(rearmed.is_empty(), "a corpse retirement re-armed {} units, first {:?}", rearmed.len(), rearmed.first());
         Ok(())
     }
 
