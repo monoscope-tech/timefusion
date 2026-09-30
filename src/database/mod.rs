@@ -374,12 +374,6 @@ pub mod scan_metric_names {
         CERT_SKIP_BLOCKED_NO_STATS = "timefusion.scan.cert_skip_blocked_no_stats" as scan.cert_skip_blocked_no_stats;
         CERT_SKIP_BLOCKED_OVERLAP = "timefusion.scan.cert_skip_blocked_overlap" as scan.cert_skip_blocked_overlap;
         CERT_SKIP_FILES = "timefusion.scan.cert_skip_files" as scan.cert_skip_files;
-        // Key-level refinement of the per-file skip (`timefusion_read_dedup_key_restrict`):
-        // scans that restricted, scans whose key set exceeded the cap, and proved rows that
-        // bypassed `DedupExec` because no blocker holds their key.
-        DEDUP_KEY_RESTRICT_SCANS = "timefusion.scan.dedup_key_restrict_scans" as scan.dedup_key_restrict_scans;
-        DEDUP_KEY_RESTRICT_FALLBACKS = "timefusion.scan.dedup_key_restrict_fallbacks" as scan.dedup_key_restrict_fallbacks;
-        DEDUP_KEY_RESTRICT_PASSTHROUGH_ROWS = "timefusion.scan.dedup_key_restrict_passthrough_rows" as scan.dedup_key_restrict_passthrough_rows;
         // Why `record_certification` refused, split by the failing conjunct.
         CERT_REFUSED_DROPPED = "timefusion.scan.cert_refused_dropped" as scan.cert_refused_dropped;
         CERT_REFUSED_INCOMPLETE = "timefusion.scan.cert_refused_incomplete" as scan.cert_refused_incomplete;

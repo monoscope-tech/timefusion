@@ -90,8 +90,7 @@ Engineering:
   - Metrics tiers `metrics_1m_v2` / `metrics_1h_v2` unchanged.
 - **On by default:** DV strip for all dates (fleet cap 12 per 10 min), W59 dirty re-flush drain, one heavy
   slot per query, measure re-mint backfill (2 cells per pass).
-- **Dark flags (FLAG-switchable):** `timefusion_read_dedup_key_restrict`
-  (W46), `timefusion_maintenance_cpu_tokens` (8..256; prod runs 66). Byte admission for wide scans
+- **Dark flags (FLAG-switchable):** `timefusion_maintenance_cpu_tokens` (8..256; prod runs 66). Byte admission for wide scans
   stays behind config flags. W21 witness carry stays off.
 - **Latency:** p95/p99 are recorded at stream end since 18:09. Values before that excluded streaming time
   and are not comparable.
@@ -114,10 +113,9 @@ Done items carry evidence (commit or number). Open items carry the next action, 
       Inconclusive and not binding: p95 B−A −0.66 s (CI −3.7…+2.4), GB/h −11% (CI −70…+59); tokens read 0/66 while
       `admission_refused_state_bytes_total` was 29,201 — state memory binds, not the token cap. Default stays 66;
       the `FLAG SET timefusion_maintenance_cpu_tokens` override stays as an ops knob.
-- [ ] **Experiment: W46 key-level dedup restriction** (`FLAG SET timefusion_read_dedup_key_restrict ON`). The 09-29 night run
-      was INVALID: its load (16 workers of raw sealed-day scans) OOM-killed prod at 23:47 and every later query failed on dead
-      connections. Re-run with ≤4 raw workers and byte admission ON, on sealed uncertified days (the only path W46 acts on).
-      Enable rule: DedupExec input rows drop, counts equal in both arms, paired p95 lower bound > 0.
+- [x] **Experiment: W46 key-level dedup restriction** — deleted: A/B showed no benefit. Paired ABBA/BAAB on prod
+      09-30, 8 windows: p95 B−A −0.05 s (CI −0.26…+0.16), p99 −0.29 s (CI −1.68…+1.10). The enable rule needed the
+      p95 lower bound > 0; not met. Flag, restricted-scan path and `dedup_key_restrict_*` counters removed.
 - [x] Capacity replay 1x/2x/4x: W10 calibration within ±10% per lane; W26 (`5610c94e`, `d19631fb`); ~2x headroom.
 - [x] Stage 0 rollout gates: release 2 (#323).
 - [x] Byte-aware batches: measured, missed the 10% CPU gate (1.87–1.95 s vs 1.91–1.95 s). Stays off.
@@ -191,7 +189,7 @@ Done items carry evidence (commit or number). Open items carry the next action, 
 - [x] W33 skip dedup on certified-clean days; W37 per-project spans for the per-file skip (unproven:proved 23:1 → 2:1);
       W39 mint Dedup units for probe-declined bins + counter honesty; mint horizon gate; W22/W23 analyses.
 - [x] W50 Dedup `processed_bytes` records measured bytes (was 0).
-- [x] W46 key-level dedup restriction built dark (`0f131e24`). Enable decision: see Experiments.
+- [x] W46 key-level dedup restriction built dark (`0f131e24`), then deleted after its A/B (see Experiments).
 
 ### Read path
 
@@ -389,9 +387,9 @@ ROLLUP POLICIES otel_logs_and_spans
 ROLLUP PAUSE  otel_logs_and_spans otel_logs_and_spans_rollup_sessions_1h_v1
 ROLLUP RESUME otel_logs_and_spans otel_logs_and_spans_rollup_dashboard_1m_v4 FROM '2026-08-29T00:00:00Z'
 FLAG SHOW
-FLAG SET timefusion_read_dedup_key_restrict ON       -- ON|OFF
+FLAG SET timefusion_query_scan_byte_admission ON     -- ON|OFF
 FLAG SET timefusion_maintenance_cpu_tokens 128        -- 8..256
-FLAG RESET timefusion_read_dedup_key_restrict
+FLAG RESET timefusion_query_scan_byte_admission
 ```
 
 Scripts:

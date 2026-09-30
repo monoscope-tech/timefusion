@@ -2107,19 +2107,6 @@ pub struct MaintenanceConfig {
     /// touching.
     #[serde_inline_default(true)]
     pub timefusion_read_dedup_skip_per_file: bool,
-    /// KEY-level refinement of the per-file skip (DARK). A proved file blocked only by
-    /// overlapping unproved files sends through `DedupExec` just the rows whose dedup key
-    /// occurs in those files; the rest bypass it.
-    ///
-    /// SOUNDNESS: the proved set holds at most one row per key, and every other version
-    /// of a proved row lies in an overlapping unproved file, so a proved row whose key is
-    /// in none of them is its own dedup winner.
-    #[serde(default)]
-    pub timefusion_read_dedup_key_restrict: bool,
-    /// Upper bound on blocker rows read to build a scan's key set; above it the scan
-    /// falls back to the plain per-file split (`dedup_key_restrict_fallbacks`).
-    #[serde_inline_default(200_000)]
-    pub timefusion_read_dedup_key_restrict_max_keys: usize,
     /// Persist sweep certifications to the data dir and reload at boot, so the
     /// read-side dedup skip doesn't restart cold. It cannot widen certification:
     /// a reloaded entry faces the same fingerprint-equality check, so a stale
@@ -2246,14 +2233,13 @@ pub struct MaintenanceConfig {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, strum::EnumString, strum::IntoStaticStr, strum::VariantArray, strum::VariantNames)]
 #[strum(serialize_all = "snake_case", ascii_case_insensitive)]
 pub enum RuntimeFlag {
-    TimefusionReadDedupKeyRestrict,
     /// Maintenance admission's CPU-token capacity; config is `coordinator_job_slots`.
     TimefusionMaintenanceCpuTokens,
     TimefusionQueryScanByteAdmission,
 }
 
 /// Per-flag override: 0 = config, else value + 1.
-static FLAG_OVERRIDES: [std::sync::atomic::AtomicU32; 3] = [const { std::sync::atomic::AtomicU32::new(0) }; 3];
+static FLAG_OVERRIDES: [std::sync::atomic::AtomicU32; 2] = [const { std::sync::atomic::AtomicU32::new(0) }; 2];
 
 impl RuntimeFlag {
     fn slot(self) -> &'static std::sync::atomic::AtomicU32 {
@@ -2285,7 +2271,6 @@ impl AppConfig {
     /// THE read for a [`RuntimeFlag`]: the runtime override, else config.
     pub fn flag_value(&self, flag: RuntimeFlag) -> u32 {
         flag.override_value().unwrap_or_else(|| match flag {
-            RuntimeFlag::TimefusionReadDedupKeyRestrict => self.maintenance.timefusion_read_dedup_key_restrict.into(),
             RuntimeFlag::TimefusionMaintenanceCpuTokens => u32::try_from(self.derived.coordinator_job_slots()).unwrap_or(u32::MAX),
             RuntimeFlag::TimefusionQueryScanByteAdmission => self.memory.timefusion_query_scan_byte_admission.into(),
         })
@@ -2446,10 +2431,10 @@ mod tests {
     #[test_case::test_case(true, None => true ; "reset_reads_config")]
     fn runtime_flag_override_is_what_read_sites_see(configured: bool, runtime: Option<bool>) -> bool {
         let mut cfg = AppConfig::default();
-        cfg.maintenance.timefusion_read_dedup_key_restrict = configured;
-        RuntimeFlag::TimefusionReadDedupKeyRestrict.set_override(runtime.map(u32::from));
-        let seen = cfg.flag(RuntimeFlag::TimefusionReadDedupKeyRestrict);
-        RuntimeFlag::TimefusionReadDedupKeyRestrict.set_override(None);
+        cfg.memory.timefusion_query_scan_byte_admission = configured;
+        RuntimeFlag::TimefusionQueryScanByteAdmission.set_override(runtime.map(u32::from));
+        let seen = cfg.flag(RuntimeFlag::TimefusionQueryScanByteAdmission);
+        RuntimeFlag::TimefusionQueryScanByteAdmission.set_override(None);
         seen
     }
 

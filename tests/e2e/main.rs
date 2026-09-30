@@ -16,7 +16,6 @@ mod heavy_query_admission;
 mod hot_tail_sorted_footer;
 mod insert_unnest_scaling;
 mod insert_unnest_variant;
-mod key_level_dedup;
 mod merge_on_read;
 mod multi_tenant_isolation;
 mod or_utf8view_delta;

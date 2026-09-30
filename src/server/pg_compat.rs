@@ -1389,20 +1389,14 @@ mod stats_table_tests {
 
     #[test]
     fn flags_component_reports_effective_value_and_override() {
-        use crate::config::RuntimeFlag::{
-            TimefusionMaintenanceCpuTokens as Cpu, TimefusionQueryScanByteAdmission as Bytes, TimefusionReadDedupKeyRestrict as Restrict,
-        };
+        use crate::config::RuntimeFlag::{TimefusionMaintenanceCpuTokens as Cpu, TimefusionQueryScanByteAdmission as Bytes};
         crate::config::set_config_for_test(crate::config::AppConfig::default());
-        Restrict.set_override(Some(1));
         Cpu.set_override(Some(96));
         let rows = snapshot_rows(&StatsTableProvider::new(None));
-        [Restrict, Cpu].into_iter().for_each(|f| f.set_override(None));
+        Cpu.set_override(None);
         let flags: Vec<_> = rows.iter().filter(|(c, ..)| c == "flags").map(|(_, k, v)| (k.as_str(), v.as_str())).collect();
-        let (r, c, b): (&str, &str, &str) = (Restrict.into(), Cpu.into(), Bytes.into());
-        assert_eq!(
-            flags,
-            [(r, "true"), (&*format!("{r}.override"), "true"), (c, "96"), (&*format!("{c}.override"), "96"), (b, "false"), (&*format!("{b}.override"), "null")]
-        );
+        let (c, b): (&str, &str) = (Cpu.into(), Bytes.into());
+        assert_eq!(flags, [(c, "96"), (&*format!("{c}.override"), "96"), (b, "false"), (&*format!("{b}.override"), "null")]);
     }
 
     /// Scan metrics wired and nothing else: an unwired pool reports 0 rather than dividing by zero, and every counter

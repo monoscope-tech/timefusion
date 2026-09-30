@@ -61,8 +61,6 @@ pub struct E2eEnvBuilder {
     repair_resume: bool,
     landed_skip: bool,
     mark_sorted_at_write: bool,
-    dedup_key_restrict: bool,
-    dedup_key_restrict_max_keys: Option<usize>,
 }
 
 impl Default for E2eEnvBuilder {
@@ -95,8 +93,6 @@ impl Default for E2eEnvBuilder {
             repair_resume: false,
             landed_skip: false,
             mark_sorted_at_write: true,
-            dedup_key_restrict: false,
-            dedup_key_restrict_max_keys: None,
         }
     }
 }
@@ -150,9 +146,6 @@ impl E2eEnvBuilder {
         /// Defer `UPDATE ... FROM` Delta legs through the coalescer; drain
         /// explicitly with `E2eEnv::drain_dml_coalescer`. 0 = synchronous.
         with_dml_coalesce_secs(secs: u64) => dml_coalesce_secs = secs,
-        /// Key-level restriction of the per-file dedup skip.
-        with_dedup_key_restrict(on: bool) => dedup_key_restrict = on,
-        with_dedup_key_restrict_max_keys(keys: usize) => dedup_key_restrict_max_keys = Some(keys),
     }
 
     flag_setters! {
@@ -405,10 +398,6 @@ fn build_config(b: &E2eEnvBuilder, endpoint: &str, bucket: &str, data_dir: PathB
     cfg.buffer.timefusion_landed_skip_enabled = b.landed_skip;
     cfg.maintenance.timefusion_repair_mark_sorted_at_write = b.mark_sorted_at_write;
     cfg.maintenance.timefusion_dml_merge_key_prune = b.dml_merge_key_prune;
-    cfg.maintenance.timefusion_read_dedup_key_restrict = b.dedup_key_restrict;
-    if let Some(v) = b.dedup_key_restrict_max_keys {
-        cfg.maintenance.timefusion_read_dedup_key_restrict_max_keys = v;
-    }
     // A 0% selectivity floor is the off switch for the WHOLE prefilter. Clearing
     // `timefusion_tantivy_file_pruning` alone is NOT enough: a zero-hit index
     // still yields an empty `id IN ()`, which prunes every file.
