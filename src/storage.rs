@@ -1182,7 +1182,8 @@ impl FoyerObjectStoreCache {
             // full-object download from a query miss on a large file — that read
             // amplification competes with the foreground range requests; large files are
             // warmed only by upload capture and the post-commit/restart warmer.
-            if file_meta.size <= self.config.l1_max_entry_bytes as u64 {
+            // A bypassed scan declines the admission, so it fetches only the range.
+            if file_meta.size <= self.config.l1_max_entry_bytes as u64 && !bypass_active() {
                 debug!("Foyer cache MISS for Parquet data: {} (range: {}..{}, fetching full file)", location, range.start, range.end);
                 if let Ok(result) = self.get_cached(location).await {
                     let full = Self::read_payload(result.payload).await?;
@@ -2603,6 +2604,23 @@ mod tests {
         assert_eq!(&cache.get_range_cached(&path, 64..128).await?[..], &body[64..128]);
         assert_eq!(&cache.get_range_cached(&path, 10..190).await?[..], &body[10..190]);
         assert_eq!(gets.load(Ordering::Relaxed), after_first, "later ranges must be main-tier hits, not per-range GETs");
+        Ok(())
+    }
+
+    /// A bypassed scan declines its first admission, so fetching an L1-sized file
+    /// whole per range miss costs a full GET and pins the whole body behind the
+    /// returned slice, outside every memory pool, once per concurrent range.
+    #[tokio::test]
+    async fn bypassed_range_miss_on_an_l1_sized_file_fetches_only_the_range() -> anyhow::Result<()> {
+        let mem = Arc::new(InMemory::new());
+        let (_shared, cache, _dir) = shared_with("bypass_small", mem.clone(), |c| c.l1_max_entry_bytes = 8 << 20).await?;
+        let path = Path::from("tbl/date=2026-01-02/small.parquet");
+        let body: Vec<u8> = (0..4 << 20).map(|i| (i % 251) as u8).collect();
+        mem.put(&path, PutPayload::from(Bytes::from(body.clone()))).await?;
+
+        let got = scan_bypass_scope(true, cache.get_range_cached(&path, 100..200)).await?;
+        assert_eq!(&got[..], &body[100..200]);
+        assert_eq!(cache.get_stats().main.inner_bytes_read, PARQUET_RANGE_ALIGNMENT_BYTES, "a bypassed miss must fetch its aligned range, not the 4 MiB file");
         Ok(())
     }
 
