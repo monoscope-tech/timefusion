@@ -647,6 +647,15 @@ pub(crate) fn rollups_read_any(source: &str, mut columns: impl Iterator<Item = i
 /// Only the flush writes it, and only for versions `VersionOnlyLedger` admitted.
 pub(crate) const VERSION_ONLY_TAG: &str = "timefusion.version_only_columns";
 
+/// Add-action tag listing, as JSON `[[start, end], ...]` micros, the dirty-bin cells a
+/// flushed file's rows occupy. Its stats cannot: one late row stretches min..max over
+/// every cell between it and the current ones.
+pub(crate) const DIRTY_CELLS_TAG: &str = "timefusion.dirty_cells";
+
+fn dirty_cells(tags: Option<&HashMap<String, Option<String>>>) -> Option<Vec<(i64, i64)>> {
+    serde_json::from_str(tags?.get(DIRTY_CELLS_TAG)?.as_deref()?).ok()
+}
+
 /// A file of version rows that copy already-witnessed winners and differ only in
 /// columns no rollup of `source` reads. Every row witness skips it, on the recording
 /// and the re-proving side alike; builds still read it. Re-checked against the live
@@ -1571,14 +1580,15 @@ impl Database {
             if cursor >= version {
                 continue;
             }
-            // Per partition, `(hours the missed commits can have touched, of those
-            // the hours needing a Dedup re-mint)`. ALL_HOURS per changed partition
-            // instead would make every restart re-enqueue the day and reset
-            // completed frontier work to Pending. The dedup half accumulates from
-            // UNTAGGED commits only: a `DV_DEDUP_COMMIT_KEY` commit adds no rows, so
-            // re-minting Dedup from it would upsert already-Complete slices back to
-            // Pending forever.
-            let mut partition_hours: HashMap<(String, String), (u32, u32)> = HashMap::new();
+            // Per partition, `(ranges the missed commits can have touched, of those
+            // the ranges needing a Dedup re-mint)`. The whole day per changed partition
+            // instead would make every restart re-enqueue the day and reset completed
+            // frontier work to Pending. The dedup half accumulates from UNTAGGED commits
+            // only: a `DV_DEDUP_COMMIT_KEY` commit adds no rows, so re-minting Dedup from
+            // it would upsert already-Complete slices back to Pending forever.
+            type Ranges = Vec<(i64, i64)>;
+            let mut partition_ranges: HashMap<(String, String), (Ranges, Ranges)> = HashMap::new();
+            let whole_day = |date: &str| date_start_micros(date).map(|start| vec![(start, start + DAY_MICROS)]).unwrap_or_default();
             let mut missing_commit = None;
             for commit_version in cursor.saturating_add(1)..=version {
                 let Some(bytes) = log_store.read_commit_entry(commit_version).await? else {
@@ -1595,17 +1605,22 @@ impl Database {
                     match action {
                         deltalake::kernel::Action::Add(add) if add.data_change => {
                             let Some(partition) = Self::maintenance_partition_from_action(&add.path, Some(&add.partition_values), "default") else { continue };
-                            let mask = chrono::NaiveDate::parse_from_str(&partition.1, "%Y-%m-%d")
-                                .ok()
-                                .and_then(day_start_micros)
-                                .and_then(|day_start| add.stats.as_deref().and_then(|stats| crate::rollup::hours_from_stats_json(stats, day_start)))
-                                .unwrap_or(crate::rollup::ALL_HOURS);
+                            // A flush file's min..max spans every cell between a late row
+                            // and current ones; its tag names only the cells it holds.
+                            let ranges = dirty_cells(add.tags.as_ref()).unwrap_or_else(|| {
+                                date_start_micros(&partition.1)
+                                    .and_then(|day_start| {
+                                        let hours = crate::rollup::hours_from_stats_json(add.stats.as_deref()?, day_start)?;
+                                        Some(crate::rollup::dirty_ranges(day_start, hours))
+                                    })
+                                    .unwrap_or_else(|| whole_day(&partition.1))
+                            });
                             partitions_with_adds.insert(partition.clone());
-                            let hours = partition_hours.entry(partition).or_insert((0, 0));
-                            hours.0 |= mask;
+                            let touched = partition_ranges.entry(partition).or_default();
                             if !dv_dedup_commit {
-                                hours.1 |= mask;
+                                touched.1.extend(&ranges);
                             }
+                            touched.0.extend(ranges);
                         }
                         // A Remove carries no stats; in a rewrite commit its span
                         // is covered by the paired Adds. Only a partition with
@@ -1622,7 +1637,8 @@ impl Database {
                 // Conservative day regardless of the tag: a tagged commit never
                 // removes without a paired Add, so if one does, mint everything.
                 for partition in remove_only.difference(&partitions_with_adds).cloned() {
-                    partition_hours.insert(partition, (crate::rollup::ALL_HOURS, crate::rollup::ALL_HOURS));
+                    let day = whole_day(&partition.1);
+                    partition_ranges.insert(partition, (day.clone(), day));
                 }
             }
             if let Some(missing) = missing_commit {
@@ -1655,33 +1671,33 @@ impl Database {
                             warn!(source, storage_project, cursor, table = name, path = %file.path(), event = "maintenance_partition_reconcile_failed");
                             continue 'sources;
                         };
-                        partition_hours.entry(partition).or_insert((0, 0)).0 = crate::rollup::ALL_HOURS;
+                        partition_ranges.entry(partition).or_default();
                     }
                 }
-                // The missing commits make every hour bound uncertain.
-                partition_hours.values_mut().for_each(|hours| hours.0 = crate::rollup::ALL_HOURS);
                 warn!(
                     source,
                     storage_project,
                     cursor,
                     missing,
                     version,
-                    partitions = partition_hours.len(),
+                    partitions = partition_ranges.len(),
                     event = "maintenance_history_gap_recovery",
                     "requeueing whole partitions from live metadata before advancing an expired cursor"
                 );
             }
-            for ((partition_project, date), (hours, with_dedup)) in partition_hours {
+            for ((partition_project, date), (touched, with_dedup)) in partition_ranges {
                 let project = if storage_project.is_empty() { partition_project } else { storage_project.clone() };
                 if missing_commit.is_some() {
                     self.enqueue_maintenance_partition(&project, source, &date)?;
                     queued = queued.saturating_add(1 + schema.rollups.len());
                 } else {
-                    // The two halves of one partition's hours — mint both, commit once.
-                    self.mint_maintenance_hours(&project, source, &date, with_dedup, true)?;
-                    self.mint_maintenance_hours(&project, source, &date, hours & !with_dedup, false)?;
+                    // The two halves of one partition's ranges — mint both, commit once.
+                    let (touched, with_dedup) = (crate::write::mem_buffer::merge_ranges(touched), crate::write::mem_buffer::merge_ranges(with_dedup));
+                    self.mint_invalidations(&project, source, &date, Some(&with_dedup), true)?;
+                    self.mint_invalidations(&project, source, &date, Some(&crate::rollup::uncovered_gaps(&touched, &with_dedup)), false)?;
                     self.commit_journal()?;
-                    queued = queued.saturating_add(usize::try_from(hours.count_ones()).unwrap_or(24) * schema.rollups.len());
+                    let hours = date_start_micros(&date).map_or(24, |day_start| hours_of_ranges(day_start, &touched).count_ones());
+                    queued = queued.saturating_add(usize::try_from(hours).unwrap_or(24) * schema.rollups.len());
                 }
                 tokio::task::yield_now().await;
             }

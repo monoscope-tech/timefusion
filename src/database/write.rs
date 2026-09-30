@@ -655,6 +655,21 @@ impl Database {
                 dirty_bins.extend(bins);
                 tagged_sorted = sorted;
             }
+            let bin = crate::database::compact::bin_micros();
+            let cells: HashMap<&str, String> = dirty_bins
+                .iter()
+                .into_group_map_by(|(date, _)| date.as_str())
+                .into_iter()
+                .map(|(date, bins)| (date, crate::write::mem_buffer::merge_ranges(bins.iter().map(|(_, cell)| (cell * bin, (cell + 1) * bin)).collect())))
+                .filter_map(|(date, ranges)| Some((date, serde_json::to_string(&ranges).ok()?)))
+                .collect();
+            for action in &mut adds {
+                if let deltalake::kernel::Action::Add(add) = action
+                    && let Some(cells) = add.partition_values.get("date").cloned().flatten().and_then(|date| cells.get(date.as_str()))
+                {
+                    add.tags.get_or_insert_default().insert(crate::database::maintain::DIRTY_CELLS_TAG.to_owned(), Some(cells.clone()));
+                }
+            }
             if adds.is_empty() {
                 return Ok(Vec::new());
             }

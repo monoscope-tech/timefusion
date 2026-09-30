@@ -4171,6 +4171,41 @@ async fn reconcile_enqueues_only_the_hours_a_missed_commit_touched() -> Result<(
     Ok(())
 }
 
+/// One late row flushed beside current rows lands in a file whose stats span both. The
+/// reconcile must re-arm only the two cells' hours, not every cell between them: prod
+/// 09-30 re-armed 03:00–15:59 of Talstack's day (~70 cells x 4 tiers) per late row.
+#[tokio::test]
+async fn reconcile_rearms_only_the_cells_a_late_row_flush_touched() -> Result<()> {
+    use crate::maintenance_coordinator::TaskState;
+    let db = Database::with_config(create_test_config("reconcile-late-row")).await?;
+    db.get_or_create_unified_table("otel_logs_and_spans").await?;
+    assert_eq!(db.reconcile_maintenance_task_cursors().await?, 0, "first reconcile baselines the cursor");
+
+    let project = format!("late_{}", uuid::Uuid::new_v4().simple());
+    let day_start = midnight_micros(Utc::now().date_naive() - chrono::Duration::days(1));
+    let (late, current) = (day_start + 3 * 3_600_000_000 + 300_000_000, day_start + 15 * 3_600_000_000 + 480_000_000);
+    let rows = vec![test_span_ts("late", "op", &project, late), test_span_ts("current", "op", &project, current)];
+    db.insert_records_batch(&project, "otel_logs_and_spans", vec![json_to_batch(rows)?], true, None).await?;
+    // What ingest minted is done: only the reconcile's re-arm is measured.
+    {
+        let mut journal = db.maintenance_tasks.lock().unwrap();
+        let keys = journal.tasks().filter(|task| task.key.project_id == project).map(|task| task.key.clone()).collect_vec();
+        keys.iter().for_each(|key| _ = journal.complete(key));
+    }
+    db.reconcile_maintenance_task_cursors().await?;
+
+    let journal = db.maintenance_tasks.lock().unwrap();
+    let rearmed = journal.tasks().filter(|task| task.key.project_id == project && task.state != TaskState::Complete).collect_vec();
+    let hour_of = |micros: i64| (micros - day_start).div_euclid(3_600_000_000);
+    let outside = rearmed.iter().filter(|task| ![3, 15].contains(&hour_of(task.key.slice.start_micros))).map(|task| task.key.slice).collect_vec();
+    assert!(outside.is_empty(), "{} of {} re-armed slices lie between the two touched hours, first {:?}", outside.len(), rearmed.len(), outside.first());
+    assert!(
+        [late, current].iter().all(|&ts| rearmed.iter().any(|task| task.key.slice.start_micros <= ts && ts < task.key.slice.end_micros)),
+        "both rows' own cells must still re-arm"
+    );
+    Ok(())
+}
+
 /// A self-authored DV-dedup commit must re-mint NEITHER Dedup NOR Rollup.
 ///
 /// DV-dedup carries `data_change=true` (it masks rows), so without the tag reconcile
