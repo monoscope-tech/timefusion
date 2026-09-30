@@ -2065,8 +2065,9 @@ pub struct MaintenanceConfig {
     pub timefusion_rollup_backfill_tier_inflight: usize,
     /// Cells a census pass re-mints because they predate a measure their tier now
     /// declares. Holes are admitted first and these still count against the tier
-    /// in-flight cap, so the re-mint only fills idle room. 0 disables it.
-    #[serde_inline_default(2)]
+    /// in-flight cap, so the re-mint only fills idle room. 0 disables it. At 2 a
+    /// 31-day tier took ~15 h to gain a new measure, leaving its charts raw meanwhile.
+    #[serde_inline_default(8)]
     pub timefusion_rollup_measure_remints_per_pass: usize,
     /// `(project_id, date)` cells a one-shot repair forces a full re-derive of,
     /// as `project:YYYY-MM-DD`. Empty means "use `DAMAGED_CELLS`". Non-empty
@@ -2503,7 +2504,7 @@ mod tests {
         assert!(config.rollup_read_enabled_for("a-project-created-tomorrow"));
         assert_eq!(config.timefusion_rollup_backfill_days, 31, "the shipped default is the value prod exercises");
         assert_eq!(config.timefusion_rollup_backfill_tier_inflight, 16, "a new tier must not queue its whole horizon at once");
-        assert_eq!(config.timefusion_rollup_measure_remints_per_pass, 2, "a newly declared measure must not re-mint its whole horizon at once");
+        assert_eq!(config.timefusion_rollup_measure_remints_per_pass, 8, "a newly declared measure must not re-mint its whole horizon at once");
         assert!(config.timefusion_rollup_certified_clean, "certified-clean input skips winner selection by default");
 
         // The canary still narrows the READ side when it is set, and only then.
