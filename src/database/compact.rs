@@ -1085,7 +1085,7 @@ impl Database {
         let (chunks, skipped_any): (Vec<(String, String)>, bool) = if schema.dedup_keys.iter().any(|k| k == "timestamp") {
             // Ten-minute sealed bins bound materialization and avoid racing late
             // flushes; newer duplicates are retried later.
-            let sealed_before = Utc::now().naive_utc() - chrono::Duration::hours(2);
+            let sealed_before = crate::support::now_utc().naive_utc() - chrono::Duration::hours(2);
             let mut skipped_unsealed = false;
             // Shard the probe by TIME, never by a key hash. `hash_bucket(...)` has no
             // parquet statistics, so EVERY hash shard re-read the whole partition to

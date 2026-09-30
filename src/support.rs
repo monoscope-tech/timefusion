@@ -36,10 +36,15 @@ pub fn now_secs() -> u64 {
     (now_micros() / 1_000_000).max(0) as u64
 }
 
+/// The (possibly frozen) clock as a UTC datetime.
+pub fn now_utc() -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::from_timestamp_micros(now_micros()).unwrap_or_default()
+}
+
 /// Today's UTC date on the (possibly frozen) clock. Maintenance that decides
 /// which partitions are sealed must use this, never `Utc::now`.
 pub fn today_utc() -> chrono::NaiveDate {
-    chrono::DateTime::from_timestamp_micros(now_micros()).unwrap_or_default().date_naive()
+    now_utc().date_naive()
 }
 
 /// True when the clock is currently pinned (test mode).

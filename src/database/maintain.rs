@@ -6919,7 +6919,7 @@ impl Database {
         // Today plus a lookback window: a cross-flush dupe landing in a prior-day
         // partition (late replay crossing midnight UTC) never collapses under a
         // today-only scope. The version skip below bounds the cost.
-        let today = Utc::now().date_naive();
+        let today = crate::support::today_utc();
         let lookback = self.config.maintenance.timefusion_dedup_lookback_days as i64;
         let dates: Vec<chrono::NaiveDate> = (0..=lookback).rev().map(|d| today - chrono::Duration::days(d)).collect();
 
@@ -7185,10 +7185,10 @@ impl Database {
         // Eligible bins classified per table per tick. Large on purpose: per-pass cost is
         // bounded by the (project, date) GROUP count (one batch probe each), not by this.
         const DIRTY_BIN_DRAIN_BATCH: usize = 16384;
-        let sealed_before = (Utc::now() - chrono::Duration::hours(2)).timestamp_micros();
+        let sealed_before = crate::support::now_micros() - 2 * 3_600_000_000;
         // Today's SEALED bins are eligible; `sealed_before` keeps staging away from the live
         // MemBuffer/late-arrival window.
-        let today_date = Utc::now().date_naive();
+        let today_date = crate::support::today_utc();
         let candidates: Vec<_> = self
             .dedup_dirty_bins
             .iter()
@@ -10922,6 +10922,14 @@ mod rollup_noop_skip_tests {
         advance_and_drain(db).await.map(|_| ())
     }
 
+    /// Dedup masks only bins sealed 2 h, so a test writing just past midnight pins noon.
+    /// Tomorrow, not today: a dedup path reading the wall clock then fails at any hour.
+    fn pin_tomorrow_noon() -> chrono::NaiveDate {
+        let tomorrow = chrono::Utc::now().date_naive() + chrono::Duration::days(1);
+        crate::support::set_micros(tomorrow.and_hms_opt(12, 0, 0).expect("noon").and_utc().timestamp_micros());
+        tomorrow
+    }
+
     /// The dedup sweep over the unified table — what masks losers with a deletion vector.
     async fn dedup_unified(db: &Database) -> Result<()> {
         let table_ref = db.unified_tables().read().await.get("otel_logs_and_spans").expect("table created").clone();
@@ -11739,9 +11747,8 @@ mod rollup_noop_skip_tests {
         db.get_or_create_unified_table("otel_logs_and_spans").await?;
         db.reconcile_maintenance_task_cursors().await?;
         let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
-        let today = crate::support::today_utc();
+        let today = pin_tomorrow_noon();
         let at = today.and_hms_opt(0, 1, 0).expect("valid minute").and_utc().timestamp_micros();
-        assert!(chrono::Utc::now().timestamp_micros() - at > 3 * 3_600_000_000, "precondition: dedup masks only bins sealed 2 h; run after 03:00 UTC");
         for rows in [
             vec![test_span_ts("dup", "first", &project_id, at), test_span_ts("other", "op", &project_id, at + 1)],
             vec![test_span_ts("dup", "second", &project_id, at)],
@@ -11808,8 +11815,7 @@ mod rollup_noop_skip_tests {
         const MINUTE: i64 = 60_000_000;
         let db = Arc::new(Database::with_config(rollup_cfg("dv_strip_corpse_first")).await?);
         let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
-        let midnight = crate::support::today_utc().and_hms_opt(0, 0, 0).expect("midnight").and_utc().timestamp_micros();
-        assert!(chrono::Utc::now().timestamp_micros() - midnight > 3 * 3_600_000_000, "precondition: dedup masks only bins sealed 2 h; run after 03:00 UTC");
+        let midnight = pin_tomorrow_noon().and_hms_opt(0, 0, 0).expect("midnight").and_utc().timestamp_micros();
         let span = |id: &str, op: &str, minute: i64| test_span_ts(id, op, &project_id, midnight + minute * MINUTE);
         // Every row of the 00:09-00:11 straddler is superseded; half of the 00:21-00:25 file is.
         for rows in [
