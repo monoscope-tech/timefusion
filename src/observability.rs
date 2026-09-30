@@ -440,6 +440,33 @@ pub fn init_metrics(
         RUNTIME_LAG_MAX_MS.load(Relaxed)
     );
 
+    // No memory metric had history, so a deploy that came within 1% of the
+    // cgroup limit left no trace once the container exited.
+    fn charged() -> u64 {
+        crate::database::process_memory_bytes().unwrap_or(0) as u64
+    }
+    observe!(gauge "timefusion.memory.charged_bytes", "cgroup memory less clean page cache — the number the OOM killer acts on", charged());
+    observe!(gauge
+        "timefusion.memory.charged_peak_bytes",
+        "Highest charged_bytes sampled (every 500ms) since the previous export",
+        MEMORY_PEAK_BYTES.swap(0, Relaxed).max(charged())
+    );
+    observe!(gauge
+        "timefusion.memory.limit_bytes",
+        "Memory limit charged_bytes is budgeted against",
+        crate::config::try_config().map_or(0, |c| c.derived.memory_limit_bytes) as u64
+    );
+    meter
+        .u64_observable_gauge("timefusion.memory.jemalloc_bytes")
+        .with_description("jemalloc heap by kind; resident minus allocated is fragmentation. Absent without --features profiling")
+        .with_callback(|obs| {
+            if let Some((allocated, _, resident, ..)) = jemalloc_bytes() {
+                obs.observe(allocated, &[KeyValue::new("kind", "allocated")]);
+                obs.observe(resident, &[KeyValue::new("kind", "resident")]);
+            }
+        })
+        .build();
+
     observe!(gauge
         "timefusion.rollup.maintenance.pending_dirty_partitions",
         "Source partitions with durable rollup invalidations awaiting maintenance",
@@ -831,6 +858,10 @@ static RUNTIME_LAG_MAX_MS: AtomicU64 = AtomicU64::new(0);
 /// Most recent sample, so a gauge shows the CURRENT state rather than a
 /// high-water mark that never comes back down.
 static RUNTIME_LAG_LAST_MS: AtomicU64 = AtomicU64::new(0);
+/// Highest charged memory the lag sampler saw since the last export: a 30s
+/// export alone misses a sub-minute spike. The final partial window is lost at
+/// shutdown (the sampler is cancelled and OTLP is not flushed — see main.rs).
+static MEMORY_PEAK_BYTES: AtomicU64 = AtomicU64::new(0);
 
 /// Samples how late a task that asked to wake in exactly `SAMPLE_EVERY` really
 /// woke — i.e. whether CPU-bound work is starving the runtime the pgwire
@@ -851,6 +882,7 @@ pub fn spawn_runtime_lag_sampler(cancel: tokio_util::sync::CancellationToken) {
             let lag_ms = tokio::time::Instant::now().saturating_duration_since(deadline).as_millis();
             RUNTIME_LAG_LAST_MS.store(lag_ms as u64, Relaxed);
             RUNTIME_LAG_MAX_MS.fetch_max(lag_ms as u64, Relaxed);
+            MEMORY_PEAK_BYTES.fetch_max(crate::database::process_memory_bytes().unwrap_or(0) as u64, Relaxed);
             if lag_ms >= NOTEWORTHY {
                 warn!(lag_ms, "tokio runtime scheduling lag — a task that asked for {SAMPLE_EVERY:?} woke this late; the pgwire handshake shares this runtime");
             }
