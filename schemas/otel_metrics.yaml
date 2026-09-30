@@ -2,9 +2,13 @@ table_name: otel_metrics
 partitions:
   - project_id
   - date
+# Must stay a prefix of `sorting_columns`, so the dedup rewrite collapses adjacent
+# runs in one pass instead of a ROW_NUMBER window. Measured equivalent to
+# (timestamp, id) on live data: zero groups where this key merges two `id`s.
 dedup_keys:
   - timestamp
-  - id
+  - metric_name
+  - series_id
 # TF-owned, for the same reason as otel_logs_and_spans: `stamp_version`
 # overwrites this column, and `ingested_at` is client-visible data.
 dedup_tiebreak: updated_at

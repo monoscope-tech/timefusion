@@ -1873,7 +1873,8 @@ use arrow_ipc::{reader::FileReader, writer::FileWriter};
 
 // Bumped whenever an older on-disk index would be mis-read rather than merely
 // stale — e.g. a narrower key tail, or winners not bound to full DV descriptors.
-const FORMAT_VERSION: &str = "3";
+// "4": otel_metrics' key tail changed from `id` to `metric_name, series_id`.
+const FORMAT_VERSION: &str = "4";
 const META_VERSION: &str = "tf.logical_count.version";
 const META_FINGERPRINT: &str = "tf.logical_count.fingerprint";
 const META_FILES: &str = "tf.logical_count.files";
@@ -2629,7 +2630,7 @@ mod logical_count_index_tests {
     fn legacy_logical_count_files_require_rebuilding() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("legacy.arrow");
-        for version in ["1", "2"] {
+        for version in ["1", "2", "3"] {
             let schema = Schema::empty().with_metadata([(META_VERSION.to_owned(), version.to_owned())].into());
             let mut writer = FileWriter::try_new(std::fs::File::create(&path).unwrap(), &schema).unwrap();
             writer.finish().unwrap();

@@ -10166,3 +10166,39 @@ async fn concurrent_first_create_of_a_table_all_resolve() -> Result<()> {
     assert!(errs.is_empty(), "concurrent creates failed: {errs:?}");
     Ok(())
 }
+
+/// otel_metrics' dedup key is `(timestamp, metric_name, series_id)`: a re-sent point
+/// under a new `id` collapses, another series at the same instant does not, and the
+/// copy-on-write rewrite takes the one-pass collapse. The audit counter only moves
+/// inside the collapse branch, so it is what tells it apart from the ROW_NUMBER window.
+#[tokio::test]
+async fn otel_metrics_dedup_collapses_on_its_series_key_via_the_streaming_collapse() -> Result<()> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut cfg = (*create_test_config("metrics-collapse")).clone();
+    cfg.maintenance.timefusion_use_deletion_vectors = false;
+    let db = Database::with_config(Arc::new(cfg)).await?;
+    let project = format!("mc_{}", uuid::Uuid::new_v4().simple());
+    let ts = (Utc::now() - chrono::Duration::days(2)).timestamp_micros();
+    let date = chrono::DateTime::from_timestamp_micros(ts).unwrap().date_naive();
+    let point = |id: &str, series: &str| {
+        serde_json::json!({
+            "project_id": project, "timestamp": ts, "date": date.to_string(), "ingested_at": ts, "id": id, "series_id": series,
+            "metric_name": "cpu", "metric_unit": "1", "metric_type": "gauge", "flags": 0, "dropped_attributes_count": 0, "message_size_bytes": 0,
+        })
+    };
+    // Separate commits, so the duplicate is physical and crosses files.
+    for (id, series) in [("a", "s1"), ("b", "s1"), ("c", "s2")] {
+        db.insert_records_batch(&project, "otel_metrics", vec![json_to_batch_for("otel_metrics", vec![point(id, series)])?], true, None).await?;
+    }
+    let table = db.get_or_create_unified_table("otel_metrics").await?;
+    assert_eq!(delta_physical_row_count(&table).await?, 3);
+
+    let audited = || crate::observability::maintenance_stats().immutable_audit_shards_total.load(Relaxed);
+    let before = audited();
+    let limits = DedupExecutionLimits { max_decoded_bytes: 1 << 30, max_concurrent_shards: 1, probe_hash_shards: 1, sort_partitions: 1, batch_rows: 1024 };
+    let (dropped, complete, _) = db.dedup_partition_range_limited(&table, "otel_metrics", &project, date, None, Some(limits)).await?;
+    assert_eq!((dropped, complete), (1, true), "`a`/`b` share (timestamp, metric_name, series_id) and collapse; `c` is another series");
+    assert_eq!(delta_physical_row_count(&table).await?, 2);
+    assert!(audited() > before, "the rewrite must take the streaming collapse, not the ROW_NUMBER window");
+    Ok(())
+}

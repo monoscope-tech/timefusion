@@ -2247,10 +2247,23 @@ mod immutable_audit_tests {
     }
 
     /// The streaming-collapse rewrite rests on this property, and it lives in a
-    /// YAML file anyone can reorder.
+    /// YAML file anyone can reorder. A table that breaks it still dedups
+    /// correctly, just through the window, so nothing else would notice.
     #[test]
     fn the_shipped_dedup_keys_lead_the_shipped_sort() {
-        assert!(dedup_keys_lead_the_sort(logs_schema()), "otel dedup keys must be the leading sorting_columns, or the rewrite silently reverts to the window");
+        let registry = crate::schema::registry();
+        let offenders: Vec<String> = registry
+            .list_tables()
+            .into_iter()
+            .filter_map(|name| registry.get(&name))
+            .filter(|schema| schema.version_append && !dedup_keys_lead_the_sort(schema))
+            .map(|schema| format!("{}: {:?} vs {:?}", schema.table_name, schema.dedup_keys, schema.sorting_columns.iter().map(|c| &c.name).collect::<Vec<_>>()))
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "merge-on-read dedup_keys must lead sorting_columns, or the rewrite silently reverts to the window:\n{}",
+            offenders.join("\n")
+        );
         let mut misaligned = logs_schema().clone();
         misaligned.dedup_keys = vec!["timestamp".to_owned(), "id".to_owned()];
         assert!(!dedup_keys_lead_the_sort(&misaligned), "keys with `service` wedged between them are NOT a prefix");
