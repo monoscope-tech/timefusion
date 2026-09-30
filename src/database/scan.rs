@@ -1317,9 +1317,15 @@ mod stale_coverage_metric_tests {
     /// `record_prefilter_skip` only fires if a query happens to hit that path.
     #[test]
     fn every_search_refusal_is_a_registered_prefilter_reason() {
-        for reason in
-            ["delta_no_index", "delta_no_usable_index", "delta_cap_exceeded_one_index", "delta_cap_exceeded_combined", "delta_cap_exceeded_memo", "delta_error"]
-        {
+        for reason in [
+            "delta_no_index",
+            "delta_no_usable_index",
+            "delta_cap_exceeded_one_index",
+            "delta_cap_exceeded_combined",
+            "delta_cap_exceeded_memo",
+            "delta_cold_index",
+            "delta_error",
+        ] {
             assert!(scan_metric_names::prefilter_skip_metric(reason).is_some(), "{reason} would vanish from the breakdown");
         }
         // Distinct names, or the split buys nothing.
@@ -1613,7 +1619,7 @@ impl TableProvider for ProjectRoutingTable {
             // ONE pass over the in-window index set: the predicate tree compiles to a single
             // tantivy BooleanQuery per index (And→Must, Or→Should), hits unioned across indexes
             // (they cover disjoint row sets).
-            match svc.search_detailed(&self.table_name, &project_id, tree, max_hits, query_time_range).await {
+            match svc.search_detailed(&self.table_name, &project_id, tree, max_hits, query_time_range, false).await {
                 Ok(Ok(r)) => match decide_prefilter(
                     r.hits.into_iter().map(|h| h.id).collect(),
                     r.indexed_rows,

@@ -111,7 +111,7 @@ async fn build_index_for_file_reads_parquet_and_publishes_searchable_index() {
     download(store_obj.as_ref(), &object_store::path::Path::from(expected_blob.as_str())).await.expect("blob exists");
 
     let cache = TempDir::new().unwrap();
-    let search = TantivySearchService::new(store_obj.clone(), cache.path().to_path_buf(), Arc::new(TantivyConfig::default()));
+    let search = Arc::new(TantivySearchService::new(store_obj.clone(), cache.path().to_path_buf(), Arc::new(TantivyConfig::default())));
     let hits = search.search(TABLE, "p1", "id", "row-b").await.expect("search").expect("some hits");
     assert_eq!(hits.iter().map(|h| h.id.as_str()).collect::<Vec<_>>(), vec!["row-b"]);
 }

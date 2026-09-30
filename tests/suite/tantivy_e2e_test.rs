@@ -38,6 +38,8 @@ fn cfg(test_id: &str) -> Arc<AppConfig> {
         timefusion_tantivy_compression_level: 3,
         timefusion_tantivy_route_equality: true,
         timefusion_tantivy_prefilter_min_selectivity_pct: 50,
+        // As in prod: a cold cache skips the prefilter, so unseeded tests would never exercise it.
+        timefusion_tantivy_seed_cache_on_publish: true,
         ..Default::default()
     };
     Arc::new(c)
@@ -592,6 +594,40 @@ async fn flushed_index_prefilter_is_actually_used() -> Result<()> {
     Ok(())
 }
 
+/// A cold local index cache must not make SQL wait on blob installs: the scan answers with the
+/// original predicate (a user-written `text_match` included — it has a row evaluator, so no
+/// predicate is tantivy-only), and the next query after the background warm uses the prefilter.
+#[serial]
+#[tokio::test(flavor = "multi_thread")]
+async fn cold_index_cache_scans_unfiltered_then_prefilters_once_warm() -> Result<()> {
+    let pair = Pair::new("cold", Land::Flushed, &flush_group("c1", "login failed", "d")).await?;
+    pair.wait_manifest(1).await?;
+    let stats = &pair.on.tantivy_search().expect("search service").stats;
+    let load = |c: &std::sync::atomic::AtomicU64| c.load(std::sync::atomic::Ordering::Relaxed);
+
+    for (warms, predicate) in (1..).zip(["level = 'ERROR'", "text_match(status_message, 'failed')"]) {
+        std::fs::remove_dir_all(pair.cache_root.join("tantivy_cache"))?;
+        let prepares = load(&stats.prepares);
+        pair.assert_ids(predicate, &["c1"], "a cold window scans with the original predicate").await?;
+        assert_eq!(load(&stats.prepares), prepares, "a cold window must not open an index on the query path [{predicate}]");
+        // Re-query while waiting: a query landing before the previous warm left the dedup map
+        // spawns nothing, and the next cold one must.
+        let warmed = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            while load(&stats.blob_fetches) < warms {
+                pair.assert_ids(predicate, &["c1"], "a cold window scans with the original predicate").await?;
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            anyhow::Ok(())
+        });
+        warmed.await.expect("background warm must install the blob")?;
+        assert!(load(&stats.cold_warms_spawned) >= warms, "a cold window must queue a background warm [{predicate}]");
+    }
+    let prepares = load(&stats.prepares);
+    pair.assert_ids("level = 'ERROR'", &["c1"], "the warm window must still match the baseline").await?;
+    assert!(load(&stats.prepares) > prepares, "once warm, the prefilter must search the index");
+    Ok(())
+}
+
 /// Exact `=`, OR-disjunctions and `IN` lists routed through the id-prefilter
 /// must all equal the full-scan baseline. In particular an OR whose other side
 /// is unroutable must fall back, never intersect down to ∅.
@@ -634,7 +670,7 @@ async fn flushed_eq_on_uuid_id_with_dashes_matches_baseline() -> Result<()> {
 
     // Query the search service directly: the SQL assert above can be rescued by
     // the full-scan fallback, so only this proves the prefilter itself fires.
-    let search = TantivySearchService::new(pair.svc.object_store.clone(), pair.cache_root.clone(), Arc::new(TantivyConfig::default()));
+    let search = Arc::new(TantivySearchService::new(pair.svc.object_store.clone(), pair.cache_root.clone(), Arc::new(TantivyConfig::default())));
     let hits: Vec<String> =
         search.search_with_stats(TABLE, &pair.p, &leaf("id", uid), 1000, None).await?.map(|r| r.hits.into_iter().map(|h| h.id).collect()).unwrap_or_default();
     assert!(hits.contains(&uid.to_string()), "tantivy exact search on `id` must return the dashed UUID, not fall back; got {hits:?}");

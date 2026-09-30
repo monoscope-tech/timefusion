@@ -72,6 +72,10 @@ pub struct SearchStats {
     /// the result-merge bookkeeping, which no other counter can see.
     pub fanouts: AtomicU64,
     pub fanout_us: AtomicU64,
+    /// Background installs queued by prefilter searches refused as cold, and
+    /// those dropped because the warm queue was full.
+    pub cold_warms_spawned: AtomicU64,
+    pub cold_warms_dropped: AtomicU64,
 }
 
 impl SearchStats {
@@ -164,11 +168,21 @@ pub struct TantivySearchService {
     /// busy project — after paying for every cold blob download in the window — while a
     /// narrower fringe window of the same predicate may still fit.
     cap_exceeded: DashMap<CapKey, (Instant, u64)>,
+    /// Background warms queued or running, keyed by cache dir so a hot cold
+    /// window queues each blob once however many queries see it cold.
+    warming: DashMap<PathBuf, ()>,
+    /// Bounds queued background warms; a full queue drops the warm.
+    warm_queue: Arc<tokio::sync::Semaphore>,
+    /// Background warms that may hold an install permit at once, leaving the
+    /// rest of `install_permits` to installs a caller is waiting on.
+    warm_permits: tokio::sync::Semaphore,
 }
 
 type CapKey = (String, String, PredNode, usize);
 
 const MAX_CONCURRENT_INSTALLS: usize = 4;
+const MAX_CONCURRENT_WARMS: usize = 2;
+const MAX_QUEUED_WARMS: usize = 64;
 const CAP_EXCEEDED_TTL: Duration = Duration::from_secs(600);
 
 /// Outcome of one [`TantivySearchService::reap_disk_cache`] sweep.
@@ -241,11 +255,14 @@ impl TantivySearchService {
             install_permits: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_INSTALLS)),
             installing: DashMap::new(),
             cap_exceeded: DashMap::new(),
+            warming: DashMap::new(),
+            warm_queue: Arc::new(tokio::sync::Semaphore::new(MAX_QUEUED_WARMS)),
+            warm_permits: tokio::sync::Semaphore::new(MAX_CONCURRENT_WARMS),
         }
     }
 
     /// Single-predicate convenience used by tests/tools.
-    pub async fn search(&self, table: &str, project_id: &str, field: &str, query_str: &str) -> Result<Option<Vec<Hit>>> {
+    pub async fn search(self: &Arc<Self>, table: &str, project_id: &str, field: &str, query_str: &str) -> Result<Option<Vec<Hit>>> {
         let node = PredNode::Leaf(TextMatchPred { column: field.to_string(), query: query_str.to_string() });
         Ok(self.search_with_stats(table, project_id, &node, usize::MAX, None).await?.map(|r| r.hits))
     }
@@ -320,15 +337,20 @@ impl TantivySearchService {
     /// - `Ok(None)` — no usable index, or hit cap exceeded.
     /// - `Ok(Some(SearchResult))` — search ran to completion within bounds.
     pub async fn search_with_stats(
-        &self, table: &str, project_id: &str, node: &PredNode, max_hits: usize, time_range: Option<(i64, i64)>,
+        self: &Arc<Self>, table: &str, project_id: &str, node: &PredNode, max_hits: usize, time_range: Option<(i64, i64)>,
     ) -> Result<Option<SearchResult>> {
-        Ok(self.search_detailed(table, project_id, node, max_hits, time_range).await?.ok())
+        Ok(self.search_detailed(table, project_id, node, max_hits, time_range, true).await?.ok())
     }
 
     /// `search_with_stats`, but the `Err` says WHY it could not answer: the
     /// refusals want opposite fixes (backfill / bigger cap / reindex).
+    ///
+    /// Without `wait_for_cold`, a window with any in-window index not installed
+    /// locally is refused as `delta_cold_index` and its missing blobs are warmed
+    /// in the background: the prefilter only accelerates a scan that evaluates
+    /// the predicate itself, so it must never make the query wait on downloads.
     pub async fn search_detailed(
-        &self, table: &str, project_id: &str, node: &PredNode, max_hits: usize, time_range: Option<(i64, i64)>,
+        self: &Arc<Self>, table: &str, project_id: &str, node: &PredNode, max_hits: usize, time_range: Option<(i64, i64)>, wait_for_cold: bool,
     ) -> Result<std::result::Result<SearchResult, &'static str>> {
         let cap_key: CapKey = (table.to_string(), project_id.to_string(), node.clone(), max_hits);
         let width = time_range.map_or(u64::MAX, |(lo, hi)| hi.abs_diff(lo));
@@ -371,6 +393,17 @@ impl TantivySearchService {
                 Some((file_uuid(key).to_string(), blob_path.clone(), e.rows, e.covered_files.clone(), e.ordinals_valid && e.covered_files.len() == 1, window))
             })
             .collect();
+        if !wait_for_cold {
+            let cold: Vec<_> = work
+                .iter()
+                .filter(|(uuid, blob, ..)| !has_any_segment(&self.cache_dir(table, project_id, uuid, blob)))
+                .map(|(uuid, blob, ..)| (uuid.clone(), blob.clone()))
+                .collect();
+            if !cold.is_empty() {
+                self.warm_in_background(table, project_id, cold);
+                return Ok(Err("delta_cold_index"));
+            }
+        }
 
         // One download+open+search task per index, SEARCH_CONCURRENCY-wide.
         // `None` hits = the index lacks a queried field (coverage gap).
@@ -520,6 +553,31 @@ impl TantivySearchService {
         Ok(warmed)
     }
 
+    /// Queue background installs of `blobs`, deduplicated against queued warms
+    /// and dropped once `MAX_QUEUED_WARMS` are pending.
+    fn warm_in_background(self: &Arc<Self>, table: &str, project_id: &str, blobs: Vec<(String, String)>) {
+        for (uuid, blob) in blobs {
+            let dir = self.cache_dir(table, project_id, &uuid, &blob);
+            let dashmap::mapref::entry::Entry::Vacant(slot) = self.warming.entry(dir.clone()) else { continue };
+            let Ok(queued) = Arc::clone(&self.warm_queue).try_acquire_owned() else {
+                SearchStats::add(&self.stats.cold_warms_dropped, 1);
+                continue;
+            };
+            slot.insert(());
+            SearchStats::add(&self.stats.cold_warms_spawned, 1);
+            let (me, table, project_id) = (Arc::clone(self), table.to_string(), project_id.to_string());
+            tokio::spawn(async move {
+                let _queued = queued;
+                if let Ok(_warm) = me.warm_permits.acquire().await
+                    && let Err(e) = me.ensure_cached(&table, &project_id, &uuid, &blob).await
+                {
+                    tracing::debug!("background tantivy warm of {blob} failed: {e:#}");
+                }
+                me.warming.remove(&dir);
+            });
+        }
+    }
+
     /// TTL-cached manifest read, removing the per-query S3 GET + JSON parse.
     pub(crate) async fn load_manifest_cached(&self, table: &str, project_id: &str) -> Result<Arc<Manifest>> {
         let key = (table.to_string(), project_id.to_string());
@@ -579,8 +637,12 @@ impl TantivySearchService {
         Ok((index, reader))
     }
 
+    fn cache_dir(&self, table: &str, project_id: &str, file_uuid: &str, blob_path: &str) -> PathBuf {
+        super::local_cache_path(&self.cache_root, table, project_id, &cache_generation_key(file_uuid, blob_path))
+    }
+
     async fn ensure_cached(&self, table: &str, project_id: &str, file_uuid: &str, blob_path: &str) -> Result<PathBuf> {
-        let dir = super::local_cache_path(&self.cache_root, table, project_id, &cache_generation_key(file_uuid, blob_path));
+        let dir = self.cache_dir(table, project_id, file_uuid, blob_path);
         // Stamped on every hit, not only on miss: recency is what the reaper
         // sorts by, so a frequently-served dir must not look as old as its unpack.
         self.last_used.insert(dir.clone(), SystemTime::now());

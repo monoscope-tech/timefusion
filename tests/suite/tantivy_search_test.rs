@@ -516,6 +516,9 @@ impl FailAfterArm {
     fn arm(&self) {
         self.armed.store(true, Relaxed);
     }
+    fn disarm(&self) {
+        self.armed.store(false, Relaxed);
+    }
     fn check(&self) -> OsResult<()> {
         if self.armed.load(Relaxed) {
             return Err(object_store::Error::NotSupported { source: "object store is armed to fail".into() });
@@ -727,7 +730,7 @@ async fn an_over_cap_predicate_is_refused_without_searching_again() {
     let rows_ref: Vec<(i64, &str, &str)> = rows.iter().map(|(t, id, l)| (*t, id.as_str(), *l)).collect();
     env.publish(&rows_ref, &["cap-uri"]).await;
     let error = level_error_node();
-    let search = || env.search.search_detailed(env.table, env.project, &error, 10, Some((1_000_000, 1_000_010)));
+    let search = || env.search.search_detailed(env.table, env.project, &error, 10, Some((1_000_000, 1_000_010)), true);
     let cost = || {
         [&env.search.stats.indexes_searched, &env.search.stats.prepares, &env.search.stats.manifest_loads, &env.search.stats.manifest_hits]
             .map(|c| c.load(Relaxed))
@@ -742,6 +745,46 @@ async fn an_over_cap_predicate_is_refused_without_searching_again() {
     assert_eq!(env.search.search_with_stats(env.table, env.project, &node, 10, None).await.unwrap().expect("usable").hits.len(), 1);
 }
 
+/// Prod 2026-09-30: a cold 24h ERROR count waited 88.9 s on installing every blob in the window
+/// (1.85 s warm) behind the shared install permits. The prefilter only accelerates a scan that
+/// evaluates the predicate itself, so a cold window must refuse at once — with no object-store
+/// read on the query path, proven by an armed store — and warm in the background for the next query.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cold_window_skips_the_prefilter_and_warms_in_the_background() {
+    let store = Arc::new(FailAfterArm::new(Arc::new(InMemory::new())));
+    let env = Env::new("otel_logs_and_spans", "p-cold", store.clone(), prod_defaults(), prod_defaults());
+    env.publish(&[(1_000_000, "a", "ERROR"), (1_000_001, "b", "INFO")], &["f1"]).await;
+    env.publish(&[(2_000_000, "c", "ERROR")], &["f2"]).await;
+    let error = level_error_node();
+    let search = |window| env.search.search_detailed(env.table, env.project, &error, 100, window, false);
+    let fetches = || env.search.stats.blob_fetches.load(Relaxed);
+
+    // Caches the manifest; a window that prunes every index has nothing to warm.
+    assert_eq!(search(Some((10, 20))).await.unwrap().err(), Some("delta_no_usable_index"));
+    store.arm();
+    assert_eq!(search(None).await.unwrap().err(), Some("delta_cold_index"), "a cold window must be refused, not installed or errored");
+    assert_eq!((fetches(), env.search.stats.prepares.load(Relaxed)), (0, 0), "a refused cold query must not install or open any index");
+
+    // The warm queued under the armed store failed; later cold queries queue it again until
+    // the background installs land and the prefilter engages.
+    store.disarm();
+    let r = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            match search(None).await.unwrap() {
+                Ok(r) => break r,
+                Err(reason) => assert_eq!(reason, "delta_cold_index"),
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("background warm must install both blobs");
+    let mut ids: Vec<_> = r.hits.iter().map(|h| h.id.as_str()).collect();
+    ids.sort();
+    assert_eq!(ids, ["a", "c"]);
+    assert_eq!(fetches(), 2, "each blob is installed once, in the background");
+}
+
 /// Prod 2026-09-30: a sealed-day index spans the whole day, so a fringe leg over a few hours
 /// of a busy project overflowed the cap on the DAY's matches and discarded the search after
 /// downloading every blob. The cap must count only in-window matches.
@@ -752,7 +795,7 @@ async fn a_busy_day_index_answers_a_window_whose_matches_fit_the_cap() {
     let rows_ref: Vec<(i64, &str, &str)> = rows.iter().map(|(t, id, l)| (*t, id.as_str(), *l)).collect();
     env.publish(&rows_ref, &["busy-uri"]).await;
     let error = level_error_node();
-    let search = |range| env.search.search_detailed(env.table, env.project, &error, 10, range);
+    let search = |range| env.search.search_detailed(env.table, env.project, &error, 10, range, true);
 
     assert_eq!(search(None).await.unwrap().err(), Some("delta_cap_exceeded_one_index"), "30 whole-day matches overflow a cap of 10");
     let (lo, hi) = (1_010_000, 1_019_000);
