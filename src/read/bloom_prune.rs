@@ -31,13 +31,16 @@ use tracing::{debug, warn};
 /// IN-lists above this skip pruning: per-value probe cost must stay
 /// negligible next to the planning it saves.
 pub(crate) const MAX_NEEDLE_VALUES: usize = 64;
-/// A file whose bloom payload exceeds this is recorded `no_bloom` — a bloom
-/// this dense prunes little and would bloat the sidecar.
+/// Per-file sidecar budget. Columns are kept smallest first while they fit, so a
+/// large file drops its near-unique columns (dense blooms that prune little) but
+/// keeps the cheap ones.
 pub(crate) const PER_FILE_BLOOM_CAP_BYTES: u64 = 4 * 1024 * 1024;
 /// Windows wider than this skip pruning: per-date probe cost scales with the
 /// window, while the value concentrates in point lookups.
 pub(crate) const MAX_PRUNE_DATES: usize = 92;
-const SIDECAR_VERSION: u8 = 1;
+/// v1 recorded a file over the budget as `no_bloom`; those entries decode as absent so the
+/// reconcile re-lifts them under the per-column fit.
+const SIDECAR_VERSION: u8 = 2;
 const BINCODE_CONFIG: bincode::config::Configuration = bincode::config::standard();
 
 /// One file's serialized blooms: column name → one serialized `Sbbf` per row
@@ -65,8 +68,12 @@ pub fn encode_sidecar(sidecar: &DateSidecar) -> Result<Vec<u8>> {
 
 pub fn decode_sidecar(bytes: &[u8]) -> Result<DateSidecar> {
     let Some((&v, rest)) = bytes.split_first() else { anyhow::bail!("empty bloom sidecar") };
-    anyhow::ensure!(v == SIDECAR_VERSION, "unknown bloom sidecar version {v}");
-    Ok(bincode::decode_from_slice(rest, BINCODE_CONFIG)?.0)
+    anyhow::ensure!(matches!(v, 1..=SIDECAR_VERSION), "unknown bloom sidecar version {v}");
+    let mut sidecar: DateSidecar = bincode::decode_from_slice(rest, BINCODE_CONFIG)?.0;
+    if v == 1 {
+        sidecar.files.retain(|f| !f.no_bloom);
+    }
+    Ok(sidecar)
 }
 
 /// `project_id=<pid>/date=<d>/part-….parquet` → (pid, date).
@@ -338,8 +345,8 @@ impl BloomPruneRegistry {
 }
 
 /// Lift `cols`' existing parquet blooms out of one file: footer + bloom ranges
-/// only, no row decode. `no_bloom` when the file has no usable blooms or its
-/// payload exceeds `PER_FILE_BLOOM_CAP_BYTES`.
+/// only, no row decode. Keeps the columns that `fit_columns` admits; `no_bloom`
+/// when none qualifies.
 pub async fn build_file_blooms(store: Arc<dyn ObjectStore>, rel: &str, file_size: u64, cols: &[String]) -> Result<FileBlooms> {
     let reader = crate::storage::ObjectStoreReader::new(store, Path::from(rel), file_size);
     let mut builder = ParquetRecordBatchStreamBuilder::new(reader).await.context("parquet footer")?;
@@ -347,23 +354,37 @@ pub async fn build_file_blooms(store: Arc<dyn ObjectStore>, rel: &str, file_size
     // Leaf indices are resolved up front because reading a bloom borrows the builder mutably.
     let leaves: Vec<Option<usize>> = cols.iter().map(|col| builder.parquet_schema().columns().iter().position(|c| c.path().string() == *col)).collect();
     let mut columns = Vec::with_capacity(cols.len());
-    let mut total = 0u64;
     'col: for (col, leaf) in cols.iter().zip(leaves).filter_map(|(col, leaf)| Some((col, leaf?))) {
-        let mut blooms = Vec::with_capacity(n_rg);
+        let (mut blooms, mut size) = (Vec::with_capacity(n_rg), 0u64);
         for rg in 0..n_rg {
             // A column qualifies only with a bloom in EVERY row group.
             let Some(sbbf) = builder.get_row_group_column_bloom_filter(rg, leaf).await.context("read bloom")? else { continue 'col };
             let mut bytes = Vec::new();
             sbbf.write(&mut bytes).map_err(|e| anyhow!("serialize bloom: {e}"))?;
-            total += bytes.len() as u64;
-            if total > PER_FILE_BLOOM_CAP_BYTES {
-                return Ok(FileBlooms { rel: rel.to_string(), no_bloom: true, columns: Vec::new() });
+            size += bytes.len() as u64;
+            if size > PER_FILE_BLOOM_CAP_BYTES {
+                continue 'col;
             }
             blooms.push(bytes);
         }
         columns.push((col.clone(), blooms));
     }
+    let columns = fit_columns(columns, PER_FILE_BLOOM_CAP_BYTES);
     Ok(FileBlooms { rel: rel.to_string(), no_bloom: columns.is_empty(), columns })
+}
+
+/// The smallest columns whose blooms fit `cap` together.
+fn fit_columns(mut columns: Vec<(String, Vec<Vec<u8>>)>, cap: u64) -> Vec<(String, Vec<Vec<u8>>)> {
+    let size = |(_, blooms): &(String, Vec<Vec<u8>>)| blooms.iter().map(|b| b.len() as u64).sum::<u64>();
+    columns.sort_by_cached_key(size);
+    let mut total = 0;
+    columns
+        .into_iter()
+        .take_while(|c| {
+            total += size(c);
+            total <= cap
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -405,6 +426,26 @@ mod tests {
     fn probe_semantics(file: &str, col: &str, values: &[&str]) -> Option<bool> {
         let needles: Vec<(String, Vec<String>)> = vec![(col.to_string(), values.iter().map(|v| v.to_string()).collect())];
         fixture().files.get(&format!("project_id=p/date=2026-08-22/{file}.parquet")).map(|probe| probe.rejects(&needles))
+    }
+
+    /// Sizes are per-column bloom bytes; a large file keeps its cheap columns rather than none.
+    #[test_case(&[("id", 5), ("session", 1), ("trace", 2)], 4 => vec!["session", "trace"] ; "drops the dense column that busts the cap")]
+    #[test_case(&[("id", 5), ("session", 1)], 10 => vec!["session", "id"] ; "everything fits")]
+    #[test_case(&[("id", 5)], 4 => Vec::<&str>::new() ; "nothing fits")]
+    fn fit_columns_keeps_smallest(cols: &[(&str, usize)], cap: u64) -> Vec<String> {
+        let cols = cols.iter().map(|(c, n)| (c.to_string(), vec![vec![0u8; *n]])).collect();
+        fit_columns(cols, cap).into_iter().map(|(c, _)| c).collect()
+    }
+
+    /// v1 sidecars decode with their over-cap `no_bloom` stubs dropped, so reconcile re-lifts them;
+    /// a current-version stub is a settled verdict and stays.
+    #[test_case(1 => vec!["f1"] ; "v1 stub is absent")]
+    #[test_case(SIDECAR_VERSION => vec!["f1", "f2"] ; "current stub is kept")]
+    fn legacy_no_bloom_decodes_absent(version: u8) -> Vec<String> {
+        let entry = |rel: &str, no_bloom| FileBlooms { rel: rel.into(), no_bloom, columns: vec![] };
+        let mut bytes = encode_sidecar(&DateSidecar { files: vec![entry("f1", false), entry("f2", true)] }).unwrap();
+        bytes[0] = version;
+        decode_sidecar(&bytes).unwrap().files.into_iter().map(|f| f.rel).collect()
     }
 
     const T: &str = "context___trace_id";

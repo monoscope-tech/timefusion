@@ -220,6 +220,47 @@ async fn pgwire_bound_any_array_prunes_like_in_list() -> Result<()> {
     Ok(())
 }
 
+/// A file whose blooms over all columns exceeded the per-file cap was recorded `no_bloom` —
+/// every compacted file, so a sealed day never pruned. Such stubs in a sidecar written before
+/// the per-column fit must be re-lifted, after which a session lookup rejects the other file.
+#[tokio::test(flavor = "multi_thread")]
+async fn legacy_no_bloom_stubs_are_relifted_and_prune() -> Result<()> {
+    use std::sync::atomic::Ordering::Relaxed;
+    use timefusion::read::bloom_prune::{DateSidecar, FileBlooms, encode_sidecar, sidecar_path};
+    let cfg = TestConfigBuilder::new("bloom_relift").with_buffer_mode(BufferMode::Enabled).build();
+    let store = Arc::new(InMemory::new());
+    let reg = Arc::new(BloomPruneRegistry::new(store.clone(), 64 << 20, Duration::from_secs(300)));
+    let db = Arc::new(Database::with_config(cfg).await?.with_bloom_prune(reg));
+    let pid = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+    let ts = ts();
+    for (id, session) in [("a", "sess-A"), ("b", "sess-B")] {
+        let mut r = row(id, &pid, ts, &format!("trace-{id}"));
+        r["attributes___session___id"] = json!(session);
+        insert(&db, &pid, vec![r]).await?;
+    }
+    // Seeded before any reconcile or query, so no resident entry masks the stored stub.
+    let date = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(ts).unwrap().date_naive().to_string();
+    let files = db.list_file_uris(&pid, "otel_logs_and_spans").await?;
+    let stubs = files.iter().map(|uri| FileBlooms { rel: uri[uri.find("project_id=").unwrap()..].to_string(), no_bloom: true, columns: vec![] }).collect();
+    let mut legacy = encode_sidecar(&DateSidecar { files: stubs })?;
+    legacy[0] = 1;
+    object_store::ObjectStoreExt::put(store.as_ref(), &sidecar_path("otel_logs_and_spans", &pid, &date), legacy.into()).await?;
+    db.bloom_sidecar_reconcile().await?;
+
+    let mut ctx = Arc::clone(&db).create_session_context();
+    db.setup_session_context(&mut ctx)?;
+    let (lo, hi) = (ts - 3_600_000_000, ts + 3_600_000_000);
+    let sql = format!(
+        "SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = '{pid}' AND attributes___session___id IN ('sess-A', 'sess-X') \
+         AND timestamp >= to_timestamp_micros({lo}) AND timestamp <= to_timestamp_micros({hi})"
+    );
+    let stats = &db.bloom_prune().unwrap().stats;
+    let before = stats.files_rejected.load(Relaxed);
+    let n = ctx.sql(&sql).await?.collect().await?[0].column(0).as_primitive::<Int64Type>().value(0);
+    assert_eq!((n, stats.files_rejected.load(Relaxed) - before), (1, 1), "sess-B's file must be bloom-rejected once its stub is re-lifted");
+    Ok(())
+}
+
 /// `attributes___session___id` is `enrich_only`: monoscope's backfill only fills it, so a
 /// session lookup may prune files lacking the id even though an UPDATE appends a new version
 /// in a new file and leaves the empty version behind. The lookup must still resolve every row
