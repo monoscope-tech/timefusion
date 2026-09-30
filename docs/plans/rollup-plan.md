@@ -224,8 +224,10 @@ Done items carry evidence (commit or number). Open items carry the next action, 
       (`dv_strip_resorts_total` counts undeclared footers); all-DV cells strip one file at a time;
       bodies of today's/yesterday's outputs ≤256 MB warmed within the preload budget.
 - [ ] Parks are in-memory: each restart retries a refused set once. Decide if persistence is worth it.
-- [ ] Re-measure the 2-day-old shipbubble trace lookup once 09-26/27 are fully stripped (last: 15.9 s cold, 3.1 s warm).
-- [ ] Watch query latency against the 12-per-10-min cap while today's strip debt drains (it dominates 09-29 HotPacking).
+- [x] Re-measure the 2-day-old shipbubble trace lookup once 09-26/27 are fully stripped (last: 15.9 s cold, 3.1 s warm).
+      09-30 20:00: 2.64 s cold / 0.61 s warm (was 15.9 s / 3.1 s).
+- [x] Watch query latency against the 12-per-10-min cap while today's strip debt drains (it dominates 09-29 HotPacking).
+      09-30: realistic dashboard mix p95 1.8 s / p99 2.6 s with the cap in force; no strip-driven latency seen.
 
 ### Tiers
 
@@ -233,7 +235,8 @@ Done items carry evidence (commit or number). Open items carry the next action, 
 - [x] v4 widening: 09-21 → 09-14 → 09-07 → `RESUME FROM 2026-08-29` (19:02, all 31 days).
 - [x] drop-v3 (`4319b951`): owner overrode the contiguity gate (queries older than 14 days are rare).
 - [x] v4 backfill: contiguous days min/median 30/30 (09-30 04:07).
-- [ ] Re-rank residual cost once the backfill finishes (1B and 1C may matter for large units).
+- [x] Re-rank residual cost once the backfill finishes (1B and 1C may matter for large units).
+      Done 09-30 as the Stage 1C measurement: HotPacking 41%, v4 30%, Dedup 12%; churn was re-arm waves (fixed dfb0701a, 36bbbe6a).
 - [x] W28 `service_name_hll` unblocked (`e0e27dbe`).
 - [x] RUM measures on v4 (`180ced63`, `8bea392b`); measure re-mint backfill for older cells (`8184a638`, in progress).
 - [x] RUM widgets (monoscope branch merged into `overnight-exploration-29-09`) route to v4 `rum_*` measures:
@@ -251,7 +254,8 @@ Done items carry evidence (commit or number). Open items carry the next action, 
 - [x] W56 hour-grain session tiers (the proper W40 fix, `ecc2483f`). `rollup_miss_sub_grain_slices_total` read 0.
 - [x] W27 `sessions_1h_v2` resumed from 2026-09-22 (18:08).
 - [x] Land `test/rum-sessions-e2e` (`prepared_rum_sessions_use_browser_rollups_and_raw_edges`, passes) with the next deploy.
-- [ ] Confirm the RUM sessions query routes to `sessions_1h_v2` in prod on a mature process.
+- [x] Confirm the RUM sessions query routes to `sessions_1h_v2` in prod on a mature process.
+      09-30: sealed-day sessions query is a hybrid rollup hit, 2.1 s.
 - [x] Dropped `sessions_1h_v1` (`6c3e8b3b`, deployed 09-30 04:45); its durable pause is retired at boot with its queued work.
 
 ### Scheduler and ops
@@ -268,8 +272,9 @@ Done items carry evidence (commit or number). Open items carry the next action, 
       `refused_cells` via `select_bin`, WARN only on a real refusal (`02f9f0a1`, `27440d30`). Ledger
       disagreements are a boot burst (the ledger is written only at replay); seeded coverage is gated by the
       same output + row checks as replay.
-- [ ] `ordering_pushdown::one_unsorted_file_does_not_cost_the_majority_its_ordering` e2e flakes under load
+- [x] `ordering_pushdown::one_unsorted_file_does_not_cost_the_majority_its_ordering` e2e flakes under load
       (passes alone). Leave unless it blocks signoff.
+      Already fixed by `a84e3775` (light-optimize disabled in the test); stress runs 0 failures.
 - [x] Old-process shutdown can panic in `buoyant_kernel_engine` executor (`RecvError`) after the WAL drained.
       Cause: cancelling maintenance dropped the maintenance runtime at once, under in-flight kernel IO. Fixed:
       that runtime now outlives `maintenance_tasks_tracker` (preload + dedup cron now tracked).
@@ -278,7 +283,7 @@ Done items carry evidence (commit or number). Open items carry the next action, 
       `a_retired_corpse_goes_first_and_counts_as_progress`: "dedup masks only bins sealed 2 h; run after 03:00 UTC"),
       which blocks every signoff for 3 h a day. Pinning `support::set_micros` alone is not enough: some part of the dedup
       path still judges "sealed 2 h" by wall time. Find it, route it through the virtual clock, then pin the tests.
-- [ ] **Memory spikes / OOM — root cause found by a prod heap profile (09-30).** The 09-29 OOM and 09-30 spikes of
+- [x] **Memory spikes / OOM — root cause found by a prod heap profile (09-30).** The 09-29 OOM and 09-30 spikes of
       41–106 GB (also with no synthetic load, 07:00–07:07) were tantivy `ensure_cached` installing whole index blobs
       in memory: `zstd::decode_all` 83.7 GB + `GetResult::bytes` 28.3 GB live, up to 32 installs at once, outside every
       pool. Fixed in `fa75bbd3` (stream download → zstd → tar to disk, ≤4 installs, one download per blob), deployed
@@ -286,6 +291,7 @@ Done items carry evidence (commit or number). Open items carry the next action, 
       past ~30 GB. Recipe: `TIMEFUSION_HEAP_PROFILE_ACTIVE=true` via `docker service update --env-add` (owner-approved;
       a CapRover deploy resets it), `scratchpad/heapcatch/catch.sh`, `scratchpad/heapsym/sym.sh`.
       Not the cause, all ruled out: DedupExec (absent from these plans), the deploy drain (178k rows, 1 s), byte admission.
+      Verified: realistic load anon peak 19.5–24.8 GB across four runs after `7a259c3c`.
 - [x] Whole-file GET on a bypassed miss of a ≤16 MB parquet file (`7a259c3c`): real but small (+3.5 → +1.5 GB locally).
 - [x] Realistic 4-min baseline before the fix (09-30 06:45): 330 queries, p50 0.69 s, p95 6.8 s, p99 15.1 s, 7 errors.
 - [x] **Tantivy install fix verified** (`7a259c3c`, 09-30 08:04–08:34, 2,086 queries): anon peak 23.6 GB (was 41–106 GB spikes).
@@ -302,10 +308,12 @@ Done items carry evidence (commit or number). Open items carry the next action, 
       predicate, bounded background warm (≤2 permits, 64-deep queue). Whale sealed 24h ERROR count on untouched days:
       1.97 s / 1.44 s cold (was 88.9 s / 10.3 s). First hour: 107 warms spawned, 155 dropped (queue full, by design).
       Histogram readers (`histogram_reader`) still install cold indexes synchronously — not covered.
-- [ ] 09-30 decisions (owner): batch sealed-day rebuilds to ≤1/h per cell + enforce the rebuild deadline (in progress);
+- [x] 09-30 decisions (owner): batch sealed-day rebuilds to ≤1/h per cell + enforce the rebuild deadline (in progress);
       delete byte admission (in progress); heap profiling left OFF (recipe in memory); monoscope items handed to the
       monoscope session (array_has lowering, issue-chart backoff, 10 s session-lookup timeout; hashes cadence unchanged).
-- [ ] Flaky: `kill_recovery::acked_rows_survive_sigkill_*` (multi_tenant, concurrent_writers) each retried once 09-30.
+      Done: sealed-day rebuilds ≤1/h (`bfd17aed`; deadline NOT enforced — owner: long whale rebuilds are fine if progressing); byte admission deleted (`24929428`); monoscope items shipped on its `tf-followups` branch.
+- [x] Flaky: `kill_recovery::acked_rows_survive_sigkill_*` (multi_tenant, concurrent_writers) each retried once 09-30.
+      Root cause: concurrent first CREATE of a table failed on "protocol changed"; fixed `45d02461` (adopt the winner's table on any CREATE failure).
 - [ ] Flaky e2e: `recent_window_pruning::dv_bearing_file_keeps_parquet_pushdown_on_its_siblings` (1 retry in 0930e signoff).
 - [x] Late RUM rows void a whole sealed day slice (09-29 day slice rebuilt 256×; one rebuild took 2,461 s while a sealed
       consolidation overlapped). Fixed on `rollup/batch-sealed-rebuilds`: a built rollup slice over a date before today
@@ -323,9 +331,12 @@ Done items carry evidence (commit or number). Open items carry the next action, 
 
 - [ ] Pattern-tag `update2Sql` source fix (`BackgroundJobs.hs` ~2944): ~40% of today's masked rows are its
       MoR versions, and it blocks certification.
-- [ ] `array_has` lowering for `hashes` predicates (`monoscope/plans/array-has-lowering.md`, ~40x cheaper).
-- [ ] Back off issue-chart auto-refresh after a timeout (Talstack `jsonb_path_exists(to_jsonb(hashes))` charts hit 90 s).
-- [ ] Add a timeout to the `Issues.hs:488-497` session lookup (`tryWithin Nothing`; stalls up to 77 s).
+- [x] `array_has` lowering for `hashes` predicates (`monoscope/plans/array-has-lowering.md`, ~40x cheaper).
+      Implemented on monoscope `tf-followups` (09-30); PR pending on the monoscope side.
+- [x] Back off issue-chart auto-refresh after a timeout (Talstack `jsonb_path_exists(to_jsonb(hashes))` charts hit 90 s).
+      Implemented on monoscope `tf-followups` (09-30); PR pending on the monoscope side.
+- [x] Add a timeout to the `Issues.hs:488-497` session lookup (`tryWithin Nothing`; stalls up to 77 s).
+      Implemented on monoscope `tf-followups` (09-30); PR pending on the monoscope side.
 - [ ] Optional: compute `trace_count` in `rollupServiceEdges` without referencing `bucketed` twice (12 → 6 scans).
 
 ### 2026-09-29/30 overnight log (condensed)
