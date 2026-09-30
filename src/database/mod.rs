@@ -424,6 +424,7 @@ pub mod scan_metric_names {
         PREFILTER_SKIP_NO_USABLE_INDEX = "timefusion.scan.prefilter_skipped.no_usable_index" as scan.prefilter_skipped_no_usable_index when "delta_no_usable_index";
         PREFILTER_SKIP_CAP_EXCEEDED_ONE_INDEX = "timefusion.scan.prefilter_skipped.cap_exceeded_one_index" as scan.prefilter_skipped_cap_exceeded_one_index when "delta_cap_exceeded_one_index";
         PREFILTER_SKIP_CAP_EXCEEDED_COMBINED = "timefusion.scan.prefilter_skipped.cap_exceeded_combined" as scan.prefilter_skipped_cap_exceeded_combined when "delta_cap_exceeded_combined";
+        PREFILTER_SKIP_CAP_EXCEEDED_MEMO = "timefusion.scan.prefilter_skipped.cap_exceeded_memo" as scan.prefilter_skipped_cap_exceeded_memo when "delta_cap_exceeded_memo";
         PREFILTER_SKIP_NO_HITS_RETURNED = "timefusion.scan.prefilter_skipped.no_hits_returned" as scan.prefilter_skipped_no_hits_returned when "delta_no_hits_returned";
         PREFILTER_SKIP_DELTA_ERROR = "timefusion.scan.prefilter_skipped.delta_error" as scan.prefilter_skipped_delta_error when "delta_error";
     }

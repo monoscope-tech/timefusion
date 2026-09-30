@@ -1317,7 +1317,9 @@ mod stale_coverage_metric_tests {
     /// `record_prefilter_skip` only fires if a query happens to hit that path.
     #[test]
     fn every_search_refusal_is_a_registered_prefilter_reason() {
-        for reason in ["delta_no_index", "delta_no_usable_index", "delta_cap_exceeded_one_index", "delta_cap_exceeded_combined", "delta_error"] {
+        for reason in
+            ["delta_no_index", "delta_no_usable_index", "delta_cap_exceeded_one_index", "delta_cap_exceeded_combined", "delta_cap_exceeded_memo", "delta_error"]
+        {
             assert!(scan_metric_names::prefilter_skip_metric(reason).is_some(), "{reason} would vanish from the breakdown");
         }
         // Distinct names, or the split buys nothing.

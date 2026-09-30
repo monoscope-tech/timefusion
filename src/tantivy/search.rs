@@ -14,7 +14,7 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    time::{Instant, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 
 use anyhow::{Context, Result, anyhow};
@@ -158,9 +158,16 @@ pub struct TantivySearchService {
     install_permits: Arc<tokio::sync::Semaphore>,
     /// Per-dir install lock: concurrent misses on one blob fetch it once.
     installing: DashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>,
+    /// Predicates whose search recently overflowed `max_hits`. The cap counts whole-index
+    /// hits, so a common value (`status_code = 'ERROR'`) overflows on every query of a
+    /// busy project — after paying for every cold blob download in the window.
+    cap_exceeded: DashMap<CapKey, Instant>,
 }
 
+type CapKey = (String, String, PredNode, usize);
+
 const MAX_CONCURRENT_INSTALLS: usize = 4;
+const CAP_EXCEEDED_TTL: Duration = Duration::from_secs(600);
 
 /// Outcome of one [`TantivySearchService::reap_disk_cache`] sweep.
 #[derive(Debug, Default, Clone, Copy)]
@@ -231,6 +238,7 @@ impl TantivySearchService {
             last_used: DashMap::new(),
             install_permits: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_INSTALLS)),
             installing: DashMap::new(),
+            cap_exceeded: DashMap::new(),
         }
     }
 
@@ -319,6 +327,17 @@ impl TantivySearchService {
     pub async fn search_detailed(
         &self, table: &str, project_id: &str, node: &PredNode, max_hits: usize, time_range: Option<(i64, i64)>,
     ) -> Result<std::result::Result<SearchResult, &'static str>> {
+        let cap_key: CapKey = (table.to_string(), project_id.to_string(), node.clone(), max_hits);
+        if self.cap_exceeded.get(&cap_key).is_some_and(|at| at.elapsed() < CAP_EXCEEDED_TTL) {
+            return Ok(Err("delta_cap_exceeded_memo"));
+        }
+        let cap_exceeded = |reason: &'static str| {
+            if self.cap_exceeded.len() >= 4096 {
+                self.cap_exceeded.retain(|_, at| at.elapsed() < CAP_EXCEEDED_TTL);
+            }
+            self.cap_exceeded.insert(cap_key.clone(), Instant::now());
+            Ok(Err(reason))
+        };
         let m = self.load_manifest_cached(table, project_id).await?;
         if m.entries.is_empty() {
             return Ok(Err("delta_no_index"));
@@ -400,7 +419,7 @@ impl TantivySearchService {
         while let Some(res) = tasks.next().await {
             // Per-index overflow: some index alone exceeds `max_hits`.
             let Some((hits, rows, entry_covered, ordinals_valid)) = res? else {
-                return Ok(Err("delta_cap_exceeded_one_index"));
+                return cap_exceeded("delta_cap_exceeded_one_index");
             };
             let Some(hits) = hits else {
                 // An index that can't answer a queried field is a coverage hole
@@ -429,7 +448,7 @@ impl TantivySearchService {
                 if seen.insert((h.timestamp_micros, h.id.clone())) {
                     all_hits.push(h);
                     if all_hits.len() > max_hits {
-                        return Ok(Err("delta_cap_exceeded_combined"));
+                        return cap_exceeded("delta_cap_exceeded_combined");
                     }
                 }
             }

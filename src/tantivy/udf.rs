@@ -284,7 +284,7 @@ pub fn extract_text_match(expr: &datafusion::logical_expr::Expr) -> Option<TextM
     Some(TextMatchPred { column: c.name.clone(), query })
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TextMatchPred {
     pub column: String,
     pub query: String,
@@ -292,7 +292,7 @@ pub struct TextMatchPred {
 
 /// Boolean structure of the routable `text_match` predicates in a filter tree,
 /// evaluated inside the tantivy/MemBuffer indexes (And→Must, Or→Should).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum PredNode {
     And(Vec<PredNode>),
     Or(Vec<PredNode>),

@@ -715,3 +715,29 @@ async fn a_fat_needle_aborts_before_materializing_hits() {
     let r = env.search.search_with_stats(env.table, env.project, &node, 10, None).await.unwrap().expect("usable");
     assert_eq!(r.hits.len(), 1);
 }
+
+/// Prod 2026-09-30: `count(*) … status_code = 'ERROR'` p99 tail (50–90 s under load). The
+/// cap counts whole-index hits, so a common value overflows on every query of a busy
+/// project — after downloading every cold blob in the window. The next query for the same
+/// predicate must refuse without loading the manifest or touching an index.
+#[tokio::test]
+async fn an_over_cap_predicate_is_refused_without_searching_again() {
+    let env = Env::prod("otel_logs_and_spans", "p-capmemo");
+    let rows: Vec<(i64, String, &str)> = (0..50).map(|i| (1_000_000 + i as i64, format!("id-{i}"), "ERROR")).collect();
+    let rows_ref: Vec<(i64, &str, &str)> = rows.iter().map(|(t, id, l)| (*t, id.as_str(), *l)).collect();
+    env.publish(&rows_ref, &["cap-uri"]).await;
+    let error = level_error_node();
+    let search = || env.search.search_detailed(env.table, env.project, &error, 10, Some((1_000_000, 1_000_010)));
+    let cost = || {
+        [&env.search.stats.indexes_searched, &env.search.stats.prepares, &env.search.stats.manifest_loads, &env.search.stats.manifest_hits]
+            .map(|c| c.load(Relaxed))
+    };
+
+    assert!(search().await.unwrap().is_err_and(|r| r.starts_with("delta_cap_exceeded_")), "50 hits must overflow a cap of 10");
+    let after_first = cost();
+    assert_eq!(search().await.unwrap().err(), Some("delta_cap_exceeded_memo"));
+    assert_eq!(cost(), after_first, "a remembered overflow must not reload the manifest or search any index");
+    // A different predicate on the same project is unaffected.
+    let node = timefusion::tantivy::udf::PredNode::Leaf(TextMatchPred { column: "id".into(), query: "id-7".into() });
+    assert_eq!(env.search.search_with_stats(env.table, env.project, &node, 10, None).await.unwrap().expect("usable").hits.len(), 1);
+}
