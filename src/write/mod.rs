@@ -4817,11 +4817,13 @@ mod tests {
     #[serial]
     #[tokio::test]
     async fn force_flush_current_bucket_drains_open_window() {
+        let now = crate::support::set_micros(chrono::Utc::now().timestamp_micros());
+        let _clock = scopeguard::guard((), |_| crate::support::unfreeze());
         let (_dir, cfg, project, table) = test_ids_env("fc");
         let layer = layer_with(cfg, noop_delta());
 
-        // create_test_batch uses now() timestamps → the current (open) bucket.
-        layer.insert(&project, &table, vec![create_test_batch(&project)]).await.unwrap();
+        // Row and flush clocks must stay in the same bucket even at a wall-clock boundary.
+        layer.insert(&project, &table, vec![span_batch("open", "span", &project, now)]).await.unwrap();
 
         layer.flush_completed_buckets().await.unwrap();
         assert!(!layer.is_empty(), "completed-bucket flush must leave the open bucket in MemBuffer");
