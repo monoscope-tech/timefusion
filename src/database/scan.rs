@@ -557,9 +557,7 @@ impl ProjectRoutingTable {
             .map_or_else(Default::default, |window| self.database.certified_file_split(&table, project_id, &self.table_name, window));
         if skip_dedup && readmit_mutable_filters {
             let mutable = Self::version_mutable_columns(&self.table_name);
-            let leg_safe = |f: &Expr| {
-                !Self::references_tombstone(&self.table_name, f) && !mutable.as_ref().is_some_and(|m| f.column_refs().iter().any(|c| m.contains(&c.name)))
-            };
+            let leg_safe = |f: &Expr| !Self::references_tombstone(&self.table_name, f) && Self::version_safe(&self.table_name, mutable.as_ref(), f);
             delta_only_filters.extend(unstripped_filters.iter().filter(|f| !leg_safe(f) && !Self::references_tombstone(&self.table_name, f)).cloned());
         }
         // Restoring the pushed limit is only sound when nothing above the
@@ -656,7 +654,8 @@ impl ProjectRoutingTable {
             .iter()
             .filter(|f| {
                 !Self::references_tombstone(&self.table_name, f)
-                    && f.column_refs().iter().all(|c| schema.index_of(&c.name).is_ok() && !mutable.as_ref().is_some_and(|m| m.contains(&c.name)))
+                    && f.column_refs().iter().all(|c| schema.index_of(&c.name).is_ok())
+                    && Self::version_safe(&self.table_name, mutable.as_ref(), f)
             })
             .cloned()
             .reduce(Expr::and);
@@ -779,6 +778,22 @@ impl ProjectRoutingTable {
                 .chain(schema.tombstone_column.clone())
                 .collect(),
         )
+    }
+
+    /// Is `f` sound below the merge-on-read dedup, i.e. can it match an older
+    /// version only when it matches the winner too? True when it reads no column
+    /// of `mutable`, or reads `enrich_only` ones solely through non-empty `=`/`IN`
+    /// combined by AND/OR — both monotone in a value that only moves from empty
+    /// to set.
+    pub(crate) fn version_safe(table_name: &str, mutable: Option<&HashSet<String>>, f: &Expr) -> bool {
+        fn safe(f: &Expr, m: &HashSet<String>, schema: Option<&crate::schema::TableSchema>) -> bool {
+            match f {
+                _ if !f.column_refs().iter().any(|c| m.contains(&c.name)) => true,
+                Expr::BinaryExpr(BinaryExpr { left, op: Operator::And | Operator::Or, right }) => safe(left, m, schema) && safe(right, m, schema),
+                _ => schema.is_some_and(|s| crate::read::bloom_prune::is_enrich_needle(f, s)),
+            }
+        }
+        mutable.is_none_or(|m| safe(f, m, crate::schema::get_schema(table_name)))
     }
 
     /// Does `f` mention the table's tombstone marker? Such a predicate must never reach a scan leg.
@@ -1388,6 +1403,22 @@ mod decide_prefilter_tests {
         assert!(!routed_touches_mutable(Some(&mutable), None), "nothing routed");
     }
 
+    /// Which predicates may run below the dedup on otel, whose session id is `enrich_only`.
+    #[test_case("context___trace_id = 'x'" => true ; "immutable column")]
+    #[test_case("attributes___session___id IN ('a', 'b')" => true ; "non-empty IN over an enrich_only column")]
+    #[test_case("attributes___session___id = 'a' OR context___trace_id = 'x'" => true ; "OR with an immutable leg")]
+    #[test_case("attributes___session___id = ''" => false ; "empty value: an older version can hold it while the winner does not")]
+    #[test_case("attributes___session___id IS NULL" => false ; "IS NULL matches the pre-enrichment version")]
+    #[test_case("attributes___session___id <> 'a'" => false ; "negation is not monotone")]
+    #[test_case("NOT (attributes___session___id = 'a')" => false ; "NOT over a needle")]
+    #[test_case("attributes___session___id = 'a' AND hashes IS NULL" => false ; "AND with a plain-mutable leg")]
+    #[test_case("attributes___user___id = 'a'" => false ; "plain mutable column")]
+    fn otel_version_safe(sql: &str) -> bool {
+        let schema = crate::schema::get_schema("otel_logs_and_spans").unwrap().schema_ref();
+        let expr = datafusion::prelude::SessionContext::new().parse_sql_expr(sql, &schema.as_ref().clone().try_into().unwrap()).unwrap();
+        ProjectRoutingTable::version_safe("otel_logs_and_spans", ProjectRoutingTable::version_mutable_columns("otel_logs_and_spans").as_ref(), &expr)
+    }
+
     /// Against the REAL schema: fires if an indexed column is later marked `mutable: true`,
     /// which would silently make zero-hit pruning unsound on a merge-on-read table.
     #[test]
@@ -1544,9 +1575,7 @@ impl TableProvider for ProjectRoutingTable {
         // `decide_prefilter` therefore refuses mutable predicates entirely.
         let mutable = Self::version_mutable_columns(&self.table_name);
         let unstripped_filters = filters;
-        let leg_safe = |f: &Expr| {
-            !Self::references_tombstone(&self.table_name, f) && !mutable.as_ref().is_some_and(|m| f.column_refs().iter().any(|c| m.contains(&c.name)))
-        };
+        let leg_safe = |f: &Expr| !Self::references_tombstone(&self.table_name, f) && Self::version_safe(&self.table_name, mutable.as_ref(), f);
         let filters: Vec<Expr> = filters.iter().filter(|f| leg_safe(f)).cloned().collect();
         let optimized_filters = self.apply_time_series_optimizations(&filters)?;
 

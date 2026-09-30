@@ -7116,7 +7116,7 @@ mod writer_properties_tests {
     }
 
     fn field(name: &str, dt: &str) -> FieldDef {
-        FieldDef { name: name.into(), data_type: dt.into(), nullable: true, tantivy: None, dictionary: None, bloom_filter: false, mutable: false }
+        FieldDef { name: name.into(), data_type: dt.into(), nullable: true, ..Default::default() }
     }
 
     fn schema_with(fields: Vec<FieldDef>, sort: Vec<&str>) -> TableSchema {

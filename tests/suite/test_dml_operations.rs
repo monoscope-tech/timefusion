@@ -244,6 +244,36 @@ mod tests {
     #[test_case(
         "UPDATE otel_logs_and_spans SET attributes___session___id = COALESCE(attributes___session___id, 'sess-1') WHERE project_id = 'test_project'"
         => (3, 0) ; "test_update_session_backfill_shape_sets_once_then_noops")]
+    // monoscope's backfillSessionSql verbatim bar the grouping key: an aggregated
+    // self-source filling the `enrich_only` session id, which must pass the
+    // overwrite check through the FROM path.
+    #[test_case(
+        "UPDATE otel_logs_and_spans o
+            SET attributes___session___id     = COALESCE(o.attributes___session___id, s.sid),
+                attributes___user___id        = COALESCE(o.attributes___user___id, s.uid),
+                attributes___user___email     = COALESCE(o.attributes___user___email, s.uemail),
+                attributes___user___name      = COALESCE(o.attributes___user___name, s.uname),
+                attributes___user___full_name = COALESCE(o.attributes___user___full_name, s.ufull)
+            FROM (
+              SELECT name AS span_name,
+                     MAX('sess-' || name)               FILTER (WHERE name IS NOT NULL) AS sid,
+                     MAX('user-' || name)               FILTER (WHERE name IS NOT NULL) AS uid,
+                     MAX(attributes___user___email)     FILTER (WHERE attributes___user___email IS NOT NULL) AS uemail,
+                     MAX(attributes___user___name)      FILTER (WHERE attributes___user___name IS NOT NULL) AS uname,
+                     MAX(attributes___user___full_name) FILTER (WHERE attributes___user___full_name IS NOT NULL) AS ufull
+              FROM otel_logs_and_spans
+              WHERE project_id = 'test_project' AND timestamp >= '{lo}' AND timestamp < '{hi}'
+              GROUP BY name
+            ) s
+            WHERE o.project_id = 'test_project'
+              AND o.name = s.span_name
+              AND o.timestamp >= '{lo}' AND o.timestamp < '{hi}'
+              AND ((o.attributes___session___id IS NULL AND s.sid IS NOT NULL)
+                OR (o.attributes___user___id IS NULL AND s.uid IS NOT NULL)
+                OR (o.attributes___user___email IS NULL AND s.uemail IS NOT NULL)
+                OR (o.attributes___user___name IS NULL AND s.uname IS NOT NULL)
+                OR (o.attributes___user___full_name IS NULL AND s.ufull IS NOT NULL))"
+        => (3, 0) ; "test_update_monoscope_session_backfill_fills_enrich_only_once")]
     #[serial]
     #[tokio::test(flavor = "multi_thread")]
     async fn update_from_run_twice(sql_template: &'static str) -> (u64, u64) {

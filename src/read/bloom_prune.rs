@@ -83,19 +83,29 @@ pub fn project_date_of_rel(rel: &str) -> Option<(&str, &str)> {
     Some((pid, date))
 }
 
-/// Equality/IN needles over bloom-enabled, non-version-mutable string
-/// columns, from the query's top-level conjuncts. Two conjuncts on the same
-/// column merge value lists — weaker, but always safe.
+/// Equality/IN needles over bloom-enabled string columns that are not
+/// version-mutable (or are `enrich_only`, needles over non-empty values only),
+/// from the query's top-level conjuncts. Two conjuncts on the same column merge
+/// value lists — weaker, but always safe.
 pub fn extract_needles(filters: &[Expr], schema: &crate::schema::TableSchema, mutable: Option<&HashSet<String>>) -> Vec<(String, Vec<String>)> {
-    let eligible = |name: &str| schema.fields.iter().any(|f| f.name == name && f.bloom_filter) && !mutable.is_some_and(|m| m.contains(name));
+    let enrich = |name: &str| schema.field(name).is_some_and(|f| f.enrich_only);
+    let eligible = |name: &str| schema.field(name).is_some_and(|f| f.bloom_filter) && (enrich(name) || !mutable.is_some_and(|m| m.contains(name)));
     filters
         .iter()
         .flat_map(|f| split_conjunction(f))
-        .filter_map(|conjunct| needle(conjunct, &eligible).filter(|(_, values)| values.len() <= MAX_NEEDLE_VALUES))
+        .filter_map(|conjunct| {
+            needle(conjunct, &eligible).filter(|(col, values)| values.len() <= MAX_NEEDLE_VALUES && !(enrich(col) && values.iter().any(String::is_empty)))
+        })
         .into_group_map()
         .into_iter()
         .map(|(col, groups)| (col, groups.concat()))
         .collect()
+}
+
+/// `col = 'v'` / `col IN (...)` over an `enrich_only` column, every value
+/// non-empty: an older version (still empty) cannot match unless the winner does.
+pub(crate) fn is_enrich_needle(e: &Expr, schema: &crate::schema::TableSchema) -> bool {
+    needle(e, &|name| schema.field(name).is_some_and(|f| f.enrich_only)).is_some_and(|(_, values)| !values.iter().any(String::is_empty))
 }
 
 /// `col = 'v'`, `col IN (...)`, or an OR of those over one column — DataFusion
@@ -397,21 +407,25 @@ mod tests {
         fixture().files.get(&format!("project_id=p/date=2026-08-22/{file}.parquet")).map(|probe| probe.rejects(&needles))
     }
 
-    #[test_case("context___trace_id = 'a' OR context___trace_id = 'b' OR context___trace_id = 'c'", Some(vec!["a", "b", "c"]) ; "short IN / ANY lowered to an OR chain")]
-    #[test_case("(context___trace_id = 'a' AND name = 'x') OR context___trace_id = 'b'", Some(vec!["a", "b"]) ; "AND legs yield their needle")]
+    const T: &str = "context___trace_id";
+    const S: &str = "attributes___session___id";
+    #[test_case("context___trace_id = 'a' OR context___trace_id = 'b' OR context___trace_id = 'c'", Some((T, vec!["a", "b", "c"])) ; "short IN / ANY lowered to an OR chain")]
+    #[test_case("(context___trace_id = 'a' AND name = 'x') OR context___trace_id = 'b'", Some((T, vec!["a", "b"])) ; "AND legs yield their needle")]
     #[test_case("context___trace_id = 'a' OR name = 'b'", None ; "OR across columns proves nothing")]
-    #[test_case("context___trace_id = 'a' OR attributes___session___id = 'b'", None ; "a mutable leg poisons the OR")]
+    #[test_case("attributes___user___id = 'b'", None ; "a mutable column is never a needle")]
+    #[test_case("attributes___session___id IN ('a', 'b')", Some((S, vec!["a", "b"])) ; "an enrich_only column is a needle")]
+    #[test_case("attributes___session___id IN ('a', '')", None ; "an empty enrich_only value is not a needle")]
     #[test_case("context___trace_id NOT IN ('a')", None ; "NOT IN is never a needle")]
-    fn needles_from_or_chains(sql: &str, want: Option<Vec<&str>>) {
+    fn needles_from_or_chains(sql: &str, want: Option<(&str, Vec<&str>)>) {
         use datafusion::{
             arrow::datatypes::{DataType, Field, Schema},
             common::DFSchema,
             prelude::SessionContext,
         };
-        let fields = ["context___trace_id", "attributes___session___id", "name"].map(|n| Field::new(n, DataType::Utf8, true));
+        let fields = [T, S, "attributes___user___id", "name"].map(|n| Field::new(n, DataType::Utf8, true));
         let expr = SessionContext::new().parse_sql_expr(sql, &DFSchema::try_from(Schema::new(fields.to_vec())).unwrap()).unwrap();
-        let mutable: HashSet<String> = ["attributes___session___id".to_string()].into();
-        let got = extract_needles(&[expr], crate::schema::get_schema("otel_logs_and_spans").unwrap(), Some(&mutable));
-        assert_eq!(got, want.map(|v| vec![("context___trace_id".to_string(), v.into_iter().map(String::from).collect())]).unwrap_or_default());
+        let mutable = crate::database::ProjectRoutingTable::version_mutable_columns("otel_logs_and_spans");
+        let got = extract_needles(&[expr], crate::schema::get_schema("otel_logs_and_spans").unwrap(), mutable.as_ref());
+        assert_eq!(got, want.map(|(c, v)| vec![(c.to_string(), v.into_iter().map(String::from).collect())]).unwrap_or_default());
     }
 }

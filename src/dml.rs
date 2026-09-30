@@ -951,9 +951,24 @@ async fn perform_version_append(
     } else {
         None
     };
+    // An `enrich_only` column may only be filled: a version replacing a set value
+    // would let an older one match a pruned lookup its winner no longer does.
+    let enrich: Vec<&str> = assignments.iter().map(|(c, _)| c.as_str()).filter(|c| schema.field(c).is_some_and(|f| f.enrich_only)).collect();
+    let overwrites: Option<Expr> = assignments
+        .iter()
+        .filter(|(c, _)| enrich.contains(&c.as_str()))
+        .map(|(name, e)| {
+            let old = col(Column::new(Some(table_name.to_string()), name));
+            let new = requalify_for_merge(e.clone(), &source_cols, MOR_SOURCE, table_name)?;
+            Ok(old.clone().is_not_null().and(old.clone().not_eq(lit(""))).and(binary_expr(new, Operator::IsDistinctFrom, old)))
+        })
+        .process_results::<_, _, DataFusionError, _>(|it| it.reduce(Expr::or))?;
     let mut exprs = exprs;
     if let Some(pred) = changed.clone() {
         exprs.push(pred.alias(MOR_CHANGED_COL));
+    }
+    if let Some(pred) = overwrites.clone() {
+        exprs.push(pred.alias(MOR_OVERWRITES_COL));
     }
     let plan = builder.project(exprs)?.build()?;
 
@@ -967,6 +982,15 @@ async fn perform_version_append(
     let mut retracted = 0u64;
     while let Some(batch) = stream.next().await {
         let mut batch = batch?;
+        if overwrites.is_some() && batch.num_columns() > 0 {
+            use datafusion::arrow::array::cast::AsArray;
+            if batch.column(batch.num_columns() - 1).as_boolean().true_count() > 0 {
+                return Err(DataFusionError::Execution(format!(
+                    "UPDATE may only fill enrich_only column(s) {enrich:?} on {table_name} where they are NULL or '', never change or clear a set value"
+                )));
+            }
+            batch = batch.project(&(0..batch.num_columns() - 1).collect::<Vec<_>>())?;
+        }
         if changed.is_some() && batch.num_columns() > 0 {
             use datafusion::arrow::array::cast::AsArray;
             let mask = batch.column(batch.num_columns() - 1).as_boolean().clone();
@@ -1045,6 +1069,8 @@ async fn perform_version_append(
 /// Marker column carrying the per-row "assignments changed something" verdict;
 /// stripped before the append so the batch matches the table schema.
 const MOR_CHANGED_COL: &str = "__tf_changed";
+/// Marker column flagging rows whose UPDATE would overwrite a set `enrich_only` value.
+const MOR_OVERWRITES_COL: &str = "__tf_overwrites";
 
 /// Merge-on-read is a property of the SCHEMA alone — never also of whether a
 /// buffered layer is attached, or the same data would resolve differently

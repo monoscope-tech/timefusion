@@ -514,6 +514,14 @@ pub struct FieldDef {
     /// columns are always treated as mutable without declaring it.
     #[serde(default)]
     pub mutable: bool,
+    /// Narrows `mutable`: an UPDATE may only fill this column where it is NULL or
+    /// `''` (enforced per row by the merge-on-read append), so a row's versions
+    /// move from empty to one final value and never back. A positive `=`/`IN` over
+    /// non-empty values then matches an older version only if it matches the
+    /// winner too, so such predicates prune and push below the dedup like
+    /// immutable ones. Any other predicate on the column stays mutable.
+    #[serde(default)]
+    pub enrich_only: bool,
 }
 
 /// Per-column tantivy index configuration. Drives `tantivy_index::schema`.

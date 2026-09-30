@@ -219,3 +219,77 @@ async fn pgwire_bound_any_array_prunes_like_in_list() -> Result<()> {
     assert_eq!(stats.files_rejected.load(Relaxed) - before, 3, "the three files holding none of the ids must be bloom-rejected");
     Ok(())
 }
+
+/// `attributes___session___id` is `enrich_only`: monoscope's backfill only fills it, so a
+/// session lookup may prune files lacking the id even though an UPDATE appends a new version
+/// in a new file and leaves the empty version behind. The lookup must still resolve every row
+/// to its winning version, exactly like the unpruned formulation.
+#[tokio::test(flavor = "multi_thread")]
+async fn enrich_only_session_lookup_prunes_and_resolves_winners() -> Result<()> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let (db, pid) = setup("bloom_enrich").await?;
+    let mut ctx = Arc::clone(&db).create_session_context();
+    db.setup_session_context(&mut ctx)?;
+    let ts = ts();
+    // One commit per row => one file each.
+    for (id, session) in [("s1", None), ("s2", Some("sess-B")), ("s3", Some("")), ("s4", None)] {
+        let mut r = row(id, &pid, ts, &format!("trace-{id}"));
+        r["attributes___session___id"] = json!(session);
+        insert(&db, &pid, vec![r]).await?;
+    }
+    let exec = async |sql: String| ctx.sql(&sql).await?.collect().await;
+    // monoscope's backfill shape fills s1; a direct fill takes s3 from '' to a value. Each
+    // appends a version in its own file; the empty versions stay in theirs.
+    exec(format!(
+        "UPDATE otel_logs_and_spans SET attributes___session___id = COALESCE(attributes___session___id, 'sess-A') WHERE project_id = '{pid}' AND id = 's1'"
+    ))
+    .await?;
+    exec(format!("UPDATE otel_logs_and_spans SET attributes___session___id = 'sess-C' WHERE project_id = '{pid}' AND id = 's3'")).await?;
+    db.bloom_sidecar_reconcile().await?;
+
+    let (lo, hi) = (ts - 3_600_000_000, ts + 3_600_000_000);
+    let rows = async |pred: &str| -> Result<Vec<String>> {
+        let sql = format!(
+            "SELECT id || ':' || COALESCE(attributes___session___id, 'null') AS v FROM otel_logs_and_spans WHERE project_id = '{pid}' AND {pred} \
+             AND timestamp >= to_timestamp_micros({lo}) AND timestamp <= to_timestamp_micros({hi}) ORDER BY 1"
+        );
+        let batches = ctx.sql(&sql).await?.collect().await?;
+        let mut out = vec![];
+        for b in &batches {
+            let col = datafusion::arrow::compute::cast(b.column(0), &datafusion::arrow::datatypes::DataType::Utf8)?;
+            out.extend(col.as_string::<i32>().iter().flatten().map(String::from));
+        }
+        Ok(out)
+    };
+    let stats = &db.bloom_prune().unwrap().stats;
+    let pruned = async |pred: &str| -> Result<(Vec<String>, u64)> {
+        let before = stats.files_rejected.load(Relaxed);
+        let got = rows(pred).await?;
+        Ok((got, stats.files_rejected.load(Relaxed) - before))
+    };
+
+    let ids = "attributes___session___id IN ('sess-A', 'sess-B', 'sess-C')";
+    let (got, rejected) = pruned(ids).await?;
+    assert_eq!(got, ["s1:sess-A", "s2:sess-B", "s3:sess-C"], "enriched winners found, their empty versions not returned");
+    assert_eq!(rejected, 3, "the three files holding only empty versions (s1, s3, s4) must be bloom-rejected");
+    // The same predicate in a shape no pruning path reads.
+    assert_eq!(rows(&format!("COALESCE({ids}, false)")).await?, got, "pruned lookup must equal the unpruned one");
+
+    // Predicates the pre-enrichment versions satisfy must not prune or run below the dedup.
+    assert_eq!(pruned("attributes___session___id = ''").await?, (vec![], 0), "s3's stale '' version must not win");
+    assert_eq!(rows("attributes___session___id IS NULL").await?, ["s4:null"], "s1's stale NULL version must not win");
+
+    // Enrich-only: a set value can be neither changed nor cleared; refilling it is a no-op.
+    for set in ["'other'", "NULL", "''"] {
+        let res = exec(format!("UPDATE otel_logs_and_spans SET attributes___session___id = {set} WHERE project_id = '{pid}' AND id = 's2'")).await;
+        assert!(res.is_err_and(|e| e.to_string().contains("enrich_only")), "SET {set} over a set value must be refused");
+    }
+    exec(format!("UPDATE otel_logs_and_spans SET attributes___session___id = 'sess-B' WHERE project_id = '{pid}' AND id = 's2'")).await?;
+    assert_eq!(rows("attributes___session___id = 'sess-B'").await?, ["s2:sess-B"]);
+
+    // A tombstone carries the enriched value, so it is read and hides the row.
+    exec(format!("DELETE FROM otel_logs_and_spans WHERE project_id = '{pid}' AND id = 's1'")).await?;
+    db.bloom_sidecar_reconcile().await?;
+    assert_eq!(pruned(ids).await?.0, ["s2:sess-B", "s3:sess-C"], "deleted row must not resurrect");
+    Ok(())
+}
