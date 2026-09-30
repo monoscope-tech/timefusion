@@ -390,6 +390,9 @@ fn build_config(b: &E2eEnvBuilder, endpoint: &str, bucket: &str, data_dir: PathB
     cfg.buffer.timefusion_flush_immediately = b.flush_immediately;
     cfg.cache.timefusion_foyer_disabled = b.foyer_disabled;
     cfg.parquet.timefusion_checkpoint_interval = b.checkpoint_interval;
+    // Wall-clock cron would checkpoint mid-test at an even-minute boundary; tests
+    // drive it via `run_checkpoint_maintenance`.
+    cfg.maintenance.timefusion_checkpoint_schedule = String::new();
     cfg.maintenance.timefusion_optimize_sort_by = b.optimize_sort_by;
     cfg.maintenance.timefusion_light_optimize_enabled = b.light_optimize_enabled;
     cfg.maintenance.timefusion_use_deletion_vectors = b.use_deletion_vectors;
