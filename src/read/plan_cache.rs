@@ -776,6 +776,13 @@ impl PlanCacheHook {
             .ok()
             .and_then(|plan| {
                 let types = if value_count == 0 { Default::default() } else { plan.get_parameter_types().ok()? };
+                // A lifted literal is an untyped (Null) placeholder until bound; a
+                // placeholder the optimizer folded away (e.g. log's null
+                // propagation → NULL) would serve that fold for every literal.
+                if let Some(i) = (1..=value_count).find(|i| !types.contains_key(&format!("${i}"))) {
+                    warn!(target: "plan_cache", "shape folded away ${i}, declining: {shape_key}");
+                    return None;
+                }
                 Some(ShapeEntry { plan, param_types: (1..=value_count).map(|i| types.get(&format!("${i}")).cloned().flatten()).collect() })
             });
         if built.is_none() {
@@ -1222,6 +1229,18 @@ mod tests {
         // Non-cacheable AST kind bypasses too.
         assert!(hook.cached_plan(&parse("SET TIME ZONE 'UTC'"), &ctx).await.is_none());
         assert_eq!(hook.shape_counters(), (3, 0));
+    }
+
+    /// `log(b, x)` null-propagates on a Null-typed arg, so its untyped-placeholder
+    /// template folded to NULL and served NULL for every literal.
+    #[test_case("SELECT log(2, 5000)", false; "log folds its placeholders away")]
+    #[test_case("SELECT log(100)", false; "single arg log too")]
+    #[test_case("SELECT log10(100), power(2, 10), sqrt(16)", true; "siblings keep their placeholders")]
+    #[tokio::test]
+    async fn shape_whose_placeholder_folds_away_is_declined(sql: &str, cached: bool) {
+        let hook = PlanCacheHook::new(64, true);
+        assert_eq!(hook.cached_plan(&parse(sql), &test_ctx()).await.is_some(), cached);
+        assert_eq!(hook.shape_counters(), (cached as u64, !cached as u64));
     }
 
     /// Varying the INSERT batch size must not grow the cache without bound: every

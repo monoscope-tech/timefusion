@@ -210,3 +210,15 @@ ORDER BY hour_bucket
 
 # Clean up would go here, but DELETE is not supported in this system
 # Test data will remain in the table
+
+# log(b, x) / log(x) returned NULL over pgwire: the plan cache's shape template
+# folded log's untyped literal placeholders to NULL (monoscope service-map buckets)
+query RRRRRR
+SELECT log(2, 5000) a, log(100) b, log(2.0, 5000.0) c, log(2::float8, 5000::float8) d, log(100.0) e, log(10, 100) f
+----
+12.28771237954945 2 12.28771237954945 12.28771237954945 2 2
+
+query RRRRRR
+SELECT log10(1000) a, log2(8) b, ln(1) c, power(2, 10) d, exp(0) e, sqrt(16) f
+----
+3 3 0 1024 1 4
