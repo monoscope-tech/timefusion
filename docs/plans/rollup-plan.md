@@ -121,8 +121,8 @@ Done items carry evidence (commit or number). Open items carry the next action, 
 - [x] Capacity replay 1x/2x/4x: W10 calibration within ±10% per lane; W26 (`5610c94e`, `d19631fb`); ~2x headroom.
 - [x] Stage 0 rollout gates: release 2 (#323).
 - [x] Byte-aware batches: measured, missed the 10% CPU gate (1.87–1.95 s vs 1.91–1.95 s). Stays off.
-- [ ] Stage 1A certified-clean path (gate ≥20% CPU per qualifying build): built, off by default, never
-      run as an experiment. Low value while today is never day-certified.
+- [x] Stage 1A certified-clean path: ON by default (`f62fb4ae`). Staging A/B 34–71% less build CPU, identical
+      counts/sums/sketches; prod parity on 09-28 totals (6297304f, 28f62f01) matched.
 
 ### Stage 0: coverage reconciliation and loops
 
@@ -137,8 +137,8 @@ Done items carry evidence (commit or number). Open items carry the next action, 
       W42 no fusion of unended cells, orphan-derived prune. Re-mint loop gone (100/15 min → 0).
 - [x] Throughput: claim fast path, `edit_tasks` → `mark_dirty`, tier backfill cap 16, output-state pricing
       (~48 KB per output row), state split, coarsening cap, v4 sibling prior, state waiter (`06727291`).
-- [ ] Packed repairs: off since `e67b936a`. Trigger to re-enable: a packed-remainder witness that survives
-      the repair. Not started.
+- [x] Packed repairs: deleted (`f62fb4ae`, on-or-delete policy). `rollup_escalated_*` counters measure what
+      the escalations cost; revisit only if they show a large lane.
 - [ ] `ws/recovery-adopt-v2` (`3ff9bb66`): deprioritized (~4 requeues per restart). Decide finish or drop.
 
 ### Stage 1: measurement and repeated work
@@ -158,15 +158,18 @@ Done items carry evidence (commit or number). Open items carry the next action, 
 ### Stage 2: source visibility and today-window hits
 
 - [x] W31 content-fingerprint slice proof (`682179d0`).
-- [ ] **Today's slices go stale under `hashes`-only MoR UPDATEs** (measured 09-29 night): ~90% of today's slices
+- [x] **Today's slices go stale under `hashes`-only MoR UPDATEs** (measured 09-29 night): ~90% of today's slices
       refuted wherever monoscope's pattern-tag UPDATE lands (~7/min on 6297304f); a 24h window keeps ~1 h of
       provable today coverage, falls under the 1/5 interior floor and runs raw (RUM page views 23–45 s). Every
       sealed-day window routes fine. Fix built: `ws/version-append-witness` (version-only files tagged
       `timefusion.version_only_columns`, skipped by the row-count and content witnesses when no tier reads those
       columns; kill switch `timefusion_rollup_version_only_witness`). Deploy separately from `batch/overnight`;
       verify the 6297304f 24h page-view query flips to a hybrid hit and `scan.rollup_stale_grew` falls.
+      **Deployed `9e21fc3d` 03:48 09-30.** First 20 min: quarantine 0, coordinator errors 0, `stale_coverage`
+      3 of 370 misses, 53 hybrid hits. `version_only_declined_rows` (171k vs 2.7k tagged) are UPDATEs whose
+      predecessor was still buffered: their flush is the row's first, i.e. new data, so declining is correct.
 - [x] W21 witness carry: closed, stays off. Recovers ~0.7%; blockers: double count, ledger lost on restart.
-- [ ] `ws/w31-transparent-witness` (2 WIP commits, paused): finish or drop.
+- [x] `ws/w31-transparent-witness`: dropped, superseded by the version-only witness (`9e21fc3d`).
 - [ ] **Captured source view** (goal doc Stage 2 protocol) — trigger: a reproduced hybrid snapshot race, or
       logical-only routing needed. Not triggered: W31 solved today-window hits physically.
 
@@ -199,7 +202,8 @@ Done items carry evidence (commit or number). Open items carry the next action, 
       W53 tantivy cache 400 GB, W55 `count(<expr>)` wrong-answer fix.
 - [x] W48 be87ebc1 slow warm: resolved by W44 + W51 (6.1 s cold → 0.7 s warm).
 - [x] `8184a638`: pgwire latency at stream end; one heavy slot per query; FLAG switch.
-- [ ] Byte admission for wide scans (`bafd8a50`, flags off): decide whether to A/B it.
+- [ ] Byte admission for wide scans (FLAG `timefusion_query_scan_byte_admission`): A/B running 09-30 04:05
+      (4 sealed-day workers, ABBA A=ON, watchdog stops at 80 GiB of 120). Verdict: on or delete.
 - [ ] Remove W36 `split_sorted_runs` at the next DataFusion fork bump, after carrying sort info through
       `MemorySourceConfig::repartitioned` in the fork.
 
@@ -234,7 +238,7 @@ Done items carry evidence (commit or number). Open items carry the next action, 
 - [x] W4: `sessions_1h_v1` had no consumer; stays paused.
 - [x] W56 hour-grain session tiers (the proper W40 fix, `ecc2483f`). `rollup_miss_sub_grain_slices_total` read 0.
 - [x] W27 `sessions_1h_v2` resumed from 2026-09-22 (18:08).
-- [ ] Land `test/rum-sessions-e2e` (`prepared_rum_sessions_use_browser_rollups_and_raw_edges`, passes) with the next deploy.
+- [x] Land `test/rum-sessions-e2e` (`prepared_rum_sessions_use_browser_rollups_and_raw_edges`, passes) with the next deploy.
 - [ ] Confirm the RUM sessions query routes to `sessions_1h_v2` in prod on a mature process.
 - [ ] Decide whether to drop `sessions_1h_v1`.
 
@@ -244,7 +248,7 @@ Done items carry evidence (commit or number). Open items carry the next action, 
       ingest dirty-livelock fix (`d7d44054`, `3bfa405e`, `4ee017dd`), task-age-from-reopen metric.
 - [ ] Journal lock wait: recheck on a ≥1 h process (mature ~7 s/min; 14–18 s/min seen on young ones).
       `coordinator_claim` ~371/s is the baseline, not a regression.
-- [ ] Change `oldest_task_age_seconds` to oldest due-and-unclaimed, or age since last re-arm.
+- [x] `oldest_due_unclaimed_age_seconds` added (`f62fb4ae`).
 - [ ] W25 parts 2–3: the 4.9 s container create → start; CapRover's double service update (1.6 s per deploy).
 - [ ] Dependency advisories not closable by patch bumps: rustls-webpki 0.101 (AWS SDK), tokio-tar,
       tokio-postgres/postgres-types (0.2.14 breaks arrow-pg encoding).
