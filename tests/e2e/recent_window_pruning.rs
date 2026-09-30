@@ -168,7 +168,15 @@ async fn recent_window_prunes_within_compacted_file() -> anyhow::Result<()> {
 #[serial_test::serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn dv_bearing_file_keeps_parquet_pushdown_on_its_siblings() -> anyhow::Result<()> {
-    let env = hot_partition_builder().with_deletion_vectors().with_flush_interval(Duration::from_secs(3600)).with_tantivy_prefilter(false).start().await?;
+    // The eviction tick also flushes completed buckets (every PAST bucket is), so at the
+    // harness's 1s default it splits the fixture's files wherever it lands.
+    let env = hot_partition_builder()
+        .with_deletion_vectors()
+        .with_flush_interval(Duration::from_secs(3600))
+        .with_eviction_interval(Duration::from_secs(3600))
+        .with_tantivy_prefilter(false)
+        .start()
+        .await?;
     env.db().cancel_maintenance();
     let client = env.pg_client().await?;
 
@@ -186,7 +194,7 @@ async fn dv_bearing_file_keeps_parquet_pushdown_on_its_siblings() -> anyhow::Res
     env.force_flush().await?;
 
     let (files, dv_files) = dedup_past_partition(&env).await?;
-    assert!(files >= 2 && dv_files == 1, "fixture needs one DV-bearing file among DV-free ones: {dv_files}/{files}");
+    assert!(files == 2 && dv_files == 1, "fixture needs one DV-bearing file and one DV-free one: {dv_files}/{files}");
 
     let sql = format!(
         "SELECT time_bucket('10 minutes', timestamp) AS b, COUNT(*) FROM otel_logs_and_spans \
