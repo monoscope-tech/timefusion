@@ -353,6 +353,13 @@ Where cost and slowness come from:
   reconcile turned that span into a re-arm of every cell in it (~6 of 42 cells actually held rows). The two waves
   were 70% of Talstack's v4 run time in the window. Flushed files now carry `timefusion.dirty_cells` (the cells
   their rows occupy) and the reconcile re-arms only those; untagged/rewrite files keep the old behaviour.
+  **Second trigger (`36bbbe6a`, deployed 18:44):** a remove-only commit that retired ONE fully-masked corpse file was
+  marked `data_change=true`; the reconcile's "removes, no adds ⇒ whole day" rule re-armed Talstack's entire day
+  (72 tasks → 314 units across Dedup + 3 tiers, incl. hours with no data) at 17:49. Corpse retirement now commits
+  `data_change=false` (no logical change: every row was already masked). An unexplained 78-unit reconcile at 18:01
+  remains; being watched on the new build.
+- [x] Ingest-time client-retry dedup deleted (`3faac43f`, 18:16): prod ran it on every insert with a 2.79M-entry
+      index and `key_hits_total=0` — the 09-07 revert (`6a69edbb`) had never been applied.
 
 - **Masks on today's partition** (all 214 DV bitmaps decoded): ~57–62% of masked rows are exact duplicates TF
   made. An UPDATE/DELETE during a flush commit left the bucket dirty, and the whole bucket was re-flushed
