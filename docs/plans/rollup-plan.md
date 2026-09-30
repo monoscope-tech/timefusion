@@ -1,6 +1,6 @@
 # Rollup plan
 
-Status as of 2026-09-29 ~20:00 UTC. This is the single entry point for the rollup plan. It replaces both
+Status as of 2026-09-30 ~04:00 UTC. This is the single entry point for the rollup plan. It replaces both
 handovers, the workstream sheet, the first-deployment checklist, the 09-27 review and the unit-economics,
 query-yield and residual-ranking notes. Their history is in git (`git log -- docs/plans/`).
 
@@ -80,7 +80,7 @@ Engineering:
 
 ## 3. Current prod state (2026-09-29 ~20:00 UTC)
 
-- **Image:** master `db63a37b`, deployed 19:40. It stacks `8184a638` (18:09) and `4319b951` (19:13).
+- **Image:** master `9e21fc3d` (03:48, version-append witness) on `f62fb4ae` (03:14, `batch/overnight`: 11 dead flags deleted, certified-clean on, query yield deleted, byte-admission FLAG, escalation + due-age metrics, OR-chain bloom pruning, derived null-measure fix, RUM sessions e2e).
 - **Tiers:**
   - `dashboard_1m_v4` / `dashboard_1h_v3` (with `level`) are the dashboard tiers. v3 and `1h_v2` are dropped.
   - v4 policy `RESUME FROM 2026-08-29` (full 31 days) since 19:02. At 18:51 v4 had 15 contiguous days.
@@ -114,8 +114,10 @@ Done items carry evidence (commit or number). Open items carry the next action, 
       Inconclusive and not binding: p95 B−A −0.66 s (CI −3.7…+2.4), GB/h −11% (CI −70…+59); tokens read 0/66 while
       `admission_refused_state_bytes_total` was 29,201 — state memory binds, not the token cap. Default stays 66;
       the `FLAG SET timefusion_maintenance_cpu_tokens` override stays as an ops knob.
-- [ ] **Experiment: W46 key-level dedup restriction** (`FLAG SET timefusion_read_dedup_key_restrict ON`).
-      Record result / decide enable (owner).
+- [ ] **Experiment: W46 key-level dedup restriction** (`FLAG SET timefusion_read_dedup_key_restrict ON`). The 09-29 night run
+      was INVALID: its load (16 workers of raw sealed-day scans) OOM-killed prod at 23:47 and every later query failed on dead
+      connections. Re-run with ≤4 raw workers and byte admission ON, on sealed uncertified days (the only path W46 acts on).
+      Enable rule: DedupExec input rows drop, counts equal in both arms, paired p95 lower bound > 0.
 - [x] Capacity replay 1x/2x/4x: W10 calibration within ±10% per lane; W26 (`5610c94e`, `d19631fb`); ~2x headroom.
 - [x] Stage 0 rollout gates: release 2 (#323).
 - [x] Byte-aware batches: measured, missed the 10% CPU gate (1.87–1.95 s vs 1.91–1.95 s). Stays off.
@@ -272,6 +274,19 @@ Done items carry evidence (commit or number). Open items carry the next action, 
 - [ ] Back off issue-chart auto-refresh after a timeout (Talstack `jsonb_path_exists(to_jsonb(hashes))` charts hit 90 s).
 - [ ] Add a timeout to the `Issues.hs:488-497` session lookup (`tryWithin Nothing`; stalls up to 77 s).
 - [ ] Optional: compute `trace_count` in `rollupServiceEdges` without referencing `bucketed` twice (12 → 6 scans).
+
+### 2026-09-29/30 overnight log (condensed)
+
+- Deployed `8184a638`, `4319b951` (drop-v3 + DV follow-ups), `db63a37b` (cpu-token FLAG), `f62fb4ae` (batch/overnight,
+  net −2.8k lines), `9e21fc3d` (version-append witness). All after a full green local signoff.
+- Experiments (paired ABBA/BAAB, synthetic load): query-latency yield → deleted (engaged, no latency benefit);
+  CPU-token cap → not binding (state memory binds); W46 → invalid run (see its task).
+- Staging A/B: certified-clean −34…−71% build CPU, t-digest accuracy within 1.14× → on by default. Prod parity check after
+  deploy: 09-28 sealed totals routed == raw for 6297304f and 28f62f01.
+- Incident (mine): synthetic raw-scan load OOM-killed prod at 23:47:02; auto-restart, WAL replay 6.29M rows, no loss.
+- Bug found and fixed: derived `dashboard_1h_v3` builds failed over base cells predating the `rum_*` measures
+  (non-nullable count column) → 66 quarantined units; all measure columns now nullable, TAG_MEASURES still gates reads.
+- Backlog: 33–65 GB after drop-v3 vs 171–309 GB on 09-29 morning.
 
 ## 5. Key findings worth keeping
 
