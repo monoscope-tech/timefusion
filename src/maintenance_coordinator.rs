@@ -354,6 +354,10 @@ pub struct MaintenanceTask {
     /// When this rollup unit last committed output, for [`SEALED_REBUILD_INTERVAL_MICROS`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub built_micros: Option<i64>,
+    /// What this unit last committed. Survives re-queues so a restart re-adopts exactly
+    /// that output while the rebuild waits; the read witness then judges it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub built: Option<BuiltOutput>,
     /// Memoised claim rank — see [`TaskJournal::rank`]. Runtime only.
     #[serde(skip)]
     pub(crate) rank_cache: RankCache,
@@ -386,6 +390,7 @@ impl MaintenanceTask {
             pended_unix_ms: None,
             dirty: Vec::new(),
             built_micros: None,
+            built: None,
             rank_cache: RankCache::default(),
         }
     }
@@ -445,6 +450,13 @@ impl InputFootprint {
         });
         Self { fp, whole_file_bytes, files }
     }
+}
+
+/// A rollup unit's last committed output: its publication and the exact tier files it added.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub struct BuiltOutput {
+    pub publication: Publication,
+    pub paths: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
@@ -1784,7 +1796,12 @@ impl TaskJournal {
         true
     }
 
-    pub fn upsert(&mut self, task: MaintenanceTask) {
+    pub fn upsert(&mut self, mut task: MaintenanceTask) {
+        // A replacement (a fusion over a built day) keeps the key's build proof. Not in
+        // `insert_task`: replay must not resurrect a proof a later record cleared.
+        if task.built.is_none() {
+            task.built = self.task(&task.key).and_then(|old| old.built.clone());
+        }
         if !self.rollup_build_allowed(&task.key) && !self.task_indices.contains_key(&task.key) && task.state != TaskState::Complete {
             return;
         }
@@ -2417,9 +2434,10 @@ impl TaskJournal {
 
     /// [`Self::publish`] for a unit that committed output at `now_micros`, which starts its
     /// sealed rebuild interval. A no-op completion rebuilt nothing and must not.
-    pub fn publish_built(&mut self, key: &TaskKey, publication: Publication, now_micros: i64) -> bool {
+    pub fn publish_built(&mut self, key: &TaskKey, publication: Publication, paths: Vec<String>, now_micros: i64) -> bool {
         if let Some(task) = self.task_mut(key) {
             task.built_micros = Some(now_micros);
+            task.built = (!paths.is_empty()).then(|| BuiltOutput { publication: Publication { evidence: None, ..publication.clone() }, paths });
         }
         self.finish(key, Some(publication))
     }
@@ -2595,6 +2613,7 @@ impl TaskJournal {
             child.attempts = 0;
             child.retry_reason = None;
             child.publication = None;
+            child.built = None;
             // A split narrows the WORK, not the priority: without this the children rank by
             // their own narrow width and fall behind every day-wide unit.
             child.backfill_priority_micros = Some(parent.scheduling_width());
@@ -2683,8 +2702,35 @@ impl TaskJournal {
                 // `Publication` is what coverage is recovered from at boot; leaving it would
                 // have the next process re-adopt the cell being replaced.
                 task.publication = None;
+                task.built = None;
             },
         )
+    }
+
+    /// Drop the built proofs of `project_id`'s rollup units over `source` overlapping
+    /// `window` (all when `None`). For changes the row witness cannot see (DML rewrites,
+    /// deletion vectors), whose output must not be re-adopted at boot.
+    pub fn forget_built(&mut self, project_id: &str, source: &str, window: Option<(i64, i64)>) -> usize {
+        self.edit_tasks(
+            |task| {
+                task.built.is_some()
+                    && task.key.project_id == project_id
+                    && task.key.source == source
+                    && window.is_none_or(|(start, end)| task.key.slice.overlaps(start, end))
+            },
+            |task| task.built = None,
+        )
+    }
+
+    /// Built proofs of rollup units into `target` that are queued again rather than Complete.
+    pub fn requeued_built(&self, source: &str, target: &str) -> Vec<(TaskKey, BuiltOutput)> {
+        self.snapshot
+            .tasks
+            .iter()
+            .filter(|task| matches!(task.state, TaskState::Pending | TaskState::Running | TaskState::Retry))
+            .filter(|task| task.key.source == source && task.key.physical_table == target)
+            .filter_map(|task| task.built.clone().map(|built| (task.key.clone(), built)))
+            .collect()
     }
 
     pub(crate) fn rollup_policy_status(&self, table: &str) -> RollupPolicyStatus {
@@ -6222,7 +6268,7 @@ mod tests {
             assert!(journal.claim_next(Operation::BaseRollup, built_at, true).is_some());
             let publication =
                 Publication { source_fingerprint: 0, generation: "g".into(), rows: 1, source_rows: None, source_rows_below: None, evidence: None };
-            assert!(journal.publish_built(&unit.key, publication, built_at));
+            assert!(journal.publish_built(&unit.key, publication, vec![], built_at));
         }
         let (source, project, table, date) = TaskJournal::cell_of(&unit).expect("cell");
         match mark {
@@ -6246,7 +6292,7 @@ mod tests {
         journal.upsert(whole.clone());
         assert!(journal.claim_next(Operation::BaseRollup, now, true).is_some());
         let publication = Publication { source_fingerprint: 0, generation: "g".into(), rows: 1, source_rows: None, source_rows_below: None, evidence: None };
-        assert!(journal.publish_built(&whole.key, publication, now));
+        assert!(journal.publish_built(&whole.key, publication, vec![], now));
         for hour in [3, 15] {
             journal.upsert(task("p", day + hour * DERIVED_SLICE_MICROS, day + hour * DERIVED_SLICE_MICROS + NORMAL_SLICE_MICROS, Operation::BaseRollup));
         }
@@ -6254,6 +6300,28 @@ mod tests {
         assert_eq!(journal.state(&whole.key), Some(TaskState::Pending));
         assert!(journal.claim_next(Operation::BaseRollup, now + 1, true).is_none());
         assert!(journal.claim_next(Operation::BaseRollup, now + SEALED_REBUILD_INTERVAL_MICROS, true).is_some());
+    }
+
+    /// The built proof outlives a re-queue and a replacement of its key, but not a reopen
+    /// the row witness cannot see; a journal written before the field loads without one.
+    #[test]
+    fn a_built_proof_survives_requeues_but_not_a_derived_reopen() -> anyhow::Result<()> {
+        let unit = task("p", 0, DERIVED_SLICE_MICROS, Operation::DerivedRollup);
+        let (dir, mut journal) = new_journal();
+        journal.upsert(unit.clone());
+        let publication = Publication { source_fingerprint: 0, generation: "g".into(), rows: 1, source_rows: None, source_rows_below: None, evidence: None };
+        assert!(journal.publish_built(&unit.key, publication, vec!["a.parquet".into()], 0));
+        let proofs = |journal: &TaskJournal| journal.requeued_built("source", "table").len();
+        journal.enqueue(unit.key.clone(), 1, 1, 0);
+        journal.upsert(MaintenanceTask::pending(unit.key.clone(), 1, 1, 0));
+        journal.checkpoint()?;
+        assert_eq!(proofs(&TaskJournal::load(dir.path())?), 1, "a re-queued, replaced key keeps its proof across a reload");
+        assert!(journal.complete(&unit.key) && journal.reopen_derived_over("p", "table", 0, 1) == 1);
+        journal.checkpoint()?;
+        assert_eq!(proofs(&TaskJournal::load(dir.path())?), 0, "and a reopen drops it for good");
+        let legacy = serde_json::to_value(&unit)?;
+        assert!(legacy.get("built").is_none() && serde_json::from_value::<MaintenanceTask>(legacy)?.built.is_none());
+        Ok(())
     }
 
     /// The proof latches. The frontier re-enqueues the same key without it, and

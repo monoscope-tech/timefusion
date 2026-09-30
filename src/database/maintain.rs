@@ -1774,6 +1774,7 @@ impl Database {
                 pended_unix_ms: None,
                 dirty: Vec::new(),
                 built_micros: None,
+                built: None,
                 rank_cache: Default::default(),
             };
             let mut partitions: HashMap<(String, chrono::NaiveDate), Vec<TailAdd>> = HashMap::new();
@@ -3623,7 +3624,7 @@ impl Database {
                 );
             }
             journal.note_escalation(&key, estimated_rows, estimated_bytes);
-            journal.publish_built(&key, publication.clone(), crate::support::now_micros());
+            journal.publish_built(&key, publication.clone(), adds.iter().map(|add| add.path.clone()).collect(), crate::support::now_micros());
             // A BASE slice just changed under the derived cells built over it, whose
             // witness (the RAW partition) agrees forever on a sealed day. The COVERAGE
             // must be dropped WITH the task and in this order, so that a cell under
@@ -4705,8 +4706,12 @@ impl Database {
         &self, project_id: &str, source: &str, predicate: Option<&datafusion::logical_expr::Expr>, assignments: &[(String, datafusion::logical_expr::Expr)],
     ) -> std::io::Result<()> {
         let moves_rows = assignments.iter().any(|(column, _)| column == "timestamp");
-        let masks = (!moves_rows).then(|| predicate.and_then(crate::rollup::timestamp_window)).flatten().and_then(|(lo, hi)| window_hour_masks(lo, hi));
-        let Some(masks) = masks else { return self.invalidate_rollup_source(project_id, source) };
+        let window = (!moves_rows).then(|| predicate.and_then(crate::rollup::timestamp_window)).flatten();
+        {
+            let _guard = crate::support::lock(&self.rollup_journal_lock);
+            self.journal().forget_built(project_id, source, window);
+        }
+        let Some(masks) = window.and_then(|(lo, hi)| window_hour_masks(lo, hi)) else { return self.invalidate_rollup_source(project_id, source) };
         for (date, hours) in masks {
             self.apply_rollup_hours(project_id, source, &date, hours)?;
         }
@@ -6057,6 +6062,8 @@ impl Database {
             unverifiable += spec_unverifiable;
             let published = self.journal().published_rollups(source, &target);
             let publications: HashMap<_, _> = published.iter().map(|(key, publication)| ((key.project_id.as_str(), key.slice), publication)).collect();
+            let requeued = self.journal().requeued_built(source, &target);
+            let built: HashMap<_, _> = requeued.iter().map(|(key, built)| ((key.project_id.as_str(), key.slice), built)).collect();
             for (key, publication) in &published {
                 if publication.source_rows.is_none() {
                     witnessless.push((key.project_id.clone(), key.slice));
@@ -6128,7 +6135,17 @@ impl Database {
                         fate(UnverifiableFate::InvalidSlice);
                         continue;
                     };
-                    let complete = self.journal().rollup_slice_complete(source, &project_id, &target, slice)
+                    let identity = (project_id.clone(), slice_start, slice_end, generation.clone(), source_fp, source_rows);
+                    // A re-queued slice keeps its coverage only through the output it last
+                    // committed: this identity, and exactly those files, still live. The
+                    // read witness then decides whether that output is still current.
+                    let rebuilt = built.get(&(project_id.as_str(), slice)).filter(|built| {
+                        (built.publication.generation == generation
+                            && built.publication.source_fingerprint == source_fp
+                            && built.publication.source_rows == source_rows)
+                            && paths_by_identity.get(&identity).is_some_and(|(_, live)| live.iter().sorted().eq(built.paths.iter().sorted()))
+                    });
+                    let complete = (rebuilt.is_some() || self.journal().rollup_slice_complete(source, &project_id, &target, slice))
                         && !publications.get(&(project_id.as_str(), slice)).is_some_and(|publication| publication.rows == 0);
                     let Some(date) = chrono::DateTime::from_timestamp_micros(slice_start).map(|time| time.date_naive().to_string()) else {
                         fate(UnverifiableFate::InvalidSlice);
@@ -6142,10 +6159,10 @@ impl Database {
                         fate(UnverifiableFate::JournalIncomplete);
                         continue;
                     }
-                    let identity = (project_id.clone(), slice_start, slice_end, generation.clone(), source_fp, source_rows);
-                    let publication = publications.get(&(project_id.as_str(), slice)).filter(|publication| {
-                        publication.generation == generation && publication.source_fingerprint == source_fp && publication.source_rows == source_rows
-                    });
+                    let publication =
+                        publications.get(&(project_id.as_str(), slice)).copied().or(rebuilt.map(|built| &built.publication)).filter(|publication| {
+                            publication.generation == generation && publication.source_fingerprint == source_fp && publication.source_rows == source_rows
+                        });
                     // Tags retain the expected count after a no-op clears the task publication.
                     // Legacy output can use an independent matching journal record instead.
                     let complete_output = output_rows_by_identity.get(&identity).is_some_and(|rows| {
@@ -11135,6 +11152,107 @@ mod rollup_noop_skip_tests {
         remint_and_drain(&db).await?;
         assert!(skips() > before, "a slice re-minted after a restart must still be proved redundant from its tags");
         assert_eq!(tier_version(&db).await, Some(published_at), "and must not write to the tier");
+        Ok(())
+    }
+
+    /// A late row re-pends the built slice it lands in and every built slice after it in
+    /// its hour. A restart re-adopts each one's committed output from the journal's built
+    /// proof and the witness judges it: an untouched sibling keeps routing, the touched
+    /// slice reads raw. A file the proof does not name (a remainder republished at a new
+    /// path) and a journal written before the proof existed adopt nothing, as before.
+    #[test_case::test_case("", 15, true, true ; "a re-queued untouched sibling is re-adopted and routes")]
+    #[test_case::test_case("", 42, true, false ; "a re-queued touched slice is re-adopted but stale")]
+    #[test_case::test_case("remainder", 15, false, false ; "a file the proof does not name is not")]
+    #[test_case::test_case("no_proof", 15, false, false ; "a journal without proofs adopts nothing")]
+    #[serial]
+    #[tokio::test]
+    async fn a_requeued_slice_is_readopted_from_its_built_proof(tamper: &str, late: u32, adopts: bool, routes: bool) -> Result<()> {
+        let source = "otel_logs_and_spans";
+        let cfg = rollup_cfg("built_proof_readopt");
+        let project = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+        let date = chrono::Utc::now().date_naive() - chrono::Duration::days(3);
+        let active = |db: &Database| -> Vec<_> {
+            db.journal()
+                .tasks()
+                .filter(|task| task.key.physical_table == TIER && task.state.is_active())
+                .map(|task| (task.key.clone(), task.dirty.clone()))
+                .sorted()
+                .collect()
+        };
+        let span = async |db: &Database, id: &str, minute: u32| {
+            let ts = date.and_hms_opt(20, minute, 0).expect("valid minute").and_utc().timestamp_micros();
+            db.insert_records_batch(&project, source, vec![json_to_batch(vec![test_span_ts(id, "op", &project, ts)])?], true, None).await.map(|_| ())
+        };
+        let (sibling, queued) = {
+            let db = Database::with_config(Arc::clone(&cfg)).await?;
+            span(&db, "seed", 45).await?;
+            dedup_unified(&db).await?;
+            assert!(advance_and_drain(&db).await? > 0, "the fixture needs a published slice");
+            span(&db, "late", late).await?;
+            let requeued: Vec<_> = db
+                .journal()
+                .tasks()
+                .filter(|task| task.key.physical_table == TIER && task.state.is_active() && task.built.is_some())
+                .map(|task| task.key.slice)
+                .collect();
+            let [sibling] = requeued[..] else { panic!("the late row must re-pend exactly the one built slice: {requeued:?}") };
+            let sibling = (sibling.start_micros, sibling.end_micros);
+            match tamper {
+                "remainder" => {
+                    use deltalake::kernel::{Action, transaction::TableReference};
+                    use deltalake::protocol::{DeltaOperation, SaveMode};
+                    use object_store::ObjectStoreExt;
+                    let target = db.resolve_table(&project, TIER).await?;
+                    let table = target.read().await.clone();
+                    let original = table
+                        .snapshot()?
+                        .log_data()
+                        .iter()
+                        .map(|file| add_action(&file))
+                        .find(|add| Database::slice_tag_range(add) == Some(sibling))
+                        .expect("live");
+                    let store = table.log_store().object_store(None);
+                    let copy = original.path.replace(".parquet", "-remainder.parquet");
+                    store.copy(&object_store::path::Path::from(original.path.as_str()), &object_store::path::Path::from(copy.as_str())).await?;
+                    // Same tags and row count: only the path tells it apart from the proof.
+                    deltalake::kernel::transaction::CommitBuilder::default()
+                        .with_actions(vec![Action::Remove(remove_for_add(&original, true)), Action::Add(deltalake::kernel::Add { path: copy, ..original })])
+                        .build(
+                            Some(table.snapshot()? as &dyn TableReference),
+                            table.log_store(),
+                            DeltaOperation::Write { mode: SaveMode::Append, partition_by: None, predicate: None },
+                        )
+                        .await?;
+                }
+                "no_proof" => {
+                    let mut journal = db.journal();
+                    journal.forget_built(&project, source, None);
+                    journal.checkpoint()?;
+                }
+                _ => {}
+            }
+            (sibling, active(&db))
+        };
+
+        let db = Arc::new(Database::with_config(cfg).await?);
+        db.recover_rollup_coverage(source).await?;
+        let adopted = db.rollup_slice_coverage.contains_key(&(project.clone(), source.to_owned(), TIER.to_owned(), sibling.0, sibling.1));
+        assert_eq!(adopted, adopts);
+        db.preload_replay_complete.store(true, std::sync::atomic::Ordering::Release);
+        db.plan_rollup_backfill().await?;
+        assert_eq!(active(&db), queued, "neither recovery nor the census may queue work beyond the pending rebuilds");
+        let (start, end) = sibling;
+        let sql = format!(
+            "SELECT status_code, COUNT(*) AS n FROM otel_logs_and_spans WHERE project_id = '{project}' \
+             AND timestamp >= to_timestamp_micros({start}) AND timestamp < to_timestamp_micros({end}) GROUP BY status_code ORDER BY status_code"
+        );
+        let mut ctx = Arc::clone(&db).create_session_context();
+        db.setup_session_context(&mut ctx)?;
+        let state = ctx.state();
+        let plan = state.optimize(&state.create_logical_plan(&sql).await?)?;
+        assert_eq!(matches!(db.rollup_sql(&plan, &state).await, Ok(Some(_))), routes);
+        let render = |batches: Vec<RecordBatch>| arrow::util::pretty::pretty_format_batches(&batches).map(|table| table.to_string());
+        assert_eq!(render(ctx.sql(&sql).await?.collect().await?)?, render(db.query_delta_only(&sql).await?)?);
         Ok(())
     }
 
