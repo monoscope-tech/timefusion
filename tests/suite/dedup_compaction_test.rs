@@ -1836,6 +1836,8 @@ async fn certifying_a_partition_builds_rollup_buckets_that_match_the_raw_aggrega
 
     let late = date_of(ts).and_hms_opt(20, 30, 0).unwrap().and_utc().timestamp_micros();
     commit_span(&db, &project_id, "span_late", "op", late).await?;
+    // A built day before today rebuilds at most once per interval.
+    timefusion::support::advance_micros(timefusion::maintenance_coordinator::SEALED_REBUILD_INTERVAL_MICROS);
     assert!(env.certify_and_drain().await? > 0, "late slice tasks must be drained");
     assert_eq!(delta_scalar(&db, &rollup_total).await?, raw_total + 1, "an incremental rebuild must carry the untouched hours forward exactly once");
     Ok(())

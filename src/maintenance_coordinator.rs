@@ -115,6 +115,10 @@ pub fn is_schema_failure(message: &str) -> bool {
     message.contains("Schema error") || message.contains("SchemaError") || message.contains("No field named")
 }
 pub const FINALIZATION_DELAY_MICROS: i64 = 15 * 60 * 1_000_000;
+/// Least time between two builds of one rollup slice over a date before today. Late
+/// rows re-arm a sealed day on nearly every flush, and each re-arm rebuilt the whole
+/// day slice (256 times for one 09-29 cell); reads cover the gap with a raw leg.
+pub const SEALED_REBUILD_INTERVAL_MICROS: i64 = 60 * 60 * 1_000_000;
 pub const INVALIDATION_DEADLINE_BUCKET_MICROS: i64 = 30 * 1_000_000;
 pub const LIVE_FRONTIER_WINDOW_MICROS: i64 = DAY_MICROS;
 const PRIORITY_BUCKET_MICROS: i64 = 60 * 1_000_000;
@@ -347,6 +351,9 @@ pub struct MaintenanceTask {
     /// not invalidation-driven (census hole, backfill): the whole slice is required.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dirty: Vec<(i64, i64)>,
+    /// When this rollup unit last committed output, for [`SEALED_REBUILD_INTERVAL_MICROS`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub built_micros: Option<i64>,
     /// Memoised claim rank — see [`TaskJournal::rank`]. Runtime only.
     #[serde(skip)]
     pub(crate) rank_cache: RankCache,
@@ -378,6 +385,7 @@ impl MaintenanceTask {
             backfill_priority_micros: None,
             pended_unix_ms: None,
             dirty: Vec::new(),
+            built_micros: None,
             rank_cache: RankCache::default(),
         }
     }
@@ -847,7 +855,9 @@ thread_local! {
 /// there is a `Self`, shares one definition with every other insert site.
 fn insert_task(tasks: &mut Vec<MaintenanceTask>, indices: &mut HashMap<TaskKey, usize>, task: MaintenanceTask) {
     match indices.get(&task.key).copied() {
-        Some(index) => tasks[index] = task,
+        // A build stamp is history of the KEY, so a replacement (a fusion over a built
+        // day) must not reset the sealed rebuild interval.
+        Some(index) => tasks[index] = MaintenanceTask { built_micros: task.built_micros.or(tasks[index].built_micros), ..task },
         None => {
             indices.insert(task.key.clone(), tasks.len());
             tasks.push(task);
@@ -1661,6 +1671,7 @@ impl TaskJournal {
     fn refusal_reason(&self, task: &MaintenanceTask, now_micros: i64) -> Option<&'static str> {
         (task.deadline_micros > now_micros)
             .then_some("not_due")
+            .or_else(|| self.rebuild_held_until(task, now_micros).map(|_| "rebuild_held"))
             .or_else(|| Self::is_quarantined(task).then_some("quarantined"))
             .or_else(|| (!self.dependencies_complete(task)).then_some("dependencies"))
     }
@@ -2208,6 +2219,10 @@ impl TaskJournal {
                 }
                 continue;
             }
+            if let Some(until) = self.rebuild_held_until(task, now_micros) {
+                idle_until = idle_until.min(until);
+                continue;
+            }
             let waited = now_micros.saturating_sub(task.key.slice.end_micros);
             let admits = |(sealed_only, window_only, horizon_only): Reservation| {
                 !(sealed_only && is_frontier_task(task, now_micros))
@@ -2398,6 +2413,28 @@ impl TaskJournal {
 
     pub fn publish(&mut self, key: &TaskKey, publication: Publication) -> bool {
         self.finish(key, Some(publication))
+    }
+
+    /// [`Self::publish`] for a unit that committed output at `now_micros`, which starts its
+    /// sealed rebuild interval. A no-op completion rebuilt nothing and must not.
+    pub fn publish_built(&mut self, key: &TaskKey, publication: Publication, now_micros: i64) -> bool {
+        if let Some(task) = self.task_mut(key) {
+            task.built_micros = Some(now_micros);
+        }
+        self.finish(key, Some(publication))
+    }
+
+    /// Until when a re-mint of an already-built rollup slice over a date before today
+    /// waits, so late rows batch into one rebuild per interval. Today's cells, never-built
+    /// slices, and damage cells are never held. `tier_holes` is not an exemption: the late
+    /// row's invalidation drops the day's coverage, so every held cell reads as a hole.
+    fn rebuild_held_until(&self, task: &MaintenanceTask, now_micros: i64) -> Option<i64> {
+        let until = task.built_micros?.saturating_add(SEALED_REBUILD_INTERVAL_MICROS);
+        (until > now_micros
+            && matches!(task.key.operation, Operation::BaseRollup | Operation::DerivedRollup)
+            && task.key.slice.end_micros <= now_micros.div_euclid(DAY_MICROS) * DAY_MICROS
+            && self.hole_rank(task) != 0)
+            .then_some(until)
     }
 
     /// Mark a unit Complete. `None` leaves any existing publication untouched.
@@ -6164,6 +6201,59 @@ mod tests {
 
         journal.enqueue(at(DAY_MICROS, HOUR), 0, 1, 0);
         assert!(journal.claim_exact(&at(DAY_MICROS, HOUR), 0, true).is_none(), "the following day is a different fact and stays unproven");
+    }
+
+    /// Late rows re-arm a built rollup slice. Over a date before today the rebuild waits out
+    /// `SEALED_REBUILD_INTERVAL_MICROS` from the build, still queued; everything else runs.
+    #[test_case::test_case(-DAY_MICROS, true, "", 0 => false ; "a built sealed day waits")]
+    #[test_case::test_case(-DAY_MICROS, true, "", SEALED_REBUILD_INTERVAL_MICROS => true ; "and runs once the interval passes")]
+    #[test_case::test_case(0, true, "", 0 => true ; "today never waits")]
+    #[test_case::test_case(-DAY_MICROS, false, "", 0 => true ; "a never-built slice never waits")]
+    #[test_case::test_case(-DAY_MICROS, true, "damage", 0 => true ; "a damaged cell never waits")]
+    #[test_case::test_case(-DAY_MICROS, true, "hole", 0 => false ; "a late row's lost coverage still waits")]
+    fn a_rebuilt_sealed_slice_waits_out_its_interval(day: i64, built: bool, mark: &str, after: i64) -> bool {
+        let today = 10 * DAY_MICROS;
+        let now = today + 12 * DERIVED_SLICE_MICROS;
+        let built_at = now - SEALED_REBUILD_INTERVAL_MICROS / 2;
+        let unit = task("p", today + day, today + day + DERIVED_SLICE_MICROS, Operation::BaseRollup);
+        let (_dir, mut journal) = new_journal();
+        journal.upsert(unit.clone());
+        if built {
+            assert!(journal.claim_next(Operation::BaseRollup, built_at, true).is_some());
+            let publication =
+                Publication { source_fingerprint: 0, generation: "g".into(), rows: 1, source_rows: None, source_rows_below: None, evidence: None };
+            assert!(journal.publish_built(&unit.key, publication, built_at));
+        }
+        let (source, project, table, date) = TaskJournal::cell_of(&unit).expect("cell");
+        match mark {
+            "hole" => journal.set_tier_holes(HashSet::from([(source, project, table, date)])),
+            "damage" => journal.set_untagged_cells(&source, &table, [(project, date)]),
+            _ => {}
+        }
+        journal.enqueue(unit.key.clone(), now, 1, 0);
+        let claimed = journal.claim_next(Operation::BaseRollup, now + after, true).is_some();
+        assert!(claimed || journal.state(&unit.key) == Some(TaskState::Pending), "a held rebuild stays queued");
+        claimed
+    }
+
+    /// Sealed-slice fusion re-creates a built day key from the narrow units late rows mint;
+    /// the replacement must keep the build stamp or it rebuilds the day at once.
+    #[test]
+    fn fusing_late_units_into_a_built_day_keeps_its_rebuild_interval() {
+        let (day, now) = (10 * DAY_MICROS, 13 * DAY_MICROS);
+        let whole = task("p", day, day + DAY_MICROS, Operation::BaseRollup);
+        let (_dir, mut journal) = new_journal();
+        journal.upsert(whole.clone());
+        assert!(journal.claim_next(Operation::BaseRollup, now, true).is_some());
+        let publication = Publication { source_fingerprint: 0, generation: "g".into(), rows: 1, source_rows: None, source_rows_below: None, evidence: None };
+        assert!(journal.publish_built(&whole.key, publication, now));
+        for hour in [3, 15] {
+            journal.upsert(task("p", day + hour * DERIVED_SLICE_MICROS, day + hour * DERIVED_SLICE_MICROS + NORMAL_SLICE_MICROS, Operation::BaseRollup));
+        }
+        assert!(journal.coarsen_sealed_slices(now) > 0, "the late units must fuse for this to test anything");
+        assert_eq!(journal.state(&whole.key), Some(TaskState::Pending));
+        assert!(journal.claim_next(Operation::BaseRollup, now + 1, true).is_none());
+        assert!(journal.claim_next(Operation::BaseRollup, now + SEALED_REBUILD_INTERVAL_MICROS, true).is_some());
     }
 
     /// The proof latches. The frontier re-enqueues the same key without it, and

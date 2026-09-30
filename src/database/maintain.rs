@@ -1773,6 +1773,7 @@ impl Database {
                 backfill_priority_micros: None,
                 pended_unix_ms: None,
                 dirty: Vec::new(),
+                built_micros: None,
                 rank_cache: Default::default(),
             };
             let mut partitions: HashMap<(String, chrono::NaiveDate), Vec<TailAdd>> = HashMap::new();
@@ -3622,7 +3623,7 @@ impl Database {
                 );
             }
             journal.note_escalation(&key, estimated_rows, estimated_bytes);
-            journal.publish(&key, publication.clone());
+            journal.publish_built(&key, publication.clone(), crate::support::now_micros());
             // A BASE slice just changed under the derived cells built over it, whose
             // witness (the RAW partition) agrees forever on a sealed day. The COVERAGE
             // must be dropped WITH the task and in this order, so that a cell under
@@ -10887,9 +10888,10 @@ mod rollup_noop_skip_tests {
         Ok((db, project_id, chrono::Utc::now().date_naive() - chrono::Duration::days(3)))
     }
 
-    /// Past the coordinator's cadence, so every ready rollup unit drains.
+    /// Past the coordinator's cadence and the sealed rebuild interval, so every ready rollup
+    /// unit drains.
     async fn advance_and_drain(db: &Database) -> Result<usize> {
-        crate::support::advance_micros(16 * 60 * 1_000_000);
+        crate::support::advance_micros(crate::maintenance_coordinator::SEALED_REBUILD_INTERVAL_MICROS);
         db.drain_coordinator_rollups(64).await
     }
 
@@ -11984,6 +11986,53 @@ mod rollup_noop_skip_tests {
             "batch boundaries must not lose or repeat contributions"
         );
         phase("result_verified");
+        Ok(())
+    }
+
+    /// Late rows into a built sealed day: prod rebuilt one 09-29 day slice 256 times, once
+    /// per flush. Inside the interval the day is rebuilt zero times and reads stay exact
+    /// through the raw leg; after it, exactly once.
+    #[serial]
+    #[tokio::test]
+    async fn late_rows_into_a_sealed_day_batch_into_one_rebuild_per_interval() -> Result<()> {
+        use crate::maintenance_coordinator::{DAY_MICROS, TaskKey, TimeSlice};
+        use datafusion::arrow::{array::AsArray, datatypes::Int64Type};
+        let (db, project_id, date) = rollup_db("sealed_rebuild_interval").await?;
+        // The census reads coverage, not presence, only once the tag replay is done, as in prod.
+        db.preload_replay_complete.store(true, std::sync::atomic::Ordering::Release);
+        insert_span(&db, &project_id, date, 12, "seed", "op").await?;
+        db.run_unit_once("otel_logs_and_spans", &project_id, date, Operation::BaseRollup, 24, 0, None).await?;
+        let built = tier_version(&db).await;
+        let day = day_start_micros(date).expect("valid day");
+        let slice = TimeSlice::new(day, day + DAY_MICROS)?;
+        let day_key = TaskKey {
+            physical_table: TIER.into(),
+            source: "otel_logs_and_spans".into(),
+            project_id: project_id.clone(),
+            slice,
+            operation: Operation::BaseRollup,
+        };
+        let sql = format!(
+            "SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = '{project_id}' AND timestamp >= to_timestamp_micros({day}) AND timestamp < to_timestamp_micros({})",
+            day + DAY_MICROS
+        );
+        let mut ctx = Arc::clone(&db).create_session_context();
+        db.setup_session_context(&mut ctx)?;
+        let count = |batches: Vec<RecordBatch>| batches[0].column(0).as_primitive::<Int64Type>().value(0);
+        for (late, hour) in [15, 15, 16].into_iter().enumerate() {
+            insert_span(&db, &project_id, date, hour, &format!("late{late}"), "op").await?;
+            db.plan_rollup_backfill().await?;
+            crate::support::advance_micros(16 * 60 * 1_000_000);
+            db.drain_coordinator_rollups(64).await?;
+            assert_eq!(tier_version(&db).await, built, "late row {late} rebuilt the sealed day inside its interval");
+            assert_eq!(db.journal().state(&day_key), Some(TaskState::Pending), "the rebuild is deferred, not dropped");
+            let expected = 2 + i64::try_from(late)?;
+            assert_eq!((count(ctx.sql(&sql).await?.collect().await?), count(db.query_delta_only(&sql).await?)), (expected, expected));
+        }
+        advance_and_drain(&db).await?;
+        assert_eq!(tier_version(&db).await, built.map(|version| version + 1), "the batched late rows cost exactly one rebuild");
+        assert_eq!(db.journal().state(&day_key), Some(TaskState::Complete));
+        assert_eq!(count(ctx.sql(&sql).await?.collect().await?), 4);
         Ok(())
     }
 

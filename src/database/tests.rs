@@ -3688,6 +3688,7 @@ async fn a_day_wide_publish_retires_an_untagged_tier_file() -> Result<()> {
     // a damaged partition.
     insert_a_span(&db, &project, "s3", noon + 3).await?;
     day_unit(&db)?;
+    crate::support::advance_micros(crate::maintenance_coordinator::SEALED_REBUILD_INTERVAL_MICROS);
     assert!(db.run_maintenance_units(1024).await? > 0, "the rebuild must run");
     assert_eq!(live_files(&db).await?, 1, "a day-wide rebuild must RETIRE the untagged file, not stack a version beside it");
     assert_eq!(tier_total(&db).await?, 4, "and the rebuilt partition counts each span once");

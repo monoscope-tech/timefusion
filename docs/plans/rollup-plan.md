@@ -298,8 +298,12 @@ Done items carry evidence (commit or number). Open items carry the next action, 
       monoscope session (array_has lowering, issue-chart backoff, 10 s session-lookup timeout; hashes cadence unchanged).
 - [ ] Flaky: `kill_recovery::acked_rows_survive_sigkill_*` (multi_tenant, concurrent_writers) each retried once 09-30.
 - [ ] Flaky e2e: `recent_window_pruning::dv_bearing_file_keeps_parquet_pushdown_on_its_siblings` (1 retry in 0930e signoff).
-- [ ] Late RUM rows void a whole sealed day slice (09-29 day slice rebuilt 256×; one rebuild took 2,461 s while a sealed
-      consolidation overlapped; the 15-min rebuild deadline is not enforced). Options: hourly sealed slices, or accept.
+- [x] Late RUM rows void a whole sealed day slice (09-29 day slice rebuilt 256×; one rebuild took 2,461 s while a sealed
+      consolidation overlapped). Fixed on `rollup/batch-sealed-rebuilds`: a built rollup slice over a date before today
+      is rebuilt at most once per `SEALED_REBUILD_INTERVAL_MICROS` (1 h); the re-arm stays queued and reads use the raw
+      leg meanwhile. Today, never-built slices and damage (untagged) cells are not held. The 15-min "deadline" is an IDLE
+      window by design (rollups use the 60-min one, no lifetime cap), so long but progressing rebuilds are not killed.
+      Consolidation and rollup of one partition are not serialized: no per-partition cross-lane lock exists.
 
 ### Monoscope-owner decisions
 
