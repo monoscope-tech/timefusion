@@ -3936,10 +3936,6 @@ impl Database {
         let target = declared_target.min(crate::config::coordinator_packing_cap_bytes(smallest_pair));
         let unsorted_candidates = candidates.iter().filter(|add| !add.is_sorted_run).count();
         let under_target_candidates = candidates.iter().filter(|add| add.size < target).count();
-        // A pair that does not fit means planner and packer see different candidate sets
-        // (the planner does not apply the packer's range filter).
-        let two_smallest = candidates.iter().map(|add| add.size).filter(|size| *size < target).k_smallest(2).collect_tuple();
-        let smallest_pair = two_smallest.map_or(-1, |(smaller, larger): (i64, i64)| smaller.saturating_add(larger));
         // Captured before the move: the packer takes `candidates` by value.
         let ranges_by_path: HashMap<String, (i64, i64)> = candidates.iter().filter_map(|add| add.event_range.map(|range| (add.path.clone(), range))).collect();
         // Today, a bin stays inside ONE rollup slice cell, so packing never moves a
@@ -4003,7 +3999,9 @@ impl Database {
                 stats.compaction_invariant_violations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 debug_assert!(false, "packer refused {wedged_cells} cells of packable files the planner would queue");
             }
-            warn!(
+            // WARN only on a refusal: a lone strip or L0 bin is work, and an empty
+            // selection over unpackable cells is a unit's normal final re-plan.
+            macro_rules! selected_nothing { ($level:ident) => { $level!(
                 operation = ?key.operation,
                 project_id = %key.project_id,
                 table = %key.physical_table,
@@ -4019,11 +4017,10 @@ impl Database {
                 selected = selected.len(),
                 refused_cells = wedged_cells,
                 target,
-                smallest_pair_bytes = smallest_pair,
-                smallest_pair_fits = smallest_pair >= 0 && smallest_pair <= target,
                 event = "compaction_unit_selected_nothing",
                 "a compaction unit selected fewer than two files and will retire none"
-            );
+            ) } }
+            if wedged_cells > 0 { selected_nothing!(warn) } else { selected_nothing!(debug) }
         }
         Ok(selected)
     }
