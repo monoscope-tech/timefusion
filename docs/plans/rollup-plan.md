@@ -290,8 +290,11 @@ Done items carry evidence (commit or number). Open items carry the next action, 
 - [x] ERROR-count tail: the `status_code` tantivy prefilter overflowed its 2,000-hit cap on busy sealed-day indexes AFTER
       downloading every cold blob (cold whale sealed 24h: 14.8 s vs 1.05 s unfiltered). Over-cap memo (`c122952c`):
       realistic mix p95 1.8 s, p99 2.6 s, 3,779 queries/12 min, anon peak 19.5 GB.
-- [ ] Window-aware cap (`fix/prefilter-window-cap` `87ad5e49`, ready): count only in-window hits so fringe legs succeed;
-      removes the first-query cold cost. Deploy after the 18:05 gate.
+- [x] Window-aware cap deployed (`3b8d42b2`, 11:04): in-window hits only. Did NOT remove the cold first-query cost:
+      whale sealed 24h 7 d back 88.9 s cold / 1.85 s warm (8 d back 10.3 s / 1.95 s); unfiltered ~1 s.
+- [ ] Never block a query on cold index installs: skip the prefilter when its blobs are not local, warm them in the
+      background (`fix/prefilter-cold-skip`, in progress). Deploy after the 18:05 gate.
+- [ ] Flaky: `kill_recovery::acked_rows_survive_sigkill_*` (multi_tenant, concurrent_writers) each retried once 09-30.
 - [ ] Flaky e2e: `recent_window_pruning::dv_bearing_file_keeps_parquet_pushdown_on_its_siblings` (1 retry in 0930e signoff).
 - [ ] Late RUM rows void a whole sealed day slice (09-29 day slice rebuilt 256×; one rebuild took 2,461 s while a sealed
       consolidation overlapped; the 15-min rebuild deadline is not enforced). Options: hourly sealed slices, or accept.
