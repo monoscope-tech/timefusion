@@ -233,9 +233,11 @@ Done items carry evidence (commit or number). Open items carry the next action, 
 - [ ] Re-rank residual cost once the backfill finishes (1B and 1C may matter for large units).
 - [x] W28 `service_name_hll` unblocked (`e0e27dbe`).
 - [x] RUM measures on v4 (`180ced63`, `8bea392b`); measure re-mint backfill for older cells (`8184a638`, in progress).
-- [ ] RUM widgets (monoscope branch merged into `overnight-exploration-29-09`) route to v4 `rum_*` measures:
+- [x] RUM widgets (monoscope branch merged into `overnight-exploration-29-09`) route to v4 `rum_*` measures:
       confirm hits in prod once the backfill re-mints historical cells. 09-30 09:15: after re-mint at 8/pass
-      (`dadf3311`, ~480/h) sealed Talstack page views route: 7d 0.88 s, 28d 2.2 s (were 3.4–4.2 s raw / 90 s timeout). 09-30 04:20: the 7-day sealed Talstack
+      (`dadf3311`, ~480/h) sealed Talstack page views route: 7d 0.88 s, 28d 2.2 s (were 3.4–4.2 s raw / 90 s timeout).
+      09-30 16:10: backfill complete — 28-day page views (09-01..09-29) are FULL rollup hits: Talstack 0.49 s,
+      shipbubble 0.7 s. 09-30 04:20: the 7-day sealed Talstack
       page-view query still runs raw (3.4–4.2 s, `measure_not_stored`). Re-mints run at 2 per pass, about 25–44
       per hour, so expect several more hours.
 - [ ] W12 `name` HLL (owner): add the unfiltered `name_hll` only if a daytime sample shows service-tab misses.
