@@ -471,7 +471,7 @@ fn privatize_sliced(arr: &ArrayRef) -> ArrayRef {
 /// View gc then buffer privatization. Runs at every bucket insert and before
 /// WAL serialization so neither memory accounting nor WAL entries carry other
 /// allocations' bytes.
-pub fn compact_batch(batch: RecordBatch) -> RecordBatch {
+pub(crate) fn compact_batch(batch: RecordBatch) -> RecordBatch {
     let cols: Vec<ArrayRef> = batch.columns().iter().map(|c| privatize_sliced(&compact_view_arrays(c))).collect();
     if cols.iter().zip(batch.columns()).all(|(a, b)| Arc::ptr_eq(a, b)) { batch } else { RecordBatch::try_new(batch.schema(), cols).unwrap_or(batch) }
 }

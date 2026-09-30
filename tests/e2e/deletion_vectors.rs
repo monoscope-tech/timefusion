@@ -7,7 +7,7 @@
 
 use std::time::Duration;
 
-use super::harness::{E2eEnv, E2eEnvBuilder, FROZEN_START_MICROS, insert_dormant_at, insert_dormant_named};
+use super::harness::{E2eEnv, E2eEnvBuilder, FROZEN_START_MICROS, insert_dormant_at};
 use tokio_postgres::Client;
 
 /// DV-enabled env; callers chain any extra builder options plus `.start()`.
@@ -108,9 +108,8 @@ async fn dv_dedup_drops_cross_file_duplicate_without_rewriting() -> anyhow::Resu
     seed(&client, "u", 3, past).await?;
     insert_dormant_at(&client, "dup", past + 100 * sec).await?;
     env.force_flush().await?;
-    // File 2: the DUPLICATE — identical timestamp+id dedup key but different content,
-    // else the ingest-time content-identity filter drops it before it lands.
-    insert_dormant_named(&client, "dup", past + 100 * sec, "span-v2").await?;
+    // File 2: the DUPLICATE (identical timestamp+id dedup key) + one more unique.
+    insert_dormant_at(&client, "dup", past + 100 * sec).await?;
     insert_dormant_at(&client, "u-3", past + 3 * sec).await?;
     env.force_flush().await?;
 

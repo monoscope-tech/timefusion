@@ -570,17 +570,10 @@ pub async fn insert_at(client: &tokio_postgres::Client, id: &str, ts_micros: i64
 /// `otel_logs_and_spans`, where an UPDATE appends a row version instead of
 /// masking-and-rewriting) — deletion-vector tests need it as their subject.
 pub async fn insert_dormant_at(client: &tokio_postgres::Client, id: &str, ts_micros: i64) -> Result<()> {
-    insert_dormant_named(client, id, ts_micros, "span").await
-}
-
-/// Like [`insert_dormant_at`] but with an explicit `name`: a row sharing a dedup
-/// KEY but differing in content gets past the ingest-time content-identity filter,
-/// which would drop an exact re-send before it became a physical duplicate.
-pub async fn insert_dormant_named(client: &tokio_postgres::Client, id: &str, ts_micros: i64, name: &str) -> Result<()> {
     let dt = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(ts_micros).unwrap();
     let sql = format!(
         "INSERT INTO mor_dormant (project_id, date, timestamp, id, name, status_code, level) \
-         VALUES ($1, '{}', '{}', $2, '{name}', 'OK', 'INFO')",
+         VALUES ($1, '{}', '{}', $2, 'span', 'OK', 'INFO')",
         dt.date_naive(),
         dt.format("%Y-%m-%d %H:%M:%S%.f"),
     );

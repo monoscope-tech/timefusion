@@ -1927,17 +1927,6 @@ atomic_stats! {
         /// progressing work is allowed to finish; sustained nonzero with no
         /// completion = wedged.
         cron_long_running as "cron_long_running_total",
-        /// Ingest-time client-retry dedup: rows DROPPED because their exact
-        /// client-visible content was provably already committed. A far-too-high
-        /// dropped/rows_ingested ratio means it is misfiring on legitimate version
-        /// traffic; a permanent zero means the hash point has drifted inert.
-        ingest_dedup_dropped_rows as "ingest_dedup_dropped_rows_total",
-        /// Probes whose dedup KEY matched a flushed row (content match or not).
-        /// key_hits >> dropped_rows = version traffic, not retries.
-        ingest_dedup_key_hits as "ingest_dedup_key_hits_total",
-        /// Gauge: live identity entries across every per-table index (both epochs).
-        ingest_dedup_index_entries,
-        ingest_dedup_epoch_rotations as "ingest_dedup_epoch_rotations_total",
         /// Boot hot-body preload: bodies fetched (files, bytes), files already
         /// cached, files left out by a byte cap, and passes cut by the wall budget.
         hot_body_preload_files as "hot_body_preload_files_total",
