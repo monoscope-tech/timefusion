@@ -268,8 +268,9 @@ Done items carry evidence (commit or number). Open items carry the next action, 
 
 - [x] W10 sim, W18, W26 matrix, W11 OTel 0.33, W15 observability, W25 part 4 (rollout phase timing),
       ingest dirty-livelock fix (`d7d44054`, `3bfa405e`, `4ee017dd`), task-age-from-reopen metric.
-- [ ] Journal lock wait: recheck on a ≥1 h process (mature ~7 s/min; 14–18 s/min seen on young ones).
+- [x] Journal lock wait: recheck on a ≥1 h process (mature ~7 s/min; 14–18 s/min seen on young ones).
       `coordinator_claim` ~371/s is the baseline, not a regression.
+      09-30 21:55 on `90004268` (68 min old): 10.0 s/min summed across threads; avg wait ~0.37 ms, max 93 ms. Slightly above the ~7 s/min baseline, not a bottleneck.
 - [x] `oldest_due_unclaimed_age_seconds` added (`f62fb4ae`).
 - [ ] W25 parts 2–3: the 4.9 s container create → start; CapRover's double service update (1.6 s per deploy).
 - [ ] **Look at tomorrow (owner, 09-30 decision): CapRover config.** Needs someone with CapRover access; TF sessions
