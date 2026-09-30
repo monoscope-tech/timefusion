@@ -6279,6 +6279,15 @@ pub(crate) fn select_cell_bin(cells: &[Vec<TailAdd>], policy: BinPolicy) -> Vec<
         .unwrap_or_default()
 }
 
+/// Cells the packer REFUSED: packable (every file a sorted run, two under target
+/// or DV'd) yet binned below a pair. Another cell's bin outranking them is a
+/// choice, not a refusal — a masked strip outranks a clean pack by design.
+pub(crate) fn refused_cells(cells: &[Vec<TailAdd>], policy: BinPolicy) -> usize {
+    let packable =
+        |cell: &Vec<TailAdd>| cell.iter().all(|add| add.is_sorted_run) && cell.iter().filter(|add| add.size < policy.target_size || add.has_dv).count() >= 2;
+    cells.iter().filter(|cell| packable(cell) && select_bin(cell, policy).len() < 2).count()
+}
+
 /// Decoded bytes of the bin ONE unit takes from `debt`, through the packer's own
 /// selection — what a hygiene unit is priced at. The whole debt is the benefit,
 /// not the cost: summing it priced a today unit over hundreds of DV files and

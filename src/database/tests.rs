@@ -6010,6 +6010,23 @@ fn planner_and_packer_pair_only_within_a_slice_cell(ranges: &[Option<(i64, i64)>
     (queued, packed.len())
 }
 
+/// The compaction invariant counts cells the packer REFUSED, not cells it merely
+/// ranked below another bin: a masked strip outranks a clean pack by design, and
+/// prod 2026-09-30 counted every such pick as a planner/packer disagreement.
+/// Returns (files the packer took, refused cells).
+#[test_case(&[(1, false), (2, false), (15, true)] => (1, 0) ; "a strip picked over a clean pair refuses nothing")]
+#[test_case(&[(1, false), (2, false)] => (2, 0) ; "a clean pair is packed")]
+fn a_strip_outranking_a_pair_is_no_invariant_violation(files: &[(i64, bool)]) -> (usize, usize) {
+    const MINUTE: i64 = 60_000_000;
+    let adds = files.iter().enumerate().map(|(i, &(at, dv))| {
+        let add = tail_file(&format!("f{i}"), 10 * MB, true, Some((at * MINUTE, (at + 1) * MINUTE)), dv, Some(10));
+        super::TailAdd { masked: if dv { 5 } else { 0 }, strip: dv, ..add }
+    });
+    let cells = super::slice_cells(adds, &super::slice_bounds([10 * MINUTE], 0));
+    let policy = hygiene_policy(super::COORDINATOR_HOT_TARGET_BYTES);
+    (super::select_cell_bin(&cells, policy).len(), super::refused_cells(&cells, policy))
+}
+
 /// The coordinator packer's policy.
 fn hygiene_policy(target_size: i64) -> super::BinPolicy {
     super::BinPolicy { target_size, max_rows: u64::MAX, order: super::BinOrder::SmallestFirst, level_unsorted_first: true }

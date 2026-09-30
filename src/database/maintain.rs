@@ -3948,23 +3948,21 @@ impl Database {
             if key.operation == Operation::HotPacking { self.packing_bounds(&key.project_id, &key.source, key.slice.start_micros) } else { Some(Vec::new()) };
         let Some(bounds) = bounds else { return Ok(Vec::new()) };
         let cells = slice_cells(self.admit_strips(&key.project_id, &key.source, &date, &bounds, candidates), &bounds);
-        let selected = select_cell_bin(
-            &cells,
-            BinPolicy {
-                target_size: target,
-                // NO row cap. It was a SECOND bound in a different unit from the
-                // byte budget, and once the byte cap stopped collapsing it simply
-                // became the new collapse: two 1.038M-row files exceed 2M, so a
-                // row-dense table like otel_metrics was still capped at a pair.
-                // The sort is bounded in DECODED BYTES by slicing, which already
-                // accounts for row count and row width together.
-                max_rows: u64::MAX,
-                // Smallest-first LEVELS: an L0 tail is sorted into runs before
-                // runs merge with each other.
-                order: crate::database::BinOrder::SmallestFirst,
-                level_unsorted_first: true,
-            },
-        );
+        let policy = BinPolicy {
+            target_size: target,
+            // NO row cap. It was a SECOND bound in a different unit from the
+            // byte budget, and once the byte cap stopped collapsing it simply
+            // became the new collapse: two 1.038M-row files exceed 2M, so a
+            // row-dense table like otel_metrics was still capped at a pair.
+            // The sort is bounded in DECODED BYTES by slicing, which already
+            // accounts for row count and row width together.
+            max_rows: u64::MAX,
+            // Smallest-first LEVELS: an L0 tail is sorted into runs before
+            // runs merge with each other.
+            order: crate::database::BinOrder::SmallestFirst,
+            level_unsorted_first: true,
+        };
+        let selected = select_cell_bin(&cells, policy);
         // Span of the output: merging unions the inputs' ranges and dedup reads a file
         // once per 10-minute bin it touches. Bounded by one slice cell today; reported only
         // for sealed dates.
@@ -4000,10 +3998,7 @@ impl Database {
             // planner pairs only within one. PACKABLE, narrower than under-target: a
             // cell with any L0 file sorts it first, and a lone L0 file is legitimate
             // work rather than a refusal.
-            let wedged_cells = cells
-                .iter()
-                .filter(|cell| cell.iter().all(|add| add.is_sorted_run) && cell.iter().filter(|add| add.size < target || add.has_dv).count() >= 2)
-                .count();
+            let wedged_cells = crate::database::refused_cells(&cells, policy);
             if wedged_cells > 0 {
                 stats.compaction_invariant_violations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 debug_assert!(false, "packer refused {wedged_cells} cells of packable files the planner would queue");
@@ -4022,6 +4017,7 @@ impl Database {
                 unsorted_candidates,
                 under_target = under_target_candidates,
                 selected = selected.len(),
+                refused_cells = wedged_cells,
                 target,
                 smallest_pair_bytes = smallest_pair,
                 smallest_pair_fits = smallest_pair >= 0 && smallest_pair <= target,
