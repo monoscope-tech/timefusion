@@ -532,6 +532,33 @@ FROM otel_logs_and_spans WHERE project_id = 'mono_shapes' AND id = 'ms_1'
 ----
 true
 
+# Monoscope lowers `hashes[*] == "x"` to `array_has` on TimeFusion; it must agree with
+# the jsonpath form on NULL and empty `hashes`. Equality only: the negations diverge
+# on NULL (NOT array_has is tri-valued), so `!=` is never rewritten.
+
+statement ok
+INSERT INTO otel_logs_and_spans (project_id, timestamp, id, hashes, date, name, kind, summary) VALUES
+    ('mono_arrhas', TIMESTAMP '2026-01-15T10:00:00Z', 'ah_1', ARRAY['h1','h2']::VARCHAR[], DATE '2026-01-15', 'a', 'server', ARRAY['ok']),
+    ('mono_arrhas', TIMESTAMP '2026-01-15T10:00:01Z', 'ah_2', NULL, DATE '2026-01-15', 'a', 'server', ARRAY['ok']),
+    ('mono_arrhas', TIMESTAMP '2026-01-15T10:00:02Z', 'ah_3', ARRAY[]::VARCHAR[], DATE '2026-01-15', 'a', 'server', ARRAY['ok']),
+    ('mono_arrhas', TIMESTAMP '2026-01-15T10:00:03Z', 'ah_4', ARRAY['h1']::VARCHAR[], DATE '2026-01-15', 'a', 'server', ARRAY['ok'])
+
+query II
+SELECT
+    count(*) FILTER (WHERE array_has(hashes, 'h1')),
+    count(*) FILTER (WHERE jsonb_path_exists(to_jsonb(hashes), '$[*] ? (@ == "h1")'::jsonpath))
+FROM otel_logs_and_spans WHERE project_id = 'mono_arrhas'
+----
+2 2
+
+query II
+SELECT
+    count(*) FILTER (WHERE array_has(hashes, 'nope')),
+    count(*) FILTER (WHERE jsonb_path_exists(to_jsonb(hashes), '$[*] ? (@ == "nope")'::jsonpath))
+FROM otel_logs_and_spans WHERE project_id = 'mono_arrhas'
+----
+0 0
+
 # `substring(x FROM 'regex')` — an operator reading widget access logs out of
 # `body` lost a whole query to `substr(Utf8View, Utf8)` type inference.
 
