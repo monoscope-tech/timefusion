@@ -1193,8 +1193,10 @@ impl RoutedRollup {
         let group_by = self.group_by();
         let having =
             self.guard.as_ref().map_or_else(String::new, |guard| format!(" HAVING {} > 0", guard.merge.sql(&[format!("__s{}_0", self.measures.len())])));
+        // One raw leg PER fringe: scan pruners bound by the hull of a leg's time
+        // filters, and fringes ORed into one leg span every interior between them.
         let legs = std::iter::once(self.leg(&self.target, interiors, &generations, &rollup_projects))
-            .chain((!fringes.is_empty()).then(|| self.leg(&self.source, &fringes, "", &rollup_projects)))
+            .chain(fringes.iter().map(|fringe| self.leg(&self.source, std::slice::from_ref(fringe), "", &rollup_projects)))
             .chain(raw_only_leg)
             .join(" UNION ALL ");
         format!("SELECT {outer} FROM ({legs}) AS rollup_union{group_by}{having}")
@@ -3341,6 +3343,34 @@ mod tests {
         assert!(generated.contains("duration_digest"), "the percentile must read the digest state: {generated}");
         assert!(generated.contains("duration_count"), "the guarded count(*) must resolve to count(duration): {generated}");
         assert!(!generated.contains("request_count"), "request_count counts null-duration rows the guard excluded: {generated}");
+    }
+
+    /// Every raw scan must be bounded by ITS OWN fringe. The tantivy prefilter, bloom
+    /// and certification pruners take the hull of a scan's time filters, so one leg
+    /// ORing the head and tail fringes opens every index of the interior between them
+    /// (prod 6297304f: a fully covered 5-day hybrid searched 2,532 indexes in 4 s, one
+    /// fringe 16 in 0.7 s).
+    #[tokio::test]
+    async fn every_raw_leg_is_bounded_by_its_own_fringe() {
+        use datafusion::logical_expr::{LogicalPlan, utils::split_conjunction};
+        let state = session().await;
+        let route =
+            route_for(&state, &format!("SELECT COUNT(*) FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW}")).await.expect("match").expect("route");
+        let interiors = [(120_000_000, 300_000_000), (360_000_000, 600_000_000)];
+        let generations = interiors.map(|range| generation_range("project", "generation", range));
+        let plan = optimized(&state, &route.sql(&generations, &interiors, &ProjectSplit::default())).await;
+        let mut hulls = Vec::new();
+        plan.apply(|node| {
+            if let LogicalPlan::Filter(filter) = node
+                && matches!(filter.input.as_ref(), LogicalPlan::TableScan(scan) if scan.table_name.table() == SOURCE)
+            {
+                hulls.push(crate::database::filters_time_range(&split_conjunction(&filter.predicate).into_iter().cloned().collect::<Vec<_>>()));
+            }
+            Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+        })
+        .expect("walk");
+        hulls.sort();
+        assert_eq!(hulls, complement(route.lo, route.hi, &interiors).into_iter().map(Some).collect::<Vec<_>>());
     }
 
     /// monoscope's RUM predicates (`browserScope`, `pageViewPredicate`, `errorPredicate`)

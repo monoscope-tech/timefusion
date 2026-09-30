@@ -70,7 +70,7 @@ pub(crate) use index::{TantivyBackfillWork, fair_tantivy_backfill_work, fair_tan
 pub use scan::ProjectRoutingTable;
 pub(crate) use scan::{DECODE_UNITS_PER_READER, GatedScanExec, scan_pressure_permits, selected_file_work, stale_coverage_metric};
 #[cfg(test)]
-pub(crate) use scan::{NOMINAL_DECODE_BATCH_BYTES, date_partition_window, pressure_permit_claim_at};
+pub(crate) use scan::{NOMINAL_DECODE_BATCH_BYTES, date_partition_window, filters_time_range, pressure_permit_claim_at};
 
 /// The decode ratio every sort budget is denominated in; `config` derives the
 /// repair budget from it.
