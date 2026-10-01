@@ -557,8 +557,12 @@ impl ProjectRoutingTable {
             .map_or_else(Default::default, |window| self.database.certified_file_split(&table, project_id, &self.table_name, window));
         if skip_dedup && readmit_mutable_filters {
             let mutable = Self::version_mutable_columns(&self.table_name);
-            let leg_safe = |f: &Expr| !Self::references_tombstone(&self.table_name, f) && Self::version_safe(&self.table_name, mutable.as_ref(), f);
-            delta_only_filters.extend(unstripped_filters.iter().filter(|f| !leg_safe(f) && !Self::references_tombstone(&self.table_name, f)).cloned());
+            delta_only_filters.extend(
+                unstripped_filters
+                    .iter()
+                    .filter(|f| !Self::references_tombstone(&self.table_name, f) && !Self::version_safe(&self.table_name, mutable.as_ref(), f))
+                    .cloned(),
+            );
         }
         // Restoring the pushed limit is only sound when nothing above the
         // scan drops rows — the tombstone filter does, regardless of dedup.
@@ -680,11 +684,7 @@ impl ProjectRoutingTable {
         let schema = coerced.schema();
         let predicate = filters
             .iter()
-            .filter(|f| {
-                !Self::references_tombstone(&self.table_name, f)
-                    && f.column_refs().iter().all(|c| schema.index_of(&c.name).is_ok())
-                    && Self::version_safe(&self.table_name, mutable.as_ref(), f)
-            })
+            .filter(|f| Self::leg_safe(&self.table_name, mutable.as_ref(), f) && f.column_refs().iter().all(|c| schema.index_of(&c.name).is_ok()))
             .cloned()
             .reduce(Expr::and);
         let filtered: Arc<dyn ExecutionPlan> = if let Some(predicate) = predicate {
@@ -822,6 +822,11 @@ impl ProjectRoutingTable {
             }
         }
         mutable.is_none_or(|m| safe(f, m, crate::schema::get_schema(table_name)))
+    }
+
+    /// May `f` run on a scan leg below the dedup: no tombstone reference, and [`Self::version_safe`].
+    fn leg_safe(table_name: &str, mutable: Option<&HashSet<String>>, f: &Expr) -> bool {
+        !Self::references_tombstone(table_name, f) && Self::version_safe(table_name, mutable, f)
     }
 
     /// Does `f` mention the table's tombstone marker? Such a predicate must never reach a scan leg.
@@ -1603,8 +1608,7 @@ impl TableProvider for ProjectRoutingTable {
         // `decide_prefilter` therefore refuses mutable predicates entirely.
         let mutable = Self::version_mutable_columns(&self.table_name);
         let unstripped_filters = filters;
-        let leg_safe = |f: &Expr| !Self::references_tombstone(&self.table_name, f) && Self::version_safe(&self.table_name, mutable.as_ref(), f);
-        let filters: Vec<Expr> = filters.iter().filter(|f| leg_safe(f)).cloned().collect();
+        let filters: Vec<Expr> = filters.iter().filter(|f| Self::leg_safe(&self.table_name, mutable.as_ref(), f)).cloned().collect();
         let optimized_filters = self.apply_time_series_optimizations(&filters)?;
 
         let project_id = self.extract_project_id_from_filters(&optimized_filters).unwrap_or_else(|| self.default_project.clone());
