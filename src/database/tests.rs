@@ -1318,7 +1318,7 @@ async fn a_partly_covered_window_is_exact_and_counts_a_measure_decline_once() ->
     Ok(())
 }
 
-/// monoscope's KQL `rate(value)` per 30-minute bin: a per-series LAG over bins sandwiched
+/// monoscope's KQL `rate(value)` per 30-minute bin: a per-series LAG over 5-minute cells sandwiched
 /// between two aggregates. The inner one must route to the per-series tier and equal raw.
 /// One cumulative series at 10/s resets at 12:00 (to 300 = the 30 s since its restart),
 /// one DELTA series adds 30 per 30 s point: every bin reads 10 + 1.
@@ -1351,12 +1351,13 @@ async fn a_per_series_counter_rate_routes_to_the_series_tier_and_equals_raw() ->
     let sql = format!(
         "SELECT extract(epoch from time_bucket('30 minutes', timestamp))::integer, 'value', COALESCE(sum(__rate_value), 0)::float FROM \
          (SELECT *, (CASE WHEN aggregation_temporality = 'DELTA' THEN __sum_value WHEN __prev_value IS NULL THEN NULL WHEN __first_value < __prev_value THEN __max_value ELSE __max_value - __prev_value END) \
-             / GREATEST(1800.0, CAST(extract(epoch from timestamp) AS DOUBLE PRECISION) - CAST(extract(epoch from __prev_ts) AS DOUBLE PRECISION)) AS __rate_value FROM \
+             / GREATEST(1800.0, SUM(CAST(extract(epoch from timestamp) AS DOUBLE PRECISION) - CAST(extract(epoch from __prev_ts) AS DOUBLE PRECISION)) \
+               OVER (PARTITION BY series_id, time_bucket('30 minutes', timestamp))) AS __rate_value FROM \
            (SELECT *, __last_ts AS timestamp, LAG(__last_ts) OVER (PARTITION BY series_id ORDER BY __last_ts) AS __prev_ts, LAG(__max_value) OVER (PARTITION BY series_id ORDER BY __last_ts) AS __prev_value FROM \
-             (SELECT time_bucket('30 minutes', timestamp) AS __bin, series_id, aggregation_temporality, max(timestamp) AS __last_ts, max(value) AS __max_value, \
+             (SELECT series_id, aggregation_temporality, max(timestamp) AS __last_ts, max(value) AS __max_value, \
                      first_value(value ORDER BY timestamp) AS __first_value, sum(value) AS __sum_value \
               FROM otel_metrics WHERE project_id='{project}' and timestamp BETWEEN '{lookback}' AND '{hi}' and (metric_name = 'rows') \
-              GROUP BY time_bucket('30 minutes', timestamp), series_id, aggregation_temporality) AS __series_bins) AS __series_points) AS otel_metrics \
+              GROUP BY time_bucket('5 minutes', timestamp), series_id, aggregation_temporality) AS __series_cells) AS __series_points) AS otel_metrics \
          WHERE timestamp BETWEEN '{lo}' AND '{hi}' GROUP BY time_bucket('30 minutes', timestamp) ORDER BY time_bucket('30 minutes', timestamp) DESC"
     );
     let stats = crate::observability::maintenance_stats;

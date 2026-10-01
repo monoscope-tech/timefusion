@@ -3817,21 +3817,19 @@ mod tests {
         assert_substitutes(&session().await, &sql, Some(WIDE_HORIZON)).await;
     }
 
-    /// KQL `rate()`'s per-series bins read the per-series tier whose grain divides the bin.
-    #[test_case::test_case("30 minutes", "otel_metrics_rollup_series_5m_v1"; "a 7d chart")]
-    #[test_case::test_case("2 hours", "otel_metrics_rollup_series_1h_v1"; "a 30d chart")]
+    /// monoscope's KQL `rate()` reads 5-minute per-series cells, under an `IN` filter.
     #[tokio::test]
-    async fn per_series_bins_route_to_the_series_tier(bin: &str, tier: &str) {
+    async fn per_series_cells_route_to_the_series_tier() {
         let tiers =
             crate::schema::get_schema("otel_metrics").expect("metrics schema").rollups.iter().map(|spec| spec.table_name("otel_metrics")).collect::<Vec<_>>();
         let state = session_over(std::iter::once("otel_metrics".to_string()).chain(tiers));
         let sql = format!(
-            "SELECT time_bucket('{bin}', timestamp), series_id, aggregation_temporality, max(timestamp), max(value), first_value(value ORDER BY timestamp), sum(value) \
+            "SELECT time_bucket('5 minutes', timestamp), series_id, aggregation_temporality, max(timestamp), max(value), first_value(value ORDER BY timestamp), sum(value) \
              FROM otel_metrics WHERE project_id = 'project' AND metric_name IN ('a', 'b', 'c', 'd') \
                AND timestamp >= to_timestamp_micros(0) AND timestamp < to_timestamp_micros({}) GROUP BY 1, 2, 3",
             30 * 86_400_000_000i64
         );
-        assert_eq!(route_for(&state, &sql).await.expect("match").expect("route").target, tier);
+        assert_eq!(route_for(&state, &sql).await.expect("match").expect("route").target, "otel_metrics_rollup_series_5m_v1");
         assert_substitutes(&state, &sql, None).await;
     }
 
