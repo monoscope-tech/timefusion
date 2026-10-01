@@ -1697,6 +1697,11 @@ pub(crate) async fn match_aggregates(
     let mut predicates = Vec::new();
     let source = match source_and_filters(&aggregate.input, &mut predicates) {
         Ok(source) => source,
+        // An aggregate over a window over the aggregate a rollup CAN answer (a
+        // per-series counter rate summed across series): route the inner one, the
+        // window and this aggregate then run over its rewrite. The inner match
+        // counts its own miss.
+        Err(_) if outermost_aggregate(&original.input).is_some() => return Box::pin(match_aggregates(&original.input, session)).await,
         Err(node) => {
             // Count this only when a rollup-bearing table sits underneath; an
             // aggregate over `pg_catalog` alone was never a candidate.
@@ -3243,9 +3248,6 @@ mod tests {
              GROUP BY b.status_code"
         ),
         "Join", MissReason::MultiScanSource; "a SELF-JOIN — monoscope rollUpServiceMap edges, every prod multi-scan decline")]
-    #[test_case::test_case(
-        &format!("SELECT count(DISTINCT status_code) FROM (SELECT DISTINCT status_code FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW}) d"),
-        "Aggregate", MissReason::UnwalkableSource; "an inner DISTINCT, which plans as a second Aggregate")]
     #[tokio::test]
     async fn an_unwalkable_shape_is_counted_and_names_the_node_that_refused(sql: &str, expected_node: &str, expected_reason: MissReason) {
         let state = session().await;
@@ -3808,6 +3810,31 @@ mod tests {
         assert_substitutes(&state, &sql, Some(WIDE_HORIZON)).await;
     }
 
+    /// An aggregate over a derived one routes the inner aggregate; the outer runs over its rewrite.
+    #[tokio::test]
+    async fn an_aggregate_over_a_derived_aggregate_routes_the_inner_one() {
+        let sql = format!("SELECT count(DISTINCT status_code) FROM (SELECT DISTINCT status_code FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW}) d");
+        assert_substitutes(&session().await, &sql, Some(WIDE_HORIZON)).await;
+    }
+
+    /// KQL `rate()`'s per-series bins read the per-series tier whose grain divides the bin.
+    #[test_case::test_case("30 minutes", "otel_metrics_rollup_series_5m_v1"; "a 7d chart")]
+    #[test_case::test_case("2 hours", "otel_metrics_rollup_series_1h_v1"; "a 30d chart")]
+    #[tokio::test]
+    async fn per_series_bins_route_to_the_series_tier(bin: &str, tier: &str) {
+        let tiers =
+            crate::schema::get_schema("otel_metrics").expect("metrics schema").rollups.iter().map(|spec| spec.table_name("otel_metrics")).collect::<Vec<_>>();
+        let state = session_over(std::iter::once("otel_metrics".to_string()).chain(tiers));
+        let sql = format!(
+            "SELECT time_bucket('{bin}', timestamp), series_id, aggregation_temporality, max(timestamp), max(value), first_value(value ORDER BY timestamp), sum(value) \
+             FROM otel_metrics WHERE project_id = 'project' AND metric_name IN ('a', 'b', 'c', 'd') \
+               AND timestamp >= to_timestamp_micros(0) AND timestamp < to_timestamp_micros({}) GROUP BY 1, 2, 3",
+            30 * 86_400_000_000i64
+        );
+        assert_eq!(route_for(&state, &sql).await.expect("match").expect("route").target, tier);
+        assert_substitutes(&state, &sql, None).await;
+    }
+
     /// `::float` is Float32 in DataFusion while `value_max` is stored Float64, so
     /// the rewrite must be cast back to the query's own output type or the schema
     /// gate discards it (`rewrite_schema_mismatch`, the TF self-metrics dashboard).
@@ -3832,7 +3859,12 @@ mod tests {
         let state = session_over(["otel_metrics", "otel_metrics_rollup_metrics_1m_v2"].map(str::to_owned));
         let sql = format!("SELECT max(value::varchar) FROM otel_metrics WHERE project_id = 'project' AND {WINDOW}");
         let original = optimized(&state, &sql).await;
-        let route = match_aggregates(&original, &state).await.expect("match").into_iter().next().expect("route");
+        let route = match_aggregates(&original, &state)
+            .await
+            .expect("match")
+            .into_iter()
+            .find(|route| route.target == "otel_metrics_rollup_metrics_1m_v2")
+            .expect("route");
         let rewrite = state.create_logical_plan(&hybrid_sql(&route, WIDE_HORIZON)).await.expect("parse rewrite");
         let rewrite = crate::dml::requalified(rewrite, route.matched.schema()).expect("requalify");
         let rebuilt = crate::dml::substitute(&original, &route.matched, rewrite).expect("substitute");

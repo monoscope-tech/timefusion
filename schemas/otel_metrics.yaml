@@ -152,3 +152,24 @@ rollups:
       - { name: value_min, agg: min, column: value }
       - { name: value_max, agg: max, column: value }
       - { name: value_digest, agg: tdigest, column: value }
+  # Per-series tiers for counter rate/increase. Each row keeps what a per-series
+  # LAG over bins needs: the bin's max (a monotonic counter's last value, or its
+  # pre-reset peak), its first value (below the previous bin's max ⇒ the counter
+  # reset), the newest point's time (gap time base) and the sum (DELTA points).
+  # 5m, not 1m: at 30 s export 1m is barely smaller than raw, while 5m serves
+  # every bin_auto width from 24h windows up; narrower bins read raw, which is
+  # cheap at the short windows that ask for them.
+  - grain: 5m
+    name: series_5m_v1
+    dimensions: [metric_name, series_id, aggregation_temporality]
+    measures: &series_measures
+      - { name: value_max, agg: max, column: value }
+      - { name: value_first, agg: first, column: value }
+      - { name: first_at, agg: min, column: timestamp }
+      - { name: last_at, agg: max, column: timestamp }
+      - { name: value_sum, agg: sum, column: value }
+  - grain: 1h
+    name: series_1h_v1
+    derive_from: series_5m_v1
+    dimensions: [metric_name, series_id, aggregation_temporality]
+    measures: *series_measures

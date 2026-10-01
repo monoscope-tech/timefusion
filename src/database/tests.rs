@@ -1261,13 +1261,13 @@ async fn unbuilt_days(label: &str, days_back: std::ops::RangeInclusive<i64>) -> 
     Ok((db, project, days))
 }
 
-/// Build one base `tier` of `otel_logs_and_spans` for one whole day.
-async fn build_base_tier(db: &Database, project: &str, tier: &str, day: chrono::NaiveDate) -> Result<()> {
+/// Build one base `tier` of `source` for one whole day.
+async fn build_base_tier(db: &Database, source: &str, project: &str, tier: &str, day: chrono::NaiveDate) -> Result<()> {
     use crate::maintenance_coordinator::{DAY_MICROS, MAX_DECODED_BYTES, Operation, TaskKey, TimeSlice};
     let start = midnight_micros(day);
     let key = TaskKey {
-        physical_table: format!("otel_logs_and_spans_rollup_{tier}"),
-        source: "otel_logs_and_spans".to_owned(),
+        physical_table: format!("{source}_rollup_{tier}"),
+        source: source.to_owned(),
         project_id: project.to_owned(),
         slice: TimeSlice::new(start, start + DAY_MICROS)?,
         operation: Operation::BaseRollup,
@@ -1290,7 +1290,7 @@ fn days_window(project: &str, days: &[chrono::NaiveDate]) -> String {
 async fn a_partly_covered_window_is_exact_and_counts_a_measure_decline_once() -> Result<()> {
     let (db, project, days) = unbuilt_days("partial", 3..=5).await?;
     for day in &days[1..] {
-        build_base_tier(&db, &project, "dashboard_1m_v4", *day).await?;
+        build_base_tier(&db, "otel_logs_and_spans", &project, "dashboard_1m_v4", *day).await?;
     }
     let mut ctx = Arc::clone(&db).create_session_context();
     db.setup_session_context(&mut ctx)?;
@@ -1318,6 +1318,58 @@ async fn a_partly_covered_window_is_exact_and_counts_a_measure_decline_once() ->
     Ok(())
 }
 
+/// monoscope's KQL `rate(value)` per 30-minute bin: a per-series LAG over bins sandwiched
+/// between two aggregates. The inner one must route to the per-series tier and equal raw.
+/// One cumulative series at 10/s resets at 12:00 (to 300 = the 30 s since its restart),
+/// one DELTA series adds 30 per 30 s point: every bin reads 10 + 1.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_per_series_counter_rate_routes_to_the_series_tier_and_equals_raw() -> Result<()> {
+    let db = Arc::new(Database::with_config(rollup_backfill_config("series_rate", 35)).await?);
+    db.cancel_maintenance();
+    let project = format!("rate_{}", uuid::Uuid::new_v4().simple());
+    let day = (Utc::now() - chrono::Duration::days(2)).date_naive();
+    let at = |h: u32, m: u32| day.and_hms_opt(h, m, 0).expect("valid time").and_utc();
+    let points = (0..480i64)
+        .flat_map(|i| {
+            let ts = at(10, 0).timestamp_micros() + i * 30_000_000;
+            let counter = if i < 240 { 5000 + 300 * i } else { 300 * (i - 239) };
+            [("c", "CUMULATIVE", counter, None), ("d", "DELTA", 30, Some(ts - 30_000_000))].map(|(series, temporality, value, start)| {
+                serde_json::json!({
+                    "project_id": project, "timestamp": ts, "start_timestamp": start, "date": day.to_string(), "ingested_at": ts,
+                    "id": format!("{series}{i}"), "series_id": series, "metric_name": "rows", "metric_unit": "1", "metric_type": "SUM",
+                    "aggregation_temporality": temporality, "value": value as f64, "flags": 0, "dropped_attributes_count": 0, "message_size_bytes": 0,
+                })
+            })
+        })
+        .collect();
+    db.insert_records_batch(&project, "otel_metrics", vec![json_to_batch_for("otel_metrics", points)?], true, None).await?;
+    build_base_tier(&db, "otel_metrics", &project, "series_5m_v1", day).await?;
+    let mut ctx = Arc::clone(&db).create_session_context();
+    db.setup_session_context(&mut ctx)?;
+    let iso = |t: chrono::DateTime<Utc>| t.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let (lookback, lo, hi) = (iso(at(10, 0)), iso(at(10, 30)), iso(at(14, 0)));
+    let sql = format!(
+        "SELECT extract(epoch from time_bucket('30 minutes', timestamp))::integer, 'value', COALESCE(sum(__rate_value), 0)::float FROM \
+         (SELECT *, (CASE WHEN aggregation_temporality = 'DELTA' THEN __sum_value WHEN __prev_value IS NULL THEN NULL WHEN __first_value < __prev_value THEN __max_value ELSE __max_value - __prev_value END) \
+             / GREATEST(1800.0, CAST(extract(epoch from timestamp) AS DOUBLE PRECISION) - CAST(extract(epoch from __prev_ts) AS DOUBLE PRECISION)) AS __rate_value FROM \
+           (SELECT *, __last_ts AS timestamp, LAG(__last_ts) OVER (PARTITION BY series_id ORDER BY __last_ts) AS __prev_ts, LAG(__max_value) OVER (PARTITION BY series_id ORDER BY __last_ts) AS __prev_value FROM \
+             (SELECT time_bucket('30 minutes', timestamp) AS __bin, series_id, aggregation_temporality, max(timestamp) AS __last_ts, max(value) AS __max_value, \
+                     first_value(value ORDER BY timestamp) AS __first_value, sum(value) AS __sum_value \
+              FROM otel_metrics WHERE project_id='{project}' and timestamp BETWEEN '{lookback}' AND '{hi}' and (metric_name = 'rows') \
+              GROUP BY time_bucket('30 minutes', timestamp), series_id, aggregation_temporality) AS __series_bins) AS __series_points) AS otel_metrics \
+         WHERE timestamp BETWEEN '{lo}' AND '{hi}' GROUP BY time_bucket('30 minutes', timestamp) ORDER BY time_bucket('30 minutes', timestamp) DESC"
+    );
+    let stats = crate::observability::maintenance_stats;
+    let hits = || stats().rollup_hits_hybrid.load(std::sync::atomic::Ordering::Relaxed) + stats().rollup_hits_full.load(std::sync::atomic::Ordering::Relaxed);
+    let show = |batches: Vec<RecordBatch>| datafusion::arrow::util::pretty::pretty_format_batches(&batches).expect("format").to_string();
+    let before = hits();
+    let routed = show(ctx.sql(&sql).await?.collect().await?);
+    assert_eq!(hits(), before + 1, "the inner per-series aggregate must route: {routed}");
+    assert_eq!(routed, show(db.query_delta_only(&sql).await?), "routed must equal raw");
+    assert_eq!(routed.matches("| 11.0 ").count(), 7, "every bin, the reset one included, reads 10/s + 1/s: {routed}");
+    Ok(())
+}
+
 /// Prod's `1h_by_1m` probe with the tier built: it serves a hybrid and no miss is
 /// counted. Once the tier declines, the miss must name its own reason, not `not_built`.
 #[tokio::test(flavor = "multi_thread")]
@@ -1331,7 +1383,7 @@ async fn the_last_hour_probe_counts_the_tiers_own_decline() -> Result<()> {
     }
     let day = |micros: i64| chrono::DateTime::from_timestamp_micros(micros).expect("in range").date_naive();
     for date in [day(now - 3_600_000_000), day(now)].into_iter().dedup() {
-        build_base_tier(&db, &project, "dashboard_1m_v4", date).await?;
+        build_base_tier(&db, "otel_logs_and_spans", &project, "dashboard_1m_v4", date).await?;
     }
     let mut ctx = Arc::clone(&db).create_session_context();
     db.setup_session_context(&mut ctx)?;
@@ -9037,7 +9089,7 @@ async fn hybrid_dashboard_raw_leg_admits_to_cache_on_first_view() -> Result<()> 
     }
     let day = |micros: i64| chrono::DateTime::from_timestamp_micros(micros).expect("in range").date_naive();
     for date in [day(now - 3_600_000_000), day(now)].into_iter().dedup() {
-        build_base_tier(&writer, &project, "dashboard_1m_v4", date).await?;
+        build_base_tier(&writer, "otel_logs_and_spans", &project, "dashboard_1m_v4", date).await?;
     }
     let mut cfg = (*base).clone();
     cfg.cache.timefusion_foyer_disabled = false;
