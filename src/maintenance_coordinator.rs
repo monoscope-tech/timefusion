@@ -2727,8 +2727,7 @@ impl TaskJournal {
         self.snapshot
             .tasks
             .iter()
-            .filter(|task| matches!(task.state, TaskState::Pending | TaskState::Running | TaskState::Retry))
-            .filter(|task| task.key.source == source && task.key.physical_table == target)
+            .filter(|task| task.state.is_active() && task.key.source == source && task.key.physical_table == target)
             .filter_map(|task| task.built.clone().map(|built| (task.key.clone(), built)))
             .collect()
     }
@@ -6249,6 +6248,10 @@ mod tests {
         assert!(journal.claim_exact(&at(DAY_MICROS, HOUR), 0, true).is_none(), "the following day is a different fact and stays unproven");
     }
 
+    fn one_row_publication() -> Publication {
+        Publication { source_fingerprint: 0, generation: "g".into(), rows: 1, source_rows: None, source_rows_below: None, evidence: None }
+    }
+
     /// Late rows re-arm a built rollup slice. Over a date before today the rebuild waits out
     /// `SEALED_REBUILD_INTERVAL_MICROS` from the build, still queued; everything else runs.
     #[test_case::test_case(-DAY_MICROS, true, "", 0 => false ; "a built sealed day waits")]
@@ -6266,9 +6269,7 @@ mod tests {
         journal.upsert(unit.clone());
         if built {
             assert!(journal.claim_next(Operation::BaseRollup, built_at, true).is_some());
-            let publication =
-                Publication { source_fingerprint: 0, generation: "g".into(), rows: 1, source_rows: None, source_rows_below: None, evidence: None };
-            assert!(journal.publish_built(&unit.key, publication, vec![], built_at));
+            assert!(journal.publish_built(&unit.key, one_row_publication(), vec![], built_at));
         }
         let (source, project, table, date) = TaskJournal::cell_of(&unit).expect("cell");
         match mark {
@@ -6291,8 +6292,7 @@ mod tests {
         let (_dir, mut journal) = new_journal();
         journal.upsert(whole.clone());
         assert!(journal.claim_next(Operation::BaseRollup, now, true).is_some());
-        let publication = Publication { source_fingerprint: 0, generation: "g".into(), rows: 1, source_rows: None, source_rows_below: None, evidence: None };
-        assert!(journal.publish_built(&whole.key, publication, vec![], now));
+        assert!(journal.publish_built(&whole.key, one_row_publication(), vec![], now));
         for hour in [3, 15] {
             journal.upsert(task("p", day + hour * DERIVED_SLICE_MICROS, day + hour * DERIVED_SLICE_MICROS + NORMAL_SLICE_MICROS, Operation::BaseRollup));
         }
@@ -6309,8 +6309,7 @@ mod tests {
         let unit = task("p", 0, DERIVED_SLICE_MICROS, Operation::DerivedRollup);
         let (dir, mut journal) = new_journal();
         journal.upsert(unit.clone());
-        let publication = Publication { source_fingerprint: 0, generation: "g".into(), rows: 1, source_rows: None, source_rows_below: None, evidence: None };
-        assert!(journal.publish_built(&unit.key, publication, vec!["a.parquet".into()], 0));
+        assert!(journal.publish_built(&unit.key, one_row_publication(), vec!["a.parquet".into()], 0));
         let proofs = |journal: &TaskJournal| journal.requeued_built("source", "table").len();
         journal.enqueue(unit.key.clone(), 1, 1, 0);
         journal.upsert(MaintenanceTask::pending(unit.key.clone(), 1, 1, 0));
