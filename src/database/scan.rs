@@ -609,6 +609,33 @@ impl ProjectRoutingTable {
         Ok((skip_dedup, plans, certified_plans))
     }
 
+    /// Parquet's row-group bloom check reads `col = lit` / `col IN (..)` only on a bare
+    /// column, but the Delta leg binds Utf8 files under the Utf8View table schema, so the
+    /// column arrives wrapped in a cast. DataFusion's physical simplifier unwraps that cast
+    /// for comparisons, not for in-lists, so an IN list (DataFusion keeps >3 items as one)
+    /// never bloom-pruned. The equivalent OR chain does. Only bloom columns, and bounded,
+    /// to keep the pushed row filter cheap; the scan's own FilterExec keeps the hash-set IN.
+    fn in_list_as_equalities(&self, filter: &Expr) -> Expr {
+        use datafusion::common::tree_node::{Transformed, TreeNode};
+        const MAX_LOWERED_IN_LIST: usize = 32;
+        filter
+            .clone()
+            .transform(|e| match e {
+                Expr::InList(datafusion::logical_expr::expr::InList { expr, list, negated: false })
+                    if matches!(&*expr, Expr::Column(c) if crate::schema::get_schema(&self.table_name)
+                        .is_some_and(|s| s.fields.iter().any(|f| f.bloom_filter && f.name == c.name)))
+                        && (1..=MAX_LOWERED_IN_LIST).contains(&list.len())
+                        && list.iter().all(|l| matches!(l, Expr::Literal(..))) =>
+                {
+                    Ok(Transformed::yes(
+                        datafusion::logical_expr::utils::disjunction(list.into_iter().map(|l| (*expr).clone().eq(l))).expect("non-empty IN list"),
+                    ))
+                }
+                e => Ok(Transformed::no(e)),
+            })
+            .map_or_else(|_| filter.clone(), |t| t.data)
+    }
+
     /// Shared tail of the Delta scan: projection-index translation into the
     /// provider's schema, the provider scan itself, and type coercion.
     async fn scan_via_provider(
@@ -630,7 +657,8 @@ impl ProjectRoutingTable {
         });
 
         let started = std::time::Instant::now();
-        let delta_plan = provider.scan(state, translated_projection.as_ref(), filters, limit).await;
+        let pushed: Vec<Expr> = filters.iter().map(|f| self.in_list_as_equalities(f)).collect();
+        let delta_plan = provider.scan(state, translated_projection.as_ref(), &pushed, limit).await;
         metrics::counter!(scan_metric_names::PROVIDER_SCAN_TOTAL).increment(1);
         metrics::counter!(scan_metric_names::PROVIDER_SCAN_US_TOTAL).increment(started.elapsed().as_micros() as u64);
         // Must run before anything reads the leg's ordering.

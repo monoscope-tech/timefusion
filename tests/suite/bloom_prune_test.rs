@@ -57,6 +57,24 @@ async fn count_by_trace_id(db: &Arc<Database>, project_id: &str, trace_id: &str,
     Ok(res[0].column(0).as_primitive::<Int64Type>().value(0))
 }
 
+/// A pgwire client on `db`, so a test sees what monoscope's bound statements plan to.
+async fn pg_client(db: &Arc<Database>) -> Result<tokio_postgres::Client> {
+    let port = std::net::TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
+    let mut ctx = Arc::clone(db).create_session_context();
+    db.setup_session_context(&mut ctx)?;
+    let opts = datafusion_postgres::ServerOptions::new().with_port(port).with_host("127.0.0.1".into());
+    let auth = timefusion::server::AuthConfig { username: "postgres".into(), password: Some("postgres".into()) };
+    tokio::spawn(async move { timefusion::server::serve_with_logging(Arc::new(ctx), &opts, auth, None, None, std::future::pending::<()>()).await.ok() });
+    loop {
+        if let Ok((client, conn)) = tokio_postgres::connect(&format!("host=127.0.0.1 port={port} user=postgres password=postgres"), tokio_postgres::NoTls).await
+        {
+            tokio::spawn(conn);
+            return Ok(client);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 #[tokio::test]
 async fn bloom_sidecar_build_has_no_false_negatives() -> Result<()> {
     let (db, project_id) = setup("bloom_no_fn").await?;
@@ -187,20 +205,7 @@ async fn pgwire_bound_any_array_prunes_like_in_list() -> Result<()> {
     }
     db.bloom_sidecar_reconcile().await?;
 
-    let port = std::net::TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
-    let mut ctx = Arc::clone(&db).create_session_context();
-    db.setup_session_context(&mut ctx)?;
-    let opts = datafusion_postgres::ServerOptions::new().with_port(port).with_host("127.0.0.1".into());
-    let auth = timefusion::server::AuthConfig { username: "postgres".into(), password: Some("postgres".into()) };
-    tokio::spawn(async move { timefusion::server::serve_with_logging(Arc::new(ctx), &opts, auth, None, None, std::future::pending::<()>()).await.ok() });
-    let client = loop {
-        if let Ok((client, conn)) = tokio_postgres::connect(&format!("host=127.0.0.1 port={port} user=postgres password=postgres"), tokio_postgres::NoTls).await
-        {
-            tokio::spawn(conn);
-            break client;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    };
+    let client = pg_client(&db).await?;
     let (lo, hi) = (ts - 3_600_000_000, ts + 3_600_000_000);
     let sql = format!(
         "SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = '{project_id}' AND context___trace_id = ANY($1) \
@@ -332,5 +337,49 @@ async fn enrich_only_session_lookup_prunes_and_resolves_winners() -> Result<()> 
     exec(format!("DELETE FROM otel_logs_and_spans WHERE project_id = '{pid}' AND id = 's1'")).await?;
     db.bloom_sidecar_reconcile().await?;
     assert_eq!(pruned(ids).await?.0, ["s2:sess-B", "s3:sess-C"], "deleted row must not resurrect");
+    Ok(())
+}
+
+/// Parquet's row-group bloom check reads only a bare column, and the Delta leg casts the
+/// Utf8 file column to the table's Utf8View. DataFusion unwraps that cast for `=` and for
+/// IN lists of <=3 (lowered to `=`), not for longer IN lists, so monoscope's 5-id
+/// `session_id = ANY($1)` lookup decoded every row group of every file it opened.
+#[tokio::test(flavor = "multi_thread")]
+async fn parquet_row_group_bloom_prunes_absent_ids_in_long_in_lists() -> Result<()> {
+    let (db, pid) = setup("pq_bloom_in_list").await?;
+    let ts = ts();
+    let rows = (0..50)
+        .map(|i| {
+            let mut r = row(&format!("id-{i}"), &pid, ts, &format!("trace-{i}"));
+            r["attributes___session___id"] = json!(format!("sess-{i}"));
+            r
+        })
+        .collect();
+    insert(&db, &pid, rows).await?;
+    let client = pg_client(&db).await?;
+    let (lo, hi) = (ts - 3_600_000_000, ts + 3_600_000_000);
+    let explain = |pred: &str| {
+        format!(
+            "EXPLAIN ANALYZE SELECT id FROM otel_logs_and_spans WHERE project_id = '{pid}' AND {pred} \
+             AND timestamp >= to_timestamp_micros({lo}) AND timestamp <= to_timestamp_micros({hi})"
+        )
+    };
+    let re = regex::Regex::new(r"row_groups_pruned_bloom_filter=(\d+) total \u{2192} (\d+) matched")?;
+    let assert_pruned = |pred: &str, rows: Vec<tokio_postgres::Row>| {
+        let plan = rows.iter().map(|r| r.get::<_, String>(1)).collect::<Vec<_>>().join("\n");
+        let pruned: u64 = re.captures_iter(&plan).map(|c| c[1].parse::<u64>().unwrap() - c[2].parse::<u64>().unwrap()).sum();
+        assert!(pruned > 0, "`{pred}` must bloom-prune its row group:\n{plan}");
+    };
+    // Absent but inside each column's min/max, so only the bloom filter can skip them.
+    let bound = "attributes___session___id = ANY($1)";
+    let stmt = client.prepare_typed(&explain(bound), &[tokio_postgres::types::Type::TEXT_ARRAY]).await?;
+    assert_pruned(bound, client.query(&stmt, &[&vec!["sess-1x", "sess-2x", "sess-3x", "sess-4x", "sess-5x"]]).await?);
+    for pred in [
+        "attributes___session___id IN ('sess-1x', 'sess-2x', 'sess-3x', 'sess-4x', 'sess-5x')",
+        "attributes___session___id IN ('sess-1x', 'sess-2x')",
+        "id = 'id-1x'",
+    ] {
+        assert_pruned(pred, client.query(&explain(pred), &[]).await?);
+    }
     Ok(())
 }
