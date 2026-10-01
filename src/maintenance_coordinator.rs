@@ -1154,8 +1154,7 @@ impl TaskJournal {
         }
         let policies = self.snapshot.rollup_policies.len();
         self.snapshot.rollup_policies.retain(|table, _| declared.contains(table));
-        let policies = policies - self.snapshot.rollup_policies.len();
-        policies
+        policies - self.snapshot.rollup_policies.len()
             + self.retain_tasks(|task| {
                 !(task.key.physical_table.contains("_rollup_") && task.state != TaskState::Complete && !declared.contains(&task.key.physical_table))
             })
