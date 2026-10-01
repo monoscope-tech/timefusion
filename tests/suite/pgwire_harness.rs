@@ -21,14 +21,19 @@ impl TestServer {
         timefusion::support::init_test_logging();
 
         let test_id = Uuid::new_v4().to_string();
-        // Kernel-assigned port: tests run as concurrent processes, so any fixed range collides.
-        let port = std::net::TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
-
         let db = Arc::new(Database::with_config(minio_test_config(&test_id, &format!("/tmp/timefusion-{test_id}"))).await?);
         db.get_or_create_table("test_project", "otel_logs_and_spans").await?;
+        let mut server = Self::serve(db).await?;
+        server.test_id = test_id;
+        Ok(server)
+    }
 
+    /// Serve an existing `db`, so a test sees what bound statements plan to.
+    pub async fn serve(db: Arc<Database>) -> Result<Self> {
+        // Kernel-assigned port: tests run as concurrent processes, so any fixed range collides.
+        let port = std::net::TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
         let shutdown = Arc::new(Notify::new());
-        let (db, sd) = (db.clone(), shutdown.clone());
+        let sd = shutdown.clone();
         tokio::spawn(async move {
             let mut ctx = db.clone().create_session_context();
             db.setup_session_context(&mut ctx).expect("Failed to setup context");
@@ -47,7 +52,7 @@ impl TestServer {
         });
 
         Self::connect(port).await?;
-        Ok(Self { port, test_id, shutdown })
+        Ok(Self { port, test_id: String::new(), shutdown })
     }
 
     async fn connect(port: u16) -> Result<Client> {

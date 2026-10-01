@@ -57,24 +57,6 @@ async fn count_by_trace_id(db: &Arc<Database>, project_id: &str, trace_id: &str,
     Ok(res[0].column(0).as_primitive::<Int64Type>().value(0))
 }
 
-/// A pgwire client on `db`, so a test sees what monoscope's bound statements plan to.
-async fn pg_client(db: &Arc<Database>) -> Result<tokio_postgres::Client> {
-    let port = std::net::TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
-    let mut ctx = Arc::clone(db).create_session_context();
-    db.setup_session_context(&mut ctx)?;
-    let opts = datafusion_postgres::ServerOptions::new().with_port(port).with_host("127.0.0.1".into());
-    let auth = timefusion::server::AuthConfig { username: "postgres".into(), password: Some("postgres".into()) };
-    tokio::spawn(async move { timefusion::server::serve_with_logging(Arc::new(ctx), &opts, auth, None, None, std::future::pending::<()>()).await.ok() });
-    loop {
-        if let Ok((client, conn)) = tokio_postgres::connect(&format!("host=127.0.0.1 port={port} user=postgres password=postgres"), tokio_postgres::NoTls).await
-        {
-            tokio::spawn(conn);
-            return Ok(client);
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-}
-
 #[tokio::test]
 async fn bloom_sidecar_build_has_no_false_negatives() -> Result<()> {
     let (db, project_id) = setup("bloom_no_fn").await?;
@@ -208,7 +190,8 @@ async fn pgwire_bound_any_array_prunes_like_in_list() -> Result<()> {
     }
     db.bloom_sidecar_reconcile().await?;
 
-    let client = pg_client(&db).await?;
+    let server = crate::pgwire_harness::TestServer::serve(Arc::clone(&db)).await?;
+    let client = server.client().await?;
     let (lo, hi) = (ts - 3_600_000_000, ts + 3_600_000_000);
     let sql = format!(
         "SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = '{project_id}' AND context___trace_id = ANY($1) \
@@ -359,7 +342,8 @@ async fn parquet_row_group_bloom_prunes_absent_ids_in_long_in_lists() -> Result<
         })
         .collect();
     insert(&db, &pid, rows).await?;
-    let client = pg_client(&db).await?;
+    let server = crate::pgwire_harness::TestServer::serve(Arc::clone(&db)).await?;
+    let client = server.client().await?;
     let (lo, hi) = (ts - 3_600_000_000, ts + 3_600_000_000);
     let explain = |pred: &str| {
         format!(
