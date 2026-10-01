@@ -377,12 +377,11 @@ pub async fn build_file_blooms(store: Arc<dyn ObjectStore>, rel: &str, file_size
 fn fit_columns(mut columns: Vec<(String, Vec<Vec<u8>>)>, cap: u64) -> Vec<(String, Vec<Vec<u8>>)> {
     let size = |(_, blooms): &(String, Vec<Vec<u8>>)| blooms.iter().map(|b| b.len() as u64).sum::<u64>();
     columns.sort_by_cached_key(size);
-    let mut total = 0;
     columns
         .into_iter()
-        .take_while(|c| {
-            total += size(c);
-            total <= cap
+        .scan(0, |total, c| {
+            *total += size(&c);
+            (*total <= cap).then_some(c)
         })
         .collect()
 }
