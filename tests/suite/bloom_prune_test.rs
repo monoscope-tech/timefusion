@@ -155,9 +155,11 @@ async fn split_path_bloom_prunes_indexed_and_raw_legs() -> Result<()> {
     let db = Database::with_config(Arc::clone(&cfg)).await?;
     let storage_uri = format!("s3://{}/{}/tantivy", cfg.aws.aws_s3_bucket.clone().unwrap(), cfg.core.timefusion_table_prefix);
     let tstore = db.create_object_store(&storage_uri, &cfg.aws.build_storage_options(None)).await?;
-    let tcfg = Arc::new(cfg.tantivy.clone());
+    // A cold index cache skips the prefilter, so seed the reader on publish as prod does.
+    let tcfg = Arc::new(timefusion::config::TantivyConfig { timefusion_tantivy_seed_cache_on_publish: true, ..cfg.tantivy.clone() });
     let svc = Arc::new(TantivyIndexService::new(tstore.clone(), tcfg.clone(), std::env::temp_dir().join(format!("tf-scratch-{}", uuid::Uuid::new_v4()))));
     let search = Arc::new(TantivySearchService::new(tstore, cfg.core.timefusion_data_dir.clone(), tcfg));
+    svc.with_reader(&search);
     let db = Arc::new(db.with_tantivy_search(search.clone()).with_tantivy_indexer(svc.clone()).with_bloom_prune(reg));
     let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
     let ts = ts();
@@ -184,6 +186,7 @@ async fn split_path_bloom_prunes_indexed_and_raw_legs() -> Result<()> {
 
     // Proves the split branch ran rather than the no-coverage fallback.
     assert!(search.stats.queries.load(Relaxed) > 0, "equality routing must have engaged the tantivy prefilter");
+    assert_eq!(search.stats.cold_warms_spawned.load(Relaxed), 0, "every query must find the published index already local");
 
     // Needle in neither file: the split path's empty-include arm.
     let before = stats.files_rejected.load(Relaxed);
