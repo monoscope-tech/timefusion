@@ -1375,7 +1375,7 @@ async fn a_per_series_counter_rate_routes_to_the_series_tier_and_equals_raw(by: 
     let join = join
         .replace("{project}", &project)
         .replace("{day_before}", &midnight(day.pred_opt().expect("a day before")))
-        .replace("{day_after}", &midnight(day.succ_opt().expect("a day after")));
+        .replace("{day_after}", &iso(day.succ_opt().expect("a day after").and_hms_opt(12, 0, 0).expect("noon").and_utc()));
     let sql = format!(
         "SELECT extract(epoch from time_bucket('30 minutes', timestamp))::integer, {by}, COALESCE(sum(__rate_value), 0)::float FROM \
          (SELECT *, (CASE WHEN aggregation_temporality = 'DELTA' THEN __sum_value WHEN __prev_value IS NULL THEN NULL WHEN __first_value < __prev_value THEN __max_value ELSE __max_value - __prev_value END) \

@@ -407,8 +407,12 @@ pub(crate) fn restore_variant_scan_types(plan: LogicalPlan) -> Result<Transforme
             // Once a scan below is Variant-typed this node's exprs may face
             // `Struct op Utf8`; coerce, then recompute so the type propagates.
             if changed {
-                let coerced = coerce_variant_value_positions(patched.data)?;
-                Ok(Transformed::yes(coerced.recompute_schema()?))
+                Ok(Transformed::yes(match coerce_variant_value_positions(patched.data)? {
+                    // `recompute_schema` keeps a Union's cached schema while its width is
+                    // unchanged, so a rollup hybrid's raw leg would stay Utf8View.
+                    LogicalPlan::Union(union) => LogicalPlan::Union(datafusion::logical_expr::Union::try_new_with_loose_types(union.inputs)?),
+                    coerced => coerced.recompute_schema()?,
+                }))
             } else {
                 Ok(patched)
             }
