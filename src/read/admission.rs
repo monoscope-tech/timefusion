@@ -184,16 +184,13 @@ impl fmt::Debug for AdmissionExec {
 impl DisplayAs for AdmissionExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match t {
-            DisplayFormatType::Default | DisplayFormatType::Verbose => match self.class {
-                HeavyClass::OrderedMorMerge { fan_in, buffered_bytes } => write!(
-                    f,
-                    "AdmissionExec: class={}, fan_in={fan_in}, buffered_mb={}, available={}",
-                    self.class.label(),
-                    buffered_bytes >> 20,
-                    heavy_sem().available_permits()
-                ),
-                HeavyClass::SpillingSort => write!(f, "AdmissionExec: class={}, available={}", self.class.label(), heavy_sem().available_permits()),
-            },
+            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+                write!(f, "AdmissionExec: class={}", self.class.label())?;
+                if let HeavyClass::OrderedMorMerge { fan_in, buffered_bytes } = self.class {
+                    write!(f, ", fan_in={fan_in}, buffered_mb={}", buffered_bytes >> 20)?;
+                }
+                write!(f, ", available={}", heavy_sem().available_permits())
+            }
             _ => write!(f, "AdmissionExec"),
         }
     }
