@@ -168,3 +168,14 @@ rollups:
       - { name: first_at, agg: min, column: timestamp }
       - { name: last_at, agg: max, column: timestamp }
       - { name: value_sum, agg: sum, column: value }
+  # Each series' attributes, for a rate charted by attribute: series_id hashes the
+  # attributes, so the chart aggregates the tier above by series and joins this
+  # after. Daily, so one row per series and day; carrying them on the 5m cells
+  # instead would copy them into every cell. `resource` is left out: it is 2.5x
+  # the bytes to decode per build, and charts group by its promoted columns.
+  - grain: 1d
+    name: series_attrs_1d_v1
+    dimensions: [metric_name, series_id]
+    measures:
+      - { name: attributes_first, agg: first, column: attributes }
+      - { name: first_at, agg: min, column: timestamp }

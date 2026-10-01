@@ -110,18 +110,31 @@ impl Database {
             .or_else(|| (!route.measures_available(coverage.measures.as_ref())).then_some(crate::rollup::MissReason::MeasureNotStored))
     }
 
+    /// One rewrite per independent aggregate a tier serves; the others stay raw.
     pub(crate) async fn rollup_sql(
         &self, logical_plan: &datafusion::logical_expr::LogicalPlan, session: &datafusion::execution::context::SessionState,
-    ) -> std::result::Result<Option<RollupRewrite>, crate::rollup::MissReason> {
+    ) -> std::result::Result<Vec<RollupRewrite>, crate::rollup::MissReason> {
         // Checked before the matcher: `match_aggregates` plans one statement per filtered
         // measure, and with the feature off that cost must not be paid.
         if self.bypass_rollup {
-            return Ok(None);
+            return Ok(Vec::new());
         }
-        let routes = crate::rollup::match_aggregates(logical_plan, session).await?;
-        if routes.is_empty() {
-            return Ok(None);
-        }
+        let branches: Vec<Vec<_>> = crate::rollup::match_aggregates(logical_plan, session)
+            .await?
+            .into_iter()
+            .chunk_by(|route| route.matched.clone())
+            .into_iter()
+            .map(|(_, routes)| routes.collect())
+            .collect();
+        crate::rollup::any_branch(
+            futures::future::join_all(branches.into_iter().map(|routes| async { self.best_rewrite(routes, session).await.map(Vec::from_iter) })).await,
+        )
+    }
+
+    /// The best of one aggregate's candidate tiers.
+    async fn best_rewrite(
+        &self, routes: Vec<crate::rollup::RoutedRollup>, session: &datafusion::execution::context::SessionState,
+    ) -> std::result::Result<Option<RollupRewrite>, crate::rollup::MissReason> {
         // A cross-project route reads every project at once, so a per-project allowlist cannot
         // be honoured: enabled only when the rollout is on for everyone.
         let enabled = match routes[0].project_id.as_deref() {

@@ -1050,7 +1050,7 @@ async fn rollup_routing_rejects_legacy_materialization_generations() -> Result<(
         "SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id='{project}' AND timestamp >= to_timestamp_micros({lo}) AND timestamp < to_timestamp_micros({hi})"
     );
     let plan = state.optimize(&state.create_logical_plan(&sql).await?)?;
-    assert!(matches!(db.rollup_sql(&plan, &state).await, Ok(Some(_))), "fresh materializations must route");
+    assert!(db.rollup_sql(&plan, &state).await.is_ok_and(|rewrites| !rewrites.is_empty()), "fresh materializations must route");
     let schema = get_schema("otel_logs_and_spans").unwrap();
     let target = schema.rollups.iter().find(|spec| spec.derive_from.is_none()).unwrap().table_name("otel_logs_and_spans");
     // Settle the write path's narrower tasks through the real coverage check,
@@ -1101,7 +1101,7 @@ async fn rollup_routing_rejects_legacy_materialization_generations() -> Result<(
     assert!(
         matches!(outcome, Err(crate::rollup::MissReason::StaleCoverage | crate::rollup::MissReason::NotBuilt)),
         "matching source rows cannot validate a pre-fix materialization: {:?}",
-        outcome.as_ref().map(|route| route.as_ref().map(|r| r.sql.as_str())).map_err(|reason| reason.label())
+        outcome.as_ref().map(|routes| routes.iter().map(|r| r.sql.as_str()).collect::<Vec<_>>()).map_err(|reason| reason.label())
     );
     let (key, mut publication) = db.journal().published_rollups("otel_logs_and_spans", &target).into_iter().find(|(key, _)| key.project_id == project).unwrap();
     let derived = db.run_unit_once("otel_logs_and_spans", &project, day, crate::maintenance_coordinator::Operation::DerivedRollup, 24, 0, None).await?;
@@ -1136,12 +1136,13 @@ async fn rollup_routing_rejects_legacy_materialization_generations() -> Result<(
         "obsolete completed materializations must be rebuilt; key={key:?}, tasks={task_states:?}, coverage={:?}",
         db.rollup_slice_coverage.iter().map(|entry| (entry.key().clone(), entry.value().clone())).collect::<Vec<_>>()
     );
-    assert!(!matches!(db.rollup_sql(&plan, &state).await, Ok(Some(_))), "recovery must not restore an obsolete publication");
+    assert!(!db.rollup_sql(&plan, &state).await.is_ok_and(|rewrites| !rewrites.is_empty()), "recovery must not restore an obsolete publication");
     let rebuilt = db.run_unit_once("otel_logs_and_spans", &project, day, Operation::BaseRollup, 24, 0, None).await?;
     assert_eq!(rebuilt.state, Some(TaskState::Complete));
     let live = live_paths(&db, &project, &target).await;
     assert!(obsolete_paths.iter().all(|path| !live.contains(path)), "the rebuild retires the obsolete files");
-    let rewrite = db.rollup_sql(&plan, &state).await.map_err(|reason| anyhow::anyhow!("{}", reason.label()))?.expect("rebuilt coverage must route");
+    let rewrite =
+        db.rollup_sql(&plan, &state).await.map_err(|reason| anyhow::anyhow!("{}", reason.label()))?.into_iter().next().expect("rebuilt coverage must route");
     let batches = ctx.sql(&rewrite.sql).await?.collect().await?;
     assert_eq!(first_i64(batches[0].column(0)), Some(4), "rebuilt rollup agrees with the four source rows");
 
@@ -1319,11 +1320,16 @@ async fn a_partly_covered_window_is_exact_and_counts_a_measure_decline_once() ->
 }
 
 /// monoscope's KQL `rate(value)` per 30-minute bin: a per-series LAG over 5-minute cells sandwiched
-/// between two aggregates. The inner one must route to the per-series tier and equal raw.
-/// One cumulative series at 10/s resets at 12:00 (to 300 = the 30 s since its restart),
-/// one DELTA series adds 30 per 30 s point: every bin reads 10 + 1.
+/// between two aggregates. The inner one must route to the per-series tier and equal raw; charted
+/// `by attributes.t`, the cells join each series' attributes, and that lookup routes too.
+/// One cumulative series (t=a) at 10/s resets at 12:00 (to 300 = the 30 s since its restart),
+/// one DELTA series (t=b) adds 30 per 30 s point: every bin reads 10 + 1.
+#[test_case("'value'", "", 1, &[("value", "11.0")]; "summed across series")]
+#[test_case("variant_to_json(attributes)->>'t'", " JOIN (SELECT series_id, first_value(attributes ORDER BY timestamp) AS attributes FROM otel_metrics \
+     WHERE project_id='{project}' and timestamp >= '{day_before}' and timestamp < '{day_after}' and (metric_name = 'rows') GROUP BY series_id) AS __series_attrs USING (series_id)",
+    2, &[("a", "10.0"), ("b", "1.0")]; "by attribute")]
 #[tokio::test(flavor = "multi_thread")]
-async fn a_per_series_counter_rate_routes_to_the_series_tier_and_equals_raw() -> Result<()> {
+async fn a_per_series_counter_rate_routes_to_the_series_tier_and_equals_raw(by: &str, join: &str, routes: u64, bins: &[(&str, &str)]) -> Result<()> {
     let db = Arc::new(Database::with_config(rollup_backfill_config("series_rate", 35)).await?);
     db.cancel_maintenance();
     let project = format!("rate_{}", uuid::Uuid::new_v4().simple());
@@ -1342,14 +1348,36 @@ async fn a_per_series_counter_rate_routes_to_the_series_tier_and_equals_raw() ->
             })
         })
         .collect();
-    db.insert_records_batch(&project, "otel_metrics", vec![json_to_batch_for("otel_metrics", points)?], true, None).await?;
+    // Series c carries {"t":"a"}, d {"t":"b"}: rows alternate c, d.
+    let batch = json_to_batch_for("otel_metrics", points)?;
+    let column = batch.schema().index_of("attributes")?;
+    let variants = SessionContext::new();
+    variants.register_udf((*crate::read::functions::json_to_variant_udf()).clone());
+    let variants =
+        variants.sql(r#"SELECT json_to_variant(column1) FROM (VALUES ('{"t":"a"}'), ('{"t":"b"}'))"#).await?.collect().await?.remove(0).column(0).clone();
+    let variants = datafusion::arrow::compute::cast(&variants, batch.schema().field(column).data_type())?;
+    let attributes = datafusion::arrow::compute::take(
+        &variants,
+        &datafusion::arrow::array::UInt32Array::from_iter_values((0..batch.num_rows() as u32).map(|row| row % 2)),
+        None,
+    )?;
+    let columns = batch.columns().iter().enumerate().map(|(i, array)| if i == column { Arc::clone(&attributes) } else { Arc::clone(array) }).collect();
+    db.insert_records_batch(&project, "otel_metrics", vec![RecordBatch::try_new(batch.schema(), columns)?], true, None).await?;
     build_base_tier(&db, "otel_metrics", &project, "series_5m_v1", day).await?;
+    for date in [day.pred_opt().expect("a day before"), day] {
+        build_base_tier(&db, "otel_metrics", &project, "series_attrs_1d_v1", date).await?;
+    }
     let mut ctx = Arc::clone(&db).create_session_context();
     db.setup_session_context(&mut ctx)?;
     let iso = |t: chrono::DateTime<Utc>| t.format("%Y-%m-%dT%H:%M:%SZ").to_string();
     let (lookback, lo, hi) = (iso(at(10, 0)), iso(at(10, 30)), iso(at(14, 0)));
+    let midnight = |date: chrono::NaiveDate| iso(date.and_hms_opt(0, 0, 0).expect("midnight").and_utc());
+    let join = join
+        .replace("{project}", &project)
+        .replace("{day_before}", &midnight(day.pred_opt().expect("a day before")))
+        .replace("{day_after}", &midnight(day.succ_opt().expect("a day after")));
     let sql = format!(
-        "SELECT extract(epoch from time_bucket('30 minutes', timestamp))::integer, 'value', COALESCE(sum(__rate_value), 0)::float FROM \
+        "SELECT extract(epoch from time_bucket('30 minutes', timestamp))::integer, {by}, COALESCE(sum(__rate_value), 0)::float FROM \
          (SELECT *, (CASE WHEN aggregation_temporality = 'DELTA' THEN __sum_value WHEN __prev_value IS NULL THEN NULL WHEN __first_value < __prev_value THEN __max_value ELSE __max_value - __prev_value END) \
              / GREATEST(1800.0, SUM(CAST(extract(epoch from timestamp) AS DOUBLE PRECISION) - CAST(extract(epoch from __prev_ts) AS DOUBLE PRECISION)) \
                OVER (PARTITION BY series_id, time_bucket('30 minutes', timestamp))) AS __rate_value FROM \
@@ -1357,17 +1385,20 @@ async fn a_per_series_counter_rate_routes_to_the_series_tier_and_equals_raw() ->
              (SELECT series_id, aggregation_temporality, max(timestamp) AS __last_ts, max(value) AS __max_value, \
                      first_value(value ORDER BY timestamp) AS __first_value, sum(value) AS __sum_value \
               FROM otel_metrics WHERE project_id='{project}' and timestamp BETWEEN '{lookback}' AND '{hi}' and (metric_name = 'rows') \
-              GROUP BY time_bucket('5 minutes', timestamp), series_id, aggregation_temporality) AS __series_cells) AS __series_points) AS otel_metrics \
-         WHERE timestamp BETWEEN '{lo}' AND '{hi}' GROUP BY time_bucket('30 minutes', timestamp) ORDER BY time_bucket('30 minutes', timestamp) DESC"
+              GROUP BY time_bucket('5 minutes', timestamp), series_id, aggregation_temporality) AS __series_cells{join}) AS __series_points) AS otel_metrics \
+         WHERE timestamp BETWEEN '{lo}' AND '{hi}' GROUP BY time_bucket('30 minutes', timestamp), {by} ORDER BY time_bucket('30 minutes', timestamp) DESC, 2"
     );
     let stats = crate::observability::maintenance_stats;
     let hits = || stats().rollup_hits_hybrid.load(std::sync::atomic::Ordering::Relaxed) + stats().rollup_hits_full.load(std::sync::atomic::Ordering::Relaxed);
     let show = |batches: Vec<RecordBatch>| datafusion::arrow::util::pretty::pretty_format_batches(&batches).expect("format").to_string();
     let before = hits();
     let routed = show(ctx.sql(&sql).await?.collect().await?);
-    assert_eq!(hits(), before + 1, "the inner per-series aggregate must route: {routed}");
+    assert_eq!(hits(), before + routes, "every per-series aggregate must route: {routed}");
     assert_eq!(routed, show(db.query_delta_only(&sql).await?), "routed must equal raw");
-    assert_eq!(routed.matches("| 11.0 ").count(), 7, "every bin, the reset one included, reads 10/s + 1/s: {routed}");
+    for (series, rate) in bins {
+        let reads = routed.lines().filter(|line| line.split('|').map(str::trim).skip(2).take(2).eq([*series, *rate])).count();
+        assert_eq!(reads, 7, "every bin, the reset one included, reads 10/s + 1/s: {routed}");
+    }
     Ok(())
 }
 
@@ -1587,7 +1618,7 @@ async fn a_date_that_cannot_prove_its_digest_falls_to_the_raw_fringe() -> Result
     let state = ctx.state();
     let route = async |db: &Database, sql: String| {
         let plan = state.optimize(&state.create_logical_plan(&sql).await.expect("parse")).expect("optimize");
-        db.rollup_sql(&plan, &state).await.map_err(|reason| anyhow::anyhow!("declined: {}", reason.label()))
+        db.rollup_sql(&plan, &state).await.map(|rewrites| rewrites.into_iter().next()).map_err(|reason| anyhow::anyhow!("declined: {}", reason.label()))
     };
 
     // The control: without it the refusal assertion below also passes when nothing routes.
@@ -1678,7 +1709,13 @@ async fn the_census_remints_a_cell_published_before_a_measure_was_declared() -> 
         !published.is_empty() && published.iter().all(|held| held.as_ref().is_some_and(|names| names.contains(MEASURE))),
         "the rebuild must materialize the measure rather than complete as a no-op: {published:?}"
     );
-    let routed = db.rollup_sql(&plan, &state).await.map_err(|reason| anyhow::anyhow!("declined: {}", reason.label()))?.expect("the re-minted cell routes");
+    let routed = db
+        .rollup_sql(&plan, &state)
+        .await
+        .map_err(|reason| anyhow::anyhow!("declined: {}", reason.label()))?
+        .into_iter()
+        .next()
+        .expect("the re-minted cell routes");
     assert!(routed_days(&routed.ticket).contains(&day.to_string()), "the re-minted day must be read from the tier");
     Ok(())
 }
@@ -1727,7 +1764,11 @@ async fn a_derived_cell_over_base_cells_predating_a_count_measure_publishes_with
     let mut ctx = Arc::clone(&db).create_session_context();
     db.setup_session_context(&mut ctx)?;
     let state = ctx.state();
-    let route = async |sql: &str| db.rollup_sql(&state.optimize(&state.create_logical_plan(sql).await.expect("parse")).expect("optimize"), &state).await;
+    let route = async |sql: &str| {
+        db.rollup_sql(&state.optimize(&state.create_logical_plan(sql).await.expect("parse")).expect("optimize"), &state)
+            .await
+            .map(|rewrites| rewrites.into_iter().next())
+    };
     let count = async |sql: &str| anyhow::Ok(first_i64(ctx.sql(sql).await?.collect().await?[0].column(0)));
 
     let rum = sql(" AND (name LIKE 'Pageview %' OR name = 'documentLoad')");
@@ -2092,7 +2133,7 @@ async fn an_overlapping_chain_leaves_its_disjoint_slices_proven() -> Result<()> 
         let state = ctx.state();
         let plan = state.optimize(&state.create_logical_plan(&sql).await?)?;
         let rewrite = db.rollup_sql(&plan, &state).await.map_err(|reason| anyhow::anyhow!("[{lo},{hi}) declined: {}", reason.label()))?;
-        assert_eq!(rewrite.map(|rewrite| rewrite.mode), Some(mode), "[{lo},{hi}) must route from the disjoint slices");
+        assert_eq!(rewrite.into_iter().map(|rewrite| rewrite.mode).collect::<Vec<_>>(), [mode], "[{lo},{hi}) must route from the disjoint slices");
         // Not a guard for the drop itself: it stays green with overlaps KEPT, since tier reads
         // collapse a bucket's states on `(timestamp, id)` and `id` ignores the slice.
         let render = |batches: &[RecordBatch]| arrow::util::pretty::pretty_format_batches(batches).map(|table| table.to_string());
@@ -2141,7 +2182,7 @@ async fn a_count_of_a_nullable_expression_is_not_served_as_the_row_count() -> Re
         );
         let state = ctx.state();
         let plan = state.optimize(&state.create_logical_plan(&sql).await?)?;
-        let routed = db.rollup_sql(&plan, &state).await.map(|rewrite| rewrite.is_some());
+        let routed = db.rollup_sql(&plan, &state).await.map(|rewrites| !rewrites.is_empty());
         assert_eq!(render(&ctx.sql(&sql).await?.collect().await?)?, render(&db.query_delta_only(&sql).await?)?, "count({arg}) must answer as raw");
         assert_eq!(routed, want, "count({arg})");
     }
@@ -2244,7 +2285,7 @@ async fn a_sub_grain_tier_routes_only_over_whole_grain_slices() -> Result<()> {
                 );
                 let state = ctx.state();
                 let plan = state.optimize(&state.create_logical_plan(&sql).await?)?;
-                let routed = db.rollup_sql(&plan, &state).await.map(|rewrite| rewrite.map(|rewrite| rewrite.grain));
+                let routed = db.rollup_sql(&plan, &state).await.map(|rewrites| rewrites.into_iter().next().map(|rewrite| rewrite.grain));
                 let before = refusals();
                 assert_eq!(
                     render(&ctx.sql(&sql).await?.collect().await?)?,
@@ -3041,7 +3082,7 @@ async fn the_tag_replay_records_what_it_reads_into_the_coverage_ledger(split: bo
         "SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id='{project}' AND timestamp >= to_timestamp_micros({lo}) AND timestamp < to_timestamp_micros({hi})"
     );
     let plan = state.optimize(&state.create_logical_plan(&sql).await?)?;
-    assert!(matches!(db.rollup_sql(&plan, &state).await, Ok(Some(_))), "ledger seeding must restore readable output before tag replay");
+    assert!(db.rollup_sql(&plan, &state).await.is_ok_and(|rewrites| !rewrites.is_empty()), "ledger seeding must restore readable output before tag replay");
 
     Ok(())
 }
@@ -3340,6 +3381,8 @@ async fn the_census_repairs_missing_output_despite_unchanged_source_evidence(dam
         .rollup_sql(&plan, &state)
         .await
         .map_err(|reason| anyhow::anyhow!("fresh output did not route: {}", reason.label()))?
+        .into_iter()
+        .next()
         .expect("fresh output must route before the mutation");
     assert!(db.rollup_ticket_current(&accepted.ticket).await, "the fresh route ticket must pass its execution recheck");
     db.mark_replay_complete();
@@ -3428,13 +3471,20 @@ async fn the_census_repairs_missing_output_despite_unchanged_source_evidence(dam
                 .rollup_sql(&plan, &state)
                 .await
                 .map_err(|reason| anyhow::anyhow!("physical rewrite lost readable coverage: {}", reason.label()))?
+                .into_iter()
+                .next()
                 .expect("complete physical rewrites must route before metadata recovery");
             assert!(db.rollup_ticket_current(&immediate.ticket).await, "complete physical rewrites must pass the execution recheck");
             let rows = ctx.sql(&immediate.sql).await?.collect().await?;
             assert_eq!(first_i64(rows[0].column(0)), Some(2), "physical rewrites must preserve results without a recovery pass");
             db.recover_rollup_coverage("otel_logs_and_spans").await?;
-            let healthy =
-                db.rollup_sql(&plan, &state).await.map_err(|reason| anyhow::anyhow!("{}", reason.label()))?.expect("complete split output must route");
+            let healthy = db
+                .rollup_sql(&plan, &state)
+                .await
+                .map_err(|reason| anyhow::anyhow!("{}", reason.label()))?
+                .into_iter()
+                .next()
+                .expect("complete split output must route");
             let rows = ctx.sql(&healthy.sql).await?.collect().await?;
             assert_eq!(first_i64(rows[0].column(0)), Some(2), "recovery must accept the complete physical rewrite");
             if matches!(damage, RollupOutputDamage::PartialOutputAfterNoop) {
@@ -3468,8 +3518,13 @@ async fn the_census_repairs_missing_output_despite_unchanged_source_evidence(dam
             pending_tier_slices(&db, &project, &tier).iter().all(|slice| !slice.overlaps(evening, hi)),
             "repairing the old prefix must preserve valid evening coverage"
         );
-        let rewrite =
-            db.rollup_sql(&plan, &state).await.map_err(|reason| anyhow::anyhow!("{}", reason.label()))?.expect("the valid evening slice must still route");
+        let rewrite = db
+            .rollup_sql(&plan, &state)
+            .await
+            .map_err(|reason| anyhow::anyhow!("{}", reason.label()))?
+            .into_iter()
+            .next()
+            .expect("the valid evening slice must still route");
         assert!(db.rollup_ticket_current(&rewrite.ticket).await, "a hybrid ticket requires only its accepted evening interval");
         let rows = ctx.sql(&rewrite.sql).await?.collect().await?;
         assert_eq!(first_i64(rows[0].column(0)), Some(1), "the empty source prefix must not resurrect old aggregate rows");
@@ -3478,7 +3533,8 @@ async fn the_census_repairs_missing_output_despite_unchanged_source_evidence(dam
     }
     let repaired = db.run_unit_once("otel_logs_and_spans", &project, day, crate::maintenance_coordinator::Operation::BaseRollup, 24, 0, None).await?;
     assert_eq!(repaired.state, Some(crate::maintenance_coordinator::TaskState::Complete));
-    let rewrite = db.rollup_sql(&plan, &state).await.map_err(|reason| anyhow::anyhow!("{}", reason.label()))?.expect("repaired output must route");
+    let rewrite =
+        db.rollup_sql(&plan, &state).await.map_err(|reason| anyhow::anyhow!("{}", reason.label()))?.into_iter().next().expect("repaired output must route");
     assert!(db.rollup_ticket_current(&rewrite.ticket).await, "repair must restore an executable ticket");
     let rows = ctx.sql(&rewrite.sql).await?.collect().await?;
     assert_eq!(
@@ -10029,7 +10085,7 @@ async fn a_late_file_outside_a_slice_leaves_it_readable(late_hour: u32, routes: 
     let state = ctx.state();
     let route = async || {
         let plan = state.optimize(&state.create_logical_plan(&sql).await.expect("parse")).expect("optimize");
-        db.rollup_sql(&plan, &state).await.map(|rewrite| rewrite.map(|rewrite| rewrite.mode)).map_err(|reason| reason.label())
+        db.rollup_sql(&plan, &state).await.map(|rewrites| rewrites.into_iter().next().map(|rewrite| rewrite.mode)).map_err(|reason| reason.label())
     };
     assert_eq!(route().await, Ok(Some("full")), "the built afternoon slice must route before the late row");
 

@@ -11270,7 +11270,7 @@ mod rollup_noop_skip_tests {
         db.setup_session_context(&mut ctx)?;
         let state = ctx.state();
         let plan = state.optimize(&state.create_logical_plan(&sql).await?)?;
-        assert_eq!(matches!(db.rollup_sql(&plan, &state).await, Ok(Some(_))), routes);
+        assert_eq!(db.rollup_sql(&plan, &state).await.is_ok_and(|rewrites| !rewrites.is_empty()), routes);
         let render = |batches: Vec<RecordBatch>| arrow::util::pretty::pretty_format_batches(&batches).map(|table| table.to_string());
         assert_eq!(render(ctx.sql(&sql).await?.collect().await?)?, render(db.query_delta_only(&sql).await?)?);
         Ok(())
@@ -11459,7 +11459,7 @@ mod rollup_noop_skip_tests {
         );
         let state = ctx.state();
         let plan = state.optimize(&state.create_logical_plan(&sql).await?)?;
-        let route = db.rollup_sql(&plan, &state).await.expect("empty coverage must be routable").expect("rollup route");
+        let route = db.rollup_sql(&plan, &state).await.expect("empty coverage must be routable").into_iter().next().expect("rollup route");
         assert!(route.sql.contains("AND (FALSE)"), "a proven empty tier must not authorize same-generation leftovers");
         for query in [&sql, &route.sql] {
             let rows = ctx.sql(query).await?.collect().await?;
@@ -11568,7 +11568,7 @@ mod rollup_noop_skip_tests {
                 db.setup_session_context(&mut ctx)?;
                 let state = ctx.state();
                 let plan = state.optimize(&state.create_logical_plan(&by_status).await?)?;
-                let routes = matches!(db.rollup_sql(&plan, &state).await, Ok(Some(_)));
+                let routes = db.rollup_sql(&plan, &state).await.is_ok_and(|rewrites| !rewrites.is_empty());
                 let render = |batches: Vec<RecordBatch>| arrow::util::pretty::pretty_format_batches(&batches).map(|table| table.to_string());
                 Ok::<_, anyhow::Error>((routes, render(ctx.sql(&by_status).await?.collect().await?)?, render(db.query_delta_only(&by_status).await?)?))
             }
@@ -11730,7 +11730,7 @@ mod rollup_noop_skip_tests {
         let answer = || async {
             let state = ctx.state();
             let plan = state.optimize(&state.create_logical_plan(&sql).await?)?;
-            let routed = matches!(db.rollup_sql(&plan, &state).await, Ok(Some(_)));
+            let routed = db.rollup_sql(&plan, &state).await.is_ok_and(|rewrites| !rewrites.is_empty());
             let render = |batches: Vec<RecordBatch>| arrow::util::pretty::pretty_format_batches(&batches).map(|table| table.to_string());
             anyhow::Ok((routed, render(ctx.sql(&sql).await?.collect().await?)?, render(db.query_delta_only(&sql).await?)?))
         };
@@ -11914,7 +11914,7 @@ mod rollup_noop_skip_tests {
         let answer = || async {
             let state = ctx.state();
             let plan = state.optimize(&state.create_logical_plan(&sql).await?)?;
-            let routed = matches!(db.rollup_sql(&plan, &state).await, Ok(Some(_)));
+            let routed = db.rollup_sql(&plan, &state).await.is_ok_and(|rewrites| !rewrites.is_empty());
             let render = |batches: Vec<RecordBatch>| arrow::util::pretty::pretty_format_batches(&batches).map(|table| table.to_string());
             anyhow::Ok((routed, render(ctx.sql(&sql).await?.collect().await?)?, render(db.query_delta_only(&sql).await?)?))
         };
@@ -12051,7 +12051,7 @@ mod rollup_noop_skip_tests {
             "SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id='{project_id}' AND timestamp >= to_timestamp_micros({lo}) AND timestamp < to_timestamp_micros({hi})"
         );
         let plan = state.optimize(&state.create_logical_plan(&sql).await?)?;
-        assert!(matches!(db.rollup_sql(&plan, &state).await, Ok(Some(_))), "the prefix must route before the append");
+        assert!(db.rollup_sql(&plan, &state).await.is_ok_and(|rewrites| !rewrites.is_empty()), "the prefix must route before the append");
         insert_span(&db, &project_id, date, if within_coverage { 12 } else { 13 }, "later-row", "op").await?;
 
         let before = pending_base_rollups(&db);
@@ -12070,7 +12070,7 @@ mod rollup_noop_skip_tests {
             assert!(db.rollup_sql(&plan, &state).await.is_err(), "recovery cannot resurrect stale coverage");
         } else {
             assert_eq!(after, before, "a valid bounded witness must not acquire new repair debt during recovery");
-            assert!(matches!(db.rollup_sql(&plan, &state).await, Ok(Some(_))), "the unaffected prefix must remain readable");
+            assert!(db.rollup_sql(&plan, &state).await.is_ok_and(|rewrites| !rewrites.is_empty()), "the unaffected prefix must remain readable");
         }
         Ok(())
     }
@@ -12361,7 +12361,7 @@ mod rollup_noop_skip_tests {
         db.setup_session_context(&mut ctx)?;
         let state = ctx.state();
         let plan = state.optimize(&state.create_logical_plan(&sql).await?)?;
-        let route = db.rollup_sql(&plan, &state).await.expect("slice coverage is readable").expect("rollup route");
+        let route = db.rollup_sql(&plan, &state).await.expect("slice coverage is readable").into_iter().next().expect("rollup route");
         // One proven hour is below the day query's 20% routing threshold.
         // Require the slice route without claiming the other 23 hours covered.
         for query in [&sql, &route.sql, &day_sql] {

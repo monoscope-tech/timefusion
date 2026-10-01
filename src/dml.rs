@@ -192,13 +192,16 @@ impl QueryPlanner for DmlQueryPlanner {
             Err(error) => tracing::warn!(%error, "indexed histogram declined; using ordinary planning"),
         }
         match self.database.rollup_sql(logical_plan, session_state).await {
-            Ok(Some(crate::database::RollupRewrite { sql, grain, mode, matched, ticket, .. })) => {
+            Ok(rewrites) if !rewrites.is_empty() => {
                 // Each failure carries its own stage label, log message and miss reason.
                 type RewriteFailure = (DataFusionError, &'static str, &'static str, crate::rollup::MissReason);
                 let planned: std::result::Result<Arc<dyn ExecutionPlan>, RewriteFailure> = async {
                     let rewritten = async {
-                        let plan = session_state.create_logical_plan(&sql).await?;
-                        session_state.optimize(&substitute(logical_plan, &matched, requalified(plan, matched.schema())?)?)
+                        let mut plan = logical_plan.clone();
+                        for crate::database::RollupRewrite { sql, matched, .. } in &rewrites {
+                            plan = substitute(&plan, matched, requalified(session_state.create_logical_plan(sql).await?, matched.schema())?)?;
+                        }
+                        session_state.optimize(&plan)
                     }
                     .await
                     .map_err(|e| (e, "sql", "rollup rewrite SQL could not be planned; using raw plan", crate::rollup::MissReason::UnsupportedShape))?;
@@ -214,8 +217,15 @@ impl QueryPlanner for DmlQueryPlanner {
                 }
                 .await;
                 match planned {
-                    Ok(exec) if self.database.rollup_ticket_current(&ticket).await => {
-                        crate::observability::record_rollup_hit(mode, &grain, ticket.tier());
+                    Ok(exec)
+                        if futures::future::join_all(rewrites.iter().map(|rewrite| self.database.rollup_ticket_current(&rewrite.ticket)))
+                            .await
+                            .into_iter()
+                            .all(|current| current) =>
+                    {
+                        for rewrite in &rewrites {
+                            crate::observability::record_rollup_hit(rewrite.mode, &rewrite.grain, rewrite.ticket.tier());
+                        }
                         return Ok(exec);
                     }
                     Ok(_) => {
@@ -231,7 +241,7 @@ impl QueryPlanner for DmlQueryPlanner {
                     }
                 }
             }
-            Ok(None) => {}
+            Ok(_) => {}
             Err(reason) => {
                 crate::observability::record_rollup_miss(reason);
                 // Sampled so a multiple-per-second miss rate cannot flood the

@@ -1656,24 +1656,29 @@ async fn measure_filters<'a>(
     Ok(filters)
 }
 
-/// The outermost `Aggregate`, wherever the optimizer put it. Nothing above it is
-/// inspected or rebuilt — the rewrite is substituted in place. Do not match a
-/// fixed grammar of parent nodes; the shape above depends on the analyzer rules.
+/// The outermost `Aggregate` of each independent branch, wherever the optimizer
+/// put it. Nothing above one is inspected or rebuilt — each rewrite is substituted
+/// in place. Do not match a fixed grammar of parent nodes; the shape above depends
+/// on the analyzer rules.
 ///
 /// An aggregate directly over another never reaches the scan, so the inner one is
 /// matched: that is how `count(DISTINCT d)` plans (an outer `count` over a
-/// group-by on `d`), and the group-by is what the rollup can answer.
-fn outermost_aggregate(plan: &datafusion::logical_expr::LogicalPlan) -> Option<&datafusion::logical_expr::LogicalPlan> {
+/// group-by on `d`), and the group-by is what the rollup can answer. Each input of
+/// a join or union is its own branch: a per-series rate joined to its series'
+/// attributes routes both aggregates.
+fn outermost_aggregates(plan: &datafusion::logical_expr::LogicalPlan) -> Vec<&datafusion::logical_expr::LogicalPlan> {
     use datafusion::logical_expr::LogicalPlan;
     match plan {
-        LogicalPlan::Aggregate(aggregate) if matches!(aggregate.input.as_ref(), LogicalPlan::Aggregate(_)) => outermost_aggregate(&aggregate.input),
-        LogicalPlan::Aggregate(_) => Some(plan),
-        plan => plan.inputs().into_iter().find_map(outermost_aggregate),
+        LogicalPlan::Aggregate(aggregate) if matches!(aggregate.input.as_ref(), LogicalPlan::Aggregate(_)) => outermost_aggregates(&aggregate.input),
+        LogicalPlan::Aggregate(_) => vec![plan],
+        // Unique: `substitute` replaces every occurrence of a matched node at once.
+        plan => plan.inputs().into_iter().flat_map(outermost_aggregates).unique().collect(),
     }
 }
 
-/// Every rollup that could serve this aggregate, best first. The caller picks:
-/// only it knows which tiers are actually built for the dates in the window.
+/// Every rollup that could serve each independent aggregate, best first per
+/// aggregate and grouped by `matched`. The caller picks: only it knows which tiers
+/// are actually built for the dates in the window.
 pub(crate) async fn match_aggregates(
     plan: &datafusion::logical_expr::LogicalPlan, session: &datafusion::execution::context::SessionState,
 ) -> Result<Vec<RoutedRollup>, MissReason> {
@@ -1687,8 +1692,31 @@ pub(crate) async fn match_aggregates(
     ) {
         return Ok(Vec::new());
     }
-    let Some(matched) = outermost_aggregate(plan) else { return Ok(Vec::new()) };
-    let LogicalPlan::Aggregate(original) = matched else { unreachable!("outermost_aggregate returns an Aggregate") };
+    match_branches(plan, session).await
+}
+
+/// The routes of every branch's aggregate.
+async fn match_branches(
+    plan: &datafusion::logical_expr::LogicalPlan, session: &datafusion::execution::context::SessionState,
+) -> Result<Vec<RoutedRollup>, MissReason> {
+    any_branch(futures::future::join_all(outermost_aggregates(plan).into_iter().map(|matched| Box::pin(match_aggregate(matched, session)))).await)
+}
+
+/// Every branch's answers: a declining branch stays raw, so only a decline of
+/// every branch is a miss (the first one's).
+pub(crate) fn any_branch<T>(branches: impl IntoIterator<Item = Result<Vec<T>, MissReason>>) -> Result<Vec<T>, MissReason> {
+    let (found, misses): (Vec<_>, Vec<_>) = branches.into_iter().partition_result();
+    match misses.into_iter().next() {
+        Some(miss) if found.iter().all(Vec::is_empty) => Err(miss),
+        _ => Ok(found.into_iter().flatten().collect()),
+    }
+}
+
+async fn match_aggregate(
+    matched: &datafusion::logical_expr::LogicalPlan, session: &datafusion::execution::context::SessionState,
+) -> Result<Vec<RoutedRollup>, MissReason> {
+    use datafusion::logical_expr::LogicalPlan;
+    let LogicalPlan::Aggregate(original) = matched else { unreachable!("outermost_aggregates returns Aggregates") };
     // Match against the pre-CSE shape where there is one; `matched` stays the
     // node actually in the tree, which is what the rewrite substitutes for.
     let inlined = inline_common_exprs(original);
@@ -1698,10 +1726,9 @@ pub(crate) async fn match_aggregates(
     let source = match source_and_filters(&aggregate.input, &mut predicates) {
         Ok(source) => source,
         // An aggregate over a window over the aggregate a rollup CAN answer (a
-        // per-series counter rate summed across series): route the inner one, the
-        // window and this aggregate then run over its rewrite. The inner match
-        // counts its own miss.
-        Err(_) if outermost_aggregate(&original.input).is_some() => return Box::pin(match_aggregates(&original.input, session)).await,
+        // per-series counter rate summed across series): route the inner ones, the
+        // window and this aggregate then run over their rewrites.
+        Err(_) if !outermost_aggregates(&original.input).is_empty() => return match_branches(&original.input, session).await,
         Err(node) => {
             // Count this only when a rollup-bearing table sits underneath; an
             // aggregate over `pg_catalog` alone was never a candidate.
@@ -3281,7 +3308,7 @@ mod tests {
 
         // Read off the same walk the matcher runs, so a test-only re-derivation
         // cannot drift from the log line.
-        let Some(datafusion::logical_expr::LogicalPlan::Aggregate(aggregate)) = outermost_aggregate(&plan) else { panic!("an aggregate") };
+        let [datafusion::logical_expr::LogicalPlan::Aggregate(aggregate)] = outermost_aggregates(&plan)[..] else { panic!("an aggregate") };
         let refused = source_and_filters(aggregate.input.as_ref(), &mut Vec::new()).expect_err("the walk must refuse");
         assert!(refused.contains(expected_node), "the refusal must name the node that stopped the walk, got {refused:?} for {}", plan.display_indent());
     }
@@ -3541,7 +3568,7 @@ mod tests {
         db.setup_session_context(&mut ctx)?;
         let state = ctx.state();
         let plan = optimized(&state, include_str!("../tests/fixtures/session_list_rollup.sql")).await;
-        assert!(outermost_aggregate(&plan).is_some(), "the client fixture must exercise aggregate matching");
+        assert!(!outermost_aggregates(&plan).is_empty(), "the client fixture must exercise aggregate matching");
         let routes = match_aggregates(&plan, &state).await.expect("diagnose the nested client query");
         assert!(routes.is_empty(), "the current session-list query must use raw fallback: {routes:?}");
         Ok(())
