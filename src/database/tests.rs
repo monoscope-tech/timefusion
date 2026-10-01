@@ -1325,8 +1325,8 @@ async fn a_partly_covered_window_is_exact_and_counts_a_measure_decline_once() ->
 /// One cumulative series (t=a) at 10/s resets at 12:00 (to 300 = the 30 s since its restart),
 /// one DELTA series (t=b) adds 30 per 30 s point: every bin reads 10 + 1.
 #[test_case("'value'", "", 1, &[("value", "11.0")]; "summed across series")]
-#[test_case("variant_to_json(attributes)->>'t'", " JOIN (SELECT series_id, first_value(attributes ORDER BY timestamp) AS attributes FROM otel_metrics \
-     WHERE project_id='{project}' and timestamp >= '{day_before}' and timestamp < '{day_after}' and (metric_name = 'rows') GROUP BY series_id) AS __series_attrs USING (series_id)",
+#[test_case("variant_to_json(attributes)->>'t'", " JOIN (SELECT series_id, first_value(attributes) AS attributes FROM (SELECT series_id, attributes FROM otel_metrics \
+     WHERE project_id='{project}' and timestamp >= '{day_before}' and timestamp < '{day_after}' and (metric_name = 'rows') GROUP BY series_id, attributes) AS __attrs GROUP BY series_id) AS __series_attrs USING (series_id)",
     2, &[("a", "10.0"), ("b", "1.0")]; "by attribute")]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_per_series_counter_rate_routes_to_the_series_tier_and_equals_raw(by: &str, join: &str, routes: u64, bins: &[(&str, &str)]) -> Result<()> {
@@ -1365,7 +1365,7 @@ async fn a_per_series_counter_rate_routes_to_the_series_tier_and_equals_raw(by: 
     db.insert_records_batch(&project, "otel_metrics", vec![RecordBatch::try_new(batch.schema(), columns)?], true, None).await?;
     build_base_tier(&db, "otel_metrics", &project, "series_5m_v1", day).await?;
     for date in [day.pred_opt().expect("a day before"), day] {
-        build_base_tier(&db, "otel_metrics", &project, "series_attrs_1d_v1", date).await?;
+        build_base_tier(&db, "otel_metrics", &project, "series_attrs_1d_v2", date).await?;
     }
     let mut ctx = Arc::clone(&db).create_session_context();
     db.setup_session_context(&mut ctx)?;

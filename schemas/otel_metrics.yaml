@@ -171,11 +171,13 @@ rollups:
   # Each series' attributes, for a rate charted by attribute: series_id hashes the
   # attributes, so the chart aggregates the tier above by series and joins this
   # after. Daily, so one row per series and day; carrying them on the 5m cells
-  # instead would copy them into every cell. `resource` is left out: it is 2.5x
-  # the bytes to decode per build, and charts group by its promoted columns.
+  # instead would copy them into every cell. A dimension, not a `first` measure:
+  # DataFusion has no groups accumulator for first_value over a Variant, and the
+  # per-group fallback took hours per prod project-day. `resource` is left out:
+  # it is 2.5x the bytes to decode per build, and charts group by its promoted
+  # columns.
   - grain: 1d
-    name: series_attrs_1d_v1
-    dimensions: [metric_name, series_id]
+    name: series_attrs_1d_v2
+    dimensions: [metric_name, series_id, attributes]
     measures:
-      - { name: attributes_first, agg: first, column: attributes }
       - { name: first_at, agg: min, column: timestamp }
