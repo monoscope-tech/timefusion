@@ -6160,10 +6160,11 @@ impl Database {
                     // A re-queued slice keeps its coverage only through the output it last
                     // committed: this identity, and exactly those files, still live. The
                     // read witness then decides whether that output is still current.
+                    let same_identity = |publication: &&crate::maintenance_coordinator::Publication| {
+                        publication.generation == generation && publication.source_fingerprint == source_fp && publication.source_rows == source_rows
+                    };
                     let rebuilt = built.get(&(project_id.as_str(), slice)).filter(|built| {
-                        (built.publication.generation == generation
-                            && built.publication.source_fingerprint == source_fp
-                            && built.publication.source_rows == source_rows)
+                        same_identity(&&built.publication)
                             && paths_by_identity.get(&identity).is_some_and(|(_, live)| live.iter().sorted().eq(built.paths.iter().sorted()))
                     });
                     let complete = (rebuilt.is_some() || self.journal().rollup_slice_complete(source, &project_id, &target, slice))
@@ -6181,9 +6182,7 @@ impl Database {
                         continue;
                     }
                     let publication =
-                        publications.get(&(project_id.as_str(), slice)).copied().or(rebuilt.map(|built| &built.publication)).filter(|publication| {
-                            publication.generation == generation && publication.source_fingerprint == source_fp && publication.source_rows == source_rows
-                        });
+                        publications.get(&(project_id.as_str(), slice)).copied().or(rebuilt.map(|built| &built.publication)).filter(same_identity);
                     // Tags retain the expected count after a no-op clears the task publication.
                     // Legacy output can use an independent matching journal record instead.
                     let complete_output = output_rows_by_identity.get(&identity).is_some_and(|rows| {
