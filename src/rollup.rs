@@ -3523,9 +3523,7 @@ mod tests {
     async fn current_session_requirements_have_explicit_routing_eligibility(group: &str, aggregate: &str) -> Option<String> {
         route_alone(&format!(
             "SELECT {group}, {aggregate} FROM {SOURCE} WHERE project_id = 'project' \
-             AND timestamp >= to_timestamp_micros(0) AND timestamp < to_timestamp_micros(86400000000) \
-             AND (resource___telemetry___sdk___language IN ('webjs', 'javascript', 'js') OR resource___user_agent___original IS NOT NULL \
-                  OR name IN ('documentLoad', 'documentFetch') OR (name LIKE 'Pageview %' OR name = 'documentLoad')) GROUP BY 1"
+             AND timestamp >= to_timestamp_micros(0) AND timestamp < to_timestamp_micros(86400000000) AND {RUM_BROWSER} GROUP BY 1"
         ))
         .await
         .ok()
