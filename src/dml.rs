@@ -937,17 +937,12 @@ async fn perform_version_append(
     // assignment disables suppression for the statement rather than half-prove
     // it. DELETE always appends: the tombstone itself is the change.
     let comparable = |name: &String| table_schema.field_with_name(name).is_ok_and(|f| !matches!(f.data_type(), DataType::Struct(_)));
+    let stored = |name: &str| col(Column::new(Some(table_name.to_string()), name));
+    let differs = |(name, e): &(String, Expr)| -> Result<Expr> {
+        Ok(binary_expr(requalify_for_merge(e.clone(), &source_cols, MOR_SOURCE, table_name)?, Operator::IsDistinctFrom, stored(name)))
+    };
     let changed: Option<Expr> = if !tombstone && !assignments.is_empty() && assignments.iter().all(|(c, _)| comparable(c)) {
-        assignments
-            .iter()
-            .map(|(name, e)| {
-                Ok(binary_expr(
-                    requalify_for_merge(e.clone(), &source_cols, MOR_SOURCE, table_name)?,
-                    Operator::IsDistinctFrom,
-                    col(Column::new(Some(table_name.to_string()), name)),
-                ))
-            })
-            .process_results::<_, _, DataFusionError, _>(|it| it.reduce(Expr::or))?
+        assignments.iter().map(differs).process_results(|it| it.reduce(Expr::or))?
     } else {
         None
     };
@@ -957,11 +952,7 @@ async fn perform_version_append(
     let overwrites: Option<Expr> = assignments
         .iter()
         .filter(|(c, _)| enrich.contains(&c.as_str()))
-        .map(|(name, e)| {
-            let old = col(Column::new(Some(table_name.to_string()), name));
-            let new = requalify_for_merge(e.clone(), &source_cols, MOR_SOURCE, table_name)?;
-            Ok(old.clone().is_not_null().and(old.clone().not_eq(lit(""))).and(binary_expr(new, Operator::IsDistinctFrom, old)))
-        })
+        .map(|assignment| Ok(stored(&assignment.0).is_not_null().and(stored(&assignment.0).not_eq(lit(""))).and(differs(assignment)?)))
         .process_results::<_, _, DataFusionError, _>(|it| it.reduce(Expr::or))?;
     let mut exprs = exprs;
     if let Some(pred) = changed.clone() {
@@ -982,19 +973,19 @@ async fn perform_version_append(
     let mut retracted = 0u64;
     while let Some(batch) = stream.next().await {
         let mut batch = batch?;
+        // Marker columns pop in reverse of their push order.
         if overwrites.is_some() && batch.num_columns() > 0 {
-            use datafusion::arrow::array::cast::AsArray;
-            if batch.column(batch.num_columns() - 1).as_boolean().true_count() > 0 {
+            let (rest, overwrite) = pop_marker(&batch)?;
+            if overwrite.true_count() > 0 {
                 return Err(DataFusionError::Execution(format!(
                     "UPDATE may only fill enrich_only column(s) {enrich:?} on {table_name} where they are NULL or '', never change or clear a set value"
                 )));
             }
-            batch = batch.project(&(0..batch.num_columns() - 1).collect::<Vec<_>>())?;
+            batch = rest;
         }
         if changed.is_some() && batch.num_columns() > 0 {
-            use datafusion::arrow::array::cast::AsArray;
-            let mask = batch.column(batch.num_columns() - 1).as_boolean().clone();
-            batch = datafusion::arrow::compute::filter_record_batch(&batch.project(&(0..batch.num_columns() - 1).collect::<Vec<_>>())?, &mask)?;
+            let (rest, mask) = pop_marker(&batch)?;
+            batch = datafusion::arrow::compute::filter_record_batch(&rest, &mask)?;
             suppressed += (mask.len() - batch.num_rows()) as u64;
         }
         if batch.num_rows() == 0 {
@@ -1071,6 +1062,13 @@ async fn perform_version_append(
 const MOR_CHANGED_COL: &str = "__tf_changed";
 /// Marker column flagging rows whose UPDATE would overwrite a set `enrich_only` value.
 const MOR_OVERWRITES_COL: &str = "__tf_overwrites";
+
+/// Split a batch's trailing boolean marker column off the rest.
+fn pop_marker(batch: &RecordBatch) -> Result<(RecordBatch, datafusion::arrow::array::BooleanArray)> {
+    use datafusion::arrow::array::cast::AsArray;
+    let last = batch.num_columns() - 1;
+    Ok((batch.project(&(0..last).collect::<Vec<_>>())?, batch.column(last).as_boolean().clone()))
+}
 
 /// Merge-on-read is a property of the SCHEMA alone — never also of whether a
 /// buffered layer is attached, or the same data would resolve differently
