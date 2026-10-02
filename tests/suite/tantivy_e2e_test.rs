@@ -355,7 +355,9 @@ async fn mutable_index_filter_cannot_resurrect_an_uncovered_version() -> Result<
         "flush-created indexes must preserve physical Parquet row ordinals without manual backfill"
     );
     assert_eq!(row_count(&ctx, &unindexed_sql).await?, 0, "the newer nonmatching version must suppress the old match");
-    assert_eq!(snapshots(&db), before + 1, "freshly flushed hashes must reach the histogram path without manual backfill");
+    // One file here is outside index coverage, so the window takes the ordinary scan: counting
+    // it on the histogram path read its rows inside planning (10-02: 7-31 s for a 1h chart).
+    assert_eq!(snapshots(&db), before, "a window holding any unindexed file must take the ordinary scan");
     let result = db.tantivy_search().unwrap().search_with_stats(table, &project, &leaf("name", "a"), 100, None).await?.expect("usable newer index");
     assert!(result.hits.is_empty(), "only the uncovered old version matches");
     assert_eq!(result.indexed_rows, 10);
@@ -378,6 +380,20 @@ async fn mutable_index_filter_cannot_resurrect_an_uncovered_version() -> Result<
         "memory changes must reuse the unchanged Delta snapshot"
     );
     assert!(db.indexed_histogram(&project, table, window, None, 0, ctx.task_ctx()).await.is_err(), "snapshot capture must enforce its decoded budget");
+    // Index the direct write too: SQL takes the histogram path only over a fully indexed window.
+    let store = db.resolve_table(&project, table).await?.read().await.log_store().object_store(None);
+    let covered = timefusion::tantivy::load_manifest(svc.object_store.as_ref(), table, &project)
+        .await?
+        .entries
+        .into_values()
+        .flat_map(|entry| entry.covered_files)
+        .collect::<Vec<_>>();
+    for uri in db.list_file_uris(&project, table).await? {
+        let rel = timefusion::tantivy::search::parquet_rel_of_uri(&uri).expect("relative parquet path");
+        if !covered.iter().any(|file| file.ends_with(rel)) {
+            svc.build_index_for_file(table, &project, rel, &uri, store.clone()).await?;
+        }
+    }
     for width in ["'1 second'", "INTERVAL '1 second'"] {
         let sql = format!(
             "SELECT time_bucket({width}, timestamp) AS bucket, count(*) AS n FROM {table} WHERE project_id='{project}' AND timestamp >= TIMESTAMP '{}' AND timestamp < TIMESTAMP '{}' AND array_has(hashes, 'b') GROUP BY 1 ORDER BY 1",
