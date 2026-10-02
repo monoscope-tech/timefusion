@@ -263,7 +263,12 @@ builds and process ages, so they are not one baseline. pgwire p99 was 23.6 s and
       a minute base tier's unit as its whole hour (older dates keep 10-minute mints, which widen to whole days);
       a publish drops contained slices' coverage; boot queues today's closed sub-hour hours. Guard
       `an_hour_base_slice_lifts_the_ten_minute_packing_bounds_inside_it` (5 bounds → 0; red with the drop removed).
-      Pending prod check: files per (project, hour) of today ≤2 for closed hours, rollup hit rate flat. Original: Today never consolidates: every project has ~20–30 files per
+      Prod check 10-02 21:50: today's 1m tier is all hour slices; closed hours fell to 2–6 files (shipbubble,
+      whale), 10–17 (demo). Remaining fragments per hour: (a) DV-masked 5-min files awaiting the strip budget,
+      (b) the hour's last flush file running seconds past the edge (a MemBuffer bucket is chosen per BATCH), which
+      straddles the cell bound and never packs. (b) fixed `be148b07`: today's rows stage one file per UTC hour.
+      Coverage misses did not rise (`not_built` 2.4% vs 3.4%, `stale_coverage` 0.25% vs 1.8% of misses); the lower
+      hit rate is query mix. Re-check closed hours of 10-03 for ≤2 files. Original: Today never consolidates: every project has ~20–30 files per
       hour of today's data, including data 12 h old. Files span 5–15 min at 1–3 MB, and demo has 155 DV files of
       368. Pending HotPacking reads 0. The cause is `packing_bounds` → `slice_bounds` (`database/mod.rs`): a hot
       bin may not straddle any live slice's `covered_through`, and base slices are minted on the 10-minute grid.
