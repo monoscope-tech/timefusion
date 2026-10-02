@@ -2038,6 +2038,14 @@ pub struct MaintenanceConfig {
     #[serde_inline_default(true)]
     pub timefusion_rollup_noop_skip_enabled: bool,
 
+    /// Writes mint BASE rollup units in whole hours instead of 10-minute cells.
+    /// A hot pack may not straddle a live slice's `covered_through`, so with
+    /// 10-minute slices today's partition stays 10-minute files all day; hour
+    /// slices let it pack an hour into one or two files. The current hour then
+    /// builds once it goes quiet, so it is served raw until then.
+    #[serde_inline_default(true)]
+    pub timefusion_rollup_hour_units: bool,
+
     /// Record a file as verified-sorted when the WRITE that produced it stamped a
     /// `sorting_columns` footer. A marked file is NEVER offered to footer repair.
     ///

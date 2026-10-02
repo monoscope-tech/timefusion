@@ -195,6 +195,103 @@ Done items carry evidence (commit or number). Open items carry the next action, 
       1.3 GB/M rows after W33/W37/W39.
 - [ ] **Stage 6 minute revisions** — trigger: ≥30% saving on ≥20% of the relevant resource. Not triggered.
 
+### Latest-window reads (2026-10-02)
+
+Goal (owner, 10-02): reads of the latest data are fast under real prod load, with **no monoscope change**.
+`bin_auto` keeps emitting 10–30 s buckets for 1h, so the latest hour is always raw and must be cheap there.
+Targets on monoscope's emitted overview shapes (shipbubble, demo, whale; process ≥10 min old; ≥3 runs, arms
+alternated): ≤1h p50 <300 ms / p95 <1 s; 24h p50 <1 s / p95 <2 s; no statement over 5 s on these shapes.
+
+Baseline, shipbubble "Events by Service". On `fe58c7e2` under load: 1h 1.9–2.5 s and 24h 8–9 s, with 22–47 s
+stalls (3 of 27 runs). On `036b88db` at 25 min uptime: 1h 0.27–0.42 s and 24h 1.6–2.6 s. These are different
+builds and process ages, so they are not one baseline. pgwire p99 was 23.6 s and p999 90 s while scan p99 was
+~1 s.
+
+- [x] **L0 `bench/latest_bench.py`** (`d837b50d`). Baseline 10-02 ~19:45 UTC on `53b78e43` (1 round): 15m p50 261 ms
+      / max 15.8 s; 1h p50 258 ms / max 1.5 s; 6h p50 491 ms / max 13.5 s; 24h p50 2.9 s / max 37.8 s.
+      **After `942b83bf`** (19:55 UTC, 13 min uptime, 2 rounds): 15m p50 225 ms / p95 356 ms / max 434 ms; 1h p50
+      240 ms / p95 568 ms / max 1.8 s — both MEET target. 6h p50 594 ms / p95 4.3 s; 24h p50 877 ms (meets) / p95
+      17 s (misses). The 24h tail is the unrouted shapes (`top_resources`, `error_rate`, `apdex`,
+      `latency_percentiles`, `http_by_status`, all `missing_measure`/`unknown_filter`/`filter_not_eligible`) plus
+      contention while the remint backlog drains (CPU 2,100%). Next lever for 24h: a tier carrying those measures
+      (new tier, not a spec change to `dashboard_1m_v4`, which would orphan its 30 days). Monoscope's overview SQL (templates from `pgwire.slow_statement`) at
+      15m/1h/6h/24h × 3 projects, run **sequentially** (see Rules: concurrent raw load OOMed prod). Output per
+      window: p50/p95, plus deltas of `heavy_query_queued`, `queue_timeout` and rollup hits/misses. Run it before
+      every deploy below and ≥10 min after.
+- [x] **L1 phases shipped** (`d837b50d`): `pgwire.slow_statement` carries `planned_us` (do_query returned: parse,
+      plan, routing) and `first_row_us`. First 25 min of data: ~1/3 of slow-statement time was PLANNING, nearly all
+      in one shape, `count(*)` by `time_bucket` with `array_has(hashes, ?)` (monoscope's issue/pattern charts):
+      209 runs, 2,507 s planning, 9–21 s p50 per run. Cause: `histogram_plan` counts the window during planning and
+      reads rows of every unindexed file there; it took that path when ANY file was indexed. Fixed `726f86c1`
+      (every file indexed, else ordinary scan): 1h 7–31 s → 0.25 s, 24h 10–36 s → 2.3 s, identical counts; sealed
+      windows tie. Second mechanism, named from `first_row_us` ≈ 30 s on 1h charts planned in 0.3 s: the heavy
+      gate classified every chart's final `ORDER BY time_bucket(..)` (a sort of ~100 aggregate groups) as a
+      spilling sort, so charts queued the full 30 s `HEAVY_QUEUE_WAIT` while the L2 widgets held 5–9 of 8 permits
+      (`available=0` on every EXPLAIN sampled). Fixed `942b83bf`: a sort of an aggregate's groups is not heavy;
+      a wide ordered merge below it still is. Original L1 candidates, kept for reference: The widget plans contain **no `AdmissionExec`**
+      (checked 1h and 24h with plain EXPLAIN), so the heavy gate cannot be what queues them, and a short-query lane
+      would not touch them. The 09-29 yield A/B already ruled out maintenance concurrency. Candidates to
+      correlate against stall timestamps:
+      - the scan permit pool (`GatedScanExec`, 256 permits; 245 free at one sample);
+      - IO and CPU taken by the 90 s queries (L2);
+      - tokio scheduling lag (2.06 s max on `fe58c7e2`).
+      Instrument time-to-first-batch split into planning, routing, scan-permit wait and execution, so a stalled
+      statement names its own phase.
+- [ ] **L2 The four 90 s shapes — all `hashes`-filtered shipbubble widgets** (10-02 20:45 log: 78 of 81 timeouts):
+      latency percentile, error rate, apdex (`hashes @>`) and status breakdown, on 7–14 d windows. Apdex over 7 d:
+      14.6–58 s with the tantivy prefilter, 30 s without (1.15 M matching rows of ~18 M); 14 d times out at 90 s.
+      No routing fix exists: the tiers have no hash dimension. Next: a per-hash hourly tier (unnest `hashes` as a
+      dimension, count/duration/percentile-sketch/status measures) — new rollup capability, own design. Original
+      notes:
+      **Proposal (needs owner sign-off: new tier storage + rebuild cost).** `hashes_1h_v1`, grain 1h, dimension
+      `hash` from `unnest(array_distinct(hashes))`; measures `count`, `duration_{count,sum,min,max}`, the existing
+      `error_count` filter, apdex buckets (`duration <= 500 ms`, `<= 2 s`) and a duration percentile sketch.
+      Routing: `array_has(hashes, x)` / `hashes @> ARRAY[x]` with ONE element rewrites to `hash = x` (exact only
+      because the unnest is distinct per row). Status breakdown needs `attributes___http___response___status_code`
+      as a second dimension (rows = hours × hashes × statuses; size it from prod before choosing). Risks: `hashes`
+      is MUTABLE (monoscope appends via MoR UPDATE), so this tier reads the column the version-only witness skips
+      and today's slices re-stale on every pattern-tag UPDATE (~7/min on 6297304f); the build must aggregate
+      keep-greatest winners. Measured 10-02: shipbubble carries 1,649 distinct hashes in one hour (254k hash
+      entries), so ~40–50k tier rows/day against ~2.5 M raw rows. Still to measure: the hashes UPDATE rate per hour. In 25 min, 78 heavy-permit holds lasted 80–90 s: statement timeouts that
+      return nothing, while holding 5–9 of the K = 8 permits in a typical minute (1,596 of 2,641 admissions
+      queued). The shapes are 24h/7d overview widgets falling back to raw: latency percentile, error rate
+      (`count(*) filter`), the status-code breakdown (`sum(count(*)) over ()`) and apdex (`hashes @>`). Get each
+      shape's miss reason (`rollup_miss_sampled`, or a counter diff around single runs) and fix the routing or
+      the plan. Also bound a permit's hold by the remaining statement timeout, so a query that cannot finish
+      frees its slot early.
+- [x] **L3 Hour cells for today's partition** (`8eed4b3f`, `timefusion_rollup_hour_units`). Writes into TODAY mint
+      a minute base tier's unit as its whole hour (older dates keep 10-minute mints, which widen to whole days);
+      a publish drops contained slices' coverage; boot queues today's closed sub-hour hours. Guard
+      `an_hour_base_slice_lifts_the_ten_minute_packing_bounds_inside_it` (5 bounds → 0; red with the drop removed).
+      Pending prod check: files per (project, hour) of today ≤2 for closed hours, rollup hit rate flat. Original: Today never consolidates: every project has ~20–30 files per
+      hour of today's data, including data 12 h old. Files span 5–15 min at 1–3 MB, and demo has 155 DV files of
+      368. Pending HotPacking reads 0. The cause is `packing_bounds` → `slice_bounds` (`database/mod.rs`): a hot
+      bin may not straddle any live slice's `covered_through`, and base slices are minted on the 10-minute grid.
+      Both row witnesses and the W31 content proof would refute every 10-minute slice a cross-cell pack
+      touches, so the bounds must coarsen, not be ignored.
+      Fix: after `hour_end + grace` (start at 15 min), mint a whole-hour BaseRollup unit `[H, H+1h)` that
+      supersedes its six 10-minute slices, replacing coverage and tier output in one commit. W56 is the
+      precedent: 1h tiers are built in whole hours and a republished hour retires the file it replaces.
+      `slice_bounds` then yields hour edges for closed hours, and HotPacking merges an hour into 1–2 files,
+      admitting its DV strips in the same rewrite. The current hour keeps 10-minute slices for freshness. Kill
+      switch `TIMEFUSION_HOUR_SLICES`.
+      Before code: a `slice_proof` case table (straddler, late file, DV file). Then `timefusion sim` on today's
+      journal and `run-unit` on one shipbubble hour.
+      Metrics: files per (project, hour) of today (add to `prod_report.py`; target ≤2 per closed hour), with
+      the rollup hit rate held flat after ≥2 h.
+- [~] **L4 Certify today's closed hours** — no new code needed so far: the existing per-file split
+      (`certified_file_split`) fires once packed hour files stop overlapping fresh flushes. `dedup_skipped_per_file`
+      1,015 in the first 21 min after L3 (~48/min) vs 633 over the previous 15 h process (~0.7/min). Re-check
+      after ≥2 h together with the rollup hit rate (5.4% at 21 min vs 7.8% before; young process, remint backlog
+      draining — not a verdict). Original: once packed and deduped, so reads skip `DedupExec` there. A live day
+      cannot be day-certified (Certification, below); this is the hour-scope version. Metric: read-side dedup
+      skipped % on today's windows (2.3% on 10-02).
+- Out of scope: a sub-minute tier for `bin_auto`'s 10–30 s buckets. Revisit only if ≤1h misses its target after
+  L1–L3, since uncontended raw execution of 1h is ~300 ms.
+- Measurement trap (10-02): **EXPLAIN ANALYZE does not take the rollup path.** It shows a raw scan for a sealed
+  day whose plain statement routes; 10 plain runs moved rollup hits +13/+16 against ~0.6 expected from
+  background traffic. Judge routing by counter diffs around plain runs.
+
 ### Stage 5 prerequisites: certification and dedup
 
 - [x] W33 skip dedup on certified-clean days; W37 per-project spans for the per-file skip (unproven:proved 23:1 → 2:1);

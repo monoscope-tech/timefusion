@@ -716,6 +716,9 @@ pub struct TaskJournal {
     /// Reused across claims so the hot path allocates nothing. Holds indices,
     /// not references, so it can live on `self` while the walk borrows the tasks.
     claim_scratch: Vec<(Rank, usize, bool, bool)>,
+    /// Writes mint BASE rollup units in whole hours (`timefusion_rollup_hour_units`).
+    /// Bisection still floors at the grain, so an hour too big for one unit splits as before.
+    pub(crate) base_hour_units: bool,
     dirty_tasks: HashSet<TaskKey>,
     /// Keys removed since the last write, pending a `Removed` tombstone.
     removed_tasks: HashSet<TaskKey>,
@@ -976,6 +979,7 @@ impl TaskJournal {
             rank_generation: 0,
             dedup_generation: 0,
             claim_scratch: Vec::new(),
+            base_hour_units: false,
             claim_tick: 0,
             frontier_lag_secs: std::sync::atomic::AtomicU64::new(0),
             dedup_complete_edges: HashMap::new(),
@@ -1979,6 +1983,10 @@ impl TaskJournal {
         let Invalidation { source, rollup_table, start_micros, end_micros, derived, .. } = invalidation;
         let normal_slices = TimeSlice::normal_units(start_micros, end_micros)?;
         let grain = rollup_unit_grain(source, rollup_table, if derived { Operation::DerivedRollup } else { Operation::BaseRollup });
+        // Today only: hot packing is fenced only on today, and older dates keep the
+        // 10-minute mints that widen to whole-day units.
+        let today = invalidation.observed_at_micros.div_euclid(DAY_MICROS) * DAY_MICROS;
+        let grain = if self.base_hour_units && !derived && start_micros >= today { grain.max(DERIVED_SLICE_MICROS) } else { grain };
         let rollup_slices = if grain > NORMAL_SLICE_MICROS {
             let aligned_start = start_micros.div_euclid(grain) * grain;
             let aligned_end = end_micros.saturating_add(grain - 1).div_euclid(grain) * grain;
@@ -4281,6 +4289,7 @@ mod tests {
     }
 
     const SESSIONS: &str = "otel_logs_and_spans_rollup_sessions_1h_v2";
+    const DASHBOARD_1M: &str = "otel_logs_and_spans_rollup_dashboard_1m_v4";
 
     /// A unit of a real source, so its tier's declared grain applies.
     fn in_logs(mut unit: MaintenanceTask) -> MaintenanceTask {
@@ -4309,6 +4318,23 @@ mod tests {
             .map(|task| (task.key.slice.start_micros, task.key.slice.end_micros))
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(live, std::collections::BTreeSet::from([(HOUR, 2 * HOUR), (3 * HOUR, 5 * HOUR), (6 * HOUR, 7 * HOUR)]));
+    }
+
+    /// With `base_hour_units` a write mints a minute base tier's unit as its whole hour, so the
+    /// tier's slices fence today's hot packing at hour edges rather than at the touched range.
+    #[test_case::test_case(false => vec![(DERIVED_SLICE_MICROS + NORMAL_SLICE_MICROS + 7, DERIVED_SLICE_MICROS + NORMAL_SLICE_MICROS + 9)] ; "off: the touched range")]
+    #[test_case::test_case(true => vec![(DERIVED_SLICE_MICROS, 2 * DERIVED_SLICE_MICROS)] ; "on: the whole hour")]
+    fn base_hour_units_mint_a_minute_tier_in_whole_hours(hour_units: bool) -> Vec<(i64, i64)> {
+        const AT: i64 = DERIVED_SLICE_MICROS + NORMAL_SLICE_MICROS;
+        // Observed on the same UTC day: hour units apply to today's writes only.
+        let (_dir, mut journal) = new_journal();
+        journal.base_hour_units = hour_units;
+        journal.invalidate(Invalidation { source: "otel_logs_and_spans", ..invalidation(DASHBOARD_1M, AT + 7, AT + 9, 0, false) }).expect("invalidate");
+        journal
+            .tasks()
+            .filter(|task| task.key.operation == Operation::BaseRollup)
+            .map(|task| (task.key.slice.start_micros, task.key.slice.end_micros))
+            .collect()
     }
 
     /// `task`, with the physical table named — a few assertions turn on the tier.

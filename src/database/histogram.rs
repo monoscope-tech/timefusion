@@ -903,19 +903,16 @@ impl super::Database {
         let Some(query) = crate::tantivy::planner::match_query(plan) else { return Ok(None) };
         let captured =
             self.capture_histogram(&query.project, &query.table, query.window, Some(&query.membership), 64 * 1024 * 1024, session.task_ctx()).await?;
-        // With no usable element index, ordinary SQL can prune a narrow time
-        // window without sorting daily visibility or starting a daily proof.
+        // Every captured file must carry a usable element index: an unindexed one is
+        // counted by reading its rows INSIDE planning, which made a 1h `array_has(hashes, ?)`
+        // chart plan in 7-31 s on prod against 0.25 s for the ordinary scan (10-02, today's
+        // freshly flushed files). Ordinary SQL prunes that window without daily visibility.
         let columns = query.membership.columns();
-        let has_index = captured.partitions.values().try_fold(false, |found, files| -> Result<bool> {
-            Ok(found
-                || captured
-                    .manifest
-                    .histogram_entries(&captured.root, files)?
-                    .iter()
-                    .flatten()
-                    .any(|entry| columns.iter().all(|column| entry.entry.element_fields.contains(*column))))
+        let indexed = captured.partitions.values().try_fold(true, |all, files| -> Result<bool> {
+            let entries = captured.manifest.histogram_entries(&captured.root, files)?;
+            Ok(all && every_file_indexed(entries.iter().map(|entry| entry.as_ref().map(|entry| &entry.entry.element_fields)), &columns))
         })?;
-        if !has_index {
+        if !indexed {
             return Ok(None);
         }
         let mut proof = None;
@@ -1045,9 +1042,24 @@ impl super::Database {
     }
 }
 
+/// Whether every file (`None` = no usable index) indexes all of `columns` as elements.
+fn every_file_indexed<'a>(files: impl IntoIterator<Item = Option<&'a std::collections::BTreeSet<String>>>, columns: &std::collections::BTreeSet<&str>) -> bool {
+    files.into_iter().all(|fields| fields.is_some_and(|fields| columns.iter().all(|column| fields.contains(*column))))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test_case::test_case(&[Some(&["hashes"][..]), Some(&["hashes", "level"][..])] => true ; "all indexed")]
+    #[test_case::test_case(&[Some(&["hashes"][..]), None] => false ; "one unindexed file declines")]
+    #[test_case::test_case(&[Some(&["hashes"][..]), Some(&["level"][..])] => false ; "one file lacks the column")]
+    #[test_case::test_case(&[] => true ; "no files")]
+    fn histogram_needs_every_file_indexed(files: &[Option<&[&str]>]) -> bool {
+        let files: Vec<Option<std::collections::BTreeSet<String>>> =
+            files.iter().map(|fields| fields.map(|fields| fields.iter().map(|f| f.to_string()).collect())).collect();
+        every_file_indexed(files.iter().map(Option::as_ref), &std::collections::BTreeSet::from(["hashes"]))
+    }
 
     #[tokio::test]
     async fn captured_histograms_preserve_delta_keys_under_late_buffered_rows() -> Result<()> {
