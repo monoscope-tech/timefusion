@@ -83,7 +83,7 @@ jobs:
     name: Clippy
     needs: gate
     if: needs.gate.outputs.skip_clippy != 'true'
-    runs-on: blacksmith-16vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
       - name: Free disk space
@@ -112,7 +112,7 @@ jobs:
     name: Clippy & Test (shard ${{ matrix.shard }})
     needs: gate
     if: needs.gate.outputs.skip_test != 'true' || needs.gate.outputs.skip_pg_smoke != 'true'
-    runs-on: blacksmith-16vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     # Tests run concurrently now. The old `--test-threads=1` was there because
     # every `WalManager` shared the process-global `WALRUS_DATA_DIR`, so two
     # concurrent tests corrupted each other's WAL (9/9 tantivy_e2e failed).
@@ -261,7 +261,7 @@ jobs:
     name: E2E
     needs: gate
     if: needs.gate.outputs.skip_e2e != 'true'
-    runs-on: blacksmith-16vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
       CARGO_TERM_COLOR: always
