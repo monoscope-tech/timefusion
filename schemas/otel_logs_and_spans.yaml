@@ -428,6 +428,7 @@ fields:
   - name: attributes___http___route
     data_type: Utf8
     nullable: true
+    bloom_filter: true
 
 # Continuous-aggregate rollups derived from this table. The rollup's own table
 # (`otel_logs_and_spans_rollup_dashboard_1m_v4`) is SYNTHESIZED from this spec plus the field

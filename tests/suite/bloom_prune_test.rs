@@ -125,7 +125,7 @@ async fn bloom_pruning_excludes_files_and_empty_needle_scans_zero_files() -> Res
 }
 
 #[tokio::test]
-async fn endpoint_host_and_path_blooms_prune_other_files() -> Result<()> {
+async fn endpoint_host_route_and_path_blooms_prune_other_files() -> Result<()> {
     use std::sync::atomic::Ordering::Relaxed;
     let (db, project_id) = setup("endpoint_blooms").await?;
     let ts = ts();
@@ -133,6 +133,7 @@ async fn endpoint_host_and_path_blooms_prune_other_files() -> Result<()> {
         let mut r = row(id, &project_id, ts, id);
         r["attributes___server___address"] = json!(host);
         r["attributes___http___request___method"] = json!("POST");
+        r["attributes___http___route"] = json!(if id == "a" { "/orders/{id}" } else { "/shipments/{id}" });
         r["attributes___url___path"] = json!(path);
         insert(&db, &project_id, vec![r]).await?;
     }
@@ -140,7 +141,9 @@ async fn endpoint_host_and_path_blooms_prune_other_files() -> Result<()> {
     let mut ctx = Arc::clone(&db).create_session_context();
     db.setup_session_context(&mut ctx)?;
     let stats = &db.bloom_prune().unwrap().stats;
-    for predicate in ["attributes___server___address IN ('api.a.test')", "attributes___url___path IN ('/orders/a')"] {
+    for predicate in
+        ["attributes___server___address IN ('api.a.test')", "attributes___http___route IN ('/orders/{id}')", "attributes___url___path IN ('/orders/a')"]
+    {
         let before = stats.files_rejected.load(Relaxed);
         let sql = format!(
             "SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = '{project_id}' AND {predicate} AND attributes___http___request___method IN ('POST') \
