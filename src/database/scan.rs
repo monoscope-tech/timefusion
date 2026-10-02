@@ -257,12 +257,7 @@ impl ProjectRoutingTable {
             .flatten()
             .filter_map(|(uri, ords)| Some((crate::tantivy::search::parquet_rel_of_uri(uri)?.to_string(), ords.clone())))
             .collect();
-        // The tantivy id list narrows rows, never files: the files are already chosen, and random
-        // ids span every file's min/max. Kept out of delta-kernel's skipping predicate, where log
-        // replay evaluates it as an N-way OR against every file's stats; parquet still gets it.
-        let is_id_list = |f: &&Expr| matches!(f, Expr::InList(l) if !l.negated && matches!(&*l.expr, Expr::Column(c) if c.name == "id"));
-        let has_id_list = filters.iter().any(|f| is_id_list(&f));
-        if file_selection.is_some() || !ordinal_selections.is_empty() || has_id_list {
+        if file_selection.is_some() || !ordinal_selections.is_empty() {
             use deltalake::delta_datafusion::{FileSelection, MissingSelectedFilePolicy};
             if let Some(sel) = &file_selection {
                 metrics::counter!(scan_metric_names::PRUNED_FILES).increment(sel.len() as u64);
@@ -292,11 +287,7 @@ impl ProjectRoutingTable {
             }
             metrics::counter!(scan_metric_names::PRUNED_SELECT_US).increment(select_started.elapsed().as_micros() as u64);
             let build_started = std::time::Instant::now();
-            let mut scan = builder.build().await.map_err(|e| DataFusionError::External(Box::new(e)))?;
-            if has_id_list {
-                scan = scan.with_file_skipping_predicate(filters.iter().filter(|f| !is_id_list(f)).cloned());
-            }
-            let provider: Arc<dyn TableProvider> = Arc::new(scan);
+            let provider: Arc<dyn TableProvider> = Arc::new(builder.build().await.map_err(|e| DataFusionError::External(Box::new(e)))?);
             metrics::counter!(scan_metric_names::PRUNED_BUILD_US).increment(build_started.elapsed().as_micros() as u64);
             let scan_started = std::time::Instant::now();
             let plan = self.scan_via_provider(provider, state, projection, filters, limit).await;
@@ -396,16 +387,7 @@ impl ProjectRoutingTable {
         query_time_range: Option<(i64, i64)>, bloom_rejected: Option<&HashSet<String>>, date_restrict: Option<&HashSet<String>>,
         file_restrict: Option<&HashSet<String>>,
     ) -> DFResult<Vec<Arc<dyn ExecutionPlan>>> {
-        // Row ordinals already restrict decoding to the hits, so when they cover every file the
-        // leg reads, the id list is pure planning cost: delta-kernel replays it as an N-way OR
-        // against each file's stats. Without full ordinal coverage the list still narrows.
-        let narrow = |filters: &[Expr], files: Option<&HashSet<String>>| {
-            let ordinals_cover = files.zip(row_selections).is_some_and(|(files, sel)| {
-                let mut read = files.iter().filter(|u| !zero_hit_files.is_some_and(|z| z.contains(*u))).peekable();
-                read.peek().is_some() && read.all(|u| sel.contains_key(u))
-            });
-            filters.iter().cloned().chain(id_filter.filter(|_| !ordinals_cover).cloned()).collect::<Vec<_>>()
-        };
+        let narrow = |filters: &[Expr]| filters.iter().cloned().chain(id_filter.cloned()).collect::<Vec<_>>();
         // Per-date dedup skip: restrict this call's file universe to one side of
         // the certified/uncertified split, so two calls partition the in-window
         // files exactly once. An unattributable URI fails the test and lands on
@@ -433,7 +415,7 @@ impl ProjectRoutingTable {
         };
         let (lo, hi) = query_time_range.unwrap_or((i64::MIN, i64::MAX));
         let Some(covered) = covered_files else {
-            let narrowed = narrow(filters, None);
+            let narrowed = narrow(filters);
             let merged = merged_exclude(table);
             let exclude = merged.as_ref().or(zero_hit_files);
             // Under a split an exclude is not enough — an include is what bounds
@@ -493,7 +475,7 @@ impl ProjectRoutingTable {
         // needed when the snapshot has raw debt. Never under a date or file split: the
         // fast path reads every live file, so both sides would read everything.
         if raw.is_empty() && !indexed.is_empty() && !bloom_pruned_any && date_restrict.is_none() && file_restrict.is_none() {
-            let narrowed = narrow(filters, Some(&indexed));
+            let narrowed = narrow(filters);
             metrics::counter!(scan_metric_names::TANTIVY_FASTPATH).increment(1);
             let plan = self.scan_delta_table(table, state, projection, &narrowed, limit, None, zero_hit_files, row_selections).await?;
             metrics::counter!(scan_metric_names::TANTIVY_SCAN_US).increment(scan_started.elapsed().as_micros() as u64);
@@ -505,7 +487,7 @@ impl ProjectRoutingTable {
 
         let mut plans = Vec::with_capacity(2);
         if !indexed.is_empty() {
-            let narrowed = narrow(filters, Some(&indexed));
+            let narrowed = narrow(filters);
             plans.push(self.scan_delta_table(table, state, projection, &narrowed, limit, Some(&indexed), None, row_selections).await?);
         }
         if !raw.is_empty() {
