@@ -124,6 +124,39 @@ async fn bloom_pruning_excludes_files_and_empty_needle_scans_zero_files() -> Res
     Ok(())
 }
 
+#[tokio::test]
+async fn endpoint_host_route_and_path_blooms_prune_other_files() -> Result<()> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let (db, project_id) = setup("endpoint_blooms").await?;
+    let ts = ts();
+    for (id, host, path) in [("a", "api.a.test", "/orders/a"), ("b", "api.b.test", "/orders/b")] {
+        let mut r = row(id, &project_id, ts, id);
+        r["attributes___server___address"] = json!(host);
+        r["attributes___http___request___method"] = json!("POST");
+        r["attributes___http___route"] = json!(if id == "a" { "/orders/{id}" } else { "/shipments/{id}" });
+        r["attributes___url___path"] = json!(path);
+        insert(&db, &project_id, vec![r]).await?;
+    }
+    db.bloom_sidecar_reconcile().await?;
+    let mut ctx = Arc::clone(&db).create_session_context();
+    db.setup_session_context(&mut ctx)?;
+    let stats = &db.bloom_prune().unwrap().stats;
+    for predicate in
+        ["attributes___server___address IN ('api.a.test')", "attributes___http___route IN ('/orders/{id}')", "attributes___url___path IN ('/orders/a')"]
+    {
+        let before = stats.files_rejected.load(Relaxed);
+        let sql = format!(
+            "SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = '{project_id}' AND {predicate} AND attributes___http___request___method IN ('POST') \
+             AND timestamp >= to_timestamp_micros({}) AND timestamp <= to_timestamp_micros({})",
+            ts - 3_600_000_000,
+            ts + 3_600_000_000
+        );
+        let n = ctx.sql(&sql).await?.collect().await?[0].column(0).as_primitive::<Int64Type>().value(0);
+        assert_eq!((n, stats.files_rejected.load(Relaxed) - before), (1, 1), "{predicate} must reject the other endpoint's file");
+    }
+    Ok(())
+}
+
 /// Split path: tantivy covers some files while others are unindexed. Bloom rejection
 /// must reach both legs without dropping rows, and an all-rejected needle must take
 /// the empty-include arm rather than falling back to an unrestricted scan.

@@ -449,6 +449,8 @@ mod tests {
 
     const T: &str = "context___trace_id";
     const S: &str = "attributes___session___id";
+    const H: &str = "attributes___server___address";
+    const P: &str = "attributes___url___path";
     #[test_case("context___trace_id = 'a' OR context___trace_id = 'b' OR context___trace_id = 'c'", Some((T, vec!["a", "b", "c"])) ; "short IN / ANY lowered to an OR chain")]
     #[test_case("(context___trace_id = 'a' AND name = 'x') OR context___trace_id = 'b'", Some((T, vec!["a", "b"])) ; "AND legs yield their needle")]
     #[test_case("context___trace_id = 'a' OR name = 'b'", None ; "OR across columns proves nothing")]
@@ -456,13 +458,15 @@ mod tests {
     #[test_case("attributes___session___id IN ('a', 'b')", Some((S, vec!["a", "b"])) ; "an enrich_only column is a needle")]
     #[test_case("attributes___session___id IN ('a', '')", None ; "an empty enrich_only value is not a needle")]
     #[test_case("context___trace_id NOT IN ('a')", None ; "NOT IN is never a needle")]
+    #[test_case("attributes___server___address IN ('integrations.routelift.com')", Some((H, vec!["integrations.routelift.com"])) ; "endpoint host")]
+    #[test_case("attributes___url___path IN ('/v1/deliveries/estimate/v2')", Some((P, vec!["/v1/deliveries/estimate/v2"])) ; "endpoint path")]
     fn needles_from_or_chains(sql: &str, want: Option<(&str, Vec<&str>)>) {
         use datafusion::{
             arrow::datatypes::{DataType, Field, Schema},
             common::DFSchema,
             prelude::SessionContext,
         };
-        let fields = [T, S, "attributes___user___id", "name"].map(|n| Field::new(n, DataType::Utf8, true));
+        let fields = [T, S, H, P, "attributes___user___id", "name"].map(|n| Field::new(n, DataType::Utf8, true));
         let expr = SessionContext::new().parse_sql_expr(sql, &DFSchema::try_from(Schema::new(fields.to_vec())).unwrap()).unwrap();
         let mutable = crate::database::ProjectRoutingTable::version_mutable_columns("otel_logs_and_spans");
         let got = extract_needles(&[expr], crate::schema::get_schema("otel_logs_and_spans").unwrap(), mutable.as_ref());
