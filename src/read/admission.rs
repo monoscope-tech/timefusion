@@ -119,7 +119,11 @@ fn estimated_row_bytes(schema: &Schema) -> usize {
 /// `DedupExec`, and only when one batch per input exceeds a sort reservation;
 /// incidental merges elsewhere keep their existing concurrency.
 fn heavy_class(plan: &Arc<dyn ExecutionPlan>, batch_rows: usize) -> Option<HeavyClass> {
-    if downcast::<SortExec>(plan.as_ref()).is_some_and(|sort| sort.fetch().is_none()) {
+    // A sort of an aggregate's GROUPS is no bigger than the aggregate, which the pool
+    // already accounts and spills; gating it queued every dashboard chart's final
+    // `ORDER BY time_bucket(..)` (~100 rows) behind long scans (10-02: 1h charts waited
+    // the full 30 s for a permit). The search continues below for a wide merge.
+    if downcast::<SortExec>(plan.as_ref()).is_some_and(|sort| sort.fetch().is_none() && !sorts_groups(sort.input())) {
         return Some(HeavyClass::SpillingSort);
     }
     if let Some(dedup) = downcast::<DedupExec>(plan.as_ref())
@@ -130,6 +134,15 @@ fn heavy_class(plan: &Arc<dyn ExecutionPlan>, batch_rows: usize) -> Option<Heavy
         return (buffered_bytes > crate::config::DEFAULT_SORT_SPILL_RESERVATION_BYTES).then_some(HeavyClass::OrderedMorMerge { fan_in, buffered_bytes });
     }
     plan.children().into_iter().find_map(|child| heavy_class(child, batch_rows))
+}
+
+/// Whether `plan` is an aggregate's output, through row-preserving wrappers.
+fn sorts_groups(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    use datafusion::physical_plan::{aggregates::AggregateExec, projection::ProjectionExec, repartition::RepartitionExec};
+    let node = plan.as_ref();
+    downcast::<AggregateExec>(node).is_some()
+        || ((downcast::<ProjectionExec>(node).is_some() || downcast::<RepartitionExec>(node).is_some() || downcast::<CoalescePartitionsExec>(node).is_some())
+            && plan.children().first().is_some_and(|child| sorts_groups(child)))
 }
 
 /// Wrap a heavy plan's root so its execution holds one heavy-query permit.
@@ -365,6 +378,20 @@ mod tests {
     #[test]
     fn an_unbounded_sort_is_heavy() {
         assert_eq!(heavy_class(&sort(empty(), None), BATCH), Some(HeavyClass::SpillingSort));
+    }
+
+    fn aggregate(input: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
+        use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode, PhysicalGroupBy};
+        let group = PhysicalGroupBy::new_single(vec![(Arc::new(Column::new(input.schema().field(0).name(), 0)), "t".to_owned())]);
+        Arc::new(AggregateExec::try_new(AggregateMode::Single, group, vec![], vec![], Arc::clone(&input), input.schema()).unwrap())
+    }
+
+    /// A chart's final ORDER BY sorts the aggregate's groups, not raw rows: not gated,
+    /// while a wide merge feeding the aggregate still is.
+    #[test_case::test_case(empty() => None ; "sort of groups over a cheap input")]
+    #[test_case::test_case(ordered_mor(8, false) => Some("ordered_mor_merge") ; "a wide merge below the aggregate stays gated")]
+    fn a_sort_of_aggregate_groups_is_not_heavy(input: Arc<dyn ExecutionPlan>) -> Option<&'static str> {
+        heavy_class(&sort(aggregate(input), None), BATCH).map(|class| class.label())
     }
 
     /// A bounded TopK holds only `n` rows and never spills, so it is NOT gated —
