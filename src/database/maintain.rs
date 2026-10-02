@@ -532,7 +532,7 @@ pub(crate) fn add_row_count(add: &deltalake::kernel::Add) -> Option<u64> {
 }
 
 /// `(min, max)` row-timestamp bounds an `Add`'s statistics declare, when readable.
-fn add_ts_bounds(add: &deltalake::kernel::Add) -> (Option<i64>, Option<i64>) {
+pub(crate) fn add_ts_bounds(add: &deltalake::kernel::Add) -> (Option<i64>, Option<i64>) {
     add.get_stats().ok().flatten().map_or((None, None), |stats| {
         (
             stats.min_values.get("timestamp").and_then(|value| value.as_value()).and_then(delta_stat_micros),

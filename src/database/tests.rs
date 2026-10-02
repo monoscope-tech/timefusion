@@ -2379,6 +2379,34 @@ async fn an_hour_base_slice_lifts_the_ten_minute_packing_bounds_inside_it() -> R
     Ok(())
 }
 
+/// A flush unit whose rows cross an hour edge stages one file per hour: a file straddling the
+/// edge joins no hot-packing cell, which left one fragment per hour all day (10-02: e.g. a
+/// 07:55:00-08:00:04 file beside each hour's packed file).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_flush_never_stages_a_file_across_an_hour() -> Result<()> {
+    const HOUR: i64 = 3_600_000_000;
+    let db = Database::with_config(create_test_config("hour-split")).await?;
+    let project = format!("hsplit_{}", uuid::Uuid::new_v4().simple());
+    // Today's hours are fenced; the clock is pinned so the edge is always today and in the past.
+    let midnight = midnight_micros(Utc::now().date_naive());
+    let _clock = crate::support::set_micros(midnight + 12 * HOUR);
+    let edge = midnight + 8 * HOUR;
+    let spans =
+        [-5_000_000, -1_000, 0, 4_000_000].iter().enumerate().map(|(i, offset)| test_span_ts(&format!("s{i}"), "GET /", &project, edge + offset)).collect();
+    db.insert_records_batch(&project, "otel_logs_and_spans", vec![json_to_batch(spans)?], true, None).await?;
+    let spans: Vec<(i64, i64)> = live_adds(&db.resolve_table(&project, "otel_logs_and_spans").await?)
+        .await
+        .iter()
+        .filter_map(|add| match super::maintain::add_ts_bounds(add) {
+            (Some(lo), Some(hi)) => Some((lo, hi)),
+            _ => None,
+        })
+        .sorted()
+        .collect();
+    assert_eq!(spans, [(edge - 5_000_000, edge - 1_000), (edge, edge + 4_000_000)], "one file per hour, none across the edge");
+    Ok(())
+}
+
 /// A fresh process must route from the durable coverage ledger at boot: until
 /// `recover_rollup_coverage` replays every tier's Delta log, routing is not attempted
 /// at all, and that replay window is a large share of a short-lived process's uptime.

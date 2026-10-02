@@ -17,6 +17,22 @@ async fn lock_with_flush_priority<'a>(lock: &'a tokio::sync::Mutex<()>, waiters:
 }
 
 /// Spawn detached best-effort post-commit work that a maintenance shutdown cancels.
+/// `batch`'s rows grouped by hour of TODAY (earlier rows share one group: sealed dates pack
+/// across hours), each group in input order so a sorted stream stays sorted per group. A batch
+/// inside one group is returned whole.
+fn split_by_hour(batch: RecordBatch, today_start: i64) -> Result<Vec<(i64, RecordBatch)>, arrow_schema::ArrowError> {
+    use datafusion::arrow::{array::TimestampMicrosecondArray, compute::filter_record_batch};
+    const HOUR: i64 = 3_600_000_000;
+    let Some(ts) = batch.column_by_name("timestamp").and_then(|c| c.as_any().downcast_ref::<TimestampMicrosecondArray>()) else {
+        return Ok(vec![(i64::MIN, batch)]);
+    };
+    let windows: Vec<i64> = ts.iter().map(|t| t.filter(|t| *t >= today_start).map_or(i64::MIN, |t| t.div_euclid(HOUR))).collect();
+    if windows.iter().all_equal() {
+        return Ok(vec![(windows.first().copied().unwrap_or_default(), batch)]);
+    }
+    windows.iter().copied().unique().map(|window| Ok((window, filter_record_batch(&batch, &windows.iter().map(|w| Some(*w == window)).collect())?))).collect()
+}
+
 fn spawn_until_shutdown(shutdown: Arc<CancellationToken>, work: impl std::future::Future<Output = ()> + Send + 'static) {
     tokio::spawn(async move {
         tokio::select! {
@@ -434,20 +450,38 @@ impl Database {
     /// `WriteBuilder`, does not cast for us) and streams them in, flushing at `max_file_bytes`
     /// so one oversized bucket doesn't land as a single file. On a sorted stream each flushed
     /// piece keeps its own footer and stays time-disjoint.
+    ///
+    /// Today's rows are split by UTC hour into one writer each, so no file straddles an hour:
+    /// a straddler joins no hot-packing cell (`slice_bounds`), and every flush unit holding a
+    /// batch that crossed the edge left one such fragment per hour for the whole day.
     async fn stage_batches(
-        writer: &mut deltalake::writer::RecordBatchWriter, batches: FlushBatches, max_file_bytes: usize,
+        writer: deltalake::writer::RecordBatchWriter, batches: FlushBatches, max_file_bytes: usize, table: &DeltaTable, properties: &WriterProperties,
     ) -> Result<Vec<deltalake::kernel::Action>, deltalake::DeltaTableError> {
         use deltalake::writer::DeltaWriter;
+        let today_start = crate::support::now_micros().div_euclid(DAY_MICROS) * DAY_MICROS;
         let target_schema = writer.arrow_schema();
+        let mut first = Some(writer);
+        let mut writers: std::collections::BTreeMap<i64, deltalake::writer::RecordBatchWriter> = std::collections::BTreeMap::new();
         let mut staged = Vec::new();
         for b in batches {
             let casted = deltalake::kernel::schema::cast_record_batch(&b?, target_schema.clone(), true, true)?;
-            writer.write(casted).await?;
-            if writer.buffer_len() >= max_file_bytes {
-                staged.extend(writer.flush().await?);
+            for (hour, rows) in split_by_hour(casted, today_start)? {
+                let writer = match writers.entry(hour) {
+                    std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+                    std::collections::btree_map::Entry::Vacant(entry) => entry.insert(match first.take() {
+                        Some(writer) => writer,
+                        None => deltalake::writer::RecordBatchWriter::for_table(table)?.with_writer_properties(properties.clone()),
+                    }),
+                };
+                writer.write(rows).await?;
+                if writer.buffer_len() >= max_file_bytes {
+                    staged.extend(writer.flush().await?);
+                }
             }
         }
-        staged.extend(writer.flush().await?);
+        for writer in writers.values_mut().chain(first.as_mut()) {
+            staged.extend(writer.flush().await?);
+        }
         Ok(staged.into_iter().map(deltalake::kernel::Action::Add).collect())
     }
 
@@ -501,7 +535,7 @@ impl Database {
                 let table_fields: HashSet<&str> = arrow_schema.fields().iter().map(|f| f.name().as_str()).collect();
                 !batches.schemas().iter().any(|s| s.fields().iter().any(|f| !table_fields.contains(f.name().as_str())))
             });
-        Ok(PreparedWrite { table_ref, schema, dirty_bins, batches, writer_properties, stage_store, staged_writer, sorted })
+        Ok(PreparedWrite { table_ref, schema, dirty_bins, batches, writer_properties, stage_store, staged_writer, staging_table, sorted })
     }
 
     /// Identity of one flush unit's batch set; `None` when the replay-decline is
@@ -605,7 +639,7 @@ impl Database {
             (batches.clone(), Vec::new(), String::new())
         };
         let tagged = if versions.is_empty() { None } else { Some(self.prepare_staged_write(&project_id, &table_name, versions.clone()).await?) };
-        let PreparedWrite { table_ref, schema, mut dirty_bins, batches: sorted_batches, writer_properties, stage_store, staged_writer, sorted } =
+        let PreparedWrite { table_ref, schema, mut dirty_bins, batches: sorted_batches, writer_properties, stage_store, staged_writer, staging_table, sorted } =
             self.prepare_staged_write(&project_id, &table_name, rest).await?;
         if tagged.as_ref().is_some_and(|tagged| tagged.staged_writer.is_none() || staged_writer.is_none()) {
             // No staged path for one group: write everything untagged, which only costs
@@ -628,17 +662,19 @@ impl Database {
         // re-commit the already-uploaded parquet with no re-encode/re-upload. When a batch
         // carries a column absent from the table schema there is no staged writer, and the
         // locked WriteBuilder merge path below runs instead.
-        if let Some(mut writer) = staged_writer {
+        if let Some(writer) = staged_writer {
             let stage_span = tracing::trace_span!(parent: &span, "delta.stage_parquet");
             let max_file_bytes = self.config.maintenance.timefusion_writer_max_file_bytes;
-            let mut adds = Self::stage_batches(&mut writer, batches, max_file_bytes)
+            let mut adds = Self::stage_batches(writer, batches, max_file_bytes, &staging_table, &writer_properties)
                 .instrument(stage_span)
                 .await
                 .map_err(|e| anyhow::anyhow!("staged parquet flush failed: {}", e))?;
             let untagged = adds.len();
             let mut tagged_sorted = false;
-            if let Some(PreparedWrite { staged_writer: Some(mut writer), batches, dirty_bins: bins, sorted, .. }) = tagged {
-                let staged = Self::stage_batches(&mut writer, batches, max_file_bytes).await.map_err(|e| anyhow::anyhow!("staged parquet flush failed: {}", e));
+            if let Some(PreparedWrite { staged_writer: Some(writer), batches, dirty_bins: bins, sorted, staging_table, writer_properties, .. }) = tagged {
+                let staged = Self::stage_batches(writer, batches, max_file_bytes, &staging_table, &writer_properties)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("staged parquet flush failed: {}", e));
                 let staged = match staged {
                     Ok(staged) => staged,
                     Err(e) => {

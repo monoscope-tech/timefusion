@@ -2267,6 +2267,8 @@ struct PreparedWrite {
     /// those objects have no Add/Remove and VACUUM never reclaims them.
     stage_store: Arc<dyn object_store::ObjectStore>,
     staged_writer: Option<deltalake::writer::RecordBatchWriter>,
+    /// What `staged_writer` was built from, to open one sibling writer per UTC hour.
+    staging_table: DeltaTable,
 }
 
 /// `data_change`: true when the rewrite drops rows (dedup), false for a data-preserving compaction.
