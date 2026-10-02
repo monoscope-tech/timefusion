@@ -413,6 +413,10 @@ struct StatementLatency {
     query: String,
     protocol: &'static str,
     started_at: std::time::Instant,
+    /// Until `do_query` returned: parse, plan and rollup routing.
+    planned_us: u64,
+    /// Until the first row: admission, scan permits and execution to the first batch.
+    first_row_us: std::sync::OnceLock<u64>,
     rows: std::sync::atomic::AtomicU64,
     stream_failed: std::sync::atomic::AtomicBool,
 }
@@ -424,7 +428,8 @@ impl Drop for StatementLatency {
         if self.stream_failed.load(std::sync::atomic::Ordering::Relaxed) {
             self.metrics.iter().for_each(|m| m.record_pgwire_query(duration_us));
         } else {
-            record_statement_latency(self.metrics.as_deref(), &self.query, self.protocol, duration_us, *self.rows.get_mut(), None);
+            let phases = (self.planned_us, self.first_row_us.get().copied().unwrap_or(duration_us));
+            record_statement_latency(self.metrics.as_deref(), &self.query, self.protocol, duration_us, *self.rows.get_mut(), None, Some(phases));
         }
     }
 }
@@ -486,7 +491,10 @@ fn with_response_deadline(response: Response, deadline: Option<tokio::time::Inst
                     if let (Some(latency), Some((row, _))) = (&context.latency, &next) {
                         use std::sync::atomic::Ordering::Relaxed;
                         match row {
-                            Ok(_) => drop(latency.rows.fetch_add(1, Relaxed)),
+                            Ok(_) => {
+                                latency.first_row_us.get_or_init(|| latency.started_at.elapsed().as_micros() as u64);
+                                latency.rows.fetch_add(1, Relaxed);
+                            }
                             Err(_) => latency.stream_failed.store(true, Relaxed),
                         }
                     }
@@ -536,12 +544,20 @@ async fn run_statement<T, R>(
     let context = StreamFailureContext::new(query, protocol, timeout, t0);
     match run_with_statement_timeout(timeout, execute.instrument(execute_span)).await {
         Ok((value, deadline)) => {
-            let latency =
-                StatementLatency { metrics: scan_metrics, query: query.to_owned(), protocol, started_at: t0, rows: 0.into(), stream_failed: false.into() };
+            let latency = StatementLatency {
+                metrics: scan_metrics,
+                query: query.to_owned(),
+                protocol,
+                started_at: t0,
+                planned_us: t0.elapsed().as_micros() as u64,
+                first_row_us: std::sync::OnceLock::new(),
+                rows: 0.into(),
+                stream_failed: false.into(),
+            };
             Ok(finish(value, deadline, StreamFailureContext { latency: Some(Arc::new(latency)), ..context }))
         }
         Err(error) => {
-            record_statement_latency(scan_metrics.as_deref(), query, protocol, t0.elapsed().as_micros() as u64, 0, Some(&error));
+            record_statement_latency(scan_metrics.as_deref(), query, protocol, t0.elapsed().as_micros() as u64, 0, Some(&error), None);
             warn!(protocol, error = %error, "statement failed");
             Err(error)
         }
@@ -1177,6 +1193,7 @@ fn record_query_span(span: &tracing::Span, query: &str) {
 /// included in this event.
 fn record_statement_latency(
     metrics: Option<&crate::database::ScanMetrics>, query: &str, protocol: &'static str, duration_us: u64, rows: u64, failure: Option<&PgWireError>,
+    phases: Option<(u64, u64)>,
 ) {
     if let Some(metrics) = metrics {
         metrics.record_pgwire_query(duration_us);
@@ -1224,7 +1241,16 @@ fn record_statement_latency(
         );
     }
     if slow {
-        statement_event!(info, "pgwire.slow_statement", "slow PostgreSQL statement", success = success, rows = rows);
+        let (planned_us, first_row_us) = phases.map_or((None, None), |(planned, first)| (Some(planned), Some(first)));
+        statement_event!(
+            info,
+            "pgwire.slow_statement",
+            "slow PostgreSQL statement",
+            success = success,
+            rows = rows,
+            planned_us = planned_us,
+            first_row_us = first_row_us
+        );
     }
 }
 
@@ -1517,7 +1543,7 @@ mod pgwire_handlers_tests {
                 assert!(response.data_rows.next().await.is_none(), "{case}");
             }
             let failure = crate::server::pg_compat::statement_timeout_error();
-            super::record_statement_latency(None, "SELECT 'private-literal-canary' FROM otel_logs_and_spans", "simple", 10, 0, Some(&failure));
+            super::record_statement_latency(None, "SELECT 'private-literal-canary' FROM otel_logs_and_spans", "simple", 10, 0, Some(&failure), None);
         }
         let output = std::fs::read_to_string(log.path())?;
         let failures: Vec<_> = output.lines().filter(|line| line.contains("pgwire.stream_failed")).collect();
@@ -1586,9 +1612,13 @@ mod pgwire_handlers_tests {
         }
         let output = std::fs::read_to_string(log.path())?;
         let slow = output.lines().find(|line| line.contains("pgwire.slow_statement")).unwrap_or_else(|| panic!("streamed 1.2 s but not slow: {output}"));
-        let duration_us: u64 = slow.split("duration_us=").nth(1).and_then(|v| v.split_whitespace().next()).expect("duration_us").parse()?;
-        assert!(duration_us >= 3 * ROW_DELAY.as_micros() as u64, "latency must include the streamed rows: {slow}");
+        let field =
+            |name: &str| -> u64 { slow.split(&format!("{name}=")).nth(1).and_then(|v| v.split_whitespace().next()).and_then(|v| v.parse().ok()).expect(name) };
+        assert!(field("duration_us") >= 3 * ROW_DELAY.as_micros() as u64, "latency must include the streamed rows: {slow}");
         assert!(slow.contains("rows=3"), "{slow}");
+        // The phases name where a slow statement spent its time: planning returned at once, the first row waited one delay.
+        assert!(field("planned_us") < ROW_DELAY.as_micros() as u64, "{slow}");
+        assert!((ROW_DELAY.as_micros() as u64..2 * ROW_DELAY.as_micros() as u64).contains(&field("first_row_us")), "{slow}");
         Ok(())
     }
 

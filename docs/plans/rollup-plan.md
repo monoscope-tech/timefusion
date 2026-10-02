@@ -195,6 +195,63 @@ Done items carry evidence (commit or number). Open items carry the next action, 
       1.3 GB/M rows after W33/W37/W39.
 - [ ] **Stage 6 minute revisions** — trigger: ≥30% saving on ≥20% of the relevant resource. Not triggered.
 
+### Latest-window reads (2026-10-02)
+
+Goal (owner, 10-02): reads of the latest data are fast under real prod load, with **no monoscope change**.
+`bin_auto` keeps emitting 10–30 s buckets for 1h, so the latest hour is always raw and must be cheap there.
+Targets on monoscope's emitted overview shapes (shipbubble, demo, whale; process ≥10 min old; ≥3 runs, arms
+alternated): ≤1h p50 <300 ms / p95 <1 s; 24h p50 <1 s / p95 <2 s; no statement over 5 s on these shapes.
+
+Baseline, shipbubble "Events by Service". On `fe58c7e2` under load: 1h 1.9–2.5 s and 24h 8–9 s, with 22–47 s
+stalls (3 of 27 runs). On `036b88db` at 25 min uptime: 1h 0.27–0.42 s and 24h 1.6–2.6 s. These are different
+builds and process ages, so they are not one baseline. pgwire p99 was 23.6 s and p999 90 s while scan p99 was
+~1 s.
+
+- [ ] **L0 `bench/latest_bench.py`.** Monoscope's overview SQL (templates from `pgwire.slow_statement`) at
+      15m/1h/6h/24h × 3 projects, run **sequentially** (see Rules: concurrent raw load OOMed prod). Output per
+      window: p50/p95, plus deltas of `heavy_query_queued`, `queue_timeout` and rollup hits/misses. Run it before
+      every deploy below and ≥10 min after.
+- [ ] **L1 Name the stall mechanism before building anything.** The widget plans contain **no `AdmissionExec`**
+      (checked 1h and 24h with plain EXPLAIN), so the heavy gate cannot be what queues them, and a short-query lane
+      would not touch them. The 09-29 yield A/B already ruled out maintenance concurrency. Candidates to
+      correlate against stall timestamps:
+      - the scan permit pool (`GatedScanExec`, 256 permits; 245 free at one sample);
+      - IO and CPU taken by the 90 s queries (L2);
+      - tokio scheduling lag (2.06 s max on `fe58c7e2`).
+      Instrument time-to-first-batch split into planning, routing, scan-permit wait and execution, so a stalled
+      statement names its own phase.
+- [ ] **L2 The four 90 s shapes.** In 25 min, 78 heavy-permit holds lasted 80–90 s: statement timeouts that
+      return nothing, while holding 5–9 of the K = 8 permits in a typical minute (1,596 of 2,641 admissions
+      queued). The shapes are 24h/7d overview widgets falling back to raw: latency percentile, error rate
+      (`count(*) filter`), the status-code breakdown (`sum(count(*)) over ()`) and apdex (`hashes @>`). Get each
+      shape's miss reason (`rollup_miss_sampled`, or a counter diff around single runs) and fix the routing or
+      the plan. Also bound a permit's hold by the remaining statement timeout, so a query that cannot finish
+      frees its slot early.
+- [ ] **L3 Hour cells for today's partition.** Today never consolidates: every project has ~20–30 files per
+      hour of today's data, including data 12 h old. Files span 5–15 min at 1–3 MB, and demo has 155 DV files of
+      368. Pending HotPacking reads 0. The cause is `packing_bounds` → `slice_bounds` (`database/mod.rs`): a hot
+      bin may not straddle any live slice's `covered_through`, and base slices are minted on the 10-minute grid.
+      Both row witnesses and the W31 content proof would refute every 10-minute slice a cross-cell pack
+      touches, so the bounds must coarsen, not be ignored.
+      Fix: after `hour_end + grace` (start at 15 min), mint a whole-hour BaseRollup unit `[H, H+1h)` that
+      supersedes its six 10-minute slices, replacing coverage and tier output in one commit. W56 is the
+      precedent: 1h tiers are built in whole hours and a republished hour retires the file it replaces.
+      `slice_bounds` then yields hour edges for closed hours, and HotPacking merges an hour into 1–2 files,
+      admitting its DV strips in the same rewrite. The current hour keeps 10-minute slices for freshness. Kill
+      switch `TIMEFUSION_HOUR_SLICES`.
+      Before code: a `slice_proof` case table (straddler, late file, DV file). Then `timefusion sim` on today's
+      journal and `run-unit` on one shipbubble hour.
+      Metrics: files per (project, hour) of today (add to `prod_report.py`; target ≤2 per closed hour), with
+      the rollup hit rate held flat after ≥2 h.
+- [ ] **L4 Certify today's closed hours** once packed and deduped, so reads skip `DedupExec` there. A live day
+      cannot be day-certified (Certification, below); this is the hour-scope version. Metric: read-side dedup
+      skipped % on today's windows (2.3% on 10-02).
+- Out of scope: a sub-minute tier for `bin_auto`'s 10–30 s buckets. Revisit only if ≤1h misses its target after
+  L1–L3, since uncontended raw execution of 1h is ~300 ms.
+- Measurement trap (10-02): **EXPLAIN ANALYZE does not take the rollup path.** It shows a raw scan for a sealed
+  day whose plain statement routes; 10 plain runs moved rollup hits +13/+16 against ~0.6 expected from
+  background traffic. Judge routing by counter diffs around plain runs.
+
 ### Stage 5 prerequisites: certification and dedup
 
 - [x] W33 skip dedup on certified-clean days; W37 per-project spans for the per-file skip (unproven:proved 23:1 → 2:1);
