@@ -38,6 +38,9 @@ enum RollupRebuildReason {
     /// The slice HAS a witness but the partition moved under it — verifiable,
     /// and simply lost the race with ingest or dedup.
     WitnessMoved,
+    /// Today's closed hour is covered by 10-minute base slices whose bounds fence
+    /// hot packing; republished as one hour unit (`timefusion_rollup_hour_units`).
+    SubHourSlices,
 }
 
 /// How a tier's contiguity may move the fleet gauge.
@@ -3614,6 +3617,14 @@ impl Database {
                     (_, files) => RollupOutputEvidence::from_file_count(files),
                 },
             };
+            // The commit retired every tier file CONTAINED in this slice; drop their coverage
+            // with them, or each one's `covered_through` stays a packing bound inside it.
+            self.rollup_slice_coverage.retain(|(project, source, table, start, end), _| {
+                (project, source, table) != (&key.project_id, &key.source, &key.physical_table)
+                    || (*start, *end) == (key.slice.start_micros, key.slice.end_micros)
+                    || *start < key.slice.start_micros
+                    || *end > key.slice.end_micros
+            });
             self.rollup_slice_coverage.insert(
                 (key.project_id.clone(), key.source.clone(), key.physical_table.clone(), key.slice.start_micros, key.slice.end_micros),
                 slice_coverage.clone(),
@@ -5506,7 +5517,7 @@ impl Database {
     /// rollups: it has no witness to protect. `None` until this process has
     /// recovered the source's coverage — before that the bounds are incomplete,
     /// and planner and packer both skip today rather than pack across them.
-    fn packing_bounds(&self, project_id: &str, source: &str, day_start: i64) -> Option<Vec<i64>> {
+    pub(crate) fn packing_bounds(&self, project_id: &str, source: &str, day_start: i64) -> Option<Vec<i64>> {
         if get_schema(source).is_none_or(|schema| schema.rollups.is_empty()) {
             return Some(Vec::new());
         }
@@ -5726,6 +5737,25 @@ impl Database {
             "unverifiable slices queued for republish, newest first"
         );
         queued
+    }
+
+    /// Today's closed hours still covered by sub-hour slices of `target`, as whole-hour
+    /// slices. Empty when `timefusion_rollup_hour_units` is off.
+    fn sub_hour_slices_today(&self, source: &str, target: &str) -> Vec<(String, crate::maintenance_coordinator::TimeSlice)> {
+        use crate::maintenance_coordinator::{DERIVED_SLICE_MICROS as HOUR, FINALIZATION_DELAY_MICROS, TimeSlice};
+        if !self.config.maintenance.timefusion_rollup_hour_units {
+            return Vec::new();
+        }
+        let now = crate::support::now_micros();
+        let today = now.div_euclid(DAY_MICROS) * DAY_MICROS;
+        self.rollup_slice_coverage
+            .iter()
+            .filter(|entry| entry.key().1 == source && entry.key().2 == target && entry.key().3 >= today && entry.key().4 - entry.key().3 < HOUR)
+            .map(|entry| (entry.key().0.clone(), entry.key().3.div_euclid(HOUR) * HOUR))
+            .filter(|(_, hour)| hour + HOUR + FINALIZATION_DELAY_MICROS <= now)
+            .unique()
+            .map(|(project, hour)| (project, TimeSlice { start_micros: hour, end_micros: hour + HOUR }))
+            .collect()
     }
 
     /// How many DATE-level coverage entries exist.
@@ -6257,6 +6287,9 @@ impl Database {
             self.enqueue_unverifiable_rebuilds(source, spec, &target, RollupRebuildReason::MissingRowWitness, &witnessless);
             self.enqueue_unverifiable_rebuilds(source, spec, &target, RollupRebuildReason::ObsoleteGeneration, &obsolete_generations);
             self.enqueue_unverifiable_rebuilds(source, spec, &target, RollupRebuildReason::UnprovenOutput, &incomplete_output);
+            if spec.derive_from.is_none() {
+                self.enqueue_unverifiable_rebuilds(source, spec, &target, RollupRebuildReason::SubHourSlices, &self.sub_hour_slices_today(source, &target));
+            }
             self.recover_date_coverage(source, &target).await?;
             // Untagged legacy generations are left uncovered: recovering them needs a
             // rollup data scan, which starves pgwire at startup. Reads fall back to

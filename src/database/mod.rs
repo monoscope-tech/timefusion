@@ -3170,6 +3170,7 @@ impl Database {
         let rollup_source_epochs = Arc::new(dashmap::DashMap::new());
         let rollup_invalidated_at = Arc::new(dashmap::DashMap::new());
         let mut maintenance_tasks = crate::maintenance_coordinator::TaskJournal::load(&cfg.core.timefusion_data_dir)?;
+        maintenance_tasks.base_hour_units = cfg.maintenance.timefusion_rollup_hour_units;
         let requeued_tasks = maintenance_tasks.requeue_running(crate::support::now_micros());
         if requeued_tasks != 0 {
             maintenance_tasks.checkpoint()?;

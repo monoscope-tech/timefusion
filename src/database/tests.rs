@@ -2336,6 +2336,49 @@ async fn a_sub_grain_tier_routes_only_over_whole_grain_slices() -> Result<()> {
     Ok(())
 }
 
+/// A base slice published over finer ones drops their coverage with their files, so a
+/// day's hot packing is fenced at the hour edge instead of every 10-minute cell inside it
+/// (10-02: today's partition held 20-30 files per hour of data all day).
+#[tokio::test(flavor = "multi_thread")]
+async fn an_hour_base_slice_lifts_the_ten_minute_packing_bounds_inside_it() -> Result<()> {
+    use crate::maintenance_coordinator::{DERIVED_SLICE_MICROS as HOUR, MaintenanceTask, NORMAL_SLICE_MICROS, Operation, TaskKey, TaskState, TimeSlice};
+    const SOURCE: &str = "otel_logs_and_spans";
+    let db = Arc::new(Database::with_config(rollup_backfill_config("hour-bounds", 35)).await?);
+    db.cancel_maintenance();
+    db.rollup_coverage_recovered.insert(SOURCE.to_owned());
+    let project = format!("hourb_{}", uuid::Uuid::new_v4().simple());
+    let day_start = midnight_micros((Utc::now() - chrono::Duration::days(3)).date_naive());
+    let noon = day_start + 12 * HOUR;
+    for (i, minute) in [5, 25, 45].into_iter().enumerate() {
+        let span = test_span_ts(&format!("s{i}"), "GET /", &project, noon + minute * 60_000_000);
+        db.insert_records_batch(&project, SOURCE, vec![json_to_batch(vec![span])?], true, None).await?;
+    }
+    let base =
+        get_schema(SOURCE).expect("schema").rollups.iter().find(|spec| spec.name.as_deref() == Some("dashboard_1m_v4")).expect("tier").table_name(SOURCE);
+    let publish = async |start: i64, width: i64| -> Result<()> {
+        let key = TaskKey {
+            physical_table: base.clone(),
+            source: SOURCE.into(),
+            project_id: project.clone(),
+            slice: TimeSlice::new(start, start + width)?,
+            operation: Operation::BaseRollup,
+        };
+        db.journal().upsert(MaintenanceTask::pending(key.clone(), 0, 0, 0));
+        assert!(db.run_coordinator_rollup_selected(crate::database::maintain::TaskSelection::Exact(&key)).await?);
+        assert_eq!(db.journal().state(&key), Some(TaskState::Complete), "{:?} published", key.slice);
+        Ok(())
+    };
+    let inside =
+        || db.packing_bounds(&project, SOURCE, day_start).expect("recovered").into_iter().filter(|bound| (noon + 1..noon + HOUR).contains(bound)).count();
+    for start in (noon..noon + HOUR).step_by(NORMAL_SLICE_MICROS as usize) {
+        publish(start, NORMAL_SLICE_MICROS).await?;
+    }
+    assert_eq!(inside(), 5, "six 10-minute slices fence five bounds inside the hour");
+    publish(noon, HOUR).await?;
+    assert_eq!(inside(), 0, "the hour slice retired the cells inside it, and their bounds with them");
+    Ok(())
+}
+
 /// A fresh process must route from the durable coverage ledger at boot: until
 /// `recover_rollup_coverage` replays every tier's Delta log, routing is not attempted
 /// at all, and that replay window is a large share of a short-lived process's uptime.
@@ -4271,7 +4314,13 @@ async fn reconcile_enqueues_only_the_hours_a_missed_commit_touched() -> Result<(
     let journal = db.maintenance_tasks.lock().unwrap();
     let tasks = journal.tasks().filter(|task| task.key.project_id == project).collect::<Vec<_>>();
     let (base, hourly, derived) = declared_rollup_tiers();
-    assert_eq!(tasks.len(), 6 + 6 * base + hourly + derived, "one touched hour: 6 dedup + 6 per minute tier + 1 per hour tier, not 312 for the whole day");
+    // A minute tier mints its whole hour on today (`base_hour_units`), its 10-minute cells before.
+    let per_minute_tier = if day == crate::support::today_utc() { 1 } else { 6 };
+    assert_eq!(
+        tasks.len(),
+        6 + per_minute_tier * base + hourly + derived,
+        "one touched hour: 6 dedup + per minute tier + 1 per hour tier, not 312 for the whole day"
+    );
     assert!(
         tasks.iter().all(|task| task.key.slice.start_micros >= hour_start && task.key.slice.end_micros <= hour_start + 3_600_000_000),
         "every reconciled task must lie inside the touched hour; day {day} starts {day_start}"
