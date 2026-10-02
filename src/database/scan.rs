@@ -387,7 +387,16 @@ impl ProjectRoutingTable {
         query_time_range: Option<(i64, i64)>, bloom_rejected: Option<&HashSet<String>>, date_restrict: Option<&HashSet<String>>,
         file_restrict: Option<&HashSet<String>>,
     ) -> DFResult<Vec<Arc<dyn ExecutionPlan>>> {
-        let narrow = |filters: &[Expr]| filters.iter().cloned().chain(id_filter.cloned()).collect::<Vec<_>>();
+        // Row ordinals already restrict decoding to the hits, so when they cover every file the
+        // leg reads, the id list is pure planning cost: delta-kernel replays it as an N-way OR
+        // against each file's stats. Without full ordinal coverage the list still narrows.
+        let narrow = |filters: &[Expr], files: Option<&HashSet<String>>| {
+            let ordinals_cover = files.zip(row_selections).is_some_and(|(files, sel)| {
+                let mut read = files.iter().filter(|u| !zero_hit_files.is_some_and(|z| z.contains(*u))).peekable();
+                read.peek().is_some() && read.all(|u| sel.contains_key(u))
+            });
+            filters.iter().cloned().chain(id_filter.filter(|_| !ordinals_cover).cloned()).collect::<Vec<_>>()
+        };
         // Per-date dedup skip: restrict this call's file universe to one side of
         // the certified/uncertified split, so two calls partition the in-window
         // files exactly once. An unattributable URI fails the test and lands on
@@ -415,7 +424,7 @@ impl ProjectRoutingTable {
         };
         let (lo, hi) = query_time_range.unwrap_or((i64::MIN, i64::MAX));
         let Some(covered) = covered_files else {
-            let narrowed = narrow(filters);
+            let narrowed = narrow(filters, None);
             let merged = merged_exclude(table);
             let exclude = merged.as_ref().or(zero_hit_files);
             // Under a split an exclude is not enough — an include is what bounds
@@ -475,7 +484,7 @@ impl ProjectRoutingTable {
         // needed when the snapshot has raw debt. Never under a date or file split: the
         // fast path reads every live file, so both sides would read everything.
         if raw.is_empty() && !indexed.is_empty() && !bloom_pruned_any && date_restrict.is_none() && file_restrict.is_none() {
-            let narrowed = narrow(filters);
+            let narrowed = narrow(filters, Some(&indexed));
             metrics::counter!(scan_metric_names::TANTIVY_FASTPATH).increment(1);
             let plan = self.scan_delta_table(table, state, projection, &narrowed, limit, None, zero_hit_files, row_selections).await?;
             metrics::counter!(scan_metric_names::TANTIVY_SCAN_US).increment(scan_started.elapsed().as_micros() as u64);
@@ -487,7 +496,7 @@ impl ProjectRoutingTable {
 
         let mut plans = Vec::with_capacity(2);
         if !indexed.is_empty() {
-            let narrowed = narrow(filters);
+            let narrowed = narrow(filters, Some(&indexed));
             plans.push(self.scan_delta_table(table, state, projection, &narrowed, limit, Some(&indexed), None, row_selections).await?);
         }
         if !raw.is_empty() {

@@ -38,6 +38,9 @@ fn cfg(test_id: &str) -> Arc<AppConfig> {
         timefusion_tantivy_compression_level: 3,
         timefusion_tantivy_route_equality: true,
         timefusion_tantivy_prefilter_min_selectivity_pct: 50,
+        timefusion_tantivy_prefilter_max_hits: 2_000,
+        timefusion_tantivy_file_pruning: true,
+        timefusion_tantivy_row_selection: true,
         // As in prod: a cold cache skips the prefilter, so unseeded tests would never exercise it.
         timefusion_tantivy_seed_cache_on_publish: true,
         ..Default::default()
@@ -768,4 +771,59 @@ async fn startup_backfills_existing_hashes_without_an_opt_in() -> Result<()> {
     assert_eq!(search.stats.histogram_snapshots.load(std::sync::atomic::Ordering::Relaxed), 1, "backfilled hashes must reach native SQL counting");
     db.shutdown().await?;
     Ok(())
+}
+
+/// Rows the Delta leg's parquet reader decoded, from `EXPLAIN ANALYZE`.
+async fn decoded_rows(ctx: &SessionContext, sql: &str) -> Result<usize> {
+    let txt = ctx
+        .sql(&format!("EXPLAIN ANALYZE {sql}"))
+        .await?
+        .collect()
+        .await?
+        .iter()
+        .map(|b| arrow::util::pretty::pretty_format_batches(std::slice::from_ref(b)).unwrap().to_string())
+        .collect::<String>();
+    Ok(txt
+        .lines()
+        .filter(|l| l.contains("DataSourceExec: file_groups"))
+        .filter_map(|l| {
+            let v = l.split("output_rows=").nth(1)?.split([',', ']']).next()?.trim();
+            let (n, scale) = v.strip_suffix(" K").map_or((v, 1.0), |n| (n, 1e3));
+            Some(n.parse::<f64>().ok()? * scale)
+        })
+        .sum::<f64>()
+        .round() as usize)
+}
+
+/// When row selections cover every indexed file they already restrict decoding to the hits, so
+/// the `id IN (...)` list must not reach the Delta provider: delta-kernel evaluates it as an
+/// N-way OR against every file's stats during log replay, which planned a 1,000-hit
+/// `status_code = 'ERROR'` dashboard query in 9s on prod. Needles must still decode only their row.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn row_selections_replace_the_id_list_in_the_delta_scan() -> Result<()> {
+    let group = |f: usize| {
+        (0..1000)
+            .map(move |i| (format!("f{f}-r{i}"), "n".to_string(), if i % 20 == 0 { "op failed".to_string() } else { "ordinary".to_string() }))
+            .collect::<Vec<_>>()
+    };
+    let pair = Pair::new("rowsel", Land::Flushed, &group(0)).await?;
+    for f in 1..20 {
+        pair.write(Land::Flushed, &group(f)).await?;
+    }
+    pair.wait_manifest(20).await?;
+    let warm = pair.on.tantivy_search().unwrap().search_detailed(TABLE, &pair.p, &leaf("level", "ERROR"), 2_000, None, true).await?;
+    assert!(warm.is_ok_and(|r| r.row_selections.len() == 20), "every flushed file must carry row ordinals");
+
+    for (predicate, hits) in [("level = 'ERROR'", 1000), ("id = 'f3-r5'", 1)] {
+        let sql = pair.id_sql(predicate);
+        assert_eq!(collect_ids(&pair.ctx, &sql).await?, pair.baseline_ids(predicate).await?, "routed result must equal the baseline [{predicate}]");
+        assert_eq!(decoded_rows(&pair.ctx, &sql).await?, hits, "row selections must restrict decoding to the hits [{predicate}]");
+        assert!(!plan_text(&pair.ctx, &sql).await?.contains("IN (SET)"), "covered files must not carry the id list into the scan [{predicate}]");
+    }
+    Ok(())
+}
+
+async fn plan_text(ctx: &SessionContext, sql: &str) -> Result<String> {
+    Ok(datafusion::physical_plan::displayable(ctx.sql(sql).await?.create_physical_plan().await?.as_ref()).indent(false).to_string())
 }
