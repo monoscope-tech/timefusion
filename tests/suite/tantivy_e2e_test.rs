@@ -12,6 +12,7 @@ use arrow::array::{Array, RecordBatch};
 use datafusion::{arrow::array::AsArray, execution::context::SessionContext};
 use serde_json::json;
 use serial_test::serial;
+use test_case::test_case;
 use timefusion::{
     config::{AppConfig, TantivyConfig},
     database::Database,
@@ -23,7 +24,7 @@ use timefusion::{
     write::DeltaWriteCallback,
 };
 
-fn cfg(test_id: &str) -> Arc<AppConfig> {
+fn cfg(test_id: &str) -> AppConfig {
     let mut c = AppConfig::default();
     c.aws.aws_s3_bucket = Some("timefusion-tests".to_string());
     c.aws.aws_access_key_id = Some("minioadmin".into());
@@ -45,7 +46,7 @@ fn cfg(test_id: &str) -> Arc<AppConfig> {
         timefusion_tantivy_seed_cache_on_publish: true,
         ..Default::default()
     };
-    Arc::new(c)
+    c
 }
 
 /// The on-disk cache root `cfg` gives a test id; a hand-built
@@ -57,7 +58,15 @@ fn data_dir(test_id: &str) -> PathBuf {
 /// Build a DB with the full BufferedWriteLayer + Tantivy callback wired up,
 /// returning an immediately-flushing layer (interval=1s).
 async fn build_db(test_id: &str, tantivy_enabled: bool) -> Result<(Database, SessionContext, Option<Arc<TantivyIndexService>>)> {
-    let cfg_arc = cfg(test_id);
+    build_db_with(test_id, tantivy_enabled, |_| {}).await
+}
+
+async fn build_db_with(
+    test_id: &str, tantivy_enabled: bool, tweak: impl FnOnce(&mut AppConfig),
+) -> Result<(Database, SessionContext, Option<Arc<TantivyIndexService>>)> {
+    let mut cfg_arc = cfg(test_id);
+    tweak(&mut cfg_arc);
+    let cfg_arc = Arc::new(cfg_arc);
     let mut db = Database::with_config(cfg_arc.clone()).await?;
 
     let db_for_cb = db.clone();
@@ -204,9 +213,14 @@ struct Pair {
 
 impl Pair {
     async fn new<S: AsRef<str>>(tag: &str, land: Land, rows: &[(S, S, S)]) -> Result<Self> {
+        Self::with(tag, land, rows, |_| {}).await
+    }
+
+    /// `tweak` applies to the tantivy-enabled side only; the baseline needs none.
+    async fn with<S: AsRef<str>>(tag: &str, land: Land, rows: &[(S, S, S)], tweak: impl FnOnce(&mut AppConfig)) -> Result<Self> {
         let id = uuid::Uuid::new_v4().to_string()[..8].to_string();
         let on_id = format!("{id}-{tag}-on");
-        let (on, ctx, svc) = build_db(&on_id, true).await?;
+        let (on, ctx, svc) = build_db_with(&on_id, true, tweak).await?;
         let (off, ctx_off, _) = build_db(&format!("{id}-{tag}-off"), false).await?;
         let pair = Self { on, off, ctx, ctx_off, svc: svc.expect("tantivy enabled"), cache_root: data_dir(&on_id), p: unique_project() };
         pair.write(land, rows).await?;
@@ -795,32 +809,52 @@ async fn decoded_rows(ctx: &SessionContext, sql: &str) -> Result<usize> {
         .round() as usize)
 }
 
-/// When row selections cover every indexed file they already restrict decoding to the hits, so
-/// the `id IN (...)` list must not reach the Delta provider: delta-kernel evaluates it as an
-/// N-way OR against every file's stats during log replay, which planned a 1,000-hit
-/// `status_code = 'ERROR'` dashboard query in 9s on prod. Needles must still decode only their row.
+/// Min-of-5 physical planning time.
+async fn plan_time(ctx: &SessionContext, sql: &str) -> Result<std::time::Duration> {
+    let mut best = std::time::Duration::MAX;
+    for _ in 0..5 {
+        let t = std::time::Instant::now();
+        ctx.sql(sql).await?.create_physical_plan().await?;
+        best = best.min(t.elapsed());
+    }
+    Ok(best)
+}
+
+/// A 1,000-hit prefilter must cost decoded rows, not planning: delta-kernel used to replay the
+/// `id IN (...)` list as an N-way OR against every file's stats, planning a prod
+/// `status_code = 'ERROR'` dashboard query in 9s. Row ordinals, when they cover every file,
+/// replace the list; without them the list must still reach parquet, so decoding stays at the hits.
+#[test_case(true ; "row ordinals replace the id list")]
+#[test_case(false ; "without ordinals the id list narrows parquet only")]
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
-async fn row_selections_replace_the_id_list_in_the_delta_scan() -> Result<()> {
-    let group = |f: usize| {
-        (0..1000)
+async fn tantivy_id_list_costs_rows_not_planning(row_selection: bool) -> Result<()> {
+    const FILES: usize = 50;
+    let per = 20_000 / FILES;
+    let group = move |f: usize| {
+        (0..per)
             .map(move |i| (format!("f{f}-r{i}"), "n".to_string(), if i % 20 == 0 { "op failed".to_string() } else { "ordinary".to_string() }))
             .collect::<Vec<_>>()
     };
-    let pair = Pair::new("rowsel", Land::Flushed, &group(0)).await?;
-    for f in 1..20 {
+    let pair = Pair::with("idlist", Land::Flushed, &group(0), |c| c.tantivy.timefusion_tantivy_row_selection = row_selection).await?;
+    for f in 1..FILES {
         pair.write(Land::Flushed, &group(f)).await?;
     }
-    pair.wait_manifest(20).await?;
+    pair.wait_manifest(FILES).await?;
     let warm = pair.on.tantivy_search().unwrap().search_detailed(TABLE, &pair.p, &leaf("level", "ERROR"), 2_000, None, true).await?;
-    assert!(warm.is_ok_and(|r| r.row_selections.len() == 20), "every flushed file must carry row ordinals");
+    assert!(warm.is_ok_and(|r| r.hits.len() == 1000), "the prefilter must answer from a warm index");
 
     for (predicate, hits) in [("level = 'ERROR'", 1000), ("id = 'f3-r5'", 1)] {
         let sql = pair.id_sql(predicate);
         assert_eq!(collect_ids(&pair.ctx, &sql).await?, pair.baseline_ids(predicate).await?, "routed result must equal the baseline [{predicate}]");
-        assert_eq!(decoded_rows(&pair.ctx, &sql).await?, hits, "row selections must restrict decoding to the hits [{predicate}]");
-        assert!(!plan_text(&pair.ctx, &sql).await?.contains("IN (SET)"), "covered files must not carry the id list into the scan [{predicate}]");
+        assert_eq!(decoded_rows(&pair.ctx, &sql).await?, hits, "decoding must stay at the hits [{predicate}]");
+        assert_eq!(plan_text(&pair.ctx, &sql).await?.contains("IN (SET)"), !row_selection, "the id list reaches the scan only without ordinals [{predicate}]");
     }
+    let routed = plan_time(&pair.ctx, &pair.id_sql("level = 'ERROR'")).await?;
+    let bypass = plan_time(&pair.ctx, &pair.id_sql("level || '' = 'ERROR'")).await?;
+    // Debug build, 50 files: ~20x the unrouted plan before the fix, ~7x after (the rest is the
+    // tantivy search itself). A timing bound, so it is a cost guard with margin, not a proof.
+    assert!(routed < bypass * 12, "a 1,000-id prefilter must not dominate planning: routed {routed:?} vs unrouted {bypass:?}");
     Ok(())
 }
 

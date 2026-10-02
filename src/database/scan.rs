@@ -257,7 +257,12 @@ impl ProjectRoutingTable {
             .flatten()
             .filter_map(|(uri, ords)| Some((crate::tantivy::search::parquet_rel_of_uri(uri)?.to_string(), ords.clone())))
             .collect();
-        if file_selection.is_some() || !ordinal_selections.is_empty() {
+        // The tantivy id list narrows rows, never files: the files are already chosen, and random
+        // ids span every file's min/max. Kept out of delta-kernel's skipping predicate, where log
+        // replay evaluates it as an N-way OR against every file's stats; parquet still gets it.
+        let is_id_list = |f: &&Expr| matches!(f, Expr::InList(l) if !l.negated && matches!(&*l.expr, Expr::Column(c) if c.name == "id"));
+        let has_id_list = filters.iter().any(|f| is_id_list(&f));
+        if file_selection.is_some() || !ordinal_selections.is_empty() || has_id_list {
             use deltalake::delta_datafusion::{FileSelection, MissingSelectedFilePolicy};
             if let Some(sel) = &file_selection {
                 metrics::counter!(scan_metric_names::PRUNED_FILES).increment(sel.len() as u64);
@@ -287,7 +292,11 @@ impl ProjectRoutingTable {
             }
             metrics::counter!(scan_metric_names::PRUNED_SELECT_US).increment(select_started.elapsed().as_micros() as u64);
             let build_started = std::time::Instant::now();
-            let provider: Arc<dyn TableProvider> = Arc::new(builder.build().await.map_err(|e| DataFusionError::External(Box::new(e)))?);
+            let mut scan = builder.build().await.map_err(|e| DataFusionError::External(Box::new(e)))?;
+            if has_id_list {
+                scan = scan.with_file_skipping_predicate(filters.iter().filter(|f| !is_id_list(f)).cloned());
+            }
+            let provider: Arc<dyn TableProvider> = Arc::new(scan);
             metrics::counter!(scan_metric_names::PRUNED_BUILD_US).increment(build_started.elapsed().as_micros() as u64);
             let scan_started = std::time::Instant::now();
             let plan = self.scan_via_provider(provider, state, projection, filters, limit).await;
