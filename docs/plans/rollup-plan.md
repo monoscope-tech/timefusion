@@ -289,8 +289,14 @@ builds and process ages, so they are not one baseline. pgwire p99 was 23.6 s and
       shipped and fixed on the way: adding `RollupSpec.unnest` changed every spec's Debug, hence every tier's
       generation (`ad71f20b`) — prod began rebuilding history (pending base 53 → 999); fixed `1ec5ff0d` with a
       legacy-shape oracle test. First prod check: shipbubble 10-02 built; routed per-hash counts identical to raw
-      (25/25 buckets, `pat:6a072bab` and `e64bd2e9`). Pending: 7–14 d endpoint widget latency once the 14-day
-      backfill completes. In 25 min, 78 heavy-permit holds lasted 80–90 s: statement timeouts that
+      (25/25 buckets, `pat:6a072bab` and `e64bd2e9`). Backfill of 15 days done by ~09:00. Two more fixes:
+      `4c970900` — a hybrid's raw leg rendered the tier's `hash = x` against the source ("Valid fields are…",
+      UnsupportedShape), so every hash query ran raw; raw legs now keep `array_has(hashes, x)`. After it, shipbubble
+      7 d endpoint widgets ROUTE (hybrid hits +1/run, 0 misses): requests/p95/error rate/status breakdown 0.8–2.4 s
+      (was 58 s → 90 s timeout), 7 d routed counts identical to raw for both hashes. `636e9fac` — apdex
+      (`sum(CASE … 1.0 … 0.5 … 0)`) still timed out at 90 s: it now folds two cumulative count measures
+      (`Merge::Apdex`, exact shape only). Pending: apdex check after the measure remint; traces list is raw but
+      0.6–1.7 s. In 25 min, 78 heavy-permit holds lasted 80–90 s: statement timeouts that
       return nothing, while holding 5–9 of the K = 8 permits in a typical minute (1,596 of 2,641 admissions
       queued). The shapes are 24h/7d overview widgets falling back to raw: latency percentile, error rate
       (`count(*) filter`), the status-code breakdown (`sum(count(*)) over ()`) and apdex (`hashes @>`). Get each
