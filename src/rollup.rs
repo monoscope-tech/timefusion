@@ -769,6 +769,9 @@ pub(crate) struct RoutedRollup {
     /// selected: it only powers the `HAVING` that reproduces group elimination.
     guard: Option<RoutedMeasure>,
     row_filters: Vec<String>,
+    /// `row_filters` as the RAW source spells them: an unnest tier's `dim = x` is
+    /// `array_has(column, x)` there, since the element dimension is no source column.
+    raw_row_filters: Vec<String>,
     /// `(expression, output alias)`. Every expression is valid, and means the
     /// same thing, on BOTH tables — which is what lets the union share them.
     groups: Vec<(String, String)>,
@@ -1145,7 +1148,8 @@ impl RoutedRollup {
             }))
             .join(", ");
         let ranges = ranges.iter().map(Self::range_sql).join(" OR ");
-        let row_filters = self.row_filters.iter().map(|filter| format!(" AND ({filter})")).collect::<String>();
+        let filters = if table == self.target { &self.row_filters } else { &self.raw_row_filters };
+        let row_filters = filters.iter().map(|filter| format!(" AND ({filter})")).collect::<String>();
         let group_by = self.group_by();
         format!("SELECT {select} FROM {table} WHERE {projects}({ranges}){extra}{row_filters}{group_by}")
     }
@@ -1361,15 +1365,17 @@ fn timestamp_literal(expr: &datafusion::logical_expr::Expr) -> Option<i64> {
     }
 }
 
-fn dimension_filter_sql(expr: &datafusion::logical_expr::Expr, spec: &RollupSpec) -> Option<String> {
+/// A pushable filter as `(tier SQL, raw-source SQL)`; they differ only for an unnest tier.
+fn dimension_filter_sql(expr: &datafusion::logical_expr::Expr, spec: &RollupSpec) -> Option<(String, String)> {
     // Membership of the unnested column is equality on the element dimension.
     if let Some(unnest) = &spec.unnest
         && let Some(crate::tantivy::histogram::Membership::Contains { column, value }) = crate::tantivy::planner::membership(expr)
         && column == unnest.column
     {
-        return Some(format!("{} = {}", unnest.dimension, sql_literal(&value)));
+        let value = sql_literal(&value);
+        return Some((format!("{} = {value}", unnest.dimension), format!("array_has({}, {value})", quoted(&unnest.column))));
     }
-    dimension_filter_sql_over(expr, &spec.dimensions)
+    dimension_filter_sql_over(expr, &spec.dimensions).map(|sql| (sql.clone(), sql))
 }
 
 fn dimension_filter_sql_over(expr: &datafusion::logical_expr::Expr, dimensions: &[String]) -> Option<String> {
@@ -1952,6 +1958,7 @@ async fn route_with_spec(
     let mut project_id = None;
     let (mut lo, mut hi) = (None, None);
     let mut row_filters = Vec::new();
+    let mut raw_row_filters = Vec::new();
     let mut promotable: Vec<&Expr> = Vec::new();
     // `col IS NOT NULL`, held apart from `promotable` and resolved as the guard.
     let mut null_guards: Vec<&str> = Vec::new();
@@ -1982,7 +1989,10 @@ async fn route_with_spec(
             // Two different literals cannot both hold; never keep the last.
             (Some(value), _) if project_id.as_deref().is_some_and(|current| current != value) => return Err(MissReason::MissingProject),
             (Some(value), _) => project_id = Some(value.to_string()),
-            (None, Some(filter)) => row_filters.push(filter),
+            (None, Some((filter, raw))) => {
+                row_filters.push(filter);
+                raw_row_filters.push(raw);
+            }
             // `col IS NOT NULL` over a non-dimension is expressed exactly by a
             // `count(col)` measure, so it becomes the guard.
             (None, None) => match unaliased(term) {
@@ -2229,6 +2239,7 @@ async fn route_with_spec(
         matched: datafusion::logical_expr::LogicalPlan::Aggregate(aggregate.clone()),
         guard,
         row_filters,
+        raw_row_filters,
         groups,
         measures,
     })
@@ -3119,6 +3130,29 @@ mod tests {
                 assert_eq!(generation_render(&spec), format!("{legacy:?}"), "{source}/{:?}", spec.name);
             }
         }
+    }
+
+    /// A hybrid rewrite's raw leg reads the SOURCE, which has no element dimension: it must
+    /// keep the membership predicate while the tier leg reads `hash = x` (10-03: the raw leg
+    /// said `hash = x`, every rewrite failed to plan and the widgets ran raw).
+    #[tokio::test]
+    async fn an_unnest_hybrid_keeps_the_membership_on_its_raw_leg() {
+        let state = session().await;
+        let sql = format!(
+            "SELECT time_bucket('1 hours', timestamp) AS tb, COUNT(*) FROM {SOURCE} WHERE project_id = 'project' \
+             AND timestamp >= to_timestamp_micros(0) AND timestamp < to_timestamp_micros(10800000000) AND array_has(hashes, 'x') GROUP BY 1"
+        );
+        let plan = optimized(&state, &sql).await;
+        let datafusion::logical_expr::LogicalPlan::Aggregate(aggregate) = outermost_aggregates(&plan)[0] else { panic!("an aggregate") };
+        let mut predicates = Vec::new();
+        let source = source_and_filters(&aggregate.input, &mut predicates).expect("walkable");
+        let route = route_with_spec(&hashes_spec(), &source, SOURCE, &predicates, aggregate, &state).await.expect("routes");
+        let interior = (0, 3_600_000_000);
+        let rewrite = route.sql(&[generation_range("project", "generation", interior)], &[interior], &ProjectSplit::default());
+        let (tier, raw): (Vec<&str>, Vec<&str>) = rewrite.split("UNION ALL").partition(|leg| leg.contains(&route.target));
+        assert!(!tier.is_empty() && !raw.is_empty(), "a hybrid with both legs: {rewrite}");
+        assert!(tier.iter().all(|leg| leg.contains("hash = 'x'")), "{rewrite}");
+        assert!(raw.iter().all(|leg| leg.contains("array_has(\"hashes\", 'x')") && !leg.contains("hash = ")), "{rewrite}");
     }
 
     /// For tests whose only interest is HOW a shape declines.
