@@ -237,7 +237,7 @@ builds and process ages, so they are not one baseline. pgwire p99 was 23.6 s and
       - tokio scheduling lag (2.06 s max on `fe58c7e2`).
       Instrument time-to-first-batch split into planning, routing, scan-permit wait and execution, so a stalled
       statement names its own phase.
-- [~] **L2 The four 90 s shapes — all `hashes`-filtered shipbubble widgets** (tier live, backfilling) (10-02 20:45 log: 78 of 81 timeouts):
+- [x] **L2 The four 90 s shapes — all `hashes`-filtered shipbubble widgets** (`hashes_30m`, 10-03) (10-02 20:45 log: 78 of 81 timeouts):
       latency percentile, error rate, apdex (`hashes @>`) and status breakdown, on 7–14 d windows. Apdex over 7 d:
       14.6–58 s with the tantivy prefilter, 30 s without (1.15 M matching rows of ~18 M); 14 d times out at 90 s.
       No routing fix exists: the tiers have no hash dimension. Next: a per-hash hourly tier (unnest `hashes` as a
@@ -295,8 +295,11 @@ builds and process ages, so they are not one baseline. pgwire p99 was 23.6 s and
       7 d endpoint widgets ROUTE (hybrid hits +1/run, 0 misses): requests/p95/error rate/status breakdown 0.8–2.4 s
       (was 58 s → 90 s timeout), 7 d routed counts identical to raw for both hashes. `636e9fac` — apdex
       (`sum(CASE … 1.0 … 0.5 … 0)`) still timed out at 90 s: it now folds two cumulative count measures
-      (`Merge::Apdex`, exact shape only). Pending: apdex check after the measure remint; traces list is raw but
-      0.6–1.7 s. In 25 min, 78 heavy-permit holds lasted 80–90 s: statement timeouts that
+      (`Merge::Apdex`, exact shape only). Verified ~12:00: 7 d apdex routes (hybrid +1/run), `e64bd2e9` 0.9988
+      routed = 0.9988 raw in 2.0 s; `pat:6a072bab` 0.9468 in 1.7 s warm (raw still times out at 90 s). Every
+      endpoint widget that timed out now answers in ~1–2 s; the traces list stays raw at 0.6–1.7 s.
+      Follow-ups (not blocking): the overview's 24h apdex/top_resources/http_by_status on the dashboard tiers
+      (apdex needs the two bands under the HTTP scope; the others need name / status dimensions). In 25 min, 78 heavy-permit holds lasted 80–90 s: statement timeouts that
       return nothing, while holding 5–9 of the K = 8 permits in a typical minute (1,596 of 2,641 admissions
       queued). The shapes are 24h/7d overview widgets falling back to raw: latency percentile, error rate
       (`count(*) filter`), the status-code breakdown (`sum(count(*)) over ()`) and apdex (`hashes @>`). Get each
