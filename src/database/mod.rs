@@ -2651,7 +2651,8 @@ pub struct Database {
     /// batch on EVERY route call that met a stale-looking slice; after a restart
     /// that is every call until recovery catches up, and the planning drag keeps
     /// queries in flight longer, which is pool pressure by another name.
-    rollup_file_rows_cache: dashmap::DashMap<String, (u64, std::sync::Arc<crate::database::maintain::PartitionFileRows>)>,
+    /// Per `(source, tier)`: a version-only file is skipped by some tiers and counted by others.
+    rollup_file_rows_cache: dashmap::DashMap<(String, String), (u64, std::sync::Arc<crate::database::maintain::PartitionFileRows>)>,
     pub(crate) version_only: Arc<crate::database::maintain::VersionOnlyLedger>,
     /// Untagged live files per tier TABLE (tiers publish independently, so one shared slot would
     /// read clean while another tier still held damage). The exported gauge is the SUM over tiers.

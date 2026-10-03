@@ -1006,7 +1006,7 @@ async fn a_built_rollup_routes_and_stops_routing_once_its_source_grows() -> Resu
     let source = db.resolve_table(&project, "otel_logs_and_spans").await?;
     let partition_rows = async || -> Result<Option<u64>> {
         let table = source.read().await;
-        Ok(Database::partition_stats_bounded(&table, "otel_logs_and_spans", &|_, _| i64::MAX)?
+        Ok(Database::partition_stats_bounded(&table, "otel_logs_and_spans", None, &|_, _| i64::MAX)?
             .remove(&(project.clone(), day.to_string()))
             .and_then(|stats| u64::try_from(stats.rows).ok()))
     };
@@ -2405,6 +2405,29 @@ async fn a_flush_never_stages_a_file_across_an_hour() -> Result<()> {
         .collect();
     assert_eq!(spans, [(edge - 5_000_000, edge - 1_000), (edge, edge + 4_000_000)], "one file per hour, none across the edge");
     Ok(())
+}
+
+/// Version-only is decided PER TIER: a version file assigning a column one tier reads moves
+/// that tier's witness and no other's. `resource___deployment___environment___name` is a
+/// sessions-tier dimension the dashboard tiers never read; nothing reads `hashes` yet, so its versions
+/// stay invisible to every tier (the `9e21fc3d` behaviour today's slices depend on).
+#[test_case::test_case("resource___deployment___environment___name", Some("otel_logs_and_spans_rollup_dashboard_1m_v4") => true ; "a column the dashboard tier ignores")]
+#[test_case::test_case("resource___deployment___environment___name", Some("otel_logs_and_spans_rollup_sessions_1h_v2") => false ; "the tier reading it counts it")]
+#[test_case::test_case("resource___deployment___environment___name", None => false ; "any tier reading it counts for all at once")]
+#[test_case::test_case("hashes", Some("otel_logs_and_spans_rollup_dashboard_1m_v4") => true ; "hashes no tier reads")]
+#[test_case::test_case("hashes", None => true ; "hashes for every tier")]
+fn a_version_only_file_is_skipped_only_by_tiers_not_reading_it(column: &str, tier: Option<&str>) -> bool {
+    let tags = HashMap::from([(super::maintain::VERSION_ONLY_TAG.to_owned(), Some(column.to_owned()))]);
+    super::maintain::version_only(Some(&tags), "otel_logs_and_spans", tier)
+}
+
+/// A merge-on-read UPDATE is a version-only candidate when SOME tier ignores what it
+/// assigns — that tier's witnesses can skip it while the readers still count it.
+#[test_case::test_case(&["resource___deployment___environment___name"] => true ; "the dashboard tier ignores the environment")]
+#[test_case::test_case(&["hashes"] => true ; "every tier ignores hashes")]
+#[test_case::test_case(&["status_code"] => false ; "every tier reads status_code")]
+fn a_version_is_tagged_when_some_tier_ignores_it(columns: &[&str]) -> bool {
+    super::maintain::some_rollup_ignores("otel_logs_and_spans", columns)
 }
 
 /// A fresh process must route from the durable coverage ledger at boot: until

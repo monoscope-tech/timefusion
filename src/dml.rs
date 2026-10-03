@@ -867,7 +867,8 @@ async fn perform_version_append(
         return Ok(0);
     }
     let table_schema = schema.schema_ref();
-    let irrelevant = !tombstone && !crate::database::maintain::rollups_read_any(table_name, assignments.iter().map(|(column, _)| column));
+    let assigned = assignments.iter().map(|(column, _)| column.as_str()).collect::<Vec<_>>();
+    let irrelevant = !tombstone && crate::database::maintain::some_rollup_ignores(table_name, &assigned);
     // Taken BEFORE the read: a commit begun after it may land a version this statement
     // never saw, which its append would silently revert.
     let commits = database.version_only.commits(project_id, table_name);
