@@ -252,7 +252,28 @@ builds and process ages, so they are not one baseline. pgwire p99 was 23.6 s and
       is MUTABLE (monoscope appends via MoR UPDATE), so this tier reads the column the version-only witness skips
       and today's slices re-stale on every pattern-tag UPDATE (~7/min on 6297304f); the build must aggregate
       keep-greatest winners. Measured 10-02: shipbubble carries 1,649 distinct hashes in one hour (254k hash
-      entries), so ~40–50k tier rows/day against ~2.5 M raw rows. Still to measure: the hashes UPDATE rate per hour. In 25 min, 78 heavy-permit holds lasted 80–90 s: statement timeouts that
+      entries), so ~40–50k tier rows/day against ~2.5 M raw rows. Still to measure: the hashes UPDATE rate per hour.
+      **10-03:** read-only on prod, one sealed day (10-01) hourly × distinct hash: shipbubble 38,002 rows (6,819
+      hashes, 7.1 M entries) aggregated in 1.4 s; whale 18,521 rows in 3.7 s. A sealed shipbubble file shows why
+      nothing cheaper works: one hash at 3.5% selectivity sits in 233/237 pages (98%), so a prefilter or row
+      selection cannot narrow the read. Capability shipped `ad71f20b` (no tier declared — zero prod effect):
+      `RollupSpec.unnest`, `array_has(col, x)` / one-element `@>` route as `dimension = x`, and the version-only
+      witness counts the list as read. **Ready-to-apply tier** (owner sign-off; validated against the endpoint
+      dashboard's prod SQL templates — requests, p95, error rate, requests-by-status and the status breakdown
+      route; apdex's `sum(CASE)` and the recent-traces list stay raw):
+      ```yaml
+        - grain: 30m            # 7d line charts bin at 30m
+          name: hashes_30m
+          unnest: { column: hashes, dimension: hash }
+          dimensions: [hash, attributes___http___response___status_code]
+          backfill_days: 14
+          measures:
+            - { name: request_count, agg: count }
+            - { name: duration_count, agg: count, column: duration }
+            - { name: duration_sum, agg: sum, column: duration }
+            - { name: duration_digest, agg: tdigest, column: duration }
+            - { name: error_5xx_count, agg: count, filter: "COALESCE(attributes___http___response___status_code, 0) >= 500" }
+      ``` In 25 min, 78 heavy-permit holds lasted 80–90 s: statement timeouts that
       return nothing, while holding 5–9 of the K = 8 permits in a typical minute (1,596 of 2,641 admissions
       queued). The shapes are 24h/7d overview widgets falling back to raw: latency percentile, error rate
       (`count(*) filter`), the status-code breakdown (`sum(count(*)) over ()`) and apdex (`hashes @>`). Get each
