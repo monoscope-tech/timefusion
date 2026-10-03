@@ -1960,6 +1960,16 @@ async fn route_with_spec(
     // filter, leaving a term no declared measure can match.
     let mut terms: Vec<&Expr> = predicates.iter().flat_map(split_conjunction).collect();
     strip_index_hints(&mut terms);
+    // An unnest tier holds each row once PER ELEMENT: summed across elements it counts
+    // a row with two hashes twice and one with none never, so it answers only a query
+    // pinning one element.
+    if let Some(unnest) = &spec.unnest
+        && !terms.iter().any(|term| {
+            matches!(crate::tantivy::planner::membership(term), Some(crate::tantivy::histogram::Membership::Contains { column, .. }) if column == unnest.column)
+        })
+    {
+        return Err(MissReason::FilterNotEligible);
+    }
     for term in terms {
         if narrow_timestamp(term, &mut lo, &mut hi)? {
             continue;
@@ -3012,6 +3022,8 @@ mod tests {
     #[test_case::test_case("array_has(hashes, 'x')" => Ok(vec!["hash = 'x'".to_string()]) ; "array_has")]
     #[test_case::test_case("hashes @> ARRAY['x']" => Ok(vec!["hash = 'x'".to_string()]) ; "contains one element")]
     #[test_case::test_case("array_has_any(hashes, ARRAY['x', 'y'])" => Err(MissReason::FilterNotEligible) ; "any of two declines")]
+    // 10-03: an unpinned count routed here answered 1 for 4 rows — rows without a hash vanish.
+    #[test_case::test_case("kind = 'server'" => Err(MissReason::FilterNotEligible) ; "a query pinning no element declines")]
     #[tokio::test]
     async fn membership_of_the_unnested_column_routes_as_element_equality(filter: &str) -> Result<Vec<String>, MissReason> {
         let state = session().await;

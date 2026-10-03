@@ -2409,13 +2409,15 @@ async fn a_flush_never_stages_a_file_across_an_hour() -> Result<()> {
 
 /// Version-only is decided PER TIER: a version file assigning a column one tier reads moves
 /// that tier's witness and no other's. `resource___deployment___environment___name` is a
-/// sessions-tier dimension the dashboard tiers never read; nothing reads `hashes` yet, so its versions
-/// stay invisible to every tier (the `9e21fc3d` behaviour today's slices depend on).
+/// sessions-tier dimension the dashboard tiers never read; only `hashes_30m` reads `hashes`, so
+/// monoscope's pattern-tag versions stay invisible to the dashboard tiers (the `9e21fc3d`
+/// behaviour today's slices depend on) while the hash tier counts them.
 #[test_case::test_case("resource___deployment___environment___name", Some("otel_logs_and_spans_rollup_dashboard_1m_v4") => true ; "a column the dashboard tier ignores")]
 #[test_case::test_case("resource___deployment___environment___name", Some("otel_logs_and_spans_rollup_sessions_1h_v2") => false ; "the tier reading it counts it")]
 #[test_case::test_case("resource___deployment___environment___name", None => false ; "any tier reading it counts for all at once")]
-#[test_case::test_case("hashes", Some("otel_logs_and_spans_rollup_dashboard_1m_v4") => true ; "hashes no tier reads")]
-#[test_case::test_case("hashes", None => true ; "hashes for every tier")]
+#[test_case::test_case("hashes", Some("otel_logs_and_spans_rollup_dashboard_1m_v4") => true ; "hashes the dashboard tier ignores")]
+#[test_case::test_case("hashes", Some("otel_logs_and_spans_rollup_hashes_30m") => false ; "the hash tier counts hashes")]
+#[test_case::test_case("hashes", None => false ; "hashes for every tier at once")]
 fn a_version_only_file_is_skipped_only_by_tiers_not_reading_it(column: &str, tier: Option<&str>) -> bool {
     let tags = HashMap::from([(super::maintain::VERSION_ONLY_TAG.to_owned(), Some(column.to_owned()))]);
     super::maintain::version_only(Some(&tags), "otel_logs_and_spans", tier)
@@ -2424,8 +2426,8 @@ fn a_version_only_file_is_skipped_only_by_tiers_not_reading_it(column: &str, tie
 /// A merge-on-read UPDATE is a version-only candidate when SOME tier ignores what it
 /// assigns — that tier's witnesses can skip it while the readers still count it.
 #[test_case::test_case(&["resource___deployment___environment___name"] => true ; "the dashboard tier ignores the environment")]
-#[test_case::test_case(&["hashes"] => true ; "every tier ignores hashes")]
-#[test_case::test_case(&["status_code"] => false ; "every tier reads status_code")]
+#[test_case::test_case(&["hashes"] => true ; "the dashboard tiers ignore hashes")]
+#[test_case::test_case(&["timestamp"] => false ; "every tier reads the time axis")]
 fn a_version_is_tagged_when_some_tier_ignores_it(columns: &[&str]) -> bool {
     super::maintain::some_rollup_ignores("otel_logs_and_spans", columns)
 }
@@ -4330,16 +4332,20 @@ async fn maintenance_reconciliation_recovers_expired_history(valid_partition_met
     Ok(())
 }
 
-/// `(base tiers, derived tiers)` DECLARED for `otel_logs_and_spans`. Task-count
-/// expectations derive from this rather than a literal, so adding a tier is not a
-/// spurious failure.
-/// `(minute base, hour base, derived)` tiers: an hour tier mints one unit per hour, a
-/// minute tier one per 10-minute cell.
-fn declared_rollup_tiers() -> (usize, usize, usize) {
+/// Base rollup units one touched hour of `otel_logs_and_spans` mints, plus its derived
+/// tiers. Task-count expectations derive from this rather than a literal, so adding a tier
+/// is not a spurious failure. A base tier mints its grain's cells, at least 10 minutes
+/// wide; on today (`base_hour_units`) it mints the whole hour.
+fn declared_rollup_units(today: bool) -> (usize, usize) {
+    use crate::maintenance_coordinator::{DERIVED_SLICE_MICROS as HOUR, NORMAL_SLICE_MICROS};
     let rollups = &crate::schema::get_schema("otel_logs_and_spans").expect("schema").rollups;
     let derived = rollups.iter().filter(|spec| spec.derive_from.is_some()).count();
-    let hourly = rollups.iter().filter(|spec| spec.derive_from.is_none() && spec.grain_micros() > Some(60_000_000)).count();
-    (rollups.len() - derived - hourly, hourly, derived)
+    let base = rollups
+        .iter()
+        .filter(|spec| spec.derive_from.is_none())
+        .map(|spec| if today { 1 } else { (HOUR / spec.grain_micros().expect("grain").clamp(NORMAL_SLICE_MICROS, HOUR)) as usize })
+        .sum();
+    (base, derived)
 }
 
 /// Reconciling a missed commit must invalidate only the hours the commit's files
@@ -4364,19 +4370,14 @@ async fn reconcile_enqueues_only_the_hours_a_missed_commit_touched() -> Result<(
 
     let journal = db.maintenance_tasks.lock().unwrap();
     let tasks = journal.tasks().filter(|task| task.key.project_id == project).collect::<Vec<_>>();
-    let (base, hourly, derived) = declared_rollup_tiers();
-    // A minute tier mints its whole hour on today (`base_hour_units`), its 10-minute cells before.
-    let per_minute_tier = if day == crate::support::today_utc() { 1 } else { 6 };
-    assert_eq!(
-        tasks.len(),
-        6 + per_minute_tier * base + hourly + derived,
-        "one touched hour: 6 dedup + per minute tier + 1 per hour tier, not 312 for the whole day"
-    );
+    let (base, derived) = declared_rollup_units(day == crate::support::today_utc());
+    assert_eq!(tasks.len(), 6 + base + derived, "one touched hour: 6 dedup + each tier's cells of that hour, not 312 for the whole day");
     assert!(
         tasks.iter().all(|task| task.key.slice.start_micros >= hour_start && task.key.slice.end_micros <= hour_start + 3_600_000_000),
         "every reconciled task must lie inside the touched hour; day {day} starts {day_start}"
     );
-    assert_eq!(queued, base + hourly + derived, "one dirty hour x one enqueue per declared rollup spec");
+    let specs = crate::schema::get_schema("otel_logs_and_spans").expect("schema").rollups.len();
+    assert_eq!(queued, specs, "one dirty hour x one enqueue per declared rollup spec");
     Ok(())
 }
 
@@ -4614,12 +4615,12 @@ async fn first_rollup_invalidation_enqueues_only_the_touched_hour() -> Result<()
 
     let journal = db.maintenance_tasks.lock().unwrap();
     let counts = journal.tasks().counts_by(|task| task.key.operation);
-    let (base, hourly, derived) = declared_rollup_tiers();
+    let (base, derived) = declared_rollup_units(false);
     assert_eq!(counts.get(&Operation::Dedup), Some(&6));
-    assert_eq!(counts.get(&Operation::BaseRollup), Some(&(6 * base + hourly)));
+    assert_eq!(counts.get(&Operation::BaseRollup), Some(&base));
     assert_eq!(counts.get(&Operation::DerivedRollup), Some(&derived));
     assert_eq!(counts.get(&Operation::HotPacking), None, "ingest must not mint file-hygiene work; the debt planner owns it");
-    assert_eq!(journal.tasks().count(), 6 + 6 * base + hourly + derived, "one touched hour, not 456 full-day tasks");
+    assert_eq!(journal.tasks().count(), 6 + base + derived, "one touched hour, not 456 full-day tasks");
     Ok(())
 }
 

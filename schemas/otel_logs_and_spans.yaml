@@ -553,6 +553,22 @@ rollups:
   # measure is declared under it and the router promotes the query's scope to the
   # `event_count` guard. The filters are monoscope's `browserScope`,
   # `errorPredicate` and `pageViewPredicate` verbatim; they must stay in lockstep.
+  # Per-hash tier for monoscope's endpoint/issue widgets, which filter on
+  # `hashes @> ARRAY[h]` / `array_has(hashes, h)` over 7-14 d and timed out at 90 s:
+  # a hash's rows sit in ~98% of pages, so only an aggregate keyed by hash is cheap.
+  # Each row counts once per DISTINCT hash. 30m because 7d line charts bin at 30m.
+  # Measured 10-01: 38k rows/day for shipbubble, a day aggregated in 1.4 s.
+  - grain: 30m
+    name: hashes_30m
+    unnest: { column: hashes, dimension: hash }
+    dimensions: [hash, attributes___http___response___status_code]
+    backfill_days: 14
+    measures:
+      - { name: request_count, agg: count }
+      - { name: duration_count, agg: count, column: duration }
+      - { name: duration_sum, agg: sum, column: duration }
+      - { name: duration_digest, agg: tdigest, column: duration }
+      - { name: error_5xx_count, agg: count, filter: "COALESCE(attributes___http___response___status_code, 0) >= 500" }
   - grain: 1h
     name: sessions_1h_v2
     # The session list reads recent windows only.
