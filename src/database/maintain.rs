@@ -626,6 +626,8 @@ fn spec_source_columns<'a>(source: &'a crate::schema::TableSchema, spec: &'a cra
         .chain(source.dedup_tiebreak.iter().map(String::as_str))
         .chain(source.tombstone_column.iter().map(String::as_str))
         .chain(spec.dimensions.iter().map(String::as_str))
+        // An unnest tier's dimension is no source column; the list it explodes is.
+        .chain(spec.unnest.iter().map(|unnest| unnest.column.as_str()))
         .chain(spec.measures.iter().filter_map(|measure| measure.column.as_deref()))
         .chain(
             spec.measures

@@ -40,6 +40,18 @@ pub struct RollupSpec {
     /// `timefusion_rollup_backfill_days`. For a tier only recent windows read.
     #[serde(default)]
     pub backfill_days: Option<u16>,
+    /// See [`RollupUnnest`]; its `dimension` is also listed in `dimensions`.
+    #[serde(default)]
+    pub unnest: Option<RollupUnnest>,
+}
+
+/// Explode an array column into one row per DISTINCT element, grouped as `dimension`, so
+/// `array_has(column, x)` reads as `dimension = x`. Exact only because each source row
+/// contributes each element once. Base tiers only.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct RollupUnnest {
+    pub column: String,
+    pub dimension: String,
 }
 
 /// One stored measure. Only DECOMPOSABLE aggregates are expressible, so they
@@ -133,8 +145,23 @@ impl RollupSpec {
         anyhow::ensure!(self.grain_micros().is_some(), "rollup {target}: invalid grain `{}`", self.grain);
         anyhow::ensure!(self.name.as_deref().is_none_or(is_ident), "rollup {target}: name must be an SQL identifier");
         let mut names = HashSet::new();
+        let unnested = self.unnest.as_ref().map(|unnest| unnest.dimension.as_str());
+        if let Some(unnest) = &self.unnest {
+            anyhow::ensure!(self.derive_from.is_none(), "rollup {target}: only a base tier may unnest");
+            anyhow::ensure!(
+                source.field(&unnest.column).is_some_and(|field| field.data_type.starts_with("List")),
+                "rollup {target}: unnest column `{}` must be a list column",
+                unnest.column
+            );
+            anyhow::ensure!(
+                self.dimensions.contains(&unnest.dimension),
+                "rollup {target}: unnest dimension `{}` must be listed in `dimensions`",
+                unnest.dimension
+            );
+            anyhow::ensure!(source.field(&unnest.dimension).is_none(), "rollup {target}: unnest dimension `{}` shadows a source column", unnest.dimension);
+        }
         for dimension in &self.dimensions {
-            anyhow::ensure!(source.field(dimension).is_some(), "rollup {target}: unknown dimension `{dimension}`");
+            anyhow::ensure!(unnested == Some(dimension.as_str()) || source.field(dimension).is_some(), "rollup {target}: unknown dimension `{dimension}`");
             anyhow::ensure!(names.insert(dimension), "rollup {target}: duplicate dimension `{dimension}`");
             anyhow::ensure!(
                 !IDENTITY_FIELDS.iter().any(|(name, ..)| *name == dimension.as_str()),
@@ -232,7 +259,10 @@ impl RollupSpec {
             // for rows missing the dimension even when the source column is not.
             // `tantivy: None` is deliberate — inheriting the source's index
             // config turns a dimension equality into a much slower `text_match`.
-            .chain(self.dimensions.iter().map(|d| Ok(FieldDef { nullable: true, tantivy: None, ..src_field(d)? })))
+            .chain(self.dimensions.iter().map(|d| match self.unnest.as_ref().is_some_and(|unnest| &unnest.dimension == d) {
+                true => Ok(plain(d, "Utf8", true)),
+                false => Ok(FieldDef { nullable: true, tantivy: None, ..src_field(d)? }),
+            }))
             .chain(self.measures.iter().map(|m| {
                 let ty = match (m.agg.as_str(), &m.column) {
                     ("count", _) => "Int64".to_string(),
@@ -791,7 +821,15 @@ mod tests {
 
     /// A 1m rollup over `kind` — the shape every spec test varies.
     fn spec(name: &str, measures: Vec<RollupMeasure>) -> RollupSpec {
-        RollupSpec { grain: "1m".into(), name: Some(name.into()), dimensions: vec!["kind".into()], measures, derive_from: None, backfill_days: None }
+        RollupSpec {
+            grain: "1m".into(),
+            name: Some(name.into()),
+            dimensions: vec!["kind".into()],
+            measures,
+            derive_from: None,
+            backfill_days: None,
+            unnest: None,
+        }
     }
 
     /// The merge-on-read triple every tombstoned table must declare identically.
@@ -842,6 +880,24 @@ mod tests {
         // `kind` is tantivy-indexed on the source and must NOT inherit it here —
         // see `synthesize`.
         assert!(rollup.fields.iter().all(|f| f.tantivy.is_none()), "no rollup field may carry a tantivy config");
+    }
+
+    /// An unnest tier needs a list column, its element dimension listed and new, and no
+    /// derivation; the dimension is synthesized as the element type, not the list's.
+    #[test_case("hashes", "hash", true, None => Ok(Some("Utf8".to_string())) ; "list column, new dimension")]
+    #[test_case("name", "hash", true, None => Err(()) ; "not a list column")]
+    #[test_case("hashes", "hash", false, None => Err(()) ; "dimension not listed")]
+    #[test_case("hashes", "kind", true, None => Err(()) ; "dimension shadows a source column")]
+    #[test_case("hashes", "hash", true, Some("base") => Err(()) ; "derived tiers may not unnest")]
+    fn an_unnest_tier_validates_and_types_its_dimension(column: &str, dimension: &str, listed: bool, derive_from: Option<&str>) -> Result<Option<String>, ()> {
+        let spec = RollupSpec {
+            dimensions: if listed { vec![dimension.into()] } else { vec![] },
+            derive_from: derive_from.map(Into::into),
+            unnest: Some(RollupUnnest { column: column.into(), dimension: dimension.into() }),
+            ..spec("unnest_test", vec![measure("c", "count", None, None)])
+        };
+        spec.validate(source()).map_err(|_| ())?;
+        Ok(spec.synthesize(source()).map_err(|_| ())?.fields.iter().find(|field| field.name == dimension).map(|field| field.data_type.clone()))
     }
 
     /// A `first` measure is only re-aggregable if a companion `min(timestamp)`

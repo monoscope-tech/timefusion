@@ -59,7 +59,7 @@ fn jsonpath_member(path: &str) -> Option<String> {
     serde_json::from_str(path.strip_suffix(')')?.trim_end()).ok()
 }
 
-fn membership(expr: &Expr) -> Option<Membership> {
+pub(crate) fn membership(expr: &Expr) -> Option<Membership> {
     match unalias(expr) {
         Expr::ScalarFunction(function) => match (function.name(), function.args.as_slice()) {
             ("jsonb_path_exists", [Expr::ScalarFunction(json), path]) => {

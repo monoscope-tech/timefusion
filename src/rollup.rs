@@ -219,11 +219,19 @@ fn bucketed_projection(spec: &RollupSpec, derived: bool) -> anyhow::Result<(Stri
 
 /// The partition's rows, rebuilt over `ranges` only and carried forward verbatim
 /// from `target` everywhere else. Empty `ranges` means the whole day, from scratch.
+/// `from`, exploded by the spec's [`crate::schema::RollupUnnest`] when it builds from raw rows.
+fn unnested(spec: &RollupSpec, from: &str, derived: bool) -> String {
+    match (&spec.unnest, derived) {
+        (Some(unnest), false) => format!("(SELECT *, unnest(array_distinct({})) AS {} FROM {from})", quoted(&unnest.column), quoted(&unnest.dimension)),
+        _ => from.to_string(),
+    }
+}
+
 pub(crate) fn build_partition_sql_ranges(
     spec: &RollupSpec, source: &str, from: &str, target: &str, project_id: &str, date: &str, ranges: &[(i64, i64)],
 ) -> anyhow::Result<String> {
     let (select_dimensions, projection) = bucketed_projection(spec, from != source)?;
-    let source = from;
+    let source = &unnested(spec, from, from != source);
     let group_by = (1..=1 + spec.dimensions.len()).join(", ");
 
     let partition = format!("project_id = {} AND date = {}", sql_literal(project_id), sql_literal(date));
@@ -254,8 +262,9 @@ pub(crate) fn build_cohort_sql_range_mode(
     let projects = project_ids.iter().map(|project| sql_literal(project)).join(", ");
     Ok(format!(
         "SELECT project_id, {projection} \
-         FROM {from} WHERE project_id IN ({projects}) AND date = {} AND timestamp >= to_timestamp_micros({start}) AND timestamp < to_timestamp_micros({end}) \
+         FROM {} WHERE project_id IN ({projects}) AND date = {} AND timestamp >= to_timestamp_micros({start}) AND timestamp < to_timestamp_micros({end}) \
          GROUP BY {group_by}",
+        unnested(spec, from, derived),
         sql_literal(date)
     ))
 }
@@ -1341,7 +1350,18 @@ fn timestamp_literal(expr: &datafusion::logical_expr::Expr) -> Option<i64> {
     }
 }
 
-fn dimension_filter_sql(expr: &datafusion::logical_expr::Expr, dimensions: &[String]) -> Option<String> {
+fn dimension_filter_sql(expr: &datafusion::logical_expr::Expr, spec: &RollupSpec) -> Option<String> {
+    // Membership of the unnested column is equality on the element dimension.
+    if let Some(unnest) = &spec.unnest
+        && let Some(crate::tantivy::histogram::Membership::Contains { column, value }) = crate::tantivy::planner::membership(expr)
+        && column == unnest.column
+    {
+        return Some(format!("{} = {}", unnest.dimension, sql_literal(&value)));
+    }
+    dimension_filter_sql_over(expr, &spec.dimensions)
+}
+
+fn dimension_filter_sql_over(expr: &datafusion::logical_expr::Expr, dimensions: &[String]) -> Option<String> {
     use datafusion::{
         logical_expr::{Expr, Operator},
         scalar::ScalarValue,
@@ -1373,16 +1393,19 @@ fn dimension_filter_sql(expr: &datafusion::logical_expr::Expr, dimensions: &[Str
     match unaliased(expr) {
         Expr::Column(column) if dimensions.iter().any(|dimension| dimension == &column.name) => Some(column.name.clone()),
         Expr::Literal(value, _) => literal(value),
-        Expr::BinaryExpr(binary) => {
-            Some(format!("{} {} {}", dimension_filter_sql(&binary.left, dimensions)?, operator(binary.op)?, dimension_filter_sql(&binary.right, dimensions)?))
-        }
-        Expr::IsNull(expr) => Some(format!("{} IS NULL", dimension_filter_sql(expr, dimensions)?)),
-        Expr::IsNotNull(expr) => Some(format!("{} IS NOT NULL", dimension_filter_sql(expr, dimensions)?)),
+        Expr::BinaryExpr(binary) => Some(format!(
+            "{} {} {}",
+            dimension_filter_sql_over(&binary.left, dimensions)?,
+            operator(binary.op)?,
+            dimension_filter_sql_over(&binary.right, dimensions)?
+        )),
+        Expr::IsNull(expr) => Some(format!("{} IS NULL", dimension_filter_sql_over(expr, dimensions)?)),
+        Expr::IsNotNull(expr) => Some(format!("{} IS NOT NULL", dimension_filter_sql_over(expr, dimensions)?)),
         Expr::InList(list) => Some(format!(
             "{} {}IN ({})",
-            dimension_filter_sql(&list.expr, dimensions)?,
+            dimension_filter_sql_over(&list.expr, dimensions)?,
             if list.negated { "NOT " } else { "" },
-            list.list.iter().map(|item| dimension_filter_sql(item, dimensions)).collect::<Option<Vec<_>>>()?.join(", ")
+            list.list.iter().map(|item| dimension_filter_sql_over(item, dimensions)).collect::<Option<Vec<_>>>()?.join(", ")
         )),
         _ => None,
     }
@@ -1934,7 +1957,7 @@ async fn route_with_spec(
         // we cannot may NOT be answered by a measure pre-filtered the same way,
         // because the raw query also eliminates the groups where nothing matched
         // and re-aggregating resurrects them as 0/NULL rows.
-        match (eq_literal(term, "project_id"), dimension_filter_sql(term, &spec.dimensions)) {
+        match (eq_literal(term, "project_id"), dimension_filter_sql(term, spec)) {
             // Two different literals cannot both hold; never keep the last.
             (Some(value), _) if project_id.as_deref().is_some_and(|current| current != value) => return Err(MissReason::MissingProject),
             (Some(value), _) => project_id = Some(value.to_string()),
@@ -2460,6 +2483,7 @@ mod tests {
             ],
             derive_from: None,
             backfill_days: None,
+            unnest: None,
         };
         let ctx = datafusion::prelude::SessionContext::new();
         let (first, second) = (rows(0, 9), rows(0, 7));
@@ -2529,6 +2553,7 @@ mod tests {
             ],
             derive_from: None,
             backfill_days: None,
+            unnest: None,
         }
     }
 
@@ -2854,6 +2879,7 @@ mod tests {
             }],
             derive_from: derive_from.map(str::to_string),
             backfill_days: None,
+            unnest: None,
         };
         let raw = build_partition_sql(&spec(None), SOURCE, "project", "2026-08-01").expect("valid SQL");
         assert!(raw.contains("hll_agg(context___trace_id) FILTER (WHERE kind = 'server') AS traces"), "{raw}");
@@ -2909,6 +2935,83 @@ mod tests {
 
     async fn route_for(state: &datafusion::execution::context::SessionState, sql: &str) -> Result<Option<RoutedRollup>, MissReason> {
         match_aggregates(&optimized(state, sql).await, state).await.map(|routes| routes.into_iter().next())
+    }
+
+    fn hashes_spec() -> RollupSpec {
+        RollupSpec {
+            grain: "1h".into(),
+            name: Some("hashes_test".into()),
+            dimensions: vec!["hash".into()],
+            measures: vec![RollupMeasure { name: "c".into(), agg: "count".into(), column: None, filter: None }],
+            derive_from: None,
+            backfill_days: None,
+            unnest: Some(crate::schema::RollupUnnest { column: "hashes".into(), dimension: "hash".into() }),
+        }
+    }
+
+    /// An unnest tier counts each row once under every DISTINCT element of its list,
+    /// which is what makes `hash = x` over the tier equal `array_has(hashes, x)` over rows.
+    #[tokio::test]
+    async fn an_unnest_tier_counts_each_row_once_per_distinct_element() {
+        use arrow::array::{ListBuilder, StringBuilder};
+        let mut hashes = ListBuilder::new(StringBuilder::new());
+        for row in [Some(vec!["a", "a", "b"]), Some(vec!["b"]), Some(vec![]), None, Some(vec!["c"])] {
+            match row {
+                Some(values) => {
+                    values.into_iter().for_each(|value| hashes.values().append_value(value));
+                    hashes.append(true);
+                }
+                None => hashes.append(false),
+            }
+        }
+        let hashes = hashes.finish();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), false),
+            Field::new("project_id", DataType::Utf8, false),
+            Field::new("date", DataType::Utf8, false),
+            Field::new("hashes", hashes.data_type().clone(), true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(TimestampMicrosecondArray::from(vec![0, 1, 2, 3, 4]).with_timezone("UTC")),
+                Arc::new(StringArray::from(vec!["p"; 5])),
+                Arc::new(StringArray::from(vec!["1970-01-01"; 5])),
+                Arc::new(hashes),
+            ],
+        )
+        .expect("batch");
+        let ctx = datafusion::prelude::SessionContext::new();
+        let partial = rollup_partial_for_batches(&ctx, &hashes_spec(), SOURCE, "p", "1970-01-01", &[batch], (0, 3_600_000_000)).await.expect("partial");
+        let counts: Vec<(String, i64)> = partial
+            .iter()
+            .flat_map(|batch| {
+                let hash = arrow::compute::cast(batch.column_by_name("hash").expect("hash"), &DataType::Utf8).expect("cast");
+                let hash = hash.as_any().downcast_ref::<StringArray>().expect("utf8").clone();
+                let count = batch.column_by_name("c").expect("c").as_any().downcast_ref::<Int64Array>().expect("count").clone();
+                (0..batch.num_rows()).map(move |row| (hash.value(row).to_string(), count.value(row)))
+            })
+            .sorted()
+            .collect();
+        assert_eq!(counts, [("a".into(), 1), ("b".into(), 2), ("c".into(), 1)], "a row counts once per distinct element; empty and null lists count nowhere");
+    }
+
+    /// Membership of the unnested column routes as equality on its element dimension;
+    /// a multi-element ANY cannot, since one tier row per element would double count.
+    #[test_case::test_case("array_has(hashes, 'x')" => Ok(vec!["hash = 'x'".to_string()]) ; "array_has")]
+    #[test_case::test_case("hashes @> ARRAY['x']" => Ok(vec!["hash = 'x'".to_string()]) ; "contains one element")]
+    #[test_case::test_case("array_has_any(hashes, ARRAY['x', 'y'])" => Err(MissReason::FilterNotEligible) ; "any of two declines")]
+    #[tokio::test]
+    async fn membership_of_the_unnested_column_routes_as_element_equality(filter: &str) -> Result<Vec<String>, MissReason> {
+        let state = session().await;
+        let window = "timestamp >= to_timestamp_micros(0) AND timestamp < to_timestamp_micros(10800000000)";
+        let sql =
+            format!("SELECT time_bucket('1 hours', timestamp) AS tb, COUNT(*) FROM {SOURCE} WHERE project_id = 'project' AND {window} AND {filter} GROUP BY 1");
+        let plan = optimized(&state, &sql).await;
+        let datafusion::logical_expr::LogicalPlan::Aggregate(aggregate) = outermost_aggregates(&plan)[0] else { panic!("an aggregate") };
+        let mut predicates = Vec::new();
+        let source = source_and_filters(&aggregate.input, &mut predicates).expect("walkable");
+        route_with_spec(&hashes_spec(), &source, SOURCE, &predicates, aggregate, &state).await.map(|route| route.row_filters)
     }
 
     /// For tests whose only interest is HOW a shape declines.
