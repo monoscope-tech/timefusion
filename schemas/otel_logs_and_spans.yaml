@@ -569,6 +569,9 @@ rollups:
       - { name: duration_sum, agg: sum, column: duration }
       - { name: duration_digest, agg: tdigest, column: duration }
       - { name: error_5xx_count, agg: count, filter: "COALESCE(attributes___http___response___status_code, 0) >= 500" }
+      # monoscope's apdex numerator (500 ms satisfied, 2 s tolerating) as cumulative bands.
+      - { name: apdex_satisfied_count, agg: count, column: duration, filter: "duration <= 500000000" }
+      - { name: apdex_tolerated_count, agg: count, column: duration, filter: "duration <= 2000000000" }
   - grain: 1h
     name: sessions_1h_v2
     # The session list reads recent windows only.

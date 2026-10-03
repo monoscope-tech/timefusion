@@ -426,13 +426,17 @@ pub(crate) enum Merge {
     /// Earliest value in the window. Two states — value and the timestamp of the
     /// row it came from — since "earliest" is not recoverable from the value alone.
     First,
+    /// An apdex numerator, `sum(CASE WHEN d <= a THEN 1.0 WHEN d <= b THEN 0.5 ELSE 0 END)`
+    /// with `a <= b`, from the cumulative counts `d <= a` and `d <= b`: `0.5·both`, since
+    /// the satisfied band lies inside the tolerating one.
+    Apdex,
 }
 
 impl Merge {
     /// State columns consumed, in order. `Avg` carries sum and count apart —
     /// an average is not a state, and the union would average two averages.
     const fn arity(self) -> usize {
-        if matches!(self, Self::Avg | Self::First) { 2 } else { 1 }
+        if matches!(self, Self::Avg | Self::First | Self::Apdex) { 2 } else { 1 }
     }
 
     /// The associative operator that folds one state column across legs.
@@ -444,7 +448,7 @@ impl Merge {
             Self::Hll | Self::DimensionHll => "hll_merge",
             // Exhaustive on purpose: a new state-carrying variant must name its
             // operator rather than silently folding with SUM.
-            Self::Count | Self::Sum | Self::Avg | Self::First => "SUM",
+            Self::Count | Self::Sum | Self::Avg | Self::First | Self::Apdex => "SUM",
         }
     }
 
@@ -466,6 +470,7 @@ impl Merge {
     fn sql(self, states: &[String]) -> String {
         match (self, states) {
             (Self::Count, [count]) => format!("COALESCE(SUM({count}), 0)"),
+            (Self::Apdex, [satisfied, tolerated]) => format!("(0.5 * CAST(SUM({satisfied}) AS DOUBLE) + 0.5 * CAST(SUM({tolerated}) AS DOUBLE))"),
             // CAST the dividend, not the result: both states are Int64, so
             // dividing first truncates.
             (Self::Avg, [sum, count]) => {
@@ -1494,6 +1499,37 @@ fn strip_index_hints(operands: &mut Vec<&datafusion::logical_expr::Expr>) {
     operands.retain(|operand| hint_column(operand).is_none_or(|column| !compared.contains(&column)));
 }
 
+/// `CASE WHEN c <= a THEN 1.0 WHEN c <= b THEN 0.5 ELSE 0 END` over one column with `a <= b`,
+/// as its two bands: the shape whose sum is an apdex numerator ([`Merge::Apdex`]).
+fn apdex_case(expr: &datafusion::logical_expr::Expr) -> Option<(&datafusion::logical_expr::Expr, &datafusion::logical_expr::Expr)> {
+    use datafusion::{
+        arrow::datatypes::DataType,
+        logical_expr::{Expr, Operator},
+        scalar::ScalarValue,
+    };
+    let number = |expr: &Expr| match unaliased(expr) {
+        Expr::Literal(value, _) => match value.cast_to(&DataType::Float64).ok()? {
+            ScalarValue::Float64(Some(value)) => Some(value),
+            _ => None,
+        },
+        _ => None,
+    };
+    let band = |expr: &Expr| match unaliased(expr) {
+        Expr::BinaryExpr(binary) if binary.op == Operator::LtEq => Some((column_name(&binary.left)?.to_string(), number(&binary.right)?)),
+        _ => None,
+    };
+    let Expr::Case(case) = unaliased(expr) else { return None };
+    let [(satisfied, one), (tolerated, half)] = case.when_then_expr.as_slice() else { return None };
+    let ((column, a), (other, b)) = (band(satisfied)?, band(tolerated)?);
+    (case.expr.is_none()
+        && column == other
+        && a <= b
+        && number(one) == Some(1.0)
+        && number(half) == Some(0.5)
+        && case.else_expr.as_deref().and_then(number) == Some(0.0))
+    .then_some((satisfied.as_ref(), tolerated.as_ref()))
+}
+
 fn canonical_and<'a>(expressions: impl IntoIterator<Item = &'a datafusion::logical_expr::Expr>) -> String {
     use datafusion::logical_expr::{Expr, Operator, utils::split_binary};
     // `X AND X` must canonicalize to `X`: a pushed-down predicate is collected
@@ -2178,6 +2214,16 @@ async fn route_with_spec(
             // to the measure declared as exactly that conjunction.
             let filter = canonical_and(function.params.filter.iter().flat_map(|filter| split_conjunction(filter.as_ref())).chain(promotable.iter().copied()));
             let name = function.func.name().to_ascii_lowercase();
+            if name == "sum"
+                && let Some((satisfied, tolerated)) = function.params.args.first().and_then(apdex_case)
+            {
+                let count = |band: &Expr| {
+                    let conjuncts = function.params.filter.iter().flat_map(|filter| split_conjunction(filter.as_ref())).chain(promotable.iter().copied());
+                    declared_measure("count", null_guard, &canonical_and(conjuncts.chain([band])))
+                };
+                let resolved = count(satisfied).zip(count(tolerated)).ok_or(MissReason::MissingMeasure)?;
+                return Ok(routed_measure(alias, Merge::Apdex, &[resolved.0, resolved.1]));
+            }
             // Measures are declared over a bare column or none; `count(<expr>)`
             // skips the rows where `<expr>` is NULL, so only a non-null literal
             // (`count(*)`) may read the row count.
@@ -3067,6 +3113,8 @@ mod tests {
                 m("duration_sum", "sum", Some("duration"), None),
                 m("duration_digest", "tdigest", Some("duration"), None),
                 m("error_5xx_count", "count", None, Some("COALESCE(attributes___http___response___status_code, 0) >= 500")),
+                m("apdex_satisfied_count", "count", Some("duration"), Some("duration <= 500000000")),
+                m("apdex_tolerated_count", "count", Some("duration"), Some("duration <= 2000000000")),
             ],
             derive_from: None,
             backfill_days: None,
@@ -3081,7 +3129,7 @@ mod tests {
     #[test_case::test_case("select extract(epoch from time_bucket('30 minutes', timestamp))::integer, 'value', round((coalesce(((count(*) filter (where coalesce(attributes___http___response___status_code, 0) >= 500)::float * 100.0) / nullif(count(*)::float, 0)), 0))::numeric, 2)::float as round_ from otel_logs_and_spans where project_id='p' and {W} and ((array_has(hashes, 'x'))) group by time_bucket('30 minutes', timestamp)" => true ; "error rate")]
     #[test_case::test_case("select extract(epoch from time_bucket('30 minutes', timestamp))::integer, coalesce(coalesce((attributes___http___response___status_code)::text, 'unknown')::text, 'null'), count(*)::float as count_ from otel_logs_and_spans where project_id='p' and {W} and ((array_has(hashes, 'x') and attributes___http___response___status_code is not null)) group by time_bucket('30 minutes', timestamp), coalesce(coalesce((attributes___http___response___status_code)::text, 'unknown')::text, 'null') limit 10000" => true ; "requests by status code")]
     #[test_case::test_case("select coalesce(attributes___http___response___status_code::text, 'unknown') as status_code, count(*)::text as count, round((count(*)::float * 100.0 / greatest(1, sum(count(*)) over ())::float)::numeric, 1)::float::text as pct, round((avg(duration) / 1e6)::numeric, 2)::text as avg_latency from otel_logs_and_spans where project_id='p' and hashes @> array['x'] and {W} group by attributes___http___response___status_code order by count(*) desc limit 20" => true ; "status code breakdown")]
-    #[test_case::test_case("select round((sum(case when duration <= 500000000 then 1.0 when duration <= 2000000000 then 0.5 else 0 end)) / greatest(1, count(*))::numeric, 2)::float from otel_logs_and_spans where project_id='p' and hashes @> array['x'] and duration is not null and {W}" => false ; "apdex sums a CASE no measure stores")]
+    #[test_case::test_case("select round((sum(case when duration <= 500000000 then 1.0 when duration <= 2000000000 then 0.5 else 0 end)) / greatest(1, count(*))::numeric, 2)::float from otel_logs_and_spans where project_id='p' and hashes @> array['x'] and duration is not null and {W}" => true ; "apdex")]
     #[tokio::test]
     async fn the_endpoint_widgets_route_to_a_hash_tier(sql: &str) -> bool {
         let state = session().await;
@@ -3153,6 +3201,22 @@ mod tests {
         assert!(!tier.is_empty() && !raw.is_empty(), "a hybrid with both legs: {rewrite}");
         assert!(tier.iter().all(|leg| leg.contains("hash = 'x'")), "{rewrite}");
         assert!(raw.iter().all(|leg| leg.contains("array_has(\"hashes\", 'x')") && !leg.contains("hash = ")), "{rewrite}");
+    }
+
+    /// Only monoscope's exact apdex numerator decomposes into the two cumulative counts:
+    /// any other weights, an inverted band order or a second column would answer wrong.
+    #[test_case::test_case("CASE WHEN duration <= 500000000 THEN 1.0 WHEN duration <= 2000000000 THEN 0.5 ELSE 0 END" => true ; "the apdex numerator")]
+    #[test_case::test_case("CASE WHEN duration <= 2000000000 THEN 1.0 WHEN duration <= 500000000 THEN 0.5 ELSE 0 END" => false ; "bands out of order")]
+    #[test_case::test_case("CASE WHEN duration <= 500000000 THEN 1.0 WHEN duration <= 2000000000 THEN 0.25 ELSE 0 END" => false ; "other weights")]
+    #[test_case::test_case("CASE WHEN duration <= 500000000 THEN 1.0 WHEN severity___severity_number <= 2000000000 THEN 0.5 ELSE 0 END" => false ; "two columns")]
+    #[test_case::test_case("CASE WHEN duration <= 500000000 THEN 1.0 WHEN duration <= 2000000000 THEN 0.5 ELSE 1 END" => false ; "a nonzero else")]
+    #[tokio::test]
+    async fn only_the_apdex_numerator_decomposes(case: &str) -> bool {
+        let state = session().await;
+        let plan = optimized(&state, &format!("SELECT SUM({case}) FROM {SOURCE} WHERE project_id = 'p'")).await;
+        let datafusion::logical_expr::LogicalPlan::Aggregate(aggregate) = outermost_aggregates(&plan)[0] else { panic!("an aggregate") };
+        let datafusion::logical_expr::Expr::AggregateFunction(sum) = unaliased(&aggregate.aggr_expr[0]) else { panic!("sum") };
+        apdex_case(&sum.params.args[0]).is_some()
     }
 
     /// For tests whose only interest is HOW a shape declines.
