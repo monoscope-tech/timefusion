@@ -3014,6 +3014,56 @@ mod tests {
         route_with_spec(&hashes_spec(), &source, SOURCE, &predicates, aggregate, &state).await.map(|route| route.row_filters)
     }
 
+    /// The proposed `hashes_30m` tier: the endpoint dashboard's widgets (monoscope
+    /// `endpoint-stats.yaml`), all scoped by `{{const-endpointFilter}}` = hash membership.
+    fn endpoint_spec() -> RollupSpec {
+        let m = |name: &str, agg: &str, column: Option<&str>, filter: Option<&str>| RollupMeasure {
+            name: name.into(),
+            agg: agg.into(),
+            column: column.map(Into::into),
+            filter: filter.map(Into::into),
+        };
+        RollupSpec {
+            grain: "30m".into(),
+            name: Some("hashes_30m".into()),
+            dimensions: vec!["hash".into(), "attributes___http___response___status_code".into()],
+            measures: vec![
+                m("request_count", "count", None, None),
+                m("duration_count", "count", Some("duration"), None),
+                m("duration_sum", "sum", Some("duration"), None),
+                m("duration_digest", "tdigest", Some("duration"), None),
+                m("error_5xx_count", "count", None, Some("COALESCE(attributes___http___response___status_code, 0) >= 500")),
+            ],
+            derive_from: None,
+            backfill_days: None,
+            unnest: Some(crate::schema::RollupUnnest { column: "hashes".into(), dimension: "hash".into() }),
+        }
+    }
+
+    /// Each endpoint widget, verbatim from prod's statement templates, against the proposed
+    /// tier: the shapes it exists for must route, and the ones it cannot serve must decline.
+    #[test_case::test_case("select extract(epoch from time_bucket('30 minutes', timestamp))::integer, 'value', count(*)::float as count_ from otel_logs_and_spans where project_id='p' and {W} and ((array_has(hashes, 'x'))) group by time_bucket('30 minutes', timestamp) order by time_bucket('30 minutes', timestamp) desc" => true ; "requests")]
+    #[test_case::test_case("select extract(epoch from time_bucket('30 minutes', timestamp))::integer, 'value', (coalesce((coalesce(approx_percentile(0.95, percentile_agg(cast(duration as double precision))), 0)::float / nullif(1000000, 0)), 0))::float as arith_ from otel_logs_and_spans where project_id='p' and {W} and ((array_has(hashes, 'x') and duration is not null)) group by time_bucket('30 minutes', timestamp)" => true ; "p95 latency")]
+    #[test_case::test_case("select extract(epoch from time_bucket('30 minutes', timestamp))::integer, 'value', round((coalesce(((count(*) filter (where coalesce(attributes___http___response___status_code, 0) >= 500)::float * 100.0) / nullif(count(*)::float, 0)), 0))::numeric, 2)::float as round_ from otel_logs_and_spans where project_id='p' and {W} and ((array_has(hashes, 'x'))) group by time_bucket('30 minutes', timestamp)" => true ; "error rate")]
+    #[test_case::test_case("select extract(epoch from time_bucket('30 minutes', timestamp))::integer, coalesce(coalesce((attributes___http___response___status_code)::text, 'unknown')::text, 'null'), count(*)::float as count_ from otel_logs_and_spans where project_id='p' and {W} and ((array_has(hashes, 'x') and attributes___http___response___status_code is not null)) group by time_bucket('30 minutes', timestamp), coalesce(coalesce((attributes___http___response___status_code)::text, 'unknown')::text, 'null') limit 10000" => true ; "requests by status code")]
+    #[test_case::test_case("select coalesce(attributes___http___response___status_code::text, 'unknown') as status_code, count(*)::text as count, round((count(*)::float * 100.0 / greatest(1, sum(count(*)) over ())::float)::numeric, 1)::float::text as pct, round((avg(duration) / 1e6)::numeric, 2)::text as avg_latency from otel_logs_and_spans where project_id='p' and hashes @> array['x'] and {W} group by attributes___http___response___status_code order by count(*) desc limit 20" => true ; "status code breakdown")]
+    #[test_case::test_case("select round((sum(case when duration <= 500000000 then 1.0 when duration <= 2000000000 then 0.5 else 0 end)) / greatest(1, count(*))::numeric, 2)::float from otel_logs_and_spans where project_id='p' and hashes @> array['x'] and duration is not null and {W}" => false ; "apdex sums a CASE no measure stores")]
+    #[tokio::test]
+    async fn the_endpoint_widgets_route_to_a_hash_tier(sql: &str) -> bool {
+        let state = session().await;
+        let sql = sql.replace("{W}", "timestamp >= to_timestamp_micros(0) AND timestamp < to_timestamp_micros(1209600000000)");
+        let plan = optimized(&state, &sql).await;
+        let aggregates = outermost_aggregates(&plan);
+        let datafusion::logical_expr::LogicalPlan::Aggregate(original) = aggregates[0] else { panic!("an aggregate") };
+        // As `match_aggregate`: match the pre-CSE shape.
+        let inlined = inline_common_exprs(original);
+        let aggregate = inlined.as_ref().unwrap_or(original);
+        let mut predicates = Vec::new();
+        let source = source_and_filters(&aggregate.input, &mut predicates).expect("walkable");
+        let routed = route_with_spec(&endpoint_spec(), &source, SOURCE, &predicates, aggregate, &state).await;
+        routed.is_ok()
+    }
+
     /// For tests whose only interest is HOW a shape declines.
     async fn route_alone(sql: &str) -> Result<Option<RoutedRollup>, MissReason> {
         route_for(&session().await, sql).await
