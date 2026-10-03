@@ -82,9 +82,20 @@ pub fn generation_id(spec: &RollupSpec, source: &str, project_id: &str, date: &s
     // Bump when source-read semantics change, not just the SQL spec; forces a rebuild.
     const MATERIALIZATION_VERSION: u8 = 1;
     MATERIALIZATION_VERSION.hash(&mut hasher);
-    format!("{spec:?}").hash(&mut hasher);
+    generation_render(spec).hash(&mut hasher);
     (source, project_id, date).hash(&mut hasher);
     format!("{:016x}", hasher.finish())
+}
+
+/// The spec as its generation hashes it: `Debug`, with an absent field added after the
+/// first tiers shipped rendered as it was before it existed. A new field that changed
+/// this string would orphan every tier's history at once (10-03: `unnest` did).
+fn generation_render(spec: &RollupSpec) -> String {
+    let rendered = format!("{spec:?}");
+    match spec.unnest {
+        None => rendered.replacen(", unnest: None }", " }", 1),
+        Some(_) => rendered,
+    }
 }
 
 /// SQL that builds one source `(project_id, date)` partition. Measure filters
@@ -3062,6 +3073,40 @@ mod tests {
         let source = source_and_filters(&aggregate.input, &mut predicates).expect("walkable");
         let routed = route_with_spec(&endpoint_spec(), &source, SOURCE, &predicates, aggregate, &state).await;
         routed.is_ok()
+    }
+
+    /// Every declared tier's generation must render exactly as the spec did before fields
+    /// were added to it — a changed string orphans all of a tier's history (10-03).
+    #[test]
+    fn a_field_added_to_rollup_specs_keeps_every_existing_generation() {
+        mod legacy {
+            /// `RollupSpec` as it was when the deployed tiers were built.
+            #[derive(Debug)]
+            #[allow(dead_code)]
+            pub struct RollupSpec {
+                pub grain: String,
+                pub name: Option<String>,
+                pub dimensions: Vec<String>,
+                pub measures: Vec<crate::schema::RollupMeasure>,
+                pub derive_from: Option<String>,
+                pub backfill_days: Option<u16>,
+            }
+        }
+        for source in crate::schema::registry().list_tables() {
+            for spec in
+                crate::schema::get_schema(&source).map(|schema| schema.rollups.clone()).unwrap_or_default().into_iter().filter(|spec| spec.unnest.is_none())
+            {
+                let legacy = legacy::RollupSpec {
+                    grain: spec.grain.clone(),
+                    name: spec.name.clone(),
+                    dimensions: spec.dimensions.clone(),
+                    measures: spec.measures.clone(),
+                    derive_from: spec.derive_from.clone(),
+                    backfill_days: spec.backfill_days,
+                };
+                assert_eq!(generation_render(&spec), format!("{legacy:?}"), "{source}/{:?}", spec.name);
+            }
+        }
     }
 
     /// For tests whose only interest is HOW a shape declines.
