@@ -237,7 +237,7 @@ builds and process ages, so they are not one baseline. pgwire p99 was 23.6 s and
       - tokio scheduling lag (2.06 s max on `fe58c7e2`).
       Instrument time-to-first-batch split into planning, routing, scan-permit wait and execution, so a stalled
       statement names its own phase.
-- [ ] **L2 The four 90 s shapes — all `hashes`-filtered shipbubble widgets** (10-02 20:45 log: 78 of 81 timeouts):
+- [~] **L2 The four 90 s shapes — all `hashes`-filtered shipbubble widgets** (tier live, backfilling) (10-02 20:45 log: 78 of 81 timeouts):
       latency percentile, error rate, apdex (`hashes @>`) and status breakdown, on 7–14 d windows. Apdex over 7 d:
       14.6–58 s with the tantivy prefilter, 30 s without (1.15 M matching rows of ~18 M); 14 d times out at 90 s.
       No routing fix exists: the tiers have no hash dimension. Next: a per-hash hourly tier (unnest `hashes` as a
@@ -283,7 +283,14 @@ builds and process ages, so they are not one baseline. pgwire p99 was 23.6 s and
       is version-only PER TIER (skipped by tiers that read none of its tagged columns, counted by tiers that read
       one); the DML candidate test becomes "some tier is unaffected"; the witness inputs are computed per read-set.
       Guard to write: a `hashes` UPDATE moves the hash tier's witness and leaves `dashboard_1m_v4`'s unchanged.
-      The endpoint-widget routing test lives on branch `latest-reads` (`2b473ea2`, unpushed). In 25 min, 78 heavy-permit holds lasted 80–90 s: statement timeouts that
+      **Done 10-03:** per-tier version-only witness `4217e58e` (a version is tagged when SOME tier ignores what it
+      assigns; witness inputs computed per tier); `hashes_30m` declared `00dbaf5c` with the guard that an unnest
+      tier answers only a query pinning one element (an unpinned count had answered 1 for 4 rows). Regression
+      shipped and fixed on the way: adding `RollupSpec.unnest` changed every spec's Debug, hence every tier's
+      generation (`ad71f20b`) — prod began rebuilding history (pending base 53 → 999); fixed `1ec5ff0d` with a
+      legacy-shape oracle test. First prod check: shipbubble 10-02 built; routed per-hash counts identical to raw
+      (25/25 buckets, `pat:6a072bab` and `e64bd2e9`). Pending: 7–14 d endpoint widget latency once the 14-day
+      backfill completes. In 25 min, 78 heavy-permit holds lasted 80–90 s: statement timeouts that
       return nothing, while holding 5–9 of the K = 8 permits in a typical minute (1,596 of 2,641 admissions
       queued). The shapes are 24h/7d overview widgets falling back to raw: latency percentile, error rate
       (`count(*) filter`), the status-code breakdown (`sum(count(*)) over ()`) and apdex (`hashes @>`). Get each
