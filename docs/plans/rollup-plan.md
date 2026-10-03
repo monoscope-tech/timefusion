@@ -273,7 +273,17 @@ builds and process ages, so they are not one baseline. pgwire p99 was 23.6 s and
             - { name: duration_sum, agg: sum, column: duration }
             - { name: duration_digest, agg: tdigest, column: duration }
             - { name: error_5xx_count, agg: count, filter: "COALESCE(attributes___http___response___status_code, 0) >= 500" }
-      ``` In 25 min, 78 heavy-permit holds lasted 80–90 s: statement timeouts that
+      ```
+      **BLOCKER before declaring it — per-tier version-only witness.** Version-only is decided per SOURCE:
+      `rollups_read_any` (dml.rs: whether a MoR UPDATE may be version-only at all), `version_only` in the row
+      witness (`partition_file_rows`), the content witness (`partition_file_content`), the build's `content_fp` and
+      `carry_rewrite_witness`. Declaring a tier that reads `hashes` therefore either (a) makes every `hashes`-only
+      UPDATE a normal write, re-staling ALL tiers' today slices — undoing `9e21fc3d` — or (b) if excluded, lets the
+      hash tier's witnesses ignore the very UPDATEs that change it (silent wrong counts). Required first: a file
+      is version-only PER TIER (skipped by tiers that read none of its tagged columns, counted by tiers that read
+      one); the DML candidate test becomes "some tier is unaffected"; the witness inputs are computed per read-set.
+      Guard to write: a `hashes` UPDATE moves the hash tier's witness and leaves `dashboard_1m_v4`'s unchanged.
+      The endpoint-widget routing test lives on branch `latest-reads` (`2b473ea2`, unpushed). In 25 min, 78 heavy-permit holds lasted 80–90 s: statement timeouts that
       return nothing, while holding 5–9 of the K = 8 permits in a typical minute (1,596 of 2,641 admissions
       queued). The shapes are 24h/7d overview widgets falling back to raw: latency percentile, error rate
       (`count(*) filter`), the status-code breakdown (`sum(count(*)) over ()`) and apdex (`hashes @>`). Get each
