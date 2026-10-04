@@ -354,12 +354,13 @@ builds and process ages, so they are not one baseline. pgwire p99 was 23.6 s and
       ordering over a duration and the sanity check refused a TopK whose orderings printed identically (~66 failures/day,
       reproduced in plain DataFusion). The session's `abs` answers Unordered instead. Verified on prod: the failing
       past-window lookups return in 1.4–2.4 s.
-- [x] **Service map: constant select items no longer defeat the shape cache** (`ca12f084`) — but that did not move its
-      planning (still 1.0–1.3 s on prod): monoscope sends it with `$N` params, so the logical plan was already cached.
-      The cost is physical: `sp` is inlined at five references, each with its own projection and pushed `kind IN`
-      filters, and each scan's Delta legs run dozens of delta-kernel file selections (~20 ms each, different
-      predicates). A per-statement scan memo was built and dropped — it never hits on this shape. Left as is: both
-      `with sp as` queries are monoscope's scheduled per-slice edge rollups into Postgres, not page reads.
+- [x] **Service map planning halved** (`4cfcefab`): `ca12f084` (constant select items lifted by the shape cache)
+      did not move it — monoscope sends `$N` params, so its logical plan was already cached. The cost was `kind IN
+      (...)`: `kind` is indexed, so each of `sp`'s five references ran a tantivy search over the window, matched
+      nearly every span and was declined as low-selectivity (~250 ms/scan). The decline now enters the over-cap memo
+      (`prefilter_skipped_low_selectivity_memo`). Prod: one-scan EXPLAIN 383–686 → 174–210 ms; the whole statement
+      alone 0.97 → ~0.5 s. The 5-minute burst (~10 projects' slice jobs in one second) still logs 1.0–1.4 s tails.
+      Both `with sp as` queries are monoscope's scheduled per-slice edge rollups into Postgres, not page reads.
 - [x] **Overview apdex** (`1f83be69`): HTTP-scoped cumulative bands on the dashboard tiers; `Merge::Apdex`.
 - [x] **Overview `var_service`**: already routes (hybrid); 1.0–2.6 s on prod, the 8–13 s bench samples were contention.
 - [x] **Overview top endpoints / requests-by-status** (`02f82bc3`): `endpoints_1m` [name, kind, status] + count;
@@ -370,8 +371,18 @@ builds and process ages, so they are not one baseline. pgwire p99 was 23.6 s and
       sorts `(timestamp, metric_name, series_id)` and every row group interleaves every metric. Fix = cluster by metric
       within the day: sort `(metric_name, series_id, timestamp)` (dedup keys stay leading, so dedup survives) — but it
       changes the timestamp ordering the read path, TopK and footer-ordering logic assume, and rewrites all metrics data.
-- [ ] Low priority: certifying today's closed hours (read-side dedup skipped only 6.9%); the hourly hash-count job
-      (`with served as …`, 3.7 s) could read `hashes_30m` if the router learned unnest CTEs.
+- [x] **Hourly proven-endpoint job (`with served as …`, 3.7 s raw) routes to `hashes_30m`** (`e480f2ae`): an
+      aggregate over an unnesting derived table is restated over the source with the element as the tier's dimension;
+      raw legs read the source unnested; `floor(epoch/N)` groups as an N-second bucket; new measure
+      `http_request_count` (the job's `method IS NOT NULL` guard) backfills over 14 days. Verify on prod after the
+      backfill: routed, `table.project_id` set on the raw leg's scan, routed == raw.
+- [ ] **Certifying today's closed hours — measured, not built (owner call).** Denials today are 98% `slice_only`: a
+      latest window always reaches past the proven intervals, so the whole day is deduped. A frontier split
+      (`T ≤ min(proven, MemBuffer row_min_ts)`, since merge-on-read versions land at old timestamps) is the design, but
+      the prize is small: shipbubble 24h raw = 9.4 s wall, DedupExec 0.41 s + its sorted merge 0.27 s (~7%), the rest
+      scan IO; dashboard 24h reads already route (~1.2 s). Not worth a duplicate-row risk unless that changes.
+- [x] **Dark flags: none left in code** — every owner-gated flag now defaults on (eager retraction `9d30d17f`,
+      heavy-query admission live). The remaining items are CapRover env (below).
 
 ### Stage 5 prerequisites: certification and dedup
 
