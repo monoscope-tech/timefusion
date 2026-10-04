@@ -347,6 +347,28 @@ builds and process ages, so they are not one baseline. pgwire p99 was 23.6 s and
   day whose plain statement routes; 10 plain runs moved rollup hits +13/+16 against ~0.6 expected from
   background traffic. Judge routing by counter diffs around plain runs.
 
+### Prod levers 10-04 (state review)
+
+- [x] **SanityCheckPlan on the nearest-trace lookup** (`8473b49b`): `ORDER BY abs(extract(epoch from timestamp -
+      $pivot)) LIMIT n` over a Delta-only window (scan sorted `timestamp DESC`) — built-in `abs` errored deriving its
+      ordering over a duration and the sanity check refused a TopK whose orderings printed identically (~66 failures/day,
+      reproduced in plain DataFusion). The session's `abs` answers Unordered instead. Verified on prod: the failing
+      past-window lookups return in 1.4–2.4 s.
+- [x] **Service map re-planned every call** (`ca12f084`): shape caching lifted constant select items in `UNION ALL`
+      branches to untyped placeholders; type coercion failed and the shape was negative-cached (~1.2 s planning/call).
+- [x] **Overview apdex** (`1f83be69`): HTTP-scoped cumulative bands on the dashboard tiers; `Merge::Apdex`.
+- [x] **Overview `var_service`**: already routes (hybrid); 1.0–2.6 s on prod, the 8–13 s bench samples were contention.
+- [x] **Overview top endpoints / requests-by-status** (`02f82bc3`): `endpoints_1m` [name, kind, status] + count;
+      same-grain ties now break by declaration order (dimension count says nothing about cardinality).
+- [ ] **Web vitals (`with source as …` on `otel_metrics`), owner decision.** Not a routing gap: the window-function
+      pipeline needs raw points, and the scan itself is the cost — demo 24 h reads 44.7 M rows / 460 MB to return 60 k
+      web-vital points (count alone 69.8 s; row groups, page index and blooms prune nothing) because `otel_metrics`
+      sorts `(timestamp, metric_name, series_id)` and every row group interleaves every metric. Fix = cluster by metric
+      within the day: sort `(metric_name, series_id, timestamp)` (dedup keys stay leading, so dedup survives) — but it
+      changes the timestamp ordering the read path, TopK and footer-ordering logic assume, and rewrites all metrics data.
+- [ ] Low priority: certifying today's closed hours (read-side dedup skipped only 6.9%); the hourly hash-count job
+      (`with served as …`, 3.7 s) could read `hashes_30m` if the router learned unnest CTEs.
+
 ### Stage 5 prerequisites: certification and dedup
 
 - [x] W33 skip dedup on certified-clean days; W37 per-project spans for the per-file skip (unproven:proved 23:1 → 2:1);
