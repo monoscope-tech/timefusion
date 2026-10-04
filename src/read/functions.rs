@@ -555,6 +555,69 @@ shared_udf!(pub variant_get_step_udf: VariantGetStepUdf);
 shared_udf!(pub json_to_variant_udf: datafusion_variant::JsonToVariantUdf);
 shared_udf!(pub json_to_pg_text_udf: JsonToPgTextUdf);
 
+/// A scalar UDF whose ordering, when it cannot be derived, is "unordered" rather than an error.
+///
+/// Built-in `abs` derives its ordering by comparing the argument's range with zero, and over
+/// a duration (`abs(timestamp - $pivot)`, monoscope's nearest-trace sort) that comparison
+/// errors. The error surfaced as `SanityCheckPlan` refusing a TopK whose required and actual
+/// orderings were identical (10-04: ~66 failed issue-page lookups a day). Unordered is always
+/// a sound answer: it only forgoes an ordering optimization.
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct OrderingTolerant(ScalarUDF);
+
+impl datafusion::logical_expr::ScalarUDFImpl for OrderingTolerant {
+    fn name(&self) -> &str {
+        self.0.name()
+    }
+    fn aliases(&self) -> &[String] {
+        self.0.aliases()
+    }
+    fn signature(&self) -> &datafusion::logical_expr::Signature {
+        self.0.signature()
+    }
+    fn return_type(&self, arg_types: &[DataType]) -> datafusion::error::Result<DataType> {
+        self.0.return_type(arg_types)
+    }
+    fn return_field_from_args(&self, args: datafusion::logical_expr::ReturnFieldArgs) -> datafusion::error::Result<arrow::datatypes::FieldRef> {
+        self.0.return_field_from_args(args)
+    }
+    fn invoke_with_args(&self, args: datafusion::logical_expr::ScalarFunctionArgs) -> datafusion::error::Result<datafusion::logical_expr::ColumnarValue> {
+        self.0.invoke_with_args(args)
+    }
+    fn simplify(
+        &self, args: Vec<datafusion::logical_expr::Expr>, info: &datafusion::logical_expr::simplify::SimplifyContext,
+    ) -> datafusion::error::Result<datafusion::logical_expr::simplify::ExprSimplifyResult> {
+        self.0.simplify(args, info)
+    }
+    fn coerce_types(&self, arg_types: &[DataType]) -> datafusion::error::Result<Vec<DataType>> {
+        self.0.coerce_types(arg_types)
+    }
+    fn short_circuits(&self) -> bool {
+        self.0.short_circuits()
+    }
+    fn evaluate_bounds(
+        &self, inputs: &[&datafusion::logical_expr::interval_arithmetic::Interval],
+    ) -> datafusion::error::Result<datafusion::logical_expr::interval_arithmetic::Interval> {
+        self.0.evaluate_bounds(inputs)
+    }
+    fn propagate_constraints(
+        &self, interval: &datafusion::logical_expr::interval_arithmetic::Interval, inputs: &[&datafusion::logical_expr::interval_arithmetic::Interval],
+    ) -> datafusion::error::Result<Option<Vec<datafusion::logical_expr::interval_arithmetic::Interval>>> {
+        self.0.propagate_constraints(interval, inputs)
+    }
+    fn output_ordering(
+        &self, inputs: &[datafusion::logical_expr::sort_properties::ExprProperties],
+    ) -> datafusion::error::Result<datafusion::logical_expr::sort_properties::SortProperties> {
+        Ok(self.0.output_ordering(inputs).unwrap_or(datafusion::logical_expr::sort_properties::SortProperties::Unordered))
+    }
+    fn preserves_lex_ordering(&self, inputs: &[datafusion::logical_expr::sort_properties::ExprProperties]) -> datafusion::error::Result<bool> {
+        Ok(self.0.preserves_lex_ordering(inputs).unwrap_or(false))
+    }
+    fn documentation(&self) -> Option<&datafusion::logical_expr::Documentation> {
+        self.0.documentation()
+    }
+}
+
 /// `ctx.register_udf(ScalarUDF::from(T))` for each UDF built from a default struct.
 macro_rules! reg_from {
     ($ctx:expr, $($udf:expr),+ $(,)?) => { $( $ctx.register_udf(ScalarUDF::from($udf)); )+ };
@@ -591,6 +654,7 @@ pub fn register_custom_functions(ctx: &mut datafusion::execution::context::Sessi
     );
 
     // create_udf-based UDFs that carry construction logic.
+    ctx.register_udf(ScalarUDF::new_from_impl(OrderingTolerant(datafusion::functions::math::abs().as_ref().clone())));
     ctx.register_udf(create_jsonb_array_elements_udf());
     ctx.register_udf(ScalarUDF::from(TimeBucketUDF::default()));
     ctx.register_udaf(binary_state_udaf("percentile_agg", DataType::Float64, Arc::new(|_| Ok(Box::<SketchAccumulator<TDigestWrapper>>::default()))));
@@ -2207,6 +2271,36 @@ mod time_bucket_streaming_tests {
                 async { ctx.sql(&format!("SELECT time_bucket({width}, TIMESTAMP '2026-01-01')")).await?.collect().await }.await;
             assert!(ran.is_err(), "invalid width {width}");
         }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod ordering_tolerant_tests {
+    use datafusion::prelude::*;
+
+    /// monoscope's nearest-trace lookup sorts by distance from a pivot over a scan the files
+    /// declare sorted by `timestamp DESC`. Built-in `abs` errored deriving that ordering and
+    /// `SanityCheckPlan` refused the TopK; red on a context without `register_custom_functions`.
+    #[tokio::test]
+    async fn a_distance_sort_over_a_sorted_scan_plans() -> datafusion::error::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(4));
+        super::register_custom_functions(&mut ctx).expect("custom functions");
+        for file in 0..3 {
+            let sql = format!(
+                "COPY (SELECT to_timestamp_micros(1790922600000000 - i * 1000000 - {file} * 7) AT TIME ZONE 'UTC' AS timestamp, \
+                 CAST(i AS VARCHAR) AS context___trace_id FROM generate_series(0, 2000) t(i) ORDER BY 1 DESC) TO '{}/f{file}.parquet'",
+                dir.path().display()
+            );
+            ctx.sql(&sql).await?.collect().await?;
+        }
+        let sorted = ParquetReadOptions::default().file_sort_order(vec![vec![col("timestamp").sort(false, true)]]);
+        ctx.register_parquet("t", dir.path().to_str().expect("utf8 path"), sorted).await?;
+        let sql = "select context___trace_id, timestamp from t where timestamp <> '2026-10-02T06:00:00Z' \
+                   order by abs(extract(epoch from timestamp - '2026-10-02T06:30:00Z'::timestamptz)) limit 2";
+        let rows: usize = ctx.sql(sql).await?.collect().await?.iter().map(|batch| batch.num_rows()).sum();
+        assert_eq!(rows, 2);
         Ok(())
     }
 }
