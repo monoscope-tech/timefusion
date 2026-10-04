@@ -7789,6 +7789,44 @@ async fn a_verified_sorted_footer_survives_a_restart() -> Result<()> {
     Ok(())
 }
 
+/// A verified path is only verified against the sort order it was checked under.
+#[test_case::test_case("# sorts: t=ts-n\na\n\nb\n" => Some(vec!["a", "b"]) ; "the same order keeps every path")]
+#[test_case::test_case("# sorts: t=ts-n\n" => Some(vec![]) ; "a current header with no paths is current")]
+#[test_case::test_case("# sorts: t=m+,ts-n\na\n" => None ; "a changed sort order discards them")]
+#[test_case::test_case("a\nb\n" => None ; "a file written before the header existed is discarded")]
+fn verified_paths_belong_to_one_sort_order(contents: &str) -> Option<Vec<&str>> {
+    super::maintain::verified_under(contents, "# sorts: t=ts-n")
+}
+
+/// A footer counts as sorted only for the order it declares: after a table's sort changes,
+/// every file written under the old order is a repair suspect again, and a check under the
+/// old order must not exonerate it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_footer_written_under_another_sort_order_is_a_repair_suspect() -> Result<()> {
+    let db = Database::with_config(create_test_config("footer-order")).await?;
+    let project = format!("order_{}", uuid::Uuid::new_v4().simple());
+    insert_a_span(&db, &project, "a", Utc::now().timestamp_micros() - 86_400_000_000).await?;
+    let table_ref = db.resolve_table(&project, "otel_logs_and_spans").await?;
+    let (store, files) = {
+        let table = table_ref.read().await;
+        (table.log_store().object_store(None), table.snapshot()?.log_data().iter().map(|f| f.path().into_owned()).collect::<Vec<_>>())
+    };
+    // The write marked it verified under the shipped order; a build with another order
+    // starts from an empty set (`verified_under`).
+    db.repair_verified_sorted.clear();
+    let shipped = get_schema("otel_logs_and_spans").expect("schema");
+    let mut reordered = shipped.clone();
+    reordered.sorting_columns.rotate_left(1);
+    let mut flipped = shipped.clone();
+    flipped.sorting_columns[0].descending ^= true;
+    for (schema, sorted) in [(&reordered, false), (&flipped, false), (shipped, true)] {
+        assert_eq!(Database::footer_sorted_as(&store, &files[0], schema).await, sorted, "{:?}", schema.sorting_columns);
+        assert_eq!(db.repair_bin_already_sorted(&table_ref, schema, &files).await, sorted);
+        assert_eq!(db.repair_verified_sorted.contains(&files[0]), sorted, "only the matching order exonerates the file");
+    }
+    Ok(())
+}
+
 fn add_action(path: &str) -> deltalake::kernel::Action {
     deltalake::kernel::Action::Add(deltalake::kernel::Add { path: path.to_string(), size: 1, ..Default::default() })
 }

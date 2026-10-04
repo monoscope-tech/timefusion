@@ -4362,7 +4362,9 @@ impl Database {
                 .fold(0u64, |bytes, file| bytes.saturating_add(estimated_decoded_bytes(file.size())))
         };
         note(5);
-        if operation == crate::maintenance_coordinator::Operation::Repair && self.repair_bin_already_sorted(&table_ref, &files).await {
+        if operation == crate::maintenance_coordinator::Operation::Repair
+            && self.repair_bin_already_sorted(&table_ref, schema_or_default(&key.source), &files).await
+        {
             return self.settle_compaction_unit(&table_ref, &key, true).await.map(|()| true);
         }
         let Some(schema) = get_schema(&key.source) else { return retry("compaction_schema_missing".to_owned(), 300) };
@@ -8144,7 +8146,7 @@ impl Database {
                     // `Retry`, NOT `Converged`: clearing a suspect leaves this project's next
                     // candidate unexamined, and `Converged` would drop it for the rest of the
                     // tick — one cleared suspect per tick.
-                    if pass == TailPass::Repair && self.repair_bin_already_sorted(table_ref, &files).await {
+                    if pass == TailPass::Repair && self.repair_bin_already_sorted(table_ref, schema_or_default(table_name), &files).await {
                         return (project_id, Ok(BinOutcome::Retry));
                     }
                     // Did a previous attempt already WRITE this exact rewrite? Commit it
@@ -9126,7 +9128,12 @@ impl Database {
     pub(crate) fn persist_verified_sorted(&self, paths: &[String]) {
         let _guard = crate::support::lock(&self.repair_verified_lock);
         let file_path = self.repair_verified_path();
-        let write = crate::support::without_blocking_the_worker(|| append_state_lines(&file_path, paths));
+        let write = crate::support::without_blocking_the_worker(|| {
+            if !file_path.exists() {
+                append_state_lines(&file_path, &[sort_signature_line()])?;
+            }
+            append_state_lines(&file_path, paths)
+        });
         if let Err(e) = write {
             warn!("verified-sorted append failed ({:?}): {} — repair will re-probe these footers after a restart", file_path, e);
         }
@@ -9155,11 +9162,13 @@ impl Database {
         let file_path = self.repair_verified_path();
         crate::support::without_blocking_the_worker(|| {
             let Ok(contents) = std::fs::read_to_string(&file_path) else { return (Vec::new(), 0) };
-            let all: Vec<&str> = contents.lines().filter(|line| !line.is_empty()).collect();
+            let signature = sort_signature_line();
+            let current = verified_under(&contents, &signature);
+            let all = current.as_deref().unwrap_or_default();
             let kept: Vec<String> = all[all.len().saturating_sub(REPAIR_VERIFIED_PERSIST_CAP)..].iter().map(|line| (*line).to_string()).collect();
-            let dropped = all.len() - kept.len();
-            if dropped > 0
-                && let Err(e) = std::fs::write(&file_path, kept.iter().map(|path| format!("{path}\n")).collect::<String>())
+            let dropped = contents.lines().filter(|line| !line.is_empty()).count().saturating_sub(kept.len() + 1);
+            if (current.is_none() || dropped > 0)
+                && let Err(e) = std::fs::write(&file_path, std::iter::once(&signature).chain(&kept).map(|line| format!("{line}\n")).collect::<String>())
             {
                 warn!("verified-sorted compaction failed ({:?}): {e}", file_path);
             }
@@ -9666,7 +9675,9 @@ impl Database {
         use futures::StreamExt;
         let before = planned.len();
         let kept: Vec<(String, Vec<String>)> = futures::stream::iter(planned)
-            .map(|(project_id, files)| async move { (!self.repair_bin_already_sorted(table_ref, &files).await).then_some((project_id, files)) })
+            .map(|(project_id, files)| async move {
+                (!self.repair_bin_already_sorted(table_ref, schema_or_default(table_name), &files).await).then_some((project_id, files))
+            })
             .buffer_unordered(REPAIR_VERIFY_CONCURRENCY)
             .filter_map(std::future::ready)
             .collect()
@@ -9677,14 +9688,14 @@ impl Database {
         kept
     }
 
-    /// True if every file in the repair bin already carries a `sorting_columns` footer.
+    /// True if every file in the repair bin already carries `schema`'s sort order in its footer.
     ///
     /// Records the bin in `repair_verified_sorted` when true so admission stops offering it.
     /// Unreadable footer is not evidence of sortedness, so returns false.
-    async fn repair_bin_already_sorted(&self, table_ref: &Arc<RwLock<DeltaTable>>, files: &[String]) -> bool {
+    pub(super) async fn repair_bin_already_sorted(&self, table_ref: &Arc<RwLock<DeltaTable>>, schema: &crate::schema::TableSchema, files: &[String]) -> bool {
         let object_store = { table_ref.read().await.log_store().object_store(None) };
         for path in files {
-            if !Self::footer_declares_sorted(&object_store, path).await {
+            if !Self::footer_sorted_as(&object_store, path, schema).await {
                 return false;
             }
         }
@@ -9693,16 +9704,15 @@ impl Database {
         true
     }
 
-    /// True if every row group of this object carries a non-empty `sorting_columns` footer.
+    /// True if this object's footer declares `schema`'s sort order ([`footer_declares`]).
     /// An unreadable footer returns false (a needless rewrite beats a silent wrong answer).
-    async fn footer_declares_sorted(object_store: &Arc<dyn object_store::ObjectStore>, path: &str) -> bool {
+    pub(super) async fn footer_sorted_as(object_store: &Arc<dyn object_store::ObjectStore>, path: &str, schema: &crate::schema::TableSchema) -> bool {
         use deltalake::datafusion::parquet::arrow::async_reader::AsyncFileReader;
         use object_store::{ObjectStoreExt, path::Path as OsPath};
         let os_path = OsPath::from(path);
         let Ok(meta) = object_store.head(&os_path).await else { return false };
         let mut reader = crate::storage::ObjectStoreReader::new(object_store.clone(), os_path, meta.size);
-        let Ok(pq) = reader.get_metadata(None).await else { return false };
-        !pq.row_groups().iter().any(|rg| rg.sorting_columns().is_none_or(|sc| sc.is_empty()))
+        reader.get_metadata(None).await.is_ok_and(|pq| footer_declares(&pq, schema))
     }
 
     /// Seed the verified-sorted set from files that already exist (write-time marking only
@@ -9724,7 +9734,7 @@ impl Database {
         // Grouped BY TABLE with the store taken once under the enumeration lock, so the probe
         // stage below takes NO table locks: per-file re-locking would starve
         // `refresh_table_snapshot`'s writer and leave queries on a stale snapshot.
-        let mut unknown: Vec<(Arc<dyn object_store::ObjectStore>, Vec<String>)> = Vec::new();
+        let mut unknown: Vec<(Arc<dyn object_store::ObjectStore>, &crate::schema::TableSchema, Vec<String>)> = Vec::new();
         let mut tables_read = 0usize;
         let mut candidates = 0usize;
         for (_, source, table_ref) in self.all_tables().await {
@@ -9745,7 +9755,7 @@ impl Database {
                     .collect();
                 candidates += paths.len();
                 if !paths.is_empty() {
-                    unknown.push((table.log_store().object_store(None), paths));
+                    unknown.push((table.log_store().object_store(None), schema_or_default(&source), paths));
                 }
             }
             if candidates >= limit {
@@ -9762,12 +9772,12 @@ impl Database {
         // PARAMETER carries the store leaves the trait object's lifetime to inference, which
         // then demands an unsatisfiable higher-ranked `FnOnce`.
         let mut verified: Vec<String> = Vec::new();
-        for (object_store, paths) in unknown {
+        for (object_store, schema, paths) in unknown {
             let found: Vec<String> = futures::stream::iter(paths)
                 .map(|path| {
                     // Cloned INSIDE the closure so its parameter is a plain `String`.
                     let object_store = Arc::clone(&object_store);
-                    async move { Self::footer_declares_sorted(&object_store, &path).await.then_some(path) }
+                    async move { Self::footer_sorted_as(&object_store, &path, schema).await.then_some(path) }
                 })
                 .buffer_unordered(REPAIR_VERIFY_CONCURRENCY)
                 .filter_map(std::future::ready)
@@ -10249,6 +10259,38 @@ impl Database {
 /// Append newline-terminated records to a maintenance state file, creating its parent
 /// directory if needed. Callers must hold the file's lock and wrap this in
 /// `without_blocking_the_worker`; these files are cleanup aids, never correctness boundaries.
+/// The header stamping `repair_verified_sorted.txt` with every table's declared sort order.
+/// A path is only "verified" against the order it was checked under, and a schema change
+/// arrives only with a new build, so a file stamped with any other header is discarded at
+/// load and its footers are probed again against the new order.
+fn sort_signature_line() -> String {
+    let column = |c: &crate::schema::SortingColumnDef| format!("{}{}{}", c.name, if c.descending { "-" } else { "+" }, if c.nulls_first { "n" } else { "" });
+    let table = |name: String| Some(format!("{name}={}", crate::schema::get_schema(&name)?.sorting_columns.iter().map(column).join(",")));
+    format!("# sorts: {}", crate::schema::registry().list_tables().into_iter().sorted().filter_map(table).join(";"))
+}
+
+/// The verified paths `contents` holds, or `None` when its header is not `signature`.
+pub(crate) fn verified_under<'a>(contents: &'a str, signature: &str) -> Option<Vec<&'a str>> {
+    let mut lines = contents.lines().filter(|line| !line.is_empty());
+    (lines.next() == Some(signature)).then(|| lines.collect())
+}
+
+/// Whether every row group of a parquet footer declares exactly `schema`'s sort order —
+/// columns, direction and null order. Columns are resolved by NAME through the file's own
+/// schema, since a footer's leaf indices are relative to the schema it was written under.
+/// A footer declaring any other order (a table whose sort changed) is a repair suspect.
+pub(crate) fn footer_declares(pq: &deltalake::datafusion::parquet::file::metadata::ParquetMetaData, schema: &crate::schema::TableSchema) -> bool {
+    let leaves = pq.file_metadata().schema_descr();
+    let leaf = |idx: i32| usize::try_from(idx).ok().and_then(|i| leaves.columns().get(i)).map(|column| column.name());
+    let expected: Vec<_> =
+        schema.sorting_columns.iter().filter(|c| !schema.partitions.contains(&c.name)).map(|c| (Some(c.name.as_str()), c.descending, c.nulls_first)).collect();
+    !expected.is_empty()
+        && pq.row_groups().iter().all(|rg| {
+            rg.sorting_columns()
+                .is_some_and(|declared| declared.iter().map(|sc| (leaf(sc.column_idx), sc.descending, sc.nulls_first)).eq(expected.iter().copied()))
+        })
+}
+
 fn append_state_lines(path: &std::path::Path, lines: &[String]) -> std::io::Result<()> {
     use std::io::Write;
     if let Some(dir) = path.parent() {

@@ -164,7 +164,7 @@ Tests (rs-minimal-tests ladder):
 
 Gate: suite + e2e green; prod `dedup_full_set_total` unchanged after deploy.
 
-### Stage 2 — repair rewrites files whose footer order differs from the schema
+### Stage 2 — repair rewrites files whose footer order differs from the schema  ✅ implemented
 
 - Compare each file's footer `sorting_columns` with `schema.sorting_columns()` (names + direction), not just
   presence (`maintain.rs` ~9696, `compact.rs` ~628). A mismatched file is a repair candidate.
@@ -173,11 +173,18 @@ Gate: suite + e2e green; prod `dedup_full_set_total` unchanged after deploy.
 - Admission: one (project, date) unit at a time, priced in decoded bytes like today. Pace so the table
   (~185 GB) migrates over days without starving dedup/rollups — reuse the repair lane's budget, newest days
   first (they are what dashboards read).
-- Inert until Stage 3 (all footers match the current schema).
+- Implementation: one predicate `footer_declares` (columns resolved by name through the file's own schema,
+  plus direction and null order) shared by repair, the seed sweep and recompress; `repair_verified_sorted.txt`
+  carries a `# sorts:` header of every table's order, and a file under any other header is discarded at load.
+- **Not inert:** the first boot finds no header and re-probes every footer once — a dry run of the cost Stage 3
+  pays. Prod sample (10-04): 122/122 `otel_metrics` and 120/121 `otel_logs_and_spans` footers match exactly;
+  the one miss is an old leaf-index footer naming the wrong column — a lying footer the old "any non-empty
+  footer" check accepted, now repaired.
 
 Tests:
-- A file written under one sort and read under another is selected; a matching file is not.
-- Fixed point: after repair, a second pass selects nothing (no churn — see the 09-13 work-amplifier lesson).
+- A file written under one sort and read under another is selected; a matching file is not
+  (`a_footer_written_under_another_sort_order_is_a_repair_suspect`, plus a case table for the header).
+- Fixed point after repair: **moved to Stage 3**, where the shipped schema actually changes order.
 
 ### Stage 2b — dedup each layout's dates separately
 
@@ -234,6 +241,7 @@ Tests:
   unaffected: their SQL orders explicitly and their own sort is independent.
 
 Tests:
+- Fixed point (from Stage 2): after repairing a day written under the old order, a second pass selects nothing.
 - The existing `the_shipped_dedup_keys_lead_the_shipped_sort` (`compact.rs:2252`) passes with both lists
   reordered together.
 - Routed rollups over a mixed-layout window equal raw (`a_per_series_counter_rate_routes_to_the_series_tier_and_equals_raw`).

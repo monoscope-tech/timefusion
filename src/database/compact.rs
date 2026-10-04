@@ -625,19 +625,17 @@ impl Database {
         // A partition holding an UNSORTED file is never "done", whatever its
         // compression tier — a tier-qualified file with an unsorted footer voids the
         // declared ordering for every scan. Sortedness vetoes the tier-probe skip.
-        let declares_order = get_schema(table_name).is_some_and(|s| !s.sorting_columns.is_empty());
-        let any_unsorted = declares_order
+        let ordered = get_schema(table_name).filter(|s| !s.sorting_columns.is_empty());
+        let any_unsorted = ordered.is_some()
             && futures::stream::iter(&uris)
                 .any(|uri| {
                     let object_store = object_store.clone();
                     // An unreadable footer is not evidence of sortedness; say
                     // no for this file and let the tier probe decide.
                     async move {
-                        Self::probe_footer(&object_store, table_prefix, uri, |pq| {
-                            Some(pq.row_groups().iter().any(|rg| rg.sorting_columns().is_none_or(|sc| sc.is_empty())))
-                        })
-                        .await
-                        .is_ok_and(|unsorted| unsorted == Some(true))
+                        Self::probe_footer(&object_store, table_prefix, uri, |pq| ordered.map(|schema| !super::maintain::footer_declares(pq, schema)))
+                            .await
+                            .is_ok_and(|unsorted| unsorted == Some(true))
                     }
                 })
                 .await;
