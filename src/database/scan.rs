@@ -30,6 +30,68 @@ fn split_sorted_runs(mut parts: Vec<Vec<RecordBatch>>, target: usize) -> Vec<Vec
     parts
 }
 
+/// `CAST(<string> AS Utf8View)` that keeps its input's ordering. The cast is one-to-one and
+/// byte-order preserving, but DataFusion's `CastExpr` only carries orderings through numeric
+/// widening, so a Delta leg whose files lead with a string sort key (metric-first
+/// `otel_metrics`) would lose its declared ordering — and with it bounded dedup — in the
+/// projection that coerces it to the table schema.
+#[derive(Debug, Eq)]
+struct StringViewCast {
+    expr: Arc<dyn datafusion::physical_expr::PhysicalExpr>,
+}
+
+// By hand: the derives trip rust-lang/rust#78808 on `Arc<dyn PhysicalExpr>`, as in DataFusion's own exprs.
+impl PartialEq for StringViewCast {
+    fn eq(&self, other: &Self) -> bool {
+        self.expr.eq(&other.expr)
+    }
+}
+
+impl std::hash::Hash for StringViewCast {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.expr.hash(state);
+    }
+}
+
+impl std::fmt::Display for StringViewCast {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "CAST({} AS Utf8View)", self.expr)
+    }
+}
+
+impl datafusion::physical_expr::PhysicalExpr for StringViewCast {
+    fn return_field(&self, input_schema: &arrow_schema::Schema) -> DFResult<arrow_schema::FieldRef> {
+        Ok(Arc::new(self.expr.return_field(input_schema)?.as_ref().clone().with_data_type(arrow_schema::DataType::Utf8View)))
+    }
+
+    fn evaluate(&self, batch: &RecordBatch) -> DFResult<datafusion::logical_expr::ColumnarValue> {
+        self.expr.evaluate(batch)?.cast_to(&arrow_schema::DataType::Utf8View, None)
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn datafusion::physical_expr::PhysicalExpr>> {
+        vec![&self.expr]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>, mut children: Vec<Arc<dyn datafusion::physical_expr::PhysicalExpr>>,
+    ) -> DFResult<Arc<dyn datafusion::physical_expr::PhysicalExpr>> {
+        Ok(Arc::new(Self { expr: children.swap_remove(0) }))
+    }
+
+    fn get_properties(
+        &self, children: &[datafusion::logical_expr::sort_properties::ExprProperties],
+    ) -> DFResult<datafusion::logical_expr::sort_properties::ExprProperties> {
+        let unbounded = datafusion::logical_expr::interval_arithmetic::Interval::make_unbounded(&arrow_schema::DataType::Utf8View)?;
+        Ok(children[0].clone().with_range(unbounded))
+    }
+
+    fn fmt_sql(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "CAST(")?;
+        self.expr.fmt_sql(f)?;
+        write!(f, " AS Utf8View)")
+    }
+}
+
 impl ProjectRoutingTable {
     pub fn new(
         default_project: String, database: Arc<Database>, schema: SchemaRef, batch_queue: Option<Arc<crate::write::BatchQueue>>, table_name: String,
@@ -685,7 +747,7 @@ impl ProjectRoutingTable {
             None => self.schema.clone(),
         };
 
-        let coerced = Self::coerce_plan_to_schema(delta_plan, &target_schema)?;
+        let coerced = Self::coerce_plan_to_schema(delta_plan, &target_schema, !self.sort_led_by_time())?;
         // Delta may leave predicates inexact, especially when a deletion vector
         // prevents Parquet filtering. Apply immutable predicates AFTER its row
         // masks, but BEFORE dedup has to retain every row in the selected files.
@@ -773,27 +835,573 @@ impl ProjectRoutingTable {
         Ok(Arc::new(GatedScanExec::new(plan, sem, Some(self.database.scan_metrics.clone()), bypass_cache, pool_size)))
     }
 
-    /// Sort keys that make `DedupExec`'s keep-greatest engage.
-    ///
-    /// Only for a table declaring a `dedup_tiebreak`: the leading run of declared sorting columns
-    /// that are dedup keys. Equal dedup keys agree on all of them, so all versions of a row live in
-    /// one contiguous run and the operator can emit without buffering the scan. An i64-backed lead
-    /// alone already bounds a run, so it stays one column and the injected sort cheap; any other
-    /// lead takes the whole prefix, or one run could span every row sharing a `metric_name`.
-    pub(crate) fn keep_greatest_ordering(table: &crate::schema::TableSchema, leg_schema: &SchemaRef) -> Option<datafusion::physical_expr::LexOrdering> {
-        use datafusion::{
-            arrow::{compute::SortOptions, datatypes::DataType},
-            physical_expr::{LexOrdering, PhysicalSortExpr},
+    /// Whether the table's sort leads with an i64-backed column, as every table did before
+    /// `otel_metrics` went metric-first; such a table plans exactly as it always has.
+    pub(super) fn sort_led_by_time(&self) -> bool {
+        use datafusion::arrow::datatypes::DataType;
+        crate::schema::get_schema(&self.table_name)
+            .and_then(|schema| self.schema.field_with_name(&schema.sorting_columns.first()?.name).ok())
+            .is_none_or(|lead| matches!(lead.data_type(), DataType::Int64 | DataType::Timestamp(..)))
+    }
+
+    /// The scan proper: one plan over the whole window. `scan` calls it directly, or once per
+    /// layout run (`scan_layout_runs`), which therefore never splits again.
+    async fn scan_whole(
+        &self, state: &dyn Session, projection: Option<&Vec<usize>>, filters: &[Expr], limit: Option<usize>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        let span = tracing::Span::current();
+        let scan_start = std::time::Instant::now();
+        let scan_metrics = self.database.scan_metrics.clone();
+
+        // Internal Delta-only reads (rollup builds, maintenance) are not the
+        // unbounded client scans this guard exists to reject.
+        if !self.database.bypass_rollup
+            && let Some(reason) = self.bounded_otel_scan_reason(filters, limit)
+        {
+            match self.database.config.core.timefusion_otel_scan_guard {
+                config::OtelScanGuard::Off => {}
+                config::OtelScanGuard::Observe => {
+                    metrics::counter!(scan_metric_names::BOUNDED_OTEL_SCAN_CANDIDATES).increment(1);
+                    warn!(event = "otel_scan_guard_candidate", table.name = %self.table_name, reason, "raw OTel scan would be rejected");
+                }
+                config::OtelScanGuard::Enforce => {
+                    metrics::counter!(scan_metric_names::BOUNDED_OTEL_SCAN_REJECTIONS).increment(1);
+                    return Err(DataFusionError::Plan("raw OTel queries require project_id = <value> and a timestamp lower bound or LIMIT".to_string()));
+                }
+            }
+        }
+
+        // Mutable predicates must run after version resolution. Narrowing only
+        // the indexed leg can remove the winning version of a matching raw row.
+        // `decide_prefilter` therefore refuses mutable predicates entirely.
+        let mutable = Self::version_mutable_columns(&self.table_name);
+        let unstripped_filters = filters;
+        let filters: Vec<Expr> = filters.iter().filter(|f| Self::leg_safe(&self.table_name, mutable.as_ref(), f)).cloned().collect();
+        let optimized_filters = self.apply_time_series_optimizations(&filters)?;
+
+        let project_id = self.extract_project_id_from_filters(&optimized_filters).unwrap_or_else(|| self.default_project.clone());
+        span.record("table.project_id", project_id.as_str());
+
+        // Tantivy prefilter, two independent paths: the Delta side builds `id IN (delta_ids)`
+        // for the Delta scan only (MemBuffer rows are never indexed, so applying it there would
+        // drop valid rows); the MemBuffer side prefilters under its own bucket lock. On a MOR
+        // table keep the unstripped tree so mutable predicates can be detected.
+        let text_match_tree = match mutable.is_some() {
+            false => crate::tantivy::udf::collect_text_match_tree(&optimized_filters),
+            true => crate::tantivy::udf::collect_text_match_tree(&self.apply_time_series_optimizations(unstripped_filters)?),
         };
+        // Query [lo,hi] timestamp window, shared by the tantivy prefilter and the skip-delta
+        // watermark check below.
+        let query_time_range = filters_time_range(&optimized_filters);
+        let mut tantivy_id_filter: Option<Expr> = None;
+        // When index coverage is partial, indexed and raw files are read as separate Delta legs.
+        // Only the indexed leg receives the narrowing id-set; uncovered files retain the
+        // original predicate and therefore cannot lose rows.
+        let mut tantivy_covered_files: Option<HashSet<String>> = None;
+        // Files the prefilter proved hold no matches (zero-hit covering
+        // index) — excluded from the Delta scan when file pruning is on.
+        let mut tantivy_exclude: Option<HashSet<String>> = None;
+        // Per-file matching row ordinals (row-selection pushdown), for files
+        // whose covering index was built in parquet row order.
+        let mut tantivy_row_selections: Option<HashMap<String, Vec<u64>>> = None;
+        // File-level needle pruning: table-relative paths the resident bloom registry proves
+        // cannot contain the query's equality/IN needles. Memory-only consult — a cold registry
+        // prunes nothing. Unlike zero_hit_files this must reach the RAW leg too.
+        let bloom_rejected: Option<HashSet<String>> = (|| {
+            let reg = self.database.bloom_prune()?;
+            let dates = crate::read::bloom_prune::dates_in_range(query_time_range?)?;
+            let schema = crate::schema::get_schema(&self.table_name)?;
+            let needles = crate::read::bloom_prune::extract_needles(&optimized_filters, schema, Self::version_mutable_columns(&self.table_name).as_ref());
+            if needles.is_empty() {
+                return None;
+            }
+            let rejected = reg.rejected_rels(&self.table_name, &project_id, &dates, &needles);
+            (!rejected.is_empty()).then_some(rejected)
+        })();
+        if let Some(tree) = text_match_tree.as_ref()
+            && let Some(svc) = self.database.tantivy_search()
+        {
+            let tcfg = &self.database.config().tantivy;
+            let max_hits = tcfg.prefilter_max_hits();
+            let min_sel_pct = tcfg.prefilter_min_selectivity_pct() as u64;
+            crate::observability::record_tantivy_prefilter_attempt();
+            metrics::counter!(scan_metric_names::PREFILTER_ATTEMPTS).increment(1);
+
+            let skip = |reason: &'static str| {
+                record_prefilter_skip(reason);
+                debug!("Tantivy prefilter skipped for {}/{}: {}", project_id, self.table_name, reason);
+            };
+            // ONE pass over the in-window index set: the predicate tree compiles to a single
+            // tantivy BooleanQuery per index (And→Must, Or→Should), hits unioned across indexes
+            // (they cover disjoint row sets).
+            match svc.search_detailed(&self.table_name, &project_id, tree, max_hits, query_time_range, false).await {
+                Ok(Ok(r)) => match decide_prefilter(
+                    r.hits.into_iter().map(|h| h.id).collect(),
+                    r.indexed_rows,
+                    min_sel_pct,
+                    r.field_coverage_gap,
+                    r.covered_files,
+                    r.zero_hit_files,
+                    r.row_selections,
+                    // Predicate-aware, not table-wide: if every ROUTED predicate column is
+                    // immutable, all versions of a matching row carry the same values, so a
+                    // file whose index found no match cannot hold any version of one
+                    // (tombstones included — same keys). A predicate touching a mutable column
+                    // (or the tiebreak/tombstone) takes the conservative path.
+                    routed_touches_mutable(mutable.as_ref(), text_match_tree.as_ref()),
+                    tcfg.timefusion_tantivy_file_pruning,
+                    tcfg.timefusion_tantivy_row_selection,
+                ) {
+                    PrefilterDecision::Skipped(reason) => {
+                        if reason == "low_selectivity" {
+                            svc.remember_unselective(&self.table_name, &project_id, tree, max_hits, query_time_range);
+                        }
+                        skip(reason)
+                    }
+                    PrefilterDecision::Used { ids, covered_files, exclude_files, row_selections } => {
+                        crate::observability::record_tantivy_prefilter_used();
+                        metrics::counter!(scan_metric_names::PREFILTER_USED).increment(1);
+                        tantivy_id_filter = Some(col("id").in_list(ids.into_iter().map(lit).collect(), false));
+                        // Carry the coverage set forward and split against the snapshot taken at
+                        // scan construction: a flush or compaction can commit in between.
+                        tantivy_covered_files = Some(covered_files);
+                        tantivy_exclude = exclude_files;
+                        tantivy_row_selections = row_selections;
+                    }
+                },
+                Ok(Err(reason)) => skip(reason),
+                Err(e) => {
+                    warn!("tantivy search failed for {}/{}: {:#} — falling back to full scan", project_id, self.table_name, e);
+                    crate::observability::record_tantivy_prefilter_error();
+                    skip("delta_error");
+                }
+            }
+        }
+
+        // Read-side dedup setup: collapse physical duplicates of dedup-key rows
+        // over the routed/pruned union at query time, so COUNT(*) is correct
+        // regardless of sweep timing. The pushed projection is augmented with
+        // any dedup-key columns the query projected away; `output_projection`
+        // restores the requested set. No-op without declared dedup_keys.
+        let table_schema = crate::schema::get_schema(&self.table_name);
+        let dedup_keys: Vec<String> = table_schema.as_ref().map(|s| s.dedup_keys.clone()).unwrap_or_default();
+        // The tiebreak rides in with the keys ONLY for merge-on-read tables (DedupExec keeps
+        // the greatest version per key and must see the column). Elsewhere keep-greatest cannot
+        // engage, so the column would be read and never used.
+        let dedup_tiebreak: Option<String> = table_schema.as_ref().filter(|s| s.version_append).and_then(|s| s.dedup_tiebreak.clone());
+        // Merge-on-read DELETE: a tombstone version must reach the filter ABOVE
+        // the dedup, so its marker column rides in with the keys and is stripped
+        // again afterwards. `None` on every table that declares none.
+        let tombstone: Option<String> = table_schema.and_then(|s| s.tombstone_column.clone());
+        // `tombstone_keep` is the requested width when the marker rode in purely for the filter
+        // (one trailing column the post-filter projection removes). The dedup skip must be
+        // decided BEFORE the projection is built, or augmenting with the keys disables it.
+        // A fast-resolve miss simply declines — the skip is an optimisation, never correctness.
+        let skip_verdict = match dedup_keys.is_empty() {
+            true => DedupSkipVerdict::Disabled,
+            false => self
+                .database
+                .try_fast_resolve(&project_id, &self.table_name)
+                .and_then(|t| t.try_read().ok().map(|table| self.dedup_skip_allowed(&table, &project_id, query_time_range, &dedup_keys)))
+                // A resolve miss is its own denial reason (cold provider cache), not an
+                // uncertified partition.
+                .unwrap_or(DedupSkipVerdict::Unresolved),
+        };
+        let pre_skip_dedup = skip_verdict.granted();
+        let (scan_projection, output_projection, tombstone_keep): (Option<Vec<usize>>, Option<Vec<usize>>, Option<usize>) = match projection {
+            Some(p) if !dedup_keys.is_empty() || tombstone.is_some() => {
+                let full_schema = self.schema();
+                // The dedup keys ALWAYS ride in, even when `pre_skip_dedup` says the window is
+                // certified: the skip is granted PER LEG below and the mem ∪ delta union path
+                // never grants it, so dropping the keys here yields DedupExecs over scans that
+                // cannot feed them.
+                let augment = dedup_keys.iter().chain(dedup_tiebreak.iter()).chain(tombstone.iter());
+                let missing: Vec<usize> = augment.filter_map(|k| full_schema.index_of(k).ok()).filter(|i| !p.contains(i)).collect();
+                if missing.is_empty() {
+                    (Some(p.clone()), None, None)
+                } else {
+                    let aug: Vec<usize> = p.iter().chain(&missing).copied().collect();
+                    // The marker alone must survive DedupExec's projection restore; its index is
+                    // in `missing`, hence in `aug`, by construction. Requested columns occupy the
+                    // first p.len() positions of the augmented output.
+                    let extra = tombstone.as_ref().and_then(|t| full_schema.index_of(t).ok()).filter(|i| !p.contains(i));
+                    let out: Vec<usize> = (0..p.len()).chain(extra.and_then(|ti| aug.iter().position(|&i| i == ti))).collect();
+                    (Some(aug), Some(out), extra.map(|_| p.len()))
+                }
+            }
+            _ => (projection.cloned(), None, None),
+        };
+        let projection = scan_projection.as_ref();
+        // DedupExec drops rows AFTER the scan, so a pushed `limit` must NOT truncate the
+        // underlying scans — the deduped result could then yield < limit rows even when more
+        // exist below the cut. The outer limit still caps; `orig_limit` is restored on
+        // Delta-only paths that skip DedupExec. The tombstone filter suppresses it for the
+        // same reason even where dedup doesn't.
+        let orig_limit = limit;
+        let limit = limit.filter(|_| dedup_keys.is_empty() && tombstone.is_none());
+
+        let scan_state = parking_lot::Mutex::new(ScanShape::default());
+        // DedupExec restores the requested columns when it runs; every leg that bypasses it
+        // still owes that debt, or augmented key columns leak into the result and the two
+        // sides of a union disagree on schema.
+        let pay_projection = |leg: Arc<dyn ExecutionPlan>| match &output_projection {
+            Some(idxs) => Self::project_indices(leg, idxs),
+            None => Ok(leg),
+        };
+        let finish = |plan: Arc<dyn ExecutionPlan>| match &tombstone {
+            Some(marker) => Self::filter_tombstones(plan, marker, tombstone_keep),
+            None => Ok(plan),
+        };
+        // Legs of the mem ∪ hot ∪ delta union, in recency order. `skip_legs` are Delta legs over
+        // date partitions certified duplicate-free: they are unioned ABOVE DedupExec rather than
+        // fed through it. Sound because `date` derives from `timestamp` and DML re-appends
+        // preserve it, so no dedup key spans a date boundary.
+        let wrap_result_split =
+            |mut legs: Vec<(Arc<dyn ExecutionPlan>, crate::read::LegKind)>, skip_legs: Vec<Arc<dyn ExecutionPlan>>| -> DFResult<Arc<dyn ExecutionPlan>> {
+                fn union_or_single(mut plans: Vec<Arc<dyn ExecutionPlan>>) -> DFResult<Arc<dyn ExecutionPlan>> {
+                    Ok(if plans.len() == 1 { plans.remove(0) } else { UnionExec::try_new(plans)? as Arc<dyn ExecutionPlan> })
+                }
+                // A leg pruned to nothing bottoms out in an EmptyExec, which declares no output
+                // ordering, and one such leg would veto `merge_req` below (Delta legs are
+                // unsortable) — costing the SPM and forcing DedupExec into full-set mode. An
+                // empty leg contributes no rows; drop it. Keep one if all are empty so the
+                // single-plan path stays valid.
+                fn provably_empty(plan: &dyn ExecutionPlan) -> bool {
+                    plan.is::<datafusion::physical_plan::empty::EmptyExec>() || matches!(plan.children().as_slice(), [child] if provably_empty(child.as_ref()))
+                }
+                if legs.len() > 1 && legs.iter().any(|(p, _)| provably_empty(p.as_ref())) {
+                    match legs.iter().any(|(p, _)| !provably_empty(p.as_ref())) {
+                        true => legs.retain(|(p, _)| !provably_empty(p.as_ref())),
+                        false => legs.truncate(1),
+                    }
+                }
+                // Under a per-date split the deduped side can end up with NO legs while the
+                // certified side carries every row (file-level pruning removes the uncertified
+                // dates' files entirely). Everything below indexes `plans[0]`, so without this
+                // the scan panics. The certified legs need no dedup, only the projection debt.
+                let shape = ScanShape { partial_skip: !skip_legs.is_empty(), ..*scan_state.lock() };
+                scan_metrics.record_scan(scan_start.elapsed().as_micros() as u64, shape, skip_verdict);
+                if legs.is_empty() && !skip_legs.is_empty() {
+                    return finish(union_or_single(skip_legs.into_iter().map(&pay_projection).collect::<DFResult<Vec<_>>>()?)?);
+                }
+                let leg_sortable: Vec<bool> = legs.iter().map(|(_, k)| k.sortable()).collect();
+                let legs: Vec<Arc<dyn ExecutionPlan>> = legs
+                    .into_iter()
+                    .map(|(plan, kind)| match crate::read::ordering_probe_enabled() {
+                        true => Arc::new(crate::read::OrderingProbeExec::new(plan, kind)) as Arc<dyn ExecutionPlan>,
+                        false => plan,
+                    })
+                    .collect();
+                let dedup_on = !dedup_keys.is_empty() && !shape.skip_dedup;
+                let mut plans = legs;
+                // Merge-on-read prerequisite: keep-greatest only engages while the input still
+                // declares an ordering on the leading dedup key, so the in-memory legs are
+                // sorted up to the Delta leg's footer ordering and merged explicitly. The SPM
+                // is built HERE, not left to EnforceDistribution — DedupExec declares no
+                // required input ordering, so EnforceSorting would delete the injected sorts.
+                // Gated on `version_append` so non-MOR scans pay no sort.
+                let mut merge_req = None;
+                // A table whose sort leads with a non-i64 column may still hold days written under an
+                // earlier order (see `layout_runs`), so it takes its requirement from what the Delta
+                // leg declares; a timestamp-led table keeps the schema's.
+                let leg_requirement = || {
+                    let delta = plans.iter().zip(&leg_sortable).find(|(_, sortable)| !**sortable)?.0;
+                    let declared = delta.properties().output_ordering()?.iter().cloned();
+                    Self::keep_greatest_requirement(declared, &dedup_keys, &delta.schema())
+                };
+                if dedup_on
+                    && table_schema.is_some_and(|t| t.version_append)
+                    && let Some(req) = plans.first().and_then(|p| {
+                        let schema_req = table_schema.and_then(|t| Self::keep_greatest_ordering(t, &p.schema()))?;
+                        Some(match schema_req.len() > 1 {
+                            true => leg_requirement().unwrap_or(schema_req),
+                            false => schema_req,
+                        })
+                    })
+                {
+                    // Per-leg sortability: the DELTA leg is NEVER sortable — MOR UPDATEs make
+                    // files overlap and a read-time SortExec over them exhausts the query pool;
+                    // footer-less files need REPAIR, not read-time sorting. `ordered_children`
+                    // bails whenever an unsortable leg misses `req`, so a Delta sort is
+                    // structurally impossible here. The in-memory legs ARE sortable.
+                    match crate::read::optimizers::ordered_children(&plans, &req, None, &leg_sortable, false)? {
+                        Some(ordered) => {
+                            plans = ordered;
+                            merge_req = Some(req);
+                        }
+                        // `None` is either "every leg already satisfies `req`" (merge anyway)
+                        // or "an unsortable leg doesn't" (bail; keep-greatest stays dormant and
+                        // keep-first is still sound).
+                        None => {
+                            let all = plans
+                                .iter()
+                                .map(|p| p.properties().equivalence_properties().ordering_satisfy(req.iter().cloned()))
+                                .collect::<DFResult<Vec<_>>>()?;
+                            merge_req = all.iter().all(|&s| s).then_some(req);
+                        }
+                    }
+                }
+                // `plans` is non-empty on every known path; erroring rather than indexing turns
+                // an impossible state into a failed query instead of a panicked one.
+                if plans.is_empty() {
+                    return Err(datafusion::error::DataFusionError::Execution(format!("scan produced no legs to union (project_id={project_id})")));
+                }
+                let plan = union_or_single(plans)?;
+                let plan = match merge_req.clone() {
+                    Some(req) => Arc::new(datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec::new(req, plan)),
+                    None => plan,
+                };
+                let plan = match dedup_on {
+                    true => Arc::new(
+                        crate::read::DedupExec::with_tiebreak(plan, dedup_keys.clone(), dedup_tiebreak.clone(), output_projection.clone())?
+                            // Declaring it REQUIRED stops EnforceSorting deleting the merge above.
+                            .requiring(merge_req.clone()),
+                    ) as Arc<dyn ExecutionPlan>,
+                    false => pay_projection(plan)?,
+                };
+                // Union the certified-date legs on top; they owe the same
+                // projection debt as the `dedup_on == false` branch above.
+                let plan = match skip_legs.is_empty() {
+                    true => plan,
+                    false => union_or_single(std::iter::once(Ok(plan)).chain(skip_legs.into_iter().map(&pay_projection)).collect::<DFResult<Vec<_>>>()?)?,
+                };
+                finish(plan)
+            };
+        let wrap_result = |legs: Vec<(Arc<dyn ExecutionPlan>, crate::read::LegKind)>| wrap_result_split(legs, Vec::new());
+        // Both Delta-only exits are the same scan and the same bookkeeping; they differ only in
+        // whether mutable filters are readmitted.
+        let delta_only = async |readmit_mutable_filters: bool| -> DFResult<Arc<dyn ExecutionPlan>> {
+            let (skip_dedup, plans, certified_plans) = self
+                .scan_delta_only(
+                    state,
+                    projection,
+                    &optimized_filters,
+                    unstripped_filters,
+                    &project_id,
+                    query_time_range,
+                    &dedup_keys,
+                    pre_skip_dedup,
+                    &tombstone,
+                    orig_limit,
+                    limit,
+                    readmit_mutable_filters,
+                    tantivy_id_filter.as_ref(),
+                    tantivy_covered_files.as_ref(),
+                    tantivy_exclude.as_ref(),
+                    tantivy_row_selections.as_ref(),
+                    bloom_rejected.as_ref(),
+                )
+                .await?;
+            {
+                let mut shape = scan_state.lock();
+                shape.skip_dedup |= skip_dedup;
+                shape.has_delta = true;
+            }
+            wrap_result_split(plans.into_iter().map(|plan| (plan, crate::read::LegKind::Delta)).collect(), certified_plans)
+        };
+        let layer = self.database.buffered_layer();
+        debug!("ProjectRoutingTable::scan - buffered_layer present: {}, project_id: {}", layer.is_some(), project_id);
+        let Some(layer) = layer else {
+            debug!("No buffered layer, querying Delta only");
+            // A sweep-certified window holds exactly one winning row per key, so the
+            // stale-version hazard that keeps mutable predicates above DedupExec has no
+            // instance and they may be pushed down. Delta-only by construction: the skip is
+            // never granted while the MemBuffer leg is in play.
+            return delta_only(true).await;
+        };
+
+        span.record("scan.uses_mem_buffer", true);
+
+        // Skip Delta when the query's lower bound is strictly above the per-table flushed
+        // watermark (max row ts ever handed to a Delta commit, floored at boot): Delta provably
+        // holds nothing newer. Do NOT weaken this to `query_min >= mem_oldest` — that hides
+        // rows whenever Delta holds data inside MemBuffer's range.
+        //
+        // Second disjunct: if no flush has ever committed for this (project, table), Delta is
+        // empty. Flipped by the flush callback after a successful commit, never flipped back.
+        let skip_delta = query_time_range.is_some_and(|(query_min, _)| query_min > layer.delta_flushed_watermark(&project_id, &self.table_name))
+            || self.database.delta_scan_can_be_skipped(&project_id, &self.table_name);
+        scan_state.lock().skipped_delta = skip_delta;
+
+        // `query_partitioned_with_text_match` runs its own per-bucket prefilter inside the
+        // bucket lock. Never prepend `tantivy_id_filter` here — it is derived from delta-side
+        // IDs and would drop legitimate MemBuffer rows. On a MOR table the mem leg gets no tree
+        // at all: the per-bucket row prefilter sits below DedupExec, and dropping a stale
+        // version's row while its match-bearing sibling is in another leg breaks keep-greatest.
+        let mem_tree = text_match_tree.as_ref().filter(|_| mutable.is_none());
+        let mem_plan_started = std::time::Instant::now();
+        let mem_leg = layer.query_partitioned_with_text_match(&project_id, &self.table_name, &optimized_filters, mem_tree).unwrap_or_else(|e| {
+            warn!("Failed to query mem buffer: {}", e);
+            Default::default()
+        });
+        metrics::counter!(scan_metric_names::MEM_PLAN_TOTAL).increment(1);
+        metrics::counter!(scan_metric_names::MEM_PLAN_US_TOTAL).increment(mem_plan_started.elapsed().as_micros() as u64);
+        let mem_partitions = match mem_leg.sorted {
+            true => split_sorted_runs(mem_leg.partitions, state.config().target_partitions()),
+            false => mem_leg.partitions,
+        };
+
+        let mem_ranges = layer.get_bucket_ranges(&project_id, &self.table_name);
+
+        debug!("MemBuffer partitions count: {} for {}/{}", mem_partitions.len(), project_id, self.table_name);
+        if mem_partitions.is_empty() {
+            debug!("No MemBuffer data, querying Delta only for {}/{}", project_id, self.table_name);
+            return delta_only(false).await;
+        }
+
+        scan_state.lock().has_mem = true;
+        let mem_plan = self.create_memory_exec(&mem_partitions, projection, mem_leg.sorted)?;
+
+        if skip_delta {
+            span.record("scan.skipped_delta", true);
+            debug!("Skipping Delta scan - query time range entirely within MemBuffer for {}/{}", project_id, self.table_name);
+            return wrap_result(vec![(mem_plan, crate::read::LegKind::Mem)]);
+        }
+
+        // Build Delta filters with per-bucket exclusion so the union doesn't double-count:
+        // Delta excludes the mem row ranges where those legs are authoritative
+        // (`get_bucket_ranges` skips open and force-flushed buckets, whose windows legitimately
+        // straddle stores). MOR scans supply no exclusions: their union resolves row identities.
+        let mut delta_filters = optimized_filters.clone();
+        let ts_us = |t: i64| lit(ScalarValue::TimestampMicrosecond(Some(t), Some("UTC".into())));
+        let ts_cmp = |op: Operator, t: i64| Expr::BinaryExpr(BinaryExpr { left: Box::new(col("timestamp")), op, right: Box::new(ts_us(t)) });
+        // NOT (ts >= start AND ts < end)  ≡  (ts < start) OR (ts >= end)
+        delta_filters.extend(
+            crate::write::mem_buffer::merge_ranges(mem_ranges).into_iter().map(|(start, end)| ts_cmp(Operator::Lt, start).or(ts_cmp(Operator::GtEq, end))),
+        );
+        let resolve_span = tracing::trace_span!(parent: &span, "resolve_delta_table");
+        // A query executed through a retained pgwire plan must still see a
+        // committed ingest from another connection. `try_fast_resolve` opts
+        // into an explicitly stale-tolerant snapshot, which is not valid for
+        // an investigation read: it can turn a successful write into apparent
+        // “no data”. `resolve_table` is lock-local on the common path and only
+        // refreshes the Delta snapshot when a newer committed version is known.
+        // No fast resolve was attempted, so do not turn this into a synthetic
+        // cache miss in the scan telemetry.
+        scan_state.lock().fast_resolve_hit = None;
+        let delta_table = self.database.resolve_table(&project_id, &self.table_name).instrument(resolve_span).await?;
+        let table = delta_table.read().await;
+        let delta_plans = self
+            .scan_delta_with_tantivy(
+                &table,
+                state,
+                projection,
+                &delta_filters,
+                limit,
+                tantivy_id_filter.as_ref(),
+                tantivy_covered_files.as_ref(),
+                tantivy_exclude.as_ref(),
+                tantivy_row_selections.as_ref(),
+                query_time_range,
+                bloom_rejected.as_ref(),
+                None,
+                None,
+            )
+            .await?;
+        scan_state.lock().has_delta = true;
+
+        // Union the legs in recency order — mem, then Delta — so DedupExec's keep-first
+        // favours the freshest copy of a row.
+        use crate::read::LegKind;
+        wrap_result(std::iter::once((mem_plan, LegKind::Mem)).chain(delta_plans.into_iter().map(|p| (p, LegKind::Delta))).collect())
+    }
+
+    /// Runs of consecutive window dates split by layout, while a table whose sort leads with a
+    /// non-i64 column still holds days written under an earlier order: a date is current when
+    /// every file of the project carries the schema's order (`repair_verified_sorted`), and a date
+    /// with no files joins the current side. `None` when the window holds one layout, is unbounded,
+    /// or the table is timestamp-led — the scan then plans as one piece, exactly as before.
+    async fn layout_runs(&self, filters: &[Expr]) -> Option<Vec<(i64, i64)>> {
+        (!self.sort_led_by_time()).then_some(())?;
+        let (lo, hi) = filters_time_range(filters)?;
+        let project_id = self.extract_project_id_from_filters(filters).unwrap_or_else(|| self.default_project.clone());
+        let table_ref = self.database.resolve_table(&project_id, &self.table_name).await.ok()?;
+        let legacy: HashSet<String> = {
+            let table = table_ref.read().await;
+            let snapshot = table.snapshot().ok()?;
+            snapshot
+                .log_data()
+                .iter()
+                .map(|file| file.path().into_owned())
+                .filter(|path| path_partition_value(path, "project_id").is_none_or(|pid| pid == project_id))
+                .filter(|path| !self.database.repair_verified_sorted.contains(path))
+                .filter_map(|path| path_partition_value(&path, "date").map(str::to_string))
+                .collect()
+        };
+        let runs: Vec<(i64, i64)> = window_dates(lo, hi)?
+            .into_iter()
+            .chunk_by(|date| legacy.contains(&date.to_string()))
+            .into_iter()
+            .filter_map(|(_, dates)| {
+                let dates: Vec<_> = dates.collect();
+                let day = |date: &chrono::NaiveDate| date.and_hms_opt(0, 0, 0).map(|t| t.and_utc().timestamp_micros());
+                Some((day(dates.first()?)?, day(&dates.last()?.succ_opt()?)?))
+            })
+            .collect();
+        (runs.len() > 1).then_some(runs)
+    }
+
+    /// One scan per layout run, each filtered to its own days AFTER its dedup and unioned. Exact
+    /// because `date` is derived from `timestamp` on every write path, so all versions of a key —
+    /// sharing its timestamp — fall in one run, and each run plans with its own Delta leg's
+    /// ordering instead of one union whose legs disagree and drop the whole scan to full-set dedup.
+    async fn scan_layout_runs(
+        &self, state: &dyn Session, projection: Option<&Vec<usize>>, filters: &[Expr], limit: Option<usize>, runs: Vec<(i64, i64)>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        let time = crate::schema::schema_or_default(&self.table_name).time_column_name();
+        let ts = self.schema.index_of(time)?;
+        let widened = projection.filter(|p| !p.contains(&ts)).map(|p| p.iter().copied().chain([ts]).collect::<Vec<_>>());
+        let at = |micros: i64| lit(ScalarValue::TimestampMicrosecond(Some(micros), Some("UTC".into())));
+        let widened = widened.as_ref();
+        let piece = |(start, end): (i64, i64)| async move {
+            let range = col(time).gt_eq(at(start)).and(col(time).lt(at(end)));
+            let scoped: Vec<Expr> = filters.iter().cloned().chain([range.clone()]).collect();
+            let plan = self.scan_whole(state, widened.or(projection), &scoped, limit).await?;
+            let df_schema = datafusion::common::DFSchema::try_from(plan.schema().as_ref().clone())?;
+            let props = datafusion::execution::context::ExecutionProps::new();
+            let predicate = datafusion::physical_expr::create_physical_expr(&range, &df_schema, &props, &Default::default())?;
+            let filtered: Arc<dyn ExecutionPlan> = Arc::new(datafusion::physical_plan::filter::FilterExec::try_new(predicate, plan)?);
+            match projection.zip(widened) {
+                Some((requested, _)) => Self::project_indices(filtered, &(0..requested.len()).collect::<Vec<_>>()),
+                None => Ok(filtered),
+            }
+        };
+        let pieces = futures::future::try_join_all(runs.into_iter().map(piece)).await?;
+        metrics::counter!(scan_metric_names::LAYOUT_SPLIT_SCANS).increment(1);
+        UnionExec::try_new(pieces)
+    }
+
+    /// Sort keys that make `DedupExec`'s keep-greatest engage, from the table's declared order.
+    ///
+    /// Only for a table declaring a `dedup_tiebreak`: see [`Self::keep_greatest_requirement`].
+    pub(crate) fn keep_greatest_ordering(table: &crate::schema::TableSchema, leg_schema: &SchemaRef) -> Option<datafusion::physical_expr::LexOrdering> {
+        use datafusion::{arrow::compute::SortOptions, physical_expr::PhysicalSortExpr};
         table.dedup_tiebreak.as_ref()?;
-        let prefix: Vec<_> = table.sorting_columns.iter().take_while(|sc| table.dedup_keys.contains(&sc.name)).collect();
-        let lead = leg_schema.index_of(&prefix.first()?.name).ok()?;
-        let width = if matches!(leg_schema.field(lead).data_type(), DataType::Int64 | DataType::Timestamp(..)) { 1 } else { prefix.len() };
-        let sorts = prefix[..width].iter().map(|sc| {
+        let sorts = table.sorting_columns.iter().map_while(|sc| {
             let opts = SortOptions { descending: sc.descending, nulls_first: sc.nulls_first };
             Some(PhysicalSortExpr::new(Arc::new(PhysicalColumn::new(&sc.name, leg_schema.index_of(&sc.name).ok()?)), opts))
         });
-        LexOrdering::new(sorts.collect::<Option<Vec<_>>>()?)
+        Self::keep_greatest_requirement(sorts, &table.dedup_keys, leg_schema)
+    }
+
+    /// The leading run of `sorts` whose columns are dedup keys. Equal dedup keys agree on all of
+    /// them, so all versions of a row live in one contiguous run and the operator can emit without
+    /// buffering the scan. An i64-backed lead alone already bounds a run, so it stays one column
+    /// and the injected sort cheap; any other lead takes the whole prefix, or one run could span
+    /// every row sharing a `metric_name`.
+    pub(crate) fn keep_greatest_requirement(
+        sorts: impl IntoIterator<Item = datafusion::physical_expr::PhysicalSortExpr>, dedup_keys: &[String], leg_schema: &SchemaRef,
+    ) -> Option<datafusion::physical_expr::LexOrdering> {
+        use datafusion::arrow::datatypes::DataType;
+        let prefix: Vec<_> = sorts
+            .into_iter()
+            .take_while(|se| {
+                crate::read::optimizers::downcast::<PhysicalColumn>(se.expr.as_ref()).is_some_and(|col| dedup_keys.iter().any(|key| key == col.name()))
+            })
+            .collect();
+        let lead = crate::read::optimizers::downcast::<PhysicalColumn>(prefix.first()?.expr.as_ref())?;
+        let width = if matches!(leg_schema.field(lead.index()).data_type(), DataType::Int64 | DataType::Timestamp(..)) { 1 } else { prefix.len() };
+        datafusion::physical_expr::LexOrdering::new(prefix.into_iter().take(width))
     }
 
     /// Columns whose value can differ between versions of one row (`None` for
@@ -887,7 +1495,7 @@ impl ProjectRoutingTable {
 
     /// Wrap an execution plan with type coercion if the output schema doesn't match the target.
     /// This handles cases like Delta returning Utf8 when we expect Utf8View.
-    fn coerce_plan_to_schema(plan: Arc<dyn ExecutionPlan>, target_schema: &SchemaRef) -> DFResult<Arc<dyn ExecutionPlan>> {
+    fn coerce_plan_to_schema(plan: Arc<dyn ExecutionPlan>, target_schema: &SchemaRef, keep_string_order: bool) -> DFResult<Arc<dyn ExecutionPlan>> {
         let plan_schema = plan.schema();
         if plan_schema.fields().len() != target_schema.fields().len() {
             return Ok(plan);
@@ -911,8 +1519,12 @@ impl ProjectRoutingTable {
             .zip(target_schema.fields())
             .map(|((idx, plan_field), target_field)| {
                 let col_expr = Arc::new(PhysicalColumn::new(plan_field.name(), idx)) as Arc<dyn datafusion::physical_expr::PhysicalExpr>;
-                let expr: Arc<dyn datafusion::physical_expr::PhysicalExpr> =
-                    if differs(plan_field, target_field) { Arc::new(CastExpr::new(col_expr, target_field.data_type().clone(), None)) } else { col_expr };
+                use arrow_schema::DataType::{LargeUtf8, Utf8, Utf8View};
+                let expr: Arc<dyn datafusion::physical_expr::PhysicalExpr> = match (plan_field.data_type(), target_field.data_type()) {
+                    _ if !differs(plan_field, target_field) => col_expr,
+                    (Utf8 | LargeUtf8, Utf8View) if keep_string_order => Arc::new(StringViewCast { expr: col_expr }),
+                    _ => Arc::new(CastExpr::new(col_expr, target_field.data_type().clone(), None)),
+                };
                 (expr, target_field.name().clone())
             })
             .collect();
@@ -1594,447 +2206,10 @@ impl TableProvider for ProjectRoutingTable {
         )
     )]
     async fn scan(&self, state: &dyn Session, projection: Option<&Vec<usize>>, filters: &[Expr], limit: Option<usize>) -> DFResult<Arc<dyn ExecutionPlan>> {
-        let span = tracing::Span::current();
-        let scan_start = std::time::Instant::now();
-        let scan_metrics = self.database.scan_metrics.clone();
-
-        // Internal Delta-only reads (rollup builds, maintenance) are not the
-        // unbounded client scans this guard exists to reject.
-        if !self.database.bypass_rollup
-            && let Some(reason) = self.bounded_otel_scan_reason(filters, limit)
-        {
-            match self.database.config.core.timefusion_otel_scan_guard {
-                config::OtelScanGuard::Off => {}
-                config::OtelScanGuard::Observe => {
-                    metrics::counter!(scan_metric_names::BOUNDED_OTEL_SCAN_CANDIDATES).increment(1);
-                    warn!(event = "otel_scan_guard_candidate", table.name = %self.table_name, reason, "raw OTel scan would be rejected");
-                }
-                config::OtelScanGuard::Enforce => {
-                    metrics::counter!(scan_metric_names::BOUNDED_OTEL_SCAN_REJECTIONS).increment(1);
-                    return Err(DataFusionError::Plan("raw OTel queries require project_id = <value> and a timestamp lower bound or LIMIT".to_string()));
-                }
-            }
+        match self.layout_runs(filters).await {
+            Some(runs) => self.scan_layout_runs(state, projection, filters, limit, runs).await,
+            None => self.scan_whole(state, projection, filters, limit).await,
         }
-
-        // Mutable predicates must run after version resolution. Narrowing only
-        // the indexed leg can remove the winning version of a matching raw row.
-        // `decide_prefilter` therefore refuses mutable predicates entirely.
-        let mutable = Self::version_mutable_columns(&self.table_name);
-        let unstripped_filters = filters;
-        let filters: Vec<Expr> = filters.iter().filter(|f| Self::leg_safe(&self.table_name, mutable.as_ref(), f)).cloned().collect();
-        let optimized_filters = self.apply_time_series_optimizations(&filters)?;
-
-        let project_id = self.extract_project_id_from_filters(&optimized_filters).unwrap_or_else(|| self.default_project.clone());
-        span.record("table.project_id", project_id.as_str());
-
-        // Tantivy prefilter, two independent paths: the Delta side builds `id IN (delta_ids)`
-        // for the Delta scan only (MemBuffer rows are never indexed, so applying it there would
-        // drop valid rows); the MemBuffer side prefilters under its own bucket lock. On a MOR
-        // table keep the unstripped tree so mutable predicates can be detected.
-        let text_match_tree = match mutable.is_some() {
-            false => crate::tantivy::udf::collect_text_match_tree(&optimized_filters),
-            true => crate::tantivy::udf::collect_text_match_tree(&self.apply_time_series_optimizations(unstripped_filters)?),
-        };
-        // Query [lo,hi] timestamp window, shared by the tantivy prefilter and the skip-delta
-        // watermark check below.
-        let query_time_range = filters_time_range(&optimized_filters);
-        let mut tantivy_id_filter: Option<Expr> = None;
-        // When index coverage is partial, indexed and raw files are read as separate Delta legs.
-        // Only the indexed leg receives the narrowing id-set; uncovered files retain the
-        // original predicate and therefore cannot lose rows.
-        let mut tantivy_covered_files: Option<HashSet<String>> = None;
-        // Files the prefilter proved hold no matches (zero-hit covering
-        // index) — excluded from the Delta scan when file pruning is on.
-        let mut tantivy_exclude: Option<HashSet<String>> = None;
-        // Per-file matching row ordinals (row-selection pushdown), for files
-        // whose covering index was built in parquet row order.
-        let mut tantivy_row_selections: Option<HashMap<String, Vec<u64>>> = None;
-        // File-level needle pruning: table-relative paths the resident bloom registry proves
-        // cannot contain the query's equality/IN needles. Memory-only consult — a cold registry
-        // prunes nothing. Unlike zero_hit_files this must reach the RAW leg too.
-        let bloom_rejected: Option<HashSet<String>> = (|| {
-            let reg = self.database.bloom_prune()?;
-            let dates = crate::read::bloom_prune::dates_in_range(query_time_range?)?;
-            let schema = crate::schema::get_schema(&self.table_name)?;
-            let needles = crate::read::bloom_prune::extract_needles(&optimized_filters, schema, Self::version_mutable_columns(&self.table_name).as_ref());
-            if needles.is_empty() {
-                return None;
-            }
-            let rejected = reg.rejected_rels(&self.table_name, &project_id, &dates, &needles);
-            (!rejected.is_empty()).then_some(rejected)
-        })();
-        if let Some(tree) = text_match_tree.as_ref()
-            && let Some(svc) = self.database.tantivy_search()
-        {
-            let tcfg = &self.database.config().tantivy;
-            let max_hits = tcfg.prefilter_max_hits();
-            let min_sel_pct = tcfg.prefilter_min_selectivity_pct() as u64;
-            crate::observability::record_tantivy_prefilter_attempt();
-            metrics::counter!(scan_metric_names::PREFILTER_ATTEMPTS).increment(1);
-
-            let skip = |reason: &'static str| {
-                record_prefilter_skip(reason);
-                debug!("Tantivy prefilter skipped for {}/{}: {}", project_id, self.table_name, reason);
-            };
-            // ONE pass over the in-window index set: the predicate tree compiles to a single
-            // tantivy BooleanQuery per index (And→Must, Or→Should), hits unioned across indexes
-            // (they cover disjoint row sets).
-            match svc.search_detailed(&self.table_name, &project_id, tree, max_hits, query_time_range, false).await {
-                Ok(Ok(r)) => match decide_prefilter(
-                    r.hits.into_iter().map(|h| h.id).collect(),
-                    r.indexed_rows,
-                    min_sel_pct,
-                    r.field_coverage_gap,
-                    r.covered_files,
-                    r.zero_hit_files,
-                    r.row_selections,
-                    // Predicate-aware, not table-wide: if every ROUTED predicate column is
-                    // immutable, all versions of a matching row carry the same values, so a
-                    // file whose index found no match cannot hold any version of one
-                    // (tombstones included — same keys). A predicate touching a mutable column
-                    // (or the tiebreak/tombstone) takes the conservative path.
-                    routed_touches_mutable(mutable.as_ref(), text_match_tree.as_ref()),
-                    tcfg.timefusion_tantivy_file_pruning,
-                    tcfg.timefusion_tantivy_row_selection,
-                ) {
-                    PrefilterDecision::Skipped(reason) => {
-                        if reason == "low_selectivity" {
-                            svc.remember_unselective(&self.table_name, &project_id, tree, max_hits, query_time_range);
-                        }
-                        skip(reason)
-                    }
-                    PrefilterDecision::Used { ids, covered_files, exclude_files, row_selections } => {
-                        crate::observability::record_tantivy_prefilter_used();
-                        metrics::counter!(scan_metric_names::PREFILTER_USED).increment(1);
-                        tantivy_id_filter = Some(col("id").in_list(ids.into_iter().map(lit).collect(), false));
-                        // Carry the coverage set forward and split against the snapshot taken at
-                        // scan construction: a flush or compaction can commit in between.
-                        tantivy_covered_files = Some(covered_files);
-                        tantivy_exclude = exclude_files;
-                        tantivy_row_selections = row_selections;
-                    }
-                },
-                Ok(Err(reason)) => skip(reason),
-                Err(e) => {
-                    warn!("tantivy search failed for {}/{}: {:#} — falling back to full scan", project_id, self.table_name, e);
-                    crate::observability::record_tantivy_prefilter_error();
-                    skip("delta_error");
-                }
-            }
-        }
-
-        // Read-side dedup setup: collapse physical duplicates of dedup-key rows
-        // over the routed/pruned union at query time, so COUNT(*) is correct
-        // regardless of sweep timing. The pushed projection is augmented with
-        // any dedup-key columns the query projected away; `output_projection`
-        // restores the requested set. No-op without declared dedup_keys.
-        let table_schema = crate::schema::get_schema(&self.table_name);
-        let dedup_keys: Vec<String> = table_schema.as_ref().map(|s| s.dedup_keys.clone()).unwrap_or_default();
-        // The tiebreak rides in with the keys ONLY for merge-on-read tables (DedupExec keeps
-        // the greatest version per key and must see the column). Elsewhere keep-greatest cannot
-        // engage, so the column would be read and never used.
-        let dedup_tiebreak: Option<String> = table_schema.as_ref().filter(|s| s.version_append).and_then(|s| s.dedup_tiebreak.clone());
-        // Merge-on-read DELETE: a tombstone version must reach the filter ABOVE
-        // the dedup, so its marker column rides in with the keys and is stripped
-        // again afterwards. `None` on every table that declares none.
-        let tombstone: Option<String> = table_schema.and_then(|s| s.tombstone_column.clone());
-        // `tombstone_keep` is the requested width when the marker rode in purely for the filter
-        // (one trailing column the post-filter projection removes). The dedup skip must be
-        // decided BEFORE the projection is built, or augmenting with the keys disables it.
-        // A fast-resolve miss simply declines — the skip is an optimisation, never correctness.
-        let skip_verdict = match dedup_keys.is_empty() {
-            true => DedupSkipVerdict::Disabled,
-            false => self
-                .database
-                .try_fast_resolve(&project_id, &self.table_name)
-                .and_then(|t| t.try_read().ok().map(|table| self.dedup_skip_allowed(&table, &project_id, query_time_range, &dedup_keys)))
-                // A resolve miss is its own denial reason (cold provider cache), not an
-                // uncertified partition.
-                .unwrap_or(DedupSkipVerdict::Unresolved),
-        };
-        let pre_skip_dedup = skip_verdict.granted();
-        let (scan_projection, output_projection, tombstone_keep): (Option<Vec<usize>>, Option<Vec<usize>>, Option<usize>) = match projection {
-            Some(p) if !dedup_keys.is_empty() || tombstone.is_some() => {
-                let full_schema = self.schema();
-                // The dedup keys ALWAYS ride in, even when `pre_skip_dedup` says the window is
-                // certified: the skip is granted PER LEG below and the mem ∪ delta union path
-                // never grants it, so dropping the keys here yields DedupExecs over scans that
-                // cannot feed them.
-                let augment = dedup_keys.iter().chain(dedup_tiebreak.iter()).chain(tombstone.iter());
-                let missing: Vec<usize> = augment.filter_map(|k| full_schema.index_of(k).ok()).filter(|i| !p.contains(i)).collect();
-                if missing.is_empty() {
-                    (Some(p.clone()), None, None)
-                } else {
-                    let aug: Vec<usize> = p.iter().chain(&missing).copied().collect();
-                    // The marker alone must survive DedupExec's projection restore; its index is
-                    // in `missing`, hence in `aug`, by construction. Requested columns occupy the
-                    // first p.len() positions of the augmented output.
-                    let extra = tombstone.as_ref().and_then(|t| full_schema.index_of(t).ok()).filter(|i| !p.contains(i));
-                    let out: Vec<usize> = (0..p.len()).chain(extra.and_then(|ti| aug.iter().position(|&i| i == ti))).collect();
-                    (Some(aug), Some(out), extra.map(|_| p.len()))
-                }
-            }
-            _ => (projection.cloned(), None, None),
-        };
-        let projection = scan_projection.as_ref();
-        // DedupExec drops rows AFTER the scan, so a pushed `limit` must NOT truncate the
-        // underlying scans — the deduped result could then yield < limit rows even when more
-        // exist below the cut. The outer limit still caps; `orig_limit` is restored on
-        // Delta-only paths that skip DedupExec. The tombstone filter suppresses it for the
-        // same reason even where dedup doesn't.
-        let orig_limit = limit;
-        let limit = limit.filter(|_| dedup_keys.is_empty() && tombstone.is_none());
-
-        let scan_state = parking_lot::Mutex::new(ScanShape::default());
-        // DedupExec restores the requested columns when it runs; every leg that bypasses it
-        // still owes that debt, or augmented key columns leak into the result and the two
-        // sides of a union disagree on schema.
-        let pay_projection = |leg: Arc<dyn ExecutionPlan>| match &output_projection {
-            Some(idxs) => Self::project_indices(leg, idxs),
-            None => Ok(leg),
-        };
-        let finish = |plan: Arc<dyn ExecutionPlan>| match &tombstone {
-            Some(marker) => Self::filter_tombstones(plan, marker, tombstone_keep),
-            None => Ok(plan),
-        };
-        // Legs of the mem ∪ hot ∪ delta union, in recency order. `skip_legs` are Delta legs over
-        // date partitions certified duplicate-free: they are unioned ABOVE DedupExec rather than
-        // fed through it. Sound because `date` derives from `timestamp` and DML re-appends
-        // preserve it, so no dedup key spans a date boundary.
-        let wrap_result_split =
-            |mut legs: Vec<(Arc<dyn ExecutionPlan>, crate::read::LegKind)>, skip_legs: Vec<Arc<dyn ExecutionPlan>>| -> DFResult<Arc<dyn ExecutionPlan>> {
-                fn union_or_single(mut plans: Vec<Arc<dyn ExecutionPlan>>) -> DFResult<Arc<dyn ExecutionPlan>> {
-                    Ok(if plans.len() == 1 { plans.remove(0) } else { UnionExec::try_new(plans)? as Arc<dyn ExecutionPlan> })
-                }
-                // A leg pruned to nothing bottoms out in an EmptyExec, which declares no output
-                // ordering, and one such leg would veto `merge_req` below (Delta legs are
-                // unsortable) — costing the SPM and forcing DedupExec into full-set mode. An
-                // empty leg contributes no rows; drop it. Keep one if all are empty so the
-                // single-plan path stays valid.
-                fn provably_empty(plan: &dyn ExecutionPlan) -> bool {
-                    plan.is::<datafusion::physical_plan::empty::EmptyExec>() || matches!(plan.children().as_slice(), [child] if provably_empty(child.as_ref()))
-                }
-                if legs.len() > 1 && legs.iter().any(|(p, _)| provably_empty(p.as_ref())) {
-                    match legs.iter().any(|(p, _)| !provably_empty(p.as_ref())) {
-                        true => legs.retain(|(p, _)| !provably_empty(p.as_ref())),
-                        false => legs.truncate(1),
-                    }
-                }
-                // Under a per-date split the deduped side can end up with NO legs while the
-                // certified side carries every row (file-level pruning removes the uncertified
-                // dates' files entirely). Everything below indexes `plans[0]`, so without this
-                // the scan panics. The certified legs need no dedup, only the projection debt.
-                let shape = ScanShape { partial_skip: !skip_legs.is_empty(), ..*scan_state.lock() };
-                scan_metrics.record_scan(scan_start.elapsed().as_micros() as u64, shape, skip_verdict);
-                if legs.is_empty() && !skip_legs.is_empty() {
-                    return finish(union_or_single(skip_legs.into_iter().map(&pay_projection).collect::<DFResult<Vec<_>>>()?)?);
-                }
-                let leg_sortable: Vec<bool> = legs.iter().map(|(_, k)| k.sortable()).collect();
-                let legs: Vec<Arc<dyn ExecutionPlan>> = legs
-                    .into_iter()
-                    .map(|(plan, kind)| match crate::read::ordering_probe_enabled() {
-                        true => Arc::new(crate::read::OrderingProbeExec::new(plan, kind)) as Arc<dyn ExecutionPlan>,
-                        false => plan,
-                    })
-                    .collect();
-                let dedup_on = !dedup_keys.is_empty() && !shape.skip_dedup;
-                let mut plans = legs;
-                // Merge-on-read prerequisite: keep-greatest only engages while the input still
-                // declares an ordering on the leading dedup key, so the in-memory legs are
-                // sorted up to the Delta leg's footer ordering and merged explicitly. The SPM
-                // is built HERE, not left to EnforceDistribution — DedupExec declares no
-                // required input ordering, so EnforceSorting would delete the injected sorts.
-                // Gated on `version_append` so non-MOR scans pay no sort.
-                let mut merge_req = None;
-                if dedup_on
-                    && table_schema.is_some_and(|t| t.version_append)
-                    && let Some(req) = plans.first().and_then(|p| table_schema.and_then(|t| Self::keep_greatest_ordering(t, &p.schema())))
-                {
-                    // Per-leg sortability: the DELTA leg is NEVER sortable — MOR UPDATEs make
-                    // files overlap and a read-time SortExec over them exhausts the query pool;
-                    // footer-less files need REPAIR, not read-time sorting. `ordered_children`
-                    // bails whenever an unsortable leg misses `req`, so a Delta sort is
-                    // structurally impossible here. The in-memory legs ARE sortable.
-                    match crate::read::optimizers::ordered_children(&plans, &req, None, &leg_sortable, false)? {
-                        Some(ordered) => {
-                            plans = ordered;
-                            merge_req = Some(req);
-                        }
-                        // `None` is either "every leg already satisfies `req`" (merge anyway)
-                        // or "an unsortable leg doesn't" (bail; keep-greatest stays dormant and
-                        // keep-first is still sound).
-                        None => {
-                            let all = plans
-                                .iter()
-                                .map(|p| p.properties().equivalence_properties().ordering_satisfy(req.iter().cloned()))
-                                .collect::<DFResult<Vec<_>>>()?;
-                            merge_req = all.iter().all(|&s| s).then_some(req);
-                        }
-                    }
-                }
-                // `plans` is non-empty on every known path; erroring rather than indexing turns
-                // an impossible state into a failed query instead of a panicked one.
-                if plans.is_empty() {
-                    return Err(datafusion::error::DataFusionError::Execution(format!("scan produced no legs to union (project_id={project_id})")));
-                }
-                let plan = union_or_single(plans)?;
-                let plan = match merge_req.clone() {
-                    Some(req) => Arc::new(datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec::new(req, plan)),
-                    None => plan,
-                };
-                let plan = match dedup_on {
-                    true => Arc::new(
-                        crate::read::DedupExec::with_tiebreak(plan, dedup_keys.clone(), dedup_tiebreak.clone(), output_projection.clone())?
-                            // Declaring it REQUIRED stops EnforceSorting deleting the merge above.
-                            .requiring(merge_req.clone()),
-                    ) as Arc<dyn ExecutionPlan>,
-                    false => pay_projection(plan)?,
-                };
-                // Union the certified-date legs on top; they owe the same
-                // projection debt as the `dedup_on == false` branch above.
-                let plan = match skip_legs.is_empty() {
-                    true => plan,
-                    false => union_or_single(std::iter::once(Ok(plan)).chain(skip_legs.into_iter().map(&pay_projection)).collect::<DFResult<Vec<_>>>()?)?,
-                };
-                finish(plan)
-            };
-        let wrap_result = |legs: Vec<(Arc<dyn ExecutionPlan>, crate::read::LegKind)>| wrap_result_split(legs, Vec::new());
-        // Both Delta-only exits are the same scan and the same bookkeeping; they differ only in
-        // whether mutable filters are readmitted.
-        let delta_only = async |readmit_mutable_filters: bool| -> DFResult<Arc<dyn ExecutionPlan>> {
-            let (skip_dedup, plans, certified_plans) = self
-                .scan_delta_only(
-                    state,
-                    projection,
-                    &optimized_filters,
-                    unstripped_filters,
-                    &project_id,
-                    query_time_range,
-                    &dedup_keys,
-                    pre_skip_dedup,
-                    &tombstone,
-                    orig_limit,
-                    limit,
-                    readmit_mutable_filters,
-                    tantivy_id_filter.as_ref(),
-                    tantivy_covered_files.as_ref(),
-                    tantivy_exclude.as_ref(),
-                    tantivy_row_selections.as_ref(),
-                    bloom_rejected.as_ref(),
-                )
-                .await?;
-            {
-                let mut shape = scan_state.lock();
-                shape.skip_dedup |= skip_dedup;
-                shape.has_delta = true;
-            }
-            wrap_result_split(plans.into_iter().map(|plan| (plan, crate::read::LegKind::Delta)).collect(), certified_plans)
-        };
-        let layer = self.database.buffered_layer();
-        debug!("ProjectRoutingTable::scan - buffered_layer present: {}, project_id: {}", layer.is_some(), project_id);
-        let Some(layer) = layer else {
-            debug!("No buffered layer, querying Delta only");
-            // A sweep-certified window holds exactly one winning row per key, so the
-            // stale-version hazard that keeps mutable predicates above DedupExec has no
-            // instance and they may be pushed down. Delta-only by construction: the skip is
-            // never granted while the MemBuffer leg is in play.
-            return delta_only(true).await;
-        };
-
-        span.record("scan.uses_mem_buffer", true);
-
-        // Skip Delta when the query's lower bound is strictly above the per-table flushed
-        // watermark (max row ts ever handed to a Delta commit, floored at boot): Delta provably
-        // holds nothing newer. Do NOT weaken this to `query_min >= mem_oldest` — that hides
-        // rows whenever Delta holds data inside MemBuffer's range.
-        //
-        // Second disjunct: if no flush has ever committed for this (project, table), Delta is
-        // empty. Flipped by the flush callback after a successful commit, never flipped back.
-        let skip_delta = query_time_range.is_some_and(|(query_min, _)| query_min > layer.delta_flushed_watermark(&project_id, &self.table_name))
-            || self.database.delta_scan_can_be_skipped(&project_id, &self.table_name);
-        scan_state.lock().skipped_delta = skip_delta;
-
-        // `query_partitioned_with_text_match` runs its own per-bucket prefilter inside the
-        // bucket lock. Never prepend `tantivy_id_filter` here — it is derived from delta-side
-        // IDs and would drop legitimate MemBuffer rows. On a MOR table the mem leg gets no tree
-        // at all: the per-bucket row prefilter sits below DedupExec, and dropping a stale
-        // version's row while its match-bearing sibling is in another leg breaks keep-greatest.
-        let mem_tree = text_match_tree.as_ref().filter(|_| mutable.is_none());
-        let mem_plan_started = std::time::Instant::now();
-        let mem_leg = layer.query_partitioned_with_text_match(&project_id, &self.table_name, &optimized_filters, mem_tree).unwrap_or_else(|e| {
-            warn!("Failed to query mem buffer: {}", e);
-            Default::default()
-        });
-        metrics::counter!(scan_metric_names::MEM_PLAN_TOTAL).increment(1);
-        metrics::counter!(scan_metric_names::MEM_PLAN_US_TOTAL).increment(mem_plan_started.elapsed().as_micros() as u64);
-        let mem_partitions = match mem_leg.sorted {
-            true => split_sorted_runs(mem_leg.partitions, state.config().target_partitions()),
-            false => mem_leg.partitions,
-        };
-
-        let mem_ranges = layer.get_bucket_ranges(&project_id, &self.table_name);
-
-        debug!("MemBuffer partitions count: {} for {}/{}", mem_partitions.len(), project_id, self.table_name);
-        if mem_partitions.is_empty() {
-            debug!("No MemBuffer data, querying Delta only for {}/{}", project_id, self.table_name);
-            return delta_only(false).await;
-        }
-
-        scan_state.lock().has_mem = true;
-        let mem_plan = self.create_memory_exec(&mem_partitions, projection, mem_leg.sorted)?;
-
-        if skip_delta {
-            span.record("scan.skipped_delta", true);
-            debug!("Skipping Delta scan - query time range entirely within MemBuffer for {}/{}", project_id, self.table_name);
-            return wrap_result(vec![(mem_plan, crate::read::LegKind::Mem)]);
-        }
-
-        // Build Delta filters with per-bucket exclusion so the union doesn't double-count:
-        // Delta excludes the mem row ranges where those legs are authoritative
-        // (`get_bucket_ranges` skips open and force-flushed buckets, whose windows legitimately
-        // straddle stores). MOR scans supply no exclusions: their union resolves row identities.
-        let mut delta_filters = optimized_filters.clone();
-        let ts_us = |t: i64| lit(ScalarValue::TimestampMicrosecond(Some(t), Some("UTC".into())));
-        let ts_cmp = |op: Operator, t: i64| Expr::BinaryExpr(BinaryExpr { left: Box::new(col("timestamp")), op, right: Box::new(ts_us(t)) });
-        // NOT (ts >= start AND ts < end)  ≡  (ts < start) OR (ts >= end)
-        delta_filters.extend(
-            crate::write::mem_buffer::merge_ranges(mem_ranges).into_iter().map(|(start, end)| ts_cmp(Operator::Lt, start).or(ts_cmp(Operator::GtEq, end))),
-        );
-        let resolve_span = tracing::trace_span!(parent: &span, "resolve_delta_table");
-        // A query executed through a retained pgwire plan must still see a
-        // committed ingest from another connection. `try_fast_resolve` opts
-        // into an explicitly stale-tolerant snapshot, which is not valid for
-        // an investigation read: it can turn a successful write into apparent
-        // “no data”. `resolve_table` is lock-local on the common path and only
-        // refreshes the Delta snapshot when a newer committed version is known.
-        // No fast resolve was attempted, so do not turn this into a synthetic
-        // cache miss in the scan telemetry.
-        scan_state.lock().fast_resolve_hit = None;
-        let delta_table = self.database.resolve_table(&project_id, &self.table_name).instrument(resolve_span).await?;
-        let table = delta_table.read().await;
-        let delta_plans = self
-            .scan_delta_with_tantivy(
-                &table,
-                state,
-                projection,
-                &delta_filters,
-                limit,
-                tantivy_id_filter.as_ref(),
-                tantivy_covered_files.as_ref(),
-                tantivy_exclude.as_ref(),
-                tantivy_row_selections.as_ref(),
-                query_time_range,
-                bloom_rejected.as_ref(),
-                None,
-                None,
-            )
-            .await?;
-        scan_state.lock().has_delta = true;
-
-        // Union the legs in recency order — mem, then Delta — so DedupExec's keep-first
-        // favours the freshest copy of a row.
-        use crate::read::LegKind;
-        wrap_result(std::iter::once((mem_plan, LegKind::Mem)).chain(delta_plans.into_iter().map(|p| (p, LegKind::Delta))).collect())
     }
 }
 

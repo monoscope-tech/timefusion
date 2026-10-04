@@ -229,6 +229,7 @@ pub mod scan_metric_names {
         DEDUP_DENIED_NEVER_CERTIFIED = "timefusion.scan.dedup_denied_never_certified" as scan.dedup_denied_never_certified;
         DEDUP_DENIED_FP_MOVED = "timefusion.scan.dedup_denied_fp_moved" as scan.dedup_denied_fp_moved;
         DEDUP_DENIED_SLICE_ONLY = "timefusion.scan.dedup_denied_slice_only" as scan.dedup_denied_slice_only;
+        LAYOUT_SPLIT_SCANS = "timefusion.scan.layout_split_scans" as scan.layout_split_scans;
         DEDUP_DENIED_NO_WINDOW = "timefusion.scan.dedup_denied_no_window" as scan.dedup_denied_no_window;
         DEDUP_DENIED_UNRESOLVED = "timefusion.scan.dedup_denied_unresolved" as scan.dedup_denied_unresolved;
         DEDUP_DENIED_DISABLED = "timefusion.scan.dedup_denied_disabled" as scan.dedup_denied_disabled;

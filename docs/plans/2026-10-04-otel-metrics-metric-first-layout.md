@@ -192,7 +192,7 @@ Go/no-go for the Stage 2 deploy (the re-probe dry run), on a ≥1 h process:
 - No-go (revert): rewrites climbing on files the sample said match, or `pending_repair` flat for an hour —
   either means `footer_declares` disagrees with prod footers for a reason the 243-file sample missed.
 
-### Stage 2b — dedup each layout's dates separately
+### Stage 2b — dedup each layout's dates separately  ✅ implemented
 
 Dedup keys include `timestamp` and partitions are `date(timestamp)`, so **a key never spans dates**. When a
 scan's files carry more than one footer ordering, split it into one leg per layout by date set — the same
@@ -210,10 +210,27 @@ days: tuple bound), then union. No read-time sort of a whole layout, no full-set
   as tails above.
 - Inert until Stage 3 (one layout everywhere).
 
+**As built** (decisions that differ from the text above):
+- Mechanism: for a table whose sort leads with a non-time column (`sort_led_by_time`), `scan` splits the
+  window into runs of consecutive same-layout dates (`layout_runs`) and runs the whole existing scan once per
+  run (`scan_whole`), each filtered to its run AFTER dedup and unioned. Same partition as per-layout legs, with
+  no surgery inside leg assembly; the per-date/per-file certification splits keep working within a run.
+- Requirement: a string-led table takes `DedupExec`'s merge requirement from the Delta leg's declared ordering
+  (`keep_greatest_requirement`), so an old-layout run stays `bounded[timestamp]`.
+- Verified gate: decides only which run a date joins (any unverified file ⇒ legacy). Within a run the leg's
+  declared order is trusted and a lie fails closed (`OrderingViolation`, counted) — rather than the
+  undeclared-leg fallback, which would send an honest but not-yet-verified day to full-set dedup and fail the
+  same large windows at the 2 GiB cap.
+- Found while testing: TimeFusion's Utf8→Utf8View coercion projection erased every string-led ordering
+  (DataFusion's `CastExpr` preserves order only for numeric widening). `StringViewCast` keeps it, gated like
+  the split so timestamp-led tables plan exactly as before.
+
 Tests:
-- A window spanning an old-layout day, a new-layout day, and a new-layout late tail on the old day: result
-  equals raw (`query_delta_only`), `dedup_full_set_total` unchanged, no read-time sort over budget (assert the
-  plan, not only the answer).
+- A window spanning an old-layout day (footer written timestamp-first), a metric-first day, and a newer
+  version of an old-day key in MemBuffer: one row per key, the newest wins, `count(*)` exact, the window splits,
+  `dedup_full_set_total` unchanged (`a_window_across_two_sort_layouts_dedups_each_day_under_its_own_order`,
+  fixture `mor_metric_first`). Red without the split, and red with the schema's requirement on the old run.
+- `only_a_string_led_table_plans_by_layout`: logs and (pre-flip) metrics stay on the old path.
 
 ### Stage 2c — bounded packing for a non-time leading sort column
 

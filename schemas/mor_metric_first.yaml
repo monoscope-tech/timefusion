@@ -1,0 +1,53 @@
+# Merge-on-read FIXTURE with a string-led sort, the shape `otel_metrics` takes in the
+# metric-first layout (docs/plans/2026-10-04-otel-metrics-metric-first-layout.md). Nothing
+# writes to it in production; it exists so the string-led dedup bound and the per-layout
+# scan split run the real path in tests before any production table depends on them.
+table_name: mor_metric_first
+partitions:
+  - project_id
+  - date
+# Same set as the sort's leading columns, so equal keys are adjacent in a sorted stream.
+dedup_keys:
+  - metric
+  - timestamp
+  - id
+dedup_tiebreak: updated_at
+tombstone_column: deleted
+version_append: true
+sorting_columns:
+  - name: metric
+    descending: false
+    nulls_first: false
+  - name: timestamp
+    descending: true
+    nulls_first: true
+  - name: id
+    descending: false
+    nulls_first: false
+z_order_columns: []
+fields:
+  - name: date
+    data_type: Date32
+    nullable: false
+  - name: timestamp
+    data_type: 'Timestamp(Microsecond, Some("UTC"))'
+    nullable: false
+  - name: id
+    data_type: Utf8
+    nullable: false
+  - name: metric
+    data_type: Utf8
+    nullable: false
+  - name: value
+    data_type: Int64
+    nullable: true
+    mutable: true
+  - name: project_id
+    data_type: Utf8
+    nullable: true
+  - name: updated_at
+    data_type: 'Timestamp(Microsecond, Some("UTC"))'
+    nullable: true
+  - name: deleted
+    data_type: Boolean
+    nullable: true

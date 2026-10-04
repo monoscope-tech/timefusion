@@ -7827,6 +7827,88 @@ async fn a_footer_written_under_another_sort_order_is_a_repair_suspect() -> Resu
     Ok(())
 }
 
+/// A window spanning a day written under an earlier sort order and a day in the schema's
+/// metric-first order — with a newer version of a legacy-day key still in MemBuffer — dedups
+/// each day under its own order: one row per key, the newest version, and no full-set dedup.
+/// Fails without the split or with the schema's requirement on the legacy run. It does NOT
+/// guard `scan_layout_runs`' post-dedup range filter: the legs already enforce their run's range
+/// (the Delta leg's re-applied filter, day-aligned MemBuffer buckets), so that filter is a
+/// second line this fixture cannot reach.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_window_across_two_sort_layouts_dedups_each_day_under_its_own_order() -> Result<()> {
+    const TABLE: &str = "mor_metric_first";
+    crate::observability::init_local_metrics_for_test();
+    let cfg = create_test_config("layouts");
+    let layer = Arc::new(crate::support::test_helpers::test_layer(Arc::clone(&cfg))?);
+    let db = Arc::new(Database::with_config(cfg).await?.with_buffered_layer(layer));
+    let project = format!("layout_{}", uuid::Uuid::new_v4().simple());
+    let day = |back: i64| (Utc::now() - chrono::Duration::days(back)).date_naive();
+    let (legacy_day, current_day) = (day(3), day(2));
+    let rows = |date: chrono::NaiveDate, value: i64| -> Vec<serde_json::Value> {
+        (0..3)
+            .cartesian_product(0..4)
+            .map(|(m, k)| {
+                let ts = date.and_hms_opt(12, 0, k).expect("valid").and_utc().timestamp_micros();
+                serde_json::json!({"timestamp": ts, "id": format!("k{k}"), "metric": format!("m{m}"), "value": value, "project_id": project, "date": date.to_string()})
+            })
+            .collect()
+    };
+    let schema = get_schema(TABLE).expect("fixture");
+    db.insert_records_batch(&project, TABLE, vec![json_to_batch_for(TABLE, rows(current_day, 1))?], true, None).await?;
+    // The legacy day: timestamp-first, written as a build with the earlier order would have.
+    let mut legacy = schema.clone();
+    legacy.sorting_columns.rotate_left(1);
+    let (sorted, _) = sort_batches_by_schema_reference(&legacy, vec![json_to_batch_for(TABLE, rows(legacy_day, 1))?]);
+    {
+        let table_ref = db.resolve_table(&project, TABLE).await?;
+        let mut table = table_ref.write().await;
+        let mut writer = deltalake::writer::RecordBatchWriter::for_table(&table)?.with_writer_properties(db.create_writer_properties(&legacy, 3, true));
+        for batch in sorted {
+            let batch = deltalake::kernel::schema::cast_record_batch(&batch, writer.arrow_schema(), true, true)?;
+            deltalake::writer::DeltaWriter::write(&mut writer, batch).await?;
+        }
+        deltalake::writer::DeltaWriter::flush_and_commit(&mut writer, &mut table).await?;
+    }
+    // A newer version of a legacy-day key, still in MemBuffer at its original timestamp.
+    let newer = rows(legacy_day, 2)[..1].to_vec();
+    db.insert_records_batch(&project, TABLE, vec![json_to_batch_for(TABLE, newer)?], false, None).await?;
+
+    let mut ctx = Arc::clone(&db).create_session_context();
+    db.setup_session_context(&mut ctx)?;
+    let (lo, hi) = (legacy_day.to_string(), current_day.succ_opt().expect("next").to_string());
+    let sql = format!(
+        "SELECT metric, id, timestamp, value FROM {TABLE} WHERE project_id = '{project}' AND timestamp >= '{lo}' AND timestamp < '{hi}' ORDER BY 1, 2, 3"
+    );
+    let full_set = || crate::observability::counter_value(scan_metric_names::DEDUP_FULL_SET_TOTAL);
+    let (splits, full_before) = (crate::observability::counter_value(scan_metric_names::LAYOUT_SPLIT_SCANS), full_set());
+    let show = |batches: Vec<RecordBatch>| datafusion::arrow::util::pretty::pretty_format_batches(&batches).expect("format").to_string();
+    let got = show(ctx.sql(&sql).await?.collect().await?);
+    assert_eq!(crate::observability::counter_value(scan_metric_names::LAYOUT_SPLIT_SCANS), splits + 1, "the window must split by layout");
+    assert_eq!(full_set(), full_before, "each layout dedups bounded: {got}");
+    assert_eq!(got.lines().filter(|line| line.contains("| ")).count(), 1 + 24, "one header and one row per key: {got}");
+    assert!(got.lines().any(|line| line.contains("| m0     | k0 ") && line.trim_end().ends_with("| 2     |")), "the newer version wins: {got}");
+    let count = show(
+        ctx.sql(&format!("SELECT count(*) FROM {TABLE} WHERE project_id = '{project}' AND timestamp >= '{lo}' AND timestamp < '{hi}'"))
+            .await?
+            .collect()
+            .await?,
+    );
+    assert!(count.contains("| 24 "), "count(*) over the split: {count}");
+    Ok(())
+}
+
+/// Only a table whose sort leads with a non-time column takes the layout split and the
+/// order-keeping string cast; every timestamp-led table plans exactly as before.
+#[test_case::test_case("otel_logs_and_spans" => true)]
+#[test_case::test_case("otel_metrics" => true ; "until its sort flips")]
+#[test_case::test_case("mor_metric_first" => false)]
+#[tokio::test]
+async fn only_a_string_led_table_plans_by_layout(table: &str) -> bool {
+    let db = Arc::new(Database::with_config(create_test_config("sort-lead")).await.expect("db"));
+    let schema = get_schema(table).expect("registered").schema_ref();
+    super::ProjectRoutingTable::new("p".into(), db, schema, None, table.to_string()).sort_led_by_time()
+}
+
 fn add_action(path: &str) -> deltalake::kernel::Action {
     deltalake::kernel::Action::Add(deltalake::kernel::Add { path: path.to_string(), size: 1, ..Default::default() })
 }
