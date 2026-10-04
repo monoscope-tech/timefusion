@@ -745,6 +745,24 @@ async fn an_over_cap_predicate_is_refused_without_searching_again() {
     assert_eq!(env.search.search_with_stats(env.table, env.project, &node, 10, None).await.unwrap().expect("usable").hits.len(), 1);
 }
 
+/// A search the scan declined as unselective (`kind IN (...)` matching nearly every span,
+/// ~250 ms of planning per scan on prod) is not run again for an equal-or-wider window;
+/// a narrower one may be selective and still searches.
+#[tokio::test]
+async fn an_unselective_predicate_is_refused_without_searching_again() {
+    let env = Env::prod("otel_logs_and_spans", "p-unselective");
+    env.publish(&[(1_000_000, "a", "ERROR"), (1_000_001, "b", "ERROR")], &["u1"]).await;
+    let error = level_error_node();
+    let search = |window| env.search.search_detailed(env.table, env.project, &error, 100, Some(window), true);
+    let searched = || env.search.stats.indexes_searched.load(Relaxed);
+    assert!(search((1_000_000, 1_000_010)).await.unwrap().is_ok());
+    env.search.remember_unselective(env.table, env.project, &error, 100, Some((1_000_000, 1_000_010)));
+    let before = searched();
+    assert_eq!(search((999_000, 1_000_020)).await.unwrap().err(), Some("low_selectivity_memo"));
+    assert_eq!(searched(), before, "a remembered unselective search must not search any index");
+    assert!(search((1_000_000, 1_000_001)).await.unwrap().is_ok(), "a narrower window searches again");
+}
+
 /// Prod 2026-09-30: a cold 24h ERROR count waited 88.9 s on installing every blob in the window
 /// (1.85 s warm) behind the shared install permits. The prefilter only accelerates a scan that
 /// evaluates the predicate itself, so a cold window must refuse at once — with no object-store

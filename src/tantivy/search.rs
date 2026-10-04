@@ -166,8 +166,10 @@ pub struct TantivySearchService {
     /// Predicates whose search recently overflowed `max_hits`, with the narrowest window width
     /// that did. A common value (`status_code = 'ERROR'`) overflows on every wide query of a
     /// busy project — after paying for every cold blob download in the window — while a
-    /// narrower fringe window of the same predicate may still fit.
-    cap_exceeded: DashMap<CapKey, (Instant, u64)>,
+    /// narrower fringe window of the same predicate may still fit. A search the caller
+    /// declined as unselective (`kind IN (...)` matching nearly every span) is remembered
+    /// the same way; the value carries the reason the memo answers with.
+    cap_exceeded: DashMap<CapKey, (Instant, u64, &'static str)>,
     /// Background warms queued or running, keyed by cache dir so a hot cold
     /// window queues each blob once however many queries see it cold.
     warming: DashMap<PathBuf, ()>,
@@ -184,6 +186,10 @@ const MAX_CONCURRENT_INSTALLS: usize = 4;
 const MAX_CONCURRENT_WARMS: usize = 2;
 const MAX_QUEUED_WARMS: usize = 64;
 const CAP_EXCEEDED_TTL: Duration = Duration::from_secs(600);
+
+fn window_width(time_range: Option<(i64, i64)>) -> u64 {
+    time_range.map_or(u64::MAX, |(lo, hi)| hi.abs_diff(lo))
+}
 
 /// Outcome of one [`TantivySearchService::reap_disk_cache`] sweep.
 #[derive(Debug, Default, Clone, Copy)]
@@ -342,6 +348,22 @@ impl TantivySearchService {
         Ok(self.search_detailed(table, project_id, node, max_hits, time_range, true).await?.ok())
     }
 
+    /// Skip this predicate's search for equal-or-wider windows until the memo expires:
+    /// the hits were too many to prune with. Always sound — the scan still evaluates
+    /// the predicate itself.
+    pub fn remember_unselective(&self, table: &str, project_id: &str, node: &PredNode, max_hits: usize, time_range: Option<(i64, i64)>) {
+        self.remember_refusal((table.to_string(), project_id.to_string(), node.clone(), max_hits), window_width(time_range), "low_selectivity_memo");
+    }
+
+    fn remember_refusal(&self, key: CapKey, width: u64, reason: &'static str) {
+        if self.cap_exceeded.len() >= 4096 {
+            self.cap_exceeded.retain(|_, e| e.0.elapsed() < CAP_EXCEEDED_TTL);
+        }
+        let mut e = self.cap_exceeded.entry(key).or_insert((Instant::now(), width, reason));
+        let narrowest = if e.0.elapsed() < CAP_EXCEEDED_TTL { e.1.min(width) } else { width };
+        *e = (Instant::now(), narrowest, reason);
+    }
+
     /// `search_with_stats`, but the `Err` says WHY it could not answer: the
     /// refusals want opposite fixes (backfill / bigger cap / reindex).
     ///
@@ -353,16 +375,12 @@ impl TantivySearchService {
         self: &Arc<Self>, table: &str, project_id: &str, node: &PredNode, max_hits: usize, time_range: Option<(i64, i64)>, wait_for_cold: bool,
     ) -> Result<std::result::Result<SearchResult, &'static str>> {
         let cap_key: CapKey = (table.to_string(), project_id.to_string(), node.clone(), max_hits);
-        let width = time_range.map_or(u64::MAX, |(lo, hi)| hi.abs_diff(lo));
-        if self.cap_exceeded.get(&cap_key).is_some_and(|e| e.0.elapsed() < CAP_EXCEEDED_TTL && width >= e.1) {
-            return Ok(Err("delta_cap_exceeded_memo"));
+        let width = window_width(time_range);
+        if let Some(e) = self.cap_exceeded.get(&cap_key).filter(|e| e.0.elapsed() < CAP_EXCEEDED_TTL && width >= e.1) {
+            return Ok(Err(e.2));
         }
         let cap_exceeded = |reason: &'static str| {
-            if self.cap_exceeded.len() >= 4096 {
-                self.cap_exceeded.retain(|_, e| e.0.elapsed() < CAP_EXCEEDED_TTL);
-            }
-            let mut e = self.cap_exceeded.entry(cap_key.clone()).or_insert((Instant::now(), width));
-            *e = (Instant::now(), if e.0.elapsed() < CAP_EXCEEDED_TTL { e.1.min(width) } else { width });
+            self.remember_refusal(cap_key.clone(), width, "delta_cap_exceeded_memo");
             Ok(Err(reason))
         };
         let m = self.load_manifest_cached(table, project_id).await?;

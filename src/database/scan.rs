@@ -1366,6 +1366,7 @@ mod stale_coverage_metric_tests {
             "delta_cap_exceeded_one_index",
             "delta_cap_exceeded_combined",
             "delta_cap_exceeded_memo",
+            "low_selectivity_memo",
             "delta_cold_index",
             "delta_error",
         ] {
@@ -1693,7 +1694,12 @@ impl TableProvider for ProjectRoutingTable {
                     tcfg.timefusion_tantivy_file_pruning,
                     tcfg.timefusion_tantivy_row_selection,
                 ) {
-                    PrefilterDecision::Skipped(reason) => skip(reason),
+                    PrefilterDecision::Skipped(reason) => {
+                        if reason == "low_selectivity" {
+                            svc.remember_unselective(&self.table_name, &project_id, tree, max_hits, query_time_range);
+                        }
+                        skip(reason)
+                    }
                     PrefilterDecision::Used { ids, covered_files, exclude_files, row_selections } => {
                         crate::observability::record_tantivy_prefilter_used();
                         metrics::counter!(scan_metric_names::PREFILTER_USED).increment(1);
