@@ -3630,6 +3630,19 @@ impl Database {
             .with_config(options.into())
             .with_runtime_env(runtime_env)
             .with_default_features()
+            .with_optimizer_rules(
+                datafusion::optimizer::Optimizer::new()
+                    .rules
+                    .into_iter()
+                    .map(|rule| {
+                        if rule.name() == "common_sub_expression_eliminate" {
+                            Arc::new(crate::read::optimizers::FilterSafeCse) as Arc<dyn datafusion::optimizer::OptimizerRule + Send + Sync>
+                        } else {
+                            rule
+                        }
+                    })
+                    .collect(),
+            )
             // Ours FIRST, ahead of DataFusion's defaults: CoreFunctionPlanner claims
             // e.g. every `SUBSTRING` unconditionally, so appending would hide the PG
             // regex form from our planner.
