@@ -186,6 +186,12 @@ Tests:
   (`a_footer_written_under_another_sort_order_is_a_repair_suspect`, plus a case table for the header).
 - Fixed point after repair: **moved to Stage 3**, where the shipped schema actually changes order.
 
+Go/no-go for the Stage 2 deploy (the re-probe dry run), on a ≥1 h process:
+- Expected: `pending_repair` rises as every sealed partition of every sorted table becomes a suspect, then
+  drains as `footer_repair_suspect_cleared` fires; actual repair rewrites ≈ the <1% lying footers.
+- No-go (revert): rewrites climbing on files the sample said match, or `pending_repair` flat for an hour —
+  either means `footer_declares` disagrees with prod footers for a reason the 243-file sample missed.
+
 ### Stage 2b — dedup each layout's dates separately
 
 Dedup keys include `timestamp` and partitions are `date(timestamp)`, so **a key never spans dates**. When a
