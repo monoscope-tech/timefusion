@@ -1,0 +1,260 @@
+# otel_metrics: metric-first layout
+
+Status: proposed (2026-10-04). Owner decision: re-sort everything.
+
+## Why
+
+Web vitals on the demo project read **44.7M rows to return ~58k** for a 24h window (count alone 69.8 s).
+`otel_metrics` is sorted `(timestamp DESC, metric_name, series_id)`, so every row group interleaves every
+metric and nothing prunes on `metric_name` — not row groups, pages or blooms.
+
+Query pattern (owner, 10-04): **never across metrics; one metric, then a time window.** Queries never name
+`series_id` — they select series by attribute filters and usually aggregate across many of them
+(`sum(rate(...))` over instances, p95 over pods, `GROUP BY attributes.route`).
+
+Measured on prod (hourly rollup, demo project, last 24h):
+
+| | value |
+|---|---|
+| distinct metrics/day | demo 441, whale 291, shipbubble 17 |
+| rows/day (demo) | 43.8M; top 10 metrics = 61%; the 4 biggest ~4.5M each |
+| `browser.web_vital.*` (demo) | ~58k rows/day = 0.13% |
+| sealed-day files (demo / whale / shipbubble) | 4-5 / 1 / 1 files, ~2 / 0.4 / 0.1 GB |
+| read-side dedup today (all tables) | 34,045 bounded vs 838 full-set (97.6% bounded) |
+
+## Decision
+
+Sort every `otel_metrics` file by **`(metric_name, timestamp DESC, series_id)`** and reorder
+`dedup_keys` to **`(metric_name, timestamp, series_id)`** — the same key set, now the full sort prefix.
+Keep the `[project_id, date]` partitions.
+
+This matches prior art: ClickHouse's OTel exporter `ORDER BY (ServiceName, MetricName, Attributes, TimeUnix)`
+partitioned by day; InfluxDB 3 sorts each table's Parquet by tags then time; Cortex/Prometheus Parquet sorts
+row groups by `__name__`.
+
+### Alternatives rejected
+
+- **Partition by `metric_name`.** 441 metrics × ~2 GB/day ≈ 4.5 MB partitions; Delta guidance is ≥1 GB per
+  partition. Thousands of tiny files, a bigger log, more commits, more maintenance units.
+- **Liquid clustering in our delta-rs fork.** Its pruning is file-level, and our partitions hold 1-5 files.
+  Hilbert order inside files destroys the timestamp/sort order dedup and footer ordering need. It is a
+  protocol table feature (`clustering` + `delta.clustering` domain metadata) other writers must honour — the
+  one option that would tie the data to our implementation. Not in delta-rs upstream (issue #2043).
+- **Metric-range files** (split sealed days into files by `metric_name` range, timestamp-sorted inside).
+  Kept the time-first paths but pruned only to ~1/16 of a day, grew the Delta log, and needed a cutting
+  writer + converged tag + tail re-cluster. Its premise — time-only reads matter — does not hold for queries.
+- **`(metric_name, series_id, timestamp)`.** Makes each series contiguous (the window-function shape
+  `PARTITION BY series_id ORDER BY timestamp`), but queries never filter `series_id`, so its second place
+  prunes nothing and spreads every series' run across the whole day — a time window inside a metric then
+  prunes nothing either. Time second keeps metric + window pruning down to row groups and pages; the
+  per-series windows keep their sort, now over a pruned metric+window slice instead of the whole day.
+
+### Compatibility
+
+No fork change and no protocol feature. Files are ordinary Parquet + Delta `add` actions; the sort is recorded
+in each footer's `sorting_columns`. `metric_name` and `series_id` already get per-file stats
+(`stats_columns_for`, `src/database/mod.rs`: sorting columns + dedup keys), so any engine — Databricks
+included — skips files and row groups on them.
+
+## Schema change (stage 3)
+
+```yaml
+dedup_keys:            # same set, reordered: must stay a prefix of sorting_columns
+  - metric_name
+  - timestamp
+  - series_id
+sorting_columns:
+  - { name: metric_name, descending: false, nulls_first: false }
+  - { name: timestamp,   descending: true,  nulls_first: true }
+  - { name: series_id,   descending: false, nulls_first: false }
+```
+
+Every write path already reads the schema's order (flush `sort_batches_by_schema`, packing/repair
+`schema_order_by_clause`, delta-rs optimize `schema_optimize_sort_columns`, DV-merge append), and footers come
+from `schema.sorting_columns()`, so new files are honest the moment this ships.
+
+## What breaks today, and the stage that fixes it
+
+From a code map of the read and maintenance paths (file:line refs as of `98bf79e9`).
+
+| # | Risk | Kind | Fixed by |
+|---|---|---|---|
+| 1 | Bounded read dedup needs an Int64/timestamp lead (`leading_bound`, `src/read/mod.rs:334`; `keep_greatest_ordering`, `src/database/scan.rs:785`). A string lead → full-set dedup, capped at 2 GiB/query → large windows fail. | availability | Stage 1 |
+| 2 | Repair checks a footer *exists*, not *which* columns (`maintain.rs` ~9696, `compact.rs` ~628). Old days never migrate. | cost (forever mixed) | Stage 2 |
+| 3 | Mixed layouts: the minority layout gets a read-time `SortExec` up to 1 GiB compressed per query (`repair_isolated_scan_ordering`, `src/read/optimizers.rs` ~1714); over budget it is unordered → full-set dedup → >2 GiB fails. One demo day is ~2 GB compressed, so any window touching an unmigrated demo day hits this. | availability during migration | Stage 2b (per-layout date legs) + Stage 4 gate |
+| 3b | Packing slices on the leading sort column and its range probe casts it to `i64` (`maintain.rs:8393`, `mod.rs:5151`); a `metric_name` lead declines slicing, and the tail packer has no row cap because it relies on slicing (`mod.rs:6585`) → unbounded sorts. | availability (maintenance OOM) | Stage 2c |
+| 3c | A falsely declared ordering (lying footer) makes a streaming collapse emit a key, clear its state, then see the key again: `A, B, A` emits `A` twice or an older and a newer version (`src/read/mod.rs:1003-1006`: `close_run` + `seen.clear()`). Unrecoverable once emitted. The existing timestamp bound has the same gap. | correctness | Stage 1 (fail closed + verified legs only) |
+| 4 | Time locality lost inside a day: dedup bins (10-min, rewrite every overlapping file), the dedup probe's time sharding, per-file certification overlap, packing "event-time disjoint" cuts. | maintenance cost | Stage 0 measurement, Stage 3 adjustments |
+| 5 | `ORDER BY timestamp DESC LIMIT` across a metric no longer streams. | cost (queries we do not run) | accepted |
+| 6 | File regrouping by declared ordering degrades when flush files hold every metric (`regroup_for_declared_ordering`, fork). | cost | accepted; watch |
+| 7 | Inexact string min/max for `metric_name` trusted for file grouping. | theoretical correctness | Stage 1 test |
+
+Unaffected: dedup-key checks are `any(== "timestamp")`; `RunCollapse` and the dedup operator compare by
+equality/hash; rollup SQL orders explicitly; tantivy is not configured on `otel_metrics`.
+
+## Stages
+
+Each stage is its own deploy, signed off with `make ci-signoff`, and proven on prod before the next.
+
+### Stage 0 — measure the time-only maintenance readers (no deploy)
+
+Queries never cross metrics; maintenance does. Before Stage 3, size what a metric-first day costs each lane:
+
+- Rollup base builds on `otel_metrics`: unit width per day age (`base_hour_units` mints hour units for
+  today's writes only — sealed days build in day units, which read the day once either way). Confirm from the
+  journal on prod.
+- Dedup dirty bins and the probe for `otel_metrics`: units/day and bytes read per unit (`timefusion_stats`
+  + monoscope maintenance metrics). A bin rewrites every file overlapping its 10 minutes; today that is the
+  day's 1-5 files; after the flip it is the same files, so bytes should be flat — verify.
+- Late-arrival and merge-on-read UPDATE volume on sealed `otel_metrics` days (these land as tail files).
+
+Gate: write the numbers into this file. If any lane's cost would rise by more than ~2× on sealed days, adjust
+it in Stage 3 before the flip.
+
+### Stage 1 — read-side dedup collapses runs when the ordering covers the keys
+
+When the input's declared ordering has every dedup key as its prefix (in any column type), all versions of
+a key are adjacent: `DedupExec` keep-greatest can emit each run as soon as the key tuple changes, with no
+per-run buffering — strictly better than today's timestamp bound. Implement as a generalisation of `Bound`:
+track the leading **key tuple** via the arrow row format (`RowConverter` with the sort options, so byte
+order = sort order), keep the i64 fast path for timestamp-led tables (logs: 97% of dedups, CPU-sensitive).
+
+- `leading_bound` / `detect_bound` (`src/read/mod.rs`) and `keep_greatest_ordering` (`src/database/scan.rs`):
+  accept a non-numeric lead when the declared ordering covers all dedup keys.
+- **False orderings fail closed.** A streaming collapse cannot retract a run it emitted, so a lying footer
+  (`A, B, A`) is not recoverable in-stream. Two layers:
+  1. Engage the tuple bound only on legs whose files are *verified* sorted (written by our sorted writer or
+     confirmed by repair: `repair_verified_sorted` / `SORTED_RUN_TAG`); any other leg keeps today's path.
+  2. On a backward key-tuple move the new path returns an error (`ordering violation in <table> leg <leg>;
+     file ordering is false`) and bumps `ordering_violations_*`. It does not emit a possibly-duplicated
+     answer. The existing i64 timestamp bound keeps its current behaviour (a separate follow-up — prod's
+     `ordering_violations_delta` is non-zero today).
+- Ship with no table using it (otel_metrics is still timestamp-led), so the deploy is inert for prod reads.
+
+Tests (rs-minimal-tests ladder):
+- Property test: for random batches sorted by a `(Utf8, ts, Utf8)` key with random duplicate versions,
+  streaming collapse == full-set keep-greatest, and peak buffered bytes stay O(one run).
+- Case table: lead types Utf8 / Utf8View / Int64 / Timestamp; asc/desc; nulls first/last.
+- False footer: input `A(v1), B, A(v2)` declared sorted on the tuple path → the query errors with the
+  ordering-violation message and the counter rises; no row is emitted for the second `A`. An unverified leg
+  with the same data takes the full-set path and returns exactly `A(v2), B`.
+- Inexact string stats: metric names sharing a >64-char prefix across two files must not be grouped under a
+  false ordering (risk 7).
+- Cost assertion: bounded path chosen (counter), not just correct output.
+
+Gate: suite + e2e green; prod `dedup_full_set_total` unchanged after deploy.
+
+### Stage 2 — repair rewrites files whose footer order differs from the schema
+
+- Compare each file's footer `sorting_columns` with `schema.sorting_columns()` (names + direction), not just
+  presence (`maintain.rs` ~9696, `compact.rs` ~628). A mismatched file is a repair candidate.
+- `repair_verified_sorted` is persisted and filled at write time: key it by the sort signature (or clear
+  entries whose footer no longer matches) so a schema change re-queues old files.
+- Admission: one (project, date) unit at a time, priced in decoded bytes like today. Pace so the table
+  (~185 GB) migrates over days without starving dedup/rollups — reuse the repair lane's budget, newest days
+  first (they are what dashboards read).
+- Inert until Stage 3 (all footers match the current schema).
+
+Tests:
+- A file written under one sort and read under another is selected; a matching file is not.
+- Fixed point: after repair, a second pass selects nothing (no churn — see the 09-13 work-amplifier lesson).
+
+### Stage 2b — dedup each layout's dates separately
+
+Dedup keys include `timestamp` and partitions are `date(timestamp)`, so **a key never spans dates**. When a
+scan's files carry more than one footer ordering, split it into one leg per layout by date set — the same
+date-restricted leg machinery the per-date dedup skip already uses (`scan_side!` / `date_restrict`,
+`src/database/scan.rs` ~582-607) — and dedup each leg with its own ordering (old days: timestamp bound; new
+days: tuple bound), then union. No read-time sort of a whole layout, no full-set fallback across layouts.
+
+- A day is single-layout once repair rewrites it (one commit per (project, date)). A day can be mixed only by
+  late files landing on an unmigrated day after the flip; those tail files are small, so they are sorted to the
+  day's majority order at read time (well under the 1 GiB budget), and the day is already a repair candidate.
+- MemBuffer rows follow the current schema order; they belong to today (new layout) or to late days, handled
+  as tails above.
+- Inert until Stage 3 (one layout everywhere).
+
+Tests:
+- A window spanning an old-layout day, a new-layout day, and a new-layout late tail on the old day: result
+  equals raw (`query_delta_only`), `dedup_full_set_total` unchanged, no read-time sort over budget (assert the
+  plan, not only the answer).
+
+### Stage 2c — bounded packing for a non-time leading sort column
+
+Prerequisite to the flip. Generalise slicing so it does not need an `i64` lead:
+
+- Range probe over the bin: `SELECT <lead>, count(*) … GROUP BY 1 ORDER BY 1` (the bin is small; `metric_name`
+  is non-null in the schema). Cut contiguous lead-value ranges with balanced row counts:
+  `WHERE metric_name >= a AND metric_name < b`, emitted in the output's sort direction into one writer, so the
+  concatenation stays globally sorted and the footer honest.
+- A single lead value larger than one slice (the 4.5M-row k6 metrics) is cut further on the next sort column
+  (`timestamp`, still i64) within that value.
+- Until that exists, give the tail packer a row cap whenever slicing declines, so a declined slice can never
+  mean an unbounded sort.
+
+Tests:
+- A bin whose decoded size exceeds the sort budget, led by a string column with one dominant value: packs in
+  bounded slices (assert the slice count / per-slice rows), output rows == input rows, footer ordering honest
+  (re-read and verify monotone).
+
+### Stage 3 — flip the schema
+
+- Prerequisites: Stages 1, 2, 2b and 2c deployed and their gates met.
+- Apply the yaml above. Update the `schema.rs:1047` assertion message ("lead sort key must be leaf 0") and
+  the yaml comment that names the old key order.
+- Adjust any lane Stage 0 flagged. Expected candidates:
+  - dedup probe time sharding (`compact.rs` ~1088): shard by metric range instead of time for tables whose
+    sort leads with a non-time key, so each shard prunes on `metric_name` stats;
+  - packing's "event-time disjoint" cut comment (`maintain.rs` ~8507) — cuts stay on contiguous slices of the
+    sorted stream (still honest footers); only the comment's claim changes.
+- Rollup tiers on `otel_metrics` (`metrics_1m_v2`, `metrics_1h_v2`, `series_5m_v1`, `series_attrs_1d_v2`) are
+  unaffected: their SQL orders explicitly and their own sort is independent.
+
+Tests:
+- The existing `the_shipped_dedup_keys_lead_the_shipped_sort` (`compact.rs:2252`) passes with both lists
+  reordered together.
+- Routed rollups over a mixed-layout window equal raw (`a_per_series_counter_rate_routes_to_the_series_tier_and_equals_raw`).
+- New: a metric + time-window query over a migrated day prunes to that metric's row groups inside the window
+  — assert `row_groups_pruned_statistics` / bytes scanned, not only the answer.
+
+### Stage 4 — migrate and verify
+
+- Watch per deploy (`bench/prod_report.py`, monoscope metrics): repair backlog draining for `otel_metrics`,
+  `ordering_repair_declined`, `dedup_full_set_total`, query-pool `Resources exhausted`, p99.
+
+**Go/no-go after the flip** (checked at +1 h and +24 h; process ≥10 min old):
+
+| Signal | Go | Roll back |
+|---|---|---|
+| `otel_metrics` queries failing with `unordered merge-on-read dedup exceeded` or `Resources exhausted` | 0 | any |
+| tuple-path ordering-violation errors | 0 | any (a lying footer exists — investigate before resuming) |
+| `ordering_repair_declined` for `otel_metrics` | 0 (Stage 2b keeps layouts in separate legs) | > 0 sustained over 1 h |
+| `dedup_full_set_total` delta vs the 24 h before the flip | ≤ +10% | > +10% |
+| repair backlog for `otel_metrics` | drains every hour | flat for 6 h |
+
+Rollback = revert the yaml order and redeploy. Both layouts carry honest footers and Stage 2b handles either
+majority, so rollback is a read-safe deploy; repair then migrates the already-converted days back (cost, not
+correctness).
+- Done when every sealed `otel_metrics` file's footer matches the schema.
+
+Success criteria (prod, process ≥10 min old, ≥3 runs, alternate arms):
+- Demo 24h web vitals: rows read ≥10× lower than 44.7M; wall time reported before/after.
+- No increase in `dedup_full_set_total` for `otel_metrics` reads.
+- Maintenance lanes within the Stage 0 budget.
+
+## Out of scope / follow-ups
+
+- Attribute-value filters (`attributes->>'page' = …`) select series inside a metric; `attributes` is Variant
+  with no stats, and `series_id` (a hash of the attribute set) is only the tiebreak. If those queries are slow: bloom or
+  tantivy sidecars on metric attributes, or promote hot attributes to columns.
+- Today's partition: hourly files are sorted metric-first too, so today-window reads benefit immediately
+  after Stage 3, without waiting for migration.
+
+## Sources
+
+- ClickHouse OTel exporter schema: https://github.com/open-telemetry/opentelemetry-collector-contrib/blob/main/exporter/clickhouseexporter/README.md
+- ClickStack schemas: https://clickhouse.com/docs/use-cases/observability/clickstack/ingesting-data/schemas
+- InfluxDB 3 primary key / sort: https://docs.influxdata.com/influxdb3/core/get-started/
+- Cortex Parquet storage: https://cortexmetrics.io/docs/proposals/parquet-storage/
+- Delta partitioning guidance: https://learn.microsoft.com/en-us/azure/databricks/delta/best-practices
+- Liquid clustering: https://docs.delta.io/delta-clustering/ · delta-rs issue: https://github.com/delta-io/delta-rs/issues/2043
