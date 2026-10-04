@@ -4188,6 +4188,19 @@ fn keep_greatest_ordering_requires_a_tiebreak() {
     let mut unkeyed = otel.clone();
     unkeyed.dedup_keys = vec!["id".into()];
     assert!(ProjectRoutingTable::keep_greatest_ordering(&unkeyed, &schema).is_none(), "lead sort key must itself be a dedup key");
+
+    // A string lead (the metric-first `otel_metrics` layout) takes the whole dedup-key
+    // prefix: `metric_name` alone would make one run of every row of a metric.
+    let metrics = get_schema("otel_metrics").expect("registered");
+    let mut metric_first = metrics.clone();
+    metric_first.sorting_columns.rotate_left(1);
+    metric_first.dedup_keys = metric_first.sorting_columns.iter().map(|sc| sc.name.clone()).collect();
+    let schema = metrics.schema_ref();
+    let ord = ProjectRoutingTable::keep_greatest_ordering(&metric_first, &schema).expect("string-led tiebreak table");
+    assert_eq!(
+        ord.iter().map(|se| se.expr.to_string().split('@').next().unwrap_or_default().to_string()).collect::<Vec<_>>(),
+        ["metric_name", "series_id", "timestamp"]
+    );
 }
 
 /// A predicate on the tombstone marker must never be handed to a scan leg —

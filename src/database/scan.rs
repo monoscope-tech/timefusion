@@ -773,24 +773,27 @@ impl ProjectRoutingTable {
         Ok(Arc::new(GatedScanExec::new(plan, sem, Some(self.database.scan_metrics.clone()), bypass_cache, pool_size)))
     }
 
-    /// Lead sort key that makes `DedupExec`'s keep-greatest engage.
+    /// Sort keys that make `DedupExec`'s keep-greatest engage.
     ///
-    /// The table's first declared sorting column, but only when the table declares a `dedup_tiebreak`
-    /// and that column is itself a dedup key of an i64-backed type. Equal dedup keys then share the
-    /// bound value, so all versions of a row live in one contiguous run and the operator can emit
-    /// without buffering the scan. One column, not the whole sort order, keeps the injected sort
-    /// cheap.
+    /// Only for a table declaring a `dedup_tiebreak`: the leading run of declared sorting columns
+    /// that are dedup keys. Equal dedup keys agree on all of them, so all versions of a row live in
+    /// one contiguous run and the operator can emit without buffering the scan. An i64-backed lead
+    /// alone already bounds a run, so it stays one column and the injected sort cheap; any other
+    /// lead takes the whole prefix, or one run could span every row sharing a `metric_name`.
     pub(crate) fn keep_greatest_ordering(table: &crate::schema::TableSchema, leg_schema: &SchemaRef) -> Option<datafusion::physical_expr::LexOrdering> {
         use datafusion::{
             arrow::{compute::SortOptions, datatypes::DataType},
             physical_expr::{LexOrdering, PhysicalSortExpr},
         };
         table.dedup_tiebreak.as_ref()?;
-        let sc = table.sorting_columns.first().filter(|sc| table.dedup_keys.contains(&sc.name))?;
-        let idx = leg_schema.index_of(&sc.name).ok()?;
-        matches!(leg_schema.field(idx).data_type(), DataType::Int64 | DataType::Timestamp(..)).then_some(())?;
-        let opts = SortOptions { descending: sc.descending, nulls_first: sc.nulls_first };
-        LexOrdering::new(vec![PhysicalSortExpr::new(Arc::new(PhysicalColumn::new(&sc.name, idx)), opts)])
+        let prefix: Vec<_> = table.sorting_columns.iter().take_while(|sc| table.dedup_keys.contains(&sc.name)).collect();
+        let lead = leg_schema.index_of(&prefix.first()?.name).ok()?;
+        let width = if matches!(leg_schema.field(lead).data_type(), DataType::Int64 | DataType::Timestamp(..)) { 1 } else { prefix.len() };
+        let sorts = prefix[..width].iter().map(|sc| {
+            let opts = SortOptions { descending: sc.descending, nulls_first: sc.nulls_first };
+            Some(PhysicalSortExpr::new(Arc::new(PhysicalColumn::new(&sc.name, leg_schema.index_of(&sc.name).ok()?)), opts))
+        });
+        LexOrdering::new(sorts.collect::<Option<Vec<_>>>()?)
     }
 
     /// Columns whose value can differ between versions of one row (`None` for

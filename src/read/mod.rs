@@ -42,6 +42,7 @@ use datafusion::{
     },
 };
 use futures::StreamExt;
+use itertools::Itertools;
 
 use crate::{database::scan_metric_names, observability::arrow_err};
 
@@ -67,7 +68,7 @@ fn check_unbounded_growth(current: usize, additional: usize) -> DFResult<()> {
 }
 
 /// Tracks an ordered timestamp run so its dedup state can be released promptly.
-struct Bound {
+struct TimeBound {
     /// Bound column index within the input schema.
     idx: usize,
     /// True when the sort is descending (bound decreases down the stream).
@@ -76,7 +77,29 @@ struct Bound {
     last: Option<i64>,
 }
 
-impl Bound {
+/// A dedup run: one i64 lead value, or — when the lead is not i64-backed — the
+/// dedup-key prefix of the declared ordering.
+enum Bound {
+    Time(TimeBound),
+    Tuple(TupleRun),
+}
+
+/// The run key of a non-i64 lead: the dedup-key prefix of the declared ordering,
+/// order-encoded with its sort options so byte order is the declared order.
+struct TupleRun {
+    cols: Vec<usize>,
+    conv: RowConverter,
+    last: Option<datafusion::arrow::row::OwnedRow>,
+}
+
+/// A run arrived after a later one under a declared ordering. A streaming dedup has
+/// already emitted the earlier run, so continuing would serve a duplicate or a
+/// superseded version; the query fails instead.
+#[derive(Debug, thiserror::Error)]
+#[error("ordering violation: rows arrived out of their declared order, so they cannot be deduplicated in a stream")]
+pub struct OrderingViolation;
+
+impl TimeBound {
     /// Is `a` strictly further along the declared direction than `b`?
     const fn ahead(&self, a: i64, b: i64) -> bool {
         if self.desc { a < b } else { a > b }
@@ -97,6 +120,42 @@ impl Bound {
     /// Advance against the global counter every dedup scan feeds.
     fn advance(&mut self, t: i64) -> bool {
         self.step(t, &ORDERING_VIOLATIONS)
+    }
+}
+
+impl Bound {
+    /// Advance over `batch`, yielding per row whether it opens a new run; `None` when an
+    /// i64 lead column is not i64-backed. A tuple run that moves BACKWARD fails with
+    /// [`OrderingViolation`]: its earlier run was already emitted and cannot be retracted.
+    fn run_starts(&mut self, batch: &RecordBatch) -> DFResult<Option<Vec<bool>>> {
+        match self {
+            Self::Time(time) => Ok(bound_slice(batch.column(time.idx)).map(|values| values.iter().map(|&v| time.advance(v)).collect())),
+            Self::Tuple(tuple) => {
+                let columns: Vec<ArrayRef> = tuple.cols.iter().map(|&i| batch.column(i).clone()).collect();
+                let rows = tuple.conv.convert_columns(&columns).map_err(arrow_err)?;
+                rows.iter()
+                    .map(|row| match tuple.last.as_ref().map(|last| row.cmp(&last.row())) {
+                        Some(std::cmp::Ordering::Equal) => Ok(false),
+                        Some(std::cmp::Ordering::Less) => {
+                            ORDERING_VIOLATIONS.fetch_add(1, Ordering::Relaxed);
+                            Err(DataFusionError::External(Box::new(OrderingViolation)))
+                        }
+                        opened => {
+                            tuple.last = Some(row.owned());
+                            Ok(opened.is_some())
+                        }
+                    })
+                    .collect::<DFResult<_>>()
+                    .map(Some)
+            }
+        }
+    }
+
+    fn describe(&self, schema: &SchemaRef) -> String {
+        match self {
+            Self::Time(time) => schema.field(time.idx).name().clone(),
+            Self::Tuple(tuple) => tuple.cols.iter().map(|&i| schema.field(i).name()).join(", "),
+        }
     }
 }
 
@@ -329,19 +388,35 @@ impl ExecutionPlan for OrderingProbeExec {
     }
 }
 
-/// The input's leading sort column as a `Bound`, when `accept`s its name and it
+/// The input's leading sort column as a `TimeBound`, when `accept`s its name and it
 /// is i64-backed. The declared ordering is never verified — see `detect_bound`.
-fn leading_bound(input: &Arc<dyn ExecutionPlan>, in_schema: &SchemaRef, accept: impl Fn(&str) -> bool) -> Option<Bound> {
+fn leading_bound(input: &Arc<dyn ExecutionPlan>, in_schema: &SchemaRef, accept: impl Fn(&str) -> bool) -> Option<TimeBound> {
     let se = input.properties().output_ordering()?.iter().next()?;
     let col = sort_col(se)?;
-    (accept(col.name()) && matches!(in_schema.field(col.index()).data_type(), DataType::Int64 | DataType::Timestamp(..))).then(|| Bound {
+    (accept(col.name()) && matches!(in_schema.field(col.index()).data_type(), DataType::Int64 | DataType::Timestamp(..))).then(|| TimeBound {
         idx: col.index(),
         desc: se.options.descending,
         last: None,
     })
 }
 
-/// Rows observed out of the order their scan declared. See `Bound::step`.
+/// The longest prefix of the declared ordering whose columns are all dedup keys, as a
+/// tuple `Bound`. Equal keys agree on every column of that prefix, so all versions of
+/// a key fall in one run however the prefix is typed.
+fn tuple_bound(input: &Arc<dyn ExecutionPlan>, in_schema: &SchemaRef, keys: &[String]) -> Option<Bound> {
+    let prefix: Vec<(usize, datafusion::arrow::compute::SortOptions)> = input
+        .properties()
+        .output_ordering()?
+        .iter()
+        .map_while(|se| sort_col(se).filter(|col| keys.iter().any(|key| key == col.name())).map(|col| (col.index(), se.options)))
+        .collect();
+    prefix.first()?;
+    let fields = prefix.iter().map(|&(i, options)| SortField::new_with_options(in_schema.field(i).data_type().clone(), options)).collect();
+    let conv = RowConverter::new(fields).ok()?;
+    Some(Bound::Tuple(TupleRun { cols: prefix.into_iter().map(|(i, _)| i).collect(), conv, last: None }))
+}
+
+/// Rows observed out of the order their scan declared. See `TimeBound::step`.
 pub(crate) static ORDERING_VIOLATIONS: AtomicU64 = AtomicU64::new(0);
 
 pub fn ordering_violations() -> u64 {
@@ -405,14 +480,17 @@ fn dedup_key_idxs(key_idxs: &[usize]) -> Vec<usize> {
     key_idxs.to_vec()
 }
 
-/// Enable bounded mode iff the input's leading sort column is a dedup key of an
-/// i64-backed type AND `timefusion_read_dedup_bounded` is on.
+/// Enable bounded mode when `timefusion_read_dedup_bounded` is on and the input's
+/// declared ordering leads with dedup keys: an i64-backed lead bounds runs alone;
+/// any other lead bounds them by the whole dedup-key prefix (`tuple_bound`).
 ///
 /// The ordering here is *declared*, never verified — `output_ordering()` is only
 /// as trustworthy as the parquet footer behind it; `dedup_key_idxs` keeps the
 /// operator sound when that declaration lies.
 fn detect_bound(input: &Arc<dyn ExecutionPlan>, keys: &[String], in_schema: &SchemaRef, enabled: bool) -> Option<Bound> {
-    enabled.then(|| leading_bound(input, in_schema, |name| keys.iter().any(|k| k == name))).flatten()
+    enabled
+        .then(|| leading_bound(input, in_schema, |name| keys.iter().any(|k| k == name)).map(Bound::Time).or_else(|| tuple_bound(input, in_schema, keys)))
+        .flatten()
 }
 
 /// The input's output ordering, remapped through `output_projection` onto the
@@ -509,7 +587,7 @@ impl DisplayAs for DedupExec {
         write!(f, "DedupExec: keys=[{}], mode=", self.keys.join(", "))?;
         let survivor = if self.tiebreak.as_ref().is_some_and(|tb| in_schema.index_of(tb).is_ok()) { "greatest" } else { "first" };
         match detect_bound(&self.input, &self.keys, &in_schema, bounded_dedup_enabled()) {
-            Some(b) => write!(f, "bounded[{}]/{survivor}", in_schema.field(b.idx).name()),
+            Some(b) => write!(f, "bounded[{}]/{survivor}", b.describe(&in_schema)),
             None => write!(f, "full-set/{survivor}"),
         }
     }
@@ -994,15 +1072,13 @@ impl Dedup {
             g.compact_floor = g.bytes.saturating_mul(2);
         }
         let tbs = g.tiebreak_rows(batch.column(g.idx))?;
-        let not_i64 = |idx| DataFusionError::Internal(format!("DedupExec bound column {idx} is not i64-backed"));
-        let bvals = self.bound.as_ref().map(|b| bound_slice(batch.column(b.idx)).ok_or_else(|| not_i64(b.idx))).transpose()?;
+        let not_i64 = || DataFusionError::Internal("DedupExec bound column is not i64-backed".into());
+        let starts = self.bound.as_mut().map(|b| b.run_starts(batch)?.ok_or_else(not_i64)).transpose()?;
         // Index of `batch` within the open run's buffer; `None` until a row of
         // this batch wins something.
         let mut cur: Option<u32> = None;
         for i in 0..batch.num_rows() {
-            if let (Some(bound), Some(vals)) = (self.bound.as_mut(), bvals.as_ref())
-                && bound.advance(vals[i])
-            {
+            if starts.as_ref().is_some_and(|starts| starts[i]) {
                 g.close_run(&mut self.seen, false);
                 self.seen.clear();
             }
@@ -1068,20 +1144,16 @@ fn filter_project_out(batch: &RecordBatch, mask: &BooleanArray, output_projectio
 /// requested projection. Returns `None` when nothing survives (caller pulls the
 /// next batch).
 fn dedup_first(
-    batch: &RecordBatch, keys: &datafusion::arrow::row::Rows, seen: &mut SeenSet, output_projection: Option<&[usize]>, mut bound: Option<&mut Bound>,
+    batch: &RecordBatch, keys: &datafusion::arrow::row::Rows, seen: &mut SeenSet, output_projection: Option<&[usize]>, bound: Option<&mut Bound>,
 ) -> DFResult<Option<RecordBatch>> {
-    // `bound_slice` returning None (unsupported type) disables eviction for this
-    // batch — still correct. `.map(idx)` first so the slice borrows `batch`, not
-    // `bound`, which the closure below needs mutably.
-    let bvals = bound.as_ref().map(|b| b.idx).and_then(|i| bound_slice(batch.column(i)));
-    // Borrowed probe: hash the encoded bytes in place and allocate only on a
+    // Unsupported i64 lead (`values` → None) disables eviction for this batch — still
+    // correct. Borrowed probe: hash the encoded bytes in place and allocate only on a
     // miss. When the bound advances past the current run the seen-set is cleared
     // first — no earlier key can recur in a sorted stream.
+    let starts = bound.map(|b| b.run_starts(batch)).transpose()?.flatten();
     let mask: BooleanArray = (0..batch.num_rows())
         .map(|i| {
-            if let (Some(b), Some(vals)) = (bound.as_deref_mut(), bvals)
-                && b.advance(vals[i])
-            {
+            if starts.as_ref().is_some_and(|starts| starts[i]) {
                 seen.clear();
             }
             let bytes = keys.row(i).data();
@@ -1222,7 +1294,7 @@ mod tests {
     fn dedup_batch_bounded_window_evicts_on_advance() {
         // Two-column key (id, ts); bound = ts (col 1), ascending.
         let mut seen = SeenSet::default();
-        let mut bound = Bound { idx: 1, desc: false, last: None };
+        let mut bound = Bound::Time(TimeBound { idx: 1, desc: false, last: None });
 
         // Run ts=10: a,b,a → within-run dup of `a` collapses.
         let r1 = batch(&["a", "b", "a"], &[10, 10, 10]);
@@ -1235,7 +1307,7 @@ mod tests {
         let o2 = first(&r2, &[0, 1], &mut seen, Some(&mut bound)).unwrap();
         assert_eq!(o2.num_rows(), 1, "(a,11) survives once; second (a,11) is a same-run dup");
         assert_eq!(seen.len(), 1, "seen-set bounded to the current run, not O(all distinct)");
-        assert_eq!(bound.last, Some(11));
+        assert!(matches!(bound, Bound::Time(TimeBound { last: Some(11), .. })));
     }
 
     /// A footer declaring `timestamp DESC` over unsorted data makes the bound
@@ -1244,7 +1316,7 @@ mod tests {
     #[test]
     fn bounded_dedup_false_ordering_does_not_collapse_distinct_timestamps() {
         // Declared DESC, actually ASCENDING — the footer lied.
-        let mut bound = Bound { idx: 1, desc: true, last: None };
+        let mut bound = Bound::Time(TimeBound { idx: 1, desc: true, last: None });
         let b = batch(&["a", "a"], &[5, 10]);
 
         let mut seen = SeenSet::default();
@@ -1253,7 +1325,7 @@ mod tests {
 
         assert_eq!(dedup_key_idxs(&[0, 1]), vec![0, 1], "bound column must stay in the dedup key");
 
-        let mut bound2 = Bound { idx: 1, desc: true, last: None };
+        let mut bound2 = Bound::Time(TimeBound { idx: 1, desc: true, last: None });
         let mut seen2 = SeenSet::default();
         let kept = first(&b, &[0, 1], &mut seen2, Some(&mut bound2)).unwrap();
         assert_eq!(kept.num_rows(), 2, "(a,5) and (a,10) are DISTINCT rows and must both survive");
@@ -1273,7 +1345,7 @@ mod tests {
     #[test]
     fn advance_counts_declared_ordering_violations() {
         let before = ordering_violations();
-        let mut b = Bound { idx: 0, desc: true, last: None };
+        let mut b = TimeBound { idx: 0, desc: true, last: None };
         b.advance(10); // first row: no baseline, no violation
         b.advance(5); // DESC-consistent
         b.advance(9); // moves back UP under a DESC claim → violation
@@ -1459,6 +1531,61 @@ mod tests {
             .collect()
     }
 
+    /// A `DedupExec` keyed `(ts, id)` whose source declares `(id ASC, ts DESC)` — a
+    /// string-led ordering, the metric-first layout's shape — when `ordered`.
+    fn string_led_plan(batches: Vec<RecordBatch>, ordered: bool) -> DedupExec {
+        let desc = SortOptions { descending: true, nulls_first: true };
+        let ordering = LexOrdering::new(vec![
+            PhysicalSortExpr::new(Arc::new(Column::new("id", 0)), SortOptions::default()),
+            PhysicalSortExpr::new(Arc::new(Column::new("ts", 1)), desc),
+        ]);
+        DedupExec::with_tiebreak(source(&[batches], ordering.filter(|_| ordered)), vec!["ts".into(), "id".into()], Some("tb".into()), None).unwrap()
+    }
+
+    async fn try_collect_rows(plan: &DedupExec) -> DFResult<Vec<(String, i64, Option<i64>)>> {
+        let stream = plan.execute(0, Arc::new(TaskContext::default()))?;
+        Ok(batch_rows(&futures::TryStreamExt::try_collect::<Vec<_>>(stream).await?))
+    }
+
+    proptest::proptest! {
+        /// A string-led ordering streams keep-greatest over the dedup-key prefix: same
+        /// survivors as the full-set path, at their input positions.
+        #[test]
+        fn a_string_led_ordering_dedups_in_runs(
+            rows in proptest::collection::vec((0..4u8, 0..6i64, proptest::option::of(0..5i64)), 1..60),
+            chunk in 1..7usize,
+        ) {
+            let mut rows: Vec<(String, i64, Option<i64>)> = rows.into_iter().map(|(m, ts, tb)| (format!("m{m}"), ts, tb)).collect();
+            rows.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+            let batches = rows.chunks(chunk).map(|c| {
+                let ids: Vec<&str> = c.iter().map(|r| r.0.as_str()).collect();
+                vbatch(&ids, &c.iter().map(|r| r.1).collect::<Vec<_>>(), &c.iter().map(|r| r.2).collect::<Vec<_>>())
+            }).collect::<Vec<_>>();
+            let run = |ordered| tokio::runtime::Runtime::new().unwrap().block_on(try_collect_rows(&string_led_plan(batches.clone(), ordered))).unwrap();
+            let plan = string_led_plan(batches.clone(), true);
+            let shown = datafusion::physical_plan::displayable(&plan).one_line().to_string();
+            proptest::prop_assert!(shown.contains("bounded[id, ts]/greatest"), "{}", shown);
+            let (streamed, mut buffered) = (run(true), run(false));
+            buffered.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+            proptest::prop_assert_eq!(streamed, buffered);
+        }
+    }
+
+    /// A false string-led ordering (`A, B, A`) fails the query: the first `A` run was
+    /// emitted when `B` opened, so the second `A` could only be served as a duplicate
+    /// or a superseded version. Without the claim the same rows dedup exactly.
+    #[tokio::test]
+    async fn a_false_string_led_ordering_fails_instead_of_serving_two_versions() {
+        let rows = || vec![vbatch(&["a", "b"], &[10, 10], &[Some(1), Some(1)]), vbatch(&["a"], &[10], &[Some(2)])];
+        let before = ordering_violations();
+        let err = try_collect_rows(&string_led_plan(rows(), true)).await.expect_err("a backward run must fail");
+        assert!(matches!(&err, DataFusionError::External(e) if e.is::<OrderingViolation>()), "{err}");
+        assert_eq!(ordering_violations(), before + 1);
+        let mut exact = try_collect_rows(&string_led_plan(rows(), false)).await.unwrap();
+        exact.sort();
+        assert_eq!(exact, vec![("a".into(), 10, Some(2)), ("b".into(), 10, Some(1))]);
+    }
+
     async fn collect_rows(plan: &DedupExec) -> Vec<(String, i64, Option<i64>)> {
         let mut stream = plan.execute(0, Arc::new(TaskContext::default())).unwrap();
         let mut out = Vec::new();
@@ -1605,7 +1732,7 @@ mod tests {
     /// batches hold only the open run, not O(scan).
     #[test]
     fn keep_greatest_run_state_is_bounded() {
-        let mut d = dedup_state(Some(Bound { idx: 1, desc: false, last: None }));
+        let mut d = dedup_state(Some(Bound::Time(TimeBound { idx: 1, desc: false, last: None })));
         for t in 0..200i64 {
             d.push(&vbatch(&["a", "b", "a"], &[t, t, t], &[Some(1), Some(1), Some(2)])).unwrap();
         }

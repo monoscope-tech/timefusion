@@ -111,7 +111,27 @@ Queries never cross metrics; maintenance does. Before Stage 3, size what a metri
 Gate: write the numbers into this file. If any lane's cost would rise by more than ~2× on sealed days, adjust
 it in Stage 3 before the flip.
 
-### Stage 1 — read-side dedup collapses runs when the ordering covers the keys
+**Results (prod journal, last 24 h, 2026-10-04):**
+
+| Lane | Units/day | Slice | Whole-file bytes |
+|---|---|---|---|
+| dedup | 1,016 | 10 min (1,008), day (4) | 11.1 GB |
+| base rollup `series_5m_v1` | 228 | 60 min (168), 10 min (48), day (7) | 13.5 GB |
+| base rollup `metrics_1m_v2` | 226 | same | 12.5 GB |
+| derived `metrics_1h_v2` | 174 | 60 min | 0.8 GB (reads the tier) |
+| repair | 12 | day | 9.6 GB |
+
+- Hour and day units read whole files either way → flat.
+- At risk: **dedup's 10-minute bins on today's hourly files.** Row groups are 128 MB (`timefusion_max_row_group_size`),
+  so the time pruning a bin gets today is mostly page-level (20k-row pages). After the flip each metric's run is
+  still time-ordered (`timestamp` second), so page pruning survives for metrics above ~20k rows/hour and is lost
+  for the long tail. Expected: dedup decode for `otel_metrics` rises by up to the bin/file ratio (≤6×) on small
+  metrics, ~flat on large ones.
+- Gate for Stage 4: `otel_metrics` dedup unit decode bytes/day ≤ 2× the pre-flip day. Mitigation if exceeded:
+  dedup `otel_metrics` in hour bins (one unit per hourly file instead of six) — a per-table bin width, which needs
+  the dirty-bin producer, prober and drain to agree per table (`bin_micros`, `compact.rs`).
+
+### Stage 1 — read-side dedup collapses runs when the ordering covers the keys  ✅ implemented
 
 When the input's declared ordering has every dedup key as its prefix (in any column type), all versions of
 a key are adjacent: `DedupExec` keep-greatest can emit each run as soon as the key tuple changes, with no
@@ -125,6 +145,7 @@ order = sort order), keep the i64 fast path for timestamp-led tables (logs: 97% 
   (`A, B, A`) is not recoverable in-stream. Two layers:
   1. Engage the tuple bound only on legs whose files are *verified* sorted (written by our sorted writer or
      confirmed by repair: `repair_verified_sorted` / `SORTED_RUN_TAG`); any other leg keeps today's path.
+     **Lives at the scan, in Stage 2b** — `DedupExec` sees a declared ordering, not files.
   2. On a backward key-tuple move the new path returns an error (`ordering violation in <table> leg <leg>;
      file ordering is false`) and bumps `ordering_violations_*`. It does not emit a possibly-duplicated
      answer. The existing i64 timestamp bound keeps its current behaviour (a separate follow-up — prod's
@@ -138,8 +159,7 @@ Tests (rs-minimal-tests ladder):
 - False footer: input `A(v1), B, A(v2)` declared sorted on the tuple path → the query errors with the
   ordering-violation message and the counter rises; no row is emitted for the second `A`. An unverified leg
   with the same data takes the full-set path and returns exactly `A(v2), B`.
-- Inexact string stats: metric names sharing a >64-char prefix across two files must not be grouped under a
-  false ordering (risk 7).
+- Inexact string stats (risk 7): **moved to Stage 3** — it needs a string-led Delta table.
 - Cost assertion: bounded path chosen (counter), not just correct output.
 
 Gate: suite + e2e green; prod `dedup_full_set_total` unchanged after deploy.
@@ -167,6 +187,9 @@ date-restricted leg machinery the per-date dedup skip already uses (`scan_side!`
 `src/database/scan.rs` ~582-607) — and dedup each leg with its own ordering (old days: timestamp bound; new
 days: tuple bound), then union. No read-time sort of a whole layout, no full-set fallback across layouts.
 
+- **Verified-files gate (from Stage 1, layer 1):** a leg declares a string-led ordering to `DedupExec` only
+  when every file in it is verified sorted (`repair_verified_sorted` / `SORTED_RUN_TAG`); unverified files go
+  to an undeclared leg (full-set path). This keeps a lying footer from turning into a failed query.
 - A day is single-layout once repair rewrites it (one commit per (project, date)). A day can be mixed only by
   late files landing on an unmigrated day after the flip; those tail files are small, so they are sorted to the
   day's majority order at read time (well under the 1 GiB budget), and the day is already a repair candidate.
@@ -214,6 +237,8 @@ Tests:
 - The existing `the_shipped_dedup_keys_lead_the_shipped_sort` (`compact.rs:2252`) passes with both lists
   reordered together.
 - Routed rollups over a mixed-layout window equal raw (`a_per_series_counter_rate_routes_to_the_series_tier_and_equals_raw`).
+- Risk 7: two files whose metric names share a >64-character prefix (inexact footer min/max) are not grouped
+  under a false ordering — the query returns the exact answer, no `OrderingViolation`.
 - New: a metric + time-window query over a migrated day prunes to that metric's row groups inside the window
   — assert `row_groups_pruned_statistics` / bytes scanned, not only the answer.
 
