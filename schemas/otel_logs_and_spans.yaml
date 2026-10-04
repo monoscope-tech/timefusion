@@ -503,6 +503,20 @@ rollups:
           filter: "kind = 'server' OR name = 'apitoolkit-http-span' OR name = 'monoscope.http'",
         }
       - { name: duration_digest, agg: tdigest, column: duration }
+      # monoscope's apdex numerator over HTTP spans (500 ms satisfied, 2 s tolerating) as
+      # cumulative bands; `Merge::Apdex` folds them, `server_duration_count` is the guard.
+      - {
+          name: server_apdex_satisfied_count,
+          agg: count,
+          column: duration,
+          filter: "(kind = 'server' OR name = 'apitoolkit-http-span' OR name = 'monoscope.http') AND duration <= 500000000",
+        }
+      - {
+          name: server_apdex_tolerated_count,
+          agg: count,
+          column: duration,
+          filter: "(kind = 'server' OR name = 'apitoolkit-http-span' OR name = 'monoscope.http') AND duration <= 2000000000",
+        }
       # monoscope's *Active Services* stat, `dcount(resource.service.name)`. It is
       # the ONE dcount column that routes on a measure alone: the column is a
       # declared dimension, so the widget's `IS NOT NULL` becomes a row filter.

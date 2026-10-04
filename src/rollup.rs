@@ -3219,6 +3219,19 @@ mod tests {
         apdex_case(&sum.params.args[0]).is_some()
     }
 
+    /// The overview's apdex stat (HTTP spans, `duration IS NOT NULL`) routes to the dashboard
+    /// tier through its two cumulative bands; it ran raw at 7-9 s over 24 h (10-04).
+    #[tokio::test]
+    async fn the_overview_apdex_routes_to_the_dashboard_tier() {
+        let sql = format!(
+            "select round((sum(case when duration <= 500000000 then 1.0 when duration <= 2000000000 then 0.5 else 0 end)) / greatest(1, count(*))::numeric, 2)::float \
+             from {SOURCE} where project_id = 'project' and (kind = 'server' or name = 'apitoolkit-http-span' or name = 'monoscope.http') \
+             and duration is not null and {WINDOW}"
+        );
+        let route = route_alone(&sql).await.expect("matches").expect("routes");
+        assert!(route.target.contains("dashboard"), "{}", route.target);
+    }
+
     /// For tests whose only interest is HOW a shape declines.
     async fn route_alone(sql: &str) -> Result<Option<RoutedRollup>, MissReason> {
         route_for(&session().await, sql).await
