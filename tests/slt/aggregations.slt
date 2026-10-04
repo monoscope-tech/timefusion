@@ -237,3 +237,13 @@ HAVING COUNT(*) >= 1
 ERROR 1
 INFO 2
 WARN 1
+
+# Aggregate FILTER must reject non-numeric rows before evaluating the cast,
+# even when the cast is shared by two aggregates.
+query T
+WITH metrics(key, value) AS (VALUES ('a', '1'), ('b', '2'), ('reason', 'source_not_flushed'))
+SELECT COALESCE(SUM(value::bigint) FILTER (WHERE key IN ('a', 'b')), 0) || '/' ||
+       COALESCE(SUM(value::bigint) FILTER (WHERE key = 'a'), 0)
+FROM metrics
+----
+3/1

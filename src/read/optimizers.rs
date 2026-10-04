@@ -2439,8 +2439,33 @@ use std::collections::BTreeSet;
 
 use datafusion::{
     logical_expr::{Sort, SortExpr},
-    optimizer::{ApplyOrder, OptimizerConfig, OptimizerRule},
+    optimizer::{ApplyOrder, OptimizerConfig, OptimizerRule, common_subexpr_eliminate::CommonSubexprEliminate},
 };
+
+#[derive(Debug)]
+pub struct FilterSafeCse;
+
+impl OptimizerRule for FilterSafeCse {
+    fn name(&self) -> &str {
+        "filter_safe_cse"
+    }
+
+    fn rewrite(&self, plan: LogicalPlan, config: &dyn OptimizerConfig) -> Result<Transformed<LogicalPlan>> {
+        let filtered_computation = |expr: &Expr| {
+            let expr = match expr {
+                Expr::Alias(a) => a.expr.as_ref(),
+                other => other,
+            };
+            matches!(expr, Expr::AggregateFunction(a) if a.params.filter.is_some() && a.params.args.iter().any(|arg| !is_trivial(arg)))
+        };
+        // CSE can lift shared aggregate inputs ahead of their FILTER predicates.
+        if plan.exists(|node| Ok(matches!(node, LogicalPlan::Aggregate(a) if a.aggr_expr.iter().filter(|e| filtered_computation(e)).count() > 1)))? {
+            Ok(Transformed::no(plan))
+        } else {
+            CommonSubexprEliminate::new().rewrite(plan, config)
+        }
+    }
+}
 
 #[derive(Debug, Default)]
 pub struct DeferExpensiveProjection;
