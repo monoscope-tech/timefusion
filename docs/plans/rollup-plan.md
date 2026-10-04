@@ -354,8 +354,12 @@ builds and process ages, so they are not one baseline. pgwire p99 was 23.6 s and
       ordering over a duration and the sanity check refused a TopK whose orderings printed identically (~66 failures/day,
       reproduced in plain DataFusion). The session's `abs` answers Unordered instead. Verified on prod: the failing
       past-window lookups return in 1.4–2.4 s.
-- [x] **Service map re-planned every call** (`ca12f084`): shape caching lifted constant select items in `UNION ALL`
-      branches to untyped placeholders; type coercion failed and the shape was negative-cached (~1.2 s planning/call).
+- [x] **Service map: constant select items no longer defeat the shape cache** (`ca12f084`) — but that did not move its
+      planning (still 1.0–1.3 s on prod): monoscope sends it with `$N` params, so the logical plan was already cached.
+      The cost is physical: `sp` is inlined at five references, each with its own projection and pushed `kind IN`
+      filters, and each scan's Delta legs run dozens of delta-kernel file selections (~20 ms each, different
+      predicates). A per-statement scan memo was built and dropped — it never hits on this shape. Left as is: both
+      `with sp as` queries are monoscope's scheduled per-slice edge rollups into Postgres, not page reads.
 - [x] **Overview apdex** (`1f83be69`): HTTP-scoped cumulative bands on the dashboard tiers; `Merge::Apdex`.
 - [x] **Overview `var_service`**: already routes (hybrid); 1.0–2.6 s on prod, the 8–13 s bench samples were contention.
 - [x] **Overview top endpoints / requests-by-status** (`02f82bc3`): `endpoints_1m` [name, kind, status] + count;
