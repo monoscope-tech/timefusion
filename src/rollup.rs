@@ -1834,8 +1834,9 @@ async fn match_aggregate(
 
     // Coarsest grain first (strictly fewer rows for the same answer). At one grain a
     // tier whose dimensions strictly contain another's is its replacement, so it goes
-    // first and the replaced tier serves only when it declines; other ties break
-    // toward the narrower dimension set.
+    // first and the replaced tier serves only when it declines; other ties break toward
+    // the tier declared first. Not toward fewer dimensions: dimension COUNT says nothing
+    // about cardinality (endpoints_1m's name x status out-rows dashboard_1m_v4's four).
     let supersedes = |spec: &crate::schema::RollupSpec| {
         schema.rollups.iter().any(|other| {
             other.grain_micros() == spec.grain_micros()
@@ -1843,8 +1844,12 @@ async fn match_aggregate(
                 && other.dimensions.iter().all(|d| spec.dimensions.contains(d))
         })
     };
-    let candidates =
-        schema.rollups.iter().sorted_by_key(|spec| (std::cmp::Reverse(spec.grain_micros().unwrap_or(0)), !supersedes(spec), spec.dimensions.len()));
+    let candidates = schema
+        .rollups
+        .iter()
+        .enumerate()
+        .sorted_by_key(|(declared, spec)| (std::cmp::Reverse(spec.grain_micros().unwrap_or(0)), !supersedes(spec), *declared))
+        .map(|(_, spec)| spec);
     let (mut miss, mut grain_miss) = (None, None);
     let mut routes = Vec::new();
     for spec in candidates {
@@ -1857,6 +1862,9 @@ async fn match_aggregate(
             // declined that way. A grain miss is only reached AFTER the filter was
             // accepted, so it outranks another spec's filter miss.
             Err(reason @ (MissReason::PartialBucket | MissReason::TinyInterior)) => grain_miss = Some(reason),
+            // "No tier's measures mention these columns" is the least actionable reason, so
+            // another tier's (a near miss, a missing measure) is never overwritten by it.
+            Err(MissReason::FilterNotEligible) if miss.is_some() => {}
             Err(reason) => miss = Some(reason),
         }
     }
@@ -3232,6 +3240,16 @@ mod tests {
         assert!(route.target.contains("dashboard"), "{}", route.target);
     }
 
+    /// The overview's top-endpoints table and HTTP-status chart group by endpoint name and
+    /// status, which no dashboard dimension holds; they ran raw at 5-23 s over 24 h (10-04).
+    #[test_case::test_case("select name from otel_logs_and_spans where project_id = 'project' and name is not null and kind = 'server' and {W} group by name order by count(*) desc limit 20" ; "top endpoints")]
+    #[test_case::test_case("select extract(epoch from time_bucket('1 minutes', timestamp))::integer, coalesce(cast(attributes___http___response___status_code as text), 'unknown'), count(*)::float as count_ from otel_logs_and_spans where project_id = 'project' and {W} and (((kind = 'server' or name = 'apitoolkit-http-span' or name = 'monoscope.http') and attributes___http___response___status_code is not null)) group by time_bucket('1 minutes', timestamp), coalesce(cast(attributes___http___response___status_code as text), 'unknown') order by time_bucket('1 minutes', timestamp) desc limit 10000" ; "requests by status")]
+    #[tokio::test]
+    async fn the_overview_endpoint_widgets_route_to_the_endpoints_tier(sql: &str) {
+        let route = route_alone(&sql.replace("{W}", WINDOW)).await.expect("matches").expect("routes");
+        assert!(route.target.contains("endpoints"), "{}", route.target);
+    }
+
     /// For tests whose only interest is HOW a shape declines.
     async fn route_alone(sql: &str) -> Result<Option<RoutedRollup>, MissReason> {
         route_for(&session().await, sql).await
@@ -3541,7 +3559,8 @@ mod tests {
             "SELECT time_bucket('1 minute', timestamp), COUNT(*) FROM {SOURCE} \
              WHERE project_id = 'project' AND timestamp >= now() - interval '1 hour' GROUP BY 1"
         );
-        assert_eq!(targets(&session().await, &sql).await, Ok(vec!["dashboard_1m_v4".to_owned()]));
+        // Both minute tiers can serve a bare count; the dashboard tier, declared first, leads.
+        assert_eq!(targets(&session().await, &sql).await, Ok(vec!["dashboard_1m_v4".to_owned(), "endpoints_1m".to_owned()]));
     }
 
     /// The status chart routes under any status filter, whether or not it leaves the `level` fallback reachable.
@@ -3806,9 +3825,9 @@ mod tests {
              GROUP BY time_bucket('1 hours', timestamp)"
         ),
         MissReason::UnknownFilter ; "a near miss on a declared column is distinguished from an ineligible one")]
-    // `name` is not a declared dimension, so it can only *select* a pre-filtered measure — and groups the raw query eliminates would come back as 0/NULL rows.
+    // `duration` is no declared dimension, so it can only *select* a pre-filtered measure — and groups the raw query eliminates would come back as 0/NULL rows.
     #[test_case::test_case(
-        &format!("SELECT COUNT(*) FROM {SOURCE} WHERE project_id = 'project' AND name = 'monoscope.http' AND {WINDOW}"),
+        &format!("SELECT COUNT(*) FROM {SOURCE} WHERE project_id = 'project' AND duration = 1000 AND {WINDOW}"),
         MissReason::UnknownFilter ; "a residual row filter refuses the route rather than inventing zero rows")]
     // Sub-grain server-scope panels: the dashboard tiers accept the scope and decline on
     // bucket size; the sessions tier's filter miss must not relabel that.

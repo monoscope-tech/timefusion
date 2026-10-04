@@ -2332,7 +2332,7 @@ async fn a_distinct_count_over_a_dimension_routes_and_matches_raw() -> Result<()
         assert_eq!(routed, show(db.query_delta_only(&query).await?), "the routed answer must equal raw: {query}");
     }
 
-    let query = format!("SELECT count(DISTINCT name) AS v FROM otel_logs_and_spans WHERE {window}");
+    let query = format!("SELECT count(DISTINCT context___trace_id) AS v FROM otel_logs_and_spans WHERE {window}");
     let hits = any_rollup_hits();
     let answer = show(ctx.sql(&query).await?.collect().await?);
     assert_eq!(any_rollup_hits(), hits, "a distinct count over a non-dimension must not route");

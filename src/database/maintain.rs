@@ -13225,9 +13225,9 @@ mod rollup_relevance_tests {
     /// restates every column its base reads.
     #[test_case::test_case(&["hashes"] => vec!["hashes_30m"] ; "monoscope's hashes enrichment touches only the hash tier")]
     #[test_case::test_case(&["attributes___user___id"] => vec!["sessions_1h_v2"] ; "user enrichment touches only the session tiers")]
-    #[test_case::test_case(&["attributes___http___response___status_code"] => vec!["dashboard_1h_v3", "dashboard_1m_v4", "hashes_30m"] ; "a measure filter column touches every dashboard tier and the hash tier")]
+    #[test_case::test_case(&["attributes___http___response___status_code"] => vec!["dashboard_1h_v3", "dashboard_1m_v4", "endpoints_1m", "hashes_30m"] ; "a measure filter column touches the dashboard, endpoint and hash tiers")]
     #[test_case::test_case(&["level"] => vec!["dashboard_1h_v3", "dashboard_1m_v4", "sessions_1h_v2"] ; "a level change touches every tier that reads level")]
-    #[test_case::test_case(&["timestamp"] => vec!["dashboard_1h_v3", "dashboard_1m_v4", "hashes_30m", "sessions_1h_v2"] ; "moving a row touches every tier")]
+    #[test_case::test_case(&["timestamp"] => vec!["dashboard_1h_v3", "dashboard_1m_v4", "endpoints_1m", "hashes_30m", "sessions_1h_v2"] ; "moving a row touches every tier")]
     fn tiers_reading(columns: &[&str]) -> Vec<String> {
         super::rollup_tiers_reading("otel_logs_and_spans", columns)
             .into_iter()

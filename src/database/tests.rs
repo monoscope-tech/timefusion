@@ -2172,8 +2172,8 @@ async fn a_count_of_a_nullable_expression_is_not_served_as_the_row_count() -> Re
         ("nullif(name, 'op')", Err(MissingMeasure)),
         ("CAST(NULL AS INT)", Err(MissingMeasure)),
         ("status_code", Err(MissingMeasure)),
-        // The optimizer rewrites a lone DISTINCT into an inner GROUP BY; `name` is no tier dimension.
-        ("DISTINCT name", Err(UnknownGroupBy)),
+        // The optimizer rewrites a lone DISTINCT into an inner GROUP BY; a trace id is no tier dimension.
+        ("DISTINCT context___trace_id", Err(UnknownGroupBy)),
     ] {
         let sql = format!(
             "SELECT count({arg}) AS c FROM otel_logs_and_spans WHERE project_id = '{project}' \

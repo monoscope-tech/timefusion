@@ -567,6 +567,16 @@ rollups:
   # measure is declared under it and the router promotes the query's scope to the
   # `event_count` guard. The filters are monoscope's `browserScope`,
   # `errorPredicate` and `pageViewPredicate` verbatim; they must stay in lockstep.
+  # Endpoint tier for the overview's top-endpoints table and HTTP-status chart, which
+  # group by endpoint name / status — dimensions the dashboard tiers do not carry. The
+  # HTTP scope (kind or name) is all dimensions here, so it is a row filter, not a
+  # measure. Measured 10-02: 6-21k (10m, name, kind, status) cells per project-day.
+  - grain: 1m
+    name: endpoints_1m
+    dimensions: [name, kind, attributes___http___response___status_code]
+    backfill_days: 14
+    measures:
+      - { name: request_count, agg: count }
   # Per-hash tier for monoscope's endpoint/issue widgets, which filter on
   # `hashes @> ARRAY[h]` / `array_has(hashes, h)` over 7-14 d and timed out at 90 s:
   # a hash's rows sit in ~98% of pages, so only an aggregate keyed by hash is cheap.
