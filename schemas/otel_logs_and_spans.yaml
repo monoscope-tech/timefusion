@@ -596,6 +596,8 @@ rollups:
       # monoscope's apdex numerator (500 ms satisfied, 2 s tolerating) as cumulative bands.
       - { name: apdex_satisfied_count, agg: count, column: duration, filter: "duration <= 500000000" }
       - { name: apdex_tolerated_count, agg: count, column: duration, filter: "duration <= 2000000000" }
+      # monoscope's hourly proven-endpoint job counts HTTP requests per hash (`method IS NOT NULL`).
+      - { name: http_request_count, agg: count, column: attributes___http___request___method }
   - grain: 1h
     name: sessions_1h_v2
     # The session list reads recent windows only.

@@ -1319,6 +1319,57 @@ async fn a_partly_covered_window_is_exact_and_counts_a_measure_decline_once() ->
     Ok(())
 }
 
+/// monoscope's hourly proven-endpoint count unnests `hashes` itself. With the hash tier built
+/// on two of three days it is a hybrid whose raw legs unnest too, and it must equal raw: rows
+/// with two listed hashes count once per hash, and non-HTTP, failed and unlisted rows not at all.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unnesting_hash_count_routes_to_the_hash_tier_and_equals_raw() -> Result<()> {
+    let db = Arc::new(Database::with_config(rollup_backfill_config("served", 35)).await?);
+    db.cancel_maintenance();
+    let project = format!("served_{}", uuid::Uuid::new_v4().simple());
+    let days: Vec<chrono::NaiveDate> = (3..=5).rev().map(|back| (Utc::now() - chrono::Duration::days(back)).date_naive()).collect();
+    let rows = [
+        (&["a", "b"][..], Some("GET"), 200),
+        (&["a", "c"], Some("GET"), 204),
+        (&["b"], None, 200),
+        (&["a"], Some("GET"), 500),
+        (&[], Some("GET"), 200),
+        (&["c"], Some("GET"), 200),
+    ];
+    let mut spans = Vec::new();
+    for (day, hour, (i, (hashes, method, status))) in
+        days.iter().flat_map(|day| [1, 7, 13, 19].map(|hour| (day, hour))).cartesian_product(rows.iter().enumerate()).map(|((d, h), r)| (d, h, r))
+    {
+        let mut span = test_span_ts(&format!("{day}-{hour}-{i}"), "op", &project, day.and_hms_opt(hour, 0, 0).expect("valid").and_utc().timestamp_micros());
+        span["hashes"] = serde_json::json!(hashes);
+        span["attributes___http___request___method"] = serde_json::json!(method);
+        span["attributes___http___response___status_code"] = serde_json::json!(status);
+        spans.push(span);
+    }
+    db.insert_records_batch(&project, "otel_logs_and_spans", vec![json_to_batch(spans)?], true, None).await?;
+    for day in &days[1..] {
+        build_base_tier(&db, "otel_logs_and_spans", &project, "hashes_30m", *day).await?;
+    }
+    let mut ctx = Arc::clone(&db).create_session_context();
+    db.setup_session_context(&mut ctx)?;
+    let lo = midnight_micros(days[0]) + 15 * 60_000_000;
+    let sql = format!(
+        "WITH served AS (SELECT unnest(hashes) AS hash, floor(extract(epoch from timestamp) / 3600)::bigint AS hour_bucket FROM otel_logs_and_spans \
+         WHERE project_id = '{project}' AND timestamp >= to_timestamp_micros({lo}) AND attributes___http___request___method IS NOT NULL \
+         AND attributes___http___response___status_code < 400 AND hashes && ARRAY['a','b']::text[]) \
+         SELECT hash, hour_bucket, count(*)::bigint AS cnt FROM served WHERE hash = ANY(ARRAY['a','b']::text[]) GROUP BY hash, hour_bucket ORDER BY 1, 2"
+    );
+    let stats = crate::observability::maintenance_stats;
+    let hits = || stats().rollup_hits_hybrid.load(std::sync::atomic::Ordering::Relaxed) + stats().rollup_hits_full.load(std::sync::atomic::Ordering::Relaxed);
+    let show = |batches: Vec<RecordBatch>| datafusion::arrow::util::pretty::pretty_format_batches(&batches).expect("format").to_string();
+    let before = hits();
+    let routed = show(ctx.sql(&sql).await?.collect().await?);
+    assert_eq!(hits(), before + 1, "must route, or equality proves nothing: {routed}");
+    assert_eq!(routed, show(db.query_delta_only(&sql).await?), "routed must equal raw");
+    assert_eq!(routed.matches("| a    |").count(), 12, "a: two rows per hour, every hour: {routed}");
+    Ok(())
+}
+
 /// monoscope's KQL `rate(value)` per 30-minute bin: a per-series LAG over 5-minute cells sandwiched
 /// between two aggregates. The inner one must route to the per-series tier and equal raw; charted
 /// `by attributes.t`, the cells join each series' attributes, and that lookup routes too.

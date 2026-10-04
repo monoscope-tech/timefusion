@@ -777,6 +777,9 @@ pub(crate) struct RoutedRollup {
     /// `row_filters` as the RAW source spells them: an unnest tier's `dim = x` is
     /// `array_has(column, x)` there, since the element dimension is no source column.
     raw_row_filters: Vec<String>,
+    /// What the raw legs read: the source, or for a query that unnests, the source with
+    /// one row per element so its element dimension is a column there too.
+    raw_from: String,
     /// `(expression, output alias)`. Every expression is valid, and means the
     /// same thing, on BOTH tables — which is what lets the union share them.
     groups: Vec<(String, String)>,
@@ -1191,7 +1194,7 @@ impl RoutedRollup {
         let rollup_projects = self.projects_in(split.covered.as_deref());
         // Unproved projects are read raw across the WHOLE window; with the covered
         // projects' interior and fringes that partitions (project x time) exactly.
-        let raw_only_leg = (!split.raw_only.is_empty()).then(|| self.leg(&self.source, &[(self.lo, end)], "", &self.projects_in(Some(&split.raw_only))));
+        let raw_only_leg = (!split.raw_only.is_empty()).then(|| self.leg(&self.raw_from, &[(self.lo, end)], "", &self.projects_in(Some(&split.raw_only))));
         if fringes.is_empty() && raw_only_leg.is_none() {
             // Single leg: the rollup rows ARE the partial states.
             let select = self
@@ -1225,7 +1228,7 @@ impl RoutedRollup {
         // One raw leg PER fringe: scan pruners bound by the hull of a leg's time
         // filters, and fringes ORed into one leg span every interior between them.
         let legs = std::iter::once(self.leg(&self.target, interiors, &generations, &rollup_projects))
-            .chain(fringes.iter().map(|fringe| self.leg(&self.source, std::slice::from_ref(fringe), "", &rollup_projects)))
+            .chain(fringes.iter().map(|fringe| self.leg(&self.raw_from, std::slice::from_ref(fringe), "", &rollup_projects)))
             .chain(raw_only_leg)
             .join(" UNION ALL ");
         format!("SELECT {outer} FROM ({legs}) AS rollup_union{group_by}{having}")
@@ -1665,6 +1668,95 @@ pub(crate) fn inline_common_exprs(aggregate: &datafusion::logical_expr::Aggregat
         .filter(|rebuilt| rebuilt.schema.has_equivalent_names_and_types(&aggregate.schema).is_ok())
 }
 
+/// An aggregate over a derived table that unnests one list column — monoscope's
+/// `WITH served AS (SELECT unnest(hashes) AS hash, … FROM src WHERE …) SELECT hash, … GROUP BY …` —
+/// restated over the source, each element becoming the column its unnest tier names.
+/// Returns the restated aggregate, the source, the unnested column and every filter, those
+/// above the unnest restated over the element. For MATCHING only, as `inline_common_exprs`.
+pub(crate) fn inline_unnest_source(
+    aggregate: &datafusion::logical_expr::Aggregate,
+) -> Option<(datafusion::logical_expr::Aggregate, String, String, Vec<datafusion::logical_expr::Expr>)> {
+    use datafusion::common::{
+        Column, ScalarValue,
+        tree_node::{Transformed, TreeNode},
+    };
+    use datafusion::logical_expr::{Aggregate, Expr, LogicalPlan, LogicalPlanBuilder, lit};
+
+    let below_alias = match aggregate.input.as_ref() {
+        LogicalPlan::SubqueryAlias(alias) => alias.input.as_ref(),
+        plan => plan,
+    };
+    let LogicalPlan::Projection(outer) = below_alias else { return None };
+    let (mut node, mut above) = (outer.input.as_ref(), Vec::new());
+    while let LogicalPlan::Filter(filter) = node {
+        above.push(filter.predicate.clone());
+        node = filter.input.as_ref();
+    }
+    let LogicalPlan::Unnest(unnest) = node else { return None };
+    let ([(_, list)], [exec], true) = (unnest.list_type_columns.as_slice(), unnest.exec_columns.as_slice(), unnest.struct_type_columns.is_empty()) else {
+        return None;
+    };
+    let LogicalPlan::Projection(inner) = unnest.input.as_ref() else { return None };
+    (list.depth == 1).then_some(())?;
+    let mut predicates = Vec::new();
+    let source = source_and_filters(&inner.input, &mut predicates).ok()?;
+    let mut definitions = HashMap::new();
+    let mut column = None;
+    for expr in &inner.expr {
+        match expr {
+            Expr::Alias(alias) if alias.name == exec.name => column = Some(column_name(&alias.expr)?.to_string()),
+            Expr::Alias(alias) => drop(definitions.insert(alias.name.clone(), alias.expr.as_ref().clone())),
+            Expr::Column(_) => {}
+            _ => return None,
+        }
+    }
+    let column = column?;
+    let dimension = crate::schema::get_schema(&source)?
+        .rollups
+        .iter()
+        .find_map(|spec| spec.unnest.as_ref().filter(|unnest| unnest.column == column).map(|unnest| unnest.dimension.clone()))?;
+    definitions.insert(list.output_column.name.clone(), Expr::Column(Column::from_name(&dimension)));
+    let inline = |expr: &Expr, definitions: &HashMap<String, Expr>| {
+        expr.clone()
+            .transform_up(|node| {
+                Ok(match &node {
+                    Expr::Column(column) => definitions.get(&column.name).map_or(Transformed::no(node), |definition| Transformed::yes(definition.clone())),
+                    _ => Transformed::no(node),
+                })
+            })
+            .and_then(|inlined| crate::write::mem_buffer::strip_column_qualifiers(inlined.data.unalias_nested().data))
+            .ok()
+    };
+    for expr in &outer.expr {
+        match expr {
+            Expr::Alias(alias) => {
+                let inlined = inline(&alias.expr, &definitions)?;
+                definitions.insert(alias.name.clone(), inlined);
+            }
+            Expr::Column(_) => {}
+            _ => return None,
+        }
+    }
+    predicates.extend(above.iter().map(|predicate| inline(predicate, &definitions)).collect::<Option<Vec<_>>>()?);
+    let element = unnest.schema.field_with_unqualified_name(&list.output_column.name).ok()?.data_type().clone();
+    let columns = inner.input.schema().columns().into_iter().map(Expr::Column);
+    let input = LogicalPlanBuilder::from(inner.input.as_ref().clone())
+        .project(columns.chain([lit(ScalarValue::try_from(&element).ok()?).alias(&dimension)]))
+        .and_then(LogicalPlanBuilder::build)
+        .ok()?;
+    let restate = |exprs: &[Expr], offset: usize| {
+        exprs
+            .iter()
+            .enumerate()
+            .map(|(index, expr)| inline(expr, &definitions).map(|inlined| inlined.alias(aggregate.schema.field(offset + index).name())))
+            .collect()
+    };
+    let (group_expr, aggr_expr): (Option<Vec<_>>, Option<Vec<_>>) =
+        (restate(&aggregate.group_expr, 0), restate(&aggregate.aggr_expr, aggregate.group_expr.len()));
+    let restated = Aggregate::try_new(std::sync::Arc::new(input), group_expr?, aggr_expr?).ok()?;
+    Some((restated, source, column, predicates))
+}
+
 /// Every table `plan` scans, in walk order. Diagnostics only: the COUNT is what
 /// separates a shape a rollup could plausibly serve from one it structurally
 /// cannot, since a rollup answers from a single source.
@@ -1799,8 +1891,13 @@ async fn match_aggregate(
     let aggregate = inlined.as_ref().unwrap_or(original);
     let shape = || matched.display_indent_schema().to_string().lines().take(6).join(" | ");
     let mut predicates = Vec::new();
-    let source = match source_and_filters(&aggregate.input, &mut predicates) {
-        Ok(source) => source,
+    let unnested_source = || inline_unnest_source(aggregate);
+    let (source, unnested, restated) = match source_and_filters(&aggregate.input, &mut predicates) {
+        Ok(source) => (source, None, None),
+        Err(_) if let Some((restated, source, column, filters)) = unnested_source() => {
+            predicates = filters;
+            (source, Some(column), Some(restated))
+        }
         // An aggregate over a window over the aggregate a rollup CAN answer (a
         // per-series counter rate summed across series): route the inner ones, the
         // window and this aggregate then run over their rewrites.
@@ -1830,6 +1927,7 @@ async fn match_aggregate(
             return Ok(Vec::new());
         }
     };
+    let aggregate = restated.as_ref().unwrap_or(aggregate);
     let Some(schema) = crate::schema::get_schema(&source).filter(|schema| !schema.rollups.is_empty()) else { return Ok(Vec::new()) };
 
     // Coarsest grain first (strictly fewer rows for the same answer). At one grain a
@@ -1853,7 +1951,7 @@ async fn match_aggregate(
     let (mut miss, mut grain_miss) = (None, None);
     let mut routes = Vec::new();
     for spec in candidates {
-        match route_with_spec(spec, &source, &schema.table_name, &predicates, aggregate, session).await {
+        match route_with_spec(spec, &source, &schema.table_name, &predicates, aggregate, unnested.as_deref(), session).await {
             // The rewrite replaces the node that is IN the tree, never the
             // inlined stand-in — `substitute` finds it by structural equality.
             Ok(route) => routes.push(RoutedRollup { matched: matched.clone(), ..route }),
@@ -1995,7 +2093,7 @@ fn routed_measure(alias: String, merge: Merge, resolved: &[&RollupMeasure]) -> R
 /// with the aggregate's OWN field name — the untouched nodes above reference it.
 async fn route_with_spec(
     spec: &RollupSpec, source: &str, table_name: &str, predicates: &[datafusion::logical_expr::Expr], aggregate: &datafusion::logical_expr::Aggregate,
-    session: &datafusion::execution::context::SessionState,
+    unnested: Option<&str>, session: &datafusion::execution::context::SessionState,
 ) -> Result<RoutedRollup, MissReason> {
     use datafusion::logical_expr::{Expr, utils::split_conjunction};
 
@@ -2011,10 +2109,25 @@ async fn route_with_spec(
     // filter, leaving a term no declared measure can match.
     let mut terms: Vec<&Expr> = predicates.iter().flat_map(split_conjunction).collect();
     strip_index_hints(&mut terms);
+    // A query that unnests reads one row per element, as only the tier unnesting the same
+    // column stores them; any other tier counts source rows.
+    if unnested.is_some() && spec.unnest.as_ref().map(|unnest| unnest.column.as_str()) != unnested {
+        return Err(MissReason::FilterNotEligible);
+    }
+    // Over an unnest, a membership the element filter implies (`hashes && L` beside
+    // `hash IN V`, V ⊆ L) admits no element the element filter does not.
+    if let Some(unnest) = spec.unnest.as_ref().filter(|_| unnested.is_some()) {
+        let pinned: Vec<HashSet<String>> = terms.iter().filter_map(|term| element_values(term, &unnest.dimension)).collect();
+        terms.retain(|term| !any_member_of(term, &unnest.column).is_some_and(|any_of| pinned.iter().any(|values| values.is_subset(&any_of))));
+        // Any other is a row-level condition the per-element rows cannot express.
+        if terms.iter().any(|term| crate::tantivy::planner::membership(term).is_some_and(|membership| membership.columns().contains(unnest.column.as_str()))) {
+            return Err(MissReason::FilterNotEligible);
+        }
+    }
     // An unnest tier holds each row once PER ELEMENT: summed across elements it counts
     // a row with two hashes twice and one with none never, so it answers only a query
-    // pinning one element.
-    if let Some(unnest) = &spec.unnest
+    // pinning one element — or one that unnests itself.
+    if let Some(unnest) = spec.unnest.as_ref().filter(|_| unnested.is_none())
         && !terms.iter().any(|term| {
             matches!(crate::tantivy::planner::membership(term), Some(crate::tantivy::histogram::Membership::Contains { column, .. }) if column == unnest.column)
         })
@@ -2171,6 +2284,17 @@ async fn route_with_spec(
                     }
                     format!("time_bucket({}, timestamp)", sql_literal(interval))
                 }
+                // `floor(extract(epoch from timestamp) / N)` reads only the N-second bucket, and a
+                // grain-aligned bucket start lies in the same one as each of its rows when N is
+                // a whole number of grains — so it means the same on both tables.
+                other if let Some(seconds) = epoch_bucket_seconds(other) => {
+                    let width = seconds.checked_mul(1_000_000).ok_or(MissReason::UnsupportedShape)?;
+                    if width < grain || width % grain != 0 {
+                        return Err(MissReason::PartialBucket);
+                    }
+                    let bare = crate::write::mem_buffer::strip_column_qualifiers(expression.clone().unalias()).map_err(|_| MissReason::UnsupportedShape)?;
+                    datafusion::sql::unparser::expr_to_sql(&bare).map_err(|_| MissReason::UnsupportedShape)?.to_string()
+                }
                 // A deterministic expression over declared dimensions only (say
                 // `COALESCE(dim, lit)`) is a function of them, so partitioning by
                 // them refines it and re-aggregating decomposable states over a
@@ -2294,9 +2418,61 @@ async fn route_with_spec(
         guard,
         row_filters,
         raw_row_filters,
+        raw_from: match (unnested, &spec.unnest) {
+            (Some(column), Some(unnest)) => format!("(SELECT *, unnest({}) AS {} FROM {source}) AS __elements", quoted(column), quoted(&unnest.dimension)),
+            _ => source.to_string(),
+        },
         groups,
         measures,
     })
+}
+
+/// `N` of `floor(date_part('epoch', timestamp) / N)`, a whole number of seconds.
+fn epoch_bucket_seconds(expr: &datafusion::logical_expr::Expr) -> Option<i64> {
+    use datafusion::{
+        logical_expr::{Expr, Operator},
+        scalar::ScalarValue,
+    };
+    let Expr::ScalarFunction(floor) = unaliased(expr) else { return None };
+    let ("floor", [Expr::BinaryExpr(divide)]) = (floor.name(), floor.args.as_slice()) else { return None };
+    let Expr::ScalarFunction(part) = unaliased(&divide.left) else { return None };
+    let ("date_part", [unit, column]) = (part.name(), part.args.as_slice()) else { return None };
+    (divide.op == Operator::Divide && string_literal(unit)?.eq_ignore_ascii_case("epoch") && column_name(column) == Some("timestamp")).then_some(())?;
+    match unaliased(&divide.right) {
+        Expr::Literal(ScalarValue::Float64(Some(n)), _) if n.fract() == 0.0 && *n >= 1.0 => Some(*n as i64),
+        Expr::Literal(ScalarValue::Int64(Some(n)), _) if *n >= 1 => Some(*n),
+        _ => None,
+    }
+}
+
+/// The values `term` restricts `column` to: `column = v`, ORs of those, or `column IN (…)`.
+fn element_values(term: &datafusion::logical_expr::Expr, column: &str) -> Option<HashSet<String>> {
+    use datafusion::logical_expr::{Expr, Operator};
+    match unaliased(term) {
+        Expr::BinaryExpr(binary) if binary.op == Operator::Or => {
+            Some(element_values(&binary.left, column)?.union(&element_values(&binary.right, column)?).cloned().collect())
+        }
+        Expr::BinaryExpr(binary) if binary.op == Operator::Eq && column_name(&binary.left) == Some(column) => {
+            string_literal(&binary.right).map(|v| HashSet::from([v.to_string()]))
+        }
+        Expr::InList(list) if !list.negated && column_name(&list.expr) == Some(column) => {
+            list.list.iter().map(|item| string_literal(item).map(str::to_string)).collect()
+        }
+        _ => None,
+    }
+}
+
+/// The values of which `term` requires `column` to hold at least one, when it says only that.
+fn any_member_of(term: &datafusion::logical_expr::Expr, column: &str) -> Option<HashSet<String>> {
+    use crate::tantivy::histogram::Membership;
+    fn any_of(membership: Membership, column: &str) -> Option<HashSet<String>> {
+        match membership {
+            Membership::Contains { column: member, value } if member == column => Some(HashSet::from([value])),
+            Membership::Or(left, right) => Some(any_of(*left, column)?.union(&any_of(*right, column)?).cloned().collect()),
+            _ => None,
+        }
+    }
+    any_of(crate::tantivy::planner::membership(term)?, column)
 }
 
 #[cfg(test)]
@@ -3099,7 +3275,7 @@ mod tests {
         let datafusion::logical_expr::LogicalPlan::Aggregate(aggregate) = outermost_aggregates(&plan)[0] else { panic!("an aggregate") };
         let mut predicates = Vec::new();
         let source = source_and_filters(&aggregate.input, &mut predicates).expect("walkable");
-        route_with_spec(&hashes_spec(), &source, SOURCE, &predicates, aggregate, &state).await.map(|route| route.row_filters)
+        route_with_spec(&hashes_spec(), &source, SOURCE, &predicates, aggregate, None, &state).await.map(|route| route.row_filters)
     }
 
     /// The proposed `hashes_30m` tier: the endpoint dashboard's widgets (monoscope
@@ -3150,8 +3326,30 @@ mod tests {
         let aggregate = inlined.as_ref().unwrap_or(original);
         let mut predicates = Vec::new();
         let source = source_and_filters(&aggregate.input, &mut predicates).expect("walkable");
-        let routed = route_with_spec(&endpoint_spec(), &source, SOURCE, &predicates, aggregate, &state).await;
+        let routed = route_with_spec(&endpoint_spec(), &source, SOURCE, &predicates, aggregate, None, &state).await;
         routed.is_ok()
+    }
+
+    /// monoscope's hourly proven-endpoint job unnests `hashes` itself, so it reads one row per
+    /// element exactly as `hashes_30m` stores them: it routes there with no membership pin, its
+    /// `hashes && L` implied by the element filter, and its raw legs unnest too.
+    #[tokio::test]
+    async fn an_unnesting_hash_count_routes_to_the_hash_tier() {
+        let state = session().await;
+        let served = |hashes: &str| {
+            format!(
+                "WITH served AS (SELECT unnest(hashes) AS hash, floor(extract(epoch from timestamp) / {{N}})::bigint AS hour_bucket FROM otel_logs_and_spans \
+                 WHERE project_id = 'p' AND timestamp >= to_timestamp_micros(1800000000) AND timestamp < to_timestamp_micros(1209600000000) \
+                 AND attributes___http___request___method IS NOT NULL AND attributes___http___response___status_code < 400 AND hashes && ARRAY[{hashes}]::text[]) \
+                 SELECT hash, hour_bucket, count(*)::bigint AS cnt FROM served WHERE hash = ANY(ARRAY['a','b']::text[]) GROUP BY hash, hour_bucket"
+            )
+        };
+        let route = route_for(&state, &served("'a','b'").replace("{N}", "3600")).await.expect("routes").expect("a route");
+        assert_eq!(route.target, "otel_logs_and_spans_rollup_hashes_30m");
+        assert!(route.raw_from.contains(r#"unnest("hashes") AS "hash""#), "the raw legs read one row per element: {}", route.raw_from);
+        // `hashes && ['a']` beside `hash IN ('a','b')` keeps rows the element filter alone would drop.
+        assert!(route_for(&state, &served("'a'").replace("{N}", "3600")).await.is_err_and(|miss| miss != MissReason::UnsupportedShape));
+        assert_eq!(route_for(&state, &served("'a','b'").replace("{N}", "600")).await.err(), Some(MissReason::PartialBucket), "a bucket finer than the grain");
     }
 
     /// Every declared tier's generation must render exactly as the spec did before fields
@@ -3202,7 +3400,7 @@ mod tests {
         let datafusion::logical_expr::LogicalPlan::Aggregate(aggregate) = outermost_aggregates(&plan)[0] else { panic!("an aggregate") };
         let mut predicates = Vec::new();
         let source = source_and_filters(&aggregate.input, &mut predicates).expect("walkable");
-        let route = route_with_spec(&hashes_spec(), &source, SOURCE, &predicates, aggregate, &state).await.expect("routes");
+        let route = route_with_spec(&hashes_spec(), &source, SOURCE, &predicates, aggregate, None, &state).await.expect("routes");
         let interior = (0, 3_600_000_000);
         let rewrite = route.sql(&[generation_range("project", "generation", interior)], &[interior], &ProjectSplit::default());
         let (tier, raw): (Vec<&str>, Vec<&str>) = rewrite.split("UNION ALL").partition(|leg| leg.contains(&route.target));
