@@ -564,6 +564,42 @@ fn max_placeholder_index(stmt: &Statement) -> usize {
 /// plan shape (LIMIT, bucket sizes) and vary little. `base > 0` leaves the
 /// client's `$1..$base` binds untouched (mixed now()+`$N` path); `include_strings`
 /// is off there because a prepared statement's literals are fixed across binds.
+/// String constants projected as a bare select item, in any query, CTE or UNION branch.
+/// Lifted to an untyped `$N`, `SELECT 'service' AS kind … UNION ALL …` stops type-checking
+/// (monoscope's service map planned fresh every call, ~1.2 s); left inline they only narrow
+/// the template.
+fn projected_string_constants(stmt: &Statement) -> std::collections::HashSet<String> {
+    use datafusion::sql::sqlparser::ast::{Query, Visit, Visitor};
+    fn selects(set: &SetExpr, out: &mut std::collections::HashSet<String>) {
+        match set {
+            SetExpr::Select(select) => out.extend(select.projection.iter().filter_map(|item| match item {
+                SelectItem::UnnamedExpr(SqlExpr::Value(v)) | SelectItem::ExprWithAlias { expr: SqlExpr::Value(v), .. } => match &v.value {
+                    Value::SingleQuotedString(s) => Some(s.clone()),
+                    _ => None,
+                },
+                _ => None,
+            })),
+            SetExpr::SetOperation { left, right, .. } => {
+                selects(left, out);
+                selects(right, out);
+            }
+            SetExpr::Query(query) => selects(&query.body, out),
+            _ => {}
+        }
+    }
+    struct Collect(std::collections::HashSet<String>);
+    impl Visitor for Collect {
+        type Break = ();
+        fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<()> {
+            selects(&query.body, &mut self.0);
+            ControlFlow::Continue(())
+        }
+    }
+    let mut collect = Collect(Default::default());
+    let _ = stmt.visit(&mut collect);
+    collect.0
+}
+
 fn parameterize_statement(stmt: &Statement, base: usize, include_strings: bool) -> Option<(Statement, Vec<ScalarValue>)> {
     // A regex `SUBSTRING(x FROM 'pat')` must keep its pattern inline: lifted to
     // `$N` it becomes an untyped placeholder that coerces to substr's declared
@@ -581,6 +617,7 @@ fn parameterize_statement(stmt: &Statement, base: usize, include_strings: bool) 
         return None;
     }
 
+    let projected = projected_string_constants(stmt);
     let mut stmt = stmt.clone();
     let mut values: Vec<ScalarValue> = Vec::new();
 
@@ -627,6 +664,7 @@ fn parameterize_statement(stmt: &Statement, base: usize, include_strings: bool) 
             SqlExpr::Value(vs) if include_strings => {
                 if let Value::SingleQuotedString(s) = &vs.value
                     && !s.trim_start().starts_with('{')
+                    && !projected.contains(s)
                 {
                     vs.value = placeholder_for(&mut values, base, ScalarValue::Utf8(Some(s.clone())));
                 }
@@ -1204,6 +1242,36 @@ mod tests {
             assert!(normalize_count_star(&parse(sql)).is_none(), "declined: {sql}");
         }
         assert_eq!(plan(parse("SELECT COUNT(*) FROM t")).await.expect("plans").schema().field(0).name(), "count(*)");
+    }
+
+    /// monoscope's service map: CTEs, a self-join, `NOT EXISTS` and constant select items in
+    /// `UNION ALL` branches. Lifting those constants failed type coercion, so the shape was
+    /// negative-cached and every call re-planned (10-04: ~1.2 s of planning per call).
+    #[tokio::test]
+    async fn a_union_of_constant_select_items_caches_by_shape() {
+        let hook = PlanCacheHook::new(64, true);
+        let mut ctx = SessionContext::new();
+        crate::read::functions::register_custom_functions(&mut ctx).unwrap();
+        let schema = crate::schema::get_schema("otel_logs_and_spans").unwrap().schema_ref();
+        ctx.register_table("otel_logs_and_spans", Arc::new(datafusion::datasource::MemTable::try_new(schema, vec![vec![]]).unwrap())).unwrap();
+        let sql = |lo: &str| {
+            format!(
+                "WITH sp AS (SELECT context___trace_id tid, context___span_id sid, parent_id par, COALESCE(resource___service___name, 'unknown') svc, \
+            COALESCE(resource->'deployment'->'environment'->>'name', resource->'deployment'->>'environment', resource->'service'->>'namespace', resource->'k8s'->'namespace'->>'name', '') env, \
+            kind knd, status_code stc, duration dur, name nm, attributes___db___system___name db_sys, attributes___db___namespace db_ns, attributes___server___address srv, attributes___network___peer___address peer \
+            FROM otel_logs_and_spans WHERE project_id = 'p' AND timestamp >= '{lo}' AND timestamp < '2026-10-04T08:00:00Z' AND kind IN ('server','client','producer','consumer')), \
+            hops AS (SELECT p.env env, p.svc src, 'service' src_kind, c.svc tgt, 'service' tgt_kind, c.stc st, c.dur dur FROM sp c JOIN sp p ON c.tid = p.tid AND c.par = p.sid \
+              WHERE c.knd IN ('server','consumer') AND p.knd IN ('client','producer') \
+            UNION ALL SELECT p.env, p.svc, 'service', CASE WHEN p.db_ns IS NOT NULL AND p.db_ns <> '' AND p.db_ns !~ '^[0-9]+$' THEN 'db:' || p.db_ns ELSE 'http:' || COALESCE(NULLIF(LOWER(p.srv), ''), p.nm) END, 'external', p.stc, p.dur \
+              FROM sp p WHERE p.knd IN ('client','producer') AND NOT EXISTS (SELECT 1 FROM sp c WHERE c.tid = p.tid AND c.par = p.sid AND c.knd IN ('server','consumer'))) \
+            SELECT env, src, tgt, count(*) FROM hops GROUP BY 1, 2, 3"
+            )
+        };
+        for lo in ["2026-10-04T07:00:00Z", "2026-10-04T07:01:00Z"] {
+            assert!(hook.cached_plan(&parse(&sql(lo)), &ctx).await.is_some_and(|plan| plan.is_ok()), "served from the shape cache");
+        }
+        assert_eq!(hook.shape_counters(), (2, 0), "both windows hit one shape, none declined");
+        assert_eq!(hook.shapes.len(), 1);
     }
 
     #[tokio::test]
