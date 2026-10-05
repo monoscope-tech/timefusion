@@ -315,6 +315,11 @@ metrics): a 4-minute burst read 68% "full-set" while every real scan was `bounde
 global, not per table; the flip changes only `otel_metrics`' plans, so a global delta against a post-fix
 baseline still isolates it.
 
+Baseline before the flip (10-05 ~00:55 UTC, process 18 min old after the counter fix):
+- `dedup_full_set_total` 0 of 3,261 dedups (the corrected counter).
+- Demo 24h web vitals (`count(*)`, 5 `browser.web_vital.*` names): 65.0 s, 459 MB scanned, row groups
+  192 of 202 kept by statistics (5% pruned), ~60k rows.
+
 Success criteria (prod, process ≥10 min old, ≥3 runs, alternate arms):
 - Demo 24h web vitals: rows read ≥10× lower than 44.7M; wall time reported before/after.
 - No increase in `dedup_full_set_total` for `otel_metrics` reads.
