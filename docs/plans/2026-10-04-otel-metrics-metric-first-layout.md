@@ -333,6 +333,12 @@ no other repair holds a MiB, which a queue of small repairs never allows. Fix: a
 sliced to half the budget (`lead_value_slice_clauses`) and priced by one slice (`repair_permit_mib`); each slice
 re-reads the old file, since metric ranges cannot prune a timestamp-first file.
 
++3.5 h (04:30 UTC, repair fix `2011a938` live 1.5 h): 114 of 139 live files since 09-28 metric-first; demo's
+10-04 at 4 of 5 files; `layout_split_scans` 9 with full-set dedup 7 of 15,889. Demo 24h web vitals, same query
+as the baseline: **65.0 s → 3.06 s cold / 0.28 s warm; 459 MB → 70.8 MB scanned; row groups 192/202 → 39/227;
+rows decoded 44.7M → 6.69M (6.7×)**, dedup `bounded[metric_name, …]`. The remainder is row groups shared with
+other metrics, including 10-04's last timestamp-first file.
+
 Success criteria (prod, process ≥10 min old, ≥3 runs, alternate arms):
 - Demo 24h web vitals: rows read ≥10× lower than 44.7M; wall time reported before/after.
 - No increase in `dedup_full_set_total` for `otel_metrics` reads.
