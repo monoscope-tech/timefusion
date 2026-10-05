@@ -1044,7 +1044,7 @@ mod tests {
             // Partition columns live in the path, not the file, so they consume
             // no leaf: `timestamp` at leaf 0 proves `date` (declared first) was
             // excluded.
-            assert_eq!(leaves.first().map(String::as_str), Some("timestamp"), "{table}: the lead sort key must be leaf 0");
+            assert_eq!(leaves.first().map(String::as_str), Some("timestamp"), "{table}: the first non-partition field must be leaf 0");
             for partition in &schema.partitions {
                 assert!(!leaves.contains(partition), "{table}: partition `{partition}` must not occupy a parquet leaf");
             }

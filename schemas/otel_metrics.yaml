@@ -6,8 +6,8 @@ partitions:
 # runs in one pass instead of a ROW_NUMBER window. Measured equivalent to
 # (timestamp, id) on live data: zero groups where this key merges two `id`s.
 dedup_keys:
-  - timestamp
   - metric_name
+  - timestamp
   - series_id
 # TF-owned, for the same reason as otel_logs_and_spans: `stamp_version`
 # overwrites this column, and `ingested_at` is client-visible data.
@@ -24,13 +24,16 @@ tombstone_column: deleted
 # unlike the old unbounded fallback (keep-first) it still serves the newest
 # version. Watch `mor_delta_leg_sorts` — it must stay 0.
 version_append: true
+# Metric-first: every query pins one metric, then a time window, so each file
+# keeps a metric's rows together and time-ordered within it, and a metric filter
+# prunes row groups and pages (docs/plans/2026-10-04-otel-metrics-metric-first-layout.md).
 sorting_columns:
-  - name: timestamp
-    descending: true
-    nulls_first: true
   - name: metric_name
     descending: false
     nulls_first: false
+  - name: timestamp
+    descending: true
+    nulls_first: true
   - name: series_id
     descending: false
     nulls_first: false

@@ -255,7 +255,7 @@ Tests:
   the slices, sorted one by one and concatenated, equal one sort of the whole bin. Red with the time cuts in
   the wrong direction, and red if a one-value bin declines.
 
-### Stage 3 — flip the schema
+### Stage 3 — flip the schema  ✅ implemented
 
 - Prerequisites: Stages 1, 2, 2b and 2c deployed and their gates met.
 - Apply the yaml above. Update the `schema.rs:1047` assertion message ("lead sort key must be leaf 0") and
@@ -267,14 +267,25 @@ Tests:
     sorted stream (still honest footers); only the comment's claim changes.
 - Rollup tiers on `otel_metrics` (`metrics_1m_v2`, `metrics_1h_v2`, `series_5m_v1`, `series_attrs_1d_v2`) are
   unaffected: their SQL orders explicitly and their own sort is independent.
+- The dedup probe's time shards need no change: within a metric-first file each metric's run stays
+  time-ordered, so a time shard still prunes at page level; Stage 0's dedup gate measures it.
+- Flip day: repair plans sealed dates only, so today's old-layout hourly files are replaced by hot packing,
+  not repair. Until midnight UTC today is a mixed run whose minority layout is sorted at read time (1 GiB
+  compressed budget; the demo's whole day is ~1.5-2 GB, so the minority stays under it). The next day starts
+  clean; `ordering_repair_declined` in the go/no-go table catches a breach.
 
 Tests:
-- Fixed point (from Stage 2): after repairing a day written under the old order, a second pass selects nothing.
+- Fixed point (from Stage 2): `repair_migrates_a_day_written_under_an_earlier_order_and_then_rests` — repair
+  rewrites the earlier-order file (one suspect per unit), every footer then declares the schema's order, and a
+  further unit leaves the table version unchanged. Red under the old "any footer" check.
+- Cost: `a_metric_filter_prunes_the_row_groups_of_other_metrics` — one metric of six reads 11 of 58 row groups;
+  the old timestamp-first layout reads 58 of 58 (red).
 - The existing `the_shipped_dedup_keys_lead_the_shipped_sort` (`compact.rs:2252`) passes with both lists
   reordered together.
 - Routed rollups over a mixed-layout window equal raw (`a_per_series_counter_rate_routes_to_the_series_tier_and_equals_raw`).
-- Risk 7: two files whose metric names share a >64-character prefix (inexact footer min/max) are not grouped
-  under a false ordering — the query returns the exact answer, no `OrderingViolation`.
+- Risk 7: `files_overlapping_past_a_long_shared_prefix_are_not_grouped_as_sorted` — files whose metric ranges
+  overlap only past a 70-character prefix stay in separate groups (even at `target_partitions = 1`), merged in
+  order under `bounded[metric, timestamp, id]`, all rows returned.
 - New: a metric + time-window query over a migrated day prunes to that metric's row groups inside the window
   — assert `row_groups_pruned_statistics` / bytes scanned, not only the answer.
 

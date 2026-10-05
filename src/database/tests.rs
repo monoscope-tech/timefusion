@@ -4192,14 +4192,10 @@ fn keep_greatest_ordering_requires_a_tiebreak() {
     // A string lead (the metric-first `otel_metrics` layout) takes the whole dedup-key
     // prefix: `metric_name` alone would make one run of every row of a metric.
     let metrics = get_schema("otel_metrics").expect("registered");
-    let mut metric_first = metrics.clone();
-    metric_first.sorting_columns.rotate_left(1);
-    metric_first.dedup_keys = metric_first.sorting_columns.iter().map(|sc| sc.name.clone()).collect();
-    let schema = metrics.schema_ref();
-    let ord = ProjectRoutingTable::keep_greatest_ordering(&metric_first, &schema).expect("string-led tiebreak table");
+    let ord = ProjectRoutingTable::keep_greatest_ordering(metrics, &metrics.schema_ref()).expect("string-led tiebreak table");
     assert_eq!(
         ord.iter().map(|se| se.expr.to_string().split('@').next().unwrap_or_default().to_string()).collect::<Vec<_>>(),
-        ["metric_name", "series_id", "timestamp"]
+        ["metric_name", "timestamp", "series_id"]
     );
 }
 
@@ -7827,6 +7823,109 @@ async fn a_footer_written_under_another_sort_order_is_a_repair_suspect() -> Resu
     Ok(())
 }
 
+/// `mor_metric_first` rows on `day` at noon: one per `(metric, k)`, id `k{k}`, second `k`.
+fn metric_first_rows<'a>(project: &str, day: chrono::NaiveDate, keys: impl IntoIterator<Item = (&'a str, u32)>, value: i64) -> Vec<serde_json::Value> {
+    keys.into_iter()
+        .map(|(metric, k)| {
+            let ts = day.and_hms_opt(12, 0, k).expect("valid").and_utc().timestamp_micros();
+            serde_json::json!({"timestamp": ts, "id": format!("k{k}"), "metric": metric, "value": value, "project_id": project, "date": day.to_string()})
+        })
+        .collect()
+}
+
+/// Three metrics by four keys.
+const GRID: [(&str, u32); 12] =
+    [("m0", 0), ("m0", 1), ("m0", 2), ("m0", 3), ("m1", 0), ("m1", 1), ("m1", 2), ("m1", 3), ("m2", 0), ("m2", 1), ("m2", 2), ("m2", 3)];
+
+/// Commit `rows` as one file sorted, and footer-stamped, under `table`'s order rotated left by
+/// one — what a build with an earlier order would have written. Bypasses TF's write path, so
+/// the file is not marked verified.
+async fn write_under_earlier_order(db: &Database, project: &str, table: &str, rows: Vec<serde_json::Value>) -> Result<()> {
+    let mut earlier = get_schema(table).expect("registered").clone();
+    earlier.sorting_columns.rotate_left(1);
+    let (sorted, _) = sort_batches_by_schema_reference(&earlier, vec![json_to_batch_for(table, rows)?]);
+    let table_ref = db.resolve_table(project, table).await?;
+    let mut delta = table_ref.write().await;
+    let mut writer = deltalake::writer::RecordBatchWriter::for_table(&delta)?.with_writer_properties(db.create_writer_properties(&earlier, 3, true));
+    for batch in sorted {
+        let batch = deltalake::kernel::schema::cast_record_batch(&batch, writer.arrow_schema(), true, true)?;
+        deltalake::writer::DeltaWriter::write(&mut writer, batch).await?;
+    }
+    deltalake::writer::DeltaWriter::flush_and_commit(&mut writer, &mut delta).await?;
+    Ok(())
+}
+
+/// The point of the metric-first layout: a metric filter skips the row groups of other metrics,
+/// so a one-metric read decodes a fraction of the file, not all of it. Asserted on the parquet
+/// scan's pruning metrics, not only on the answer.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_metric_filter_prunes_the_row_groups_of_other_metrics() -> Result<()> {
+    let db = Arc::new(Database::with_config(test_config_with("metric-prune", |cfg| cfg.parquet.timefusion_max_row_group_size = 64 * 1024)).await?);
+    let project = format!("prune_{}", uuid::Uuid::new_v4().simple());
+    let day = (Utc::now() - chrono::Duration::days(2)).date_naive();
+    let points: Vec<serde_json::Value> = (0..6)
+        .cartesian_product(0..200i64)
+        .map(|(m, i)| {
+            let ts = day.and_hms_opt(10, 0, 0).expect("valid").and_utc().timestamp_micros() + i * 1_000_000;
+            serde_json::json!({
+                "project_id": project, "timestamp": ts, "date": day.to_string(), "ingested_at": ts, "id": format!("m{m}-{i}"),
+                "series_id": format!("s{m}"), "metric_name": format!("m{m}"), "metric_unit": "1", "metric_type": "GAUGE",
+                "value": i as f64, "flags": 0, "dropped_attributes_count": 0, "message_size_bytes": 0,
+            })
+        })
+        .collect();
+    db.insert_records_batch(&project, "otel_metrics", vec![json_to_batch_for("otel_metrics", points)?], true, None).await?;
+    let mut ctx = Arc::clone(&db).create_session_context();
+    db.setup_session_context(&mut ctx)?;
+    let sql = format!(
+        "EXPLAIN ANALYZE SELECT count(*) FROM otel_metrics WHERE project_id = '{project}' AND metric_name = 'm3' AND timestamp >= '{day}' AND timestamp < '{}'",
+        day.succ_opt().expect("next")
+    );
+    let plan = datafusion::arrow::util::pretty::pretty_format_batches(&ctx.sql(&sql).await?.collect().await?)?.to_string();
+    // Rendered human-readable: `1.20 K total → 200 matched`.
+    let pruning = regex::Regex::new(r"row_groups_pruned_statistics=([\d.]+)( K)? total \u{2192} (\d+) matched").expect("regex");
+    let (total, matched) = pruning
+        .captures(&plan)
+        .map(|c| (c[1].parse::<f64>().unwrap_or(0.0) * if c.get(2).is_some() { 1000.0 } else { 1.0 }, c[3].parse::<f64>().unwrap_or(0.0)))
+        .expect("pruning metrics");
+    assert!(total > 3.0 && matched * 3.0 <= total, "one metric of six must skip most row groups: {matched} of {total}");
+    Ok(())
+}
+
+/// A day written under an earlier sort order is migrated by repair and then left alone: one
+/// unit rewrites it so every footer declares the schema's order, and the next finds nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn repair_migrates_a_day_written_under_an_earlier_order_and_then_rests() -> Result<()> {
+    const TABLE: &str = "mor_metric_first";
+    let db = Arc::new(Database::with_config(create_test_config("migrate")).await?);
+    let project = format!("migrate_{}", uuid::Uuid::new_v4().simple());
+    let day = (Utc::now() - chrono::Duration::days(3)).date_naive();
+    let rows = metric_first_rows(&project, day, GRID, 1);
+    // A first write creates the table under the schema's order; the earlier-order file joins it.
+    db.insert_records_batch(&project, TABLE, vec![json_to_batch_for(TABLE, rows[..1].to_vec())?], true, None).await?;
+    write_under_earlier_order(&db, &project, TABLE, rows[1..].to_vec()).await?;
+    let schema = get_schema(TABLE).expect("fixture");
+    let table_ref = db.resolve_table(&project, TABLE).await?;
+    let footers = || async {
+        let table = table_ref.read().await;
+        let store = table.log_store().object_store(None);
+        let files: Vec<String> = table.snapshot().expect("snapshot").log_data().iter().map(|f| f.path().into_owned()).collect();
+        futures::future::join_all(files.iter().map(|file| Database::footer_sorted_as(&store, file, schema))).await
+    };
+    assert!(footers().await.contains(&false), "precondition: one file carries the earlier order");
+    // A unit takes one suspect: a file whose footer already matches is cleared, not rewritten.
+    let repair = || db.run_unit_once(TABLE, &project, day, crate::maintenance_coordinator::Operation::Repair, 24, 0, None);
+    for _ in 0..3 {
+        repair().await?;
+    }
+    assert!(footers().await.iter().all(|&sorted| sorted), "after repair every footer declares the schema's order");
+    let version = || async { table_ref.read().await.version() };
+    let settled = version().await;
+    repair().await?;
+    assert_eq!(version().await, settled, "a migrated day is left alone");
+    Ok(())
+}
+
 /// A window spanning a day written under an earlier sort order and a day in the schema's
 /// metric-first order — with a newer version of a legacy-day key still in MemBuffer — dedups
 /// each day under its own order: one row per key, the newest version, and no full-set dedup.
@@ -7844,31 +7943,11 @@ async fn a_window_across_two_sort_layouts_dedups_each_day_under_its_own_order() 
     let project = format!("layout_{}", uuid::Uuid::new_v4().simple());
     let day = |back: i64| (Utc::now() - chrono::Duration::days(back)).date_naive();
     let (legacy_day, current_day) = (day(3), day(2));
-    let rows = |date: chrono::NaiveDate, value: i64| -> Vec<serde_json::Value> {
-        (0..3)
-            .cartesian_product(0..4)
-            .map(|(m, k)| {
-                let ts = date.and_hms_opt(12, 0, k).expect("valid").and_utc().timestamp_micros();
-                serde_json::json!({"timestamp": ts, "id": format!("k{k}"), "metric": format!("m{m}"), "value": value, "project_id": project, "date": date.to_string()})
-            })
-            .collect()
-    };
-    let schema = get_schema(TABLE).expect("fixture");
+    let rows = |date: chrono::NaiveDate, value: i64| metric_first_rows(&project, date, GRID, value);
+
     db.insert_records_batch(&project, TABLE, vec![json_to_batch_for(TABLE, rows(current_day, 1))?], true, None).await?;
     // The legacy day: timestamp-first, written as a build with the earlier order would have.
-    let mut legacy = schema.clone();
-    legacy.sorting_columns.rotate_left(1);
-    let (sorted, _) = sort_batches_by_schema_reference(&legacy, vec![json_to_batch_for(TABLE, rows(legacy_day, 1))?]);
-    {
-        let table_ref = db.resolve_table(&project, TABLE).await?;
-        let mut table = table_ref.write().await;
-        let mut writer = deltalake::writer::RecordBatchWriter::for_table(&table)?.with_writer_properties(db.create_writer_properties(&legacy, 3, true));
-        for batch in sorted {
-            let batch = deltalake::kernel::schema::cast_record_batch(&batch, writer.arrow_schema(), true, true)?;
-            deltalake::writer::DeltaWriter::write(&mut writer, batch).await?;
-        }
-        deltalake::writer::DeltaWriter::flush_and_commit(&mut writer, &mut table).await?;
-    }
+    write_under_earlier_order(&db, &project, TABLE, rows(legacy_day, 1)).await?;
     // A newer version of a legacy-day key, still in MemBuffer at its original timestamp.
     let newer = rows(legacy_day, 2)[..1].to_vec();
     db.insert_records_batch(&project, TABLE, vec![json_to_batch_for(TABLE, newer)?], false, None).await?;
@@ -7900,7 +7979,7 @@ async fn a_window_across_two_sort_layouts_dedups_each_day_under_its_own_order() 
 /// Only a table whose sort leads with a non-time column takes the layout split and the
 /// order-keeping string cast; every timestamp-led table plans exactly as before.
 #[test_case::test_case("otel_logs_and_spans" => true)]
-#[test_case::test_case("otel_metrics" => true ; "until its sort flips")]
+#[test_case::test_case("otel_metrics" => false ; "metric-first")]
 #[test_case::test_case("mor_metric_first" => false)]
 #[tokio::test]
 async fn only_a_string_led_table_plans_by_layout(table: &str) -> bool {
@@ -7992,13 +8071,23 @@ async fn files_overlapping_past_a_long_shared_prefix_are_not_grouped_as_sorted()
     let project = format!("prefix_{}", uuid::Uuid::new_v4().simple());
     let day = (Utc::now() - chrono::Duration::days(2)).date_naive();
     let prefix = "m".repeat(70);
-    let row = |metric: &str, k: u32| {
-        let ts = day.and_hms_opt(12, 0, k).expect("valid").and_utc().timestamp_micros();
-        serde_json::json!({"timestamp": ts, "id": format!("k{k}"), "metric": metric, "value": 1, "project_id": project, "date": day.to_string()})
-    };
     let (a, z, m) = (format!("{prefix}a"), format!("{prefix}z"), format!("{prefix}m"));
-    db.insert_records_batch(&project, TABLE, vec![json_to_batch_for(TABLE, vec![row(&a, 0), row(&z, 1)])?], true, None).await?;
-    db.insert_records_batch(&project, TABLE, vec![json_to_batch_for(TABLE, vec![row(&m, 2), row(&m, 3)])?], true, None).await?;
+    db.insert_records_batch(
+        &project,
+        TABLE,
+        vec![json_to_batch_for(TABLE, metric_first_rows(&project, day, [(a.as_str(), 0), (z.as_str(), 1)], 1))?],
+        true,
+        None,
+    )
+    .await?;
+    db.insert_records_batch(
+        &project,
+        TABLE,
+        vec![json_to_batch_for(TABLE, metric_first_rows(&project, day, [(m.as_str(), 2), (m.as_str(), 3)], 1))?],
+        true,
+        None,
+    )
+    .await?;
     let mut ctx = Arc::clone(&db).create_session_context();
     db.setup_session_context(&mut ctx)?;
     ctx.sql("SET datafusion.execution.target_partitions = 1").await?.collect().await?;
