@@ -637,11 +637,13 @@ impl ExecutionPlan for DedupExec {
         let bound = detect_bound(&self.input, &self.keys, &in_schema, bounded_dedup_enabled());
         // Bounded vs full-set is the difference between a LIMIT that terminates
         // early and one that buffers the whole window into the 2 GiB budget.
-        metrics::counter!(match bound {
+        // Counted on the first row, not at plan: a scan that reads nothing (a
+        // project with no rows in the window) has no ordering to bound by and
+        // costs nothing, and counting it drowns the real full-set scans.
+        let mode = match bound {
             Some(_) => scan_metric_names::DEDUP_BOUNDED_TOTAL,
             None => scan_metric_names::DEDUP_FULL_SET_TOTAL,
-        })
-        .increment(1);
+        };
         let key_idxs = dedup_key_idxs(&self.key_idxs);
         // A bound lets keep-greatest emit per run, but is not required: without
         // one it buffers to end-of-stream rather than forcing a blocking sort.
@@ -676,35 +678,39 @@ impl ExecutionPlan for DedupExec {
         // One input batch can yield several output batches (a keep-greatest
         // flush emits one per buffered batch) or none at all, so `flat_map` fans
         // them out lazily.
-        let stream = futures::stream::unfold((input, dedup, baseline, input_rows, false), |(mut input, mut dedup, baseline, input_rows, done)| async move {
-            if done {
-                return None;
-            }
-            let (produced, done) = match input.next().await {
-                None => {
-                    let produced = {
-                        let _timer = baseline.elapsed_compute().timer();
-                        dedup.finish()
-                    };
-                    baseline.done();
-                    (produced, true)
+        let stream =
+            futures::stream::unfold((input, dedup, baseline, input_rows, false), move |(mut input, mut dedup, baseline, input_rows, done)| async move {
+                if done {
+                    return None;
                 }
-                Some(Err(e)) => (Err(e), false),
-                Some(Ok(batch)) => {
-                    input_rows.add(batch.num_rows());
-                    let produced = {
-                        let _timer = baseline.elapsed_compute().timer();
-                        dedup.push(&batch)
-                    };
-                    (produced, false)
-                }
-            };
-            produced.iter().flatten().for_each(|batch| {
-                batch.record_output(&baseline);
-            });
-            Some((produced, (input, dedup, baseline, input_rows, done)))
-        })
-        .flat_map(|r| futures::stream::iter(r.map_or_else(|e| vec![Err(e)], |bs| bs.into_iter().map(Ok).collect::<Vec<_>>())));
+                let (produced, done) = match input.next().await {
+                    None => {
+                        let produced = {
+                            let _timer = baseline.elapsed_compute().timer();
+                            dedup.finish()
+                        };
+                        baseline.done();
+                        (produced, true)
+                    }
+                    Some(Err(e)) => (Err(e), false),
+                    Some(Ok(batch)) => {
+                        if input_rows.value() == 0 && batch.num_rows() > 0 {
+                            metrics::counter!(mode).increment(1);
+                        }
+                        input_rows.add(batch.num_rows());
+                        let produced = {
+                            let _timer = baseline.elapsed_compute().timer();
+                            dedup.push(&batch)
+                        };
+                        (produced, false)
+                    }
+                };
+                produced.iter().flatten().for_each(|batch| {
+                    batch.record_output(&baseline);
+                });
+                Some((produced, (input, dedup, baseline, input_rows, done)))
+            })
+            .flat_map(|r| futures::stream::iter(r.map_or_else(|e| vec![Err(e)], |bs| bs.into_iter().map(Ok).collect::<Vec<_>>())));
 
         // Statement timeouts are enforced by dropping the in-flight future, and
         // that can only happen when a poll returns `Pending`. Unbounded
@@ -1584,6 +1590,19 @@ mod tests {
         let mut exact = try_collect_rows(&string_led_plan(rows(), false)).await.unwrap();
         exact.sort();
         assert_eq!(exact, vec![("a".into(), 10, Some(2)), ("b".into(), 10, Some(1))]);
+    }
+
+    /// The bounded/full-set counters measure scans that read rows: a project with nothing in
+    /// the window has no ordering to bound by and must not count as a full-set scan.
+    #[tokio::test]
+    async fn an_empty_scan_counts_no_dedup_mode() {
+        crate::observability::init_local_metrics_for_test();
+        let full = || crate::observability::counter_value(scan_metric_names::DEDUP_FULL_SET_TOTAL);
+        let before = full();
+        let _ = try_collect_rows(&dedup_plan(vec![vbatch(&[], &[], &[])], false, true)).await.unwrap();
+        assert_eq!(full(), before, "nothing read, nothing counted");
+        let _ = try_collect_rows(&dedup_plan(vec![vbatch(&["a"], &[1], &[None])], false, true)).await.unwrap();
+        assert_eq!(full(), before + 1, "a scan that reads rows counts once");
     }
 
     async fn collect_rows(plan: &DedupExec) -> Vec<(String, i64, Option<i64>)> {

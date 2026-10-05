@@ -290,13 +290,19 @@ Tests:
 | `otel_metrics` queries failing with `unordered merge-on-read dedup exceeded` or `Resources exhausted` | 0 | any |
 | tuple-path ordering-violation errors | 0 | any (a lying footer exists — investigate before resuming) |
 | `ordering_repair_declined` for `otel_metrics` | 0 (Stage 2b keeps layouts in separate legs) | > 0 sustained over 1 h |
-| `dedup_full_set_total` delta vs the 24 h before the flip | ≤ +10% | > +10% |
+| `dedup_full_set_total` delta vs the 24 h before the flip (baseline taken after `dedup mode counted on first row` deployed — earlier values count empty scans) | ≤ +10% | > +10% |
 | repair backlog for `otel_metrics` | drains every hour | flat for 6 h |
 
 Rollback = revert the yaml order and redeploy. Both layouts carry honest footers and Stage 2b handles either
 majority, so rollback is a read-safe deploy; repair then migrates the already-converted days back (cost, not
 correctness).
 - Done when every sealed `otel_metrics` file's footer matches the schema.
+
+Measurement note (10-05): until the counter fix, `dedup_full_set_total` counted every DedupExec at plan time,
+including scans of projects with no rows in the window (monoscope's `projectCacheById` counts every project's
+metrics): a 4-minute burst read 68% "full-set" while every real scan was `bounded[timestamp]`. The counter is
+global, not per table; the flip changes only `otel_metrics`' plans, so a global delta against a post-fix
+baseline still isolates it.
 
 Success criteria (prod, process ≥10 min old, ≥3 runs, alternate arms):
 - Demo 24h web vitals: rows read ≥10× lower than 44.7M; wall time reported before/after.

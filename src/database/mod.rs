@@ -393,6 +393,7 @@ pub mod scan_metric_names {
         BOUNDED_OTEL_SCAN_REJECTIONS = "timefusion.scan.bounded_otel_scan_rejections" as scan.bounded_otel_scan_rejections;
         WIDE_SCAN_OVERSIZE_TOTAL = "timefusion.scan.wide_scan_oversize_total" as scan.wide_scan_oversize_total;
         // full-set has no LIMIT early termination and charges the 2 GiB per-query budget.
+        // One per DedupExec that reads a row; an empty scan counts as neither.
         DEDUP_BOUNDED_TOTAL = "timefusion.scan.dedup_bounded_total" as scan.dedup_bounded_total;
         DEDUP_FULL_SET_TOTAL = "timefusion.scan.dedup_full_set_total" as scan.dedup_full_set_total;
         DEDUP_WINNER_COMPACTIONS_TOTAL = "timefusion.scan.dedup_winner_compactions_total" as scan.dedup_winner_compactions_total;

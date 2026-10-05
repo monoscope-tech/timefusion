@@ -7982,6 +7982,38 @@ async fn a_string_led_bin_packs_in_slices_that_concatenate_sorted(distinct: usiz
     Ok(())
 }
 
+/// String min/max stats may be truncated to a prefix. Two files whose `metric` ranges overlap
+/// only past a long shared prefix must not be grouped under a false string-led ordering: the
+/// read returns every row, and no `OrderingViolation`.
+#[tokio::test(flavor = "multi_thread")]
+async fn files_overlapping_past_a_long_shared_prefix_are_not_grouped_as_sorted() -> Result<()> {
+    const TABLE: &str = "mor_metric_first";
+    let db = Arc::new(Database::with_config(create_test_config("stats-prefix")).await?);
+    let project = format!("prefix_{}", uuid::Uuid::new_v4().simple());
+    let day = (Utc::now() - chrono::Duration::days(2)).date_naive();
+    let prefix = "m".repeat(70);
+    let row = |metric: &str, k: u32| {
+        let ts = day.and_hms_opt(12, 0, k).expect("valid").and_utc().timestamp_micros();
+        serde_json::json!({"timestamp": ts, "id": format!("k{k}"), "metric": metric, "value": 1, "project_id": project, "date": day.to_string()})
+    };
+    let (a, z, m) = (format!("{prefix}a"), format!("{prefix}z"), format!("{prefix}m"));
+    db.insert_records_batch(&project, TABLE, vec![json_to_batch_for(TABLE, vec![row(&a, 0), row(&z, 1)])?], true, None).await?;
+    db.insert_records_batch(&project, TABLE, vec![json_to_batch_for(TABLE, vec![row(&m, 2), row(&m, 3)])?], true, None).await?;
+    let mut ctx = Arc::clone(&db).create_session_context();
+    db.setup_session_context(&mut ctx)?;
+    ctx.sql("SET datafusion.execution.target_partitions = 1").await?.collect().await?;
+    let sql =
+        format!("SELECT metric, id FROM {TABLE} WHERE project_id = '{project}' AND timestamp >= '{day}' AND timestamp < '{}'", day.succ_opt().expect("next"));
+    let plan = datafusion::arrow::util::pretty::pretty_format_batches(&ctx.sql(&format!("EXPLAIN {sql}")).await?.collect().await?)?.to_string();
+    assert!(
+        plan.contains("file_groups={2 groups") && plan.contains("bounded[metric, timestamp, id]"),
+        "overlapping files stay in separate groups, merged in order: {plan}"
+    );
+    let rows: usize = ctx.sql(&sql).await?.collect().await?.iter().map(RecordBatch::num_rows).sum();
+    assert_eq!(rows, 4);
+    Ok(())
+}
+
 fn add_action(path: &str) -> deltalake::kernel::Action {
     deltalake::kernel::Action::Add(deltalake::kernel::Add { path: path.to_string(), size: 1, ..Default::default() })
 }
