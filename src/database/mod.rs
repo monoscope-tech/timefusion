@@ -5198,6 +5198,42 @@ async fn repair_slice_cuts(ctx: &datafusion::prelude::SessionContext, bin_table:
     (0..batch.num_columns()).filter_map(|i| first_i64(batch.column(i))).sorted_unstable().dedup().collect()
 }
 
+/// One slice of a bin whose sort leads with a non-time column: a run of whole lead values
+/// `[from, to)` (open-ended when `to` is `None`), or one value heavier than a slice, cut on the
+/// time column `[from, to)`.
+#[derive(Debug, PartialEq)]
+pub(crate) enum LeadSlice {
+    Values(String, Option<String>),
+    Within(String, i64, Option<i64>),
+}
+
+/// Row-balanced, contiguous slices over `counts` — `(value, rows, min_ts, max_ts)` per lead
+/// value, ascending — that together cover every row exactly once. A value's rows stay in one
+/// slice unless it alone outweighs a slice, so all versions of a key (which share the lead
+/// value) are sorted together.
+pub(crate) fn lead_value_slices(counts: &[(String, u64, i64, i64)], want: usize) -> Vec<LeadSlice> {
+    let budget = counts.iter().map(|c| c.1).sum::<u64>().div_ceil(want.max(1) as u64).max(1);
+    // A fold would thread three accumulators through every step; the loop reads plainer.
+    let (mut out, mut open, mut rows_open) = (Vec::new(), None::<&str>, 0u64);
+    for (i, (value, rows, lo, hi)) in counts.iter().enumerate() {
+        if *rows > budget {
+            out.extend(open.take().map(|from| LeadSlice::Values(from.to_string(), Some(value.clone()))));
+            rows_open = 0;
+            let pieces = usize::try_from(rows.div_ceil(budget)).map_or(want, |pieces| pieces.min(want));
+            out.extend(repair_slice_bounds(*lo, *hi, pieces).into_iter().map(|(from, to)| LeadSlice::Within(value.clone(), from, to)));
+            continue;
+        }
+        let from = *open.get_or_insert(value.as_str());
+        rows_open += rows;
+        if rows_open >= budget {
+            out.push(LeadSlice::Values(from.to_string(), counts.get(i + 1).map(|next| next.0.clone())));
+            (open, rows_open) = (None, 0);
+        }
+    }
+    out.extend(open.map(|from| LeadSlice::Values(from.to_string(), None)));
+    out
+}
+
 /// Turn interior cut points into the same half-open, ascending tiling
 /// `repair_slice_bounds` produces: `[lo, c1), [c1, c2), ... [cn, +inf)`.
 fn repair_bounds_from_cuts(lo: i64, hi: i64, cuts: &[i64]) -> Vec<(i64, Option<i64>)> {

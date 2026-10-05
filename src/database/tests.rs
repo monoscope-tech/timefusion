@@ -7909,6 +7909,79 @@ async fn only_a_string_led_table_plans_by_layout(table: &str) -> bool {
     super::ProjectRoutingTable::new("p".into(), db, schema, None, table.to_string()).sort_led_by_time()
 }
 
+proptest::proptest! {
+    /// Every (value, timestamp) of a bin falls in exactly one string-lead slice.
+    #[test]
+    fn lead_value_slices_cover_every_row_once(
+        rows in proptest::collection::vec((1..50u64, 0..1_000i64, 0..1_000i64), 1..12),
+        want in 1..8usize,
+    ) {
+        let counts: Vec<(String, u64, i64, i64)> = rows.iter().enumerate().map(|(i, &(n, a, b))| (format!("m{i:02}"), n, a.min(b), a.max(b))).collect();
+        let slices = super::lead_value_slices(&counts, want);
+        let holds = |slice: &super::LeadSlice, value: &str, ts: i64| match slice {
+            super::LeadSlice::Values(from, to) => value >= from.as_str() && to.as_deref().is_none_or(|to| value < to),
+            super::LeadSlice::Within(v, from, to) => v == value && ts >= *from && to.is_none_or(|to| ts < to),
+        };
+        for (value, _, lo, hi) in &counts {
+            for ts in [*lo, (lo + hi) / 2, *hi] {
+                proptest::prop_assert_eq!(slices.iter().filter(|slice| holds(slice, value, ts)).count(), 1, "{} at {} in {:?}", value, ts, slices);
+            }
+        }
+    }
+}
+
+/// Packing a bin led by a string column sorts it slice by slice; concatenated in order, the
+/// slices must equal one sort of the whole bin — every row once, in the schema's order, with a
+/// dominant value cut on time.
+#[test_case::test_case(7 ; "a dominant value among others")]
+#[test_case::test_case(1 ; "one value only, which must still be cut")]
+#[tokio::test]
+async fn a_string_led_bin_packs_in_slices_that_concatenate_sorted(distinct: usize) -> Result<()> {
+    use datafusion::{datasource::MemTable, prelude::SessionContext};
+    let schema = get_schema("mor_metric_first").expect("fixture");
+    let metrics: Vec<String> = (0..600).map(|i| if i < 400 { "m0".to_string() } else { format!("m{}", i % distinct) }).collect();
+    let ts = arrow::array::TimestampMicrosecondArray::from_iter_values((0..600).map(|i| (i * 7919 % 600) as i64 * 1_000_000)).with_timezone("UTC");
+    let ids: Vec<String> = (0..600).map(|i| format!("k{i}")).collect();
+    let arrow_schema = Arc::new(arrow_schema::Schema::new(vec![
+        arrow_schema::Field::new("metric", arrow_schema::DataType::Utf8, false),
+        arrow_schema::Field::new("timestamp", ts.data_type().clone(), false),
+        arrow_schema::Field::new("id", arrow_schema::DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&arrow_schema),
+        vec![Arc::new(arrow::array::StringArray::from(metrics)), Arc::new(ts), Arc::new(arrow::array::StringArray::from(ids))],
+    )?;
+    let ctx = SessionContext::new();
+    ctx.register_table("bin", Arc::new(MemTable::try_new(arrow_schema, vec![vec![batch]])?))?;
+    let clauses = super::maintain::lead_value_slice_clauses(&ctx, "bin", "metric", schema, 4).await;
+    assert!(
+        clauses.len() >= 4 && clauses.iter().filter(|c| c.contains("\"metric\" = 'm0'")).count() > 1,
+        "m0 outweighs a slice and is cut on time: {clauses:#?}"
+    );
+    let order = " ORDER BY metric ASC, timestamp DESC, id ASC";
+    let show = |batches: Vec<RecordBatch>| {
+        batches
+            .iter()
+            .map(|b| {
+                datafusion::arrow::util::pretty::pretty_format_batches(std::slice::from_ref(b))
+                    .expect("fmt")
+                    .to_string()
+                    .lines()
+                    .filter(|l| l.starts_with("| "))
+                    .skip(1)
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .concat()
+    };
+    let mut sliced = Vec::new();
+    for clause in &clauses {
+        sliced.extend(show(ctx.sql(&format!("SELECT * FROM bin{clause}{order}")).await?.collect().await?));
+    }
+    assert_eq!(sliced, show(ctx.sql(&format!("SELECT * FROM bin{order}")).await?.collect().await?), "slices concatenate to one sort of the bin");
+    Ok(())
+}
+
 fn add_action(path: &str) -> deltalake::kernel::Action {
     deltalake::kernel::Action::Add(deltalake::kernel::Add { path: path.to_string(), size: 1, ..Default::default() })
 }

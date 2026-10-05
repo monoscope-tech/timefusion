@@ -8397,8 +8397,15 @@ impl Database {
             // footer ordering carries the ORDER BY, so it is never re-cut like an L0 file.
             let slice_target = if dv_strip { None } else { coordinator_slice_target(pass, targets.len(), bytes_in) };
             let slice_col = lead.filter(|_| sorted).and_then(|c| slice_target.map(|target| (c.name.clone(), target)));
+            let lead_type = match &slice_col {
+                Some((col, _)) => ctx.table_provider(bin_table.as_str()).await.ok().and_then(|p| p.schema().field_with_name(col).ok().map(|f| f.data_type().clone())),
+                None => None,
+            };
             let slices: Vec<String> = match slice_col {
                 None => Vec::new(),
+                Some((col, target)) if lead_type.as_ref().is_some_and(|ty| matches!(ty, arrow_schema::DataType::Utf8 | arrow_schema::DataType::Utf8View | arrow_schema::DataType::LargeUtf8)) => {
+                    lead_value_slice_clauses(&ctx, &bin_table, &col, schema, repair_slice_want(bytes_in, target)).await
+                }
                 Some((col, target)) => {
                     // DECODED bytes on both sides; sizing in compressed bytes
                     // oversizes every slice by the compression ratio.
@@ -8410,11 +8417,7 @@ impl Database {
                     // timestamp, and DataFusion will not coerce a bare integer.
                     // `{:?}` on the Arrow type is `arrow_cast`'s type syntax; no
                     // type in hand means decline slicing.
-                    let cast_ty = ctx
-                        .table_provider(bin_table.as_str())
-                        .await
-                        .ok()
-                        .and_then(|p| p.schema().field_with_name(&col).ok().map(|f| format!("{:?}", f.data_type())));
+                    let cast_ty = lead_type.as_ref().map(|ty| format!("{ty:?}"));
                     match (want > 1).then_some(()).and(cast_ty).zip(bin_time_range(&ctx, &probe).await) {
                         Some((ty, (lo, hi))) if hi > lo => {
                             // Equal-ROW cuts where they can be had; the equal-TIME
@@ -10259,6 +10262,76 @@ impl Database {
 /// Append newline-terminated records to a maintenance state file, creating its parent
 /// directory if needed. Callers must hold the file's lock and wrap this in
 /// `without_blocking_the_worker`; these files are cleanup aids, never correctness boundaries.
+/// `WHERE` clauses slicing a bin whose sort leads with the string column `col`, in the
+/// schema's sort order so one writer's concatenation stays sorted ([`lead_value_slices`]).
+/// Empty — unsliced — when slicing cannot help or the probe fails, and when any row has a NULL
+/// lead, which would fall outside every range.
+pub(super) async fn lead_value_slice_clauses(
+    ctx: &datafusion::prelude::SessionContext, bin_table: &str, col: &str, schema: &crate::schema::TableSchema, want: usize,
+) -> Vec<String> {
+    use arrow::array::{AsArray, Int64Array};
+    let time = schema.time_column_name();
+    let time_desc = schema.sorting_columns.iter().find(|c| c.name == time).is_some_and(|c| c.descending);
+    let lead_desc = schema.sorting_columns.first().is_some_and(|c| c.descending);
+    let probe = format!(
+        "SELECT CAST(\"{col}\" AS VARCHAR) AS v, count(*) AS n, min(arrow_cast(\"{time}\", 'Int64')) AS lo, max(arrow_cast(\"{time}\", 'Int64')) AS hi \
+         FROM {bin_table} GROUP BY 1 ORDER BY 1"
+    );
+    let Ok(batches) = async { ctx.sql(&probe).await?.collect().await }.await else { return Vec::new() };
+    let counts: Option<Vec<(String, u64, i64, i64)>> = batches
+        .iter()
+        .flat_map(|batch| {
+            let cast = |i: usize, ty: &arrow_schema::DataType| arrow::compute::cast(batch.column(i), ty).ok();
+            let values = cast(0, &arrow_schema::DataType::Utf8);
+            let ints: Vec<_> = (1..4).map(|i| cast(i, &arrow_schema::DataType::Int64)).collect();
+            (0..batch.num_rows()).map(move |row| {
+                let int = |i: usize| ints[i].as_ref()?.as_any().downcast_ref::<Int64Array>().filter(|a| a.is_valid(row)).map(|a| a.value(row));
+                let value = values.as_ref().filter(|a| a.is_valid(row)).map(|a| a.as_string::<i32>().value(row).to_string());
+                Some((value?, u64::try_from(int(0)?).ok()?, int(1)?, int(2)?))
+            })
+        })
+        .collect();
+    let Some(counts) = counts.filter(|counts| want > 1 && !counts.is_empty()) else { return Vec::new() };
+    let Some(time_type) = ctx.table_provider(bin_table).await.ok().and_then(|p| p.schema().field_with_name(time).ok().map(|f| format!("{:?}", f.data_type())))
+    else {
+        return Vec::new();
+    };
+    let text = |v: &str| format!("'{}'", v.replace('\'', "''"));
+    let at = |micros: i64| format!("arrow_cast({micros}, '{time_type}')");
+    let mut groups: Vec<Vec<String>> = lead_value_slices(&counts, want)
+        .into_iter()
+        .chunk_by(|slice| match slice {
+            LeadSlice::Within(value, ..) => Some(value.clone()),
+            LeadSlice::Values(..) => None,
+        })
+        .into_iter()
+        .flat_map(|(within, slices)| {
+            let clauses: Vec<String> = slices
+                .map(|slice| match slice {
+                    LeadSlice::Values(from, to) => {
+                        format!(" WHERE \"{col}\" >= {}{}", text(&from), to.map_or_else(String::new, |to| format!(" AND \"{col}\" < {}", text(&to))))
+                    }
+                    LeadSlice::Within(value, from, to) => format!(
+                        " WHERE \"{col}\" = {} AND \"{time}\" >= {}{}",
+                        text(&value),
+                        at(from),
+                        to.map_or_else(String::new, |to| format!(" AND \"{time}\" < {}", at(to)))
+                    ),
+                })
+                .collect();
+            match within {
+                // One heavy value's time cuts are one group, ordered by the time column.
+                Some(_) => vec![if time_desc { clauses.into_iter().rev().collect() } else { clauses }],
+                None => clauses.into_iter().map(|clause| vec![clause]).collect(),
+            }
+        })
+        .collect();
+    if lead_desc {
+        groups.reverse();
+    }
+    groups.into_iter().flatten().collect()
+}
+
 /// The header stamping `repair_verified_sorted.txt` with every table's declared sort order.
 /// A path is only "verified" against the order it was checked under, and a schema change
 /// arrives only with a new build, so a file stamped with any other header is discarded at

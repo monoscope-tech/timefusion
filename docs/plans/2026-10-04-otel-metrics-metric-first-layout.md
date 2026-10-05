@@ -232,7 +232,7 @@ Tests:
   fixture `mor_metric_first`). Red without the split, and red with the schema's requirement on the old run.
 - `only_a_string_led_table_plans_by_layout`: logs and (pre-flip) metrics stay on the old path.
 
-### Stage 2c — bounded packing for a non-time leading sort column
+### Stage 2c — bounded packing for a non-time leading sort column  ✅ implemented
 
 Prerequisite to the flip. Generalise slicing so it does not need an `i64` lead:
 
@@ -242,13 +242,18 @@ Prerequisite to the flip. Generalise slicing so it does not need an `i64` lead:
   concatenation stays globally sorted and the footer honest.
 - A single lead value larger than one slice (the 4.5M-row k6 metrics) is cut further on the next sort column
   (`timestamp`, still i64) within that value.
-- Until that exists, give the tail packer a row cap whenever slicing declines, so a declined slice can never
-  mean an unbounded sort.
+- ~~Until that exists, give the tail packer a row cap whenever slicing declines.~~ Not built: slicing exists, and
+  its remaining declines (a failed probe, a NULL lead — `metric_name` is non-null) are exactly the timestamp
+  slicer's.
+- As built: `lead_value_slices` (pure; row-balanced ranges of whole values, a value heavier than a range cut on
+  time) and `lead_value_slice_clauses` (one grouped probe, clauses in the schema's order). A bin of ONE value
+  is cut on time too — declining there was the unbounded sort this stage removes.
 
 Tests:
-- A bin whose decoded size exceeds the sort budget, led by a string column with one dominant value: packs in
-  bounded slices (assert the slice count / per-slice rows), output rows == input rows, footer ordering honest
-  (re-read and verify monotone).
+- `lead_value_slices_cover_every_row_once` (proptest): every (value, timestamp) falls in exactly one slice.
+- `a_string_led_bin_packs_in_slices_that_concatenate_sorted` (a dominant value among others; one value only):
+  the slices, sorted one by one and concatenated, equal one sort of the whole bin. Red with the time cuts in
+  the wrong direction, and red if a one-value bin declines.
 
 ### Stage 3 — flip the schema
 
