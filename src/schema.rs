@@ -464,6 +464,14 @@ impl TableSchema {
         self.partitions.iter().map(String::as_str).collect()
     }
 
+    /// Whether the sort leads with an i64-backed column (timestamp-first), as every table did
+    /// before `otel_metrics` went metric-first; such a table keeps the timestamp-bounded paths.
+    pub fn sorts_by_time(&self) -> bool {
+        self.sorting_columns.first().is_none_or(|lead| {
+            self.schema_ref().field_with_name(&lead.name).is_ok_and(|f| matches!(f.data_type(), ArrowDataType::Int64 | ArrowDataType::Timestamp(..)))
+        })
+    }
+
     pub fn sorting_columns(&self) -> Vec<SortingColumn> {
         // `SortingColumn.column_idx` indexes physical parquet LEAVES among the
         // NON-partition fields (partition columns live in the path, not the

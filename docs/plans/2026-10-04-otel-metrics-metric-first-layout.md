@@ -326,6 +326,13 @@ Flip deployed 10-05 01:06 UTC (`da434b55`, image `356ec50`). At +42 min: full-se
 Live files: today 53/53 metric-first (hot packing already rewrote the old ones); sealed days 09-29..10-04
 about half migrated. **+1 h gate: go.**
 
++1.5 h: migration stalled for the largest tenants (demo, whale): their units retried thousands of times on
+`repair_budget_busy` / `admission_busy` with no completion. Repair takes non-waiting byte permits priced by the
+whole file's decoded size, clamped to the WHOLE budget — so a file larger than the budget can start only when
+no other repair holds a MiB, which a queue of small repairs never allows. Fix: a string-led table's repair is
+sliced to half the budget (`lead_value_slice_clauses`) and priced by one slice (`repair_permit_mib`); each slice
+re-reads the old file, since metric ranges cannot prune a timestamp-first file.
+
 Success criteria (prod, process ≥10 min old, ≥3 runs, alternate arms):
 - Demo 24h web vitals: rows read ≥10× lower than 44.7M; wall time reported before/after.
 - No increase in `dedup_full_set_total` for `otel_metrics` reads.

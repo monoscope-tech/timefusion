@@ -838,10 +838,7 @@ impl ProjectRoutingTable {
     /// Whether the table's sort leads with an i64-backed column, as every table did before
     /// `otel_metrics` went metric-first; such a table plans exactly as it always has.
     pub(super) fn sort_led_by_time(&self) -> bool {
-        use datafusion::arrow::datatypes::DataType;
-        crate::schema::get_schema(&self.table_name)
-            .and_then(|schema| self.schema.field_with_name(&schema.sorting_columns.first()?.name).ok())
-            .is_none_or(|lead| matches!(lead.data_type(), DataType::Int64 | DataType::Timestamp(..)))
+        crate::schema::get_schema(&self.table_name).is_none_or(crate::schema::TableSchema::sorts_by_time)
     }
 
     /// The scan proper: one plan over the whole window. `scan` calls it directly, or once per

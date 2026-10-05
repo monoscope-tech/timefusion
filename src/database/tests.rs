@@ -7892,6 +7892,18 @@ async fn a_metric_filter_prunes_the_row_groups_of_other_metrics() -> Result<()> 
     Ok(())
 }
 
+/// A repair takes permits for what its sort holds at once. Unsliced, a bin larger than the budget
+/// takes all of it (so it waits for an empty lane, which a queue of small repairs never leaves);
+/// a sliced string-led repair takes one slice. Guards the pricing decision only: the budget is a
+/// constant no fixture file can exceed, so the semaphore race itself is not reproduced here.
+#[test_case::test_case(10 << 30, 4096, None => 4096 ; "a whole-file sort larger than the budget takes it all")]
+#[test_case::test_case(10 << 30, 4096, Some(2048 << 20) => 2048 ; "a sliced repair takes one slice")]
+#[test_case::test_case(100 << 20, 4096, Some(2048 << 20) => 100 ; "a bin smaller than a slice takes its own size")]
+#[test_case::test_case(1, 4096, None => 1 ; "never zero")]
+fn repair_permits_price_what_the_sort_holds(decoded: u64, budget_mib: usize, slice: Option<i64>) -> u32 {
+    super::maintain::repair_permit_mib(decoded, budget_mib, slice)
+}
+
 /// A day written under an earlier sort order is migrated by repair and then left alone: one
 /// unit rewrites it so every footer declares the schema's order, and the next finds nothing.
 #[tokio::test(flavor = "multi_thread")]

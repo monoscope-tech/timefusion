@@ -8279,6 +8279,13 @@ impl Database {
         } else {
             None
         };
+        // A string-led table's repair re-sorts a whole file written in another order, so no
+        // bound narrows it; sliced, each pass sorts half the repair budget and is priced by it.
+        // Unsliced, a file larger than the budget waited for the WHOLE budget to be free, which
+        // a queue of smaller repairs never allows (after the otel_metrics flip the largest
+        // tenants' days never started).
+        let string_led_repair_slice = (pass == TailPass::Repair && !schema.sorts_by_time())
+            .then(|| i64::try_from(self.config.derived.repair_rewrite_budget_bytes() / 2).unwrap_or(i64::MAX));
         let _light_permit = match light_permit {
             Some(permit) => permit,
             // Repair queues on its OWN one-permit semaphore: its bins are whole
@@ -8290,9 +8297,7 @@ impl Database {
                 // Priced in decoded MiB, CLAMPED to the whole budget so a bin
                 // larger than the budget still takes everything and runs alone.
                 let budget_mib = self.config.derived.repair_rewrite_budget_mib();
-                let want_mib = u32::try_from(estimated_decoded_bytes(targets.iter().map(|a| a.size).sum::<i64>()) / (1024 * 1024))
-                    .unwrap_or(u32::MAX)
-                    .clamp(1, u32::try_from(budget_mib).unwrap_or(u32::MAX));
+                let want_mib = repair_permit_mib(estimated_decoded_bytes(targets.iter().map(|a| a.size).sum::<i64>()), budget_mib, string_led_repair_slice);
                 let Ok(permit) = Arc::clone(&self.repair_rewrite_sem).try_acquire_many_owned(want_mib) else {
                     crate::observability::maintenance_stats().compaction_permits_unavailable.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     info!(
@@ -8395,7 +8400,7 @@ impl Database {
             let lead = schema.sorting_columns.first();
             // A lone SORTED DV file is a strip: an order-preserving filter copy whose
             // footer ordering carries the ORDER BY, so it is never re-cut like an L0 file.
-            let slice_target = if dv_strip { None } else { coordinator_slice_target(pass, targets.len(), bytes_in) };
+            let slice_target = if dv_strip { None } else { coordinator_slice_target(pass, targets.len(), bytes_in).or(string_led_repair_slice) };
             let slice_col = lead.filter(|_| sorted).and_then(|c| slice_target.map(|target| (c.name.clone(), target)));
             let lead_type = match &slice_col {
                 Some((col, _)) => ctx.table_provider(bin_table.as_str()).await.ok().and_then(|p| p.schema().field_with_name(col).ok().map(|f| f.data_type().clone())),
@@ -10262,6 +10267,13 @@ impl Database {
 /// Append newline-terminated records to a maintenance state file, creating its parent
 /// directory if needed. Callers must hold the file's lock and wrap this in
 /// `without_blocking_the_worker`; these files are cleanup aids, never correctness boundaries.
+/// Repair permits (decoded MiB) a bin takes: what its sort holds at once — one slice when
+/// sliced — clamped to the whole budget so an unsliced bin larger than it still runs alone.
+pub(crate) fn repair_permit_mib(decoded: u64, budget_mib: usize, slice: Option<i64>) -> u32 {
+    let held = slice.map_or(decoded, |slice| decoded.min(slice.unsigned_abs()));
+    u32::try_from(held / (1024 * 1024)).unwrap_or(u32::MAX).clamp(1, u32::try_from(budget_mib).unwrap_or(u32::MAX))
+}
+
 /// `WHERE` clauses slicing a bin whose sort leads with the string column `col`, in the
 /// schema's sort order so one writer's concatenation stays sorted ([`lead_value_slices`]).
 /// Empty — unsliced — when slicing cannot help or the probe fails, and when any row has a NULL
