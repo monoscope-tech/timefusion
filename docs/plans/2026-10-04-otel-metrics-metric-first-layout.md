@@ -320,6 +320,12 @@ Baseline before the flip (10-05 ~00:55 UTC, process 18 min old after the counter
 - Demo 24h web vitals (`count(*)`, 5 `browser.web_vital.*` names): 65.0 s, 459 MB scanned, row groups
   192 of 202 kept by statistics (5% pruned), ~60k rows.
 
+Flip deployed 10-05 01:06 UTC (`da434b55`, image `356ec50`). At +42 min: full-set dedup 2 of 6,755 (0.03%);
+0 `OrderingViolation`, 0 `ordering_repair_declined` on `otel_metrics`, 0 dedup 2 GiB errors; every
+`Resources exhausted` (51) was a repair unit's sort, retried — none from a query. `pending_repair` 345 → 217.
+Live files: today 53/53 metric-first (hot packing already rewrote the old ones); sealed days 09-29..10-04
+about half migrated. **+1 h gate: go.**
+
 Success criteria (prod, process ≥10 min old, ≥3 runs, alternate arms):
 - Demo 24h web vitals: rows read ≥10× lower than 44.7M; wall time reported before/after.
 - No increase in `dedup_full_set_total` for `otel_metrics` reads.
