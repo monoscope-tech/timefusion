@@ -339,6 +339,14 @@ as the baseline: **65.0 s → 3.06 s cold / 0.28 s warm; 459 MB → 70.8 MB scan
 rows decoded 44.7M → 6.69M (6.7×)**, dedup `bounded[metric_name, …]`. The remainder is row groups shared with
 other metrics, including 10-04's last timestamp-first file.
 
++8.5 h (09:40 UTC), 10-04 fully migrated — **success criterion met.** Demo 24h web vitals: row groups 17 of 224,
+pages 18 of 265 (page index), rows decoded 368K (60K matched) vs 44.7M before = **~120×**; 459 MB → 2.3 MB
+scanned (200×); 0.85 s. The +3.5 h shortfall was the one unmigrated 10-04 file, not row-group granularity:
+page-level pruning was already on (`enable_page_index`, `EnabledStatistics::Page` on sort keys, 20k-row pages —
+the same shape as Iceberg's defaults: 128 MB row groups, page cap 20k rows). No row-group change needed.
+One-day A/B, migrated 10-03 vs old 09-25: web vitals 4/168 vs 179/179 row groups, 0.93 MB vs 459 MB, 155 ms vs
+0.5-16 s (cache-dependent); one heavy metric 9.3 MB vs 410 MB.
+
 Success criteria (prod, process ≥10 min old, ≥3 runs, alternate arms):
 - Demo 24h web vitals: rows read ≥10× lower than 44.7M; wall time reported before/after.
 - No increase in `dedup_full_set_total` for `otel_metrics` reads.
