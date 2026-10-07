@@ -2115,10 +2115,8 @@ mod tests {
     fn fd_path(fd: i32) -> Option<PathBuf> {
         let mut buf = [0u8; libc::PATH_MAX as usize];
         // SAFETY: F_GETPATH writes at most PATH_MAX bytes into `buf`.
-        if unsafe { libc::fcntl(fd, libc::F_GETPATH, buf.as_mut_ptr()) } != 0 {
-            return None;
-        }
-        Some(PathBuf::from(std::ffi::CStr::from_bytes_until_nul(&buf).ok()?.to_str().ok()?))
+        (unsafe { libc::fcntl(fd, libc::F_GETPATH, buf.as_mut_ptr()) } == 0).then_some(())?;
+        std::ffi::CStr::from_bytes_until_nul(&buf).ok()?.to_str().ok().map(PathBuf::from)
     }
 
     /// The alertable count must include BOTH the flat `quarantine/*.bin` WAL

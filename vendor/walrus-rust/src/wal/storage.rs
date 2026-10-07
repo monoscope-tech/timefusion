@@ -196,7 +196,7 @@ impl SharedMmapKeeper {
     }
 
     fn poisoned() -> std::io::Error {
-        std::io::Error::new(std::io::ErrorKind::Other, "mmap keeper lock poisoned")
+        std::io::Error::other("mmap keeper lock poisoned")
     }
 
     /// The cached handle, never opening one: fsync must not resurrect a file
