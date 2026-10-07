@@ -250,9 +250,9 @@ impl Writer {
         let mut ring = io_uring::IoUring::new(ring_size).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("io_uring init failed: {}", e)))?;
         let mut buffers: Vec<Vec<u8>> = Vec::new();
         // Kept until submit_and_wait returns: the raw fds handed to the kernel must stay open.
-        let mut handles = Vec::with_capacity(write_plan.len());
+        let handles = write_plan.iter().map(|(blk, ..)| blk.mmap()).collect::<std::io::Result<Vec<_>>>()?;
 
-        for (blk, offset, data_idx) in write_plan.iter() {
+        for ((blk, offset, data_idx), mmap) in write_plan.iter().zip(&handles) {
             let data = batch[*data_idx];
             let next_block_start = blk.offset + blk.limit;
 
@@ -274,7 +274,6 @@ impl Writer {
             let file_offset = blk.offset + offset;
 
             // Get raw FD
-            let mmap = blk.mmap()?;
             let fd = if let Some(fd_backend) = mmap.storage().as_fd() {
                 io_uring::types::Fd(fd_backend.file().as_raw_fd())
             } else {
@@ -289,7 +288,6 @@ impl Writer {
             let write_op = io_uring::opcode::Write::new(fd, combined.as_ptr(), combined.len() as u32).offset(file_offset).build().user_data(*data_idx as u64);
 
             buffers.push(combined);
-            handles.push(mmap);
 
             unsafe {
                 ring.submission().push(&write_op).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("io_uring push failed: {}", e)))?;
