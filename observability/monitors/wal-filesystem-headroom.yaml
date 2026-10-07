@@ -1,0 +1,18 @@
+title: 'TF page: WAL filesystem running out of space'
+query: 'metrics | where metric_name == "timefusion.wal.filesystem_free_pct" | summarize last(value)'
+alert_threshold: 5
+warning_threshold: 10
+alert_recovery_threshold: 8
+warning_recovery_threshold: 12
+trigger_less_than: true
+check_interval_mins: 5
+time_window_mins: 15
+threshold_sustained_for_mins: 5
+severity: error
+message: 'Restore filesystem headroom by reclaiming verified disposable data or expanding storage. Inspect allocated WAL bytes and the oldest retention pin. Preserve unflushed WAL.'
+emails: [anthony@talstack.com]
+slack_channels: []
+teams: []
+visualization_type: numeric
+# Activate after the metric is deployed and live samples are verified.
+active: false

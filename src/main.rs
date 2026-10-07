@@ -454,7 +454,7 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
     // coordination: two live processes on one dir fork it and silently lose the
     // older process's appends. Blocks until the previous process releases the
     // flock; held for the whole process lifetime and released even on SIGKILL.
-    let _wal_dir_lock = timefusion::write::wal::WalDirLock::acquire(&cfg.core.wal_dir()).await?;
+    let wal_dir_lock = Arc::new(timefusion::write::wal::WalDirLock::acquire(&cfg.core.wal_dir()).await?);
 
     let t_db = std::time::Instant::now();
     let mut db = Database::with_config(Arc::clone(&cfg_arc)).await?;
@@ -468,8 +468,8 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
     );
 
     let db_for_callback = db.clone();
-    let delta_write_callback: timefusion::write::DeltaWriteCallback =
-        Arc::new(move |project_id: String, table_name: String, batches: Vec<arrow::array::RecordBatch>, wal_watermark: timefusion::write::DeltaWatermark| {
+    let delta_write_callback: timefusion::write::DeltaWriteCallback = Arc::new(
+        move |project_id: String, table_name: String, batches: Vec<arrow::array::RecordBatch>, wal_watermark: timefusion::write::FlushCommitContext| {
             let db = db_for_callback.clone();
             Box::pin(async move {
                 // Returns the URIs newly added by this commit; the watermark goes
@@ -482,7 +482,8 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
                 db.mark_delta_has_files(&project_id, &table_name);
                 Ok(added)
             })
-        });
+        },
+    );
 
     // Register UDFs up front so this context's FunctionRegistry doubles as the
     // WAL-replay registry. Table providers depend on buffered_layer and are
@@ -495,7 +496,7 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
     timefusion::write::wal::boot_wal_gc(&cfg.core.wal_dir());
 
     let t_layer = std::time::Instant::now();
-    let mut layer = BufferedWriteLayer::with_config(cfg_arc.clone(), registry)?.with_delta_writer(delta_write_callback);
+    let mut layer = BufferedWriteLayer::with_config(cfg_arc.clone(), registry)?.with_delta_writer(delta_write_callback).with_wal_dir_lock(wal_dir_lock.clone());
     info!("bootstrap.phase=buffered_write_layer_init elapsed_ms={}", t_layer.elapsed().as_millis());
     let indexed_tables = cfg.tantivy.indexed_tables();
     let bucket = cfg.aws.aws_s3_bucket.as_deref().unwrap_or_default();
@@ -581,6 +582,7 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
         "bootstrap.phase=cursor_snapshot skip_delta_scan={skip_delta_scan} clean_snapshot={clean_snapshot} local_wal_consumed={local_wal_consumed} elapsed_ms={}",
         t_snap.elapsed().as_millis()
     );
+    db.reconcile_flush_publications(buffered_layer.as_ref()).await?;
     if skip_delta_scan {
         info!(
             "Skipping Delta-derived cursor reconciliation ({})",
@@ -765,7 +767,7 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
 
     info!("Shutdown complete.");
     // Do NOT synchronously flush OTLP here: its exporter has a 10s network
-    // timeout, and `_wal_dir_lock` is held until this future returns, so the
+    // timeout, and `wal_dir_lock` is held until this future returns, so the
     // replacement would wait that long for the WAL. Losing the final telemetry
     // batch is cheaper than extending the outage.
 

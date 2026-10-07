@@ -595,9 +595,9 @@ pub fn max_concurrent_heavy_sorts(partitions: usize, pool_bytes: usize) -> usize
     (pool_bytes / (per_sort * RESERVATION_POOL_SHARE)).max(MIN_CONCURRENT_HEAVY_SORTS)
 }
 
-/// A floor so a small box still admits a useful degree of concurrency rather than
-/// serializing every heavy query.
-const MIN_CONCURRENT_HEAVY_SORTS: usize = 4;
+/// Always allow one heavy query to make progress. A concurrency floor above one
+/// can exceed the pool on small hosts or wide physical plans.
+const MIN_CONCURRENT_HEAVY_SORTS: usize = 1;
 
 /// The number the whole tree derives from: the detected limit, LOWERED by an
 /// operator request — budgeting above the cgroup is never valid, so an
@@ -1419,7 +1419,7 @@ pub struct BufferConfig {
     // commits / small files for shorter startup.
     #[serde_inline_default(60)]
     pub timefusion_flush_interval_secs: u64,
-    // Flush dwell: a sealed-but-young bucket waits this long from CREATION before
+    // Flush dwell: a sealed or future bucket waits this long from CREATION before
     // the periodic flush commits it, unless it is already big. -1 = one
     // bucket_duration, 0 = off. See flush_completed_buckets.
     #[serde_inline_default(-1)]
@@ -2724,13 +2724,16 @@ mod tests {
     /// K is derived from pool geometry, NOT from any client count — the invariant
     /// that stops a monoscope pool bump from silently starving each sort's merge
     /// reservation. On prod's 8 partitions x 22 GB pool it admits ~20 concurrent
-    /// heavy sorts, and NEVER fewer than the floor.
+    /// heavy sorts, while a small pool serializes them instead of over-admitting.
     #[test]
     fn heavy_sort_admission_is_derived_from_the_pool_not_the_clients() {
         assert_eq!(max_concurrent_heavy_sorts(8, 22 * GIB), 22 * GIB / (DEFAULT_SORT_SPILL_RESERVATION_BYTES * 8 * RESERVATION_POOL_SHARE));
         assert!(max_concurrent_heavy_sorts(8, 22 * GIB) >= 20, "prod geometry admits a useful degree of concurrency");
-        // A tiny pool still admits the floor rather than serializing everything.
-        assert_eq!(max_concurrent_heavy_sorts(48, 512 * MIB), MIN_CONCURRENT_HEAVY_SORTS);
+        let (partitions, pool) = (48, 512 * MIB);
+        let concurrent = max_concurrent_heavy_sorts(partitions, pool);
+        let reservation = sort_spill_reservation_bytes(None, partitions, pool, concurrent);
+        assert_eq!(concurrent, 1);
+        assert!(concurrent * partitions * reservation < pool, "admitted merge reservations must leave room for rows");
     }
 
     /// The hygiene gate is what stands between "use all the memory" and an OOM,
@@ -3444,6 +3447,11 @@ fn available_disk_for(path: &std::path::Path) -> Option<usize> {
         .filter(|d| canonical.starts_with(d.mount_point()))
         .max_by_key(|d| d.mount_point().as_os_str().len())
         .map(|d| (d.available_space() / GIB as u64) as usize)
+}
+
+/// Total and available bytes on the filesystem hosting `path`, including bind mounts.
+pub(crate) fn disk_space_for(path: &std::path::Path) -> Option<(u64, u64)> {
+    fs4::statvfs(path).ok().map(|stats| (stats.total_space(), stats.available_space()))
 }
 
 #[cfg(test)]

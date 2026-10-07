@@ -5,6 +5,122 @@ use super::*;
 /// Shared OCC retry budget for the staged and merge commit loops.
 const MAX_COMMIT_RETRIES: u32 = 5;
 
+pub(super) const FLUSH_COMMIT_ID_KEY: &str = "timefusion.flush_commit_id";
+
+/// Observe the publication boundary of WriteBuilder, whose upload and commit
+/// errors otherwise have the same type. Confirm an accepted request retry
+/// before Delta's OCC loop can republish the same flush at another version.
+pub(super) struct FlushPublication {
+    inner: deltalake::logstore::LogStoreRef,
+    version: parking_lot::Mutex<Option<deltalake::kernel::Version>>,
+    journal: Option<(Arc<crate::write::wal::FlushPublicationJournal>, crate::write::wal::FlushPublicationTarget)>,
+}
+
+impl FlushPublication {
+    pub(super) fn new(inner: deltalake::logstore::LogStoreRef) -> Self {
+        Self { inner, version: parking_lot::Mutex::new(None), journal: None }
+    }
+
+    fn with_journal(mut self, journal: Option<Arc<crate::write::wal::FlushPublicationJournal>>, table_id: &str) -> Self {
+        self.journal = journal.map(|journal| {
+            (
+                journal,
+                crate::write::wal::FlushPublicationTarget {
+                    table_uri: self.inner.root_url().to_string(),
+                    table_id: table_id.to_owned(),
+                    log_store_name: Some(self.inner.name()),
+                },
+            )
+        });
+        self
+    }
+
+    pub(super) fn version(&self) -> Option<deltalake::kernel::Version> {
+        *self.version.lock()
+    }
+}
+
+#[async_trait]
+impl deltalake::logstore::LogStore for FlushPublication {
+    fn name(&self) -> String {
+        self.inner.name()
+    }
+
+    async fn refresh(&self) -> deltalake::DeltaResult<()> {
+        self.inner.refresh().await
+    }
+
+    async fn read_commit_entry(&self, version: deltalake::kernel::Version) -> deltalake::DeltaResult<Option<bytes::Bytes>> {
+        self.inner.read_commit_entry(version).await
+    }
+
+    async fn write_commit_entry(
+        &self, version: deltalake::kernel::Version, commit: deltalake::logstore::CommitOrBytes, operation_id: uuid::Uuid,
+    ) -> std::result::Result<(), deltalake::kernel::transaction::TransactionError> {
+        if let Some((journal, target)) = &self.journal {
+            let payload = match &commit {
+                deltalake::logstore::CommitOrBytes::LogBytes(bytes) => Some(bytes.as_ref()),
+                deltalake::logstore::CommitOrBytes::TmpCommit(_) => None,
+            };
+            journal.record_version(version, target.clone(), payload).map_err(|source| deltalake::kernel::transaction::TransactionError::LogStoreError {
+                msg: "could not persist flush publication version".to_owned(),
+                source: Box::new(source),
+            })?;
+        }
+        *self.version.lock() = Some(version);
+        let payload = match &commit {
+            deltalake::logstore::CommitOrBytes::LogBytes(bytes) if self.journal.is_some() => Some(bytes.clone()),
+            _ => None,
+        };
+        let result = self.inner.write_commit_entry(version, commit, operation_id).await;
+        if matches!(&result, Err(deltalake::kernel::transaction::TransactionError::VersionAlreadyExists(_)))
+            && let Some(payload) = payload
+        {
+            match self.inner.read_commit_entry(version).await {
+                Ok(Some(landed)) if landed == payload => return Ok(()),
+                Ok(Some(_)) => {} // A foreign immutable payload permits the OCC retry.
+                outcome => {
+                    return Err(deltalake::kernel::transaction::TransactionError::LogStoreError {
+                        msg: format!("could not reconcile an occupied flush publication version: {outcome:?}"),
+                        source: Box::new(InconclusiveCommit),
+                    });
+                }
+            }
+        }
+        result
+    }
+
+    async fn abort_commit_entry(
+        &self, version: deltalake::kernel::Version, commit: deltalake::logstore::CommitOrBytes, operation_id: uuid::Uuid,
+    ) -> std::result::Result<(), deltalake::kernel::transaction::TransactionError> {
+        self.inner.abort_commit_entry(version, commit, operation_id).await
+    }
+
+    async fn get_latest_version(&self, start: deltalake::kernel::Version) -> deltalake::DeltaResult<deltalake::kernel::Version> {
+        self.inner.get_latest_version(start).await
+    }
+
+    fn object_store(&self, operation_id: Option<uuid::Uuid>) -> Arc<dyn object_store::ObjectStore> {
+        self.inner.object_store(operation_id)
+    }
+
+    fn root_object_store(&self, operation_id: Option<uuid::Uuid>) -> Arc<dyn object_store::ObjectStore> {
+        self.inner.root_object_store(operation_id)
+    }
+
+    fn config(&self) -> &deltalake::logstore::LogStoreConfig {
+        self.inner.config()
+    }
+
+    fn root_url(&self) -> &url::Url {
+        self.inner.root_url()
+    }
+
+    fn transaction_url(&self, operation_id: Option<uuid::Uuid>) -> deltalake::DeltaResult<url::Url> {
+        self.inner.transaction_url(operation_id)
+    }
+}
+
 /// How many top memory-pool consumers to name when a pool is exhausted.
 const TOP_POOL_CONSUMERS: std::num::NonZeroUsize = std::num::NonZeroUsize::new(5).unwrap();
 
@@ -49,6 +165,7 @@ struct StagedCommit<'a> {
     adds: &'a [deltalake::kernel::Action],
     schema: &'a crate::schema::TableSchema,
     properties: CommitProperties,
+    publication: Option<&'a Arc<crate::write::wal::FlushPublicationJournal>>,
 }
 
 impl Database {
@@ -560,9 +677,9 @@ impl Database {
         )
     )]
     pub async fn insert_records_batch(
-        &self, project_id: &str, table_name: &str, batches: Vec<RecordBatch>, skip_queue: bool, watermark: Option<&crate::write::DeltaWatermark>,
+        &self, project_id: &str, table_name: &str, batches: Vec<RecordBatch>, skip_queue: bool, context: Option<&crate::write::FlushCommitContext>,
     ) -> Result<Vec<String>> {
-        self.insert_records_batch_bounded(project_id, table_name, batches, skip_queue, watermark, true, false).await
+        self.insert_records_batch_bounded(project_id, table_name, batches, skip_queue, context, true, false).await
     }
 
     /// `bound: false` is for DML re-appends only — see
@@ -570,9 +687,11 @@ impl Database {
     /// append its caller already stamped and will admit or invalidate itself.
     #[allow(clippy::too_many_arguments)]
     pub async fn insert_records_batch_bounded(
-        &self, project_id: &str, table_name: &str, batches: Vec<RecordBatch>, skip_queue: bool, watermark: Option<&crate::write::DeltaWatermark>, bound: bool,
-        stamped: bool,
+        &self, project_id: &str, table_name: &str, batches: Vec<RecordBatch>, skip_queue: bool, context: Option<&crate::write::FlushCommitContext>,
+        bound: bool, stamped: bool,
     ) -> Result<Vec<String>> {
+        let watermark = context.map(|context| &context.watermark);
+        let journal = context.and_then(|context| context.publication.as_ref());
         let span = tracing::Span::current();
         // Delta-rs' Arrow→Delta schema conversion only accepts the IANA `"UTC"`
         // form, not a `+00:00` offset.
@@ -594,6 +713,10 @@ impl Database {
         };
 
         let table_name = if table_name.is_empty() { "otel_logs_and_spans" } else { table_name }.to_string();
+        let buffered_layer = self.buffered_layer().filter(|_| !skip_queue);
+        // Apply the buffered admission bound before recording dirty ranges, or
+        // discarded future rows leave durable tasks with no source to flush.
+        let batches = if bound && buffered_layer.is_some() { crate::write::bound_event_time(&project_id, &table_name, batches) } else { batches };
 
         if watermark.is_none() && !stamped {
             self.invalidate_rollup_batches(&project_id, &table_name, &batches)?;
@@ -608,9 +731,9 @@ impl Database {
 
         // Buffered layer (WAL → MemBuffer): nothing is written synchronously, so an
         // empty URI list is correct.
-        if !skip_queue && let Some(layer) = self.buffered_layer() {
+        if let Some(layer) = buffered_layer {
             span.record("use_queue", "buffered_layer");
-            layer.insert_bounded(&project_id, &table_name, batches, bound).await?;
+            layer.insert_bounded(&project_id, &table_name, batches, false).await?;
             return Ok(Vec::new());
         }
 
@@ -645,16 +768,18 @@ impl Database {
             // No staged path for one group: write everything untagged, which only costs
             // the slices a rebuild.
             self.version_only.forget(&project_id, &table_name, &versions);
-            return Box::pin(self.insert_records_batch_bounded(&project_id, &table_name, batches, skip_queue, watermark, bound, stamped)).await;
+            return Box::pin(self.insert_records_batch_bounded(&project_id, &table_name, batches, skip_queue, context, bound, stamped)).await;
         }
         let batches = sorted_batches;
 
         // Base properties (hooks off) when there is no watermark: leaving this unset
         // lets WriteBuilder's own default re-enable the checkpoint hook.
+        let commit_id = watermark.is_some().then(|| journal.map_or_else(uuid::Uuid::new_v4, |journal| journal.commit_id()).to_string());
         let commit_properties = self.with_incremental_advance(watermark.map_or_else(base_commit_properties, |w| {
             build_watermark_commit_properties(
                 [(project_id.clone(), table_name.clone(), w.clone())],
                 landed.map(|d| (project_id.clone(), table_name.clone(), d)),
+                commit_id.as_deref(),
             )
         }));
         // STAGED COMMIT (fast path): encode parquet + upload to S3 OUTSIDE the per-table
@@ -716,7 +841,7 @@ impl Database {
                     &table_ref,
                     &[(project_id.as_str(), dirty_bins.as_slice())],
                     &table_name,
-                    StagedCommit { adds: &adds, schema, properties: commit_properties },
+                    StagedCommit { adds: &adds, schema, properties: commit_properties, publication: journal },
                 )
                 .await
             {
@@ -757,11 +882,23 @@ impl Database {
             let commit_guard = lock_with_flush_priority(&commit_lock, &flush_waiters).await;
             let table = { table_ref.read().await.clone() };
             let pre_uris: HashSet<String> = file_uris(&table);
+            let publication = if commit_id.is_some() {
+                Some(Arc::new(FlushPublication::new(table.log_store()).with_journal(journal.cloned(), table.snapshot()?.metadata().id())))
+            } else {
+                None
+            };
+            let writing_table = publication.as_ref().map_or_else(
+                || table.clone(),
+                |publication| {
+                    let mut writing_table = DeltaTable::new(publication.clone());
+                    writing_table.state = table.state.clone();
+                    writing_table
+                },
+            );
 
             let write_span = tracing::trace_span!(parent: &span, "delta.write_operation", retry_attempt = attempt);
             let write_result = async {
-                table
-                    .clone()
+                writing_table
                     .write(batches.clone())
                     .with_partition_columns(schema.partitions.clone())
                     .with_writer_properties(writer_properties.clone())
@@ -775,12 +912,20 @@ impl Database {
 
             match write_result {
                 Ok(new_table) => {
+                    if let Some(journal) = journal
+                        && let Some(version) = new_table.version()
+                    {
+                        journal.note_committed(version);
+                    }
+                    // Never retain the per-attempt observer in the shared table.
+                    let mut committed = DeltaTable::new(table.log_store());
+                    committed.state = new_table.state;
                     let added = self
                         .record_committed_write(
                             &table_ref,
                             &[(project_id.as_str(), dirty_bins.as_slice())],
                             &table_name,
-                            new_table,
+                            committed,
                             &pre_uris,
                             watermark.is_some(),
                         )
@@ -800,7 +945,21 @@ impl Database {
                             debug!("Failed to reload table state after conflict: {}", reload_err);
                         }
                     } else {
-                        return Err(anyhow::anyhow!("Delta write failed: {}", e));
+                        drop(commit_guard);
+                        let error = anyhow::Error::new(e);
+                        if let Some(version) = publication.as_ref().and_then(|publication| publication.version())
+                            && let Some(commit_id) = &commit_id
+                            && self.reconcile_merge_flush(&table_ref, version, commit_id, transport_publication_uncertain(&error)).await
+                        {
+                            if let Some(journal) = journal {
+                                journal.note_committed(version);
+                            }
+                            let committed = table_ref.read().await.clone();
+                            return Ok(self
+                                .record_committed_write(&table_ref, &[(project_id.as_str(), dirty_bins.as_slice())], &table_name, committed, &pre_uris, true)
+                                .await);
+                        }
+                        return Err(error.context("Delta write failed"));
                     }
                 }
             }
@@ -821,7 +980,7 @@ impl Database {
         &self, warm: bool, table_ref: &Arc<RwLock<DeltaTable>>, projects: &[(&str, &[(String, i64)])], table_name: &str, commit: StagedCommit<'_>,
     ) -> Result<Vec<String>> {
         use deltalake::kernel::transaction::TableReference;
-        let StagedCommit { adds, schema, properties } = commit;
+        let StagedCommit { adds, schema, properties, publication: journal } = commit;
         let op = deltalake::protocol::DeltaOperation::Write {
             mode: deltalake::protocol::SaveMode::Append,
             partition_by: (!schema.partitions.is_empty()).then(|| schema.partitions.clone()),
@@ -843,6 +1002,12 @@ impl Database {
             }
             let refresh_ms = t_refresh.elapsed().as_millis();
             let mut new_table = { table_ref.read().await.clone() };
+            let publication = if let Some(journal) = journal {
+                Some(Arc::new(FlushPublication::new(new_table.log_store()).with_journal(Some(journal.clone()), new_table.snapshot()?.metadata().id())))
+            } else {
+                None
+            };
+            let log_store: deltalake::logstore::LogStoreRef = publication.as_ref().map_or_else(|| new_table.log_store(), |publication| publication.clone());
             let t_build = std::time::Instant::now();
             // Bounded: this await holds the per-table commit lock every other
             // committer queues on.
@@ -852,7 +1017,7 @@ impl Database {
                 table_name,
                 deltalake::kernel::transaction::CommitBuilder::from(properties.clone()).with_actions(adds.to_vec()).build(
                     Some(new_table.snapshot()? as &dyn TableReference),
-                    new_table.log_store(),
+                    log_store,
                     op.clone(),
                 ),
             )
@@ -865,6 +1030,11 @@ impl Database {
                     // don't pay the full-table file-URI walk.
                     let pre_uris: HashSet<String> = file_uris(&new_table);
                     new_table.state = Some(finalized.snapshot());
+                    if let Some(journal) = journal
+                        && let Some(version) = new_table.version()
+                    {
+                        journal.note_committed(version);
+                    }
                     drop(commit_guard);
                     let t_record = std::time::Instant::now();
                     let added = self.record_committed_write(table_ref, projects, table_name, new_table, &pre_uris, warm).await;
@@ -879,9 +1049,9 @@ impl Database {
                     );
                     return Ok(added);
                 }
-                Err(CommitFailure { message: e, timed_out }) => {
+                Err(CommitFailure { message: e, publication_uncertain }) => {
                     drop(commit_guard);
-                    if !timed_out && is_occ_conflict_err(&e) {
+                    if !publication_uncertain && is_occ_conflict_err(&e) {
                         retry_count += 1;
                         if retry_count >= MAX_COMMIT_RETRIES {
                             return Err(anyhow::anyhow!("staged commit failed after {} retries: {}", MAX_COMMIT_RETRIES, e));
@@ -895,7 +1065,21 @@ impl Database {
                     // caller delete parquet a landed commit references.
                     let pre_uris: HashSet<String> = file_uris(&new_table);
                     let subject = format!("staged commit for {}/{}", projects[0].0, table_name);
-                    return match probe_after_timeout(self.probe_commit_landed_bounded(table_ref, adds).await, timed_out) {
+                    let probe = if let Some(journal) = journal
+                        && let Some(version) = publication.as_ref().and_then(|publication| publication.version())
+                    {
+                        if self.reconcile_merge_flush(table_ref, version, &journal.commit_id().to_string(), publication_uncertain).await {
+                            journal.note_committed(version);
+                            CommitProbe::Landed
+                        } else {
+                            CommitProbe::NotLanded
+                        }
+                    } else if warm {
+                        self.reconcile_flush_commit(table_ref, adds, publication_uncertain).await
+                    } else {
+                        probe_after_uncertain_commit(self.probe_commit_landed_bounded(table_ref, adds).await, publication_uncertain)
+                    };
+                    return match probe {
                         CommitProbe::Landed => {
                             warn!("{subject} reported an error but LANDED (post-commit hook failed) — draining bucket: {e}");
                             let post = { table_ref.read().await.clone() };
@@ -925,6 +1109,65 @@ impl Database {
             Err(_) => {
                 crate::observability::record_commit_timeout("landing_probe");
                 CommitProbe::Inconclusive
+            }
+        }
+    }
+
+    /// A flush must resolve an uncertain publication before its callback can fail
+    /// and schedule a fresh write. Keep probing outside the commit lock; neither a
+    /// failed refresh nor absence after an abandoned request permits republishing.
+    pub(super) async fn reconcile_flush_commit(
+        &self, table_ref: &Arc<RwLock<DeltaTable>>, adds: &[deltalake::kernel::Action], publication_uncertain: bool,
+    ) -> CommitProbe {
+        loop {
+            let probe = probe_after_uncertain_commit(self.probe_commit_landed_bounded(table_ref, adds).await, publication_uncertain);
+            if !matches!(probe, CommitProbe::Inconclusive) {
+                return probe;
+            }
+            warn!(
+                event = "flush_commit_landing_unconfirmed",
+                files = adds.len(),
+                "flush publication is still unconfirmed — retaining rows and probing before any retry"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(fastrand::u64(10_000..=15_000))).await;
+        }
+    }
+
+    /// Resolve WriteBuilder's exact publication version. Another commit owning
+    /// that immutable version proves our delayed conditional write cannot land.
+    pub(super) async fn reconcile_merge_flush(
+        &self, table_ref: &Arc<RwLock<DeltaTable>>, version: deltalake::kernel::Version, commit_id: &str, publication_uncertain: bool,
+    ) -> bool {
+        loop {
+            let probe = tokio::time::timeout(COMMIT_LOCK_OP_TIMEOUT, async {
+                let store = table_ref.read().await.log_store();
+                let Some(bytes) = store.read_commit_entry(version).await? else {
+                    return Ok(if publication_uncertain { CommitProbe::Inconclusive } else { CommitProbe::NotLanded });
+                };
+                let ours = deltalake::logstore::get_actions(version, &bytes)?.iter().any(|action| {
+                    matches!(action, deltalake::kernel::Action::CommitInfo(info) if info.info.get(FLUSH_COMMIT_ID_KEY).and_then(serde_json::Value::as_str) == Some(commit_id))
+                });
+                if !ours {
+                    return Ok(CommitProbe::NotLanded);
+                }
+                refresh_table_snapshot(table_ref, self.incremental_snapshot()).await?;
+                Ok::<_, deltalake::DeltaTableError>(if table_ref.read().await.version().is_some_and(|visible| visible >= version) {
+                    CommitProbe::Landed
+                } else {
+                    CommitProbe::Inconclusive
+                })
+            })
+            .await;
+            match probe {
+                Ok(Ok(CommitProbe::Landed)) => return true,
+                Ok(Ok(CommitProbe::NotLanded)) => return false,
+                _ => {
+                    warn!(
+                        event = "flush_commit_landing_unconfirmed",
+                        version, commit_id, "schema-evolution flush publication is unconfirmed — probing before any retry"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(fastrand::u64(10_000..=15_000))).await;
+                }
             }
         }
     }
@@ -1064,6 +1307,180 @@ impl Database {
             *shared = fresh;
             debug!("Reconciled snapshot for {project_id}/{table_name} at v{fresh_version:?}");
         }
+    }
+
+    /// Resume only the original conditional PUT, with no OCC version advancement.
+    /// Exclusive WAL ownership excludes the predecessor's live retry loop; a
+    /// delayed server-side PUT can only publish these same bytes at this version.
+    async fn resume_flush_publication(
+        &self, layer: &crate::write::BufferedWriteLayer, table_ref: &Arc<RwLock<DeltaTable>>, record: &crate::write::wal::FlushPublicationRecord,
+        version: deltalake::kernel::Version,
+    ) -> Result<CommitProbe> {
+        use crate::write::wal::FlushPublicationState;
+        use object_store::ObjectStoreExt;
+        anyhow::ensure!(layer.owns_wal_dir(), "resuming flush {} requires ownership of its WAL directory", record.commit_id);
+        let FlushPublicationState::Publishing { target, .. } = &record.state else {
+            anyhow::bail!("flush {} has no pending publication", record.commit_id);
+        };
+        let store = {
+            let table = table_ref.read().await;
+            let store = table.log_store();
+            anyhow::ensure!(
+                target.log_store_name.as_deref() == Some("DefaultLogStore") && store.name() == "DefaultLogStore",
+                "flush {} has no compatible conditional-PUT backend proof",
+                record.commit_id
+            );
+            anyhow::ensure!(
+                table.version().and_then(|visible| visible.checked_add(1)) == Some(version),
+                "flush {} cannot resume a historical or noncontiguous version {version}",
+                record.commit_id
+            );
+            store
+        };
+        let payload = record.commit_payloads.get(&version).ok_or_else(|| anyhow::anyhow!("flush {} has no exact payload for {version}", record.commit_id))?;
+        let bytes = bytes::Bytes::copy_from_slice(payload.as_bytes());
+        let actions = deltalake::logstore::get_actions(version, &bytes)?;
+        let commit_id = record.commit_id.to_string();
+        anyhow::ensure!(
+            actions.iter().any(|action| {
+                matches!(action, deltalake::kernel::Action::CommitInfo(info) if info.info.get(FLUSH_COMMIT_ID_KEY).and_then(serde_json::Value::as_str) == Some(commit_id.as_str()))
+            }),
+            "flush {} payload does not contain its publication identity", record.commit_id
+        );
+        let outcome = tokio::time::timeout(COMMIT_LOCK_OP_TIMEOUT, async {
+            let mut adds = 0;
+            for action in &actions {
+                if let deltalake::kernel::Action::Add(add) = action {
+                    let meta = store.object_store(None).head(&object_store::path::Path::parse(&add.path)?).await?;
+                    anyhow::ensure!(u64::try_from(add.size).ok() == Some(meta.size), "flush {} staged file size changed: {}", record.commit_id, add.path);
+                    // Flush-generated Adds currently have no deletion vectors.
+                    // A future writer with external DV objects needs separate proof.
+                    anyhow::ensure!(add.deletion_vector.is_none(), "flush {} staged deletion vector requires verification", record.commit_id);
+                    adds += 1;
+                }
+            }
+            anyhow::ensure!(adds > 0, "flush {} payload has no staged data files", record.commit_id);
+            let result = store.write_commit_entry(version, deltalake::logstore::CommitOrBytes::LogBytes(bytes), record.commit_id).await;
+            if let Err(error) = result {
+                warn!(event = "flush_recovery_publication_unconfirmed", commit_id = %record.commit_id, version, %error,
+                    "same-version conditional PUT failed; checking the immutable version before deciding its outcome");
+            }
+            // Even a failed response can represent a successful publication.
+            let Some(published) = store.read_commit_entry(version).await? else { return Ok(CommitProbe::Inconclusive) };
+            let ours = deltalake::logstore::get_actions(version, &published)?.iter().any(|action| {
+                matches!(action, deltalake::kernel::Action::CommitInfo(info) if info.info.get(FLUSH_COMMIT_ID_KEY).and_then(serde_json::Value::as_str) == Some(commit_id.as_str()))
+            });
+            if !ours {
+                return Ok(CommitProbe::NotLanded);
+            }
+            refresh_table_snapshot(table_ref, self.incremental_snapshot()).await?;
+            anyhow::ensure!(table_ref.read().await.version().is_some_and(|visible| visible >= version), "resumed flush {} is not visible", record.commit_id);
+            Ok::<_, anyhow::Error>(CommitProbe::Landed)
+        })
+        .await;
+        match outcome {
+            Ok(result) => result,
+            Err(_) => Ok(CommitProbe::Inconclusive),
+        }
+    }
+
+    /// Resolve durable flush intents before replay, independently of the recent
+    /// history scan. Missing versions require exact-payload resumption proof;
+    /// otherwise preserve WAL and stop startup conservatively.
+    pub async fn reconcile_flush_publications(&self, layer: &crate::write::BufferedWriteLayer) -> Result<usize> {
+        use crate::write::wal::{FlushPublicationJournal, FlushPublicationState};
+        layer.begin_publication_recovery(&[]);
+        let paths = FlushPublicationJournal::paths(layer.wal().data_dir())?;
+        let mut topics = HashSet::new();
+        for path in &paths {
+            let record = FlushPublicationJournal::open(path.clone())?.record();
+            if matches!(record.state, FlushPublicationState::Publishing { .. } | FlushPublicationState::Committed { .. }) {
+                topics.insert((record.project_id, record.table_name));
+            }
+        }
+        let topics = topics.into_iter().collect::<Vec<_>>();
+        layer.begin_publication_recovery(&topics);
+        let mut confirmed = 0;
+        let mut refreshed = HashSet::new();
+        for path in paths {
+            let journal = FlushPublicationJournal::open(path)?;
+            let record = journal.record();
+            let (target, versions, proven) = match &record.state {
+                FlushPublicationState::Prepared | FlushPublicationState::Aborted => continue,
+                FlushPublicationState::Publishing { target, versions } => (target, versions.clone(), false),
+                FlushPublicationState::Committed { target, version } => (target, vec![*version], true),
+            };
+            let table_ref = self.resolve_table(&record.project_id, &record.table_name).await?;
+            if refreshed.insert((target.table_uri.clone(), target.table_id.clone())) {
+                tokio::time::timeout(COMMIT_LOCK_OP_TIMEOUT, refresh_table_snapshot(&table_ref, self.incremental_snapshot())).await??;
+            }
+            let store = {
+                let table = table_ref.read().await;
+                anyhow::ensure!(
+                    table.log_store().root_url().as_str() == target.table_uri && table.snapshot()?.metadata().id() == target.table_id,
+                    "flush publication {} targets a different physical Delta table; preserving WAL",
+                    record.commit_id
+                );
+                if let FlushPublicationState::Committed { version, .. } = &record.state {
+                    anyhow::ensure!(
+                        table.version().is_some_and(|visible| visible >= *version),
+                        "confirmed flush publication {} is not visible in the refreshed Delta snapshot; preserving WAL",
+                        record.commit_id
+                    );
+                }
+                table.log_store()
+            };
+            let mut landed = proven;
+            let mut missing = Vec::new();
+            for version in versions {
+                if proven {
+                    break;
+                }
+                match tokio::time::timeout(COMMIT_LOCK_OP_TIMEOUT, store.read_commit_entry(version)).await?? {
+                    Some(bytes) => {
+                        if deltalake::logstore::get_actions(version, &bytes)?.iter().any(|action| {
+                            matches!(action, deltalake::kernel::Action::CommitInfo(info) if info.info.get(FLUSH_COMMIT_ID_KEY).and_then(serde_json::Value::as_str) == Some(record.commit_id.to_string().as_str()))
+                        }) {
+                            let visible = table_ref.read().await.version().is_some_and(|visible| visible >= version);
+                            anyhow::ensure!(visible, "flush publication {} is not visible in the refreshed Delta snapshot", record.commit_id);
+                            journal.note_committed(version);
+                            landed = true;
+                            break;
+                        }
+                    }
+                    None => missing.push(version),
+                }
+            }
+            // Read every recorded attempt before resuming: a later attempt may
+            // already have landed even when an earlier version is unavailable.
+            let mut unknown = false;
+            if !landed {
+                for version in missing {
+                    match self.resume_flush_publication(layer, &table_ref, &record, version).await? {
+                        CommitProbe::Landed => {
+                            journal.note_committed(version);
+                            landed = true;
+                            break;
+                        }
+                        CommitProbe::NotLanded => {}
+                        CommitProbe::Inconclusive => unknown = true,
+                    }
+                }
+            }
+            if !landed && unknown {
+                warn!(event = "flush_commit_landing_unconfirmed", commit_id = %record.commit_id, project_id = %record.project_id,
+                    table = %record.table_name, "startup cannot resolve the original Delta publication; retaining its topic and WAL");
+                anyhow::bail!("flush publication {} has an unresolved Delta version; preserving WAL before replay", record.commit_id);
+            }
+            if landed {
+                layer.note_landed_write_ranges(&record.project_id, &record.table_name, &record.write_identities);
+                confirmed += 1;
+            } else {
+                journal.mark_aborted()?;
+            }
+        }
+        layer.finish_publication_recovery(&topics);
+        Ok(confirmed)
     }
 
     /// Read the latest commit metadata for each WAL topic and fast-forward the walrus cursor to

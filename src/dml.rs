@@ -707,6 +707,17 @@ impl DmlContext<'_> {
         G: FnOnce(Option<Expr>) -> Fut,
         Fut: std::future::Future<Output = Result<u64>>,
     {
+        // Resolve older publications before applying the memory leg. Keep the
+        // snapshot lock only through that synchronous mutation: a later flush
+        // then sees post-DML rows, while an unresolved wait changes nothing.
+        let flush_guard = if let Some(layer) = self.buffered_layer {
+            let started = Instant::now();
+            let guard = layer.await_inflight_flushes(self.project_id, self.table_name).await?;
+            log_slow_phase("await_inflight_flush", self.table_name, self.project_id, started, None);
+            Some(guard)
+        } else {
+            None
+        };
         let has_uncommitted = self.buffered_layer.is_some_and(|l| l.has_table(self.project_id, self.table_name));
 
         let mem_rows = match self.buffered_layer.filter(|_| has_uncommitted) {
@@ -718,6 +729,7 @@ impl DmlContext<'_> {
             }
             None => 0,
         };
+        drop(flush_guard);
         debug!(
             "DML mem leg for {}/{}: layer_present={} table_in_buffer={} mem_rows={}",
             self.project_id,
@@ -726,16 +738,6 @@ impl DmlContext<'_> {
             has_uncommitted,
             mem_rows
         );
-
-        // The Delta leg must run AFTER any in-flight flush commit: a flush
-        // snapshotted before the mem leg lands PRE-DML values that only the
-        // Delta leg can correct. It also makes the has_committed check below
-        // see a table whose first-ever commit was still airborne.
-        if let Some(layer) = self.buffered_layer {
-            let started = Instant::now();
-            layer.await_inflight_flushes(self.project_id, self.table_name).await;
-            log_slow_phase("await_inflight_flush", self.table_name, self.project_id, started, None);
-        }
 
         // The unified-tables lookup intentionally ignores project_id: unified
         // tables are shared, so a hit means "some project has committed data

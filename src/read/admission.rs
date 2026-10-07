@@ -11,7 +11,7 @@
 //!
 //! This is that gate. A pgwire-only physical rule wraps a plan that contains a
 //! spilling `SortExec`, or a multi-partition ordered merge feeding merge-on-read
-//! dedup, in [`AdmissionExec`], which holds ONE permit for the stream's lifetime.
+//! dedup, in [`AdmissionExec`], which holds its weighted permits for the stream's lifetime.
 //! The latter buffers one decoded batch per input partition and can consume close
 //! to a GiB before a small outer `LIMIT` emits anything, but only for wide rows:
 //! a merge is gated when its estimated buffer exceeds one sort reservation. Cheap queries —
@@ -58,19 +58,29 @@ const HEAVY_HELD_LOG_AFTER: std::time::Duration = std::time::Duration::from_secs
 
 /// The process-wide heavy-sort permit pool, sized once at first use from the
 /// query-pool geometry.
-static HEAVY_SEM: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+struct HeavyGate {
+    semaphore: Arc<tokio::sync::Semaphore>,
+    partitions: usize,
+    slots: usize,
+}
 
-pub(crate) fn heavy_sem() -> &'static Arc<tokio::sync::Semaphore> {
-    HEAVY_SEM.get_or_init(|| {
-        let k = crate::config::try_config().map_or(8, |cfg| {
+static HEAVY_GATE: OnceLock<HeavyGate> = OnceLock::new();
+
+fn heavy_gate() -> &'static HeavyGate {
+    HEAVY_GATE.get_or_init(|| {
+        let (partitions, slots) = crate::config::try_config().map_or((1, 8), |cfg| {
             let partitions = match cfg.memory.timefusion_query_partitions {
                 0 => cfg.derived.cores(),
                 n => n,
             };
-            crate::config::max_concurrent_heavy_sorts(partitions, cfg.derived.query_pool_bytes())
+            (partitions, crate::config::max_concurrent_heavy_sorts(partitions, cfg.derived.query_pool_bytes()))
         });
-        Arc::new(tokio::sync::Semaphore::new(k))
+        HeavyGate { semaphore: Arc::new(tokio::sync::Semaphore::new(slots)), partitions, slots }
     })
+}
+
+pub(crate) fn heavy_sem() -> &'static Arc<tokio::sync::Semaphore> {
+    &heavy_gate().semaphore
 }
 
 /// Does the plan contain a SPILLING sort — one with no `fetch` bound?
@@ -118,7 +128,7 @@ fn estimated_row_bytes(schema: &Schema) -> usize {
 /// heavy-query gate. An ordered merge is heavy only below an order-dependent
 /// `DedupExec`, and only when one batch per input exceeds a sort reservation;
 /// incidental merges elsewhere keep their existing concurrency.
-fn heavy_class(plan: &Arc<dyn ExecutionPlan>, batch_rows: usize) -> Option<HeavyClass> {
+fn heavy_node_class(plan: &Arc<dyn ExecutionPlan>, batch_rows: usize) -> Option<HeavyClass> {
     // A sort of an aggregate's GROUPS is no bigger than the aggregate, which the pool
     // already accounts and spills; gating it queued every dashboard chart's final
     // `ORDER BY time_bucket(..)` (~100 rows) behind long scans (10-02: 1h charts waited
@@ -133,7 +143,33 @@ fn heavy_class(plan: &Arc<dyn ExecutionPlan>, batch_rows: usize) -> Option<Heavy
         let buffered_bytes = fan_in * batch_rows * estimated_row_bytes(&plan.children()[0].schema());
         return (buffered_bytes > crate::config::DEFAULT_SORT_SPILL_RESERVATION_BYTES).then_some(HeavyClass::OrderedMorMerge { fan_in, buffered_bytes });
     }
-    plan.children().into_iter().find_map(|child| heavy_class(child, batch_rows))
+    None
+}
+
+fn heavy_class(plan: &Arc<dyn ExecutionPlan>, batch_rows: usize) -> Option<HeavyClass> {
+    heavy_node_class(plan, batch_rows).or_else(|| plan.children().into_iter().find_map(|child| heavy_class(child, batch_rows)))
+}
+
+/// Charge the actual operators rather than assuming every query contains one
+/// configured-width sort. Parent and child sorts may overlap while streaming;
+/// account both. The pool share leaves the other half available for working rows.
+fn heavy_permits(plan: &Arc<dyn ExecutionPlan>, batch_rows: usize, partitions: usize, slots: usize) -> usize {
+    fn cost(plan: &Arc<dyn ExecutionPlan>, batch_rows: usize) -> usize {
+        let here = match heavy_node_class(plan, batch_rows) {
+            Some(HeavyClass::SpillingSort) => {
+                let sort = downcast::<SortExec>(plan.as_ref()).unwrap();
+                let batch_bytes = batch_rows.saturating_mul(estimated_row_bytes(&sort.input().schema()));
+                crate::config::DEFAULT_SORT_SPILL_RESERVATION_BYTES.max(batch_bytes).saturating_mul(sort.input().properties().partitioning.partition_count())
+            }
+            Some(HeavyClass::OrderedMorMerge { buffered_bytes, .. }) => buffered_bytes,
+            None => 0,
+        };
+        plan.children().into_iter().fold(here, |total, child| total.saturating_add(cost(child, batch_rows)))
+    }
+    let unit = crate::config::DEFAULT_SORT_SPILL_RESERVATION_BYTES.saturating_mul(partitions.max(1));
+    // An oversized query takes the whole gate, rather than waiting forever for
+    // more permits than exist. DataFusion's pool still bounds its allocations.
+    cost(plan, batch_rows).div_ceil(unit).max(1).min(slots)
 }
 
 /// Whether `plan` is an aggregate's output, through row-preserving wrappers.
@@ -145,7 +181,7 @@ fn sorts_groups(plan: &Arc<dyn ExecutionPlan>) -> bool {
             && plan.children().first().is_some_and(|child| sorts_groups(child)))
 }
 
-/// Wrap a heavy plan's root so its execution holds one heavy-query permit.
+/// Wrap a heavy plan's root so its execution holds its priced heavy-query permits.
 ///
 /// Registered ONLY on the pgwire-facing session (never maintenance, which has its
 /// own pool). Runs last so it wraps the absolute root, whose `execute` the pgwire
@@ -164,27 +200,30 @@ impl PhysicalOptimizerRule for HeavyQueryAdmission {
         let Some(class) = heavy_class(&plan, config.execution.batch_size.get()) else {
             return Ok(plan);
         };
+        let gate = heavy_gate();
+        let permits = heavy_permits(&plan, config.execution.batch_size.get(), gate.partitions, gate.slots);
         // A multi-partition root is executed once per partition (`execute_stream`
-        // coalesces over it); coalescing here keeps one slot per query.
+        // coalesces over it); coalescing here charges the query only once.
         let plan = match plan.properties().partitioning.partition_count() > 1 {
             true => Arc::new(CoalescePartitionsExec::new(plan)),
             false => plan,
         };
-        Ok(Arc::new(AdmissionExec::new(plan, class)))
+        Ok(Arc::new(AdmissionExec::new(plan, class, permits)))
     }
 }
 
-/// Holds one heavy-query permit for the lifetime of the wrapped stream.
+/// Holds the query's weighted permits for the lifetime of the wrapped stream.
 pub struct AdmissionExec {
     input: Arc<dyn ExecutionPlan>,
     class: HeavyClass,
+    permits: usize,
     properties: std::sync::Arc<PlanProperties>,
 }
 
 impl AdmissionExec {
-    fn new(input: Arc<dyn ExecutionPlan>, class: HeavyClass) -> Self {
+    fn new(input: Arc<dyn ExecutionPlan>, class: HeavyClass, permits: usize) -> Self {
         let properties = input.properties().clone();
-        Self { input, class, properties }
+        Self { input, class, permits, properties }
     }
 }
 
@@ -198,7 +237,7 @@ impl DisplayAs for AdmissionExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                write!(f, "AdmissionExec: class={}", self.class.label())?;
+                write!(f, "AdmissionExec: class={}, permits={}", self.class.label(), self.permits)?;
                 if let HeavyClass::OrderedMorMerge { fan_in, buffered_bytes } = self.class {
                     write!(f, ", fan_in={fan_in}, buffered_mb={}", buffered_bytes >> 20)?;
                 }
@@ -248,11 +287,12 @@ impl ExecutionPlan for AdmissionExec {
         vec![&self.input]
     }
     fn with_new_children(self: Arc<Self>, children: Vec<Arc<dyn ExecutionPlan>>) -> DFResult<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(Self::new(children[0].clone(), self.class)))
+        Ok(Arc::new(Self::new(children[0].clone(), self.class, self.permits)))
     }
     fn execute(&self, partition: usize, context: Arc<TaskContext>) -> DFResult<SendableRecordBatchStream> {
         let schema = self.input.schema();
         let class = self.class;
+        let permits = self.permits as u32;
         // Captured here, synchronously inside the statement's span, so a long hold
         // is reported with the query that caused it.
         let start = Admit::Pending(Arc::clone(&self.input), partition, context, tracing::Span::current());
@@ -264,8 +304,8 @@ impl ExecutionPlan for AdmissionExec {
                     // releases when the stream ends or is dropped (client disconnect /
                     // cancellation).
                     let sem = Arc::clone(heavy_sem());
-                    let queued = sem.available_permits() == 0;
-                    let permit = match tokio::time::timeout(HEAVY_QUEUE_WAIT, sem.acquire_owned()).await {
+                    let queued = sem.available_permits() < permits as usize;
+                    let permit = match tokio::time::timeout(HEAVY_QUEUE_WAIT, sem.acquire_many_owned(permits)).await {
                         Ok(Ok(permit)) => HeldPermit { _permit: permit, span, since: std::time::Instant::now(), class },
                         // Semaphore closed only at shutdown: end the stream cleanly.
                         Ok(Err(_closed)) => return None,
@@ -380,6 +420,42 @@ mod tests {
         assert_eq!(heavy_class(&sort(empty(), None), BATCH), Some(HeavyClass::SpillingSort));
     }
 
+    #[test_case::test_case(8 => 1 ; "configured width")]
+    #[test_case::test_case(26 => 4 ; "physical fanout exceeds configured width")]
+    #[test_case::test_case(200 => 8 ; "oversized query takes the whole gate")]
+    fn physical_sort_fanout_prices_admission(fanout: usize) -> usize {
+        let input = Arc::new(EmptyExec::new(empty().schema()).with_partitions(fanout));
+        super::heavy_permits(&sort(input, None), BATCH, 8, 8)
+    }
+
+    #[test]
+    fn overlapping_sorts_share_the_same_budget() {
+        let input = Arc::new(EmptyExec::new(empty().schema()).with_partitions(8));
+        let first = Arc::new(SortExec::new(ordering(), input).with_preserve_partitioning(true));
+        assert_eq!(super::heavy_permits(&sort(first, None), BATCH, 8, 8), 2);
+    }
+
+    /// The failing RUM population query sorts the same histogram input for
+    /// both per-epoch and per-series windows, which can execute concurrently.
+    #[tokio::test]
+    async fn histogram_epoch_and_series_windows_charge_both_sorts() {
+        let ctx = datafusion::prelude::SessionContext::new();
+        let df = ctx
+            .sql(
+                "WITH source(series_id,start_timestamp,timestamp,distribution_count) AS (
+                VALUES (1,0,1,10), (1,0,2,20), (1,2,3,30)
+             ) SELECT LAG(distribution_count) OVER(PARTITION BY series_id,start_timestamp ORDER BY timestamp),
+                      LAG(timestamp) OVER(PARTITION BY series_id ORDER BY timestamp)
+               FROM source",
+            )
+            .await
+            .unwrap();
+        let plan = df.create_physical_plan().await.unwrap();
+        assert!(super::heavy_permits(&plan, BATCH, 1, 8) >= 2, "both window orderings must share the heavy budget");
+        let rows = datafusion::physical_plan::collect(plan, ctx.task_ctx()).await.unwrap();
+        assert_eq!(rows.iter().map(|b| b.num_rows()).sum::<usize>(), 3);
+    }
+
     fn aggregate(input: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
         use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode, PhysicalGroupBy};
         let group = PhysicalGroupBy::new_single(vec![(Arc::new(Column::new(input.schema().field(0).name(), 0)), "t".to_owned())]);
@@ -443,7 +519,7 @@ mod tests {
     #[test]
     fn the_wrapper_preserves_the_plan_contract() {
         let inner = sort(empty(), None);
-        let wrapped = Arc::new(AdmissionExec::new(Arc::clone(&inner), HeavyClass::SpillingSort));
+        let wrapped = Arc::new(AdmissionExec::new(Arc::clone(&inner), HeavyClass::SpillingSort, 1));
         assert_eq!(wrapped.schema(), inner.schema());
         assert_eq!(wrapped.children().len(), 1);
         assert!(datafusion::physical_plan::replace_children_if_necessary(wrapped, vec![inner]).is_ok());
@@ -459,7 +535,7 @@ mod tests {
         use futures::StreamExt;
 
         let before = super::heavy_sem().available_permits();
-        let wrapped = Arc::new(AdmissionExec::new(empty(), HeavyClass::SpillingSort));
+        let wrapped = Arc::new(AdmissionExec::new(empty(), HeavyClass::SpillingSort, 1));
         let mut stream = wrapped.execute(0, Arc::new(TaskContext::default())).unwrap();
         // First poll drives the Pending arm: the permit is taken here.
         let _ = stream.next().await;
@@ -481,11 +557,14 @@ mod tests {
 
         let sem = Arc::clone(super::heavy_sem());
         let capacity = sem.available_permits();
-        let held = Arc::clone(&sem).acquire_many_owned(capacity.try_into().unwrap()).await.unwrap();
-        let wrapped = Arc::new(AdmissionExec::new(empty(), HeavyClass::SpillingSort));
+        let held = Arc::clone(&sem).acquire_many_owned((capacity - 1).try_into().unwrap()).await.unwrap();
+        let wrapped = Arc::new(AdmissionExec::new(empty(), HeavyClass::SpillingSort, 2));
         let mut stream = wrapped.execute(0, Arc::new(TaskContext::default())).unwrap();
 
-        assert!(tokio::time::timeout(std::time::Duration::from_millis(20), stream.next()).await.is_err(), "a stream must wait while every permit is held");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), stream.next()).await.is_err(),
+            "a two-slot query must wait when only one slot is free"
+        );
         drop(held);
         assert!(tokio::time::timeout(std::time::Duration::from_secs(1), stream.next()).await.unwrap().is_none(), "the empty child completes once admitted");
         assert_eq!(sem.available_permits(), capacity, "the admitted stream returns its permit");
@@ -500,7 +579,7 @@ mod tests {
 
         let sem = Arc::clone(super::heavy_sem());
         let _held = Arc::clone(&sem).acquire_many_owned(sem.available_permits().try_into().unwrap()).await.unwrap();
-        let wrapped = Arc::new(AdmissionExec::new(empty(), HeavyClass::SpillingSort));
+        let wrapped = Arc::new(AdmissionExec::new(empty(), HeavyClass::SpillingSort, 1));
         let err = wrapped.execute(0, Arc::new(TaskContext::default())).unwrap().next().await.unwrap().unwrap_err();
         assert!(
             matches!(&err, DataFusionError::ResourcesExhausted(msg) if msg == "too many concurrent heavy queries; the request waited for a slot and timed out — retry shortly"),

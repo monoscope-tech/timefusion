@@ -1861,16 +1861,19 @@ fn base_commit_properties() -> CommitProperties {
 }
 
 /// Build [`CommitProperties`] carrying the watermark under [`WAL_WATERMARK_KEY`] and the landed
-/// identities under [`LANDED_DIGESTS_KEY`]. `watermarks` takes every (project, table, watermark)
+/// identities under [`LANDED_DIGESTS_KEY`], plus the merge-path publication identity.
+/// `watermarks` takes every (project, table, watermark)
 /// the commit carries; one with no positions is omitted and recovery skips that commit.
 ///
-/// Both keys MUST be written in one `with_metadata` call: it REPLACES the map rather than extending
+/// All keys MUST be written in one `with_metadata` call: it REPLACES the map rather than extending
 /// it, so a chained second call silently drops the watermark.
 fn build_watermark_commit_properties(
     watermarks: impl IntoIterator<Item = (String, String, crate::write::DeltaWatermark)>,
-    digests: impl IntoIterator<Item = (String, String, crate::write::LandedDigest)>,
+    digests: impl IntoIterator<Item = (String, String, crate::write::LandedDigest)>, commit_id: Option<&str>,
 ) -> CommitProperties {
-    match flush_commit_metadata(watermarks, digests) {
+    let mut metadata = flush_commit_metadata(watermarks, digests);
+    metadata.extend(commit_id.map(|id| (write::FLUSH_COMMIT_ID_KEY.to_owned(), serde_json::Value::String(id.to_owned()))));
+    match metadata {
         metadata if metadata.is_empty() => base_commit_properties(),
         metadata => base_commit_properties().with_metadata(metadata),
     }
@@ -2214,22 +2217,33 @@ const COMMIT_LOCK_OP_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 #[derive(Debug)]
 struct CommitFailure {
     message: String,
-    /// The await was ABANDONED mid-flight, so the commit may still land and no probe may be trusted
-    /// to say "no" — see [`probe_after_timeout`].
-    timed_out: bool,
+    /// The await was abandoned or the HTTP request lost its response. The commit
+    /// may still land, so absence cannot authorize another publication or cleanup.
+    publication_uncertain: bool,
+}
+
+fn transport_publication_uncertain(error: &anyhow::Error) -> bool {
+    InconclusiveCommit::marks(error)
+        || error.chain().any(|cause| {
+            cause.downcast_ref::<object_store::client::HttpError>().is_some_and(|http| http.kind() != object_store::client::HttpErrorKind::Connect)
+        })
 }
 
 /// Run one commit-path future under `bound` so a hung object-store request cannot pin a commit
-/// lock. A timeout is a failure whose landing is UNKNOWN, never "did not commit": callers MUST
-/// route it through `probe_after_timeout` + `CommitProbe::Inconclusive`, which leaves staged
+/// lock. An abandoned await or lost HTTP response has UNKNOWN landing, never "did not commit": callers MUST
+/// route it through `probe_after_uncertain_commit` + `CommitProbe::Inconclusive`, which leaves staged
 /// parquet in place and requeues the work.
-async fn bounded_commit_await<T, E: std::fmt::Display>(
+async fn bounded_commit_await<T, E: Into<anyhow::Error>>(
     bound: std::time::Duration, op: &'static str, table_name: &str, fut: impl std::future::IntoFuture<Output = std::result::Result<T, E>>,
 ) -> std::result::Result<T, CommitFailure> {
     let started = std::time::Instant::now();
     match tokio::time::timeout(bound, fut.into_future()).await {
         Ok(Ok(v)) => Ok(v),
-        Ok(Err(e)) => Err(CommitFailure { message: e.to_string(), timed_out: false }),
+        Ok(Err(e)) => {
+            let e = e.into();
+            let publication_uncertain = transport_publication_uncertain(&e);
+            Err(CommitFailure { message: e.to_string(), publication_uncertain })
+        }
         Err(_) => {
             crate::observability::record_commit_timeout(op);
             warn!(
@@ -2240,15 +2254,15 @@ async fn bounded_commit_await<T, E: std::fmt::Display>(
                 event = "commit_lock_timeout",
                 "commit-lock operation exceeded its bound — releasing the lock, landing UNCONFIRMED"
             );
-            Err(CommitFailure { message: format!("{op} exceeded {}s while holding the commit lock", bound.as_secs()), timed_out: true })
+            Err(CommitFailure { message: format!("{op} exceeded {}s while holding the commit lock", bound.as_secs()), publication_uncertain: true })
         }
     }
 }
 
-/// A commit whose await TIMED OUT can never be classified `NotLanded`: the request was abandoned in
-/// flight, so "I don't see our Adds" is not evidence of absence. `Landed` still passes through.
-fn probe_after_timeout(probe: CommitProbe, timed_out: bool) -> CommitProbe {
-    match (probe, timed_out) {
+/// An abandoned commit or lost HTTP response cannot be classified `NotLanded`:
+/// "I don't see our Adds" is not evidence of absence. `Landed` still passes through.
+fn probe_after_uncertain_commit(probe: CommitProbe, publication_uncertain: bool) -> CommitProbe {
+    match (probe, publication_uncertain) {
         (CommitProbe::NotLanded, true) => CommitProbe::Inconclusive,
         (probe, _) => probe,
     }
@@ -6320,13 +6334,24 @@ pub(crate) fn select_cell_bin(cells: &[Vec<TailAdd>], policy: BinPolicy) -> Vec<
         .unwrap_or_default()
 }
 
+pub(crate) fn single_strip_selected(cells: &[Vec<TailAdd>], selected: &[String]) -> bool {
+    matches!(selected, [path] if cells.iter().flatten().any(|add| add.path == *path && add.strip))
+}
+
 /// Cells the packer REFUSED: packable (every file a sorted run, two under target
 /// or DV'd) yet binned below a pair. Another cell's bin outranking them is a
 /// choice, not a refusal — a masked strip outranks a clean pack by design.
+/// A selected lone strip is also useful work, even if it retires no file.
 pub(crate) fn refused_cells(cells: &[Vec<TailAdd>], policy: BinPolicy) -> usize {
     let packable =
         |cell: &Vec<TailAdd>| cell.iter().all(|add| add.is_sorted_run) && cell.iter().filter(|add| add.size < policy.target_size || add.has_dv).count() >= 2;
-    cells.iter().filter(|cell| packable(cell) && select_bin(cell, policy).len() < 2).count()
+    cells
+        .iter()
+        .filter(|cell| {
+            let selected = select_bin(cell, policy);
+            packable(cell) && selected.len() < 2 && !single_strip_selected(std::slice::from_ref(*cell), &selected)
+        })
+        .count()
 }
 
 /// Decoded bytes of the bin ONE unit takes from `debt`, through the packer's own

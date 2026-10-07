@@ -40,6 +40,10 @@ pub enum WalError {
     EmptyBatch,
     #[error("Internal WAL invariant violated: {0}")]
     Internal(String),
+    #[error("Invalid flush publication journal {path}: {reason}")]
+    InvalidFlushJournal { path: PathBuf, reason: &'static str },
+    #[error("Flush publication journal decode error: {0}")]
+    FlushJournalDecode(#[from] serde_json::Error),
 }
 
 /// TimeFusion's own metadata directory alongside the walrus data files (topic
@@ -663,13 +667,52 @@ impl WalManager {
     /// never-written shard; any non-origin tail without a cursor must replay.
     pub fn is_fully_consumed(&self) -> Result<bool, WalError> {
         for (project_id, table_name) in self.list_topic_pairs() {
-            let tails = self.current_position(&project_id, &table_name)?;
-            let cursors = self.persisted_read_positions(&project_id, &table_name)?;
-            if tails.into_iter().zip(cursors).any(|(tail, cursor)| cursor.unwrap_or(WalPosition::ORIGIN) != tail) {
+            if !self.is_topic_fully_consumed(&project_id, &table_name)? {
                 return Ok(false);
             }
         }
         Ok(true)
+    }
+
+    fn is_topic_fully_consumed(&self, project_id: &str, table_name: &str) -> Result<bool, WalError> {
+        let tails = self.current_position(project_id, table_name)?;
+        let cursors = self.persisted_read_positions(project_id, table_name)?;
+        Ok(tails.into_iter().zip(cursors).all(|(tail, cursor)| cursor.unwrap_or(WalPosition::ORIGIN) == tail))
+    }
+
+    /// Cursor positions are renumbered on restart. Retain publication proof
+    /// until every physical file present before publication has been reclaimed.
+    /// Older records without a file inventory are conservatively retained.
+    pub(crate) fn retire_flush_publications(&self) -> Result<(), WalError> {
+        if self.recovery_rewind_path().exists() {
+            return Ok(());
+        }
+        let journals = FlushPublicationJournal::load(&self.data_dir)?;
+        // Snapshot intent paths first so a newer intent cannot be compared against an
+        // inventory taken before its WAL append. Scan once for the whole batch.
+        let present = std::fs::read_dir(&self.data_dir)?
+            .map(|entry| entry.map(|entry| PathBuf::from(entry.file_name())))
+            .collect::<std::io::Result<std::collections::HashSet<_>>>()?;
+        // Make the observed WAL unlinks durable before removing their proof.
+        std::fs::File::open(&self.data_dir)?.sync_all()?;
+        for journal in journals {
+            let journal = match journal {
+                // Another post-flush reclamation may have retired this proof
+                // after our filename snapshot. Recovery readers still fail closed.
+                Err(WalError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                journal => journal?,
+            };
+            let record = journal.record();
+            if matches!(record.state, FlushPublicationState::Committed { .. } | FlushPublicationState::Aborted)
+                && self.is_topic_fully_consumed(&record.project_id, &record.table_name)?
+                && let Some(files) = &record.wal_files
+                && files.iter().all(|file| !present.contains(file))
+            {
+                remove_if_exists(&journal.path)?;
+            }
+        }
+        std::fs::File::open(self.data_dir.join(META_DIR))?.sync_all()?;
+        Ok(())
     }
 
     /// Whether startup may skip remote Delta cursor reconciliation from local
@@ -937,12 +980,24 @@ impl WalManager {
 
     /// Returns WAL file count and total size in bytes by scanning the data directory.
     pub fn wal_stats(&self) -> (usize, u64) {
-        std::fs::read_dir(&self.data_dir)
-            .into_iter()
-            .flatten()
-            .flatten()
-            .filter_map(|e| e.metadata().ok().filter(|m| m.is_file()))
-            .fold((0, 0), |(files, bytes), m| (files + 1, bytes + m.len()))
+        let (files, logical, _) = self.wal_usage();
+        (files, logical)
+    }
+
+    /// Logical size includes sparse preallocation; allocated bytes measure
+    /// actual filesystem blocks on Unix.
+    pub fn wal_usage(&self) -> (usize, u64, Option<u64>) {
+        std::fs::read_dir(&self.data_dir).into_iter().flatten().flatten().filter_map(|e| e.metadata().ok().filter(|m| m.is_file())).fold(
+            (0, 0, cfg!(unix).then_some(0)),
+            |(files, bytes, allocated), m| {
+                #[cfg(unix)]
+                let allocated = {
+                    use std::os::unix::fs::MetadataExt;
+                    allocated.map(|n| n + m.blocks() * 512)
+                };
+                (files + 1, bytes + m.len(), allocated)
+            },
+        )
     }
 }
 
@@ -954,6 +1009,255 @@ pub(crate) fn serialize_record_batch(batch: &RecordBatch) -> Result<Vec<u8>, Wal
         w.finish()?;
     }
     Ok(buf)
+}
+
+const WAL_BATCH_IDENTITY_KEY: &str = "timefusion.wal_batch_identity";
+
+/// A logical write and its original row range, independent of WAL block IDs.
+/// The reserved IPC metadata travels with the WAL payload; it is not a user column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub(crate) struct WalBatchIdentity {
+    pub write_id: uuid::Uuid,
+    pub row_offset: u64,
+    pub row_count: u64,
+}
+
+impl WalBatchIdentity {
+    pub(crate) fn from_batch(batch: &RecordBatch) -> Option<Self> {
+        let identity: Self = serde_json::from_str(batch.schema_ref().metadata().get(WAL_BATCH_IDENTITY_KEY)?).ok()?;
+        (!identity.write_id.is_nil() && identity.row_count == batch.num_rows() as u64 && identity.row_offset.checked_add(identity.row_count).is_some())
+            .then_some(identity)
+    }
+
+    /// Extract internal lineage before canonicalizing or exposing the batch schema.
+    pub(crate) fn take_from_batch(batch: RecordBatch) -> Result<(RecordBatch, Option<Self>), WalError> {
+        let identity = Self::from_batch(&batch);
+        if !batch.schema_ref().metadata().contains_key(WAL_BATCH_IDENTITY_KEY) {
+            return Ok((batch, identity));
+        }
+        let mut metadata = batch.schema_ref().metadata().clone();
+        metadata.remove(WAL_BATCH_IDENTITY_KEY);
+        let schema = std::sync::Arc::new(batch.schema_ref().as_ref().clone().with_metadata(metadata));
+        Ok((RecordBatch::try_new(schema, batch.columns().to_vec())?, identity))
+    }
+
+    fn attach(self, batch: RecordBatch) -> Result<RecordBatch, WalError> {
+        let mut metadata = batch.schema_ref().metadata().clone();
+        metadata.insert(WAL_BATCH_IDENTITY_KEY.into(), serde_json::to_string(&self).map_err(|e| WalError::Internal(e.to_string()))?);
+        let schema = std::sync::Arc::new(batch.schema_ref().as_ref().clone().with_metadata(metadata));
+        Ok(RecordBatch::try_new(schema, batch.columns().to_vec())?)
+    }
+}
+
+/// Publication state survives process death. Every attempted immutable Delta
+/// version must be durable before its request can leave this process.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) enum FlushPublicationState {
+    Prepared,
+    Publishing { target: FlushPublicationTarget, versions: Vec<deltalake::kernel::Version> },
+    Committed { target: FlushPublicationTarget, version: deltalake::kernel::Version },
+    Aborted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct FlushPublicationTarget {
+    pub table_uri: String,
+    pub table_id: String,
+    #[serde(default)]
+    pub log_store_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct FlushPublicationRecord {
+    format_version: u32,
+    pub commit_id: uuid::Uuid,
+    pub project_id: String,
+    pub table_name: String,
+    pub write_identities: Vec<WalBatchIdentity>,
+    #[serde(default)]
+    wal_files: Option<Vec<PathBuf>>,
+    /// Exact conditional-PUT payloads, durable before their version is sent.
+    /// Legacy or temporary-file log stores retain version-only evidence.
+    #[serde(default)]
+    pub commit_payloads: std::collections::BTreeMap<deltalake::kernel::Version, String>,
+    pub state: FlushPublicationState,
+}
+
+#[derive(Debug)]
+pub(crate) struct FlushPublicationJournal {
+    path: PathBuf,
+    record: parking_lot::Mutex<FlushPublicationRecord>,
+}
+
+impl FlushPublicationJournal {
+    pub(crate) fn create(data_dir: &Path, project_id: &str, table_name: &str, identities: &[WalBatchIdentity]) -> Result<Self, WalError> {
+        let commit_id = uuid::Uuid::new_v4();
+        let path = meta_path(data_dir, &format!("flush-{commit_id}.json"));
+        let record = FlushPublicationRecord {
+            format_version: 1,
+            commit_id,
+            project_id: project_id.to_owned(),
+            table_name: table_name.to_owned(),
+            write_identities: identities.to_vec(),
+            wal_files: Some(
+                std::fs::read_dir(data_dir)?
+                    .map(|entry| {
+                        let entry = entry?;
+                        Ok(entry.file_type()?.is_file().then(|| PathBuf::from(entry.file_name())))
+                    })
+                    .collect::<std::io::Result<Vec<_>>>()?
+                    .into_iter()
+                    .flatten()
+                    .collect(),
+            ),
+            state: FlushPublicationState::Prepared,
+            commit_payloads: Default::default(),
+        };
+        Self::validate(&path, &record)?;
+        write_json_atomic(&path, &record, true, "flush publication intent")?;
+        Ok(Self { path, record: parking_lot::Mutex::new(record) })
+    }
+
+    fn validate(path: &Path, record: &FlushPublicationRecord) -> Result<(), WalError> {
+        let valid_ranges = !record.write_identities.is_empty()
+            && record
+                .write_identities
+                .iter()
+                .all(|identity| !identity.write_id.is_nil() && identity.row_count > 0 && identity.row_offset.checked_add(identity.row_count).is_some());
+        let valid_state = match &record.state {
+            FlushPublicationState::Prepared | FlushPublicationState::Aborted => true,
+            FlushPublicationState::Publishing { target, versions } => !target.table_id.is_empty() && !target.table_uri.is_empty() && !versions.is_empty(),
+            FlushPublicationState::Committed { target, .. } => !target.table_id.is_empty() && !target.table_uri.is_empty(),
+        };
+        let valid_payloads = record.commit_payloads.iter().all(|(version, payload)| {
+            deltalake::logstore::get_actions(*version, &bytes::Bytes::copy_from_slice(payload.as_bytes())).is_ok()
+                && match &record.state {
+                    FlushPublicationState::Prepared => false,
+                    FlushPublicationState::Publishing { versions, .. } => versions.contains(version),
+                    FlushPublicationState::Committed { version: committed, .. } => version <= committed,
+                    FlushPublicationState::Aborted => true,
+                }
+        });
+        if record.format_version != 1
+            || record.commit_id.is_nil()
+            || !valid_ranges
+            || !valid_state
+            || !valid_payloads
+            || record.wal_files.as_ref().is_some_and(|files| files.iter().any(|file| file.file_name().is_none_or(|name| Path::new(name) != file)))
+            || path.file_name().and_then(|name| name.to_str()) != Some(format!("flush-{}.json", record.commit_id).as_str())
+        {
+            return Err(WalError::InvalidFlushJournal { path: path.to_owned(), reason: "unsupported format or invalid publication identity" });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn paths(data_dir: &Path) -> Result<Vec<PathBuf>, WalError> {
+        std::fs::read_dir(data_dir.join(META_DIR))?
+            .filter_map(|entry| match entry {
+                Ok(entry) if entry.file_name().to_str().is_some_and(|name| name.starts_with("flush-") && name.ends_with(".json")) => Some(Ok(entry.path())),
+                Ok(_) => None,
+                Err(error) => Some(Err(error)),
+            })
+            .collect::<std::io::Result<Vec<_>>>()
+            .map_err(WalError::from)
+    }
+
+    pub(crate) fn open(path: PathBuf) -> Result<Self, WalError> {
+        let record = serde_json::from_slice(&std::fs::read(&path)?)?;
+        Self::validate(&path, &record)?;
+        Ok(Self { path, record: parking_lot::Mutex::new(record) })
+    }
+
+    /// Snapshot filenames, then decode one journal at consumption. A stalled
+    /// global WAL pin can retain many large payloads; never preload them all.
+    pub(crate) fn load(data_dir: &Path) -> Result<impl Iterator<Item = Result<Self, WalError>>, WalError> {
+        Ok(Self::paths(data_dir)?.into_iter().map(Self::open))
+    }
+
+    pub(crate) fn record(&self) -> FlushPublicationRecord {
+        self.record.lock().clone()
+    }
+
+    pub(crate) fn commit_id(&self) -> uuid::Uuid {
+        self.record.lock().commit_id
+    }
+
+    /// The version intent was already durable before publication. Failure to
+    /// cache a proven success must not turn that success into a duplicate retry.
+    pub(crate) fn note_committed(&self, version: deltalake::kernel::Version) {
+        if let Err(error) = self.mark_committed(version) {
+            warn!(event = "flush_publication_checkpoint_failed", commit_id = %self.commit_id(), version, %error,
+                "commit landed; preserving its durable version intent for restart reconciliation");
+        }
+    }
+
+    pub(crate) fn record_version(&self, version: deltalake::kernel::Version, target: FlushPublicationTarget, payload: Option<&[u8]>) -> Result<(), WalError> {
+        let mut current = self.record.lock();
+        let mut record = current.clone();
+        let mut versions = match &record.state {
+            FlushPublicationState::Prepared => Vec::new(),
+            FlushPublicationState::Publishing { target: previous, versions } if previous == &target => versions.clone(),
+            FlushPublicationState::Publishing { .. } | FlushPublicationState::Committed { .. } | FlushPublicationState::Aborted => {
+                return Err(WalError::InvalidFlushJournal { path: self.path.clone(), reason: "publication target changed or attempt already finished" });
+            }
+        };
+        if !versions.contains(&version) {
+            versions.push(version);
+        }
+        if let Some(payload) = payload {
+            let payload =
+                std::str::from_utf8(payload).map_err(|_| WalError::InvalidFlushJournal { path: self.path.clone(), reason: "commit payload is not UTF-8" })?;
+            if record.commit_payloads.get(&version).is_some_and(|previous| previous != payload) {
+                return Err(WalError::InvalidFlushJournal { path: self.path.clone(), reason: "immutable commit payload changed" });
+            }
+            record.commit_payloads.insert(version, payload.to_owned());
+        }
+        record.state = FlushPublicationState::Publishing { target, versions };
+        Self::validate(&self.path, &record)?;
+        write_json_atomic(&self.path, &record, true, "flush publication version")?;
+        *current = record;
+        Ok(())
+    }
+
+    pub(crate) fn mark_aborted(&self) -> Result<(), WalError> {
+        let mut current = self.record.lock();
+        if matches!(current.state, FlushPublicationState::Committed { .. }) {
+            return Err(WalError::InvalidFlushJournal { path: self.path.clone(), reason: "cannot abort a committed publication" });
+        }
+        let mut record = current.clone();
+        record.state = FlushPublicationState::Aborted;
+        write_json_atomic(&self.path, &record, true, "terminal flush failure")?;
+        *current = record;
+        Ok(())
+    }
+
+    pub(crate) fn mark_committed(&self, version: deltalake::kernel::Version) -> Result<(), WalError> {
+        let mut current = self.record.lock();
+        let target = match &current.state {
+            FlushPublicationState::Publishing { target, versions } if versions.contains(&version) => Some(target.clone()),
+            FlushPublicationState::Committed { target, version: previous } if *previous == version => Some(target.clone()),
+            FlushPublicationState::Prepared
+            | FlushPublicationState::Aborted
+            | FlushPublicationState::Publishing { .. }
+            | FlushPublicationState::Committed { .. } => None,
+        }
+        .ok_or_else(|| WalError::InvalidFlushJournal { path: self.path.clone(), reason: "commit version was never observed" })?;
+        let mut record = current.clone();
+        record.state = FlushPublicationState::Committed { target, version };
+        write_json_atomic(&self.path, &record, true, "confirmed flush publication")?;
+        *current = record;
+        Ok(())
+    }
+}
+
+/// Always mint a new identity at admission, including for byte-identical appends.
+/// A client-supplied reserved identity must never establish recovery proof.
+pub(crate) fn identify_batch_for_wal(batch: RecordBatch) -> Result<RecordBatch, WalError> {
+    if batch.num_rows() == 0 {
+        return WalBatchIdentity::take_from_batch(batch).map(|(batch, _)| batch);
+    }
+    WalBatchIdentity { write_id: uuid::Uuid::new_v4(), row_offset: 0, row_count: batch.num_rows() as u64 }.attach(batch)
 }
 
 /// Serialize `batch` into one or more independently-replayable IPC payloads:
@@ -985,12 +1289,22 @@ fn split_to_wal_payloads(batch: &RecordBatch, target: usize, hard_max: usize) ->
         None => (batch.clone(), data.len()),
     };
     drop(data);
+    let identity = WalBatchIdentity::from_batch(&batch);
     // +1 chunk of headroom absorbs row-size skew without a second pass.
     let chunks = parent_len.div_ceil(target) + 1;
     let rows_per = batch.num_rows().div_ceil(chunks).max(1);
     (0..batch.num_rows()).step_by(rows_per).try_fold(Vec::with_capacity(chunks), |mut out, start| {
         let len = rows_per.min(batch.num_rows() - start);
         let chunk = crate::write::mem_buffer::compact_batch(batch.slice(start, len));
+        let chunk = match identity {
+            Some(identity) => WalBatchIdentity {
+                row_offset: identity.row_offset.checked_add(start as u64).ok_or_else(|| WalError::Internal("WAL identity row offset overflow".into()))?,
+                row_count: len as u64,
+                ..identity
+            }
+            .attach(chunk)?,
+            None => chunk,
+        };
         let chunk_data = serialize_record_batch(&chunk)?;
         if chunk_data.len() <= target || len <= 1 {
             if chunk_data.len() > hard_max {
@@ -1028,7 +1342,7 @@ fn flatten_dictionary_columns(batch: &RecordBatch) -> Result<Option<RecordBatch>
             _ => Ok(((**f).clone(), c.clone())),
         })
         .collect::<Result<_, WalError>>()?;
-    Ok(Some(RecordBatch::try_new(std::sync::Arc::new(arrow::datatypes::Schema::new(fields)), cols)?))
+    Ok(Some(RecordBatch::try_new(std::sync::Arc::new(arrow::datatypes::Schema::new_with_metadata(fields, batch.schema_ref().metadata().clone())), cols)?))
 }
 
 pub(crate) fn deserialize_record_batch(data: &[u8]) -> Result<RecordBatch, WalError> {
@@ -1175,11 +1489,8 @@ pub(crate) fn write_atomic_with(target: &std::path::Path, durable: bool, write: 
             let _ = std::fs::remove_file(&tmp);
         })?;
         std::fs::rename(&tmp, target)?;
-        if durable
-            && let Some(dir) = target.parent()
-            && let Ok(d) = std::fs::File::open(dir)
-        {
-            let _ = d.sync_all();
+        if durable && let Some(dir) = target.parent() {
+            std::fs::File::open(if dir.as_os_str().is_empty() { Path::new(".") } else { dir })?.sync_all()?;
         }
         Ok(())
     })
@@ -1209,6 +1520,7 @@ fn read_cursor_snapshot(wal_dir: &std::path::Path) -> Option<CursorSnapshot> {
 pub struct WalDirLock {
     // Never read after construction — its liveness IS the lock.
     _file: std::fs::File,
+    wal_dir: PathBuf,
 }
 
 impl WalDirLock {
@@ -1227,7 +1539,7 @@ impl WalDirLock {
                     if waits > 0 {
                         info!("WAL dir lock acquired after waiting for a previous process to exit");
                     }
-                    return Ok(Self { _file: file });
+                    return Ok(Self { _file: file, wal_dir: std::fs::canonicalize(wal_dir)? });
                 }
                 // Ok(false) = another live TimeFusion process owns the WAL.
                 // Poll at 25ms; log every ~10s (400 polls), escalate past ~60s.
@@ -1270,6 +1582,10 @@ impl WalDirLock {
                 Err(e) => return Err(WalError::Io(e)),
             }
         }
+    }
+
+    pub(crate) fn owns_dir(&self, wal_dir: &Path) -> bool {
+        std::fs::canonicalize(wal_dir).is_ok_and(|path| path == self.wal_dir)
     }
 }
 
@@ -1560,6 +1876,150 @@ mod tests {
                 deserialize_record_batch(p).unwrap()
             })
             .collect()
+    }
+
+    #[test_case::test_case(false ; "string rows")]
+    #[test_case::test_case(true ; "dictionary rows")]
+    fn wal_identity_survives_row_splitting_and_distinguishes_identical_appends(dictionary: bool) {
+        let mut original = str_batch(&wide_strs(12, 512));
+        if dictionary {
+            let array = arrow::compute::cast(original.column(0), &DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8))).unwrap();
+            original = RecordBatch::try_new(Arc::new(Schema::new(vec![Field::new("body", array.data_type().clone(), false)])), vec![array]).unwrap();
+        }
+        let first = identify_batch_for_wal(original.clone()).unwrap();
+        let identity = WalBatchIdentity::from_batch(&first).unwrap();
+        let second = identify_batch_for_wal(first.clone()).unwrap();
+        assert_ne!(identity.write_id, WalBatchIdentity::from_batch(&second).unwrap().write_id, "a supplied identity must be replaced");
+        let empty = identify_batch_for_wal(first.slice(0, 0)).unwrap();
+        assert!(WalBatchIdentity::from_batch(&empty).is_none(), "empty appends cannot mint an unflushable publication intent");
+        let payloads = split_to_wal_payloads(&first, 2_000, MAX_BATCH_SIZE).unwrap();
+        assert!(payloads.len() > 1, "the real IPC splitter must divide this fixture");
+        let mut covered_rows = 0;
+        for batch in decode_bounded(&payloads, 2_000) {
+            let part = WalBatchIdentity::from_batch(&batch).expect("each replayable fragment must carry a valid identity");
+            assert_eq!(part.write_id, identity.write_id);
+            assert_eq!(part.row_offset, covered_rows, "fragments must tile the original write without overlap or gaps");
+            covered_rows += part.row_count;
+            let expected_columns = batch.columns().to_vec();
+            let (stripped, extracted) = WalBatchIdentity::take_from_batch(batch).unwrap();
+            assert_eq!(extracted, Some(part));
+            assert_eq!(stripped.columns(), expected_columns, "extracting lineage preserves rows");
+            assert!(!stripped.schema_ref().metadata().contains_key(WAL_BATCH_IDENTITY_KEY));
+        }
+        assert_eq!(covered_rows, original.num_rows() as u64);
+        assert!(WalBatchIdentity::from_batch(&original).is_none(), "legacy IPC payloads have no new recovery proof");
+        for invalid in ["not-json".to_owned(), serde_json::to_string(&WalBatchIdentity { write_id: uuid::Uuid::nil(), ..identity }).unwrap()] {
+            let metadata = [(WAL_BATCH_IDENTITY_KEY.to_owned(), invalid), ("user".to_owned(), "preserved".to_owned())].into();
+            let schema = Arc::new(original.schema_ref().as_ref().clone().with_metadata(metadata));
+            let invalid = RecordBatch::try_new(schema, original.columns().to_vec()).unwrap();
+            let (stripped, extracted) = WalBatchIdentity::take_from_batch(invalid).unwrap();
+            assert!(extracted.is_none(), "malformed identities must not establish publication proof");
+            assert_eq!(stripped.schema_ref().metadata().get("user").map(String::as_str), Some("preserved"));
+            assert!(!stripped.schema_ref().metadata().contains_key(WAL_BATCH_IDENTITY_KEY));
+        }
+    }
+
+    #[test_case::test_case(true ; "confirmed publication waits for durable cursor retirement")]
+    #[test_case::test_case(false ; "terminal failure waits for durable cursor retirement")]
+    fn flush_publication_journal_survives_reopen_and_reclaims_after_cursor(committed: bool) {
+        let (dir, wal, table) = wal_fixture("flush-journal", crate::config::WalFsyncMode::SyncEach, 1);
+        let batch = identify_batch_for_wal(create_test_batch()).unwrap();
+        let identity = WalBatchIdentity::from_batch(&batch).unwrap();
+        wal.append("proj", &table, &batch).unwrap();
+        let journal = FlushPublicationJournal::create(dir.path(), "proj", &table, &[identity]).unwrap();
+        let commit_id = journal.commit_id();
+        let target = FlushPublicationTarget { table_uri: "memory:///journal".into(), table_id: uuid::Uuid::new_v4().to_string(), log_store_name: None };
+        let payload = serde_json::to_vec(&serde_json::json!({"commitInfo": {"timefusion.flush_commit_id": commit_id, "note": "durable λ\n"}})).unwrap();
+        journal.record_version(1, target.clone(), Some(&payload)).unwrap();
+        assert!(journal.record_version(1, target.clone(), Some(b"{}")).is_err(), "an attempted version's bytes cannot change");
+        assert!(journal.record_version(2, target.clone(), Some(&[0xff])).is_err(), "invalid UTF-8 cannot replace durable evidence");
+        assert!(journal.record_version(2, target.clone(), Some(b"not-json")).is_err(), "malformed Delta actions cannot become recovery evidence");
+        journal.record_version(2, target.clone(), None).unwrap();
+        drop(journal);
+        let journals = FlushPublicationJournal::load(dir.path()).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(journals.len(), 1);
+        let journal = &journals[0];
+        assert_eq!(journal.commit_id(), commit_id);
+        assert_eq!(journal.record().write_identities, [identity]);
+        assert_eq!(journal.record().commit_payloads.get(&1).map(String::as_bytes), Some(payload.as_slice()));
+        assert!(!journal.record().commit_payloads.contains_key(&2), "legacy version-only evidence stays conservative");
+        assert!(matches!(journal.record().state, FlushPublicationState::Publishing { versions, .. } if versions == [1, 2]));
+        let blocked = journal.path.with_extension("json.tmp");
+        std::fs::create_dir(&blocked).unwrap();
+        assert!(journal.record_version(3, target, Some(&payload)).is_err(), "a failed fsync/write must prevent publication of the next version");
+        assert!(matches!(journal.record().state, FlushPublicationState::Publishing { versions, .. } if versions == [1, 2]));
+        assert!(!journal.record().commit_payloads.contains_key(&3), "failed persistence cannot expose resumable commit bytes");
+        std::fs::remove_dir(blocked).unwrap();
+        assert!(journal.mark_committed(3).is_err(), "an unobserved version cannot authorize replay skips");
+        if committed {
+            journal.mark_committed(2).unwrap();
+        } else {
+            journal.mark_aborted().unwrap();
+        }
+        wal.retire_flush_publications().unwrap();
+        assert_eq!(FlushPublicationJournal::load(dir.path()).unwrap().collect::<Result<Vec<_>, _>>().unwrap().len(), 1, "unread WAL still requires the intent");
+        wal.write_recovery_rewind_marker().unwrap();
+        let tail = wal.current_position("proj", &table).unwrap();
+        wal.set_persisted_positions("proj", &table, &tail).unwrap();
+        wal.retire_flush_publications().unwrap();
+        assert_eq!(
+            FlushPublicationJournal::load(dir.path()).unwrap().collect::<Result<Vec<_>, _>>().unwrap().len(),
+            1,
+            "a replay rewind vetoes reclamation even at the consumed tail"
+        );
+        wal.remove_recovery_rewind_marker();
+        wal.retire_flush_publications().unwrap();
+        assert_eq!(
+            FlushPublicationJournal::load(dir.path()).unwrap().collect::<Result<Vec<_>, _>>().unwrap().len(),
+            1,
+            "consumed WAL can still replay after block IDs are renumbered"
+        );
+        for file in journal.record().wal_files.unwrap() {
+            std::fs::remove_file(dir.path().join(file)).unwrap();
+        }
+        wal.retire_flush_publications().unwrap();
+        assert!(FlushPublicationJournal::load(dir.path()).unwrap().collect::<Result<Vec<_>, _>>().unwrap().is_empty());
+        let journal = FlushPublicationJournal::create(dir.path(), "proj", &table, &[identity]).unwrap();
+        std::fs::write(&journal.path, b"not-json").unwrap();
+        assert!(
+            matches!(FlushPublicationJournal::load(dir.path()).unwrap().collect::<Result<Vec<_>, _>>(), Err(WalError::FlushJournalDecode(_))),
+            "corrupt proof must not be silently discarded"
+        );
+        assert!(journal.path.exists());
+    }
+
+    #[test_case::test_case(1; "one retained payload")]
+    #[test_case::test_case(64; "many retained payloads")]
+    fn flush_publication_reader_snapshots_names_without_preloading_payloads(count: usize) {
+        let (dir, wal, table) = wal_fixture("lazy-flush-journals", crate::config::WalFsyncMode::SyncEach, 1);
+        let batch = identify_batch_for_wal(create_test_batch()).unwrap();
+        let identity = WalBatchIdentity::from_batch(&batch).unwrap();
+        wal.append("proj", &table, &batch).unwrap();
+        let target = FlushPublicationTarget { table_uri: "memory:///lazy-journals".into(), table_id: uuid::Uuid::new_v4().to_string(), log_store_name: None };
+        let note = "x".repeat(1024 * 1024);
+        for _ in 0..count {
+            let journal = FlushPublicationJournal::create(dir.path(), "proj", &table, &[identity]).unwrap();
+            let payload = serde_json::to_vec(&serde_json::json!({"commitInfo": {"timefusion.flush_commit_id": journal.commit_id(), "note": note}})).unwrap();
+            journal.record_version(1, target.clone(), Some(&payload)).unwrap();
+            journal.mark_aborted().unwrap();
+        }
+        wal.retire_flush_publications().unwrap();
+        let paths = FlushPublicationJournal::paths(dir.path()).unwrap();
+        assert_eq!(paths.len(), count, "unread WAL retains every terminal attempt's proof");
+        let journals = FlushPublicationJournal::load(dir.path()).unwrap();
+        // New intents cannot enter a snapshot that GC may compare with an
+        // earlier WAL-file inventory. Existing payloads must still be read late.
+        let later = FlushPublicationJournal::create(dir.path(), "proj", &table, &[identity]).unwrap();
+        for path in paths {
+            std::fs::write(path, b"not-json").unwrap();
+        }
+        let mut consumed = 0;
+        for journal in journals {
+            assert!(matches!(journal, Err(WalError::FlushJournalDecode(_))), "the reader must not cache a payload before consumption");
+            consumed += 1;
+        }
+        assert_eq!(consumed, count, "a later intent must not enter the earlier filename snapshot");
+        assert!(later.path.exists());
     }
 
     // Arrow IPC decode hands every column a slice of one message-body

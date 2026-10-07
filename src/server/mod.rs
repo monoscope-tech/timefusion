@@ -12,7 +12,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     config::AppConfig,
     database::Database,
-    write::{BufferedWriteLayer, DeltaWatermark},
+    write::{BufferedWriteLayer, FlushCommitContext},
 };
 
 /// Fully initialized server state.
@@ -95,6 +95,7 @@ pub async fn bootstrap(cfg: Arc<AppConfig>) -> Result<Bootstrapped> {
     // derive cursors from Delta so WAL replay doesn't re-inject entries Delta
     // already has.
     let wal_ref = buffered_layer.wal();
+    db.reconcile_flush_publications(buffered_layer.as_ref()).await?;
     let t_snap = std::time::Instant::now();
     let clean_snapshot = wal_ref.load_cursor_snapshot().is_some_and(|snap| wal_ref.restore_cursor_snapshot(&snap).is_ok() && snap.clean_shutdown);
     let local_wal_consumed = !clean_snapshot && wal_ref.can_skip_delta_reconcile().unwrap_or(false);
@@ -156,7 +157,7 @@ pub fn tantivy_index_callback(db: &Database, indexer: Arc<crate::tantivy::search
 /// Creates the per-bucket Delta writer shared by production and tests.
 pub fn delta_write_callback(db: &crate::database::Database) -> crate::write::DeltaWriteCallback {
     let db = db.clone();
-    Arc::new(move |project_id: String, table_name: String, batches: Vec<RecordBatch>, wal_watermark: DeltaWatermark| {
+    Arc::new(move |project_id: String, table_name: String, batches: Vec<RecordBatch>, wal_watermark: FlushCommitContext| {
         let db = db.clone();
         Box::pin(async move { db.insert_records_batch(&project_id, &table_name, batches, true, Some(&wal_watermark)).await })
     })

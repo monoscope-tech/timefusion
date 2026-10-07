@@ -613,6 +613,21 @@ impl TableFunctionImpl for PgShowAllSettingsFunction {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test_case::test_case("42", false, true ; "numeric literal")]
+    #[test_case::test_case("0", false, true ; "zero is not empty")]
+    #[test_case::test_case("''", true, false ; "empty text")]
+    #[test_case::test_case("'value'", false, true ; "nonempty text")]
+    #[test_case::test_case("NULL::bigint", true, false ; "typed numeric null")]
+    #[test_case::test_case("false", false, true ; "boolean is not empty")]
+    #[tokio::test]
+    async fn generated_empty_checks_accept_nontext_values(value: &str, empty: bool, nonempty: bool) {
+        let ctx = SessionContext::new();
+        let sql = format!("SELECT ({value} IS NULL OR ({value})::text = ''), ({value} IS NOT NULL AND ({value})::text != '')");
+        let batches = ctx.sql(&sql).await.unwrap().collect().await.unwrap();
+        let values: Vec<_> = batches[0].columns().iter().map(|a| a.as_any().downcast_ref::<BooleanArray>().unwrap().value(0)).collect();
+        assert_eq!(values, [empty, nonempty]);
+    }
     use datafusion::arrow::array::AsArray;
 
     /// Runs `sql` on a session wired the way pgwire wires one, as user `operator`.
@@ -909,10 +924,14 @@ impl StatsTableProvider {
                         "dirty_livelock_takes_total" => s.dirty_livelock_takes_total,
                         "flush_completed_total" => s.flush_completed_total,
                         "flush_failed_total" => s.flush_failed_total,
-                        // Ingest-vs-drain; `rows_in_buffer_lag` ≈ rows currently buffered.
+                        // DML retractions and replacements also remove buffered rows,
+                        // so cumulative ingest-minus-flush is not the backlog.
                         "rows_ingested_total" => s.rows_ingested_total,
                         "rows_flushed_total" => s.rows_flushed_total,
-                        "rows_in_buffer_lag" => s.rows_ingested_total.saturating_sub(s.rows_flushed_total),
+                        "rows_in_buffer_lag" => s.mem_total_rows,
+                        "airborne_topics" => s.airborne_topics,
+                        "retry_topics" => s.retry_topics,
+                        "next_retry_secs" => or_null(s.next_retry_secs),
                         // Drain effectiveness: flat under pressure ⇒ the flush path is
                         // draining empty buckets.
                         "flush_freed_bytes_total" => s.flush_freed_bytes_total,
@@ -940,6 +959,13 @@ impl StatsTableProvider {
                     rows!["wal";
                         "files" => s.wal_files,
                         "disk_bytes" => s.wal_disk_bytes,
+                        "allocated_bytes" => or_null(s.wal_allocated_bytes),
+                        "oldest_pin_age_secs" => or_null(s.wal_pin_age_secs),
+                        "inflight_pins" => s.inflight_wal_pins,
+                        "oldest_buffered_pin_project" => or_null(s.oldest_buffered_wal_pin.as_ref().map(|p| p.project_id.as_str())),
+                        "oldest_buffered_pin_table" => or_null(s.oldest_buffered_wal_pin.as_ref().map(|p| p.table_name.as_str())),
+                        "oldest_buffered_pin_bucket" => or_null(s.oldest_buffered_wal_pin.as_ref().map(|p| p.bucket_id)),
+                        "oldest_buffered_pin_empty" => or_null(s.oldest_buffered_wal_pin.as_ref().map(|p| p.empty)),
                         "disk_mb" => mb(s.wal_disk_bytes as f64),
                         // Parked payloads, invisible to wal_disk_bytes. Alert if > 0.
                         "quarantine_files" => s.quarantine_files,

@@ -3664,6 +3664,14 @@ mod tests {
              FROM {SOURCE} WHERE project_id = 'project' AND {SERVER} AND {WINDOW} GROUP BY 1"
         ),
         &["server_error_count"] ; "an aggregate filter combines with the promoted row filter")]
+    #[test_case::test_case(
+        &format!(
+            "SELECT time_bucket('1 hours', timestamp) AS bucket, \
+                    ROUND((COALESCE(COUNT(*) FILTER (WHERE status_code = 'ERROR' OR COALESCE(attributes___http___response___status_code, 0) >= 500)::float * 100 \
+                    / NULLIF(COUNT(*)::float, 0), 0))::numeric, 2)::float AS error_pct \
+             FROM {SOURCE} WHERE project_id = 'project' AND {SERVER} AND {WINDOW} GROUP BY 1"
+        ),
+        &["server_error_count", "server_request_count"] ; "the status percentage uses both declared server measures")]
     // An aggregate inside a CTE is reachable because the matcher searches the tree instead of peeling the root.
     #[test_case::test_case(
         &format!(
@@ -4035,6 +4043,14 @@ mod tests {
              AND timestamp >= to_timestamp_micros(0) AND timestamp < to_timestamp_micros(960000000) GROUP BY 1"
         ),
         MissReason::PartialBucket ; "a grain decline is not masked by a tier that cannot serve the scope")]
+    #[test_case::test_case(
+        &format!(
+            "SELECT time_bucket('30 seconds', timestamp), \
+                    COUNT(*) FILTER (WHERE status_code = 'ERROR' OR COALESCE(attributes___http___response___status_code, 0) >= 500) AS errors, \
+                    COUNT(*) AS requests FROM {SOURCE} WHERE project_id = 'project' AND {SERVER} \
+             AND timestamp >= to_timestamp_micros(0) AND timestamp < to_timestamp_micros(10800000000) GROUP BY 1"
+        ),
+        MissReason::PartialBucket ; "the status percentage cannot split a minute grain into 30-second buckets")]
     #[tokio::test]
     async fn a_shape_the_matcher_refuses_names_its_reason(sql: &str, reason: MissReason) {
         let miss = route_alone(sql).await.err();

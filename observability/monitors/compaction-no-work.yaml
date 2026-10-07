@@ -1,0 +1,30 @@
+active: true
+alert_recovery_threshold: null
+alert_threshold: 5000.0
+check_interval_mins: 15
+email_all: false
+emails:
+- anthony@talstack.com
+environment: null
+message: Compaction units are repeatedly claiming cells and selecting no bin. A converged
+  partition does this occasionally; thousands per hour means the lane is spinning
+  and burning CPU without retiring files. Pair with compaction_seconds_since_commit
+  to tell a wedge from a quiet period.
+notify_after_mins: null
+query: metrics | where metric_name == "timefusion.maintenance.compaction_units_selected_nothing"
+  | summarize increase(value)
+service: null
+severity: warning
+slack_channels: []
+stop_after_count: null
+subject: TimeFusion compaction lane spinning
+teams: []
+threshold_sustained_for_mins: 30
+time_window_mins: 60
+title: 'TF warn: compaction units claiming cells and doing nothing'
+trigger_less_than: false
+unit: null
+visualization_type: numeric
+warning_recovery_threshold: null
+warning_threshold: null
+

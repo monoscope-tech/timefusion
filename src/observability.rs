@@ -382,6 +382,31 @@ pub fn init_metrics(
         })
         .build();
 
+    // Read filesystem space once per export callback, rather than in every
+    // snapshot_stats call. Unknown mounts emit no sample, not a false zero.
+    let bl_for_disk = buffered_layer.clone();
+    meter
+        .u64_observable_gauge("timefusion.wal.filesystem_available_bytes")
+        .with_description("Available bytes on the filesystem hosting the WAL")
+        .with_callback(move |obs| {
+            if let Some((_, available)) = bl_for_disk.upgrade().and_then(|l| crate::config::disk_space_for(l.wal().data_dir())) {
+                obs.observe(available, &[]);
+            }
+        })
+        .build();
+    let bl_for_disk_pct = buffered_layer.clone();
+    meter
+        .u64_observable_gauge("timefusion.wal.filesystem_free_pct")
+        .with_description("Available space as a percentage of the filesystem hosting the WAL")
+        .with_callback(move |obs| {
+            if let Some((total, available)) = bl_for_disk_pct.upgrade().and_then(|l| crate::config::disk_space_for(l.wal().data_dir()))
+                && total > 0
+            {
+                obs.observe(available.saturating_mul(100) / total, &[]);
+            }
+        })
+        .build();
+
     // One observable metric. `|s| value` upgrades the Weak, snapshots stats and
     // observes a derived value; a plain expression is read from a process-global
     // atomic, evaluated once per export cycle. Use `counter` for cumulative
@@ -417,7 +442,11 @@ pub fn init_metrics(
     observe!(counter "timefusion.mem_buffer.rows_ingested_total", "Cumulative rows accepted into MemBuffer (incl. WAL recovery)", |s| s
         .rows_ingested_total);
     observe!(counter "timefusion.mem_buffer.rows_flushed_total", "Cumulative rows drained from MemBuffer to Delta", |s| s.rows_flushed_total);
-    observe!(gauge "timefusion.wal.disk_bytes", "Disk bytes occupied by WAL shards", |s| s.wal_disk_bytes);
+    observe!(gauge "timefusion.wal.disk_bytes", "Logical WAL file size, including sparse preallocation", |s| s.wal_disk_bytes);
+    observe!(gauge "timefusion.wal.allocated_bytes", "Filesystem blocks allocated to WAL files (Unix)", |s| s.wal_allocated_bytes.unwrap_or(0));
+    observe!(gauge "timefusion.wal.oldest_pin_age_seconds", "Age of oldest buffered, in-flight, or orphaned WAL retention pin", |s| s.wal_pin_age_secs.unwrap_or(0));
+    observe!(gauge "timefusion.flush.airborne_topics", "Topics with detached or unresolved commits", |s| s.airborne_topics as u64);
+    observe!(gauge "timefusion.flush.retry_topics", "Topics awaiting another flush attempt", |s| s.retry_topics as u64);
     observe!(gauge "timefusion.wal.files", "Number of WAL segment files on disk", |s| s.wal_files as u64);
     observe!(gauge "timefusion.tantivy.recovery_pending_files", "Committed Parquet files awaiting post-WAL-replay Tantivy indexing", |s| s
         .tantivy_recovery_pending_files

@@ -1,0 +1,12 @@
+title: 'TF warn: stalled or failed detached flush commits'
+query: 'resource.service.name == "timefusion" and (body contains "commit stalled" or body contains "flush_detached_commit_failed" or body contains "flush_detached_commit_hung" or body contains "flush_commit_landing_unconfirmed") | summarize count()'
+alert_threshold: 0
+trigger_less_than: false
+check_interval_mins: 5
+time_window_mins: 15
+severity: warning
+message: 'A flush exceeded its watchdog, failed, or remains in commit reconciliation. Inspect storage errors, airborne topics, retry topics, and the oldest WAL retention pin. Preserve unflushed WAL; an absent response does not prove a commit failed.'
+emails: [anthony@talstack.com]
+slack_channels: []
+teams: []
+visualization_type: numeric

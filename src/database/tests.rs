@@ -4567,6 +4567,54 @@ async fn reconcile_skips_dedup_and_rollup_remint_for_tagged_dv_dedup_commits() -
 /// The maintenance journal must be `fsync`ed before a write is acknowledged, but that
 /// barrier must not be paid once per (project, date) in the batch. Asserts the COST,
 /// not just the outcome: a per-partition version produces the same journal.
+/// Invalidation must describe admitted data, including mixed batches; otherwise
+/// rejected future timestamps create durable maintenance work with no source.
+#[test_case(true, false; "all incoming rows rejected")]
+#[test_case(true, true; "only accepted rows invalidate")]
+#[test_case(false, true; "DML reappend retains original timestamps")]
+#[serial]
+#[tokio::test]
+async fn buffered_admission_invalidates_only_retained_rows(bound: bool, mixed: bool) -> Result<()> {
+    const DAY: i64 = 86_400_000_000;
+    let now = chrono::DateTime::parse_from_rfc3339("2026-10-01T11:19:03Z")?.timestamp_micros();
+    crate::support::set_micros(now);
+    let _clock = scopeguard::guard((), |_| crate::support::unfreeze());
+    let dir = tempfile::tempdir()?;
+    let cfg = test_config_with("admitted-rollup-invalidations", |cfg| cfg.core.timefusion_data_dir = dir.path().to_path_buf());
+    let layer = Arc::new(crate::support::test_helpers::test_layer(cfg.clone())?);
+    let db = Database::with_config(cfg.clone()).await?.with_buffered_layer(layer.clone());
+    db.cancel_maintenance();
+    let project = "admitted-rollup-project";
+    let source = "otel_logs_and_spans";
+    let timestamps: Vec<_> = [now + 8 * DAY, now + 9 * DAY].into_iter().chain(mixed.then_some(now)).collect();
+    let batch = json_to_batch(
+        timestamps.iter().enumerate().map(|(id, &ts)| crate::support::test_helpers::test_span_ts(&id.to_string(), "admission", project, ts)).collect(),
+    )?;
+    db.insert_records_batch_bounded(project, source, vec![batch], false, None, bound, false).await?;
+    let retained: Vec<_> = timestamps.into_iter().filter(|&ts| !bound || ts == now).collect();
+    let expected_dates: HashSet<_> = retained.iter().map(|&ts| chrono::DateTime::from_timestamp_micros(ts).unwrap().date_naive().to_string()).collect();
+    assert_eq!(layer.snapshot_stats().mem_total_rows, retained.len());
+    db.flush_rollup_journal()?;
+    let actual_dates: HashSet<_> =
+        crate::rollup_journal::load(&cfg.core.timefusion_data_dir).into_iter().filter(|entry| entry.project_id == project).map(|entry| entry.date).collect();
+    assert_eq!(actual_dates, expected_dates, "rejected rows must not leave durable dirty partitions");
+    let task_dates: HashSet<_> = db
+        .journal()
+        .tasks()
+        .filter(|task| task.key.project_id == project)
+        .map(|task| chrono::DateTime::from_timestamp_micros(task.key.slice.start_micros).unwrap().date_naive().to_string())
+        .collect();
+    assert_eq!(task_dates, expected_dates, "maintenance tasks must describe all and only admitted dates");
+    let (entries, errors) = layer.wal().read_entries_raw(project, source, None, true)?;
+    assert_eq!(errors, 0);
+    let rows = entries
+        .iter()
+        .map(|entry| crate::write::wal::deserialize_record_batch(&entry.data).map(|batch| batch.num_rows()))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    assert_eq!(rows.into_iter().sum::<usize>(), retained.len(), "only admitted rows enter WAL");
+    Ok(())
+}
+
 #[tokio::test]
 async fn a_multi_partition_invalidation_costs_one_journal_commit() -> Result<()> {
     use datafusion::arrow::{
@@ -6308,6 +6356,23 @@ fn a_strip_outranking_a_pair_is_no_invariant_violation(files: &[(i64, bool)]) ->
     (super::select_cell_bin(&cells, policy).len(), super::refused_cells(&cells, policy))
 }
 
+/// A large DV file can be selected alone after a small clean file would exceed
+/// the bin budget with it. That strip is useful work, not a planner refusal.
+#[test]
+fn a_lone_strip_beside_a_small_file_is_no_invariant_violation() {
+    let cell = vec![
+        tail_file("small", 10 * MB, true, None, false, Some(10)),
+        tail_file("large", 300 * MB, true, None, false, Some(10)),
+        stripped(tail_file("dv", 350 * MB, true, None, true, Some(10)), true),
+    ];
+    let cells = super::slice_cells(cell, &[]);
+    let policy = hygiene_policy(super::COORDINATOR_HOT_TARGET_BYTES);
+    let selected = super::select_cell_bin(&cells, policy);
+    assert_eq!(selected, ["dv"]);
+    assert!(super::single_strip_selected(&cells, &selected));
+    assert_eq!(super::refused_cells(&cells, policy), 0);
+}
+
 /// The coordinator packer's policy.
 fn hygiene_policy(target_size: i64) -> super::BinPolicy {
     super::BinPolicy { target_size, max_rows: u64::MAX, order: super::BinOrder::SmallestFirst, level_unsorted_first: true }
@@ -6848,22 +6913,22 @@ async fn a_timed_out_commit_frees_the_lock_and_lands_unconfirmed() {
             std::time::Duration::from_millis(50),
             "wave_commit",
             "otel_logs_and_spans",
-            futures::future::pending::<std::result::Result<(), String>>(),
+            futures::future::pending::<std::result::Result<(), std::io::Error>>(),
         )
         .await
         .expect_err("a never-answering commit must be abandoned")
     };
-    assert!(failure.timed_out, "the failure must be marked as an abandoned await, not a plain error");
+    assert!(failure.publication_uncertain, "the failure must be marked as an abandoned await, not a plain error");
     assert!(started.elapsed() < std::time::Duration::from_secs(5), "the bound, not the store, decides when the lock is freed");
     assert!(lock.try_lock().is_ok(), "the next committer must find the lock free");
-    // The routing decision the wave/flush paths make with `timed_out`.
-    assert!(matches!(super::probe_after_timeout(super::CommitProbe::NotLanded, failure.timed_out), super::CommitProbe::Inconclusive));
-    assert!(matches!(super::probe_after_timeout(super::CommitProbe::Inconclusive, true), super::CommitProbe::Inconclusive));
+    // The routing decision the wave/flush paths make with `publication_uncertain`.
+    assert!(matches!(super::probe_after_uncertain_commit(super::CommitProbe::NotLanded, failure.publication_uncertain), super::CommitProbe::Inconclusive));
+    assert!(matches!(super::probe_after_uncertain_commit(super::CommitProbe::Inconclusive, true), super::CommitProbe::Inconclusive));
     // Positive evidence still passes through — a landed commit is credited.
-    assert!(matches!(super::probe_after_timeout(super::CommitProbe::Landed, true), super::CommitProbe::Landed));
+    assert!(matches!(super::probe_after_uncertain_commit(super::CommitProbe::Landed, true), super::CommitProbe::Landed));
     // Without a timeout, a probe's "did not land" is trusted (that IS how
     // orphaned staged parquet gets reclaimed).
-    assert!(matches!(super::probe_after_timeout(super::CommitProbe::NotLanded, false), super::CommitProbe::NotLanded));
+    assert!(matches!(super::probe_after_uncertain_commit(super::CommitProbe::NotLanded, false), super::CommitProbe::NotLanded));
 }
 
 /// The backstop must be invisible on the happy path and must not swallow
@@ -6871,13 +6936,79 @@ async fn a_timed_out_commit_frees_the_lock_and_lands_unconfirmed() {
 #[tokio::test]
 async fn bounded_commit_await_passes_success_and_errors_through() {
     let ok: std::result::Result<u8, super::CommitFailure> =
-        super::bounded_commit_await(std::time::Duration::from_secs(30), "flush_commit", "t", async { Ok::<_, String>(7u8) }).await;
+        super::bounded_commit_await(std::time::Duration::from_secs(30), "flush_commit", "t", async { Ok::<_, std::io::Error>(7u8) }).await;
     assert_eq!(ok.map_err(|e| e.message), Ok(7));
-    let err = super::bounded_commit_await(std::time::Duration::from_secs(30), "flush_commit", "t", async { Err::<(), _>("version already exists") })
-        .await
-        .expect_err("errors propagate");
-    assert!(!err.timed_out, "a real commit error must keep its normal (probe/OCC) classification");
+    let err = super::bounded_commit_await(std::time::Duration::from_secs(30), "flush_commit", "t", async {
+        Err::<(), _>(std::io::Error::other("version already exists"))
+    })
+    .await
+    .expect_err("errors propagate");
+    assert!(!err.publication_uncertain, "a real commit error must keep its normal (probe/OCC) classification");
     assert_eq!(err.message, "version already exists");
+}
+
+#[test_case(object_store::client::HttpErrorKind::Connect, false; "connection failure is retryable")]
+#[test_case(object_store::client::HttpErrorKind::Timeout, true; "response timeout is uncertain")]
+#[test_case(object_store::client::HttpErrorKind::Interrupted, true; "response connection was lost")]
+#[test_case(object_store::client::HttpErrorKind::Request, true; "request may have been sent")]
+#[test_case(object_store::client::HttpErrorKind::Decode, true; "response could not be decoded")]
+#[test_case(object_store::client::HttpErrorKind::Unknown, true; "unknown transport outcome is uncertain")]
+#[tokio::test]
+async fn commit_transport_errors_keep_their_publication_class(kind: object_store::client::HttpErrorKind, uncertain: bool) {
+    let source =
+        object_store::Error::Generic { store: "S3", source: Box::new(object_store::client::HttpError::new(kind, std::io::Error::other("transport failed"))) };
+    let error = deltalake::DeltaTableError::Transaction { source: deltalake::kernel::transaction::TransactionError::ObjectStore { source } };
+    let failure = super::bounded_commit_await(std::time::Duration::from_secs(1), "flush_commit", "t", async { Err::<(), _>(error) })
+        .await
+        .expect_err("the storage error must propagate");
+    assert_eq!(failure.publication_uncertain, uncertain);
+    assert_eq!(matches!(super::probe_after_uncertain_commit(CommitProbe::NotLanded, failure.publication_uncertain), CommitProbe::Inconclusive), uncertain);
+}
+
+/// The S3 client's own deadline fires before the outer commit deadline. A PUT
+/// received by the server without a response must remain an uncertain publication.
+#[tokio::test]
+async fn an_s3_response_timeout_cannot_authorize_republishing() -> Result<()> {
+    use object_store::{ObjectStore, aws::AmazonS3Builder};
+    use tokio::io::AsyncReadExt;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let endpoint = format!("http://{}", listener.local_addr()?);
+    let (sent, received) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await?;
+        let mut request = [0; 4096];
+        let bytes = socket.read(&mut request).await?;
+        let _ = sent.send(request[..bytes].starts_with(b"PUT "));
+        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        drop(socket);
+        Ok::<_, std::io::Error>(())
+    });
+    let store = AmazonS3Builder::new()
+        .with_bucket_name("timeout-regression")
+        .with_region("us-east-1")
+        .with_access_key_id("test")
+        .with_secret_access_key("test")
+        .with_endpoint(endpoint)
+        .with_client_options(object_store::ClientOptions::new().with_timeout(std::time::Duration::from_millis(100)))
+        .with_allow_http(true)
+        .with_retry(object_store::RetryConfig { max_retries: 0, ..Default::default() })
+        .build()?;
+    let failure = super::bounded_commit_await(std::time::Duration::from_secs(2), "flush_commit", "t", async {
+        store
+            .put_opts(&object_store::path::Path::from("_delta_log/00000000000000000001.json"), "{}".into(), object_store::PutMode::Create.into())
+            .await
+            .map_err(deltalake::DeltaTableError::from)
+    })
+    .await
+    .expect_err("the server never returns a response");
+    server.abort();
+    let _ = server.await;
+    assert!(tokio::time::timeout(std::time::Duration::from_secs(1), received).await??, "the PUT must have reached the server");
+    assert!(failure.publication_uncertain);
+    assert!(!failure.message.contains("exceeded 2s"), "the S3 request timeout, not the outer deadline, must fire");
+    assert!(matches!(super::probe_after_uncertain_commit(CommitProbe::NotLanded, failure.publication_uncertain), CommitProbe::Inconclusive));
+    Ok(())
 }
 
 /// The staged-intent manifest is a cleanup aid, never a correctness input:
@@ -8563,6 +8694,918 @@ async fn mem_table(name: &str, cols: Vec<deltalake::kernel::StructField>) -> Res
     let url = Url::parse(&format!("memory:///{name}"))?;
     let table = mem_backend(store.clone(), &url).build()?.create().with_columns(cols).await?;
     Ok((store, url, table))
+}
+
+/// A remote publication can finish after its local await times out. An absent
+/// Add must keep that flush in reconciliation until the original commit lands.
+#[tokio::test]
+async fn uncertain_flush_waits_for_the_original_delta_publication() -> Result<()> {
+    use deltalake::writer::DeltaWriter;
+
+    let db = Database::with_config(create_test_config("uncertain-flush-probe")).await?;
+    db.cancel_maintenance();
+    let (_, _, table) = mem_table("uncertain-flush-probe", int_id_cols()).await?;
+    let mut writer = deltalake::writer::RecordBatchWriter::for_table(&table)?;
+    writer.write(int_id_batch(vec![1, 2])).await?;
+    let adds: Vec<_> = writer.flush().await?.into_iter().map(deltalake::kernel::Action::Add).collect();
+    let remote = Arc::new(RwLock::new(table.clone()));
+    let local = Arc::new(RwLock::new(table));
+    assert!(matches!(db.reconcile_flush_commit(&local, &adds, false).await, CommitProbe::NotLanded));
+
+    let reconcile = db.reconcile_flush_commit(&local, &adds, true);
+    tokio::pin!(reconcile);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), &mut reconcile).await.is_err(),
+        "an absent timed-out publication cannot schedule another write"
+    );
+    commit_to(&remote, adds.clone(), append_op(false)).await?;
+    let result = tokio::time::timeout(std::time::Duration::from_secs(16), &mut reconcile).await?;
+    assert!(matches!(result, CommitProbe::Landed));
+    assert_eq!(local.read().await.version(), Some(1), "reconciliation must observe the original commit, not publish another version");
+    assert_eq!(live_adds(&local).await.len(), 1);
+    Ok(())
+}
+
+#[test_case(true; "the original publication lands")]
+#[test_case(false; "another writer owns the version")]
+#[tokio::test]
+async fn schema_flush_reconciles_the_exact_publication_version(ours: bool) -> Result<()> {
+    let db = Database::with_config(create_test_config("schema-flush-reconcile")).await?;
+    db.cancel_maintenance();
+    let (_, _, table) = mem_table("schema-flush-reconcile", int_id_cols()).await?;
+    let publication = Arc::new(super::write::FlushPublication::new(table.log_store()));
+    let mut writer = DeltaTable::new(publication.clone());
+    writer.state = table.state.clone();
+    let local = Arc::new(RwLock::new(table));
+    assert_eq!(publication.version(), None);
+    let reconcile = db.reconcile_merge_flush(&local, 1, "original", true);
+    tokio::pin!(reconcile);
+    assert!(tokio::time::timeout(std::time::Duration::from_millis(50), &mut reconcile).await.is_err(), "a missing version cannot prove failure after timeout");
+    writer
+        .write(vec![int_id_batch(vec![1, 2])])
+        .with_commit_properties(
+            base_commit_properties()
+                .with_metadata([(super::write::FLUSH_COMMIT_ID_KEY.to_owned(), serde_json::json!(if ours { "original" } else { "other" }))]),
+        )
+        .await?;
+    assert_eq!(publication.version(), Some(1));
+    assert_eq!(tokio::time::timeout(std::time::Duration::from_secs(16), &mut reconcile).await?, ours);
+    if ours {
+        assert_eq!(local.read().await.version(), Some(1));
+        assert_eq!(live_adds(&local).await.len(), 1);
+    }
+    Ok(())
+}
+
+/// Exercise the actual fallback against an older Delta schema. Its commit must
+/// preserve WAL recovery metadata and remove the per-attempt observer afterwards.
+#[tokio::test]
+async fn schema_evolution_flush_preserves_recovery_metadata() -> Result<()> {
+    let db = Database::with_config(create_test_config("schema-flush-metadata")).await?;
+    db.cancel_maintenance();
+    let schema = get_default_schema();
+    let store = Arc::new(object_store::memory::InMemory::new());
+    let url = Url::parse("memory:///schema-flush-metadata")?;
+    let table = mem_backend(store, &url)
+        .build()?
+        .create()
+        .with_columns(schema.columns()?.into_iter().filter(|field| field.name != "name").collect::<Vec<_>>())
+        .with_partition_columns(schema.partitions.clone())
+        .await?;
+    let table_ref = Arc::new(RwLock::new(table));
+    db.unified_tables.write().await.insert(schema.table_name.clone(), table_ref.clone());
+    let project = "schema-flush-project";
+    let batch = json_to_batch(vec![test_span("original", "new column", project)])?;
+    let digest = crate::write::landed_digest(std::slice::from_ref(&batch)).expect("span identity");
+    let watermark = vec![Some(walrus_rust::WalPosition { block_id: 5, offset: 64 })];
+    let added = db.insert_records_batch(project, &schema.table_name, vec![batch], true, Some(&watermark.clone().into())).await?;
+    assert_eq!(added.len(), 1);
+    let table = table_ref.read().await;
+    assert!(table.log_store().as_any().downcast::<super::write::FlushPublication>().is_err(), "the observer must not become the shared table's log store");
+    let commits: Vec<_> = table.history(Some(1)).try_collect().await?;
+    let info = &commits[0].info;
+    assert!(info.get(super::write::FLUSH_COMMIT_ID_KEY).and_then(serde_json::Value::as_str).is_some());
+    assert_eq!(parse_watermark_from_json(info, 1, project, &schema.table_name), watermark);
+    assert_eq!(parse_landed_digests_from_json(info, project, &schema.table_name), vec![digest]);
+    Ok(())
+}
+
+/// Reopen WAL and Delta at the cut between detached publication and local receipt
+/// retirement. This exercises persisted recovery state, not a process SIGKILL.
+#[test_case("otel_logs_and_spans", false; "deduplicated table")]
+#[test_case("variant_bench", false; "append only table")]
+#[test_case("otel_logs_and_spans", true; "deduplicated publication loses confirmation checkpoint")]
+#[test_case("variant_bench", true; "append only publication loses confirmation checkpoint")]
+#[serial]
+#[tokio::test(start_paused = true)]
+async fn restart_before_detached_receipt_retirement_does_not_republish(name: &str, lost_confirmation: bool) -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let cfg = test_config_with("detached-restart", |cfg| {
+        cfg.core.timefusion_data_dir = dir.path().to_path_buf();
+        cfg.buffer.timefusion_flush_bucket_timeout_secs = 1;
+        cfg.buffer.timefusion_landed_skip_enabled = true;
+        cfg.buffer.timefusion_delta_scan_depth = 1;
+    });
+    let schema = crate::schema::get_schema(name).expect("recovery fixture");
+    assert_eq!(schema.dedup_keys.is_empty(), name == "variant_bench", "exercise both table durability models");
+    let project = "detached-restart-project";
+    let mut row = test_span("original", "before", project);
+    row["shape"] = serde_json::json!("restart");
+    let batch = json_to_batch_for(name, vec![row])?;
+    let delta_dir = dir.path().join("delta");
+    std::fs::create_dir_all(&delta_dir)?;
+    let url = Url::from_directory_path(&delta_dir).expect("absolute Delta path");
+    let table = deltalake::DeltaTableBuilder::from_url(url.clone())?
+        .build()?
+        .create()
+        .with_columns(schema.columns()?)
+        .with_partition_columns(schema.partitions.clone())
+        .await?;
+    let target = Arc::new(RwLock::new(table));
+    let replacement_lock = {
+        let db = Database::with_config(cfg.clone()).await?;
+        db.cancel_maintenance();
+        db.unified_tables.write().await.insert(name.into(), target.clone());
+        let writer = crate::server::delta_write_callback(&db);
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let _release_on_failure = scopeguard::guard(release.clone(), |release| release.add_permits(1));
+        let layer = test_layer(cfg.clone())?
+            .with_delta_writer({
+                let release = release.clone();
+                Arc::new(move |p, t, batches, watermark| {
+                    let (writer, release) = (writer.clone(), release.clone());
+                    Box::pin(async move {
+                        let added = writer(p, t, batches, watermark).await?;
+                        release.acquire().await?.forget();
+                        Ok(added)
+                    })
+                })
+            })
+            .with_wal_dir_lock(Arc::new(crate::write::wal::WalDirLock::acquire(&cfg.core.wal_dir()).await?));
+        layer.insert(project, name, vec![batch.clone()]).await?;
+        layer.force_flush_current_buckets().await?;
+        assert_eq!(target.read().await.version(), Some(1), "the detached publication must actually land");
+        assert_eq!(layer.snapshot_stats().mem_total_rows, 1, "receipt must still await local retirement");
+        let journals = crate::write::wal::FlushPublicationJournal::load(layer.wal().data_dir())?.collect::<std::result::Result<Vec<_>, _>>()?;
+        assert_eq!(journals.len(), 1, "unretired publication evidence must survive the old process");
+        let published = target.read().await.log_store().read_commit_entry(1).await?.expect("published commit");
+        assert_eq!(
+            journals[0].record().commit_payloads.get(&1).map(String::as_bytes),
+            Some(published.as_ref()),
+            "restart evidence must retain the exact published bytes, including the original Add paths"
+        );
+        if lost_confirmation {
+            let mut record = journals[0].record();
+            let crate::write::wal::FlushPublicationState::Committed { target, version } = record.state else {
+                anyhow::bail!("fixture publication not confirmed");
+            };
+            record.state = crate::write::wal::FlushPublicationState::Publishing { target, versions: vec![version] };
+            let path = crate::write::wal::meta_path(layer.wal().data_dir(), &format!("flush-{}.json", record.commit_id));
+            let bytes = serde_json::to_vec(&record)?;
+            crate::write::wal::write_atomic_with(&path, true, |file| std::io::Write::write_all(file, &bytes))?;
+        }
+        commit_to(&target, Vec::new(), append_op(true)).await?;
+        assert_eq!(target.read().await.version(), Some(2), "the original publication must fall outside the one-commit history scan");
+        drop(layer);
+        let path = cfg.core.wal_dir();
+        let mut contender = scopeguard::guard(
+            tokio::spawn({
+                let path = path.clone();
+                async move { crate::write::wal::WalDirLock::acquire(&path).await }
+            }),
+            |task| task.abort(),
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !contender.is_finished() && !crate::write::wal::takeover_requested(&path) {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        })
+        .await?;
+        assert!(!contender.is_finished(), "a replacement must not acquire WAL ownership while the detached callback remains active");
+        release.add_permits(1);
+        tokio::time::timeout(std::time::Duration::from_secs(5), &mut *contender).await???
+    };
+    let reopened = deltalake::DeltaTableBuilder::from_url(url)?.load().await?;
+    let target = Arc::new(RwLock::new(reopened));
+    let db = Database::with_config(cfg.clone()).await?;
+    db.cancel_maintenance();
+    db.unified_tables.write().await.insert(name.into(), target.clone());
+    let layer = Arc::new(test_layer(cfg)?.with_delta_writer(crate::server::delta_write_callback(&db)).with_wal_dir_lock(Arc::new(replacement_lock)));
+    assert_eq!(db.reconcile_flush_publications(&layer).await?, 1);
+    db.derive_wal_cursors_from_delta(layer.wal(), Some(&layer)).await?;
+    let replay = layer.recover_from_wal().await?;
+    assert_eq!(replay.entries_already_committed, 1, "test must read the unretired WAL entry and prove its publication");
+    assert_eq!(replay.entries_replayed, 0, "proven committed rows must not re-enter the buffer");
+    assert_eq!(
+        crate::write::wal::FlushPublicationJournal::load(layer.wal().data_dir())?.collect::<std::result::Result<Vec<_>, _>>()?.len(),
+        1,
+        "publication proof must outlive replayable physical WAL files"
+    );
+    layer.force_flush_current_buckets().await?;
+    assert_eq!(delta_physical_row_count(&target).await?, 1, "the original publication must not be repeated on recovery");
+    if schema.dedup_keys.is_empty() {
+        layer.insert(project, name, vec![batch]).await?;
+        layer.force_flush_current_buckets().await?;
+        assert_eq!(delta_physical_row_count(&target).await?, 2, "an identical later append is a distinct acknowledged write");
+    }
+    assert!(layer.is_drained(), "recovered durable rows must release their WAL holds");
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum MissingFlushPublication {
+    Resume,
+    NoOwnership,
+    ForeignWalOwnership,
+    MissingFile,
+    ChangedSize,
+    WrongBackend,
+    LegacyEvidence,
+    WrongIdentity,
+    FutureVersion,
+    OccupiedVersion,
+}
+
+/// Reconstruct the durable cut immediately before a conditional commit PUT:
+/// retain its real staged Parquet and journal, remove the published log entry,
+/// and reopen at the preceding snapshot. This is a persistent-state fault
+/// injection, not a process-death test.
+#[test_case("variant_bench", MissingFlushPublication::Resume; "append-only resumes original bytes")]
+#[test_case("otel_logs_and_spans", MissingFlushPublication::Resume; "deduplicated resumes original bytes")]
+#[test_case("variant_bench", MissingFlushPublication::NoOwnership; "missing ownership keeps WAL")]
+#[test_case("variant_bench", MissingFlushPublication::ForeignWalOwnership; "foreign WAL ownership keeps WAL")]
+#[test_case("variant_bench", MissingFlushPublication::MissingFile; "missing staged file keeps WAL")]
+#[test_case("variant_bench", MissingFlushPublication::ChangedSize; "changed staged size keeps WAL")]
+#[test_case("variant_bench", MissingFlushPublication::WrongBackend; "incompatible backend keeps WAL")]
+#[test_case("variant_bench", MissingFlushPublication::LegacyEvidence; "legacy version-only evidence keeps WAL")]
+#[test_case("variant_bench", MissingFlushPublication::WrongIdentity; "foreign payload identity keeps WAL")]
+#[test_case("variant_bench", MissingFlushPublication::FutureVersion; "noncontiguous version keeps WAL")]
+#[test_case("variant_bench", MissingFlushPublication::OccupiedVersion; "another writer owns original version")]
+#[serial]
+#[tokio::test]
+async fn startup_resumes_only_original_conditional_flush(name: &str, cut: MissingFlushPublication) -> Result<()> {
+    use crate::write::wal::{FlushPublicationJournal, FlushPublicationState, WalDirLock};
+    use object_store::ObjectStoreExt;
+    let dir = tempfile::tempdir()?;
+    let cfg = test_config_with("resume-flush", |cfg| cfg.core.timefusion_data_dir = dir.path().to_path_buf());
+    let db = Database::with_config(cfg.clone()).await?;
+    db.cancel_maintenance();
+    let schema = crate::schema::get_schema(name).expect("fixture schema");
+    let project = "resume-flush";
+    let delta_dir = dir.path().join("delta");
+    std::fs::create_dir_all(&delta_dir)?;
+    let url = Url::from_directory_path(&delta_dir).expect("absolute fixture path");
+    let table =
+        DeltaTableBuilder::from_url(url.clone())?.build()?.create().with_columns(schema.columns()?).with_partition_columns(schema.partitions.clone()).await?;
+    let target = Arc::new(RwLock::new(table));
+    db.unified_tables.write().await.insert(name.into(), target.clone());
+    let lock = Arc::new(WalDirLock::acquire(&cfg.core.wal_dir()).await?);
+    let old_layer = test_layer(cfg.clone())?.with_wal_dir_lock(lock);
+    let mut row = test_span("original", "before", project);
+    row["shape"] = serde_json::json!("resumed");
+    old_layer.insert(project, name, vec![json_to_batch_for(name, vec![row])?]).await?;
+    let (_, _, bucket_id) = old_layer.mem_buffer().bucket_keys(|_| true).into_iter().next().expect("one bucket");
+    let snapshot = old_layer.mem_buffer().snapshot_bucket_for_flush(project, name, bucket_id).expect("admitted snapshot");
+    let journal = Arc::new(FlushPublicationJournal::create(old_layer.wal().data_dir(), project, name, &snapshot.write_identities)?);
+    let context = crate::write::FlushCommitContext { watermark: vec![None; old_layer.wal().shards_per_topic()], publication: Some(journal.clone()) };
+    db.insert_records_batch(project, name, snapshot.batches, true, Some(&context)).await?;
+    assert_eq!(target.read().await.version(), Some(1));
+    let mut record = journal.record();
+    let original_payload = record.commit_payloads.get(&1).expect("real conditional payload").clone();
+    let staged_store = target.read().await.log_store().object_store(None);
+    let FlushPublicationState::Committed { mut target, .. } = record.state else { anyhow::bail!("fixture did not commit") };
+    if matches!(cut, MissingFlushPublication::WrongBackend) {
+        target.log_store_name = Some("S3LogStore".into());
+    }
+    if matches!(cut, MissingFlushPublication::LegacyEvidence) {
+        target.log_store_name = None;
+        record.commit_payloads.clear();
+    }
+    let mut actions = deltalake::logstore::get_actions(1, &bytes::Bytes::copy_from_slice(original_payload.as_bytes()))?;
+    for action in &mut actions {
+        match action {
+            deltalake::kernel::Action::Add(add) if matches!(cut, MissingFlushPublication::MissingFile) => {
+                staged_store.delete(&object_store::path::Path::parse(&add.path)?).await?;
+            }
+            deltalake::kernel::Action::Add(add) if matches!(cut, MissingFlushPublication::ChangedSize) => add.size += 1,
+            deltalake::kernel::Action::CommitInfo(info) if matches!(cut, MissingFlushPublication::WrongIdentity) => {
+                info.info.insert(super::write::FLUSH_COMMIT_ID_KEY.into(), serde_json::json!(uuid::Uuid::new_v4()));
+            }
+            _ => {}
+        }
+    }
+    if matches!(cut, MissingFlushPublication::ChangedSize | MissingFlushPublication::WrongIdentity) {
+        record.commit_payloads.insert(1, actions.iter().map(serde_json::to_string).collect::<std::result::Result<Vec<_>, _>>()?.join("\n"));
+    }
+    let version = if matches!(cut, MissingFlushPublication::FutureVersion) { 2 } else { 1 };
+    if version == 2 {
+        record.commit_payloads = [(2, original_payload.clone())].into();
+    }
+    record.state = FlushPublicationState::Publishing { target, versions: vec![version] };
+    let path = crate::write::wal::meta_path(old_layer.wal().data_dir(), &format!("flush-{}.json", record.commit_id));
+    let bytes = serde_json::to_vec(&record)?;
+    crate::write::wal::write_atomic_with(&path, true, |file| std::io::Write::write_all(file, &bytes))?;
+    std::fs::remove_file(delta_dir.join("_delta_log/00000000000000000001.json"))?;
+    drop(old_layer);
+    let table = DeltaTableBuilder::from_url(url)?.load().await?;
+    let target = Arc::new(RwLock::new(table));
+    db.unified_tables.write().await.insert(name.into(), target.clone());
+    assert_eq!(target.read().await.version(), Some(0));
+    if matches!(cut, MissingFlushPublication::OccupiedVersion) {
+        commit_to(&target, Vec::new(), append_op(true)).await?;
+    }
+    let foreign_dir = tempfile::tempdir()?;
+    let mut layer = test_layer(cfg.clone())?.with_delta_writer(crate::server::delta_write_callback(&db));
+    if !matches!(cut, MissingFlushPublication::NoOwnership) {
+        let lock_dir = if matches!(cut, MissingFlushPublication::ForeignWalOwnership) { foreign_dir.path().to_path_buf() } else { cfg.core.wal_dir() };
+        layer = layer.with_wal_dir_lock(Arc::new(WalDirLock::acquire(&lock_dir).await?));
+    }
+    let layer = Arc::new(layer);
+    let before = layer.wal().persisted_read_positions(project, name)?;
+    if matches!(cut, MissingFlushPublication::Resume | MissingFlushPublication::OccupiedVersion) {
+        let resumed = matches!(cut, MissingFlushPublication::Resume);
+        assert_eq!(db.reconcile_flush_publications(&layer).await?, usize::from(resumed));
+        let replay = layer.recover_from_wal().await?;
+        assert_eq!(replay.entries_already_committed, u64::from(resumed));
+        assert_eq!(replay.entries_replayed, u64::from(!resumed));
+        if resumed {
+            let published = target.read().await.log_store().read_commit_entry(1).await?.expect("resumed version");
+            assert_eq!(published.as_ref(), original_payload.as_bytes(), "recovery must reuse the exact original Add paths and commit bytes");
+        }
+        layer.force_flush_current_buckets().await?;
+        assert_eq!(delta_physical_row_count(&target).await?, 1, "recovery must retain exactly one physical copy");
+        assert_eq!(target.read().await.version(), Some(if resumed { 1 } else { 2 }));
+        assert!(layer.is_drained());
+    } else {
+        assert!(db.reconcile_flush_publications(&layer).await.is_err());
+        assert!(layer.recover_from_wal().await.is_err(), "unknown publication must prohibit replay");
+        assert_eq!(layer.wal().persisted_read_positions(project, name)?, before);
+        assert_eq!(target.read().await.version(), Some(0), "failed safety checks must not publish any version");
+        assert!(target.read().await.log_store().read_commit_entry(1).await?.is_none(), "remote storage must have no publication after failed checks");
+        assert_eq!(delta_physical_row_count(&target).await?, 0);
+        assert_eq!(layer.snapshot_stats().airborne_topics, 1);
+        assert_eq!(FlushPublicationJournal::load(layer.wal().data_dir())?.collect::<std::result::Result<Vec<_>, _>>()?.len(), 1);
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum PublicationNetworkFault {
+    OriginalTransientError,
+    OriginalTransientMissingProbe,
+    OriginalSchemaTransientError,
+    OriginalForeignWins,
+    LostReply,
+    OriginalArrivesLate,
+    ForeignWins,
+    RequestArrivesLate,
+}
+
+enum PublicationProxyReply {
+    Discard,
+    Forward,
+    Withhold,
+    TransientError,
+}
+
+struct PublicationRequestGate {
+    body: Vec<u8>,
+    release: tokio::sync::oneshot::Sender<PublicationProxyReply>,
+    published: tokio::sync::oneshot::Receiver<u16>,
+}
+
+/// Forward real HTTP to local MinIO. Only an armed, conditional version-one
+/// PUT is paused; file uploads, reads and LISTs retain real S3 behavior.
+async fn publication_fault_proxy(
+    socket: &mut tokio::net::TcpStream, armed: &std::sync::atomic::AtomicBool, puts: &std::sync::atomic::AtomicU64,
+    missing_probe: &std::sync::atomic::AtomicBool, gates: &tokio::sync::mpsc::UnboundedSender<PublicationRequestGate>,
+) -> Result<()> {
+    use std::sync::atomic::Ordering;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut request = Vec::new();
+    let mut chunk = [0; 4096];
+    let header_end = loop {
+        let read = socket.read(&mut chunk).await?;
+        anyhow::ensure!(read > 0, "proxy client closed before HTTP headers");
+        request.extend_from_slice(&chunk[..read]);
+        if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+            break end + 4;
+        }
+    };
+    let headers = std::str::from_utf8(&request[..header_end])?;
+    if headers.starts_with("GET ")
+        && headers.lines().next().is_some_and(|line| line.contains("/_delta_log/00000000000000000001.json "))
+        && missing_probe.swap(false, Ordering::SeqCst)
+    {
+        socket.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await?;
+        return Ok(());
+    }
+    let conditional = headers.starts_with("PUT ")
+        && headers.lines().next().is_some_and(|line| line.contains("/_delta_log/00000000000000000001.json "))
+        && headers.lines().any(|line| line.eq_ignore_ascii_case("if-none-match: *"));
+    let gated = conditional && armed.swap(false, Ordering::SeqCst);
+    if conditional {
+        puts.fetch_add(1, Ordering::Relaxed);
+    }
+    let mut publication = None;
+    if gated {
+        let length = headers
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .find_map(|(name, value)| name.eq_ignore_ascii_case("content-length").then(|| value.trim().parse::<usize>()))
+            .transpose()?
+            .ok_or_else(|| anyhow::anyhow!("conditional commit PUT has no Content-Length"))?;
+        while request.len() < header_end + length {
+            let read = socket.read(&mut chunk).await?;
+            anyhow::ensure!(read > 0, "conditional request ended before its commit bytes");
+            request.extend_from_slice(&chunk[..read]);
+        }
+        let (release, wait) = tokio::sync::oneshot::channel();
+        let (sent, published) = tokio::sync::oneshot::channel();
+        gates.send(PublicationRequestGate { body: request[header_end..header_end + length].to_vec(), release, published })?;
+        let reply = wait.await?;
+        if matches!(reply, PublicationProxyReply::Discard) {
+            return Ok(());
+        }
+        publication = Some((reply, sent));
+    }
+    let mut upstream = tokio::net::TcpStream::connect("127.0.0.1:9000").await?;
+    upstream.write_all(&request).await?;
+    if let Some((reply, sent)) = publication {
+        let mut response = Vec::new();
+        while !response.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+            let read = upstream.read(&mut chunk).await?;
+            anyhow::ensure!(read > 0, "MinIO closed before the publication response");
+            response.extend_from_slice(&chunk[..read]);
+        }
+        let status = std::str::from_utf8(&response)?.split_whitespace().nth(1).ok_or_else(|| anyhow::anyhow!("missing HTTP status"))?.parse()?;
+        let _ = sent.send(status);
+        if matches!(reply, PublicationProxyReply::TransientError) {
+            socket.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await?;
+            return Ok(());
+        }
+        if matches!(reply, PublicationProxyReply::Withhold) {
+            // The S3 client's real response deadline fires. The proxy can still
+            // serve its subsequent reconciliation reads on other connections.
+            std::future::pending::<()>().await;
+        }
+        // A delayed request can publish after its client has closed the socket.
+        if socket.write_all(&response).await.is_err() {
+            return Ok(());
+        }
+    }
+    let _ = tokio::io::copy_bidirectional(socket, &mut upstream).await;
+    Ok(())
+}
+
+/// Pause the first real conditional request after its intent was fsynced,
+/// cancel its writer, then recover over S3 with controlled request/response
+/// loss. MinIO decides the immutable-version race; no store behavior is faked.
+#[test_case(PublicationNetworkFault::LostReply; "accepted resumption loses its response")]
+#[test_case(PublicationNetworkFault::OriginalTransientError; "accepted original receives a retryable response")]
+#[test_case(PublicationNetworkFault::OriginalTransientMissingProbe; "accepted original probe temporarily reports absence")]
+#[test_case(PublicationNetworkFault::OriginalSchemaTransientError; "accepted schema merge receives a retryable response")]
+#[test_case(PublicationNetworkFault::OriginalForeignWins; "original conflicts with a foreign version")]
+#[test_case(PublicationNetworkFault::OriginalArrivesLate; "delayed original request wins")]
+#[test_case(PublicationNetworkFault::ForeignWins; "foreign commit wins after the negative probe")]
+#[test_case(PublicationNetworkFault::RequestArrivesLate; "negative probe precedes delayed publication")]
+#[serial]
+#[tokio::test(flavor = "multi_thread")]
+async fn startup_flush_resumption_survives_s3_publication_faults(fault: PublicationNetworkFault) -> Result<()> {
+    use crate::write::wal::{FlushPublicationJournal, FlushPublicationState, WalDirLock};
+    use object_store::{ClientConfigKey, ClientOptions, ObjectStore, RetryConfig, aws::AmazonS3Builder};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let endpoint = format!("http://{}", listener.local_addr()?);
+    let armed = Arc::new(AtomicBool::new(false));
+    let puts = Arc::new(AtomicU64::new(0));
+    let missing_probe = Arc::new(AtomicBool::new(false));
+    let (sent, mut gates) = tokio::sync::mpsc::unbounded_channel();
+    let _proxy = scopeguard::guard(
+        tokio::spawn({
+            let (armed, puts, missing_probe) = (armed.clone(), puts.clone(), missing_probe.clone());
+            async move {
+                let mut requests = tokio::task::JoinSet::new();
+                loop {
+                    tokio::select! {
+                        accepted = listener.accept() => {
+                            let (mut socket, _) = match accepted {
+                                Ok(connection) => connection,
+                                Err(error) => break Err::<(), _>(error),
+                            };
+                            let (armed, puts, missing_probe, sent) = (armed.clone(), puts.clone(), missing_probe.clone(), sent.clone());
+                            requests.spawn(async move { publication_fault_proxy(&mut socket, &armed, &puts, &missing_probe, &sent).await });
+                        }
+                        _ = requests.join_next(), if !requests.is_empty() => {}
+                    }
+                }
+            }
+        }),
+        |task| task.abort(),
+    );
+    let store_for = |endpoint: String| -> Result<Arc<dyn ObjectStore>> {
+        Ok(Arc::new(
+            AmazonS3Builder::new()
+                .with_bucket_name("timefusion-tests")
+                .with_region("us-east-1")
+                .with_access_key_id("minioadmin")
+                .with_secret_access_key("minioadmin")
+                .with_endpoint(endpoint)
+                .with_retry(RetryConfig {
+                    max_retries: usize::from(matches!(
+                        fault,
+                        PublicationNetworkFault::OriginalTransientError
+                            | PublicationNetworkFault::OriginalTransientMissingProbe
+                            | PublicationNetworkFault::OriginalSchemaTransientError
+                    )),
+                    ..Default::default()
+                })
+                // No idle socket reuse: each real HTTP request crosses the
+                // proxy's inspected first-request boundary.
+                .with_client_options(ClientOptions::new().with_timeout(std::time::Duration::from_secs(1)).with_config(ClientConfigKey::PoolMaxIdlePerHost, "0"))
+                .with_allow_http(true)
+                .build()?,
+        ))
+    };
+    let store = store_for(endpoint)?;
+    let direct = store_for("http://127.0.0.1:9000".into())?;
+    let url = Url::parse(&format!("s3://timefusion-tests/test-publication-fault-{}", uuid::Uuid::new_v4()))?;
+    let dir = tempfile::tempdir()?;
+    let cfg = test_config_with("network-flush", |cfg| cfg.core.timefusion_data_dir = dir.path().to_path_buf());
+    let name = "variant_bench";
+    let schema = crate::schema::get_schema(name).expect("append-only fixture");
+    let project = "network-flush";
+    let db = Arc::new(Database::with_config(cfg.clone()).await?);
+    db.cancel_maintenance();
+    let table = DeltaTableBuilder::from_url(url.clone())?
+        .with_storage_backend(store.clone(), url.clone())
+        .build()?
+        .create()
+        .with_columns(
+            schema
+                .columns()?
+                .into_iter()
+                .filter(|field| !matches!(fault, PublicationNetworkFault::OriginalSchemaTransientError) || field.name != "name")
+                .collect::<Vec<_>>(),
+        )
+        .with_partition_columns(schema.partitions.clone())
+        .await?;
+    db.unified_tables.write().await.insert(name.into(), Arc::new(RwLock::new(table)));
+    let old_layer = test_layer(cfg.clone())?.with_wal_dir_lock(Arc::new(WalDirLock::acquire(&cfg.core.wal_dir()).await?));
+    let mut row = test_span("original", "before", project);
+    row["shape"] = serde_json::json!("network");
+    old_layer.insert(project, name, vec![json_to_batch_for(name, vec![row])?]).await?;
+    let (_, _, bucket_id) = old_layer.mem_buffer().bucket_keys(|_| true).into_iter().next().expect("one admitted bucket");
+    let snapshot = old_layer.mem_buffer().snapshot_bucket_for_flush(project, name, bucket_id).expect("admitted snapshot");
+    let journal = Arc::new(FlushPublicationJournal::create(old_layer.wal().data_dir(), project, name, &snapshot.write_identities)?);
+    let context = crate::write::FlushCommitContext { watermark: vec![None; old_layer.wal().shards_per_topic()], publication: Some(journal.clone()) };
+    armed.store(true, Ordering::SeqCst);
+    let mut writer = scopeguard::guard(
+        tokio::spawn({
+            let db = db.clone();
+            async move { db.insert_records_batch(project, name, snapshot.batches, true, Some(&context)).await }
+        }),
+        |task| task.abort(),
+    );
+    let mut original = Some(tokio::time::timeout(std::time::Duration::from_secs(5), gates.recv()).await?.expect("original PUT gate"));
+    let payload = journal.record().commit_payloads.get(&1).expect("intent must precede the request").clone();
+    assert_eq!(original.as_ref().unwrap().body, payload.as_bytes());
+    assert!(matches!(journal.record().state, FlushPublicationState::Publishing { versions, .. } if versions == [1]));
+    if matches!(
+        fault,
+        PublicationNetworkFault::OriginalTransientError
+            | PublicationNetworkFault::OriginalTransientMissingProbe
+            | PublicationNetworkFault::OriginalSchemaTransientError
+            | PublicationNetworkFault::OriginalForeignWins
+    ) {
+        let foreign = matches!(fault, PublicationNetworkFault::OriginalForeignWins);
+        if foreign {
+            let table = DeltaTableBuilder::from_url(url.clone())?.with_storage_backend(direct, url.clone()).load().await?;
+            commit_to(&Arc::new(RwLock::new(table)), Vec::new(), append_op(true)).await?;
+        }
+        let gate = original.take().unwrap();
+        missing_probe.store(matches!(fault, PublicationNetworkFault::OriginalTransientMissingProbe), Ordering::SeqCst);
+        let _ = gate.release.send(if foreign { PublicationProxyReply::Forward } else { PublicationProxyReply::TransientError });
+        assert_eq!(tokio::time::timeout(std::time::Duration::from_secs(5), gate.published).await??, if foreign { 412 } else { 200 });
+        tokio::time::timeout(std::time::Duration::from_secs(10), &mut *writer).await???;
+        let target = db.unified_tables.read().await.get(name).expect("original table").clone();
+        let expected_version = if foreign { 2 } else { 1 };
+        assert_eq!(target.read().await.version(), Some(expected_version));
+        assert!(
+            target.read().await.log_store().read_commit_entry(expected_version + 1).await?.is_none(),
+            "an accepted request retry must not publish the flush at another version"
+        );
+        assert_eq!(delta_physical_row_count(&target).await?, 1);
+        assert!(matches!(journal.record().state, FlushPublicationState::Committed { version, .. } if version == expected_version));
+        return Ok(());
+    }
+    writer.abort();
+    assert!((&mut *writer).await.expect_err("old writer was cancelled").is_cancelled());
+    drop(old_layer);
+    drop(db);
+    if !matches!(fault, PublicationNetworkFault::OriginalArrivesLate) {
+        let gate = original.take().unwrap();
+        let _ = gate.release.send(PublicationProxyReply::Discard);
+    }
+    let table = DeltaTableBuilder::from_url(url.clone())?.with_storage_backend(store, url.clone()).load().await?;
+    assert_eq!(table.version(), Some(0));
+    let target = Arc::new(RwLock::new(table));
+    let db = Arc::new(Database::with_config(cfg.clone()).await?);
+    db.cancel_maintenance();
+    db.unified_tables.write().await.insert(name.into(), target.clone());
+    let layer = Arc::new(
+        test_layer(cfg.clone())?
+            .with_delta_writer(crate::server::delta_write_callback(&db))
+            .with_wal_dir_lock(Arc::new(WalDirLock::acquire(&cfg.core.wal_dir()).await?)),
+    );
+    let before = layer.wal().persisted_read_positions(project, name)?;
+    armed.store(true, Ordering::SeqCst);
+    let mut recovery = scopeguard::guard(
+        tokio::spawn({
+            let (db, layer) = (db.clone(), layer.clone());
+            async move { db.reconcile_flush_publications(&layer).await }
+        }),
+        |task| task.abort(),
+    );
+    let resumed = tokio::time::timeout(std::time::Duration::from_secs(5), gates.recv()).await?.expect("resumed PUT gate");
+    assert_eq!(resumed.body, payload.as_bytes(), "recovery must send the original immutable payload");
+    match fault {
+        PublicationNetworkFault::OriginalTransientError
+        | PublicationNetworkFault::OriginalTransientMissingProbe
+        | PublicationNetworkFault::OriginalSchemaTransientError
+        | PublicationNetworkFault::OriginalForeignWins => unreachable!("original response case completed above"),
+        PublicationNetworkFault::LostReply => {
+            let _ = resumed.release.send(PublicationProxyReply::Withhold);
+            assert_eq!(tokio::time::timeout(std::time::Duration::from_secs(5), resumed.published).await??, 200);
+        }
+        PublicationNetworkFault::OriginalArrivesLate => {
+            let gate = original.take().unwrap();
+            let _ = gate.release.send(PublicationProxyReply::Forward);
+            assert_eq!(tokio::time::timeout(std::time::Duration::from_secs(5), gate.published).await??, 200);
+            let _ = resumed.release.send(PublicationProxyReply::Forward);
+            assert_eq!(tokio::time::timeout(std::time::Duration::from_secs(5), resumed.published).await??, 412);
+        }
+        PublicationNetworkFault::ForeignWins => {
+            let table = DeltaTableBuilder::from_url(url.clone())?.with_storage_backend(direct, url.clone()).load().await?;
+            commit_to(&Arc::new(RwLock::new(table)), Vec::new(), append_op(true)).await?;
+            let _ = resumed.release.send(PublicationProxyReply::Forward);
+            assert_eq!(tokio::time::timeout(std::time::Duration::from_secs(5), resumed.published).await??, 412);
+        }
+        PublicationNetworkFault::RequestArrivesLate => {
+            assert!(tokio::time::timeout(std::time::Duration::from_secs(5), &mut *recovery).await??.is_err());
+            assert_eq!(layer.wal().persisted_read_positions(project, name)?, before);
+            assert_eq!(layer.snapshot_stats().airborne_topics, 1);
+            assert!(layer.recover_from_wal().await.is_err(), "a negative probe must not permit replay while publication remains possible");
+            assert!(target.read().await.log_store().read_commit_entry(1).await?.is_none());
+            let _ = resumed.release.send(PublicationProxyReply::Forward);
+            assert_eq!(tokio::time::timeout(std::time::Duration::from_secs(5), resumed.published).await??, 200);
+            assert_eq!(db.reconcile_flush_publications(&layer).await?, 1);
+        }
+    }
+    let ours = !matches!(fault, PublicationNetworkFault::ForeignWins);
+    if !matches!(fault, PublicationNetworkFault::RequestArrivesLate) {
+        assert_eq!(tokio::time::timeout(std::time::Duration::from_secs(5), &mut *recovery).await???, usize::from(ours));
+    }
+    assert_eq!(puts.load(Ordering::Relaxed), 2, "startup must make one same-version attempt, without an OCC retry");
+    assert!(target.read().await.log_store().read_commit_entry(2).await?.is_none(), "resumption must never advance to another version");
+    let replay = layer.recover_from_wal().await?;
+    assert_eq!(replay.entries_already_committed, u64::from(ours));
+    assert_eq!(replay.entries_replayed, u64::from(!ours));
+    layer.force_flush_current_buckets().await?;
+    assert_eq!(delta_physical_row_count(&target).await?, 1, "lost replies and competing versions must preserve one physical copy");
+    assert_eq!(target.read().await.version(), Some(if ours { 1 } else { 2 }));
+    assert!(layer.is_drained());
+    Ok(())
+}
+
+/// An unresolved or redirected publication must leave the WAL unread. Once
+/// the original immutable version lands on its original table, retrying startup
+/// reconciles it without another publication.
+#[test_case(false; "missing version retains the WAL")]
+#[test_case(true; "different physical table retains the WAL")]
+#[serial]
+#[tokio::test]
+async fn startup_flush_publication_preserves_wal_until_proven(other_table: bool) -> Result<()> {
+    use crate::write::wal::{FlushPublicationJournal, FlushPublicationTarget};
+    let dir = tempfile::tempdir()?;
+    let cfg = test_config_with("startup-flush-proof", |cfg| cfg.core.timefusion_data_dir = dir.path().to_path_buf());
+    let db = Database::with_config(cfg.clone()).await?;
+    db.cancel_maintenance();
+    let name = "variant_bench";
+    let schema = crate::schema::get_schema(name).expect("append-only fixture");
+    let project = "startup-flush-proof";
+    let store = Arc::new(object_store::memory::InMemory::new());
+    let url = Url::parse("memory:///startup-flush-proof")?;
+    let table = mem_backend(store, &url).build()?.create().with_columns(schema.columns()?).with_partition_columns(schema.partitions.clone()).await?;
+    let target = Arc::new(RwLock::new(table));
+    db.unified_tables.write().await.insert(name.into(), target.clone());
+    let mut row = test_span("original", "before", project);
+    row["shape"] = serde_json::json!("startup proof");
+    let batch = json_to_batch_for(name, vec![row])?;
+    let journal = {
+        let layer = test_layer(cfg.clone())?;
+        layer.insert(project, name, vec![batch.clone()]).await?;
+        let (_, _, bucket_id) = layer.mem_buffer().bucket_keys(|_| true).into_iter().next().expect("one bucket");
+        let snapshot = layer.mem_buffer().snapshot_bucket_for_flush(project, name, bucket_id).expect("admitted rows");
+        let journal = Arc::new(FlushPublicationJournal::create(layer.wal().data_dir(), project, name, &snapshot.write_identities)?);
+        assert!(layer.mem_buffer().restore_unresolved_snapshot_holds(&snapshot));
+        let table = target.read().await;
+        journal.record_version(
+            1,
+            FlushPublicationTarget {
+                table_uri: table.log_store().root_url().to_string(),
+                table_id: table.snapshot()?.metadata().id().to_owned(),
+                log_store_name: Some(table.log_store().name()),
+            },
+            None,
+        )?;
+        journal
+    };
+    let layer = Arc::new(test_layer(cfg)?.with_delta_writer(crate::server::delta_write_callback(&db)));
+    if other_table {
+        let (_, _, other) = mem_table("other-startup-target", schema.columns()?).await?;
+        db.unified_tables.write().await.insert(name.into(), Arc::new(RwLock::new(other)));
+    }
+    let before = layer.wal().persisted_read_positions(project, name)?;
+    assert!(db.reconcile_flush_publications(&layer).await.is_err());
+    assert_eq!(layer.snapshot_stats().airborne_topics, 1, "unresolved ownership must prevent a competing flush");
+    assert!(layer.recover_from_wal().await.is_err(), "replay must not proceed with unverified publication evidence");
+    assert_eq!(layer.wal().persisted_read_positions(project, name)?, before, "failed reconciliation must not consume acknowledged WAL rows");
+    assert_eq!(delta_physical_row_count(&target).await?, 0);
+    assert_eq!(FlushPublicationJournal::load(layer.wal().data_dir())?.collect::<std::result::Result<Vec<_>, _>>()?.len(), 1);
+    db.unified_tables.write().await.insert(name.into(), target.clone());
+    let context = crate::write::FlushCommitContext { watermark: vec![None; layer.wal().shards_per_topic()], publication: Some(journal) };
+    db.insert_records_batch(project, name, vec![batch], true, Some(&context)).await?;
+    assert_eq!(db.reconcile_flush_publications(&layer).await?, 1);
+    assert_eq!(layer.snapshot_stats().airborne_topics, 0);
+    let replay = layer.recover_from_wal().await?;
+    assert_eq!(replay.entries_already_committed, 1);
+    assert_eq!(replay.entries_replayed, 0);
+    layer.force_flush_current_buckets().await?;
+    assert_eq!(delta_physical_row_count(&target).await?, 1);
+    assert_eq!(target.read().await.version(), Some(1), "startup must observe the original publication, not republish it");
+    assert!(layer.is_drained());
+    Ok(())
+}
+
+/// Retained receipts across tenants share a physical Delta log. Reconciliation
+/// must share its explicit refresh, allowing the resolver's initial probe too.
+#[test_case(1; "one shared physical table")]
+#[test_case(2; "two independent physical tables")]
+#[serial]
+#[tokio::test(start_paused = true)]
+async fn startup_flush_publication_refreshes_each_physical_table_once(table_count: usize) -> Result<()> {
+    use object_store::throttle::{ThrottleConfig, ThrottledStore};
+    let dir = tempfile::tempdir()?;
+    let cfg = test_config_with("startup-flush-grouping", |cfg| cfg.core.timefusion_data_dir = dir.path().to_path_buf());
+    let db = Database::with_config(cfg.clone()).await?;
+    db.cancel_maintenance();
+    let layer = test_layer(cfg)?.with_delta_writer(crate::server::delta_write_callback(&db));
+    let mut tables = Vec::new();
+    for name in ["variant_bench", "otel_logs_and_spans"].into_iter().take(table_count) {
+        let schema = crate::schema::get_schema(name).expect("recovery fixture");
+        let (store, url, table) = mem_table(&format!("startup-grouping-{name}"), schema.columns()?).await?;
+        let target = Arc::new(RwLock::new(table));
+        db.unified_tables.write().await.insert(name.into(), target.clone());
+        for tenant in 0..8 {
+            let project = format!("startup-grouping-{tenant}");
+            let mut row = test_span("original", "before", &project);
+            row["shape"] = serde_json::json!("startup grouping");
+            layer.insert(&project, name, vec![json_to_batch_for(name, vec![row])?]).await?;
+        }
+        tables.push((store, url, target));
+    }
+    layer.force_flush_current_buckets().await?;
+    assert_eq!(crate::write::wal::FlushPublicationJournal::load(layer.wal().data_dir())?.collect::<std::result::Result<Vec<_>, _>>()?.len(), table_count * 8);
+    let wait = std::time::Duration::from_millis(100);
+    for (store, url, target) in tables {
+        let slow = Arc::new(ThrottledStore::new(store, ThrottleConfig { wait_get_per_call: wait, ..Default::default() }));
+        let mut table = mem_backend(slow, &url).build()?;
+        table.state = target.read().await.state.clone();
+        *target.write().await = table;
+    }
+    let started = tokio::time::Instant::now();
+    assert_eq!(db.reconcile_flush_publications(&layer).await?, table_count * 8);
+    assert!(started.elapsed() <= wait * u32::try_from(table_count * 2)?, "remote refresh cost must depend on physical tables, not retained receipts");
+    assert_eq!(layer.snapshot_stats().airborne_topics, 0);
+    Ok(())
+}
+
+/// An in-place DML statement must order after the original detached publication,
+/// even though its caller already restored the rows and released its holds.
+#[test_case(false, false, true; "delete after detached take")]
+#[test_case(true, false, true; "update after detached take")]
+#[test_case(false, true, true; "delete take timeout preserves rows")]
+#[test_case(true, true, true; "update take timeout preserves rows")]
+#[test_case(false, false, false; "delete after detached snapshot")]
+#[test_case(true, false, false; "update after detached snapshot")]
+#[test_case(false, true, false; "delete snapshot timeout preserves rows")]
+#[test_case(true, true, false; "update snapshot timeout preserves rows")]
+#[serial]
+#[tokio::test(start_paused = true)]
+async fn dml_waits_for_detached_publication(update: bool, expires: bool, force: bool) -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let cfg = test_config_with("detached-dml", |cfg| {
+        cfg.core.timefusion_data_dir = dir.path().to_path_buf();
+        cfg.buffer.timefusion_flush_bucket_timeout_secs = 1;
+    });
+    let db = Database::with_config(cfg.clone()).await?;
+    db.cancel_maintenance();
+    let name = "mor_dormant";
+    let project = "detached-dml-project";
+    let schema = crate::schema::get_schema(name).expect("in-place DML fixture");
+    let url = Url::parse("memory:///detached-dml")?;
+    let table = mem_backend(Arc::new(object_store::memory::InMemory::new()), &url)
+        .build()?
+        .create()
+        .with_columns(schema.columns()?)
+        .with_partition_columns(schema.partitions.clone())
+        .await?;
+    let target = Arc::new(RwLock::new(table));
+    db.unified_tables.write().await.insert(name.into(), target.clone());
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let layer = Arc::new(test_layer(cfg)?.with_delta_writer({
+        let (target, release) = (target.clone(), release.clone());
+        Arc::new(move |_p, _t, batches, _wm| {
+            let (target, release) = (target.clone(), release.clone());
+            Box::pin(async move {
+                release.acquire().await?.forget();
+                let mut table = target.write().await;
+                *table = table.clone().write(batches).await?;
+                Ok(table.get_file_uris()?.collect())
+            })
+        })
+    }));
+    let db = Arc::new(db.with_buffered_layer(layer.clone()));
+    let mut ctx = db.clone().create_session_context();
+    db.setup_session_context(&mut ctx)?;
+    let now = crate::support::now_micros();
+    layer.insert(project, name, vec![json_to_batch_for(name, vec![test_span_ts("row", "before", project, now)])?]).await?;
+    if force {
+        layer.force_flush_current_buckets().await?;
+    } else {
+        layer.flush_all_now().await?;
+    }
+    let sql = if update {
+        format!("UPDATE {name} SET name = 'after' WHERE project_id = '{project}'")
+    } else {
+        format!("DELETE FROM {name} WHERE project_id = '{project}'")
+    };
+    let mut dml = Box::pin(async { ctx.sql(&sql).await?.collect().await });
+    assert!(tokio::time::timeout(std::time::Duration::from_millis(100), &mut dml).await.is_err(), "DML completed before the detached original published");
+    assert_eq!(query_col_strings(&layer, project, name, "name"), vec!["before"], "waiting must precede the memory mutation");
+    if expires {
+        let error =
+            tokio::time::timeout(std::time::Duration::from_secs(40), &mut dml).await?.expect_err("an unknown publication must reject DML at its wait deadline");
+        assert!(error.to_string().contains("DML could not establish flush ordering"), "{error}");
+        assert_eq!(query_col_strings(&layer, project, name, "name"), vec!["before"], "a rejected statement must leave its memory row unchanged");
+        assert_eq!(target.read().await.version(), Some(0), "a rejected statement must not publish a Delta mutation");
+    }
+    release.add_permits(1);
+    if expires {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async { ctx.sql(&sql).await?.collect().await }).await??;
+    } else {
+        tokio::time::timeout(std::time::Duration::from_secs(5), dml).await??;
+    }
+    assert!(layer.is_empty(), "completion receipt retires the old snapshot before DML");
+    let batches = db.query_delta_only(&format!("SELECT name FROM {name} WHERE project_id = '{project}'")).await?;
+    let names: Vec<_> = batches
+        .iter()
+        .flat_map(|batch| {
+            let col = arrow::compute::cast(batch.column_by_name("name").unwrap(), &arrow::datatypes::DataType::Utf8).unwrap();
+            use arrow::array::AsArray;
+            col.as_string::<i32>().iter().flatten().map(str::to_owned).collect::<Vec<_>>()
+        })
+        .collect();
+    assert_eq!(names, if update { vec!["after".to_string()] } else { vec![] }, "the original publication must not resurrect pre-DML values");
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_failed_upload_never_enters_log_publication() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir()?;
+    let table = DeltaTableBuilder::from_url(Url::from_directory_path(dir.path()).expect("absolute temporary directory"))?
+        .build()?
+        .create()
+        .with_columns(int_id_cols())
+        .await?;
+    let publication = Arc::new(super::write::FlushPublication::new(table.log_store()));
+    let mut writer = DeltaTable::new(publication.clone());
+    writer.state = table.state.clone();
+    let _restore = scopeguard::guard(dir.path(), |path| {
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755));
+    });
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555))?;
+    let failed = writer.clone().write(vec![int_id_batch(vec![1, 2])]).await;
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755))?;
+    assert!(failed.is_err(), "the read-only directory must reject Parquet upload");
+    assert_eq!(publication.version(), None, "a terminal upload failure must remain retryable");
+    writer.write(vec![int_id_batch(vec![1, 2])]).await?;
+    assert_eq!(publication.version(), Some(1), "a fresh upload can publish after storage recovers");
+    Ok(())
 }
 
 /// A one-column Int32 Delta table with deletion vectors enabled, holding `1..=4` in a
@@ -10591,11 +11634,10 @@ async fn a_late_file_outside_a_slice_leaves_it_readable(late_hour: u32, routes: 
     Ok(())
 }
 
-/// A heavy query whose root has several output partitions holds ONE heavy slot
-/// while it runs, not one per partition. Prod: monoscope's hash-partitioned
-/// `served` GROUP BY took all eight slots at once.
+/// A heavy query is priced once at its coalesced root. Its real sort fan-out
+/// consumes weighted permits, never a separate admission for each partition.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_multi_partition_heavy_query_takes_one_heavy_slot() -> Result<()> {
+async fn a_multi_partition_heavy_query_is_admitted_once() -> Result<()> {
     let db = Arc::new(db_where("heavy-slot-once", |_| {}).await?);
     db.cancel_maintenance();
     let project = format!("heavy_slot_{}", uuid::Uuid::new_v4().simple());
@@ -10617,18 +11659,20 @@ async fn a_multi_partition_heavy_query_takes_one_heavy_slot() -> Result<()> {
     let plan = ctx.sql(&sql).await?.create_physical_plan().await?;
     let shown = datafusion::physical_plan::displayable(plan.as_ref()).indent(true).to_string();
     assert!(shown.starts_with("AdmissionExec"), "the root must be gated:\n{shown}");
+    assert_eq!(shown.matches("AdmissionExec").count(), 1, "only the root owns admission:\n{shown}");
+    assert_eq!(plan.properties().partitioning.partition_count(), 1, "coalesce before admission, so partitioned collection cannot acquire again");
 
-    // Every root partition executed and held open, as `collect_partitioned` and
-    // `execute_stream`'s coalesce do; a partition that yields a batch keeps its slot.
+    // Hold the output stream after its first batch, as a slow client would.
     let sem = crate::read::admission::heavy_sem();
     let before = sem.available_permits();
     let mut streams = (0..plan.properties().partitioning.partition_count()).map(|p| plan.execute(p, ctx.task_ctx())).collect::<DFResult<Vec<_>>>()?;
     for stream in &mut streams {
         futures::StreamExt::next(stream).await.transpose()?;
     }
-    assert_eq!(before - sem.available_permits(), 1, "one running query holds one heavy slot:\n{shown}");
+    let charged = before - sem.available_permits();
+    assert!((2..=before).contains(&charged), "the actual parallel sort must charge multiple permits once:\n{shown}");
     drop(streams);
-    assert_eq!(sem.available_permits(), before, "the query returns its slot");
+    assert_eq!(sem.available_permits(), before, "the query returns all its weighted permits");
     Ok(())
 }
 

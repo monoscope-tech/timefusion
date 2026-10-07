@@ -337,6 +337,46 @@ async fn sigkill_drill(name: &str, opts: TfOpts, kill_delay: Option<Duration>, r
     crash_drill(name, opts, kill_delay, async |tf| insert_rounds(tf, name, rounds, rows, tolerate).await).await
 }
 
+/// Append-only counts expose replay duplicates that merge-on-read would hide.
+/// Identical inserts are distinct writes, including after repeated real crashes.
+#[test_case(false; "unflushed identical appends")]
+#[test_case(true; "committed identical appends")]
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial]
+async fn identical_append_writes_survive_sigkill(flush_immediately: bool) -> Result<()> {
+    let opts = TfOpts { extra_env: vec![("TIMEFUSION_FLUSH_IMMEDIATELY".into(), flush_immediately.to_string())], ..Default::default() };
+    let mut tf = Tf::start("identical-append", opts).await?;
+    let now = chrono::Utc::now();
+    let insert = format!(
+        "INSERT INTO variant_bench (project_id, date, timestamp, id, shape) VALUES ('{PROJECT}', '{}', '{}', 'same-id', 'restart')",
+        now.date_naive(),
+        now.format("%Y-%m-%d %H:%M:%S%.f")
+    );
+    let count = format!("SELECT count(*) FROM variant_bench WHERE project_id = '{PROJECT}'");
+    for expected in [2i64, 3] {
+        let client = tf.connect().await?;
+        for _ in 0..if expected == 2 { 2 } else { 1 } {
+            client.execute(&insert, &[]).await?;
+        }
+        assert_eq!(client.query_one(&count, &[]).await?.get::<_, i64>(0), expected, "every identical append carries its own durability promise");
+        drop(client);
+        let before_kill = std::fs::read_dir(tf.data_dir.join("wal/.timefusion_meta"))?
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+            .map(|entry| (entry.file_name(), std::fs::read_to_string(entry.path()).unwrap_or_default()))
+            .collect::<Vec<_>>();
+        tf.kill9()?;
+        tf.restart().await?;
+        assert_eq!(
+            tf.connect().await?.query_one(&count, &[]).await?.get::<_, i64>(0),
+            expected,
+            "SIGKILL recovery must neither lose nor duplicate appends; before kill: {before_kill:?}; boot: {}",
+            std::fs::read_to_string(&tf.boot_log)?
+        );
+    }
+    Ok(())
+}
+
 /// WAL topics are sharded per (project, table), so a per-shard cursor/hold bug
 /// can strand some tenants while others survive — invisible to a single-tenant test.
 #[tokio::test(flavor = "multi_thread")]

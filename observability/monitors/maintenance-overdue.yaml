@@ -1,0 +1,13 @@
+title: 'TF warn: maintenance work more than one day overdue'
+query: 'metrics | where metric_name == "timefusion.maintenance.oldest_due_unclaimed_age_seconds" | summarize last(value)'
+alert_threshold: 86400
+trigger_less_than: false
+check_interval_mins: 15
+time_window_mins: 15
+threshold_sustained_for_mins: 30
+severity: warning
+message: 'Inspect the oldest due task, dependencies, admission refusals, and quarantine state before changing concurrency. Task age alone does not establish starvation.'
+emails: [anthony@talstack.com]
+slack_channels: []
+teams: []
+visualization_type: numeric

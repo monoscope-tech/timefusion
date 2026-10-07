@@ -24,6 +24,7 @@ use itertools::Itertools;
 use parking_lot::Mutex;
 use tracing::{debug, error, info, instrument, warn};
 
+use super::wal::WalBatchIdentity;
 use crate::{observability::arrow_err, read::functions::FnRegistry};
 
 // Must track `d_bucket_duration_secs` in config.rs.
@@ -304,6 +305,7 @@ pub(crate) fn pin_opt(v: i64) -> Option<i64> {
 #[derive(Debug, Default, Clone)]
 struct WalShardState {
     first_positions: Vec<Option<walrus_rust::WalPosition>>,
+    write_identities: Vec<WalBatchIdentity>,
 }
 
 impl WalShardState {
@@ -333,6 +335,8 @@ pub struct FlushableBucket {
     /// read-cursor holds. Registered as in-flight holds while the flush is
     /// airborne; restored to the bucket if the Delta commit fails.
     pub wal_first_positions: Vec<Option<walrus_rust::WalPosition>>,
+    /// Original admitted row ranges, preserved independently of batch coalescing.
+    pub(crate) write_identities: Vec<WalBatchIdentity>,
     /// `mutation_gen` at snapshot time (snapshot-flush path only). If it moved
     /// by commit time a DML mutated the bucket mid-flight, so
     /// `finish_flushed_snapshot` must keep the rows and re-flush.
@@ -349,6 +353,15 @@ pub struct FlushableBucket {
     /// Key of this take's entry in `MemBuffer::taking_pins`; released via
     /// [`MemBuffer::release_taking_pin`] once the inflight pin is registered.
     pub taking_pin_seq: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct WalPinSnapshot {
+    pub project_id: String,
+    pub table_name: String,
+    pub bucket_id: i64,
+    pub append_micros: i64,
+    pub empty: bool,
 }
 
 #[derive(Debug, Default)]
@@ -1021,11 +1034,12 @@ impl MemBuffer {
     pub fn insert_with_hold(
         &self, project_id: &str, table_name: &str, batch: RecordBatch, timestamp_micros: i64, wal_hold: Option<(usize, walrus_rust::WalPosition)>,
     ) -> anyhow::Result<()> {
+        let (batch, identity) = WalBatchIdentity::take_from_batch(batch)?;
         let declared = crate::schema::get_schema(table_name).map(|schema| schema.schema_ref());
         let batch = canonicalize_declared_batch(batch, declared.as_ref())?;
         let schema = batch.schema();
         let table = self.get_or_create_table(project_id, table_name, &schema)?;
-        let (mem_delta, bucket_id) = table.insert_batch(batch, timestamp_micros, wal_hold)?;
+        let (mem_delta, bucket_id) = table.insert_identified_batch(batch, timestamp_micros, wal_hold, identity)?;
         apply_signed_delta(&self.estimated_bytes, mem_delta);
         self.cache_invalidate(&Self::cache_key(project_id, table_name, bucket_id));
         Ok(())
@@ -1057,6 +1071,28 @@ impl MemBuffer {
             .filter_map(|t| t.buckets.iter().filter_map(|b| pin_opt(b.first_wal_pin_micros.load(Ordering::Relaxed))).min())
             .chain(self.taking_pins.iter().map(|e| *e.value()))
             .min()
+    }
+
+    /// Owner of the oldest live bucket pin, including empty DML shells.
+    pub fn oldest_wal_pin(&self) -> Option<WalPinSnapshot> {
+        self.tables
+            .iter()
+            .filter_map(|table| {
+                table
+                    .buckets
+                    .iter()
+                    .filter_map(|bucket| {
+                        pin_opt(bucket.first_wal_pin_micros.load(Ordering::Relaxed)).map(|append_micros| WalPinSnapshot {
+                            project_id: table.project_id.to_string(),
+                            table_name: table.table_name.to_string(),
+                            bucket_id: *bucket.key(),
+                            append_micros,
+                            empty: bucket.batches.lock().is_empty(),
+                        })
+                    })
+                    .min_by_key(|pin| pin.append_micros)
+            })
+            .min_by_key(|pin| pin.append_micros)
     }
 
     /// Drop a take-in-progress pin once the flush path has registered its own
@@ -1120,8 +1156,8 @@ impl MemBuffer {
         if batches.is_empty() {
             return Ok(());
         }
-        let schema = batches[0].schema();
-        let table = self.get_or_create_table(project_id, table_name, &schema)?;
+        let (first, _) = WalBatchIdentity::take_from_batch(batches[0].clone())?;
+        let table = self.get_or_create_table(project_id, table_name, &first.schema())?;
 
         let inserted: Vec<(i64, i64)> = batches.into_iter().map(|batch| table.insert_batch(batch, timestamp_micros, None)).try_collect()?;
         apply_signed_delta(&self.estimated_bytes, inserted.iter().map(|&(sz, _)| sz).sum());
@@ -1373,6 +1409,15 @@ impl MemBuffer {
         // Capture the DML generation under the same lock as the batch clones,
         // so a mutation can't slip between clone and capture.
         let (snapshot_gen, snapshot_rewrite_gen) = (bucket.mutation_gen.load(Ordering::Relaxed), bucket.rewrite_gen.load(Ordering::Relaxed));
+        // Transfer the snapshot's age pin along with its positions. Late
+        // arrivals must own a new pin rather than inherit the flushed prefix's.
+        // Park it before clearing the bucket so GC cannot see a gap.
+        let first_wal_pin_micros = bucket.first_wal_pin_micros.load(Ordering::Relaxed);
+        let taking_pin_seq = self.taking_seq.fetch_add(1, Ordering::Relaxed);
+        if let Some(pin) = pin_opt(first_wal_pin_micros) {
+            self.taking_pins.insert(taking_pin_seq, pin);
+        }
+        bucket.first_wal_pin_micros.store(i64::MAX, Ordering::Relaxed);
         drop(wal_g);
         drop(batches_g);
         Some(FlushableBucket {
@@ -1382,13 +1427,13 @@ impl MemBuffer {
             row_count: batches.iter().map(|b| b.num_rows()).sum(),
             batches,
             wal_first_positions: pad_positions(&wal_state.first_positions, self.shards_per_topic),
+            write_identities: wal_state.write_identities,
             snapshot_gen,
             snapshot_rewrite_gen,
             min_timestamp: bucket.min_timestamp.load(Ordering::Relaxed),
             max_timestamp: bucket.max_timestamp.load(Ordering::Relaxed),
-            first_wal_pin_micros: bucket.first_wal_pin_micros.load(Ordering::Relaxed),
-            // u64::MAX is never allocated by `taking_seq`, so releasing it is a no-op.
-            taking_pin_seq: u64::MAX,
+            first_wal_pin_micros,
+            taking_pin_seq,
         })
     }
 
@@ -1409,6 +1454,7 @@ impl MemBuffer {
         // Source evaporated while airborne (evicted/reaped): the rows are
         // durably in Delta, so count as drained.
         let Some(table) = self.get_table(&b.project_id, &b.table_name) else {
+            self.release_taking_pin(b.taking_pin_seq);
             return true;
         };
         // Greatest row timestamp this commit handed to Delta — both the flushed
@@ -1422,7 +1468,9 @@ impl MemBuffer {
             let dirty = bucket.mutation_gen.load(Ordering::Relaxed) != b.snapshot_gen;
             if dirty && !(drain_clean && bucket.rewrite_gen.load(Ordering::Relaxed) == b.snapshot_rewrite_gen) {
                 // Dirty: re-pin and re-flush next cycle.
-                bucket.restore_holds(&b.wal_first_positions);
+                bucket.first_wal_pin_micros.fetch_min(b.first_wal_pin_micros, Ordering::Relaxed);
+                bucket.restore_holds(&b.wal_first_positions, false);
+                self.release_taking_pin(b.taking_pin_seq);
                 bucket.dirty_flushes.fetch_add(1, Ordering::Relaxed);
                 crate::observability::flush_dirty_stats().dirty_reflush_rows_reflushed.fetch_add(b.row_count as u64, Ordering::Relaxed);
                 info!("finish_flushed_snapshot: bucket {}.{}/{} mutated mid-flight — keeping rows for re-flush", b.project_id, b.table_name, b.bucket_id);
@@ -1452,6 +1500,8 @@ impl MemBuffer {
                 bucket.min_timestamp.store(min, Ordering::Relaxed);
                 bucket.max_timestamp.store(max, Ordering::Relaxed);
             }
+            let landed: std::collections::HashSet<_> = b.write_identities.iter().copied().collect();
+            bucket.wal_shard_state.lock().write_identities.retain(|identity| !landed.contains(identity));
             bucket.flush_pinned_prefix.store(0, Ordering::Relaxed);
             drop(g);
             // Mirror the CLAMPED amount onto the MemBuffer total — raw `freed`
@@ -1479,6 +1529,7 @@ impl MemBuffer {
             drop(table);
             self.try_drop_empty_table(&key);
         }
+        self.release_taking_pin(b.taking_pin_seq);
         true
     }
 
@@ -1488,13 +1539,32 @@ impl MemBuffer {
     /// entries stay replayable.
     #[must_use]
     pub fn restore_snapshot_holds(&self, b: &FlushableBucket) -> bool {
+        self.restore_snapshot_holds_inner(b, false)
+    }
+
+    /// Retain the snapshot prefix until the detached publication is resolved.
+    #[must_use]
+    pub(crate) fn restore_unresolved_snapshot_holds(&self, b: &FlushableBucket) -> bool {
+        self.restore_snapshot_holds_inner(b, true)
+    }
+
+    fn restore_snapshot_holds_inner(&self, b: &FlushableBucket, keep_prefix: bool) -> bool {
         let Some(table) = self.get_table(&b.project_id, &b.table_name) else {
             return false;
         };
         let Some(bucket) = table.buckets.get(&b.bucket_id) else {
             return false;
         };
-        bucket.restore_holds(&b.wal_first_positions);
+        let _batches = bucket.batches.lock();
+        bucket.first_wal_pin_micros.fetch_min(b.first_wal_pin_micros, Ordering::Relaxed);
+        bucket.restore_holds(&b.wal_first_positions, keep_prefix);
+        // DML changes the original rows, so those ranges no longer prove publication.
+        if bucket.mutation_gen.load(Ordering::Relaxed) == b.snapshot_gen {
+            let mut state = bucket.wal_shard_state.lock();
+            let mut known: std::collections::HashSet<_> = state.write_identities.iter().copied().collect();
+            state.write_identities.extend(b.write_identities.iter().copied().filter(|identity| known.insert(*identity)));
+        }
+        self.release_taking_pin(b.taking_pin_seq);
         true
     }
 
@@ -1601,6 +1671,7 @@ impl MemBuffer {
             batches,
             row_count,
             wal_first_positions: pad_positions(&wal_state.first_positions, self.shards_per_topic),
+            write_identities: wal_state.write_identities,
             snapshot_gen: 0, // take removes rows; the gen check is snapshot-path-only
             snapshot_rewrite_gen: 0,
             min_timestamp,
@@ -1619,11 +1690,21 @@ impl MemBuffer {
     /// watermark can't pass the un-restored entries.
     #[must_use]
     pub fn restore_taken_bucket(&self, b: &FlushableBucket) -> bool {
+        self.restore_taken_bucket_inner(b, false).is_some()
+    }
+
+    /// Restore an unresolved take as a protected prefix and capture its DML
+    /// generation under the batch lock. A later completion can drain only it.
+    pub(crate) fn restore_taken_snapshot(&self, b: &FlushableBucket) -> Option<FlushableBucket> {
+        self.restore_taken_bucket_inner(b, true)
+    }
+
+    fn restore_taken_bucket_inner(&self, b: &FlushableBucket, protect_prefix: bool) -> Option<FlushableBucket> {
         // Recreate the table if it was reaped while the bucket was airborne: a
         // silent no-op drops the rows AND their cursor holds, letting the
         // watermark pass acked entries.
         let Some(schema) = b.batches.first().map(|batch| batch.schema()) else {
-            return true; // nothing to restore
+            return Some(b.clone()); // nothing to restore
         };
         let table = match self.get_or_create_table(&b.project_id, &b.table_name, &schema) {
             Ok(t) => t,
@@ -1632,15 +1713,28 @@ impl MemBuffer {
                     "restore_taken_bucket: cannot restore {} rows for {}.{} bucket {} ({}); rows stay WAL-only until restart replay",
                     b.row_count, b.project_id, b.table_name, b.bucket_id, e
                 );
-                return false;
+                return None;
             }
         };
         let bucket = table.buckets.entry(b.bucket_id).or_insert_with(TimeBucket::new);
         let mut batches_g = bucket.batches.lock();
         let mut wal_g = bucket.wal_shard_state.lock();
         let added: usize = b.batches.iter().map(estimate_batch_size).sum();
-        batches_g.extend(b.batches.iter().cloned());
+        if protect_prefix {
+            let mut prefix = b.batches.clone();
+            prefix.append(&mut *batches_g);
+            *batches_g = prefix;
+            bucket.flush_pinned_prefix.store(b.batches.len(), Ordering::Relaxed);
+        } else {
+            batches_g.extend(b.batches.iter().cloned());
+        }
+        let snapshot = FlushableBucket {
+            snapshot_gen: bucket.mutation_gen.load(Ordering::Relaxed),
+            snapshot_rewrite_gen: bucket.rewrite_gen.load(Ordering::Relaxed),
+            ..b.clone()
+        };
         b.wal_first_positions.iter().enumerate().filter_map(|(i, p)| p.map(|p| (i, p))).for_each(|(i, pos)| wal_g.merge(i, pos));
+        wal_g.write_identities.extend(b.write_identities.iter().copied());
         bucket.memory_bytes.fetch_add(added, Ordering::Relaxed);
         bucket.row_count.fetch_add(b.row_count, Ordering::Relaxed);
         // Monotonic widen so restored rows stay visible to time-range pruning
@@ -1652,7 +1746,7 @@ impl MemBuffer {
         drop(batches_g);
         self.estimated_bytes.fetch_add(added, Ordering::Relaxed);
         self.cache_invalidate(&Self::cache_key(&b.project_id, &b.table_name, b.bucket_id));
-        true
+        Some(snapshot)
     }
 
     /// Count buckets that have DWELLED here since before `cutoff_micros` —
@@ -2290,6 +2384,13 @@ impl TableBuffer {
     /// `bucket.memory_bytes`. The caller must apply it verbatim to
     /// `MemBuffer::estimated_bytes`, or that total drifts.
     pub fn insert_batch(&self, batch: RecordBatch, timestamp_micros: i64, wal_hold: Option<(usize, walrus_rust::WalPosition)>) -> anyhow::Result<(i64, i64)> {
+        let (batch, identity) = WalBatchIdentity::take_from_batch(batch)?;
+        self.insert_identified_batch(batch, timestamp_micros, wal_hold, identity)
+    }
+
+    fn insert_identified_batch(
+        &self, batch: RecordBatch, timestamp_micros: i64, wal_hold: Option<(usize, walrus_rust::WalPosition)>, identity: Option<WalBatchIdentity>,
+    ) -> anyhow::Result<(i64, i64)> {
         // Reconcile against the declared schema BEFORE storing, so every
         // downstream consumer sees one authoritative nullability.
         let batch = canonicalize_declared_batch(batch, self.declared.as_ref())?;
@@ -2316,6 +2417,9 @@ impl TableBuffer {
                 None => {
                     bucket.first_wal_pin_micros.fetch_min(chrono::Utc::now().timestamp_micros(), Ordering::Relaxed);
                 }
+            }
+            if let Some(identity) = identity {
+                bucket.wal_shard_state.lock().write_identities.push(identity);
             }
             g.push(batch);
             bucket.memory_bytes.fetch_add(new_size, Ordering::Relaxed);
@@ -2405,6 +2509,7 @@ impl TimeBucket {
     /// snapshot/drain observe a consistent (rows, gen, holds) triple.
     fn note_dml_mutation(&self, wal_hold: Option<(usize, walrus_rust::WalPosition)>, rewrites: bool) {
         self.mutation_gen.fetch_add(1, Ordering::Relaxed);
+        self.wal_shard_state.lock().write_identities.clear();
         if rewrites {
             self.rewrite_gen.fetch_add(1, Ordering::Relaxed);
         }
@@ -2421,14 +2526,14 @@ impl TimeBucket {
         }
     }
 
-    /// Re-pin a flush snapshot's WAL holds and lift the prefix fence — the
-    /// snapshotted rows are the bucket's own again (failed commit, or a DML
-    /// that dirtied the bucket mid-flight).
-    fn restore_holds(&self, positions: &[Option<walrus_rust::WalPosition>]) {
+    /// Re-pin the snapshot; unresolved publication must retain its prefix fence.
+    fn restore_holds(&self, positions: &[Option<walrus_rust::WalPosition>], keep_prefix: bool) {
         for (shard, pos) in positions.iter().enumerate() {
             self.record_wal_append(shard, *pos);
         }
-        self.flush_pinned_prefix.store(0, Ordering::Relaxed);
+        if !keep_prefix {
+            self.flush_pinned_prefix.store(0, Ordering::Relaxed);
+        }
     }
 
     fn snapshot_wal_shard_state(&self, shards_per_topic: usize) -> Vec<Option<walrus_rust::WalPosition>> {
@@ -3142,6 +3247,39 @@ mod tests {
         assert!(holds[0].is_some(), "late arrival's hold must survive the prefix drain");
     }
 
+    #[test_case("landed"; "successful prefix releases its old pin")]
+    #[test_case("failed"; "failed commit restores its old pin")]
+    #[test_case("dirty"; "rewritten prefix restores its old pin")]
+    fn snapshot_gc_pin_follows_uncommitted_rows(outcome: &str) {
+        let buffer = MemBuffer::new();
+        let ts = chrono::Utc::now().timestamp_micros();
+        let id = MemBuffer::compute_bucket_id(ts);
+        let old_pin = ts - 9 * 3600 * 1_000_000;
+        buffer.insert_with_hold("p", "t", create_test_batch(ts), ts, Some((0, walrus_rust::WalPosition::ORIGIN))).unwrap();
+        buffer.get_table("p", "t").unwrap().buckets.get(&id).unwrap().first_wal_pin_micros.store(old_pin, Ordering::Relaxed);
+        let snapshot = buffer.snapshot_bucket_for_flush("p", "t", id).unwrap();
+        assert_eq!(buffer.oldest_wal_append_micros(), Some(old_pin), "snapshot must protect its WAL before handoff");
+        buffer.insert_with_hold("p", "t", create_test_batch(ts), ts, Some((0, walrus_rust::WalPosition { block_id: 9, offset: 9 }))).unwrap();
+        // The caller now owns the snapshot's in-flight pin. Only the late
+        // arrival should pin the live bucket until failure/dirty restoration.
+        buffer.release_taking_pin(snapshot.taking_pin_seq);
+        let late_pin = buffer.oldest_wal_append_micros().unwrap();
+        assert!(late_pin > old_pin);
+        match outcome {
+            "landed" => assert!(buffer.finish_flushed_snapshot(&snapshot, true)),
+            "failed" => assert!(buffer.restore_snapshot_holds(&snapshot)),
+            "dirty" => {
+                assert_eq!(buffer.update("p", "t", None, &[("name".into(), datafusion::logical_expr::lit("changed"))], None).unwrap(), 2);
+                assert!(!buffer.finish_flushed_snapshot(&snapshot, true));
+            }
+            _ => unreachable!(),
+        }
+        assert_eq!(buffer.oldest_wal_append_micros(), Some(if outcome == "landed" { late_pin } else { old_pin }));
+        let next = buffer.snapshot_bucket_for_flush("p", "t", id).unwrap();
+        assert!(buffer.finish_flushed_snapshot(&next, true));
+        assert_eq!(buffer.oldest_wal_append_micros(), None, "all committed rows must release all pins");
+    }
+
     /// The prefix drain must narrow a surviving bucket's range to the surviving
     /// rows — otherwise `get_bucket_ranges` masks the drained rows' freshly
     /// committed Delta copies. It must not blanket-exempt the bucket either: the
@@ -3635,15 +3773,25 @@ mod tests {
     /// batches per bucket, on the insert path and through the flush path. (Concat
     /// fires when len > the cap, and the next push reaches the cap again before
     /// the next concat, hence the `+ 1`.)
-    #[test_case(10, 1 ; "ten one-row inserts share a single bucket")]
-    #[test_case(1000, 30 ; "prod fragmentation incident: 1000 OTLP INSERTs of ~30 rows")]
-    fn insert_coalesces_small_batches_into_bucket_tail(inserts: usize, row_count_per_insert: usize) {
+    #[test_case(10, 1, false ; "ten one-row inserts share a single bucket")]
+    #[test_case(1000, 30, false ; "prod fragmentation incident: 1000 OTLP INSERTs of ~30 rows")]
+    #[test_case(10, 1, true ; "write identities survive small-batch coalescing and detached retirement")]
+    #[test_case(1000, 30, true ; "write identities survive production-scale fragmentation")]
+    fn insert_coalesces_small_batches_into_bucket_tail(inserts: usize, row_count_per_insert: usize, identified: bool) {
         let buffer = MemBuffer::new();
         let ts = 1_000_000_000_000i64;
         let total_rows = row_count_per_insert * inserts;
+        let mut identities = Vec::new();
 
         for i in 0..inserts {
             let batch = make_batch_with_rows(ts + i as i64, row_count_per_insert);
+            let batch = if identified {
+                let batch = super::super::wal::identify_batch_for_wal(batch).unwrap();
+                identities.push(WalBatchIdentity::from_batch(&batch).unwrap());
+                batch
+            } else {
+                batch
+            };
             buffer.insert("p1", "t1", batch, ts).unwrap();
         }
 
@@ -3653,6 +3801,7 @@ mod tests {
         let n_batches = snapshot.len();
 
         assert_eq!(snapshot.iter().map(|b| b.num_rows()).sum::<usize>(), total_rows, "row preservation");
+        assert!(snapshot.iter().all(|batch| batch.schema() == make_batch_with_rows(ts, 1).schema()), "internal metadata must not leak into query schemas");
         assert!(
             n_batches <= MAX_BATCH_COUNT_PER_BUCKET + 1,
             "bucket should hold ≤{} batches after amortized coalesce, got {n_batches}",
@@ -3664,12 +3813,32 @@ mod tests {
         assert_eq!(flushable.len(), 1, "all inserts share one time bucket");
         assert_eq!(flushable[0].row_count, total_rows);
         assert_eq!(flushable[0].batches.iter().map(|b| b.num_rows()).sum::<usize>(), total_rows, "no rows lost to insert-time coalesce");
+        assert_eq!(flushable[0].write_identities, identities, "coalescing must retain original admitted row ranges");
         assert!(
             flushable[0].batches.len() <= MAX_BATCH_COUNT_PER_BUCKET + 1,
             "got {} batches, expected ≤ {}",
             flushable[0].batches.len(),
             MAX_BATCH_COUNT_PER_BUCKET + 1
         );
+        if identified {
+            let receipt = buffer.restore_taken_snapshot(&flushable[0]).unwrap();
+            let late = super::super::wal::identify_batch_for_wal(make_batch_with_rows(ts, 1)).unwrap();
+            let late_identity = WalBatchIdentity::from_batch(&late).unwrap();
+            buffer.insert("p1", "t1", late, ts).unwrap();
+            assert!(buffer.finish_flushed_snapshot(&receipt, true));
+            let snapshot = buffer.snapshot_bucket_for_flush("p1", "t1", bucket_id).unwrap();
+            assert_eq!(snapshot.row_count, 1, "late append survives receipt retirement");
+            assert_eq!(snapshot.write_identities, [late_identity], "committed lineage retires without consuming late lineage");
+            assert!(buffer.restore_snapshot_holds(&snapshot));
+            assert!(buffer.restore_snapshot_holds(&snapshot));
+            let restored = buffer.snapshot_bucket_for_flush("p1", "t1", bucket_id).unwrap();
+            assert_eq!(restored.write_identities, [late_identity], "retry restoration is idempotent");
+            assert!(buffer.restore_snapshot_holds(&restored));
+            assert_eq!(buffer.delete("p1", "t1", None, None).unwrap(), 1);
+            buffer.insert("p1", "t1", make_batch_with_rows(ts, 1), ts).unwrap();
+            let mutated = buffer.take_bucket_for_flush("p1", "t1", bucket_id).unwrap();
+            assert!(mutated.write_identities.is_empty(), "a DML mutation or legacy append cannot reuse publication proof");
+        }
     }
 
     fn make_batch_with_rows(start_ts: i64, n: usize) -> RecordBatch {

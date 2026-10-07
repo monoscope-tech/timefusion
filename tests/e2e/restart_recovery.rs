@@ -118,17 +118,18 @@ async fn cold_start_under_five_seconds() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The landed-batch skip end to end: commit writes `timefusion.landed_digests`
-/// -> boot scan installs it into the layer -> the re-flush of the replayed rows
-/// is declined.
+/// Durable publication proof skips committed WAL during replay. Without that
+/// receipt, the legacy Delta-history digest still declines the replayed flush.
 ///
 /// The duplicate must be produced by the drop-cursor-advance hook, not by
 /// re-sending rows: `otel_logs_and_spans` is `version_append`, so an inbound
 /// write gets a fresh `updated_at` and is genuinely different content. Only WAL
 /// replay preserves the durable stamp, so a client cannot spoof a landed identity.
+#[test_case::test_case(true; "durable publication skips replay")]
+#[test_case::test_case(false; "legacy history declines reflush")]
 #[serial_test::serial]
 #[tokio::test(flavor = "multi_thread")]
-async fn replayed_rows_that_delta_already_holds_are_not_written_again() -> anyhow::Result<()> {
+async fn replayed_rows_that_delta_already_holds_are_not_written_again(publication_receipt: bool) -> anyhow::Result<()> {
     let mut env = quiesced().with_landed_skip().start().await?;
     {
         let client = env.pg_client().await?;
@@ -138,14 +139,31 @@ async fn replayed_rows_that_delta_already_holds_are_not_written_again() -> anyho
         let stats = env.force_flush().await?;
         assert!(stats.buckets_flushed > 0, "nothing was committed, so there is no landed identity to find: {stats:?}");
     }
+    if !publication_receipt {
+        // Reconstruct the pre-journal recovery boundary without changing any
+        // acknowledged WAL bytes or the actual Delta commit history.
+        for entry in std::fs::read_dir(env.data_dir.join("wal/.timefusion_meta"))? {
+            let path = entry?.path();
+            if path.file_name().and_then(|name| name.to_str()).is_some_and(|name| name.starts_with("flush-") && name.ends_with(".json")) {
+                std::fs::remove_file(path)?;
+            }
+        }
+    }
     tokio::time::sleep(Duration::from_millis(400)).await;
 
     env.restart().await?;
 
-    // Rows already durable in Delta are back in MemBuffer, queued to be written again.
     let stats = env.snapshot_stats();
-    assert!(stats.wal_replay_rows >= 5, "replay did not re-insert the committed rows, so there is no duplicate to decline: {stats:?}");
-    assert_eq!(stats.landed_skips_total, 0, "a fresh process has skipped nothing yet");
+    if publication_receipt {
+        assert_eq!(stats.wal_replay_rows, 0, "confirmed publication must bypass replay: {stats:?}");
+        assert_eq!(stats.mem_total_rows, 0, "committed rows must not re-enter the buffer");
+        assert_eq!(stats.landed_skips_total, 5, "each committed WAL entry was skipped");
+    } else {
+        assert!(stats.wal_replay_rows >= 5, "without publication proof, WAL must replay conservatively: {stats:?}");
+        assert_eq!(stats.landed_skips_total, 0, "the legacy skip occurs at reflush");
+    }
+    let table_ref = env.db().resolve_table("e2e_project", "otel_logs_and_spans").await?;
+    let version = table_ref.read().await.version();
 
     let after = env.force_flush().await?;
     let stats = env.snapshot_stats();
@@ -153,6 +171,14 @@ async fn replayed_rows_that_delta_already_holds_are_not_written_again() -> anyho
         stats.landed_skips_total > 0,
         "the re-write of already-committed rows was NOT declined — the identity did not survive Delta metadata -> boot scan -> skip (flush={after:?}, stats={stats:?})"
     );
+    let table = table_ref.read().await;
+    assert_eq!(table.version(), version, "recovery and reflush must not publish another commit");
+    assert_eq!(
+        table.snapshot()?.log_data().iter().map(|file| file.num_records()).sum::<Option<usize>>(),
+        Some(5),
+        "the physical Delta files hold exactly five rows"
+    );
+    drop(table);
 
     let client = env.pg_client().await?;
     assert_eq!(count_rows(&client, "e2e_project").await?, 5, "the declined flush must not have cost any rows");

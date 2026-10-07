@@ -1,0 +1,12 @@
+title: 'TF warn: queries exhausted their memory pool'
+query: 'resource.service.name == "timefusion" and attributes.error contains "Resources exhausted" | summarize count()'
+alert_threshold: 0
+trigger_less_than: false
+check_interval_mins: 5
+time_window_mins: 15
+severity: warning
+message: 'Capture the failing SQL shape and inspect heavy-query admission, sort fan-out, spill reservations, and query-pool usage.'
+emails: [anthony@talstack.com]
+slack_channels: []
+teams: []
+visualization_type: numeric

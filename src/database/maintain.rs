@@ -4060,10 +4060,10 @@ impl Database {
                 );
             }
         }
-        // Only when the unit will do nothing: one file is a 1:1 rewrite and retires none.
+        // Only when the unit will do nothing: a lone admitted DV strip is useful work.
         // COUNTED, not just logged: the 2026-09-15 wedge emitted this line thousands of
         // times a minute for three days and nothing aggregated it, so no alert could fire.
-        if selected.len() < 2 {
+        if selected.len() < 2 && !single_strip_selected(&cells, &selected) {
             let stats = crate::observability::maintenance_stats();
             stats.compaction_units_selected_nothing.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             // THE INVARIANT. Two under-target files are exactly what the planner
@@ -8884,11 +8884,11 @@ impl Database {
                     self.warm_strip_bodies(table_ref, &fresh);
                     return WaveResult { landed: carried.tap_mut(|landed| landed.extend(fresh)), failed };
                 }
-                Err(CommitFailure { message: e, timed_out }) => {
+                Err(CommitFailure { message: e, publication_uncertain }) => {
                     // Released BEFORE the probe: the probe is another log read,
                     // and on a timeout the store is already slow.
                     drop(commit_guard);
-                    let occ = !timed_out && is_occ_conflict_err(&e);
+                    let occ = !publication_uncertain && is_occ_conflict_err(&e);
                     if occ {
                         crate::observability::record_optimize_conflict();
                     }
@@ -8902,7 +8902,7 @@ impl Database {
                     // landed-but-hook-failed commit already Removed the OLD
                     // files, so the new files are the only live copy.
                     let all_adds: Vec<Action> = fresh.iter().flat_map(|b| b.adds.iter().cloned()).collect();
-                    match probe_after_timeout(self.probe_commit_landed_bounded(table_ref, &all_adds).await, timed_out) {
+                    match probe_after_uncertain_commit(self.probe_commit_landed_bounded(table_ref, &all_adds).await, publication_uncertain) {
                         CommitProbe::Landed => {
                             warn!("{engine} wave for '{}' reported an error but LANDED (post-commit hook failed): {}", table_name, e);
                             let post = { table_ref.read().await.clone() };
@@ -9563,11 +9563,11 @@ impl Database {
     /// cleanup aid, correctness never depends on it.
     pub async fn reconcile_staged_intents(&self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str) {
         use object_store::ObjectStoreExt;
-        let entries = self.staged_intents();
+        let mut entries = self.staged_intents();
         if entries.is_empty() {
             return;
         }
-        let (referenced, store) = {
+        let (referenced, live, store) = {
             let table = table_ref.read().await;
             let Ok(snapshot) = table.snapshot() else {
                 warn!("staged-intent reconcile skipped for '{table_name}': no snapshot loaded");
@@ -9583,9 +9583,33 @@ impl Database {
                     std::iter::once(f.path().into_owned()).chain(dv)
                 })
                 .collect();
-            (referenced, table.log_store().object_store(None))
+            let interest: HashSet<&str> = entries
+                .iter()
+                .filter(|entry| entry.table_name == table_name && entry.rollup.is_none() && self.config.maintenance.timefusion_repair_resume_enabled)
+                .flat_map(|entry| entry.target_paths.iter().chain(entry.adds.iter().map(|add| &add.path)))
+                .map(String::as_str)
+                .collect();
+            let live: HashMap<String, Option<i64>> = snapshot
+                .log_data()
+                .iter()
+                .filter(|file| interest.contains(&*file.path()))
+                .map(|file| {
+                    let dropped = file.deletion_vector_descriptor().map_or(0, |dv| dv.cardinality);
+                    (file.path().into_owned(), file.num_records().and_then(|rows| i64::try_from(rows).ok()).map(|rows| rows - dropped))
+                })
+                .collect();
+            (referenced, live, table.log_store().object_store(None))
         };
         let now_secs = crate::support::now_secs();
+        let live_view: HashMap<&str, Option<i64>> = live.iter().map(|(path, rows)| (path.as_str(), *rows)).collect();
+        let original_count = entries.len();
+        // Table resolution during WAL recovery can precede the first repair pass.
+        // Its eligible staged output is resumable work, not an orphan to delete.
+        entries.retain(|entry| {
+            !(self.config.maintenance.timefusion_repair_resume_enabled
+                && entry.rollup.is_none()
+                && matches!(classify_resume(entry, table_name, now_secs, &live_view), ResumeVerdict::Commit))
+        });
         let orphans = staged_orphan_deletions(&entries, table_name, now_secs, &referenced);
         let orphan_count = orphans.len();
         let deleted = futures::stream::iter(orphans)
@@ -9605,7 +9629,14 @@ impl Database {
             .buffer_unordered(8)
             .fold(0usize, |acc, n| async move { acc + n })
             .await;
-        info!(table_name, entries = entries.len(), orphans = orphan_count, deleted, event = "staged_intent_reconciled");
+        info!(
+            table_name,
+            entries = entries.len(),
+            resumable = original_count - entries.len(),
+            orphans = orphan_count,
+            deleted,
+            event = "staged_intent_reconciled"
+        );
         // Clear ONLY the entries this reconcile judged: this table's, old enough to be
         // unambiguous. Other tables' entries (and young ones) stay for their own pass.
         let ids: Vec<&str> = entries
