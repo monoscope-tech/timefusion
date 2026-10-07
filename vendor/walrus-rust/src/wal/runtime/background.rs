@@ -21,7 +21,7 @@ use super::DELETION_TX;
 use crate::wal::config::USE_FD_BACKEND;
 use crate::wal::{
     config::{FsyncSchedule, debug_print},
-    storage::{StorageImpl, open_storage_for_path},
+    storage::{SharedMmapKeeper, release_file},
 };
 
 pub(super) fn start_background_workers(fsync_schedule: FsyncSchedule) -> Arc<mpsc::Sender<String>> {
@@ -36,7 +36,6 @@ pub(super) fn start_background_workers(fsync_schedule: FsyncSchedule) -> Arc<mps
     // instances, e.g. parallel tests) a non-owner tick eats the flag against
     // an empty delete_pending and the request is lost.
     let owns_deletions = DELETION_TX.get().is_some_and(|tx| Arc::ptr_eq(tx, &del_tx_arc));
-    let pool: HashMap<String, StorageImpl> = HashMap::new();
     let tick = Arc::new(AtomicU64::new(0));
     let sleep_millis = match fsync_schedule {
         FsyncSchedule::Milliseconds(ms) => ms.max(1),
@@ -48,7 +47,6 @@ pub(super) fn start_background_workers(fsync_schedule: FsyncSchedule) -> Arc<mps
         if owns_deletions {
             let _ = super::DELETION_THREAD.set(thread::current());
         }
-        let mut pool = pool;
         let tick = tick;
         let del_rx = del_rx;
         let mut delete_pending = HashSet::new();
@@ -71,25 +69,9 @@ pub(super) fn start_background_workers(fsync_schedule: FsyncSchedule) -> Arc<mps
                 debug_print!("[flush] scheduling {} paths", unique.len());
             }
 
-            // Phase 2: Open/map files if needed
-            for path in unique.iter() {
-                // Skip if file doesn't exist
-                if !Path::new(&path).exists() {
-                    debug_print!("[flush] file does not exist, skipping: {}", path);
-                    continue;
-                }
-
-                if !pool.contains_key(path) {
-                    match open_storage_for_path(path) {
-                        Ok(storage) => {
-                            pool.insert(path.clone(), storage);
-                        }
-                        Err(e) => {
-                            debug_print!("[flush] failed to open storage for {}: {}", path, e);
-                        }
-                    }
-                }
-            }
+            // Phase 2: Borrow each file's shared handle for this cycle only. A
+            // long-lived private pool would pin deleted files open between resets.
+            let pool: HashMap<&String, _> = unique.iter().filter_map(|path| SharedMmapKeeper::cached(path).map(|m| (path, m))).collect();
 
             // Phase 3: Flush operations
             #[cfg(target_os = "linux")]
@@ -100,7 +82,7 @@ pub(super) fn start_background_workers(fsync_schedule: FsyncSchedule) -> Arc<mps
 
                     for path in unique.iter() {
                         if let Some(storage) = pool.get(path) {
-                            if let Some(fd_backend) = storage.as_fd() {
+                            if let Some(fd_backend) = storage.storage().as_fd() {
                                 let raw_fd = fd_backend.file().as_raw_fd();
                                 fsync_batch.push((raw_fd, path.clone()));
                             }
@@ -150,7 +132,7 @@ pub(super) fn start_background_workers(fsync_schedule: FsyncSchedule) -> Arc<mps
                     }
                 } else {
                     for path in unique.iter() {
-                        if let Some(storage) = pool.get_mut(path) {
+                        if let Some(storage) = pool.get(path) {
                             if let Err(e) = storage.flush() {
                                 debug_print!("[flush] flush error for {}: {}", path, e);
                             }
@@ -162,7 +144,7 @@ pub(super) fn start_background_workers(fsync_schedule: FsyncSchedule) -> Arc<mps
             #[cfg(not(target_os = "linux"))]
             {
                 for path in unique.iter() {
-                    if let Some(storage) = pool.get_mut(path) {
+                    if let Some(storage) = pool.get(path) {
                         if let Err(e) = storage.flush() {
                             debug_print!("[flush] flush error for {}: {}", path, e);
                         }
@@ -188,13 +170,12 @@ pub(super) fn start_background_workers(fsync_schedule: FsyncSchedule) -> Arc<mps
                     if forced {
                         tick.store(0, Ordering::Relaxed);
                     }
-                    let mut empty: HashMap<String, StorageImpl> = HashMap::new();
-                    std::mem::swap(&mut pool, &mut empty); // reset map every hour to avoid unconstrained overflow
-
-                    // Perform batched deletions now that mmaps/fds are dropped
                     for path in delete_pending.drain() {
                         match fs::remove_file(&path) {
-                            Ok(_) => debug_print!("[reclaim] deleted file {}", path),
+                            Ok(_) => {
+                                release_file(Path::new(&path));
+                                debug_print!("[reclaim] deleted file {}", path)
+                            }
                             Err(e) => {
                                 debug_print!("[reclaim] delete failed for {}: {}", path, e)
                             }

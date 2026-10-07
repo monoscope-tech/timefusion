@@ -447,6 +447,11 @@ pub fn init_metrics(
     }
     observe!(gauge "timefusion.memory.charged_bytes", "cgroup memory less clean page cache — the number the OOM killer acts on", charged());
     observe!(gauge
+        "timefusion.process.deleted_open_bytes",
+        "Disk bytes pinned by files this process holds open after unlinking them; df counts them, du cannot find them. Any sustained nonzero value is a handle leak (walrus pinned 920 GB this way on 2026-10-07). PAGE if > 10 GB",
+        deleted_open_bytes()
+    );
+    observe!(gauge
         "timefusion.memory.charged_peak_bytes",
         "Highest charged_bytes sampled (every 500ms) since the previous export",
         MEMORY_PEAK_BYTES.swap(0, Relaxed).max(charged())
@@ -1943,6 +1948,32 @@ pub fn process_rss_bytes() -> Option<usize> {
     // statm fields are in pages; resident is field 2. 4 KiB pages assumed.
     let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
     statm.split_whitespace().nth(1)?.parse::<usize>().ok().map(|pages| pages * 4096)
+}
+
+/// Bytes pinned by files this process still holds open after they were
+/// unlinked. Linux only (0 elsewhere): stats each `/proc/self/fd` magic link,
+/// which still resolves to the inode when its name is gone.
+fn deleted_open_bytes() -> u64 {
+    let Ok(fds) = std::fs::read_dir("/proc/self/fd") else { return 0 };
+    fds.flatten()
+        .filter(|fd| std::fs::read_link(fd.path()).is_ok_and(|target| target.to_string_lossy().ends_with(" (deleted)")))
+        .filter_map(|fd| std::fs::metadata(fd.path()).ok())
+        .map(|meta| meta.len())
+        .sum()
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod deleted_open_bytes_tests {
+    #[test]
+    fn counts_an_open_file_once_it_is_unlinked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pinned");
+        std::fs::write(&path, vec![0u8; 1 << 20]).unwrap();
+        let _held = std::fs::File::open(&path).unwrap();
+        let before = super::deleted_open_bytes();
+        std::fs::remove_file(&path).unwrap();
+        assert!(super::deleted_open_bytes() >= before + (1 << 20));
+    }
 }
 
 #[cfg(test)]

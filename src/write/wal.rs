@@ -1422,7 +1422,11 @@ pub fn gc_wal_files(wal_dir: &std::path::Path, max_age: std::time::Duration, unf
             }
             if meta.modified().unwrap_or(SystemTime::UNIX_EPOCH) < cutoff {
                 match std::fs::remove_file(&path) {
-                    Ok(()) => (deleted, bytes_freed) = (deleted + 1, bytes_freed + meta.len()),
+                    Ok(()) => {
+                        // Unlinking alone frees nothing while walrus holds the handle.
+                        walrus_rust::release_file(&path);
+                        (deleted, bytes_freed) = (deleted + 1, bytes_freed + meta.len());
+                    }
                     Err(e) => warn!("wal gc: failed to remove {}: {}", path.display(), e),
                 }
             }
@@ -2070,6 +2074,49 @@ mod tests {
         assert!(parked.iter().all(|p| p.exists()), "quarantine payloads and sidecars must never be reclaimed by GC");
         assert_eq!(segs.iter().filter(|p| p.exists()).count(), 2 - swept.0 as usize, "the deleted count must match the segments actually gone");
         swept
+    }
+
+    /// Regression (2026-10-07): prod held 878 unlinked segments (920 GB) open
+    /// until the disk filled, because walrus kept a handle per file forever and
+    /// GC's unlink freed nothing. A segment GC deletes must also be closed,
+    /// even while blocks in it are still chained for readers.
+    #[test]
+    fn gc_closes_handles_of_deleted_segments() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal = wal_in(&tmp, crate::config::WalFsyncMode::None, 1);
+        let table = uniq("fdleak");
+        wal.append("p", &table, &create_test_batch()).unwrap();
+        assert_eq!(wal.read_entries_raw("p", &table, None, true).unwrap().0.len(), 1);
+        assert!(segment_fds(tmp.path()) > 0, "walrus holds the segment it wrote");
+
+        let (deleted, _) = gc_wal_files(tmp.path(), std::time::Duration::ZERO, None).unwrap();
+        assert!(deleted > 0);
+        assert_eq!(segment_fds(tmp.path()), 0, "every deleted segment's handle must be closed");
+    }
+
+    /// Open fds on WAL segments under `dir`, unlinked ones included (Linux
+    /// reports those as `<path> (deleted)`). The meta dir is not walrus's.
+    fn segment_fds(dir: &std::path::Path) -> usize {
+        let dir = dir.canonicalize().unwrap();
+        std::fs::read_dir("/dev/fd")
+            .unwrap()
+            .flatten()
+            .filter_map(|e| fd_path(e.file_name().to_str()?.parse().ok()?))
+            .filter(|p| p.starts_with(&dir) && !p.starts_with(dir.join(META_DIR)))
+            .count()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn fd_path(fd: i32) -> Option<PathBuf> {
+        std::fs::read_link(format!("/proc/self/fd/{fd}")).ok()
+    }
+
+    #[cfg(target_os = "macos")]
+    fn fd_path(fd: i32) -> Option<PathBuf> {
+        let mut buf = [0u8; libc::PATH_MAX as usize];
+        // SAFETY: F_GETPATH writes at most PATH_MAX bytes into `buf`.
+        (unsafe { libc::fcntl(fd, libc::F_GETPATH, buf.as_mut_ptr()) } == 0).then_some(())?;
+        std::ffi::CStr::from_bytes_until_nul(&buf).ok()?.to_str().ok().map(PathBuf::from)
     }
 
     /// The alertable count must include BOTH the flat `quarantine/*.bin` WAL
