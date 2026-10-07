@@ -4,7 +4,7 @@ use rkyv::{Archive, Deserialize, Serialize};
 
 use crate::wal::{
     config::{PREFIX_META_SIZE, checksum64, debug_print},
-    storage::SharedMmap,
+    storage::{SharedMmap, SharedMmapKeeper},
 };
 
 #[derive(Clone, Debug)]
@@ -27,11 +27,20 @@ pub struct Block {
     pub(crate) file_path: String,
     pub(crate) offset: u64,
     pub(crate) limit: u64,
-    pub(crate) mmap: Arc<SharedMmap>,
     pub(crate) used: u64,
 }
 
 impl Block {
+    /// This block's file handle, looked up per access: a block never owns one,
+    /// so a released (deleted) file is not pinned open by blocks still chained.
+    pub(crate) fn mmap(&self) -> std::io::Result<Arc<SharedMmap>> {
+        SharedMmapKeeper::get_mmap_arc(&self.file_path)
+    }
+
+    pub(crate) fn flush(&self) -> std::io::Result<()> {
+        self.mmap()?.flush()
+    }
+
     pub(crate) fn write(&self, in_block_offset: u64, data: &[u8], owned_by: &str, next_block_start: u64) -> std::io::Result<()> {
         debug_assert!(in_block_offset + (data.len() as u64 + PREFIX_META_SIZE as u64) <= self.limit);
 
@@ -56,14 +65,15 @@ impl Block {
         combined.extend_from_slice(data);
 
         let file_offset = self.offset + in_block_offset;
-        self.mmap.write(file_offset as usize, &combined);
+        self.mmap()?.write(file_offset as usize, &combined);
         Ok(())
     }
 
     pub(crate) fn read(&self, in_block_offset: u64) -> std::io::Result<(Entry, usize)> {
         let mut meta_buffer = vec![0; PREFIX_META_SIZE];
         let file_offset = self.offset + in_block_offset;
-        self.mmap.read(file_offset as usize, &mut meta_buffer);
+        let mmap = self.mmap()?;
+        mmap.read(file_offset as usize, &mut meta_buffer);
 
         // Read the actual metadata length from first 2 bytes
         let meta_len = (meta_buffer[0] as usize) | ((meta_buffer[1] as usize) << 8);
@@ -87,7 +97,7 @@ impl Block {
         // Read the actual data
         let new_offset = file_offset + PREFIX_META_SIZE as u64;
         let mut ret_buffer = vec![0; actual_entry_size];
-        self.mmap.read(new_offset as usize, &mut ret_buffer);
+        mmap.read(new_offset as usize, &mut ret_buffer);
 
         // Verify checksum
         let expected = meta.checksum;
@@ -109,7 +119,7 @@ impl Block {
         }
         let zeros = vec![0u8; len];
         let file_offset = self.offset + in_block_offset;
-        self.mmap.write(file_offset as usize, &zeros);
+        self.mmap()?.write(file_offset as usize, &zeros);
         Ok(())
     }
 }

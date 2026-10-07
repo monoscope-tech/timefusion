@@ -496,6 +496,8 @@ impl Walrus {
 
             let mut temp_buffers: Vec<Vec<u8>> = vec![Vec::new(); plan.len()];
             let mut expected_sizes: Vec<usize> = vec![0; plan.len()];
+            // Kept until submit_and_wait returns: the raw fds handed to the kernel must stay open.
+            let handles = plan.iter().map(|read_plan| read_plan.blk.mmap()).collect::<io::Result<Vec<_>>>()?;
 
             for (plan_idx, read_plan) in plan.iter().enumerate() {
                 let size = (read_plan.end - read_plan.start) as usize;
@@ -503,7 +505,7 @@ impl Walrus {
                 let mut buffer = vec![0u8; size];
                 let file_offset = read_plan.blk.offset + read_plan.start;
 
-                let fd = if let Some(fd_backend) = read_plan.blk.mmap.storage().as_fd() {
+                let fd = if let Some(fd_backend) = handles[plan_idx].storage().as_fd() {
                     io_uring::types::Fd(fd_backend.file().as_raw_fd())
                 } else {
                     return Err(io::Error::new(io::ErrorKind::Unsupported, "batch reads require FD backend when io_uring is enabled"));
@@ -542,26 +544,22 @@ impl Walrus {
         } else {
             plan.iter()
                 .map(|read_plan| {
-                    let size = (read_plan.end - read_plan.start) as usize;
-                    let mut buffer = vec![0u8; size];
-                    let file_offset = (read_plan.blk.offset + read_plan.start) as usize;
-                    read_plan.blk.mmap.read(file_offset, &mut buffer);
-                    buffer
+                    let mut buffer = vec![0u8; (read_plan.end - read_plan.start) as usize];
+                    read_plan.blk.mmap()?.read((read_plan.blk.offset + read_plan.start) as usize, &mut buffer);
+                    Ok(buffer)
                 })
-                .collect()
+                .collect::<io::Result<_>>()?
         };
 
         #[cfg(not(target_os = "linux"))]
         let buffers: Vec<Vec<u8>> = plan
             .iter()
             .map(|read_plan| {
-                let size = (read_plan.end - read_plan.start) as usize;
-                let mut buffer = vec![0u8; size];
-                let file_offset = (read_plan.blk.offset + read_plan.start) as usize;
-                read_plan.blk.mmap.read(file_offset, &mut buffer);
-                buffer
+                let mut buffer = vec![0u8; (read_plan.end - read_plan.start) as usize];
+                read_plan.blk.mmap()?.read((read_plan.blk.offset + read_plan.start) as usize, &mut buffer);
+                Ok(buffer)
             })
-            .collect();
+            .collect::<io::Result<_>>()?;
 
         // 4) Parse entries from buffers in plan order
         let mut entries = Vec::new();

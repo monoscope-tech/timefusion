@@ -205,7 +205,6 @@ impl Walrus {
                     file_path: file_path.clone(),
                     offset: block_offset,
                     limit: DEFAULT_BLOCK_SIZE,
-                    mmap: mmap.clone(),
                     used: 0,
                 };
                 let mut in_block_off: u64 = 0;
@@ -226,7 +225,7 @@ impl Walrus {
                 }
 
                 let block =
-                    Block { id: next_block_id as u64, file_path: file_path.clone(), offset: block_offset, limit: DEFAULT_BLOCK_SIZE, mmap: mmap.clone(), used };
+                    Block { id: next_block_id as u64, file_path: file_path.clone(), offset: block_offset, limit: DEFAULT_BLOCK_SIZE, used };
                 // register and append
                 BlockStateTracker::register_block(next_block_id, file_path);
                 FileStateTracker::add_block_to_file_state(file_path);

@@ -1,8 +1,9 @@
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, hash_map::Entry},
     fs::OpenOptions,
+    path::{Path, PathBuf},
     sync::{
         Arc, OnceLock, RwLock,
         atomic::{AtomicU64, Ordering},
@@ -183,48 +184,44 @@ impl SharedMmap {
     }
 }
 
-pub(crate) struct SharedMmapKeeper {
-    data: HashMap<String, Arc<SharedMmap>>,
-}
+/// The one open handle per WAL file, shared by every block in it. Blocks look
+/// their file up here per access instead of owning a handle, so dropping an
+/// entry ([`release_file`]) is what finally closes a deleted file.
+pub(crate) struct SharedMmapKeeper;
 
 impl SharedMmapKeeper {
-    fn new() -> Self {
-        Self { data: HashMap::new() }
+    fn map() -> &'static RwLock<HashMap<PathBuf, Arc<SharedMmap>>> {
+        static MAP: OnceLock<RwLock<HashMap<PathBuf, Arc<SharedMmap>>>> = OnceLock::new();
+        MAP.get_or_init(Default::default)
     }
 
-    // Fast path: many readers concurrently
-    fn get_mmap_arc_read(path: &str) -> Option<Arc<SharedMmap>> {
-        static MMAP_KEEPER: OnceLock<RwLock<SharedMmapKeeper>> = OnceLock::new();
-        let keeper_lock = MMAP_KEEPER.get_or_init(|| RwLock::new(SharedMmapKeeper::new()));
-        let keeper = keeper_lock.read().ok()?;
-        keeper.data.get(path).cloned()
+    fn poisoned() -> std::io::Error {
+        std::io::Error::new(std::io::ErrorKind::Other, "mmap keeper lock poisoned")
     }
 
-    // Read-mostly accessor that escalates to write lock only on miss
+    /// The cached handle, never opening one: fsync must not resurrect a file
+    /// that was released.
+    pub(crate) fn cached(path: &str) -> Option<Arc<SharedMmap>> {
+        Self::map().read().ok()?.get(Path::new(path)).cloned()
+    }
+
     pub(crate) fn get_mmap_arc(path: &str) -> std::io::Result<Arc<SharedMmap>> {
-        if let Some(existing) = Self::get_mmap_arc_read(path) {
-            return Ok(existing);
-        }
-
-        static MMAP_KEEPER: OnceLock<RwLock<SharedMmapKeeper>> = OnceLock::new();
-        let keeper_lock = MMAP_KEEPER.get_or_init(|| RwLock::new(SharedMmapKeeper::new()));
-
-        // Double-check with a fresh read lock to avoid unnecessary write lock
-        {
-            let keeper = keeper_lock.read().map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "mmap keeper read lock poisoned"))?;
-            if let Some(existing) = keeper.data.get(path) {
-                return Ok(existing.clone());
-            }
-        }
-
-        let mut keeper = keeper_lock.write().map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "mmap keeper write lock poisoned"))?;
-        if let Some(existing) = keeper.data.get(path) {
+        if let Some(existing) = Self::map().read().map_err(|_| Self::poisoned())?.get(Path::new(path)) {
             return Ok(existing.clone());
         }
+        Ok(match Self::map().write().map_err(|_| Self::poisoned())?.entry(PathBuf::from(path)) {
+            Entry::Occupied(existing) => existing.get().clone(),
+            Entry::Vacant(slot) => slot.insert(SharedMmap::new(path)?).clone(),
+        })
+    }
+}
 
-        let arc = SharedMmap::new(path)?;
-        keeper.data.insert(path.to_string(), arc.clone());
-        Ok(arc)
+/// Close walrus's handle on a WAL file. Call AFTER unlinking it: a reader
+/// racing the release then fails to re-open the missing path instead of
+/// caching a fresh handle to a file that is about to disappear.
+pub fn release_file(path: &Path) {
+    if let Ok(mut map) = SharedMmapKeeper::map().write() {
+        map.remove(path);
     }
 }
 
@@ -234,8 +231,4 @@ pub(crate) fn set_fsync_schedule(schedule: FsyncSchedule) {
 
 pub(crate) fn fsync_schedule() -> Option<FsyncSchedule> {
     GLOBAL_FSYNC_SCHEDULE.get().copied()
-}
-
-pub(crate) fn open_storage_for_path(path: &str) -> std::io::Result<StorageImpl> {
-    create_storage_impl(path)
 }

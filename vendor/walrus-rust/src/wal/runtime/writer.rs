@@ -67,7 +67,7 @@ impl Writer {
             FileStateTracker::set_block_unlocked(block.id as usize);
             let mut sealed = block.clone();
             sealed.used = *cur;
-            sealed.mmap.flush()?;
+            sealed.flush()?;
             let _ = self.reader.append_block_to_chain(&self.col, sealed);
             debug_print!("[writer] appended sealed block to chain: col={}", self.col);
             // switch to new block
@@ -88,7 +88,7 @@ impl Writer {
         match self.fsync_schedule {
             FsyncSchedule::SyncEach => {
                 // Immediate mmap flush, skip background flusher
-                block.mmap.flush()?;
+                block.flush()?;
                 debug_print!("[writer] immediate fsync: col={}, block_id={}", self.col, block.id);
             }
             FsyncSchedule::Milliseconds(_) => {
@@ -170,7 +170,7 @@ impl Writer {
                 FileStateTracker::set_block_unlocked(block.id as usize);
                 let mut sealed = block.clone();
                 sealed.used = planning_offset;
-                sealed.mmap.flush()?;
+                sealed.flush()?;
                 let _ = self.reader.append_block_to_chain(&self.col, sealed);
 
                 // Allocate new block
@@ -213,7 +213,7 @@ impl Writer {
                 let mut fsynced = HashSet::new();
                 for (w_blk, _, _) in write_plan[0..=(*data_idx)].iter() {
                     if fsynced.insert(w_blk.file_path.clone()) {
-                        let _ = w_blk.mmap.flush();
+                        let _ = w_blk.flush();
                     }
                 }
 
@@ -229,7 +229,7 @@ impl Writer {
         let mut fsynced = HashSet::new();
         for (blk, _, _) in write_plan.iter() {
             if !fsynced.contains(&blk.file_path) {
-                blk.mmap.flush()?;
+                blk.flush()?;
                 fsynced.insert(blk.file_path.clone());
             }
         }
@@ -249,6 +249,8 @@ impl Writer {
         let ring_size = (write_plan.len() + 64).min(4096) as u32; // Cap at 4096, convert to u32
         let mut ring = io_uring::IoUring::new(ring_size).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("io_uring init failed: {}", e)))?;
         let mut buffers: Vec<Vec<u8>> = Vec::new();
+        // Kept until submit_and_wait returns: the raw fds handed to the kernel must stay open.
+        let mut handles = Vec::with_capacity(write_plan.len());
 
         for (blk, offset, data_idx) in write_plan.iter() {
             let data = batch[*data_idx];
@@ -272,7 +274,8 @@ impl Writer {
             let file_offset = blk.offset + offset;
 
             // Get raw FD
-            let fd = if let Some(fd_backend) = blk.mmap.storage().as_fd() {
+            let mmap = blk.mmap()?;
+            let fd = if let Some(fd_backend) = mmap.storage().as_fd() {
                 io_uring::types::Fd(fd_backend.file().as_raw_fd())
             } else {
                 // Rollback and fail
@@ -286,6 +289,7 @@ impl Writer {
             let write_op = io_uring::opcode::Write::new(fd, combined.as_ptr(), combined.len() as u32).offset(file_offset).build().user_data(*data_idx as u64);
 
             buffers.push(combined);
+            handles.push(mmap);
 
             unsafe {
                 ring.submission().push(&write_op).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("io_uring push failed: {}", e)))?;
@@ -326,7 +330,7 @@ impl Writer {
                     let mut fsynced = HashSet::new();
                     for (blk, _, _) in write_plan.iter() {
                         if fsynced.insert(blk.file_path.clone()) {
-                            let _ = blk.mmap.flush();
+                            let _ = blk.flush();
                         }
                     }
 
@@ -342,7 +346,7 @@ impl Writer {
                 let mut fsynced = HashSet::new();
                 for (blk, _, _) in write_plan.iter() {
                     if !fsynced.contains(&blk.file_path) {
-                        blk.mmap.flush()?;
+                        blk.flush()?;
                         fsynced.insert(blk.file_path.clone());
                     }
                 }
@@ -363,7 +367,7 @@ impl Writer {
                 let mut fsynced = HashSet::new();
                 for (blk, _, _) in write_plan.iter() {
                     if fsynced.insert(blk.file_path.clone()) {
-                        let _ = blk.mmap.flush();
+                        let _ = blk.flush();
                     }
                 }
 
@@ -389,7 +393,7 @@ impl Writer {
     /// every byte previously accepted by `write()` is on disk.
     pub(super) fn sync(&self) -> std::io::Result<()> {
         let block = self.current_block.lock().map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "current_block lock poisoned"))?;
-        block.mmap.flush()
+        block.flush()
     }
 
     pub(super) fn snapshot_block(&self) -> std::io::Result<(Block, u64)> {

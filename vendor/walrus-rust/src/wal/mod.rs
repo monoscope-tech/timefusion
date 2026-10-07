@@ -7,6 +7,7 @@ mod storage;
 pub use block::Entry;
 pub use config::{FsyncSchedule, disable_fd_backend, enable_fd_backend};
 pub use runtime::{ReadConsistency, WalIndex, WalPosition, Walrus};
+pub use storage::release_file;
 
 #[doc(hidden)]
 pub fn __set_thread_namespace_for_tests(key: &str) {
