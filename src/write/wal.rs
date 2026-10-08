@@ -1736,7 +1736,8 @@ pub fn gc_wal_files(wal_dir: &std::path::Path, max_age: std::time::Duration, unf
                 stack.push(path);
                 continue;
             }
-            if meta.modified().unwrap_or(SystemTime::UNIX_EPOCH) < cutoff {
+            // An idle topic's open block keeps an old mtime; deleting its file wedges every later append.
+            if meta.modified().unwrap_or(SystemTime::UNIX_EPOCH) < cutoff && !walrus_rust::is_file_live(&path) {
                 match std::fs::remove_file(&path) {
                     Ok(()) => {
                         // Unlinking alone frees nothing while walrus holds the handle.
@@ -2543,15 +2544,31 @@ mod tests {
     #[test]
     fn gc_closes_handles_of_deleted_segments() {
         let tmp = tempfile::tempdir().unwrap();
-        let wal = wal_in(&tmp, crate::config::WalFsyncMode::None, 1);
         let table = uniq("fdleak");
-        wal.append("p", &table, &create_test_batch()).unwrap();
+        // The previous process's segments: no writer or allocator of this one uses them.
+        wal_in(&tmp, crate::config::WalFsyncMode::None, 1).append("p", &table, &create_test_batch()).unwrap();
+        let wal = wal_in(&tmp, crate::config::WalFsyncMode::None, 1);
         assert_eq!(wal.read_entries_raw("p", &table, None, true).unwrap().0.len(), 1);
-        assert!(segment_fds(tmp.path()) > 0, "walrus holds the segment it wrote");
+        let held = segment_fds(tmp.path());
 
         let (deleted, _) = gc_wal_files(tmp.path(), std::time::Duration::ZERO, None).unwrap();
         assert!(deleted > 0);
-        assert_eq!(segment_fds(tmp.path()), 0, "every deleted segment's handle must be closed");
+        assert!(segment_fds(tmp.path()) < held, "every deleted segment's handle must be closed");
+    }
+
+    /// Regression (2026-10-08): GC deleted the segment holding an idle topic's
+    /// open block (old mtime, data already flushed), and every later append for
+    /// that project failed with ENOENT until restart (~86k failed INSERTs).
+    #[test]
+    fn gc_keeps_segments_writers_still_append_to() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal = wal_in(&tmp, crate::config::WalFsyncMode::SyncEach, 1);
+        let table = uniq("idle");
+        wal.append("p", &table, &create_test_batch()).unwrap();
+        gc_wal_files(tmp.path(), std::time::Duration::ZERO, None).unwrap();
+        wal.append("p", &table, &create_test_batch()).expect("append after GC");
+        wal.append("p", &uniq("new"), &create_test_batch()).expect("a new topic's first append after GC");
+        assert_eq!(wal.read_entries_raw("p", &table, None, true).unwrap().0.len(), 2);
     }
 
     /// Open fds on WAL segments under `dir`, unlinked ones included (Linux

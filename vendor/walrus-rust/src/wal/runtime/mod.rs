@@ -10,6 +10,7 @@ mod walrus_read;
 mod walrus_write;
 mod writer;
 
+pub use allocator::is_file_live;
 #[allow(unused_imports)]
 pub use index::{BlockPos, WalIndex};
 pub use position::WalPosition;

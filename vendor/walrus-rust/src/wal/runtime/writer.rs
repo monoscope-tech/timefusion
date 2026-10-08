@@ -35,6 +35,14 @@ pub(super) struct Writer {
     is_batch_writing: AtomicBool,
 }
 
+/// A dropped writer never writes its block again, so the block stops pinning its file live.
+impl Drop for Writer {
+    fn drop(&mut self) {
+        let block = self.current_block.get_mut().unwrap_or_else(|poisoned| poisoned.into_inner());
+        FileStateTracker::set_block_unlocked(block.id as usize);
+    }
+}
+
 impl Writer {
     pub(super) fn new(
         allocator: Arc<BlockAllocator>, current_block: Block, reader: Arc<Reader>, col: String, publisher: Arc<mpsc::Sender<String>>,

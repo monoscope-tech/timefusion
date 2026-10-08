@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{
         Arc, Mutex, MutexGuard, OnceLock, RwLock,
         atomic::{AtomicBool, AtomicU16, Ordering},
@@ -25,10 +25,17 @@ pub(super) struct BlockAllocator {
     paths: Arc<WalPathManager>,
 }
 
+impl Drop for BlockAllocator {
+    fn drop(&mut self) {
+        allocating_files().remove(&self.state().file_path);
+    }
+}
+
 impl BlockAllocator {
     pub(super) fn new(paths: Arc<WalPathManager>) -> std::io::Result<Self> {
         let file1 = paths.create_new_file()?;
         SharedMmapKeeper::get_mmap_arc(&file1)?;
+        allocating_files().insert(file1.clone());
         debug_print!("[alloc] init: created file={}, max_file_size={}B, block_size={}B", file1, MAX_FILE_SIZE, DEFAULT_BLOCK_SIZE);
         Ok(BlockAllocator { next_block: Mutex::new(Block { id: 1, offset: 0, limit: DEFAULT_BLOCK_SIZE, file_path: file1, used: 0 }), paths })
     }
@@ -44,6 +51,21 @@ impl BlockAllocator {
         self.next_block.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    /// Switch allocation to a fresh file and mark the previous one fully allocated.
+    fn roll_over(&self, data: &mut Block) -> std::io::Result<()> {
+        let file = self.paths.create_new_file()?;
+        SharedMmapKeeper::get_mmap_arc(&file)?;
+        let prev = std::mem::replace(&mut data.file_path, file.clone());
+        (data.offset, data.used) = (0, 0);
+        let mut live = allocating_files();
+        live.insert(file);
+        live.remove(&prev);
+        drop(live);
+        FileStateTracker::set_fully_allocated(prev);
+        debug_print!("[alloc] rolled over to new file: {}", data.file_path);
+        Ok(())
+    }
+
     /// SAFETY: Caller must ensure the returned `Block` is treated as uniquely
     /// owned by a single writer until it is sealed — two writers sharing one
     /// block would race on its mmap. The allocator itself hands out disjoint
@@ -51,15 +73,8 @@ impl BlockAllocator {
     pub(super) unsafe fn get_next_available_block(&self) -> std::io::Result<Block> {
         let mut guard = self.state();
         let data = &mut *guard;
-        let prev_block_file_path = data.file_path.clone();
         if data.offset >= MAX_FILE_SIZE {
-            // mark previous file as fully allocated before switching
-            FileStateTracker::set_fully_allocated(prev_block_file_path);
-            data.file_path = self.paths.create_new_file()?;
-            SharedMmapKeeper::get_mmap_arc(&data.file_path)?;
-            data.offset = 0;
-            data.used = 0;
-            debug_print!("[alloc] rolled over to new file: {}", data.file_path);
+            self.roll_over(data)?;
         }
 
         // set the cur block as locked
@@ -89,13 +104,7 @@ impl BlockAllocator {
         let mut guard = self.state();
         let data = &mut *guard;
         if data.offset + alloc_size > MAX_FILE_SIZE {
-            let prev_block_file_path = data.file_path.clone();
-            data.file_path = self.paths.create_new_file()?;
-            SharedMmapKeeper::get_mmap_arc(&data.file_path)?;
-            data.offset = 0;
-            // mark the previous file fully allocated now
-            FileStateTracker::set_fully_allocated(prev_block_file_path);
-            debug_print!("[alloc] file rollover for sized alloc -> {}", data.file_path);
+            self.roll_over(data)?;
         }
         let ret = Block { id: data.id, file_path: data.file_path.clone(), offset: data.offset, limit: alloc_size, used: 0 };
         // register the new block before handing it out
@@ -126,6 +135,20 @@ pub(super) fn flush_check(file_path: String) {
 struct BlockState {
     is_checkpointed: AtomicBool,
     file_path: String,
+}
+
+/// Files an allocator still hands blocks out of: the next block it allocates lands there.
+fn allocating_files() -> MutexGuard<'static, HashSet<String>> {
+    static FILES: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    FILES.get_or_init(Default::default).lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Whether a writer may still write into `path`: an allocator's current file, or one
+/// holding a block a writer has not sealed. Deleting such a file wedges its writers,
+/// whose next append can no longer open it.
+pub fn is_file_live(path: &std::path::Path) -> bool {
+    let path = path.to_string_lossy();
+    allocating_files().contains(path.as_ref()) || FileStateTracker::get_state_snapshot(&path).is_some_and(|(locked, ..)| locked > 0)
 }
 
 pub(super) struct BlockStateTracker {}

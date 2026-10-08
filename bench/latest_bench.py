@@ -18,7 +18,7 @@ import psycopg
 DSN = re.search(r'^TIMEFUSION_PG_URL=(.*)$', (Path(__file__).resolve().parents[2] / "monoscope/.env").read_text(), re.M)[1].strip().strip('"')
 PROJECTS = {"shipbubble": "28f62f01-46a1-400e-8195-da7bc3505b5b", "demo": "00000000-0000-0000-0000-000000000000",
             "whale": "87576849-4941-49d3-a15d-680fef88a1a8"}
-WINDOWS = {"15m": 900, "1h": 3600, "6h": 6 * 3600, "24h": 86400}
+WINDOWS = {"15m": 900, "1h": 3600, "6h": 6 * 3600, "24h": 86400, "7d": 7 * 86400, "14d": 14 * 86400, "30d": 30 * 86400}
 LADDER = [(1, "1 second"), (2, "2 seconds"), (5, "5 seconds"), (10, "10 seconds"), (15, "15 seconds"), (30, "30 seconds"),
           (60, "1 minute"), (120, "2 minutes"), (300, "5 minutes"), (600, "10 minutes"), (900, "15 minutes"), (1800, "30 minutes"),
           (3600, "1 hour"), (7200, "2 hours"), (10800, "3 hours"), (21600, "6 hours"), (43200, "12 hours"), (86400, "1 day")]
@@ -54,6 +54,12 @@ def queries(bar: str, line: str) -> dict[str, str]:
         "errors_by_service": by_svc("status_code = 'ERROR' and resource___service___name is not null"),
         "http_by_service": by_svc("resource___service___name is not null and kind = 'server'"),
         "http_by_status": f"select {ts(bar)}, {status}, count(*)::float as count_ {FROM} and {B} and (({HTTP} and attributes___http___response___status_code is not null)) {grp(bar, ', ' + status)} limit 10000",
+        "le_list": "select jsonb_build_array(id, to_char(timestamp at time zone 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"'), context___trace_id, name, duration, resource___service___name, parent_id, "
+        "cast(extract(epoch from (start_time)) * 1000000000 as bigint), coalesce(errors is not null or (kind = 'log' and (lower(level) = 'error' or severity___severity_number >= 17 or status_code = 'ERROR')), false), "
+        f"to_jsonb(summary), context___span_id, kind) {FROM} and {B} and (true) order by timestamp desc limit 501",
+        "le_status": f"select {ts(bar)}, coalesce(status_code::text, 'null'), count(*)::float as count_ {FROM} and {B} and (true) {grp(bar, ', coalesce(status_code::text, ' + chr(39) + 'null' + chr(39) + ')')}",
+        "le_percentiles": f"with bucket_digests as (select {ts(bar)} as timeb, percentile_agg(cast(duration as double precision)) as digest {FROM} and {B} and ((duration is not null)) group by timeb having count(*) > 0) "
+        "select b.timeb, q.quantile, coalesce(approx_percentile(q.percentile, b.digest), 0)::float as value from bucket_digests b cross join (values (0.5, 'p50'), (0.75, 'p75'), (0.9, 'p90'), (0.95, 'p95')) as q(percentile, quantile) order by b.timeb desc, q.quantile",
         "latency_percentiles": f"select {ts(line)}, " + ", ".join(f"coalesce(approx_percentile({q}, percentile_agg(cast(duration as double precision))), 0)::float" for q in (0.5, 0.9, 0.99))
         + f" {FROM} and {B} and (({HTTP} and duration is not null)) {grp(line)}",
     }

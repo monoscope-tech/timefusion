@@ -249,4 +249,4 @@
 
 #![recursion_limit = "256"]
 pub mod wal;
-pub use wal::{Entry, FsyncSchedule, ReadConsistency, WalIndex, WalPosition, Walrus, disable_fd_backend, enable_fd_backend, release_file};
+pub use wal::{Entry, FsyncSchedule, ReadConsistency, WalIndex, WalPosition, Walrus, disable_fd_backend, enable_fd_backend, is_file_live, release_file};
