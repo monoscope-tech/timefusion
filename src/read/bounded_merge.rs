@@ -265,8 +265,7 @@ impl BoundedMergeStream {
             // Every open input needs a head before any row can be ordered.
             let mut pending = false;
             for p in 0..self.inputs.len() {
-                loop {
-                    let Input::Open { stream, head: None } = &mut self.inputs[p] else { break };
+                while let Input::Open { stream, head: None } = &mut self.inputs[p] {
                     match stream.poll_next_unpin(cx) {
                         Poll::Pending => {
                             pending = true;
@@ -392,7 +391,7 @@ pub(crate) fn partition_bounds(plan: &Arc<dyn ExecutionPlan>, column: &str, desc
         let groups: Vec<Option<i64>> = config
             .file_groups
             .iter()
-            .map(|group| group.files().iter().map(file_bound).collect::<Option<Vec<_>>>().map(|bounds| fold_bound(bounds.into_iter(), descending)).flatten())
+            .map(|group| group.files().iter().map(file_bound).collect::<Option<Vec<_>>>().and_then(|bounds| fold_bound(bounds.into_iter(), descending)))
             .collect();
         return if groups.len() == partitions { groups } else { unknown() };
     }

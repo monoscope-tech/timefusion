@@ -191,8 +191,12 @@ impl QueryPlanner for DmlQueryPlanner {
             Ok(None) => {}
             Err(error) => tracing::warn!(%error, "indexed histogram declined; using ordinary planning"),
         }
-        match self.database.rollup_sql(logical_plan, session_state).await {
+        let route_started = std::time::Instant::now();
+        let routed = self.database.rollup_sql(logical_plan, session_state).await;
+        crate::observability::record_plan_phase(crate::observability::PlanPhase::RollupRoute, route_started);
+        match routed {
             Ok(rewrites) if !rewrites.is_empty() => {
+                let rewrite_started = std::time::Instant::now();
                 // Each failure carries its own stage label, log message and miss reason.
                 type RewriteFailure = (DataFusionError, &'static str, &'static str, crate::rollup::MissReason);
                 let planned: std::result::Result<Arc<dyn ExecutionPlan>, RewriteFailure> = async {
@@ -216,6 +220,7 @@ impl QueryPlanner for DmlQueryPlanner {
                         .map_err(|e| (e, "physical", "rollup rewrite could not be planned; using raw plan", crate::rollup::MissReason::UnsupportedShape))
                 }
                 .await;
+                crate::observability::record_plan_phase(crate::observability::PlanPhase::RollupRewritePlan, rewrite_started);
                 match planned {
                     Ok(exec)
                         if futures::future::join_all(rewrites.iter().map(|rewrite| self.database.rollup_ticket_current(&rewrite.ticket)))

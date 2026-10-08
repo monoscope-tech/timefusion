@@ -1005,6 +1005,11 @@ impl StatsTableProvider {
             )
             .collect();
 
+        let planning: Vec<Row> = crate::observability::plan_phases()
+            .flat_map(|(phase, micros, calls)| {
+                [("planning", format!("{phase}_us"), micros.to_string()), ("planning", format!("{phase}_calls"), calls.to_string())]
+            })
+            .collect();
         let plan_cache = crate::read::plan_cache::global().map_or_else(Vec::new, |pc| {
             let (hits, misses) = pc.counters();
             // Shape path = literal- and now()-bearing SELECTs, distinct from the
@@ -1292,6 +1297,7 @@ impl StatsTableProvider {
             read_dedup,
             maintenance,
             plan_cache,
+            planning,
             scan,
             foyer,
             logical_count,

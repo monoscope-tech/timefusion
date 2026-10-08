@@ -108,7 +108,10 @@ async fn order_by_ts_desc_limit_merges_mem_and_delta() -> anyhow::Result<()> {
     let sql = "SELECT id, timestamp FROM otel_logs_and_spans WHERE project_id = 'e2e_project' ORDER BY timestamp DESC LIMIT 12";
 
     let plan = explain(&client, sql).await?;
-    assert!(plan.contains("SortPreservingMergeExec"), "expected a streaming SortPreservingMergeExec (ordering pushdown fired); plan was:\n{plan}");
+    assert!(
+        plan.contains("SortPreservingMergeExec") || plan.contains("BoundedMergeExec"),
+        "expected a streaming order-preserving merge (ordering pushdown fired); plan was:\n{plan}"
+    );
 
     let rows = client.query(sql, &[]).await?;
     let ids: Vec<String> = rows.iter().map(|r| r.get::<_, String>(0)).collect();

@@ -233,6 +233,41 @@ fn publish_local(local: LocalRecorder, recorder: impl metrics::Recorder + Sync +
     }
 }
 
+/// Where a statement's planning time goes, summed since boot (`timefusion_stats`
+/// component `planning`); difference two reads for a per-statement average.
+#[derive(Clone, Copy, strum::EnumIter, strum::IntoStaticStr, strum::EnumCount)]
+#[strum(serialize_all = "snake_case")]
+pub enum PlanPhase {
+    /// The whole rollup routing decision, matcher and coverage included.
+    RollupRoute,
+    /// Matching the plan's aggregates against the declared tiers.
+    RollupMatch,
+    /// One pass over the source table's add actions for partition fingerprints.
+    RollupSourceStats,
+    /// The tier's published output ranges.
+    RollupOutputCoverage,
+    /// Planning the routed rewrite (SQL, optimize, physical).
+    RollupRewritePlan,
+}
+
+static PLAN_PHASES: [(AtomicU64, AtomicU64); <PlanPhase as strum::EnumCount>::COUNT] =
+    [const { (AtomicU64::new(0), AtomicU64::new(0)) }; <PlanPhase as strum::EnumCount>::COUNT];
+
+pub fn record_plan_phase(phase: PlanPhase, started: std::time::Instant) {
+    let (micros, calls) = &PLAN_PHASES[phase as usize];
+    micros.fetch_add(started.elapsed().as_micros() as u64, Relaxed);
+    calls.fetch_add(1, Relaxed);
+}
+
+/// `(phase, total micros, calls)` per [`PlanPhase`].
+pub fn plan_phases() -> impl Iterator<Item = (&'static str, u64, u64)> {
+    use strum::IntoEnumIterator as _;
+    PlanPhase::iter().map(|phase| {
+        let (micros, calls) = &PLAN_PHASES[phase as usize];
+        (phase.into(), micros.load(Relaxed), calls.load(Relaxed))
+    })
+}
+
 /// Read back a quantile (0.0-1.0) for a name recorded via `metrics::histogram!()`.
 /// `None` if metrics weren't initialized or the name has never recorded a value.
 pub fn histogram_quantile(name: &str, p: f64) -> Option<f64> {

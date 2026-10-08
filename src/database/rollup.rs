@@ -119,13 +119,10 @@ impl Database {
         if self.bypass_rollup {
             return Ok(Vec::new());
         }
-        let branches: Vec<Vec<_>> = crate::rollup::match_aggregates(logical_plan, session)
-            .await?
-            .into_iter()
-            .chunk_by(|route| route.matched.clone())
-            .into_iter()
-            .map(|(_, routes)| routes.collect())
-            .collect();
+        let match_started = std::time::Instant::now();
+        let matched = crate::rollup::match_aggregates(logical_plan, session).await;
+        crate::observability::record_plan_phase(crate::observability::PlanPhase::RollupMatch, match_started);
+        let branches: Vec<Vec<_>> = matched?.into_iter().chunk_by(|route| route.matched.clone()).into_iter().map(|(_, routes)| routes.collect()).collect();
         crate::rollup::any_branch(
             futures::future::join_all(branches.into_iter().map(|routes| async { self.best_rewrite(routes, session).await.map(Vec::from_iter) })).await,
         )
@@ -193,6 +190,7 @@ impl Database {
         // entire add-actions batch each time, which dominates planning cost on a large table.
         let lookup_project = route.project_id.clone().unwrap_or_else(|| "default".to_string());
         let source_table = self.resolve_table(&lookup_project, &route.source).await.map_err(|_| crate::rollup::MissReason::IncompleteCoverage)?;
+        let stats_started = std::time::Instant::now();
         let fingerprints = {
             let table = source_table.read().await;
             // Unbounded (`i64::MAX`) to match how the write side stamps `source_rows` and the
@@ -200,6 +198,7 @@ impl Database {
             Self::partition_stats_bounded(&table, &route.source, Some(&route.target), &|_, _| i64::MAX)
                 .map_err(|_| crate::rollup::MissReason::IncompleteCoverage)?
         };
+        crate::observability::record_plan_phase(crate::observability::PlanPhase::RollupSourceStats, stats_started);
         // A project's own live stats for a date, falling back to the unified table's row (a
         // project on "default" storage has no row of its own).
         fn stats_of<'a>(fingerprints: &'a HashMap<(String, String), PartitionStats>, project: &str, date: &str) -> Option<&'a PartitionStats> {
@@ -226,11 +225,13 @@ impl Database {
             return Err(crate::rollup::MissReason::NotBuilt);
         }
         let target_table = self.resolve_table(&lookup_project, &route.target).await.map_err(|_| crate::rollup::MissReason::IncompleteCoverage)?;
+        let output_started = std::time::Instant::now();
         let output = {
             let table = target_table.read().await;
             self.rollup_output_coverage(&route.source, (&route.target, &table, &lookup_project), &fingerprints)
                 .map_err(|_| crate::rollup::MissReason::IncompleteCoverage)?
         };
+        crate::observability::record_plan_phase(crate::observability::PlanPhase::RollupOutputCoverage, output_started);
         // Buffered rows are absent from every rollup partition; the earliest project's bound
         // governs, and everything at or above it is read raw.
         let buffered = projects

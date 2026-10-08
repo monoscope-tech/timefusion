@@ -65,6 +65,17 @@ At 30d, most filtered queries time out at 90 s.
   - `endpoints_1m` and `hashes_30m` now backfill 31 days instead of 14, without changing their generation.
   - The pgwire e2e guard goes red with either fix reverted.
 
+- [x] **Measured after the routing deploy** (`1c548150`, process more than 20 minutes old, 1 round). No query hits the 90 s timeout any more.
+
+  | Widget | 7d | 14d | 30d |
+  | --- | --- | --- | --- |
+  | `error_rate` | 12 s (cold first run) | 3.6 s | 4.7 s |
+  | `http_by_status` | 4.8 s | 2.7 s | 29.7 s |
+  | everything else | — | ≤ 4.2 s | — |
+
+  - 30d `top_resources` (25 s) and `http_by_status` stay raw until `endpoints_1m` backfills days 15–31.
+  - The routed floor is about 3 s, of which planning is 0.7–1 s at 7d/14d and 1.6–2.7 s at 30d (`pgwire.slow_statement planned_us`). That is R5.
+
 ### R1 — Latest-N with a filter: stop reading every group's head file
 
 Prior art (research notes in section 5): ClickHouse read-in-order with a limit, the InfluxDB IOx `ProgressiveEvalExec`, and DataFusion's TopK dynamic filters and statistics-based file ordering.
@@ -78,6 +89,22 @@ Design: a stats-aware merge in place of `SortPreservingMergeExec` above the scan
 - Correctness: the output order on the leading key is the same as `SortPreservingMergeExec`, and no row can be skipped, because an inactive partition holds nothing above its bound.
 - Guards: an e2e test asserting cost, namely that a dense filtered latest-501 over many files opens fewer than K files (bytes served), plus correctness on the same answer as before.
 - Metric: `foyer.bytes_served` per list query. Target is under 100 MB for the 7d errors list.
+
+Status:
+- Built: `src/read/bounded_merge.rs`.
+- Property test against `SortPreservingMergeExec`, with fetch and ties. A non-strict tie rule fails it with a minimal counterexample.
+- e2e `a_latest_n_opens_only_the_file_groups_that_can_contribute`:
+  - opens 7 of 19 inputs;
+  - goes red with the rule unregistered.
+- The output batch is capped at the limit above. Without the cap, the merge filled a session batch (8192 rows) and opened every input before the limit could stop it.
+
+### R5 — Planning cost of routed widgets
+
+- `timefusion_stats` component `planning` adds per-phase totals: route, match, source stats, output coverage, and rewrite planning.
+- Read before and after a bench to get each phase's average cost per statement, then fix the largest.
+- Suspects:
+  - `partition_stats_bounded` scans every add action of the unified source table, per candidate tier, per statement.
+  - `rollup_output_coverage` scans the tier's snapshot.
 
 ### R2 — Filtered charts and needles over 7–30 days
 
