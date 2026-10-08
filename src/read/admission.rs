@@ -105,8 +105,9 @@ impl HeavyClass {
 }
 
 fn ordered_merge_fan_in(plan: &Arc<dyn ExecutionPlan>) -> Option<usize> {
-    let here =
-        downcast::<SortPreservingMergeExec>(plan.as_ref()).map(|merge| merge.input().properties().partitioning.partition_count()).filter(|&fan_in| fan_in > 1);
+    let merges =
+        downcast::<SortPreservingMergeExec>(plan.as_ref()).is_some() || downcast::<crate::read::bounded_merge::BoundedMergeExec>(plan.as_ref()).is_some();
+    let here = merges.then(|| plan.children()[0].properties().partitioning.partition_count()).filter(|&fan_in| fan_in > 1);
     plan.children().into_iter().filter_map(ordered_merge_fan_in).chain(here).max()
 }
 

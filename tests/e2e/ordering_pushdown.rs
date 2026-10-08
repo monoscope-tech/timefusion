@@ -124,6 +124,25 @@ async fn order_by_ts_desc_limit_merges_mem_and_delta() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A latest-N must not read every Delta file group (prod 10-08: a 7-day errors list
+/// decoded 24 head files, 1.7 GB, for 501 rows). File statistics bound each group, so the
+/// merge opens only the groups whose rows could still be next.
+#[serial_test::serial]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_latest_n_opens_only_the_file_groups_that_can_contribute() -> anyhow::Result<()> {
+    let (_env, client) = mem_and_delta_env(8).await?;
+    let sql = "SELECT id FROM otel_logs_and_spans WHERE project_id = 'e2e_project' AND status_code = 'OK' ORDER BY timestamp DESC LIMIT 7";
+    let ids: Vec<String> = client.query(sql, &[]).await?.iter().map(|r| r.get(0)).collect();
+    assert_eq!(ids, ["new-4", "new-3", "new-2", "new-1", "new-0", "old-39", "old-38"]);
+    let analyzed = flat_rows(&client, &format!("EXPLAIN ANALYZE {sql}")).await?;
+    let metric =
+        |name: &str| analyzed.split(&format!("{name}=")).nth(1).and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).next()?.parse::<usize>().ok());
+    let (opened, skipped) = (metric("inputs_opened"), metric("inputs_never_opened"));
+    assert!(analyzed.contains("BoundedMergeExec"), "a latest-N over bounded file groups must plan the bounded merge:\n{analyzed}");
+    assert!(skipped.is_some_and(|skipped| skipped >= 4), "most of the 8 file groups must stay closed: opened={opened:?} skipped={skipped:?}\n{analyzed}");
+    Ok(())
+}
+
 // `OptimizeType::SortBy` must leave an honest DESC footer so an optimized
 // partition keeps the streaming merge. Uses the specific-date `compact_date`
 // because optimize's window keys off the real wall clock, not the virtual clock.

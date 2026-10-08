@@ -14,6 +14,7 @@
 
 pub mod admission;
 pub mod bloom_prune;
+pub mod bounded_merge;
 pub mod functions;
 pub mod optimizers;
 pub mod plan_cache;

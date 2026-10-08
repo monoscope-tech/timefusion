@@ -3689,6 +3689,8 @@ impl Database {
                 // their discharge of DedupExec's ordering, which otherwise leaves the
                 // operator reading through an order-erasing coalesce.
                 rules.push(Arc::new(crate::read::optimizers::DedupNeedsOrderedInput));
+                // After the merge under a fetch is final, before admission prices it.
+                rules.push(Arc::new(crate::read::bounded_merge::BoundedMergeForFetch));
                 // LAST, on the pgwire session only, so it wraps the absolute root
                 // (executed once) of a heavy plan. Internal SQL contexts (maintenance,
                 // rollup) have their own pool and are never gated.
