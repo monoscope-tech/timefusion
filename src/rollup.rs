@@ -91,11 +91,17 @@ pub fn generation_id(spec: &RollupSpec, source: &str, project_id: &str, date: &s
 /// first tiers shipped rendered as it was before it existed. A new field that changed
 /// this string would orphan every tier's history at once (10-03: `unnest` did).
 fn generation_render(spec: &RollupSpec) -> String {
-    let rendered = format!("{spec:?}");
+    let rendered = format!("{:?}", RollupSpec { backfill_days: legacy_backfill_days(spec.backfill_days), ..spec.clone() });
     match spec.unnest {
         None => rendered.replacen(", unnest: None }", " }", 1),
         Some(_) => rendered,
     }
+}
+
+/// `backfill_days` is a build horizon, not content. The endpoint tiers were built at 14
+/// days and raised to 31 (10-09), so 31 renders as 14 and their history stays valid.
+fn legacy_backfill_days(days: Option<u16>) -> Option<u16> {
+    days.map(|days| if days == 31 { 14 } else { days })
 }
 
 /// SQL that builds one source `(project_id, date)` partition. Measure filters
@@ -1446,7 +1452,7 @@ fn canonical(expr: &datafusion::logical_expr::Expr) -> String {
             datafusion::scalar::ScalarValue::Utf8(value)
             | datafusion::scalar::ScalarValue::Utf8View(value)
             | datafusion::scalar::ScalarValue::LargeUtf8(value) => format!("Str({value:?})"),
-            value => format!("{value:?}"),
+            _ => format!("{:?}", canonical_operands(expr.clone())),
         },
         Expr::BinaryExpr(binary) if matches!(binary.op, Operator::And | Operator::Or) => {
             let mut operands: Vec<&Expr> = Vec::new();
@@ -1470,8 +1476,36 @@ fn canonical(expr: &datafusion::logical_expr::Expr) -> String {
         Expr::BinaryExpr(binary) => format!("({} {:?} {})", canonical(&binary.left), binary.op, canonical(&binary.right)),
         Expr::IsNotNull(expr) => format!("{} IS NOT NULL", canonical(expr)),
         Expr::ScalarFunction(function) => format!("{}({})", function.name(), function.args.iter().map(canonical).join(",")),
-        expr => format!("{expr:?}"),
+        // Anything else (the CASE `coalesce` simplifies into, LIKE) by its debug form, minus what differs
+        // between a parameterized query and the declared filter for the same predicate.
+        expr => format!("{:?}", canonical_operands(expr.clone())),
     }
+}
+
+/// Erase spellings of one predicate that compare equal: column qualifiers, the string literal
+/// type, and integer width. A bound `$1 = 0` beside an Int32 column stays Int32 while the
+/// declared filter's `0` is Int64 and widens the column (10-08: every error-rate widget missed).
+fn canonical_operands(expr: datafusion::logical_expr::Expr) -> datafusion::logical_expr::Expr {
+    use datafusion::{
+        common::tree_node::{Transformed, TreeNode},
+        logical_expr::{Cast, Expr},
+        scalar::ScalarValue,
+    };
+    expr.transform_up(|expr| {
+        Ok(match expr {
+            Expr::Column(column) => Transformed::yes(Expr::Column(datafusion::common::Column::from_name(column.name))),
+            Expr::Cast(Cast { expr, field }) if field.data_type().is_integer() && matches!(*expr, Expr::Column(_)) => Transformed::yes(*expr),
+            Expr::Literal(ScalarValue::Utf8View(value) | ScalarValue::LargeUtf8(value), metadata) => {
+                Transformed::yes(Expr::Literal(ScalarValue::Utf8(value), metadata))
+            }
+            Expr::Literal(value, metadata) if value.data_type().is_integer() => match value.cast_to(&datafusion::arrow::datatypes::DataType::Int64) {
+                Ok(widened) => Transformed::yes(Expr::Literal(widened, metadata)),
+                Err(_) => Transformed::no(Expr::Literal(value, metadata)),
+            },
+            expr => Transformed::no(expr),
+        })
+    })
+    .map_or_else(|_| unreachable!("the closure never fails"), |transformed| transformed.data)
 }
 
 /// Drop tantivy `text_match` accelerators from one AND level. They are added
@@ -1500,6 +1534,26 @@ fn strip_index_hints(operands: &mut Vec<&datafusion::logical_expr::Expr>) {
         .flat_map(|operand| operand.column_refs().into_iter().map(|column| column.name.clone()))
         .collect();
     operands.retain(|operand| hint_column(operand).is_none_or(|column| !compared.contains(&column)));
+}
+
+/// [`strip_index_hints`] at every AND level below an OR: the HTTP scope arrives as
+/// `(kind = 'server' AND text_match(kind, 'server')) OR name = …`, which as written is
+/// no dimension filter.
+fn without_index_hints(expr: &datafusion::logical_expr::Expr) -> datafusion::logical_expr::Expr {
+    use datafusion::logical_expr::{
+        BinaryExpr, Expr, Operator,
+        utils::{conjunction, split_conjunction},
+    };
+    match unaliased(expr) {
+        Expr::BinaryExpr(BinaryExpr { left, op: Operator::Or, right }) => without_index_hints(left).or(without_index_hints(right)),
+        Expr::BinaryExpr(BinaryExpr { op: Operator::And, .. }) => {
+            let operands: Vec<Expr> = split_conjunction(expr).into_iter().map(without_index_hints).collect();
+            let mut kept: Vec<&Expr> = operands.iter().collect();
+            strip_index_hints(&mut kept);
+            conjunction(kept.into_iter().cloned()).unwrap_or_else(|| expr.clone())
+        }
+        _ => expr.clone(),
+    }
 }
 
 /// `CASE WHEN c <= a THEN 1.0 WHEN c <= b THEN 0.5 ELSE 0 END` over one column with `a <= b`,
@@ -2107,7 +2161,8 @@ async fn route_with_spec(
     // Strip tantivy hints BEFORE classifying, or a hint is orphaned into
     // `promotable` once the predicate it accelerates is consumed as a dimension
     // filter, leaving a term no declared measure can match.
-    let mut terms: Vec<&Expr> = predicates.iter().flat_map(split_conjunction).collect();
+    let unhinted: Vec<Expr> = predicates.iter().flat_map(split_conjunction).map(without_index_hints).collect();
+    let mut terms: Vec<&Expr> = unhinted.iter().collect();
     strip_index_hints(&mut terms);
     // A query that unnests reads one row per element, as only the tier unnesting the same
     // column stores them; any other tier counts source rows.
@@ -3379,7 +3434,7 @@ mod tests {
                     dimensions: spec.dimensions.clone(),
                     measures: spec.measures.clone(),
                     derive_from: spec.derive_from.clone(),
-                    backfill_days: spec.backfill_days,
+                    backfill_days: legacy_backfill_days(spec.backfill_days),
                 };
                 assert_eq!(generation_render(&spec), format!("{legacy:?}"), "{source}/{:?}", spec.name);
             }

@@ -27,6 +27,7 @@ mod pressure_flush;
 mod recent_window_pruning;
 mod repair_resume;
 mod restart_recovery;
+mod rollup_routing;
 mod smoke;
 mod staged_commit;
 mod wide_scan_gate;

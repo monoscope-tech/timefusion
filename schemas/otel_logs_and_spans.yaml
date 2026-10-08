@@ -574,7 +574,7 @@ rollups:
   - grain: 1m
     name: endpoints_1m
     dimensions: [name, kind, attributes___http___response___status_code]
-    backfill_days: 14
+    backfill_days: 31
     measures:
       - { name: request_count, agg: count }
   # Per-hash tier for monoscope's endpoint/issue widgets, which filter on
@@ -586,7 +586,7 @@ rollups:
     name: hashes_30m
     unnest: { column: hashes, dimension: hash }
     dimensions: [hash, attributes___http___response___status_code]
-    backfill_days: 14
+    backfill_days: 31
     measures:
       - { name: request_count, agg: count }
       - { name: duration_count, agg: count, column: duration }
