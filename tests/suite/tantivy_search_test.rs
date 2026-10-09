@@ -31,6 +31,11 @@ fn prod_defaults() -> TantivyConfig {
     serde_json::from_str("{}").expect("TantivyConfig has a default for every field")
 }
 
+/// Prod config writing `tar.zst` blobs, for the whole-install path bundles bypass.
+fn tar_zst() -> TantivyConfig {
+    TantivyConfig { timefusion_tantivy_bundle_writes: false, ..prod_defaults() }
+}
+
 fn level_error_node() -> timefusion::tantivy::udf::PredNode {
     timefusion::tantivy::udf::PredNode::Leaf(TextMatchPred { column: "level".into(), query: "ERROR".into() })
 }
@@ -772,7 +777,7 @@ async fn an_unselective_predicate_is_refused_without_searching_again() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_cold_window_skips_the_prefilter_and_warms_in_the_background() {
     let store = Arc::new(FailAfterArm::new(Arc::new(InMemory::new())));
-    let env = Env::new("otel_logs_and_spans", "p-cold", store.clone(), prod_defaults(), prod_defaults());
+    let env = Env::new("otel_logs_and_spans", "p-cold", store.clone(), tar_zst(), tar_zst());
     env.publish(&[(1_000_000, "a", "ERROR"), (1_000_001, "b", "INFO")], &["f1"]).await;
     env.publish(&[(2_000_000, "c", "ERROR")], &["f2"]).await;
     let error = level_error_node();
@@ -815,7 +820,7 @@ async fn a_cold_window_skips_the_prefilter_and_warms_in_the_background() {
 /// index's files drop out of `covered_files`, so the scan reads them with the predicate.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_cold_index_leaves_only_its_own_files_unpruned() {
-    let env = Env::prod("otel_logs_and_spans", "p-partial-cold");
+    let env = Env::new("otel_logs_and_spans", "p-partial-cold", Arc::new(InMemory::new()), tar_zst(), tar_zst());
     env.publish(&[(1_000_000, "a", "ERROR"), (1_000_001, "b", "INFO")], &["warm-file"]).await;
     env.publish(&[(2_000_000, "c", "ERROR")], &["cold-file"]).await;
     let error = level_error_node();
@@ -859,7 +864,7 @@ async fn a_bundled_index_is_searched_by_range_reads_without_an_install() {
     ranged.publish(&[(1_000_000, "a", "ERROR"), (1_000_001, "b", "INFO")], &["f1"]).await;
     ranged.publish(&[(2_000_000, "c", "ERROR")], &["f2"]).await;
     assert!(ranged.manifest().await.entries.values().all(|e| e.bundle_head.is_some()), "bundle writes record each head");
-    let installed = Env::new("otel_logs_and_spans", "p-bundle", store, bundled(), bundled());
+    let installed = Env::new("otel_logs_and_spans", "p-bundle", store, bundled(), TantivyConfig { timefusion_tantivy_range_reads: false, ..bundled() });
 
     // A ranged bundle is never cold, so even a search that will not wait for installs uses it.
     for (env, wait_for_cold, bundle_opens, blob_fetches) in [(&ranged, false, 2, 0), (&installed, true, 0, 2)] {

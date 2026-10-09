@@ -726,11 +726,13 @@ impl TantivySearchService {
         super::local_cache_path(&self.cache_root, table, project_id, &cache_generation_key(file_uuid, blob_path))
     }
 
-    /// An index to search: a bundle opened for range reads, or an installed directory.
+    /// An index to search: its installed directory when one exists (seeded at publish, or
+    /// a `tar.zst`), else a bundle opened for range reads.
     async fn open_index(
         &self, table: &str, project_id: &str, file_uuid: &str, blob_path: &str, bundle_head: Option<u64>,
     ) -> Result<Either<(Index, IndexReader), PathBuf>> {
-        match bundle_head.filter(|_| self.config.range_reads()) {
+        let installed = has_any_segment(&self.cache_dir(table, project_id, file_uuid, blob_path));
+        match bundle_head.filter(|_| self.config.range_reads() && !installed) {
             Some(head) => Ok(Either::Left(self.open_bundle(blob_path, head).await?)),
             None => Ok(Either::Right(self.ensure_cached(table, project_id, file_uuid, blob_path).await?)),
         }
@@ -935,8 +937,9 @@ fn install_blob_into_cache(dir: &Path, blob: impl std::io::Read) -> Result<()> {
     Ok(())
 }
 
-/// Serves a bundle's ranges from the object store. Called from blocking threads only (the
-/// search's `block_in_place`, or warm-up's scoped threads), hence the captured runtime.
+/// Serves a bundle's ranges from the object store through the captured runtime. Tantivy
+/// reads are synchronous and may run on a thread that drives a runtime, where `block_on`
+/// is illegal, so such a read waits on the fetch from a thread of its own.
 #[derive(Debug)]
 struct StoreSource {
     store: Arc<dyn ObjectStore>,
@@ -949,7 +952,11 @@ impl super::hotcache::BundleSource for StoreSource {
     fn read(&self, range: std::ops::Range<u64>) -> std::io::Result<bytes::Bytes> {
         SearchStats::add(&self.stats.range_reads, 1);
         SearchStats::add(&self.stats.range_read_bytes, range.end - range.start);
-        self.rt.block_on(self.store.get_range(&self.path, range)).map_err(std::io::Error::other)
+        let fetch = || self.rt.block_on(self.store.get_range(&self.path, range)).map_err(std::io::Error::other);
+        match tokio::runtime::Handle::try_current() {
+            Ok(_) => std::thread::scope(|s| s.spawn(fetch).join()).map_err(|_| std::io::Error::other("bundle fetch panicked"))?,
+            Err(_) => fetch(),
+        }
     }
 }
 

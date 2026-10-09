@@ -1148,10 +1148,10 @@ pub struct TantivyConfig {
     pub timefusion_tantivy_manifest_ttl_secs: u64,
     /// Write new indexes as range-readable bundles (`tantivy::hotcache`). Every reader
     /// since `dde040e9` reads both formats; an older image cannot install a bundle.
-    #[serde(default)]
+    #[serde_inline_default(true)]
     pub timefusion_tantivy_bundle_writes: bool,
     /// Search bundles by ranged reads instead of installing them whole; `FLAG SET`-able.
-    #[serde(default)]
+    #[serde_inline_default(true)]
     pub timefusion_tantivy_range_reads: bool,
     /// Decompressed bundle blocks held in memory across all open bundles.
     #[serde_inline_default(1024)]

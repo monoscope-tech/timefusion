@@ -189,20 +189,19 @@ The `http.status = 500` list stays slow because the filter is sparse, so the mer
     | `level`="ERROR" | 8 | 0.36 MB |
 
   - Next: those reads are sequential (8–20 round trips ≈ 3–8 s cold per index). Before any flag flips, add a block cache (repeated term-dictionary reads) and a batched warm-up so a cold search is two round trips.
-  - **Range-read path** (branch `tantivy/range-reads`, both flags OFF):
+  - **Range-read path** (branch `tantivy/range-reads`; both settings ON by default per owner 10-09, "I don't like flags", and kept only as kill switches):
     - `timefusion_tantivy_bundle_writes` (config) makes new builds write bundles and record `bundle_head` in the manifest entry.
     - `timefusion_tantivy_range_reads` (config + `FLAG SET`) makes search and the indexed histogram open a bundle with one GET of its head. Reads then go through a shared block cache (`timefusion_tantivy_block_cache_mb`, default 1024) and a store source that fetches each missing run of blocks in one ranged GET.
     - `hotcache::warm` prefetches each queried field's term dictionary, then every term's postings, in two parallel rounds.
-    - A ranged bundle is never "cold", and the prefetch cron skips it.
+    - A ranged bundle is never "cold", and the prefetch cron skips it. An index already installed locally (seeded at publish) is still read from disk.
+    - Reads may run on a thread driving a runtime (current-thread runtimes, or code outside `block_in_place`), where `block_on` panics; such a read fetches from a scoped thread of its own.
     - Counters: `tantivy.bundle_opens`, `range_reads`, `range_read_bytes`, against `blob_fetch_bytes`.
   - Per-phase reads on the prod sample, block cache on (3 h window):
     - `body`="timeout": warm 9 reads / 1.4 MB, window count 2 / 6.8 MB (`_timestamp` column), term count 0, hits (595) 3 / 47 MB, mostly the `_id` fast column.
     - Every other query is ≤3 MB after warm-up.
     - ⇒ A cold `body` search moves about 57 MB instead of a 1.38 GB download plus 2.17 GB unpack, in about 4 round trips.
     - Follow-up: hit materialization reads most of `_id`. With valid ordinals, row selections need only `_row_ordinal`.
-  - **Rollout (owner decision):**
-    1. Turn on `timefusion_tantivy_bundle_writes` (env; every image since `dde040e9` reads bundles).
-    2. Once a day of bundles exists, A/B `FLAG SET timefusion_tantivy_range_reads ON/OFF` in-process on cold 7d/30d needle searches, comparing `range_read_bytes` vs `blob_fetch_bytes`, latency, and memory high-water.
+  - **Rollout:** on by default. New builds write bundles from this deploy on, and old `tar.zst` indexes keep installing whole until they are rebuilt. Rolling back below `dde040e9` cannot install bundles. To verify after deploy: `tantivy.bundle_opens`/`range_read_bytes` grow while `blob_fetch_bytes` flattens, cold 7d/30d needle latency holds, and memory stays flat. Kill switch: `FLAG SET timefusion_tantivy_range_reads OFF`.
   - Known limitation: tantivy 0.22 reads a field's term dictionary whole, so a trace/span id lookup reads that field's 33–36 MB FST per file. That is 40x less than today's blob, but not cheap. Out of scope for this arc.
   - ⇒ A hotcache of text-field term dictionaries is about 3 MB per 2M-row file and fits a resident budget. The postings are what range reads must avoid fetching whole.
   - ⇒ Side win: ID term dictionaries (about 250 MB per file) duplicate the bloom sidecars, and `id` is indexed twice. Trimming them from new builds shrinks every blob, which speeds today's cold installs too.
