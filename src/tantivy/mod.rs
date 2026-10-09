@@ -1079,8 +1079,9 @@ fn blob_base(blob: &str) -> ObjPath {
     ObjPath::from(split_blob_generation(blob).map_or_else(|| blob.to_string(), |(stem, _)| format!("{stem}{BLOB_SUFFIX}")))
 }
 
-/// Repack a `tar.zst` index blob as a bundle under a new generation; returns its path and head.
-pub async fn convert_blob(store: &dyn ObjectStore, blob: &str, level: i32, scratch: &Path) -> Result<(ObjPath, u64)> {
+/// Repack a `tar.zst` index blob as a bundle under a new generation; returns its path, head,
+/// and the unpacked index it was packed from.
+pub async fn convert_blob(store: &dyn ObjectStore, blob: &str, level: i32, scratch: &Path) -> Result<(ObjPath, u64, tempfile::TempDir)> {
     let tmp = scratch_tempdir(scratch)?;
     let stream =
         futures::TryStreamExt::map_err(store.get(&ObjPath::from(blob)).await.with_context(|| format!("get {blob}"))?.into_stream(), std::io::Error::other);
@@ -1094,7 +1095,7 @@ pub async fn convert_blob(store: &dyn ObjectStore, blob: &str, level: i32, scrat
     let head = hotcache::head_len(&bundle)?;
     let path = generation_blob_path(&blob_base(blob), uuid::Uuid::new_v4());
     upload(store, &path, bundle).await?;
-    Ok((path, head))
+    Ok((path, head, tmp))
 }
 
 pub async fn remove_manifest_entries(store: &dyn ObjectStore, table: &str, project_id: &str, parquet_keys: &[String]) -> Result<()> {

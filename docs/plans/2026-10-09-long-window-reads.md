@@ -209,6 +209,12 @@ The `http.status = 500` list stays slow because the filter is sparse, so the mer
     - Each conversion stream-unpacks to scratch, repacks, uploads a new generation, and swaps the entry only if it still points at the old blob (`swap_to_bundle`). The old blob retires via the GC grace period.
     - Guard: `converted_tar_zst_indexes_are_searched_by_range_reads`, red with the swap disabled.
     - Expect about 50 GB/h, and shipbubble's 35 days range-readable within hours. Watch the `tantivy_bundles_converted` log, `tantivy.cold_indexes_left_raw` falling, and `bundle_opens` rising.
+  - **Regression found 14:10 10-09:**
+    - The first conversion tick converted 604 indexes in 10 minutes. Newest first, so the hottest ones, already installed locally by the 3-day prefetch.
+    - Their new blob paths no longer matched the local installs, and the prefetch skipped bundles, so searches range-read hundreds of indexes at about 4 round trips each.
+    - The 7d needle went from 3.8 s to 49–67 s (global counters were mixed with other traffic, but the mechanism held).
+    - Fix (branch `tantivy/keep-hot-installs`): a conversion moves the already-unpacked index into the cache under the new path whenever the old blob was installed, and the prefetch installs bundles again. Range reads serve only what is not installed locally.
+    - Guard: the conversion test's hot arm (0 bundle opens, 0 downloads), red without the move.
   - Known limitation: tantivy 0.22 reads a field's term dictionary whole, so a trace/span id lookup reads that field's 33–36 MB FST per file. That is 40x less than today's blob, but not cheap. Out of scope for this arc.
   - ⇒ A hotcache of text-field term dictionaries is about 3 MB per 2M-row file and fits a resident budget. The postings are what range reads must avoid fetching whole.
   - ⇒ Side win: ID term dictionaries (about 250 MB per file) duplicate the bloom sidecars, and `id` is indexed twice. Trimming them from new builds shrinks every blob, which speeds today's cold installs too.

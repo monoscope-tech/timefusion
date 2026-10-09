@@ -883,7 +883,7 @@ async fn a_bundled_index_is_searched_by_range_reads_without_an_install() {
 #[tokio::test(flavor = "multi_thread")]
 async fn converted_tar_zst_indexes_are_searched_by_range_reads() {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let env = Env::new("otel_logs_and_spans", "p-convert", store.clone(), tar_zst(), prod_defaults());
+    let env = Env::new("otel_logs_and_spans", "p-convert", store.clone(), tar_zst(), prod_defaults()).seeded();
     env.publish(&[(1_000_000, "a", "ERROR"), (1_000_001, "b", "INFO")], &["f1"]).await;
     env.publish(&[(2_000_000, "c", "ERROR")], &["f2"]).await;
     let old: Vec<String> = env.manifest().await.entries.values().filter_map(|e| e.index.clone()).collect();
@@ -895,10 +895,13 @@ async fn converted_tar_zst_indexes_are_searched_by_range_reads() {
     assert!(old.iter().all(|blob| manifest.retired_blobs.contains_key(blob)), "replaced blobs retire for the GC");
     assert_eq!(env.svc.convert_to_bundles(env.table, 100_000, forever).await.unwrap(), 0, "a converted index is left alone");
 
-    let reader = Env::new("otel_logs_and_spans", "p-convert", store, prod_defaults(), prod_defaults());
-    let r = reader.search.search_detailed(reader.table, reader.project, &level_error_node(), 100, None, false).await.unwrap().unwrap();
-    let mut ids: Vec<_> = r.hits.iter().map(|h| h.id.as_str()).collect();
-    ids.sort();
-    assert_eq!(ids, ["a", "c"]);
-    assert_eq!((reader.search.stats.bundle_opens.load(Relaxed), reader.search.stats.blob_fetches.load(Relaxed)), (2, 0));
+    // Installed (seeded) indexes stay installed under their new path; elsewhere, range reads.
+    let fresh = Env::new("otel_logs_and_spans", "p-convert", store, prod_defaults(), prod_defaults());
+    for (reader, bundle_opens) in [(&env, 0), (&fresh, 2)] {
+        let r = reader.search.search_detailed(reader.table, reader.project, &level_error_node(), 100, None, false).await.unwrap().unwrap();
+        let mut ids: Vec<_> = r.hits.iter().map(|h| h.id.as_str()).collect();
+        ids.sort();
+        assert_eq!(ids, ["a", "c"]);
+        assert_eq!((reader.search.stats.bundle_opens.load(Relaxed), reader.search.stats.blob_fetches.load(Relaxed)), (bundle_opens, 0));
+    }
 }

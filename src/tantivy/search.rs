@@ -588,8 +588,6 @@ impl TantivySearchService {
                 .entries
                 .iter()
                 .filter(|(_, e)| e.schema_version == SCHEMA_VERSION && e.max_timestamp_micros.is_some_and(|mx| mx >= cutoff))
-                // Range reads search a bundle in place; installing it whole is the cost they remove.
-                .filter(|(_, e)| e.bundle_head.is_none() || !self.config.range_reads())
                 .filter_map(|(key, e)| Some((file_uuid(key).to_string(), e.index.as_ref()?.clone())))
                 .collect();
             // Concurrent, at the same width as a query's fan-out; already-resident
@@ -1449,10 +1447,20 @@ impl TantivyIndexService {
         let level = self.config.compression_level();
         Ok(futures::stream::iter(todo.into_iter().take_while(|_| Instant::now() < deadline))
             .map(|(_, project, key, old)| async move {
-                let (new, head) = super::convert_blob(store, &old, level, &self.scratch_root).await?;
+                let (new, head, unpacked) = super::convert_blob(store, &old, level, &self.scratch_root).await?;
                 let swapped = super::swap_to_bundle(store, table, &project, &key, &old, new.as_ref(), head).await?;
                 if !swapped {
                     let _ = store.delete(&new).await;
+                } else if let Some(reader) = self.reader() {
+                    // A locally installed index stays installed under its new path: the
+                    // content is identical, and a hot index must not fall back to range reads.
+                    let (from, to) =
+                        (reader.cache_dir(table, &project, file_uuid(&key), &old), reader.cache_dir(table, &project, file_uuid(&key), new.as_ref()));
+                    if has_any_segment(&from) && std::fs::rename(unpacked.path(), &to).is_ok() {
+                        drop(unpacked.keep());
+                        reader.last_used.insert(to, SystemTime::now());
+                        let _ = std::fs::remove_dir_all(&from);
+                    }
                 }
                 anyhow::Ok(swapped)
             })
