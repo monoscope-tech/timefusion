@@ -280,6 +280,10 @@ Measured 10-09 00:25 with the per-phase counters, single 30d widgets, second run
 - **Levers:**
   - Fork: keep per-file min/max only for projected, sort and partition columns before the merge. Careful: BoundedMerge and ordering validation read per-file timestamp min/max, and DataFusion may answer aggregates from statistics.
   - Maintenance: consolidate recent days sooner.
+- **Prototype measured** (fork worktree `delta-rs-stats`, branch `tf-stats-trim`, change stashed): `compute_all_files_statistics(…, collect_stats=false)` at `next/scan/mod.rs:1372` cuts provider planning about a third (2,500-of-50k files: 78→52 ms; 10k: 31→20 ms).
+  - Per-file stats survive, so BoundedMerge's `partition_bounds` and ordering validation are unaffected.
+  - NOT shippable as-is: DataFusion `JoinSelection` picks the hash-join build side from summary `num_rows`/`total_byte_size`, and the hashes `UPDATE … FROM` path joins against the OTel scan.
+  - Safe variant: keep row/byte totals and sort/partition column stats, and skip the other columns' merge. Expected ~10% of a widget's planning; low priority next to consolidation.
 
 ### R2 — Filtered charts and needles over 7–30 days
 
