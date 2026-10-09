@@ -2203,10 +2203,13 @@ impl TableProvider for ProjectRoutingTable {
         )
     )]
     async fn scan(&self, state: &dyn Session, projection: Option<&Vec<usize>>, filters: &[Expr], limit: Option<usize>) -> DFResult<Arc<dyn ExecutionPlan>> {
-        match self.layout_runs(filters).await {
+        let started = std::time::Instant::now();
+        let plan = match self.layout_runs(filters).await {
             Some(runs) => self.scan_layout_runs(state, projection, filters, limit, runs).await,
             None => self.scan_whole(state, projection, filters, limit).await,
-        }
+        };
+        crate::observability::record_plan_phase(crate::observability::PlanPhase::TableScan, started);
+        plan
     }
 }
 

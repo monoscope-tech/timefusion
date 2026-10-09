@@ -205,7 +205,9 @@ impl QueryPlanner for DmlQueryPlanner {
                         for crate::database::RollupRewrite { sql, matched, .. } in &rewrites {
                             plan = substitute(&plan, matched, requalified(session_state.create_logical_plan(sql).await?, matched.schema())?)?;
                         }
-                        session_state.optimize(&plan)
+                        let optimized = session_state.optimize(&plan);
+                        crate::observability::record_plan_phase(crate::observability::PlanPhase::RollupRewriteLogical, rewrite_started);
+                        optimized
                     }
                     .await
                     .map_err(|e| (e, "sql", "rollup rewrite SQL could not be planned; using raw plan", crate::rollup::MissReason::UnsupportedShape))?;

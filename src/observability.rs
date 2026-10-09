@@ -248,6 +248,10 @@ pub enum PlanPhase {
     RollupOutputCoverage,
     /// Planning the routed rewrite (SQL, optimize, physical).
     RollupRewritePlan,
+    /// Its logical half: parse, substitute, optimize.
+    RollupRewriteLogical,
+    /// `ProjectRoutingTable::scan`, every table scan planned (rewrites' legs included).
+    TableScan,
 }
 
 static PLAN_PHASES: [(AtomicU64, AtomicU64); <PlanPhase as strum::EnumCount>::COUNT] =

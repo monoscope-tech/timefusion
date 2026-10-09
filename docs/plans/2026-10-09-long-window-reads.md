@@ -98,7 +98,32 @@ Status:
   - goes red with the rule unregistered.
 - The output batch is capped at the limit above. Without the cap, the merge filled a session batch (8192 rows) and opened every input before the limit could stop it.
 
+**Shipped** in `f27ff309` (PR #331, deployed 00:09 UTC 10-09). Prod at 15 min uptime, 7d, two runs each:
+
+| Filter | Served before | Served after | Time after |
+| --- | --- | --- | --- |
+| errors list | 1.7–2.1 GB | 108–239 MB | 4.8–5.8 s (was 9–52 s) |
+| route list | — | 54–456 MB | 4.6–15 s |
+| `http.status = 500` list | — | 488–624 MB | 19–30 s |
+
+The `http.status = 500` list stays slow because the filter is sparse, so the merge widens across most files. That is R2 territory (index prefilter or bloom).
+
 ### R5 — Planning cost of routed widgets
+
+Measured 10-09 00:25 with the per-phase counters, single 30d widgets, second run:
+
+| Phase | Time |
+| --- | --- |
+| Routing decision | 50–75 ms |
+| Output coverage (inside the routing decision) | 40–60 ms |
+| Source stats (inside the routing decision) | 4–8 ms |
+| Rewrite planning | **870–920 ms** (2.0–2.6 s on first runs) |
+| Whole statement | 1.2 s |
+
+- Rewrite planning is about 75% of a routed widget.
+- Each hybrid rewrite is one tier leg plus one raw source scan per uncovered fringe. A plain raw scan plans in about 0.25–0.3 s.
+- Next release adds the `rollup_rewrite_logical` and `table_scan` phases, which split logical from physical planning and give scans per statement.
+
 
 - `timefusion_stats` component `planning` adds per-phase totals: route, match, source stats, output coverage, and rewrite planning.
 - Read before and after a bench to get each phase's average cost per statement, then fix the largest.
@@ -116,6 +141,12 @@ Status:
 ### R3 — Unfiltered log explorer at 30d
 
 - Percentiles at 30d were 23 s in one sample and 3.7 s in another. Classify each run as cold or warm and routed or raw, then fix what is named.
+
+### R6 — WAL segments pinned by idle writers (follow-up to `4fee4fd7`)
+
+- GC now keeps any segment that holds an unsealed writer block. An idle topic can therefore pin a 1 GB segment until it writes 10 MB.
+- The bound is about one segment per writer: 30 topics × 4 shards, about 124 GB, against 793 GB free.
+- Watch `wal.files` and `wal.disk_mb`. Fix properly by having GC seal and roll a writer whose segment aged out.
 
 ### R4 — Monitoring (continuous)
 
