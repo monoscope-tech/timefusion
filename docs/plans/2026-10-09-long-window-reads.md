@@ -420,6 +420,12 @@ Shipped today after the call:
 
 **Open levers, in order:**
 1. **24h is shipbubble's default window and misses the rollup on `stale_coverage`.** Today's slices go stale continuously from hashes UPDATE version appends, so 24h `var_service`/overview reads raw: 2.8 s warm, **40–83 s on the first query after a restart**. 7d routes hybrid. This is the rollup-freshness track (`tf_rollup_hits_today_window`). Fewer restarts help meanwhile.
+   - **Diagnosed 22:00:**
+     - Prod counters: hybrid hits 60 against misses 488 (≈11% hit rate). `rollup_stale_grew` 2,054 of 2,056 moved slices; fingerprint/epoch moves 0; witness stale-too 2,055.
+     - The router (`database/rollup.rs`, after the slice loop) goes hybrid whenever ANY covered range survives. 24h misses only because yesterday's day coverage AND every today slice are stale; 7d routes because older days are covered.
+     - "Grew" is genuine new source rows inside already-built slices. `rollup_version_only_declined_rows` 310,703 of 310,706 is by design: `mor_versions_retracted` 292,327 shows the predecessors were still buffered, so each enrichment UPDATE is the rows' FIRST flush (monoscope enriches minutes after ingest).
+     - ⇒ This is a republish-throughput problem (BaseRollup pending ~86), not a routing bug.
+     - Candidate: have the rollup build for today/yesterday wait for, or exclude, the enrichment lag, so slices are not built before their rows' first flush.
 2. **Endpoint widget execution** (~1.5 s of ~2.6 s) is the hybrid raw leg over today's not-yet-rolled-up data.
 3. **Delta provider planning, ~31 ms per scan**: replay 21 ms (seeded) and footer ordering. Maintenance scans (`compact.rs:861`, `Error` policy) still pay the second replay.
 4. **Needle floor (~4.5 s at 30d)**: tantivy prepare/fan-out long poles over ~60 large complete indexes, plus manifest load 0.5 s.
