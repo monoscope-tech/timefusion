@@ -1048,10 +1048,13 @@ async fn perform_version_append(
             // a buffered one, including any newer version raced in since the read, was
             // just retracted) and no commit began since the read.
             let stats = crate::observability::dml_stats();
-            let stamp = (dropped == 0 && database.version_only.commits(project_id, table_name) == commits)
-                .then(|| crate::write::version_stamp_of(table_name, &batches[0]))
-                .flatten();
+            let range = crate::database::maintain::row_time_range(table_name, &batches);
+            let raced = database.version_only.overlapping_commit_since(project_id, table_name, commits, range);
+            let stamp = (dropped == 0 && !raced).then(|| crate::write::version_stamp_of(table_name, &batches[0])).flatten();
             let rows = batches[0].num_rows() as u64;
+            if dropped == 0 && raced {
+                stats.rollup_version_only_declined_by_commit_rows.fetch_add(rows, std::sync::atomic::Ordering::Relaxed);
+            }
             match stamp {
                 Some(stamp) => {
                     database.version_only.admit(project_id, table_name, stamp, columns.clone());

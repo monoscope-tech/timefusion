@@ -705,6 +705,17 @@ fn version_only_paths(table: &DeltaTable, source: &str, tier: Option<&str>) -> R
     Ok(paths)
 }
 
+/// The `[min, max]` row timestamps of `batches`, or `None` when unknown.
+pub(crate) fn row_time_range(table: &str, batches: &[RecordBatch]) -> Option<(i64, i64)> {
+    use arrow::array::AsArray;
+    let column = crate::schema::get_schema(table).and_then(|schema| schema.time_column.clone()).unwrap_or_else(|| "timestamp".to_owned());
+    batches.iter().try_fold(None::<(i64, i64)>, |acc, batch| {
+        let array = batch.column_by_name(&column)?.as_primitive_opt::<arrow::datatypes::TimestampMicrosecondType>()?.clone();
+        let (min, max) = (arrow::compute::min(&array)?, arrow::compute::max(&array)?);
+        Some(Some(acc.map_or((min, max), |(lo, hi)| (lo.min(min), hi.max(max)))))
+    })?
+}
+
 /// Version-append batches admitted as version-only, until a flush tags their rows.
 ///
 /// IN MEMORY by design: an entry lost to a restart or the TTL only flushes its rows
@@ -712,16 +723,22 @@ fn version_only_paths(table: &DeltaTable, source: &str, tier: Option<&str>) -> R
 /// witness match that should not.
 #[derive(Debug, Default)]
 pub(crate) struct VersionOnlyLedger {
-    /// Delta commits begun per `(project, table)`. A commit that begins after a
-    /// statement's read may land a version the statement did not copy, so its
-    /// append could revert it: the statement then admits nothing.
-    commits: dashmap::DashMap<(String, String), u64>,
+    /// Delta commits begun per `(project, table)`: the sequence, and the recent ones'
+    /// row-timestamp ranges (`None` = unknown). A commit begun after a statement's read
+    /// may land a version the statement did not copy, so its append could revert it;
+    /// only a commit holding rows at the statement's timestamps can, since `timestamp`
+    /// is a dedup key no UPDATE may assign.
+    commits: dashmap::DashMap<(String, String), CommitLog>,
     /// Per `(project, table)`: admitted version stamp → the columns it assigned.
     stamps: dashmap::DashMap<(String, String), std::collections::BTreeMap<i64, String>>,
 }
 
 /// Admitted stamps a flush has not tagged by then are forgotten (untagged, not wrong).
 const VERSION_ONLY_TTL_MICROS: i64 = 2 * 3600 * 1_000_000;
+/// A table's commit sequence and its recent commits' `(sequence, row-time range)`.
+type CommitLog = (u64, std::collections::VecDeque<(u64, Option<(i64, i64)>)>);
+/// Recent commit ranges kept per `(project, table)`; one evicted since a read counts as overlapping.
+const VERSION_ONLY_COMMIT_RANGES: usize = 1024;
 
 impl VersionOnlyLedger {
     fn key(project_id: &str, table: &str) -> (String, String) {
@@ -729,12 +746,32 @@ impl VersionOnlyLedger {
     }
 
     pub(crate) fn commits(&self, project_id: &str, table: &str) -> u64 {
-        self.commits.get(&Self::key(project_id, table)).map_or(0, |seq| *seq)
+        self.commits.get(&Self::key(project_id, table)).map_or(0, |entry| entry.0)
     }
 
-    /// Called BEFORE a Delta write of `(project, table)` stages anything.
-    pub(crate) fn begin_commit(&self, project_id: &str, table: &str) {
-        *self.commits.entry(Self::key(project_id, table)).or_default() += 1;
+    /// Whether a commit begun after sequence `since` may hold rows timestamped in `range`.
+    pub(crate) fn overlapping_commit_since(&self, project_id: &str, table: &str, since: u64, range: Option<(i64, i64)>) -> bool {
+        let Some(entry) = self.commits.get(&Self::key(project_id, table)) else { return false };
+        let (current, recent) = &*entry;
+        let newer: Vec<_> = recent.iter().filter(|(seq, _)| *seq > since).collect();
+        // Evicted commits are unknown, and an unknown range on either side overlaps.
+        (newer.len() as u64) < current.saturating_sub(since)
+            || newer.iter().any(|(_, committed)| match (committed, range) {
+                (Some((lo, hi)), Some((min, max))) => *lo <= max && min <= *hi,
+                _ => true,
+            })
+    }
+
+    /// Called BEFORE a Delta write of `(project, table)` stages anything, with the
+    /// row-timestamp range it carries.
+    pub(crate) fn begin_commit(&self, project_id: &str, table: &str, range: Option<(i64, i64)>) {
+        let mut entry = self.commits.entry(Self::key(project_id, table)).or_default();
+        entry.0 += 1;
+        let seq = entry.0;
+        entry.1.push_back((seq, range));
+        if entry.1.len() > VERSION_ONLY_COMMIT_RANGES {
+            entry.1.pop_front();
+        }
     }
 
     pub(crate) fn admit(&self, project_id: &str, table: &str, stamp: i64, columns: String) {
@@ -11789,6 +11826,30 @@ mod rollup_noop_skip_tests {
         db.recover_rollup_coverage("otel_logs_and_spans").await?;
         assert!(!db.rollup_slice_coverage.contains_key(&key), "empty recovery must refuse changed source or overlapping old output");
         Ok(())
+    }
+
+    /// A version-only append is refused only by a commit begun since its read that may
+    /// hold its rows: one at their timestamps, of unknown range, or evicted from memory. Any
+    /// commit at all used to refuse it, which on a busy table refused nearly every one.
+    #[test_case::test_case(&[], Some((10, 20)) => false ; "no commit since the read")]
+    #[test_case::test_case(&[Some((30, 40))], Some((10, 20)) => false ; "a commit at other timestamps")]
+    #[test_case::test_case(&[Some((30, 40)), Some((15, 35))], Some((10, 20)) => true ; "a commit holding the rows' timestamps")]
+    #[test_case::test_case(&[None], Some((10, 20)) => true ; "a commit of unknown range")]
+    #[test_case::test_case(&[Some((30, 40))], None => true ; "rows of unknown range")]
+    fn a_version_only_append_is_refused_only_by_an_overlapping_commit(since_read: &[Option<(i64, i64)>], rows: Option<(i64, i64)>) -> bool {
+        let ledger = VersionOnlyLedger::default();
+        ledger.begin_commit("p", "t", Some((0, 100)));
+        let read = ledger.commits("p", "t");
+        since_read.iter().for_each(|&range| ledger.begin_commit("p", "t", range));
+        ledger.overlapping_commit_since("p", "t", read, rows)
+    }
+
+    #[test]
+    fn a_commit_evicted_since_the_read_counts_as_overlapping() {
+        let ledger = VersionOnlyLedger::default();
+        (0..=VERSION_ONLY_COMMIT_RANGES).for_each(|_| ledger.begin_commit("p", "t", Some((30, 40))));
+        assert!(ledger.overlapping_commit_since("p", "t", 0, Some((10, 20))), "a commit no longer remembered may hold anything");
+        assert!(!ledger.overlapping_commit_since("p", "t", 1, Some((10, 20))));
     }
 
     /// Monoscope's pattern-tag UPDATE (`SET hashes = …`) appends versions of already

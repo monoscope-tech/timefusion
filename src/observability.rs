@@ -1416,6 +1416,8 @@ atomic_stats! {
         /// Candidates refused (a buffered predecessor or a commit since the read); they
         /// invalidate their slices as any other version append does.
         rollup_version_only_declined_rows as "rollup_version_only_declined_rows_total",
+        /// Of those, refused because an overlapping commit began since the read.
+        rollup_version_only_declined_by_commit_rows as "rollup_version_only_declined_by_commit_rows_total",
         /// Admitted rows a flush committed in tagged files.
         rollup_version_only_flushed_rows as "rollup_version_only_flushed_rows_total",
     }

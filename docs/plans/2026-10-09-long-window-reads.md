@@ -90,6 +90,26 @@ At 30d, most filtered queries time out at 90 s.
     By-status was 22 s and an error. The 30d request chart was 6.8 s.
   - The e2e guard sends the six widgets verbatim and asserts the exact answer for each.
 
+### NIGHT QUEUE 10-09 → 10-10 (the live to-do list; checked as each lands on prod)
+
+Order = user impact for shipbubble. Prod measurements run one at a time; code runs in parallel worktrees; signoff and deploys are serial.
+
+- [x] **N0** Diagnose why every dashboard widget pays a raw "today" leg. A 7d widget is 0.45 s ending at midnight and 2.95 s ending now. Every hour of today misses with `stale_coverage`; yesterday hits fully.
+- [x] **N1** Rollup debounce max-wait (#355, `b352c5df`): ended rollup slices come due ≤30 min after first dirty.
+- [ ] **N2** Version-only admission narrowed to OVERLAPPING commits (branch `rollup/version-only-overlap`). Enrichment of older rows was refused whenever ANY commit began since its read (declined 310,703 of 310,706), so every hour of today stayed stale. Verify on prod:
+  - `rollup_version_only_rows_total` grows;
+  - `..._declined_by_commit_rows_total` stays low;
+  - hourly probes of today hit;
+  - 7d widget ending-now approaches 0.45 s.
+- [ ] **N3** Endpoint widgets (`array_has(hashes, …)`): `hashes_30m` today slices are invalidated by the hashes updates themselves. Measure after N2; if still raw, cheapen the today leg (CPU-bound dedup and list decode, ~2.5 s).
+- [ ] **N4** Remaining shipbubble rollup misses: `multi_scan_source` (30d traffic and var_service), `not_built` (latency_percentiles, http_by_status 7d), `filter_not_eligible`.
+- [ ] **N5** Delta planning ~31 ms per scan. Maintenance scans' second replay is in a parallel worktree, `scan/maintenance-selection-ignore`.
+- [ ] **N6** WAL segments pinned by idle writers (parallel worktree `wal/roll-idle-writers`).
+- [ ] **N7** Rare-column filters (`http.status = 500`, route): 20–50 s cold.
+- [ ] **N8** 30d percentile charts: 3.7 s against 23 s variance; classify cold/warm and routed/raw.
+- [ ] **N9** Needle leftovers: hit materialization reads `_id` (~47 MB per index); trace-id FST whole reads.
+- [ ] **N10** Keep the scorecard current; morning summary.
+
 ### R1 — Latest-N with a filter: stop reading every group's head file
 
 Prior art (research notes in section 5): ClickHouse read-in-order with a limit, the InfluxDB IOx `ProgressiveEvalExec`, and DataFusion's TopK dynamic filters and statistics-based file ordering.
@@ -151,7 +171,7 @@ The `http.status = 500` list stays slow because the filter is sparse, so the mer
   - A raw-indexed `id` column holds exactly `_id`'s terms. New builds drop the user `id` field, and an `id` predicate resolves to `_id`, which saves about 78 MB of terms per 2M-row file. Old indexes still carry `id` and resolve to it directly.
   - Guard `a_raw_id_column_is_served_by_the_id_field_not_indexed_twice`, red with the duplicate field back.
   - **Not trimmed:** `context___trace_id`, `context___span_id` and `parent_id`. An equality filter on them is rewritten to `text_match`, and tantivy answers it with row-level selections. Blooms only prune whole files, and row-group stats on random IDs prune nothing, so dropping these fields would turn a trace lookup into decoding the whole file.
-- [ ] **Range-readable indexes with a hotcache, behind a flag** (owner: start it; estimate 3–4 engineer-weeks plus A/B). Design notes:
+- [x] **Range-readable indexes with a hotcache** (shipped on by default, #344–#348) (owner: start it; estimate 3–4 engineer-weeks plus A/B). Design notes:
   - Do NOT enable tantivy's `quickwit` feature: it switches the term dictionary to SSTable, so every existing index stops opening, and it cannot be A/B'd at runtime. Warm-up is hand-built:
     1. Term lookups are sync against the resident term dictionary.
     2. Postings ranges are fetched in one batched async read.

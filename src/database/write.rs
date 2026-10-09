@@ -754,7 +754,7 @@ impl Database {
         // what the flush side hashes when it checks.
         let landed = watermark.is_some().then(|| self.landed_digest_for(&table_name, &batches)).flatten();
 
-        self.version_only.begin_commit(&project_id, &table_name);
+        self.version_only.begin_commit(&project_id, &table_name, crate::database::maintain::row_time_range(&table_name, &batches));
         // Admitted version-only rows stage into their own tagged files of this commit.
         let (rest, versions, columns) = if watermark.is_some() && self.config.maintenance.timefusion_rollup_version_only_witness {
             self.version_only.split(&project_id, &table_name, batches.clone())?
