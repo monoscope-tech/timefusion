@@ -805,6 +805,9 @@ async fn a_cold_window_skips_the_prefilter_and_warms_in_the_background() {
     ids.sort();
     assert_eq!(ids, ["a", "c"]);
     assert_eq!(fetches(), 2, "each blob is installed once, in the background");
+    use futures::TryStreamExt;
+    let blobs: u64 = store.list(Some(&Path::from("indexes"))).map_ok(|meta| meta.size).try_collect::<Vec<_>>().await.unwrap().iter().sum();
+    assert_eq!(env.search.stats.blob_fetch_bytes.load(Relaxed), blobs, "install bytes count each blob once");
 }
 
 /// One cold index must not cost the warm ones their pruning (10-09: a 30-day needle search

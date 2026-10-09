@@ -46,6 +46,8 @@ pub struct SearchStats {
     pub manifest_hits: AtomicU64,
     pub blob_fetches: AtomicU64,
     pub blob_fetch_us: AtomicU64,
+    /// Bytes downloaded by whole-blob installs; what range reads exist to shrink.
+    pub blob_fetch_bytes: AtomicU64,
     pub index_opens: AtomicU64,
     pub index_open_us: AtomicU64,
     pub reader_hits: AtomicU64,
@@ -718,7 +720,9 @@ impl TantivySearchService {
             let permit = Arc::clone(&self.install_permits).acquire_owned().await?;
             let started = Instant::now();
             let path = ObjPath::from(blob_path);
-            let stream = self.object_store.get(&path).await.with_context(|| format!("get {path}"))?.into_stream().map_err(std::io::Error::other);
+            let blob = self.object_store.get(&path).await.with_context(|| format!("get {path}"))?;
+            SearchStats::add(&self.stats.blob_fetch_bytes, blob.meta.size);
+            let stream = blob.into_stream().map_err(std::io::Error::other);
             // Streamed end to end (object store -> zstd -> tar -> disk) on a
             // blocking thread: buffering a blob whole cost ~100 GB of heap in prod.
             // The permit moves in so a cancelled query frees it only when the unpack ends.

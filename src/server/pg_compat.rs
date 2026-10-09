@@ -1213,6 +1213,7 @@ impl StatsTableProvider {
                 // per-index searches run `search_concurrency`-way.
                 "manifest_load_us_total" => s.manifest_load_us.load(Relaxed),
                 "blob_fetch_us_total" => s.blob_fetch_us.load(Relaxed),
+                "blob_fetch_bytes" => s.blob_fetch_bytes.load(Relaxed),
                 "index_open_us_total" => s.index_open_us.load(Relaxed),
                 "search_us_total" => s.search_us.load(Relaxed),
                 // Time the four above cannot see: fanout_us minus prepare_us minus
