@@ -195,9 +195,10 @@ The cold cost is round trips, below.
   | Before | 2.3–2.6 s | 38–42 | 88 MB |
   | After | 3.4–4.1 s | 326–392 | 490–540 MB |
 
-- Reason: the reader wrapper cannot see the access plan. It fetched chunks of row groups that statistics, page index or bloom pruning would have skipped.
+- **Correction (04:15):** the same probe after the revert, on fresh cold day 10-02, also read 317 GETs / 491 MB in 7.1 s. The comparison was confounded: global `foyer.*` counters on a young process include post-restart background reads, and each arm used different days. **The read-ahead's effect is unknown, not shown to be harmful.**
+- The reasoning below still holds as a risk, but it was not demonstrated: the reader wrapper cannot see the access plan, so it can fetch chunks of row groups that statistics, page index or bloom pruning would skip.
 - A correct version needs the opener's `ParquetAccessPlan`: read ahead only row groups the plan will read, ideally only the page ranges it selects.
-- Also: put any such change behind a runtime flag, so it can be A/B'd on prod without a deploy.
+- Also: put any such change behind a `FLAG SET` runtime switch, and A/B it within one process on the same cold-day population. Measure per-query bytes, not global counters.
 
 **Original proposal — column-chunk read-ahead.**
 - Design: in the fork's `InstrumentedParquetFileReader::get_byte_ranges`, map the requested ranges to (row group, column) chunks using the file's metadata.
