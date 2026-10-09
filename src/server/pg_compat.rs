@@ -1140,7 +1140,7 @@ impl StatsTableProvider {
         });
 
         let p = deltalake::delta_datafusion::parquet_metrics::snapshot();
-        let parquet = rows!["parquet";
+        let mut parquet = rows!["parquet";
             "metadata_cache_hits" => p.metadata_cache_hits,
             "metadata_cache_misses" => p.metadata_cache_misses,
             "bytes_read" => p.bytes_read,
@@ -1150,6 +1150,13 @@ impl StatsTableProvider {
             "bytes_planned" => p.bytes_planned,
             "selected_row_groups" => p.selected_row_groups,
         ];
+        // Where the Delta provider's `scan()` spends planning time, beside the `planning` phases.
+        parquet.extend(
+            deltalake::delta_datafusion::parquet_metrics::PlanPhase::NAMES
+                .iter()
+                .zip(p.plan_phase_us)
+                .map(|(name, us)| ("planning", format!("delta_{name}_us"), us.to_string())),
+        );
 
         let cache_sizes = self.cache_sizes.as_ref().map_or_else(Vec::new, |snap| {
             // These caches don't evict; size tracks unique (project, table) pairs
