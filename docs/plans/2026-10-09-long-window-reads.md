@@ -185,13 +185,21 @@ The cold cost is round trips, below.
 - Cause: rows are written in row groups of about 36k rows (the 128 MB decoded cap on wide rows), so a file has about 17 row groups. The parquet reader fetches each row group's column chunks separately, one round after another.
 - Cache churn is low. A quiet 6-minute window read 2.6 GB from the store but admitted only 0.17 GB, with 118 evictions. Warm state survives, and restarts keep the disk cache (158 blocks recovered).
 
-**Built 10-09 ~03:40:**
-- Fork `f0795e64` (branch `tf-readahead`), also landed on `timefusion-upgrade-55-dv` as `02a1115d`.
-- TF pin bump on branch `reads/readahead`.
-- The fork test reads a 20-row-group file: identical rows, at most 5 round trips against 20, and red with read-ahead disabled.
-- Scope: columns a call reads at least half of (predicate columns under pushdown). Sparse page reads of projected columns still cost one round trip per matching row group.
+**Tried and reverted 10-09:**
+- Built: fork `f0795e64` (also `02a1115d` on `timefusion-upgrade-55-dv`), deployed as `4c96c0c4` at 03:39, reverted as `d6c20f00`.
+- Fork test: identical rows, at most 5 round trips against 20 on a 20-row-group file.
+- Prod, cold single recent days, filter on a column not read before:
 
-**Column-chunk read-ahead (original proposal).**
+  | Build | Time | GETs | Fetched |
+  | --- | --- | --- | --- |
+  | Before | 2.3–2.6 s | 38–42 | 88 MB |
+  | After | 3.4–4.1 s | 326–392 | 490–540 MB |
+
+- Reason: the reader wrapper cannot see the access plan. It fetched chunks of row groups that statistics, page index or bloom pruning would have skipped.
+- A correct version needs the opener's `ParquetAccessPlan`: read ahead only row groups the plan will read, ideally only the page ranges it selects.
+- Also: put any such change behind a runtime flag, so it can be A/B'd on prod without a deploy.
+
+**Original proposal — column-chunk read-ahead.**
 - Design: in the fork's `InstrumentedParquetFileReader::get_byte_ranges`, map the requested ranges to (row group, column) chunks using the file's metadata.
 - Add the same columns for the next row groups to the SAME batched `get_byte_ranges` call, under a per-reader byte budget of about 16 MB, and serve later requests that fall inside a buffered chunk.
 - No spawned tasks, so the scan's cache-bypass scope and permits still apply.
