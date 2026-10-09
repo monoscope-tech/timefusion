@@ -120,6 +120,11 @@ pub const FINALIZATION_DELAY_MICROS: i64 = 15 * 60 * 1_000_000;
 /// day slice (256 times for one 09-29 cell); reads cover the gap with a raw leg.
 pub const SEALED_REBUILD_INTERVAL_MICROS: i64 = 60 * 60 * 1_000_000;
 pub const INVALIDATION_DEADLINE_BUCKET_MICROS: i64 = 30 * 1_000_000;
+/// The longest re-invalidation may defer an ended slice past when it first went dirty. Each
+/// touch restarts the quiet period, so without a cap a slice touched more often than every
+/// `FINALIZATION_DELAY` never comes due: prod held a task 21 h while today's and yesterday's
+/// rollup coverage stayed stale and 24 h dashboards read raw.
+pub const MAX_QUIET_WAIT_MICROS: i64 = 2 * FINALIZATION_DELAY_MICROS;
 pub const LIVE_FRONTIER_WINDOW_MICROS: i64 = DAY_MICROS;
 const PRIORITY_BUCKET_MICROS: i64 = 60 * 1_000_000;
 /// File-count band for hygiene benefit ranking. Coarse ON PURPOSE: `claim_next`
@@ -2072,6 +2077,15 @@ impl TaskJournal {
                 let dirt = if untouched || operation == Operation::Dedup { &[][..] } else { touched };
                 if let Some(index) = self.task_indices.get(&key).copied() {
                     let task = &mut self.snapshot.tasks[index];
+                    // Debounce with a max wait: an ended rollup slice still waiting is capped at
+                    // first-dirty + MAX_QUIET_WAIT, since reads route only to fresh coverage.
+                    // Not dedup (a rewrite per cap would add write amplification), a reopened
+                    // unit, or an open slice.
+                    let waiting = matches!(operation, Operation::BaseRollup | Operation::DerivedRollup)
+                        && matches!(task.state, TaskState::Pending | TaskState::Retry)
+                        && slice.end_micros <= observed_at_micros;
+                    let first_dirty = i64::try_from(task.pended_unix_ms.unwrap_or(task.created_unix_ms)).unwrap_or(i64::MAX / 1_000).saturating_mul(1_000);
+                    let deadline_micros = if waiting { deadline_micros.min(first_dirty.saturating_add(MAX_QUIET_WAIT_MICROS)) } else { deadline_micros };
                     let new_deadline = task.deadline_micros.max(deadline_micros);
                     let changed = task.add_dirty(dirt.iter().copied())
                         || task.state != TaskState::Pending
@@ -5615,6 +5629,24 @@ mod tests {
             "ingest must not mint file-hygiene work per slice; the debt planner owns it"
         );
         assert!(journal.tasks().all(|task| task.deadline_micros == FINALIZATION_DELAY_MICROS + 2 * INVALIDATION_DEADLINE_BUCKET_MICROS));
+    }
+
+    #[test]
+    fn a_continuously_touched_ended_slice_still_comes_due() {
+        let (_dir, mut journal) = new_journal();
+        const MINUTE: i64 = 60_000_000;
+        for touch in 0..36 {
+            // An ended slice re-dirtied every 5 minutes for 3 hours, as late rows keep landing.
+            journal.invalidate(invalidation("rollup", 0, NORMAL_SLICE_MICROS, NORMAL_SLICE_MICROS + touch * 5 * MINUTE, false)).expect("invalidate");
+        }
+        let first_dirty = NORMAL_SLICE_MICROS.div_euclid(1_000) * 1_000;
+        let deadline = |operation| journal.tasks().find(|task| task.key.operation == operation).map(|task| task.deadline_micros).unwrap();
+        assert!(
+            deadline(Operation::BaseRollup) <= first_dirty + MAX_QUIET_WAIT_MICROS + INVALIDATION_DEADLINE_BUCKET_MICROS,
+            "the rollup deadline {} must not slide past first-dirty + {MAX_QUIET_WAIT_MICROS}",
+            deadline(Operation::BaseRollup)
+        );
+        assert!(deadline(Operation::Dedup) > first_dirty + 3 * 3_600_000_000, "dedup keeps waiting for quiet: a rewrite per cap would add write amplification");
     }
 
     #[test]

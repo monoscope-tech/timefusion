@@ -426,6 +426,11 @@ Shipped today after the call:
      - "Grew" is genuine new source rows inside already-built slices. `rollup_version_only_declined_rows` 310,703 of 310,706 is by design: `mor_versions_retracted` 292,327 shows the predecessors were still buffered, so each enrichment UPDATE is the rows' FIRST flush (monoscope enriches minutes after ingest).
      - ⇒ This is a republish-throughput problem (BaseRollup pending ~86), not a routing bug.
      - Candidate: have the rollup build for today/yesterday wait for, or exclude, the enrichment lag, so slices are not built before their rows' first flush.
+   - **Root cause found 22:40 (debounce starvation):** `invalidate_slices` restarts an existing task's quiet period on every touch (`deadline = max(old, now + FINALIZATION_DELAY)`), with no max wait.
+     - A rollup slice re-dirtied more often than every 15 minutes never comes due. Prod showed `oldest_task_age_seconds` = 77,321 (21.5 h) with 94 BaseRollups pending and 0 eligible.
+     - Fix (branch `rollup/debounce-max-wait`): an ENDED rollup slice still pending is capped at first-dirty + `MAX_QUIET_WAIT` (30 min). Dedup, reopened units and open slices keep the old debounce.
+     - Guard: `a_continuously_touched_ended_slice_still_comes_due`, red without the cap.
+     - Watch: rollup hit rate (`rollup_hits_*` against `rollup_misses_total`), `rollup_miss_stale_coverage_total`, `oldest_task_age_seconds`, and 24h `var_service`.
 2. **Endpoint widget execution** (~1.5 s of ~2.6 s) is the hybrid raw leg over today's not-yet-rolled-up data.
 3. **Delta provider planning, ~31 ms per scan**: replay 21 ms (seeded) and footer ordering. Maintenance scans (`compact.rs:861`, `Error` policy) still pay the second replay.
 4. **Needle floor (~4.5 s at 30d)**: tantivy prepare/fan-out long poles over ~60 large complete indexes, plus manifest load 0.5 s.
