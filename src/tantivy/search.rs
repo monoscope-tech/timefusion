@@ -408,7 +408,8 @@ impl TantivySearchService {
             return Ok(Err("delta_no_index"));
         }
         let plan_started = Instant::now();
-        let current = || m.entries.iter().filter(|(_, e)| e.schema_version == SCHEMA_VERSION);
+        let redundant = m.redundant_keys();
+        let current = || m.entries.iter().filter(|(key, e)| e.schema_version == SCHEMA_VERSION && !redundant.contains(*key));
         // This API evaluates joined-text predicates. Element indexes require
         // their own exact-membership query; a field name alone is not coverage.
         if current().any(|(_, e)| {
@@ -1466,8 +1467,10 @@ impl TantivyIndexService {
         let store = self.object_store.as_ref();
         let mut todo = vec![];
         for project in super::list_manifest_projects(store, table).await? {
-            todo.extend(super::load_manifest(store, table, &project).await?.entries.into_iter().filter_map(|(key, e)| {
-                let current = e.bundle_head.is_none() && e.error.is_none() && e.schema_version == SCHEMA_VERSION;
+            let manifest = super::load_manifest(store, table, &project).await?;
+            let redundant = manifest.redundant_keys();
+            todo.extend(manifest.entries.into_iter().filter_map(|(key, e)| {
+                let current = e.bundle_head.is_none() && e.error.is_none() && e.schema_version == SCHEMA_VERSION && !redundant.contains(&key);
                 Some((e.max_timestamp_micros.filter(|&t| current && t >= cutoff)?, project.clone(), key, e.index?))
             }));
         }
@@ -1763,8 +1766,16 @@ impl TantivyIndexService {
                     e.ordinals_valid = false;
                 })
                 .count();
-            let (kept_len, dirty) = (kept.len(), !stale.is_empty() || pruned > 0);
             m.entries = kept;
+            // Redundant fragments retire rather than delete: in-flight readers may still hold them.
+            let redundant = m.redundant_keys();
+            let now = Utc::now();
+            for key in &redundant {
+                if let Some(blob) = m.entries.remove(key).and_then(|e| e.index) {
+                    m.retired_blobs.entry(blob).or_insert(now);
+                }
+            }
+            let (kept_len, dirty) = (m.entries.len(), !stale.is_empty() || pruned > 0 || !redundant.is_empty());
             // A day exceeds the normal manifest TTL and statement lifetime.
             // Cold reads racing later collection fail back to the canonical scan;
             // warm readers retain their own mappings to the immutable generation.

@@ -763,6 +763,21 @@ impl Manifest {
         Ok(files.iter().map(|file| selected.remove(file.path.as_str())).collect())
     }
 
+    /// Entries a complete single-file index makes redundant: every file they cover has an
+    /// index built from that committed file itself, holding all its rows and at least their
+    /// element fields. Compaction carries pre-compaction indexes forward onto their outputs,
+    /// so a consolidated day kept hundreds of such fragments beside the two indexes covering it.
+    pub fn redundant_keys(&self) -> std::collections::HashSet<String> {
+        let complete: HashMap<&str, &std::collections::BTreeSet<String>> =
+            self.entries.values().filter(|e| e.is_complete()).map(|e| (e.covered_files[0].as_str(), &e.element_fields)).collect();
+        self.entries
+            .iter()
+            .filter(|(_, e)| !e.is_complete() && !e.covered_files.is_empty())
+            .filter(|(_, e)| e.covered_files.iter().all(|f| complete.get(f.as_str()).is_some_and(|fields| fields.is_superset(&e.element_fields))))
+            .map(|(key, _)| key.clone())
+            .collect()
+    }
+
     fn insert(&mut self, key: String, entry: ManifestEntry) {
         if let Some(blob) = &entry.index {
             self.retired_blobs.remove(blob);
@@ -1028,6 +1043,11 @@ impl ManifestEntry {
     /// Whether this entry has the list representation requested by the table.
     /// Used by both the coverage census and maintenance backfill.
     /// Element histograms also require one-file physical ordinal coverage.
+    /// Built from one committed file read back: holds every physical row of that file.
+    pub fn is_complete(&self) -> bool {
+        self.is_usable() && self.ordinals_valid && self.covered_files.len() == 1
+    }
+
     pub fn covers_current_elements(&self, table: &TableSchema) -> bool {
         self.is_usable()
             && (self.element_fields.is_empty() || (self.ordinals_valid && self.covered_files.len() == 1))

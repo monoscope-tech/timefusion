@@ -219,6 +219,12 @@ The `http.status = 500` list stays slow because the filter is sparse, so the mer
     - The cron converts newest-first across every project at about 650 per tick, so shipbubble's 30d needle (about 9k cold indexes per query) would wait many hours.
     - The cold-index background warm now repacks a searched `tar.zst` as a bundle (under the same 2-slot warm limit), installs it under the new path, and folds the entry into the cached manifest. What users search converts first.
     - Guard: `a_searched_cold_tar_zst_index_converts_in_the_background`, red with conversion disabled in the warm path.
+  - **Root cause of the needle fan-out (18:00 10-09):** every sealed shipbubble day had 2 complete single-file indexes (10-08: 1.61M + 1.97M rows) plus **565 carried-forward fragments**. Compaction carries pre-compaction indexes onto their outputs, and GC kept them because their covered files are live.
+    - So a 7d needle opened ~1,700 indexes instead of ~40, and a 30d one ~12k, flooding the warm queue (dropped) and the conversions with dead weight.
+    - Fix (branch `tantivy/drop-redundant-fragments`):
+      - `Manifest::redundant_keys`: entries whose every covered file has a complete index (usable, ordinals valid, single file) with ⊇ element fields.
+      - Searches skip them, GC retires their blobs (one-day grace), and conversion skips them.
+    - Guard: `fragments_of_a_completely_indexed_file_are_skipped_and_retired`, red separately for the query filter and the GC.
   - Known limitation: tantivy 0.22 reads a field's term dictionary whole, so a trace/span id lookup reads that field's 33–36 MB FST per file. That is 40x less than today's blob, but not cheap. Out of scope for this arc.
   - ⇒ A hotcache of text-field term dictionaries is about 3 MB per 2M-row file and fits a resident budget. The postings are what range reads must avoid fetching whole.
   - ⇒ Side win: ID term dictionaries (about 250 MB per file) duplicate the bloom sidecars, and `id` is indexed twice. Trimming them from new builds shrinks every blob, which speeds today's cold installs too.

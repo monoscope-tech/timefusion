@@ -932,3 +932,35 @@ async fn a_searched_cold_tar_zst_index_converts_in_the_background() {
     let stats = &env.search.stats;
     assert_eq!((stats.blob_fetches.load(Relaxed), stats.bundle_opens.load(Relaxed)), (0, 0), "converted indexes are served installed");
 }
+
+/// Fragments carried forward onto a file that has its own complete index are searched no
+/// more, and GC retires them: a consolidated day kept ~565 of them beside its two indexes.
+#[tokio::test(flavor = "multi_thread")]
+async fn fragments_of_a_completely_indexed_file_are_skipped_and_retired() {
+    let env = Env::new(
+        "otel_logs_and_spans",
+        "p-fragments",
+        Arc::new(InMemory::new()),
+        tar_zst(),
+        TantivyConfig { timefusion_tantivy_manifest_ttl_secs: 0, ..tar_zst() },
+    );
+    env.publish(&[(1_000_000, "a", "ERROR")], &["f1"]).await;
+    env.publish(&[(1_000_000, "a", "ERROR"), (2_000_000, "b", "ERROR")], &["f1"]).await;
+    let manifest = env.manifest().await;
+    let (fragment, complete) = {
+        let mut keys: Vec<_> = manifest.entries.iter().map(|(k, e)| (e.rows, k.clone())).collect();
+        keys.sort();
+        (keys[0].1.clone(), keys[1].1.clone())
+    };
+    let fragment_blob = manifest.entries[&fragment].index.clone().unwrap();
+    let mut entry = manifest.entries[&complete].clone();
+    entry.ordinals_valid = true;
+    upsert_manifest(env.store.as_ref(), env.table, env.project, &complete, entry).await.unwrap();
+
+    let r = env.search.search_detailed(env.table, env.project, &level_error_node(), 100, None, true).await.unwrap().unwrap();
+    assert_eq!((r.hits.len(), env.search.stats.indexes_searched.load(Relaxed)), (2, 1), "only the complete index is searched");
+    env.gc(&["f1"]).await;
+    let manifest = env.manifest().await;
+    assert_eq!(manifest.entries.keys().cloned().collect::<Vec<_>>(), [complete]);
+    assert!(manifest.retired_blobs.contains_key(&fragment_blob), "the fragment's blob retires");
+}
