@@ -264,11 +264,17 @@ Measured 10-09 00:25 with the per-phase counters, single 30d widgets, second run
 | `scan_certification` | 40–70 ms |
 | Mem leg | 50–370 ms |
 
-- The provider cost is the fork's `DeltaScan::scan`: `scan_metadata_seeded` (`kernel/snapshot/scan.rs`) → `scan_metadata_from`. It re-runs kernel data skipping and the scan-row transform over every materialized file of the snapshot on every scan. Cost scales with the table's total file count, not the query's window.
-- Fix candidates:
-  - Memoize the replayed `ScanMetadata` per (snapshot version, predicate) inside the fork.
-  - Or seed the replay with only the project partition's files.
-- Both are fork changes; measure `scan_provider` per call before and after.
+- The provider cost is the fork's `DeltaScan::scan`. Measured locally (ignored test `measure_provider_scan_planning_by_file_count`, branch `perf/provider-scan`, 32-column stats):
+
+  | Table size | One day selected | Whole project selected (~2,500 files) |
+  | --- | --- | --- |
+  | 1k files | 0.6 ms | 1.2 ms |
+  | 10k files | 1.8 ms | 6.2 ms |
+  | 50k files | 8.4 ms | 29.7 ms |
+
+- ⇒ The per-scan replay over the whole snapshot is cheap. Cost scales with the files a scan SELECTS (~10 µs each), so prod's ~95 ms per scan means the legs select thousands of files.
+- The lever is fewer, larger files in the windows widgets read: rollup-tier and today-partition consolidation. Caching kernel replay is not the lever.
+- Next: count files selected per leg on prod (`scan.pruned_files_total` / provider file-group counts) for a 7d endpoint widget.
 
 ### R2 — Filtered charts and needles over 7–30 days
 
