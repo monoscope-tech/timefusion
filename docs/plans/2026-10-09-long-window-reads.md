@@ -185,7 +185,13 @@ The cold cost is round trips, below.
 - Cause: rows are written in row groups of about 36k rows (the 128 MB decoded cap on wide rows), so a file has about 17 row groups. The parquet reader fetches each row group's column chunks separately, one round after another.
 - Cache churn is low. A quiet 6-minute window read 2.6 GB from the store but admitted only 0.17 GB, with 118 evictions. Warm state survives, and restarts keep the disk cache (158 blocks recovered).
 
-**Next lever (owner decision: fork change) — column-chunk read-ahead.**
+**Built 10-09 ~03:40:**
+- Fork `f0795e64` (branch `tf-readahead`), also landed on `timefusion-upgrade-55-dv` as `02a1115d`.
+- TF pin bump on branch `reads/readahead`.
+- The fork test reads a 20-row-group file: identical rows, at most 5 round trips against 20, and red with read-ahead disabled.
+- Scope: columns a call reads at least half of (predicate columns under pushdown). Sparse page reads of projected columns still cost one round trip per matching row group.
+
+**Column-chunk read-ahead (original proposal).**
 - Design: in the fork's `InstrumentedParquetFileReader::get_byte_ranges`, map the requested ranges to (row group, column) chunks using the file's metadata.
 - Add the same columns for the next row groups to the SAME batched `get_byte_ranges` call, under a per-reader byte budget of about 16 MB, and serve later requests that fall inside a buffered chunk.
 - No spawned tasks, so the scan's cache-bypass scope and permits still apply.
