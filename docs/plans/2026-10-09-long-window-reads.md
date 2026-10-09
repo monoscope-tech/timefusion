@@ -162,6 +162,18 @@ The `http.status = 500` list stays slow because the filter is sparse, so the mer
     - Term dictionaries total 251 MB. Text fields are small: `body` 1.1, `attributes` 0.8, `summary` 0.7 MB, `name` tiny (≈2.7 MB). ID fields dominate: `id` 78 MB **and** `_id` 78 MB (indexed twice), `context___span_id` 36, `context___trace_id` 33, `parent_id` 13.5, `_timestamp` 9.7 MB.
     - Postings total 1.69 GB: `attributes` 656, `summary` 626, `body` 349 MB.
     - Store 94 MB, fast fields 56 MB (`_id` 44 MB), positions 50 MB.
+  - Step 1b, measured 10-09 with `hotcache::RecordingDirectory` on the same index (test `measure_reads_of_a_needle_search`, ignored, run on a local copy). Bytes a search actually reads:
+
+    | Phase | Reads | Bytes |
+    |---|---|---|
+    | open + reader | 28 | ~54 KB (meta 9 KB, store footer 44 KB) |
+    | `body`="timeout" | 12 | term 1.14 MB (the whole field FST) + postings 0.54 MB |
+    | `attributes`="shipment" | 13 | term 0.84 MB + postings 2.75 MB |
+    | `summary`="connection refused" | 20 | term 0.72 MB + postings 7.8 MB |
+    | `name`="GET" | 8 | 7 KB + 0.48 MB |
+    | `level`="ERROR" | 8 | <11 KB |
+
+    ⇒ A cold needle search needs about 2–9 MB of a 1.38 GB blob (about 0.15–0.6%). Term dictionaries are read whole, so they are the hotcache; postings are a handful of ranges, one batched round trip. The catch: the blob is `tar.zst`, which cannot be range-read. The bundle must store files uncompressed (2.17 GB vs 1.38 GB, +57% storage) or compress per file.
   - ⇒ A hotcache of text-field term dictionaries is about 3 MB per 2M-row file and fits a resident budget. The postings are what range reads must avoid fetching whole.
   - ⇒ Side win: ID term dictionaries (about 250 MB per file) duplicate the bloom sidecars, and `id` is indexed twice. Trimming them from new builds shrinks every blob, which speeds today's cold installs too.
   - Also measured: shipbubble's index manifest is ONE 24.5 MB JSON with 22,688 entries. Manifest loads average 544 ms at a 49% hit rate, a planning cost worth splitting per date (done above).

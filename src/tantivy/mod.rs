@@ -5,6 +5,7 @@
 //! from the YAML `TableSchema`. Indexes always store `_timestamp` and `_id`.
 
 pub mod histogram;
+pub mod hotcache;
 pub(crate) mod planner;
 pub mod search;
 pub mod udf;
