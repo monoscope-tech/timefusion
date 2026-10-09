@@ -905,3 +905,30 @@ async fn converted_tar_zst_indexes_are_searched_by_range_reads() {
         assert_eq!((reader.search.stats.bundle_opens.load(Relaxed), reader.search.stats.blob_fetches.load(Relaxed)), (bundle_opens, 0));
     }
 }
+
+/// A cold `tar.zst` index a search wants is repacked as a bundle in the background and
+/// installed under its new path, so the next search covers it from disk.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_searched_cold_tar_zst_index_converts_in_the_background() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let env = Env::new("otel_logs_and_spans", "p-demand", store, tar_zst(), TantivyConfig { timefusion_tantivy_manifest_ttl_secs: 60, ..prod_defaults() });
+    env.publish(&[(1_000_000, "a", "ERROR")], &["f1"]).await;
+    env.publish(&[(2_000_000, "c", "ERROR")], &["f2"]).await;
+    let error = level_error_node();
+    let search = || env.search.search_detailed(env.table, env.project, &error, 100, None, false);
+    assert_eq!(search().await.unwrap().err(), Some("delta_cold_index"));
+    let r = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        loop {
+            match search().await.unwrap() {
+                Ok(r) if r.covered_files.len() == 2 => break r,
+                _ => tokio::time::sleep(std::time::Duration::from_millis(20)).await,
+            }
+        }
+    })
+    .await
+    .expect("background conversions must cover both files");
+    assert_eq!(r.hits.len(), 2);
+    assert!(env.manifest().await.entries.values().all(|e| e.bundle_head.is_some()), "searched indexes are now bundles");
+    let stats = &env.search.stats;
+    assert_eq!((stats.blob_fetches.load(Relaxed), stats.bundle_opens.load(Relaxed)), (0, 0), "converted indexes are served installed");
+}

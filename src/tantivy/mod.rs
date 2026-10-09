@@ -1061,15 +1061,17 @@ pub async fn upsert_manifest_many(store: &dyn ObjectStore, table: &str, project_
 
 /// Remove entries by parquet key (used during compaction GC).
 /// Point `key` at the bundle `new` iff it still points at `old`; `old` retires like any
-/// replaced blob. False when the entry moved on (rebuilt, GC'd) while `new` was made.
-pub async fn swap_to_bundle(store: &dyn ObjectStore, table: &str, project_id: &str, key: &str, old: &str, new: &str, bundle_head: u64) -> Result<bool> {
+/// replaced blob. `None` when the entry moved on (rebuilt, GC'd) while `new` was made.
+pub async fn swap_to_bundle(
+    store: &dyn ObjectStore, table: &str, project_id: &str, key: &str, old: &str, new: &str, bundle_head: u64,
+) -> Result<Option<ManifestEntry>> {
     mutate(store, table, project_id, |m| match m.entries.get(key).filter(|e| e.index.as_deref() == Some(old)) {
         Some(entry) => {
             let entry = ManifestEntry { index: Some(new.to_string()), bundle_head: Some(bundle_head), ..entry.clone() };
-            m.insert(key.to_string(), entry);
-            (true, true)
+            m.insert(key.to_string(), entry.clone());
+            (Some(entry), true)
         }
-        None => (false, false),
+        None => (None, false),
     })
     .await
 }

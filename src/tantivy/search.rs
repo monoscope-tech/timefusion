@@ -421,37 +421,29 @@ impl TantivySearchService {
         let mut covered_files: HashSet<String> = current().filter(|(_, e)| usable_entry(e)).flat_map(|(_, e)| e.covered_files.iter().cloned()).collect();
         // Time-prune: skip indexes whose timestamp span can't overlap the query
         // window (no blob download). Conservative on unknown bounds.
-        // Work item: (file_uuid, blob_path, rows, entry covered_files, ordinals_valid, window, bundle_head).
+        // Work item: (manifest key, blob_path, rows, entry covered_files, ordinals_valid, window, bundle_head).
         // `window` is set only when the entry's span sticks out of the query window.
         let mut work: Vec<_> = current()
             .filter_map(|(key, e)| {
                 let blob_path = e.index.as_ref().filter(|_| entry_overlaps(e.min_timestamp_micros, e.max_timestamp_micros, time_range))?;
                 let window =
                     time_range.filter(|&(lo, hi)| !(e.min_timestamp_micros.is_some_and(|m| m >= lo) && e.max_timestamp_micros.is_some_and(|m| m <= hi)));
-                Some((
-                    file_uuid(key).to_string(),
-                    blob_path.clone(),
-                    e.rows,
-                    e.covered_files.clone(),
-                    e.ordinals_valid && e.covered_files.len() == 1,
-                    window,
-                    e.bundle_head,
-                ))
+                Some((key.clone(), blob_path.clone(), e.rows, e.covered_files.clone(), e.ordinals_valid && e.covered_files.len() == 1, window, e.bundle_head))
             })
             .collect();
         if !wait_for_cold {
             let cold;
             let range_reads = self.config.range_reads();
-            (work, cold) = work
-                .into_iter()
-                .partition(|(uuid, blob, .., bundle)| (range_reads && bundle.is_some()) || has_any_segment(&self.cache_dir(table, project_id, uuid, blob)));
+            (work, cold) = work.into_iter().partition(|(key, blob, .., bundle)| {
+                (range_reads && bundle.is_some()) || has_any_segment(&self.cache_dir(table, project_id, file_uuid(key), blob))
+            });
             if !cold.is_empty() {
                 // All-or-nothing here made one cold day of a 30-day window full-scan all 30.
                 for (.., covered, _, _, _) in &cold {
                     covered.iter().for_each(|file| _ = covered_files.remove(file));
                 }
                 SearchStats::add(&self.stats.cold_indexes_left_raw, cold.len() as u64);
-                self.warm_in_background(table, project_id, cold.into_iter().map(|(uuid, blob, ..)| (uuid, blob)).collect());
+                self.warm_in_background(table, project_id, cold.into_iter().map(|(key, blob, .., bundle)| (key, blob, bundle.is_none())).collect());
                 if work.is_empty() {
                     return Ok(Err("delta_cold_index"));
                 }
@@ -464,9 +456,10 @@ impl TantivySearchService {
         SearchStats::add(&self.stats.indexes_searched, work.len() as u64);
         SearchStats::timed(&self.stats.plans, &self.stats.plan_us, plan_started);
         let _fanout = TimedPhase { count: &self.stats.fanouts, micros: &self.stats.fanout_us, started: Instant::now() };
-        let mut tasks = futures::stream::iter(work.into_iter().map(|(file_uuid, blob_path, rows, entry_covered, ordinals_valid, window, bundle)| async move {
+        let mut tasks = futures::stream::iter(work.into_iter().map(|(key, blob_path, rows, entry_covered, ordinals_valid, window, bundle)| async move {
+            let file_uuid = file_uuid(&key);
             let prepare_started = Instant::now();
-            let opened = self.open_index(table, project_id, &file_uuid, &blob_path, bundle).await?;
+            let opened = self.open_index(table, project_id, file_uuid, &blob_path, bundle).await?;
             let bundled = opened.is_left();
             // The rest is synchronous, CPU-bound tantivy work that yields
             // nowhere; running it inline would hold a runtime worker.
@@ -604,11 +597,12 @@ impl TantivySearchService {
         Ok(warmed)
     }
 
-    /// Queue background installs of `blobs`, deduplicated against queued warms
-    /// and dropped once `MAX_QUEUED_WARMS` are pending.
-    fn warm_in_background(self: &Arc<Self>, table: &str, project_id: &str, blobs: Vec<(String, String)>) {
-        for (uuid, blob) in blobs {
-            let dir = self.cache_dir(table, project_id, &uuid, &blob);
+    /// Queue background installs of cold `(key, blob, tar_zst)` indexes, deduplicated against
+    /// queued warms and dropped once `MAX_QUEUED_WARMS` are pending. With bundle writes on, a
+    /// `tar.zst` is repacked as a bundle instead, so what users search converts first.
+    fn warm_in_background(self: &Arc<Self>, table: &str, project_id: &str, blobs: Vec<(String, String, bool)>) {
+        for (key, blob, tar_zst) in blobs {
+            let dir = self.cache_dir(table, project_id, file_uuid(&key), &blob);
             let dashmap::mapref::entry::Entry::Vacant(slot) = self.warming.entry(dir.clone()) else { continue };
             let Ok(queued) = Arc::clone(&self.warm_queue).try_acquire_owned() else {
                 SearchStats::add(&self.stats.cold_warms_dropped, 1);
@@ -619,10 +613,17 @@ impl TantivySearchService {
             let (me, table, project_id) = (Arc::clone(self), table.to_string(), project_id.to_string());
             tokio::spawn(async move {
                 let _queued = queued;
-                if let Ok(_warm) = me.warm_permits.acquire().await
-                    && let Err(e) = me.ensure_cached(&table, &project_id, &uuid, &blob).await
-                {
-                    tracing::debug!("background tantivy warm of {blob} failed: {e:#}");
+                if let Ok(_warm) = me.warm_permits.acquire().await {
+                    let warmed = match tar_zst && me.config.timefusion_tantivy_bundle_writes {
+                        true => {
+                            let level = me.config.compression_level();
+                            convert_entry(me.object_store.as_ref(), Some(&me), &table, &project_id, &key, &blob, level, &me.cache_root, true).await.map(drop)
+                        }
+                        false => me.ensure_cached(&table, &project_id, file_uuid(&key), &blob).await.map(drop),
+                    };
+                    if let Err(e) = warmed {
+                        tracing::debug!("background tantivy warm of {blob} failed: {e:#}");
+                    }
                 }
                 me.warming.remove(&dir);
             });
@@ -935,6 +936,33 @@ fn install_blob_into_cache(dir: &Path, blob: impl std::io::Read) -> Result<()> {
         Err(e) => return Err(e).context("rename into cache"),
     }
     Ok(())
+}
+
+/// Repack `old` as a bundle and point `key` at it. The unpacked index is installed under the
+/// new path when `install` or when `old` was installed, since the content is identical and a
+/// hot index must not fall back to range reads; the reader's cached manifest learns the entry.
+#[allow(clippy::too_many_arguments)]
+async fn convert_entry(
+    store: &dyn ObjectStore, reader: Option<&TantivySearchService>, table: &str, project: &str, key: &str, old: &str, level: i32, scratch: &Path, install: bool,
+) -> Result<bool> {
+    let (new, head, unpacked) = super::convert_blob(store, old, level, scratch).await?;
+    let Some(entry) = super::swap_to_bundle(store, table, project, key, old, new.as_ref(), head).await? else {
+        let _ = store.delete(&new).await;
+        return Ok(false);
+    };
+    if let Some(reader) = reader {
+        let (from, to) = (reader.cache_dir(table, project, file_uuid(key), old), reader.cache_dir(table, project, file_uuid(key), new.as_ref()));
+        let installed = has_any_segment(&from);
+        if (install || installed) && to.parent().is_some_and(|p| std::fs::create_dir_all(p).is_ok()) && std::fs::rename(unpacked.path(), &to).is_ok() {
+            drop(unpacked.keep());
+            reader.last_used.insert(to, SystemTime::now());
+            if installed {
+                let _ = std::fs::remove_dir_all(&from);
+            }
+        }
+        reader.apply_published_entry(table, project, key, entry);
+    }
+    Ok(true)
 }
 
 /// Serves a bundle's ranges from the object store through the captured runtime. Tantivy
@@ -1447,22 +1475,7 @@ impl TantivyIndexService {
         let level = self.config.compression_level();
         Ok(futures::stream::iter(todo.into_iter().take_while(|_| Instant::now() < deadline))
             .map(|(_, project, key, old)| async move {
-                let (new, head, unpacked) = super::convert_blob(store, &old, level, &self.scratch_root).await?;
-                let swapped = super::swap_to_bundle(store, table, &project, &key, &old, new.as_ref(), head).await?;
-                if !swapped {
-                    let _ = store.delete(&new).await;
-                } else if let Some(reader) = self.reader() {
-                    // A locally installed index stays installed under its new path: the
-                    // content is identical, and a hot index must not fall back to range reads.
-                    let (from, to) =
-                        (reader.cache_dir(table, &project, file_uuid(&key), &old), reader.cache_dir(table, &project, file_uuid(&key), new.as_ref()));
-                    if has_any_segment(&from) && std::fs::rename(unpacked.path(), &to).is_ok() {
-                        drop(unpacked.keep());
-                        reader.last_used.insert(to, SystemTime::now());
-                        let _ = std::fs::remove_dir_all(&from);
-                    }
-                }
-                anyhow::Ok(swapped)
+                convert_entry(store, self.reader().as_deref(), table, &project, &key, &old, level, &self.scratch_root, false).await
             })
             .buffer_unordered(BUNDLE_CONVERSIONS)
             .filter_map(|r| futures::future::ready(r.inspect_err(|e| warn!("tantivy bundle conversion failed for {table}: {e:#}")).ok().filter(|&s| s)))
