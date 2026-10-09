@@ -276,10 +276,12 @@ Measured 10-09 00:25 with the per-phase counters, single 30d widgets, second run
 - The lever is fewer, larger files in the windows widgets read: rollup-tier and today-partition consolidation. Caching kernel replay is not the lever.
 - **Scales with schema width too.** With 2,500 selected files: 32 columns → 30 ms, 200 columns → 62 ms (~25 µs per file).
 - **Profile** (macOS `sample`): the hot path is DataFusion's `compute_all_files_statistics` merge (`precision_min`/`precision_max` over `ScalarValue`, `ColumnStatistics` clone and drop), plus building every file's all-column `ColumnStatistics` in the fork's `extract_file_statistics`. Kernel replay and stats JSON parsing are minor.
-- **Prod file counts** (shipbubble raw objects, an upper bound before vacuum): 10-01..10-05 are 2 files/day (consolidated), 10-06..10-09 are 477–1,348/day. Recent unconsolidated days drive both planning and cold round trips.
-- **Levers:**
-  - Fork: keep per-file min/max only for projected, sort and partition columns before the merge. Careful: BoundedMerge and ordering validation read per-file timestamp min/max, and DataFusion may answer aggregates from statistics.
-  - Maintenance: consolidate recent days sooner.
+- **CORRECTION (live Delta log, 16:10):** the "477–1,348 files/day" was raw S3 objects, mostly superseded files awaiting vacuum. Live state:
+  - Every sealed shipbubble day is **2 files**; today is 27.
+  - The whole tables are ~1.3k live files (`otel_logs_and_spans` 1,364, `endpoints_1m` 1,068, `dashboard_1m_v4` 1,184), with no deletion vectors.
+  - A 7d widget leg selects about 40 files, which plans in about 1 ms locally. **Prod's ~95 ms per `scan_provider` is NOT file count.**
+- **Next suspect: per-scan footer work.** `derive_common_ordering` / `apply_footer_sort_stats` fetch and decode each selected file's parquet footer every scan, through DataFusion's 512 MB decoded-metadata cache. Wide-schema footers of 1 GB files decode to MBs, so the cache may churn. Unconfirmed: there is no hit/miss counter.
+- **Next step:** fork sub-phase timers inside `DeltaScan::scan` (kernel replay, footer ordering, plan build), exported via `timefusion_stats` `planning`. Pin bump and deploy after the call, then fix the measured largest.
 - **Prototype measured** (fork worktree `delta-rs-stats`, branch `tf-stats-trim`, change stashed): `compute_all_files_statistics(…, collect_stats=false)` at `next/scan/mod.rs:1372` cuts provider planning about a third (2,500-of-50k files: 78→52 ms; 10k: 31→20 ms).
   - Per-file stats survive, so BoundedMerge's `partition_bounds` and ordering validation are unaffected.
   - NOT shippable as-is: DataFusion `JoinSelection` picks the hash-join build side from summary `num_rows`/`total_byte_size`, and the hashes `UPDATE … FROM` path joins against the OTel scan.
