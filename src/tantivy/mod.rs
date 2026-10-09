@@ -795,17 +795,174 @@ pub async fn list_manifest_projects(store: &dyn ObjectStore, table: &str) -> Res
     Ok(listing.common_prefixes.iter().filter_map(|p| p.parts().next_back().map(|s| s.as_ref().to_string())).collect())
 }
 
-pub async fn load_manifest(store: &dyn ObjectStore, table: &str, project_id: &str) -> Result<Manifest> {
-    match store.get(&manifest_path(table, project_id)).await {
-        Ok(result) => serde_json::from_slice(&result.bytes().await.context("read manifest bytes")?).context("parse manifest json"),
-        Err(object_store::Error::NotFound { .. }) => Ok(Manifest::default()),
-        Err(e) => Err(e).context("load manifest"),
+// A manifest is stored as one shard per partition date plus a small root listing them, so a
+// publish rewrites only its date and a query reads only its window. Shipbubble's single
+// manifest had reached 24.5 MB / 22,688 entries: 544 ms per load, rewritten whole on every
+// publish. A legacy `manifest.json` still loads until the first write shards it.
+
+/// The shard holding everything about one partition date, or [`UNDATED_SHARD`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ManifestShard {
+    pub entries: BTreeMap<String, ManifestEntry>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub retired_blobs: BTreeMap<String, DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) count_proof: Option<visibility::PartitionCountProof>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ManifestRoot {
+    pub version: u32,
+    pub shards: std::collections::BTreeSet<String>,
+}
+
+/// Entries whose key or blob carries no `date=` partition (multi-file `bucket-*` blobs).
+pub const UNDATED_SHARD: &str = "undated";
+
+/// The shard a key or blob path belongs to: its `date=` partition value.
+pub fn shard_of(path: &str) -> String {
+    path.split('/').find_map(|segment| segment.strip_prefix("date=")).map_or_else(|| UNDATED_SHARD.to_string(), str::to_string)
+}
+
+/// Wide enough that loading every shard of a project is one store round trip: GETs cost a
+/// round trip whatever their size, and one prod project holds ~70 dates.
+pub const MANIFEST_SHARD_FETCHES: usize = 128;
+
+pub type ShardDates = std::ops::RangeInclusive<chrono::NaiveDate>;
+
+/// The partition dates a `[lo, hi]` microsecond window can touch.
+pub fn shard_dates(lo: i64, hi: i64) -> Option<ShardDates> {
+    let date = |micros| DateTime::from_timestamp_micros(micros).map(|t| t.date_naive());
+    Some(date(lo)?..=date(hi)?)
+}
+
+/// Whether `shard` can hold entries dated within `dates`; undated shards always can.
+pub fn shard_in_window(shard: &str, dates: Option<&ShardDates>) -> bool {
+    dates.is_none_or(|dates| shard.parse::<chrono::NaiveDate>().ok().is_none_or(|date| dates.contains(&date)))
+}
+
+fn shard_dir(table: &str, project_id: &str) -> String {
+    format!("{MANIFEST_PREFIX}/{table}/{project_id}/shards")
+}
+
+pub fn manifest_root_path(table: &str, project_id: &str) -> ObjPath {
+    ObjPath::from(format!("{}/_root.json", shard_dir(table, project_id)))
+}
+
+pub fn manifest_shard_path(table: &str, project_id: &str, shard: &str) -> ObjPath {
+    ObjPath::from(format!("{}/{shard}.json", shard_dir(table, project_id)))
+}
+
+impl Manifest {
+    pub fn into_shards(self) -> BTreeMap<String, ManifestShard> {
+        let mut shards: BTreeMap<String, ManifestShard> = BTreeMap::new();
+        for (key, entry) in self.entries {
+            shards.entry(shard_of(&key)).or_default().entries.insert(key, entry);
+        }
+        for (blob, at) in self.retired_blobs {
+            shards.entry(shard_of(&blob)).or_default().retired_blobs.insert(blob, at);
+        }
+        for (date, proof) in self.count_proofs {
+            shards.entry(date.to_string()).or_default().count_proof = Some(proof);
+        }
+        shards
+    }
+
+    pub fn from_shards<'a>(version: u32, shards: impl IntoIterator<Item = (&'a str, &'a ManifestShard)>) -> Self {
+        let mut m = Manifest { version, ..Default::default() };
+        for (name, shard) in shards {
+            m.entries.extend(shard.entries.iter().map(|(k, e)| (k.clone(), e.clone())));
+            m.retired_blobs.extend(shard.retired_blobs.iter().map(|(b, at)| (b.clone(), *at)));
+            if let (Some(proof), Ok(date)) = (&shard.count_proof, name.parse::<chrono::NaiveDate>()) {
+                m.count_proofs.insert(date, proof.clone());
+            }
+        }
+        m
     }
 }
 
+async fn get_bytes(store: &dyn ObjectStore, path: &ObjPath) -> Result<Option<Bytes>> {
+    match store.get(path).await {
+        Ok(result) => Ok(Some(result.bytes().await.with_context(|| format!("read {path}"))?)),
+        Err(object_store::Error::NotFound { .. }) => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("get {path}")),
+    }
+}
+
+async fn get_json<T: serde::de::DeserializeOwned>(store: &dyn ObjectStore, path: &ObjPath) -> Result<Option<T>> {
+    get_bytes(store, path).await?.map(|b| serde_json::from_slice(&b).with_context(|| format!("parse {path}"))).transpose()
+}
+
+/// The whole manifest: every shard (fetched concurrently), else the legacy single file.
+pub async fn load_manifest(store: &dyn ObjectStore, table: &str, project_id: &str) -> Result<Manifest> {
+    Ok(load_manifest_shards(store, table, project_id).await?.0)
+}
+
+/// The root, or for a legacy single-file manifest a root plus every shard split out of it.
+pub async fn load_manifest_root(store: &dyn ObjectStore, table: &str, project_id: &str) -> Result<(ManifestRoot, Option<BTreeMap<String, ManifestShard>>)> {
+    if let Some(root) = get_json(store, &manifest_root_path(table, project_id)).await? {
+        return Ok((root, None));
+    }
+    let legacy: Manifest = get_json(store, &manifest_path(table, project_id)).await?.unwrap_or_default();
+    let version = legacy.version;
+    let shards = legacy.into_shards();
+    Ok((ManifestRoot { version, shards: shards.keys().cloned().collect() }, Some(shards)))
+}
+
+/// One shard; absent when a stale root still names a shard emptied since.
+pub async fn load_manifest_shard(store: &dyn ObjectStore, table: &str, project_id: &str, name: &str) -> Result<ManifestShard> {
+    Ok(get_json(store, &manifest_shard_path(table, project_id, name)).await?.unwrap_or_default())
+}
+
+/// The manifest plus the stored bytes of the shards it was assembled from; `None` = loaded
+/// from the legacy file.
+async fn load_manifest_shards(store: &dyn ObjectStore, table: &str, project_id: &str) -> Result<(Manifest, Option<BTreeMap<String, Bytes>>)> {
+    use futures::{StreamExt, TryStreamExt};
+    let Some(root) = get_json::<ManifestRoot>(store, &manifest_root_path(table, project_id)).await? else {
+        return Ok((get_json(store, &manifest_path(table, project_id)).await?.unwrap_or_default(), None));
+    };
+    let raw: BTreeMap<String, Bytes> = futures::stream::iter(root.shards.iter().cloned())
+        .map(|name| async move { anyhow::Ok(get_bytes(store, &manifest_shard_path(table, project_id, &name)).await?.map(|b| (name, b))) })
+        .buffer_unordered(MANIFEST_SHARD_FETCHES)
+        .try_filter_map(|found| async move { Ok(found) })
+        .try_collect()
+        .await?;
+    let shards = raw
+        .iter()
+        .map(|(name, b)| Ok((name.as_str(), serde_json::from_slice::<ManifestShard>(b).with_context(|| format!("parse shard {name}"))?)))
+        .collect::<Result<Vec<_>>>()?;
+    Ok((Manifest::from_shards(root.version, shards.iter().map(|(n, s)| (*n, s))), Some(raw)))
+}
+
+/// Write `manifest` as shards, putting only those that differ from `previous` (all of them
+/// when `previous` is the legacy file) and the root when the set of shards changed.
+async fn save_manifest_shards(
+    store: &dyn ObjectStore, table: &str, project_id: &str, manifest: &Manifest, previous: Option<&BTreeMap<String, Bytes>>,
+) -> Result<()> {
+    let version = manifest.version;
+    let shards = manifest.clone().into_shards();
+    for (name, shard) in &shards {
+        let body = serde_json::to_vec(shard).context("serialize shard")?;
+        if previous.and_then(|p| p.get(name)).is_none_or(|old| old[..] != body[..]) {
+            store.put(&manifest_shard_path(table, project_id, name), body.into()).await.context("put shard")?;
+        }
+    }
+    let names: std::collections::BTreeSet<String> = shards.keys().cloned().collect();
+    if previous.is_none_or(|p| !p.keys().eq(names.iter())) {
+        let root = ManifestRoot { version, shards: names };
+        store.put(&manifest_root_path(table, project_id), serde_json::to_vec(&root).context("serialize root")?.into()).await.context("put root")?;
+    }
+    // After the root stops naming them, so a reader never lists a shard that is gone.
+    for name in previous.into_iter().flat_map(BTreeMap::keys).filter(|name| !shards.contains_key(*name)) {
+        if let Err(e) = store.delete(&manifest_shard_path(table, project_id, name)).await {
+            warn!("manifest shard {name} not deleted: {e}");
+        }
+    }
+    Ok(())
+}
+
 pub async fn save_manifest(store: &dyn ObjectStore, table: &str, project_id: &str, manifest: &Manifest) -> Result<()> {
-    let body = serde_json::to_vec_pretty(manifest).context("serialize manifest")?;
-    store.put(&manifest_path(table, project_id), body.into()).await.context("put manifest").map(drop)
+    save_manifest_shards(store, table, project_id, manifest, None).await
 }
 
 type ManifestLocks = dashmap::DashMap<TableKey, Arc<tokio::sync::Mutex<()>>>;
@@ -820,10 +977,10 @@ pub async fn mutate<R, F: FnOnce(&mut Manifest) -> (R, bool)>(store: &dyn Object
     static LOCKS: std::sync::OnceLock<ManifestLocks> = std::sync::OnceLock::new();
     let lock = LOCKS.get_or_init(Default::default).entry((table.into(), project_id.into())).or_default().clone();
     let _guard = lock.lock().await;
-    let mut m = load_manifest(store, table, project_id).await?;
+    let (mut m, previous) = load_manifest_shards(store, table, project_id).await?;
     let (out, dirty) = f(&mut m);
     if dirty {
-        save_manifest(store, table, project_id, &m).await?;
+        save_manifest_shards(store, table, project_id, &m, previous.as_ref()).await?;
     }
     Ok(out)
 }

@@ -502,16 +502,17 @@ async fn gc_after_compaction_drops_the_cached_manifest() {
 }
 
 /// An object store that serves normally until `arm()`, then fails every GET,
-/// so a test can assert "this read did not go to S3" positively.
+/// so a test can assert "this read did not go to S3" positively. Counts GETs.
 #[derive(Debug)]
-struct FailAfterArm {
+pub(crate) struct FailAfterArm {
     inner: Arc<dyn ObjectStore>,
     armed: std::sync::atomic::AtomicBool,
+    pub(crate) gets: std::sync::atomic::AtomicUsize,
 }
 
 impl FailAfterArm {
-    fn new(inner: Arc<dyn ObjectStore>) -> Self {
-        Self { inner, armed: std::sync::atomic::AtomicBool::new(false) }
+    pub(crate) fn new(inner: Arc<dyn ObjectStore>) -> Self {
+        Self { inner, armed: Default::default(), gets: Default::default() }
     }
     fn arm(&self) {
         self.armed.store(true, Relaxed);
@@ -544,6 +545,7 @@ impl ObjectStore for FailAfterArm {
     /// `head()` also routes here, so arming this blocks every read shape the
     /// search path can use.
     async fn get_opts(&self, location: &Path, options: GetOptions) -> OsResult<GetResult> {
+        self.gets.fetch_add(1, Relaxed);
         self.check()?;
         self.inner.get_opts(location, options).await
     }

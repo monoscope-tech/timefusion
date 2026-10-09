@@ -138,6 +138,15 @@ The `http.status = 500` list stays slow because the filter is sparse, so the mer
   - The warm indexes still prune.
   - Counter `tantivy.cold_indexes_left_raw`.
   - Guard `a_cold_index_leaves_only_its_own_files_unpruned`, red with the old refusal.
+- [x] **Per-date index manifest** (branch `tantivy/manifest-split`):
+  - The manifest is now `index_manifests/{table}/{pid}/shards/{date|undated}.json` plus a `_root.json` listing the shards. Shipbubble has 67 shards of about 0.35 MB each in compact JSON; the single file was 24.5 MB of pretty-printed JSON.
+  - A query loads only its window's shards plus `undated`. The cache holds shards, so a 7d query reuses the shards a 30d query loaded.
+  - A publish rewrites only the shards whose bytes changed (normally today's), and the root only when the set of shards changes. An emptied shard is deleted after the root drops it.
+  - Shard GETs are issued 128 at a time, so a cold load is the root GET plus one round of shard GETs, at most two round trips. The store is round-trip-bound (p50 350–600 ms whatever the size), so a cold load costs about the same as before; the gains are cache reuse across windows and roughly 70x smaller publish writes.
+  - Coverage of files outside the window's dates is no longer loaded. That is sound: an uncovered file is scanned raw with the predicate, and date partitions are pruned by the scan anyway.
+  - `tantivy.manifest_hits/loads` now count per window load, not per whole manifest, so do not compare them with the 49% baseline.
+  - **Migration is one-way.** The first write after deploy splits the legacy `manifest.json` into shards and leaves the legacy file untouched. A rollback to an older image reads that stale `manifest.json`, so entries published since are invisible. Their files are scanned raw until the index backfill re-covers them, and no blobs are lost: orphan reconcile works off live parquet, not the manifest. Entries an old image publishes after a rollback are likewise invisible after the next roll-forward.
+  - Guard `a_manifest_publish_rewrites_only_its_date_and_a_window_reads_only_its_dates` (ETags of untouched shards, GET counts per window). It went red with "rewrite every shard" and with "load every shard".
 - [ ] **Range-readable indexes with a hotcache, behind a flag** (owner: start it; estimate 3–4 engineer-weeks plus A/B). Design notes:
   - Do NOT enable tantivy's `quickwit` feature: it switches the term dictionary to SSTable, so every existing index stops opening, and it cannot be A/B'd at runtime. Warm-up is hand-built:
     1. Term lookups are sync against the resident term dictionary.
@@ -151,7 +160,7 @@ The `http.status = 500` list stays slow because the filter is sparse, so the mer
     - Store 94 MB, fast fields 56 MB (`_id` 44 MB), positions 50 MB.
   - ⇒ A hotcache of text-field term dictionaries is about 3 MB per 2M-row file and fits a resident budget. The postings are what range reads must avoid fetching whole.
   - ⇒ Side win: ID term dictionaries (about 250 MB per file) duplicate the bloom sidecars, and `id` is indexed twice. Trimming them from new builds shrinks every blob, which speeds today's cold installs too.
-  - Also measured: shipbubble's index manifest is ONE 24.5 MB JSON with 22,688 entries. Manifest loads average 544 ms at a 49% hit rate, a planning cost worth splitting per date.
+  - Also measured: shipbubble's index manifest is ONE 24.5 MB JSON with 22,688 entries. Manifest loads average 544 ms at a 49% hit rate, a planning cost worth splitting per date (done above).
   - Store each index as range-readable files with a hotcache footer, and implement a tantivy `Directory` over object-store ranges, as `quickwit-directories` does.
   - Keep the footers resident under a byte budget.
   - A/B the change within one process before turning it on.

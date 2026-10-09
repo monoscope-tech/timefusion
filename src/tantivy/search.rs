@@ -21,14 +21,14 @@ use std::{
 use anyhow::{Context, Result, anyhow};
 use dashmap::DashMap;
 use futures::{StreamExt, TryStreamExt};
-use itertools::Itertools;
+use itertools::{Either, Itertools};
 use lru::LruCache;
 use object_store::{ObjectStore, ObjectStoreExt, path::Path as ObjPath};
 use parking_lot::Mutex;
 use tantivy::{Index, IndexReader};
 
 use crate::tantivy::{
-    MANIFEST_PREFIX, Manifest, SCHEMA_VERSION, load_manifest,
+    MANIFEST_SHARD_FETCHES, Manifest, ManifestRoot, ManifestShard, SCHEMA_VERSION, ShardDates,
     udf::{PredNode, TextMatchPred},
     upsert_manifest,
 };
@@ -146,6 +146,13 @@ pub struct HistogramSnapshotResult {
     pub index_errors: Vec<anyhow::Error>,
 }
 
+/// A project's manifest root and the shards read through it, each stamped with its load time.
+#[derive(Debug, Default)]
+struct CachedManifest {
+    root: Option<(Instant, Arc<ManifestRoot>)>,
+    shards: HashMap<String, (Instant, Arc<ManifestShard>)>,
+}
+
 #[derive(Debug)]
 pub struct TantivySearchService {
     pub object_store: Arc<dyn ObjectStore>,
@@ -153,9 +160,9 @@ pub struct TantivySearchService {
     pub config: Arc<TantivyConfig>,
     pub stats: SearchStats,
     readers: Mutex<LruCache<PathBuf, (Index, IndexReader)>>,
-    /// TTL cache of parsed manifests, keyed (table, project). Per-service
+    /// TTL cache of parsed manifest shards, keyed (table, project). Per-service
     /// (not global) so distinct object stores never cross-contaminate.
-    manifests: DashMap<(String, String), (Instant, Arc<Manifest>)>,
+    manifests: DashMap<(String, String), CachedManifest>,
     /// Last time each cache dir was served to a query — the reaper's recency
     /// signal, since mmap reads don't reliably move a directory's atime. Dirs
     /// absent here fall back to dir mtime, which is their unpack time.
@@ -386,7 +393,7 @@ impl TantivySearchService {
             self.remember_refusal(cap_key.clone(), width, "delta_cap_exceeded_memo");
             Ok(Err(reason))
         };
-        let m = self.load_manifest_cached(table, project_id).await?;
+        let m = self.load_manifest_cached(table, project_id, time_range.and_then(|(lo, hi)| crate::tantivy::shard_dates(lo, hi))).await?;
         if m.entries.is_empty() {
             return Ok(Err("delta_no_index"));
         }
@@ -546,15 +553,9 @@ impl TantivySearchService {
     /// failures are skipped. Returns the number of blobs warmed.
     pub async fn warm_recent(self: &Arc<Self>, table: &str, days: u32) -> Result<usize> {
         let cutoff = crate::support::now_micros() - i64::from(days) * 86_400_000_000;
-        let prefix = ObjPath::from(format!("{}/{table}", MANIFEST_PREFIX));
-        let objs: Vec<_> = self.object_store.list(Some(&prefix)).try_collect().await?;
         let mut warmed = 0usize;
-        for meta in objs.iter().filter(|m| m.location.as_ref().ends_with("/manifest.json")) {
-            // .../{project}/manifest.json
-            let Some(project) = meta.location.as_ref().rsplit('/').nth(1) else {
-                continue;
-            };
-            let Ok(m) = load_manifest(self.object_store.as_ref(), table, project).await else {
+        for project in &crate::tantivy::list_manifest_projects(self.object_store.as_ref(), table).await? {
+            let Ok(m) = self.load_manifest_cached(table, project, None).await else {
                 continue;
             };
             // Owned, not borrowed from `m`: the warm tasks below must be 'static.
@@ -603,18 +604,48 @@ impl TantivySearchService {
         }
     }
 
-    /// TTL-cached manifest read, removing the per-query S3 GET + JSON parse.
-    pub(crate) async fn load_manifest_cached(&self, table: &str, project_id: &str) -> Result<Arc<Manifest>> {
-        let key = (table.to_string(), project_id.to_string());
-        if let Some(m) = self.manifests.get(&key).filter(|e| e.0.elapsed() < self.config.manifest_ttl()).map(|e| e.1.clone()) {
-            SearchStats::add(&self.stats.manifest_hits, 1);
-            return Ok(m);
-        }
+    /// TTL-cached manifest of the shards dated within `dates` (all when `None`), removing
+    /// the per-query S3 GETs + JSON parse.
+    pub async fn load_manifest_cached(&self, table: &str, project_id: &str, dates: Option<ShardDates>) -> Result<Arc<Manifest>> {
+        let (store, key, ttl) = (self.object_store.as_ref(), (table.to_string(), project_id.to_string()), self.config.manifest_ttl());
         let started = Instant::now();
-        let m = Arc::new(load_manifest(self.object_store.as_ref(), table, project_id).await?);
-        SearchStats::timed(&self.stats.manifest_loads, &self.stats.manifest_load_us, started);
-        self.manifests.insert(key, (Instant::now(), m.clone()));
-        Ok(m)
+        let cached_root = self.manifests.get(&key).and_then(|c| c.root.clone()).filter(|(at, _)| at.elapsed() < ttl);
+        let hit = cached_root.is_some();
+        let root = match cached_root {
+            Some((_, root)) => root,
+            None => {
+                let (root, legacy) = crate::tantivy::load_manifest_root(store, table, project_id).await?;
+                let (now, root) = (Instant::now(), Arc::new(root));
+                let mut cached = self.manifests.entry(key.clone()).or_default();
+                cached.root = Some((now, root.clone()));
+                cached.shards.extend(legacy.into_iter().flatten().map(|(name, shard)| (name, (now, Arc::new(shard)))));
+                root
+            }
+        };
+        let wanted = root.shards.iter().filter(|name| crate::tantivy::shard_in_window(name, dates.as_ref()));
+        let (mut shards, missing): (Vec<_>, Vec<_>) = {
+            let cached = self.manifests.get(&key);
+            wanted
+                .map(|name| match cached.as_ref().and_then(|c| c.shards.get(name)).filter(|(at, _)| at.elapsed() < ttl) {
+                    Some((_, shard)) => Either::Left((name.clone(), shard.clone())),
+                    None => Either::Right(name.clone()),
+                })
+                .partition_map(|e| e)
+        };
+        if hit && missing.is_empty() {
+            SearchStats::add(&self.stats.manifest_hits, 1);
+        } else {
+            let loaded: Vec<(String, Arc<ManifestShard>)> = futures::stream::iter(missing)
+                .map(|name| async move { anyhow::Ok((name.clone(), Arc::new(crate::tantivy::load_manifest_shard(store, table, project_id, &name).await?))) })
+                .buffer_unordered(MANIFEST_SHARD_FETCHES)
+                .try_collect()
+                .await?;
+            let now = Instant::now();
+            self.manifests.entry(key).or_default().shards.extend(loaded.iter().map(|(name, shard)| (name.clone(), (now, shard.clone()))));
+            shards.extend(loaded);
+            SearchStats::timed(&self.stats.manifest_loads, &self.stats.manifest_load_us, started);
+        }
+        Ok(Arc::new(Manifest::from_shards(root.version, shards.iter().map(|(name, shard)| (name.as_str(), &**shard)))))
     }
 
     /// Fold a just-published entry into the cached manifest instead of dropping
@@ -622,18 +653,22 @@ impl TantivySearchService {
     /// instead would drive the hit rate to zero on busy projects, which publish
     /// far more often than they are queried.
     pub fn apply_published_entry(&self, table: &str, project_id: &str, key: &str, entry: crate::tantivy::ManifestEntry) {
-        // `entry()` holds the shard lock across the read-modify-write; a plain
+        // `get_mut()` holds the shard lock across the read-modify-write; a plain
         // get-clone-insert would let concurrent publishes drop each other's entry.
-        let dashmap::mapref::entry::Entry::Occupied(mut occupied) = self.manifests.entry((table.to_string(), project_id.to_string())) else {
+        let Some(mut cached) = self.manifests.get_mut(&(table.to_string(), project_id.to_string())) else {
             // Nothing cached: the next read loads it, including this entry.
             return;
         };
-        let (loaded_at, current) = occupied.get();
+        let shard = crate::tantivy::shard_of(key);
+        if cached.root.as_ref().is_some_and(|(_, root)| !root.shards.contains(&shard)) {
+            // A new shard: re-read the root so readers look for it.
+            cached.root = None;
+        }
         // Keep the ORIGINAL load time, or a frequently-publishing project would
         // never re-read its manifest and never see other writers.
-        let (loaded_at, mut updated) = (*loaded_at, (**current).clone());
-        updated.entries.insert(key.to_string(), entry);
-        occupied.insert((loaded_at, Arc::new(updated)));
+        if let Some((_, current)) = cached.shards.get_mut(&shard) {
+            Arc::make_mut(current).entries.insert(key.to_string(), entry);
+        }
     }
 
     /// Drop a cached manifest so the next read reloads it from S3, the GC

@@ -1003,7 +1003,9 @@ impl super::Database {
         if partitions.is_empty() {
             partitions.entry(lo.div_euclid(DAY_MICROS)).or_default();
         }
-        let manifest = search.load_manifest_cached(table_name, project).await?;
+        let dates =
+            partitions.keys().next().zip(partitions.keys().next_back()).and_then(|(lo, hi)| crate::tantivy::shard_dates(lo * DAY_MICROS, hi * DAY_MICROS));
+        let manifest = search.load_manifest_cached(table_name, project, dates).await?;
         let mut logical_counts = std::collections::BTreeMap::new();
         for (&day, files) in &partitions {
             let current: crate::read::CountFiles = files.iter().map(|file| (file.path.clone(), file.deletion_vector.clone())).collect();

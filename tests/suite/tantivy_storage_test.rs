@@ -174,3 +174,52 @@ async fn concurrent_upserts_last_writer_wins() {
     let m = load_manifest(store_obj.as_ref(), "logs", "proj1").await.unwrap();
     assert!(!m.entries.is_empty());
 }
+
+#[tokio::test]
+async fn a_manifest_publish_rewrites_only_its_date_and_a_window_reads_only_its_dates() -> anyhow::Result<()> {
+    use std::sync::atomic::Ordering::Relaxed;
+
+    use object_store::{ObjectStore, ObjectStoreExt};
+    use timefusion::tantivy::{Manifest, manifest_path, manifest_root_path, manifest_shard_path, search::TantivySearchService, shard_dates};
+    let counting = Arc::new(super::tantivy_search_test::FailAfterArm::new(Arc::new(InMemory::new())));
+    let store: Arc<dyn ObjectStore> = counting.clone();
+    let (day1, day2) = ("p/date=2026-10-01/a.parquet", "p/date=2026-10-02/b.parquet");
+    let legacy =
+        serde_json::json!({"version": SCHEMA_VERSION, "entries": {day1: entry(None, 1, None), day2: entry(None, 2, None), "bucket-x": entry(None, 3, None)}});
+    store.put(&manifest_path("logs", "p"), serde_json::to_vec_pretty(&legacy)?.into()).await?;
+    let keys = |m: &Manifest| m.entries.keys().cloned().collect::<Vec<_>>();
+    assert_eq!(keys(&load_manifest(store.as_ref(), "logs", "p").await?), ["bucket-x", day1, day2]);
+
+    // The first publish migrates the legacy file into shards, then a publish puts only its own date.
+    upsert_manifest(store.as_ref(), "logs", "p", "p/date=2026-10-02/c.parquet", entry(None, 0, None)).await?;
+    let etags = async || {
+        let mut tags = vec![];
+        for shard in ["2026-10-01", "2026-10-02", "undated"] {
+            tags.push(store.head(&manifest_shard_path("logs", "p", shard)).await?.e_tag);
+        }
+        anyhow::Ok(tags)
+    };
+    let before = etags().await?;
+    upsert_manifest(store.as_ref(), "logs", "p", "p/date=2026-10-02/d.parquet", entry(None, 0, None)).await?;
+    let after = etags().await?;
+    assert_eq!((before[0] == after[0], before[1] == after[1], before[2] == after[2]), (true, false, true));
+    assert_eq!(load_manifest(store.as_ref(), "logs", "p").await?.entries.len(), 5);
+
+    // A window GETs the root and its own shards once, then serves from cache.
+    let cfg = timefusion::config::TantivyConfig { timefusion_tantivy_manifest_ttl_secs: 60, ..Default::default() };
+    let search = TantivySearchService::new(store.clone(), tempfile::tempdir()?.path().into(), Arc::new(cfg));
+    let day = 1_790_899_200_000_000; // 2026-10-02T00:00Z
+    for expected_gets in [3, 0] {
+        let gets = counting.gets.load(Relaxed);
+        let window = search.load_manifest_cached("logs", "p", shard_dates(day, day + 3_600_000_000)).await?;
+        assert_eq!(keys(&window), ["bucket-x", day2, "p/date=2026-10-02/c.parquet", "p/date=2026-10-02/d.parquet"]);
+        assert_eq!(counting.gets.load(Relaxed) - gets, expected_gets);
+    }
+
+    // A date emptied of entries leaves the root, then the store.
+    remove_manifest_entries(store.as_ref(), "logs", "p", &[day1.into()]).await?;
+    assert!(store.head(&manifest_shard_path("logs", "p", "2026-10-01")).await.is_err());
+    let root: serde_json::Value = serde_json::from_slice(&store.get(&manifest_root_path("logs", "p")).await?.bytes().await?)?;
+    assert_eq!(root["shards"], serde_json::json!(["2026-10-02", "undated"]));
+    Ok(())
+}
