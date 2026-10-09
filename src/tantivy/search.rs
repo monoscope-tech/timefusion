@@ -1087,7 +1087,7 @@ pub fn build_node_query(index: &Index, node: &PredNode) -> Result<PredsQuery> {
     let q: Box<dyn Query> = match node {
         PredNode::Leaf(p) => {
             let schema = index.schema();
-            let Ok(field) = schema.get_field(&p.column) else {
+            let Some(field) = crate::tantivy::resolve_field(&schema, &p.column) else {
                 return Ok(PredsQuery::MissingField);
             };
             let tokenizer = match schema.get_field_entry(field).field_type() {

@@ -451,6 +451,23 @@ mod builder_tests {
         Ok(())
     }
 
+    #[test]
+    fn a_raw_id_column_is_served_by_the_id_field_not_indexed_twice() -> Result<()> {
+        use crate::tantivy::{
+            search::{PredsQuery, build_node_query},
+            udf::{PredNode, TextMatchPred},
+        };
+        let mut table = table();
+        table.fields[1].tantivy = Some(TantivyFieldConfig { indexed: true, tokenizer: Some("raw".into()), ..Default::default() });
+        let (index, ..) = build_in_memory(&table, &(1..5).map(batch).collect::<Vec<_>>())?;
+        assert!(index.schema().get_field("id").is_err(), "id must not be indexed a second time");
+        let PredsQuery::Query(q) = build_node_query(&index, &PredNode::Leaf(TextMatchPred { column: "id".into(), query: "id3".into() }))? else {
+            anyhow::bail!("an id predicate must resolve to the id field");
+        };
+        assert_eq!(index.reader()?.searcher().search(&*q, &tantivy::collector::Count)?, 1);
+        Ok(())
+    }
+
     fn error_hits(index: &Index, built: &BuiltSchema) -> Vec<Hit> {
         let q = TermQuery::new(Term::from_field_text(built.user_fields["level"].field, "ERROR"), IndexRecordOption::Basic);
         let mut hits = query_index(index, &q, None).expect("query");
@@ -575,6 +592,8 @@ const MAX_TOKEN_LEN: usize = 256;
 
 pub const TS_FIELD: &str = "_timestamp";
 pub const ID_FIELD: &str = "_id";
+/// The column `ID_FIELD` indexes verbatim.
+pub const ID_SOURCE: &str = "id";
 /// Global row offset of the doc within the file the index covers (FAST). Only
 /// meaningful when the index was built by reading the parquet back in row order
 /// (`ManifestEntry.ordinals_valid`); flush-path indexes see pre-sort batches.
@@ -626,10 +645,21 @@ pub fn build_for_table(table: &TableSchema) -> BuiltSchema {
     let row_ordinal = b.add_u64_field(ROW_ORDINAL_FIELD, NumericOptions::default() | FAST);
 
     let user_fields: HashMap<_, _> = indexed_fields(table)
-        .filter(|(fd, _)| fd.name != TS_FIELD && fd.name != ID_FIELD)
+        .filter(|(fd, cfg)| fd.name != TS_FIELD && fd.name != ID_FIELD && !aliases_id_field(fd, cfg))
         .map(|(fd, cfg)| (fd.name.clone(), UserField { field: b.add_text_field(&fd.name, text_options_for(cfg)), source: fd.clone() }))
         .collect();
     BuiltSchema { schema: b.build(), timestamp, id, row_ordinal, user_fields }
+}
+
+/// A raw-indexed `id` column holds exactly `ID_FIELD`'s terms, so it resolves to that field
+/// instead of indexing every id a second time (~78 MB of terms per 2M-row file).
+fn aliases_id_field(fd: &FieldDef, cfg: &TantivyFieldConfig) -> bool {
+    fd.name == ID_SOURCE && canonical_tokenizer(cfg) == RAW_TOKENIZER && cfg.list_mode != TantivyListMode::Elements && cfg.flatten.is_none()
+}
+
+/// A column's field; `id` falls back to `ID_FIELD` in indexes built without the duplicate.
+pub fn resolve_field(schema: &Schema, column: &str) -> Option<Field> {
+    schema.get_field(column).ok().or_else(|| (column == ID_SOURCE).then(|| schema.get_field(ID_FIELD).ok()).flatten())
 }
 
 fn raw_id_options() -> TextOptions {

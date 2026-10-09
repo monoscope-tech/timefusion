@@ -147,6 +147,10 @@ The `http.status = 500` list stays slow because the filter is sparse, so the mer
   - `tantivy.manifest_hits/loads` now count per window load, not per whole manifest, so do not compare them with the 49% baseline.
   - **Migration is one-way.** The first write after deploy splits the legacy `manifest.json` into shards and leaves the legacy file untouched. A rollback to an older image reads that stale `manifest.json`, so entries published since are invisible. Their files are scanned raw until the index backfill re-covers them, and no blobs are lost: orphan reconcile works off live parquet, not the manifest. Entries an old image publishes after a rollback are likewise invisible after the next roll-forward.
   - Guard `a_manifest_publish_rewrites_only_its_date_and_a_window_reads_only_its_dates` (ETags of untouched shards, GET counts per window). It went red with "rewrite every shard" and with "load every shard".
+- [x] **Stop indexing `id` twice** (branch `tantivy/id-alias`):
+  - A raw-indexed `id` column holds exactly `_id`'s terms. New builds drop the user `id` field, and an `id` predicate resolves to `_id`, which saves about 78 MB of terms per 2M-row file. Old indexes still carry `id` and resolve to it directly.
+  - Guard `a_raw_id_column_is_served_by_the_id_field_not_indexed_twice`, red with the duplicate field back.
+  - **Not trimmed:** `context___trace_id`, `context___span_id` and `parent_id`. An equality filter on them is rewritten to `text_match`, and tantivy answers it with row-level selections. Blooms only prune whole files, and row-group stats on random IDs prune nothing, so dropping these fields would turn a trace lookup into decoding the whole file.
 - [ ] **Range-readable indexes with a hotcache, behind a flag** (owner: start it; estimate 3–4 engineer-weeks plus A/B). Design notes:
   - Do NOT enable tantivy's `quickwit` feature: it switches the term dictionary to SSTable, so every existing index stops opening, and it cannot be A/B'd at runtime. Warm-up is hand-built:
     1. Term lookups are sync against the resident term dictionary.
