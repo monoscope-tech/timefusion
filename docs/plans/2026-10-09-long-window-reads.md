@@ -255,6 +255,21 @@ Measured 10-09 00:25 with the per-phase counters, single 30d widgets, second run
   - `partition_stats_bounded` scans every add action of the unified source table, per candidate tier, per statement.
   - `rollup_output_coverage` scans the tier's snapshot.
 
+**Update 10-09 15:00 (endpoint widget, 7d, warm, about 1 s total):**
+
+| Phase | Time |
+| --- | --- |
+| `scan_provider` | 4 calls × ~95 ms ≈ 0.4 s, the largest bucket |
+| `rollup_rewrite_plan` | ~0.35 s (contains the leg scans) |
+| `scan_certification` | 40–70 ms |
+| Mem leg | 50–370 ms |
+
+- The provider cost is the fork's `DeltaScan::scan`: `scan_metadata_seeded` (`kernel/snapshot/scan.rs`) → `scan_metadata_from`. It re-runs kernel data skipping and the scan-row transform over every materialized file of the snapshot on every scan. Cost scales with the table's total file count, not the query's window.
+- Fix candidates:
+  - Memoize the replayed `ScanMetadata` per (snapshot version, predicate) inside the fork.
+  - Or seed the replay with only the project partition's files.
+- Both are fork changes; measure `scan_provider` per call before and after.
+
 ### R2 — Filtered charts and needles over 7–30 days
 
 **Diagnosed 10-09 02:00.** The shipbubble 7d chart grouped by `status_code` with an `http.status = 500` filter took 21–90 s. Grouped by bucket only, it took 0.3–1.3 s.
