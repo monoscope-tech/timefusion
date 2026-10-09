@@ -1157,6 +1157,7 @@ impl StatsTableProvider {
                 .zip(p.plan_phase_us)
                 .map(|(name, us)| ("planning", format!("delta_{name}_us"), us.to_string())),
         );
+        parquet.push(("planning", "delta_unseeded_replays".to_string(), p.unseeded_replays.to_string()));
 
         let cache_sizes = self.cache_sizes.as_ref().map_or_else(Vec::new, |snap| {
             // These caches don't evict; size tracks unique (project, table) pairs
