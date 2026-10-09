@@ -138,7 +138,20 @@ The `http.status = 500` list stays slow because the filter is sparse, so the mer
   - The warm indexes still prune.
   - Counter `tantivy.cold_indexes_left_raw`.
   - Guard `a_cold_index_leaves_only_its_own_files_unpruned`, red with the old refusal.
-- [ ] **Range-readable indexes with a hotcache, behind a flag.**
+- [ ] **Range-readable indexes with a hotcache, behind a flag** (owner: start it; estimate 3–4 engineer-weeks plus A/B). Design notes:
+  - Do NOT enable tantivy's `quickwit` feature: it switches the term dictionary to SSTable, so every existing index stops opening, and it cannot be A/B'd at runtime. Warm-up is hand-built:
+    1. Term lookups are sync against the resident term dictionary.
+    2. Postings ranges are fetched in one batched async read.
+    3. The search runs sync.
+  - Layout: uncompressed bundle with a file table and a hotcache footer. Manifest gains `format` and `hotcache` fields; `SCHEMA_VERSION` must not be bumped (an `==` check would orphan every existing entry).
+  - Read side: a strict `BundleDirectory` whose misses are errors, so a missing range never blocks a query; a foyer range store; flag `timefusion_tantivy_range_reads`.
+  - Step 1, measured 10-09 on one prod index (shipbubble 09-30, 2.06M rows, 1.38 GB tar.zst, 2.17 GB unpacked):
+    - Term dictionaries total 251 MB. Text fields are small: `body` 1.1, `attributes` 0.8, `summary` 0.7 MB, `name` tiny (≈2.7 MB). ID fields dominate: `id` 78 MB **and** `_id` 78 MB (indexed twice), `context___span_id` 36, `context___trace_id` 33, `parent_id` 13.5, `_timestamp` 9.7 MB.
+    - Postings total 1.69 GB: `attributes` 656, `summary` 626, `body` 349 MB.
+    - Store 94 MB, fast fields 56 MB (`_id` 44 MB), positions 50 MB.
+  - ⇒ A hotcache of text-field term dictionaries is about 3 MB per 2M-row file and fits a resident budget. The postings are what range reads must avoid fetching whole.
+  - ⇒ Side win: ID term dictionaries (about 250 MB per file) duplicate the bloom sidecars, and `id` is indexed twice. Trimming them from new builds shrinks every blob, which speeds today's cold installs too.
+  - Also measured: shipbubble's index manifest is ONE 24.5 MB JSON with 22,688 entries. Manifest loads average 544 ms at a 49% hit rate, a planning cost worth splitting per date.
   - Store each index as range-readable files with a hotcache footer, and implement a tantivy `Directory` over object-store ranges, as `quickwit-directories` does.
   - Keep the footers resident under a byte budget.
   - A/B the change within one process before turning it on.
