@@ -3182,6 +3182,10 @@ impl BufferedWriteLayer {
         self.mem_buffer.min_buffered_micros(project_id, table_name, lo, hi)
     }
 
+    pub fn min_row_micros(&self, project_id: &str, table_name: &str) -> Option<i64> {
+        self.mem_buffer.min_row_micros(project_id, table_name)
+    }
+
     /// Upper bound on row timestamps Delta can hold for this table — see
     /// `delta_flushed_watermark`. Queries bounded strictly above this can
     /// skip the Delta scan.

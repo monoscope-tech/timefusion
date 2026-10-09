@@ -3098,6 +3098,66 @@ async fn per_date_dedup_skip_matches_the_all_or_nothing_result() -> Result<()> {
     Ok(())
 }
 
+/// The per-date skip with a MemBuffer leg (10-09): a window reaching into today deduped
+/// every sealed day too (shipbubble's 7-day status chart, 21-90 s vs 0.5 s without today).
+/// A certified date may skip only while nothing buffered can be a newer version of one of
+/// its keys; a late version still in MemBuffer must keep its date deduped.
+#[test_case(false ; "only today is buffered: the certified date skips")]
+#[test_case(true ; "a newer version of the certified date's key is buffered: it still dedups")]
+#[serial]
+#[tokio::test]
+async fn per_date_skip_with_a_mem_leg_never_skips_a_buffered_version(late_version: bool) -> Result<()> {
+    let (today_ts, older_ts) = (noon_days_ago(0), noon_days_ago(3));
+    let run = |per_date: bool| async move {
+        let cfg = tuned_cfg(&format!("per_date_mem_{per_date}_{late_version}"), |c| {
+            c.maintenance.timefusion_read_dedup_skip_swept = true;
+            c.maintenance.timefusion_read_dedup_skip_per_date = per_date;
+        });
+        let layer = Arc::new(timefusion::support::test_helpers::test_layer(Arc::clone(&cfg))?);
+        let db = Arc::new(Database::with_config(cfg).await?.with_buffered_layer(layer));
+        let project_id = new_project_id();
+        let insert = |key: &'static str, ts: i64, tag: &'static str, to_delta: bool| {
+            let (db, project_id) = (Arc::clone(&db), project_id.clone());
+            async move {
+                let mut value = test_span_ts(key, "span", &project_id, ts);
+                value["hashes"] = serde_json::json!([tag]);
+                db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![json_to_batch(vec![value])?], to_delta, None).await
+            }
+        };
+        for tag in ["original", "updated"] {
+            insert("older_key", older_ts, tag, true).await?;
+        }
+        // The first sweep removes the duplicate; the second proves the partition clean.
+        for _ in 0..2 {
+            sweep_once(&db).await?;
+        }
+        insert("today_key", today_ts, "today", false).await?;
+        if late_version {
+            insert("older_key", older_ts, "final", false).await?;
+        }
+        let mut ctx = Arc::clone(&db).create_session_context();
+        db.setup_session_context(&mut ctx)?;
+        let sql = format!(
+            "SELECT array_element(hashes, 1) AS tag FROM otel_logs_and_spans WHERE project_id = '{project_id}' \
+             AND timestamp >= to_timestamp_micros({}) AND timestamp <= to_timestamp_micros({})",
+            older_ts - 1,
+            today_ts + 1
+        );
+        let plan = ctx.sql(&sql).await?.create_physical_plan().await?;
+        let mut tags = col0_strings(&datafusion::physical_plan::collect(plan.clone(), ctx.task_ctx()).await?);
+        tags.sort();
+        let deduped = find_node(&plan, "DedupExec").and_then(|dedup| dedup.metrics()?.sum_by_name("input_rows")).map(|rows| rows.as_usize());
+        Ok::<_, anyhow::Error>((tags, deduped, rendered(&plan)))
+    };
+    let ((baseline, _, _), (split, deduped, plan)) = (run(false).await?, run(true).await?);
+    let want = if late_version { ["final", "today"] } else { ["today", "updated"] };
+    assert_eq!(split, want, "one winning version per key: {plan}");
+    assert_eq!(split, baseline, "the split must answer what the single dedup answers");
+    // The cost half: the certified date's two versions bypass DedupExec only when safe.
+    assert_eq!(deduped, Some(if late_version { 3 } else { 1 }), "rows the dedup read: {plan}");
+    Ok(())
+}
+
 /// A selective point lookup whose needle is in no file, with the per-date split
 /// enabled: the bloom prefilter removes every file and the scan must return
 /// nothing without erroring.

@@ -1286,29 +1286,61 @@ impl ProjectRoutingTable {
         scan_state.lock().fast_resolve_hit = None;
         let delta_table = self.database.resolve_table(&project_id, &self.table_name).instrument(resolve_span).await?;
         let table = delta_table.read().await;
-        let delta_plans = self
-            .scan_delta_with_tantivy(
-                &table,
-                state,
-                projection,
-                &delta_filters,
-                limit,
-                tantivy_id_filter.as_ref(),
-                tantivy_covered_files.as_ref(),
-                tantivy_exclude.as_ref(),
-                tantivy_row_selections.as_ref(),
-                query_time_range,
-                bloom_rejected.as_ref(),
-                None,
-                None,
-            )
-            .await?;
+        // Per-DATE skip on this path too. A certified date holds one version per key, and no
+        // newer version of one can be buffered when every buffered row is later than the
+        // date's end: a version keeps its row's timestamp, which the dedup key leads with.
+        // The floor also reads the leg's own rows, since a bucket's row span is published
+        // after its batch. Without this, a window reaching into today deduped every sealed
+        // day too (shipbubble 7d status chart: 21-90 s vs 0.5 s for the sealed days alone).
+        let mem_floor = layer.min_row_micros(&project_id, &self.table_name).into_iter().chain(earliest_row(&mem_partitions)).min();
+        let skip_dates: HashSet<String> = match (query_time_range, mem_floor) {
+            (Some(window), Some(floor)) if !dedup_keys.is_empty() && self.database.config.maintenance.timefusion_read_dedup_skip_per_date => {
+                let (_, certified) = self.dedup_skip_certified(&table, &project_id, Some(window), &dedup_keys);
+                certified.into_iter().filter(|date| date_start_micros(date).is_some_and(|start| start.saturating_add(DAY_MICROS) <= floor)).collect()
+            }
+            _ => HashSet::new(),
+        };
+        let kept_dates: HashSet<String> = query_time_range
+            .filter(|_| !skip_dates.is_empty())
+            .and_then(|(lo, hi)| window_dates(lo, hi))
+            .into_iter()
+            .flatten()
+            .map(|date| date.to_string())
+            .filter(|date| !skip_dates.contains(date))
+            .collect();
+        macro_rules! delta_side {
+            ($dates:expr) => {
+                self.scan_delta_with_tantivy(
+                    &table,
+                    state,
+                    projection,
+                    &delta_filters,
+                    limit,
+                    tantivy_id_filter.as_ref(),
+                    tantivy_covered_files.as_ref(),
+                    tantivy_exclude.as_ref(),
+                    tantivy_row_selections.as_ref(),
+                    query_time_range,
+                    bloom_rejected.as_ref(),
+                    $dates,
+                    None,
+                )
+            };
+        }
+        let delta_plans = delta_side!((!skip_dates.is_empty()).then_some(&kept_dates)).await?;
+        let skip_plans = match skip_dates.is_empty() {
+            true => Vec::new(),
+            false => {
+                metrics::counter!(scan_metric_names::DEDUP_SKIPPED_PER_DATE).increment(1);
+                delta_side!(Some(&skip_dates)).await?
+            }
+        };
         scan_state.lock().has_delta = true;
 
         // Union the legs in recency order — mem, then Delta — so DedupExec's keep-first
         // favours the freshest copy of a row.
         use crate::read::LegKind;
-        wrap_result(std::iter::once((mem_plan, LegKind::Mem)).chain(delta_plans.into_iter().map(|p| (p, LegKind::Delta))).collect())
+        wrap_result_split(std::iter::once((mem_plan, LegKind::Mem)).chain(delta_plans.into_iter().map(|p| (p, LegKind::Delta))).collect(), skip_plans)
     }
 
     /// Runs of consecutive window dates split by layout, while a table whose sort leads with a
@@ -2224,6 +2256,20 @@ impl TableProvider for ProjectRoutingTable {
         crate::observability::record_plan_phase(crate::observability::PlanPhase::TableScan, started);
         plan
     }
+}
+
+/// Earliest timestamp among the mem leg's rows; `i64::MIN` (no date can skip) when a
+/// batch carries no readable timestamp.
+fn earliest_row(partitions: &[Vec<RecordBatch>]) -> Option<i64> {
+    use datafusion::arrow::{array::AsArray, datatypes::TimestampMicrosecondType};
+    partitions
+        .iter()
+        .flatten()
+        .filter_map(|batch| match batch.column_by_name("timestamp").and_then(|column| column.as_primitive_opt::<TimestampMicrosecondType>()) {
+            Some(timestamps) => datafusion::arrow::compute::min(timestamps),
+            None => Some(i64::MIN),
+        })
+        .min()
 }
 
 #[cfg(test)]

@@ -1232,6 +1232,23 @@ impl MemBuffer {
             .min()
     }
 
+    /// Lower bound on every row timestamp buffered for `(project, table)`, any bucket: its
+    /// key start, routing min and true row min. A late merge-on-read version sits in a
+    /// current bucket at its row's original timestamp, so the routing span alone is too new.
+    pub fn min_row_micros(&self, project_id: &str, table_name: &str) -> Option<i64> {
+        let table = self.get_table(project_id, table_name)?;
+        table
+            .buckets
+            .iter()
+            .map(|b| {
+                b.key()
+                    .saturating_mul(bucket_duration_micros())
+                    .min(b.value().min_timestamp.load(Ordering::Relaxed))
+                    .min(b.value().row_min_ts.load(Ordering::Relaxed))
+            })
+            .min()
+    }
+
     /// Query with a text-match prefilter. Per bucket the snapshot and the ID
     /// set are taken under the same `batches` lock, so a concurrent insert
     /// cannot be visible in the data but absent from the IDs. With `node`

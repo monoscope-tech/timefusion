@@ -152,6 +152,23 @@ Measured 10-09 00:25 with the per-phase counters, single 30d widgets, second run
 
 ### R2 — Filtered charts and needles over 7–30 days
 
+**Diagnosed 10-09 02:00.** The shipbubble 7d chart grouped by `status_code` with an `http.status = 500` filter took 21–90 s. Grouped by bucket only, it took 0.3–1.3 s.
+
+| Measurement | Result |
+| --- | --- |
+| Sealed days only, status-grouped | No `DedupExec`; certified days skip it |
+| One sealed day | Filter pushed into parquet, 3.38M rows pruned, 65 MB, 0.8 s |
+| Window including today | Whole window goes through one `DedupExec` |
+
+- Count-only charts are served by the logical-count index without dedup, which is why grouping by bucket alone was fast.
+- Cause: the per-date split (certified dates skip dedup) existed only on the Delta-only path. Any window reaching into the MemBuffer deduped every sealed day.
+- Fix (branch `reads/per-date-split`):
+  - Extend the split to the mem ∪ delta path.
+  - A certified date skips only if every buffered row is later than the date's end. The floor is the minimum of the bucket metadata (key start, routing min, row min) and the leg's own rows, because a late merge-on-read version keeps its old timestamp.
+  - Guard: `per_date_skip_with_a_mem_leg_never_skips_a_buffered_version`. It goes red both ways: an unsafe skip returns the superseded version, and with the split disabled the dedup reads the sealed rows.
+
+Still open for R2: the `http.status = 500` *list* (sparse, no index) and needle text search at 30d.
+
 - Filter on dimension columns (status, service, kind, level): route through the tiers. Verify that each one routes.
 - Filter on non-dimension columns (route, `http.status`, text): this is a raw scan.
   - Measure cold and warm cost per day, and whether the cost is I/O misses or decode.
