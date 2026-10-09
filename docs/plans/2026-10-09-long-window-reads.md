@@ -76,6 +76,20 @@ At 30d, most filtered queries time out at 90 s.
   - 30d `top_resources` (25 s) and `http_by_status` stay raw until `endpoints_1m` backfills days 15–31.
   - The routed floor is about 3 s, of which planning is 0.7–1 s at 7d/14d and 1.6–2.7 s at 30d (`pgwire.slow_statement planned_us`). That is R5.
 
+- [x] **Endpoint analytics routes** (`5c8bbe85`, PR #333, deployed 01:21 10-09):
+  - The request chart went to the indexed histogram, which counts at plan time and ran before rollups. Rollups now go first.
+  - Requests-by-status had stacked CSE projections, and the matcher peeled only one. It now peels all of them.
+  - Prod, shipbubble endpoint `f7d8a198`, all 6 widgets route at every window:
+
+    | Window | Range |
+    | --- | --- |
+    | 7d | 0.7–2.1 s |
+    | 14d | 0.9–2.1 s |
+    | 30d | 1.2–2.4 s; requests 4.7 s on the first run |
+
+    By-status was 22 s and an error. The 30d request chart was 6.8 s.
+  - The e2e guard sends the six widgets verbatim and asserts the exact answer for each.
+
 ### R1 — Latest-N with a filter: stop reading every group's head file
 
 Prior art (research notes in section 5): ClickHouse read-in-order with a limit, the InfluxDB IOx `ProgressiveEvalExec`, and DataFusion's TopK dynamic filters and statistics-based file ordering.
@@ -122,7 +136,12 @@ Measured 10-09 00:25 with the per-phase counters, single 30d widgets, second run
 
 - Rewrite planning is about 75% of a routed widget.
 - Each hybrid rewrite is one tier leg plus one raw source scan per uncovered fringe. A plain raw scan plans in about 0.25–0.3 s.
-- Next release adds the `rollup_rewrite_logical` and `table_scan` phases, which split logical from physical planning and give scans per statement.
+- Measured with `adef5b59`:
+  - Logical rewrite planning is about 15 ms. The rest is physical: the legs' table scans.
+  - Each `table_scan` costs about 150–220 ms, and a routed 30d widget plans about 3 of them.
+  - `provider_scan_us_avg` is about 70 ms and `mem_plan_us_avg` about 15 ms, which leaves 70–110 ms per scan unattributed.
+- `7550ecb3` adds the `scan_certification`, `scan_tantivy`, `scan_provider` and `scan_mem_leg` sub-phases.
+- Leading hypothesis (from the code map): per-date certification walks over the whole unified snapshot. Fix candidate: one pass per snapshot version, grouped by (project, date), shared by every scan in a statement.
 
 
 - `timefusion_stats` component `planning` adds per-phase totals: route, match, source stats, output coverage, and rewrite planning.
