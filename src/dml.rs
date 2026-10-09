@@ -186,11 +186,6 @@ impl QueryPlanner for DmlQueryPlanner {
             .as_any()
             .downcast_ref::<SessionState>()
             .ok_or_else(|| datafusion::common::DataFusionError::Internal("DmlQueryPlanner requires a SessionState".into()))?;
-        match self.database.histogram_plan(logical_plan, session_state).await {
-            Ok(Some(plan)) => return self.planner.create_physical_plan(&plan, session_state).await,
-            Ok(None) => {}
-            Err(error) => tracing::warn!(%error, "indexed histogram declined; using ordinary planning"),
-        }
         let route_started = std::time::Instant::now();
         let routed = self.database.rollup_sql(logical_plan, session_state).await;
         crate::observability::record_plan_phase(crate::observability::PlanPhase::RollupRoute, route_started);
@@ -262,6 +257,14 @@ impl QueryPlanner for DmlQueryPlanner {
                     );
                 }
             }
+        }
+        // After the rollups, never before: a tier answers from precomputed rows, while the
+        // indexed histogram counts the whole window at planning time (an endpoint's 7-day
+        // request chart took 6.8 s that way on 10-08).
+        match self.database.histogram_plan(logical_plan, session_state).await {
+            Ok(Some(plan)) => return self.planner.create_physical_plan(&plan, session_state).await,
+            Ok(None) => {}
+            Err(error) => tracing::warn!(%error, "indexed histogram declined; using ordinary planning"),
         }
         match logical_plan {
             LogicalPlan::Dml(dml) if matches!(dml.op, WriteOp::Update | WriteOp::Delete) => {

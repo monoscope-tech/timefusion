@@ -1690,36 +1690,46 @@ pub(crate) fn inline_common_exprs(aggregate: &datafusion::logical_expr::Aggregat
 
     const CSE_PREFIX: &str = "__common_expr_";
 
-    let LogicalPlan::Projection(projection) = aggregate.input.as_ref() else { return None };
-    // A rename or a computed projection declines, as in `source_and_filters`.
-    let definitions = projection.expr.iter().try_fold(std::collections::HashMap::new(), |mut definitions, expr| match expr {
-        Expr::Alias(alias) if alias.name.starts_with(CSE_PREFIX) => {
-            definitions.insert(alias.name.clone(), alias.expr.as_ref().clone());
-            Some(definitions)
+    // CSE stacks one projection per nesting level (`coalesce(coalesce(x::text, …), …)`
+    // defines `__common_expr_1` from `__common_expr_2`), so peel every one of them. A
+    // rename or a computed projection declines, as in `source_and_filters`.
+    let mut definitions = std::collections::HashMap::new();
+    let mut input = &aggregate.input;
+    while let LogicalPlan::Projection(projection) = input.as_ref()
+        && projection.expr.iter().any(|expr| matches!(expr, Expr::Alias(alias) if alias.name.starts_with(CSE_PREFIX)))
+    {
+        for expr in &projection.expr {
+            match expr {
+                Expr::Alias(alias) if alias.name.starts_with(CSE_PREFIX) => {
+                    definitions.insert(alias.name.clone(), alias.expr.as_ref().clone());
+                }
+                Expr::Column(_) => {}
+                _ => return None,
+            }
         }
-        Expr::Column(_) => Some(definitions),
-        _ => None,
-    })?;
+        input = &projection.input;
+    }
     (!definitions.is_empty()).then_some(())?;
-    let inline = |expr: &Expr| {
-        expr.clone()
-            .transform_up(|node| {
-                Ok(match &node {
-                    Expr::Column(column) => definitions.get(&column.name).map_or(Transformed::no(node), |definition| Transformed::yes(definition.clone())),
-                    _ => Transformed::no(node),
-                })
+    let substitute = |expr: Expr| {
+        expr.transform_up(|node| {
+            Ok(match &node {
+                Expr::Column(column) => definitions.get(&column.name).map_or(Transformed::no(node), |definition| Transformed::yes(definition.clone())),
+                _ => Transformed::no(node),
             })
-            .map(|transformed| transformed.data)
-            .ok()
-            // One bottom-up pass cannot resolve an alias defined via another
-            // alias, so decline a half-substituted shape.
+        })
+        .map(|transformed| transformed.data)
+        .ok()
+    };
+    // One pass per level resolves an alias defined via another; a shape still naming a
+    // CSE alias after that is half-substituted and declines.
+    let inline = |expr: &Expr| {
+        (0..=definitions.len())
+            .try_fold(expr.clone(), |expr, _| substitute(expr))
             .filter(|inlined| !inlined.column_refs().iter().any(|column| column.name.starts_with(CSE_PREFIX)))
     };
     let group_expr = aggregate.group_expr.iter().map(inline).collect::<Option<Vec<_>>>()?;
     let aggr_expr = aggregate.aggr_expr.iter().map(inline).collect::<Option<Vec<_>>>()?;
-    Aggregate::try_new(projection.input.clone(), group_expr, aggr_expr)
-        .ok()
-        .filter(|rebuilt| rebuilt.schema.has_equivalent_names_and_types(&aggregate.schema).is_ok())
+    Aggregate::try_new(input.clone(), group_expr, aggr_expr).ok().filter(|rebuilt| rebuilt.schema.has_equivalent_names_and_types(&aggregate.schema).is_ok())
 }
 
 /// An aggregate over a derived table that unnests one list column — monoscope's

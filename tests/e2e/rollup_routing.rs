@@ -29,9 +29,9 @@ async fn monoscope_overview_widgets_route_to_rollup_tiers() -> anyhow::Result<()
     ] {
         client
             .execute(
-                "INSERT INTO otel_logs_and_spans (project_id, timestamp, id, hashes, summary, name, kind, status_code, attributes___http___response___status_code) \
-                 VALUES ('e2e_project', $1, $2, ARRAY[]::text[], ARRAY['fixture'], 'GET', $3, $4, $5)",
-                &[&(noon + chrono::Duration::minutes(minute)), &format!("span-{minute}"), &kind, &status, &http_status],
+                "INSERT INTO otel_logs_and_spans (project_id, timestamp, id, hashes, summary, name, kind, status_code, attributes___http___response___status_code, duration) \
+                 VALUES ('e2e_project', $1, $2, $3, ARRAY['fixture'], 'GET', $4, $5, $6, 100000000)",
+                &[&(noon + chrono::Duration::minutes(minute)), &format!("span-{minute}"), &if kind == "server" { vec!["ep1"] } else { vec![] }, &kind, &status, &http_status],
             )
             .await?;
     }
@@ -42,7 +42,7 @@ async fn monoscope_overview_widgets_route_to_rollup_tiers() -> anyhow::Result<()
     for _ in 0..2 {
         env.db().dedup_today_partitions(&table, "otel_logs_and_spans", "otel_logs_and_spans").await?;
     }
-    for tier in ["dashboard_1m_v4", "endpoints_1m"] {
+    for tier in ["dashboard_1m_v4", "endpoints_1m", "hashes_30m"] {
         let built = env.db().run_unit_once("otel_logs_and_spans", "e2e_project", day, Operation::BaseRollup, 24, 0, Some(tier)).await?;
         assert_eq!(built.state, Some(TaskState::Complete), "{tier} must be published");
     }
@@ -77,6 +77,57 @@ async fn monoscope_overview_widgets_route_to_rollup_tiers() -> anyhow::Result<()
                 "select name, count(*)::bigint from otel_logs_and_spans where {scope} and name is not null and kind = 'server' group by name order by count(*) desc limit 20"
             ),
             vec!["GET 5"],
+        ),
+        // The endpoint dashboard (monoscope endpoint-stats.yaml), one endpoint's hash.
+        (
+            "endpoint requests",
+            format!(
+                "select extract(epoch from time_bucket('1 hour', timestamp))::integer, 'value', count(*)::float as count_ from otel_logs_and_spans \
+                 where {scope} and ((array_has(hashes, 'ep1'))) group by time_bucket('1 hour', timestamp) order by time_bucket('1 hour', timestamp) desc"
+            ),
+            vec!["value 5.0"],
+        ),
+        (
+            "endpoint error rate",
+            format!(
+                "select extract(epoch from time_bucket('1 hour', timestamp))::integer, 'value', round((coalesce(((count(*) filter (where coalesce(attributes___http___response___status_code, 0) >= 500)::float * 100.0) \
+                 / nullif(count(*)::float, 0)), 0))::numeric, 2)::float as round_ from otel_logs_and_spans where {scope} and ((array_has(hashes, 'ep1'))) group by time_bucket('1 hour', timestamp)"
+            ),
+            vec!["value 40.0"],
+        ),
+        (
+            "endpoint requests by status",
+            format!(
+                "select extract(epoch from time_bucket('1 hour', timestamp))::integer, coalesce(coalesce((attributes___http___response___status_code)::text, 'unknown')::text, 'null'), \
+                 count(*)::float as count_ from otel_logs_and_spans where {scope} and ((array_has(hashes, 'ep1') and attributes___http___response___status_code is not null)) \
+                 group by time_bucket('1 hour', timestamp), coalesce(coalesce((attributes___http___response___status_code)::text, 'unknown')::text, 'null') limit 10000"
+            ),
+            vec!["200 2.0", "404 1.0", "500 1.0", "503 1.0"],
+        ),
+        (
+            "endpoint p95",
+            format!(
+                "select extract(epoch from time_bucket('1 hour', timestamp))::integer, 'value', (coalesce((coalesce(approx_percentile(0.95, percentile_agg(cast(duration as double precision))), 0)::float \
+                 / nullif(1000000, 0)), 0))::float as arith_ from otel_logs_and_spans where {scope} and ((array_has(hashes, 'ep1') and duration is not null)) group by time_bucket('1 hour', timestamp)"
+            ),
+            vec!["value 100.0"],
+        ),
+        (
+            "endpoint status table",
+            format!(
+                "select coalesce(attributes___http___response___status_code::text, 'unknown') as status_code, count(*)::text as count, \
+                 round((count(*)::float * 100.0 / greatest(1, sum(count(*)) over ())::float)::numeric, 1)::float::text as pct, round((avg(duration) / 1e6)::numeric, 2)::text as avg_latency \
+                 from otel_logs_and_spans where {scope} and hashes @> array['ep1'] group by attributes___http___response___status_code order by count(*) desc limit 20"
+            ),
+            vec!["20.0 100.00", "20.0 100.00", "20.0 100.00", "40.0 100.00"],
+        ),
+        (
+            "endpoint apdex",
+            format!(
+                "select round((sum(case when duration <= 500000000 then 1.0 when duration <= 2000000000 then 0.5 else 0 end)) / greatest(1, count(*))::numeric, 2)::float \
+                 from otel_logs_and_spans where {scope} and hashes @> array['ep1'] and duration is not null"
+            ),
+            vec!["1.0"],
         ),
     ] {
         let before = hits();
