@@ -76,6 +76,8 @@ pub struct SearchStats {
     /// those dropped because the warm queue was full.
     pub cold_warms_spawned: AtomicU64,
     pub cold_warms_dropped: AtomicU64,
+    /// Cold in-window indexes a search left out while its warm ones still pruned.
+    pub cold_indexes_left_raw: AtomicU64,
 }
 
 impl SearchStats {
@@ -367,10 +369,11 @@ impl TantivySearchService {
     /// `search_with_stats`, but the `Err` says WHY it could not answer: the
     /// refusals want opposite fixes (backfill / bigger cap / reindex).
     ///
-    /// Without `wait_for_cold`, a window with any in-window index not installed
-    /// locally is refused as `delta_cold_index` and its missing blobs are warmed
-    /// in the background: the prefilter only accelerates a scan that evaluates
-    /// the predicate itself, so it must never make the query wait on downloads.
+    /// Without `wait_for_cold`, an in-window index not installed locally is left out
+    /// and warmed in the background: its files drop out of `covered_files`, so the
+    /// scan reads them as if unindexed, with the predicate itself. The prefilter
+    /// only accelerates that scan, so it must never wait on downloads. A window with
+    /// no warm index at all is refused as `delta_cold_index`.
     pub async fn search_detailed(
         self: &Arc<Self>, table: &str, project_id: &str, node: &PredNode, max_hits: usize, time_range: Option<(i64, i64)>, wait_for_cold: bool,
     ) -> Result<std::result::Result<SearchResult, &'static str>> {
@@ -398,12 +401,12 @@ impl TantivySearchService {
         }
         // Coverage ignores the time-prune below: a pruned entry still covers its
         // file, its rows are merely out of window (see SearchResult docs).
-        let covered_files: HashSet<String> = current().filter(|(_, e)| usable_entry(e)).flat_map(|(_, e)| e.covered_files.iter().cloned()).collect();
+        let mut covered_files: HashSet<String> = current().filter(|(_, e)| usable_entry(e)).flat_map(|(_, e)| e.covered_files.iter().cloned()).collect();
         // Time-prune: skip indexes whose timestamp span can't overlap the query
         // window (no blob download). Conservative on unknown bounds.
         // Work item: (file_uuid, blob_path, rows, entry covered_files, ordinals_valid, window).
         // `window` is set only when the entry's span sticks out of the query window.
-        let work: Vec<_> = current()
+        let mut work: Vec<_> = current()
             .filter_map(|(key, e)| {
                 let blob_path = e.index.as_ref().filter(|_| entry_overlaps(e.min_timestamp_micros, e.max_timestamp_micros, time_range))?;
                 let window =
@@ -412,14 +415,18 @@ impl TantivySearchService {
             })
             .collect();
         if !wait_for_cold {
-            let cold: Vec<_> = work
-                .iter()
-                .filter(|(uuid, blob, ..)| !has_any_segment(&self.cache_dir(table, project_id, uuid, blob)))
-                .map(|(uuid, blob, ..)| (uuid.clone(), blob.clone()))
-                .collect();
+            let cold;
+            (work, cold) = work.into_iter().partition(|(uuid, blob, ..)| has_any_segment(&self.cache_dir(table, project_id, uuid, blob)));
             if !cold.is_empty() {
-                self.warm_in_background(table, project_id, cold);
-                return Ok(Err("delta_cold_index"));
+                // All-or-nothing here made one cold day of a 30-day window full-scan all 30.
+                for (.., covered, _, _) in &cold {
+                    covered.iter().for_each(|file| _ = covered_files.remove(file));
+                }
+                SearchStats::add(&self.stats.cold_indexes_left_raw, cold.len() as u64);
+                self.warm_in_background(table, project_id, cold.into_iter().map(|(uuid, blob, ..)| (uuid, blob)).collect());
+                if work.is_empty() {
+                    return Ok(Err("delta_cold_index"));
+                }
             }
         }
 

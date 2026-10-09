@@ -1205,6 +1205,7 @@ impl StatsTableProvider {
                 "cache_seeded" => s.cache_seeded.load(Relaxed),
                 "cache_seed_failures" => s.cache_seed_failures.load(Relaxed),
                 "cold_warms_spawned" => s.cold_warms_spawned.load(Relaxed),
+                "cold_indexes_left_raw" => s.cold_indexes_left_raw.load(Relaxed),
                 "cold_warms_dropped" => s.cold_warms_dropped.load(Relaxed),
                 // Raw monotonic microseconds: each `*_us_avg` above divides by its
                 // own denominator, so avg*count mixes denominators and cannot be

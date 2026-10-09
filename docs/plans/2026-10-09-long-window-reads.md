@@ -122,6 +122,27 @@ Status:
 
 The `http.status = 500` list stays slow because the filter is sparse, so the merge widens across most files. That is R2 territory (index prefilter or bloom).
 
+### R7 — Needle searches (owner decision 10-09: partial prefilter, then a hotcache)
+
+**Prior art:**
+- **Quickwit's hotcache:** stores the bytes needed to open an index (under 0.1% of a split) in the split footer, keeps them resident, then reads term-dictionary blocks and postings by byte range. A cold split costs about 3 round trips.
+- **ClickHouse and Loki n-gram blooms:** a poor fit. A per-file trigram set saturates at about 1M rows, Loki 3.3 dropped n-gram blooms for build cost, and ClickHouse deprecated `ngrambf` for an inverted text index.
+
+**Our state:**
+- A tantivy index is one `tar.zst` blob per parquet file, installed whole before any search. A cold blob fetch averages 1.14 s; a manifest load averages 544 ms with a 49% hit rate.
+- Any cold in-window index refused the whole prefilter (`search.rs`), so one cold day of a 30d window full-scanned all 30.
+
+**Steps:**
+- [x] **Partial prefilter** (branch `reads/partial-prefilter`):
+  - Cold indexes are left out and warmed in the background, and their files are scanned with the predicate.
+  - The warm indexes still prune.
+  - Counter `tantivy.cold_indexes_left_raw`.
+  - Guard `a_cold_index_leaves_only_its_own_files_unpruned`, red with the old refusal.
+- [ ] **Range-readable indexes with a hotcache, behind a flag.**
+  - Store each index as range-readable files with a hotcache footer, and implement a tantivy `Directory` over object-store ranges, as `quickwit-directories` does.
+  - Keep the footers resident under a byte budget.
+  - A/B the change within one process before turning it on.
+
 ### R5 — Planning cost of routed widgets
 
 Measured 10-09 00:25 with the per-phase counters, single 30d widgets, second run:

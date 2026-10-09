@@ -788,8 +788,10 @@ async fn a_cold_window_skips_the_prefilter_and_warms_in_the_background() {
     store.disarm();
     let r = tokio::time::timeout(std::time::Duration::from_secs(10), async {
         loop {
+            // Partial while one blob is still installing: the warm index prunes alone.
             match search(None).await.unwrap() {
-                Ok(r) => break r,
+                Ok(r) if r.covered_files.len() == 2 => break r,
+                Ok(_) => {}
                 Err(reason) => assert_eq!(reason, "delta_cold_index"),
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -801,6 +803,24 @@ async fn a_cold_window_skips_the_prefilter_and_warms_in_the_background() {
     ids.sort();
     assert_eq!(ids, ["a", "c"]);
     assert_eq!(fetches(), 2, "each blob is installed once, in the background");
+}
+
+/// One cold index must not cost the warm ones their pruning (10-09: a 30-day needle search
+/// full-scanned all 30 days because any cold index refused the whole window). The cold
+/// index's files drop out of `covered_files`, so the scan reads them with the predicate.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cold_index_leaves_only_its_own_files_unpruned() {
+    let env = Env::prod("otel_logs_and_spans", "p-partial-cold");
+    env.publish(&[(1_000_000, "a", "ERROR"), (1_000_001, "b", "INFO")], &["warm-file"]).await;
+    env.publish(&[(2_000_000, "c", "ERROR")], &["cold-file"]).await;
+    let error = level_error_node();
+    // Installs only the first index: the second's span is outside this window.
+    assert!(env.search.search_detailed(env.table, env.project, &error, 100, Some((1_000_000, 1_000_010)), true).await.unwrap().is_ok());
+
+    let result = env.search.search_detailed(env.table, env.project, &error, 100, None, false).await.unwrap().expect("the warm index still prunes");
+    assert_eq!(result.hits.iter().map(|h| h.id.as_str()).collect::<Vec<_>>(), ["a"]);
+    assert!(result.covered_files.contains("warm-file") && !result.covered_files.contains("cold-file"), "{:?}", result.covered_files);
+    assert_eq!(env.search.stats.cold_indexes_left_raw.load(Relaxed), 1);
 }
 
 /// Prod 2026-09-30: a sealed-day index spans the whole day, so a fringe leg over a few hours
