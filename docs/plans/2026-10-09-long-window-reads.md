@@ -274,7 +274,12 @@ Measured 10-09 00:25 with the per-phase counters, single 30d widgets, second run
 
 - ⇒ The per-scan replay over the whole snapshot is cheap. Cost scales with the files a scan SELECTS (~10 µs each), so prod's ~95 ms per scan means the legs select thousands of files.
 - The lever is fewer, larger files in the windows widgets read: rollup-tier and today-partition consolidation. Caching kernel replay is not the lever.
-- Next: count files selected per leg on prod (`scan.pruned_files_total` / provider file-group counts) for a 7d endpoint widget.
+- **Scales with schema width too.** With 2,500 selected files: 32 columns → 30 ms, 200 columns → 62 ms (~25 µs per file).
+- **Profile** (macOS `sample`): the hot path is DataFusion's `compute_all_files_statistics` merge (`precision_min`/`precision_max` over `ScalarValue`, `ColumnStatistics` clone and drop), plus building every file's all-column `ColumnStatistics` in the fork's `extract_file_statistics`. Kernel replay and stats JSON parsing are minor.
+- **Prod file counts** (shipbubble raw objects, an upper bound before vacuum): 10-01..10-05 are 2 files/day (consolidated), 10-06..10-09 are 477–1,348/day. Recent unconsolidated days drive both planning and cold round trips.
+- **Levers:**
+  - Fork: keep per-file min/max only for projected, sort and partition columns before the merge. Careful: BoundedMerge and ordering validation read per-file timestamp min/max, and DataFusion may answer aggregates from statistics.
+  - Maintenance: consolidate recent days sooner.
 
 ### R2 — Filtered charts and needles over 7–30 days
 
