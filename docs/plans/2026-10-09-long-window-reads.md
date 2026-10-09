@@ -167,7 +167,33 @@ Measured 10-09 00:25 with the per-phase counters, single 30d widgets, second run
   - A certified date skips only if every buffered row is later than the date's end. The floor is the minimum of the bucket metadata (key start, routing min, row min) and the leg's own rows, because a late merge-on-read version keeps its old timestamp.
   - Guard: `per_date_skip_with_a_mem_leg_never_skips_a_buffered_version`. It goes red both ways: an unsafe skip returns the superseded version, and with the split disabled the dedup reads the sealed rows.
 
-Still open for R2: the `http.status = 500` *list* (sparse, no index) and needle text search at 30d.
+**Shipped** in `82af1ddd` (PR #335, deployed 02:37 10-09). On prod, `dedup_skipped_per_date` reached 134 within 30 minutes. 7d status-grouped charts with filters, `http.status = 500` and route:
+
+| State | Before | After |
+| --- | --- | --- |
+| Warm | 21–90 s | 0.8 s |
+| Cold | — | 26–38 s |
+
+The cold cost is round trips, below.
+
+**Cold raw scans are bound by round trips (measured 03:00 10-09).**
+- Object-store GET latency below the cache (`timefusion.store.request_ms`, op `get_range`, 6 h): p50 350–600 ms, p95 0.8–1.25 s, p99 1.1–1.7 s.
+- In-flight `get_range` averaged only 1–8, so the pipe is not saturated: latency is per request.
+- The 7d cold chart made 2,174 GETs and read 3.6 GB from the store; warm, the same query is served 969 MB from cache.
+  - 1 MB range alignment therefore amplifies about 3.6× (not 40×; `bytes_served` counts hits only).
+  - The real cost is about 90 sequential GETs per stream.
+- Cause: rows are written in row groups of about 36k rows (the 128 MB decoded cap on wide rows), so a file has about 17 row groups. The parquet reader fetches each row group's column chunks separately, one round after another.
+- Cache churn is low. A quiet 6-minute window read 2.6 GB from the store but admitted only 0.17 GB, with 118 evictions. Warm state survives, and restarts keep the disk cache (158 blocks recovered).
+
+**Next lever (owner decision: fork change) — column-chunk read-ahead.**
+- Design: in the fork's `InstrumentedParquetFileReader::get_byte_ranges`, map the requested ranges to (row group, column) chunks using the file's metadata.
+- Add the same columns for the next row groups to the SAME batched `get_byte_ranges` call, under a per-reader byte budget of about 16 MB, and serve later requests that fall inside a buffered chunk.
+- No spawned tasks, so the scan's cache-bypass scope and permits still apply.
+- Expected: about 90 sequential rounds per stream become about 20, i.e. cold 7d charts of about 30 s fall to 5–8 s.
+- Process: fork commit on the branch carrying pin `ec8319c` (`tf-read-skipping-predicate`), land it on the integration branch `timefusion-upgrade-55-dv` too, pin bump, full signoff.
+- Alternative without a fork change: larger row groups for sealed rewrites only. This trades against the decode-memory bound the 128 MB cap exists for.
+
+Still open for R2: the `http.status = 500` *list* (sparse, no index) and needle text search at 30d (cold tantivy indexes are skipped by design, so it is a full scan).
 
 - Filter on dimension columns (status, service, kind, level): route through the tiers. Verify that each one routes.
 - Filter on non-dimension columns (route, `http.status`, text): this is a raw scan.
@@ -183,6 +209,17 @@ Still open for R2: the `http.status = 500` *list* (sparse, no index) and needle 
 - GC now keeps any segment that holds an unsealed writer block. An idle topic can therefore pin a 1 GB segment until it writes 10 MB.
 - The bound is about one segment per writer: 30 topics × 4 shards, about 124 GB, against 793 GB free.
 - Watch `wal.files` and `wal.disk_mb`. Fix properly by having GC seal and roll a writer whose segment aged out.
+
+### Scorecard 10-09 02:00 (build `7550ecb3`, shipbubble, 2 rounds, warm)
+
+| Window | p50 | Slowest widget |
+| --- | --- | --- |
+| 7d | 0.50 s | 2.4 s |
+| 14d | 0.54 s | 1.6 s |
+| 30d | 0.65 s | 2.2 s |
+
+- These are all 15 overview and log-explorer shapes. The 10-08 baseline had 90 s timeouts on `error_rate` and `http_by_status`, and 67 s for `top_resources`.
+- Endpoint analytics: all 6 widgets 0.7–2.4 s at 7d, 14d and 30d.
 
 ### R4 — Monitoring (continuous)
 
