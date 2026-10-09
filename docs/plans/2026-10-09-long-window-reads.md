@@ -205,6 +205,19 @@ The cold cost is round trips, below.
 - TF `RuntimeFlag::TimefusionParquetReadAhead` (config `timefusion_parquet_read_ahead`, default off) is applied at boot and on `FLAG SET`.
 - A/B protocol: alternate `FLAG SET timefusion_parquet_read_ahead ON/OFF` within one process. Each arm runs on fresh cold (date, column) pairs from the same population. Compare time and `parquet.bytes_read` deltas.
 
+**A/B result (10-09 05:15–05:30, process 36 min old):**
+- Method: 24 day×method pairs on shipbubble days 09-26..10-01, alternating `FLAG SET timefusion_parquet_read_ahead` ON/OFF.
+- Cold pairs (DELETE, PUT, OPTIONS; HEAD pairs were already cached and excluded):
+
+  | Arm | Pairs | Average | Range | Parquet `bytes_read` per query |
+  | --- | --- | --- | --- | --- |
+  | ON | 9 | 3.4 s | 1.9–5.6 s | higher |
+  | OFF | 9 | 2.9 s | 2.2–3.7 s | lower |
+
+- **No benefit; the flag stays OFF.** Under filter pushdown the reader's round trips are mostly sparse page reads of projected columns, which read-ahead does not cover, while read-ahead adds whole-chunk bytes for row groups pruning would skip.
+- A real fix needs the opener's access plan, or larger row groups for sealed rewrites.
+- Side finding: `FLAG` fails over the extended protocol, i.e. a prepared statement (psycopg auto-prepares after 5 repeats). Only the simple protocol intercepts it.
+
 **Original proposal — column-chunk read-ahead.**
 - Design: in the fork's `InstrumentedParquetFileReader::get_byte_ranges`, map the requested ranges to (row group, column) chunks using the file's metadata.
 - Add the same columns for the next row groups to the SAME batched `get_byte_ranges` call, under a per-reader byte budget of about 16 MB, and serve later requests that fall inside a buffered chunk.
