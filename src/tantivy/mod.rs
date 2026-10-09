@@ -24,7 +24,7 @@ use std::{
     sync::Arc,
 };
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use arrow::{
     array::{Array, ArrayRef, ListArray, StringArray, StringViewArray, StructArray, TimestampMicrosecondArray},
     datatypes::DataType,
@@ -1240,8 +1240,14 @@ pub fn pack_dir(dir: &Path, level: i32) -> Result<Bytes> {
 
 /// Stream-unpack a tar.zst blob into `dest`: peak memory is the decoder's
 /// buffers, never the blob or its decompressed tar.
-pub fn unpack_to_dir(blob: impl std::io::Read, dest: &Path) -> Result<()> {
+pub fn unpack_to_dir(mut blob: impl std::io::Read, dest: &Path) -> Result<()> {
     std::fs::create_dir_all(dest).context("mkdir dest")?;
+    let mut magic = [0; 4];
+    blob.read_exact(&mut magic).context("read blob magic")?;
+    let blob = std::io::Read::chain(&magic[..], blob);
+    if hotcache::is_bundle(&magic) {
+        return hotcache::unpack_bundle(blob, dest).context("bundle unpack");
+    }
     tar::Archive::new(zstd::Decoder::new(blob).context("zstd decoder")?).unpack(dest).context("tar unpack")
 }
 
@@ -1251,6 +1257,11 @@ pub fn unpack_to_dir(blob: impl std::io::Read, dest: &Path) -> Result<()> {
 /// until a manual reindex. Stages into a `RamDirectory` — `zstd::decode_all`
 /// already holds the whole tar in memory, so writing it to disk is pure waste.
 pub fn verify_blob(blob: &[u8]) -> Result<()> {
+    if hotcache::is_bundle(blob) {
+        let dir = hotcache::BundleDirectory::in_memory(Bytes::copy_from_slice(blob))?;
+        ensure!(dir.bundle_len() == blob.len() as u64, "bundle is {} bytes, its table describes {}", blob.len(), dir.bundle_len());
+        return open_index_in(dir)?.reader().map(drop).map_err(|e| anyhow!("open bundle reader: {e}"));
+    }
     let tar_bytes = zstd::decode_all(blob).context("zstd decode")?;
     let staged = tantivy::directory::RamDirectory::create();
     let mut files = 0usize;
@@ -1279,7 +1290,7 @@ pub fn open_index(dir: &Path) -> Result<Index> {
     open_index_in(MmapDirectory::open(dir).map_err(|e| anyhow!("open mmap dir: {e}"))?)
 }
 
-fn open_index_in(dir: impl tantivy::Directory) -> Result<Index> {
+pub fn open_index_in(dir: impl tantivy::Directory) -> Result<Index> {
     let index = Index::open(dir).map_err(|e| anyhow!("open index: {e}"))?;
     // Registry is per-Index and not persisted: the reader must re-register the
     // same chains the writer used, or lookups silently fall back to default.

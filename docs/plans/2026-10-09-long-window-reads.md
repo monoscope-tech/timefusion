@@ -177,6 +177,18 @@ The `http.status = 500` list stays slow because the filter is sparse, so the mer
   - Format decision (10-09): prod holds about 3.2 TB of indexes across the top eight projects (shipbubble 466 GB), so an uncompressed bundle (+57%) costs about 1.9 TB. Per-file zstd ratios on the sample: `.idx` 1691→1097 MB, `.term` 251→158, `.store` 94→58, `.fast` incompressible. ⇒ Block-compress the files (zstd, 64–128 KB blocks, offset table). Postings ranges average about 90 KB, so read amplification stays under 2x.
   - Hotcache = the ~54 KB open set (meta, composite file tables, store footer) as one contiguous footer, resident in foyer: 12k indexes for a 30d window ≈ 650 MB. Term dictionaries and postings are NOT resident; they go through the foyer range store like any cached range. Text-field FSTs (~2.7 MB per 2M-row file) times 12k files does not fit in memory.
   - A cold text search is two batched GETs (footer + FSTs, then postings), about 1 s: latency parity with today's 1.14 s blob fetch. The win is bytes moved and resident (the 09-30 OOM was whole-blob installs). Metric: `tantivy.blob_fetch_bytes` (added) against range-read bytes.
+  - **Bundle format** (branch `tantivy/bundle`, readers only, nothing writes it yet): `[TFB1][u32 table len][table json][hot bytes][zstd 64 KB blocks…]`. The leading magic lets the existing whole-install path stream-unpack a bundle like a `tar.zst`, so the rollout is: (1) every binary can read bundles, (2) flip the writer, (3) range reads behind the flag. `verify_blob` opens a bundle through `BundleDirectory` and checks its length against the table.
+  - Measured on the prod sample (shipbubble 09-30, 2.06M rows): bundle **1326 MB vs tar.zst 1380 MB**, packed in 11.4 s (debug build, zstd-3). Head 49 KB; opening a reader makes **0** reads past it. Hit counts match the unpacked index exactly.
+
+    | Query | Reads | Compressed bytes |
+    |---|---|---|
+    | `body`="timeout" | 12 | 1.6 MB |
+    | `summary`="connection refused" | 20 | 5.8 MB |
+    | `attributes`="shipment" | 13 | 2.8 MB |
+    | `name`="GET" | 8 | 0.7 MB |
+    | `level`="ERROR" | 8 | 0.36 MB |
+
+  - Next: those reads are sequential (8–20 round trips ≈ 3–8 s cold per index). Before any flag flips, add a block cache (repeated term-dictionary reads) and a batched warm-up so a cold search is two round trips.
   - Known limitation: tantivy 0.22 reads a field's term dictionary whole, so a trace/span id lookup reads that field's 33–36 MB FST per file. That is 40x less than today's blob, but not cheap. Out of scope for this arc.
   - ⇒ A hotcache of text-field term dictionaries is about 3 MB per 2M-row file and fits a resident budget. The postings are what range reads must avoid fetching whole.
   - ⇒ Side win: ID term dictionaries (about 250 MB per file) duplicate the bloom sidecars, and `id` is indexed twice. Trimming them from new builds shrinks every blob, which speeds today's cold installs too.

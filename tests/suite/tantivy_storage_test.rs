@@ -223,3 +223,55 @@ async fn a_manifest_publish_rewrites_only_its_date_and_a_window_reads_only_its_d
     assert_eq!(root["shards"], serde_json::json!(["2026-10-02", "undated"]));
     Ok(())
 }
+
+#[tokio::test]
+async fn a_bundle_opens_from_its_head_and_answers_like_the_unpacked_index() -> anyhow::Result<()> {
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+
+    use bytes::Bytes;
+    use timefusion::tantivy::{
+        MergeMode, build_to_dir,
+        hotcache::{BundleDirectory, BundleSource, pack_bundle},
+        open_index, open_index_in,
+        search::{PredsQuery, build_node_query},
+        udf::{PredNode, TextMatchPred},
+    };
+    #[derive(Debug)]
+    struct Counting(Bytes, AtomicUsize);
+    impl BundleSource for Counting {
+        fn read(&self, range: std::ops::Range<u64>) -> std::io::Result<Bytes> {
+            self.1.fetch_add(1, Relaxed);
+            self.0.read(range)
+        }
+    }
+    let rows: Vec<(i64, String, String)> = (0..50_000).map(|i| (i, format!("id{i}"), format!("L{}", i % 5_000))).collect();
+    let rows: Vec<(i64, &str, &str)> = rows.iter().map(|(t, id, level)| (*t, id.as_str(), level.as_str())).collect();
+    let built = TempDir::new()?;
+    build_to_dir(&logs_schema(), [logs_batch(&rows, false)], built.path(), MergeMode::Now)?;
+    let blob = pack_bundle(built.path(), 3)?;
+    verify_blob(&blob)?;
+    assert!(verify_blob(&blob[..blob.len() - 1]).is_err(), "a truncated bundle must be rejected");
+
+    let unpacked = TempDir::new()?;
+    unpack_to_dir(&blob[..], unpacked.path())?;
+    for entry in std::fs::read_dir(built.path())? {
+        let name = entry?.file_name();
+        assert_eq!(std::fs::read(built.path().join(&name))?, std::fs::read(unpacked.path().join(&name))?, "{name:?} round-trips");
+    }
+
+    let source = Arc::new(Counting(blob.clone(), AtomicUsize::new(0)));
+    let bundle = open_index_in(BundleDirectory::new(blob, source.clone())?)?;
+    let searcher = bundle.reader()?.searcher();
+    assert_eq!(source.1.load(Relaxed), 0, "opening a reader must read only the head");
+    let plain = open_index(unpacked.path())?;
+    for (column, query, expected) in [("level", "L7", 10), ("level", "L4999", 10), ("level", "nope", 0), ("id", "id31337", 1)] {
+        let node = PredNode::Leaf(TextMatchPred { column: column.into(), query: query.into() });
+        let count = |index: &tantivy::Index, searcher: &tantivy::Searcher| -> anyhow::Result<usize> {
+            let PredsQuery::Query(q) = build_node_query(index, &node)? else { anyhow::bail!("{column} is not indexed") };
+            Ok(searcher.search(&*q, &tantivy::collector::Count)?)
+        };
+        assert_eq!((count(&bundle, &searcher)?, count(&plain, &plain.reader()?.searcher())?), (expected, expected), "{column}={query}");
+    }
+    assert!(source.1.load(Relaxed) > 0, "term lookups read past the head");
+    Ok(())
+}
