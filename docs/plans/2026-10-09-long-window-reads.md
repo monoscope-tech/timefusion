@@ -402,6 +402,28 @@ Still open for R2: the `http.status = 500` *list* (sparse, no index) and needle 
 - These are all 15 overview and log-explorer shapes. The 10-08 baseline had 90 s timeouts on `error_rate` and `http_by_status`, and 67 s for `top_resources`.
 - Endpoint analytics: all 6 widgets 0.7–2.4 s at 7d, 14d and 30d.
 
+### Scorecard 10-09 21:30 (build `729d54c2`, shipbubble, warm)
+
+| Query | 7d | 14d | 30d | Was (this morning / afternoon) |
+| --- | --- | --- | --- | --- |
+| Needle `name ilike '%webhook%'` (latest 501) | 4.5 s | 6.5 s | 4.4–4.9 s | 34–41 s / 90 s timeout |
+| Dashboard widgets | 2–3 s | 2–3 s | 2.5–3.5 s | 0.5–2.4 s (fewer restarts) |
+| Endpoint widgets | 1.8–2.7 s | 2–3.1 s | 2.5–5.7 s | 1.3–2.5 s |
+| Log explorer list | 0.7–1.4 s | 0.7 s | 0.8–1.0 s | — |
+
+Shipped today after the call:
+- #348: on-demand conversion + Delta planning timers.
+- #349: unseeded-replay counter.
+- #350: skip/retire fragments.
+- #351: no second replay for Ignore selections.
+- #352: parallel per-index search.
+
+**Open levers, in order:**
+1. **24h is shipbubble's default window and misses the rollup on `stale_coverage`.** Today's slices go stale continuously from hashes UPDATE version appends, so 24h `var_service`/overview reads raw: 2.8 s warm, **40–83 s on the first query after a restart**. 7d routes hybrid. This is the rollup-freshness track (`tf_rollup_hits_today_window`). Fewer restarts help meanwhile.
+2. **Endpoint widget execution** (~1.5 s of ~2.6 s) is the hybrid raw leg over today's not-yet-rolled-up data.
+3. **Delta provider planning, ~31 ms per scan**: replay 21 ms (seeded) and footer ordering. Maintenance scans (`compact.rs:861`, `Error` policy) still pay the second replay.
+4. **Needle floor (~4.5 s at 30d)**: tantivy prepare/fan-out long poles over ~60 large complete indexes, plus manifest load 0.5 s.
+
 ### R4 — Monitoring (continuous)
 
 - TimeFusion dashboard: monoscope project `87576849`, dashboard `8e2deff2`.
