@@ -11846,3 +11846,26 @@ async fn otel_metrics_dedup_collapses_on_its_series_key_via_the_streaming_collap
     assert!(audited() > before, "the rewrite must take the streaming collapse, not the ROW_NUMBER window");
     Ok(())
 }
+
+/// A Delta-backed query records where its provider scan planned, so `timefusion_stats`
+/// can attribute the per-scan planning cost.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_delta_scan_records_its_planning_phases() -> Result<()> {
+    use deltalake::delta_datafusion::parquet_metrics::{PlanPhase, snapshot};
+    let (db, ctx, prefix) = setup_test_database().await?;
+    let project_id = format!("plan_phases_{prefix}");
+    let ts = chrono::Utc::now().timestamp_micros() - 3_600_000_000;
+    let date = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(ts).unwrap().date_naive().to_string();
+    let rows = vec![serde_json::json!({"timestamp": ts, "id": "a", "name": "n", "project_id": project_id, "date": date, "summary": []})];
+    db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![json_to_batch_for("otel_logs_and_spans", rows)?], true, None).await?;
+    let before = snapshot().plan_phase_us;
+    ctx.sql(&format!("SELECT id FROM otel_logs_and_spans WHERE project_id = '{project_id}' AND timestamp > to_timestamp_micros({})", ts - 1))
+        .await?
+        .collect()
+        .await?;
+    let after = snapshot().plan_phase_us;
+    for phase in [PlanPhase::Replay, PlanPhase::Build] {
+        assert!(after[phase as usize] > before[phase as usize], "{phase:?} not recorded");
+    }
+    Ok(())
+}
