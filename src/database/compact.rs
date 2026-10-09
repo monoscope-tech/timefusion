@@ -852,13 +852,16 @@ impl Database {
 
     /// Builds a `TableProviderBuilder` scoped to exactly `files`. `file_col`
     /// requests the synthetic file-identity column dedup rewrites key on.
+    ///
+    /// Callers take `files` from `snapshot` itself, so none can be missing. `Ignore` rather
+    /// than `Error`: proving that would cost a second full replay of the snapshot per scan.
     pub(crate) async fn narrow_provider(
         log_store: deltalake::logstore::LogStoreRef, snapshot: Arc<deltalake::kernel::EagerSnapshot>, files: Vec<String>, file_col: Option<&str>,
         row_index_col: Option<&str>,
     ) -> Result<Arc<dyn TableProvider>, deltalake::DeltaTableError> {
-        use deltalake::delta_datafusion::{FileSelection, TableProviderBuilder};
-        let mut builder =
-            TableProviderBuilder::default().with_log_store(log_store).with_eager_snapshot(snapshot).with_file_selection(FileSelection::from_file_paths(files));
+        use deltalake::delta_datafusion::{FileSelection, MissingSelectedFilePolicy, TableProviderBuilder};
+        let selection = FileSelection::from_file_paths(files).with_missing_file_policy(MissingSelectedFilePolicy::Ignore);
+        let mut builder = TableProviderBuilder::default().with_log_store(log_store).with_eager_snapshot(snapshot).with_file_selection(selection);
         if let Some(col) = file_col {
             builder = builder.with_file_column(col);
         }

@@ -11869,3 +11869,33 @@ async fn a_delta_scan_records_its_planning_phases() -> Result<()> {
     }
     Ok(())
 }
+
+/// Every caller selects files from the very snapshot it hands `narrow_provider`, so a selected
+/// file is never missing; the `Error` policy only bought a second full replay of the snapshot
+/// per maintenance scan (~12 ms on prod). An absent path is ignored, not an error.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_narrow_provider_ignores_a_selected_file_its_snapshot_lacks() -> Result<()> {
+    let (db, _ctx, prefix) = setup_test_database().await?;
+    let project_id = format!("narrow_ignore_{prefix}");
+    let ts = chrono::Utc::now().timestamp_micros() - 3_600_000_000;
+    let date = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(ts).unwrap().date_naive().to_string();
+    let rows = (0..8)
+        .map(|i| serde_json::json!({"timestamp": ts + i, "id": format!("id-{i}"), "name": "n", "project_id": project_id, "date": date, "summary": []}))
+        .collect();
+    db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![json_to_batch_for("otel_logs_and_spans", rows)?], true, None).await?;
+    let table_ref = db.resolve_table(&project_id, "otel_logs_and_spans").await?;
+    let (snapshot, log_store, mut files) = {
+        let table = table_ref.read().await;
+        let snapshot = Arc::new(table.snapshot()?.snapshot().clone());
+        let files: Vec<String> = snapshot.log_data().iter().map(|f| f.path().to_string()).collect();
+        (snapshot, table.log_store(), files)
+    };
+    files.push(format!("project_id={project_id}/date={date}/part-00000-gone-c000.zstd.parquet"));
+    let provider = Database::narrow_provider(log_store, snapshot, files, None, None).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+    let ctx = SessionContext::new();
+    ctx.register_table("scan", provider)?;
+    let batches = ctx.sql(&format!("SELECT count(*) FROM scan WHERE project_id = '{project_id}'")).await?.collect().await?;
+    let count = batches[0].column(0).as_any().downcast_ref::<arrow::array::Int64Array>().unwrap().value(0);
+    assert_eq!(count, 8);
+    Ok(())
+}
