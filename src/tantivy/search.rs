@@ -201,6 +201,8 @@ type CapKey = (String, String, PredNode, usize);
 const MAX_CONCURRENT_INSTALLS: usize = 4;
 const MAX_CONCURRENT_WARMS: usize = 2;
 const MAX_QUEUED_WARMS: usize = 64;
+/// Conversions in flight; each holds one packed bundle (up to ~1.4 GB) in memory.
+const BUNDLE_CONVERSIONS: usize = 2;
 const CAP_EXCEEDED_TTL: Duration = Duration::from_secs(600);
 
 fn window_width(time_range: Option<(i64, i64)>) -> u64 {
@@ -1430,6 +1432,36 @@ pub struct TantivyIndexService {
 }
 
 impl TantivyIndexService {
+    /// Repack recent `tar.zst` indexes as bundles, newest first, until `deadline`. A cold
+    /// `tar.zst` index is skipped by searches until a whole-blob install lands, and the warm
+    /// queue drops most of those; a bundle is searched in place by range reads instead.
+    pub async fn convert_to_bundles(&self, table: &str, days: u32, deadline: Instant) -> Result<usize> {
+        let cutoff = crate::support::now_micros() - i64::from(days) * 86_400_000_000;
+        let store = self.object_store.as_ref();
+        let mut todo = vec![];
+        for project in super::list_manifest_projects(store, table).await? {
+            todo.extend(super::load_manifest(store, table, &project).await?.entries.into_iter().filter_map(|(key, e)| {
+                let current = e.bundle_head.is_none() && e.error.is_none() && e.schema_version == SCHEMA_VERSION;
+                Some((e.max_timestamp_micros.filter(|&t| current && t >= cutoff)?, project.clone(), key, e.index?))
+            }));
+        }
+        todo.sort_unstable_by_key(|t| std::cmp::Reverse(t.0));
+        let level = self.config.compression_level();
+        Ok(futures::stream::iter(todo.into_iter().take_while(|_| Instant::now() < deadline))
+            .map(|(_, project, key, old)| async move {
+                let (new, head) = super::convert_blob(store, &old, level, &self.scratch_root).await?;
+                let swapped = super::swap_to_bundle(store, table, &project, &key, &old, new.as_ref(), head).await?;
+                if !swapped {
+                    let _ = store.delete(&new).await;
+                }
+                anyhow::Ok(swapped)
+            })
+            .buffer_unordered(BUNDLE_CONVERSIONS)
+            .filter_map(|r| futures::future::ready(r.inspect_err(|e| warn!("tantivy bundle conversion failed for {table}: {e:#}")).ok().filter(|&s| s)))
+            .count()
+            .await)
+    }
+
     fn pack(&self) -> super::Pack {
         super::Pack { level: self.config.compression_level(), bundle: self.config.timefusion_tantivy_bundle_writes }
     }

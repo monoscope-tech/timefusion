@@ -1060,6 +1060,43 @@ pub async fn upsert_manifest_many(store: &dyn ObjectStore, table: &str, project_
 }
 
 /// Remove entries by parquet key (used during compaction GC).
+/// Point `key` at the bundle `new` iff it still points at `old`; `old` retires like any
+/// replaced blob. False when the entry moved on (rebuilt, GC'd) while `new` was made.
+pub async fn swap_to_bundle(store: &dyn ObjectStore, table: &str, project_id: &str, key: &str, old: &str, new: &str, bundle_head: u64) -> Result<bool> {
+    mutate(store, table, project_id, |m| match m.entries.get(key).filter(|e| e.index.as_deref() == Some(old)) {
+        Some(entry) => {
+            let entry = ManifestEntry { index: Some(new.to_string()), bundle_head: Some(bundle_head), ..entry.clone() };
+            m.insert(key.to_string(), entry);
+            (true, true)
+        }
+        None => (false, false),
+    })
+    .await
+}
+
+/// The base path a blob's generations hang off.
+fn blob_base(blob: &str) -> ObjPath {
+    ObjPath::from(split_blob_generation(blob).map_or_else(|| blob.to_string(), |(stem, _)| format!("{stem}{BLOB_SUFFIX}")))
+}
+
+/// Repack a `tar.zst` index blob as a bundle under a new generation; returns its path and head.
+pub async fn convert_blob(store: &dyn ObjectStore, blob: &str, level: i32, scratch: &Path) -> Result<(ObjPath, u64)> {
+    let tmp = scratch_tempdir(scratch)?;
+    let stream =
+        futures::TryStreamExt::map_err(store.get(&ObjPath::from(blob)).await.with_context(|| format!("get {blob}"))?.into_stream(), std::io::Error::other);
+    let dir = tmp.path().to_owned();
+    // Streamed straight to disk: buffering a blob whole is what OOM'd installs on 09-30.
+    let bundle = tokio::task::spawn_blocking(move || {
+        unpack_to_dir(tokio_util::io::SyncIoBridge::new(tokio_util::io::StreamReader::new(stream)), &dir)?;
+        hotcache::pack_bundle(&dir, level)
+    })
+    .await??;
+    let head = hotcache::head_len(&bundle)?;
+    let path = generation_blob_path(&blob_base(blob), uuid::Uuid::new_v4());
+    upload(store, &path, bundle).await?;
+    Ok((path, head))
+}
+
 pub async fn remove_manifest_entries(store: &dyn ObjectStore, table: &str, project_id: &str, parquet_keys: &[String]) -> Result<()> {
     if parquet_keys.is_empty() {
         return Ok(());

@@ -877,3 +877,28 @@ async fn a_bundled_index_is_searched_by_range_reads_without_an_install() {
         assert_eq!(stats.range_reads.load(Relaxed) > 0, bundle_opens > 0, "only bundle searches read by range");
     }
 }
+
+/// Old `tar.zst` indexes are repacked as bundles in place, so searches stop skipping them
+/// as cold and read them by range instead.
+#[tokio::test(flavor = "multi_thread")]
+async fn converted_tar_zst_indexes_are_searched_by_range_reads() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let env = Env::new("otel_logs_and_spans", "p-convert", store.clone(), tar_zst(), prod_defaults());
+    env.publish(&[(1_000_000, "a", "ERROR"), (1_000_001, "b", "INFO")], &["f1"]).await;
+    env.publish(&[(2_000_000, "c", "ERROR")], &["f2"]).await;
+    let old: Vec<String> = env.manifest().await.entries.values().filter_map(|e| e.index.clone()).collect();
+
+    let forever = std::time::Instant::now() + std::time::Duration::from_secs(600);
+    assert_eq!(env.svc.convert_to_bundles(env.table, 100_000, forever).await.unwrap(), 2);
+    let manifest = env.manifest().await;
+    assert!(manifest.entries.values().all(|e| e.bundle_head.is_some() && !old.contains(e.index.as_ref().unwrap())));
+    assert!(old.iter().all(|blob| manifest.retired_blobs.contains_key(blob)), "replaced blobs retire for the GC");
+    assert_eq!(env.svc.convert_to_bundles(env.table, 100_000, forever).await.unwrap(), 0, "a converted index is left alone");
+
+    let reader = Env::new("otel_logs_and_spans", "p-convert", store, prod_defaults(), prod_defaults());
+    let r = reader.search.search_detailed(reader.table, reader.project, &level_error_node(), 100, None, false).await.unwrap().unwrap();
+    let mut ids: Vec<_> = r.hits.iter().map(|h| h.id.as_str()).collect();
+    ids.sort();
+    assert_eq!(ids, ["a", "c"]);
+    assert_eq!((reader.search.stats.bundle_opens.load(Relaxed), reader.search.stats.blob_fetches.load(Relaxed)), (2, 0));
+}

@@ -202,6 +202,13 @@ The `http.status = 500` list stays slow because the filter is sparse, so the mer
     - ⇒ A cold `body` search moves about 57 MB instead of a 1.38 GB download plus 2.17 GB unpack, in about 4 round trips.
     - Follow-up: hit materialization reads most of `_id`. With valid ordinals, row selections need only `_row_ordinal`.
   - **Rollout:** on by default. New builds write bundles from this deploy on, and old `tar.zst` indexes keep installing whole until they are rebuilt. Rolling back below `dde040e9` cannot install bundles. To verify after deploy: `tantivy.bundle_opens`/`range_read_bytes` grow while `blob_fetch_bytes` flattens, cold 7d/30d needle latency holds, and memory stays flat. Kill switch: `FLAG SET timefusion_tantivy_range_reads OFF`.
+  - **Converting old indexes** (branch `tantivy/convert-bundles`). Measured 13:20 10-09 on prod, a 7d `name ilike '%webhook%'` search:
+    - 1,679 indexes searched; **1,218 cold `tar.zst` indexes left raw**, with their 379 files scanned with the predicate.
+    - 1,154 background warms dropped (queue full), and the next query repeats it. About 42% of a 7d window never prunes.
+    - Fix: the 15-minute hot-warm cron now also repacks `tar.zst` entries within `timefusion_cache_recent_days` (35) as bundles, newest first, 2 at a time, for up to 10 minutes per tick.
+    - Each conversion stream-unpacks to scratch, repacks, uploads a new generation, and swaps the entry only if it still points at the old blob (`swap_to_bundle`). The old blob retires via the GC grace period.
+    - Guard: `converted_tar_zst_indexes_are_searched_by_range_reads`, red with the swap disabled.
+    - Expect about 50 GB/h, and shipbubble's 35 days range-readable within hours. Watch the `tantivy_bundles_converted` log, `tantivy.cold_indexes_left_raw` falling, and `bundle_opens` rising.
   - Known limitation: tantivy 0.22 reads a field's term dictionary whole, so a trace/span id lookup reads that field's 33–36 MB FST per file. That is 40x less than today's blob, but not cheap. Out of scope for this arc.
   - ⇒ A hotcache of text-field term dictionaries is about 3 MB per 2M-row file and fits a resident budget. The postings are what range reads must avoid fetching whole.
   - ⇒ Side win: ID term dictionaries (about 250 MB per file) duplicate the bloom sidecars, and `id` is indexed twice. Trimming them from new builds shrinks every blob, which speeds today's cold installs too.

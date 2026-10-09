@@ -12,6 +12,9 @@ pub(crate) fn sort_backfill_uris_newest_first(uris: &mut [String]) {
 
 /// Wall-clock the GC phase of one reconcile pass may spend before yielding to the backfill.
 const GC_PHASE_BUDGET: std::time::Duration = std::time::Duration::from_secs(120);
+/// Wall clock one hot-warm tick may spend converting `tar.zst` indexes to bundles; the
+/// tick recurs every 15 minutes.
+const BUNDLE_CONVERSION_BUDGET: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// Tables reconciled at once; bounded low on purpose.
 pub(crate) const TANTIVY_RECONCILE_CONCURRENCY: usize = 3;
@@ -196,6 +199,16 @@ impl Database {
             match svc.warm_recent(&table, days).await {
                 Ok(n) => debug!("tantivy hot warm: table={table} days={days} blobs_resident={n}"),
                 Err(e) => warn!("tantivy hot warm failed for {table}: {e}"),
+            }
+        }
+        // Within the cache horizon, so every window a dashboard reads becomes range-readable.
+        let Some(indexer) = self.tantivy_indexer().cloned().filter(|i| i.config.timefusion_tantivy_bundle_writes) else { return };
+        let (horizon, deadline) = (self.config.cache.timefusion_cache_recent_days as u32, std::time::Instant::now() + BUNDLE_CONVERSION_BUDGET);
+        for table in self.config.tantivy.indexed_tables() {
+            match indexer.convert_to_bundles(&table, horizon, deadline).await {
+                Ok(0) => {}
+                Ok(n) => info!(table, converted = n, event = "tantivy_bundles_converted"),
+                Err(e) => warn!("tantivy bundle conversion failed for {table}: {e:#}"),
             }
         }
     }
