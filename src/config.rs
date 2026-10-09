@@ -1146,6 +1146,16 @@ pub struct TantivyConfig {
     /// and a stale entry only costs a wasted lookup.
     #[serde_inline_default(300)]
     pub timefusion_tantivy_manifest_ttl_secs: u64,
+    /// Write new indexes as range-readable bundles (`tantivy::hotcache`). Every reader
+    /// since `dde040e9` reads both formats; an older image cannot install a bundle.
+    #[serde(default)]
+    pub timefusion_tantivy_bundle_writes: bool,
+    /// Search bundles by ranged reads instead of installing them whole; `FLAG SET`-able.
+    #[serde(default)]
+    pub timefusion_tantivy_range_reads: bool,
+    /// Decompressed bundle blocks held in memory across all open bundles.
+    #[serde_inline_default(1024)]
+    pub timefusion_tantivy_block_cache_mb: usize,
     /// Files a single backfill pass will attempt — a COUNT ceiling only, against
     /// a pathological queue of tiny files. The real bound is
     /// `timefusion_tantivy_backfill_max_bytes_per_pass_mb`; set too low, this
@@ -1221,6 +1231,9 @@ impl TantivyConfig {
     /// Floored at 1: a zero-capacity LRU would make every open a cold open.
     pub fn reader_cache_entries(&self) -> NonZeroUsize {
         NonZeroUsize::new(self.timefusion_tantivy_reader_cache_entries).unwrap_or(NonZeroUsize::MIN)
+    }
+    pub fn range_reads(&self) -> bool {
+        RuntimeFlag::TimefusionTantivyRangeReads.override_value().map_or(self.timefusion_tantivy_range_reads, |v| v == 1)
     }
     pub fn manifest_ttl(&self) -> Duration {
         Duration::from_secs(self.timefusion_tantivy_manifest_ttl_secs)
@@ -2250,10 +2263,12 @@ pub enum RuntimeFlag {
     TimefusionMaintenanceCpuTokens,
     /// The parquet reader's column-chunk read-ahead (0/1).
     TimefusionParquetReadAhead,
+    /// Range reads of bundled tantivy indexes (0/1).
+    TimefusionTantivyRangeReads,
 }
 
 /// Per-flag override: 0 = config, else value + 1.
-static FLAG_OVERRIDES: [std::sync::atomic::AtomicU32; 2] = [const { std::sync::atomic::AtomicU32::new(0) }; 2];
+static FLAG_OVERRIDES: [std::sync::atomic::AtomicU32; 3] = [const { std::sync::atomic::AtomicU32::new(0) }; 3];
 
 impl RuntimeFlag {
     fn slot(self) -> &'static std::sync::atomic::AtomicU32 {
@@ -2263,7 +2278,7 @@ impl RuntimeFlag {
     pub fn range(self) -> std::ops::RangeInclusive<u32> {
         match self {
             Self::TimefusionMaintenanceCpuTokens => 8..=256,
-            Self::TimefusionParquetReadAhead => 0..=1,
+            Self::TimefusionParquetReadAhead | Self::TimefusionTantivyRangeReads => 0..=1,
         }
     }
 
@@ -2287,6 +2302,7 @@ impl AppConfig {
         flag.override_value().unwrap_or_else(|| match flag {
             RuntimeFlag::TimefusionMaintenanceCpuTokens => u32::try_from(self.derived.coordinator_job_slots()).unwrap_or(u32::MAX),
             RuntimeFlag::TimefusionParquetReadAhead => u32::from(self.parquet.timefusion_parquet_read_ahead),
+            RuntimeFlag::TimefusionTantivyRangeReads => u32::from(self.tantivy.timefusion_tantivy_range_reads),
         })
     }
 

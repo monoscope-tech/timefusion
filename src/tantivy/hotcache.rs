@@ -118,6 +118,51 @@ pub fn is_bundle(head: &[u8]) -> bool {
     head.starts_with(BUNDLE_MAGIC)
 }
 
+/// Bytes before the first block: what one GET must fetch to open the bundle.
+pub fn head_len(blob: &[u8]) -> anyhow::Result<u64> {
+    let mut cursor = blob;
+    let table = read_table(&mut cursor)?;
+    Ok((blob.len() - cursor.len()) as u64 + table.hot.iter().map(|h| h.2).sum::<u64>())
+}
+
+/// Decompressed blocks shared by every open bundle, keyed `(bundle, file, block)`.
+pub type BlockCache = Arc<Mutex<lru::LruCache<(u64, u32, u32), Arc<[u8]>>>>;
+
+pub fn block_cache(bytes: usize) -> BlockCache {
+    Arc::new(Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(bytes / BUNDLE_BLOCK).unwrap_or(std::num::NonZeroUsize::MIN))))
+}
+
+/// Prefetch what `query` reads through its terms, in two parallel rounds: each queried
+/// field's term dictionary, then every term's postings. Sequentially, a cold bundle pays
+/// one round trip per read; this way it pays two, and the search then runs from the cache.
+pub fn warm(searcher: &tantivy::Searcher, query: &dyn tantivy::query::Query) -> io::Result<()> {
+    use tantivy::schema::IndexRecordOption;
+    let mut fields: HashMap<tantivy::schema::Field, Vec<(tantivy::Term, bool)>> = HashMap::new();
+    query.query_terms(&mut |term, positions| fields.entry(term.field()).or_default().push((term.clone(), positions)));
+    let fields = &fields;
+    std::thread::scope(|s| {
+        let readers = searcher
+            .segment_readers()
+            .iter()
+            .flat_map(|segment| fields.iter().map(move |(&field, terms)| (s.spawn(move || segment.inverted_index(field).map_err(io::Error::other)), terms)))
+            .collect_vec();
+        let postings = readers
+            .into_iter()
+            .map(|(reader, terms)| Ok((reader.join().map_err(|_| io::Error::other("warm thread panicked"))??, terms)))
+            .collect::<io::Result<Vec<_>>>()?
+            .into_iter()
+            .flat_map(|(reader, terms)| {
+                terms.iter().map(move |(term, positions)| {
+                    let reader = reader.clone();
+                    let option = if *positions { IndexRecordOption::WithFreqsAndPositions } else { IndexRecordOption::Basic };
+                    s.spawn(move || reader.read_postings(term, option).map(drop))
+                })
+            })
+            .collect_vec();
+        postings.into_iter().try_for_each(|h| h.join().map_err(|_| io::Error::other("warm thread panicked"))?)
+    })
+}
+
 /// The merged byte ranges that opening `dir` and creating a searcher read.
 fn open_set(dir: &Path) -> anyhow::Result<Vec<(PathBuf, Range<usize>)>> {
     let recording = RecordingDirectory::new(tantivy::directory::MmapDirectory::open(dir)?);
@@ -209,6 +254,7 @@ impl BundleSource for Bytes {
 
 #[derive(Debug)]
 struct FileLayout {
+    index: u32,
     len: usize,
     /// Absolute offsets of each block, plus the end of the last.
     blocks: Vec<u64>,
@@ -223,6 +269,7 @@ pub struct BundleDirectory {
     head: Bytes,
     files: Arc<HashMap<PathBuf, FileLayout>>,
     source: Arc<dyn BundleSource>,
+    cache: Option<(u64, BlockCache)>,
 }
 
 impl BundleDirectory {
@@ -243,15 +290,24 @@ impl BundleDirectory {
         let files = table
             .files
             .iter()
-            .map(|f| {
+            .zip(0..)
+            .map(|(f, index)| {
                 let blocks = std::iter::once(offset).chain(f.blocks.iter().map(|&size| {
                     offset += u64::from(size);
                     offset
                 }));
-                (PathBuf::from(&f.name), FileLayout { len: f.len as usize, blocks: blocks.collect(), hot: hot.remove(f.name.as_str()).unwrap_or_default() })
+                (
+                    PathBuf::from(&f.name),
+                    FileLayout { index, len: f.len as usize, blocks: blocks.collect(), hot: hot.remove(f.name.as_str()).unwrap_or_default() },
+                )
             })
             .collect();
-        Ok(Self { head, files: Arc::new(files), source })
+        Ok(Self { head, files: Arc::new(files), source, cache: None })
+    }
+
+    /// Share decompressed blocks through `cache`, keyed by `bundle`, unique per blob.
+    pub fn with_cache(self, bundle: u64, cache: BlockCache) -> Self {
+        Self { cache: Some((bundle, cache)), ..self }
     }
 
     /// The byte length of the whole bundle this head describes.
@@ -272,14 +328,24 @@ impl BundleDirectory {
             return Ok(self.head[start..start + range.len()].to_vec());
         }
         let (first, last) = (range.start / BUNDLE_BLOCK, (range.end - 1) / BUNDLE_BLOCK);
-        let span = self.source.read(file.blocks[first]..file.blocks[last + 1])?;
-        let mut out = Vec::with_capacity((last - first + 1) * BUNDLE_BLOCK);
-        for (block, end) in (first..=last).zip(&file.blocks[first + 1..=last + 1]) {
-            let compressed = &span[(file.blocks[block] - file.blocks[first]) as usize..(end - file.blocks[first]) as usize];
-            out.extend_from_slice(&zstd::bulk::decompress(compressed, BUNDLE_BLOCK)?);
+        let key = |block: usize| self.cache.as_ref().map(|(bundle, _)| (*bundle, file.index, block as u32));
+        let mut blocks: Vec<Option<Arc<[u8]>>> = (first..=last).map(|block| Some(self.cache.as_ref()?.1.lock().get(&key(block)?)?.clone())).collect();
+        // Each run of missing blocks is contiguous in the bundle: one read.
+        let missing = (first..=last).filter(|b| blocks[b - first].is_none()).collect_vec();
+        for run in missing.chunk_by(|a, b| a + 1 == *b) {
+            let (lo, hi) = (run[0], run[run.len() - 1]);
+            let span = self.source.read(file.blocks[lo]..file.blocks[hi + 1])?;
+            for block in lo..=hi {
+                let compressed = &span[(file.blocks[block] - file.blocks[lo]) as usize..(file.blocks[block + 1] - file.blocks[lo]) as usize];
+                let bytes: Arc<[u8]> = zstd::bulk::decompress(compressed, BUNDLE_BLOCK)?.into();
+                if let (Some((_, cache)), Some(key)) = (&self.cache, key(block)) {
+                    cache.lock().put(key, bytes.clone());
+                }
+                blocks[block - first] = Some(bytes);
+            }
         }
         let skip = range.start - first * BUNDLE_BLOCK;
-        Ok(out[skip..skip + range.len()].to_vec())
+        Ok(blocks.into_iter().flatten().flat_map(|b| b.iter().copied().collect_vec()).skip(skip).take(range.len()).collect())
     }
 }
 
@@ -403,7 +469,7 @@ mod tests {
         let started = std::time::Instant::now();
         let blob = pack_bundle(Path::new(&dir), 3)?;
         let source = Arc::new(Counted(blob.clone(), Default::default()));
-        let directory = BundleDirectory::new(blob.clone(), source.clone())?;
+        let directory = BundleDirectory::new(blob.clone(), source.clone())?.with_cache(1, block_cache(1 << 30));
         println!(
             "bundle {} MB in {:?}, head {} KB",
             blob.len() >> 20,
@@ -417,10 +483,29 @@ mod tests {
             let PredsQuery::Query(q) = build_node_query(&index, &PredNode::Leaf(TextMatchPred { column: column.into(), query: query.into() }))? else {
                 continue;
             };
-            let started = std::time::Instant::now();
+            let phase = |name: &str| {
+                let (reads, bytes) = std::mem::take(&mut *source.1.lock());
+                println!("  {column}={query:?} {name}: reads={reads} bytes={} KB", bytes >> 10);
+            };
+            let (lo, hi) = (1_790_726_400_000_000, 1_790_737_200_000_000);
+            let range: Box<dyn tantivy::query::Query> = Box::new(tantivy::query::RangeQuery::new_i64_bounds(
+                crate::tantivy::TS_FIELD.into(),
+                std::ops::Bound::Included(lo),
+                std::ops::Bound::Included(hi),
+            ));
+            let q: Box<dyn tantivy::query::Query> =
+                Box::new(tantivy::query::BooleanQuery::new(vec![(tantivy::query::Occur::Must, q), (tantivy::query::Occur::Must, range.box_clone())]));
+            warm(&searcher, &*q)?;
+            phase("warm");
+            searcher.search(&*range, &tantivy::collector::Count)?;
+            phase("window count");
             let hits = searcher.search(&*q, &tantivy::collector::Count)?;
-            let (reads, bytes) = std::mem::take(&mut *source.1.lock());
-            println!("{column}={query:?} hits={hits} reads={reads} bytes={} KB in {:?}", bytes >> 10, started.elapsed());
+            phase("term count");
+            if hits <= 10_000 {
+                crate::tantivy::search::query_with_searcher(&searcher, &*q, Some(10_001))?;
+                phase("hits");
+            }
+            println!("{column}={query:?} hits={hits}");
         }
         Ok(())
     }

@@ -48,6 +48,10 @@ pub struct SearchStats {
     pub blob_fetch_us: AtomicU64,
     /// Bytes downloaded by whole-blob installs; what range reads exist to shrink.
     pub blob_fetch_bytes: AtomicU64,
+    /// Ranged reads of bundles in place of whole-blob installs.
+    pub range_reads: AtomicU64,
+    pub range_read_bytes: AtomicU64,
+    pub bundle_opens: AtomicU64,
     pub index_opens: AtomicU64,
     pub index_open_us: AtomicU64,
     pub reader_hits: AtomicU64,
@@ -160,11 +164,12 @@ pub struct TantivySearchService {
     pub object_store: Arc<dyn ObjectStore>,
     pub cache_root: PathBuf,
     pub config: Arc<TantivyConfig>,
-    pub stats: SearchStats,
+    pub stats: Arc<SearchStats>,
     readers: Mutex<LruCache<PathBuf, (Index, IndexReader)>>,
     /// TTL cache of parsed manifest shards, keyed (table, project). Per-service
     /// (not global) so distinct object stores never cross-contaminate.
     manifests: DashMap<(String, String), CachedManifest>,
+    block_cache: super::hotcache::BlockCache,
     /// Last time each cache dir was served to a query — the reaper's recency
     /// signal, since mmap reads don't reliably move a directory's atime. Dirs
     /// absent here fall back to dir mtime, which is their unpack time.
@@ -265,8 +270,9 @@ impl TantivySearchService {
             object_store,
             cache_root,
             readers: Mutex::new(LruCache::new(config.reader_cache_entries())),
+            block_cache: super::hotcache::block_cache(config.timefusion_tantivy_block_cache_mb << 20),
             config,
-            stats: SearchStats::default(),
+            stats: Default::default(),
             manifests: DashMap::new(),
             last_used: DashMap::new(),
             install_permits: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_INSTALLS)),
@@ -325,9 +331,9 @@ impl TantivySearchService {
         anyhow::ensure!(entry.schema_version == SCHEMA_VERSION && entry.error.is_none(), "histogram index is not usable");
         anyhow::ensure!(entry.ordinals_valid && entry.covered_files.len() == 1, "histogram requires physical single-file coverage");
         let blob = entry.index.as_deref().context("histogram index is missing")?;
-        let dir = self.ensure_cached(table, project_id, file_uuid(key), blob).await?;
+        let opened = self.open_index(table, project_id, file_uuid(key), blob, entry.bundle_head).await?;
         crate::support::without_blocking_the_worker(|| {
-            let (index, reader) = self.open_cached(&dir)?;
+            let (index, reader) = self.opened(opened)?;
             let searcher = reader.searcher();
             anyhow::ensure!(searcher.num_docs() == entry.rows, "histogram index row count differs from its manifest");
             for segment in searcher.segment_readers().iter().filter(|s| s.num_docs() != 0) {
@@ -413,22 +419,33 @@ impl TantivySearchService {
         let mut covered_files: HashSet<String> = current().filter(|(_, e)| usable_entry(e)).flat_map(|(_, e)| e.covered_files.iter().cloned()).collect();
         // Time-prune: skip indexes whose timestamp span can't overlap the query
         // window (no blob download). Conservative on unknown bounds.
-        // Work item: (file_uuid, blob_path, rows, entry covered_files, ordinals_valid, window).
+        // Work item: (file_uuid, blob_path, rows, entry covered_files, ordinals_valid, window, bundle_head).
         // `window` is set only when the entry's span sticks out of the query window.
         let mut work: Vec<_> = current()
             .filter_map(|(key, e)| {
                 let blob_path = e.index.as_ref().filter(|_| entry_overlaps(e.min_timestamp_micros, e.max_timestamp_micros, time_range))?;
                 let window =
                     time_range.filter(|&(lo, hi)| !(e.min_timestamp_micros.is_some_and(|m| m >= lo) && e.max_timestamp_micros.is_some_and(|m| m <= hi)));
-                Some((file_uuid(key).to_string(), blob_path.clone(), e.rows, e.covered_files.clone(), e.ordinals_valid && e.covered_files.len() == 1, window))
+                Some((
+                    file_uuid(key).to_string(),
+                    blob_path.clone(),
+                    e.rows,
+                    e.covered_files.clone(),
+                    e.ordinals_valid && e.covered_files.len() == 1,
+                    window,
+                    e.bundle_head,
+                ))
             })
             .collect();
         if !wait_for_cold {
             let cold;
-            (work, cold) = work.into_iter().partition(|(uuid, blob, ..)| has_any_segment(&self.cache_dir(table, project_id, uuid, blob)));
+            let range_reads = self.config.range_reads();
+            (work, cold) = work
+                .into_iter()
+                .partition(|(uuid, blob, .., bundle)| (range_reads && bundle.is_some()) || has_any_segment(&self.cache_dir(table, project_id, uuid, blob)));
             if !cold.is_empty() {
                 // All-or-nothing here made one cold day of a 30-day window full-scan all 30.
-                for (.., covered, _, _) in &cold {
+                for (.., covered, _, _, _) in &cold {
                     covered.iter().for_each(|file| _ = covered_files.remove(file));
                 }
                 SearchStats::add(&self.stats.cold_indexes_left_raw, cold.len() as u64);
@@ -445,19 +462,23 @@ impl TantivySearchService {
         SearchStats::add(&self.stats.indexes_searched, work.len() as u64);
         SearchStats::timed(&self.stats.plans, &self.stats.plan_us, plan_started);
         let _fanout = TimedPhase { count: &self.stats.fanouts, micros: &self.stats.fanout_us, started: Instant::now() };
-        let mut tasks = futures::stream::iter(work.into_iter().map(|(file_uuid, blob_path, rows, entry_covered, ordinals_valid, window)| async move {
+        let mut tasks = futures::stream::iter(work.into_iter().map(|(file_uuid, blob_path, rows, entry_covered, ordinals_valid, window, bundle)| async move {
             let prepare_started = Instant::now();
-            let dir = self.ensure_cached(table, project_id, &file_uuid, &blob_path).await?;
+            let opened = self.open_index(table, project_id, &file_uuid, &blob_path, bundle).await?;
+            let bundled = opened.is_left();
             // The rest is synchronous, CPU-bound tantivy work that yields
             // nowhere; running it inline would hold a runtime worker.
             crate::support::without_blocking_the_worker(|| {
-                let (index, reader) = self.open_cached(&dir).with_context(|| format!("open index {file_uuid}"))?;
+                let (index, reader) = self.opened(opened).with_context(|| format!("open index {file_uuid}"))?;
                 SearchStats::timed(&self.stats.prepares, &self.stats.prepare_us, prepare_started);
                 let started = Instant::now();
                 let out = match build_node_query(&index, node)? {
                     PredsQuery::MissingField => Some((None, rows, entry_covered, ordinals_valid)),
                     PredsQuery::Query(q) => {
                         let searcher = reader.searcher();
+                        if bundled {
+                            super::hotcache::warm(&searcher, &*q).with_context(|| format!("warm index {file_uuid}"))?;
+                        }
                         // Match and count only in-window docs: a sealed-day index spans the whole
                         // day, so its whole-index count overflows the cap for a few-hour fringe
                         // of a busy project. Sound for the zero-hit/row-selection sets because
@@ -565,6 +586,8 @@ impl TantivySearchService {
                 .entries
                 .iter()
                 .filter(|(_, e)| e.schema_version == SCHEMA_VERSION && e.max_timestamp_micros.is_some_and(|mx| mx >= cutoff))
+                // Range reads search a bundle in place; installing it whole is the cost they remove.
+                .filter(|(_, e)| e.bundle_head.is_none() || !self.config.range_reads())
                 .filter_map(|(key, e)| Some((file_uuid(key).to_string(), e.index.as_ref()?.clone())))
                 .collect();
             // Concurrent, at the same width as a query's fan-out; already-resident
@@ -701,6 +724,40 @@ impl TantivySearchService {
 
     fn cache_dir(&self, table: &str, project_id: &str, file_uuid: &str, blob_path: &str) -> PathBuf {
         super::local_cache_path(&self.cache_root, table, project_id, &cache_generation_key(file_uuid, blob_path))
+    }
+
+    /// An index to search: a bundle opened for range reads, or an installed directory.
+    async fn open_index(
+        &self, table: &str, project_id: &str, file_uuid: &str, blob_path: &str, bundle_head: Option<u64>,
+    ) -> Result<Either<(Index, IndexReader), PathBuf>> {
+        match bundle_head.filter(|_| self.config.range_reads()) {
+            Some(head) => Ok(Either::Left(self.open_bundle(blob_path, head).await?)),
+            None => Ok(Either::Right(self.ensure_cached(table, project_id, file_uuid, blob_path).await?)),
+        }
+    }
+
+    fn opened(&self, opened: Either<(Index, IndexReader), PathBuf>) -> Result<(Index, IndexReader)> {
+        opened.either(Ok, |dir| self.open_cached(&dir))
+    }
+
+    /// A bundle searched in place: one GET of its head opens it, later reads go by range
+    /// through the shared block cache. Cached alongside installed indexes, keyed by blob.
+    async fn open_bundle(&self, blob_path: &str, head_len: u64) -> Result<(Index, IndexReader)> {
+        let key = PathBuf::from(format!("bundle:{blob_path}"));
+        if let Some(v) = self.readers.lock().get(&key) {
+            SearchStats::add(&self.stats.reader_hits, 1);
+            return Ok(v.clone());
+        }
+        let path = ObjPath::from(blob_path);
+        let head = self.object_store.get_range(&path, 0..head_len).await.with_context(|| format!("get head of {path}"))?;
+        let source = Arc::new(StoreSource { store: self.object_store.clone(), path, rt: tokio::runtime::Handle::current(), stats: self.stats.clone() });
+        let bundle = std::hash::BuildHasher::hash_one(&std::hash::BuildHasherDefault::<std::collections::hash_map::DefaultHasher>::default(), blob_path);
+        let directory = super::hotcache::BundleDirectory::new(head, source)?.with_cache(bundle, self.block_cache.clone());
+        let index = super::open_index_in(directory)?;
+        let reader = index.reader().map_err(|e| anyhow!("open bundle reader: {e}"))?;
+        SearchStats::add(&self.stats.bundle_opens, 1);
+        self.readers.lock().put(key, (index.clone(), reader.clone()));
+        Ok((index, reader))
     }
 
     async fn ensure_cached(&self, table: &str, project_id: &str, file_uuid: &str, blob_path: &str) -> Result<PathBuf> {
@@ -876,6 +933,24 @@ fn install_blob_into_cache(dir: &Path, blob: impl std::io::Read) -> Result<()> {
         Err(e) => return Err(e).context("rename into cache"),
     }
     Ok(())
+}
+
+/// Serves a bundle's ranges from the object store. Called from blocking threads only (the
+/// search's `block_in_place`, or warm-up's scoped threads), hence the captured runtime.
+#[derive(Debug)]
+struct StoreSource {
+    store: Arc<dyn ObjectStore>,
+    path: ObjPath,
+    rt: tokio::runtime::Handle,
+    stats: Arc<SearchStats>,
+}
+
+impl super::hotcache::BundleSource for StoreSource {
+    fn read(&self, range: std::ops::Range<u64>) -> std::io::Result<bytes::Bytes> {
+        SearchStats::add(&self.stats.range_reads, 1);
+        SearchStats::add(&self.stats.range_read_bytes, range.end - range.start);
+        self.rt.block_on(self.store.get_range(&self.path, range)).map_err(std::io::Error::other)
+    }
 }
 
 /// True if `dir` already holds an extracted index (a `seg*` file or `meta.json`).
@@ -1348,6 +1423,10 @@ pub struct TantivyIndexService {
 }
 
 impl TantivyIndexService {
+    fn pack(&self) -> super::Pack {
+        super::Pack { level: self.config.compression_level(), bundle: self.config.timefusion_tantivy_bundle_writes }
+    }
+
     pub fn new(object_store: Arc<dyn ObjectStore>, config: Arc<TantivyConfig>, scratch_root: PathBuf) -> Self {
         crate::tantivy::reap_orphaned_scratch_dirs(&scratch_root);
         Self { object_store, config, newest_indexed_micros: AtomicI64::new(i64::MIN), reader: Mutex::new(None), scratch_root }
@@ -1413,10 +1492,10 @@ impl TantivyIndexService {
         // merging is deferred to keep it off the ingest path.
         let (ordinals_valid, merge) = (false, MergeMode::Deferred);
         let svc_table = crate::schema::get_schema(table_name).with_context(|| format!("schema not found for {table_name}"))?;
-        let level = self.config.compression_level();
+        let pack = self.pack();
         let scratch = self.scratch_root.clone();
         let pack_result = tokio::task::spawn_blocking(move || {
-            let (blob, stats) = super::build_and_pack(svc_table, &batches, level, merge, &scratch)?;
+            let (blob, stats) = super::build_and_pack(svc_table, &batches, pack, merge, &scratch)?;
             super::verify_blob(&blob).context("verify packed blob")?;
             Ok::<_, anyhow::Error>((blob, stats))
         })
@@ -1455,7 +1534,7 @@ impl TantivyIndexService {
     ) -> Result<(String, ManifestEntry)> {
         let path = super::index_path_for_parquet(table_name, parquet_rel);
         let table = crate::schema::get_schema(table_name).with_context(|| format!("schema not found for {table_name}"))?;
-        let result = super::build_parquet_and_pack(delta_store, parquet_rel, table, self.config.compression_level(), MergeMode::Now, &self.scratch_root).await;
+        let result = super::build_parquet_and_pack(delta_store, parquet_rel, table, self.pack(), MergeMode::Now, &self.scratch_root).await;
         self.publish_built_index(table_name, project_id, parquet_rel, path, vec![parquet_uri.to_string()], true, result, defer).await
     }
 
@@ -1480,6 +1559,7 @@ impl TantivyIndexService {
         // failed upload leaves a locally-readable index nothing points at.
         let blob_path = super::generation_blob_path(&blob_path, uuid::Uuid::new_v4());
         super::upload(self.object_store.as_ref(), &blob_path, blob.clone()).await?;
+        let bundle_head = super::hotcache::is_bundle(&blob).then(|| super::hotcache::head_len(&blob)).transpose()?;
         self.seed_reader_cache(table_name, project_id, manifest_key, blob_path.as_ref(), blob).await;
         let entry = ManifestEntry {
             element_fields: stats.element_fields,
@@ -1492,6 +1572,7 @@ impl TantivyIndexService {
             error: None,
             covered_files,
             ordinals_valid,
+            bundle_head,
         };
         if !defer {
             upsert_manifest(self.object_store.as_ref(), table_name, project_id, manifest_key, entry.clone()).await?;

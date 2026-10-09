@@ -810,6 +810,9 @@ pub struct ManifestEntry {
     /// row selection.
     #[serde(default)]
     pub ordinals_valid: bool,
+    /// Set iff `index` is a range-readable bundle: the bytes one GET fetches to open it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_head: Option<u64>,
 }
 
 /// Object-store path of the manifest for a given table/project.
@@ -1125,8 +1128,9 @@ pub fn index_to_parquet_rel(table: &str, blob_path: &str) -> Option<String> {
 /// Tantivy writer, then pack and verify the completed index — the
 /// memory-bounded counterpart to [`build_and_pack`].
 pub async fn build_parquet_and_pack(
-    store: Arc<dyn ObjectStore>, parquet_rel: &str, table: &'static TableSchema, level: i32, merge: MergeMode, scratch: &Path,
+    store: Arc<dyn ObjectStore>, parquet_rel: &str, table: &'static TableSchema, pack: impl Into<Pack>, merge: MergeMode, scratch: &Path,
 ) -> Result<(Bytes, IndexBuildStats)> {
+    let pack = pack.into();
     use deltalake::datafusion::parquet::arrow::{ProjectionMask, async_reader::ParquetRecordBatchStreamBuilder};
     use futures::TryStreamExt;
 
@@ -1157,7 +1161,7 @@ pub async fn build_parquet_and_pack(
     decode?;
     let (_built, stats) = built?;
     tokio::task::spawn_blocking(move || {
-        let blob = pack_dir(tmp.path(), level)?;
+        let blob = pack.pack(tmp.path())?;
         verify_blob(&blob).context("verify packed blob")?;
         Ok::<_, anyhow::Error>((blob, stats))
     })
@@ -1212,10 +1216,31 @@ pub fn reap_orphaned_scratch_dirs(root: &Path) {
 
 /// Build a tantivy `Index` to a fresh on-disk directory in one shot, then
 /// pack it into a `tar.zst` blob. Avoids any RAM→disk copy.
-pub fn build_and_pack(table: &TableSchema, batches: &[RecordBatch], level: i32, merge: MergeMode, scratch: &Path) -> Result<(Bytes, IndexBuildStats)> {
+pub fn build_and_pack(
+    table: &TableSchema, batches: &[RecordBatch], pack: impl Into<Pack>, merge: MergeMode, scratch: &Path,
+) -> Result<(Bytes, IndexBuildStats)> {
     let tmp = scratch_tempdir(scratch).context("build_and_pack: tempdir")?;
     let (_built, stats) = build_to_dir(table, batches, tmp.path(), merge)?;
-    Ok((pack_dir(tmp.path(), level)?, stats))
+    Ok((pack.into().pack(tmp.path())?, stats))
+}
+
+/// How a built index directory becomes a blob; a bare level is a `tar.zst`.
+#[derive(Debug, Clone, Copy)]
+pub struct Pack {
+    pub level: i32,
+    pub bundle: bool,
+}
+
+impl From<i32> for Pack {
+    fn from(level: i32) -> Self {
+        Self { level, bundle: false }
+    }
+}
+
+impl Pack {
+    fn pack(self, dir: &Path) -> Result<Bytes> {
+        if self.bundle { hotcache::pack_bundle(dir, self.level) } else { pack_dir(dir, self.level) }
+    }
 }
 
 /// Build a tantivy `Index` to a fresh on-disk directory in one shot.

@@ -848,3 +848,27 @@ async fn a_busy_day_index_answers_a_window_whose_matches_fit_the_cap() {
     assert_eq!(hits, [10, 12, 14, 16, 18].map(|i| (1_000_000 + i * 1_000, format!("id-{i}"))), "exactly the window's matches");
     assert_eq!(r.indexed_rows, 10, "selectivity must be judged against the window's rows, not the day's");
 }
+
+/// A bundle is searched in place by ranged reads when the flag is on, and installed whole
+/// like a `tar.zst` when it is off; both answer the same.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bundled_index_is_searched_by_range_reads_without_an_install() {
+    let bundled = || TantivyConfig { timefusion_tantivy_bundle_writes: true, timefusion_tantivy_manifest_ttl_secs: 60, ..prod_defaults() };
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let ranged = Env::new("otel_logs_and_spans", "p-bundle", store.clone(), bundled(), TantivyConfig { timefusion_tantivy_range_reads: true, ..bundled() });
+    ranged.publish(&[(1_000_000, "a", "ERROR"), (1_000_001, "b", "INFO")], &["f1"]).await;
+    ranged.publish(&[(2_000_000, "c", "ERROR")], &["f2"]).await;
+    assert!(ranged.manifest().await.entries.values().all(|e| e.bundle_head.is_some()), "bundle writes record each head");
+    let installed = Env::new("otel_logs_and_spans", "p-bundle", store, bundled(), bundled());
+
+    // A ranged bundle is never cold, so even a search that will not wait for installs uses it.
+    for (env, wait_for_cold, bundle_opens, blob_fetches) in [(&ranged, false, 2, 0), (&installed, true, 0, 2)] {
+        let r = env.search.search_detailed(env.table, env.project, &level_error_node(), 100, None, wait_for_cold).await.unwrap().unwrap();
+        let mut ids: Vec<_> = r.hits.iter().map(|h| h.id.as_str()).collect();
+        ids.sort();
+        assert_eq!(ids, ["a", "c"]);
+        let stats = &env.search.stats;
+        assert_eq!((stats.bundle_opens.load(Relaxed), stats.blob_fetches.load(Relaxed)), (bundle_opens, blob_fetches));
+        assert_eq!(stats.range_reads.load(Relaxed) > 0, bundle_opens > 0, "only bundle searches read by range");
+    }
+}
