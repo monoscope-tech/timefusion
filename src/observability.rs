@@ -252,6 +252,14 @@ pub enum PlanPhase {
     RollupRewriteLogical,
     /// `ProjectRoutingTable::scan`, every table scan planned (rewrites' legs included).
     TableScan,
+    /// Inside it: the dedup certification walks (window verdict, per-file split).
+    ScanCertification,
+    /// The tantivy text-match prefilter.
+    ScanTantivy,
+    /// The Delta provider's own scan (log replay, pruning, footers).
+    ScanProvider,
+    /// The MemBuffer leg.
+    ScanMemLeg,
 }
 
 static PLAN_PHASES: [(AtomicU64, AtomicU64); <PlanPhase as strum::EnumCount>::COUNT] =

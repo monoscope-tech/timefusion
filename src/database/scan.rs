@@ -623,9 +623,13 @@ impl ProjectRoutingTable {
         // Per-FILE split, tried only where the per-DATE one did not claim the
         // window: within an uncertified date, files a sweep proved clean can still
         // skip when no uncertified file overlaps them.
-        let (certified_files, uncertified_files) = query_time_range
-            .filter(|_| !skip_dedup && per_date_dates.is_empty() && !dedup_keys.is_empty())
-            .map_or_else(Default::default, |window| self.database.certified_file_split(&table, project_id, &self.table_name, window));
+        let (certified_files, uncertified_files) =
+            query_time_range.filter(|_| !skip_dedup && per_date_dates.is_empty() && !dedup_keys.is_empty()).map_or_else(Default::default, |window| {
+                let started = std::time::Instant::now();
+                let split = self.database.certified_file_split(&table, project_id, &self.table_name, window);
+                crate::observability::record_plan_phase(crate::observability::PlanPhase::ScanCertification, started);
+                split
+            });
         if skip_dedup && readmit_mutable_filters {
             let mutable = Self::version_mutable_columns(&self.table_name);
             delta_only_filters.extend(
@@ -736,6 +740,7 @@ impl ProjectRoutingTable {
         let delta_plan = provider.scan(state, translated_projection.as_ref(), &pushed, limit).await;
         metrics::counter!(scan_metric_names::PROVIDER_SCAN_TOTAL).increment(1);
         metrics::counter!(scan_metric_names::PROVIDER_SCAN_US_TOTAL).increment(started.elapsed().as_micros() as u64);
+        crate::observability::record_plan_phase(crate::observability::PlanPhase::ScanProvider, started);
         // Must run before anything reads the leg's ordering.
         let delta_plan = crate::read::optimizers::repair_isolated_scan_ordering(
             delta_plan?,
@@ -915,6 +920,7 @@ impl ProjectRoutingTable {
             let rejected = reg.rejected_rels(&self.table_name, &project_id, &dates, &needles);
             (!rejected.is_empty()).then_some(rejected)
         })();
+        let tantivy_started = std::time::Instant::now();
         if let Some(tree) = text_match_tree.as_ref()
             && let Some(svc) = self.database.tantivy_search()
         {
@@ -974,6 +980,7 @@ impl ProjectRoutingTable {
                 }
             }
         }
+        crate::observability::record_plan_phase(crate::observability::PlanPhase::ScanTantivy, tantivy_started);
 
         // Read-side dedup setup: collapse physical duplicates of dedup-key rows
         // over the routed/pruned union at query time, so COUNT(*) is correct
@@ -1233,6 +1240,7 @@ impl ProjectRoutingTable {
         });
         metrics::counter!(scan_metric_names::MEM_PLAN_TOTAL).increment(1);
         metrics::counter!(scan_metric_names::MEM_PLAN_US_TOTAL).increment(mem_plan_started.elapsed().as_micros() as u64);
+        crate::observability::record_plan_phase(crate::observability::PlanPhase::ScanMemLeg, mem_plan_started);
         let mem_partitions = match mem_leg.sorted {
             true => split_sorted_runs(mem_leg.partitions, state.config().target_partitions()),
             false => mem_leg.partitions,
@@ -1544,7 +1552,12 @@ impl ProjectRoutingTable {
         match window {
             _ if dedup_keys.is_empty() || !self.database.config.maintenance.timefusion_read_dedup_skip_swept => (DedupSkipVerdict::Disabled, HashSet::new()),
             None => (DedupSkipVerdict::NoWindow, HashSet::new()),
-            Some(w) => self.database.dedup_window_certified(table, project_id, &self.table_name, w),
+            Some(w) => {
+                let started = std::time::Instant::now();
+                let verdict = self.database.dedup_window_certified(table, project_id, &self.table_name, w);
+                crate::observability::record_plan_phase(crate::observability::PlanPhase::ScanCertification, started);
+                verdict
+            }
         }
     }
 
