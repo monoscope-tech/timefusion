@@ -964,3 +964,17 @@ async fn fragments_of_a_completely_indexed_file_are_skipped_and_retired() {
     assert_eq!(manifest.entries.keys().cloned().collect::<Vec<_>>(), [complete]);
     assert!(manifest.retired_blobs.contains_key(&fragment_blob), "the fragment's blob retires");
 }
+
+/// The per-index searches of one query run in parallel: under `block_in_place` inside one
+/// `buffer_unordered` task they ran one at a time (prod 30d needle: 377 x ~17 ms, serial).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_query_searches_its_indexes_in_parallel() {
+    let env = Env::prod("otel_logs_and_spans", "p-parallel");
+    for i in 0..32 {
+        env.publish(&[(1_000_000 + i, &format!("r{i}"), "ERROR")], &[&format!("f{i}")]).await;
+    }
+    let r = env.search.search_detailed(env.table, env.project, &level_error_node(), 1_000, None, true).await.unwrap().unwrap();
+    assert_eq!(r.hits.len(), 32);
+    let peak = env.search.stats.parallel_searches_peak.load(Relaxed);
+    assert!(peak > 1, "per-index searches must overlap, peak {peak}");
+}

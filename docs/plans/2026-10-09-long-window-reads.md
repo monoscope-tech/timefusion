@@ -225,6 +225,11 @@ The `http.status = 500` list stays slow because the filter is sparse, so the mer
       - `Manifest::redundant_keys`: entries whose every covered file has a complete index (usable, ordinals valid, single file) with ⊇ element fields.
       - Searches skip them, GC retires their blobs (one-day grace), and conversion skips them.
     - Guard: `fragments_of_a_completely_indexed_file_are_skipped_and_retired`, red separately for the query filter and the GC.
+  - **Serial fan-out (20:15 10-09):** with the fragments gone (#350), a warm 30d needle took 7.9 s. Tantivy fan-out wall time was 6.53 s, almost equal to the summed per-index search time (6.51 s over 377 indexes).
+    - The per-index work ran under `block_in_place` inside one `buffer_unordered` task, which parks the whole stream, so `search_concurrency = 32` bought nothing.
+    - Fix (branch `tantivy/parallel-search`): `spawn_blocking` per index.
+    - New stat `tantivy.parallel_searches_peak` (1 = serialized).
+    - Guard: `one_query_searches_its_indexes_in_parallel`, red (peak 1) on the old path.
   - Known limitation: tantivy 0.22 reads a field's term dictionary whole, so a trace/span id lookup reads that field's 33–36 MB FST per file. That is 40x less than today's blob, but not cheap. Out of scope for this arc.
   - ⇒ A hotcache of text-field term dictionaries is about 3 MB per 2M-row file and fits a resident budget. The postings are what range reads must avoid fetching whole.
   - ⇒ Side win: ID term dictionaries (about 250 MB per file) duplicate the bloom sidecars, and `id` is indexed twice. Trimming them from new builds shrinks every blob, which speeds today's cold installs too.

@@ -1225,6 +1225,7 @@ impl StatsTableProvider {
                 "range_reads" => s.range_reads.load(Relaxed),
                 "range_read_bytes" => s.range_read_bytes.load(Relaxed),
                 "bundle_opens" => s.bundle_opens.load(Relaxed),
+                "parallel_searches_peak" => s.parallel_searches_peak.load(Relaxed),
                 "index_open_us_total" => s.index_open_us.load(Relaxed),
                 "search_us_total" => s.search_us.load(Relaxed),
                 // Time the four above cannot see: fanout_us minus prepare_us minus

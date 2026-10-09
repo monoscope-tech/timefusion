@@ -52,6 +52,9 @@ pub struct SearchStats {
     pub range_reads: AtomicU64,
     pub range_read_bytes: AtomicU64,
     pub bundle_opens: AtomicU64,
+    /// Per-index searches running at once, and the most ever; 1 means the fan-out serialized.
+    pub parallel_searches: AtomicU64,
+    pub parallel_searches_peak: AtomicU64,
     pub index_opens: AtomicU64,
     pub index_open_us: AtomicU64,
     pub reader_hits: AtomicU64,
@@ -462,13 +465,19 @@ impl TantivySearchService {
             let prepare_started = Instant::now();
             let opened = self.open_index(table, project_id, file_uuid, &blob_path, bundle).await?;
             let bundled = opened.is_left();
-            // The rest is synchronous, CPU-bound tantivy work that yields
-            // nowhere; running it inline would hold a runtime worker.
-            crate::support::without_blocking_the_worker(|| {
-                let (index, reader) = self.opened(opened).with_context(|| format!("open index {file_uuid}"))?;
-                SearchStats::timed(&self.stats.prepares, &self.stats.prepare_us, prepare_started);
+            // The rest is synchronous, CPU-bound tantivy work that yields nowhere. On a
+            // blocking thread of its own, not `block_in_place`: that parks this whole fan-out
+            // task, so `buffer_unordered` ran the searches one at a time (30d: 377 x ~17 ms).
+            let (me, node) = (Arc::clone(self), node.clone());
+            tokio::task::spawn_blocking(move || {
+                let running = me.stats.parallel_searches.fetch_add(1, Ordering::Relaxed) + 1;
+                me.stats.parallel_searches_peak.fetch_max(running, Ordering::Relaxed);
+                let _running = scopeguard::guard((), |()| _ = me.stats.parallel_searches.fetch_sub(1, Ordering::Relaxed));
+                let file_uuid = super::search::file_uuid(&key);
+                let (index, reader) = me.opened(opened).with_context(|| format!("open index {file_uuid}"))?;
+                SearchStats::timed(&me.stats.prepares, &me.stats.prepare_us, prepare_started);
                 let started = Instant::now();
-                let out = match build_node_query(&index, node)? {
+                let out = match build_node_query(&index, &node)? {
                     PredsQuery::MissingField => Some((None, rows, entry_covered, ordinals_valid)),
                     PredsQuery::Query(q) => {
                         let searcher = reader.searcher();
@@ -497,14 +506,15 @@ impl TantivySearchService {
                             None
                         } else {
                             let hits = query_with_searcher(&searcher, &*q, Some(max_hits.saturating_add(1)))?;
-                            SearchStats::add(&self.stats.hits_materialized, hits.len() as u64);
+                            SearchStats::add(&me.stats.hits_materialized, hits.len() as u64);
                             Some((Some(hits), rows, entry_covered, ordinals_valid))
                         }
                     }
                 };
-                SearchStats::timed(&self.stats.searches, &self.stats.search_us, started);
+                SearchStats::timed(&me.stats.searches, &me.stats.search_us, started);
                 Ok::<_, anyhow::Error>(out)
             })
+            .await?
         }))
         .buffer_unordered(self.config.search_concurrency());
 
