@@ -3044,7 +3044,7 @@ dependencies = [
 [[package]]
 name = "deltalake"
 version = "2.0.0"
-source = "git+https://github.com/tonyalaribe/delta-rs-timefusion.git?rev=ec8319cab701c9e73babbacd9af97f0d154c8fbd#ec8319cab701c9e73babbacd9af97f0d154c8fbd"
+source = "git+https://github.com/tonyalaribe/delta-rs-timefusion.git?rev=e87db4dddaef47db2c57eb13f150d14303acc820#e87db4dddaef47db2c57eb13f150d14303acc820"
 dependencies = [
  "buoyant_kernel",
  "ctor",
@@ -3055,7 +3055,7 @@ dependencies = [
 [[package]]
 name = "deltalake-aws"
 version = "2.0.0"
-source = "git+https://github.com/tonyalaribe/delta-rs-timefusion.git?rev=ec8319cab701c9e73babbacd9af97f0d154c8fbd#ec8319cab701c9e73babbacd9af97f0d154c8fbd"
+source = "git+https://github.com/tonyalaribe/delta-rs-timefusion.git?rev=e87db4dddaef47db2c57eb13f150d14303acc820#e87db4dddaef47db2c57eb13f150d14303acc820"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -3078,7 +3078,7 @@ dependencies = [
 [[package]]
 name = "deltalake-core"
 version = "2.0.0"
-source = "git+https://github.com/tonyalaribe/delta-rs-timefusion.git?rev=ec8319cab701c9e73babbacd9af97f0d154c8fbd#ec8319cab701c9e73babbacd9af97f0d154c8fbd"
+source = "git+https://github.com/tonyalaribe/delta-rs-timefusion.git?rev=e87db4dddaef47db2c57eb13f150d14303acc820#e87db4dddaef47db2c57eb13f150d14303acc820"
 dependencies = [
  "alloc-stdlib 0.2.2",
  "arrow",
@@ -3137,7 +3137,7 @@ dependencies = [
 [[package]]
 name = "deltalake-derive"
 version = "1.0.0"
-source = "git+https://github.com/tonyalaribe/delta-rs-timefusion.git?rev=ec8319cab701c9e73babbacd9af97f0d154c8fbd#ec8319cab701c9e73babbacd9af97f0d154c8fbd"
+source = "git+https://github.com/tonyalaribe/delta-rs-timefusion.git?rev=e87db4dddaef47db2c57eb13f150d14303acc820#e87db4dddaef47db2c57eb13f150d14303acc820"
 dependencies = [
  "convert_case 0.9.0",
  "itertools 0.14.0",
@@ -4430,7 +4430,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.57.0",
+ "windows-core 0.62.2",
 ]
 
 [[package]]
@@ -6284,7 +6284,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "27c6023962132f4b30eb4c172c91ce92d933da334c59c23cddee82358ddafb0b"
 dependencies = [
  "anyhow",
- "itertools 0.12.1",
+ "itertools 0.13.0",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -9563,7 +9563,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

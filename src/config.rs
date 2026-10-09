@@ -1754,6 +1754,10 @@ impl CacheConfig {
 pub struct ParquetConfig {
     #[serde_inline_default(20_000)]
     pub timefusion_page_row_count_limit: usize,
+    /// Column-chunk read-ahead in the parquet reader: a column read whole rides ahead into
+    /// the next row groups. Off until an on-prod A/B (`FLAG SET`) shows it pays.
+    #[serde(default)]
+    pub timefusion_parquet_read_ahead: bool,
     /// ZSTD level for every WORKING write: flush, hot-tail packing, dedup staging.
     /// There are exactly two levels in the system (this and `..._zstd_level_warm`)
     /// — staged parquet is final, so a cheaper level needs a re-tiering pass that
@@ -2244,10 +2248,12 @@ pub struct MaintenanceConfig {
 pub enum RuntimeFlag {
     /// Maintenance admission's CPU-token capacity; config is `coordinator_job_slots`.
     TimefusionMaintenanceCpuTokens,
+    /// The parquet reader's column-chunk read-ahead (0/1).
+    TimefusionParquetReadAhead,
 }
 
 /// Per-flag override: 0 = config, else value + 1.
-static FLAG_OVERRIDES: [std::sync::atomic::AtomicU32; 1] = [const { std::sync::atomic::AtomicU32::new(0) }; 1];
+static FLAG_OVERRIDES: [std::sync::atomic::AtomicU32; 2] = [const { std::sync::atomic::AtomicU32::new(0) }; 2];
 
 impl RuntimeFlag {
     fn slot(self) -> &'static std::sync::atomic::AtomicU32 {
@@ -2257,6 +2263,7 @@ impl RuntimeFlag {
     pub fn range(self) -> std::ops::RangeInclusive<u32> {
         match self {
             Self::TimefusionMaintenanceCpuTokens => 8..=256,
+            Self::TimefusionParquetReadAhead => 0..=1,
         }
     }
 
@@ -2279,7 +2286,13 @@ impl AppConfig {
     pub fn flag_value(&self, flag: RuntimeFlag) -> u32 {
         flag.override_value().unwrap_or_else(|| match flag {
             RuntimeFlag::TimefusionMaintenanceCpuTokens => u32::try_from(self.derived.coordinator_job_slots()).unwrap_or(u32::MAX),
+            RuntimeFlag::TimefusionParquetReadAhead => u32::from(self.parquet.timefusion_parquet_read_ahead),
         })
+    }
+
+    /// Push the flags that live outside this crate into it; at boot and after `FLAG SET`.
+    pub fn apply_runtime_flags(&self) {
+        deltalake::delta_datafusion::parquet_metrics::set_read_ahead(self.flag_value(RuntimeFlag::TimefusionParquetReadAhead) == 1);
     }
 }
 

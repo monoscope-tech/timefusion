@@ -619,6 +619,7 @@ impl LoggingSimpleQueryHandler {
         if let FlagCmd::Set(flag, value) = cmd {
             let old = cfg.flag_value(flag);
             flag.set_override(value);
+            cfg.apply_runtime_flags();
             info!(flag = <&str>::from(flag), old, new = cfg.flag_value(flag), override_value = ?value, event = "runtime_flag_changed");
         }
         let rows: Vec<_> = crate::config::RuntimeFlag::VARIANTS
@@ -1666,6 +1667,8 @@ mod pgwire_handlers_tests {
     #[test_case("FLAG SET timefusion_maintenance_cpu_tokens 257" => Err(()); "above range")]
     #[test_case("FLAG SET timefusion_maintenance_cpu_tokens -1" => Err(()); "negative")]
     #[test_case("FLAG SET timefusion_maintenance_cpu_tokens ON" => Err(()); "numeric flag is not boolean")]
+    #[test_case("FLAG SET timefusion_parquet_read_ahead ON" => Ok(Some(crate::server::FlagCmd::Set(crate::config::RuntimeFlag::TimefusionParquetReadAhead, Some(1)))); "boolean flag")]
+    #[test_case("FLAG SET timefusion_parquet_read_ahead 2" => Err(()); "boolean out of range")]
     #[test_case("flag reset TIMEFUSION_MAINTENANCE_CPU_TOKENS" => Ok(Some(crate::server::FlagCmd::Set(crate::config::RuntimeFlag::TimefusionMaintenanceCpuTokens, None))); "reset, any case")]
     #[test_case("FLAG SHOW extra" => Err(()); "reject trailing input")]
     #[test_case("FLAG SET timefusion_maintenance_cpu_tokens" => Err(()); "set needs a value")]

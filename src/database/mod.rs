@@ -3162,6 +3162,7 @@ impl Database {
 
     /// Create a new Database with explicit config. Prefer this over `new()` in tests.
     pub async fn with_config(cfg: Arc<AppConfig>) -> Result<Self> {
+        cfg.apply_runtime_flags();
         crate::storage::prune_stale(&Self::delta_snapshot_dir(&cfg), crate::storage::SNAPSHOT_MAX_AGE);
         let dedup_dirty_bins = Arc::new(dashmap::DashMap::new());
         // Re-key any bin recorded at a different width. The queue is the ONLY record that a bin

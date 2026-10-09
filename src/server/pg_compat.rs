@@ -1428,8 +1428,9 @@ mod stats_table_tests {
         Cpu.set_override(Some(96));
         let rows = snapshot_rows(&StatsTableProvider::new(None));
         Cpu.set_override(None);
-        let flags: Vec<_> = rows.iter().filter(|(c, ..)| c == "flags").map(|(_, k, v)| (k.as_str(), v.as_str())).collect();
         let c: &str = Cpu.into();
+        let flags: Vec<_> =
+            rows.iter().filter(|(component, key, _)| component == "flags" && key.starts_with(c)).map(|(_, k, v)| (k.as_str(), v.as_str())).collect();
         assert_eq!(flags, [(c, "96"), (&*format!("{c}.override"), "96")]);
     }
 

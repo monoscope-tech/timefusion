@@ -200,6 +200,11 @@ The cold cost is round trips, below.
 - A correct version needs the opener's `ParquetAccessPlan`: read ahead only row groups the plan will read, ideally only the page ranges it selects.
 - Also: put any such change behind a `FLAG SET` runtime switch, and A/B it within one process on the same cold-day population. Measure per-query bytes, not global counters.
 
+**Re-shipped dark for an on-prod A/B:**
+- Fork `e87db4dd` adds a `set_read_ahead` switch, off by default; integration branch `1ecfc1cb`.
+- TF `RuntimeFlag::TimefusionParquetReadAhead` (config `timefusion_parquet_read_ahead`, default off) is applied at boot and on `FLAG SET`.
+- A/B protocol: alternate `FLAG SET timefusion_parquet_read_ahead ON/OFF` within one process. Each arm runs on fresh cold (date, column) pairs from the same population. Compare time and `parquet.bytes_read` deltas.
+
 **Original proposal — column-chunk read-ahead.**
 - Design: in the fork's `InstrumentedParquetFileReader::get_byte_ranges`, map the requested ranges to (row group, column) chunks using the file's metadata.
 - Add the same columns for the next row groups to the SAME batched `get_byte_ranges` call, under a per-reader byte budget of about 16 MB, and serve later requests that fall inside a buffered chunk.
