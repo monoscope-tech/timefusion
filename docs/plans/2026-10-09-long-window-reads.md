@@ -135,6 +135,15 @@ At 30d, most filtered queries time out at 90 s.
   - WAL 7.0 GB in 8 files, oldest pin 459 s. There's no before/after WAL number for #357 this session.
   - `pending_base_rollup` 78, `pending_dedup` 108, eligible 0, 0 running. The oldest task is 6.6 h old.
 
+### 08:05 check (current build, 1.8 h uptime)
+- **Dashboards (scorecard):** 0.3–1.7 s at 24h/7d/30d.
+- **Endpoint requests widget:** 0.9–1.5 s.
+- **Needles:** 0.5–1.0 s.
+- **RSS:** 17.1 GB.
+- **Disk tier:** `foyer.l2_write_bytes` 26.5 GB, so it's still writing.
+- **WAL: 16.0 GB in 17 files.** It was 7.0 GB at 06:36, and your watch line is 50 GB. The oldest pin is 455 s, so it isn't pin-bound. Check the GC cadence if it keeps climbing.
+- **Maintenance runs in waves** (hot packing completing at 08:10). But one due task has gone unclaimed for 6.9 h (`oldest_due_unclaimed_age_seconds` 24,687), with `admission_refused_state_bytes_total` 3 and `retry.BaseRollup.admission_busy` 3. That's likely a BaseRollup unit too large for the state-bytes budget. Not investigated.
+
 ### Housekeeping
 - `FLAG timefusion_parquet_range_kb` is now an inert knob: the A/B concluded and the default is unchanged. Remove it with the next code change.
 - The vendored `foyer-storage` is pinned to 0.22.6 via `[patch.crates-io]`. If `foyer` bumps its storage dependency, the patch stops applying with only a cargo warning. The bug is worth an upstream issue to foyer-rs (your call).
