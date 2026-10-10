@@ -96,19 +96,33 @@ Order = user impact for shipbubble. Prod measurements run one at a time; code ru
 
 - [x] **N0** Diagnose why every dashboard widget pays a raw "today" leg. A 7d widget is 0.45 s ending at midnight and 2.95 s ending now. Every hour of today misses with `stale_coverage`; yesterday hits fully.
 - [x] **N1** Rollup debounce max-wait (#355, `b352c5df`): ended rollup slices come due ≤30 min after first dirty.
-- [ ] **N2** Version-only admission narrowed to OVERLAPPING commits (branch `rollup/version-only-overlap`). Enrichment of older rows was refused whenever ANY commit began since its read (declined 310,703 of 310,706), so every hour of today stayed stale. Verify on prod:
+- [x] **N2** Version-only admission narrowed to OVERLAPPING commits (#356, `e3f50cd9`, live 00:42).
+  - Measured 01:22: `declined_by_commit` = **0** and admitted 522 (was 3 total).
+  - The remaining declines are first flushes (buffered predecessor, by design).
+  - Original notes: Enrichment of older rows was refused whenever ANY commit began since its read (declined 310,703 of 310,706), so every hour of today stayed stale. Verify on prod:
   - `rollup_version_only_rows_total` grows;
   - `..._declined_by_commit_rows_total` stays low;
   - hourly probes of today hit;
   - 7d widget ending-now approaches 0.45 s.
-- [ ] **N3** Endpoint widgets (`array_has(hashes, …)`): `hashes_30m` today slices are invalidated by the hashes updates themselves. Measure after N2; if still raw, cheapen the today leg (CPU-bound dedup and list decode, ~2.5 s).
+- [x] **N3** Endpoint widgets: after #355 + N2 + the drain, **0.7–2.4 s at 7–30d** (01:35; was 1.8–5.7 s at 21:30). `hashes_30m` today 0.3 s, 10-09 1.0 s, 10-08 0.4 s (all routed). The remaining ~1 s is planning (N5). Original notes:: `hashes_30m` today slices are invalidated by the hashes updates themselves. Measure after N2; if still raw, cheapen the today leg (CPU-bound dedup and list decode, ~2.5 s).
 - [ ] **N4** Remaining shipbubble rollup misses: `multi_scan_source` (30d traffic and var_service), `not_built` (latency_percentiles, http_by_status 7d), `filter_not_eligible`.
+- [x] **N5a** Maintenance scans skip the second replay (#356). **N5b** open: per-scan planning ~31 ms (replay 21 ms, footer ordering) is now the largest fixed cost of a routed widget.
 - [ ] **N5** Delta planning ~31 ms per scan. Maintenance scans' second replay is in a parallel worktree, `scan/maintenance-selection-ignore`.
 - [ ] **N6** WAL segments pinned by idle writers (parallel worktree `wal/roll-idle-writers`).
-- [ ] **N7** Rare-column filters (`http.status = 500`, route): 20–50 s cold.
-- [ ] **N8** 30d percentile charts: 3.7 s against 23 s variance; classify cold/warm and routed/raw.
+- [ ] **N7** Rare-column filters: 20–50 s cold. **Analyzed 01:45**, 7d chart filtered on `attributes___http___request___method`:
+  - Run 1: 50.8 s, 2,065 GETs, 3.4 GB from the store.
+  - Run 2: 31 s, still 1,791 GETs (frequency-based cache admission).
+  - Run 3: 2.3 s, cached.
+  - Cost = ~10 GETs per file per scan, from ~36k-row row groups (the `timefusion_max_row_group_size` 128 MB cap).
+  - Proposal: raise the row-group cap for SEALED consolidation only (fewer, larger row groups means proportionally fewer cold GETs).
+  - NOT shipped: 4x writer memory in the lane that nearly OOM'd at 00:16. Prove it on `run-unit` or staging first.
+- [x] **N8** 30d percentile charts: warm and routed (hybrid) **1.1–2.4 s** (01:40). The 23 s samples were cold/stale-coverage periods, not a separate defect. Original:: 3.7 s against 23 s variance; classify cold/warm and routed/raw.
 - [ ] **N9** Needle leftovers: hit materialization reads `_id` (~47 MB per index); trace-id FST whole reads.
 - [ ] **N10** Keep the scorecard current; morning summary.
+
+**Incidents tonight (both resolved; lessons in the memory notes):**
+- 00:06–00:24 midnight storm. Day rollover + starved rollups released by #355 took `pending_base_rollup` to 962, running tasks 12→54, CPU 40/48 cores, RSS to 67.8 GB. Throttled with `FLAG SET timefusion_maintenance_cpu_tokens 24`; RSS fell to 48 GB. Re-applied automatically after the 00:42 restart.
+- 00:42–01:25 my throttle wedged maintenance. 24 tokens is below some units' cost: 0 running, `tasks_complete` frozen. Raised to 40 and work resumed. Rule: a cap must stay at or above the largest unit's cost; verify `tasks_complete` moves after any cap change.
 
 ### R1 — Latest-N with a filter: stop reading every group's head file
 
