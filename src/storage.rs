@@ -1575,7 +1575,7 @@ impl ObjectStore for FoyerObjectStoreCache {
         // Cap the tee buffer at the largest entry the disk tier can persist,
         // tightened by the inline-warm and per-upload caps. The budget must
         // be in the min, or every reservation fails and capture silently stops.
-        let cap = [self.config.warm_inline_max_bytes, self.config.write_capture_max_bytes, self.config.write_capture_budget_bytes, FOYER_FLUSH_BUFFER_BYTES]
+        let cap = [self.config.warm_inline_max_bytes, self.config.write_capture_max_bytes, self.config.write_capture_budget_bytes]
             .into_iter()
             .filter(|&c| c > 0)
             .fold(self.config.block_size_bytes, usize::min);
