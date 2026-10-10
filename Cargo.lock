@@ -3747,8 +3747,6 @@ dependencies = [
 [[package]]
 name = "foyer-storage"
 version = "0.22.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "118192f532ba013f0cdc607efc22324b9ed855baed185608af0daa986e835c6b"
 dependencies = [
  "allocator-api2",
  "anyhow",

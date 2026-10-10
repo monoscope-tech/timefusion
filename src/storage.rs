@@ -2714,6 +2714,38 @@ mod tests {
         Ok(())
     }
 
+    /// A disk tier recovered with no clean block must still take writes. Prod reopened 158
+    /// blocks with data and 0 clean, then wrote nothing for its whole life (`l2_write_bytes`
+    /// 0 after 12.8 GB admitted): nothing reclaims until a block is written, and no block can
+    /// be written without a clean one.
+    #[tokio::test]
+    async fn a_disk_tier_reopened_without_a_clean_block_still_takes_writes() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let open = || build_hybrid_cache(dir.path(), 1 << 20, 1, 512 << 20, 64 << 20, None);
+        let put = |cache: &FoyerCache, key: String| {
+            let value = CacheValue::new(vec![7u8; 2 << 20], meta_for(&Path::from(key.as_str()), 2 << 20));
+            cache.insert_with_properties(key, value, HybridCacheProperties::default().with_location(Location::OnDisk));
+        };
+        let cache = open().await?;
+        (0..40).for_each(|i| put(&cache, format!("fill{i}")));
+        cache.close().await?;
+        drop(cache);
+        // Every block a copy of a data block: the state a stop mid-write leaves behind.
+        let blocks = std::fs::read_dir(dir.path())?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.to_string_lossy().contains("foyer-storage"))
+            .sorted()
+            .collect_vec();
+        let data = blocks.iter().find(|p| std::fs::read(p).is_ok_and(|b| b.iter().take(4096).any(|&x| x != 0))).expect("a written block").clone();
+        blocks.iter().filter(|p| **p != data).try_for_each(|p| std::fs::copy(&data, p).map(drop))?;
+
+        let cache = open().await?;
+        (0..8).for_each(|i| put(&cache, format!("after{i}")));
+        tokio::time::timeout(Duration::from_secs(10), cache.storage().wait()).await.map_err(|_| anyhow::anyhow!("flushers never got a clean block"))?;
+        assert!(cache.statistics().disk_write_bytes() > 0, "the reopened disk tier wrote nothing");
+        Ok(())
+    }
+
     /// The disk tier must keep what the read path steers to it. foyer drops an entry, without
     /// error, when its flush buffer is full or the entry is larger than that buffer (16 MiB by
     /// default), so a cold scan's burst and every entry above `l1_max_entry_bytes` were lost.

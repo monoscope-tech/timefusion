@@ -259,6 +259,10 @@ strip = "none"
 # unsupported `_pq_.*` startup option, even when protocol 3.2 itself matches.
 # MemPortalStore also exposes statement cleanup for SQL DEALLOCATE ALL.
 pgwire = { path = "vendor/pgwire" }
+# foyer-storage 0.22.6 + reclaim when a flusher waits for a clean block. Upstream only
+# reclaims after taking a clean block or finishing a write/reclaim, so a disk tier
+# recovered with 0 clean blocks never writes again.
+foyer-storage = { path = "vendor/foyer-storage" }
 # datafusion-postgres ecosystem on our fork's DataFusion 54 branch
 # (apitoolkit/datafusion-postgres @ timefusion-df54, off v0.16.0). Includes
 # bind-parameter, cursor, catalog, and PostgreSQL-client compatibility fixes.
