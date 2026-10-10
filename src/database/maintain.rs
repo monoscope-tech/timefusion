@@ -5427,6 +5427,7 @@ impl Database {
         let Some(day_start) = date_start_micros(date) else { return };
         let day_end = day_start.saturating_add(DAY_MICROS);
         let mut carried = 0u64;
+        let mut keys = Vec::new();
         self.rollup_slice_coverage.iter_mut().for_each(|mut entry| {
             let (project, source, _, start, _) = entry.key();
             if project != project_id || source != table_name || *start < day_start || *start >= day_end {
@@ -5435,8 +5436,12 @@ impl Database {
             if let Some(rows) = entry.value().source_rows {
                 entry.value_mut().source_rows = Some(rows.saturating_sub(dropped));
                 carried = carried.saturating_add(1);
+                keys.push(entry.key().clone());
             }
         });
+        if !keys.is_empty() {
+            self.persist_carried_witnesses(keys);
+        }
         if carried > 0 {
             crate::observability::maintenance_stats().rollup_witness_carried.fetch_add(carried, std::sync::atomic::Ordering::Relaxed);
             debug!(table_name, project_id, date, dropped, carried, event = "rollup_witness_carried_across_dedup");
@@ -5482,11 +5487,13 @@ impl Database {
         // Per tier: (live partition files, rewrite inputs, rewrite outputs).
         let mut sides: HashMap<String, Option<(FileRows, FileRows, FileRows)>> = HashMap::new();
         let mut carried = 0u64;
+        let mut keys = Vec::new();
         for mut entry in self.rollup_slice_coverage.iter_mut() {
             let (project, held_source, tier, start, _) = entry.key();
             if project != project_id || held_source != source || !day.contains(start) {
                 continue;
             }
+            let key = entry.key().clone();
             let tier = tier.clone();
             let Some((live, inputs, outputs)) = sides
                 .entry(tier.clone())
@@ -5500,6 +5507,7 @@ impl Database {
             };
             let coverage = entry.value_mut();
             let bound = coverage.covered_through;
+            let before = carried;
             for (held, bound) in [(&mut coverage.source_rows, i64::MAX), (&mut coverage.source_rows_below, bound)] {
                 if let Some(rows) = held.and_then(|held| crate::rollup::carried_witness(held, live, inputs, outputs, bound)).filter(|rows| Some(*rows) != *held)
                 {
@@ -5507,9 +5515,34 @@ impl Database {
                     carried += 1;
                 }
             }
+            if carried > before {
+                keys.push(key);
+            }
+        }
+        if !keys.is_empty() {
+            self.persist_carried_witnesses(keys);
         }
         crate::observability::maintenance_stats().rollup_witness_carried.fetch_add(carried, std::sync::atomic::Ordering::Relaxed);
         debug!(source, project_id, date, carried, event = "rollup_witness_carried_across_rewrite");
+    }
+
+    /// Write the carried witnesses of `keys` through to the sidecar recovery applies over
+    /// the tier tags, which keep the pre-rewrite counts. Best-effort: a lost write only
+    /// costs that slice a rebuild.
+    fn persist_carried_witnesses(&self, keys: Vec<RollupSliceCoverageKey>) {
+        for key in keys {
+            if let Some(coverage) = self.rollup_slice_coverage.get(&key) {
+                let carried = crate::storage::StoredCarriedWitness {
+                    slice: key.clone(),
+                    build: (coverage.generation.clone(), coverage.source_fp),
+                    source_rows: coverage.source_rows,
+                    source_rows_below: coverage.source_rows_below,
+                };
+                self.rollup_carried_witnesses.insert(key, carried);
+            }
+        }
+        let stored = self.rollup_carried_witnesses.iter().map(|entry| entry.value().clone()).collect_vec();
+        crate::storage::store_sidecar(&self.config.core.timefusion_data_dir, crate::storage::ROLLUP_CARRIED_WITNESSES, &stored);
     }
 
     /// THE strip-lane admission, one predicate for planner and packer so they
@@ -6369,6 +6402,15 @@ impl Database {
                     // rebuild rather than freezing.
                     let content_fp = content_fp_by_identity.get(&identity).copied().flatten();
                     let source_rows_below = bounded_by_identity.get(&identity).copied().flatten();
+                    // A rewrite after the build moved the witnesses; the carry outlives the tags.
+                    let slice_key = (project_id.clone(), source.to_string(), target.clone(), slice_start, slice_end);
+                    let carried = self
+                        .rollup_carried_witnesses
+                        .get(&slice_key)
+                        .filter(|carried| carried.build == (generation.clone(), source_fp))
+                        .map(|carried| carried.clone());
+                    let (source_rows, source_rows_below) =
+                        carried.map_or((source_rows, source_rows_below), |carried| (carried.source_rows, carried.source_rows_below));
                     let output =
                         paths_by_identity.get(&identity).map_or(RollupOutputEvidence::Unknown, |(_, paths)| RollupOutputEvidence::from_file_count(paths.len()));
                     self.rollup_slice_coverage.insert(
@@ -6419,6 +6461,14 @@ impl Database {
             event = "rollup_coverage_recovered"
         );
         self.rollup_coverage_recovered.insert(source.to_owned());
+        // A carry outlives only its own build: drop those whose slice retired or rebuilt.
+        let held = self.rollup_carried_witnesses.len();
+        self.rollup_carried_witnesses.retain(|key, carried| {
+            key.1 != source || self.rollup_slice_coverage.get(key).is_some_and(|coverage| (coverage.generation.clone(), coverage.source_fp) == carried.build)
+        });
+        if self.rollup_carried_witnesses.len() != held {
+            self.persist_carried_witnesses(Vec::new());
+        }
         Ok(recovered)
     }
 
@@ -12259,6 +12309,64 @@ mod rollup_noop_skip_tests {
         let (routed, served, after) = answer().await?;
         assert!(routed, "the carried witness keeps today's slice routed");
         assert_eq!((served, after), (raw.clone(), raw), "and it answers exactly as before, and as raw");
+        Ok(())
+    }
+
+    /// A carried witness must survive a restart. Recovery re-reads the tier files' tags,
+    /// which still hold the pre-strip counts, so without a persisted carry every slice of
+    /// today built before a deploy read stale until rebuilt (prod 10-10: every hour of
+    /// today but the newest missed with `stale_coverage` after each deploy).
+    #[serial]
+    #[tokio::test]
+    async fn a_carried_witness_survives_a_restart() -> Result<()> {
+        let cfg = rollup_cfg("carried_witness_restart");
+        let db = Arc::new(Database::with_config(Arc::clone(&cfg)).await?);
+        db.get_or_create_unified_table("otel_logs_and_spans").await?;
+        db.reconcile_maintenance_task_cursors().await?;
+        let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+        let today = pin_tomorrow_noon();
+        let at = today.and_hms_opt(0, 1, 0).expect("valid minute").and_utc().timestamp_micros();
+        for rows in [
+            vec![test_span_ts("dup", "first", &project_id, at), test_span_ts("other", "op", &project_id, at + 1)],
+            vec![test_span_ts("dup", "second", &project_id, at)],
+        ] {
+            db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![json_to_batch(rows)?], true, None).await?;
+        }
+        dedup_unified(&db).await?;
+        db.reconcile_maintenance_task_cursors().await?;
+        assert!(advance_and_drain(&db).await? > 0, "today's slice must build");
+        db.recover_rollup_coverage("otel_logs_and_spans").await?;
+        let (lo, hi) = db
+            .rollup_slice_coverage
+            .iter()
+            .find(|entry| entry.key().0 == project_id && entry.key().2 == TIER && entry.key().3 <= at && at < entry.key().4)
+            .map(|entry| (entry.key().3, entry.key().4))
+            .expect("the live base slice holding the rows");
+        let sql = format!(
+            "SELECT COUNT(*) AS c FROM otel_logs_and_spans WHERE project_id='{project_id}' AND timestamp >= to_timestamp_micros({lo}) AND timestamp < to_timestamp_micros({hi})"
+        );
+        let answer = async |db: &Arc<Database>| {
+            let mut ctx = Arc::clone(db).create_session_context();
+            db.setup_session_context(&mut ctx)?;
+            let state = ctx.state();
+            let plan = state.optimize(&state.create_logical_plan(&sql).await?)?;
+            let routed = db.rollup_sql(&plan, &state).await.is_ok_and(|rewrites| !rewrites.is_empty());
+            let render = |batches: Vec<RecordBatch>| arrow::util::pretty::pretty_format_batches(&batches).map(|table| table.to_string());
+            anyhow::Ok((routed, render(ctx.sql(&sql).await?.collect().await?)?, render(db.query_delta_only(&sql).await?)?))
+        };
+        let (_, _, raw) = answer(&db).await?;
+        db.plan_compaction_debt().await?;
+        assert!(db.run_coordinator_compaction_once(Operation::HotPacking).await?, "today's DV file is hot-packing debt");
+        let (routed, served, _) = answer(&db).await?;
+        assert!(routed && served == raw, "precondition: the carried witness routes the slice in-process");
+        drop(db);
+
+        let db = Arc::new(Database::with_config(cfg).await?);
+        db.get_or_create_unified_table("otel_logs_and_spans").await?;
+        db.recover_rollup_coverage("otel_logs_and_spans").await?;
+        let (routed, served, after) = answer(&db).await?;
+        assert!(routed, "the slice must still route after a restart");
+        assert_eq!((served, after), (raw.clone(), raw), "and answer exactly as raw");
         Ok(())
     }
 

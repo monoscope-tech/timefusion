@@ -2656,6 +2656,9 @@ pub struct Database {
     /// `rollup_slice_coverage`.
     rollup_coverage: Arc<dashmap::DashMap<RollupCoverageKey, RollupCoverage>>,
     rollup_slice_coverage: Arc<dashmap::DashMap<RollupSliceCoverageKey, RollupCoverage>>,
+    /// Witnesses carried across row-dropping rewrites, by slice and build `(generation,
+    /// source_fp)`; persisted so recovery can apply them over the tier tags.
+    rollup_carried_witnesses: Arc<dashmap::DashMap<RollupSliceCoverageKey, crate::storage::StoredCarriedWitness>>,
     /// Sources whose `recover_rollup_coverage` has completed in this process.
     rollup_coverage_recovered: Arc<dashmap::DashSet<String>>,
     /// A `StripWindow` per `StripKey`.
@@ -3357,6 +3360,12 @@ impl Database {
             rollup_source_epochs,
             rollup_coverage: Arc::new(dashmap::DashMap::new()),
             rollup_slice_coverage: Arc::new(dashmap::DashMap::new()),
+            rollup_carried_witnesses: Arc::new(
+                crate::storage::load_sidecar::<crate::storage::StoredCarriedWitness>(&cfg.core.timefusion_data_dir, crate::storage::ROLLUP_CARRIED_WITNESSES)
+                    .into_iter()
+                    .map(|carried| (carried.slice.clone(), carried))
+                    .collect(),
+            ),
             rollup_coverage_recovered: Arc::new(dashmap::DashSet::new()),
             dv_strips_landed: Arc::new(dashmap::DashMap::new()),
             dv_strips_global: Arc::new(parking_lot::Mutex::new((0, 0))),

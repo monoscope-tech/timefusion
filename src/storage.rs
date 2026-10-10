@@ -3114,6 +3114,20 @@ pub const DIRTY_BINS: (&str, &str) = ("dedup_dirty_bins.json", "dirty-bin queue"
 
 pub const ROLLUP_COVERAGE: (&str, &str) = ("rollup_coverage_ledger.json", "rollup coverage ledger");
 
+/// Rollup slice witnesses carried across row-dropping rewrites, keyed by the slice's build
+/// identity. Recovery reads the tier files' tags, which keep the pre-rewrite counts.
+pub const ROLLUP_CARRIED_WITNESSES: (&str, &str) = ("rollup_carried_witnesses.json", "carried rollup witness store");
+
+/// One carried witness: the slice `(project, source, tier, start, end)` built as
+/// `(generation, source_fp)` now proves `source_rows` / `source_rows_below`.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct StoredCarriedWitness {
+    pub slice: (String, String, String, i64, i64),
+    pub build: (String, u64),
+    pub source_rows: Option<u64>,
+    pub source_rows_below: Option<u64>,
+}
+
 /// One slice of a rollup tier, and what it was built FROM. The same facts also
 /// live in Delta metadata tags on each parquet file (`TAG_SLICE_START` etc.).
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
