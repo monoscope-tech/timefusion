@@ -424,10 +424,7 @@ async fn build_hybrid_cache(
             .storage()
             .with_spawner(foyer_spawner())
             .with_io_engine_config(PsyncIoEngineConfig::new())
-            .with_engine_config(
-                BlockEngineConfig::new(FsDeviceBuilder::new(dir).with_capacity(disk_bytes).build()?)
-                    .with_block_size(block_size),
-            )
+            .with_engine_config(BlockEngineConfig::new(FsDeviceBuilder::new(dir).with_capacity(disk_bytes).build()?).with_block_size(block_size))
             .build()
             .await?,
     ))
