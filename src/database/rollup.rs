@@ -94,11 +94,21 @@ const COORDINATOR_IDLE_BACKOFF: std::time::Duration = std::time::Duration::from_
 
 impl Database {
     pub(super) fn rollup_generation_current(source: &str, target: &str, project: &str, date: &str, coverage: &RollupCoverage) -> bool {
-        let Some(spec) = get_schema(source).and_then(|schema| schema.rollups.iter().find(|spec| spec.table_name(source) == target)) else {
-            return false;
+        // Specs are compiled in, so a (target, measure set) prefix never goes stale.
+        static PREFIXES: std::sync::LazyLock<dashmap::DashMap<(String, Option<Vec<String>>), Option<u64>>> = std::sync::LazyLock::new(dashmap::DashMap::new);
+        let measures = coverage.measures.as_ref().map(|names| names.iter().cloned().sorted_unstable().collect::<Vec<_>>());
+        let key = (target.to_owned(), measures);
+        let prefix = match PREFIXES.get(&key) {
+            Some(prefix) => *prefix,
+            None => {
+                let prefix = get_schema(source)
+                    .and_then(|schema| schema.rollups.iter().find(|spec| spec.table_name(source) == target))
+                    .map(|spec| crate::rollup::generation_prefix(spec, key.1.as_deref()));
+                PREFIXES.insert(key, prefix);
+                prefix
+            }
         };
-        let measures = coverage.measures.as_ref().map(|names| names.iter().cloned().collect::<Vec<_>>());
-        coverage.generation == crate::rollup::generation_id(spec, source, project, date, coverage.source_fp, measures.as_deref())
+        prefix.is_some_and(|prefix| coverage.generation == crate::rollup::generation_id_from(prefix, source, project, date))
     }
 
     /// Why a coverage cell cannot serve this route: a stale generation first, then

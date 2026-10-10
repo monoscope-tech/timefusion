@@ -35,6 +35,45 @@ fn rollup_output_evidence_requires_empty_publication_proof(output: RollupOutputE
     .is_some()
 }
 
+/// Routing checks every slice-coverage cell's generation on every query; rendering the
+/// spec per cell was 72% of `rollup_output_coverage` on prod. The answer must not change
+/// (ids are persisted), and a spec must render once, not once per cell.
+#[test]
+fn generation_checks_render_each_spec_once_and_match_the_persisted_ids() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let source = "otel_logs_and_spans";
+    let schema = crate::schema::get_schema(source).expect("registered");
+    let cells = (0..200).map(|i| (format!("project-{}", i % 7), format!("2026-09-{:02}", 1 + i % 28))).collect::<Vec<_>>();
+    let check = |spec: &crate::schema::RollupSpec, measures: Option<HashSet<String>>| {
+        let target = spec.table_name(source);
+        let held = measures.as_ref().map(|names| names.iter().cloned().collect::<Vec<_>>());
+        let before = crate::rollup::GENERATION_RENDERS.load(Relaxed);
+        for (project, date) in &cells {
+            let coverage = |generation| RollupCoverage {
+                source_fp: 7,
+                source_epoch: None,
+                generation,
+                source_rows: None,
+                source_rows_below: None,
+                covered_through: 0,
+                measures: measures.clone(),
+                content_fp: None,
+                output: RollupOutputEvidence::Unknown,
+            };
+            let persisted = crate::rollup::generation_id(spec, source, project, date, 7, held.as_deref());
+            assert!(Database::rollup_generation_current(source, &target, project, date, &coverage(persisted)), "{target} {project} {date}");
+            assert!(!Database::rollup_generation_current(source, &target, project, date, &coverage("0000000000000000".into())));
+        }
+        // `generation_id` itself renders once per cell; the routing check adds at most one.
+        let renders = crate::rollup::GENERATION_RENDERS.load(Relaxed) - before;
+        assert!(renders <= cells.len() + 1, "{target}: the routing check rendered the spec {} times for {} cells", renders - cells.len(), cells.len());
+    };
+    for spec in &schema.rollups {
+        check(spec, None);
+        check(spec, Some(spec.measures.iter().take(1).map(|m| m.name.clone()).collect()));
+    }
+}
+
 #[test_case(1 => 1; "a one-lane pool cannot reserve a lane")]
 #[test_case(2 => 1; "a two-lane pool splits hot and sealed")]
 #[test_case(5 => 1; "production leaves four of five lanes available to sealed debt")]
