@@ -27,6 +27,14 @@ use tracing::{Instrument, debug, field::Empty, info, instrument, warn};
 
 /// Align large Parquet data reads so sliding time predicates reuse the same cache entry.
 const PARQUET_RANGE_ALIGNMENT_BYTES: u64 = 1024 * 1024;
+/// Default of `FLAG SET timefusion_parquet_range_kb`.
+pub const PARQUET_RANGE_KB: u32 = (PARQUET_RANGE_ALIGNMENT_BYTES / 1024) as u32;
+
+/// Parquet read granularity: a data-range miss widens to this alignment, and `get_ranges`
+/// coalesces requests across gaps up to it. 0 = fetch exactly what the reader asks for.
+fn parquet_range_bytes() -> u64 {
+    u64::from(crate::config::RuntimeFlag::TimefusionParquetRangeKb.override_value().unwrap_or(PARQUET_RANGE_KB)) * 1024
+}
 
 /// Clip an aligned read's response offsets to the bytes actually returned.
 ///
@@ -1183,6 +1191,7 @@ impl FoyerObjectStoreCache {
             // amplification competes with the foreground range requests; large files are
             // warmed only by upload capture and the post-commit/restart warmer.
             // A bypassed scan declines the admission, so it fetches only the range.
+            let align = parquet_range_bytes();
             if file_meta.size <= self.config.l1_max_entry_bytes as u64 && !bypass_active() {
                 debug!("Foyer cache MISS for Parquet data: {} (range: {}..{}, fetching full file)", location, range.start, range.end);
                 if let Ok(result) = self.get_cached(location).await {
@@ -1191,11 +1200,11 @@ impl FoyerObjectStoreCache {
                         return Ok(Bytes::from(full).slice(range.start as usize..range.end as usize));
                     }
                 }
-            } else if file_size > PARQUET_RANGE_ALIGNMENT_BYTES {
+            } else if align > 0 && file_size > align {
                 // Exact DataFusion ranges shift with the predicate; normalize their
                 // edges so the next refresh addresses the same cache entry.
-                let aligned_start = (range.start / PARQUET_RANGE_ALIGNMENT_BYTES) * PARQUET_RANGE_ALIGNMENT_BYTES;
-                let aligned_end = range.end.div_ceil(PARQUET_RANGE_ALIGNMENT_BYTES).saturating_mul(PARQUET_RANGE_ALIGNMENT_BYTES).min(file_size);
+                let aligned_start = (range.start / align) * align;
+                let aligned_end = range.end.div_ceil(align).saturating_mul(align).min(file_size);
                 let aligned = aligned_start..aligned_end;
                 let aligned_key = Self::make_range_cache_key(location, &aligned);
                 if aligned != range
@@ -1571,6 +1580,10 @@ impl ObjectStore for FoyerObjectStoreCache {
             admission: self.admission.clone(),
             reservation,
         }))
+    }
+
+    async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> ObjectStoreResult<Vec<Bytes>> {
+        object_store::coalesce_ranges(ranges, |range| self.get_range(location, range), parquet_range_bytes()).await
     }
 
     async fn get_opts(&self, location: &Path, options: GetOptions) -> ObjectStoreResult<GetResult> {
@@ -2657,6 +2670,24 @@ mod tests {
         let warm = cache.get_stats().main;
         assert_eq!(warm.range_hits, 1, "a range inside an already-fetched window must hit the main range cache ({name})");
         assert_eq!(warm.inner_bytes_read, cold.inner_bytes_read, "a range hit must not touch the inner store");
+        Ok(())
+    }
+
+    /// `FLAG SET timefusion_parquet_range_kb 0` fetches exactly the ranges the reader asks for:
+    /// no alignment widening, no gap-filling between them.
+    #[tokio::test]
+    async fn range_kb_zero_fetches_exactly_the_requested_ranges() -> anyhow::Result<()> {
+        let mem = Arc::new(InMemory::new());
+        let (_shared, cache, _dir) = shared_with("range_kb_zero", mem.clone(), |c| c.l1_max_entry_bytes = 64).await?;
+        let path = Path::from("tbl/date=2026-01-02/exact.parquet");
+        let body: Vec<u8> = (0..4 * PARQUET_RANGE_ALIGNMENT_BYTES as usize).map(|i| (i % 251) as u8).collect();
+        mem.put(&path, PutPayload::from(Bytes::from(body.clone()))).await?;
+
+        crate::config::RuntimeFlag::TimefusionParquetRangeKb.set_override(Some(0));
+        let got = cache.get_ranges(&path, &[100..200, 300_000..300_100]).await;
+        crate::config::RuntimeFlag::TimefusionParquetRangeKb.set_override(None);
+        assert_eq!(got?, vec![Bytes::copy_from_slice(&body[100..200]), Bytes::copy_from_slice(&body[300_000..300_100])]);
+        assert_eq!(cache.get_stats().main.inner_bytes_read, 200, "no alignment widening and no gap-filling");
         Ok(())
     }
 
