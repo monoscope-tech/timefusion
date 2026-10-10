@@ -71,21 +71,7 @@ impl Writer {
 
         let need = (PREFIX_META_SIZE as u64) + (data.len() as u64);
         if *cur + need > block.limit {
-            debug_print!("[writer] sealing: col={}, block_id={}, used={}, need={}, limit={}", self.col, block.id, *cur, need, block.limit);
-            FileStateTracker::set_block_unlocked(block.id as usize);
-            let mut sealed = block.clone();
-            sealed.used = *cur;
-            sealed.flush()?;
-            let _ = self.reader.append_block_to_chain(&self.col, sealed);
-            debug_print!("[writer] appended sealed block to chain: col={}", self.col);
-            // switch to new block
-            // SAFETY: We hold `current_block` and `current_offset` mutexes, so
-            // this writer has exclusive ownership of the active block. The
-            // allocator's internal lock ensures unique block handout.
-            let new_block = unsafe { self.allocator.alloc_block(need) }?;
-            debug_print!("[writer] switched to new block: col={}, new_block_id={}", self.col, new_block.id);
-            *block = new_block;
-            *cur = 0;
+            self.seal_and_switch(&mut block, &mut cur, need)?;
         }
         let next_block_start = block.offset + block.limit; // simplistic for now
         block.write(*cur, data, &self.col, next_block_start)?;
@@ -394,6 +380,38 @@ struct BatchRevertInfo {
 }
 
 impl Writer {
+    /// Seal the active block into the reader chain and switch to a fresh one of at least
+    /// `need` bytes. Callers hold `current_block` and `current_offset`.
+    fn seal_and_switch(&self, block: &mut Block, cur: &mut u64, need: u64) -> std::io::Result<()> {
+        debug_print!("[writer] sealing: col={}, block_id={}, used={}, need={}, limit={}", self.col, block.id, *cur, need, block.limit);
+        FileStateTracker::set_block_unlocked(block.id as usize);
+        let mut sealed = block.clone();
+        sealed.used = *cur;
+        sealed.flush()?;
+        let _ = self.reader.append_block_to_chain(&self.col, sealed);
+        // SAFETY: the caller holds both mutexes, so this writer exclusively owns the
+        // active block; the allocator's lock makes the handout unique.
+        *block = unsafe { self.allocator.alloc_block(need) }?;
+        *cur = 0;
+        debug_print!("[writer] switched to new block: col={}, new_block_id={}", self.col, block.id);
+        Ok(())
+    }
+
+    /// Seal and switch the active block when it lives in a `stale` file: an idle writer's
+    /// open block otherwise pins its whole segment, since GC must not delete a file a
+    /// writer still appends to. True when it rolled.
+    pub(super) fn roll_if(&self, stale: impl Fn(&str) -> bool) -> std::io::Result<bool> {
+        if self.is_batch_writing.load(Ordering::Acquire) {
+            return Ok(false);
+        }
+        let mut block = self.current_block.lock().map_err(|_| std::io::Error::other("current_block lock poisoned"))?;
+        let mut cur = self.current_offset.lock().map_err(|_| std::io::Error::other("current_offset lock poisoned"))?;
+        if !stale(&block.file_path) {
+            return Ok(false);
+        }
+        self.seal_and_switch(&mut block, &mut cur, 1).map(|()| true)
+    }
+
     /// Durably flush the active block's storage. Sealed blocks are flushed at
     /// seal time and `batch_write` flushes what it touched, so after this
     /// every byte previously accepted by `write()` is on disk.

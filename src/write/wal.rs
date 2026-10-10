@@ -232,6 +232,20 @@ pub struct WalManager {
 }
 
 impl WalManager {
+    /// GC this WAL's directory past `max_age` and the durability floor (see [`gc_wal_files`]).
+    /// Writers whose open block sits in an aged-out segment roll to a fresh one first: an
+    /// idle topic's block otherwise pins its whole segment until it writes another 10 MB.
+    pub fn gc(&self, max_age: std::time::Duration, unflushed_floor_micros: Option<i64>) -> std::io::Result<(u64, u64)> {
+        let cutoff = gc_cutoff(max_age, unflushed_floor_micros);
+        let rolled = self.wal.roll_writers_in(|path| std::fs::metadata(path).and_then(|m| m.modified()).is_ok_and(|modified| modified < cutoff))?;
+        if rolled > 0 {
+            debug!(rolled, "wal gc: rolled idle writers off aged segments");
+        }
+        gc_wal_files(&self.data_dir, max_age, unflushed_floor_micros)
+    }
+}
+
+impl WalManager {
     pub fn with_fsync_mode_and_shards(data_dir: PathBuf, mode: crate::config::WalFsyncMode, shards_per_topic: usize) -> Result<Self, WalError> {
         std::fs::create_dir_all(&data_dir)?;
         Self::check_wal_version_stamp(&data_dir)?;
@@ -1693,6 +1707,15 @@ pub fn quarantine_stats(wal_dir: &std::path::Path) -> (usize, u64) {
     (files, bytes)
 }
 
+/// Files last modified before this are past GC's age and durability bounds.
+fn gc_cutoff(max_age: std::time::Duration, unflushed_floor_micros: Option<i64>) -> std::time::SystemTime {
+    use std::time::SystemTime;
+    let by_age = SystemTime::now().checked_sub(max_age).unwrap_or(SystemTime::UNIX_EPOCH);
+    unflushed_floor_micros.map_or(by_age, |floor| {
+        by_age.min(SystemTime::UNIX_EPOCH + std::time::Duration::from_micros(floor.saturating_sub(GC_FLOOR_SLACK_MICROS).max(0) as u64))
+    })
+}
+
 /// Delete WAL files older than `max_age` by mtime, recursing into subdirs.
 /// Skips dotfiles/dotdirs (`.timefusion_meta/`).
 ///
@@ -1707,10 +1730,7 @@ pub fn quarantine_stats(wal_dir: &std::path::Path) -> (usize, u64) {
 /// data ⇒ pure mtime. Without it, a crash loop's aged files ARE the backlog.
 pub fn gc_wal_files(wal_dir: &std::path::Path, max_age: std::time::Duration, unflushed_floor_micros: Option<i64>) -> std::io::Result<(u64, u64)> {
     use std::time::SystemTime;
-    let by_age = SystemTime::now().checked_sub(max_age).unwrap_or(SystemTime::UNIX_EPOCH);
-    let cutoff = unflushed_floor_micros.map_or(by_age, |floor| {
-        by_age.min(SystemTime::UNIX_EPOCH + std::time::Duration::from_micros(floor.saturating_sub(GC_FLOOR_SLACK_MICROS).max(0) as u64))
-    });
+    let cutoff = gc_cutoff(max_age, unflushed_floor_micros);
     let (mut deleted, mut bytes_freed) = (0u64, 0u64);
     let mut stack: Vec<PathBuf> = vec![wal_dir.to_path_buf()];
     while let Some(dir) = stack.pop() {
@@ -2569,6 +2589,27 @@ mod tests {
         wal.append("p", &table, &create_test_batch()).expect("append after GC");
         wal.append("p", &uniq("new"), &create_test_batch()).expect("a new topic's first append after GC");
         assert_eq!(wal.read_entries_raw("p", &table, None, true).unwrap().0.len(), 2);
+    }
+
+    /// Regression (R6): an idle topic's open block pinned its whole 1 GB segment until the
+    /// topic wrote another 10 MB, so GC kept aged-out segments indefinitely.
+    #[test]
+    fn gc_rolls_idle_writers_off_aged_segments() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal = wal_in(&tmp, crate::config::WalFsyncMode::SyncEach, 1);
+        let segments = || std::fs::read_dir(tmp.path()).unwrap().flatten().filter(|e| e.path().is_file()).map(|e| e.path()).collect::<Vec<_>>();
+        let idle = uniq("idle");
+        wal.append("p", &idle, &create_test_batch()).unwrap();
+        let first = segments();
+        // 100 more topics take a block each: the allocator moves to a new segment while the
+        // first still holds every one of their open blocks.
+        for _ in 0..100 {
+            wal.append("p", &uniq("busy"), &create_test_batch()).unwrap();
+        }
+        assert!(segments().len() > first.len(), "the allocator must have moved to a new segment");
+        wal.gc(std::time::Duration::ZERO, None).unwrap();
+        assert!(first.iter().all(|path| !path.exists()), "the aged segment its idle writers pinned must be reclaimed");
+        wal.append("p", &idle, &create_test_batch()).expect("an idle writer appends after its segment is reclaimed");
     }
 
     /// Open fds on WAL segments under `dir`, unlinked ones included (Linux

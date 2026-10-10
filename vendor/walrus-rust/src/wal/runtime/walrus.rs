@@ -96,6 +96,13 @@ impl Walrus {
         Ok(instance)
     }
 
+    /// Roll every writer whose active block lives in a file `stale` accepts, so the file
+    /// stops being live and GC may reclaim it. Returns how many rolled.
+    pub fn roll_writers_in(&self, stale: impl Fn(&std::path::Path) -> bool) -> std::io::Result<usize> {
+        let writers: Vec<Arc<Writer>> = self.writers.read().map_err(|_| std::io::Error::other("writers read lock poisoned"))?.values().cloned().collect();
+        writers.iter().try_fold(0, |rolled, writer| Ok(rolled + usize::from(writer.roll_if(|path| stale(std::path::Path::new(path)))?)))
+    }
+
     pub(super) fn get_or_create_writer(&self, col_name: &str) -> std::io::Result<Arc<Writer>> {
         if let Some(writer) = {
             let map = self.writers.read().map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "writers read lock poisoned"))?;

@@ -1862,14 +1862,13 @@ impl BufferedWriteLayer {
         // the sweep interval would otherwise never reclaim anything.
         const SWEEP_INTERVAL: Duration = Duration::from_secs(600);
         let max_age = self.config.buffer.wal_gc_max_age();
-        let wal_dir = self.wal.data_dir().clone();
         loop {
-            let dir = wal_dir.clone();
+            let wal = Arc::clone(&self.wal);
             // Durability floor: never delete a file that un-flushed data
             // (buffered, airborne, or orphaned) may still replay from.
             let floor = self.oldest_unflushed_wal_append_micros();
             // Filesystem walk is sync — keep it off the runtime.
-            let res = tokio::task::spawn_blocking(move || crate::write::wal::gc_wal_files(&dir, max_age, floor)).await;
+            let res = tokio::task::spawn_blocking(move || wal.gc(max_age, floor)).await;
             match res {
                 Ok(Ok((deleted, bytes_freed))) if deleted > 0 => {
                     info!("WAL GC: deleted {} stale files, freed {} bytes", deleted, bytes_freed);
