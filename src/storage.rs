@@ -401,19 +401,22 @@ fn foyer_spawner() -> foyer::Spawner {
         .clone()
 }
 
-/// foyer's disk flushers. Each serializes entries into a buffer of `FOYER_FLUSH_BUFFER_BYTES`
-/// and DROPS, without error, any entry that does not fit (foyer's default is one 16 MiB
-/// buffer). So this is also the largest value the disk tier can hold.
-const FOYER_FLUSHERS: usize = 4;
-const FOYER_FLUSH_BUFFER_BYTES: usize = 64 << 20;
-/// Entries queued for the flushers beyond this are dropped; a cold scan admits ~150 MB/s.
-const FOYER_SUBMIT_QUEUE_BYTES: usize = 1 << 30;
+/// foyer disk-tier write sizing for a `disk`-byte device of `block`-byte blocks: (flushers,
+/// per-flusher buffer, submit queue). A flusher DROPS, without error, any entry that does not
+/// fit its buffer, so the buffer is also the largest value the disk tier holds. Up to 4 x 64 MiB
+/// and a 1 GiB queue (a cold scan admits ~150 MB/s), scaled down so a small device keeps a
+/// spare clean block per flusher and is not outsized by its own buffers.
+fn flush_sizing(disk: usize, block: usize) -> (usize, usize, usize) {
+    let flushers = (disk / block.max(1)).saturating_sub(1).clamp(1, 4);
+    (flushers, (64usize << 20).min(block).min(disk / 4).max(1 << 20), (1usize << 30).min(disk))
+}
 
 /// Build one hybrid (memory + disk) cache tier.
 async fn build_hybrid_cache(
     dir: &std::path::Path, memory_bytes: usize, shards: usize, disk_bytes: usize, block_size: usize,
     listener: Option<Arc<dyn foyer::EventListener<Key = String, Value = CacheValue>>>,
 ) -> anyhow::Result<FoyerCache> {
+    let (flushers, buffer, queue) = flush_sizing(disk_bytes, block_size);
     let builder = HybridCacheBuilder::new().with_policy(HybridCachePolicy::WriteOnInsertion);
     let builder = listener.into_iter().fold(builder, |b, l| b.with_event_listener(l));
     Ok(Arc::new(
@@ -427,9 +430,9 @@ async fn build_hybrid_cache(
             .with_engine_config(
                 BlockEngineConfig::new(FsDeviceBuilder::new(dir).with_capacity(disk_bytes).build()?)
                     .with_block_size(block_size)
-                    .with_flushers(FOYER_FLUSHERS)
-                    .with_buffer_pool_size(FOYER_FLUSHERS * FOYER_FLUSH_BUFFER_BYTES)
-                    .with_submit_queue_size_threshold(FOYER_SUBMIT_QUEUE_BYTES),
+                    .with_flushers(flushers)
+                    .with_buffer_pool_size(flushers * buffer)
+                    .with_submit_queue_size_threshold(queue),
             )
             .build()
             .await?,
@@ -1575,10 +1578,15 @@ impl ObjectStore for FoyerObjectStoreCache {
         // Cap the tee buffer at the largest entry the disk tier can persist,
         // tightened by the inline-warm and per-upload caps. The budget must
         // be in the min, or every reservation fails and capture silently stops.
-        let cap = [self.config.warm_inline_max_bytes, self.config.write_capture_max_bytes, self.config.write_capture_budget_bytes, FOYER_FLUSH_BUFFER_BYTES]
-            .into_iter()
-            .filter(|&c| c > 0)
-            .fold(self.config.block_size_bytes, usize::min);
+        let cap = [
+            self.config.warm_inline_max_bytes,
+            self.config.write_capture_max_bytes,
+            self.config.write_capture_budget_bytes,
+            flush_sizing(self.config.disk_size_bytes, self.config.block_size_bytes).1,
+        ]
+        .into_iter()
+        .filter(|&c| c > 0)
+        .fold(self.config.block_size_bytes, usize::min);
         // Denied = this upload streams through un-teed; it never waits or fails.
         let reservation = CaptureReservation::acquire(cap, self.config.write_capture_budget_bytes);
         if reservation.is_none() {
@@ -2681,6 +2689,17 @@ mod tests {
         assert_eq!(warm.range_hits, 1, "a range inside an already-fetched window must hit the main range cache ({name})");
         assert_eq!(warm.inner_bytes_read, cold.inner_bytes_read, "a range hit must not touch the inner store");
         Ok(())
+    }
+
+    /// Prod-sized devices keep 4 x 64 MiB flushers; a device smaller than its own buffers
+    /// (CI e2e: 50 MB under 2 GiB blocks) falls back to one small flusher. The fixed sizing
+    /// broke flush write-capture on Linux CI.
+    #[test_case::test_case(313 << 30, 2 << 30 => (4, 64 << 20, 1 << 30); "prod")]
+    #[test_case::test_case(50 << 20, 2 << 30 => (1, 12_800 << 10, 50 << 20); "ci e2e device smaller than a block")]
+    #[test_case::test_case(512 << 20, 64 << 20 => (4, 64 << 20, 512 << 20); "eight small blocks")]
+    #[test_case::test_case(192 << 20, 64 << 20 => (2, 48 << 20, 192 << 20); "three blocks keep a spare")]
+    fn flush_sizing_scales_to_the_device(disk: usize, block: usize) -> (usize, usize, usize) {
+        flush_sizing(disk, block)
     }
 
     /// A disk tier recovered with no clean block must still take writes. Prod reopened 158
