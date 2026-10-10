@@ -95,7 +95,8 @@ const COORDINATOR_IDLE_BACKOFF: std::time::Duration = std::time::Duration::from_
 impl Database {
     pub(super) fn rollup_generation_current(source: &str, target: &str, project: &str, date: &str, coverage: &RollupCoverage) -> bool {
         // Specs are compiled in, so a (target, measure set) prefix never goes stale.
-        static PREFIXES: std::sync::LazyLock<dashmap::DashMap<(String, Option<Vec<String>>), Option<u64>>> = std::sync::LazyLock::new(dashmap::DashMap::new);
+        type Prefixes = dashmap::DashMap<(String, Option<Vec<String>>), Option<u64>>;
+        static PREFIXES: std::sync::LazyLock<Prefixes> = std::sync::LazyLock::new(Prefixes::new);
         let measures = coverage.measures.as_ref().map(|names| names.iter().cloned().sorted_unstable().collect::<Vec<_>>());
         let key = (target.to_owned(), measures);
         let prefix = match PREFIXES.get(&key) {
