@@ -1,3 +1,4 @@
+// bisect probe 5805d005
 //! Tests that recently-flushed data is served from Foyer rather than S3.
 //! Asserts on Foyer's `inner_gets` (S3 body fetches) rather than wall-clock so
 //! it's deterministic on CI.
