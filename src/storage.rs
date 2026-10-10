@@ -337,6 +337,11 @@ pub struct FoyerRuntimeStats {
     pub entry_count: usize,
     /// Main-cache L1 capacity evictions since process start.
     pub evictions: u64,
+    /// Main-cache disk-tier device I/O since process start (foyer's own counters).
+    pub l2_write_bytes: usize,
+    pub l2_read_bytes: usize,
+    pub l2_write_ios: usize,
+    pub l2_read_ios: usize,
 }
 
 impl CacheStats {
@@ -583,6 +588,10 @@ impl SharedFoyerCache {
             l2_used_bytes: crate::support::without_blocking_the_worker(|| allocated_bytes(&self.config.cache_dir)),
             entry_count: self.cache.memory().entries(),
             evictions: self.evictions.load(Ordering::Relaxed),
+            l2_write_bytes: self.cache.statistics().disk_write_bytes(),
+            l2_read_bytes: self.cache.statistics().disk_read_bytes(),
+            l2_write_ios: self.cache.statistics().disk_write_ios(),
+            l2_read_ios: self.cache.statistics().disk_read_ios(),
             admit_write_capture_bytes: self.admission.write_capture_bytes.load(Ordering::Relaxed),
             admit_read_miss_bytes: self.admission.read_miss_bytes.load(Ordering::Relaxed),
             admit_refresh_bytes: self.admission.refresh_bytes.load(Ordering::Relaxed),
