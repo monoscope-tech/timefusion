@@ -237,7 +237,8 @@ impl WalManager {
     /// idle topic's block otherwise pins its whole segment until it writes another 10 MB.
     pub fn gc(&self, max_age: std::time::Duration, unflushed_floor_micros: Option<i64>) -> std::io::Result<(u64, u64)> {
         let cutoff = gc_cutoff(max_age, unflushed_floor_micros);
-        let rolled = self.wal.roll_writers_in(|path| std::fs::metadata(path).and_then(|m| m.modified()).is_ok_and(|modified| modified < cutoff))?;
+        // By BIRTH, not mtime: a slow topic appending into an old segment keeps its mtime fresh.
+        let rolled = self.wal.roll_writers_in(|path| segment_birth(path).is_some_and(|born| born < cutoff))?;
         if rolled > 0 {
             debug!(rolled, "wal gc: rolled idle writers off aged segments");
         }
@@ -1708,6 +1709,12 @@ pub fn quarantine_stats(wal_dir: &std::path::Path) -> (usize, u64) {
 }
 
 /// Files last modified before this are past GC's age and durability bounds.
+/// When walrus created a segment: its name is the creation time in unix millis; mtime otherwise.
+fn segment_birth(path: &Path) -> Option<std::time::SystemTime> {
+    let named = path.file_name()?.to_str()?.parse::<u64>().ok().map(|ms| std::time::UNIX_EPOCH + std::time::Duration::from_millis(ms));
+    named.or_else(|| std::fs::metadata(path).and_then(|m| m.modified()).ok())
+}
+
 fn gc_cutoff(max_age: std::time::Duration, unflushed_floor_micros: Option<i64>) -> std::time::SystemTime {
     use std::time::SystemTime;
     let by_age = SystemTime::now().checked_sub(max_age).unwrap_or(SystemTime::UNIX_EPOCH);
@@ -2610,6 +2617,33 @@ mod tests {
         wal.gc(std::time::Duration::ZERO, None).unwrap();
         assert!(first.iter().all(|path| !path.exists()), "the aged segment its idle writers pinned must be reclaimed");
         wal.append("p", &idle, &create_test_batch()).expect("an idle writer appends after its segment is reclaimed");
+    }
+
+    /// A slow topic still appending into an old segment refreshes its mtime, so rolling by
+    /// mtime never fired and the segment stayed pinned (prod 10-10: 7 → 24 GB in 2 h). The
+    /// roll must key on when the segment was BORN.
+    #[test]
+    fn gc_rolls_a_slow_writer_off_an_old_segment_it_keeps_touching() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal = wal_in(&tmp, crate::config::WalFsyncMode::SyncEach, 1);
+        let segments = || std::fs::read_dir(tmp.path()).unwrap().flatten().filter(|e| e.path().is_file()).map(|e| e.path()).collect::<Vec<_>>();
+        let slow = uniq("slow");
+        wal.append("p", &slow, &create_test_batch()).unwrap();
+        let first = segments();
+        for _ in 0..100 {
+            wal.append("p", &uniq("busy"), &create_test_batch()).unwrap();
+        }
+        assert!(segments().len() > first.len(), "the allocator must have moved to a new segment");
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        wal.append("p", &slow, &create_test_batch()).unwrap();
+        let max_age = std::time::Duration::from_secs(1);
+        wal.gc(max_age, None).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        // Still writing: never idle for `max_age`, as a slow but live prod topic.
+        wal.append("p", &slow, &create_test_batch()).unwrap();
+        wal.gc(max_age, None).unwrap();
+        assert!(first.iter().all(|path| !path.exists()), "a segment born before the cutoff must not stay pinned by a writer that keeps touching it");
+        wal.append("p", &slow, &create_test_batch()).expect("the slow writer appends after its segment is reclaimed");
     }
 
     /// Open fds on WAL segments under `dir`, unlinked ones included (Linux
