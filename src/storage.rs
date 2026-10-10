@@ -1100,9 +1100,7 @@ impl FoyerObjectStoreCache {
     async fn get_range_cached(&self, location: &Path, range: Range<u64>) -> ObjectStoreResult<Bytes> {
         let span = tracing::Span::current();
         let is_parquet = is_parquet_file(location);
-        let mut range_cache_key = Self::make_range_cache_key(location, &range);
-        let mut fetch_range = range.clone();
-        let mut response_slice = None;
+        let range_cache_key = Self::make_range_cache_key(location, &range);
         let mut range_meta = None;
 
         let full_cache_key = Self::make_cache_key(location);
@@ -1218,22 +1216,9 @@ impl FoyerObjectStoreCache {
                     }
                 }
             } else if file_size > PARQUET_RANGE_ALIGNMENT_BYTES {
-                // Exact DataFusion ranges shift with the predicate; normalize their
-                // edges so the next refresh addresses the same cache entry.
-                let aligned_start = (range.start / PARQUET_RANGE_ALIGNMENT_BYTES) * PARQUET_RANGE_ALIGNMENT_BYTES;
-                let aligned_end = range.end.div_ceil(PARQUET_RANGE_ALIGNMENT_BYTES).saturating_mul(PARQUET_RANGE_ALIGNMENT_BYTES).min(file_size);
-                let aligned = aligned_start..aligned_end;
-                let aligned_key = Self::make_range_cache_key(location, &aligned);
-                if aligned != range
-                    && let Some((data, _)) = self.live_slice(&self.cache, &aligned_key, aligned.start, &range, self.config.l1_max_entry_bytes).await
-                {
-                    record_range_hit(&self.stats, range.end - range.start);
-                    span.record("cache_hit", true);
-                    return Ok(data);
-                }
-                response_slice = Some(((range.start - aligned.start) as usize, (range.end - aligned.start) as usize));
-                range_cache_key = aligned_key;
-                fetch_range = aligned;
+                let (data, hit) = self.get_blocks(location, &range, &file_meta, false).await?;
+                span.record("cache_hit", hit);
+                return Ok(data);
             }
         }
 
@@ -1244,18 +1229,18 @@ impl FoyerObjectStoreCache {
         let start_time = std::time::Instant::now();
         let inner_span = tracing::trace_span!(parent: &span, "s3.get_range",
             location = %location,
-            range.start = fetch_range.start,
-            range.end = fetch_range.end
+            range.start = range.start,
+            range.end = range.end
         );
-        let result = self.inner.get_range(location, fetch_range.clone()).instrument(inner_span).await?;
+        let result = self.inner.get_range(location, range.clone()).instrument(inner_span).await?;
         let duration = start_time.elapsed();
 
         debug!(
             "S3 GET_RANGE request: {} (range: {}..{}, size: {} bytes, duration: {}ms, parquet: {})",
             location,
-            fetch_range.start,
-            fetch_range.end,
-            fetch_range.end - fetch_range.start,
+            range.start,
+            range.end,
+            range.end - range.start,
             duration.as_millis(),
             is_parquet
         );
@@ -1265,23 +1250,85 @@ impl FoyerObjectStoreCache {
         if let Some(meta) = range_meta.as_ref() {
             self.admit_data_range(location, range_cache_key, result.clone(), meta);
         }
-        Ok(match response_slice {
-            // The aligned fetch is an OPTIMISATION and must never turn a short
-            // read into a panic. `aligned_end` is clamped to `file_size` while
-            // these offsets come from the caller's unclamped `range.end`, so any
-            // read past the end of the object — a stale `ObjectMeta`, a file
-            // rewritten smaller between plan and scan — asks for bytes the
-            // response cannot contain. Prod killed a maintenance worker on
-            // exactly that: `range end out of bounds: 1957431 <= 1900074`.
-            //
-            // The honest answer is the intersection of what was asked for with
-            // what exists, which is what the unaligned path at `l1_max_entry_bytes`
-            // already returns via its `range.end <= full.len()` guard. Warned, not
-            // silent: a short read here means someone's view of the file is wrong,
-            // and that is worth seeing even though it is no longer fatal.
-            Some((start, end)) => result.slice(clamp_to_available(start, end, result.len(), location)),
-            None => result,
-        })
+        Ok(result)
+    }
+
+    /// Serve `range` of a large parquet file from fixed blocks of `PARQUET_RANGE_ALIGNMENT_BYTES`,
+    /// each cached under its own key, so reads DataFusion shifts or coalesces differently
+    /// share blocks. A miss fetches only its missing blocks, one GET per contiguous run.
+    /// `warm` admits the fetched blocks disk-only. Returns the bytes and whether no fetch ran.
+    async fn get_blocks(&self, location: &Path, range: &Range<u64>, file: &ObjectMeta, warm: bool) -> ObjectStoreResult<(Bytes, bool)> {
+        let b = PARQUET_RANGE_ALIGNMENT_BYTES;
+        let blocks = (range.start / b..range.end.min(file.size).div_ceil(b)).map(|k| k * b..((k + 1) * b).min(file.size)).collect_vec();
+        let key = |blk: &Range<u64>| Self::make_range_cache_key(location, blk);
+        let keys = blocks.iter().map(key).collect_vec();
+        let mut data: Vec<Option<Bytes>> =
+            futures::future::join_all(blocks.iter().zip(&keys).map(|(blk, k)| self.live_slice(&self.cache, k, blk.start, blk, self.config.l1_max_entry_bytes)))
+                .await
+                .into_iter()
+                .map(|hit| hit.map(|(bytes, _)| bytes))
+                .collect();
+        let runs = blocks
+            .iter()
+            .zip(&data)
+            .filter(|(_, hit)| hit.is_none())
+            .map(|(blk, _)| blk.clone())
+            .coalesce(|a, b| if a.end == b.start { Ok(a.start..b.end) } else { Err((a, b)) })
+            .collect_vec();
+        let fetched = futures::future::try_join_all(runs.iter().map(|run| self.inner.get_range(location, run.clone()))).await?;
+        match runs.is_empty() {
+            true => record_range_hit(&self.stats, range.end.min(file.size).saturating_sub(range.start)),
+            false => add(&self.stats.misses, 1),
+        }
+        for (run, bytes) in runs.iter().zip(fetched) {
+            add(&self.stats.inner_gets, 1);
+            add(&self.stats.inner_bytes_read, bytes.len() as u64);
+            record_range_miss(&self.stats, bytes.len() as u64);
+            for (i, blk) in blocks.iter().enumerate().filter(|(_, blk)| run.start <= blk.start && blk.end <= run.end) {
+                let (start, end) = ((blk.start - run.start) as usize, (blk.end - run.start) as usize);
+                let block = bytes.slice(start.min(bytes.len())..end.min(bytes.len()));
+                // A short read (stale meta) is served but never cached as a whole block.
+                if block.len() as u64 == blk.end - blk.start {
+                    match warm {
+                        true if is_within_recent_window(location, self.config.cache_recent_days) => {
+                            self.cache.insert_with_properties(
+                                keys[i].clone(),
+                                range_value(location, block.clone(), file),
+                                HybridCacheProperties::default().with_location(Location::OnDisk),
+                            );
+                        }
+                        true => {}
+                        false => self.admit_data_range(location, keys[i].clone(), block.clone(), file),
+                    }
+                }
+                data[i] = Some(block);
+            }
+        }
+        let last = blocks.len().saturating_sub(1);
+        let mut parts = blocks.iter().zip(data).enumerate().map(|(i, (blk, bytes))| {
+            let bytes = bytes.unwrap_or_default();
+            // Only the last block may fall short of the request: warn there, not on interior blocks.
+            let end = if i == last { range.end } else { range.end.min(blk.end) };
+            bytes.slice(clamp_to_available((range.start.max(blk.start) - blk.start) as usize, (end - blk.start) as usize, bytes.len(), location))
+        });
+        let out = match blocks.len() {
+            0 => Bytes::new(),
+            1 => parts.next().unwrap_or_default(),
+            _ => parts
+                .fold(bytes::BytesMut::with_capacity((range.end - range.start) as usize), |mut out, part| {
+                    out.extend_from_slice(&part);
+                    out
+                })
+                .freeze(),
+        };
+        Ok((out, runs.is_empty()))
+    }
+
+    /// Fetch the uncached blocks of `range` in a large parquet file and admit them disk-only,
+    /// so a later query is served locally without displacing the L1 working set.
+    pub async fn warm_blocks(&self, location: &Path, range: Range<u64>) -> ObjectStoreResult<()> {
+        let file = self.head_cached(location).await?;
+        self.get_blocks(location, &range, &file, true).await.map(drop)
     }
 
     /// Resolve a path's `ObjectMeta` from cache only (no S3): full-file cache,
@@ -2754,6 +2801,47 @@ mod tests {
             }
         }
         assert!(lost.is_empty(), "entries never reached disk: {lost:?}");
+        Ok(())
+    }
+
+    /// Data ranges are cached as fixed blocks, so a request is served from whatever blocks
+    /// earlier requests fetched, however those requests were shifted or coalesced, and a miss
+    /// fetches only its missing blocks: one GET per contiguous missing run.
+    #[test_case::test_case(&[100..1_500_000], 1_100_000..1_900_000, 0, 0 ; "shifted inside a fetched span: no fetch")]
+    #[test_case::test_case(&[100..1_500_000], 1_200_000..2_500_000, 1 << 20, 1 ; "overlapping: only the new block")]
+    #[test_case::test_case(&[10..20, 2_200_000..2_300_000], 0..3_000_000, 1 << 20, 1 ; "hole between cached blocks: one block")]
+    #[test_case::test_case(&[10..20], 0..4_194_304, 3 << 20, 1 ; "tail after a cached head: one run")]
+    #[tokio::test]
+    async fn a_data_range_fetches_only_its_uncached_blocks(warm: &[Range<u64>], range: Range<u64>, bytes: u64, gets: u64) -> anyhow::Result<()> {
+        let mem = Arc::new(InMemory::new());
+        let (_shared, cache, _dir) = shared_with("block_ranges", mem.clone(), |c| c.l1_max_entry_bytes = 64).await?;
+        let path = Path::from("tbl/date=2026-01-02/blocks.parquet");
+        let body: Vec<u8> = (0..4 * PARQUET_RANGE_ALIGNMENT_BYTES as usize).map(|i| (i % 251) as u8).collect();
+        mem.put(&path, PutPayload::from(Bytes::from(body.clone()))).await?;
+        for r in warm {
+            cache.get_range_cached(&path, r.clone()).await?;
+        }
+        let before = cache.get_stats().main;
+        assert_eq!(&cache.get_range_cached(&path, range.clone()).await?[..], &body[range.start as usize..range.end as usize]);
+        let after = cache.get_stats().main;
+        assert_eq!((after.inner_bytes_read - before.inner_bytes_read, after.inner_gets - before.inner_gets), (bytes, gets));
+        Ok(())
+    }
+
+    /// `warm_blocks` lands a range's blocks disk-only: a later query reads none of it from the
+    /// store, and the L1 working set is untouched.
+    #[tokio::test]
+    async fn warmed_blocks_serve_a_later_query_without_a_fetch() -> anyhow::Result<()> {
+        let mem = Arc::new(InMemory::new());
+        let (_shared, cache, _dir) = shared_with("block_warm", mem.clone(), |c| c.l1_max_entry_bytes = 2 << 20).await?;
+        let path = Path::from("tbl/date=2026-01-02/warm.parquet");
+        let body: Vec<u8> = (0..3 * PARQUET_RANGE_ALIGNMENT_BYTES as usize).map(|i| (i % 251) as u8).collect();
+        mem.put(&path, PutPayload::from(Bytes::from(body.clone()))).await?;
+        cache.warm_blocks(&path, 0..body.len() as u64).await?;
+        assert_eq!(cache.cache.memory().usage(), 0, "warming must not occupy L1");
+        let before = cache.get_stats().main.inner_bytes_read;
+        assert_eq!(&cache.get_range_cached(&path, 700_000..2_900_000).await?[..], &body[700_000..2_900_000]);
+        assert_eq!(cache.get_stats().main.inner_bytes_read, before, "a warmed range must not touch the store");
         Ok(())
     }
 
