@@ -144,8 +144,28 @@ At 30d, most filtered queries time out at 90 s.
 - **WAL: 16.0 GB in 17 files.** It was 7.0 GB at 06:36, and your watch line is 50 GB. The oldest pin is 455 s, so it isn't pin-bound. Check the GC cadence if it keeps climbing.
 - **Maintenance runs in waves** (hot packing completing at 08:10). But one due task has gone unclaimed for 6.9 h (`oldest_due_unclaimed_age_seconds` 24,687), with `admission_refused_state_bytes_total` 3 and `retry.BaseRollup.admission_busy` 3. That's likely a BaseRollup unit too large for the state-bytes budget. Not investigated.
 
+### Late morning 10-10
+- **#371 WAL roll by segment birth (live ~09:30).** Writers are now rolled off a segment by its birth time; #357 used mtime, which a slow topic writing into an old segment keeps fresh.
+
+  | Uptime | WAL | Files |
+  | --- | --- | --- |
+  | 21 min | 6 GB | 7 |
+  | 45 min | 12 GB | 13 |
+  | 70 min | 13 GB | 14 |
+
+  Growth flattened, GC now frees 2–4 files per pass, and there were 0 append errors. The previous build was at 24 GB after 2.5 h and still climbing.
+- **#372 tantivy indexes `attributes___http___response___status_code` and `attributes___http___route` (live 10:43).** Integer equality now routes to tantivy, and old indexes are rebuilt on backfill. The same PR drops `timefusion_parquet_range_kb`. Row counts in the 7d battery are unchanged. The status-500 list at 20 min uptime:
+
+  | Window | Time | Indexes searched | Files planned | Store reads |
+  | --- | --- | --- | --- | --- |
+  | 7d | 3.9 s | 168 | 41 | — |
+  | 30d | 5.9 s | 217 | 85 | 52 MB, 15 GETs |
+
+  The cold first run was 41–67 s.
+- **foyer upstream:** issue foyer-rs/foyer#1373, PR foyer-rs/foyer#1374.
+
 ### Housekeeping
-- `FLAG timefusion_parquet_range_kb` is now an inert knob: the A/B concluded and the default is unchanged. Remove it with the next code change.
+- `FLAG timefusion_parquet_range_kb`: removed in #372.
 - The vendored `foyer-storage` is pinned to 0.22.6 via `[patch.crates-io]`. If `foyer` bumps its storage dependency, the patch stops applying with only a cargo warning. The bug is worth an upstream issue to foyer-rs (your call).
 
 ### NIGHT QUEUE 10-09 → 10-10 (the live to-do list; checked as each lands on prod)
