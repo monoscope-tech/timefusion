@@ -76,6 +76,12 @@ fn sql_literal(value: &str) -> String {
 /// must share a generation so a query can merge them. `measures` restricts the
 /// spec to what the cell actually materialized before hashing (`None` = whole spec).
 pub fn generation_id(spec: &RollupSpec, source: &str, project_id: &str, date: &str, _source_fp: u64, measures: Option<&[String]>) -> String {
+    generation_id_from(generation_prefix(spec, measures), source, project_id, date)
+}
+
+/// FNV state after the spec half of a generation id. It depends only on the spec and
+/// the measure set, so a caller hashing many cells of one spec can compute it once.
+pub(crate) fn generation_prefix(spec: &RollupSpec, measures: Option<&[String]>) -> u64 {
     let restricted = measures.map(|names| RollupSpec { measures: spec.measures.iter().filter(|m| names.contains(&m.name)).cloned().collect(), ..spec.clone() });
     let spec = restricted.as_ref().unwrap_or(spec);
     let mut hasher = fnv::FnvHasher::default();
@@ -83,6 +89,12 @@ pub fn generation_id(spec: &RollupSpec, source: &str, project_id: &str, date: &s
     const MATERIALIZATION_VERSION: u8 = 1;
     MATERIALIZATION_VERSION.hash(&mut hasher);
     generation_render(spec).hash(&mut hasher);
+    hasher.finish()
+}
+
+/// The id of one `(source, project, date)` cell from its spec's [`generation_prefix`].
+pub(crate) fn generation_id_from(prefix: u64, source: &str, project_id: &str, date: &str) -> String {
+    let mut hasher = fnv::FnvHasher::with_key(prefix);
     (source, project_id, date).hash(&mut hasher);
     format!("{:016x}", hasher.finish())
 }
@@ -91,12 +103,17 @@ pub fn generation_id(spec: &RollupSpec, source: &str, project_id: &str, date: &s
 /// first tiers shipped rendered as it was before it existed. A new field that changed
 /// this string would orphan every tier's history at once (10-03: `unnest` did).
 fn generation_render(spec: &RollupSpec) -> String {
+    #[cfg(test)]
+    GENERATION_RENDERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let rendered = format!("{:?}", RollupSpec { backfill_days: legacy_backfill_days(spec.backfill_days), ..spec.clone() });
     match spec.unnest {
         None => rendered.replacen(", unnest: None }", " }", 1),
         Some(_) => rendered,
     }
 }
+
+#[cfg(test)]
+pub(crate) static GENERATION_RENDERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// `backfill_days` is a build horizon, not content. The endpoint tiers were built at 14
 /// days and raised to 31 (10-09), so 31 renders as 14 and their history stays valid.
