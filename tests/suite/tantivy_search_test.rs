@@ -752,6 +752,41 @@ async fn an_over_cap_predicate_is_refused_without_searching_again() {
     assert_eq!(env.search.search_with_stats(env.table, env.project, &node, 10, None).await.unwrap().expect("usable").hits.len(), 1);
 }
 
+/// Prod 2026-10-10: `kind = 'server'` over 1d materialized 14,946 hits before the combined
+/// cap refused it: every in-flight index counted under the cap on its own and materialized
+/// up to `max_hits`. The fan-out shares one count budget.
+#[tokio::test]
+async fn a_combined_overflow_materializes_no_more_than_the_cap() {
+    let env = Env::prod("otel_logs_and_spans", "p-combined");
+    for f in 0..8i64 {
+        let rows: Vec<(i64, String, &str)> = (0..8).map(|i| (1_000_000 + f * 100 + i, format!("id-{f}-{i}"), "ERROR")).collect();
+        let rows_ref: Vec<(i64, &str, &str)> = rows.iter().map(|(t, id, l)| (*t, id.as_str(), *l)).collect();
+        env.publish(&rows_ref, &[&format!("combined-uri-{f}")]).await;
+    }
+    let r = env.search.search_detailed(env.table, env.project, &level_error_node(), 10, None, true).await.unwrap();
+    assert_eq!(r.err(), Some("delta_cap_exceeded_combined"), "64 hits across 8 indexes overflow a cap of 10");
+    let materialized = env.search.stats.hits_materialized.load(Relaxed);
+    assert!(materialized <= 10, "an overflowing fan-out must stop materializing at the cap; materialized {materialized}");
+}
+
+/// A hybrid's edge window shrinks with every refresh, so a refusal remembered at one width
+/// must also answer a slightly narrower window, or every refresh searches again.
+#[tokio::test]
+async fn an_over_cap_refusal_answers_a_slightly_narrower_window() {
+    let env = Env::prod("otel_logs_and_spans", "p-capshrink");
+    let rows: Vec<(i64, String, &str)> = (0..50).map(|i| (1_000_000 + i as i64, format!("id-{i}"), "ERROR")).collect();
+    let rows_ref: Vec<(i64, &str, &str)> = rows.iter().map(|(t, id, l)| (*t, id.as_str(), *l)).collect();
+    env.publish(&rows_ref, &["shrink-uri"]).await;
+    let error = level_error_node();
+    let search = |window| env.search.search_detailed(env.table, env.project, &error, 10, Some(window), true);
+    let searched = || env.search.stats.indexes_searched.load(Relaxed);
+    assert!(search((1_000_000, 1_000_100)).await.unwrap().is_err_and(|r| r.starts_with("delta_cap_exceeded_")));
+    let before = searched();
+    assert_eq!(search((1_000_005, 1_000_100)).await.unwrap().err(), Some("delta_cap_exceeded_memo"));
+    assert_eq!(searched(), before, "a slightly narrower window must be answered by the memo");
+    assert_ne!(search((1_000_000, 1_000_010)).await.unwrap().err(), Some("delta_cap_exceeded_memo"), "a much narrower window searches again");
+}
+
 /// A search the scan declined as unselective (`kind IN (...)` matching nearly every span,
 /// ~250 ms of planning per scan on prod) is not run again for an equal-or-wider window;
 /// a narrower one may be selective and still searches.

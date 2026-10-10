@@ -212,6 +212,13 @@ fn window_width(time_range: Option<(i64, i64)>) -> u64 {
     time_range.map_or(u64::MAX, |(lo, hi)| hi.abs_diff(lo))
 }
 
+/// Whether a refusal remembered at width `remembered` answers a window of `width`. A
+/// hybrid's edge window shrinks a little with every refresh, so a refusal also covers
+/// windows within 10% narrower; a much narrower window may be selective and searches.
+fn covers_width(remembered: u64, width: u64) -> bool {
+    u128::from(width) * 10 >= u128::from(remembered) * 9
+}
+
 /// Outcome of one [`TantivySearchService::reap_disk_cache`] sweep.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ReapReport {
@@ -399,7 +406,7 @@ impl TantivySearchService {
     ) -> Result<std::result::Result<SearchResult, &'static str>> {
         let cap_key: CapKey = (table.to_string(), project_id.to_string(), node.clone(), max_hits);
         let width = window_width(time_range);
-        if let Some(e) = self.cap_exceeded.get(&cap_key).filter(|e| e.0.elapsed() < CAP_EXCEEDED_TTL && width >= e.1) {
+        if let Some(e) = self.cap_exceeded.get(&cap_key).filter(|e| e.0.elapsed() < CAP_EXCEEDED_TTL && covers_width(e.1, width)) {
             return Ok(Err(e.2));
         }
         let cap_exceeded = |reason: &'static str| {
@@ -460,6 +467,9 @@ impl TantivySearchService {
         SearchStats::add(&self.stats.indexes_searched, work.len() as u64);
         SearchStats::timed(&self.stats.plans, &self.stats.plan_us, plan_started);
         let _fanout = TimedPhase { count: &self.stats.fanouts, micros: &self.stats.fanout_us, started: Instant::now() };
+        // One count budget for the whole fan-out: once the in-flight counts pass the cap the
+        // result is refused anyway, so no further index materializes hits.
+        let counted = &Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut tasks = futures::stream::iter(work.into_iter().map(|(key, blob_path, rows, entry_covered, ordinals_valid, window, bundle)| async move {
             let file_uuid = file_uuid(&key);
             let prepare_started = Instant::now();
@@ -468,7 +478,7 @@ impl TantivySearchService {
             // The rest is synchronous, CPU-bound tantivy work that yields nowhere. On a
             // blocking thread of its own, not `block_in_place`: that parks this whole fan-out
             // task, so `buffer_unordered` ran the searches one at a time (30d: 377 x ~17 ms).
-            let (me, node) = (Arc::clone(self), node.clone());
+            let (me, node, counted) = (Arc::clone(self), node.clone(), Arc::clone(counted));
             tokio::task::spawn_blocking(move || {
                 let running = me.stats.parallel_searches.fetch_add(1, Ordering::Relaxed) + 1;
                 me.stats.parallel_searches_peak.fetch_max(running, Ordering::Relaxed);
@@ -478,7 +488,7 @@ impl TantivySearchService {
                 SearchStats::timed(&me.stats.prepares, &me.stats.prepare_us, prepare_started);
                 let started = Instant::now();
                 let out = match build_node_query(&index, &node)? {
-                    PredsQuery::MissingField => Some((None, rows, entry_covered, ordinals_valid)),
+                    PredsQuery::MissingField => Ok((None, rows, entry_covered, ordinals_valid)),
                     PredsQuery::Query(q) => {
                         let searcher = reader.searcher();
                         if bundled {
@@ -503,11 +513,13 @@ impl TantivySearchService {
                         // `search()` passes usize::MAX, hence the saturating add.
                         let count = searcher.search(&*q, &tantivy::collector::Count).map_err(|e| anyhow!("count: {e}"))?;
                         if count > max_hits {
-                            None
+                            Err("delta_cap_exceeded_one_index")
+                        } else if counted.fetch_add(count, Ordering::Relaxed).saturating_add(count) > max_hits {
+                            Err("delta_cap_exceeded_combined")
                         } else {
                             let hits = query_with_searcher(&searcher, &*q, Some(max_hits.saturating_add(1)))?;
                             SearchStats::add(&me.stats.hits_materialized, hits.len() as u64);
-                            Some((Some(hits), rows, entry_covered, ordinals_valid))
+                            Ok((Some(hits), rows, entry_covered, ordinals_valid))
                         }
                     }
                 };
@@ -532,9 +544,10 @@ impl TantivySearchService {
         // — a partial selection would UNDER-select, so drop theirs entirely.
         let mut unselectable_files: HashSet<String> = HashSet::new();
         while let Some(res) = tasks.next().await {
-            // Per-index overflow: some index alone exceeds `max_hits`.
-            let Some((hits, rows, entry_covered, ordinals_valid)) = res? else {
-                return cap_exceeded("delta_cap_exceeded_one_index");
+            // Overflow: one index alone, or the fan-out's shared count, exceeds `max_hits`.
+            let (hits, rows, entry_covered, ordinals_valid) = match res? {
+                Ok(searched) => searched,
+                Err(reason) => return cap_exceeded(reason),
             };
             let Some(hits) = hits else {
                 // An index that can't answer a queried field is a coverage hole
