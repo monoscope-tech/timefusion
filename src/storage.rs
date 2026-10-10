@@ -404,6 +404,14 @@ fn foyer_spawner() -> foyer::Spawner {
         .clone()
 }
 
+/// foyer's disk flushers. Each serializes entries into a buffer of `FOYER_FLUSH_BUFFER_BYTES`
+/// and DROPS, without error, any entry that does not fit (foyer's default is one 16 MiB
+/// buffer). So this is also the largest value the disk tier can hold.
+const FOYER_FLUSHERS: usize = 4;
+const FOYER_FLUSH_BUFFER_BYTES: usize = 64 << 20;
+/// Entries queued for the flushers beyond this are dropped; a cold scan admits ~150 MB/s.
+const FOYER_SUBMIT_QUEUE_BYTES: usize = 1 << 30;
+
 /// Build one hybrid (memory + disk) cache tier.
 async fn build_hybrid_cache(
     dir: &std::path::Path, memory_bytes: usize, shards: usize, disk_bytes: usize, block_size: usize,
@@ -419,7 +427,13 @@ async fn build_hybrid_cache(
             .storage()
             .with_spawner(foyer_spawner())
             .with_io_engine_config(PsyncIoEngineConfig::new())
-            .with_engine_config(BlockEngineConfig::new(FsDeviceBuilder::new(dir).with_capacity(disk_bytes).build()?).with_block_size(block_size))
+            .with_engine_config(
+                BlockEngineConfig::new(FsDeviceBuilder::new(dir).with_capacity(disk_bytes).build()?)
+                    .with_block_size(block_size)
+                    .with_flushers(FOYER_FLUSHERS)
+                    .with_buffer_pool_size(FOYER_FLUSHERS * FOYER_FLUSH_BUFFER_BYTES)
+                    .with_submit_queue_size_threshold(FOYER_SUBMIT_QUEUE_BYTES),
+            )
             .build()
             .await?,
     ))
@@ -1558,10 +1572,10 @@ impl ObjectStore for FoyerObjectStoreCache {
         if !is_within_recent_window(location, self.config.cache_recent_days) {
             return Ok(inner);
         }
-        // Cap the tee buffer at the disk block size (foyer's largest persistable
-        // entry), tightened by the inline-warm and per-upload caps. The budget must
+        // Cap the tee buffer at the largest entry the disk tier can persist,
+        // tightened by the inline-warm and per-upload caps. The budget must
         // be in the min, or every reservation fails and capture silently stops.
-        let cap = [self.config.warm_inline_max_bytes, self.config.write_capture_max_bytes, self.config.write_capture_budget_bytes]
+        let cap = [self.config.warm_inline_max_bytes, self.config.write_capture_max_bytes, self.config.write_capture_budget_bytes, FOYER_FLUSH_BUFFER_BYTES]
             .into_iter()
             .filter(|&c| c > 0)
             .fold(self.config.block_size_bytes, usize::min);
@@ -2688,6 +2702,29 @@ mod tests {
         crate::config::RuntimeFlag::TimefusionParquetRangeKb.set_override(None);
         assert_eq!(got?, vec![Bytes::copy_from_slice(&body[100..200]), Bytes::copy_from_slice(&body[300_000..300_100])]);
         assert_eq!(cache.get_stats().main.inner_bytes_read, 200, "no alignment widening and no gap-filling");
+        Ok(())
+    }
+
+    /// The disk tier must keep what the read path steers to it. foyer drops an entry, without
+    /// error, when its flush buffer is full or the entry is larger than that buffer (16 MiB by
+    /// default), so a cold scan's burst and every entry above `l1_max_entry_bytes` were lost.
+    #[tokio::test]
+    async fn disk_tier_keeps_bursts_and_large_entries() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let cache = build_hybrid_cache(dir.path(), 1 << 20, 1, 1 << 30, 64 << 20, None).await?;
+        let sizes = std::iter::repeat_n(2usize << 20, 48).chain([24 << 20]).collect_vec();
+        for (i, &len) in sizes.iter().enumerate() {
+            let value = CacheValue::new(vec![i as u8; len], meta_for(&Path::from(format!("k{i}")), len as u64));
+            cache.insert_with_properties(format!("k{i}"), value, HybridCacheProperties::default().with_location(Location::OnDisk));
+        }
+        cache.storage().wait().await;
+        let mut lost = vec![];
+        for (i, &len) in sizes.iter().enumerate() {
+            if cache.get(&format!("k{i}")).await?.is_none() {
+                lost.push((i, len));
+            }
+        }
+        assert!(lost.is_empty(), "entries never reached disk: {lost:?}");
         Ok(())
     }
 
