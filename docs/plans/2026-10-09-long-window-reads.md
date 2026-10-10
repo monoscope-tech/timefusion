@@ -90,6 +90,55 @@ At 30d, most filtered queries time out at 90 s.
     By-status was 22 s and an error. The 30d request chart was 6.8 s.
   - The e2e guard sends the six widgets verbatim and asserts the exact answer for each.
 
+### MORNING SUMMARY 10-10 (N10)
+
+### Headline (07:03 scorecard, current build, 45 min uptime)
+- **Dashboards (shipbubble):** every widget is 0.3–1.2 s at 24h, 7d and 30d. The one outlier is 30d p95_latency at 5.3 s (1.1–1.4 s in other runs).
+- **Endpoint requests widget:** 1.3–2.8 s at 7d/14d/30d, all routed. The 03:56 run of all six endpoint widgets: 7d 0.5–1.3 s, 30d 0.9–2.1 s.
+- **Text/needle search:** 0.9 s at 7d and 30d.
+- **Biggest find: prod's disk cache tier had been writing nothing.** foyer recovered with 0 clean blocks and deadlocked, so its 313 GB disk tier was a frozen snapshot from some past restart. Fixed in #366. A repeated filtered query went from 20 s on its second run to 1.4 s.
+- **Log-explorer filters (list/chart), on re-run:**
+  - 7d: 0.3–2.4 s, from 17–55 s.
+  - 30d: 0.5–4 s, from 26–67 s.
+
+### Shipped to prod tonight (each signed off locally; CI green on the exact commit)
+| PR | What | Measured on prod |
+|---|---|---|
+| #355 | Rollup debounce max-wait: an ended slice comes due ≤30 min after it was first dirtied | Today's hours stopped staying stale. 24h widgets 2–83 s → 0.5–0.6 s |
+| #356 | Version-only (hashes enrichment) admission refused only by overlapping commits. Maintenance scans skip the second replay | Commit-race declines 310k → 0 |
+| #357 | WAL GC rolls idle writers off aged segments | Not separately measured; WAL 7.0 GB at 06:36 |
+| #359 | Partition-pinned Delta replay seed | Planning replay per scan 65–70 → 9–24 ms |
+| #361 | Wide scan's first cache sighting lands disk-only (L1 protected) | Only effective since #366 |
+| #362 | MemBuffer (today) leg copies only the scanned columns. New `FLAG timefusion_parquet_range_kb` | Mem leg 60–100 → 5–10 ms per call |
+| #363 | foyer disk flushers sized: 4×64 MiB, 1 GiB queue. Defaults silently dropped bursts and every entry >16 MiB | Local repro: 42 of 49 entries lost before the fix |
+| #365 | Export foyer disk I/O (`foyer.l2_write_bytes` etc.) | Showed `l2_write_bytes` = 0 → found #366 |
+| #366 | **Vendored foyer-storage fix: reclaim when a flusher waits for a clean block** | Re-run of a cold 7d query: 20 s → 1.4 s. 3.4 GB now lands on disk per cold scan |
+| #358 #364 #367 #368 | Plan-doc tracker updates | — |
+
+### Measured and rejected
+- **Parquet range alignment (in-process A/B, 8 column/day pairs):** exact ranges move 2–4× fewer bytes but issue more GETs, at the same latency (4.45 vs 4.33 s). The store is round-trip-bound. The flag stays at its default (1024).
+- **Read-ahead** (10-09 A/B) already showed no gain.
+
+### Still slow, needs your call
+- **Cold first run of a raw sealed-day scan.** A filter on `attributes.http.response.status_code = 500` takes 28–48 s the first time at 7d/30d. A route-filter chart takes 29 s the first time at 30d. The second run is fast now.
+  - Cause: no rollup tier carries http status alongside `status_code`, and none carries `attributes___http___route`. Those queries therefore scan raw parquet, at ~12 serial GETs per file. DedupExec's ordering stops DataFusion from splitting big files across partitions.
+  - Option A: a new `endpoints_1m` generation with `status_code` (and/or route) as dimensions. Needs a 31-day backfill.
+  - Option B: tantivy raw-term fields for http status and route, which would prefilter list queries. Needs an index rebuild.
+  - Both are tier or index design changes with backfill load, so I didn't ship them unattended.
+- **Remaining rollup edge misses (N4):** today's leg and the 30-days-ago fringe. Interior days route fully.
+
+### Watch
+- `foyer.l2_write_bytes` should keep growing: 19.7 GB in the first 20 min after #366. md4 (`/mnt/ephemeral`) is idle between cold scans.
+- The first hour or two of sealed-day hit rate will be noisy. Recovered blocks register for eviction in `HashSet` order, so the first reclaims evict in no particular age order. That's efficiency, not correctness.
+- Health at 06:36:
+  - RSS 14.1 GB of 120 GB.
+  - WAL 7.0 GB in 8 files, oldest pin 459 s. There's no before/after WAL number for #357 this session.
+  - `pending_base_rollup` 78, `pending_dedup` 108, eligible 0, 0 running. The oldest task is 6.6 h old.
+
+### Housekeeping
+- `FLAG timefusion_parquet_range_kb` is now an inert knob: the A/B concluded and the default is unchanged. Remove it with the next code change.
+- The vendored `foyer-storage` is pinned to 0.22.6 via `[patch.crates-io]`. If `foyer` bumps its storage dependency, the patch stops applying with only a cargo warning. The bug is worth an upstream issue to foyer-rs (your call).
+
 ### NIGHT QUEUE 10-09 → 10-10 (the live to-do list; checked as each lands on prod)
 
 Order = user impact for shipbubble. Prod measurements run one at a time; code runs in parallel worktrees; signoff and deploys are serial.
@@ -159,7 +208,7 @@ Order = user impact for shipbubble. Prod measurements run one at a time; code ru
 - [x] **N11** MemBuffer leg narrowed to the scan's columns (#362, live 04:52). Prod 05:01: an isolated today-leg scan's mem leg takes **5–10 ms per call** (was ~60–100 ms). Widget wall time is unchanged at ~0.55–0.6 s, so the rest is elsewhere. Every today leg filtered and sorted all ~90 columns of each matching buffered row: 345–480 ms of a 0.56–0.64 s today leg (30d `var_service`). The prod profile puts `take` above `lexsort`. Project first (projection + sort columns + `timestamp`), then filter and sort.
 - [x] **N4 (partly)** 30d `var_service`: every whole day of the 30 routes full in 150–290 ms; the 3.5 s samples are the today leg plus noise (1.0 s re-measured). Remaining misses are the edges, not the interior.
 - [ ] **N9** Needle leftovers: hit materialization reads `_id` (~47 MB per index); trace-id FST whole reads.
-- [ ] **N10** Keep the scorecard current; morning summary.
+- [x] **N10** Keep the scorecard current; morning summary (above).
 
 **Incidents tonight (both resolved; lessons in the memory notes):**
 - 00:06–00:24 midnight storm. Day rollover + starved rollups released by #355 took `pending_base_rollup` to 962, running tasks 12→54, CPU 40/48 cores, RSS to 67.8 GB. Throttled with `FLAG SET timefusion_maintenance_cpu_tokens 24`; RSS fell to 48 GB. Re-applied automatically after the 00:42 restart.
