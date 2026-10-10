@@ -106,11 +106,11 @@ Order = user impact for shipbubble. Prod measurements run one at a time; code ru
   - 7d widget ending-now approaches 0.45 s.
 - [x] **N3** Endpoint widgets: after #355 + N2 + the drain, **0.7–2.4 s at 7–30d** (01:35; was 1.8–5.7 s at 21:30). `hashes_30m` today 0.3 s, 10-09 1.0 s, 10-08 0.4 s (all routed). The remaining ~1 s is planning (N5). Original notes:: `hashes_30m` today slices are invalidated by the hashes updates themselves. Measure after N2; if still raw, cheapen the today leg (CPU-bound dedup and list decode, ~2.5 s).
 - [ ] **N4** Remaining shipbubble rollup misses: `multi_scan_source` (30d traffic and var_service), `not_built` (latency_percentiles, http_by_status 7d), `filter_not_eligible`.
-- [x] **N5a** Maintenance scans skip the second replay (#356). **N5b** open: per-scan planning ~31 ms (replay 21 ms, footer ordering) is now the largest fixed cost of a routed widget.
-- [x] **N5b** Partition-pinned replay seed (fork `e37dc433`, branch `perf/replay-project-seed`): a scan pinning `project_id` seeds kernel replay with that project's files only, cached per (snapshot, column, value). Bench (50k files, 20 partitions): replay 22 ms → 5.5–8.1 ms; scan 25 → 8–12 ms. Guard `a_delta_scan_records_its_planning_phases`: seed rows = the project's files (red: 2 vs 1). Watch `planning.delta_replay_us` / `scan_provider_calls`.
-- [ ] **N5** Delta planning ~31 ms per scan. Maintenance scans' second replay is in a parallel worktree, `scan/maintenance-selection-ignore`.
+- [x] **N5a** Maintenance scans skip the second replay (#356).
 - [x] **N6** WAL segments pinned by idle writers (#357, `a17afcd1`, live 01:58): GC rolls writers off aged segments before sweeping.
-- [ ] **N5b** Delta replay ~50 ms CPU per scan: kernel data skipping over all ~1.4k files of the unified table, when a project pins ~180 (prod CPU flamegraph 01:33). Fork agent building a per-(version, project) partition seed cache.
+- [x] **N5b** Partition-pinned replay seed (#359, fork `e37dc433`, live 03:10). A `project_id = X` scan replays only that partition's files (cached per snapshot). Bench (50k files, 20 partitions): replay 22 ms → 5.5–8.1 ms. Guard `a_delta_scan_records_its_planning_phases` (red: 2 vs 1). Prod 03:25: replay per scan **9–24 ms** (was 65–70 ms); 24h/7d traffic, error_rate, le_status, var_service **0.6–0.8 s**.
+  - Endpoint widget re-measured 04:00: 7d **0.6–1.1 s** (the 3.1 s at 03:25 was one cold sample). Legs: 6d→midnight 0.3–0.8 s; today 0.5 s.
+  - What a routed 7d endpoint widget still pays: rollup rewrite planning ~250 ms and the MemBuffer leg 170–300 ms.
 - [ ] **N7** Rare-column filters: 20–50 s cold. **Analyzed 01:45**, 7d chart filtered on `attributes___http___request___method`:
   - Run 1: 50.8 s, 2,065 GETs, 3.4 GB from the store.
   - Run 2: 31 s, still 1,791 GETs (frequency-based cache admission).
