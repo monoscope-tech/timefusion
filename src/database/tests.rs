@@ -10620,7 +10620,8 @@ async fn racing_creators_of_one_table_both_get_it() -> Result<()> {
 /// A dashboard's `now() - INTERVAL '24 hours'` scan must admit its files on the FIRST view.
 /// `now()` folds at plan time but the bypass gate re-reads the clock at scan time, so a 24h
 /// window measured 24h+ε, bypassed admission, and only a third view read warm. A week-deep
-/// scan must still bypass so a historical sweep cannot evict the hot tail.
+/// scan must still bypass L1 so a historical sweep cannot evict the hot tail, yet its re-run
+/// must be served from the disk tier.
 #[tokio::test(flavor = "multi_thread")]
 async fn day_dashboard_scan_admits_to_cache_on_first_view() -> Result<()> {
     let base = create_test_config("day-dashboard-admit");
@@ -10660,7 +10661,8 @@ async fn day_dashboard_scan_admits_to_cache_on_first_view() -> Result<()> {
     assert!(first_bytes > 0, "the first view must fetch from the store, or it proves nothing");
     assert_eq!(first_bypassed, 0, "a 24h dashboard scan must admit what it fetched");
     assert_eq!(read(&day, "24 hours").await?.0, 0, "the second view of a 24h dashboard must be served entirely from cache");
-    assert!(read(&week, "7 days").await?.1 > 0, "a week-deep scan must still bypass admission");
+    assert!(read(&week, "7 days").await?.1 > 0, "a week-deep scan must still bypass L1 admission");
+    assert_eq!(read(&week, "7 days").await?.0, 0, "a re-run week-deep scan must be served locally, not fetched cold twice");
     Ok(())
 }
 

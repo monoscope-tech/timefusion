@@ -1354,20 +1354,23 @@ impl FoyerObjectStoreCache {
     }
 
     /// Single funnel for every cache population, so `scan_bypass_scope` can
-    /// suppress all of them in one place. `l1_max_entry_bytes = 0` keeps the
+    /// steer all of them in one place. `l1_max_entry_bytes = 0` keeps the
     /// default L1+disk placement. Returns whether the entry was admitted.
     fn admit(&self, cache: &FoyerCache, key: String, value: CacheValue, l1_max_entry_bytes: usize) -> bool {
+        // A bypassed scan's first sighting goes disk-only: it cannot evict the hot L1 set,
+        // yet re-running the query is served locally rather than paying the cold fetch twice.
         if bypass_active() && !self.repeat_sighting(&key) {
             crate::observability::record_cache_insert_bypassed();
             self.admission.insert_bypassed.fetch_add(1, Ordering::Relaxed);
-            return false;
+            cache.insert_with_properties(key, value, HybridCacheProperties::default().with_location(Location::OnDisk));
+            return true;
         }
         insert_main(cache, key, value, l1_max_entry_bytes);
         true
     }
 
     /// Has a bypassed scan already tried to admit `key` once? First sighting
-    /// declines, second admits, so a one-off wide scan can't evict the hot set.
+    /// lands disk-only, second admits normally.
     /// Bounded by clearing wholesale at [`BYPASS_SEEN_MAX`] — a hint only.
     fn repeat_sighting(&self, key: &str) -> bool {
         if self.bypass_seen.len() >= BYPASS_SEEN_MAX {
@@ -2538,9 +2541,9 @@ mod tests {
         Ok(())
     }
 
-    // A wide historical scan must READ through the cache without POPULATING it.
+    // A wide historical scan must READ through the cache without POPULATING L1.
     #[tokio::test]
-    async fn bypass_scope_suppresses_population_but_not_hits() -> anyhow::Result<()> {
+    async fn bypass_scope_keeps_misses_out_of_l1_but_not_hits() -> anyhow::Result<()> {
         let inner = Arc::new(InMemory::new());
         let (cache, _dir) = cache_with("scan_bypass", inner.clone(), |_| {}).await?;
         let hot = Path::from("tbl/date=2026-01-02/hot.parquet");
@@ -2557,7 +2560,7 @@ mod tests {
         let stats = cache.get_stats();
         assert_eq!(stats.main.hits, 1, "lookups still hit inside a bypass scope");
         assert_eq!(stats.main.inner_gets, 1, "the miss still fetches");
-        assert!(!cache.cache.contains(cold.as_ref()), "a bypassed miss must not populate the cache");
+        assert!(!cache.cache.memory().contains(cold.as_ref()), "a bypassed miss must not populate L1");
         assert!(cache.cache.contains(hot.as_ref()), "the pre-existing hot entry survives the scan");
 
         // Same read outside the scope populates normally.
@@ -2569,19 +2572,20 @@ mod tests {
         Ok(())
     }
 
-    /// A bypassed scan declines on first sighting but admits on the second.
+    /// A bypassed scan's first sighting lands disk-only: the hot L1 set is untouched,
+    /// yet re-running the same query is served locally instead of paying the cold fetch twice.
     #[tokio::test]
-    async fn a_repeated_bypassed_scan_warms_on_the_second_sighting() -> anyhow::Result<()> {
+    async fn a_repeated_bypassed_scan_is_served_locally_on_the_second_run() -> anyhow::Result<()> {
         let inner = Arc::new(InMemory::new());
         let (cache, _dir) = cache_with("bypass_repeat", inner.clone(), |_| {}).await?;
         let cold = Path::from("tbl/date=2020-01-01/cold.parquet");
         inner.put(&cold, PutPayload::from_static(b"cold-bytes")).await?;
 
         scan_bypass_scope(true, async { cache.get(&cold).await.unwrap().bytes().await.unwrap() }).await;
-        assert!(!cache.cache.contains(cold.as_ref()), "first sighting still declines — a one-off scan pays nothing");
-
-        scan_bypass_scope(true, async { cache.get(&cold).await.unwrap().bytes().await.unwrap() }).await;
-        assert!(cache.cache.contains(cold.as_ref()), "second sighting admits, so a refreshing panel converges");
+        assert!(!cache.cache.memory().contains(cold.as_ref()), "a one-off scan must not occupy L1");
+        let second = scan_bypass_scope(true, async { cache.get(&cold).await.unwrap().bytes().await.unwrap() }).await;
+        assert_eq!(second, Bytes::from_static(b"cold-bytes"));
+        assert_eq!(cache.get_stats().main.inner_gets, 1, "the second run must not refetch");
 
         assert!(!bypass_active(), "the scope must not leak past its future");
         cache.shutdown().await?;
