@@ -133,6 +133,18 @@ Order = user impact for shipbubble. Prod measurements run one at a time; code ru
   | 2 | 0.56 s | 4 | — |
 
   Before the fix, run 1 was 20 s and refetched everything. #361 (disk-only first sighting) and #363 (flusher sizing) only take effect now.
+- [x] **Filter battery after #366 (06:35–06:50; list = latest 501, chart = per-bucket counts; pass 2 = immediate re-run):**
+
+  | Filter | 7d before (04:10) | 7d pass 1 | 7d pass 2 | 30d before | 30d pass 1 | 30d pass 2 |
+  | --- | --- | --- | --- | --- | --- | --- |
+  | `status_code = 500` list | 55.1 s | 27.6 s | **2.4 s** | 67.0 s | 41.1 s | **4.0 s** |
+  | `status_code = 500` chart | 26.0 s | 1.9 s | **0.4 s** | 60.8 s | 48.2 s | **2.0 s** |
+  | route chart | 17.5 s | 1.3 s | **0.5 s** | 50.1 s | 29.3 s | **2.3 s** |
+  | errors list / chart | 3.1 / 1.3 s | 1.9 / 2.4 s | 0.8 / 0.6 s | 3.4 / 3.9 s | 2.5 / 3.4 s | 0.8 / 0.5 s |
+  | route list | 2.6 s | 0.9 s | 0.7 s | 0.9 s | 1.1 s | 0.9 s |
+  | body search list / chart | 0.4 / 0.4 s | 1.8 / 0.3 s | 0.3 / 0.3 s | 1.0 / 0.6 s | 3.1 / 0.5 s | 0.5 / 0.6 s |
+
+  Pass 1 partly benefits from bytes earlier probes left on disk. Cold first runs of status-500 and route queries over sealed days stay at 30–50 s: raw scans, round-trip-bound. A fix needs a tier or index carrying those columns (owner decision; see the summary).
 - [x] **N12 history: #363 did not make the re-run local on prod.** 7d `user_email`: run 0 25.9 s steered 1,634 entries disk-only; run 1 18.0 s still fetched 3.2 GB in 1,695 GETs. Locally, at prod's 2 GiB block size, a full device and a ~400 MB/s paced burst, every entry is kept. #365 exports foyer's own device counters (`foyer.l2_write_bytes/l2_read_bytes/…`) so prod can show whether the entries are written and whether the re-run reads them.
 - [ ] **N13** Range amplification: cold scans fetch 3–4.6× the bytes parquet requests (1 MiB alignment plus 1 MiB `get_ranges` coalesce gap). 7d http500 chart: 26 s, 0.8 GB requested vs 3.7 GB fetched in 2,278 GETs. `FLAG SET timefusion_parquet_range_kb N` (#362; default 1024, 0 = exact). A/B it in one process on fresh cold (column, day) pairs: time, `foyer.inner_bytes_read`, `parquet.bytes_read`.
   - Filter battery 04:10 (log explorer, list and chart). The worst shapes left:
