@@ -2807,19 +2807,19 @@ mod tests {
     /// Data ranges are cached as fixed blocks, so a request is served from whatever blocks
     /// earlier requests fetched, however those requests were shifted or coalesced, and a miss
     /// fetches only its missing blocks: one GET per contiguous missing run.
-    #[test_case::test_case(&[100..1_500_000], 1_100_000..1_900_000, 0, 0 ; "shifted inside a fetched span: no fetch")]
-    #[test_case::test_case(&[100..1_500_000], 1_200_000..2_500_000, 1 << 20, 1 ; "overlapping: only the new block")]
-    #[test_case::test_case(&[10..20, 2_200_000..2_300_000], 0..3_000_000, 1 << 20, 1 ; "hole between cached blocks: one block")]
-    #[test_case::test_case(&[10..20], 0..4_194_304, 3 << 20, 1 ; "tail after a cached head: one run")]
+    #[test_case::test_case(&[(100, 1_500_000)], 1_100_000..1_900_000, 0, 0 ; "shifted inside a fetched span: no fetch")]
+    #[test_case::test_case(&[(100, 1_500_000)], 1_200_000..2_500_000, 1 << 20, 1 ; "overlapping: only the new block")]
+    #[test_case::test_case(&[(10, 20), (2_200_000, 2_300_000)], 0..3_000_000, 1 << 20, 1 ; "hole between cached blocks: one block")]
+    #[test_case::test_case(&[(10, 20)], 0..4_194_304, 3 << 20, 1 ; "tail after a cached head: one run")]
     #[tokio::test]
-    async fn a_data_range_fetches_only_its_uncached_blocks(warm: &[Range<u64>], range: Range<u64>, bytes: u64, gets: u64) -> anyhow::Result<()> {
+    async fn a_data_range_fetches_only_its_uncached_blocks(warm: &[(u64, u64)], range: Range<u64>, bytes: u64, gets: u64) -> anyhow::Result<()> {
         let mem = Arc::new(InMemory::new());
         let (_shared, cache, _dir) = shared_with("block_ranges", mem.clone(), |c| c.l1_max_entry_bytes = 64).await?;
         let path = Path::from("tbl/date=2026-01-02/blocks.parquet");
         let body: Vec<u8> = (0..4 * PARQUET_RANGE_ALIGNMENT_BYTES as usize).map(|i| (i % 251) as u8).collect();
         mem.put(&path, PutPayload::from(Bytes::from(body.clone()))).await?;
-        for r in warm {
-            cache.get_range_cached(&path, r.clone()).await?;
+        for &(start, end) in warm {
+            cache.get_range_cached(&path, start..end).await?;
         }
         let before = cache.get_stats().main;
         assert_eq!(&cache.get_range_cached(&path, range.clone()).await?[..], &body[range.start as usize..range.end as usize]);
