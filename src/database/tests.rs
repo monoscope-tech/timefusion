@@ -11858,6 +11858,10 @@ async fn a_delta_scan_records_its_planning_phases() -> Result<()> {
     let date = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(ts).unwrap().date_naive().to_string();
     let rows = vec![serde_json::json!({"timestamp": ts, "id": "a", "name": "n", "project_id": project_id, "date": date, "summary": []})];
     db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![json_to_batch_for("otel_logs_and_spans", rows)?], true, None).await?;
+    let other = format!("{project_id}_other");
+    let rows = vec![serde_json::json!({"timestamp": ts, "id": "b", "name": "n", "project_id": other, "date": date, "summary": []})];
+    db.insert_records_batch(&other, "otel_logs_and_spans", vec![json_to_batch_for("otel_logs_and_spans", rows)?], true, None).await?;
+    let seeded = snapshot().replay_seed_rows;
     let before = snapshot().plan_phase_us;
     ctx.sql(&format!("SELECT id FROM otel_logs_and_spans WHERE project_id = '{project_id}' AND timestamp > to_timestamp_micros({})", ts - 1))
         .await?
@@ -11867,6 +11871,8 @@ async fn a_delta_scan_records_its_planning_phases() -> Result<()> {
     for phase in [PlanPhase::Replay, PlanPhase::Build] {
         assert!(after[phase as usize] > before[phase as usize], "{phase:?} not recorded");
     }
+    // The project pin seeds the replay with that project's file only, not the other's.
+    assert_eq!(snapshot().replay_seed_rows - seeded, 1, "a project-pinned replay must read only its project's files");
     Ok(())
 }
 
