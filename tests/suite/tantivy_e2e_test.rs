@@ -133,6 +133,8 @@ fn make_batch<S: AsRef<str>>(project: &str, rows: &[(S, S, S)]) -> RecordBatch {
                 "name": name,
                 "level": lvl,
                 "status_message": msg,
+                "attributes___http___response___status_code": if lvl == "ERROR" { 500 } else { 200 },
+                "attributes___http___route": format!("/v1/{name}"),
                 "project_id": project,
                 "date": now.date_naive().to_string(),
                 "hashes": [],
@@ -685,6 +687,27 @@ async fn flushed_eq_or_and_in_list_prefilters_match_baseline() -> Result<()> {
     ] {
         pair.assert_ids(predicate, &want, why).await?;
     }
+    Ok(())
+}
+
+/// Integer and path-valued `=` on raw-indexed columns route through the index, and
+/// equal the full-scan baseline. MemBuffer rows hold the same columns unindexed: the
+/// routed `text_match` must row-evaluate an Int32 column, not drop every row.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn status_and_route_equality_prefilter_and_match_baseline() -> Result<()> {
+    let pair = Pair::new("http", Land::Flushed, &flush_group("h1", "checkout failed", "h")).await?;
+    pair.wait_manifest(1).await?;
+    let queries = || pair.on.tantivy_search().expect("search service").stats.queries.load(std::sync::atomic::Ordering::Relaxed);
+    for predicate in
+        ["attributes___http___response___status_code = 500", "attributes___http___route = '/v1/n' AND attributes___http___response___status_code = 500"]
+    {
+        let before = queries();
+        pair.assert_ids(predicate, &["h1"], "flushed rows").await?;
+        assert!(queries() > before, "the predicate must search the index [{predicate}]");
+    }
+    pair.write(Land::Mem, &[("m1", "pay", "card failed")]).await?;
+    pair.assert_ids("attributes___http___response___status_code = 500", &["h1", "m1"], "unindexed MemBuffer rows").await?;
     Ok(())
 }
 

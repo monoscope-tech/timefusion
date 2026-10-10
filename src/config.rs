@@ -2265,12 +2265,10 @@ pub enum RuntimeFlag {
     TimefusionParquetReadAhead,
     /// Range reads of bundled tantivy indexes (0/1).
     TimefusionTantivyRangeReads,
-    /// Parquet read alignment and coalesce gap in KiB; 0 = exact ranges.
-    TimefusionParquetRangeKb,
 }
 
 /// Per-flag override: 0 = config, else value + 1.
-static FLAG_OVERRIDES: [std::sync::atomic::AtomicU32; 4] = [const { std::sync::atomic::AtomicU32::new(0) }; 4];
+static FLAG_OVERRIDES: [std::sync::atomic::AtomicU32; 3] = [const { std::sync::atomic::AtomicU32::new(0) }; 3];
 
 impl RuntimeFlag {
     fn slot(self) -> &'static std::sync::atomic::AtomicU32 {
@@ -2281,7 +2279,6 @@ impl RuntimeFlag {
         match self {
             Self::TimefusionMaintenanceCpuTokens => 8..=256,
             Self::TimefusionParquetReadAhead | Self::TimefusionTantivyRangeReads => 0..=1,
-            Self::TimefusionParquetRangeKb => 0..=4096,
         }
     }
 
@@ -2306,7 +2303,6 @@ impl AppConfig {
             RuntimeFlag::TimefusionMaintenanceCpuTokens => u32::try_from(self.derived.coordinator_job_slots()).unwrap_or(u32::MAX),
             RuntimeFlag::TimefusionParquetReadAhead => u32::from(self.parquet.timefusion_parquet_read_ahead),
             RuntimeFlag::TimefusionTantivyRangeReads => u32::from(self.tantivy.timefusion_tantivy_range_reads),
-            RuntimeFlag::TimefusionParquetRangeKb => crate::storage::PARQUET_RANGE_KB,
         })
     }
 

@@ -1008,7 +1008,10 @@ fn match_indexed_in_list(expr: &Expr, indexed_columns: &IndexedCols, allow_eq: b
 /// classified now, placeholders defer to scan time.
 fn eq_term_route(rhs: &Expr) -> Option<Route> {
     match rhs {
-        Expr::Literal(s, _) => extract_utf8_string(s).filter(|v| !v.is_empty() && v.chars().all(is_eq_term_safe)).map(Route::Ready),
+        Expr::Literal(s, _) => extract_utf8_string(s)
+            .or_else(|| (s.data_type().is_integer() && !s.is_null()).then(|| s.to_string()))
+            .filter(|v| !v.is_empty() && v.chars().all(is_eq_term_safe))
+            .map(Route::Ready),
         // Value unknown until Bind; the deferred tag keeps the prefilter in
         // plans cached with placeholders.
         Expr::Placeholder(_) => Some(Route::Deferred { rhs: rhs.clone(), kind: "eq".into() }),
@@ -1224,9 +1227,10 @@ mod tantivy_rewriter_tests {
     #[test_case(eq("tid", "abc123"), false => None ; "flag off reverts to bloom/stats")]
     #[test_case(eq("name", "runServer"), true => None ; "ngram3 is lossy for equality")]
     #[test_case(re("tid", Operator::NotEq, "abc", false), true => None ; "`!=` has no term form")]
-    #[test_case(eq("tid", "a:b"), true => None ; "colon is query syntax")]
-    #[test_case(eq("tid", "foo bar"), true => None ; "space, AND-split can't match one raw token")]
-    #[test_case(eq("tid", "a.b"), true => None ; "dot conservatively excluded")]
+    #[test_case(eq("tid", "a:b"), true => ready("tid", "a:b") ; "raw equality bypasses the query parser: colon is a literal")]
+    #[test_case(eq("tid", "foo bar"), true => ready("tid", "foo bar") ; "raw analyzer keeps a spaced value as one term")]
+    #[test_case(eq("tid", "/v1/a.b"), true => ready("tid", "/v1/a.b") ; "path-valued route")]
+    #[test_case(eq("tid", "foo*"), true => None ; "a star would switch the leaf to parser prefix semantics")]
     #[test_case(eq("tid", ""), true => None ; "empty literal")]
     // ILIKE on a raw (case-sensitive) column would silently miss case variants.
     #[test_case(ilike("tid", "foo"), true => None ; "ILIKE never routes on a raw column")]
@@ -1262,7 +1266,7 @@ mod tantivy_rewriter_tests {
     #[test_case(in_list("tid", &["a", "b"], false), true => "or(tid:a,tid:b)" ; "IN-list routes as an Or of terms")]
     #[test_case(in_list("tid", &["a"], true), true => "none" ; "NOT IN is never routed")]
     #[test_case(in_list("name", &["abc"], false), true => "none" ; "IN-list on an ngram3 column")]
-    #[test_case(in_list("tid", &["a:b"], false), true => "none" ; "IN-list with a QueryParser-unsafe literal")]
+    #[test_case(in_list("tid", &["a*"], false), true => "none" ; "IN-list with a starred literal")]
     #[test_case(in_list("tid", &["a"], false), false => "none" ; "IN-list with the flag off")]
     fn routed_tree_cases(expr: Expr, allow_eq: bool) -> String {
         fn go(n: &PredNode) -> String {

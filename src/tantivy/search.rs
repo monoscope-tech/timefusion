@@ -1636,6 +1636,7 @@ impl TantivyIndexService {
         self.seed_reader_cache(table_name, project_id, manifest_key, blob_path.as_ref(), blob).await;
         let entry = ManifestEntry {
             element_fields: stats.element_fields,
+            fields: stats.fields,
             index: Some(blob_path.to_string()),
             rows: stats.rows,
             built_at: Utc::now(),

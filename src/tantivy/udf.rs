@@ -24,9 +24,10 @@ pub fn is_tantivy_safe_term_char(c: char) -> bool {
     c.is_alphanumeric() || matches!(c, '.' | '-' | '_' | ' ' | '/' | '@')
 }
 
-/// Accepts exact terms that pass through the raw query parser unchanged.
+/// Exact terms compile through the raw analyzer, not the query parser, so only `*`
+/// (which switches the leaf to parser prefix semantics) is unsafe.
 pub fn is_eq_term_safe(c: char) -> bool {
-    c.is_alphanumeric() || matches!(c, '-' | '_')
+    c != '*'
 }
 
 /// Decide which Tantivy query form a SQL LIKE pattern maps to.
@@ -249,6 +250,10 @@ fn string_extractor(arr: &ArrayRef) -> Box<dyn Fn(usize) -> Option<String> + '_>
         // index and predicates on Variant columns silently never match.
         DataType::Struct(_) if crate::schema::is_variant_type(arr.data_type()) => {
             Box::new(move |i| crate::tantivy::variant_to_text(arr, i, false).ok().flatten())
+        }
+        // Integers render as the decimal term the index holds.
+        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => {
+            Box::new(move |i| (!arr.is_null(i)).then(|| arrow::util::display::array_value_to_string(arr, i).ok()).flatten())
         }
         // Anything else — degrade to never-match.
         _ => Box::new(|_| None),

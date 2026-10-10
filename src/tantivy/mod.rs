@@ -76,6 +76,8 @@ pub enum MergeMode {
 pub struct IndexBuildStats {
     /// Fields actually encoded as separate exact array elements in this build.
     pub element_fields: std::collections::BTreeSet<String>,
+    /// Every user field this build indexed.
+    pub fields: std::collections::BTreeSet<String>,
     pub rows: u64,
     pub batches: u32,
     pub min_timestamp_micros: Option<i64>,
@@ -102,7 +104,7 @@ pub fn index_to_writer(
     let mut writer: IndexWriter = index.writer(WRITER_HEAP_BYTES).context("create tantivy writer")?;
     // Explicit merges keep `TermMerger` off the ingest path.
     writer.set_merge_policy(Box::new(NoMergePolicy));
-    let mut stats = IndexBuildStats { element_fields: built.element_fields(), ..Default::default() };
+    let mut stats = IndexBuildStats { element_fields: built.element_fields(), fields: built.user_fields.keys().cloned().collect(), ..Default::default() };
     for batch in batches {
         index_batch(built, &mut writer, batch.borrow(), &mut stats)?;
         stats.batches = stats.batches.saturating_add(1);
@@ -226,6 +228,8 @@ fn index_batch(built: &BuiltSchema, writer: &mut IndexWriter, batch: &RecordBatc
 enum ColKind {
     Utf8,
     Utf8View,
+    /// Integers index as their decimal string, the term `col = <n>` routes to.
+    Int,
     ListUtf8,
     VariantJson(VariantArray),
     VariantKv(VariantArray),
@@ -236,6 +240,7 @@ impl ColKind {
         Ok(match column.data_type() {
             DataType::Utf8 => Self::Utf8,
             DataType::Utf8View => Self::Utf8View,
+            DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => Self::Int,
             DataType::List(_) => Self::ListUtf8,
             DataType::Struct(_) => {
                 let array = VariantArray::try_new(column.as_ref()).context("prepare variant index column")?;
@@ -255,6 +260,7 @@ impl ColKind {
         Ok(match self {
             Self::Utf8 => Some(col.as_any().downcast_ref::<StringArray>().context("utf8 cast")?.value(row).to_string()),
             Self::Utf8View => Some(col.as_any().downcast_ref::<StringViewArray>().context("utf8view cast")?.value(row).to_string()),
+            Self::Int => Some(arrow::util::display::array_value_to_string(col, row)?),
             // Space-join, not "skip when empty": empty elements are real terms.
             Self::ListUtf8 => Some(list_strs(&col.as_any().downcast_ref::<ListArray>().context("list cast")?.value(row))?.join(" ")),
             Self::VariantJson(array) => prepared_variant_to_text(array, row, false)?,
@@ -424,6 +430,8 @@ mod builder_tests {
         let mut entry = ManifestEntry::failed("old build".into(), vec!["file".into()]);
         entry.index = Some("index".into());
         entry.error = None;
+        assert!(!entry.covers_current_elements(&table), "an index lacking a declared field must be rebuilt");
+        entry.fields = stats.fields.clone();
         assert_eq!(entry.covers_current_elements(&table), mode == TantivyListMode::JoinedText, "legacy index must not stop element backfill");
         entry.element_fields = stats.element_fields.clone();
         assert_eq!(entry.covers_current_elements(&table), mode == TantivyListMode::JoinedText, "element histograms need physical ordinals");
@@ -804,6 +812,10 @@ pub struct ManifestEntry {
     /// cannot answer exact element predicates, even if the field name exists.
     #[serde(default)]
     pub element_fields: std::collections::BTreeSet<String>,
+    /// User fields the index holds. Empty in legacy manifests, which backfill
+    /// therefore rebuilds once the schema declares a field they may lack.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub fields: std::collections::BTreeSet<String>,
     /// Object-store path to the index tar.zst, or `None` if build failed.
     pub index: Option<String>,
     pub rows: u64,
@@ -1052,6 +1064,7 @@ impl ManifestEntry {
         self.is_usable()
             && (self.element_fields.is_empty() || (self.ordinals_valid && self.covered_files.len() == 1))
             && self.element_fields == element_field_names(&table.fields)
+            && indexed_fields(table).all(|(fd, cfg)| self.fields.contains(&fd.name) || fd.name == TS_FIELD || fd.name == ID_FIELD || aliases_id_field(fd, cfg))
     }
     /// Entry recorded when the index build itself failed: no index, no rows,
     /// but the covered files are still tracked so GC can reap it later.
