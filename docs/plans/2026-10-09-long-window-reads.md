@@ -108,7 +108,8 @@ Order = user impact for shipbubble. Prod measurements run one at a time; code ru
 - [ ] **N4** Remaining shipbubble rollup misses: `multi_scan_source` (30d traffic and var_service), `not_built` (latency_percentiles, http_by_status 7d), `filter_not_eligible`.
 - [x] **N5a** Maintenance scans skip the second replay (#356). **N5b** open: per-scan planning ~31 ms (replay 21 ms, footer ordering) is now the largest fixed cost of a routed widget.
 - [ ] **N5** Delta planning ~31 ms per scan. Maintenance scans' second replay is in a parallel worktree, `scan/maintenance-selection-ignore`.
-- [ ] **N6** WAL segments pinned by idle writers (parallel worktree `wal/roll-idle-writers`).
+- [x] **N6** WAL segments pinned by idle writers (#357, `a17afcd1`, live 01:58): GC rolls writers off aged segments before sweeping.
+- [ ] **N5b** Delta replay ~50 ms CPU per scan: kernel data skipping over all ~1.4k files of the unified table, when a project pins ~180 (prod CPU flamegraph 01:33). Fork agent building a per-(version, project) partition seed cache.
 - [ ] **N7** Rare-column filters: 20–50 s cold. **Analyzed 01:45**, 7d chart filtered on `attributes___http___request___method`:
   - Run 1: 50.8 s, 2,065 GETs, 3.4 GB from the store.
   - Run 2: 31 s, still 1,791 GETs (frequency-based cache admission).
