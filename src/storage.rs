@@ -426,10 +426,7 @@ async fn build_hybrid_cache(
             .with_io_engine_config(PsyncIoEngineConfig::new())
             .with_engine_config(
                 BlockEngineConfig::new(FsDeviceBuilder::new(dir).with_capacity(disk_bytes).build()?)
-                    .with_block_size(block_size)
-                    .with_flushers(FOYER_FLUSHERS)
-                    .with_buffer_pool_size(FOYER_FLUSHERS * FOYER_FLUSH_BUFFER_BYTES)
-                    .with_submit_queue_size_threshold(FOYER_SUBMIT_QUEUE_BYTES),
+                    .with_block_size(block_size),
             )
             .build()
             .await?,
