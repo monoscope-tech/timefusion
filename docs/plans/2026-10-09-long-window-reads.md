@@ -121,7 +121,19 @@ Order = user impact for shipbubble. Prod measurements run one at a time; code ru
 - [x] **N8** 30d percentile charts: warm and routed (hybrid) **1.1–2.4 s** (01:40). The 23 s samples were cold/stale-coverage periods, not a separate defect. Original:: 3.7 s against 23 s variance; classify cold/warm and routed/raw.
 - [ ] **N7b** Cache admission (#361): a bypassed (wide) scan declined admission on first sighting, so a re-run fetched everything cold again: 7d `url_scheme` chart 8.8 s, then 5.7 s, then 0.2 s. First sighting now lands disk-only (`Location::OnDisk`), so L1 stays protected and the re-run is local. The foyer disk tier is on md4 (`/mnt/ephemeral`, ~5% util), not the WAL/data array.
   - Cold first run (8.8 s): 30 files, 361 GETs at ~200 ms, ~12 serial round trips per file. DedupExec needs ordered legs, so DataFusion cannot split a big sealed file across partitions; the critical path is one file's row groups in series. The 10-09 read-ahead A/B showed no gain. Remaining options: access-plan-aware prefetch (fork), or bigger sealed row groups (staging first).
-- [ ] **N11** MemBuffer leg narrowed to the scan's columns. Every today leg filtered and sorted all ~90 columns of each matching buffered row: 345–480 ms of a 0.56–0.64 s today leg (30d `var_service`). The prod profile puts `take` above `lexsort`. Project first (projection + sort columns + `timestamp`), then filter and sort.
+  - **#361 shipped 04:23 but does NOT deliver at prod scale.** 7d `user_agent` chart: run 1 32.9 s steered 2,026 entries disk-only; run 2 24.2 s still fetched 3.5 GB in 2,079 GETs. Root cause is N12.
+- [ ] **N12** foyer's disk tier drops what it is given (#363, stacked on #362). The block engine defaults to 1 flusher, a 16 MiB flush buffer and a 16 MiB submit queue, and `BlobWriter::push` silently drops any entry that does not fit. So a cold scan's burst mostly never reaches disk, and **no entry above 16 MiB is ever written**, including everything steered disk-only past `l1_max_entry_mb` = 16. Repro: 48 × 2 MiB + one 24 MiB → 42 of 49 lost. Fix: 4 × 64 MiB flushers, 1 GiB queue, write capture capped at 64 MiB. Follow-up: `warm_full` still downloads files over 64 MiB that the tier cannot keep.
+- [ ] **N13** Range amplification: cold scans fetch 3–4.6× the bytes parquet requests (1 MiB alignment plus 1 MiB `get_ranges` coalesce gap). 7d http500 chart: 26 s, 0.8 GB requested vs 3.7 GB fetched in 2,278 GETs. `FLAG SET timefusion_parquet_range_kb N` (#362; default 1024, 0 = exact). A/B it in one process on fresh cold (column, day) pairs: time, `foyer.inner_bytes_read`, `parquet.bytes_read`.
+  - Filter battery 04:10 (log explorer, list and chart). The worst shapes left:
+
+    | Filter | 7d | 30d |
+    | --- | --- | --- |
+    | `status_code = 500`, list | 55 s | 67 s |
+    | `status_code = 500`, chart | 26 s | 61 s |
+    | route filter, chart | 17.5 s | 50 s |
+
+    errors 1.3–3.9 s, route list 0.9–2.6 s, body search 0.4–1.0 s.
+- [ ] **N11** MemBuffer leg narrowed to the scan's columns (#362). Every today leg filtered and sorted all ~90 columns of each matching buffered row: 345–480 ms of a 0.56–0.64 s today leg (30d `var_service`). The prod profile puts `take` above `lexsort`. Project first (projection + sort columns + `timestamp`), then filter and sort.
 - [x] **N4 (partly)** 30d `var_service`: every whole day of the 30 routes full in 150–290 ms; the 3.5 s samples are the today leg plus noise (1.0 s re-measured). Remaining misses are the edges, not the interior.
 - [ ] **N9** Needle leftovers: hit materialization reads `_id` (~47 MB per index); trace-id FST whole reads.
 - [ ] **N10** Keep the scorecard current; morning summary.
