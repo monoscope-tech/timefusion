@@ -109,7 +109,7 @@ Order = user impact for shipbubble. Prod measurements run one at a time; code ru
 - [x] **N5a** Maintenance scans skip the second replay (#356).
 - [x] **N6** WAL segments pinned by idle writers (#357, `a17afcd1`, live 01:58): GC rolls writers off aged segments before sweeping.
 - [x] **N5b** Partition-pinned replay seed (#359, fork `e37dc433`, live 03:10). A `project_id = X` scan replays only that partition's files (cached per snapshot). Bench (50k files, 20 partitions): replay 22 ms → 5.5–8.1 ms. Guard `a_delta_scan_records_its_planning_phases` (red: 2 vs 1). Prod 03:25: replay per scan **9–24 ms** (was 65–70 ms); 24h/7d traffic, error_rate, le_status, var_service **0.6–0.8 s**.
-  - Endpoint widget re-measured 04:00: 7d **0.6–1.1 s** (the 3.1 s at 03:25 was one cold sample). Legs: 6d→midnight 0.3–0.8 s; today 0.5 s.
+  - Endpoint widgets re-measured 03:56, all routed: 7d **0.5–1.3 s**, 14d 0.7–1.8 s, 30d 0.9–2.1 s (the 3.1 s at 03:25 was one cold sample). Legs: 6d→midnight 0.3–0.8 s; today 0.5 s.
   - What a routed 7d endpoint widget still pays: rollup rewrite planning ~250 ms and the MemBuffer leg 170–300 ms.
 - [ ] **N7** Rare-column filters: 20–50 s cold. **Analyzed 01:45**, 7d chart filtered on `attributes___http___request___method`:
   - Run 1: 50.8 s, 2,065 GETs, 3.4 GB from the store.
@@ -119,6 +119,10 @@ Order = user impact for shipbubble. Prod measurements run one at a time; code ru
   - Proposal: raise the row-group cap for SEALED consolidation only (fewer, larger row groups means proportionally fewer cold GETs).
   - NOT shipped: 4x writer memory in the lane that nearly OOM'd at 00:16. Prove it on `run-unit` or staging first.
 - [x] **N8** 30d percentile charts: warm and routed (hybrid) **1.1–2.4 s** (01:40). The 23 s samples were cold/stale-coverage periods, not a separate defect. Original:: 3.7 s against 23 s variance; classify cold/warm and routed/raw.
+- [ ] **N7b** Cache admission (#361): a bypassed (wide) scan declined admission on first sighting, so a re-run fetched everything cold again: 7d `url_scheme` chart 8.8 s, then 5.7 s, then 0.2 s. First sighting now lands disk-only (`Location::OnDisk`), so L1 stays protected and the re-run is local. The foyer disk tier is on md4 (`/mnt/ephemeral`, ~5% util), not the WAL/data array.
+  - Cold first run (8.8 s): 30 files, 361 GETs at ~200 ms, ~12 serial round trips per file. DedupExec needs ordered legs, so DataFusion cannot split a big sealed file across partitions; the critical path is one file's row groups in series. The 10-09 read-ahead A/B showed no gain. Remaining options: access-plan-aware prefetch (fork), or bigger sealed row groups (staging first).
+- [ ] **N11** MemBuffer leg narrowed to the scan's columns. Every today leg filtered and sorted all ~90 columns of each matching buffered row: 345–480 ms of a 0.56–0.64 s today leg (30d `var_service`). The prod profile puts `take` above `lexsort`. Project first (projection + sort columns + `timestamp`), then filter and sort.
+- [x] **N4 (partly)** 30d `var_service`: every whole day of the 30 routes full in 150–290 ms; the 3.5 s samples are the today leg plus noise (1.0 s re-measured). Remaining misses are the edges, not the interior.
 - [ ] **N9** Needle leftovers: hit materialization reads `_id` (~47 MB per index); trace-id FST whole reads.
 - [ ] **N10** Keep the scorecard current; morning summary.
 
