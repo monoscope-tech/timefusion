@@ -726,11 +726,20 @@ fn filter_batch_by_id_set(batch: &RecordBatch, ids: &std::collections::HashSet<S
 /// Drop non-matching rows and any batch that ends up empty; `None` is a no-op.
 /// Best-effort: on any evaluation error the batch is kept UNFILTERED, so
 /// DataFusion's FilterExec must still be in the plan.
-pub fn filter_snapshot(snapshot: Vec<RecordBatch>, pred: &Option<Arc<dyn datafusion::physical_expr::PhysicalExpr>>) -> Vec<RecordBatch> {
-    let Some(p) = pred else { return snapshot };
+/// Narrow each batch to `keep` (all columns when `None`), then filter it by `pred`, which is
+/// evaluated against the full batch, so filtering copies only the kept columns.
+pub fn filter_snapshot(
+    snapshot: Vec<RecordBatch>, pred: &Option<Arc<dyn datafusion::physical_expr::PhysicalExpr>>, keep: Option<&[usize]>,
+) -> Vec<RecordBatch> {
     snapshot
         .iter()
-        .map(|b| eval_bool_mask(p, b).ok().and_then(|mask| filter_record_batch(b, &mask).ok()).unwrap_or_else(|| b.clone()))
+        .map(|b| {
+            let kept = keep.and_then(|k| b.project(k).ok()).unwrap_or_else(|| b.clone());
+            match pred {
+                Some(p) => eval_bool_mask(p, b).ok().and_then(|mask| filter_record_batch(&kept, &mask).ok()).unwrap_or(kept),
+                None => kept,
+            }
+        })
         .filter(|b| b.num_rows() > 0)
         .collect()
 }
@@ -1254,10 +1263,11 @@ impl MemBuffer {
     /// cannot be visible in the data but absent from the IDs. With `node`
     /// `None` or no indexed fields, behaves like `query_partitioned`.
     #[instrument(skip(self, filters, node), fields(project_id, table_name))]
+    /// `keep`: table-schema column indices the caller reads (see [`Self::scan_buckets`]).
     pub fn query_partitioned_with_text_match(
-        &self, project_id: &str, table_name: &str, filters: &[Expr], node: Option<&crate::tantivy::udf::PredNode>,
+        &self, project_id: &str, table_name: &str, filters: &[Expr], node: Option<&crate::tantivy::udf::PredNode>, keep: Option<&[usize]>,
     ) -> anyhow::Result<MemLeg> {
-        self.scan_buckets(project_id, table_name, filters, crate::schema::get_schema(table_name).filter(|s| has_indexed_fields(s)).zip(node))
+        self.scan_buckets(project_id, table_name, filters, crate::schema::get_schema(table_name).filter(|s| has_indexed_fields(s)).zip(node), keep)
     }
 
     /// Flattened [`Self::query_partitioned`] — same rows, bucket partitioning dropped.
@@ -1270,7 +1280,7 @@ impl MemBuffer {
     /// buckets by timestamp.
     #[instrument(skip(self, filters), fields(project_id, table_name))]
     pub fn query_partitioned(&self, project_id: &str, table_name: &str, filters: &[Expr]) -> anyhow::Result<MemLeg> {
-        self.scan_buckets(project_id, table_name, filters, None)
+        self.scan_buckets(project_id, table_name, filters, None, None)
     }
 
     /// Captures complete overlapping buckets and their authority over Delta.
@@ -1308,8 +1318,11 @@ impl MemBuffer {
     /// Bucket scan shared by both query entry points: prune by timestamp
     /// range, snapshot each surviving bucket — atomically with its text-match
     /// id set when `text` is given — then apply the compiled predicate.
+    /// `keep` narrows the returned batches to those table-schema columns
+    /// (ascending; must include every sorting column) before anything is copied.
     fn scan_buckets(
         &self, project_id: &str, table_name: &str, filters: &[Expr], text: Option<(&crate::schema::TableSchema, &crate::tantivy::udf::PredNode)>,
+        keep: Option<&[usize]>,
     ) -> anyhow::Result<MemLeg> {
         let ts_range = extract_timestamp_range(filters);
         let Some(table) = self.get_table(project_id, table_name) else { return Ok(MemLeg::default()) };
@@ -1335,7 +1348,7 @@ impl MemBuffer {
                     Some(ids) => snapshot.iter().map(|b| filter_batch_by_id_set(b, &ids)).filter(|b| b.num_rows() > 0).collect(),
                     None => snapshot,
                 };
-                anyhow::Ok(filter_snapshot(by_id, &pred))
+                anyhow::Ok(filter_snapshot(by_id, &pred, keep))
             })
             .collect::<anyhow::Result<Vec<_>>>()?
             .into_iter()
@@ -3173,8 +3186,30 @@ mod tests {
 
         let preds = query.map(name_preds);
         let node = preds.as_deref().and_then(crate::tantivy::udf::PredNode::from_preds);
-        let parts = buffer.query_partitioned_with_text_match("p1", "otel_logs_and_spans", &[], node.as_ref()).unwrap();
+        let parts = buffer.query_partitioned_with_text_match("p1", "otel_logs_and_spans", &[], node.as_ref(), None).unwrap();
         col_strings(&parts.partitions.concat(), "id").into_iter().sorted().collect()
+    }
+
+    /// A narrowed leg copies only the kept columns, and holds exactly the full leg's
+    /// filtered rows in the same sorted order, even when the filter reads a dropped column.
+    #[test]
+    fn a_narrowed_mem_leg_is_the_full_leg_on_its_columns() {
+        use datafusion::logical_expr::{col, lit};
+        let buffer = MemBuffer::new();
+        let ts = chrono::Utc::now().timestamp_micros();
+        for (i, svc) in ["delta", "alpha", "charlie", "bravo"].into_iter().enumerate() {
+            buffer.insert("p1", "otel_logs_and_spans", spans(&[(&format!("id-{i}"), svc)]), ts + i as i64 % 2).unwrap();
+        }
+        let schema = buffer.get_table("p1", "otel_logs_and_spans").unwrap().schema().clone();
+        let keep = ["timestamp", "resource___service___name", "id"].map(|c| schema.index_of(c).unwrap()).into_iter().sorted().collect_vec();
+        let filter = [col("name").not_eq(lit(datafusion::scalar::ScalarValue::Utf8View(Some("bravo".into()))))];
+        let leg = |keep| buffer.query_partitioned_with_text_match("p1", "otel_logs_and_spans", &filter, None, keep).unwrap();
+        let (full, narrow) = (leg(None), leg(Some(&keep)));
+        assert!(full.sorted && narrow.sorted, "both legs must keep the ordering claim");
+        let narrow = narrow.partitions.concat();
+        assert!(narrow.iter().all(|b| b.num_columns() == keep.len()), "the leg must not copy unread columns");
+        assert_eq!(narrow, full.partitions.concat().iter().map(|b| b.project(&keep).unwrap()).collect_vec());
+        assert_eq!(narrow.iter().map(|b| b.num_rows()).sum::<usize>(), 3, "the filter still applies");
     }
 
     /// `restore_taken_bucket` must replay the rows' real timestamp range, not

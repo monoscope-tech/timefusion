@@ -239,15 +239,35 @@ impl ProjectRoutingTable {
     /// `sorted` is the caller's claim that every partition is already ordered by
     /// the table's declared `sorting_columns`; declaring it is what stops a
     /// blocking `SortExec` being injected over this leg.
-    fn create_memory_exec(&self, partitions: &[Vec<RecordBatch>], projection: Option<&Vec<usize>>, sorted: bool) -> DFResult<Arc<dyn ExecutionPlan>> {
-        let mem_source =
-            MemorySourceConfig::try_new(partitions, self.schema.clone(), projection.cloned()).map_err(|e| DataFusionError::External(Box::new(e)))?;
+    /// Table columns the in-memory leg must carry: the projection plus the sorting columns and
+    /// `timestamp`, ascending. `None` = every column. Copying only these is what makes the leg's
+    /// filter and sort cheap on a ~90-column table.
+    fn mem_leg_columns(&self, projection: Option<&Vec<usize>>) -> Option<Vec<usize>> {
+        let sorting = crate::schema::get_schema(&self.table_name).into_iter().flat_map(|t| t.sorting_columns.iter().map(|c| c.name.as_str()));
+        let named = sorting.chain(["timestamp"]).filter_map(|name| self.schema.index_of(name).ok());
+        let keep: Vec<usize> = projection?.iter().copied().chain(named).sorted_unstable().dedup().collect();
+        (keep.len() < self.schema.fields().len()).then_some(keep)
+    }
+
+    /// `keep`: the table columns `partitions` were narrowed to, ascending; `projection` is
+    /// still in table-schema indices and is remapped onto them.
+    fn create_memory_exec(
+        &self, partitions: &[Vec<RecordBatch>], projection: Option<&Vec<usize>>, keep: Option<&[usize]>, sorted: bool,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        let (schema, projection) = match keep {
+            Some(keep) => (
+                Arc::new(self.schema.project(keep)?),
+                projection.map(|p| p.iter().map(|i| keep.binary_search(i).expect("keep holds the projection")).collect()),
+            ),
+            None => (self.schema.clone(), projection.cloned()),
+        };
+        let mem_source = MemorySourceConfig::try_new(partitions, schema.clone(), projection).map_err(|e| DataFusionError::External(Box::new(e)))?;
 
         // The UNPROJECTED schema on purpose: `try_with_sort_information` validates
         // each sort column's (name, index) against the source's ORIGINAL schema
         // and maps it through the projection itself. Projected indices silently
         // drop the claim. `sort_partition` uses the same unprojected schema.
-        Ok(Arc::new(DataSourceExec::new(Arc::new(Self::declare_ordering(mem_source, sorted, &self.table_name, &self.schema)))))
+        Ok(Arc::new(DataSourceExec::new(Arc::new(Self::declare_ordering(mem_source, sorted, &self.table_name, &schema)))))
     }
 
     /// Attach the table's declared ordering to an in-memory source. Failure to
@@ -1234,10 +1254,20 @@ impl ProjectRoutingTable {
         // version's row while its match-bearing sibling is in another leg breaks keep-greatest.
         let mem_tree = text_match_tree.as_ref().filter(|_| mutable.is_none());
         let mem_plan_started = std::time::Instant::now();
-        let mem_leg = layer.query_partitioned_with_text_match(&project_id, &self.table_name, &optimized_filters, mem_tree).unwrap_or_else(|e| {
-            warn!("Failed to query mem buffer: {}", e);
-            Default::default()
-        });
+        let scan_mem = |keep: Option<&[usize]>| {
+            layer.query_partitioned_with_text_match(&project_id, &self.table_name, &optimized_filters, mem_tree, keep).unwrap_or_else(|e| {
+                warn!("Failed to query mem buffer: {}", e);
+                Default::default()
+            })
+        };
+        let mut keep = self.mem_leg_columns(projection);
+        let mut mem_leg = scan_mem(keep.as_deref());
+        // A batch too narrow to project comes back whole; a leg must have one shape.
+        if let Some(k) = &keep
+            && mem_leg.partitions.iter().flatten().any(|b| b.num_columns() != k.len())
+        {
+            (mem_leg, keep) = (scan_mem(None), None);
+        }
         metrics::counter!(scan_metric_names::MEM_PLAN_TOTAL).increment(1);
         metrics::counter!(scan_metric_names::MEM_PLAN_US_TOTAL).increment(mem_plan_started.elapsed().as_micros() as u64);
         crate::observability::record_plan_phase(crate::observability::PlanPhase::ScanMemLeg, mem_plan_started);
@@ -1255,7 +1285,7 @@ impl ProjectRoutingTable {
         }
 
         scan_state.lock().has_mem = true;
-        let mem_plan = self.create_memory_exec(&mem_partitions, projection, mem_leg.sorted)?;
+        let mem_plan = self.create_memory_exec(&mem_partitions, projection, keep.as_deref(), mem_leg.sorted)?;
 
         if skip_delta {
             span.record("scan.skipped_delta", true);

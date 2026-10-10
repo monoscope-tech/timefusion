@@ -3210,8 +3210,9 @@ impl BufferedWriteLayer {
     /// `query_partitioned` when `node` is None or the table has no indexed fields.
     pub fn query_partitioned_with_text_match(
         &self, project_id: &str, table_name: &str, filters: &[datafusion::logical_expr::Expr], node: Option<&crate::tantivy::udf::PredNode>,
+        keep: Option<&[usize]>,
     ) -> anyhow::Result<crate::write::mem_buffer::MemLeg> {
-        self.mem_buffer.query_partitioned_with_text_match(project_id, table_name, filters, node)
+        self.mem_buffer.query_partitioned_with_text_match(project_id, table_name, filters, node, keep)
     }
 
     /// Check if a table exists in the memory buffer.
