@@ -3751,7 +3751,6 @@ impl Database {
                 rules.push(Arc::new(crate::read::optimizers::DedupNeedsOrderedInput));
                 // After the merge under a fetch is final, before admission prices it.
                 rules.push(Arc::new(crate::read::bounded_merge::BoundedMergeForFetch));
-                rules.push(Arc::new(crate::read::bounded_merge::NarrowAscendingFetch));
                 // LAST, on the pgwire session only, so it wraps the absolute root
                 // (executed once) of a heavy plan. Internal SQL contexts (maintenance,
                 // rollup) have their own pool and are never gated.
