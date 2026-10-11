@@ -172,6 +172,26 @@ At 30d, most filtered queries time out at 90 s.
 - **#375** coverage checks hash each rollup spec once, about 30–90 ms less planning per routed query.
 - Still open: cache warmer (approved). A cold first run of a filter on an unindexed column is still about 10–35 s.
 
+### 10-11 late morning
+- **#380 + #381 disk-cache warmer.** It records the columns client scans read and warms them across the last 14 days, within 25% of the disk tier and 64 MB/s.
+  - Prod, 1 h after recording two columns from a 1-minute query: first-run 14d charts took 1.3 s (`telemetry.sdk.version`, 6 GETs) and 5.0 s (`url.query`, 84 GETs). The cold baseline was 25–35 s.
+  - The control column was warm too, because live traffic had recorded it.
+  - Two passes fetched 40 GB, about 11 MB/s on average.
+- **Battery at 10:11** (one query at a time; first run after a deploy):
+
+  | Query | 7d | 14d | 30d |
+  | --- | --- | --- | --- |
+  | Endpoint requests | 2.0 s | 1.1 s | 1.4 s |
+  | Endpoint p95 (monoscope shape, routed) | — | 0.6 s | 1.1–2.3 s |
+  | Endpoint by-status | 0.4 s | 0.6 s | 1.1 s |
+  | Errors, list / chart | 0.7 / 3.5 s | 0.4 / 3.0 s | 0.6 / 1.0 s |
+  | http500, list / chart | 0.7 / 0.4 s | 1.1 / 0.7 s | 1.7 / 5.0 s |
+  | Route, list / chart | 0.4 / 0.5 s | 0.4 / 0.9 s | 0.7 / 1.8 s |
+  | Body search, list / chart | 1.3 / 0.3 s | 2.1 / 0.4 s | 2.4 / 0.5 s |
+
+  - The 7d errors chart re-runs at 0.76–0.81 s, so 3.5 s was variance.
+- **md4 writes:** ~449 MB/s, of which foyer accounts for 1.6 MB/s. The rest is another workload on the same array; it was 314 MB/s on 10-10, before the cache changes, at 8% utilization.
+
 ### Housekeeping
 - `FLAG timefusion_parquet_range_kb`: removed in #372.
 - The vendored `foyer-storage` is pinned to 0.22.6 via `[patch.crates-io]`. If `foyer` bumps its storage dependency, the patch stops applying with only a cargo warning. The bug is worth an upstream issue to foyer-rs (your call).
