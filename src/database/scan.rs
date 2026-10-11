@@ -922,7 +922,7 @@ impl ProjectRoutingTable {
             let keys = crate::schema::get_schema(&self.table_name)
                 .into_iter()
                 .flat_map(|t| t.dedup_keys.iter().cloned().chain(t.sorting_columns.iter().map(|c| c.name.clone())));
-            self.database.read_activity.record(&self.table_name, &project_id, projected.chain(filtered).chain(keys), query_time_range);
+            self.database.read_activity.record(&self.table_name, &project_id, projected.chain(filtered).chain(keys));
         }
         let mut tantivy_id_filter: Option<Expr> = None;
         // When index coverage is partial, indexed and raw files are read as separate Delta legs.

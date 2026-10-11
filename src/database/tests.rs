@@ -10705,10 +10705,10 @@ async fn day_dashboard_scan_admits_to_cache_on_first_view() -> Result<()> {
     Ok(())
 }
 
-/// The disk-cache warmer pre-loads what recent client scans read. A scan that selects no file
-/// still records its project, day and columns; one warm pass then makes a cold week-deep scan of
-/// those columns read nothing from the store, while a column no scan read stays cold, and a pass
-/// whose budget is below one column chunk fetches nothing.
+/// The disk-cache warmer pre-loads what recent client scans read, across the whole recent
+/// horizon: a scan of the last minute records its project and columns, and one warm pass makes a
+/// cold week-deep scan of those columns, over days that scan never touched, read nothing from the
+/// store. A column no scan read stays cold, and a pass below one column chunk fetches nothing.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_warm_pass_serves_recently_read_columns_without_store_reads() -> Result<()> {
     let base = create_test_config("disk-warm");
@@ -10716,7 +10716,8 @@ async fn a_warm_pass_serves_recently_read_columns_without_store_reads() -> Resul
     let writer = Database::with_config(base.clone()).await?;
     writer.cancel_maintenance();
     let project = format!("warm_{}", uuid::Uuid::new_v4().simple());
-    let at = Utc::now().timestamp_micros() - 90_000_000;
+    // Three days back: outside every window the recording scan reads.
+    let at = Utc::now().timestamp_micros() - 3 * 86_400_000_000;
     // Long incompressible names: column chunks span many cache blocks, as prod's do, so a column
     // shares only its boundary blocks with its neighbours.
     let name = || (0..20).map(|_| uuid::Uuid::new_v4().to_string()).collect::<String>();
@@ -10738,7 +10739,7 @@ async fn a_warm_pass_serves_recently_read_columns_without_store_reads() -> Resul
         Ok(cache.runtime_stats().stats.main.inner_bytes_read - before)
     };
     let week = |column: &str| format!("SELECT {column} FROM otel_logs_and_spans WHERE project_id = '{project}' AND timestamp >= now() - INTERVAL '7 days'");
-    // The last minute holds no row, so this scan selects no file yet records `name` for today.
+    // The last minute holds no row, so this scan selects no file yet records `name`.
     store_bytes(format!("SELECT name FROM otel_logs_and_spans WHERE project_id = '{project}' AND timestamp >= now() - INTERVAL '1 minute'")).await?;
 
     assert_eq!(db.warm_recent_reads_within(1).await.0, 0, "a budget below one column chunk must fetch nothing");

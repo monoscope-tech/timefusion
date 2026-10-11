@@ -1023,46 +1023,36 @@ const WARM_FETCH_BYTES: u64 = 8 << 20;
 #[derive(Debug, Default)]
 pub(crate) struct ReadActivity(dashmap::DashMap<(String, String), ReadSet>);
 
-/// A recently-read (table, project) with its live columns and days.
-type RecentRead = ((String, String), HashSet<String>, HashSet<chrono::NaiveDate>);
+/// A recently-read (table, project) with its live columns.
+type RecentRead = ((String, String), HashSet<String>);
 
 #[derive(Debug, Default)]
 struct ReadSet {
     columns: HashMap<String, std::time::Instant>,
-    dates: HashMap<chrono::NaiveDate, std::time::Instant>,
 }
 
 impl ReadActivity {
-    pub(crate) fn record(&self, table: &str, project: &str, columns: impl IntoIterator<Item = String>, window: Option<(i64, i64)>) {
+    pub(crate) fn record(&self, table: &str, project: &str, columns: impl IntoIterator<Item = String>) {
         let key = (table.to_string(), project.to_string());
         if self.0.len() >= WARM_MAX_PAIRS && !self.0.contains_key(&key) {
             return;
         }
-        let (now, today) = (std::time::Instant::now(), Utc::now().date_naive());
-        let oldest = today - chrono::Days::new(WARM_DAYS);
-        let day = |micros: i64| chrono::DateTime::from_timestamp_micros(micros).map(|t| t.date_naive());
-        // Open bounds (i64::MIN/MAX) clamp to the warmed span: the last WARM_DAYS through today.
-        let dates = window.map(|(lo, hi)| {
-            let hi = day(hi).unwrap_or(today).min(today);
-            day(lo).unwrap_or(oldest).max(oldest).iter_days().take_while(move |d| *d <= hi)
-        });
+        let now = std::time::Instant::now();
         let mut set = self.0.entry(key).or_default();
         columns.into_iter().for_each(|c| _ = set.columns.insert(c, now));
-        dates.into_iter().flatten().for_each(|d| _ = set.dates.insert(d, now));
     }
 
-    /// Pairs read within the TTL, most recent first, with their live columns and days.
+    /// Pairs read within the TTL, most recent first, with their live columns.
     fn recent(&self) -> Vec<RecentRead> {
         let live = |at: &std::time::Instant| at.elapsed() < WARM_READ_TTL;
         self.0
             .iter()
             .filter_map(|e| {
                 let last = e.columns.values().filter(|at| live(at)).max().copied()?;
-                let columns = e.columns.iter().filter(|(_, at)| live(at)).map(|(c, _)| c.clone()).collect();
-                Some((last, e.key().clone(), columns, e.dates.iter().filter(|(_, at)| live(at)).map(|(d, _)| *d).collect()))
+                Some((last, e.key().clone(), e.columns.iter().filter(|(_, at)| live(at)).map(|(c, _)| c.clone()).collect()))
             })
             .sorted_by(|a, b| b.0.cmp(&a.0))
-            .map(|(_, key, columns, dates)| (key, columns, dates))
+            .map(|(_, key, columns)| (key, columns))
             .collect()
     }
 }
@@ -4546,7 +4536,10 @@ impl Database {
         let (Some(shared), true) = (self.object_store_cache.clone(), budget > 0) else { return (0, 0) };
         let rate = (cfg.timefusion_disk_warm_mb_per_sec.max(1) as f64) * (1 << 20) as f64;
         let (mut considered, mut fetched) = (0u64, 0u64);
-        'pairs: for ((table, project), columns, dates) in self.read_activity.recent() {
+        // The whole horizon, not just the days already read: a 7d read must make the 14d and
+        // 30d queries that follow it warm too.
+        let oldest = Utc::now().date_naive() - chrono::Days::new(WARM_DAYS);
+        'pairs: for ((table, project), columns) in self.read_activity.recent() {
             let Ok(table_ref) = self.resolve_table(&project, &table).await else { continue };
             let (store, table_uri, files) = {
                 let t = table_ref.read().await;
@@ -4557,7 +4550,7 @@ impl Database {
                     .filter(|(rel, _)| !rel.contains("project_id=") || rel.contains(&partition))
                     // Smaller files are read whole, not in blocks.
                     .filter(|(_, size)| *size > crate::storage::PARQUET_RANGE_ALIGNMENT_BYTES)
-                    .filter_map(|(rel, size)| Some((crate::storage::date_partition_of(&rel).filter(|d| dates.contains(d))?, rel, size)))
+                    .filter_map(|(rel, size)| Some((crate::storage::date_partition_of(&rel).filter(|d| *d >= oldest)?, rel, size)))
                     .sorted_by(|a, b| b.0.cmp(&a.0))
                     .collect_vec();
                 (t.log_store().object_store(None), t.table_url().to_string(), files)
