@@ -152,6 +152,38 @@ async fn a_latest_n_opens_only_the_file_groups_that_can_contribute() -> anyhow::
     Ok(())
 }
 
+/// An oldest-first latest-N must not decode every Delta file (prod 10-11: a 24h list served
+/// 169 MB for 501 rows, newest-first served 6 MB): files are sorted newest-first, so reaching
+/// a file's oldest rows reads it whole. File statistics name the oldest files that hold enough
+/// rows; the rest stay closed. When that narrowed answer cannot be proven complete (a filter
+/// leaves too few rows in the oldest files), the full plan runs and still answers exactly.
+#[serial_test::serial]
+#[tokio::test(flavor = "multi_thread")]
+async fn an_oldest_first_latest_n_reads_only_the_oldest_files() -> anyhow::Result<()> {
+    let (_env, client) = mem_and_delta_env(8).await?;
+    let metric = |analyzed: &str, name: &str| {
+        analyzed.split(&format!("{name}=")).nth(1).and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).next()?.parse::<usize>().ok())
+    };
+
+    let sql = "SELECT id FROM otel_logs_and_spans WHERE project_id = 'e2e_project' ORDER BY timestamp ASC LIMIT 2";
+    let ids: Vec<String> = client.query(sql, &[]).await?.iter().map(|r| r.get(0)).collect();
+    assert_eq!(ids, ["old-0", "old-1"]);
+    let analyzed = flat_rows(&client, &format!("EXPLAIN ANALYZE {sql}")).await?;
+    assert!(
+        metric(&analyzed, "files_pruned").is_some_and(|pruned| pruned >= 1) && metric(&analyzed, "fell_back") == Some(0),
+        "an oldest-first latest-N must leave the newer files closed and answer from the oldest:\n{analyzed}"
+    );
+
+    // Matches only `old-30`..`old-39`, in the newest files: the narrowed run finds none.
+    let sparse =
+        "SELECT id FROM otel_logs_and_spans WHERE project_id = 'e2e_project' AND length(id) = 6 AND substr(id, 5, 1) = '3' ORDER BY timestamp ASC LIMIT 3";
+    let ids: Vec<String> = client.query(sparse, &[]).await?.iter().map(|r| r.get(0)).collect();
+    assert_eq!(ids, ["old-30", "old-31", "old-32"], "a narrowed answer that is short must fall back to the full plan");
+    let analyzed = flat_rows(&client, &format!("EXPLAIN ANALYZE {sparse}")).await?;
+    assert_eq!(metric(&analyzed, "fell_back"), Some(1), "the short narrowed answer must not stand:\n{analyzed}");
+    Ok(())
+}
+
 // `OptimizeType::SortBy` must leave an honest DESC footer so an optimized
 // partition keeps the streaming merge. Uses the specific-date `compact_date`
 // because optimize's window keys off the real wall clock, not the virtual clock.
