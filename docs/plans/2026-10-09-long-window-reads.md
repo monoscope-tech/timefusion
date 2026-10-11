@@ -164,6 +164,14 @@ At 30d, most filtered queries time out at 90 s.
   The cold first run was 41–67 s.
 - **foyer upstream:** issue foyer-rs/foyer#1373, PR foyer-rs/foyer#1374.
 
+### 10-10 evening → 10-11
+- **#376** tantivy guard: the fan-out shares one count budget, and the refusal memo also answers windows up to 10% narrower. 30d `level = 'INFO'` list: 2.4 s first run, 0.37 s repeat.
+- **#378** foyer flusher sizing now scales to the device. #363's fixed 4 × 64 MiB broke `flush_warm` on Linux CI (50 MB disk). CI bisect: #361 and #362 pass, #363 fails, master with only the sizing reverted passes. CI had never run e2e on master since #363, because master pushes reuse local macOS attestations. Prod keeps 4 × 64 MiB and a 1 GiB queue.
+- **#377** carried rollup witnesses persist across restarts. DV-strip and dedup adjust each slice's witness in memory only, so every deploy left today's earlier hours `stale_coverage` until rebuilt. **Verified at 06:13: hours 00–04 hit fully before and after #375's restart.**
+- **#374** block cache: parquet data is cached in fixed 1 MiB blocks. Prod 7d `db.namespace` filter: cold 35.3 s (797 GETs, 1.2 GB); window shifted 1 min 1.4 s (10 GETs); shifted 7 min 1.5 s (8 GETs).
+- **#375** coverage checks hash each rollup spec once, about 30–90 ms less planning per routed query.
+- Still open: cache warmer (approved). A cold first run of a filter on an unindexed column is still about 10–35 s.
+
 ### Housekeeping
 - `FLAG timefusion_parquet_range_kb`: removed in #372.
 - The vendored `foyer-storage` is pinned to 0.22.6 via `[patch.crates-io]`. If `foyer` bumps its storage dependency, the patch stops applying with only a cargo warning. The bug is worth an upstream issue to foyer-rs (your call).
