@@ -413,6 +413,7 @@ struct StatementLatency {
     metrics: Option<Arc<crate::database::ScanMetrics>>,
     query: String,
     protocol: &'static str,
+    project_id: String,
     started_at: std::time::Instant,
     /// Until `do_query` returned: parse, plan and rollup routing.
     planned_us: u64,
@@ -430,19 +431,28 @@ impl Drop for StatementLatency {
             self.metrics.iter().for_each(|m| m.record_pgwire_query(duration_us));
         } else {
             let phases = (self.planned_us, self.first_row_us.get().copied().unwrap_or(duration_us));
-            record_statement_latency(self.metrics.as_deref(), &self.query, self.protocol, duration_us, *self.rows.get_mut(), None, Some(phases));
+            record_statement_latency(
+                self.metrics.as_deref(),
+                &self.query,
+                (self.protocol, &self.project_id),
+                duration_us,
+                *self.rows.get_mut(),
+                None,
+                Some(phases),
+            );
         }
     }
 }
 
 impl StreamFailureContext {
-    fn new(query: &str, protocol: &'static str, timeout: Option<std::time::Duration>, started_at: std::time::Instant) -> Self {
+    /// `bound_project`: the project bound to a `project_id = $N` placeholder, when known.
+    fn new(query: &str, protocol: &'static str, timeout: Option<std::time::Duration>, started_at: std::time::Instant, bound_project: Option<String>) -> Self {
         let (tables, project_id) = query_dimensions(query);
         Self {
             fingerprint: query_fingerprint(query),
             template: query_template(query),
             tables,
-            project_id: project_id.to_owned(),
+            project_id: bound_project.unwrap_or_else(|| project_id.to_owned()),
             protocol,
             deadline_ms: timeout.map(|timeout| timeout.as_millis().min(u128::from(u64::MAX)) as u64),
             started_at,
@@ -535,20 +545,21 @@ fn with_response_deadline(response: Response, deadline: Option<tokio::time::Inst
 /// span's `query.text` lands on the same line as the error.
 async fn run_statement<T, R>(
     scan_metrics: Option<Arc<crate::database::ScanMetrics>>, max_statement_secs: u64, client_timeout: Option<std::time::Duration>, query: &str,
-    protocol: &'static str, execute: impl std::future::Future<Output = PgWireResult<T>>,
+    (protocol, bound_project): (&'static str, Option<String>), execute: impl std::future::Future<Output = PgWireResult<T>>,
     finish: impl FnOnce(T, Option<tokio::time::Instant>, StreamFailureContext) -> R,
 ) -> PgWireResult<R> {
     let _giant = giant_stmt_permit(query.len()).await;
     let execute_span = tracing::trace_span!(parent: &tracing::Span::current(), "datafusion.execute");
     let t0 = std::time::Instant::now();
     let timeout = effective_statement_timeout(client_timeout, max_statement_secs, batch_statement_secs()).filter(|_| statement_timeout_applies(query));
-    let context = StreamFailureContext::new(query, protocol, timeout, t0);
+    let context = StreamFailureContext::new(query, protocol, timeout, t0, bound_project);
     match run_with_statement_timeout(timeout, execute.instrument(execute_span)).await {
         Ok((value, deadline)) => {
             let latency = StatementLatency {
                 metrics: scan_metrics,
                 query: query.to_owned(),
                 protocol,
+                project_id: context.project_id.clone(),
                 started_at: t0,
                 planned_us: t0.elapsed().as_micros() as u64,
                 first_row_us: std::sync::OnceLock::new(),
@@ -558,7 +569,7 @@ async fn run_statement<T, R>(
             Ok(finish(value, deadline, StreamFailureContext { latency: Some(Arc::new(latency)), ..context }))
         }
         Err(error) => {
-            record_statement_latency(scan_metrics.as_deref(), query, protocol, t0.elapsed().as_micros() as u64, 0, Some(&error), None);
+            record_statement_latency(scan_metrics.as_deref(), query, (protocol, &context.project_id), t0.elapsed().as_micros() as u64, 0, Some(&error), None);
             warn!(protocol, error = %error, "statement failed");
             Err(error)
         }
@@ -1194,8 +1205,8 @@ fn record_query_span(span: &tracing::Span, query: &str) {
 /// and project dimensions are extracted only for diagnosis; raw SQL is never
 /// included in this event.
 fn record_statement_latency(
-    metrics: Option<&crate::database::ScanMetrics>, query: &str, protocol: &'static str, duration_us: u64, rows: u64, failure: Option<&PgWireError>,
-    phases: Option<(u64, u64)>,
+    metrics: Option<&crate::database::ScanMetrics>, query: &str, (protocol, project_id): (&'static str, &str), duration_us: u64, rows: u64,
+    failure: Option<&PgWireError>, phases: Option<(u64, u64)>,
 ) {
     if let Some(metrics) = metrics {
         metrics.record_pgwire_query(duration_us);
@@ -1210,7 +1221,7 @@ fn record_statement_latency(
         return;
     }
     let (_, operation) = classify_query(query);
-    let (tables, project_id) = query_dimensions(query);
+    let (tables, _) = query_dimensions(query);
     let (fingerprint, template) = (query_fingerprint(query), query_template(query));
     macro_rules! statement_event {
         ($emit:ident, $event:literal, $message:literal $(, $field:ident = $value:expr)*) => {
@@ -1254,6 +1265,15 @@ fn record_statement_latency(
             first_row_us = first_row_us
         );
     }
+}
+
+/// The value bound to `project_id = $N` (optionally `$N::type`) in an extended-protocol
+/// statement, so its slow/failed events name the project; text bytes only, ≤128 chars.
+fn bound_project_id(query: &str, parameters: &[Option<bytes::Bytes>]) -> Option<String> {
+    static PLACEHOLDER: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"(?i)\bproject_id\s*=\s*\$(\d+)"#).unwrap());
+    let n: usize = PLACEHOLDER.captures(query)?.get(1)?.as_str().parse().ok()?;
+    let value = std::str::from_utf8(parameters.get(n.checked_sub(1)?)?.as_deref()?).ok()?;
+    (!value.is_empty() && value.len() <= 128 && !value.chars().any(char::is_control)).then(|| value.to_owned())
 }
 
 fn query_dimensions(query: &str) -> (String, &str) {
@@ -1312,7 +1332,7 @@ impl SimpleQueryHandler for LoggingSimpleQueryHandler {
             self.max_statement_secs,
             client_timeout,
             query,
-            "simple",
+            ("simple", None),
             <DfSessionService as SimpleQueryHandler>::do_query(&self.inner, client, query),
             |responses: Vec<Response>, deadline, context| {
                 responses.into_iter().map(|response| with_response_deadline(response, deadline, context.clone())).collect()
@@ -1422,7 +1442,7 @@ impl ExtendedQueryHandler for LoggingExtendedQueryHandler {
             self.max_statement_secs,
             client_timeout,
             query,
-            "extended",
+            ("extended", bound_project_id(query, &portal.parameters)),
             <DfSessionService as ExtendedQueryHandler>::do_query(&self.inner, client, portal, max_rows),
             with_response_deadline,
         )
@@ -1493,7 +1513,7 @@ mod pgwire_handlers_tests {
             Err::<DataRow, _>(crate::server::pg_compat::statement_timeout_error())
         });
         let deadline = Some(tokio::time::Instant::now() + Duration::from_millis(1));
-        let context = StreamFailureContext::new("SELECT pg_sleep(1)", "simple", Some(Duration::from_millis(1)), std::time::Instant::now());
+        let context = StreamFailureContext::new("SELECT pg_sleep(1)", "simple", Some(Duration::from_millis(1)), std::time::Instant::now(), None);
         let Response::Query(mut response) = with_response_deadline(Response::Query(QueryResponse::new(Arc::new(vec![]), rows)), deadline, context) else {
             panic!("expected query response");
         };
@@ -1531,7 +1551,7 @@ mod pgwire_handlers_tests {
                 let query = "SELECT 'private-literal-canary' AS value FROM otel_logs_and_spans";
                 super::record_query_span(&span, query);
                 let timeout = deadline.then_some(Duration::from_secs(1));
-                let context = StreamFailureContext::new(query, "extended", timeout, std::time::Instant::now());
+                let context = StreamFailureContext::new(query, "extended", timeout, std::time::Instant::now(), None);
                 let response = span.in_scope(|| {
                     with_response_deadline(
                         Response::Query(QueryResponse::new(Arc::new(vec![]), rows)),
@@ -1545,7 +1565,7 @@ mod pgwire_handlers_tests {
                 assert!(response.data_rows.next().await.is_none(), "{case}");
             }
             let failure = crate::server::pg_compat::statement_timeout_error();
-            super::record_statement_latency(None, "SELECT 'private-literal-canary' FROM otel_logs_and_spans", "simple", 10, 0, Some(&failure), None);
+            super::record_statement_latency(None, "SELECT 'private-literal-canary' FROM otel_logs_and_spans", ("simple", ""), 10, 0, Some(&failure), None);
         }
         let output = std::fs::read_to_string(log.path())?;
         let failures: Vec<_> = output.lines().filter(|line| line.contains("pgwire.stream_failed")).collect();
@@ -1601,7 +1621,7 @@ mod pgwire_handlers_tests {
             crate::server::pg_compat::DEFAULT_MAX_STATEMENT_SECS,
             None,
             "SELECT id FROM otel_logs_and_spans",
-            "simple",
+            ("simple", None),
             async { Ok(vec![Response::Query(QueryResponse::new(Arc::new(vec![]), rows))]) },
             |responses: Vec<Response>, deadline, context| {
                 responses.into_iter().map(|r| with_response_deadline(r, deadline, context.clone())).collect::<Vec<_>>()
@@ -1848,6 +1868,23 @@ mod pgwire_handlers_tests {
     #[test_case(parse_delta_recovery_audit, "SELECT 1" => Ok(None) ; "audit falls through on select")]
     fn delta_version_commands_require_one_exact_version(parse: fn(&str) -> Result<Option<super::DeltaVersionCmd>, String>, query: &str) -> Parsed {
         parse(query).map_err(|_| ()).map(|cmd| cmd.map(|c| format!("{}|{}", c.table, c.version)))
+    }
+
+    /// An extended statement's slow/failed events name the project bound to `project_id = $N`;
+    /// they logged an empty project, which hid which tenant a 3.7 s planning lookup came from.
+    #[test_case::test_case("SELECT 1 FROM t WHERE x = $1 AND project_id = $2", &[Some("x"), Some("p1")] => Some("p1".to_string()); "second placeholder")]
+    #[test_case::test_case("SELECT 1 FROM t WHERE project_id = $1::text", &[Some("p2")] => Some("p2".to_string()); "cast placeholder")]
+    #[test_case::test_case("SELECT 1 FROM t WHERE project_id = 'lit'", &[Some("p3")] => None; "literal is left to query_dimensions")]
+    #[test_case::test_case("SELECT 1 FROM t WHERE project_id = $3", &[Some("p4")] => None; "missing parameter")]
+    #[test_case::test_case("SELECT 1 FROM t WHERE project_id = $1", &[None] => None; "null parameter")]
+    fn bound_project_id_resolves_placeholders(query: &str, params: &[Option<&str>]) -> Option<String> {
+        let params = params.iter().map(|p| p.map(|v| bytes::Bytes::copy_from_slice(v.as_bytes()))).collect::<Vec<_>>();
+        super::bound_project_id(query, &params)
+    }
+
+    #[test]
+    fn oversized_bound_project_is_dropped() {
+        assert_eq!(super::bound_project_id("SELECT 1 FROM t WHERE project_id = $1", &[Some(bytes::Bytes::from("p".repeat(129)))]), None);
     }
 
     #[test]
