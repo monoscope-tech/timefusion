@@ -208,6 +208,19 @@ At 30d, most filtered queries time out at 90 s.
   - 13:04–13:29: **0** ASC lists over 1 s in prod's slow log, against ~15 per 25 min before.
   - Benign, open: `plan_cache: shape build failed: Cannot coerce … Float32 / Utf8View` for the p95 widget (`nullif(1000000, 0)` parameterized). That query plans uncached.
 
+- **#389:** slow and failed statement logs now name the bound project for extended-protocol (`project_id = $N`) statements. That exposed the next item.
+- **#390, skip the tantivy prefilter below a 1-hour window (live 17:59).** On high-cardinality `context___trace_id`, a term lookup loads the field's whole FST per index (49–119 MB of range reads). Monoscope's issue-page session lookup (±5 min) took 3.9–7.4 s with the prefilter and 0.07–0.19 s without. Default project, prod 18:02:
+
+  | Trace age | Before | After |
+  | --- | --- | --- |
+  | 5 d | 5.5 s | 79 ms |
+  | 20 d | 7.4 s | 55 ms |
+  | 25 d | 3.9 s | 286 ms |
+
+  With the fix these lookups searched no indexes. A 7d needle still searches 266 indexes; no planning errors.
+- **monoscope#672 (open, needs review):** the issue-page previous/next event ordered by `abs(timestamp - from)`. It now orders by `timestamp DESC`/`ASC` in its one-sided window: 1.5–1.9 s → 0.15 s, same event.
+- **Decided against:** a plan-cache shape-build warning (`Float32 / Utf8View`) for rare p95 variants. The common p95 widget hits the shape cache, so there's no user-visible gain.
+
 ### Housekeeping
 - `FLAG timefusion_parquet_range_kb`: removed in #372.
 - The vendored `foyer-storage` is pinned to 0.22.6 via `[patch.crates-io]`. If `foyer` bumps its storage dependency, the patch stops applying with only a cargo warning. The bug is worth an upstream issue to foyer-rs (your call).
