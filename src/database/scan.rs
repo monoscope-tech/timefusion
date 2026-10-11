@@ -915,6 +915,15 @@ impl ProjectRoutingTable {
         // Query [lo,hi] timestamp window, shared by the tantivy prefilter and the skip-delta
         // watermark check below.
         let query_time_range = filters_time_range(&optimized_filters);
+        if !self.database.bypass_rollup {
+            let projected = projection.into_iter().flatten().filter_map(|&i| self.schema.fields().get(i)).map(|f| f.name().clone());
+            let filtered = unstripped_filters.iter().flat_map(|f| f.column_refs()).map(|c| c.name.clone());
+            // Raw legs also read the dedup and sort keys, beyond the query's own projection.
+            let keys = crate::schema::get_schema(&self.table_name)
+                .into_iter()
+                .flat_map(|t| t.dedup_keys.iter().cloned().chain(t.sorting_columns.iter().map(|c| c.name.clone())));
+            self.database.read_activity.record(&self.table_name, &project_id, projected.chain(filtered).chain(keys), query_time_range);
+        }
         let mut tantivy_id_filter: Option<Expr> = None;
         // When index coverage is partial, indexed and raw files are read as separate Delta legs.
         // Only the indexed leg receives the narrowing id-set; uncovered files retain the

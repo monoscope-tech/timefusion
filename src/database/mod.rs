@@ -1010,6 +1010,60 @@ fn uri_date_in_window(uri: &str, lo: i64, hi: i64) -> bool {
 
 /// The cache-key prefix for a table: its URI minus any `?endpoint=...` query
 /// string and trailing slash. File URIs are relativized against this.
+/// Days back the disk-cache warmer serves, and how long a read keeps its columns warm-worthy.
+const WARM_DAYS: u64 = 14;
+const WARM_READ_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+/// Bound on tracked (table, project) pairs; reads of further pairs are not recorded.
+const WARM_MAX_PAIRS: usize = 256;
+/// Largest single warm fetch, so a big column chunk never sits whole in memory.
+const WARM_FETCH_BYTES: u64 = 8 << 20;
+
+/// What client scans read recently, per (table, project): the columns and the days, each with
+/// its last read. Best-effort and bounded; feeds [`Database::warm_recent_reads`].
+#[derive(Debug, Default)]
+pub(crate) struct ReadActivity(dashmap::DashMap<(String, String), ReadSet>);
+
+#[derive(Debug, Default)]
+struct ReadSet {
+    columns: HashMap<String, std::time::Instant>,
+    dates: HashMap<chrono::NaiveDate, std::time::Instant>,
+}
+
+impl ReadActivity {
+    pub(crate) fn record(&self, table: &str, project: &str, columns: impl IntoIterator<Item = String>, window: Option<(i64, i64)>) {
+        let key = (table.to_string(), project.to_string());
+        if self.0.len() >= WARM_MAX_PAIRS && !self.0.contains_key(&key) {
+            return;
+        }
+        let (now, today) = (std::time::Instant::now(), Utc::now().date_naive());
+        let oldest = today - chrono::Days::new(WARM_DAYS);
+        let day = |micros: i64| chrono::DateTime::from_timestamp_micros(micros).map(|t| t.date_naive());
+        // Open bounds (i64::MIN/MAX) clamp to the warmed span: the last WARM_DAYS through today.
+        let dates = window.map(|(lo, hi)| {
+            let hi = day(hi).unwrap_or(today).min(today);
+            day(lo).unwrap_or(oldest).max(oldest).iter_days().take_while(move |d| *d <= hi)
+        });
+        let mut set = self.0.entry(key).or_default();
+        columns.into_iter().for_each(|c| _ = set.columns.insert(c, now));
+        dates.into_iter().flatten().for_each(|d| _ = set.dates.insert(d, now));
+    }
+
+    /// Pairs read within the TTL, most recent first, with their live columns and days.
+    fn recent(&self) -> Vec<((String, String), HashSet<String>, HashSet<chrono::NaiveDate>)> {
+        let live = |at: &std::time::Instant| at.elapsed() < WARM_READ_TTL;
+        self.0
+            .iter()
+            .filter_map(|e| {
+                let last = e.columns.values().filter(|at| live(at)).max().copied()?;
+                let columns = e.columns.iter().filter(|(_, at)| live(at)).map(|(c, _)| c.clone()).collect();
+                Some((last, e.key().clone(), columns, e.dates.iter().filter(|(_, at)| live(at)).map(|(d, _)| *d).collect()))
+            })
+            .sorted_by(|a, b| b.0.cmp(&a.0))
+            .map(|(_, key, columns, dates)| (key, columns, dates))
+            .collect()
+    }
+}
+
 fn table_cache_prefix(table_uri: &str) -> &str {
     table_uri.split('?').next().unwrap_or(table_uri).trim_end_matches('/')
 }
@@ -2597,6 +2651,8 @@ pub struct Database {
     /// Cached Delta-side `TableProvider` per (project, table) + snapshot version. Exact-version
     /// invalidation; concurrent misses single-flight via a per-key `OnceCell`. No drop eviction.
     delta_provider_cache: DeltaProviderCache,
+    /// What client scans read recently; drives the disk-cache warmer.
+    pub(crate) read_activity: Arc<ReadActivity>,
     /// Cumulative scan-path counters, exported via `timefusion_stats`.
     pub scan_metrics: Arc<ScanMetrics>,
     batch_queue: Option<Arc<crate::write::BatchQueue>>,
@@ -3332,6 +3388,7 @@ impl Database {
             fast_resolve_cache: Arc::new(dashmap::DashMap::new()),
             delta_has_files: dashmap::DashMap::new(),
             delta_provider_cache: Arc::new(dashmap::DashMap::new()),
+            read_activity: Arc::default(),
             scan_metrics: Arc::new(ScanMetrics::default()),
             batch_queue: None,
             maintenance_shutdown: Arc::new(maintenance_shutdown),
@@ -4468,6 +4525,105 @@ impl Database {
 
     /// [`Self::preload_hot_bodies_with`] under the configured caps, at the boot
     /// body pace (0 = no boot body warms, this one included).
+    /// One disk-cache warm pass: for the (table, project) pairs client scans read recently, newest
+    /// days first, fetch the column-chunk blocks of the columns they read into the disk tier,
+    /// up to `timefusion_disk_warm_budget_pct` of the foyer disk and at the configured rate.
+    /// Cached blocks are skipped by index probe, so a pass over a warm set reads nothing.
+    /// Returns (fetched, already-cached) bytes.
+    pub(crate) async fn warm_recent_reads(&self) -> (u64, u64) {
+        let cfg = &self.config.cache;
+        self.warm_recent_reads_within((cfg.disk_size_bytes() / 100 * cfg.timefusion_disk_warm_budget_pct) as u64).await
+    }
+
+    /// [`Self::warm_recent_reads`] with an explicit warm-set budget in bytes.
+    pub(crate) async fn warm_recent_reads_within(&self, budget: u64) -> (u64, u64) {
+        use deltalake::datafusion::parquet::arrow::async_reader::AsyncFileReader;
+        use object_store::ObjectStoreExt;
+        let cfg = &self.config.cache;
+        let (Some(shared), true) = (self.object_store_cache.clone(), budget > 0) else { return (0, 0) };
+        let rate = (cfg.timefusion_disk_warm_mb_per_sec.max(1) as f64) * (1 << 20) as f64;
+        let (mut considered, mut fetched) = (0u64, 0u64);
+        'pairs: for ((table, project), columns, dates) in self.read_activity.recent() {
+            let Ok(table_ref) = self.resolve_table(&project, &table).await else { continue };
+            let (store, table_uri, files) = {
+                let t = table_ref.read().await;
+                let partition = format!("project_id={project}/");
+                let files = t.snapshot().map(|s| s.log_data().iter().map(|f| (f.path().into_owned(), f.size() as u64)).collect_vec()).unwrap_or_default();
+                let files = files
+                    .into_iter()
+                    .filter(|(rel, _)| !rel.contains("project_id=") || rel.contains(&partition))
+                    // Smaller files are read whole, not in blocks.
+                    .filter(|(_, size)| *size > crate::storage::PARQUET_RANGE_ALIGNMENT_BYTES)
+                    .filter_map(|(rel, size)| Some((crate::storage::date_partition_of(&rel).filter(|d| dates.contains(d))?, rel, size)))
+                    .sorted_by(|a, b| b.0.cmp(&a.0))
+                    .collect_vec();
+                (t.log_store().object_store(None), t.table_url().to_string(), files)
+            };
+            let table_path = table_path_in_bucket(table_cache_prefix(&table_uri));
+            for (_, rel, size) in files {
+                let path = object_store::path::Path::from(rel.as_str());
+                let Ok(meta) = crate::storage::ObjectStoreReader::new(store.clone(), path.clone(), size).get_metadata(None).await else { continue };
+                let chunks = meta
+                    .row_groups()
+                    .iter()
+                    .flat_map(|rg| rg.columns())
+                    .filter(|c| c.column_descr().path().parts().first().is_some_and(|name| columns.contains(name)))
+                    .map(|c| c.byte_range())
+                    .map(|(start, len)| start..start + len)
+                    .collect_vec();
+                let key = bucket_cache_key(table_path, &path);
+                let within = chunks
+                    .into_iter()
+                    .take_while(|chunk| {
+                        considered += chunk.end - chunk.start;
+                        considered <= budget
+                    })
+                    .collect_vec();
+                let over = considered > budget;
+                // Adjacent chunks share boundary blocks: merge at block granularity so each block
+                // is probed and fetched once per pass.
+                let b = crate::storage::PARQUET_RANGE_ALIGNMENT_BYTES;
+                // A read STARTING in the footer-sized tail takes the metadata path, not blocks, so
+                // a warm fetch must start before it (the footer read above already cached the tail).
+                let tail = size.saturating_sub(cfg.timefusion_parquet_metadata_size_hint as u64);
+                let merged = within
+                    .into_iter()
+                    .map(|c| c.start / b * b..c.end.div_ceil(b) * b)
+                    .sorted_by_key(|r| r.start)
+                    .coalesce(|x, y| if y.start <= x.end { Ok(x.start..x.end.max(y.end)) } else { Err((x, y)) })
+                    .collect_vec();
+                for chunk in merged {
+                    for run in shared.uncached_block_runs(&key, chunk, size) {
+                        let mut pieces = (run.start..run.end).step_by(WARM_FETCH_BYTES as usize).map(|s| s..(s + WARM_FETCH_BYTES).min(run.end)).collect_vec();
+                        // A trailing piece starting in the tail rides on the one before it.
+                        if let [.., prev, last] = pieces.as_mut_slice()
+                            && last.start >= tail
+                        {
+                            prev.end = last.end;
+                            pieces.pop();
+                        }
+                        for piece in pieces.into_iter().filter(|p| p.start < tail) {
+                            let started = std::time::Instant::now();
+                            let n = piece.end - piece.start;
+                            // A bypass scope: first sightings land disk-only, never in L1.
+                            if crate::storage::scan_bypass_scope(true, store.get_range(&path, piece)).await.is_err() {
+                                continue;
+                            }
+                            fetched += n;
+                            tokio::time::sleep(std::time::Duration::from_secs_f64(n as f64 / rate).saturating_sub(started.elapsed())).await;
+                        }
+                    }
+                }
+                if over {
+                    break 'pairs;
+                }
+            }
+        }
+        let cached = considered.min(budget).saturating_sub(fetched);
+        shared.record_warm_pass(fetched, cached);
+        (fetched, cached)
+    }
+
     async fn preload_hot_bodies(&self) {
         let m = &self.config.maintenance;
         if m.timefusion_warm_body_boot_files_per_sec == 0 {

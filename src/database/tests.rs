@@ -10705,6 +10705,53 @@ async fn day_dashboard_scan_admits_to_cache_on_first_view() -> Result<()> {
     Ok(())
 }
 
+/// The disk-cache warmer pre-loads what recent client scans read. A scan that selects no file
+/// still records its project, day and columns; one warm pass then makes a cold week-deep scan of
+/// those columns read nothing from the store, while a column no scan read stays cold, and a pass
+/// whose budget is below one column chunk fetches nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_warm_pass_serves_recently_read_columns_without_store_reads() -> Result<()> {
+    let base = create_test_config("disk-warm");
+    // Written by a cacheless process, so no write-capture pre-warms the reader's cache.
+    let writer = Database::with_config(base.clone()).await?;
+    writer.cancel_maintenance();
+    let project = format!("warm_{}", uuid::Uuid::new_v4().simple());
+    let at = Utc::now().timestamp_micros() - 90_000_000;
+    // Long incompressible names: column chunks span many cache blocks, as prod's do, so a column
+    // shares only its boundary blocks with its neighbours.
+    let name = || (0..20).map(|_| uuid::Uuid::new_v4().to_string()).collect::<String>();
+    let rows = (0..30_000).map(|i| test_span_ts(&format!("{project}-{i}"), &name(), &project, at)).collect();
+    writer.insert_records_batch(&project, "otel_logs_and_spans", vec![json_to_batch(rows)?], true, None).await?;
+    let mut cfg = (*base).clone();
+    cfg.cache.timefusion_foyer_disabled = false;
+    cfg.core.timefusion_data_dir = PathBuf::from(format!("{}-reader", base.core.timefusion_data_dir.display()));
+    cfg.memory.timefusion_wide_scan_max_mb = 0;
+    cfg.cache.timefusion_foyer_l1_max_entry_mb = 0;
+    let db = Arc::new(Database::with_config(Arc::new(cfg)).await?);
+    db.cancel_maintenance();
+    let mut ctx = Arc::clone(&db).create_session_context();
+    db.setup_session_context(&mut ctx)?;
+    let cache = db.object_store_cache().expect("foyer enabled").clone();
+    let store_bytes = async |sql: String| -> Result<u64> {
+        let before = cache.runtime_stats().stats.main.inner_bytes_read;
+        ctx.sql(&sql).await?.collect().await?;
+        Ok(cache.runtime_stats().stats.main.inner_bytes_read - before)
+    };
+    let week = |column: &str| format!("SELECT {column} FROM otel_logs_and_spans WHERE project_id = '{project}' AND timestamp >= now() - INTERVAL '7 days'");
+    // The last minute holds no row, so this scan selects no file yet records `name` for today.
+    store_bytes(format!("SELECT name FROM otel_logs_and_spans WHERE project_id = '{project}' AND timestamp >= now() - INTERVAL '1 minute'")).await?;
+
+    assert_eq!(db.warm_recent_reads_within(1).await.0, 0, "a budget below one column chunk must fetch nothing");
+    let (fetched, _) = db.warm_recent_reads_within(u64::MAX).await;
+    assert!(fetched > 0, "the pass must fetch the recently-read columns' blocks");
+    cache.flush_disk().await;
+    assert_eq!(db.warm_recent_reads_within(u64::MAX).await.0, 0, "a pass over a warm set fetches nothing");
+    assert_eq!(store_bytes(week("name")).await?, 0, "a cold scan of recently-read columns must be served by the disk tier");
+    // `summary` is large, so most of its blocks share nothing with the warmed columns.
+    assert!(store_bytes(week("summary")).await? > 0, "a column no scan read must not have been warmed");
+    Ok(())
+}
+
 /// A hybrid rollup rewrite reads its raw fringes as `(range) OR (range)`. The window
 /// extraction saw only top-level comparisons, so that leg read as infinitely deep and
 /// bypassed cache admission: every first dashboard view stayed cold.

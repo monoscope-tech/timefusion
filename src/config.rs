@@ -1720,6 +1720,13 @@ pub struct CacheConfig {
     /// day so day-long dashboards admit on first view.
     #[serde_inline_default(26)]
     pub timefusion_cache_bypass_scan_hours: u64,
+    /// Share (percent) of the foyer disk the background warmer may keep filled with the parquet
+    /// blocks recent client scans read: their tables, projects, days and columns. 0 disables.
+    #[serde_inline_default(25)]
+    pub timefusion_disk_warm_budget_pct: usize,
+    /// Object-store read rate cap for the warmer, MB/s.
+    #[serde_inline_default(64)]
+    pub timefusion_disk_warm_mb_per_sec: usize,
 }
 
 /// Clock drift between planning and scanning that the cache-bypass depth absorbs.

@@ -965,6 +965,10 @@ impl Database {
         });
 
         // Cache stats — every 5 minutes.
+        spawn_db_cron(&db, "Disk cache warm", "0 */10 * * * *", cancel.clone(), |db| async move {
+            let (fetched, cached) = db.warm_recent_reads().await;
+            debug!(fetched, cached, "disk cache warm pass");
+        });
         spawn_db_cron(&db, "Cache stats", "0 */5 * * * *", cancel.clone(), |db| async move {
             if let Some(ref cache) = db.object_store_cache {
                 cache.log_stats();

@@ -26,7 +26,7 @@ use tokio::{sync::Mutex, task::JoinSet};
 use tracing::{Instrument, debug, field::Empty, info, instrument, warn};
 
 /// Align large Parquet data reads so sliding time predicates reuse the same cache entry.
-const PARQUET_RANGE_ALIGNMENT_BYTES: u64 = 1024 * 1024;
+pub(crate) const PARQUET_RANGE_ALIGNMENT_BYTES: u64 = 1024 * 1024;
 
 /// Clip an aligned read's response offsets to the bytes actually returned.
 ///
@@ -312,6 +312,10 @@ pub struct FoyerRuntimeStats {
     pub admit_refresh_bytes: u64,
     pub write_capture_admitted: u64,
     pub insert_bypassed: u64,
+    /// Disk-cache warmer: passes run, bytes fetched into the disk tier, bytes found already cached.
+    pub warm_passes: u64,
+    pub warm_fetched_bytes: u64,
+    pub warm_cached_bytes: u64,
     pub memory_size_bytes: usize,
     pub disk_size_bytes: usize,
     pub ttl_seconds: u64,
@@ -471,6 +475,9 @@ pub struct AdmissionStats {
     pub write_capture_admitted: AtomicU64,
     /// Populations a scan-bypass scope declined (see [`FoyerObjectStoreCache::admit`]).
     pub insert_bypassed: AtomicU64,
+    pub warm_passes: AtomicU64,
+    pub warm_fetched_bytes: AtomicU64,
+    pub warm_cached_bytes: AtomicU64,
 }
 
 impl AdmissionStats {
@@ -592,6 +599,9 @@ impl SharedFoyerCache {
             admit_refresh_bytes: self.admission.refresh_bytes.load(Ordering::Relaxed),
             write_capture_admitted: self.admission.write_capture_admitted.load(Ordering::Relaxed),
             insert_bypassed: self.admission.insert_bypassed.load(Ordering::Relaxed),
+            warm_passes: self.admission.warm_passes.load(Ordering::Relaxed),
+            warm_fetched_bytes: self.admission.warm_fetched_bytes.load(Ordering::Relaxed),
+            warm_cached_bytes: self.admission.warm_cached_bytes.load(Ordering::Relaxed),
         }
     }
 
@@ -648,6 +658,29 @@ impl SharedFoyerCache {
     /// promotion. May false-positive on a hash collision (foyer's contract).
     pub fn contains_data(&self, key: &str) -> bool {
         self.cache.contains(key)
+    }
+
+    /// The runs of `range` (clamped to `size`) whose data blocks are not cached under `key`, the
+    /// object's bucket-relative path. Index probes only: no IO, no promotion.
+    pub fn uncached_block_runs(&self, key: &str, range: Range<u64>, size: u64) -> Vec<Range<u64>> {
+        let (b, location) = (PARQUET_RANGE_ALIGNMENT_BYTES, Path::from(key));
+        (range.start / b..range.end.min(size).div_ceil(b))
+            .map(|k| k * b..((k + 1) * b).min(size))
+            .filter(|blk| !self.cache.contains(&FoyerObjectStoreCache::make_range_cache_key(&location, blk)))
+            .coalesce(|a, b| if a.end == b.start { Ok(a.start..b.end) } else { Err((a, b)) })
+            .collect()
+    }
+
+    /// Wait until queued disk-tier writes are flushed; until then `contains` cannot see them.
+    pub async fn flush_disk(&self) {
+        self.cache.storage().wait().await;
+    }
+
+    /// Account one disk-cache warmer pass.
+    pub fn record_warm_pass(&self, fetched: u64, cached: u64) {
+        self.admission.warm_passes.fetch_add(1, Ordering::Relaxed);
+        self.admission.warm_fetched_bytes.fetch_add(fetched, Ordering::Relaxed);
+        self.admission.warm_cached_bytes.fetch_add(cached, Ordering::Relaxed);
     }
 }
 
