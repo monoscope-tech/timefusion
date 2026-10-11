@@ -1238,6 +1238,13 @@ pub fn build_node_query(index: &Index, node: &PredNode) -> Result<PredsQuery> {
                 // that a conjunction of whole terms would UNDER-match, so those
                 // keep the parser.
                 Some(tok) if tok.as_str() == NGRAM3_TOKENIZER || !p.query.ends_with('*') => analyzed_conjunction_query(index, field, tok, &p.query)?,
+                // A raw value is ONE term, so a prefix is a walk of the term dictionary. The
+                // parser's prefix query matched nothing on raw fields, and the prefilter then
+                // dropped every indexed row (`id LIKE 'e%'`: 573 of 19,056).
+                Some(tok) if tok.as_str() == super::RAW_TOKENIZER => Box::new(
+                    tantivy::query::RegexQuery::from_pattern(&format!("{}.*", regex::escape(p.query.trim_end_matches('*'))), field)
+                        .map_err(|e| anyhow!("prefix query '{}': {e}", p.query))?,
+                ),
                 _ => {
                     let mut qp = QueryParser::for_index(index, vec![field]);
                     qp.set_conjunction_by_default();
@@ -1439,6 +1446,28 @@ mod reader_tests {
     #[test_case("level", "two" => Ok(String::new()) ; "raw stays exact: no partial match")]
     fn text_match_prefilter_hits(column: &str, query: &str) -> std::result::Result<String, String> {
         hit_ids_on(column, query)
+    }
+
+    /// `id LIKE 'e%'` on prod returned 573 of 19,056 rows: a raw `foo*` went through the
+    /// query parser's prefix query, which silently expands to at most 50 terms, and the
+    /// prefilter then excluded every other row. Raw prefixes must match every term.
+    #[test_case("ab*" => 60 ; "more distinct terms than the parser's expansion cap")]
+    #[test_case("ab-5*" => 11 ; "a narrower prefix")]
+    #[test_case("two w*" => 1 ; "a raw value containing a space")]
+    #[test_case("zz*" => 0 ; "no term has the prefix")]
+    #[test_case("ab-5" => 1 ; "exact raw term sanity")]
+    fn a_raw_prefix_matches_every_term(query: &str) -> usize {
+        let mut index = ngram_index();
+        let schema = index.schema();
+        let (level, id, ts) = (schema.get_field("level").unwrap(), schema.get_field(ID_FIELD).unwrap(), schema.get_field(TS_FIELD).unwrap());
+        let mut w = index.writer(15_000_000).expect("writer");
+        (0..60).for_each(|i| _ = w.add_document(doc!(ts => 100 + i as i64, id => format!("p{i}"), level => format!("ab-{i}"))).expect("add"));
+        w.commit().expect("commit");
+        drop(w);
+        index.set_default_multithread_executor().expect("executor");
+        let node = PredNode::Leaf(TextMatchPred { column: "level".into(), query: query.into() });
+        let PredsQuery::Query(q) = build_node_query(&index, &node).expect("query") else { panic!("field must exist") };
+        query_index(&index, &*q, None).expect("search").len()
     }
 }
 
