@@ -192,6 +192,16 @@ At 30d, most filtered queries time out at 90 s.
   - The 7d errors chart re-runs at 0.76–0.81 s, so 3.5 s was variance.
 - **md4 writes:** ~449 MB/s, of which foyer accounts for 1.6 MB/s. The rest is another workload on the same array; it was 314 MB/s on 10-10, before the cache changes, at 8% utilization.
 
+### 10-11 midday
+- **#385, correctness fix:** a `LIKE 'prefix%'` on a raw-indexed column (e.g. `id`) returned only unindexed and buffered rows. The query parser's raw prefix query matched nothing, and the prefilter then dropped every indexed row. Fix: build the prefix as a `RegexQuery` over the term dictionary.
+
+  | Prefix, prod 2h | Before (LIKE vs true) | After 11:34 |
+  | --- | --- | --- |
+  | `'e%'` | 573 vs 19,056 | 17,888 = 17,888 |
+  | `'ab%'` | 38 vs 1,184 | 1,111 = 1,111 |
+- **Incident #383 → reverted #384:** the ASC latest-N narrowing edited `FileScanConfig` file groups. Prod's `DeltaScanExec` deletion-vector scan keeps its own selected-file list, so every `ORDER BY timestamp ASC LIMIT` failed planning from 10:57 to 11:14 UTC. The revert tree equals the prior signed-off master. ASC lists are back to 0.98 s (24h) against 0.09 s for DESC.
+  - Redo: prune through the Delta provider's selection (as the tantivy/bloom exclusions do), with deletion-vector files in the test.
+
 ### Housekeeping
 - `FLAG timefusion_parquet_range_kb`: removed in #372.
 - The vendored `foyer-storage` is pinned to 0.22.6 via `[patch.crates-io]`. If `foyer` bumps its storage dependency, the patch stops applying with only a cargo warning. The bug is worth an upstream issue to foyer-rs (your call).
