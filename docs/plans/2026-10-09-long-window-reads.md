@@ -202,6 +202,12 @@ At 30d, most filtered queries time out at 90 s.
 - **Incident #383 → reverted #384:** the ASC latest-N narrowing edited `FileScanConfig` file groups. Prod's `DeltaScanExec` deletion-vector scan keeps its own selected-file list, so every `ORDER BY timestamp ASC LIMIT` failed planning from 10:57 to 11:14 UTC. The revert tree equals the prior signed-off master. ASC lists are back to 0.98 s (24h) against 0.09 s for DESC.
   - Redo: prune through the Delta provider's selection (as the tantivy/bloom exclusions do), with deletion-vector files in the test.
 
+- **#387, ASC latest-N redone safely (live 12:59):** the planner re-plans the query with `timestamp <= <latest ts of the oldest files holding 4× the page>`, so the provider prunes through its own selection and DV scans stay consistent. A full narrowed page is exact by construction; a short page falls back. The tests include deletion-vector files.
+  - Prod 13:03 (process 2 min old): shipbubble 24h ASC 1.16 s, 7d 0.61 s; monoscope's project 24h 0.29 s (was 1.1–6 s).
+  - The first 200 rows match a non-narrowable sort exactly, and there were no planning errors.
+  - 13:04–13:29: **0** ASC lists over 1 s in prod's slow log, against ~15 per 25 min before.
+  - Benign, open: `plan_cache: shape build failed: Cannot coerce … Float32 / Utf8View` for the p95 widget (`nullif(1000000, 0)` parameterized). That query plans uncached.
+
 ### Housekeeping
 - `FLAG timefusion_parquet_range_kb`: removed in #372.
 - The vendored `foyer-storage` is pinned to 0.22.6 via `[patch.crates-io]`. If `foyer` bumps its storage dependency, the patch stops applying with only a cargo warning. The bug is worth an upstream issue to foyer-rs (your call).
