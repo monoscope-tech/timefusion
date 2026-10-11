@@ -1023,6 +1023,9 @@ const WARM_FETCH_BYTES: u64 = 8 << 20;
 #[derive(Debug, Default)]
 pub(crate) struct ReadActivity(dashmap::DashMap<(String, String), ReadSet>);
 
+/// A recently-read (table, project) with its live columns and days.
+type RecentRead = ((String, String), HashSet<String>, HashSet<chrono::NaiveDate>);
+
 #[derive(Debug, Default)]
 struct ReadSet {
     columns: HashMap<String, std::time::Instant>,
@@ -1049,7 +1052,7 @@ impl ReadActivity {
     }
 
     /// Pairs read within the TTL, most recent first, with their live columns and days.
-    fn recent(&self) -> Vec<((String, String), HashSet<String>, HashSet<chrono::NaiveDate>)> {
+    fn recent(&self) -> Vec<RecentRead> {
         let live = |at: &std::time::Instant| at.elapsed() < WARM_READ_TTL;
         self.0
             .iter()
