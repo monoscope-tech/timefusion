@@ -110,6 +110,35 @@ impl ProjectRoutingTable {
         filters.iter().find_map(crate::read::optimizers::extract_project_id_from_expr)
     }
 
+    /// `(min, max, rows)` of `column` for each live Delta file of the filtered project that
+    /// overlaps the filtered window, from the add actions' statistics. `None` when any such
+    /// file lacks them. Rows are physical (`num_records`), an estimate under deletion vectors.
+    pub(crate) async fn file_spans(&self, filters: &[Expr], column: &str) -> Option<Vec<(i64, i64, usize)>> {
+        use arrow::array::{Array, AsArray};
+        let project = self.extract_project_id_from_filters(filters).unwrap_or_else(|| self.default_project.clone());
+        let (lo, hi) = filters_time_range(filters).unwrap_or((i64::MIN, i64::MAX));
+        let table = self.database.resolve_table(&project, &self.table_name).await.ok()?;
+        let actions = table.read().await.snapshot().ok()?.snapshot().add_actions_table(true).ok()?;
+        let records = actions.column_by_name("num_records")?.as_primitive_opt::<arrow::datatypes::Int64Type>()?.clone();
+        let (min, max) =
+            (crate::read::ts_micros_column(&actions, &format!("min.{column}"))?, crate::read::ts_micros_column(&actions, &format!("max.{column}"))?);
+        let projects = match actions.column_by_name("partition.project_id") {
+            Some(c) => Some(arrow::compute::cast(c, &arrow::datatypes::DataType::Utf8).ok()?),
+            None => None,
+        };
+        let projects = projects.as_ref().map(|c| c.as_string::<i32>());
+        (0..actions.num_rows())
+            .filter(|&r| projects.is_none_or(|p| p.is_valid(r) && p.value(r) == project))
+            .map(|r| {
+                let span = (min.is_valid(r) && max.is_valid(r) && records.is_valid(r))
+                    .then(|| (min.value(r), max.value(r), usize::try_from(records.value(r)).unwrap_or(0)));
+                (span, r)
+            })
+            .filter(|(span, _)| span.is_none_or(|(a, b, _)| b >= lo && a <= hi))
+            .map(|(span, _)| span)
+            .collect()
+    }
+
     fn bounded_otel_scan_reason(&self, filters: &[Expr], limit: Option<usize>) -> Option<&'static str> {
         let conjuncts: Vec<&Expr> = filters.iter().flat_map(datafusion::logical_expr::utils::split_conjunction).collect();
         let bounded = conjuncts.iter().any(|expr| Self::is_bounding_predicate(expr))

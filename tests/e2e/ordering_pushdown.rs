@@ -152,6 +152,41 @@ async fn a_latest_n_opens_only_the_file_groups_that_can_contribute() -> anyhow::
     Ok(())
 }
 
+/// An oldest-first latest-N over a merge-on-read table answers from the oldest files only,
+/// exactly as the full plan does; a filter that leaves the oldest files short falls back.
+#[serial_test::serial]
+#[tokio::test(flavor = "multi_thread")]
+async fn an_oldest_first_latest_n_reads_only_the_oldest_files() -> anyhow::Result<()> {
+    let (_env, client) = mem_and_delta_env(8).await?;
+    let bytes = async |sql: &str| -> anyhow::Result<(Vec<String>, u64)> {
+        let read = async || -> anyhow::Result<u64> {
+            Ok(client
+                .query_one("SELECT value FROM timefusion_stats WHERE component = 'parquet' AND key = 'bytes_read'", &[])
+                .await?
+                .get::<_, String>(0)
+                .parse()?)
+        };
+        let before = read().await?;
+        let ids = client.query(sql, &[]).await?.iter().map(|r| r.get(0)).collect();
+        Ok((ids, read().await? - before))
+    };
+    let (ids, narrowed) = bytes("SELECT id FROM otel_logs_and_spans WHERE project_id = 'e2e_project' ORDER BY timestamp ASC LIMIT 2").await?;
+    // A sort key that is not a bare column disables the narrowing: the same rows, every file read.
+    let (full_ids, full) =
+        bytes("SELECT id FROM otel_logs_and_spans WHERE project_id = 'e2e_project' ORDER BY timestamp + INTERVAL '0 seconds' ASC LIMIT 2").await?;
+    assert_eq!(ids, ["old-0", "old-1"]);
+    assert_eq!(ids, full_ids);
+    assert!(narrowed < full, "the narrowed query must decode fewer bytes: {narrowed} vs {full}");
+
+    // Matches only `old-30`..`old-39`, in the newest files: the narrowed page is short.
+    let (ids, _) = bytes(
+        "SELECT id FROM otel_logs_and_spans WHERE project_id = 'e2e_project' AND length(id) = 6 AND substr(id, 5, 1) = '3' ORDER BY timestamp ASC LIMIT 3",
+    )
+    .await?;
+    assert_eq!(ids, ["old-30", "old-31", "old-32"], "a short narrowed page must fall back to the full, exact answer");
+    Ok(())
+}
+
 // `OptimizeType::SortBy` must leave an honest DESC footer so an optimized
 // partition keeps the streaming merge. Uses the specific-date `compact_date`
 // because optimize's window keys off the real wall clock, not the virtual clock.

@@ -612,3 +612,173 @@ mod tests {
         assert_eq!(opened, Some(INITIAL_READ_AHEAD), "only the read-ahead window may open; metrics: {metrics}");
     }
 }
+
+/// Oldest-first latest-N (`ORDER BY ts ASC LIMIT n`) over files sorted newest-first decodes
+/// every file whole to reach its oldest rows. When file statistics name the oldest files
+/// that already hold enough rows, the same query is planned again with `ts <= bound` (their
+/// latest timestamp) so the Delta provider skips the rest through its own file selection,
+/// which keeps deletion-vector scans consistent; nothing edits a planned scan. A full page
+/// from that narrowed query is exact: it holds every row at or before its last timestamp,
+/// ties included. A short page falls back to the full plan.
+pub(crate) async fn narrow_ascending_fetch(
+    logical: &datafusion::logical_expr::LogicalPlan, full: Arc<dyn ExecutionPlan>, state: &datafusion::execution::SessionState,
+    planner: &datafusion::physical_planner::DefaultPhysicalPlanner,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    use datafusion::physical_planner::PhysicalPlanner;
+    let Some((page, column, scan)) = ascending_page(logical) else { return Ok(full) };
+    if full.properties().partitioning.partition_count() != 1 {
+        return Ok(full);
+    }
+    // From the Delta log, not the planned scan: per-file statistics reach a deletion-vector
+    // scan's physical plan only partially, and the add actions are what the provider prunes on.
+    let Some(table) = datafusion::datasource::source_as_provider(&scan.source).ok() else { return Ok(full) };
+    let Some(table) = downcast::<crate::database::ProjectRoutingTable>(&*table) else { return Ok(full) };
+    let Some(mut files) = table.file_spans(&scan.filters, &column.name).await.filter(|f| !f.is_empty()) else { return Ok(full) };
+    files.sort_by_key(|&(_, max, _)| max);
+    let mut held = 0usize;
+    let Some(&(_, max, _)) = files.iter().find(|&&(_, _, rows)| {
+        held = held.saturating_add(rows);
+        held >= page.rows.saturating_mul(NARROW_ROW_MARGIN)
+    }) else {
+        return Ok(full);
+    };
+    let bound = max.saturating_add(STATS_SLACK_MICROS);
+    let skipped = files.iter().filter(|&&(min, _, _)| min > bound).count();
+    if skipped == 0 {
+        return Ok(full);
+    }
+    let narrowed = state.optimize(&with_upper_bound(logical, &column, bound)?)?;
+    let narrow = planner.create_physical_plan(&narrowed, state).await?;
+    if narrow.schema() != full.schema() {
+        return Ok(full);
+    }
+    metrics::counter!("timefusion_narrowed_fetch_planned_total").increment(1);
+    Ok(Arc::new(NarrowedFetchExec { narrow, full, rows: page.rows, total_files: files.len(), skipped, metrics: ExecutionPlanMetricsSet::new() }))
+}
+
+struct AscendingPage {
+    /// Rows the whole query returns when the window holds enough of them.
+    rows: usize,
+}
+
+/// `[Projection|Limit|SubqueryAlias]* -> Sort(ts ASC, fetch) -> [Projection|Filter|SubqueryAlias]* -> TableScan`.
+/// Anything that could pick or drop rows by something other than the sort key (aggregates,
+/// DISTINCT ON, windows, joins, inner limits) disqualifies the plan: a `ts <= bound` filter
+/// below it could change which rows it keeps.
+fn ascending_page(plan: &datafusion::logical_expr::LogicalPlan) -> Option<(AscendingPage, datafusion::common::Column, &datafusion::logical_expr::TableScan)> {
+    use datafusion::logical_expr::{Expr, LogicalPlan};
+    let (mut node, mut skip, mut limit) = (plan, 0usize, None::<usize>);
+    let sort = loop {
+        match node {
+            LogicalPlan::Projection(p) => node = &p.input,
+            LogicalPlan::SubqueryAlias(a) => node = &a.input,
+            LogicalPlan::Limit(l) => {
+                skip += match l.get_skip_type().ok()? {
+                    datafusion::logical_expr::SkipType::Literal(s) => s,
+                    _ => return None,
+                };
+                limit = match l.get_fetch_type().ok()? {
+                    datafusion::logical_expr::FetchType::Literal(f) => f,
+                    _ => return None,
+                };
+                node = &l.input;
+            }
+            LogicalPlan::Sort(s) => break s,
+            _ => return None,
+        }
+    };
+    let lead = sort.expr.first()?;
+    let Expr::Column(column) = &lead.expr else { return None };
+    if !lead.asc {
+        return None;
+    }
+    let fetch = sort.fetch?;
+    let mut below = sort.input.as_ref();
+    let scan = loop {
+        match below {
+            LogicalPlan::Projection(p) => below = &p.input,
+            LogicalPlan::Filter(f) => below = &f.input,
+            LogicalPlan::SubqueryAlias(a) => below = &a.input,
+            LogicalPlan::TableScan(scan) if scan.fetch.is_none() && scan.projected_schema.has_column_with_unqualified_name(&column.name) => break scan,
+            _ => return None,
+        }
+    };
+    let rows = fetch.saturating_sub(skip).min(limit.unwrap_or(usize::MAX));
+    (rows > 0).then(|| (AscendingPage { rows }, column.clone(), scan))
+}
+
+/// `plan` with `column <= bound` above its table scan, typed like the scanned column.
+fn with_upper_bound(
+    plan: &datafusion::logical_expr::LogicalPlan, column: &datafusion::common::Column, bound: i64,
+) -> Result<datafusion::logical_expr::LogicalPlan> {
+    use datafusion::logical_expr::{LogicalPlan, LogicalPlanBuilder, col, lit};
+    plan.clone()
+        .transform_up(|node| {
+            let LogicalPlan::TableScan(scan) = &node else { return Ok(Transformed::no(node)) };
+            let field = scan.projected_schema.field_with_unqualified_name(&column.name)?;
+            let value = ScalarValue::TimestampMicrosecond(Some(bound), None).cast_to(field.data_type())?;
+            let scanned = datafusion::common::Column::new(Some(scan.table_name.clone()), column.name.clone());
+            Ok(Transformed::yes(LogicalPlanBuilder::from(node.clone()).filter(col(scanned).lt_eq(lit(value)))?.build()?))
+        })
+        .data()
+}
+
+/// The oldest files must hold this many times the page, so filters, the window and dedup
+/// rarely leave the narrowed page short.
+const NARROW_ROW_MARGIN: usize = 4;
+
+/// Runs `narrow` and returns it when it fills the page; otherwise runs `full`.
+#[derive(Debug)]
+struct NarrowedFetchExec {
+    narrow: Arc<dyn ExecutionPlan>,
+    full: Arc<dyn ExecutionPlan>,
+    rows: usize,
+    total_files: usize,
+    skipped: usize,
+    metrics: ExecutionPlanMetricsSet,
+}
+
+impl DisplayAs for NarrowedFetchExec {
+    fn fmt_as(&self, _: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "NarrowedFetchExec: rows={}, files={}, skipped={}", self.rows, self.total_files, self.skipped)
+    }
+}
+
+impl ExecutionPlan for NarrowedFetchExec {
+    fn name(&self) -> &'static str {
+        "NarrowedFetchExec"
+    }
+    fn properties(&self) -> &Arc<PlanProperties> {
+        self.full.properties()
+    }
+    fn apply_expressions(&self, _: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>) -> Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.narrow, &self.full]
+    }
+    fn with_new_children(self: Arc<Self>, children: Vec<Arc<dyn ExecutionPlan>>) -> Result<Arc<dyn ExecutionPlan>> {
+        let [narrow, full]: [Arc<dyn ExecutionPlan>; 2] =
+            children.try_into().map_err(|_| datafusion::error::DataFusionError::Internal("NarrowedFetchExec takes two children".into()))?;
+        Ok(Arc::new(Self { narrow, full, rows: self.rows, total_files: self.total_files, skipped: self.skipped, metrics: ExecutionPlanMetricsSet::new() }))
+    }
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
+    }
+    fn execute(&self, partition: usize, context: Arc<TaskContext>) -> Result<SendableRecordBatchStream> {
+        use futures::{StreamExt, TryStreamExt};
+        let (narrow, full, rows, schema) = (Arc::clone(&self.narrow), Arc::clone(&self.full), self.rows, self.full.schema());
+        let fell_back = MetricBuilder::new(&self.metrics).counter("fell_back", partition);
+        MetricBuilder::new(&self.metrics).counter("files_skipped", partition).add(self.skipped);
+        let stream = futures::stream::once(async move {
+            let batches: Vec<RecordBatch> = narrow.execute(partition, Arc::clone(&context))?.try_collect().await?;
+            if batches.iter().map(RecordBatch::num_rows).sum::<usize>() >= rows {
+                return Ok::<_, datafusion::error::DataFusionError>(futures::stream::iter(batches.into_iter().map(Ok)).boxed());
+            }
+            fell_back.add(1);
+            Ok(full.execute(partition, context)?.boxed())
+        })
+        .try_flatten();
+        Ok(Box::pin(datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(schema, stream)))
+    }
+}

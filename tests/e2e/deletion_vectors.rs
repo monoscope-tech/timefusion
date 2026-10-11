@@ -235,3 +235,52 @@ async fn dv_merge_update_from_source_masks_and_appends() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+/// Parquet bytes the process has decoded so far.
+async fn parquet_bytes_read(client: &Client) -> anyhow::Result<u64> {
+    let row = client.query_one("SELECT value FROM timefusion_stats WHERE component = 'parquet' AND key = 'bytes_read'", &[]).await?;
+    Ok(row.get::<_, String>(0).parse()?)
+}
+
+/// Ids and parquet bytes decoded for one query.
+async fn ids_and_bytes(client: &Client, sql: &str) -> anyhow::Result<(Vec<String>, u64)> {
+    let before = parquet_bytes_read(client).await?;
+    let ids = client.query(sql, &[]).await?.iter().map(|r| r.get(0)).collect();
+    Ok((ids, parquet_bytes_read(client).await? - before))
+}
+
+/// An oldest-first latest-N must not decode every file (prod 10-11: 169 MB for 501 rows,
+/// 0.8-6 s), and narrowing to the oldest files must go through the provider's own file
+/// selection: #383 edited the planned scan's file groups and every DV-carrying table then
+/// failed with "DeltaScanExec sequential deletion vector scan lacks selected files".
+/// Files here carry deletion vectors in both the oldest and a skipped file.
+#[serial_test::serial]
+#[tokio::test(flavor = "multi_thread")]
+async fn an_oldest_first_latest_n_over_dv_files_reads_only_the_oldest() -> anyhow::Result<()> {
+    let env = dv_env().start().await?;
+    // Compaction would merge the flushed files this test needs kept apart.
+    env.db().cancel_maintenance();
+    let client = env.pg_client().await?;
+    for batch in 0..6i64 {
+        seed(&client, &format!("d{batch}"), 5, FROZEN_START_MICROS + batch * 180 * 1_000_000).await?;
+        env.advance(Duration::from_secs(180));
+        env.force_flush().await?;
+    }
+    assert!(parquet_files(&env).await?.len() >= 6, "each flush must land its own file");
+    client.execute("DELETE FROM mor_dormant WHERE project_id = 'e2e_project' AND id IN ('d0-1', 'd5-2')", &[]).await?;
+
+    let narrowable = "SELECT id FROM mor_dormant WHERE project_id = 'e2e_project' ORDER BY timestamp ASC LIMIT 3";
+    // A sort key that is not a bare column disables the narrowing: same rows, every file decoded.
+    let full = "SELECT id FROM mor_dormant WHERE project_id = 'e2e_project' ORDER BY timestamp + INTERVAL '0 seconds' ASC LIMIT 3";
+    let (ids, narrowed_bytes) = ids_and_bytes(&client, narrowable).await?;
+    let (full_ids, full_bytes) = ids_and_bytes(&client, full).await?;
+    assert_eq!(ids, ["d0-0", "d0-2", "d0-3"], "the deleted d0-1 must stay gone and the oldest rows come first");
+    assert_eq!(ids, full_ids);
+    assert!(narrowed_bytes < full_bytes, "the narrowed query must decode fewer bytes than the full one: {narrowed_bytes} vs {full_bytes}");
+
+    // Only the newest file matches: the narrowed page comes back short and the full plan answers.
+    let sparse = "SELECT id FROM mor_dormant WHERE project_id = 'e2e_project' AND id LIKE 'd5-%' ORDER BY timestamp ASC LIMIT 3";
+    let (ids, _) = ids_and_bytes(&client, sparse).await?;
+    assert_eq!(ids, ["d5-0", "d5-1", "d5-3"], "a short narrowed page must fall back to the full, exact answer");
+    Ok(())
+}
