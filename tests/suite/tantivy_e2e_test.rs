@@ -663,6 +663,30 @@ async fn cold_index_cache_scans_unfiltered_then_prefilters_once_warm() -> Result
     Ok(())
 }
 
+/// A point lookup over a narrow window skips the index: the timestamp stats already prune it
+/// to a few row groups, while a term query on a high-cardinality field loads that field's
+/// whole term dictionary (prod: 49-119 MB, 3.9-7.4 s for a ±5 min trace-id lookup, against
+/// 0.1-0.2 s raw). A wide window still searches.
+#[serial]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_narrow_window_skips_the_prefilter_and_a_wide_one_uses_it() -> Result<()> {
+    let pair = Pair::new("narrow", Land::Flushed, &flush_group("n1", "login failed", "n")).await?;
+    pair.wait_manifest(1).await?;
+    let stats = &pair.on.tantivy_search().expect("search service").stats;
+    let searched = || stats.indexes_searched.load(std::sync::atomic::Ordering::Relaxed);
+    let now = chrono::Utc::now();
+    let window = |mins: i64| {
+        let (lo, hi) = (now - chrono::Duration::minutes(mins), now + chrono::Duration::minutes(mins));
+        format!("level = 'ERROR' AND timestamp BETWEEN '{}' AND '{}'", lo.to_rfc3339(), hi.to_rfc3339())
+    };
+    let before = searched();
+    pair.assert_ids(&window(5), &["n1"], "a narrow window answers from the scan").await?;
+    assert_eq!(searched(), before, "a ±5 min window must not search the index");
+    pair.assert_ids(&window(7 * 24 * 60), &["n1"], "a wide window still prefilters").await?;
+    assert!(searched() > before, "a 7-day window must search the index");
+    Ok(())
+}
+
 /// Exact `=`, OR-disjunctions and `IN` lists routed through the id-prefilter
 /// must all equal the full-scan baseline. In particular an OR whose other side
 /// is unroutable must fall back, never intersect down to ∅.

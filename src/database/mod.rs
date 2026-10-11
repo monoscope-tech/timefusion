@@ -427,6 +427,7 @@ pub mod scan_metric_names {
         PREFILTER_SKIP_COLD_INDEX = "timefusion.scan.prefilter_skipped.cold_index" as scan.prefilter_skipped_cold_index when "delta_cold_index";
         PREFILTER_SKIP_NO_HITS_RETURNED = "timefusion.scan.prefilter_skipped.no_hits_returned" as scan.prefilter_skipped_no_hits_returned when "delta_no_hits_returned";
         PREFILTER_SKIP_DELTA_ERROR = "timefusion.scan.prefilter_skipped.delta_error" as scan.prefilter_skipped_delta_error when "delta_error";
+        PREFILTER_SKIP_NARROW_WINDOW = "timefusion.scan.prefilter_skipped.narrow_window" as scan.prefilter_skipped_narrow_window when "narrow_window";
     }
     derived {
         CERT_DWELL_SECS_TOTAL = "timefusion.scan.cert_dwell_secs_total" via scan.cert_dwell_secs_avg;

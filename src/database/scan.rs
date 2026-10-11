@@ -992,49 +992,53 @@ impl ProjectRoutingTable {
                 record_prefilter_skip(reason);
                 debug!("Tantivy prefilter skipped for {}/{}: {}", project_id, self.table_name, reason);
             };
-            // ONE pass over the in-window index set: the predicate tree compiles to a single
-            // tantivy BooleanQuery per index (And→Must, Or→Should), hits unioned across indexes
-            // (they cover disjoint row sets).
-            match svc.search_detailed(&self.table_name, &project_id, tree, max_hits, query_time_range, false).await {
-                Ok(Ok(r)) => match decide_prefilter(
-                    r.hits.into_iter().map(|h| h.id).collect(),
-                    r.indexed_rows,
-                    min_sel_pct,
-                    r.field_coverage_gap,
-                    r.covered_files,
-                    r.zero_hit_files,
-                    r.row_selections,
-                    // Predicate-aware, not table-wide: if every ROUTED predicate column is
-                    // immutable, all versions of a matching row carry the same values, so a
-                    // file whose index found no match cannot hold any version of one
-                    // (tombstones included — same keys). A predicate touching a mutable column
-                    // (or the tiebreak/tombstone) takes the conservative path.
-                    routed_touches_mutable(mutable.as_ref(), text_match_tree.as_ref()),
-                    tcfg.timefusion_tantivy_file_pruning,
-                    tcfg.timefusion_tantivy_row_selection,
-                ) {
-                    PrefilterDecision::Skipped(reason) => {
-                        if reason == "low_selectivity" {
-                            svc.remember_unselective(&self.table_name, &project_id, tree, max_hits, query_time_range);
+            if query_time_range.is_some_and(|(lo, hi)| hi.saturating_sub(lo) < PREFILTER_MIN_WINDOW_MICROS) {
+                skip("narrow_window");
+            } else {
+                // ONE pass over the in-window index set: the predicate tree compiles to a single
+                // tantivy BooleanQuery per index (And→Must, Or→Should), hits unioned across indexes
+                // (they cover disjoint row sets).
+                match svc.search_detailed(&self.table_name, &project_id, tree, max_hits, query_time_range, false).await {
+                    Ok(Ok(r)) => match decide_prefilter(
+                        r.hits.into_iter().map(|h| h.id).collect(),
+                        r.indexed_rows,
+                        min_sel_pct,
+                        r.field_coverage_gap,
+                        r.covered_files,
+                        r.zero_hit_files,
+                        r.row_selections,
+                        // Predicate-aware, not table-wide: if every ROUTED predicate column is
+                        // immutable, all versions of a matching row carry the same values, so a
+                        // file whose index found no match cannot hold any version of one
+                        // (tombstones included — same keys). A predicate touching a mutable column
+                        // (or the tiebreak/tombstone) takes the conservative path.
+                        routed_touches_mutable(mutable.as_ref(), text_match_tree.as_ref()),
+                        tcfg.timefusion_tantivy_file_pruning,
+                        tcfg.timefusion_tantivy_row_selection,
+                    ) {
+                        PrefilterDecision::Skipped(reason) => {
+                            if reason == "low_selectivity" {
+                                svc.remember_unselective(&self.table_name, &project_id, tree, max_hits, query_time_range);
+                            }
+                            skip(reason)
                         }
-                        skip(reason)
+                        PrefilterDecision::Used { ids, covered_files, exclude_files, row_selections } => {
+                            crate::observability::record_tantivy_prefilter_used();
+                            metrics::counter!(scan_metric_names::PREFILTER_USED).increment(1);
+                            tantivy_id_filter = Some(col("id").in_list(ids.into_iter().map(lit).collect(), false));
+                            // Carry the coverage set forward and split against the snapshot taken at
+                            // scan construction: a flush or compaction can commit in between.
+                            tantivy_covered_files = Some(covered_files);
+                            tantivy_exclude = exclude_files;
+                            tantivy_row_selections = row_selections;
+                        }
+                    },
+                    Ok(Err(reason)) => skip(reason),
+                    Err(e) => {
+                        warn!("tantivy search failed for {}/{}: {:#} — falling back to full scan", project_id, self.table_name, e);
+                        crate::observability::record_tantivy_prefilter_error();
+                        skip("delta_error");
                     }
-                    PrefilterDecision::Used { ids, covered_files, exclude_files, row_selections } => {
-                        crate::observability::record_tantivy_prefilter_used();
-                        metrics::counter!(scan_metric_names::PREFILTER_USED).increment(1);
-                        tantivy_id_filter = Some(col("id").in_list(ids.into_iter().map(lit).collect(), false));
-                        // Carry the coverage set forward and split against the snapshot taken at
-                        // scan construction: a flush or compaction can commit in between.
-                        tantivy_covered_files = Some(covered_files);
-                        tantivy_exclude = exclude_files;
-                        tantivy_row_selections = row_selections;
-                    }
-                },
-                Ok(Err(reason)) => skip(reason),
-                Err(e) => {
-                    warn!("tantivy search failed for {}/{}: {:#} — falling back to full scan", project_id, self.table_name, e);
-                    crate::observability::record_tantivy_prefilter_error();
-                    skip("delta_error");
                 }
             }
         }
@@ -2102,6 +2106,11 @@ mod stale_coverage_metric_tests {
         assert_eq!(names.len(), scan_metric_names::PREFILTER_SKIP_REASONS.len());
     }
 }
+
+/// Below this query window the prefilter costs more than it saves: timestamp stats already prune
+/// to a few row groups, while a term query loads the field's whole term dictionary per index
+/// (prod: 49-119 MB, 3.9-7.4 s for a ±5 min trace-id lookup that scans raw in 0.1-0.2 s).
+const PREFILTER_MIN_WINDOW_MICROS: i64 = 3_600_000_000;
 
 /// Charge one prefilter skip to the total AND to its reason.
 ///
