@@ -868,6 +868,22 @@ async fn a_cold_index_leaves_only_its_own_files_unpruned() {
     assert_eq!(env.search.stats.cold_indexes_left_raw.load(Relaxed), 1);
 }
 
+/// An index sticking out of the window with no match anywhere answers without the
+/// timestamp range work, and still prunes its file.
+#[tokio::test]
+async fn a_windowed_search_with_no_match_prunes_without_the_range() {
+    let env = Env::prod("otel_logs_and_spans", "p-window-miss");
+    env.publish(&[(1_000_000, "a", "ERROR"), (1_000_100, "b", "INFO")], &["w-uri"]).await;
+    let warn = timefusion::tantivy::udf::PredNode::Leaf(TextMatchPred { column: "level".into(), query: "WARN".into() });
+    let result = env.search.search_detailed(env.table, env.project, &warn, 100, Some((1_000_050, 1_000_200)), true).await.unwrap().expect("searched");
+    assert!(result.hits.is_empty());
+    assert!(result.zero_hit_files.contains("w-uri"), "{:?}", result.zero_hit_files);
+    assert_eq!(result.indexed_rows, 2, "a no-match entry counts its whole index");
+    let error =
+        env.search.search_detailed(env.table, env.project, &level_error_node(), 100, Some((1_000_050, 1_000_200)), true).await.unwrap().expect("searched");
+    assert!(error.hits.is_empty() && error.indexed_rows == 1, "a matching entry still counts only in-window rows");
+}
+
 /// Prod 2026-09-30: a sealed-day index spans the whole day, so a fringe leg over a few hours
 /// of a busy project overflowed the cap on the DAY's matches and discarded the search after
 /// downloading every blob. The cap must count only in-window matches.

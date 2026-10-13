@@ -117,7 +117,8 @@ impl Drop for TimedPhase<'_> {
 #[derive(Debug)]
 pub struct SearchResult {
     pub hits: Vec<Hit>,
-    /// In-window rows covered by queried manifest entries.
+    /// In-window rows covered by queried manifest entries; an entry with no match
+    /// anywhere counts all its rows, which skips the window count and hides no match.
     pub indexed_rows: u64,
     /// Files covered by every successful entry, including time-pruned entries.
     pub covered_files: HashSet<String>,
@@ -501,6 +502,10 @@ impl TantivySearchService {
                         // merge-on-read versions share their row's timestamp.
                         let (q, rows): (Box<dyn Query>, u64) = match window {
                             None => (q, rows),
+                            // No match in the whole index is no match in the window: skip the range
+                            // scorer, which opens the timestamp fast field per segment. The whole-index
+                            // row count only enlarges `indexed_rows`, which never hides a match.
+                            Some(_) if searcher.search(&*q, &tantivy::collector::Count).map_err(|e| anyhow!("count: {e}"))? == 0 => (q, rows),
                             Some((lo, hi)) => {
                                 let range: Box<dyn Query> = Box::new(RangeQuery::new_i64_bounds(TS_FIELD.into(), Bound::Included(lo), Bound::Included(hi)));
                                 let in_window = searcher.search(&*range, &tantivy::collector::Count).map_err(|e| anyhow!("window count: {e}"))?;
