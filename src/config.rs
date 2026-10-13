@@ -1143,8 +1143,9 @@ pub struct TantivyConfig {
     pub timefusion_tantivy_search_concurrency: usize,
     /// TTL for the parsed-manifest cache, which sits on the planning path. Safe
     /// to lengthen: this process invalidates its own entry on publish and GC,
-    /// and a stale entry only costs a wasted lookup.
-    #[serde_inline_default(300)]
+    /// and a stale entry only costs a wasted lookup. A query misses if ANY of its
+    /// per-date shards expired, so a 30-day window at 300 s missed 83% of the time.
+    #[serde_inline_default(3600)]
     pub timefusion_tantivy_manifest_ttl_secs: u64,
     /// Write new indexes as range-readable bundles (`tantivy::hotcache`). Every reader
     /// since `dde040e9` reads both formats; an older image cannot install a bundle.
@@ -2480,7 +2481,7 @@ mod tests {
         assert_eq!(cfg.timefusion_tantivy_prefetch_days, 3, "the hot window must be warmed by default");
         assert_eq!(cfg.search_concurrency(), 32);
         assert_eq!(cfg.reader_cache_entries().get(), 2048);
-        assert_eq!(cfg.manifest_ttl(), Duration::from_secs(300));
+        assert_eq!(cfg.manifest_ttl(), Duration::from_secs(3600));
         // A COUNT ceiling against a pathological queue of tiny files, NOT the
         // pass bound — `timefusion_tantivy_backfill_max_bytes_per_pass` is.
         assert_eq!(cfg.timefusion_tantivy_backfill_max_files_per_pass, 320);
