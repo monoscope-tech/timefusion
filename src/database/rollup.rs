@@ -206,8 +206,7 @@ impl Database {
             let table = source_table.read().await;
             // Unbounded (`i64::MAX`) to match how the write side stamps `source_rows` and the
             // date-level `source_fp`; the computation must stay identical on both sides.
-            Self::partition_stats_bounded(&table, &route.source, Some(&route.target), &|_, _| i64::MAX)
-                .map_err(|_| crate::rollup::MissReason::IncompleteCoverage)?
+            Self::partition_stats(&table, &route.source, Some(&route.target)).map_err(|_| crate::rollup::MissReason::IncompleteCoverage)?
         };
         crate::observability::record_plan_phase(crate::observability::PlanPhase::RollupSourceStats, stats_started);
         // A project's own live stats for a date, falling back to the unified table's row (a
@@ -529,7 +528,7 @@ impl Database {
         let Ok(source_table) = self.resolve_table(lookup_project, source).await else { return false };
         let fingerprints = {
             let table = source_table.read().await;
-            let Ok(stats) = Self::partition_stats_bounded(&table, source, Some(target), &|_, _| i64::MAX) else { return false };
+            let Ok(stats) = Self::partition_stats(&table, source, Some(target)) else { return false };
             stats
         };
         let Ok(target_table) = self.resolve_table(lookup_project, target).await else { return false };

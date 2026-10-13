@@ -2066,6 +2066,9 @@ fn partition_file_fp(files: &[String]) -> u64 {
     h.finish()
 }
 
+/// Stats per `(project, date)` partition, as fingerprinted for rollup coverage.
+pub(crate) type PartitionStatsMap = HashMap<(String, String), PartitionStats>;
+
 /// A partition's identity hash plus the row timestamps its files span.
 #[derive(Clone, Copy)]
 pub(crate) struct PartitionStats {

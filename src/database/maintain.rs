@@ -5236,6 +5236,23 @@ impl Database {
         Ok(true)
     }
 
+    /// [`Self::partition_stats_bounded`] unbounded, memoized per snapshot version: the read
+    /// path asks for it on every routed query, and each call rebuilds the whole table's
+    /// add-actions batch (~80% of a routed 30-day chart's planning CPU on prod).
+    pub(crate) fn partition_stats(table: &DeltaTable, source: &str, tier: Option<&str>) -> Result<Arc<PartitionStatsMap>> {
+        type Memo = dashmap::DashMap<(String, String, Option<String>), (u64, Arc<PartitionStatsMap>)>;
+        static MEMO: std::sync::LazyLock<Memo> = std::sync::LazyLock::new(Memo::new);
+        let (key, version) = ((table.table_url().to_string(), source.to_owned(), tier.map(str::to_owned)), table.version());
+        if let Some(hit) = MEMO.get(&key).filter(|hit| Some(hit.0) == version) {
+            return Ok(Arc::clone(&hit.1));
+        }
+        let stats = Arc::new(Self::partition_stats_bounded(table, source, tier, &|_, _| i64::MAX)?);
+        if let Some(version) = version {
+            MEMO.insert(key, (version, Arc::clone(&stats)));
+        }
+        Ok(stats)
+    }
+
     pub(crate) fn partition_stats_bounded(
         table: &DeltaTable, source: &str, tier: Option<&str>, bound_for: &dyn Fn(&str, &str) -> i64,
     ) -> Result<HashMap<(String, String), PartitionStats>> {

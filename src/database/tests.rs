@@ -1050,6 +1050,16 @@ async fn a_built_rollup_routes_and_stops_routing_once_its_source_grows() -> Resu
             .and_then(|stats| u64::try_from(stats.rows).ok()))
     };
     let now = partition_rows().await?;
+    // The read path's memoized form: equal to the computation above, reused at one version.
+    let memoized = async || -> Result<(Arc<crate::database::PartitionStatsMap>, Option<u64>)> {
+        let table = source.read().await;
+        let stats = Database::partition_stats(&table, "otel_logs_and_spans", None)?;
+        let rows = stats.get(&(project.clone(), day.to_string())).and_then(|stats| u64::try_from(stats.rows).ok());
+        Ok((stats, rows))
+    };
+    let (first, rows) = memoized().await?;
+    assert_eq!(rows, now);
+    assert!(Arc::ptr_eq(&first, &memoized().await?.0), "one snapshot version computes once");
     assert_eq!(witnesses.first().copied().flatten(), now, "a freshly built slice must agree with its source, or the guard refuses every rollup");
     assert!(crate::rollup::slice_coverage_agrees(&witnesses, now), "a fresh build must be trusted");
 
@@ -1057,6 +1067,7 @@ async fn a_built_rollup_routes_and_stops_routing_once_its_source_grows() -> Resu
     insert_a_span(&db, &project, "b", at + 1).await?;
     let grown = partition_rows().await?;
     assert_ne!(now, grown, "the write must move the partition's row count, or this proves nothing");
+    assert_eq!(memoized().await?.1, grown, "a new version must not be served the memoized pre-write stats");
     assert!(!crate::rollup::slice_coverage_agrees(&witnesses, grown), "a slice built before the write must not be served afterwards");
     Ok(())
 }
