@@ -721,7 +721,7 @@ pub fn init_metrics(
     );
     observe!(gauge
         "timefusion.maintenance.sealed_seconds_since_commit",
-        "Seconds since the SEALED lane last committed. Separate from the combined gauge because the hot lane kept committing right through the 2026-09-15 sealed-lane outage. PAGE above two hours",
+        "Seconds since the SEALED lane last committed, or last had no sealed work queued. Separate from the combined gauge because the hot lane kept committing right through the 2026-09-15 sealed-lane outage. PAGE above two hours",
         {
             let stamped = maintenance_stats().last_sealed_commit_unix.load(Relaxed);
             let now = crate::support::now_micros().max(0) as u64 / 1_000_000;

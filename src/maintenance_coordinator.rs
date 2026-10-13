@@ -3053,6 +3053,11 @@ impl TaskJournal {
         stats.maintenance_tasks_complete.store(counts[TaskState::Complete as usize].saturating_add(counts[TaskState::Superseded as usize]), Relaxed);
         stats.maintenance_backlog_bytes.store(backlog_bytes, Relaxed);
         stats.sealed_compaction_debt_bytes.store(sealed_debt_bytes, Relaxed);
+        // An idle lane is a fresh one: with no sealed work queued there is nothing to commit,
+        // and letting the gauge age through idleness pages on a healthy lane.
+        if per_operation[Operation::SealedConsolidation as usize] == 0 {
+            stats.last_sealed_commit_unix.store(u64::try_from(now_micros.div_euclid(1_000_000)).unwrap_or_default(), Relaxed);
+        }
         let eligible_lag_secs = frontier_lag_secs(latest_frontier_rollup.values().copied(), now_micros);
         stats.maintenance_eligible_watermark_lag_secs.store(eligible_lag_secs, Relaxed);
         self.frontier_lag_secs.store(eligible_lag_secs, Relaxed);
@@ -4607,6 +4612,22 @@ mod tests {
         assert_eq!(due, 0, "re-armed into the future: nothing is due");
         assert!(oldest >= 7_200, "the creation-age gauge is unchanged");
         Ok(())
+    }
+
+    /// An idle sealed lane reads fresh; one with sealed work queued keeps aging until it commits.
+    #[test_case::test_case(false; "idle lane")]
+    #[test_case::test_case(true; "queued sealed work")]
+    fn sealed_commit_gauge_ages_only_while_sealed_work_waits(queued: bool) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let (_dir, mut journal) = new_journal();
+        let now = crate::support::now_micros();
+        if queued {
+            upserted(&mut journal, task_in("source", "p", now - DAY_MICROS, now - DAY_MICROS + NORMAL_SLICE_MICROS, Operation::SealedConsolidation));
+        }
+        let stats = crate::observability::maintenance_stats();
+        stats.last_sealed_commit_unix.store(1, Relaxed);
+        journal.publish_statistics();
+        assert_eq!(stats.last_sealed_commit_unix.load(Relaxed) == 1, queued);
     }
 
     /// The operation's own deadline, in micros — the floor a burned unit waits.
