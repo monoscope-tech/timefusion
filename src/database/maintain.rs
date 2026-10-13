@@ -43,6 +43,10 @@ enum RollupRebuildReason {
     SubHourSlices,
 }
 
+/// How long a slice of today must have been closed before recovery requeues it on a moved
+/// witness: past the hour's own late arrivals, so the rebuild's bounded witness holds.
+const CLOSED_SLICE_MARGIN_MICROS: i64 = 3_600_000_000;
+
 /// How a tier's contiguity may move the fleet gauge.
 #[derive(Clone, Copy, Debug)]
 enum FleetTier {
@@ -5778,17 +5782,20 @@ impl Database {
                 // with no path back to `proven`. `enqueue_unverifiable_rebuilds` is
                 // newest-first and bounded, so this cannot flood the queue.
                 //
-                // SEALED DAYS ONLY: a rebuild cannot make the witness agree on a day that
-                // is still ingesting, because the partition moves again before the next
-                // recovery pass looks -- requeuing a live day cycles instead of catching
-                // up. `date < today` is the cheap form of "no longer live"; the precise
-                // predicate is the dedup certification, so a partition still taking late
-                // arrivals for yesterday reads as sealed here and can be requeued twice.
-                if date < chrono::Utc::now().date_naive().to_string() {
-                    moved.extend(slices.iter().filter(|(start, coverage)| !agrees(*start, coverage)).map(|(start, coverage)| {
-                        (project.clone(), crate::maintenance_coordinator::TimeSlice { start_micros: *start, end_micros: coverage.covered_through })
-                    }));
-                }
+                // Sealed days, and today's hours closed at least `CLOSED_SLICE_MARGIN_MICROS`
+                // ago once the bounded witness is on. A whole-partition witness cannot agree
+                // on a day still ingesting, so requeuing a live day cycles; a closed hour's
+                // rebuild records a witness below its own end that later ingest cannot move.
+                // What stales such an hour is a logical no-op rewrite (dedup, packing), and
+                // left unqueued it stays a raw hole in every chart over today until midnight.
+                let sealed = date < chrono::Utc::now().date_naive().to_string();
+                let closed_before = crate::support::now_micros().saturating_sub(CLOSED_SLICE_MARGIN_MICROS);
+                let requeue = |coverage: &RollupCoverage| {
+                    sealed || (self.config.maintenance.timefusion_rollup_bounded_witness && coverage.covered_through <= closed_before)
+                };
+                moved.extend(slices.iter().filter(|(start, coverage)| !agrees(*start, coverage) && requeue(coverage)).map(|(start, coverage)| {
+                    (project.clone(), crate::maintenance_coordinator::TimeSlice { start_micros: *start, end_micros: coverage.covered_through })
+                }));
                 continue;
             }
             let mut spans: Vec<(i64, i64)> = slices.iter().map(|(start, coverage)| (*start, coverage.covered_through)).collect();
@@ -12537,6 +12544,59 @@ mod rollup_noop_skip_tests {
             assert_eq!(after, before, "a valid bounded witness must not acquire new repair debt during recovery");
             assert!(db.rollup_sql(&plan, &state).await.is_ok_and(|rewrites| !rewrites.is_empty()), "the unaffected prefix must remain readable");
         }
+        Ok(())
+    }
+
+    /// A logical no-op rewrite (dedup, packing) can move a closed hour of TODAY under its
+    /// slice with no write to re-mint it. Recovery must queue it once the hour has been closed
+    /// past the margin, or it stays a raw hole in every chart over today until midnight; a
+    /// slice still inside the margin waits, as its hour may still take late rows.
+    #[test_case::test_case(2 * 3_600_000_000, true ; "closed past the margin is requeued")]
+    #[test_case::test_case(1_800_000_000, false ; "inside the margin waits")]
+    #[serial]
+    #[tokio::test]
+    async fn a_moved_slice_of_today_is_requeued_once_closed(after_end: i64, requeued: bool) -> Result<()> {
+        let db = Arc::new(Database::with_config(rollup_cfg("todays_moved_requeue")).await?);
+        let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+        assert!(build_day(&db, &project_id, chrono::Utc::now().date_naive(), "seed").await? > 0, "the fixture needs today's built slice");
+        db.recover_rollup_coverage("otel_logs_and_spans").await?;
+        let key = db
+            .rollup_slice_coverage
+            .iter()
+            .find(|entry| entry.key().0 == project_id && entry.key().2 == TIER && entry.output != RollupOutputEvidence::Empty)
+            .map(|entry| entry.key().clone())
+            .expect("today's populated slice");
+        let queued = |db: &Database| {
+            db.journal().tasks().any(|task| {
+                task.key.project_id == project_id
+                    && task.key.physical_table == TIER
+                    && task.key.slice.overlaps(key.3, key.4)
+                    && matches!(task.state, TaskState::Pending | TaskState::Retry)
+            })
+        };
+        assert!(!queued(&db), "nothing may be pending before the input moves");
+        // Inputs below the slice's end change: every proof the slice carries now disagrees.
+        let inside = key.3 + 60_000_000;
+        db.query_delta_only(&format!(
+            "INSERT INTO otel_logs_and_spans (project_id, timestamp, id, hashes, summary, name, date) \
+             VALUES ('{project_id}', to_timestamp_micros({inside}), 'unannounced', ARRAY[]::text[], ARRAY['x'], 'op', CAST(to_timestamp_micros({inside}) AS DATE))"
+        ))
+        .await?;
+        // That write re-pended the slice; close it unrebuilt, the state a rewrite with no
+        // invalidation leaves behind.
+        let repended: Vec<_> = db
+            .journal()
+            .tasks()
+            .filter(|task| {
+                task.key.project_id == project_id && task.key.slice.overlaps(key.3, key.4) && matches!(task.state, TaskState::Pending | TaskState::Retry)
+            })
+            .map(|task| task.key.clone())
+            .collect();
+        repended.iter().for_each(|task| _ = db.journal().complete(task));
+        assert!(!queued(&db), "the fixture must leave the moved slice complete and unqueued");
+        crate::support::set_micros(key.4 + after_end);
+        db.recover_rollup_coverage("otel_logs_and_spans").await?;
+        assert_eq!(queued(&db), requeued);
         Ok(())
     }
 
