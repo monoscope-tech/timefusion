@@ -1917,7 +1917,9 @@ impl TaskJournal {
                 return true;
             }
             if task.state != TaskState::Running {
-                let new_deadline = task.deadline_micros.min(deadline_micros);
+                // Earliest wins only while the debt is still owed; a finished unit's old
+                // deadline would reopen it days overdue, ahead of work that really is.
+                let new_deadline = if task.state.is_active() { task.deadline_micros.min(deadline_micros) } else { deadline_micros };
                 let changed = task.state != TaskState::Pending
                     || task.deadline_micros != new_deadline
                     || task.estimated_decoded_bytes != estimated_decoded_bytes
@@ -4612,6 +4614,26 @@ mod tests {
         assert_eq!(due, 0, "re-armed into the future: nothing is due");
         assert!(oldest >= 7_200, "the creation-age gauge is unchanged");
         Ok(())
+    }
+
+    /// A finished unit reopened by a new enqueue is due from that enqueue, not from the
+    /// deadline it carried when it first ran.
+    #[test]
+    fn a_reopened_complete_task_takes_the_new_deadline() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let (_dir, mut journal) = new_journal();
+        let now = crate::support::now_micros();
+        let key = upserted(
+            &mut journal,
+            task_in("source", "p", now - 3 * DAY_MICROS, now - 3 * DAY_MICROS + NORMAL_SLICE_MICROS, Operation::Dedup)
+                .tap_mut(|unit| unit.deadline_micros = now - 3 * DAY_MICROS)
+                .tap_mut(|unit| unit.state = TaskState::Complete),
+        );
+        journal.enqueue(key.clone(), now - 600_000_000, 0, 0);
+        assert_eq!(journal.state(&key), Some(TaskState::Pending));
+        journal.publish_statistics();
+        let due = crate::observability::maintenance_stats().maintenance_oldest_due_unclaimed_age_secs.load(Relaxed);
+        assert!((600..660).contains(&due), "due from the reopening enqueue, got {due}");
     }
 
     /// An idle sealed lane reads fresh; one with sealed work queued keeps aging until it commits.
