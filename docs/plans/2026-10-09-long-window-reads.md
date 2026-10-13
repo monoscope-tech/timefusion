@@ -645,6 +645,28 @@ Shipped today after the call:
 3. **Delta provider planning, ~31 ms per scan**: replay 21 ms (seeded) and footer ordering. Maintenance scans (`compact.rs:861`, `Error` policy) still pay the second replay.
 4. **Needle floor (~4.5 s at 30d)**: tantivy prepare/fan-out long poles over ~60 large complete indexes, plus manifest load 0.5 s.
 
+### 10-13 results and open leads
+
+Shipped, each measured on prod:
+- #392: two maintenance gauges no longer page on a healthy queue. A completed task re-queued with its old deadline drove `oldest_due_unclaimed_age_seconds` to ~3 days, and the fix ended a midnight-to-01:20 rebuild storm of ~700 attempts per slice. The sealed-lane gauge now reads fresh while the lane is idle.
+- #393: the manifest cache TTL is 1 h instead of 5 min. Hit rate went from 16% to 45–65%.
+- #394: certification lists the snapshot once per call, not per date: ~195 ms → ~15 ms per 30-day scan.
+- #395: a windowed tantivy search with no match skips the timestamp range scorer: ~6 ms per index search.
+- #396: new `routes_30m` tier for route-filtered charts.
+- #397: the read path's partition stats are memoized per snapshot version. They had been ~80% of a routed 30-day chart's planning. Route chart 7/14/30d went from 0.81/0.95/1.52 s to 0.38/0.45/0.52 s.
+- monoscope #674 (JSON-path `== true`) and #675 (adjacent hash lookups via `hashes_30m`, ~57 s → ~0.6 s with no match) are awaiting review.
+
+Shipbubble now, one connection, ~150 ms RTT included:
+- Overview widgets 15m–24h: median 0.33–0.53 s.
+- Log list 24h–30d: 0.38–0.47 s.
+- Text search 7–30d: 0.3–0.5 s.
+- Route and endpoint charts 30d: ~0.5–0.6 s.
+
+Open leads:
+1. **Today's stale slices are never rebuilt.** Shipbubble's 10-13 05:00 and 09:00 `dashboard_1m_v4` slices are complete (attempt 1), yet every read refuses them: `rollup_miss_stale_coverage`, and the bounded and content proofs fail too. The moved-witness requeue in `maintain.rs` runs for sealed days only (`date < today`), so a today slice that loses its proof stays a raw hole until midnight. This is the 24h histogram's ~1 s: yesterday reads `full` in 0.4 s, today-so-far reads `hybrid` in 1.2–1.3 s, and the 15-minute raw tail alone costs ~0.1 s. Before relaxing the rule for closed hours, find what moved those hours' files below the slice end (packing or DV dedup), or a requeue will cycle.
+2. **30-day http500 list ~1 s** (24k matches). The newest 501 are all today's, and 1 day costs the same as 30 days, so the cost is reading today's unconsolidated partition, not the window.
+3. **`BETWEEN` makes a closed window hybrid.** The inclusive upper bound becomes a 1 µs raw leg: ~0.3 s on a single day. Only custom closed ranges hit it; relative windows end at now anyway.
+
 ### R4 — Monitoring (continuous)
 
 - TimeFusion dashboard: monoscope project `87576849`, dashboard `8e2deff2`.
