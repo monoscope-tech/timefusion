@@ -737,6 +737,7 @@ pub(crate) struct VersionOnlyLedger {
 const VERSION_ONLY_TTL_MICROS: i64 = 2 * 3600 * 1_000_000;
 /// A table's commit sequence and its recent commits' `(sequence, row-time range)`.
 type CommitLog = (u64, std::collections::VecDeque<(u64, Option<(i64, i64)>)>);
+type LiveFile = (String, Option<deltalake::kernel::DeletionVectorDescriptor>);
 /// Recent commit ranges kept per `(project, table)`; one evicted since a read counts as overlapping.
 const VERSION_ONLY_COMMIT_RANGES: usize = 1024;
 
@@ -6783,10 +6784,16 @@ impl Database {
         // authorises removes DedupExec from the whole scan, including the MemBuffer and
         // hot-tier legs, which can hold superseded merge-on-read versions.
         let mut certified_any = false;
+        // One snapshot pass for the whole window, keyed by `date=` segment: listing the
+        // snapshot once per date made a 30-day planning pay ~60 full-snapshot walks.
+        let (Ok(uris), Ok(live)) = (table.get_file_uris(), Self::live_files(table)) else {
+            return (DedupSkipVerdict::Unresolved, HashSet::new());
+        };
+        let uris_by_date =
+            uris.filter(|uri| uri.ends_with(".parquet")).filter_map(|uri| Some((path_partition_value(&uri, "date")?.to_string(), uri))).into_group_map();
+        let mut live_by_date = live.into_iter().filter_map(|file| Some((path_partition_value(&file.0, "date")?.to_string(), file))).into_group_map();
         for date in dates {
-            let Ok(mut by_pid) = Self::partition_files_by_pid(table, &format!("date={date}")) else {
-                return (DedupSkipVerdict::Unresolved, HashSet::new());
-            };
+            let mut by_pid = Self::group_by_pid(uris_by_date.get(&date.to_string()).into_iter().flatten().cloned());
             // The sweep keys custom-project tables (no project_id= path
             // segment) under "default"; match its grouping exactly.
             let Some((key_pid, files)) =
@@ -6795,7 +6802,7 @@ impl Database {
                 continue; // no Delta files for this date → nothing to dedup
             };
             let fp_key = (key_pid, table_name.to_string(), date.to_string());
-            let Ok((_, visibility)) = Self::logical_count_partition_snapshot(table, &fp_key.0, &date.to_string()) else {
+            let Ok((_, visibility)) = Self::count_partition(live_by_date.remove(&fp_key.2).unwrap_or_default(), &fp_key.0, &fp_key.2) else {
                 return (DedupSkipVerdict::Unresolved, HashSet::new());
             };
             // Bound in a `let`, NOT inlined as the match scrutinee: the `Ref` would live
@@ -6954,14 +6961,20 @@ impl Database {
     }
 
     pub(crate) fn logical_count_partition_snapshot(table: &DeltaTable, project_id: &str, date: &str) -> Result<(u64, crate::read::CountFiles)> {
-        let snapshot = table.snapshot()?.snapshot();
-        let paths: HashSet<_> = dedup_partition_paths(snapshot.log_data().iter().map(|file| file.path().to_string()), project_id, date).into_iter().collect();
+        Self::count_partition(Self::live_files(table)?, project_id, date)
+    }
+
+    /// Every live `(path, deletion vector)` of the snapshot.
+    fn live_files(table: &DeltaTable) -> Result<Vec<LiveFile>> {
+        Ok(table.snapshot()?.snapshot().log_data().iter().map(|file| (file.path().into_owned(), file.deletion_vector_descriptor())).collect())
+    }
+
+    /// [`Self::logical_count_partition_snapshot`] over an already-listed live set.
+    fn count_partition(live: Vec<LiveFile>, project_id: &str, date: &str) -> Result<(u64, crate::read::CountFiles)> {
+        let paths: HashSet<_> = dedup_partition_paths(live.iter().map(|(path, _)| path.clone()), project_id, date).into_iter().collect();
         let mut files = crate::read::CountFiles::new();
-        for file in snapshot.log_data().iter().filter(|file| paths.contains(file.path().as_ref())) {
-            anyhow::ensure!(
-                files.insert(file.path().into_owned(), file.deletion_vector_descriptor()).is_none(),
-                "logical-count snapshot has multiple active entries for one Parquet path"
-            );
+        for (path, dv) in live.into_iter().filter(|(path, _)| paths.contains(path)) {
+            anyhow::ensure!(files.insert(path, dv).is_none(), "logical-count snapshot has multiple active entries for one Parquet path");
         }
         Ok((Self::file_visibility_fingerprint(&files)?, files))
     }

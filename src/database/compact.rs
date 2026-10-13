@@ -1805,11 +1805,11 @@ impl Database {
     /// tables don't embed it). Shared by the sweep's fingerprint capture and
     /// the read-side dedup-skip check so both hash identical groupings.
     pub(crate) fn partition_files_by_pid(table: &DeltaTable, date_marker: &str) -> Result<HashMap<String, Vec<String>>> {
-        Ok(table
-            .get_file_uris()?
-            .filter(|uri| uri.contains(date_marker) && uri.ends_with(".parquet"))
-            .map(|uri| (path_partition_value(&uri, "project_id").unwrap_or("default").to_string(), uri))
-            .into_group_map())
+        Ok(Self::group_by_pid(table.get_file_uris()?.filter(|uri| uri.contains(date_marker) && uri.ends_with(".parquet"))))
+    }
+
+    pub(crate) fn group_by_pid(uris: impl Iterator<Item = String>) -> HashMap<String, Vec<String>> {
+        uris.map(|uri| (path_partition_value(&uri, "project_id").unwrap_or("default").to_string(), uri)).into_group_map()
     }
 
     /// Live `(path, dv_unique_id)` set of one project's `date=` partition. Unlike
