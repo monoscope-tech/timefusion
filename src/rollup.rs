@@ -3824,7 +3824,7 @@ mod tests {
     /// best first. One reading an undeclared column must DECLINE, not vanish as a
     /// silent `Ok(empty)`.
     #[test_case::test_case("coalesce(status_code, level)", Ok(&["dashboard_1h_v3", "dashboard_1m_v4"]) ; "monoscope's status chart reads level")]
-    #[test_case::test_case("status_code", Ok(&["dashboard_1h_v3", "dashboard_1m_v4"]) ; "a plain status group")]
+    #[test_case::test_case("status_code", Ok(&["dashboard_1h_v3", "routes_30m", "dashboard_1m_v4"]) ; "a plain status group")]
     #[test_case::test_case("coalesce(status_code, name)", Err(MissReason::UnsupportedShape) ; "an unservable group expression is counted rather than silent")]
     #[tokio::test]
     async fn a_group_expression_routes_to_the_tiers_declaring_its_columns(key: &str, expected: Result<&[&str], MissReason>) {

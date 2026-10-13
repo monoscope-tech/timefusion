@@ -29,9 +29,17 @@ async fn monoscope_overview_widgets_route_to_rollup_tiers() -> anyhow::Result<()
     ] {
         client
             .execute(
-                "INSERT INTO otel_logs_and_spans (project_id, timestamp, id, hashes, summary, name, kind, status_code, attributes___http___response___status_code, duration) \
-                 VALUES ('e2e_project', $1, $2, $3, ARRAY['fixture'], 'GET', $4, $5, $6, 100000000)",
-                &[&(noon + chrono::Duration::minutes(minute)), &format!("span-{minute}"), &if kind == "server" { vec!["ep1"] } else { vec![] }, &kind, &status, &http_status],
+                "INSERT INTO otel_logs_and_spans (project_id, timestamp, id, hashes, summary, name, kind, status_code, attributes___http___response___status_code, duration, attributes___http___route) \
+                 VALUES ('e2e_project', $1, $2, $3, ARRAY['fixture'], 'GET', $4, $5, $6, 100000000, $7)",
+                &[
+                    &(noon + chrono::Duration::minutes(minute)),
+                    &format!("span-{minute}"),
+                    &if kind == "server" { vec!["ep1"] } else { vec![] },
+                    &kind,
+                    &status,
+                    &http_status,
+                    &(kind == "server").then_some("/v1/labels/{param}"),
+                ],
             )
             .await?;
     }
@@ -42,7 +50,7 @@ async fn monoscope_overview_widgets_route_to_rollup_tiers() -> anyhow::Result<()
     for _ in 0..2 {
         env.db().dedup_today_partitions(&table, "otel_logs_and_spans", "otel_logs_and_spans").await?;
     }
-    for tier in ["dashboard_1m_v4", "endpoints_1m", "hashes_30m"] {
+    for tier in ["dashboard_1m_v4", "endpoints_1m", "hashes_30m", "routes_30m"] {
         let built = env.db().run_unit_once("otel_logs_and_spans", "e2e_project", day, Operation::BaseRollup, 24, 0, Some(tier)).await?;
         assert_eq!(built.state, Some(TaskState::Complete), "{tier} must be published");
     }
@@ -120,6 +128,16 @@ async fn monoscope_overview_widgets_route_to_rollup_tiers() -> anyhow::Result<()
                  from otel_logs_and_spans where {scope} and hashes @> array['ep1'] group by attributes___http___response___status_code order by count(*) desc limit 20"
             ),
             vec!["20.0 100.00", "20.0 100.00", "20.0 100.00", "40.0 100.00"],
+        ),
+        // A log-explorer status chart filtered to one route.
+        (
+            "route requests by status",
+            format!(
+                "select extract(epoch from time_bucket('1 hour', timestamp))::integer, coalesce(status_code::text, 'null'), count(*)::float as count_ from otel_logs_and_spans \
+                 where {scope} and ((attributes___http___route = '/v1/labels/{{param}}')) group by time_bucket('1 hour', timestamp), coalesce(status_code::text, 'null') \
+                 order by time_bucket('1 hour', timestamp) desc"
+            ),
+            vec!["ERROR 1.0", "OK 4.0"],
         ),
         (
             "endpoint apdex",

@@ -579,6 +579,19 @@ rollups:
     backfill_days: 31
     measures:
       - { name: request_count, agg: count }
+  # Per-route tier for log-explorer charts filtered by `attributes___http___route` (a
+  # 30-day status chart for one shipbubble route scanned 2.3 GB raw, ~2 s). Routes are
+  # templated: measured 10-13, 396 routes and ~6.7k (hour, route, method, status) cells
+  # a day for shipbubble. 30m so 7d charts' 30m bins route.
+  - grain: 30m
+    name: routes_30m
+    dimensions: [attributes___http___route, attributes___http___request___method, status_code, attributes___http___response___status_code]
+    backfill_days: 31
+    measures:
+      - { name: request_count, agg: count }
+      - { name: duration_count, agg: count, column: duration }
+      - { name: duration_sum, agg: sum, column: duration }
+      - { name: duration_digest, agg: tdigest, column: duration }
   # Per-hash tier for monoscope's endpoint/issue widgets, which filter on
   # `hashes @> ARRAY[h]` / `array_has(hashes, h)` over 7-14 d and timed out at 90 s:
   # a hash's rows sit in ~98% of pages, so only an aggregate keyed by hash is cheap.
