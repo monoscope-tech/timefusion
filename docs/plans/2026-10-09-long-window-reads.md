@@ -674,6 +674,18 @@ Open leads:
 - Remaining systematic cost: the first query after a deploy is cold (2.4–3.7 s, mostly opening tantivy readers for older indexes). The column warmer does not cover index readers. Real-user slow reads, daytime: ~6/h, mostly the demo project's adjacent-trace lookup, which monoscope #675 fixes.
 - Local env note: when OrbStack wedges it keeps holding :9000 with no container, and every MinIO-backed test hangs. `orb stop && orb start`, then `make minio-start`.
 
+### Open lead: hash-filtered log lists (issue pages)
+
+`array_has(hashes, X) ORDER BY timestamp DESC LIMIT 501`, for project 6297304f, a hash with 90 matches in 7 days:
+- 24h: 6.1 s. 7d: 19.6 s.
+- The same query restricted by hand to the matches' timestamps (`timestamp IN (…)`): 1.5 s.
+
+The prod slow log shows the issue page's list at 4.5–4.7 s.
+
+Why it is not shipped: `hashes` is version-mutable, so the prefilter refuses it (`mutable_visibility`). A timestamp narrowing is sound only if the candidate set holds every timestamp where ANY version matches, since versions share their timestamp (it is a dedup key) and dedup is global over the legs. Tantivy hits cover indexed files only. If a tag is removed while its old version sits in an unindexed file or the MemBuffer and the new, non-matching winner sits in an indexed file, the winner's timestamp is missing, the winner is filtered out, the old version wins, and a ghost row appears. Tag replacement was measured at ~1 in 25,014 version pairs (09-03), and that was ruled disqualifying.
+
+Sound version: candidates = hit timestamps ∪ the timestamps of rows matching in the raw legs (uncovered files plus MemBuffer), computed by scanning those legs during planning or as a runtime dynamic filter. #400 (newest-first bound) does not help: few matches never fill a page.
+
 ### R4 — Monitoring (continuous)
 
 - TimeFusion dashboard: monoscope project `87576849`, dashboard `8e2deff2`.
