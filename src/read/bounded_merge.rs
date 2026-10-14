@@ -625,7 +625,7 @@ pub(crate) async fn narrow_ascending_fetch(
     planner: &datafusion::physical_planner::DefaultPhysicalPlanner,
 ) -> Result<Arc<dyn ExecutionPlan>> {
     use datafusion::physical_planner::PhysicalPlanner;
-    let Some((page, column, scan)) = ascending_page(logical) else { return Ok(full) };
+    let Some((page, column, scan)) = latest_page(logical, true) else { return Ok(full) };
     if full.properties().partitioning.partition_count() != 1 {
         return Ok(full);
     }
@@ -647,7 +647,7 @@ pub(crate) async fn narrow_ascending_fetch(
     if skipped == 0 {
         return Ok(full);
     }
-    let narrowed = state.optimize(&with_upper_bound(logical, &column, bound)?)?;
+    let narrowed = state.optimize(&with_bound(logical, &column, bound, true)?)?;
     let narrow = planner.create_physical_plan(&narrowed, state).await?;
     if narrow.schema() != full.schema() {
         return Ok(full);
@@ -656,16 +656,50 @@ pub(crate) async fn narrow_ascending_fetch(
     Ok(Arc::new(NarrowedFetchExec { narrow, full, rows: page.rows, total_files: files.len(), skipped, metrics: ExecutionPlanMetricsSet::new() }))
 }
 
+/// Newest-first latest-N (`ORDER BY ts DESC LIMIT n`) under an indexed predicate reads every
+/// match in the window to keep the newest `n`: a 30-day list of a few hundred errors decoded a
+/// whole day of matches. The search index names the timestamp of the newest matches; the same
+/// query is planned again with `ts >= bound`. Exact for the same reason as the ascending case
+/// (a full page holds every row at or after its last timestamp), so the bound is only a
+/// heuristic: a short page falls back to the full plan.
+pub(crate) async fn narrow_descending_fetch(
+    logical: &datafusion::logical_expr::LogicalPlan, full: Arc<dyn ExecutionPlan>, state: &datafusion::execution::SessionState,
+    planner: &datafusion::physical_planner::DefaultPhysicalPlanner,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    use datafusion::physical_planner::PhysicalPlanner;
+    let Some((page, column, scan)) = latest_page(logical, false) else { return Ok(full) };
+    if full.properties().partitioning.partition_count() != 1 {
+        return Ok(full);
+    }
+    let Some(table) = datafusion::datasource::source_as_provider(&scan.source).ok() else { return Ok(full) };
+    let Some(table) = downcast::<crate::database::ProjectRoutingTable>(&*table) else { return Ok(full) };
+    let Some((lo, hi)) = crate::database::filters_time_range(&scan.filters) else { return Ok(full) };
+    let Some(bound) = table.newest_match_bound(&scan.filters, page.rows.saturating_mul(NARROW_ROW_MARGIN)).await else { return Ok(full) };
+    // Worth a second plan only when it drops most of the window.
+    if bound.saturating_sub(lo) < hi.saturating_sub(lo) / 2 {
+        return Ok(full);
+    }
+    let narrowed = state.optimize(&with_bound(logical, &column, bound, false)?)?;
+    let narrow = planner.create_physical_plan(&narrowed, state).await?;
+    if narrow.schema() != full.schema() {
+        return Ok(full);
+    }
+    metrics::counter!("timefusion_narrowed_desc_fetch_planned_total").increment(1);
+    Ok(Arc::new(NarrowedFetchExec { narrow, full, rows: page.rows, total_files: 0, skipped: 0, metrics: ExecutionPlanMetricsSet::new() }))
+}
+
 struct AscendingPage {
     /// Rows the whole query returns when the window holds enough of them.
     rows: usize,
 }
 
-/// `[Projection|Limit|SubqueryAlias]* -> Sort(ts ASC, fetch) -> [Projection|Filter|SubqueryAlias]* -> TableScan`.
+/// `[Projection|Limit|SubqueryAlias]* -> Sort(ts ASC|DESC, fetch) -> [Projection|Filter|SubqueryAlias]* -> TableScan`.
 /// Anything that could pick or drop rows by something other than the sort key (aggregates,
-/// DISTINCT ON, windows, joins, inner limits) disqualifies the plan: a `ts <= bound` filter
+/// DISTINCT ON, windows, joins, inner limits) disqualifies the plan: a bound on `ts`
 /// below it could change which rows it keeps.
-fn ascending_page(plan: &datafusion::logical_expr::LogicalPlan) -> Option<(AscendingPage, datafusion::common::Column, &datafusion::logical_expr::TableScan)> {
+fn latest_page(
+    plan: &datafusion::logical_expr::LogicalPlan, ascending: bool,
+) -> Option<(AscendingPage, datafusion::common::Column, &datafusion::logical_expr::TableScan)> {
     use datafusion::logical_expr::{Expr, LogicalPlan};
     let (mut node, mut skip, mut limit) = (plan, 0usize, None::<usize>);
     let sort = loop {
@@ -689,7 +723,7 @@ fn ascending_page(plan: &datafusion::logical_expr::LogicalPlan) -> Option<(Ascen
     };
     let lead = sort.expr.first()?;
     let Expr::Column(column) = &lead.expr else { return None };
-    if !lead.asc {
+    if lead.asc != ascending {
         return None;
     }
     let fetch = sort.fetch?;
@@ -707,9 +741,10 @@ fn ascending_page(plan: &datafusion::logical_expr::LogicalPlan) -> Option<(Ascen
     (rows > 0).then(|| (AscendingPage { rows }, column.clone(), scan))
 }
 
-/// `plan` with `column <= bound` above its table scan, typed like the scanned column.
-fn with_upper_bound(
-    plan: &datafusion::logical_expr::LogicalPlan, column: &datafusion::common::Column, bound: i64,
+/// `plan` with `column <= bound` (`upper`) or `column >= bound` above its table scan, typed
+/// like the scanned column.
+fn with_bound(
+    plan: &datafusion::logical_expr::LogicalPlan, column: &datafusion::common::Column, bound: i64, upper: bool,
 ) -> Result<datafusion::logical_expr::LogicalPlan> {
     use datafusion::logical_expr::{LogicalPlan, LogicalPlanBuilder, col, lit};
     plan.clone()
@@ -718,7 +753,8 @@ fn with_upper_bound(
             let field = scan.projected_schema.field_with_unqualified_name(&column.name)?;
             let value = ScalarValue::TimestampMicrosecond(Some(bound), None).cast_to(field.data_type())?;
             let scanned = datafusion::common::Column::new(Some(scan.table_name.clone()), column.name.clone());
-            Ok(Transformed::yes(LogicalPlanBuilder::from(node.clone()).filter(col(scanned).lt_eq(lit(value)))?.build()?))
+            let bounded = if upper { col(scanned).lt_eq(lit(value)) } else { col(scanned).gt_eq(lit(value)) };
+            Ok(Transformed::yes(LogicalPlanBuilder::from(node.clone()).filter(bounded)?.build()?))
         })
         .data()
 }

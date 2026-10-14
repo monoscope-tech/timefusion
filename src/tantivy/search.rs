@@ -595,6 +595,62 @@ impl TantivySearchService {
         Ok(Ok(SearchResult { hits: all_hits, indexed_rows, covered_files, zero_hit_files, row_selections, field_coverage_gap }))
     }
 
+    /// The timestamp of the `n`-th newest indexed match of `node` in `time_range`, or `None`
+    /// when the warm indexes hold fewer. A lower bound for a newest-first page whose
+    /// soundness never depends on it (a short page falls back), so cold indexes are skipped
+    /// rather than installed.
+    pub async fn nth_newest_timestamp(
+        self: &Arc<Self>, table: &str, project_id: &str, node: &PredNode, n: usize, time_range: Option<(i64, i64)>,
+    ) -> Result<Option<i64>> {
+        let m = self.load_manifest_cached(table, project_id, time_range.and_then(|(lo, hi)| crate::tantivy::shard_dates(lo, hi))).await?;
+        let redundant = m.redundant_keys();
+        let range_reads = self.config.range_reads();
+        let work: Vec<_> = m
+            .entries
+            .iter()
+            .filter(|(key, e)| e.schema_version == SCHEMA_VERSION && !redundant.contains(*key) && usable_entry(e))
+            .filter_map(|(key, e)| {
+                let blob = e.index.as_ref().filter(|_| entry_overlaps(e.min_timestamp_micros, e.max_timestamp_micros, time_range))?;
+                let window =
+                    time_range.filter(|&(lo, hi)| !(e.min_timestamp_micros.is_some_and(|m| m >= lo) && e.max_timestamp_micros.is_some_and(|m| m <= hi)));
+                Some((key.clone(), blob.clone(), window, e.bundle_head))
+            })
+            .filter(|(key, blob, _, bundle)| (range_reads && bundle.is_some()) || has_any_segment(&self.cache_dir(table, project_id, file_uuid(key), blob)))
+            .collect();
+        let mut newest: Vec<i64> = futures::stream::iter(work.into_iter().map(|(key, blob, window, bundle)| async move {
+            let opened = self.open_index(table, project_id, file_uuid(&key), &blob, bundle).await?;
+            let bundled = opened.is_left();
+            let (me, node) = (Arc::clone(self), node.clone());
+            tokio::task::spawn_blocking(move || -> Result<Vec<i64>> {
+                let (index, reader) = me.opened(opened)?;
+                let PredsQuery::Query(q) = build_node_query(&index, &node)? else { return Ok(Vec::new()) };
+                let searcher = reader.searcher();
+                if bundled {
+                    super::hotcache::warm(&searcher, &*q)?;
+                }
+                let q: Box<dyn Query> = match window {
+                    None => q,
+                    Some((lo, hi)) => Box::new(BooleanQuery::new(vec![
+                        (Occur::Must, q),
+                        (Occur::Must, Box::new(RangeQuery::new_i64_bounds(TS_FIELD.into(), Bound::Included(lo), Bound::Included(hi)))),
+                    ])),
+                };
+                let top =
+                    searcher.search(&*q, &TopDocs::with_limit(n).order_by_fast_field::<i64>(TS_FIELD, Order::Desc)).map_err(|e| anyhow!("newest: {e}"))?;
+                Ok(top.into_iter().map(|(ts, _)| ts).collect())
+            })
+            .await?
+        }))
+        .buffer_unordered(self.config.search_concurrency())
+        .try_concat()
+        .await?;
+        if n == 0 || newest.len() < n {
+            return Ok(None);
+        }
+        newest.select_nth_unstable_by(n - 1, |a, b| b.cmp(a));
+        Ok(Some(newest[n - 1]))
+    }
+
     /// Warm the local disk cache with every blob whose data is at most `days`
     /// old, across all projects of `table`. Best-effort: individual blob
     /// failures are skipped. Returns the number of blobs warmed.
@@ -1194,7 +1250,7 @@ mod tests {
 // by the Delta sidecar search and the MemBuffer bucket index.
 
 use tantivy::{
-    Searcher, TantivyDocument, Term,
+    Order, Searcher, TantivyDocument, Term,
     collector::TopDocs,
     query::{BooleanQuery, Occur, Query, QueryParser, RangeQuery, TermQuery},
     schema::{Field, FieldType, IndexRecordOption, Value},

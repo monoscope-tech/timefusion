@@ -110,6 +110,16 @@ impl ProjectRoutingTable {
         filters.iter().find_map(crate::read::optimizers::extract_project_id_from_expr)
     }
 
+    /// The timestamp of the `n`-th newest match the search index holds for `filters`, the
+    /// lower bound a newest-first page is narrowed to. `None` without an indexable predicate.
+    pub(crate) async fn newest_match_bound(&self, filters: &[Expr], n: usize) -> Option<i64> {
+        let optimized = self.apply_time_series_optimizations(filters).ok()?;
+        let tree = crate::tantivy::udf::collect_text_match_tree(&optimized)?;
+        let project = self.extract_project_id_from_filters(&optimized).unwrap_or_else(|| self.default_project.clone());
+        let svc = self.database.tantivy_search()?;
+        svc.nth_newest_timestamp(&self.table_name, &project, &tree, n, filters_time_range(&optimized)).await.ok().flatten()
+    }
+
     /// `(min, max, rows)` of `column` for each live Delta file of the filtered project that
     /// overlaps the filtered window, from the add actions' statistics. `None` when any such
     /// file lacks them. Rows are physical (`num_records`), an estimate under deletion vectors.

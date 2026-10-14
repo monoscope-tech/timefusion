@@ -936,3 +936,103 @@ async fn tantivy_id_list_costs_rows_not_planning(row_selection: bool, with_dv: b
     assert!(routed < bypass * 12, "a 1,000-id prefilter must not dominate planning: routed {routed:?} vs unrouted {bypass:?}");
     Ok(())
 }
+
+/// `(timestamp, id, level)` rows, each in its own day's partition.
+fn timed_batch(project: &str, rows: &[(i64, String, &str)]) -> RecordBatch {
+    let records = rows
+        .iter()
+        .map(|(ts, id, level)| {
+            json!({
+                "timestamp": ts, "id": id, "name": "n", "level": level, "status_message": "m",
+                "project_id": project, "hashes": [], "summary": vec![format!("summary for {id}")],
+                "date": chrono::DateTime::from_timestamp_micros(*ts).expect("valid").date_naive().to_string(),
+            })
+        })
+        .collect();
+    json_to_batch(records).expect("json_to_batch")
+}
+
+/// Ids in result order.
+async fn ordered_ids(ctx: &SessionContext, sql: &str) -> Result<Vec<String>> {
+    let batches = ctx.sql(sql).await?.collect().await?;
+    Ok(batches
+        .iter()
+        .flat_map(|b| {
+            let ids = arrow::compute::cast(b.column(0), &arrow::datatypes::DataType::Utf8).expect("utf8");
+            (0..ids.len()).map(move |i| ids.as_string::<i32>().value(i).to_string()).collect::<Vec<_>>()
+        })
+        .collect())
+}
+
+/// Ids of `sql` and the `fell_back` count of its `NarrowedFetchExec`, which must be planned.
+async fn narrowed_page(ctx: &SessionContext, sql: &str) -> Result<(Vec<String>, usize)> {
+    let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+    let shown = datafusion::physical_plan::displayable(plan.as_ref()).indent(true).to_string();
+    assert!(shown.contains("NarrowedFetchExec"), "the page must be narrowed to the index bound:\n{shown}");
+    let batches = datafusion::physical_plan::collect(std::sync::Arc::clone(&plan), ctx.task_ctx()).await?;
+    let ids = batches
+        .iter()
+        .flat_map(|b| {
+            let ids = arrow::compute::cast(b.column(0), &arrow::datatypes::DataType::Utf8).expect("utf8");
+            (0..ids.len()).map(move |i| ids.as_string::<i32>().value(i).to_string()).collect::<Vec<_>>()
+        })
+        .collect();
+    let mut fell_back = 0;
+    datafusion::physical_plan::accept(plan.as_ref(), &mut FellBack(&mut fell_back))?;
+    Ok((ids, fell_back))
+}
+
+struct FellBack<'a>(&'a mut usize);
+
+impl datafusion::physical_plan::ExecutionPlanVisitor for FellBack<'_> {
+    type Error = datafusion::error::DataFusionError;
+    fn pre_visit(&mut self, plan: &dyn datafusion::physical_plan::ExecutionPlan) -> Result<bool, Self::Error> {
+        if plan.name() == "NarrowedFetchExec" {
+            *self.0 += plan.metrics().and_then(|m| m.sum_by_name("fell_back")).map_or(0, |v| v.as_usize());
+        }
+        Ok(true)
+    }
+}
+
+/// A newest-first page under an indexed predicate over a wide window is planned again from
+/// the index's newest matches (`ts >= bound`), fills without falling back, and must equal the
+/// full scan, deletions included.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_newest_first_page_narrows_to_the_index_bound_and_matches_baseline() -> Result<()> {
+    let id = uuid::Uuid::new_v4().to_string()[..8].to_string();
+    let (on, ctx, svc) = build_db(&format!("{id}-desc-on"), true).await?;
+    let (off, ctx_off, _) = build_db(&format!("{id}-desc-off"), false).await?;
+    let p = unique_project();
+    let (now, step) = (chrono::Utc::now().timestamp_micros(), 80 * 60_000_000i64);
+    // 120 errors, one every 80 minutes over ~6.7 days, each beside an INFO filler.
+    let rows: Vec<(i64, String, &str)> =
+        (0..120i64).flat_map(|i| [(now - i * step, format!("e{i}"), "ERROR"), (now - i * step - 1, format!("i{i}"), "INFO")]).collect();
+    for db in [&on, &off] {
+        db.insert_records_batch(&p, TABLE, vec![timed_batch(&p, &rows)], false, None).await?;
+        flush_all(db).await?;
+    }
+    // Every flushed row must be indexed before the page asks the index for its bound.
+    let store = svc.expect("tantivy").object_store.clone();
+    for _ in 0..150 {
+        if wait_for_manifest_entries(store.as_ref(), &p, 1).await?.entries.values().map(|e| e.rows).sum::<u64>() >= rows.len() as u64 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    let page = format!(
+        "SELECT id FROM {TABLE} WHERE project_id='{p}' AND timestamp BETWEEN to_timestamp_micros({}) AND to_timestamp_micros({now}) AND level = 'ERROR' ORDER BY timestamp DESC LIMIT 2",
+        now - 7 * 24 * 3_600_000_000
+    );
+    assert_eq!(narrowed_page(&ctx, &page).await?, (vec!["e0".to_string(), "e1".to_string()], 0), "narrowed, and filled without falling back");
+    assert_eq!(ordered_ids(&ctx, &page).await?, ordered_ids(&ctx_off, &page).await?);
+
+    // Deleting the eight newest errors must not surface them, whichever way the page is filled
+    // (the short-page fallback itself is `NarrowedFetchExec`'s, shared with the ascending case).
+    let gone = (0..8).map(|i| format!("'e{i}'")).collect::<Vec<_>>().join(",");
+    for ctx in [&ctx, &ctx_off] {
+        ctx.sql(&format!("DELETE FROM {TABLE} WHERE project_id='{p}' AND id IN ({gone})")).await?.collect().await?;
+    }
+    assert_eq!(ordered_ids(&ctx, &page).await?, ["e8", "e9"]);
+    assert_eq!(ordered_ids(&ctx, &page).await?, ordered_ids(&ctx_off, &page).await?);
+    Ok(())
+}
