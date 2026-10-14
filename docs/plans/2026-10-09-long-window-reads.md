@@ -667,6 +667,13 @@ Open leads:
 2. **30-day http500 list ~1 s** (24k matches). The newest 501 are all today's, and 1 day costs the same as 30 days, so the cost is reading today's unconsolidated partition, not the window.
 3. **`BETWEEN` makes a closed window hybrid.** The inclusive upper bound becomes a 1 µs raw leg: ~0.3 s on a single day. Only custom closed ranges hit it; relative windows end at now anyway.
 
+### 10-14 results
+
+- #399 requeues today's closed rollup slices whose witness moved. Shipbubble's 24h log-explorer histogram went from 1.2–1.4 s (hybrid over stale 05:00/09:00 holes) to 0.36–0.51 s. BaseRollup starts settled at ~21/30 min afterwards, so the requeue does not cycle. This closes open lead 1 of 10-13.
+- #400 narrows a newest-first page under an indexed predicate to the search index's newest matches: `ts >= bound` from per-index `TopDocs` on `_timestamp`, falling back when the page is short. Shipbubble http-500 newest 501 at 7–30d went from 1.5–2.3 s to 0.63–0.76 s, and ERROR at 30d from ~1.0 s to 0.61 s. This closes open lead 2.
+- Remaining systematic cost: the first query after a deploy is cold (2.4–3.7 s, mostly opening tantivy readers for older indexes). The column warmer does not cover index readers. Real-user slow reads, daytime: ~6/h, mostly the demo project's adjacent-trace lookup, which monoscope #675 fixes.
+- Local env note: when OrbStack wedges it keeps holding :9000 with no container, and every MinIO-backed test hangs. `orb stop && orb start`, then `make minio-start`.
+
 ### R4 — Monitoring (continuous)
 
 - TimeFusion dashboard: monoscope project `87576849`, dashboard `8e2deff2`.
