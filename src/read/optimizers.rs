@@ -928,9 +928,17 @@ use crate::tantivy::{
     udf::{NGRAM_MIN_QUERY_LEN, TEXT_MATCH_NAME, TextMatchUdf, classify_like_pattern, is_eq_term_safe, regex_literal_substring},
 };
 
-/// Per-column index facts: the resolved tokenizer, and whether the *stored*
-/// column is a plain string (the latter gates regex routing).
-type IndexedCol = (&'static str, bool);
+/// Per-column index facts: the resolved tokenizer, and the text the index holds.
+type IndexedCol = (&'static str, Stored);
+
+/// What an index's text is for its column: the string itself, a Variant's canonical JSON
+/// (`variant_to_json`), or a rendering no SQL expression reproduces.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Stored {
+    Text,
+    VariantJson,
+    Other,
+}
 type IndexedCols = HashMap<String, IndexedCol>;
 
 #[derive(Debug, Default)]
@@ -1061,8 +1069,10 @@ fn match_indexed_predicate(expr: &Expr, indexed_columns: &IndexedCols, allow_eq:
             Some((c.name.clone(), eq_term_route(rhs)?))
         }
         Expr::Like(Like { negated: false, expr: l, pattern: r, escape_char, case_insensitive }) => {
-            let Expr::Column(c) = l.as_ref() else { return None };
-            let tok = indexed_columns.get(&c.name)?.0;
+            let (c, tok) = match l.as_ref() {
+                Expr::Column(c) => (c, indexed_columns.get(&c.name)?.0),
+                other => indexed_text(other, indexed_columns)?,
+            };
             // ILIKE on raw (case-sensitive single token) is not accelerable
             // without a parallel case-insensitive index. Other tokenizers
             // lowercase both index and query side, so ILIKE needs no extra work.
@@ -1087,10 +1097,9 @@ fn match_indexed_predicate(expr: &Expr, indexed_columns: &IndexedCols, allow_eq:
         // substring query: ngram3 lowercases + ASCII-folds both sides, so its hit
         // set is a superset of both. Only PLAIN substrings route.
         Expr::BinaryExpr(BinaryExpr { left, op: Operator::RegexMatch | Operator::RegexIMatch, right }) => {
-            let c = column_through_string_cast(left)?;
-            let (tok, text_typed) = *indexed_columns.get(&c.name)?;
+            let (c, tok) = indexed_text(left, indexed_columns)?;
             let Expr::Literal(s, _) = right.as_ref() else { return None };
-            (tok == NGRAM3_TOKENIZER && text_typed)
+            (tok == NGRAM3_TOKENIZER)
                 .then(|| regex_literal_substring(utf8_scalar(s)?).filter(|q| q.chars().count() >= NGRAM_MIN_QUERY_LEN))
                 .flatten()
                 .map(|q| (c.name.clone(), Route::Ready(q)))
@@ -1099,12 +1108,25 @@ fn match_indexed_predicate(expr: &Expr, indexed_columns: &IndexedCols, allow_eq:
     }
 }
 
-/// The column under zero or more string casts, which are value-preserving for
-/// string types (non-string sources are rejected by the `text_typed` gate).
-fn column_through_string_cast(e: &Expr) -> Option<&Column> {
-    match e {
-        Expr::Column(c) => Some(c),
-        Expr::Cast(Cast { expr, field }) | Expr::TryCast(TryCast { expr, field }) if is_text_type(field.data_type()) => column_through_string_cast(expr),
+/// The indexed column `e` reads as exactly the text its index holds, with its tokenizer:
+/// a string column under value-preserving string casts, or a JSON-indexed Variant read as
+/// text. This rule runs before `coerce_variant_value_positions`, which lowers every text
+/// read of a Variant to `variant_to_json` — the serializer the index renders with.
+fn indexed_text<'a>(e: &'a Expr, indexed_columns: &IndexedCols) -> Option<(&'a Column, &'static str)> {
+    let (c, json) = match e {
+        Expr::Cast(Cast { expr, field }) | Expr::TryCast(TryCast { expr, field }) if is_text_type(field.data_type()) => {
+            return indexed_text(expr, indexed_columns);
+        }
+        Expr::Column(c) => (c, false),
+        Expr::ScalarFunction(sf) if sf.name() == "variant_to_json" => match sf.args.as_slice() {
+            [Expr::Column(c)] => (c, true),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    match *indexed_columns.get(&c.name)? {
+        (tok, Stored::VariantJson) => Some((c, tok)),
+        (tok, Stored::Text) if !json => Some((c, tok)),
         _ => None,
     }
 }
@@ -1147,7 +1169,12 @@ fn indexed_columns_for(table: &str) -> Option<&'static IndexedCols> {
                                 Some(DEFAULT_TOKENIZER) => DEFAULT_TOKENIZER,
                                 _ => NGRAM3_TOKENIZER,
                             };
-                            Some((f.name.clone(), (tok, matches!(f.data_type.as_str(), "Utf8" | "LargeUtf8" | "Utf8View"))))
+                            let stored = match f.data_type.as_str() {
+                                "Utf8" | "LargeUtf8" | "Utf8View" => Stored::Text,
+                                "Variant" if cfg.flatten.as_deref() != Some("kv") => Stored::VariantJson,
+                                _ => Stored::Other,
+                            };
+                            Some((f.name.clone(), (tok, stored)))
                         })
                         .collect();
                     (!cols.is_empty()).then_some((name, cols))
@@ -1188,10 +1215,16 @@ mod tantivy_rewriter_tests {
     /// `tid`/`sid` raw-tokenized, `name` ngram3, all text-typed; `body` is ngram3
     /// but NOT text-typed (a Variant/List column). `unindexed` is absent.
     fn cols() -> IndexedCols {
-        [("tid", RAW_TOKENIZER, true), ("sid", RAW_TOKENIZER, true), ("name", NGRAM3_TOKENIZER, true), ("body", NGRAM3_TOKENIZER, false)]
-            .into_iter()
-            .map(|(k, tok, text)| (k.to_string(), (tok, text)))
-            .collect()
+        [
+            ("tid", RAW_TOKENIZER, Stored::Text),
+            ("sid", RAW_TOKENIZER, Stored::Text),
+            ("name", NGRAM3_TOKENIZER, Stored::Text),
+            ("body", NGRAM3_TOKENIZER, Stored::VariantJson),
+            ("summary", NGRAM3_TOKENIZER, Stored::Other),
+        ]
+        .into_iter()
+        .map(|(k, tok, stored)| (k.to_string(), (tok, stored)))
+        .collect()
     }
 
     fn col(name: &str) -> Expr {
@@ -1210,6 +1243,20 @@ mod tantivy_rewriter_tests {
     fn re(c: &str, op: Operator, pat: &str, cast: bool) -> Expr {
         let lhs = if cast { Expr::Cast(Cast::new(Box::new(col(c)), DataType::Utf8)) } else { col(c) };
         Expr::BinaryExpr(BinaryExpr::new(Box::new(lhs), op, Box::new(lit(pat))))
+    }
+
+    /// `variant_to_json(col)::text`, as the planner renders `body::text`.
+    fn json_text(c: &str) -> Expr {
+        let udf = Arc::new(ScalarUDF::new_from_impl(datafusion_variant::VariantToJsonUdf::default()));
+        Expr::Cast(Cast::new(Box::new(Expr::ScalarFunction(ScalarFunction::new_udf(udf, vec![col(c)]))), DataType::Utf8View))
+    }
+
+    fn json_re(c: &str, op: Operator, pat: &str) -> Expr {
+        Expr::BinaryExpr(BinaryExpr::new(Box::new(json_text(c)), op, Box::new(lit(pat))))
+    }
+
+    fn json_ilike(c: &str, pat: &str) -> Expr {
+        Expr::Like(Like { negated: false, expr: Box::new(json_text(c)), pattern: Box::new(lit(pat)), escape_char: None, case_insensitive: true })
     }
 
     fn in_list(c: &str, items: &[&str], negated: bool) -> Expr {
@@ -1251,9 +1298,12 @@ mod tantivy_rewriter_tests {
     #[test_case(re("name", Operator::RegexIMatch, "", true), true => None ; "empty pattern")]
     #[test_case(re("name", Operator::RegexIMatch, "a\\", true), true => None ; "trailing backslash")]
     #[test_case(re("tid", Operator::RegexIMatch, "abcdef", true), true => None ; "regex never routes on a raw column")]
-    // Variant/List (not text-typed): the index holds our own rendering, which
-    // `::text` need not reproduce.
-    #[test_case(re("body", Operator::RegexIMatch, "boom", true), true => None ; "non-text column never routes")]
+    // A List's index holds a joined rendering `::text` does not reproduce.
+    #[test_case(re("body", Operator::RegexIMatch, "boom", true), true => ready("body", "boom") ; "a Variant's text cast is lowered to its JSON")]
+    #[test_case(re("summary", Operator::RegexIMatch, "boom", true), true => None ; "a list's joined rendering is not its text")]
+    #[test_case(json_re("body", Operator::RegexIMatch, "boom"), true => ready("body", "boom") ; "variant_to_json regex routes on a JSON index")]
+    #[test_case(json_ilike("body", "%boom%"), true => ready("body", "boom") ; "variant_to_json ILIKE routes on a JSON index")]
+    #[test_case(json_re("name", Operator::RegexIMatch, "boom"), true => None ; "variant_to_json of a text column is not its index text")]
     fn match_indexed_predicate_cases(expr: Expr, allow_eq: bool) -> Option<(String, Route)> {
         match_indexed_predicate(&expr, &cols(), allow_eq)
     }

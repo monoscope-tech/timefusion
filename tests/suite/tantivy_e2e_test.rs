@@ -1125,3 +1125,56 @@ async fn a_mutable_predicate_narrows_to_candidate_timestamps_without_ghosts() ->
     }
     Ok(())
 }
+
+/// `body contains "x"` reaches TimeFusion as `body::text ~* 'x'`, planned as
+/// `variant_to_json(body)`; the JSON body index holds that same text, so the search routes
+/// and must equal the unindexed answer, MemBuffer rows and case variants included.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_body_text_search_routes_through_the_json_index() -> Result<()> {
+    use timefusion::{
+        database::scan_metric_names::PREFILTER_USED,
+        observability::{counter_value, init_local_metrics_for_test},
+    };
+    init_local_metrics_for_test();
+    let id = uuid::Uuid::new_v4().to_string()[..8].to_string();
+    let (on, ctx, svc) = build_db(&format!("{id}-body-on"), true).await?;
+    let (off, ctx_off, _) = build_db(&format!("{id}-body-off"), false).await?;
+    let p = unique_project();
+    let now = chrono::Utc::now().timestamp_micros();
+    let batch = |rows: &[(i64, &str, &str)]| -> Result<RecordBatch> {
+        let base = timed_batch(&p, &rows.iter().map(|(minutes, id, _)| (now - minutes * 60_000_000, id.to_string(), "INFO")).collect::<Vec<_>>());
+        let at = base.schema().index_of("body")?;
+        let mut columns = base.columns().to_vec();
+        columns[at] = super::tantivy_index_test::build_variant(rows.iter().map(|(.., body)| *body).collect());
+        Ok(RecordBatch::try_new(base.schema(), columns)?)
+    };
+    let mut flushed = vec![(1, "hit-upper", r#"{"msg":"upstream TIMEOUT"}"#), (2, "hit-nested", r#"{"err":{"kind":"timeout"}}"#)];
+    flushed.extend((0..40).map(|i| (3 + i, "", r#"{"msg":"ok"}"#)));
+    let ids: Vec<String> = (0..40).map(|i| format!("ok{i}")).collect();
+    flushed.iter_mut().skip(2).zip(&ids).for_each(|(row, id)| row.1 = id);
+    for db in [&on, &off] {
+        db.insert_records_batch(&p, TABLE, vec![batch(&flushed)?], false, None).await?;
+        flush_all(db).await?;
+    }
+    let store = svc.expect("tantivy").object_store.clone();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    while timefusion::tantivy::load_manifest(store.as_ref(), TABLE, &p).await?.entries.values().map(|e| e.rows).sum::<u64>() < flushed.len() as u64 {
+        anyhow::ensure!(tokio::time::Instant::now() < deadline, "the flushed body must be indexed");
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    for db in [&on, &off] {
+        db.insert_records_batch(&p, TABLE, vec![batch(&[(0, "hit-buffered", r#"{"msg":"read timeout"}"#)])?], false, None).await?;
+    }
+    for predicate in ["body::text ~* 'timeout'", "body::text ILIKE '%timeout%'"] {
+        let sql = format!(
+            "SELECT id FROM {TABLE} WHERE project_id='{p}' AND timestamp BETWEEN to_timestamp_micros({}) AND to_timestamp_micros({now}) AND {predicate} ORDER BY timestamp DESC",
+            now - 3 * 3_600_000_000
+        );
+        let before = counter_value(PREFILTER_USED);
+        let ids = ordered_ids(&ctx, &sql).await?;
+        assert_eq!(counter_value(PREFILTER_USED), before + 1, "{predicate} must route through the body index");
+        assert_eq!(ids, ["hit-buffered", "hit-upper", "hit-nested"], "{predicate}");
+        assert_eq!(ids, ordered_ids(&ctx_off, &sql).await?);
+    }
+    Ok(())
+}

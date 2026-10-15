@@ -1016,7 +1016,8 @@ impl ProjectRoutingTable {
         // `decide_prefilter` therefore refuses mutable predicates entirely.
         let mutable = Self::version_mutable_columns(&self.table_name);
         let unstripped_filters = filters;
-        let filters: Vec<Expr> = filters.iter().filter(|f| Self::leg_safe(&self.table_name, mutable.as_ref(), f)).cloned().collect();
+        let filters: Vec<Expr> =
+            filters.iter().filter(|f| Self::leg_safe(&self.table_name, mutable.as_ref(), f) && !self.references_variant(f)).cloned().collect();
         let mut optimized_filters = self.apply_time_series_optimizations(&filters)?;
 
         let project_id = self.extract_project_id_from_filters(&optimized_filters).unwrap_or_else(|| self.default_project.clone());
@@ -1024,12 +1025,10 @@ impl ProjectRoutingTable {
 
         // Tantivy prefilter, two independent paths: the Delta side builds `id IN (delta_ids)`
         // for the Delta scan only (MemBuffer rows are never indexed, so applying it there would
-        // drop valid rows); the MemBuffer side prefilters under its own bucket lock. On a MOR
-        // table keep the unstripped tree so mutable predicates can be detected.
-        let text_match_tree = match mutable.is_some() {
-            false => crate::tantivy::udf::collect_text_match_tree(&optimized_filters),
-            true => crate::tantivy::udf::collect_text_match_tree(&self.apply_time_series_optimizations(unstripped_filters)?),
-        };
+        // drop valid rows); the MemBuffer side prefilters under its own bucket lock. The tree
+        // comes from the unstripped filters: mutable predicates must be detected, and a Variant
+        // column's `text_match` never reaches the legs.
+        let text_match_tree = crate::tantivy::udf::collect_text_match_tree(&self.apply_time_series_optimizations(unstripped_filters)?);
         // Query [lo,hi] timestamp window, shared by the tantivy prefilter and the skip-delta
         // watermark check below.
         let query_time_range = filters_time_range(&optimized_filters);
@@ -1668,6 +1667,11 @@ impl ProjectRoutingTable {
             }
         }
         mutable.is_none_or(|m| safe(f, m, crate::schema::get_schema(table_name)))
+    }
+
+    /// Does `f` read a Variant column? The Delta legs cannot evaluate such a predicate.
+    fn references_variant(&self, f: &Expr) -> bool {
+        f.column_refs().iter().any(|c| self.schema.field_with_name(&c.name).is_ok_and(|field| crate::schema::is_variant_type(field.data_type())))
     }
 
     /// May `f` run on a scan leg below the dedup: no tombstone reference, and [`Self::version_safe`].
@@ -2401,18 +2405,17 @@ impl TableProvider for ProjectRoutingTable {
 
     fn supports_filters_pushdown(&self, filter: &[&Expr]) -> DFResult<Vec<TableProviderFilterPushDown>> {
         // The delta-kernel scan cannot evaluate predicates on Variant columns, so mark those
-        // filters `Unsupported` and let DataFusion apply them in a FilterExec above the scan.
-        let variant_cols: HashSet<String> = crate::schema::registry()
-            .get(&self.table_name)
-            .map(|s| s.schema_ref().fields().iter().filter(|f| crate::schema::is_variant_type(f.data_type())).map(|f| f.name().clone()).collect())
-            .unwrap_or_default();
+        // filters `Unsupported` and let DataFusion apply them in a FilterExec above the scan —
+        // except `text_match`, which `scan()` routes to the index and keeps off the legs.
         let mutable = Self::version_mutable_columns(&self.table_name);
         Ok(filter
             .iter()
             .map(|f| {
-                if Self::references_tombstone(&self.table_name, f)
-                    || (!variant_cols.is_empty() && f.column_refs().iter().any(|c| variant_cols.contains(&c.name)))
-                {
+                if Self::references_tombstone(&self.table_name, f) {
+                    TableProviderFilterPushDown::Unsupported
+                } else if matches!(f, Expr::ScalarFunction(sf) if sf.name() == crate::tantivy::udf::TEXT_MATCH_NAME) {
+                    TableProviderFilterPushDown::Inexact
+                } else if self.references_variant(f) {
                     TableProviderFilterPushDown::Unsupported
                 } else if mutable.as_ref().is_some_and(|m| f.column_refs().iter().any(|c| m.contains(&c.name))) {
                     // `Inexact`, not `Unsupported`: both keep a FilterExec above the scan, but

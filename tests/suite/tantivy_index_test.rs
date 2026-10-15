@@ -81,7 +81,7 @@ fn batch(rows: &[Row<'_>]) -> RecordBatch {
     RecordBatch::try_new(schema, vec![ts, id, level, msg, summary, body, attrs]).unwrap()
 }
 
-fn build_variant(jsons: Vec<&str>) -> ArrayRef {
+pub(crate) fn build_variant(jsons: Vec<&str>) -> ArrayRef {
     let mut b = VariantArrayBuilder::new(jsons.len());
     for j in jsons {
         if j.is_empty() {
