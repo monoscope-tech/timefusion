@@ -1069,10 +1069,7 @@ fn match_indexed_predicate(expr: &Expr, indexed_columns: &IndexedCols, allow_eq:
             Some((c.name.clone(), eq_term_route(rhs)?))
         }
         Expr::Like(Like { negated: false, expr: l, pattern: r, escape_char, case_insensitive }) => {
-            let (c, tok) = match l.as_ref() {
-                Expr::Column(c) => (c, indexed_columns.get(&c.name)?.0),
-                other => indexed_text(other, indexed_columns)?,
-            };
+            let (c, tok) = indexed_text(l, indexed_columns)?;
             // ILIKE on raw (case-sensitive single token) is not accelerable
             // without a parallel case-insensitive index. Other tokenizers
             // lowercase both index and query side, so ILIKE needs no extra work.
@@ -1282,6 +1279,7 @@ mod tantivy_rewriter_tests {
     // ILIKE on a raw (case-sensitive) column would silently miss case variants.
     #[test_case(ilike("tid", "foo"), true => None ; "ILIKE never routes on a raw column")]
     #[test_case(ilike("name", "%foo%"), true => ready("name", "foo") ; "ILIKE substring routes on ngram3")]
+    #[test_case(ilike("summary", "%boom%"), true => None ; "ILIKE never routes on an index holding another rendering")]
     #[test_case(re("name", Operator::RegexIMatch, "runServer", true), true => ready("name", "runServer") ; "cast-wrapped regex imatch on ngram3 routes")]
     #[test_case(re("name", Operator::RegexIMatch, "runServer", false), true => ready("name", "runServer") ; "bare column regex imatch routes (DataFusion may fold the no-op cast)")]
     #[test_case(re("name", Operator::RegexMatch, "runServer", true), true => ready("name", "runServer") ; "cast-wrapped regex match on ngram3 routes")]

@@ -1015,9 +1015,12 @@ impl ProjectRoutingTable {
         // the indexed leg can remove the winning version of a matching raw row.
         // `decide_prefilter` therefore refuses mutable predicates entirely.
         let mutable = Self::version_mutable_columns(&self.table_name);
-        let unstripped_filters = filters;
-        let filters: Vec<Expr> =
-            filters.iter().filter(|f| Self::leg_safe(&self.table_name, mutable.as_ref(), f) && !self.references_variant(f)).cloned().collect();
+        // A Variant predicate (only `text_match` reaches here) feeds the index alone: no leg,
+        // readmitted or not, can evaluate it.
+        let routed_filters = filters;
+        let unstripped_filters: Vec<Expr> = filters.iter().filter(|f| !self.references_variant(f)).cloned().collect();
+        let unstripped_filters = unstripped_filters.as_slice();
+        let filters: Vec<Expr> = unstripped_filters.iter().filter(|f| Self::leg_safe(&self.table_name, mutable.as_ref(), f)).cloned().collect();
         let mut optimized_filters = self.apply_time_series_optimizations(&filters)?;
 
         let project_id = self.extract_project_id_from_filters(&optimized_filters).unwrap_or_else(|| self.default_project.clone());
@@ -1028,13 +1031,13 @@ impl ProjectRoutingTable {
         // drop valid rows); the MemBuffer side prefilters under its own bucket lock. The tree
         // comes from the unstripped filters: mutable predicates must be detected, and a Variant
         // column's `text_match` never reaches the legs.
-        let text_match_tree = crate::tantivy::udf::collect_text_match_tree(&self.apply_time_series_optimizations(unstripped_filters)?);
+        let text_match_tree = crate::tantivy::udf::collect_text_match_tree(&self.apply_time_series_optimizations(routed_filters)?);
         // Query [lo,hi] timestamp window, shared by the tantivy prefilter and the skip-delta
         // watermark check below.
         let query_time_range = filters_time_range(&optimized_filters);
         if !self.database.bypass_rollup {
             let projected = projection.into_iter().flatten().filter_map(|&i| self.schema.fields().get(i)).map(|f| f.name().clone());
-            let filtered = unstripped_filters.iter().flat_map(|f| f.column_refs()).map(|c| c.name.clone());
+            let filtered = routed_filters.iter().flat_map(|f| f.column_refs()).map(|c| c.name.clone());
             // Raw legs also read the dedup and sort keys, beyond the query's own projection.
             let keys = crate::schema::get_schema(&self.table_name)
                 .into_iter()

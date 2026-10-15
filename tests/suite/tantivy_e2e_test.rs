@@ -1165,15 +1165,20 @@ async fn a_body_text_search_routes_through_the_json_index() -> Result<()> {
     for db in [&on, &off] {
         db.insert_records_batch(&p, TABLE, vec![batch(&[(0, "hit-buffered", r#"{"msg":"read timeout"}"#)])?], false, None).await?;
     }
-    for predicate in ["body::text ~* 'timeout'", "body::text ILIKE '%timeout%'"] {
+    for (predicate, expected, routed) in [
+        ("body::text ~* 'timeout'", &["hit-buffered", "hit-upper", "hit-nested"][..], true),
+        ("body::text ILIKE '%timeout%'", &["hit-buffered", "hit-upper", "hit-nested"], true),
+        // JSON punctuation is not a routable term character, so no rendering difference can drop a row.
+        (r#"body::text ILIKE '%"kind":"timeout"%'"#, &["hit-nested"], false),
+    ] {
         let sql = format!(
             "SELECT id FROM {TABLE} WHERE project_id='{p}' AND timestamp BETWEEN to_timestamp_micros({}) AND to_timestamp_micros({now}) AND {predicate} ORDER BY timestamp DESC",
             now - 3 * 3_600_000_000
         );
         let before = counter_value(PREFILTER_USED);
         let ids = ordered_ids(&ctx, &sql).await?;
-        assert_eq!(counter_value(PREFILTER_USED), before + 1, "{predicate} must route through the body index");
-        assert_eq!(ids, ["hit-buffered", "hit-upper", "hit-nested"], "{predicate}");
+        assert_eq!(counter_value(PREFILTER_USED), before + u64::from(routed), "{predicate}: routed must be {routed}");
+        assert_eq!(ids, expected, "{predicate}");
         assert_eq!(ids, ordered_ids(&ctx_off, &sql).await?);
     }
     Ok(())
