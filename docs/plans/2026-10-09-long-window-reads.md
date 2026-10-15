@@ -695,6 +695,14 @@ Prod at 11 min uptime, project 6297304f, `pat:e12e74a9`, 3 alternating runs, one
 
 Next on this lead: planning reads uncovered files, so a cold index set (right after a deploy) makes the first query slow (11.9 s). If that matters, cap the uncovered bytes and fall back.
 
+### 10-15 results (#403, #404)
+
+- **#404 scoped rollup output coverage.** Routing decoded every tier Add action for every project, twice per dashboard query. Prod, 24h shipbubble traffic widget, ≥20 min uptime: `rollup_output_coverage` 78 → 17–20 ms per query; wall 0.72 → 0.57–0.61 s (laptop, ~190 ms RTT included).
+- **Shipbubble dashboards** (12 widgets, 2 rounds, ~40 min uptime): p50 0.77 s at 7d, 0.87 s at 14d, 1.08 s at 30d; max 1.64 s. All routed hybrid.
+- **Log explorer** (unfiltered list of 500 + level histogram, warm): list 0.42–0.62 s and histogram 0.55–0.94 s at 24h–30d.
+- **Real slow log, last 24h:** the issue-page hash lists were the top user-facing shape (311 slow, p50 6.9 s), fixed by #403. The adjacent-hash trace lookups (`array_contains(hashes, $1)`, project 0000…) stop at 07:31, which fits monoscope #675. The rest is background work (billing counts on `otel_metrics`, cross-project counts, alert monitors).
+- **Cold after deploy:** the first long-window query on a fresh process is still 5–30 s (planning 3–6 s, the rest execution). The foyer disk tier survives restarts (bind mount, 86% hit rate), so the cold part is in-process state, not data.
+
 ### R4 — Monitoring (continuous)
 
 - TimeFusion dashboard: monoscope project `87576849`, dashboard `8e2deff2`.
