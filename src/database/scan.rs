@@ -548,6 +548,13 @@ impl ProjectRoutingTable {
             .map_err(|e| DataFusionError::External(Box::new(e)))?
             .filter(|uri| uri.ends_with(".parquet") && uri_date_in_window(uri, lo, hi) && !covered.contains(uri))
             .collect();
+        // Cold indexes leave their files raw, and this read happens during planning.
+        let sizes: HashMap<String, u64> = table.snapshot()?.log_data().iter().map(|f| (f.path().into_owned(), f.size() as u64)).collect();
+        let size_of = |uri: &String| sizes.get(crate::tantivy::search::parquet_rel_of_uri(uri)?);
+        debug_assert!(raw.iter().all(|uri| size_of(uri).is_some()), "every raw file must be priced");
+        if raw.iter().filter_map(size_of).sum::<u64>() > MAX_CANDIDATE_RAW_BYTES {
+            return Ok(None);
+        }
         if !raw.is_empty() {
             let columns: Vec<usize> = predicate
                 .column_refs()
@@ -2225,6 +2232,9 @@ const PREFILTER_MIN_WINDOW_MICROS: i64 = 3_600_000_000;
 /// Past this many candidate timestamps a mutable predicate is common enough that the
 /// `timestamp IN (..)` restriction would not prune, so the scan keeps its full path.
 const MAX_CANDIDATE_TIMESTAMPS: usize = 20_000;
+
+/// Uncovered bytes a mutable-membership scan may read during planning before it keeps its full path.
+const MAX_CANDIDATE_RAW_BYTES: u64 = 512 << 20;
 
 /// Charge one prefilter skip to the total AND to its reason.
 ///
