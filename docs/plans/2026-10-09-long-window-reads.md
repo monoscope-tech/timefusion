@@ -703,6 +703,20 @@ Next on this lead: planning reads uncovered files, so a cold index set (right af
 - **Real slow log, last 24h:** the issue-page hash lists were the top user-facing shape (311 slow, p50 6.9 s), fixed by #403. The adjacent-hash trace lookups (`array_contains(hashes, $1)`, project 0000…) stop at 07:31, which fits monoscope #675. The rest is background work (billing counts on `otel_metrics`, cross-project counts, alert monitors).
 - **Cold after deploy:** the first long-window query on a fresh process is still 5–30 s (planning 3–6 s, the rest execution). The foyer disk tier survives restarts (bind mount, 86% hit rate), so the cold part is in-process state, not data.
 
+### 10-15 body text search (#405)
+
+monoscope renders `body contains "x"` as `body::text ~* 'x'`. It never reached the body index: the rewriter took string-typed columns only, and every Variant filter was withheld from `scan()`. #405 routes it (same serializer as the index; original predicate kept).
+
+Prod, shipbubble, `timeout`, ~1.5 h uptime, one query at a time, versus `time[o]ut` (a regex, so never routed):
+- 1d: 7.9 s routed vs 54.0 s bypassed.
+- 3d: 16.4 s vs 71.4 s.
+- 7d and 30d: both still hit the 90 s statement timeout.
+- A common term (`error`, 1d) declines on selectivity: 0.75 s, no errors.
+
+Where the routed time goes: planning is 0.1–0.4 s; the rest is the unindexed files (~270 today, `tantivy_uncovered_files`; only 2 sealed) scanned raw with every body rendered to JSON. Today's partition is uncovered by design: `timefusion_tantivy_backfill_skip_today` avoids racing the hot-tail packer, and wave commits carry coverage forward (399/h, 0 failed) but the uncovered remainder persists.
+
+**Next lead (needs a decision on CPU):** index today's files once they stop changing (e.g. unmodified ≥30 min), or index today's body at flush and carry it through packing. Either brings 1d/7d body search toward the indexed cost, at a known tantivy CPU price.
+
 ### R4 — Monitoring (continuous)
 
 - TimeFusion dashboard: monoscope project `87576849`, dashboard `8e2deff2`.
