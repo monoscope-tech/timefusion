@@ -1123,6 +1123,15 @@ async fn a_mutable_predicate_narrows_to_candidate_timestamps_without_ghosts() ->
         assert_eq!(ids, baseline);
         assert!(narrowed <= 8 && full >= 60, "{predicate}: dedup must see only candidate versions: {narrowed} vs {full}");
     }
+    // Over the cap the search is refused, and a page polling the same hash must not pay it again.
+    let search = on.tantivy_search().expect("search service");
+    let (other, window) =
+        (timefusion::tantivy::histogram::Membership::Contains { column: "hashes".into(), value: "other".into() }, Some((now - 3 * 3_600_000_000, now)));
+    let touched = || search.stats.reader_hits.load(std::sync::atomic::Ordering::Relaxed) + search.stats.index_opens.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(search.membership_timestamps(table, &p, &other, 5, window).await?.is_none(), "60 fillers exceed a cap of 5");
+    let before = touched();
+    assert!(search.membership_timestamps(table, &p, &other, 5, window).await?.is_none());
+    assert_eq!(touched(), before, "a remembered overflow must not open an index");
     Ok(())
 }
 

@@ -623,12 +623,29 @@ impl TantivySearchService {
     pub async fn membership_timestamps(
         self: &Arc<Self>, table: &str, project_id: &str, membership: &Membership, cap: usize, time_range: Option<(i64, i64)>,
     ) -> Result<Option<(HashSet<i64>, HashSet<String>)>> {
+        // A page polling a common hash would otherwise pay the whole search every time only to
+        // overflow; the refusal is remembered like the prefilter's.
+        fn key(m: &Membership) -> PredNode {
+            match m {
+                Membership::Contains { column, value } => PredNode::Leaf(TextMatchPred { column: column.clone(), query: format!("\0member:{value}") }),
+                Membership::And(l, r) => PredNode::And(vec![key(l), key(r)]),
+                Membership::Or(l, r) => PredNode::Or(vec![key(l), key(r)]),
+            }
+        }
+        let (cap_key, width) = ((table.to_string(), project_id.to_string(), key(membership), cap), window_width(time_range));
+        if self.cap_exceeded.get(&cap_key).is_some_and(|e| e.0.elapsed() < CAP_EXCEEDED_TTL && covers_width(e.1, width)) {
+            return Ok(None);
+        }
         let membership = membership.clone();
         let query = move |index: &Index, elements: &BTreeSet<String>| {
             membership.columns().iter().all(|c| elements.contains(*c)).then(|| membership.query(&index.schema(), elements)).transpose()
         };
         let (found, covered) = self.newest_matches(table, project_id, query, cap.saturating_add(1), time_range).await?;
-        Ok((found.len() <= cap).then(|| (found.into_iter().collect(), covered)))
+        if found.len() > cap {
+            self.remember_refusal(cap_key, width, "delta_cap_exceeded_memo");
+            return Ok(None);
+        }
+        Ok(Some((found.into_iter().collect(), covered)))
     }
 
     /// Up to `n` newest match timestamps from each warm in-window index, and the files covered
