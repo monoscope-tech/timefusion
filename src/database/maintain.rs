@@ -1301,15 +1301,20 @@ impl Database {
             .collect()
     }
 
-    /// Validate output once per tier snapshot, not once per coverage interval.
+    /// Validate output once per tier snapshot, not once per coverage interval. `only` restricts
+    /// the answer to one project's cells, skipping other projects' files before decoding them.
     pub(super) fn rollup_output_coverage(
         &self, source: &str, (target, table, default_project): (&str, &DeltaTable, &str), partitions: &HashMap<(String, String), PartitionStats>,
+        only: Option<&str>,
     ) -> Result<RollupOutputCoverage> {
         let mut counts: HashMap<_, std::collections::BTreeMap<(i64, i64), RollupOutputProof>> = HashMap::new();
         let mut occupied: HashMap<BackfillCell, Vec<(i64, i64)>> = HashMap::new();
         let mut unproven: HashMap<BackfillCell, Vec<(i64, i64)>> = HashMap::new();
         let mut unknown_partition = false;
         for file in table.snapshot()?.log_data().iter() {
+            if only.is_some_and(|only| super::path_partition_value(&file.path(), "project_id").is_some_and(|project| project != only)) {
+                continue;
+            }
             let add = add_action(&file);
             let tagged = if let Some((start, end)) = Self::slice_tag_range(&add)
                 && let Some(project) = Self::tag_project(&add)
@@ -1360,7 +1365,7 @@ impl Database {
             .iter()
             .filter_map(|entry| {
                 let ((project, held_source, held_target, start, end), coverage) = (entry.key(), entry.value());
-                if held_source != source || held_target != target {
+                if held_source != source || held_target != target || only.is_some_and(|only| only != project) {
                     return None;
                 }
                 let day = chrono::DateTime::from_timestamp_micros(*start)?.date_naive();
@@ -1442,7 +1447,7 @@ impl Database {
         else {
             return Ok(HashMap::new());
         };
-        let output = self.rollup_output_coverage(source, target, partitions)?;
+        let output = self.rollup_output_coverage(source, target, partitions, None)?;
         let output = output
             .populated
             .into_iter()
@@ -3905,7 +3910,10 @@ impl Database {
         let Some(date) = chrono::DateTime::from_timestamp_micros(key.slice.start_micros).map(|time| time.date_naive()) else { return false };
         let Ok(target) = self.resolve_table(&key.project_id, &key.physical_table).await else { return false };
         let table = target.read().await;
-        let Ok(output) = self.rollup_output_coverage(&key.source, (&key.physical_table, &table, &key.project_id), &HashMap::new()) else { return false };
+        let Ok(output) = self.rollup_output_coverage(&key.source, (&key.physical_table, &table, &key.project_id), &HashMap::new(), Some(&key.project_id))
+        else {
+            return false;
+        };
         output.ranges(&key.project_id, date, &coverage).iter().any(|&(start, end)| start <= key.slice.start_micros && end >= key.slice.end_micros)
     }
 

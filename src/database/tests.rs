@@ -2215,9 +2215,12 @@ async fn an_overlapping_chain_leaves_its_disjoint_slices_proven() -> Result<()> 
     let proven = {
         let table_ref = db.get_or_create_table(&project, &tier).await?;
         let table = table_ref.read().await;
-        let output = db.rollup_output_coverage("otel_logs_and_spans", (&tier, &table, &project), &HashMap::new())?;
+        let output = db.rollup_output_coverage("otel_logs_and_spans", (&tier, &table, &project), &HashMap::new(), None)?;
         let coverage =
             db.rollup_slice_coverage.iter().find(|entry| entry.key().0 == project && entry.key().2 == tier).expect("published coverage").value().clone();
+        let scoped = |only| db.rollup_output_coverage("otel_logs_and_spans", (&tier, &table, &project), &HashMap::new(), Some(only));
+        assert_eq!(scoped(&project)?.ranges(&project, day, &coverage), output.ranges(&project, day, &coverage), "scoping must keep the project's own proof");
+        assert!(scoped("another")?.ranges(&project, day, &coverage).is_empty(), "scoping must skip other projects' files");
         output.ranges(&project, day, &coverage).to_vec()
     };
     assert_eq!(proven, [(day_start, day_start + 6 * HOUR), (day_start + 18 * HOUR, day_start + 24 * HOUR)], "only the chain's members lose their proof");

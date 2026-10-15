@@ -238,7 +238,7 @@ impl Database {
         let output_started = std::time::Instant::now();
         let output = {
             let table = target_table.read().await;
-            self.rollup_output_coverage(&route.source, (&route.target, &table, &lookup_project), &fingerprints)
+            self.rollup_output_coverage(&route.source, (&route.target, &table, &lookup_project), &fingerprints, route.project_id.as_deref())
                 .map_err(|_| crate::rollup::MissReason::IncompleteCoverage)?
         };
         crate::observability::record_plan_phase(crate::observability::PlanPhase::RollupOutputCoverage, output_started);
@@ -500,7 +500,7 @@ impl Database {
             ticket: RollupReadTicket {
                 dates: ticket,
                 slices: slice_ticket,
-                output: RollupOutputTicket { source: route.source, target: route.target, lookup_project, accepted: accepted_output },
+                output: RollupOutputTicket { source: route.source, target: route.target, lookup_project, project: route.project_id, accepted: accepted_output },
             },
         })
     }
@@ -524,7 +524,7 @@ impl Database {
         {
             return false;
         }
-        let RollupOutputTicket { source, target, lookup_project, accepted } = &ticket.output;
+        let RollupOutputTicket { source, target, lookup_project, project, accepted } = &ticket.output;
         let Ok(source_table) = self.resolve_table(lookup_project, source).await else { return false };
         let fingerprints = {
             let table = source_table.read().await;
@@ -533,7 +533,7 @@ impl Database {
         };
         let Ok(target_table) = self.resolve_table(lookup_project, target).await else { return false };
         let table = target_table.read().await;
-        self.rollup_output_coverage(source, (target, &table, lookup_project), &fingerprints).is_ok_and(|live| live.contains(accepted))
+        self.rollup_output_coverage(source, (target, &table, lookup_project), &fingerprints, project.as_deref()).is_ok_and(|live| live.contains(accepted))
     }
 
     /// Query Delta tables directly, bypassing the in-memory buffer (for testing).

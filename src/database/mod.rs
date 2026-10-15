@@ -873,6 +873,7 @@ struct RollupOutputTicket {
     source: String,
     target: String,
     lookup_project: String,
+    project: Option<String>,
     accepted: maintain::RollupOutputCoverage,
 }
 
