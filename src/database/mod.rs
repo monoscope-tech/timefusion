@@ -268,6 +268,7 @@ pub mod scan_metric_names {
         ROLLUP_STALE_NO_WITNESS = "timefusion.scan.rollup_stale_no_witness" as scan.rollup_stale_no_witness;
         ROLLUP_STALE_SHRANK = "timefusion.scan.rollup_stale_shrank" as scan.rollup_stale_shrank;
         ROLLUP_STALE_GREW = "timefusion.scan.rollup_stale_grew" as scan.rollup_stale_grew;
+        PREFILTER_MUTABLE_CANDIDATES = "timefusion.scan.prefilter_mutable_candidates" as scan.prefilter_mutable_candidates;
         ROLLUP_STALE_NO_SOURCE_ROWS = "timefusion.scan.rollup_stale_no_source_rows" as scan.rollup_stale_no_source_rows;
         /// Indexes built by the reconcile BACKFILL specifically — flush,
         /// compaction and the wave reindex publish separately.

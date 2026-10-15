@@ -504,6 +504,78 @@ impl ProjectRoutingTable {
         self.scan_via_provider(provider, state, projection, filters, limit).await
     }
 
+    /// Every in-window timestamp at which some version of a row matches `filters`: the indexed
+    /// matches of `membership` for the files its warm indexes cover, plus the rows matching in
+    /// the other files and in the MemBuffer. `None` past `MAX_CANDIDATE_TIMESTAMPS`. The
+    /// MemBuffer is read before the Delta snapshot is taken, so a racing flush lands in one.
+    async fn mutable_candidate_timestamps(
+        &self, state: &dyn Session, project_id: &str, filters: &[Expr], membership: &crate::tantivy::histogram::Membership, (lo, hi): (i64, i64),
+    ) -> DFResult<Option<HashSet<i64>>> {
+        use datafusion::physical_plan::filter::FilterExec;
+        let Some(predicate) = filters.iter().cloned().reduce(Expr::and) else { return Ok(None) };
+        let svc = self.database.tantivy_search().ok_or_else(|| DataFusionError::Internal("no tantivy".into()))?;
+        let Some((mut found, covered)) = svc
+            .membership_timestamps(&self.table_name, project_id, membership, MAX_CANDIDATE_TIMESTAMPS, Some((lo, hi)))
+            .await
+            .map_err(|e| DataFusionError::External(e.into()))?
+        else {
+            return Ok(None);
+        };
+        let collect_matching = |batch: &RecordBatch, found: &mut HashSet<i64>| -> DFResult<()> {
+            let schema = datafusion::common::DFSchema::try_from(batch.schema().as_ref().clone())?;
+            let mask = state.create_physical_expr(predicate.clone(), &schema)?.evaluate(batch)?.into_array(batch.num_rows())?;
+            let mask =
+                mask.as_any().downcast_ref::<arrow::array::BooleanArray>().ok_or_else(|| DataFusionError::Internal("candidate mask is not boolean".into()))?;
+            let ts = arrow::compute::cast(
+                batch.column_by_name("timestamp").ok_or_else(|| DataFusionError::Internal("no timestamp".into()))?,
+                &arrow::datatypes::DataType::Int64,
+            )?;
+            let ts = ts.as_any().downcast_ref::<arrow::array::Int64Array>().expect("cast to Int64");
+            found.extend((0..batch.num_rows()).filter(|&i| mask.is_valid(i) && mask.value(i) && ts.is_valid(i)).map(|i| ts.value(i)));
+            Ok(())
+        };
+        if let Some(layer) = self.database.buffered_layer() {
+            let mem =
+                layer.query_partitioned_with_text_match(project_id, &self.table_name, filters, None, None).map_err(|e| DataFusionError::External(e.into()))?;
+            for batch in mem.partitions.iter().flatten() {
+                collect_matching(batch, &mut found)?;
+            }
+        }
+        let table = self.database.resolve_table(project_id, &self.table_name).await.map_err(|e| DataFusionError::External(e.into()))?;
+        let table = table.read().await;
+        let raw: HashSet<String> = table
+            .get_file_uris()
+            .map_err(|e| DataFusionError::External(Box::new(e)))?
+            .filter(|uri| uri.ends_with(".parquet") && uri_date_in_window(uri, lo, hi) && !covered.contains(uri))
+            .collect();
+        if !raw.is_empty() {
+            let columns: Vec<usize> = predicate
+                .column_refs()
+                .into_iter()
+                .map(|c| c.name.clone())
+                .chain(std::iter::once("timestamp".to_string()))
+                .collect::<HashSet<_>>()
+                .into_iter()
+                .filter_map(|name| self.schema.index_of(&name).ok())
+                .collect();
+            let plan = self.scan_delta_table(&table, state, Some(&columns), filters, None, Some(&raw), None, None).await?;
+            let schema = datafusion::common::DFSchema::try_from(plan.schema().as_ref().clone())?;
+            let plan = Arc::new(FilterExec::try_new(state.create_physical_expr(predicate.clone(), &schema)?, plan)?);
+            for batch in datafusion::physical_plan::collect(plan, state.task_ctx()).await? {
+                let ts = arrow::compute::cast(
+                    batch.column_by_name("timestamp").ok_or_else(|| DataFusionError::Internal("no timestamp".into()))?,
+                    &arrow::datatypes::DataType::Int64,
+                )?;
+                let ts = ts.as_any().downcast_ref::<arrow::array::Int64Array>().expect("cast to Int64");
+                found.extend(ts.iter().flatten());
+                if found.len() > MAX_CANDIDATE_TIMESTAMPS {
+                    return Ok(None);
+                }
+            }
+        }
+        Ok((found.len() <= MAX_CANDIDATE_TIMESTAMPS).then_some(found))
+    }
+
     /// Build one Delta leg for complete/no Tantivy coverage, or two disjoint
     /// legs when sidecar coverage is partial. The covered leg is narrowed by
     /// the Tantivy id set; the uncovered leg evaluates the original filters.
@@ -938,7 +1010,7 @@ impl ProjectRoutingTable {
         let mutable = Self::version_mutable_columns(&self.table_name);
         let unstripped_filters = filters;
         let filters: Vec<Expr> = filters.iter().filter(|f| Self::leg_safe(&self.table_name, mutable.as_ref(), f)).cloned().collect();
-        let optimized_filters = self.apply_time_series_optimizations(&filters)?;
+        let mut optimized_filters = self.apply_time_series_optimizations(&filters)?;
 
         let project_id = self.extract_project_id_from_filters(&optimized_filters).unwrap_or_else(|| self.default_project.clone());
         span.record("table.project_id", project_id.as_str());
@@ -1050,6 +1122,34 @@ impl ProjectRoutingTable {
                         skip("delta_error");
                     }
                 }
+            }
+        }
+        // Membership in a mutable list stays above the dedup, so it reads every version in the
+        // window. All versions of a row share its timestamp (a dedup key): restricting EVERY leg
+        // to the timestamps where some version matches keeps each candidate key whole for
+        // `DedupExec`, and the predicate above it still picks the visible rows.
+        if tantivy_id_filter.is_none()
+            && let Some(mutable) = mutable.as_ref()
+            && let Some(window) = query_time_range.filter(|(lo, hi)| hi.saturating_sub(*lo) >= PREFILTER_MIN_WINDOW_MICROS)
+            && let Some(membership) = unstripped_filters
+                .iter()
+                .filter_map(crate::tantivy::planner::membership)
+                .filter(|m| m.columns().iter().any(|c| mutable.contains(*c)))
+                .reduce(|a, b| crate::tantivy::histogram::Membership::And(Box::new(a), Box::new(b)))
+        {
+            let unstripped = self.apply_time_series_optimizations(unstripped_filters)?;
+            match self.mutable_candidate_timestamps(state, &project_id, &unstripped, &membership, window).await {
+                Ok(Some(candidates)) => {
+                    metrics::counter!(scan_metric_names::PREFILTER_MUTABLE_CANDIDATES).increment(1);
+                    let ts_type = self.schema.field_with_name("timestamp")?.data_type().clone();
+                    let values = candidates
+                        .into_iter()
+                        .map(|t| ScalarValue::TimestampMicrosecond(Some(t), None).cast_to(&ts_type).map(lit))
+                        .collect::<DFResult<Vec<_>>>()?;
+                    optimized_filters.push(col("timestamp").in_list(values, false));
+                }
+                Ok(None) => {}
+                Err(e) => warn!("mutable candidate collection failed for {}/{}: {:#} — falling back to full scan", project_id, self.table_name, e),
             }
         }
         crate::observability::record_plan_phase(crate::observability::PlanPhase::ScanTantivy, tantivy_started);
@@ -2121,6 +2221,10 @@ mod stale_coverage_metric_tests {
 /// to a few row groups, while a term query loads the field's whole term dictionary per index
 /// (prod: 49-119 MB, 3.9-7.4 s for a ±5 min trace-id lookup that scans raw in 0.1-0.2 s).
 const PREFILTER_MIN_WINDOW_MICROS: i64 = 3_600_000_000;
+
+/// Past this many candidate timestamps a mutable predicate is common enough that the
+/// `timestamp IN (..)` restriction would not prune, so the scan keeps its full path.
+const MAX_CANDIDATE_TIMESTAMPS: usize = 20_000;
 
 /// Charge one prefilter skip to the total AND to its reason.
 ///

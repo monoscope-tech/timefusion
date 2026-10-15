@@ -8,7 +8,7 @@
 //! object-store GC cannot see it).
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     ops::Bound,
     path::{Path, PathBuf},
     sync::{
@@ -29,6 +29,7 @@ use tantivy::{Index, IndexReader};
 
 use crate::tantivy::{
     MANIFEST_SHARD_FETCHES, Manifest, ManifestRoot, ManifestShard, SCHEMA_VERSION, ShardDates,
+    histogram::Membership,
     udf::{PredNode, TextMatchPred},
     upsert_manifest,
 };
@@ -602,6 +603,40 @@ impl TantivySearchService {
     pub async fn nth_newest_timestamp(
         self: &Arc<Self>, table: &str, project_id: &str, node: &PredNode, n: usize, time_range: Option<(i64, i64)>,
     ) -> Result<Option<i64>> {
+        let node = node.clone();
+        let query = move |index: &Index, _: &BTreeSet<String>| {
+            Ok(match build_node_query(index, &node)? {
+                PredsQuery::Query(q) => Some(q),
+                PredsQuery::MissingField => None,
+            })
+        };
+        let (mut newest, _) = self.newest_matches(table, project_id, query, n, time_range).await?;
+        if n == 0 || newest.len() < n {
+            return Ok(None);
+        }
+        newest.select_nth_unstable_by(n - 1, |a, b| b.cmp(a));
+        Ok(Some(newest[n - 1]))
+    }
+
+    /// Every in-window timestamp where an indexed row physically matches `membership` (any
+    /// version, visible or not), with the files whose indexes answered; `None` past `cap`.
+    pub async fn membership_timestamps(
+        self: &Arc<Self>, table: &str, project_id: &str, membership: &Membership, cap: usize, time_range: Option<(i64, i64)>,
+    ) -> Result<Option<(HashSet<i64>, HashSet<String>)>> {
+        let membership = membership.clone();
+        let query = move |index: &Index, elements: &BTreeSet<String>| {
+            membership.columns().iter().all(|c| elements.contains(*c)).then(|| membership.query(&index.schema(), elements)).transpose()
+        };
+        let (found, covered) = self.newest_matches(table, project_id, query, cap.saturating_add(1), time_range).await?;
+        Ok((found.len() <= cap).then(|| (found.into_iter().collect(), covered)))
+    }
+
+    /// Up to `n` newest match timestamps from each warm in-window index, and the files covered
+    /// by the indexes `query` could answer (`None` = it cannot).
+    async fn newest_matches(
+        self: &Arc<Self>, table: &str, project_id: &str, query: impl Fn(&Index, &BTreeSet<String>) -> Result<Option<Box<dyn Query>>> + Clone + Send + 'static,
+        n: usize, time_range: Option<(i64, i64)>,
+    ) -> Result<(Vec<i64>, HashSet<String>)> {
         let m = self.load_manifest_cached(table, project_id, time_range.and_then(|(lo, hi)| crate::tantivy::shard_dates(lo, hi))).await?;
         let redundant = m.redundant_keys();
         let range_reads = self.config.range_reads();
@@ -613,42 +648,45 @@ impl TantivySearchService {
                 let blob = e.index.as_ref().filter(|_| entry_overlaps(e.min_timestamp_micros, e.max_timestamp_micros, time_range))?;
                 let window =
                     time_range.filter(|&(lo, hi)| !(e.min_timestamp_micros.is_some_and(|m| m >= lo) && e.max_timestamp_micros.is_some_and(|m| m <= hi)));
-                Some((key.clone(), blob.clone(), window, e.bundle_head))
+                Some((key.clone(), blob.clone(), window, e.bundle_head, e.element_fields.clone(), e.covered_files.clone()))
             })
-            .filter(|(key, blob, _, bundle)| (range_reads && bundle.is_some()) || has_any_segment(&self.cache_dir(table, project_id, file_uuid(key), blob)))
+            .filter(|(key, blob, _, bundle, ..)| (range_reads && bundle.is_some()) || has_any_segment(&self.cache_dir(table, project_id, file_uuid(key), blob)))
             .collect();
-        let mut newest: Vec<i64> = futures::stream::iter(work.into_iter().map(|(key, blob, window, bundle)| async move {
-            let opened = self.open_index(table, project_id, file_uuid(&key), &blob, bundle).await?;
-            let bundled = opened.is_left();
-            let (me, node) = (Arc::clone(self), node.clone());
-            tokio::task::spawn_blocking(move || -> Result<Vec<i64>> {
-                let (index, reader) = me.opened(opened)?;
-                let PredsQuery::Query(q) = build_node_query(&index, &node)? else { return Ok(Vec::new()) };
-                let searcher = reader.searcher();
-                if bundled {
-                    super::hotcache::warm(&searcher, &*q)?;
-                }
-                let q: Box<dyn Query> = match window {
-                    None => q,
-                    Some((lo, hi)) => Box::new(BooleanQuery::new(vec![
-                        (Occur::Must, q),
-                        (Occur::Must, Box::new(RangeQuery::new_i64_bounds(TS_FIELD.into(), Bound::Included(lo), Bound::Included(hi)))),
-                    ])),
-                };
-                let top =
-                    searcher.search(&*q, &TopDocs::with_limit(n).order_by_fast_field::<i64>(TS_FIELD, Order::Desc)).map_err(|e| anyhow!("newest: {e}"))?;
-                Ok(top.into_iter().map(|(ts, _)| ts).collect())
-            })
-            .await?
+        let found: Vec<(Vec<i64>, Vec<String>)> = futures::stream::iter(work.into_iter().map(|(key, blob, window, bundle, elements, covered)| {
+            let query = query.clone();
+            async move {
+                let opened = self.open_index(table, project_id, file_uuid(&key), &blob, bundle).await?;
+                let bundled = opened.is_left();
+                let me = Arc::clone(self);
+                tokio::task::spawn_blocking(move || -> Result<(Vec<i64>, Vec<String>)> {
+                    let (index, reader) = me.opened(opened)?;
+                    let Some(q) = query(&index, &elements)? else { return Ok((Vec::new(), Vec::new())) };
+                    let searcher = reader.searcher();
+                    if bundled {
+                        super::hotcache::warm(&searcher, &*q)?;
+                    }
+                    let q: Box<dyn Query> = match window {
+                        None => q,
+                        Some((lo, hi)) => Box::new(BooleanQuery::new(vec![
+                            (Occur::Must, q),
+                            (Occur::Must, Box::new(RangeQuery::new_i64_bounds(TS_FIELD.into(), Bound::Included(lo), Bound::Included(hi)))),
+                        ])),
+                    };
+                    let top =
+                        searcher.search(&*q, &TopDocs::with_limit(n).order_by_fast_field::<i64>(TS_FIELD, Order::Desc)).map_err(|e| anyhow!("newest: {e}"))?;
+                    Ok((top.into_iter().map(|(ts, _)| ts).collect(), covered))
+                })
+                .await?
+            }
         }))
         .buffer_unordered(self.config.search_concurrency())
-        .try_concat()
+        .try_collect()
         .await?;
-        if n == 0 || newest.len() < n {
-            return Ok(None);
-        }
-        newest.select_nth_unstable_by(n - 1, |a, b| b.cmp(a));
-        Ok(Some(newest[n - 1]))
+        Ok(found.into_iter().fold((Vec::new(), HashSet::new()), |(mut ts, mut files), (t, f)| {
+            ts.extend(t);
+            files.extend(f);
+            (ts, files)
+        }))
     }
 
     /// Warm the local disk cache with every blob whose data is at most `days`

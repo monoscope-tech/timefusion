@@ -1036,3 +1036,93 @@ async fn a_newest_first_page_narrows_to_the_index_bound_and_matches_baseline() -
     assert_eq!(ordered_ids(&ctx, &page).await?, ordered_ids(&ctx_off, &page).await?);
     Ok(())
 }
+
+/// Rows reaching every `DedupExec` in `sql`'s physical plan, with its ids.
+async fn ids_and_dedup_input(ctx: &SessionContext, sql: &str) -> Result<(Vec<String>, usize)> {
+    struct DedupInput(usize);
+    impl datafusion::physical_plan::ExecutionPlanVisitor for DedupInput {
+        type Error = datafusion::error::DataFusionError;
+        fn pre_visit(&mut self, plan: &dyn datafusion::physical_plan::ExecutionPlan) -> Result<bool, Self::Error> {
+            if plan.name() == "DedupExec" {
+                self.0 += plan.children().iter().filter_map(|c| c.metrics()?.output_rows()).sum::<usize>();
+            }
+            Ok(true)
+        }
+    }
+    let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+    let batches = datafusion::physical_plan::collect(Arc::clone(&plan), ctx.task_ctx()).await?;
+    let mut ids: Vec<String> = batches
+        .iter()
+        .flat_map(|b| {
+            let ids = arrow::compute::cast(b.column(0), &arrow::datatypes::DataType::Utf8).expect("utf8");
+            (0..ids.len()).map(move |i| ids.as_string::<i32>().value(i).to_string()).collect::<Vec<_>>()
+        })
+        .collect();
+    ids.sort();
+    let mut input = DedupInput(0);
+    datafusion::physical_plan::accept(plan.as_ref(), &mut input)?;
+    Ok((ids, input.0))
+}
+
+/// A predicate on a mutable column narrows every leg to the timestamps where some version
+/// matches (indexed hits, unindexed files, MemBuffer), so the newest version of each candidate
+/// still decides: no superseded match resurfaces and no newly matching version is lost.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_mutable_predicate_narrows_to_candidate_timestamps_without_ghosts() -> Result<()> {
+    use timefusion::{
+        database::scan_metric_names::PREFILTER_MUTABLE_CANDIDATES,
+        observability::{counter_value, init_local_metrics_for_test},
+        support::test_helpers::json_to_batch_for,
+    };
+    init_local_metrics_for_test();
+    let id = uuid::Uuid::new_v4().to_string()[..8].to_string();
+    let (on, ctx, svc) = build_db(&format!("{id}-mutcand-on"), true).await?;
+    let (off, ctx_off, _) = build_db(&format!("{id}-mutcand-off"), false).await?;
+    let (p, table, hash) = (unique_project(), "mor_versioned", "pat:E12e74a9");
+    let now = chrono::Utc::now().timestamp_micros();
+    let row = |id: &str, minutes: i64, h: &str| {
+        let ts = now - minutes * 60_000_000;
+        let date = chrono::DateTime::from_timestamp_micros(ts).unwrap().date_naive().to_string();
+        json!({"timestamp": ts, "date": date, "id": id, "name": id, "hashes": [h], "project_id": p})
+    };
+    let fillers = |n: i64| (0..n).map(|i| row(&format!("f{i}"), 60 + i, "other")).collect::<Vec<_>>();
+    for db in [&on, &off] {
+        // Unindexed (direct) file: `ghost`'s older matching version, and `solo`, matching only here.
+        let direct = [vec![row("ghost", 1, hash), row("solo", 5, hash)], fillers(30)].concat();
+        db.insert_records_batch(&p, table, vec![json_to_batch_for(table, direct)?], true, None).await?;
+        // Indexed file: `ghost` stops matching, `stale` and `kept` match, `late` does not yet.
+        let indexed = [vec![row("ghost", 1, "other"), row("stale", 2, hash), row("kept", 3, hash), row("late", 4, "other")], fillers(30)].concat();
+        db.insert_records_batch(&p, table, vec![json_to_batch_for(table, indexed)?], false, None).await?;
+        flush_all(db).await?;
+    }
+    let store = svc.expect("tantivy").object_store.clone();
+    for _ in 0..150 {
+        if timefusion::tantivy::load_manifest(store.as_ref(), table, &p).await?.entries.values().map(|e| e.rows).sum::<u64>() >= 34 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    for db in [&on, &off] {
+        // MemBuffer: `stale` stops matching, `late` starts.
+        db.insert_records_batch(&p, table, vec![json_to_batch_for(table, vec![row("stale", 2, "other"), row("late", 4, hash)])?], false, None).await?;
+    }
+    for predicate in [
+        format!("array_has(hashes, '{hash}')"),
+        format!("'{hash}' = ANY(hashes)"),
+        format!("hashes @> ARRAY['{hash}']"),
+        format!("hashes && ARRAY['{hash}', 'absent']"),
+    ] {
+        let sql = format!(
+            "SELECT id FROM {table} WHERE project_id='{p}' AND timestamp BETWEEN to_timestamp_micros({}) AND to_timestamp_micros({now}) AND {predicate} ORDER BY timestamp DESC",
+            now - 3 * 3_600_000_000
+        );
+        let before = counter_value(PREFILTER_MUTABLE_CANDIDATES);
+        let (ids, narrowed) = ids_and_dedup_input(&ctx, &sql).await?;
+        assert_eq!(counter_value(PREFILTER_MUTABLE_CANDIDATES), before + 1, "{predicate} must take the candidate path");
+        assert_eq!(ids, ["kept", "late", "solo"], "{predicate}");
+        let (baseline, full) = ids_and_dedup_input(&ctx_off, &sql).await?;
+        assert_eq!(ids, baseline);
+        assert!(narrowed <= 8 && full >= 60, "{predicate}: dedup must see only candidate versions: {narrowed} vs {full}");
+    }
+    Ok(())
+}
