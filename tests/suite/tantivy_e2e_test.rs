@@ -1096,10 +1096,9 @@ async fn a_mutable_predicate_narrows_to_candidate_timestamps_without_ghosts() ->
         flush_all(db).await?;
     }
     let store = svc.expect("tantivy").object_store.clone();
-    for _ in 0..150 {
-        if timefusion::tantivy::load_manifest(store.as_ref(), table, &p).await?.entries.values().map(|e| e.rows).sum::<u64>() >= 34 {
-            break;
-        }
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    while timefusion::tantivy::load_manifest(store.as_ref(), table, &p).await?.entries.values().map(|e| e.rows).sum::<u64>() < 34 {
+        anyhow::ensure!(tokio::time::Instant::now() < deadline, "the flushed file must be indexed, or the covered path goes untested");
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
     for db in [&on, &off] {
