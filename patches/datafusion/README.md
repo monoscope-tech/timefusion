@@ -92,4 +92,5 @@ This review does not establish behavior outside the selected patch or replace th
 - Update every affected workspace dependency reference consistently.
 - Build and check the release from its committed manifest and lockfile.
 
-The [rollup plan](../../docs/plans/rollup-plan.md) tracks the remaining release gates.
+The [current backlog](../../docs/plans/2026-10-19-next-work.md#validation-for-implementation) tracks the release gates.
+The [durability reference](../../docs/reference/timefusion-durability.md#spill-ownership-and-upgrades) preserves the spill and upgrade contracts.

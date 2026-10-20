@@ -820,7 +820,7 @@ impl Database {
         // Prod 2026-09-13 measured this class at 18,418 `rollup_stale_shrank`
         // against 229,361 `grew`, so this is the 7.4% — worth taking because it
         // is nearly free and repairs slices already stamped, not because it is
-        // the larger lever. See `2026-09-13-stop-re-rolling-deduped-partitions.md`.
+        // the larger lever. See `docs/reference/timefusion-maintenance.md` (rollup source witnesses).
         // Only rows the wave physically removed: a DV-masked bin leaves `num_records`, and so
         // the witness, unchanged, and subtracting its drops would stale every slice of the day.
         let rewritten = wave_rewritten_rows(&result.landed);

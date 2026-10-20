@@ -1,5 +1,5 @@
 # Merge-on-read FIXTURE with a string-led sort, the shape `otel_metrics` takes in the
-# metric-first layout (docs/plans/2026-10-04-otel-metrics-metric-first-layout.md). Nothing
+# metric-first layout (docs/reference/timefusion-reads.md). Nothing
 # writes to it in production; it exists so the string-led dedup bound and the per-layout
 # scan split run the real path in tests before any production table depends on them.
 table_name: mor_metric_first

@@ -322,7 +322,7 @@ Where things live, one line each. `src/` is expanded under Module Structure.
 ├── schemas/                YAML table schemas, compiled in via include_dir!
 ├── proto/                  timefusion.proto; build.rs codegens from it
 ├── vendor/                 forked deps: pgwire, walrus-rust, tikv-jemalloc-sys
-├── docs/                   architecture notes, incident reports, docs/plans/ (100+), dashboards
+├── docs/                   architecture notes, incident reports, docs/plans/ (current work), docs/reference/ (concepts), dashboards
 ├── tasks/                  older task briefs, superseded by docs/plans
 ├── scripts/                prod benchmarking and probe scripts
 ├── deploy/                 CapRover service override + pgwire proxy config
@@ -577,7 +577,7 @@ insert(project_id, table_name, batches)
 - `TIMEFUSION_S3_CONNECT_TIMEOUT` (humantime, default `3s` — tuned for same-region S3; widen behind slow proxies or cross-region links)
 - `TIMEFUSION_REPAIR_RESUME_ENABLED` (default **true** — before staging a bin, COMMIT a matching staged-but-uncommitted rewrite instead of redoing the 40+ min work; set `=false` to revert to re-stage + reconcile-and-delete). A repair bin is one 40+ min whole-file rewrite and prod replaces the task every 15-28 min, so with resume off every pass discarded a complete staged output. Note `repair_resumed_total`/`rollup_resumed_total` reading 0 does **not** mean the flag is off — check the decline counters too: 0 resumed *with* 0 declined means the path was never reached.
 - `TIMEFUSION_PLAN_CACHE_CAPACITY` (default 2048 — cross-connection plan-cache templates), `TIMEFUSION_PLAN_CACHE_TIME_FNS` (default **true** — parameterize `now()` for shape caching on the hot dashboard path; it was canaried and turned on after 2026-07-19 flamegraphs put ~25% of CPU in `SessionState::optimize` on now()-bearing misses. Set `=false` only as an emergency kill switch)
-- `TIMEFUSION_LANDED_SKIP_ENABLED` (default **true**) — decline a flush whose batch set is provably already committed, i.e. the duplicates WAL replay re-inserts after an unclean exit (58% of duplicate groups in a sampled prod file; see `docs/plans/2026-09-02-stop-manufacturing-duplicates.md`). Only ever active on a DIRTY boot — a clean boot skips the Delta history scan that loads the identities, so it costs nothing. Watch `wal.landed_skips` against `wal.replay_rows` in `timefusion_stats`.
+- `TIMEFUSION_LANDED_SKIP_ENABLED` (default **true**) — decline a flush whose batch set is provably already committed, i.e. the duplicates WAL replay re-inserts after an unclean exit (58% of duplicate groups in a sampled prod file; see `docs/reference/timefusion-durability.md`). Only ever active on a DIRTY boot — a clean boot skips the Delta history scan that loads the identities, so it costs nothing. Watch `wal.landed_skips` against `wal.replay_rows` in `timefusion_stats`.
 - `TIMEFUSION_CPU_PROFILE` (default on; set `false`/`0` to skip the pprof CPU sampler). Signal-handler + libunwind code that runs at boot — the shape of a SIGSEGV with no Rust panic. Prod crashlooped `exit 139` on 2026-08-11 with `starting cpu profiler` as the last line of every attempt, and there was no way to test that without shipping an image into an outage. Heap profiling is jemalloc's own and is unaffected.
 
 ## Key Constants
@@ -645,7 +645,7 @@ Measuring maintenance changes by deploying to prod costs ~half a day per hypothe
 3. **Staging** (`timefusion-staging`, same R2, scratch prefix, seeded whale/shipbubble days) — MinIO validates correctness, not cost: the per-unit fixed cost is object-store round trips, so throughput experiments need real S3 latency. Restarts there are free.
 4. **Prod, only after 1–3 agree.** One change per deploy (batch variants behind env kill-switches, e.g. `TIMEFUSION_REPAIR_RESUME_ENABLED`); ≥2h quiet before trusting numbers; every experiment PR names the `timefusion_stats` metric it moves.
 
-Convergence (draining a backlog, building 30 contiguous days) is wall-clock physics and cannot be compressed — what this buys is ~1h time-to-knowledge per decision. If `sim`/`run-unit`/staging don't exist yet, building them is Phase 0 of `docs/plans/2026-08-18-an-architecture-that-keeps-up.md` — do that first.
+Convergence (draining a backlog, building 30 contiguous days) is wall-clock physics and cannot be compressed — what this buys is ~1h time-to-knowledge per decision. If `sim`/`run-unit`/staging don't exist yet, build those measurement tools first; see `docs/reference/timefusion-decisions.md` (experiment tools).
 
 ### Diagnosing a slow query — the cheap measurements come FIRST
 
