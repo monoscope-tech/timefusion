@@ -1240,7 +1240,7 @@ impl FoyerObjectStoreCache {
             // amplification competes with the foreground range requests; large files are
             // warmed only by upload capture and the post-commit/restart warmer.
             // A bypassed scan declines the admission, so it fetches only the range.
-            if file_meta.size <= self.config.l1_max_entry_bytes as u64 && !bypass_active() {
+            if file_meta.size <= self.config.l1_max_entry_bytes as u64 && !bypass_active() && is_within_recent_window(location, self.config.cache_recent_days) {
                 debug!("Foyer cache MISS for Parquet data: {} (range: {}..{}, fetching full file)", location, range.start, range.end);
                 if let Ok(result) = self.get_cached(location).await {
                     let full = Self::read_payload(result.payload).await?;
@@ -1308,6 +1308,15 @@ impl FoyerObjectStoreCache {
             .map(|(blk, _)| blk.clone())
             .coalesce(|a, b| if a.end == b.start { Ok(a.start..b.end) } else { Err((a, b)) })
             .collect_vec();
+        // Fully cold, nonadmitted reads cannot reuse widened blocks. Keep existing
+        // block hits (including partial hits) on the normal reuse path.
+        if !runs.is_empty() && data.iter().all(Option::is_none) && !is_within_recent_window(location, self.config.cache_recent_days) {
+            record_miss_with_fetch(&self.stats);
+            let bytes = self.inner.get_range(location, range.start..range.end.min(file.size)).await?;
+            add(&self.stats.inner_bytes_read, bytes.len() as u64);
+            record_range_miss(&self.stats, bytes.len() as u64);
+            return Ok((bytes, false));
+        }
         let fetched = futures::future::try_join_all(runs.iter().map(|run| self.inner.get_range(location, run.clone()))).await?;
         match runs.is_empty() {
             true => record_range_hit(&self.stats, range.end.min(file.size).saturating_sub(range.start)),
@@ -2736,6 +2745,37 @@ mod tests {
         let got = scan_bypass_scope(true, cache.get_range_cached(&path, 100..200)).await?;
         assert_eq!(&got[..], &body[100..200]);
         assert_eq!(cache.get_stats().main.inner_bytes_read, PARQUET_RANGE_ALIGNMENT_BYTES, "a bypassed miss must fetch its aligned range, not the 4 MiB file");
+        Ok(())
+    }
+
+    /// Cold misses cannot amortize extra fetched bytes because admission rejects their partition.
+    #[test_case::test_case(4096, 8 << 20, false, 200, 200 ; "cold small file")]
+    #[test_case::test_case(3 * PARQUET_RANGE_ALIGNMENT_BYTES as usize, 64, false, 200, 200 ; "cold aligned file")]
+    #[test_case::test_case(3 * PARQUET_RANGE_ALIGNMENT_BYTES as usize, 64, true, 200, 0 ; "existing cold block stays usable")]
+    #[test_case::test_case(3 * PARQUET_RANGE_ALIGNMENT_BYTES as usize, 64, true, 1_500_000, 2 * PARQUET_RANGE_ALIGNMENT_BYTES ; "partial cold block hit stays useful")]
+    #[tokio::test]
+    async fn nonadmitted_range_misses_fetch_only_requested_bytes(body_len: usize, l1_cap: usize, cached: bool, end: u64, fetched: u64) -> anyhow::Result<()> {
+        let mem = Arc::new(InMemory::new());
+        let (shared, cache, _dir) = shared_with("nonadmitted_range", mem.clone(), |c| {
+            c.cache_recent_days = 8;
+            c.l1_max_entry_bytes = l1_cap;
+        })
+        .await?;
+        let path = Path::from(format!("tbl/date={}/part.parquet", Utc::now().date_naive() - chrono::Duration::days(30)));
+        let body: Vec<u8> = (0..body_len).map(|i| (i % 251) as u8).collect();
+        mem.put(&path, PutPayload::from(Bytes::from(body.clone()))).await?;
+        if cached {
+            let block = 0..PARQUET_RANGE_ALIGNMENT_BYTES;
+            shared.cache.insert(
+                FoyerObjectStoreCache::make_range_cache_key(&path, &block),
+                range_value(&path, Bytes::copy_from_slice(&body[..block.end as usize]), &meta_for(&path, body_len as u64)),
+            );
+        }
+        for _ in 0..2 {
+            assert_eq!(&cache.get_range_cached(&path, 100..end).await?[..], &body[100..end as usize]);
+        }
+        assert_eq!(cache.get_stats().main.inner_bytes_read, fetched, "cold reads must preserve hits and avoid uncacheable overfetch");
+        assert!(!shared.contains_data(path.as_ref()), "a range read must not populate the full file");
         Ok(())
     }
 
