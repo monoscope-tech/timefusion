@@ -401,13 +401,18 @@ pub mod test_helpers {
         }
     }
 
+    /// Explicit test endpoint, with the local-first default used by the harnesses.
+    pub fn minio_endpoint() -> String {
+        std::env::var("TIMEFUSION_TEST_S3_ENDPOINT").unwrap_or_else(|_| "http://127.0.0.1:9000".to_string())
+    }
+
     /// Shared MinIO + foyer-disabled config keyed by an explicit table id / data dir.
     fn minio_base_config(table_id: &str, data_dir: &str) -> AppConfig {
         let mut cfg = AppConfig::default();
         cfg.aws.aws_s3_bucket = Some("timefusion-tests".to_string());
         cfg.aws.aws_access_key_id = Some("minioadmin".to_string());
         cfg.aws.aws_secret_access_key = Some("minioadmin".to_string());
-        cfg.aws.aws_s3_endpoint = "http://127.0.0.1:9000".to_string();
+        cfg.aws.aws_s3_endpoint = minio_endpoint();
         cfg.aws.aws_default_region = Some("us-east-1".to_string());
         cfg.aws.aws_allow_http = Some("true".to_string());
         cfg.core.timefusion_table_prefix = format!("test-{table_id}");
