@@ -271,7 +271,7 @@ async fn register_custom_storage(db: &Database, project_id: &str, table_name: &s
             s3_region: "us-east-1".to_string(),
             s3_access_key_id: "minioadmin".to_string(),
             s3_secret_access_key: "minioadmin".to_string(),
-            s3_endpoint: Some("http://127.0.0.1:9000".to_string()),
+            s3_endpoint: Some(crate::support::test_helpers::minio_endpoint()),
         },
     );
 }
@@ -7875,7 +7875,7 @@ fn create_test_config(test_id: &str) -> Arc<AppConfig> {
     cfg.aws.aws_s3_bucket = Some("timefusion-tests".to_string());
     cfg.aws.aws_access_key_id = Some("minioadmin".to_string());
     cfg.aws.aws_secret_access_key = Some("minioadmin".to_string());
-    cfg.aws.aws_s3_endpoint = "http://127.0.0.1:9000".to_string();
+    cfg.aws.aws_s3_endpoint = crate::support::test_helpers::minio_endpoint();
     cfg.aws.aws_default_region = Some("us-east-1".to_string());
     cfg.aws.aws_allow_http = Some("true".to_string());
     // Unique per RUN, not merely per test name: keying storage on the name alone makes a
@@ -9242,7 +9242,10 @@ async fn publication_fault_proxy(
         }
         publication = Some((reply, sent));
     }
-    let mut upstream = tokio::net::TcpStream::connect("127.0.0.1:9000").await?;
+    let endpoint = url::Url::parse(&crate::support::test_helpers::minio_endpoint())?;
+    let host = endpoint.host_str().ok_or_else(|| anyhow::anyhow!("test MinIO endpoint has no host"))?;
+    let port = endpoint.port_or_known_default().ok_or_else(|| anyhow::anyhow!("test MinIO endpoint has no port"))?;
+    let mut upstream = tokio::net::TcpStream::connect((host, port)).await?;
     upstream.write_all(&request).await?;
     if let Some((reply, sent)) = publication {
         let mut response = Vec::new();
@@ -9341,7 +9344,7 @@ async fn startup_flush_resumption_survives_s3_publication_faults(fault: Publicat
         ))
     };
     let store = store_for(endpoint)?;
-    let direct = store_for("http://127.0.0.1:9000".into())?;
+    let direct = store_for(crate::support::test_helpers::minio_endpoint())?;
     let url = Url::parse(&format!("s3://timefusion-tests/test-publication-fault-{}", uuid::Uuid::new_v4()))?;
     let dir = tempfile::tempdir()?;
     let cfg = test_config_with("network-flush", |cfg| cfg.core.timefusion_data_dir = dir.path().to_path_buf());

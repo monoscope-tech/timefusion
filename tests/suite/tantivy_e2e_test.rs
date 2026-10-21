@@ -29,7 +29,7 @@ fn cfg(test_id: &str) -> AppConfig {
     c.aws.aws_s3_bucket = Some("timefusion-tests".to_string());
     c.aws.aws_access_key_id = Some("minioadmin".into());
     c.aws.aws_secret_access_key = Some("minioadmin".into());
-    c.aws.aws_s3_endpoint = "http://127.0.0.1:9000".into();
+    c.aws.aws_s3_endpoint = timefusion::support::test_helpers::minio_endpoint();
     c.aws.aws_default_region = Some("us-east-1".into());
     c.aws.aws_allow_http = Some("true".into());
     c.core.timefusion_table_prefix = format!("tantivy-e2e-{test_id}");
