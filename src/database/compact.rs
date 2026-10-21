@@ -2501,11 +2501,29 @@ mod probe_shard_tests {
 mod ordered_probe_contract_tests {
     use super::*;
     use crate::support::test_helpers::{TestConfigBuilder, array_get_str, json_to_batch_for};
+    use anyhow::Context;
     use datafusion::{
         common::tree_node::{TreeNode, TreeNodeRecursion},
         physical_plan::{InputOrderMode, aggregates::AggregateExec},
     };
     use deltalake::writer::DeltaWriter;
+
+    async fn assert_probe_released(ctx: &SessionContext) -> Result<()> {
+        let runtime = ctx.runtime_env();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while runtime.memory_pool.reserved() != 0 || runtime.disk_manager.used_disk_space() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .with_context(|| {
+            format!(
+                "probe must release pool and spill reservations; reserved_bytes={} spill_bytes={}",
+                runtime.memory_pool.reserved(),
+                runtime.disk_manager.used_disk_space()
+            )
+        })
+    }
 
     /// Match the observed file/row-group overlap without scanning production rows.
     /// The oracle counts raw keys before any DataFusion grouping or read-side dedup.
@@ -2580,6 +2598,212 @@ mod ordered_probe_contract_tests {
         let started = std::time::Instant::now();
         assert_eq!(db.probe_dup_bins(&table, TABLE, &project, &day.to_string()).await?, expected);
         eprintln!("ordered={ordered} probe_elapsed_ms={}", started.elapsed().as_millis());
+        assert_probe_released(&ctx).await?;
+        Ok(())
+    }
+
+    /// Expensive, explicit volume experiment; normal CI retains the exact-key cases above.
+    #[test_case::test_case(4096, 0 ; "four million rows")]
+    #[test_case::test_case(295781, 424 ; "production row count")]
+    #[ignore = "writes a production-shaped synthetic key workload to local MinIO"]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn whole_date_probe_volume(rows_per_group: usize, mut extra_rows: usize) -> Result<()> {
+        use arrow::array::{ArrayRef, StringArray, TimestampMicrosecondArray, UInt32Array, new_null_array};
+        const TABLE: &str = "otel_logs_and_spans";
+        // Reuse only a previous local experiment prefix to avoid rewriting gigabytes while debugging cancellation.
+        let reuse = std::env::var("TIMEFUSION_PROBE_VOLUME_PREFIX").ok();
+        let mut config = TestConfigBuilder::new("probe-volume").build();
+        if let Some(prefix) = &reuse {
+            anyhow::ensure!(
+                prefix.strip_prefix("test-probe-volume-").is_some_and(|s| s.len() == 8 && s.bytes().all(|b| b.is_ascii_hexdigit())),
+                "expected a generated local probe-volume prefix"
+            );
+            Arc::make_mut(&mut config).core.timefusion_table_prefix = prefix.clone();
+        }
+        let db = Database::with_config(config).await?;
+        db.cancel_maintenance();
+        let mut project = format!("volume_{}", uuid::Uuid::new_v4().simple());
+        let start = chrono::NaiveDate::from_ymd_opt(2026, 8, 10).unwrap().and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_micros();
+        let table = db.resolve_table(&project, TABLE).await?;
+        let max_group_rows = rows_per_group + usize::from(extra_rows > 0);
+        let ranges: Vec<_> = (0..23)
+            .map(|file| {
+                let groups = if file < 11 { 43 } else { 42 };
+                let extra = extra_rows.min(groups);
+                extra_rows -= extra;
+                let lo = file * 43 * rows_per_group / 2;
+                (lo, lo + groups * rows_per_group + extra)
+            })
+            .collect();
+        assert_eq!(extra_rows, 0);
+        let total_rows: usize = ranges.iter().map(|(lo, hi)| hi - lo).sum();
+        let max_key = ranges.iter().map(|(_, hi)| *hi).max().unwrap();
+        let step = 86_400_000_000i64 / i64::try_from(max_key + 1)?;
+        assert!(step > 127, "timestamp jitter must preserve strict key order");
+        let timestamp = |key: usize| start + key as i64 * step + (twox_hash::XxHash64::oneshot(2, &key.to_le_bytes()) & 127) as i64;
+        let mut expected = HashSet::new();
+        for (i, &(lo, hi)) in ranges.iter().enumerate() {
+            for &(other_lo, other_hi) in &ranges[i + 1..] {
+                let from = lo.max(other_lo);
+                let to = hi.min(other_hi);
+                if from < to {
+                    expected.extend(timestamp(from) / 600_000_000..=timestamp(to - 1) / 600_000_000);
+                }
+            }
+        }
+        let prepared = std::time::Instant::now();
+        if reuse.is_some() {
+            let delta = table.read().await;
+            let rows = delta
+                .snapshot()?
+                .log_data()
+                .iter()
+                .try_fold(0usize, |sum, file| Ok::<_, anyhow::Error>(sum + file.num_records().context("reused input needs exact row statistics")?))?;
+            anyhow::ensure!(rows == total_rows, "reused input has {rows} rows, expected {total_rows}");
+            let uri = delta.get_file_uris()?.next().context("reused input has no Parquet files")?;
+            project = crate::tantivy::search::project_id_of_uri(&uri).context("reused input needs a project partition")?.to_owned();
+        } else {
+            // Expand one valid schema row; all non-key values are constant or shared null arrays.
+            let template = json_to_batch_for(
+                TABLE,
+                vec![serde_json::json!({"project_id": project, "date": "2026-08-10",
+            "timestamp": start, "id": "template", "level": "INFO", "status_code": "UNSET", "hashes": [], "summary": []})],
+            )?;
+            let schema = schema_or_default(TABLE);
+            let properties = db.create_writer_properties(schema, 3, true).into_builder().set_max_row_group_row_count(Some(max_group_rows)).build();
+            for (file, &(lo, hi)) in ranges.iter().enumerate() {
+                let mut delta = table.write().await;
+                let mut writer = deltalake::writer::RecordBatchWriter::for_table(&delta)?.with_writer_properties(properties.clone());
+                for upper in (lo..hi).rev().step_by(32_768) {
+                    let lower = (upper + 1).saturating_sub(32_768).max(lo);
+                    let keys: Vec<_> = (lower..=upper).rev().collect();
+                    let timestamps: ArrayRef = Arc::new(TimestampMicrosecondArray::from_iter_values(keys.iter().map(|k| timestamp(*k))).with_timezone("UTC"));
+                    let ids: ArrayRef = Arc::new(StringArray::from_iter_values(keys.iter().map(|key| {
+                        let bytes = key.to_le_bytes();
+                        uuid::Uuid::from_u64_pair(twox_hash::XxHash64::oneshot(0, &bytes), twox_hash::XxHash64::oneshot(1, &bytes)).to_string()
+                    })));
+                    let services: ArrayRef = Arc::new(StringArray::from(keys.iter().map(|k| (k % 7 != 0).then_some("api-service")).collect::<Vec<_>>()));
+                    let indices = UInt32Array::from(vec![0; keys.len()]);
+                    let mut nulls = std::collections::HashMap::new();
+                    let columns = template
+                        .schema()
+                        .fields()
+                        .iter()
+                        .enumerate()
+                        .map(|(index, field)| {
+                            let source = match field.name().as_str() {
+                                "timestamp" => Some(&timestamps),
+                                "id" => Some(&ids),
+                                "resource___service___name" => Some(&services),
+                                _ => None,
+                            };
+                            match source {
+                                Some(array) => arrow::compute::cast(array, field.data_type()),
+                                None if template.column(index).is_null(0) => {
+                                    Ok(Arc::clone(nulls.entry(field.data_type().clone()).or_insert_with(|| new_null_array(field.data_type(), keys.len()))))
+                                }
+                                None => arrow::compute::take(template.column(index).as_ref(), &indices, None),
+                            }
+                        })
+                        .collect::<std::result::Result<Vec<_>, _>>()?;
+                    let batch = RecordBatch::try_new(template.schema(), columns)?;
+                    let batch = deltalake::kernel::schema::cast_record_batch(&batch, writer.arrow_schema(), true, true)?;
+                    writer.write(batch).await?;
+                }
+                writer.flush_and_commit(&mut delta).await?;
+                eprintln!("volume_prepare file={} rows={} elapsed_ms={}", file + 1, hi - lo, prepared.elapsed().as_millis());
+            }
+        }
+        eprintln!(
+            "volume_input rows={total_rows} files=23 row_groups=977 pool_limit_bytes={} prepare_ms={} reused={} table_uri={}",
+            db.heavy_pool_bytes(),
+            prepared.elapsed().as_millis(),
+            reuse.is_some(),
+            table.read().await.table_url()
+        );
+        let context_started = std::time::Instant::now();
+        let ctx = db.dedup_probe_ctx(&table, TABLE, &project, "2026-08-10", None).await?;
+        eprintln!("volume_context elapsed_ms={}", context_started.elapsed().as_millis());
+        let sql = format!(
+            "SELECT CAST(date_bin(INTERVAL '10 minutes', timestamp, TIMESTAMP '1970-01-01T00:00:00') AS VARCHAR) FROM \
+            (SELECT timestamp, count(*) AS c FROM {DEDUP_SCAN_NAME} WHERE project_id = '{project}' AND date = DATE '2026-08-10' \
+             GROUP BY timestamp, resource___service___name, id) AS g WHERE c > 1 GROUP BY 1 ORDER BY 1"
+        );
+        for pass in ["first", "repeat"] {
+            let started = std::time::Instant::now();
+            let frame = ctx.sql(&sql).await?;
+            let logical_ms = started.elapsed().as_millis();
+            let plan = frame.create_physical_plan().await?;
+            let planning_ms = started.elapsed().as_millis();
+            let runtime = ctx.runtime_env();
+            let mut peak_pool = runtime.memory_pool.reserved();
+            let result = {
+                let query = tokio::time::timeout(std::time::Duration::from_secs(240), datafusion::physical_plan::collect(Arc::clone(&plan), ctx.task_ctx()));
+                tokio::pin!(query);
+                let mut samples = tokio::time::interval(std::time::Duration::from_millis(10));
+                loop {
+                    tokio::select! {
+                        result = &mut query => break result,
+                        _ = samples.tick() => peak_pool = peak_pool.max(runtime.memory_pool.reserved()),
+                    }
+                }
+            };
+            let mut metrics = std::collections::BTreeMap::new();
+            plan.apply(|node| {
+                if let Some(values) = node.metrics() {
+                    for (name, value) in [
+                        ("bytes_scanned", values.sum_by_name("bytes_scanned").map(|v| v.as_usize())),
+                        ("elapsed_compute_ns", values.elapsed_compute()),
+                        ("spill_count", values.spill_count()),
+                        ("spilled_bytes", values.spilled_bytes()),
+                    ] {
+                        if let Some(value) = value {
+                            *metrics.entry(name).or_insert(0usize) += value;
+                        }
+                    }
+                }
+                Ok(TreeNodeRecursion::Continue)
+            })?;
+            eprintln!(
+                "volume_probe pass={pass} rows={total_rows} logical_ms={logical_ms} planning_ms={planning_ms} total_ms={} peak_pool_bytes={peak_pool} timeout={} metrics={metrics:?}",
+                started.elapsed().as_millis(),
+                result.is_err()
+            );
+            assert_probe_released(&ctx).await.context("completed volume pass")?;
+            let batches = result??;
+            let actual = read_string_column(batches)?
+                .into_iter()
+                .map(|s| {
+                    chrono::NaiveDateTime::parse_from_str(&s[..19].replace('T', " "), "%Y-%m-%d %H:%M:%S").map(|t| t.and_utc().timestamp_micros() / 600_000_000)
+                })
+                .collect::<std::result::Result<HashSet<_>, _>>()?;
+            assert_eq!(actual, expected);
+        }
+        let plan = ctx.sql(&sql).await?.create_physical_plan().await?;
+        let runtime = ctx.runtime_env();
+        let canceled_reserved = {
+            let query = datafusion::physical_plan::collect(plan, ctx.task_ctx());
+            tokio::pin!(query);
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                let mut samples = tokio::time::interval(std::time::Duration::from_millis(5));
+                loop {
+                    tokio::select! {
+                        result = &mut query => { result?; anyhow::bail!("probe completed before acquiring an observable reservation"); },
+                        _ = samples.tick() => {
+                            let reserved = runtime.memory_pool.reserved();
+                            if reserved > 0 { break Ok::<_, anyhow::Error>(reserved); }
+                        }
+                    }
+                }
+            })
+            .await??
+        };
+        assert_probe_released(&ctx).await.context("canceled volume pass")?;
+        eprintln!(
+            "volume_canceled reserved_before_drop={canceled_reserved} reserved_bytes={} spill_bytes={}",
+            runtime.memory_pool.reserved(),
+            runtime.disk_manager.used_disk_space()
+        );
         Ok(())
     }
 }
