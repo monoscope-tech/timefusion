@@ -2311,9 +2311,12 @@ impl BufferedWriteLayer {
     /// rows, and compute the conservative WAL watermark the commit must carry.
     fn prepare_flush(&self, bucket: &FlushableBucket) -> anyhow::Result<(Vec<RecordBatch>, DeltaWatermark)> {
         // Raise the Delta watermark before the commit (see field docs).
-        if bucket.max_timestamp != i64::MIN {
+        // Routing timestamps identify the bucket; a batch can also contain
+        // newer rows. The scan watermark must bound every row sent to Delta.
+        let row_max = bucket.batches.iter().filter_map(batch_timestamp_range).map(|(_, hi)| hi).fold(bucket.max_timestamp, i64::max);
+        if row_max != i64::MIN {
             let key = (Arc::<str>::from(bucket.project_id.as_str()), Arc::<str>::from(bucket.table_name.as_str()));
-            self.delta_flushed_watermark.entry(key).and_modify(|w| *w = (*w).max(bucket.max_timestamp)).or_insert(bucket.max_timestamp);
+            self.delta_flushed_watermark.entry(key).and_modify(|w| *w = (*w).max(row_max)).or_insert(row_max);
         }
         // Last-write-wins dedup on the per-table key set from schema YAML (empty key list =
         // pass-through). Must run before both the Delta write and the tantivy sidecar so both

@@ -286,3 +286,85 @@ async fn dv_masked_scan_keeps_one_stream_per_file_group() -> anyhow::Result<()> 
     assert_eq!(stale, 1, "the masked copy of r-0001 reappeared");
     Ok(())
 }
+
+/// The billing caller needs exact count AND byte sum over (start, end]. Keep
+/// that contract visible while profiling the raw route; a count-only shortcut
+/// cannot answer it. The larger case is a local cost baseline, not a prod SLA.
+#[test_case::test_case(48; "boundary fixture")]
+#[test_case::test_case(65_536; "raw cost baseline")]
+#[serial_test::serial]
+#[tokio::test(flavor = "multi_thread")]
+async fn metrics_usage_totals_preserve_boundaries_and_visible_versions(n: usize) -> anyhow::Result<()> {
+    let env = E2eEnv::builder().with_bucket_duration(Duration::from_secs(300)).start().await?;
+    let client = env.pg_client().await?;
+    env.db().cancel_maintenance();
+    client.batch_execute("SET statement_timeout = '90s'").await?;
+    let lower = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(FROZEN_START_MICROS).unwrap();
+    let upper = lower + chrono::Duration::days(1);
+    let midpoint = lower + chrono::Duration::hours(12);
+    assert!(client.execute(
+        "INSERT INTO otel_metrics (project_id, timestamp, date, ingested_at, id, series_id, metric_name, metric_unit, metric_type, flags, dropped_attributes_count, message_size_bytes) \
+         VALUES ('usage', $1, $2, $1, 'null-probe', 'null-probe', 'null-probe', '1', 'GAUGE', 0, 0, NULL)", &[&lower, &lower.date_naive()],
+    ).await.is_err(), "invalid NULL must fail before it can strand accepted rows at flush");
+    assert_eq!(env.snapshot_stats().rows_ingested_total, 0, "rejected NULL must not enter the write path");
+    let times: Vec<_> = (0..=n).map(|i| lower + chrono::Duration::microseconds(i as i64 * 86_400_000_000 / n as i64)).collect();
+    let mut oracle: Vec<_> = times.iter().enumerate().map(|(i, &time)| (time, (i % 251) as i64)).collect();
+    for (chunk, batch) in times.chunks(4096).enumerate() {
+        let offset = chunk * 4096;
+        let stamps: Vec<_> = batch.iter().map(|time| time.to_rfc3339()).collect();
+        let ids: Vec<_> = (offset..offset + batch.len()).map(|i| format!("point-{i}")).collect();
+        let metrics: Vec<_> = (offset..offset + batch.len()).map(|i| format!("metric-{}", i % 8)).collect();
+        let series: Vec<_> = (offset..offset + batch.len()).map(|i| format!("series-{}", i % 256)).collect();
+        let bytes: Vec<_> = (offset..offset + batch.len()).map(|i| (i % 251) as i64).collect();
+        client.execute(
+            "INSERT INTO otel_metrics (project_id, timestamp, date, ingested_at, id, series_id, metric_name, metric_unit, metric_type, flags, dropped_attributes_count, message_size_bytes) \
+             SELECT 'usage' AS project_id, u.ts::timestamp AS timestamp, u.ts::date AS date, u.ts::timestamp AS ingested_at, u.id, u.series, u.metric, '1' AS metric_unit, 'GAUGE' AS metric_type, 0 AS flags, 0 AS dropped_attributes_count, u.bytes \
+             FROM unnest($1::text[], $2::text[], $3::text[], $4::text[], $5::bigint[]) AS u(ts, id, series, metric, bytes)",
+            &[&stamps, &ids, &series, &metrics, &bytes],
+        ).await?;
+    }
+    let query = "SELECT count(*)::bigint, coalesce(sum(message_size_bytes), 0)::bigint FROM otel_metrics \
+                 WHERE project_id = $1 AND timestamp > $2 AND timestamp <= $3";
+    let statement = client.prepare(query).await?;
+    for phase in ["ingested", "delta", "mutable"] {
+        if phase == "delta" {
+            env.advance(Duration::from_secs(25 * 3600));
+            env.flush_and_evict().await?;
+            assert_eq!(env.snapshot_stats().mem_total_rows, 0, "baseline must reach Delta");
+        }
+        if phase == "mutable" {
+            assert!(
+                client.execute("UPDATE otel_metrics SET message_size_bytes = 999 WHERE project_id = 'usage' AND id = 'point-1'", &[]).await.is_err(),
+                "byte size is immutable in the metrics schema"
+            );
+            let replay = times[1];
+            client.execute(
+                "INSERT INTO otel_metrics (project_id, timestamp, date, ingested_at, id, series_id, metric_name, metric_unit, metric_type, flags, dropped_attributes_count, message_size_bytes) \
+                 VALUES ('usage', $1, $2, $1, 'point-1', 'series-1', 'metric-1', '1', 'GAUGE', 0, 0, 1)", &[&replay, &replay.date_naive()],
+            ).await?;
+            client.execute("DELETE FROM otel_metrics WHERE project_id = 'usage' AND id = 'point-2'", &[]).await?;
+            oracle.remove(2);
+            let late = upper - chrono::Duration::microseconds(1);
+            client.execute(
+                "INSERT INTO otel_metrics (project_id, timestamp, date, ingested_at, id, series_id, metric_name, metric_unit, metric_type, flags, dropped_attributes_count, message_size_bytes) \
+                 VALUES ('usage', $1, $2, $1, 'late', 'late', 'late', '1', 'GAUGE', 0, 0, 77)", &[&late, &late.date_naive()],
+            ).await?;
+            oracle.push((late, 77));
+            assert!(env.snapshot_stats().mem_total_rows > 0, "late write must exercise the buffered leg");
+        }
+        for (start, end) in [(lower, upper), (lower, midpoint), (midpoint, upper), (upper, upper + chrono::Duration::seconds(1))] {
+            let expected =
+                oracle.iter().filter(|(time, _)| *time > start && *time <= end).fold((0_i64, 0_i64), |(count, sum), (_, bytes)| (count + 1, sum + bytes));
+            for attempt in 0..2 {
+                let before = std::time::Instant::now();
+                let row = client.query_one(&statement, &[&"usage", &start, &end]).await?;
+                assert_eq!((row.get::<_, i64>(0), row.get::<_, i64>(1)), expected, "{phase}: ({start}, {end}]");
+                eprintln!("usage n={n} phase={phase} attempt={attempt} range=({start}, {end}] elapsed_us={}", before.elapsed().as_micros());
+            }
+        }
+        let plan = explain_analyze(&client, &format!("SELECT count(*)::bigint, coalesce(sum(message_size_bytes), 0)::bigint FROM otel_metrics WHERE project_id='usage' AND timestamp > '{}' AND timestamp <= '{}'", lower.to_rfc3339(), upper.to_rfc3339())).await?;
+        eprintln!("usage n={n} phase={phase} mem_rows={} plan:\n{plan}", env.snapshot_stats().mem_total_rows);
+        assert!(!plan.contains("metrics_1m_v2") && !plan.contains("metrics_1h_v2"), "the current summaries have no byte-sum measure");
+    }
+    Ok(())
+}
