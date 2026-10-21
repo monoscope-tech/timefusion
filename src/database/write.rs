@@ -747,6 +747,9 @@ impl Database {
         }
 
         span.record("use_queue", false);
+        if let Some(layer) = self.buffered_layer() {
+            layer.note_delta_rows(&project_id, &table_name, &batches);
+        }
 
         // Identity of the batch set this commit carries, so a later boot can decline
         // to re-write it. Must be computed on the batches AS THE FLUSH HANDED THEM
@@ -1260,6 +1263,9 @@ impl Database {
             );
         }
         for (project, dirty_bins) in projects {
+            // Publication invalidates empty-table evidence even when file URI
+            // attribution is unavailable. This includes direct/bulk writers.
+            self.mark_delta_has_files(project, table_name);
             self.statistics_extractor.invalidate(project, table_name).await;
             for (date, bin) in *dirty_bins {
                 self.enqueue_dirty_bin(project, table_name, date, *bin);

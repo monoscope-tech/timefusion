@@ -184,3 +184,97 @@ async fn replayed_rows_that_delta_already_holds_are_not_written_again(publicatio
     assert_eq!(count_rows(&client, "e2e_project").await?, 5, "the declined flush must not have cost any rows");
     Ok(())
 }
+
+/// Boot time is not an upper bound on persisted event time: admitted rows can
+/// be in the future. A new buffered row must not hide that Delta population.
+#[test_case::test_case("otel_logs_and_spans", false; "logs")]
+#[test_case::test_case("otel_metrics", false; "metrics")]
+#[test_case::test_case("otel_logs_and_spans", true; "logs without statistics")]
+#[test_case::test_case("otel_metrics", true; "metrics without statistics")]
+#[serial_test::serial]
+#[tokio::test(flavor = "multi_thread")]
+async fn future_delta_rows_remain_visible_with_a_mem_leg_after_restart(table: &str, omit_stats: bool) -> anyhow::Result<()> {
+    let mut env = quiesced().with_landed_skip().start().await?;
+    env.db().cancel_maintenance();
+    let boot = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(FROZEN_START_MICROS).unwrap();
+    let (columns, values) = if table == "otel_metrics" {
+        (
+            ", ingested_at, series_id, metric_name, metric_unit, metric_type, flags, dropped_attributes_count, message_size_bytes",
+            ", $1, 's', 'm', '1', 'GAUGE', 0, 0, 1",
+        )
+    } else {
+        (", summary", ", ARRAY['s']")
+    };
+    let insert = format!("INSERT INTO {table} (project_id, timestamp, date, id{columns}) VALUES ('e2e_project', $1, $2, $3{values})");
+    let future = boot + chrono::Duration::hours(12) + chrono::Duration::microseconds(123);
+    {
+        let client = env.pg_client().await?;
+        client.execute(&insert, &[&future, &future.date_naive(), &"delta"]).await?;
+        env.force_flush().await?;
+        assert_eq!(env.snapshot_stats().mem_total_rows, 0, "the future row must reach Delta before restart");
+    }
+    if omit_stats {
+        // A valid Delta Add need not carry statistics. Replace only metadata,
+        // retaining the same physical rows and the original publication proof.
+        let handle = env.db().resolve_table("e2e_project", table).await?;
+        let target = handle.read().await.clone();
+        let actions = target
+            .snapshot()?
+            .log_data()
+            .iter()
+            .map(|file| {
+                deltalake::kernel::Action::Add(deltalake::kernel::Add {
+                    path: file.path().into_owned(),
+                    size: file.size(),
+                    modification_time: file.modification_time(),
+                    partition_values: file.partition_values_map(),
+                    tags: Some(file.tags()),
+                    deletion_vector: file.deletion_vector_descriptor(),
+                    data_change: false,
+                    ..Default::default()
+                })
+            })
+            .collect();
+        let operation = deltalake::protocol::DeltaOperation::Write { mode: deltalake::protocol::SaveMode::Append, partition_by: None, predicate: None };
+        deltalake::kernel::transaction::CommitBuilder::default()
+            .with_actions(actions)
+            .build(Some(target.snapshot()? as &dyn deltalake::kernel::transaction::TableReference), target.log_store(), operation)
+            .await?;
+    }
+    env.restart().await?;
+    env.db().cancel_maintenance();
+    assert_eq!(env.snapshot_stats().mem_total_rows, 0, "a replayed copy must not conceal a Delta-skip defect");
+    let client = env.pg_client().await?;
+    let time = boot + chrono::Duration::hours(14);
+    client.execute(&insert, &[&time, &time.date_naive(), &"memory"]).await?;
+    assert_eq!(env.snapshot_stats().mem_total_rows, 1, "exercise a real hybrid read");
+    let rows = client
+        .query(
+            &format!("SELECT id FROM {table} WHERE project_id='e2e_project' AND timestamp > $1 AND timestamp <= $2 ORDER BY id"),
+            &[&(future - chrono::Duration::microseconds(1)), &(boot + chrono::Duration::hours(16))],
+        )
+        .await?;
+    assert_eq!(rows.iter().map(|row| row.get::<_, String>(0)).collect::<Vec<_>>(), ["delta", "memory"]);
+    let bound = env.buffered_layer().delta_timestamp_upper_bound("e2e_project", table);
+    if omit_stats {
+        assert_eq!(bound, None, "a loaded file without statistics must retain the complete Delta leg");
+    } else {
+        assert!(
+            bound.is_some_and(|upper| upper >= future.timestamp_micros() && upper < time.timestamp_micros()),
+            "known Add statistics must retain a finite conservative skip bound"
+        );
+    }
+    // Bulk writes bypass the buffered event-time admission bound. Account for
+    // their actual rows before publication, even beyond the 48-hour ceiling.
+    let bulk_time = boot + chrono::Duration::hours(96);
+    client.execute(&insert.replace(table, &format!("{table}__bulk")), &[&bulk_time, &bulk_time.date_naive(), &"bulk"]).await?;
+    assert_eq!(env.snapshot_stats().mem_total_rows, 1, "bulk must commit directly to Delta");
+    let rows = client
+        .query(
+            &format!("SELECT id FROM {table} WHERE project_id='e2e_project' AND timestamp > $1 AND timestamp <= $2 ORDER BY id"),
+            &[&(boot + chrono::Duration::hours(13)), &(boot + chrono::Duration::hours(100))],
+        )
+        .await?;
+    assert_eq!(rows.iter().map(|row| row.get::<_, String>(0)).collect::<Vec<_>>(), ["bulk", "memory"]);
+    Ok(())
+}

@@ -4062,7 +4062,32 @@ impl Database {
                 "fast_resolve_cache crossed soft limit (no eviction by design). If your steady-state tenant count is below the threshold, dropped or transient project_ids are accumulating. Watch scan.fast_resolve_cache_entries in timefusion_stats."
             );
         }
-        let has_files = t.read().await.version().is_some_and(|v| v > 0);
+        let table = t.read().await;
+        let snapshot = table.snapshot();
+        // Version zero can already contain data. Only a loaded empty file set
+        // proves that skipping Delta is safe.
+        let has_files = snapshot.as_ref().map_or(true, |state| state.snapshot().log_data().iter().next().is_some());
+        if let Some(layer) = self.buffered_layer()
+            && layer.needs_initial_delta_timestamp_bound(project_id, table_name)
+        {
+            // Read cached Add statistics once per resolved key, one file at a
+            // time. Missing/malformed bounds retain the ordinary scan path.
+            let initial = snapshot.ok().and_then(|state| {
+                state
+                    .snapshot()
+                    .log_data()
+                    .iter()
+                    .filter(|file| file.partition_values_map().get("project_id").and_then(Option::as_deref).is_none_or(|actual| actual == project_id))
+                    .try_fold(i64::MIN, |upper, file| {
+                        let stats: serde_json::Value = serde_json::from_str(file.stats().as_deref()?).ok()?;
+                        // Delta Add timestamps are truncated to milliseconds;
+                        // cover every microsecond in the reported final millisecond.
+                        Some(upper.max(delta_stat_micros(stats.get("maxValues")?.get("timestamp")?)?.saturating_add(999)))
+                    })
+            });
+            layer.initialize_delta_timestamp_bound(project_id, table_name, initial);
+        }
+        drop(table);
         let entry = self.delta_has_files.entry(key).or_default();
         if has_files {
             // Release pairs with the Acquire load in delta_scan_can_be_skipped.

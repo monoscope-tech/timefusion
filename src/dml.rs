@@ -807,20 +807,18 @@ pub(crate) fn fmt_capped(value: &dyn std::fmt::Debug, limit: usize) -> String {
 /// would clamp away rows whose Delta copy is still stale, losing the update.
 fn delta_leg_predicate(buffered_layer: Option<&Arc<BufferedWriteLayer>>, table_name: &str, project_id: &str, predicate: Option<&Expr>) -> Option<Option<Expr>> {
     let time_col = crate::dml::table_time_column(table_name);
-    let base: Option<Expr> = match buffered_layer {
-        None => predicate.cloned(),
-        Some(layer) => {
-            let watermark = layer.delta_flushed_watermark(project_id, table_name);
-            match crate::dml::clamp_to_watermark(predicate, time_col, watermark) {
+    let base: Option<Expr> =
+        match buffered_layer.filter(|_| time_col == "timestamp").and_then(|layer| layer.delta_timestamp_upper_bound(project_id, table_name)) {
+            None => predicate.cloned(),
+            Some(watermark) => match crate::dml::clamp_to_watermark(predicate, time_col, watermark) {
                 crate::dml::WatermarkClamp::Keep(p) => p,
                 crate::dml::WatermarkClamp::SkipDelta => {
                     crate::observability::record_dml_delta_leg_skipped();
                     debug!("DML delta leg skipped for {project_id}/{table_name}: time window entirely above flush watermark");
                     return None;
                 }
-            }
-        }
-    };
+            },
+        };
     // Derive `date`-partition bounds from the clamped time-column predicate so
     // the Delta leg prunes files instead of scanning every partition.
     let partitions_by_date = crate::schema::get_schema(table_name).is_some_and(|s| s.partitions.iter().any(|p| p == "date"));
@@ -2565,12 +2563,16 @@ impl DmlCoalescer {
         // Bucket after folding so each merge unit's target window stays ∝
         // DML_MERGE_BUCKET_MICROS, not the group's union window (see const).
         for (key, mut group) in groups.into_iter().flat_map(|(key, g)| bucket_group(g).into_iter().map(move |b| (key.clone(), b))) {
-            if let Some(layer) = db.buffered_layer() {
+            if let Some(layer) = db.buffered_layer()
+                && table_time_column(&key.table_name) == "timestamp"
+            {
                 // Folded groups clamp against the MAX member watermark: a row
                 // is excludable only when it is unflushed for every member.
                 let projects = group.folded_projects.as_deref().unwrap_or_else(|| std::slice::from_ref(&key.project_id));
-                let wm = projects.iter().map(|p| layer.delta_flushed_watermark(p, &key.table_name)).max().unwrap_or(i64::MIN);
-                if matches!(clamp_decomposed(&mut group.predicate, wm), ClampAction::Skip) {
+                let watermark =
+                    projects.iter().try_fold(i64::MIN, |upper, project| Some(upper.max(layer.delta_timestamp_upper_bound(project, &key.table_name)?)));
+                // An unknown member's historical rows cannot be clamped away.
+                if watermark.is_some_and(|upper| matches!(clamp_decomposed(&mut group.predicate, upper), ClampAction::Skip)) {
                     crate::observability::record_dml_delta_leg_skipped();
                     debug!("dml coalesce: skipping {}/{} group — window entirely above flush watermark", key.project_id, key.table_name);
                     continue;

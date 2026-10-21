@@ -1411,15 +1411,12 @@ impl ProjectRoutingTable {
 
         span.record("scan.uses_mem_buffer", true);
 
-        // Skip Delta when the query's lower bound is strictly above the per-table flushed
-        // watermark (max row ts ever handed to a Delta commit, floored at boot): Delta provably
-        // holds nothing newer. Do NOT weaken this to `query_min >= mem_oldest` — that hides
-        // rows whenever Delta holds data inside MemBuffer's range.
-        //
-        // Second disjunct: if no flush has ever committed for this (project, table), Delta is
-        // empty. Flipped by the flush callback after a successful commit, never flipped back.
-        let skip_delta = query_time_range.is_some_and(|(query_min, _)| query_min > layer.delta_flushed_watermark(&project_id, &self.table_name))
-            || self.database.delta_scan_can_be_skipped(&project_id, &self.table_name);
+        // Skip only above a proved snapshot/flush bound. Boot wall time is not
+        // a bound on previously committed future-dated rows. Unknown statistics
+        // require the normal scan; a failed in-flight flush only raises the bound.
+        let skip_delta =
+            query_time_range.zip(layer.delta_timestamp_upper_bound(&project_id, &self.table_name)).is_some_and(|((query_min, _), upper)| query_min > upper)
+                || self.database.delta_scan_can_be_skipped(&project_id, &self.table_name);
         scan_state.lock().skipped_delta = skip_delta;
 
         // `query_partitioned_with_text_match` runs its own per-bucket prefilter inside the

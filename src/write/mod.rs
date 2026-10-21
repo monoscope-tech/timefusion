@@ -444,6 +444,19 @@ struct CoalescedGroup {
     first_wal_pin: Option<i64>,
 }
 
+#[derive(Default)]
+struct DeltaTimestampBound {
+    initial: std::sync::OnceLock<Option<i64>>,
+    flushed: Option<i64>,
+}
+
+impl DeltaTimestampBound {
+    fn upper_bound(&self) -> Option<i64> {
+        let initial = self.initial.get().copied().flatten()?;
+        Some(self.flushed.map_or(initial, |flushed| initial.max(flushed)))
+    }
+}
+
 struct CombinedBucket {
     combined: crate::write::mem_buffer::FlushableBucket,
     source_buckets: Vec<crate::write::mem_buffer::FlushableBucket>,
@@ -588,14 +601,10 @@ pub struct BufferedWriteLayer {
     /// so graceful shutdown does not await in-flight tantivy uploads — the
     /// sidecar is best-effort and rebuildable from Delta.
     tantivy_spawn_sem: Arc<tokio::sync::Semaphore>,
-    /// Per-(project, table) max row timestamp ever handed to a Delta commit this
-    /// process lifetime, floored at `boot_micros`. A query whose lower time
-    /// bound is above it can skip the Delta scan. Must be raised BEFORE the
-    /// commit so a query can't race between commit-visible and watermark-raise;
-    /// a failed commit then leaves it conservatively high.
-    delta_flushed_watermark: DashMap<crate::write::mem_buffer::TableKey, i64>,
-    /// Recovery-time floor for the watermark: anything committed by earlier
-    /// process lifetimes has row timestamps at/below roughly this.
+    /// Initial snapshot proof plus row maxima handed to commits in this process.
+    /// Unknown initial bounds must not permit a Delta-skip optimization.
+    delta_timestamp_bounds: DashMap<crate::write::mem_buffer::TableKey, DeltaTimestampBound>,
+    /// Process start time, exposed in runtime statistics.
     boot_micros: i64,
     /// WAL read-cursor holds for inserts whose entry is appended but whose
     /// MemBuffer bucket hasn't recorded its hold yet (the append→record
@@ -780,7 +789,7 @@ impl BufferedWriteLayer {
             // Above realistic per-cycle table fan-out, still bounding
             // worst-case S3 / tantivy heap usage.
             tantivy_spawn_sem: Arc::new(tokio::sync::Semaphore::new(16)),
-            delta_flushed_watermark: DashMap::new(),
+            delta_timestamp_bounds: DashMap::new(),
             boot_micros: crate::support::now_micros(),
             pending_wal_holds: DashMap::new(),
             inflight_flush_holds: DashMap::new(),
@@ -2311,13 +2320,8 @@ impl BufferedWriteLayer {
     /// rows, and compute the conservative WAL watermark the commit must carry.
     fn prepare_flush(&self, bucket: &FlushableBucket) -> anyhow::Result<(Vec<RecordBatch>, DeltaWatermark)> {
         // Raise the Delta watermark before the commit (see field docs).
-        // Routing timestamps identify the bucket; a batch can also contain
-        // newer rows. The scan watermark must bound every row sent to Delta.
-        let row_max = bucket.batches.iter().filter_map(batch_timestamp_range).map(|(_, hi)| hi).fold(bucket.max_timestamp, i64::max);
-        if row_max != i64::MIN {
-            let key = (Arc::<str>::from(bucket.project_id.as_str()), Arc::<str>::from(bucket.table_name.as_str()));
-            self.delta_flushed_watermark.entry(key).and_modify(|w| *w = (*w).max(row_max)).or_insert(row_max);
-        }
+        // Routing timestamps identify the bucket, not its complete row span.
+        self.note_delta_rows(&bucket.project_id, &bucket.table_name, &bucket.batches);
         // Last-write-wins dedup on the per-table key set from schema YAML (empty key list =
         // pass-through). Must run before both the Delta write and the tantivy sidecar so both
         // see the same row set.
@@ -3188,12 +3192,35 @@ impl BufferedWriteLayer {
         self.mem_buffer.min_row_micros(project_id, table_name)
     }
 
-    /// Upper bound on row timestamps Delta can hold for this table — see
-    /// `delta_flushed_watermark`. Queries bounded strictly above this can
-    /// skip the Delta scan.
-    pub fn delta_flushed_watermark(&self, project_id: &str, table_name: &str) -> i64 {
+    /// Raise the bound before publishing these normalized rows. This also
+    /// covers direct bulk writes, which bypass buffered event-time admission.
+    pub(crate) fn note_delta_rows(&self, project_id: &str, table_name: &str, batches: &[RecordBatch]) {
+        let maximum =
+            batches.iter().filter_map(|batch| crate::read::ts_micros_column(batch, "timestamp")).filter_map(|column| arrow::compute::max(&column)).max();
+        if let Some(maximum) = maximum {
+            let key = (Arc::<str>::from(project_id), Arc::<str>::from(table_name));
+            let mut bound = self.delta_timestamp_bounds.entry(key).or_default();
+            bound.flushed = Some(bound.flushed.map_or(maximum, |prior| prior.max(maximum)));
+        }
+    }
+
+    pub(crate) fn needs_initial_delta_timestamp_bound(&self, project_id: &str, table_name: &str) -> bool {
         let key = (Arc::<str>::from(project_id), Arc::<str>::from(table_name));
-        self.delta_flushed_watermark.get(&key).map_or(self.boot_micros, |w| (*w).max(self.boot_micros))
+        self.delta_timestamp_bounds.get(&key).is_none_or(|bound| bound.initial.get().is_none())
+    }
+
+    /// Install the loaded snapshot's bound without losing any in-flight flush
+    /// maximum. `None` means missing statistics, not an empty snapshot.
+    pub(crate) fn initialize_delta_timestamp_bound(&self, project_id: &str, table_name: &str, initial: Option<i64>) {
+        let key = (Arc::<str>::from(project_id), Arc::<str>::from(table_name));
+        self.delta_timestamp_bounds.entry(key).or_default().initial.get_or_init(|| initial);
+    }
+
+    /// A proved upper bound on every row Delta can hold. Startup wall time is
+    /// insufficient because admitted or bulk-loaded rows can be in the future.
+    pub fn delta_timestamp_upper_bound(&self, project_id: &str, table_name: &str) -> Option<i64> {
+        let key = (Arc::<str>::from(project_id), Arc::<str>::from(table_name));
+        self.delta_timestamp_bounds.get(&key)?.upper_bound()
     }
 
     pub fn query(&self, project_id: &str, table_name: &str, filters: &[datafusion::logical_expr::Expr]) -> anyhow::Result<Vec<RecordBatch>> {
@@ -3368,6 +3395,22 @@ mod tests {
 
     use super::*;
     use crate::support::test_helpers::{json_to_batch, query_col_strings, test_layer, test_span};
+
+    #[test_case::test_case(None, None, false => None; "uninitialized")]
+    #[test_case::test_case(None, Some(200), false => None; "flush cannot prove unseen history")]
+    #[test_case::test_case(None, Some(200), true => None; "missing statistics stay unknown")]
+    #[test_case::test_case(Some(100), None, true => Some(100); "snapshot only")]
+    #[test_case::test_case(Some(100), Some(200), true => Some(200); "newer flush wins")]
+    #[test_case::test_case(Some(300), Some(200), true => Some(300); "older flush cannot lower bound")]
+    #[test_case::test_case(Some(i64::MIN), None, true => Some(i64::MIN); "proven empty")]
+    #[test_case::test_case(Some(i64::MIN), Some(200), true => Some(200); "first write after empty snapshot")]
+    fn delta_timestamp_bound_needs_snapshot_proof(initial: Option<i64>, flushed: Option<i64>, observed: bool) -> Option<i64> {
+        let bound = DeltaTimestampBound { flushed, ..Default::default() };
+        if observed {
+            bound.initial.get_or_init(|| initial);
+        }
+        bound.upper_bound()
+    }
 
     /// `landed_digest` must be order-independent (replay reorders batches relative to the
     /// original flush) and must never cancel — hence addition, not XOR, which would collapse a
@@ -5336,6 +5379,9 @@ mod tests {
     #[serial]
     #[tokio::test]
     async fn a_stalled_commit_detaches_and_its_completion_drains_the_bucket() {
+        // Keep row and force-flush selection in the same bucket across a wall-clock boundary.
+        let now = crate::support::set_micros(chrono::Utc::now().timestamp_micros());
+        let _clock = scopeguard::guard((), |_| crate::support::unfreeze());
         let (_dir, cfg, project, _keyless) = test_env_with("dt", |c| {
             c.buffer.timefusion_flush_dwell_secs = 0;
             c.buffer.timefusion_flush_bucket_timeout_secs = 1;
@@ -5357,7 +5403,7 @@ mod tests {
                 })
             }),
         );
-        layer.insert(&project, &table, vec![create_test_batch(&project)]).await.unwrap();
+        layer.insert(&project, &table, vec![span_batch("test", "span", &project, now)]).await.unwrap();
 
         layer.force_flush_current_buckets().await.unwrap();
         assert!(!layer.is_empty(), "the timed-out cycle must restore the bucket");

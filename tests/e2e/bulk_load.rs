@@ -21,6 +21,9 @@ async fn insert_bulk(client: &tokio_postgres::Client, id: &str, ts_micros: i64) 
 async fn bulk_alias_skips_membuffer_but_is_queryable() -> anyhow::Result<()> {
     let env = E2eEnv::builder().start().await?;
     let client = env.pg_client().await?;
+    env.db().cancel_maintenance();
+    env.db().resolve_table("e2e_project", "otel_logs_and_spans").await?;
+    assert!(env.db().delta_scan_can_be_skipped("e2e_project", "otel_logs_and_spans"), "fixture must start with known empty Delta");
 
     // Control: a normal INSERT lands in the MemBuffer.
     insert_at(&client, "buffered-1", FROZEN_START_MICROS).await?;
@@ -35,6 +38,14 @@ async fn bulk_alias_skips_membuffer_but_is_queryable() -> anyhow::Result<()> {
     // ...yet the bulk row is immediately visible in the real table (it's in Delta).
     let count: i64 = client.query_one("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1 AND id = $2", &[&"e2e_project", &"bulk-1"]).await?.get(0);
     assert_eq!(count, 1, "bulk row not visible in otel_logs_and_spans (skip_queue write lost)");
+
+    let start = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(FROZEN_START_MICROS).unwrap();
+    let rows = client.query("SELECT id FROM otel_logs_and_spans WHERE project_id='e2e_project' AND timestamp >= $1 ORDER BY id", &[&start]).await?;
+    assert_eq!(
+        rows.iter().map(|row| row.get::<_, String>(0)).collect::<Vec<_>>(),
+        ["buffered-1", "bulk-1"],
+        "a bulk publication must revoke cached empty-Delta evidence"
+    );
 
     Ok(())
 }
