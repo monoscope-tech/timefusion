@@ -2525,12 +2525,22 @@ mod ordered_probe_contract_tests {
         })
     }
 
+    fn probe_file_row_groups(file: usize, full_overlap: bool) -> usize {
+        if full_overlap {
+            // Production footer census: 16×43, 1×44, 2×42, 3×40, 1×41.
+            [43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 44, 42, 42, 40, 40, 40, 41][file]
+        } else {
+            42 + usize::from(file < 11)
+        }
+    }
+
     /// Match the observed file/row-group overlap without scanning production rows.
     /// The oracle counts raw keys before any DataFusion grouping or read-side dedup.
-    #[test_case::test_case(true ; "ordered overlapping files")]
-    #[test_case::test_case(false ; "unordered fallback")]
+    #[test_case::test_case(true, false ; "ordered overlapping files")]
+    #[test_case::test_case(false, false ; "unordered fallback")]
+    #[test_case::test_case(true, true ; "ordered full overlap")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn whole_date_probe_matches_raw_keys_across_overlapping_files(ordered: bool) -> Result<()> {
+    async fn whole_date_probe_matches_raw_keys_across_overlapping_files(ordered: bool, full_overlap: bool) -> Result<()> {
         const TABLE: &str = "otel_logs_and_spans";
         let db = Database::with_config(TestConfigBuilder::new("ordered-probe-contract").build()).await?;
         db.cancel_maintenance();
@@ -2541,14 +2551,14 @@ mod ordered_probe_contract_tests {
         let schema = schema_or_default(TABLE);
         let mut counts = std::collections::HashMap::new();
         for file in 0..23 {
-            // Eleven 43-group files and twelve 42-group files: 977 groups total.
-            let rows = (if file < 11 { 43 } else { 42 }) * 64;
+            let rows = probe_file_row_groups(file, full_overlap) * 64;
             let records = (0..rows)
                 .map(|row| {
-                    let key = file * 128 + row;
-                    let ts = start + (key / 3) as i64 * 3_000_000;
+                    let key = if full_overlap { row } else { file * 128 + row };
+                    let ts = start + (key / 3) as i64 * if full_overlap { 6_000_000 } else { 3_000_000 };
                     let service = (key % 7 != 0).then_some("api");
-                    let id = format!("id-{}", key % 17);
+                    let identity_file = if full_overlap { if key % 2 == 0 { file / 2 } else { file + 23 } } else { 0 };
+                    let id = format!("id-{}-{identity_file}", key % 17);
                     *counts.entry((ts, service, id.clone())).or_insert(0i64) += 1;
                     serde_json::json!({"project_id": project, "date": day.to_string(), "timestamp": ts,
                         "resource___service___name": service, "id": id, "level": "INFO", "status_code": "UNSET", "hashes": [], "summary": []})
@@ -2631,20 +2641,7 @@ mod ordered_probe_contract_tests {
         let max_group_rows = rows_per_group + usize::from(extra_rows > 0);
         let ranges: Vec<_> = (0..23)
             .map(|file| {
-                let groups = if full_overlap {
-                    // Production footer census: 16×43, 1×44, 2×42, 3×40, 1×41.
-                    match file {
-                        0..16 => 43,
-                        16 => 44,
-                        17..19 => 42,
-                        19..22 => 40,
-                        _ => 41,
-                    }
-                } else if file < 11 {
-                    43
-                } else {
-                    42
-                };
+                let groups = probe_file_row_groups(file, full_overlap);
                 let extra = extra_rows.min(groups);
                 extra_rows -= extra;
                 let lo = if full_overlap { 0 } else { file * 43 * rows_per_group / 2 };
