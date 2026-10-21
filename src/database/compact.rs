@@ -2613,19 +2613,22 @@ mod ordered_probe_contract_tests {
     }
 
     /// Expensive, explicit volume experiment; normal CI retains the exact-key cases above.
-    #[test_case::test_case(4096, 0, false ; "four million rows")]
-    #[test_case::test_case(295781, 424, false ; "production row count")]
-    #[test_case::test_case(4096, 0, true ; "four million rows full overlap")]
-    #[test_case::test_case(295781, 424, true ; "production row count full overlap")]
+    #[test_case::test_case(4096, 0, false, 0 ; "four million rows")]
+    #[test_case::test_case(295781, 424, false, 0 ; "production row count")]
+    #[test_case::test_case(4096, 0, true, 0 ; "four million rows full overlap")]
+    #[test_case::test_case(295781, 424, true, 0 ; "production row count full overlap")]
+    #[test_case::test_case(4096, 0, true, 1 ; "four million rows full overlap single partition")]
+    #[test_case::test_case(295781, 424, true, 1 ; "production row count full overlap single partition")]
     #[ignore = "writes a production-shaped synthetic key workload to local MinIO"]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn whole_date_probe_volume(rows_per_group: usize, mut extra_rows: usize, full_overlap: bool) -> Result<()> {
+    async fn whole_date_probe_volume(rows_per_group: usize, mut extra_rows: usize, full_overlap: bool, target_partitions: usize) -> Result<()> {
         use arrow::array::{ArrayRef, StringArray, TimestampMicrosecondArray, UInt32Array, new_null_array};
         const TABLE: &str = "otel_logs_and_spans";
         // Reuse only a previous local experiment prefix to avoid rewriting gigabytes while debugging cancellation.
         let reuse = std::env::var("TIMEFUSION_PROBE_VOLUME_PREFIX").ok();
         anyhow::ensure!(!full_overlap || reuse.is_none(), "full-overlap inputs must be regenerated; row counts alone cannot establish their geometry");
         let mut config = TestConfigBuilder::new("probe-volume").build();
+        Arc::make_mut(&mut config).memory.timefusion_query_partitions = target_partitions;
         if let Some(prefix) = &reuse {
             anyhow::ensure!(
                 prefix.strip_prefix("test-probe-volume-").is_some_and(|s| s.len() == 8 && s.bytes().all(|b| b.is_ascii_hexdigit())),
@@ -2737,7 +2740,7 @@ mod ordered_probe_contract_tests {
             }
         }
         eprintln!(
-            "volume_input rows={total_rows} files=23 row_groups=977 full_overlap={full_overlap} pool_limit_bytes={} prepare_ms={} reused={} table_uri={}",
+            "volume_input rows={total_rows} files=23 row_groups=977 full_overlap={full_overlap} target_partitions={target_partitions} pool_limit_bytes={} prepare_ms={} reused={} table_uri={}",
             db.heavy_pool_bytes(),
             prepared.elapsed().as_millis(),
             reuse.is_some(),
