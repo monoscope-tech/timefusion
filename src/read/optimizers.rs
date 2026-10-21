@@ -890,9 +890,11 @@ mod peel_tests {
         // Running the analyzer twice must not double-wrap.
         let once = analyze(variant_projection());
         let twice = analyze(once.clone());
+        assert_eq!(twice, once, "a second pass must preserve the complete analyzed plan");
         let expr_twice = first_projection_expr(&twice);
+        assert_eq!(expr_twice.schema_name().to_string(), "v", "wire conversion must preserve the projected name");
         assert!(is_variant_to_json_call(expr_twice));
-        let Expr::ScalarFunction(sf) = expr_twice else {
+        let Expr::ScalarFunction(sf) = expr_twice.clone().unalias() else {
             panic!("not a scalar function");
         };
         assert_eq!(sf.args.len(), 1);
