@@ -83,21 +83,30 @@ async fn insert_select_unnest_coerces_text_to_variant() -> anyhow::Result<()> {
             fields[idx] = Arc::new(Field::new(name, DataType::Utf8, false));
             columns[idx] = Arc::new(StringArray::from(vec![value])) as ArrayRef;
         }
+        let id = row.schema().index_of("id")?;
+        fields[id] = Arc::new(fields[id].as_ref().clone().with_nullable(true));
         Ok(RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)?)
     };
     let good = input_batch("e2e_rejected_a", r#"{"msg":"safe"}"#)?;
     let bad = input_batch("e2e_rejected_b", "private-literal-canary invalid JSON")?;
+    let null_id = input_batch("e2e_rejected_b", r#"{"msg":"safe"}"#)?;
+    let mut columns = null_id.columns().to_vec();
+    let id = null_id.schema().index_of("id")?;
+    columns[id] = arrow::array::new_null_array(columns[id].data_type(), 1);
+    let null_id = RecordBatch::try_new(null_id.schema(), columns)?;
     let before = env.snapshot_stats();
-    let mixed = arrow::compute::concat_batches(&good.schema(), [&good, &bad])?;
-    assert!(routing.fast_insert_batch(mixed).await.is_err());
-    let stream = RecordBatchStreamAdapter::new(good.schema(), futures::stream::iter([Ok(good), Ok(bad)]));
-    assert!(routing.write_all(Box::pin(stream), &ctx.task_ctx()).await.is_err());
-    let after = env.snapshot_stats();
-    assert_eq!(
-        (after.rows_ingested_total, after.mem_total_rows, after.wal_known_topics, after.wal_disk_bytes),
-        (before.rows_ingested_total, before.mem_total_rows, before.wal_known_topics, before.wal_disk_bytes),
-        "both write entry points must finish conversion across projects/batches before any WAL append"
-    );
+    for bad in [bad, null_id] {
+        let mixed = arrow::compute::concat_batches(&good.schema(), [&good, &bad])?;
+        assert!(routing.fast_insert_batch(mixed).await.is_err());
+        let stream = RecordBatchStreamAdapter::new(good.schema(), futures::stream::iter([Ok(good.clone()), Ok(bad)]));
+        assert!(routing.write_all(Box::pin(stream), &ctx.task_ctx()).await.is_err());
+        let after = env.snapshot_stats();
+        assert_eq!(
+            (after.rows_ingested_total, after.mem_total_rows, after.wal_known_topics, after.wal_disk_bytes),
+            (before.rows_ingested_total, before.mem_total_rows, before.wal_known_topics, before.wal_disk_bytes),
+            "both write entry points must validate all batches/projects before any WAL append"
+        );
+    }
 
     // Keep the Variant extraction non-aggregate: an aggregate over it hits an
     // unrelated aggregate-schema path.

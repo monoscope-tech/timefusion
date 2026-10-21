@@ -2528,7 +2528,8 @@ fn derive_date_partition(batch: RecordBatch) -> DFResult<RecordBatch> {
     RecordBatch::try_new(schema, columns).map_err(arrow_err)
 }
 
-/// Convert Utf8/Utf8View/LargeUtf8 columns to Variant binary StructArrays where the target schema
+/// Reject NULLs in required input columns, then convert Utf8/Utf8View/LargeUtf8
+/// columns to Variant binary StructArrays where the target schema
 /// expects Variant — the table provider presents Variant columns as Utf8View for the SQL planner's
 /// type check, while Delta storage expects Variant structs.
 fn convert_variant_columns(batch: RecordBatch, target_schema: &SchemaRef) -> DFResult<RecordBatch> {
@@ -2562,9 +2563,19 @@ fn convert_variant_columns(batch: RecordBatch, target_schema: &SchemaRef) -> DFR
         Ok(StructArray::new(fields.into(), vec![metadata, value], arr.nulls().cloned()))
     }
 
+    // The shared write funnel derives `date` from a non-null timestamp before
+    // queueing. All other required input columns must be valid before any WAL
+    // append, rather than failing a coalesced flush after acknowledgement.
+    let derives_date = batch.column_by_name("timestamp").is_some_and(|timestamp| timestamp.null_count() == 0);
     remap_batch_columns(batch, |idx, _field, col| {
-        let Some(target_field) = target_schema.fields().get(idx).filter(|f| is_variant_type(f.data_type())) else { return Ok(None) };
+        let Some(target_field) = target_schema.fields().get(idx) else { return Ok(None) };
         let name = target_field.name();
+        if !target_field.is_nullable() && col.null_count() > 0 && !(derives_date && name == "date") {
+            return Err(DataFusionError::Execution(format!("NULL in required column {name}")));
+        }
+        if !is_variant_type(target_field.data_type()) {
+            return Ok(None);
+        }
         let bad_downcast = |ty: &str| DataFusionError::Execution(format!("{ty} downcast failed for column {name}"));
         let converted = match col.data_type() {
             DataType::Utf8View => utf8_to_variant(col.as_any().downcast_ref::<StringViewArray>().ok_or_else(|| bad_downcast("Utf8View"))?.iter(), name)?,

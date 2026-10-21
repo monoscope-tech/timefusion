@@ -43,6 +43,29 @@ fn convert_variant_errors_do_not_disclose_input(ty: DataType, oversized: bool) -
     Ok(())
 }
 
+#[test_case("value", false, true, false => false; "required scalar rejects null")]
+#[test_case("value", true, true, false => true; "nullable scalar retains null")]
+#[test_case("value", false, false, false => true; "required scalar accepts value")]
+#[test_case("date", false, true, false => false; "null date without derivation rejects")]
+#[test_case("date", false, true, true => true; "date derives from timestamp")]
+fn insert_nulls_obey_required_columns(name: &str, nullable: bool, null: bool, timestamp: bool) -> bool {
+    use arrow::{
+        array::{ArrayRef, Date32Array, Int64Array, TimestampMicrosecondArray},
+        datatypes::{Field, Schema},
+    };
+    let value = (!null).then_some(42);
+    let column: ArrayRef = if name == "date" { Arc::new(Date32Array::from(vec![value])) } else { Arc::new(Int64Array::from(vec![value.map(i64::from)])) };
+    let mut fields = vec![Field::new(name, column.data_type().clone(), nullable)];
+    let mut columns = vec![column];
+    if timestamp {
+        let time = Arc::new(TimestampMicrosecondArray::from(vec![1]).with_timezone("UTC"));
+        fields.push(Field::new("timestamp", time.data_type().clone(), false));
+        columns.push(time);
+    }
+    let batch = RecordBatch::try_new(Arc::new(Schema::new(fields.iter().map(|field| field.clone().with_nullable(true)).collect::<Vec<_>>())), columns).unwrap();
+    convert_variant_columns(batch, &Arc::new(Schema::new(fields))).is_ok()
+}
+
 #[test_case(0 => RollupOutputEvidence::Unknown; "absent files are not empty proof")]
 #[test_case(1 => RollupOutputEvidence::Files(std::num::NonZeroU32::MIN); "file backed")]
 #[test_case(u32::MAX as u64 => RollupOutputEvidence::Files(std::num::NonZeroU32::MAX); "largest exact count")]
