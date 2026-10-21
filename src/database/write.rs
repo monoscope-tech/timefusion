@@ -1394,30 +1394,58 @@ impl Database {
     /// history scan. Missing versions require exact-payload resumption proof;
     /// otherwise preserve WAL and stop startup conservatively.
     pub async fn reconcile_flush_publications(&self, layer: &crate::write::BufferedWriteLayer) -> Result<usize> {
-        use crate::write::wal::{FlushPublicationJournal, FlushPublicationState};
+        use crate::{
+            observability::TimedSection,
+            write::wal::{FlushPublicationJournal, FlushPublicationState},
+        };
+        let started = std::time::Instant::now();
+        let _total = TimedSection::new("flush_recovery_total");
         layer.begin_publication_recovery(&[]);
-        let paths = FlushPublicationJournal::paths(layer.wal().data_dir())?;
+        let paths = {
+            let _timer = TimedSection::new("flush_recovery_list");
+            FlushPublicationJournal::paths(layer.wal().data_dir())?
+        };
+        let journals = paths.len();
         let mut topics = HashSet::new();
+        let (mut prepared, mut publishing, mut committed, mut aborted) = (0usize, 0usize, 0usize, 0usize);
         for path in &paths {
-            let record = FlushPublicationJournal::open(path.clone())?.record();
+            let record = {
+                let _timer = TimedSection::new("flush_recovery_decode");
+                FlushPublicationJournal::open(path.clone())?.record()
+            };
+            match &record.state {
+                FlushPublicationState::Prepared => prepared += 1,
+                FlushPublicationState::Publishing { .. } => publishing += 1,
+                FlushPublicationState::Committed { .. } => committed += 1,
+                FlushPublicationState::Aborted => aborted += 1,
+            }
             if matches!(record.state, FlushPublicationState::Publishing { .. } | FlushPublicationState::Committed { .. }) {
                 topics.insert((record.project_id, record.table_name));
             }
         }
         let topics = topics.into_iter().collect::<Vec<_>>();
+        info!(journals, prepared, publishing, committed, aborted, topics = topics.len(), event = "flush_publication_recovery_started");
         layer.begin_publication_recovery(&topics);
         let mut confirmed = 0;
         let mut refreshed = HashSet::new();
         for path in paths {
-            let journal = FlushPublicationJournal::open(path)?;
-            let record = journal.record();
+            let (journal, record) = {
+                let _timer = TimedSection::new("flush_recovery_decode");
+                let journal = FlushPublicationJournal::open(path)?;
+                let record = journal.record();
+                (journal, record)
+            };
             let (target, versions, proven) = match &record.state {
                 FlushPublicationState::Prepared | FlushPublicationState::Aborted => continue,
                 FlushPublicationState::Publishing { target, versions } => (target, versions.clone(), false),
                 FlushPublicationState::Committed { target, version } => (target, vec![*version], true),
             };
-            let table_ref = self.resolve_table(&record.project_id, &record.table_name).await?;
+            let table_ref = {
+                let _timer = TimedSection::new("flush_recovery_resolve");
+                self.resolve_table(&record.project_id, &record.table_name).await?
+            };
             if refreshed.insert((target.table_uri.clone(), target.table_id.clone())) {
+                let _timer = TimedSection::new("flush_recovery_refresh");
                 tokio::time::timeout(COMMIT_LOCK_OP_TIMEOUT, refresh_table_snapshot(&table_ref, self.incremental_snapshot())).await??;
             }
             let store = {
@@ -1442,7 +1470,11 @@ impl Database {
                 if proven {
                     break;
                 }
-                match tokio::time::timeout(COMMIT_LOCK_OP_TIMEOUT, store.read_commit_entry(version)).await?? {
+                let entry = {
+                    let _timer = TimedSection::new("flush_recovery_version_probe");
+                    tokio::time::timeout(COMMIT_LOCK_OP_TIMEOUT, store.read_commit_entry(version)).await??
+                };
+                match entry {
                     Some(bytes) => {
                         if deltalake::logstore::get_actions(version, &bytes)?.iter().any(|action| {
                             matches!(action, deltalake::kernel::Action::CommitInfo(info) if info.info.get(FLUSH_COMMIT_ID_KEY).and_then(serde_json::Value::as_str) == Some(record.commit_id.to_string().as_str()))
@@ -1462,7 +1494,11 @@ impl Database {
             let mut unknown = false;
             if !landed {
                 for version in missing {
-                    match self.resume_flush_publication(layer, &table_ref, &record, version).await? {
+                    let resumed = {
+                        let _timer = TimedSection::new("flush_recovery_resume");
+                        self.resume_flush_publication(layer, &table_ref, &record, version).await?
+                    };
+                    match resumed {
                         CommitProbe::Landed => {
                             journal.note_committed(version);
                             landed = true;
@@ -1486,6 +1522,14 @@ impl Database {
             }
         }
         layer.finish_publication_recovery(&topics);
+        info!(
+            journals,
+            topics = topics.len(),
+            physical_tables = refreshed.len(),
+            confirmed,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            event = "flush_publication_recovery_complete"
+        );
         Ok(confirmed)
     }
 

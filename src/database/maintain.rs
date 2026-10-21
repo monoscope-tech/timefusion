@@ -977,12 +977,46 @@ impl Drop for PlanProgress {
 /// `collect()` reports nothing until it returns, so a unit inside a long
 /// aggregate is indistinguishable from a stalled one and gets killed.
 pub(crate) async fn collect_watched(ctx: &datafusion::prelude::SessionContext, sql: &str) -> Result<Vec<arrow::array::RecordBatch>> {
-    let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+    let mut scan = WatchedScan { planned: None, started: std::time::Instant::now(), outcome: ScanOutcome::Canceled };
+    let planned = {
+        let _timer = crate::observability::TimedSection::new("maintenance_sql_planning");
+        async { ctx.sql(sql).await?.create_physical_plan().await }.await
+    };
+    let plan = match planned {
+        Ok(plan) => plan,
+        Err(error) => {
+            scan.outcome = ScanOutcome::Failed;
+            return Err(error.into());
+        }
+    };
+    scan.planned = Some((Arc::clone(&plan), scan.started.elapsed()));
     let _progress = PlanProgress::watch(Arc::clone(&plan));
-    let started = std::time::Instant::now();
-    let batches = datafusion::physical_plan::collect(Arc::clone(&plan), ctx.task_ctx()).await?;
-    log_scan_pruning(plan.as_ref(), started.elapsed());
-    Ok(batches)
+    let result = datafusion::physical_plan::collect(Arc::clone(&plan), ctx.task_ctx()).await;
+    scan.outcome = if result.is_ok() { ScanOutcome::Succeeded } else { ScanOutcome::Failed };
+    result.map_err(Into::into)
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ScanOutcome {
+    Canceled,
+    Failed,
+    Succeeded,
+}
+
+/// Capture partial scan work when a caller drops the execution future at its deadline.
+struct WatchedScan {
+    planned: Option<(Arc<dyn datafusion::physical_plan::ExecutionPlan>, std::time::Duration)>,
+    started: std::time::Instant,
+    outcome: ScanOutcome,
+}
+
+impl Drop for WatchedScan {
+    fn drop(&mut self) {
+        match &self.planned {
+            Some((plan, planning)) => log_scan_pruning(plan.as_ref(), self.started.elapsed().saturating_sub(*planning), *planning, self.outcome),
+            None => info!(outcome = ?self.outcome, planning_ms = self.started.elapsed().as_millis() as u64, event = "maintenance_query_planning"),
+        }
+    }
 }
 
 fn plan_metric_fold(plan: &dyn datafusion::physical_plan::ExecutionPlan, of: impl Fn(&datafusion::physical_plan::metrics::MetricsSet) -> u64 + Copy) -> u64 {
@@ -997,26 +1031,30 @@ fn plan_metric_sum(plan: &dyn datafusion::physical_plan::ExecutionPlan, name: &s
 /// `bytes_scanned` is the only usable measure: predicate-excluded files are
 /// dropped during PLANNING so they reach no `pruned` counter, and
 /// `files_processed` is PER PARTITION so it grows with repartitioning.
-fn log_scan_pruning(plan: &dyn datafusion::physical_plan::ExecutionPlan, elapsed: std::time::Duration) {
+fn log_scan_pruning(plan: &dyn datafusion::physical_plan::ExecutionPlan, elapsed: std::time::Duration, planning: std::time::Duration, outcome: ScanOutcome) {
     let bytes_scanned = plan_metric_sum(plan, "bytes_scanned");
-    let _ = SCAN_CAPTURE.try_with(|passes| {
-        passes.borrow_mut().push(super::ScanPass {
-            bytes_scanned,
-            row_groups_pruned: plan_metric_sum(plan, "row_groups_pruned_statistics") + plan_metric_sum(plan, "row_groups_pruned_bloom_filter"),
-            output_rows: plan_output_rows(plan),
-            peak_mem_bytes: plan_metric_sum(plan, "peak_mem_used"),
-            elapsed_ms: elapsed.as_millis() as u64,
-            plan: datafusion::physical_plan::display::DisplayableExecutionPlan::with_metrics(plan).indent(true).to_string(),
-        })
-    });
-    if bytes_scanned == 0 {
+    if matches!(outcome, ScanOutcome::Succeeded) {
+        let _ = SCAN_CAPTURE.try_with(|passes| {
+            passes.borrow_mut().push(super::ScanPass {
+                bytes_scanned,
+                row_groups_pruned: plan_metric_sum(plan, "row_groups_pruned_statistics") + plan_metric_sum(plan, "row_groups_pruned_bloom_filter"),
+                output_rows: plan_output_rows(plan),
+                peak_mem_bytes: plan_metric_sum(plan, "peak_mem_used"),
+                elapsed_ms: elapsed.as_millis() as u64,
+                plan: datafusion::physical_plan::display::DisplayableExecutionPlan::with_metrics(plan).indent(true).to_string(),
+            })
+        });
+    }
+    if bytes_scanned == 0 && matches!(outcome, ScanOutcome::Succeeded) {
         return;
     }
     info!(
+        ?outcome,
+        planning_ms = planning.as_millis() as u64,
         operation = UNIT_OPERATION.try_with(|operation| *operation).unwrap_or("none"),
         bytes_scanned,
         row_groups_pruned = plan_metric_sum(plan, "row_groups_pruned_statistics") + plan_metric_sum(plan, "row_groups_pruned_bloom_filter"),
-        output_rows = plan_metric_sum(plan, "output_rows"),
+        output_rows = plan_output_rows(plan),
         elapsed_ms = elapsed.as_millis() as u64,
         event = "maintenance_scan_pruning",
         "how much of the registered partition a maintenance query actually opened"
