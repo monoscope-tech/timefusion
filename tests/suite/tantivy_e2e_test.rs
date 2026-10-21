@@ -1067,8 +1067,13 @@ async fn ids_and_dedup_input(ctx: &SessionContext, sql: &str) -> Result<(Vec<Str
 /// A predicate on a mutable column narrows every leg to the timestamps where some version
 /// matches (indexed hits, unindexed files, MemBuffer), so the newest version of each candidate
 /// still decides: no superseded match resurfaces and no newly matching version is lost.
+#[test_case(false, false; "partial coverage with seeded disk")]
+#[test_case(true, false; "complete coverage with seeded disk")]
+#[test_case(false, true; "partial coverage with cold disk")]
+#[test_case(true, true; "complete coverage with cold disk")]
 #[tokio::test(flavor = "multi_thread")]
-async fn a_mutable_predicate_narrows_to_candidate_timestamps_without_ghosts() -> Result<()> {
+async fn a_mutable_predicate_narrows_to_candidate_timestamps_without_ghosts(complete: bool, cold_disk: bool) -> Result<()> {
+    use object_store::ObjectStoreExt;
     use timefusion::{
         database::scan_metric_names::PREFILTER_MUTABLE_CANDIDATES,
         observability::{counter_value, init_local_metrics_for_test},
@@ -1079,7 +1084,11 @@ async fn a_mutable_predicate_narrows_to_candidate_timestamps_without_ghosts() ->
     let (on, ctx, svc) = build_db_with(&format!("{id}-mutcand-on"), true, |cfg| {
         // The fixture's derived TantivyConfig::default has a one-reader floor;
         // use the production capacity so the warm pass does not thrash it.
-        cfg.tantivy.timefusion_tantivy_reader_cache_entries = AppConfig::default().tantivy.timefusion_tantivy_reader_cache_entries;
+        let production = AppConfig::default().tantivy;
+        cfg.tantivy.timefusion_tantivy_reader_cache_entries = production.timefusion_tantivy_reader_cache_entries;
+        cfg.tantivy.timefusion_tantivy_bundle_writes = production.timefusion_tantivy_bundle_writes;
+        cfg.tantivy.timefusion_tantivy_range_reads = production.timefusion_tantivy_range_reads;
+        cfg.tantivy.timefusion_tantivy_block_cache_mb = production.timefusion_tantivy_block_cache_mb;
     })
     .await?;
     let (off, ctx_off, _) = build_db(&format!("{id}-mutcand-off"), false).await?;
@@ -1116,11 +1125,47 @@ async fn a_mutable_predicate_narrows_to_candidate_timestamps_without_ghosts() ->
         db.insert_records_batch(&p, table, vec![json_to_batch_for(table, indexed)?], false, None).await?;
         flush_all(db).await?;
     }
-    let store = svc.expect("tantivy").object_store.clone();
+    let service = svc.expect("tantivy");
+    let store = service.object_store.clone();
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
     while timefusion::tantivy::load_manifest(store.as_ref(), table, &p).await?.entries.values().map(|e| e.rows).sum::<u64>() < 36 {
         anyhow::ensure!(tokio::time::Instant::now() < deadline, "the flushed file must be indexed, or the covered path goes untested");
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    let uris = on.list_file_uris(&p, table).await?;
+    if complete {
+        let covered = timefusion::tantivy::load_manifest(store.as_ref(), table, &p)
+            .await?
+            .entries
+            .into_values()
+            .flat_map(|entry| entry.covered_files)
+            .collect::<std::collections::HashSet<_>>();
+        let delta_store = on.resolve_table(&p, table).await?.read().await.log_store().object_store(None);
+        for uri in &uris {
+            if !covered.contains(uri) {
+                let rel = timefusion::tantivy::search::parquet_rel_of_uri(uri).expect("relative parquet path");
+                service.build_index_for_file(table, &p, rel, uri, delta_store.clone()).await?;
+            }
+        }
+    }
+    let covered = timefusion::tantivy::load_manifest(store.as_ref(), table, &p)
+        .await?
+        .entries
+        .into_values()
+        .flat_map(|entry| entry.covered_files)
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(uris.iter().all(|uri| covered.contains(uri)), complete, "the requested coverage state must be real");
+    let mut index_bytes = 0;
+    for entry in timefusion::tantivy::load_manifest(store.as_ref(), table, &p).await?.entries.into_values() {
+        if let Some(path) = entry.index {
+            index_bytes += store.head(&object_store::path::Path::from(path)).await?.size;
+        }
+    }
+    assert!(index_bytes > 0);
+    let search = on.tantivy_search().expect("search service");
+    assert!(search.stats.cache_seeded.load(std::sync::atomic::Ordering::Relaxed) > 0, "publication must seed real local indexes");
+    if cold_disk {
+        std::fs::remove_dir_all(on.config().core.timefusion_data_dir.join("tantivy_cache"))?;
     }
     for db in [&on, &off] {
         // MemBuffer: `stale` stops matching, `late` starts.
@@ -1194,8 +1239,10 @@ async fn a_mutable_predicate_narrows_to_candidate_timestamps_without_ghosts() ->
     let iso = |time| chrono::DateTime::from_timestamp_micros(time).unwrap().format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string();
     let search = on.tantivy_search().expect("search service");
     let opens = || search.stats.index_opens.load(std::sync::atomic::Ordering::Relaxed) + search.stats.bundle_opens.load(std::sync::atomic::Ordering::Relaxed);
-    assert_eq!(opens(), 0, "first query must exercise a cold index reader (published disk cache is present)");
+    assert_eq!(opens(), 0, "first query must exercise a cold index reader");
+    let range_bytes = || search.stats.range_read_bytes.load(std::sync::atomic::Ordering::Relaxed);
     let mut warm_opens = 0;
+    let mut warm_bytes = 0;
     for pass in 0..2 {
         for (tag, trace) in [
             (hash, Some("trace-kept")),
@@ -1214,6 +1261,7 @@ async fn a_mutable_predicate_narrows_to_candidate_timestamps_without_ghosts() ->
             );
             let before = counter_value(PREFILTER_MUTABLE_CANDIDATES);
             let bytes = deltalake::delta_datafusion::parquet_metrics::snapshot().bytes_read;
+            let index_before = range_bytes();
             let phases: Vec<_> = timefusion::observability::plan_phases().collect();
             let started = std::time::Instant::now();
             let actual = sample(tokio::time::timeout(std::time::Duration::from_secs(5), clients[0].simple_query(&sql)).await??);
@@ -1226,7 +1274,13 @@ async fn a_mutable_predicate_narrows_to_candidate_timestamps_without_ghosts() ->
                 .collect();
             let read_bytes = deltalake::delta_datafusion::parquet_metrics::snapshot().bytes_read - bytes;
             assert!(read_bytes <= 4 * own_delta_bytes, "planning plus execution must stay bounded by this project's physical files");
-            eprintln!("issue sample pass={pass} tag={tag} elapsed_us={} parquet_bytes={read_bytes} phases={cost:?}", elapsed.as_micros());
+            let index_read_bytes = range_bytes() - index_before;
+            assert!(index_read_bytes <= 4 * index_bytes, "range reads must stay bounded by this project's index objects");
+            assert_eq!(search.stats.blob_fetches.load(std::sync::atomic::Ordering::Relaxed), 0, "sample queries must not install whole blobs");
+            eprintln!(
+                "issue sample complete={complete} cold_disk={cold_disk} pass={pass} tag={tag} elapsed_us={} parquet_bytes={read_bytes} index_range_bytes={index_read_bytes} phases={cost:?}",
+                elapsed.as_micros()
+            );
             let oracle = sample(tokio::time::timeout(std::time::Duration::from_secs(5), clients[1].simple_query(&sql)).await??);
             assert_eq!(counter_value(PREFILTER_MUTABLE_CANDIDATES), before + 1, "oracle must not use the candidate path");
             assert_eq!(actual, oracle, "pass {pass}: all projected values must match the full latest-visible-row oracle for {tag}");
@@ -1235,9 +1289,21 @@ async fn a_mutable_predicate_narrows_to_candidate_timestamps_without_ghosts() ->
         }
         if pass == 0 {
             warm_opens = opens();
+            warm_bytes = range_bytes();
             assert!(warm_opens > 0);
+            if cold_disk {
+                assert!(
+                    search.stats.bundle_opens.load(std::sync::atomic::Ordering::Relaxed) > 0 && warm_bytes > 0,
+                    "cold disk must exercise remote bundle reads"
+                );
+                assert_eq!(search.stats.index_opens.load(std::sync::atomic::Ordering::Relaxed), 0);
+            } else {
+                assert!(search.stats.index_opens.load(std::sync::atomic::Ordering::Relaxed) > 0, "seeded disk must open installed readers");
+                assert_eq!(warm_bytes, 0);
+            }
         } else {
             assert_eq!(opens(), warm_opens, "warm repetition must reuse open index readers");
+            assert_eq!(range_bytes(), warm_bytes, "warm repetition must reuse bundle blocks");
         }
     }
     drop(clients);
