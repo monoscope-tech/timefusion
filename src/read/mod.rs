@@ -820,7 +820,17 @@ impl Winners {
     fn min_batch(&self, default: usize) -> usize {
         match self {
             Self::Small(entries) => entries.iter().map(|(_, cand)| cand.batch as usize).min().unwrap_or(default),
-            Self::Large(entries) => entries.values().map(|cand| cand.batch as usize).min().unwrap_or(default),
+            Self::Large(entries) => {
+                let mut first = default;
+                for cand in entries.values() {
+                    first = first.min(cand.batch as usize);
+                    if first == 0 {
+                        // Batch zero pins the prefix; later candidates cannot free it.
+                        break;
+                    }
+                }
+                first
+            }
         }
     }
 
@@ -1803,6 +1813,19 @@ mod tests {
         }
         out.extend(d.finish().unwrap());
         rows_of(&out)
+    }
+
+    #[test]
+    fn a_large_winner_set_releases_only_dead_prefixes() {
+        let mut d = dedup_state(None);
+        let ids: Vec<String> = (0..32).map(|i| format!("key-{i:02}")).collect();
+        let ids: Vec<&str> = ids.iter().map(String::as_str).collect();
+        assert!(d.push(&vbatch(&ids, &[1; 32], &[Some(1); 32])).unwrap().is_empty());
+        assert!(d.push(&vbatch(&ids[..16], &[1; 16], &[Some(2); 16])).unwrap().is_empty());
+        assert_eq!(d.greatest.as_ref().unwrap().batches.len(), 2, "an unbeaten batch-zero winner pins the prefix");
+        assert!(d.push(&vbatch(&ids[16..], &[1; 16], &[Some(2); 16])).unwrap().is_empty());
+        assert_eq!(d.greatest.as_ref().unwrap().batches.len(), 2, "the fully beaten prefix must now be released");
+        assert_eq!(rows_of(&d.finish().unwrap()), ids.iter().map(|id| (id.to_string(), 1, Some(2))).collect::<Vec<_>>());
     }
 
     /// Collapsing the retained buffer to current winners must not change a
