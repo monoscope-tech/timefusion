@@ -910,7 +910,9 @@ impl Database {
         // catalog/execution internals and can resolve the scan name to an older
         // eager snapshot.
         let state = limits.map_or_else(
-            || build_optimize_session_state(self.config.memory.timefusion_query_partitions, self.maintenance_runtime_env()),
+            // A single consumer avoids repartition queues spilling the full key
+            // stream while preserving the existing maintenance pool and deadline.
+            || build_optimize_session_state(1, self.maintenance_runtime_env()),
             |limits| {
                 build_optimize_session_state_tuned(
                     self.config.memory.timefusion_query_partitions,
@@ -2504,7 +2506,7 @@ mod ordered_probe_contract_tests {
     use anyhow::Context;
     use datafusion::{
         common::tree_node::{TreeNode, TreeNodeRecursion},
-        physical_plan::{InputOrderMode, aggregates::AggregateExec},
+        physical_plan::{InputOrderMode, aggregates::AggregateExec, repartition::RepartitionExec},
     };
     use deltalake::writer::DeltaWriter;
 
@@ -2585,6 +2587,9 @@ mod ordered_probe_contract_tests {
         let plan = ctx.sql(&sql).await?.create_physical_plan().await?;
         let mut aggregates = 0;
         plan.apply(|node| {
+            if let Some(repartition) = node.downcast_ref::<RepartitionExec>() {
+                assert_eq!(repartition.partitioning().partition_count(), 1, "dedup probes must not create spilling multi-consumer repartition queues");
+            }
             if let Some(aggregate) = node.downcast_ref::<AggregateExec>() {
                 aggregates += 1;
                 assert_eq!(*aggregate.input_order_mode() != InputOrderMode::Linear, ordered);
@@ -2613,22 +2618,19 @@ mod ordered_probe_contract_tests {
     }
 
     /// Expensive, explicit volume experiment; normal CI retains the exact-key cases above.
-    #[test_case::test_case(4096, 0, false, 0 ; "four million rows")]
-    #[test_case::test_case(295781, 424, false, 0 ; "production row count")]
-    #[test_case::test_case(4096, 0, true, 0 ; "four million rows full overlap")]
-    #[test_case::test_case(295781, 424, true, 0 ; "production row count full overlap")]
-    #[test_case::test_case(4096, 0, true, 1 ; "four million rows full overlap single partition")]
-    #[test_case::test_case(295781, 424, true, 1 ; "production row count full overlap single partition")]
+    #[test_case::test_case(4096, 0, false ; "four million rows")]
+    #[test_case::test_case(295781, 424, false ; "production row count")]
+    #[test_case::test_case(4096, 0, true ; "four million rows full overlap")]
+    #[test_case::test_case(295781, 424, true ; "production row count full overlap")]
     #[ignore = "writes a production-shaped synthetic key workload to local MinIO"]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn whole_date_probe_volume(rows_per_group: usize, mut extra_rows: usize, full_overlap: bool, target_partitions: usize) -> Result<()> {
+    async fn whole_date_probe_volume(rows_per_group: usize, mut extra_rows: usize, full_overlap: bool) -> Result<()> {
         use arrow::array::{ArrayRef, StringArray, TimestampMicrosecondArray, UInt32Array, new_null_array};
         const TABLE: &str = "otel_logs_and_spans";
         // Reuse only a previous local experiment prefix to avoid rewriting gigabytes while debugging cancellation.
         let reuse = std::env::var("TIMEFUSION_PROBE_VOLUME_PREFIX").ok();
         anyhow::ensure!(!full_overlap || reuse.is_none(), "full-overlap inputs must be regenerated; row counts alone cannot establish their geometry");
         let mut config = TestConfigBuilder::new("probe-volume").build();
-        Arc::make_mut(&mut config).memory.timefusion_query_partitions = target_partitions;
         if let Some(prefix) = &reuse {
             anyhow::ensure!(
                 prefix.strip_prefix("test-probe-volume-").is_some_and(|s| s.len() == 8 && s.bytes().all(|b| b.is_ascii_hexdigit())),
@@ -2740,7 +2742,7 @@ mod ordered_probe_contract_tests {
             }
         }
         eprintln!(
-            "volume_input rows={total_rows} files=23 row_groups=977 full_overlap={full_overlap} target_partitions={target_partitions} pool_limit_bytes={} prepare_ms={} reused={} table_uri={}",
+            "volume_input rows={total_rows} files=23 row_groups=977 full_overlap={full_overlap} pool_limit_bytes={} prepare_ms={} reused={} table_uri={}",
             db.heavy_pool_bytes(),
             prepared.elapsed().as_millis(),
             reuse.is_some(),
@@ -2748,7 +2750,7 @@ mod ordered_probe_contract_tests {
         );
         let context_started = std::time::Instant::now();
         let ctx = db.dedup_probe_ctx(&table, TABLE, &project, "2026-08-10", None).await?;
-        eprintln!("volume_context elapsed_ms={}", context_started.elapsed().as_millis());
+        eprintln!("volume_context elapsed_ms={} target_partitions={}", context_started.elapsed().as_millis(), ctx.state().config().target_partitions());
         let sql = format!(
             "SELECT CAST(date_bin(INTERVAL '10 minutes', timestamp, TIMESTAMP '1970-01-01T00:00:00') AS VARCHAR) FROM \
             (SELECT timestamp, count(*) AS c FROM {DEDUP_SCAN_NAME} WHERE project_id = '{project}' AND date = DATE '2026-08-10' \
