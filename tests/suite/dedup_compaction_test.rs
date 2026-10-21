@@ -1282,6 +1282,16 @@ async fn tantivy_backfill_skips_todays_partition_but_the_census_still_counts_it(
     assert!(uncovered >= 1, "the census must still SEE today's uncovered files, got {uncovered}");
     let (built, _, _) = db.tantivy_reconcile_table(TABLE).await?;
     assert_eq!(built, 0, "today's partition is churn — the backfill must not spend the pass on it, built={built}");
+    for offset in [1, -1, -7, -8] {
+        let date = now.date_naive() + chrono::Duration::days(offset);
+        commit_span(&db, &project_id, &format!("day-{offset}"), "n", date.and_hms_opt(12, 0, 0).unwrap().and_utc().timestamp_micros()).await?;
+    }
+    let (uncovered, _, by_age) = db.tantivy_coverage_census().await?;
+    assert_eq!(uncovered, 5);
+    assert_eq!(by_age[0], 1, "future partitions must not inflate today's uncovered file count");
+    assert_eq!(by_age, [1, 2, 1, 1], "today, week, older, and future partitions must remain distinct");
+    assert_eq!(by_age.iter().sum::<u64>(), uncovered);
+    assert_eq!(timefusion::observability::maintenance_stats().tantivy_uncovered_sealed_files.load(std::sync::atomic::Ordering::Relaxed), 3);
     Ok(())
 }
 
@@ -1339,7 +1349,7 @@ async fn tantivy_reconcile_backfills_new_files_and_gcs_orphans() -> Result<()> {
     let (uncovered_after, _, by_age_after) = db.tantivy_coverage_census().await?;
     assert_eq!(tantivy_stats.tantivy_uncovered_files.load(ordering), 0, "the all-table census must publish zero after all uncovered files have been indexed");
     assert_eq!(uncovered_after, 0, "after indexing every uncovered file the census must independently agree the reindex is done");
-    assert_eq!(by_age_after, [0; 3], "a finished reindex leaves no uncovered file in any age bucket");
+    assert_eq!(by_age_after, [0; 4], "a finished reindex leaves no uncovered file in any age bucket");
     let m = load_manifest(tantivy_store.as_ref(), TABLE, &project_id).await?;
     assert_eq!(m.entries.len(), 2, "per-uuid manifest covers both files");
 

@@ -408,6 +408,20 @@ mod liveness_clock_tests {
         assert_eq!(format!("{watched:?}"), format!("{plain:?}"), "watching a plan must not change what it returns");
     }
 
+    #[tokio::test]
+    async fn optional_plan_cost_metrics_distinguish_absence_from_zero() {
+        use datafusion::physical_plan::{collect, empty::EmptyExec};
+        let empty = EmptyExec::new(Arc::new(arrow::datatypes::Schema::empty()));
+        assert_eq!(super::plan_observed_metric_sum(&empty, |metrics| metrics.spill_count()), None);
+        let ctx = SessionContext::new();
+        let plan = physical(&ctx, "SELECT a FROM (VALUES (2), (1)) AS t(a) ORDER BY a").await;
+        let rows = collect(Arc::clone(&plan), ctx.task_ctx()).await.expect("sort");
+        assert_eq!(rows.iter().map(arrow::array::RecordBatch::num_rows).sum::<usize>(), 2);
+        assert_eq!(super::plan_observed_metric_sum(plan.as_ref(), |metrics| metrics.spill_count()), Some(0));
+        assert_eq!(super::plan_observed_metric_sum(plan.as_ref(), |metrics| metrics.spilled_bytes()), Some(0));
+        assert!(super::plan_observed_metric_sum(plan.as_ref(), |metrics| metrics.elapsed_compute()).is_some_and(|nanos| nanos > 0));
+    }
+
     /// The watcher must not outlive its guard, or an abandoned unit keeps
     /// reporting progress forever.
     #[tokio::test(start_paused = true)]
@@ -1027,6 +1041,14 @@ fn plan_metric_sum(plan: &dyn datafusion::physical_plan::ExecutionPlan, name: &s
     plan_metric_fold(plan, |metrics| metrics.sum_by_name(name).map_or(0, |value| value.as_usize() as u64))
 }
 
+/// Preserve absence when no operator reports this optional typed metric.
+fn plan_observed_metric_sum(
+    plan: &dyn datafusion::physical_plan::ExecutionPlan, of: impl Fn(&datafusion::physical_plan::metrics::MetricsSet) -> Option<usize> + Copy,
+) -> Option<u64> {
+    let own = plan.metrics().and_then(|metrics| of(&metrics)).map(|value| value as u64);
+    plan.children().iter().filter_map(|child| plan_observed_metric_sum(child.as_ref(), of)).fold(own, |sum, value| Some(sum.unwrap_or(0).saturating_add(value)))
+}
+
 /// How much of what a maintenance query COULD have read it actually read.
 /// `bytes_scanned` is the only usable measure: predicate-excluded files are
 /// dropped during PLANNING so they reach no `pruned` counter, and
@@ -1055,6 +1077,9 @@ fn log_scan_pruning(plan: &dyn datafusion::physical_plan::ExecutionPlan, elapsed
         bytes_scanned,
         row_groups_pruned = plan_metric_sum(plan, "row_groups_pruned_statistics") + plan_metric_sum(plan, "row_groups_pruned_bloom_filter"),
         output_rows = plan_output_rows(plan),
+        elapsed_compute_ns = plan_observed_metric_sum(plan, |metrics| metrics.elapsed_compute()),
+        spill_count = plan_observed_metric_sum(plan, |metrics| metrics.spill_count()),
+        spilled_bytes = plan_observed_metric_sum(plan, |metrics| metrics.spilled_bytes()),
         elapsed_ms = elapsed.as_millis() as u64,
         event = "maintenance_scan_pruning",
         "how much of the registered partition a maintenance query actually opened"
@@ -4685,7 +4710,7 @@ impl Database {
         {
             match self.tantivy_coverage_census().await {
                 Ok((uncovered, oversized, by_age)) => {
-                    info!(uncovered, oversized, today = by_age[0], week = by_age[1], older = by_age[2], event = "tantivy_coverage_census")
+                    info!(uncovered, oversized, today = by_age[0], week = by_age[1], older = by_age[2], future = by_age[3], event = "tantivy_coverage_census")
                 }
                 Err(error) => warn!(%error, event = "tantivy_coverage_census_failed"),
             }

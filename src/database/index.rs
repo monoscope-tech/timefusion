@@ -320,11 +320,11 @@ impl Database {
     }
 
     /// Refresh global Tantivy coverage gauges without building indexes. Reads Delta and index
-    /// metadata only. Returns `(uncovered, oversized, by_age)`, `by_age` = `[today, 1-7d, older]`.
-    pub async fn tantivy_coverage_census(&self) -> anyhow::Result<(u64, u64, [u64; 3])> {
-        let Some(svc) = self.tantivy_indexer().cloned() else { return Ok((0, 0, [0; 3])) };
+    /// metadata only. Returns `(uncovered, oversized, by_age)`, `by_age` = `[today, 1-7d, older, future]`.
+    pub async fn tantivy_coverage_census(&self) -> anyhow::Result<(u64, u64, [u64; 4])> {
+        let Some(svc) = self.tantivy_indexer().cloned() else { return Ok((0, 0, [0; 4])) };
         let (mut uncovered, mut oversized) = (0u64, 0u64);
-        let mut by_age = [0u64; 3];
+        let mut by_age = [0u64; 4];
         let today = crate::support::now_micros() / 86_400_000_000;
         for table_name in svc.config.indexed_tables().into_iter().filter(|t| svc.config.is_table_indexed(t)) {
             for root in self.table_roots(&table_name).await {
@@ -335,7 +335,12 @@ impl Database {
                     // Partition date, not file mtime: a rewrite of old data is still old.
                     let age_days = crate::storage::date_partition_of(&uri)
                         .map_or(i64::MAX, |d| today - d.and_hms_opt(0, 0, 0).map_or(0, |t| t.and_utc().timestamp_micros() / 86_400_000_000));
-                    by_age[usize::from(age_days > 0) + usize::from(age_days > 7)] += 1;
+                    by_age[match age_days {
+                        ..0 => 3,
+                        0 => 0,
+                        1..=7 => 1,
+                        _ => 2,
+                    }] += 1;
                 }
             }
         }
