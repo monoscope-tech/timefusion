@@ -175,3 +175,36 @@ git log -- docs/plans/
 Substitute any original filename from the review inventory in the `git show` command.
 The original revision contains the four September files retired earlier as well as the remaining dated notes.
 New observations belong in the current review/backlog. Stable concepts belong in these four topic references.
+
+## October 21 dependency applicability
+
+The isolated candidate includes compatible advisory updates and the required cursor protocol correction.
+Its final audit checks lockfile SHA-256 `2a930bdf13ffe14540eedfed11723150c52d4e008871ba76a87e86b62a3f3b92`.
+The pinned cursor fork is `1388ea37ec8eeefd13b07771f8d0052f164ae7f1`.
+The OSV scan returns 22 matched package versions and 34 records, with 28 groups after alias deduplication.
+Seventeen matched versions appear in the Linux normal/build graph. Build dependencies and maintenance notices remain distinct from runtime triggers.
+The registry package set matches the earlier candidate scan. A Git source change still requires fresh integrated validation.
+
+Owner for the following dispositions: TimeFusion dependency maintainers. These are retained follow-ups, not a clean vulnerability report.
+
+| Remaining package / advisory | Observed path or trigger | Disposition |
+| --- | --- | --- |
+| `h2 0.3.27`, RUSTSEC-2026-0258 | The legacy AWS HTTP client retains this normal dependency. The advisory concerns unbounded empty DATA frames | Open: migrate the legacy connector or backport its fix separately. Updating `h2 0.4` does not fix this branch |
+| `rustls 0.21.12`, RUSTSEC-2026-0346 / 0349 | The AWS legacy connector retains this version. Session Debug disclosure requires the affected session formatting. The downgrade report concerns supported key-exchange state | Open: trace selected connector features and session-cache logging before an AWS/TLS migration. Do not infer post-quantum support from the broad affected-version range |
+| `rustls-webpki 0.101.7`, RUSTSEC-2026-0098 / 0099 / 0104 / 0382 | Legacy Rustls retains certificate validation code. These cover name constraints, CRL parsing, and distrusted intermediates | Open: retain this branch in the TLS migration scope. The updated `0.103.16` branch does not remove it |
+| `aws-smithy-json 0.61.9`, GHSA-8ffr-xgwf-xj56 | `aws-sdk-s3 1.119.0` retains the old parser. The advisory describes recursion in generated Smithy servers | Open: inspect client response parsing in the SDK migration. TimeFusion exposes PGWire/gRPC rather than a generated Smithy server. That difference alone is not proof of parser safety |
+| `lru 0.12.5`, RUSTSEC-2026-0002 and its GHSA alias | Tantivy and AWS S3 retain this version. The defect concerns `LruCache::IterMut` | No affected iterator call identified in the inspected cache consumers. Recheck their complete call graph before closure or a dependency migration |
+| `lru 0.12.5 / 0.16.4`, RUSTSEC-2026-0253 | The trigger requires a stored key's `Drop` to panic during `pop`, followed by continued cache use | Inspected keys use strings, paths, integers, and tuples of ordinary reference-counted strings. No panicking key destructor was identified. Retain the report for dependency maintenance |
+| `rkyv 0.7.46`, RUSTSEC-2026-0235 | Walrus and rust_decimal retain this version. The defect requires conflicting metadata for archived shared pointers | No archived Rc/Arc appears in the inspected WAL metadata/index shapes. Keep the format unchanged in this batch. Any migration needs old-WAL compatibility and restart proof |
+| `quick-xml 0.26.0 / 0.39.4`, RUSTSEC-2026-0194 / 0195 | Inferno uses XML output. Object-store code uses XML for storage responses. The defects concern duplicate attributes and namespace allocation | Open: inspect each parser entry point and input bound. Do not classify both paths as public XML ingestion |
+| `bincode 1.3.3 / 2.0.1`, RUSTSEC-2025-0141 | Maintenance notice, including persisted-data consumers | Defer replacement to a format-compatible maintenance batch. The notice supplies no reason to rewrite live WAL bytes |
+| `dotenv`, `instant`, `paste`, `proc-macro-error2`, `rustls-pemfile`, `unsafe-libyaml` | RUSTSEC-2021-0141, 2024-0384 / 0436 / 0449, 2025-0134, 2026-0173 are maintenance notices | Retain dependency replacement work. Build-only applicability is not a runtime exploit claim |
+| `quinn-proto 0.11.15`, RUSTSEC-2026-0338 through 0342 | Absent from the selected Linux normal/build graph | Excluded from this runtime assessment. Recheck before enabling HTTP/3 or changing feature unification |
+| `rsa 0.9.10`, RUSTSEC-2023-0071 | Absent from the selected Linux normal/build graph | Excluded from this runtime assessment. Retain development-feature applicability |
+| `scc 2.4.0`, RUSTSEC-2026-0205; `tokio-tar 0.3.1`, RUSTSEC-2025-0111 and its GHSA alias | Absent from the selected Linux normal/build graph | Excluded from this runtime assessment. Recheck test/tooling exposure separately |
+| `webpki-root-certs 1.0.7`, RUSTSEC-2026-0383 | Absent from the selected Linux normal/build graph | Excluded for this target. Recheck platform-specific certificate features before changing the deployment target |
+
+The candidate fixes the compatible current branches. It does not resolve every retained advisory or maintenance notice.
+Do not add audit suppressions or change persisted formats to obtain a green count.
+Final release evidence must identify the checked lockfile, selected features, image, rollback image, and passing local signoff.
+Raw scan and graph evidence: `/tmp/timefusion-advisory-refresh-2026-10-21/{final-candidate,frozen-pin-audit}/`.
