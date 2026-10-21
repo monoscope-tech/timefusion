@@ -6986,7 +6986,7 @@ impl Database {
         added_spans_miss_window(added.iter().map(|rel| spans.get(*rel).copied().flatten()), (lo, hi))
     }
 
-    fn file_visibility_fingerprint(files: &crate::read::CountFiles) -> Result<u64> {
+    pub(super) fn file_visibility_fingerprint(files: &crate::read::CountFiles) -> Result<u64> {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         std::hash::Hash::hash(&serde_json::to_vec(files)?, &mut hasher);
         Ok(std::hash::Hasher::finish(&hasher))
@@ -7860,6 +7860,15 @@ impl Database {
                 visibility.ok()
             };
             let started = std::time::Instant::now();
+            info!(
+                project,
+                table_name,
+                date,
+                pre_input_fp = pre.as_ref().map(|(fp, _)| *fp),
+                pre_input_files = pre.as_ref().map(|(_, files)| files.len()),
+                budget_ms = remaining.as_millis() as u64,
+                event = "dedup_partition_probe_started"
+            );
             match tokio::time::timeout(remaining, self.probe_dup_bins(table, table_name, &project, &date)).await {
                 Ok(Ok(dup_bins)) => {
                     self.note_probe_cost(table_name, started.elapsed());
@@ -7867,7 +7876,15 @@ impl Database {
                     let cleared: Vec<_> = bins.iter().filter(|b| !dup_bins.contains(b)).map(|b| (project.clone(), date.clone(), *b)).collect();
                     stats.dirty_bin_processed.fetch_add(cleared.len() as u64, Relaxed);
                     stats.dirty_bin_batch_probe_clean.fetch_add(cleared.len() as u64, Relaxed);
-                    info!(project, table_name, date, queued = bins.len(), clean = cleared.len(), event = "dedup_batch_probe");
+                    info!(
+                        project,
+                        table_name,
+                        date,
+                        queued = bins.len(),
+                        clean = cleared.len(),
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        event = "dedup_batch_probe"
+                    );
                     // A probe that finds NO duplicate-bearing bin has proved the whole
                     // partition duplicate-free — the SAME predicate a zero-drop rewrite
                     // establishes — so it goes through `record_certification` rather than a
@@ -7909,7 +7926,7 @@ impl Database {
                     cleared
                 }
                 Ok(Err(error)) => {
-                    warn!(project, table_name, date, %error, event = "dedup_batch_probe_failure");
+                    warn!(project, table_name, date, elapsed_ms = started.elapsed().as_millis() as u64, %error, event = "dedup_batch_probe_failure");
                     Vec::new()
                 }
                 Err(_) => {
@@ -7919,7 +7936,7 @@ impl Database {
                     // elapsed time is only a LOWER bound, but a less-wrong one than omitting it.
                     self.note_probe_cost(table_name, started.elapsed());
                     crate::observability::maintenance_stats().dedup_probe_timeouts.fetch_add(1, Relaxed);
-                    warn!(project, table_name, date, event = "dedup_batch_probe_timeout");
+                    warn!(project, table_name, date, elapsed_ms = started.elapsed().as_millis() as u64, event = "dedup_batch_probe_timeout");
                     Vec::new()
                 }
             }

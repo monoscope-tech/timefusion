@@ -880,10 +880,28 @@ impl Database {
     /// itself, not just the SQL scan — an unrestricted provider eagerly materializes statistics for
     /// every live file in the unified table before partition pruning.
     async fn dedup_probe_ctx(
-        &self, table_ref: &Arc<RwLock<DeltaTable>>, project_id: &str, date_str: &str, limits: Option<DedupExecutionLimits>,
+        &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, project_id: &str, date_str: &str, limits: Option<DedupExecutionLimits>,
     ) -> Result<datafusion::prelude::SessionContext> {
         let (snapshot, log_store) = snapshot_and_store(table_ref).await?;
         let partition_files = dedup_partition_paths(snapshot.log_data().iter().map(|f| f.path().to_string()), project_id, date_str);
+        // Describe this provider's actual snapshot, independently of the earlier certification witness.
+        let paths: HashSet<_> = partition_files.iter().map(String::as_str).collect();
+        let (visibility, input_bytes) = snapshot.log_data().iter().filter(|file| paths.contains(file.path().as_ref())).fold(
+            (crate::read::CountFiles::new(), 0u64),
+            |(mut files, bytes), file| {
+                files.insert(file.path().into_owned(), file.deletion_vector_descriptor());
+                (files, bytes.saturating_add(file.size().max(0) as u64))
+            },
+        );
+        info!(
+            table_name,
+            project_id,
+            date = date_str,
+            input_fp = Self::file_visibility_fingerprint(&visibility).ok(),
+            input_files = visibility.len(),
+            input_file_bytes = input_bytes,
+            event = "dedup_probe_input_selected"
+        );
         // Probe-only provider; the rewrite builds its own per attempt from a FRESH
         // snapshot, with the synthetic source-file column.
         let provider =
@@ -1031,12 +1049,18 @@ impl Database {
     ///
     /// A dup group shares one exact `timestamp` (it is a dedup key), so the group's bin is derived
     /// exactly. Only valid when `timestamp` is a dedup key.
+    #[instrument(name = "dedup_partition_probe", skip(self, table_ref))]
     pub(crate) async fn probe_dup_bins(&self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, project_id: &str, date_str: &str) -> Result<HashSet<i64>> {
         let schema = schema_or_default(table_name);
-        let ctx = self.dedup_probe_ctx(table_ref, project_id, date_str, None).await?;
+        let ctx = self.dedup_probe_ctx(table_ref, table_name, project_id, date_str, None).instrument(tracing::info_span!("dedup_probe_context")).await?;
         let filter = format!("project_id = '{}' AND date = DATE '{date_str}'", project_id.replace('\'', "''"));
         let keys_csv = quoted_csv(&schema.dedup_keys);
-        Ok(Self::dup_bin_starts(&ctx, &filter, &keys_csv).await?.into_iter().map(|s| s.and_utc().timestamp_micros() / bin_micros()).collect())
+        Ok(Self::dup_bin_starts(&ctx, &filter, &keys_csv)
+            .instrument(tracing::info_span!("dedup_probe_aggregate"))
+            .await?
+            .into_iter()
+            .map(|s| s.and_utc().timestamp_micros() / bin_micros())
+            .collect())
     }
 
     /// Probe one partition/bin for duplicates and STAGE (never commit) a
@@ -1053,7 +1077,7 @@ impl Database {
             return Ok((Vec::new(), true));
         }
         let date_str = date.to_string();
-        let ctx = self.dedup_probe_ctx(table_ref, project_id, &date_str, limits).await?;
+        let ctx = self.dedup_probe_ctx(table_ref, table_name, project_id, &date_str, limits).await?;
         let scan_name = DEDUP_SCAN_NAME;
         // Escape quotes so a caller cannot inject SQL through the partition
         // predicate; `date_str` comes from NaiveDate::to_string and is already safe.
