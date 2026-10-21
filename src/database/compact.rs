@@ -2496,3 +2496,78 @@ mod probe_shard_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod ordered_probe_contract_tests {
+    use super::*;
+    use crate::support::test_helpers::{TestConfigBuilder, json_to_batch_for};
+    use datafusion::{
+        common::tree_node::{TreeNode, TreeNodeRecursion},
+        physical_plan::{InputOrderMode, aggregates::AggregateExec},
+    };
+    use deltalake::writer::DeltaWriter;
+
+    /// Match the observed file/row-group overlap without scanning production rows.
+    /// The oracle counts raw keys before any DataFusion grouping or read-side dedup.
+    #[test_case::test_case(true ; "ordered overlapping files")]
+    #[test_case::test_case(false ; "unordered fallback")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn whole_date_probe_matches_raw_keys_across_overlapping_files(ordered: bool) -> Result<()> {
+        const TABLE: &str = "otel_logs_and_spans";
+        let db = Database::with_config(TestConfigBuilder::new("ordered-probe-contract").build()).await?;
+        db.cancel_maintenance();
+        let project = format!("probe_{}", uuid::Uuid::new_v4().simple());
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 8, 10).unwrap();
+        let start = day.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_micros();
+        let table = db.resolve_table(&project, TABLE).await?;
+        let schema = schema_or_default(TABLE);
+        let mut counts = std::collections::HashMap::new();
+        for file in 0..23 {
+            // Eleven 43-group files and twelve 42-group files: 977 groups total.
+            let rows = (if file < 11 { 43 } else { 42 }) * 64;
+            let records = (0..rows)
+                .map(|row| {
+                    let key = file * 128 + row;
+                    let ts = start + (key / 3) as i64 * 3_000_000;
+                    let service = (key % 7 != 0).then_some("api");
+                    let id = format!("id-{}", key % 17);
+                    *counts.entry((ts, service, id.clone())).or_insert(0usize) += 1;
+                    serde_json::json!({"project_id": project, "date": day.to_string(), "timestamp": ts,
+                        "resource___service___name": service, "id": id, "level": "INFO", "status_code": "UNSET", "hashes": [], "summary": []})
+                })
+                .collect();
+            let batch = json_to_batch_for(TABLE, records)?;
+            let batches = if ordered { sort_batches_by_schema_reference(schema, vec![batch]).0 } else { vec![batch] };
+            let properties = db.create_writer_properties(schema, 3, ordered).into_builder().set_max_row_group_row_count(Some(64)).build();
+            let mut delta = table.write().await;
+            let mut writer = deltalake::writer::RecordBatchWriter::for_table(&delta)?.with_writer_properties(properties);
+            for batch in batches {
+                let batch = deltalake::kernel::schema::cast_record_batch(&batch, writer.arrow_schema(), true, true)?;
+                writer.write(batch).await?;
+            }
+            writer.flush_and_commit(&mut delta).await?;
+        }
+        let expected: HashSet<_> = counts.into_iter().filter(|(_, n)| *n > 1).map(|((ts, _, _), _)| ts / 600_000_000).collect();
+        assert!(expected.len() > 5, "duplicates must span several ten-minute bins");
+        let ctx = db.dedup_probe_ctx(&table, TABLE, &project, &day.to_string(), None).await?;
+        let sql = format!(
+            "SELECT timestamp, resource___service___name, id, count(*) FROM {DEDUP_SCAN_NAME} \
+             WHERE project_id = '{project}' AND date = DATE '2026-08-10' GROUP BY timestamp, resource___service___name, id"
+        );
+        let plan = ctx.sql(&sql).await?.create_physical_plan().await?;
+        let mut aggregates = 0;
+        plan.apply(|node| {
+            if let Some(aggregate) = node.downcast_ref::<AggregateExec>() {
+                aggregates += 1;
+                assert_eq!(*aggregate.input_order_mode() != InputOrderMode::Linear, ordered);
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })?;
+        assert!(aggregates > 0, "the probe must retain its grouping plan");
+        eprintln!("ordered={ordered} files=23 row_groups=977\n{}", datafusion::physical_plan::displayable(plan.as_ref()).indent(true));
+        let started = std::time::Instant::now();
+        assert_eq!(db.probe_dup_bins(&table, TABLE, &project, &day.to_string()).await?, expected);
+        eprintln!("ordered={ordered} probe_elapsed_ms={}", started.elapsed().as_millis());
+        Ok(())
+    }
+}
