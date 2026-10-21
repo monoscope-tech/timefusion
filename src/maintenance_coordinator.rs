@@ -373,6 +373,8 @@ struct DueTaskDiagnostic {
     key: TaskKey,
     state: TaskState,
     deadline_micros: i64,
+    built_micros: Option<i64>,
+    rebuild_held_until_micros: Option<i64>,
     attempts: u32,
     retry_reason: Option<String>,
     required_parent_table: Option<String>,
@@ -3126,6 +3128,8 @@ impl TaskJournal {
                 key: task.key.clone(),
                 state: task.state,
                 deadline_micros: task.deadline_micros,
+                built_micros: task.built_micros,
+                rebuild_held_until_micros: self.rebuild_held_until(task, now_micros),
                 attempts: task.attempts,
                 retry_reason: task.retry_reason.clone(),
                 required_parent_table: Self::required_parent_table(task),
@@ -5806,6 +5810,54 @@ mod tests {
     }
 
     #[test]
+    fn a_touched_future_slice_can_be_due_but_still_waits_for_its_parent() -> anyhow::Result<()> {
+        let (dir, mut journal) = new_journal();
+        let source = "otel_logs_and_spans";
+        let table = "otel_logs_and_spans_rollup_dashboard_1h_v3";
+        let start = 1_792_558_800_000_000;
+        let deadline = 1_792_539_030_000_000;
+        let now = crate::support::set_micros(1_792_557_365_883_380);
+        let change = |observed_at_micros| Invalidation {
+            source_table: source,
+            rollup_table: table,
+            source,
+            project_id: "future",
+            start_micros: start,
+            end_micros: start + DERIVED_SLICE_MICROS,
+            observed_at_micros,
+            derived: true,
+            mint_dedup: false,
+            mint_rollup: true,
+        };
+        journal.invalidate(change(deadline - FINALIZATION_DELAY_MICROS))?;
+        journal.checkpoint()?;
+        let mut journal = TaskJournal::load(dir.path())?;
+        let child = journal.tasks().next().expect("future derived slice").key.clone();
+        journal.publish_statistics();
+        let snapshot = due_task_snapshot();
+        assert_eq!(snapshot["tasks"][0]["deadline_micros"], deadline);
+        assert_eq!(snapshot["tasks"][0]["key"]["slice"]["start_micros"], start);
+        assert_eq!(snapshot["oldest_due_unclaimed_age_seconds"], (now - deadline) / 1_000_000);
+        assert_eq!(snapshot["tasks"][0]["eligibility_refusal"], "dependencies");
+        assert!(journal.claim_next(Operation::DerivedRollup, now, true).is_none());
+
+        let parent = upserted(
+            &mut journal,
+            task_in("otel_logs_and_spans_rollup_dashboard_1m_v4", "future", start, start + DERIVED_SLICE_MICROS, Operation::BaseRollup)
+                .tap_mut(|task| task.key.source = source.into()),
+        );
+        assert!(journal.claim_next(Operation::DerivedRollup, now, true).is_none(), "an unfinished actual parent still blocks");
+        journal.complete(&parent);
+        assert_eq!(journal.claim_next(Operation::DerivedRollup, now, true).expect("completed parent proves coverage").key, child);
+        journal.complete(&child);
+        journal.invalidate(change(now))?;
+        assert!(journal.task(&child).expect("reopened child").deadline_micros >= now + FINALIZATION_DELAY_MICROS);
+        journal.publish_statistics();
+        assert_eq!(due_task_snapshot()["due_nonquarantined"], 0, "new work does not inherit the old overdue age");
+        Ok(())
+    }
+
+    #[test]
     fn a_continuously_touched_ended_slice_still_comes_due() {
         let (_dir, mut journal) = new_journal();
         const MINUTE: i64 = 60_000_000;
@@ -6511,6 +6563,14 @@ mod tests {
         journal.enqueue(unit.key.clone(), now, 1, 0);
         let claimed = journal.claim_next(Operation::BaseRollup, now + after, true).is_some();
         assert!(claimed || journal.state(&unit.key) == Some(TaskState::Pending), "a held rebuild stays queued");
+        if !claimed {
+            crate::support::set_micros(now + after);
+            journal.publish_statistics();
+            let snapshot = due_task_snapshot();
+            assert_eq!(snapshot["tasks"][0]["built_micros"], built_at);
+            assert_eq!(snapshot["tasks"][0]["rebuild_held_until_micros"], built_at + SEALED_REBUILD_INTERVAL_MICROS);
+            assert_eq!(snapshot["tasks"][0]["eligibility_refusal"], "rebuild_held");
+        }
         claimed
     }
 
