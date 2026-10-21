@@ -4,6 +4,7 @@
 //! sent as `text[]` must coerce to Variant.
 
 use timefusion::support;
+use tokio_postgres::types::Type;
 
 use super::harness::{E2eEnv, FROZEN_START_MICROS};
 
@@ -114,5 +115,87 @@ async fn insert_select_unnest_coerces_text_to_variant() -> anyhow::Result<()> {
     let n_hit: i64 =
         client.query_one("SELECT COUNT(*)::bigint FROM otel_logs_and_spans WHERE project_id=$1 AND body ->> 'msg' = 'hello-1'", &[&pid]).await?.get(0);
     assert_eq!(n_hit, 1, "Variant predicate holds from Delta after flush");
+    Ok(())
+}
+
+/// Real metrics scans must retain inherited projection names after Variant rewrites.
+#[test_case::test_case("SELECT coalesce(attributes, 'null') FROM otel_metrics WHERE project_id='e2e_projection'", "coalesce(otel_metrics.attributes,Utf8(\"null\"))", Type::TEXT, Some(serde_json::Value::Null); "direct coalesce")]
+#[test_case::test_case("SELECT * FROM (SELECT coalesce(attributes, 'null') FROM otel_metrics WHERE project_id='e2e_projection') q", "coalesce(otel_metrics.attributes,Utf8(\"null\"))", Type::TEXT, Some(serde_json::Value::Null); "inherited coalesce")]
+#[test_case::test_case("WITH q AS (SELECT coalesce(attributes, 'null') AS value FROM otel_metrics WHERE project_id='e2e_projection') SELECT value FROM q", "value", Type::TEXT, Some(serde_json::Value::Null); "explicit alias")]
+#[test_case::test_case("SELECT * FROM (SELECT attributes FROM otel_metrics WHERE project_id='e2e_projection') q", "attributes", Type::JSONB, None; "nested column")]
+#[test_case::test_case("SELECT coalesce(attributes, attributes) FROM otel_metrics WHERE project_id='e2e_projection'", "coalesce(otel_metrics.attributes,otel_metrics.attributes)", Type::JSONB, None; "binary coalesce")]
+#[serial_test::serial]
+#[tokio::test(flavor = "multi_thread")]
+async fn variant_projection_names_survive_pgwire(sql: &str, name: &str, wire_type: Type, null_value: Option<serde_json::Value>) -> anyhow::Result<()> {
+    let (env, client) = E2eEnv::short_buckets().await?;
+    env.db().cancel_maintenance();
+    let dt = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(FROZEN_START_MICROS).unwrap();
+    client.execute(
+        "INSERT INTO otel_metrics (project_id, timestamp, date, ingested_at, id, series_id, metric_name, metric_unit, metric_type, flags, dropped_attributes_count, message_size_bytes, attributes) \
+         VALUES ('e2e_projection', $1, $2, $1, 'populated', 's1', 'requests', '1', 'GAUGE', 0, 0, 10, '{\"label\":\"a\"}'), \
+                ('e2e_projection', $1, $2, $1, 'null', 's2', 'requests', '1', 'GAUGE', 0, 0, 10, NULL)",
+        &[&dt, &dt.date_naive()],
+    ).await?;
+    let cache = timefusion::read::plan_cache::global().expect("production plan cache");
+    let before = cache.shape_counters();
+    let mut expected = vec![Some(r#"{"label":"a"}"#.to_string()), null_value.map(|v| v.to_string())];
+    for phase in 0..3 {
+        if phase == 1 {
+            env.advance(std::time::Duration::from_secs(10 * 60));
+            env.flush_and_evict().await?;
+        }
+        if phase == 2 {
+            let now = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(support::now_micros()).unwrap();
+            client.execute(
+                "INSERT INTO otel_metrics (project_id, timestamp, date, ingested_at, id, series_id, metric_name, metric_unit, metric_type, flags, dropped_attributes_count, message_size_bytes, attributes) \
+                 VALUES ('e2e_projection', $1, $2, $1, 'new', 's3', 'requests', '1', 'GAUGE', 0, 0, 10, '{\"label\":\"b\"}')",
+                &[&now, &now.date_naive()],
+            ).await?;
+            expected.push(Some(r#"{"label":"b"}"#.to_string()));
+        }
+        assert_eq!(env.snapshot_stats().mem_total_rows, [2, 0, 1][phase], "fixture must exercise MemBuffer, Delta, then mixed storage");
+        expected.sort();
+        let simple = client.simple_query(sql).await?;
+        let simple: Vec<_> = simple
+            .iter()
+            .filter_map(|message| match message {
+                tokio_postgres::SimpleQueryMessage::Row(row) => Some(row),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            simple.iter().all(|row| row.columns()[0].name() == name),
+            "phase {phase}: simple output name must survive rewriting: {:?}",
+            simple.iter().map(|row| row.columns()[0].name()).collect::<Vec<_>>()
+        );
+        let mut values = simple
+            .iter()
+            .map(|row| row.get(0).map(serde_json::from_str::<serde_json::Value>).transpose().map(|v| v.map(|v| v.to_string())))
+            .collect::<Result<Vec<_>, _>>()?;
+        values.sort();
+        assert_eq!(values, expected, "phase {phase}: simple values and NULL semantics");
+        let statement = client.prepare(sql).await?;
+        assert_eq!(statement.columns()[0].name(), name);
+        assert_eq!(statement.columns()[0].type_(), &wire_type);
+        for _ in 0..2 {
+            let rows = client.query(&statement, &[]).await?;
+            let mut values = rows
+                .iter()
+                .map(|row| -> anyhow::Result<Option<String>> {
+                    let value: Option<serde_json::Value> = if wire_type == Type::JSONB {
+                        row.try_get(0)?
+                    } else {
+                        row.try_get::<_, Option<String>>(0)?.as_deref().map(serde_json::from_str).transpose()?
+                    };
+                    Ok(value.map(|v| v.to_string()))
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            values.sort();
+            assert_eq!(values, expected, "phase {phase}: prepared and cached values and NULL semantics");
+        }
+    }
+    let after = cache.shape_counters();
+    assert!(after.0 > before.0, "the queries must still use the shape cache");
+    assert_eq!(after.1, before.1, "the fix must not add cache refusals");
     Ok(())
 }

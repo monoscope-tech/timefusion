@@ -564,7 +564,8 @@ fn max_placeholder_index(stmt: &Statement) -> usize {
 /// plan shape (LIMIT, bucket sizes) and vary little. `base > 0` leaves the
 /// client's `$1..$base` binds untouched (mixed now()+`$N` path); `include_strings`
 /// is off there because a prepared statement's literals are fixed across binds.
-/// String constants projected as a bare select item, in any query, CTE or UNION branch.
+/// Strings in unnamed projection expressions also form their output names.
+/// Keep them inline, plus bare projected strings in any query, CTE or UNION branch.
 /// Lifted to an untyped `$N`, `SELECT 'service' AS kind … UNION ALL …` stops type-checking
 /// (monoscope's service map planned fresh every call, ~1.2 s); left inline they only narrow
 /// the template.
@@ -572,13 +573,22 @@ fn projected_string_constants(stmt: &Statement) -> std::collections::HashSet<Str
     use datafusion::sql::sqlparser::ast::{Query, Visit, Visitor};
     fn selects(set: &SetExpr, out: &mut std::collections::HashSet<String>) {
         match set {
-            SetExpr::Select(select) => out.extend(select.projection.iter().filter_map(|item| match item {
-                SelectItem::UnnamedExpr(SqlExpr::Value(v)) | SelectItem::ExprWithAlias { expr: SqlExpr::Value(v), .. } => match &v.value {
-                    Value::SingleQuotedString(s) => Some(s.clone()),
-                    _ => None,
-                },
-                _ => None,
-            })),
+            SetExpr::Select(select) => {
+                for item in &select.projection {
+                    let expr = match item {
+                        SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr: expr @ SqlExpr::Value(_), .. } => expr,
+                        _ => continue,
+                    };
+                    let _: ControlFlow<()> = visit_expressions(expr, |expr: &SqlExpr| {
+                        if let SqlExpr::Value(v) = expr
+                            && let Value::SingleQuotedString(value) = &v.value
+                        {
+                            out.insert(value.clone());
+                        }
+                        ControlFlow::Continue(())
+                    });
+                }
+            }
             SetExpr::SetOperation { left, right, .. } => {
                 selects(left, out);
                 selects(right, out);
@@ -1242,6 +1252,23 @@ mod tests {
             assert!(normalize_count_star(&parse(sql)).is_none(), "declined: {sql}");
         }
         assert_eq!(plan(parse("SELECT COUNT(*) FROM t")).await.expect("plans").schema().field(0).name(), "count(*)");
+    }
+
+    #[tokio::test]
+    async fn shape_cache_preserves_unaliased_expression_names() -> anyhow::Result<()> {
+        let hook = PlanCacheHook::new(64, true);
+        let ctx = test_ctx();
+        for fallback in ["null", "unknown"] {
+            for project in ["p", "q"] {
+                let statement = parse(&format!("SELECT COALESCE(CAST(id AS VARCHAR), '{fallback}') FROM t WHERE project_id='{project}'"));
+                let uncached = ctx.state().statement_to_plan(DfStatement::Statement(Box::new(statement.clone()))).await?;
+                let cached = hook.cached_plan(&statement, &ctx).await.expect("shape served")?;
+                assert_eq!(cached.schema().field(0).name(), uncached.schema().field(0).name(), "cache parameter names must not enter the output schema");
+            }
+        }
+        assert_eq!(hook.shape_counters(), (4, 0), "every statement still uses the shape cache");
+        assert_eq!(hook.shapes.len(), 2, "projects share shapes; name-bearing constants distinguish output contracts");
+        Ok(())
     }
 
     /// monoscope's service map: CTEs, a self-join, `NOT EXISTS` and constant select items in

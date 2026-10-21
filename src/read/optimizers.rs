@@ -2,6 +2,7 @@ use datafusion::{
     logical_expr::{
         BinaryExpr, Expr, Operator,
         expr::{Cast, TryCast},
+        expr_rewriter::NamePreserver,
         utils::split_conjunction,
     },
     prelude::col,
@@ -495,7 +496,12 @@ fn coerce_variant_value_positions(plan: LogicalPlan) -> Result<LogicalPlan> {
     if !schema.fields().iter().any(|f| is_variant_type(f.data_type())) {
         return Ok(plan);
     }
-    plan.map_expressions(|expr| expr.transform_up(|e| coerce_expr(e, &schema))).map(|t| t.data)
+    let names = NamePreserver::new(&plan);
+    plan.map_expressions(|expr| {
+        let name = names.save(&expr);
+        expr.transform_up(|e| coerce_expr(e, &schema)).map(|rewritten| rewritten.update_data(|expr| name.restore(expr)))
+    })
+    .map(|t| t.data)
 }
 
 /// Wraps any Variant operand in a scalar-text position with `variant_to_json`.
@@ -512,6 +518,16 @@ fn coerce_expr(e: Expr, schema: &DFSchema) -> Result<Transformed<Expr>> {
         // text (pg OID 25), not variant_to_json's jsonb output (OID 3802).
         Expr::Cast(Cast { expr, field }) if is_text_type(field.data_type()) && is_variant_expr(&expr, schema) => {
             Ok(Transformed::yes(Expr::Cast(Cast { expr: Box::new(wrap(*expr)), field })))
+        }
+        // Mixed Variant/text COALESCE has text semantics, while all-Variant
+        // arguments must retain their binary type for intermediate operations.
+        Expr::ScalarFunction(mut sf)
+            if sf.func.name() == "coalesce"
+                && sf.args.iter().any(|arg| arg.get_type(schema).is_ok_and(|ty| is_text_type(&ty)))
+                && sf.args.iter().any(|arg| is_variant_expr(arg, schema)) =>
+        {
+            sf.args = sf.args.into_iter().map(|arg| if is_variant_expr(&arg, schema) { wrap(arg) } else { arg }).collect();
+            Ok(Transformed::yes(Expr::ScalarFunction(sf)))
         }
         Expr::BinaryExpr(BinaryExpr { left, op, right })
             if is_text_comparison_op(op) && (is_variant_expr(&left, schema) || is_variant_expr(&right, schema)) =>
@@ -623,12 +639,12 @@ fn is_variant_expr(expr: &Expr, schema: &DFSchema) -> bool {
 }
 
 fn wrap_with_variant_to_json(expr: &Expr) -> Expr {
-    let wrap = |inner: Expr| call_udf(&variant_to_json_udf(), vec![inner]);
-    match expr {
-        // Keep the alias outermost so the output column name is unchanged.
-        Expr::Alias(a) => wrap(a.expr.as_ref().clone()).alias(a.name.clone()),
-        other => wrap(other.clone()),
-    }
+    let name = NamePreserver::new_for_projection().save(expr);
+    let value = match expr {
+        Expr::Alias(alias) => alias.expr.as_ref().clone(),
+        other => other.clone(),
+    };
+    name.restore(call_udf(&variant_to_json_udf(), vec![value]))
 }
 
 /// Peephole: `json_as_text(variant_to_json(v), 'k')` → the Variant-native
