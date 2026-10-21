@@ -2603,15 +2603,18 @@ mod ordered_probe_contract_tests {
     }
 
     /// Expensive, explicit volume experiment; normal CI retains the exact-key cases above.
-    #[test_case::test_case(4096, 0 ; "four million rows")]
-    #[test_case::test_case(295781, 424 ; "production row count")]
+    #[test_case::test_case(4096, 0, false ; "four million rows")]
+    #[test_case::test_case(295781, 424, false ; "production row count")]
+    #[test_case::test_case(4096, 0, true ; "four million rows full overlap")]
+    #[test_case::test_case(295781, 424, true ; "production row count full overlap")]
     #[ignore = "writes a production-shaped synthetic key workload to local MinIO"]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn whole_date_probe_volume(rows_per_group: usize, mut extra_rows: usize) -> Result<()> {
+    async fn whole_date_probe_volume(rows_per_group: usize, mut extra_rows: usize, full_overlap: bool) -> Result<()> {
         use arrow::array::{ArrayRef, StringArray, TimestampMicrosecondArray, UInt32Array, new_null_array};
         const TABLE: &str = "otel_logs_and_spans";
         // Reuse only a previous local experiment prefix to avoid rewriting gigabytes while debugging cancellation.
         let reuse = std::env::var("TIMEFUSION_PROBE_VOLUME_PREFIX").ok();
+        anyhow::ensure!(!full_overlap || reuse.is_none(), "full-overlap inputs must be regenerated; row counts alone cannot establish their geometry");
         let mut config = TestConfigBuilder::new("probe-volume").build();
         if let Some(prefix) = &reuse {
             anyhow::ensure!(
@@ -2628,10 +2631,23 @@ mod ordered_probe_contract_tests {
         let max_group_rows = rows_per_group + usize::from(extra_rows > 0);
         let ranges: Vec<_> = (0..23)
             .map(|file| {
-                let groups = if file < 11 { 43 } else { 42 };
+                let groups = if full_overlap {
+                    // Production footer census: 16×43, 1×44, 2×42, 3×40, 1×41.
+                    match file {
+                        0..16 => 43,
+                        16 => 44,
+                        17..19 => 42,
+                        19..22 => 40,
+                        _ => 41,
+                    }
+                } else if file < 11 {
+                    43
+                } else {
+                    42
+                };
                 let extra = extra_rows.min(groups);
                 extra_rows -= extra;
-                let lo = file * 43 * rows_per_group / 2;
+                let lo = if full_overlap { 0 } else { file * 43 * rows_per_group / 2 };
                 (lo, lo + groups * rows_per_group + extra)
             })
             .collect();
@@ -2643,11 +2659,18 @@ mod ordered_probe_contract_tests {
         let timestamp = |key: usize| start + key as i64 * step + (twox_hash::XxHash64::oneshot(2, &key.to_le_bytes()) & 127) as i64;
         let mut expected = HashSet::new();
         for (i, &(lo, hi)) in ranges.iter().enumerate() {
-            for &(other_lo, other_hi) in &ranges[i + 1..] {
+            for (j, &(other_lo, other_hi)) in ranges.iter().enumerate().skip(i + 1) {
+                // Full overlap keeps most keys distinct across files. Only even
+                // row keys in adjacent file pairs share their complete identity.
+                if full_overlap && i / 2 != j / 2 {
+                    continue;
+                }
                 let from = lo.max(other_lo);
+                let from = if full_overlap { from.next_multiple_of(2) } else { from };
                 let to = hi.min(other_hi);
                 if from < to {
-                    expected.extend(timestamp(from) / 600_000_000..=timestamp(to - 1) / 600_000_000);
+                    let last = if full_overlap { (to - 1) / 2 * 2 } else { to - 1 };
+                    expected.extend(timestamp(from) / 600_000_000..=timestamp(last) / 600_000_000);
                 }
             }
         }
@@ -2679,8 +2702,10 @@ mod ordered_probe_contract_tests {
                     let keys: Vec<_> = (lower..=upper).rev().collect();
                     let timestamps: ArrayRef = Arc::new(TimestampMicrosecondArray::from_iter_values(keys.iter().map(|k| timestamp(*k))).with_timezone("UTC"));
                     let ids: ArrayRef = Arc::new(StringArray::from_iter_values(keys.iter().map(|key| {
+                        let salt = if full_overlap { if key % 2 == 0 { file / 2 } else { file + 23 } } else { 0 } as u64;
                         let bytes = key.to_le_bytes();
-                        uuid::Uuid::from_u64_pair(twox_hash::XxHash64::oneshot(0, &bytes), twox_hash::XxHash64::oneshot(1, &bytes)).to_string()
+                        uuid::Uuid::from_u64_pair(twox_hash::XxHash64::oneshot(2 * salt, &bytes), twox_hash::XxHash64::oneshot(2 * salt + 1, &bytes))
+                            .to_string()
                     })));
                     let services: ArrayRef = Arc::new(StringArray::from(keys.iter().map(|k| (k % 7 != 0).then_some("api-service")).collect::<Vec<_>>()));
                     let indices = UInt32Array::from(vec![0; keys.len()]);
@@ -2715,7 +2740,7 @@ mod ordered_probe_contract_tests {
             }
         }
         eprintln!(
-            "volume_input rows={total_rows} files=23 row_groups=977 pool_limit_bytes={} prepare_ms={} reused={} table_uri={}",
+            "volume_input rows={total_rows} files=23 row_groups=977 full_overlap={full_overlap} pool_limit_bytes={} prepare_ms={} reused={} table_uri={}",
             db.heavy_pool_bytes(),
             prepared.elapsed().as_millis(),
             reuse.is_some(),
