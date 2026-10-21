@@ -1064,15 +1064,64 @@ async fn ids_and_dedup_input(ctx: &SessionContext, sql: &str) -> Result<(Vec<Str
     Ok((ids, input.0))
 }
 
+#[derive(Clone, Copy, Debug)]
+enum PageContract {
+    IssueSample,
+    LogExplorer,
+}
+
+/// Decode the actual wire result without truncating at the client. The prepared
+/// browser contract binds its page size and records time through its first row.
+async fn wire_page(client: &tokio_postgres::Client, sql: &str, contract: PageContract) -> Result<(Vec<serde_json::Value>, Option<std::time::Duration>)> {
+    match contract {
+        PageContract::IssueSample => Ok((
+            client
+                .simple_query(sql)
+                .await?
+                .into_iter()
+                .filter_map(|message| match message {
+                    tokio_postgres::SimpleQueryMessage::Row(row) => Some(json!([row.get(0), row.get(1), row.get(2)])),
+                    _ => None,
+                })
+                .collect(),
+            None,
+        )),
+        PageContract::LogExplorer => {
+            use futures::{StreamExt, TryStreamExt};
+            let started = std::time::Instant::now();
+            let stream = client.query_raw(sql, [&501i64 as &(dyn tokio_postgres::types::ToSql + Sync)]).await?.fuse();
+            futures::pin_mut!(stream);
+            let first = stream.try_next().await?;
+            let first_row = first.as_ref().map(|_| started.elapsed());
+            let mut rows: Vec<serde_json::Value> = futures::stream::iter(first.into_iter().map(Ok))
+                .chain(stream)
+                .and_then(|row| async move { row.try_get::<_, serde_json::Value>(0) })
+                .try_collect()
+                .await?;
+            assert!(rows.windows(2).all(|pair| pair[0][1].as_str() >= pair[1][1].as_str()), "browser rows must retain descending timestamps");
+            // The caller orders only by timestamp; compare tied rows as a set
+            // without discarding the order between distinct timestamps.
+            for tied in rows.chunk_by_mut(|a, b| a[1] == b[1]) {
+                tied.sort_by_cached_key(|row| row[0].as_str().expect("browser id").to_owned());
+            }
+            Ok((rows, first_row))
+        }
+    }
+}
+
 /// A predicate on a mutable column narrows every leg to the timestamps where some version
 /// matches (indexed hits, unindexed files, MemBuffer), so the newest version of each candidate
 /// still decides: no superseded match resurfaces and no newly matching version is lost.
-#[test_case(false, false; "partial coverage with seeded disk")]
-#[test_case(true, false; "complete coverage with seeded disk")]
-#[test_case(false, true; "partial coverage with cold disk")]
-#[test_case(true, true; "complete coverage with cold disk")]
+#[test_case(false, false, PageContract::IssueSample; "partial coverage with seeded disk")]
+#[test_case(true, false, PageContract::IssueSample; "complete coverage with seeded disk")]
+#[test_case(false, true, PageContract::IssueSample; "partial coverage with cold disk")]
+#[test_case(true, true, PageContract::IssueSample; "complete coverage with cold disk")]
+#[test_case(false, false, PageContract::LogExplorer; "browser partial coverage with seeded disk")]
+#[test_case(true, false, PageContract::LogExplorer; "browser complete coverage with seeded disk")]
+#[test_case(false, true, PageContract::LogExplorer; "browser partial coverage with cold disk")]
+#[test_case(true, true, PageContract::LogExplorer; "browser complete coverage with cold disk")]
 #[tokio::test(flavor = "multi_thread")]
-async fn a_mutable_predicate_narrows_to_candidate_timestamps_without_ghosts(complete: bool, cold_disk: bool) -> Result<()> {
+async fn a_mutable_predicate_narrows_to_candidate_timestamps_without_ghosts(complete: bool, cold_disk: bool, contract: PageContract) -> Result<()> {
     use object_store::ObjectStoreExt;
     use timefusion::{
         database::scan_metric_names::PREFILTER_MUTABLE_CANDIDATES,
@@ -1080,6 +1129,10 @@ async fn a_mutable_predicate_narrows_to_candidate_timestamps_without_ghosts(comp
         support::test_helpers::json_to_batch_for,
     };
     init_local_metrics_for_test();
+    let (window_hours, budget_secs) = match contract {
+        PageContract::IssueSample => (3, 4),
+        PageContract::LogExplorer => (14 * 24, 90),
+    };
     let id = uuid::Uuid::new_v4().to_string()[..8].to_string();
     let (on, ctx, svc) = build_db_with(&format!("{id}-mutcand-on"), true, |cfg| {
         // The fixture's derived TantivyConfig::default has a one-reader floor;
@@ -1102,12 +1155,30 @@ async fn a_mutable_predicate_narrows_to_candidate_timestamps_without_ghosts(comp
             ("late", h) if h == hash => vec![h, "buffered"],
             _ => vec![h],
         };
-        json!({"timestamp": ts, "date": date, "id": id, "name": id, "hashes": hashes, "project_id": p, "summary": [id], "context___trace_id": format!("trace-{id}"), "message_size_bytes": 1})
+        let mut record = json!({"timestamp": ts, "date": date, "id": id, "name": id, "hashes": hashes, "project_id": p, "summary": [id], "context___trace_id": format!("trace-{id}"), "message_size_bytes": 1});
+        if matches!(contract, PageContract::LogExplorer) && id != "solo" {
+            record["duration"] = json!(1200);
+            record["resource___service___name"] = json!("browser-api");
+            record["parent_id"] = json!(format!("parent-{id}"));
+            record["start_time"] = json!(ts);
+            record["context___span_id"] = json!(format!("span-{id}"));
+            record["kind"] = json!("span");
+            record["level"] = json!("ERROR");
+            record["severity___severity_number"] = json!(17);
+            record["summary"] = json!([id, "quoted \"summary\"\nnext line"]);
+        }
+        record
     };
     let fillers = |n: i64| (0..n).map(|i| row(&format!("f{i}"), 60 + i, "other")).collect::<Vec<_>>();
     for db in [&on, &off] {
         // Unindexed (direct) file: `ghost`'s older matching version, and `solo`, matching only here.
-        let direct = [vec![row("ghost", 1, hash), row("solo", 5, hash), row("removed-only", 6, "removed")], fillers(30)].concat();
+        let older = match contract {
+            PageContract::IssueSample => Vec::new(),
+            PageContract::LogExplorer => {
+                (0..512).map(|i| row(&format!("page-{i}"), 181 + i * 36, hash)).chain([row("tie-a", 8, "ties"), row("tie-b", 8, "ties")]).collect()
+            }
+        };
+        let direct = [vec![row("ghost", 1, hash), row("solo", 5, hash), row("removed-only", 6, "removed")], fillers(30), older].concat();
         db.insert_records_batch(&p, table, vec![json_to_batch_for(table, direct)?], true, None).await?;
         // Indexed file: `ghost` stops matching, `stale` and `kept` match, `late` does not yet.
         let indexed = [
@@ -1198,8 +1269,8 @@ async fn a_mutable_predicate_narrows_to_candidate_timestamps_without_ghosts(comp
         *table_ref.write().await = target;
         own_bytes
     };
-    // Exercise the identified issue-sample contract through simple PGWire,
-    // against an independent server whose prefilter is disabled as the oracle.
+    // Exercise each captured caller through its actual protocol, against an
+    // independent server whose prefilter is disabled as the oracle.
     let stop = tokio_util::sync::CancellationToken::new();
     let mut tasks = tokio::task::JoinSet::new();
     let mut clients = Vec::new();
@@ -1222,20 +1293,9 @@ async fn a_mutable_predicate_narrows_to_candidate_timestamps_without_ghosts(comp
         });
         let (client, connection) = tokio_postgres::connect(&format!("host=127.0.0.1 port={port} user=postgres password=test"), tokio_postgres::NoTls).await?;
         tasks.spawn(async move { connection.await.map_err(anyhow::Error::from) });
-        client.batch_execute("SET statement_timeout = '4s'").await?;
+        client.batch_execute(&format!("SET statement_timeout = '{budget_secs}s'")).await?;
         clients.push(client);
     }
-    let sample = |messages: Vec<tokio_postgres::SimpleQueryMessage>| {
-        messages
-            .into_iter()
-            .filter_map(|message| match message {
-                tokio_postgres::SimpleQueryMessage::Row(row) => {
-                    Some((row.get(0).map(str::to_owned), row.get(1).map(str::to_owned), row.get(2).map(str::to_owned)))
-                }
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-    };
     let iso = |time| chrono::DateTime::from_timestamp_micros(time).unwrap().format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string();
     let search = on.tantivy_search().expect("search service");
     let opens = || search.stats.index_opens.load(std::sync::atomic::Ordering::Relaxed) + search.stats.bundle_opens.load(std::sync::atomic::Ordering::Relaxed);
@@ -1252,11 +1312,24 @@ async fn a_mutable_predicate_narrows_to_candidate_timestamps_without_ghosts(comp
             ("absent", None),
             ("removed", None),
             ("deleted", None),
-        ] {
+        ]
+        .into_iter()
+        .chain(matches!(contract, PageContract::LogExplorer).then_some(("ties", Some("trace-tie-a"))))
+        {
+            let projection = match contract {
+                PageContract::IssueSample => "timestamp, summary, context___trace_id",
+                PageContract::LogExplorer => {
+                    "jsonb_build_array(id,to_char(timestamp at time zone 'UTC', 'YYYY-MM-DD HH24:MI:SS.US'),context___trace_id,name,duration,resource___service___name,parent_id,cast(extract(epoch from (start_time)) * 1000000 as bigint),coalesce(errors is not null or (kind = 'span' and (lower(level) = 'error' or severity___severity_number >= 17 or status_code = 'ERROR')), false),to_jsonb(summary),context___span_id,kind)"
+                }
+            };
+            let (predicate, limit) = match contract {
+                PageContract::IssueSample => (format!("'{tag}' = ANY(hashes)"), "1"),
+                PageContract::LogExplorer => (format!("array_has(hashes, '{tag}')"), "$1"),
+            };
             let sql = format!(
-                "SELECT timestamp, summary, context___trace_id FROM otel_logs_and_spans WHERE project_id='{p}' \
-                AND timestamp BETWEEN '{}' AND '{}' AND '{tag}' = ANY(hashes) ORDER BY timestamp DESC LIMIT 1",
-                iso(now - 3 * 3_600_000_000),
+                "SELECT {projection} FROM otel_logs_and_spans WHERE project_id='{p}' \
+                AND timestamp BETWEEN '{}' AND '{}' AND {predicate} ORDER BY timestamp DESC LIMIT {limit}",
+                iso(now - window_hours * 3_600_000_000),
                 iso(now)
             );
             let before = counter_value(PREFILTER_MUTABLE_CANDIDATES);
@@ -1264,9 +1337,9 @@ async fn a_mutable_predicate_narrows_to_candidate_timestamps_without_ghosts(comp
             let index_before = range_bytes();
             let phases: Vec<_> = timefusion::observability::plan_phases().collect();
             let started = std::time::Instant::now();
-            let actual = sample(tokio::time::timeout(std::time::Duration::from_secs(5), clients[0].simple_query(&sql)).await??);
+            let (actual, first_row) = tokio::time::timeout(std::time::Duration::from_secs(budget_secs + 1), wire_page(&clients[0], &sql, contract)).await??;
             let elapsed = started.elapsed();
-            assert!(elapsed < std::time::Duration::from_secs(4), "saved issue-sample contract must retain its four-second deadline");
+            assert!(elapsed < std::time::Duration::from_secs(budget_secs), "{contract:?} must retain its captured deadline");
             assert_eq!(counter_value(PREFILTER_MUTABLE_CANDIDATES), before + 1, "foreign files must not disable scoped candidate collection");
             let cost: Vec<_> = timefusion::observability::plan_phases()
                 .zip(phases)
@@ -1278,14 +1351,44 @@ async fn a_mutable_predicate_narrows_to_candidate_timestamps_without_ghosts(comp
             assert!(index_read_bytes <= 4 * index_bytes, "range reads must stay bounded by this project's index objects");
             assert_eq!(search.stats.blob_fetches.load(std::sync::atomic::Ordering::Relaxed), 0, "sample queries must not install whole blobs");
             eprintln!(
-                "issue sample complete={complete} cold_disk={cold_disk} pass={pass} tag={tag} elapsed_us={} parquet_bytes={read_bytes} index_range_bytes={index_read_bytes} phases={cost:?}",
+                "{contract:?} complete={complete} cold_disk={cold_disk} pass={pass} tag={tag} elapsed_us={} first_row={first_row:?} parquet_bytes={read_bytes} index_range_bytes={index_read_bytes} phases={cost:?}",
                 elapsed.as_micros()
             );
-            let oracle = sample(tokio::time::timeout(std::time::Duration::from_secs(5), clients[1].simple_query(&sql)).await??);
+            let (oracle, _) = tokio::time::timeout(std::time::Duration::from_secs(budget_secs + 1), wire_page(&clients[1], &sql, contract)).await??;
             assert_eq!(counter_value(PREFILTER_MUTABLE_CANDIDATES), before + 1, "oracle must not use the candidate path");
             assert_eq!(actual, oracle, "pass {pass}: all projected values must match the full latest-visible-row oracle for {tag}");
-            assert_eq!(actual.first().and_then(|row| row.2.as_deref()), trace, "pass {pass}: expected visible winner for {tag}");
-            assert_eq!(actual.len(), usize::from(trace.is_some()));
+            assert_eq!(actual.first().and_then(|row| row[2].as_str()), trace, "pass {pass}: expected visible winner for {tag}");
+            let expected_len = match (contract, tag) {
+                (PageContract::LogExplorer, tag) if tag == hash => 501,
+                (PageContract::LogExplorer, "other") => 33,
+                (PageContract::LogExplorer, "ties") => 2,
+                _ => usize::from(trace.is_some()),
+            };
+            assert_eq!(actual.len(), expected_len);
+            if matches!(contract, PageContract::LogExplorer) && tag == hash {
+                let expected: Vec<_> =
+                    ["kept".to_string(), "late".to_string(), "solo".to_string()].into_iter().chain((0..498).map(|i| format!("page-{i}"))).collect();
+                assert_eq!(actual.iter().map(|row| row[0].as_str().expect("browser id")).collect::<Vec<_>>(), expected);
+                let ts = now - 3 * 60_000_000;
+                assert_eq!(
+                    actual[0],
+                    json!([
+                        "kept",
+                        chrono::DateTime::from_timestamp_micros(ts).unwrap().format("%Y-%m-%d %H:%M:%S%.6f").to_string(),
+                        "trace-kept",
+                        "kept",
+                        1200,
+                        "browser-api",
+                        "parent-kept",
+                        ts,
+                        true,
+                        ["kept", "quoted \"summary\"\nnext line"],
+                        "span-kept",
+                        "span"
+                    ]),
+                    "all twelve prepared JSON fields must preserve their values and types"
+                );
+            }
         }
         if pass == 0 {
             warm_opens = opens();
