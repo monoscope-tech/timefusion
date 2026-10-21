@@ -421,7 +421,7 @@ dependencies = [
 [[package]]
 name = "arrow-pg"
 version = "0.15.0"
-source = "git+https://github.com/apitoolkit/datafusion-postgres.git?rev=68fdc80d4a136e7ff0b02eb3755a3418141b9952#68fdc80d4a136e7ff0b02eb3755a3418141b9952"
+source = "git+https://github.com/apitoolkit/datafusion-postgres.git?rev=1388ea37ec8eeefd13b07771f8d0052f164ae7f1#1388ea37ec8eeefd13b07771f8d0052f164ae7f1"
 dependencies = [
  "arrow-schema",
  "bytes",
@@ -2708,7 +2708,7 @@ dependencies = [
 [[package]]
 name = "datafusion-pg-catalog"
 version = "0.18.3"
-source = "git+https://github.com/apitoolkit/datafusion-postgres.git?rev=68fdc80d4a136e7ff0b02eb3755a3418141b9952#68fdc80d4a136e7ff0b02eb3755a3418141b9952"
+source = "git+https://github.com/apitoolkit/datafusion-postgres.git?rev=1388ea37ec8eeefd13b07771f8d0052f164ae7f1#1388ea37ec8eeefd13b07771f8d0052f164ae7f1"
 dependencies = [
  "arrow-pg",
  "async-trait",
@@ -2722,7 +2722,7 @@ dependencies = [
 [[package]]
 name = "datafusion-pg-functions"
 version = "0.1.0"
-source = "git+https://github.com/apitoolkit/datafusion-postgres.git?rev=68fdc80d4a136e7ff0b02eb3755a3418141b9952#68fdc80d4a136e7ff0b02eb3755a3418141b9952"
+source = "git+https://github.com/apitoolkit/datafusion-postgres.git?rev=1388ea37ec8eeefd13b07771f8d0052f164ae7f1#1388ea37ec8eeefd13b07771f8d0052f164ae7f1"
 dependencies = [
  "datafusion",
  "libm",
@@ -2841,7 +2841,7 @@ dependencies = [
 [[package]]
 name = "datafusion-postgres"
 version = "0.18.0"
-source = "git+https://github.com/apitoolkit/datafusion-postgres.git?rev=68fdc80d4a136e7ff0b02eb3755a3418141b9952#68fdc80d4a136e7ff0b02eb3755a3418141b9952"
+source = "git+https://github.com/apitoolkit/datafusion-postgres.git?rev=1388ea37ec8eeefd13b07771f8d0052f164ae7f1#1388ea37ec8eeefd13b07771f8d0052f164ae7f1"
 dependencies = [
  "arrow-pg",
  "async-trait",
@@ -3513,7 +3513,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4699,7 +4699,7 @@ checksum = "3640c1c38b8e4e43584d8df18be5fc6b0aa314ce6ebf51b53313d4306cca8e46"
 dependencies = [
  "hermit-abi",
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6284,7 +6284,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "27c6023962132f4b30eb4c172c91ce92d933da334c59c23cddee82358ddafb0b"
 dependencies = [
  "anyhow",
- "itertools 0.13.0",
+ "itertools 0.12.1",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -6481,7 +6481,7 @@ dependencies = [
  "once_cell",
  "socket2 0.5.10",
  "tracing",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -7021,7 +7021,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.4.15",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -7034,7 +7034,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.11.0",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7114,7 +7114,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -8350,7 +8350,7 @@ dependencies = [
  "getrandom 0.4.1",
  "once_cell",
  "rustix 1.1.3",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

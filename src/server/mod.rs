@@ -2396,7 +2396,17 @@ mod streaming_tests {
             let input = GatedInput { batch: batch.clone(), release: release.clone(), fail_after };
             ctx.register_table(name, Arc::new(StreamingTable::try_new(schema.clone(), vec![Arc::new(input)])?))?;
         }
-        let handlers = handler_factory(Arc::new(ctx), AuthConfig { username: "postgres".into(), password: Some("test".into()) }, None, None);
+        let lifetime_release = Arc::new(tokio::sync::Notify::new());
+        let lifetime = Arc::downgrade(&lifetime_release);
+        ctx.register_table(
+            "cursor_lifetime",
+            Arc::new(StreamingTable::try_new(
+                schema.clone(),
+                vec![Arc::new(GatedInput { batch: batch.clone(), release: lifetime_release.clone(), fail_after: false })],
+            )?),
+        )?;
+        let ctx = Arc::new(ctx);
+        let handlers = handler_factory(ctx.clone(), AuthConfig { username: "postgres".into(), password: Some("test".into()) }, None, None);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let port = listener.local_addr()?.port();
         let mut tasks = tokio::task::JoinSet::new();
@@ -2448,7 +2458,7 @@ mod streaming_tests {
             release.notify_one();
             drain_to_error(&mut failed, None, "late input failure never reached the client").await;
             client.batch_execute("DECLARE exhausted CURSOR FOR SELECT 42::BIGINT AS n").await?;
-            assert_eq!(client.query("FETCH ALL FROM exhausted", &[]).await?.len(), 1);
+            assert_eq!(client.query("FETCH ALL FROM exhausted", &[]).await?[0].get::<_, i64>(0), 42);
             for _ in 0..2 {
                 let empty = client.simple_query("FETCH ALL FROM exhausted").await?;
                 assert!(empty.iter().any(
@@ -2456,6 +2466,35 @@ mod streaming_tests {
                 ));
             }
             client.batch_execute("CLOSE exhausted").await?;
+            client.batch_execute("DECLARE mixed CURSOR FOR SELECT n, CASE WHEN n=2 THEN NULL ELSE 'label' END AS label, ARRAY[n,n+1] AS ns FROM gated").await?;
+            assert!(client.query("FETCH FORWARD 0 FROM mixed", &[]).await?.is_empty());
+            let fetch = client.prepare("FETCH FORWARD 1 FROM mixed").await?;
+            let row = client.query(&fetch, &[]).await?.remove(0);
+            assert_eq!((row.get::<_, i64>(0), row.get::<_, String>(1), row.get::<_, Vec<i64>>(2)), (1, "label".into(), vec![1, 2]));
+            let text = client.simple_query("FETCH FORWARD 1 FROM mixed").await?;
+            assert!(text.iter().any(|message| matches!(message, tokio_postgres::SimpleQueryMessage::Row(row) if row.get(0) == Some("2") && row.get(1).is_none() && row.get(2) == Some("{2,3}"))));
+            release.notify_one();
+            let tail = client.query("FETCH ALL FROM mixed", &[]).await?;
+            assert_eq!((tail.len(), tail[0].get::<_, i64>(0), tail[0].get::<_, Vec<i64>>(2)), (1, 3, vec![3, 4]));
+            assert!(client.query(&fetch, &[]).await?.is_empty());
+            client.batch_execute("CLOSE mixed; DECLARE mixed CURSOR FOR SELECT 99::BIGINT").await?;
+            assert_eq!(client.query(&fetch, &[]).await.unwrap_err().code(), Some(&tokio_postgres::error::SqlState::FEATURE_NOT_SUPPORTED));
+            assert_eq!(client.query_one("FETCH ALL FROM mixed", &[]).await?.get::<_, i64>(0), 99);
+            client.batch_execute("CLOSE mixed; DECLARE canceled CURSOR FOR SELECT n FROM gated").await?;
+            let rows = client.query_raw("FETCH ALL FROM canceled", std::iter::empty::<&i32>()).await?;
+            futures::pin_mut!(rows);
+            assert_eq!(rows.next().await.unwrap()?.get::<_, i64>(0), 1);
+            client.cancel_token().cancel_query(NoTls).await?;
+            drain_to_error(&mut rows, Some(tokio_postgres::error::SqlState::QUERY_CANCELED), "cursor FETCH was never canceled").await;
+            client.batch_execute("CLOSE canceled; DECLARE retained CURSOR FOR SELECT n FROM cursor_lifetime").await?;
+            ctx.deregister_table("cursor_lifetime")?;
+            drop(lifetime_release);
+            assert!(lifetime.upgrade().is_some(), "the open cursor must retain its input");
+            assert_eq!(client.query_one("FETCH FORWARD 1 FROM retained", &[]).await?.get::<_, i64>(0), 1);
+            client.batch_execute("CLOSE retained").await?;
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                while lifetime.upgrade().is_some() { tokio::task::yield_now().await; }
+            }).await?;
             // The simple protocol must also flush and remain cancellable.
             let rows = client.simple_query_raw("SELECT n FROM gated").await?;
             futures::pin_mut!(rows);
