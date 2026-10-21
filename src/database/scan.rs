@@ -549,8 +549,22 @@ impl ProjectRoutingTable {
             .filter(|uri| uri.ends_with(".parquet") && uri_date_in_window(uri, lo, hi) && !covered.contains(uri))
             .collect();
         // Cold indexes leave their files raw, and this read happens during planning.
-        let sizes: HashMap<String, u64> = table.snapshot()?.log_data().iter().map(|f| (f.path().into_owned(), f.size() as u64)).collect();
-        let size_of = |uri: &String| sizes.get(crate::tantivy::search::parquet_rel_of_uri(uri)?);
+        // Shared tables include other projects. Their files cost this query zero
+        // bytes only when the actual partition metadata proves the project
+        // predicate prunes them. Keep unknown partitions fully priced.
+        let scoped_project = self.extract_project_id_from_filters(filters);
+        let prices: HashMap<String, u64> = table
+            .snapshot()?
+            .log_data()
+            .iter()
+            .map(|file| {
+                let foreign = scoped_project
+                    .as_deref()
+                    .is_some_and(|project| file.partition_values_map().get("project_id").and_then(Option::as_deref).is_some_and(|actual| actual != project));
+                (file.path().into_owned(), if foreign { 0 } else { file.size() as u64 })
+            })
+            .collect();
+        let size_of = |uri: &String| prices.get(crate::tantivy::search::parquet_rel_of_uri(uri)?);
         debug_assert!(raw.iter().all(|uri| size_of(uri).is_some()), "every raw file must be priced");
         if raw.iter().filter_map(size_of).sum::<u64>() > MAX_CANDIDATE_RAW_BYTES {
             return Ok(None);

@@ -1076,35 +1076,179 @@ async fn a_mutable_predicate_narrows_to_candidate_timestamps_without_ghosts() ->
     };
     init_local_metrics_for_test();
     let id = uuid::Uuid::new_v4().to_string()[..8].to_string();
-    let (on, ctx, svc) = build_db(&format!("{id}-mutcand-on"), true).await?;
+    let (on, ctx, svc) = build_db_with(&format!("{id}-mutcand-on"), true, |cfg| {
+        // The fixture's derived TantivyConfig::default has a one-reader floor;
+        // use the production capacity so the warm pass does not thrash it.
+        cfg.tantivy.timefusion_tantivy_reader_cache_entries = AppConfig::default().tantivy.timefusion_tantivy_reader_cache_entries;
+    })
+    .await?;
     let (off, ctx_off, _) = build_db(&format!("{id}-mutcand-off"), false).await?;
-    let (p, table, hash) = (unique_project(), "mor_versioned", "pat:E12e74a9");
+    let (p, table, hash) = (unique_project(), "otel_logs_and_spans", "pat:E12e74a9");
     let now = chrono::Utc::now().timestamp_micros();
     let row = |id: &str, minutes: i64, h: &str| {
         let ts = now - minutes * 60_000_000;
         let date = chrono::DateTime::from_timestamp_micros(ts).unwrap().date_naive().to_string();
-        json!({"timestamp": ts, "date": date, "id": id, "name": id, "hashes": [h], "project_id": p})
+        let hashes = match (id, h) {
+            ("solo", _) => vec![h, "unindexed"],
+            ("late", h) if h == hash => vec![h, "buffered"],
+            _ => vec![h],
+        };
+        json!({"timestamp": ts, "date": date, "id": id, "name": id, "hashes": hashes, "project_id": p, "summary": [id], "context___trace_id": format!("trace-{id}"), "message_size_bytes": 1})
     };
     let fillers = |n: i64| (0..n).map(|i| row(&format!("f{i}"), 60 + i, "other")).collect::<Vec<_>>();
     for db in [&on, &off] {
         // Unindexed (direct) file: `ghost`'s older matching version, and `solo`, matching only here.
-        let direct = [vec![row("ghost", 1, hash), row("solo", 5, hash)], fillers(30)].concat();
+        let direct = [vec![row("ghost", 1, hash), row("solo", 5, hash), row("removed-only", 6, "removed")], fillers(30)].concat();
         db.insert_records_batch(&p, table, vec![json_to_batch_for(table, direct)?], true, None).await?;
         // Indexed file: `ghost` stops matching, `stale` and `kept` match, `late` does not yet.
-        let indexed = [vec![row("ghost", 1, "other"), row("stale", 2, hash), row("kept", 3, hash), row("late", 4, "other")], fillers(30)].concat();
+        let indexed = [
+            vec![
+                row("ghost", 1, "other"),
+                row("stale", 2, hash),
+                row("kept", 3, hash),
+                row("late", 4, "other"),
+                row("removed-only", 6, "other"),
+                row("deleted-only", 7, "deleted"),
+            ],
+            fillers(30),
+        ]
+        .concat();
         db.insert_records_batch(&p, table, vec![json_to_batch_for(table, indexed)?], false, None).await?;
         flush_all(db).await?;
     }
     let store = svc.expect("tantivy").object_store.clone();
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
-    while timefusion::tantivy::load_manifest(store.as_ref(), table, &p).await?.entries.values().map(|e| e.rows).sum::<u64>() < 34 {
+    while timefusion::tantivy::load_manifest(store.as_ref(), table, &p).await?.entries.values().map(|e| e.rows).sum::<u64>() < 36 {
         anyhow::ensure!(tokio::time::Instant::now() < deadline, "the flushed file must be indexed, or the covered path goes untested");
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
     for db in [&on, &off] {
         // MemBuffer: `stale` stops matching, `late` starts.
-        db.insert_records_batch(&p, table, vec![json_to_batch_for(table, vec![row("stale", 2, "other"), row("late", 4, hash)])?], false, None).await?;
+        let mut deleted = row("deleted-only", 7, "deleted");
+        deleted["deleted"] = json!(true);
+        db.insert_records_batch(&p, table, vec![json_to_batch_for(table, vec![row("stale", 2, "other"), row("late", 4, hash), deleted])?], false, None).await?;
     }
+    // Another tenant's large file must not consume this project's planning budget.
+    // The misleading path label pins that partition metadata is authoritative.
+    // Its absent object also proves partition pruning does not read that tenant.
+    let own_delta_bytes: u64 = {
+        let table_ref = on.resolve_table(&p, table).await?;
+        let mut target = table_ref.read().await.clone();
+        let own_bytes = target.snapshot()?.log_data().iter().map(|file| file.size() as u64).sum();
+        let foreign = unique_project();
+        let date = chrono::DateTime::from_timestamp_micros(now).unwrap().date_naive().to_string();
+        let add = deltalake::kernel::Add {
+            path: format!("project_id={p}/date={date}/foreign-unreadable.parquet"),
+            partition_values: [("project_id".into(), Some(foreign)), ("date".into(), Some(date))].into(),
+            size: 1 << 30,
+            data_change: true,
+            ..Default::default()
+        };
+        let operation = deltalake::protocol::DeltaOperation::Write { mode: deltalake::protocol::SaveMode::Append, partition_by: None, predicate: None };
+        let committed = deltalake::kernel::transaction::CommitBuilder::default()
+            .with_actions(vec![deltalake::kernel::Action::Add(add)])
+            .build(Some(target.snapshot()? as &dyn deltalake::kernel::transaction::TableReference), target.log_store(), operation)
+            .await?;
+        target.state = Some(committed.snapshot());
+        *table_ref.write().await = target;
+        own_bytes
+    };
+    // Exercise the identified issue-sample contract through simple PGWire,
+    // against an independent server whose prefilter is disabled as the oracle.
+    let stop = tokio_util::sync::CancellationToken::new();
+    let mut tasks = tokio::task::JoinSet::new();
+    let mut clients = Vec::new();
+    for context in [ctx.clone(), ctx_off.clone()] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let port = listener.local_addr()?.port();
+        let shutdown = stop.clone().cancelled_owned();
+        tasks.spawn(async move {
+            timefusion::server::serve_with_listener(
+                listener,
+                Arc::new(context),
+                &datafusion_postgres::ServerOptions::new(),
+                timefusion::server::AuthConfig { username: "postgres".into(), password: Some("test".into()) },
+                None,
+                None,
+                shutdown,
+            )
+            .await
+            .map_err(|error| anyhow::anyhow!("{error}"))
+        });
+        let (client, connection) = tokio_postgres::connect(&format!("host=127.0.0.1 port={port} user=postgres password=test"), tokio_postgres::NoTls).await?;
+        tasks.spawn(async move { connection.await.map_err(anyhow::Error::from) });
+        client.batch_execute("SET statement_timeout = '4s'").await?;
+        clients.push(client);
+    }
+    let sample = |messages: Vec<tokio_postgres::SimpleQueryMessage>| {
+        messages
+            .into_iter()
+            .filter_map(|message| match message {
+                tokio_postgres::SimpleQueryMessage::Row(row) => {
+                    Some((row.get(0).map(str::to_owned), row.get(1).map(str::to_owned), row.get(2).map(str::to_owned)))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    let iso = |time| chrono::DateTime::from_timestamp_micros(time).unwrap().format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string();
+    let search = on.tantivy_search().expect("search service");
+    let opens = || search.stats.index_opens.load(std::sync::atomic::Ordering::Relaxed) + search.stats.bundle_opens.load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(opens(), 0, "first query must exercise a cold index reader (published disk cache is present)");
+    let mut warm_opens = 0;
+    for pass in 0..2 {
+        for (tag, trace) in [
+            (hash, Some("trace-kept")),
+            ("other", Some("trace-ghost")),
+            ("unindexed", Some("trace-solo")),
+            ("buffered", Some("trace-late")),
+            ("absent", None),
+            ("removed", None),
+            ("deleted", None),
+        ] {
+            let sql = format!(
+                "SELECT timestamp, summary, context___trace_id FROM otel_logs_and_spans WHERE project_id='{p}' \
+                AND timestamp BETWEEN '{}' AND '{}' AND '{tag}' = ANY(hashes) ORDER BY timestamp DESC LIMIT 1",
+                iso(now - 3 * 3_600_000_000),
+                iso(now)
+            );
+            let before = counter_value(PREFILTER_MUTABLE_CANDIDATES);
+            let bytes = deltalake::delta_datafusion::parquet_metrics::snapshot().bytes_read;
+            let phases: Vec<_> = timefusion::observability::plan_phases().collect();
+            let started = std::time::Instant::now();
+            let actual = sample(tokio::time::timeout(std::time::Duration::from_secs(5), clients[0].simple_query(&sql)).await??);
+            let elapsed = started.elapsed();
+            assert!(elapsed < std::time::Duration::from_secs(4), "saved issue-sample contract must retain its four-second deadline");
+            assert_eq!(counter_value(PREFILTER_MUTABLE_CANDIDATES), before + 1, "foreign files must not disable scoped candidate collection");
+            let cost: Vec<_> = timefusion::observability::plan_phases()
+                .zip(phases)
+                .map(|((phase, us, calls), (_, old_us, old_calls))| (phase, us - old_us, calls - old_calls))
+                .collect();
+            let read_bytes = deltalake::delta_datafusion::parquet_metrics::snapshot().bytes_read - bytes;
+            assert!(read_bytes <= 4 * own_delta_bytes, "planning plus execution must stay bounded by this project's physical files");
+            eprintln!("issue sample pass={pass} tag={tag} elapsed_us={} parquet_bytes={read_bytes} phases={cost:?}", elapsed.as_micros());
+            let oracle = sample(tokio::time::timeout(std::time::Duration::from_secs(5), clients[1].simple_query(&sql)).await??);
+            assert_eq!(counter_value(PREFILTER_MUTABLE_CANDIDATES), before + 1, "oracle must not use the candidate path");
+            assert_eq!(actual, oracle, "pass {pass}: all projected values must match the full latest-visible-row oracle for {tag}");
+            assert_eq!(actual.first().and_then(|row| row.2.as_deref()), trace, "pass {pass}: expected visible winner for {tag}");
+            assert_eq!(actual.len(), usize::from(trace.is_some()));
+        }
+        if pass == 0 {
+            warm_opens = opens();
+            assert!(warm_opens > 0);
+        } else {
+            assert_eq!(opens(), warm_opens, "warm repetition must reuse open index readers");
+        }
+    }
+    drop(clients);
+    stop.cancel();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while let Some(result) = tasks.join_next().await {
+            result??;
+        }
+        anyhow::Ok(())
+    })
+    .await??;
     for predicate in [
         format!("array_has(hashes, '{hash}')"),
         format!("'{hash}' = ANY(hashes)"),
