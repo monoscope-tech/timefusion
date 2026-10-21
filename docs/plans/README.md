@@ -1,13 +1,15 @@
 # TimeFusion plans
 
-Last reviewed: 2026-10-20. Owner: TimeFusion maintainers.
+Last reviewed: 2026-10-21. Owner: TimeFusion maintainers.
 
 ## Current work
 
 [Next work](2026-10-19-next-work.md) is the single backlog, with priorities, owners, dependencies, and acceptance checks.
 The [October 19 review](../reviews/2026-10-19-timefusion-triage.md) records the alert/issue snapshot and completed work.
 Its [outstanding issue inventory](../reviews/2026-10-19-timefusion-outstanding-issues.tsv) contains the 696 non-archived records at that review.
-The telemetry snapshot remains dated October 19. This consolidation did not refresh it.
+The active plan includes the October 20–21 evidence refresh, historical alert reconciliation, and exact metrics-total timeout work.
+It distinguishes partial local regressions from completed implementation and production acceptance.
+The separate October 19 review remains a dated historical snapshot.
 
 ## Historical concepts
 

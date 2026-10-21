@@ -30,7 +30,73 @@ async fn insert_select_unnest_coerces_text_to_variant() -> anyhow::Result<()> {
         SELECT u.pid, u.id, u.ts::timestamp, u.d::date, string_to_array(u.summary, chr(31)), u.body, u.attrs \
         FROM unnest($1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::text[], $7::text[]) \
         AS u(pid, id, ts, d, summary, body, attrs)";
+    // A bad final row must reject conversion before either project's first write/WAL append.
+    let rejected_rows = 3;
+    let mut rejected_pids = vec!["e2e_rejected_a".to_string(); rejected_rows];
+    rejected_pids[rejected_rows - 1] = "e2e_rejected_b".into();
+    let rejected_ids: Vec<String> = (0..rejected_rows).map(|i| format!("rejected-{i}")).collect();
+    let rejected_tss = vec![tss[0].clone(); rejected_rows];
+    let rejected_dates = vec![dates[0].clone(); rejected_rows];
+    let rejected_summaries = vec![summaries[0].clone(); rejected_rows];
+    let rejected_attrs = vec![attrs[0].clone(); rejected_rows];
+    let before = env.snapshot_stats();
+    for invalid in ["private-literal-canary invalid JSON".to_string(), format!(r#"{{"private-literal-canary":{}}}"#, "1".repeat(1_000))] {
+        let mut rejected_bodies = vec![bodies[0].clone(); rejected_rows];
+        rejected_bodies[rejected_rows - 1] = invalid;
+        let error = client
+            .execute(sql, &[&rejected_pids, &rejected_ids, &rejected_tss, &rejected_dates, &rejected_summaries, &rejected_bodies, &rejected_attrs])
+            .await
+            .expect_err("malformed JSON must reject the complete conversion stage");
+        let message = error.as_db_error().expect("server error").message();
+        assert!(!message.contains("private-literal-canary"), "wire errors must not disclose input: {message}");
+        assert!(message.contains("Invalid JSON") && message.contains("body"), "safe error locates the invalid column: {message}");
+        let after = env.snapshot_stats();
+        assert_eq!(
+            (after.rows_ingested_total, after.mem_total_rows, after.wal_known_topics, after.wal_disk_bytes),
+            (before.rows_ingested_total, before.mem_total_rows, before.wal_known_topics, before.wal_disk_bytes),
+            "conversion failure must not reach the write layer or WAL, including prior valid batches/projects"
+        );
+    }
     client.execute(sql, &[&pids, &ids, &tss, &dates, &summaries, &bodies, &attrs]).await?;
+
+    // Exercise the two write entry points directly with full real-provider rows,
+    // including a valid first batch followed by an invalid second project.
+    use arrow::{
+        array::{ArrayRef, StringArray},
+        datatypes::{DataType, Field, Schema},
+        record_batch::RecordBatch,
+    };
+    use datafusion::{datasource::sink::DataSink, physical_plan::stream::RecordBatchStreamAdapter};
+    use std::sync::Arc;
+    let mut ctx = env.db().clone().create_session_context();
+    env.db().setup_session_context(&mut ctx)?;
+    let provider = ctx.table_provider("otel_logs_and_spans").await?;
+    let routing = provider.downcast_ref::<timefusion::database::ProjectRoutingTable>().expect("real routing provider");
+    let stored = env.buffered_layer().query(pid, "otel_logs_and_spans", &[])?;
+    let row = stored.iter().find(|batch| batch.num_rows() > 0).expect("valid inserted row").slice(0, 1);
+    let input_batch = |project: &str, body: &str| -> anyhow::Result<RecordBatch> {
+        let mut fields = row.schema().fields().to_vec();
+        let mut columns = row.columns().to_vec();
+        for (name, value) in [("project_id", project), ("body", body)] {
+            let idx = row.schema().index_of(name)?;
+            fields[idx] = Arc::new(Field::new(name, DataType::Utf8, false));
+            columns[idx] = Arc::new(StringArray::from(vec![value])) as ArrayRef;
+        }
+        Ok(RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)?)
+    };
+    let good = input_batch("e2e_rejected_a", r#"{"msg":"safe"}"#)?;
+    let bad = input_batch("e2e_rejected_b", "private-literal-canary invalid JSON")?;
+    let before = env.snapshot_stats();
+    let mixed = arrow::compute::concat_batches(&good.schema(), [&good, &bad])?;
+    assert!(routing.fast_insert_batch(mixed).await.is_err());
+    let stream = RecordBatchStreamAdapter::new(good.schema(), futures::stream::iter([Ok(good), Ok(bad)]));
+    assert!(routing.write_all(Box::pin(stream), &ctx.task_ctx()).await.is_err());
+    let after = env.snapshot_stats();
+    assert_eq!(
+        (after.rows_ingested_total, after.mem_total_rows, after.wal_known_topics, after.wal_disk_bytes),
+        (before.rows_ingested_total, before.mem_total_rows, before.wal_known_topics, before.wal_disk_bytes),
+        "both write entry points must finish conversion across projects/batches before any WAL append"
+    );
 
     // Keep the Variant extraction non-aggregate: an aggregate over it hits an
     // unrelated aggregate-schema path.

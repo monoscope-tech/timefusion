@@ -1,0 +1,14 @@
+# Proposal: enable only after checking both this monitor and telemetry liveness.
+active: false
+title: 'TF warn: PostgreSQL statement or stream failures'
+query: 'resource.service.name in ("timefusion", "srv-captain--timefusion") and (body contains "pgwire.failed_statement" or body contains "pgwire.stream_failed" or body contains "PgWire internal error:") | summarize count()'
+alert_threshold: 0
+trigger_less_than: false
+check_interval_mins: 5
+time_window_mins: 15
+severity: warning
+message: 'A PostgreSQL statement failed, including WARN stream failures and pre-execution errors. Console and OTel exports can describe the same failure: this count detects presence, not distinct failed statements or an error rate. Correlate timestamp, fingerprint, protocol, and stage before counting incidents. Recovery requires no matching events for the full window AND fresh TimeFusion telemetry; check the companion telemetry-liveness monitor. Missing exports alone do not prove recovery.'
+emails: [anthony@talstack.com]
+slack_channels: []
+teams: []
+visualization_type: numeric

@@ -2,7 +2,7 @@
 
 pub mod pg_compat;
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
 use anyhow::{Context, Result};
 use arrow::array::RecordBatch;
@@ -434,7 +434,7 @@ impl Drop for StatementLatency {
             record_statement_latency(
                 self.metrics.as_deref(),
                 &self.query,
-                (self.protocol, &self.project_id),
+                (self.protocol, &self.project_id, "execute"),
                 duration_us,
                 *self.rows.get_mut(),
                 None,
@@ -514,6 +514,7 @@ fn with_response_deadline(response: Response, deadline: Option<tokio::time::Inst
                         crate::observability::maintenance_stats().pgwire_stream_failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         warn!(
                             event = "pgwire.stream_failed",
+                            stage = "stream",
                             failure.class = stream_failure_class(error),
                             query.fingerprint = %context.fingerprint,
                             query.template = %context.template,
@@ -569,7 +570,15 @@ async fn run_statement<T, R>(
             Ok(finish(value, deadline, StreamFailureContext { latency: Some(Arc::new(latency)), ..context }))
         }
         Err(error) => {
-            record_statement_latency(scan_metrics.as_deref(), query, (protocol, &context.project_id), t0.elapsed().as_micros() as u64, 0, Some(&error), None);
+            record_statement_latency(
+                scan_metrics.as_deref(),
+                query,
+                (protocol, &context.project_id, "execute"),
+                t0.elapsed().as_micros() as u64,
+                0,
+                Some(&error),
+                None,
+            );
             warn!(protocol, error = %error, "statement failed");
             Err(error)
         }
@@ -1205,8 +1214,8 @@ fn record_query_span(span: &tracing::Span, query: &str) {
 /// and project dimensions are extracted only for diagnosis; raw SQL is never
 /// included in this event.
 fn record_statement_latency(
-    metrics: Option<&crate::database::ScanMetrics>, query: &str, (protocol, project_id): (&'static str, &str), duration_us: u64, rows: u64,
-    failure: Option<&PgWireError>, phases: Option<(u64, u64)>,
+    metrics: Option<&crate::database::ScanMetrics>, query: &str, (protocol, project_id, stage): (&'static str, &str, &'static str), duration_us: u64,
+    rows: u64, failure: Option<&PgWireError>, phases: Option<(u64, u64)>,
 ) {
     if let Some(metrics) = metrics {
         metrics.record_pgwire_query(duration_us);
@@ -1233,6 +1242,7 @@ fn record_statement_latency(
                 query.tables = %tables,
                 project.id = %project_id,
                 protocol,
+                stage,
                 duration_us,
                 $($field = $value,)*
                 $message
@@ -1249,6 +1259,7 @@ fn record_statement_latency(
             query.tables = %tables,
             project.id = %project_id,
             protocol,
+            stage,
             duration_us,
             "PostgreSQL statement failed"
         );
@@ -1265,6 +1276,12 @@ fn record_statement_latency(
             first_row_us = first_row_us
         );
     }
+}
+
+/// Prepare/Describe failures have no execution latency sample or bound values.
+fn record_extended_failure(query: &str, stage: &'static str, started: Instant, error: &PgWireError) {
+    let (_, project_id) = query_dimensions(query);
+    record_statement_latency(None, query, ("extended", project_id, stage), started.elapsed().as_micros() as u64, 0, Some(error), None);
 }
 
 /// The value bound to `project_id = $N` (optionally `$N::type`) in an extended-protocol
@@ -1379,7 +1396,11 @@ impl datafusion_postgres::pgwire::api::stmt::QueryParser for RewritingQueryParse
         C: ClientInfo + Unpin + Send + Sync,
     {
         let rewritten = rewrite_row_to_json_record(sql);
-        self.inner.parse_sql(client, rewritten.as_deref().unwrap_or(sql), types).await
+        let started = Instant::now();
+        self.inner
+            .parse_sql(client, rewritten.as_deref().unwrap_or(sql), types)
+            .await
+            .inspect_err(|error| record_extended_failure(sql, "parse", started, error))
     }
 
     fn get_parameter_types(&self, statement: &Self::Statement) -> PgWireResult<Vec<Type>> {
@@ -1409,7 +1430,11 @@ impl ExtendedQueryHandler for LoggingExtendedQueryHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        self.inner.do_describe_statement(client, statement).await
+        let started = Instant::now();
+        self.inner
+            .do_describe_statement(client, statement)
+            .await
+            .inspect_err(|error| record_extended_failure(&statement.statement.0, "describe_statement", started, error))
     }
 
     async fn do_describe_portal<C>(&self, client: &mut C, portal: &Portal<Self::Statement>) -> PgWireResult<DescribePortalResponse>
@@ -1419,7 +1444,11 @@ impl ExtendedQueryHandler for LoggingExtendedQueryHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        self.inner.do_describe_portal(client, portal).await
+        let started = Instant::now();
+        self.inner
+            .do_describe_portal(client, portal)
+            .await
+            .inspect_err(|error| record_extended_failure(&portal.statement.statement.0, "describe_portal", started, error))
     }
 
     #[instrument(
@@ -1565,7 +1594,15 @@ mod pgwire_handlers_tests {
                 assert!(response.data_rows.next().await.is_none(), "{case}");
             }
             let failure = crate::server::pg_compat::statement_timeout_error();
-            super::record_statement_latency(None, "SELECT 'private-literal-canary' FROM otel_logs_and_spans", ("simple", ""), 10, 0, Some(&failure), None);
+            super::record_statement_latency(
+                None,
+                "SELECT 'private-literal-canary' FROM otel_logs_and_spans",
+                ("simple", "", "execute"),
+                10,
+                0,
+                Some(&failure),
+                None,
+            );
         }
         let output = std::fs::read_to_string(log.path())?;
         let failures: Vec<_> = output.lines().filter(|line| line.contains("pgwire.stream_failed")).collect();
@@ -1599,6 +1636,128 @@ mod pgwire_handlers_tests {
             "pre-stream failure must carry the same attribution: {failed_statement}"
         );
         assert!(!output.contains("private-literal-canary"));
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn prepare_failures_keep_scrubbed_query_context_over_pgwire() -> anyhow::Result<()> {
+        use tokio_postgres::NoTls;
+        let log = tempfile::NamedTempFile::new()?;
+        let subscriber = tracing_subscriber::fmt().without_time().with_ansi(false).with_writer(std::sync::Mutex::new(log.reopen()?)).finish();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+        let ctx = datafusion::prelude::SessionContext::new();
+        ctx.register_batch(
+            "otel_logs_and_spans",
+            arrow::record_batch::RecordBatch::new_empty(Arc::new(arrow::datatypes::Schema::new(vec![arrow::datatypes::Field::new(
+                "resource___service___name",
+                arrow::datatypes::DataType::Utf8,
+                true,
+            )]))),
+        )?;
+        // Planning succeeds, but PostgreSQL cannot describe a Decimal256 field.
+        ctx.register_batch(
+            "unsupported_wire",
+            arrow::record_batch::RecordBatch::new_empty(Arc::new(arrow::datatypes::Schema::new(vec![arrow::datatypes::Field::new(
+                "amount",
+                arrow::datatypes::DataType::Decimal256(40, 0),
+                true,
+            )]))),
+        )?;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let port = listener.local_addr()?.port();
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let stop = shutdown.clone().cancelled_owned();
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(async move {
+            super::serve_with_listener(
+                listener,
+                Arc::new(ctx),
+                &datafusion_postgres::ServerOptions::new(),
+                super::AuthConfig { username: "postgres".into(), password: Some("test".into()) },
+                None,
+                None,
+                stop,
+            )
+            .await
+            .map_err(|error| anyhow::anyhow!("{error}"))
+        });
+        let (client, connection) = tokio_postgres::connect(&format!("host=127.0.0.1 port={port} user=postgres password=test"), NoTls).await?;
+        tasks.spawn(async move { connection.await.map_err(anyhow::Error::from) });
+        for sql in ["SELECT 'private-literal-canary', {", "SELECT service, 'private-literal-canary' FROM otel_logs_and_spans"] {
+            assert!(client.simple_query(sql).await.is_err());
+            assert!(client.prepare(sql).await.is_err());
+        }
+        assert!(client.prepare("SELECT amount, 'private-literal-canary' FROM unsupported_wire").await.is_err());
+        assert_eq!(client.query_one("SELECT 42::BIGINT", &[]).await?.get::<_, i64>(0), 42, "errors do not poison the connection");
+        // Send Parse/Bind/DescribePortal directly: the regular client prepares
+        // through DescribeStatement and cannot construct an unsupported statement.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            use datafusion_postgres::pgwire::messages::{
+                Message,
+                extendedquery::{Bind, Describe, Parse, Sync},
+                startup::{Password, Startup},
+            };
+            use tokio::io::AsyncWriteExt;
+            async fn receive(socket: &mut tokio::net::TcpStream) -> anyhow::Result<(u8, Vec<u8>)> {
+                use tokio::io::AsyncReadExt;
+                let tag = socket.read_u8().await?;
+                let length = socket.read_u32().await?;
+                anyhow::ensure!(length >= 4, "invalid backend frame");
+                let mut body = vec![0; length as usize - 4];
+                socket.read_exact(&mut body).await?;
+                Ok((tag, body))
+            }
+            let mut socket = tokio::net::TcpStream::connect(("127.0.0.1", port)).await?;
+            let mut packet = bytes::BytesMut::new();
+            let mut startup = Startup::new();
+            startup.parameters = [("user".into(), "postgres".into()), ("database".into(), "postgres".into())].into();
+            startup.encode(&mut packet)?;
+            socket.write_all(&packet).await?;
+            assert_eq!(receive(&mut socket).await?, (b'R', 3_i32.to_be_bytes().to_vec()), "cleartext authentication challenge");
+            packet.clear();
+            Password::new("test".into()).encode(&mut packet)?;
+            socket.write_all(&packet).await?;
+            while receive(&mut socket).await?.0 != b'Z' {}
+            packet.clear();
+            Parse::new(None, "SELECT amount, 'private-literal-canary' FROM unsupported_wire".into(), vec![]).encode(&mut packet)?;
+            Bind::new(None, None, vec![], vec![], vec![]).encode(&mut packet)?;
+            Describe::new(b'P', None).encode(&mut packet)?;
+            Sync::new().encode(&mut packet)?;
+            socket.write_all(&packet).await?;
+            let mut tags = Vec::new();
+            loop {
+                let tag = receive(&mut socket).await?.0;
+                tags.push(tag);
+                if tag == b'Z' {
+                    break;
+                }
+            }
+            assert_eq!(tags, [b'1', b'2', b'E', b'Z'], "Parse and Bind succeed before DescribePortal rejects the wire type");
+            anyhow::Ok(())
+        })
+        .await??;
+        let output = std::fs::read_to_string(log.path())?;
+        let attributed: Vec<_> = output.lines().filter(|line| line.contains("event=\"pgwire.failed_statement\"")).collect();
+        assert_eq!(attributed.len(), 6, "simple execution, extended Parse and both Describe paths each need one attributed failure: {output}");
+        assert_eq!(attributed.iter().filter(|line| line.contains("stage=\"parse\"")).count(), 2);
+        assert_eq!(attributed.iter().filter(|line| line.contains("stage=\"describe_statement\"")).count(), 1, "Describe errors need their own stage: {output}");
+        assert_eq!(
+            attributed.iter().filter(|line| line.contains("stage=\"describe_portal\"")).count(),
+            1,
+            "portal Describe errors need their own stage: {output}"
+        );
+        assert!(
+            attributed.iter().all(|line| line.contains("query.fingerprint") && line.contains("query.template") && !line.contains("private-literal-canary"))
+        );
+        drop(client);
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(result) = tasks.join_next().await {
+                result??;
+            }
+            anyhow::Ok(())
+        })
+        .await??;
         Ok(())
     }
 

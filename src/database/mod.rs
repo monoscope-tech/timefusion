@@ -2540,11 +2540,14 @@ fn convert_variant_columns(batch: RecordBatch, target_schema: &SchemaRef) -> DFR
     use parquet_variant_compute::VariantArrayBuilder;
     use parquet_variant_json::JsonToVariant;
 
-    fn utf8_to_variant<'a>(iter: impl ExactSizeIterator<Item = Option<&'a str>>) -> DFResult<StructArray> {
+    fn utf8_to_variant<'a>(iter: impl ExactSizeIterator<Item = Option<&'a str>>, column: &str) -> DFResult<StructArray> {
         let mut builder = VariantArrayBuilder::new(iter.len());
         for (idx, item) in iter.enumerate() {
             match item {
-                Some(s) => builder.append_json(s).map_err(|e| DataFusionError::Execution(format!("Invalid JSON at row {idx}: {e} (value: '{s}')")))?,
+                // Both the value and a builder's nested cause can contain client data.
+                Some(s) => builder
+                    .append_json(s)
+                    .map_err(|_| DataFusionError::Execution(format!("Invalid JSON at row {idx} in column {column}: invalid or unsupported JSON value")))?,
                 None => builder.append_null(),
             }
         }
@@ -2564,9 +2567,9 @@ fn convert_variant_columns(batch: RecordBatch, target_schema: &SchemaRef) -> DFR
         let name = target_field.name();
         let bad_downcast = |ty: &str| DataFusionError::Execution(format!("{ty} downcast failed for column {name}"));
         let converted = match col.data_type() {
-            DataType::Utf8View => utf8_to_variant(col.as_any().downcast_ref::<StringViewArray>().ok_or_else(|| bad_downcast("Utf8View"))?.iter())?,
-            DataType::Utf8 => utf8_to_variant(col.as_any().downcast_ref::<StringArray>().ok_or_else(|| bad_downcast("Utf8"))?.iter())?,
-            DataType::LargeUtf8 => utf8_to_variant(col.as_any().downcast_ref::<LargeStringArray>().ok_or_else(|| bad_downcast("LargeUtf8"))?.iter())?,
+            DataType::Utf8View => utf8_to_variant(col.as_any().downcast_ref::<StringViewArray>().ok_or_else(|| bad_downcast("Utf8View"))?.iter(), name)?,
+            DataType::Utf8 => utf8_to_variant(col.as_any().downcast_ref::<StringArray>().ok_or_else(|| bad_downcast("Utf8"))?.iter(), name)?,
+            DataType::LargeUtf8 => utf8_to_variant(col.as_any().downcast_ref::<LargeStringArray>().ok_or_else(|| bad_downcast("LargeUtf8"))?.iter(), name)?,
             _ => return Ok(None), // already Variant struct
         };
         Ok(Some((target_field.clone(), Arc::new(converted) as arrow::array::ArrayRef)))

@@ -368,6 +368,34 @@ pub struct MaintenanceTask {
     pub(crate) rank_cache: RankCache,
 }
 
+#[derive(Clone, Serialize)]
+struct DueTaskDiagnostic {
+    key: TaskKey,
+    state: TaskState,
+    deadline_micros: i64,
+    attempts: u32,
+    retry_reason: Option<String>,
+    required_parent_table: Option<String>,
+    eligibility_refusal: Option<&'static str>,
+}
+
+#[derive(Clone, Serialize)]
+struct DueTaskSnapshot {
+    observed_at_micros: i64,
+    due_nonquarantined: u64,
+    oldest_due_unclaimed_age_seconds: u64,
+    tasks: Vec<DueTaskDiagnostic>,
+}
+
+static DUE_TASK_SNAPSHOT: Mutex<Option<DueTaskSnapshot>> = Mutex::new(None);
+
+/// Last published diagnostic, without taking the journal lock on a query thread.
+/// `null` means no journal statistics have been published yet.
+pub(crate) fn due_task_snapshot() -> serde_json::Value {
+    let snapshot = lock(&DUE_TASK_SNAPSHOT).clone();
+    serde_json::json!(snapshot)
+}
+
 impl MaintenanceTask {
     /// Width for SCHEDULING only, never for planning or execution.
     pub fn scheduling_width(&self) -> i64 {
@@ -2358,14 +2386,21 @@ impl TaskJournal {
                 .is_some_and(|ranges| ranges.iter().any(|&(start, end)| start <= task.key.slice.start_micros && end >= task.key.slice.end_micros))
     }
 
+    fn required_parent_table(task: &MaintenanceTask) -> Option<String> {
+        if task.key.operation != Operation::DerivedRollup {
+            return None;
+        }
+        crate::schema::get_schema(&task.key.source).and_then(|schema| {
+            let parent = schema.rollups.iter().find(|spec| spec.table_name(&task.key.source) == task.key.physical_table)?.derive_from.as_deref()?;
+            schema.rollups.iter().find(|spec| spec.name.as_deref() == Some(parent)).map(|spec| spec.table_name(&task.key.source))
+        })
+    }
+
     fn dependencies_complete(&self, task: &MaintenanceTask) -> bool {
         if task.key.operation != Operation::DerivedRollup {
             return true;
         }
-        let base_table = crate::schema::get_schema(&task.key.source).and_then(|schema| {
-            let parent = schema.rollups.iter().find(|spec| spec.table_name(&task.key.source) == task.key.physical_table)?.derive_from.as_deref()?;
-            schema.rollups.iter().find(|spec| spec.name.as_deref() == Some(parent)).map(|spec| spec.table_name(&task.key.source))
-        });
+        let base_table = Self::required_parent_table(task);
         // Historical coverage need not have retained completed build tasks.
         let proven = |coverage: bool| {
             self.cached_base_tier_proven(task) || {
@@ -2995,6 +3030,7 @@ impl TaskJournal {
         let mut sealed_debt_bytes = 0u64;
         let mut oldest_pended = u64::MAX;
         let mut oldest_due = i64::MAX;
+        let mut oldest_due_tasks: Vec<&MaintenanceTask> = Vec::with_capacity(5);
         let mut beyond_horizon = 0u64;
         let mut latest_frontier_rollup: HashMap<(&str, &str, &str), &MaintenanceTask> = HashMap::new();
         let mut per_operation = [0u64; <Operation as strum::EnumCount>::COUNT];
@@ -3026,6 +3062,11 @@ impl TaskJournal {
                     if !Self::is_quarantined(task) {
                         due_nonquarantined = due_nonquarantined.saturating_add(1);
                         oldest_due = oldest_due.min(task.deadline_micros);
+                        let at = oldest_due_tasks.partition_point(|old| (old.deadline_micros, &old.key) < (task.deadline_micros, &task.key));
+                        if at < 5 {
+                            oldest_due_tasks.insert(at, task);
+                            oldest_due_tasks.truncate(5);
+                        }
                     }
                     if task.key.operation == Operation::BaseRollup {
                         eligible_base_rollup = eligible_base_rollup.saturating_add(1);
@@ -3079,6 +3120,20 @@ impl TaskJournal {
         stats.maintenance_oldest_task_age_secs.store(oldest_age_secs, Relaxed);
         let oldest_due_secs = if oldest_due == i64::MAX { 0 } else { u64::try_from(now_micros.saturating_sub(oldest_due) / 1_000_000).unwrap_or_default() };
         stats.maintenance_oldest_due_unclaimed_age_secs.store(oldest_due_secs, Relaxed);
+        let tasks = oldest_due_tasks
+            .into_iter()
+            .map(|task| DueTaskDiagnostic {
+                key: task.key.clone(),
+                state: task.state,
+                deadline_micros: task.deadline_micros,
+                attempts: task.attempts,
+                retry_reason: task.retry_reason.clone(),
+                required_parent_table: Self::required_parent_table(task),
+                eligibility_refusal: self.refusal_reason(task, now_micros),
+            })
+            .collect();
+        *lock(&DUE_TASK_SNAPSHOT) =
+            Some(DueTaskSnapshot { observed_at_micros: now_micros, due_nonquarantined, oldest_due_unclaimed_age_seconds: oldest_due_secs, tasks });
         stats.maintenance_beyond_horizon_tasks.store(beyond_horizon, Relaxed);
     }
 }
@@ -4634,6 +4689,82 @@ mod tests {
         journal.publish_statistics();
         let due = crate::observability::maintenance_stats().maintenance_oldest_due_unclaimed_age_secs.load(Relaxed);
         assert!((600..660).contains(&due), "due from the reopening enqueue, got {due}");
+    }
+
+    #[test]
+    fn oldest_due_diagnostic_follows_gauge_and_live_dependencies() -> anyhow::Result<()> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let (_dir, mut journal) = new_journal();
+        let now = crate::support::now_micros();
+        for i in 0..9 {
+            upserted(
+                &mut journal,
+                task_in("source", &format!("due-{i}"), now - DAY_MICROS, now, Operation::Dedup)
+                    .tap_mut(|task| task.deadline_micros = now - (60 + i) * 1_000_000),
+            );
+        }
+        for state in [TaskState::Running, TaskState::Complete, TaskState::Superseded] {
+            upserted(
+                &mut journal,
+                task_in("source", &format!("excluded-{state:?}"), now - DAY_MICROS, now, Operation::Dedup).tap_mut(|task| {
+                    task.state = state;
+                    task.deadline_micros = now - DAY_MICROS;
+                }),
+            );
+        }
+        upserted(&mut journal, task_in("source", "future", now - DAY_MICROS, now, Operation::Dedup).tap_mut(|task| task.deadline_micros = now + DAY_MICROS));
+        upserted(
+            &mut journal,
+            task_in("source", "quarantined", now - DAY_MICROS, now, Operation::Dedup).tap_mut(|task| {
+                task.deadline_micros = now - DAY_MICROS;
+                task.retry_reason = Some(TaskJournal::SCHEMA_FAILURE_REASON.into());
+            }),
+        );
+        let source = "otel_logs_and_spans";
+        let paused = "otel_logs_and_spans_rollup_sessions_1h_v2";
+        upserted(
+            &mut journal,
+            task_in(paused, "paused", now - DAY_MICROS, now, Operation::BaseRollup).tap_mut(|task| {
+                task.key.source = source.into();
+                task.deadline_micros = now - DAY_MICROS;
+            }),
+        );
+        journal.set_rollup_build_policy(source, paused, RollupBuildPolicy::Paused)?;
+        let parent_table = "otel_logs_and_spans_rollup_dashboard_1m_v4";
+        let parent = upserted(
+            &mut journal,
+            task_in(parent_table, "child", now - DERIVED_SLICE_MICROS, now, Operation::BaseRollup).tap_mut(|task| {
+                task.key.source = source.into();
+                task.deadline_micros = now + DAY_MICROS;
+            }),
+        );
+        let child = upserted(
+            &mut journal,
+            task_in("otel_logs_and_spans_rollup_dashboard_1h_v3", "child", now - DERIVED_SLICE_MICROS, now, Operation::DerivedRollup).tap_mut(|task| {
+                task.key.source = source.into();
+                task.deadline_micros = now - 3_600_000_000;
+            }),
+        );
+        journal.publish_statistics();
+        let snapshot = due_task_snapshot();
+        assert_eq!(snapshot["due_nonquarantined"], 10, "the diagnostic must describe the gauge's exact population");
+        let tasks = snapshot["tasks"].as_array().expect("published task identities");
+        assert_eq!(tasks.len(), 5, "diagnostic storage is bounded");
+        assert_eq!(serde_json::from_value::<TaskKey>(tasks[0]["key"].clone())?, child);
+        assert_eq!(tasks[0]["required_parent_table"], parent_table);
+        assert_eq!(tasks[0]["eligibility_refusal"], "dependencies");
+        assert_eq!(tasks[1]["key"]["project_id"], "due-8");
+        assert_eq!(
+            snapshot["oldest_due_unclaimed_age_seconds"].as_u64(),
+            Some(crate::observability::maintenance_stats().maintenance_oldest_due_unclaimed_age_secs.load(Relaxed))
+        );
+        journal.complete(&parent);
+        journal.publish_statistics();
+        assert!(due_task_snapshot()["tasks"][0]["eligibility_refusal"].is_null(), "completed actual parent releases the dependency");
+        journal.complete(&child);
+        journal.publish_statistics();
+        assert_eq!(due_task_snapshot()["tasks"][0]["key"]["project_id"], "due-8", "completion changes both the gauge and its responsible unit");
+        Ok(())
     }
 
     /// An idle sealed lane reads fresh; one with sealed work queued keeps aging until it commits.

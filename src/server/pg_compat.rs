@@ -993,7 +993,10 @@ impl StatsTableProvider {
 
         let maintenance: Vec<Row> = atomic_rows(crate::observability::maintenance_stats().stats_rows())
             .into_iter()
-            .chain([("maintenance", "retry_reason".to_owned(), crate::observability::maintenance_retry_reason())])
+            .chain([
+                ("maintenance", "retry_reason".to_owned(), crate::observability::maintenance_retry_reason()),
+                ("maintenance", "oldest_due_tasks".to_owned(), crate::maintenance_coordinator::due_task_snapshot().to_string()),
+            ])
             // Derived from the bucket lists, never hand-listed: a reason added
             // without a row would be silently unattributable. The retry/work rows
             // that follow have the same shape — one row per (operation, reason) seen.
@@ -1426,6 +1429,11 @@ mod stats_table_tests {
         );
         expect("memory", "maintenance_pool_used_bytes maintenance_pool_pct coordinator_pool_used_bytes coordinator_pool_pct");
         expect("logical_count", "resident_partitions resident_bytes_estimated resident_mb_estimated resident_limit_bytes resident_limit_mb");
+        expect("maintenance", "oldest_due_tasks");
+        assert!(
+            rows.contains(&("maintenance".into(), "oldest_due_tasks".into(), "null".into())),
+            "before journal publication the diagnostic is explicit no-data"
+        );
         expect("runtime", "uptime_seconds scheduling_lag_ms scheduling_lag_max_ms worker_threads");
         // Same section name under both kinds must stay two distinct rows: one
         // claims worker occupancy, the other only wall time.

@@ -1,0 +1,14 @@
+# Proposal: activate together with query-failures after checking live samples.
+active: false
+title: 'TF warn: telemetry heartbeat missing'
+query: 'metrics | where metric_name == "timefusion.mem_buffer.pressure_pct" | summarize count()'
+alert_threshold: 1
+trigger_less_than: true
+check_interval_mins: 5
+time_window_mins: 10
+severity: warning
+message: 'No TimeFusion memory-pressure samples arrived in the preceding ten-minute window. A zero pressure value is a valid heartbeat; absent rows are not. Investigate exporter, ingestion, and process health. Treat query-failure status as unknown until fresh telemetry returns. Recovery requires at least one fresh sample; a query error or null evaluation is not a healthy heartbeat.'
+emails: [anthony@talstack.com]
+slack_channels: []
+teams: []
+visualization_type: numeric

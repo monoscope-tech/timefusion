@@ -1,10 +1,47 @@
 use std::path::PathBuf;
 
+use arrow::datatypes::DataType;
 use serial_test::serial;
 use test_case::test_case;
 
 use super::*;
 use crate::{config::AppConfig, schema::get_default_schema, support::test_helpers::*};
+
+#[test_case(DataType::Utf8, false; "utf8 syntax")]
+#[test_case(DataType::Utf8View, false; "view syntax")]
+#[test_case(DataType::LargeUtf8, false; "large syntax")]
+#[test_case(DataType::Utf8, true; "utf8 oversized number")]
+#[test_case(DataType::Utf8View, true; "view oversized number")]
+#[test_case(DataType::LargeUtf8, true; "large oversized number")]
+fn convert_variant_errors_do_not_disclose_input(ty: DataType, oversized: bool) -> Result<()> {
+    use arrow::{
+        array::{ArrayRef, LargeStringArray, StringArray, StringViewArray},
+        datatypes::{Field, Schema},
+    };
+    let input = if oversized { format!(r#"{{"private-canary":{}}}"#, "1".repeat(1_000)) } else { "private-canary invalid JSON".into() };
+    let target = Arc::new(Schema::new(vec![Field::new(
+        "body",
+        DataType::Struct(vec![Field::new("metadata", DataType::Binary, false), Field::new("value", DataType::Binary, false)].into()),
+        true,
+    )]));
+    let batch = |values: Vec<Option<&str>>| {
+        let column: ArrayRef = match ty {
+            DataType::Utf8 => Arc::new(StringArray::from(values)),
+            DataType::Utf8View => Arc::new(StringViewArray::from(values)),
+            DataType::LargeUtf8 => Arc::new(LargeStringArray::from(values)),
+            _ => unreachable!(),
+        };
+        RecordBatch::try_new(Arc::new(Schema::new(vec![Field::new("body", ty.clone(), true)])), vec![column])
+    };
+    let good = convert_variant_columns(batch(vec![None, Some(r#"{"value":42,"max_u64":18446744073709551615,"min_i64":-9223372036854775808}"#)])?, &target)?;
+    assert_eq!(good.num_rows(), 2);
+    assert!(good.column(0).is_null(0));
+    let error = convert_variant_columns(batch(vec![None, Some(&input)])?, &target).expect_err("invalid JSON must reject conversion").to_string();
+    assert!(error.contains("row 1"), "must locate the failing row: {error}");
+    assert!(!error.contains("private-canary"), "input must not enter the error: {error}");
+    assert!(error.contains("body"), "must locate the failing column: {error}");
+    Ok(())
+}
 
 #[test_case(0 => RollupOutputEvidence::Unknown; "absent files are not empty proof")]
 #[test_case(1 => RollupOutputEvidence::Files(std::num::NonZeroU32::MIN); "file backed")]
