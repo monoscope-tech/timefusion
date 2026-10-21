@@ -2500,7 +2500,7 @@ mod probe_shard_tests {
 #[cfg(test)]
 mod ordered_probe_contract_tests {
     use super::*;
-    use crate::support::test_helpers::{TestConfigBuilder, json_to_batch_for};
+    use crate::support::test_helpers::{TestConfigBuilder, array_get_str, json_to_batch_for};
     use datafusion::{
         common::tree_node::{TreeNode, TreeNodeRecursion},
         physical_plan::{InputOrderMode, aggregates::AggregateExec},
@@ -2531,7 +2531,7 @@ mod ordered_probe_contract_tests {
                     let ts = start + (key / 3) as i64 * 3_000_000;
                     let service = (key % 7 != 0).then_some("api");
                     let id = format!("id-{}", key % 17);
-                    *counts.entry((ts, service, id.clone())).or_insert(0usize) += 1;
+                    *counts.entry((ts, service, id.clone())).or_insert(0i64) += 1;
                     serde_json::json!({"project_id": project, "date": day.to_string(), "timestamp": ts,
                         "resource___service___name": service, "id": id, "level": "INFO", "status_code": "UNSET", "hashes": [], "summary": []})
                 })
@@ -2547,7 +2547,7 @@ mod ordered_probe_contract_tests {
             }
             writer.flush_and_commit(&mut delta).await?;
         }
-        let expected: HashSet<_> = counts.into_iter().filter(|(_, n)| *n > 1).map(|((ts, _, _), _)| ts / 600_000_000).collect();
+        let expected: HashSet<_> = counts.iter().filter(|(_, n)| **n > 1).map(|((ts, _, _), _)| ts / 600_000_000).collect();
         assert!(expected.len() > 5, "duplicates must span several ten-minute bins");
         let ctx = db.dedup_probe_ctx(&table, TABLE, &project, &day.to_string(), None).await?;
         let sql = format!(
@@ -2565,6 +2565,18 @@ mod ordered_probe_contract_tests {
         })?;
         assert!(aggregates > 0, "the probe must retain its grouping plan");
         eprintln!("ordered={ordered} files=23 row_groups=977\n{}", datafusion::physical_plan::displayable(plan.as_ref()).indent(true));
+        let mut observed = std::collections::HashMap::new();
+        for batch in datafusion::physical_plan::collect(Arc::clone(&plan), ctx.task_ctx()).await? {
+            let timestamps = batch.column(0).as_any().downcast_ref::<arrow::array::TimestampMicrosecondArray>().unwrap();
+            let group_counts = batch.column(3).as_any().downcast_ref::<arrow::array::Int64Array>().unwrap();
+            for row in 0..batch.num_rows() {
+                let service = (!batch.column(1).is_null(row)).then(|| array_get_str(batch.column(1).as_ref(), row));
+                let key = (timestamps.value(row), service, array_get_str(batch.column(2).as_ref(), row));
+                assert!(observed.insert(key, group_counts.value(row)).is_none(), "each raw key must form exactly one group");
+            }
+        }
+        let counts: std::collections::HashMap<_, _> = counts.into_iter().map(|((ts, service, id), n)| ((ts, service.map(str::to_owned), id), n)).collect();
+        assert_eq!(observed, counts, "group counts must match every raw key, not only duplicate-bearing bins");
         let started = std::time::Instant::now();
         assert_eq!(db.probe_dup_bins(&table, TABLE, &project, &day.to_string()).await?, expected);
         eprintln!("ordered={ordered} probe_elapsed_ms={}", started.elapsed().as_millis());
