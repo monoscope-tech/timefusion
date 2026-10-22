@@ -1588,14 +1588,23 @@ async fn mutable_candidate_fixture(complete: bool, cold_disk: bool, contract: Pa
                 elapsed.as_micros()
             );
             let oracle_bytes = deltalake::delta_datafusion::parquet_metrics::snapshot().bytes_read;
+            let phases: Vec<_> = timefusion::observability::plan_phases().collect();
             let oracle_started = std::time::Instant::now();
-            let (oracle, oracle_first_row) =
-                tokio::time::timeout(std::time::Duration::from_secs(budget_secs + 1), wire_page(&clients[1], &sql, contract)).await??;
+            let oracle_page = tokio::time::timeout(std::time::Duration::from_secs(budget_secs + 1), wire_page(&clients[1], &sql, contract)).await;
+            let cost: Vec<_> = timefusion::observability::plan_phases()
+                .zip(phases)
+                .map(|((phase, us, calls), (_, old_us, old_calls))| (phase, us - old_us, calls - old_calls))
+                .collect();
             eprintln!(
-                "{contract:?} raw_oracle pass={pass} tag={tag} elapsed_us={} first_row={oracle_first_row:?} parquet_bytes={}",
+                "{contract:?} raw_oracle complete={complete} cold_disk={cold_disk} pass={pass} tag={tag} elapsed_us={} first_row={:?} parquet_bytes={} phases={cost:?} reserved_bytes={} spill_bytes={} outcome={:?}",
                 oracle_started.elapsed().as_micros(),
-                deltalake::delta_datafusion::parquet_metrics::snapshot().bytes_read - oracle_bytes
+                oracle_page.as_ref().ok().and_then(|page| page.as_ref().ok()).and_then(|(_, first_row)| *first_row),
+                deltalake::delta_datafusion::parquet_metrics::snapshot().bytes_read - oracle_bytes,
+                ctx_off.runtime_env().memory_pool.reserved(),
+                ctx_off.runtime_env().disk_manager.used_disk_space(),
+                oracle_page.as_ref().map(|result| result.as_ref().map(|_| ()))
             );
+            let (oracle, _) = oracle_page??;
             assert_eq!(counter_value(PREFILTER_MUTABLE_CANDIDATES), before + u64::from(!requires_raw_fallback), "oracle must not use the candidate path");
             assert_eq!(actual, oracle, "pass {pass}: all projected values must match the full latest-visible-row oracle for {tag}");
             assert_eq!(actual.first().and_then(|row| row[2].as_str()), trace, "pass {pass}: expected visible winner for {tag}");
