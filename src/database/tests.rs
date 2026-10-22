@@ -10375,6 +10375,47 @@ fn provider_versions_retains_recent_and_expires() {
     assert_eq!(ring.len(), 0);
 }
 
+/// A pressure flush must keep acknowledged rows readable while the real Delta
+/// writer is still waiting to publish them.
+#[serial]
+#[tokio::test(flavor = "multi_thread")]
+async fn pressure_flush_keeps_acknowledged_rows_visible_before_commit() -> Result<()> {
+    let now = crate::support::set_micros(Utc::now().timestamp_micros());
+    let _clock = scopeguard::guard((), |_| crate::support::unfreeze());
+    let cfg = create_test_config("pressure-visible-before-commit");
+    let db = Database::with_config(cfg.clone()).await?;
+    let name = "otel_logs_and_spans";
+    let (_, _, table) = mem_table("pressure-visible-before-commit", get_schema(name).unwrap().columns()?).await?;
+    db.unified_tables.write().await.insert(name.into(), Arc::new(RwLock::new(table)));
+    let writer = crate::server::delta_write_callback(&db);
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let resume = Arc::new(tokio::sync::Notify::new());
+    let gate = (entered.clone(), resume.clone());
+    let layer = Arc::new(test_layer(cfg)?.with_delta_writer(Arc::new(move |project, table, batches, context| {
+        let (writer, entered, resume) = (writer.clone(), gate.0.clone(), gate.1.clone());
+        Box::pin(async move {
+            entered.notify_one();
+            resume.notified().await;
+            writer(project, table, batches, context).await
+        })
+    })));
+    let db = db.with_buffered_layer(layer.clone());
+    let ctx = session_for(&db)?;
+    insert_otel_ts(&db, "pressure-visible", "before", "span", now, false).await?;
+    let sql = "SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = 'pressure-visible'";
+    assert_eq!(count_of(&ctx, sql).await?, 1);
+    let flushing = tokio::spawn(async move { layer.force_flush_current_buckets().await });
+    tokio::time::timeout(std::time::Duration::from_secs(10), entered.notified()).await?;
+    let during = tokio::time::timeout(std::time::Duration::from_secs(5), count_of(&ctx, sql)).await;
+    resume.notify_one();
+    flushing.await??;
+    assert_eq!(delta_physical_row_count(otel_unified_table(&db).await.as_ref()).await?, 1, "the real writer must publish one physical row");
+    assert_eq!(during??, 1, "acknowledged rows must remain readable before publication");
+    assert_eq!(count_of(&ctx, sql).await?, 1, "publication must preserve the same logical row");
+    db.shutdown().await?;
+    Ok(())
+}
+
 /// When `force_flush_current_buckets` commits the open bucket to Delta and later
 /// inserts repopulate the same bucket_id, the query path must still return the
 /// force-flushed rows (the per-bucket exclusion must not mask the whole range).

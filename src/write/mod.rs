@@ -1041,25 +1041,17 @@ impl BufferedWriteLayer {
     }
 
     /// Force-flush the current (still-open) bucket(s) to Delta — the escalation
-    /// tier for when one open window alone exceeds the memory budget. Rows are
-    /// taken atomically under the insert lock and restored on commit failure;
-    /// durability never depends on this (the WAL holds them).
+    /// tier for when one open window alone exceeds the memory budget. Keep the
+    /// snapshot readable and charged until publication drains its prefix.
     pub(crate) async fn force_flush_current_buckets(&self) -> anyhow::Result<()> {
         let current = MemBuffer::current_bucket_id();
-        // No stuck-older-bucket gate needed: an unflushed older bucket pins the
-        // cursor via its holds, so force-flushing the open window can never move
-        // the cursor past it.
-        let mut first = true;
-        self.force_flush_buckets(
-            |mem| mem.bucket_keys(|id| id >= current),
-            || {
-                if std::mem::take(&mut first) {
-                    crate::observability::record_backpressure_force_flush();
-                    self.backpressure_force_flush_total.fetch_add(1, Ordering::Relaxed);
-                }
-            },
-        )
-        .await;
+        // An older bucket's WAL holds still pin its cursor. Reuse the normal
+        // snapshot path so an airborne commit cannot hide acknowledged rows.
+        let stats = self.flush_buckets_where(|id| id >= current).await?;
+        if stats.buckets_flushed > 0 || stats.buckets_failed > 0 {
+            crate::observability::record_backpressure_force_flush();
+            self.backpressure_force_flush_total.fetch_add(1, Ordering::Relaxed);
+        }
         Ok(())
     }
 
