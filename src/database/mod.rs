@@ -2660,7 +2660,8 @@ pub struct Database {
     fast_resolve_cache: FastResolveCache,
     /// Per-(project, table) sticky "Delta may hold matching files" bit — must never be falsely
     /// `false`. While false, scans skip Delta and MemBuffer is authoritative.
-    delta_has_files: dashmap::DashMap<(String, String), Arc<std::sync::atomic::AtomicBool>>,
+    /// Share the map across clones so new entries cannot retain stale empty proofs.
+    delta_has_files: Arc<dashmap::DashMap<(String, String), Arc<std::sync::atomic::AtomicBool>>>,
     /// Cached Delta-side `TableProvider` per (project, table) + snapshot version. Exact-version
     /// invalidation; concurrent misses single-flight via a per-key `OnceCell`. No drop eviction.
     delta_provider_cache: DeltaProviderCache,
@@ -3399,7 +3400,7 @@ impl Database {
             unified_tables: Arc::new(RwLock::new(HashMap::new())),
             custom_project_tables: Arc::new(RwLock::new(HashMap::new())),
             fast_resolve_cache: Arc::new(dashmap::DashMap::new()),
-            delta_has_files: dashmap::DashMap::new(),
+            delta_has_files: Arc::new(dashmap::DashMap::new()),
             delta_provider_cache: Arc::new(dashmap::DashMap::new()),
             read_activity: Arc::default(),
             scan_metrics: Arc::new(ScanMetrics::default()),

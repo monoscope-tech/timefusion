@@ -10236,6 +10236,12 @@ async fn test_delta_has_files_sticky_bit() -> Result<()> {
     // Same invariant on the SELECT path (try_fast_resolve → fast_resolve_cache).
     let _ = db.try_fast_resolve(&p1, t);
     assert!(!db.delta_scan_can_be_skipped(&p1, t), "STICKY-TRUE preserved across try_fast_resolve too");
+
+    let writer = db.clone();
+    db.resolve_table(&p2, t).await?;
+    assert!(db.delta_scan_can_be_skipped(&p2, t), "empty evidence is created after the writer clone");
+    writer.mark_delta_has_files(&p2, t);
+    assert!(!db.delta_scan_can_be_skipped(&p2, t), "a commit through an earlier clone invalidates the new empty proof");
     Ok(())
 }
 

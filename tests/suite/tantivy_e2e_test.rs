@@ -189,6 +189,53 @@ fn unique_project() -> String {
 }
 const TABLE: &str = "otel_logs_and_spans";
 
+/// A flush between the Delta-empty proof and the memory snapshot must not hide
+/// rows acknowledged before the query started.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn flush_between_delta_empty_check_and_mem_snapshot_keeps_acknowledged_rows() -> Result<()> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio::sync::Notify;
+    use tracing::instrument::WithSubscriber;
+    use tracing_subscriber::{Layer, layer::SubscriberExt};
+
+    struct PauseMemSnapshot {
+        entered: Arc<Notify>,
+        resume: Arc<Notify>,
+        once: AtomicBool,
+    }
+    impl<S: tracing::Subscriber> Layer<S> for PauseMemSnapshot {
+        fn on_new_span(&self, attrs: &tracing::span::Attributes<'_>, _: &tracing::span::Id, _: tracing_subscriber::layer::Context<'_, S>) {
+            if attrs.metadata().name() == "query_partitioned_with_text_match" && !self.once.swap(true, Ordering::SeqCst) {
+                self.entered.notify_one();
+                tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(tokio::time::timeout(std::time::Duration::from_secs(10), self.resume.notified()))
+                })
+                .expect("writer must finish the controlled flush");
+            }
+        }
+    }
+
+    let project = unique_project();
+    let (db, ctx, _) = build_db(&format!("flush-snapshot-{project}"), false).await?;
+    db.insert_records_batch(&project, TABLE, vec![make_batch(&project, &[("before", "span", "body")])], false, None).await?;
+    db.resolve_table(&project, TABLE).await?;
+    assert!(db.delta_scan_can_be_skipped(&project, TABLE));
+    let entered = Arc::new(Notify::new());
+    let resume = Arc::new(Notify::new());
+    let subscriber = tracing_subscriber::registry().with(PauseMemSnapshot { entered: entered.clone(), resume: resume.clone(), once: AtomicBool::new(false) });
+    let sql = format!("SELECT id FROM {TABLE} WHERE project_id = '{project}'");
+    let reader = tokio::spawn(async move { collect_ids(&ctx, &sql).await }.with_subscriber(subscriber));
+    tokio::time::timeout(std::time::Duration::from_secs(10), entered.notified()).await?;
+    let flushed = db.buffered_layer().unwrap().flush_all_now().await?;
+    assert_eq!(flushed.total_rows, 1, "{flushed:?}");
+    assert!(!db.delta_scan_can_be_skipped(&project, TABLE));
+    db.insert_records_batch(&project, TABLE, vec![make_batch(&project, &[("after", "span", "body")])], false, None).await?;
+    resume.notify_one();
+    assert_eq!(reader.await??, ["after", "before"]);
+    Ok(())
+}
+
 /// Where the fixture rows live when the query runs.
 #[derive(Clone, Copy)]
 enum Land {

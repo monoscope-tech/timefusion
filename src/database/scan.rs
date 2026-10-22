@@ -1411,14 +1411,6 @@ impl ProjectRoutingTable {
 
         span.record("scan.uses_mem_buffer", true);
 
-        // Skip only above a proved snapshot/flush bound. Boot wall time is not
-        // a bound on previously committed future-dated rows. Unknown statistics
-        // require the normal scan; a failed in-flight flush only raises the bound.
-        let skip_delta =
-            query_time_range.zip(layer.delta_timestamp_upper_bound(&project_id, &self.table_name)).is_some_and(|((query_min, _), upper)| query_min > upper)
-                || self.database.delta_scan_can_be_skipped(&project_id, &self.table_name);
-        scan_state.lock().skipped_delta = skip_delta;
-
         // `query_partitioned_with_text_match` runs its own per-bucket prefilter inside the
         // bucket lock. Never prepend `tantivy_id_filter` here — it is derived from delta-side
         // IDs and would drop legitimate MemBuffer rows. On a MOR table the mem leg gets no tree
@@ -1447,6 +1439,17 @@ impl ProjectRoutingTable {
             true => split_sorted_runs(mem_leg.partitions, state.config().target_partitions()),
             false => mem_leg.partitions,
         };
+
+        // Capture MemBuffer before checking whether Delta can be skipped. A flush
+        // may commit and drain rows between these steps; its published bound/bit
+        // must then invalidate the skip instead of hiding the drained prefix.
+        // Skip only above a proved snapshot/flush bound. Boot wall time is not
+        // a bound on previously committed future-dated rows. Unknown statistics
+        // require the normal scan; a failed in-flight flush only raises the bound.
+        let skip_delta =
+            query_time_range.zip(layer.delta_timestamp_upper_bound(&project_id, &self.table_name)).is_some_and(|((query_min, _), upper)| query_min > upper)
+                || self.database.delta_scan_can_be_skipped(&project_id, &self.table_name);
+        scan_state.lock().skipped_delta = skip_delta;
 
         let mem_ranges = layer.get_bucket_ranges(&project_id, &self.table_name);
 
