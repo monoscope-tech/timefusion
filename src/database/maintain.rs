@@ -7596,10 +7596,11 @@ impl Database {
             let key: DirtyBinKey = (project_id.clone(), table_name.to_string(), date.clone(), bin);
             // STOP ADMITTING once the pass is out of budget, and bound each bin by what is left
             // rather than by `stage_deadline` alone — the pass holds `maintenance_job_sem`, so
-            // over-running costs every tick behind it. Bailing here leaves the bin QUEUED (the
-            // dequeue below has not run yet), so the next tick serves it.
+            // over-running costs every tick behind it. Classification may already have
+            // dequeued this bin, so restore its marker if staging cannot start.
             let remaining = pass_deadline.saturating_duration_since(std::time::Instant::now());
             if remaining.is_zero() {
+                self.dedup_dirty_bins.insert(key, ());
                 return None;
             }
             // No persist here — it would make the drain O(queue x batch) in fsync I/O. Crash
@@ -10916,6 +10917,69 @@ mod certify_on_completion_tests {
     }
 
     const TABLE: &str = "otel_logs_and_spans";
+
+    #[serial]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dirty_bin_probe_expiring_before_staging_preserves_retry() -> Result<()> {
+        use tracing::instrument::WithSubscriber;
+        use tracing_subscriber::{Layer, layer::SubscriberExt};
+        struct PauseAggregate {
+            entered: Arc<tokio::sync::Notify>,
+            resume: Arc<tokio::sync::Notify>,
+        }
+        impl<S: tracing::Subscriber> Layer<S> for PauseAggregate {
+            fn on_new_span(&self, attrs: &tracing::span::Attributes<'_>, _: &tracing::span::Id, _: tracing_subscriber::layer::Context<'_, S>) {
+                if attrs.metadata().name() == "dedup_probe_aggregate" {
+                    self.entered.notify_one();
+                    tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current().block_on(tokio::time::timeout(std::time::Duration::from_secs(10), self.resume.notified()))
+                    })
+                    .expect("release the controlled probe before the test guard expires");
+                }
+            }
+        }
+        let date = chrono::Utc::now().date_naive();
+        let now = date.and_hms_opt(12, 0, 0).unwrap().and_utc().timestamp_micros();
+        crate::support::set_micros(now);
+        let _clock = scopeguard::guard((), |_| crate::support::unfreeze());
+        let cfg = TestConfigBuilder::new("expired_dirty_probe").build();
+        let db = Database::with_config(cfg.clone()).await?;
+        let name = "mor_versioned";
+        let project = uuid::Uuid::new_v4().to_string();
+        let timestamp = now - 3 * 3_600_000_000;
+        for value in ["first", "second"] {
+            let batch = crate::support::test_helpers::json_to_batch_for(name, vec![test_span_ts("duplicate", value, &project, timestamp)])?;
+            db.insert_records_batch(&project, name, vec![batch], true, None).await?;
+        }
+        let table = db.resolve_table(&project, name).await?;
+        let bin = timestamp / crate::database::compact::bin_micros();
+        for queued in [bin, bin + 1] {
+            db.enqueue_dirty_bin(&project, name, &date.to_string(), queued);
+        }
+        let key = (project.clone(), name.to_owned(), date.to_string(), bin);
+        assert!(db.dedup_dirty_bins.contains_key(&key));
+        let version = table.read().await.version();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let resume = Arc::new(tokio::sync::Notify::new());
+        let subscriber = tracing_subscriber::registry().with(PauseAggregate { entered: entered.clone(), resume: resume.clone() });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let work = tokio::spawn({
+            let (db, table) = (db.clone(), table.clone());
+            async move { db.dedup_dirty_bins_for_table(&table, name, &|| true, std::time::Duration::MAX, deadline).await }.with_subscriber(subscriber)
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(10), entered.notified()).await?;
+        tokio::time::sleep_until(deadline.into()).await;
+        resume.notify_one();
+        work.await??;
+        assert_eq!(table.read().await.version(), version, "an expired pass cannot have staged a rewrite");
+        assert!(db.dedup_dirty_bins.contains_key(&key), "the probe dequeued this unfinished bin; the next pass must still own it");
+        let saved = crate::storage::load_sidecar::<crate::storage::DirtyBin>(&cfg.core.timefusion_data_dir, crate::storage::DIRTY_BINS);
+        assert!(saved.iter().any(|entry| entry.project_id == project && entry.table_name == name && entry.bin == bin));
+        db.dedup_dirty_bins_for_table(&table, name, &|| true, std::time::Duration::MAX, std::time::Instant::now() + std::time::Duration::from_secs(30)).await?;
+        assert!(!db.dedup_dirty_bins.contains_key(&key));
+        assert!(db.probe_dup_bins(&table, name, &project, &date.to_string()).await?.is_empty(), "the retry must actually remove the duplicate");
+        Ok(())
+    }
 
     #[test_case::test_case(false, false, false; "clean remainder")]
     #[test_case::test_case(true, false, false; "dirty remainder")]
