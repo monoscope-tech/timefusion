@@ -892,7 +892,7 @@ tokio::task_local! {
     static UNIT_OPERATION: &'static str;
 
     /// Every scan pass of the unit `run-unit` is executing, with its plan metrics.
-    static SCAN_CAPTURE: std::cell::RefCell<Vec<super::ScanPass>>;
+    pub(super) static SCAN_CAPTURE: std::cell::RefCell<Vec<super::ScanPass>>;
 }
 
 /// Rows the current unit has written, or `None` outside a unit scope.
@@ -7596,10 +7596,11 @@ impl Database {
             let key: DirtyBinKey = (project_id.clone(), table_name.to_string(), date.clone(), bin);
             // STOP ADMITTING once the pass is out of budget, and bound each bin by what is left
             // rather than by `stage_deadline` alone — the pass holds `maintenance_job_sem`, so
-            // over-running costs every tick behind it. Bailing here leaves the bin QUEUED (the
-            // dequeue below has not run yet), so the next tick serves it.
+            // over-running costs every tick behind it. Classification may already have
+            // dequeued this bin, so restore its marker if staging cannot start.
             let remaining = pass_deadline.saturating_duration_since(std::time::Instant::now());
             if remaining.is_zero() {
+                self.dedup_dirty_bins.insert(key, ());
                 return None;
             }
             // No persist here — it would make the drain O(queue x batch) in fsync I/O. Crash
@@ -7861,6 +7862,95 @@ impl Database {
         note_probe_cost_into(&self.dedup_probe_cost_ms, table_name, u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX));
     }
 
+    /// Bank completed clean windows before the shared phase deadline can cancel
+    /// the probe. Only certification-only groups use this path: a dirty-bin
+    /// classifier still needs the complete set before it can dequeue clean bins.
+    /// A nonempty result contains discovered dirty bins, not a whole-date census.
+    /// `None` means the input moved; no partition verdict is available.
+    async fn probe_uncertified_slices(
+        &self, table: &Arc<RwLock<DeltaTable>>, table_name: &str, project: &str, date_str: &str, pre: &crate::read::CountFiles,
+    ) -> Result<Option<HashSet<i64>>> {
+        use crate::maintenance_coordinator::{DAY_MICROS, TimeSlice};
+        let date = chrono::NaiveDate::parse_from_str(date_str, "%Y-%m-%d")?;
+        let day_start = day_start_micros(date).context("certification date is outside the supported timestamp range")?;
+        let day_end = day_start.saturating_add(DAY_MICROS);
+        let key = (project.to_owned(), table_name.to_owned(), date_str.to_owned());
+        let (files, spans, decoded_bytes) = {
+            let table = table.read().await;
+            // Filter before decoding statistics; unrelated tenants must not
+            // materialize their add-actions/statistics for this probe.
+            let (spans, decoded_bytes) = table.snapshot()?.log_data().iter().filter(|file| pre.contains_key(file.path().as_ref())).fold(
+                (Vec::new(), 0u64),
+                |(mut spans, bytes), file| {
+                    let add = add_action(&file);
+                    let (lo, hi) = add_ts_bounds(&add);
+                    spans.push(lo.zip(hi));
+                    (spans, bytes.saturating_add(estimated_decoded_bytes(add.size)))
+                },
+            );
+            (Self::partition_files_by_pid(&table, &format!("date={date}"))?.remove(project).unwrap_or_default(), spans, decoded_bytes)
+        };
+        let resuming = self.dedup_slice_coverage.get(&key).is_some_and(|coverage| coverage.files == *pre && !coverage.intervals.is_empty());
+        // A UTC-day partition can contain misplaced or unknown-time rows. Its
+        // whole-partition proof must still examine those rows, so keep the full
+        // probe when metadata cannot bound every file inside this day.
+        if (!resuming && decoded_bytes <= crate::maintenance_coordinator::MAX_DECODED_BYTES)
+            || pre.is_empty()
+            || files.len() != pre.len()
+            || !schema_or_default(table_name).dedup_keys.iter().any(|key| key == "timestamp")
+            || spans.len() != pre.len()
+            || !spans.iter().all(|span| span.is_some_and(|(lo, hi)| lo >= day_start && lo <= hi && hi < day_end))
+        {
+            return self.probe_dup_bins(table, table_name, project, date_str).await.map(Some);
+        }
+        let ctx = self.dedup_probe_ctx(table, table_name, project, date_str, None).await?;
+        let keys = super::compact::quoted_csv(&schema_or_default(table_name).dedup_keys);
+        loop {
+            if Self::logical_count_partition_snapshot(&*table.read().await, project, date_str)?.1 != *pre {
+                return Ok(None);
+            }
+            let intervals =
+                self.dedup_slice_coverage.get(&key).filter(|coverage| coverage.files == *pre).map(|coverage| coverage.intervals.clone()).unwrap_or_default();
+            let start = intervals.iter().fold(day_start, |cursor, &(lo, hi)| if lo <= cursor { cursor.max(hi) } else { cursor });
+            if start >= day_end {
+                self.record_certification(table, table_name, project, date, pre, (0, true)).await?;
+                return Ok(Some(HashSet::new()));
+            }
+            // One hour bounds a completed unit without repeatedly decoding the
+            // same roughly half-hour row groups for ten-minute queries.
+            let end = start
+                .saturating_add(3_600_000_000)
+                .min(day_end)
+                .min(intervals.iter().filter(|(lo, _)| *lo > start).map(|(lo, _)| *lo).min().unwrap_or(day_end));
+            let filter = format!(
+                "project_id = '{}' AND date = DATE '{date_str}' AND timestamp >= to_timestamp_micros({start}) AND timestamp < to_timestamp_micros({end})",
+                project.replace('\'', "''")
+            );
+            let dirty: HashSet<_> = Self::dup_bin_starts(&ctx, &filter, &keys)
+                .await?
+                .into_iter()
+                .map(|time| time.and_utc().timestamp_micros() / crate::database::compact::bin_micros())
+                .collect();
+            if !dirty.is_empty() {
+                return Ok(Some(dirty));
+            }
+            let slice = TimeSlice::new(start, end)?;
+            if self.record_clean_slice(table, table_name, project, date, (slice, 0, None), (&files, pre)).await?.is_some() {
+                return Ok(Some(HashSet::new()));
+            }
+            info!(
+                project,
+                table_name,
+                date = date_str,
+                start_micros = start,
+                end_micros = end,
+                input_fp = Self::file_visibility_fingerprint(pre).ok(),
+                event = "dedup_certification_slice_proved"
+            );
+            tokio::task::yield_now().await;
+        }
+    }
+
     /// Runs the batch probe over each (project, date) with ≥2 queued bins and
     /// strips the probe-clean bins out of `ready`, consuming them. Group keys
     /// are dequeued BEFORE the probe so dirtiness enqueued while it runs
@@ -7942,11 +8032,21 @@ impl Database {
                 date,
                 pre_input_fp = pre.as_ref().map(|(fp, _)| *fp),
                 pre_input_files = pre.as_ref().map(|(_, files)| files.len()),
+                queued = bins.len(),
                 budget_ms = remaining.as_millis() as u64,
                 event = "dedup_partition_probe_started"
             );
-            match tokio::time::timeout(remaining, self.probe_dup_bins(table, table_name, &project, &date)).await {
-                Ok(Ok(dup_bins)) => {
+            let probe = async {
+                if bins.is_empty()
+                    && let Some((_, visibility)) = &pre
+                {
+                    self.probe_uncertified_slices(table, table_name, &project, &date, visibility).await
+                } else {
+                    self.probe_dup_bins(table, table_name, &project, &date).await.map(Some)
+                }
+            };
+            match tokio::time::timeout(remaining, probe).await {
+                Ok(Ok(Some(dup_bins))) => {
                     self.note_probe_cost(table_name, started.elapsed());
                     let stats = crate::observability::maintenance_stats();
                     let cleared: Vec<_> = bins.iter().filter(|b| !dup_bins.contains(b)).map(|b| (project.clone(), date.clone(), *b)).collect();
@@ -8000,6 +8100,10 @@ impl Database {
                         info!(project, table_name, date, dirty_bins = dup_bins.len(), event = "dedup_certify_declined");
                     }
                     cleared
+                }
+                Ok(Ok(None)) => {
+                    info!(project, table_name, date, event = "dedup_certification_inputs_moved");
+                    Vec::new()
                 }
                 Ok(Err(error)) => {
                     warn!(project, table_name, date, elapsed_ms = started.elapsed().as_millis() as u64, %error, event = "dedup_batch_probe_failure");
@@ -10813,6 +10917,244 @@ mod certify_on_completion_tests {
     }
 
     const TABLE: &str = "otel_logs_and_spans";
+
+    #[serial]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dirty_bin_probe_expiring_before_staging_preserves_retry() -> Result<()> {
+        use tracing::instrument::WithSubscriber;
+        use tracing_subscriber::{Layer, layer::SubscriberExt};
+        struct PauseAggregate {
+            entered: Arc<tokio::sync::Notify>,
+            resume: Arc<tokio::sync::Notify>,
+        }
+        impl<S: tracing::Subscriber> Layer<S> for PauseAggregate {
+            fn on_new_span(&self, attrs: &tracing::span::Attributes<'_>, _: &tracing::span::Id, _: tracing_subscriber::layer::Context<'_, S>) {
+                if attrs.metadata().name() == "dedup_probe_aggregate" {
+                    self.entered.notify_one();
+                    tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current().block_on(tokio::time::timeout(std::time::Duration::from_secs(10), self.resume.notified()))
+                    })
+                    .expect("release the controlled probe before the test guard expires");
+                }
+            }
+        }
+        let date = chrono::Utc::now().date_naive();
+        let now = date.and_hms_opt(12, 0, 0).unwrap().and_utc().timestamp_micros();
+        crate::support::set_micros(now);
+        let _clock = scopeguard::guard((), |_| crate::support::unfreeze());
+        let cfg = TestConfigBuilder::new("expired_dirty_probe").build();
+        let db = Database::with_config(cfg.clone()).await?;
+        let name = "mor_versioned";
+        let project = uuid::Uuid::new_v4().to_string();
+        let timestamp = now - 3 * 3_600_000_000;
+        for value in ["first", "second"] {
+            let batch = crate::support::test_helpers::json_to_batch_for(name, vec![test_span_ts("duplicate", value, &project, timestamp)])?;
+            db.insert_records_batch(&project, name, vec![batch], true, None).await?;
+        }
+        let table = db.resolve_table(&project, name).await?;
+        let bin = timestamp / crate::database::compact::bin_micros();
+        for queued in [bin, bin + 1] {
+            db.enqueue_dirty_bin(&project, name, &date.to_string(), queued);
+        }
+        let key = (project.clone(), name.to_owned(), date.to_string(), bin);
+        assert!(db.dedup_dirty_bins.contains_key(&key));
+        let version = table.read().await.version();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let resume = Arc::new(tokio::sync::Notify::new());
+        let subscriber = tracing_subscriber::registry().with(PauseAggregate { entered: entered.clone(), resume: resume.clone() });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let work = tokio::spawn({
+            let (db, table) = (db.clone(), table.clone());
+            async move { db.dedup_dirty_bins_for_table(&table, name, &|| true, std::time::Duration::MAX, deadline).await }.with_subscriber(subscriber)
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(10), entered.notified()).await?;
+        tokio::time::sleep_until(deadline.into()).await;
+        resume.notify_one();
+        work.await??;
+        assert_eq!(table.read().await.version(), version, "an expired pass cannot have staged a rewrite");
+        assert!(db.dedup_dirty_bins.contains_key(&key), "the probe dequeued this unfinished bin; the next pass must still own it");
+        let saved = crate::storage::load_sidecar::<crate::storage::DirtyBin>(&cfg.core.timefusion_data_dir, crate::storage::DIRTY_BINS);
+        assert!(saved.iter().any(|entry| entry.project_id == project && entry.table_name == name && entry.bin == bin));
+        db.dedup_dirty_bins_for_table(&table, name, &|| true, std::time::Duration::MAX, std::time::Instant::now() + std::time::Duration::from_secs(30)).await?;
+        assert!(!db.dedup_dirty_bins.contains_key(&key));
+        assert!(db.probe_dup_bins(&table, name, &project, &date.to_string()).await?.is_empty(), "the retry must actually remove the duplicate");
+        Ok(())
+    }
+
+    #[test_case::test_case(false, false, false; "clean remainder")]
+    #[test_case::test_case(true, false, false; "dirty remainder")]
+    #[test_case::test_case(false, true, false; "changed proved prefix")]
+    #[test_case::test_case(false, false, true; "misplaced timestamps")]
+    #[serial]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn certification_probe_reuses_persisted_clean_prefix(late_duplicate: bool, change_prefix: bool, outside_day: bool) -> Result<()> {
+        let cfg = TestConfigBuilder::new("certification_probe_resume").build();
+        let db = Database::with_config(cfg.clone()).await?;
+        let project = uuid::Uuid::new_v4().to_string();
+        let date = chrono::Utc::now().date_naive() - chrono::Duration::days(1);
+        let day = day_slice(date);
+        let early = day.start_micros + 3_600_000_000;
+        let late = day.start_micros + 13 * 3_600_000_000;
+        let records = (0..2_000).map(|i| test_span_ts(&format!("early-{i}"), "early", &project, early + i)).collect();
+        db.insert_records_batch(&project, TABLE, vec![json_to_batch(records)?], true, None).await?;
+        for id in ["late", if late_duplicate || outside_day { "late" } else { "other" }] {
+            let mut row = test_span_ts(id, "late", &project, late + if outside_day { crate::maintenance_coordinator::DAY_MICROS } else { 0 });
+            row["date"] = serde_json::json!(date.to_string());
+            let batch = json_to_batch(vec![row])?;
+            if outside_day {
+                // Ingest normalizes date from timestamp. Use the real Delta
+                // writer to create a deliberately misplaced physical partition.
+                use deltalake::writer::DeltaWriter;
+                let mut columns = batch.columns().to_vec();
+                let days = date.signed_duration_since(chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap()).num_days();
+                columns[batch.schema().index_of("date")?] = Arc::new(arrow::array::Date32Array::from(vec![i32::try_from(days)?]));
+                let batch = RecordBatch::try_new(batch.schema(), columns)?;
+                let table = db.resolve_table(&project, TABLE).await?;
+                let mut table = table.write().await;
+                let mut writer = deltalake::writer::RecordBatchWriter::for_table(&table)?;
+                writer.write(deltalake::kernel::schema::cast_record_batch(&batch, writer.arrow_schema(), true, true)?).await?;
+                writer.flush_and_commit(&mut table).await?;
+            } else {
+                db.insert_records_batch(&project, TABLE, vec![batch], true, None).await?;
+            }
+        }
+        let table = db.resolve_table(&project, TABLE).await?;
+        let full_rows = SCAN_CAPTURE
+            .scope(std::cell::RefCell::new(Vec::new()), async {
+                let dirty = db.probe_dup_bins(&table, TABLE, &project, &date.to_string()).await?;
+                assert_eq!(dirty.is_empty(), !(late_duplicate || outside_day));
+                assert!(dirty.iter().all(|bin| *bin >= (day.start_micros + 12 * 3_600_000_000) / crate::database::compact::bin_micros()));
+                anyhow::Ok(SCAN_CAPTURE.with(|passes| passes.borrow().iter().map(|pass| pass.output_rows).sum::<u64>()))
+            })
+            .await?;
+        assert!(full_rows >= 2_000, "the full probe must observe the prefix");
+        let (files, visibility) = {
+            let table = table.read().await;
+            (
+                Database::partition_files_by_pid(&table, &format!("date={date}"))?.remove(&project).unwrap(),
+                Database::logical_count_partition_snapshot(&table, &project, &date.to_string())?.1,
+            )
+        };
+        let prefix = crate::maintenance_coordinator::TimeSlice { start_micros: day.start_micros, end_micros: day.start_micros + 12 * 3_600_000_000 };
+        assert!(db.record_clean_slice(&table, TABLE, &project, date, (prefix, 0, None), (&files, &visibility)).await?.is_none());
+        drop(table);
+        drop(db);
+
+        let db = Database::with_config(cfg).await?;
+        let table = db.resolve_table(&project, TABLE).await?;
+        let key = (project.clone(), TABLE.to_owned(), date.to_string());
+        assert_eq!(db.dedup_slice_coverage.get(&key).expect("the checkpoint survives restart").intervals, [(prefix.start_micros, prefix.end_micros)]);
+        if change_prefix {
+            db.insert_records_batch(&project, TABLE, vec![json_to_batch(vec![test_span_ts("early-0", "changed", &project, early)])?], true, None).await?;
+        }
+        let scanned_rows = SCAN_CAPTURE
+            .scope(std::cell::RefCell::new(Vec::new()), async {
+                assert!(
+                    db.batch_probe_classify(
+                        &table,
+                        TABLE,
+                        Vec::new(),
+                        vec![(project.clone(), date.to_string())],
+                        std::time::Instant::now() + std::time::Duration::from_secs(30)
+                    )
+                    .await
+                    .is_empty()
+                );
+                SCAN_CAPTURE.with(|passes| passes.borrow().iter().map(|pass| pass.output_rows).sum::<u64>())
+            })
+            .await;
+        let dirty = late_duplicate || change_prefix || outside_day;
+        assert_eq!(db.dedup_clean_fp.get(&key).is_some_and(|proof| !proof.stale), !dirty);
+        assert_eq!(db.dedup_probe_declined.contains_key(&key), dirty);
+        if !change_prefix && !outside_day {
+            assert!(scanned_rows < 100, "the two remaining rows must not rescan the 2,000 proved rows: {scanned_rows} operator rows");
+        }
+        Ok(())
+    }
+
+    #[serial]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn certification_probe_keeps_small_partitions_in_one_scan() -> Result<()> {
+        let (db, project, date, table) = seed_dup_day(TestConfigBuilder::new("small_certification_probe").build(), &[]).await?;
+        let passes = SCAN_CAPTURE
+            .scope(std::cell::RefCell::new(Vec::new()), async {
+                db.batch_probe_classify(
+                    &table,
+                    TABLE,
+                    Vec::new(),
+                    vec![(project.clone(), date.to_string())],
+                    std::time::Instant::now() + std::time::Duration::from_secs(30),
+                )
+                .await;
+                SCAN_CAPTURE.with(std::cell::RefCell::take)
+            })
+            .await;
+        assert_eq!(passes.len(), 1, "a date fitting one existing work unit must retain one scan");
+        assert!(db.dedup_probe_declined.contains_key(&(project, TABLE.to_owned(), date.to_string())));
+        Ok(())
+    }
+
+    #[serial]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn certification_probe_cancellation_preserves_completed_windows() -> Result<()> {
+        let cfg = TestConfigBuilder::new("cancel_certification_probe").build();
+        let db = Database::with_config(cfg.clone()).await?;
+        let project = uuid::Uuid::new_v4().to_string();
+        let date = chrono::Utc::now().date_naive() - chrono::Duration::days(1);
+        let day = day_slice(date);
+        let hour = 3_600_000_000;
+        let records = (0..24).map(|i| test_span_ts(&format!("hour-{i}"), "unique", &project, day.start_micros + i * hour + hour / 2)).collect();
+        db.insert_records_batch(&project, TABLE, vec![json_to_batch(records)?], true, None).await?;
+        let table = db.resolve_table(&project, TABLE).await?;
+        assert!(db.probe_dup_bins(&table, TABLE, &project, &date.to_string()).await?.is_empty());
+        let (files, visibility) = {
+            let table = table.read().await;
+            (
+                Database::partition_files_by_pid(&table, &format!("date={date}"))?.remove(&project).unwrap(),
+                Database::logical_count_partition_snapshot(&table, &project, &date.to_string())?.1,
+            )
+        };
+        let first = crate::maintenance_coordinator::TimeSlice::new(day.start_micros, day.start_micros + hour)?;
+        assert!(db.record_clean_slice(&table, TABLE, &project, date, (first, 0, None), (&files, &visibility)).await?.is_none());
+        let key = (project.clone(), TABLE.to_owned(), date.to_string());
+        let mut probe = tokio::spawn({
+            let (db, table, project) = (db.clone(), table.clone(), project.clone());
+            async move {
+                db.batch_probe_classify(
+                    &table,
+                    TABLE,
+                    Vec::new(),
+                    vec![(project, date.to_string())],
+                    std::time::Instant::now() + std::time::Duration::from_secs(30),
+                )
+                .await
+            }
+        });
+        let checkpoint = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                tokio::select! {
+                    result = &mut probe => { panic!("probe finished before cancellation at its next checkpoint: {result:?}"); },
+                    _ = tokio::task::yield_now() => {
+                        if let Some(end) = db.dedup_slice_coverage.get(&key).and_then(|coverage| coverage.intervals.first().map(|(_, end)| *end))
+                            && end > first.end_micros && end < day.end_micros { break end; }
+                    }
+                }
+            }
+        })
+        .await?;
+        probe.abort();
+        assert!(probe.await.unwrap_err().is_cancelled());
+        assert!(!db.dedup_clean_fp.get(&key).is_some_and(|proof| !proof.stale));
+        let persisted = crate::storage::load_sidecar::<crate::storage::StoredSliceCoverage>(&cfg.core.timefusion_data_dir, crate::storage::SLICE_COVERAGE);
+        assert!(
+            persisted.iter().any(|coverage| coverage.project_id == project && coverage.intervals.iter().any(|(_, end)| *end >= checkpoint)),
+            "cancellation must leave the completed window recoverable"
+        );
+        db.batch_probe_classify(&table, TABLE, Vec::new(), vec![(project, date.to_string())], std::time::Instant::now() + std::time::Duration::from_secs(30))
+            .await;
+        assert!(db.dedup_clean_fp.get(&key).is_some_and(|proof| !proof.stale));
+        Ok(())
+    }
 
     #[test_case::test_case(false; "covered bin first")]
     #[test_case::test_case(true; "covered bin last")]
