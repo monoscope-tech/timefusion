@@ -201,7 +201,6 @@ pub struct StatsSnapshot {
     pub backpressure_rejected_total: u64,
     /// Open-bucket force-flush escalations.
     pub backpressure_force_flush_total: u64,
-    pub dirty_livelock_takes_total: u64,
     pub rows_ingested_total: u64,
     pub rows_flushed_total: u64,
     pub flush_freed_bytes_total: u64,
@@ -574,8 +573,6 @@ pub struct BufferedWriteLayer {
     backpressure_engaged_total: AtomicU64,
     backpressure_rejected_total: AtomicU64,
     backpressure_force_flush_total: AtomicU64,
-    /// Compatibility counter: dirty flushes no longer take readable rows.
-    dirty_livelock_takes_total: AtomicU64,
     /// Set by the flush loop when on-disk WAL bytes exceed the HARD limit
     /// (`wal_hard_limit_bytes`); while set, `insert` rejects instead of acking
     /// into an unbounded backlog (the upstream DLQ absorbs + replays). Cleared
@@ -772,7 +769,6 @@ impl BufferedWriteLayer {
             backpressure_engaged_total: AtomicU64::new(0),
             backpressure_rejected_total: AtomicU64::new(0),
             backpressure_force_flush_total: AtomicU64::new(0),
-            dirty_livelock_takes_total: AtomicU64::new(0),
             rows_ingested_total: AtomicU64::new(0),
             rows_flushed_total: AtomicU64::new(0),
             flush_freed_bytes_total: AtomicU64::new(0),
@@ -3079,7 +3075,6 @@ impl BufferedWriteLayer {
             backpressure_engaged_total: self.backpressure_engaged_total.load(Ordering::Relaxed),
             backpressure_rejected_total: self.backpressure_rejected_total.load(Ordering::Relaxed),
             backpressure_force_flush_total: self.backpressure_force_flush_total.load(Ordering::Relaxed),
-            dirty_livelock_takes_total: self.dirty_livelock_takes_total.load(Ordering::Relaxed),
             rows_ingested_total: self.rows_ingested_total.load(Ordering::Relaxed),
             rows_flushed_total: self.rows_flushed_total.load(Ordering::Relaxed),
             flush_freed_bytes_total: self.flush_freed_bytes_total.load(Ordering::Relaxed),
@@ -4072,7 +4067,7 @@ mod tests {
     }
 
     /// Prod 2026-09-28: continuous UPDATEs dirtied every snapshot of the same
-    /// buckets, none ever drained, and the full buffer rejected inserts. After
+    /// buckets, none ever drained, and the full buffer rejected inserts.
     /// After repeated dirty finishes, a stable readable prefix must publish.
     /// Version appends remain available; legacy DML resumes afterward.
     #[serial]
@@ -4147,7 +4142,6 @@ mod tests {
         release.add_permits(1);
         layer.flush_completed_buckets().await.unwrap();
         assert!(layer.is_empty(), "the forced prefix and the subsequent version both make progress");
-        assert_eq!(layer.snapshot_stats().dirty_livelock_takes_total, 0, "no destructive take is needed");
         let last = committed.lock().last().cloned().unwrap();
         assert_eq!(arrow::util::display::array_value_to_string(last.column_by_name("name").unwrap(), 0).unwrap(), "after-freeze");
     }
