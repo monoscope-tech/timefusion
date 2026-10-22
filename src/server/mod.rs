@@ -1278,8 +1278,18 @@ fn record_statement_latency(
     }
 }
 
+/// Bounded startup identity only; never capture the complete metadata or cancel secret.
+fn client_application_name(client: &impl ClientInfo) -> String {
+    client.metadata().get("application_name").map_or_else(String::new, |name| name.chars().take(128).filter(|ch| !ch.is_control()).collect())
+}
+
 /// Prepare/Describe failures have no execution latency sample or bound values.
-fn record_extended_failure(query: &str, stage: &'static str, started: Instant, error: &PgWireError) {
+#[instrument(
+    name = "postgres.query.prepare_failure",
+    skip_all,
+    fields(client.application_name = %client_application_name(client), client.address = %client.socket_addr(), client.pid = client.pid_and_secret_key().0)
+)]
+fn record_extended_failure(client: &impl ClientInfo, query: &str, stage: &'static str, started: Instant, error: &PgWireError) {
     let (_, project_id) = query_dimensions(query);
     record_statement_latency(None, query, ("extended", project_id, stage), started.elapsed().as_micros() as u64, 0, Some(error), None);
 }
@@ -1305,7 +1315,10 @@ impl SimpleQueryHandler for LoggingSimpleQueryHandler {
     #[instrument(
         name = "postgres.query.simple",
         skip_all,
-        fields(query.text = Empty, query.type = Empty, query.operation = Empty, db.system = "postgresql", db.operation = Empty)
+        fields(
+            query.text = Empty, query.type = Empty, query.operation = Empty, db.system = "postgresql", db.operation = Empty,
+            client.application_name = %client_application_name(client), client.address = %client.socket_addr(), client.pid = client.pid_and_secret_key().0
+        )
     )]
     async fn do_query<C>(&self, client: &mut C, query: &str) -> PgWireResult<Vec<Response>>
     where
@@ -1400,7 +1413,7 @@ impl datafusion_postgres::pgwire::api::stmt::QueryParser for RewritingQueryParse
         self.inner
             .parse_sql(client, rewritten.as_deref().unwrap_or(sql), types)
             .await
-            .inspect_err(|error| record_extended_failure(sql, "parse", started, error))
+            .inspect_err(|error| record_extended_failure(client, sql, "parse", started, error))
     }
 
     fn get_parameter_types(&self, statement: &Self::Statement) -> PgWireResult<Vec<Type>> {
@@ -1434,7 +1447,7 @@ impl ExtendedQueryHandler for LoggingExtendedQueryHandler {
         self.inner
             .do_describe_statement(client, statement)
             .await
-            .inspect_err(|error| record_extended_failure(&statement.statement.0, "describe_statement", started, error))
+            .inspect_err(|error| record_extended_failure(client, &statement.statement.0, "describe_statement", started, error))
     }
 
     async fn do_describe_portal<C>(&self, client: &mut C, portal: &Portal<Self::Statement>) -> PgWireResult<DescribePortalResponse>
@@ -1448,13 +1461,17 @@ impl ExtendedQueryHandler for LoggingExtendedQueryHandler {
         self.inner
             .do_describe_portal(client, portal)
             .await
-            .inspect_err(|error| record_extended_failure(&portal.statement.statement.0, "describe_portal", started, error))
+            .inspect_err(|error| record_extended_failure(client, &portal.statement.statement.0, "describe_portal", started, error))
     }
 
     #[instrument(
         name = "postgres.query.extended",
         skip_all,
-        fields(query.text = Empty, query.type = Empty, query.operation = Empty, query.portal = %portal.name, query.max_rows = max_rows, db.system = "postgresql", db.operation = Empty)
+        fields(
+            query.text = Empty, query.type = Empty, query.operation = Empty, query.portal = %portal.name, query.max_rows = max_rows,
+            db.system = "postgresql", db.operation = Empty,
+            client.application_name = %client_application_name(client), client.address = %client.socket_addr(), client.pid = client.pid_and_secret_key().0
+        )
     )]
     async fn do_query<C>(&self, client: &mut C, portal: &Portal<Self::Statement>, max_rows: usize) -> PgWireResult<Response>
     where
@@ -1663,6 +1680,10 @@ mod pgwire_handlers_tests {
                 true,
             )]))),
         )?;
+        ctx.register_batch(
+            "stream_failure",
+            arrow::record_batch::RecordBatch::try_from_iter([("divisor", Arc::new(arrow::array::Int64Array::from(vec![0_i64])) as arrow::array::ArrayRef)])?,
+        )?;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let port = listener.local_addr()?.port();
         let shutdown = tokio_util::sync::CancellationToken::new();
@@ -1673,7 +1694,7 @@ mod pgwire_handlers_tests {
                 listener,
                 Arc::new(ctx),
                 &datafusion_postgres::ServerOptions::new(),
-                super::AuthConfig { username: "postgres".into(), password: Some("test".into()) },
+                super::AuthConfig { username: "postgres".into(), password: Some("connection-password-canary".into()) },
                 None,
                 None,
                 stop,
@@ -1681,17 +1702,26 @@ mod pgwire_handlers_tests {
             .await
             .map_err(|error| anyhow::anyhow!("{error}"))
         });
-        let (client, connection) = tokio_postgres::connect(&format!("host=127.0.0.1 port={port} user=postgres password=test"), NoTls).await?;
+        let socket = tokio::net::TcpStream::connect(("127.0.0.1", port)).await?;
+        let client_addr = socket.local_addr()?;
+        let (client, connection) = tokio_postgres::Config::new()
+            .user("postgres")
+            .password("connection-password-canary")
+            .application_name("caller-primary\nprobe")
+            .connect_raw(socket, NoTls)
+            .await?;
         tasks.spawn(async move { connection.await.map_err(anyhow::Error::from) });
         for sql in ["SELECT 'private-literal-canary', {", "SELECT service, 'private-literal-canary' FROM otel_logs_and_spans"] {
             assert!(client.simple_query(sql).await.is_err());
             assert!(client.prepare(sql).await.is_err());
         }
         assert!(client.prepare("SELECT amount, 'private-literal-canary' FROM unsupported_wire").await.is_err());
+        assert!(client.simple_query("SELECT 42 / divisor FROM stream_failure").await.is_err());
+        assert!(client.query("SELECT 42 / divisor FROM stream_failure", &[]).await.is_err());
         assert_eq!(client.query_one("SELECT 42::BIGINT", &[]).await?.get::<_, i64>(0), 42, "errors do not poison the connection");
         // Send Parse/Bind/DescribePortal directly: the regular client prepares
         // through DescribeStatement and cannot construct an unsupported statement.
-        tokio::time::timeout(Duration::from_secs(10), async {
+        let (portal_addr, portal_pid) = tokio::time::timeout(Duration::from_secs(10), async {
             use datafusion_postgres::pgwire::messages::{
                 Message,
                 extendedquery::{Bind, Describe, Parse, Sync},
@@ -1708,16 +1738,31 @@ mod pgwire_handlers_tests {
                 Ok((tag, body))
             }
             let mut socket = tokio::net::TcpStream::connect(("127.0.0.1", port)).await?;
+            let portal_addr = socket.local_addr()?;
             let mut packet = bytes::BytesMut::new();
             let mut startup = Startup::new();
-            startup.parameters = [("user".into(), "postgres".into()), ("database".into(), "postgres".into())].into();
+            startup.parameters = [
+                ("user".into(), "postgres".into()),
+                ("database".into(), "postgres".into()),
+                ("application_name".into(), format!("{}application-tail-canary", "é".repeat(128))),
+            ]
+            .into();
             startup.encode(&mut packet)?;
             socket.write_all(&packet).await?;
             assert_eq!(receive(&mut socket).await?, (b'R', 3_i32.to_be_bytes().to_vec()), "cleartext authentication challenge");
             packet.clear();
-            Password::new("test".into()).encode(&mut packet)?;
+            Password::new("connection-password-canary".into()).encode(&mut packet)?;
             socket.write_all(&packet).await?;
-            while receive(&mut socket).await?.0 != b'Z' {}
+            let mut portal_pid = None;
+            loop {
+                let (tag, body) = receive(&mut socket).await?;
+                if tag == b'K' {
+                    portal_pid = Some(i32::from_be_bytes(body[..4].try_into()?));
+                }
+                if tag == b'Z' {
+                    break;
+                }
+            }
             packet.clear();
             Parse::new(None, "SELECT amount, 'private-literal-canary' FROM unsupported_wire".into(), vec![]).encode(&mut packet)?;
             Bind::new(None, None, vec![], vec![], vec![]).encode(&mut packet)?;
@@ -1733,7 +1778,7 @@ mod pgwire_handlers_tests {
                 }
             }
             assert_eq!(tags, [b'1', b'2', b'E', b'Z'], "Parse and Bind succeed before DescribePortal rejects the wire type");
-            anyhow::Ok(())
+            anyhow::Ok((portal_addr, portal_pid.expect("backend key data")))
         })
         .await??;
         let output = std::fs::read_to_string(log.path())?;
@@ -1749,6 +1794,20 @@ mod pgwire_handlers_tests {
         assert!(
             attributed.iter().all(|line| line.contains("query.fingerprint") && line.contains("query.template") && !line.contains("private-literal-canary"))
         );
+        let streams: Vec<_> = output.lines().filter(|line| line.contains("event=\"pgwire.stream_failed\"")).collect();
+        assert_eq!(streams.len(), 2, "both wire protocols must preserve caller identity after the handler returns: {output}");
+        for line in attributed.iter().chain(&streams) {
+            let portal = line.contains("stage=\"describe_portal\"");
+            let (name, address) = if portal { ("é".repeat(128), portal_addr) } else { ("caller-primaryprobe".into(), client_addr) };
+            assert!(line.contains(&format!("client.application_name={name}")), "bounded caller name: {line}");
+            assert!(line.contains(&format!("client.address={address}")), "actual socket identity: {line}");
+            assert!(line.contains("client.pid="), "backend connection identity: {line}");
+            if portal {
+                assert!(line.contains(&format!("client.pid={portal_pid}")), "identity must match BackendKeyData: {line}");
+            }
+        }
+        assert!(!output.contains("connection-password-canary"));
+        assert!(!output.contains("application-tail-canary"));
         drop(client);
         shutdown.cancel();
         tokio::time::timeout(Duration::from_secs(10), async {
