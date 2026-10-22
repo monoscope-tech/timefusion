@@ -9183,7 +9183,7 @@ impl Database {
         // a fully-covered input set is a manifest edit, not a rebuild.
         let mut carried: HashSet<String> = HashSet::new();
         for bin in bins {
-            let for_bin: Vec<String> = files.iter().filter(|(project, _, _)| *project == bin.project_id).map(|(_, _, uri)| uri.clone()).collect();
+            let for_bin: Vec<String> = wave_added_parquet(std::slice::from_ref(bin), live_uris).into_iter().map(|(_, _, uri)| uri).collect();
             if for_bin.is_empty() {
                 continue;
             }
@@ -10813,6 +10813,78 @@ mod certify_on_completion_tests {
     }
 
     const TABLE: &str = "otel_logs_and_spans";
+
+    #[test_case::test_case(false; "covered bin first")]
+    #[test_case::test_case(true; "covered bin last")]
+    #[serial]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn wave_index_coverage_stays_with_its_source_bin(reverse: bool) -> Result<()> {
+        use crate::tantivy::{
+            search::{TantivyIndexService, TantivySearchService, parquet_rel_of_uri},
+            udf::{PredNode, TextMatchPred},
+        };
+
+        let db = Database::with_config(TestConfigBuilder::new("wave_index_scope").build()).await?;
+        let scratch = tempfile::tempdir()?;
+        let indexes: Arc<dyn object_store::ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let config = Arc::new(db.config.tantivy.clone());
+        let indexer = Arc::new(TantivyIndexService::new(indexes.clone(), config.clone(), scratch.path().join("scratch")));
+        let search = Arc::new(TantivySearchService::new(indexes, scratch.path().join("cache"), config));
+        indexer.with_reader(&search);
+        let db = db.with_tantivy_indexer(indexer.clone()).with_tantivy_search(search.clone());
+        let project = uuid::Uuid::new_v4().to_string();
+        let date = chrono::Utc::now().date_naive() - chrono::Duration::days(1);
+        let ts = date.and_hms_opt(12, 0, 0).unwrap().and_utc().timestamp_micros();
+        let variants = SessionContext::new();
+        variants.register_udf((*crate::read::functions::json_to_variant_udf()).clone());
+        let mut inputs = Vec::new();
+        for (i, id) in ["covered", "needle"].into_iter().enumerate() {
+            let batch = json_to_batch(vec![test_span_ts(id, id, &project, ts + i as i64)])?;
+            let body = batch.schema().index_of("body")?;
+            let value = variants.sql(&format!(r#"SELECT json_to_variant('{{"message":"{id}"}}')"#)).await?.collect().await?.remove(0).column(0).clone();
+            let mut columns = batch.columns().to_vec();
+            columns[body] = datafusion::arrow::compute::cast(&value, batch.schema().field(body).data_type())?;
+            db.insert_records_batch(&project, TABLE, vec![RecordBatch::try_new(batch.schema(), columns)?], true, None).await?;
+            inputs.push(db.list_file_uris(&project, TABLE).await?.into_iter().find(|uri| !inputs.contains(uri)).expect("one new source file"));
+        }
+        let table = db.resolve_table(&project, TABLE).await?;
+        let store = table.read().await.log_store().object_store(None);
+        indexer.build_index_for_file(TABLE, &project, parquet_rel_of_uri(&inputs[0]).unwrap(), &inputs[0], store).await?;
+        let mut bins = Vec::new();
+        for uri in &inputs {
+            let options = HotStageOptions { pass: TailPass::Repair, operation: None, runtime_env: None, light_permit: None };
+            let BinOutcome::Staged(bin) =
+                db.stage_hot_bin(&table, TABLE, get_schema(TABLE).unwrap(), &project, vec![parquet_rel_of_uri(uri).unwrap().to_owned()], options).await?
+            else {
+                panic!("a real source file must stage");
+            };
+            bins.push(bin);
+        }
+        if reverse {
+            bins.reverse();
+        }
+        let result = db.commit_wave(&table, TABLE, &[format!("date={date}/")], false, bins, 0).await;
+        assert_eq!((result.landed.len(), result.failed.len()), (2, 0), "both disjoint bins must commit");
+        let raw = db.query_delta_only(&format!("SELECT id, name FROM {TABLE} WHERE project_id='{project}'")).await?;
+        let expected: Vec<_> = raw
+            .iter()
+            .flat_map(|batch| {
+                (0..batch.num_rows())
+                    .filter(|&row| crate::support::test_helpers::array_get_str(batch.column(1), row) == "needle")
+                    .map(|row| crate::support::test_helpers::array_get_str(batch.column(0), row))
+            })
+            .collect();
+        assert_eq!(expected, ["needle"], "the raw post-commit row survives");
+        let predicate = PredNode::Leaf(TextMatchPred { column: "body".into(), query: "needle".into() });
+        let indexed = search.search_with_stats(TABLE, &project, &predicate, 100, None).await?.expect("body search must run");
+        assert!(db.list_file_uris(&project, TABLE).await?.iter().all(|uri| indexed.covered_files.contains(uri)), "both output files must be declared covered");
+        assert_eq!(
+            indexed.hits.into_iter().map(|hit| hit.id).collect::<Vec<_>>(),
+            expected,
+            "carrying the covered bin must not hide the other bin's unindexed row"
+        );
+        Ok(())
+    }
 
     struct Pass {
         db: Database,
