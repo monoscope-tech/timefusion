@@ -2779,7 +2779,7 @@ mod ordered_probe_contract_tests {
                     (crate::database::maintain::SCAN_CAPTURE.with(std::cell::RefCell::take), peak)
                 })
                 .await;
-            assert!(peak_pool <= usize::try_from(db.heavy_pool_bytes())?);
+            assert!(peak_pool <= db.heavy_pool_bytes());
             tokio::time::timeout(std::time::Duration::from_secs(5), async {
                 while runtime.memory_pool.reserved() != 0 || runtime.disk_manager.used_disk_space() != 0 {
                     tokio::task::yield_now().await;
