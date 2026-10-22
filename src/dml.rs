@@ -1033,28 +1033,29 @@ async fn perform_version_append(
         // AFTER the stamped append is in the buffer: drop the buffered rows it
         // supersedes so the flush writes one copy, not two. Ordering matters —
         // retracting first would leave a window where a scan sees neither.
-        let dropped = match (tombstone, layer, schema.dedup_tiebreak.as_deref()) {
-            (false, Some(l), Some(tb)) => l.retract_superseded(project_id, table_name, &batches[0], &schema.dedup_keys, tb) as u64,
-            _ => 0,
+        let retraction = match (tombstone, layer, schema.dedup_tiebreak.as_deref()) {
+            (false, Some(l), Some(tb)) => l.retract_superseded(project_id, table_name, &batches[0], &schema.dedup_keys, tb),
+            _ => Some(0),
         };
-        retracted += dropped;
+        retracted += retraction.unwrap_or_default() as u64;
+        let predecessors_flushed = retraction == Some(0);
         // A batch that superseded a still-buffered row is that row's first flush: new
         // data, which no witness may absorb. Only a batch whose predecessors are all
         // already flushed is transparent.
         crate::observability::record_witness_moving_rows(
-            if irrelevant && dropped == 0 { "transparent" } else { "base_version" },
+            if irrelevant && predecessors_flushed { "transparent" } else { "base_version" },
             database.rows_below_live_coverage(project_id, table_name, &batches[0]),
         );
         if candidate {
-            // Version-only iff every predecessor was already flushed (`dropped == 0`:
-            // a buffered one, including any newer version raced in since the read, was
-            // just retracted) and no commit began since the read.
+            // A deferred retraction proves nothing about buffered predecessors.
+            // Only a completed zero-row retraction and no racing commit admit
+            // a version-only witness.
             let stats = crate::observability::dml_stats();
             let range = crate::database::maintain::row_time_range(table_name, &batches);
             let raced = database.version_only.overlapping_commit_since(project_id, table_name, commits, range);
-            let stamp = (dropped == 0 && !raced).then(|| crate::write::version_stamp_of(table_name, &batches[0])).flatten();
+            let stamp = (predecessors_flushed && !raced).then(|| crate::write::version_stamp_of(table_name, &batches[0])).flatten();
             let rows = batches[0].num_rows() as u64;
-            if dropped == 0 && raced {
+            if predecessors_flushed && raced {
                 stats.rollup_version_only_declined_by_commit_rows.fetch_add(rows, std::sync::atomic::Ordering::Relaxed);
             }
             match stamp {

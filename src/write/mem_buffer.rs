@@ -283,8 +283,8 @@ pub struct TimeBucket {
     /// committed rows and the dirty finish can drain it like a clean one.
     rewrite_gen: AtomicU64,
     /// Consecutive snapshot flushes this bucket finished dirty. Continuous
-    /// in-place DML (or any DML with the drain kill switch off) can dirty every snapshot, so
-    /// the flush cycle takes such a bucket destructively instead.
+    /// in-place DML (or retraction with the drain kill switch off) can dirty
+    /// every snapshot, so the flush cycle briefly freezes those mutations.
     dirty_flushes: AtomicU32,
     /// Wall-clock micros of the newest WAL entry pinned here (append time, so
     /// ARRIVAL time). Drives [`MemBuffer::reap_expired_empty_buckets`]'s grace
@@ -1720,21 +1720,11 @@ impl MemBuffer {
     /// watermark can't pass the un-restored entries.
     #[must_use]
     pub fn restore_taken_bucket(&self, b: &FlushableBucket) -> bool {
-        self.restore_taken_bucket_inner(b, false).is_some()
-    }
-
-    /// Restore an unresolved take as a protected prefix and capture its DML
-    /// generation under the batch lock. A later completion can drain only it.
-    pub(crate) fn restore_taken_snapshot(&self, b: &FlushableBucket) -> Option<FlushableBucket> {
-        self.restore_taken_bucket_inner(b, true)
-    }
-
-    fn restore_taken_bucket_inner(&self, b: &FlushableBucket, protect_prefix: bool) -> Option<FlushableBucket> {
         // Recreate the table if it was reaped while the bucket was airborne: a
         // silent no-op drops the rows AND their cursor holds, letting the
         // watermark pass acked entries.
         let Some(schema) = b.batches.first().map(|batch| batch.schema()) else {
-            return Some(b.clone()); // nothing to restore
+            return true; // nothing to restore
         };
         let table = match self.get_or_create_table(&b.project_id, &b.table_name, &schema) {
             Ok(t) => t,
@@ -1743,26 +1733,14 @@ impl MemBuffer {
                     "restore_taken_bucket: cannot restore {} rows for {}.{} bucket {} ({}); rows stay WAL-only until restart replay",
                     b.row_count, b.project_id, b.table_name, b.bucket_id, e
                 );
-                return None;
+                return false;
             }
         };
         let bucket = table.buckets.entry(b.bucket_id).or_insert_with(TimeBucket::new);
         let mut batches_g = bucket.batches.lock();
         let mut wal_g = bucket.wal_shard_state.lock();
         let added: usize = b.batches.iter().map(estimate_batch_size).sum();
-        if protect_prefix {
-            let mut prefix = b.batches.clone();
-            prefix.append(&mut *batches_g);
-            *batches_g = prefix;
-            bucket.flush_pinned_prefix.store(b.batches.len(), Ordering::Relaxed);
-        } else {
-            batches_g.extend(b.batches.iter().cloned());
-        }
-        let snapshot = FlushableBucket {
-            snapshot_gen: bucket.mutation_gen.load(Ordering::Relaxed),
-            snapshot_rewrite_gen: bucket.rewrite_gen.load(Ordering::Relaxed),
-            ..b.clone()
-        };
+        batches_g.extend(b.batches.iter().cloned());
         b.wal_first_positions.iter().enumerate().filter_map(|(i, p)| p.map(|p| (i, p))).for_each(|(i, pos)| wal_g.merge(i, pos));
         wal_g.write_identities.extend(b.write_identities.iter().copied());
         bucket.memory_bytes.fetch_add(added, Ordering::Relaxed);
@@ -1776,7 +1754,7 @@ impl MemBuffer {
         drop(batches_g);
         self.estimated_bytes.fetch_add(added, Ordering::Relaxed);
         self.cache_invalidate(&Self::cache_key(&b.project_id, &b.table_name, b.bucket_id));
-        Some(snapshot)
+        true
     }
 
     /// Count buckets that have DWELLED here since before `cutoff_micros` —
@@ -3873,7 +3851,9 @@ mod tests {
             MAX_BATCH_COUNT_PER_BUCKET + 1
         );
         if identified {
-            let receipt = buffer.restore_taken_snapshot(&flushable[0]).unwrap();
+            assert!(buffer.restore_taken_bucket(&flushable[0]));
+            buffer.release_taking_pin(flushable[0].taking_pin_seq);
+            let receipt = buffer.snapshot_bucket_for_flush("p1", "t1", bucket_id).unwrap();
             let late = super::super::wal::identify_batch_for_wal(make_batch_with_rows(ts, 1)).unwrap();
             let late_identity = WalBatchIdentity::from_batch(&late).unwrap();
             buffer.insert("p1", "t1", late, ts).unwrap();
