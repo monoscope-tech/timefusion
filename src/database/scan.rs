@@ -521,7 +521,7 @@ impl ProjectRoutingTable {
         else {
             return Ok(None);
         };
-        let collect_matching = |batch: &RecordBatch, found: &mut HashSet<i64>| -> DFResult<()> {
+        let collect_matching = |batch: &RecordBatch, found: &mut HashSet<i64>| -> DFResult<bool> {
             let schema = datafusion::common::DFSchema::try_from(batch.schema().as_ref().clone())?;
             let mask = state.create_physical_expr(predicate.clone(), &schema)?.evaluate(batch)?.into_array(batch.num_rows())?;
             let mask =
@@ -531,14 +531,15 @@ impl ProjectRoutingTable {
                 &arrow::datatypes::DataType::Int64,
             )?;
             let ts = ts.as_any().downcast_ref::<arrow::array::Int64Array>().expect("cast to Int64");
-            found.extend((0..batch.num_rows()).filter(|&i| mask.is_valid(i) && mask.value(i) && ts.is_valid(i)).map(|i| ts.value(i)));
-            Ok(())
+            Ok(extend_candidate_timestamps(found, (0..batch.num_rows()).filter(|&i| mask.is_valid(i) && mask.value(i) && ts.is_valid(i)).map(|i| ts.value(i))))
         };
         if let Some(layer) = self.database.buffered_layer() {
             let mem =
                 layer.query_partitioned_with_text_match(project_id, &self.table_name, filters, None, None).map_err(|e| DataFusionError::External(e.into()))?;
             for batch in mem.partitions.iter().flatten() {
-                collect_matching(batch, &mut found)?;
+                if !collect_matching(batch, &mut found)? {
+                    return Ok(None);
+                }
             }
         }
         let table = self.database.resolve_table(project_id, &self.table_name).await.map_err(|e| DataFusionError::External(e.into()))?;
@@ -582,16 +583,8 @@ impl ProjectRoutingTable {
             let plan = self.scan_delta_table(&table, state, Some(&columns), filters, None, Some(&raw), None, None).await?;
             let schema = datafusion::common::DFSchema::try_from(plan.schema().as_ref().clone())?;
             let plan = Arc::new(FilterExec::try_new(state.create_physical_expr(predicate.clone(), &schema)?, plan)?);
-            for batch in datafusion::physical_plan::collect(plan, state.task_ctx()).await? {
-                let ts = arrow::compute::cast(
-                    batch.column_by_name("timestamp").ok_or_else(|| DataFusionError::Internal("no timestamp".into()))?,
-                    &arrow::datatypes::DataType::Int64,
-                )?;
-                let ts = ts.as_any().downcast_ref::<arrow::array::Int64Array>().expect("cast to Int64");
-                found.extend(ts.iter().flatten());
-                if found.len() > MAX_CANDIDATE_TIMESTAMPS {
-                    return Ok(None);
-                }
+            if !collect_candidate_timestamps(datafusion::physical_plan::execute_stream(plan, state.task_ctx())?, &mut found).await? {
+                return Ok(None);
             }
         }
         Ok((found.len() <= MAX_CANDIDATE_TIMESTAMPS).then_some(found))
@@ -2253,6 +2246,68 @@ const PREFILTER_MIN_WINDOW_MICROS: i64 = 3_600_000_000;
 /// Past this many candidate timestamps a mutable predicate is common enough that the
 /// `timestamp IN (..)` restriction would not prune, so the scan keeps its full path.
 const MAX_CANDIDATE_TIMESTAMPS: usize = 20_000;
+
+/// Returns false once the candidate set is too large to use for pruning.
+fn extend_candidate_timestamps(found: &mut HashSet<i64>, mut timestamps: impl Iterator<Item = i64>) -> bool {
+    !timestamps.any(|ts| found.insert(ts) && found.len() > MAX_CANDIDATE_TIMESTAMPS)
+}
+
+async fn collect_candidate_timestamps(mut stream: SendableRecordBatchStream, found: &mut HashSet<i64>) -> DFResult<bool> {
+    while let Some(batch) = stream.try_next().await? {
+        let ts = arrow::compute::cast(
+            batch.column_by_name("timestamp").ok_or_else(|| DataFusionError::Internal("no timestamp".into()))?,
+            &arrow::datatypes::DataType::Int64,
+        )?;
+        let ts = ts.as_any().downcast_ref::<arrow::array::Int64Array>().expect("cast to Int64");
+        if !extend_candidate_timestamps(found, ts.iter().flatten()) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+#[cfg(test)]
+mod candidate_memory_tests {
+    use super::*;
+
+    #[test]
+    fn candidate_limit_stops_consuming_at_first_distinct_overflow() {
+        let mut found = HashSet::new();
+        let mut consumed = 0;
+        let timestamps = (0..MAX_CANDIDATE_TIMESTAMPS as i64 + 100).flat_map(|ts| [ts, ts]).inspect(|_| consumed += 1);
+        assert!(!extend_candidate_timestamps(&mut found, timestamps));
+        assert_eq!(found.len(), MAX_CANDIDATE_TIMESTAMPS + 1);
+        assert_eq!(consumed, 2 * MAX_CANDIDATE_TIMESTAMPS + 1);
+        found.remove(&(MAX_CANDIDATE_TIMESTAMPS as i64));
+        assert!(extend_candidate_timestamps(&mut found, [0, 1, 1].into_iter()));
+        assert_eq!(found.len(), MAX_CANDIDATE_TIMESTAMPS);
+    }
+
+    #[tokio::test]
+    async fn candidate_stream_preserves_exact_set_and_drops_on_overflow() {
+        use arrow::array::Int64Array;
+        use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+        let batch = |values| RecordBatch::try_from_iter([("timestamp", Arc::new(Int64Array::from(values)) as arrow::array::ArrayRef)]).unwrap();
+        let first = batch(vec![Some(2), None, Some(1), Some(2)]);
+        let mut found = HashSet::from([3]);
+        let stream = RecordBatchStreamAdapter::new(first.schema(), futures::stream::iter([Ok(first)]));
+        assert!(collect_candidate_timestamps(Box::pin(stream), &mut found).await.unwrap());
+        assert_eq!(found, HashSet::from([1, 2, 3]));
+
+        let overflow = batch((0..MAX_CANDIDATE_TIMESTAMPS as i64 + 2).map(Some).collect::<Vec<_>>());
+        let held = Arc::new(());
+        let witness = Arc::downgrade(&held);
+        let tail = futures::stream::once(async move {
+            let _held = held;
+            Err(DataFusionError::Execution("candidate overflow polled the next batch".into()))
+        });
+        let stream = RecordBatchStreamAdapter::new(overflow.schema(), futures::stream::iter([Ok(overflow)]).chain(tail));
+        found.clear();
+        assert!(!collect_candidate_timestamps(Box::pin(stream), &mut found).await.unwrap());
+        assert_eq!(found.len(), MAX_CANDIDATE_TIMESTAMPS + 1);
+        assert!(witness.upgrade().is_none(), "the unpolled tail must be released on fallback");
+    }
+}
 
 /// Uncovered bytes a mutable-membership scan may read during planning before it keeps its full path.
 const MAX_CANDIDATE_RAW_BYTES: u64 = 512 << 20;

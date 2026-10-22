@@ -10375,43 +10375,106 @@ fn provider_versions_retains_recent_and_expires() {
     assert_eq!(ring.len(), 0);
 }
 
-/// A pressure flush must keep acknowledged rows readable while the real Delta
-/// writer is still waiting to publish them.
+/// Both pressure and legacy dirty-snapshot escalation must keep the newest
+/// acknowledged value readable while the real Delta writer awaits publication.
+#[test_case::test_case(0; "pressure")]
+#[test_case::test_case(2; "dirty_livelock")]
 #[serial]
 #[tokio::test(flavor = "multi_thread")]
-async fn pressure_flush_keeps_acknowledged_rows_visible_before_commit() -> Result<()> {
+async fn flush_keeps_acknowledged_rows_visible_before_commit(dirty_rounds: u32) -> Result<()> {
     let now = crate::support::set_micros(Utc::now().timestamp_micros());
     let _clock = scopeguard::guard((), |_| crate::support::unfreeze());
-    let cfg = create_test_config("pressure-visible-before-commit");
+    let mut cfg = create_test_config("flush-visible-before-commit");
+    Arc::make_mut(&mut cfg).buffer.timefusion_flush_dwell_secs = 0;
+    Arc::make_mut(&mut cfg).maintenance.timefusion_rollup_version_only_witness = true;
     let db = Database::with_config(cfg.clone()).await?;
     let name = "otel_logs_and_spans";
-    let (_, _, table) = mem_table("pressure-visible-before-commit", get_schema(name).unwrap().columns()?).await?;
+    let (_, _, table) = mem_table("flush-visible-before-commit", get_schema(name).unwrap().columns()?).await?;
     db.unified_tables.write().await.insert(name.into(), Arc::new(RwLock::new(table)));
     let writer = crate::server::delta_write_callback(&db);
     let entered = Arc::new(tokio::sync::Notify::new());
-    let resume = Arc::new(tokio::sync::Notify::new());
+    let resume = Arc::new(tokio::sync::Semaphore::new(0));
     let gate = (entered.clone(), resume.clone());
     let layer = Arc::new(test_layer(cfg)?.with_delta_writer(Arc::new(move |project, table, batches, context| {
         let (writer, entered, resume) = (writer.clone(), gate.0.clone(), gate.1.clone());
         Box::pin(async move {
             entered.notify_one();
-            resume.notified().await;
+            resume.acquire().await?.forget();
             writer(project, table, batches, context).await
         })
     })));
     let db = db.with_buffered_layer(layer.clone());
     let ctx = session_for(&db)?;
-    insert_otel_ts(&db, "pressure-visible", "before", "span", now, false).await?;
-    let sql = "SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = 'pressure-visible'";
-    assert_eq!(count_of(&ctx, sql).await?, 1);
-    let flushing = tokio::spawn(async move { layer.force_flush_current_buckets().await });
+    let ts = if dirty_rounds == 0 { now } else { now - 2 * crate::write::mem_buffer::bucket_duration_micros() };
+    insert_otel_ts(&db, "flush-visible", "before", "v0", ts, false).await?;
+    let read = async || -> Result<Vec<String>> {
+        Ok(ctx
+            .sql("SELECT name FROM otel_logs_and_spans WHERE project_id = 'flush-visible'")
+            .await?
+            .collect()
+            .await?
+            .iter()
+            .flat_map(|batch| (0..batch.num_rows()).map(|i| crate::support::test_helpers::array_get_str(batch.column(0), i)).collect::<Vec<_>>())
+            .collect())
+    };
+    assert_eq!(read().await?, ["v0"]);
+    for round in 1..=dirty_rounds {
+        let flushing = {
+            let layer = layer.clone();
+            tokio::spawn(async move { layer.force_evict_now().await })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(10), entered.notified()).await?;
+        let stamped = crate::write::stamp_version(name, layer.query("flush-visible", name, &[])?);
+        let stamp = datafusion::scalar::ScalarValue::try_from_array(stamped[0].column_by_name("updated_at").unwrap(), 0)?;
+        let changed = layer.update(
+            "flush-visible",
+            name,
+            None,
+            &[("name".into(), datafusion::logical_expr::lit(format!("v{round}"))), ("updated_at".into(), datafusion::logical_expr::lit(stamp))],
+        );
+        resume.add_permits(1);
+        flushing.await??;
+        assert_eq!(changed?, 1, "the acknowledged legacy UPDATE dirties this actual snapshot");
+        assert_eq!(read().await?, [format!("v{round}")]);
+    }
+    let flushing = tokio::spawn(async move { if dirty_rounds == 0 { layer.force_flush_current_buckets().await } else { layer.force_evict_now().await } });
     tokio::time::timeout(std::time::Duration::from_secs(10), entered.notified()).await?;
-    let during = tokio::time::timeout(std::time::Duration::from_secs(5), count_of(&ctx, sql)).await;
-    resume.notify_one();
+    let during = tokio::time::timeout(std::time::Duration::from_secs(5), read()).await;
+    let stats = crate::observability::dml_stats();
+    let enrichment = if dirty_rounds > 0 {
+        let admitted = stats.rollup_version_only_rows.load(std::sync::atomic::Ordering::Relaxed);
+        let declined = stats.rollup_version_only_declined_rows.load(std::sync::atomic::Ordering::Relaxed);
+        let append = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            ctx.sql("UPDATE otel_logs_and_spans SET attributes___session___id = 'during-freeze' WHERE project_id = 'flush-visible'").await?.collect().await
+        })
+        .await;
+        Some((admitted, declined, append))
+    } else {
+        None
+    };
+    resume.add_permits(1 + usize::from(dirty_rounds > 0));
     flushing.await??;
-    assert_eq!(delta_physical_row_count(otel_unified_table(&db).await.as_ref()).await?, 1, "the real writer must publish one physical row");
-    assert_eq!(during??, 1, "acknowledged rows must remain readable before publication");
-    assert_eq!(count_of(&ctx, sql).await?, 1, "publication must preserve the same logical row");
+    if let Some((admitted, declined, append)) = enrichment {
+        append??;
+        assert_eq!(
+            stats.rollup_version_only_rows.load(std::sync::atomic::Ordering::Relaxed),
+            admitted,
+            "a deferred retraction cannot admit a version-only witness"
+        );
+        assert_eq!(stats.rollup_version_only_declined_rows.load(std::sync::atomic::Ordering::Relaxed), declined + 1);
+        assert_eq!(
+            count_of(&ctx, "SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = 'flush-visible' AND attributes___session___id = 'during-freeze'")
+                .await?,
+            1
+        );
+    }
+    assert_eq!(
+        delta_physical_row_count(otel_unified_table(&db).await.as_ref()).await?,
+        i64::from(dirty_rounds + 1 + u32::from(dirty_rounds > 0)),
+        "every real snapshot must publish"
+    );
+    assert_eq!(during??, [format!("v{dirty_rounds}")], "the newest acknowledged value must stay visible before publication");
+    assert_eq!(read().await?, [format!("v{dirty_rounds}")], "publication preserves one latest logical row");
     db.shutdown().await?;
     Ok(())
 }

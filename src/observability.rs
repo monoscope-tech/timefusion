@@ -2097,6 +2097,18 @@ static LOGGER_PROVIDER: OnceLock<SdkLoggerProvider> = OnceLock::new();
 const EXPORT_BATCH: usize = 32;
 const EXPORT_TIMEOUT: Duration = Duration::from_secs(10);
 
+fn otlp_log_bridge(
+    provider: &SdkLoggerProvider,
+) -> opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge<SdkLoggerProvider, opentelemetry_sdk::logs::SdkLogger> {
+    opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge::builder(provider)
+        .with_tracing_span_attributes(opentelemetry_appender_tracing::layer::TracingSpanAttributes::allowlist([
+            "client.application_name",
+            "client.address",
+            "client.pid",
+        ]))
+        .build()
+}
+
 pub fn init_telemetry(config: &TelemetryConfig) -> anyhow::Result<()> {
     opentelemetry::global::set_text_map_propagator(TraceContextPropagator::new());
 
@@ -2138,7 +2150,7 @@ pub fn init_telemetry(config: &TelemetryConfig) -> anyhow::Result<()> {
         .with_batch_config(opentelemetry_sdk::logs::BatchConfigBuilder::default().with_max_export_batch_size(EXPORT_BATCH).build())
         .build();
     let logger_provider = SdkLoggerProvider::builder().with_log_processor(log_processor).with_resource(resource).build();
-    let log_bridge = opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge::new(&logger_provider)
+    let log_bridge = otlp_log_bridge(&logger_provider)
         .with_filter(tracing_subscriber::filter::filter_fn(|meta| !["opentelemetry", "tonic", "h2", "hyper"].iter().any(|p| meta.target().starts_with(p))));
     let _ = LOGGER_PROVIDER.set(logger_provider);
 
@@ -2216,6 +2228,38 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn otlp_failure_logs_keep_only_allowlisted_caller_fields() -> anyhow::Result<()> {
+        use opentelemetry::logs::AnyValue;
+        let exporter = opentelemetry_sdk::logs::InMemoryLogExporter::default();
+        let provider = SdkLoggerProvider::builder().with_simple_exporter(exporter.clone()).build();
+        let subscriber = tracing_subscriber::registry().with(otlp_log_bridge(&provider));
+        tracing::subscriber::with_default(subscriber, || {
+            let parent = tracing::info_span!(
+                "postgres.query.simple",
+                client.application_name = "caller",
+                client.address = "127.0.0.1:54321",
+                client.pid = 42,
+                secret = "private-span-canary"
+            );
+            let child = parent.in_scope(|| tracing::info_span!("execute"));
+            drop(parent);
+            child.in_scope(|| tracing::warn!(event = "pgwire.stream_failed", "PostgreSQL row stream failed"));
+        });
+        provider.force_flush()?;
+        let logs = exporter.get_emitted_logs()?;
+        let [log] = logs.as_slice() else { panic!("expected one exported failure") };
+        for (key, expected) in [
+            ("client.application_name", AnyValue::String("caller".into())),
+            ("client.address", AnyValue::String("127.0.0.1:54321".into())),
+            ("client.pid", AnyValue::Int(42)),
+        ] {
+            assert_eq!(log.record.attributes_iter().find(|(k, _)| k.as_str() == key).map(|(_, v)| v), Some(&expected), "exported {key}");
+        }
+        assert!(!log.record.attributes_iter().any(|(key, _)| key.as_str() == "secret"));
+        Ok(())
+    }
 
     fn no_jemalloc() -> Option<u64> {
         None

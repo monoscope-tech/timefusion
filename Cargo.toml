@@ -66,7 +66,7 @@ tracing-opentelemetry = "0.34"
 opentelemetry = "0.33"
 opentelemetry-otlp = { version = "0.33", features = ["grpc-tonic", "metrics", "logs"] }
 opentelemetry_sdk = { version = "0.33", features = ["rt-tokio", "metrics", "logs"] }
-opentelemetry-appender-tracing = "0.33"
+opentelemetry-appender-tracing = { version = "0.33", features = ["experimental_span_attributes"] }
 metrics = "0.24"
 # 0.2.1 (latest release) pins opentelemetry 0.31; upstream main is on 0.33.
 metrics-exporter-opentelemetry = { git = "https://github.com/Noelware/metrics-exporter-opentelemetry.git", rev = "b93abba878a51cd9e2ce62df554142be6f02764d" }
@@ -131,8 +131,8 @@ serde-inline-default = "1.0.2"
 bon = "3.9.3"
 
 [dev-dependencies]
-# ManualReader, to read exported OTel counters back in tests. Adds no crates.
-opentelemetry_sdk = { version = "0.33", features = ["experimental_metrics_custom_reader"] }
+# ManualReader and in-memory export, to read OTel records back in tests. Adds no crates.
+opentelemetry_sdk = { version = "0.33", features = ["experimental_metrics_custom_reader", "testing"] }
 sqllogictest = { git = "https://github.com/risinglightdb/sqllogictest-rs.git" }
 serial_test = "3.2.0"
 tokio = { version = "1.48", features = ["test-util"] }

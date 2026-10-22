@@ -49,8 +49,8 @@ const HARD_LIMIT_HEADROOM_DIVISOR: usize = 5;
 /// Bucket-id time slices one flush cycle commits before releasing `flush_lock`,
 /// so a deep backlog drains as many small commits that each finish.
 const FLUSH_CHUNK_BUCKET_IDS: usize = 2;
-/// Consecutive dirty snapshot flushes before a bucket is taken destructively.
-const DIRTY_FLUSHES_BEFORE_TAKE: u32 = 2;
+/// Consecutive dirty snapshots before briefly freezing in-place DML and retraction.
+const DIRTY_FLUSHES_BEFORE_FREEZE: u32 = 2;
 /// The reservation ceiling live writers are rejected at.
 fn hard_limit(max_bytes: usize) -> usize {
     max_bytes.saturating_add(max_bytes / HARD_LIMIT_HEADROOM_DIVISOR)
@@ -201,7 +201,6 @@ pub struct StatsSnapshot {
     pub backpressure_rejected_total: u64,
     /// Open-bucket force-flush escalations.
     pub backpressure_force_flush_total: u64,
-    pub dirty_livelock_takes_total: u64,
     pub rows_ingested_total: u64,
     pub rows_flushed_total: u64,
     pub flush_freed_bytes_total: u64,
@@ -462,24 +461,11 @@ struct CombinedBucket {
     source_buckets: Vec<crate::write::mem_buffer::FlushableBucket>,
 }
 
-type RestoredTake = Arc<parking_lot::Mutex<Option<FlushableBucket>>>;
-
-#[derive(Clone, Copy)]
-enum FlushSources<'a> {
-    Snapshots(&'a [FlushableBucket]),
-    Taken(&'a RestoredTake),
-}
-
-enum ConfirmedSources {
-    Snapshots(Vec<FlushableBucket>),
-    Taken(RestoredTake),
-}
-
 /// A successful detached callback confirms these exact source snapshots. Unlike
 /// a replay digest, this receipt also works for append-only tables and late twins.
 struct ConfirmedFlush {
     bucket: FlushableBucket,
-    sources: ConfirmedSources,
+    sources: Vec<FlushableBucket>,
     batches: Vec<RecordBatch>,
     files: Vec<String>,
 }
@@ -562,6 +548,8 @@ pub struct BufferedWriteLayer {
     tantivy_index_callback: Option<TantivyIndexCallback>,
     background_tasks: Mutex<Vec<JoinHandle<()>>>,
     flush_lock: Mutex<()>,
+    /// Stabilizes a dirty prefix without hiding it or blocking version appends.
+    legacy_dml_gate: tokio::sync::RwLock<()>,
     /// `FLUSH_COMMIT_BYTE_CAP`, overridable only by tests — small fixtures
     /// cannot reach a 2 GiB cap.
     flush_commit_byte_cap: u64,
@@ -585,7 +573,6 @@ pub struct BufferedWriteLayer {
     backpressure_engaged_total: AtomicU64,
     backpressure_rejected_total: AtomicU64,
     backpressure_force_flush_total: AtomicU64,
-    dirty_livelock_takes_total: AtomicU64,
     /// Set by the flush loop when on-disk WAL bytes exceed the HARD limit
     /// (`wal_hard_limit_bytes`); while set, `insert` rejects instead of acking
     /// into an unbounded backlog (the upstream DLQ absorbs + replays). Cleared
@@ -768,6 +755,7 @@ impl BufferedWriteLayer {
             tantivy_index_callback: None,
             background_tasks: Mutex::new(Vec::new()),
             flush_lock: Mutex::new(()),
+            legacy_dml_gate: tokio::sync::RwLock::new(()),
             flush_commit_byte_cap: FLUSH_COMMIT_BYTE_CAP,
             relief_lock: Mutex::new(()),
             reserved_bytes: AtomicUsize::new(0),
@@ -781,7 +769,6 @@ impl BufferedWriteLayer {
             backpressure_engaged_total: AtomicU64::new(0),
             backpressure_rejected_total: AtomicU64::new(0),
             backpressure_force_flush_total: AtomicU64::new(0),
-            dirty_livelock_takes_total: AtomicU64::new(0),
             rows_ingested_total: AtomicU64::new(0),
             rows_flushed_total: AtomicU64::new(0),
             flush_freed_bytes_total: AtomicU64::new(0),
@@ -1055,36 +1042,6 @@ impl BufferedWriteLayer {
         Ok(())
     }
 
-    /// Take-flush the buckets `keys` selects UNDER the flush lock (rows removed
-    /// under the insert lock, restored on commit failure). `on_take` runs as each
-    /// bucket is taken, before its commit.
-    async fn force_flush_buckets(&self, keys: impl FnOnce(&MemBuffer) -> Vec<(String, String, i64)>, mut on_take: impl FnMut()) {
-        let _flush_guard = self.flush_lock.lock().await;
-        if self.settle_confirmed_flushes() {
-            self.write_post_flush_snapshot().await;
-        }
-        for (project_id, table_name, bucket_id) in keys(&self.mem_buffer) {
-            if !self.flush_topic_ready(&project_id, &table_name) {
-                continue;
-            }
-            let Some(bucket) = self.mem_buffer.take_bucket_for_flush(&project_id, &table_name, bucket_id) else {
-                continue;
-            };
-            on_take();
-            match self.flush_taken_bucket(&bucket).await {
-                Ok(()) => {
-                    self.rows_flushed_total.fetch_add(bucket.row_count as u64, Ordering::Relaxed);
-                    self.flush_freed_bytes_total.fetch_add(flushable_bytes(&bucket), Ordering::Relaxed);
-                    self.flush_completed_total.fetch_add(1, Ordering::Relaxed);
-                }
-                Err(e) => {
-                    warn!("force-flush: Delta commit failed; rows restored to MemBuffer (WAL holds them): {}", e);
-                    self.note_flush_failure(1);
-                }
-            }
-        }
-    }
-
     /// Exempt the buckets a merge-on-read version append lands in from the
     /// Delta-scan exclusion. A version append carries the row's ORIGINAL
     /// timestamp, so an unmarked bucket would make MemBuffer authoritative for
@@ -1101,8 +1058,11 @@ impl BufferedWriteLayer {
     }
 
     /// See [`MemBuffer::retract_superseded`].
-    pub fn retract_superseded(&self, project_id: &str, table_name: &str, appended: &RecordBatch, keys: &[String], tiebreak: &str) -> usize {
-        self.mem_buffer.retract_superseded(project_id, table_name, appended, keys, tiebreak, crate::dml::table_time_column(table_name))
+    /// `None` defers this optimization during a forced snapshot. It does not
+    /// prove that the predecessor rows were already flushed.
+    pub fn retract_superseded(&self, project_id: &str, table_name: &str, appended: &RecordBatch, keys: &[String], tiebreak: &str) -> Option<usize> {
+        let _mutation = self.legacy_dml_gate.try_read().ok()?;
+        Some(self.mem_buffer.retract_superseded(project_id, table_name, appended, keys, tiebreak, crate::dml::table_time_column(table_name)))
     }
 
     pub async fn insert(&self, project_id: &str, table_name: &str, batches: Vec<RecordBatch>) -> anyhow::Result<()> {
@@ -2063,17 +2023,9 @@ impl BufferedWriteLayer {
                 self.write_post_flush_snapshot().await;
             }
         }
-        // Continuous DML can dirty every snapshot of a bucket, which then never
-        // drains and fills the buffer until inserts are rejected. Take those
-        // destructively: the take is atomic with inserts and DML, so no race.
-        if !self.mem_buffer.dirty_livelocked_keys(DIRTY_FLUSHES_BEFORE_TAKE).is_empty() {
-            self.force_flush_buckets(
-                |mem| mem.dirty_livelocked_keys(DIRTY_FLUSHES_BEFORE_TAKE),
-                || {
-                    self.dirty_livelock_takes_total.fetch_add(1, Ordering::Relaxed);
-                },
-            )
-            .await;
+        // The same snapshot pipeline also drains dirty open/dwell-held buckets.
+        if !self.mem_buffer.dirty_livelocked_keys(DIRTY_FLUSHES_BEFORE_FREEZE).is_empty() {
+            self.flush_bucket_keys(|mem| mem.dirty_livelocked_keys(DIRTY_FLUSHES_BEFORE_FREEZE)).await?;
         }
         let current_bucket = MemBuffer::current_bucket_id();
         // Snapshot the bucket list ONCE: re-deriving the remaining set each pass
@@ -2114,12 +2066,34 @@ impl BufferedWriteLayer {
     /// The one flush pipeline: periodic task, pressure relief, pgwire `FLUSH` and
     /// shutdown all route through it.
     async fn flush_buckets_where(&self, pred: impl Fn(i64) -> bool) -> anyhow::Result<FlushStats> {
+        self.flush_bucket_keys(|mem| mem.bucket_keys(pred)).await
+    }
+
+    async fn flush_bucket_keys(&self, keys: impl FnOnce(&MemBuffer) -> Vec<(String, String, i64)>) -> anyhow::Result<FlushStats> {
         let _flush_guard = self.flush_lock.lock().await;
         let confirmed = self.settle_confirmed_flushes();
 
         // Group per (project, table) FIRST: the in-flight registration below must
         // precede any snapshot of that topic's buckets.
-        let by_topic: HashMap<(String, String), Vec<i64>> = self.mem_buffer.bucket_keys(&pred).into_iter().map(|(p, t, id)| ((p, t), id)).into_group_map();
+        let by_topic: HashMap<(String, String), Vec<i64>> = keys(&self.mem_buffer).into_iter().map(|(p, t, id)| ((p, t), id)).into_group_map();
+        let freeze = self
+            .mem_buffer
+            .dirty_livelocked_keys(DIRTY_FLUSHES_BEFORE_FREEZE)
+            .into_iter()
+            .any(|(p, t, id)| self.flush_topic_ready(&p, &t) && by_topic.get(&(p, t)).is_some_and(|ids| ids.contains(&id)));
+        // Queue a writer so admitted mutations finish and new ones decline
+        // before WAL append. Inserts remain available and outside the prefix.
+        let _mutation = if freeze {
+            let gate = self.legacy_dml_gate.write();
+            let budget = self.adaptive_flush_timeout();
+            Some(if budget.is_zero() {
+                gate.await
+            } else {
+                tokio::time::timeout(budget, gate).await.map_err(|_| anyhow::anyhow!("dirty flush could not quiesce DML within {budget:?}"))?
+            })
+        } else {
+            None
+        };
 
         // Snapshot (not take): rows stay queryable in MemBuffer while the Delta
         // commit is airborne.
@@ -2213,7 +2187,7 @@ impl BufferedWriteLayer {
         let group_futures: Vec<_> = groups
             .into_iter()
             .map(|group| async move {
-                let result = self.flush_bucket(&group.0.combined, FlushSources::Snapshots(&group.0.source_buckets)).await;
+                let result = self.flush_bucket(&group.0.combined, &group.0.source_buckets).await;
                 let (combined, token) = scopeguard::ScopeGuard::into_inner(group);
                 self.settle_flushed_group(combined, token, result)
             })
@@ -2340,7 +2314,7 @@ impl BufferedWriteLayer {
     /// Flush a bucket to Delta Lake via the configured callback.
     /// The callback MUST complete the Delta commit before returning Ok - this is critical
     /// for durability. We only advance the WAL watermark after this returns successfully.
-    async fn flush_bucket(&self, bucket: &FlushableBucket, sources: FlushSources<'_>) -> anyhow::Result<()> {
+    async fn flush_bucket(&self, bucket: &FlushableBucket, sources: &[FlushableBucket]) -> anyhow::Result<()> {
         let (batches, delta_watermark) = self.prepare_flush(bucket)?;
         if self.already_landed(&bucket.project_id, &bucket.table_name, &batches) {
             self.flush_retries.remove(&(bucket.project_id.clone(), bucket.table_name.clone()));
@@ -2433,7 +2407,7 @@ impl BufferedWriteLayer {
     /// Own the original attempt after watchdog expiry or caller cancellation.
     /// Task failure has no authoritative storage outcome and cannot clear the topic.
     fn watch_detached_flush(
-        &self, bucket: &FlushableBucket, sources: FlushSources<'_>, batches: &[RecordBatch], mut handle: JoinHandle<anyhow::Result<Vec<String>>>,
+        &self, bucket: &FlushableBucket, sources: &[FlushableBucket], batches: &[RecordBatch], mut handle: JoinHandle<anyhow::Result<Vec<String>>>,
     ) {
         let topic = (bucket.project_id.clone(), bucket.table_name.clone());
         self.airborne_commits.insert(topic.clone());
@@ -2442,15 +2416,7 @@ impl BufferedWriteLayer {
         let (digests, airborne) = (Arc::clone(&self.landed_digests), Arc::clone(&self.airborne_commits));
         let (retries, wake) = (Arc::clone(&self.flush_retries), Arc::clone(&self.pressure_notify));
         let confirmed = self.confirmed_flushes.clone();
-        let mut receipt = ConfirmedFlush {
-            bucket: bucket.clone(),
-            sources: match sources {
-                FlushSources::Snapshots(sources) => ConfirmedSources::Snapshots(sources.to_vec()),
-                FlushSources::Taken(restored) => ConfirmedSources::Taken(restored.clone()),
-            },
-            batches: batches.to_vec(),
-            files: Vec::new(),
-        };
+        let mut receipt = ConfirmedFlush { bucket: bucket.clone(), sources: sources.to_vec(), batches: batches.to_vec(), files: Vec::new() };
         let ceiling = detach_ceiling(self.config.buffer.flush_bucket_timeout());
         tokio::spawn(async move {
             let landed = if ceiling.is_zero() {
@@ -2495,10 +2461,7 @@ impl BufferedWriteLayer {
         let topics: Vec<_> = self.confirmed_flushes.iter().map(|entry| entry.key().clone()).collect();
         for topic in topics {
             if let Some((_, receipt)) = self.confirmed_flushes.remove(&topic) {
-                let source_buckets = match receipt.sources {
-                    ConfirmedSources::Snapshots(sources) => sources,
-                    ConfirmedSources::Taken(restored) => restored.lock().take().into_iter().collect(),
-                };
+                let source_buckets = receipt.sources;
                 let group = CombinedBucket { combined: receipt.bucket, source_buckets };
                 self.index_flushed_files(&group.combined, receipt.batches, receipt.files);
                 let bucket = &group.combined;
@@ -3019,39 +2982,6 @@ impl BufferedWriteLayer {
         info!("WAL reclaim handoff: before({}), after({}), completed={}", counts(&before), counts(&after), self.wal.reclaim_sweep_complete(epoch));
     }
 
-    /// Flush one taken bucket: force-flushed marking + in-flight hold registration + Delta
-    /// commit + watermark advance on success, restore on failure.
-    async fn flush_taken_bucket(&self, bucket: &FlushableBucket) -> anyhow::Result<()> {
-        // A concurrent insert can revive the taken bucket; the revived bucket's range exclusion
-        // would then mask this commit's rows with nothing to punch through — mark BEFORE the
-        // commit so no query races into a masked window.
-        self.mem_buffer.mark_force_flushed(&bucket.project_id, &bucket.table_name, bucket.bucket_id);
-        let token = self.register_inflight_holds(&bucket.project_id, &bucket.table_name, bucket.wal_first_positions.clone());
-        self.register_inflight_pin(token, bucket.first_wal_pin_micros);
-        // Only now may the take-time parking pin go: the two pins must overlap, never gap, or
-        // a concurrent GC sweep could delete the taken bucket's backing WAL file.
-        self.mem_buffer.release_taking_pin(bucket.taking_pin_seq);
-        // Cancellation drops the await without entering its Err branch. Restore
-        // the taken rows before releasing their in-flight holds in either case.
-        let restored: RestoredTake = Arc::new(parking_lot::Mutex::new(None));
-        let restore = scopeguard::guard(token, |token| {
-            if let Some(snapshot) = self.mem_buffer.restore_taken_snapshot(bucket) {
-                *restored.lock() = Some(snapshot);
-                self.release_inflight_holds(&bucket.project_id, &bucket.table_name, token);
-            } else {
-                self.orphan_inflight_holds(&bucket.project_id, &bucket.table_name, token, bucket.wal_first_positions.clone(), bucket.first_wal_pin_micros);
-            }
-        });
-        match self.flush_bucket(bucket, FlushSources::Taken(&restored)).await {
-            Ok(()) => {
-                let token = scopeguard::ScopeGuard::into_inner(restore);
-                self.release_and_advance(&bucket.project_id, &bucket.table_name, token);
-                Ok(())
-            }
-            Err(e) => Err(e),
-        }
-    }
-
     /// Check if buffer is empty (all data flushed).
     pub fn is_empty(&self) -> bool {
         self.mem_buffer.get_stats().total_rows == 0
@@ -3145,7 +3075,6 @@ impl BufferedWriteLayer {
             backpressure_engaged_total: self.backpressure_engaged_total.load(Ordering::Relaxed),
             backpressure_rejected_total: self.backpressure_rejected_total.load(Ordering::Relaxed),
             backpressure_force_flush_total: self.backpressure_force_flush_total.load(Ordering::Relaxed),
-            dirty_livelock_takes_total: self.dirty_livelock_takes_total.load(Ordering::Relaxed),
             rows_ingested_total: self.rows_ingested_total.load(Ordering::Relaxed),
             rows_flushed_total: self.rows_flushed_total.load(Ordering::Relaxed),
             flush_freed_bytes_total: self.flush_freed_bytes_total.load(Ordering::Relaxed),
@@ -3310,8 +3239,13 @@ impl BufferedWriteLayer {
     }
 
     /// [`Self::admit_write`] for the DML entry points, whose error type is DataFusion's.
-    fn admit_dml(&self) -> datafusion::error::Result<WriteAdmission<'_>> {
-        self.admit_write().map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))
+    fn admit_dml(&self) -> datafusion::error::Result<(WriteAdmission<'_>, tokio::sync::RwLockReadGuard<'_, ()>)> {
+        let admission = self.admit_write().map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
+        let mutation = self
+            .legacy_dml_gate
+            .try_read()
+            .map_err(|_| datafusion::error::DataFusionError::Execution("DML must wait for a pending flush; retry after publication".into()))?;
+        Ok((admission, mutation))
     }
 
     /// Delete rows matching the predicate from the memory buffer.
@@ -4133,12 +4067,12 @@ mod tests {
     }
 
     /// Prod 2026-09-28: continuous UPDATEs dirtied every snapshot of the same
-    /// buckets, none ever drained, and the full buffer rejected inserts. After
-    /// `DIRTY_FLUSHES_BEFORE_TAKE` dirty finishes the bucket must be taken and
-    /// land its post-UPDATE rows.
+    /// buckets, none ever drained, and the full buffer rejected inserts.
+    /// After repeated dirty finishes, a stable readable prefix must publish.
+    /// Version appends remain available; legacy DML resumes afterward.
     #[serial]
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_bucket_dirtied_by_every_flush_is_taken_not_livelocked() {
+    async fn dirty_snapshot_freeze_preserves_visibility_and_progress() {
         let (_dir, cfg, project, table) = test_ids_env("lv");
         let old_ts = crate::support::now_micros() - 2 * crate::write::mem_buffer::bucket_duration_micros();
         let committed = Arc::new(parking_lot::Mutex::new(Vec::<RecordBatch>::new()));
@@ -4159,7 +4093,7 @@ mod tests {
         let layer = layer_with(cfg, cb);
         layer.insert(&project, &table, vec![span_batch("a", "v0", &project, old_ts)]).await.unwrap();
 
-        for round in 1..=DIRTY_FLUSHES_BEFORE_TAKE {
+        for round in 1..=DIRTY_FLUSHES_BEFORE_FREEZE {
             let entered_wait = entered.notified();
             let flusher = {
                 let layer = layer.clone();
@@ -4173,13 +4107,43 @@ mod tests {
             assert!(!layer.is_empty(), "round {round}: a dirty finish keeps the rows");
         }
 
+        let flusher = {
+            let layer = layer.clone();
+            tokio::spawn(async move { layer.flush_completed_buckets().await })
+        };
+        entered.notified().await;
+        let visible = query_col_strings(&layer, &project, &table, "name");
+        let charged = layer.mem_buffer().estimated_memory_bytes();
+        let tail = layer.wal.current_position(&project, &table).unwrap();
+        let refused = layer.update(&project, &table, None, &[("name".into(), datafusion::logical_expr::lit("rejected"))]);
+        let after_refusal = layer.wal.current_position(&project, &table).unwrap();
+        // Appending a new version stays available; retraction is only a memory optimization.
+        let version = stamp_version("otel_logs_and_spans", vec![span_batch("a", "new-version", &project, old_ts)]);
+        let keys = crate::schema::get_schema("otel_logs_and_spans").unwrap().dedup_keys.clone();
+        layer.mark_version_buckets(&project, &table, &version);
+        layer.insert(&project, &table, version.clone()).await.unwrap();
+        let retracted = layer.retract_superseded(&project, &table, &version[0], &keys, "updated_at");
+        release.add_permits(1);
+        entered.notified().await; // The ordinary pass follows the forced prefix.
+        let following = query_col_strings(&layer, &project, &table, "name");
+        let frozen = committed.lock().last().cloned().expect("the frozen prefix committed");
+        let resumed = layer.update(&project, &table, None, &[("name".into(), datafusion::logical_expr::lit("after-freeze"))]);
+        release.add_permits(1);
+        flusher.await.unwrap().unwrap();
+        assert_eq!(visible, [format!("v{DIRTY_FLUSHES_BEFORE_FREEZE}")], "the pending publication must retain its acknowledged rows");
+        assert!(charged > 0, "readable pending rows remain charged to admission");
+        assert!(refused.is_err(), "legacy mutations must wait for the forced snapshot instead of dirtying it forever");
+        assert_eq!(after_refusal, tail, "a refused mutation must not enter the WAL");
+        assert!(retracted.is_none(), "deferred retraction cannot prove that predecessors were flushed");
+        assert_eq!(following, ["new-version"]);
+        assert_eq!(arrow::util::display::array_value_to_string(frozen.column_by_name("name").unwrap(), 0).unwrap(), format!("v{DIRTY_FLUSHES_BEFORE_FREEZE}"));
+        assert_eq!(resumed.unwrap(), 1, "legacy DML resumes after the forced prefix publishes");
+        assert_eq!(query_col_strings(&layer, &project, &table, "name"), ["after-freeze"]);
         release.add_permits(1);
         layer.flush_completed_buckets().await.unwrap();
-        assert!(layer.is_empty(), "a bucket dirtied by every snapshot flush must be taken, not re-flushed forever");
-        assert_eq!(layer.snapshot_stats().dirty_livelock_takes_total, 1);
-        let last = committed.lock().last().cloned().expect("the take committed");
-        let names = last.column_by_name("name").map(|c| arrow::util::display::array_value_to_string(c, 0).unwrap());
-        assert_eq!(names.as_deref(), Some(format!("v{DIRTY_FLUSHES_BEFORE_TAKE}").as_str()), "the take must land the post-UPDATE row");
+        assert!(layer.is_empty(), "the forced prefix and the subsequent version both make progress");
+        let last = committed.lock().last().cloned().unwrap();
+        assert_eq!(arrow::util::display::array_value_to_string(last.column_by_name("name").unwrap(), 0).unwrap(), "after-freeze");
     }
 
     /// Prod 2026-09-29: a merge-on-read UPDATE retracting a buffered row while
@@ -4237,7 +4201,7 @@ mod tests {
             layer.mark_version_buckets(&project, T, &version);
             layer.insert_bounded(&project, T, version.clone(), false).await.unwrap();
             if retract {
-                assert_eq!(layer.retract_superseded(&project, T, &version[0], &keys, "updated_at"), 1, "the UPDATE retracts the buffered row");
+                assert_eq!(layer.retract_superseded(&project, T, &version[0], &keys, "updated_at"), Some(1), "the UPDATE retracts the buffered row");
             }
         }
         layer.insert(&project, T, stamped(vec![span("late", "v1", false)])).await.unwrap();
