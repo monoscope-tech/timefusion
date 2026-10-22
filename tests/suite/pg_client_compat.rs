@@ -91,6 +91,25 @@ impl Drop for TestServer {
     }
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn aborted_transactions_report_the_postgres_sqlstate_and_recover() -> Result<()> {
+    let server = TestServer::start().await?;
+    let client = server.client().await?;
+    for simple in [true, false] {
+        for blocked in ["SELECT 1", "BEGIN"] {
+            client.batch_execute("BEGIN").await?;
+            assert!(client.simple_query("SELECT 1 / 0").await.is_err());
+            let error = if simple { client.simple_query(blocked).await.map(|_| ()) } else { client.query(blocked, &[]).await.map(|_| ()) }
+                .expect_err("commands must remain blocked in an aborted transaction");
+            assert_eq!(error.code(), Some(&tokio_postgres::error::SqlState::IN_FAILED_SQL_TRANSACTION), "simple={simple}, sql={blocked}");
+            client.batch_execute("ROLLBACK").await?;
+            let messages = client.simple_query("SELECT 42").await?;
+            assert!(messages.iter().any(|message| matches!(message, tokio_postgres::SimpleQueryMessage::Row(row) if row.get(0) == Some("42"))));
+        }
+    }
+    Ok(())
+}
+
 fn startup_packet() -> Vec<u8> {
     let mut body = 196_610_i32.to_be_bytes().to_vec();
     for (name, value) in [("user", "postgres"), ("database", "postgres"), ("_pq_.test_protocol_negotiation", "1")] {
