@@ -879,7 +879,7 @@ impl Database {
     /// which would then be written to Delta on the next real flush. Restricts provider construction
     /// itself, not just the SQL scan — an unrestricted provider eagerly materializes statistics for
     /// every live file in the unified table before partition pruning.
-    async fn dedup_probe_ctx(
+    pub(super) async fn dedup_probe_ctx(
         &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, project_id: &str, date_str: &str, limits: Option<DedupExecutionLimits>,
     ) -> Result<datafusion::prelude::SessionContext> {
         let (snapshot, log_store) = snapshot_and_store(table_ref).await?;
@@ -930,7 +930,7 @@ impl Database {
     /// The 10-minute duplicate probe: returns the bucket starts whose
     /// dedup-key groups have count > 1 under `filter`. Aggregates group keys only, so it is bounded
     /// by key cardinality rather than row width (a `SELECT *` here allocates outside any pool).
-    async fn dup_bin_starts(ctx: &datafusion::prelude::SessionContext, filter: &str, keys_csv: &str) -> Result<Vec<chrono::NaiveDateTime>> {
+    pub(super) async fn dup_bin_starts(ctx: &datafusion::prelude::SessionContext, filter: &str, keys_csv: &str) -> Result<Vec<chrono::NaiveDateTime>> {
         let probe = format!(
             "SELECT CAST(date_bin(INTERVAL '10 minutes', \"timestamp\", TIMESTAMP '1970-01-01T00:00:00') AS VARCHAR) FROM \
              (SELECT \"timestamp\", count(*) AS c FROM {DEDUP_SCAN_NAME} WHERE {filter} GROUP BY {keys_csv}) AS g \
@@ -1922,7 +1922,7 @@ fn dedup_staged_intent(wave_id: String, table_name: &str, project_id: &str, path
 }
 
 /// `"a", "b", …` — quoted column list for SQL, the shape every dedup query needs.
-fn quoted_csv(names: &[String]) -> String {
+pub(super) fn quoted_csv(names: &[String]) -> String {
     names.iter().map(|name| crate::rollup::quoted(name)).join(", ")
 }
 
@@ -2618,13 +2618,15 @@ mod ordered_probe_contract_tests {
     }
 
     /// Expensive, explicit volume experiment; normal CI retains the exact-key cases above.
-    #[test_case::test_case(4096, 0, false ; "four million rows")]
-    #[test_case::test_case(295781, 424, false ; "production row count")]
-    #[test_case::test_case(4096, 0, true ; "four million rows full overlap")]
-    #[test_case::test_case(295781, 424, true ; "production row count full overlap")]
+    #[test_case::test_case(4096, 0, false, false ; "four million rows")]
+    #[test_case::test_case(295781, 424, false, false ; "production row count")]
+    #[test_case::test_case(4096, 0, true, false ; "four million rows full overlap")]
+    #[test_case::test_case(295781, 424, true, false ; "production row count full overlap")]
+    #[test_case::test_case(4096, 0, true, true ; "four million rows certification slices")]
+    #[test_case::test_case(295781, 424, true, true ; "production row count certification slices")]
     #[ignore = "writes a production-shaped synthetic key workload to local MinIO"]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn whole_date_probe_volume(rows_per_group: usize, mut extra_rows: usize, full_overlap: bool) -> Result<()> {
+    async fn whole_date_probe_volume(rows_per_group: usize, mut extra_rows: usize, full_overlap: bool, certification_slices: bool) -> Result<()> {
         use arrow::array::{ArrayRef, StringArray, TimestampMicrosecondArray, UInt32Array, new_null_array};
         const TABLE: &str = "otel_logs_and_spans";
         // Reuse only a previous local experiment prefix to avoid rewriting gigabytes while debugging cancellation.
@@ -2748,6 +2750,45 @@ mod ordered_probe_contract_tests {
             reuse.is_some(),
             table.read().await.table_url()
         );
+        if certification_slices {
+            let compressed: i64 = table.read().await.snapshot()?.log_data().iter().map(|file| file.size()).sum();
+            assert!(
+                crate::database::maintain::estimated_decoded_bytes(compressed) > crate::maintenance_coordinator::MAX_DECODED_BYTES,
+                "this case must exercise a fresh partition larger than one work unit"
+            );
+            let started = std::time::Instant::now();
+            let passes = crate::database::maintain::SCAN_CAPTURE
+                .scope(std::cell::RefCell::new(Vec::new()), async {
+                    db.batch_probe_classify(
+                        &table,
+                        TABLE,
+                        Vec::new(),
+                        vec![(project.clone(), "2026-08-10".into())],
+                        std::time::Instant::now() + std::time::Duration::from_secs(240),
+                    )
+                    .await;
+                    crate::database::maintain::SCAN_CAPTURE.with(std::cell::RefCell::take)
+                })
+                .await;
+            assert!(
+                db.dedup_probe_declined.contains_key(&(project.clone(), TABLE.to_owned(), "2026-08-10".into())),
+                "a real duplicate must be found before the unchanged phase deadline"
+            );
+            let rows: u64 = passes.iter().map(|pass| pass.output_rows).sum();
+            let bytes: u64 = passes.iter().map(|pass| pass.bytes_scanned).sum();
+            assert!(!passes.is_empty() && rows < total_rows as u64, "a dirty first window must not process the full date: {rows} operator rows");
+            assert!(
+                !db.dedup_window_clean(&*table.read().await, &project, TABLE, (start, start + 86_400_000_000 - 1)).granted(),
+                "finding duplicates must never grant the day certificate"
+            );
+            eprintln!(
+                "volume_certification rows={total_rows} files=23 row_groups=977 elapsed_ms={} passes={} operator_rows={rows} bytes_scanned={bytes} peak_operator_bytes={}",
+                started.elapsed().as_millis(),
+                passes.len(),
+                passes.iter().map(|pass| pass.peak_mem_bytes).max().unwrap_or(0)
+            );
+            return Ok(());
+        }
         let context_started = std::time::Instant::now();
         let ctx = db.dedup_probe_ctx(&table, TABLE, &project, "2026-08-10", None).await?;
         eprintln!("volume_context elapsed_ms={} target_partitions={}", context_started.elapsed().as_millis(), ctx.state().config().target_partitions());
