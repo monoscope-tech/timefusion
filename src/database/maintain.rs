@@ -7896,7 +7896,7 @@ impl Database {
             || pre.is_empty()
             || !schema_or_default(table_name).dedup_keys.iter().any(|key| key == "timestamp")
             || spans.len() != pre.len()
-            || !spans.iter().all(|span| span.is_some_and(|(lo, hi)| lo >= day_start && hi < day_end))
+            || !spans.iter().all(|span| span.is_some_and(|(lo, hi)| lo >= day_start && lo <= hi && hi < day_end))
         {
             return self.probe_dup_bins(table, table_name, project, date_str).await.map(Some);
         }

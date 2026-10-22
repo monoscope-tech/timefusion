@@ -2757,19 +2757,35 @@ mod ordered_probe_contract_tests {
                 "this case must exercise a fresh partition larger than one work unit"
             );
             let started = std::time::Instant::now();
-            let passes = crate::database::maintain::SCAN_CAPTURE
+            let runtime = db.maintenance_runtime_env();
+            let (passes, peak_pool) = crate::database::maintain::SCAN_CAPTURE
                 .scope(std::cell::RefCell::new(Vec::new()), async {
-                    db.batch_probe_classify(
+                    let probe = db.batch_probe_classify(
                         &table,
                         TABLE,
                         Vec::new(),
                         vec![(project.clone(), "2026-08-10".into())],
                         std::time::Instant::now() + std::time::Duration::from_secs(240),
-                    )
-                    .await;
-                    crate::database::maintain::SCAN_CAPTURE.with(std::cell::RefCell::take)
+                    );
+                    tokio::pin!(probe);
+                    let mut peak = runtime.memory_pool.reserved();
+                    let mut samples = tokio::time::interval(std::time::Duration::from_millis(10));
+                    loop {
+                        tokio::select! {
+                            _ = &mut probe => break,
+                            _ = samples.tick() => peak = peak.max(runtime.memory_pool.reserved()),
+                        }
+                    }
+                    (crate::database::maintain::SCAN_CAPTURE.with(std::cell::RefCell::take), peak)
                 })
                 .await;
+            assert!(peak_pool <= usize::try_from(db.heavy_pool_bytes())?);
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while runtime.memory_pool.reserved() != 0 || runtime.disk_manager.used_disk_space() != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await?;
             assert!(
                 db.dedup_probe_declined.contains_key(&(project.clone(), TABLE.to_owned(), "2026-08-10".into())),
                 "a real duplicate must be found before the unchanged phase deadline"
@@ -2782,11 +2798,15 @@ mod ordered_probe_contract_tests {
                 "finding duplicates must never grant the day certificate"
             );
             eprintln!(
-                "volume_certification rows={total_rows} files=23 row_groups=977 elapsed_ms={} passes={} operator_rows={rows} bytes_scanned={bytes} peak_operator_bytes={}",
+                "volume_certification rows={total_rows} files=23 row_groups=977 elapsed_ms={} passes={} operator_rows={rows} bytes_scanned={bytes} sampled_pool_peak_bytes={peak_pool} reserved_after={} spill_after={}",
                 started.elapsed().as_millis(),
                 passes.len(),
-                passes.iter().map(|pass| pass.peak_mem_bytes).max().unwrap_or(0)
+                runtime.memory_pool.reserved(),
+                runtime.disk_manager.used_disk_space()
             );
+            for pass in &passes {
+                eprintln!("{}", pass.plan);
+            }
             return Ok(());
         }
         let context_started = std::time::Instant::now();
