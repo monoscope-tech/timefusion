@@ -382,6 +382,7 @@ mod liveness_clock_tests {
         ctx.register_parquet("t", dir.path().to_str().expect("utf8"), ParquetReadOptions::default()).await.expect("register");
         async fn scanned(ctx: &SessionContext, sql: &str) -> (u64, u64) {
             let plan = physical(ctx, sql).await;
+            assert!(super::plan_file_groups(plan.as_ref()).is_some_and(|groups| groups > 0), "real Parquet scans must report their physical file groups");
             datafusion::physical_plan::collect(Arc::clone(&plan), ctx.task_ctx()).await.expect("collect");
             (super::plan_metric_sum(plan.as_ref(), "bytes_scanned"), super::plan_metric_sum(plan.as_ref(), "files_processed"))
         }
@@ -412,6 +413,7 @@ mod liveness_clock_tests {
     async fn optional_plan_cost_metrics_distinguish_absence_from_zero() {
         use datafusion::physical_plan::{collect, empty::EmptyExec};
         let empty = EmptyExec::new(Arc::new(arrow::datatypes::Schema::empty()));
+        assert_eq!(super::plan_file_groups(&empty), None);
         assert_eq!(super::plan_observed_metric_sum(&empty, |metrics| metrics.spill_count()), None);
         let ctx = SessionContext::new();
         let plan = physical(&ctx, "SELECT a FROM (VALUES (2), (1)) AS t(a) ORDER BY a").await;
@@ -1049,6 +1051,16 @@ fn plan_observed_metric_sum(
     plan.children().iter().filter_map(|child| plan_observed_metric_sum(child.as_ref(), of)).fold(own, |sum, value| Some(sum.unwrap_or(0).saturating_add(value)))
 }
 
+/// Physical file groups, not target partitions or the selected-file count.
+/// Unknown source types remain absent instead of looking serial or empty.
+fn plan_file_groups(plan: &dyn datafusion::physical_plan::ExecutionPlan) -> Option<u64> {
+    use crate::read::optimizers::downcast;
+    use datafusion::datasource::{physical_plan::FileScanConfig, source::DataSourceExec};
+    let own =
+        downcast::<DataSourceExec>(plan).and_then(|source| downcast::<FileScanConfig>(source.data_source().as_ref())).map(|scan| scan.file_groups.len() as u64);
+    plan.children().iter().filter_map(|child| plan_file_groups(child.as_ref())).fold(own, |sum, groups| Some(sum.unwrap_or(0).saturating_add(groups)))
+}
+
 /// How much of what a maintenance query COULD have read it actually read.
 /// `bytes_scanned` is the only usable measure: predicate-excluded files are
 /// dropped during PLANNING so they reach no `pruned` counter, and
@@ -1075,6 +1087,7 @@ fn log_scan_pruning(plan: &dyn datafusion::physical_plan::ExecutionPlan, elapsed
         planning_ms = planning.as_millis() as u64,
         operation = UNIT_OPERATION.try_with(|operation| *operation).unwrap_or("none"),
         bytes_scanned,
+        source_file_groups = plan_file_groups(plan),
         row_groups_pruned = plan_metric_sum(plan, "row_groups_pruned_statistics") + plan_metric_sum(plan, "row_groups_pruned_bloom_filter"),
         output_rows = plan_output_rows(plan),
         elapsed_compute_ns = plan_observed_metric_sum(plan, |metrics| metrics.elapsed_compute()),

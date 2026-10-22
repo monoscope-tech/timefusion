@@ -696,7 +696,7 @@ impl WalManager {
     }
 
     /// Cursor positions are renumbered on restart. Retain publication proof
-    /// until every physical file present before publication has been reclaimed.
+    /// until every payload file present before publication has been reclaimed.
     /// Older records without a file inventory are conservatively retained.
     pub(crate) fn retire_flush_publications(&self) -> Result<(), WalError> {
         if self.recovery_rewind_path().exists() {
@@ -721,7 +721,11 @@ impl WalManager {
             if matches!(record.state, FlushPublicationState::Committed { .. } | FlushPublicationState::Aborted)
                 && self.is_topic_fully_consumed(&record.project_id, &record.table_name)?
                 && let Some(files) = &record.wal_files
-                && files.iter().all(|file| !present.contains(file))
+                // The cursor index (and its atomic replacement) contains only
+                // positions and survives payload-segment reclamation.
+                && files.iter().all(|file| {
+                    matches!(file.to_str(), Some("read_offset_idx_index.db" | "read_offset_idx_index.db.tmp")) || !present.contains(file)
+                })
             {
                 remove_if_exists(&journal.path)?;
             }
@@ -1954,6 +1958,13 @@ mod tests {
         let batch = identify_batch_for_wal(create_test_batch()).unwrap();
         let identity = WalBatchIdentity::from_batch(&batch).unwrap();
         wal.append("proj", &table, &batch).unwrap();
+        wal.set_persisted_positions("proj", &table, &[WalPosition::ORIGIN]).unwrap();
+        let index = dir.path().join("read_offset_idx_index.db");
+        assert!(index.exists(), "later publication intents see the persistent cursor index");
+        let index_tmp = index.with_extension("db.tmp");
+        std::fs::copy(&index, &index_tmp).unwrap();
+        let unknown = dir.path().join("unknown-wal-payload");
+        std::fs::write(&unknown, b"retain unknown files conservatively").unwrap();
         let journal = FlushPublicationJournal::create(dir.path(), "proj", &table, &[identity]).unwrap();
         let commit_id = journal.commit_id();
         let target = FlushPublicationTarget { table_uri: "memory:///journal".into(), table_id: uuid::Uuid::new_v4().to_string(), log_store_name: None };
@@ -2003,8 +2014,21 @@ mod tests {
             "consumed WAL can still replay after block IDs are renumbered"
         );
         for file in journal.record().wal_files.unwrap() {
-            std::fs::remove_file(dir.path().join(file)).unwrap();
+            let path = dir.path().join(file);
+            if path != index && path != index_tmp && path != unknown {
+                std::fs::remove_file(path).unwrap();
+            }
         }
+        std::fs::copy(&index, &index_tmp).unwrap();
+        assert!(index.exists(), "segment reclamation must not require deleting the live cursor index");
+        assert!(index_tmp.exists(), "an interrupted cursor-index replacement also holds no payload");
+        wal.retire_flush_publications().unwrap();
+        assert_eq!(
+            FlushPublicationJournal::load(dir.path()).unwrap().collect::<Result<Vec<_>, _>>().unwrap().len(),
+            1,
+            "an unknown file must still retain publication proof"
+        );
+        std::fs::remove_file(unknown).unwrap();
         wal.retire_flush_publications().unwrap();
         assert!(FlushPublicationJournal::load(dir.path()).unwrap().collect::<Result<Vec<_>, _>>().unwrap().is_empty());
         let journal = FlushPublicationJournal::create(dir.path(), "proj", &table, &[identity]).unwrap();
