@@ -1865,9 +1865,12 @@ impl StoreRequest {
     }
 
     fn stream<T: Send + 'static>(op: StoreOp, stream: BoxStream<'static, T>) -> BoxStream<'static, T> {
+        Self::start(op).guard_stream(stream)
+    }
+
+    fn guard_stream<T: Send + 'static>(self, stream: BoxStream<'static, T>) -> BoxStream<'static, T> {
         use futures::StreamExt;
-        let request = Self::start(op);
-        stream.inspect(move |_| _ = &request).boxed()
+        stream.inspect(move |_| _ = &self).boxed()
     }
 }
 
@@ -1892,15 +1895,23 @@ impl ObjectStore for RequestClassRouter {
     }
 
     async fn get_opts(&self, location: &Path, options: GetOptions) -> ObjectStoreResult<GetResult> {
-        let op = if options.head {
+        let head = options.head;
+        let op = if head {
             StoreOp::Head
         } else if options.range.is_some() {
             StoreOp::GetRange
         } else {
             StoreOp::Get
         };
-        let _request = StoreRequest::start(op);
-        self.route(location).get_opts(location, options).await
+        let request = StoreRequest::start(op);
+        let result = self.route(location).get_opts(location, options).await?;
+        // HTTP response bodies are read after get_opts returns its headers.
+        // HEAD and local file handles have no remote body to keep in flight.
+        let payload = match result.payload {
+            object_store::GetResultPayload::Stream(stream) if !head => object_store::GetResultPayload::Stream(request.guard_stream(stream)),
+            payload => payload,
+        };
+        Ok(GetResult { payload, ..result })
     }
 
     async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> ObjectStoreResult<Vec<Bytes>> {
@@ -1962,6 +1973,37 @@ mod tests {
         assert_eq!((get.inflight.load(Ordering::Relaxed), get.latency.total()), (0, 1));
     }
 
+    #[test_case::test_case(false, false; "full body completes")]
+    #[test_case::test_case(true, false; "range body completes")]
+    #[test_case::test_case(true, true; "range body is cancelled")]
+    #[tokio::test]
+    async fn store_request_guard_covers_the_response_body(range: bool, cancel: bool) {
+        let mem = Arc::new(InMemory::new());
+        let path = Path::from("body.parquet");
+        mem.put(&path, Bytes::from_static(b"abc").into()).await.unwrap();
+        let (polled, release) = (Arc::new(tokio::sync::Notify::new()), Arc::new(tokio::sync::Notify::new()));
+        let (mut slow, _, _) = counting_store(&mem, Duration::ZERO);
+        Arc::get_mut(&mut slow).unwrap().delay = ReadDelay::Body { polled: polled.clone(), release: release.clone() };
+        let router = RequestClassRouter::new(slow.clone(), slow);
+        let head = router.get_opts(&path, GetOptions::new().with_head(true)).await.unwrap();
+        let head_stats = &STORE_OPS[StoreOp::Head as usize].1;
+        assert_eq!((head_stats.inflight.load(Ordering::Relaxed), head_stats.latency.total()), (0, 1));
+        drop(head);
+        let stats = &STORE_OPS[if range { StoreOp::GetRange } else { StoreOp::Get } as usize].1;
+        let task = tokio::spawn(async move { if range { router.get_range(&path, 1..2).await } else { router.get(&path).await?.bytes().await } });
+        // The consumer has reached the body, so response headers have already returned.
+        polled.notified().await;
+        assert_eq!((stats.inflight.load(Ordering::Relaxed), stats.latency.total()), (1, 0));
+        if cancel {
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+        } else {
+            release.notify_one();
+            assert_eq!(task.await.unwrap().unwrap(), Bytes::from_static(if range { b"b" } else { b"abc" }));
+        }
+        assert_eq!((stats.inflight.load(Ordering::Relaxed), stats.latency.total()), (0, 1));
+    }
+
     /// Removes a test's cache dir when the test ends, including on panic.
     struct CacheDirGuard(PathBuf);
 
@@ -1995,7 +2037,7 @@ mod tests {
     /// A round-trip-counting inner store, with its (heads, gets) counters.
     fn counting_store(inner: &Arc<InMemory>, delay: Duration) -> (Arc<CountingStore>, Arc<AtomicUsize>, Arc<AtomicUsize>) {
         let (heads, gets) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
-        (Arc::new(CountingStore { inner: inner.clone(), heads: heads.clone(), gets: gets.clone(), delay }), heads, gets)
+        (Arc::new(CountingStore { inner: inner.clone(), heads: heads.clone(), gets: gets.clone(), delay: ReadDelay::Headers(delay) }), heads, gets)
     }
 
     fn meta_for(path: &Path, size: u64) -> ObjectMeta {
@@ -2554,6 +2596,12 @@ mod tests {
         Ok(())
     }
 
+    #[derive(Debug)]
+    enum ReadDelay {
+        Headers(Duration),
+        Body { polled: Arc<tokio::sync::Notify>, release: Arc<tokio::sync::Notify> },
+    }
+
     /// Counts S3-equivalent round-trips; `head()` routes through `get_opts`.
     #[derive(Debug, derive_more::Display)]
     #[display("CountingStore")]
@@ -2561,7 +2609,7 @@ mod tests {
         inner: Arc<InMemory>,
         heads: Arc<AtomicUsize>,
         gets: Arc<AtomicUsize>,
-        delay: Duration,
+        delay: ReadDelay,
     }
 
     #[async_trait]
@@ -2580,10 +2628,31 @@ mod tests {
             } else {
                 self.gets.fetch_add(1, Ordering::Relaxed);
             }
-            if !options.head && !self.delay.is_zero() {
-                tokio::time::sleep(self.delay).await;
+            let head = options.head;
+            if !head
+                && let ReadDelay::Headers(delay) = &self.delay
+                && !delay.is_zero()
+            {
+                tokio::time::sleep(*delay).await;
             }
-            self.inner.get_opts(location, options).await
+            let mut result = self.inner.get_opts(location, options).await?;
+            if !head
+                && let ReadDelay::Body { polled, release } = &self.delay
+                && let object_store::GetResultPayload::Stream(stream) = result.payload
+            {
+                use futures::StreamExt;
+                let (polled, release) = (polled.clone(), release.clone());
+                let stream = stream.then(move |chunk| {
+                    let (polled, release) = (polled.clone(), release.clone());
+                    async move {
+                        polled.notify_one();
+                        release.notified().await;
+                        chunk
+                    }
+                });
+                result.payload = object_store::GetResultPayload::Stream(stream.boxed());
+            }
+            Ok(result)
         }
 
         fn delete_stream(&self, locations: BoxStream<'static, ObjectStoreResult<Path>>) -> BoxStream<'static, ObjectStoreResult<Path>> {
