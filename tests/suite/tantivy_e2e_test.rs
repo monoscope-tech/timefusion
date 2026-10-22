@@ -1122,6 +1122,159 @@ async fn wire_page(client: &tokio_postgres::Client, sql: &str, contract: PageCon
 #[test_case(true, true, PageContract::LogExplorer; "browser complete coverage with cold disk")]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_mutable_predicate_narrows_to_candidate_timestamps_without_ghosts(complete: bool, cold_disk: bool, contract: PageContract) -> Result<()> {
+    mutable_candidate_fixture(complete, cold_disk, contract, None).await
+}
+
+#[test_case(false, true, 23; "partial cold at proportional volume")]
+#[test_case(true, true, 23; "complete cold at proportional volume")]
+#[test_case(false, true, 1; "partial cold at calibrated volume")]
+#[test_case(true, true, 1; "complete cold at calibrated volume")]
+#[ignore = "streams a calibrated production-volume browser workload to local MinIO"]
+#[tokio::test(flavor = "multi_thread")]
+async fn log_explorer_at_volume(complete: bool, cold_disk: bool, divisor: usize) -> Result<()> {
+    mutable_candidate_fixture(complete, cold_disk, PageContract::LogExplorer, Some(divisor)).await
+}
+
+/// Background rows never match any registered predicate. Their summaries have
+/// the observed decoded width; exact pages still come from the mutable fixture.
+async fn append_browser_background(db: &Database, project: &str, now: i64, divisor: usize) -> Result<()> {
+    use arrow::array::{ArrayRef, Int64Array, ListBuilder, StringArray, StringBuilder, TimestampMicrosecondArray, UInt32Array, new_null_array};
+    use deltalake::{
+        datafusion::parquet::{
+            basic::{Compression, Encoding, ZstdLevel},
+            file::properties::{EnabledStatistics, WriterProperties},
+            schema::types::ColumnPath,
+        },
+        writer::{DeltaWriter, RecordBatchWriter},
+    };
+    const TABLE: &str = "otel_logs_and_spans";
+    // (days before query end, physical rows, row groups), from the retained
+    // 37-file metadata calibration. The exact failed historical snapshot is unavailable.
+    let layout: Vec<(i64, usize, usize)> = serde_json::from_str(include_str!("../fixtures/log_explorer_volume.json"))?;
+    let schema = timefusion::schema::get_schema(TABLE).expect("schema");
+    let table = db.resolve_table(project, TABLE).await?;
+    let day_micros = 86_400_000_000;
+    let today = now.div_euclid(day_micros) * day_micros;
+    let padding = "x".repeat(479);
+    let started = std::time::Instant::now();
+    let mut total_rows = 0;
+    for (file, &(age, physical_rows, groups)) in layout.iter().enumerate() {
+        let rows = physical_rows.div_ceil(divisor);
+        let lower = (today - age * day_micros).max(now - 14 * day_micros);
+        let upper = (today - (age - 1) * day_micros).min(now);
+        let step = (upper - lower) / i64::try_from(rows + 1)?;
+        anyhow::ensure!(step > 0, "the selected date span must fit strictly ordered synthetic timestamps");
+        let date = chrono::DateTime::from_timestamp_micros(lower).unwrap().date_naive().to_string();
+        let template = timefusion::support::test_helpers::json_to_batch_for(
+            TABLE,
+            vec![json!({
+                "project_id": project, "date": date, "timestamp": lower, "id": "template", "name": "background",
+                "hashes": ["volume-nonmatching"], "summary": [], "resource___service___name": "browser-background",
+                "duration": 1200, "start_time": lower, "kind": "span", "level": "ERROR", "severity___severity_number": 17
+            })],
+        )?;
+        let properties = WriterProperties::builder()
+            .set_compression(Compression::ZSTD(ZstdLevel::try_new(3)?))
+            .set_max_row_group_row_count(Some(rows.div_ceil(groups)))
+            .set_dictionary_page_size_limit(8_388_608)
+            .set_statistics_enabled(EnabledStatistics::Chunk)
+            .set_column_statistics_enabled(ColumnPath::from("timestamp"), EnabledStatistics::Page)
+            .set_data_page_row_count_limit(db.config().parquet.timefusion_page_row_count_limit)
+            .set_sorting_columns(Some(schema.sorting_columns()));
+        // Match the production writer's encoding choices without exposing its
+        // private factory just for this integration fixture.
+        let properties = schema
+            .fields
+            .iter()
+            .fold(properties, |builder, field| {
+                let column = ColumnPath::from(field.name.as_str());
+                let time_like = field.data_type.starts_with("Timestamp") || field.data_type == "Date32";
+                let sort_key = schema.sorting_columns.iter().any(|sort| sort.name == field.name);
+                let builder = if time_like || sort_key { builder.set_column_statistics_enabled(column.clone(), EnabledStatistics::Page) } else { builder };
+                let builder = match field.data_type.as_str() {
+                    _ if time_like => {
+                        builder.set_column_encoding(column.clone(), Encoding::DELTA_BINARY_PACKED).set_column_dictionary_enabled(column.clone(), false)
+                    }
+                    "Int32" | "Int64" | "UInt32" | "UInt64" => builder.set_column_encoding(column.clone(), Encoding::DELTA_BINARY_PACKED),
+                    "Utf8" if sort_key => {
+                        builder.set_column_encoding(column.clone(), Encoding::DELTA_BYTE_ARRAY).set_column_dictionary_enabled(column.clone(), false)
+                    }
+                    _ => builder,
+                };
+                if field.dictionary == Some(false) { builder.set_column_dictionary_enabled(column, false) } else { builder }
+            })
+            .build();
+        let mut delta = table.write().await;
+        let mut writer = RecordBatchWriter::for_table(&delta)?.with_writer_properties(properties);
+        for high in (0..rows).rev().step_by(8192) {
+            let low = (high + 1).saturating_sub(8192);
+            let keys: Vec<_> = (low..=high).rev().collect();
+            let hash = |seed: u64, row: usize| twox_hash::XxHash64::oneshot(seed + 2 * file as u64, &row.to_le_bytes());
+            let timestamps: ArrayRef = Arc::new(
+                TimestampMicrosecondArray::from_iter_values(keys.iter().map(|&row| lower + (row + 1) as i64 * step + (hash(0, row) % step as u64) as i64))
+                    .with_timezone("UTC"),
+            );
+            let ids = StringArray::from_iter_values(keys.iter().map(|&row| uuid::Uuid::from_u64_pair(hash(0, row), hash(1, row)).to_string()));
+            let mut summaries = ListBuilder::new(StringBuilder::new());
+            let mut hashes = ListBuilder::new(StringBuilder::new());
+            for (row, &key) in keys.iter().enumerate() {
+                summaries.values().append_value(format!("{} {padding}", ids.value(row)));
+                summaries.append(true);
+                hashes.values().append_value(format!("noise-{:03x}", hash(6, key / 2) % 4096));
+                hashes.values().append_value("volume-nonmatching");
+                hashes.append(true);
+            }
+            let sources: std::collections::HashMap<&str, ArrayRef> = [
+                ("timestamp", Arc::clone(&timestamps)),
+                ("start_time", timestamps),
+                ("id", Arc::new(ids) as ArrayRef),
+                ("summary", Arc::new(summaries.finish()) as ArrayRef),
+                ("hashes", Arc::new(hashes.finish()) as ArrayRef),
+                (
+                    "context___span_id",
+                    Arc::new(StringArray::from_iter(keys.iter().map(|&row| (row % 5 != 0).then(|| format!("{:016x}", hash(2, row)))))) as ArrayRef,
+                ),
+                ("parent_id", Arc::new(StringArray::from_iter(keys.iter().map(|&row| (row % 9 < 5).then(|| format!("{:016x}", hash(3, row)))))) as ArrayRef),
+                (
+                    "context___trace_id",
+                    Arc::new(StringArray::from_iter_values(
+                        keys.iter().map(|&row| uuid::Uuid::from_u64_pair(hash(4, row / 8), hash(7, row / 8)).simple().to_string()),
+                    )) as ArrayRef,
+                ),
+                ("duration", Arc::new(Int64Array::from_iter_values(keys.iter().map(|&row| (hash(5, row) % 3_600_000_000) as i64))) as ArrayRef),
+            ]
+            .into();
+            let indices = UInt32Array::from(vec![0; keys.len()]);
+            let mut nulls = std::collections::HashMap::new();
+            let columns = template
+                .schema()
+                .fields()
+                .iter()
+                .enumerate()
+                .map(|(index, field)| match sources.get(field.name().as_str()) {
+                    Some(array) => arrow::compute::cast(array, field.data_type()),
+                    None if template.column(index).is_null(0) => {
+                        Ok(Arc::clone(nulls.entry(field.data_type().clone()).or_insert_with(|| new_null_array(field.data_type(), keys.len()))))
+                    }
+                    None => arrow::compute::take(template.column(index).as_ref(), &indices, None),
+                })
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let batch = RecordBatch::try_new(template.schema(), columns)?;
+            writer.write(deltalake::kernel::schema::cast_record_batch(&batch, writer.arrow_schema(), true, true)?).await?;
+        }
+        writer.flush_and_commit(&mut delta).await?;
+        total_rows += rows;
+        eprintln!("browser_volume_prepare file={} rows={rows} total_rows={total_rows} elapsed_ms={}", file + 1, started.elapsed().as_millis());
+    }
+    eprintln!(
+        "browser_volume_input background_rows={total_rows} background_files={} divisor={divisor} summary_bytes=516 table_uri={}",
+        layout.len(),
+        table.read().await.table_url()
+    );
+    Ok(())
+}
+
+async fn mutable_candidate_fixture(complete: bool, cold_disk: bool, contract: PageContract, background_divisor: Option<usize>) -> Result<()> {
     use object_store::ObjectStoreExt;
     use timefusion::{
         database::scan_metric_names::PREFILTER_MUTABLE_CANDIDATES,
@@ -1133,8 +1286,13 @@ async fn a_mutable_predicate_narrows_to_candidate_timestamps_without_ghosts(comp
         PageContract::IssueSample => (3, 4),
         PageContract::LogExplorer => (14 * 24, 90),
     };
+    // The calibrated partial case leaves over 6 GiB unindexed, above the
+    // existing 512 MiB planning-read cap. It must keep the exact raw fallback.
+    // Normal and proportional cases still require timestamp narrowing.
+    let requires_raw_fallback = !complete && background_divisor == Some(1);
     let id = uuid::Uuid::new_v4().to_string()[..8].to_string();
     let (on, ctx, svc) = build_db_with(&format!("{id}-mutcand-on"), true, |cfg| {
+        cfg.core.timefusion_pgwire_max_statement_secs = budget_secs;
         // The fixture's derived TantivyConfig::default has a one-reader floor;
         // use the production capacity so the warm pass does not thrash it.
         let production = AppConfig::default().tantivy;
@@ -1144,7 +1302,7 @@ async fn a_mutable_predicate_narrows_to_candidate_timestamps_without_ghosts(comp
         cfg.tantivy.timefusion_tantivy_block_cache_mb = production.timefusion_tantivy_block_cache_mb;
     })
     .await?;
-    let (off, ctx_off, _) = build_db(&format!("{id}-mutcand-off"), false).await?;
+    let (off, ctx_off, _) = build_db_with(&format!("{id}-mutcand-off"), false, |cfg| cfg.core.timefusion_pgwire_max_statement_secs = budget_secs).await?;
     let (p, table, hash) = (unique_project(), "otel_logs_and_spans", "pat:E12e74a9");
     let now = chrono::Utc::now().timestamp_micros();
     let row = |id: &str, minutes: i64, h: &str| {
@@ -1171,6 +1329,9 @@ async fn a_mutable_predicate_narrows_to_candidate_timestamps_without_ghosts(comp
     };
     let fillers = |n: i64| (0..n).map(|i| row(&format!("f{i}"), 60 + i, "other")).collect::<Vec<_>>();
     for db in [&on, &off] {
+        if let Some(divisor) = background_divisor {
+            append_browser_background(db, &p, now, divisor).await?;
+        }
         // Unindexed (direct) file: `ghost`'s older matching version, and `solo`, matching only here.
         let older = match contract {
             PageContract::IssueSample => Vec::new(),
@@ -1274,7 +1435,7 @@ async fn a_mutable_predicate_narrows_to_candidate_timestamps_without_ghosts(comp
     let stop = tokio_util::sync::CancellationToken::new();
     let mut tasks = tokio::task::JoinSet::new();
     let mut clients = Vec::new();
-    for context in [ctx.clone(), ctx_off.clone()] {
+    for (context, db) in [(ctx.clone(), on.clone()), (ctx_off.clone(), off.clone())] {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let port = listener.local_addr()?.port();
         let shutdown = stop.clone().cancelled_owned();
@@ -1285,7 +1446,7 @@ async fn a_mutable_predicate_narrows_to_candidate_timestamps_without_ghosts(comp
                 &datafusion_postgres::ServerOptions::new(),
                 timefusion::server::AuthConfig { username: "postgres".into(), password: Some("test".into()) },
                 None,
-                None,
+                Some(Arc::new(db)),
                 shutdown,
             )
             .await
@@ -1294,6 +1455,15 @@ async fn a_mutable_predicate_narrows_to_candidate_timestamps_without_ghosts(comp
         let (client, connection) = tokio_postgres::connect(&format!("host=127.0.0.1 port={port} user=postgres password=test"), tokio_postgres::NoTls).await?;
         tasks.spawn(async move { connection.await.map_err(anyhow::Error::from) });
         client.batch_execute(&format!("SET statement_timeout = '{budget_secs}s'")).await?;
+        let expected_timeout = format!("{}ms", budget_secs * 1000);
+        assert!(
+            client
+                .simple_query("SHOW statement_timeout")
+                .await?
+                .iter()
+                .any(|message| matches!(message, tokio_postgres::SimpleQueryMessage::Row(row) if row.get(0) == Some(expected_timeout.as_str()))),
+            "the wire server must enforce the captured {budget_secs}-second deadline"
+        );
         clients.push(client);
     }
     let iso = |time| chrono::DateTime::from_timestamp_micros(time).unwrap().format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string();
@@ -1303,6 +1473,7 @@ async fn a_mutable_predicate_narrows_to_candidate_timestamps_without_ghosts(comp
     let range_bytes = || search.stats.range_read_bytes.load(std::sync::atomic::Ordering::Relaxed);
     let mut warm_opens = 0;
     let mut warm_bytes = 0;
+    let mut cancellation_sql = None;
     for pass in 0..2 {
         for (tag, trace) in [
             (hash, Some("trace-kept")),
@@ -1332,30 +1503,53 @@ async fn a_mutable_predicate_narrows_to_candidate_timestamps_without_ghosts(comp
                 iso(now - window_hours * 3_600_000_000),
                 iso(now)
             );
+            if background_divisor.is_some() && pass == 0 && tag == hash {
+                cancellation_sql = Some(sql.clone());
+            }
             let before = counter_value(PREFILTER_MUTABLE_CANDIDATES);
             let bytes = deltalake::delta_datafusion::parquet_metrics::snapshot().bytes_read;
             let index_before = range_bytes();
             let phases: Vec<_> = timefusion::observability::plan_phases().collect();
             let started = std::time::Instant::now();
-            let (actual, first_row) = tokio::time::timeout(std::time::Duration::from_secs(budget_secs + 1), wire_page(&clients[0], &sql, contract)).await??;
+            let page = tokio::time::timeout(std::time::Duration::from_secs(budget_secs + 1), wire_page(&clients[0], &sql, contract)).await;
             let elapsed = started.elapsed();
-            assert!(elapsed < std::time::Duration::from_secs(budget_secs), "{contract:?} must retain its captured deadline");
-            assert_eq!(counter_value(PREFILTER_MUTABLE_CANDIDATES), before + 1, "foreign files must not disable scoped candidate collection");
             let cost: Vec<_> = timefusion::observability::plan_phases()
                 .zip(phases)
                 .map(|((phase, us, calls), (_, old_us, old_calls))| (phase, us - old_us, calls - old_calls))
                 .collect();
             let read_bytes = deltalake::delta_datafusion::parquet_metrics::snapshot().bytes_read - bytes;
-            assert!(read_bytes <= 4 * own_delta_bytes, "planning plus execution must stay bounded by this project's physical files");
             let index_read_bytes = range_bytes() - index_before;
+            if !matches!(page, Ok(Ok(_))) {
+                eprintln!(
+                    "{contract:?} failed complete={complete} cold_disk={cold_disk} pass={pass} tag={tag} elapsed_us={} parquet_bytes={read_bytes} index_range_bytes={index_read_bytes} phases={cost:?} outcome={:?}",
+                    elapsed.as_micros(),
+                    page.as_ref().map(|result| result.as_ref().map(|_| ()))
+                );
+            }
+            let (actual, first_row) = page??;
+            assert!(elapsed < std::time::Duration::from_secs(budget_secs), "{contract:?} must retain its captured deadline");
+            assert_eq!(
+                counter_value(PREFILTER_MUTABLE_CANDIDATES),
+                before + u64::from(!requires_raw_fallback),
+                "candidate admission must preserve the planning-read cap"
+            );
+            assert!(read_bytes <= 4 * own_delta_bytes, "planning plus execution must stay bounded by this project's physical files");
             assert!(index_read_bytes <= 4 * index_bytes, "range reads must stay bounded by this project's index objects");
             assert_eq!(search.stats.blob_fetches.load(std::sync::atomic::Ordering::Relaxed), 0, "sample queries must not install whole blobs");
             eprintln!(
                 "{contract:?} complete={complete} cold_disk={cold_disk} pass={pass} tag={tag} elapsed_us={} first_row={first_row:?} parquet_bytes={read_bytes} index_range_bytes={index_read_bytes} phases={cost:?}",
                 elapsed.as_micros()
             );
-            let (oracle, _) = tokio::time::timeout(std::time::Duration::from_secs(budget_secs + 1), wire_page(&clients[1], &sql, contract)).await??;
-            assert_eq!(counter_value(PREFILTER_MUTABLE_CANDIDATES), before + 1, "oracle must not use the candidate path");
+            let oracle_bytes = deltalake::delta_datafusion::parquet_metrics::snapshot().bytes_read;
+            let oracle_started = std::time::Instant::now();
+            let (oracle, oracle_first_row) =
+                tokio::time::timeout(std::time::Duration::from_secs(budget_secs + 1), wire_page(&clients[1], &sql, contract)).await??;
+            eprintln!(
+                "{contract:?} raw_oracle pass={pass} tag={tag} elapsed_us={} first_row={oracle_first_row:?} parquet_bytes={}",
+                oracle_started.elapsed().as_micros(),
+                deltalake::delta_datafusion::parquet_metrics::snapshot().bytes_read - oracle_bytes
+            );
+            assert_eq!(counter_value(PREFILTER_MUTABLE_CANDIDATES), before + u64::from(!requires_raw_fallback), "oracle must not use the candidate path");
             assert_eq!(actual, oracle, "pass {pass}: all projected values must match the full latest-visible-row oracle for {tag}");
             assert_eq!(actual.first().and_then(|row| row[2].as_str()), trace, "pass {pass}: expected visible winner for {tag}");
             let expected_len = match (contract, tag) {
@@ -1409,6 +1603,42 @@ async fn a_mutable_predicate_narrows_to_candidate_timestamps_without_ghosts(comp
             assert_eq!(range_bytes(), warm_bytes, "warm repetition must reuse bundle blocks");
         }
     }
+    if let Some(sql) = cancellation_sql {
+        let runtime = ctx_off.runtime_env();
+        let token = clients[1].cancel_token();
+        let query = wire_page(&clients[1], &sql, contract);
+        futures::pin_mut!(query);
+        let reserved = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut tick = tokio::time::interval(std::time::Duration::from_millis(1));
+            loop {
+                tokio::select! {
+                    result = &mut query => { result?; anyhow::bail!("browser query completed before an observable reservation"); },
+                    _ = tick.tick() => {
+                        let bytes = runtime.memory_pool.reserved();
+                        if bytes > 0 { break anyhow::Ok(bytes); }
+                    }
+                }
+            }
+        })
+        .await??;
+        let canceled = std::time::Instant::now();
+        token.cancel_query(tokio_postgres::NoTls).await?;
+        let error = tokio::time::timeout(std::time::Duration::from_secs(5), &mut query).await?.expect_err("the browser query must acknowledge cancellation");
+        assert_eq!(error.downcast_ref::<tokio_postgres::Error>().and_then(|error| error.code()), Some(&tokio_postgres::error::SqlState::QUERY_CANCELED));
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while runtime.memory_pool.reserved() != 0 || runtime.disk_manager.used_disk_space() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        let release_ms = canceled.elapsed().as_millis();
+        assert_eq!(clients[1].query_one("SELECT 42::BIGINT", &[]).await?.get::<_, i64>(0), 42, "the canceled connection must remain usable");
+        eprintln!(
+            "browser_volume_canceled reserved_before={reserved} release_ms={release_ms} reserved_after={} spill_after={}",
+            runtime.memory_pool.reserved(),
+            runtime.disk_manager.used_disk_space()
+        );
+    }
     drop(clients);
     stop.cancel();
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -1429,12 +1659,17 @@ async fn a_mutable_predicate_narrows_to_candidate_timestamps_without_ghosts(comp
             now - 3 * 3_600_000_000
         );
         let before = counter_value(PREFILTER_MUTABLE_CANDIDATES);
-        let (ids, narrowed) = ids_and_dedup_input(&ctx, &sql).await?;
-        assert_eq!(counter_value(PREFILTER_MUTABLE_CANDIDATES), before + 1, "{predicate} must take the candidate path");
+        let (ids, narrowed) = tokio::time::timeout(std::time::Duration::from_secs(budget_secs), ids_and_dedup_input(&ctx, &sql)).await??;
+        assert_eq!(counter_value(PREFILTER_MUTABLE_CANDIDATES), before + u64::from(!requires_raw_fallback), "{predicate} must preserve candidate admission");
         assert_eq!(ids, ["kept", "late", "solo"], "{predicate}");
-        let (baseline, full) = ids_and_dedup_input(&ctx_off, &sql).await?;
+        let (baseline, full) = tokio::time::timeout(std::time::Duration::from_secs(budget_secs), ids_and_dedup_input(&ctx_off, &sql)).await??;
         assert_eq!(ids, baseline);
-        assert!(narrowed <= 8 && full >= 60, "{predicate}: dedup must see only candidate versions: {narrowed} vs {full}");
+        if requires_raw_fallback {
+            assert_eq!(narrowed, full, "{predicate}: over-budget input must retain the exact raw fallback");
+        } else {
+            assert!(narrowed <= 8, "{predicate}: dedup must see only candidate versions: {narrowed} vs {full}");
+        }
+        assert!(full >= 60, "{predicate}: the raw oracle must retain its full input");
     }
     // Over the cap the search is refused, and a page polling the same hash must not pay it again.
     let search = on.tantivy_search().expect("search service");

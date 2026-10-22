@@ -32,6 +32,12 @@ final-status-level = "slow"
 filter = 'binary(e2e)'
 slow-timeout = { period = "30s", terminate-after = 8 }
 
+# These ignored manual cases prepare two 91-million-row stores before querying.
+# Preparation alone exceeds 600s; each query retains its own 90s deadline.
+[[profile.default.overrides]]
+filter = 'binary(suite) & test(/log_explorer_at_volume::.*_at_calibrated_volume$/)'
+slow-timeout = { period = "60s", terminate-after = 120 }
+
 # The longest fixtures start first, so the suite's tail is the slowest test
 # rather than whichever long test happened to be scheduled last. Each is one
 # CPU-bound thread (~170 MB), so they run alongside everything else: capping

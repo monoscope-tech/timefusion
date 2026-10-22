@@ -581,8 +581,8 @@ mod tests {
         /// only delay opening an input, so a tie on `ts` across inputs still merges whole.
         #[test]
         fn merges_exactly_like_sort_preserving_merge(
-            partitions in proptest::collection::vec(proptest::collection::vec((0..12i64, 0..4i64), 0..12), 1..7),
-            unbounded in proptest::collection::vec(proptest::bool::ANY, 7),
+            partitions in proptest::collection::vec(proptest::collection::vec((0..12i64, 0..4i64), 0..12), 1..39),
+            unbounded in proptest::collection::vec(proptest::bool::ANY, 39),
             chunk in 1..5usize,
             fetch in proptest::option::of(0..20usize),
         ) {
@@ -610,6 +610,26 @@ mod tests {
         let metrics = merge.metrics().unwrap();
         let opened = metrics.sum_by_name("inputs_opened").map(|m| m.as_usize());
         assert_eq!(opened, Some(INITIAL_READ_AHEAD), "only the read-ahead window may open; metrics: {metrics}");
+    }
+
+    #[test_case::test_case(None => vec![0, 1]; "all rows")]
+    #[test_case::test_case(Some(1) => vec![0]; "fetch")]
+    #[tokio::test]
+    async fn equal_keys_keep_partition_order_when_bounds_open_the_later_partition_first(fetch: Option<usize>) -> Vec<i64> {
+        let schema = Arc::new(Schema::new(["ts", "id", "payload"].map(|name| Field::new(name, DataType::Int64, false)).to_vec()));
+        let batches = (0..2)
+            .map(|partition| {
+                vec![RecordBatch::try_new(Arc::clone(&schema), [50, 0, partition].map(|value| Arc::new(Int64Array::from(vec![value])) as _).to_vec()).unwrap()]
+            })
+            .collect::<Vec<_>>();
+        let input = MemorySourceConfig::try_new_exec(&batches, schema, None).unwrap();
+        let plan = Arc::new(BoundedMergeExec::new(input, ordering(), vec![Some(50), Some(51)], fetch));
+        datafusion::physical_plan::collect(plan, Arc::new(TaskContext::default()))
+            .await
+            .unwrap()
+            .iter()
+            .flat_map(|batch| batch.column(2).as_primitive::<Int64Type>().values().to_vec())
+            .collect()
     }
 }
 
