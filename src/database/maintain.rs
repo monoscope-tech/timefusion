@@ -7864,6 +7864,7 @@ impl Database {
     /// Bank completed clean windows before the shared phase deadline can cancel
     /// the probe. Only certification-only groups use this path: a dirty-bin
     /// classifier still needs the complete set before it can dequeue clean bins.
+    /// A nonempty result contains discovered dirty bins, not a whole-date census.
     /// `None` means the input moved; no partition verdict is available.
     async fn probe_uncertified_slices(
         &self, table: &Arc<RwLock<DeltaTable>>, table_name: &str, project: &str, date_str: &str, pre: &crate::read::CountFiles,
@@ -7894,6 +7895,7 @@ impl Database {
         // probe when metadata cannot bound every file inside this day.
         if (!resuming && decoded_bytes <= crate::maintenance_coordinator::MAX_DECODED_BYTES)
             || pre.is_empty()
+            || files.len() != pre.len()
             || !schema_or_default(table_name).dedup_keys.iter().any(|key| key == "timestamp")
             || spans.len() != pre.len()
             || !spans.iter().all(|span| span.is_some_and(|(lo, hi)| lo >= day_start && lo <= hi && hi < day_end))
