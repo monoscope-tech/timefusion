@@ -7,12 +7,12 @@ Credentials come from .env.prod by default and are never included in the report.
 
 import argparse
 import collections
-from concurrent.futures import ThreadPoolExecutor
 import datetime
 import json
-from pathlib import Path
 import re
 import uuid
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import boto3
 from botocore.exceptions import ClientError
@@ -31,14 +31,18 @@ def load_manifest(client, bucket, prefix):
 
     root = get_json(f"{prefix}/shards/_root.json")
     if root is None:
-        return get_json(f"{prefix}/manifest.json"), "legacy"
+        return get_json(f"{prefix}/manifest.json"), "legacy", []
     entries = {}
+    missing_shards = []
     with ThreadPoolExecutor(max_workers=8) as pool:
-        shards = pool.map(lambda date: get_json(f"{prefix}/shards/{date}.json"), sorted(root["shards"]))
-        for shard in shards:
-            if shard is not None:
+        names = sorted(root["shards"])
+        shards = pool.map(lambda date: get_json(f"{prefix}/shards/{date}.json"), names)
+        for name, shard in zip(names, shards):
+            if shard is None:
+                missing_shards.append(name)
+            else:
                 entries.update(shard["entries"])
-    return {"version": root["version"], "entries": entries}, "sharded"
+    return {"version": root["version"], "entries": entries}, "sharded", missing_shards
 
 
 def audit(project, env_file):
@@ -54,7 +58,7 @@ def audit(project, env_file):
         "s3", endpoint_url=env["AWS_S3_ENDPOINT"], region_name=env["AWS_REGION"],
         aws_access_key_id=env["AWS_ACCESS_KEY_ID"], aws_secret_access_key=env["AWS_SECRET_ACCESS_KEY"],
     )
-    manifest, manifest_format = load_manifest(client, bucket, f"index_manifests/{table_name}/{project}")
+    manifest, manifest_format, missing_shards = load_manifest(client, bucket, f"index_manifests/{table_name}/{project}")
     if manifest is None or manifest.get("version") != 1:
         raise ValueError("Missing or unsupported manifest version")
     options = {key: env[key] for key in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_REGION")}
@@ -117,13 +121,13 @@ def audit(project, env_file):
     for date, day in days.items():
         day["age_class"] = "future" if date > today else "today" if date == today else "sealed"
     return {
-        "at": at.isoformat(), "manifest_format": manifest_format,
+        "at": at.isoformat(), "manifest_format": manifest_format, "missing_shards": missing_shards,
         "project": project, "delta_version": table.version(), "live_project_files": len(live),
         "manifest_entries": len(entries),
         "manifest_hash_entries": sum("hashes" in entry.get("element_fields", []) for entry in entries.values()),
         "by_date": dict(sorted(days.items())),
         "files": file_details,
-        "limitations": "Delta and manifest read independently. Project URIs are cross-checked against add actions. Physical candidates require one-file URI/schema/ordinal metadata plus exact hash elements or a declared body field. Body index candidates also include carried coverage without physical ordinals. Index contents are not decoded. Compressed file bytes are not projected I/O, query latency, or build cost.",
+        "limitations": "Delta, manifest root and shards are independent reads. Project URIs are cross-checked against add actions. Age classes use UTC partition dates. Physical candidates require one-file URI/schema/ordinal metadata plus exact hash elements or a declared body field. Body index candidates also include carried coverage without physical ordinals. Index contents are not decoded. Compressed file bytes are not projected I/O, query latency, or build cost.",
     }
 
 
