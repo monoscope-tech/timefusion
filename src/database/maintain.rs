@@ -10814,6 +10814,78 @@ mod certify_on_completion_tests {
 
     const TABLE: &str = "otel_logs_and_spans";
 
+    #[test_case::test_case(false, false; "clean remainder")]
+    #[test_case::test_case(true, false; "dirty remainder")]
+    #[test_case::test_case(false, true; "changed proved prefix")]
+    #[serial]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn certification_probe_reuses_persisted_clean_prefix(late_duplicate: bool, change_prefix: bool) -> Result<()> {
+        let cfg = TestConfigBuilder::new("certification_probe_resume").build();
+        let db = Database::with_config(cfg.clone()).await?;
+        let project = uuid::Uuid::new_v4().to_string();
+        let date = chrono::Utc::now().date_naive() - chrono::Duration::days(1);
+        let day = day_slice(date);
+        let early = day.start_micros + 3_600_000_000;
+        let late = day.start_micros + 13 * 3_600_000_000;
+        let records = (0..2_000).map(|i| test_span_ts(&format!("early-{i}"), "early", &project, early + i)).collect();
+        db.insert_records_batch(&project, TABLE, vec![json_to_batch(records)?], true, None).await?;
+        for id in ["late", if late_duplicate { "late" } else { "other" }] {
+            db.insert_records_batch(&project, TABLE, vec![json_to_batch(vec![test_span_ts(id, "late", &project, late)])?], true, None).await?;
+        }
+        let table = db.resolve_table(&project, TABLE).await?;
+        let full_rows = SCAN_CAPTURE
+            .scope(std::cell::RefCell::new(Vec::new()), async {
+                let dirty = db.probe_dup_bins(&table, TABLE, &project, &date.to_string()).await?;
+                assert_eq!(dirty.is_empty(), !late_duplicate);
+                assert!(dirty.iter().all(|bin| *bin >= (day.start_micros + 12 * 3_600_000_000) / crate::database::compact::bin_micros()));
+                anyhow::Ok(SCAN_CAPTURE.with(|passes| passes.borrow().iter().map(|pass| pass.output_rows).sum::<u64>()))
+            })
+            .await?;
+        assert!(full_rows >= 2_000, "the full probe must observe the prefix");
+        let (files, visibility) = {
+            let table = table.read().await;
+            (
+                Database::partition_files_by_pid(&table, &format!("date={date}"))?.remove(&project).unwrap(),
+                Database::logical_count_partition_snapshot(&table, &project, &date.to_string())?.1,
+            )
+        };
+        let prefix = crate::maintenance_coordinator::TimeSlice { start_micros: day.start_micros, end_micros: day.start_micros + 12 * 3_600_000_000 };
+        assert!(db.record_clean_slice(&table, TABLE, &project, date, (prefix, 0, None), (&files, &visibility)).await?.is_none());
+        drop(table);
+        drop(db);
+
+        let db = Database::with_config(cfg).await?;
+        let table = db.resolve_table(&project, TABLE).await?;
+        let key = (project.clone(), TABLE.to_owned(), date.to_string());
+        assert_eq!(db.dedup_slice_coverage.get(&key).expect("the checkpoint survives restart").intervals, [(prefix.start_micros, prefix.end_micros)]);
+        if change_prefix {
+            db.insert_records_batch(&project, TABLE, vec![json_to_batch(vec![test_span_ts("early-0", "changed", &project, early)])?], true, None).await?;
+        }
+        let scanned_rows = SCAN_CAPTURE
+            .scope(std::cell::RefCell::new(Vec::new()), async {
+                assert!(
+                    db.batch_probe_classify(
+                        &table,
+                        TABLE,
+                        Vec::new(),
+                        vec![(project.clone(), date.to_string())],
+                        std::time::Instant::now() + std::time::Duration::from_secs(30)
+                    )
+                    .await
+                    .is_empty()
+                );
+                SCAN_CAPTURE.with(|passes| passes.borrow().iter().map(|pass| pass.output_rows).sum::<u64>())
+            })
+            .await;
+        let dirty = late_duplicate || change_prefix;
+        assert_eq!(db.dedup_clean_fp.get(&key).is_some_and(|proof| !proof.stale), !dirty);
+        assert_eq!(db.dedup_probe_declined.contains_key(&key), dirty);
+        if !change_prefix {
+            assert!(scanned_rows < 100, "the two remaining rows must not rescan the 2,000 proved rows: {scanned_rows} operator rows");
+        }
+        Ok(())
+    }
+
     #[test_case::test_case(false; "covered bin first")]
     #[test_case::test_case(true; "covered bin last")]
     #[serial]
