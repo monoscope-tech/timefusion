@@ -2538,35 +2538,53 @@ mod ordered_probe_contract_tests {
 
     /// Match the observed file/row-group overlap without scanning production rows.
     /// The oracle counts raw keys before any DataFusion grouping or read-side dedup.
-    #[test_case::test_case(true, false ; "ordered overlapping files")]
-    #[test_case::test_case(false, false ; "unordered fallback")]
-    #[test_case::test_case(true, true ; "ordered full overlap")]
+    #[test_case::test_case("otel_logs_and_spans", true, false ; "ordered overlapping logs")]
+    #[test_case::test_case("otel_logs_and_spans", false, false ; "unordered logs fallback")]
+    #[test_case::test_case("otel_logs_and_spans", true, true ; "ordered logs full overlap")]
+    #[test_case::test_case("otel_metrics", true, false ; "ordered overlapping metrics")]
+    #[test_case::test_case("otel_metrics", false, false ; "unordered metrics fallback")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn whole_date_probe_matches_raw_keys_across_overlapping_files(ordered: bool, full_overlap: bool) -> Result<()> {
-        const TABLE: &str = "otel_logs_and_spans";
+    async fn whole_date_probe_matches_raw_keys_across_overlapping_files(table_name: &str, ordered: bool, full_overlap: bool) -> Result<()> {
+        let metrics = table_name == "otel_metrics";
         let db = Database::with_config(TestConfigBuilder::new("ordered-probe-contract").build()).await?;
         db.cancel_maintenance();
         let project = format!("probe_{}", uuid::Uuid::new_v4().simple());
-        let day = chrono::NaiveDate::from_ymd_opt(2026, 8, 10).unwrap();
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 8, if metrics { 31 } else { 10 }).unwrap();
         let start = day.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_micros();
-        let table = db.resolve_table(&project, TABLE).await?;
-        let schema = schema_or_default(TABLE);
+        let table = db.resolve_table(&project, table_name).await?;
+        let schema = schema_or_default(table_name);
         let mut counts = std::collections::HashMap::new();
-        for file in 0..23 {
-            let rows = probe_file_row_groups(file, full_overlap) * 64;
+        let row_groups: Vec<_> = if metrics { vec![42, 42, 48, 37] } else { (0..23).map(|file| probe_file_row_groups(file, full_overlap)).collect() };
+        for (file, groups) in row_groups.iter().enumerate() {
+            let rows = groups * 64;
             let records = (0..rows)
                 .map(|row| {
                     let key = if full_overlap { row } else { file * 128 + row };
-                    let ts = start + (key / 3) as i64 * if full_overlap { 6_000_000 } else { 3_000_000 };
-                    let service = (key % 7 != 0).then_some("api");
+                    let ts = start
+                        + (key / 3) as i64
+                            * if metrics {
+                                72_000_000
+                            } else if full_overlap {
+                                6_000_000
+                            } else {
+                                3_000_000
+                            };
+                    let service =
+                        if metrics { Some(["asyncio.process.created", "cpu.usage", "http.server.duration"][key % 3]) } else { (key % 7 != 0).then_some("api") };
                     let identity_file = if full_overlap { if key % 2 == 0 { file / 2 } else { file + 23 } } else { 0 };
                     let id = format!("id-{}-{identity_file}", key % 17);
                     *counts.entry((ts, service, id.clone())).or_insert(0i64) += 1;
-                    serde_json::json!({"project_id": project, "date": day.to_string(), "timestamp": ts,
-                        "resource___service___name": service, "id": id, "level": "INFO", "status_code": "UNSET", "hashes": [], "summary": []})
+                    if metrics {
+                        serde_json::json!({"project_id": project, "date": day.to_string(), "timestamp": ts, "ingested_at": ts,
+                            "metric_name": service, "series_id": id, "id": format!("point-{file}-{row}"), "metric_unit": "1", "metric_type": "gauge",
+                            "flags": 0, "dropped_attributes_count": 0, "message_size_bytes": 0})
+                    } else {
+                        serde_json::json!({"project_id": project, "date": day.to_string(), "timestamp": ts,
+                            "resource___service___name": service, "id": id, "level": "INFO", "status_code": "UNSET", "hashes": [], "summary": []})
+                    }
                 })
                 .collect();
-            let batch = json_to_batch_for(TABLE, records)?;
+            let batch = json_to_batch_for(table_name, records)?;
             let batches = if ordered { sort_batches_by_schema_reference(schema, vec![batch]).0 } else { vec![batch] };
             let properties = db.create_writer_properties(schema, 3, ordered).into_builder().set_max_row_group_row_count(Some(64)).build();
             let mut delta = table.write().await;
@@ -2579,12 +2597,18 @@ mod ordered_probe_contract_tests {
         }
         let expected: HashSet<_> = counts.iter().filter(|(_, n)| **n > 1).map(|((ts, _, _), _)| ts / 600_000_000).collect();
         assert!(expected.len() > 5, "duplicates must span several ten-minute bins");
-        let ctx = db.dedup_probe_ctx(&table, TABLE, &project, &day.to_string(), None).await?;
+        let ctx = db.dedup_probe_ctx(&table, table_name, &project, &day.to_string(), None).await?;
+        let (subject, identity) = if metrics { ("metric_name", "series_id") } else { ("resource___service___name", "id") };
+        let keys = quoted_csv(&schema.dedup_keys);
         let sql = format!(
-            "SELECT timestamp, resource___service___name, id, count(*) FROM {DEDUP_SCAN_NAME} \
-             WHERE project_id = '{project}' AND date = DATE '2026-08-10' GROUP BY timestamp, resource___service___name, id"
+            "SELECT timestamp, {subject}, {identity}, count(*) FROM {DEDUP_SCAN_NAME} \
+             WHERE project_id = '{project}' AND date = DATE '{day}' GROUP BY {keys}"
         );
         let plan = ctx.sql(&sql).await?.create_physical_plan().await?;
+        eprintln!(
+            "table={table_name} ordered={ordered} file_row_groups={row_groups:?}\n{}",
+            datafusion::physical_plan::displayable(plan.as_ref()).indent(true)
+        );
         let mut aggregates = 0;
         plan.apply(|node| {
             if let Some(repartition) = node.downcast_ref::<RepartitionExec>() {
@@ -2597,7 +2621,6 @@ mod ordered_probe_contract_tests {
             Ok(TreeNodeRecursion::Continue)
         })?;
         assert!(aggregates > 0, "the probe must retain its grouping plan");
-        eprintln!("ordered={ordered} files=23 row_groups=977\n{}", datafusion::physical_plan::displayable(plan.as_ref()).indent(true));
         let mut observed = std::collections::HashMap::new();
         for batch in datafusion::physical_plan::collect(Arc::clone(&plan), ctx.task_ctx()).await? {
             let timestamps = batch.column(0).as_any().downcast_ref::<arrow::array::TimestampMicrosecondArray>().unwrap();
@@ -2611,22 +2634,26 @@ mod ordered_probe_contract_tests {
         let counts: std::collections::HashMap<_, _> = counts.into_iter().map(|((ts, service, id), n)| ((ts, service.map(str::to_owned), id), n)).collect();
         assert_eq!(observed, counts, "group counts must match every raw key, not only duplicate-bearing bins");
         let started = std::time::Instant::now();
-        assert_eq!(db.probe_dup_bins(&table, TABLE, &project, &day.to_string()).await?, expected);
+        assert_eq!(db.probe_dup_bins(&table, table_name, &project, &day.to_string()).await?, expected);
         eprintln!("ordered={ordered} probe_elapsed_ms={}", started.elapsed().as_millis());
         assert_probe_released(&ctx).await?;
         Ok(())
     }
 
     /// Expensive, explicit volume experiment; normal CI retains the exact-key cases above.
-    #[test_case::test_case(4096, 0, false ; "four million rows")]
-    #[test_case::test_case(295781, 424, false ; "production row count")]
-    #[test_case::test_case(4096, 0, true ; "four million rows full overlap")]
-    #[test_case::test_case(295781, 424, true ; "production row count full overlap")]
+    #[test_case::test_case("otel_logs_and_spans", 4096, 0, false ; "four million rows")]
+    #[test_case::test_case("otel_logs_and_spans", 295781, 424, false ; "production row count")]
+    #[test_case::test_case("otel_logs_and_spans", 4096, 0, true ; "four million rows full overlap")]
+    #[test_case::test_case("otel_logs_and_spans", 295781, 424, true ; "production row count full overlap")]
+    #[test_case::test_case("otel_metrics", 4096, 0, false ; "metrics small volume")]
+    #[test_case::test_case("otel_metrics", 233990, 72, false ; "metrics production row count")]
     #[ignore = "writes a production-shaped synthetic key workload to local MinIO"]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn whole_date_probe_volume(rows_per_group: usize, mut extra_rows: usize, full_overlap: bool) -> Result<()> {
+    async fn whole_date_probe_volume(table_name: &str, rows_per_group: usize, mut extra_rows: usize, full_overlap: bool) -> Result<()> {
         use arrow::array::{ArrayRef, StringArray, TimestampMicrosecondArray, UInt32Array, new_null_array};
-        const TABLE: &str = "otel_logs_and_spans";
+        let metrics = table_name == "otel_metrics";
+        let day = if metrics { "2026-08-31" } else { "2026-08-10" };
+        let schema = schema_or_default(table_name);
         // Reuse only a previous local experiment prefix to avoid rewriting gigabytes while debugging cancellation.
         let reuse = std::env::var("TIMEFUSION_PROBE_VOLUME_PREFIX").ok();
         anyhow::ensure!(!full_overlap || reuse.is_none(), "full-overlap inputs must be regenerated; row counts alone cannot establish their geometry");
@@ -2641,15 +2668,17 @@ mod ordered_probe_contract_tests {
         let db = Database::with_config(config).await?;
         db.cancel_maintenance();
         let mut project = format!("volume_{}", uuid::Uuid::new_v4().simple());
-        let start = chrono::NaiveDate::from_ymd_opt(2026, 8, 10).unwrap().and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_micros();
-        let table = db.resolve_table(&project, TABLE).await?;
+        let start = chrono::NaiveDate::parse_from_str(day, "%Y-%m-%d")?.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_micros();
+        let table = db.resolve_table(&project, table_name).await?;
         let max_group_rows = rows_per_group + usize::from(extra_rows > 0);
-        let ranges: Vec<_> = (0..23)
-            .map(|file| {
-                let groups = probe_file_row_groups(file, full_overlap);
+        let group_counts: Vec<_> = if metrics { vec![42, 42, 48, 37] } else { (0..23).map(|file| probe_file_row_groups(file, full_overlap)).collect() };
+        let ranges: Vec<_> = group_counts
+            .iter()
+            .enumerate()
+            .map(|(file, &groups)| {
                 let extra = extra_rows.min(groups);
                 extra_rows -= extra;
-                let lo = if full_overlap { 0 } else { file * 43 * rows_per_group / 2 };
+                let lo = if full_overlap || metrics { 0 } else { file * 43 * rows_per_group / 2 };
                 (lo, lo + groups * rows_per_group + extra)
             })
             .collect();
@@ -2690,71 +2719,98 @@ mod ordered_probe_contract_tests {
         } else {
             // Expand one valid schema row; all non-key values are constant or shared null arrays.
             let template = json_to_batch_for(
-                TABLE,
-                vec![serde_json::json!({"project_id": project, "date": "2026-08-10",
-            "timestamp": start, "id": "template", "level": "INFO", "status_code": "UNSET", "hashes": [], "summary": []})],
+                table_name,
+                vec![if metrics {
+                    serde_json::json!({"project_id": project, "date": day, "timestamp": start, "ingested_at": start,
+                    "metric_name": "template", "series_id": "template", "id": "template", "metric_unit": "1", "metric_type": "gauge",
+                    "flags": 0, "dropped_attributes_count": 0, "message_size_bytes": 0})
+                } else {
+                    serde_json::json!({"project_id": project, "date": "2026-08-10",
+            "timestamp": start, "id": "template", "level": "INFO", "status_code": "UNSET", "hashes": [], "summary": []})
+                }],
             )?;
-            let schema = schema_or_default(TABLE);
             let properties = db.create_writer_properties(schema, 3, true).into_builder().set_max_row_group_row_count(Some(max_group_rows)).build();
             for (file, &(lo, hi)) in ranges.iter().enumerate() {
                 let mut delta = table.write().await;
                 let mut writer = deltalake::writer::RecordBatchWriter::for_table(&delta)?.with_writer_properties(properties.clone());
-                for upper in (lo..hi).rev().step_by(32_768) {
-                    let lower = (upper + 1).saturating_sub(32_768).max(lo);
-                    let keys: Vec<_> = (lower..=upper).rev().collect();
-                    let timestamps: ArrayRef = Arc::new(TimestampMicrosecondArray::from_iter_values(keys.iter().map(|k| timestamp(*k))).with_timezone("UTC"));
-                    let ids: ArrayRef = Arc::new(StringArray::from_iter_values(keys.iter().map(|key| {
-                        let salt = if full_overlap { if key % 2 == 0 { file / 2 } else { file + 23 } } else { 0 } as u64;
-                        let bytes = key.to_le_bytes();
-                        uuid::Uuid::from_u64_pair(twox_hash::XxHash64::oneshot(2 * salt, &bytes), twox_hash::XxHash64::oneshot(2 * salt + 1, &bytes))
-                            .to_string()
-                    })));
-                    let services: ArrayRef = Arc::new(StringArray::from(keys.iter().map(|k| (k % 7 != 0).then_some("api-service")).collect::<Vec<_>>()));
-                    let indices = UInt32Array::from(vec![0; keys.len()]);
-                    let mut nulls = std::collections::HashMap::new();
-                    let columns = template
-                        .schema()
-                        .fields()
-                        .iter()
-                        .enumerate()
-                        .map(|(index, field)| {
-                            let source = match field.name().as_str() {
-                                "timestamp" => Some(&timestamps),
-                                "id" => Some(&ids),
-                                "resource___service___name" => Some(&services),
-                                _ => None,
-                            };
-                            match source {
-                                Some(array) => arrow::compute::cast(array, field.data_type()),
-                                None if template.column(index).is_null(0) => {
-                                    Ok(Arc::clone(nulls.entry(field.data_type().clone()).or_insert_with(|| new_null_array(field.data_type(), keys.len()))))
+                // Metric name leads the ordering; timestamps descend within each name.
+                let name_width = max_key.div_ceil(3);
+                let segments: Vec<_> = if metrics {
+                    (0..3).map(|name| (lo.max(name * name_width), hi.min((name + 1) * name_width))).filter(|(lo, hi)| lo < hi).collect()
+                } else {
+                    vec![(lo, hi)]
+                };
+                for (segment_lo, segment_hi) in segments {
+                    for upper in (segment_lo..segment_hi).rev().step_by(32_768) {
+                        let lower = (upper + 1).saturating_sub(32_768).max(segment_lo);
+                        let keys: Vec<_> = (lower..=upper).rev().collect();
+                        let timestamps: ArrayRef =
+                            Arc::new(TimestampMicrosecondArray::from_iter_values(keys.iter().map(|k| timestamp(*k))).with_timezone("UTC"));
+                        let ids: ArrayRef = Arc::new(StringArray::from_iter_values(keys.iter().map(|key| {
+                            let salt = if full_overlap { if key % 2 == 0 { file / 2 } else { file + 23 } } else { 0 } as u64;
+                            let bytes = key.to_le_bytes();
+                            uuid::Uuid::from_u64_pair(twox_hash::XxHash64::oneshot(2 * salt, &bytes), twox_hash::XxHash64::oneshot(2 * salt + 1, &bytes))
+                                .to_string()
+                        })));
+                        let services: ArrayRef = Arc::new(StringArray::from(
+                            keys.iter()
+                                .map(|k| {
+                                    if metrics {
+                                        Some(["asyncio.process.created", "cpu.usage", "http.server.duration"][k / name_width])
+                                    } else {
+                                        (k % 7 != 0).then_some("api-service")
+                                    }
+                                })
+                                .collect::<Vec<_>>(),
+                        ));
+                        let indices = UInt32Array::from(vec![0; keys.len()]);
+                        let mut nulls = std::collections::HashMap::new();
+                        let columns = template
+                            .schema()
+                            .fields()
+                            .iter()
+                            .enumerate()
+                            .map(|(index, field)| {
+                                let source = match field.name().as_str() {
+                                    "timestamp" => Some(&timestamps),
+                                    "id" if !metrics => Some(&ids),
+                                    "series_id" if metrics => Some(&ids),
+                                    "resource___service___name" | "metric_name" => Some(&services),
+                                    _ => None,
+                                };
+                                match source {
+                                    Some(array) => arrow::compute::cast(array, field.data_type()),
+                                    None if template.column(index).is_null(0) => {
+                                        Ok(Arc::clone(nulls.entry(field.data_type().clone()).or_insert_with(|| new_null_array(field.data_type(), keys.len()))))
+                                    }
+                                    None => arrow::compute::take(template.column(index).as_ref(), &indices, None),
                                 }
-                                None => arrow::compute::take(template.column(index).as_ref(), &indices, None),
-                            }
-                        })
-                        .collect::<std::result::Result<Vec<_>, _>>()?;
-                    let batch = RecordBatch::try_new(template.schema(), columns)?;
-                    let batch = deltalake::kernel::schema::cast_record_batch(&batch, writer.arrow_schema(), true, true)?;
-                    writer.write(batch).await?;
+                            })
+                            .collect::<std::result::Result<Vec<_>, _>>()?;
+                        let batch = RecordBatch::try_new(template.schema(), columns)?;
+                        let batch = deltalake::kernel::schema::cast_record_batch(&batch, writer.arrow_schema(), true, true)?;
+                        writer.write(batch).await?;
+                    }
                 }
                 writer.flush_and_commit(&mut delta).await?;
                 eprintln!("volume_prepare file={} rows={} elapsed_ms={}", file + 1, hi - lo, prepared.elapsed().as_millis());
             }
         }
         eprintln!(
-            "volume_input rows={total_rows} files=23 row_groups=977 full_overlap={full_overlap} pool_limit_bytes={} prepare_ms={} reused={} table_uri={}",
+            "volume_input rows={total_rows} table={table_name} file_row_groups={group_counts:?} full_overlap={full_overlap} pool_limit_bytes={} prepare_ms={} reused={} table_uri={}",
             db.heavy_pool_bytes(),
             prepared.elapsed().as_millis(),
             reuse.is_some(),
             table.read().await.table_url()
         );
         let context_started = std::time::Instant::now();
-        let ctx = db.dedup_probe_ctx(&table, TABLE, &project, "2026-08-10", None).await?;
+        let ctx = db.dedup_probe_ctx(&table, table_name, &project, day, None).await?;
         eprintln!("volume_context elapsed_ms={} target_partitions={}", context_started.elapsed().as_millis(), ctx.state().config().target_partitions());
         let sql = format!(
             "SELECT CAST(date_bin(INTERVAL '10 minutes', timestamp, TIMESTAMP '1970-01-01T00:00:00') AS VARCHAR) FROM \
-            (SELECT timestamp, count(*) AS c FROM {DEDUP_SCAN_NAME} WHERE project_id = '{project}' AND date = DATE '2026-08-10' \
-             GROUP BY timestamp, resource___service___name, id) AS g WHERE c > 1 GROUP BY 1 ORDER BY 1"
+            (SELECT timestamp, count(*) AS c FROM {DEDUP_SCAN_NAME} WHERE project_id = '{project}' AND date = DATE '{day}' \
+             GROUP BY {}) AS g WHERE c > 1 GROUP BY 1 ORDER BY 1",
+            quoted_csv(&schema.dedup_keys)
         );
         for pass in ["first", "repeat"] {
             let started = std::time::Instant::now();
