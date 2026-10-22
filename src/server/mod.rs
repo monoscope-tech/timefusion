@@ -1689,12 +1689,14 @@ mod pgwire_handlers_tests {
         let shutdown = tokio_util::sync::CancellationToken::new();
         let stop = shutdown.clone().cancelled_owned();
         let mut tasks = tokio::task::JoinSet::new();
+        let password = uuid::Uuid::new_v4().to_string();
+        let server_password = password.clone();
         tasks.spawn(async move {
             super::serve_with_listener(
                 listener,
                 Arc::new(ctx),
                 &datafusion_postgres::ServerOptions::new(),
-                super::AuthConfig { username: "postgres".into(), password: Some("connection-password-canary".into()) },
+                super::AuthConfig { username: "postgres".into(), password: Some(server_password) },
                 None,
                 None,
                 stop,
@@ -1704,12 +1706,8 @@ mod pgwire_handlers_tests {
         });
         let socket = tokio::net::TcpStream::connect(("127.0.0.1", port)).await?;
         let client_addr = socket.local_addr()?;
-        let (client, connection) = tokio_postgres::Config::new()
-            .user("postgres")
-            .password("connection-password-canary")
-            .application_name("caller-primary\nprobe")
-            .connect_raw(socket, NoTls)
-            .await?;
+        let (client, connection) =
+            tokio_postgres::Config::new().user("postgres").password(&password).application_name("caller-primary\nprobe").connect_raw(socket, NoTls).await?;
         tasks.spawn(async move { connection.await.map_err(anyhow::Error::from) });
         for sql in ["SELECT 'private-literal-canary', {", "SELECT service, 'private-literal-canary' FROM otel_logs_and_spans"] {
             assert!(client.simple_query(sql).await.is_err());
@@ -1751,7 +1749,7 @@ mod pgwire_handlers_tests {
             socket.write_all(&packet).await?;
             assert_eq!(receive(&mut socket).await?, (b'R', 3_i32.to_be_bytes().to_vec()), "cleartext authentication challenge");
             packet.clear();
-            Password::new("connection-password-canary".into()).encode(&mut packet)?;
+            Password::new(password.clone()).encode(&mut packet)?;
             socket.write_all(&packet).await?;
             let mut portal_pid = None;
             loop {
@@ -1806,7 +1804,7 @@ mod pgwire_handlers_tests {
                 assert!(line.contains(&format!("client.pid={portal_pid}")), "identity must match BackendKeyData: {line}");
             }
         }
-        assert!(!output.contains("connection-password-canary"));
+        assert!(!output.contains(&password));
         assert!(!output.contains("application-tail-canary"));
         drop(client);
         shutdown.cancel();
