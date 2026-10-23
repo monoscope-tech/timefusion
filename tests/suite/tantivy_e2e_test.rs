@@ -1354,17 +1354,35 @@ struct BrowserReplayCredentials {
 #[serial]
 #[ignore = "requires copied calibrated browser artifacts and local read-only MinIO credentials"]
 async fn retained_browser_fixture_recovers_exact_buffered_versions() -> Result<()> {
-    retained_browser_fixture(false).await
+    retained_browser_fixture(RetainedCheck::Recovery).await
 }
 
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 #[ignore = "requires retained calibrated browser inputs; keeps every query at 90 seconds"]
 async fn retained_browser_fixture_preserves_full_wire_contract() -> Result<()> {
-    retained_browser_fixture(true).await
+    retained_browser_fixture(RetainedCheck::Pages(PageRun::Contract)).await
 }
 
-async fn retained_browser_fixture(verify_pages: bool) -> Result<()> {
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+#[ignore = "focused retained-input comparison; full wire matrix remains a separate gate"]
+async fn retained_browser_fixture_first_wire_pair() -> Result<()> {
+    retained_browser_fixture(RetainedCheck::Pages(PageRun::FirstPair)).await
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PageRun {
+    FirstPair,
+    Contract,
+}
+
+enum RetainedCheck {
+    Recovery,
+    Pages(PageRun),
+}
+
+async fn retained_browser_fixture(check: RetainedCheck) -> Result<()> {
     use object_store::ObjectStoreExt;
     timefusion::observability::init_local_metrics_for_test();
     let directory = PathBuf::from(
@@ -1372,7 +1390,10 @@ async fn retained_browser_fixture(verify_pages: bool) -> Result<()> {
     );
     let replay: BrowserReplay = serde_json::from_slice(&std::fs::read(directory.join("replay-context.json"))?)?;
     let credentials: BrowserReplayCredentials = serde_json::from_slice(&std::fs::read(directory.join("credentials.json"))?)?;
-    anyhow::ensure!(credentials.endpoint == "http://127.0.0.1:9000" && credentials.bucket == "timefusion-tests", "replay requires the isolated local store");
+    anyhow::ensure!(
+        matches!(credentials.endpoint.as_str(), "http://127.0.0.1:9000" | "http://127.0.0.1:19000") && credentials.bucket == "timefusion-tests",
+        "replay requires the isolated local store"
+    );
     // SAFETY: serial, ignored fixture runs alone; restore the application clock
     // even on failure. Tokio and statement deadlines retain real elapsed time.
     anyhow::ensure!(!timefusion::support::is_frozen(), "another fixture owns the clock");
@@ -1443,7 +1464,7 @@ async fn retained_browser_fixture(verify_pages: bool) -> Result<()> {
         drop(table);
         arms.push((db, ctx));
     }
-    if verify_pages {
+    if let RetainedCheck::Pages(run) = check {
         let mut arms = arms.into_iter();
         let (on, ctx) = arms.next().expect("indexed arm");
         let (off, ctx_off) = arms.next().expect("raw arm");
@@ -1482,6 +1503,7 @@ async fn retained_browser_fixture(verify_pages: bool) -> Result<()> {
             true,
             PageContract::LogExplorer,
             true,
+            run,
         )
         .await?;
     }
@@ -1646,6 +1668,7 @@ async fn mutable_candidate_fixture(complete: bool, cold_disk: bool, contract: Pa
         cold_disk,
         contract,
         requires_raw_fallback,
+        PageRun::Contract,
     )
     .await
 }
@@ -1663,7 +1686,7 @@ struct MutableCandidateInput {
 }
 
 async fn verify_mutable_candidate_input(
-    input: MutableCandidateInput, complete: bool, cold_disk: bool, contract: PageContract, requires_raw_fallback: bool,
+    input: MutableCandidateInput, complete: bool, cold_disk: bool, contract: PageContract, requires_raw_fallback: bool, run: PageRun,
 ) -> Result<()> {
     use timefusion::{database::scan_metric_names::PREFILTER_MUTABLE_CANDIDATES, observability::counter_value};
     let MutableCandidateInput { on, ctx, off, ctx_off, p, now, index_bytes, own_delta_bytes, has_background } = input;
@@ -1716,7 +1739,8 @@ async fn verify_mutable_candidate_input(
     let mut warm_opens = 0;
     let mut warm_bytes = 0;
     let mut cancellation_sql = None;
-    for pass in 0..2 {
+    let passes = if run == PageRun::FirstPair { 1 } else { 2 };
+    for pass in 0..passes {
         for (tag, trace) in [
             (hash, Some("trace-kept")),
             ("other", Some("trace-ghost")),
@@ -1728,6 +1752,7 @@ async fn verify_mutable_candidate_input(
         ]
         .into_iter()
         .chain(matches!(contract, PageContract::LogExplorer).then_some(("ties", Some("trace-tie-a"))))
+        .filter(|(tag, _)| run == PageRun::Contract || *tag == hash)
         {
             let projection = match contract {
                 PageContract::IssueSample => "timestamp, summary, context___trace_id",
@@ -1834,6 +1859,19 @@ async fn verify_mutable_candidate_input(
                     "all twelve prepared JSON fields must preserve their values and types"
                 );
             }
+            let runtimes = [ctx.runtime_env(), ctx_off.runtime_env()];
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while runtimes.iter().any(|r| r.memory_pool.reserved() != 0 || r.disk_manager.used_disk_space() != 0) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await?;
+            eprintln!(
+                "browser_pair_complete pass={pass} tag={tag} rows={} reserved_after={} spill_after={}",
+                actual.len(),
+                runtimes.iter().map(|r| r.memory_pool.reserved()).sum::<usize>(),
+                runtimes.iter().map(|r| r.disk_manager.used_disk_space()).sum::<u64>()
+            );
         }
         if pass == 0 {
             warm_opens = opens();
@@ -1854,7 +1892,9 @@ async fn verify_mutable_candidate_input(
             assert_eq!(range_bytes(), warm_bytes, "warm repetition must reuse bundle blocks");
         }
     }
-    if let Some(sql) = cancellation_sql {
+    if run == PageRun::Contract
+        && let Some(sql) = cancellation_sql
+    {
         let runtime = ctx_off.runtime_env();
         let token = clients[1].cancel_token();
         let query = wire_page(&clients[1], &sql, contract);
@@ -1899,6 +1939,9 @@ async fn verify_mutable_candidate_input(
         anyhow::Ok(())
     })
     .await??;
+    if run == PageRun::FirstPair {
+        return Ok(());
+    }
     for predicate in [
         format!("array_has(hashes, '{hash}')"),
         format!("'{hash}' = ANY(hashes)"),
