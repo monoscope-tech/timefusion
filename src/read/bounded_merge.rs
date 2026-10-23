@@ -158,6 +158,7 @@ impl ExecutionPlan for BoundedMergeExec {
             batch_size: self.batch_rows.map_or(context.session_config().batch_size(), |rows| rows.clamp(1, context.session_config().batch_size())),
             opened: MetricBuilder::new(&self.metrics).counter("inputs_opened", partition),
             skipped: MetricBuilder::new(&self.metrics).counter("inputs_never_opened", partition),
+            encoded: MetricBuilder::new(&self.metrics).counter("key_rows_encoded", partition),
             baseline: BaselineMetrics::new(&self.metrics, partition),
         };
         while stream.closed.last().is_some_and(|&p| stream.bounds[p].is_none()) {
@@ -203,6 +204,7 @@ struct BoundedMergeStream {
     batch_size: usize,
     opened: Count,
     skipped: Count,
+    encoded: Count,
     baseline: BaselineMetrics,
 }
 
@@ -229,6 +231,7 @@ impl BoundedMergeStream {
     fn head(&mut self, slot_batch: RecordBatch) -> Result<Head> {
         let columns = self.expr.iter().map(|sort| sort.expr.evaluate(&slot_batch)?.into_array(slot_batch.num_rows())).collect::<Result<Vec<_>>>()?;
         let rows = self.converter.convert_columns(&columns)?;
+        self.encoded.add(rows.num_rows());
         let lead = cast(&columns[0], &DataType::Int64)?
             .as_any()
             .downcast_ref::<Int64Array>()
@@ -598,6 +601,18 @@ mod tests {
             let got = runtime.block_on(rows(Arc::new(BoundedMergeExec::new(plan, ordering(), bounds, fetch))));
             proptest::prop_assert_eq!(got, want);
         }
+    }
+
+    #[test_case::test_case(false => Some(0); "unique leading keys")]
+    #[test_case::test_case(true => Some(4); "ties retain full encoding")]
+    #[tokio::test]
+    async fn leading_keys_avoid_row_encoding(tied: bool) -> Option<usize> {
+        let ts = |value| if tied { 9 } else { value };
+        let input = input(&[vec![(ts(9), 0), (ts(5), 2)], vec![(ts(8), 1), (ts(4), 3)]], 2);
+        let want = rows(Arc::new(SortPreservingMergeExec::new(ordering(), Arc::clone(&input)))).await;
+        let plan = Arc::new(BoundedMergeExec::new(input, ordering(), vec![None; 2], None));
+        assert_eq!(rows(Arc::clone(&plan) as _).await, want);
+        plan.metrics().unwrap().sum_by_name("key_rows_encoded").map(|value| value.as_usize())
     }
 
     /// The point of the operator: a latest-3 over six hourly inputs reads only the newest.
