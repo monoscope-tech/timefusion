@@ -1321,6 +1321,109 @@ async fn append_browser_background(db: &Database, project: &str, now: i64, divis
     Ok(())
 }
 
+/// A retained calibrated fixture must survive canonical WAL recovery before it
+/// can supply a matched performance control. Preparation copies the archived
+/// local state and supplies read-only credentials for the local object store.
+#[derive(serde::Deserialize)]
+struct BrowserReplay {
+    application_now_micros: i64,
+    prepared_end_micros: i64,
+    project: String,
+    stores: Vec<BrowserReplayStore>,
+}
+
+#[derive(serde::Deserialize)]
+struct BrowserReplayStore {
+    name: String,
+    uri: String,
+    delta_version: u64,
+    active_project_files: usize,
+    local_state: PathBuf,
+}
+
+#[derive(serde::Deserialize)]
+struct BrowserReplayCredentials {
+    endpoint: String,
+    bucket: String,
+    region: String,
+    access_key: String,
+    secret_key: String,
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+#[ignore = "requires copied calibrated browser artifacts and local read-only MinIO credentials"]
+async fn retained_browser_fixture_recovers_exact_buffered_versions() -> Result<()> {
+    let directory = PathBuf::from(
+        std::env::var_os("TIMEFUSION_BROWSER_REPLAY_DIR").ok_or_else(|| anyhow::anyhow!("set TIMEFUSION_BROWSER_REPLAY_DIR to prepared replay artifacts"))?,
+    );
+    let replay: BrowserReplay = serde_json::from_slice(&std::fs::read(directory.join("replay-context.json"))?)?;
+    let credentials: BrowserReplayCredentials = serde_json::from_slice(&std::fs::read(directory.join("credentials.json"))?)?;
+    anyhow::ensure!(credentials.endpoint == "http://127.0.0.1:9000" && credentials.bucket == "timefusion-tests", "replay requires the isolated local store");
+    // SAFETY: serial, ignored fixture runs alone; restore the application clock
+    // even on failure. Tokio and statement deadlines retain real elapsed time.
+    anyhow::ensure!(!timefusion::support::is_frozen(), "another fixture owns the clock");
+    timefusion::support::set_micros(replay.application_now_micros);
+    let _clock = scopeguard::guard((), |_| timefusion::support::unfreeze());
+    for input in &replay.stores {
+        let prefix = input
+            .uri
+            .strip_prefix("s3://timefusion-tests/")
+            .and_then(|uri| uri.strip_suffix("/otel_logs_and_spans"))
+            .ok_or_else(|| anyhow::anyhow!("invalid retained table URI"))?;
+        let (db, _, _) = build_db_with("retained-browser", input.name == "on", |cfg| {
+            cfg.aws.aws_s3_endpoint = credentials.endpoint.clone();
+            cfg.aws.aws_access_key_id = Some(credentials.access_key.clone());
+            cfg.aws.aws_secret_access_key = Some(credentials.secret_key.clone());
+            cfg.aws.aws_default_region = Some(credentials.region.clone());
+            cfg.core.timefusion_table_prefix = prefix.into();
+            cfg.core.timefusion_data_dir = input.local_state.clone();
+            cfg.core.timefusion_pgwire_max_statement_secs = 90;
+        })
+        .await?;
+        let layer = db.buffered_layer().expect("buffered replay layer");
+        let recovered = layer.recover_from_wal().await?;
+        assert_eq!(recovered.corrupted_entries_skipped, 0);
+        let batches = layer.query(&replay.project, "otel_logs_and_spans", &[])?;
+        let mut actual = Vec::new();
+        for batch in &batches {
+            let ids = arrow::compute::cast(batch.column_by_name("id").expect("id"), &arrow::datatypes::DataType::Utf8)?;
+            let timestamps = arrow::compute::cast(batch.column_by_name("timestamp").expect("timestamp"), &arrow::datatypes::DataType::Int64)?;
+            let deleted = batch.column_by_name("deleted").expect("tombstone").as_boolean();
+            for i in 0..batch.num_rows() {
+                actual.push((
+                    ids.as_string::<i32>().value(i).to_string(),
+                    timestamps.as_primitive::<arrow::datatypes::Int64Type>().value(i),
+                    !deleted.is_null(i) && deleted.value(i),
+                ));
+            }
+        }
+        actual.sort();
+        let expected = [("deleted-only", 7, true), ("late", 4, false), ("stale", 2, false)]
+            .map(|(id, minutes, deleted)| (id.to_string(), replay.prepared_end_micros - minutes * 60_000_000, deleted));
+        assert_eq!(actual, expected, "{}: preserve buffered winners and tombstone", input.name);
+        let target = db.resolve_table(&replay.project, "otel_logs_and_spans").await?;
+        let table = target.read().await;
+        assert_eq!(table.version(), Some(input.delta_version), "retained Delta snapshot");
+        let own_files = table
+            .snapshot()?
+            .log_data()
+            .iter()
+            .filter(|file| file.partition_values_map().get("project_id").and_then(Option::as_deref) == Some(replay.project.as_str()))
+            .count();
+        assert_eq!(own_files, input.active_project_files, "partition metadata must exclude the misleading foreign path");
+        eprintln!(
+            "browser_replay_recovered arm={} buffered_rows={} entries={} delta_version={} own_files={}",
+            input.name,
+            actual.len(),
+            recovered.entries_replayed,
+            input.delta_version,
+            own_files
+        );
+    }
+    Ok(())
+}
+
 async fn mutable_candidate_fixture(complete: bool, cold_disk: bool, contract: PageContract, background_divisor: Option<usize>) -> Result<()> {
     use object_store::ObjectStoreExt;
     use timefusion::{
