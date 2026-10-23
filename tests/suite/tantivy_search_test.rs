@@ -774,7 +774,8 @@ async fn a_combined_overflow_materializes_no_more_than_the_cap() {
 #[tokio::test]
 async fn an_over_cap_refusal_answers_a_slightly_narrower_window() {
     let env = Env::prod("otel_logs_and_spans", "p-capshrink");
-    let rows: Vec<(i64, String, &str)> = (0..50).map(|i| (1_000_000 + i as i64, format!("id-{i}"), "ERROR")).collect();
+    let mut rows: Vec<(i64, String, &str)> = (0..50).map(|i| (1_000_000 + i as i64, format!("id-{i}"), "ERROR")).collect();
+    rows.push((2_000_050, "quiet".into(), "ERROR"));
     let rows_ref: Vec<(i64, &str, &str)> = rows.iter().map(|(t, id, l)| (*t, id.as_str(), *l)).collect();
     env.publish(&rows_ref, &["shrink-uri"]).await;
     let error = level_error_node();
@@ -784,7 +785,11 @@ async fn an_over_cap_refusal_answers_a_slightly_narrower_window() {
     let before = searched();
     assert_eq!(search((1_000_005, 1_000_100)).await.unwrap().err(), Some("delta_cap_exceeded_memo"));
     assert_eq!(searched(), before, "a slightly narrower window must be answered by the memo");
+    assert_eq!(search((1_000_005, 1_000_105)).await.unwrap().err(), Some("delta_cap_exceeded_memo"));
+    assert_eq!(searched(), before, "a nearby moving window must retain memo reuse");
     assert_ne!(search((1_000_000, 1_000_010)).await.unwrap().err(), Some("delta_cap_exceeded_memo"), "a much narrower window searches again");
+    let quiet = search((2_000_000, 2_000_100)).await.unwrap().expect("an overflow in a disjoint window cannot answer this one");
+    assert_eq!(quiet.hits.iter().map(|hit| hit.id.as_str()).collect::<Vec<_>>(), ["quiet"]);
 }
 
 /// A search the scan declined as unselective (`kind IN (...)` matching nearly every span,

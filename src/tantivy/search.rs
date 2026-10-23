@@ -184,13 +184,13 @@ pub struct TantivySearchService {
     install_permits: Arc<tokio::sync::Semaphore>,
     /// Per-dir install lock: concurrent misses on one blob fetch it once.
     installing: DashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>,
-    /// Predicates whose search recently overflowed `max_hits`, with the narrowest window width
+    /// Predicates whose search recently overflowed `max_hits`, with the narrowest overlapping window
     /// that did. A common value (`status_code = 'ERROR'`) overflows on every wide query of a
     /// busy project — after paying for every cold blob download in the window — while a
-    /// narrower fringe window of the same predicate may still fit. A search the caller
+    /// narrower or disjoint window of the same predicate may still fit. A search the caller
     /// declined as unselective (`kind IN (...)` matching nearly every span) is remembered
     /// the same way; the value carries the reason the memo answers with.
-    cap_exceeded: DashMap<CapKey, (Instant, u64, &'static str)>,
+    cap_exceeded: DashMap<CapKey, CachedRefusal>,
     /// Background warms queued or running, keyed by cache dir so a hot cold
     /// window queues each blob once however many queries see it cold.
     warming: DashMap<PathBuf, ()>,
@@ -202,6 +202,13 @@ pub struct TantivySearchService {
 }
 
 type CapKey = (String, String, PredNode, usize);
+
+#[derive(Debug)]
+struct CachedRefusal {
+    since: Instant,
+    time_range: Option<(i64, i64)>,
+    reason: &'static str,
+}
 
 const MAX_CONCURRENT_INSTALLS: usize = 4;
 const MAX_CONCURRENT_WARMS: usize = 2;
@@ -219,6 +226,22 @@ fn window_width(time_range: Option<(i64, i64)>) -> u64 {
 /// windows within 10% narrower; a much narrower window may be selective and searches.
 fn covers_width(remembered: u64, width: u64) -> bool {
     u128::from(width) * 10 >= u128::from(remembered) * 9
+}
+
+/// Keep the moving-window heuristic for overlapping searches. A distant window
+/// can be selective even when it has the same width as a remembered refusal.
+fn covers_window(remembered: Option<(i64, i64)>, requested: Option<(i64, i64)>) -> bool {
+    if !covers_width(window_width(remembered), window_width(requested)) {
+        return false;
+    }
+    match (remembered, requested) {
+        (_, None) => true,
+        (None, Some(_)) => false,
+        (Some((a, b)), Some((c, d))) => {
+            let (lo, hi) = (a.max(c), b.min(d));
+            a <= b && c <= d && lo <= hi && covers_width(a.abs_diff(b).min(c.abs_diff(d)), lo.abs_diff(hi))
+        }
+    }
 }
 
 /// Outcome of one [`TantivySearchService::reap_disk_cache`] sweep.
@@ -379,20 +402,25 @@ impl TantivySearchService {
         Ok(self.search_detailed(table, project_id, node, max_hits, time_range, true).await?.ok())
     }
 
-    /// Skip this predicate's search for equal-or-wider windows until the memo expires:
+    /// Skip this predicate's search for overlapping equal-or-wider windows until the memo expires:
     /// the hits were too many to prune with. Always sound — the scan still evaluates
     /// the predicate itself.
     pub fn remember_unselective(&self, table: &str, project_id: &str, node: &PredNode, max_hits: usize, time_range: Option<(i64, i64)>) {
-        self.remember_refusal((table.to_string(), project_id.to_string(), node.clone(), max_hits), window_width(time_range), "low_selectivity_memo");
+        self.remember_refusal((table.to_string(), project_id.to_string(), node.clone(), max_hits), time_range, "low_selectivity_memo");
     }
 
-    fn remember_refusal(&self, key: CapKey, width: u64, reason: &'static str) {
+    fn remember_refusal(&self, key: CapKey, time_range: Option<(i64, i64)>, reason: &'static str) {
         if self.cap_exceeded.len() >= 4096 {
-            self.cap_exceeded.retain(|_, e| e.0.elapsed() < CAP_EXCEEDED_TTL);
+            self.cap_exceeded.retain(|_, e| e.since.elapsed() < CAP_EXCEEDED_TTL);
         }
-        let mut e = self.cap_exceeded.entry(key).or_insert((Instant::now(), width, reason));
-        let narrowest = if e.0.elapsed() < CAP_EXCEEDED_TTL { e.1.min(width) } else { width };
-        *e = (Instant::now(), narrowest, reason);
+        let mut e = self.cap_exceeded.entry(key).or_insert(CachedRefusal { since: Instant::now(), time_range, reason });
+        let narrowest =
+            if e.since.elapsed() < CAP_EXCEEDED_TTL && window_width(e.time_range) <= window_width(time_range) && covers_window(e.time_range, time_range) {
+                e.time_range
+            } else {
+                time_range
+            };
+        *e = CachedRefusal { since: Instant::now(), time_range: narrowest, reason };
     }
 
     /// `search_with_stats`, but the `Err` says WHY it could not answer: the
@@ -407,12 +435,11 @@ impl TantivySearchService {
         self: &Arc<Self>, table: &str, project_id: &str, node: &PredNode, max_hits: usize, time_range: Option<(i64, i64)>, wait_for_cold: bool,
     ) -> Result<std::result::Result<SearchResult, &'static str>> {
         let cap_key: CapKey = (table.to_string(), project_id.to_string(), node.clone(), max_hits);
-        let width = window_width(time_range);
-        if let Some(e) = self.cap_exceeded.get(&cap_key).filter(|e| e.0.elapsed() < CAP_EXCEEDED_TTL && covers_width(e.1, width)) {
-            return Ok(Err(e.2));
+        if let Some(e) = self.cap_exceeded.get(&cap_key).filter(|e| e.since.elapsed() < CAP_EXCEEDED_TTL && covers_window(e.time_range, time_range)) {
+            return Ok(Err(e.reason));
         }
         let cap_exceeded = |reason: &'static str| {
-            self.remember_refusal(cap_key.clone(), width, "delta_cap_exceeded_memo");
+            self.remember_refusal(cap_key.clone(), time_range, "delta_cap_exceeded_memo");
             Ok(Err(reason))
         };
         let m = self.load_manifest_cached(table, project_id, time_range.and_then(|(lo, hi)| crate::tantivy::shard_dates(lo, hi))).await?;
@@ -632,8 +659,8 @@ impl TantivySearchService {
                 Membership::Or(l, r) => PredNode::Or(vec![key(l), key(r)]),
             }
         }
-        let (cap_key, width) = ((table.to_string(), project_id.to_string(), key(membership), cap), window_width(time_range));
-        if self.cap_exceeded.get(&cap_key).is_some_and(|e| e.0.elapsed() < CAP_EXCEEDED_TTL && covers_width(e.1, width)) {
+        let cap_key = (table.to_string(), project_id.to_string(), key(membership), cap);
+        if self.cap_exceeded.get(&cap_key).is_some_and(|e| e.since.elapsed() < CAP_EXCEEDED_TTL && covers_window(e.time_range, time_range)) {
             return Ok(None);
         }
         let membership = membership.clone();
@@ -642,7 +669,7 @@ impl TantivySearchService {
         };
         let (found, covered) = self.newest_matches(table, project_id, query, cap.saturating_add(1), time_range).await?;
         if found.len() > cap {
-            self.remember_refusal(cap_key, width, "delta_cap_exceeded_memo");
+            self.remember_refusal(cap_key, time_range, "delta_cap_exceeded_memo");
             return Ok(None);
         }
         Ok(Some((found.into_iter().collect(), covered)))
@@ -1140,7 +1167,7 @@ mod tests {
     use proptest::prelude::*;
     use test_case::test_case;
 
-    use super::{TantivySearchService, collect_index_dirs, entry_overlaps};
+    use super::{TantivySearchService, collect_index_dirs, covers_window, entry_overlaps};
 
     /// Fake extracted index of `bytes` bytes at `<root>/tantivy_cache/<rel>`.
     fn fake_index(root: &std::path::Path, rel: &str, bytes: usize) -> PathBuf {
@@ -1267,6 +1294,22 @@ mod tests {
         assert!(dirs.iter().all(|d| d.join("seg0.store").exists()));
         assert_eq!(svc.stats.blob_fetches.load(std::sync::atomic::Ordering::Relaxed), 8, "concurrent misses on one blob fetch it once");
         assert!(started.elapsed() >= wait * (8 / super::MAX_CONCURRENT_INSTALLS) as u32, "installs exceeded the concurrency bound");
+    }
+
+    #[test_case(Some((0, 100)), Some((200, 300)) => false ; "disjoint windows")]
+    #[test_case(Some((0, 100)), Some((5, 105)) => true ; "nearby moving window")]
+    #[test_case(Some((0, 100)), Some((50, 150)) => false ; "insufficient overlap")]
+    #[test_case(Some((0, 100)), Some((5, 100)) => true ; "slightly narrower window")]
+    #[test_case(Some((0, 100)), Some((0, 50)) => false ; "much narrower window")]
+    #[test_case(Some((0, 100)), None => true ; "unbounded request includes refused window")]
+    #[test_case(None, Some((0, 100)) => false ; "bounded request needs its own evidence")]
+    #[test_case(None, None => true ; "same unbounded request")]
+    #[test_case(Some((1, 1)), Some((1, 1)) => true ; "same point")]
+    #[test_case(Some((1, 1)), Some((2, 2)) => false ; "different points")]
+    #[test_case(Some((i64::MIN, i64::MAX)), Some((i64::MIN + 1, i64::MAX)) => true ; "full signed timestamp range")]
+    #[test_case(Some((100, 0)), Some((100, 200)) => false ; "inverted window")]
+    fn refusal_window_reuse(remembered: Option<(i64, i64)>, requested: Option<(i64, i64)>) -> bool {
+        covers_window(remembered, requested)
     }
 
     /// An unknown bound is treated permissively (won't wrongly prune), but a
