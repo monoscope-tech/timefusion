@@ -38,6 +38,12 @@ slow-timeout = { period = "30s", terminate-after = 8 }
 filter = 'binary(suite) & test(/log_explorer_at_volume::.*_at_calibrated_volume$/)'
 slow-timeout = { period = "60s", terminate-after = 120 }
 
+# Retained replay skips volume preparation but runs the same cold/warm caller
+# matrix and raw oracles. Each statement still has its captured 90s deadline.
+[[profile.default.overrides]]
+filter = 'binary(suite) & test(retained_browser_fixture_preserves_full_wire_contract)'
+slow-timeout = { period = "60s", terminate-after = 60 }
+
 # The longest fixtures start first, so the suite's tail is the slowest test
 # rather than whichever long test happened to be scheduled last. Each is one
 # CPU-bound thread (~170 MB), so they run alongside everything else: capping

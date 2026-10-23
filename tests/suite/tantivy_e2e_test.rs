@@ -1354,6 +1354,19 @@ struct BrowserReplayCredentials {
 #[serial]
 #[ignore = "requires copied calibrated browser artifacts and local read-only MinIO credentials"]
 async fn retained_browser_fixture_recovers_exact_buffered_versions() -> Result<()> {
+    retained_browser_fixture(false).await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+#[ignore = "requires retained calibrated browser inputs; keeps every query at 90 seconds"]
+async fn retained_browser_fixture_preserves_full_wire_contract() -> Result<()> {
+    retained_browser_fixture(true).await
+}
+
+async fn retained_browser_fixture(verify_pages: bool) -> Result<()> {
+    use object_store::ObjectStoreExt;
+    timefusion::observability::init_local_metrics_for_test();
     let directory = PathBuf::from(
         std::env::var_os("TIMEFUSION_BROWSER_REPLAY_DIR").ok_or_else(|| anyhow::anyhow!("set TIMEFUSION_BROWSER_REPLAY_DIR to prepared replay artifacts"))?,
     );
@@ -1365,13 +1378,15 @@ async fn retained_browser_fixture_recovers_exact_buffered_versions() -> Result<(
     anyhow::ensure!(!timefusion::support::is_frozen(), "another fixture owns the clock");
     timefusion::support::set_micros(replay.application_now_micros);
     let _clock = scopeguard::guard((), |_| timefusion::support::unfreeze());
+    assert_eq!(replay.stores.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), ["on", "off"]);
+    let mut arms = Vec::new();
     for input in &replay.stores {
         let prefix = input
             .uri
             .strip_prefix("s3://timefusion-tests/")
             .and_then(|uri| uri.strip_suffix("/otel_logs_and_spans"))
             .ok_or_else(|| anyhow::anyhow!("invalid retained table URI"))?;
-        let (db, _, _) = build_db_with("retained-browser", input.name == "on", |cfg| {
+        let (db, ctx, _) = build_db_with("retained-browser", input.name == "on", |cfg| {
             cfg.aws.aws_s3_endpoint = credentials.endpoint.clone();
             cfg.aws.aws_access_key_id = Some(credentials.access_key.clone());
             cfg.aws.aws_secret_access_key = Some(credentials.secret_key.clone());
@@ -1379,6 +1394,11 @@ async fn retained_browser_fixture_recovers_exact_buffered_versions() -> Result<(
             cfg.core.timefusion_table_prefix = prefix.into();
             cfg.core.timefusion_data_dir = input.local_state.clone();
             cfg.core.timefusion_pgwire_max_statement_secs = 90;
+            let production = AppConfig::default().tantivy;
+            cfg.tantivy.timefusion_tantivy_reader_cache_entries = production.timefusion_tantivy_reader_cache_entries;
+            cfg.tantivy.timefusion_tantivy_bundle_writes = production.timefusion_tantivy_bundle_writes;
+            cfg.tantivy.timefusion_tantivy_range_reads = production.timefusion_tantivy_range_reads;
+            cfg.tantivy.timefusion_tantivy_block_cache_mb = production.timefusion_tantivy_block_cache_mb;
         })
         .await?;
         let layer = db.buffered_layer().expect("buffered replay layer");
@@ -1420,21 +1440,61 @@ async fn retained_browser_fixture_recovers_exact_buffered_versions() -> Result<(
             input.delta_version,
             own_files
         );
+        drop(table);
+        arms.push((db, ctx));
+    }
+    if verify_pages {
+        let mut arms = arms.into_iter();
+        let (on, ctx) = arms.next().expect("indexed arm");
+        let (off, ctx_off) = arms.next().expect("raw arm");
+        let target = on.resolve_table(&replay.project, "otel_logs_and_spans").await?;
+        let own_delta_bytes = target
+            .read()
+            .await
+            .snapshot()?
+            .log_data()
+            .iter()
+            .filter(|file| file.partition_values_map().get("project_id").and_then(Option::as_deref) == Some(replay.project.as_str()))
+            .map(|file| file.size() as u64)
+            .sum();
+        let search = on.tantivy_search().expect("indexed search service");
+        let manifest = timefusion::tantivy::load_manifest(search.object_store.as_ref(), "otel_logs_and_spans", &replay.project).await?;
+        let mut index_bytes = 0;
+        for entry in manifest.entries.into_values() {
+            if let Some(path) = entry.index {
+                index_bytes += search.object_store.head(&object_store::path::Path::from(path)).await?.size;
+            }
+        }
+        anyhow::ensure!(index_bytes > 0, "the retained indexed arm must have real indexes");
+        verify_mutable_candidate_input(
+            MutableCandidateInput {
+                on,
+                ctx,
+                off,
+                ctx_off,
+                p: replay.project,
+                now: replay.prepared_end_micros,
+                index_bytes,
+                own_delta_bytes,
+                has_background: true,
+            },
+            false,
+            true,
+            PageContract::LogExplorer,
+            true,
+        )
+        .await?;
     }
     Ok(())
 }
 
 async fn mutable_candidate_fixture(complete: bool, cold_disk: bool, contract: PageContract, background_divisor: Option<usize>) -> Result<()> {
     use object_store::ObjectStoreExt;
-    use timefusion::{
-        database::scan_metric_names::PREFILTER_MUTABLE_CANDIDATES,
-        observability::{counter_value, init_local_metrics_for_test},
-        support::test_helpers::json_to_batch_for,
-    };
+    use timefusion::{observability::init_local_metrics_for_test, support::test_helpers::json_to_batch_for};
     init_local_metrics_for_test();
-    let (window_hours, budget_secs) = match contract {
-        PageContract::IssueSample => (3, 4),
-        PageContract::LogExplorer => (14 * 24, 90),
+    let budget_secs = match contract {
+        PageContract::IssueSample => 4,
+        PageContract::LogExplorer => 90,
     };
     // The calibrated partial case leaves over 6 GiB unindexed, above the
     // existing 512 MiB planning-read cap. It must keep the exact raw fallback.
@@ -1580,6 +1640,38 @@ async fn mutable_candidate_fixture(complete: bool, cold_disk: bool, contract: Pa
         *table_ref.write().await = target;
         own_bytes
     };
+    verify_mutable_candidate_input(
+        MutableCandidateInput { on, ctx, off, ctx_off, p, now, index_bytes, own_delta_bytes, has_background: background_divisor.is_some() },
+        complete,
+        cold_disk,
+        contract,
+        requires_raw_fallback,
+    )
+    .await
+}
+
+struct MutableCandidateInput {
+    on: Database,
+    ctx: SessionContext,
+    off: Database,
+    ctx_off: SessionContext,
+    p: String,
+    now: i64,
+    index_bytes: u64,
+    own_delta_bytes: u64,
+    has_background: bool,
+}
+
+async fn verify_mutable_candidate_input(
+    input: MutableCandidateInput, complete: bool, cold_disk: bool, contract: PageContract, requires_raw_fallback: bool,
+) -> Result<()> {
+    use timefusion::{database::scan_metric_names::PREFILTER_MUTABLE_CANDIDATES, observability::counter_value};
+    let MutableCandidateInput { on, ctx, off, ctx_off, p, now, index_bytes, own_delta_bytes, has_background } = input;
+    let (table, hash) = ("otel_logs_and_spans", "pat:E12e74a9");
+    let (window_hours, budget_secs) = match contract {
+        PageContract::IssueSample => (3, 4),
+        PageContract::LogExplorer => (14 * 24, 90),
+    };
     // Exercise each captured caller through its actual protocol, against an
     // independent server whose prefilter is disabled as the oracle.
     let stop = tokio_util::sync::CancellationToken::new();
@@ -1653,7 +1745,7 @@ async fn mutable_candidate_fixture(complete: bool, cold_disk: bool, contract: Pa
                 iso(now - window_hours * 3_600_000_000),
                 iso(now)
             );
-            if background_divisor.is_some() && pass == 0 && tag == hash {
+            if has_background && pass == 0 && tag == hash {
                 cancellation_sql = Some(sql.clone());
             }
             let before = counter_value(PREFILTER_MUTABLE_CANDIDATES);
