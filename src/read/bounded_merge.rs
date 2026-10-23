@@ -13,6 +13,7 @@
 //! input anyway and keeps the plain merge's parallelism.
 
 use std::{
+    cmp::Ordering,
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
@@ -20,7 +21,7 @@ use std::{
 
 use datafusion::{
     arrow::{
-        array::{Array, Int64Array, RecordBatch},
+        array::{Array, ArrayRef, Int64Array, RecordBatch},
         compute::{cast, interleave_record_batch},
         datatypes::{DataType, SchemaRef},
         row::{RowConverter, Rows, SortField},
@@ -142,11 +143,13 @@ impl ExecutionPlan for BoundedMergeExec {
         let mut closed: Vec<usize> = (0..self.bounds.len()).collect();
         closed.sort_by_key(|&p| (self.bounds[p].is_some(), self.bounds[p].map(|b| if lead.descending { -b } else { b })));
         closed.reverse();
+        let primitive_lead = matches!(self.expr.first().expr.data_type(&schema)?, DataType::Int64 | DataType::Timestamp(..));
         let mut stream = BoundedMergeStream {
             input: Arc::clone(&self.input),
             context: Arc::clone(&context),
             expr: self.expr.clone(),
             converter: RowConverter::new(fields)?,
+            primitive_lead,
             schema,
             bounds: self.bounds.clone(),
             inputs: (0..self.bounds.len()).map(|_| Input::Closed).collect(),
@@ -181,9 +184,36 @@ enum Input {
 /// leading key as i64 (`None` = null), read at `cursor`.
 struct Head {
     slot: usize,
-    rows: Rows,
+    rows: SortKeys,
     lead: Int64Array,
     cursor: usize,
+}
+
+impl Head {
+    fn leading(&self) -> Option<i64> {
+        (!self.lead.is_null(self.cursor)).then(|| self.lead.value(self.cursor))
+    }
+}
+
+/// Keep evaluated keys until a leading-key tie requires compound comparison.
+/// A single converter owns all row encodings, including dictionary state.
+enum SortKeys {
+    Columns(Vec<ArrayRef>),
+    Rows(Rows),
+}
+
+impl SortKeys {
+    fn rows(&mut self, converter: &RowConverter, encoded: &Count) -> Result<&Rows> {
+        if let Self::Columns(columns) = self {
+            let rows = converter.convert_columns(columns)?;
+            encoded.add(rows.num_rows());
+            *self = Self::Rows(rows);
+        }
+        match self {
+            Self::Rows(rows) => Ok(rows),
+            Self::Columns(_) => unreachable!("columns were encoded above"),
+        }
+    }
 }
 
 struct BoundedMergeStream {
@@ -191,6 +221,7 @@ struct BoundedMergeStream {
     context: Arc<TaskContext>,
     expr: LexOrdering,
     converter: RowConverter,
+    primitive_lead: bool,
     schema: SchemaRef,
     bounds: Vec<Option<i64>>,
     inputs: Vec<Input>,
@@ -230,15 +261,67 @@ impl BoundedMergeStream {
 
     fn head(&mut self, slot_batch: RecordBatch) -> Result<Head> {
         let columns = self.expr.iter().map(|sort| sort.expr.evaluate(&slot_batch)?.into_array(slot_batch.num_rows())).collect::<Result<Vec<_>>>()?;
-        let rows = self.converter.convert_columns(&columns)?;
-        self.encoded.add(rows.num_rows());
         let lead = cast(&columns[0], &DataType::Int64)?
             .as_any()
             .downcast_ref::<Int64Array>()
             .cloned()
             .ok_or_else(|| datafusion::error::DataFusionError::Internal("BoundedMergeExec leading key is not integer-like".into()))?;
+        let mut rows = SortKeys::Columns(columns);
+        if !self.primitive_lead {
+            rows.rows(&self.converter, &self.encoded)?;
+        }
         self.pool.push(slot_batch);
         Ok(Head { slot: self.pool.len() - 1, rows, lead, cursor: 0 })
+    }
+
+    fn compare_heads(&mut self, a: usize, b: usize) -> Result<Ordering> {
+        // Selection visits inputs in order, so the current best precedes b.
+        let (before, after) = self.inputs.split_at_mut(b);
+        let Input::Open { head: Some(a), .. } = &mut before[a] else { unreachable!("selection requires a head") };
+        let Input::Open { head: Some(b), .. } = &mut after[0] else { unreachable!("selection requires a head") };
+        if self.primitive_lead {
+            let options = self.expr.first().options;
+            let order = match (a.leading(), b.leading()) {
+                (None, None) => Ordering::Equal,
+                (None, Some(_)) => {
+                    if options.nulls_first {
+                        Ordering::Less
+                    } else {
+                        Ordering::Greater
+                    }
+                }
+                (Some(_), None) => {
+                    if options.nulls_first {
+                        Ordering::Greater
+                    } else {
+                        Ordering::Less
+                    }
+                }
+                (Some(a), Some(b)) => {
+                    if options.descending {
+                        b.cmp(&a)
+                    } else {
+                        a.cmp(&b)
+                    }
+                }
+            };
+            if order != Ordering::Equal {
+                return Ok(order);
+            }
+        }
+        Ok(a.rows.rows(&self.converter, &self.encoded)?.row(a.cursor).cmp(&b.rows.rows(&self.converter, &self.encoded)?.row(b.cursor)))
+    }
+
+    fn best_head(&mut self) -> Result<Option<usize>> {
+        (0..self.inputs.len()).try_fold(None, |best, p| {
+            if !matches!(self.inputs[p], Input::Open { head: Some(_), .. }) {
+                return Ok(best);
+            }
+            Ok(Some(match best {
+                Some(best) if self.compare_heads(best, p)? != Ordering::Greater => best,
+                _ => p,
+            }))
+        })
     }
 
     /// Build the output from the picked rows, then keep only the batches heads still point into.
@@ -296,13 +379,13 @@ impl BoundedMergeStream {
                     Err(error) => Poll::Ready(Some(Err(error))),
                 };
             }
-            let best = (0..self.inputs.len())
-                .filter_map(|p| match &self.inputs[p] {
-                    Input::Open { head: Some(head), .. } => Some((p, head)),
-                    _ => None,
-                })
-                .min_by(|(_, a), (_, b)| a.rows.row(a.cursor).cmp(&b.rows.row(b.cursor)))
-                .map(|(p, head)| (p, (!head.lead.is_null(head.cursor)).then(|| head.lead.value(head.cursor))));
+            let best = match self.best_head() {
+                Ok(best) => best.map(|p| {
+                    let Input::Open { head: Some(head), .. } = &self.inputs[p] else { unreachable!("selected input has a head") };
+                    (p, head.leading())
+                }),
+                Err(error) => return Poll::Ready(Some(Err(error))),
+            };
             let Some((p, lead)) = best else {
                 // Every open input ran dry: widen the window so a needle keeps its fan-out.
                 let mut opened = false;
@@ -331,7 +414,7 @@ impl BoundedMergeStream {
             let Input::Open { head: Some(head), .. } = &mut self.inputs[p] else { unreachable!("best is an open input with a head") };
             self.picked.push((head.slot, head.cursor));
             head.cursor += 1;
-            if head.cursor == head.rows.num_rows()
+            if head.cursor == head.lead.len()
                 && let Input::Open { head, .. } = &mut self.inputs[p]
             {
                 *head = None;
@@ -613,6 +696,64 @@ mod tests {
         let plan = Arc::new(BoundedMergeExec::new(input, ordering(), vec![None; 2], None));
         assert_eq!(rows(Arc::clone(&plan) as _).await, want);
         plan.metrics().unwrap().sum_by_name("key_rows_encoded").map(|value| value.as_usize())
+    }
+
+    #[test_case::test_case(DataType::Int64, false; "integer and strings")]
+    #[test_case::test_case(DataType::Timestamp(datafusion::arrow::datatypes::TimeUnit::Microsecond, None), true; "timestamp and dictionaries")]
+    #[test_case::test_case(DataType::Float64, true; "fractional fallback and dictionaries")]
+    #[tokio::test]
+    async fn nullable_compound_keys_preserve_order(data_type: DataType, dictionary: bool) {
+        use datafusion::{
+            arrow::array::{DictionaryArray, Float64Array, StringArray},
+            physical_plan::sorts::sort::SortExec,
+        };
+        let lead: ArrayRef = if data_type == DataType::Float64 {
+            Arc::new(Float64Array::from(vec![Some(-2.5), None, Some(3.5), Some(3.25)]))
+        } else {
+            cast(&Int64Array::from(vec![Some(i64::MIN + 1), None, Some(i64::MAX - 1), Some(0)]), &data_type).unwrap()
+        };
+        let batches: Vec<Vec<RecordBatch>> = [vec![Some("z"), Some("b"), None, Some("a")], vec![Some("a"), None, Some("z"), Some("b")]]
+            .into_iter()
+            .map(|ids| {
+                let ids: ArrayRef = if dictionary {
+                    Arc::new(ids.into_iter().collect::<DictionaryArray<datafusion::arrow::datatypes::Int32Type>>())
+                } else {
+                    Arc::new(StringArray::from(ids))
+                };
+                let schema = Arc::new(Schema::new(vec![Field::new("ts", data_type.clone(), true), Field::new("id", ids.data_type().clone(), true)]));
+                vec![RecordBatch::try_new(schema, vec![lead.clone(), ids]).unwrap()]
+            })
+            .chain([Vec::new()])
+            .collect();
+        let schema = batches[0][0].schema();
+        let values = |batches: Vec<RecordBatch>| {
+            batches
+                .into_iter()
+                .flat_map(|batch| {
+                    (0..batch.num_rows())
+                        .map(|row| batch.columns().iter().map(|col| ScalarValue::try_from_array(col, row).unwrap()).collect::<Vec<_>>())
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+        };
+        for descending in [false, true] {
+            for nulls_first in [false, true] {
+                let ordering = LexOrdering::new([
+                    PhysicalSortExpr::new(Arc::new(Column::new("ts", 0)), SortOptions { descending, nulls_first }),
+                    PhysicalSortExpr::new(Arc::new(Column::new("id", 1)), SortOptions { descending: !descending, nulls_first }),
+                ])
+                .unwrap();
+                let input = MemorySourceConfig::try_new_exec(&batches, schema.clone(), None).unwrap();
+                let input: Arc<dyn ExecutionPlan> = Arc::new(SortExec::new(ordering.clone(), input).with_preserve_partitioning(true));
+                let want = Arc::new(SortPreservingMergeExec::new(ordering.clone(), input.clone()));
+                let got = Arc::new(BoundedMergeExec::new(input, ordering, vec![None; 3], None));
+                let context = Arc::new(TaskContext::default());
+                let want = datafusion::physical_plan::collect(want, context.clone()).await.unwrap();
+                let actual = datafusion::physical_plan::collect(got.clone(), context).await.unwrap();
+                assert_eq!(values(actual), values(want), "{data_type:?}, descending={descending}, nulls_first={nulls_first}");
+                assert_eq!(got.metrics().unwrap().sum_by_name("key_rows_encoded").map(|v| v.as_usize()), Some(8), "ties encode each batch once");
+            }
+        }
     }
 
     /// The point of the operator: a latest-3 over six hourly inputs reads only the newest.
