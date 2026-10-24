@@ -920,7 +920,7 @@ mod peel_tests {
 
 // Transparent Tantivy acceleration for standard SQL predicates: LIKE / ILIKE /
 // `=` / `IN` / literal-substring regex on tantivy-indexed columns gain an
-// additively AND-ed `text_match(col, q)` call, which `ProjectRoutingTable` turns
+// additively AND-ed routing hint, which `ProjectRoutingTable` turns
 // into an `id IN (...)` prefilter narrowing the Delta scan.
 //
 // Correctness invariants:
@@ -943,7 +943,7 @@ use datafusion::{
 
 use crate::tantivy::{
     DEFAULT_TOKENIZER, NGRAM3_TOKENIZER, RAW_TOKENIZER,
-    udf::{NGRAM_MIN_QUERY_LEN, TEXT_MATCH_NAME, TextMatchUdf, classify_like_pattern, is_eq_term_safe, regex_literal_substring},
+    udf::{NGRAM_MIN_QUERY_LEN, RoutingHintUdf, classify_like_pattern, is_eq_term_safe, is_search_predicate, regex_literal_substring},
 };
 
 /// Per-column index facts: the resolved tokenizer, and the text the index holds.
@@ -1001,13 +1001,13 @@ fn rewrite_node(plan: LogicalPlan, allow_eq: bool) -> Result<Transformed<Logical
     }
 }
 
-/// Longest IN-list expanded into an OR of `text_match` calls; beyond this the
+/// Longest IN-list expanded into an OR of routing hints; beyond this the
 /// per-item query cost outweighs the pruning.
 const MAX_ROUTED_IN_LIST: usize = 100;
 
 fn rewrite_expr(expr: Expr, indexed_columns: &IndexedCols, allow_eq: bool) -> Result<Transformed<Expr>> {
-    // Skip the children of a text_match call (already a tantivy predicate).
-    if matches!(&expr, Expr::ScalarFunction(sf) if sf.func.name() == TEXT_MATCH_NAME) {
+    // Skip explicit text_match calls and generated routing hints.
+    if matches!(&expr, Expr::ScalarFunction(sf) if is_search_predicate(sf.func.name())) {
         return Ok(Transformed::new(expr, false, TreeNodeRecursion::Jump));
     }
     let tantivy = match_indexed_predicate(&expr, indexed_columns, allow_eq).map(|(column, route)| route.into_call(column)).or_else(|| {
@@ -1048,15 +1048,15 @@ fn eq_term_route(rhs: &Expr) -> Option<Route> {
 /// How a routed predicate reaches tantivy.
 #[derive(Debug, PartialEq)]
 enum Route {
-    /// Literal classified at plan time → `text_match(col, query)`.
+    /// Literal classified at plan time.
     Ready(String),
-    /// `$N` placeholder, emitted as `text_match(col, $N, kind)`; the scan-side
+    /// `$N` placeholder carried with its predicate kind; the scan-side
     /// collector classifies it once the literal is known.
     Deferred { rhs: Expr, kind: String },
 }
 
 impl Route {
-    /// `text_match(col, query)` — or `text_match(col, $N, kind)` when deferred.
+    /// Internal hint carrying the column, query, and optional deferred kind.
     fn into_call(self, column: String) -> Expr {
         // Cached Arc — analyzer rules run on every query.
         static CELL: OnceLock<Arc<ScalarUDF>> = OnceLock::new();
@@ -1065,7 +1065,7 @@ impl Route {
             Route::Ready(query) => vec![col, lit(query)],
             Route::Deferred { rhs, kind } => vec![col, rhs, lit(kind)],
         };
-        call_udf(CELL.get_or_init(|| Arc::new(ScalarUDF::from(TextMatchUdf::default()))), args)
+        call_udf(CELL.get_or_init(|| Arc::new(ScalarUDF::from(RoutingHintUdf::default()))), args)
     }
 }
 
@@ -1280,6 +1280,44 @@ mod tantivy_rewriter_tests {
 
     fn ready(c: &str, q: &str) -> Option<(String, Route)> {
         Some((c.to_string(), Route::Ready(q.to_string())))
+    }
+
+    #[test]
+    fn generated_routing_hint_does_not_filter_rows() {
+        use datafusion::{
+            arrow::datatypes::Field,
+            logical_expr::{ColumnarValue, ScalarFunctionArgs},
+        };
+        for route in [Route::Ready("timeout".into()), Route::Deferred { rhs: lit("%timeout%"), kind: format!("ilike:{NGRAM3_TOKENIZER}") }] {
+            let hint = route.into_call("body".into());
+            assert_eq!(
+                collect_text_match_tree(std::slice::from_ref(&hint)),
+                Some(PredNode::Leaf(crate::tantivy::udf::TextMatchPred { column: "body".into(), query: "timeout".into() }))
+            );
+            let Expr::ScalarFunction(sf) = hint else { panic!("routing function") };
+            let args = sf
+                .args
+                .iter()
+                .map(|e| {
+                    ColumnarValue::Scalar(match e {
+                        Expr::Column(_) => ScalarValue::Utf8(Some("unrelated".into())),
+                        Expr::Literal(value, _) => value.clone(),
+                        _ => panic!("routing argument"),
+                    })
+                })
+                .collect();
+            let value = sf
+                .func
+                .invoke_with_args(ScalarFunctionArgs {
+                    args,
+                    arg_fields: vec![],
+                    number_rows: 1,
+                    return_field: Arc::new(Field::new("", DataType::Boolean, false)),
+                    config_options: Arc::new(datafusion::config::ConfigOptions::default()),
+                })
+                .unwrap();
+            assert!(matches!(value, ColumnarValue::Scalar(ScalarValue::Boolean(Some(true)))), "the original predicate owns row evaluation");
+        }
     }
 
     /// Exact `=` routes only on a raw column; every other shape (ngram3, `!=`,

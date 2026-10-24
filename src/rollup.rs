@@ -1535,7 +1535,9 @@ fn strip_index_hints(operands: &mut Vec<&datafusion::logical_expr::Expr>) {
     use datafusion::logical_expr::{Expr, Operator};
     fn hint_column(expr: &Expr) -> Option<String> {
         match unaliased(expr) {
-            Expr::ScalarFunction(function) if function.name() == "text_match" => column_name(function.args.first()?).map(str::to_string),
+            Expr::ScalarFunction(function) if crate::tantivy::udf::is_search_predicate(function.name()) => {
+                column_name(function.args.first()?).map(str::to_string)
+            }
             // The IN-list spelling is an OR subtree of per-item `text_match`
             // calls; only an OR whose EVERY leaf hints the same column is a hint.
             Expr::BinaryExpr(binary) if binary.op == Operator::Or => {
@@ -3024,23 +3026,22 @@ mod tests {
     #[test]
     fn a_filter_carrying_tantivy_hints_matches_the_same_filter_without_them() {
         use datafusion::logical_expr::{col, lit};
-        let text_match = |args: Vec<datafusion::logical_expr::Expr>| {
-            datafusion::logical_expr::Expr::ScalarFunction(datafusion::logical_expr::expr::ScalarFunction::new_udf(
-                crate::tantivy::udf::text_match_udf().into(),
-                args,
-            ))
-        };
-        let base = col("kind").eq(lit("server")).or(col("name").eq(lit("monoscope.http")));
-        // What the declared measure filter canonicalizes to (one hint).
-        let declared = col("kind").eq(lit("server")).and(text_match(vec![col("kind"), lit("server")])).or(col("name").eq(lit("monoscope.http")));
-        // What the query carries: a second hint, in the three-arg arity.
-        let query = col("kind")
-            .eq(lit("server"))
-            .and(text_match(vec![col("kind"), lit("server")]))
-            .and(text_match(vec![col("kind"), lit("server"), lit("eq")]))
-            .or(col("name").eq(lit("monoscope.http")));
-        assert_eq!(canonical_and([&query]), canonical_and([&declared]), "hint arity must not decide whether a panel routes");
-        assert_eq!(canonical_and([&query]), canonical_and([&base]), "a hint is an accelerator, not a predicate");
+        for udf in [crate::tantivy::udf::text_match_udf(), datafusion::logical_expr::ScalarUDF::from(crate::tantivy::udf::RoutingHintUdf::default())] {
+            let text_match = |args: Vec<datafusion::logical_expr::Expr>| {
+                datafusion::logical_expr::Expr::ScalarFunction(datafusion::logical_expr::expr::ScalarFunction::new_udf(udf.clone().into(), args))
+            };
+            let base = col("kind").eq(lit("server")).or(col("name").eq(lit("monoscope.http")));
+            // What the declared measure filter canonicalizes to (one hint).
+            let declared = col("kind").eq(lit("server")).and(text_match(vec![col("kind"), lit("server")])).or(col("name").eq(lit("monoscope.http")));
+            // What the query carries: a second hint, in the three-arg arity.
+            let query = col("kind")
+                .eq(lit("server"))
+                .and(text_match(vec![col("kind"), lit("server")]))
+                .and(text_match(vec![col("kind"), lit("server"), lit("eq")]))
+                .or(col("name").eq(lit("monoscope.http")));
+            assert_eq!(canonical_and([&query]), canonical_and([&declared]), "hint arity must not decide whether a panel routes");
+            assert_eq!(canonical_and([&query]), canonical_and([&base]), "a hint is an accelerator, not a predicate");
+        }
     }
 
     /// `AND` is idempotent, so a conjunct the optimizer leaves on both the Filter

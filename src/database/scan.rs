@@ -2478,14 +2478,14 @@ impl TableProvider for ProjectRoutingTable {
     fn supports_filters_pushdown(&self, filter: &[&Expr]) -> DFResult<Vec<TableProviderFilterPushDown>> {
         // The delta-kernel scan cannot evaluate predicates on Variant columns, so mark those
         // filters `Unsupported` and let DataFusion apply them in a FilterExec above the scan —
-        // except `text_match`, which `scan()` routes to the index and keeps off the legs.
+        // except text_match and routing hints, which scan() routes only to the index.
         let mutable = Self::version_mutable_columns(&self.table_name);
         Ok(filter
             .iter()
             .map(|f| {
                 if Self::references_tombstone(&self.table_name, f) {
                     TableProviderFilterPushDown::Unsupported
-                } else if matches!(f, Expr::ScalarFunction(sf) if sf.name() == crate::tantivy::udf::TEXT_MATCH_NAME) {
+                } else if matches!(f, Expr::ScalarFunction(sf) if crate::tantivy::udf::is_search_predicate(sf.name())) {
                     TableProviderFilterPushDown::Inexact
                 } else if self.references_variant(f) {
                     TableProviderFilterPushDown::Unsupported
