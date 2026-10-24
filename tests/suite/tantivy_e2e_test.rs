@@ -1383,6 +1383,13 @@ async fn retained_browser_fixture_other_wire_pairs() -> Result<()> {
     retained_browser_fixture(RetainedCheck::Pages(PageRun::OtherPairs)).await
 }
 
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+#[ignore = "requires retained calibrated browser inputs; isolates the three-hour admission and overflow guards"]
+async fn retained_browser_fixture_preserves_three_hour_candidate_guards() -> Result<()> {
+    retained_browser_fixture(RetainedCheck::PredicateGuards).await
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PageRun {
     FirstPair,
@@ -1393,6 +1400,7 @@ enum PageRun {
 enum RetainedCheck {
     Recovery,
     Pages(PageRun),
+    PredicateGuards,
 }
 
 async fn retained_browser_fixture(check: RetainedCheck) -> Result<()> {
@@ -1476,6 +1484,11 @@ async fn retained_browser_fixture(check: RetainedCheck) -> Result<()> {
         );
         drop(table);
         arms.push((db, ctx));
+    }
+    if matches!(&check, RetainedCheck::PredicateGuards) {
+        let (on, ctx) = &arms[0];
+        let (_, ctx_off) = &arms[1];
+        return verify_candidate_predicates(on, ctx, ctx_off, &replay.project, replay.prepared_end_micros, 90, true).await;
     }
     if let RetainedCheck::Pages(run) = check {
         let mut arms = arms.into_iter();
@@ -1740,7 +1753,7 @@ async fn verify_mutable_candidate_input(
 ) -> Result<()> {
     use timefusion::{database::scan_metric_names::PREFILTER_MUTABLE_CANDIDATES, observability::counter_value};
     let MutableCandidateInput { on, ctx, off, ctx_off, p, now, index_bytes, own_delta_bytes, has_background } = input;
-    let (table, hash) = ("otel_logs_and_spans", "pat:E12e74a9");
+    let hash = "pat:E12e74a9";
     let (window_hours, budget_secs) = match contract {
         PageContract::IssueSample => (3, 4),
         PageContract::LogExplorer => (14 * 24, 90),
@@ -2015,6 +2028,47 @@ async fn verify_mutable_candidate_input(
     if run != PageRun::Contract {
         return Ok(());
     }
+    verify_candidate_predicates(&on, &ctx, &ctx_off, &p, now, budget_secs, requires_raw_fallback).await
+}
+
+async fn verify_candidate_predicates(
+    on: &Database, ctx: &SessionContext, ctx_off: &SessionContext, p: &str, now: i64, budget_secs: u64, wide_requires_raw_fallback: bool,
+) -> Result<()> {
+    use timefusion::{database::scan_metric_names::PREFILTER_MUTABLE_CANDIDATES, observability::counter_value};
+    let (table, hash) = ("otel_logs_and_spans", "pat:E12e74a9");
+    let search = on.tantivy_search().expect("search service");
+    let covered = timefusion::tantivy::load_manifest(search.object_store.as_ref(), table, p)
+        .await?
+        .entries
+        .into_values()
+        .flat_map(|entry| entry.covered_files)
+        .filter_map(|uri| timefusion::tantivy::search::parquet_rel_of_uri(&uri).map(str::to_owned))
+        .collect::<std::collections::HashSet<_>>();
+    let target = on.resolve_table(p, table).await?;
+    let target = target.read().await;
+    let upper = chrono::DateTime::from_timestamp_micros(now).unwrap().date_naive().to_string();
+    let raw_bytes = |lo| -> u64 {
+        let lower = chrono::DateTime::from_timestamp_micros(lo).unwrap().date_naive().to_string();
+        target
+            .snapshot()
+            .unwrap()
+            .log_data()
+            .iter()
+            .filter(|file| {
+                let partitions = file.partition_values_map();
+                partitions.get("project_id").and_then(Option::as_deref).is_none_or(|project| project == p)
+                    && partitions.get("date").and_then(Option::as_deref).is_none_or(|date| date >= lower.as_str() && date <= upper.as_str())
+                    && !covered.contains(file.path().as_ref())
+            })
+            .map(|file| file.size() as u64)
+            .sum()
+    };
+    let (wide_bytes, narrow_bytes) = (raw_bytes(now - 14 * 86_400_000_000), raw_bytes(now - 3 * 3_600_000_000));
+    let cap = 512 << 20;
+    assert_eq!(wide_bytes > cap, wide_requires_raw_fallback, "preserve the broad-window corpus budget");
+    assert!(narrow_bytes <= cap, "the separate three-hour guard must fit the unchanged planning cap: {narrow_bytes}");
+    eprintln!("browser_candidate_guard_budget wide_bytes={wide_bytes} three_hour_bytes={narrow_bytes} cap={cap}");
+    drop(target);
     for predicate in [
         format!("array_has(hashes, '{hash}')"),
         format!("'{hash}' = ANY(hashes)"),
@@ -2026,26 +2080,21 @@ async fn verify_mutable_candidate_input(
             now - 3 * 3_600_000_000
         );
         let before = counter_value(PREFILTER_MUTABLE_CANDIDATES);
-        let (ids, narrowed) = tokio::time::timeout(std::time::Duration::from_secs(budget_secs), ids_and_dedup_input(&ctx, &sql)).await??;
-        assert_eq!(counter_value(PREFILTER_MUTABLE_CANDIDATES), before + u64::from(!requires_raw_fallback), "{predicate} must preserve candidate admission");
+        let (ids, narrowed) = tokio::time::timeout(std::time::Duration::from_secs(budget_secs), ids_and_dedup_input(ctx, &sql)).await??;
+        assert_eq!(counter_value(PREFILTER_MUTABLE_CANDIDATES), before + 1, "{predicate} must preserve candidate admission");
         assert_eq!(ids, ["kept", "late", "solo"], "{predicate}");
-        let (baseline, full) = tokio::time::timeout(std::time::Duration::from_secs(budget_secs), ids_and_dedup_input(&ctx_off, &sql)).await??;
+        let (baseline, full) = tokio::time::timeout(std::time::Duration::from_secs(budget_secs), ids_and_dedup_input(ctx_off, &sql)).await??;
         assert_eq!(ids, baseline);
-        if requires_raw_fallback {
-            assert_eq!(narrowed, full, "{predicate}: over-budget input must retain the exact raw fallback");
-        } else {
-            assert!(narrowed <= 8, "{predicate}: dedup must see only candidate versions: {narrowed} vs {full}");
-        }
+        assert!(narrowed <= 8, "{predicate}: the bounded three-hour query must dedup only candidate versions: {narrowed} vs {full}");
         assert!(full >= 60, "{predicate}: the raw oracle must retain its full input");
     }
     // Over the cap the search is refused, and a page polling the same hash must not pay it again.
-    let search = on.tantivy_search().expect("search service");
     let (other, window) =
         (timefusion::tantivy::histogram::Membership::Contains { column: "hashes".into(), value: "other".into() }, Some((now - 3 * 3_600_000_000, now)));
     let touched = || search.stats.reader_hits.load(std::sync::atomic::Ordering::Relaxed) + search.stats.index_opens.load(std::sync::atomic::Ordering::Relaxed);
-    assert!(search.membership_timestamps(table, &p, &other, 5, window).await?.is_none(), "60 fillers exceed a cap of 5");
+    assert!(search.membership_timestamps(table, p, &other, 5, window).await?.is_none(), "60 fillers exceed a cap of 5");
     let before = touched();
-    assert!(search.membership_timestamps(table, &p, &other, 5, window).await?.is_none());
+    assert!(search.membership_timestamps(table, p, &other, 5, window).await?.is_none());
     assert_eq!(touched(), before, "a remembered overflow must not open an index");
     Ok(())
 }
