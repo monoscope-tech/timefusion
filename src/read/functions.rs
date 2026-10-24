@@ -9,8 +9,8 @@ use chrono_tz::Tz;
 use datafusion::{
     arrow::{
         array::{
-            Array, ArrayRef, BinaryArray, BinaryViewArray, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
-            StringArray, StringViewArray, TimestampMicrosecondArray, TimestampNanosecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+            Array, ArrayRef, BinaryArray, BinaryViewArray, BooleanArray, Decimal128Array, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array,
+            Int64Array, StringArray, StringViewArray, TimestampMicrosecondArray, TimestampNanosecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
         },
         datatypes::{DataType, Field, FieldRef, IntervalUnit, TimeUnit},
     },
@@ -159,6 +159,15 @@ pub(super) enum PathComponent {
 }
 
 impl ExprPlanner for VariantAwareExprPlanner {
+    fn plan_extract(&self, args: Vec<Expr>) -> datafusion::error::Result<PlannerResult<Vec<Expr>>> {
+        if let [Expr::Literal(part, _), _] = args.as_slice()
+            && extract_utf8_string(part).is_some_and(|part| part.eq_ignore_ascii_case("epoch"))
+        {
+            return Ok(PlannerResult::Planned(udf_call(exact_epoch_udf(), args)));
+        }
+        Ok(PlannerResult::Original(args))
+    }
+
     fn plan_binary_op(&self, expr: RawBinaryExpr, schema: &DFSchema) -> datafusion::error::Result<PlannerResult<RawBinaryExpr>> {
         // PG array overlap: `a && b` → array_has_any(a, b), which DataFusion's
         // NestedFunctionPlanner does not cover. Only when both sides are lists.
@@ -549,6 +558,7 @@ macro_rules! shared_udf {
     };
 }
 
+shared_udf!(exact_epoch_udf: ExactEpochUDF);
 shared_udf!(pub variant_to_json_udf: VariantToJsonExtUdf);
 shared_udf!(pub variant_get_udf: VariantGetExtUdf);
 shared_udf!(pub variant_get_step_udf: VariantGetStepUdf);
@@ -1032,6 +1042,35 @@ macro_rules! jsonb_wrapper {
 }
 jsonb_wrapper!(JsonbBuildArrayUDF, JsonBuildArrayUDF, "jsonb_build_array");
 jsonb_wrapper!(ToJsonbUDF, ToJsonUDF, "to_jsonb");
+
+// SQL EXTRACT returns numeric, while date_part deliberately returns double precision.
+// Keep the planner's date_part name and arguments so projection names stay stable.
+udf_struct!(ExactEpochUDF, datafusion::functions::datetime::date_part().signature().clone());
+
+impl ScalarUDFImpl for ExactEpochUDF {
+    udf_boilerplate!("date_part");
+
+    fn return_type(&self, args: &[DataType]) -> datafusion::error::Result<DataType> {
+        Ok(if matches!(args.get(1), Some(DataType::Timestamp(..))) { DataType::Decimal128(28, 9) } else { DataType::Float64 })
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> datafusion::error::Result<ColumnarValue> {
+        let [_, source] = args_n::<2>(&args.args, "date_part", "")?;
+        let DataType::Timestamp(unit, _) = source.data_type() else {
+            // Preserve the existing date/interval extraction path.
+            return datafusion::functions::datetime::date_part().invoke_with_args(args);
+        };
+        let scale: i128 = match unit {
+            TimeUnit::Second => 1_000_000_000,
+            TimeUnit::Millisecond => 1_000_000,
+            TimeUnit::Microsecond => 1_000,
+            TimeUnit::Nanosecond => 1,
+        };
+        let ticks = datafusion::arrow::compute::cast(&as_array(source)?, &DataType::Int64)?;
+        let nanos: Decimal128Array = downcast::<Int64Array>(ticks.as_ref(), "timestamp ticks")?.iter().map(|v| v.map(|v| i128::from(v) * scale)).collect();
+        Ok(ColumnarValue::Array(Arc::new(nanos.with_precision_and_scale(28, 9).map_err(arrow_err)?)))
+    }
+}
 
 udf_struct!(ExtractEpochUDF, Signature::any(1, Volatility::Immutable));
 
@@ -2058,6 +2097,46 @@ mod tests {
     #[test_case::test_case("DY YYYY" => vec![FmtPart::PgDY, FmtPart::Chrono(" %Y".to_string())] ; "pg DY splits the chrono buffer")]
     fn test_parse_pg_format(fmt: &str) -> Vec<FmtPart> {
         parse_pg_format(fmt)
+    }
+
+    #[test_case::test_case("to_timestamp_nanos(1792854698319451123)" => "1792854698319451123"; "nanoseconds")]
+    #[test_case::test_case("to_timestamp_micros(1792854698319451)" => "1792854698319451000"; "microseconds")]
+    #[test_case::test_case("to_timestamp_millis(1792854698319)" => "1792854698319000000"; "milliseconds")]
+    #[test_case::test_case("to_timestamp_seconds(1792854698)" => "1792854698000000000"; "seconds")]
+    #[test_case::test_case("to_timestamp_nanos(-1)" => "-1"; "before epoch")]
+    #[test_case::test_case("to_timestamp_nanos(1792854698319451123) AT TIME ZONE 'UTC'" => "1792854698319451123"; "timezone")]
+    #[test_case::test_case("CAST(NULL AS TIMESTAMP)" => "null"; "null")]
+    #[test_case::test_case("DATE '1970-01-02'" => "86400000000000"; "date fallback")]
+    #[test_case::test_case("INTERVAL '-1 microsecond'" => "-1000"; "interval fallback")]
+    #[tokio::test]
+    async fn extract_epoch_preserves_nanoseconds(source: &str) -> String {
+        // Match Database's planner order: the default datetime planner claims EXTRACT.
+        let state = datafusion::execution::SessionStateBuilder::new()
+            .with_default_features()
+            .with_expr_planners(
+                std::iter::once(Arc::new(VariantAwareExprPlanner) as Arc<dyn ExprPlanner>)
+                    .chain(datafusion::execution::SessionStateDefaults::default_expr_planners())
+                    .collect(),
+            )
+            .build();
+        let mut ctx = datafusion::prelude::SessionContext::new_with_state(state);
+        register_custom_functions(&mut ctx).unwrap();
+        let batches = ctx
+            .sql(&format!("SELECT coalesce(CAST(CAST(EXTRACT(EPOCH FROM ({source})) * 1000000000 AS BIGINT) AS TEXT), 'null')"))
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        batches[0].column(0).as_any().downcast_ref::<StringViewArray>().unwrap().value(0).to_string()
+    }
+
+    #[test_case::test_case("date_part('epoch', to_timestamp_micros(1792854698319451))"; "date part")]
+    #[test_case::test_case("extract_epoch(to_timestamp_micros(1792854698319451))"; "compatibility function")]
+    #[tokio::test]
+    async fn floating_epoch_apis_keep_their_type(expression: &str) {
+        let batches = udf_ctx().sql(&format!("SELECT {expression}")).await.unwrap().collect().await.unwrap();
+        assert_eq!(batches[0].column(0).data_type(), &DataType::Float64);
     }
 
     /// End-to-end `to_char` parity; expected outputs captured from Postgres 16.
