@@ -153,6 +153,7 @@ impl ExecutionPlan for BoundedMergeExec {
             schema,
             bounds: self.bounds.clone(),
             inputs: (0..self.bounds.len()).map(|_| Input::Closed).collect(),
+            winners: vec![None; 2 * self.bounds.len().max(1).next_power_of_two()],
             closed,
             needs_head: Vec::new(),
             read_ahead: INITIAL_READ_AHEAD,
@@ -165,6 +166,8 @@ impl ExecutionPlan for BoundedMergeExec {
             encoded: MetricBuilder::new(&self.metrics).counter("key_rows_encoded", partition),
             head_slots_checked: MetricBuilder::new(&self.metrics).counter("head_slots_checked", partition),
             pending_head_slots: 0,
+            key_comparisons: MetricBuilder::new(&self.metrics).counter("key_comparisons", partition),
+            pending_key_comparisons: 0,
             baseline: BaselineMetrics::new(&self.metrics, partition),
         };
         while stream.closed.last().is_some_and(|&p| stream.bounds[p].is_none()) {
@@ -228,6 +231,8 @@ struct BoundedMergeStream {
     schema: SchemaRef,
     bounds: Vec<Option<i64>>,
     inputs: Vec<Input>,
+    /// Complete tournament tree; leaves follow partition order, preserving stable ties.
+    winners: Vec<Option<usize>>,
     /// Inputs not yet opened, the next to open LAST.
     closed: Vec<usize>,
     /// Open inputs waiting for a batch; ready heads need no further polling.
@@ -243,6 +248,8 @@ struct BoundedMergeStream {
     encoded: Count,
     head_slots_checked: Count,
     pending_head_slots: usize,
+    key_comparisons: Count,
+    pending_key_comparisons: usize,
     baseline: BaselineMetrics,
 }
 
@@ -283,7 +290,8 @@ impl BoundedMergeStream {
     }
 
     fn compare_heads(&mut self, a: usize, b: usize) -> Result<Ordering> {
-        // Selection visits inputs in order, so the current best precedes b.
+        self.pending_key_comparisons += 1;
+        // Winners of the left subtree always precede those of the right subtree.
         let (before, after) = self.inputs.split_at_mut(b);
         let Input::Open { head: Some(a), .. } = &mut before[a] else { unreachable!("selection requires a head") };
         let Input::Open { head: Some(b), .. } = &mut after[0] else { unreachable!("selection requires a head") };
@@ -320,16 +328,19 @@ impl BoundedMergeStream {
         Ok(a.rows.rows(&self.converter, &self.encoded)?.row(a.cursor).cmp(&b.rows.rows(&self.converter, &self.encoded)?.row(b.cursor)))
     }
 
-    fn best_head(&mut self) -> Result<Option<usize>> {
-        (0..self.inputs.len()).try_fold(None, |best, p| {
-            if !matches!(self.inputs[p], Input::Open { head: Some(_), .. }) {
-                return Ok(best);
-            }
-            Ok(Some(match best {
-                Some(best) if self.compare_heads(best, p)? != Ordering::Greater => best,
-                _ => p,
-            }))
-        })
+    fn update_winner(&mut self, p: usize) -> Result<()> {
+        let mut node = self.winners.len() / 2 + p;
+        self.winners[node] = matches!(self.inputs[p], Input::Open { head: Some(_), .. }).then_some(p);
+        while node > 1 {
+            node /= 2;
+            self.winners[node] = match (self.winners[2 * node], self.winners[2 * node + 1]) {
+                (Some(a), Some(b)) => Some(if self.compare_heads(a, b)? != Ordering::Greater { a } else { b }),
+                (a, b) => a.or(b),
+            };
+            // Recompute every ancestor even if the winner's partition did not change:
+            // advancing its cursor changed the key it contributes to the next match.
+        }
+        Ok(())
     }
 
     /// Build the output from the picked rows, then keep only the batches heads still point into.
@@ -378,6 +389,9 @@ impl BoundedMergeStream {
                             if let Input::Open { head, .. } = &mut self.inputs[p] {
                                 *head = Some(new_head);
                             }
+                            if let Err(error) = self.update_winner(p) {
+                                return Poll::Ready(Some(Err(error)));
+                            }
                         }
                     }
                 }
@@ -390,13 +404,10 @@ impl BoundedMergeStream {
                     Err(error) => Poll::Ready(Some(Err(error))),
                 };
             }
-            let best = match self.best_head() {
-                Ok(best) => best.map(|p| {
-                    let Input::Open { head: Some(head), .. } = &self.inputs[p] else { unreachable!("selected input has a head") };
-                    (p, head.leading())
-                }),
-                Err(error) => return Poll::Ready(Some(Err(error))),
-            };
+            let best = self.winners[1].map(|p| {
+                let Input::Open { head: Some(head), .. } = &self.inputs[p] else { unreachable!("selected input has a head") };
+                (p, head.leading())
+            });
             let Some((p, lead)) = best else {
                 // Every open input ran dry: widen the window so a needle keeps its fan-out.
                 let mut opened = false;
@@ -431,6 +442,9 @@ impl BoundedMergeStream {
                 *head = None;
                 self.needs_head.push(p);
             }
+            if let Err(error) = self.update_winner(p) {
+                return Poll::Ready(Some(Err(error)));
+            }
             self.remaining = self.remaining.map(|n| n - 1);
             if self.picked.len() >= self.batch_size {
                 return Poll::Ready(self.flush().transpose());
@@ -446,6 +460,8 @@ impl Stream for BoundedMergeStream {
         let poll = self.poll_inner(cx);
         let checked = std::mem::take(&mut self.pending_head_slots);
         self.head_slots_checked.add(checked);
+        let comparisons = std::mem::take(&mut self.pending_key_comparisons);
+        self.key_comparisons.add(comparisons);
         self.baseline.record_poll(poll)
     }
 }
@@ -710,6 +726,9 @@ mod tests {
         assert_eq!(tokio::task::unconstrained(rows(Arc::clone(&plan) as _)).await, want);
         let checked = plan.metrics().unwrap().sum_by_name("head_slots_checked").unwrap().as_usize();
         assert_eq!(checked, 2 * partitions.len(), "check each input only for its batch and EOF");
+        let comparisons = plan.metrics().unwrap().sum_by_name("key_comparisons").unwrap().as_usize();
+        let height = partitions.len().next_power_of_two().ilog2() as usize;
+        assert!(comparisons <= (want.len() + 2 * partitions.len()) * height, "selection must update a logarithmic path: {comparisons} comparisons");
     }
 
     #[test_case::test_case(false => Some(0); "unique leading keys")]
