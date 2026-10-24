@@ -4143,7 +4143,7 @@ mod tests {
     /// child would publish a partial bucket the keep-one tier read undercounts.
     #[test_case::test_case("table", Operation::BaseRollup => MIN_SLICE_MICROS ; "base units bisect to the minute")]
     #[test_case::test_case("table", Operation::DerivedRollup => DERIVED_SLICE_MICROS ; "derived units stop at the hour")]
-    #[test_case::test_case(SESSIONS, Operation::BaseRollup => DERIVED_SLICE_MICROS ; "an hour base tier stops at its grain")]
+    #[test_case::test_case(ROUTES_30M, Operation::BaseRollup => 3 * NORMAL_SLICE_MICROS ; "a 30 minute base tier stops at its grain")]
     fn bisection_leaves_never_go_below_the_operation_floor(table: &str, operation: Operation) -> i64 {
         let mut pending = vec![in_logs(task_in(table, "p", 0, DAY_MICROS, operation))];
         let mut leaves = Vec::new();
@@ -4368,7 +4368,7 @@ mod tests {
         task_in("table", project, start, end, operation)
     }
 
-    const SESSIONS: &str = "otel_logs_and_spans_rollup_sessions_1h_v2";
+    const ROUTES_30M: &str = "otel_logs_and_spans_rollup_routes_30m";
     const DASHBOARD_1M: &str = "otel_logs_and_spans_rollup_dashboard_1m_v4";
 
     /// A unit of a real source, so its tier's declared grain applies.
@@ -4377,27 +4377,28 @@ mod tests {
         unit
     }
 
-    /// Every way a unit of an hour base tier is minted lands on whole hours: a write's
+    /// Every way a unit of a 30-minute base tier is minted lands on whole grains: a write's
     /// invalidation, an arbitrary enqueued hole, and a legacy 10-minute fragment at boot.
     #[test]
-    fn an_hour_base_tier_is_only_ever_minted_in_whole_hours() {
+    fn a_coarse_base_tier_is_only_ever_minted_in_whole_grains() {
         const HOUR: i64 = DERIVED_SLICE_MICROS;
+        const GRAIN: i64 = 3 * NORMAL_SLICE_MICROS;
         let (_dir, mut journal) = new_journal();
         journal
             .invalidate(Invalidation {
                 source: "otel_logs_and_spans",
-                ..invalidation(SESSIONS, HOUR + NORMAL_SLICE_MICROS, HOUR + 2 * NORMAL_SLICE_MICROS, 0, false)
+                ..invalidation(ROUTES_30M, HOUR + NORMAL_SLICE_MICROS, HOUR + 2 * NORMAL_SLICE_MICROS, 0, false)
             })
             .expect("invalidate");
-        journal.enqueue(in_logs(task_in(SESSIONS, "p", 3 * HOUR + 7, 4 * HOUR + 1, Operation::BaseRollup)).key, 0, 1, 0);
-        journal.upsert(in_logs(task_in(SESSIONS, "p", 6 * HOUR + NORMAL_SLICE_MICROS, 6 * HOUR + 2 * NORMAL_SLICE_MICROS, Operation::BaseRollup)));
+        journal.enqueue(in_logs(task_in(ROUTES_30M, "p", 3 * HOUR + 7, 4 * HOUR + 1, Operation::BaseRollup)).key, 0, 1, 0);
+        journal.upsert(in_logs(task_in(ROUTES_30M, "p", 6 * HOUR + NORMAL_SLICE_MICROS, 6 * HOUR + 2 * NORMAL_SLICE_MICROS, Operation::BaseRollup)));
         assert_eq!(journal.migrate_sub_grain_slices(), 1, "only the legacy fragment migrates");
         let live = journal
             .tasks()
             .filter(|task| task.key.operation == Operation::BaseRollup && task.state == TaskState::Pending)
             .map(|task| (task.key.slice.start_micros, task.key.slice.end_micros))
             .collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(live, std::collections::BTreeSet::from([(HOUR, 2 * HOUR), (3 * HOUR, 5 * HOUR), (6 * HOUR, 7 * HOUR)]));
+        assert_eq!(live, std::collections::BTreeSet::from([(HOUR, HOUR + GRAIN), (3 * HOUR, 4 * HOUR + GRAIN), (6 * HOUR, 6 * HOUR + GRAIN)]));
     }
 
     /// With `base_hour_units` a write mints a minute base tier's unit as its whole hour, so the
@@ -4442,7 +4443,7 @@ mod tests {
     fn rollup_pause_survives_restart_and_resume_bounds_history(compacted: bool) -> anyhow::Result<()> {
         let (dir, mut journal) = new_journal();
         let source = "otel_logs_and_spans";
-        let table = "otel_logs_and_spans_rollup_sessions_1h_v2";
+        let table = "otel_logs_and_spans_rollup_routes_30m";
         let hour = DERIVED_SLICE_MICROS;
         let unit = |start| {
             let mut unit = task_in(table, "p", start, start + hour, Operation::BaseRollup);
@@ -4527,7 +4528,7 @@ mod tests {
     fn failed_rollup_resume_stays_unclaimable_until_persistence_succeeds(fails_fsync: bool, compacted: bool) -> anyhow::Result<()> {
         let (dir, mut journal) = new_journal();
         let source = "otel_logs_and_spans";
-        let table = "otel_logs_and_spans_rollup_sessions_1h_v2";
+        let table = "otel_logs_and_spans_rollup_routes_30m";
         let mut unit = task_in(table, "p", 0, DERIVED_SLICE_MICROS, Operation::BaseRollup);
         unit.key.source = source.to_owned();
         let key = upserted(&mut journal, unit);
@@ -4621,7 +4622,7 @@ mod tests {
         use std::sync::atomic::Ordering::Relaxed;
         let (_dir, mut journal) = new_journal();
         let source = "otel_logs_and_spans";
-        let table = "otel_logs_and_spans_rollup_sessions_1h_v2";
+        let table = "otel_logs_and_spans_rollup_routes_30m";
         let now = crate::support::now_micros();
         let mut unit = task_in(table, "p", now - DERIVED_SLICE_MICROS, now, Operation::BaseRollup);
         unit.key.source = source.to_owned();
@@ -4725,7 +4726,7 @@ mod tests {
             }),
         );
         let source = "otel_logs_and_spans";
-        let paused = "otel_logs_and_spans_rollup_sessions_1h_v2";
+        let paused = "otel_logs_and_spans_rollup_routes_30m";
         upserted(
             &mut journal,
             task_in(paused, "paused", now - DAY_MICROS, now, Operation::BaseRollup).tap_mut(|task| {
@@ -7629,7 +7630,7 @@ mod tests {
             .collect();
         journal.upsert(unit(derived, 0, DERIVED_SLICE_MICROS, Operation::DerivedRollup));
         assert!(journal.claim_next(Operation::DerivedRollup, 0, true).is_none());
-        let unrelated = upserted(&mut journal, unit("otel_logs_and_spans_rollup_sessions_1h_v2", 0, DERIVED_SLICE_MICROS, Operation::BaseRollup));
+        let unrelated = upserted(&mut journal, unit("otel_logs_and_spans_rollup_routes_30m", 0, DERIVED_SLICE_MICROS, Operation::BaseRollup));
         journal.complete(&unrelated);
         assert!(
             journal.claim_next(Operation::DerivedRollup, 0, true).is_none(),

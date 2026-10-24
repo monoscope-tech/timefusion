@@ -11871,7 +11871,7 @@ mod rollup_noop_skip_tests {
     async fn paused_backfill_creates_no_raw_work_and_resume_bounds_its_scan() -> Result<()> {
         use crate::maintenance_coordinator::{Operation, RollupBuildPolicy, TaskJournal};
         let source = "otel_logs_and_spans";
-        let session_tier = "otel_logs_and_spans_rollup_sessions_1h_v2";
+        let resumed = "otel_logs_and_spans_rollup_routes_30m";
         let project = format!("pause_{}", uuid::Uuid::new_v4());
         let date = crate::support::today_utc() - chrono::Duration::days(3);
         let mut cfg = (*rollup_cfg("paused_backfill_admission")).clone();
@@ -11901,16 +11901,16 @@ mod rollup_noop_skip_tests {
         );
         let start = date.and_hms_opt(12, 0, 0).expect("noon").and_utc().timestamp_micros();
         let end = day_start_micros(date).expect("valid day") + DAY_MICROS;
-        db.journal().set_rollup_build_policy(source, session_tier, RollupBuildPolicy::ResumeFrom { start_micros: start })?;
+        db.journal().set_rollup_build_policy(source, resumed, RollupBuildPolicy::ResumeFrom { start_micros: start })?;
         assert!(db.plan_rollup_backfill().await? > 0, "the permitted suffix must still get built");
         let journal = db.journal();
         let work: Vec<_> = journal.tasks().filter(|task| task.state.is_active()).collect();
         assert!(work.iter().any(|task| task.key.operation == Operation::Dedup));
-        assert!(work.iter().any(|task| task.key.physical_table == session_tier));
+        assert!(work.iter().any(|task| task.key.physical_table == resumed));
         assert!(
             work.iter().all(|task| {
                 task.key.project_id == project
-                    && (task.key.physical_table == source || task.key.physical_table == session_tier)
+                    && (task.key.physical_table == source || task.key.physical_table == resumed)
                     && task.key.slice.start_micros >= start
                     && task.key.slice.end_micros <= end
             }),
@@ -11928,8 +11928,8 @@ mod rollup_noop_skip_tests {
     async fn unverifiable_rebuilds_skip_a_paused_tier() -> Result<()> {
         use crate::maintenance_coordinator::{RollupBuildPolicy, TimeSlice};
         let source = "otel_logs_and_spans";
-        let target = "otel_logs_and_spans_rollup_sessions_1h_v2";
-        let spec = get_schema(source).expect("source schema").rollups.iter().find(|spec| spec.table_name(source) == target).expect("sessions tier").clone();
+        let target = "otel_logs_and_spans_rollup_routes_30m";
+        let spec = get_schema(source).expect("source schema").rollups.iter().find(|spec| spec.table_name(source) == target).expect("route tier").clone();
         let (db, project, date) = rollup_db("paused_rebuilds").await?;
         db.journal().set_rollup_build_policy(source, target, RollupBuildPolicy::Paused)?;
         let day = day_start_micros(date).expect("valid day");
@@ -12294,15 +12294,15 @@ mod rollup_noop_skip_tests {
     #[tokio::test]
     async fn run_unit_once_builds_the_requested_tier() -> Result<()> {
         let (db, project, date) = rollup_db("run_unit_tier").await?;
-        insert_span(&db, &project, date, 12, "a", "documentLoad").await?;
-        let report = db.run_unit_once("otel_logs_and_spans", &project, date, Operation::BaseRollup, 24, 0, Some("sessions_1h_v2")).await?;
+        insert_span(&db, &project, date, 12, "a", "op").await?;
+        let report = db.run_unit_once("otel_logs_and_spans", &project, date, Operation::BaseRollup, 24, 0, Some("routes_30m")).await?;
         assert_eq!(report.state, Some(TaskState::Complete));
         let rows = async |tier: &str, measure: &str| -> Result<Option<i64>> {
             let batches = db.query_delta_only(&format!("SELECT CAST(SUM({measure}) AS BIGINT) FROM {tier} WHERE project_id = '{project}'")).await?;
             use datafusion::arrow::array::AsArray;
             Ok(batches[0].column(0).as_primitive::<datafusion::arrow::datatypes::Int64Type>().iter().next().flatten())
         };
-        assert_eq!(rows("otel_logs_and_spans_rollup_sessions_1h_v2", "event_count").await?, Some(1), "the named tier is built");
+        assert_eq!(rows("otel_logs_and_spans_rollup_routes_30m", "request_count").await?, Some(1), "the named tier is built");
         assert_eq!(rows(TIER, "request_count").await?, None, "the first-declared tier is not");
         Ok(())
     }
@@ -12460,9 +12460,9 @@ mod rollup_noop_skip_tests {
     /// names the statements (each flushed), whether the process restarts, then whether
     /// the slice still routes.
     #[test_case::test_case(&[Stmt::Hashes], false, true ; "hashes only routes")]
-    // Version-only is per tier: `attributes___user___id` is read only by the sessions tier,
-    // so this dashboard slice stays provable; the session id is read by this tier and refutes it.
-    #[test_case::test_case(&[Stmt::User], false, true ; "a column only another tier reads keeps this tier provable")]
+    // Version-only is per tier: `hashes` is read only by the hash tier and `attributes___user___id`
+    // by none, so this dashboard slice stays provable; the session id is read by this tier and refutes it.
+    #[test_case::test_case(&[Stmt::User], false, true ; "a column no tier reads keeps this tier provable")]
     #[test_case::test_case(&[Stmt::Session], false, false ; "a column this tier reads refutes")]
     #[test_case::test_case(&[Stmt::Hashes], true, true ; "hashes only routes after a restart")]
     #[test_case::test_case(&[Stmt::Hashes, Stmt::Hashes], false, true ; "repeated versions of one row route")]
@@ -14157,10 +14157,10 @@ mod rollup_relevance_tests {
     /// tier's inheritance of its base's reads cannot be isolated here: `dashboard_1h_v3`
     /// restates every column its base reads.
     #[test_case::test_case(&["hashes"] => vec!["hashes_30m"] ; "monoscope's hashes enrichment touches only the hash tier")]
-    #[test_case::test_case(&["attributes___user___id"] => vec!["sessions_1h_v2"] ; "user enrichment touches only the session tiers")]
+    #[test_case::test_case(&["attributes___user___id"] => Vec::<String>::new() ; "user enrichment touches no tier")]
     #[test_case::test_case(&["attributes___http___response___status_code"] => vec!["dashboard_1h_v3", "dashboard_1m_v4", "endpoints_1m", "hashes_30m", "routes_30m"] ; "a measure filter column touches the dashboard, endpoint, hash and route tiers")]
-    #[test_case::test_case(&["level"] => vec!["dashboard_1h_v3", "dashboard_1m_v4", "sessions_1h_v2"] ; "a level change touches every tier that reads level")]
-    #[test_case::test_case(&["timestamp"] => vec!["dashboard_1h_v3", "dashboard_1m_v4", "endpoints_1m", "hashes_30m", "routes_30m", "sessions_1h_v2"] ; "moving a row touches every tier")]
+    #[test_case::test_case(&["level"] => vec!["dashboard_1h_v3", "dashboard_1m_v4"] ; "a level change touches every tier that reads level")]
+    #[test_case::test_case(&["timestamp"] => vec!["dashboard_1h_v3", "dashboard_1m_v4", "endpoints_1m", "hashes_30m", "routes_30m"] ; "moving a row touches every tier")]
     fn tiers_reading(columns: &[&str]) -> Vec<String> {
         super::rollup_tiers_reading("otel_logs_and_spans", columns)
             .into_iter()

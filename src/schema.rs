@@ -857,7 +857,7 @@ mod tests {
     fn rollup_tier_unknown_lists_declared_tiers() {
         let err = source().rollup_tier(Some("dashboard_1m_v9"), false).unwrap_err().to_string();
         assert!(err.starts_with("unknown rollup tier dashboard_1m_v9; otel_logs_and_spans declares: "), "{err}");
-        assert!(["dashboard_1m_v4", "dashboard_1h_v3", "sessions_1h_v2"].iter().all(|tier| err.contains(tier)), "{err}");
+        assert!(["dashboard_1m_v4", "dashboard_1h_v3", "routes_30m"].iter().all(|tier| err.contains(tier)), "{err}");
     }
 
     #[test_case("mor_versioned")]

@@ -1934,7 +1934,7 @@ mod pgwire_handlers_tests {
         use anyhow::Context;
         use tokio_postgres::{NoTls, SimpleQueryMessage};
         const SOURCE: &str = "otel_logs_and_spans";
-        const TIER: &str = "otel_logs_and_spans_rollup_sessions_1h_v2";
+        const TIER: &str = "otel_logs_and_spans_rollup_routes_30m";
 
         fn policy(messages: &[SimpleQueryMessage]) -> anyhow::Result<serde_json::Value> {
             let value = messages
@@ -1943,7 +1943,7 @@ mod pgwire_handlers_tests {
                     SimpleQueryMessage::Row(row) if row.get("table") == Some(TIER) => row.get("policy"),
                     _ => None,
                 })
-                .context("session policy row missing")?;
+                .context("tier policy row missing")?;
             Ok(serde_json::from_str(value)?)
         }
 
