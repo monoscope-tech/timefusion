@@ -154,6 +154,7 @@ impl ExecutionPlan for BoundedMergeExec {
             bounds: self.bounds.clone(),
             inputs: (0..self.bounds.len()).map(|_| Input::Closed).collect(),
             closed,
+            needs_head: Vec::new(),
             read_ahead: INITIAL_READ_AHEAD,
             pool: Vec::new(),
             picked: Vec::new(),
@@ -162,6 +163,8 @@ impl ExecutionPlan for BoundedMergeExec {
             opened: MetricBuilder::new(&self.metrics).counter("inputs_opened", partition),
             skipped: MetricBuilder::new(&self.metrics).counter("inputs_never_opened", partition),
             encoded: MetricBuilder::new(&self.metrics).counter("key_rows_encoded", partition),
+            head_slots_checked: MetricBuilder::new(&self.metrics).counter("head_slots_checked", partition),
+            pending_head_slots: 0,
             baseline: BaselineMetrics::new(&self.metrics, partition),
         };
         while stream.closed.last().is_some_and(|&p| stream.bounds[p].is_none()) {
@@ -227,6 +230,8 @@ struct BoundedMergeStream {
     inputs: Vec<Input>,
     /// Inputs not yet opened, the next to open LAST.
     closed: Vec<usize>,
+    /// Open inputs waiting for a batch; ready heads need no further polling.
+    needs_head: Vec<usize>,
     read_ahead: usize,
     /// Batches the pending output rows point into.
     pool: Vec<RecordBatch>,
@@ -236,6 +241,8 @@ struct BoundedMergeStream {
     opened: Count,
     skipped: Count,
     encoded: Count,
+    head_slots_checked: Count,
+    pending_head_slots: usize,
     baseline: BaselineMetrics,
 }
 
@@ -243,6 +250,7 @@ impl BoundedMergeStream {
     fn open_next(&mut self) -> Result<bool> {
         let Some(p) = self.closed.pop() else { return Ok(false) };
         self.inputs[p] = Input::Open { stream: self.input.execute(p, Arc::clone(&self.context))?, head: None };
+        self.needs_head.push(p);
         self.opened.add(1);
         Ok(true)
     }
@@ -350,7 +358,9 @@ impl BoundedMergeStream {
             }
             // Every open input needs a head before any row can be ordered.
             let mut pending = false;
-            for p in 0..self.inputs.len() {
+            self.pending_head_slots = self.pending_head_slots.saturating_add(self.needs_head.len());
+            for index in 0..self.needs_head.len() {
+                let p = self.needs_head[index];
                 while let Input::Open { stream, head: None } = &mut self.inputs[p] {
                     match stream.poll_next_unpin(cx) {
                         Poll::Pending => {
@@ -372,6 +382,7 @@ impl BoundedMergeStream {
                     }
                 }
             }
+            self.needs_head.retain(|&p| matches!(self.inputs[p], Input::Open { head: None, .. }));
             if pending {
                 return match self.flush() {
                     Ok(Some(batch)) => Poll::Ready(Some(Ok(batch))),
@@ -418,6 +429,7 @@ impl BoundedMergeStream {
                 && let Input::Open { head, .. } = &mut self.inputs[p]
             {
                 *head = None;
+                self.needs_head.push(p);
             }
             self.remaining = self.remaining.map(|n| n - 1);
             if self.picked.len() >= self.batch_size {
@@ -432,6 +444,8 @@ impl Stream for BoundedMergeStream {
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let poll = self.poll_inner(cx);
+        let checked = std::mem::take(&mut self.pending_head_slots);
+        self.head_slots_checked.add(checked);
         self.baseline.record_poll(poll)
     }
 }
@@ -684,6 +698,18 @@ mod tests {
             let got = runtime.block_on(rows(Arc::new(BoundedMergeExec::new(plan, ordering(), bounds, fetch))));
             proptest::prop_assert_eq!(got, want);
         }
+    }
+
+    #[tokio::test]
+    async fn ready_heads_are_not_rechecked_per_row() {
+        let partitions: Vec<_> = (0..38).map(|p| (0..3).rev().map(|ts| (ts, p)).collect()).collect();
+        let input = input(&partitions, 3);
+        let want = rows(Arc::new(SortPreservingMergeExec::new(ordering(), Arc::clone(&input)))).await;
+        let plan = Arc::new(BoundedMergeExec::new(input, ordering(), vec![None; partitions.len()], None));
+        // Isolate ready-head work from Tokio's task-budget retries.
+        assert_eq!(tokio::task::unconstrained(rows(Arc::clone(&plan) as _)).await, want);
+        let checked = plan.metrics().unwrap().sum_by_name("head_slots_checked").unwrap().as_usize();
+        assert_eq!(checked, 2 * partitions.len(), "check each input only for its batch and EOF");
     }
 
     #[test_case::test_case(false => Some(0); "unique leading keys")]

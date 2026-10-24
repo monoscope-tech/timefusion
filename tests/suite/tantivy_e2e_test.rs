@@ -1764,8 +1764,7 @@ async fn verify_mutable_candidate_input(
             PageRun::Contract => true,
             PageRun::FirstPair => *tag == hash,
             PageRun::OtherPairs => *tag == "other",
-        })
-        {
+        }) {
             let projection = match contract {
                 PageContract::IssueSample => "timestamp, summary, context___trace_id",
                 PageContract::LogExplorer => {
