@@ -4055,8 +4055,9 @@ mod tests {
     }
 
     /// monoscope's RUM predicates (`browserScope`, `pageViewPredicate`, `errorPredicate`)
-    /// and the widget scope `{{query_ast_filters}}` expands to, byte for byte.
-    const RUM_SCOPE: &str = "project_id = 'project' AND timestamp BETWEEN '1970-01-01T00:00:00Z' AND '1970-01-02T00:00:00Z' AND TRUE";
+    /// and the widget scope `{{query_ast_filters}}` expands to, byte for byte, its
+    /// Application variable left as `{{application}}`.
+    const RUM_SCOPE: &str = "project_id = 'project' and timestamp BETWEEN '1970-01-01T00:00:00Z' AND '1970-01-02T00:00:00Z' and {{application}}";
     const RUM_BROWSER: &str = "(resource___telemetry___sdk___language IN ('webjs', 'javascript', 'js') OR resource___user_agent___original IS NOT NULL \
                                OR name IN ('documentLoad', 'documentFetch') OR (name LIKE 'Pageview %' OR name = 'documentLoad'))";
     const RUM_PAGEVIEW: &str = "(name LIKE 'Pageview %' OR name = 'documentLoad')";
@@ -4095,9 +4096,16 @@ mod tests {
         &["rum_pageview_count", "rum_error_count"] ; "the activity chart unpivoted to long form")]
     #[tokio::test]
     async fn rum_widgets_route_to_their_declared_measures(sql: &str, measures: &[&str]) {
-        let (_, generated) = assert_substitutes(&session().await, sql, None).await;
-        for measure in measures {
-            assert!(generated.contains(measure), "{measure} must be read: {generated}");
+        let state = session().await;
+        // The dashboard's Application variable as monoscope lowers it from KQL: absent, none selected, one selected.
+        // Unselected must fold away; selected must survive as a filter on the tier's service dimension.
+        for application in ["TRUE", "(('' = '' OR resource___service___name = ''))", "(('web' = '' OR resource___service___name = 'web'))"] {
+            let (_, generated) = assert_substitutes(&state, &sql.replace("{{application}}", application), None).await;
+            for measure in measures {
+                assert!(generated.contains(measure), "{application}: {measure} must be read: {generated}");
+            }
+            assert!(!generated.contains("resource___service___name = ''"), "{application}: {generated}");
+            assert!(!application.contains("'web'") || generated.contains("resource___service___name = 'web'"), "{application}: {generated}");
         }
     }
 
