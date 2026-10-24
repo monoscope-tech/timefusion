@@ -1,5 +1,5 @@
 //! Analyzer-level tests for the tantivy predicate rewriter: which SQL predicates
-//! get an additive `text_match` injected into the LogicalPlan. No MinIO/Delta —
+//! get an additive `__tantivy_routing_hint` injected into the LogicalPlan. No MinIO/Delta —
 //! end-to-end prefilter behavior lives in `tantivy_e2e_test.rs`.
 
 #![cfg(test)]
@@ -30,7 +30,7 @@ async fn analyzer_only_ctx() -> Result<SessionContext> {
 
 /// Parse + analyze a SELECT and return the post-analyzer LogicalPlan.
 /// Analyzer rules only run inside `state.optimize()`, so the returned plan is
-/// also optimized — harmless here, since the optimizer never removes text_match.
+/// also optimized — harmless here, since the optimizer never removes __tantivy_routing_hint.
 async fn analyze(ctx: &SessionContext, sql: &str) -> Result<LogicalPlan> {
     let plan = ctx.state().create_logical_plan(sql).await?;
     Ok(ctx.state().optimize(&plan)?)
@@ -71,13 +71,13 @@ async fn plan_for(pred: &str) -> String {
 #[test_case("name = 'ok'" => false ; "skips_sub_3_char_eq_on_ngram3")]
 #[tokio::test]
 async fn rewriter_routes_predicate(pred: &str) -> bool {
-    plan_for(pred).await.contains("text_match")
+    plan_for(pred).await.contains("__tantivy_routing_hint")
 }
 
-#[test_case("name LIKE 'api%'", &["text_match", "api*"] ; "rewriter_handles_trailing_wildcard_like")]
+#[test_case("name LIKE 'api%'", &["__tantivy_routing_hint", "api*"] ; "rewriter_handles_trailing_wildcard_like")]
 // Both columns get an injection. Filter pushdown duplicates each call in the printed plan,
 // so assert presence per column rather than an exact count.
-#[test_case("level LIKE 'ERR%' AND name LIKE 'svc%'", &["text_match(level", "text_match(name"] ; "rewriter_handles_multiple_indexed_predicates")]
+#[test_case("level LIKE 'ERR%' AND name LIKE 'svc%'", &["__tantivy_routing_hint(level", "__tantivy_routing_hint(name"] ; "rewriter_handles_multiple_indexed_predicates")]
 #[tokio::test]
 async fn rewriter_injects(pred: &'static str, needles: &'static [&'static str]) {
     let s = plan_for(pred).await;
@@ -93,7 +93,7 @@ async fn rewriter_is_idempotent_under_replanning() -> Result<()> {
     let p1 = plan_str(&analyze(&ctx, &sql).await?);
     let p2 = plan_str(&analyze(&ctx, &sql).await?);
     assert_eq!(p1, p2, "non-deterministic plan");
-    assert!(p1.contains("text_match"), "expected text_match in plan, got:\n{}", p1);
+    assert!(p1.contains("__tantivy_routing_hint"), "expected __tantivy_routing_hint in plan, got:\n{}", p1);
     Ok(())
 }
 

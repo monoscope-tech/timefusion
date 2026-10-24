@@ -15,6 +15,11 @@ use datafusion::{
 };
 
 pub const TEXT_MATCH_NAME: &str = "text_match";
+const ROUTING_HINT_NAME: &str = "__tantivy_routing_hint";
+
+pub(crate) fn is_search_predicate(name: &str) -> bool {
+    matches!(name, TEXT_MATCH_NAME | ROUTING_HINT_NAME)
+}
 
 /// Minimum literal length accepted by the trigram index.
 pub const NGRAM_MIN_QUERY_LEN: usize = 3;
@@ -142,6 +147,34 @@ impl Default for TextMatchUdf {
     }
 }
 
+/// Generated only alongside an original SQL predicate, which owns row evaluation.
+/// Keep its arguments for scan routing without rendering or testing rows twice.
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub(crate) struct RoutingHintUdf {
+    sig: Signature,
+}
+
+impl Default for RoutingHintUdf {
+    fn default() -> Self {
+        Self { sig: TextMatchUdf::default().sig }
+    }
+}
+
+impl ScalarUDFImpl for RoutingHintUdf {
+    fn name(&self) -> &str {
+        ROUTING_HINT_NAME
+    }
+    fn signature(&self) -> &Signature {
+        &self.sig
+    }
+    fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Boolean)
+    }
+    fn invoke_with_args(&self, _args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        Ok(ColumnarValue::Scalar(datafusion::scalar::ScalarValue::Boolean(Some(true))))
+    }
+}
+
 impl ScalarUDFImpl for TextMatchUdf {
     fn name(&self) -> &str {
         TEXT_MATCH_NAME
@@ -264,7 +297,7 @@ pub fn text_match_udf() -> ScalarUDF {
     ScalarUDF::from(TextMatchUdf::default())
 }
 
-/// Detect a `text_match(col, 'q'[, kind])` predicate and extract its column
+/// Extract a user text_match predicate or an internal routing hint and its column
 /// name and tantivy query; 3-arg (placeholder-routed) calls are classified
 /// here. `None` = not routable, and the collector treats it as opaque.
 pub fn extract_text_match(expr: &datafusion::logical_expr::Expr) -> Option<TextMatchPred> {
@@ -276,7 +309,7 @@ pub fn extract_text_match(expr: &datafusion::logical_expr::Expr) -> Option<TextM
         }
     }
     let Expr::ScalarFunction(sf) = expr else { return None };
-    if sf.func.name() != TEXT_MATCH_NAME {
+    if !is_search_predicate(sf.func.name()) {
         return None;
     }
     let Some(Expr::Column(c)) = sf.args.first() else { return None };

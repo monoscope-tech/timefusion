@@ -164,7 +164,7 @@ async fn recent_window_prunes_within_compacted_file() -> anyhow::Result<()> {
 /// in it, the timestamp bound included: DV keep-masks are positional, so the fork
 /// withheld pushdown scan-wide instead of only from the masked files. Prod (2026-09-28)
 /// decoded 4.94M rows to keep 2.18K on a 6h window once dedup had masked a file in
-/// today's partition. The query is the prod probe, `text_match`-inside-OR included.
+/// today's partition. The query is the prod probe, routing-hint-inside-OR included.
 #[serial_test::serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn dv_bearing_file_keeps_parquet_pushdown_on_its_siblings() -> anyhow::Result<()> {
@@ -206,7 +206,7 @@ async fn dv_bearing_file_keeps_parquet_pushdown_on_its_siblings() -> anyhow::Res
     assert_eq!(total, 15, "server spans at idx 50,60,..,190");
 
     let plan = explain_analyze(&client, &sql).await?;
-    assert!(plan.contains("text_match(kind"), "the tantivy rewrite did not inject text_match, so this is not the prod shape.\nplan:\n{plan}");
+    assert!(plan.contains("__tantivy_routing_hint(kind"), "the tantivy rewrite did not inject a routing hint, so this is not the prod shape.\nplan:\n{plan}");
     let scans: Vec<&str> = plan.lines().filter(|l| l.contains("DataSourceExec") && l.contains("file_type=parquet")).collect();
     assert!(
         scans.iter().any(|l| l.contains("predicate=timestamp@")),
