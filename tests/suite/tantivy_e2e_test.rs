@@ -1371,9 +1371,17 @@ async fn retained_browser_fixture_first_wire_pair() -> Result<()> {
     retained_browser_fixture(RetainedCheck::Pages(PageRun::FirstPair)).await
 }
 
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+#[ignore = "focused cold/warm profiling of the registered other predicate; full contract remains required"]
+async fn retained_browser_fixture_other_wire_pairs() -> Result<()> {
+    retained_browser_fixture(RetainedCheck::Pages(PageRun::OtherPairs)).await
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PageRun {
     FirstPair,
+    OtherPairs,
     Contract,
 }
 
@@ -1752,7 +1760,11 @@ async fn verify_mutable_candidate_input(
         ]
         .into_iter()
         .chain(matches!(contract, PageContract::LogExplorer).then_some(("ties", Some("trace-tie-a"))))
-        .filter(|(tag, _)| run == PageRun::Contract || *tag == hash)
+        .filter(|(tag, _)| match run {
+            PageRun::Contract => true,
+            PageRun::FirstPair => *tag == hash,
+            PageRun::OtherPairs => *tag == "other",
+        })
         {
             let projection = match contract {
                 PageContract::IssueSample => "timestamp, summary, context___trace_id",
@@ -1939,7 +1951,7 @@ async fn verify_mutable_candidate_input(
         anyhow::Ok(())
     })
     .await??;
-    if run == PageRun::FirstPair {
+    if run != PageRun::Contract {
         return Ok(());
     }
     for predicate in [
