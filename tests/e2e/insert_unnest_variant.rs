@@ -127,6 +127,66 @@ async fn insert_select_unnest_coerces_text_to_variant() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// JSON construction must decode stored Variant columns across every storage leg.
+#[serial_test::serial]
+#[tokio::test(flavor = "multi_thread")]
+async fn nested_variant_json_survives_pgwire_and_flush() -> anyhow::Result<()> {
+    use serde_json::{Value, json};
+
+    let (env, client) = E2eEnv::short_buckets().await?;
+    env.db().cancel_maintenance();
+    let sql = "SELECT id, row_to_json(named_struct('attributes', attributes)) AS record, jsonb_build_array(attributes) AS items \
+               FROM otel_metrics WHERE project_id='e2e_nested_json' ORDER BY id";
+    let insert = "INSERT INTO otel_metrics (project_id, timestamp, date, ingested_at, id, series_id, metric_name, metric_unit, metric_type, flags, dropped_attributes_count, message_size_bytes, attributes) \
+                  VALUES ('e2e_nested_json', $1, $2, $1, $3, $3, 'requests', '1', 'GAUGE', 0, 0, 10, $4)";
+    let attributes = json!({"failure":{"class":"timeout"},"count":2,"active":true,"items":[1,null,"text"]});
+    let mut expected = std::collections::BTreeMap::from([("null", Value::Null), ("populated", attributes.clone())]);
+    for phase in 0..3 {
+        if phase == 1 {
+            env.advance(std::time::Duration::from_secs(10 * 60));
+            env.flush_and_evict().await?;
+        } else {
+            let dt = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(support::now_micros()).unwrap();
+            let rows =
+                if phase == 0 { vec![("populated", Some(attributes.to_string())), ("null", None)] } else { vec![("new", Some(r#""{\"a\":1}""#.into()))] };
+            for (id, value) in rows {
+                client.execute(insert, &[&dt, &dt.date_naive(), &id, &value]).await?;
+            }
+            if phase == 2 {
+                expected.insert("new", json!(r#"{"a":1}"#));
+            }
+        }
+        assert_eq!(env.snapshot_stats().mem_total_rows, [2, 0, 1][phase]);
+        let simple = client.simple_query(sql).await?;
+        let actual = simple
+            .iter()
+            .filter_map(|message| match message {
+                tokio_postgres::SimpleQueryMessage::Row(row) => Some(row),
+                _ => None,
+            })
+            .map(|row| -> anyhow::Result<_> {
+                Ok((row.get(0).unwrap().to_string(), serde_json::from_str::<Value>(row.get(1).unwrap())?, serde_json::from_str::<Value>(row.get(2).unwrap())?))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let expected: Vec<_> = expected.iter().map(|(id, value)| (id.to_string(), json!({"attributes":value}), json!([value]))).collect();
+        assert_eq!(actual, expected, "phase {phase}: simple JSON values");
+        let statement = client.prepare(sql).await?;
+        assert_eq!(statement.columns()[1].type_(), &Type::TEXT);
+        assert_eq!(statement.columns()[2].type_(), &Type::JSONB);
+        for _ in 0..2 {
+            let rows = client.query(&statement, &[]).await?;
+            let actual = rows
+                .iter()
+                .map(|row| -> anyhow::Result<_> {
+                    Ok((row.try_get::<_, String>(0)?, serde_json::from_str::<Value>(&row.try_get::<_, String>(1)?)?, row.try_get::<_, Value>(2)?))
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            assert_eq!(actual, expected, "phase {phase}: prepared and cached JSON values");
+        }
+    }
+    Ok(())
+}
+
 /// Real metrics scans must retain inherited projection names after Variant rewrites.
 #[test_case::test_case("SELECT coalesce(attributes, 'null') FROM otel_metrics WHERE project_id='e2e_projection'", "coalesce(otel_metrics.attributes,Utf8(\"null\"))", Type::TEXT, Some(serde_json::Value::Null); "direct coalesce")]
 #[test_case::test_case("SELECT * FROM (SELECT coalesce(attributes, 'null') FROM otel_metrics WHERE project_id='e2e_projection') q", "coalesce(otel_metrics.attributes,Utf8(\"null\"))", Type::TEXT, Some(serde_json::Value::Null); "inherited coalesce")]
