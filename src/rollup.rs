@@ -1322,13 +1322,13 @@ fn simplify_filtered_group(
         .map(|result| result.data)
 }
 
-/// `extract(epoch from X)` — which DataFusion plans as `date_part('EPOCH', X)`
-/// — optionally under an integer cast, returning `X` and the cast's SQL type.
+/// Epoch extraction, optionally under an integer cast. Keep the function's SQL
+/// name so rewrites preserve numeric EXTRACT versus floating date_part semantics.
 ///
 /// Only `EPOCH` qualifies: every other field (`hour`, `dow`, …) is many-to-one
 /// over buckets and would merge groups the raw path keeps apart. Only integer
 /// casts qualify, being the ones whose SQL spelling reproduces exactly.
-fn epoch_of(expr: &datafusion::logical_expr::Expr) -> Option<(&datafusion::logical_expr::Expr, Option<&'static str>)> {
+fn epoch_of(expr: &datafusion::logical_expr::Expr) -> Option<(&datafusion::logical_expr::Expr, Option<&'static str>, &str)> {
     use datafusion::logical_expr::Expr;
     let expr = if let Expr::Alias(alias) = expr { alias.expr.as_ref() } else { expr };
     let (expr, cast) = match expr {
@@ -1343,10 +1343,10 @@ fn epoch_of(expr: &datafusion::logical_expr::Expr) -> Option<(&datafusion::logic
         expr => (expr, None),
     };
     let Expr::ScalarFunction(function) = unaliased(expr) else { return None };
-    (function.name().eq_ignore_ascii_case("date_part")
+    (matches!(function.name(), "date_part" | "timefusion_extract_epoch")
         && function.args.len() == 2
         && string_literal(&function.args[0]).is_some_and(|field| field.eq_ignore_ascii_case("EPOCH")))
-    .then(|| (&function.args[1], cast))
+    .then(|| (&function.args[1], cast, function.name()))
 }
 
 fn column_name(expr: &datafusion::logical_expr::Expr) -> Option<&str> {
@@ -2350,7 +2350,7 @@ async fn route_with_spec(
             // REPRODUCED, not dropped: the rewrite has to match the aggregate's
             // schema types.
             let epoch_wrapped = epoch_of(expression);
-            let expression = match epoch_wrapped.map_or_else(|| unaliased(expression), |(inner, _)| inner) {
+            let expression = match epoch_wrapped.map_or_else(|| unaliased(expression), |(inner, _, _)| inner) {
                 Expr::Column(column) if is_dimension(&column.name) => column.name.clone(),
                 Expr::ScalarFunction(function)
                     if function.name().eq_ignore_ascii_case("time_bucket")
@@ -2394,9 +2394,9 @@ async fn route_with_spec(
             // Only the bucket may wear the epoch wrapper; a dimension grouped by
             // `extract(epoch …)` is nonsense and must not be silently accepted.
             let expression = match epoch_wrapped {
-                Some((_, cast)) if expression.starts_with("time_bucket(") => match cast {
-                    Some(sql_type) => format!("CAST(date_part('EPOCH', {expression}) AS {sql_type})"),
-                    None => format!("date_part('EPOCH', {expression})"),
+                Some((_, cast, function)) if expression.starts_with("time_bucket(") => match cast {
+                    Some(sql_type) => format!("CAST({function}('EPOCH', {expression}) AS {sql_type})"),
+                    None => format!("{function}('EPOCH', {expression})"),
                 },
                 Some(_) => return Err(MissReason::UnsupportedShape),
                 None => expression,
@@ -2518,11 +2518,18 @@ fn epoch_bucket_seconds(expr: &datafusion::logical_expr::Expr) -> Option<i64> {
     let Expr::ScalarFunction(floor) = unaliased(expr) else { return None };
     let ("floor", [Expr::BinaryExpr(divide)]) = (floor.name(), floor.args.as_slice()) else { return None };
     let Expr::ScalarFunction(part) = unaliased(&divide.left) else { return None };
-    let ("date_part", [unit, column]) = (part.name(), part.args.as_slice()) else { return None };
+    let [unit, column] = part.args.as_slice() else { return None };
+    if !matches!(part.name(), "date_part" | "timefusion_extract_epoch") {
+        return None;
+    }
     (divide.op == Operator::Divide && string_literal(unit)?.eq_ignore_ascii_case("epoch") && column_name(column) == Some("timestamp")).then_some(())?;
     match unaliased(&divide.right) {
         Expr::Literal(ScalarValue::Float64(Some(n)), _) if n.fract() == 0.0 && *n >= 1.0 => Some(*n as i64),
         Expr::Literal(ScalarValue::Int64(Some(n)), _) if *n >= 1 => Some(*n),
+        Expr::Literal(value @ (ScalarValue::Decimal128(..) | ScalarValue::Decimal256(..)), _) => {
+            let ScalarValue::Int64(Some(n)) = value.cast_to(&arrow::datatypes::DataType::Int64).ok()? else { return None };
+            (n >= 1 && ScalarValue::Int64(Some(n)).cast_to(&value.data_type()).ok()? == *value).then_some(n)
+        }
         _ => None,
     }
 }
@@ -3432,6 +3439,22 @@ mod tests {
         // `hashes && ['a']` beside `hash IN ('a','b')` keeps rows the element filter alone would drop.
         assert!(route_for(&state, &served("'a'").replace("{N}", "3600")).await.is_err_and(|miss| miss != MissReason::UnsupportedShape));
         assert_eq!(route_for(&state, &served("'a','b'").replace("{N}", "600")).await.err(), Some(MissReason::PartialBucket), "a bucket finer than the grain");
+    }
+
+    #[test_case::test_case(3600, 0 => Some(3600); "integer decimal")]
+    #[test_case::test_case(3600000, 3 => Some(3600); "scaled integer decimal")]
+    #[test_case::test_case(3600500, 3 => None; "fractional width")]
+    #[test_case::test_case(0, 0 => None; "zero width")]
+    #[test_case::test_case(-3600, 0 => None; "negative width")]
+    #[test_case::test_case(i128::MAX / 100, 0 => None; "out of range")]
+    fn decimal_epoch_bucket_width(value: i128, scale: i8) -> Option<i64> {
+        use datafusion::{
+            prelude::{col, lit},
+            scalar::ScalarValue,
+        };
+        let epoch = datafusion::functions::datetime::date_part().call(vec![lit("EPOCH"), col("timestamp")]);
+        let divide = epoch / lit(ScalarValue::Decimal128(Some(value), 38, scale));
+        epoch_bucket_seconds(&datafusion::functions::math::floor().call(vec![divide]))
     }
 
     /// Every declared tier's generation must render exactly as the spec did before fields
