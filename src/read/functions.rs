@@ -1084,6 +1084,11 @@ fn array_to_json_values(array: &ArrayRef) -> datafusion::error::Result<Vec<JsonV
 /// wants it only at the top level: list elements must stay JSON strings
 /// (`to_jsonb(text[])`), so list/struct recursion always passes `false`.
 fn array_to_json_values_inner(array: &ArrayRef, sniff_json: bool) -> datafusion::error::Result<Vec<JsonValue>> {
+    if is_variant_type(array.data_type()) {
+        // Variant is a logical JSON value, including inside records and lists.
+        let values: Vec<Option<JsonValue>> = map_variant_rows(array, |json| Some(json.clone()))?;
+        return Ok(values.into_iter().map(|value| value.unwrap_or(JsonValue::Null)).collect());
+    }
     Ok(match array.data_type() {
         DataType::Utf8View => {
             let strs: &StringViewArray = downcast(array, "Failed to downcast to StringViewArray")?;
@@ -2172,6 +2177,10 @@ mod tests {
     #[test_case::test_case(r#"SELECT to_json(make_array('{"a":1}')) AS s"# => r#"["{\"a\":1}"]"# ; "to_json shares array_to_json_values")]
     #[test_case::test_case("SELECT row_to_json(named_struct('total', 1, 'active', 2)) AS d" => r#"{"active":2,"total":1}"# ; "row_to_json of a struct")]
     #[test_case::test_case("SELECT to_json(named_struct('total', 1, 'active', 2)) AS d" => r#"{"active":2,"total":1}"# ; "to_json of a struct column")]
+    #[test_case::test_case(r#"SELECT row_to_json(named_struct('attributes', json_to_variant('{"failure":{"class":"timeout"},"count":2,"active":true}')))"# => r#"{"attributes":{"active":true,"count":2,"failure":{"class":"timeout"}}}"# ; "row keeps nested variant values")]
+    #[test_case::test_case(r#"SELECT json_build_array(json_to_variant('[1,true,null,{"a":"b"}]'), json_to_variant('"{\"a\":1}"'))"# => r#"[[1,true,null,{"a":"b"}],"{\"a\":1}"]"# ; "variant containers and strings keep their types")]
+    #[test_case::test_case(r#"SELECT to_jsonb(make_array(json_to_variant('{"a":1}'), json_to_variant('null'), json_to_variant(NULL::text)))"# => r#"[{"a":1},null,null]"# ; "variant lists preserve json and sql nulls")]
+    #[test_case::test_case(r#"SELECT to_jsonb(json_to_variant('{"a":[1,false]}'))"# => r#"{"a":[1,false]}"# ; "top level variant uses logical json")]
     #[tokio::test]
     async fn json_rendering_matches_postgres(sql: &str) -> String {
         text(sql).await
