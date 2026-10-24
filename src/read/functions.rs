@@ -647,6 +647,7 @@ pub fn register_custom_functions(ctx: &mut datafusion::execution::context::Sessi
         ToJsonbUDF::default(),
         ToJsonUDF::default(),
         ExtractEpochUDF::default(),
+        ExactEpochUDF::default(),
         JsonToPgTextUdf::default(),
         datafusion_variant::JsonToVariantUdf::default(),
         VariantToJsonExtUdf::default(),
@@ -982,11 +983,13 @@ impl ScalarUDFImpl for JsonBuildArrayUDF {
         // below would be O(rows² × args).
         let cols = args.iter().map(|arg| array_to_json_values(&as_array(arg)?)).collect::<datafusion::error::Result<Vec<_>>>()?;
 
-        let out = StringViewArray::from_iter_values((0..num_rows).map(|row_idx| {
-            // len-1 columns are broadcast scalars
-            let row: Vec<JsonValue> = cols.iter().map(|c| c[if c.len() == 1 { 0 } else { row_idx }].clone()).collect();
-            JsonValue::Array(row).to_string()
-        }));
+        let out: StringViewArray = (0..num_rows)
+            .map(|row_idx| {
+                // len-1 columns are broadcast scalars
+                let row = cols.iter().map(|c| c[if c.len() == 1 { 0 } else { row_idx }].clone()).collect();
+                JsonOutput::Array(row).encode().map(Some)
+            })
+            .collect::<datafusion::error::Result<_>>()?;
         Ok(ColumnarValue::Array(Arc::new(out)))
     }
 }
@@ -1003,7 +1006,8 @@ impl ScalarUDFImpl for ToJsonUDF {
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> datafusion::error::Result<ColumnarValue> {
         let [arg] = args_n::<1>(&args.args, "to_json", "")?;
-        let out = StringViewArray::from_iter_values(array_to_json_values(&as_array(arg)?)?.iter().map(JsonValue::to_string));
+        let out: StringViewArray =
+            array_to_json_values(&as_array(arg)?)?.iter().map(|value| value.encode().map(Some)).collect::<datafusion::error::Result<_>>()?;
         Ok(ColumnarValue::Array(Arc::new(out)))
     }
 }
@@ -1044,18 +1048,26 @@ jsonb_wrapper!(JsonbBuildArrayUDF, JsonBuildArrayUDF, "jsonb_build_array");
 jsonb_wrapper!(ToJsonbUDF, ToJsonUDF, "to_jsonb");
 
 // SQL EXTRACT returns numeric, while date_part deliberately returns double precision.
-// Keep the planner's date_part name and arguments so projection names stay stable.
+// A distinct SQL name preserves numeric semantics through SQL round trips;
+// schema_name keeps existing projection names.
 udf_struct!(ExactEpochUDF, datafusion::functions::datetime::date_part().signature().clone());
 
 impl ScalarUDFImpl for ExactEpochUDF {
-    udf_boilerplate!("date_part");
+    udf_boilerplate!("timefusion_extract_epoch");
+
+    fn schema_name(&self, args: &[Expr]) -> datafusion::error::Result<String> {
+        datafusion::functions::datetime::date_part().schema_name(args)
+    }
 
     fn return_type(&self, args: &[DataType]) -> datafusion::error::Result<DataType> {
         Ok(if matches!(args.get(1), Some(DataType::Timestamp(..))) { DataType::Decimal128(28, 9) } else { DataType::Float64 })
     }
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> datafusion::error::Result<ColumnarValue> {
-        let [_, source] = args_n::<2>(&args.args, "date_part", "")?;
+        let [part, source] = args_n::<2>(&args.args, self.name(), "")?;
+        if !extract_scalar_string(part, "EXTRACT field")?.eq_ignore_ascii_case("epoch") {
+            return datafusion::common::exec_err!("timefusion_extract_epoch requires EPOCH");
+        }
         let DataType::Timestamp(unit, _) = source.data_type() else {
             // Preserve the existing date/interval extraction path.
             return datafusion::functions::datetime::date_part().invoke_with_args(args);
@@ -1114,21 +1126,37 @@ macro_rules! json_floats {
     };
 }
 
+/// JSON values with exact decimal tokens, including inside arrays and records.
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(untagged)]
+enum JsonOutput {
+    Value(JsonValue),
+    Number(Box<serde_json::value::RawValue>),
+    Array(Vec<Self>),
+    Object(std::collections::BTreeMap<String, Self>),
+}
+
+impl JsonOutput {
+    fn encode(&self) -> datafusion::error::Result<String> {
+        serde_json::to_string(self).map_err(|error| DataFusionError::External(Box::new(error)))
+    }
+}
+
 /// Convert Arrow array to JSON values
-fn array_to_json_values(array: &ArrayRef) -> datafusion::error::Result<Vec<JsonValue>> {
+fn array_to_json_values(array: &ArrayRef) -> datafusion::error::Result<Vec<JsonOutput>> {
     array_to_json_values_inner(array, true)
 }
 
 /// `sniff_json` parses Utf8 values that look like JSON into real JSON. PG parity
 /// wants it only at the top level: list elements must stay JSON strings
 /// (`to_jsonb(text[])`), so list/struct recursion always passes `false`.
-fn array_to_json_values_inner(array: &ArrayRef, sniff_json: bool) -> datafusion::error::Result<Vec<JsonValue>> {
+fn array_to_json_values_inner(array: &ArrayRef, sniff_json: bool) -> datafusion::error::Result<Vec<JsonOutput>> {
     if is_variant_type(array.data_type()) {
         // Variant is a logical JSON value, including inside records and lists.
         let values: Vec<Option<JsonValue>> = map_variant_rows(array, |json| Some(json.clone()))?;
-        return Ok(values.into_iter().map(|value| value.unwrap_or(JsonValue::Null)).collect());
+        return Ok(values.into_iter().map(|value| JsonOutput::Value(value.unwrap_or(JsonValue::Null))).collect());
     }
-    Ok(match array.data_type() {
+    let values: Vec<JsonValue> = match array.data_type() {
         DataType::Utf8View => {
             let strs: &StringViewArray = downcast(array, "Failed to downcast to StringViewArray")?;
             let looks_json = |s: &str| (s.starts_with('{') && s.ends_with('}')) || (s.starts_with('[') && s.ends_with(']'));
@@ -1162,6 +1190,17 @@ fn array_to_json_values_inner(array: &ArrayRef, sniff_json: bool) -> datafusion:
                 })
                 .collect::<datafusion::error::Result<_>>()?
         }
+        DataType::Decimal128(..) | DataType::Decimal256(..) => {
+            return (0..array.len())
+                .map(|row| {
+                    if array.is_null(row) {
+                        return Ok(JsonOutput::Value(JsonValue::Null));
+                    }
+                    let number = datafusion::arrow::util::display::array_value_to_string(array.as_ref(), row)?;
+                    serde_json::value::RawValue::from_string(number).map(JsonOutput::Number).map_err(|error| DataFusionError::External(Box::new(error)))
+                })
+                .collect();
+        }
         // A record renders as a JSON object keyed by field name — PG's `row_to_json(t)`.
         DataType::Struct(fields) => {
             let columns: &datafusion::arrow::array::StructArray = downcast(array, "Failed to downcast to StructArray")?;
@@ -1171,32 +1210,37 @@ fn array_to_json_values_inner(array: &ArrayRef, sniff_json: bool) -> datafusion:
                 .zip(columns.columns())
                 .map(|(field, column)| array_to_json_values_inner(column, false).map(|values| (field.name().clone(), values)))
                 .collect::<datafusion::error::Result<Vec<_>>>()?;
-            // Keys render sorted; DataFusion 55 enables serde_json's `preserve_order`, which
-            // would otherwise switch output to field order.
-            let mut per_field = per_field;
-            per_field.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
-            (0..array.len())
+            // BTreeMap keeps record keys sorted independently of serde_json features.
+            return Ok((0..array.len())
                 .map(|row| {
                     if columns.is_null(row) {
-                        return JsonValue::Null;
+                        JsonOutput::Value(JsonValue::Null)
+                    } else {
+                        JsonOutput::Object(per_field.iter().map(|(name, values)| (name.clone(), values[row].clone())).collect())
                     }
-                    per_field.iter().map(|(name, values)| (name.clone(), values[row].clone())).collect::<serde_json::Map<_, _>>().into()
                 })
-                .collect()
+                .collect());
         }
-        DataType::List(_) => list_to_json_values::<i32>(array)?,
-        DataType::LargeList(_) => list_to_json_values::<i64>(array)?,
-        DataType::FixedSizeList(field, _) => list_to_json_values::<i32>(&datafusion::arrow::compute::cast(array, &DataType::List(field.clone()))?)?,
+        DataType::List(_) => return list_to_json_values::<i32>(array),
+        DataType::LargeList(_) => return list_to_json_values::<i64>(array),
+        DataType::FixedSizeList(field, _) => return list_to_json_values::<i32>(&datafusion::arrow::compute::cast(array, &DataType::List(field.clone()))?),
         // Anything else: render through its string form.
         _ => return array_to_json_values_inner(&datafusion::arrow::compute::cast(array, &DataType::Utf8View)?, sniff_json),
-    })
+    };
+    Ok(values.into_iter().map(JsonOutput::Value).collect())
 }
 
-fn list_to_json_values<O: datafusion::arrow::array::OffsetSizeTrait>(array: &ArrayRef) -> datafusion::error::Result<Vec<JsonValue>> {
+fn list_to_json_values<O: datafusion::arrow::array::OffsetSizeTrait>(array: &ArrayRef) -> datafusion::error::Result<Vec<JsonOutput>> {
     let list_array: &datafusion::arrow::array::GenericListArray<O> = downcast(array, "Failed to downcast to list array")?;
     // Always sniff_json=false: PG's to_jsonb(text[]) keeps elements as JSON strings.
     (0..list_array.len())
-        .map(|i| if list_array.is_null(i) { Ok(JsonValue::Null) } else { array_to_json_values_inner(&list_array.value(i), false).map(JsonValue::Array) })
+        .map(|i| {
+            if list_array.is_null(i) {
+                Ok(JsonOutput::Value(JsonValue::Null))
+            } else {
+                array_to_json_values_inner(&list_array.value(i), false).map(JsonOutput::Array)
+            }
+        })
         .collect()
 }
 
@@ -2099,17 +2143,7 @@ mod tests {
         parse_pg_format(fmt)
     }
 
-    #[test_case::test_case("to_timestamp_nanos(1792854698319451123)" => "1792854698319451123"; "nanoseconds")]
-    #[test_case::test_case("to_timestamp_micros(1792854698319451)" => "1792854698319451000"; "microseconds")]
-    #[test_case::test_case("to_timestamp_millis(1792854698319)" => "1792854698319000000"; "milliseconds")]
-    #[test_case::test_case("to_timestamp_seconds(1792854698)" => "1792854698000000000"; "seconds")]
-    #[test_case::test_case("to_timestamp_nanos(-1)" => "-1"; "before epoch")]
-    #[test_case::test_case("to_timestamp_nanos(1792854698319451123) AT TIME ZONE 'UTC'" => "1792854698319451123"; "timezone")]
-    #[test_case::test_case("CAST(NULL AS TIMESTAMP)" => "null"; "null")]
-    #[test_case::test_case("DATE '1970-01-02'" => "86400000000000"; "date fallback")]
-    #[test_case::test_case("INTERVAL '-1 microsecond'" => "-1000"; "interval fallback")]
-    #[tokio::test]
-    async fn extract_epoch_preserves_nanoseconds(source: &str) -> String {
+    fn exact_epoch_ctx() -> datafusion::prelude::SessionContext {
         // Match Database's planner order: the default datetime planner claims EXTRACT.
         let state = datafusion::execution::SessionStateBuilder::new()
             .with_default_features()
@@ -2121,6 +2155,21 @@ mod tests {
             .build();
         let mut ctx = datafusion::prelude::SessionContext::new_with_state(state);
         register_custom_functions(&mut ctx).unwrap();
+        ctx
+    }
+
+    #[test_case::test_case("to_timestamp_nanos(1792854698319451123)" => "1792854698319451123"; "nanoseconds")]
+    #[test_case::test_case("to_timestamp_micros(1792854698319451)" => "1792854698319451000"; "microseconds")]
+    #[test_case::test_case("to_timestamp_millis(1792854698319)" => "1792854698319000000"; "milliseconds")]
+    #[test_case::test_case("to_timestamp_seconds(1792854698)" => "1792854698000000000"; "seconds")]
+    #[test_case::test_case("to_timestamp_nanos(-1)" => "-1"; "before epoch")]
+    #[test_case::test_case("to_timestamp_nanos(1792854698319451123) AT TIME ZONE 'UTC'" => "1792854698319451123"; "timezone")]
+    #[test_case::test_case("CAST(NULL AS TIMESTAMP)" => "null"; "null")]
+    #[test_case::test_case("DATE '1970-01-02'" => "86400000000000"; "date fallback")]
+    #[test_case::test_case("INTERVAL '-1 microsecond'" => "-1000"; "interval fallback")]
+    #[tokio::test]
+    async fn extract_epoch_preserves_nanoseconds(source: &str) -> String {
+        let ctx = exact_epoch_ctx();
         let batches = ctx
             .sql(&format!("SELECT coalesce(CAST(CAST(EXTRACT(EPOCH FROM ({source})) * 1000000000 AS BIGINT) AS TEXT), 'null')"))
             .await
@@ -2128,6 +2177,28 @@ mod tests {
             .collect()
             .await
             .unwrap();
+        batches[0].column(0).as_any().downcast_ref::<StringViewArray>().unwrap().value(0).to_string()
+    }
+
+    #[tokio::test]
+    async fn extract_epoch_keeps_its_projection_name() {
+        let sql = "SELECT EXTRACT(EPOCH FROM to_timestamp_micros(1792854698319451))";
+        let numeric = exact_epoch_ctx().sql(sql).await.unwrap();
+        let floating = udf_ctx().sql(sql).await.unwrap();
+        assert_eq!(numeric.schema().field(0).name(), floating.schema().field(0).name());
+        assert_eq!(numeric.schema().field(0).data_type(), &DataType::Decimal128(28, 9));
+        assert_eq!(floating.schema().field(0).data_type(), &DataType::Float64);
+    }
+
+    #[test_case::test_case("to_jsonb(EXTRACT(EPOCH FROM to_timestamp_nanos(1792854698319451123)))" => "1792854698.319451123"; "numeric epoch")]
+    #[test_case::test_case("jsonb_build_array(EXTRACT(EPOCH FROM to_timestamp_nanos(1792854698319451123)))" => "[1792854698.319451123]"; "numeric in json array")]
+    #[test_case::test_case("to_jsonb(make_array(EXTRACT(EPOCH FROM to_timestamp_nanos(1792854698319451123)), EXTRACT(EPOCH FROM CAST(NULL AS TIMESTAMP))))" => "[1792854698.319451123,null]"; "nested numeric and null")]
+    #[test_case::test_case("row_to_json(named_struct('epoch', EXTRACT(EPOCH FROM to_timestamp_nanos(1792854698319451123))))" => "{\"epoch\":1792854698.319451123}"; "numeric in record")]
+    #[test_case::test_case("to_jsonb(CAST('12345678901234567890.123456789' AS DECIMAL(29,9)))" => "12345678901234567890.123456789"; "decimal128")]
+    #[test_case::test_case("to_jsonb(CAST('123456789012345678901234567890.123456789' AS DECIMAL(50,9)))" => "123456789012345678901234567890.123456789"; "decimal256")]
+    #[tokio::test]
+    async fn decimal_json_preserves_numbers(expression: &str) -> String {
+        let batches = exact_epoch_ctx().sql(&format!("SELECT {expression}")).await.unwrap().collect().await.unwrap();
         batches[0].column(0).as_any().downcast_ref::<StringViewArray>().unwrap().value(0).to_string()
     }
 
@@ -2186,13 +2257,13 @@ mod tests {
         elements.into_iter().for_each(|value| b.values().append_value(value));
         b.append(true);
         let arr: ArrayRef = Arc::new(b.finish());
-        assert_eq!(array_to_json_values(&arr).unwrap(), expected, "LargeList");
+        assert_eq!(serde_json::to_value(array_to_json_values(&arr).unwrap()).unwrap(), json!(expected), "LargeList");
 
         let mut b = FixedSizeListBuilder::new(StringViewBuilder::new(), 2);
         elements.into_iter().for_each(|value| b.values().append_value(value));
         b.append(true);
         let arr: ArrayRef = Arc::new(b.finish());
-        assert_eq!(array_to_json_values(&arr).unwrap(), expected, "FixedSizeList");
+        assert_eq!(serde_json::to_value(array_to_json_values(&arr).unwrap()).unwrap(), json!(expected), "FixedSizeList");
     }
 
     /// `json_build_array` must stay linear in rows (not O(rows² × args)) and must
