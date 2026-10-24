@@ -1432,8 +1432,11 @@ async fn a_partly_covered_window_is_exact_and_counts_a_measure_decline_once() ->
 /// monoscope's hourly proven-endpoint count unnests `hashes` itself. With the hash tier built
 /// on two of three days it is a hybrid whose raw legs unnest too, and it must equal raw: rows
 /// with two listed hashes count once per hash, and non-HTTP, failed and unlisted rows not at all.
+#[test_case("floor(extract(epoch from timestamp) / 3600)::bigint"; "integer epoch bucket")]
+#[test_case("extract(epoch from time_bucket('1 hour', timestamp))"; "numeric epoch bucket")]
+#[test_case("date_part('epoch', time_bucket('1 hour', timestamp))"; "floating epoch bucket")]
 #[tokio::test(flavor = "multi_thread")]
-async fn an_unnesting_hash_count_routes_to_the_hash_tier_and_equals_raw() -> Result<()> {
+async fn an_unnesting_hash_count_routes_to_the_hash_tier_and_equals_raw(bucket: &str) -> Result<()> {
     let db = Arc::new(Database::with_config(rollup_backfill_config("served", 35)).await?);
     db.cancel_maintenance();
     let project = format!("served_{}", uuid::Uuid::new_v4().simple());
@@ -1464,7 +1467,7 @@ async fn an_unnesting_hash_count_routes_to_the_hash_tier_and_equals_raw() -> Res
     db.setup_session_context(&mut ctx)?;
     let lo = midnight_micros(days[0]) + 15 * 60_000_000;
     let sql = format!(
-        "WITH served AS (SELECT unnest(hashes) AS hash, floor(extract(epoch from timestamp) / 3600)::bigint AS hour_bucket FROM otel_logs_and_spans \
+        "WITH served AS (SELECT unnest(hashes) AS hash, {bucket} AS hour_bucket FROM otel_logs_and_spans \
          WHERE project_id = '{project}' AND timestamp >= to_timestamp_micros({lo}) AND attributes___http___request___method IS NOT NULL \
          AND attributes___http___response___status_code < 400 AND hashes && ARRAY['a','b']::text[]) \
          SELECT hash, hour_bucket, count(*)::bigint AS cnt FROM served WHERE hash = ANY(ARRAY['a','b']::text[]) GROUP BY hash, hour_bucket ORDER BY 1, 2"

@@ -1115,6 +1115,7 @@ async fn ids_and_dedup_input(ctx: &SessionContext, sql: &str) -> Result<(Vec<Str
 enum PageContract {
     IssueSample,
     LogExplorer,
+    RouteLogExplorer,
 }
 
 /// Decode the actual wire result without truncating at the client. The prepared
@@ -1133,7 +1134,7 @@ async fn wire_page(client: &tokio_postgres::Client, sql: &str, contract: PageCon
                 .collect(),
             None,
         )),
-        PageContract::LogExplorer => {
+        PageContract::LogExplorer | PageContract::RouteLogExplorer => {
             use futures::{StreamExt, TryStreamExt};
             let started = std::time::Instant::now();
             let stream = client.query_raw(sql, [&501i64 as &(dyn tokio_postgres::types::ToSql + Sync)]).await?.fuse();
@@ -1167,6 +1168,10 @@ async fn wire_page(client: &tokio_postgres::Client, sql: &str, contract: PageCon
 #[test_case(true, false, PageContract::LogExplorer; "browser complete coverage with seeded disk")]
 #[test_case(false, true, PageContract::LogExplorer; "browser partial coverage with cold disk")]
 #[test_case(true, true, PageContract::LogExplorer; "browser complete coverage with cold disk")]
+#[test_case(false, false, PageContract::RouteLogExplorer; "route partial coverage with seeded disk")]
+#[test_case(true, false, PageContract::RouteLogExplorer; "route complete coverage with seeded disk")]
+#[test_case(false, true, PageContract::RouteLogExplorer; "route partial coverage with cold disk")]
+#[test_case(true, true, PageContract::RouteLogExplorer; "route complete coverage with cold disk")]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_mutable_predicate_narrows_to_candidate_timestamps_without_ghosts(complete: bool, cold_disk: bool, contract: PageContract) -> Result<()> {
     mutable_candidate_fixture(complete, cold_disk, contract, None).await
@@ -1524,12 +1529,13 @@ async fn mutable_candidate_fixture(complete: bool, cold_disk: bool, contract: Pa
     init_local_metrics_for_test();
     let budget_secs = match contract {
         PageContract::IssueSample => 4,
-        PageContract::LogExplorer => 90,
+        PageContract::LogExplorer | PageContract::RouteLogExplorer => 90,
     };
     // The calibrated partial case leaves over 6 GiB unindexed, above the
     // existing 512 MiB planning-read cap. It must keep the exact raw fallback.
     // Normal and proportional cases still require timestamp narrowing.
     let requires_raw_fallback = !complete && background_divisor == Some(1);
+    let route = matches!(contract, PageContract::RouteLogExplorer);
     let id = uuid::Uuid::new_v4().to_string()[..8].to_string();
     let (on, ctx, svc) = build_db_with(&format!("{id}-mutcand-on"), true, |cfg| {
         cfg.core.timefusion_pgwire_max_statement_secs = budget_secs;
@@ -1554,7 +1560,7 @@ async fn mutable_candidate_fixture(complete: bool, cold_disk: bool, contract: Pa
             _ => vec![h],
         };
         let mut record = json!({"timestamp": ts, "date": date, "id": id, "name": id, "hashes": hashes, "project_id": p, "summary": [id], "context___trace_id": format!("trace-{id}"), "message_size_bytes": 1});
-        if matches!(contract, PageContract::LogExplorer) && id != "solo" {
+        if matches!(contract, PageContract::LogExplorer | PageContract::RouteLogExplorer) && (route || id != "solo") {
             record["duration"] = json!(1200);
             record["resource___service___name"] = json!("browser-api");
             record["parent_id"] = json!(format!("parent-{id}"));
@@ -1564,6 +1570,19 @@ async fn mutable_candidate_fixture(complete: bool, cold_disk: bool, contract: Pa
             record["level"] = json!("ERROR");
             record["severity___severity_number"] = json!(17);
             record["summary"] = json!([id, "quoted \"summary\"\nnext line"]);
+        }
+        if route {
+            record["kind"] = json!("server");
+            record["resource___deployment___environment___name"] = if id.len().is_multiple_of(2) { json!("") } else { serde_json::Value::Null };
+            record["attributes___server___address"] = json!("browser-proxy");
+            record["attributes___http___request___method"] = json!("GET");
+            // Route fields are immutable; only hashes change across these versions.
+            let route_tag = match id {
+                "ghost" | "stale" => "other",
+                "late" | "deleted-only" => hash,
+                _ => h,
+            };
+            record["attributes___url___path"] = json!(format!("/fixture/{route_tag}"));
         }
         record
     };
@@ -1575,11 +1594,34 @@ async fn mutable_candidate_fixture(complete: bool, cold_disk: bool, contract: Pa
         // Unindexed (direct) file: `ghost`'s older matching version, and `solo`, matching only here.
         let older = match contract {
             PageContract::IssueSample => Vec::new(),
-            PageContract::LogExplorer => {
-                (0..512).map(|i| row(&format!("page-{i}"), 181 + i * 36, hash)).chain([row("tie-a", 8, "ties"), row("tie-b", 8, "ties")]).collect()
-            }
+            PageContract::LogExplorer | PageContract::RouteLogExplorer => (0..512)
+                .map(|i| row(&format!("page-{i}"), 181 + i * if route { 18 } else { 36 }, hash))
+                .chain([row("tie-a", 8, "ties"), row("tie-b", 8, "ties")])
+                .collect(),
         };
-        let direct = [vec![row("ghost", 1, hash), row("solo", 5, hash), row("removed-only", 6, "removed")], fillers(30), older].concat();
+        let excluded = if route {
+            [
+                ("attributes___server___address", serde_json::Value::Null),
+                ("resource___deployment___environment___name", json!("other")),
+                ("resource___service___name", json!("browser-proxy")),
+                ("kind", json!("client")),
+                ("attributes___http___request___method", json!("POST")),
+                ("attributes___url___path", json!("/other")),
+            ]
+            .into_iter()
+            .map(|(column, value)| {
+                // Separate timestamps keep these route-only controls outside the
+                // membership fixture's eight-version candidate budget.
+                let mut record = row(&format!("excluded-{column}"), 9, hash);
+                record[column] = value;
+                record["hashes"] = json!([]);
+                record
+            })
+            .collect()
+        } else {
+            Vec::new()
+        };
+        let direct = [vec![row("ghost", 1, hash), row("solo", 5, hash), row("removed-only", 6, "removed")], fillers(30), older, excluded].concat();
         db.insert_records_batch(&p, table, vec![json_to_batch_for(table, direct)?], true, None).await?;
         // Indexed file: `ghost` stops matching, `stale` and `kept` match, `late` does not yet.
         let indexed = [
@@ -1702,7 +1744,9 @@ async fn verify_mutable_candidate_input(
     let (window_hours, budget_secs) = match contract {
         PageContract::IssueSample => (3, 4),
         PageContract::LogExplorer => (14 * 24, 90),
+        PageContract::RouteLogExplorer => (7 * 24, 90),
     };
+    let route = matches!(contract, PageContract::RouteLogExplorer);
     // Exercise each captured caller through its actual protocol, against an
     // independent server whose prefilter is disabled as the oracle.
     let stop = tokio_util::sync::CancellationToken::new();
@@ -1759,21 +1803,32 @@ async fn verify_mutable_candidate_input(
             ("deleted", None),
         ]
         .into_iter()
-        .chain(matches!(contract, PageContract::LogExplorer).then_some(("ties", Some("trace-tie-a"))))
+        .chain(matches!(contract, PageContract::LogExplorer | PageContract::RouteLogExplorer).then_some(("ties", Some("trace-tie-a"))))
+        .filter(|(tag, _)| !route || *tag == hash)
         .filter(|(tag, _)| match run {
             PageRun::Contract => true,
             PageRun::FirstPair => *tag == hash,
             PageRun::OtherPairs => *tag == "other",
         }) {
             let projection = match contract {
-                PageContract::IssueSample => "timestamp, summary, context___trace_id",
-                PageContract::LogExplorer => {
-                    "jsonb_build_array(id,to_char(timestamp at time zone 'UTC', 'YYYY-MM-DD HH24:MI:SS.US'),context___trace_id,name,duration,resource___service___name,parent_id,cast(extract(epoch from (start_time)) * 1000000 as bigint),coalesce(errors is not null or (kind = 'span' and (lower(level) = 'error' or severity___severity_number >= 17 or status_code = 'ERROR')), false),to_jsonb(summary),context___span_id,kind)"
+                PageContract::IssueSample => "timestamp, summary, context___trace_id".to_owned(),
+                PageContract::LogExplorer | PageContract::RouteLogExplorer => {
+                    let (time_format, scale, error_kind) =
+                        if route { ("YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"", 1_000_000_000, "log") } else { ("YYYY-MM-DD HH24:MI:SS.US", 1_000_000, "span") };
+                    format!(
+                        "jsonb_build_array(id,to_char(timestamp at time zone 'UTC', '{time_format}'),context___trace_id,name,duration,resource___service___name,parent_id,cast(extract(epoch from (start_time)) * {scale} as bigint),coalesce(errors is not null or (kind = '{error_kind}' and (lower(level) = 'error' or severity___severity_number >= 17 or status_code = 'ERROR')), false),to_jsonb(summary),context___span_id,kind)"
+                    )
                 }
             };
             let (predicate, limit) = match contract {
                 PageContract::IssueSample => (format!("'{tag}' = ANY(hashes)"), "1"),
                 PageContract::LogExplorer => (format!("array_has(hashes, '{tag}')"), "$1"),
+                PageContract::RouteLogExplorer => (
+                    format!(
+                        "resource___service___name = 'browser-api' AND (resource___deployment___environment___name IS NULL OR resource___deployment___environment___name = '') AND (attributes___server___address = 'browser-proxy' OR (attributes___server___address IS NULL AND resource___service___name = 'browser-proxy')) AND kind = 'server' AND attributes___http___request___method = 'GET' AND attributes___url___path = '/fixture/{tag}'"
+                    ),
+                    "$1",
+                ),
             };
             let sql = format!(
                 "SELECT {projection} FROM otel_logs_and_spans WHERE project_id='{p}' \
@@ -1808,7 +1863,7 @@ async fn verify_mutable_candidate_input(
             assert!(elapsed < std::time::Duration::from_secs(budget_secs), "{contract:?} must retain its captured deadline");
             assert_eq!(
                 counter_value(PREFILTER_MUTABLE_CANDIDATES),
-                before + u64::from(!requires_raw_fallback),
+                before + u64::from(!requires_raw_fallback && !route),
                 "candidate admission must preserve the planning-read cap"
             );
             assert!(read_bytes <= 4 * own_delta_bytes, "planning plus execution must stay bounded by this project's physical files");
@@ -1836,17 +1891,21 @@ async fn verify_mutable_candidate_input(
                 oracle_page.as_ref().map(|result| result.as_ref().map(|_| ()))
             );
             let (oracle, _) = oracle_page??;
-            assert_eq!(counter_value(PREFILTER_MUTABLE_CANDIDATES), before + u64::from(!requires_raw_fallback), "oracle must not use the candidate path");
+            assert_eq!(
+                counter_value(PREFILTER_MUTABLE_CANDIDATES),
+                before + u64::from(!requires_raw_fallback && !route),
+                "oracle must not use the candidate path"
+            );
             assert_eq!(actual, oracle, "pass {pass}: all projected values must match the full latest-visible-row oracle for {tag}");
             assert_eq!(actual.first().and_then(|row| row[2].as_str()), trace, "pass {pass}: expected visible winner for {tag}");
             let expected_len = match (contract, tag) {
-                (PageContract::LogExplorer, tag) if tag == hash => 501,
-                (PageContract::LogExplorer, "other") => 33,
-                (PageContract::LogExplorer, "ties") => 2,
+                (PageContract::LogExplorer | PageContract::RouteLogExplorer, tag) if tag == hash => 501,
+                (PageContract::LogExplorer | PageContract::RouteLogExplorer, "other") => 33,
+                (PageContract::LogExplorer | PageContract::RouteLogExplorer, "ties") => 2,
                 _ => usize::from(trace.is_some()),
             };
             assert_eq!(actual.len(), expected_len);
-            if matches!(contract, PageContract::LogExplorer) && tag == hash {
+            if matches!(contract, PageContract::LogExplorer | PageContract::RouteLogExplorer) && tag == hash {
                 let expected: Vec<_> =
                     ["kept".to_string(), "late".to_string(), "solo".to_string()].into_iter().chain((0..498).map(|i| format!("page-{i}"))).collect();
                 assert_eq!(actual.iter().map(|row| row[0].as_str().expect("browser id")).collect::<Vec<_>>(), expected);
@@ -1855,17 +1914,20 @@ async fn verify_mutable_candidate_input(
                     actual[0],
                     json!([
                         "kept",
-                        chrono::DateTime::from_timestamp_micros(ts).unwrap().format("%Y-%m-%d %H:%M:%S%.6f").to_string(),
+                        chrono::DateTime::from_timestamp_micros(ts)
+                            .unwrap()
+                            .format(if route { "%Y-%m-%dT%H:%M:%S%.6fZ" } else { "%Y-%m-%d %H:%M:%S%.6f" })
+                            .to_string(),
                         "trace-kept",
                         "kept",
                         1200,
                         "browser-api",
                         "parent-kept",
-                        ts,
-                        true,
+                        ts * if route { 1000 } else { 1 },
+                        !route,
                         ["kept", "quoted \"summary\"\nnext line"],
                         "span-kept",
-                        "span"
+                        if route { "server" } else { "span" }
                     ]),
                     "all twelve prepared JSON fields must preserve their values and types"
                 );
