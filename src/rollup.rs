@@ -3809,35 +3809,6 @@ mod tests {
         assert_eq!(route.measures_available(tag.as_ref()), serves);
     }
 
-    /// monoscope RUM's session list (`otelSessionCoreRows`), as sent with its bound
-    /// environment and service parameters. The browser scope is not a dimension: it
-    /// promotes to the guard count and every measure is declared under it.
-    #[test_case::test_case("NULL", "NULL", "" ; "unscoped")]
-    #[test_case::test_case("'production'", "NULL", "" ; "one environment")]
-    #[test_case::test_case("NULL", "'web'", "" ; "one service")]
-    #[test_case::test_case("NULL", "NULL", " AND COUNT(*) FILTER (WHERE (status_code = 'ERROR' OR lower(COALESCE(level, '')) = 'error' OR attributes___exception___type IS NOT NULL)) > 0" ; "errored sessions only")]
-    #[tokio::test]
-    async fn rum_session_list_routes_to_the_browser_session_tier(environment: &str, service: &str, having: &str) {
-        let error = "(status_code = 'ERROR' OR lower(COALESCE(level, '')) = 'error' OR attributes___exception___type IS NOT NULL)";
-        let pageview = "(name LIKE 'Pageview %' OR name = 'documentLoad')";
-        let sql = format!(
-            "SELECT attributes___session___id, MIN(timestamp), MAX(timestamp), COUNT(*)::bigint, \
-             COUNT(*) FILTER (WHERE {error})::bigint, COUNT(*) FILTER (WHERE {pageview})::bigint, \
-             MAX(attributes___user___id), MAX(attributes___user___full_name), MAX(attributes___user___email), MAX(resource___service___name), \
-             NULL::text AS last_page, NULL::text AS user_agent, false AS has_replay \
-             FROM {SOURCE} WHERE project_id = 'project' \
-             AND timestamp >= to_timestamp_micros(0) AND timestamp <= to_timestamp_micros(172800000000) \
-             AND ({environment}::text IS NULL OR resource___deployment___environment___name = {environment}) \
-             AND ({service}::text IS NULL OR resource___service___name = {service}) \
-             AND (resource___telemetry___sdk___language IN ('webjs', 'javascript', 'js') OR resource___user_agent___original IS NOT NULL \
-                  OR name IN ('documentLoad', 'documentFetch') OR {pageview}) \
-             AND attributes___session___id IS NOT NULL AND attributes___session___id <> '' \
-             GROUP BY attributes___session___id HAVING true{having} ORDER BY MAX(timestamp) DESC LIMIT 200"
-        );
-        let route = route_alone(&sql).await.expect("the RUM session list must route").expect("a route");
-        assert_eq!(route.target, "otel_logs_and_spans_rollup_sessions_1h_v2");
-    }
-
     /// The tiers `sql` routes to, best first, without the table prefix.
     async fn targets(state: &datafusion::execution::context::SessionState, sql: &str) -> Result<Vec<String>, MissReason> {
         let routes = match_aggregates(&optimized(state, sql).await, state).await?;
@@ -4055,8 +4026,9 @@ mod tests {
     }
 
     /// monoscope's RUM predicates (`browserScope`, `pageViewPredicate`, `errorPredicate`)
-    /// and the widget scope `{{query_ast_filters}}` expands to, byte for byte.
-    const RUM_SCOPE: &str = "project_id = 'project' AND timestamp BETWEEN '1970-01-01T00:00:00Z' AND '1970-01-02T00:00:00Z' AND TRUE";
+    /// and the widget scope `{{query_ast_filters}}` expands to, byte for byte, its
+    /// Application variable left as `{{application}}`.
+    const RUM_SCOPE: &str = "project_id = 'project' and timestamp BETWEEN '1970-01-01T00:00:00Z' AND '1970-01-02T00:00:00Z' and {{application}}";
     const RUM_BROWSER: &str = "(resource___telemetry___sdk___language IN ('webjs', 'javascript', 'js') OR resource___user_agent___original IS NOT NULL \
                                OR name IN ('documentLoad', 'documentFetch') OR (name LIKE 'Pageview %' OR name = 'documentLoad'))";
     const RUM_PAGEVIEW: &str = "(name LIKE 'Pageview %' OR name = 'documentLoad')";
@@ -4095,9 +4067,16 @@ mod tests {
         &["rum_pageview_count", "rum_error_count"] ; "the activity chart unpivoted to long form")]
     #[tokio::test]
     async fn rum_widgets_route_to_their_declared_measures(sql: &str, measures: &[&str]) {
-        let (_, generated) = assert_substitutes(&session().await, sql, None).await;
-        for measure in measures {
-            assert!(generated.contains(measure), "{measure} must be read: {generated}");
+        let state = session().await;
+        // The dashboard's Application variable as monoscope lowers it from KQL: absent, none selected, one selected.
+        // Unselected must fold away; selected must survive as a filter on the tier's service dimension.
+        for application in ["TRUE", "(('' = '' OR resource___service___name = ''))", "(('web' = '' OR resource___service___name = 'web'))"] {
+            let (_, generated) = assert_substitutes(&state, &sql.replace("{{application}}", application), None).await;
+            for measure in measures {
+                assert!(generated.contains(measure), "{application}: {measure} must be read: {generated}");
+            }
+            assert!(!generated.contains("resource___service___name = ''"), "{application}: {generated}");
+            assert!(!application.contains("'web'") || generated.contains("resource___service___name = 'web'"), "{application}: {generated}");
         }
     }
 
@@ -4194,7 +4173,7 @@ mod tests {
     // Isolate requirements from Monoscope LogQueries.fetchSessions (8f1aaa2fe).
     // These are routing probes, not a full-client-query or consumer-frequency test.
     #[test_case::test_case("attributes___session___id", "COUNT(*)"
-        => Some("otel_logs_and_spans_rollup_sessions_1h_v2".to_owned()); "declared session count routes")]
+        => None; "no tier declares the session id")]
     #[test_case::test_case(
         "COALESCE(NULLIF(attributes___session___id, ''), NULLIF(attributes___user___id, ''), NULLIF(attributes___user___email, ''))", "COUNT(*)"
         => None; "fallback session identity is not stored")]

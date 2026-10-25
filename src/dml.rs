@@ -306,9 +306,11 @@ impl QueryPlanner for DmlQueryPlanner {
                 }))
             }
             _ => {
+                if let Some(narrowed) = crate::read::bounded_merge::narrow_descending_fetch(logical_plan, session_state, &self.planner).await? {
+                    return Ok(narrowed);
+                }
                 let full = self.planner.create_physical_plan(logical_plan, session_state).await?;
-                let full = crate::read::bounded_merge::narrow_ascending_fetch(logical_plan, full, session_state, &self.planner).await?;
-                crate::read::bounded_merge::narrow_descending_fetch(logical_plan, full, session_state, &self.planner).await
+                crate::read::bounded_merge::narrow_ascending_fetch(logical_plan, full, session_state, &self.planner).await
             }
         }
     }

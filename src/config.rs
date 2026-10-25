@@ -1154,8 +1154,10 @@ pub struct TantivyConfig {
     /// Search bundles by ranged reads instead of installing them whole; `FLAG SET`-able.
     #[serde_inline_default(true)]
     pub timefusion_tantivy_range_reads: bool,
-    /// Decompressed bundle blocks held in memory across all open bundles.
-    #[serde_inline_default(1024)]
+    /// Decompressed bundle blocks held in memory across all open bundles. One 7-day list over
+    /// day-sized indexes reads ~460 MB compressed (several GB decompressed), so 1 GB evicted a
+    /// query's own blocks and every dashboard refresh fetched them from S3 again.
+    #[serde_inline_default(4096)]
     pub timefusion_tantivy_block_cache_mb: usize,
     /// Files a single backfill pass will attempt — a COUNT ceiling only, against
     /// a pathological queue of tiny files. The real bound is
@@ -1881,8 +1883,10 @@ pub struct MaintenanceConfig {
     #[serde_inline_default(true)]
     pub timefusion_light_optimize_enabled: bool,
     // Hot/today compaction target. A tiny target leaves the hot partition as
-    // dozens of files and makes recent queries file-open-latency bound.
-    #[serde_inline_default(256 * MIB as i64)]
+    // dozens of files and makes recent queries file-open-latency bound; a large one
+    // lets one dedup deletion vector turn off predicate pushdown for a whole
+    // 7M-row file until it is stripped.
+    #[serde_inline_default(128 * MIB as i64)]
     pub timefusion_light_optimize_target_size: i64,
 
     /// Per-runtime-env spill ceiling in GiB for the maintenance-family
@@ -3393,12 +3397,21 @@ pub fn apply(config: &mut AppConfig) {
     // Always emit the breakdown: the slack figure is the operator's only view of
     // how much room the untracked consumers have.
     let slack_mb = audit.slack_mb();
-    let BudgetAudit { committed_mb, warn_at_mb, query_pool_mb, mem_buffer_hard_mb, maintenance_pool_mb, foyer_mb, tantivy_peak_mb, df_metadata_cache_mb } =
-        audit;
+    let BudgetAudit {
+        committed_mb,
+        warn_at_mb,
+        query_pool_mb,
+        mem_buffer_hard_mb,
+        maintenance_pool_mb,
+        foyer_mb,
+        tantivy_peak_mb,
+        tantivy_block_cache_mb,
+        df_metadata_cache_mb,
+    } = audit;
     let msg = format!(
         "bootstrap.phase=budget_audit committed_mb={committed_mb} warn_at_mb={warn_at_mb} slack_mb={slack_mb} \
          (query_pool={query_pool_mb} mem_buffer_hard={mem_buffer_hard_mb} maintenance_pool={maintenance_pool_mb} foyer={foyer_mb} \
-         tantivy_peak={tantivy_peak_mb} df_metadata_cache={df_metadata_cache_mb}) ram_mb={total_ram_mb} — \
+         tantivy_peak={tantivy_peak_mb} tantivy_block_cache={tantivy_block_cache_mb} df_metadata_cache={df_metadata_cache_mb}) ram_mb={total_ram_mb} — \
          slack absorbs UNTRACKED allocation (parquet decode, walrus mmaps, tantivy, allocator overhead); one wide scan can \
          exceed a small slack, which is how a box gets OOM-killed while every individual budget looks fine"
     );
@@ -3420,6 +3433,7 @@ pub struct BudgetAudit {
     pub maintenance_pool_mb: usize,
     pub foyer_mb: usize,
     pub tantivy_peak_mb: usize,
+    pub tantivy_block_cache_mb: usize,
     pub df_metadata_cache_mb: usize,
     pub committed_mb: usize,
     pub warn_at_mb: usize,
@@ -3462,14 +3476,16 @@ pub fn budget_audit(config: &AppConfig, total_ram_mb: usize) -> BudgetAudit {
     let query_pool_mb = config.derived.query_pool_bytes() / MIB;
     let maintenance_pool_mb = config.derived.maintenance_pool_bytes() / MIB;
     let df_metadata_cache_mb = config.cache.timefusion_df_metadata_cache_mb;
+    let tantivy_block_cache_mb = if config.tantivy.indexed_tables().is_empty() { 0 } else { config.tantivy.timefusion_tantivy_block_cache_mb };
     BudgetAudit {
         query_pool_mb,
         mem_buffer_hard_mb,
         maintenance_pool_mb,
         foyer_mb,
         tantivy_peak_mb,
+        tantivy_block_cache_mb,
         df_metadata_cache_mb,
-        committed_mb: query_pool_mb + mem_buffer_hard_mb + maintenance_pool_mb + foyer_mb + tantivy_peak_mb + df_metadata_cache_mb,
+        committed_mb: query_pool_mb + mem_buffer_hard_mb + maintenance_pool_mb + foyer_mb + tantivy_peak_mb + tantivy_block_cache_mb + df_metadata_cache_mb,
         warn_at_mb: total_ram_mb * OVERSUB_WARN_PCT / 100,
     }
 }
@@ -3515,7 +3531,10 @@ mod autotune_tests {
         assert_eq!(a.maintenance_pool_mb, cfg.derived.maintenance_pool_bytes() / MIB, "was missing entirely");
         let effective = cfg.buffer.timefusion_buffer_max_memory_mb - a.foyer_mb - a.tantivy_peak_mb;
         assert_eq!(a.mem_buffer_hard_mb, effective * 6 / 5);
-        assert_eq!(a.committed_mb, a.query_pool_mb + a.mem_buffer_hard_mb + a.maintenance_pool_mb + a.foyer_mb + a.tantivy_peak_mb + a.df_metadata_cache_mb);
+        assert_eq!(
+            a.committed_mb,
+            a.query_pool_mb + a.mem_buffer_hard_mb + a.maintenance_pool_mb + a.foyer_mb + a.tantivy_peak_mb + a.tantivy_block_cache_mb + a.df_metadata_cache_mb
+        );
         a
     }
 
