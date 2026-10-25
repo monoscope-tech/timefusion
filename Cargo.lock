@@ -2202,7 +2202,7 @@ dependencies = [
 [[package]]
 name = "datafusion"
 version = "55.1.0"
-source = "git+https://github.com/tonyalaribe/datafusion.git?rev=2f17a2380e5cb3b32d3d70cf97cea37ed45d61f0#2f17a2380e5cb3b32d3d70cf97cea37ed45d61f0"
+source = "git+https://github.com/tonyalaribe/datafusion.git?rev=1f06ab1bd4f27506e0e12d435c36f2673dfbbd98#1f06ab1bd4f27506e0e12d435c36f2673dfbbd98"
 dependencies = [
  "arrow",
  "arrow-schema",
@@ -2254,7 +2254,7 @@ dependencies = [
 [[package]]
 name = "datafusion-catalog"
 version = "55.1.0"
-source = "git+https://github.com/tonyalaribe/datafusion.git?rev=2f17a2380e5cb3b32d3d70cf97cea37ed45d61f0#2f17a2380e5cb3b32d3d70cf97cea37ed45d61f0"
+source = "git+https://github.com/tonyalaribe/datafusion.git?rev=1f06ab1bd4f27506e0e12d435c36f2673dfbbd98#1f06ab1bd4f27506e0e12d435c36f2673dfbbd98"
 dependencies = [
  "arrow",
  "async-trait",
@@ -2278,7 +2278,7 @@ dependencies = [
 [[package]]
 name = "datafusion-catalog-listing"
 version = "55.1.0"
-source = "git+https://github.com/tonyalaribe/datafusion.git?rev=2f17a2380e5cb3b32d3d70cf97cea37ed45d61f0#2f17a2380e5cb3b32d3d70cf97cea37ed45d61f0"
+source = "git+https://github.com/tonyalaribe/datafusion.git?rev=1f06ab1bd4f27506e0e12d435c36f2673dfbbd98#1f06ab1bd4f27506e0e12d435c36f2673dfbbd98"
 dependencies = [
  "arrow",
  "async-trait",
@@ -2301,7 +2301,7 @@ dependencies = [
 [[package]]
 name = "datafusion-common"
 version = "55.1.0"
-source = "git+https://github.com/tonyalaribe/datafusion.git?rev=2f17a2380e5cb3b32d3d70cf97cea37ed45d61f0#2f17a2380e5cb3b32d3d70cf97cea37ed45d61f0"
+source = "git+https://github.com/tonyalaribe/datafusion.git?rev=1f06ab1bd4f27506e0e12d435c36f2673dfbbd98#1f06ab1bd4f27506e0e12d435c36f2673dfbbd98"
 dependencies = [
  "arrow",
  "arrow-ipc",
@@ -2327,7 +2327,7 @@ dependencies = [
 [[package]]
 name = "datafusion-common-runtime"
 version = "55.1.0"
-source = "git+https://github.com/tonyalaribe/datafusion.git?rev=2f17a2380e5cb3b32d3d70cf97cea37ed45d61f0#2f17a2380e5cb3b32d3d70cf97cea37ed45d61f0"
+source = "git+https://github.com/tonyalaribe/datafusion.git?rev=1f06ab1bd4f27506e0e12d435c36f2673dfbbd98#1f06ab1bd4f27506e0e12d435c36f2673dfbbd98"
 dependencies = [
  "futures",
  "log",
@@ -2337,7 +2337,7 @@ dependencies = [
 [[package]]
 name = "datafusion-datasource"
 version = "55.1.0"
-source = "git+https://github.com/tonyalaribe/datafusion.git?rev=2f17a2380e5cb3b32d3d70cf97cea37ed45d61f0#2f17a2380e5cb3b32d3d70cf97cea37ed45d61f0"
+source = "git+https://github.com/tonyalaribe/datafusion.git?rev=1f06ab1bd4f27506e0e12d435c36f2673dfbbd98#1f06ab1bd4f27506e0e12d435c36f2673dfbbd98"
 dependencies = [
  "arrow",
  "async-compression",
@@ -2373,7 +2373,7 @@ dependencies = [
 [[package]]
 name = "datafusion-datasource-arrow"
 version = "55.1.0"
-source = "git+https://github.com/tonyalaribe/datafusion.git?rev=2f17a2380e5cb3b32d3d70cf97cea37ed45d61f0#2f17a2380e5cb3b32d3d70cf97cea37ed45d61f0"
+source = "git+https://github.com/tonyalaribe/datafusion.git?rev=1f06ab1bd4f27506e0e12d435c36f2673dfbbd98#1f06ab1bd4f27506e0e12d435c36f2673dfbbd98"
 dependencies = [
  "arrow",
  "arrow-ipc",
@@ -2397,7 +2397,7 @@ dependencies = [
 [[package]]
 name = "datafusion-datasource-csv"
 version = "55.1.0"
-source = "git+https://github.com/tonyalaribe/datafusion.git?rev=2f17a2380e5cb3b32d3d70cf97cea37ed45d61f0#2f17a2380e5cb3b32d3d70cf97cea37ed45d61f0"
+source = "git+https://github.com/tonyalaribe/datafusion.git?rev=1f06ab1bd4f27506e0e12d435c36f2673dfbbd98#1f06ab1bd4f27506e0e12d435c36f2673dfbbd98"
 dependencies = [
  "arrow",
  "async-trait",
@@ -2420,7 +2420,7 @@ dependencies = [
 [[package]]
 name = "datafusion-datasource-json"
 version = "55.1.0"
-source = "git+https://github.com/tonyalaribe/datafusion.git?rev=2f17a2380e5cb3b32d3d70cf97cea37ed45d61f0#2f17a2380e5cb3b32d3d70cf97cea37ed45d61f0"
+source = "git+https://github.com/tonyalaribe/datafusion.git?rev=1f06ab1bd4f27506e0e12d435c36f2673dfbbd98#1f06ab1bd4f27506e0e12d435c36f2673dfbbd98"
 dependencies = [
  "arrow",
  "async-trait",
@@ -2443,7 +2443,7 @@ dependencies = [
 [[package]]
 name = "datafusion-datasource-parquet"
 version = "55.1.0"
-source = "git+https://github.com/tonyalaribe/datafusion.git?rev=2f17a2380e5cb3b32d3d70cf97cea37ed45d61f0#2f17a2380e5cb3b32d3d70cf97cea37ed45d61f0"
+source = "git+https://github.com/tonyalaribe/datafusion.git?rev=1f06ab1bd4f27506e0e12d435c36f2673dfbbd98#1f06ab1bd4f27506e0e12d435c36f2673dfbbd98"
 dependencies = [
  "arrow",
  "arrow-schema",
@@ -2475,12 +2475,12 @@ dependencies = [
 [[package]]
 name = "datafusion-doc"
 version = "55.1.0"
-source = "git+https://github.com/tonyalaribe/datafusion.git?rev=2f17a2380e5cb3b32d3d70cf97cea37ed45d61f0#2f17a2380e5cb3b32d3d70cf97cea37ed45d61f0"
+source = "git+https://github.com/tonyalaribe/datafusion.git?rev=1f06ab1bd4f27506e0e12d435c36f2673dfbbd98#1f06ab1bd4f27506e0e12d435c36f2673dfbbd98"
 
 [[package]]
 name = "datafusion-execution"
 version = "55.1.0"
-source = "git+https://github.com/tonyalaribe/datafusion.git?rev=2f17a2380e5cb3b32d3d70cf97cea37ed45d61f0#2f17a2380e5cb3b32d3d70cf97cea37ed45d61f0"
+source = "git+https://github.com/tonyalaribe/datafusion.git?rev=1f06ab1bd4f27506e0e12d435c36f2673dfbbd98#1f06ab1bd4f27506e0e12d435c36f2673dfbbd98"
 dependencies = [
  "arrow",
  "arrow-buffer",
@@ -2505,7 +2505,7 @@ dependencies = [
 [[package]]
 name = "datafusion-expr"
 version = "55.1.0"
-source = "git+https://github.com/tonyalaribe/datafusion.git?rev=2f17a2380e5cb3b32d3d70cf97cea37ed45d61f0#2f17a2380e5cb3b32d3d70cf97cea37ed45d61f0"
+source = "git+https://github.com/tonyalaribe/datafusion.git?rev=1f06ab1bd4f27506e0e12d435c36f2673dfbbd98#1f06ab1bd4f27506e0e12d435c36f2673dfbbd98"
 dependencies = [
  "arrow",
  "arrow-schema",
@@ -2529,7 +2529,7 @@ dependencies = [
 [[package]]
 name = "datafusion-expr-common"
 version = "55.1.0"
-source = "git+https://github.com/tonyalaribe/datafusion.git?rev=2f17a2380e5cb3b32d3d70cf97cea37ed45d61f0#2f17a2380e5cb3b32d3d70cf97cea37ed45d61f0"
+source = "git+https://github.com/tonyalaribe/datafusion.git?rev=1f06ab1bd4f27506e0e12d435c36f2673dfbbd98#1f06ab1bd4f27506e0e12d435c36f2673dfbbd98"
 dependencies = [
  "arrow",
  "datafusion-common",
@@ -2540,7 +2540,7 @@ dependencies = [
 [[package]]
 name = "datafusion-functions"
 version = "55.1.0"
-source = "git+https://github.com/tonyalaribe/datafusion.git?rev=2f17a2380e5cb3b32d3d70cf97cea37ed45d61f0#2f17a2380e5cb3b32d3d70cf97cea37ed45d61f0"
+source = "git+https://github.com/tonyalaribe/datafusion.git?rev=1f06ab1bd4f27506e0e12d435c36f2673dfbbd98#1f06ab1bd4f27506e0e12d435c36f2673dfbbd98"
 dependencies = [
  "arrow",
  "arrow-buffer",
@@ -2571,7 +2571,7 @@ dependencies = [
 [[package]]
 name = "datafusion-functions-aggregate"
 version = "55.1.0"
-source = "git+https://github.com/tonyalaribe/datafusion.git?rev=2f17a2380e5cb3b32d3d70cf97cea37ed45d61f0#2f17a2380e5cb3b32d3d70cf97cea37ed45d61f0"
+source = "git+https://github.com/tonyalaribe/datafusion.git?rev=1f06ab1bd4f27506e0e12d435c36f2673dfbbd98#1f06ab1bd4f27506e0e12d435c36f2673dfbbd98"
 dependencies = [
  "arrow",
  "datafusion-common",
@@ -2591,7 +2591,7 @@ dependencies = [
 [[package]]
 name = "datafusion-functions-aggregate-common"
 version = "55.1.0"
-source = "git+https://github.com/tonyalaribe/datafusion.git?rev=2f17a2380e5cb3b32d3d70cf97cea37ed45d61f0#2f17a2380e5cb3b32d3d70cf97cea37ed45d61f0"
+source = "git+https://github.com/tonyalaribe/datafusion.git?rev=1f06ab1bd4f27506e0e12d435c36f2673dfbbd98#1f06ab1bd4f27506e0e12d435c36f2673dfbbd98"
 dependencies = [
  "arrow",
  "datafusion-common",
@@ -2615,7 +2615,7 @@ dependencies = [
 [[package]]
 name = "datafusion-functions-nested"
 version = "55.1.0"
-source = "git+https://github.com/tonyalaribe/datafusion.git?rev=2f17a2380e5cb3b32d3d70cf97cea37ed45d61f0#2f17a2380e5cb3b32d3d70cf97cea37ed45d61f0"
+source = "git+https://github.com/tonyalaribe/datafusion.git?rev=1f06ab1bd4f27506e0e12d435c36f2673dfbbd98#1f06ab1bd4f27506e0e12d435c36f2673dfbbd98"
 dependencies = [
  "arrow",
  "arrow-ord",
@@ -2639,7 +2639,7 @@ dependencies = [
 [[package]]
 name = "datafusion-functions-table"
 version = "55.1.0"
-source = "git+https://github.com/tonyalaribe/datafusion.git?rev=2f17a2380e5cb3b32d3d70cf97cea37ed45d61f0#2f17a2380e5cb3b32d3d70cf97cea37ed45d61f0"
+source = "git+https://github.com/tonyalaribe/datafusion.git?rev=1f06ab1bd4f27506e0e12d435c36f2673dfbbd98#1f06ab1bd4f27506e0e12d435c36f2673dfbbd98"
 dependencies = [
  "arrow",
  "async-trait",
@@ -2654,7 +2654,7 @@ dependencies = [
 [[package]]
 name = "datafusion-functions-window"
 version = "55.1.0"
-source = "git+https://github.com/tonyalaribe/datafusion.git?rev=2f17a2380e5cb3b32d3d70cf97cea37ed45d61f0#2f17a2380e5cb3b32d3d70cf97cea37ed45d61f0"
+source = "git+https://github.com/tonyalaribe/datafusion.git?rev=1f06ab1bd4f27506e0e12d435c36f2673dfbbd98#1f06ab1bd4f27506e0e12d435c36f2673dfbbd98"
 dependencies = [
  "arrow",
  "datafusion-common",
@@ -2670,7 +2670,7 @@ dependencies = [
 [[package]]
 name = "datafusion-functions-window-common"
 version = "55.1.0"
-source = "git+https://github.com/tonyalaribe/datafusion.git?rev=2f17a2380e5cb3b32d3d70cf97cea37ed45d61f0#2f17a2380e5cb3b32d3d70cf97cea37ed45d61f0"
+source = "git+https://github.com/tonyalaribe/datafusion.git?rev=1f06ab1bd4f27506e0e12d435c36f2673dfbbd98#1f06ab1bd4f27506e0e12d435c36f2673dfbbd98"
 dependencies = [
  "datafusion-common",
  "datafusion-physical-expr-common",
@@ -2679,7 +2679,7 @@ dependencies = [
 [[package]]
 name = "datafusion-macros"
 version = "55.1.0"
-source = "git+https://github.com/tonyalaribe/datafusion.git?rev=2f17a2380e5cb3b32d3d70cf97cea37ed45d61f0#2f17a2380e5cb3b32d3d70cf97cea37ed45d61f0"
+source = "git+https://github.com/tonyalaribe/datafusion.git?rev=1f06ab1bd4f27506e0e12d435c36f2673dfbbd98#1f06ab1bd4f27506e0e12d435c36f2673dfbbd98"
 dependencies = [
  "datafusion-doc",
  "quote",
@@ -2689,7 +2689,7 @@ dependencies = [
 [[package]]
 name = "datafusion-optimizer"
 version = "55.1.0"
-source = "git+https://github.com/tonyalaribe/datafusion.git?rev=2f17a2380e5cb3b32d3d70cf97cea37ed45d61f0#2f17a2380e5cb3b32d3d70cf97cea37ed45d61f0"
+source = "git+https://github.com/tonyalaribe/datafusion.git?rev=1f06ab1bd4f27506e0e12d435c36f2673dfbbd98#1f06ab1bd4f27506e0e12d435c36f2673dfbbd98"
 dependencies = [
  "arrow",
  "chrono",
@@ -2732,7 +2732,7 @@ dependencies = [
 [[package]]
 name = "datafusion-physical-expr"
 version = "55.1.0"
-source = "git+https://github.com/tonyalaribe/datafusion.git?rev=2f17a2380e5cb3b32d3d70cf97cea37ed45d61f0#2f17a2380e5cb3b32d3d70cf97cea37ed45d61f0"
+source = "git+https://github.com/tonyalaribe/datafusion.git?rev=1f06ab1bd4f27506e0e12d435c36f2673dfbbd98#1f06ab1bd4f27506e0e12d435c36f2673dfbbd98"
 dependencies = [
  "arrow",
  "arrow-schema",
@@ -2755,7 +2755,7 @@ dependencies = [
 [[package]]
 name = "datafusion-physical-expr-adapter"
 version = "55.1.0"
-source = "git+https://github.com/tonyalaribe/datafusion.git?rev=2f17a2380e5cb3b32d3d70cf97cea37ed45d61f0#2f17a2380e5cb3b32d3d70cf97cea37ed45d61f0"
+source = "git+https://github.com/tonyalaribe/datafusion.git?rev=1f06ab1bd4f27506e0e12d435c36f2673dfbbd98#1f06ab1bd4f27506e0e12d435c36f2673dfbbd98"
 dependencies = [
  "arrow",
  "datafusion-common",
@@ -2769,7 +2769,7 @@ dependencies = [
 [[package]]
 name = "datafusion-physical-expr-common"
 version = "55.1.0"
-source = "git+https://github.com/tonyalaribe/datafusion.git?rev=2f17a2380e5cb3b32d3d70cf97cea37ed45d61f0#2f17a2380e5cb3b32d3d70cf97cea37ed45d61f0"
+source = "git+https://github.com/tonyalaribe/datafusion.git?rev=1f06ab1bd4f27506e0e12d435c36f2673dfbbd98#1f06ab1bd4f27506e0e12d435c36f2673dfbbd98"
 dependencies = [
  "arrow",
  "chrono",
@@ -2786,7 +2786,7 @@ dependencies = [
 [[package]]
 name = "datafusion-physical-optimizer"
 version = "55.1.0"
-source = "git+https://github.com/tonyalaribe/datafusion.git?rev=2f17a2380e5cb3b32d3d70cf97cea37ed45d61f0#2f17a2380e5cb3b32d3d70cf97cea37ed45d61f0"
+source = "git+https://github.com/tonyalaribe/datafusion.git?rev=1f06ab1bd4f27506e0e12d435c36f2673dfbbd98#1f06ab1bd4f27506e0e12d435c36f2673dfbbd98"
 dependencies = [
  "arrow",
  "datafusion-common",
@@ -2805,7 +2805,7 @@ dependencies = [
 [[package]]
 name = "datafusion-physical-plan"
 version = "55.1.0"
-source = "git+https://github.com/tonyalaribe/datafusion.git?rev=2f17a2380e5cb3b32d3d70cf97cea37ed45d61f0#2f17a2380e5cb3b32d3d70cf97cea37ed45d61f0"
+source = "git+https://github.com/tonyalaribe/datafusion.git?rev=1f06ab1bd4f27506e0e12d435c36f2673dfbbd98#1f06ab1bd4f27506e0e12d435c36f2673dfbbd98"
 dependencies = [
  "arrow",
  "arrow-data",
@@ -2865,7 +2865,7 @@ dependencies = [
 [[package]]
 name = "datafusion-proto"
 version = "55.1.0"
-source = "git+https://github.com/tonyalaribe/datafusion.git?rev=2f17a2380e5cb3b32d3d70cf97cea37ed45d61f0#2f17a2380e5cb3b32d3d70cf97cea37ed45d61f0"
+source = "git+https://github.com/tonyalaribe/datafusion.git?rev=1f06ab1bd4f27506e0e12d435c36f2673dfbbd98#1f06ab1bd4f27506e0e12d435c36f2673dfbbd98"
 dependencies = [
  "arrow",
  "datafusion-catalog",
@@ -2891,7 +2891,7 @@ dependencies = [
 [[package]]
 name = "datafusion-proto-common"
 version = "55.1.0"
-source = "git+https://github.com/tonyalaribe/datafusion.git?rev=2f17a2380e5cb3b32d3d70cf97cea37ed45d61f0#2f17a2380e5cb3b32d3d70cf97cea37ed45d61f0"
+source = "git+https://github.com/tonyalaribe/datafusion.git?rev=1f06ab1bd4f27506e0e12d435c36f2673dfbbd98#1f06ab1bd4f27506e0e12d435c36f2673dfbbd98"
 dependencies = [
  "arrow",
  "datafusion-common",
@@ -2901,7 +2901,7 @@ dependencies = [
 [[package]]
 name = "datafusion-proto-models"
 version = "55.1.0"
-source = "git+https://github.com/tonyalaribe/datafusion.git?rev=2f17a2380e5cb3b32d3d70cf97cea37ed45d61f0#2f17a2380e5cb3b32d3d70cf97cea37ed45d61f0"
+source = "git+https://github.com/tonyalaribe/datafusion.git?rev=1f06ab1bd4f27506e0e12d435c36f2673dfbbd98#1f06ab1bd4f27506e0e12d435c36f2673dfbbd98"
 dependencies = [
  "datafusion-common",
  "datafusion-proto-common",
@@ -2911,7 +2911,7 @@ dependencies = [
 [[package]]
 name = "datafusion-pruning"
 version = "55.1.0"
-source = "git+https://github.com/tonyalaribe/datafusion.git?rev=2f17a2380e5cb3b32d3d70cf97cea37ed45d61f0#2f17a2380e5cb3b32d3d70cf97cea37ed45d61f0"
+source = "git+https://github.com/tonyalaribe/datafusion.git?rev=1f06ab1bd4f27506e0e12d435c36f2673dfbbd98#1f06ab1bd4f27506e0e12d435c36f2673dfbbd98"
 dependencies = [
  "arrow",
  "datafusion-common",
@@ -2926,7 +2926,7 @@ dependencies = [
 [[package]]
 name = "datafusion-session"
 version = "55.1.0"
-source = "git+https://github.com/tonyalaribe/datafusion.git?rev=2f17a2380e5cb3b32d3d70cf97cea37ed45d61f0#2f17a2380e5cb3b32d3d70cf97cea37ed45d61f0"
+source = "git+https://github.com/tonyalaribe/datafusion.git?rev=1f06ab1bd4f27506e0e12d435c36f2673dfbbd98#1f06ab1bd4f27506e0e12d435c36f2673dfbbd98"
 dependencies = [
  "arrow-schema",
  "async-trait",
@@ -2940,7 +2940,7 @@ dependencies = [
 [[package]]
 name = "datafusion-sql"
 version = "55.1.0"
-source = "git+https://github.com/tonyalaribe/datafusion.git?rev=2f17a2380e5cb3b32d3d70cf97cea37ed45d61f0#2f17a2380e5cb3b32d3d70cf97cea37ed45d61f0"
+source = "git+https://github.com/tonyalaribe/datafusion.git?rev=1f06ab1bd4f27506e0e12d435c36f2673dfbbd98#1f06ab1bd4f27506e0e12d435c36f2673dfbbd98"
 dependencies = [
  "arrow",
  "bigdecimal",
