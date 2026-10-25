@@ -2356,44 +2356,38 @@ async fn a_count_of_a_nullable_expression_is_not_served_as_the_row_count() -> Re
     Ok(())
 }
 
-/// A non-derived 1h tier is built at its grain: its 10-minute mints land as ONE hour unit,
-/// and a republished hour retires the file it replaces, so the tier read's `(timestamp, id)`
-/// dedup never sees two states of one bucket. Slices cut below the grain before that rule
-/// (W40: routed 1 vs raw 4) are refused as proof until a whole-hour rebuild replaces them.
+/// A non-derived tier coarser than the 10-minute mint is built at its grain: its mints land
+/// as ONE grain unit, and a republished grain retires the file it replaces, so the tier
+/// read's `(timestamp, id)` dedup never sees two states of one bucket. Slices cut below the
+/// grain before that rule (W40: routed 1 vs raw 4) are refused as proof until a whole-grain
+/// rebuild replaces them.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_sub_grain_tier_routes_only_over_whole_grain_slices() -> Result<()> {
     use crate::maintenance_coordinator::{MaintenanceTask, NORMAL_SLICE_MICROS, Operation, TAG_SLICE_END, TAG_SLICE_START, TaskKey, TaskState, TimeSlice};
     use crate::rollup::MissReason::{NotBuilt, SubGrainSlices};
     const HOUR: i64 = 3_600_000_000;
+    const GRAIN: i64 = 30 * 60_000_000;
     let db = Arc::new(Database::with_config(rollup_backfill_config("subgrain-partials", 35)).await?);
     db.cancel_maintenance();
     let project = format!("subgrain_{}", uuid::Uuid::new_v4().simple());
     let day = (Utc::now() - chrono::Duration::days(3)).date_naive();
     let day_start = midnight_micros(day);
     let noon = day_start + 12 * HOUR;
-    // The session tier counts only browser rows, and routes only a query scoped to them.
-    let insert_a_span = async |db: &Database, project: &str, id: &str, ts: i64| -> Result<()> {
-        db.insert_records_batch(project, "otel_logs_and_spans", vec![json_to_batch(vec![test_span_ts(id, "documentLoad", project, ts)])?], true, None)
-            .await
-            .map(|_| ())
-    };
-    let browser = "AND (resource___telemetry___sdk___language IN ('webjs', 'javascript', 'js') OR resource___user_agent___original IS NOT NULL \
-                   OR name IN ('documentLoad', 'documentFetch') OR (name LIKE 'Pageview %' OR name = 'documentLoad'))";
-    for (i, offset) in [0, 25].into_iter().enumerate() {
+    for (i, offset) in [0, 12].into_iter().enumerate() {
         insert_a_span(&db, &project, &format!("s{i}"), noon + offset * 60_000_000).await?;
     }
     db.run_unit_once("otel_logs_and_spans", &project, day, Operation::BaseRollup, 24, 0, None).await?;
     db.run_unit_once("otel_logs_and_spans", &project, day, Operation::DerivedRollup, 24, 0, None).await?;
-    let sessions = get_schema("otel_logs_and_spans")
+    let routes = get_schema("otel_logs_and_spans")
         .expect("schema")
         .rollups
         .iter()
-        .find(|spec| spec.name.as_deref() == Some("sessions_1h_v2"))
+        .find(|spec| spec.name.as_deref() == Some("routes_30m"))
         .expect("tier")
         .table_name("otel_logs_and_spans");
     let key = |start: i64, width: i64| -> Result<TaskKey> {
         Ok(TaskKey {
-            physical_table: sessions.clone(),
+            physical_table: routes.clone(),
             source: "otel_logs_and_spans".into(),
             project_id: project.clone(),
             slice: TimeSlice::new(start, start + width)?,
@@ -2408,29 +2402,31 @@ async fn a_sub_grain_tier_routes_only_over_whole_grain_slices() -> Result<()> {
             Result::<()>::Ok(())
         }
     };
-    // The six 10-minute mints of one hour become the hour itself.
-    let publish_hour = |hour: i64| {
-        let (key, run, sessions) = (&key, &run, &sessions);
+    // The three 10-minute mints of one grain become the grain itself.
+    let publish_grain = |grain: i64| {
+        let (key, run, routes) = (&key, &run, &routes);
         let db = Arc::clone(&db);
         async move {
-            for start in (hour..hour + HOUR).step_by(NORMAL_SLICE_MICROS as usize) {
+            for start in (grain..grain + GRAIN).step_by(NORMAL_SLICE_MICROS as usize) {
                 db.journal().enqueue(key(start, NORMAL_SLICE_MICROS)?, 0, crate::maintenance_coordinator::MAX_DECODED_BYTES, 0);
             }
             let queued = db
                 .journal()
                 .tasks()
-                .filter(|task| &task.key.physical_table == sessions && task.state == TaskState::Pending)
+                .filter(|task| &task.key.physical_table == routes && task.state == TaskState::Pending)
                 .map(|task| task.key.slice)
                 .collect::<Vec<_>>();
-            assert_eq!(queued, [key(hour, HOUR)?.slice], "one whole-hour unit, never a sub-grain one");
-            run(key(hour, HOUR)?).await
+            // A write mints its whole hour, so the hour's other grain may be queued beside this one.
+            assert!(queued.contains(&key(grain, GRAIN)?.slice), "the grain itself is queued: {queued:?}");
+            assert!(queued.iter().all(|slice| slice.start_micros % GRAIN == 0 && slice.width() == GRAIN), "never a sub-grain unit: {queued:?}");
+            run(key(grain, GRAIN)?).await
         }
     };
     let live_slices = || {
         let db = Arc::clone(&db);
-        let (project, sessions) = (project.clone(), sessions.clone());
+        let (project, routes) = (project.clone(), routes.clone());
         async move {
-            let adds = live_adds(&db.resolve_table(&project, &sessions).await?).await;
+            let adds = live_adds(&db.resolve_table(&project, &routes).await?).await;
             let tag = |add: &deltalake::kernel::Add, name: &str| add.tags.as_ref()?.get(name)?.as_deref()?.parse::<i64>().ok();
             Result::<Vec<_>>::Ok(adds.iter().filter_map(|add| Some((tag(add, TAG_SLICE_START)?, tag(add, TAG_SLICE_END)?))).sorted().collect())
         }
@@ -2445,10 +2441,9 @@ async fn a_sub_grain_tier_routes_only_over_whole_grain_slices() -> Result<()> {
         let (db, ctx, project) = (Arc::clone(&db), ctx.clone(), project.clone());
         async move {
             for (group, bucket, (lo, hi), want) in cases {
-                let scope = if group == "attributes___session___id" { browser } else { "" };
                 let sql = format!(
                     "SELECT time_bucket('{bucket}', timestamp) AS tb, {group}, COUNT(*) AS c FROM otel_logs_and_spans WHERE project_id = '{project}' \
-                     AND timestamp >= to_timestamp_micros({lo}) AND timestamp < to_timestamp_micros({hi}) {scope} GROUP BY 1, 2 ORDER BY 1, 2"
+                     AND timestamp >= to_timestamp_micros({lo}) AND timestamp < to_timestamp_micros({hi}) GROUP BY 1, 2 ORDER BY 1, 2"
                 );
                 let state = ctx.state();
                 let plan = state.optimize(&state.create_logical_plan(&sql).await?)?;
@@ -2466,21 +2461,22 @@ async fn a_sub_grain_tier_routes_only_over_whole_grain_slices() -> Result<()> {
         }
     };
     let hourly = || Ok(Some("3600000000us".to_string()));
+    let grained = || Ok(Some("1800000000us".to_string()));
     let around = |at: i64| (at - 2 * HOUR, at + 2 * HOUR);
 
-    // An hour published before all its rows landed, then republished complete: exact at
+    // A grain published before all its rows landed, then republished complete: exact at
     // both points, and the republish REPLACES the earlier file rather than joining it.
-    publish_hour(noon).await?;
-    check(vec![("attributes___session___id", "1 hours", around(noon), hourly())]).await?;
-    for (i, offset) in [35, 55].into_iter().enumerate() {
+    publish_grain(noon).await?;
+    check(vec![("attributes___http___route", "30 minutes", around(noon), grained())]).await?;
+    for (i, offset) in [18, 28].into_iter().enumerate() {
         insert_a_span(&db, &project, &format!("late{i}"), noon + offset * 60_000_000).await?;
     }
     db.run_unit_once("otel_logs_and_spans", &project, day, Operation::BaseRollup, 24, 0, None).await?;
     db.run_unit_once("otel_logs_and_spans", &project, day, Operation::DerivedRollup, 24, 0, None).await?;
-    publish_hour(noon).await?;
-    assert_eq!(live_slices().await?, [(noon, noon + HOUR)], "the republished hour retired the file it supersedes");
+    publish_grain(noon).await?;
+    assert_eq!(live_slices().await?, [(noon, noon + GRAIN)], "the republished grain retired the file it supersedes");
     check(vec![
-        ("attributes___session___id", "1 hours", around(noon), hourly()),
+        ("attributes___http___route", "30 minutes", around(noon), grained()),
         ("status_code", "1 hours", around(noon), hourly()),
         ("status_code", "10 minutes", around(noon), Ok(Some("60000000us".to_string()))),
         ("resource___service___name", "1 hours", around(noon - 24 * HOUR), Err(NotBuilt)),
@@ -2488,18 +2484,18 @@ async fn a_sub_grain_tier_routes_only_over_whole_grain_slices() -> Result<()> {
     .await?;
 
     // Partials a pre-fix build left behind, as a legacy journal still holds them.
-    let one = noon + HOUR;
-    for (i, offset) in [0, 25, 35, 55].into_iter().enumerate() {
+    let one = noon + GRAIN;
+    for (i, offset) in [0, 8, 15, 25].into_iter().enumerate() {
         insert_a_span(&db, &project, &format!("old{i}"), one + offset * 60_000_000).await?;
     }
-    for start in (one..one + HOUR).step_by(NORMAL_SLICE_MICROS as usize) {
+    for start in (one..one + GRAIN).step_by(NORMAL_SLICE_MICROS as usize) {
         db.journal().upsert(MaintenanceTask::pending(key(start, NORMAL_SLICE_MICROS)?, 0, 0, 0));
         run(key(start, NORMAL_SLICE_MICROS)?).await?;
     }
-    check(vec![("attributes___session___id", "1 hours", (noon, one + HOUR), Err(SubGrainSlices))]).await?;
-    publish_hour(one).await?;
-    assert_eq!(live_slices().await?, [(noon, noon + HOUR), (one, one + HOUR)], "the hour retired every partial inside it");
-    check(vec![("attributes___session___id", "1 hours", (noon, one + HOUR), hourly())]).await?;
+    check(vec![("attributes___http___route", "30 minutes", (noon, one + GRAIN), Err(SubGrainSlices))]).await?;
+    publish_grain(one).await?;
+    assert_eq!(live_slices().await?, [(noon, noon + GRAIN), (one, one + GRAIN)], "the grain retired every partial inside it");
+    check(vec![("attributes___http___route", "30 minutes", (noon, one + GRAIN), grained())]).await?;
     Ok(())
 }
 
@@ -2575,13 +2571,13 @@ async fn a_flush_never_stages_a_file_across_an_hour() -> Result<()> {
 }
 
 /// Version-only is decided PER TIER: a version file assigning a column one tier reads moves
-/// that tier's witness and no other's. `resource___deployment___environment___name` is a
-/// sessions-tier dimension the dashboard tiers never read; only `hashes_30m` reads `hashes`, so
+/// that tier's witness and no other's. `attributes___http___route` is a route-tier
+/// dimension the dashboard tiers never read; only `hashes_30m` reads `hashes`, so
 /// monoscope's pattern-tag versions stay invisible to the dashboard tiers (the `9e21fc3d`
 /// behaviour today's slices depend on) while the hash tier counts them.
-#[test_case::test_case("resource___deployment___environment___name", Some("otel_logs_and_spans_rollup_dashboard_1m_v4") => true ; "a column the dashboard tier ignores")]
-#[test_case::test_case("resource___deployment___environment___name", Some("otel_logs_and_spans_rollup_sessions_1h_v2") => false ; "the tier reading it counts it")]
-#[test_case::test_case("resource___deployment___environment___name", None => false ; "any tier reading it counts for all at once")]
+#[test_case::test_case("attributes___http___route", Some("otel_logs_and_spans_rollup_dashboard_1m_v4") => true ; "a column the dashboard tier ignores")]
+#[test_case::test_case("attributes___http___route", Some("otel_logs_and_spans_rollup_routes_30m") => false ; "the tier reading it counts it")]
+#[test_case::test_case("attributes___http___route", None => false ; "any tier reading it counts for all at once")]
 #[test_case::test_case("hashes", Some("otel_logs_and_spans_rollup_dashboard_1m_v4") => true ; "hashes the dashboard tier ignores")]
 #[test_case::test_case("hashes", Some("otel_logs_and_spans_rollup_hashes_30m") => false ; "the hash tier counts hashes")]
 #[test_case::test_case("hashes", None => false ; "hashes for every tier at once")]

@@ -564,11 +564,6 @@ rollups:
     dimensions: [resource___service___name, kind, status_code, level]
     measures: *dashboard_measures
 
-  # Browser sessions for monoscope RUM's session list (`otelSessionCoreRows`). RUM
-  # scopes every row to browser telemetry. The scope is not a dimension, so each
-  # measure is declared under it and the router promotes the query's scope to the
-  # `event_count` guard. The filters are monoscope's `browserScope`,
-  # `errorPredicate` and `pageViewPredicate` verbatim; they must stay in lockstep.
   # Endpoint tier for the overview's top-endpoints table and HTTP-status chart, which
   # group by endpoint name / status — dimensions the dashboard tiers do not carry. The
   # HTTP scope (kind or name) is all dimensions here, so it is a row filter, not a
@@ -613,60 +608,3 @@ rollups:
       - { name: apdex_tolerated_count, agg: count, column: duration, filter: "duration <= 2000000000" }
       # monoscope's hourly proven-endpoint job counts HTTP requests per hash (`method IS NOT NULL`).
       - { name: http_request_count, agg: count, column: attributes___http___request___method }
-  - grain: 1h
-    name: sessions_1h_v2
-    # The session list reads recent windows only.
-    backfill_days: 7
-    dimensions: [attributes___session___id, resource___service___name, resource___deployment___environment___name]
-    measures:
-      - {
-          name: event_count,
-          agg: count,
-          filter: "resource___telemetry___sdk___language IN ('webjs', 'javascript', 'js') OR resource___user_agent___original IS NOT NULL OR name IN ('documentLoad', 'documentFetch') OR (name LIKE 'Pageview %' OR name = 'documentLoad')",
-        }
-      - {
-          name: error_count,
-          agg: count,
-          filter: "(resource___telemetry___sdk___language IN ('webjs', 'javascript', 'js') OR resource___user_agent___original IS NOT NULL OR name IN ('documentLoad', 'documentFetch') OR (name LIKE 'Pageview %' OR name = 'documentLoad')) AND (status_code = 'ERROR' OR lower(COALESCE(level, '')) = 'error' OR attributes___exception___type IS NOT NULL)",
-        }
-      - {
-          name: pageview_count,
-          agg: count,
-          filter: "(resource___telemetry___sdk___language IN ('webjs', 'javascript', 'js') OR resource___user_agent___original IS NOT NULL OR name IN ('documentLoad', 'documentFetch') OR (name LIKE 'Pageview %' OR name = 'documentLoad')) AND (name LIKE 'Pageview %' OR name = 'documentLoad')",
-        }
-      - {
-          name: first_seen,
-          agg: min,
-          column: timestamp,
-          filter: "resource___telemetry___sdk___language IN ('webjs', 'javascript', 'js') OR resource___user_agent___original IS NOT NULL OR name IN ('documentLoad', 'documentFetch') OR (name LIKE 'Pageview %' OR name = 'documentLoad')",
-        }
-      - {
-          name: last_seen,
-          agg: max,
-          column: timestamp,
-          filter: "resource___telemetry___sdk___language IN ('webjs', 'javascript', 'js') OR resource___user_agent___original IS NOT NULL OR name IN ('documentLoad', 'documentFetch') OR (name LIKE 'Pageview %' OR name = 'documentLoad')",
-        }
-      - {
-          name: user_id,
-          agg: max,
-          column: attributes___user___id,
-          filter: "resource___telemetry___sdk___language IN ('webjs', 'javascript', 'js') OR resource___user_agent___original IS NOT NULL OR name IN ('documentLoad', 'documentFetch') OR (name LIKE 'Pageview %' OR name = 'documentLoad')",
-        }
-      - {
-          name: user_full_name,
-          agg: max,
-          column: attributes___user___full_name,
-          filter: "resource___telemetry___sdk___language IN ('webjs', 'javascript', 'js') OR resource___user_agent___original IS NOT NULL OR name IN ('documentLoad', 'documentFetch') OR (name LIKE 'Pageview %' OR name = 'documentLoad')",
-        }
-      - {
-          name: user_email,
-          agg: max,
-          column: attributes___user___email,
-          filter: "resource___telemetry___sdk___language IN ('webjs', 'javascript', 'js') OR resource___user_agent___original IS NOT NULL OR name IN ('documentLoad', 'documentFetch') OR (name LIKE 'Pageview %' OR name = 'documentLoad')",
-        }
-      - {
-          name: service_name,
-          agg: max,
-          column: resource___service___name,
-          filter: "resource___telemetry___sdk___language IN ('webjs', 'javascript', 'js') OR resource___user_agent___original IS NOT NULL OR name IN ('documentLoad', 'documentFetch') OR (name LIKE 'Pageview %' OR name = 'documentLoad')",
-        }
