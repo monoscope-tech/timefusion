@@ -1070,7 +1070,11 @@ async fn a_newest_first_page_narrows_to_the_index_bound_and_matches_baseline() -
         "SELECT id FROM {TABLE} WHERE project_id='{p}' AND timestamp BETWEEN to_timestamp_micros({}) AND to_timestamp_micros({now}) AND level = 'ERROR' ORDER BY timestamp DESC LIMIT 2",
         now - 7 * 24 * 3_600_000_000
     );
+    let hits = || on.tantivy_search().expect("search").stats.hits_materialized.load(std::sync::atomic::Ordering::Relaxed);
+    let before = hits();
     assert_eq!(narrowed_page(&ctx, &page).await?, (vec!["e0".to_string(), "e1".to_string()], 0), "narrowed, and filled without falling back");
+    // A filled page never plans the full window, whose prefilter resolves all 120 matches.
+    assert!(hits() - before < 30, "only the narrowed window's matches are resolved: {}", hits() - before);
     assert_eq!(ordered_ids(&ctx, &page).await?, ordered_ids(&ctx_off, &page).await?);
 
     // Deleting the eight newest errors must not surface them, whichever way the page is filled

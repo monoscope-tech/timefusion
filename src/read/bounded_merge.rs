@@ -874,39 +874,44 @@ pub(crate) async fn narrow_ascending_fetch(
         return Ok(full);
     }
     metrics::counter!("timefusion_narrowed_fetch_planned_total").increment(1);
-    Ok(Arc::new(NarrowedFetchExec { narrow, full, rows: page.rows, total_files: files.len(), skipped, metrics: ExecutionPlanMetricsSet::new() }))
+    Ok(Arc::new(NarrowedFetchExec {
+        narrow,
+        full: Fallback::Planned(full),
+        rows: page.rows,
+        total_files: files.len(),
+        skipped,
+        metrics: ExecutionPlanMetricsSet::new(),
+    }))
 }
 
 /// Newest-first latest-N (`ORDER BY ts DESC LIMIT n`) under an indexed predicate reads every
 /// match in the window to keep the newest `n`: a 30-day list of a few hundred errors decoded a
-/// whole day of matches. The search index names the timestamp of the newest matches; the same
-/// query is planned again with `ts >= bound`. Exact for the same reason as the ascending case
-/// (a full page holds every row at or after its last timestamp), so the bound is only a
-/// heuristic: a short page falls back to the full plan.
+/// whole day of matches. The search index names the timestamp of the newest matches and the
+/// query is planned with `ts >= bound`. Exact for the same reason as the ascending case (a full
+/// page holds every row at or after its last timestamp), so the bound is only a heuristic: a
+/// short page plans and runs the full query. Planned FIRST, because planning the full query is
+/// itself the cost — its prefilter resolves every match in the window (prod: 463 MB of index
+/// reads for 1,818 errors over 6 days).
 pub(crate) async fn narrow_descending_fetch(
-    logical: &datafusion::logical_expr::LogicalPlan, full: Arc<dyn ExecutionPlan>, state: &datafusion::execution::SessionState,
+    logical: &datafusion::logical_expr::LogicalPlan, state: &datafusion::execution::SessionState,
     planner: &datafusion::physical_planner::DefaultPhysicalPlanner,
-) -> Result<Arc<dyn ExecutionPlan>> {
+) -> Result<Option<Arc<dyn ExecutionPlan>>> {
     use datafusion::physical_planner::PhysicalPlanner;
-    let Some((page, column, scan)) = latest_page(logical, false) else { return Ok(full) };
-    if full.properties().partitioning.partition_count() != 1 {
-        return Ok(full);
-    }
-    let Some(table) = datafusion::datasource::source_as_provider(&scan.source).ok() else { return Ok(full) };
-    let Some(table) = downcast::<crate::database::ProjectRoutingTable>(&*table) else { return Ok(full) };
-    let Some((lo, hi)) = crate::database::filters_time_range(&scan.filters) else { return Ok(full) };
-    let Some(bound) = table.newest_match_bound(&scan.filters, page.rows.saturating_mul(NARROW_ROW_MARGIN)).await else { return Ok(full) };
-    // Worth a second plan only when it drops most of the window.
-    if bound.saturating_sub(lo) < hi.saturating_sub(lo) / 2 {
-        return Ok(full);
-    }
+    let Some((page, column, scan)) = latest_page(logical, false) else { return Ok(None) };
+    let Some(table) = datafusion::datasource::source_as_provider(&scan.source).ok() else { return Ok(None) };
+    let Some(table) = downcast::<crate::database::ProjectRoutingTable>(&*table) else { return Ok(None) };
+    let Some((lo, _)) = crate::database::filters_time_range(&scan.filters) else { return Ok(None) };
+    let Some(bound) = table.newest_match_bound(&scan.filters, page.rows.saturating_mul(NARROW_ROW_MARGIN)).await.filter(|bound| *bound > lo) else {
+        return Ok(None);
+    };
     let narrowed = state.optimize(&with_bound(logical, &column, bound, false)?)?;
     let narrow = planner.create_physical_plan(&narrowed, state).await?;
-    if narrow.schema() != full.schema() {
-        return Ok(full);
+    if narrow.properties().partitioning.partition_count() != 1 {
+        return Ok(None);
     }
     metrics::counter!("timefusion_narrowed_desc_fetch_planned_total").increment(1);
-    Ok(Arc::new(NarrowedFetchExec { narrow, full, rows: page.rows, total_files: 0, skipped: 0, metrics: ExecutionPlanMetricsSet::new() }))
+    let full = Fallback::Deferred(Box::new((logical.clone(), state.clone())));
+    Ok(Some(Arc::new(NarrowedFetchExec { narrow, full, rows: page.rows, total_files: 0, skipped: 0, metrics: ExecutionPlanMetricsSet::new() })))
 }
 
 struct AscendingPage {
@@ -984,11 +989,31 @@ fn with_bound(
 /// rarely leave the narrowed page short.
 const NARROW_ROW_MARGIN: usize = 4;
 
+/// The full query a short narrowed page falls back to: already planned, or planned only then.
+#[derive(Debug, Clone)]
+enum Fallback {
+    Planned(Arc<dyn ExecutionPlan>),
+    Deferred(Box<(datafusion::logical_expr::LogicalPlan, datafusion::execution::SessionState)>),
+}
+
+impl Fallback {
+    async fn plan(self) -> Result<Arc<dyn ExecutionPlan>> {
+        use datafusion::physical_planner::PhysicalPlanner;
+        match self {
+            Self::Planned(plan) => Ok(plan),
+            Self::Deferred(deferred) => {
+                let (logical, state) = *deferred;
+                datafusion::physical_planner::DefaultPhysicalPlanner::with_extension_planners(vec![]).create_physical_plan(&logical, &state).await
+            }
+        }
+    }
+}
+
 /// Runs `narrow` and returns it when it fills the page; otherwise runs `full`.
 #[derive(Debug)]
 struct NarrowedFetchExec {
     narrow: Arc<dyn ExecutionPlan>,
-    full: Arc<dyn ExecutionPlan>,
+    full: Fallback,
     rows: usize,
     total_files: usize,
     skipped: usize,
@@ -1006,17 +1031,23 @@ impl ExecutionPlan for NarrowedFetchExec {
         "NarrowedFetchExec"
     }
     fn properties(&self) -> &Arc<PlanProperties> {
-        self.full.properties()
+        self.narrow.properties()
     }
     fn apply_expressions(&self, _: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>) -> Result<TreeNodeRecursion> {
         Ok(TreeNodeRecursion::Continue)
     }
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        vec![&self.narrow, &self.full]
+        match &self.full {
+            Fallback::Planned(full) => vec![&self.narrow, full],
+            Fallback::Deferred(_) => vec![&self.narrow],
+        }
     }
     fn with_new_children(self: Arc<Self>, children: Vec<Arc<dyn ExecutionPlan>>) -> Result<Arc<dyn ExecutionPlan>> {
-        let [narrow, full]: [Arc<dyn ExecutionPlan>; 2] =
-            children.try_into().map_err(|_| datafusion::error::DataFusionError::Internal("NarrowedFetchExec takes two children".into()))?;
+        let (narrow, full) = match (children.as_slice(), &self.full) {
+            ([narrow, full], Fallback::Planned(_)) => (Arc::clone(narrow), Fallback::Planned(Arc::clone(full))),
+            ([narrow], deferred @ Fallback::Deferred(_)) => (Arc::clone(narrow), deferred.clone()),
+            _ => return Err(datafusion::error::DataFusionError::Internal("NarrowedFetchExec children do not match its fallback".into())),
+        };
         Ok(Arc::new(Self { narrow, full, rows: self.rows, total_files: self.total_files, skipped: self.skipped, metrics: ExecutionPlanMetricsSet::new() }))
     }
     fn metrics(&self) -> Option<MetricsSet> {
@@ -1024,7 +1055,7 @@ impl ExecutionPlan for NarrowedFetchExec {
     }
     fn execute(&self, partition: usize, context: Arc<TaskContext>) -> Result<SendableRecordBatchStream> {
         use futures::{StreamExt, TryStreamExt};
-        let (narrow, full, rows, schema) = (Arc::clone(&self.narrow), Arc::clone(&self.full), self.rows, self.full.schema());
+        let (narrow, full, rows, schema) = (Arc::clone(&self.narrow), self.full.clone(), self.rows, self.narrow.schema());
         let fell_back = MetricBuilder::new(&self.metrics).counter("fell_back", partition);
         MetricBuilder::new(&self.metrics).counter("files_skipped", partition).add(self.skipped);
         let stream = futures::stream::once(async move {
@@ -1033,6 +1064,10 @@ impl ExecutionPlan for NarrowedFetchExec {
                 return Ok::<_, datafusion::error::DataFusionError>(futures::stream::iter(batches.into_iter().map(Ok)).boxed());
             }
             fell_back.add(1);
+            let full = full.plan().await?;
+            if full.schema() != narrow.schema() {
+                return Err(datafusion::error::DataFusionError::Internal("narrowed and full plans disagree on schema".into()));
+            }
             Ok(full.execute(partition, context)?.boxed())
         })
         .try_flatten();

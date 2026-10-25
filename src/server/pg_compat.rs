@@ -889,6 +889,7 @@ impl StatsTableProvider {
                 "maintenance_pool_mb" => a.maintenance_pool_mb,
                 "foyer_mb" => a.foyer_mb,
                 "tantivy_peak_mb" => a.tantivy_peak_mb,
+                "tantivy_block_cache_mb" => a.tantivy_block_cache_mb,
                 "df_metadata_cache_mb" => a.df_metadata_cache_mb,
                 "oversubscribed" => a.oversubscribed(),
             ]
