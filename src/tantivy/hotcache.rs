@@ -348,8 +348,16 @@ impl BundleDirectory {
                 blocks[block - first] = Some(bytes);
             }
         }
-        let skip = range.start - first * BUNDLE_BLOCK;
-        Ok(blocks.into_iter().flatten().flat_map(|b| b.iter().copied().collect_vec()).skip(skip).take(range.len()).collect())
+        // Slice copies: tantivy opens a fast-field column by reading it whole, so on a day-sized
+        // index this runs over hundreds of MB per query, where a per-byte copy cost seconds.
+        let mut out = Vec::with_capacity(range.len());
+        let mut skip = range.start - first * BUNDLE_BLOCK;
+        for block in blocks.iter().flatten() {
+            let block = &block[skip.min(block.len())..];
+            skip = 0;
+            out.extend_from_slice(&block[..block.len().min(range.len() - out.len())]);
+        }
+        Ok(out)
     }
 }
 
@@ -419,6 +427,28 @@ mod tests {
         search::{PredsQuery, build_node_query},
         udf::{PredNode, TextMatchPred},
     };
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(32))]
+        /// Any byte range of a multi-block file reads back exactly, cold or from the block cache.
+        #[test]
+        fn a_bundle_range_reads_back_exactly(len in 1usize..(3 * BUNDLE_BLOCK + 17), a in 0usize..(3 * BUNDLE_BLOCK + 17), b in 0usize..(3 * BUNDLE_BLOCK + 17)) {
+            let data: Vec<u8> = (0..len).map(|i| (i * 31 % 251) as u8).collect();
+            let dir = tempfile::tempdir().unwrap();
+            let mut schema = tantivy::schema::Schema::builder();
+            schema.add_text_field("t", tantivy::schema::STRING);
+            tantivy::Index::create_in_dir(dir.path(), schema.build()).unwrap().writer::<tantivy::TantivyDocument>(15_000_000).unwrap().commit().unwrap();
+            std::fs::write(dir.path().join("x.fast"), &data).unwrap();
+            let blob = pack_bundle(dir.path(), 1).unwrap();
+            let directory = BundleDirectory::new(blob.clone(), Arc::new(blob)).unwrap().with_cache(7, block_cache(1 << 20));
+            let handle = tantivy::Directory::get_file_handle(&directory, Path::new("x.fast")).unwrap();
+            let (lo, hi) = (a.min(b) % len, (a.max(b) % len).max(a.min(b) % len));
+            for _ in 0..2 {
+                let read = handle.read_bytes(lo..hi).unwrap();
+                proptest::prop_assert_eq!(read.as_slice(), &data[lo..hi]);
+            }
+        }
+    }
 
     /// Per file extension: (reads, bytes read).
     fn summarize(log: &[(PathBuf, Range<usize>)]) -> BTreeMap<String, (usize, usize)> {
