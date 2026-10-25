@@ -898,6 +898,9 @@ pub(crate) async fn narrow_descending_fetch(
 ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
     use datafusion::physical_planner::PhysicalPlanner;
     let Some((page, column, scan)) = latest_page(logical, false) else { return Ok(None) };
+    if column.name != "timestamp" {
+        return Ok(None);
+    }
     let Some(table) = datafusion::datasource::source_as_provider(&scan.source).ok() else { return Ok(None) };
     let Some(table) = downcast::<crate::database::ProjectRoutingTable>(&*table) else { return Ok(None) };
     let Some((lo, _)) = crate::database::filters_time_range(&scan.filters) else { return Ok(None) };
