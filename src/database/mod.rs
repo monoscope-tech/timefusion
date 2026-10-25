@@ -2940,12 +2940,12 @@ pub struct Database {
     repair_pass_permit: Arc<tokio::sync::Semaphore>,
 }
 
-/// Drop the hot (today) partition from a backfill queue, returning how many URIs were removed.
-/// `marker` is `None` when the skip is disabled.
-fn drop_hot_partition(uris: &mut Vec<String>, marker: Option<&str>) -> u64 {
+/// Drop the hot (today) partition from a backfill queue, except the files `converged` names,
+/// returning how many URIs were removed. `marker` is `None` when the skip is disabled.
+fn drop_hot_partition(uris: &mut Vec<String>, marker: Option<&str>, converged: impl Fn(&str) -> bool) -> u64 {
     let Some(marker) = marker else { return 0 };
     let before = uris.len();
-    uris.retain(|uri| !uri.contains(marker));
+    uris.retain(|uri| !uri.contains(marker) || converged(uri));
     (before - uris.len()) as u64
 }
 

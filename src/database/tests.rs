@@ -4186,13 +4186,14 @@ fn tantivy_backfill_prioritizes_recent_partitions() {
 /// The hot-tail skip: today's partition leaves the backfill queue, every other date
 /// stays. Today's files are rewritten within hours and already covered at birth by
 /// the flush callback and the inline-reindex paths.
-#[test_case::test_case(None => (3, 0) ; "disabled keeps the whole queue")]
-#[test_case::test_case(Some("date=2026-08-22") => (2, 1) ; "today is dropped")]
-#[test_case::test_case(Some("date=2026-08-2") => (0, 3) ; "a prefix marker is the caller's error, not silently ignored")]
-#[test_case::test_case(Some("date=2026-01-01") => (3, 0) ; "a date with no files drops nothing")]
+#[test_case::test_case(None => (4, 0) ; "disabled keeps the whole queue")]
+#[test_case::test_case(Some("date=2026-08-22") => (3, 1) ; "today is dropped except its converged file")]
+#[test_case::test_case(Some("date=2026-08-2") => (1, 3) ; "a prefix marker is the caller's error, not silently ignored")]
+#[test_case::test_case(Some("date=2026-01-01") => (4, 0) ; "a date with no files drops nothing")]
 fn tantivy_backfill_drops_the_hot_partition(marker: Option<&str>) -> (usize, u64) {
-    let mut uris = ["date=2026-08-22/a.parquet", "date=2026-08-21/b.parquet", "date=2026-08-20/c.parquet"].map(String::from).to_vec();
-    let dropped = super::drop_hot_partition(&mut uris, marker);
+    let mut uris =
+        ["date=2026-08-22/a.parquet", "date=2026-08-22/converged.parquet", "date=2026-08-21/b.parquet", "date=2026-08-20/c.parquet"].map(String::from).to_vec();
+    let dropped = super::drop_hot_partition(&mut uris, marker, |uri| uri.contains("converged"));
     (uris.len(), dropped)
 }
 

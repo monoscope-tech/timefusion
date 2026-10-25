@@ -473,7 +473,11 @@ impl Database {
             for (pid, mut uris) in by_pid {
                 // Counted before the hot-tail skip, so the gauge reports the true total.
                 uncovered_total = uncovered_total.saturating_add(uris.len() as u64);
-                skipped_today = skipped_today.saturating_add(drop_hot_partition(&mut uris, skip_today.as_deref()));
+                // A file at the hot-tail target is never repacked, so indexing it cannot race the
+                // packer; until then carried-forward entries leave it searched as hundreds.
+                let target = self.config.maintenance.timefusion_light_optimize_target_size.max(1) as u64;
+                let converged = |uri: &str| parquet_rel_of_uri(uri).and_then(|rel| sizes.get(rel)).is_some_and(|size| *size >= target);
+                skipped_today = skipped_today.saturating_add(drop_hot_partition(&mut uris, skip_today.as_deref(), converged));
                 sort_backfill_uris_newest_first(&mut uris);
                 let queue = uris.into_iter().filter_map(|uri| Some((parquet_rel_of_uri(&uri)?.to_string(), uri))).collect::<VecDeque<_>>();
                 queues.push((pid, queue));
