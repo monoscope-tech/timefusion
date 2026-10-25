@@ -217,6 +217,9 @@ const MAX_QUEUED_WARMS: usize = 64;
 const BUNDLE_CONVERSIONS: usize = 2;
 const CAP_EXCEEDED_TTL: Duration = Duration::from_secs(600);
 
+/// Index entries a rewrite may carry onto its output before it is rebuilt as one.
+const MAX_CARRIED_ENTRIES: usize = 8;
+
 fn window_width(time_range: Option<(i64, i64)>) -> u64 {
     time_range.map_or(u64::MAX, |(lo, hi)| hi.abs_diff(lo))
 }
@@ -1929,6 +1932,13 @@ impl TantivyIndexService {
             // would vouch here and be invisible at query time (false negative).
             let covered: HashSet<String> = m.entries.values().filter(|e| usable_entry(e)).flat_map(|e| e.covered_files.iter().map(|u| rel_of(u))).collect();
             if !removed_rel.iter().all(|u| covered.contains(u)) {
+                return (false, false);
+            }
+            // Each carried entry is one more index every query over the output searches: today's
+            // packed files accumulated ~550 (2.8 s of fan-out per query). Past the cap the caller
+            // rebuilds one index, and the inputs' entries age out with their files.
+            if m.entries.values().filter(|e| usable_entry(e) && e.covered_files.iter().any(|u| removed_rel.contains(&rel_of(u)))).count() > MAX_CARRIED_ENTRIES
+            {
                 return (false, false);
             }
             let mut touched = false;

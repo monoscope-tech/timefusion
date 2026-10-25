@@ -649,6 +649,20 @@ async fn carry_forward_covers_a_rewrite_only_when_every_input_was_covered() {
     assert!(covering.iter().all(|e| !e.ordinals_valid), "row ordinals are per-file positions; the output's are not the inputs'");
 }
 
+/// Past the cap a rewrite is rebuilt rather than carried, or every query over the output
+/// searches each input's index.
+#[tokio::test]
+async fn carry_forward_declines_past_the_carried_entry_cap() {
+    let env = Env::zstd3("otel_logs_and_spans", "p-carry-cap");
+    let inputs: Vec<String> = (0..9).map(|i| format!("in_{i}")).collect();
+    for (i, uri) in inputs.iter().enumerate() {
+        env.publish(&[(1_000_000 + i as i64, &format!("id{i}"), "ERROR")], &[uri]).await;
+    }
+    let refs: Vec<&str> = inputs.iter().map(String::as_str).collect();
+    assert!(!env.carry_forward(&refs, &["out"]).await, "nine entries exceed the cap, so the caller must rebuild");
+    assert!(env.carry_forward(&refs[..8], &["out8"]).await, "eight entries are still carried");
+}
+
 /// A multi-file entry must not take its live siblings down with it when one
 /// covered file is compacted away. Keeping the entry is sound because the index
 /// is a candidate generator, but row ordinals are per-file positions and must be
