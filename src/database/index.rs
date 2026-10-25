@@ -12,6 +12,9 @@ pub(crate) fn sort_backfill_uris_newest_first(uris: &mut [String]) {
 
 /// Wall-clock the GC phase of one reconcile pass may spend before yielding to the backfill.
 const GC_PHASE_BUDGET: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// How long a file of today must go unrewritten before the backfill treats it as settled.
+const TODAY_STABLE_MILLIS: i64 = 30 * 60 * 1000;
 /// Wall clock one hot-warm tick may spend converting `tar.zst` indexes to bundles; the
 /// tick recurs every 15 minutes.
 const BUNDLE_CONVERSION_BUDGET: std::time::Duration = std::time::Duration::from_secs(600);
@@ -460,6 +463,13 @@ impl Database {
                 continue;
             };
             let (by_pid, sizes, delta_store) = self.group_uncovered_files_by_project(svc, &table_ref, table_name, &mut oversized_total, true).await?;
+            let stable_before = chrono::Utc::now().timestamp_millis() - TODAY_STABLE_MILLIS;
+            let stable: HashSet<String> = table_ref
+                .read()
+                .await
+                .snapshot()
+                .map(|s| s.log_data().iter().filter(|f| f.modification_time() < stable_before).map(|f| f.path().into_owned()).collect())
+                .unwrap_or_default();
             let mut queues = Vec::with_capacity(by_pid.len());
             // `skip_today` keeps the backfill from racing the hot-tail packer, which rewrites
             // today's files and would void the index. Only base tables are hot-packed.
@@ -473,10 +483,12 @@ impl Database {
             for (pid, mut uris) in by_pid {
                 // Counted before the hot-tail skip, so the gauge reports the true total.
                 uncovered_total = uncovered_total.saturating_add(uris.len() as u64);
-                // A file at the hot-tail target is never repacked, so indexing it cannot race the
-                // packer; until then carried-forward entries leave it searched as hundreds.
+                // A file at the hot-tail target is never repacked, and one the packer has left
+                // alone for half an hour rarely is, so indexing either cannot race it; until then
+                // carried-forward entries leave it searched as dozens of indexes.
                 let target = self.config.maintenance.timefusion_light_optimize_target_size.max(1) as u64;
-                let converged = |uri: &str| parquet_rel_of_uri(uri).and_then(|rel| sizes.get(rel)).is_some_and(|size| *size >= target);
+                let converged =
+                    |uri: &str| parquet_rel_of_uri(uri).is_some_and(|rel| sizes.get(rel).is_some_and(|size| *size >= target) || stable.contains(rel));
                 skipped_today = skipped_today.saturating_add(drop_hot_partition(&mut uris, skip_today.as_deref(), converged));
                 sort_backfill_uris_newest_first(&mut uris);
                 let queue = uris.into_iter().filter_map(|uri| Some((parquet_rel_of_uri(&uri)?.to_string(), uri))).collect::<VecDeque<_>>();
