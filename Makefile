@@ -217,7 +217,7 @@ warm:
 # The image helpers' own tests and, for a full signoff, the production image
 # build + smoke test run beside the checks (.ci/helpers.log, .ci/image.log);
 # the image is pushed only once every check has passed.
-HELPER_TESTS = scripts/test-production-image.py scripts/deploy/test_prepare.py scripts/deploy/test_lease.py scripts/deploy/test_run.py
+HELPER_TESTS = scripts/test-production-image.py scripts/deploy/test_prepare.py scripts/deploy/test_lease.py scripts/deploy/test_run.py scripts/test-ci-selftest.py
 ci-signoff:
 	@mkdir -p .ci; image=; \
 	(for t in $(HELPER_TESTS); do PYTHONDONTWRITEBYTECODE=1 python3 $$t || exit 1; done) >.ci/helpers.log 2>&1 & helpers=$$!; \
@@ -239,6 +239,7 @@ ci-down:
 	./scripts/ci/ci.sh down
 
 ci-selftest:
+	python3 scripts/test-ci-selftest.py
 	./scripts/ci/ci.sh selftest
 
 .PHONY: deploy

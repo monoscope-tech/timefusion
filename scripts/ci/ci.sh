@@ -614,12 +614,33 @@ cmd_selftest() {
   assert "every declared input path exists" "" "$missing"
 
   # Pinning is what survives a step that rewrites the tree mid-run.
-  WORKTREE_TREE=''
-  before=$(fingerprint fmt)
-  pin_fingerprints fmt
-  : > "src/$probe"; WORKTREE_TREE=''; after=$(fingerprint fmt); rm -f "src/$probe"
-  unset CI_FINGERPRINTS; rm -rf .ci
-  assert "pinned fp survives tree change" "$before" "$after"
+  (
+    saved_fingerprints=$(mktemp -t ci-selftest-fingerprints.XXXXXX)
+    had_fingerprints=false
+    if [ -e .ci/fingerprints.tsv ]; then
+      cp -p .ci/fingerprints.tsv "$saved_fingerprints"
+      had_fingerprints=true
+    fi
+    trap '
+      rm -f "src/$probe"
+      if "$had_fingerprints"; then
+        cp -p "$saved_fingerprints" .ci/fingerprints.tsv
+      else
+        rm -f .ci/fingerprints.tsv
+        rmdir .ci 2>/dev/null || true
+      fi
+      rm -f "$saved_fingerprints"
+    ' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    WORKTREE_TREE=''
+    before=$(fingerprint fmt)
+    pin_fingerprints fmt
+    : > "src/$probe"; WORKTREE_TREE=''; after=$(fingerprint fmt); rm -f "src/$probe"
+    unset CI_FINGERPRINTS
+    assert "pinned fp survives tree change" "$before" "$after"
+    exit "$SELFTEST_RC"
+  ) || SELFTEST_RC=1
 
   assert "ref roundtrip caps" 'ghc pg' \
     "$(printf '%s' "$(attest_ref x deadbeef 'ghc pg')" | cut -d/ -f7 | tr '.' ' ')"
