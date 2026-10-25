@@ -52,6 +52,10 @@ pub struct SearchStats {
     /// Ranged reads of bundles in place of whole-blob installs.
     pub range_reads: AtomicU64,
     pub range_read_bytes: AtomicU64,
+    /// `range_read_bytes` by index file kind; the rest is everything else.
+    pub range_read_fast_bytes: AtomicU64,
+    pub range_read_terms_bytes: AtomicU64,
+    pub range_read_store_bytes: AtomicU64,
     pub bundle_opens: AtomicU64,
     /// Per-index searches running at once, and the most ever; 1 means the fan-out serialized.
     pub parallel_searches: AtomicU64,
@@ -1147,6 +1151,18 @@ struct StoreSource {
 }
 
 impl super::hotcache::BundleSource for StoreSource {
+    fn read_file(&self, range: std::ops::Range<u64>, file: &Path) -> std::io::Result<bytes::Bytes> {
+        let kind = match file.extension().and_then(|e| e.to_str()) {
+            Some("fast") => Some(&self.stats.range_read_fast_bytes),
+            Some("term" | "idx" | "pos") => Some(&self.stats.range_read_terms_bytes),
+            Some("store") => Some(&self.stats.range_read_store_bytes),
+            _ => None,
+        };
+        if let Some(kind) = kind {
+            SearchStats::add(kind, range.end - range.start);
+        }
+        self.read(range)
+    }
     fn read(&self, range: std::ops::Range<u64>) -> std::io::Result<bytes::Bytes> {
         SearchStats::add(&self.stats.range_reads, 1);
         SearchStats::add(&self.stats.range_read_bytes, range.end - range.start);

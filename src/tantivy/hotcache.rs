@@ -243,6 +243,10 @@ pub fn unpack_bundle(mut r: impl std::io::Read, dest: &Path) -> anyhow::Result<(
 /// Where a bundle's bytes come from: the blob in memory, or ranged object-store reads.
 pub trait BundleSource: Send + Sync + std::fmt::Debug + 'static {
     fn read(&self, range: Range<u64>) -> io::Result<Bytes>;
+    /// `read` on behalf of `file`, the index file the range belongs to.
+    fn read_file(&self, range: Range<u64>, _file: &Path) -> io::Result<Bytes> {
+        self.read(range)
+    }
 }
 
 impl BundleSource for Bytes {
@@ -319,7 +323,7 @@ impl BundleDirectory {
         Self::new(blob.clone(), Arc::new(blob))
     }
 
-    fn read(&self, file: &FileLayout, range: Range<usize>) -> io::Result<Vec<u8>> {
+    fn read(&self, path: &Path, file: &FileLayout, range: Range<usize>) -> io::Result<Vec<u8>> {
         if range.is_empty() {
             return Ok(vec![]);
         }
@@ -334,7 +338,7 @@ impl BundleDirectory {
         let missing = (first..=last).filter(|b| blocks[b - first].is_none()).collect_vec();
         for run in missing.chunk_by(|a, b| a + 1 == *b) {
             let (lo, hi) = (run[0], run[run.len() - 1]);
-            let span = self.source.read(file.blocks[lo]..file.blocks[hi + 1])?;
+            let span = self.source.read_file(file.blocks[lo]..file.blocks[hi + 1], path)?;
             for block in lo..=hi {
                 let compressed = &span[(file.blocks[block] - file.blocks[lo]) as usize..(file.blocks[block + 1] - file.blocks[lo]) as usize];
                 let bytes: Arc<[u8]> = zstd::bulk::decompress(compressed, BUNDLE_BLOCK)?.into();
@@ -364,7 +368,7 @@ impl HasLen for BundleHandle {
 #[async_trait::async_trait]
 impl FileHandle for BundleHandle {
     fn read_bytes(&self, range: Range<usize>) -> io::Result<OwnedBytes> {
-        Ok(OwnedBytes::new(self.dir.read(&self.dir.files[&self.path], range)?))
+        Ok(OwnedBytes::new(self.dir.read(&self.path, &self.dir.files[&self.path], range)?))
     }
 }
 
@@ -384,7 +388,7 @@ impl Directory for BundleDirectory {
     }
     fn atomic_read(&self, path: &Path) -> Result<Vec<u8>, OpenReadError> {
         let file = self.files.get(path).ok_or_else(|| OpenReadError::FileDoesNotExist(path.to_owned()))?;
-        self.read(file, 0..file.len).map_err(|e| OpenReadError::wrap_io_error(e, path.to_owned()))
+        self.read(path, file, 0..file.len).map_err(|e| OpenReadError::wrap_io_error(e, path.to_owned()))
     }
     fn delete(&self, path: &Path) -> Result<(), DeleteError> {
         Err(DeleteError::IoError { io_error: Arc::new(read_only(path)), filepath: path.to_owned() })
