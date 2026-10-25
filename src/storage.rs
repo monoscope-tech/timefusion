@@ -507,6 +507,20 @@ impl foyer::EventListener for EvictionCounter {
 }
 
 impl SharedFoyerCache {
+    /// A range of an immutable object (e.g. a tantivy bundle) from the cache; `None` on a miss.
+    pub async fn get_immutable(&self, key: &str) -> Option<Bytes> {
+        let entry = self.cache.get(&key.to_owned()).await.ok()??;
+        let value = entry.value();
+        (!value.is_expired(self.config.ttl)).then(|| value.data.clone())
+    }
+
+    /// Cache an immutable object's range disk-only: it survives restarts without displacing
+    /// the in-memory working set.
+    pub fn put_immutable(&self, key: String, data: Bytes) {
+        let meta = ObjectMeta { location: Path::from(key.as_str()), last_modified: Utc::now(), size: data.len() as u64, e_tag: None, version: None };
+        self.cache.insert_with_properties(key, CacheValue::new(data, meta), HybridCacheProperties::default().with_location(Location::OnDisk));
+    }
+
     /// Create the process-wide data + metadata caches.
     pub async fn new(config: FoyerCacheConfig) -> anyhow::Result<Self> {
         info!(

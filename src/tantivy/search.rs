@@ -52,6 +52,9 @@ pub struct SearchStats {
     /// Ranged reads of bundles in place of whole-blob installs.
     pub range_reads: AtomicU64,
     pub range_read_bytes: AtomicU64,
+    /// Bundle ranges served by the disk cache instead of the object store.
+    pub range_disk_hits: AtomicU64,
+    pub range_disk_hit_bytes: AtomicU64,
     /// `range_read_bytes` by index file kind; the rest is everything else.
     pub range_read_fast_bytes: AtomicU64,
     pub range_read_terms_bytes: AtomicU64,
@@ -179,6 +182,9 @@ pub struct TantivySearchService {
     /// (not global) so distinct object stores never cross-contaminate.
     manifests: DashMap<(String, String), CachedManifest>,
     block_cache: super::hotcache::BlockCache,
+    /// Disk tier under `block_cache`: bundles are immutable (every publish takes a fresh
+    /// generation path), so their ranges survive restarts there.
+    disk_cache: Option<Arc<crate::storage::SharedFoyerCache>>,
     /// Last time each cache dir was served to a query — the reaper's recency
     /// signal, since mmap reads don't reliably move a directory's atime. Dirs
     /// absent here fall back to dir mtime, which is their unpack time.
@@ -315,6 +321,7 @@ impl TantivySearchService {
             cache_root,
             readers: Mutex::new(LruCache::new(config.reader_cache_entries())),
             block_cache: super::hotcache::block_cache(config.timefusion_tantivy_block_cache_mb << 20),
+            disk_cache: None,
             config,
             stats: Default::default(),
             manifests: DashMap::new(),
@@ -326,6 +333,11 @@ impl TantivySearchService {
             warm_queue: Arc::new(tokio::sync::Semaphore::new(MAX_QUEUED_WARMS)),
             warm_permits: tokio::sync::Semaphore::new(MAX_CONCURRENT_WARMS),
         }
+    }
+
+    pub fn with_disk_cache(mut self, cache: Option<Arc<crate::storage::SharedFoyerCache>>) -> Self {
+        self.disk_cache = cache;
+        self
     }
 
     /// Single-predicate convenience used by tests/tools.
@@ -927,7 +939,13 @@ impl TantivySearchService {
         }
         let path = ObjPath::from(blob_path);
         let head = self.object_store.get_range(&path, 0..head_len).await.with_context(|| format!("get head of {path}"))?;
-        let source = Arc::new(StoreSource { store: self.object_store.clone(), path, rt: tokio::runtime::Handle::current(), stats: self.stats.clone() });
+        let source = Arc::new(StoreSource {
+            store: self.object_store.clone(),
+            path,
+            rt: tokio::runtime::Handle::current(),
+            stats: self.stats.clone(),
+            disk_cache: self.disk_cache.clone(),
+        });
         let bundle = std::hash::BuildHasher::hash_one(&std::hash::BuildHasherDefault::<std::collections::hash_map::DefaultHasher>::default(), blob_path);
         let directory = super::hotcache::BundleDirectory::new(head, source)?.with_cache(bundle, self.block_cache.clone());
         let index = super::open_index_in(directory)?;
@@ -1148,6 +1166,7 @@ struct StoreSource {
     path: ObjPath,
     rt: tokio::runtime::Handle,
     stats: Arc<SearchStats>,
+    disk_cache: Option<Arc<crate::storage::SharedFoyerCache>>,
 }
 
 impl super::hotcache::BundleSource for StoreSource {
@@ -1164,9 +1183,25 @@ impl super::hotcache::BundleSource for StoreSource {
         self.read(range)
     }
     fn read(&self, range: std::ops::Range<u64>) -> std::io::Result<bytes::Bytes> {
-        SearchStats::add(&self.stats.range_reads, 1);
-        SearchStats::add(&self.stats.range_read_bytes, range.end - range.start);
-        let fetch = || self.rt.block_on(self.store.get_range(&self.path, range)).map_err(std::io::Error::other);
+        let key = format!("tantivy-bundle:{}:{}-{}", self.path, range.start, range.end);
+        let fetch = || {
+            self.rt.block_on(async {
+                if let Some(cache) = &self.disk_cache
+                    && let Some(bytes) = cache.get_immutable(&key).await
+                {
+                    SearchStats::add(&self.stats.range_disk_hits, 1);
+                    SearchStats::add(&self.stats.range_disk_hit_bytes, bytes.len() as u64);
+                    return Ok(bytes);
+                }
+                SearchStats::add(&self.stats.range_reads, 1);
+                SearchStats::add(&self.stats.range_read_bytes, range.end - range.start);
+                let bytes = self.store.get_range(&self.path, range.clone()).await.map_err(std::io::Error::other)?;
+                if let Some(cache) = &self.disk_cache {
+                    cache.put_immutable(key.clone(), bytes.clone());
+                }
+                Ok(bytes)
+            })
+        };
         match tokio::runtime::Handle::try_current() {
             Ok(_) => std::thread::scope(|s| s.spawn(fetch).join()).map_err(|_| std::io::Error::other("bundle fetch panicked"))?,
             Err(_) => fetch(),
