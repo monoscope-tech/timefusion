@@ -948,9 +948,12 @@ impl TantivySearchService {
             rt: tokio::runtime::Handle::current(),
             stats: self.stats.clone(),
             disk_cache: self.disk_cache.clone(),
+            len: std::sync::OnceLock::new(),
         });
         let bundle = std::hash::BuildHasher::hash_one(&std::hash::BuildHasherDefault::<std::collections::hash_map::DefaultHasher>::default(), blob_path);
-        let directory = super::hotcache::BundleDirectory::new(head, source)?.with_cache(bundle, self.block_cache.clone());
+        let directory = super::hotcache::BundleDirectory::new(head, source.clone())?;
+        let _ = source.len.set(directory.bundle_len());
+        let directory = directory.with_cache(bundle, self.block_cache.clone());
         let index = super::open_index_in(directory)?;
         let reader = index.reader().map_err(|e| anyhow!("open bundle reader: {e}"))?;
         SearchStats::add(&self.stats.bundle_opens, 1);
@@ -1170,6 +1173,49 @@ struct StoreSource {
     rt: tokio::runtime::Handle,
     stats: Arc<SearchStats>,
     disk_cache: Option<Arc<crate::storage::SharedFoyerCache>>,
+    /// Bundle length, known once its head is parsed; clamps the last disk chunk.
+    len: std::sync::OnceLock<u64>,
+}
+
+/// Disk-cache granularity for bundle ranges. Aligned, so a read is served whatever runs of
+/// blocks the in-memory cache happens to be missing: exact-range keys missed whenever a
+/// partly evicted index asked for a different run (prod: 828 MB refetched from S3).
+const DISK_CHUNK: u64 = 1 << 20;
+
+impl StoreSource {
+    async fn fetch(&self, range: std::ops::Range<u64>) -> std::io::Result<bytes::Bytes> {
+        SearchStats::add(&self.stats.range_reads, 1);
+        SearchStats::add(&self.stats.range_read_bytes, range.end - range.start);
+        self.store.get_range(&self.path, range).await.map_err(std::io::Error::other)
+    }
+
+    async fn read_chunked(&self, range: std::ops::Range<u64>, cache: &crate::storage::SharedFoyerCache, len: u64) -> std::io::Result<bytes::Bytes> {
+        let chunks: Vec<u64> = (range.start / DISK_CHUNK..=(range.end - 1) / DISK_CHUNK).collect();
+        let key = |chunk: u64| format!("tantivy-chunk:{}:{chunk}", self.path);
+        let mut got = futures::future::join_all(chunks.iter().map(|&chunk| async move { cache.get_immutable(&key(chunk)).await })).await;
+        for bytes in got.iter().flatten() {
+            SearchStats::add(&self.stats.range_disk_hits, 1);
+            SearchStats::add(&self.stats.range_disk_hit_bytes, bytes.len() as u64);
+        }
+        let missing = (0..chunks.len()).filter(|&i| got[i].is_none()).collect_vec();
+        for run in missing.chunk_by(|a, b| a + 1 == *b) {
+            let (lo, hi) = (chunks[run[0]], chunks[run[run.len() - 1]]);
+            let span = self.fetch(lo * DISK_CHUNK..((hi + 1) * DISK_CHUNK).min(len)).await?;
+            for &i in run {
+                let at = ((chunks[i] - lo) * DISK_CHUNK) as usize;
+                let chunk = span.slice(at..(at + DISK_CHUNK as usize).min(span.len()));
+                cache.put_immutable(key(chunks[i]), chunk.clone());
+                got[i] = Some(chunk);
+            }
+        }
+        let mut out = Vec::with_capacity((range.end - range.start) as usize);
+        for (chunk, bytes) in chunks.iter().zip(got.iter().flatten()) {
+            let start = (range.start.saturating_sub(chunk * DISK_CHUNK) as usize).min(bytes.len());
+            let end = ((range.end - chunk * DISK_CHUNK) as usize).min(bytes.len());
+            out.extend_from_slice(&bytes[start..end]);
+        }
+        Ok(out.into())
+    }
 }
 
 impl super::hotcache::BundleSource for StoreSource {
@@ -1186,23 +1232,12 @@ impl super::hotcache::BundleSource for StoreSource {
         self.read(range)
     }
     fn read(&self, range: std::ops::Range<u64>) -> std::io::Result<bytes::Bytes> {
-        let key = format!("tantivy-bundle:{}:{}-{}", self.path, range.start, range.end);
         let fetch = || {
             self.rt.block_on(async {
-                if let Some(cache) = &self.disk_cache
-                    && let Some(bytes) = cache.get_immutable(&key).await
-                {
-                    SearchStats::add(&self.stats.range_disk_hits, 1);
-                    SearchStats::add(&self.stats.range_disk_hit_bytes, bytes.len() as u64);
-                    return Ok(bytes);
+                match (&self.disk_cache, self.len.get()) {
+                    (Some(cache), Some(&len)) if range.start < range.end => self.read_chunked(range.clone(), cache, len).await,
+                    _ => self.fetch(range.clone()).await,
                 }
-                SearchStats::add(&self.stats.range_reads, 1);
-                SearchStats::add(&self.stats.range_read_bytes, range.end - range.start);
-                let bytes = self.store.get_range(&self.path, range.clone()).await.map_err(std::io::Error::other)?;
-                if let Some(cache) = &self.disk_cache {
-                    cache.put_immutable(key.clone(), bytes.clone());
-                }
-                Ok(bytes)
             })
         };
         match tokio::runtime::Handle::try_current() {
@@ -1578,6 +1613,50 @@ pub fn query_with_searcher(searcher: &Searcher, query: &dyn Query, limit: Option
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod disk_chunk_tests {
+    use super::*;
+
+    /// A range the disk tier has never seen whole is still served from its aligned chunks:
+    /// a partly evicted index asks for different runs than the read that filled the cache.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_overlapping_range_is_served_from_disk_chunks() {
+        use object_store::ObjectStoreExt;
+        let len = 3 * DISK_CHUNK + 12_345;
+        let blob: Vec<u8> = (0..len).map(|i| (i * 7 % 253) as u8).collect();
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let path = ObjPath::from("indexes/x.bundle");
+        store.put(&path, blob.clone().into()).await.unwrap();
+        let disk = Arc::new(crate::storage::SharedFoyerCache::new(crate::storage::FoyerCacheConfig::test_config("disk_chunks")).await.unwrap());
+        let source = || {
+            let source = StoreSource {
+                store: store.clone(),
+                path: path.clone(),
+                rt: tokio::runtime::Handle::current(),
+                stats: Default::default(),
+                disk_cache: Some(disk.clone()),
+                len: std::sync::OnceLock::new(),
+            };
+            let _ = source.len.set(len);
+            source
+        };
+        let first = source();
+        assert_eq!(super::super::hotcache::BundleSource::read(&first, 0..len).unwrap(), &blob[..]);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        // A new range per attempt, so only the first read's chunks can serve it.
+        for attempt in 0u64.. {
+            let later = source();
+            let range = DISK_CHUNK / 2 + attempt..2 * DISK_CHUNK + 777 + attempt;
+            assert_eq!(super::super::hotcache::BundleSource::read(&later, range.clone()).unwrap(), &blob[range.start as usize..range.end as usize]);
+            if later.stats.range_reads.load(Ordering::Relaxed) == 0 {
+                break;
+            }
+            assert!(Instant::now() < deadline, "an overlapping range must be served from the chunks the first read cached");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
 }
 
 #[cfg(test)]
