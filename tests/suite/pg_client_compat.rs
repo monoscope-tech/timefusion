@@ -92,6 +92,27 @@ impl Drop for TestServer {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn integer_epoch_parameters_preserve_decimal_bucket_boundaries() -> Result<()> {
+    // Models/Apis/Endpoints.hs binds integer start/width values beside exact
+    // decimal EXTRACT(EPOCH); retain the integer wire OIDs used by that caller.
+    let server = TestServer::start().await?;
+    let client = server.client().await?;
+    let sql = "SELECT floor((extract(epoch FROM to_timestamp_nanos($1::bigint)) - $2) / $3)::bigint";
+    for (nanos, start, width, expected) in
+        [(1_999_999_999_i64, 0_i64, 1_i64, 1_i64), (2_000_000_000, 0, 1, 2), (-1, 0, 1, -1), (1_792_854_698_319_451_123, 1_792_854_600, 60, 1)]
+    {
+        let rows = client
+            .query_typed(
+                sql,
+                &[(&nanos, tokio_postgres::types::Type::INT8), (&start, tokio_postgres::types::Type::INT8), (&width, tokio_postgres::types::Type::INT8)],
+            )
+            .await?;
+        assert_eq!(rows[0].get::<_, i64>(0), expected);
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn aborted_transactions_report_the_postgres_sqlstate_and_recover() -> Result<()> {
     let server = TestServer::start().await?;
     let client = server.client().await?;

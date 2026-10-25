@@ -269,7 +269,7 @@ foyer-storage = { path = "vendor/foyer-storage" }
 # Patching datafusion-postgres alone pulls its sibling
 # arrow-pg/datafusion-pg-catalog from the same git workspace, so those need no
 # separate patch.
-datafusion-postgres = { git = "https://github.com/apitoolkit/datafusion-postgres.git", rev = "697a4ddafab0ee1ca3780233055ad269dca13e5a" }
+datafusion-postgres = { git = "https://github.com/apitoolkit/datafusion-postgres.git", rev = "29bdb324cd3defa3ef3d34058f8696993ed17855" }
 # DataFusion 54.1 with shared sort-buffer reservations, positional Parquet scan protection, SQL DEALLOCATE ALL,
 # and the existing UPDATE FROM support.
 # Keep the workspace crates on one source so their public Rust types agree.
