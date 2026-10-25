@@ -654,13 +654,13 @@ async fn carry_forward_covers_a_rewrite_only_when_every_input_was_covered() {
 #[tokio::test]
 async fn carry_forward_declines_past_the_carried_entry_cap() {
     let env = Env::zstd3("otel_logs_and_spans", "p-carry-cap");
-    let inputs: Vec<String> = (0..9).map(|i| format!("in_{i}")).collect();
+    let inputs: Vec<String> = (0..3).map(|i| format!("in_{i}")).collect();
     for (i, uri) in inputs.iter().enumerate() {
         env.publish(&[(1_000_000 + i as i64, &format!("id{i}"), "ERROR")], &[uri]).await;
     }
     let refs: Vec<&str> = inputs.iter().map(String::as_str).collect();
-    assert!(!env.carry_forward(&refs, &["out"]).await, "nine entries exceed the cap, so the caller must rebuild");
-    assert!(env.carry_forward(&refs[..8], &["out8"]).await, "eight entries are still carried");
+    assert!(!env.carry_forward(&refs, &["out"]).await, "three entries exceed the cap, so the caller must rebuild");
+    assert!(env.carry_forward(&refs[..2], &["out2"]).await, "two entries are still carried");
 }
 
 /// A multi-file entry must not take its live siblings down with it when one

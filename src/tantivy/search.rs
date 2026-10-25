@@ -227,8 +227,11 @@ const MAX_QUEUED_WARMS: usize = 64;
 const BUNDLE_CONVERSIONS: usize = 2;
 const CAP_EXCEEDED_TTL: Duration = Duration::from_secs(600);
 
-/// Index entries a rewrite may carry onto its output before it is rebuilt as one.
-const MAX_CARRIED_ENTRIES: usize = 8;
+/// Index entries a rewrite may carry onto its output before it is rebuilt as one. Today's
+/// partition stays below the packing target, so the backfill never consolidates it: at 8,
+/// 33 files of one project were searched as 260 indexes. Hot-tail outputs are small, so a
+/// rebuild is cheap.
+const MAX_CARRIED_ENTRIES: usize = 2;
 
 fn window_width(time_range: Option<(i64, i64)>) -> u64 {
     time_range.map_or(u64::MAX, |(lo, hi)| hi.abs_diff(lo))
