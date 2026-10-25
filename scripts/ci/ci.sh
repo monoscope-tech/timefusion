@@ -104,12 +104,13 @@ worktree_tree() {
 # rewrites monoscope.cabal, `npm ci` can touch a lockfile, the lint job refactors
 # src/ in place — and recomputing afterwards would attest a fingerprint the gate
 # never looked up, so nothing would ever be reused.
-pin_fingerprints() { # <check...>
-  local c
-  mkdir -p .ci
-  : > .ci/fingerprints.tsv
-  for c in "$@"; do printf '%s\t%s\n' "$c" "$(fingerprint "$c")" >> .ci/fingerprints.tsv; done
-  export CI_FINGERPRINTS=.ci/fingerprints.tsv
+pin_fingerprints() { # <destination> <check...>
+  local destination=$1 c
+  shift
+  mkdir -p "$(dirname "$destination")"
+  : > "$destination"
+  for c in "$@"; do printf '%s\t%s\n' "$c" "$(fingerprint "$c")" >> "$destination"; done
+  export CI_FINGERPRINTS="$destination"
 }
 
 fingerprint() { # <check>
@@ -408,7 +409,7 @@ cmd_gate() {
   out=${GITHUB_OUTPUT:-/dev/null}
   summary=${GITHUB_STEP_SUMMARY:-/dev/null}
   # shellcheck disable=SC2046
-  pin_fingerprints $(selected_checks "$@")
+  pin_fingerprints .ci/fingerprints.tsv $(selected_checks "$@")
   # Hand the pinned values to the jobs that will do the work, so they attest the
   # exact fingerprints this gate just looked up.
   { echo 'fingerprints<<CI_FP_EOF'; cat .ci/fingerprints.tsv; echo CI_FP_EOF; } >> "$out"
@@ -459,7 +460,7 @@ cmd_run() {
   CAPS=$(detect_caps)
   note "capabilities: ${CAPS:-none}"
   # shellcheck disable=SC2046
-  [ -n "${CI_FINGERPRINTS:-}" ] || pin_fingerprints $(selected_checks "$@")
+  [ -n "${CI_FINGERPRINTS:-}" ] || pin_fingerprints .ci/fingerprints.tsv $(selected_checks "$@")
   for c in $(selected_checks "$@"); do
     req=$(check_requires "$c")
     # A missing capability is never a silent pass — this run can say nothing about
@@ -615,30 +616,17 @@ cmd_selftest() {
 
   # Pinning is what survives a step that rewrites the tree mid-run.
   (
-    saved_fingerprints=$(mktemp -t ci-selftest-fingerprints.XXXXXX)
-    had_fingerprints=false
-    if [ -e .ci/fingerprints.tsv ]; then
-      cp -p .ci/fingerprints.tsv "$saved_fingerprints"
-      had_fingerprints=true
-    fi
-    trap '
-      rm -f "src/$probe"
-      if "$had_fingerprints"; then
-        cp -p "$saved_fingerprints" .ci/fingerprints.tsv
-      else
-        rm -f .ci/fingerprints.tsv
-        rmdir .ci 2>/dev/null || true
-      fi
-      rm -f "$saved_fingerprints"
-    ' EXIT
+    probe_fingerprints=$(mktemp -t ci-selftest-fingerprints.XXXXXX)
+    trap 'rm -f "$probe_fingerprints" "src/$probe"' EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM
     WORKTREE_TREE=''
     before=$(fingerprint fmt)
-    pin_fingerprints fmt
+    pin_fingerprints "$probe_fingerprints" fmt
     : > "src/$probe"; WORKTREE_TREE=''; after=$(fingerprint fmt); rm -f "src/$probe"
     unset CI_FINGERPRINTS
     assert "pinned fp survives tree change" "$before" "$after"
+    # Carry assertion failures out of the isolated fingerprint environment.
     exit "$SELFTEST_RC"
   ) || SELFTEST_RC=1
 
