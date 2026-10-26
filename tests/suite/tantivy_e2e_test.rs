@@ -1077,6 +1077,11 @@ async fn a_newest_first_page_narrows_to_the_index_bound_and_matches_baseline() -
     assert!(hits() - before < 30, "only the narrowed window's matches are resolved: {}", hits() - before);
     assert_eq!(ordered_ids(&ctx, &page).await?, ordered_ids(&ctx_off, &page).await?);
 
+    for column in ["context___is_remote", "severity___severity_number"] {
+        let other_sort = page.replace("ORDER BY timestamp DESC", &format!("ORDER BY {column} DESC NULLS FIRST, id"));
+        assert_eq!(ordered_ids(&ctx, &other_sort).await?, ordered_ids(&ctx_off, &other_sort).await?, "timestamp bounds must not narrow another sort key");
+    }
+
     // Deleting the eight newest errors must not surface them, whichever way the page is filled
     // (the short-page fallback itself is `NarrowedFetchExec`'s, shared with the ascending case).
     let gone = (0..8).map(|i| format!("'e{i}'")).collect::<Vec<_>>().join(",");
