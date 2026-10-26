@@ -90,6 +90,19 @@ def run_is_finished(run_id):
     return done.returncode == 0 and done.stdout.strip() == 'completed'
 
 
+def superseded_attempt(record):
+    """True when this process is a later attempt of the run that wrote `record`.
+
+    A rerun keeps its run id, so `run_is_finished` reports the holder alive and the
+    rerun waits out its own failed attempt's lease. GitHub starts a new attempt only
+    after the previous one completed, so an older attempt of THIS run is dead.
+    """
+    try:
+        return record.get('run_id') == os.environ.get('GITHUB_RUN_ID') is not None and int(record.get('run_attempt', 1)) < int(os.environ['GITHUB_RUN_ATTEMPT'])
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
 @dataclass
 class RolloutGuard:
     owner: str
@@ -154,7 +167,7 @@ class DeploymentLease:
         if record.get('mutating') is not False:
             # Reclaimable only once the holder is PROVABLY gone. Age alone never
             # qualifies a mutating lease, and a holder we cannot ask about never does.
-            if not run_is_finished(record.get('run_id')):
+            if not (superseded_attempt(record) or run_is_finished(record.get('run_id'))):
                 return False
             # A finished run cannot still be mid-rollout. What remains is whether
             # it ever REPLACED anything, and there are two independent witnesses —
@@ -201,7 +214,7 @@ class DeploymentLease:
     @contextlib.contextmanager
     def hold(self, image, wait_seconds=2700):
         record = {'image': image, 'nonce': uuid.uuid4().hex, 'mutating': False,
-                  'run_id': os.environ.get('GITHUB_RUN_ID'), 'pid': os.getpid(), 'started': time.time()}
+                  'run_id': os.environ.get('GITHUB_RUN_ID'), 'run_attempt': os.environ.get('GITHUB_RUN_ATTEMPT'), 'pid': os.getpid(), 'started': time.time()}
         owner = self.commit(record)
         deadline = time.monotonic() + wait_seconds
         last_notice = 0
