@@ -1998,14 +1998,16 @@ mod ordered_union_for_topk_tests {
 // SELECT aliases; a relation without them is left alone rather than guessed at.
 
 use datafusion::sql::sqlparser::ast::{
-    Expr as SqlExpr, Function, FunctionArg, FunctionArgExpr, FunctionArgumentList, FunctionArguments, Ident, ObjectName, ObjectNamePart, Query, Select,
-    SelectItem, SetExpr, Statement, TableFactor, Value as SqlValue, ValueWithSpan, VisitMut, VisitorMut,
+    Expr as SqlExpr, Function, FunctionArg, FunctionArgExpr, FunctionArgumentList, FunctionArguments, GroupByExpr, Ident, ObjectName, ObjectNamePart, OrderBy,
+    OrderByKind, Query, Select, SelectItem, SetExpr, Statement, TableFactor, Value as SqlValue, ValueWithSpan, VisitMut, VisitorMut,
 };
 
 /// Cheap guard so the parse/unparse round trip only happens for statements that
 /// could possibly need it.
 pub fn might_need_rewrite(sql: &str) -> bool {
-    sql.to_ascii_lowercase().contains("row_to_json")
+    static ORDINAL: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"(?i)\border\s+by\s+(?:[^;]*?,\s*)?\d").expect("valid regex"));
+    sql.to_ascii_lowercase().contains("row_to_json") || ORDINAL.is_match(sql)
 }
 
 /// Returns the rewritten statement only when something actually changed, so an
@@ -2025,11 +2027,38 @@ impl VisitorMut for RowToJsonRecord {
 
     fn post_visit_query(&mut self, query: &mut Query) -> std::ops::ControlFlow<Self::Break> {
         self.rewrite_set_expr(query.body.as_mut());
+        self.rewrite_order_ordinals(query);
         std::ops::ControlFlow::Continue(())
     }
 }
 
 impl RowToJsonRecord {
+    /// DataFusion rejects `GROUP BY 1 ORDER BY 2` when select item 2 is a scalar over an
+    /// aggregate (`round(avg(x))`) yet accepts the same item spelled out, so an ordinal naming
+    /// an unaliased aggregate output is replaced by its expression. Group keys already plan
+    /// and stay untouched, as do a union's ordinals, which name its output.
+    fn rewrite_order_ordinals(&mut self, query: &mut Query) {
+        let (SetExpr::Select(select), Some(OrderBy { kind: OrderByKind::Expressions(exprs), .. })) = (query.body.as_ref(), query.order_by.as_mut()) else {
+            return;
+        };
+        let GroupByExpr::Expressions(keys, _) = &select.group_by else { return };
+        if keys.is_empty() {
+            return;
+        }
+        let ordinal = |expr: &SqlExpr| match expr {
+            SqlExpr::Value(ValueWithSpan { value: SqlValue::Number(n, _), .. }) => n.parse::<usize>().ok(),
+            _ => None,
+        };
+        for order in exprs {
+            let Some(n) = ordinal(&order.expr) else { continue };
+            let Some(SelectItem::UnnamedExpr(expr)) = n.checked_sub(1).and_then(|i| select.projection.get(i)) else { continue };
+            if !matches!(expr, SqlExpr::Identifier(_) | SqlExpr::CompoundIdentifier(_)) && !keys.iter().any(|key| ordinal(key) == Some(n) || key == expr) {
+                order.expr = expr.clone();
+                self.rewrote = true;
+            }
+        }
+    }
+
     /// A UNION's branches are `SetExpr`s, not `Query`s, so they are never
     /// reached by matching on `query.body` alone.
     fn rewrite_set_expr(&mut self, body: &mut SetExpr) {
@@ -2164,6 +2193,25 @@ mod row_to_json_record_tests {
     #[test_case::test_case("SELECT row_to_json(t) FROM some_table t" => None ; "plain table alias is left alone")]
     fn declines_to_rewrite(sql: &str) -> Option<String> {
         rewrite_sql(sql)
+    }
+
+    #[test_case::test_case("SELECT k, round(avg(v)) FROM t GROUP BY 1 ORDER BY 2 DESC" => Some(vec!["b".into(), "a".into()]) ; "scalar over aggregate")]
+    #[test_case::test_case("SELECT k, round(avg(v)) FROM t GROUP BY 1 ORDER BY 2, 1" => Some(vec!["a".into(), "b".into()]) ; "mixed ordinals")]
+    #[test_case::test_case("SELECT k, avg(v) FROM t GROUP BY 1 ORDER BY 2 DESC" => Some(vec!["b".into(), "a".into()]) ; "a bare aggregate keeps its order")]
+    #[test_case::test_case("SELECT k, avg(v) FROM t GROUP BY 1 ORDER BY 1 DESC" => None ; "a column ordinal is left alone")]
+    #[test_case::test_case("SELECT upper(k), count(*) FROM t GROUP BY 1 ORDER BY 1" => None ; "a computed group key is left alone")]
+    #[test_case::test_case("SELECT upper(k), count(*) FROM t GROUP BY upper(k) ORDER BY 1" => None ; "a group key spelled out is left alone")]
+    #[test_case::test_case("SELECT k FROM t UNION ALL SELECT k FROM t ORDER BY 1" => None ; "a union's ordinal is left alone")]
+    #[tokio::test]
+    async fn order_by_ordinal_over_a_scalar_aggregate_plans(sql: &str) -> Option<Vec<String>> {
+        assert!(might_need_rewrite(sql));
+        let rewritten = rewrite_sql(sql)?;
+        let ctx = datafusion::prelude::SessionContext::new();
+        ctx.sql("CREATE TABLE t (k VARCHAR, v DOUBLE) AS VALUES ('a', 1.0), ('b', 2.0)").await.expect("table");
+        let batches = ctx.sql(&rewritten).await.expect("the rewrite plans").collect().await.expect("runs");
+        let keys = arrow::compute::concat_batches(&batches[0].schema(), &batches).expect("concat");
+        let keys = arrow::compute::cast(keys.column(0), &arrow::datatypes::DataType::Utf8).expect("cast");
+        Some(arrow::array::AsArray::as_string::<i32>(&keys).iter().map(|k| k.unwrap_or_default().to_string()).collect())
     }
 }
 
