@@ -124,10 +124,10 @@ run-minio:
 	@echo "Running with MinIO configuration..."
 	@export $$(cat .env.minio.prod | grep -v '^#' | xargs) && cargo run
 
-# Start MinIO server
+# Start the shared development server without stopping isolated MinIO fixtures.
 minio-start:
 	@mkdir -p /tmp/minio-data
-	@pkill -f "minio server" || true
+	@pkill -f '^minio server /tmp/minio-data --console-address :9001$$' || true
 	@MINIO_ROOT_USER=minioadmin MINIO_ROOT_PASSWORD=minioadmin nohup minio server /tmp/minio-data --console-address :9001 > /tmp/minio.log 2>&1 &
 	@sleep 2
 	@export $$(cat .env.test | grep -v '^#' | xargs) && \
@@ -137,7 +137,7 @@ minio-start:
 
 # Stop MinIO server
 minio-stop:
-	@pkill -f "minio server" || true
+	@pkill -f '^minio server /tmp/minio-data --console-address :9001$$' || true
 	@echo "MinIO stopped"
 
 # Clean MinIO data
