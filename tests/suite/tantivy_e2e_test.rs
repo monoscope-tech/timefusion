@@ -2150,6 +2150,13 @@ async fn a_body_text_search_routes_through_the_json_index() -> Result<()> {
     for (predicate, expected, routed) in [
         ("body::text ~* 'timeout'", &["hit-buffered", "hit-upper", "hit-nested"][..], true),
         ("body::text ILIKE '%timeout%'", &["hit-buffered", "hit-upper", "hit-nested"], true),
+        // monoscope free text: one OR over body, status_message and name.
+        ("(body::text ~* 'timeout' OR status_message ~* 'timeout' OR name ~* 'timeout')", &["hit-buffered", "hit-upper", "hit-nested"], true),
+        (
+            "((body::text ~* 'timeout' AND body::text ~* 'read[^[:alnum:]]+timeout') OR (name ~* 'timeout' AND name ~* 'read[^[:alnum:]]+timeout'))",
+            &["hit-buffered"],
+            true,
+        ),
         // JSON punctuation is not a routable term character, so no rendering difference can drop a row.
         (r#"body::text ILIKE '%"kind":"timeout"%'"#, &["hit-nested"], false),
     ] {
