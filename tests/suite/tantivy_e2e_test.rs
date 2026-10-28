@@ -897,6 +897,58 @@ async fn startup_backfills_existing_hashes_without_an_opt_in() -> Result<()> {
     Ok(())
 }
 
+/// A pre-`tf_ngram3p` index keeps serving and is rebuilt positional by the backfill.
+#[tokio::test(flavor = "multi_thread")]
+async fn backfill_rebuilds_an_index_built_before_positional_grams() -> Result<()> {
+    use timefusion::{
+        support::test_helpers::{json_to_batch_for, minio_test_config},
+        tantivy::{load_manifest, save_manifest},
+    };
+
+    let dir = tempfile::tempdir()?;
+    let project = unique_project();
+    let mut config = (*minio_test_config(&project, dir.path().to_str().unwrap())).clone();
+    config.tantivy = serde_json::from_str("{}")?;
+    let config = Arc::new(config);
+    let db = Database::with_config(config.clone()).await?;
+    let uri = format!("s3://timefusion-tests/{}/tantivy", config.core.timefusion_table_prefix);
+    let store = db.create_object_store(&uri, &config.aws.build_storage_options(None)).await?;
+    let indexer = Arc::new(TantivyIndexService::new(
+        store.clone(),
+        Arc::new(config.tantivy.clone()),
+        std::env::temp_dir().join(format!("tf-scratch-{}", uuid::Uuid::new_v4())),
+    ));
+    let search = Arc::new(TantivySearchService::new(store.clone(), dir.path().join("indexes"), Arc::new(config.tantivy.clone())));
+    indexer.with_reader(&search);
+    let db = Arc::new(db.with_tantivy_indexer(indexer).with_tantivy_search(search.clone()));
+    let schema = timefusion::schema::get_schema(TABLE).unwrap();
+    let timestamp = chrono::Utc::now() - chrono::Duration::days(2);
+    let row = json!({"project_id": project, "id": "dl", "timestamp": timestamp.timestamp_micros(), "date": timestamp.date_naive().to_string(),
+        "name": "update", "status_message": "ER_LOCK_DEADLOCK: Deadlock found when trying to get lock", "summary": [], "hashes": []});
+    db.insert_records_batch(&project, TABLE, vec![json_to_batch_for(TABLE, vec![row])?], true, None).await?;
+    let current = |m: &timefusion::tantivy::Manifest| m.entries.values().filter(|e| e.covers_current_elements(schema)).count();
+    db.spawn_tantivy_backfill();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    while current(&load_manifest(store.as_ref(), TABLE, &project).await?) == 0 {
+        anyhow::ensure!(tokio::time::Instant::now() < deadline, "backfill must index the sealed file");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let mut legacy = load_manifest(store.as_ref(), TABLE, &project).await?;
+    legacy.entries.values_mut().for_each(|e| e.positional = false);
+    save_manifest(store.as_ref(), TABLE, &project, &legacy).await?;
+    assert_eq!(current(&legacy), 0, "a pre-positional entry is stale");
+    assert!(legacy.entries.values().all(|e| e.covers_current_fields(schema)), "and still serves queries");
+    db.spawn_tantivy_backfill();
+    while current(&load_manifest(store.as_ref(), TABLE, &project).await?) == 0 {
+        anyhow::ensure!(tokio::time::Instant::now() < deadline, "backfill must rebuild the stale entry positional");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let hits = search.search_with_stats(TABLE, &project, &leaf("status_message", "ER_LOCK_DEADLOCK"), 1000, None).await?.expect("covered");
+    assert_eq!(hits.hits.len(), 1);
+    db.shutdown().await?;
+    Ok(())
+}
+
 /// `metric` summed over the Delta leg's parquet reads, from `EXPLAIN ANALYZE`.
 async fn scan_metric(ctx: &SessionContext, sql: &str, metric: &str) -> Result<usize> {
     let txt = ctx
