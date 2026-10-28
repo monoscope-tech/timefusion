@@ -238,9 +238,18 @@ impl<R: std::io::Read> std::io::Read for Tee<'_, R> {
     }
 }
 
-/// Unpack a bundle into `dest`. `remote_positions` leaves the `.pos` files (positional grams
-/// make them most of an index, and only phrase queries read them) in the bundle and saves its
-/// head as [`HEAD_FILE`], so [`LocalFirst`] can range-read them.
+/// Does the index whose bundle `head` this is hold a `tf_ngram3p` field? Read from its own
+/// `meta.json`, which opening reads and the head therefore holds; unreadable means no.
+fn holds_positional_grams(head: Bytes) -> bool {
+    let Ok(meta) = BundleDirectory::new(head.clone(), Arc::new(head)).and_then(|d| Ok(d.atomic_read(Path::new("meta.json"))?)) else { return false };
+    serde_json::from_slice::<serde_json::Value>(&meta)
+        .is_ok_and(|m| m["schema"].as_array().is_some_and(|fields| fields.iter().any(|f| f["options"]["indexing"]["tokenizer"] == super::NGRAM3P_TOKENIZER)))
+}
+
+/// Unpack a bundle into `dest`. With `remote_positions`, an index holding positional grams
+/// leaves its `.pos` files (most of such an index, read only by phrase queries) in the bundle
+/// and saves its head as [`HEAD_FILE`], so [`LocalFirst`] can range-read them. Every other
+/// index unpacks whole, so binaries without [`LocalFirst`] can still open it.
 pub fn unpack_bundle(mut r: impl std::io::Read, dest: &Path, remote_positions: bool) -> anyhow::Result<()> {
     use std::io::Write;
     let mut head = vec![];
@@ -250,6 +259,7 @@ pub fn unpack_bundle(mut r: impl std::io::Read, dest: &Path, remote_positions: b
         std::io::copy(&mut std::io::Read::take(&mut tee, table.hot.iter().map(|h| h.2).sum()), &mut std::io::sink())?;
         table
     };
+    let remote_positions = remote_positions && holds_positional_grams(Bytes::from(head.clone()));
     let mut buf = vec![];
     for file in &table.files {
         if remote_positions && file.name.ends_with(".pos") {
@@ -597,6 +607,23 @@ mod tests {
             assert_eq!((count(&hybrid, query)?, count(&whole, query)?), (expected, expected), "{query}");
             assert_eq!(source.1.lock().1 > before, phrase, "{query}: only a phrase reads positions");
         }
+        Ok(())
+    }
+
+    /// An index without positional grams unpacks whole: an older binary must still open it.
+    #[test]
+    fn an_index_without_positional_grams_unpacks_whole() -> anyhow::Result<()> {
+        let (whole_dir, part_dir) = (tempfile::tempdir()?, tempfile::tempdir()?);
+        let mut schema = tantivy::schema::Schema::builder();
+        let body = schema.add_text_field("body", tantivy::schema::TEXT);
+        let index = tantivy::Index::create_in_dir(whole_dir.path(), schema.build())?;
+        let mut writer = index.writer::<tantivy::TantivyDocument>(15_000_000)?;
+        writer.add_document(tantivy::doc!(body => "read timeout"))?;
+        writer.commit()?;
+        unpack_bundle(&pack_bundle(whole_dir.path(), 3)?[..], part_dir.path(), true)?;
+        assert!(!part_dir.path().join(HEAD_FILE).exists());
+        assert!(std::fs::read_dir(part_dir.path())?.flatten().any(|e| e.path().extension().is_some_and(|x| x == "pos")));
+        tantivy::Index::open_in_dir(part_dir.path())?;
         Ok(())
     }
 

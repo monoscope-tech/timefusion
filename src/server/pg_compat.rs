@@ -1239,6 +1239,7 @@ impl StatsTableProvider {
                 "range_disk_hit_bytes" => s.range_disk_hit_bytes.load(Relaxed),
                 "range_read_fast_bytes" => s.range_read_fast_bytes.load(Relaxed),
                 "range_read_terms_bytes" => s.range_read_terms_bytes.load(Relaxed),
+                "range_read_pos_bytes" => s.range_read_pos_bytes.load(Relaxed),
                 "range_read_store_bytes" => s.range_read_store_bytes.load(Relaxed),
                 "bundle_opens" => s.bundle_opens.load(Relaxed),
                 "parallel_searches_peak" => s.parallel_searches_peak.load(Relaxed),

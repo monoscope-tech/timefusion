@@ -59,6 +59,8 @@ pub struct SearchStats {
     pub range_read_fast_bytes: AtomicU64,
     pub range_read_terms_bytes: AtomicU64,
     pub range_read_store_bytes: AtomicU64,
+    /// Positions: what phrase queries over installs that left them remote cost.
+    pub range_read_pos_bytes: AtomicU64,
     pub bundle_opens: AtomicU64,
     /// Per-index searches running at once, and the most ever; 1 means the fan-out serialized.
     pub parallel_searches: AtomicU64,
@@ -1238,7 +1240,8 @@ impl super::hotcache::BundleSource for StoreSource {
     fn read_file(&self, range: std::ops::Range<u64>, file: &Path) -> std::io::Result<bytes::Bytes> {
         let kind = match file.extension().and_then(|e| e.to_str()) {
             Some("fast") => Some(&self.stats.range_read_fast_bytes),
-            Some("term" | "idx" | "pos") => Some(&self.stats.range_read_terms_bytes),
+            Some("term" | "idx") => Some(&self.stats.range_read_terms_bytes),
+            Some("pos") => Some(&self.stats.range_read_pos_bytes),
             Some("store") => Some(&self.stats.range_read_store_bytes),
             _ => None,
         };
