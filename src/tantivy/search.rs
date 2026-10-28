@@ -1266,13 +1266,13 @@ impl super::hotcache::BundleSource for StoreSource {
     }
 }
 
-/// True if `dir` already holds an extracted index (a `seg*` file or `meta.json`).
 /// Opened from a bundle, or installed with its positions left in one: reads it makes go by
 /// range, so `hotcache::warm` must fetch them in parallel first.
 fn reads_by_range(opened: &Either<(Index, IndexReader), PathBuf>) -> bool {
     opened.as_ref().right().is_none_or(|dir| dir.join(super::hotcache::HEAD_FILE).exists())
 }
 
+/// True if `dir` already holds an extracted index (a `seg*` file or `meta.json`).
 fn has_any_segment(dir: &Path) -> bool {
     std::fs::read_dir(dir).is_ok_and(|rd| rd.flatten().any(|e| e.file_name() == "meta.json" || e.file_name().to_string_lossy().starts_with("seg")))
 }
@@ -1752,6 +1752,7 @@ mod reader_tests {
             ("unrelated payload", "INFO"),
             ("deadlo then a lock", "INFO"),
             (r#"{"err":"ER_LOCK_DEADLOCK: Deadlock found"}"#, "WARN"),
+            ("Ünïcödé façade straße", "INFO"),
         ];
         for (i, (text, lvl)) in docs.iter().enumerate() {
             w.add_document(doc!(built.timestamp => i as i64, built.id => format!("id{i}"), body => *text, level => *lvl, legacy => *text)).expect("add");
@@ -1791,6 +1792,10 @@ mod reader_tests {
     #[test_case("body", "lock" => Ok("id4,id5".to_string()) ; "a single gram is a plain term")]
     #[test_case("body", "dlo" => Ok("id4,id5".to_string()) ; "a three-char word is one gram")]
     #[test_case("legacy", "deadlock" => Ok("id4,id5".to_string()) ; "legacy ngram3 conjunction over-selects, a superset")]
+    #[test_case("body", "facade" => Ok("id6".to_string()) ; "ASCII folding keeps the grams adjacent")]
+    #[test_case("body", "FAÇADE" => Ok("id6".to_string()) ; "folded and lowercased query side")]
+    #[test_case("body", "straße" => Ok("id6".to_string()) ; "a gram that folds to four chars keeps its offset")]
+    #[test_case("body", "ünïcödé" => Ok("id6".to_string()) ; "multi-byte characters")]
     // `level` (raw): the whole indexed value is ONE token.
     #[test_case("level", "ERROR" => Ok("id1".to_string()) ; "raw term matches the whole indexed value")]
     #[test_case("level", "-alpha" => Ok("id0".to_string()) ; "a leading `-` used to parse as a lone MustNot clause (no hits)")]
