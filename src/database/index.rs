@@ -284,7 +284,8 @@ impl Database {
             let covered_by = |current: fn(&crate::tantivy::ManifestEntry, &crate::schema::TableSchema) -> bool| -> HashSet<&String> {
                 manifest.entries.values().filter(|e| current(e, schema)).flat_map(|e| e.covered_files.iter()).collect()
             };
-            let (current, serving) = (covered_by(crate::tantivy::ManifestEntry::covers_current_elements), covered_by(crate::tantivy::ManifestEntry::covers_current_fields));
+            let (current, serving) =
+                (covered_by(crate::tantivy::ManifestEntry::covers_current_elements), covered_by(crate::tantivy::ManifestEntry::covers_current_fields));
             uris.retain(|uri| !current.contains(uri));
             if max_bytes > 0 {
                 let before = uris.len();
@@ -468,7 +469,8 @@ impl Database {
             let Ok(table_ref) = self.resolve_table(&root, table_name).await else {
                 continue;
             };
-            let (by_pid, mut stale, sizes, delta_store) = self.group_uncovered_files_by_project(svc, &table_ref, table_name, &mut oversized_total, true).await?;
+            let (by_pid, mut stale, sizes, delta_store) =
+                self.group_uncovered_files_by_project(svc, &table_ref, table_name, &mut oversized_total, true).await?;
             let stable_before = chrono::Utc::now().timestamp_millis() - TODAY_STABLE_MILLIS;
             let stable: HashSet<String> = table_ref
                 .read()

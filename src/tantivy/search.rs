@@ -525,7 +525,7 @@ impl TantivySearchService {
             let file_uuid = file_uuid(&key);
             let prepare_started = Instant::now();
             let opened = self.open_index(table, project_id, file_uuid, &blob_path, bundle).await?;
-            let bundled = opened.is_left();
+            let bundled = reads_by_range(&opened);
             // The rest is synchronous, CPU-bound tantivy work that yields nowhere. On a
             // blocking thread of its own, not `block_in_place`: that parks this whole fan-out
             // task, so `buffer_unordered` ran the searches one at a time (30d: 377 x ~17 ms).
@@ -722,7 +722,7 @@ impl TantivySearchService {
             let query = query.clone();
             async move {
                 let opened = self.open_index(table, project_id, file_uuid(&key), &blob, bundle).await?;
-                let bundled = opened.is_left();
+                let bundled = reads_by_range(&opened);
                 let me = Arc::clone(self);
                 tokio::task::spawn_blocking(move || -> Result<(Vec<i64>, Vec<String>)> {
                     let (index, reader) = me.opened(opened)?;
@@ -905,7 +905,14 @@ impl TantivySearchService {
             return Ok(v.clone());
         }
         let started = Instant::now();
-        let index = super::open_index(dir)?;
+        let index = match std::fs::read(dir.join(super::hotcache::HEAD_FILE)) {
+            Ok(head) => {
+                let blob = std::fs::read_to_string(dir.join(super::hotcache::SOURCE_FILE)).context("read bundle source")?;
+                let local = tantivy::directory::MmapDirectory::open(dir).map_err(|e| anyhow!("open mmap dir: {e}"))?;
+                super::open_index_in(super::hotcache::LocalFirst { local, remote: self.bundle_directory(&blob, head.into())? })?
+            }
+            Err(_) => super::open_index(dir)?,
+        };
         let reader = index.reader().map_err(|e| anyhow!("open reader: {e}"))?;
         SearchStats::timed(&self.stats.index_opens, &self.stats.index_open_us, started);
         self.readers.lock().put(dir.to_path_buf(), (index.clone(), reader.clone()));
@@ -932,19 +939,12 @@ impl TantivySearchService {
         opened.either(Ok, |dir| self.open_cached(&dir))
     }
 
-    /// A bundle searched in place: one GET of its head opens it, later reads go by range
-    /// through the shared block cache. Cached alongside installed indexes, keyed by blob.
-    async fn open_bundle(&self, blob_path: &str, head_len: u64) -> Result<(Index, IndexReader)> {
-        let key = PathBuf::from(format!("bundle:{blob_path}"));
-        if let Some(v) = self.readers.lock().get(&key) {
-            SearchStats::add(&self.stats.reader_hits, 1);
-            return Ok(v.clone());
-        }
-        let path = ObjPath::from(blob_path);
-        let head = self.object_store.get_range(&path, 0..head_len).await.with_context(|| format!("get head of {path}"))?;
+    /// `blob_path`'s bundle, read by range through the block and disk caches. Building one is
+    /// IO-free: `head` already holds what opening reads.
+    fn bundle_directory(&self, blob_path: &str, head: bytes::Bytes) -> Result<super::hotcache::BundleDirectory> {
         let source = Arc::new(StoreSource {
             store: self.object_store.clone(),
-            path,
+            path: ObjPath::from(blob_path),
             rt: tokio::runtime::Handle::current(),
             stats: self.stats.clone(),
             disk_cache: self.disk_cache.clone(),
@@ -953,8 +953,19 @@ impl TantivySearchService {
         let bundle = std::hash::BuildHasher::hash_one(&std::hash::BuildHasherDefault::<std::collections::hash_map::DefaultHasher>::default(), blob_path);
         let directory = super::hotcache::BundleDirectory::new(head, source.clone())?;
         let _ = source.len.set(directory.bundle_len());
-        let directory = directory.with_cache(bundle, self.block_cache.clone());
-        let index = super::open_index_in(directory)?;
+        Ok(directory.with_cache(bundle, self.block_cache.clone()))
+    }
+
+    /// A bundle searched in place: one GET of its head opens it, later reads go by range
+    /// through the shared block cache. Cached alongside installed indexes, keyed by blob.
+    async fn open_bundle(&self, blob_path: &str, head_len: u64) -> Result<(Index, IndexReader)> {
+        let key = PathBuf::from(format!("bundle:{blob_path}"));
+        if let Some(v) = self.readers.lock().get(&key) {
+            SearchStats::add(&self.stats.reader_hits, 1);
+            return Ok(v.clone());
+        }
+        let head = self.object_store.get_range(&ObjPath::from(blob_path), 0..head_len).await.with_context(|| format!("get head of {blob_path}"))?;
+        let index = super::open_index_in(self.bundle_directory(blob_path, head)?)?;
         let reader = index.reader().map_err(|e| anyhow!("open bundle reader: {e}"))?;
         SearchStats::add(&self.stats.bundle_opens, 1);
         self.readers.lock().put(key, (index.clone(), reader.clone()));
@@ -987,7 +998,7 @@ impl TantivySearchService {
             let target = dir.clone();
             tokio::task::spawn_blocking(move || {
                 let _permit = permit;
-                install_blob_into_cache(&target, tokio_util::io::SyncIoBridge::new(tokio_util::io::StreamReader::new(stream)))
+                install_blob_into_cache(&target, tokio_util::io::SyncIoBridge::new(tokio_util::io::StreamReader::new(stream)), path.as_ref())
             })
             .await??;
             SearchStats::timed(&self.stats.blob_fetches, &self.stats.blob_fetch_us, started);
@@ -1121,11 +1132,16 @@ fn cache_generation_key(key: &str, blob: &str) -> String {
 ///
 /// Deliberately does NOT stamp `last_used` — a seeded dir's mtime is its unpack
 /// time, which already sorts it as newest for the reaper.
-fn install_blob_into_cache(dir: &Path, blob: impl std::io::Read) -> Result<()> {
+/// Positions stay in the bundle (`blob_path`), read by range only by phrase queries: they are
+/// most of a positional index, and installing them would not fit the hot window on local disk.
+fn install_blob_into_cache(dir: &Path, blob: impl std::io::Read, blob_path: &str) -> Result<()> {
     let parent = dir.parent().ok_or_else(|| anyhow!("cache path has no parent"))?;
     std::fs::create_dir_all(parent).context("mkdir cache parent")?;
     let tmp = tempfile::TempDir::new_in(parent).context("tempdir for unpack")?;
-    super::unpack_to_dir(blob, tmp.path())?;
+    super::unpack_to_dir(blob, tmp.path(), true)?;
+    if tmp.path().join(super::hotcache::HEAD_FILE).exists() {
+        std::fs::write(tmp.path().join(super::hotcache::SOURCE_FILE), blob_path).context("write bundle source")?;
+    }
     // Bound in a `let` so the `tmp.path()` borrow ends before the arms move `tmp`.
     let renamed = std::fs::rename(tmp.path(), dir);
     match renamed {
@@ -1248,6 +1264,12 @@ impl super::hotcache::BundleSource for StoreSource {
 }
 
 /// True if `dir` already holds an extracted index (a `seg*` file or `meta.json`).
+/// Opened from a bundle, or installed with its positions left in one: reads it makes go by
+/// range, so `hotcache::warm` must fetch them in parallel first.
+fn reads_by_range(opened: &Either<(Index, IndexReader), PathBuf>) -> bool {
+    opened.as_ref().right().is_none_or(|dir| dir.join(super::hotcache::HEAD_FILE).exists())
+}
+
 fn has_any_segment(dir: &Path) -> bool {
     std::fs::read_dir(dir).is_ok_and(|rd| rd.flatten().any(|e| e.file_name() == "meta.json" || e.file_name().to_string_lossy().starts_with("seg")))
 }
@@ -1359,7 +1381,7 @@ mod tests {
         let (tmp, blob) = (tempfile::tempdir().unwrap(), packed_blob(8 << 20));
         let dir = tmp.path().join("idx");
         let mut probe = Probe { inner: &blob[..], root: tmp.path(), streamed: false };
-        super::install_blob_into_cache(&dir, &mut probe).unwrap();
+        super::install_blob_into_cache(&dir, &mut probe, "blob").unwrap();
         assert!(probe.streamed, "unpack must write while the blob is still being read");
         assert_eq!(std::fs::metadata(dir.join("seg0.store")).unwrap().len(), 8 << 20);
     }
@@ -2044,7 +2066,8 @@ impl TantivyIndexService {
         }
         let Some(reader) = self.reader() else { return };
         let dir = super::local_cache_path(&reader.cache_root, table, project_id, &cache_generation_key(file_uuid(manifest_key), blob_path));
-        let failure = match tokio::task::spawn_blocking(move || install_blob_into_cache(&dir, &blob[..])).await {
+        let source = blob_path.to_string();
+        let failure = match tokio::task::spawn_blocking(move || install_blob_into_cache(&dir, &blob[..], &source)).await {
             Ok(Ok(())) => return SearchStats::add(&reader.stats.cache_seeded, 1),
             Ok(Err(e)) => format!("tantivy cache seed failed for {project_id}/{table}: {e:#}"),
             Err(e) => format!("tantivy cache seed join failed for {project_id}/{table}: {e}"),

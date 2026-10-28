@@ -41,7 +41,7 @@ async fn pack_upload_download_unpack_query_roundtrip() {
     assert_eq!(dl, blob);
 
     let dir = TempDir::new().unwrap();
-    unpack_to_dir(&dl[..], dir.path()).expect("unpack");
+    unpack_to_dir(&dl[..], dir.path(), false).expect("unpack");
     let idx = timefusion::tantivy::open_index(dir.path()).expect("open");
     let built = build_for_table(&table);
     let level_field = built.user_fields.get("level").unwrap().field;
@@ -253,7 +253,7 @@ async fn a_bundle_opens_from_its_head_and_answers_like_the_unpacked_index() -> a
     assert!(verify_blob(&blob[..blob.len() - 1]).is_err(), "a truncated bundle must be rejected");
 
     let unpacked = TempDir::new()?;
-    unpack_to_dir(&blob[..], unpacked.path())?;
+    unpack_to_dir(&blob[..], unpacked.path(), false)?;
     for entry in std::fs::read_dir(built.path())? {
         let name = entry?.file_name();
         assert_eq!(std::fs::read(built.path().join(&name))?, std::fs::read(unpacked.path().join(&name))?, "{name:?} round-trips");
