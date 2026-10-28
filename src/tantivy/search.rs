@@ -1442,11 +1442,11 @@ mod tests {
 use tantivy::{
     Order, Searcher, TantivyDocument, Term,
     collector::TopDocs,
-    query::{BooleanQuery, Occur, Query, QueryParser, RangeQuery, TermQuery},
+    query::{BooleanQuery, Occur, PhraseQuery, Query, QueryParser, RangeQuery, TermQuery},
     schema::{Field, FieldType, IndexRecordOption, Value},
 };
 
-use crate::tantivy::{ID_FIELD, NGRAM3_TOKENIZER, ROW_ORDINAL_FIELD, TS_FIELD};
+use crate::tantivy::{ID_FIELD, ROW_ORDINAL_FIELD, TS_FIELD};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Hit {
@@ -1488,7 +1488,7 @@ pub fn build_node_query(index: &Index, node: &PredNode) -> Result<PredsQuery> {
                 // substring). On raw/default it carries real prefix semantics
                 // that a conjunction of whole terms would UNDER-match, so those
                 // keep the parser.
-                Some(tok) if tok.as_str() == NGRAM3_TOKENIZER || !p.query.ends_with('*') => analyzed_conjunction_query(index, field, tok, &p.query)?,
+                Some(tok) if super::is_ngram3_family(tok) || !p.query.ends_with('*') => analyzed_conjunction_query(index, field, tok, &p.query)?,
                 // A raw value is ONE term, so a prefix is a walk of the term dictionary. The
                 // parser's prefix query matched nothing on raw fields, and the prefilter then
                 // dropped every indexed row (`id LIKE 'e%'`: 573 of 19,056).
@@ -1539,20 +1539,31 @@ fn analyzed_conjunction_query(index: &Index, field: Field, tokenizer: &str, quer
     // ngram3 requires each whitespace-separated word independently. The others
     // must see the WHOLE literal: `default` splits it itself and `raw` indexes
     // the value as one token, so pre-splitting would under-match.
-    let words: Vec<&str> = if tokenizer == NGRAM3_TOKENIZER { query.split_whitespace().collect() } else { vec![query] };
-    let clauses: Vec<(Occur, Box<dyn Query>)> = words
-        .iter()
-        // Plan-time classification appends `*` for `LIKE 'foo%'`; on a 3-gram
-        // field prefix ⊆ substring, so dropping the marker keeps the prefilter a
-        // superset. (Non-ngram3 `*` queries never reach here — see the caller.)
-        .flat_map(|word| {
-            let mut terms = Vec::new();
-            analyzer.token_stream(word.trim_end_matches('*')).process(&mut |t| terms.push(t.text.clone()));
-            terms
-        })
-        .unique()
-        .map(|t| (Occur::Must, Box::new(TermQuery::new(Term::from_field_text(field, &t), IndexRecordOption::Basic)) as Box<dyn Query>))
-        .collect();
+    let words: Vec<&str> = if super::is_ngram3_family(tokenizer) { query.split_whitespace().collect() } else { vec![query] };
+    // Plan-time classification appends `*` for `LIKE 'foo%'`; on a 3-gram
+    // field prefix ⊆ substring, so dropping the marker keeps the prefilter a
+    // superset. (Non-ngram3 `*` queries never reach here — see the caller.)
+    let mut tokens = |word: &str| {
+        let mut terms = Vec::new();
+        analyzer.token_stream(word.trim_end_matches('*')).process(&mut |t| terms.push((t.position, Term::from_field_text(field, &t.text))));
+        terms
+    };
+    let term = |t: Term| Box::new(TermQuery::new(t, IndexRecordOption::Basic)) as Box<dyn Query>;
+    // Positional grams make each word one phrase: its grams at their own offsets, i.e. the word
+    // as a substring of one indexed value.
+    let phrase = tokenizer == super::NGRAM3P_TOKENIZER && crate::config::try_config().is_none_or(|c| c.tantivy.timefusion_tantivy_phrase_queries);
+    let clauses: Vec<(Occur, Box<dyn Query>)> = if phrase {
+        words
+            .iter()
+            .map(|w| tokens(w))
+            .filter(|grams| !grams.is_empty())
+            .map(|mut grams| {
+                (Occur::Must, if grams.len() == 1 { term(grams.remove(0).1) } else { Box::new(PhraseQuery::new_with_offset(grams)) as Box<dyn Query> })
+            })
+            .collect()
+    } else {
+        words.iter().flat_map(|w| tokens(w)).map(|(_, t)| t).unique().map(|t| (Occur::Must, term(t))).collect()
+    };
     if clauses.is_empty() {
         return Err(anyhow!("query '{query}' produces no {tokenizer} terms"));
     }
@@ -1686,14 +1697,20 @@ mod reader_tests {
             dedup_tiebreak: None,
             tombstone_column: None,
             version_append: false,
-            fields: ["body", "level"]
+            fields: ["body", "level", "legacy"]
                 .into_iter()
                 .map(|name| FieldDef {
                     name: name.into(),
                     data_type: "String".into(),
                     nullable: true,
-                    // body → ngram3 (default), level → raw single token.
-                    tantivy: Some(TantivyFieldConfig { indexed: true, tokenizer: (name == "level").then(|| "raw".to_string()), ..Default::default() }),
+                    // body → positional ngram3 (default), level → raw single token, legacy → the
+                    // position-free ngram3 every pre-`tf_ngram3p` index holds (kv flatten keeps it).
+                    tantivy: Some(TantivyFieldConfig {
+                        indexed: true,
+                        tokenizer: (name == "level").then(|| "raw".to_string()),
+                        flatten: (name == "legacy").then(|| "kv".to_string()),
+                        ..Default::default()
+                    }),
                     ..Default::default()
                 })
                 .collect(),
@@ -1701,11 +1718,18 @@ mod reader_tests {
         let built = build_for_table(&table);
         let index = Index::create_in_ram(built.schema.clone());
         crate::tantivy::register_tokenizers(&index);
-        let (body, level) = (built.user_fields["body"].field, built.user_fields["level"].field);
+        let (body, level, legacy) = (built.user_fields["body"].field, built.user_fields["level"].field, built.user_fields["legacy"].field);
         let mut w = index.writer(15_000_000).expect("writer");
-        let docs = [("accept -header now", "-alpha"), ("err -1234 code", "ERROR"), ("foo NOT bar baz", "two words"), ("unrelated payload", "INFO")];
+        let docs = [
+            ("accept -header now", "-alpha"),
+            ("err -1234 code", "ERROR"),
+            ("foo NOT bar baz", "two words"),
+            ("unrelated payload", "INFO"),
+            ("deadlo then a lock", "INFO"),
+            (r#"{"err":"ER_LOCK_DEADLOCK: Deadlock found"}"#, "WARN"),
+        ];
         for (i, (text, lvl)) in docs.iter().enumerate() {
-            w.add_document(doc!(built.timestamp => i as i64, built.id => format!("id{i}"), body => *text, level => *lvl)).expect("add");
+            w.add_document(doc!(built.timestamp => i as i64, built.id => format!("id{i}"), body => *text, level => *lvl, legacy => *text)).expect("add");
         }
         w.commit().expect("commit");
         index
@@ -1733,6 +1757,15 @@ mod reader_tests {
     #[test_case("body", "zzzqqq" => Ok(String::new()) ; "still selective: literal in no doc returns nothing")]
     #[test_case("body", "header xy" => Ok("id0".to_string()) ; "a <3-char word yields no trigram, is dropped (broadens), never empties")]
     #[test_case("body", "xy" => matches Err(_) ; "nothing left to query: all-short literal errors so callers scan")]
+    // Positional grams: a word matches only as a substring, so every trigram present but apart
+    // (id4) is no longer a candidate; the position-free legacy index still over-selects.
+    #[test_case("body", "deadlock" => Ok("id5".to_string()) ; "phrase needs the grams adjacent")]
+    #[test_case("body", "DEADLOCK" => Ok("id5".to_string()) ; "phrase stays case-insensitive")]
+    #[test_case("body", "ER_LOCK_DEADLOCK" => Ok("id5".to_string()) ; "a routable punctuated literal is one phrase")]
+    #[test_case("body", "lock deadlock" => Ok("id5".to_string()) ; "one phrase per word, ANDed")]
+    #[test_case("body", "lock" => Ok("id4,id5".to_string()) ; "a single gram is a plain term")]
+    #[test_case("body", "dlo" => Ok("id4,id5".to_string()) ; "a three-char word is one gram")]
+    #[test_case("legacy", "deadlock" => Ok("id4,id5".to_string()) ; "legacy ngram3 conjunction over-selects, a superset")]
     // `level` (raw): the whole indexed value is ONE token.
     #[test_case("level", "ERROR" => Ok("id1".to_string()) ; "raw term matches the whole indexed value")]
     #[test_case("level", "-alpha" => Ok("id0".to_string()) ; "a leading `-` used to parse as a lone MustNot clause (no hits)")]
@@ -1984,6 +2017,7 @@ impl TantivyIndexService {
             covered_files,
             ordinals_valid,
             bundle_head,
+            positional: true,
         };
         if !defer {
             upsert_manifest(self.object_store.as_ref(), table_name, project_id, manifest_key, entry.clone()).await?;

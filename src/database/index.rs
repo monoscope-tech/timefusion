@@ -264,7 +264,7 @@ impl Database {
     async fn group_uncovered_files_by_project(
         &self, svc: &crate::tantivy::search::TantivyIndexService, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, oversized: &mut u64,
         warn_skipped: bool,
-    ) -> anyhow::Result<(HashMap<String, Vec<String>>, HashMap<String, u64>, Arc<dyn object_store::ObjectStore>)> {
+    ) -> anyhow::Result<(HashMap<String, Vec<String>>, HashMap<String, Vec<String>>, HashMap<String, u64>, Arc<dyn object_store::ObjectStore>)> {
         let schema = crate::schema::get_schema(table_name).ok_or_else(|| anyhow::anyhow!("missing schema for index coverage: {table_name}"))?;
         let (uris, sizes, delta_store) = {
             let t = table_ref.read().await;
@@ -278,12 +278,14 @@ impl Database {
             .filter_map(|uri| Some((crate::tantivy::search::project_id_of_uri(&uri)?.to_string(), uri)))
             .into_group_map();
         let max_bytes = self.config.tantivy.timefusion_tantivy_backfill_max_file_mb * 1024 * 1024;
-        let mut result: HashMap<String, Vec<String>> = HashMap::with_capacity(by_pid.len());
+        let (mut result, mut stale): (HashMap<String, Vec<String>>, HashMap<String, Vec<String>>) = Default::default();
         for (pid, mut uris) in by_pid {
             let manifest = crate::tantivy::load_manifest(svc.object_store.as_ref(), table_name, &pid).await?;
-            let covered: HashSet<&String> =
-                manifest.entries.values().filter(|e| e.covers_current_elements(schema)).flat_map(|e| e.covered_files.iter()).collect();
-            uris.retain(|uri| !covered.contains(uri));
+            let covered_by = |current: fn(&crate::tantivy::ManifestEntry, &crate::schema::TableSchema) -> bool| -> HashSet<&String> {
+                manifest.entries.values().filter(|e| current(e, schema)).flat_map(|e| e.covered_files.iter()).collect()
+            };
+            let (current, serving) = (covered_by(crate::tantivy::ManifestEntry::covers_current_elements), covered_by(crate::tantivy::ManifestEntry::covers_current_fields));
+            uris.retain(|uri| !current.contains(uri));
             if max_bytes > 0 {
                 let before = uris.len();
                 uris.retain(|uri| crate::tantivy::search::parquet_rel_of_uri(uri).and_then(|rel| sizes.get(rel)).is_none_or(|size| *size <= max_bytes));
@@ -293,9 +295,11 @@ impl Database {
                     warn!(table_name, project_id = %pid, skipped, "tantivy backfill skipped files over TIMEFUSION_TANTIVY_BACKFILL_MAX_FILE_MB");
                 }
             }
-            result.insert(pid, uris);
+            let (served, uncovered): (Vec<String>, Vec<String>) = uris.into_iter().partition(|uri| serving.contains(uri));
+            result.insert(pid.clone(), uncovered);
+            stale.insert(pid, served);
         }
-        Ok((result, sizes, delta_store))
+        Ok((result, stale, sizes, delta_store))
     }
 
     /// Commit one project's deferred manifest entries. Best-effort: the blobs are already
@@ -326,13 +330,14 @@ impl Database {
     /// metadata only. Returns `(uncovered, oversized, by_age)`, `by_age` = `[today, 1-7d, older, future]`.
     pub async fn tantivy_coverage_census(&self) -> anyhow::Result<(u64, u64, [u64; 4])> {
         let Some(svc) = self.tantivy_indexer().cloned() else { return Ok((0, 0, [0; 4])) };
-        let (mut uncovered, mut oversized) = (0u64, 0u64);
+        let (mut uncovered, mut oversized, mut stale_files) = (0u64, 0u64, 0u64);
         let mut by_age = [0u64; 4];
         let today = crate::support::now_micros() / 86_400_000_000;
         for table_name in svc.config.indexed_tables().into_iter().filter(|t| svc.config.is_table_indexed(t)) {
             for root in self.table_roots(&table_name).await {
                 let Ok(table_ref) = self.resolve_table(&root, &table_name).await else { continue };
-                let (by_pid, ..) = self.group_uncovered_files_by_project(&svc, &table_ref, &table_name, &mut oversized, false).await?;
+                let (by_pid, stale, ..) = self.group_uncovered_files_by_project(&svc, &table_ref, &table_name, &mut oversized, false).await?;
+                stale_files = stale_files.saturating_add(stale.values().map(|v| v.len() as u64).sum());
                 for uri in by_pid.into_values().flatten() {
                     uncovered = uncovered.saturating_add(1);
                     // Partition date, not file mtime: a rewrite of old data is still old.
@@ -356,6 +361,7 @@ impl Database {
         // actionable is coverage lost on a date that is DONE being written.
         stats.tantivy_uncovered_sealed_files.store(by_age[1].saturating_add(by_age[2]), std::sync::atomic::Ordering::Relaxed);
         stats.tantivy_oversized_skipped.store(oversized, std::sync::atomic::Ordering::Relaxed);
+        stats.tantivy_stale_files.store(stale_files, std::sync::atomic::Ordering::Relaxed);
         Ok((uncovered, oversized, by_age))
     }
 
@@ -462,7 +468,7 @@ impl Database {
             let Ok(table_ref) = self.resolve_table(&root, table_name).await else {
                 continue;
             };
-            let (by_pid, sizes, delta_store) = self.group_uncovered_files_by_project(svc, &table_ref, table_name, &mut oversized_total, true).await?;
+            let (by_pid, mut stale, sizes, delta_store) = self.group_uncovered_files_by_project(svc, &table_ref, table_name, &mut oversized_total, true).await?;
             let stable_before = chrono::Utc::now().timestamp_millis() - TODAY_STABLE_MILLIS;
             let stable: HashSet<String> = table_ref
                 .read()
@@ -491,6 +497,12 @@ impl Database {
                     |uri: &str| parquet_rel_of_uri(uri).is_some_and(|rel| sizes.get(rel).is_some_and(|size| *size >= target) || stable.contains(rel));
                 skipped_today = skipped_today.saturating_add(drop_hot_partition(&mut uris, skip_today.as_deref(), converged));
                 sort_backfill_uris_newest_first(&mut uris);
+                // A stale index still answers queries; an uncovered file is a full scan. Stale
+                // rebuilds queue behind every uncovered file of the project.
+                let mut rebuilds = stale.remove(&pid).unwrap_or_default();
+                skipped_today = skipped_today.saturating_add(drop_hot_partition(&mut rebuilds, skip_today.as_deref(), converged));
+                sort_backfill_uris_newest_first(&mut rebuilds);
+                uris.extend(rebuilds);
                 let queue = uris.into_iter().filter_map(|uri| Some((parquet_rel_of_uri(&uri)?.to_string(), uri))).collect::<VecDeque<_>>();
                 queues.push((pid, queue));
             }

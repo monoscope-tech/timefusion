@@ -1198,6 +1198,10 @@ pub struct TantivyConfig {
     /// reader decodes only matching rows.
     #[serde_inline_default(true)]
     pub timefusion_tantivy_row_selection: bool,
+    /// Search `tf_ngram3p` indexes with one phrase per word, so candidates are exact
+    /// substrings. Kill switch: `false` falls back to the trigram conjunction, still sound.
+    #[serde_inline_default(true)]
+    pub timefusion_tantivy_phrase_queries: bool,
 }
 
 impl TantivyConfig {
