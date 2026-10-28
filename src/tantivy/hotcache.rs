@@ -223,12 +223,39 @@ fn read_table(r: &mut impl std::io::Read) -> anyhow::Result<BundleTable> {
 }
 
 /// Stream a bundle into `dest` as plain files; memory is one block.
-pub fn unpack_bundle(mut r: impl std::io::Read, dest: &Path) -> anyhow::Result<()> {
+/// Beside an install whose positions stayed in the bundle: the bundle head, and its blob path.
+pub const HEAD_FILE: &str = "bundle.head";
+pub const SOURCE_FILE: &str = "bundle.source";
+
+/// Copies what it reads into `.1`.
+struct Tee<'a, R>(&'a mut R, &'a mut Vec<u8>);
+
+impl<R: std::io::Read> std::io::Read for Tee<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.0.read(buf)?;
+        self.1.extend_from_slice(&buf[..n]);
+        Ok(n)
+    }
+}
+
+/// Unpack a bundle into `dest`. `remote_positions` leaves the `.pos` files (positional grams
+/// make them most of an index, and only phrase queries read them) in the bundle and saves its
+/// head as [`HEAD_FILE`], so [`LocalFirst`] can range-read them.
+pub fn unpack_bundle(mut r: impl std::io::Read, dest: &Path, remote_positions: bool) -> anyhow::Result<()> {
     use std::io::Write;
-    let table = read_table(&mut r)?;
-    std::io::copy(&mut std::io::Read::take(&mut r, table.hot.iter().map(|h| h.2).sum()), &mut std::io::sink())?;
+    let mut head = vec![];
+    let table = {
+        let mut tee = Tee(&mut r, &mut head);
+        let table = read_table(&mut tee)?;
+        std::io::copy(&mut std::io::Read::take(&mut tee, table.hot.iter().map(|h| h.2).sum()), &mut std::io::sink())?;
+        table
+    };
     let mut buf = vec![];
     for file in &table.files {
+        if remote_positions && file.name.ends_with(".pos") {
+            std::io::copy(&mut std::io::Read::take(&mut r, file.blocks.iter().map(|&b| u64::from(b)).sum()), &mut std::io::sink())?;
+            continue;
+        }
         let mut out = std::io::BufWriter::new(std::fs::File::create(dest.join(&file.name))?);
         for &size in &file.blocks {
             buf.resize(size as usize, 0);
@@ -236,6 +263,9 @@ pub fn unpack_bundle(mut r: impl std::io::Read, dest: &Path) -> anyhow::Result<(
             out.write_all(&zstd::bulk::decompress(&buf, BUNDLE_BLOCK)?)?;
         }
         out.flush()?;
+    }
+    if remote_positions {
+        std::fs::write(dest.join(HEAD_FILE), head)?;
     }
     Ok(())
 }
@@ -418,6 +448,44 @@ impl Directory for BundleDirectory {
     }
 }
 
+/// An installed index whose `.pos` files stayed in its bundle: local files first, the rest by
+/// range from `remote`.
+#[derive(Debug, Clone)]
+pub struct LocalFirst<L> {
+    pub local: L,
+    pub remote: BundleDirectory,
+}
+
+impl<L: Directory + Clone> Directory for LocalFirst<L> {
+    fn get_file_handle(&self, path: &Path) -> Result<Arc<dyn FileHandle>, OpenReadError> {
+        if self.local.exists(path)? { self.local.get_file_handle(path) } else { self.remote.get_file_handle(path) }
+    }
+    fn exists(&self, path: &Path) -> Result<bool, OpenReadError> {
+        Ok(self.local.exists(path)? || self.remote.exists(path)?)
+    }
+    fn atomic_read(&self, path: &Path) -> Result<Vec<u8>, OpenReadError> {
+        if self.local.exists(path)? { self.local.atomic_read(path) } else { self.remote.atomic_read(path) }
+    }
+    fn delete(&self, path: &Path) -> Result<(), DeleteError> {
+        self.local.delete(path)
+    }
+    fn open_write(&self, path: &Path) -> Result<WritePtr, OpenWriteError> {
+        self.local.open_write(path)
+    }
+    fn atomic_write(&self, path: &Path, data: &[u8]) -> io::Result<()> {
+        self.local.atomic_write(path, data)
+    }
+    fn sync_directory(&self) -> io::Result<()> {
+        self.local.sync_directory()
+    }
+    fn acquire_lock(&self, lock: &tantivy::directory::Lock) -> Result<tantivy::directory::DirectoryLock, tantivy::directory::error::LockError> {
+        self.local.acquire_lock(lock)
+    }
+    fn watch(&self, watch_callback: WatchCallback) -> tantivy::Result<WatchHandle> {
+        self.local.watch(watch_callback)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -492,6 +560,44 @@ mod tests {
             (c.0, c.1) = (c.0 + 1, c.1 + range.end - range.start);
             self.0.read(range)
         }
+    }
+
+    /// Positions left in the bundle: no `.pos` on disk, nothing remote to open, the same hits as
+    /// a whole install, and only a phrase reads positions.
+    #[test]
+    fn an_install_with_remote_positions_answers_like_a_whole_one() -> anyhow::Result<()> {
+        use tantivy::schema::{IndexRecordOption, TextFieldIndexing, TextOptions};
+        let (whole_dir, part_dir) = (tempfile::tempdir()?, tempfile::tempdir()?);
+        let mut schema = tantivy::schema::Schema::builder();
+        let indexing = TextFieldIndexing::default().set_tokenizer(crate::tantivy::NGRAM3P_TOKENIZER).set_index_option(IndexRecordOption::WithFreqsAndPositions);
+        let body = schema.add_text_field("body", TextOptions::default().set_indexing_options(indexing));
+        let index = tantivy::Index::create_in_dir(whole_dir.path(), schema.build())?;
+        crate::tantivy::register_tokenizers(&index);
+        let mut writer = index.writer::<tantivy::TantivyDocument>(15_000_000)?;
+        for (i, text) in ["ER_LOCK_DEADLOCK: Deadlock found", "deadlo then a lock", "read timeout"].iter().cycle().take(3000).enumerate() {
+            writer.add_document(tantivy::doc!(body => format!("{text} {i}")))?;
+        }
+        writer.commit()?;
+        let blob = pack_bundle(whole_dir.path(), 3)?;
+        unpack_bundle(&blob[..], part_dir.path(), true)?;
+        assert!(!std::fs::read_dir(part_dir.path())?.flatten().any(|e| e.path().extension().is_some_and(|x| x == "pos")), "positions stay remote");
+        let source = Arc::new(Counted(blob.clone(), Default::default()));
+        let remote = BundleDirectory::new(std::fs::read(part_dir.path().join(HEAD_FILE))?.into(), source.clone())?;
+        let hybrid = super::super::open_index_in(LocalFirst { local: tantivy::directory::MmapDirectory::open(part_dir.path())?, remote })?;
+        let whole = super::super::open_index(whole_dir.path())?;
+        assert_eq!(source.1.lock().0, 0, "opening reads nothing remote");
+        let count = |index: &tantivy::Index, query: &str| -> anyhow::Result<usize> {
+            let PredsQuery::Query(q) = build_node_query(index, &PredNode::Leaf(TextMatchPred { column: "body".into(), query: query.into() }))? else {
+                anyhow::bail!("body is indexed")
+            };
+            Ok(index.reader()?.searcher().search(&*q, &tantivy::collector::Count)?)
+        };
+        for (query, expected, phrase) in [("deadlock", 1000, true), ("timeout", 1000, true), ("loc", 2000, false)] {
+            let before = source.1.lock().1;
+            assert_eq!((count(&hybrid, query)?, count(&whole, query)?), (expected, expected), "{query}");
+            assert_eq!(source.1.lock().1 > before, phrase, "{query}: only a phrase reads positions");
+        }
+        Ok(())
     }
 
     /// Bundle size and per-query object reads for an unpacked prod index.

@@ -1221,7 +1221,7 @@ pub async fn convert_blob(store: &dyn ObjectStore, blob: &str, level: i32, scrat
     let dir = tmp.path().to_owned();
     // Streamed straight to disk: buffering a blob whole is what OOM'd installs on 09-30.
     let bundle = tokio::task::spawn_blocking(move || {
-        unpack_to_dir(tokio_util::io::SyncIoBridge::new(tokio_util::io::StreamReader::new(stream)), &dir)?;
+        unpack_to_dir(tokio_util::io::SyncIoBridge::new(tokio_util::io::StreamReader::new(stream)), &dir, false)?;
         hotcache::pack_bundle(&dir, level)
     })
     .await??;
@@ -1436,13 +1436,14 @@ pub fn pack_dir(dir: &Path, level: i32) -> Result<Bytes> {
 
 /// Stream-unpack a tar.zst blob into `dest`: peak memory is the decoder's
 /// buffers, never the blob or its decompressed tar.
-pub fn unpack_to_dir(mut blob: impl std::io::Read, dest: &Path) -> Result<()> {
+/// `remote_positions`: see [`hotcache::unpack_bundle`]; a `tar.zst` always unpacks whole.
+pub fn unpack_to_dir(mut blob: impl std::io::Read, dest: &Path, remote_positions: bool) -> Result<()> {
     std::fs::create_dir_all(dest).context("mkdir dest")?;
     let mut magic = [0; 4];
     blob.read_exact(&mut magic).context("read blob magic")?;
     let blob = std::io::Read::chain(&magic[..], blob);
     if hotcache::is_bundle(&magic) {
-        return hotcache::unpack_bundle(blob, dest).context("bundle unpack");
+        return hotcache::unpack_bundle(blob, dest, remote_positions).context("bundle unpack");
     }
     tar::Archive::new(zstd::Decoder::new(blob).context("zstd decoder")?).unpack(dest).context("tar unpack")
 }
