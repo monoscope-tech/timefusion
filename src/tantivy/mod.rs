@@ -464,6 +464,18 @@ mod builder_tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn a_blob_over_the_single_put_limit_uploads_in_parts() -> Result<()> {
+        let store = object_store::memory::InMemory::new();
+        let blob = Bytes::from((0..10_000u32).flat_map(u32::to_le_bytes).collect::<Vec<_>>());
+        for (name, single_put_max) in [("whole", usize::MAX), ("parts", 1_000)] {
+            let path = ObjPath::from(name);
+            upload_in_parts_above(&store, &path, blob.clone(), single_put_max, 4096).await?;
+            assert_eq!(download(&store, &path).await?, blob, "{name}");
+        }
+        Ok(())
+    }
+
     /// Positional grams go only where the index text IS the residual's text, and an entry
     /// built before them serves queries yet still queues for a rebuild.
     #[test_case("Utf8", None, true ; "a text column")]
@@ -1495,8 +1507,21 @@ pub fn open_index_in(dir: impl tantivy::Directory) -> Result<Index> {
     Ok(index)
 }
 
+/// S3 and R2 reject one PUT over 5 GiB, and a positional index of a busy day crosses it.
+const SINGLE_PUT_MAX: usize = 1 << 30;
+const UPLOAD_PART: usize = 256 << 20;
+
 pub async fn upload(store: &dyn ObjectStore, path: &ObjPath, blob: Bytes) -> Result<()> {
-    store.put(path, blob.into()).await.with_context(|| format!("upload {path}")).map(drop)
+    upload_in_parts_above(store, path, blob, SINGLE_PUT_MAX, UPLOAD_PART).await
+}
+
+async fn upload_in_parts_above(store: &dyn ObjectStore, path: &ObjPath, blob: Bytes, single_put_max: usize, part: usize) -> Result<()> {
+    if blob.len() <= single_put_max {
+        return store.put(path, blob.into()).await.with_context(|| format!("upload {path}")).map(drop);
+    }
+    let mut parts = object_store::WriteMultipart::new_with_chunk_size(store.put_multipart(path).await.with_context(|| format!("start upload {path}"))?, part);
+    parts.put(blob);
+    parts.finish().await.with_context(|| format!("upload {path} in parts")).map(drop)
 }
 
 pub async fn download(store: &dyn ObjectStore, path: &ObjPath) -> Result<Bytes> {
