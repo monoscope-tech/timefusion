@@ -559,7 +559,7 @@ impl Database {
                         pending.entry(pid.clone()).or_default().push(entry);
                         pending_since.entry(pid.clone()).or_insert_with(std::time::Instant::now);
                     }
-                    Err(e) => warn!("tantivy backfill build failed table={} project={}: {}", table_name, pid, e),
+                    Err(e) => warn!("tantivy backfill build failed table={} project={}: {:#}", table_name, pid, e),
                 }
                 // Swept over EVERY pending project: checking only `pid` leaves the age bound
                 // unreachable for a project with one build per pass.
