@@ -1084,9 +1084,11 @@ pub struct TantivyConfig {
     pub timefusion_tantivy_min_files_for_pushdown: usize,
     /// If a tantivy prefilter would produce more than this many hits, skip
     /// the `id IN (...)` pushdown entirely — planning cost grows with the
-    /// literal count, so above this the pushdown is slower than the scan it
-    /// replaces.
-    #[serde_inline_default(2_000)]
+    /// literal count (~0.11 s per 1,000 ids). A/B on prod 2026-10-30: a word
+    /// sparse near now but over 2,000 across 30d fell back to a 42 s scan and
+    /// took 1.7-2.8 s at 10,000; dense words were unchanged (their capped scans
+    /// stop early under LIMIT). Runtime FLAG: `timefusion_tantivy_prefilter_max_hits`.
+    #[serde_inline_default(10_000)]
     pub timefusion_tantivy_prefilter_max_hits: usize,
     /// If a tantivy prefilter selects more than this percentage of the
     /// indexed rows, the pushdown isn't worth the round-trip; skip it and
@@ -2493,6 +2495,7 @@ mod tests {
         let cfg: TantivyConfig = serde_json::from_str("{}").expect("every field has a default");
         assert!(cfg.seed_cache_on_publish(), "a published index must be kept locally by default");
         assert_eq!(cfg.timefusion_tantivy_prefetch_days, 3, "the hot window must be warmed by default");
+        assert_eq!(cfg.prefilter_max_hits(), 10_000, "a sparse word over 2,000 hits fell back to a whole-window scan");
         assert_eq!(cfg.search_concurrency(), 32);
         assert_eq!(cfg.reader_cache_entries().get(), 2048);
         assert_eq!(cfg.manifest_ttl(), Duration::from_secs(3600));
