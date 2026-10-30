@@ -7253,8 +7253,16 @@ fn build_writer_properties(
                 _ => builder,
             };
 
-            // Explicit per-column dict opt-out; Some(true)/None leaves defaults intact.
-            let builder = if field.dictionary == Some(false) { builder.set_column_dictionary_enabled(col.clone(), false) } else { builder };
+            // Explicit per-column dict opt-out; Some(true)/None leaves defaults intact. A Variant is
+            // stored as its `metadata` and `value` leaves, which a top-level path does not reach.
+            let leaves = match dt {
+                "Variant" => ["metadata", "value"].map(|leaf| ColumnPath::new(vec![field.name.clone(), leaf.into()])).to_vec(),
+                _ => vec![col.clone()],
+            };
+            let builder = match field.dictionary {
+                Some(false) => leaves.into_iter().fold(builder, |b, leaf| b.set_column_dictionary_enabled(leaf, false)),
+                _ => builder,
+            };
 
             if field.bloom_filter && !parquet_cfg.timefusion_bloom_filter_disabled {
                 builder
@@ -7812,12 +7820,25 @@ mod writer_properties_tests {
     #[test_case("ts" => (Some(Encoding::DELTA_BINARY_PACKED), false) ; "timestamp uses delta binary packed and no dict")]
     #[test_case("n" => matches (Some(Encoding::DELTA_BINARY_PACKED), _) ; "int uses delta binary packed")]
     #[test_case("stacktrace" => matches (_, false) ; "dictionary opt-out disables dict")]
+    #[test_case("body.value" => matches (_, false) ; "a Variant opt-out reaches its value leaf")]
+    #[test_case("body.metadata" => matches (_, false) ; "a Variant opt-out reaches its metadata leaf")]
+    #[test_case("events.value" => matches (_, true) ; "a Variant without the opt-out keeps its dictionary")]
     fn column_encoding_and_dictionary(col: &str) -> (Option<Encoding>, bool) {
-        let mut no_dict = field("stacktrace", "Utf8");
-        no_dict.dictionary = Some(false);
-        let sch = schema_with(vec![field("id", "Utf8"), field("ts", "Timestamp(Nanosecond, None)"), field("n", "Int64"), no_dict], vec!["id"]);
+        let no_dict = |name: &str, dt: &str| FieldDef { dictionary: Some(false), ..field(name, dt) };
+        let sch = schema_with(
+            vec![
+                field("id", "Utf8"),
+                field("ts", "Timestamp(Nanosecond, None)"),
+                field("n", "Int64"),
+                no_dict("stacktrace", "Utf8"),
+                no_dict("body", "Variant"),
+                field("events", "Variant"),
+            ],
+            vec!["id"],
+        );
         let p = build_writer_properties(&cfg(), &sch, 3, true, None);
-        (p.encoding(&ColumnPath::from(col)), p.dictionary_enabled(&ColumnPath::from(col)))
+        let path = ColumnPath::new(col.split('.').map(String::from).collect());
+        (p.encoding(&path), p.dictionary_enabled(&path))
     }
 
     // Page-level stats only on declared sort keys; wide columns get chunk-level

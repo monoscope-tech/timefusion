@@ -135,10 +135,14 @@ fields:
   - name: body
     data_type: Variant
     nullable: true
+    # Off: a search candidate decodes its row group's whole dictionary. On a 2M-row
+    # Shipbubble file, body+duration without one: +2.3% bytes, -76% read, ~9x faster.
+    dictionary: false
     tantivy: { indexed: true, tokenizer: ngram3, flatten: json }
   - name: duration
     data_type: Int64
     nullable: true
+    dictionary: false
   - name: start_time
     data_type: 'Timestamp(Microsecond, Some("UTC"))'
     nullable: true
