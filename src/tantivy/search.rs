@@ -52,6 +52,15 @@ pub struct SearchStats {
     /// Ranged reads of bundles in place of whole-blob installs.
     pub range_reads: AtomicU64,
     pub range_read_bytes: AtomicU64,
+    /// Bundle ranges served by the disk cache instead of the object store.
+    pub range_disk_hits: AtomicU64,
+    pub range_disk_hit_bytes: AtomicU64,
+    /// `range_read_bytes` by index file kind; the rest is everything else.
+    pub range_read_fast_bytes: AtomicU64,
+    pub range_read_terms_bytes: AtomicU64,
+    pub range_read_store_bytes: AtomicU64,
+    /// Positions: what phrase queries over installs that left them remote cost.
+    pub range_read_pos_bytes: AtomicU64,
     pub bundle_opens: AtomicU64,
     /// Per-index searches running at once, and the most ever; 1 means the fan-out serialized.
     pub parallel_searches: AtomicU64,
@@ -175,6 +184,9 @@ pub struct TantivySearchService {
     /// (not global) so distinct object stores never cross-contaminate.
     manifests: DashMap<(String, String), CachedManifest>,
     block_cache: super::hotcache::BlockCache,
+    /// Disk tier under `block_cache`: bundles are immutable (every publish takes a fresh
+    /// generation path), so their ranges survive restarts there.
+    disk_cache: Option<Arc<crate::storage::SharedFoyerCache>>,
     /// Last time each cache dir was served to a query — the reaper's recency
     /// signal, since mmap reads don't reliably move a directory's atime. Dirs
     /// absent here fall back to dir mtime, which is their unpack time.
@@ -217,8 +229,11 @@ const MAX_QUEUED_WARMS: usize = 64;
 const BUNDLE_CONVERSIONS: usize = 2;
 const CAP_EXCEEDED_TTL: Duration = Duration::from_secs(600);
 
-/// Index entries a rewrite may carry onto its output before it is rebuilt as one.
-const MAX_CARRIED_ENTRIES: usize = 8;
+/// Index entries a rewrite may carry onto its output before it is rebuilt as one. Today's
+/// partition stays below the packing target, so the backfill never consolidates it: at 8,
+/// 33 files of one project were searched as 260 indexes. Hot-tail outputs are small, so a
+/// rebuild is cheap.
+const MAX_CARRIED_ENTRIES: usize = 2;
 
 fn window_width(time_range: Option<(i64, i64)>) -> u64 {
     time_range.map_or(u64::MAX, |(lo, hi)| hi.abs_diff(lo))
@@ -311,6 +326,7 @@ impl TantivySearchService {
             cache_root,
             readers: Mutex::new(LruCache::new(config.reader_cache_entries())),
             block_cache: super::hotcache::block_cache(config.timefusion_tantivy_block_cache_mb << 20),
+            disk_cache: None,
             config,
             stats: Default::default(),
             manifests: DashMap::new(),
@@ -322,6 +338,11 @@ impl TantivySearchService {
             warm_queue: Arc::new(tokio::sync::Semaphore::new(MAX_QUEUED_WARMS)),
             warm_permits: tokio::sync::Semaphore::new(MAX_CONCURRENT_WARMS),
         }
+    }
+
+    pub fn with_disk_cache(mut self, cache: Option<Arc<crate::storage::SharedFoyerCache>>) -> Self {
+        self.disk_cache = cache;
+        self
     }
 
     /// Single-predicate convenience used by tests/tools.
@@ -506,7 +527,7 @@ impl TantivySearchService {
             let file_uuid = file_uuid(&key);
             let prepare_started = Instant::now();
             let opened = self.open_index(table, project_id, file_uuid, &blob_path, bundle).await?;
-            let bundled = opened.is_left();
+            let bundled = reads_by_range(&opened);
             // The rest is synchronous, CPU-bound tantivy work that yields nowhere. On a
             // blocking thread of its own, not `block_in_place`: that parks this whole fan-out
             // task, so `buffer_unordered` ran the searches one at a time (30d: 377 x ~17 ms).
@@ -703,7 +724,7 @@ impl TantivySearchService {
             let query = query.clone();
             async move {
                 let opened = self.open_index(table, project_id, file_uuid(&key), &blob, bundle).await?;
-                let bundled = opened.is_left();
+                let bundled = reads_by_range(&opened);
                 let me = Arc::clone(self);
                 tokio::task::spawn_blocking(move || -> Result<(Vec<i64>, Vec<String>)> {
                     let (index, reader) = me.opened(opened)?;
@@ -886,7 +907,14 @@ impl TantivySearchService {
             return Ok(v.clone());
         }
         let started = Instant::now();
-        let index = super::open_index(dir)?;
+        let index = match std::fs::read(dir.join(super::hotcache::HEAD_FILE)) {
+            Ok(head) => {
+                let blob = std::fs::read_to_string(dir.join(super::hotcache::SOURCE_FILE)).context("read bundle source")?;
+                let local = tantivy::directory::MmapDirectory::open(dir).map_err(|e| anyhow!("open mmap dir: {e}"))?;
+                super::open_index_in(super::hotcache::LocalFirst { local, remote: self.bundle_directory(&blob, head.into())? })?
+            }
+            Err(_) => super::open_index(dir)?,
+        };
         let reader = index.reader().map_err(|e| anyhow!("open reader: {e}"))?;
         SearchStats::timed(&self.stats.index_opens, &self.stats.index_open_us, started);
         self.readers.lock().put(dir.to_path_buf(), (index.clone(), reader.clone()));
@@ -913,6 +941,23 @@ impl TantivySearchService {
         opened.either(Ok, |dir| self.open_cached(&dir))
     }
 
+    /// `blob_path`'s bundle, read by range through the block and disk caches. Building one is
+    /// IO-free: `head` already holds what opening reads.
+    fn bundle_directory(&self, blob_path: &str, head: bytes::Bytes) -> Result<super::hotcache::BundleDirectory> {
+        let source = Arc::new(StoreSource {
+            store: self.object_store.clone(),
+            path: ObjPath::from(blob_path),
+            rt: tokio::runtime::Handle::current(),
+            stats: self.stats.clone(),
+            disk_cache: self.disk_cache.clone(),
+            len: std::sync::OnceLock::new(),
+        });
+        let bundle = std::hash::BuildHasher::hash_one(&std::hash::BuildHasherDefault::<std::collections::hash_map::DefaultHasher>::default(), blob_path);
+        let directory = super::hotcache::BundleDirectory::new(head, source.clone())?;
+        let _ = source.len.set(directory.bundle_len());
+        Ok(directory.with_cache(bundle, self.block_cache.clone()))
+    }
+
     /// A bundle searched in place: one GET of its head opens it, later reads go by range
     /// through the shared block cache. Cached alongside installed indexes, keyed by blob.
     async fn open_bundle(&self, blob_path: &str, head_len: u64) -> Result<(Index, IndexReader)> {
@@ -921,12 +966,8 @@ impl TantivySearchService {
             SearchStats::add(&self.stats.reader_hits, 1);
             return Ok(v.clone());
         }
-        let path = ObjPath::from(blob_path);
-        let head = self.object_store.get_range(&path, 0..head_len).await.with_context(|| format!("get head of {path}"))?;
-        let source = Arc::new(StoreSource { store: self.object_store.clone(), path, rt: tokio::runtime::Handle::current(), stats: self.stats.clone() });
-        let bundle = std::hash::BuildHasher::hash_one(&std::hash::BuildHasherDefault::<std::collections::hash_map::DefaultHasher>::default(), blob_path);
-        let directory = super::hotcache::BundleDirectory::new(head, source)?.with_cache(bundle, self.block_cache.clone());
-        let index = super::open_index_in(directory)?;
+        let head = self.object_store.get_range(&ObjPath::from(blob_path), 0..head_len).await.with_context(|| format!("get head of {blob_path}"))?;
+        let index = super::open_index_in(self.bundle_directory(blob_path, head)?)?;
         let reader = index.reader().map_err(|e| anyhow!("open bundle reader: {e}"))?;
         SearchStats::add(&self.stats.bundle_opens, 1);
         self.readers.lock().put(key, (index.clone(), reader.clone()));
@@ -959,7 +1000,7 @@ impl TantivySearchService {
             let target = dir.clone();
             tokio::task::spawn_blocking(move || {
                 let _permit = permit;
-                install_blob_into_cache(&target, tokio_util::io::SyncIoBridge::new(tokio_util::io::StreamReader::new(stream)))
+                install_blob_into_cache(&target, tokio_util::io::SyncIoBridge::new(tokio_util::io::StreamReader::new(stream)), path.as_ref())
             })
             .await??;
             SearchStats::timed(&self.stats.blob_fetches, &self.stats.blob_fetch_us, started);
@@ -1093,11 +1134,16 @@ fn cache_generation_key(key: &str, blob: &str) -> String {
 ///
 /// Deliberately does NOT stamp `last_used` — a seeded dir's mtime is its unpack
 /// time, which already sorts it as newest for the reaper.
-fn install_blob_into_cache(dir: &Path, blob: impl std::io::Read) -> Result<()> {
+/// Positions stay in the bundle (`blob_path`), read by range only by phrase queries: they are
+/// most of a positional index, and installing them would not fit the hot window on local disk.
+fn install_blob_into_cache(dir: &Path, blob: impl std::io::Read, blob_path: &str) -> Result<()> {
     let parent = dir.parent().ok_or_else(|| anyhow!("cache path has no parent"))?;
     std::fs::create_dir_all(parent).context("mkdir cache parent")?;
     let tmp = tempfile::TempDir::new_in(parent).context("tempdir for unpack")?;
-    super::unpack_to_dir(blob, tmp.path())?;
+    super::unpack_to_dir(blob, tmp.path(), true)?;
+    if tmp.path().join(super::hotcache::HEAD_FILE).exists() {
+        std::fs::write(tmp.path().join(super::hotcache::SOURCE_FILE), blob_path).context("write bundle source")?;
+    }
     // Bound in a `let` so the `tmp.path()` borrow ends before the arms move `tmp`.
     let renamed = std::fs::rename(tmp.path(), dir);
     match renamed {
@@ -1144,18 +1190,94 @@ struct StoreSource {
     path: ObjPath,
     rt: tokio::runtime::Handle,
     stats: Arc<SearchStats>,
+    disk_cache: Option<Arc<crate::storage::SharedFoyerCache>>,
+    /// Bundle length, known once its head is parsed; clamps the last disk chunk.
+    len: std::sync::OnceLock<u64>,
+}
+
+/// Disk-cache granularity for bundle ranges. Aligned, so a read is served whatever runs of
+/// blocks the in-memory cache happens to be missing: exact-range keys missed whenever a
+/// partly evicted index asked for a different run (prod: 828 MB refetched from S3).
+/// Two bundle blocks: replaying real cold phrase searches, 1 MiB fetched 5.5x the bytes
+/// asked for and 128 KiB 1.6x, for 8% more GETs (each read is one run either way).
+const DISK_CHUNK: u64 = 128 << 10;
+
+/// The chunk's disk-cache key. It names the chunk size, because the disk tier outlives the
+/// process: a chunk cached at another size holds other bytes under the same index.
+fn disk_chunk_key(path: &ObjPath, chunk: u64) -> String {
+    format!("tantivy-chunk-{DISK_CHUNK}:{path}:{chunk}")
+}
+
+impl StoreSource {
+    async fn fetch(&self, range: std::ops::Range<u64>) -> std::io::Result<bytes::Bytes> {
+        SearchStats::add(&self.stats.range_reads, 1);
+        SearchStats::add(&self.stats.range_read_bytes, range.end - range.start);
+        self.store.get_range(&self.path, range).await.map_err(std::io::Error::other)
+    }
+
+    async fn read_chunked(&self, range: std::ops::Range<u64>, cache: &crate::storage::SharedFoyerCache, len: u64) -> std::io::Result<bytes::Bytes> {
+        let chunks: Vec<u64> = (range.start / DISK_CHUNK..=(range.end - 1) / DISK_CHUNK).collect();
+        let key = |chunk: u64| disk_chunk_key(&self.path, chunk);
+        let mut got = futures::future::join_all(chunks.iter().map(|&chunk| async move { cache.get_immutable(&key(chunk)).await })).await;
+        for bytes in got.iter().flatten() {
+            SearchStats::add(&self.stats.range_disk_hits, 1);
+            SearchStats::add(&self.stats.range_disk_hit_bytes, bytes.len() as u64);
+        }
+        let missing = (0..chunks.len()).filter(|&i| got[i].is_none()).collect_vec();
+        for run in missing.chunk_by(|a, b| a + 1 == *b) {
+            let (lo, hi) = (chunks[run[0]], chunks[run[run.len() - 1]]);
+            let span = self.fetch(lo * DISK_CHUNK..((hi + 1) * DISK_CHUNK).min(len)).await?;
+            for &i in run {
+                let at = ((chunks[i] - lo) * DISK_CHUNK) as usize;
+                let chunk = span.slice(at..(at + DISK_CHUNK as usize).min(span.len()));
+                cache.put_immutable(key(chunks[i]), chunk.clone());
+                got[i] = Some(chunk);
+            }
+        }
+        let mut out = Vec::with_capacity((range.end - range.start) as usize);
+        for (chunk, bytes) in chunks.iter().zip(got.iter().flatten()) {
+            let start = (range.start.saturating_sub(chunk * DISK_CHUNK) as usize).min(bytes.len());
+            let end = ((range.end - chunk * DISK_CHUNK) as usize).min(bytes.len());
+            out.extend_from_slice(&bytes[start..end]);
+        }
+        Ok(out.into())
+    }
 }
 
 impl super::hotcache::BundleSource for StoreSource {
+    fn read_file(&self, range: std::ops::Range<u64>, file: &Path) -> std::io::Result<bytes::Bytes> {
+        let kind = match file.extension().and_then(|e| e.to_str()) {
+            Some("fast") => Some(&self.stats.range_read_fast_bytes),
+            Some("term" | "idx") => Some(&self.stats.range_read_terms_bytes),
+            Some("pos") => Some(&self.stats.range_read_pos_bytes),
+            Some("store") => Some(&self.stats.range_read_store_bytes),
+            _ => None,
+        };
+        if let Some(kind) = kind {
+            SearchStats::add(kind, range.end - range.start);
+        }
+        self.read(range)
+    }
     fn read(&self, range: std::ops::Range<u64>) -> std::io::Result<bytes::Bytes> {
-        SearchStats::add(&self.stats.range_reads, 1);
-        SearchStats::add(&self.stats.range_read_bytes, range.end - range.start);
-        let fetch = || self.rt.block_on(self.store.get_range(&self.path, range)).map_err(std::io::Error::other);
+        let fetch = || {
+            self.rt.block_on(async {
+                match (&self.disk_cache, self.len.get()) {
+                    (Some(cache), Some(&len)) if range.start < range.end => self.read_chunked(range.clone(), cache, len).await,
+                    _ => self.fetch(range.clone()).await,
+                }
+            })
+        };
         match tokio::runtime::Handle::try_current() {
             Ok(_) => std::thread::scope(|s| s.spawn(fetch).join()).map_err(|_| std::io::Error::other("bundle fetch panicked"))?,
             Err(_) => fetch(),
         }
     }
+}
+
+/// Opened from a bundle, or installed with its positions left in one: reads it makes go by
+/// range, so `hotcache::warm` must fetch them in parallel first.
+fn reads_by_range(opened: &Either<(Index, IndexReader), PathBuf>) -> bool {
+    opened.as_ref().right().is_none_or(|dir| dir.join(super::hotcache::HEAD_FILE).exists())
 }
 
 /// True if `dir` already holds an extracted index (a `seg*` file or `meta.json`).
@@ -1270,7 +1392,7 @@ mod tests {
         let (tmp, blob) = (tempfile::tempdir().unwrap(), packed_blob(8 << 20));
         let dir = tmp.path().join("idx");
         let mut probe = Probe { inner: &blob[..], root: tmp.path(), streamed: false };
-        super::install_blob_into_cache(&dir, &mut probe).unwrap();
+        super::install_blob_into_cache(&dir, &mut probe, "blob").unwrap();
         assert!(probe.streamed, "unpack must write while the blob is still being read");
         assert_eq!(std::fs::metadata(dir.join("seg0.store")).unwrap().len(), 8 << 20);
     }
@@ -1353,11 +1475,11 @@ mod tests {
 use tantivy::{
     Order, Searcher, TantivyDocument, Term,
     collector::TopDocs,
-    query::{BooleanQuery, Occur, Query, QueryParser, RangeQuery, TermQuery},
+    query::{BooleanQuery, Occur, PhraseQuery, Query, QueryParser, RangeQuery, TermQuery},
     schema::{Field, FieldType, IndexRecordOption, Value},
 };
 
-use crate::tantivy::{ID_FIELD, NGRAM3_TOKENIZER, ROW_ORDINAL_FIELD, TS_FIELD};
+use crate::tantivy::{ID_FIELD, ROW_ORDINAL_FIELD, TS_FIELD};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Hit {
@@ -1399,7 +1521,9 @@ pub fn build_node_query(index: &Index, node: &PredNode) -> Result<PredsQuery> {
                 // substring). On raw/default it carries real prefix semantics
                 // that a conjunction of whole terms would UNDER-match, so those
                 // keep the parser.
-                Some(tok) if tok.as_str() == NGRAM3_TOKENIZER || !p.query.ends_with('*') => analyzed_conjunction_query(index, field, tok, &p.query)?,
+                Some(tok) if super::is_ngram3_family(tok) || !p.query.ends_with('*') => {
+                    analyzed_conjunction_query(index, field, tok, &p.query, phrase_queries_enabled())?
+                }
                 // A raw value is ONE term, so a prefix is a walk of the term dictionary. The
                 // parser's prefix query matched nothing on raw fields, and the prefilter then
                 // dropped every indexed row (`id LIKE 'e%'`: 573 of 19,056).
@@ -1445,25 +1569,41 @@ pub fn build_node_query(index: &Index, node: &PredNode) -> Result<PredsQuery> {
 /// A conjunction over-selects relative to a phrase query, which is always sound
 /// for a prefilter. A word too short to produce a token is dropped (broadens);
 /// a literal yielding no token at all errors out into a full scan.
-fn analyzed_conjunction_query(index: &Index, field: Field, tokenizer: &str, query: &str) -> Result<Box<dyn Query>> {
+/// `TIMEFUSION_TANTIVY_PHRASE_QUERIES`, the kill switch for positional phrases; on when unconfigured.
+fn phrase_queries_enabled() -> bool {
+    crate::config::try_config().is_none_or(|c| c.tantivy.timefusion_tantivy_phrase_queries)
+}
+
+fn analyzed_conjunction_query(index: &Index, field: Field, tokenizer: &str, query: &str, phrases: bool) -> Result<Box<dyn Query>> {
     let mut analyzer = index.tokenizers().get(tokenizer).ok_or_else(|| anyhow!("tokenizer {tokenizer} not registered"))?;
     // ngram3 requires each whitespace-separated word independently. The others
     // must see the WHOLE literal: `default` splits it itself and `raw` indexes
     // the value as one token, so pre-splitting would under-match.
-    let words: Vec<&str> = if tokenizer == NGRAM3_TOKENIZER { query.split_whitespace().collect() } else { vec![query] };
-    let clauses: Vec<(Occur, Box<dyn Query>)> = words
-        .iter()
-        // Plan-time classification appends `*` for `LIKE 'foo%'`; on a 3-gram
-        // field prefix ⊆ substring, so dropping the marker keeps the prefilter a
-        // superset. (Non-ngram3 `*` queries never reach here — see the caller.)
-        .flat_map(|word| {
-            let mut terms = Vec::new();
-            analyzer.token_stream(word.trim_end_matches('*')).process(&mut |t| terms.push(t.text.clone()));
-            terms
-        })
-        .unique()
-        .map(|t| (Occur::Must, Box::new(TermQuery::new(Term::from_field_text(field, &t), IndexRecordOption::Basic)) as Box<dyn Query>))
-        .collect();
+    let words: Vec<&str> = if super::is_ngram3_family(tokenizer) { query.split_whitespace().collect() } else { vec![query] };
+    // Plan-time classification appends `*` for `LIKE 'foo%'`; on a 3-gram
+    // field prefix ⊆ substring, so dropping the marker keeps the prefilter a
+    // superset. (Non-ngram3 `*` queries never reach here — see the caller.)
+    let mut tokens = |word: &str| {
+        let mut terms = Vec::new();
+        analyzer.token_stream(word.trim_end_matches('*')).process(&mut |t| terms.push((t.position, Term::from_field_text(field, &t.text))));
+        terms
+    };
+    let term = |t: Term| Box::new(TermQuery::new(t, IndexRecordOption::Basic)) as Box<dyn Query>;
+    // Positional grams make each word one phrase: its grams at their own offsets, i.e. the word
+    // as a substring of one indexed value.
+    let phrase = phrases && tokenizer == super::NGRAM3P_TOKENIZER;
+    let clauses: Vec<(Occur, Box<dyn Query>)> = if phrase {
+        words
+            .iter()
+            .map(|w| tokens(w))
+            .filter(|grams| !grams.is_empty())
+            .map(|mut grams| {
+                (Occur::Must, if grams.len() == 1 { term(grams.remove(0).1) } else { Box::new(PhraseQuery::new_with_offset(grams)) as Box<dyn Query> })
+            })
+            .collect()
+    } else {
+        words.iter().flat_map(|w| tokens(w)).map(|(_, t)| t).unique().map(|t| (Occur::Must, term(t))).collect()
+    };
     if clauses.is_empty() {
         return Err(anyhow!("query '{query}' produces no {tokenizer} terms"));
     }
@@ -1527,6 +1667,75 @@ pub fn query_with_searcher(searcher: &Searcher, query: &dyn Query, limit: Option
 }
 
 #[cfg(test)]
+mod disk_chunk_tests {
+    use super::*;
+
+    /// A range the disk tier has never seen whole is still served from its aligned chunks:
+    /// a partly evicted index asks for different runs than the read that filled the cache.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_overlapping_range_is_served_from_disk_chunks() {
+        use object_store::ObjectStoreExt;
+        let len = 3 * DISK_CHUNK + 12_345;
+        let blob: Vec<u8> = (0..len).map(|i| (i * 7 % 253) as u8).collect();
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let path = ObjPath::from("indexes/x.bundle");
+        store.put(&path, blob.clone().into()).await.unwrap();
+        let disk = Arc::new(crate::storage::SharedFoyerCache::new(crate::storage::FoyerCacheConfig::test_config("disk_chunks")).await.unwrap());
+        let source = || {
+            let source = StoreSource {
+                store: store.clone(),
+                path: path.clone(),
+                rt: tokio::runtime::Handle::current(),
+                stats: Default::default(),
+                disk_cache: Some(disk.clone()),
+                len: std::sync::OnceLock::new(),
+            };
+            let _ = source.len.set(len);
+            source
+        };
+        let first = source();
+        assert_eq!(super::super::hotcache::BundleSource::read(&first, 0..len).unwrap(), &blob[..]);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        // A new range per attempt, so only the first read's chunks can serve it.
+        for attempt in 0u64.. {
+            let later = source();
+            let range = DISK_CHUNK / 2 + attempt..2 * DISK_CHUNK + 777 + attempt;
+            assert_eq!(super::super::hotcache::BundleSource::read(&later, range.clone()).unwrap(), &blob[range.start as usize..range.end as usize]);
+            if later.stats.range_reads.load(Ordering::Relaxed) == 0 {
+                break;
+            }
+            assert!(Instant::now() < deadline, "an overlapping range must be served from the chunks the first read cached");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// A chunk left on disk by a binary with another chunk size is never served: the key
+    /// names the size, so it misses instead of returning that size's bytes for this offset.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_chunk_cached_at_another_size_is_not_served() {
+        use object_store::ObjectStoreExt;
+        let len = 4 * DISK_CHUNK;
+        let blob: Vec<u8> = (0..len).map(|i| (i * 7 % 253) as u8).collect();
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let path = ObjPath::from("indexes/y.bundle");
+        store.put(&path, blob.clone().into()).await.unwrap();
+        let disk = Arc::new(crate::storage::SharedFoyerCache::new(crate::storage::FoyerCacheConfig::test_config("disk_chunk_size")).await.unwrap());
+        disk.put_immutable(format!("tantivy-chunk:{path}:1"), bytes::Bytes::from(vec![0xAA; DISK_CHUNK as usize]));
+        let source = StoreSource {
+            store,
+            path,
+            rt: tokio::runtime::Handle::current(),
+            stats: Default::default(),
+            disk_cache: Some(disk),
+            len: std::sync::OnceLock::new(),
+        };
+        let _ = source.len.set(len);
+        let range = DISK_CHUNK..2 * DISK_CHUNK;
+        assert_eq!(super::super::hotcache::BundleSource::read(&source, range.clone()).unwrap(), &blob[range.start as usize..range.end as usize]);
+    }
+}
+
+#[cfg(test)]
 mod reader_tests {
     use std::sync::LazyLock;
 
@@ -1553,14 +1762,20 @@ mod reader_tests {
             dedup_tiebreak: None,
             tombstone_column: None,
             version_append: false,
-            fields: ["body", "level"]
+            fields: ["body", "level", "legacy"]
                 .into_iter()
                 .map(|name| FieldDef {
                     name: name.into(),
                     data_type: "String".into(),
                     nullable: true,
-                    // body → ngram3 (default), level → raw single token.
-                    tantivy: Some(TantivyFieldConfig { indexed: true, tokenizer: (name == "level").then(|| "raw".to_string()), ..Default::default() }),
+                    // body → positional ngram3 (default), level → raw single token, legacy → the
+                    // position-free ngram3 every pre-`tf_ngram3p` index holds (kv flatten keeps it).
+                    tantivy: Some(TantivyFieldConfig {
+                        indexed: true,
+                        tokenizer: (name == "level").then(|| "raw".to_string()),
+                        flatten: (name == "legacy").then(|| "kv".to_string()),
+                        ..Default::default()
+                    }),
                     ..Default::default()
                 })
                 .collect(),
@@ -1568,11 +1783,19 @@ mod reader_tests {
         let built = build_for_table(&table);
         let index = Index::create_in_ram(built.schema.clone());
         crate::tantivy::register_tokenizers(&index);
-        let (body, level) = (built.user_fields["body"].field, built.user_fields["level"].field);
+        let (body, level, legacy) = (built.user_fields["body"].field, built.user_fields["level"].field, built.user_fields["legacy"].field);
         let mut w = index.writer(15_000_000).expect("writer");
-        let docs = [("accept -header now", "-alpha"), ("err -1234 code", "ERROR"), ("foo NOT bar baz", "two words"), ("unrelated payload", "INFO")];
+        let docs = [
+            ("accept -header now", "-alpha"),
+            ("err -1234 code", "ERROR"),
+            ("foo NOT bar baz", "two words"),
+            ("unrelated payload", "INFO"),
+            ("deadlo then a lock", "INFO"),
+            (r#"{"err":"ER_LOCK_DEADLOCK: Deadlock found"}"#, "WARN"),
+            ("Ünïcödé façade straße", "INFO"),
+        ];
         for (i, (text, lvl)) in docs.iter().enumerate() {
-            w.add_document(doc!(built.timestamp => i as i64, built.id => format!("id{i}"), body => *text, level => *lvl)).expect("add");
+            w.add_document(doc!(built.timestamp => i as i64, built.id => format!("id{i}"), body => *text, level => *lvl, legacy => *text)).expect("add");
         }
         w.commit().expect("commit");
         index
@@ -1600,6 +1823,19 @@ mod reader_tests {
     #[test_case("body", "zzzqqq" => Ok(String::new()) ; "still selective: literal in no doc returns nothing")]
     #[test_case("body", "header xy" => Ok("id0".to_string()) ; "a <3-char word yields no trigram, is dropped (broadens), never empties")]
     #[test_case("body", "xy" => matches Err(_) ; "nothing left to query: all-short literal errors so callers scan")]
+    // Positional grams: a word matches only as a substring, so every trigram present but apart
+    // (id4) is no longer a candidate; the position-free legacy index still over-selects.
+    #[test_case("body", "deadlock" => Ok("id5".to_string()) ; "phrase needs the grams adjacent")]
+    #[test_case("body", "DEADLOCK" => Ok("id5".to_string()) ; "phrase stays case-insensitive")]
+    #[test_case("body", "ER_LOCK_DEADLOCK" => Ok("id5".to_string()) ; "a routable punctuated literal is one phrase")]
+    #[test_case("body", "lock deadlock" => Ok("id5".to_string()) ; "one phrase per word, ANDed")]
+    #[test_case("body", "lock" => Ok("id4,id5".to_string()) ; "a single gram is a plain term")]
+    #[test_case("body", "dlo" => Ok("id4,id5".to_string()) ; "a three-char word is one gram")]
+    #[test_case("legacy", "deadlock" => Ok("id4,id5".to_string()) ; "legacy ngram3 conjunction over-selects, a superset")]
+    #[test_case("body", "facade" => Ok("id6".to_string()) ; "ASCII folding keeps the grams adjacent")]
+    #[test_case("body", "FAÇADE" => Ok("id6".to_string()) ; "folded and lowercased query side")]
+    #[test_case("body", "straße" => Ok("id6".to_string()) ; "a gram that folds to four chars keeps its offset")]
+    #[test_case("body", "ünïcödé" => Ok("id6".to_string()) ; "multi-byte characters")]
     // `level` (raw): the whole indexed value is ONE token.
     #[test_case("level", "ERROR" => Ok("id1".to_string()) ; "raw term matches the whole indexed value")]
     #[test_case("level", "-alpha" => Ok("id0".to_string()) ; "a leading `-` used to parse as a lone MustNot clause (no hits)")]
@@ -1608,6 +1844,23 @@ mod reader_tests {
     #[test_case("level", "two" => Ok(String::new()) ; "raw stays exact: no partial match")]
     fn text_match_prefilter_hits(column: &str, query: &str) -> std::result::Result<String, String> {
         hit_ids_on(column, query)
+    }
+
+    /// The kill switch: with phrases off, a positional field answers exactly as the legacy
+    /// trigram conjunction over the same text does.
+    #[test_case("deadlock" ; "scattered grams match again")]
+    #[test_case("lock deadlock" ; "several words")]
+    #[test_case("ER_LOCK_DEADLOCK" ; "punctuated literal")]
+    #[test_case("straße" ; "folded text")]
+    #[test_case("zzzqqq" ; "no match")]
+    fn phrases_off_answers_as_the_legacy_conjunction(query: &str) {
+        let hits = |column: &str| {
+            let field = NGRAM_INDEX.schema().get_field(column).expect("field");
+            let FieldType::Str(o) = NGRAM_INDEX.schema().get_field_entry(field).field_type().clone() else { panic!("text field") };
+            let q = analyzed_conjunction_query(&NGRAM_INDEX, field, o.get_indexing_options().expect("indexed").tokenizer(), query, false).expect("query");
+            query_index(&NGRAM_INDEX, &*q, None).expect("search").into_iter().map(|h| h.id).sorted().join(",")
+        };
+        assert_eq!(hits("body"), hits("legacy"), "{query}");
     }
 
     /// `id LIKE 'e%'` on prod returned 573 of 19,056 rows: a raw `foo*` went through the
@@ -1851,6 +2104,7 @@ impl TantivyIndexService {
             covered_files,
             ordinals_valid,
             bundle_head,
+            positional: true,
         };
         if !defer {
             upsert_manifest(self.object_store.as_ref(), table_name, project_id, manifest_key, entry.clone()).await?;
@@ -1877,7 +2131,8 @@ impl TantivyIndexService {
         }
         let Some(reader) = self.reader() else { return };
         let dir = super::local_cache_path(&reader.cache_root, table, project_id, &cache_generation_key(file_uuid(manifest_key), blob_path));
-        let failure = match tokio::task::spawn_blocking(move || install_blob_into_cache(&dir, &blob[..])).await {
+        let source = blob_path.to_string();
+        let failure = match tokio::task::spawn_blocking(move || install_blob_into_cache(&dir, &blob[..], &source)).await {
             Ok(Ok(())) => return SearchStats::add(&reader.stats.cache_seeded, 1),
             Ok(Err(e)) => format!("tantivy cache seed failed for {project_id}/{table}: {e:#}"),
             Err(e) => format!("tantivy cache seed join failed for {project_id}/{table}: {e}"),

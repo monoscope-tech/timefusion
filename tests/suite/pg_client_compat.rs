@@ -259,3 +259,49 @@ async fn pgadmin_dashboard_rewrites_every_union_branch() -> Result<()> {
     assert_eq!(charts, [r#"session_stats={"Idle":0,"Total":0}"#, r#"tps_stats={"Transactions":0}"#]);
     Ok(())
 }
+
+/// DataFusion rejects `ORDER BY <n>` naming a scalar over an aggregate; the AST rewrite
+/// spells the ordinal out. Pinned on both protocols, which parse through different entry points.
+#[tokio::test(flavor = "multi_thread")]
+async fn order_by_ordinal_over_a_scalar_aggregate_plans_on_both_protocols() -> Result<()> {
+    let server = TestServer::start().await?;
+    let client = server.client().await?;
+    let sql = "WITH t(k, v) AS (VALUES ('a', 1.0), ('b', 2.0), ('b', 4.0)) SELECT k, round(avg(v))::TEXT FROM t GROUP BY 1 ORDER BY 2 DESC";
+    let extended = client.query(sql, &[]).await?.iter().map(|row| row.get::<_, String>(0)).collect::<Vec<_>>();
+    assert_eq!(extended, ["b", "a"], "extended protocol");
+    let simple = client
+        .simple_query(sql)
+        .await?
+        .iter()
+        .filter_map(|message| match message {
+            tokio_postgres::SimpleQueryMessage::Row(row) => row.get(0).map(str::to_owned),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(simple, ["b", "a"], "simple protocol");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn aggregate_ordering_preserves_input_values_and_output_aliases() -> Result<()> {
+    let server = TestServer::start().await?;
+    let client = server.client().await?;
+    for (sort, expected) in [("MAX(last_seen) DESC", ["10", "2"]), ("MAX(audience_sessions.last_seen) DESC", ["10", "2"]), ("last_seen DESC", ["2", "10"])] {
+        let sql = format!(
+            "WITH audience_sessions(user_id, last_seen) AS (VALUES ('u1', 2), ('u2', 10)) SELECT MAX(last_seen)::TEXT AS last_seen FROM audience_sessions WHERE last_seen > $1::BIGINT GROUP BY user_id ORDER BY {sort}"
+        );
+        let rows = client.query(&sql, &[&0_i64]).await?;
+        let actual = rows.iter().map(|row| row.get::<_, String>(0)).collect::<Vec<_>>();
+        assert_eq!(actual, expected, "extended protocol: {sort}");
+        let messages = client.simple_query(&sql.replace("$1::BIGINT", "0")).await?;
+        let actual = messages
+            .iter()
+            .filter_map(|message| match message {
+                tokio_postgres::SimpleQueryMessage::Row(row) => row.get(0),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected, "simple protocol: {sort}");
+    }
+    Ok(())
+}

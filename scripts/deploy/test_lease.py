@@ -1,4 +1,5 @@
 import contextlib
+import os
 import pathlib
 import subprocess
 import tempfile
@@ -137,6 +138,22 @@ class AbandonedLeaseTest(unittest.TestCase):
             # keeps its lease however old the serving process is.
             with mock.patch.object(lease_module, 'run_is_finished', return_value=False):
                 self.assertFalse(b.abandoned(held), 'a live holder keeps its lease')
+
+    def test_a_rerun_reclaims_its_own_failed_attempts_lease(self):
+        """2026-10-26: a failed HANDOFF left an unresolved lease, and `gh run rerun`
+        waited 45 minutes on it because the rerun shares the run id, so GitHub
+        reported the holder still running. A later attempt proves the earlier one
+        finished; an equal or unknown attempt proves nothing."""
+        started = 1_000_000
+        with repo() as (a, b), self.stale_after(0), self.serving_boot(boot_micros=(started - 3600) * 1_000_000):
+            a.git('push', 'origin', a.commit({'image': 'image-a', 'mutating': True, 'started': started, 'run_id': '123', 'run_attempt': '1'}) + ':' + LEASE_REF)
+            held = a.remote(LEASE_REF)
+            with mock.patch.object(lease_module, 'run_is_finished', return_value=False):
+                for attempt, reclaimed in [('2', True), ('1', False)]:
+                    with mock.patch.dict(os.environ, {'GITHUB_RUN_ID': '123', 'GITHUB_RUN_ATTEMPT': attempt}):
+                        self.assertEqual(b.abandoned(held), reclaimed, f'attempt {attempt}')
+                with mock.patch.dict(os.environ, {'GITHUB_RUN_ID': '456', 'GITHUB_RUN_ATTEMPT': '2'}):
+                    self.assertFalse(b.abandoned(held), 'another run still running keeps its lease')
 
     def test_a_lease_that_did_replace_production_is_not_reclaimed_early(self):
         """The direction that must never be wrong.

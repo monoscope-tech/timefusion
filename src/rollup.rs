@@ -2359,14 +2359,21 @@ async fn route_with_spec(
                         && function.args.len() == 2
                         && column_name(&function.args[1]) == Some("timestamp") =>
                 {
-                    let interval = string_literal(&function.args[0]).ok_or(MissReason::UnsupportedShape)?;
-                    let width = parse_bucket_micros(interval).ok_or(MissReason::UnsupportedShape)?;
+                    let (width, interval) = match unaliased(&function.args[0]) {
+                        Expr::Literal(datafusion::scalar::ScalarValue::IntervalMonthDayNano(Some(i)), _) => {
+                            crate::read::functions::interval_to_micros(i.months, i.days, i.nanoseconds)
+                                .ok()
+                                .map(|width| (width, format!("{} seconds", width / 1_000_000)))
+                        }
+                        other => string_literal(other).and_then(|interval| Some((parse_bucket_micros(interval)?, interval.to_owned()))),
+                    }
+                    .ok_or(MissReason::UnsupportedShape)?;
                     // A width that is not a whole number of grains makes one rollup
                     // row straddle two output buckets; no state can be split.
                     if width < grain || width % grain != 0 {
                         return Err(MissReason::PartialBucket);
                     }
-                    format!("time_bucket({}, timestamp)", sql_literal(interval))
+                    format!("time_bucket({}, timestamp)", sql_literal(&interval))
                 }
                 // `floor(extract(epoch from timestamp) / N)` reads only the N-second bucket, and a
                 // grain-aligned bucket start lies in the same one as each of its rows when N is
@@ -2956,6 +2963,22 @@ mod tests {
         for refused in ["duration", "timestamp DESC"] {
             assert!(matches!(route(refused).await, Err(MissReason::NonDecomposableAggregate)), "`ORDER BY {refused}` must still be refused outright");
         }
+    }
+
+    /// `time_bucket(INTERVAL '1 hour', …)` is the same bucket as `time_bucket('1 hour', …)`;
+    /// only the string spelling used to route, so a hand-written query scanned raw.
+    #[tokio::test]
+    async fn an_interval_bucket_width_routes_like_its_string_spelling() {
+        let state = session().await;
+        let sql = |width: &str| {
+            format!(
+                "SELECT time_bucket({width}, timestamp), count(*) FROM {SOURCE} WHERE project_id = 'p' AND timestamp >= to_timestamp_micros(1786500000000000) AND timestamp < to_timestamp_micros(1789092000000000) GROUP BY 1"
+            )
+        };
+        let route = async |width: &str| route_for(&state, &sql(width)).await.map(|route| route.is_some());
+        assert_eq!(route("INTERVAL '1 hour'").await, Ok(true), "an INTERVAL width must route");
+        assert_eq!(route("'1 hour'").await, Ok(true));
+        assert!(route("INTERVAL '1 month'").await.is_err(), "a month is not a fixed width and must not route");
     }
 
     /// An open-ended window must route, and the trailing fringe must stay open

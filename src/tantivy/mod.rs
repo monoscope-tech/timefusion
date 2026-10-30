@@ -338,7 +338,11 @@ mod builder_tests {
         array::{StringArray, TimestampMicrosecondArray},
         datatypes::{Field, Schema as ArrowSchema, TimeUnit},
     };
-    use tantivy::{Term, query::TermQuery, schema::IndexRecordOption};
+    use tantivy::{
+        Term,
+        query::TermQuery,
+        schema::{FieldType, IndexRecordOption},
+    };
     use test_case::test_case;
 
     use super::*;
@@ -458,6 +462,74 @@ mod builder_tests {
             assert!(build_in_memory(&table, &[input]).is_err(), "element mode must reject tokenized text");
         }
         Ok(())
+    }
+
+    /// A failed part aborts the upload, and `complete` never runs.
+    #[test_case(None => (true, false) ; "every part sent: completed, not aborted")]
+    #[test_case(Some(1) => (false, true) ; "a failed part: aborted, not completed")]
+    #[tokio::test]
+    async fn a_failed_part_aborts_the_upload(fail: Option<usize>) -> (bool, bool) {
+        #[derive(Debug, Default)]
+        struct Upload {
+            sent: usize,
+            fail: Option<usize>,
+            done: Arc<std::sync::Mutex<(bool, bool)>>,
+        }
+        #[async_trait::async_trait]
+        impl object_store::MultipartUpload for Upload {
+            fn put_part(&mut self, _: object_store::PutPayload) -> object_store::UploadPart {
+                let failed = self.fail == Some(self.sent);
+                self.sent += 1;
+                Box::pin(async move { if failed { Err(object_store::Error::Generic { store: "test", source: "part failed".into() }) } else { Ok(()) } })
+            }
+            async fn complete(&mut self) -> object_store::Result<object_store::PutResult> {
+                self.done.lock().unwrap().0 = true;
+                Ok(object_store::PutResult { e_tag: None, version: None })
+            }
+            async fn abort(&mut self) -> object_store::Result<()> {
+                self.done.lock().unwrap().1 = true;
+                Ok(())
+            }
+        }
+        let done = Arc::default();
+        let _ = send_parts(Box::new(Upload { fail, done: Arc::clone(&done), ..Default::default() }), Bytes::from(vec![0; 10]), 3).await;
+        *done.lock().unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_blob_over_the_single_put_limit_uploads_in_parts() -> Result<()> {
+        let store = object_store::memory::InMemory::new();
+        let blob = Bytes::from((0..10_000u32).flat_map(u32::to_le_bytes).collect::<Vec<_>>());
+        for (name, single_put_max) in [("whole", usize::MAX), ("parts", 1_000)] {
+            let path = ObjPath::from(name);
+            upload_in_parts_above(&store, &path, blob.clone(), single_put_max, 4096).await?;
+            assert_eq!(download(&store, &path).await?, blob, "{name}");
+        }
+        Ok(())
+    }
+
+    /// Positional grams go only where the index text IS the residual's text, and an entry
+    /// built before them serves queries yet still queues for a rebuild.
+    #[test_case("Utf8", None, true ; "a text column")]
+    #[test_case("Variant", Some("json"), true ; "a JSON-rendered Variant")]
+    #[test_case("Variant", Some("kv"), false ; "a kv rendering reorders leaves")]
+    #[test_case("List(Utf8)", None, false ; "a joined list")]
+    fn positional_grams_are_rebuilt_where_the_index_text_is_the_residual_text(dt: &str, flatten: Option<&str>, positional: bool) {
+        let mut table = table();
+        table.fields[2] = FieldDef {
+            name: "level".into(),
+            data_type: dt.into(),
+            tantivy: Some(TantivyFieldConfig { indexed: true, flatten: flatten.map(Into::into), ..Default::default() }),
+            ..Default::default()
+        };
+        let built = build_for_table(&table);
+        let FieldType::Str(options) = built.schema.get_field_entry(built.user_fields["level"].field).field_type() else { panic!("text field") };
+        let name = options.get_indexing_options().expect("indexed").tokenizer();
+        assert_eq!(name == NGRAM3P_TOKENIZER, positional, "{name}");
+        let entry = ManifestEntry { index: Some("index".into()), fields: ["level".to_string()].into(), ..Default::default() };
+        assert!(entry.covers_current_fields(&table));
+        assert_eq!(entry.covers_current_elements(&table), !positional, "only a positional field forces the rebuild");
+        assert!(ManifestEntry { positional: true, ..entry }.covers_current_elements(&table));
     }
 
     #[test]
@@ -588,6 +660,9 @@ mod builder_tests {
 /// Tokenizer name for n-gram indexing. Combined with `LowerCaser` so `ILIKE`
 /// semantics fall out automatically.
 pub const NGRAM3_TOKENIZER: &str = "tf_ngram3";
+/// The same 3-grams, each at its character offset, so a phrase query over a word's grams
+/// matches it as an exact substring. Plain `tf_ngram3` puts every gram at position 0.
+pub const NGRAM3P_TOKENIZER: &str = "tf_ngram3p";
 /// Word-level indexing (lowercase + word split + ASCII fold + length cap).
 /// Named after tantivy's default so `TEXT` field options can reuse it.
 pub const DEFAULT_TOKENIZER: &str = "default";
@@ -655,7 +730,7 @@ pub fn build_for_table(table: &TableSchema) -> BuiltSchema {
 
     let user_fields: HashMap<_, _> = indexed_fields(table)
         .filter(|(fd, cfg)| fd.name != TS_FIELD && fd.name != ID_FIELD && !aliases_id_field(fd, cfg))
-        .map(|(fd, cfg)| (fd.name.clone(), UserField { field: b.add_text_field(&fd.name, text_options_for(cfg)), source: fd.clone() }))
+        .map(|(fd, cfg)| (fd.name.clone(), UserField { field: b.add_text_field(&fd.name, text_options_for(fd, cfg)), source: fd.clone() }))
         .collect();
     BuiltSchema { schema: b.build(), timestamp, id, row_ordinal, user_fields }
 }
@@ -690,10 +765,23 @@ fn canonical_tokenizer(cfg: &TantivyFieldConfig) -> &'static str {
     }
 }
 
-fn text_options_for(cfg: &TantivyFieldConfig) -> TextOptions {
-    let name = canonical_tokenizer(cfg);
-    // WithFreqsAndPositions is needed for phrase queries (which n-gram matching
-    // reduces to: consecutive trigrams of the query string).
+/// Positional grams only where the index holds the very text the SQL residual reads, as one
+/// value: a kv rendering or a joined list could place a true match's grams apart.
+fn is_positional(fd: &FieldDef, cfg: &TantivyFieldConfig) -> bool {
+    canonical_tokenizer(cfg) == NGRAM3_TOKENIZER && cfg.flatten.as_deref() != Some("kv") && !fd.data_type.starts_with("List")
+}
+
+/// Does `table` declare a field indexed with positional grams?
+pub(crate) fn has_positional_fields(table: &TableSchema) -> bool {
+    indexed_fields(table).any(|(fd, cfg)| is_positional(fd, cfg))
+}
+
+pub fn is_ngram3_family(tokenizer: &str) -> bool {
+    tokenizer == NGRAM3_TOKENIZER || tokenizer == NGRAM3P_TOKENIZER
+}
+
+fn text_options_for(fd: &FieldDef, cfg: &TantivyFieldConfig) -> TextOptions {
+    let name = if is_positional(fd, cfg) { NGRAM3P_TOKENIZER } else { canonical_tokenizer(cfg) };
     let index_option = if name == RAW_TOKENIZER { IndexRecordOption::Basic } else { IndexRecordOption::WithFreqsAndPositions };
     TextOptions::default().set_indexing_options(TextFieldIndexing::default().set_tokenizer(name).set_index_option(index_option))
 }
@@ -707,10 +795,55 @@ pub fn register_tokenizers(index: &Index) {
         TextAnalyzer::builder(tokenizer).filter(RemoveLongFilter::limit(MAX_TOKEN_LEN)).filter(LowerCaser).filter(AsciiFoldingFilter).build()
     }
     let tokenizers = index.tokenizers();
-    tokenizers.register(NGRAM3_TOKENIZER, analyzer(NgramTokenizer::new(3, 3, false).expect("3-gram bounds are valid")));
+    let ngram3 = || NgramTokenizer::new(3, 3, false).expect("3-gram bounds are valid");
+    tokenizers.register(NGRAM3_TOKENIZER, analyzer(ngram3()));
+    tokenizers.register(NGRAM3P_TOKENIZER, analyzer(Positioned(ngram3())));
     // Re-register the built-in chains so behavior is pinned against upstream.
     tokenizers.register(RAW_TOKENIZER, TextAnalyzer::builder(RawTokenizer::default()).build());
     tokenizers.register(DEFAULT_TOKENIZER, analyzer(SimpleTokenizer::default()));
+}
+
+/// Numbers each token by its place in the stream. Under `NgramTokenizer::new(3, 3, false)` that
+/// is one gram per start character, so the position is the gram's character offset.
+///
+/// ```
+/// use tantivy::tokenizer::{NgramTokenizer, TokenStream, Tokenizer};
+/// let mut t = timefusion::tantivy::Positioned(NgramTokenizer::new(3, 3, false).unwrap());
+/// let mut s = t.token_stream("dead");
+/// let mut grams = vec![];
+/// while s.advance() { grams.push((s.token().text.clone(), s.token().position)); }
+/// assert_eq!(grams, [("dea".to_string(), 0), ("ead".to_string(), 1)]);
+/// ```
+#[derive(Clone)]
+pub struct Positioned<T>(pub T);
+
+pub struct PositionedStream<S> {
+    inner: S,
+    next: usize,
+}
+
+impl<T: Tokenizer> Tokenizer for Positioned<T> {
+    type TokenStream<'a> = PositionedStream<T::TokenStream<'a>>;
+    fn token_stream<'a>(&'a mut self, text: &'a str) -> Self::TokenStream<'a> {
+        PositionedStream { inner: self.0.token_stream(text), next: 0 }
+    }
+}
+
+impl<S: tantivy::tokenizer::TokenStream> tantivy::tokenizer::TokenStream for PositionedStream<S> {
+    fn advance(&mut self) -> bool {
+        let more = self.inner.advance();
+        if more {
+            self.inner.token_mut().position = self.next;
+            self.next += 1;
+        }
+        more
+    }
+    fn token(&self) -> &tantivy::tokenizer::Token {
+        self.inner.token()
+    }
+    fn token_mut(&mut self) -> &mut tantivy::tokenizer::Token {
+        self.inner.token_mut()
+    }
 }
 
 /// Helper for tests and pushdown rule: which user fields are configured?
@@ -840,6 +973,10 @@ pub struct ManifestEntry {
     /// Set iff `index` is a range-readable bundle: the bytes one GET fetches to open it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bundle_head: Option<u64>,
+    /// Built with `tf_ngram3p` on every field that takes it. Older entries still answer
+    /// queries, through the trigram conjunction; backfill rebuilds them after any uncovered file.
+    #[serde(default)]
+    pub positional: bool,
 }
 
 /// Object-store path of the manifest for a given table/project.
@@ -1061,6 +1198,11 @@ impl ManifestEntry {
     }
 
     pub fn covers_current_elements(&self, table: &TableSchema) -> bool {
+        self.covers_current_fields(table) && (self.positional || !has_positional_fields(table))
+    }
+    /// [`Self::covers_current_elements`] short of positional grams: such an entry serves queries
+    /// and only awaits a rebuild.
+    pub fn covers_current_fields(&self, table: &TableSchema) -> bool {
         self.is_usable()
             && (self.element_fields.is_empty() || (self.ordinals_valid && self.covered_files.len() == 1))
             && self.element_fields == element_field_names(&table.fields)
@@ -1123,7 +1265,7 @@ pub async fn convert_blob(store: &dyn ObjectStore, blob: &str, level: i32, scrat
     let dir = tmp.path().to_owned();
     // Streamed straight to disk: buffering a blob whole is what OOM'd installs on 09-30.
     let bundle = tokio::task::spawn_blocking(move || {
-        unpack_to_dir(tokio_util::io::SyncIoBridge::new(tokio_util::io::StreamReader::new(stream)), &dir)?;
+        unpack_to_dir(tokio_util::io::SyncIoBridge::new(tokio_util::io::StreamReader::new(stream)), &dir, false)?;
         hotcache::pack_bundle(&dir, level)
     })
     .await??;
@@ -1338,13 +1480,14 @@ pub fn pack_dir(dir: &Path, level: i32) -> Result<Bytes> {
 
 /// Stream-unpack a tar.zst blob into `dest`: peak memory is the decoder's
 /// buffers, never the blob or its decompressed tar.
-pub fn unpack_to_dir(mut blob: impl std::io::Read, dest: &Path) -> Result<()> {
+/// `remote_positions`: see [`hotcache::unpack_bundle`]; a `tar.zst` always unpacks whole.
+pub fn unpack_to_dir(mut blob: impl std::io::Read, dest: &Path, remote_positions: bool) -> Result<()> {
     std::fs::create_dir_all(dest).context("mkdir dest")?;
     let mut magic = [0; 4];
     blob.read_exact(&mut magic).context("read blob magic")?;
     let blob = std::io::Read::chain(&magic[..], blob);
     if hotcache::is_bundle(&magic) {
-        return hotcache::unpack_bundle(blob, dest).context("bundle unpack");
+        return hotcache::unpack_bundle(blob, dest, remote_positions).context("bundle unpack");
     }
     tar::Archive::new(zstd::Decoder::new(blob).context("zstd decoder")?).unpack(dest).context("tar unpack")
 }
@@ -1396,8 +1539,38 @@ pub fn open_index_in(dir: impl tantivy::Directory) -> Result<Index> {
     Ok(index)
 }
 
+/// S3 and R2 reject one PUT over 5 GiB, and a positional index of a busy day crosses it.
+const SINGLE_PUT_MAX: usize = 1 << 30;
+const UPLOAD_PART: usize = 256 << 20;
+const UPLOAD_CONCURRENCY: usize = 4;
+
 pub async fn upload(store: &dyn ObjectStore, path: &ObjPath, blob: Bytes) -> Result<()> {
-    store.put(path, blob.into()).await.with_context(|| format!("upload {path}")).map(drop)
+    upload_in_parts_above(store, path, blob, SINGLE_PUT_MAX, UPLOAD_PART).await
+}
+
+async fn upload_in_parts_above(store: &dyn ObjectStore, path: &ObjPath, blob: Bytes, single_put_max: usize, part: usize) -> Result<()> {
+    if blob.len() <= single_put_max {
+        return store.put(path, blob.into()).await.with_context(|| format!("upload {path}")).map(drop);
+    }
+    let upload = store.put_multipart(path).await.with_context(|| format!("start upload {path}"))?;
+    send_parts(upload, blob, part).await.with_context(|| format!("upload {path} in parts"))
+}
+
+/// Upload `blob` as `part`-sized parts. Any failure aborts the upload:
+/// `WriteMultipart` aborts only a failed `complete`, so a failed part left its
+/// siblings stored, unreferenced and billed.
+async fn send_parts(mut upload: Box<dyn object_store::MultipartUpload>, blob: Bytes, part: usize) -> object_store::Result<()> {
+    use futures::{StreamExt, TryStreamExt};
+    let parts: Vec<_> = (0..blob.len()).step_by(part).map(|at| upload.put_part(blob.slice(at..(at + part).min(blob.len())).into())).collect();
+    let sent = futures::stream::iter(parts).buffer_unordered(UPLOAD_CONCURRENCY).try_collect::<Vec<()>>().await;
+    let result = match sent {
+        Ok(_) => upload.complete().await.map(drop),
+        Err(e) => Err(e),
+    };
+    if result.is_err() {
+        let _ = upload.abort().await;
+    }
+    result
 }
 
 pub async fn download(store: &dyn ObjectStore, path: &ObjPath) -> Result<Bytes> {

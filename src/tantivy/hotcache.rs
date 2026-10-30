@@ -223,12 +223,49 @@ fn read_table(r: &mut impl std::io::Read) -> anyhow::Result<BundleTable> {
 }
 
 /// Stream a bundle into `dest` as plain files; memory is one block.
-pub fn unpack_bundle(mut r: impl std::io::Read, dest: &Path) -> anyhow::Result<()> {
+/// Beside an install whose positions stayed in the bundle: the bundle head, and its blob path.
+pub const HEAD_FILE: &str = "bundle.head";
+pub const SOURCE_FILE: &str = "bundle.source";
+
+/// Copies what it reads into `.1`.
+struct Tee<'a, R>(&'a mut R, &'a mut Vec<u8>);
+
+impl<R: std::io::Read> std::io::Read for Tee<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.0.read(buf)?;
+        self.1.extend_from_slice(&buf[..n]);
+        Ok(n)
+    }
+}
+
+/// Does the index whose bundle `head` this is hold a `tf_ngram3p` field? Read from its own
+/// `meta.json`, which opening reads and the head therefore holds; unreadable means no.
+fn holds_positional_grams(head: Bytes) -> bool {
+    let Ok(meta) = BundleDirectory::new(head.clone(), Arc::new(head)).and_then(|d| Ok(d.atomic_read(Path::new("meta.json"))?)) else { return false };
+    serde_json::from_slice::<serde_json::Value>(&meta)
+        .is_ok_and(|m| m["schema"].as_array().is_some_and(|fields| fields.iter().any(|f| f["options"]["indexing"]["tokenizer"] == super::NGRAM3P_TOKENIZER)))
+}
+
+/// Unpack a bundle into `dest`. With `remote_positions`, an index holding positional grams
+/// leaves its `.pos` files (most of such an index, read only by phrase queries) in the bundle
+/// and saves its head as [`HEAD_FILE`], so [`LocalFirst`] can range-read them. Every other
+/// index unpacks whole, so binaries without [`LocalFirst`] can still open it.
+pub fn unpack_bundle(mut r: impl std::io::Read, dest: &Path, remote_positions: bool) -> anyhow::Result<()> {
     use std::io::Write;
-    let table = read_table(&mut r)?;
-    std::io::copy(&mut std::io::Read::take(&mut r, table.hot.iter().map(|h| h.2).sum()), &mut std::io::sink())?;
+    let mut head = vec![];
+    let table = {
+        let mut tee = Tee(&mut r, &mut head);
+        let table = read_table(&mut tee)?;
+        std::io::copy(&mut std::io::Read::take(&mut tee, table.hot.iter().map(|h| h.2).sum()), &mut std::io::sink())?;
+        table
+    };
+    let remote_positions = remote_positions && holds_positional_grams(Bytes::from(head.clone()));
     let mut buf = vec![];
     for file in &table.files {
+        if remote_positions && file.name.ends_with(".pos") {
+            std::io::copy(&mut std::io::Read::take(&mut r, file.blocks.iter().map(|&b| u64::from(b)).sum()), &mut std::io::sink())?;
+            continue;
+        }
         let mut out = std::io::BufWriter::new(std::fs::File::create(dest.join(&file.name))?);
         for &size in &file.blocks {
             buf.resize(size as usize, 0);
@@ -237,12 +274,19 @@ pub fn unpack_bundle(mut r: impl std::io::Read, dest: &Path) -> anyhow::Result<(
         }
         out.flush()?;
     }
+    if remote_positions {
+        std::fs::write(dest.join(HEAD_FILE), head)?;
+    }
     Ok(())
 }
 
 /// Where a bundle's bytes come from: the blob in memory, or ranged object-store reads.
 pub trait BundleSource: Send + Sync + std::fmt::Debug + 'static {
     fn read(&self, range: Range<u64>) -> io::Result<Bytes>;
+    /// `read` on behalf of `file`, the index file the range belongs to.
+    fn read_file(&self, range: Range<u64>, _file: &Path) -> io::Result<Bytes> {
+        self.read(range)
+    }
 }
 
 impl BundleSource for Bytes {
@@ -319,7 +363,7 @@ impl BundleDirectory {
         Self::new(blob.clone(), Arc::new(blob))
     }
 
-    fn read(&self, file: &FileLayout, range: Range<usize>) -> io::Result<Vec<u8>> {
+    fn read(&self, path: &Path, file: &FileLayout, range: Range<usize>) -> io::Result<Vec<u8>> {
         if range.is_empty() {
             return Ok(vec![]);
         }
@@ -334,7 +378,7 @@ impl BundleDirectory {
         let missing = (first..=last).filter(|b| blocks[b - first].is_none()).collect_vec();
         for run in missing.chunk_by(|a, b| a + 1 == *b) {
             let (lo, hi) = (run[0], run[run.len() - 1]);
-            let span = self.source.read(file.blocks[lo]..file.blocks[hi + 1])?;
+            let span = self.source.read_file(file.blocks[lo]..file.blocks[hi + 1], path)?;
             for block in lo..=hi {
                 let compressed = &span[(file.blocks[block] - file.blocks[lo]) as usize..(file.blocks[block + 1] - file.blocks[lo]) as usize];
                 let bytes: Arc<[u8]> = zstd::bulk::decompress(compressed, BUNDLE_BLOCK)?.into();
@@ -344,8 +388,16 @@ impl BundleDirectory {
                 blocks[block - first] = Some(bytes);
             }
         }
-        let skip = range.start - first * BUNDLE_BLOCK;
-        Ok(blocks.into_iter().flatten().flat_map(|b| b.iter().copied().collect_vec()).skip(skip).take(range.len()).collect())
+        // Slice copies: tantivy opens a fast-field column by reading it whole, so on a day-sized
+        // index this runs over hundreds of MB per query, where a per-byte copy cost seconds.
+        let mut out = Vec::with_capacity(range.len());
+        let mut skip = range.start - first * BUNDLE_BLOCK;
+        for block in blocks.iter().flatten() {
+            let block = &block[skip.min(block.len())..];
+            skip = 0;
+            out.extend_from_slice(&block[..block.len().min(range.len() - out.len())]);
+        }
+        Ok(out)
     }
 }
 
@@ -364,7 +416,7 @@ impl HasLen for BundleHandle {
 #[async_trait::async_trait]
 impl FileHandle for BundleHandle {
     fn read_bytes(&self, range: Range<usize>) -> io::Result<OwnedBytes> {
-        Ok(OwnedBytes::new(self.dir.read(&self.dir.files[&self.path], range)?))
+        Ok(OwnedBytes::new(self.dir.read(&self.path, &self.dir.files[&self.path], range)?))
     }
 }
 
@@ -384,7 +436,7 @@ impl Directory for BundleDirectory {
     }
     fn atomic_read(&self, path: &Path) -> Result<Vec<u8>, OpenReadError> {
         let file = self.files.get(path).ok_or_else(|| OpenReadError::FileDoesNotExist(path.to_owned()))?;
-        self.read(file, 0..file.len).map_err(|e| OpenReadError::wrap_io_error(e, path.to_owned()))
+        self.read(path, file, 0..file.len).map_err(|e| OpenReadError::wrap_io_error(e, path.to_owned()))
     }
     fn delete(&self, path: &Path) -> Result<(), DeleteError> {
         Err(DeleteError::IoError { io_error: Arc::new(read_only(path)), filepath: path.to_owned() })
@@ -406,6 +458,44 @@ impl Directory for BundleDirectory {
     }
 }
 
+/// An installed index whose `.pos` files stayed in its bundle: local files first, the rest by
+/// range from `remote`.
+#[derive(Debug, Clone)]
+pub struct LocalFirst<L> {
+    pub local: L,
+    pub remote: BundleDirectory,
+}
+
+impl<L: Directory + Clone> Directory for LocalFirst<L> {
+    fn get_file_handle(&self, path: &Path) -> Result<Arc<dyn FileHandle>, OpenReadError> {
+        if self.local.exists(path)? { self.local.get_file_handle(path) } else { self.remote.get_file_handle(path) }
+    }
+    fn exists(&self, path: &Path) -> Result<bool, OpenReadError> {
+        Ok(self.local.exists(path)? || self.remote.exists(path)?)
+    }
+    fn atomic_read(&self, path: &Path) -> Result<Vec<u8>, OpenReadError> {
+        if self.local.exists(path)? { self.local.atomic_read(path) } else { self.remote.atomic_read(path) }
+    }
+    fn delete(&self, path: &Path) -> Result<(), DeleteError> {
+        self.local.delete(path)
+    }
+    fn open_write(&self, path: &Path) -> Result<WritePtr, OpenWriteError> {
+        self.local.open_write(path)
+    }
+    fn atomic_write(&self, path: &Path, data: &[u8]) -> io::Result<()> {
+        self.local.atomic_write(path, data)
+    }
+    fn sync_directory(&self) -> io::Result<()> {
+        self.local.sync_directory()
+    }
+    fn acquire_lock(&self, lock: &tantivy::directory::Lock) -> Result<tantivy::directory::DirectoryLock, tantivy::directory::error::LockError> {
+        self.local.acquire_lock(lock)
+    }
+    fn watch(&self, watch_callback: WatchCallback) -> tantivy::Result<WatchHandle> {
+        self.local.watch(watch_callback)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -415,6 +505,28 @@ mod tests {
         search::{PredsQuery, build_node_query},
         udf::{PredNode, TextMatchPred},
     };
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(32))]
+        /// Any byte range of a multi-block file reads back exactly, cold or from the block cache.
+        #[test]
+        fn a_bundle_range_reads_back_exactly(len in 1usize..(3 * BUNDLE_BLOCK + 17), a in 0usize..(3 * BUNDLE_BLOCK + 17), b in 0usize..(3 * BUNDLE_BLOCK + 17)) {
+            let data: Vec<u8> = (0..len).map(|i| (i * 31 % 251) as u8).collect();
+            let dir = tempfile::tempdir().unwrap();
+            let mut schema = tantivy::schema::Schema::builder();
+            schema.add_text_field("t", tantivy::schema::STRING);
+            tantivy::Index::create_in_dir(dir.path(), schema.build()).unwrap().writer::<tantivy::TantivyDocument>(15_000_000).unwrap().commit().unwrap();
+            std::fs::write(dir.path().join("x.fast"), &data).unwrap();
+            let blob = pack_bundle(dir.path(), 1).unwrap();
+            let directory = BundleDirectory::new(blob.clone(), Arc::new(blob)).unwrap().with_cache(7, block_cache(1 << 20));
+            let handle = tantivy::Directory::get_file_handle(&directory, Path::new("x.fast")).unwrap();
+            let (lo, hi) = (a.min(b) % len, (a.max(b) % len).max(a.min(b) % len));
+            for _ in 0..2 {
+                let read = handle.read_bytes(lo..hi).unwrap();
+                proptest::prop_assert_eq!(read.as_slice(), &data[lo..hi]);
+            }
+        }
+    }
 
     /// Per file extension: (reads, bytes read).
     fn summarize(log: &[(PathBuf, Range<usize>)]) -> BTreeMap<String, (usize, usize)> {
@@ -458,6 +570,61 @@ mod tests {
             (c.0, c.1) = (c.0 + 1, c.1 + range.end - range.start);
             self.0.read(range)
         }
+    }
+
+    /// Positions left in the bundle: no `.pos` on disk, nothing remote to open, the same hits as
+    /// a whole install, and only a phrase reads positions.
+    #[test]
+    fn an_install_with_remote_positions_answers_like_a_whole_one() -> anyhow::Result<()> {
+        use tantivy::schema::{IndexRecordOption, TextFieldIndexing, TextOptions};
+        let (whole_dir, part_dir) = (tempfile::tempdir()?, tempfile::tempdir()?);
+        let mut schema = tantivy::schema::Schema::builder();
+        let indexing = TextFieldIndexing::default().set_tokenizer(crate::tantivy::NGRAM3P_TOKENIZER).set_index_option(IndexRecordOption::WithFreqsAndPositions);
+        let body = schema.add_text_field("body", TextOptions::default().set_indexing_options(indexing));
+        let index = tantivy::Index::create_in_dir(whole_dir.path(), schema.build())?;
+        crate::tantivy::register_tokenizers(&index);
+        let mut writer = index.writer::<tantivy::TantivyDocument>(15_000_000)?;
+        for (i, text) in ["ER_LOCK_DEADLOCK: Deadlock found", "deadlo then a lock", "read timeout"].iter().cycle().take(3000).enumerate() {
+            writer.add_document(tantivy::doc!(body => format!("{text} {i}")))?;
+        }
+        writer.commit()?;
+        let blob = pack_bundle(whole_dir.path(), 3)?;
+        unpack_bundle(&blob[..], part_dir.path(), true)?;
+        assert!(!std::fs::read_dir(part_dir.path())?.flatten().any(|e| e.path().extension().is_some_and(|x| x == "pos")), "positions stay remote");
+        let source = Arc::new(Counted(blob.clone(), Default::default()));
+        let remote = BundleDirectory::new(std::fs::read(part_dir.path().join(HEAD_FILE))?.into(), source.clone())?;
+        let hybrid = super::super::open_index_in(LocalFirst { local: tantivy::directory::MmapDirectory::open(part_dir.path())?, remote })?;
+        let whole = super::super::open_index(whole_dir.path())?;
+        assert_eq!(source.1.lock().0, 0, "opening reads nothing remote");
+        let count = |index: &tantivy::Index, query: &str| -> anyhow::Result<usize> {
+            let PredsQuery::Query(q) = build_node_query(index, &PredNode::Leaf(TextMatchPred { column: "body".into(), query: query.into() }))? else {
+                anyhow::bail!("body is indexed")
+            };
+            Ok(index.reader()?.searcher().search(&*q, &tantivy::collector::Count)?)
+        };
+        for (query, expected, phrase) in [("deadlock", 1000, true), ("timeout", 1000, true), ("loc", 2000, false)] {
+            let before = source.1.lock().1;
+            assert_eq!((count(&hybrid, query)?, count(&whole, query)?), (expected, expected), "{query}");
+            assert_eq!(source.1.lock().1 > before, phrase, "{query}: only a phrase reads positions");
+        }
+        Ok(())
+    }
+
+    /// An index without positional grams unpacks whole: an older binary must still open it.
+    #[test]
+    fn an_index_without_positional_grams_unpacks_whole() -> anyhow::Result<()> {
+        let (whole_dir, part_dir) = (tempfile::tempdir()?, tempfile::tempdir()?);
+        let mut schema = tantivy::schema::Schema::builder();
+        let body = schema.add_text_field("body", tantivy::schema::TEXT);
+        let index = tantivy::Index::create_in_dir(whole_dir.path(), schema.build())?;
+        let mut writer = index.writer::<tantivy::TantivyDocument>(15_000_000)?;
+        writer.add_document(tantivy::doc!(body => "read timeout"))?;
+        writer.commit()?;
+        unpack_bundle(&pack_bundle(whole_dir.path(), 3)?[..], part_dir.path(), true)?;
+        assert!(!part_dir.path().join(HEAD_FILE).exists());
+        assert!(std::fs::read_dir(part_dir.path())?.flatten().any(|e| e.path().extension().is_some_and(|x| x == "pos")));
+        tantivy::Index::open_in_dir(part_dir.path())?;
+        Ok(())
     }
 
     /// Bundle size and per-query object reads for an unpacked prod index.

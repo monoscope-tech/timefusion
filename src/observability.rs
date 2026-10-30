@@ -1767,6 +1767,10 @@ atomic_stats! {
         /// the backfill by design, so the total is not actionable.
         tantivy_uncovered_sealed_files,
         tantivy_oversized_skipped,
+        /// Covered files whose only index predates positional grams: they still serve
+        /// queries, through the trigram conjunction, and backfill rebuilds them after every
+        /// uncovered file. Trending to 0 is the `tf_ngram3p` migration converging.
+        tantivy_stale_files,
         /// Pending (non-Complete) tasks split by operation, and the subset that is
         /// ELIGIBLE right now (deadline passed). Gauges, republished each checkpoint.
         /// `tasks_pending` alone cannot distinguish work that is absent from work

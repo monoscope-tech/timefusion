@@ -1084,9 +1084,11 @@ pub struct TantivyConfig {
     pub timefusion_tantivy_min_files_for_pushdown: usize,
     /// If a tantivy prefilter would produce more than this many hits, skip
     /// the `id IN (...)` pushdown entirely — planning cost grows with the
-    /// literal count, so above this the pushdown is slower than the scan it
-    /// replaces.
-    #[serde_inline_default(2_000)]
+    /// literal count (~0.11 s per 1,000 ids). A/B on prod 2026-10-30: a word
+    /// sparse near now but over 2,000 across 30d fell back to a 42 s scan and
+    /// took 1.7-2.8 s at 10,000; dense words were unchanged (their capped scans
+    /// stop early under LIMIT). Runtime FLAG: `timefusion_tantivy_prefilter_max_hits`.
+    #[serde_inline_default(10_000)]
     pub timefusion_tantivy_prefilter_max_hits: usize,
     /// If a tantivy prefilter selects more than this percentage of the
     /// indexed rows, the pushdown isn't worth the round-trip; skip it and
@@ -1198,6 +1200,10 @@ pub struct TantivyConfig {
     /// reader decodes only matching rows.
     #[serde_inline_default(true)]
     pub timefusion_tantivy_row_selection: bool,
+    /// Search `tf_ngram3p` indexes with one phrase per word, so candidates are exact
+    /// substrings. Kill switch: `false` falls back to the trigram conjunction, still sound.
+    #[serde_inline_default(true)]
+    pub timefusion_tantivy_phrase_queries: bool,
 }
 
 impl TantivyConfig {
@@ -1221,7 +1227,6 @@ impl TantivyConfig {
     }
     getters! {
         compression_level: i32 = (timefusion_tantivy_compression_level);
-        prefilter_max_hits: usize = (timefusion_tantivy_prefilter_max_hits.max(1));
         prefilter_min_selectivity_pct: u32 = (timefusion_tantivy_prefilter_min_selectivity_pct.min(100));
         route_equality: bool = (timefusion_tantivy_route_equality);
         /// Disk budget in bytes. Floored at 1 GB — zero would reap the cache to
@@ -1234,6 +1239,9 @@ impl TantivyConfig {
     /// Floored at 1: a zero-capacity LRU would make every open a cold open.
     pub fn reader_cache_entries(&self) -> NonZeroUsize {
         NonZeroUsize::new(self.timefusion_tantivy_reader_cache_entries).unwrap_or(NonZeroUsize::MIN)
+    }
+    pub fn prefilter_max_hits(&self) -> usize {
+        RuntimeFlag::TimefusionTantivyPrefilterMaxHits.override_value().map_or(self.timefusion_tantivy_prefilter_max_hits, |v| v as usize).max(1)
     }
     pub fn range_reads(&self) -> bool {
         RuntimeFlag::TimefusionTantivyRangeReads.override_value().map_or(self.timefusion_tantivy_range_reads, |v| v == 1)
@@ -2277,10 +2285,12 @@ pub enum RuntimeFlag {
     TimefusionParquetReadAhead,
     /// Range reads of bundled tantivy indexes (0/1).
     TimefusionTantivyRangeReads,
+    /// Hits above which the tantivy prefilter is refused and the scan runs unnarrowed.
+    TimefusionTantivyPrefilterMaxHits,
 }
 
 /// Per-flag override: 0 = config, else value + 1.
-static FLAG_OVERRIDES: [std::sync::atomic::AtomicU32; 3] = [const { std::sync::atomic::AtomicU32::new(0) }; 3];
+static FLAG_OVERRIDES: [std::sync::atomic::AtomicU32; 4] = [const { std::sync::atomic::AtomicU32::new(0) }; 4];
 
 impl RuntimeFlag {
     fn slot(self) -> &'static std::sync::atomic::AtomicU32 {
@@ -2291,6 +2301,7 @@ impl RuntimeFlag {
         match self {
             Self::TimefusionMaintenanceCpuTokens => 8..=256,
             Self::TimefusionParquetReadAhead | Self::TimefusionTantivyRangeReads => 0..=1,
+            Self::TimefusionTantivyPrefilterMaxHits => 100..=100_000,
         }
     }
 
@@ -2315,6 +2326,7 @@ impl AppConfig {
             RuntimeFlag::TimefusionMaintenanceCpuTokens => u32::try_from(self.derived.coordinator_job_slots()).unwrap_or(u32::MAX),
             RuntimeFlag::TimefusionParquetReadAhead => u32::from(self.parquet.timefusion_parquet_read_ahead),
             RuntimeFlag::TimefusionTantivyRangeReads => u32::from(self.tantivy.timefusion_tantivy_range_reads),
+            RuntimeFlag::TimefusionTantivyPrefilterMaxHits => u32::try_from(self.tantivy.timefusion_tantivy_prefilter_max_hits).unwrap_or(u32::MAX),
         })
     }
 
@@ -2483,6 +2495,7 @@ mod tests {
         let cfg: TantivyConfig = serde_json::from_str("{}").expect("every field has a default");
         assert!(cfg.seed_cache_on_publish(), "a published index must be kept locally by default");
         assert_eq!(cfg.timefusion_tantivy_prefetch_days, 3, "the hot window must be warmed by default");
+        assert_eq!(cfg.prefilter_max_hits(), 10_000, "a sparse word over 2,000 hits fell back to a whole-window scan");
         assert_eq!(cfg.search_concurrency(), 32);
         assert_eq!(cfg.reader_cache_entries().get(), 2048);
         assert_eq!(cfg.manifest_ttl(), Duration::from_secs(3600));

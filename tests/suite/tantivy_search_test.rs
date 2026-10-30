@@ -654,13 +654,13 @@ async fn carry_forward_covers_a_rewrite_only_when_every_input_was_covered() {
 #[tokio::test]
 async fn carry_forward_declines_past_the_carried_entry_cap() {
     let env = Env::zstd3("otel_logs_and_spans", "p-carry-cap");
-    let inputs: Vec<String> = (0..9).map(|i| format!("in_{i}")).collect();
+    let inputs: Vec<String> = (0..3).map(|i| format!("in_{i}")).collect();
     for (i, uri) in inputs.iter().enumerate() {
         env.publish(&[(1_000_000 + i as i64, &format!("id{i}"), "ERROR")], &[uri]).await;
     }
     let refs: Vec<&str> = inputs.iter().map(String::as_str).collect();
-    assert!(!env.carry_forward(&refs, &["out"]).await, "nine entries exceed the cap, so the caller must rebuild");
-    assert!(env.carry_forward(&refs[..8], &["out8"]).await, "eight entries are still carried");
+    assert!(!env.carry_forward(&refs, &["out"]).await, "three entries exceed the cap, so the caller must rebuild");
+    assert!(env.carry_forward(&refs[..2], &["out2"]).await, "two entries are still carried");
 }
 
 /// A multi-file entry must not take its live siblings down with it when one
@@ -945,6 +945,38 @@ async fn a_bundled_index_is_searched_by_range_reads_without_an_install() {
         let stats = &env.search.stats;
         assert_eq!((stats.bundle_opens.load(Relaxed), stats.blob_fetches.load(Relaxed)), (bundle_opens, blob_fetches));
         assert_eq!(stats.range_reads.load(Relaxed) > 0, bundle_opens > 0, "only bundle searches read by range");
+    }
+}
+
+/// A restarted reader (empty block cache) is served a bundle's ranges by the disk cache, not
+/// the object store: after a deploy every first search otherwise re-reads its columns from S3.
+#[tokio::test(flavor = "multi_thread")]
+async fn bundle_ranges_survive_a_restart_in_the_disk_cache() {
+    use timefusion::storage::{FoyerCacheConfig, SharedFoyerCache};
+    let bundled = TantivyConfig { timefusion_tantivy_bundle_writes: true, timefusion_tantivy_range_reads: true, ..prod_defaults() };
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let env = Env::new("otel_logs_and_spans", "p-bundle-disk", store.clone(), bundled.clone(), bundled.clone());
+    env.publish(&[(1_000_000, "a", "ERROR"), (1_000_001, "b", "INFO")], &["f1"]).await;
+    let disk = Arc::new(SharedFoyerCache::new(FoyerCacheConfig::test_config("bundle_disk_cache")).await.unwrap());
+    let reader = || {
+        let dir = TempDir::new().unwrap();
+        (Arc::new(TantivySearchService::new(store.clone(), dir.path().to_path_buf(), Arc::new(bundled.clone())).with_disk_cache(Some(disk.clone()))), dir)
+    };
+    let (first, _dir) = reader();
+    assert!(first.search_detailed(env.table, env.project, &level_error_node(), 100, None, false).await.unwrap().is_ok());
+    assert!(first.stats.range_reads.load(Relaxed) > 0, "the first reader fetches from the object store");
+    // Disk-only inserts land asynchronously.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let (restarted, _dir) = reader();
+        let r = restarted.search_detailed(env.table, env.project, &level_error_node(), 100, None, false).await.unwrap().unwrap();
+        assert_eq!(r.hits.iter().map(|h| h.id.as_str()).collect::<Vec<_>>(), ["a"]);
+        if restarted.stats.range_reads.load(Relaxed) == 0 {
+            assert!(restarted.stats.range_disk_hits.load(Relaxed) > 0);
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "a restarted reader must be served from the disk cache");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 }
 

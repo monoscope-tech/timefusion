@@ -897,6 +897,116 @@ async fn startup_backfills_existing_hashes_without_an_opt_in() -> Result<()> {
     Ok(())
 }
 
+/// An index whose blob is deleted while its local install (positions left in the blob)
+/// survives: the phrase search errors, and the query falls back to a full scan with the
+/// unindexed answer instead of failing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_deleted_index_blob_falls_back_to_a_full_scan() -> Result<()> {
+    use timefusion::{
+        database::scan_metric_names::{PREFILTER_USED, prefilter_skip_metric},
+        observability::{counter_value, init_local_metrics_for_test},
+    };
+    init_local_metrics_for_test();
+    let id = uuid::Uuid::new_v4().to_string()[..8].to_string();
+    // Bundles, as prod writes them: only a bundle install leaves its positions in the blob.
+    let (on, ctx, svc) = build_db_with(&format!("{id}-gone-on"), true, |c| c.tantivy.timefusion_tantivy_bundle_writes = true).await?;
+    let (off, ctx_off, _) = build_db(&format!("{id}-gone-off"), false).await?;
+    let p = unique_project();
+    let now = chrono::Utc::now().timestamp_micros();
+    let rows: Vec<(i64, String, &str)> = (0..40).map(|i| (now - (1 + i) * 60_000_000, format!("r{i}"), "INFO")).collect();
+    let mut batch = timed_batch(&p, &rows);
+    let at = batch.schema().index_of("body")?;
+    let mut columns = batch.columns().to_vec();
+    columns[at] =
+        super::tantivy_index_test::build_variant((0..40).map(|i| if i % 10 == 0 { r#"{"msg":"upstream read timeout"}"# } else { r#"{"msg":"ok"}"# }).collect());
+    batch = RecordBatch::try_new(batch.schema(), columns)?;
+    for db in [&on, &off] {
+        db.insert_records_batch(&p, TABLE, vec![batch.clone()], false, None).await?;
+        flush_all(db).await?;
+    }
+    let store = svc.expect("tantivy").object_store.clone();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    let blobs = loop {
+        let m = timefusion::tantivy::load_manifest(store.as_ref(), TABLE, &p).await?;
+        if m.entries.values().map(|e| e.rows).sum::<u64>() >= 40 {
+            break m.entries.values().filter_map(|e| e.index.clone()).collect::<Vec<_>>();
+        }
+        anyhow::ensure!(tokio::time::Instant::now() < deadline, "the flushed body must be indexed");
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    };
+    fn holds(dir: &std::path::Path, name: &str) -> bool {
+        std::fs::read_dir(dir).into_iter().flatten().flatten().any(|e| e.file_name() == name || (e.path().is_dir() && holds(&e.path(), name)))
+    }
+    anyhow::ensure!(holds(&data_dir(&format!("{id}-gone-on")), "bundle.head"), "publish must seed an install whose positions stay in the blob");
+    for blob in &blobs {
+        timefusion::tantivy::delete(store.as_ref(), &object_store::path::Path::from(blob.as_str())).await?;
+    }
+    let sql = format!(
+        "SELECT id FROM {TABLE} WHERE project_id='{p}' AND timestamp BETWEEN to_timestamp_micros({}) AND to_timestamp_micros({now}) AND body::text ~* 'read timeout' ORDER BY timestamp DESC",
+        now - 3 * 3_600_000_000
+    );
+    let failed = prefilter_skip_metric("delta_error").expect("registered");
+    let (before_failed, before_used) = (counter_value(failed), counter_value(PREFILTER_USED));
+    let ids = ordered_ids(&ctx, &sql).await?;
+    assert_eq!(counter_value(failed), before_failed + 1, "the search must fail on the missing blob");
+    assert_eq!(counter_value(PREFILTER_USED), before_used, "and must not narrow the scan");
+    assert_eq!(ids, ordered_ids(&ctx_off, &sql).await?);
+    assert_eq!(ids.len(), 4);
+    Ok(())
+}
+
+/// A pre-`tf_ngram3p` index keeps serving and is rebuilt positional by the backfill.
+#[tokio::test(flavor = "multi_thread")]
+async fn backfill_rebuilds_an_index_built_before_positional_grams() -> Result<()> {
+    use timefusion::{
+        support::test_helpers::{json_to_batch_for, minio_test_config},
+        tantivy::{load_manifest, save_manifest},
+    };
+
+    let dir = tempfile::tempdir()?;
+    let project = unique_project();
+    let mut config = (*minio_test_config(&project, dir.path().to_str().unwrap())).clone();
+    config.tantivy = serde_json::from_str("{}")?;
+    let config = Arc::new(config);
+    let db = Database::with_config(config.clone()).await?;
+    let uri = format!("s3://timefusion-tests/{}/tantivy", config.core.timefusion_table_prefix);
+    let store = db.create_object_store(&uri, &config.aws.build_storage_options(None)).await?;
+    let indexer = Arc::new(TantivyIndexService::new(
+        store.clone(),
+        Arc::new(config.tantivy.clone()),
+        std::env::temp_dir().join(format!("tf-scratch-{}", uuid::Uuid::new_v4())),
+    ));
+    let search = Arc::new(TantivySearchService::new(store.clone(), dir.path().join("indexes"), Arc::new(config.tantivy.clone())));
+    indexer.with_reader(&search);
+    let db = Arc::new(db.with_tantivy_indexer(indexer).with_tantivy_search(search.clone()));
+    let schema = timefusion::schema::get_schema(TABLE).unwrap();
+    let timestamp = chrono::Utc::now() - chrono::Duration::days(2);
+    let row = json!({"project_id": project, "id": "dl", "timestamp": timestamp.timestamp_micros(), "date": timestamp.date_naive().to_string(),
+        "name": "update", "status_message": "ER_LOCK_DEADLOCK: Deadlock found when trying to get lock", "summary": [], "hashes": []});
+    db.insert_records_batch(&project, TABLE, vec![json_to_batch_for(TABLE, vec![row])?], true, None).await?;
+    let current = |m: &timefusion::tantivy::Manifest| m.entries.values().filter(|e| e.covers_current_elements(schema)).count();
+    db.spawn_tantivy_backfill();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    while current(&load_manifest(store.as_ref(), TABLE, &project).await?) == 0 {
+        anyhow::ensure!(tokio::time::Instant::now() < deadline, "backfill must index the sealed file");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let mut legacy = load_manifest(store.as_ref(), TABLE, &project).await?;
+    legacy.entries.values_mut().for_each(|e| e.positional = false);
+    save_manifest(store.as_ref(), TABLE, &project, &legacy).await?;
+    assert_eq!(current(&legacy), 0, "a pre-positional entry is stale");
+    assert!(legacy.entries.values().all(|e| e.covers_current_fields(schema)), "and still serves queries");
+    db.spawn_tantivy_backfill();
+    while current(&load_manifest(store.as_ref(), TABLE, &project).await?) == 0 {
+        anyhow::ensure!(tokio::time::Instant::now() < deadline, "backfill must rebuild the stale entry positional");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let hits = search.search_with_stats(TABLE, &project, &leaf("status_message", "ER_LOCK_DEADLOCK"), 1000, None).await?.expect("covered");
+    assert_eq!(hits.hits.len(), 1);
+    db.shutdown().await?;
+    Ok(())
+}
+
 /// `metric` summed over the Delta leg's parquet reads, from `EXPLAIN ANALYZE`.
 async fn scan_metric(ctx: &SessionContext, sql: &str, metric: &str) -> Result<usize> {
     let txt = ctx
@@ -2150,6 +2260,18 @@ async fn a_body_text_search_routes_through_the_json_index() -> Result<()> {
     for (predicate, expected, routed) in [
         ("body::text ~* 'timeout'", &["hit-buffered", "hit-upper", "hit-nested"][..], true),
         ("body::text ILIKE '%timeout%'", &["hit-buffered", "hit-upper", "hit-nested"], true),
+        // monoscope free text: one OR over body, status_message and name.
+        ("(body::text ~* 'timeout' OR status_message ~* 'timeout' OR name ~* 'timeout')", &["hit-buffered", "hit-upper", "hit-nested"], true),
+        (
+            "((body::text ~* 'timeout' AND body::text ~* 'read[^[:alnum:]]+timeout') OR (name ~* 'timeout' AND name ~* 'read[^[:alnum:]]+timeout'))",
+            &["hit-buffered"],
+            true,
+        ),
+        // The sequence regex alone requires each of its words, so it routes as their conjunction.
+        ("body::text ~* 'read[^[:alnum:]]+timeout'", &["hit-buffered"], true),
+        ("(body::text ~* 'upstream[^[:alnum:]]+TIMEOUT' OR name ~* 'upstream[^[:alnum:]]+TIMEOUT')", &["hit-upper"], true),
+        // An arm the index cannot answer makes the whole OR opaque: no prefilter, same rows.
+        ("(body::text ~* 'timeout' OR duration < 0)", &["hit-buffered", "hit-upper", "hit-nested"], false),
         // JSON punctuation is not a routable term character, so no rendering difference can drop a row.
         (r#"body::text ILIKE '%"kind":"timeout"%'"#, &["hit-nested"], false),
     ] {
