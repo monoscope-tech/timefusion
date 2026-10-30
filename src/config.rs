@@ -1225,7 +1225,6 @@ impl TantivyConfig {
     }
     getters! {
         compression_level: i32 = (timefusion_tantivy_compression_level);
-        prefilter_max_hits: usize = (timefusion_tantivy_prefilter_max_hits.max(1));
         prefilter_min_selectivity_pct: u32 = (timefusion_tantivy_prefilter_min_selectivity_pct.min(100));
         route_equality: bool = (timefusion_tantivy_route_equality);
         /// Disk budget in bytes. Floored at 1 GB — zero would reap the cache to
@@ -1238,6 +1237,9 @@ impl TantivyConfig {
     /// Floored at 1: a zero-capacity LRU would make every open a cold open.
     pub fn reader_cache_entries(&self) -> NonZeroUsize {
         NonZeroUsize::new(self.timefusion_tantivy_reader_cache_entries).unwrap_or(NonZeroUsize::MIN)
+    }
+    pub fn prefilter_max_hits(&self) -> usize {
+        RuntimeFlag::TimefusionTantivyPrefilterMaxHits.override_value().map_or(self.timefusion_tantivy_prefilter_max_hits, |v| v as usize).max(1)
     }
     pub fn range_reads(&self) -> bool {
         RuntimeFlag::TimefusionTantivyRangeReads.override_value().map_or(self.timefusion_tantivy_range_reads, |v| v == 1)
@@ -2281,10 +2283,12 @@ pub enum RuntimeFlag {
     TimefusionParquetReadAhead,
     /// Range reads of bundled tantivy indexes (0/1).
     TimefusionTantivyRangeReads,
+    /// Hits above which the tantivy prefilter is refused and the scan runs unnarrowed.
+    TimefusionTantivyPrefilterMaxHits,
 }
 
 /// Per-flag override: 0 = config, else value + 1.
-static FLAG_OVERRIDES: [std::sync::atomic::AtomicU32; 3] = [const { std::sync::atomic::AtomicU32::new(0) }; 3];
+static FLAG_OVERRIDES: [std::sync::atomic::AtomicU32; 4] = [const { std::sync::atomic::AtomicU32::new(0) }; 4];
 
 impl RuntimeFlag {
     fn slot(self) -> &'static std::sync::atomic::AtomicU32 {
@@ -2295,6 +2299,7 @@ impl RuntimeFlag {
         match self {
             Self::TimefusionMaintenanceCpuTokens => 8..=256,
             Self::TimefusionParquetReadAhead | Self::TimefusionTantivyRangeReads => 0..=1,
+            Self::TimefusionTantivyPrefilterMaxHits => 100..=100_000,
         }
     }
 
@@ -2319,6 +2324,7 @@ impl AppConfig {
             RuntimeFlag::TimefusionMaintenanceCpuTokens => u32::try_from(self.derived.coordinator_job_slots()).unwrap_or(u32::MAX),
             RuntimeFlag::TimefusionParquetReadAhead => u32::from(self.parquet.timefusion_parquet_read_ahead),
             RuntimeFlag::TimefusionTantivyRangeReads => u32::from(self.tantivy.timefusion_tantivy_range_reads),
+            RuntimeFlag::TimefusionTantivyPrefilterMaxHits => u32::try_from(self.tantivy.timefusion_tantivy_prefilter_max_hits).unwrap_or(u32::MAX),
         })
     }
 

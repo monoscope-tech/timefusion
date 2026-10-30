@@ -1908,6 +1908,8 @@ mod pgwire_handlers_tests {
     #[test_case("FLAG SET timefusion_maintenance_cpu_tokens ON" => Err(()); "numeric flag is not boolean")]
     #[test_case("FLAG SET timefusion_parquet_read_ahead ON" => Ok(Some(crate::server::FlagCmd::Set(crate::config::RuntimeFlag::TimefusionParquetReadAhead, Some(1)))); "boolean flag")]
     #[test_case("FLAG SET timefusion_parquet_read_ahead 2" => Err(()); "boolean out of range")]
+    #[test_case("FLAG SET timefusion_tantivy_prefilter_max_hits 10000" => Ok(Some(crate::server::FlagCmd::Set(crate::config::RuntimeFlag::TimefusionTantivyPrefilterMaxHits, Some(10_000)))); "prefilter cap")]
+    #[test_case("FLAG SET timefusion_tantivy_prefilter_max_hits 99" => Err(()); "prefilter cap below range")]
     #[test_case("flag reset TIMEFUSION_MAINTENANCE_CPU_TOKENS" => Ok(Some(crate::server::FlagCmd::Set(crate::config::RuntimeFlag::TimefusionMaintenanceCpuTokens, None))); "reset, any case")]
     #[test_case("FLAG SHOW extra" => Err(()); "reject trailing input")]
     #[test_case("FLAG SET timefusion_maintenance_cpu_tokens" => Err(()); "set needs a value")]
