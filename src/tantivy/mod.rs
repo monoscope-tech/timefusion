@@ -464,6 +464,38 @@ mod builder_tests {
         Ok(())
     }
 
+    /// A failed part aborts the upload, and `complete` never runs.
+    #[test_case(None => (true, false) ; "every part sent: completed, not aborted")]
+    #[test_case(Some(1) => (false, true) ; "a failed part: aborted, not completed")]
+    #[tokio::test]
+    async fn a_failed_part_aborts_the_upload(fail: Option<usize>) -> (bool, bool) {
+        #[derive(Debug, Default)]
+        struct Upload {
+            sent: usize,
+            fail: Option<usize>,
+            done: Arc<std::sync::Mutex<(bool, bool)>>,
+        }
+        #[async_trait::async_trait]
+        impl object_store::MultipartUpload for Upload {
+            fn put_part(&mut self, _: object_store::PutPayload) -> object_store::UploadPart {
+                let failed = self.fail == Some(self.sent);
+                self.sent += 1;
+                Box::pin(async move { if failed { Err(object_store::Error::Generic { store: "test", source: "part failed".into() }) } else { Ok(()) } })
+            }
+            async fn complete(&mut self) -> object_store::Result<object_store::PutResult> {
+                self.done.lock().unwrap().0 = true;
+                Ok(object_store::PutResult { e_tag: None, version: None })
+            }
+            async fn abort(&mut self) -> object_store::Result<()> {
+                self.done.lock().unwrap().1 = true;
+                Ok(())
+            }
+        }
+        let done = Arc::default();
+        let _ = send_parts(Box::new(Upload { fail, done: Arc::clone(&done), ..Default::default() }), Bytes::from(vec![0; 10]), 3).await;
+        *done.lock().unwrap()
+    }
+
     #[tokio::test]
     async fn a_blob_over_the_single_put_limit_uploads_in_parts() -> Result<()> {
         let store = object_store::memory::InMemory::new();
@@ -1510,6 +1542,7 @@ pub fn open_index_in(dir: impl tantivy::Directory) -> Result<Index> {
 /// S3 and R2 reject one PUT over 5 GiB, and a positional index of a busy day crosses it.
 const SINGLE_PUT_MAX: usize = 1 << 30;
 const UPLOAD_PART: usize = 256 << 20;
+const UPLOAD_CONCURRENCY: usize = 4;
 
 pub async fn upload(store: &dyn ObjectStore, path: &ObjPath, blob: Bytes) -> Result<()> {
     upload_in_parts_above(store, path, blob, SINGLE_PUT_MAX, UPLOAD_PART).await
@@ -1519,9 +1552,25 @@ async fn upload_in_parts_above(store: &dyn ObjectStore, path: &ObjPath, blob: By
     if blob.len() <= single_put_max {
         return store.put(path, blob.into()).await.with_context(|| format!("upload {path}")).map(drop);
     }
-    let mut parts = object_store::WriteMultipart::new_with_chunk_size(store.put_multipart(path).await.with_context(|| format!("start upload {path}"))?, part);
-    parts.put(blob);
-    parts.finish().await.with_context(|| format!("upload {path} in parts")).map(drop)
+    let upload = store.put_multipart(path).await.with_context(|| format!("start upload {path}"))?;
+    send_parts(upload, blob, part).await.with_context(|| format!("upload {path} in parts"))
+}
+
+/// Upload `blob` as `part`-sized parts. Any failure aborts the upload:
+/// `WriteMultipart` aborts only a failed `complete`, so a failed part left its
+/// siblings stored, unreferenced and billed.
+async fn send_parts(mut upload: Box<dyn object_store::MultipartUpload>, blob: Bytes, part: usize) -> object_store::Result<()> {
+    use futures::{StreamExt, TryStreamExt};
+    let parts: Vec<_> = (0..blob.len()).step_by(part).map(|at| upload.put_part(blob.slice(at..(at + part).min(blob.len())).into())).collect();
+    let sent = futures::stream::iter(parts).buffer_unordered(UPLOAD_CONCURRENCY).try_collect::<Vec<()>>().await;
+    let result = match sent {
+        Ok(_) => upload.complete().await.map(drop),
+        Err(e) => Err(e),
+    };
+    if result.is_err() {
+        let _ = upload.abort().await;
+    }
+    result
 }
 
 pub async fn download(store: &dyn ObjectStore, path: &ObjPath) -> Result<Bytes> {
