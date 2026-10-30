@@ -897,6 +897,64 @@ async fn startup_backfills_existing_hashes_without_an_opt_in() -> Result<()> {
     Ok(())
 }
 
+/// An index whose blob is deleted while its local install (positions left in the blob)
+/// survives: the phrase search errors, and the query falls back to a full scan with the
+/// unindexed answer instead of failing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_deleted_index_blob_falls_back_to_a_full_scan() -> Result<()> {
+    use timefusion::{
+        database::scan_metric_names::{PREFILTER_USED, prefilter_skip_metric},
+        observability::{counter_value, init_local_metrics_for_test},
+    };
+    init_local_metrics_for_test();
+    let id = uuid::Uuid::new_v4().to_string()[..8].to_string();
+    // Bundles, as prod writes them: only a bundle install leaves its positions in the blob.
+    let (on, ctx, svc) = build_db_with(&format!("{id}-gone-on"), true, |c| c.tantivy.timefusion_tantivy_bundle_writes = true).await?;
+    let (off, ctx_off, _) = build_db(&format!("{id}-gone-off"), false).await?;
+    let p = unique_project();
+    let now = chrono::Utc::now().timestamp_micros();
+    let rows: Vec<(i64, String, &str)> = (0..40).map(|i| (now - (1 + i) * 60_000_000, format!("r{i}"), "INFO")).collect();
+    let mut batch = timed_batch(&p, &rows);
+    let at = batch.schema().index_of("body")?;
+    let mut columns = batch.columns().to_vec();
+    columns[at] =
+        super::tantivy_index_test::build_variant((0..40).map(|i| if i % 10 == 0 { r#"{"msg":"upstream read timeout"}"# } else { r#"{"msg":"ok"}"# }).collect());
+    batch = RecordBatch::try_new(batch.schema(), columns)?;
+    for db in [&on, &off] {
+        db.insert_records_batch(&p, TABLE, vec![batch.clone()], false, None).await?;
+        flush_all(db).await?;
+    }
+    let store = svc.expect("tantivy").object_store.clone();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    let blobs = loop {
+        let m = timefusion::tantivy::load_manifest(store.as_ref(), TABLE, &p).await?;
+        if m.entries.values().map(|e| e.rows).sum::<u64>() >= 40 {
+            break m.entries.values().filter_map(|e| e.index.clone()).collect::<Vec<_>>();
+        }
+        anyhow::ensure!(tokio::time::Instant::now() < deadline, "the flushed body must be indexed");
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    };
+    fn holds(dir: &std::path::Path, name: &str) -> bool {
+        std::fs::read_dir(dir).into_iter().flatten().flatten().any(|e| e.file_name() == name || (e.path().is_dir() && holds(&e.path(), name)))
+    }
+    anyhow::ensure!(holds(&data_dir(&format!("{id}-gone-on")), "bundle.head"), "publish must seed an install whose positions stay in the blob");
+    for blob in &blobs {
+        timefusion::tantivy::delete(store.as_ref(), &object_store::path::Path::from(blob.as_str())).await?;
+    }
+    let sql = format!(
+        "SELECT id FROM {TABLE} WHERE project_id='{p}' AND timestamp BETWEEN to_timestamp_micros({}) AND to_timestamp_micros({now}) AND body::text ~* 'read timeout' ORDER BY timestamp DESC",
+        now - 3 * 3_600_000_000
+    );
+    let failed = prefilter_skip_metric("delta_error").expect("registered");
+    let (before_failed, before_used) = (counter_value(failed), counter_value(PREFILTER_USED));
+    let ids = ordered_ids(&ctx, &sql).await?;
+    assert_eq!(counter_value(failed), before_failed + 1, "the search must fail on the missing blob");
+    assert_eq!(counter_value(PREFILTER_USED), before_used, "and must not narrow the scan");
+    assert_eq!(ids, ordered_ids(&ctx_off, &sql).await?);
+    assert_eq!(ids.len(), 4);
+    Ok(())
+}
+
 /// A pre-`tf_ngram3p` index keeps serving and is rebuilt positional by the backfill.
 #[tokio::test(flavor = "multi_thread")]
 async fn backfill_rebuilds_an_index_built_before_positional_grams() -> Result<()> {
