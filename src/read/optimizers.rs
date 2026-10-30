@@ -943,7 +943,7 @@ use datafusion::{
 
 use crate::tantivy::{
     DEFAULT_TOKENIZER, NGRAM3_TOKENIZER, RAW_TOKENIZER,
-    udf::{NGRAM_MIN_QUERY_LEN, RoutingHintUdf, classify_like_pattern, is_eq_term_safe, is_search_predicate, regex_literal_substring},
+    udf::{NGRAM_MIN_QUERY_LEN, RoutingHintUdf, classify_like_pattern, is_eq_term_safe, is_search_predicate, regex_required_words},
 };
 
 /// Per-column index facts: the resolved tokenizer, and the text the index holds.
@@ -1115,7 +1115,7 @@ fn match_indexed_predicate(expr: &Expr, indexed_columns: &IndexedCols, allow_eq:
             let (c, tok) = indexed_text(left, indexed_columns)?;
             let Expr::Literal(s, _) = right.as_ref() else { return None };
             (tok == NGRAM3_TOKENIZER)
-                .then(|| regex_literal_substring(utf8_scalar(s)?).filter(|q| q.chars().count() >= NGRAM_MIN_QUERY_LEN))
+                .then(|| regex_required_words(utf8_scalar(s)?).filter(|q| q.chars().count() >= NGRAM_MIN_QUERY_LEN))
                 .flatten()
                 .map(|q| (c.name.clone(), Route::Ready(q)))
         }
@@ -1341,6 +1341,10 @@ mod tantivy_rewriter_tests {
     #[test_case(re("name", Operator::RegexMatch, "runServer", true), true => ready("name", "runServer") ; "cast-wrapped regex match on ngram3 routes")]
     #[test_case(re("name", Operator::RegexMatch, "runServer", false), true => ready("name", "runServer") ; "bare column regex match routes")]
     #[test_case(re("name", Operator::RegexIMatch, "svc\\.user-api", true), true => ready("name", "svc.user-api") ; "escapeRegex output: `\\.` decodes to a literal")]
+    #[test_case(re("name", Operator::RegexIMatch, "ER[^[:alnum:]]+LOCK[^[:alnum:]]+DEADLOCK", true), true => ready("name", "ER LOCK DEADLOCK") ; "monoscope free-text sequence routes as its words")]
+    #[test_case(re("body", Operator::RegexIMatch, "read[^[:alnum:]]+timeout", true), true => ready("body", "read timeout") ; "a sequence on a JSON body")]
+    #[test_case(re("name", Operator::RegexIMatch, "ab[^[:alnum:]]+cd", true), true => None ; "a sequence of words too short for any trigram")]
+    #[test_case(re("name", Operator::RegexIMatch, "a.b[^[:alnum:]]+lock", true), true => None ; "a sequence with a metachar part")]
     // Unescaped metachars / anchors / short patterns / raw / non-text: never routed.
     #[test_case(re("name", Operator::RegexIMatch, "run.*", true), true => None ; "unescaped metachar")]
     #[test_case(re("name", Operator::RegexIMatch, "a|b", true), true => None ; "alternation")]

@@ -2267,6 +2267,9 @@ async fn a_body_text_search_routes_through_the_json_index() -> Result<()> {
             &["hit-buffered"],
             true,
         ),
+        // The sequence regex alone requires each of its words, so it routes as their conjunction.
+        ("body::text ~* 'read[^[:alnum:]]+timeout'", &["hit-buffered"], true),
+        ("(body::text ~* 'upstream[^[:alnum:]]+TIMEOUT' OR name ~* 'upstream[^[:alnum:]]+TIMEOUT')", &["hit-upper"], true),
         // An arm the index cannot answer makes the whole OR opaque: no prefilter, same rows.
         ("(body::text ~* 'timeout' OR duration < 0)", &["hit-buffered", "hit-upper", "hit-nested"], false),
         // JSON punctuation is not a routable term character, so no rendering difference can drop a row.
