@@ -1198,7 +1198,15 @@ struct StoreSource {
 /// Disk-cache granularity for bundle ranges. Aligned, so a read is served whatever runs of
 /// blocks the in-memory cache happens to be missing: exact-range keys missed whenever a
 /// partly evicted index asked for a different run (prod: 828 MB refetched from S3).
-const DISK_CHUNK: u64 = 1 << 20;
+/// Two bundle blocks: replaying real cold phrase searches, 1 MiB fetched 5.5x the bytes
+/// asked for and 128 KiB 1.6x, for 8% more GETs (each read is one run either way).
+const DISK_CHUNK: u64 = 128 << 10;
+
+/// The chunk's disk-cache key. It names the chunk size, because the disk tier outlives the
+/// process: a chunk cached at another size holds other bytes under the same index.
+fn disk_chunk_key(path: &ObjPath, chunk: u64) -> String {
+    format!("tantivy-chunk-{DISK_CHUNK}:{path}:{chunk}")
+}
 
 impl StoreSource {
     async fn fetch(&self, range: std::ops::Range<u64>) -> std::io::Result<bytes::Bytes> {
@@ -1209,7 +1217,7 @@ impl StoreSource {
 
     async fn read_chunked(&self, range: std::ops::Range<u64>, cache: &crate::storage::SharedFoyerCache, len: u64) -> std::io::Result<bytes::Bytes> {
         let chunks: Vec<u64> = (range.start / DISK_CHUNK..=(range.end - 1) / DISK_CHUNK).collect();
-        let key = |chunk: u64| format!("tantivy-chunk:{}:{chunk}", self.path);
+        let key = |chunk: u64| disk_chunk_key(&self.path, chunk);
         let mut got = futures::future::join_all(chunks.iter().map(|&chunk| async move { cache.get_immutable(&key(chunk)).await })).await;
         for bytes in got.iter().flatten() {
             SearchStats::add(&self.stats.range_disk_hits, 1);
@@ -1699,6 +1707,31 @@ mod disk_chunk_tests {
             assert!(Instant::now() < deadline, "an overlapping range must be served from the chunks the first read cached");
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
+    }
+
+    /// A chunk left on disk by a binary with another chunk size is never served: the key
+    /// names the size, so it misses instead of returning that size's bytes for this offset.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_chunk_cached_at_another_size_is_not_served() {
+        use object_store::ObjectStoreExt;
+        let len = 4 * DISK_CHUNK;
+        let blob: Vec<u8> = (0..len).map(|i| (i * 7 % 253) as u8).collect();
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let path = ObjPath::from("indexes/y.bundle");
+        store.put(&path, blob.clone().into()).await.unwrap();
+        let disk = Arc::new(crate::storage::SharedFoyerCache::new(crate::storage::FoyerCacheConfig::test_config("disk_chunk_size")).await.unwrap());
+        disk.put_immutable(format!("tantivy-chunk:{path}:1"), bytes::Bytes::from(vec![0xAA; DISK_CHUNK as usize]));
+        let source = StoreSource {
+            store,
+            path,
+            rt: tokio::runtime::Handle::current(),
+            stats: Default::default(),
+            disk_cache: Some(disk),
+            len: std::sync::OnceLock::new(),
+        };
+        let _ = source.len.set(len);
+        let range = DISK_CHUNK..2 * DISK_CHUNK;
+        assert_eq!(super::super::hotcache::BundleSource::read(&source, range.clone()).unwrap(), &blob[range.start as usize..range.end as usize]);
     }
 }
 
