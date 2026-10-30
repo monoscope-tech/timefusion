@@ -1513,7 +1513,9 @@ pub fn build_node_query(index: &Index, node: &PredNode) -> Result<PredsQuery> {
                 // substring). On raw/default it carries real prefix semantics
                 // that a conjunction of whole terms would UNDER-match, so those
                 // keep the parser.
-                Some(tok) if super::is_ngram3_family(tok) || !p.query.ends_with('*') => analyzed_conjunction_query(index, field, tok, &p.query)?,
+                Some(tok) if super::is_ngram3_family(tok) || !p.query.ends_with('*') => {
+                    analyzed_conjunction_query(index, field, tok, &p.query, phrase_queries_enabled())?
+                }
                 // A raw value is ONE term, so a prefix is a walk of the term dictionary. The
                 // parser's prefix query matched nothing on raw fields, and the prefilter then
                 // dropped every indexed row (`id LIKE 'e%'`: 573 of 19,056).
@@ -1559,7 +1561,12 @@ pub fn build_node_query(index: &Index, node: &PredNode) -> Result<PredsQuery> {
 /// A conjunction over-selects relative to a phrase query, which is always sound
 /// for a prefilter. A word too short to produce a token is dropped (broadens);
 /// a literal yielding no token at all errors out into a full scan.
-fn analyzed_conjunction_query(index: &Index, field: Field, tokenizer: &str, query: &str) -> Result<Box<dyn Query>> {
+/// `TIMEFUSION_TANTIVY_PHRASE_QUERIES`, the kill switch for positional phrases; on when unconfigured.
+fn phrase_queries_enabled() -> bool {
+    crate::config::try_config().is_none_or(|c| c.tantivy.timefusion_tantivy_phrase_queries)
+}
+
+fn analyzed_conjunction_query(index: &Index, field: Field, tokenizer: &str, query: &str, phrases: bool) -> Result<Box<dyn Query>> {
     let mut analyzer = index.tokenizers().get(tokenizer).ok_or_else(|| anyhow!("tokenizer {tokenizer} not registered"))?;
     // ngram3 requires each whitespace-separated word independently. The others
     // must see the WHOLE literal: `default` splits it itself and `raw` indexes
@@ -1576,7 +1583,7 @@ fn analyzed_conjunction_query(index: &Index, field: Field, tokenizer: &str, quer
     let term = |t: Term| Box::new(TermQuery::new(t, IndexRecordOption::Basic)) as Box<dyn Query>;
     // Positional grams make each word one phrase: its grams at their own offsets, i.e. the word
     // as a substring of one indexed value.
-    let phrase = tokenizer == super::NGRAM3P_TOKENIZER && crate::config::try_config().is_none_or(|c| c.tantivy.timefusion_tantivy_phrase_queries);
+    let phrase = phrases && tokenizer == super::NGRAM3P_TOKENIZER;
     let clauses: Vec<(Occur, Box<dyn Query>)> = if phrase {
         words
             .iter()
@@ -1804,6 +1811,23 @@ mod reader_tests {
     #[test_case("level", "two" => Ok(String::new()) ; "raw stays exact: no partial match")]
     fn text_match_prefilter_hits(column: &str, query: &str) -> std::result::Result<String, String> {
         hit_ids_on(column, query)
+    }
+
+    /// The kill switch: with phrases off, a positional field answers exactly as the legacy
+    /// trigram conjunction over the same text does.
+    #[test_case("deadlock" ; "scattered grams match again")]
+    #[test_case("lock deadlock" ; "several words")]
+    #[test_case("ER_LOCK_DEADLOCK" ; "punctuated literal")]
+    #[test_case("straße" ; "folded text")]
+    #[test_case("zzzqqq" ; "no match")]
+    fn phrases_off_answers_as_the_legacy_conjunction(query: &str) {
+        let hits = |column: &str| {
+            let field = NGRAM_INDEX.schema().get_field(column).expect("field");
+            let FieldType::Str(o) = NGRAM_INDEX.schema().get_field_entry(field).field_type().clone() else { panic!("text field") };
+            let q = analyzed_conjunction_query(&NGRAM_INDEX, field, o.get_indexing_options().expect("indexed").tokenizer(), query, false).expect("query");
+            query_index(&NGRAM_INDEX, &*q, None).expect("search").into_iter().map(|h| h.id).sorted().join(",")
+        };
+        assert_eq!(hits("body"), hits("legacy"), "{query}");
     }
 
     /// `id LIKE 'e%'` on prod returned 573 of 19,056 rows: a raw `foo*` went through the
