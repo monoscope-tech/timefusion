@@ -116,6 +116,27 @@ pub fn regex_literal_substring(pat: &str) -> Option<String> {
     (!out.is_empty() && !out.starts_with(' ') && !out.ends_with(' ')).then_some(out)
 }
 
+/// Separator monoscope puts between the words of a free-text sequence (`Pkg.Parser.Expr`).
+const WORD_SEPARATOR: &str = "[^[:alnum:]]+";
+
+/// The words a `~` / `~*` pattern requires, space-joined for the AND-of-words leaf: a plain
+/// literal, or literals joined by [`WORD_SEPARATOR`]. A match contains every word, so their
+/// conjunction is a superset. `None` when any part is not a literal, or no word is long
+/// enough for a trigram to find.
+///
+/// ```
+/// use timefusion::tantivy::udf::regex_required_words;
+/// assert_eq!(regex_required_words("ER[^[:alnum:]]+LOCK[^[:alnum:]]+WAIT").as_deref(), Some("ER LOCK WAIT"));
+/// assert_eq!(regex_required_words("svc\\.user-api").as_deref(), Some("svc.user-api"));
+/// assert_eq!(regex_required_words("ab[^[:alnum:]]+cd"), None);
+/// assert_eq!(regex_required_words("a.b[^[:alnum:]]+lock"), None);
+/// assert_eq!(regex_required_words("[^[:alnum:]]+lock"), None);
+/// ```
+pub fn regex_required_words(pat: &str) -> Option<String> {
+    let words = pat.split(WORD_SEPARATOR).map(regex_literal_substring).collect::<Option<Vec<_>>>()?;
+    words.iter().any(|w| w.chars().count() >= NGRAM_MIN_QUERY_LEN).then(|| words.join(" "))
+}
+
 /// Classify a deferred (placeholder-routed) `text_match` once the `$N` has been
 /// substituted, applying the same gates the plan-time path applies.
 /// `kind`: `"eq"` | `"like:<tokenizer>"` | `"ilike:<tokenizer>"`.
