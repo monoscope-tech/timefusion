@@ -17,80 +17,53 @@
 # `ERR_USE_AFTER_CLOSE: readline was closed` immediately after authenticating,
 # with or without a TTY. The HTTP API above is what the CLI calls anyway.
 #
-# EVERY KEY HERE IS LOAD-BEARING. An earlier version of this file was written
-# from memory rather than from the live value, and applying it would have
-# reverted `UpdateConfig.Order` to `start-first` — the exact swarm/WAL-lock
-# deploy wedge that `stop-first` exists to fix — and dropped StopGracePeriod and
-# Seccomp. Do not paste a hand-written version of this.
+# AS READ LIVE 2026-10-30 (CapRover appDefinitions + `docker service inspect`).
+# The stored override now carries ONLY resources; the rest of the service spec
+# below lives on the swarm service itself and survives deploys because CapRover
+# merges the override into the existing spec. An earlier version of this file
+# documented a fuller override that is not what CapRover holds. Re-read both
+# before editing, and never paste a hand-written version.
+#
+# Stored override (byte-equivalent to the live value):
+#
+#   {"TaskTemplate": {"Resources": {"Limits": {"NanoCPUs": 44000000000, "MemoryBytes": 128849018880}, "Reservations": {"NanoCPUs": 12000000000, "MemoryBytes": 34359738368}}}}
+#
+# Live swarm spec outside the override:
+#   UpdateConfig   {"Parallelism":1,"Delay":100000000,"FailureAction":"pause","Monitor":15000000000,"MaxFailureRatio":0.15,"Order":"stop-first"}
+#   RollbackConfig {"Parallelism":1,"FailureAction":"pause","Monitor":15000000000,"MaxFailureRatio":0.15,"Order":"stop-first"}
+#   ContainerSpec  StopGracePeriod 90s, Privileges.Seccomp unconfined
 #
 # - StopGracePeriod 90s: the drain + WAL handoff needs it; a shorter grace means
 #   SIGKILL mid-drain.
 # - Seccomp unconfined: required by the jemalloc/pprof profiling paths.
 # - Limits.MemoryBytes 120 GiB: the cgroup limit is TimeFusion's ONLY memory
 #   knob — the self-sizing budget tree derives every pool from `detected_limit_gb`
-#   at startup. It was 96 GiB (103079215104) until 2026-08-15 09:15Z, which is
-#   where the OOM-loop's ceiling came from; it was CONFIGURED at 96, not
-#   clobbered down to it. 120 GiB of the host's 188 GB leaves room for monoscope
-#   and the collectors.
-# - Reservations 32 GiB: scheduling floor, unchanged.
-# - Limits.NanoCpus 32 CPUs: RAISED from 28 on 2026-09-12, and it was not
-#   recorded here at all before — the live service carried
-#   `NanoCpus=28000000000` while this file documented only the memory limit,
-#   which is exactly the drift this file exists to prevent.
-#
-#   The core count is not just a throughput knob: the whole maintenance budget
-#   tree derives from it. `coordinator_jobs` is `cores/3`, the coordinator's
-#   memory share is `jobs x 512 MiB`, and `light_optimize_k` subtracts a fixed
-#   3-slice repair holdback from that share. At 28 cores that arithmetic gives
-#   9 jobs, a 4.5 GiB share, 3 slices, and a hygiene permit count of ZERO
-#   before the `.max(1)` floor — which measured as SealedConsolidation doing
-#   exactly 0 worker-seconds in four hours against 1.1 TB of sealed debt.
-#
-#   32 takes it to 10 jobs and a 5 GiB share. Pair it with the holdback cap
-#   (`LIGHT_MIN_SLICES`): 32 cores alone still yields K=1 without that change,
-#   and the formula only reaches K=3 at 48 cores. The host has 48; 32 leaves
-#   16 for monoscope and the collectors.
-# - start-first updates: every deployed binary's liveness probe accepts only
-#   the intentional startup 57P03 responder, allowing WAL takeover to complete
-#   while the external SQL probe still counts that interval as unavailable.
-# - stop-first rollback: older binaries might not implement that liveness and
+#   at startup. 120 GiB of the host's 188 GB leaves room for monoscope and the
+#   collectors.
+# - Reservations 32 GiB / 12 CPUs: scheduling floor.
+# - Limits.NanoCPUs 44 CPUs (was 32 when this file was last written; 28 before
+#   2026-09-12). The core count is not just a throughput knob: autotune derives
+#   the maintenance budget tree and `TIMEFUSION_TANTIVY_BUILD_CONCURRENCY`
+#   (cpus/8 = 5 at 44) from it, and ignores env overrides of derived knobs.
+# - UpdateConfig.Order is stop-first, although deploy/README.md describes
+#   forward deployments as start-first (HANDOFF + the 57P03 startup responder
+#   make start-first safe). The two disagree; this records the live value only.
+# - stop-first rollback: older binaries might not implement the liveness and
 #   takeover contract, so rollback stays conservative.
 #
 # No EndpointSpec here on purpose: 5432 belongs to the stable
 # srv-timefusion-pgwire-proxy service.
 {
   "TaskTemplate": {
-    "ContainerSpec": {
-      "StopGracePeriod": 90000000000,
-      "Privileges": {
-        "Seccomp": {
-          "Mode": "unconfined"
-        }
-      }
-    },
     "Resources": {
       "Limits": {
-        "MemoryBytes": 128849018880,
-        "NanoCpus": 32000000000
+        "NanoCPUs": 44000000000,
+        "MemoryBytes": 128849018880
       },
       "Reservations": {
+        "NanoCPUs": 12000000000,
         "MemoryBytes": 34359738368
       }
     }
-  },
-  "UpdateConfig": {
-    "Parallelism": 1,
-    "Order": "start-first",
-    "Delay": 100000000,
-    "FailureAction": "pause",
-    "Monitor": 15000000000,
-    "MaxFailureRatio": 0.15
-  },
-  "RollbackConfig": {
-    "Parallelism": 1,
-    "FailureAction": "pause",
-    "Monitor": 15000000000,
-    "MaxFailureRatio": 0.15,
-    "Order": "stop-first"
   }
 }
