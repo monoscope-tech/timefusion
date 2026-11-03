@@ -1980,6 +1980,32 @@ async fn recovery_queues_a_republish_for_a_slice_with_no_row_witness() -> Result
     Ok(())
 }
 
+/// A day the source holds NO rows for publishes empty, and an absent partition is a
+/// witness of zero rows. Recording it as unknown re-queued the day as `MissingRowWitness`
+/// every recovery pass: prod rebuilt one empty day ~600 times hourly, reopening the
+/// derived tier each time and pinning `oldest_due_unclaimed_age_seconds` past a day.
+#[tokio::test]
+async fn an_empty_source_day_publishes_a_zero_row_witness_and_is_not_requeued() -> Result<()> {
+    let (db, project, day, tier) = published_base_day(rollup_backfill_config("empty-day-witness", 35), "empty").await?;
+    let empty_day = day - chrono::Duration::days(1);
+    db.run_unit_once("otel_logs_and_spans", &project, empty_day, crate::maintenance_coordinator::Operation::BaseRollup, 24, 0, None).await?;
+    let on_empty = |slice: &crate::maintenance_coordinator::TimeSlice| {
+        chrono::DateTime::from_timestamp_micros(slice.start_micros).is_some_and(|time| time.date_naive() == empty_day)
+    };
+    let witnesses: Vec<_> = db
+        .journal()
+        .published_rollups("otel_logs_and_spans", &tier)
+        .into_iter()
+        .filter(|(key, _)| key.project_id == project && on_empty(&key.slice))
+        .map(|(_, publication)| (publication.rows, publication.source_rows))
+        .collect();
+    assert_eq!(witnesses, vec![(0, Some(0))], "the empty day must publish once, witnessing zero source rows");
+    db.recover_rollup_coverage("otel_logs_and_spans").await?;
+    let requeued: Vec<_> = pending_tier_slices(&db, &project, &tier).into_iter().filter(on_empty).collect();
+    assert!(requeued.is_empty(), "a witnessed empty day must not be queued for republish, got {requeued:?}");
+    Ok(())
+}
+
 /// The republish bound keeps the NEWEST slices and defers the rest — dashboards need
 /// contiguous recent days, so the bound must cut from the old end.
 #[test]

@@ -345,13 +345,20 @@ impl ErrorHandler for LoggingErrorHandler {
     where
         C: ClientInfo,
     {
-        // `ApiError` wraps an internal failure (a bug); everything else is
-        // client error or connection noise.
+        // `ApiError` wraps an internal failure (a bug) — unless the client's own SQL was
+        // rejected; everything else is client error or connection noise.
         match error {
-            PgWireError::ApiError(_) => error!("PgWire internal error: {}", error),
+            PgWireError::ApiError(_) if !is_client_sql_error(&error.to_string()) => error!("PgWire internal error: {}", error),
+            PgWireError::ApiError(_) => warn!("PgWire client SQL error: {}", error),
             _ => info!("PgWire error: {}", error),
         }
     }
+}
+
+/// DataFusion rejecting the statement itself (unknown table/column/function, bad
+/// syntax) — the client's mistake, not a server fault worth an ERROR-level page.
+fn is_client_sql_error(message: &str) -> bool {
+    ["Error during planning:", "SQL error:", "Schema error:"].iter().any(|kind| message.contains(kind))
 }
 
 /// Concurrent-giant-statement gate. A multi-MB statement materializes its
@@ -1540,8 +1547,8 @@ pub async fn serve_with_listener(
 #[cfg(test)]
 mod pgwire_handlers_tests {
     use super::{
-        StreamFailureContext, parse_delta_actions, parse_delta_history, parse_delta_recovery_audit, parse_flush, parse_handoff, parse_optimize, parse_vacuum,
-        query_dimensions, query_fingerprint, query_template, rewrite_pg_synonyms, with_response_deadline,
+        StreamFailureContext, is_client_sql_error, parse_delta_actions, parse_delta_history, parse_delta_recovery_audit, parse_flush, parse_handoff,
+        parse_optimize, parse_vacuum, query_dimensions, query_fingerprint, query_template, rewrite_pg_synonyms, with_response_deadline,
     };
     use datafusion_postgres::pgwire::{
         api::results::{QueryResponse, Response},
@@ -1554,6 +1561,15 @@ mod pgwire_handlers_tests {
 
     /// Admin-command tables flatten the parsed fields into one `|`-joined literal (one expected value pins every field); a rejection becomes `Err(())`.
     type Parsed = Result<Option<String>, ()>;
+
+    #[test_case("PgWire internal error: Error during planning: table 'datafusion.public.metrics' not found" => true ; "unknown table")]
+    #[test_case("SQL error: ParserError(\"Expected: an expression, found: EOF\")" => true ; "syntax")]
+    #[test_case("Schema error: No field named nope." => true ; "unknown column")]
+    #[test_case("Internal error: Physical input schema should be the same" => false ; "engine bug")]
+    #[test_case("Resources exhausted: Failed to allocate additional 1.0 GB" => false ; "pool exhausted")]
+    fn client_sql_errors_are_not_server_faults(message: &str) -> bool {
+        is_client_sql_error(message)
+    }
 
     #[tokio::test]
     async fn query_stream_observes_the_server_deadline() {
