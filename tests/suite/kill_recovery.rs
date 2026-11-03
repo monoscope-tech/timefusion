@@ -148,6 +148,10 @@ impl Tf {
             .env("PGWIRE_PASSWORD", "postgres")
             .env("TIMEFUSION_ALLOW_INSECURE_AUTH", "true")
             .env("RUST_LOG", "warn,timefusion=info")
+            // The binary loads `.env`, whose collector is PRODUCTION's: a test's deliberate
+            // failures would file real monoscope issues. dotenv never overrides these.
+            .env("OTEL_TRACES_EXPORTER", "none")
+            .env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:1")
             // Capture BOTH streams: tracing writes to stdout, and wait_ready
             // surfaces the tail of these files on failure.
             .stdout(Stdio::from(std::fs::File::create(&self.boot_log)?))
