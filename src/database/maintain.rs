@@ -3137,20 +3137,21 @@ impl Database {
             let date_string = date.to_string();
             // The witness the read path re-checks this slice against. Must use the SAME
             // call and bound as the read path, over the very snapshot this build aggregates.
-            let partition_stats =
-                Self::partition_stats_bounded(witness_source, &key.source, Some(&key.physical_table), &|_, _| i64::MAX).ok().and_then(|mut stats| {
+            // `Ok(None)` is a source with no partition for this day: a witness of ZERO rows.
+            // Only a failed read is unknown; recording absence as unknown re-queues the
+            // day as `MissingRowWitness` on every recovery pass, forever.
+            let stats_bounded_by = |bound: i64| {
+                Self::partition_stats_bounded(witness_source, &key.source, Some(&key.physical_table), &|_, _| bound).ok().map(|mut stats| {
                     stats.remove(&(key.project_id.clone(), date_string.clone())).or_else(|| stats.remove(&("default".to_string(), date_string.clone())))
-                });
-            let source_rows = partition_stats.map(|stats| stats.rows);
+                })
+            };
+            let partition_stats = stats_bounded_by(i64::MAX);
+            let source_rows = partition_stats.as_ref().map(|stats| stats.as_ref().map_or(0, |stats| stats.rows));
             // The same count bounded by THIS slice's end. Written alongside the
             // unbounded one and not yet read, so the flip can happen later against
             // data that already exists rather than waiting a full rebuild cycle.
-            let source_rows_below = Self::partition_stats_bounded(witness_source, &key.source, Some(&key.physical_table), &|_, _| key.slice.end_micros)
-                .ok()
-                .and_then(|mut stats| {
-                    stats.remove(&(key.project_id.clone(), date_string.clone())).or_else(|| stats.remove(&("default".to_string(), date_string.clone())))
-                })
-                .map(|stats| stats.rows);
+            let source_rows_below = stats_bounded_by(key.slice.end_micros).map(|stats| stats.map_or(0, |stats| stats.rows));
+            let partition_stats = partition_stats.flatten();
             // `(fingerprint, min_ts, max_ts)`: the identity the date-level read path
             // compares. `min_ts` decides whether this slice may claim the day's opening
             // hours; with `max_ts` it bounds where a missing base slice is a real hole.

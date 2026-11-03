@@ -259,8 +259,9 @@ pub struct TimeBucket {
     row_max_ts: AtomicI64,
     /// Wall-clock micros (via `crate::support`) of bucket creation. Drives the
     /// flush-dwell staleness signal; independent of event time so backfills
-    /// can't false-trip the "oldest bucket" alarm.
-    created_micros: i64,
+    /// can't false-trip the "oldest bucket" alarm. Restarted by a drain that
+    /// leaves survivors: they arrived while that flush was airborne.
+    created_micros: AtomicI64,
     /// Per-shard walrus positions captured BEFORE this bucket's first WAL entry
     /// (min-merged) — the bucket's read-cursor *holds*: while the bucket is
     /// unflushed the cursor must not advance past `first_positions[shard]`, or
@@ -1139,7 +1140,7 @@ impl MemBuffer {
     /// `(bucket_id, created_micros, memory_bytes)` for every bucket matching
     /// `filter`. The same id can appear once per (project, table).
     pub fn bucket_flush_meta(&self, filter: impl Fn(i64) -> bool) -> Vec<(i64, i64, usize)> {
-        self.buckets_where(filter, |_, id, b| (id, b.created_micros, b.memory_bytes.load(Ordering::Relaxed)))
+        self.buckets_where(filter, |_, id, b| (id, b.created_micros.load(Ordering::Relaxed), b.memory_bytes.load(Ordering::Relaxed)))
     }
 
     /// Buckets whose last `min_dirty` snapshot flushes all finished dirty.
@@ -1529,6 +1530,7 @@ impl MemBuffer {
                 let min = drained_max.map_or(min, |hi| min.max(hi.saturating_add(1)));
                 bucket.min_timestamp.store(min, Ordering::Relaxed);
                 bucket.max_timestamp.store(max, Ordering::Relaxed);
+                bucket.created_micros.store(crate::support::now_micros(), Ordering::Relaxed);
             }
             let landed: std::collections::HashSet<_> = b.write_identities.iter().copied().collect();
             bucket.wal_shard_state.lock().write_identities.retain(|identity| !landed.contains(identity));
@@ -1763,7 +1765,7 @@ impl MemBuffer {
     /// merge-on-read UPDATE appends the row's ORIGINAL timestamp, so a fresh
     /// bucket can hold hours-old event time and would read as debt forever.
     pub fn count_buckets_dwelling_since(&self, cutoff_micros: i64) -> usize {
-        self.tables.iter().map(|t| t.value().buckets.iter().filter(|b| b.value().created_micros < cutoff_micros).count()).sum()
+        self.tables.iter().map(|t| t.value().buckets.iter().filter(|b| b.value().created_micros.load(Ordering::Relaxed) < cutoff_micros).count()).sum()
     }
 
     #[instrument(skip(self))]
@@ -2345,7 +2347,8 @@ impl MemBuffer {
                 let batch_count = bucket.batches.lock().len();
                 stats.total_batches += batch_count;
                 if batch_count > 0 && *bucket.key() < current {
-                    stats.oldest_bucket_micros = Some(stats.oldest_bucket_micros.map_or(bucket.created_micros, |o| o.min(bucket.created_micros)));
+                    let created = bucket.created_micros.load(Ordering::Relaxed);
+                    stats.oldest_bucket_micros = Some(stats.oldest_bucket_micros.map_or(created, |o| o.min(created)));
                 }
             }
         }
@@ -2501,7 +2504,7 @@ impl TimeBucket {
             max_timestamp: AtomicI64::new(i64::MIN),
             row_min_ts: AtomicI64::new(i64::MAX),
             row_max_ts: AtomicI64::new(i64::MIN),
-            created_micros: crate::support::now_micros(),
+            created_micros: AtomicI64::new(crate::support::now_micros()),
             wal_shard_state: Mutex::new(WalShardState::default()),
             flush_pinned_prefix: AtomicUsize::new(0),
             mutation_gen: AtomicU64::new(0),
@@ -3911,6 +3914,24 @@ mod tests {
         let oldest = buffer.get_stats().oldest_bucket_micros.expect("flushable bucket present");
         let dwell_secs = (crate::support::now_micros() - oldest) / 1_000_000;
         assert!(dwell_secs < 60, "dwell should be ~0 for a freshly-buffered backfill bucket, got {dwell_secs}s");
+    }
+
+    /// Rows landing while a flush is airborne survive its prefix drain; they have dwelt
+    /// only since that flush, not since the bucket was first created. Inheriting the
+    /// creation time paged prod (`oldest_bucket_age_seconds` 4,517s) while every flush
+    /// committed and the WAL pin age stayed ~700s.
+    #[test]
+    fn oldest_bucket_age_restarts_for_rows_surviving_a_flush() {
+        let start = crate::support::set_micros(1_800_000_000_000_000);
+        let buffer = MemBuffer::new();
+        let ts = start - 2 * bucket_duration_micros();
+        buffer.insert("p", "t", make_batch_with_rows(ts, 10), ts).unwrap();
+        crate::support::advance_micros(3_600_000_000);
+        let snapshot = buffer.snapshot_bucket_for_flush("p", "t", MemBuffer::compute_bucket_id(ts)).unwrap();
+        buffer.insert("p", "t", make_batch_with_rows(ts, 1), ts).unwrap();
+        assert!(buffer.finish_flushed_snapshot(&snapshot, true));
+        let dwell_secs = (crate::support::now_micros() - buffer.get_stats().oldest_bucket_micros.expect("survivor present")) / 1_000_000;
+        assert!(dwell_secs < 60, "survivor inherited the drained prefix's dwell: {dwell_secs}s");
     }
 
     /// The cached total must equal the authoritative sum of the bucket atomics
