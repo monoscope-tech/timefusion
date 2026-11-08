@@ -435,6 +435,12 @@ fields:
     nullable: true
     bloom_filter: true
     tantivy: { indexed: true, tokenizer: raw }
+  # The visitor's country (ISO 3166-1 alpha-2), which monoscope's ingest stamps from the client's
+  # address. Geomap widgets group by it; promoted so they skip the `attributes` blob. Appended LAST,
+  # after storage was widened by `migrate-columns`, for the same reason as the column above.
+  - name: attributes___geo___country___iso_code
+    data_type: Utf8
+    nullable: true
 
 # Continuous-aggregate rollups derived from this table. The rollup's own table
 # (`otel_logs_and_spans_rollup_dashboard_1m_v4`) is SYNTHESIZED from this spec plus the field
