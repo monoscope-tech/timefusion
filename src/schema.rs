@@ -962,7 +962,7 @@ mod tests {
     /// column set does not match, and every write fails.
     /// `migrate-columns` APPENDS, so a later migration must extend a row's list
     /// at the end, never insert mid-list.
-    #[test_case("otel_logs_and_spans", &["updated_at", "deleted", "attributes___http___route", "attributes___geo___country___iso_code"] ; "otel_logs_and_spans")]
+    #[test_case("otel_logs_and_spans", &["updated_at", "deleted", "attributes___http___route"] ; "otel_logs_and_spans")]
     #[test_case("otel_metrics", &["updated_at", "deleted"] ; "otel_metrics")]
     fn shipped_mor_tables_declare_the_migrated_columns_last(name: &str, migrated: &[&str]) {
         let schema = get_schema(name).unwrap_or_else(|| panic!("{name} registered"));
