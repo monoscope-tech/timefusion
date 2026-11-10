@@ -7479,7 +7479,7 @@ impl Database {
             self.dedup_dirty_bins.remove(key);
         }
         self.persist_dirty_bins();
-        warn!(retired = undrainable.len(), event = "dirty_bins_retired_undrainable", "dropped dirty bins for tables the dedup cron does not serve");
+        info!(retired = undrainable.len(), event = "dirty_bins_retired_undrainable", "dropped dirty bins for tables the dedup cron does not serve");
         undrainable.len()
     }
 
