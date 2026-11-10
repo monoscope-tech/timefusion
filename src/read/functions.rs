@@ -529,10 +529,20 @@ impl ScalarUDFImpl for VariantGetStepUdf {
         variant_get_udf().inner().return_field_from_args(datafusion::logical_expr::ReturnFieldArgs { arg_fields: &arg_fields, scalar_arguments: &[] })
     }
     fn invoke_with_args(&self, mut args: ScalarFunctionArgs) -> datafusion::error::Result<ColumnarValue> {
-        let ColumnarValue::Scalar(step) = &args.args[1] else {
-            return datafusion::common::exec_err!("variant_get_step needs a scalar key");
+        let step = match &args.args[1] {
+            ColumnarValue::Scalar(step) => step.clone(),
+            // Common-subexpression elimination hoists a key shared by several `->`
+            // chains into a column, so it arrives as an array of one repeated value.
+            ColumnarValue::Array(keys) if keys.is_empty() => ScalarValue::Utf8(Some(String::new())),
+            ColumnarValue::Array(keys) => {
+                let first = ScalarValue::try_from_array(keys, 0)?;
+                if (1..keys.len()).any(|row| ScalarValue::try_from_array(keys, row).is_ok_and(|key| key != first)) {
+                    return datafusion::common::exec_err!("variant_get_step needs one key for the whole batch");
+                }
+                first
+            }
         };
-        let part = match step {
+        let part = match &step {
             ScalarValue::Int64(Some(i)) => PathComponent::Index(*i),
             ScalarValue::Int32(Some(i)) => PathComponent::Index((*i).into()),
             other => match extract_utf8_string(other) {

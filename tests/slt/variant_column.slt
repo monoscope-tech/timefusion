@@ -145,3 +145,11 @@ query T
 SELECT id FROM otel_logs_and_spans WHERE project_id='variant_col_test' AND body IN ('"request completed"', '"other"')
 ----
 vc_2
+
+# The same key under two -> chains in one GROUP BY: common-subexpression
+# elimination hoists the shared key into a column, which reached variant_get_step
+# as an array ("variant_get_step needs a scalar key", the k8s workloads widget).
+query T
+SELECT coalesce(body->'missing'->>'k', body->'nested'->>'k') AS workload FROM otel_logs_and_spans WHERE project_id='variant_col_test' AND id='vc_1' GROUP BY coalesce(body->'missing'->>'k', body->'nested'->>'k')
+----
+v
