@@ -38,8 +38,10 @@ pub enum MissReason {
     /// Coverage cannot be established at all: buffered rows, or a window whose
     /// dates cannot be enumerated.
     IncompleteCoverage,
-    /// The certified interior is too small to be worth the union's second scan.
+    /// The window is too narrow for any tier's grain to leave an interior.
     TinyInterior,
+    /// Coverage left no whole interior bucket in a window wide enough to have one.
+    EmptyInterior,
     /// Hybrid routing would create too many disjoint raw/rollup predicates.
     TooManyBranches,
     RewriteSchemaMismatch,
@@ -63,6 +65,12 @@ pub enum MissReason {
 impl MissReason {
     pub fn label(self) -> &'static str {
         self.into()
+    }
+
+    /// Whether any build could serve the query. Shape declines — sub-grain windows,
+    /// bucket widths finer than every grain, several scans — stay out of the hit rate.
+    pub fn servable(self) -> bool {
+        !matches!(self, Self::TinyInterior | Self::PartialBucket | Self::MultiScanSource)
     }
 }
 
@@ -2627,6 +2635,7 @@ mod tests {
                 "stale_coverage",
                 "incomplete_coverage",
                 "tiny_interior",
+                "empty_interior",
                 "too_many_branches",
                 "rewrite_schema_mismatch",
                 "unwalkable_source",
@@ -3443,6 +3452,17 @@ mod tests {
         routed.is_ok()
     }
 
+    #[test_case::test_case(MissReason::NotBuilt, true; "a missing build counts against routing")]
+    #[test_case::test_case(MissReason::EmptyInterior, true; "so does coverage that leaves no interior")]
+    #[test_case::test_case(MissReason::TinyInterior, false; "a window under one grain no build can serve")]
+    #[test_case::test_case(MissReason::PartialBucket, false; "nor buckets finer than every grain")]
+    fn only_servable_misses_enter_the_hit_rate(reason: MissReason, counted: bool) {
+        let total = || crate::observability::maintenance_stats().rollup_misses_total.load(std::sync::atomic::Ordering::Relaxed);
+        let before = total();
+        crate::observability::record_rollup_miss(reason);
+        assert_eq!(total() - before, u64::from(counted));
+    }
+
     /// monoscope's hourly proven-endpoint job unnests `hashes` itself, so it reads one row per
     /// element exactly as `hashes_30m` stores them: it routes there with no membership pin, its
     /// `hashes && L` implied by the element filter, and its raw legs unnest too.
@@ -3948,7 +3968,7 @@ mod tests {
         );
         assert_eq!(
             stats.rollup_misses_total.load(std::sync::atomic::Ordering::Relaxed) - misses_before,
-            u64::from(expected_reason != MissReason::MultiScanSource),
+            u64::from(expected_reason.servable()),
             "a multi-scan plan no rollup can serve must stay out of the hit-rate denominator"
         );
 

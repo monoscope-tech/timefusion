@@ -3242,6 +3242,38 @@ async fn a_resume_whose_staged_parquet_is_gone_stages_normally() -> Result<()> {
     Ok(())
 }
 
+/// A slice published between two replays GROWS the cell; only a held range the tags no
+/// longer prove is drift. Prod logged ~1.3k/day for today's partitions, every project
+/// `held=16 proved=17`, because each hourly replay found the hour published since.
+#[tokio::test(flavor = "multi_thread")]
+async fn coverage_published_between_replays_is_not_a_ledger_disagreement() -> Result<()> {
+    let db = Database::with_config(create_test_config("ledger-growth")).await?;
+    db.cancel_maintenance();
+    let project = format!("ledger_{}", uuid::Uuid::new_v4().simple());
+    let day = (Utc::now() - chrono::Duration::days(3)).date_naive();
+    let rows = [1, 13].map(|hour| test_span_ts(&format!("row-{hour}"), "op", &project, day.and_hms_opt(hour, 0, 0).unwrap().and_utc().timestamp_micros()));
+    db.insert_records_batch(&project, "otel_logs_and_spans", vec![json_to_batch(rows.to_vec())?], true, None).await?;
+    let disagreements = || crate::observability::maintenance_stats().coverage_ledger_disagreements.load(std::sync::atomic::Ordering::Relaxed);
+    let mut before = 0;
+    for offset in [0, 12] {
+        db.run_unit_once("otel_logs_and_spans", &project, day, crate::maintenance_coordinator::Operation::BaseRollup, 12, offset, None).await?;
+        before = if offset == 0 { disagreements() } else { before };
+        db.recover_rollup_coverage("otel_logs_and_spans").await?;
+    }
+    assert_eq!(disagreements(), before, "a second half published after the first replay only grew the cell");
+
+    use crate::storage::CoverageLedger as _;
+    let cell = ("otel_logs_and_spans".to_owned(), project.clone(), rollup_tier(false), day.to_string());
+    let mut held = db.coverage_ledger.coverage(&cell);
+    let mut unproved = held[0].clone();
+    (unproved.start_micros, unproved.end_micros) = (unproved.end_micros + 3_600_000_000, unproved.end_micros + 7_200_000_000);
+    held.push(unproved);
+    db.coverage_ledger.replace_many(vec![(cell, held)]);
+    db.recover_rollup_coverage("otel_logs_and_spans").await?;
+    assert_eq!(disagreements(), before + 1, "a held range the tags do not prove is still drift");
+    Ok(())
+}
+
 /// The tag replay also records what it read into the coverage ledger, and the
 /// ledger must agree with the tag-derived routing map in both directions.
 ///
@@ -12205,5 +12237,31 @@ async fn a_narrow_provider_ignores_a_selected_file_its_snapshot_lacks() -> Resul
     let batches = ctx.sql(&format!("SELECT count(*) FROM scan WHERE project_id = '{project_id}'")).await?.collect().await?;
     let count = batches[0].column(0).as_any().downcast_ref::<arrow::array::Int64Array>().unwrap().value(0);
     assert_eq!(count, 8);
+    Ok(())
+}
+
+/// Log cleanup deletes the checkpoint a long-lived snapshot was loaded from, and a Full
+/// vacuum replaying that snapshot's log segment 404'd (prod 11-09, a 1d rollup tier).
+#[tokio::test]
+async fn vacuum_reloads_a_snapshot_whose_checkpoint_was_cleaned_up() -> Result<()> {
+    use object_store::ObjectStoreExt as _;
+    let db = Database::with_config(create_test_config("vacuum-stale-checkpoint")).await?;
+    db.cancel_maintenance();
+    let (_, _, mut table) = mem_table("vacuum-stale-checkpoint", int_id_cols()).await?;
+    let overwrite = |table: DeltaTable, ids: Vec<i32>| table.write(vec![int_id_batch(ids)]).with_save_mode(deltalake::protocol::SaveMode::Overwrite);
+    table = overwrite(table, vec![1]).await?;
+    deltalake::checkpoints::create_checkpoint(&table, None).await?;
+    let anchor = table.version().expect("version");
+    for ids in [vec![2], vec![3]] {
+        table = overwrite(table, ids).await?;
+    }
+    // Current, so the refresh's staleness probe keeps it, and anchored on the old checkpoint.
+    let mut stale = DeltaTable::new(table.log_store());
+    stale.load().await?;
+    deltalake::checkpoints::create_checkpoint(&table, None).await?;
+    table.log_store().object_store(None).delete(&object_store::path::Path::from(format!("_delta_log/{anchor:020}.checkpoint.parquet"))).await?;
+
+    let deleted = db.vacuum_table("", "vacuum-stale-checkpoint", &Arc::new(RwLock::new(stale)), 0).await;
+    assert!(deleted > 0, "the overwritten files must be vacuumed, not lost to a 404 on the cleaned-up checkpoint");
     Ok(())
 }

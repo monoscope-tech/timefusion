@@ -157,6 +157,7 @@ counter_registry! {
     rollup_witness_moving_rows => "timefusion.rollup.witness_moving_rows": "Rows landing below a live rollup slice's covered_through, which moves its bounded witness (W31 step 0), by class: flushed = every flushed row; transparent = merge-on-read versions no rollup reads whose predecessor already flushed; base_version = the other version rows. Ingest is flushed minus both version classes",
     rollup_scan_estimated_bytes => "timefusion.rollup.scan_estimated_bytes": "Projected bytes of every rollup scan pass, including failed and repeated shard passes, by tier. Against published_input_bytes this is the wasted-scan share",
     rollup_misses              => "timefusion.rollup.misses": "Dashboard aggregates that fell through to a raw scan, labelled by REASON. Without the reason breakdown there is no feedback loop telling us which dimension to add next — a rollup silently serving 20% of traffic looks identical to one serving 90%",
+    rollup_unservable          => "timefusion.rollup.unservable": "Aggregates no rollup build could serve (a window under one grain, buckets finer than every grain, several scans), by REASON. Kept out of rollup.misses so the hit rate measures routing, not the query mix",
     cache_insert_bypassed    => "timefusion.cache.insert_bypassed": "Cache populations steered disk-only because the read ran inside a large-scan bypass scope (scan-resistant admission — a wide historical scan must not evict the hot L1 tail)",
     dedup_unit_skipped_certified => "timefusion.dedup.unit_skipped_certified": "Coordinator Dedup units completed without scanning because the partition's live files and deletion vectors equal a live whole-day certification",
     dedup_chunk_skipped        => "timefusion.dedup.chunk_skipped": "Dedup chunk rewrites skipped (over the rewrite-byte budget, or partition in failure backoff). Duplicates persist in Delta — read-side dedup keeps queries correct — until a later sweep or manual compaction clears them. WARN if sustained",
@@ -1316,15 +1317,14 @@ pub fn sample_rollup_miss(key: &'static str) -> bool {
 pub fn record_rollup_miss(reason: crate::rollup::MissReason) {
     use crate::rollup::MissReason as R;
     let stats = maintenance_stats();
-    // A plan that scans the source more than once (raw self-joins, UNIONs) is outside
-    // what any rollup can serve, so it stays out of the hit-rate denominator.
-    if reason != R::MultiScanSource {
+    if reason.servable() {
         stats.rollup_misses_total.fetch_add(1, Relaxed);
     }
     match reason {
         R::NotBuilt => &stats.rollup_miss_not_built,
         R::StaleCoverage => &stats.rollup_miss_stale_coverage,
         R::TinyInterior => &stats.rollup_miss_tiny_interior,
+        R::EmptyInterior => &stats.rollup_miss_empty_interior,
         R::TooManyBranches => &stats.rollup_miss_too_many_branches,
         R::UnsupportedShape => &stats.rollup_miss_unsupported,
         R::IncompleteCoverage => &stats.rollup_miss_incomplete_coverage,
@@ -1346,7 +1346,8 @@ pub fn record_rollup_miss(reason: crate::rollup::MissReason) {
     }
     .fetch_add(1, Relaxed);
     if let Some(m) = METRICS.get() {
-        m.rollup_misses.add(1, &[KeyValue::new("reason", reason.label())]);
+        let counter = if reason.servable() { &m.rollup_misses } else { &m.rollup_unservable };
+        counter.add(1, &[KeyValue::new("reason", reason.label())]);
     }
 }
 
@@ -1871,6 +1872,7 @@ atomic_stats! {
         rollup_miss_not_built as "rollup_miss_not_built_total",
         rollup_miss_stale_coverage as "rollup_miss_stale_coverage_total",
         rollup_miss_tiny_interior as "rollup_miss_tiny_interior_total",
+        rollup_miss_empty_interior as "rollup_miss_empty_interior_total",
         rollup_miss_too_many_branches as "rollup_miss_too_many_branches_total",
         rollup_miss_unsupported as "rollup_miss_unsupported_total",
         rollup_miss_incomplete_coverage as "rollup_miss_incomplete_coverage_total",

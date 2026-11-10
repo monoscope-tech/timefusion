@@ -356,9 +356,10 @@ impl ErrorHandler for LoggingErrorHandler {
 }
 
 /// DataFusion rejecting the statement itself (unknown table/column/function, bad
-/// syntax) — the client's mistake, not a server fault worth an ERROR-level page.
+/// syntax, a string literal that is not a value of its column's type) — the
+/// client's mistake, not a server fault worth an ERROR-level page.
 fn is_client_sql_error(message: &str) -> bool {
-    ["Error during planning:", "SQL error:", "Schema error:"].iter().any(|kind| message.contains(kind))
+    ["Error during planning:", "SQL error:", "Schema error:", "Cast error: Cannot cast string"].iter().any(|kind| message.contains(kind))
 }
 
 /// Concurrent-giant-statement gate. A multi-MB statement materializes its
@@ -1565,6 +1566,7 @@ mod pgwire_handlers_tests {
     #[test_case("PgWire internal error: Error during planning: table 'datafusion.public.metrics' not found" => true ; "unknown table")]
     #[test_case("SQL error: ParserError(\"Expected: an expression, found: EOF\")" => true ; "syntax")]
     #[test_case("Schema error: No field named nope." => true ; "unknown column")]
+    #[test_case("Optimizer rule 'simplify_expressions' failed\ncaused by\nArrow error: Cast error: Cannot cast string '1.5' to value of Int64 type" => true ; "a literal that is not a value of its column")]
     #[test_case("Internal error: Physical input schema should be the same" => false ; "engine bug")]
     #[test_case("Resources exhausted: Failed to allocate additional 1.0 GB" => false ; "pool exhausted")]
     fn client_sql_errors_are_not_server_faults(message: &str) -> bool {

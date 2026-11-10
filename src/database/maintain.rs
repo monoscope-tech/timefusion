@@ -6067,7 +6067,8 @@ impl Database {
     /// Callers MUST pass slices that already passed every filter the read path applies,
     /// so the ledger claims exactly what a query would be served — never more.
     ///
-    /// `coverage_ledger_disagreements` is the standing alarm against ledger drift; it
+    /// `coverage_ledger_disagreements` is the standing alarm against the ledger
+    /// OVER-claiming (a held range the tags no longer prove); growth is not drift. It
     /// must read zero before any read path trusts the ledger.
     fn record_readable_coverage(&self, source: &str, target: &str, readable: HashMap<crate::storage::CoverageCell, Vec<crate::storage::CoverageEntry>>) {
         use crate::storage::CoverageLedger as _;
@@ -6079,8 +6080,10 @@ impl Database {
             .map(|(cell, entries)| {
                 let proved = crate::storage::merge_coverage(entries);
                 let held = self.coverage_ledger.coverage(&cell);
-                // An empty `held` is the FIRST replay for that cell, not a disagreement.
-                if !held.is_empty() && held != proved {
+                // Only a held range the tags no longer prove is drift; a slice published
+                // since the last replay grows the cell (and an empty `held` is its first).
+                let proved_ranges = proved.iter().map(|entry| (entry.start_micros, entry.end_micros)).collect_vec();
+                if held.iter().any(|entry| !crate::rollup::ranges_cover(&proved_ranges, (entry.start_micros, entry.end_micros - 1))) {
                     disagreements += 1;
                     warn!(
                         table = %target, project_id = %cell.1, date = %cell.3,
@@ -6113,6 +6116,34 @@ impl Database {
     /// Bounded by `timefusion_rollup_backfill_days`, the same horizon the planner
     /// enumerates. `0` disables the backfill and must therefore retire NOTHING, not
     /// everything. Dates come from the virtual clock, so e2e time travel drives this.
+    /// Clear dirty hours no outstanding rollup unit still covers. The entry stays at
+    /// zero rather than going: an absent one persists as "unknown", i.e. all hours dirty.
+    fn retire_drained_rollup_dirty(&self, source: &str) -> usize {
+        use crate::maintenance_coordinator::{Operation, TaskState};
+        let _journal_guard = crate::support::lock(&self.rollup_journal_lock);
+        let mut outstanding: HashMap<(String, String), u32> = HashMap::new();
+        for task in self.journal().tasks().filter(|task| {
+            task.key.source == source
+                && matches!(task.key.operation, Operation::BaseRollup | Operation::DerivedRollup)
+                && matches!(task.state, TaskState::Pending | TaskState::Running | TaskState::Retry)
+        }) {
+            for (date, hours) in window_hour_masks(task.key.slice.start_micros, task.key.slice.end_micros).unwrap_or_default() {
+                *outstanding.entry((task.key.project_id.clone(), date)).or_default() |= hours;
+            }
+        }
+        let mut retired = 0;
+        for mut entry in self.rollup_dirty.iter_mut().filter(|entry| entry.key().1 == source && *entry.value() != 0) {
+            let (project, _, date) = entry.key().clone();
+            let left = *entry.value() & outstanding.get(&(project, date)).copied().unwrap_or(0);
+            if left == 0 {
+                self.rollup_invalidated_at.remove(entry.key());
+                retired += 1;
+            }
+            *entry.value_mut() = left;
+        }
+        retired
+    }
+
     fn retire_aged_out_coverage(&self) -> usize {
         let horizon = self.config.maintenance.timefusion_rollup_backfill_days;
         if horizon == 0 {
@@ -6137,6 +6168,7 @@ impl Database {
     pub async fn recover_rollup_coverage(&self, source: &str) -> Result<usize> {
         let Some(schema) = get_schema(source).filter(|schema| !schema.rollups.is_empty()) else { return Ok(0) };
         self.retire_aged_out_coverage();
+        self.retire_drained_rollup_dirty(source);
         let mut recovered = 0;
         // Summed over every declared tier, then stored ONCE — a per-tier store would
         // make the last spec's count the whole reading.
@@ -7448,7 +7480,7 @@ impl Database {
             self.dedup_dirty_bins.remove(key);
         }
         self.persist_dirty_bins();
-        warn!(retired = undrainable.len(), event = "dirty_bins_retired_undrainable", "dropped dirty bins for tables the dedup cron does not serve");
+        info!(retired = undrainable.len(), event = "dirty_bins_retired_undrainable", "dropped dirty bins for tables the dedup cron does not serve");
         undrainable.len()
     }
 
@@ -10291,15 +10323,34 @@ impl Database {
         // Get a clone so the table RwLock is not held across object-store IO.
         // The per-physical-table commit lock above keeps this snapshot stable.
         let table_clone = { table_ref.read().await.clone() };
-        match table_clone
-            .vacuum()
-            .with_retention_period(chrono::Duration::hours(retention_hours as i64))
-            .with_enforce_retention_duration(false) // Allow deletion of files newer than default retention
-            // Full also sweeps orphaned parquet whose tombstones already left the retained
-            // log; without it, bounding the log turns those files into a permanent leak.
-            .with_mode(deltalake::operations::vacuum::VacuumMode::Full)
-            .await
-        {
+        let vacuum = |table: DeltaTable| {
+            table
+                .vacuum()
+                .with_retention_period(chrono::Duration::hours(retention_hours as i64))
+                .with_enforce_retention_duration(false) // Allow deletion of files newer than default retention
+                // Full also sweeps orphaned parquet whose tombstones already left the retained
+                // log; without it, bounding the log turns those files into a permanent leak.
+                .with_mode(deltalake::operations::vacuum::VacuumMode::Full)
+        };
+        let result = match vacuum(table_clone.clone()).await {
+            // Log cleanup can delete the checkpoint a current snapshot was loaded from (the
+            // refresh probe keeps a current one), and Full replays that log segment. Reload
+            // from the latest checkpoint once; the commit lock makes the swap safe.
+            Err(e) if e.to_string().contains("_delta_log") && e.to_string().contains("not found") => {
+                let mut fresh = table_clone;
+                let version = fresh.version().unwrap_or_default();
+                fresh.state = None;
+                match fresh.load_version(version).await {
+                    Ok(()) => {
+                        *table_ref.write().await = fresh.clone();
+                        vacuum(fresh).await
+                    }
+                    Err(reload) => Err(reload),
+                }
+            }
+            other => other,
+        };
+        match result {
             Ok((_, metrics)) => {
                 let files_deleted = metrics.files_deleted.len();
                 info!("Vacuum completed in {:?}, deleted {} files", start_time.elapsed(), files_deleted);
@@ -13855,6 +13906,38 @@ mod rollup_journal_persist_tests {
         db.commit_journal()?;
         assert_eq!(counts().1 - before.1, 1, "an unchanged journal must be skipped on content, not merely deferred");
         assert_eq!(counts().0, before.0, "and must not write");
+        Ok(())
+    }
+
+    /// The dirty ledger is scheduling state, so an hour is clean once no rollup unit over
+    /// it is outstanding. Nothing ever cleared it, so `pending_dirty_partitions` counted
+    /// every partition ever invalidated and its oldest age tracked the wall clock.
+    #[tokio::test]
+    async fn rollup_dirty_hours_clear_once_their_units_drain() -> Result<()> {
+        use crate::maintenance_coordinator::{Operation, TaskState};
+        let db = Database::with_config(TestConfigBuilder::new("rollup_dirty_drain").with_rollups().build()).await?;
+        let (project, source) = (format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]), "otel_logs_and_spans");
+        let date = (chrono::Utc::now() - chrono::Duration::days(2)).date_naive().to_string();
+        let key = (project.clone(), source.to_string(), date.clone());
+        db.apply_rollup_hours(&project, source, &date, (1 << 12) | (1 << 13))?;
+        let units: Vec<_> = db
+            .journal()
+            .tasks()
+            .filter(|task| task.key.project_id == project && matches!(task.key.operation, Operation::BaseRollup | Operation::DerivedRollup))
+            .filter(|task| task.state != TaskState::Complete)
+            .map(|task| task.key.clone())
+            .collect();
+        assert!(!units.is_empty(), "the invalidation must mint rollup work");
+
+        db.retire_drained_rollup_dirty(source);
+        assert_eq!(db.rollup_dirty.get(&key).map(|hours| *hours), Some((1 << 12) | (1 << 13)), "outstanding units keep their hours dirty");
+
+        units.iter().for_each(|unit| assert!(db.journal().complete(unit)));
+        db.retire_drained_rollup_dirty(source);
+        assert_eq!(db.rollup_dirty.get(&key).map(|hours| *hours), Some(0), "drained hours are clean");
+        assert!(!db.rollup_invalidated_at.contains_key(&key), "and no longer age the oldest invalidation");
+        let entry = db.rollup_journal_entries().into_iter().find(|entry| entry.project_id == project).expect("the partition keeps its epoch");
+        assert!(!entry.unknown && entry.dirty_hours == 0, "the persisted ledger must say clean, not unknown: {entry:?}");
         Ok(())
     }
 }
