@@ -6666,6 +6666,45 @@ async fn hot_packing_pairs_only_within_a_slice_cell() -> Result<()> {
     Ok(())
 }
 
+/// A packing output holds a subset of its inputs' rows, so when slice coverage
+/// witnessed every input the output joins the witnessed set and the proof survives.
+/// Otherwise every packing wave made its own output block the per-file skip (52% of
+/// prod blockers on 11-10 were `packed_output`).
+#[tokio::test]
+async fn packing_witnessed_inputs_carries_the_slice_witness_to_the_output() -> Result<()> {
+    use crate::maintenance_coordinator::{DAY_MICROS, Operation, TaskKey, TimeSlice};
+    let db = Database::with_config(create_test_config("witness-carry")).await?;
+    let project = format!("carry_{}", uuid::Uuid::new_v4().simple());
+    let today = crate::support::today_utc();
+    let midnight = midnight_micros(today);
+    for (id, minute) in [("a", 1), ("c", 3)] {
+        insert_a_span(&db, &project, id, midnight + minute * 60_000_000).await?;
+    }
+    assert!(run_dedup_slice(&db, &project, midnight, midnight + 3_600_000_000).await?, "the slice unit must run");
+    let key = (project.clone(), "otel_logs_and_spans".to_owned(), today.to_string());
+    let intervals = db.dedup_slice_coverage.get(&key).map(|coverage| coverage.intervals.clone()).expect("the clean slice is banked");
+
+    db.recover_rollup_coverage("otel_logs_and_spans").await?;
+    let source = "otel_logs_and_spans".to_owned();
+    let slice = TimeSlice::new(midnight, midnight + DAY_MICROS)?;
+    db.maintenance_tasks.lock().unwrap().enqueue(
+        TaskKey { physical_table: source.clone(), source, project_id: project.clone(), slice, operation: Operation::HotPacking },
+        0,
+        1024,
+        0,
+    );
+    assert!(db.run_coordinator_compaction_once(Operation::HotPacking).await?, "the pair is packed");
+
+    let table = db.resolve_table(&project, "otel_logs_and_spans").await?;
+    let live = Database::logical_count_partition_snapshot(&*table.read().await, &project, &today.to_string())?.1;
+    assert_eq!(live.len(), 1, "the two inputs became one output");
+    let coverage = db.dedup_slice_coverage.get(&key).map(|coverage| coverage.value().clone()).expect("coverage survives the wave");
+    assert_eq!(coverage.files, live, "the output replaces its witnessed inputs");
+    assert_eq!(coverage.intervals, intervals, "and the proof is kept");
+    assert_eq!(coverage.fp, partition_file_fp(&live.keys().cloned().collect::<Vec<_>>()), "with a fingerprint the next slice will not read as moved");
+    Ok(())
+}
+
 /// A bin holding unsorted files is budgeted in DECODED bytes — a
 /// compressed-byte cap is ~12x stricter than intended, and since the
 /// sorted-run tag is written only by OPTIMIZE it applies to nearly every bin
