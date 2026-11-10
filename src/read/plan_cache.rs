@@ -140,6 +140,7 @@ impl<V: Clone> WeighedMap<V> {
     /// random half would keep the pressure and drop the hot templates.
     fn sweep(&self, label: &'static str) {
         let low_water = self.max_bytes / SWEEP_LOW_WATER_DEN * SWEEP_LOW_WATER_NUM;
+        let low_water_len = self.capacity / SWEEP_LOW_WATER_DEN * SWEEP_LOW_WATER_NUM;
         warn!(
             target: "plan_cache",
             cache = label,
@@ -157,7 +158,7 @@ impl<V: Clone> WeighedMap<V> {
         let mut held = self.bytes();
         let mut len = self.map.len();
         for (weight, key) in by_weight {
-            if held <= low_water && len < self.capacity {
+            if held <= low_water && len <= low_water_len {
                 break;
             }
             if self.map.remove(&key).is_some() {
@@ -1376,23 +1377,27 @@ mod tests {
         assert!(hook.cache.contains_key(&parse(select).to_string()), "the flood evicted the small hot SELECT instead of the bulk INSERTs paying for the bytes");
     }
 
-    /// A sweep must leave headroom: evicting to exactly the cap lets the very next
-    /// insert re-cross it, and every Parse then pays a full sort of the map.
-    #[test]
-    fn a_sweep_leaves_headroom_so_the_next_insert_cannot_re_trigger_it() {
-        // 8 slots x 1 KiB = 8 KiB of budget, entries of 1 KiB each.
+    /// A sweep must leave headroom on BOTH bounds: evicting to exactly the cap lets the
+    /// very next insert re-cross it, and every Parse then pays a full sort of the map
+    /// plus a WARN. The count bound did: ~400k sweeps/day on a two-day-old prod process.
+    #[test_case(1024 ; "the byte bound")]
+    #[test_case(1 ; "the count bound")]
+    fn a_sweep_leaves_headroom_so_the_next_insert_cannot_re_trigger_it(weight: usize) {
         let map: WeighedMap<u8> = WeighedMap::new(8, 1024);
         for i in 0..8 {
-            map.insert(format!("k{i}"), 0, 1024, "test");
+            map.insert(format!("k{i}"), 0, weight, "test");
         }
-        assert!(map.bytes() >= map.max_bytes, "the budget must actually be reached to arm the sweep");
+        assert!(map.len() >= map.capacity || map.bytes() >= map.max_bytes, "a bound must actually be reached to arm the sweep");
 
-        // This insert sweeps; the map must then sit at or under the low water mark
-        // plus the one entry just admitted.
-        map.insert("trigger".into(), 0, 1024, "test");
+        map.insert("trigger".into(), 0, weight, "test");
         let low_water = map.max_bytes / SWEEP_LOW_WATER_DEN * SWEEP_LOW_WATER_NUM;
-        assert!(map.bytes() <= low_water + 1024, "swept to {} bytes, expected <= {} — no headroom left", map.bytes(), low_water + 1024);
-        assert!(map.bytes() < map.max_bytes, "a sweep that lands ON the cap re-arms itself on the next insert");
+        assert!(map.bytes() <= low_water + weight, "swept to {} bytes, expected <= {}", map.bytes(), low_water + weight);
+        assert!(
+            map.len() <= map.capacity / SWEEP_LOW_WATER_DEN * SWEEP_LOW_WATER_NUM + 1,
+            "swept to {} entries — no headroom under {}",
+            map.len(),
+            map.capacity
+        );
     }
 
     /// An entry heavier than the entire budget is served but never admitted:
