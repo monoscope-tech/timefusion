@@ -6067,7 +6067,8 @@ impl Database {
     /// Callers MUST pass slices that already passed every filter the read path applies,
     /// so the ledger claims exactly what a query would be served — never more.
     ///
-    /// `coverage_ledger_disagreements` is the standing alarm against ledger drift; it
+    /// `coverage_ledger_disagreements` is the standing alarm against the ledger
+    /// OVER-claiming (a held range the tags no longer prove); growth is not drift. It
     /// must read zero before any read path trusts the ledger.
     fn record_readable_coverage(&self, source: &str, target: &str, readable: HashMap<crate::storage::CoverageCell, Vec<crate::storage::CoverageEntry>>) {
         use crate::storage::CoverageLedger as _;
