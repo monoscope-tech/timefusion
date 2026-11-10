@@ -475,7 +475,7 @@ impl Database {
                     "coverage produced no usable interior for this window"
                 );
             }
-            return Err(if measure_declined { crate::rollup::MissReason::MeasureNotStored } else { miss.unwrap_or(crate::rollup::MissReason::TinyInterior) });
+            return Err(if measure_declined { crate::rollup::MissReason::MeasureNotStored } else { miss.unwrap_or(crate::rollup::MissReason::EmptyInterior) });
         }
         if crate::rollup::hybrid_branch_count(route.lo, route.hi, &interiors) > 32 {
             return Err(crate::rollup::MissReason::TooManyBranches);
