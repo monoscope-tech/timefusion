@@ -5018,7 +5018,8 @@ impl Database {
     }
 
     /// The live files of one date partition that a certification still vouches
-    /// for AND that no uncertified file could hold another version of.
+    /// for AND that no file outside the current slice coverage's witnessed set could
+    /// hold another version of (any uncertified file, for files outside its intervals).
     ///
     /// The additive half of certification: `dedup_window_certified` is all-or-nothing
     /// and any new file makes it false, whereas this asks WHICH proved files are still
@@ -5044,7 +5045,21 @@ impl Database {
         let (_, visibility) = Self::logical_count_partition_snapshot(table, project_id, date).ok()?;
         let proved: HashSet<&str> = cert.files.iter().filter(|(path, dv)| visibility.get(*path) == Some(*dv)).map(|(path, _)| path.as_str()).collect();
         let (certified, uncertified): (Vec<_>, Vec<_>) = spans.iter().map(|(rel, span)| (rel.as_str(), *span)).partition(|(rel, _)| proved.contains(rel));
-        let skippable = crate::read::skippable_certified_files(certified.iter().copied(), &uncertified.iter().map(|(_, span)| *span).collect::<Vec<_>>());
+        // The live slice coverage proved its intervals duplicate-free across every file it
+        // read, and a duplicate shares its row's timestamp. So a certified file inside those
+        // intervals can be blocked only by a file the coverage did not witness.
+        let coverage = self.dedup_slice_coverage.get(&key).map(|entry| entry.value().clone()).unwrap_or_default();
+        let timestamp_keyed = schema_or_default(table_name).dedup_keys.iter().any(|key| key == "timestamp");
+        let witnessed = |rel: &str| coverage.files.get(rel).is_some_and(|dv| visibility.get(rel) == Some(dv));
+        let covered = |(rel, span): &(&str, crate::read::FileSpan)| {
+            timestamp_keyed && witnessed(rel) && span.is_some_and(|(lo, hi)| coverage.intervals.iter().any(|&(start, end)| lo >= start && hi < end))
+        };
+        let (inside, outside): (Vec<_>, Vec<_>) = certified.iter().copied().partition(covered);
+        let all_spans = uncertified.iter().map(|(_, span)| *span).collect::<Vec<_>>();
+        // A file without statistics is never exempt: its span cannot be shown inside the pass.
+        let unwitnessed = uncertified.iter().filter(|(rel, span)| span.is_none() || !witnessed(rel)).map(|(_, span)| *span).collect::<Vec<_>>();
+        let mut skippable = crate::read::skippable_certified_files(outside, &all_spans);
+        skippable.extend(crate::read::skippable_certified_files(inside, &unwitnessed));
         Self::attribute_skip_blockers(table, &cert.files, &certified, &skippable, &uncertified, [project_id, table_name, date]);
         let skippable = skippable.into_iter().map(str::to_string).collect();
         Some((skippable, spans.into_keys().collect()))

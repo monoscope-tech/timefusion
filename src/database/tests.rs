@@ -831,6 +831,40 @@ async fn per_file_skip_ignores_other_projects_but_not_its_own_overlaps() -> Resu
     Ok(())
 }
 
+/// A file the proof wholly covered skips `DedupExec` even when a WIDER file overlaps it,
+/// as long as that file was in the set the clean pass read. A duplicate of a covered row
+/// shares its timestamp, so it lies inside the proved interval where the pass saw every
+/// file. Only a file that arrived after the proof can still block it.
+#[tokio::test]
+#[serial]
+async fn a_witnessed_overlap_does_not_block_a_covered_file_but_a_new_one_does() -> Result<()> {
+    let db = Database::with_config(create_test_config("perfile-witnessed")).await?;
+    let day = cert_day();
+    let (t1, t2) = (day.start + 3_600_000_000, day.start + 7_200_000_000);
+    insert_a_span(&db, &day.project, "inside", t1).await?;
+    // One file spanning past the slice end: never certified, but read by the pass.
+    let wide = [day.start + 1_800_000_000, day.half + 3_600_000_000].map(|ts| test_span_ts(&format!("wide-{ts}"), "op", &day.project, ts));
+    db.insert_records_batch(&day.project, "otel_logs_and_spans", vec![json_to_batch(wide.to_vec())?], true, None).await?;
+    assert!(run_dedup_slice(&db, &day.project, day.start, day.half).await?, "the first-half unit must run");
+
+    let skippable_spans = async || -> Result<Vec<crate::read::FileSpan>> {
+        let table = db.resolve_table(&day.project, "otel_logs_and_spans").await?;
+        let table = table.read().await;
+        let spans = Database::partition_file_spans(&table, &day.project, &format!("date={}", day.date))?;
+        Ok(db.certified_files_in_partition(&table, &day.project, "otel_logs_and_spans", &day.date.to_string()).iter().map(|rel| spans[rel]).collect())
+    };
+    assert_eq!(skippable_spans().await?, vec![Some((t1, t1))], "the wide file was witnessed by the proof, so it must not block");
+    let sql = format!("SELECT COUNT(*)::BIGINT FROM otel_logs_and_spans WHERE project_id = '{}'", day.project);
+    let count = db.query_delta_only(&sql).await?.iter().filter(|b| b.num_rows() > 0).find_map(|b| first_i64(b.column(0)));
+    assert_eq!(count, Some(3), "skipping dedup for the covered file must not change the answer");
+
+    insert_a_span(&db, &day.project, "late", t2).await?;
+    assert_eq!(skippable_spans().await?, vec![Some((t1, t1))], "a new file that does not overlap it must not block");
+    insert_a_span(&db, &day.project, "late-overlap", t1).await?;
+    assert_eq!(skippable_spans().await?, Vec::<crate::read::FileSpan>::new(), "a file that arrived after the proof and overlaps it must block");
+    Ok(())
+}
+
 /// Restored slice evidence must stay `stale`, or a proof about ten minutes comes
 /// back indistinguishable from a proof about a whole day.
 #[tokio::test]
