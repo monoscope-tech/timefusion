@@ -2635,6 +2635,7 @@ mod tests {
                 "stale_coverage",
                 "incomplete_coverage",
                 "tiny_interior",
+                "empty_interior",
                 "too_many_branches",
                 "rewrite_schema_mismatch",
                 "unwalkable_source",
