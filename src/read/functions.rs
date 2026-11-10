@@ -1541,7 +1541,8 @@ impl ScalarUDFImpl for ApproxPercentileUDF {
 impl Sketch for crate::read::Hll {
     const MERGE_ERR: &'static str = "hll_merge expects Binary values";
 
-    /// Strings and binaries are hashed in place; anything else is cast to
+    /// Strings and binaries are hashed in place; a Variant hashes its JSON, since
+    /// equal values can carry different metadata bytes; anything else is cast to
     /// Utf8View first, which preserves distinctness for every primitive type.
     fn insert_array(&mut self, array: &ArrayRef) -> datafusion::error::Result<()> {
         macro_rules! feed {
@@ -1558,6 +1559,10 @@ impl Sketch for crate::read::Hll {
             DataType::BinaryView => feed!(BinaryViewArray),
             DataType::Binary => feed!(BinaryArray),
             DataType::LargeBinary => feed!(datafusion::arrow::array::LargeBinaryArray),
+            variant if crate::schema::is_variant_type(variant) => {
+                let json: StringArray = map_variant_rows(array, |json| Some(json.to_string()))?;
+                self.insert_array(&(Arc::new(json) as ArrayRef))
+            }
             _ => self.insert_array(&datafusion::arrow::compute::cast(array, &DataType::Utf8View)?),
         }
     }
@@ -1760,6 +1765,7 @@ mod hll_tests {
     #[test_case::test_case("SELECT hll_count(hll_agg(v)) FROM (VALUES ('a'),('b'),('a')) t(v)" => 2 ; "strings")]
     #[test_case::test_case("SELECT hll_count(hll_agg(v)) FROM (VALUES (arrow_cast(1, 'Timestamp(Microsecond, None)'))) t(v)" => 1 ; "timestamps")]
     #[test_case::test_case("SELECT distinct_count(approx_count_distinct(v)) FROM (VALUES (1),(2),(2),(NULL)) t(v)" => 2 ; "the timescale toolkit spelling runs unchanged")]
+    #[test_case::test_case(r#"SELECT distinct_count(approx_count_distinct(json_to_variant(v))) FROM (VALUES ('{"a":1}'),('{"a":2}'),('{"a":1}')) t(v)"# => 2 ; "variants, the log-pattern body count")]
     #[test_case::test_case(
         "SELECT distinct_count(approx_count_distinct(v) FILTER (WHERE v IS NOT NULL))::BIGINT FROM (VALUES (1),(2),(2),(NULL)) t(v)" => 2
         ; "the filtered form the session query sends runs here too"
