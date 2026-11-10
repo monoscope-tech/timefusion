@@ -354,6 +354,8 @@ pub mod scan_metric_names {
         // resets is coverage that never accumulates, which is what held
         // `cert_slice_files_proved` at 9 against 2,194 unproven.
         CERT_COVERAGE_RETAINED = "timefusion.scan.cert_coverage_retained" as scan.cert_coverage_retained;
+        // Wave bins whose witnessed inputs handed their slice-coverage witness to the output.
+        CERT_WITNESS_CARRIED = "timefusion.scan.cert_witness_carried" as scan.cert_witness_carried;
         CERT_COVERAGE_RESET = "timefusion.scan.cert_coverage_reset" as scan.cert_coverage_reset;
         // `declined`: the isolated non-conforming leg exceeded
         // `timefusion_read_sort_unordered_leg_max_mb`, so the union advertises no

@@ -9257,6 +9257,7 @@ impl Database {
                     // evicting first cold-starts the hottest query window.
                     let live_uris = self.swap_and_refresh_cache(table_ref, new_table, pre_uris.as_ref(), &markers).await;
                     self.reindex_wave_outputs(table_ref, table_name, &fresh, &live_uris).await;
+                    self.carry_slice_witness(table_name, &fresh);
                     self.record_wave_landed(&fresh, data_change, table_name);
                     self.warm_strip_bodies(table_ref, &fresh);
                     return WaveResult { landed: carried.tap_mut(|landed| landed.extend(fresh)), failed };
@@ -9314,6 +9315,41 @@ impl Database {
             }
         }
         WaveResult { landed: carried, failed }
+    }
+
+    /// A wave output holds a subset of its inputs' rows, so where slice coverage
+    /// witnessed every input of a bin (same path and deletion vector), the outputs
+    /// replace those inputs in the witnessed set and the coverage keeps its proof.
+    fn carry_slice_witness(&self, table_name: &str, bins: &[StagedBin]) {
+        let date_of = |add: &deltalake::kernel::Add| add.partition_values.get("date").cloned().flatten();
+        let mut carried = 0u64;
+        for bin in bins {
+            let outputs: Vec<&deltalake::kernel::Add> =
+                bin.adds.iter().filter_map(|action| if let deltalake::kernel::Action::Add(add) = action { Some(add) } else { None }).collect();
+            let Some(date) = bin.targets.first().and_then(date_of) else { continue };
+            if bin.targets.iter().chain(outputs.iter().copied()).any(|add| date_of(add).as_deref() != Some(date.as_str())) {
+                continue;
+            }
+            let key = (bin.project_id.clone(), table_name.to_string(), date);
+            let Some(mut coverage) = self.dedup_slice_coverage.get_mut(&key) else { continue };
+            if !bin.targets.iter().all(|add| coverage.files.get(&add.path) == Some(&add.deletion_vector)) {
+                continue;
+            }
+            for action in &bin.removes {
+                if let deltalake::kernel::Action::Remove(remove) = action {
+                    coverage.files.remove(&remove.path);
+                }
+            }
+            for add in outputs {
+                coverage.files.insert(add.path.clone(), add.deletion_vector.clone());
+            }
+            coverage.fp = partition_file_fp(&coverage.files.keys().cloned().collect::<Vec<_>>());
+            carried += 1;
+        }
+        if carried > 0 {
+            metrics::counter!(scan_metric_names::CERT_WITNESS_CARRIED).increment(carried);
+            self.persist_slice_coverage();
+        }
     }
 
     /// Publish search sidecars for every file a coordinator/dedup wave just
