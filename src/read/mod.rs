@@ -204,8 +204,8 @@ pub(crate) type FileSpan = Option<(i64, i64)>;
 /// May a set of files a sweep proved duplicate-free skip `DedupExec`, given the
 /// files in the same scan that were NOT proved clean?
 ///
-/// **The rule, applied PER FILE.** A certified file may skip iff no uncertified
-/// file's timestamp span overlaps ITS span. Per file rather than per set, so one
+/// **The rule, applied PER FILE.** A certified file may skip iff no file in
+/// `uncertified` (the possible blockers the caller passes) overlaps ITS span. Per file rather than per set, so one
 /// neighbouring file cannot poison every certified file behind it.
 ///
 /// **Why it holds.** The dedup key is `(timestamp, id)` and merge-on-read

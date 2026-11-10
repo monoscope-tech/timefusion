@@ -715,7 +715,7 @@ struct Certification {
 /// partition: disjoint sorted `[start, end)` intervals, all proved over `fp`.
 /// A unit that drops rows or a fingerprint move resets the accumulation —
 /// evidence over a moved file set is void. Memory-only.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 struct SliceCoverage {
     fp: u64,
     intervals: Vec<(i64, i64)>,
