@@ -12239,3 +12239,29 @@ async fn a_narrow_provider_ignores_a_selected_file_its_snapshot_lacks() -> Resul
     assert_eq!(count, 8);
     Ok(())
 }
+
+/// Log cleanup deletes the checkpoint a long-lived snapshot was loaded from, and a Full
+/// vacuum replaying that snapshot's log segment 404'd (prod 11-09, a 1d rollup tier).
+#[tokio::test]
+async fn vacuum_reloads_a_snapshot_whose_checkpoint_was_cleaned_up() -> Result<()> {
+    use object_store::ObjectStoreExt as _;
+    let db = Database::with_config(create_test_config("vacuum-stale-checkpoint")).await?;
+    db.cancel_maintenance();
+    let (_, _, mut table) = mem_table("vacuum-stale-checkpoint", int_id_cols()).await?;
+    let overwrite = |table: DeltaTable, ids: Vec<i32>| table.write(vec![int_id_batch(ids)]).with_save_mode(deltalake::protocol::SaveMode::Overwrite);
+    table = overwrite(table, vec![1]).await?;
+    deltalake::checkpoints::create_checkpoint(&table, None).await?;
+    let anchor = table.version().expect("version");
+    for ids in [vec![2], vec![3]] {
+        table = overwrite(table, ids).await?;
+    }
+    // Current, so the refresh's staleness probe keeps it, and anchored on the old checkpoint.
+    let mut stale = DeltaTable::new(table.log_store());
+    stale.load().await?;
+    deltalake::checkpoints::create_checkpoint(&table, None).await?;
+    table.log_store().object_store(None).delete(&object_store::path::Path::from(format!("_delta_log/{anchor:020}.checkpoint.parquet"))).await?;
+
+    let deleted = db.vacuum_table("", "vacuum-stale-checkpoint", &Arc::new(RwLock::new(stale)), 0).await;
+    assert!(deleted > 0, "the overwritten files must be vacuumed, not lost to a 404 on the cleaned-up checkpoint");
+    Ok(())
+}

@@ -10322,15 +10322,34 @@ impl Database {
         // Get a clone so the table RwLock is not held across object-store IO.
         // The per-physical-table commit lock above keeps this snapshot stable.
         let table_clone = { table_ref.read().await.clone() };
-        match table_clone
-            .vacuum()
-            .with_retention_period(chrono::Duration::hours(retention_hours as i64))
-            .with_enforce_retention_duration(false) // Allow deletion of files newer than default retention
-            // Full also sweeps orphaned parquet whose tombstones already left the retained
-            // log; without it, bounding the log turns those files into a permanent leak.
-            .with_mode(deltalake::operations::vacuum::VacuumMode::Full)
-            .await
-        {
+        let vacuum = |table: DeltaTable| {
+            table
+                .vacuum()
+                .with_retention_period(chrono::Duration::hours(retention_hours as i64))
+                .with_enforce_retention_duration(false) // Allow deletion of files newer than default retention
+                // Full also sweeps orphaned parquet whose tombstones already left the retained
+                // log; without it, bounding the log turns those files into a permanent leak.
+                .with_mode(deltalake::operations::vacuum::VacuumMode::Full)
+        };
+        let result = match vacuum(table_clone.clone()).await {
+            // Log cleanup can delete the checkpoint a current snapshot was loaded from (the
+            // refresh probe keeps a current one), and Full replays that log segment. Reload
+            // from the latest checkpoint once; the commit lock makes the swap safe.
+            Err(e) if e.to_string().contains("_delta_log") && e.to_string().contains("not found") => {
+                let mut fresh = table_clone;
+                let version = fresh.version().unwrap_or_default();
+                fresh.state = None;
+                match fresh.load_version(version).await {
+                    Ok(()) => {
+                        *table_ref.write().await = fresh.clone();
+                        vacuum(fresh).await
+                    }
+                    Err(reload) => Err(reload),
+                }
+            }
+            other => other,
+        };
+        match result {
             Ok((_, metrics)) => {
                 let files_deleted = metrics.files_deleted.len();
                 info!("Vacuum completed in {:?}, deleted {} files", start_time.elapsed(), files_deleted);
