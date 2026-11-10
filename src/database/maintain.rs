@@ -6079,8 +6079,10 @@ impl Database {
             .map(|(cell, entries)| {
                 let proved = crate::storage::merge_coverage(entries);
                 let held = self.coverage_ledger.coverage(&cell);
-                // An empty `held` is the FIRST replay for that cell, not a disagreement.
-                if !held.is_empty() && held != proved {
+                // Only a held range the tags no longer prove is drift; a slice published
+                // since the last replay grows the cell (and an empty `held` is its first).
+                let proved_ranges = proved.iter().map(|entry| (entry.start_micros, entry.end_micros)).collect_vec();
+                if held.iter().any(|entry| !crate::rollup::ranges_cover(&proved_ranges, (entry.start_micros, entry.end_micros - 1))) {
                     disagreements += 1;
                     warn!(
                         table = %target, project_id = %cell.1, date = %cell.3,

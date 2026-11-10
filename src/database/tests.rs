@@ -3242,6 +3242,38 @@ async fn a_resume_whose_staged_parquet_is_gone_stages_normally() -> Result<()> {
     Ok(())
 }
 
+/// A slice published between two replays GROWS the cell; only a held range the tags no
+/// longer prove is drift. Prod logged ~1.3k/day for today's partitions, every project
+/// `held=16 proved=17`, because each hourly replay found the hour published since.
+#[tokio::test(flavor = "multi_thread")]
+async fn coverage_published_between_replays_is_not_a_ledger_disagreement() -> Result<()> {
+    let db = Database::with_config(create_test_config("ledger-growth")).await?;
+    db.cancel_maintenance();
+    let project = format!("ledger_{}", uuid::Uuid::new_v4().simple());
+    let day = (Utc::now() - chrono::Duration::days(3)).date_naive();
+    let rows = [1, 13].map(|hour| test_span_ts(&format!("row-{hour}"), "op", &project, day.and_hms_opt(hour, 0, 0).unwrap().and_utc().timestamp_micros()));
+    db.insert_records_batch(&project, "otel_logs_and_spans", vec![json_to_batch(rows.to_vec())?], true, None).await?;
+    let disagreements = || crate::observability::maintenance_stats().coverage_ledger_disagreements.load(std::sync::atomic::Ordering::Relaxed);
+    let mut before = 0;
+    for offset in [0, 12] {
+        db.run_unit_once("otel_logs_and_spans", &project, day, crate::maintenance_coordinator::Operation::BaseRollup, 12, offset, None).await?;
+        before = if offset == 0 { disagreements() } else { before };
+        db.recover_rollup_coverage("otel_logs_and_spans").await?;
+    }
+    assert_eq!(disagreements(), before, "a second half published after the first replay only grew the cell");
+
+    use crate::storage::CoverageLedger as _;
+    let cell = ("otel_logs_and_spans".to_owned(), project.clone(), rollup_tier(false), day.to_string());
+    let mut held = db.coverage_ledger.coverage(&cell);
+    let mut unproved = held[0].clone();
+    (unproved.start_micros, unproved.end_micros) = (unproved.end_micros + 3_600_000_000, unproved.end_micros + 7_200_000_000);
+    held.push(unproved);
+    db.coverage_ledger.replace_many(vec![(cell, held)]);
+    db.recover_rollup_coverage("otel_logs_and_spans").await?;
+    assert_eq!(disagreements(), before + 1, "a held range the tags do not prove is still drift");
+    Ok(())
+}
+
 /// The tag replay also records what it read into the coverage ledger, and the
 /// ledger must agree with the tag-derived routing map in both directions.
 ///
