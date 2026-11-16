@@ -441,6 +441,33 @@ fields:
   - name: attributes___geo___country___iso_code
     data_type: Utf8
     nullable: true
+  # OpenTelemetry GenAI identity and usage, which monoscope normalises from every SDK dialect at
+  # ingest. LLM lists and dashboards filter and aggregate on them; promoted so they skip the
+  # `attributes` blob. Appended LAST, after `migrate-columns` widened storage (2026-11-16).
+  - name: attributes___gen_ai___operation___name
+    data_type: Utf8
+    nullable: true
+  - name: attributes___gen_ai___request___model
+    data_type: Utf8
+    nullable: true
+  - name: attributes___gen_ai___conversation___id
+    data_type: Utf8
+    nullable: true
+  - name: attributes___gen_ai___agent___name
+    data_type: Utf8
+    nullable: true
+  - name: attributes___gen_ai___tool___name
+    data_type: Utf8
+    nullable: true
+  - name: attributes___gen_ai___usage___input_tokens
+    data_type: Int64
+    nullable: true
+  - name: attributes___gen_ai___usage___output_tokens
+    data_type: Int64
+    nullable: true
+  - name: attributes___gen_ai___usage___cost
+    data_type: Float64
+    nullable: true
 
 # Continuous-aggregate rollups derived from this table. The rollup's own table
 # (`otel_logs_and_spans_rollup_dashboard_1m_v4`) is SYNTHESIZED from this spec plus the field
