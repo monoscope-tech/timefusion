@@ -999,31 +999,42 @@ fn record_section(component: &'static str, name: &'static str, elapsed: Duration
 pub struct BlockWatch(&'static str, std::time::Instant, &'static std::panic::Location<'static>);
 
 /// Wall time of a named section, awaits included — no claim that a worker was held.
-pub struct TimedSection(&'static str, std::time::Instant, &'static std::panic::Location<'static>);
+pub struct TimedSection(&'static str, std::time::Instant);
 
-macro_rules! section_timer {
-    ($ty:ident, $component:literal $(, warn_ms = $warn:literal, $msg:literal)?) => {
-        impl $ty {
-            /// `#[track_caller]` so a slow-section warning names who held it.
-            #[track_caller]
-            pub fn new(name: &'static str) -> Self {
-                Self(name, std::time::Instant::now(), std::panic::Location::caller())
-            }
-        }
-        impl Drop for $ty {
-            fn drop(&mut self) {
-                let elapsed = self.1.elapsed();
-                record_section($component, self.0, elapsed);
-                $(if elapsed.as_millis() >= $warn {
-                    warn!(section = self.0, elapsed_ms = elapsed.as_millis() as u64, caller = %self.2, $msg);
-                })?
-            }
-        }
-    };
+impl BlockWatch {
+    /// `#[track_caller]` so a slow-section warning names who held it.
+    #[track_caller]
+    pub fn new(name: &'static str) -> Self {
+        Self(name, std::time::Instant::now(), std::panic::Location::caller())
+    }
 }
 
-section_timer!(BlockWatch, "block", warn_ms = 250, "blocking section held a runtime worker — queries scheduled onto this worker waited behind it");
-section_timer!(TimedSection, "section");
+impl Drop for BlockWatch {
+    fn drop(&mut self) {
+        let elapsed = self.1.elapsed();
+        record_section("block", self.0, elapsed);
+        if elapsed.as_millis() >= 250 {
+            warn!(
+                section = self.0,
+                elapsed_ms = elapsed.as_millis() as u64,
+                caller = %self.2,
+                "blocking section held a runtime worker — queries scheduled onto this worker waited behind it"
+            );
+        }
+    }
+}
+
+impl TimedSection {
+    pub fn new(name: &'static str) -> Self {
+        Self(name, std::time::Instant::now())
+    }
+}
+
+impl Drop for TimedSection {
+    fn drop(&mut self) {
+        record_section("section", self.0, self.1.elapsed());
+    }
+}
 
 /// jemalloc's arena accounting, in bytes: `(allocated, active, resident, mapped,
 /// retained)`; `resident - allocated` is fragmentation. `None` off Linux or
