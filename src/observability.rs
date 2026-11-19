@@ -996,16 +996,18 @@ fn record_section(component: &'static str, name: &'static str, elapsed: Duration
 /// Times a section that occupies a runtime worker without yielding — a
 /// `std::sync::Mutex` hold, a synchronous rebuild. **Not for `async` bodies**:
 /// use [`TimedSection`] there, which makes no occupancy claim.
-pub struct BlockWatch(&'static str, std::time::Instant);
+pub struct BlockWatch(&'static str, std::time::Instant, &'static std::panic::Location<'static>);
 
 /// Wall time of a named section, awaits included — no claim that a worker was held.
-pub struct TimedSection(&'static str, std::time::Instant);
+pub struct TimedSection(&'static str, std::time::Instant, &'static std::panic::Location<'static>);
 
 macro_rules! section_timer {
     ($ty:ident, $component:literal $(, warn_ms = $warn:literal, $msg:literal)?) => {
         impl $ty {
+            /// `#[track_caller]` so a slow-section warning names who held it.
+            #[track_caller]
             pub fn new(name: &'static str) -> Self {
-                Self(name, std::time::Instant::now())
+                Self(name, std::time::Instant::now(), std::panic::Location::caller())
             }
         }
         impl Drop for $ty {
@@ -1013,7 +1015,7 @@ macro_rules! section_timer {
                 let elapsed = self.1.elapsed();
                 record_section($component, self.0, elapsed);
                 $(if elapsed.as_millis() >= $warn {
-                    warn!(section = self.0, elapsed_ms = elapsed.as_millis() as u64, $msg);
+                    warn!(section = self.0, elapsed_ms = elapsed.as_millis() as u64, caller = %self.2, $msg);
                 })?
             }
         }
@@ -1120,6 +1122,7 @@ pub struct Watched<T> {
 }
 
 impl<T> Watched<T> {
+    #[track_caller]
     pub fn new(name: &'static str, inner: T) -> Self {
         Self { inner, _watch: BlockWatch::new(name) }
     }

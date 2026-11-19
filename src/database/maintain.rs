@@ -1637,7 +1637,7 @@ impl Database {
     /// Write the rollup journal unconditionally, for shutdown — the one point
     /// where no later commit exists to carry a deferred write.
     pub(crate) fn flush_rollup_journal(&self) -> std::io::Result<()> {
-        let _journal_guard = crate::support::lock(&self.rollup_journal_lock);
+        let _journal_guard = crate::support::lock_off_worker(&self.rollup_journal_lock);
         self.persist_rollup_journal_bytes(crate::rollup_journal::encode(&self.rollup_journal_entries())?, true)
     }
 
@@ -2139,7 +2139,7 @@ impl Database {
         let mut all_tier_holes: HashSet<(String, String, String, String)> = HashSet::new();
         let mut all_remints: HashSet<(String, String, String, String)> = HashSet::new();
         let source_epochs: HashMap<_, _> = {
-            let _guard = crate::support::lock(&self.rollup_journal_lock);
+            let _guard = crate::support::lock_off_worker(&self.rollup_journal_lock);
             self.rollup_source_epochs.iter().map(|entry| (entry.key().clone(), *entry.value())).collect()
         };
 
@@ -2653,7 +2653,7 @@ impl Database {
         }
         // Published ONCE, after every source has contributed: these setters replace wholesale.
         {
-            let _guard = crate::support::lock(&self.rollup_journal_lock);
+            let _guard = crate::support::lock_off_worker(&self.rollup_journal_lock);
             all_base_tier_ready.retain(|(source, project, _, date), ranges| {
                 let key = (project.clone(), source.clone(), date.clone());
                 !ranges.is_empty() && source_epochs.get(&key).copied().unwrap_or(0) == self.rollup_source_epochs.get(&key).map_or(0, |epoch| *epoch.value())
@@ -3771,7 +3771,7 @@ impl Database {
             }
         }
 
-        let _journal_guard = crate::support::lock(&self.rollup_journal_lock);
+        let _journal_guard = crate::support::lock_off_worker(&self.rollup_journal_lock);
         let mut journal = self.journal();
         if journal.state(&key) == Some(TaskState::Running) {
             let slice_coverage = RollupCoverage {
@@ -3941,7 +3941,7 @@ impl Database {
 
         let empty_publication = (slice == key.slice).then(|| coverage.empty_publication()).flatten();
         let completed = {
-            let _guard = crate::support::lock(&self.rollup_journal_lock);
+            let _guard = crate::support::lock_off_worker(&self.rollup_journal_lock);
             let mut journal = self.journal();
             // An invalidation can already have requeued this task with a new deadline.
             if journal.state(key) != Some(TaskState::Running) {
@@ -4882,7 +4882,7 @@ impl Database {
         if hours == 0 {
             return Ok(());
         }
-        let _journal_guard = crate::support::lock(&self.rollup_journal_lock);
+        let _journal_guard = crate::support::lock_off_worker(&self.rollup_journal_lock);
         let source_key = (project_id.to_string(), source.to_string(), date.to_string());
         // Only the hours the mutation actually touched: expanding to a full day mints
         // hundreds of durable units per project, including future and empty slices.
@@ -4917,7 +4917,7 @@ impl Database {
         let moves_rows = assignments.iter().any(|(column, _)| column == "timestamp");
         let window = (!moves_rows).then(|| predicate.and_then(crate::rollup::timestamp_window)).flatten();
         {
-            let _guard = crate::support::lock(&self.rollup_journal_lock);
+            let _guard = crate::support::lock_off_worker(&self.rollup_journal_lock);
             self.journal().forget_built(project_id, source, window);
         }
         let Some(masks) = window.and_then(|(lo, hi)| window_hour_masks(lo, hi)) else { return self.invalidate_rollup_source(project_id, source) };
@@ -4931,7 +4931,7 @@ impl Database {
         if get_schema(source).is_none_or(|schema| schema.rollups.is_empty()) {
             return Ok(());
         }
-        let _journal_guard = crate::support::lock(&self.rollup_journal_lock);
+        let _journal_guard = crate::support::lock_off_worker(&self.rollup_journal_lock);
         let keys: Vec<_> =
             self.rollup_source_epochs.iter().filter(|entry| entry.key().0 == project_id && entry.key().1 == source).map(|entry| entry.key().clone()).collect();
         for key in &keys {
@@ -4953,6 +4953,7 @@ impl Database {
         if get_schema(source).is_none_or(|schema| schema.rollups.is_empty()) {
             return Ok(());
         }
+        let _timed = crate::observability::TimedSection::new("ingest_rollup_invalidate");
         let mut dates: HashMap<String, Vec<(i64, i64)>> = HashMap::new();
         for batch in batches {
             let Some(batch_dates) = batch_dirty_ranges(batch) else {
@@ -5313,7 +5314,7 @@ impl Database {
             return Ok(true);
         }
         let escalated = {
-            let _guard = crate::support::lock(&self.rollup_journal_lock);
+            let _guard = crate::support::lock_off_worker(&self.rollup_journal_lock);
             let mut journal = self.journal();
             if journal.state(key) != Some(crate::maintenance_coordinator::TaskState::Running) {
                 return Ok(true);
@@ -6135,7 +6136,7 @@ impl Database {
     /// zero rather than going: an absent one persists as "unknown", i.e. all hours dirty.
     fn retire_drained_rollup_dirty(&self, source: &str) -> usize {
         use crate::maintenance_coordinator::{Operation, TaskState};
-        let _journal_guard = crate::support::lock(&self.rollup_journal_lock);
+        let _journal_guard = crate::support::lock_off_worker(&self.rollup_journal_lock);
         let mut outstanding: HashMap<(String, String), u32> = HashMap::new();
         for task in self.journal().tasks().filter(|task| {
             task.key.source == source
@@ -6435,7 +6436,7 @@ impl Database {
                 let epoch = || self.rollup_source_epochs.get(&source_key).map_or(0, |entry| *entry.value());
                 let before = epoch();
                 if !self.empty_base_rollup_current(key, publication).await? {
-                    let _guard = crate::support::lock(&self.rollup_journal_lock);
+                    let _guard = crate::support::lock_off_worker(&self.rollup_journal_lock);
                     self.rollup_slice_coverage
                         .remove_if(&(key.project_id.clone(), source.to_string(), target.clone(), key.slice.start_micros, key.slice.end_micros), |_, held| {
                             held.output == RollupOutputEvidence::Empty && held.generation == publication.generation
@@ -6459,7 +6460,7 @@ impl Database {
                     obsolete_generations.push((key.project_id.clone(), key.slice));
                     continue;
                 }
-                let _guard = crate::support::lock(&self.rollup_journal_lock);
+                let _guard = crate::support::lock_off_worker(&self.rollup_journal_lock);
                 if epoch() != before
                     || !self.journal().tasks().any(|task| {
                         task.key == *key && task.state == crate::maintenance_coordinator::TaskState::Complete && task.publication.as_ref() == Some(publication)
@@ -9661,7 +9662,7 @@ impl Database {
     fn publish_resumed_rollup(&self, rollup: &crate::database::RollupResume, wave_id: &str, source_epoch: u64) -> Result<bool> {
         use crate::maintenance_coordinator::TaskState;
         let published = {
-            let _guard = crate::support::lock(&self.rollup_journal_lock);
+            let _guard = crate::support::lock_off_worker(&self.rollup_journal_lock);
             let mut journal = self.journal();
             let current = self
                 .rollup_source_epochs

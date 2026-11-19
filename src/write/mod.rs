@@ -1110,7 +1110,10 @@ impl BufferedWriteLayer {
         let batches: Vec<RecordBatch> = batches.into_iter().map(wal::identify_batch_for_wal).try_collect()?;
         let row_count: usize = batches.iter().map(|b| b.num_rows()).sum();
 
-        let reserved_size = self.reserve_with_backpressure(&batches).await?;
+        let reserved_size = {
+            let _timed = crate::observability::TimedSection::new("ingest_reserve");
+            self.reserve_with_backpressure(&batches).await?
+        };
 
         // WAL append + MemBuffer apply share one pin lifecycle (`with_wal_pin`):
         // the pending hold covers the append→apply window, then each destination

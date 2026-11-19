@@ -3038,9 +3038,10 @@ impl Database {
     ///
     /// A blocking mutex that can occupy a runtime worker for a whole checkpoint.
     /// The read path must never take it.
+    #[track_caller]
     fn journal(&self) -> crate::observability::Watched<std::sync::MutexGuard<'_, crate::maintenance_coordinator::TaskJournal>> {
         let wait = crate::observability::BlockWatch::new("journal_lock_wait");
-        let guard = crate::support::lock(&self.maintenance_tasks);
+        let guard = crate::support::lock_off_worker(&self.maintenance_tasks);
         drop(wait);
         crate::observability::Watched::new("journal_hold", guard)
     }
