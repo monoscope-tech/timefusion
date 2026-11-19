@@ -150,10 +150,10 @@ impl ProjectRoutingTable {
     }
 
     fn bounded_otel_scan_reason(&self, filters: &[Expr], limit: Option<usize>) -> Option<&'static str> {
-        // `is_bounding_predicate` doesn't recurse into AND, so check it per flattened conjunct;
-        // `filters_time_range` already recurses on its own, so it runs on `filters` directly.
-        let conjuncts: Vec<&Expr> = filters.iter().flat_map(datafusion::logical_expr::utils::split_conjunction).collect();
-        let bounded = conjuncts.iter().any(|expr| Self::is_bounding_predicate(expr)) || filters_time_range(filters).is_some_and(|(lower, _)| lower != i64::MIN);
+        // Flattened for both checks: `is_bounding_predicate` and the `date =` fallback inside
+        // `filters_time_range` look only at top-level conjuncts.
+        let conjuncts: Vec<Expr> = filters.iter().flat_map(datafusion::logical_expr::utils::split_conjunction).cloned().collect();
+        let bounded = conjuncts.iter().any(Self::is_bounding_predicate) || filters_time_range(&conjuncts).is_some_and(|(lower, _)| lower != i64::MIN);
         Self::raw_otel_scan_reason(&self.table_name, filters, limit, bounded)
     }
 
