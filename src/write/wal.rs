@@ -434,6 +434,7 @@ impl WalManager {
         let topic = Self::make_topic(project_id, table_name);
         let shard = self.pick_shard(&topic);
         let walrus_key = Self::walrus_topic_key(project_id, table_name, shard);
+        let _timed = crate::observability::TimedSection::new("ingest_wal_append");
         // Serialize AND append off the worker's own queue: the default
         // `sync_each` mode fsyncs inside `batch_append_for_topic`, a blocking
         // syscall at ingest frequency.

@@ -2010,7 +2010,7 @@ use datafusion::sql::sqlparser::ast::{
 /// could possibly need it.
 pub fn might_need_rewrite(sql: &str) -> bool {
     static ORDINAL: std::sync::LazyLock<regex::Regex> =
-        std::sync::LazyLock::new(|| regex::Regex::new(r"(?i)\border\s+by\s+(?:[^;]*?,\s*)?\d").expect("valid regex"));
+        std::sync::LazyLock::new(|| regex::Regex::new(r"(?i)\border\s+by\s+(?:[^;]*?,\s*)?\d|\bi?like\s+any\b").expect("valid regex"));
     sql.to_ascii_lowercase().contains("row_to_json") || ORDINAL.is_match(sql)
 }
 
@@ -2032,6 +2032,35 @@ impl VisitorMut for RowToJsonRecord {
     fn post_visit_query(&mut self, query: &mut Query) -> std::ops::ControlFlow<Self::Break> {
         self.rewrite_set_expr(query.body.as_mut());
         self.rewrite_order_ordinals(query);
+        std::ops::ControlFlow::Continue(())
+    }
+
+    /// DataFusion does not plan `x [I]LIKE ANY (ARRAY[...])`; over a literal array it is the
+    /// OR of one LIKE per pattern, and `ANY` of an empty array is false, as in Postgres.
+    fn post_visit_expr(&mut self, expr: &mut SqlExpr) -> std::ops::ControlFlow<Self::Break> {
+        let (SqlExpr::Like { any: any @ true, pattern, .. } | SqlExpr::ILike { any: any @ true, pattern, .. }) = expr else {
+            return std::ops::ControlFlow::Continue(());
+        };
+        let mut array = pattern.as_ref();
+        while let SqlExpr::Nested(inner) = array {
+            array = inner;
+        }
+        let SqlExpr::Array(datafusion::sql::sqlparser::ast::Array { elem, .. }) = array else { return std::ops::ControlFlow::Continue(()) };
+        let elems = elem.clone();
+        *any = false;
+        let one = |pattern: SqlExpr| {
+            let mut like = expr.clone();
+            if let SqlExpr::Like { pattern: slot, .. } | SqlExpr::ILike { pattern: slot, .. } = &mut like {
+                **slot = pattern;
+            }
+            like
+        };
+        *expr = elems
+            .into_iter()
+            .map(one)
+            .reduce(|left, right| SqlExpr::BinaryOp { left: Box::new(left), op: datafusion::sql::sqlparser::ast::BinaryOperator::Or, right: Box::new(right) })
+            .map_or(SqlExpr::Value(SqlValue::Boolean(false).into()), |ors| SqlExpr::Nested(Box::new(ors)));
+        self.rewrote = true;
         std::ops::ControlFlow::Continue(())
     }
 }
@@ -2197,6 +2226,27 @@ mod row_to_json_record_tests {
     #[test_case::test_case("SELECT row_to_json(t) FROM some_table t" => None ; "plain table alias is left alone")]
     fn declines_to_rewrite(sql: &str) -> Option<String> {
         rewrite_sql(sql)
+    }
+
+    #[test_case::test_case("SELECT k FROM t WHERE k LIKE ANY (ARRAY['a%', 'b%']) ORDER BY k" => vec!["a1", "b1"] ; "like any")]
+    #[test_case::test_case("SELECT k FROM t WHERE k ILIKE ANY (ARRAY['A%']) ORDER BY k" => vec!["a1"] ; "ilike any")]
+    #[test_case::test_case("SELECT k FROM t WHERE k NOT LIKE ANY (ARRAY['a%', 'b%']) ORDER BY k" => vec!["a1", "b1", "c1"] ; "not like any holds when one pattern misses")]
+    #[test_case::test_case("SELECT k FROM t WHERE k LIKE ANY (ARRAY[]) ORDER BY k" => Vec::<&str>::new() ; "any of an empty array is false")]
+    #[tokio::test]
+    async fn like_any_over_a_literal_array_plans(sql: &str) -> Vec<&'static str> {
+        assert!(might_need_rewrite(sql));
+        let rewritten = rewrite_sql(sql).expect("rewritten");
+        let ctx = datafusion::prelude::SessionContext::new();
+        ctx.sql("CREATE TABLE t (k VARCHAR) AS VALUES ('a1'), ('b1'), ('c1')").await.expect("table");
+        let batches = ctx.sql(&rewritten).await.expect("the rewrite plans").collect().await.expect("runs");
+        let keys: Vec<String> = batches
+            .iter()
+            .flat_map(|batch| {
+                let keys = arrow::compute::cast(batch.column(0), &arrow::datatypes::DataType::Utf8).expect("cast");
+                arrow::array::AsArray::as_string::<i32>(&keys).iter().map(|k| k.unwrap_or_default().to_string()).collect::<Vec<_>>()
+            })
+            .collect();
+        ["a1", "b1", "c1"].into_iter().filter(|k| keys.iter().any(|got| got == k)).collect()
     }
 
     #[test_case::test_case("SELECT k, round(avg(v)) FROM t GROUP BY 1 ORDER BY 2 DESC" => Some(vec!["b".into(), "a".into()]) ; "scalar over aggregate")]

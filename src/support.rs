@@ -10,6 +10,17 @@ pub(crate) fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, 
     mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// [`lock`] for a mutex whose holders can run for seconds (fsync, a whole-journal
+/// serialize): uncontended it is a plain `try_lock`; contended, the wait moves off
+/// the runtime worker so the tasks queued behind it keep running.
+pub(crate) fn lock_off_worker<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    match mutex.try_lock() {
+        Ok(guard) => guard,
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => without_blocking_the_worker(|| lock(mutex)),
+    }
+}
+
 /// An impossible epoch value marks wall-clock mode.
 const WALL_SENTINEL: i64 = i64::MIN;
 
@@ -197,35 +208,45 @@ mod tests {
 
     use super::*;
 
+    const BLOCK: Duration = Duration::from_millis(400);
+
+    /// Waits on a mutex another thread holds for [`BLOCK`].
+    fn contended(acquire: fn(&std::sync::Mutex<()>) -> std::sync::MutexGuard<'_, ()>) {
+        let (mutex, held) = (std::sync::Arc::new(std::sync::Mutex::new(())), std::sync::Arc::new(std::sync::Barrier::new(2)));
+        let holder = std::thread::spawn({
+            let (mutex, held) = (std::sync::Arc::clone(&mutex), std::sync::Arc::clone(&held));
+            move || {
+                let _guard = lock(&mutex);
+                held.wait();
+                std::thread::sleep(BLOCK);
+            }
+        });
+        held.wait();
+        drop(acquire(&mutex));
+        holder.join().unwrap();
+    }
+
     /// One worker, a task blocking it, and a neighbour that must still be
     /// polled promptly.
-    #[test]
-    fn a_blocking_call_must_not_hold_the_worker_its_neighbours_are_queued_on() {
-        const BLOCK: Duration = Duration::from_millis(400);
-
+    #[test_case(|| std::thread::sleep(BLOCK), true; "bare blocking call holds the worker")]
+    #[test_case(|| without_blocking_the_worker(|| std::thread::sleep(BLOCK)), false; "wrapped blocking call frees it")]
+    #[test_case(|| contended(lock), true; "contended lock holds the worker")]
+    #[test_case(|| contended(lock_off_worker), false; "contended lock_off_worker frees it")]
+    fn a_blocking_call_must_not_hold_the_worker_its_neighbours_are_queued_on(block: fn(), holds_worker: bool) {
         // Measures how long a neighbour waits to be polled at all. A timer is a
         // weaker probe: tokio's time driver can be driven by the idle `block_on`
         // thread, so timers still fire while the worker is held. Both tasks are
         // spawned, blocker first, so it owns the worker before the neighbour queues.
-        let neighbour_wait = |wrap: bool| {
-            let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
-            runtime.block_on(async move {
-                let blocker = tokio::spawn(async move {
-                    let block = || std::thread::sleep(BLOCK);
-                    if wrap { without_blocking_the_worker(block) } else { block() }
-                });
-                tokio::task::yield_now().await;
-                let queued_at = std::time::Instant::now();
-                let neighbour = tokio::spawn(async move { queued_at.elapsed() });
-                let (_, waited) = tokio::join!(blocker, neighbour);
-                waited.unwrap()
-            })
-        };
-
-        let blocked = neighbour_wait(false);
-        let protected = neighbour_wait(true);
-        assert!(blocked >= BLOCK / 2, "expected the naive call to hold the worker for ~{BLOCK:?}, neighbour waited only {blocked:?}");
-        assert!(protected < BLOCK / 4, "the neighbour should run while the blocking work happens elsewhere, but waited {protected:?}");
+        let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
+        let waited = runtime.block_on(async move {
+            let blocker = tokio::spawn(async move { block() });
+            tokio::task::yield_now().await;
+            let queued_at = std::time::Instant::now();
+            let neighbour = tokio::spawn(async move { queued_at.elapsed() });
+            let (_, waited) = tokio::join!(blocker, neighbour);
+            waited.unwrap()
+        });
+        assert_eq!(waited >= BLOCK / 2, holds_worker, "neighbour waited {waited:?} behind a {BLOCK:?} block");
     }
 
     /// Both call sites tokio could reject — rejection is a panic, not an error:
