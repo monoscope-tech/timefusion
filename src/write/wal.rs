@@ -454,6 +454,7 @@ impl WalManager {
             let _guard = self.append_lock(&walrus_key);
             let pre_pos = self.wal.current_position(&walrus_key).ok();
             on_pre_append(shard, pre_pos);
+            let _fsync = crate::observability::BlockWatch::new("wal_append_fsync");
             self.wal.batch_append_for_topic(&walrus_key, &payload_refs)?;
             Ok(pre_pos)
         })?;

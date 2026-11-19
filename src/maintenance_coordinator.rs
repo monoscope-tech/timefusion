@@ -827,7 +827,7 @@ impl TaskLease {
 
 impl Drop for TaskLease {
     fn drop(&mut self) {
-        let mut journal = lock(&self.journal);
+        let mut journal = crate::observability::Watched::new("journal_lease_hold", crate::support::lock_off_worker(&self.journal));
         // Emitted from the RAII lease rather than `complete()` so no early
         // return can skip it. `Running` here means the unit died without
         // recording anything and is abandoned below.
@@ -2886,6 +2886,7 @@ impl TaskJournal {
                 let (task_indices, snapshot) = (&*task_indices, &*snapshot);
                 let mut wal = OpenOptions::new().create(true).append(true).open(&*wal_path)?;
                 let durable = |key: &TaskKey| !is_derived_operation(key.operation);
+                let serialize = crate::observability::BlockWatch::new("journal_checkpoint_serialize");
                 let records =
                     dirty_tasks
                         .iter()
@@ -2906,6 +2907,7 @@ impl TaskJournal {
                             records.push(b'\n');
                             anyhow::Ok(records)
                         })?;
+                drop(serialize);
                 let record_bytes = u64::try_from(records.len())?;
                 let len = crate::support::without_blocking_the_worker(|| -> std::io::Result<u64> {
                     let len = wal.metadata()?.len();
@@ -2922,6 +2924,7 @@ impl TaskJournal {
                         );
                     }
                     *incomplete_append = Some(start);
+                    let _fsync = crate::observability::BlockWatch::new("journal_checkpoint_fsync");
                     wal.write_all(&records)?;
                     *incomplete_append = None;
                     wal.sync_all()?;
@@ -2939,8 +2942,10 @@ impl TaskJournal {
             self.rebuild_claimable();
         }
         if wal_len.is_some_and(|len| len >= JOURNAL_COMPACT_BYTES) {
+            let _compact = crate::observability::BlockWatch::new("journal_compact");
             self.compact()?;
         }
+        let _stats = crate::observability::BlockWatch::new("journal_stats_publish");
         self.publish_statistics_throttled();
         Ok(())
     }
