@@ -124,6 +124,12 @@ pub const FINALIZATION_DELAY_MICROS: i64 = 15 * 60 * 1_000_000;
 /// day slice (256 times for one 09-29 cell); reads cover the gap with a raw leg.
 pub const SEALED_REBUILD_INTERVAL_MICROS: i64 = 60 * 60 * 1_000_000;
 pub const INVALIDATION_DEADLINE_BUCKET_MICROS: i64 = 30 * 1_000_000;
+/// A quiet deadline that only slides forward is written to the journal once per this step,
+/// not per [`INVALIDATION_DEADLINE_BUCKET_MICROS`]: ingest re-touching a pending slice every
+/// bucket rewrote the whole task each time (prod 11-19: 28k of 54k WAL records in 3 h, the
+/// driver of compaction frequency). A recovered deadline is then less than one step early,
+/// so a restart can only build a slice that much sooner, never later.
+const DEADLINE_PERSIST_STEP_MICROS: i64 = 5 * 60 * 1_000_000;
 /// The longest re-invalidation may defer an ended slice past when it first went dirty. Each
 /// touch restarts the quiet period, so without a cap a slice touched more often than every
 /// `FINALIZATION_DELAY` never comes due: prod held a task 21 h while today's and yesterday's
@@ -2136,10 +2142,12 @@ impl TaskJournal {
                     let new_deadline = task.deadline_micros.max(deadline_micros);
                     let changed = task.add_dirty(dirt.iter().copied())
                         || task.state != TaskState::Pending
-                        || task.deadline_micros != new_deadline
+                        || new_deadline.div_euclid(DEADLINE_PERSIST_STEP_MICROS) != task.deadline_micros.div_euclid(DEADLINE_PERSIST_STEP_MICROS)
                         || task.retry_reason.is_some()
                         || task.publication.is_some()
                         || task.base_tier_present;
+                    // Within one step the later deadline is kept in memory only.
+                    task.deadline_micros = new_deadline;
                     if changed {
                         task.set_state(TaskState::Pending);
                         task.deadline_micros = new_deadline;
@@ -5679,6 +5687,29 @@ mod tests {
         let job = journal.take_due_compaction()?.expect("due");
         assert!(journal.finish_compact(job, Err(anyhow::anyhow!("disk full"))).is_err());
         assert!(journal.take_due_compaction()?.is_some(), "retried by the next checkpoint");
+        Ok(())
+    }
+
+    /// Ingest touching one pending slice every 10 s moved its deadline bucket every 30 s, and each
+    /// move rewrote the whole task to the journal WAL.
+    #[test]
+    fn a_sliding_quiet_deadline_is_written_once_per_step_not_per_bucket() -> anyhow::Result<()> {
+        let (dir, mut journal) = new_journal();
+        let start = 1_792_558_800_000_000;
+        for touch in 0..60 {
+            journal.invalidate(invalidation(DASHBOARD_1M, start, start + 1_000_000, start + touch * 10_000_000, false))?;
+            journal.checkpoint()?;
+        }
+        let (tasks, records) = (journal.tasks().count(), fs::read_to_string(&journal.wal_path)?.lines().count());
+        assert!(records <= 4 * tasks, "{records} WAL records for {tasks} tasks over 20 deadline buckets");
+        let reloaded = TaskJournal::load(dir.path())?;
+        for task in journal.tasks() {
+            let recovered = reloaded.task(&task.key).expect("reloaded").deadline_micros;
+            assert!(
+                (0..DEADLINE_PERSIST_STEP_MICROS).contains(&(task.deadline_micros - recovered)),
+                "a recovered deadline is never later and under one step earlier"
+            );
+        }
         Ok(())
     }
 
