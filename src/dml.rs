@@ -696,7 +696,13 @@ impl ExecutionPlan for DmlExec {
                     span.record("rows.affected", rows);
                 })
                 .and_then(|rows| RecordBatch::try_new(schema_clone, vec![Arc::new(datafusion::arrow::array::UInt64Array::from(vec![rows]))]).map_err(arrow_err))
-                .inspect_err(|e| error!("{} failed: {}", op_type.as_ref(), e))
+                .inspect_err(|e| {
+                    if crate::server::is_client_sql_error(&e.to_string()) {
+                        warn!("{} failed: {}", op_type.as_ref(), e)
+                    } else {
+                        error!("{} failed: {}", op_type.as_ref(), e)
+                    }
+                })
         };
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, futures::stream::once(future))))
