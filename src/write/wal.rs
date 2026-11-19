@@ -1,4 +1,9 @@
-use std::path::{Path, PathBuf};
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::{Duration, Instant, SystemTime},
+};
 
 use arrow::array::RecordBatch;
 use arrow_ipc::{
@@ -53,11 +58,11 @@ const TAKEOVER_REQUEST_FILE: &str = "takeover.request";
 
 /// How long a contender waits for the WAL lock before exiting non-zero. Far
 /// beyond any real handoff, so only a predecessor that will never release trips it.
-const LOCK_WAIT_GIVE_UP: std::time::Duration = std::time::Duration::from_secs(900);
+const LOCK_WAIT_GIVE_UP: Duration = Duration::from_secs(900);
 
 /// How long the holder tolerates an outstanding takeover request before taking
 /// the (lossless) graceful shutdown path anyway.
-pub const TAKEOVER_ESCALATE_AFTER: std::time::Duration = std::time::Duration::from_secs(180);
+pub const TAKEOVER_ESCALATE_AFTER: Duration = Duration::from_secs(180);
 
 /// `<data_dir>/.timefusion_meta/<file>`.
 pub fn meta_path(data_dir: &Path, file: &str) -> PathBuf {
@@ -87,7 +92,9 @@ const SNAPSHOT_VERSION: u32 = 1;
 /// `WalPosition` serialized as `(block_id, offset)`.
 type SnapPos = (u64, u64);
 /// Per-(project, table) per-shard cursor positions (`None` = never persisted).
-pub type TopicPositions = std::collections::HashMap<(String, String), Vec<Option<WalPosition>>>;
+pub type TopicPositions = HashMap<(String, String), Vec<Option<WalPosition>>>;
+/// `"project_id:table_name"` → per-shard cursor (None = never persisted).
+type SnapEntries = BTreeMap<String, Vec<Option<SnapPos>>>;
 fn pos_to_snap(p: WalPosition) -> SnapPos {
     (p.block_id, p.offset)
 }
@@ -116,8 +123,7 @@ pub struct CursorSnapshot {
     /// the backlog. Defaults to false for older snapshots (skips the sweep).
     #[serde(default)]
     pub drained: bool,
-    /// `"project_id:table_name"` → per-shard cursor (None = never written).
-    pub entries: std::collections::BTreeMap<String, Vec<Option<SnapPos>>>,
+    pub entries: SnapEntries,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -235,7 +241,7 @@ impl WalManager {
     /// GC this WAL's directory past `max_age` and the durability floor (see [`gc_wal_files`]).
     /// Writers whose open block sits in an aged-out segment roll to a fresh one first: an
     /// idle topic's block otherwise pins its whole segment until it writes another 10 MB.
-    pub fn gc(&self, max_age: std::time::Duration, unflushed_floor_micros: Option<i64>) -> std::io::Result<(u64, u64)> {
+    pub fn gc(&self, max_age: Duration, unflushed_floor_micros: Option<i64>) -> std::io::Result<(u64, u64)> {
         let cutoff = gc_cutoff(max_age, unflushed_floor_micros);
         // By BIRTH, not mtime: a slow topic appending into an old segment keeps its mtime fresh.
         let rolled = self.wal.roll_writers_in(|path| segment_birth(path).is_some_and(|born| born < cutoff))?;
@@ -244,9 +250,7 @@ impl WalManager {
         }
         gc_wal_files(&self.data_dir, max_age, unflushed_floor_micros)
     }
-}
 
-impl WalManager {
     pub fn with_fsync_mode_and_shards(data_dir: PathBuf, mode: crate::config::WalFsyncMode, shards_per_topic: usize) -> Result<Self, WalError> {
         std::fs::create_dir_all(&data_dir)?;
         Self::check_wal_version_stamp(&data_dir)?;
@@ -262,7 +266,6 @@ impl WalManager {
         let wal = Walrus::with_root(&data_dir, ReadConsistency::StrictlyAtOnce, schedule)?;
 
         let meta_dir = data_dir.join(META_DIR);
-        let _ = std::fs::create_dir_all(&meta_dir);
         let known_topics: DashSet<String> =
             std::fs::read_to_string(meta_dir.join("topics")).map(|c| c.lines().filter(|l| !l.is_empty()).map(String::from).collect()).unwrap_or_default();
 
@@ -285,7 +288,7 @@ impl WalManager {
     /// Refuse to open a WAL directory written by an incompatible binary.
     /// Fresh directories (no stamp, no walrus state) auto-stamp the current
     /// version; a pre-existing walrus dir without a stamp is refused.
-    fn check_wal_version_stamp(data_dir: &std::path::Path) -> Result<(), WalError> {
+    fn check_wal_version_stamp(data_dir: &Path) -> Result<(), WalError> {
         let meta_dir = data_dir.join(META_DIR);
         let _ = std::fs::create_dir_all(&meta_dir);
         let stamp_path = meta_dir.join("wal_version");
@@ -539,7 +542,8 @@ impl WalManager {
         let mut error_count = 0usize;
 
         // Drain each shard in append order, then sort the merged slice by
-        // timestamp so the caller sees a topic-wide ordering.
+        // timestamp so the caller sees a topic-wide ordering. A loop because every
+        // shard's reader reborrows `error_count` mutably (borrow checker).
         for shard in 0..self.shards_per_topic {
             let walrus_key = Self::walrus_topic_key(project_id, table_name, shard);
             while let Some((entry, _)) = Self::next_from_shard_timed(&self.wal, &walrus_key, checkpoint, true, &mut error_count, &mut 0, &mut 0) {
@@ -592,12 +596,12 @@ impl WalManager {
         wal: &Walrus, key: &str, checkpoint: bool, persist_checkpoint: bool, errors: &mut usize, read_nanos: &mut u128, envelope_nanos: &mut u128,
     ) -> Option<(WalEntry, WalPosition)> {
         loop {
-            let t_read = std::time::Instant::now();
+            let t_read = Instant::now();
             let next = if checkpoint && !persist_checkpoint { wal.read_next_volatile_with_position(key) } else { wal.read_next_with_position(key, checkpoint) };
             *read_nanos += t_read.elapsed().as_nanos();
             match next {
                 Ok(Some((d, pos))) => {
-                    let t_env = std::time::Instant::now();
+                    let t_env = Instant::now();
                     let decoded = deserialize_wal_entry(&d.data);
                     *envelope_nanos += t_env.elapsed().as_nanos();
                     match decoded {
@@ -683,12 +687,8 @@ impl WalManager {
     /// current write tail. `None` is equivalent to origin only for a
     /// never-written shard; any non-origin tail without a cursor must replay.
     pub fn is_fully_consumed(&self) -> Result<bool, WalError> {
-        for (project_id, table_name) in self.list_topic_pairs() {
-            if !self.is_topic_fully_consumed(&project_id, &table_name)? {
-                return Ok(false);
-            }
-        }
-        Ok(true)
+        // First `Err` or `Ok(false)` short-circuits.
+        self.list_topic_pairs().iter().map(|(p, t)| self.is_topic_fully_consumed(p, t)).find(|r| !matches!(r, Ok(true))).unwrap_or(Ok(true))
     }
 
     fn is_topic_fully_consumed(&self, project_id: &str, table_name: &str) -> Result<bool, WalError> {
@@ -707,16 +707,15 @@ impl WalManager {
         let journals = FlushPublicationJournal::load(&self.data_dir)?;
         // Snapshot intent paths first so a newer intent cannot be compared against an
         // inventory taken before its WAL append. Scan once for the whole batch.
-        let present = std::fs::read_dir(&self.data_dir)?
-            .map(|entry| entry.map(|entry| PathBuf::from(entry.file_name())))
-            .collect::<std::io::Result<std::collections::HashSet<_>>>()?;
+        let present =
+            std::fs::read_dir(&self.data_dir)?.map(|entry| entry.map(|entry| PathBuf::from(entry.file_name()))).collect::<std::io::Result<HashSet<_>>>()?;
         // Make the observed WAL unlinks durable before removing their proof.
         std::fs::File::open(&self.data_dir)?.sync_all()?;
-        for journal in journals {
+        journals.into_iter().try_for_each(|journal| {
             let journal = match journal {
                 // Another post-flush reclamation may have retired this proof
                 // after our filename snapshot. Recovery readers still fail closed.
-                Err(WalError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(WalError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
                 journal => journal?,
             };
             let record = journal.record();
@@ -731,7 +730,8 @@ impl WalManager {
             {
                 remove_if_exists(&journal.path)?;
             }
-        }
+            Ok::<_, WalError>(())
+        })?;
         std::fs::File::open(self.data_dir.join(META_DIR))?.sync_all()?;
         Ok(())
     }
@@ -740,10 +740,7 @@ impl WalManager {
     /// WAL state alone. A leftover rewind marker vetoes the shortcut: applying
     /// it will make already-consumed entries unread again.
     pub fn can_skip_delta_reconcile(&self) -> Result<bool, WalError> {
-        if self.recovery_rewind_path().exists() {
-            return Ok(false);
-        }
-        self.is_fully_consumed()
+        Ok(!self.recovery_rewind_path().exists() && self.is_fully_consumed()?)
     }
 
     /// Set the walrus persisted-read cursor per shard. Used at startup to
@@ -779,7 +776,7 @@ impl WalManager {
         )
     }
 
-    pub fn data_dir(&self) -> &PathBuf {
+    pub fn data_dir(&self) -> &Path {
         &self.data_dir
     }
 
@@ -796,10 +793,6 @@ impl WalManager {
         }
         self.persist_topic(&topic);
         Ok(())
-    }
-
-    fn cursor_snapshot_path(&self) -> PathBuf {
-        cursor_snapshot_path_in(&self.data_dir)
     }
 
     /// Capture every known topic's per-shard persisted-read cursor to a JSON
@@ -831,13 +824,13 @@ impl WalManager {
         };
         // Deliberately not fsynced: a lost snapshot only costs the next boot's
         // fast path, and drained=true reverting to absent is the safe direction.
-        write_json_atomic(&self.cursor_snapshot_path(), &snap, false, "cursor snapshot")
+        write_json_atomic(&cursor_snapshot_path_in(&self.data_dir), &snap, false, "cursor snapshot")
     }
 
     /// Remove the on-disk cursor snapshot so the next boot doesn't trust stale
     /// state. NotFound is silently ignored.
     pub fn delete_cursor_snapshot(&self) -> Result<(), WalError> {
-        Ok(remove_if_exists(&self.cursor_snapshot_path())?)
+        Ok(remove_if_exists(&cursor_snapshot_path_in(&self.data_dir))?)
     }
 
     fn recovery_rewind_path(&self) -> PathBuf {
@@ -876,7 +869,7 @@ impl WalManager {
     /// maps to ORIGIN on apply, correct only when it has no covered data.
     /// Durable (fsync).
     pub fn write_recovery_rewind_marker_at(&self, positions: &TopicPositions) -> Result<(), WalError> {
-        let entries: std::collections::BTreeMap<String, Vec<Option<SnapPos>>> =
+        let entries: SnapEntries =
             positions.iter().map(|((p, t), shards)| (Self::make_topic(p, t), shards.iter().map(|s| s.map(pos_to_snap)).collect())).collect();
         // Must be as durable as walrus's own cursor fsync (sync file + dir).
         write_json_atomic(&self.recovery_rewind_path(), &entries, true, "rewind marker")
@@ -886,12 +879,10 @@ impl WalManager {
     /// Returns true when a marker was found and applied.
     pub fn apply_recovery_rewind_marker(&self) -> Result<bool, WalError> {
         let bytes = match std::fs::read(self.recovery_rewind_path()) {
-            Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-            Err(e) => return Err(WalError::Io(e)),
+            read => read?,
         };
-        let entries: std::collections::BTreeMap<String, Vec<Option<SnapPos>>> =
-            serde_json::from_slice(&bytes).map_err(|e| WalError::Internal(format!("rewind marker decode: {}", e)))?;
+        let entries: SnapEntries = serde_json::from_slice(&bytes).map_err(|e| WalError::Internal(format!("rewind marker decode: {}", e)))?;
         entries.iter().try_for_each(|(topic, positions)| {
             let Some((project_id, table_name)) = Self::parse_topic(topic) else {
                 // Skipping would let recovery overwrite the marker with the
@@ -1023,13 +1014,9 @@ impl WalManager {
 }
 
 pub(crate) fn serialize_record_batch(batch: &RecordBatch) -> Result<Vec<u8>, WalError> {
-    let mut buf = Vec::with_capacity(batch.get_array_memory_size() + 1024);
-    {
-        let mut w = StreamWriter::try_new_with_options(&mut buf, batch.schema_ref(), IpcWriteOptions::default())?;
-        w.write(batch)?;
-        w.finish()?;
-    }
-    Ok(buf)
+    let mut w = StreamWriter::try_new_with_options(Vec::with_capacity(batch.get_array_memory_size() + 1024), batch.schema_ref(), IpcWriteOptions::default())?;
+    w.write(batch)?;
+    Ok(w.into_inner()?)
 }
 
 const WAL_BATCH_IDENTITY_KEY: &str = "timefusion.wal_batch_identity";
@@ -1056,18 +1043,21 @@ impl WalBatchIdentity {
         if !batch.schema_ref().metadata().contains_key(WAL_BATCH_IDENTITY_KEY) {
             return Ok((batch, identity));
         }
-        let mut metadata = batch.schema_ref().metadata().clone();
-        metadata.remove(WAL_BATCH_IDENTITY_KEY);
-        let schema = std::sync::Arc::new(batch.schema_ref().as_ref().clone().with_metadata(metadata));
-        Ok((RecordBatch::try_new(schema, batch.columns().to_vec())?, identity))
+        Ok((edit_schema_metadata(&batch, |m| m.remove(WAL_BATCH_IDENTITY_KEY))?, identity))
     }
 
     fn attach(self, batch: RecordBatch) -> Result<RecordBatch, WalError> {
-        let mut metadata = batch.schema_ref().metadata().clone();
-        metadata.insert(WAL_BATCH_IDENTITY_KEY.into(), serde_json::to_string(&self).map_err(|e| WalError::Internal(e.to_string()))?);
-        let schema = std::sync::Arc::new(batch.schema_ref().as_ref().clone().with_metadata(metadata));
-        Ok(RecordBatch::try_new(schema, batch.columns().to_vec())?)
+        let encoded = serde_json::to_string(&self).map_err(|e| WalError::Internal(e.to_string()))?;
+        edit_schema_metadata(&batch, |m| m.insert(WAL_BATCH_IDENTITY_KEY.into(), encoded))
     }
+}
+
+/// `batch` with its schema metadata rewritten by `edit` (whose return value is discarded).
+fn edit_schema_metadata<R>(batch: &RecordBatch, edit: impl FnOnce(&mut HashMap<String, String>) -> R) -> Result<RecordBatch, WalError> {
+    let mut metadata = batch.schema_ref().metadata().clone();
+    edit(&mut metadata);
+    let schema = Arc::new(batch.schema_ref().as_ref().clone().with_metadata(metadata));
+    Ok(RecordBatch::try_new(schema, batch.columns().to_vec())?)
 }
 
 /// Publication state survives process death. Every attempted immutable Delta
@@ -1101,7 +1091,7 @@ pub(crate) struct FlushPublicationRecord {
     /// Exact conditional-PUT payloads, durable before their version is sent.
     /// Legacy or temporary-file log stores retain version-only evidence.
     #[serde(default)]
-    pub commit_payloads: std::collections::BTreeMap<deltalake::kernel::Version, String>,
+    pub commit_payloads: BTreeMap<deltalake::kernel::Version, String>,
     pub state: FlushPublicationState,
 }
 
@@ -1123,14 +1113,8 @@ impl FlushPublicationJournal {
             write_identities: identities.to_vec(),
             wal_files: Some(
                 std::fs::read_dir(data_dir)?
-                    .map(|entry| {
-                        let entry = entry?;
-                        Ok(entry.file_type()?.is_file().then(|| PathBuf::from(entry.file_name())))
-                    })
-                    .collect::<std::io::Result<Vec<_>>>()?
-                    .into_iter()
-                    .flatten()
-                    .collect(),
+                    .filter_map(|entry| entry.and_then(|entry| Ok(entry.file_type()?.is_file().then(|| PathBuf::from(entry.file_name())))).transpose())
+                    .collect::<std::io::Result<_>>()?,
             ),
             state: FlushPublicationState::Prepared,
             commit_payloads: Default::default(),
@@ -1174,14 +1158,13 @@ impl FlushPublicationJournal {
     }
 
     pub(crate) fn paths(data_dir: &Path) -> Result<Vec<PathBuf>, WalError> {
-        std::fs::read_dir(data_dir.join(META_DIR))?
-            .filter_map(|entry| match entry {
-                Ok(entry) if entry.file_name().to_str().is_some_and(|name| name.starts_with("flush-") && name.ends_with(".json")) => Some(Ok(entry.path())),
-                Ok(_) => None,
-                Err(error) => Some(Err(error)),
+        Ok(std::fs::read_dir(data_dir.join(META_DIR))?
+            .filter_map(|entry| {
+                entry
+                    .map(|entry| entry.file_name().to_str().is_some_and(|name| name.starts_with("flush-") && name.ends_with(".json")).then(|| entry.path()))
+                    .transpose()
             })
-            .collect::<std::io::Result<Vec<_>>>()
-            .map_err(WalError::from)
+            .collect::<std::io::Result<_>>()?)
     }
 
     pub(crate) fn open(path: PathBuf) -> Result<Self, WalError> {
@@ -1302,12 +1285,9 @@ fn split_to_wal_payloads(batch: &RecordBatch, target: usize, hard_max: usize) ->
     // full dictionary), so flatten them first or the split degenerates to one
     // near-full-size entry per row. Flattening replicates values per row, so the
     // chunk math below must re-measure the flattened size.
-    let (batch, parent_len) = match flatten_dictionary_columns(batch)? {
-        Some(flat) => {
-            let len = serialize_record_batch(&flat)?.len();
-            (flat, len)
-        }
-        None => (batch.clone(), data.len()),
+    let (parent_len, batch) = match flatten_dictionary_columns(batch)? {
+        Some(flat) => (serialize_record_batch(&flat)?.len(), flat),
+        None => (data.len(), batch.clone()),
     };
     drop(data);
     let identity = WalBatchIdentity::from_batch(&batch);
@@ -1350,11 +1330,11 @@ fn split_to_wal_payloads(batch: &RecordBatch, target: usize, hard_max: usize) ->
 /// batch has no dictionary columns).
 fn flatten_dictionary_columns(batch: &RecordBatch) -> Result<Option<RecordBatch>, WalError> {
     use arrow::datatypes::{DataType, Field};
-    if !batch.schema().fields().iter().any(|f| matches!(f.data_type(), DataType::Dictionary(_, _))) {
+    if !batch.schema_ref().fields().iter().any(|f| matches!(f.data_type(), DataType::Dictionary(_, _))) {
         return Ok(None);
     }
     let (fields, cols): (Vec<Field>, Vec<arrow::array::ArrayRef>) = batch
-        .schema()
+        .schema_ref()
         .fields()
         .iter()
         .zip(batch.columns())
@@ -1363,7 +1343,7 @@ fn flatten_dictionary_columns(batch: &RecordBatch) -> Result<Option<RecordBatch>
             _ => Ok(((**f).clone(), c.clone())),
         })
         .collect::<Result<_, WalError>>()?;
-    Ok(Some(RecordBatch::try_new(std::sync::Arc::new(arrow::datatypes::Schema::new_with_metadata(fields, batch.schema_ref().metadata().clone())), cols)?))
+    Ok(Some(RecordBatch::try_new(Arc::new(arrow::datatypes::Schema::new_with_metadata(fields, batch.schema_ref().metadata().clone())), cols)?))
 }
 
 pub(crate) fn deserialize_record_batch(data: &[u8]) -> Result<RecordBatch, WalError> {
@@ -1478,13 +1458,13 @@ impl WalReplayIter<'_> {
     }
 }
 
-fn cursor_snapshot_path_in(data_dir: &std::path::Path) -> PathBuf {
+fn cursor_snapshot_path_in(data_dir: &Path) -> PathBuf {
     meta_path(data_dir, "cursor_snapshot.json")
 }
 
 /// [`write_atomic_with`] of a JSON-encoded value; `what` names the document in
 /// the encode-failure message.
-fn write_json_atomic<T: Serialize>(target: &std::path::Path, value: &T, durable: bool, what: &str) -> Result<(), WalError> {
+fn write_json_atomic<T: Serialize>(target: &Path, value: &T, durable: bool, what: &str) -> Result<(), WalError> {
     use std::io::Write;
     let bytes = serde_json::to_vec(value).map_err(|e| WalError::Internal(format!("{what} encode: {e}")))?;
     Ok(write_atomic_with(target, durable, |f| f.write_all(&bytes))?)
@@ -1496,7 +1476,7 @@ fn write_json_atomic<T: Serialize>(target: &std::path::Path, value: &T, durable:
 /// marker, drained-flag consumption); pure hint files may skip the syncs. The
 /// temp file is removed on failure. Callers are runtime tasks and `durable`
 /// costs two fsyncs, so the whole body runs off the worker thread.
-pub(crate) fn write_atomic_with(target: &std::path::Path, durable: bool, write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>) -> std::io::Result<()> {
+pub(crate) fn write_atomic_with(target: &Path, durable: bool, write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>) -> std::io::Result<()> {
     crate::support::without_blocking_the_worker(move || {
         let mut tmp = target.as_os_str().to_owned();
         tmp.push(".tmp");
@@ -1519,7 +1499,7 @@ pub(crate) fn write_atomic_with(target: &std::path::Path, durable: bool, write: 
 
 /// Read + parse + version-check the cursor snapshot.
 /// `WalManager::load_cursor_snapshot` adds shard-count and staleness checks.
-fn read_cursor_snapshot(wal_dir: &std::path::Path) -> Option<CursorSnapshot> {
+fn read_cursor_snapshot(wal_dir: &Path) -> Option<CursorSnapshot> {
     let path = cursor_snapshot_path_in(wal_dir);
     let bytes = std::fs::read(&path).ok()?;
     let snap: CursorSnapshot =
@@ -1547,61 +1527,55 @@ pub struct WalDirLock {
 impl WalDirLock {
     /// Acquire the exclusive WAL-dir lock, waiting until any other TimeFusion
     /// process holding it exits; errors once `LOCK_WAIT_GIVE_UP` elapses.
-    pub async fn acquire(wal_dir: &std::path::Path) -> Result<Self, WalError> {
+    pub async fn acquire(wal_dir: &Path) -> Result<Self, WalError> {
         let meta_dir = wal_dir.join(META_DIR);
         std::fs::create_dir_all(&meta_dir)?;
         let path = meta_dir.join("wal.lock");
         let file = std::fs::OpenOptions::new().create(true).read(true).write(true).truncate(false).open(&path)?;
         let mut waits = 0u64;
         loop {
-            match file.try_lock_exclusive() {
-                Ok(true) => {
-                    clear_takeover_request(wal_dir);
-                    if waits > 0 {
-                        info!("WAL dir lock acquired after waiting for a previous process to exit");
-                    }
-                    return Ok(Self { _file: file, wal_dir: std::fs::canonicalize(wal_dir)? });
+            if file.try_lock_exclusive()? {
+                clear_takeover_request(wal_dir);
+                if waits > 0 {
+                    info!("WAL dir lock acquired after waiting for a previous process to exit");
                 }
-                // Ok(false) = another live TimeFusion process owns the WAL.
-                // Poll at 25ms; log every ~10s (400 polls), escalate past ~60s.
-                Ok(false) => {
-                    // Asks a drained start-first predecessor to take its normal
-                    // graceful-exit path; it never authorizes this contender to
-                    // touch WAL state before acquiring the lock.
-                    if waits.is_multiple_of(400) {
-                        let request = meta_dir.join(TAKEOVER_REQUEST_FILE);
-                        // Written ONCE, never refreshed: the predecessor
-                        // escalates on the request's age, so rewriting it would
-                        // reset that age and the escalation could never fire.
-                        if !request.is_file() {
-                            let _ =
-                                std::fs::write(&request, format!("pid={} requested_at_micros={}\n", std::process::id(), chrono::Utc::now().timestamp_micros()));
-                        }
-                        let secs = waits / 40;
-                        if waits >= 2_400 {
-                            error!(
-                                "WAL dir {:?} still locked by another TimeFusion process after {secs}s — predecessor may be wedged (check for a stuck/duplicate instance)",
-                                path
-                            );
-                        } else {
-                            warn!("WAL dir {:?} is locked by another TimeFusion process; waiting for it to exit before recovery", path);
-                        }
-                    }
-                    // Bounded on purpose: a predecessor that never releases (an
-                    // orphaned container) must turn into an ordinary crash-loop
-                    // rather than a half-started process occupying memory.
-                    if waits >= LOCK_WAIT_GIVE_UP.as_millis() as u64 / 25 {
-                        return Err(WalError::LockContention(format!(
-                            "WAL dir {path:?} still locked after {}s; giving up so this process restarts instead of \
-                             occupying memory forever (look for an orphaned TimeFusion container holding the lock)",
-                            LOCK_WAIT_GIVE_UP.as_secs()
-                        )));
-                    }
-                    waits += 1;
-                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-                }
-                Err(e) => return Err(WalError::Io(e)),
+                return Ok(Self { _file: file, wal_dir: std::fs::canonicalize(wal_dir)? });
             }
+            // Another live TimeFusion process owns the WAL.
+            // Poll at 25ms; log every ~10s (400 polls), escalate past ~60s.
+            // The request asks a drained start-first predecessor to take its normal
+            // graceful-exit path; it never authorizes this contender to
+            // touch WAL state before acquiring the lock.
+            if waits.is_multiple_of(400) {
+                let request = meta_dir.join(TAKEOVER_REQUEST_FILE);
+                // Written ONCE, never refreshed: the predecessor
+                // escalates on the request's age, so rewriting it would
+                // reset that age and the escalation could never fire.
+                if !request.is_file() {
+                    let _ = std::fs::write(&request, format!("pid={} requested_at_micros={}\n", std::process::id(), chrono::Utc::now().timestamp_micros()));
+                }
+                let secs = waits / 40;
+                if waits >= 2_400 {
+                    error!(
+                        "WAL dir {:?} still locked by another TimeFusion process after {secs}s — predecessor may be wedged (check for a stuck/duplicate instance)",
+                        path
+                    );
+                } else {
+                    warn!("WAL dir {:?} is locked by another TimeFusion process; waiting for it to exit before recovery", path);
+                }
+            }
+            // Bounded on purpose: a predecessor that never releases (an
+            // orphaned container) must turn into an ordinary crash-loop
+            // rather than a half-started process occupying memory.
+            if waits >= LOCK_WAIT_GIVE_UP.as_millis() as u64 / 25 {
+                return Err(WalError::LockContention(format!(
+                    "WAL dir {path:?} still locked after {}s; giving up so this process restarts instead of \
+                     occupying memory forever (look for an orphaned TimeFusion container holding the lock)",
+                    LOCK_WAIT_GIVE_UP.as_secs()
+                )));
+            }
+            waits += 1;
+            tokio::time::sleep(Duration::from_millis(25)).await;
         }
     }
 
@@ -1610,20 +1584,20 @@ impl WalDirLock {
     }
 }
 
-pub fn takeover_requested(wal_dir: &std::path::Path) -> bool {
+pub fn takeover_requested(wal_dir: &Path) -> bool {
     meta_path(wal_dir, TAKEOVER_REQUEST_FILE).is_file()
 }
 
 /// How long a takeover request has been outstanding, or `None` when none is.
-pub fn takeover_request_age(wal_dir: &std::path::Path) -> Option<std::time::Duration> {
+pub fn takeover_request_age(wal_dir: &Path) -> Option<Duration> {
     let path = meta_path(wal_dir, TAKEOVER_REQUEST_FILE);
     let requested_at =
         std::fs::read_to_string(&path).ok()?.split_whitespace().find_map(|field| field.strip_prefix("requested_at_micros=")?.parse::<i64>().ok())?;
     let elapsed = crate::support::now_micros().saturating_sub(requested_at).max(0);
-    Some(std::time::Duration::from_micros(elapsed as u64))
+    Some(Duration::from_micros(elapsed as u64))
 }
 
-pub fn clear_takeover_request(wal_dir: &std::path::Path) {
+pub fn clear_takeover_request(wal_dir: &Path) {
     if let Err(e) = remove_if_exists(&meta_path(wal_dir, TAKEOVER_REQUEST_FILE)) {
         warn!("could not clear WAL takeover request: {e}");
     }
@@ -1636,8 +1610,8 @@ pub fn clear_takeover_request(wal_dir: &std::path::Path) {
 /// un-flushed backlog. The claim is consumed (rewritten false) so it cannot
 /// authorize a later boot's sweep. Undrained boot: skip — the floor-aware
 /// runtime sweep reclaims instead.
-pub fn boot_wal_gc(wal_dir: &std::path::Path) {
-    let t = std::time::Instant::now();
+pub fn boot_wal_gc(wal_dir: &Path) {
+    let t = Instant::now();
     let Some(mut snap) = read_cursor_snapshot(wal_dir).filter(|s| s.clean_shutdown && s.drained) else {
         info!("bootstrap.phase=wal_gc skipped=not_drained (runtime sweep reclaims post-replay)");
         return;
@@ -1666,7 +1640,7 @@ pub fn boot_wal_gc(wal_dir: &std::path::Path) {
     }
     // `drained=true` means all WAL-backed data is already in Delta, so even
     // recent segments go — Walrus startup stays independent of prior WAL size.
-    match gc_wal_files(wal_dir, std::time::Duration::ZERO, None) {
+    match gc_wal_files(wal_dir, Duration::ZERO, None) {
         Ok((deleted, bytes_freed)) => info!("bootstrap.phase=wal_gc deleted={deleted} bytes_freed={bytes_freed} elapsed_ms={}", t.elapsed().as_millis()),
         Err(e) => warn!("bootstrap.phase=wal_gc error={e} elapsed_ms={}", t.elapsed().as_millis()),
     }
@@ -1693,7 +1667,7 @@ pub(crate) const QUARANTINE_REDRIVEN_DIR_NAME: &str = "redriven";
 /// `payload_files` counts re-drivable items (`.bin` WAL entries, `.arrow` DML
 /// groups) and excludes `.meta` sidecars, so it reads as "items awaiting a
 /// human"; `bytes` bills everything on disk. Alert on payload_files > 0.
-pub fn quarantine_stats(wal_dir: &std::path::Path) -> (usize, u64) {
+pub fn quarantine_stats(wal_dir: &Path) -> (usize, u64) {
     let (mut files, mut bytes) = (0usize, 0u64);
     let mut stack = vec![wal_dir.join(QUARANTINE_DIR_NAME)];
     while let Some(dir) = stack.pop() {
@@ -1708,25 +1682,23 @@ pub fn quarantine_stats(wal_dir: &std::path::Path) -> (usize, u64) {
                 continue;
             }
             bytes += meta.len();
-            files += usize::from(matches!(std::path::Path::new(&entry.file_name()).extension().and_then(|e| e.to_str()), Some("bin" | "arrow")));
+            files += usize::from(matches!(Path::new(&entry.file_name()).extension().and_then(|e| e.to_str()), Some("bin" | "arrow")));
         }
     }
     (files, bytes)
 }
 
-/// Files last modified before this are past GC's age and durability bounds.
 /// When walrus created a segment: its name is the creation time in unix millis; mtime otherwise.
-fn segment_birth(path: &Path) -> Option<std::time::SystemTime> {
-    let named = path.file_name()?.to_str()?.parse::<u64>().ok().map(|ms| std::time::UNIX_EPOCH + std::time::Duration::from_millis(ms));
+fn segment_birth(path: &Path) -> Option<SystemTime> {
+    let named = path.file_name()?.to_str()?.parse::<u64>().ok().map(|ms| SystemTime::UNIX_EPOCH + Duration::from_millis(ms));
     named.or_else(|| std::fs::metadata(path).and_then(|m| m.modified()).ok())
 }
 
-fn gc_cutoff(max_age: std::time::Duration, unflushed_floor_micros: Option<i64>) -> std::time::SystemTime {
-    use std::time::SystemTime;
+/// Files last modified before this are past GC's age and durability bounds.
+fn gc_cutoff(max_age: Duration, unflushed_floor_micros: Option<i64>) -> SystemTime {
     let by_age = SystemTime::now().checked_sub(max_age).unwrap_or(SystemTime::UNIX_EPOCH);
-    unflushed_floor_micros.map_or(by_age, |floor| {
-        by_age.min(SystemTime::UNIX_EPOCH + std::time::Duration::from_micros(floor.saturating_sub(GC_FLOOR_SLACK_MICROS).max(0) as u64))
-    })
+    unflushed_floor_micros
+        .map_or(by_age, |floor| by_age.min(SystemTime::UNIX_EPOCH + Duration::from_micros(floor.saturating_sub(GC_FLOOR_SLACK_MICROS).max(0) as u64)))
 }
 
 /// Delete WAL files older than `max_age` by mtime, recursing into subdirs.
@@ -1741,16 +1713,14 @@ fn gc_cutoff(max_age: std::time::Duration, unflushed_floor_micros: Option<i64>) 
 /// oldest WAL-append time any un-flushed data may depend on, and no file at or
 /// after `floor − slack` is deleted whatever its age. `None` = no un-flushed
 /// data ⇒ pure mtime. Without it, a crash loop's aged files ARE the backlog.
-pub fn gc_wal_files(wal_dir: &std::path::Path, max_age: std::time::Duration, unflushed_floor_micros: Option<i64>) -> std::io::Result<(u64, u64)> {
-    use std::time::SystemTime;
+pub fn gc_wal_files(wal_dir: &Path, max_age: Duration, unflushed_floor_micros: Option<i64>) -> std::io::Result<(u64, u64)> {
     let cutoff = gc_cutoff(max_age, unflushed_floor_micros);
     let (mut deleted, mut bytes_freed) = (0u64, 0u64);
     let mut stack: Vec<PathBuf> = vec![wal_dir.to_path_buf()];
     while let Some(dir) = stack.pop() {
         let rd = match std::fs::read_dir(&dir) {
-            Ok(rd) => rd,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(e),
+            rd => rd?,
         };
         for entry in rd.flatten() {
             let name = entry.file_name();
@@ -1787,8 +1757,6 @@ pub fn gc_wal_files(wal_dir: &std::path::Path, max_age: std::time::Duration, unf
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use arrow::{
         array::{ArrayRef, Int64Array, StringViewArray},
         datatypes::{DataType, Field, Schema},
@@ -1872,10 +1840,10 @@ mod tests {
     }
 
     /// Poll until the blocked contender publishes its takeover request.
-    async fn await_takeover_request(path: &std::path::Path, msg: &str) {
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    async fn await_takeover_request(path: &Path, msg: &str) {
+        tokio::time::timeout(Duration::from_secs(5), async {
             while !takeover_requested(path) {
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
@@ -1894,7 +1862,7 @@ mod tests {
     }
 
     /// `size` zero bytes at `root/rel`, parent dirs created; returns the path.
-    fn touch(root: &std::path::Path, rel: &str, size: usize) -> PathBuf {
+    fn touch(root: &Path, rel: &str, size: usize) -> PathBuf {
         let path = root.join(rel);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, vec![0u8; size]).unwrap();
@@ -2540,10 +2508,10 @@ mod tests {
         let first = request();
 
         // Poll well past the contender's ~10s rewrite interval.
-        tokio::time::sleep(std::time::Duration::from_millis(11_000)).await;
+        tokio::time::sleep(Duration::from_millis(11_000)).await;
         assert_eq!(first, request(), "the request must not be refreshed, or its age can never reach the escalation threshold");
         assert!(
-            takeover_request_age(path).is_some_and(|age| age >= std::time::Duration::from_secs(10)),
+            takeover_request_age(path).is_some_and(|age| age >= Duration::from_secs(10)),
             "the age must grow with wall clock: {:?}",
             takeover_request_age(path)
         );
@@ -2554,7 +2522,7 @@ mod tests {
     async fn wal_lock_contender_requests_takeover_and_clears_marker_on_acquire() {
         let (tmp, owner, contender) = blocked_contender("blocked replacement must publish a takeover request").await;
         drop(owner);
-        let replacement = tokio::time::timeout(std::time::Duration::from_secs(2), contender).await.unwrap().unwrap().unwrap();
+        let replacement = tokio::time::timeout(Duration::from_secs(2), contender).await.unwrap().unwrap().unwrap();
         assert!(!takeover_requested(tmp.path()), "new WAL owner must clear the consumed request");
         drop(replacement);
     }
@@ -2582,7 +2550,7 @@ mod tests {
         ];
 
         let floor = floor_offset_secs.map(|secs| chrono::Utc::now().timestamp_micros() + secs * 1_000_000);
-        let swept = gc_wal_files(root, std::time::Duration::from_secs(max_age_secs), floor).unwrap();
+        let swept = gc_wal_files(root, Duration::from_secs(max_age_secs), floor).unwrap();
 
         assert!(meta.iter().all(|p| p.exists()), "meta dir must be skipped");
         assert!(parked.iter().all(|p| p.exists()), "quarantine payloads and sidecars must never be reclaimed by GC");
@@ -2604,7 +2572,7 @@ mod tests {
         assert_eq!(wal.read_entries_raw("p", &table, None, true).unwrap().0.len(), 1);
         let held = segment_fds(tmp.path());
 
-        let (deleted, _) = gc_wal_files(tmp.path(), std::time::Duration::ZERO, None).unwrap();
+        let (deleted, _) = gc_wal_files(tmp.path(), Duration::ZERO, None).unwrap();
         assert!(deleted > 0);
         assert!(segment_fds(tmp.path()) < held, "every deleted segment's handle must be closed");
     }
@@ -2618,7 +2586,7 @@ mod tests {
         let wal = wal_in(&tmp, crate::config::WalFsyncMode::SyncEach, 1);
         let table = uniq("idle");
         wal.append("p", &table, &create_test_batch()).unwrap();
-        gc_wal_files(tmp.path(), std::time::Duration::ZERO, None).unwrap();
+        gc_wal_files(tmp.path(), Duration::ZERO, None).unwrap();
         wal.append("p", &table, &create_test_batch()).expect("append after GC");
         wal.append("p", &uniq("new"), &create_test_batch()).expect("a new topic's first append after GC");
         assert_eq!(wal.read_entries_raw("p", &table, None, true).unwrap().0.len(), 2);
@@ -2640,7 +2608,7 @@ mod tests {
             wal.append("p", &uniq("busy"), &create_test_batch()).unwrap();
         }
         assert!(segments().len() > first.len(), "the allocator must have moved to a new segment");
-        wal.gc(std::time::Duration::ZERO, None).unwrap();
+        wal.gc(Duration::ZERO, None).unwrap();
         assert!(first.iter().all(|path| !path.exists()), "the aged segment its idle writers pinned must be reclaimed");
         wal.append("p", &idle, &create_test_batch()).expect("an idle writer appends after its segment is reclaimed");
     }
@@ -2660,11 +2628,11 @@ mod tests {
             wal.append("p", &uniq("busy"), &create_test_batch()).unwrap();
         }
         assert!(segments().len() > first.len(), "the allocator must have moved to a new segment");
-        std::thread::sleep(std::time::Duration::from_millis(1500));
+        std::thread::sleep(Duration::from_millis(1500));
         wal.append("p", &slow, &create_test_batch()).unwrap();
-        let max_age = std::time::Duration::from_secs(1);
+        let max_age = Duration::from_secs(1);
         wal.gc(max_age, None).unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(1500));
+        std::thread::sleep(Duration::from_millis(1500));
         // Still writing: never idle for `max_age`, as a slow but live prod topic.
         wal.append("p", &slow, &create_test_batch()).unwrap();
         wal.gc(max_age, None).unwrap();
@@ -2674,7 +2642,7 @@ mod tests {
 
     /// Open fds on WAL segments under `dir`, unlinked ones included (Linux
     /// reports those as `<path> (deleted)`). The meta dir is not walrus's.
-    fn segment_fds(dir: &std::path::Path) -> usize {
+    fn segment_fds(dir: &Path) -> usize {
         let dir = dir.canonicalize().unwrap();
         std::fs::read_dir("/dev/fd")
             .unwrap()
@@ -2735,7 +2703,7 @@ mod tests {
         let old_file = root.join("00.wal");
         let make_old_file = || {
             std::fs::write(&old_file, b"data").unwrap();
-            let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+            let old = std::time::SystemTime::now() - Duration::from_secs(3600);
             let f = std::fs::File::options().append(true).open(&old_file).unwrap();
             f.set_times(std::fs::FileTimes::new().set_modified(old)).unwrap();
         };
@@ -2794,9 +2762,7 @@ mod tests {
         // Pre-init sweep hits a not-yet-created dir; must not error.
         let tmp = tempfile::tempdir().unwrap();
         let missing = tmp.path().join("does-not-exist");
-        let (deleted, bytes_freed) = gc_wal_files(&missing, std::time::Duration::ZERO, None).unwrap();
-        assert_eq!(deleted, 0);
-        assert_eq!(bytes_freed, 0);
+        assert_eq!(gc_wal_files(&missing, Duration::ZERO, None).unwrap(), (0, 0));
     }
 
     /// `WalEntry::data` must NOT carry `#[bincode(with_serde)]`: bincode's

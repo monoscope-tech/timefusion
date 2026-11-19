@@ -100,7 +100,7 @@ bincode = { version = "2.0", features = ["serde"] }
 walrus-rust = { path = "vendor/walrus-rust" }
 thiserror = "2.0"
 strum = { version = "0.27", features = ["derive"] }
-derive_more = { version = "2", features = ["debug", "display", "deref", "deref_mut"] }
+derive_more = { version = "2", features = ["add", "debug", "display", "deref", "deref_mut"] }
 # Official datafusion-contrib/datafusion-variant — supports DataFusion 54 / arrow
 # 58.3 as of #62. We carry no local changes, so use upstream directly (pinned).
 datafusion-variant = { git = "https://github.com/tonyalaribe/datafusion-variant.git", rev = "2928998edca981ad0c2152e79757c0d6ab3555a1" }

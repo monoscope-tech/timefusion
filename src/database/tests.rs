@@ -5078,7 +5078,7 @@ fn row_group_row_count_binds_far_below_the_parquet_default_and_by_a_measured_row
 #[test]
 fn repair_session_reserves_merge_memory_up_front_over_the_shared_default() {
     let env = Arc::new(datafusion::execution::runtime_env::RuntimeEnv::default());
-    let repair = build_optimize_session_state_tuned(
+    let repair = build_optimize_session_state(
         0,
         Arc::clone(&env),
         Some("256"),
@@ -5097,7 +5097,7 @@ fn repair_session_reserves_merge_memory_up_front_over_the_shared_default() {
 
     // Ordinary maintenance runs many concurrent bins, where a large
     // per-partition reservation would exhaust the bounded pool.
-    let exec_of = |cpus| build_optimize_session_state(cpus, Arc::clone(&env)).config().options().execution.clone();
+    let exec_of = |cpus| build_optimize_session_state(cpus, Arc::clone(&env), None, None).config().options().execution.clone();
     let plain = exec_of(0);
     assert_eq!(plain.sort_spill_reservation_bytes, 33_554_432);
     assert_eq!(plain.batch_size.get(), 2048, "merge memory ≈ fan-in × batch; 8192-row otel batches measured up to 145MB");
@@ -5399,7 +5399,7 @@ async fn spawn_cron_job_fires_on_schedule_then_stops_on_cancel() {
     {
         let count = count.clone();
         // "* * * * * *" = every second (6-field, seconds).
-        spawn_cron_job("test", "* * * * * *", cancel.clone(), move || {
+        spawn_cron_job("test", "* * * * * *", cancel.clone(), None, move || {
             let count = count.clone();
             async move {
                 count.fetch_add(1, Ordering::SeqCst);
@@ -5418,11 +5418,11 @@ async fn spawn_cron_job_fires_on_schedule_then_stops_on_cancel() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn spawn_cron_job_on_runs_body_on_the_selected_runtime() {
+async fn spawn_cron_job_runs_body_on_the_selected_runtime() {
     let isolated = tokio::runtime::Builder::new_multi_thread().worker_threads(1).thread_name("cron-isolated").enable_all().build().expect("isolated runtime");
     let cancel = Arc::new(CancellationToken::new());
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    spawn_cron_job_on("isolated-test", "* * * * * *", cancel.clone(), Some(isolated.handle().clone()), move || {
+    spawn_cron_job("isolated-test", "* * * * * *", cancel.clone(), Some(isolated.handle().clone()), move || {
         let tx = tx.clone();
         async move {
             let name = std::thread::current().name().unwrap_or("unnamed").to_owned();
@@ -5445,7 +5445,7 @@ async fn spawn_cron_job_skips_ticks_while_previous_run_hangs() {
     use std::sync::atomic::Ordering::Relaxed;
     let cancel = Arc::new(CancellationToken::new());
     let skipped_before = crate::observability::maintenance_stats().cron_ticks_skipped.load(Relaxed);
-    spawn_cron_job("hung-test", "* * * * * *", cancel.clone(), move || async move {
+    spawn_cron_job("hung-test", "* * * * * *", cancel.clone(), None, move || async move {
         std::future::pending::<()>().await; // never returns
     });
     // Generous window: needs >=2 wall-clock second boundaries on a loaded runner.
@@ -5461,7 +5461,7 @@ async fn spawn_cron_job_lets_slow_runs_finish() {
     use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
     let cancel = Arc::new(CancellationToken::new());
     let completed = Arc::new(AtomicUsize::new(0));
-    spawn_cron_job("slow-test", "* * * * * *", cancel.clone(), {
+    spawn_cron_job("slow-test", "* * * * * *", cancel.clone(), None, {
         let completed = completed.clone();
         move || {
             let completed = completed.clone();
@@ -7133,12 +7133,12 @@ fn a_bin_whose_own_adds_are_live_is_self_landed_not_stale() {
     let live = active_without_dvs(&["alpha-new.parquet"]);
     let (fresh, stale) = super::split_live_bins(vec![alpha, beta], &live);
     assert!(fresh.is_empty(), "neither bin's targets survive");
-    let (self_landed, stale): (Vec<_>, Vec<_>) = stale.into_iter().partition(|b| super::bin_adds_live(b, &live));
+    let (self_landed, stale): (Vec<_>, Vec<_>) = stale.into_iter().partition(|b| live.adds_live(&b.adds));
     assert_eq!(project_ids(&self_landed), vec!["alpha"], "a landed bin must never be discarded");
     assert_eq!(project_ids(&stale), vec!["beta"]);
     assert_eq!(super::wave_dropped_rows(&self_landed), 4);
     // A bin whose targets ARE live is never mistaken for self-landed.
-    assert!(!super::bin_adds_live(&staged_unit("alpha", &["f1"], None), &active_without_dvs(&["f1"])));
+    assert!(!active_without_dvs(&["f1"]).adds_live(&staged_unit("alpha", &["f1"], None).adds));
 }
 
 /// A commit-lock holder must free the lock on a bounded schedule even when
@@ -7349,13 +7349,13 @@ fn resume_commits_only_a_row_preserving_rewrite_of_still_live_inputs() {
     assert_eq!(super::classify_resume(&ok, "logs", 100_000, &resume_live(&[("in1", Some(30))])), Stale);
     // Truncated staging: the case that would silently drop 30 rows.
     let short = resume_intent(&["in1", "in2"], vec![resume_add("out1", 70)]);
-    assert_eq!(super::classify_resume(&short, "logs", 100_000, &live), RowMismatch { target_rows: 100, staged_rows: 70 });
+    assert_eq!(super::classify_resume(&short, "logs", 100_000, &live), RowMismatch { target_rows: Some(100), staged_rows: Some(70) });
     // Unverifiable is not the same as verified: no stats ⇒ never commit.
     let no_stats = resume_intent(&["in1", "in2"], vec![deltalake::kernel::Add { path: "out1".into(), size: 10, ..Default::default() }]);
-    assert_eq!(super::classify_resume(&no_stats, "logs", 100_000, &live), RowMismatch { target_rows: 100, staged_rows: -1 });
+    assert_eq!(super::classify_resume(&no_stats, "logs", 100_000, &live), RowMismatch { target_rows: Some(100), staged_rows: None });
     assert_eq!(
         super::classify_resume(&ok, "logs", 100_000, &resume_live(&[("in1", None), ("in2", Some(70))])),
-        RowMismatch { target_rows: -1, staged_rows: 100 }
+        RowMismatch { target_rows: None, staged_rows: Some(100) }
     );
     // Staged parquet is uuid-named, so its presence in the snapshot can only
     // mean OUR commit landed — clear the intent, never re-commit.

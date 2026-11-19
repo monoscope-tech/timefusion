@@ -10,6 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use itertools::Itertools as _;
 use parking_lot::Mutex;
 
 static MAINTENANCE_RETRY_REASON: LazyLock<Mutex<String>> = LazyLock::new(Mutex::default);
@@ -266,7 +267,7 @@ pub enum PlanPhase {
 static PLAN_PHASES: [(AtomicU64, AtomicU64); <PlanPhase as strum::EnumCount>::COUNT] =
     [const { (AtomicU64::new(0), AtomicU64::new(0)) }; <PlanPhase as strum::EnumCount>::COUNT];
 
-pub fn record_plan_phase(phase: PlanPhase, started: std::time::Instant) {
+pub fn record_plan_phase(phase: PlanPhase, started: Instant) {
     let (micros, calls) = &PLAN_PHASES[phase as usize];
     micros.fetch_add(started.elapsed().as_micros() as u64, Relaxed);
     calls.fetch_add(1, Relaxed);
@@ -349,13 +350,15 @@ impl LatencyHistogram {
         if now.saturating_duration_since(*start) >= LATENCY_WINDOW {
             (*start, *prev, *cur) = (now, *cur, snap);
         }
-        let delta: Vec<u64> = snap.iter().zip(prev.iter()).map(|(s, p)| s - p).collect();
+        let delta: [u64; LATENCY_BUCKETS] = std::array::from_fn(|i| snap[i] - prev[i]);
         let rank = (p * delta.iter().sum::<u64>() as f64).ceil().max(1.0) as u64;
-        let mut seen = 0;
-        let b = delta.iter().position(|c| {
-            seen += c;
-            seen >= rank
-        })?;
+        let b = delta
+            .iter()
+            .scan(0, |seen, c| {
+                *seen += c;
+                Some(*seen)
+            })
+            .position(|seen| seen >= rank)?;
         Some((latency_bucket_floor_us(b) + latency_bucket_floor_us(b + 1)) as f64 / 2_000.0)
     }
 }
@@ -417,70 +420,60 @@ pub fn init_metrics(
         .build();
     publish_local(local, fanout);
 
-    // Observable gauges polled from snapshot_stats() each export cycle; if the
-    // Weak upgrade fails (layer dropped during shutdown) the gauge observes nothing.
-    let bl_for_buckets = buffered_layer.clone();
-    meter
-        .u64_observable_gauge("timefusion.mem_buffer.oldest_bucket_age_seconds")
-        .with_description("Age of oldest MemBuffer bucket; alert if > 2x flush_interval_secs")
-        .with_callback(move |obs| {
-            if let Some(age) = bl_for_buckets.upgrade().and_then(|l| l.snapshot_stats().oldest_bucket_age_secs) {
-                obs.observe(age, &[]);
-            }
-        })
-        .build();
-
-    // Read filesystem space once per export callback, rather than in every
-    // snapshot_stats call. Unknown mounts emit no sample, not a false zero.
-    let bl_for_disk = buffered_layer.clone();
-    meter
-        .u64_observable_gauge("timefusion.wal.filesystem_available_bytes")
-        .with_description("Available bytes on the filesystem hosting the WAL")
-        .with_callback(move |obs| {
-            if let Some((_, available)) = bl_for_disk.upgrade().and_then(|l| crate::config::disk_space_for(l.wal().data_dir())) {
-                obs.observe(available, &[]);
-            }
-        })
-        .build();
-    let bl_for_disk_pct = buffered_layer.clone();
-    meter
-        .u64_observable_gauge("timefusion.wal.filesystem_free_pct")
-        .with_description("Available space as a percentage of the filesystem hosting the WAL")
-        .with_callback(move |obs| {
-            if let Some((total, available)) = bl_for_disk_pct.upgrade().and_then(|l| crate::config::disk_space_for(l.wal().data_dir()))
-                && total > 0
-            {
-                obs.observe(available.saturating_mul(100) / total, &[]);
-            }
-        })
-        .build();
-
     // One observable metric. `|s| value` upgrades the Weak, snapshots stats and
-    // observes a derived value; a plain expression is read from a process-global
-    // atomic, evaluated once per export cycle. Use `counter` for cumulative
+    // observes a derived value; `opt |layer| option` observes nothing on None or
+    // a dropped layer (shutdown); a plain expression is read from a process-global
+    // atomic, evaluated once per export cycle (`stat field` reads a
+    // `MaintenanceStats` field). Use `counter` for cumulative
     // totals — a counter, not a gauge, so `rate()` still reads correctly across
     // the reset to zero that every deploy causes, and this service redeploys on
     // any non-docs push — and `gauge` for point-in-time levels.
     macro_rules! observe {
-        (@build $method:ident, $id:literal, $desc:literal, |$s:ident| $value:expr) => {{
+        (@build $method:ident, $id:literal, $desc:literal, |$s:ident| $value:expr) => {
+            observe!(@build $method, $id, $desc, opt |layer| {
+                let $s = layer.snapshot_stats();
+                Some($value)
+            })
+        };
+        (@build $method:ident, $id:literal, $desc:literal, opt |$l:ident| $value:expr) => {{
             let weak = buffered_layer.clone();
             meter
                 .$method($id)
                 .with_description($desc)
                 .with_callback(move |obs| {
-                    if let Some(layer) = weak.upgrade() {
-                        let $s = layer.snapshot_stats();
-                        obs.observe($value, &[]);
+                    if let Some(v) = weak.upgrade().and_then(|$l| $value) {
+                        obs.observe(v, &[]);
                     }
                 })
                 .build();
         }};
+        (@build $method:ident, $id:literal, $desc:literal, stat $field:ident) => {
+            observe!(@build $method, $id, $desc, maintenance_stats().$field.load(Relaxed))
+        };
         (@build $method:ident, $id:literal, $desc:literal, $read:expr) => {
             meter.$method($id).with_description($desc).with_callback(|obs| obs.observe($read, &[])).build();
         };
         (gauge $($rest:tt)+) => { observe!(@build u64_observable_gauge, $($rest)+) };
         (counter $($rest:tt)+) => { observe!(@build u64_observable_counter, $($rest)+) };
     }
+
+    observe!(gauge
+        "timefusion.mem_buffer.oldest_bucket_age_seconds",
+        "Age of oldest MemBuffer bucket; alert if > 2x flush_interval_secs",
+        opt |l| l.snapshot_stats().oldest_bucket_age_secs
+    );
+    // Read filesystem space once per export callback, rather than in every
+    // snapshot_stats call. Unknown mounts emit no sample, not a false zero.
+    observe!(gauge
+        "timefusion.wal.filesystem_available_bytes",
+        "Available bytes on the filesystem hosting the WAL",
+        opt |l| crate::config::disk_space_for(l.wal().data_dir()).map(|(_, available)| available)
+    );
+    observe!(gauge
+        "timefusion.wal.filesystem_free_pct",
+        "Available space as a percentage of the filesystem hosting the WAL",
+        opt |l| crate::config::disk_space_for(l.wal().data_dir()).and_then(|(total, available)| (total > 0).then(|| available.saturating_mul(100) / total))
+    );
 
     observe!(gauge "timefusion.mem_buffer.pressure_pct", "MemBuffer memory pressure as percentage of max", |s| s.pressure_pct as u64);
     observe!(gauge "timefusion.mem_buffer.estimated_bytes", "MemBuffer estimated heap residency in bytes", |s| s.mem_estimated_bytes as u64);
@@ -552,12 +545,12 @@ pub fn init_metrics(
     observe!(gauge
         "timefusion.rollup.maintenance.pending_dirty_partitions",
         "Source partitions with durable rollup invalidations awaiting maintenance",
-        maintenance_stats().rollup_dirty_partitions.load(Relaxed)
+        stat rollup_dirty_partitions
     );
     observe!(gauge
         "timefusion.rollup.maintenance.oldest_invalidation_age_seconds",
         "Age of the oldest durable rollup invalidation",
-        maintenance_stats().rollup_oldest_invalidation_age_secs.load(Relaxed)
+        stat rollup_oldest_invalidation_age_secs
     );
 
     // THE MAINTENANCE LANE. None of this was exported before, so all of it lived
@@ -572,7 +565,7 @@ pub fn init_metrics(
     observe!(gauge
         "timefusion.maintenance.permit_held_seconds",
         "Longest a hygiene permit has been held in one phase (high-water mark). Long AND acquisitions climbing = saturated by long sorts; long AND acquisitions frozen = stuck",
-        maintenance_stats().permit_held_secs.load(Relaxed)
+        stat permit_held_secs
     );
     // The two failure classes observed on 2026-09-14, neither of which had a
     // metric. A user-facing error with no history is invisible between incidents,
@@ -580,12 +573,12 @@ pub fn init_metrics(
     observe!(counter
         "timefusion.pgwire.stream_failed",
         "pgwire row streams that died mid-flight — the user-visible query failure",
-        maintenance_stats().pgwire_stream_failed.load(Relaxed)
+        stat pgwire_stream_failed
     );
     observe!(counter
         "timefusion.maintenance.coordinator_errors",
         "Maintenance turns that ended in an error, most often a rollup aggregation losing the maintenance pool — the upstream of not_built rollup misses",
-        maintenance_stats().maintenance_coordinator_errors.load(Relaxed)
+        stat maintenance_coordinator_errors
     );
     // Multi-resource admission must expose BOTH sides of every ratio. The
     // 2026-09-20 under-utilization incident had 66 workers and CPU tokens but
@@ -594,116 +587,116 @@ pub fn init_metrics(
     observe!(gauge
         "timefusion.maintenance.cpu_tokens_used",
         "Maintenance CPU tokens held, including units parked on I/O",
-        maintenance_stats().maintenance_cpu_tokens_used.load(Relaxed)
+        stat maintenance_cpu_tokens_used
     );
     observe!(gauge
         "timefusion.maintenance.cpu_tokens_limit",
         "Live lag-scaled maintenance CPU-token limit before the rollup reservation",
-        maintenance_stats().maintenance_cpu_tokens_limit.load(Relaxed)
+        stat maintenance_cpu_tokens_limit
     );
     observe!(gauge
         "timefusion.maintenance.cpu_tokens_capacity",
         "Maximum configured maintenance CPU-token capacity",
-        maintenance_stats().maintenance_cpu_tokens_capacity.load(Relaxed)
+        stat maintenance_cpu_tokens_capacity
     );
     observe!(gauge
         "timefusion.maintenance.rollup_reserved_cpu_tokens",
         "CPU tokens inside the live limit reserved for rollup work",
-        maintenance_stats().maintenance_rollup_reserved_cpu_tokens.load(Relaxed)
+        stat maintenance_rollup_reserved_cpu_tokens
     );
     observe!(gauge
         "timefusion.maintenance.decoded_bytes_used",
         "Estimated decoded bytes reserved by admitted maintenance units",
-        maintenance_stats().maintenance_decoded_bytes_used.load(Relaxed)
+        stat maintenance_decoded_bytes_used
     );
     observe!(gauge
         "timefusion.maintenance.decoded_bytes_capacity",
         "Configured maintenance decoded-byte admission capacity",
-        maintenance_stats().maintenance_decoded_bytes_capacity.load(Relaxed)
+        stat maintenance_decoded_bytes_capacity
     );
     observe!(gauge
         "timefusion.maintenance.object_read_tokens_used",
         "Maintenance object-read reservations currently held",
-        maintenance_stats().maintenance_object_read_tokens_used.load(Relaxed)
+        stat maintenance_object_read_tokens_used
     );
     observe!(gauge
         "timefusion.maintenance.object_read_tokens_capacity",
         "Configured maintenance object-read reservation capacity",
-        maintenance_stats().maintenance_object_read_tokens_capacity.load(Relaxed)
+        stat maintenance_object_read_tokens_capacity
     );
     observe!(gauge
         "timefusion.maintenance.object_write_tokens_used",
         "Maintenance object-write reservations currently held",
-        maintenance_stats().maintenance_object_write_tokens_used.load(Relaxed)
+        stat maintenance_object_write_tokens_used
     );
     observe!(gauge
         "timefusion.maintenance.object_write_tokens_capacity",
         "Configured maintenance object-write reservation capacity",
-        maintenance_stats().maintenance_object_write_tokens_capacity.load(Relaxed)
+        stat maintenance_object_write_tokens_capacity
     );
     observe!(counter
         "timefusion.maintenance.admission_refused_cpu",
         "Maintenance reservations refused because the requesting lane reached its CPU-token limit",
-        maintenance_stats().maintenance_admission_refused_cpu.load(Relaxed)
+        stat maintenance_admission_refused_cpu
     );
     observe!(counter
         "timefusion.maintenance.admission_refused_decoded_bytes",
         "Maintenance reservations refused by aggregate or occupancy-scaled decoded-memory admission",
-        maintenance_stats().maintenance_admission_refused_decoded_bytes.load(Relaxed)
+        stat maintenance_admission_refused_decoded_bytes
     );
     observe!(counter
         "timefusion.maintenance.admission_refused_state_bytes",
         "Rollup reservations refused because admitted aggregate state would exceed its capacity",
-        maintenance_stats().maintenance_admission_refused_state_bytes.load(Relaxed)
+        stat maintenance_admission_refused_state_bytes
     );
     observe!(counter
         "timefusion.maintenance.admission_refused_state_waiter",
         "Rollup reservations refused because another unit holds the state waiter reservation",
-        maintenance_stats().maintenance_admission_refused_state_waiter.load(Relaxed)
+        stat maintenance_admission_refused_state_waiter
     );
     observe!(counter
         "timefusion.maintenance.admission_refused_object_reads",
         "Maintenance reservations refused because object-read tokens were exhausted",
-        maintenance_stats().maintenance_admission_refused_object_reads.load(Relaxed)
+        stat maintenance_admission_refused_object_reads
     );
     observe!(counter
         "timefusion.maintenance.admission_refused_object_writes",
         "Maintenance reservations refused because object-write tokens were exhausted",
-        maintenance_stats().maintenance_admission_refused_object_writes.load(Relaxed)
+        stat maintenance_admission_refused_object_writes
     );
     observe!(gauge
         "timefusion.maintenance.permits_available",
         "Free hygiene rewrite permits. Pinned at 0 while the lane is wedged",
-        maintenance_stats().light_rewrite_permits_available.load(Relaxed)
+        stat light_rewrite_permits_available
     );
     observe!(counter
         "timefusion.maintenance.permits_acquired",
         "Hygiene permits taken. Frozen against a climbing permits_unavailable is the wedge; both climbing is healthy contention",
-        maintenance_stats().compaction_permits_acquired.load(Relaxed)
+        stat compaction_permits_acquired
     );
     observe!(counter
         "timefusion.maintenance.permits_unavailable",
         "Hygiene turns that found no free permit and gave up before claiming",
-        maintenance_stats().compaction_permits_unavailable.load(Relaxed)
+        stat compaction_permits_unavailable
     );
     observe!(counter
         "timefusion.maintenance.hot_packing_reserve_unavailable",
         "Coordinator hot-packing turns held back so pending sealed consolidation can take the shared rewrite lanes",
-        maintenance_stats().hot_packing_reserve_unavailable.load(Relaxed)
+        stat hot_packing_reserve_unavailable
     );
     observe!(counter
         "timefusion.maintenance.hot_packing_reserve_waits",
         "Cron-driven hot bins queued before the shared rewrite pool by the sealed-debt reservation",
-        maintenance_stats().hot_packing_reserve_waits.load(Relaxed)
+        stat hot_packing_reserve_waits
     );
     // Committed bins per lane — the drain rate. Quoting one without history is how
     // a working-window burst right after a restart gets reported as a sustained rate.
     observe!(counter
         "timefusion.maintenance.light_optimize_bins_committed",
         "Hot-pack and sealed-consolidation bins committed",
-        maintenance_stats().light_optimize_bins_committed.load(Relaxed)
+        stat light_optimize_bins_committed
     );
-    observe!(counter "timefusion.maintenance.dedup_bins_committed", "Dedup bins committed", maintenance_stats().dedup_bins_committed.load(Relaxed));
+    observe!(counter "timefusion.maintenance.dedup_bins_committed", "Dedup bins committed", stat dedup_bins_committed);
     // THE COMPACTION-LAG ALERT SURFACE. Throughput counters alone cannot say
     // whether a flat line means "no work" or "wedged" — on 2026-09-15 they read
     // identically for three days while sealed consolidation committed nothing and
@@ -714,65 +707,57 @@ pub fn init_metrics(
     observe!(gauge
         "timefusion.maintenance.compaction_seconds_since_commit",
         "Seconds since the last pack/sealed bin committed. Rises without bound the moment compaction stops for ANY reason — wedge, starvation, crash loop. PAGE above one hour",
-        {
-            let stamped = maintenance_stats().last_compaction_commit_unix.load(Relaxed);
-            let now = crate::support::now_micros().max(0) as u64 / 1_000_000;
-            if stamped == 0 { process_uptime_secs() } else { now.saturating_sub(stamped) }
-        }
+        secs_since_unix(maintenance_stats().last_compaction_commit_unix.load(Relaxed))
     );
     observe!(gauge
         "timefusion.maintenance.sealed_seconds_since_commit",
         "Seconds since the SEALED lane last committed, or last had no sealed work queued. Separate from the combined gauge because the hot lane kept committing right through the 2026-09-15 sealed-lane outage. PAGE above two hours",
-        {
-            let stamped = maintenance_stats().last_sealed_commit_unix.load(Relaxed);
-            let now = crate::support::now_micros().max(0) as u64 / 1_000_000;
-            if stamped == 0 { process_uptime_secs() } else { now.saturating_sub(stamped) }
-        }
+        secs_since_unix(maintenance_stats().last_sealed_commit_unix.load(Relaxed))
     );
     observe!(counter
         "timefusion.maintenance.compaction_units_selected_nothing",
         "Compaction units that claimed a cell and selected no bin. A converged cell does this once; a wedged lane does it thousands of times a minute. WARN on a sustained rate",
-        maintenance_stats().compaction_units_selected_nothing.load(Relaxed)
+        stat compaction_units_selected_nothing
     );
     observe!(counter
         "timefusion.maintenance.compaction_invariant_violations",
         "Units that declined two or more UNDER-TARGET files — files the planner queues the cell on. Structurally impossible; any nonzero value is the 2026-09-15 packer wedge regressing. PAGE if > 0",
-        maintenance_stats().compaction_invariant_violations.load(Relaxed)
+        stat compaction_invariant_violations
     );
     // Queue depth per lane. Depth alone cannot tell slow from never-claimed —
     // pair it with the permit counters above, which is what settles starvation.
-    observe!(gauge "timefusion.maintenance.pending_base_rollup", "BaseRollup units queued", maintenance_stats().pending_base_rollup.load(Relaxed));
-    observe!(gauge "timefusion.maintenance.pending_dedup", "Dedup units queued", maintenance_stats().pending_dedup.load(Relaxed));
-    observe!(gauge "timefusion.maintenance.pending_repair", "Repair units queued", maintenance_stats().pending_repair.load(Relaxed));
+    observe!(gauge "timefusion.maintenance.pending_base_rollup", "BaseRollup units queued", stat pending_base_rollup);
+    observe!(gauge "timefusion.maintenance.pending_dedup", "Dedup units queued", stat pending_dedup);
+    observe!(gauge "timefusion.maintenance.pending_repair", "Repair units queued", stat pending_repair);
     observe!(gauge
         "timefusion.maintenance.quarantined_tasks",
         "Queued units rationed to the quarantine lane after repeated worker failures",
-        maintenance_stats().maintenance_tasks_quarantined.load(Relaxed)
+        stat maintenance_tasks_quarantined
     );
     observe!(gauge
         "timefusion.maintenance.due_nonquarantined_tasks",
         "Queued units whose deadline passed and which are not quarantined; derived dependencies may still block some",
-        maintenance_stats().maintenance_tasks_due_nonquarantined.load(Relaxed)
+        stat maintenance_tasks_due_nonquarantined
     );
     observe!(counter
         "timefusion.maintenance.rollup_escalations",
         "Published rollup rebuilds wider than the invalidated ranges that armed them",
-        maintenance_stats().rollup_escalations.load(Relaxed)
+        stat rollup_escalations
     );
     observe!(counter
         "timefusion.maintenance.rollup_escalated_rows",
         "Estimated input rows rebuilt outside invalidated ranges (time share of the unit's input)",
-        maintenance_stats().rollup_escalated_rows.load(Relaxed)
+        stat rollup_escalated_rows
     );
     observe!(counter
         "timefusion.maintenance.rollup_escalated_bytes",
         "Estimated input bytes rebuilt outside invalidated ranges (time share of the unit's input)",
-        maintenance_stats().rollup_escalated_bytes.load(Relaxed)
+        stat rollup_escalated_bytes
     );
     observe!(gauge
         "timefusion.maintenance.oldest_due_unclaimed_age_seconds",
         "Wait of the oldest due, unclaimed, non-quarantined unit since its deadline (reset by every re-arm)",
-        maintenance_stats().maintenance_oldest_due_unclaimed_age_secs.load(Relaxed)
+        stat maintenance_oldest_due_unclaimed_age_secs
     );
     // INDEX COVERAGE. Live parquet with no tantivy index: those files fall back
     // to UDF scan, so queries over them are slow while every compaction metric
@@ -782,12 +767,12 @@ pub fn init_metrics(
     observe!(gauge
         "timefusion.tantivy.uncovered_sealed_files",
         "Live parquet on SEALED dates with no tantivy index — the ACTIONABLE coverage gap, and the one to alert on. Today's partition is excluded because the backfill skips it on purpose to avoid racing the hot-tail packer, and it runs to the hundreds normally",
-        maintenance_stats().tantivy_uncovered_sealed_files.load(Relaxed)
+        stat tantivy_uncovered_sealed_files
     );
     observe!(gauge
         "timefusion.tantivy.uncovered_files",
         "Live parquet files with no tantivy index. The periodic backfill drains this; a flat or rising value means coverage is being lost faster than it is rebuilt, and queries over those files silently fall back to UDF scan",
-        maintenance_stats().tantivy_uncovered_files.load(Relaxed)
+        stat tantivy_uncovered_files
     );
     // QUERY LATENCY, the headline symptom, which had no usable history at all.
     // Both latency histograms go through the `metrics` -> OTel bridge and arrive
@@ -841,7 +826,7 @@ pub fn init_metrics(
     observe!(gauge
         "timefusion.maintenance.sealed_compaction_debt_bytes",
         "Sealed compaction debt in DECODED bytes, not bytes on disk — roughly 12x the compressed footprint, and it is a stock of estimates that never decrements, so read it as a shape and never as a drain rate",
-        maintenance_stats().sealed_compaction_debt_bytes.load(Relaxed)
+        stat sealed_compaction_debt_bytes
     );
 
     if let Some(indexer_weak) = tantivy_indexer {
@@ -874,29 +859,21 @@ fn ingest_attrs(project_id: &str, table_name: &str) -> [KeyValue; 2] {
 /// Convenience helpers for hot-path counter increments. No-op if metrics
 /// weren't initialized (tests, embedded use).
 pub fn record_insert(project_id: &str, table_name: &str, rows: u64) {
-    if let Some(m) = METRICS.get() {
-        let attrs = ingest_attrs(project_id, table_name);
-        m.ingest_inserts.add(1, &attrs);
-        m.ingest_rows.add(rows, &attrs);
-    }
+    let attrs = ingest_attrs(project_id, table_name);
+    otel_add(|m| &m.ingest_inserts, 1, &attrs);
+    otel_add(|m| &m.ingest_rows, rows, &attrs);
 }
 
 pub fn record_ingest_error(project_id: &str, table_name: &str) {
-    if let Some(m) = METRICS.get() {
-        m.ingest_errors.add(1, &ingest_attrs(project_id, table_name));
-    }
+    otel_add(|m| &m.ingest_errors, 1, &ingest_attrs(project_id, table_name));
 }
 
 pub fn record_event_time_bounded(project_id: &str, table_name: &str, rows: u64) {
-    if let Some(m) = METRICS.get() {
-        m.ingest_event_time_bounded.add(rows, &ingest_attrs(project_id, table_name));
-    }
+    otel_add(|m| &m.ingest_event_time_bounded, rows, &ingest_attrs(project_id, table_name));
 }
 
 pub fn record_flush(success: bool) {
-    if let Some(m) = METRICS.get() {
-        (if success { &m.flush_completed } else { &m.flush_failed }).add(1, &[]);
-    }
+    otel_add(|m| if success { &m.flush_completed } else { &m.flush_failed }, 1, &[]);
 }
 
 /// Last observed size of the tantivy extracted-index disk cache. Written by the
@@ -909,7 +886,7 @@ pub fn record_tantivy_cache_bytes(bytes: u64) {
 
 /// When this process started, as seen from inside it — every accrual counter is
 /// only interpretable against process age.
-static PROCESS_START: LazyLock<std::time::Instant> = LazyLock::new(std::time::Instant::now);
+static PROCESS_START: LazyLock<Instant> = LazyLock::new(Instant::now);
 
 /// Pin the process-start instant. Idempotent; call as early as possible in
 /// every entry point (`main`, `bootstrap`) — the first force wins, so a late
@@ -920,6 +897,14 @@ pub fn mark_process_start() {
 
 pub fn process_uptime_secs() -> u64 {
     PROCESS_START.elapsed().as_secs()
+}
+
+/// Seconds since a unix-seconds stamp; process age while it is still 0 (never stamped).
+fn secs_since_unix(stamped: u64) -> u64 {
+    match stamped {
+        0 => process_uptime_secs(),
+        _ => (crate::support::now_micros().max(0) as u64 / 1_000_000).saturating_sub(stamped),
+    }
 }
 
 /// WHICH instance this is — minted on first use, never reused, and stamped on
@@ -996,16 +981,16 @@ fn record_section(component: &'static str, name: &'static str, elapsed: Duration
 /// Times a section that occupies a runtime worker without yielding — a
 /// `std::sync::Mutex` hold, a synchronous rebuild. **Not for `async` bodies**:
 /// use [`TimedSection`] there, which makes no occupancy claim.
-pub struct BlockWatch(&'static str, std::time::Instant, &'static std::panic::Location<'static>);
+pub struct BlockWatch(&'static str, Instant, &'static std::panic::Location<'static>);
 
 /// Wall time of a named section, awaits included — no claim that a worker was held.
-pub struct TimedSection(&'static str, std::time::Instant);
+pub struct TimedSection(&'static str, Instant);
 
 impl BlockWatch {
     /// `#[track_caller]` so a slow-section warning names who held it.
     #[track_caller]
     pub fn new(name: &'static str) -> Self {
-        Self(name, std::time::Instant::now(), std::panic::Location::caller())
+        Self(name, Instant::now(), std::panic::Location::caller())
     }
 }
 
@@ -1026,7 +1011,7 @@ impl Drop for BlockWatch {
 
 impl TimedSection {
     pub fn new(name: &'static str) -> Self {
-        Self(name, std::time::Instant::now())
+        Self(name, Instant::now())
     }
 }
 
@@ -1109,10 +1094,9 @@ impl HeapPhases {
 
     /// `phase:net/peak` in MB, e.g. `s0:+120/+4100,merge:-80/+9000`.
     pub fn phase_deltas_mb(&self) -> String {
-        self.state.as_ref().map_or_else(
-            || "n/a".to_owned(),
-            |state| state.lock().phases.iter().map(|(phase, net, peak)| format!("{phase}:{net:+}/{peak:+}")).collect::<Vec<_>>().join(","),
-        )
+        self.state
+            .as_ref()
+            .map_or_else(|| "n/a".to_owned(), |state| state.lock().phases.iter().map(|(phase, net, peak)| format!("{phase}:{net:+}/{peak:+}")).join(","))
     }
 }
 
@@ -1148,9 +1132,7 @@ macro_rules! recorders {
             $(#[$doc])*
             pub fn $fn_name() {
                 $($stats.$mirrored.fetch_add(1, Relaxed);)?
-                if let Some(m) = METRICS.get() {
-                    m.$field.add(1, &[]);
-                }
+                otel_add(|m| &m.$field, 1, &[]);
             }
         )+
     };
@@ -1163,9 +1145,7 @@ macro_rules! sum_recorders {
             $(#[$doc])*
             pub fn $fn_name($($arg: u64),+) {
                 $($($stats.$mirrored.fetch_add($arg, Relaxed);)?)+
-                if let Some(m) = METRICS.get() {
-                    $(m.$field.add($arg, &[]);)+
-                }
+                $(otel_add(|m| &m.$field, $arg, &[]);)+
             }
         )+
     };
@@ -1244,12 +1224,10 @@ sum_recorders! {
 pub fn record_rollup_hit(mode: &'static str, grain: &str, tier: &str) {
     let stats = maintenance_stats();
     if mode == "hybrid" { &stats.rollup_hits_hybrid } else { &stats.rollup_hits_full }.fetch_add(1, Relaxed);
-    if let Some(m) = METRICS.get() {
-        m.rollup_hits.add(1, &[KeyValue::new("mode", mode), KeyValue::new("grain", grain.to_string()), KeyValue::new("tier", tier.to_string())]);
-    }
+    otel_add(|m| &m.rollup_hits, 1, &[KeyValue::new("mode", mode), KeyValue::new("grain", grain.to_string()), KeyValue::new("tier", tier.to_string())]);
 }
 
-fn otel_add(counter: impl FnOnce(&MetricsRegistry) -> &opentelemetry::metrics::Counter<u64>, n: u64, attrs: &[KeyValue]) {
+fn otel_add(counter: impl FnOnce(&MetricsRegistry) -> &Counter<u64>, n: u64, attrs: &[KeyValue]) {
     if let Some(m) = METRICS.get() {
         counter(m).add(n, attrs);
     }
@@ -1359,19 +1337,14 @@ pub fn record_rollup_miss(reason: crate::rollup::MissReason) {
         R::SubGrainSlices => &stats.rollup_miss_sub_grain_slices,
     }
     .fetch_add(1, Relaxed);
-    if let Some(m) = METRICS.get() {
-        let counter = if reason.servable() { &m.rollup_misses } else { &m.rollup_unservable };
-        counter.add(1, &[KeyValue::new("reason", reason.label())]);
-    }
+    otel_add(|m| if reason.servable() { &m.rollup_misses } else { &m.rollup_unservable }, 1, &[KeyValue::new("reason", reason.label())]);
 }
 
 /// One commit-path operation abandoned by its bound. `op` is a fixed set of
 /// static labels (bounded cardinality by construction — never a table or
 /// project id, which belong on the accompanying warn's span attributes).
 pub fn record_commit_timeout(op: &'static str) {
-    if let Some(m) = METRICS.get() {
-        m.commit_lock_timeouts.add(1, &[KeyValue::new("op", op)]);
-    }
+    otel_add(|m| &m.commit_lock_timeouts, 1, &[KeyValue::new("op", op)]);
 }
 
 /// Declares a process-global atomic-counter struct together with its all-zero
@@ -2371,23 +2344,18 @@ mod tests {
 
         let mut rm = ResourceMetrics::default();
         reader.collect(&mut rm).unwrap();
-        let mut sums: Vec<String> = rm
+        let sums: Vec<String> = rm
             .scope_metrics()
             .flat_map(|scope| scope.metrics())
-            .filter_map(|metric| match metric.data() {
-                AggregatedMetrics::U64(MetricData::Sum(sum)) => Some(
-                    sum.data_points()
-                        .map(|point| {
-                            let labels: Vec<String> = point.attributes().map(|kv| format!("{}={}", kv.key, kv.value)).collect();
-                            format!("{} {} {}", metric.name(), labels.join(","), point.value())
-                        })
-                        .collect::<Vec<_>>(),
-                ),
-                _ => None,
+            .flat_map(|metric| match metric.data() {
+                AggregatedMetrics::U64(MetricData::Sum(sum)) => sum
+                    .data_points()
+                    .map(|point| format!("{} {} {}", metric.name(), point.attributes().map(|kv| format!("{}={}", kv.key, kv.value)).join(","), point.value()))
+                    .collect::<Vec<_>>(),
+                _ => vec![],
             })
-            .flatten()
+            .sorted()
             .collect();
-        sums.sort();
         assert_eq!(
             sums,
             [
@@ -2592,15 +2560,15 @@ mod imp {
 
     /// `(mtime, path)` for every file in `dir` whose name satisfies `matches`, newest first.
     fn newest_first(dir: &std::path::Path, matches: impl Fn(&str) -> bool) -> Vec<(std::time::SystemTime, PathBuf)> {
-        let mut files: Vec<_> = std::fs::read_dir(dir)
+        use itertools::Itertools as _;
+        std::fs::read_dir(dir)
             .into_iter()
             .flatten()
             .flatten()
             .filter(|e| e.file_name().to_str().is_some_and(&matches))
             .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
-            .collect();
-        files.sort_unstable_by_key(|(mtime, _)| std::cmp::Reverse(*mtime));
-        files
+            .sorted_unstable_by_key(|(mtime, _)| std::cmp::Reverse(*mtime))
+            .collect()
     }
 }
 

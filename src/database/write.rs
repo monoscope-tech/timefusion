@@ -385,7 +385,7 @@ impl Database {
     /// Heavy-maintenance session state, built once.
     pub(crate) fn maintenance_session_state(&self) -> datafusion::execution::session_state::SessionState {
         self.maintenance_session_state
-            .get_or_init(|| build_optimize_session_state(self.config.memory.timefusion_query_partitions, self.maintenance_runtime_env()))
+            .get_or_init(|| build_optimize_session_state(self.config.memory.timefusion_query_partitions, self.maintenance_runtime_env(), None, None))
             .clone()
     }
 
@@ -395,7 +395,7 @@ impl Database {
     pub(crate) fn light_optimize_session_state(&self) -> datafusion::execution::session_state::SessionState {
         self.light_optimize_session_state
             .get_or_init(|| {
-                build_optimize_session_state_tuned(
+                build_optimize_session_state(
                     self.config.memory.timefusion_query_partitions,
                     self.light_optimize_runtime_env(),
                     None,
@@ -418,7 +418,7 @@ impl Database {
         self.repair_session_states
             .entry(partitions)
             .or_insert_with(|| {
-                build_optimize_session_state_tuned(
+                build_optimize_session_state(
                     self.config.memory.timefusion_query_partitions,
                     self.repair_runtime_env(),
                     Some("256"),

@@ -558,7 +558,7 @@ impl Database {
     /// Only UDFs are registered; the caller registers its own Delta provider.
     pub(super) fn bounded_rollup_maintenance_context(&self) -> Result<datafusion::prelude::SessionContext> {
         let runtime = self.coordinator_runtime_env();
-        let state = build_optimize_session_state_tuned(1, runtime, Some("256"), None);
+        let state = build_optimize_session_state(1, runtime, Some("256"), None);
         let state =
             datafusion::execution::SessionStateBuilder::new_from_existing(state).with_physical_optimizer_rule(Arc::new(CompactRollupSortInputs)).build();
         let mut ctx = datafusion::prelude::SessionContext::new_with_state(state);
@@ -831,7 +831,7 @@ impl Database {
 
         // Dedup — collapse duplicates in sealed (< today) partitions. Holds
         // `maintenance_job_sem` to stay serialized against the full optimize job.
-        spawn_cron_job_on("Dedup", &self.config.maintenance.timefusion_dedup_schedule, cancel.clone(), self.maintenance_executor.get().cloned(), {
+        spawn_cron_job("Dedup", &self.config.maintenance.timefusion_dedup_schedule, cancel.clone(), self.maintenance_executor.get().cloned(), {
             let db = db.clone();
             move || {
                 let db = db.clone();

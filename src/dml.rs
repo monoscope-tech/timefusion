@@ -1,19 +1,24 @@
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
-    sync::Arc,
+    collections::{BTreeMap, HashMap, HashSet, VecDeque, hash_map::Entry},
+    hash::{Hash, Hasher},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Instant,
 };
 
 use async_trait::async_trait;
 use datafusion::{
     arrow::{
-        array::RecordBatch,
-        compute::concat_batches,
+        array::{RecordBatch, UInt32Array},
+        compute::{concat_batches, take},
         datatypes::{DataType, Field, Schema, SchemaRef},
+        row::{RowConverter, SortField},
     },
     catalog::Session,
     common::{
-        Column, JoinType, Result,
+        Column, JoinType, Result, ScalarValue,
         tree_node::{Transformed, TreeNode},
     },
     error::DataFusionError,
@@ -21,18 +26,21 @@ use datafusion::{
         SendableRecordBatchStream, SessionStateBuilder, TaskContext,
         context::{QueryPlanner, SessionState},
     },
-    logical_expr::{Expr, Join, LogicalPlan, Operator, WriteOp, binary_expr, utils::split_conjunction},
+    logical_expr::{BinaryExpr, Expr, Join, LogicalPlan, Operator, WriteOp, binary_expr, utils::split_conjunction},
     physical_plan::{DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, PlanProperties, stream::RecordBatchStreamAdapter},
     physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner},
+    prelude::lit,
 };
 use futures::{StreamExt, TryStreamExt};
 use itertools::Itertools;
+use tokio::sync::Notify;
+use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, error, field::Empty, info, instrument, warn};
 
 use crate::{
     database::Database,
     observability::{arrow_err, exec_err},
-    read::optimizers::extract_project_id_from_expr,
+    read::optimizers::{extract_project_id_from_expr, scalar_micros},
     write::BufferedWriteLayer,
 };
 
@@ -98,6 +106,13 @@ pub struct DmlInfo {
     pub assignments: Option<Vec<(String, Expr)>>,
     /// Materialized into [`UpdateSource`] before [`DmlExec`] is constructed.
     pub source_plan: Option<UpdateSourcePlan>,
+}
+
+impl UpdateSource {
+    /// The same merge shape over a different slice of source rows.
+    fn with_batch(&self, batch: RecordBatch) -> Self {
+        Self { batch, schema: self.schema.clone(), join_keys: self.join_keys.clone() }
+    }
 }
 
 #[derive(Clone)]
@@ -181,17 +196,15 @@ impl QueryPlanner for DmlQueryPlanner {
     }
 
     #[instrument(name = "dml.create_physical_plan", skip_all, fields(operation = Empty, table.name = Empty, project_id = Empty))]
-    async fn create_physical_plan(&self, logical_plan: &LogicalPlan, session: &dyn datafusion::catalog::Session) -> Result<Arc<dyn ExecutionPlan>> {
-        let session_state = session
-            .as_any()
-            .downcast_ref::<SessionState>()
-            .ok_or_else(|| datafusion::common::DataFusionError::Internal("DmlQueryPlanner requires a SessionState".into()))?;
-        let route_started = std::time::Instant::now();
+    async fn create_physical_plan(&self, logical_plan: &LogicalPlan, session: &dyn Session) -> Result<Arc<dyn ExecutionPlan>> {
+        let session_state =
+            session.as_any().downcast_ref::<SessionState>().ok_or_else(|| DataFusionError::Internal("DmlQueryPlanner requires a SessionState".into()))?;
+        let route_started = Instant::now();
         let routed = self.database.rollup_sql(logical_plan, session_state).await;
         crate::observability::record_plan_phase(crate::observability::PlanPhase::RollupRoute, route_started);
         match routed {
             Ok(rewrites) if !rewrites.is_empty() => {
-                let rewrite_started = std::time::Instant::now();
+                let rewrite_started = Instant::now();
                 // Each failure carries its own stage label, log message and miss reason.
                 type RewriteFailure = (DataFusionError, &'static str, &'static str, crate::rollup::MissReason);
                 let planned: std::result::Result<Arc<dyn ExecutionPlan>, RewriteFailure> = async {
@@ -264,7 +277,7 @@ impl QueryPlanner for DmlQueryPlanner {
         match self.database.histogram_plan(logical_plan, session_state).await {
             Ok(Some(plan)) => return self.planner.create_physical_plan(&plan, session_state).await,
             Ok(None) => {}
-            Err(error) => tracing::warn!(%error, "indexed histogram declined; using ordinary planning"),
+            Err(error) => warn!(%error, "indexed histogram declined; using ordinary planning"),
         }
         match logical_plan {
             LogicalPlan::Dml(dml) if matches!(dml.op, WriteOp::Update | WriteOp::Delete) => {
@@ -445,8 +458,7 @@ fn identify_target_side<'a>(join: &'a Join, target_table_name: &str) -> Result<(
         (_, Some(r)) if r.ends_with(target_table_name) => false,
         _ => {
             return Err(DataFusionError::Plan(format!(
-                "UPDATE target table `{}` not found on either side of FROM-join (left={:?}, right={:?})",
-                target_table_name, left_scan, right_scan
+                "UPDATE target table `{target_table_name}` not found on either side of FROM-join (left={left_scan:?}, right={right_scan:?})"
             )));
         }
     };
@@ -473,11 +485,10 @@ fn identify_target_side<'a>(join: &'a Join, target_table_name: &str) -> Result<(
 /// unwrapping `Alias`/`Cast`/`TryCast` (the planner inserts implicit casts on
 /// join keys). `None` for any other expression shape.
 fn expr_to_bare_col(expr: &Expr) -> Option<String> {
+    use datafusion::logical_expr::{Cast, TryCast, expr::Alias};
     match expr {
         Expr::Column(c) => Some(c.name.clone()),
-        Expr::Alias(a) => expr_to_bare_col(&a.expr),
-        Expr::Cast(cast) => expr_to_bare_col(&cast.expr),
-        Expr::TryCast(cast) => expr_to_bare_col(&cast.expr),
+        Expr::Alias(Alias { expr, .. }) | Expr::Cast(Cast { expr, .. }) | Expr::TryCast(TryCast { expr, .. }) => expr_to_bare_col(expr),
         _ => None,
     }
 }
@@ -547,13 +558,8 @@ fn extract_assignments_from_projection(proj: &datafusion::logical_expr::Projecti
 /// column untouched. `context` names the failure in the propagated error.
 fn map_columns(expr: Expr, context: &'static str, mut rewrite: impl FnMut(&Column) -> Option<Expr>) -> Result<Expr> {
     expr.transform(|e| {
-        Ok(match &e {
-            Expr::Column(col) => match rewrite(col) {
-                Some(replacement) => Transformed::yes(replacement),
-                None => Transformed::no(e),
-            },
-            _ => Transformed::no(e),
-        })
+        let replacement = if let Expr::Column(col) = &e { rewrite(col) } else { None };
+        Ok(replacement.map_or(Transformed::no(e), Transformed::yes))
     })
     .map(|t| t.data)
     .map_err(exec_err(context))
@@ -576,8 +582,7 @@ fn inline_projection_aliases(proj: &datafusion::logical_expr::Projection, assign
         return Ok(());
     }
     assignments.iter_mut().try_for_each(|(_, value_expr)| {
-        *value_expr = map_columns(value_expr.clone(), "Failed to inline CSE alias", |col| subs.get(col.name.as_str()).map(|r| (*r).clone()))?;
-        Ok(())
+        map_columns(value_expr.clone(), "Failed to inline CSE alias", |col| subs.get(col.name.as_str()).map(|r| (*r).clone())).map(|e| *value_expr = e)
     })
 }
 
@@ -814,13 +819,13 @@ pub(crate) fn fmt_capped(value: &dyn std::fmt::Debug, limit: usize) -> String {
 /// Must be called only AFTER `await_inflight_flushes`: an earlier watermark
 /// would clamp away rows whose Delta copy is still stale, losing the update.
 fn delta_leg_predicate(buffered_layer: Option<&Arc<BufferedWriteLayer>>, table_name: &str, project_id: &str, predicate: Option<&Expr>) -> Option<Option<Expr>> {
-    let time_col = crate::dml::table_time_column(table_name);
+    let time_col = table_time_column(table_name);
     let base: Option<Expr> =
         match buffered_layer.filter(|_| time_col == "timestamp").and_then(|layer| layer.delta_timestamp_upper_bound(project_id, table_name)) {
             None => predicate.cloned(),
-            Some(watermark) => match crate::dml::clamp_to_watermark(predicate, time_col, watermark) {
-                crate::dml::WatermarkClamp::Keep(p) => p,
-                crate::dml::WatermarkClamp::SkipDelta => {
+            Some(watermark) => match clamp_to_watermark(predicate, time_col, watermark) {
+                WatermarkClamp::Keep(p) => p,
+                WatermarkClamp::SkipDelta => {
                     crate::observability::record_dml_delta_leg_skipped();
                     debug!("DML delta leg skipped for {project_id}/{table_name}: time window entirely above flush watermark");
                     return None;
@@ -868,13 +873,12 @@ async fn perform_version_append(
 ) -> Result<u64> {
     use datafusion::{
         datasource::{MemTable, provider_as_source},
-        logical_expr::{LogicalPlanBuilder, col, lit},
+        logical_expr::{LogicalPlanBuilder, col},
     };
 
     let schema =
         crate::schema::get_schema(table_name).ok_or_else(|| DataFusionError::Execution(format!("merge-on-read: no registered schema for {table_name}")))?;
-    let tombstone_col = schema.tombstone_column.clone();
-    if tombstone && tombstone_col.is_none() {
+    if tombstone && schema.tombstone_column.is_none() {
         // Without a marker column a DELETE would silently delete nothing.
         return Err(DataFusionError::Execution(format!("merge-on-read: {table_name} sets version_append but declares no tombstone_column")));
     }
@@ -884,7 +888,7 @@ async fn perform_version_append(
         // winner (and the shape also slips past the immutable-column check,
         // which sees nothing assigned). Appending nothing is the only answer
         // that isn't pure packing work.
-        crate::observability::dml_stats().mor_noop_statements_skipped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        crate::observability::dml_stats().mor_noop_statements_skipped.fetch_add(1, Ordering::Relaxed);
         debug!(project_id, table_name, "merge-on-read update with no effective assignments; nothing to append");
         return Ok(0);
     }
@@ -895,7 +899,7 @@ async fn perform_version_append(
     // never saw, which its append would silently revert.
     let commits = database.version_only.commits(project_id, table_name);
     let candidate = irrelevant && layer.is_some() && database.config().maintenance.timefusion_rollup_version_only_witness;
-    let columns = assignments.iter().map(|(column, _)| column.as_str()).sorted().join(",");
+    let columns = assigned.iter().sorted().join(",");
 
     // The routing provider IS the logical table: it unions MemBuffer, the hot
     // tier and Delta and runs DedupExec, so the rows read are current versions.
@@ -915,33 +919,36 @@ async fn perform_version_append(
         .map(|p| split_conjunction(p).into_iter().cloned().partition(|c| !c.column_refs().iter().any(|col| source_cols.contains(&col.name))))
         .unwrap_or_default();
     let filter = pre_join.into_iter().fold(tenant, Expr::and);
-    let mut builder = LogicalPlanBuilder::scan(table_name, provider_as_source(provider), None)?.filter(filter)?;
+    let builder = LogicalPlanBuilder::scan(table_name, provider_as_source(provider), None)?.filter(filter)?;
+    let stored = |name: &str| col(Column::new(Some(table_name.to_string()), name));
 
-    if let Some(src) = source {
-        // The equi-join matches only AFTER the whole window is decoded, so push
-        // the source key values down as IN-lists to engage the parquet bloom
-        // filters. Sound because join-key target columns are never mutable.
-        if src.batch.num_rows() <= MOR_KEY_PUSHDOWN_ROWS {
-            builder = src.join_keys.iter().try_fold(builder, |builder, (t, s)| {
-                let arr = src.batch.column(src.schema.index_of(s)?);
-                let vals = (0..arr.len())
-                    .map(|i| datafusion::common::ScalarValue::try_from_array(arr, i))
-                    .process_results(|vals| vals.sorted_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)).dedup().map(lit).collect())?;
-                builder.filter(Expr::Column(Column::from_name(t)).in_list(vals, false))
-            })?;
+    let builder = match source {
+        None => builder,
+        Some(src) => {
+            // The equi-join matches only AFTER the whole window is decoded, so push
+            // the source key values down as IN-lists to engage the parquet bloom
+            // filters. Sound because join-key target columns are never mutable.
+            let builder = if src.batch.num_rows() <= MOR_KEY_PUSHDOWN_ROWS {
+                src.join_keys.iter().try_fold(builder, |builder, (t, s)| {
+                    let arr = src.batch.column(src.schema.index_of(s)?);
+                    let vals = (0..arr.len())
+                        .map(|i| ScalarValue::try_from_array(arr, i))
+                        .process_results(|vals| vals.sorted_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)).dedup().map(lit).collect())?;
+                    builder.filter(Expr::Column(Column::from_name(t)).in_list(vals, false))
+                })?
+            } else {
+                builder
+            };
+            let mem = MemTable::try_new(src.schema.clone(), vec![vec![src.batch.clone()]])?;
+            let src_plan = LogicalPlanBuilder::scan(MOR_SOURCE, provider_as_source(Arc::new(mem)), None)?.build()?;
+            let on: Vec<Expr> = src.join_keys.iter().map(|(t, s)| stored(t).eq(Expr::Column(Column::new(Some(MOR_SOURCE.to_string()), s)))).collect();
+            let joined = builder.join_on(src_plan, JoinType::Inner, on)?;
+            match post_join.into_iter().reduce(Expr::and) {
+                Some(guard) => joined.filter(requalify_for_merge(guard, &source_cols, MOR_SOURCE, table_name)?)?,
+                None => joined,
+            }
         }
-        let mem = MemTable::try_new(src.schema.clone(), vec![vec![src.batch.clone()]])?;
-        let src_plan = LogicalPlanBuilder::scan(MOR_SOURCE, provider_as_source(Arc::new(mem)), None)?.build()?;
-        let on: Vec<Expr> = src
-            .join_keys
-            .iter()
-            .map(|(t, s)| Expr::Column(Column::new(Some(table_name.to_string()), t)).eq(Expr::Column(Column::new(Some(MOR_SOURCE.to_string()), s))))
-            .collect();
-        builder = builder.join_on(src_plan, JoinType::Inner, on)?;
-        if let Some(guard) = post_join.into_iter().reduce(Expr::and) {
-            builder = builder.filter(requalify_for_merge(guard, &source_cols, MOR_SOURCE, table_name)?)?;
-        }
-    }
+    };
 
     // Full-row versions: every column carried forward with the assignments (and
     // tombstone marker) substituted in. The version stamp is deliberately NOT
@@ -951,13 +958,12 @@ async fn perform_version_append(
         .iter()
         .map(|f| {
             let name = f.name();
-            if tombstone && tombstone_col.as_deref() == Some(name.as_str()) {
-                return Ok(lit(true).alias(name));
+            Ok(match assignments.iter().find(|(c, _)| c == name) {
+                _ if tombstone && schema.tombstone_column.as_deref() == Some(name.as_str()) => lit(true),
+                Some((_, e)) => requalify_for_merge(e.clone(), &source_cols, MOR_SOURCE, table_name)?,
+                None => stored(name),
             }
-            match assignments.iter().find(|(c, _)| c == name) {
-                Some((_, e)) => Ok(requalify_for_merge(e.clone(), &source_cols, MOR_SOURCE, table_name)?.alias(name)),
-                None => Ok(col(Column::new(Some(table_name.to_string()), name)).alias(name)),
-            }
+            .alias(name))
         })
         .collect::<Result<Vec<_>>>()?;
 
@@ -970,7 +976,6 @@ async fn perform_version_append(
     // assignment disables suppression for the statement rather than half-prove
     // it. DELETE always appends: the tombstone itself is the change.
     let comparable = |name: &String| table_schema.field_with_name(name).is_ok_and(|f| !matches!(f.data_type(), DataType::Struct(_)));
-    let stored = |name: &str| col(Column::new(Some(table_name.to_string()), name));
     let differs = |(name, e): &(String, Expr)| -> Result<Expr> {
         Ok(binary_expr(requalify_for_merge(e.clone(), &source_cols, MOR_SOURCE, table_name)?, Operator::IsDistinctFrom, stored(name)))
     };
@@ -987,14 +992,9 @@ async fn perform_version_append(
         .filter(|(c, _)| enrich.contains(&c.as_str()))
         .map(|assignment| Ok(stored(&assignment.0).is_not_null().and(stored(&assignment.0).not_eq(lit(""))).and(differs(assignment)?)))
         .process_results::<_, _, DataFusionError, _>(|it| it.reduce(Expr::or))?;
-    let mut exprs = exprs;
-    if let Some(pred) = changed.clone() {
-        exprs.push(pred.alias(MOR_CHANGED_COL));
-    }
-    if let Some(pred) = overwrites.clone() {
-        exprs.push(pred.alias(MOR_OVERWRITES_COL));
-    }
-    let plan = builder.project(exprs)?.build()?;
+    let plan = builder
+        .project(exprs.into_iter().chain(changed.clone().map(|p| p.alias(MOR_CHANGED_COL))).chain(overwrites.clone().map(|p| p.alias(MOR_OVERWRITES_COL))))?
+        .build()?;
 
     // `session` must be a `delta_session_from(...)` one: default analyzer rules
     // only, so Variant columns round-trip as raw Structs rather than being
@@ -1064,15 +1064,15 @@ async fn perform_version_append(
             let stamp = (predecessors_flushed && !raced).then(|| crate::write::version_stamp_of(table_name, &batches[0])).flatten();
             let rows = batches[0].num_rows() as u64;
             if predecessors_flushed && raced {
-                stats.rollup_version_only_declined_by_commit_rows.fetch_add(rows, std::sync::atomic::Ordering::Relaxed);
+                stats.rollup_version_only_declined_by_commit_rows.fetch_add(rows, Ordering::Relaxed);
             }
             match stamp {
                 Some(stamp) => {
                     database.version_only.admit(project_id, table_name, stamp, columns.clone());
-                    stats.rollup_version_only_rows.fetch_add(rows, std::sync::atomic::Ordering::Relaxed);
+                    stats.rollup_version_only_rows.fetch_add(rows, Ordering::Relaxed);
                 }
                 None => {
-                    stats.rollup_version_only_declined_rows.fetch_add(rows, std::sync::atomic::Ordering::Relaxed);
+                    stats.rollup_version_only_declined_rows.fetch_add(rows, Ordering::Relaxed);
                     database
                         .invalidate_rollup_batches(project_id, table_name, &batches)
                         .map_err(|e| DataFusionError::Execution(format!("rollup invalidation failed for {project_id}/{table_name}: {e}")))?;
@@ -1081,15 +1081,14 @@ async fn perform_version_append(
         }
     }
     if rows > 0 {
-        let assigned: Vec<&str> = assignments.iter().map(|(column, _)| column.as_str()).collect();
-        let tiers = crate::database::maintain::rollup_tiers_reading(table_name, &assigned);
-        let tiers: Vec<(String, bool)> = tiers.into_iter().map(|(tier, reads)| (tier, reads || tombstone)).collect();
+        let tiers: Vec<(String, bool)> =
+            crate::database::maintain::rollup_tiers_reading(table_name, &assigned).into_iter().map(|(tier, reads)| (tier, reads || tombstone)).collect();
         crate::observability::record_version_append_relevance(&tiers, rows);
     }
     let stats = crate::observability::dml_stats();
-    stats.mor_version_rows_appended.fetch_add(rows, std::sync::atomic::Ordering::Relaxed);
-    stats.mor_noop_rows_suppressed.fetch_add(suppressed, std::sync::atomic::Ordering::Relaxed);
-    stats.mor_versions_retracted.fetch_add(retracted, std::sync::atomic::Ordering::Relaxed);
+    stats.mor_version_rows_appended.fetch_add(rows, Ordering::Relaxed);
+    stats.mor_noop_rows_suppressed.fetch_add(suppressed, Ordering::Relaxed);
+    stats.mor_versions_retracted.fetch_add(retracted, Ordering::Relaxed);
     debug!(project_id, table_name, rows, suppressed, retracted, tombstone, "merge-on-read version append");
     Ok(rows)
 }
@@ -1129,7 +1128,7 @@ async fn perform_update_with_buffer(
         // Keys are disjoint within a round, so chunking a round is semantics-
         // preserving and keeps key pushdown enabled.
         let chunks: Vec<Option<UpdateSource>> = match source {
-            Some(src) => crate::dml::split_source_rounds(src)?.into_iter().flat_map(|round| bounded_mor_source_chunks(round).into_iter().map(Some)).collect(),
+            Some(src) => split_source_rounds(src)?.into_iter().flat_map(|round| bounded_mor_source_chunks(round).into_iter().map(Some)).collect(),
             None => vec![None],
         };
         let mut total = 0u64;
@@ -1151,9 +1150,8 @@ async fn perform_update_with_buffer(
         // can't match a target row against two source rows, and the MemBuffer
         // hash-join would keep only one.
         let mut total = 0u64;
-        for round in crate::dml::split_source_rounds(src)? {
-            let src_for_mem = round.clone();
-            let src_for_delta = round;
+        for round in split_source_rounds(src)? {
+            let (src_for_mem, src_for_delta) = (round.clone(), round);
             let (coalescer, session) = (coalescer.clone(), session.clone());
             let update_span = tracing::trace_span!(parent: span, "delta.merge_update");
             total += DmlContext { database, buffered_layer, table_name, project_id, predicate: predicate.clone() }
@@ -1195,9 +1193,7 @@ fn bounded_mor_source_chunks(source: UpdateSource) -> Vec<UpdateSource> {
         chunks = rows.div_ceil(MOR_KEY_PUSHDOWN_ROWS),
         "bounded merge-on-read source to preserve complete-key pushdown"
     );
-    chunk_rows(&source.batch, MOR_KEY_PUSHDOWN_ROWS)
-        .map(|batch| UpdateSource { batch, schema: source.schema.clone(), join_keys: source.join_keys.clone() })
-        .collect()
+    chunk_rows(&source.batch, MOR_KEY_PUSHDOWN_ROWS).map(|batch| source.with_batch(batch)).collect()
 }
 
 async fn perform_delete_with_buffer(
@@ -1225,7 +1221,7 @@ async fn perform_delete_with_buffer(
 pub async fn perform_delta_update(
     database: &Database, table_name: &str, project_id: &str, predicate: Option<Expr>, assignments: Vec<(String, Expr)>, session: Arc<dyn Session>,
 ) -> Result<u64> {
-    info!("Performing Delta UPDATE on table {} for project {}", table_name, project_id);
+    info!("Performing Delta UPDATE on table {table_name} for project {project_id}");
 
     let span = tracing::Span::current();
     // Captures are cloned per attempt: the operation reruns after an OCC
@@ -1257,7 +1253,7 @@ pub async fn perform_delta_update(
 /// Perform Delta DELETE operation
 #[instrument(name = "delta.perform_delete", skip_all, fields(table.name = %table_name, project_id = %project_id, has_predicate = predicate.is_some(), rows.deleted = Empty))]
 pub async fn perform_delta_delete(database: &Database, table_name: &str, project_id: &str, predicate: Option<Expr>, session: Arc<dyn Session>) -> Result<u64> {
-    info!("Performing Delta DELETE on table {} for project {}", table_name, project_id);
+    info!("Performing Delta DELETE on table {table_name} for project {project_id}");
 
     let span = tracing::Span::current();
     // Explicit writer properties: the DeleteBuilder otherwise writes SNAPPY.
@@ -1298,7 +1294,7 @@ where
     let table_lock = database
         .resolve_table(project_id, table_name)
         .await
-        .map_err(|e| DataFusionError::Execution(format!("Table not found: {} for project {}: {}", table_name, project_id, e)))?;
+        .map_err(|e| DataFusionError::Execution(format!("Table not found: {table_name} for project {project_id}: {e}")))?;
 
     let dml_lock = database.dml_lock(project_id, table_name).await;
     let _dml_guard = dml_lock.lock().await;
@@ -1327,7 +1323,7 @@ where
             Err(e) if attempt + 1 < DML_MAX_ATTEMPTS && crate::database::is_occ_conflict_err(&e.to_string()) => {
                 attempt += 1;
                 crate::observability::record_dml_conflict();
-                warn!("DML delta op conflict on {}/{}, retrying ({}/{}): {}", project_id, table_name, attempt, DML_MAX_ATTEMPTS, e);
+                warn!("DML delta op conflict on {project_id}/{table_name}, retrying ({attempt}/{DML_MAX_ATTEMPTS}): {e}");
                 tokio::time::sleep(crate::database::occ_backoff(attempt)).await;
             }
             Err(e) => {
@@ -1414,7 +1410,7 @@ pub async fn perform_delta_merge_update(
     database: &Database, table_name: &str, project_id: &str, predicate: Option<Expr>, assignments: Vec<(String, Expr)>, source: UpdateSource,
     session: Arc<dyn Session>,
 ) -> Result<u64> {
-    info!("Performing Delta MERGE-UPDATE on table {} for project {} ({} source rows)", table_name, project_id, source.batch.num_rows());
+    info!("Performing Delta MERGE-UPDATE on table {table_name} for project {project_id} ({} source rows)", source.batch.num_rows());
 
     // Gate concurrent merges (each hash-joins against the time-windowed target);
     // held across the OCC retry loop.
@@ -1447,8 +1443,8 @@ pub async fn perform_delta_merge_update(
             // originals with a DV instead of rewriting whole matched files.
             if use_dv {
                 use deltalake::operations::merge_dv::{MergeDvUpdate, merge_update_with_deletion_vectors};
-                let partition_cols = crate::schema::get_schema(table_name).map(|s| s.partitions.clone()).unwrap_or_default();
-                let strip_cols = dv_strip_cols(&source_cols, &join_keys, &partition_cols);
+                let table_schema = crate::schema::get_schema(table_name);
+                let strip_cols = dv_strip_cols(&source_cols, &join_keys, table_schema.map_or(&[][..], |s| s.partitions.as_slice()));
                 let target_predicate = predicate.as_ref().and_then(|p| strip_source_conjuncts(p, &strip_cols));
                 let equi_keys = if database.config().maintenance.timefusion_dml_merge_key_prune { join_keys } else { vec![] };
                 return merge_update_with_deletion_vectors(
@@ -1467,7 +1463,7 @@ pub async fn perform_delta_merge_update(
                         // Sort appended rows by the table's sort keys so the footer
                         // can declare them: ONE unsorted file disables the reader's
                         // all-or-nothing footer ordering for the whole partition.
-                        append_sort_by: crate::schema::get_schema(table_name)
+                        append_sort_by: table_schema
                             .map(|s| s.sorting_columns.iter().map(|c| (c.name.clone(), c.descending, c.nulls_first)).collect())
                             .unwrap_or_default(),
                         // Sound only because every caller ran the mem leg first, so
@@ -1607,27 +1603,6 @@ mod strip_tests {
 // dedup cannot repair it. `timefusion.dml.coalesce_dropped` means the quarantine
 // write ITSELF failed, i.e. genuine loss.
 
-use std::{
-    collections::{BTreeMap, hash_map::Entry},
-    hash::{Hash, Hasher},
-    sync::atomic::{AtomicUsize, Ordering},
-};
-
-use datafusion::{
-    arrow::{
-        array::UInt32Array,
-        compute::take,
-        row::{RowConverter, SortField},
-    },
-    common::ScalarValue,
-    logical_expr::BinaryExpr,
-    prelude::lit,
-};
-use tokio::sync::Notify;
-use tokio_util::sync::CancellationToken;
-
-use crate::read::optimizers::scalar_micros;
-
 /// Queue-size pressure threshold: total buffered source rows above which a
 /// drain is triggered immediately instead of waiting for the timer. Matches
 /// `MAX_UPDATE_SOURCE_ROWS` — a drained group must stay mergeable.
@@ -1706,8 +1681,8 @@ fn quarantine_group(dir: &std::path::Path, key: &GroupKey, group: &PendingGroup,
         key.project_id,
         key.table_name,
         group.folded_projects.as_ref().map_or(String::new(), |p| p.join(",")),
-        group.join_keys.iter().map(|(t, s)| format!("{t}={s}")).collect::<Vec<_>>().join(","),
-        group.assignments.iter().map(|(c, e)| format!("{c}:={e}")).collect::<Vec<_>>().join(","),
+        group.join_keys.iter().map(|(t, s)| format!("{t}={s}")).join(","),
+        group.assignments.iter().map(|(c, e)| format!("{c}:={e}")).join(","),
         group.predicate.reconstruct(group.time_col).map_or(String::new(), |e| e.to_string()),
         group.time_col,
         group.attempts,
@@ -1801,14 +1776,14 @@ impl DecomposedPredicate {
                 (false, true) => Operator::LtEq,
                 (false, false) => Operator::Lt,
             };
-            Expr::BinaryExpr(BinaryExpr { left: Box::new(datafusion::prelude::col(time_col)), op, right: Box::new(lit(b.value.clone())) })
+            binary_expr(datafusion::prelude::col(time_col), op, lit(b.value.clone()))
         };
         self.residual
             .iter()
             .cloned()
             .chain(self.lower.as_ref().map(|b| time_expr(b, true)))
             .chain(self.upper.as_ref().map(|b| time_expr(b, false)))
-            .reduce(|a, b| a.and(b))
+            .reduce(Expr::and)
     }
 
     /// Widen this predicate's time window to also cover `other`'s (union):
@@ -1981,10 +1956,7 @@ fn clamp_decomposed(d: &mut DecomposedPredicate, watermark_micros: i64) -> Clamp
 /// and the MemBuffer hash-join would silently keep only one match. Returns one
 /// round for the common no-duplication case.
 pub(crate) fn split_source_rounds(source: UpdateSource) -> Result<Vec<UpdateSource>> {
-    Ok(split_rounds_on_keys(&source.batch, &source.join_keys)?
-        .into_iter()
-        .map(|batch| UpdateSource { batch, schema: source.schema.clone(), join_keys: source.join_keys.clone() })
-        .collect())
+    Ok(split_rounds_on_keys(&source.batch, &source.join_keys)?.into_iter().map(|batch| source.with_batch(batch)).collect())
 }
 
 /// [`split_rounds`] keyed by the SOURCE-side names of `join_keys`, resolved
@@ -2043,16 +2015,14 @@ pub(crate) fn merge_bisect<'a>(
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<u64>> + Send + 'a>> {
     Box::pin(async move {
         let rows = source.batch.num_rows();
-        match crate::dml::perform_delta_merge_update(db, table_name, project_id, predicate.clone(), assignments.clone(), source.clone(), session.clone()).await
-        {
+        match perform_delta_merge_update(db, table_name, project_id, predicate.clone(), assignments.clone(), source.clone(), session.clone()).await {
             Err(e) if e.to_string().contains("multiple source rows") && rows > 1 => {
                 let (a, b) = (source.batch.slice(0, rows / 2), source.batch.slice(rows / 2, rows - rows / 2));
                 warn!("dml merge: multi-source match on {rows} rows for {project_id}/{table_name}; bisecting ({} + {} rows)", a.num_rows(), b.num_rows());
                 // Sequential await per half: the recursion is fallible and ordered, which an iterator chain can't express here.
                 let mut n = 0;
                 for half in [a, b] {
-                    let src = UpdateSource { batch: half, schema: source.schema.clone(), join_keys: source.join_keys.clone() };
-                    n += merge_bisect(db, table_name, project_id, predicate.clone(), assignments.clone(), src, session.clone()).await?;
+                    n += merge_bisect(db, table_name, project_id, predicate.clone(), assignments.clone(), source.with_batch(half), session.clone()).await?;
                 }
                 Ok(n)
             }
@@ -2073,7 +2043,7 @@ pub async fn redrive_dml_quarantine(db: &Arc<crate::database::Database>, dir: &s
     let ctx = db.clone().create_session_context();
     // The pgwire-facing session reads Variant columns as Utf8View, which the
     // DV-merge write leg cannot cast back; use the variant-safe DML session.
-    let session: Arc<dyn Session> = crate::dml::delta_session_from(&ctx.state());
+    let session: Arc<dyn Session> = delta_session_from(&ctx.state());
     let redriven = dir.join("redriven");
     let (mut ok, mut skipped) = (0usize, 0usize);
     for entry in rd.flatten() {
@@ -2244,7 +2214,7 @@ pub(crate) fn parse_quarantine_meta(meta: &str) -> Option<QuarantineMeta> {
         .match_indices("Date32(\"")
         .filter_map(|(i, m)| {
             let s = &predicate[i + m.len()..];
-            s.split('"').next()?.parse::<chrono::NaiveDate>().ok().map(|d| (d - chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap()).num_days() as i32)
+            s.split('"').next()?.parse::<chrono::NaiveDate>().ok().map(|d| d.to_epoch_days())
         })
         .minmax()
         .into_option()?;
@@ -2336,7 +2306,7 @@ fn shape_fingerprint(join_keys: &[(String, String)], assignments: &[(String, Exp
 /// canonical matcher so routing, DML extraction and folding cannot drift apart;
 /// any other shape stays in the residual and blocks folding for that group.
 fn is_project_eq(e: &Expr, project_id: &str) -> bool {
-    crate::read::optimizers::extract_project_id_from_expr(e).as_deref() == Some(project_id)
+    extract_project_id_from_expr(e).as_deref() == Some(project_id)
 }
 
 /// Fold same-shape single-project groups on unified tables into one group per
@@ -2390,11 +2360,11 @@ fn fold_groups(groups: Vec<(GroupKey, PendingGroup)>, custom_storage: &HashSet<(
             }
             match build_folded(&table_name, shape_fp, &members) {
                 Ok(folded) => {
-                    debug!("dml coalesce: folded {} projects into one {} merge group", members.len(), table_name);
+                    debug!("dml coalesce: folded {} projects into one {table_name} merge group", members.len());
                     vec![folded]
                 }
                 Err(e) => {
-                    warn!("dml coalesce: folding {} groups for {} failed ({e}), draining per-project", members.len(), table_name);
+                    warn!("dml coalesce: folding {} groups for {table_name} failed ({e}), draining per-project", members.len());
                     unfolded(members)
                 }
             }
@@ -2410,17 +2380,12 @@ fn fold_groups(groups: Vec<(GroupKey, PendingGroup)>, custom_storage: &HashSet<(
 /// sets would pin an older IN-list to newer members' rows and silently drop
 /// their delta legs.
 fn build_folded(table_name: &str, shape_fp: u64, members: &[(GroupKey, PendingGroup, Vec<Expr>)]) -> Result<(GroupKey, PendingGroup)> {
-    use datafusion::arrow::{array::StringArray, datatypes::Field};
+    use datafusion::arrow::array::StringArray;
     let (rep_key, base, stripped) = &members[0];
     let projects: Vec<String> = members.iter().map(|(k, _, _)| k.project_id.clone()).collect();
 
-    let schema: SchemaRef = Arc::new(datafusion::arrow::datatypes::Schema::new(
-        base.schema
-            .fields()
-            .iter()
-            .cloned()
-            .chain(std::iter::once(Arc::new(Field::new("project_id", datafusion::arrow::datatypes::DataType::Utf8, false))))
-            .collect::<Vec<_>>(),
+    let schema: SchemaRef = Arc::new(Schema::new(
+        base.schema.fields().iter().cloned().chain(std::iter::once(Arc::new(Field::new("project_id", DataType::Utf8, false)))).collect::<Vec<_>>(),
     ));
     let out_schema = &schema; // &SchemaRef is Copy — capturable by both closures without moving `schema`
     let batches: Vec<BoundBatch> = members

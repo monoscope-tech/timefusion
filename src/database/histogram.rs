@@ -818,7 +818,7 @@ impl super::Database {
             return Ok(None);
         }
         let provider = Self::narrow_provider(log_store, snapshot, files.keys().cloned().collect(), None, None).await?;
-        let context = SessionContext::new_with_state(super::build_optimize_session_state(1, self.maintenance_runtime_env()));
+        let context = SessionContext::new_with_state(super::build_optimize_session_state(1, self.maintenance_runtime_env(), None, None));
         let columns: Vec<_> = schema.dedup_keys.iter().chain(schema.tombstone_column.iter()).map(String::as_str).collect();
         let frame = context
             .read_table(provider)?
@@ -1401,7 +1401,7 @@ mod tests {
         tombstone["deleted"] = serde_json::json!(true);
         insert(vec![tombstone]).await?;
         assert_eq!(db.build_histogram_count_proof(&partition).await?, None, "physical tombstones cannot be certified as live rows");
-        let batch_rows = super::super::build_optimize_session_state(1, db.maintenance_runtime_env()).config().options().execution.batch_size.get();
+        let batch_rows = super::super::build_optimize_session_state(1, db.maintenance_runtime_env(), None, None).config().options().execution.batch_size.get();
         let dense_timestamp = timestamp - DAY_MICROS;
         let dense_date = date_of(dense_timestamp);
         let dense_row = |id: usize| serde_json::json!({"project_id": project, "timestamp": dense_timestamp, "date": dense_date, "id": format!("{id:08}")});

@@ -7186,8 +7186,12 @@ impl Database {
             let provider = Self::narrow_provider(log_store, eager_snapshot, files.keys().cloned().collect(), None, None)
                 .await
                 .map_err(|error| anyhow::anyhow!("logical-count provider: {error}"))?;
-            let context =
-                SessionContext::new_with_state(build_optimize_session_state(self.config.memory.timefusion_query_partitions, self.maintenance_runtime_env()));
+            let context = SessionContext::new_with_state(build_optimize_session_state(
+                self.config.memory.timefusion_query_partitions,
+                self.maintenance_runtime_env(),
+                None,
+                None,
+            ));
             context.register_table("__logical_count_src", provider)?;
             let frame = context
                 .table("__logical_count_src")
@@ -8749,7 +8753,7 @@ impl Database {
                     TailPass::Repair => self.repair_session_state(REPAIR_SORT_PARTITION_LADDER[repair_level.min(REPAIR_SORT_PARTITION_LADDER.len() - 1)]),
                 },
                 |runtime| {
-                    build_optimize_session_state_tuned(
+                    build_optimize_session_state(
                         self.config.memory.timefusion_query_partitions,
                         runtime,
                         Some(&batch_size),
@@ -8830,7 +8834,7 @@ impl Database {
             // The writer gets this bin's measured row width so its row groups
             // are capped by decoded bytes rather than by an estimate.
             let writer_properties =
-                self.create_writer_properties_measured(schema, self.config.parquet.timefusion_zstd_compression_level, sorted, measured_bytes_per_row);
+                build_writer_properties(&self.config.parquet, schema, self.config.parquet.timefusion_zstd_compression_level, sorted, measured_bytes_per_row);
             let mut writer = deltalake::writer::RecordBatchWriter::for_table(&staging_table)
                 .map_err(|e| anyhow::anyhow!("hot bin writer: {e}"))?
                 .with_writer_properties(writer_properties);
@@ -9177,7 +9181,7 @@ impl Database {
             // then would leave the landed commit with dangling Adds. The exact
             // Adds settle it; a DV update reuses its path, so the deletion
             // vector must match too.
-            let (self_landed, stale): (Vec<StagedBin>, Vec<StagedBin>) = stale.into_iter().partition(|b| bin_adds_live(b, &active));
+            let (self_landed, stale): (Vec<StagedBin>, Vec<StagedBin>) = stale.into_iter().partition(|b| active.adds_live(&b.adds));
             stale.iter().for_each(|bin| debug!(table_name, project_id = %bin.project_id, engine, event = "wave_bin_stale_at_commit"));
             self.discard_bins(table_ref, &stale, Some(&live)).await;
             failed.extend(stale);

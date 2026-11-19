@@ -903,9 +903,9 @@ impl Database {
         let state = limits.map_or_else(
             // A single consumer avoids repartition queues spilling the full key
             // stream while preserving the existing maintenance pool and deadline.
-            || build_optimize_session_state(1, self.maintenance_runtime_env()),
+            || build_optimize_session_state(1, self.maintenance_runtime_env(), None, None),
             |limits| {
-                build_optimize_session_state_tuned(
+                build_optimize_session_state(
                     self.config.memory.timefusion_query_partitions,
                     self.coordinator_runtime_env(),
                     Some(&limits.batch_rows.to_string()),
@@ -1233,6 +1233,8 @@ impl Database {
             let ctx = datafusion::prelude::SessionContext::new_with_state(build_optimize_session_state(
                 limits.map_or(self.config.memory.timefusion_query_partitions, |l| l.sort_partitions),
                 self.maintenance_runtime_env(),
+                None,
+                None,
             ));
             ctx.register_table(scan_name, provider)?;
 
@@ -1667,6 +1669,8 @@ impl Database {
             let ctx = datafusion::prelude::SessionContext::new_with_state(build_optimize_session_state(
                 limits.map_or(self.config.memory.timefusion_query_partitions, |l| l.sort_partitions),
                 self.maintenance_runtime_env(),
+                None,
+                None,
             ));
             ctx.register_table(DEDUP_SCAN_NAME, provider)?;
 
