@@ -3476,7 +3476,7 @@ impl Database {
         // against the DECLARED target schema, and before the generation, which is
         // computed over exactly this set.
         let materialized = crate::rollup::materialized_measures(spec, derived, &present_columns, &target_schema.schema_ref(), base_evidence.as_ref());
-        let generation = crate::rollup::generation_id(spec, &key.source, &key.project_id, &date.to_string(), source_fp, Some(&materialized));
+        let generation = crate::rollup::generation_id(spec, &key.source, &key.project_id, &date.to_string(), Some(&materialized));
         let default_shard_keys = || ["project_id".to_owned(), "timestamp".to_owned()].into_iter().chain(spec.dimensions.iter().cloned()).collect::<Vec<_>>();
         let shard_keys = if derived || source_schema.dedup_keys.is_empty() { default_shard_keys() } else { source_schema.dedup_keys.clone() };
         let shard_key_sql = shard_keys.iter().map(|field| format!("CAST({} AS VARCHAR)", crate::rollup::quoted(field))).collect::<Vec<_>>().join(", ");
@@ -3486,8 +3486,7 @@ impl Database {
         let date_string = date.to_string();
         let range = (key.slice.start_micros, key.slice.end_micros);
         let projects = std::slice::from_ref(&key.project_id);
-        let cohort_sql =
-            |from: &str, derived: bool| crate::rollup::build_cohort_sql_range_mode(spec, &key.source, from, projects, &date_string, range, derived);
+        let cohort_sql = |from: &str, derived: bool| crate::rollup::build_cohort_sql_range_mode(spec, from, projects, &date_string, range, derived);
         let shaped_for_project = |aggregated: &[RecordBatch]| -> Result<Vec<RecordBatch>> {
             let generations = HashMap::from([(key.project_id.clone(), generation.clone())]);
             let mut by_project = crate::rollup::to_rollup_batches_by_project(spec, &key.source, &date_string, &generations, aggregated)?;
@@ -6422,8 +6421,7 @@ impl Database {
                 // Journal evidence can prove an obsolete generation even when all Add tags are gone.
                 // Legacy nonempty publications without measure evidence still need the tag checks.
                 if publication.evidence.as_ref().is_some_and(|evidence| {
-                    publication.generation
-                        != crate::rollup::generation_id(spec, source, &key.project_id, &date, publication.source_fingerprint, Some(&evidence.measures))
+                    publication.generation != crate::rollup::generation_id(spec, source, &key.project_id, &date, Some(&evidence.measures))
                 }) {
                     obsolete_generations.push((key.project_id.clone(), key.slice));
                     continue;
@@ -6530,7 +6528,7 @@ impl Database {
                     }
                     let measures = measures_by_identity.get(&identity).cloned().flatten();
                     let restrict = measures.as_ref().map(|names| names.iter().cloned().collect::<Vec<_>>());
-                    if crate::rollup::generation_id(spec, source, &project_id, &date, source_fp, restrict.as_deref()) != generation {
+                    if crate::rollup::generation_id(spec, source, &project_id, &date, restrict.as_deref()) != generation {
                         fate(UnverifiableFate::StaleGeneration);
                         stale_generation += 1;
                         obsolete_generations.push((project_id.clone(), slice));
@@ -9127,7 +9125,7 @@ impl Database {
         let flush_waiters = self.flush_waiters("", table_name).await;
         // Warm/evict diff scoped to the wave's dates rather than the whole table.
         let markers: Vec<&str> = date_markers.iter().map(String::as_str).collect();
-        let track_files = self.config.maintenance.timefusion_warm_after_compaction || self.config.maintenance.timefusion_evict_after_compaction;
+        let track_files = self.config.maintenance.tracks_compacted_files();
         const MAX_RETRIES: usize = 4;
         for attempt in 0..MAX_RETRIES {
             // FLUSH PRIORITY. The lock is FIFO, so enqueueing ahead of a waiting
@@ -10272,7 +10270,7 @@ impl Database {
         // Pre-state file set for deriving the files this optimize adds (to warm) and removes
         // (to evict), scoped to the one `(project_id, today)` partition it is filtered to.
         // Safe outside the retry loop: only a successful commit (which returns) changes it.
-        let track_files = self.config.maintenance.timefusion_warm_after_compaction || self.config.maintenance.timefusion_evict_after_compaction;
+        let track_files = self.config.maintenance.tracks_compacted_files();
         let (pid_marker, date_marker) = (format!("project_id={project_id}/"), format!("date={today}/"));
         let scope = [pid_marker.as_str(), date_marker.as_str()];
         let pre_uris: Option<HashSet<String>> = if track_files { Some(scoped_file_uris(&*table_ref.read().await, &scope).into_iter().collect()) } else { None };
@@ -10290,7 +10288,7 @@ impl Database {
                 // selection stay out of the commit's file set (OCC race on the hot partition).
                 .with_binned_files(selected_files)
                 .with_type(optimize_type.clone())
-                .with_target_size(std::num::NonZero::new(target_size as u64).unwrap_or(std::num::NonZero::<u64>::MIN))
+                .with_target_size(nonzero_target(target_size))
                 .with_max_files_per_bin(self.config.derived.optimize_max_files_per_bin())
                 .with_max_concurrent_tasks(self.config.derived.optimize_merge_tasks())
                 .with_writer_properties(writer_properties.clone())
@@ -11701,7 +11699,7 @@ mod rollup_noop_skip_tests {
         ctx.register_parquet("shard_raw", dir.path().to_str().expect("UTF8 temporary path"), ParquetReadOptions::default()).await?;
         let keys = source.dedup_keys.iter().map(|key| format!("CAST({} AS VARCHAR)", crate::rollup::quoted(key))).join(", ");
         let hash = format!("hash_bucket(arrow_cast(concat_ws(chr(31), {keys}), 'Utf8View'), {HASH_BUCKETS})");
-        let cohort = |from: &str, derived| crate::rollup::build_cohort_sql_range_mode(spec, SOURCE, from, &[PROJECT.to_owned()], date, range, derived);
+        let cohort = |from: &str, derived| crate::rollup::build_cohort_sql_range_mode(spec, from, &[PROJECT.to_owned()], date, range, derived);
         async fn measured(ctx: &SessionContext, sql: &str) -> Result<(Vec<RecordBatch>, u64, u64, u64)> {
             let plan = ctx.sql(sql).await?.create_physical_plan().await?;
             let _watch = PlanProgress::watch(Arc::clone(&plan));

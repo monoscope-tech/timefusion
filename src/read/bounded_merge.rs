@@ -21,15 +21,15 @@ use std::{
 
 use datafusion::{
     arrow::{
-        array::{Array, ArrayRef, Int64Array, RecordBatch},
+        array::{Array, ArrayRef, AsArray, Int64Array, RecordBatch},
         compute::{cast, interleave_record_batch},
-        datatypes::{DataType, SchemaRef},
+        datatypes::{DataType, Int64Type, SchemaRef},
         row::{RowConverter, Rows, SortField},
     },
     common::{
         Result, ScalarValue,
         config::ConfigOptions,
-        stats::Precision,
+        internal_datafusion_err, internal_err,
         tree_node::{Transformed, TransformedResult, TreeNode, TreeNodeRecursion},
     },
     datasource::{physical_plan::FileScanConfig, source::DataSourceExec},
@@ -37,7 +37,7 @@ use datafusion::{
     physical_expr::{LexOrdering, OrderingRequirements, PhysicalExpr, expressions::Column},
     physical_optimizer::PhysicalOptimizerRule,
     physical_plan::{
-        DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, PlanProperties, RecordBatchStream, SendableRecordBatchStream,
+        DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, PlanProperties, RecordBatchStream, SendableRecordBatchStream, apply_expression_roots,
         metrics::{BaselineMetrics, Count, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet},
         projection::ProjectionExec,
         sorts::sort_preserving_merge::SortPreservingMergeExec,
@@ -45,6 +45,7 @@ use datafusion::{
     },
 };
 use futures::{Stream, StreamExt};
+use itertools::Itertools;
 
 use super::optimizers::downcast;
 
@@ -98,12 +99,7 @@ impl ExecutionPlan for BoundedMergeExec {
         &self.properties
     }
     fn apply_expressions(&self, f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>) -> Result<TreeNodeRecursion> {
-        for sort in self.expr.iter() {
-            if f(&sort.expr)? == TreeNodeRecursion::Stop {
-                return Ok(TreeNodeRecursion::Stop);
-            }
-        }
-        Ok(TreeNodeRecursion::Continue)
+        apply_expression_roots(self.expr.iter().map(|sort| &sort.expr), f)
     }
     fn required_input_distribution(&self) -> Vec<Distribution> {
         vec![Distribution::UnspecifiedDistribution]
@@ -134,16 +130,16 @@ impl ExecutionPlan for BoundedMergeExec {
     }
     fn execute(&self, partition: usize, context: Arc<TaskContext>) -> Result<SendableRecordBatchStream> {
         if partition != 0 {
-            return Err(datafusion::error::DataFusionError::Internal(format!("BoundedMergeExec has one partition, asked for {partition}")));
+            return internal_err!("BoundedMergeExec has one partition, asked for {partition}");
         }
         let schema = self.input.schema();
         let fields = self.expr.iter().map(|sort| Ok(SortField::new_with_options(sort.expr.data_type(&schema)?, sort.options))).collect::<Result<Vec<_>>>()?;
         // Unbounded inputs first, then bounded ones in the order their rows can be next.
         let lead = self.expr.first().options;
-        let mut closed: Vec<usize> = (0..self.bounds.len()).collect();
-        closed.sort_by_key(|&p| (self.bounds[p].is_some(), self.bounds[p].map(|b| if lead.descending { -b } else { b })));
-        closed.reverse();
+        let closed: Vec<usize> =
+            (0..self.bounds.len()).sorted_by_key(|&p| (self.bounds[p].is_some(), self.bounds[p].map(|b| if lead.descending { -b } else { b }))).rev().collect();
         let primitive_lead = matches!(self.expr.first().expr.data_type(&schema)?, DataType::Int64 | DataType::Timestamp(..));
+        let session_batch = context.session_config().batch_size();
         let mut stream = BoundedMergeStream {
             input: Arc::clone(&self.input),
             context: Arc::clone(&context),
@@ -160,7 +156,7 @@ impl ExecutionPlan for BoundedMergeExec {
             pool: Vec::new(),
             picked: Vec::new(),
             remaining: self.fetch,
-            batch_size: self.batch_rows.map_or(context.session_config().batch_size(), |rows| rows.clamp(1, context.session_config().batch_size())),
+            batch_size: self.batch_rows.map_or(session_batch, |rows| rows.clamp(1, session_batch)),
             opened: MetricBuilder::new(&self.metrics).counter("inputs_opened", partition),
             skipped: MetricBuilder::new(&self.metrics).counter("inputs_never_opened", partition),
             encoded: MetricBuilder::new(&self.metrics).counter("key_rows_encoded", partition),
@@ -173,9 +169,7 @@ impl ExecutionPlan for BoundedMergeExec {
         while stream.closed.last().is_some_and(|&p| stream.bounds[p].is_none()) {
             stream.open_next()?;
         }
-        for _ in 0..INITIAL_READ_AHEAD {
-            stream.open_next()?;
-        }
+        stream.open(INITIAL_READ_AHEAD)?;
         Ok(Box::pin(stream))
     }
 }
@@ -197,7 +191,7 @@ struct Head {
 
 impl Head {
     fn leading(&self) -> Option<i64> {
-        (!self.lead.is_null(self.cursor)).then(|| self.lead.value(self.cursor))
+        self.lead.is_valid(self.cursor).then(|| self.lead.value(self.cursor))
     }
 }
 
@@ -215,10 +209,8 @@ impl SortKeys {
             encoded.add(rows.num_rows());
             *self = Self::Rows(rows);
         }
-        match self {
-            Self::Rows(rows) => Ok(rows),
-            Self::Columns(_) => unreachable!("columns were encoded above"),
-        }
+        let Self::Rows(rows) = self else { unreachable!("columns were encoded above") };
+        Ok(rows)
     }
 }
 
@@ -262,6 +254,11 @@ impl BoundedMergeStream {
         Ok(true)
     }
 
+    /// Opens up to `n` inputs; whether any opened.
+    fn open(&mut self, n: usize) -> Result<bool> {
+        (0..n).try_fold(false, |opened, _| Ok(self.open_next()? | opened))
+    }
+
     /// Does `value` come strictly before `bound` in output order? Strict, so every row
     /// sharing a timestamp with a closed input waits for it (keep-greatest dedup needs
     /// all versions of a key adjacent, and the key leads with the timestamp).
@@ -277,10 +274,9 @@ impl BoundedMergeStream {
     fn head(&mut self, slot_batch: RecordBatch) -> Result<Head> {
         let columns = self.expr.iter().map(|sort| sort.expr.evaluate(&slot_batch)?.into_array(slot_batch.num_rows())).collect::<Result<Vec<_>>>()?;
         let lead = cast(&columns[0], &DataType::Int64)?
-            .as_any()
-            .downcast_ref::<Int64Array>()
+            .as_primitive_opt::<Int64Type>()
             .cloned()
-            .ok_or_else(|| datafusion::error::DataFusionError::Internal("BoundedMergeExec leading key is not integer-like".into()))?;
+            .ok_or_else(|| internal_datafusion_err!("BoundedMergeExec leading key is not integer-like"))?;
         let mut rows = SortKeys::Columns(columns);
         if !self.primitive_lead {
             rows.rows(&self.converter, &self.encoded)?;
@@ -298,28 +294,10 @@ impl BoundedMergeStream {
         if self.primitive_lead {
             let options = self.expr.first().options;
             let order = match (a.leading(), b.leading()) {
-                (None, None) => Ordering::Equal,
-                (None, Some(_)) => {
-                    if options.nulls_first {
-                        Ordering::Less
-                    } else {
-                        Ordering::Greater
-                    }
-                }
-                (Some(_), None) => {
-                    if options.nulls_first {
-                        Ordering::Greater
-                    } else {
-                        Ordering::Less
-                    }
-                }
-                (Some(a), Some(b)) => {
-                    if options.descending {
-                        b.cmp(&a)
-                    } else {
-                        a.cmp(&b)
-                    }
-                }
+                (Some(a), Some(b)) if options.descending => b.cmp(&a),
+                (Some(a), Some(b)) => a.cmp(&b),
+                (a, b) if options.nulls_first => a.is_some().cmp(&b.is_some()),
+                (a, b) => b.is_some().cmp(&a.is_some()),
             };
             if order != Ordering::Equal {
                 return Ok(order);
@@ -348,28 +326,31 @@ impl BoundedMergeStream {
         if self.picked.is_empty() {
             return Ok(None);
         }
-        let pool: Vec<&RecordBatch> = self.pool.iter().collect();
-        let batch = interleave_record_batch(&pool, &self.picked)?;
+        let batch = interleave_record_batch(&self.pool.iter().collect::<Vec<_>>(), &self.picked)?;
         self.picked.clear();
-        let mut kept = Vec::new();
-        for input in &mut self.inputs {
-            if let Input::Open { head: Some(head), .. } = input {
-                kept.push(self.pool[head.slot].clone());
-                head.slot = kept.len() - 1;
-            }
-        }
-        self.pool = kept;
+        let pool = std::mem::take(&mut self.pool);
+        self.pool = self
+            .inputs
+            .iter_mut()
+            .filter_map(|input| match input {
+                Input::Open { head: Some(head), .. } => Some(head),
+                _ => None,
+            })
+            .enumerate()
+            .map(|(slot, head)| pool[std::mem::replace(&mut head.slot, slot)].clone())
+            .collect();
         Ok(Some(batch))
     }
 
-    fn poll_inner(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<RecordBatch>>> {
+    fn step(&mut self, cx: &mut Context<'_>) -> Result<Poll<Option<RecordBatch>>> {
         loop {
             if self.remaining == Some(0) {
-                return Poll::Ready(self.flush().transpose());
+                return Ok(Poll::Ready(self.flush()?));
             }
             // Every open input needs a head before any row can be ordered.
             let mut pending = false;
             self.pending_head_slots = self.pending_head_slots.saturating_add(self.needs_head.len());
+            // Indexed: the body needs `&mut self`.
             for index in 0..self.needs_head.len() {
                 let p = self.needs_head[index];
                 while let Input::Open { stream, head: None } = &mut self.inputs[p] {
@@ -379,30 +360,21 @@ impl BoundedMergeStream {
                             break;
                         }
                         Poll::Ready(None) => self.inputs[p] = Input::Done,
-                        Poll::Ready(Some(Err(error))) => return Poll::Ready(Some(Err(error))),
+                        Poll::Ready(Some(Err(error))) => return Err(error),
                         Poll::Ready(Some(Ok(batch))) if batch.num_rows() == 0 => {}
                         Poll::Ready(Some(Ok(batch))) => {
-                            let new_head = match self.head(batch) {
-                                Ok(head) => head,
-                                Err(error) => return Poll::Ready(Some(Err(error))),
-                            };
+                            let new_head = self.head(batch)?;
                             if let Input::Open { head, .. } = &mut self.inputs[p] {
                                 *head = Some(new_head);
                             }
-                            if let Err(error) = self.update_winner(p) {
-                                return Poll::Ready(Some(Err(error)));
-                            }
+                            self.update_winner(p)?;
                         }
                     }
                 }
             }
             self.needs_head.retain(|&p| matches!(self.inputs[p], Input::Open { head: None, .. }));
             if pending {
-                return match self.flush() {
-                    Ok(Some(batch)) => Poll::Ready(Some(Ok(batch))),
-                    Ok(None) => Poll::Pending,
-                    Err(error) => Poll::Ready(Some(Err(error))),
-                };
+                return Ok(self.flush()?.map_or(Poll::Pending, |batch| Poll::Ready(Some(batch))));
             }
             let best = self.winners[1].map(|p| {
                 let Input::Open { head: Some(head), .. } = &self.inputs[p] else { unreachable!("selected input has a head") };
@@ -410,44 +382,30 @@ impl BoundedMergeStream {
             });
             let Some((p, lead)) = best else {
                 // Every open input ran dry: widen the window so a needle keeps its fan-out.
-                let mut opened = false;
-                for _ in 0..self.read_ahead {
-                    opened |= match self.open_next() {
-                        Ok(opened) => opened,
-                        Err(error) => return Poll::Ready(Some(Err(error))),
-                    };
-                }
+                let opened = self.open(self.read_ahead)?;
                 self.read_ahead = self.read_ahead.saturating_mul(2);
                 if opened {
                     continue;
                 }
-                return Poll::Ready(self.flush().transpose());
+                return Ok(Poll::Ready(self.flush()?));
             };
             // A closed input whose bound the next row does not strictly precede may hold
             // that row or one before it: open it, and with it the read-ahead window.
             if self.closed.last().is_some_and(|&next| self.bounds[next].is_none_or(|bound| !self.precedes(lead, bound))) {
-                for _ in 0..self.read_ahead {
-                    if let Err(error) = self.open_next() {
-                        return Poll::Ready(Some(Err(error)));
-                    }
-                }
+                self.open(self.read_ahead)?;
                 continue;
             }
-            let Input::Open { head: Some(head), .. } = &mut self.inputs[p] else { unreachable!("best is an open input with a head") };
+            let Input::Open { head: slot, .. } = &mut self.inputs[p] else { unreachable!("best is an open input") };
+            let Some(head) = slot.as_mut() else { unreachable!("best has a head") };
             self.picked.push((head.slot, head.cursor));
             head.cursor += 1;
-            if head.cursor == head.lead.len()
-                && let Input::Open { head, .. } = &mut self.inputs[p]
-            {
-                *head = None;
+            if slot.take_if(|head| head.cursor == head.lead.len()).is_some() {
                 self.needs_head.push(p);
             }
-            if let Err(error) = self.update_winner(p) {
-                return Poll::Ready(Some(Err(error)));
-            }
+            self.update_winner(p)?;
             self.remaining = self.remaining.map(|n| n - 1);
             if self.picked.len() >= self.batch_size {
-                return Poll::Ready(self.flush().transpose());
+                return Ok(Poll::Ready(self.flush()?));
             }
         }
     }
@@ -457,7 +415,7 @@ impl Stream for BoundedMergeStream {
     type Item = Result<RecordBatch>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let poll = self.poll_inner(cx);
+        let poll = self.step(cx).map_or_else(|error| Poll::Ready(Some(Err(error))), |poll| poll.map(|batch| batch.map(Ok)));
         let checked = std::mem::take(&mut self.pending_head_slots);
         self.head_slots_checked.add(checked);
         let comparisons = std::mem::take(&mut self.pending_key_comparisons);
@@ -497,18 +455,10 @@ pub(crate) fn partition_bounds(plan: &Arc<dyn ExecutionPlan>, column: &str, desc
             if nullable && stats.null_count.get_value() != Some(&0) {
                 return None;
             }
-            let value = if descending { &stats.max_value } else { &stats.min_value };
-            let micros = match value {
-                Precision::Exact(v) | Precision::Inexact(v) => scalar_micros(v)?,
-                Precision::Absent => return None,
-            };
+            let micros = (if descending { &stats.max_value } else { &stats.min_value }).get_value().and_then(scalar_micros)?;
             Some(if descending { micros.saturating_add(STATS_SLACK_MICROS) } else { micros.saturating_sub(STATS_SLACK_MICROS) })
         };
-        let groups: Vec<Option<i64>> = config
-            .file_groups
-            .iter()
-            .map(|group| group.files().iter().map(file_bound).collect::<Option<Vec<_>>>().and_then(|bounds| fold_bound(bounds.into_iter(), descending)))
-            .collect();
+        let groups: Vec<Option<i64>> = config.file_groups.iter().map(|group| fold_bound(group.files().iter().map(file_bound), descending)).collect();
         return if groups.len() == partitions { groups } else { unknown() };
     }
     if downcast::<UnionExec>(plan.as_ref()).is_some() {
@@ -539,13 +489,15 @@ pub(crate) fn partition_bounds(plan: &Arc<dyn ExecutionPlan>, column: &str, desc
         }
         // Merges into one partition: the extreme of the inputs' bounds.
         "SortPreservingMergeExec" | "BoundedMergeExec" | "DedupExec" | "CoalescePartitionsExec" if partitions == 1 => {
-            vec![child_bounds.into_iter().collect::<Option<Vec<_>>>().and_then(|bounds| fold_bound(bounds.into_iter(), descending))]
+            vec![fold_bound(child_bounds, descending)]
         }
         _ => unknown(),
     }
 }
 
-fn fold_bound(bounds: impl Iterator<Item = i64>, descending: bool) -> Option<i64> {
+/// The extreme of `bounds` in output order; `None` if any is unknown or there are none.
+fn fold_bound(bounds: impl IntoIterator<Item = Option<i64>>, descending: bool) -> Option<i64> {
+    let bounds = bounds.into_iter().collect::<Option<Vec<_>>>()?.into_iter();
     if descending { bounds.max() } else { bounds.min() }
 }
 
@@ -644,9 +596,8 @@ fn bound_merge_below(node: &Arc<dyn ExecutionPlan>, fetch: usize) -> Result<Opti
 mod tests {
     use datafusion::{
         arrow::{
-            array::{AsArray, Int64Array},
             compute::SortOptions,
-            datatypes::{Field, Int64Type, Schema},
+            datatypes::{Field, Schema},
         },
         datasource::memory::MemorySourceConfig,
         physical_expr::PhysicalSortExpr,
@@ -846,7 +797,7 @@ pub(crate) async fn narrow_ascending_fetch(
     planner: &datafusion::physical_planner::DefaultPhysicalPlanner,
 ) -> Result<Arc<dyn ExecutionPlan>> {
     use datafusion::physical_planner::PhysicalPlanner;
-    let Some((page, column, scan)) = latest_page(logical, true) else { return Ok(full) };
+    let Some((rows, column, scan)) = latest_page(logical, true) else { return Ok(full) };
     if full.properties().partitioning.partition_count() != 1 {
         return Ok(full);
     }
@@ -857,9 +808,9 @@ pub(crate) async fn narrow_ascending_fetch(
     let Some(mut files) = table.file_spans(&scan.filters, &column.name).await.filter(|f| !f.is_empty()) else { return Ok(full) };
     files.sort_by_key(|&(_, max, _)| max);
     let mut held = 0usize;
-    let Some(&(_, max, _)) = files.iter().find(|&&(_, _, rows)| {
-        held = held.saturating_add(rows);
-        held >= page.rows.saturating_mul(NARROW_ROW_MARGIN)
+    let Some(&(_, max, _)) = files.iter().find(|&&(_, _, file_rows)| {
+        held = held.saturating_add(file_rows);
+        held >= rows.saturating_mul(NARROW_ROW_MARGIN)
     }) else {
         return Ok(full);
     };
@@ -874,14 +825,7 @@ pub(crate) async fn narrow_ascending_fetch(
         return Ok(full);
     }
     metrics::counter!("timefusion_narrowed_fetch_planned_total").increment(1);
-    Ok(Arc::new(NarrowedFetchExec {
-        narrow,
-        full: Fallback::Planned(full),
-        rows: page.rows,
-        total_files: files.len(),
-        skipped,
-        metrics: ExecutionPlanMetricsSet::new(),
-    }))
+    Ok(Arc::new(NarrowedFetchExec { narrow, full: Fallback::Planned(full), rows, total_files: files.len(), skipped, metrics: ExecutionPlanMetricsSet::new() }))
 }
 
 /// Newest-first latest-N (`ORDER BY ts DESC LIMIT n`) under an indexed predicate reads every
@@ -897,14 +841,14 @@ pub(crate) async fn narrow_descending_fetch(
     planner: &datafusion::physical_planner::DefaultPhysicalPlanner,
 ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
     use datafusion::physical_planner::PhysicalPlanner;
-    let Some((page, column, scan)) = latest_page(logical, false) else { return Ok(None) };
+    let Some((rows, column, scan)) = latest_page(logical, false) else { return Ok(None) };
     if column.name != "timestamp" {
         return Ok(None);
     }
     let Some(table) = datafusion::datasource::source_as_provider(&scan.source).ok() else { return Ok(None) };
     let Some(table) = downcast::<crate::database::ProjectRoutingTable>(&*table) else { return Ok(None) };
     let Some((lo, _)) = crate::database::filters_time_range(&scan.filters) else { return Ok(None) };
-    let Some(bound) = table.newest_match_bound(&scan.filters, page.rows.saturating_mul(NARROW_ROW_MARGIN)).await.filter(|bound| *bound > lo) else {
+    let Some(bound) = table.newest_match_bound(&scan.filters, rows.saturating_mul(NARROW_ROW_MARGIN)).await.filter(|bound| *bound > lo) else {
         return Ok(None);
     };
     let narrowed = state.optimize(&with_bound(logical, &column, bound, false)?)?;
@@ -914,21 +858,17 @@ pub(crate) async fn narrow_descending_fetch(
     }
     metrics::counter!("timefusion_narrowed_desc_fetch_planned_total").increment(1);
     let full = Fallback::Deferred(Box::new((logical.clone(), state.clone())));
-    Ok(Some(Arc::new(NarrowedFetchExec { narrow, full, rows: page.rows, total_files: 0, skipped: 0, metrics: ExecutionPlanMetricsSet::new() })))
-}
-
-struct AscendingPage {
-    /// Rows the whole query returns when the window holds enough of them.
-    rows: usize,
+    Ok(Some(Arc::new(NarrowedFetchExec { narrow, full, rows, total_files: 0, skipped: 0, metrics: ExecutionPlanMetricsSet::new() })))
 }
 
 /// `[Projection|Limit|SubqueryAlias]* -> Sort(ts ASC|DESC, fetch) -> [Projection|Filter|SubqueryAlias]* -> TableScan`.
 /// Anything that could pick or drop rows by something other than the sort key (aggregates,
 /// DISTINCT ON, windows, joins, inner limits) disqualifies the plan: a bound on `ts`
-/// below it could change which rows it keeps.
+/// below it could change which rows it keeps. Yields the rows the whole query returns when
+/// the window holds enough of them.
 fn latest_page(
     plan: &datafusion::logical_expr::LogicalPlan, ascending: bool,
-) -> Option<(AscendingPage, datafusion::common::Column, &datafusion::logical_expr::TableScan)> {
+) -> Option<(usize, datafusion::common::Column, &datafusion::logical_expr::TableScan)> {
     use datafusion::logical_expr::{Expr, LogicalPlan};
     let (mut node, mut skip, mut limit) = (plan, 0usize, None::<usize>);
     let sort = loop {
@@ -967,7 +907,7 @@ fn latest_page(
         }
     };
     let rows = fetch.saturating_sub(skip).min(limit.unwrap_or(usize::MAX));
-    (rows > 0).then(|| (AscendingPage { rows }, column.clone(), scan))
+    (rows > 0).then(|| (rows, column.clone(), scan))
 }
 
 /// `plan` with `column <= bound` (`upper`) or `column >= bound` above its table scan, typed
@@ -1036,9 +976,7 @@ impl ExecutionPlan for NarrowedFetchExec {
     fn properties(&self) -> &Arc<PlanProperties> {
         self.narrow.properties()
     }
-    fn apply_expressions(&self, _: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>) -> Result<TreeNodeRecursion> {
-        Ok(TreeNodeRecursion::Continue)
-    }
+    no_physical_exprs!();
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         match &self.full {
             Fallback::Planned(full) => vec![&self.narrow, full],
@@ -1049,15 +987,15 @@ impl ExecutionPlan for NarrowedFetchExec {
         let (narrow, full) = match (children.as_slice(), &self.full) {
             ([narrow, full], Fallback::Planned(_)) => (Arc::clone(narrow), Fallback::Planned(Arc::clone(full))),
             ([narrow], deferred @ Fallback::Deferred(_)) => (Arc::clone(narrow), deferred.clone()),
-            _ => return Err(datafusion::error::DataFusionError::Internal("NarrowedFetchExec children do not match its fallback".into())),
+            _ => return internal_err!("NarrowedFetchExec children do not match its fallback"),
         };
-        Ok(Arc::new(Self { narrow, full, rows: self.rows, total_files: self.total_files, skipped: self.skipped, metrics: ExecutionPlanMetricsSet::new() }))
+        Ok(Arc::new(Self { narrow, full, metrics: ExecutionPlanMetricsSet::new(), ..*self }))
     }
     fn metrics(&self) -> Option<MetricsSet> {
         Some(self.metrics.clone_inner())
     }
     fn execute(&self, partition: usize, context: Arc<TaskContext>) -> Result<SendableRecordBatchStream> {
-        use futures::{StreamExt, TryStreamExt};
+        use futures::TryStreamExt;
         let (narrow, full, rows, schema) = (Arc::clone(&self.narrow), self.full.clone(), self.rows, self.narrow.schema());
         let fell_back = MetricBuilder::new(&self.metrics).counter("fell_back", partition);
         MetricBuilder::new(&self.metrics).counter("files_skipped", partition).add(self.skipped);
@@ -1069,7 +1007,7 @@ impl ExecutionPlan for NarrowedFetchExec {
             fell_back.add(1);
             let full = full.plan().await?;
             if full.schema() != narrow.schema() {
-                return Err(datafusion::error::DataFusionError::Internal("narrowed and full plans disagree on schema".into()));
+                return internal_err!("narrowed and full plans disagree on schema");
             }
             Ok(full.execute(partition, context)?.boxed())
         })

@@ -32,7 +32,7 @@ impl Database {
         let current = Self::filesets_for_dates(&all_uris, &window_dates);
 
         // Keep pre-state outside OCC retries; only a successful commit changes it.
-        let track_files = self.config.maintenance.timefusion_warm_after_compaction || self.config.maintenance.timefusion_evict_after_compaction;
+        let track_files = self.config.maintenance.tracks_compacted_files();
         let pre_uris: Option<HashSet<String>> = track_files.then(|| all_uris.into_iter().collect());
 
         // Keep the active partition at the light-compaction target. A single
@@ -104,7 +104,7 @@ impl Database {
                         .optimize()
                         .with_filters(&partition_filters)
                         .with_type(optimize_type.clone())
-                        .with_target_size(std::num::NonZero::new(target_size as u64).unwrap_or(std::num::NonZero::<u64>::MIN))
+                        .with_target_size(nonzero_target(target_size))
                         .with_max_files_per_bin(self.config.derived.optimize_max_files_per_bin())
                         .with_max_concurrent_tasks(optimize_concurrency)
                         .with_writer_properties(writer_properties.clone())
@@ -276,15 +276,13 @@ impl Database {
     /// alone conflicts with every project's append to the active day.
     pub(crate) fn hot_project_ids(uris: &[String], date: chrono::NaiveDate) -> Vec<String> {
         let date_marker = format!("/date={date}/");
-        let counts = uris
-            .iter()
+        // Most-fragmented partition first: it's the one whose recent-window
+        // queries open the most files, so it benefits most from an early tick.
+        uris.iter()
             .filter(|uri| uri.contains(&date_marker))
             .filter_map(|uri| path_partition_value(uri, "project_id"))
             .filter(|project_id| !project_id.is_empty())
-            .counts();
-        // Most-fragmented partition first: it's the one whose recent-window
-        // queries open the most files, so it benefits most from an early tick.
-        counts
+            .counts()
             .into_iter()
             .sorted_by(|(a, a_count), (b, b_count)| b_count.cmp(a_count).then_with(|| a.cmp(b)))
             .map(|(project_id, _)| project_id.to_owned())
@@ -345,9 +343,8 @@ impl Database {
             // Tag-first: every exclusion below is pure metadata, so an excluded
             // file never reaches the stats parse.
             .filter_map(|file| {
-                let (size, sorted_run) = (file.size(), is_sorted_run(&file.tags()));
-                hot_bin_admits(&file.path(), &date_marker, &repair_markers, size, sorted_run, repairable, policy).then_some(())?;
-                let path = file.path();
+                let (path, size, sorted_run) = (file.path(), file.size(), is_sorted_run(&file.tags()));
+                hot_bin_admits(&path, &date_marker, &repair_markers, size, sorted_run, repairable, policy).then_some(())?;
                 let project_id = path_partition_value(&path, "project_id").filter(|p| !p.is_empty()).map(str::to_owned)?;
                 Some((
                     project_id,
@@ -355,21 +352,18 @@ impl Database {
                 ))
             })
             .into_group_map();
-        let planned = per_project
+        // Packing goes MOST-fragmented first (that partition opens the most files
+        // per query). Repair inverts it to SHORTEST-JOB-FIRST: a repair backlog is
+        // finite per project, so the goal is to finish projects. A project with
+        // hundreds of candidates cannot be finished in any tick and would hold the
+        // narrow repair slots for the whole pass while everyone waits at the barrier.
+        Ok(per_project
             .into_iter()
             .map(|(project_id, adds)| {
                 let debt = adds.len();
                 (project_id, select_tail_bin(&adds, policy.target_size, policy.min_files, policy.sorted_run_cap, seal, policy.pass), debt)
             })
             .filter(|(_, bin, _)| !bin.is_empty())
-            .collect_vec();
-        // Packing goes MOST-fragmented first (that partition opens the most files
-        // per query). Repair inverts it to SHORTEST-JOB-FIRST: a repair backlog is
-        // finite per project, so the goal is to finish projects. A project with
-        // hundreds of candidates cannot be finished in any tick and would hold the
-        // narrow repair slots for the whole pass while everyone waits at the barrier.
-        Ok(planned
-            .into_iter()
             .sorted_by(|a, b| {
                 match policy.pass {
                     TailPass::Pack => b.2.cmp(&a.2),
@@ -435,12 +429,10 @@ impl Database {
         let target_size = self.optimize_target_for_date(date);
         let schema = schema_or_default(table_name);
         let date_str = date.to_string();
-        let mut partition_filters = vec![eq_filter("date", &date_str)];
         // Scope to one tenant when asked: a whole date spans every project's files
         // and may not fit in-process; one (project, date) partition does.
-        if let Some(pid) = project_id {
-            partition_filters.push(eq_filter("project_id", pid));
-        }
+        let partition_filters: Vec<FilterLiteral> =
+            std::iter::once(eq_filter("date", &date_str)).chain(project_id.map(|pid| eq_filter("project_id", pid))).collect();
         // Retry OCC/transient S3 errors; reset the no-progress budget only when
         // committed bins reduce the scoped file count.
         const MAX_ATTEMPTS: usize = 4;
@@ -448,7 +440,7 @@ impl Database {
         // Pre-state file set for the warm/evict diff, scoped to the partition being
         // compacted: `optimize().with_filters()` can only add/remove files under
         // these markers. `None` when neither warm- nor evict-after-compaction is on.
-        let track_files = self.config.maintenance.timefusion_warm_after_compaction || self.config.maintenance.timefusion_evict_after_compaction;
+        let track_files = self.config.maintenance.tracks_compacted_files();
         let scope: Vec<String> = std::iter::once(format!("date={date}/")).chain(project_id.map(|pid| format!("project_id={pid}/"))).collect();
         let scope: Vec<&str> = scope.iter().map(String::as_str).collect();
         let scoped = scoped_file_uris(&*table_ref.read().await, &scope);
@@ -480,7 +472,7 @@ impl Database {
                 .optimize()
                 .with_filters(&partition_filters)
                 .with_type(optimize_type)
-                .with_target_size(std::num::NonZero::new(target_size as u64).unwrap_or(std::num::NonZero::<u64>::MIN))
+                .with_target_size(nonzero_target(target_size))
                 .with_max_files_per_bin(self.config.derived.optimize_max_files_per_bin())
                 .with_max_concurrent_tasks(sort_concurrency)
                 .with_writer_properties(writer_properties)
@@ -541,14 +533,15 @@ impl Database {
     /// ascending. Drives the CLI/pgwire "compact old partitions" loop.
     pub async fn partition_dates(&self, table_ref: &Arc<RwLock<DeltaTable>>) -> Result<Vec<chrono::NaiveDate>> {
         let uris: Vec<String> = { file_uris(&*table_ref.read().await) };
-        let dates: BTreeSet<chrono::NaiveDate> = uris
+        Ok(uris
             .iter()
             .filter_map(|uri| {
                 let tail = &uri[uri.find("date=")? + 5..];
-                tail.get(..10).unwrap_or(tail).parse().ok()
+                tail.get(..10).unwrap_or(tail).parse::<chrono::NaiveDate>().ok()
             })
-            .collect();
-        Ok(dates.into_iter().collect())
+            .sorted_unstable()
+            .dedup()
+            .collect())
     }
 
     /// Projects present in `date`'s live file set, most-fragmented first.
@@ -585,10 +578,8 @@ impl Database {
         &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, date: chrono::NaiveDate, target_level: i32, project: Option<&str>,
     ) -> Result<RecompressOutcome> {
         let date_str = date.to_string();
-        if project.is_some() {
-            // Scoped `replace_where` can deadlock; reject it before reading the table.
-            anyhow::bail!("recompress --project is disabled: scoped replace_where deadlocks; re-run without --project");
-        }
+        // Scoped `replace_where` can deadlock; reject it before reading the table.
+        anyhow::ensure!(project.is_none(), "recompress --project is disabled: scoped replace_where deadlocks; re-run without --project");
         let date_marker = format!("date={date_str}");
 
         let (uris, log_store, table_uri) = {
@@ -827,11 +818,11 @@ impl Database {
         if rewritten > 0 {
             self.carry_dedup_witness(table_name, project_id, &date.to_string(), rewritten);
         }
-        for bin in &result.landed {
-            if let Some(d) = &bin.dedup {
-                info!("dedup rewrite: table={} chunk=[{}] dropped={} (before={} after={})", table_name, d.label, d.dropped(), d.before, d.after);
-            }
-        }
+        result
+            .landed
+            .iter()
+            .filter_map(|bin| bin.dedup.as_ref())
+            .for_each(|d| info!("dedup rewrite: table={} chunk=[{}] dropped={} (before={} after={})", table_name, d.label, d.dropped(), d.before, d.after));
         // LANDED bins only (incl. self-landed carries): a failed bin's DV was
         // never committed and must not enter the guard's expected set.
         let masked = (!result.landed.is_empty() && result.landed.iter().all(StagedBin::masked_in_place)).then(|| {
@@ -1094,11 +1085,7 @@ impl Database {
                 .ok_or_else(|| anyhow::anyhow!("invalid dedup slice start {}", slice.start_micros))?;
             let end =
                 chrono::DateTime::from_timestamp_micros(slice.end_micros).ok_or_else(|| anyhow::anyhow!("invalid dedup slice end {}", slice.end_micros))?;
-            format!(
-                "{partition_filter} AND \"timestamp\" >= TIMESTAMP '{}' AND \"timestamp\" < TIMESTAMP '{}'",
-                start.format("%Y-%m-%d %H:%M:%S"),
-                end.format("%Y-%m-%d %H:%M:%S")
-            )
+            ts_range_filter(&partition_filter, start.format("%Y-%m-%d %H:%M:%S"), end.format("%Y-%m-%d %H:%M:%S"))
         } else {
             partition_filter.clone()
         };
@@ -1113,7 +1100,6 @@ impl Database {
             // Ten-minute sealed bins bound materialization and avoid racing late
             // flushes; newer duplicates are retried later.
             let sealed_before = crate::support::now_utc().naive_utc() - chrono::Duration::hours(2);
-            let mut skipped_unsealed = false;
             // Shard the probe by TIME, never by a key hash. `hash_bucket(...)` has no
             // parquet statistics, so EVERY hash shard re-read the whole partition to
             // answer one question — prod 2026-09-20 logged `row_groups_pruned=0` with
@@ -1130,44 +1116,38 @@ impl Database {
                 Some(slice) => (naive(slice.start_micros), naive(slice.end_micros)),
                 None => (date.and_hms_opt(0, 0, 0), date.succ_opt().and_then(|next| next.and_hms_opt(0, 0, 0))),
             };
-            let mut duplicate_starts = Vec::new();
             // Unreadable bounds mean one unsharded pass, which is correct but slow —
             // never a silent skip, which would leave duplicates physically present.
             let span = probe_lo.zip(probe_hi).and_then(|(lo, hi)| (hi - lo).num_microseconds()).filter(|span| *span > 0);
+            let mut duplicate_starts = Vec::new();
             match probe_lo.zip(span) {
                 Some((lo, span)) => {
                     for (from, to) in probe_time_shards(lo, span, probe_shards) {
-                        let shard_filter = format!(
-                            "{filter} AND \"timestamp\" >= TIMESTAMP '{}' AND \"timestamp\" < TIMESTAMP '{}'",
-                            from.format("%Y-%m-%d %H:%M:%S%.6f"),
-                            to.format("%Y-%m-%d %H:%M:%S%.6f")
-                        );
+                        let shard_filter = ts_range_filter(&filter, from.format("%Y-%m-%d %H:%M:%S%.6f"), to.format("%Y-%m-%d %H:%M:%S%.6f"));
                         duplicate_starts.extend(Self::dup_bin_starts(&ctx, &shard_filter, &keys_csv).await?);
                     }
                 }
                 None => duplicate_starts.extend(Self::dup_bin_starts(&ctx, &filter, &keys_csv).await?),
             }
-            let built: Vec<_> = duplicate_starts
+            let (sealed, unsealed): (Vec<_>, Vec<_>) = duplicate_starts
                 .into_iter()
                 .sorted_unstable()
                 .dedup()
-                .filter_map(|start| {
-                    let end = start + chrono::Duration::minutes(10);
-                    if slice.is_none() && end > sealed_before {
-                        debug!("dedup: skipping unsealed chunk starting {start} (cleared on a later sweep)");
-                        skipped_unsealed = true;
-                        return None;
-                    }
-                    let (s, e) = (start.format("%Y-%m-%d %H:%M:%S"), end.format("%Y-%m-%d %H:%M:%S"));
-                    Some((
-                        format!("{filter} AND \"timestamp\" >= TIMESTAMP '{s}' AND \"timestamp\" < TIMESTAMP '{e}'"),
+                .partition(|start| slice.is_some() || *start + chrono::Duration::minutes(10) <= sealed_before);
+            unsealed.iter().for_each(|start| debug!("dedup: skipping unsealed chunk starting {start} (cleared on a later sweep)"));
+            let built: Vec<_> = sealed
+                .into_iter()
+                .map(|start| {
+                    let (s, e) = (start.format("%Y-%m-%d %H:%M:%S"), (start + chrono::Duration::minutes(10)).format("%Y-%m-%d %H:%M:%S"));
+                    (
+                        ts_range_filter(&filter, &s, &e),
                         // Log label only: the rewrite commits targeted Remove+Add
                         // actions, so no predicate is ever kernel-evaluated.
                         format!("project_id = '{safe_pid}' AND date = '{date_str}' AND timestamp in ['{s}', '{e}')"),
-                    ))
+                    )
                 })
                 .collect();
-            (built, skipped_unsealed)
+            (built, !unsealed.is_empty())
         } else {
             // No timestamp dedup key → can't chunk safely; whole-partition
             // rewrite, gated on the same any-dupes probe.
@@ -1193,21 +1173,18 @@ impl Database {
             .buffer_unordered(permits)
             .collect()
             .await;
-        let mut units = Vec::new();
-        let mut all_complete = !skipped_any;
-        let mut first_err = None;
-        for outcome in staged {
-            match outcome {
-                Ok(BinOutcome::Staged(unit)) => units.push(unit),
-                // Nothing was verified, so the partition stays uncertified.
-                Ok(BinOutcome::Retry | BinOutcome::BudgetBusy) => all_complete = false,
-                // Probe false-positive: verified duplicate-free, nothing to commit.
-                Ok(BinOutcome::Converged) => {}
-                Err(e) => {
-                    first_err.get_or_insert(e);
+        let (units, all_complete, first_err) =
+            staged.into_iter().fold((Vec::new(), !skipped_any, None), |(mut units, complete, first_err), outcome| match outcome {
+                Ok(BinOutcome::Staged(unit)) => {
+                    units.push(unit);
+                    (units, complete, first_err)
                 }
-            }
-        }
+                // Nothing was verified, so the partition stays uncertified.
+                Ok(BinOutcome::Retry | BinOutcome::BudgetBusy) => (units, false, first_err),
+                // Probe false-positive: verified duplicate-free, nothing to commit.
+                Ok(BinOutcome::Converged) => (units, complete, first_err),
+                Err(e) => (units, complete, first_err.or(Some(e))),
+            });
         if let Some(e) = first_err {
             // One chunk's failure abandons the whole staging batch: delete the
             // siblings' parquet, whose Adds are in no commit and which VACUUM
@@ -1340,7 +1317,7 @@ impl Database {
             // told the same fact that decided the footer, not a re-derivation.
             let sorted = !schema_order_by_clause(schema).is_empty();
             // `keys_varchar` doubles as the GROUP BY for the skew probe below.
-            let keys_varchar = schema.dedup_keys.iter().map(|k| format!("CAST(\"{k}\" AS VARCHAR)")).join(", ");
+            let keys_varchar = keys_varchar(schema);
             let bucket_expr = dedup_bucket_expr(schema);
             // Independent narrow oracle for the staged output count: exactly one
             // row per distinct key. A disagreement rejects the unit before Remove
@@ -1742,7 +1719,7 @@ impl Database {
                     let batches = crate::database::maintain::collect_watched(&ctx, &sql).await?;
                     let all_pairs = pairs_of(&batches)?;
                     scanned_total += all_pairs.len() as u64;
-                    let survivors = crate::write::mem_buffer::dedup_batches(batches.clone(), &schema.dedup_keys, tiebreak, None)?;
+                    let survivors = crate::write::mem_buffer::dedup_batches(batches, &schema.dedup_keys, tiebreak, None)?;
                     let survivor_set: HashSet<(String, u64)> = pairs_of(&survivors)?.into_iter().collect();
                     survivors_total += survivor_set.len() as u64;
                     all_pairs.into_iter().filter(|pair| !survivor_set.contains(pair)).for_each(|(file, idx)| losers_by_file.entry(file).or_default().push(idx));
@@ -1930,8 +1907,17 @@ pub(super) fn quoted_csv(names: &[String]) -> String {
 /// `[0, DEDUP_BUCKET_COUNT)`; chr(31) separates keys so distinct tuples can't
 /// collide, and hashing (not `key % K`) spreads evenly and is NULL-safe.
 fn dedup_bucket_expr(schema: &crate::schema::TableSchema) -> String {
-    let keys_varchar = schema.dedup_keys.iter().map(|k| format!("CAST(\"{k}\" AS VARCHAR)")).join(", ");
-    format!("hash_bucket(arrow_cast(concat_ws(chr(31), {keys_varchar}), 'Utf8View'), {DEDUP_BUCKET_COUNT})")
+    format!("hash_bucket(arrow_cast(concat_ws(chr(31), {}), 'Utf8View'), {DEDUP_BUCKET_COUNT})", keys_varchar(schema))
+}
+
+/// The dedup keys, each cast to VARCHAR, comma-separated.
+fn keys_varchar(schema: &crate::schema::TableSchema) -> String {
+    schema.dedup_keys.iter().map(|k| format!("CAST(\"{k}\" AS VARCHAR)")).join(", ")
+}
+
+/// `base` narrowed to the half-open `timestamp` range `[from, to)`.
+fn ts_range_filter(base: &str, from: impl std::fmt::Display, to: impl std::fmt::Display) -> String {
+    format!("{base} AND \"timestamp\" >= TIMESTAMP '{from}' AND \"timestamp\" < TIMESTAMP '{to}'")
 }
 
 /// Ceiling on probe passes, so a pathological window cannot mint unbounded

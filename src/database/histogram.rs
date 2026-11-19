@@ -10,6 +10,7 @@ use datafusion::execution::TaskContext;
 /// rather than replaces that bound; 8 keeps outstanding GETs in the low hundreds.
 const HISTOGRAM_PARTITION_CONCURRENCY: usize = 8;
 
+use crate::maintenance_coordinator::DAY_MICROS;
 use crate::tantivy::{
     histogram::{HistogramWindow, Membership},
     search::{HistogramFile, HistogramSnapshot, HistogramSnapshotResult, TantivySearchService},
@@ -265,8 +266,6 @@ pub struct CapturedHistogram {
     max_decoded_bytes: usize,
     context: Arc<TaskContext>,
 }
-
-const DAY_MICROS: i64 = 86_400_000_000;
 
 /// Admission and recent-attempt history for query-triggered maintenance.
 /// A failed large day must give other requested days a chance to build.

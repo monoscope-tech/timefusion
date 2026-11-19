@@ -1318,7 +1318,7 @@ mod rollup_window_memory_tests {
         let input = crate::rollup::slice_input_sql(source, crate::rollup::SliceInput::Deduplicate(dedup), "raw", &project, range, "", Some(&present));
         let frame = ctx.sql(&input).await?;
         ctx.register_table("input", Arc::new(datafusion::datasource::ViewTable::new(frame.logical_plan().clone(), Some(input))))?;
-        let cohort = crate::rollup::build_cohort_sql_range_mode(spec, SOURCE, "input", std::slice::from_ref(&project), &day.to_string(), range, false)?;
+        let cohort = crate::rollup::build_cohort_sql_range_mode(spec, "input", std::slice::from_ref(&project), &day.to_string(), range, false)?;
         let plan = ctx.sql(&cohort).await?.create_physical_plan().await?;
         let mut sorted = Vec::new();
         plan.apply(|node| {

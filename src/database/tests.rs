@@ -120,7 +120,7 @@ fn generation_checks_render_each_spec_once_and_match_the_persisted_ids() {
                 content_fp: None,
                 output: RollupOutputEvidence::Unknown,
             };
-            let persisted = crate::rollup::generation_id(spec, source, project, date, 7, held.as_deref());
+            let persisted = crate::rollup::generation_id(spec, source, project, date, held.as_deref());
             assert!(Database::rollup_generation_current(source, &target, project, date, &coverage(persisted)), "{target} {project} {date}");
             assert!(!Database::rollup_generation_current(source, &target, project, date, &coverage("0000000000000000".into())));
         }
@@ -1710,7 +1710,7 @@ async fn strip_rollup_measure(db: &Database, project: &str, day: chrono::NaiveDa
             assert!(held.split(',').any(|name| name == measure));
             let names: Vec<String> = held.split(',').filter(|name| *name != measure).map(str::to_owned).collect();
             tags.insert(TAG_MEASURES.to_owned(), Some(names.join(",")));
-            tags.insert(TAG_GENERATION.to_owned(), Some(crate::rollup::generation_id(spec, source, project, &day.to_string(), 0, Some(&names))));
+            tags.insert(TAG_GENERATION.to_owned(), Some(crate::rollup::generation_id(spec, source, project, &day.to_string(), Some(&names))));
             actions.push(Action::Remove(remove_for_add(&add, false)));
             // A distinct path: a Remove/Add pair for one path can be replayed as a removal.
             let path = format!("{}-fixture.parquet", add.path.trim_end_matches(".parquet"));
@@ -5181,7 +5181,7 @@ async fn a_date_with_only_slice_coverage_still_counts_as_missing() -> Result<()>
     let day_start = chrono::NaiveDate::parse_from_str(day, "%Y-%m-%d").unwrap().and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_micros();
     let cell = (project.clone(), day.parse()?);
     let spec = get_schema(&source).unwrap().rollups.iter().find(|spec| spec.table_name(&source) == target).unwrap();
-    let generation = crate::rollup::generation_id(spec, &source, &project, day, 1, None);
+    let generation = crate::rollup::generation_id(spec, &source, &project, day, None);
     let partitions =
         HashMap::from([((project.clone(), day.to_string()), PartitionStats { fingerprint: 1, min_ts: day_start, max_ts: day_start, rows: 1, bytes: 1 })]);
     let gaps = || {

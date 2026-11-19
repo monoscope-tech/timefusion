@@ -26,6 +26,7 @@
 use std::{
     fmt,
     sync::{Arc, OnceLock},
+    time::{Duration, Instant},
 };
 
 use datafusion::{
@@ -49,12 +50,12 @@ use crate::{
 
 /// How long a queued heavy query waits for a permit before failing with an
 /// orderly error rather than blocking a client forever.
-const HEAVY_QUEUE_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+const HEAVY_QUEUE_WAIT: Duration = Duration::from_secs(30);
 
 /// A permit held longer than this is logged from inside its own query span when
 /// released, completed or cancelled alike. Statement logs stop timing at the
 /// first batch, so without this the queries that fill the gate are invisible.
-const HEAVY_HELD_LOG_AFTER: std::time::Duration = std::time::Duration::from_secs(5);
+const HEAVY_HELD_LOG_AFTER: Duration = Duration::from_secs(5);
 
 /// The process-wide heavy-sort permit pool, sized once at first use from the
 /// query-pool geometry.
@@ -83,9 +84,8 @@ pub(crate) fn heavy_sem() -> &'static Arc<tokio::sync::Semaphore> {
     &heavy_gate().semaphore
 }
 
-/// Does the plan contain a SPILLING sort — one with no `fetch` bound?
-///
-/// A `SortExec` carrying `fetch = Some(n)` is a `TopK`: it holds only `n` rows and
+/// A plan shape heavy enough to gate. `SpillingSort` is a sort with no `fetch` bound:
+/// a `SortExec` carrying `fetch = Some(n)` is a `TopK`: it holds only `n` rows and
 /// never spills, so it is not the shape that exhausts the pool. An unbounded sort
 /// (merge-on-read dedup, `ORDER BY` without a small `LIMIT`) is, and is exactly
 /// what the raw fallback plans on the log-explorer and session queries.
@@ -157,11 +157,10 @@ fn heavy_class(plan: &Arc<dyn ExecutionPlan>, batch_rows: usize) -> Option<Heavy
 fn heavy_permits(plan: &Arc<dyn ExecutionPlan>, batch_rows: usize, partitions: usize, slots: usize) -> usize {
     fn cost(plan: &Arc<dyn ExecutionPlan>, batch_rows: usize) -> usize {
         let here = match heavy_node_class(plan, batch_rows) {
-            Some(HeavyClass::SpillingSort) => {
-                let sort = downcast::<SortExec>(plan.as_ref()).unwrap();
+            Some(HeavyClass::SpillingSort) => downcast::<SortExec>(plan.as_ref()).map_or(0, |sort| {
                 let batch_bytes = batch_rows.saturating_mul(estimated_row_bytes(&sort.input().schema()));
                 crate::config::DEFAULT_SORT_SPILL_RESERVATION_BYTES.max(batch_bytes).saturating_mul(sort.input().properties().partitioning.partition_count())
-            }
+            }),
             Some(HeavyClass::OrderedMorMerge { buffered_bytes, .. }) => buffered_bytes,
             None => 0,
         };
@@ -198,17 +197,16 @@ impl PhysicalOptimizerRule for HeavyQueryAdmission {
         true
     }
     fn optimize(&self, plan: Arc<dyn ExecutionPlan>, config: &datafusion::config::ConfigOptions) -> DFResult<Arc<dyn ExecutionPlan>> {
-        let Some(class) = heavy_class(&plan, config.execution.batch_size.get()) else {
+        let batch_rows = config.execution.batch_size.get();
+        let Some(class) = heavy_class(&plan, batch_rows) else {
             return Ok(plan);
         };
         let gate = heavy_gate();
-        let permits = heavy_permits(&plan, config.execution.batch_size.get(), gate.partitions, gate.slots);
+        let permits = heavy_permits(&plan, batch_rows, gate.partitions, gate.slots);
         // A multi-partition root is executed once per partition (`execute_stream`
         // coalesces over it); coalescing here charges the query only once.
-        let plan = match plan.properties().partitioning.partition_count() > 1 {
-            true => Arc::new(CoalescePartitionsExec::new(plan)),
-            false => plan,
-        };
+        let plan: Arc<dyn ExecutionPlan> =
+            if plan.properties().partitioning.partition_count() > 1 { Arc::new(CoalescePartitionsExec::new(plan)) } else { plan };
         Ok(Arc::new(AdmissionExec::new(plan, class, permits)))
     }
 }
@@ -218,7 +216,7 @@ pub struct AdmissionExec {
     input: Arc<dyn ExecutionPlan>,
     class: HeavyClass,
     permits: usize,
-    properties: std::sync::Arc<PlanProperties>,
+    properties: Arc<PlanProperties>,
 }
 
 impl AdmissionExec {
@@ -262,7 +260,7 @@ enum Admit {
 struct HeldPermit {
     _permit: OwnedSemaphorePermit,
     span: tracing::Span,
-    since: std::time::Instant,
+    since: Instant,
     class: HeavyClass,
 }
 
@@ -281,7 +279,7 @@ impl ExecutionPlan for AdmissionExec {
     fn name(&self) -> &'static str {
         "AdmissionExec"
     }
-    fn properties(&self) -> &std::sync::Arc<PlanProperties> {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -292,22 +290,21 @@ impl ExecutionPlan for AdmissionExec {
     }
     fn execute(&self, partition: usize, context: Arc<TaskContext>) -> DFResult<SendableRecordBatchStream> {
         let schema = self.input.schema();
-        let class = self.class;
-        let permits = self.permits as u32;
+        let (class, permits) = (self.class, self.permits);
         // Captured here, synchronously inside the statement's span, so a long hold
         // is reported with the query that caused it.
         let start = Admit::Pending(Arc::clone(&self.input), partition, context, tracing::Span::current());
         let stream = futures::stream::unfold(start, move |state| async move {
-            match state {
+            let (mut stream, permit) = match state {
                 Admit::Pending(input, partition, context, span) => {
                     // Acquire BEFORE executing the child, so no scan starts until this
                     // query is admitted. The owned permit lives in the Running state and
                     // releases when the stream ends or is dropped (client disconnect /
                     // cancellation).
                     let sem = Arc::clone(heavy_sem());
-                    let queued = sem.available_permits() < permits as usize;
-                    let permit = match tokio::time::timeout(HEAVY_QUEUE_WAIT, sem.acquire_many_owned(permits)).await {
-                        Ok(Ok(permit)) => HeldPermit { _permit: permit, span, since: std::time::Instant::now(), class },
+                    let queued = sem.available_permits() < permits;
+                    let permit = match tokio::time::timeout(HEAVY_QUEUE_WAIT, sem.acquire_many_owned(permits as u32)).await {
+                        Ok(Ok(permit)) => HeldPermit { _permit: permit, span, since: Instant::now(), class },
                         // Semaphore closed only at shutdown: end the stream cleanly.
                         Ok(Err(_closed)) => return None,
                         Err(_elapsed) => {
@@ -325,29 +322,16 @@ impl ExecutionPlan for AdmissionExec {
                     if queued {
                         metrics::counter!(scan_metric_names::HEAVY_QUERY_QUEUED).increment(1);
                     }
-                    let mut stream = match input.execute(partition, context) {
-                        Ok(stream) => stream,
+                    match input.execute(partition, context) {
+                        Ok(stream) => (stream, permit),
                         Err(error) => return Some((Err(error), Admit::Done)),
-                    };
-                    // Pull the first batch here so the transition carries an item; the
-                    // permit rides into Running and drops with the stream.
-                    match futures::StreamExt::next(&mut stream).await {
-                        Some(batch) => Some((batch, Admit::Running(stream, permit))),
-                        None => {
-                            drop(permit);
-                            None
-                        }
                     }
                 }
-                Admit::Running(mut stream, permit) => match futures::StreamExt::next(&mut stream).await {
-                    Some(batch) => Some((batch, Admit::Running(stream, permit))),
-                    None => {
-                        drop(permit);
-                        None
-                    }
-                },
-                Admit::Done => None,
-            }
+                Admit::Running(stream, permit) => (stream, permit),
+                Admit::Done => return None,
+            };
+            // The permit rides in Running and drops with the stream.
+            futures::StreamExt::next(&mut stream).await.map(|batch| (batch, Admit::Running(stream, permit)))
         });
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
     }
@@ -355,13 +339,15 @@ impl ExecutionPlan for AdmissionExec {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{sync::Arc, time::Duration};
 
     use datafusion::{
         arrow::{
             compute::SortOptions,
             datatypes::{DataType, Field, Schema},
         },
+        error::DataFusionError,
+        execution::TaskContext,
         physical_expr::{LexOrdering, PhysicalSortExpr, expressions::Column},
         physical_plan::{
             ExecutionPlan,
@@ -369,6 +355,7 @@ mod tests {
             sorts::{sort::SortExec, sort_preserving_merge::SortPreservingMergeExec},
         },
     };
+    use futures::StreamExt;
 
     use crate::read::{DedupExec, LegKind, OrderingProbeExec};
 
@@ -400,9 +387,8 @@ mod tests {
     /// A log-explorer row: the same key plus wide text and a Variant-like struct.
     fn wide() -> Arc<Schema> {
         let variant = DataType::Struct(vec![Field::new("metadata", DataType::Binary, true), Field::new("value", DataType::Binary, true)].into());
-        let mut fields: Vec<Field> = narrow().fields().iter().map(|f| f.as_ref().clone()).collect();
-        fields.extend([Field::new("body", DataType::Utf8View, true), Field::new("attributes", variant, true)]);
-        Arc::new(Schema::new(fields))
+        let extra = [Field::new("body", DataType::Utf8View, true), Field::new("attributes", variant, true)];
+        Arc::new(Schema::new(narrow().fields().iter().map(|f| f.as_ref().clone()).chain(extra).collect::<Vec<_>>()))
     }
     fn ordered_mor(fan_in: usize, probe: bool) -> Arc<dyn ExecutionPlan> {
         ordered_mor_over(wide(), fan_in, probe)
@@ -413,12 +399,6 @@ mod tests {
         let merge = Arc::new(SortPreservingMergeExec::new(ordering(), input)) as Arc<dyn ExecutionPlan>;
         let input = if probe { Arc::new(OrderingProbeExec::new(merge, LegKind::Delta)) as Arc<dyn ExecutionPlan> } else { merge };
         Arc::new(DedupExec::new(input, vec![key], None).unwrap().requiring(Some(ordering())))
-    }
-
-    /// The pool-exhausting shape — an unbounded sort — is gated.
-    #[test]
-    fn an_unbounded_sort_is_heavy() {
-        assert_eq!(heavy_class(&sort(empty(), None), BATCH), Some(HeavyClass::SpillingSort));
     }
 
     #[test_case::test_case(8 => 1 ; "configured width")]
@@ -463,56 +443,23 @@ mod tests {
         Arc::new(AggregateExec::try_new(AggregateMode::Single, group, vec![], vec![], Arc::clone(&input), input.schema()).unwrap())
     }
 
-    /// A chart's final ORDER BY sorts the aggregate's groups, not raw rows: not gated,
-    /// while a wide merge feeding the aggregate still is.
-    #[test_case::test_case(empty() => None ; "sort of groups over a cheap input")]
-    #[test_case::test_case(ordered_mor(8, false) => Some("ordered_mor_merge") ; "a wide merge below the aggregate stays gated")]
-    fn a_sort_of_aggregate_groups_is_not_heavy(input: Arc<dyn ExecutionPlan>) -> Option<&'static str> {
-        heavy_class(&sort(aggregate(input), None), BATCH).map(|class| class.label())
-    }
-
-    /// A bounded TopK holds only `n` rows and never spills, so it is NOT gated —
-    /// gating it would throttle the fast dashboard path that earned the hit rate.
-    #[test]
-    fn a_bounded_topk_is_not_heavy() {
-        assert_eq!(heavy_class(&sort(empty(), Some(100)), BATCH), None);
-    }
-
-    /// A plan with no sort at all — a rollup-routed aggregate, a point lookup — is
-    /// never gated.
-    #[test]
-    fn a_sortless_plan_is_not_heavy() {
-        assert_eq!(heavy_class(&empty(), BATCH), None);
-    }
-
-    #[test]
-    fn a_multi_partition_ordered_mor_merge_is_heavy() {
-        assert_eq!(heavy_class(&ordered_mor(8, false), BATCH).map(|c| c.label()), Some("ordered_mor_merge"));
-    }
-
-    /// A narrow merge buffers a few MB even at a whale's fan-in, so gating it made
-    /// every raw dashboard count of the largest project queue behind 8 slots.
-    #[test]
-    fn a_narrow_whale_count_merge_is_not_heavy() {
-        assert_eq!(heavy_class(&ordered_mor_over(narrow(), 26, false), BATCH), None);
-    }
-
-    /// The shape the gate exists for, at prod's batch size and the smallest whale
-    /// fan-in seen: every column of the real table must stay gated.
-    #[test]
-    fn a_full_width_log_explorer_merge_stays_heavy() {
-        let schema = crate::schema::get_schema("otel_logs_and_spans").unwrap().schema_ref();
-        assert_eq!(heavy_class(&ordered_mor_over(schema, 7, false), 4096).map(|c| c.label()), Some("ordered_mor_merge"));
-    }
-
-    #[test]
-    fn a_single_partition_ordered_mor_merge_is_not_heavy() {
-        assert_eq!(heavy_class(&ordered_mor(1, false), BATCH), None);
-    }
-
-    #[test]
-    fn an_ordering_probe_does_not_hide_an_ordered_mor_merge() {
-        assert_eq!(heavy_class(&ordered_mor(8, true), BATCH).map(|c| c.label()), Some("ordered_mor_merge"));
+    /// Gated: unbounded sorts and wide multi-partition merges below order-dependent dedup.
+    /// Not gated: bounded TopK (never spills; gating it throttled the fast dashboard path),
+    /// sortless plans (rollup aggregates, point lookups), one-partition merges, narrow
+    /// merges (a few MB even at a whale's fan-in, yet gating them queued every raw whale
+    /// count behind 8 slots), and a chart's final ORDER BY over aggregate groups.
+    #[test_case::test_case(sort(empty(), None), BATCH => Some("sort") ; "an unbounded sort")]
+    #[test_case::test_case(sort(empty(), Some(100)), BATCH => None ; "a bounded topk")]
+    #[test_case::test_case(empty(), BATCH => None ; "a sortless plan")]
+    #[test_case::test_case(sort(aggregate(empty()), None), BATCH => None ; "a sort of aggregate groups")]
+    #[test_case::test_case(sort(aggregate(ordered_mor(8, false)), None), BATCH => Some("ordered_mor_merge") ; "a wide merge below the aggregate")]
+    #[test_case::test_case(ordered_mor(8, false), BATCH => Some("ordered_mor_merge") ; "a multi partition ordered mor merge")]
+    #[test_case::test_case(ordered_mor(1, false), BATCH => None ; "a single partition ordered mor merge")]
+    #[test_case::test_case(ordered_mor(8, true), BATCH => Some("ordered_mor_merge") ; "an ordering probe does not hide the merge")]
+    #[test_case::test_case(ordered_mor_over(narrow(), 26, false), BATCH => None ; "a narrow whale count merge")]
+    #[test_case::test_case(ordered_mor_over(crate::schema::get_schema("otel_logs_and_spans").unwrap().schema_ref(), 7, false), 4096 => Some("ordered_mor_merge") ; "a full width log explorer merge at prod batch size")]
+    fn classifies_heavy_plans(plan: Arc<dyn ExecutionPlan>, batch_rows: usize) -> Option<&'static str> {
+        heavy_class(&plan, batch_rows).map(HeavyClass::label)
     }
 
     /// The wrapper is transparent to the optimizer contract: same schema, one
@@ -532,15 +479,9 @@ mod tests {
     /// bounded no matter how the stream ends.
     #[tokio::test]
     async fn a_permit_is_held_across_the_stream_and_released_after() {
-        use datafusion::{execution::TaskContext, physical_plan::ExecutionPlan};
-        use futures::StreamExt;
-
         let before = super::heavy_sem().available_permits();
         let wrapped = Arc::new(AdmissionExec::new(empty(), HeavyClass::SpillingSort, 1));
         let mut stream = wrapped.execute(0, Arc::new(TaskContext::default())).unwrap();
-        // First poll drives the Pending arm: the permit is taken here.
-        let _ = stream.next().await;
-        // Draining to completion releases it.
         while stream.next().await.is_some() {}
         drop(stream);
         // Yield so the drop's release is observed.
@@ -553,21 +494,15 @@ mod tests {
     /// memory and query scheduling.
     #[tokio::test]
     async fn an_exhausted_gate_queues_until_a_permit_is_released() {
-        use datafusion::{execution::TaskContext, physical_plan::ExecutionPlan};
-        use futures::StreamExt;
-
         let sem = Arc::clone(super::heavy_sem());
         let capacity = sem.available_permits();
         let held = Arc::clone(&sem).acquire_many_owned((capacity - 1).try_into().unwrap()).await.unwrap();
         let wrapped = Arc::new(AdmissionExec::new(empty(), HeavyClass::SpillingSort, 2));
         let mut stream = wrapped.execute(0, Arc::new(TaskContext::default())).unwrap();
 
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(20), stream.next()).await.is_err(),
-            "a two-slot query must wait when only one slot is free"
-        );
+        assert!(tokio::time::timeout(Duration::from_millis(20), stream.next()).await.is_err(), "a two-slot query must wait when only one slot is free");
         drop(held);
-        assert!(tokio::time::timeout(std::time::Duration::from_secs(1), stream.next()).await.unwrap().is_none(), "the empty child completes once admitted");
+        assert!(tokio::time::timeout(Duration::from_secs(1), stream.next()).await.unwrap().is_none(), "the empty child completes once admitted");
         assert_eq!(sem.available_permits(), capacity, "the admitted stream returns its permit");
     }
 
@@ -575,9 +510,6 @@ mod tests {
     /// instead of blocking its client.
     #[tokio::test(start_paused = true)]
     async fn an_exhausted_gate_times_out_with_a_retryable_error() {
-        use datafusion::{error::DataFusionError, execution::TaskContext};
-        use futures::StreamExt;
-
         let sem = Arc::clone(super::heavy_sem());
         let _held = Arc::clone(&sem).acquire_many_owned(sem.available_permits().try_into().unwrap()).await.unwrap();
         let wrapped = Arc::new(AdmissionExec::new(empty(), HeavyClass::SpillingSort, 1));

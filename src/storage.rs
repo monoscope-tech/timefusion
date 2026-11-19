@@ -46,7 +46,7 @@ pub(crate) const PARQUET_RANGE_ALIGNMENT_BYTES: u64 = 1024 * 1024;
 /// intersection of what was asked for with what exists — exactly what the
 /// unaligned path returns via its own `range.end <= full.len()` guard. Warned,
 /// not silent: a short read means someone's view of the file is wrong.
-fn clamp_to_available(start: usize, end: usize, available: usize, location: &Path) -> std::ops::Range<usize> {
+fn clamp_to_available(start: usize, end: usize, available: usize, location: &Path) -> Range<usize> {
     if end > available {
         warn!(location = %location, requested_end = end, available, "range read ran past the end of the object; returning the bytes that exist");
     }
@@ -66,20 +66,16 @@ struct CacheValue {
 
 impl CacheValue {
     fn new(data: impl Into<Bytes>, meta: ObjectMeta) -> Self {
-        Self { data: data.into(), meta, timestamp_millis: current_millis() }
+        Self { data: data.into(), meta, timestamp_millis: now_unix_ms() }
     }
 
     fn age_millis(&self) -> u64 {
-        current_millis().saturating_sub(self.timestamp_millis)
+        now_unix_ms().saturating_sub(self.timestamp_millis)
     }
 
     fn is_expired(&self, ttl: Duration) -> bool {
         self.age_millis() > ttl.as_millis() as u64
     }
-}
-
-fn current_millis() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
 }
 
 fn allocated_bytes(path: &std::path::Path) -> u64 {
@@ -137,7 +133,7 @@ mod object_meta_serde {
         let s = SerializedMeta::deserialize(deserializer)?;
         Ok(ObjectMeta {
             location: Path::from(s.location),
-            last_modified: DateTime::<Utc>::from_timestamp_millis(s.last_modified).unwrap_or(Utc::now()),
+            last_modified: DateTime::<Utc>::from_timestamp_millis(s.last_modified).unwrap_or_else(Utc::now),
             size: s.size,
             e_tag: s.e_tag,
             version: s.version,
@@ -206,7 +202,7 @@ impl FoyerCacheConfig {
         let block_size_bytes = cfg.cache.block_size_bytes().max(optimize_target.saturating_mul(2)).max(2 << 30);
         let disk_size_bytes = cfg.cache.disk_size_bytes();
         if block_size_bytes > disk_size_bytes {
-            tracing::warn!(
+            warn!(
                 "Foyer disk block size ({}MB) exceeds disk capacity ({}MB) — large files won't persist to disk. Raise timefusion_foyer_disk_gb or lower the optimize target.",
                 block_size_bytes / 1024 / 1024,
                 disk_size_bytes / 1024 / 1024
@@ -358,6 +354,10 @@ fn add(counter: &AtomicU64, n: u64) {
     counter.fetch_add(n, Ordering::Relaxed);
 }
 
+fn load(counter: &AtomicU64) -> u64 {
+    counter.load(Ordering::Relaxed)
+}
+
 fn record_hit(stats: &StatsRef, bytes_served: u64) {
     add(&stats.hits, 1);
     add(&stats.bytes_served, bytes_served);
@@ -484,11 +484,11 @@ impl AdmissionStats {
     fn record(&self, source: AdmitSource, bytes: u64) {
         match source {
             AdmitSource::WriteCapture => {
-                self.write_capture_bytes.fetch_add(bytes, Ordering::Relaxed);
-                self.write_capture_admitted.fetch_add(1, Ordering::Relaxed);
+                add(&self.write_capture_bytes, bytes);
+                add(&self.write_capture_admitted, 1);
             }
-            AdmitSource::ReadMiss => drop(self.read_miss_bytes.fetch_add(bytes, Ordering::Relaxed)),
-            AdmitSource::Refresh => drop(self.refresh_bytes.fetch_add(bytes, Ordering::Relaxed)),
+            AdmitSource::ReadMiss => add(&self.read_miss_bytes, bytes),
+            AdmitSource::Refresh => add(&self.refresh_bytes, bytes),
         }
     }
 }
@@ -501,7 +501,7 @@ impl foyer::EventListener for EvictionCounter {
 
     fn on_leave(&self, event: foyer::Event, _: &Self::Key, _: &Self::Value) {
         if event == foyer::Event::Evict {
-            self.0.fetch_add(1, Ordering::Relaxed);
+            add(&self.0, 1);
         }
     }
 }
@@ -518,7 +518,7 @@ impl SharedFoyerCache {
     /// the in-memory working set.
     pub fn put_immutable(&self, key: String, data: Bytes) {
         let meta = ObjectMeta { location: Path::from(key.as_str()), last_modified: Utc::now(), size: data.len() as u64, e_tag: None, version: None };
-        self.cache.insert_with_properties(key, CacheValue::new(data, meta), HybridCacheProperties::default().with_location(Location::OnDisk));
+        insert_on_disk(&self.cache, key, CacheValue::new(data, meta));
     }
 
     /// Create the process-wide data + metadata caches.
@@ -538,7 +538,7 @@ impl SharedFoyerCache {
             config.metadata_disk_size_bytes / 1024 / 1024 / 1024,
             config.ttl.as_secs()
         );
-        if config.ttl < std::time::Duration::from_secs(300) {
+        if config.ttl < Duration::from_secs(300) {
             warn!(
                 "Foyer TTL is only {}s — cached footers expire between queries; set TIMEFUSION_FOYER_TTL_SECONDS higher unless debugging",
                 config.ttl.as_secs()
@@ -588,6 +588,7 @@ impl SharedFoyerCache {
     }
 
     pub fn runtime_stats(&self) -> FoyerRuntimeStats {
+        let disk = self.cache.statistics();
         FoyerRuntimeStats {
             stats: self.get_stats(),
             memory_size_bytes: self.config.memory_size_bytes,
@@ -603,19 +604,19 @@ impl SharedFoyerCache {
             // Recursive `read_dir` over the whole L2 directory: must not run on a runtime worker.
             l2_used_bytes: crate::support::without_blocking_the_worker(|| allocated_bytes(&self.config.cache_dir)),
             entry_count: self.cache.memory().entries(),
-            evictions: self.evictions.load(Ordering::Relaxed),
-            l2_write_bytes: self.cache.statistics().disk_write_bytes(),
-            l2_read_bytes: self.cache.statistics().disk_read_bytes(),
-            l2_write_ios: self.cache.statistics().disk_write_ios(),
-            l2_read_ios: self.cache.statistics().disk_read_ios(),
-            admit_write_capture_bytes: self.admission.write_capture_bytes.load(Ordering::Relaxed),
-            admit_read_miss_bytes: self.admission.read_miss_bytes.load(Ordering::Relaxed),
-            admit_refresh_bytes: self.admission.refresh_bytes.load(Ordering::Relaxed),
-            write_capture_admitted: self.admission.write_capture_admitted.load(Ordering::Relaxed),
-            insert_bypassed: self.admission.insert_bypassed.load(Ordering::Relaxed),
-            warm_passes: self.admission.warm_passes.load(Ordering::Relaxed),
-            warm_fetched_bytes: self.admission.warm_fetched_bytes.load(Ordering::Relaxed),
-            warm_cached_bytes: self.admission.warm_cached_bytes.load(Ordering::Relaxed),
+            evictions: load(&self.evictions),
+            l2_write_bytes: disk.disk_write_bytes(),
+            l2_read_bytes: disk.disk_read_bytes(),
+            l2_write_ios: disk.disk_write_ios(),
+            l2_read_ios: disk.disk_read_ios(),
+            admit_write_capture_bytes: load(&self.admission.write_capture_bytes),
+            admit_read_miss_bytes: load(&self.admission.read_miss_bytes),
+            admit_refresh_bytes: load(&self.admission.refresh_bytes),
+            write_capture_admitted: load(&self.admission.write_capture_admitted),
+            insert_bypassed: load(&self.admission.insert_bypassed),
+            warm_passes: load(&self.admission.warm_passes),
+            warm_fetched_bytes: load(&self.admission.warm_fetched_bytes),
+            warm_cached_bytes: load(&self.admission.warm_cached_bytes),
         }
     }
 
@@ -627,7 +628,7 @@ impl SharedFoyerCache {
     }
 
     /// How long Foyer's close may take before it is abandoned.
-    const CLOSE_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+    const CLOSE_BUDGET: Duration = Duration::from_secs(5);
 
     /// Close the caches, bounded by `deadline`. Foyer's `close()` can run for
     /// minutes and block process exit (and therefore `wal.lock` release);
@@ -677,12 +678,8 @@ impl SharedFoyerCache {
     /// The runs of `range` (clamped to `size`) whose data blocks are not cached under `key`, the
     /// object's bucket-relative path. Index probes only: no IO, no promotion.
     pub fn uncached_block_runs(&self, key: &str, range: Range<u64>, size: u64) -> Vec<Range<u64>> {
-        let (b, location) = (PARQUET_RANGE_ALIGNMENT_BYTES, Path::from(key));
-        (range.start / b..range.end.min(size).div_ceil(b))
-            .map(|k| k * b..((k + 1) * b).min(size))
-            .filter(|blk| !self.cache.contains(&FoyerObjectStoreCache::make_range_cache_key(&location, blk)))
-            .coalesce(|a, b| if a.end == b.start { Ok(a.start..b.end) } else { Err((a, b)) })
-            .collect()
+        let location = Path::from(key);
+        coalesce_runs(aligned_blocks(&range, size).filter(|blk| !self.cache.contains(&FoyerObjectStoreCache::make_range_cache_key(&location, blk))))
     }
 
     /// Wait until queued disk-tier writes are flushed; until then `contains` cannot see them.
@@ -692,9 +689,9 @@ impl SharedFoyerCache {
 
     /// Account one disk-cache warmer pass.
     pub fn record_warm_pass(&self, fetched: u64, cached: u64) {
-        self.admission.warm_passes.fetch_add(1, Ordering::Relaxed);
-        self.admission.warm_fetched_bytes.fetch_add(fetched, Ordering::Relaxed);
-        self.admission.warm_cached_bytes.fetch_add(cached, Ordering::Relaxed);
+        add(&self.admission.warm_passes, 1);
+        add(&self.admission.warm_fetched_bytes, fetched);
+        add(&self.admission.warm_cached_bytes, cached);
     }
 }
 
@@ -812,10 +809,25 @@ fn is_within_recent_window(location: &Path, recent_days: usize) -> bool {
 /// `l1_max_entry_bytes` to disk-only so they can't evict the hot L1 working set.
 fn insert_main(cache: &FoyerCache, key: String, value: CacheValue, l1_max_entry_bytes: usize) {
     if l1_max_entry_bytes > 0 && value.data.len() > l1_max_entry_bytes {
-        cache.insert_with_properties(key, value, HybridCacheProperties::default().with_location(Location::OnDisk));
+        insert_on_disk(cache, key, value);
     } else {
         cache.insert(key, value);
     }
+}
+
+fn insert_on_disk(cache: &FoyerCache, key: String, value: CacheValue) {
+    cache.insert_with_properties(key, value, HybridCacheProperties::default().with_location(Location::OnDisk));
+}
+
+/// The `PARQUET_RANGE_ALIGNMENT_BYTES` blocks covering `range`, clamped to `size`.
+fn aligned_blocks(range: &Range<u64>, size: u64) -> impl Iterator<Item = Range<u64>> {
+    let b = PARQUET_RANGE_ALIGNMENT_BYTES;
+    (range.start / b..range.end.min(size).div_ceil(b)).map(move |k| k * b..((k + 1) * b).min(size))
+}
+
+/// Merge adjacent ranges into contiguous runs.
+fn coalesce_runs(ranges: impl Iterator<Item = Range<u64>>) -> Vec<Range<u64>> {
+    ranges.coalesce(|a, b| if a.end == b.start { Ok(a.start..b.end) } else { Err((a, b)) }).collect()
 }
 
 /// Synthesize an `ObjectMeta` for a just-written object so the write path can
@@ -877,13 +889,22 @@ impl FoyerObjectStoreCache {
         info!("Explicitly invalidating and refreshing _last_checkpoint cache for table: {}", key);
         self.cache.remove(&key);
 
-        if let Ok(get_result) = self.inner.get(&Path::from(key.as_str())).await {
-            let (data, meta) = Self::collect_payload(get_result).await;
-            if !data.is_empty() {
-                self.cache.insert(key, CacheValue::new(data, meta));
-                debug!("Proactively refreshed _last_checkpoint cache after invalidation");
-            }
+        let location = Path::from(key.as_str());
+        if Self::refetch(self.inner.as_ref(), &self.cache, &location, key).await {
+            debug!("Proactively refreshed _last_checkpoint cache after invalidation");
         }
+    }
+
+    /// Re-fetch `location` into `cache` under `key`. Best-effort: a failed or
+    /// empty read caches nothing and returns false.
+    async fn refetch(inner: &dyn ObjectStore, cache: &FoyerCache, location: &Path, key: String) -> bool {
+        let Ok(GetResult { payload, meta, .. }) = inner.get(location).await else { return false };
+        let data = Self::read_payload(payload).await.unwrap_or_default();
+        if data.is_empty() {
+            return false;
+        }
+        cache.insert(key, CacheValue::new(data, meta));
+        true
     }
 
     pub async fn new(inner: Arc<dyn ObjectStore>, config: FoyerCacheConfig) -> anyhow::Result<Self> {
@@ -896,7 +917,7 @@ impl FoyerObjectStoreCache {
         &self.admission
     }
 
-    async fn record_meta_hit(&self, span: &tracing::Span, bytes_served: u64) {
+    fn record_meta_hit(&self, span: &tracing::Span, bytes_served: u64) {
         record_hit(&self.metadata_stats, bytes_served);
         span.record("cache_hit", true);
         span.record("is_metadata", true);
@@ -990,14 +1011,7 @@ impl FoyerObjectStoreCache {
         }
     }
 
-    /// Best-effort [`Self::read_payload`]: a failed read yields empty bytes,
-    /// which callers treat as "nothing to cache".
-    async fn collect_payload(result: GetResult) -> (Vec<u8>, ObjectMeta) {
-        let meta = result.meta.clone();
-        (Self::read_payload(result.payload).await.unwrap_or_default(), meta)
-    }
-
-    async fn serve_hit(&self, span: &tracing::Span, value: &CacheValue) -> GetResult {
+    fn serve_hit(&self, span: &tracing::Span, value: &CacheValue) -> GetResult {
         record_hit(&self.stats, value.data.len() as u64);
         span.record("cache_hit", true);
         Self::make_get_result(value.data.clone(), value.meta.clone())
@@ -1027,19 +1041,14 @@ impl FoyerObjectStoreCache {
 
             // _last_checkpoint is mutable: stale-while-revalidate, one refresh in flight per key.
             if Self::is_last_checkpoint(location) && !value.is_expired(ttl) {
-                let result = self.serve_hit(&span, value).await;
+                let result = self.serve_hit(&span, value);
                 let age_millis = value.age_millis();
                 if age_millis > 5000 && self.refreshing.insert(cache_key.clone()) {
                     let (inner, cache, refreshing, location, key) =
                         (self.inner.clone(), self.cache.clone(), self.refreshing.clone(), location.clone(), cache_key.clone());
                     self.spawn_tracked(async move {
                         debug!("Background refresh for _last_checkpoint: {}", location);
-                        if let Ok(result) = inner.get(&location).await {
-                            let (data, meta) = Self::collect_payload(result).await;
-                            if !data.is_empty() {
-                                cache.insert(key.clone(), CacheValue::new(data, meta));
-                            }
-                        }
+                        Self::refetch(inner.as_ref(), &cache, &location, key.clone()).await;
                         refreshing.remove(&key);
                     });
                 }
@@ -1052,7 +1061,7 @@ impl FoyerObjectStoreCache {
                 self.cache.remove(&cache_key);
                 debug!("Foyer cache EXPIRED for: {} (TTL: {}s, age: {}ms)", location, ttl.as_secs(), value.age_millis());
             } else {
-                let result = self.serve_hit(&span, value).await;
+                let result = self.serve_hit(&span, value);
                 debug!(
                     "Foyer cache HIT for: {} (avoiding S3 access, parquet={}, TTL={}s, age={}ms, size={} bytes)",
                     location,
@@ -1075,7 +1084,7 @@ impl FoyerObjectStoreCache {
         if waited_for_inflight && let Ok(Some(entry)) = self.cache.get(&cache_key).await {
             let value = entry.value();
             if !value.is_expired(ttl) {
-                let result = self.serve_hit(&span, value).await;
+                let result = self.serve_hit(&span, value);
                 span.record("cache_entry_bytes", value.data.len() as i64);
                 return Ok(result);
             }
@@ -1148,7 +1157,6 @@ impl FoyerObjectStoreCache {
         let span = tracing::Span::current();
         let is_parquet = is_parquet_file(location);
         let range_cache_key = Self::make_range_cache_key(location, &range);
-        let mut range_meta = None;
 
         let full_cache_key = Self::make_cache_key(location);
         if let Some((sliced, age_millis)) = self.live_slice(&self.cache, &full_cache_key, 0, &range, self.config.l1_max_entry_bytes).await {
@@ -1181,18 +1189,18 @@ impl FoyerObjectStoreCache {
             self.cache.remove(&range_cache_key);
         }
 
-        if is_parquet {
+        // The file's meta, when known, stamps the range admitted after the fallback fetch.
+        let range_meta = if is_parquet {
             // Probe before any HEAD, so a steady-state footer read pays zero S3
             // round-trips. l1_max=0: metadata entries are tiny, always keep in L1.
             if let Some((sliced, age_millis)) = self.live_slice(&self.metadata_cache, &range_cache_key, range.start, &range, 0).await {
-                self.record_meta_hit(&span, sliced.len() as u64).await;
+                self.record_meta_hit(&span, sliced.len() as u64);
                 debug!("Metadata cache HIT for: {} (range: {}..{}, size: {} bytes, age={}ms)", location, range.start, range.end, sliced.len(), age_millis);
                 return Ok(sliced);
             }
 
             // Need the file size to classify the request and stamp the cached range's meta.
             let file_meta = self.head_cached(location).await.inspect_err(|e| debug!("Failed to get metadata for {}: {}", location, e))?;
-            range_meta = Some(file_meta.clone());
 
             let file_size = file_meta.size;
             let metadata_size_hint = self.config.parquet_metadata_size_hint as u64;
@@ -1207,7 +1215,7 @@ impl FoyerObjectStoreCache {
             for &candidate in candidates.iter().filter(|&&c| c <= range.start && range.end <= file_size) {
                 let key = Self::make_range_cache_key(location, &(candidate..file_size));
                 if let Some((sliced, _)) = self.live_slice(&self.metadata_cache, &key, candidate, &range, 0).await {
-                    self.record_meta_hit(&span, range.end - range.start).await;
+                    self.record_meta_hit(&span, range.end - range.start);
                     debug!("Metadata cache HIT (containment {}..{}) for: {} (range: {}..{})", candidate, file_size, location, range.start, range.end);
                     return Ok(sliced);
                 }
@@ -1267,7 +1275,10 @@ impl FoyerObjectStoreCache {
                 span.record("cache_hit", hit);
                 return Ok(data);
             }
-        }
+            Some(file_meta)
+        } else {
+            None
+        };
 
         span.record("cache_hit", false);
         record_miss_with_fetch(&self.stats);
@@ -1305,8 +1316,7 @@ impl FoyerObjectStoreCache {
     /// share blocks. A miss fetches only its missing blocks, one GET per contiguous run.
     /// `warm` admits the fetched blocks disk-only. Returns the bytes and whether no fetch ran.
     async fn get_blocks(&self, location: &Path, range: &Range<u64>, file: &ObjectMeta, warm: bool) -> ObjectStoreResult<(Bytes, bool)> {
-        let b = PARQUET_RANGE_ALIGNMENT_BYTES;
-        let blocks = (range.start / b..range.end.min(file.size).div_ceil(b)).map(|k| k * b..((k + 1) * b).min(file.size)).collect_vec();
+        let blocks = aligned_blocks(range, file.size).collect_vec();
         let key = |blk: &Range<u64>| Self::make_range_cache_key(location, blk);
         let keys = blocks.iter().map(key).collect_vec();
         let mut data: Vec<Option<Bytes>> =
@@ -1315,13 +1325,7 @@ impl FoyerObjectStoreCache {
                 .into_iter()
                 .map(|hit| hit.map(|(bytes, _)| bytes))
                 .collect();
-        let runs = blocks
-            .iter()
-            .zip(&data)
-            .filter(|(_, hit)| hit.is_none())
-            .map(|(blk, _)| blk.clone())
-            .coalesce(|a, b| if a.end == b.start { Ok(a.start..b.end) } else { Err((a, b)) })
-            .collect_vec();
+        let runs = coalesce_runs(blocks.iter().zip(&data).filter(|(_, hit)| hit.is_none()).map(|(blk, _)| blk.clone()));
         // Fully cold, nonadmitted reads cannot reuse widened blocks. Keep existing
         // block hits (including partial hits) on the normal reuse path.
         if !runs.is_empty() && data.iter().all(Option::is_none) && !is_within_recent_window(location, self.config.cache_recent_days) {
@@ -1347,11 +1351,7 @@ impl FoyerObjectStoreCache {
                 if block.len() as u64 == blk.end - blk.start {
                     match warm {
                         true if is_within_recent_window(location, self.config.cache_recent_days) => {
-                            self.cache.insert_with_properties(
-                                keys[i].clone(),
-                                range_value(location, block.clone(), file),
-                                HybridCacheProperties::default().with_location(Location::OnDisk),
-                            );
+                            insert_on_disk(&self.cache, keys[i].clone(), range_value(location, block.clone(), file))
                         }
                         true => {}
                         false => self.admit_data_range(location, keys[i].clone(), block.clone(), file),
@@ -1370,12 +1370,7 @@ impl FoyerObjectStoreCache {
         let out = match blocks.len() {
             0 => Bytes::new(),
             1 => parts.next().unwrap_or_default(),
-            _ => parts
-                .fold(bytes::BytesMut::with_capacity((range.end - range.start) as usize), |mut out, part| {
-                    out.extend_from_slice(&part);
-                    out
-                })
-                .freeze(),
+            _ => Bytes::from(parts.collect_vec().concat()),
         };
         Ok((out, runs.is_empty()))
     }
@@ -1472,9 +1467,8 @@ impl FoyerObjectStoreCache {
             return;
         }
         let bytes = value.data.len() as u64;
-        if self.admit(&self.cache, key, value, self.config.l1_max_entry_bytes) {
-            self.admission.record(source, bytes);
-        }
+        self.admit(&self.cache, key, value, self.config.l1_max_entry_bytes);
+        self.admission.record(source, bytes);
     }
 
     /// Full-file admission, under the key the read path derives from `location`.
@@ -1484,18 +1478,17 @@ impl FoyerObjectStoreCache {
 
     /// Single funnel for every cache population, so `scan_bypass_scope` can
     /// steer all of them in one place. `l1_max_entry_bytes = 0` keeps the
-    /// default L1+disk placement. Returns whether the entry was admitted.
-    fn admit(&self, cache: &FoyerCache, key: String, value: CacheValue, l1_max_entry_bytes: usize) -> bool {
+    /// default L1+disk placement.
+    fn admit(&self, cache: &FoyerCache, key: String, value: CacheValue, l1_max_entry_bytes: usize) {
         // A bypassed scan's first sighting goes disk-only: it cannot evict the hot L1 set,
         // yet re-running the query is served locally rather than paying the cold fetch twice.
         if bypass_active() && !self.repeat_sighting(&key) {
             crate::observability::record_cache_insert_bypassed();
-            self.admission.insert_bypassed.fetch_add(1, Ordering::Relaxed);
-            cache.insert_with_properties(key, value, HybridCacheProperties::default().with_location(Location::OnDisk));
-            return true;
+            add(&self.admission.insert_bypassed, 1);
+            insert_on_disk(cache, key, value);
+        } else {
+            insert_main(cache, key, value, l1_max_entry_bytes);
         }
-        insert_main(cache, key, value, l1_max_entry_bytes);
-        true
     }
 
     /// Has a bypassed scan already tried to admit `key` once? First sighting
@@ -1618,7 +1611,7 @@ impl MultipartUpload for CachingMultipartUpload {
             let meta = put_result_meta(self.location.clone(), size, &result);
             // Must use the read path's key derivation or the entry is never found.
             let key = FoyerObjectStoreCache::make_cache_key(&self.location);
-            insert_main(&self.cache, key.clone(), CacheValue::new(buf, meta), self.l1_max_entry_bytes);
+            insert_main(&self.cache, key, CacheValue::new(buf, meta), self.l1_max_entry_bytes);
             self.admission.record(AdmitSource::WriteCapture, size);
             debug!("Warmed cache from multipart write: {} (size: {} bytes)", self.location, size);
         }
@@ -1657,7 +1650,7 @@ impl futures::Stream for TimedListStream {
                 this.done = true;
                 let ms = this.started.elapsed().as_millis();
                 if ms > 1500 {
-                    tracing::info!("slow_list prefix={} items={} ms={}", this.prefix, this.count, ms);
+                    info!("slow_list prefix={} items={} ms={}", this.prefix, this.count, ms);
                 }
             }
             _ => {}
@@ -3060,7 +3053,7 @@ pub const SNAPSHOT_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 3600);
 
 /// FROZEN HASH: this names a FILE on disk, so changing the hasher orphans every
 /// existing snapshot sidecar.
-fn path_for(dir: &std::path::Path, table_url: &str) -> std::path::PathBuf {
+fn path_for(dir: &std::path::Path, table_url: &str) -> PathBuf {
     use std::hash::{DefaultHasher, Hash, Hasher};
     let mut h = DefaultHasher::new();
     table_url.hash(&mut h);
@@ -3248,12 +3241,12 @@ pub struct StoredCertification {
 
 /// Wall-clock ms since the epoch.
 pub fn now_unix_ms() -> u64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
 }
 
 /// How long ago `granted_unix_ms` was, or `None` if it is in the future.
-pub fn age_since(granted_unix_ms: u64) -> Option<std::time::Duration> {
-    now_unix_ms().checked_sub(granted_unix_ms).map(std::time::Duration::from_millis)
+pub fn age_since(granted_unix_ms: u64) -> Option<Duration> {
+    now_unix_ms().checked_sub(granted_unix_ms).map(Duration::from_millis)
 }
 
 // ===== dirty_bin_queue =====
@@ -3318,11 +3311,7 @@ pub fn store_sidecar<T: Serialize>(data_dir: &std::path::Path, (file, what): (&s
             .and_then(|()| serde_json::to_vec(items).map_err(std::io::Error::other))
             .and_then(|bytes| crate::write::wal::write_atomic_with(&path, false, |f| f.write_all(&bytes)))
     });
-    if let Err(error) = result {
-        warn!(%error, "failed to persist {what}");
-        return false;
-    }
-    true
+    result.inspect_err(|error| warn!(%error, "failed to persist {what}")).is_ok()
 }
 
 /// Sidecar file names, paired with the label their warnings use.
@@ -3476,12 +3465,12 @@ enum VersionedStoredCoverage {
 /// sidecar on every mutation (never only on shutdown).
 #[derive(Debug)]
 pub struct JsonCoverageLedger {
-    data_dir: std::path::PathBuf,
-    cells: dashmap::DashMap<CoverageCell, Vec<CoverageEntry>>,
+    data_dir: PathBuf,
+    cells: DashMap<CoverageCell, Vec<CoverageEntry>>,
 }
 
 impl JsonCoverageLedger {
-    pub fn load(data_dir: impl Into<std::path::PathBuf>) -> Self {
+    pub fn load(data_dir: impl Into<PathBuf>) -> Self {
         let data_dir = data_dir.into();
         let cells = load_sidecar::<VersionedStoredCoverage>(&data_dir, ROLLUP_COVERAGE)
             .into_iter()
@@ -3503,7 +3492,7 @@ impl JsonCoverageLedger {
             })
             .collect();
         if !store_sidecar(&self.data_dir, ROLLUP_COVERAGE, &rows) {
-            crate::observability::maintenance_stats().coverage_ledger_persist_failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            crate::observability::maintenance_stats().coverage_ledger_persist_failures.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -3761,51 +3750,48 @@ mod dedup_proof_version_tests {
     }
 }
 
+use deltalake::datafusion::parquet::{
+    arrow::{arrow_reader::ArrowReaderOptions, async_reader::AsyncFileReader},
+    errors::{ParquetError, Result as ParquetResult},
+    file::metadata::{ParquetMetaData, ParquetMetaDataReader},
+};
+use futures::{FutureExt, future::BoxFuture};
+
 /// Parquet `AsyncFileReader` over an object of known size. Arrow 59.3 deprecated
 /// `ParquetObjectReader` in favour of implementing the trait directly.
 #[derive(Clone, Debug)]
 pub struct ObjectStoreReader {
     store: Arc<dyn ObjectStore>,
-    path: object_store::path::Path,
+    path: Path,
     file_size: u64,
 }
 
 impl ObjectStoreReader {
-    pub fn new(store: Arc<dyn ObjectStore>, path: object_store::path::Path, file_size: u64) -> Self {
+    pub fn new(store: Arc<dyn ObjectStore>, path: Path, file_size: u64) -> Self {
         Self { store, path, file_size }
     }
 }
 
-impl deltalake::datafusion::parquet::arrow::async_reader::AsyncFileReader for ObjectStoreReader {
-    fn get_bytes(&mut self, range: std::ops::Range<u64>) -> futures::future::BoxFuture<'_, deltalake::datafusion::parquet::errors::Result<bytes::Bytes>> {
-        use futures::FutureExt;
-        async move {
-            object_store::ObjectStoreExt::get_range(self.store.as_ref(), &self.path, range)
-                .await
-                .map_err(|e| deltalake::datafusion::parquet::errors::ParquetError::External(Box::new(e)))
-        }
-        .boxed()
+fn external(e: object_store::Error) -> ParquetError {
+    ParquetError::External(Box::new(e))
+}
+
+impl AsyncFileReader for ObjectStoreReader {
+    fn get_bytes(&mut self, range: Range<u64>) -> BoxFuture<'_, ParquetResult<Bytes>> {
+        async move { ObjectStoreExt::get_range(self.store.as_ref(), &self.path, range).await.map_err(external) }.boxed()
     }
 
-    fn get_byte_ranges(
-        &mut self, ranges: Vec<std::ops::Range<u64>>,
-    ) -> futures::future::BoxFuture<'_, deltalake::datafusion::parquet::errors::Result<Vec<bytes::Bytes>>> {
-        use futures::FutureExt;
-        async move { self.store.get_ranges(&self.path, &ranges).await.map_err(|e| deltalake::datafusion::parquet::errors::ParquetError::External(Box::new(e))) }
-            .boxed()
+    fn get_byte_ranges(&mut self, ranges: Vec<Range<u64>>) -> BoxFuture<'_, ParquetResult<Vec<Bytes>>> {
+        async move { self.store.get_ranges(&self.path, &ranges).await.map_err(external) }.boxed()
     }
 
-    fn get_metadata<'a>(
-        &'a mut self, options: Option<&'a deltalake::datafusion::parquet::arrow::arrow_reader::ArrowReaderOptions>,
-    ) -> futures::future::BoxFuture<'a, deltalake::datafusion::parquet::errors::Result<Arc<deltalake::datafusion::parquet::file::metadata::ParquetMetaData>>>
-    {
-        use deltalake::datafusion::parquet::file::metadata::ParquetMetaDataReader;
-        use futures::FutureExt;
+    fn get_metadata<'a>(&'a mut self, options: Option<&'a ArrowReaderOptions>) -> BoxFuture<'a, ParquetResult<Arc<ParquetMetaData>>> {
         async move {
-            let mut reader = ParquetMetaDataReader::new().with_metadata_options(options.map(|o| o.metadata_options().clone()));
-            if let Some(options) = options {
-                reader = reader.with_column_index_policy(options.column_index_policy()).with_offset_index_policy(options.offset_index_policy());
-            }
+            let reader = ParquetMetaDataReader::new().with_metadata_options(options.map(|o| o.metadata_options().clone()));
+            let reader = match options {
+                Some(o) => reader.with_column_index_policy(o.column_index_policy()).with_offset_index_policy(o.offset_index_policy()),
+                None => reader,
+            };
             let file_size = self.file_size;
             Ok(Arc::new(reader.load_and_finish(self, file_size).await?))
         }
