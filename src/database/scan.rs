@@ -150,11 +150,14 @@ impl ProjectRoutingTable {
     }
 
     fn bounded_otel_scan_reason(&self, filters: &[Expr], limit: Option<usize>) -> Option<&'static str> {
-        // Flattened for both checks: `is_bounding_predicate` and the `date =` fallback inside
-        // `filters_time_range` look only at top-level conjuncts.
+        Self::raw_otel_scan_reason(&self.table_name, filters, limit, Self::scan_is_bounded(filters))
+    }
+
+    /// Flattened for both checks: `is_bounding_predicate` and the `date =` fallback inside
+    /// `filters_time_range` look only at top-level conjuncts.
+    pub(crate) fn scan_is_bounded(filters: &[Expr]) -> bool {
         let conjuncts: Vec<Expr> = filters.iter().flat_map(datafusion::logical_expr::utils::split_conjunction).cloned().collect();
-        let bounded = conjuncts.iter().any(Self::is_bounding_predicate) || filters_time_range(&conjuncts).is_some_and(|(lower, _)| lower != i64::MIN);
-        Self::raw_otel_scan_reason(&self.table_name, filters, limit, bounded)
+        conjuncts.iter().any(Self::is_bounding_predicate) || filters_time_range(&conjuncts).is_some_and(|(lower, _)| lower != i64::MIN)
     }
 
     /// Predicates that bound a scan but that `filters_time_range`

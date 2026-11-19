@@ -11843,6 +11843,15 @@ fn a_date_partition_or_between_predicate_counts_as_bounded(predicate: Expr) -> b
     ProjectRoutingTable::is_bounding_predicate(&predicate)
 }
 
+/// A combined `project_id = .. AND date = ..` must stay bounded under the OTel scan guard.
+/// `is_bounding_predicate` over the flattened conjuncts is what catches it.
+#[test_case(vec![col("project_id").eq(lit("p")).and(col("date").eq(lit("2026-11-01")))] => true ; "a date bound inside one AND still bounds")]
+#[test_case(vec![col("project_id").eq(lit("p")), col("date").eq(lit("2026-11-01"))] => true ; "a top-level date bound bounds")]
+#[test_case(vec![col("project_id").eq(lit("p"))] => false ; "a project alone bounds nothing")]
+fn a_scan_bound_is_found_inside_a_conjunction(filters: Vec<Expr>) -> bool {
+    ProjectRoutingTable::scan_is_bounded(&filters)
+}
+
 #[test_case("otel_logs_and_spans", vec![], None, false => Some("missing exact project_id filter") ; "no filters at all")]
 #[test_case("otel_logs_and_spans", vec![col("project_id").eq(lit("project"))], None, false
         => Some("missing timestamp lower bound or scan limit") ; "a project alone is unbounded")]
