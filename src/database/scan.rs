@@ -110,12 +110,17 @@ impl ProjectRoutingTable {
         filters.iter().find_map(crate::read::optimizers::extract_project_id_from_expr)
     }
 
+    /// The filtered project, else the default one.
+    fn project_of(&self, filters: &[Expr]) -> String {
+        self.extract_project_id_from_filters(filters).unwrap_or_else(|| self.default_project.clone())
+    }
+
     /// The timestamp of the `n`-th newest match the search index holds for `filters`, the
     /// lower bound a newest-first page is narrowed to. `None` without an indexable predicate.
     pub(crate) async fn newest_match_bound(&self, filters: &[Expr], n: usize) -> Option<i64> {
-        let optimized = self.apply_time_series_optimizations(filters).ok()?;
+        let optimized = self.apply_time_series_optimizations(filters);
         let tree = crate::tantivy::udf::collect_text_match_tree(&optimized)?;
-        let project = self.extract_project_id_from_filters(&optimized).unwrap_or_else(|| self.default_project.clone());
+        let project = self.project_of(&optimized);
         let svc = self.database.tantivy_search()?;
         svc.nth_newest_timestamp(&self.table_name, &project, &tree, n, filters_time_range(&optimized)).await.ok().flatten()
     }
@@ -125,35 +130,34 @@ impl ProjectRoutingTable {
     /// file lacks them. Rows are physical (`num_records`), an estimate under deletion vectors.
     pub(crate) async fn file_spans(&self, filters: &[Expr], column: &str) -> Option<Vec<(i64, i64, usize)>> {
         use arrow::array::{Array, AsArray};
-        let project = self.extract_project_id_from_filters(filters).unwrap_or_else(|| self.default_project.clone());
+        let project = self.project_of(filters);
         let (lo, hi) = filters_time_range(filters).unwrap_or((i64::MIN, i64::MAX));
         let table = self.database.resolve_table(&project, &self.table_name).await.ok()?;
         let actions = table.read().await.snapshot().ok()?.snapshot().add_actions_table(true).ok()?;
         let records = actions.column_by_name("num_records")?.as_primitive_opt::<arrow::datatypes::Int64Type>()?.clone();
         let (min, max) =
             (crate::read::ts_micros_column(&actions, &format!("min.{column}"))?, crate::read::ts_micros_column(&actions, &format!("max.{column}"))?);
-        let projects = match actions.column_by_name("partition.project_id") {
-            Some(c) => Some(arrow::compute::cast(c, &arrow::datatypes::DataType::Utf8).ok()?),
-            None => None,
-        };
+        let projects = actions.column_by_name("partition.project_id").map(|c| arrow::compute::cast(c, &arrow::datatypes::DataType::Utf8)).transpose().ok()?;
         let projects = projects.as_ref().map(|c| c.as_string::<i32>());
         (0..actions.num_rows())
             .filter(|&r| projects.is_none_or(|p| p.is_valid(r) && p.value(r) == project))
             .map(|r| {
-                let span = (min.is_valid(r) && max.is_valid(r) && records.is_valid(r))
-                    .then(|| (min.value(r), max.value(r), usize::try_from(records.value(r)).unwrap_or(0)));
-                (span, r)
+                (min.is_valid(r) && max.is_valid(r) && records.is_valid(r))
+                    .then(|| (min.value(r), max.value(r), usize::try_from(records.value(r)).unwrap_or(0)))
             })
-            .filter(|(span, _)| span.is_none_or(|(a, b, _)| b >= lo && a <= hi))
-            .map(|(span, _)| span)
+            .filter(|span| span.is_none_or(|(a, b, _)| b >= lo && a <= hi))
             .collect()
     }
 
     fn bounded_otel_scan_reason(&self, filters: &[Expr], limit: Option<usize>) -> Option<&'static str> {
-        let conjuncts: Vec<&Expr> = filters.iter().flat_map(datafusion::logical_expr::utils::split_conjunction).collect();
-        let bounded = conjuncts.iter().any(|expr| Self::is_bounding_predicate(expr))
-            || filters_time_range(&conjuncts.into_iter().cloned().collect::<Vec<_>>()).is_some_and(|(lower, _)| lower != i64::MIN);
-        Self::raw_otel_scan_reason(&self.table_name, filters, limit, bounded)
+        Self::raw_otel_scan_reason(&self.table_name, filters, limit, Self::scan_is_bounded(filters))
+    }
+
+    /// Flattened for both checks: `is_bounding_predicate` and the `date =` fallback inside
+    /// `filters_time_range` look only at top-level conjuncts.
+    pub(crate) fn scan_is_bounded(filters: &[Expr]) -> bool {
+        let conjuncts: Vec<Expr> = filters.iter().flat_map(datafusion::logical_expr::utils::split_conjunction).cloned().collect();
+        conjuncts.iter().any(Self::is_bounding_predicate) || filters_time_range(&conjuncts).is_some_and(|(lower, _)| lower != i64::MIN)
     }
 
     /// Predicates that bound a scan but that `filters_time_range`
@@ -225,13 +229,8 @@ impl ProjectRoutingTable {
                         (Expr::Column(col), Expr::Literal(_, _)) | (Expr::Literal(_, _), Expr::Column(col)) if Self::is_pushdown_column(&col.name)
                     )
             }
-            // IS NULL/IS NOT NULL are exact
-            Expr::IsNull(inner) | Expr::IsNotNull(inner) => {
+            Expr::IsNull(inner) | Expr::IsNotNull(inner) | Expr::InList(datafusion::logical_expr::expr::InList { expr: inner, .. }) => {
                 matches!(inner.as_ref(), Expr::Column(col) if Self::is_pushdown_column(&col.name))
-            }
-            // IN lists are exact for pushdown columns
-            Expr::InList(in_list) => {
-                matches!(in_list.expr.as_ref(), Expr::Column(col) if Self::is_pushdown_column(&col.name))
             }
             _ => false,
         }
@@ -248,17 +247,17 @@ impl ProjectRoutingTable {
     }
 
     /// Apply time-series specific optimizations to filters
-    fn apply_time_series_optimizations(&self, filters: &[Expr]) -> DFResult<Vec<Expr>> {
+    fn apply_time_series_optimizations(&self, filters: &[Expr]) -> Vec<Expr> {
         use crate::read::optimizers::time_range_partition_pruner;
 
         // Falls back to "timestamp" when the schema isn't registered (custom tables).
-        let time_column = crate::schema::get_schema(&self.table_name).map(|s| s.time_column_name().to_string()).unwrap_or_else(|| "timestamp".to_string());
+        let time_column = crate::schema::get_schema(&self.table_name).map_or("timestamp", |s| s.time_column_name());
 
         let optimized_filters: Vec<Expr> = filters
             .iter()
             .cloned()
             .chain(filters.iter().flat_map(|filter| {
-                let date_filters = time_range_partition_pruner::timestamp_to_date_filters(filter, &time_column);
+                let date_filters = time_range_partition_pruner::timestamp_to_date_filters(filter, time_column);
                 if !date_filters.is_empty() {
                     debug!("Added {} date partition filter(s) for {} on column {}", date_filters.len(), self.table_name, time_column);
                 }
@@ -269,15 +268,9 @@ impl ProjectRoutingTable {
         if !crate::read::optimizers::ProjectIdPushdown::has_project_id_filter(&optimized_filters) {
             debug!("Query missing project_id filter - may scan all partitions");
         }
-
-        Ok(optimized_filters)
+        optimized_filters
     }
 
-    /// Create a MemorySourceConfig-based execution plan with multiple partitions.
-    ///
-    /// `sorted` is the caller's claim that every partition is already ordered by
-    /// the table's declared `sorting_columns`; declaring it is what stops a
-    /// blocking `SortExec` being injected over this leg.
     /// Table columns the in-memory leg must carry: the projection plus the sorting columns and
     /// `timestamp`, ascending. `None` = every column. Copying only these is what makes the leg's
     /// filter and sort cheap on a ~90-column table.
@@ -288,6 +281,11 @@ impl ProjectRoutingTable {
         (keep.len() < self.schema.fields().len()).then_some(keep)
     }
 
+    /// Create a MemorySourceConfig-based execution plan with multiple partitions.
+    ///
+    /// `sorted` is the caller's claim that every partition is already ordered by
+    /// the table's declared `sorting_columns`; declaring it is what stops a
+    /// blocking `SortExec` being injected over this leg.
     /// `keep`: the table columns `partitions` were narrowed to, ascending; `projection` is
     /// still in table-schema indices and is remapped onto them.
     fn create_memory_exec(
@@ -350,7 +348,7 @@ impl ProjectRoutingTable {
         &self, table: &DeltaTable, state: &dyn Session, projection: Option<&Vec<usize>>, filters: &[Expr], limit: Option<usize>,
         include_files: Option<&HashSet<String>>, exclude_files: Option<&HashSet<String>>, row_selections: Option<&HashMap<String, Vec<u64>>>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        let project_id = self.extract_project_id_from_filters(filters).unwrap_or_else(|| self.default_project.clone());
+        let project_id = self.project_of(filters);
         let cache_key = (project_id, self.table_name.clone());
 
         table.update_datafusion_session(state).map_err(|e| DataFusionError::External(Box::new(e)))?;
@@ -481,11 +479,12 @@ impl ProjectRoutingTable {
                 // (BinaryView), which mismatches our Binary-typed MemBuffer at the
                 // union and panics in physical planning. DV pushdown is safe here
                 // because this is a READ-ONLY scan (DV writes need row positions).
-                let result = if let Some(ss) = session_state {
-                    table.table_provider().with_session(Arc::new(ss)).with_pushdown_with_deletion_vectors(true).await
-                } else {
-                    table.table_provider().with_pushdown_with_deletion_vectors(true).await
-                };
+                let builder = table.table_provider().with_pushdown_with_deletion_vectors(true);
+                let result = match session_state {
+                    Some(ss) => builder.with_session(Arc::new(ss)),
+                    None => builder,
+                }
+                .await;
                 metrics::counter!(scan_metric_names::PROVIDER_BUILD_TOTAL).increment(1);
                 metrics::counter!(scan_metric_names::PROVIDER_BUILD_US_TOTAL).increment(started.elapsed().as_micros() as u64);
                 result.map_err(|e| DataFusionError::External(Box::new(e)))
@@ -511,6 +510,7 @@ impl ProjectRoutingTable {
     async fn mutable_candidate_timestamps(
         &self, state: &dyn Session, project_id: &str, filters: &[Expr], membership: &crate::tantivy::histogram::Membership, (lo, hi): (i64, i64),
     ) -> DFResult<Option<HashSet<i64>>> {
+        use arrow::array::AsArray;
         use datafusion::physical_plan::filter::FilterExec;
         let Some(predicate) = filters.iter().cloned().reduce(Expr::and) else { return Ok(None) };
         let svc = self.database.tantivy_search().ok_or_else(|| DataFusionError::Internal("no tantivy".into()))?;
@@ -524,13 +524,8 @@ impl ProjectRoutingTable {
         let collect_matching = |batch: &RecordBatch, found: &mut HashSet<i64>| -> DFResult<bool> {
             let schema = datafusion::common::DFSchema::try_from(batch.schema().as_ref().clone())?;
             let mask = state.create_physical_expr(predicate.clone(), &schema)?.evaluate(batch)?.into_array(batch.num_rows())?;
-            let mask =
-                mask.as_any().downcast_ref::<arrow::array::BooleanArray>().ok_or_else(|| DataFusionError::Internal("candidate mask is not boolean".into()))?;
-            let ts = arrow::compute::cast(
-                batch.column_by_name("timestamp").ok_or_else(|| DataFusionError::Internal("no timestamp".into()))?,
-                &arrow::datatypes::DataType::Int64,
-            )?;
-            let ts = ts.as_any().downcast_ref::<arrow::array::Int64Array>().expect("cast to Int64");
+            let mask = mask.as_boolean_opt().ok_or_else(|| DataFusionError::Internal("candidate mask is not boolean".into()))?;
+            let ts = timestamps_i64(batch)?;
             Ok(extend_candidate_timestamps(found, (0..batch.num_rows()).filter(|&i| mask.is_valid(i) && mask.value(i) && ts.is_valid(i)).map(|i| ts.value(i))))
         };
         if let Some(layer) = self.database.buffered_layer() {
@@ -574,11 +569,11 @@ impl ProjectRoutingTable {
             let columns: Vec<usize> = predicate
                 .column_refs()
                 .into_iter()
-                .map(|c| c.name.clone())
-                .chain(std::iter::once("timestamp".to_string()))
-                .collect::<HashSet<_>>()
-                .into_iter()
-                .filter_map(|name| self.schema.index_of(&name).ok())
+                .map(|c| c.name.as_str())
+                .chain(["timestamp"])
+                .filter_map(|name| self.schema.index_of(name).ok())
+                .sorted_unstable()
+                .dedup()
                 .collect();
             let plan = self.scan_delta_table(&table, state, Some(&columns), filters, None, Some(&raw), None, None).await?;
             let schema = datafusion::common::DFSchema::try_from(plan.schema().as_ref().clone())?;
@@ -678,15 +673,14 @@ impl ProjectRoutingTable {
         // defeated by several at once.
         metrics::counter!(scan_metric_names::TANTIVY_SCAN_CALLS).increment(1);
         metrics::counter!(scan_metric_names::TANTIVY_RAW_FILES).increment(raw.len() as u64);
-        for (defeated, name) in [
+        [
             (!raw.is_empty(), scan_metric_names::TANTIVY_SPLIT_RAW),
             (bloom_pruned_any, scan_metric_names::TANTIVY_SPLIT_BLOOM),
             (date_restrict.is_some() || file_restrict.is_some(), scan_metric_names::TANTIVY_SPLIT_DATE),
-        ] {
-            if defeated {
-                metrics::counter!(name).increment(1);
-            }
-        }
+        ]
+        .into_iter()
+        .filter(|(defeated, _)| *defeated)
+        .for_each(|(_, name)| metrics::counter!(name).increment(1));
         // Complete coverage keeps the single-provider fast path; the split is only
         // needed when the snapshot has raw debt. Never under a date or file split: the
         // fast path reads every live file, so both sides would read everything.
@@ -741,7 +735,6 @@ impl ProjectRoutingTable {
         limit: Option<usize>, readmit_mutable_filters: bool, tantivy_id_filter: Option<&Expr>, tantivy_covered_files: Option<&HashSet<String>>,
         tantivy_exclude: Option<&HashSet<String>>, tantivy_row_selections: Option<&HashMap<String, Vec<u64>>>, bloom_rejected: Option<&HashSet<String>>,
     ) -> DFResult<(bool, Vec<Arc<dyn ExecutionPlan>>, Vec<Arc<dyn ExecutionPlan>>)> {
-        let mut delta_only_filters = optimized_filters.to_vec();
         let delta_table = self.database.resolve_table(project_id, &self.table_name).await?;
         let table = delta_table.read().await;
         let (verdict, certified_dates) = self.dedup_skip_certified(&table, project_id, query_time_range, dedup_keys);
@@ -757,14 +750,7 @@ impl ProjectRoutingTable {
         // Complement within the window: what the DedupExec leg must still read.
         // Uses the same `window_dates` enumeration as certification, so the two
         // sides provably partition the window's dates.
-        let uncertified_dates: HashSet<String> = query_time_range
-            .filter(|_| !per_date_dates.is_empty())
-            .and_then(|(lo, hi)| window_dates(lo, hi))
-            .into_iter()
-            .flatten()
-            .map(|d| d.to_string())
-            .filter(|d| !per_date_dates.contains(d))
-            .collect();
+        let uncertified_dates = window_dates_except(query_time_range, &per_date_dates);
         // Per-FILE split, tried only where the per-DATE one did not claim the
         // window: within an uncertified date, files a sweep proved clean can still
         // skip when no uncertified file overlaps them.
@@ -775,15 +761,16 @@ impl ProjectRoutingTable {
                 crate::observability::record_plan_phase(crate::observability::PlanPhase::ScanCertification, started);
                 split
             });
-        if skip_dedup && readmit_mutable_filters {
-            let mutable = Self::version_mutable_columns(&self.table_name);
-            delta_only_filters.extend(
+        let readmitted = (skip_dedup && readmit_mutable_filters).then(|| Self::version_mutable_columns(&self.table_name));
+        let delta_only_filters: Vec<Expr> = optimized_filters
+            .iter()
+            .chain(readmitted.iter().flat_map(|mutable| {
                 unstripped_filters
                     .iter()
-                    .filter(|f| !Self::references_tombstone(&self.table_name, f) && !Self::version_safe(&self.table_name, mutable.as_ref(), f))
-                    .cloned(),
-            );
-        }
+                    .filter(move |f| !Self::references_tombstone(&self.table_name, f) && !Self::version_safe(&self.table_name, mutable.as_ref(), f))
+            }))
+            .cloned()
+            .collect();
         // Restoring the pushed limit is only sound when nothing above the
         // scan drops rows — the tombstone filter does, regardless of dedup.
         let eff_limit = if skip_dedup && tombstone.is_none() { orig_limit } else { limit };
@@ -1028,9 +1015,9 @@ impl ProjectRoutingTable {
         let unstripped_filters: Vec<Expr> = filters.iter().filter(|f| !self.references_variant(f)).cloned().collect();
         let unstripped_filters = unstripped_filters.as_slice();
         let filters: Vec<Expr> = unstripped_filters.iter().filter(|f| Self::leg_safe(&self.table_name, mutable.as_ref(), f)).cloned().collect();
-        let mut optimized_filters = self.apply_time_series_optimizations(&filters)?;
+        let mut optimized_filters = self.apply_time_series_optimizations(&filters);
 
-        let project_id = self.extract_project_id_from_filters(&optimized_filters).unwrap_or_else(|| self.default_project.clone());
+        let project_id = self.project_of(&optimized_filters);
         span.record("table.project_id", project_id.as_str());
 
         // Tantivy prefilter, two independent paths: the Delta side builds `id IN (delta_ids)`
@@ -1038,7 +1025,7 @@ impl ProjectRoutingTable {
         // drop valid rows); the MemBuffer side prefilters under its own bucket lock. The tree
         // comes from the unstripped filters: mutable predicates must be detected, and a Variant
         // column's `text_match` never reaches the legs.
-        let text_match_tree = crate::tantivy::udf::collect_text_match_tree(&self.apply_time_series_optimizations(routed_filters)?);
+        let text_match_tree = crate::tantivy::udf::collect_text_match_tree(&self.apply_time_series_optimizations(routed_filters));
         // Query [lo,hi] timestamp window, shared by the tantivy prefilter and the skip-delta
         // watermark check below.
         let query_time_range = filters_time_range(&optimized_filters);
@@ -1051,17 +1038,6 @@ impl ProjectRoutingTable {
                 .flat_map(|t| t.dedup_keys.iter().cloned().chain(t.sorting_columns.iter().map(|c| c.name.clone())));
             self.database.read_activity.record(&self.table_name, &project_id, projected.chain(filtered).chain(keys));
         }
-        let mut tantivy_id_filter: Option<Expr> = None;
-        // When index coverage is partial, indexed and raw files are read as separate Delta legs.
-        // Only the indexed leg receives the narrowing id-set; uncovered files retain the
-        // original predicate and therefore cannot lose rows.
-        let mut tantivy_covered_files: Option<HashSet<String>> = None;
-        // Files the prefilter proved hold no matches (zero-hit covering
-        // index) — excluded from the Delta scan when file pruning is on.
-        let mut tantivy_exclude: Option<HashSet<String>> = None;
-        // Per-file matching row ordinals (row-selection pushdown), for files
-        // whose covering index was built in parquet row order.
-        let mut tantivy_row_selections: Option<HashMap<String, Vec<u64>>> = None;
         // File-level needle pruning: table-relative paths the resident bloom registry proves
         // cannot contain the query's equality/IN needles. Memory-only consult — a cold registry
         // prunes nothing. Unlike zero_hit_files this must reach the RAW leg too.
@@ -1077,7 +1053,17 @@ impl ProjectRoutingTable {
             (!rejected.is_empty()).then_some(rejected)
         })();
         let tantivy_started = std::time::Instant::now();
-        if let Some(tree) = text_match_tree.as_ref()
+        // What the prefilter proved, all `None` when it did not run:
+        // - the `id IN (..)` narrowing. When index coverage is partial, indexed and raw files are
+        //   read as separate Delta legs; only the indexed leg receives it, so uncovered files
+        //   retain the original predicate and cannot lose rows.
+        // - the covered files, split against the snapshot taken at scan construction: a flush or
+        //   compaction can commit in between.
+        // - files proved to hold no matches (zero-hit covering index), excluded when file pruning is on.
+        // - per-file matching row ordinals (row-selection pushdown), for files whose covering
+        //   index was built in parquet row order.
+        type Narrowing = (Option<Expr>, Option<HashSet<String>>, Option<HashSet<String>>, Option<HashMap<String, Vec<u64>>>);
+        let (tantivy_id_filter, tantivy_covered_files, tantivy_exclude, tantivy_row_selections): Narrowing = if let Some(tree) = text_match_tree.as_ref()
             && let Some(svc) = self.database.tantivy_search()
         {
             let tcfg = &self.database.config().tantivy;
@@ -1086,12 +1072,13 @@ impl ProjectRoutingTable {
             crate::observability::record_tantivy_prefilter_attempt();
             metrics::counter!(scan_metric_names::PREFILTER_ATTEMPTS).increment(1);
 
-            let skip = |reason: &'static str| {
+            let skip = |reason: &'static str| -> Narrowing {
                 record_prefilter_skip(reason);
                 debug!("Tantivy prefilter skipped for {}/{}: {}", project_id, self.table_name, reason);
+                Default::default()
             };
             if query_time_range.is_some_and(|(lo, hi)| hi.saturating_sub(lo) < PREFILTER_MIN_WINDOW_MICROS) {
-                skip("narrow_window");
+                skip("narrow_window")
             } else {
                 // ONE pass over the in-window index set: the predicate tree compiles to a single
                 // tantivy BooleanQuery per index (And→Must, Or→Should), hits unioned across indexes
@@ -1123,23 +1110,20 @@ impl ProjectRoutingTable {
                         PrefilterDecision::Used { ids, covered_files, exclude_files, row_selections } => {
                             crate::observability::record_tantivy_prefilter_used();
                             metrics::counter!(scan_metric_names::PREFILTER_USED).increment(1);
-                            tantivy_id_filter = Some(col("id").in_list(ids.into_iter().map(lit).collect(), false));
-                            // Carry the coverage set forward and split against the snapshot taken at
-                            // scan construction: a flush or compaction can commit in between.
-                            tantivy_covered_files = Some(covered_files);
-                            tantivy_exclude = exclude_files;
-                            tantivy_row_selections = row_selections;
+                            (Some(col("id").in_list(ids.into_iter().map(lit).collect(), false)), Some(covered_files), exclude_files, row_selections)
                         }
                     },
                     Ok(Err(reason)) => skip(reason),
                     Err(e) => {
                         warn!("tantivy search failed for {}/{}: {:#} — falling back to full scan", project_id, self.table_name, e);
                         crate::observability::record_tantivy_prefilter_error();
-                        skip("delta_error");
+                        skip("delta_error")
                     }
                 }
             }
-        }
+        } else {
+            Default::default()
+        };
         // Membership in a mutable list stays above the dedup, so it reads every version in the
         // window. All versions of a row share its timestamp (a dedup key): restricting EVERY leg
         // to the timestamps where some version matches keeps each candidate key whole for
@@ -1153,7 +1137,7 @@ impl ProjectRoutingTable {
                 .filter(|m| m.columns().iter().any(|c| mutable.contains(*c)))
                 .reduce(|a, b| crate::tantivy::histogram::Membership::And(Box::new(a), Box::new(b)))
         {
-            let unstripped = self.apply_time_series_optimizations(unstripped_filters)?;
+            let unstripped = self.apply_time_series_optimizations(unstripped_filters);
             match self.mutable_candidate_timestamps(state, &project_id, &unstripped, &membership, window).await {
                 Ok(Some(candidates)) => {
                     metrics::counter!(scan_metric_names::PREFILTER_MUTABLE_CANDIDATES).increment(1);
@@ -1194,7 +1178,7 @@ impl ProjectRoutingTable {
             false => self
                 .database
                 .try_fast_resolve(&project_id, &self.table_name)
-                .and_then(|t| t.try_read().ok().map(|table| self.dedup_skip_allowed(&table, &project_id, query_time_range, &dedup_keys)))
+                .and_then(|t| t.try_read().ok().map(|table| self.dedup_skip_certified(&table, &project_id, query_time_range, &dedup_keys).0))
                 // A resolve miss is its own denial reason (cold provider cache), not an
                 // uncertified partition.
                 .unwrap_or(DedupSkipVerdict::Unresolved),
@@ -1285,54 +1269,50 @@ impl ProjectRoutingTable {
                     })
                     .collect();
                 let dedup_on = !dedup_keys.is_empty() && !shape.skip_dedup;
-                let mut plans = legs;
                 // Merge-on-read prerequisite: keep-greatest only engages while the input still
                 // declares an ordering on the leading dedup key, so the in-memory legs are
                 // sorted up to the Delta leg's footer ordering and merged explicitly. The SPM
                 // is built HERE, not left to EnforceDistribution — DedupExec declares no
                 // required input ordering, so EnforceSorting would delete the injected sorts.
                 // Gated on `version_append` so non-MOR scans pay no sort.
-                let mut merge_req = None;
                 // A table whose sort leads with a non-i64 column may still hold days written under an
                 // earlier order (see `layout_runs`), so it takes its requirement from what the Delta
                 // leg declares; a timestamp-led table keeps the schema's.
                 let leg_requirement = || {
-                    let delta = plans.iter().zip(&leg_sortable).find(|(_, sortable)| !**sortable)?.0;
+                    let delta = legs.iter().zip(&leg_sortable).find(|(_, sortable)| !**sortable)?.0;
                     let declared = delta.properties().output_ordering()?.iter().cloned();
                     Self::keep_greatest_requirement(declared, &dedup_keys, &delta.schema())
                 };
-                if dedup_on
-                    && table_schema.is_some_and(|t| t.version_append)
-                    && let Some(req) = plans.first().and_then(|p| {
-                        let schema_req = table_schema.and_then(|t| Self::keep_greatest_ordering(t, &p.schema()))?;
-                        Some(match schema_req.len() > 1 {
-                            true => leg_requirement().unwrap_or(schema_req),
-                            false => schema_req,
-                        })
+                let req = legs.first().filter(|_| dedup_on && table_schema.is_some_and(|t| t.version_append)).and_then(|p| {
+                    let schema_req = table_schema.and_then(|t| Self::keep_greatest_ordering(t, &p.schema()))?;
+                    Some(match schema_req.len() > 1 {
+                        true => leg_requirement().unwrap_or(schema_req),
+                        false => schema_req,
                     })
-                {
+                });
+                let (plans, merge_req) = match req {
                     // Per-leg sortability: the DELTA leg is NEVER sortable — MOR UPDATEs make
                     // files overlap and a read-time SortExec over them exhausts the query pool;
                     // footer-less files need REPAIR, not read-time sorting. `ordered_children`
                     // bails whenever an unsortable leg misses `req`, so a Delta sort is
                     // structurally impossible here. The in-memory legs ARE sortable.
-                    match crate::read::optimizers::ordered_children(&plans, &req, None, &leg_sortable, false)? {
-                        Some(ordered) => {
-                            plans = ordered;
-                            merge_req = Some(req);
-                        }
+                    Some(req) => match crate::read::optimizers::ordered_children(&legs, &req, None, &leg_sortable, false)? {
+                        Some(ordered) => (ordered, Some(req)),
                         // `None` is either "every leg already satisfies `req`" (merge anyway)
                         // or "an unsortable leg doesn't" (bail; keep-greatest stays dormant and
                         // keep-first is still sound).
                         None => {
-                            let all = plans
+                            let satisfied = legs
                                 .iter()
                                 .map(|p| p.properties().equivalence_properties().ordering_satisfy(req.iter().cloned()))
-                                .collect::<DFResult<Vec<_>>>()?;
-                            merge_req = all.iter().all(|&s| s).then_some(req);
+                                .collect::<DFResult<Vec<_>>>()?
+                                .into_iter()
+                                .all(|s| s);
+                            (legs, satisfied.then_some(req))
                         }
-                    }
-                }
+                    },
+                    None => (legs, None),
+                };
                 // `plans` is non-empty on every known path; erroring rather than indexing turns
                 // an impossible state into a failed query instead of a panicked one.
                 if plans.is_empty() {
@@ -1359,7 +1339,6 @@ impl ProjectRoutingTable {
                 };
                 finish(plan)
             };
-        let wrap_result = |legs: Vec<(Arc<dyn ExecutionPlan>, crate::read::LegKind)>| wrap_result_split(legs, Vec::new());
         // Both Delta-only exits are the same scan and the same bookkeeping; they differ only in
         // whether mutable filters are readmitted.
         let delta_only = async |readmit_mutable_filters: bool| -> DFResult<Arc<dyn ExecutionPlan>> {
@@ -1417,14 +1396,13 @@ impl ProjectRoutingTable {
                 Default::default()
             })
         };
-        let mut keep = self.mem_leg_columns(projection);
-        let mut mem_leg = scan_mem(keep.as_deref());
+        let narrow = self.mem_leg_columns(projection);
+        let narrowed = scan_mem(narrow.as_deref());
         // A batch too narrow to project comes back whole; a leg must have one shape.
-        if let Some(k) = &keep
-            && mem_leg.partitions.iter().flatten().any(|b| b.num_columns() != k.len())
-        {
-            (mem_leg, keep) = (scan_mem(None), None);
-        }
+        let (mem_leg, keep) = match narrow {
+            Some(k) if narrowed.partitions.iter().flatten().any(|b| b.num_columns() != k.len()) => (scan_mem(None), None),
+            narrow => (narrowed, narrow),
+        };
         metrics::counter!(scan_metric_names::MEM_PLAN_TOTAL).increment(1);
         metrics::counter!(scan_metric_names::MEM_PLAN_US_TOTAL).increment(mem_plan_started.elapsed().as_micros() as u64);
         crate::observability::record_plan_phase(crate::observability::PlanPhase::ScanMemLeg, mem_plan_started);
@@ -1458,20 +1436,24 @@ impl ProjectRoutingTable {
         if skip_delta {
             span.record("scan.skipped_delta", true);
             debug!("Skipping Delta scan - query time range entirely within MemBuffer for {}/{}", project_id, self.table_name);
-            return wrap_result(vec![(mem_plan, crate::read::LegKind::Mem)]);
+            return wrap_result_split(vec![(mem_plan, crate::read::LegKind::Mem)], Vec::new());
         }
 
         // Build Delta filters with per-bucket exclusion so the union doesn't double-count:
         // Delta excludes the mem row ranges where those legs are authoritative
         // (`get_bucket_ranges` skips open and force-flushed buckets, whose windows legitimately
         // straddle stores). MOR scans supply no exclusions: their union resolves row identities.
-        let mut delta_filters = optimized_filters.clone();
         let ts_us = |t: i64| lit(ScalarValue::TimestampMicrosecond(Some(t), Some("UTC".into())));
-        let ts_cmp = |op: Operator, t: i64| Expr::BinaryExpr(BinaryExpr { left: Box::new(col("timestamp")), op, right: Box::new(ts_us(t)) });
         // NOT (ts >= start AND ts < end)  ≡  (ts < start) OR (ts >= end)
-        delta_filters.extend(
-            crate::write::mem_buffer::merge_ranges(mem_ranges).into_iter().map(|(start, end)| ts_cmp(Operator::Lt, start).or(ts_cmp(Operator::GtEq, end))),
-        );
+        let delta_filters: Vec<Expr> = optimized_filters
+            .iter()
+            .cloned()
+            .chain(
+                crate::write::mem_buffer::merge_ranges(mem_ranges)
+                    .into_iter()
+                    .map(|(start, end)| col("timestamp").lt(ts_us(start)).or(col("timestamp").gt_eq(ts_us(end)))),
+            )
+            .collect();
         let resolve_span = tracing::trace_span!(parent: &span, "resolve_delta_table");
         // A query executed through a retained pgwire plan must still see a
         // committed ingest from another connection. `try_fast_resolve` opts
@@ -1498,14 +1480,7 @@ impl ProjectRoutingTable {
             }
             _ => HashSet::new(),
         };
-        let kept_dates: HashSet<String> = query_time_range
-            .filter(|_| !skip_dates.is_empty())
-            .and_then(|(lo, hi)| window_dates(lo, hi))
-            .into_iter()
-            .flatten()
-            .map(|date| date.to_string())
-            .filter(|date| !skip_dates.contains(date))
-            .collect();
+        let kept_dates = window_dates_except(query_time_range, &skip_dates);
         macro_rules! delta_side {
             ($dates:expr) => {
                 self.scan_delta_with_tantivy(
@@ -1549,7 +1524,7 @@ impl ProjectRoutingTable {
     async fn layout_runs(&self, filters: &[Expr]) -> Option<Vec<(i64, i64)>> {
         (!self.sort_led_by_time()).then_some(())?;
         let (lo, hi) = filters_time_range(filters)?;
-        let project_id = self.extract_project_id_from_filters(filters).unwrap_or_else(|| self.default_project.clone());
+        let project_id = self.project_of(filters);
         let table_ref = self.database.resolve_table(&project_id, &self.table_name).await.ok()?;
         let legacy: HashSet<String> = {
             let table = table_ref.read().await;
@@ -1795,10 +1770,6 @@ impl ProjectRoutingTable {
             }
         }
     }
-
-    fn dedup_skip_allowed(&self, table: &DeltaTable, project_id: &str, window: Option<(i64, i64)>, dedup_keys: &[String]) -> DedupSkipVerdict {
-        self.dedup_skip_certified(table, project_id, window, dedup_keys).0
-    }
 }
 
 /// The `(min, max)` window the filters admit, `None` when nothing bounds it.
@@ -1860,7 +1831,6 @@ pub(crate) fn filters_time_range(filters: &[Expr]) -> Option<(i64, i64)> {
 /// The micros span of a `date = <Date32>` equality, if the filters carry one.
 pub(crate) fn date_partition_window(filters: &[Expr]) -> Option<(i64, i64)> {
     use crate::read::optimizers::is_col_through_cast;
-    const DAY_MICROS: i64 = 86_400_000_000;
     filters.iter().find_map(|filter| {
         let Expr::BinaryExpr(BinaryExpr { left, op: Operator::Eq, right }) = filter else { return None };
         let literal = match (is_col_through_cast(left, "date"), is_col_through_cast(right, "date")) {
@@ -2252,14 +2222,16 @@ fn extend_candidate_timestamps(found: &mut HashSet<i64>, mut timestamps: impl It
     !timestamps.any(|ts| found.insert(ts) && found.len() > MAX_CANDIDATE_TIMESTAMPS)
 }
 
+/// The batch's `timestamp` column as raw micros.
+fn timestamps_i64(batch: &RecordBatch) -> DFResult<arrow::array::Int64Array> {
+    use arrow::array::AsArray;
+    let ts = batch.column_by_name("timestamp").ok_or_else(|| DataFusionError::Internal("no timestamp".into()))?;
+    Ok(arrow::compute::cast(ts, &arrow::datatypes::DataType::Int64)?.as_primitive::<arrow::datatypes::Int64Type>().clone())
+}
+
 async fn collect_candidate_timestamps(mut stream: SendableRecordBatchStream, found: &mut HashSet<i64>) -> DFResult<bool> {
     while let Some(batch) = stream.try_next().await? {
-        let ts = arrow::compute::cast(
-            batch.column_by_name("timestamp").ok_or_else(|| DataFusionError::Internal("no timestamp".into()))?,
-            &arrow::datatypes::DataType::Int64,
-        )?;
-        let ts = ts.as_any().downcast_ref::<arrow::array::Int64Array>().expect("cast to Int64");
-        if !extend_candidate_timestamps(found, ts.iter().flatten()) {
+        if !extend_candidate_timestamps(found, timestamps_i64(&batch)?.iter().flatten()) {
             return Ok(false);
         }
     }
@@ -2533,6 +2505,18 @@ impl TableProvider for ProjectRoutingTable {
         crate::observability::record_plan_phase(crate::observability::PlanPhase::TableScan, started);
         plan
     }
+}
+
+/// The window's dates outside `skipped`; empty when nothing is skipped (no split).
+fn window_dates_except(window: Option<(i64, i64)>, skipped: &HashSet<String>) -> HashSet<String> {
+    window
+        .filter(|_| !skipped.is_empty())
+        .and_then(|(lo, hi)| window_dates(lo, hi))
+        .into_iter()
+        .flatten()
+        .map(|date| date.to_string())
+        .filter(|date| !skipped.contains(date))
+        .collect()
 }
 
 /// Earliest timestamp among the mem leg's rows; `i64::MIN` (no date can skip) when a

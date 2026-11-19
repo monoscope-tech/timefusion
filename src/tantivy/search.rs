@@ -110,20 +110,6 @@ impl SearchStats {
     }
 }
 
-/// `timed` as an RAII guard, so a phase with early returns is charged on every
-/// exit path, not just the happy one.
-struct TimedPhase<'a> {
-    count: &'a AtomicU64,
-    micros: &'a AtomicU64,
-    started: Instant,
-}
-
-impl Drop for TimedPhase<'_> {
-    fn drop(&mut self) {
-        SearchStats::timed(self.count, self.micros, self.started);
-    }
-}
-
 #[derive(Debug)]
 pub struct SearchResult {
     pub hits: Vec<Hit>,
@@ -145,7 +131,7 @@ pub struct SearchResult {
 pub struct HistogramFile<'a> {
     pub table_root: &'a url::Url,
     pub manifest_key: &'a str,
-    pub entry: &'a crate::tantivy::ManifestEntry,
+    pub entry: &'a ManifestEntry,
     pub source_file: &'a str,
     pub visible: arrow::buffer::BooleanBuffer,
 }
@@ -388,7 +374,7 @@ impl TantivySearchService {
         crate::support::without_blocking_the_worker(|| window.has_physical_matches(&searcher, membership.query(&index.schema(), &entry.entry.element_fields)?))
     }
 
-    async fn histogram_reader(&self, table: &str, project_id: &str, key: &str, entry: &super::ManifestEntry) -> Result<(Index, tantivy::Searcher)> {
+    async fn histogram_reader(&self, table: &str, project_id: &str, key: &str, entry: &ManifestEntry) -> Result<(Index, tantivy::Searcher)> {
         anyhow::ensure!(entry.schema_version == SCHEMA_VERSION && entry.error.is_none(), "histogram index is not usable");
         anyhow::ensure!(entry.ordinals_valid && entry.covered_files.len() == 1, "histogram requires physical single-file coverage");
         let blob = entry.index.as_deref().context("histogram index is missing")?;
@@ -483,29 +469,27 @@ impl TantivySearchService {
         // Coverage ignores the time-prune below: a pruned entry still covers its
         // file, its rows are merely out of window (see SearchResult docs).
         let mut covered_files: HashSet<String> = current().filter(|(_, e)| usable_entry(e)).flat_map(|(_, e)| e.covered_files.iter().cloned()).collect();
-        // Time-prune: skip indexes whose timestamp span can't overlap the query
-        // window (no blob download). Conservative on unknown bounds.
         // Work item: (manifest key, blob_path, rows, entry covered_files, ordinals_valid, window, bundle_head).
-        // `window` is set only when the entry's span sticks out of the query window.
         let mut work: Vec<_> = current()
             .filter_map(|(key, e)| {
-                let blob_path = e.index.as_ref().filter(|_| entry_overlaps(e.min_timestamp_micros, e.max_timestamp_micros, time_range))?;
-                let window =
-                    time_range.filter(|&(lo, hi)| !(e.min_timestamp_micros.is_some_and(|m| m >= lo) && e.max_timestamp_micros.is_some_and(|m| m <= hi)));
-                Some((key.clone(), blob_path.clone(), e.rows, e.covered_files.clone(), e.ordinals_valid && e.covered_files.len() == 1, window, e.bundle_head))
+                let (blob_path, window) = windowed_blob(e, time_range)?;
+                Some((
+                    key.clone(),
+                    blob_path.to_string(),
+                    e.rows,
+                    e.covered_files.clone(),
+                    e.ordinals_valid && e.covered_files.len() == 1,
+                    window,
+                    e.bundle_head,
+                ))
             })
             .collect();
         if !wait_for_cold {
             let cold;
-            let range_reads = self.config.range_reads();
-            (work, cold) = work.into_iter().partition(|(key, blob, .., bundle)| {
-                (range_reads && bundle.is_some()) || has_any_segment(&self.cache_dir(table, project_id, file_uuid(key), blob))
-            });
+            (work, cold) = work.into_iter().partition(|(key, blob, .., bundle)| self.is_warm(table, project_id, key, blob, *bundle));
             if !cold.is_empty() {
                 // All-or-nothing here made one cold day of a 30-day window full-scan all 30.
-                for (.., covered, _, _, _) in &cold {
-                    covered.iter().for_each(|file| _ = covered_files.remove(file));
-                }
+                cold.iter().flat_map(|(_, _, _, covered, ..)| covered).for_each(|file| _ = covered_files.remove(file));
                 SearchStats::add(&self.stats.cold_indexes_left_raw, cold.len() as u64);
                 self.warm_in_background(table, project_id, cold.into_iter().map(|(key, blob, .., bundle)| (key, blob, bundle.is_none())).collect());
                 if work.is_empty() {
@@ -519,14 +503,14 @@ impl TantivySearchService {
         SearchStats::add(&self.stats.queries, 1);
         SearchStats::add(&self.stats.indexes_searched, work.len() as u64);
         SearchStats::timed(&self.stats.plans, &self.stats.plan_us, plan_started);
-        let _fanout = TimedPhase { count: &self.stats.fanouts, micros: &self.stats.fanout_us, started: Instant::now() };
+        // A guard, so the fan-out is charged on every early return too.
+        let _fanout = scopeguard::guard(Instant::now(), |started| SearchStats::timed(&self.stats.fanouts, &self.stats.fanout_us, started));
         // One count budget for the whole fan-out: once the in-flight counts pass the cap the
         // result is refused anyway, so no further index materializes hits.
         let counted = &Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut tasks = futures::stream::iter(work.into_iter().map(|(key, blob_path, rows, entry_covered, ordinals_valid, window, bundle)| async move {
-            let file_uuid = file_uuid(&key);
             let prepare_started = Instant::now();
-            let opened = self.open_index(table, project_id, file_uuid, &blob_path, bundle).await?;
+            let opened = self.open_index(table, project_id, file_uuid(&key), &blob_path, bundle).await?;
             let bundled = reads_by_range(&opened);
             // The rest is synchronous, CPU-bound tantivy work that yields nowhere. On a
             // blocking thread of its own, not `block_in_place`: that parks this whole fan-out
@@ -536,8 +520,8 @@ impl TantivySearchService {
                 let running = me.stats.parallel_searches.fetch_add(1, Ordering::Relaxed) + 1;
                 me.stats.parallel_searches_peak.fetch_max(running, Ordering::Relaxed);
                 let _running = scopeguard::guard((), |()| _ = me.stats.parallel_searches.fetch_sub(1, Ordering::Relaxed));
-                let file_uuid = super::search::file_uuid(&key);
-                let (index, reader) = me.opened(opened).with_context(|| format!("open index {file_uuid}"))?;
+                let uuid = file_uuid(&key);
+                let (index, reader) = me.opened(opened).with_context(|| format!("open index {uuid}"))?;
                 SearchStats::timed(&me.stats.prepares, &me.stats.prepare_us, prepare_started);
                 let started = Instant::now();
                 let out = match build_node_query(&index, &node)? {
@@ -545,7 +529,7 @@ impl TantivySearchService {
                     PredsQuery::Query(q) => {
                         let searcher = reader.searcher();
                         if bundled {
-                            super::hotcache::warm(&searcher, &*q).with_context(|| format!("warm index {file_uuid}"))?;
+                            super::hotcache::warm(&searcher, &*q).with_context(|| format!("warm index {uuid}"))?;
                         }
                         // Match and count only in-window docs: a sealed-day index spans the whole
                         // day, so its whole-index count overflows the cap for a few-hour fringe
@@ -559,9 +543,9 @@ impl TantivySearchService {
                             // row count only enlarges `indexed_rows`, which never hides a match.
                             Some(_) if searcher.search(&*q, &tantivy::collector::Count).map_err(|e| anyhow!("count: {e}"))? == 0 => (q, rows),
                             Some((lo, hi)) => {
-                                let range: Box<dyn Query> = Box::new(RangeQuery::new_i64_bounds(TS_FIELD.into(), Bound::Included(lo), Bound::Included(hi)));
+                                let range = ts_range(lo, hi);
                                 let in_window = searcher.search(&*range, &tantivy::collector::Count).map_err(|e| anyhow!("window count: {e}"))?;
-                                (Box::new(BooleanQuery::new(vec![(Occur::Must, q), (Occur::Must, range)])), in_window as u64)
+                                (Box::new(BooleanQuery::intersection(vec![q, range])), in_window as u64)
                             }
                         };
                         // Count-first: a per-index count over `max_hits` already
@@ -707,18 +691,14 @@ impl TantivySearchService {
     ) -> Result<(Vec<i64>, HashSet<String>)> {
         let m = self.load_manifest_cached(table, project_id, time_range.and_then(|(lo, hi)| crate::tantivy::shard_dates(lo, hi))).await?;
         let redundant = m.redundant_keys();
-        let range_reads = self.config.range_reads();
         let work: Vec<_> = m
             .entries
             .iter()
-            .filter(|(key, e)| e.schema_version == SCHEMA_VERSION && !redundant.contains(*key) && usable_entry(e))
+            .filter(|(key, e)| !redundant.contains(*key) && usable_entry(e))
             .filter_map(|(key, e)| {
-                let blob = e.index.as_ref().filter(|_| entry_overlaps(e.min_timestamp_micros, e.max_timestamp_micros, time_range))?;
-                let window =
-                    time_range.filter(|&(lo, hi)| !(e.min_timestamp_micros.is_some_and(|m| m >= lo) && e.max_timestamp_micros.is_some_and(|m| m <= hi)));
-                Some((key.clone(), blob.clone(), window, e.bundle_head, e.element_fields.clone(), e.covered_files.clone()))
+                let (blob, window) = windowed_blob(e, time_range).filter(|(blob, _)| self.is_warm(table, project_id, key, blob, e.bundle_head))?;
+                Some((key.clone(), blob.to_string(), window, e.bundle_head, e.element_fields.clone(), e.covered_files.clone()))
             })
-            .filter(|(key, blob, _, bundle, ..)| (range_reads && bundle.is_some()) || has_any_segment(&self.cache_dir(table, project_id, file_uuid(key), blob)))
             .collect();
         let found: Vec<(Vec<i64>, Vec<String>)> = futures::stream::iter(work.into_iter().map(|(key, blob, window, bundle, elements, covered)| {
             let query = query.clone();
@@ -735,10 +715,7 @@ impl TantivySearchService {
                     }
                     let q: Box<dyn Query> = match window {
                         None => q,
-                        Some((lo, hi)) => Box::new(BooleanQuery::new(vec![
-                            (Occur::Must, q),
-                            (Occur::Must, Box::new(RangeQuery::new_i64_bounds(TS_FIELD.into(), Bound::Included(lo), Bound::Included(hi)))),
-                        ])),
+                        Some((lo, hi)) => Box::new(BooleanQuery::intersection(vec![q, ts_range(lo, hi)])),
                     };
                     let top =
                         searcher.search(&*q, &TopDocs::with_limit(n).order_by_fast_field::<i64>(TS_FIELD, Order::Desc)).map_err(|e| anyhow!("newest: {e}"))?;
@@ -750,11 +727,8 @@ impl TantivySearchService {
         .buffer_unordered(self.config.search_concurrency())
         .try_collect()
         .await?;
-        Ok(found.into_iter().fold((Vec::new(), HashSet::new()), |(mut ts, mut files), (t, f)| {
-            ts.extend(t);
-            files.extend(f);
-            (ts, files)
-        }))
+        let (ts, files): (Vec<_>, Vec<_>) = found.into_iter().unzip();
+        Ok((ts.concat(), files.into_iter().flatten().collect()))
     }
 
     /// Warm the local disk cache with every blob whose data is at most `days`
@@ -805,12 +779,11 @@ impl TantivySearchService {
             tokio::spawn(async move {
                 let _queued = queued;
                 if let Ok(_warm) = me.warm_permits.acquire().await {
-                    let warmed = match tar_zst && me.config.timefusion_tantivy_bundle_writes {
-                        true => {
-                            let level = me.config.compression_level();
-                            convert_entry(me.object_store.as_ref(), Some(&me), &table, &project_id, &key, &blob, level, &me.cache_root, true).await.map(drop)
-                        }
-                        false => me.ensure_cached(&table, &project_id, file_uuid(&key), &blob).await.map(drop),
+                    let warmed = if tar_zst && me.config.timefusion_tantivy_bundle_writes {
+                        let level = me.config.compression_level();
+                        convert_entry(me.object_store.as_ref(), Some(&me), &table, &project_id, &key, &blob, level, &me.cache_root, true).await.map(drop)
+                    } else {
+                        me.ensure_cached(&table, &project_id, file_uuid(&key), &blob).await.map(drop)
                     };
                     if let Err(e) = warmed {
                         tracing::debug!("background tantivy warm of {blob} failed: {e:#}");
@@ -869,7 +842,7 @@ impl TantivySearchService {
     /// it, so this process sees its own write without reloading. Dropping
     /// instead would drive the hit rate to zero on busy projects, which publish
     /// far more often than they are queried.
-    pub fn apply_published_entry(&self, table: &str, project_id: &str, key: &str, entry: crate::tantivy::ManifestEntry) {
+    pub fn apply_published_entry(&self, table: &str, project_id: &str, key: &str, entry: ManifestEntry) {
         // `get_mut()` holds the shard lock across the read-modify-write; a plain
         // get-clone-insert would let concurrent publishes drop each other's entry.
         let Some(mut cached) = self.manifests.get_mut(&(table.to_string(), project_id.to_string())) else {
@@ -902,9 +875,8 @@ impl TantivySearchService {
     /// so entries are never stale and the reaper can drop a deleted dir's reader
     /// under the same key.
     fn open_cached(&self, dir: &Path) -> Result<(Index, IndexReader)> {
-        if let Some(v) = self.readers.lock().get(dir) {
-            SearchStats::add(&self.stats.reader_hits, 1);
-            return Ok(v.clone());
+        if let Some(v) = self.cached_reader(dir) {
+            return Ok(v);
         }
         let started = Instant::now();
         let index = match std::fs::read(dir.join(super::hotcache::HEAD_FILE)) {
@@ -921,8 +893,17 @@ impl TantivySearchService {
         Ok((index, reader))
     }
 
+    fn cached_reader(&self, key: &Path) -> Option<(Index, IndexReader)> {
+        self.readers.lock().get(key).cloned().inspect(|_| SearchStats::add(&self.stats.reader_hits, 1))
+    }
+
     fn cache_dir(&self, table: &str, project_id: &str, file_uuid: &str, blob_path: &str) -> PathBuf {
         super::local_cache_path(&self.cache_root, table, project_id, &cache_generation_key(file_uuid, blob_path))
+    }
+
+    /// Searchable without a download: a bundle read by range, or installed locally.
+    fn is_warm(&self, table: &str, project_id: &str, key: &str, blob: &str, bundle_head: Option<u64>) -> bool {
+        (self.config.range_reads() && bundle_head.is_some()) || has_any_segment(&self.cache_dir(table, project_id, file_uuid(key), blob))
     }
 
     /// An index to search: its installed directory when one exists (seeded at publish, or
@@ -944,14 +925,7 @@ impl TantivySearchService {
     /// `blob_path`'s bundle, read by range through the block and disk caches. Building one is
     /// IO-free: `head` already holds what opening reads.
     fn bundle_directory(&self, blob_path: &str, head: bytes::Bytes) -> Result<super::hotcache::BundleDirectory> {
-        let source = Arc::new(StoreSource {
-            store: self.object_store.clone(),
-            path: ObjPath::from(blob_path),
-            rt: tokio::runtime::Handle::current(),
-            stats: self.stats.clone(),
-            disk_cache: self.disk_cache.clone(),
-            len: std::sync::OnceLock::new(),
-        });
+        let source = Arc::new(StoreSource::new(self.object_store.clone(), blob_path.into(), self.stats.clone(), self.disk_cache.clone()));
         let bundle = std::hash::BuildHasher::hash_one(&std::hash::BuildHasherDefault::<std::collections::hash_map::DefaultHasher>::default(), blob_path);
         let directory = super::hotcache::BundleDirectory::new(head, source.clone())?;
         let _ = source.len.set(directory.bundle_len());
@@ -962,9 +936,8 @@ impl TantivySearchService {
     /// through the shared block cache. Cached alongside installed indexes, keyed by blob.
     async fn open_bundle(&self, blob_path: &str, head_len: u64) -> Result<(Index, IndexReader)> {
         let key = PathBuf::from(format!("bundle:{blob_path}"));
-        if let Some(v) = self.readers.lock().get(&key) {
-            SearchStats::add(&self.stats.reader_hits, 1);
-            return Ok(v.clone());
+        if let Some(v) = self.cached_reader(&key) {
+            return Ok(v);
         }
         let head = self.object_store.get_range(&ObjPath::from(blob_path), 0..head_len).await.with_context(|| format!("get head of {blob_path}"))?;
         let index = super::open_index_in(self.bundle_directory(blob_path, head)?)?;
@@ -1090,18 +1063,13 @@ fn collect_index_dirs(root: &Path) -> Vec<CachedDir> {
 /// Remove now-empty ancestors of a reaped dir, stopping at `root` (kept) or at
 /// the first non-empty directory.
 fn prune_empty_parents(dir: &Path, root: &Path) {
-    let mut cur = dir.parent();
-    while let Some(p) = cur.filter(|p| *p != root && p.starts_with(root)) {
-        if std::fs::remove_dir(p).is_err() {
-            return; // non-empty, or racing a concurrent unpack — leave it
-        }
-        cur = p.parent();
-    }
+    // An error is a non-empty dir, or one racing a concurrent unpack: leave it and stop.
+    let _ = std::iter::successors(dir.parent(), |p| p.parent()).take_while(|p| *p != root && p.starts_with(root)).try_for_each(std::fs::remove_dir);
 }
 
 /// The reader's usability predicate: an entry it would consult for coverage.
 /// Anything this rejects cannot be evidence that a file is covered.
-fn usable_entry(e: &crate::tantivy::ManifestEntry) -> bool {
+fn usable_entry(e: &ManifestEntry) -> bool {
     e.index.is_some() && e.error.is_none() && e.schema_version == SCHEMA_VERSION
 }
 
@@ -1111,6 +1079,18 @@ fn usable_entry(e: &crate::tantivy::ManifestEntry) -> bool {
 /// covers an in-window row.
 fn entry_overlaps(min: Option<i64>, max: Option<i64>, range: Option<(i64, i64)>) -> bool {
     range.is_none_or(|(lo, hi)| max.unwrap_or(i64::MAX) >= lo && min.unwrap_or(i64::MIN) <= hi)
+}
+
+/// Time-prune: an entry's blob only when its span can overlap `time_range` (no download
+/// otherwise), with the window its search must still apply, set only when the span sticks out.
+fn windowed_blob(e: &ManifestEntry, time_range: Option<(i64, i64)>) -> Option<(&str, Option<(i64, i64)>)> {
+    let (min, max) = (e.min_timestamp_micros, e.max_timestamp_micros);
+    let blob = e.index.as_deref().filter(|_| entry_overlaps(min, max, time_range))?;
+    Some((blob, time_range.filter(|&(lo, hi)| !(min.is_some_and(|m| m >= lo) && max.is_some_and(|m| m <= hi)))))
+}
+
+fn ts_range(lo: i64, hi: i64) -> Box<dyn Query> {
+    Box::new(RangeQuery::new_i64_bounds(TS_FIELD.into(), Bound::Included(lo), Bound::Included(hi)))
 }
 
 /// Strips the manifest key's `bucket-` tag to recover the bare file UUID
@@ -1209,6 +1189,10 @@ fn disk_chunk_key(path: &ObjPath, chunk: u64) -> String {
 }
 
 impl StoreSource {
+    fn new(store: Arc<dyn ObjectStore>, path: ObjPath, stats: Arc<SearchStats>, disk_cache: Option<Arc<crate::storage::SharedFoyerCache>>) -> Self {
+        Self { store, path, rt: tokio::runtime::Handle::current(), stats, disk_cache, len: std::sync::OnceLock::new() }
+    }
+
     async fn fetch(&self, range: std::ops::Range<u64>) -> std::io::Result<bytes::Bytes> {
         SearchStats::add(&self.stats.range_reads, 1);
         SearchStats::add(&self.stats.range_read_bytes, range.end - range.start);
@@ -1558,6 +1542,11 @@ pub fn build_node_query(index: &Index, node: &PredNode) -> Result<PredsQuery> {
     Ok(PredsQuery::Query(q))
 }
 
+/// `TIMEFUSION_TANTIVY_PHRASE_QUERIES`, the kill switch for positional phrases; on when unconfigured.
+fn phrase_queries_enabled() -> bool {
+    crate::config::try_config().is_none_or(|c| c.tantivy.timefusion_tantivy_phrase_queries)
+}
+
 /// Compile a routed literal against `field` WITHOUT tantivy's `QueryParser`:
 /// run the field's own analyzer over the literal and AND the resulting terms.
 ///
@@ -1569,11 +1558,6 @@ pub fn build_node_query(index: &Index, node: &PredNode) -> Result<PredsQuery> {
 /// A conjunction over-selects relative to a phrase query, which is always sound
 /// for a prefilter. A word too short to produce a token is dropped (broadens);
 /// a literal yielding no token at all errors out into a full scan.
-/// `TIMEFUSION_TANTIVY_PHRASE_QUERIES`, the kill switch for positional phrases; on when unconfigured.
-fn phrase_queries_enabled() -> bool {
-    crate::config::try_config().is_none_or(|c| c.tantivy.timefusion_tantivy_phrase_queries)
-}
-
 fn analyzed_conjunction_query(index: &Index, field: Field, tokenizer: &str, query: &str, phrases: bool) -> Result<Box<dyn Query>> {
     let mut analyzer = index.tokenizers().get(tokenizer).ok_or_else(|| anyhow!("tokenizer {tokenizer} not registered"))?;
     // ngram3 requires each whitespace-separated word independently. The others
@@ -1682,14 +1666,7 @@ mod disk_chunk_tests {
         store.put(&path, blob.clone().into()).await.unwrap();
         let disk = Arc::new(crate::storage::SharedFoyerCache::new(crate::storage::FoyerCacheConfig::test_config("disk_chunks")).await.unwrap());
         let source = || {
-            let source = StoreSource {
-                store: store.clone(),
-                path: path.clone(),
-                rt: tokio::runtime::Handle::current(),
-                stats: Default::default(),
-                disk_cache: Some(disk.clone()),
-                len: std::sync::OnceLock::new(),
-            };
+            let source = StoreSource::new(store.clone(), path.clone(), Default::default(), Some(disk.clone()));
             let _ = source.len.set(len);
             source
         };
@@ -1721,14 +1698,7 @@ mod disk_chunk_tests {
         store.put(&path, blob.clone().into()).await.unwrap();
         let disk = Arc::new(crate::storage::SharedFoyerCache::new(crate::storage::FoyerCacheConfig::test_config("disk_chunk_size")).await.unwrap());
         disk.put_immutable(format!("tantivy-chunk:{path}:1"), bytes::Bytes::from(vec![0xAA; DISK_CHUNK as usize]));
-        let source = StoreSource {
-            store,
-            path,
-            rt: tokio::runtime::Handle::current(),
-            stats: Default::default(),
-            disk_cache: Some(disk),
-            len: std::sync::OnceLock::new(),
-        };
+        let source = StoreSource::new(store, path, Default::default(), Some(disk));
         let _ = source.len.set(len);
         let range = DISK_CHUNK..2 * DISK_CHUNK;
         assert_eq!(super::super::hotcache::BundleSource::read(&source, range.clone()).unwrap(), &blob[range.start as usize..range.end as usize]);
@@ -1937,7 +1907,7 @@ impl TantivyIndexService {
             let manifest = super::load_manifest(store, table, &project).await?;
             let redundant = manifest.redundant_keys();
             todo.extend(manifest.entries.into_iter().filter_map(|(key, e)| {
-                let current = e.bundle_head.is_none() && e.error.is_none() && e.schema_version == SCHEMA_VERSION && !redundant.contains(&key);
+                let current = e.bundle_head.is_none() && usable_entry(&e) && !redundant.contains(&key);
                 Some((e.max_timestamp_micros.filter(|&t| current && t >= cutoff)?, project.clone(), key, e.index?))
             }));
         }
@@ -2186,24 +2156,20 @@ impl TantivyIndexService {
             // filters out cannot be evidence that an input is covered, or it
             // would vouch here and be invisible at query time (false negative).
             let covered: HashSet<String> = m.entries.values().filter(|e| usable_entry(e)).flat_map(|e| e.covered_files.iter().map(|u| rel_of(u))).collect();
-            if !removed_rel.iter().all(|u| covered.contains(u)) {
-                return (false, false);
-            }
+            let carries = |e: &ManifestEntry| usable_entry(e) && e.covered_files.iter().any(|u| removed_rel.contains(&rel_of(u)));
             // Each carried entry is one more index every query over the output searches: today's
             // packed files accumulated ~550 (2.8 s of fan-out per query). Past the cap the caller
             // rebuilds one index, and the inputs' entries age out with their files.
-            if m.entries.values().filter(|e| usable_entry(e) && e.covered_files.iter().any(|u| removed_rel.contains(&rel_of(u)))).count() > MAX_CARRIED_ENTRIES
-            {
+            let carried = m.entries.values().filter(|e| carries(e)).count();
+            if !removed_rel.is_subset(&covered) || carried > MAX_CARRIED_ENTRIES {
                 return (false, false);
             }
-            let mut touched = false;
-            for e in m.entries.values_mut().filter(|e| usable_entry(e) && e.covered_files.iter().any(|u| removed_rel.contains(&rel_of(u)))) {
+            m.entries.values_mut().filter(|e| carries(e)).for_each(|e| {
                 let fresh: Vec<String> = added.iter().filter(|u| !e.covered_files.contains(u)).cloned().collect();
                 e.covered_files.extend(fresh);
                 e.ordinals_valid = false;
-                touched = true;
-            }
-            (touched, touched)
+            });
+            (carried > 0, carried > 0)
         })
         .await?;
         if applied {
@@ -2256,14 +2222,14 @@ impl TantivyIndexService {
             // A day exceeds the normal manifest TTL and statement lifetime.
             // Cold reads racing later collection fail back to the canonical scan;
             // warm readers retain their own mappings to the immutable generation.
-            let cutoff = Utc::now() - chrono::Duration::days(1);
+            let cutoff = now - chrono::Duration::days(1);
             let active: HashSet<&str> = m.entries.values().filter_map(|entry| entry.index.as_deref()).collect();
             let retired: Vec<String> =
                 m.retired_blobs.iter().filter(|(blob, at)| **at < cutoff && !active.contains(blob.as_str())).map(|(blob, _)| blob.clone()).collect();
             ((stale, retired, kept_len, dirty), dirty)
         })
         .await?;
-        let mut report = GcReport { kept: kept_len, entries_removed: stale.len(), ..Default::default() };
+        let entries_removed = stale.len();
         // A blob already gone counts as deleted, so re-runs after an interrupted
         // GC don't report errors.
         let results: Vec<(String, bool)> = futures::stream::iter(stale.into_values().filter_map(|e| e.index).chain(retired))
@@ -2281,9 +2247,8 @@ impl TantivyIndexService {
             .buffer_unordered(16)
             .collect()
             .await;
-        report.blobs_deleted = results.iter().filter(|(_, ok)| *ok).count();
-        report.blob_delete_errors = results.len() - report.blobs_deleted;
-        if report.blobs_deleted > 0 {
+        let blobs_deleted = results.iter().filter(|(_, ok)| *ok).count();
+        if blobs_deleted > 0 {
             super::mutate(self.object_store.as_ref(), table, project_id, |m| {
                 let removed = results.iter().filter(|(_, ok)| *ok).filter(|(blob, _)| m.retired_blobs.remove(blob).is_some()).count();
                 ((), removed > 0)
@@ -2295,7 +2260,7 @@ impl TantivyIndexService {
         if changed {
             self.invalidate_reader(table, project_id);
         }
-        Ok(report)
+        Ok(GcReport { kept: kept_len, entries_removed, blobs_deleted, blob_delete_errors: results.len() - blobs_deleted })
     }
 }
 

@@ -1,14 +1,21 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc, LazyLock,
+        atomic::{AtomicU64, Ordering::Relaxed},
+    },
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use datafusion::{
     arrow::{
-        array::{Array, ArrayRef, BooleanArray, Int32Array, RecordBatch, StringArray},
+        array::{Array, ArrayRef, AsArray, BooleanArray, Int32Array, RecordBatch, StringArray},
         datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit},
     },
-    catalog::{MemTable, SchemaProvider, TableFunctionImpl, TableProvider},
+    catalog::{MemTable, SchemaProvider, Session, TableFunctionImpl, TableProvider},
     common::ToDFSchema,
-    datasource::empty::EmptyTable,
+    datasource::{TableType, empty::EmptyTable},
     error::{DataFusionError, Result as DFResult},
     execution::context::SessionContext,
     logical_expr::expr::Placeholder,
@@ -16,6 +23,7 @@ use datafusion::{
         ColumnarValue, Expr, LogicalPlan, LogicalPlanBuilder, ScalarFunctionArgs, ScalarFunctionImplementation, ScalarUDF, ScalarUDFImpl, Signature,
         TypeSignature, Volatility, create_udf, lit,
     },
+    physical_plan::ExecutionPlan,
     scalar::ScalarValue,
     sql::sqlparser::ast::{SelectItem, SetExpr, Statement, TableFactor},
 };
@@ -36,6 +44,8 @@ use datafusion_postgres::{
 };
 use futures::stream;
 use itertools::Itertools;
+
+use crate::{database::ScanMetrics, observability::arrow_err, storage::FoyerRuntimeStats, write::BufferedWriteLayer};
 
 pub const PG_COMPAT_VERSION: &str = "16.6";
 pub const PG_COMPAT_VERSION_NUM: &str = "160006";
@@ -90,14 +100,10 @@ pub fn setup_catalog(ctx: &SessionContext, role: &str, max_statement_secs: u64) 
     // keyed by an alias (`to_char` via `date_format`) can re-claim a name we overrode.
     // Hand such names back; ones the catalog itself installed stay its own.
     let after = ctx.state().scalar_functions().clone();
-    for (name, owner) in &before {
-        if let Some(now) = after.get(name)
-            && !Arc::ptr_eq(now, owner)
-            && before.values().any(|f| Arc::ptr_eq(f, now))
-        {
-            ctx.register_udf(owner.as_ref().clone());
-        }
-    }
+    before
+        .iter()
+        .filter(|&(name, owner)| after.get(name).is_some_and(|now| !Arc::ptr_eq(now, owner) && before.values().any(|f| Arc::ptr_eq(f, now))))
+        .for_each(|(_, owner)| ctx.register_udf(owner.as_ref().clone()));
     register_identity_udfs(ctx, role, max_statement_secs);
     overlay_runtime_stat_views(ctx)
 }
@@ -382,13 +388,16 @@ async fn deallocate_all(statement: &Statement, session_context: &SessionContext,
     if name.quote_style.is_some() || !name.value.eq_ignore_ascii_case("all") {
         return None;
     }
-    Some(match session_context.sql(&statement.to_string()).await {
-        Ok(_) => {
-            client.portal_store().clear_statements();
-            Ok(Response::Execution(Tag::new("DEALLOCATE")))
-        }
-        Err(error) => Err(PgWireError::ApiError(Box::new(error))),
-    })
+    Some(
+        session_context
+            .sql(&statement.to_string())
+            .await
+            .map(|_| {
+                client.portal_store().clear_statements();
+                Response::Execution(Tag::new("DEALLOCATE"))
+            })
+            .map_err(|error| PgWireError::ApiError(Box::new(error))),
+    )
 }
 
 fn is_pg_roles(relation: &TableFactor) -> bool {
@@ -426,9 +435,10 @@ fn role_probe_plan(statement: &Statement, fields: &[(String, RoleField)]) -> PgW
     let projection = fields.iter().map(|(name, value)| value.literal().alias(name)).collect::<Vec<_>>();
     let builder = LogicalPlanBuilder::empty(true);
     match bound_parameter_tautology(statement) {
-        Some(predicate) => builder.filter(predicate).and_then(|builder| builder.project(projection)),
-        None => builder.project(projection),
+        Some(predicate) => builder.filter(predicate),
+        None => Ok(builder),
     }
+    .and_then(|builder| builder.project(projection))
     .and_then(LogicalPlanBuilder::build)
     .map_err(|err| PgWireError::ApiError(Box::new(err)))
 }
@@ -450,16 +460,16 @@ fn show_response(name: &str, value: &str) -> PgWireResult<QueryResponse> {
 
 fn register_identity_udfs(ctx: &SessionContext, role: &str, max_statement_secs: u64) {
     let version = format!("PostgreSQL {PG_COMPAT_VERSION} (TimeFusion {}) on {}-{}", env!("CARGO_PKG_VERSION"), std::env::consts::ARCH, std::env::consts::OS);
-    for udf in [
+    [
         constant_udf("current_database", PG_COMPAT_DATABASE.into()),
         constant_udf("session_user", role.into()),
         constant_udf("version", version.into()),
         // pgAdmin checks replica status on connect; TF is never a standby.
         constant_udf("pg_is_in_recovery", false.into()),
         ScalarUDF::from(CurrentSettingUdf::new(max_statement_secs)),
-    ] {
-        ctx.register_udf(udf);
-    }
+    ]
+    .into_iter()
+    .for_each(|udf| ctx.register_udf(udf));
     ctx.register_udtf("pg_show_all_settings", Arc::new(PgShowAllSettingsFunction { max_statement_secs }));
 }
 
@@ -509,12 +519,7 @@ impl ScalarUDFImpl for CurrentSettingUdf {
         let missing_ok_array = args.args.get(1).map(|value| value.to_array(args.number_rows)).transpose()?;
         let missing_ok = missing_ok_array
             .as_ref()
-            .map(|value| {
-                value
-                    .as_any()
-                    .downcast_ref::<BooleanArray>()
-                    .ok_or_else(|| DataFusionError::Execution("current_setting missing_ok must be Boolean".to_string()))
-            })
+            .map(|value| value.as_boolean_opt().ok_or_else(|| DataFusionError::Execution("current_setting missing_ok must be Boolean".to_string())))
             .transpose()?;
         let values = (0..names.len())
             .map(|index| {
@@ -540,21 +545,24 @@ const COMPATIBILITY_SETTING_NAMES: &str = "server_version,server_version_num,sea
                                            default_transaction_read_only,in_hot_standby";
 
 fn compatibility_setting(name: &str, max_statement_secs: u64) -> Option<String> {
-    Some(match name.to_ascii_lowercase().as_str() {
-        "server_version" => PG_COMPAT_VERSION.to_string(),
-        "server_version_num" => PG_COMPAT_VERSION_NUM.to_string(),
-        "search_path" => PG_COMPAT_SCHEMA.to_string(),
-        "is_superuser" | "standard_conforming_strings" | "integer_datetimes" => "on".to_string(),
-        "default_transaction_read_only" | "in_hot_standby" => "off".to_string(),
-        "client_encoding" => "UTF8".to_string(),
-        "timezone" => "UTC".to_string(),
-        "datestyle" => "ISO, MDY".to_string(),
-        "intervalstyle" => "postgres".to_string(),
-        "bytea_output" => "hex".to_string(),
-        "client_min_messages" => "notice".to_string(),
-        "statement_timeout" => (max_statement_secs * 1_000).to_string(),
-        _ => return None,
-    })
+    Some(
+        match name.to_ascii_lowercase().as_str() {
+            "server_version" => PG_COMPAT_VERSION,
+            "server_version_num" => PG_COMPAT_VERSION_NUM,
+            "search_path" => PG_COMPAT_SCHEMA,
+            "is_superuser" | "standard_conforming_strings" | "integer_datetimes" => "on",
+            "default_transaction_read_only" | "in_hot_standby" => "off",
+            "client_encoding" => "UTF8",
+            "timezone" => "UTC",
+            "datestyle" => "ISO, MDY",
+            "intervalstyle" => "postgres",
+            "bytea_output" => "hex",
+            "client_min_messages" => "notice",
+            "statement_timeout" => return Some((max_statement_secs * 1_000).to_string()),
+            _ => return None,
+        }
+        .to_string(),
+    )
 }
 
 /// The set-returning function `pg_settings` is a view over. pgAdmin calls it
@@ -625,10 +633,9 @@ mod tests {
         let ctx = SessionContext::new();
         let sql = format!("SELECT ({value} IS NULL OR ({value})::text = ''), ({value} IS NOT NULL AND ({value})::text != '')");
         let batches = ctx.sql(&sql).await.unwrap().collect().await.unwrap();
-        let values: Vec<_> = batches[0].columns().iter().map(|a| a.as_any().downcast_ref::<BooleanArray>().unwrap().value(0)).collect();
+        let values: Vec<_> = batches[0].columns().iter().map(|a| a.as_boolean().value(0)).collect();
         assert_eq!(values, [empty, nonempty]);
     }
-    use datafusion::arrow::array::AsArray;
 
     /// Runs `sql` on a session wired the way pgwire wires one, as user `operator`.
     async fn query(sql: &str) -> RecordBatch {
@@ -748,12 +755,6 @@ mod tests {
 // `timefusion_stats` — a flat (component, key, value) introspection table over
 // write-layer, buffer, WAL, scan, cache and runtime internals.
 
-use std::sync::atomic::Ordering::Relaxed;
-
-use datafusion::{catalog::Session, datasource::TableType, physical_plan::ExecutionPlan};
-
-use crate::{database::ScanMetrics, observability::arrow_err, storage::FoyerRuntimeStats, write::BufferedWriteLayer};
-
 /// (fast-resolve cache entries, provider cache entries) at scan time.
 pub type CacheSizeSnapshot = Arc<dyn Fn() -> (usize, usize) + Send + Sync>;
 pub type FoyerStatsSnapshot = Arc<dyn Fn() -> FoyerRuntimeStats + Send + Sync>;
@@ -818,7 +819,10 @@ macro_rules! opt_setters {
     };
 }
 
-#[derive(derive_more::Debug)]
+static STATS_SCHEMA: LazyLock<SchemaRef> =
+    LazyLock::new(|| Arc::new(Schema::new(["component", "key", "value"].map(|name| Field::new(name, DataType::Utf8, false)).to_vec())));
+
+#[derive(derive_more::Debug, Default)]
 #[debug("StatsTableProvider {{ layer: {layer:?}, scan_metrics: {scan_metrics:?}, .. }}")]
 pub struct StatsTableProvider {
     layer: Option<Arc<BufferedWriteLayer>>,
@@ -832,25 +836,11 @@ pub struct StatsTableProvider {
     logical_count: Option<LogicalCountSnapshot>,
     tantivy_search: Option<Arc<crate::tantivy::search::TantivySearchService>>,
     bloom_prune: Option<Arc<crate::read::bloom_prune::BloomPruneRegistry>>,
-    schema: SchemaRef,
 }
 
 impl StatsTableProvider {
     pub fn new(layer: Option<Arc<BufferedWriteLayer>>) -> Self {
-        let schema = Arc::new(Schema::new(["component", "key", "value"].map(|name| Field::new(name, DataType::Utf8, false)).to_vec()));
-        Self {
-            layer,
-            scan_metrics: None,
-            cache_sizes: None,
-            foyer_stats: None,
-            query_pool: None,
-            maintenance_pool: None,
-            coordinator_pool: None,
-            logical_count: None,
-            tantivy_search: None,
-            bloom_prune: None,
-            schema,
-        }
+        Self { layer, ..Default::default() }
     }
 
     opt_setters! {
@@ -1150,7 +1140,7 @@ impl StatsTableProvider {
         });
 
         let p = deltalake::delta_datafusion::parquet_metrics::snapshot();
-        let mut parquet = rows!["parquet";
+        let parquet: Vec<Row> = rows!["parquet";
             "metadata_cache_hits" => p.metadata_cache_hits,
             "metadata_cache_misses" => p.metadata_cache_misses,
             "bytes_read" => p.bytes_read,
@@ -1159,16 +1149,17 @@ impl StatsTableProvider {
             "files_planned" => p.files_planned,
             "bytes_planned" => p.bytes_planned,
             "selected_row_groups" => p.selected_row_groups,
-        ];
+        ]
+        .into_iter()
         // Where the Delta provider's `scan()` spends planning time, beside the `planning` phases.
-        parquet.extend(
+        .chain(
             deltalake::delta_datafusion::parquet_metrics::PlanPhase::NAMES
                 .iter()
                 .zip(p.plan_phase_us)
                 .map(|(name, us)| ("planning", format!("delta_{name}_us"), us.to_string())),
-        );
-        parquet.push(("planning", "delta_unseeded_replays".to_string(), p.unseeded_replays.to_string()));
-        parquet.push(("planning", "delta_replay_seed_rows".to_string(), p.replay_seed_rows.to_string()));
+        )
+        .chain(rows!["planning"; "delta_unseeded_replays" => p.unseeded_replays, "delta_replay_seed_rows" => p.replay_seed_rows])
+        .collect();
 
         let cache_sizes = self.cache_sizes.as_ref().map_or_else(Vec::new, |snap| {
             // These caches don't evict; size tracks unique (project, table) pairs
@@ -1192,7 +1183,7 @@ impl StatsTableProvider {
         // that dominates them.
         let tantivy = self.tantivy_search.as_ref().map_or_else(Vec::new, |svc| {
             let s = &svc.stats;
-            let mean = |us: &std::sync::atomic::AtomicU64, n: &std::sync::atomic::AtomicU64| avg(us.load(Relaxed), n.load(Relaxed));
+            let mean = |us: &AtomicU64, n: &AtomicU64| avg(us.load(Relaxed), n.load(Relaxed));
             let (mh, ml) = (s.manifest_hits.load(Relaxed), s.manifest_loads.load(Relaxed));
             let (rh, io) = (s.reader_hits.load(Relaxed), s.index_opens.load(Relaxed));
             let (idx, q) = (s.indexes_searched.load(Relaxed), s.queries.load(Relaxed));
@@ -1301,7 +1292,7 @@ impl StatsTableProvider {
             .into_iter()
             .sorted_unstable_by_key(|section| section.0)
             .flat_map(|((component, name), count, total_us, max_us)| {
-                [("count", count), ("total_ms", total_us / 1000), ("max_ms", max_us / 1000), ("avg_us", total_us.checked_div(count).unwrap_or(0))]
+                [("count", count), ("total_ms", total_us / 1000), ("max_ms", max_us / 1000), ("avg_us", avg(total_us, count))]
                     .map(|(k, v)| (component, format!("{name}.{k}"), v.to_string()))
             })
             .collect();
@@ -1344,14 +1335,14 @@ impl StatsTableProvider {
         .flatten()
         .collect();
         let col = |field: fn(&Row) -> &str| Arc::new(rows.iter().map(|row| Some(field(row))).collect::<StringArray>()) as ArrayRef;
-        RecordBatch::try_new(Arc::clone(&self.schema), vec![col(|r| r.0), col(|r| r.1.as_str()), col(|r| r.2.as_str())]).map_err(arrow_err)
+        RecordBatch::try_new(Arc::clone(&*STATS_SCHEMA), vec![col(|r| r.0), col(|r| r.1.as_str()), col(|r| r.2.as_str())]).map_err(arrow_err)
     }
 }
 
 #[async_trait]
 impl TableProvider for StatsTableProvider {
     fn schema(&self) -> SchemaRef {
-        Arc::clone(&self.schema)
+        Arc::clone(&*STATS_SCHEMA)
     }
     fn table_type(&self) -> TableType {
         TableType::View
@@ -1360,7 +1351,7 @@ impl TableProvider for StatsTableProvider {
     async fn scan(&self, state: &dyn Session, projection: Option<&Vec<usize>>, filters: &[Expr], limit: Option<usize>) -> DFResult<Arc<dyn ExecutionPlan>> {
         // Build a fresh batch on every scan — counters move, we want point-in-time.
         let batch = self.snapshot_batch()?;
-        let mem = MemTable::try_new(Arc::clone(&self.schema), vec![vec![batch]])?;
+        let mem = MemTable::try_new(Arc::clone(&*STATS_SCHEMA), vec![vec![batch]])?;
         mem.scan(state, projection, filters, limit).await
     }
 }
@@ -1373,7 +1364,7 @@ mod stats_table_tests {
 
     fn snapshot_rows(p: &StatsTableProvider) -> Vec<OwnedRow> {
         let batch = p.snapshot_batch().unwrap();
-        let col = |i: usize| batch.column(i).as_any().downcast_ref::<StringArray>().cloned().unwrap();
+        let col = |i: usize| batch.column(i).as_string::<i32>();
         let (components, keys, values) = (col(0), col(1), col(2));
         (0..batch.num_rows()).map(|i| (components.value(i).to_string(), keys.value(i).to_string(), values.value(i).to_string())).collect()
     }

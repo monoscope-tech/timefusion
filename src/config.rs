@@ -1,4 +1,13 @@
-use std::{collections::HashMap, num::NonZeroUsize, path::PathBuf, sync::OnceLock, time::Duration};
+use std::{
+    collections::{BTreeSet, HashMap},
+    num::NonZeroUsize,
+    path::PathBuf,
+    sync::{
+        OnceLock,
+        atomic::{AtomicU32, Ordering},
+    },
+    time::Duration,
+};
 
 use serde::Deserialize;
 
@@ -63,20 +72,18 @@ fn detect_memory_limit_bytes() -> usize {
     read_parsed("/sys/fs/cgroup/memory.max", parse_cgroup_v2_memory_max)
         .or_else(|| read_parsed("/sys/fs/cgroup/memory/memory.limit_in_bytes", parse_cgroup_v1_memory_limit))
         // No cgroup limit → unmanaged box: the env override applies HERE only.
-        .or_else(|| {
-            env_memory_override_bytes().inspect(|v| tracing::warn!("budget tree: no cgroup limit; using TIMEFUSION_MEMORY_LIMIT_GB override ({} GiB)", v / GIB))
-        })
+        .or_else(|| env_memory_override_bytes().inspect(|v| warn!("budget tree: no cgroup limit; using TIMEFUSION_MEMORY_LIMIT_GB override ({} GiB)", v / GIB)))
         // Shared host: budget HALF the machine — sizing from full host RAM
         // inside a container risks a memcg OOM-loop.
         .or_else(|| {
             read_parsed("/proc/meminfo", parse_meminfo_total_bytes)
                 .map(|v| v / 2)
-                .inspect(|v| tracing::warn!("budget tree: no cgroup memory limit; deriving from HALF of host RAM ({} GiB)", v / GIB))
+                .inspect(|v| warn!("budget tree: no cgroup memory limit; deriving from HALF of host RAM ({} GiB)", v / GIB))
         })
         // macOS (dev / off-box CLI): same half-the-machine rule.
         .or_else(host_half_bytes)
         .unwrap_or_else(|| {
-            tracing::warn!("budget tree: could not detect memory limit from cgroup or /proc/meminfo; falling back to 8 GiB");
+            warn!("budget tree: could not detect memory limit from cgroup or /proc/meminfo; falling back to 8 GiB");
             8 * GIB
         })
 }
@@ -86,7 +93,7 @@ fn detect_memory_limit_bytes() -> usize {
 fn host_half_bytes() -> Option<usize> {
     Some(sysinfo::System::new_with_specifics(sysinfo::RefreshKind::new().with_memory(sysinfo::MemoryRefreshKind::everything())).total_memory() as usize / 2)
         .filter(|half| *half > 0)
-        .inspect(|half| tracing::warn!("budget tree: no cgroup; deriving from HALF of host RAM ({} GiB)", half / GIB))
+        .inspect(|half| warn!("budget tree: no cgroup; deriving from HALF of host RAM ({} GiB)", half / GIB))
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -97,7 +104,7 @@ fn host_half_bytes() -> Option<usize> {
 /// `TIMEFUSION_MEMORY_LIMIT_GB`, parsed. Consulted ONLY when no cgroup limit
 /// exists — a containerized deployment can never be resized by env var.
 fn env_memory_override_bytes() -> Option<usize> {
-    env_parse::<usize>("TIMEFUSION_MEMORY_LIMIT_GB").filter(|gb| *gb > 0).map(|gb| gb * GIB)
+    env_parse::<NonZeroUsize>("TIMEFUSION_MEMORY_LIMIT_GB").map(|gb| gb.get() * GIB)
 }
 
 /// `TIMEFUSION_MEMORY_BUDGET_GB`: sizes the whole tree BELOW the cgroup limit.
@@ -316,6 +323,25 @@ impl MemorySnapshot {
 /// refused admission can.
 const DECODED_ELASTIC_MAX_MULTIPLE: u64 = 3;
 
+/// Maintenance's share of the wide-scan decode gate.
+///
+/// A QUARTER of the shared pool, floored at one reader's worth of decode
+/// units: enough for `MAINTENANCE_MAX_PARTITIONS` sorts to make steady
+/// progress, small enough that a full-tilt drain leaves three quarters of the
+/// scan/S3 path to queries and flush BY CONSTRUCTION. Derived, never
+/// configured — a sizing env var here would be the same trap the deleted
+/// overrides were.
+///
+/// ```
+/// // Prod shape: 16 readers × 16 units = 256 shared → 64 for maintenance.
+/// assert_eq!(timefusion::config::maintenance_scan_permits(256), 64);
+/// // Tiny boxes keep one reader's worth so a single sort is never starved.
+/// assert_eq!(timefusion::config::maintenance_scan_permits(16), 16);
+/// ```
+pub fn maintenance_scan_permits(heavy_scan_permits: usize) -> usize {
+    (heavy_scan_permits / 4).max(16)
+}
+
 /// The decoded-bytes ceiling admission may use right now.
 ///
 /// `base` is the static share, and it was badly under-spent: 23 GiB on a 120 GiB
@@ -336,25 +362,6 @@ const DECODED_ELASTIC_MAX_MULTIPLE: u64 = 3;
 ///
 /// Shrinking is safe by construction: the controller tracks USED, so a smaller
 /// ceiling refuses new admissions rather than un-reserving in-flight ones.
-/// Maintenance's share of the wide-scan decode gate.
-///
-/// A QUARTER of the shared pool, floored at one reader's worth of decode
-/// units: enough for `MAINTENANCE_MAX_PARTITIONS` sorts to make steady
-/// progress, small enough that a full-tilt drain leaves three quarters of the
-/// scan/S3 path to queries and flush BY CONSTRUCTION. Derived, never
-/// configured — a sizing env var here would be the same trap the deleted
-/// overrides were.
-///
-/// ```
-/// // Prod shape: 16 readers × 16 units = 256 shared → 64 for maintenance.
-/// assert_eq!(timefusion::config::maintenance_scan_permits(256), 64);
-/// // Tiny boxes keep one reader's worth so a single sort is never starved.
-/// assert_eq!(timefusion::config::maintenance_scan_permits(16), 16);
-/// ```
-pub fn maintenance_scan_permits(heavy_scan_permits: usize) -> usize {
-    (heavy_scan_permits / 4).max(16)
-}
-
 pub fn elastic_decoded_capacity(base: u64, sample: MemorySnapshot) -> u64 {
     // The PEAK, never the instantaneous reading — see the field.
     let watermark = sample.peak_rss_bytes.max(sample.rss_bytes);
@@ -389,21 +396,9 @@ pub fn elastic_decoded_capacity(base: u64, sample: MemorySnapshot) -> u64 {
 /// drain slowly, it WEDGES, and then nothing frees the memory that closed the
 /// gate in the first place.
 pub fn hygiene_admits(sample: MemorySnapshot, in_flight: usize, ceiling: usize, floor: usize, was_open: bool) -> bool {
-    if in_flight < floor {
-        return true;
-    }
-    if in_flight >= ceiling {
-        return false;
-    }
-    hygiene_memory_open(sample, was_open)
+    in_flight < floor || (in_flight < ceiling && hygiene_memory_open(sample, was_open))
 }
 
-/// The MEMORY half of [`hygiene_admits`], independent of how many sorts run.
-///
-/// Split out because the hysteresis belongs to memory alone. Folding a full
-/// backstop into the same latch would make "the lane is busy" look like "the box
-/// is under pressure", and the lane would then have to fall all the way to the
-/// reopen threshold to admit again after merely being full.
 /// MemBuffer fill above which maintenance yields to the flush path.
 ///
 /// Flush is what makes ingested data DURABLE and visible, and it is the only
@@ -429,22 +424,22 @@ pub fn rollup_memory_admits(sample: MemorySnapshot) -> bool {
     sample.limit_bytes == 0 || (sample.jemalloc_allocated_bytes as f64 / sample.limit_bytes as f64) < ROLLUP_ALLOCATED_SHUT
 }
 
+/// The MEMORY half of [`hygiene_admits`], independent of how many sorts run.
+///
+/// Split out because the hysteresis belongs to memory alone. Folding a full
+/// backstop into the same latch would make "the lane is busy" look like "the box
+/// is under pressure", and the lane would then have to fall all the way to the
+/// reopen threshold to admit again after merely being full.
 pub fn hygiene_memory_open(sample: MemorySnapshot, was_open: bool) -> bool {
+    let threshold = if was_open { HYGIENE_GATE_SHUT } else { HYGIENE_GATE_REOPEN };
+    // An unreadable or unset budget must not be read as "infinite headroom".
+    let under = |used: usize, total: usize| total != 0 && (used as f64 / total as f64) < threshold;
     // Ingest outranks maintenance. Checked FIRST and without hysteresis: the
     // buffer filling is a customer-visible outage in progress, and there is no
     // flapping concern because the lane still keeps `hygiene_floor_slices`.
-    if sample.buffer_pressure_pct >= HYGIENE_BUFFER_YIELD_PCT {
-        return false;
-    }
-    let under = |used: usize, total: usize| {
-        // An unreadable or unset budget must not be read as "infinite headroom".
-        if total == 0 {
-            return false;
-        }
-        let fraction = used as f64 / total as f64;
-        fraction < if was_open { HYGIENE_GATE_SHUT } else { HYGIENE_GATE_REOPEN }
-    };
-    under(sample.rss_bytes, sample.limit_bytes) && under(sample.pool_reserved_bytes, sample.pool_size_bytes)
+    sample.buffer_pressure_pct < HYGIENE_BUFFER_YIELD_PCT
+        && under(sample.rss_bytes, sample.limit_bytes)
+        && under(sample.pool_reserved_bytes, sample.pool_size_bytes)
 }
 
 /// The largest COMPRESSED bin one coordinator sort can decode inside its budget.
@@ -544,13 +539,6 @@ pub(crate) const DEFAULT_SORT_SPILL_RESERVATION_BYTES: usize = 64 * MIB;
 /// reservation to nothing and push sorts back into dying mid-merge.
 const MIN_SORT_SPILL_RESERVATION_BYTES: usize = 8 * MIB;
 
-/// Effective `sort_spill_reservation_bytes`: the requested value, LOWERED so
-/// that `CONCURRENT_SORT_QUERIES` sorts of `partitions` partitions still fit
-/// `pool_bytes`.
-///
-/// `ExternalSorter` takes this reservation per partition, up front, and its
-/// merge half cannot spill, so every sort pays it whether or not it sorts
-/// anything — hence the clamp rather than honouring an over-large request.
 /// The share of the pool reservations may consume. The rest is what the sorts
 /// actually sort INTO.
 ///
@@ -561,6 +549,14 @@ const MIN_SORT_SPILL_RESERVATION_BYTES: usize = 8 * MIB;
 /// sorted, and failed dashboard reads with 78.1 MB free.
 const RESERVATION_POOL_SHARE: usize = 2;
 
+/// Effective `sort_spill_reservation_bytes`: the requested value, LOWERED so
+/// that `CONCURRENT_SORT_QUERIES` sorts of `partitions` partitions still fit
+/// `pool_bytes`.
+///
+/// `ExternalSorter` takes this reservation per partition, up front, and its
+/// merge half cannot spill, so every sort pays it whether or not it sorts
+/// anything — hence the clamp rather than honouring an over-large request.
+///
 /// `concurrency` is how many sorts may share `pool_bytes` AT ONCE, and it differs
 /// per pool. The query pool faces monoscope's client connections
 /// (`CONCURRENT_SORT_QUERIES`); the maintenance pool faces its own bounded worker
@@ -812,18 +808,17 @@ impl DerivedBudget {
 
     /// Sorts that run regardless of memory pressure — see [`hygiene_admits`].
     pub fn hygiene_floor_slices(&self) -> usize {
-        LIGHT_MIN_SLICES.min(self.max_light_optimize_k().max(1))
+        LIGHT_MIN_SLICES.min(self.max_light_optimize_k())
     }
 
     /// Concurrently admitted maintenance coordinator units. Bounded by the box:
     /// each unit reserves at most `MAX_DECODED_BYTES`, making the memory term
     /// exact. `TIMEFUSION_COORDINATOR_JOB_WORKERS=1` serializes maintenance.
     pub fn coordinator_jobs(&self) -> usize {
-        env_parse::<usize>("TIMEFUSION_COORDINATOR_JOB_WORKERS").filter(|n| *n > 0).unwrap_or_else(|| {
-            // Jobs are only useful up to the inner rewrite/sort permit pool
-            // (`HEAVY_REWRITE_PERMITS`); wider just converts slots into queueing.
-            (self.maintenance_pool_bytes / (512 * MIB)).min(self.cores / 3).clamp(1, 16)
-        })
+        // Jobs are only useful up to the inner rewrite/sort permit pool
+        // (`HEAVY_REWRITE_PERMITS`); wider just converts slots into queueing.
+        env_parse::<NonZeroUsize>("TIMEFUSION_COORDINATOR_JOB_WORKERS")
+            .map_or_else(|| (self.maintenance_pool_bytes / (512 * MIB)).min(self.cores / 3).clamp(1, 16), NonZeroUsize::get)
     }
 
     /// Worker TASK slots for the maintenance coordinator.
@@ -936,7 +931,7 @@ impl DerivedBudget {
     /// Startup log of the whole derived tree. K is logged at an illustrative
     /// 11 hot projects.
     pub fn log(&self) {
-        tracing::info!(
+        info!(
             profile = ?self.profile,
             detected_limit_gb = detect_memory_limit_clamped() / GIB,
             effective_limit_gb = self.memory_limit_bytes / GIB,
@@ -1209,8 +1204,8 @@ pub struct TantivyConfig {
 impl TantivyConfig {
     /// Tables to index: schemas with `tantivy.indexed: true` on any field,
     /// computed once. `BTreeSet` so `indexed_tables` is sorted by construction.
-    fn indexed_set() -> &'static std::collections::BTreeSet<String> {
-        static SET: OnceLock<std::collections::BTreeSet<String>> = OnceLock::new();
+    fn indexed_set() -> &'static BTreeSet<String> {
+        static SET: OnceLock<BTreeSet<String>> = OnceLock::new();
         SET.get_or_init(|| {
             let reg = crate::schema::registry();
             reg.list_tables()
@@ -1405,9 +1400,10 @@ impl AppConfig {
     /// Applies staging mode, refusing configurations that could resolve a prod path.
     pub fn enter_staging(&mut self) -> Result<(), String> {
         let Some(prefix) = self.core.staging_prefix().map(str::to_owned) else {
-            return match self.core.timefusion_staging_entry {
-                true => Err("started via a staging entry but TIMEFUSION_STAGING_PREFIX is unset; refusing to run against prod roots".into()),
-                false => Ok(()),
+            return if self.core.timefusion_staging_entry {
+                Err("started via a staging entry but TIMEFUSION_STAGING_PREFIX is unset; refusing to run against prod roots".into())
+            } else {
+                Ok(())
             };
         };
         let refuse = |why: &str| Err(format!("staging prefix {prefix:?}: {why}"));
@@ -1823,10 +1819,10 @@ pub struct ParquetConfig {
 }
 
 impl ParquetConfig {
-    /// Warm/cold boundary in days, floored at 1: today's partition is still
-    /// taking writes and must never be consolidated to the cold target.
-    pub fn cold_optimize_after_days(&self) -> u64 {
-        self.timefusion_cold_optimize_after_days.max(1)
+    getters! {
+        /// Warm/cold boundary in days, floored at 1: today's partition is still
+        /// taking writes and must never be consolidated to the cold target.
+        cold_optimize_after_days: u64 = (timefusion_cold_optimize_after_days.max(1));
     }
 }
 
@@ -2290,10 +2286,10 @@ pub enum RuntimeFlag {
 }
 
 /// Per-flag override: 0 = config, else value + 1.
-static FLAG_OVERRIDES: [std::sync::atomic::AtomicU32; 4] = [const { std::sync::atomic::AtomicU32::new(0) }; 4];
+static FLAG_OVERRIDES: [AtomicU32; <RuntimeFlag as strum::VariantArray>::VARIANTS.len()] = [const { AtomicU32::new(0) }; _];
 
 impl RuntimeFlag {
-    fn slot(self) -> &'static std::sync::atomic::AtomicU32 {
+    fn slot(self) -> &'static AtomicU32 {
         &FLAG_OVERRIDES[self as usize]
     }
 
@@ -2310,12 +2306,12 @@ impl RuntimeFlag {
     }
 
     pub fn override_value(self) -> Option<u32> {
-        self.slot().load(std::sync::atomic::Ordering::Relaxed).checked_sub(1)
+        self.slot().load(Ordering::Relaxed).checked_sub(1)
     }
 
     /// `None` returns to the config value.
     pub fn set_override(self, value: Option<u32>) {
-        self.slot().store(value.map_or(0, |v| v + 1), std::sync::atomic::Ordering::Relaxed);
+        self.slot().store(value.map_or(0, |v| v + 1), Ordering::Relaxed);
     }
 }
 
@@ -2337,6 +2333,11 @@ impl AppConfig {
 }
 
 impl MaintenanceConfig {
+    /// Compaction must record the files it tombstones when either post-commit cache action consumes them.
+    pub fn tracks_compacted_files(&self) -> bool {
+        self.timefusion_warm_after_compaction || self.timefusion_evict_after_compaction
+    }
+
     /// Reads honour the canary allow-list (empty/unset = every project);
     /// rollup BUILDS are unconditional and have no allow-list.
     pub fn rollup_read_enabled_for(&self, project_id: &str) -> bool {
@@ -2346,7 +2347,7 @@ impl MaintenanceConfig {
     /// Flush escalation-sort pool in bytes. Floored so a misconfigured 0 cannot
     /// build a zero-sized pool that fails every sort.
     pub fn flush_sort_pool_bytes(&self) -> usize {
-        (self.timefusion_flush_sort_pool_mb.max(64) as usize).saturating_mul(1 << 20)
+        (self.timefusion_flush_sort_pool_mb.max(64) as usize).saturating_mul(MIB)
     }
 }
 
@@ -3402,7 +3403,7 @@ pub fn apply(config: &mut AppConfig) {
         let reclaimed = config.derived.reclaim_maintenance_pool(overage) / MIB;
         audit = budget_audit(config, total_ram_mb);
         warn!(
-            "bootstrap.phase=budget_reclaim reclaimed_mb={reclaimed} from the maintenance pool              (it is the residual claimant, so it is what absorbed the unreserved MemBuffer overshoot,              tantivy peak and metadata cache) — maintenance_pool now {}mb, committed {}mb vs warn_at {}mb",
+            "bootstrap.phase=budget_reclaim reclaimed_mb={reclaimed} from the maintenance pool (it is the residual claimant, so it is what absorbed the unreserved MemBuffer overshoot, tantivy peak and metadata cache) — maintenance_pool now {}mb, committed {}mb vs warn_at {}mb",
             audit.maintenance_pool_mb, audit.committed_mb, audit.warn_at_mb
         );
     }
@@ -3464,7 +3465,7 @@ impl BudgetAudit {
 
 /// The audit computed at startup, so `timefusion_stats` can report the
 /// committed-vs-slack split on demand without re-detecting RAM.
-static BOOT_AUDIT: std::sync::OnceLock<BudgetAudit> = std::sync::OnceLock::new();
+static BOOT_AUDIT: OnceLock<BudgetAudit> = OnceLock::new();
 
 pub fn boot_budget_audit() -> Option<&'static BudgetAudit> {
     BOOT_AUDIT.get()

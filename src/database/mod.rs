@@ -2192,7 +2192,12 @@ fn hours_of_ranges(day_start: i64, ranges: &[(i64, i64)]) -> u32 {
     ranges.iter().filter(|(start, end)| start < end).fold(0, |mask, &(start, end)| (hour(start)..=hour(end - 1)).fold(mask, |mask, h| mask | 1 << h))
 }
 
-const DAY_MICROS: i64 = 86_400_000_000;
+use crate::maintenance_coordinator::DAY_MICROS;
+
+/// A byte target as delta-rs wants it; a non-positive config value clamps to the minimum.
+fn nonzero_target(target_size: i64) -> std::num::NonZero<u64> {
+    std::num::NonZero::new(target_size as u64).unwrap_or(std::num::NonZero::<u64>::MIN)
+}
 
 /// The TF-owned stamp a table's writes overwrite, if it declares one.
 fn tiebreak_of(source: &str) -> Option<&'static str> {

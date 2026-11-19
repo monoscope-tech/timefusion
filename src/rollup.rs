@@ -2,6 +2,7 @@
 //! conversion to the generated target schema, and read routing.
 
 use crate::schema::{RollupMeasure, RollupSpec};
+use crate::write::mem_buffer::strip_column_qualifiers;
 use itertools::Itertools;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
@@ -83,7 +84,7 @@ fn sql_literal(value: &str) -> String {
 /// Excludes the source fingerprint: independently replaceable slices of one date
 /// must share a generation so a query can merge them. `measures` restricts the
 /// spec to what the cell actually materialized before hashing (`None` = whole spec).
-pub fn generation_id(spec: &RollupSpec, source: &str, project_id: &str, date: &str, _source_fp: u64, measures: Option<&[String]>) -> String {
+pub fn generation_id(spec: &RollupSpec, source: &str, project_id: &str, date: &str, measures: Option<&[String]>) -> String {
     generation_id_from(generation_prefix(spec, measures), source, project_id, date)
 }
 
@@ -195,13 +196,13 @@ pub fn build_partition_sql_from(spec: &RollupSpec, source: &str, from: &str, pro
 /// over-counts permanently and `min`/`max` cannot be retracted. Any caller that
 /// appends these must carry a batch identity and skip an already-landed one.
 pub async fn rollup_partial_for_batches(
-    ctx: &datafusion::prelude::SessionContext, spec: &RollupSpec, source: &str, project_id: &str, date: &str, batches: &[arrow::record_batch::RecordBatch],
+    ctx: &datafusion::prelude::SessionContext, spec: &RollupSpec, project_id: &str, date: &str, batches: &[arrow::record_batch::RecordBatch],
     window: (i64, i64),
 ) -> anyhow::Result<Vec<arrow::record_batch::RecordBatch>> {
     let Some(first) = batches.first() else { return Ok(Vec::new()) };
     let input = format!("__partial_input_{}", uuid::Uuid::new_v4().simple());
     ctx.register_table(input.as_str(), std::sync::Arc::new(datafusion::datasource::MemTable::try_new(first.schema(), vec![batches.to_vec()])?))?;
-    let sql = build_cohort_sql_range_mode(spec, source, &input, std::slice::from_ref(&project_id.to_string()), date, window, false)?;
+    let sql = build_cohort_sql_range_mode(spec, &input, std::slice::from_ref(&project_id.to_string()), date, window, false)?;
     let partial = ctx.sql(&sql).await?.collect().await?;
     let _ = ctx.deregister_table(input.as_str());
     Ok(partial)
@@ -294,7 +295,7 @@ pub(crate) fn build_partition_sql_ranges(
 }
 
 pub(crate) fn build_cohort_sql_range_mode(
-    spec: &RollupSpec, _source: &str, from: &str, project_ids: &[String], date: &str, (start, end): (i64, i64), derived: bool,
+    spec: &RollupSpec, from: &str, project_ids: &[String], date: &str, (start, end): (i64, i64), derived: bool,
 ) -> anyhow::Result<String> {
     if project_ids.is_empty() {
         anyhow::bail!("rollup cohort has no projects");
@@ -1161,10 +1162,8 @@ impl RoutedRollup {
     /// on either side of a shared boundary double counts a whole bucket.
     /// `OPEN_END` is a sentinel, not a timestamp — it renders as no upper bound.
     fn range_sql(&(start, end): &(i64, i64)) -> String {
-        if end == OPEN_END {
-            return format!("(timestamp >= to_timestamp_micros({start}))");
-        }
-        format!("(timestamp >= to_timestamp_micros({start}) AND timestamp < to_timestamp_micros({end}))")
+        let upper = if end == OPEN_END { String::new() } else { format!(" AND timestamp < to_timestamp_micros({end})") };
+        format!("(timestamp >= to_timestamp_micros({start}){upper})")
     }
 
     /// `GROUP BY 1, 2, …`, positional so it is valid whether the select list
@@ -1642,13 +1641,22 @@ fn parse_bucket_micros(value: &str) -> Option<i64> {
     let mut parts = value.split_whitespace();
     let value = parts.next()?.parse::<i64>().ok()?;
     let unit = match parts.next()?.trim_end_matches('s') {
-        "second" | "sec" => 1_000_000,
-        "minute" | "min" => 60_000_000,
-        "hour" | "hr" => 3_600_000_000,
-        "day" => 86_400_000_000,
-        _ => return None,
+        "sec" => "second",
+        "min" => "minute",
+        "hr" => "hour",
+        unit => unit,
     };
-    value.checked_mul(unit)
+    value.checked_mul(unit_micros(unit)?)
+}
+
+fn unit_micros(unit: &str) -> Option<i64> {
+    match unit {
+        "second" => Some(1_000_000),
+        "minute" => Some(60_000_000),
+        "hour" => Some(3_600_000_000),
+        "day" => Some(86_400_000_000),
+        _ => None,
+    }
 }
 
 /// The scanned table, or a description of the node that stopped the walk.
@@ -1680,21 +1688,11 @@ pub(crate) fn source_and_filters(plan: &datafusion::logical_expr::LogicalPlan, f
             let source = source_and_filters(&alias.input, filters)?;
             // Unqualify so the whole chain has one spelling; otherwise the same
             // conjunct arrives twice and `canonical_and`'s dedup cannot cancel it.
-            use datafusion::common::{
-                Column,
-                tree_node::{Transformed, TreeNode},
-            };
-            let unqualify = |node: Expr| {
-                Ok(match node {
-                    Expr::Column(column) => Transformed::yes(Expr::Column(Column::new_unqualified(column.name))),
-                    node => Transformed::no(node),
-                })
-            };
-            for filter in filters.iter_mut() {
-                if let Ok(stripped) = filter.clone().transform_up(unqualify) {
-                    *filter = stripped.data;
+            filters.iter_mut().for_each(|filter| {
+                if let Ok(stripped) = strip_column_qualifiers(filter.clone()) {
+                    *filter = stripped;
                 }
-            }
+            });
             Ok(source)
         }
         plan => Err(truncated(&plan.display().to_string())),
@@ -1712,7 +1710,6 @@ fn truncated(text: &str) -> String {
 /// resembles a dimension. Deliberately narrow — only CSE's own aliases are
 /// inlined, and the rebuilt aggregate must keep the same field names and types.
 pub(crate) fn inline_common_exprs(aggregate: &datafusion::logical_expr::Aggregate) -> Option<datafusion::logical_expr::Aggregate> {
-    use datafusion::common::tree_node::{Transformed, TreeNode};
     use datafusion::logical_expr::{Aggregate, Expr, LogicalPlan};
 
     const CSE_PREFIX: &str = "__common_expr_";
@@ -1720,7 +1717,7 @@ pub(crate) fn inline_common_exprs(aggregate: &datafusion::logical_expr::Aggregat
     // CSE stacks one projection per nesting level (`coalesce(coalesce(x::text, …), …)`
     // defines `__common_expr_1` from `__common_expr_2`), so peel every one of them. A
     // rename or a computed projection declines, as in `source_and_filters`.
-    let mut definitions = std::collections::HashMap::new();
+    let mut definitions = HashMap::new();
     let mut input = &aggregate.input;
     while let LogicalPlan::Projection(projection) = input.as_ref()
         && projection.expr.iter().any(|expr| matches!(expr, Expr::Alias(alias) if alias.name.starts_with(CSE_PREFIX)))
@@ -1737,26 +1734,31 @@ pub(crate) fn inline_common_exprs(aggregate: &datafusion::logical_expr::Aggregat
         input = &projection.input;
     }
     (!definitions.is_empty()).then_some(())?;
-    let substitute = |expr: Expr| {
-        expr.transform_up(|node| {
-            Ok(match &node {
-                Expr::Column(column) => definitions.get(&column.name).map_or(Transformed::no(node), |definition| Transformed::yes(definition.clone())),
-                _ => Transformed::no(node),
-            })
-        })
-        .map(|transformed| transformed.data)
-        .ok()
-    };
     // One pass per level resolves an alias defined via another; a shape still naming a
     // CSE alias after that is half-substituted and declines.
     let inline = |expr: &Expr| {
         (0..=definitions.len())
-            .try_fold(expr.clone(), |expr, _| substitute(expr))
+            .try_fold(expr.clone(), |expr, _| substituted(expr, &definitions).ok())
             .filter(|inlined| !inlined.column_refs().iter().any(|column| column.name.starts_with(CSE_PREFIX)))
     };
     let group_expr = aggregate.group_expr.iter().map(inline).collect::<Option<Vec<_>>>()?;
     let aggr_expr = aggregate.aggr_expr.iter().map(inline).collect::<Option<Vec<_>>>()?;
     Aggregate::try_new(input.clone(), group_expr, aggr_expr).ok().filter(|rebuilt| rebuilt.schema.has_equivalent_names_and_types(&aggregate.schema).is_ok())
+}
+
+/// `expr` with every column `definitions` names replaced by its definition.
+fn substituted(
+    expr: datafusion::logical_expr::Expr, definitions: &HashMap<String, datafusion::logical_expr::Expr>,
+) -> datafusion::common::Result<datafusion::logical_expr::Expr> {
+    use datafusion::common::tree_node::{Transformed, TreeNode};
+    use datafusion::logical_expr::Expr;
+    expr.transform_up(|node| {
+        Ok(match &node {
+            Expr::Column(column) => definitions.get(&column.name).map_or(Transformed::no(node), |definition| Transformed::yes(definition.clone())),
+            _ => Transformed::no(node),
+        })
+    })
+    .map(|transformed| transformed.data)
 }
 
 /// An aggregate over a derived table that unnests one list column — monoscope's
@@ -1767,10 +1769,7 @@ pub(crate) fn inline_common_exprs(aggregate: &datafusion::logical_expr::Aggregat
 pub(crate) fn inline_unnest_source(
     aggregate: &datafusion::logical_expr::Aggregate,
 ) -> Option<(datafusion::logical_expr::Aggregate, String, String, Vec<datafusion::logical_expr::Expr>)> {
-    use datafusion::common::{
-        Column, ScalarValue,
-        tree_node::{Transformed, TreeNode},
-    };
+    use datafusion::common::{Column, ScalarValue};
     use datafusion::logical_expr::{Aggregate, Expr, LogicalPlan, LogicalPlanBuilder, lit};
 
     let below_alias = match aggregate.input.as_ref() {
@@ -1808,15 +1807,7 @@ pub(crate) fn inline_unnest_source(
         .find_map(|spec| spec.unnest.as_ref().filter(|unnest| unnest.column == column).map(|unnest| unnest.dimension.clone()))?;
     definitions.insert(list.output_column.name.clone(), Expr::Column(Column::from_name(&dimension)));
     let inline = |expr: &Expr, definitions: &HashMap<String, Expr>| {
-        expr.clone()
-            .transform_up(|node| {
-                Ok(match &node {
-                    Expr::Column(column) => definitions.get(&column.name).map_or(Transformed::no(node), |definition| Transformed::yes(definition.clone())),
-                    _ => Transformed::no(node),
-                })
-            })
-            .and_then(|inlined| crate::write::mem_buffer::strip_column_qualifiers(inlined.data.unalias_nested().data))
-            .ok()
+        substituted(expr.clone(), definitions).and_then(|inlined| strip_column_qualifiers(inlined.unalias_nested().data)).ok()
     };
     for expr in &outer.expr {
         match expr {
@@ -2138,13 +2129,8 @@ fn date_trunc_width(expr: &datafusion::logical_expr::Expr) -> Option<i64> {
     if !function.name().eq_ignore_ascii_case("date_trunc") || function.args.len() != 2 || column_name(&function.args[1]) != Some("timestamp") {
         return None;
     }
-    match string_literal(&function.args[0])?.to_ascii_lowercase().as_str() {
-        "second" | "seconds" => Some(1_000_000),
-        "minute" | "minutes" => Some(60_000_000),
-        "hour" | "hours" => Some(3_600_000_000),
-        "day" | "days" => Some(86_400_000_000),
-        _ => None,
-    }
+    let unit = string_literal(&function.args[0])?.to_ascii_lowercase();
+    unit_micros(unit.strip_suffix('s').unwrap_or(&unit))
 }
 
 /// The half-open `[lo, hi)` microsecond window `predicate` confines `timestamp`
@@ -2245,7 +2231,7 @@ async fn route_with_spec(
             // `col IS NOT NULL` over a non-dimension is expressed exactly by a
             // `count(col)` measure, so it becomes the guard.
             (None, None) => match unaliased(term) {
-                Expr::IsNotNull(inner) if column_name(inner).is_some() => null_guards.push(column_name(inner).unwrap_or_default()),
+                Expr::IsNotNull(inner) if let Some(column) = column_name(inner) => null_guards.push(column),
                 _ => promotable.push(term),
             },
         }
@@ -2360,6 +2346,13 @@ async fn route_with_spec(
             // REPRODUCED, not dropped: the rewrite has to match the aggregate's
             // schema types.
             let epoch_wrapped = epoch_of(expression);
+            // A width that is not a whole number of grains makes one rollup row
+            // straddle two output buckets; no state can be split.
+            let whole_grains = |width: i64| if width < grain || width % grain != 0 { Err(MissReason::PartialBucket) } else { Ok(()) };
+            let unparsed = || -> Result<String, MissReason> {
+                let bare = strip_column_qualifiers(expression.clone().unalias()).map_err(|_| MissReason::UnsupportedShape)?;
+                datafusion::sql::unparser::expr_to_sql(&bare).map(|sql| sql.to_string()).map_err(|_| MissReason::UnsupportedShape)
+            };
             let expression = match epoch_wrapped.map_or_else(|| unaliased(expression), |(inner, _, _)| inner) {
                 Expr::Column(column) if is_dimension(&column.name) => column.name.clone(),
                 Expr::ScalarFunction(function)
@@ -2376,23 +2369,15 @@ async fn route_with_spec(
                         other => string_literal(other).and_then(|interval| Some((parse_bucket_micros(interval)?, interval.to_owned()))),
                     }
                     .ok_or(MissReason::UnsupportedShape)?;
-                    // A width that is not a whole number of grains makes one rollup
-                    // row straddle two output buckets; no state can be split.
-                    if width < grain || width % grain != 0 {
-                        return Err(MissReason::PartialBucket);
-                    }
+                    whole_grains(width)?;
                     format!("time_bucket({}, timestamp)", sql_literal(&interval))
                 }
                 // `floor(extract(epoch from timestamp) / N)` reads only the N-second bucket, and a
                 // grain-aligned bucket start lies in the same one as each of its rows when N is
                 // a whole number of grains — so it means the same on both tables.
                 other if let Some(seconds) = epoch_bucket_seconds(other) => {
-                    let width = seconds.checked_mul(1_000_000).ok_or(MissReason::UnsupportedShape)?;
-                    if width < grain || width % grain != 0 {
-                        return Err(MissReason::PartialBucket);
-                    }
-                    let bare = crate::write::mem_buffer::strip_column_qualifiers(expression.clone().unalias()).map_err(|_| MissReason::UnsupportedShape)?;
-                    datafusion::sql::unparser::expr_to_sql(&bare).map_err(|_| MissReason::UnsupportedShape)?.to_string()
+                    whole_grains(seconds.checked_mul(1_000_000).ok_or(MissReason::UnsupportedShape)?)?;
+                    unparsed()?
                 }
                 // A deterministic expression over declared dimensions only (say
                 // `COALESCE(dim, lit)`) is a function of them, so partitioning by
@@ -2401,11 +2386,8 @@ async fn route_with_spec(
                 // A bare column that is not a declared dimension keeps its own
                 // reason — it is the one shape an operator can act on.
                 Expr::Column(_) => return Err(MissReason::UnknownGroupBy),
-                other if !other.is_volatile() && other.column_refs().iter().all(|column| is_dimension(&column.name)) => {
-                    // Rendered with its outer cast, which `unaliased` peeled but the schema keeps.
-                    let bare = crate::write::mem_buffer::strip_column_qualifiers(expression.clone().unalias()).map_err(|_| MissReason::UnsupportedShape)?;
-                    datafusion::sql::unparser::expr_to_sql(&bare).map_err(|_| MissReason::UnsupportedShape)?.to_string()
-                }
+                // Rendered with its outer cast, which `unaliased` peeled but the schema keeps.
+                other if !other.is_volatile() && other.column_refs().iter().all(|column| is_dimension(&column.name)) => unparsed()?,
                 _ => return Err(MissReason::UnsupportedShape),
             };
             // Only the bucket may wear the epoch wrapper; a dimension grouped by
@@ -2443,15 +2425,13 @@ async fn route_with_spec(
             }
             // The promoted conjuncts join the aggregate's own, so the pair resolves
             // to the measure declared as exactly that conjunction.
-            let filter = canonical_and(function.params.filter.iter().flat_map(|filter| split_conjunction(filter.as_ref())).chain(promotable.iter().copied()));
+            let conjuncts = || function.params.filter.iter().flat_map(|filter| split_conjunction(filter.as_ref())).chain(promotable.iter().copied());
+            let filter = canonical_and(conjuncts());
             let name = function.func.name().to_ascii_lowercase();
             if name == "sum"
                 && let Some((satisfied, tolerated)) = function.params.args.first().and_then(apdex_case)
             {
-                let count = |band: &Expr| {
-                    let conjuncts = function.params.filter.iter().flat_map(|filter| split_conjunction(filter.as_ref())).chain(promotable.iter().copied());
-                    declared_measure("count", null_guard, &canonical_and(conjuncts.chain([band])))
-                };
+                let count = |band| declared_measure("count", null_guard, &canonical_and(conjuncts().chain([band])));
                 let resolved = count(satisfied).zip(count(tolerated)).ok_or(MissReason::MissingMeasure)?;
                 return Ok(routed_measure(alias, Merge::Apdex, &[resolved.0, resolved.1]));
             }
@@ -2556,7 +2536,7 @@ fn element_values(term: &datafusion::logical_expr::Expr, column: &str) -> Option
     use datafusion::logical_expr::{Expr, Operator};
     match unaliased(term) {
         Expr::BinaryExpr(binary) if binary.op == Operator::Or => {
-            Some(element_values(&binary.left, column)?.union(&element_values(&binary.right, column)?).cloned().collect())
+            Some(element_values(&binary.left, column)?.into_iter().chain(element_values(&binary.right, column)?).collect())
         }
         Expr::BinaryExpr(binary) if binary.op == Operator::Eq && column_name(&binary.left) == Some(column) => {
             string_literal(&binary.right).map(|v| HashSet::from([v.to_string()]))
@@ -2574,7 +2554,7 @@ fn any_member_of(term: &datafusion::logical_expr::Expr, column: &str) -> Option<
     fn any_of(membership: Membership, column: &str) -> Option<HashSet<String>> {
         match membership {
             Membership::Contains { column: member, value } if member == column => Some(HashSet::from([value])),
-            Membership::Or(left, right) => Some(any_of(*left, column)?.union(&any_of(*right, column)?).cloned().collect()),
+            Membership::Or(left, right) => Some(any_of(*left, column)?.into_iter().chain(any_of(*right, column)?).collect()),
             _ => None,
         }
     }
@@ -2862,7 +2842,7 @@ mod tests {
         // APPEND side: each half aggregated on its own, exactly as a flush would.
         let mut appended = Vec::new();
         for half in [&first, &second] {
-            appended.extend(rollup_partial_for_batches(&ctx, &spec, SOURCE, "p", date, std::slice::from_ref(half), window).await.expect("partial"));
+            appended.extend(rollup_partial_for_batches(&ctx, &spec, "p", date, std::slice::from_ref(half), window).await.expect("partial"));
         }
         assert!(appended.len() >= 2, "precondition: two independent partials, not one combined aggregate");
 
@@ -3199,12 +3179,6 @@ mod tests {
         assert_eq!(target.dedup_tiebreak.as_deref(), Some("updated_at"), "keep-greatest needs the tiebreak");
     }
 
-    #[test]
-    fn slice_generation_is_stable_across_source_fingerprints() {
-        let spec = spec();
-        assert_eq!(generation_id(&spec, SOURCE, "p", "2026-08-15", 1, None), generation_id(&spec, SOURCE, "p", "2026-08-15", 2, None));
-    }
-
     /// A cell built under `before` carries the whole-spec generation id; recovery
     /// recomputes it from `after` restricted to what the cell says it holds, so
     /// adding a measure must not orphan it while redefining one must.
@@ -3215,23 +3189,23 @@ mod tests {
         let held: Vec<String> = before.measures.iter().map(|measure| measure.name.clone()).collect();
         let after = spec();
         assert_eq!(
-            generation_id(&before, SOURCE, "p", "2026-08-15", 1, None),
-            generation_id(&after, SOURCE, "p", "2026-08-15", 1, Some(&held)),
+            generation_id(&before, SOURCE, "p", "2026-08-15", None),
+            generation_id(&after, SOURCE, "p", "2026-08-15", Some(&held)),
             "a cell built before the measure existed must stay current"
         );
 
         let mut redefined = after.clone();
         redefined.measures[0].filter = Some("status_code = 500".to_owned());
         assert_ne!(
-            generation_id(&after, SOURCE, "p", "2026-08-15", 1, Some(&held)),
-            generation_id(&redefined, SOURCE, "p", "2026-08-15", 1, Some(&held)),
+            generation_id(&after, SOURCE, "p", "2026-08-15", Some(&held)),
+            generation_id(&redefined, SOURCE, "p", "2026-08-15", Some(&held)),
             "redefining a measure the cell HOLDS must still orphan it"
         );
         let mut regrouped = after.clone();
         regrouped.dimensions.push("name".to_owned());
         assert_ne!(
-            generation_id(&after, SOURCE, "p", "2026-08-15", 1, Some(&held)),
-            generation_id(&regrouped, SOURCE, "p", "2026-08-15", 1, Some(&held)),
+            generation_id(&after, SOURCE, "p", "2026-08-15", Some(&held)),
+            generation_id(&regrouped, SOURCE, "p", "2026-08-15", Some(&held)),
             "a different GROUP BY is a different row set, whatever the cell holds"
         );
     }
@@ -3366,7 +3340,7 @@ mod tests {
         )
         .expect("batch");
         let ctx = datafusion::prelude::SessionContext::new();
-        let partial = rollup_partial_for_batches(&ctx, &hashes_spec(), SOURCE, "p", "1970-01-01", &[batch], (0, 3_600_000_000)).await.expect("partial");
+        let partial = rollup_partial_for_batches(&ctx, &hashes_spec(), "p", "1970-01-01", &[batch], (0, 3_600_000_000)).await.expect("partial");
         let counts: Vec<(String, i64)> = partial
             .iter()
             .flat_map(|batch| {
