@@ -3287,8 +3287,8 @@ impl Database {
         let dedup_clean_fp: Arc<dashmap::DashMap<(String, String, String), Certification>> = Arc::new(
             persisted
                 .then(|| crate::storage::load_sidecar::<crate::storage::StoredCertification>(data_dir, crate::storage::CERTIFICATIONS))
-                .unwrap_or_default()
                 .into_iter()
+                .flatten()
                 .map(|entry| {
                     // Rebuild the monotonic instant from the stored wall-clock age so dwell keeps
                     // measuring real lifetime across boots; a backwards clock falls back to "now".
@@ -3302,8 +3302,8 @@ impl Database {
         let dedup_slice_coverage: Arc<dashmap::DashMap<(String, String, String), SliceCoverage>> = Arc::new(
             persisted
                 .then(|| crate::storage::load_sidecar::<crate::storage::StoredSliceCoverage>(data_dir, crate::storage::SLICE_COVERAGE))
-                .unwrap_or_default()
                 .into_iter()
+                .flatten()
                 .map(|e| ((e.project_id, e.table_name, e.date), SliceCoverage { fp: e.fp, intervals: e.intervals, files: e.files }))
                 .collect(),
         );
