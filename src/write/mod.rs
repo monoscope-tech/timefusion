@@ -678,9 +678,11 @@ impl Drop for WriteAdmission<'_> {
     }
 }
 
+/// The retryable refusal every write gets once a deploy handoff closes admission.
+pub(crate) const DRAINING: &str = "TimeFusion is draining for deployment; retry on the replacement";
+
 impl BufferedWriteLayer {
     fn admit_write(&self) -> Result<WriteAdmission<'_>, &'static str> {
-        const DRAINING: &str = "TimeFusion is draining for deployment; retry on the replacement";
         if !self.accepting_writes.load(Ordering::Acquire) {
             return Err(DRAINING);
         }
