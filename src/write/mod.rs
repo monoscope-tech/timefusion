@@ -277,8 +277,18 @@ pub struct FlushStats {
     pub buckets_deferred: u64,
 }
 
-/// MemBuffer bytes a flush reclaims. Must use the same `estimate_batch_size`
-/// as the per-bucket accounting so the totals stay comparable.
+impl FlushStats {
+    /// Sum the flows; `buckets_deferred` is a stock, so the newer pass's value wins.
+    fn merge(self, s: FlushStats) -> Self {
+        FlushStats {
+            buckets_flushed: self.buckets_flushed + s.buckets_flushed,
+            buckets_failed: self.buckets_failed + s.buckets_failed,
+            total_rows: self.total_rows + s.total_rows,
+            buckets_deferred: s.buckets_deferred,
+        }
+    }
+}
+
 /// Decoded-byte budget for ONE coalesced flush commit.
 ///
 /// The bucket-count cap (`FLUSH_CHUNK_BUCKET_IDS`) bounds how many bucket IDS a
@@ -292,6 +302,8 @@ pub struct FlushStats {
 /// runs immediately — smaller commits, steady drain, no detaching needed.
 const FLUSH_COMMIT_BYTE_CAP: u64 = 2 * 1024 * 1024 * 1024;
 
+/// MemBuffer bytes a flush reclaims. Must use the same `estimate_batch_size`
+/// as the per-bucket accounting so the totals stay comparable.
 fn flushable_bytes(b: &FlushableBucket) -> u64 {
     b.batches.iter().map(estimate_batch_size).sum::<usize>() as u64
 }
@@ -1286,9 +1298,9 @@ impl BufferedWriteLayer {
         //     Delta-derive could use to skip un-flushed replayed entries.
         //  2. The rewind marker advances as buckets drain, so a mid-replay crash
         //     re-replays only the still-un-drained tail.
-        for ((p, t), holds) in p0.iter() {
-            self.recovery_commit_floor.insert((p.clone(), t.clone()), holds.clone());
-        }
+        p0.iter().for_each(|(topic, holds)| {
+            self.recovery_commit_floor.insert(topic.clone(), holds.clone());
+        });
 
         let mut entries_replayed = 0u64;
         let mut entries_already_committed = 0u64;
@@ -2114,12 +2126,12 @@ impl BufferedWriteLayer {
         // Coalesce per (project_id, table_name): each commit pays a fixed cost
         // (log scan + JSON write + S3 RTT + tantivy build).
         let current_bucket = MemBuffer::current_bucket_id();
-        let deferred = std::sync::atomic::AtomicU64::new(0);
+        let mut deferred = 0u64;
         let mut groups: Vec<(CombinedBucket, u64)> = by_topic
             .into_iter()
             .filter_map(|((p, t), ids)| {
                 if !self.flush_topic_ready(&p, &t) {
-                    deferred.fetch_add(ids.len() as u64, Ordering::Relaxed);
+                    deferred += ids.len() as u64;
                     return None;
                 }
                 let token = self.register_inflight_holds(&p, &t, Vec::new()); // airborne marker
@@ -2131,7 +2143,7 @@ impl BufferedWriteLayer {
                 let mut ids = ids.into_iter();
                 for id in ids.by_ref() {
                     if budget == 0 && !group.source_buckets.is_empty() {
-                        deferred.fetch_add(1 + ids.len() as u64, Ordering::Relaxed);
+                        deferred += 1 + ids.len() as u64;
                         break;
                     }
                     if let Some(b) = self.mem_buffer.snapshot_bucket_for_flush(&p, &t, id) {
@@ -2199,13 +2211,8 @@ impl BufferedWriteLayer {
             .collect();
         let group_stats: Vec<(bool, FlushStats)> = stream::iter(group_futures).buffer_unordered(parallelism).collect().await;
 
-        let (any_ok, mut stats) = group_stats.into_iter().fold((confirmed, FlushStats::default()), |(any, mut acc), (ok, s)| {
-            acc.buckets_flushed += s.buckets_flushed;
-            acc.buckets_failed += s.buckets_failed;
-            acc.total_rows += s.total_rows;
-            (any | ok, acc)
-        });
-        stats.buckets_deferred = deferred.load(Ordering::Relaxed);
+        let (any_ok, stats) = group_stats.into_iter().fold((confirmed, FlushStats::default()), |(any, acc), (ok, s)| (any | ok, acc.merge(s)));
+        let stats = FlushStats { buckets_deferred: deferred, ..stats };
         if any_ok {
             self.write_post_flush_snapshot().await;
         }
@@ -2462,21 +2469,17 @@ impl BufferedWriteLayer {
 
     /// Only called under flush_lock, after the old caller's restore completed.
     fn settle_confirmed_flushes(&self) -> bool {
-        let mut settled = false;
+        // Keys collected first: removing while iterating a DashMap deadlocks its shard.
         let topics: Vec<_> = self.confirmed_flushes.iter().map(|entry| entry.key().clone()).collect();
-        for topic in topics {
-            if let Some((_, receipt)) = self.confirmed_flushes.remove(&topic) {
-                let source_buckets = receipt.sources;
-                let group = CombinedBucket { combined: receipt.bucket, source_buckets };
-                self.index_flushed_files(&group.combined, receipt.batches, receipt.files);
-                let bucket = &group.combined;
-                // The previous caller released its token after restoring holds.
-                // Own a fresh token across the confirmed prefix's retirement.
-                let token = self.register_inflight_holds(&topic.0, &topic.1, bucket.wal_first_positions.clone());
-                self.register_inflight_pin(token, bucket.first_wal_pin_micros);
-                self.settle_flushed_group(group, token, Ok(()));
-                settled = true;
-            }
+        let mut settled = false;
+        for ((project, table), ConfirmedFlush { bucket, sources, batches, files }) in topics.iter().filter_map(|topic| self.confirmed_flushes.remove(topic)) {
+            self.index_flushed_files(&bucket, batches, files);
+            // The previous caller released its token after restoring holds.
+            // Own a fresh token across the confirmed prefix's retirement.
+            let token = self.register_inflight_holds(&project, &table, bucket.wal_first_positions.clone());
+            self.register_inflight_pin(token, bucket.first_wal_pin_micros);
+            self.settle_flushed_group(CombinedBucket { combined: bucket, source_buckets: sources }, token, Ok(()));
+            settled = true;
         }
         settled
     }
@@ -2511,12 +2514,8 @@ impl BufferedWriteLayer {
         if self.recovery_active.load(Ordering::Relaxed) {
             self.defer_tantivy_files(&bucket.project_id, &bucket.table_name, added_files);
             crate::observability::record_tantivy_recovery_deferred();
-        } else if let Some(ref idx_cb) = self.tantivy_index_callback {
-            let cb = idx_cb.clone();
-            let pid = bucket.project_id.clone();
-            let tname = bucket.table_name.clone();
-            let bid = bucket.bucket_id;
-            let sem = self.tantivy_spawn_sem.clone();
+        } else if let Some(cb) = self.tantivy_index_callback.clone() {
+            let (pid, tname, bid, sem) = (bucket.project_id.clone(), bucket.table_name.clone(), bucket.bucket_id, self.tantivy_spawn_sem.clone());
             tokio::spawn(async move {
                 // semaphore closed — process is shutting down
                 let Ok(_permit) = sem.acquire_owned().await else { return };
@@ -2895,13 +2894,9 @@ impl BufferedWriteLayer {
         // progress normally empties `buckets_deferred` in a handful of rounds.
         let mut total = FlushStats::default();
         for _ in 0..1000 {
-            let stats = self.flush_buckets_where(|_| true).await?;
-            total.buckets_flushed += stats.buckets_flushed;
-            total.buckets_failed += stats.buckets_failed;
-            total.total_rows += stats.total_rows;
-            total.buckets_deferred = stats.buckets_deferred;
-            if stats.buckets_deferred == 0 {
-                return Ok(total);
+            total = total.merge(self.flush_buckets_where(|_| true).await?);
+            if total.buckets_deferred == 0 {
+                break;
             }
         }
         Ok(total)
@@ -3049,7 +3044,7 @@ impl BufferedWriteLayer {
         let (wal_files, wal_bytes, wal_allocated_bytes) = self.wal.wal_usage();
         let (quarantine_files, quarantine_bytes) = crate::write::wal::quarantine_stats(self.wal.data_dir());
         let now = crate::support::now_micros();
-        let oldest_bucket_age_secs = mem.oldest_bucket_micros.map(|ts| ((now - ts).max(0) / 1_000_000) as u64);
+        let secs_between = |from: i64, ts: i64| ((from - ts).max(0) / 1_000_000) as u64;
         StatsSnapshot {
             mem_replay_dml_noops: mem.replay_dml_noops,
             mem_project_count: mem.project_count,
@@ -3065,7 +3060,7 @@ impl BufferedWriteLayer {
             quarantine_bytes,
             wal_disk_bytes: wal_bytes,
             wal_allocated_bytes,
-            wal_pin_age_secs: self.oldest_unflushed_wal_append_micros().map(|ts| ((now - ts).max(0) / 1_000_000) as u64),
+            wal_pin_age_secs: self.oldest_unflushed_wal_append_micros().map(|ts| secs_between(now, ts)),
             oldest_buffered_wal_pin: self.mem_buffer.oldest_wal_pin(),
             inflight_wal_pins: self.inflight_wal_pins.len(),
             airborne_topics: self.airborne_commits.len(),
@@ -3074,7 +3069,7 @@ impl BufferedWriteLayer {
             wal_shards_per_topic: self.wal.shards_per_topic(),
             wal_known_topics: self.wal.known_topic_count(),
             bucket_duration_micros: crate::write::mem_buffer::bucket_duration_micros(),
-            oldest_bucket_age_secs,
+            oldest_bucket_age_secs: mem.oldest_bucket_micros.map(|ts| secs_between(now, ts)),
             flush_completed_total: self.flush_completed_total.load(Ordering::Relaxed),
             flush_failed_total: self.flush_failed_total.load(Ordering::Relaxed),
             backpressure_engaged_total: self.backpressure_engaged_total.load(Ordering::Relaxed),
@@ -3085,7 +3080,7 @@ impl BufferedWriteLayer {
             flush_freed_bytes_total: self.flush_freed_bytes_total.load(Ordering::Relaxed),
             process_rss_bytes: crate::observability::process_rss_bytes(),
             orphaned_topics: self.orphaned_wal_holds.len(),
-            orphan_pin_age_secs: self.oldest_orphan_pin_micros().map(|pin| ((chrono::Utc::now().timestamp_micros() - pin).max(0) / 1_000_000) as u64),
+            orphan_pin_age_secs: self.oldest_orphan_pin_micros().map(|pin| secs_between(chrono::Utc::now().timestamp_micros(), pin)),
             drained: self.is_drained(),
             wal_recovery_duration_ms: self.wal_recovery_duration_ms.load(Ordering::Relaxed),
             wal_replay_rows: self.wal_replay_rows.load(Ordering::Relaxed),

@@ -87,7 +87,7 @@ const CACHE_SOFT_LIMIT_WARN: usize = 10_000;
 
 /// Build de-duplicator for the cached Delta `TableProvider`: initialised once per
 /// `(project, table, version)`; concurrent misses await the same build.
-type DeltaProviderCell = tokio::sync::OnceCell<Arc<dyn datafusion::datasource::TableProvider>>;
+type DeltaProviderCell = tokio::sync::OnceCell<Arc<dyn TableProvider>>;
 
 #[derive(derive_more::Debug)]
 #[debug("CachedDeltaProvider {{ version: {version}, age: {:?}, .. }}", created_at.elapsed())]
@@ -680,7 +680,12 @@ impl ScanMetrics {
     /// Dwell percentile, in seconds. `None` (surfaced as 0) if metrics weren't
     /// initialized or nothing has been recorded yet.
     pub fn cert_dwell_percentile_secs(&self, p: f64) -> u64 {
-        crate::observability::histogram_quantile("timefusion.cert.dwell_seconds", p).unwrap_or(0.0) as u64
+        Self::quantile("timefusion.cert.dwell_seconds", p, 1.0)
+    }
+
+    /// Histogram quantile `p` of `name`, scaled; 0 when nothing was recorded.
+    fn quantile(name: &str, p: f64, scale: f64) -> u64 {
+        (crate::observability::histogram_quantile(name, p).unwrap_or(0.0) * scale) as u64
     }
 
     /// Record a pgwire end-to-end query duration.
@@ -692,10 +697,10 @@ impl ScanMetrics {
 
     /// Percentile of the full `ProjectRoutingTable::scan` call, in microseconds.
     pub fn latency_percentile_us(&self, p: f64) -> u64 {
-        (crate::observability::histogram_quantile("timefusion.scan.latency_seconds", p).unwrap_or(0.0) * 1_000_000.0) as u64
+        Self::quantile("timefusion.scan.latency_seconds", p, 1_000_000.0)
     }
     pub fn pgwire_percentile_us(&self, p: f64) -> u64 {
-        (crate::observability::histogram_quantile("timefusion.pgwire.query_latency_seconds", p).unwrap_or(0.0) * 1_000_000.0) as u64
+        Self::quantile("timefusion.pgwire.query_latency_seconds", p, 1_000_000.0)
     }
 }
 
@@ -725,6 +730,11 @@ struct SliceCoverage {
     files: crate::read::CountFiles,
 }
 
+/// `column = value` over one partition column, borrowing both.
+fn eq_filter<'a>(column: &'a str, value: &'a str) -> FilterLiteral<'a> {
+    (column, FilterOp::Eq, FilterValue::Scalar(value))
+}
+
 /// Which clean intervals survive a set of newly-arrived files.
 ///
 /// Sound only where `timestamp` is a dedup key: then a duplicate group shares one
@@ -733,16 +743,8 @@ struct SliceCoverage {
 ///
 /// `None` means "cannot decide, reset": a file with no span statistics overlaps
 /// everything, which is the same rule `partition_file_spans` states for readers.
-/// `column = value` over one partition column, borrowing both.
-fn eq_filter<'a>(column: &'a str, value: &'a str) -> FilterLiteral<'a> {
-    (column, FilterOp::Eq, FilterValue::Scalar(value))
-}
-
 fn retain_clean_intervals(intervals: &[(i64, i64)], new_spans: &[Option<(i64, i64)>]) -> Option<Vec<(i64, i64)>> {
-    if new_spans.iter().any(Option::is_none) {
-        return None;
-    }
-    let spans: Vec<(i64, i64)> = new_spans.iter().flatten().copied().collect();
+    let spans: Vec<(i64, i64)> = new_spans.iter().copied().collect::<Option<_>>()?;
     // Half-open interval vs inclusive span, matching `certify_files_within_slice`.
     Some(intervals.iter().copied().filter(|&(s, e)| !spans.iter().any(|&(min, max)| s <= max && min < e)).collect())
 }
@@ -912,7 +914,6 @@ fn flush_waiter(count: &Arc<std::sync::atomic::AtomicUsize>) -> impl Drop + use<
     })
 }
 
-/// Get a Delta table from unified tables by table_name
 pub async fn get_unified_delta_table(unified_tables: &UnifiedTables, table_name: &str) -> Option<Arc<RwLock<DeltaTable>>> {
     unified_tables.read().await.get(table_name).cloned()
 }
@@ -1009,12 +1010,10 @@ fn uri_date_in_window(uri: &str, lo: i64, hi: i64) -> bool {
     let Some(d) = crate::storage::date_partition_of(uri) else {
         return true;
     };
-    let to_date = |ts: i64, open: i64| (ts != open).then(|| chrono::DateTime::from_timestamp_micros(ts)).flatten().map(|dt| dt.date_naive());
+    let to_date = |ts: i64, open: i64| (ts != open).then_some(ts).and_then(chrono::DateTime::from_timestamp_micros).map(|dt| dt.date_naive());
     to_date(lo, i64::MIN).is_none_or(|l| d >= l) && to_date(hi, i64::MAX).is_none_or(|h| d <= h)
 }
 
-/// The cache-key prefix for a table: its URI minus any `?endpoint=...` query
-/// string and trailing slash. File URIs are relativized against this.
 /// Days back the disk-cache warmer serves, and how long a read keeps its columns warm-worthy.
 const WARM_DAYS: u64 = 14;
 const WARM_READ_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
@@ -1044,7 +1043,7 @@ impl ReadActivity {
         }
         let now = std::time::Instant::now();
         let mut set = self.0.entry(key).or_default();
-        columns.into_iter().for_each(|c| _ = set.columns.insert(c, now));
+        set.columns.extend(columns.into_iter().map(|c| (c, now)));
     }
 
     /// Pairs read within the TTL, most recent first, with their live columns.
@@ -1062,6 +1061,8 @@ impl ReadActivity {
     }
 }
 
+/// The cache-key prefix for a table: its URI minus any `?endpoint=...` query
+/// string and trailing slash. File URIs are relativized against this.
 fn table_cache_prefix(table_uri: &str) -> &str {
     table_uri.split('?').next().unwrap_or(table_uri).trim_end_matches('/')
 }
@@ -1250,8 +1251,7 @@ fn str_col_rows(column: &datafusion::arrow::array::ArrayRef) -> Option<Box<dyn I
 
 /// First row's `project_id`, if the batch carries the column.
 pub fn extract_project_id(batch: &RecordBatch) -> Option<String> {
-    let idx = batch.schema().fields().iter().position(|f| f.name() == "project_id")?;
-    str_col_rows(batch.column(idx))?.next().flatten().map(str::to_string)
+    str_col_rows(batch.column_by_name("project_id")?)?.next().flatten().map(str::to_string)
 }
 
 /// Split a batch row-wise by its `project_id` column into per-project sub-batches.
@@ -1264,19 +1264,14 @@ pub fn partition_batch_by_project(batch: RecordBatch, default_project: &str) -> 
 
     use datafusion::arrow::{array::UInt32Array, compute::take_record_batch};
 
-    let num_rows = batch.num_rows();
-    if num_rows == 0 {
+    if batch.num_rows() == 0 {
         return Ok(vec![]);
     }
-    let Some(col_idx) = batch.schema().fields().iter().position(|f| f.name() == "project_id") else {
-        return Ok(vec![(default_project.to_string(), batch)]);
-    };
-    let column = batch.column(col_idx);
-
-    // The block scopes the iterator's borrow of `batch`.
+    // The block scopes the iterator's borrow of `batch`; a loop, not `into_group_map`,
+    // so a row allocates a `String` only for a project not seen yet.
     let mut groups: BTreeMap<String, Vec<u32>> = BTreeMap::new();
     {
-        let Some(rows) = str_col_rows(column) else { return Ok(vec![(default_project.to_string(), batch)]) };
+        let Some(rows) = batch.column_by_name("project_id").and_then(str_col_rows) else { return Ok(vec![(default_project.to_string(), batch)]) };
         for (i, pid) in rows.enumerate() {
             let pid = pid.unwrap_or(default_project);
             match groups.get_mut(pid) {
@@ -1286,22 +1281,13 @@ pub fn partition_batch_by_project(batch: RecordBatch, default_project: &str) -> 
         }
     }
 
-    if groups.len() == 1 {
-        let pid = groups.into_keys().next().unwrap();
+    if groups.len() == 1
+        && let Some((pid, _)) = groups.pop_first()
+    {
         return Ok(vec![(pid, batch)]);
     }
 
     groups.into_iter().map(|(pid, indices)| Ok((pid, take_record_batch(&batch, &UInt32Array::from(indices))?))).collect()
-}
-
-/// Minimal `SessionState` for delta-rs `OptimizeBuilder`. Must be passed via
-/// `.with_session_state(...)`: delta-rs's default `DeltaSessionConfig` turns
-/// `schema_force_view_types` ON, which makes the kernel's `unshredded_variant()`
-/// schema mismatch on Variant columns.
-fn build_optimize_session_state(
-    target_partitions: usize, runtime_env: Arc<datafusion::execution::runtime_env::RuntimeEnv>,
-) -> datafusion::execution::session_state::SessionState {
-    build_optimize_session_state_tuned(target_partitions, runtime_env, None, None)
 }
 
 /// A sort whose caller runs few enough concurrent bins that
@@ -1315,10 +1301,8 @@ struct UncappedSort {
     reservation_bytes: Option<usize>,
 }
 
-/// `batch_override` shrinks the sort's indivisible admission unit; merge memory
-/// scales with fan-in x batch, so callers sorting one huge file need a smaller
 /// `ConfigOptions::set` fails only on an unknown key — i.e. when a DataFusion upgrade renames one of
-/// the load-bearing memory settings below. Silently reverting to the default is how that goes
+/// the load-bearing memory settings. Silently reverting to the default is how that goes
 /// unnoticed, so say it out loud.
 pub(crate) fn set_or_warn(options: &mut datafusion::config::ConfigOptions, key: &str, value: &str) {
     if let Err(e) = options.set(key, value) {
@@ -1326,9 +1310,16 @@ pub(crate) fn set_or_warn(options: &mut datafusion::config::ConfigOptions, key: 
     }
 }
 
+/// Minimal `SessionState` for delta-rs `OptimizeBuilder`. Must be passed via
+/// `.with_session_state(...)`: delta-rs's default `DeltaSessionConfig` turns
+/// `schema_force_view_types` ON, which makes the kernel's `unshredded_variant()`
+/// schema mismatch on Variant columns.
+///
+/// `batch_override` shrinks the sort's indivisible admission unit; merge memory
+/// scales with fan-in x batch, so callers sorting one huge file need a smaller
 /// batch than the packing bins they share a pool with. `uncapped` lifts
 /// `MAINTENANCE_MAX_PARTITIONS` and pins parallelism — see [`UncappedSort`].
-fn build_optimize_session_state_tuned(
+fn build_optimize_session_state(
     target_partitions: usize, runtime_env: Arc<datafusion::execution::runtime_env::RuntimeEnv>, batch_override: Option<&str>, uncapped: Option<UncappedSort>,
 ) -> datafusion::execution::session_state::SessionState {
     use datafusion::{execution::SessionStateBuilder, prelude::SessionConfig};
@@ -1396,7 +1387,7 @@ fn partition_file_is_empty(num_records: Option<i64>) -> bool {
 /// real) pushed a 24-hour count from 1.7s to 84s and timed out a third of all
 /// heavy queries, while every other health signal stayed green.
 pub fn queries_starving(seen: &std::sync::atomic::AtomicU64) -> bool {
-    let now = crate::observability::counter_value("timefusion.scan.heavy_query_queue_timeout");
+    let now = crate::observability::counter_value(scan_metric_names::HEAVY_QUERY_QUEUE_TIMEOUT);
     now > seen.swap(now, std::sync::atomic::Ordering::Relaxed)
 }
 
@@ -1450,21 +1441,17 @@ pub fn backfill_enqueue_deferred(
     pending: usize, coverage_short: bool, flush_stalls_delta: u64, buffer_pressure_pct: u32, replay_complete: bool, queries_starving: bool,
 ) -> Option<&'static str> {
     const BACKFILL_PENDING_CEILING: usize = 25_000;
-    if flush_stalls_delta > 0 {
-        return Some("flush_stalled");
-    }
-    // Client queries outrank backfill the same way flush does: a heavy-queue
-    // timeout is a customer waiting a full budget for nothing.
-    if queries_starving {
-        return Some("queries_starving");
-    }
-    if buffer_pressure_pct >= crate::config::HYGIENE_BUFFER_YIELD_PCT {
-        return Some("buffer_pressure");
-    }
-    if !replay_complete {
-        return Some("replay_incomplete");
-    }
-    (pending >= BACKFILL_PENDING_CEILING && !coverage_short).then_some("queue_ceiling")
+    // First match wins. Client queries outrank backfill the same way flush does: a
+    // heavy-queue timeout is a customer waiting a full budget for nothing.
+    [
+        (flush_stalls_delta > 0, "flush_stalled"),
+        (queries_starving, "queries_starving"),
+        (buffer_pressure_pct >= crate::config::HYGIENE_BUFFER_YIELD_PCT, "buffer_pressure"),
+        (!replay_complete, "replay_incomplete"),
+        (pending >= BACKFILL_PENDING_CEILING && !coverage_short, "queue_ceiling"),
+    ]
+    .into_iter()
+    .find_map(|(hit, why)| hit.then_some(why))
 }
 
 /// Which declared tiers each candidate day is missing, so the caller can enqueue
@@ -1547,10 +1534,11 @@ fn coordinator_operation_lifetime_cap(operation: crate::maintenance_coordinator:
 fn coordinator_operation_timeout(operation: crate::maintenance_coordinator::Operation) -> std::time::Duration {
     use crate::maintenance_coordinator::Operation;
     match operation {
-        Operation::HotPacking | Operation::SealedConsolidation | Operation::Repair => COORDINATOR_FILE_REWRITE_TIMEOUT,
-        // Rollup cost is set by INPUT FILE COUNT, so narrowing the slice shrinks
-        // nothing and bisection never converges.
-        Operation::BaseRollup | Operation::DerivedRollup => COORDINATOR_FILE_REWRITE_TIMEOUT,
+        // Rollups too: their cost is set by INPUT FILE COUNT, so narrowing the
+        // slice shrinks nothing and bisection never converges.
+        Operation::HotPacking | Operation::SealedConsolidation | Operation::Repair | Operation::BaseRollup | Operation::DerivedRollup => {
+            COORDINATOR_FILE_REWRITE_TIMEOUT
+        }
         Operation::Dedup => COORDINATOR_STANDARD_UNIT_TIMEOUT,
     }
 }
@@ -1564,7 +1552,7 @@ const COORDINATOR_SEALED_TARGET_BYTES: i64 = 256 * 1024 * 1024;
 /// pending. The guard is bypassed when sealed debt is zero, so this is a
 /// catch-up allocation rather than a permanent loss of concurrency.
 pub(crate) fn hot_packing_permits(light_rewrite_permits: usize) -> usize {
-    (light_rewrite_permits / 3).max(1).min(light_rewrite_permits.max(1))
+    (light_rewrite_permits / 3).max(1)
 }
 
 /// Rows per decode batch for any session that reads the wide OTel schema. The
@@ -1609,17 +1597,9 @@ fn build_delta_write_session_state(
 /// Spawn a background cron task running `job` at each wall-clock occurrence of
 /// `schedule`. A tick whose predecessor is still running is skipped, not queued;
 /// slow but healthy runs are never aborted — only shutdown forces an abort.
-fn spawn_cron_job<F, Fut>(name: &'static str, schedule: &str, cancel: Arc<CancellationToken>, job: F)
-where
-    F: Fn() -> Fut + Send + 'static,
-    Fut: std::future::Future<Output = ()> + Send + 'static,
-{
-    spawn_cron_job_on(name, schedule, cancel, None, job);
-}
-
-/// Schedule like [`spawn_cron_job`], but execute each job body on `executor` so its CPU and I/O
-/// stay off the foreground runtime. The wall-clock timer stays on the caller's runtime.
-fn spawn_cron_job_on<F, Fut>(name: &'static str, schedule: &str, cancel: Arc<CancellationToken>, executor: Option<tokio::runtime::Handle>, job: F)
+/// `executor` runs each job body off the foreground runtime; the wall-clock timer
+/// stays on the caller's.
+fn spawn_cron_job<F, Fut>(name: &'static str, schedule: &str, cancel: Arc<CancellationToken>, executor: Option<tokio::runtime::Handle>, job: F)
 where
     F: Fn() -> Fut + Send + 'static,
     Fut: std::future::Future<Output = ()> + Send + 'static,
@@ -1695,7 +1675,7 @@ where
     Fut: std::future::Future<Output = ()> + Send + 'static,
 {
     let db = Arc::clone(db);
-    spawn_cron_job(name, schedule, cancel, move || job(Arc::clone(&db)));
+    spawn_cron_job(name, schedule, cancel, None, move || job(Arc::clone(&db)));
 }
 
 /// `commitInfo.info` key for the WAL watermark.
@@ -2120,6 +2100,7 @@ fn coverage_is_short() -> bool {
 }
 
 /// The overlap of two coalesced range sets. Both inputs must already be sorted and disjoint.
+/// Imperative two-pointer walk: each step advances one side, which no adapter expresses plainer.
 fn intersect_ranges(left: &[(i64, i64)], right: &[(i64, i64)]) -> Vec<(i64, i64)> {
     let (mut i, mut j, mut out) = (0, 0, Vec::new());
     while i < left.len() && j < right.len() {
@@ -2167,13 +2148,15 @@ fn batch_dirty_ranges(batch: &RecordBatch) -> Option<HashMap<String, Vec<(i64, i
         )
     });
     if let Some(cells) = cells {
-        return Some(cells.into_iter().fold(HashMap::<String, Vec<(i64, i64)>>::new(), |mut dates, cell| {
-            let start = cell * NORMAL_SLICE_MICROS;
-            if let Some(date) = date_of(start) {
-                dates.entry(date).or_default().push((start, start + NORMAL_SLICE_MICROS));
-            }
-            dates
-        }));
+        return Some(
+            cells
+                .into_iter()
+                .filter_map(|cell| {
+                    let start = cell * NORMAL_SLICE_MICROS;
+                    Some((date_of(start)?, (start, start + NORMAL_SLICE_MICROS)))
+                })
+                .into_group_map(),
+        );
     }
     // Without a timestamp there is no cell to name, so the whole day is dirty.
     let text = cast(batch.column_by_name("date")?, &DataType::Utf8).ok()?;
@@ -2181,7 +2164,7 @@ fn batch_dirty_ranges(batch: &RecordBatch) -> Option<HashMap<String, Vec<(i64, i
         text.as_string::<i32>()
             .iter()
             .flatten()
-            .filter_map(|date| Some((date.to_string(), vec![(date_start_micros(date)?, date_start_micros(date)? + DAY_MICROS)])))
+            .filter_map(|date| date_start_micros(date).map(|start| (date.to_string(), vec![(start, start + DAY_MICROS)])))
             .collect(),
     )
 }
@@ -2369,9 +2352,9 @@ fn remove_for_add(add: &deltalake::kernel::Add, data_change: bool) -> deltalake:
 /// Collect matched Adds keeping at most one per path. A path can appear twice when an incremental
 /// snapshot refresh crosses a checkpoint, and a duplicate silently mismatches a rewrite plan.
 fn dedup_adds_by_path(adds: impl Iterator<Item = deltalake::kernel::Add>, table_name: &str) -> Vec<deltalake::kernel::Add> {
-    let mut seen = HashSet::new();
-    let mut total = 0usize;
-    let out: Vec<deltalake::kernel::Add> = adds.inspect(|_| total += 1).filter(|add| seen.insert(add.path.clone())).collect();
+    let adds = adds.collect_vec();
+    let total = adds.len();
+    let out = adds.into_iter().unique_by(|add| add.path.clone()).collect_vec();
     let dropped = total - out.len();
     if dropped > 0 {
         warn!(table_name, dropped, event = "snapshot_duplicate_adds", "snapshot listed the same file more than once — reads over it double-count rows");
@@ -2517,7 +2500,7 @@ fn derive_date_partition(batch: RecordBatch) -> DFResult<RecordBatch> {
             _ => return Err(fail("timestamp column is not a timestamp")),
         }
     };
-    let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+    let epoch = chrono::DateTime::<Utc>::UNIX_EPOCH.date_naive();
     let dates = micros
         .into_iter()
         .map(|micros| {
@@ -3085,9 +3068,10 @@ impl Database {
 
     fn build_storage_options(&self) -> HashMap<String, String> {
         let storage_options = self.config.aws.build_storage_options(self.default_s3_endpoint.as_deref());
-
-        let safe_options: HashMap<_, _> = storage_options.iter().filter(|(k, _)| !k.contains("secret") && !k.contains("password")).collect();
-        debug!("Storage options configured: {:?}", safe_options);
+        debug!(
+            "Storage options configured: {:?}",
+            storage_options.iter().filter(|(k, _)| !k.contains("secret") && !k.contains("password")).collect::<HashMap<_, _>>()
+        );
         storage_options
     }
 
@@ -3098,14 +3082,6 @@ impl Database {
     /// sort keys — the footer is trusted, not verified.
     fn create_writer_properties(&self, schema: &crate::schema::TableSchema, zstd_level: i32, declare_sorted: bool) -> WriterProperties {
         build_writer_properties(&self.config.parquet, schema, zstd_level, declare_sorted, None)
-    }
-
-    /// Writer properties for a rewrite that has measured its input's row width, so row groups
-    /// are capped by decoded bytes rather than by an estimate.
-    pub(crate) fn create_writer_properties_measured(
-        &self, schema: &crate::schema::TableSchema, zstd_level: i32, declare_sorted: bool, bytes_per_row: Option<u64>,
-    ) -> WriterProperties {
-        build_writer_properties(&self.config.parquet, schema, zstd_level, declare_sorted, bytes_per_row)
     }
 
     /// WriterProperties for DML rewrite paths (delta-rs would otherwise default to SNAPPY).
@@ -3180,24 +3156,21 @@ impl Database {
         .await?;
 
         let key_set = crate::config::key_configured();
-        let mut map = HashMap::new();
-        let mut plaintext_rows = 0usize;
-        'rows: for mut config in configs {
-            let all_encrypted = [&config.s3_access_key_id, &config.s3_secret_access_key].into_iter().all(|v| v.starts_with(crate::config::ENC_PREFIX));
-            let (project_id, table_name) = (config.project_id.clone(), config.table_name.clone());
-            for (name, field) in [("s3_access_key_id", &mut config.s3_access_key_id), ("s3_secret_access_key", &mut config.s3_secret_access_key)] {
-                match crate::config::decrypt_or_passthrough(field) {
-                    Ok(v) => *field = v,
-                    Err(e) => {
-                        error!("Skipping {project_id}/{table_name}: cannot decrypt {name}: {e}");
-                        continue 'rows;
-                    }
+        let (encrypted, map): (Vec<bool>, HashMap<_, _>) = configs
+            .into_iter()
+            .filter_map(|mut config| {
+                let all_encrypted = [&config.s3_access_key_id, &config.s3_secret_access_key].into_iter().all(|v| v.starts_with(crate::config::ENC_PREFIX));
+                let (project_id, table_name) = (config.project_id.clone(), config.table_name.clone());
+                for (name, field) in [("s3_access_key_id", &mut config.s3_access_key_id), ("s3_secret_access_key", &mut config.s3_secret_access_key)] {
+                    *field = crate::config::decrypt_or_passthrough(field)
+                        .inspect_err(|e| error!("Skipping {project_id}/{table_name}: cannot decrypt {name}: {e}"))
+                        .ok()?;
                 }
-            }
-            plaintext_rows += usize::from(!all_encrypted);
-            debug!("Loaded config: {project_id}/{table_name}");
-            map.insert((project_id, table_name), config);
-        }
+                debug!("Loaded config: {project_id}/{table_name}");
+                Some((all_encrypted, ((project_id, table_name), config)))
+            })
+            .unzip();
+        let plaintext_rows = encrypted.iter().filter(|&&e| !e).count();
         if plaintext_rows > 0 {
             warn!(
                 "{} timefusion_projects row(s) hold AWS credentials in plaintext. Re-encrypt with `timefusion encrypt-secret <value>` and UPDATE the row.",
@@ -3245,12 +3218,13 @@ impl Database {
     pub async fn with_config(cfg: Arc<AppConfig>) -> Result<Self> {
         cfg.apply_runtime_flags();
         crate::storage::prune_stale(&Self::delta_snapshot_dir(&cfg), crate::storage::SNAPSHOT_MAX_AGE);
+        let data_dir = &cfg.core.timefusion_data_dir;
         let dedup_dirty_bins = Arc::new(dashmap::DashMap::new());
         // Re-key any bin recorded at a different width. The queue is the ONLY record that a bin
         // needs dedup, so bins are remapped (over-approximating) rather than discarded.
         let width_micros = crate::database::compact::bin_micros();
         let mut remapped = 0usize;
-        for bin in crate::storage::load_sidecar::<crate::storage::DirtyBin>(&cfg.core.timefusion_data_dir, crate::storage::DIRTY_BINS) {
+        for bin in crate::storage::load_sidecar::<crate::storage::DirtyBin>(data_dir, crate::storage::DIRTY_BINS) {
             let was = bin.width_minutes.max(1) * 60 * 1_000_000;
             if was != width_micros {
                 remapped += 1;
@@ -3271,7 +3245,7 @@ impl Database {
         let rollup_dirty = Arc::new(dashmap::DashMap::new());
         let rollup_source_epochs = Arc::new(dashmap::DashMap::new());
         let rollup_invalidated_at = Arc::new(dashmap::DashMap::new());
-        let mut maintenance_tasks = crate::maintenance_coordinator::TaskJournal::load(&cfg.core.timefusion_data_dir)?;
+        let mut maintenance_tasks = crate::maintenance_coordinator::TaskJournal::load(data_dir)?;
         maintenance_tasks.base_hour_units = cfg.maintenance.timefusion_rollup_hour_units;
         let requeued_tasks = maintenance_tasks.requeue_running(crate::support::now_micros());
         if requeued_tasks != 0 {
@@ -3282,13 +3256,13 @@ impl Database {
         // `claim_next` ranks damage from a runtime set filled long after boot, so the ranking
         // is restored from a sidecar here.
         {
-            let restored = crate::storage::load_sidecar::<crate::storage::StoredUntaggedCell>(&cfg.core.timefusion_data_dir, crate::storage::UNTAGGED_CELLS);
+            let restored = crate::storage::load_sidecar::<crate::storage::StoredUntaggedCell>(data_dir, crate::storage::UNTAGGED_CELLS);
             if !restored.is_empty() {
                 info!(cells = restored.len(), event = "rollup_untagged_cells_restored");
                 maintenance_tasks.restore_untagged_cells(restored.into_iter().map(|cell| (cell.source, cell.project_id, cell.table_name, cell.date)));
             }
         }
-        for entry in crate::rollup_journal::load(&cfg.core.timefusion_data_dir) {
+        for entry in crate::rollup_journal::load(data_dir) {
             let key = (entry.project_id, entry.source, entry.date);
             rollup_source_epochs.insert(key.clone(), entry.epoch);
             let dirty = if entry.unknown { crate::rollup::ALL_HOURS } else { entry.dirty_hours };
@@ -3308,25 +3282,33 @@ impl Database {
         );
         // Reload sweep certifications so the read-side dedup skip is not cold after a deploy.
         // `dedup_window_clean` re-checks each entry's fingerprint, so stale records fail there.
-        let dedup_clean_fp: Arc<dashmap::DashMap<(String, String, String), Certification>> = Arc::new(dashmap::DashMap::new());
-        let dedup_slice_coverage: Arc<dashmap::DashMap<(String, String, String), SliceCoverage>> = Arc::new(dashmap::DashMap::new());
-        if cfg.maintenance.timefusion_dedup_certification_persist {
-            let now = std::time::Instant::now();
-            for entry in crate::storage::load_sidecar::<crate::storage::StoredCertification>(&cfg.core.timefusion_data_dir, crate::storage::CERTIFICATIONS) {
-                // Rebuild the monotonic instant from the stored wall-clock age so dwell keeps
-                // measuring real lifetime across boots; a backwards clock falls back to "now".
-                let since = crate::storage::age_since(entry.granted_unix_ms).and_then(|age| now.checked_sub(age)).unwrap_or(now);
-                dedup_clean_fp.insert(
-                    (entry.project_id, entry.table_name, entry.date),
-                    Certification { fp: entry.fp, since, files: Arc::new(entry.files), stale: entry.stale },
-                );
-            }
+        let persisted = cfg.maintenance.timefusion_dedup_certification_persist;
+        let now = std::time::Instant::now();
+        let dedup_clean_fp: Arc<dashmap::DashMap<(String, String, String), Certification>> = Arc::new(
+            persisted
+                .then(|| crate::storage::load_sidecar::<crate::storage::StoredCertification>(data_dir, crate::storage::CERTIFICATIONS))
+                .unwrap_or_default()
+                .into_iter()
+                .map(|entry| {
+                    // Rebuild the monotonic instant from the stored wall-clock age so dwell keeps
+                    // measuring real lifetime across boots; a backwards clock falls back to "now".
+                    let since = crate::storage::age_since(entry.granted_unix_ms).and_then(|age| now.checked_sub(age)).unwrap_or(now);
+                    ((entry.project_id, entry.table_name, entry.date), Certification { fp: entry.fp, since, files: Arc::new(entry.files), stale: entry.stale })
+                })
+                .collect(),
+        );
+        // Slice coverage too: the journal durably skips completed slices, so losing their
+        // evidence makes any day straddling one permanently uncertifiable.
+        let dedup_slice_coverage: Arc<dashmap::DashMap<(String, String, String), SliceCoverage>> = Arc::new(
+            persisted
+                .then(|| crate::storage::load_sidecar::<crate::storage::StoredSliceCoverage>(data_dir, crate::storage::SLICE_COVERAGE))
+                .unwrap_or_default()
+                .into_iter()
+                .map(|e| ((e.project_id, e.table_name, e.date), SliceCoverage { fp: e.fp, intervals: e.intervals, files: e.files }))
+                .collect(),
+        );
+        if persisted {
             info!(loaded = dedup_clean_fp.len(), event = "dedup_certifications_loaded");
-            // Slice coverage too: the journal durably skips completed slices, so losing their
-            // evidence makes any day straddling one permanently uncertifiable.
-            for e in crate::storage::load_sidecar::<crate::storage::StoredSliceCoverage>(&cfg.core.timefusion_data_dir, crate::storage::SLICE_COVERAGE) {
-                dedup_slice_coverage.insert((e.project_id, e.table_name, e.date), SliceCoverage { fp: e.fp, intervals: e.intervals, files: e.files });
-            }
             info!(loaded = dedup_slice_coverage.len(), event = "dedup_slice_coverage_loaded");
         }
         let aws_endpoint = &cfg.aws.aws_s3_endpoint;
@@ -3391,102 +3373,101 @@ impl Database {
             coordinator_io_slots,
             coordinator_io_slots,
         );
-        let logical_count_cache =
-            Arc::new(crate::read::LogicalCountCache::new(cfg.core.timefusion_data_dir.join("logical_count"), cfg.derived.logical_count_memory_bytes()));
+        let logical_count_cache = Arc::new(crate::read::LogicalCountCache::new(data_dir.join("logical_count"), cfg.derived.logical_count_memory_bytes()));
         let db = Self {
             config: cfg.clone(),
-            runtime_env: Arc::new(std::sync::OnceLock::new()),
-            maintenance_runtime_env: Arc::new(std::sync::OnceLock::new()),
-            light_optimize_runtime_env: Arc::new(std::sync::OnceLock::new()),
-            repair_runtime_env: Arc::new(std::sync::OnceLock::new()),
-            coordinator_runtime_env: Arc::new(std::sync::OnceLock::new()),
+            runtime_env: Default::default(),
+            maintenance_runtime_env: Default::default(),
+            light_optimize_runtime_env: Default::default(),
+            repair_runtime_env: Default::default(),
+            coordinator_runtime_env: Default::default(),
             flush_sort_gate: Arc::new(tokio::sync::Semaphore::new(flush_sort_permits(cfg.maintenance.flush_sort_pool_bytes()))),
-            flush_sort_runtime_env: Arc::new(std::sync::OnceLock::new()),
-            maintenance_session_state: Arc::new(std::sync::OnceLock::new()),
-            light_optimize_session_state: Arc::new(std::sync::OnceLock::new()),
-            repair_session_states: Arc::new(dashmap::DashMap::new()),
-            unified_tables: Arc::new(RwLock::new(HashMap::new())),
-            custom_project_tables: Arc::new(RwLock::new(HashMap::new())),
-            fast_resolve_cache: Arc::new(dashmap::DashMap::new()),
-            delta_has_files: Arc::new(dashmap::DashMap::new()),
-            delta_provider_cache: Arc::new(dashmap::DashMap::new()),
-            read_activity: Arc::default(),
-            scan_metrics: Arc::new(ScanMetrics::default()),
+            flush_sort_runtime_env: Default::default(),
+            maintenance_session_state: Default::default(),
+            light_optimize_session_state: Default::default(),
+            repair_session_states: Default::default(),
+            unified_tables: Default::default(),
+            custom_project_tables: Default::default(),
+            fast_resolve_cache: Default::default(),
+            delta_has_files: Default::default(),
+            delta_provider_cache: Default::default(),
+            read_activity: Default::default(),
+            scan_metrics: Default::default(),
             batch_queue: None,
             maintenance_shutdown: Arc::new(maintenance_shutdown),
             maintenance_tasks_tracker,
             _maintenance_cancel_guard: Some(maintenance_cancel_guard),
-            preload_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            preload_replay_complete: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            preload_replay_notify: Arc::new(tokio::sync::Notify::new()),
-            preload_tables_done: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            preload_tables_total: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            maintenance_executor: Arc::new(std::sync::OnceLock::new()),
+            preload_started: Default::default(),
+            preload_replay_complete: Default::default(),
+            preload_replay_notify: Default::default(),
+            preload_tables_done: Default::default(),
+            preload_tables_total: Default::default(),
+            maintenance_executor: Default::default(),
             config_pool,
             storage_configs: Arc::new(RwLock::new(storage_configs)),
-            storage_configs_next_refresh_ns: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            storage_configs_next_refresh_ns: Default::default(),
             default_s3_bucket: cfg.aws.aws_s3_bucket.clone(),
             default_s3_endpoint: Some(aws_endpoint.clone()),
             object_store_cache,
             statistics_extractor,
-            last_written_versions: Arc::new(RwLock::new(HashMap::new())),
-            last_dedup_versions: Arc::new(RwLock::new(HashMap::new())),
+            last_written_versions: Default::default(),
+            last_dedup_versions: Default::default(),
             dedup_clean_fp,
-            dedup_probe_declined: Arc::new(dashmap::DashMap::new()),
-            dedup_certification_persist_lock: Arc::new(std::sync::Mutex::new(())),
-            dedup_certification_persist_at: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+            dedup_probe_declined: Default::default(),
+            dedup_certification_persist_lock: Default::default(),
+            dedup_certification_persist_at: Default::default(),
             dedup_slice_coverage,
             rollup_source_epochs,
-            rollup_coverage: Arc::new(dashmap::DashMap::new()),
-            rollup_slice_coverage: Arc::new(dashmap::DashMap::new()),
+            rollup_coverage: Default::default(),
+            rollup_slice_coverage: Default::default(),
             rollup_carried_witnesses: Arc::new(
-                crate::storage::load_sidecar::<crate::storage::StoredCarriedWitness>(&cfg.core.timefusion_data_dir, crate::storage::ROLLUP_CARRIED_WITNESSES)
+                crate::storage::load_sidecar::<crate::storage::StoredCarriedWitness>(data_dir, crate::storage::ROLLUP_CARRIED_WITNESSES)
                     .into_iter()
                     .map(|carried| (carried.slice.clone(), carried))
                     .collect(),
             ),
-            rollup_coverage_recovered: Arc::new(dashmap::DashSet::new()),
-            dv_strips_landed: Arc::new(dashmap::DashMap::new()),
-            dv_strips_global: Arc::new(parking_lot::Mutex::new((0, 0))),
-            rollup_file_rows_cache: dashmap::DashMap::new(),
-            version_only: Arc::default(),
-            rollup_tier_untagged: Arc::new(dashmap::DashMap::new()),
-            coverage_ledger: Arc::new(crate::storage::JsonCoverageLedger::load(&cfg.core.timefusion_data_dir)),
+            rollup_coverage_recovered: Default::default(),
+            dv_strips_landed: Default::default(),
+            dv_strips_global: Default::default(),
+            rollup_file_rows_cache: Default::default(),
+            version_only: Default::default(),
+            rollup_tier_untagged: Default::default(),
+            coverage_ledger: Arc::new(crate::storage::JsonCoverageLedger::load(data_dir)),
             rollup_dirty,
             rollup_invalidated_at,
-            rollup_journal_lock: Arc::new(std::sync::Mutex::new(())),
-            rollup_journal_persisted: Arc::new(std::sync::Mutex::new(PersistedRollupJournal::default())),
-            journal_group_commit: Arc::new(crate::support::GroupCommit::default()),
-            task_journal_group_commit: Arc::new(crate::support::GroupCommit::default()),
+            rollup_journal_lock: Default::default(),
+            rollup_journal_persisted: Default::default(),
+            journal_group_commit: Default::default(),
+            task_journal_group_commit: Default::default(),
             maintenance_tasks: Arc::new(std::sync::Mutex::new(maintenance_tasks)),
-            maintenance_work: Arc::new(tokio::sync::Notify::new()),
+            maintenance_work: Default::default(),
             maintenance_admission,
             maintenance_debt_planned_at: Arc::new(std::sync::atomic::AtomicI64::new(i64::MIN)),
             tantivy_census_at: Arc::new(std::sync::atomic::AtomicI64::new(i64::MIN)),
-            dedup_probe_cost_ms: Arc::new(dashmap::DashMap::new()),
-            maintenance_schedule_cursor: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            rollup_backoff: Arc::new(dashmap::DashMap::new()),
+            dedup_probe_cost_ms: Default::default(),
+            maintenance_schedule_cursor: Default::default(),
+            rollup_backoff: Default::default(),
             logical_count_cache,
             // Serial by design: a build retains one winner per logical key.
             logical_count_build_sem: Arc::new(tokio::sync::Semaphore::new(1)),
             dedup_dirty_bins,
-            dedup_backoff: Arc::new(dashmap::DashMap::new()),
-            repair_verified_sorted: Arc::new(dashmap::DashSet::new()),
-            repair_verified_lock: Arc::new(std::sync::Mutex::new(())),
-            repair_verified_appends: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            repair_failures: Arc::new(dashmap::DashMap::new()),
-            lossy_refusals: Arc::new(crate::storage::load_sidecar(&cfg.core.timefusion_data_dir, crate::storage::LOSSY_PARKS).into_iter().collect()),
-            repair_degradation: Arc::new(dashmap::DashMap::new()),
+            dedup_backoff: Default::default(),
+            repair_verified_sorted: Default::default(),
+            repair_verified_lock: Default::default(),
+            repair_verified_appends: Default::default(),
+            repair_failures: Default::default(),
+            lossy_refusals: Arc::new(crate::storage::load_sidecar(data_dir, crate::storage::LOSSY_PARKS).into_iter().collect()),
+            repair_degradation: Default::default(),
             maintenance_rewrite_sem: Arc::new(tokio::sync::Semaphore::new(cfg.derived.rewrite_permits().max(1))),
             light_rewrite_sem: Arc::new(tokio::sync::Semaphore::new(light_rewrite_permits)),
-            hygiene_gate: Arc::new(HygieneGate::default()),
-            maintenance_quiesced: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            backfill_flush_stalls_seen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            census_admitted: Arc::new(dashmap::DashMap::new()),
-            census_query_timeouts_seen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            claims_query_timeouts_seen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            hygiene_gate: Default::default(),
+            maintenance_quiesced: Default::default(),
+            backfill_flush_stalls_seen: Default::default(),
+            census_admitted: Default::default(),
+            census_query_timeouts_seen: Default::default(),
+            claims_query_timeouts_seen: Default::default(),
             hot_packing_sem: Arc::new(tokio::sync::Semaphore::new(hot_packing_permits)),
-            repair_holdback_lent: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            repair_holdback_lent: Default::default(),
             repair_rewrite_sem: Arc::new(tokio::sync::Semaphore::new(cfg.derived.repair_rewrite_budget_mib())),
             // Three quarters to debt, leaving a quarter always free for the rollup chain.
             maintenance_debt_slots: Arc::new(tokio::sync::Semaphore::new((coordinator_jobs * 3 / 4).max(1))),
@@ -3498,28 +3479,28 @@ impl Database {
             heavy_scan_sem: Arc::new(tokio::sync::Semaphore::new(heavy_scan_permits)),
             maintenance_scan_sem: Arc::new(tokio::sync::Semaphore::new(crate::config::maintenance_scan_permits(heavy_scan_permits))),
             maintenance_job_sem: Arc::new(tokio::sync::Semaphore::new(1)),
-            commit_locks: Arc::new(dashmap::DashMap::new()),
-            flush_waiter_counts: Arc::new(dashmap::DashMap::new()),
-            dml_locks: Arc::new(dashmap::DashMap::new()),
-            histogram_dml: Arc::new(dashmap::DashMap::new()),
-            histogram_delta: Arc::new(histogram::HistogramDeltaCache::default()),
-            histogram_proof_build: Arc::new(histogram::HistogramProofBuilds::default()),
+            commit_locks: Default::default(),
+            flush_waiter_counts: Default::default(),
+            dml_locks: Default::default(),
+            histogram_dml: Default::default(),
+            histogram_delta: Default::default(),
+            histogram_proof_build: Default::default(),
             tantivy_backfill_slots: Default::default(),
-            snapshot_persist_gate: Arc::new(dashmap::DashMap::new()),
-            buffered_layer: Arc::new(std::sync::OnceLock::new()),
+            snapshot_persist_gate: Default::default(),
+            buffered_layer: Default::default(),
             bypass_buffer: false,
             bypass_rollup: false,
             maintenance_scan: false,
-            tantivy_search: Arc::new(std::sync::OnceLock::new()),
-            tantivy_indexer: Arc::new(std::sync::OnceLock::new()),
-            bloom_prune: Arc::new(std::sync::OnceLock::new()),
-            dml_coalescer: Arc::new(std::sync::OnceLock::new()),
-            zorder_filesets: Arc::new(RwLock::new(HashMap::new())),
-            checkpoint_versions: Arc::new(dashmap::DashMap::new()),
-            light_optimize_cursor: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            dedup_table_cursor: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            tantivy_search: Default::default(),
+            tantivy_indexer: Default::default(),
+            bloom_prune: Default::default(),
+            dml_coalescer: Default::default(),
+            zorder_filesets: Default::default(),
+            checkpoint_versions: Default::default(),
+            light_optimize_cursor: Default::default(),
+            dedup_table_cursor: Default::default(),
             repair_pass_permit: Arc::new(tokio::sync::Semaphore::new(1)),
-            staged_intent_manifest_lock: Arc::new(std::sync::Mutex::new(())),
+            staged_intent_manifest_lock: Default::default(),
         };
 
         db.seed_routing_from_ledger();
@@ -3596,7 +3577,6 @@ impl Database {
         self.bloom_prune.get().filter(|_| self.config.maintenance.timefusion_file_bloom_pruning)
     }
 
-    /// Create and configure a SessionContext with DataFusion settings
     pub fn create_session_context(self: Arc<Self>) -> SessionContext {
         self.create_session_context_for(false)
     }
@@ -3905,7 +3885,6 @@ impl Database {
         ));
     }
 
-    /// Register JSON functions from datafusion-functions-json
     pub fn register_json_functions(&self, ctx: &mut SessionContext) {
         datafusion_functions_json::register_all(ctx).expect("Failed to register JSON functions");
         info!("Registered JSON functions with SessionContext");
@@ -3922,6 +3901,9 @@ impl Database {
         self.storage_configs.read().await.keys().cloned().collect()
     }
 
+    /// Lock-free hot-path resolve: returns the cached handle without any `.await`,
+    /// skipping the version-refresh check `resolve_table` does. Only for reads that
+    /// tolerate a snapshot a few seconds behind a flush.
     #[instrument(
         name = "database.resolve_table",
         skip(self),
@@ -3932,9 +3914,6 @@ impl Database {
             is_custom = Empty,
         )
     )]
-    /// Lock-free hot-path resolve: returns the cached handle without any `.await`,
-    /// skipping the version-refresh check `resolve_table` does. Only for reads that
-    /// tolerate a snapshot a few seconds behind a flush.
     pub fn try_fast_resolve(&self, project_id: &str, table_name: &str) -> Option<Arc<RwLock<DeltaTable>>> {
         self.fast_resolve_cache.get(&table_key(project_id, table_name)).map(|r| Arc::clone(r.value()))
     }
@@ -4011,8 +3990,7 @@ impl Database {
                 && self.storage_configs_next_refresh_ns.compare_exchange(next, now_ns + STORAGE_CONFIGS_TTL_NS, Ordering::AcqRel, Ordering::Relaxed).is_ok()
                 && let Ok(new_configs) = Self::load_storage_configs(pool).await
             {
-                let mut configs = self.storage_configs.write().await;
-                *configs = new_configs;
+                *self.storage_configs.write().await = new_configs;
             }
         }
 
@@ -4182,9 +4160,11 @@ impl Database {
         // a BYO bucket with no custom endpoint must resolve against real AWS S3, so
         // the inherited default is dropped rather than kept.
         let mut storage_options = self.build_storage_options();
-        storage_options.insert("AWS_ACCESS_KEY_ID".to_string(), config.s3_access_key_id.clone());
-        storage_options.insert("AWS_SECRET_ACCESS_KEY".to_string(), config.s3_secret_access_key.clone());
-        storage_options.insert("AWS_REGION".to_string(), config.s3_region.clone());
+        storage_options.extend([
+            ("AWS_ACCESS_KEY_ID".to_string(), config.s3_access_key_id.clone()),
+            ("AWS_SECRET_ACCESS_KEY".to_string(), config.s3_secret_access_key.clone()),
+            ("AWS_REGION".to_string(), config.s3_region.clone()),
+        ]);
         match config.s3_endpoint.as_ref() {
             Some(endpoint) => storage_options.insert("AWS_ENDPOINT_URL".to_string(), endpoint.clone()),
             None => storage_options.remove("AWS_ENDPOINT_URL"),
@@ -4206,7 +4186,7 @@ impl Database {
     /// Table properties applied at CREATE and reconciled on tables loaded from
     /// storage, so a config change also reaches tables that baked in an older value.
     fn delta_table_properties(&self, table_name: &str) -> HashMap<String, String> {
-        let mut props = HashMap::from([
+        [
             // Aligned with vacuum retention so checkpoints prune Remove tombstones
             // as soon as vacuum has had its shot at the files.
             ("delta.deletedFileRetentionDuration".to_string(), format!("interval {} hours", self.config.maintenance.timefusion_vacuum_retention_hours)),
@@ -4221,16 +4201,14 @@ impl Database {
             // legacy `dataSkippingNumIndexedCols=-1` (delta-rs reads stats_columns first),
             // so that key is left alone rather than removed.
             ("delta.dataSkippingStatsColumns".to_string(), stats_columns_for(schema_or_default(table_name))),
-        ]);
+        ]
+        .into_iter()
         // Merge-on-read deletion vectors. Opt-in only; `ensure_table_properties` is
         // idempotent, so an already-upgraded table commits nothing.
-        if self.config.maintenance.timefusion_use_deletion_vectors {
-            props.insert("delta.enableDeletionVectors".to_string(), "true".to_string());
-        }
-        props
+        .chain(self.config.maintenance.timefusion_use_deletion_vectors.then(|| ("delta.enableDeletionVectors".to_string(), "true".to_string())))
+        .collect()
     }
 
-    /// Internal helper to create/load a Delta table with caching and retry logic
     async fn create_delta_table_internal(&self, storage_uri: &str, storage_options: &HashMap<String, String>, table_name: &str) -> Result<DeltaTable> {
         // Two S3 clients, one per request class: the data client keeps the generous
         // `request_timeout` a multi-MB parquet part needs, while `_delta_log` traffic
@@ -4377,8 +4355,7 @@ impl Database {
         let scope = if warm_full_files { "full" } else { "footer-only" };
         // Pace only the boot/background pass (confirm=None); per-flush confirm
         // warms are small and latency-relevant.
-        let body_pace = (confirm.is_none() && self.config.maintenance.timefusion_warm_body_boot_files_per_sec > 0)
-            .then(|| std::time::Duration::from_secs_f64(1.0 / f64::from(self.config.maintenance.timefusion_warm_body_boot_files_per_sec)));
+        let body_pace = self.hot_body_caps().filter(|_| confirm.is_none()).map(|caps| caps.pace);
         if confirm.is_none() {
             info!("Cache warm start: {count} files (scope={scope}, concurrency={concurrency})");
         }
@@ -4494,9 +4471,10 @@ impl Database {
     fn warm_strip_bodies(&self, table_ref: &Arc<RwLock<DeltaTable>>, landed: &[StagedBin]) {
         let m = &self.config.maintenance;
         let Some(shared) = self.object_store_cache.clone() else { return };
-        if !m.timefusion_warm_after_compaction || m.timefusion_hot_body_preload_projects == 0 || m.timefusion_warm_body_boot_files_per_sec == 0 {
+        if !m.timefusion_warm_after_compaction || m.timefusion_hot_body_preload_projects == 0 {
             return;
         }
+        let Some(base) = self.hot_body_caps() else { return };
         let today = Utc::now().date_naive();
         let max_bytes = self.config.cache.block_size_bytes() as u64;
         let queue: Vec<(usize, object_store::path::Path, u64)> = landed
@@ -4516,14 +4494,7 @@ impl Database {
         if queue.is_empty() {
             return;
         }
-        let caps = HotBodyCaps {
-            projects: 1,
-            total_bytes: m.timefusion_hot_body_preload_project_mb << 20,
-            project_bytes: m.timefusion_hot_body_preload_project_mb << 20,
-            budget: std::time::Duration::from_secs(m.timefusion_hot_body_preload_budget_secs),
-            pace: std::time::Duration::from_secs_f64(1.0 / f64::from(m.timefusion_warm_body_boot_files_per_sec)),
-            concurrency: 1,
-        };
+        let caps = HotBodyCaps { projects: 1, total_bytes: base.project_bytes, concurrency: 1, ..base };
         let table_ref = Arc::clone(table_ref);
         tokio::spawn(async move {
             let (store, table_uri) = {
@@ -4570,8 +4541,6 @@ impl Database {
         .await
     }
 
-    /// [`Self::preload_hot_bodies_with`] under the configured caps, at the boot
-    /// body pace (0 = no boot body warms, this one included).
     /// One disk-cache warm pass: for the (table, project) pairs client scans read recently, newest
     /// days first, fetch the column-chunk blocks of the columns they read into the disk tier,
     /// up to `timefusion_disk_warm_budget_pct` of the foyer disk and at the configured rate.
@@ -4593,6 +4562,7 @@ impl Database {
         // The whole horizon, not just the days already read: a 7d read must make the 14d and
         // 30d queries that follow it warm too.
         let oldest = Utc::now().date_naive() - chrono::Days::new(WARM_DAYS);
+        // Imperative: paced IO with a budget `break`, which no adapter expresses plainer.
         'pairs: for ((table, project), columns) in self.read_activity.recent() {
             let Ok(table_ref) = self.resolve_table(&project, &table).await else { continue };
             let (store, table_uri, files) = {
@@ -4674,21 +4644,26 @@ impl Database {
         (fetched, cached)
     }
 
-    async fn preload_hot_bodies(&self) {
+    /// The hot-body preload caps as configured, or `None` when the boot-body
+    /// rate is 0 (no boot body warms) — the pace divides by that rate, so this
+    /// is the one place the division happens.
+    fn hot_body_caps(&self) -> Option<HotBodyCaps> {
         let m = &self.config.maintenance;
-        if m.timefusion_warm_body_boot_files_per_sec == 0 {
-            return;
-        }
-        let r = self
-            .preload_hot_bodies_with(HotBodyCaps {
-                projects: m.timefusion_hot_body_preload_projects,
-                total_bytes: m.timefusion_hot_body_preload_total_mb << 20,
-                project_bytes: m.timefusion_hot_body_preload_project_mb << 20,
-                budget: std::time::Duration::from_secs(m.timefusion_hot_body_preload_budget_secs),
-                pace: std::time::Duration::from_secs_f64(1.0 / f64::from(m.timefusion_warm_body_boot_files_per_sec)),
-                concurrency: m.timefusion_hot_body_preload_concurrency,
-            })
-            .await;
+        (m.timefusion_warm_body_boot_files_per_sec > 0).then(|| HotBodyCaps {
+            projects: m.timefusion_hot_body_preload_projects,
+            total_bytes: m.timefusion_hot_body_preload_total_mb << 20,
+            project_bytes: m.timefusion_hot_body_preload_project_mb << 20,
+            budget: std::time::Duration::from_secs(m.timefusion_hot_body_preload_budget_secs),
+            pace: std::time::Duration::from_secs_f64(1.0 / f64::from(m.timefusion_warm_body_boot_files_per_sec)),
+            concurrency: m.timefusion_hot_body_preload_concurrency,
+        })
+    }
+
+    /// [`Self::preload_hot_bodies_with`] under the configured caps, at the boot
+    /// body pace (0 = no boot body warms, this one included).
+    async fn preload_hot_bodies(&self) {
+        let Some(caps) = self.hot_body_caps() else { return };
+        let r = self.preload_hot_bodies_with(caps).await;
         info!(event = "hot_body_preload_complete", files = r.files, bytes = r.bytes, cached = r.cached, capped = r.capped, budget_stopped = r.budget_stopped);
     }
 
@@ -4864,7 +4839,6 @@ impl Database {
         }
     }
 
-    /// Create an object store for the given URI and storage options
     pub async fn create_object_store(&self, storage_uri: &str, storage_options: &HashMap<String, String>) -> Result<Arc<dyn object_store::ObjectStore>> {
         self.create_object_store_with_timeout(storage_uri, storage_options, self.config.aws.request_timeout()).await
     }
@@ -5094,11 +5068,7 @@ pub(crate) struct SortMergeStream {
 /// `a`'s head sorts before `b`'s. Ties break by run index, which is what makes
 /// the merge stable w.r.t. the concatenation order.
 fn head_less(a: usize, b: usize, keys: &[arrow::row::Rows], pos: &[usize]) -> bool {
-    match keys[a].row(pos[a]).cmp(&keys[b].row(pos[b])) {
-        std::cmp::Ordering::Less => true,
-        std::cmp::Ordering::Greater => false,
-        std::cmp::Ordering::Equal => a < b,
-    }
+    (keys[a].row(pos[a]), a) < (keys[b].row(pos[b]), b)
 }
 
 fn sift_up(heap: &mut [usize], mut i: usize, keys: &[arrow::row::Rows], pos: &[usize]) {
@@ -5226,13 +5196,12 @@ fn sort_batches_by_schema(schema: &crate::schema::TableSchema, batches: Vec<Reco
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     // Small buckets: one concat + sort beats encoding rows and running a heap.
     if batches.len() == 1 || total_rows <= MERGE_MIN_ROWS {
-        let combined = if batches.len() == 1 {
-            batches.into_iter().next().unwrap()
-        } else {
-            match concat_batches(&arrow_schema, &batches) {
+        let combined = match <[RecordBatch; 1]>::try_from(batches) {
+            Ok([one]) => one,
+            Err(batches) => match concat_batches(&arrow_schema, &batches) {
                 Ok(c) => c,
                 Err(e) => return bail(format!("concat failed, writing unsorted: {e}"), batches),
-            }
+            },
         };
         return match sort_one_batch(&combined, &sort_idx) {
             Ok(sorted) => (FlushBatches::Ready(vec![sorted].into_iter()), true),
@@ -5592,7 +5561,6 @@ struct RollupTargetProof {
 
 /// Frozen persisted digest; ordering of files and map entries carries no meaning.
 fn rollup_target_fingerprint<'a>(files: impl IntoIterator<Item = &'a deltalake::kernel::Add>) -> u64 {
-    use itertools::Itertools;
     let summary = files.into_iter().fold((0u64, 0u64), |(count, fingerprint), add| {
         let identity = (
             maintain::file_content_hash(&add.path, add.deletion_vector.as_ref()),
@@ -5662,9 +5630,10 @@ enum ResumeVerdict {
     /// staged output would resurrect removed rows or drop new ones.
     Stale,
     /// Output rows != input rows — a truncated staging. Never commit this.
+    /// `None`: an Add without stats, so its row count is unknown.
     RowMismatch {
-        target_rows: i64,
-        staged_rows: i64,
+        target_rows: Option<i64>,
+        staged_rows: Option<i64>,
     },
     /// ROLLUP only: the source partition moved under the staged output, so the
     /// read path would refuse this slice the moment it landed. Discard it.
@@ -5760,7 +5729,7 @@ fn classify_resume(entry: &StagedIntent, table_name: &str, now_secs: u64, live: 
         // A repair is data-preserving by construction; this equality is what stands
         // between a killed-mid-staging bin and silent row loss.
         (Some(t), Some(s)) if t == s => ResumeVerdict::Commit,
-        (t, s) => ResumeVerdict::RowMismatch { target_rows: t.unwrap_or(-1), staged_rows: s.unwrap_or(-1) },
+        (target_rows, staged_rows) => ResumeVerdict::RowMismatch { target_rows, staged_rows },
     }
 }
 
@@ -6007,9 +5976,6 @@ fn cron_period(schedule: &str) -> std::time::Duration {
     (second - first).to_std().unwrap_or(std::time::Duration::ZERO)
 }
 
-/// Charged memory for the wave-boundary brake: cgroup `memory.current` (what
-/// memcg OOM-kills on), statm RSS as fallback. `None` on platforms with neither
-/// (dev macOS) — the brake then never engages, safe for a non-prod box.
 /// Decides whether another hygiene sort may start, against LIVE memory.
 ///
 /// The policy is [`crate::config::hygiene_admits`], a pure function; this holds
@@ -6204,6 +6170,9 @@ impl Database {
     }
 }
 
+/// Charged memory for the wave-boundary brake: cgroup `memory.current` (what
+/// memcg OOM-kills on), statm RSS as fallback. `None` on platforms with neither
+/// (dev macOS) — the brake then never engages, safe for a non-prod box.
 pub(crate) fn process_memory_bytes() -> Option<usize> {
     if let Ok(raw) = std::fs::read_to_string("/sys/fs/cgroup/memory.current")
         && let Ok(v) = raw.trim().parse::<usize>()
@@ -6377,8 +6346,6 @@ fn unsorted_bin_budget_bytes() -> i64 {
     UNSORTED_BIN_DECODED_BUDGET_BYTES / crate::database::maintain::DECODED_BYTES_PER_COMPRESSED
 }
 
-/// Pack a cell's candidates into ONE bin, smallest first.
-///
 /// How a bin orders its candidates before packing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BinOrder {
@@ -6446,6 +6413,7 @@ pub(crate) fn select_bin(candidates: &[TailAdd], policy: BinPolicy) -> Vec<Strin
         BinOrder::EventTime => ordered.sort_by_key(|add| add.event_range.map_or(i64::MIN, |range| range.0)),
     }
 
+    // Imperative: restart-on-overflow threads three accumulators; a fold reads worse.
     let (mut bytes, mut rows) = (0i64, 0u64);
     let mut selected: Vec<&TailAdd> = Vec::new();
     for add in ordered {
@@ -6803,32 +6771,35 @@ pub enum TailPass {
     Repair,
 }
 
+/// A file at or past 7/8 of target is "converged" — re-selecting it alone
+/// would rewrite it 1→1 forever.
+fn converged_bytes(target_size: i64) -> i64 {
+    let cap = target_size.max(1);
+    cap - cap / 8
+}
+
 impl HotBinPolicy<'_> {
-    /// A file at or past 7/8 of target is "converged" — re-selecting it alone
-    /// would rewrite it 1→1 forever.
     fn converged(&self) -> i64 {
-        let cap = self.target_size.max(1);
-        cap - cap / 8
+        converged_bytes(self.target_size)
     }
 }
 
 /// Pack the earliest sealed slice of `adds` into one time-disjoint bin.
 ///
-/// Carries the same INVARIANT as [`select_coordinator_compaction_candidates`]:
+/// Carries the same INVARIANT as [`select_bin`]:
 /// no rule may veto a bin outright, only bound how much one takes. The value
 /// floor and the size-ratio guard that used to sit here were removable knobs
 /// whose default combination wedged the coordinator lane for three days
 /// (2026-09-15); a packer that can decline all work has no safe default.
 pub(crate) fn select_tail_bin(adds: &[TailAdd], target_size: i64, min_files: usize, sorted_run_cap: i64, seal_micros: i64, pass: TailPass) -> Vec<String> {
-    let cap = target_size.max(1);
-    let converged = cap - cap / 8;
+    let (cap, converged) = (target_size.max(1), converged_bytes(target_size));
     // An oversized file needs a SOLO rewrite (one per bin) when it is either an
     // unsorted run or carries a deletion vector: an unsorted file disables the
     // reader's all-or-nothing footer ordering for the whole scan, and a DV
     // disables per-file parquet pushdown until it is rewritten DV-free. A SMALL
     // DV'd file packs normally (it is already under `converged`).
     let is_repair = |add: &TailAdd| add.size >= converged && (!add.is_sorted_run || add.has_dv);
-    let mut fresh: Vec<(&str, i64, i64, bool)> = adds
+    let fresh: Vec<(&str, i64, i64, bool)> = adds
         .iter()
         .filter(|add| add.size < sorted_run_cap || !add.is_sorted_run || add.has_dv)
         .filter(|add| add.size < converged || is_repair(add))
@@ -6836,6 +6807,7 @@ pub(crate) fn select_tail_bin(adds: &[TailAdd], target_size: i64, min_files: usi
             Some((min, max)) if max <= seal_micros => Some((add.path.as_str(), min, add.size, is_repair(add))),
             _ => None,
         })
+        .sorted_unstable_by_key(|(_, min, _, _)| *min)
         .collect();
     // A lone repair file is real work and needs no `min_files` company. On a
     // Repair pass EVERY candidate is repair work whatever its size: a small
@@ -6845,7 +6817,6 @@ pub(crate) fn select_tail_bin(adds: &[TailAdd], target_size: i64, min_files: usi
     if fresh.len() < min_files && !repairs_present {
         return vec![];
     }
-    fresh.sort_unstable_by_key(|(_, min, _, _)| *min);
     // A repair pass ranks NEWEST first (the most recent footer-less date is the
     // wall users hit) and SMALLEST among equals (so one un-finishable file cannot
     // head-of-line block its date). The pass's own `budget` bounds wall clock, so
@@ -6897,8 +6868,8 @@ mod repair_batch_tests {
     fn repair_sorts_with_smaller_batches_than_packing() {
         use datafusion::execution::runtime_env::RuntimeEnv;
         let batch = |state: &datafusion::execution::session_state::SessionState| state.config().options().execution.batch_size.get();
-        let pack = super::build_optimize_session_state(0, std::sync::Arc::new(RuntimeEnv::default()));
-        let repair = super::build_optimize_session_state_tuned(
+        let pack = super::build_optimize_session_state(0, std::sync::Arc::new(RuntimeEnv::default()), None, None);
+        let repair = super::build_optimize_session_state(
             0,
             std::sync::Arc::new(RuntimeEnv::default()),
             Some("256"),
@@ -6930,6 +6901,8 @@ impl ActiveFiles {
         self.0.get(path).is_some_and(|entries| matches!(entries.as_slice(), [entry] if entry == dv))
     }
 
+    /// Exact staged Adds distinguish a prior successful commit from another writer
+    /// changing our targets. An empty set cannot prove that a commit landed.
     fn adds_live(&self, actions: &[deltalake::kernel::Action]) -> bool {
         let mut adds = actions.iter().filter_map(|a| if let deltalake::kernel::Action::Add(add) = a { Some(add) } else { None }).peekable();
         adds.peek().is_some() && adds.all(|add| self.matches(&add.path, &add.deletion_vector))
@@ -6950,12 +6923,6 @@ impl ActiveFiles {
 /// survivor without removing its file, so verify every input, not only Removes.
 fn split_live_bins(bins: Vec<StagedBin>, live: &ActiveFiles) -> (Vec<StagedBin>, Vec<StagedBin>) {
     bins.into_iter().partition(|bin| bin.targets.iter().all(|add| live.matches(&add.path, &add.deletion_vector)))
-}
-
-/// Exact staged Adds distinguish a prior successful commit from another writer
-/// changing our targets. An empty set cannot prove that a commit landed.
-fn bin_adds_live(bin: &StagedBin, live: &ActiveFiles) -> bool {
-    live.adds_live(&bin.adds)
 }
 
 /// Delete the staged parquet of bins leaving a wave uncommitted — MINUS anything
@@ -7027,7 +6994,7 @@ fn pack_sort_partitions(pack_pool_bytes: usize, k: usize, cores: usize) -> usize
 /// list. The cursor only ever grows, so the modulo is what makes successive ticks
 /// walk the whole list instead of re-serving its head.
 fn sweep_resume_offset(len: usize, cursor: usize) -> usize {
-    if len == 0 { 0 } else { cursor % len }
+    cursor.checked_rem(len).unwrap_or(0)
 }
 
 /// Decrement-on-drop gauge, so a bin that times out or panics still clears its
@@ -7123,8 +7090,7 @@ where
                 Ok(BinOutcome::Retry) => pending.push(project_id),
                 // Keeping the project in rotation would spin every remaining
                 // round against the same held budget; the next tick re-plans it.
-                Ok(BinOutcome::BudgetBusy) => {}
-                Ok(BinOutcome::Converged) => {}
+                Ok(BinOutcome::BudgetBusy | BinOutcome::Converged) => {}
                 Err(error) => {
                     warn!(project_id, round, %error, event = "light_optimize_bin_failed");
                     failed += 1;
@@ -8052,44 +8018,23 @@ mod footer_repair_schedule_tests {
 
 #[cfg(test)]
 mod clean_coverage_retention_tests {
+    use test_case::test_case;
+
     use super::retain_clean_intervals;
 
-    /// The defect this replaces: coverage was discarded on ANY fingerprint move,
-    /// and on a live partition that is every flush. Prod 2026-09-14 measured the
-    /// consequence — `cert_slice_files_proved` 9 against `cert_slice_files_unproven`
-    /// 2,194, because accumulated coverage never outlived one slice while files
-    /// span hours.
-    ///
-    /// Ingest appends at the TAIL, so the morning's proved intervals are disjoint
-    /// from every file arriving now and must survive.
-    #[test]
-    fn a_tail_append_keeps_the_morning_proved() {
-        let day = [(0i64, 100), (100, 200), (200, 300)];
-        let kept = retain_clean_intervals(&day, &[Some((320, 400))]).expect("spans known");
-        assert_eq!(kept, day.to_vec(), "a file that lands after every interval invalidates none of them");
-    }
+    const DAY: &[(i64, i64)] = &[(0, 100), (100, 200), (200, 300)];
 
-    /// Only the overlapped interval is lost — the point of the change.
-    #[test]
-    fn an_overlapping_file_drops_only_what_it_touches() {
-        let day = [(0i64, 100), (100, 200), (200, 300)];
-        let kept = retain_clean_intervals(&day, &[Some((150, 160))]).expect("spans known");
-        assert_eq!(kept, vec![(0, 100), (200, 300)], "the 100-200 interval is the only one the new rows could duplicate into");
-    }
-
-    /// Fails CLOSED. A file with no statistics overlaps everything, the same rule
-    /// `partition_file_spans` states for readers, so the caller must reset.
-    #[test]
-    fn a_file_without_span_statistics_forces_a_reset() {
-        assert!(retain_clean_intervals(&[(0, 100)], &[Some((500, 600)), None]).is_none(), "unknown span must not be read as disjoint");
-    }
-
-    /// Half-open interval against an inclusive span, matching
-    /// `certify_files_within_slice`. A file whose max lands exactly on `start`
-    /// DOES touch the interval; one whose min equals `end` does not.
-    #[test]
-    fn boundaries_match_the_certification_test() {
-        assert_eq!(retain_clean_intervals(&[(100, 200)], &[Some((50, 100))]).unwrap(), Vec::<(i64, i64)>::new(), "max == start overlaps");
-        assert_eq!(retain_clean_intervals(&[(100, 200)], &[Some((200, 250))]).unwrap(), vec![(100, 200)], "min == end does not");
+    /// Coverage used to be discarded on ANY fingerprint move — every flush on a live
+    /// partition — so it never outlived one slice. Ingest appends at the TAIL, so the
+    /// morning's proved intervals must survive. Fails CLOSED: a file with no statistics
+    /// overlaps everything (`partition_file_spans`' rule). Half-open interval against an
+    /// inclusive span, matching `certify_files_within_slice`.
+    #[test_case(DAY, &[Some((320, 400))] => Some(DAY.to_vec()) ; "a tail append keeps the morning proved")]
+    #[test_case(DAY, &[Some((150, 160))] => Some(vec![(0, 100), (200, 300)]) ; "an overlapping file drops only what it touches")]
+    #[test_case(&[(0, 100)], &[Some((500, 600)), None] => None ; "a file without span statistics forces a reset")]
+    #[test_case(&[(100, 200)], &[Some((50, 100))] => Some(vec![]) ; "max equal to start overlaps")]
+    #[test_case(&[(100, 200)], &[Some((200, 250))] => Some(vec![(100, 200)]) ; "min equal to end does not")]
+    fn clean_coverage_retention(intervals: &[(i64, i64)], new_spans: &[Option<(i64, i64)>]) -> Option<Vec<(i64, i64)>> {
+        retain_clean_intervals(intervals, new_spans)
     }
 }

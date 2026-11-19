@@ -8,9 +8,13 @@ use std::{
     fs::{self, OpenOptions},
     io::{ErrorKind, Write},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering::Relaxed},
+    },
 };
 
+use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 
 use crate::support::lock;
@@ -24,7 +28,7 @@ pub(crate) type BaseTierCoverage = HashMap<(String, String, String, String), Vec
 /// one bucket at every coarser width.
 pub const COARSEN_WIDTHS: [i64; 3] = [DAY_MICROS, 6 * 60 * 60 * 1_000_000, 60 * 60 * 1_000_000];
 /// What one `coarsen_sealed_slices` pass actually did, per stage.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, derive_more::Add)]
 pub struct CoarsenReport {
     /// Units dropped because a wider live unit already covers them.
     pub subsumed: usize,
@@ -394,8 +398,7 @@ static DUE_TASK_SNAPSHOT: Mutex<Option<DueTaskSnapshot>> = Mutex::new(None);
 /// Last published diagnostic, without taking the journal lock on a query thread.
 /// `null` means no journal statistics have been published yet.
 pub(crate) fn due_task_snapshot() -> serde_json::Value {
-    let snapshot = lock(&DUE_TASK_SNAPSHOT).clone();
-    serde_json::json!(snapshot)
+    serde_json::json!(*lock(&DUE_TASK_SNAPSHOT))
 }
 
 impl MaintenanceTask {
@@ -575,7 +578,6 @@ impl GroupPrice {
     }
 
     fn unanimous_input(&self) -> Option<InputFootprint> {
-        use itertools::Itertools;
         self.distinct.values().exactly_one().ok().copied().filter(|_| self.unpriced_members == 0)
     }
 }
@@ -782,7 +784,7 @@ pub struct TaskJournal {
     /// Last observed `eligible_watermark_lag_seconds`; read by `claim_next` to
     /// decide whether the sealed reservation can still be afforded. Atomic
     /// because `publish_statistics` takes `&self`; runtime only.
-    frontier_lag_secs: std::sync::atomic::AtomicU64,
+    frontier_lag_secs: AtomicU64,
     /// Boundary micros of COMPLETED Dedup slices, per project then source, so
     /// `rank` can prefer the pending slice that EXTENDS a completed run.
     /// Runtime only. Nested maps (not a tuple key) so the lookup in `rank`
@@ -858,16 +860,15 @@ impl Drop for TaskLease {
             // backoff — a hot loop. `None` progress means we are outside a unit
             // scope, read as "it ran": never guess a unit into a free retry.
             let did_no_work = crate::database::maintain::current_unit_progress() == Some(0);
-            if failure.is_none() && did_no_work && self.shutdown.is_cancelled() {
+            let what = if failure.is_none() && did_no_work && self.shutdown.is_cancelled() {
                 journal.release_unstarted(&self.key);
-                if let Err(error) = journal.checkpoint() {
-                    tracing::error!(error = %error, task = ?self.key, "failed to checkpoint unstarted maintenance task release");
-                }
-                return;
-            }
-            journal.abandon_running(&self.key, crate::support::now_micros(), failure.as_deref());
+                "unstarted maintenance task release"
+            } else {
+                journal.abandon_running(&self.key, crate::support::now_micros(), failure.as_deref());
+                "maintenance task lease recovery"
+            };
             if let Err(error) = journal.checkpoint() {
-                tracing::error!(error = %error, task = ?self.key, "failed to checkpoint maintenance task lease recovery");
+                tracing::error!(error = %error, task = ?self.key, "failed to checkpoint {what}");
             }
         }
     }
@@ -1016,7 +1017,7 @@ impl TaskJournal {
             claim_scratch: Vec::new(),
             base_hour_units: false,
             claim_tick: 0,
-            frontier_lag_secs: std::sync::atomic::AtomicU64::new(0),
+            frontier_lag_secs: AtomicU64::new(0),
             dedup_complete_edges: HashMap::new(),
             idle_claims: HashMap::new(),
         };
@@ -1109,9 +1110,7 @@ impl TaskJournal {
                 // which `enqueue_inner` resurrects to Pending — an endless loop.
                 // `parent_measured_bytes` is set only by `split_time_task`, so it is
                 // the exact discriminator.
-                task.key.grain_aligned() != task.key
-                    && task.parent_measured_bytes.is_none()
-                    && !matches!(task.state, TaskState::Complete | TaskState::Superseded)
+                task.key.grain_aligned() != task.key && task.parent_measured_bytes.is_none() && task.state.is_active()
             },
             |task| {
                 let key = task.key.grain_aligned();
@@ -1238,7 +1237,7 @@ impl TaskJournal {
         const SEALED_AGE_MICROS: i64 = 2 * DAY_MICROS;
         self.run_once(Self::DRAIN_INCIDENT_RETIRE_MIGRATION, |journal| {
             Some(journal.retain_tasks(|task| {
-                !matches!(task.state, TaskState::Pending | TaskState::Retry)
+                !task.state.is_waiting()
                     || !matches!(task.key.operation, Operation::Dedup | Operation::BaseRollup | Operation::DerivedRollup)
                     || now_micros.saturating_sub(task.key.slice.end_micros) <= SEALED_AGE_MICROS
             }))
@@ -1252,7 +1251,7 @@ impl TaskJournal {
     pub fn retire_unfinished_fusions(&mut self, now_micros: i64) -> Option<usize> {
         self.run_once(Self::UNFINISHED_FUSION_RETIRE_MIGRATION, |journal| {
             Some(journal.retain_tasks(|task| {
-                !matches!(task.state, TaskState::Pending | TaskState::Retry)
+                !task.state.is_waiting()
                     || !matches!(task.key.operation, Operation::Dedup | Operation::BaseRollup)
                     || task.key.slice.width() <= NORMAL_SLICE_MICROS
                     || task.key.slice.end_micros <= now_micros
@@ -1311,17 +1310,9 @@ impl TaskJournal {
         // unit already covers, so on its own it leaves exactly the redundancy it
         // exists to remove.
         let subsumed = self.subsume_covered_units(now_micros);
-        let mut report = CoarsenReport { subsumed, ..Default::default() };
-        for &width in COARSEN_WIDTHS.iter() {
-            let stage = self.coarsen_to_width_reporting(width, now_micros, partition_bytes, state);
-            report.fused += stage.fused;
-            report.candidates += stage.candidates;
-            report.blocked += stage.blocked;
-            report.over_budget += stage.over_budget;
-            report.priced_by_footprint += stage.priced_by_footprint;
-            report.over_state += stage.over_state;
-        }
-        report
+        COARSEN_WIDTHS.iter().fold(CoarsenReport { subsumed, ..Default::default() }, |report, &width| {
+            report + self.coarsen_to_width_reporting(width, now_micros, partition_bytes, state)
+        })
     }
 
     /// Drop sealed units wholly covered by a WIDER non-complete unit for the
@@ -1341,7 +1332,7 @@ impl TaskJournal {
         // `split_time_task` supersedes an oversized unit and replaces it with
         // children tiling its range, so a superseded parent subsuming its own
         // children would delete exactly the work the split just created.
-        for task in self.snapshot.tasks.iter().filter(|task| matches!(task.state, TaskState::Pending | TaskState::Retry | TaskState::Running)) {
+        for task in self.snapshot.tasks.iter().filter(|task| task.state.is_active()) {
             let group = group_of(task);
             let (start, end) = (task.key.slice.start_micros, task.key.slice.end_micros);
             for (index, &width) in SUBSUME_WIDTHS.iter().enumerate().filter(|&(_, &width)| task.key.slice.width() > width) {
@@ -1495,9 +1486,7 @@ impl TaskJournal {
     /// Work of `operation` still waiting to run — every state `claim_next` can
     /// select from.
     fn queued(&self, operation: Operation) -> impl Iterator<Item = &MaintenanceTask> {
-        self.snapshot.tasks.iter().filter(move |task| {
-            task.key.operation == operation && matches!(task.state, TaskState::Pending | TaskState::Retry) && self.rollup_build_allowed(&task.key)
-        })
+        self.snapshot.tasks.iter().filter(move |task| task.key.operation == operation && task.state.is_waiting() && self.rollup_build_allowed(&task.key))
     }
 
     /// Why queued work for `operation` is not being claimed: `(pending, sealed,
@@ -1544,7 +1533,7 @@ impl TaskJournal {
         {
             return cached.rank;
         }
-        crate::observability::maintenance_stats().maintenance_rank_computations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        crate::observability::maintenance_stats().maintenance_rank_computations.fetch_add(1, Relaxed);
         let (rank, valid_until) = self.rank_uncached(task, now_micros);
         task.rank_cache.0.set(Some(CachedRank { rank, valid_until, generation: self.rank_generation, dedup_generation, inputs }));
         rank
@@ -1581,7 +1570,6 @@ impl TaskJournal {
     /// File-count spread of an operation's claimable cells, and how many of them the
     /// `benefit` term cannot tell apart. `None` when nothing is claimable.
     pub fn hygiene_debt_spread(&self, operation: Operation, now_micros: i64) -> Option<String> {
-        use itertools::Itertools;
         let files = self
             .queued(operation)
             .filter(|task| task.deadline_micros <= now_micros && !Self::is_quarantined(task))
@@ -1624,7 +1612,6 @@ impl TaskJournal {
     /// `(project, date, reason)`. Bounded to `LIMIT` because `dependencies_complete` is a scan.
     pub fn first_refused_sealed(&self, operation: Operation, now_micros: i64) -> Option<(String, String, &'static str)> {
         const LIMIT: usize = 64;
-        use itertools::Itertools;
         // A claimable one means eligibility is fine and the refusal is in ordering.
         self.queued(operation)
             .filter(|task| !is_frontier_task(task, now_micros))
@@ -1726,13 +1713,12 @@ impl TaskJournal {
             .or_else(|| (!self.dependencies_complete(task)).then_some("dependencies"))
     }
 
-    /// The task `key` names, if the journal still holds it.
     /// Re-derive the claimable set from scratch. Cheap relative to a claim and
     /// the only thing that bounds the permissive set's growth.
     fn rebuild_claimable(&mut self) {
         self.claimable.clear();
         self.idle_claims.clear();
-        for task in self.snapshot.tasks.iter().filter(|task| matches!(task.state, TaskState::Pending | TaskState::Retry | TaskState::Running)) {
+        for task in self.snapshot.tasks.iter().filter(|task| task.state.is_active()) {
             if self.rollup_build_allowed(&task.key) {
                 self.claimable.entry(task.key.operation).or_default().insert(task.key.clone());
             }
@@ -1776,9 +1762,7 @@ impl TaskJournal {
     /// holding too much rather than too little.
     fn mark_dirty(&mut self, key: TaskKey) {
         self.idle_claims.clear();
-        if self.rollup_build_allowed(&key)
-            && self.task(&key).is_some_and(|task| matches!(task.state, TaskState::Pending | TaskState::Retry | TaskState::Running))
-        {
+        if self.rollup_build_allowed(&key) && self.task(&key).is_some_and(|task| task.state.is_active()) {
             self.claimable.entry(key.operation).or_default().insert(key.clone());
         }
         Self::index_base_slice(&mut self.base_slices, &key);
@@ -1798,6 +1782,7 @@ impl TaskJournal {
         self.rank_generation = self.rank_generation.wrapping_add(1);
     }
 
+    /// The task `key` names, if the journal still holds it.
     fn task(&self, key: &TaskKey) -> Option<&MaintenanceTask> {
         self.snapshot.tasks.get(*self.task_indices.get(key)?)
     }
@@ -1919,7 +1904,7 @@ impl TaskJournal {
                         && Self::same_cell(&task.key, parent)
                         && task.key.slice.start_micros >= parent.slice.start_micros
                         && task.key.slice.end_micros <= parent.slice.end_micros
-                        && matches!(task.state, TaskState::Pending | TaskState::Retry | TaskState::Running)
+                        && task.state.is_active()
                 });
                 if live_descendant {
                     return false;
@@ -2079,11 +2064,11 @@ impl TaskJournal {
         {
             // False only for a DV-dedup-only wave, which changed no logical content.
             if operation == Operation::Dedup && !mint_dedup {
-                crate::observability::maintenance_stats().dedup_remint_skipped.fetch_add(slices.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                crate::observability::maintenance_stats().dedup_remint_skipped.fetch_add(slices.len() as u64, Relaxed);
                 continue;
             }
             if matches!(operation, Operation::BaseRollup | Operation::DerivedRollup) && !mint_rollup {
-                crate::observability::maintenance_stats().rollup_remint_skipped.fetch_add(slices.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                crate::observability::maintenance_stats().rollup_remint_skipped.fetch_add(slices.len() as u64, Relaxed);
                 continue;
             }
             for &slice in slices {
@@ -2114,7 +2099,7 @@ impl TaskJournal {
                     // Not dedup (a rewrite per cap would add write amplification), a reopened
                     // unit, or an open slice.
                     let waiting = matches!(operation, Operation::BaseRollup | Operation::DerivedRollup)
-                        && matches!(task.state, TaskState::Pending | TaskState::Retry)
+                        && task.state.is_waiting()
                         && slice.end_micros <= observed_at_micros;
                     let first_dirty = i64::try_from(task.pended_unix_ms.unwrap_or(task.created_unix_ms)).unwrap_or(i64::MAX / 1_000).saturating_mul(1_000);
                     let deadline_micros = if waiting { deadline_micros.min(first_dirty.saturating_add(MAX_QUIET_WAIT_MICROS)) } else { deadline_micros };
@@ -2149,7 +2134,7 @@ impl TaskJournal {
             return false;
         }
         let Some(task) = self.task_mut(key) else { return false };
-        if !matches!(task.state, TaskState::Pending | TaskState::Retry) {
+        if !task.state.is_waiting() {
             return false;
         }
         task.state = TaskState::Running;
@@ -2171,10 +2156,8 @@ impl TaskJournal {
             |task| {
                 task.key != *key
                     && task.key.operation == Operation::BaseRollup
-                    && matches!(task.state, TaskState::Pending | TaskState::Retry)
-                    && task.key.physical_table == key.physical_table
-                    && task.key.source == key.source
-                    && task.key.project_id == key.project_id
+                    && task.state.is_waiting()
+                    && Self::same_cell(&task.key, key)
                     && key.slice.start_micros <= task.key.slice.start_micros
                     && task.key.slice.end_micros <= key.slice.end_micros
             },
@@ -2210,7 +2193,7 @@ impl TaskJournal {
     /// Park a unit whose SQL cannot be planned. Never bisected: the children would name the
     /// same missing column and fail identically.
     fn park_schema_failure(&mut self, key: &TaskKey, now_micros: i64, error: &str) {
-        crate::observability::maintenance_stats().maintenance_schema_parked.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        crate::observability::maintenance_stats().maintenance_schema_parked.fetch_add(1, Relaxed);
         tracing::warn!(?key, %error, event = "maintenance_task_schema_parked", "parked a maintenance unit on a deterministic plan error instead of bisecting it");
         self.retry(key, Self::SCHEMA_FAILURE_REASON.to_owned(), now_micros.saturating_add(Self::SCHEMA_PARK_MICROS));
     }
@@ -2245,7 +2228,7 @@ impl TaskJournal {
         // claim in two is RESERVED for sealed work — one in four while the frontier is behind
         // its lag budget. DerivedRollup always takes the sealed turn.
         let sealed_turn = operation == Operation::DerivedRollup
-            || if self.frontier_lag_secs.load(std::sync::atomic::Ordering::Relaxed) > FRONTIER_LAG_BUDGET_SECS {
+            || if self.frontier_lag_secs.load(Relaxed) > FRONTIER_LAG_BUDGET_SECS {
                 self.claim_tick.is_multiple_of(4)
             } else {
                 self.claim_tick.is_multiple_of(2)
@@ -2376,7 +2359,7 @@ impl TaskJournal {
 
     fn task_can_be_claimed(&self, task: &MaintenanceTask, now_micros: i64, allow_quarantined: bool) -> bool {
         self.rollup_build_allowed(&task.key)
-            && matches!(task.state, TaskState::Pending | TaskState::Retry)
+            && task.state.is_waiting()
             && task.deadline_micros <= now_micros
             && (allow_quarantined || !Self::is_quarantined(task))
     }
@@ -2470,7 +2453,6 @@ impl TaskJournal {
     /// it. Rows and bytes outside the dirt are ESTIMATED as the input's time share: the
     /// input is time-prorated per file, not measured per range.
     pub fn note_escalation(&self, key: &TaskKey, input_rows: u64, input_bytes: u64) {
-        use std::sync::atomic::Ordering::Relaxed;
         let Some(task) = self.task(key).filter(|task| !task.dirty.is_empty()) else { return };
         let (start, end) = (key.slice.start_micros, key.slice.end_micros);
         let outside: i64 = crate::rollup::uncovered(start, end, task.dirty.clone()).iter().map(|(lo, hi)| hi - lo).sum();
@@ -2529,10 +2511,6 @@ impl TaskJournal {
         true
     }
 
-    /// A worker gave the task back without finishing it — an error, or a deadline it could
-    /// not meet. Once is a blip: back off and retry whole. Twice means the slice does not fit
-    /// its deadline, so bisect TIME (byte splitting does not cover this). Only positive
-    /// evidence of a DETERMINISTIC plan error in `failure` suppresses the bisect.
     /// Give a claimed unit back WITHOUT charging it an attempt.
     ///
     /// `mark_running` increments `attempts` at claim time, so a unit released
@@ -2548,10 +2526,14 @@ impl TaskJournal {
         task.attempts = task.attempts.saturating_sub(1);
         task.retry_reason = None;
         self.mark_dirty(key.clone());
-        crate::observability::maintenance_stats().maintenance_unstarted_releases.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        crate::observability::maintenance_stats().maintenance_unstarted_releases.fetch_add(1, Relaxed);
         true
     }
 
+    /// A worker gave the task back without finishing it — an error, or a deadline it could
+    /// not meet. Once is a blip: back off and retry whole. Twice means the slice does not fit
+    /// its deadline, so bisect TIME (byte splitting does not cover this). Only positive
+    /// evidence of a DETERMINISTIC plan error in `failure` suppresses the bisect.
     pub fn abandon_running(&mut self, key: &TaskKey, now_micros: i64, failure: Option<&str>) {
         if let Some(error) = failure.filter(|failure| is_schema_failure(failure)) {
             self.park_schema_failure(key, now_micros, error);
@@ -2623,7 +2605,7 @@ impl TaskJournal {
         // A Repair unit's cost is the FILE it rewrites; time-bisection cannot shrink a file
         // set, so every child would fight over the same file.
         if key.operation == Operation::Repair {
-            crate::observability::maintenance_stats().split_declined_at_floor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            crate::observability::maintenance_stats().split_declined_at_floor.fetch_add(1, Relaxed);
             return false;
         }
         let Some(index) = self.task_indices.get(key).copied() else { return false };
@@ -2642,7 +2624,7 @@ impl TaskJournal {
         // A state split sheds by construction; the input shed test would hold it at
         // the file floor, where the state is still too big.
         if !matches!(trigger, SplitTrigger::State(_)) && observed_bytes.is_some_and(|bytes| !split_sheds_enough(parent.parent_measured_bytes, bytes)) {
-            crate::observability::maintenance_stats().split_declined_at_floor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            crate::observability::maintenance_stats().split_declined_at_floor.fetch_add(1, Relaxed);
             return false;
         }
         let cost = observed_bytes.unwrap_or(parent.estimated_decoded_bytes);
@@ -2651,7 +2633,7 @@ impl TaskJournal {
             SplitTrigger::State(_) | SplitTrigger::RepeatedFailure => bisect_time_unit(&parent, cost).map(Vec::from).unwrap_or_default(),
         };
         if children.len() <= 1 || children.iter().any(|child| child.hash_shards > 1) {
-            crate::observability::maintenance_stats().split_declined_no_width.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            crate::observability::maintenance_stats().split_declined_no_width.fetch_add(1, Relaxed);
             return false;
         }
         let crosses_live = |child: &MaintenanceTask| {
@@ -2880,64 +2862,63 @@ impl TaskJournal {
         if let Some(parent) = self.wal_path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let wal_len =
-            if !self.dirty_tasks.is_empty() || !self.dirty_cursors.is_empty() || !self.removed_tasks.is_empty() || !self.dirty_rollup_policies.is_empty() {
-                let Self { wal_path, incomplete_append, dirty_tasks, dirty_cursors, removed_tasks, dirty_rollup_policies, task_indices, snapshot, .. } = self;
-                let (task_indices, snapshot) = (&*task_indices, &*snapshot);
-                let mut wal = OpenOptions::new().create(true).append(true).open(&*wal_path)?;
-                let durable = |key: &TaskKey| !is_derived_operation(key.operation);
-                let serialize = crate::observability::BlockWatch::new("journal_checkpoint_serialize");
-                let records =
-                    dirty_tasks
+        let wal_len = if policies_changed || !self.dirty_tasks.is_empty() || !self.dirty_cursors.is_empty() || !self.removed_tasks.is_empty() {
+            let Self { wal_path, incomplete_append, dirty_tasks, dirty_cursors, removed_tasks, dirty_rollup_policies, task_indices, snapshot, .. } = self;
+            let (task_indices, snapshot) = (&*task_indices, &*snapshot);
+            let mut wal = OpenOptions::new().create(true).append(true).open(&*wal_path)?;
+            let durable = |key: &TaskKey| !is_derived_operation(key.operation);
+            let serialize = crate::observability::BlockWatch::new("journal_checkpoint_serialize");
+            let records = dirty_tasks
+                .iter()
+                .filter(|key| durable(key))
+                .filter_map(|key| task_indices.get(key).map(|&index| JournalRecord::Task(Box::new(snapshot.tasks[index].clone()))))
+                .chain(dirty_cursors.iter().filter_map(|source| {
+                    (snapshot.source_cursors.get(source).copied()).map(|delta_version| JournalRecord::SourceCursor { source: source.clone(), delta_version })
+                }))
+                // AFTER the upserts, so a key removed and re-created in the same window keeps
+                // the re-creation.
+                .chain(removed_tasks.iter().filter(|key| durable(key)).cloned().map(JournalRecord::Removed))
+                .chain(
+                    dirty_rollup_policies
                         .iter()
-                        .filter(|key| durable(key))
-                        .filter_map(|key| task_indices.get(key).map(|&index| JournalRecord::Task(Box::new(snapshot.tasks[index].clone()))))
-                        .chain(dirty_cursors.iter().filter_map(|source| {
-                            (snapshot.source_cursors.get(source).copied())
-                                .map(|delta_version| JournalRecord::SourceCursor { source: source.clone(), delta_version })
-                        }))
-                        // AFTER the upserts, so a key removed and re-created in the same window keeps
-                        // the re-creation.
-                        .chain(removed_tasks.iter().filter(|key| durable(key)).cloned().map(JournalRecord::Removed))
-                        .chain(dirty_rollup_policies.iter().filter_map(|table| {
-                            snapshot.rollup_policies.get(table).map(|&policy| JournalRecord::RollupPolicy { table: table.clone(), policy })
-                        }))
-                        .try_fold(Vec::new(), |mut records, record| {
-                            serde_json::to_writer(&mut records, &record)?;
-                            records.push(b'\n');
-                            anyhow::Ok(records)
-                        })?;
-                drop(serialize);
-                let record_bytes = u64::try_from(records.len())?;
-                let len = crate::support::without_blocking_the_worker(|| -> std::io::Result<u64> {
-                    let len = wal.metadata()?.len();
-                    let start = incomplete_append.unwrap_or(len);
-                    if start > len {
-                        return Err(std::io::Error::new(ErrorKind::InvalidData, "maintenance journal shrank after a failed append"));
-                    }
-                    if start < len {
-                        wal.set_len(start)?;
-                        tracing::warn!(
-                            discarded_bytes = len - start,
-                            path = %wal_path.display(),
-                            event = "maintenance_journal_failed_append_repaired"
-                        );
-                    }
-                    *incomplete_append = Some(start);
-                    let _fsync = crate::observability::BlockWatch::new("journal_checkpoint_fsync");
-                    wal.write_all(&records)?;
-                    *incomplete_append = None;
-                    wal.sync_all()?;
-                    Ok(start.saturating_add(record_bytes))
+                        .filter_map(|table| snapshot.rollup_policies.get(table).map(|&policy| JournalRecord::RollupPolicy { table: table.clone(), policy })),
+                )
+                .try_fold(Vec::new(), |mut records, record| {
+                    serde_json::to_writer(&mut records, &record)?;
+                    records.push(b'\n');
+                    anyhow::Ok(records)
                 })?;
-                dirty_tasks.clear();
-                dirty_cursors.clear();
-                dirty_rollup_policies.clear();
-                removed_tasks.clear();
-                Some(len)
-            } else {
-                fs::metadata(&self.wal_path).ok().map(|metadata| metadata.len())
-            };
+            drop(serialize);
+            let record_bytes = u64::try_from(records.len())?;
+            let len = crate::support::without_blocking_the_worker(|| -> std::io::Result<u64> {
+                let len = wal.metadata()?.len();
+                let start = incomplete_append.unwrap_or(len);
+                if start > len {
+                    return Err(std::io::Error::new(ErrorKind::InvalidData, "maintenance journal shrank after a failed append"));
+                }
+                if start < len {
+                    wal.set_len(start)?;
+                    tracing::warn!(
+                        discarded_bytes = len - start,
+                        path = %wal_path.display(),
+                        event = "maintenance_journal_failed_append_repaired"
+                    );
+                }
+                *incomplete_append = Some(start);
+                let _fsync = crate::observability::BlockWatch::new("journal_checkpoint_fsync");
+                wal.write_all(&records)?;
+                *incomplete_append = None;
+                wal.sync_all()?;
+                Ok(start.saturating_add(record_bytes))
+            })?;
+            dirty_tasks.clear();
+            dirty_cursors.clear();
+            dirty_rollup_policies.clear();
+            removed_tasks.clear();
+            Some(len)
+        } else {
+            fs::metadata(&self.wal_path).ok().map(|metadata| metadata.len())
+        };
         if policies_changed {
             self.rebuild_claimable();
         }
@@ -2976,7 +2957,7 @@ impl TaskJournal {
         // toward the journal's full size and the claim scan slowly gets its cost
         // back.
         self.rebuild_claimable();
-        crate::observability::maintenance_stats().claimable_tasks.store(self.claimable_len() as u64, std::sync::atomic::Ordering::Relaxed);
+        crate::observability::maintenance_stats().claimable_tasks.store(self.claimable_len() as u64, Relaxed);
         // The census's own edge: an instant or differently-sized cutoff drops the edge day's
         // early Complete slices while the census still enumerates the day, and the coverage
         // replay needs those records to prove them.
@@ -2984,12 +2965,10 @@ impl TaskJournal {
         // A derived unit past the horizon can never prove its base (the census no longer
         // builds it), so it would stay queued forever; pending BASE work stays as the debt gauge.
         let dropped = self.retain_tasks(|task| {
-            task.key.slice.end_micros > cutoff
-                || !(matches!(task.state, TaskState::Complete | TaskState::Superseded)
-                    || (task.key.operation == Operation::DerivedRollup && matches!(task.state, TaskState::Pending | TaskState::Retry)))
+            task.key.slice.end_micros > cutoff || (task.state.is_active() && !(task.key.operation == Operation::DerivedRollup && task.state.is_waiting()))
         });
         if dropped != 0 {
-            crate::observability::maintenance_stats().journal_retired_tasks_pruned.fetch_add(dropped as u64, std::sync::atomic::Ordering::Relaxed);
+            crate::observability::maintenance_stats().journal_retired_tasks_pruned.fetch_add(dropped as u64, Relaxed);
         }
         dropped
     }
@@ -3029,14 +3008,12 @@ impl TaskJournal {
     }
 
     pub fn publish_statistics(&self) {
-        use std::sync::atomic::Ordering::Relaxed;
         let stats = crate::observability::maintenance_stats();
         stats.journal_stats_publishes.fetch_add(1, Relaxed);
         let mut counts = [0u64; 5];
         let mut backlog_bytes = 0u64;
         let mut sealed_debt_bytes = 0u64;
         let mut oldest_pended = u64::MAX;
-        let mut oldest_due = i64::MAX;
         let mut oldest_due_tasks: Vec<&MaintenanceTask> = Vec::with_capacity(5);
         let mut beyond_horizon = 0u64;
         let mut latest_frontier_rollup: HashMap<(&str, &str, &str), &MaintenanceTask> = HashMap::new();
@@ -3044,6 +3021,7 @@ impl TaskJournal {
         let (mut eligible_base_rollup, mut eligible_sealed) = (0u64, 0u64);
         let (mut quarantined, mut due_nonquarantined) = (0u64, 0u64);
         let now_micros = crate::support::now_micros();
+        // One imperative pass: this walks the whole journal under its mutex.
         for task in &self.snapshot.tasks {
             let scheduled = task.state == TaskState::Running || self.rollup_build_allowed(&task.key);
             counts[task.state as usize] = counts[task.state as usize].saturating_add(1);
@@ -3062,13 +3040,12 @@ impl TaskJournal {
                 // Per-operation split, plus what is claimable now: when coverage stalls, is
                 // the work absent, ineligible, or out-competed?
                 per_operation[task.key.operation as usize] = per_operation[task.key.operation as usize].saturating_add(1);
-                if matches!(task.state, TaskState::Pending | TaskState::Retry) && Self::is_quarantined(task) {
+                if task.state.is_waiting() && Self::is_quarantined(task) {
                     quarantined = quarantined.saturating_add(1);
                 }
-                if scheduled && matches!(task.state, TaskState::Pending | TaskState::Retry) && task.deadline_micros <= now_micros {
+                if scheduled && task.state.is_waiting() && task.deadline_micros <= now_micros {
                     if !Self::is_quarantined(task) {
                         due_nonquarantined = due_nonquarantined.saturating_add(1);
-                        oldest_due = oldest_due.min(task.deadline_micros);
                         let at = oldest_due_tasks.partition_point(|old| (old.deadline_micros, &old.key) < (task.deadline_micros, &task.key));
                         if at < 5 {
                             oldest_due_tasks.insert(at, task);
@@ -3095,9 +3072,9 @@ impl TaskJournal {
         stats.pending_repair.store(per_operation[Operation::Repair as usize], Relaxed);
         stats.eligible_base_rollup.store(eligible_base_rollup, Relaxed);
         stats.eligible_sealed_total.store(eligible_sealed, Relaxed);
-        stats.maintenance_tasks_pending.store(counts[0], Relaxed);
-        stats.maintenance_tasks_running.store(counts[1], Relaxed);
-        stats.maintenance_tasks_retry.store(counts[2], Relaxed);
+        stats.maintenance_tasks_pending.store(counts[TaskState::Pending as usize], Relaxed);
+        stats.maintenance_tasks_running.store(counts[TaskState::Running as usize], Relaxed);
+        stats.maintenance_tasks_retry.store(counts[TaskState::Retry as usize], Relaxed);
         stats.maintenance_tasks_quarantined.store(quarantined, Relaxed);
         stats.maintenance_tasks_due_nonquarantined.store(due_nonquarantined, Relaxed);
         stats.maintenance_tasks_complete.store(counts[TaskState::Complete as usize].saturating_add(counts[TaskState::Superseded as usize]), Relaxed);
@@ -3125,7 +3102,9 @@ impl TaskJournal {
         let now = u64::try_from(now_micros.div_euclid(1_000)).unwrap_or_default();
         let oldest_age_secs = if oldest_pended != u64::MAX { now.saturating_sub(oldest_pended) / 1_000 } else { 0 };
         stats.maintenance_oldest_task_age_secs.store(oldest_age_secs, Relaxed);
-        let oldest_due_secs = if oldest_due == i64::MAX { 0 } else { u64::try_from(now_micros.saturating_sub(oldest_due) / 1_000_000).unwrap_or_default() };
+        // Sorted by deadline, so the head is the oldest due task.
+        let oldest_due_secs =
+            oldest_due_tasks.first().map_or(0, |task| u64::try_from(now_micros.saturating_sub(task.deadline_micros) / 1_000_000).unwrap_or_default());
         stats.maintenance_oldest_due_unclaimed_age_secs.store(oldest_due_secs, Relaxed);
         let tasks = oldest_due_tasks
             .into_iter()
@@ -3152,6 +3131,12 @@ impl TaskState {
     /// what a split leaves on a parent, and it is never claimable.
     pub(crate) fn is_active(self) -> bool {
         !matches!(self, Self::Complete | Self::Superseded)
+    }
+
+    /// Queued and eligible to be claimed or retried, as opposed to running, settled, or
+    /// quarantined (quarantine is tracked separately, via `is_quarantined`, not as a state).
+    pub(crate) fn is_waiting(self) -> bool {
+        matches!(self, Self::Pending | Self::Retry)
     }
 }
 
@@ -3458,12 +3443,6 @@ macro_rules! resources_zip {
     }};
 }
 
-impl Resources {
-    fn saturating_add(self, released: Self) -> Self {
-        resources_zip!(saturating_add, self, released)
-    }
-}
-
 #[derive(Debug)]
 struct AdmissionState {
     capacity: Resources,
@@ -3528,24 +3507,21 @@ impl Refused {
     pub const WRITES: Self = Self(1 << 5);
     pub const MEMORY: Self = Self(1 << 6);
 
-    fn add(&mut self, dim: Self, stat: Option<&std::sync::atomic::AtomicU64>) {
+    fn add(&mut self, dim: Self, stat: Option<&AtomicU64>) {
         self.0 |= dim.0;
-        stat.map(|stat| stat.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+        if let Some(stat) = stat {
+            stat.fetch_add(1, Relaxed);
+        }
     }
 }
 
 impl std::fmt::Display for Refused {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let names: Vec<_> = Self::NAMES.iter().enumerate().filter(|(bit, _)| self.0 & (1 << bit) != 0).map(|(_, name)| *name).collect();
-        f.write_str(&names.join("+"))
+        f.write_str(&Self::NAMES.iter().enumerate().filter(|(bit, _)| self.0 & (1 << bit) != 0).map(|(_, name)| name).join("+"))
     }
 }
 
 impl AdmissionState {
-    fn used(&self) -> Resources {
-        self.used
-    }
-
     fn available(&self) -> Resources {
         resources_zip!(saturating_sub, self.capacity, self.used)
     }
@@ -3653,8 +3629,6 @@ impl AdmissionController {
     /// from. Unlike [`Self::with_cpu_ceiling`], `decoded_bytes` is already a
     /// carved-out capacity and must not receive another cgroup reserve haircut.
     pub fn with_decoded_capacity(cpu_base: u32, cpu_max: u32, decoded_bytes: u64, state_bytes: u64, object_reads: u32, object_writes: u32) -> Self {
-        use std::sync::atomic::Ordering::Relaxed;
-
         let capacity = Resources { cpu: cpu_max.max(cpu_base), decoded_bytes, state_bytes, object_reads, object_writes };
         let stats = crate::observability::maintenance_stats();
         stats.maintenance_cpu_tokens_capacity.store(u64::from(capacity.cpu), Relaxed);
@@ -3684,8 +3658,6 @@ impl AdmissionController {
     pub fn acquire(
         &self, request: Resources, lane: AdmissionLane, memory: crate::config::MemorySnapshot, requester: Option<StateRequester>, now_micros: i64,
     ) -> Result<AdmissionPermit, Refused> {
-        use std::sync::atomic::Ordering::Relaxed;
-
         let stats = crate::observability::maintenance_stats();
         let mut refused = Refused::default();
         if request.decoded_bytes > MAX_DECODED_BYTES {
@@ -3700,24 +3672,21 @@ impl AdmissionController {
         // A `FLAG SET` capacity takes effect at the next admission; permits already
         // held keep their tokens, and usage above a lowered ceiling only refuses.
         let cpu_capacity = crate::config::RuntimeFlag::TimefusionMaintenanceCpuTokens.override_value().unwrap_or(state.capacity.cpu);
-        if stats.maintenance_cpu_tokens_capacity.load(Relaxed) != u64::from(cpu_capacity) {
-            stats.maintenance_cpu_tokens_capacity.store(u64::from(cpu_capacity), Relaxed);
-        }
+        let publish = |gauge: &AtomicU64, value: u32| {
+            if gauge.load(Relaxed) != u64::from(value) {
+                gauge.store(u64::from(value), Relaxed);
+            }
+        };
+        publish(&stats.maintenance_cpu_tokens_capacity, cpu_capacity);
         let global_ceiling = lag_scaled_cpu_ceiling(state.cpu_base.min(cpu_capacity), cpu_capacity);
         let reserved = rollup_reserved_cpu(global_ceiling);
-        let published_ceiling = u64::from(global_ceiling);
-        if stats.maintenance_cpu_tokens_limit.load(Relaxed) != published_ceiling {
-            stats.maintenance_cpu_tokens_limit.store(published_ceiling, Relaxed);
-        }
-        let published_reserved = u64::from(reserved);
-        if stats.maintenance_rollup_reserved_cpu_tokens.load(Relaxed) != published_reserved {
-            stats.maintenance_rollup_reserved_cpu_tokens.store(published_reserved, Relaxed);
-        }
+        publish(&stats.maintenance_cpu_tokens_limit, global_ceiling);
+        publish(&stats.maintenance_rollup_reserved_cpu_tokens, reserved);
         let lane_ceiling = match lane {
             AdmissionLane::Rollup => global_ceiling,
             AdmissionLane::Other => global_ceiling.saturating_sub(reserved).max(1),
         };
-        let used = state.used();
+        let used = state.used;
         // A unit priced above the lane's whole ceiling runs ALONE, never NEVER:
         // size-priced CPU (one token per 64 MiB of decode) can exceed a small
         // box's ceiling, and unclamped it would starve that unit forever — the
@@ -3787,7 +3756,7 @@ impl AdmissionController {
         }
         // Every field was checked above; failure is now an internal invariant,
         // not an unclassified admission refusal.
-        state.used = state.used.saturating_add(request);
+        state.used = resources_zip!(saturating_add, state.used, request);
         let frontier_state = if frontier { request.state_bytes } else { 0 };
         state.frontier_state += frontier_state;
         Self::publish_utilization(&state);
@@ -3799,12 +3768,11 @@ impl AdmissionController {
     }
 
     pub fn utilization(&self) -> Resources {
-        lock(&self.0).used()
+        lock(&self.0).used
     }
 
     fn publish_utilization(state: &AdmissionState) {
-        use std::sync::atomic::Ordering::Relaxed;
-        let used = state.used();
+        let used = state.used;
         let stats = crate::observability::maintenance_stats();
         stats.maintenance_cpu_tokens_used.store(u64::from(used.cpu), Relaxed);
         stats.maintenance_decoded_bytes_used.store(used.decoded_bytes, Relaxed);
@@ -3874,8 +3842,7 @@ mod tests {
         let done = upserted(&mut journal, task("s", 0, DAY_MICROS, Operation::BaseRollup));
         assert!(journal.complete(&done));
 
-        let derived: std::collections::BTreeSet<_> =
-            journal.tasks().filter(|t| matches!(t.state, TaskState::Pending | TaskState::Retry)).map(|t| t.key.clone()).collect();
+        let derived: std::collections::BTreeSet<_> = journal.tasks().filter(|t| t.state.is_waiting()).map(|t| t.key.clone()).collect();
         assert!(derived.contains(&pending) && derived.contains(&retried), "fixture must produce both claimable states");
 
         for key in &derived {
@@ -4114,7 +4081,6 @@ mod tests {
     #[test_case::test_case(MIN_SLICE_MICROS, Operation::BaseRollup => Some(TaskState::Retry) ; "worker OOM backs off an indivisible unit")]
     #[test_case::test_case(DERIVED_SLICE_MICROS, Operation::DerivedRollup => Some(TaskState::Retry) ; "worker OOM backs off a derived hour instead of splitting it")]
     fn repeated_worker_capacity_failure_keeps_its_classification(width: i64, operation: Operation) -> Option<TaskState> {
-        use itertools::Itertools;
         use std::sync::atomic::Ordering::Relaxed;
 
         let (dir, mut journal) = new_journal();
@@ -5329,8 +5295,7 @@ mod tests {
         }
         journal.coarsen_sealed_slices(first_write);
         assert!(journal.tasks().all(|task| task.key.slice.width() <= DERIVED_SLICE_MICROS), "no unit may outgrow the hour the write touched");
-        let cells = itertools::Itertools::sorted(journal.tasks().filter(|task| task.key.operation == Operation::BaseRollup).map(|task| task.key.clone()))
-            .collect::<Vec<_>>();
+        let cells = journal.tasks().filter(|task| task.key.operation == Operation::BaseRollup).map(|task| task.key.clone()).sorted().collect::<Vec<_>>();
         assert_eq!(cells.len(), 6);
 
         let later = day + 2 * DERIVED_SLICE_MICROS;
@@ -6787,11 +6752,7 @@ mod tests {
 
     /// Widths of every still-claimable unit for `operation`, in journal order.
     fn live_widths(journal: &TaskJournal, operation: Operation) -> Vec<i64> {
-        journal
-            .tasks()
-            .filter(|t| t.key.operation == operation && matches!(t.state, TaskState::Pending | TaskState::Retry))
-            .map(|t| t.key.slice.width())
-            .collect()
+        journal.tasks().filter(|t| t.key.operation == operation && t.state.is_waiting()).map(|t| t.key.slice.width()).collect()
     }
 
     /// Widths of `project`'s pending units whose slice starts inside `day`.
@@ -6902,8 +6863,7 @@ mod tests {
         }
         assert!(journal.coarsen_sealed_slices(now) > 0, "the day must fuse");
 
-        let fused: Vec<_> =
-            journal.tasks().filter(|t| t.key.operation == Operation::BaseRollup && matches!(t.state, TaskState::Pending | TaskState::Retry)).collect();
+        let fused: Vec<_> = journal.tasks().filter(|t| t.key.operation == Operation::BaseRollup && t.state.is_waiting()).collect();
         assert_eq!(fused.len(), 1, "one day-wide unit should remain");
         assert_eq!(
             fused[0].created_unix_ms, old_ms,
@@ -6958,7 +6918,7 @@ mod tests {
         journal.coarsen_sealed_slices(now);
 
         assert!(
-            journal.tasks().any(|t| matches!(t.state, TaskState::Pending | TaskState::Retry) && t.key.operation == Operation::BaseRollup),
+            journal.tasks().any(|t| t.state.is_waiting() && t.key.operation == Operation::BaseRollup),
             "the work under a parent that is not queued work must survive"
         );
     }
