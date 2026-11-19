@@ -707,6 +707,29 @@ enum JournalRecord {
     },
 }
 
+/// A snapshot cloned under the journal lock, written without it.
+#[must_use = "a taken compaction must be finished, or the journal never compacts again"]
+pub struct CompactJob {
+    durable: Snapshot,
+    path: PathBuf,
+    /// The WAL length the snapshot covers; later records survive the rewrite.
+    wal_len: u64,
+}
+
+impl CompactJob {
+    /// Serialize and atomically replace the snapshot. Takes no journal lock.
+    pub fn write(&self) -> anyhow::Result<()> {
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        crate::support::without_blocking_the_worker(|| {
+            let bytes = serde_json::to_vec(&self.durable)?;
+            crate::write::wal::write_atomic_with(&self.path, true, |file| file.write_all(&bytes))?;
+            Ok(())
+        })
+    }
+}
+
 /// Crash-safe task journal. `checkpoint` uses fsync + atomic rename, so a failed
 /// completion checkpoint causes redundant work, never missing work.
 #[derive(Debug)]
@@ -716,6 +739,11 @@ pub struct TaskJournal {
     /// Start of a failed append, retained until retry removes its partial bytes.
     /// Complete records awaiting fsync do not need rollback.
     incomplete_append: Option<u64>,
+    /// The WAL crossed [`JOURNAL_COMPACT_BYTES`]; the next [`Self::begin_compact`] owes a snapshot.
+    compact_due: bool,
+    /// A [`CompactJob`] is out, writing its snapshot without the lock. One at a time: the
+    /// second would cut a WAL prefix the first already rewrote.
+    compacting: bool,
     snapshot: Snapshot,
     /// Stable indices into `snapshot.tasks`. Tasks are never removed, so point
     /// updates and WAL replay stay O(1) even with a production-sized backlog.
@@ -999,6 +1027,8 @@ impl TaskJournal {
             path,
             wal_path,
             incomplete_append: None,
+            compact_due: false,
+            compacting: false,
             snapshot,
             task_indices,
             dirty_tasks: HashSet::new(),
@@ -2858,6 +2888,16 @@ impl TaskJournal {
     /// the shared runtime, so the blocking `fsync` must go through
     /// `without_blocking_the_worker`; the mutex stays held across it for durability ordering.
     pub fn checkpoint(&mut self) -> anyhow::Result<()> {
+        if self.append_dirty()? >= JOURNAL_COMPACT_BYTES {
+            self.compact_due = true;
+        }
+        let _stats = crate::observability::BlockWatch::new("journal_stats_publish");
+        self.publish_statistics_throttled();
+        Ok(())
+    }
+
+    /// Append every dirty record and fsync it, returning the WAL's length.
+    fn append_dirty(&mut self) -> anyhow::Result<u64> {
         let policies_changed = !self.dirty_rollup_policies.is_empty();
         if let Some(parent) = self.wal_path.parent() {
             fs::create_dir_all(parent)?;
@@ -2915,24 +2955,21 @@ impl TaskJournal {
             dirty_cursors.clear();
             dirty_rollup_policies.clear();
             removed_tasks.clear();
-            Some(len)
+            len
         } else {
-            fs::metadata(&self.wal_path).ok().map(|metadata| metadata.len())
+            fs::metadata(&self.wal_path).map_or(0, |metadata| metadata.len())
         };
         if policies_changed {
             self.rebuild_claimable();
         }
-        if wal_len.is_some_and(|len| len >= JOURNAL_COMPACT_BYTES) {
-            let _compact = crate::observability::BlockWatch::new("journal_compact");
-            self.compact()?;
-        }
-        let _stats = crate::observability::BlockWatch::new("journal_stats_publish");
-        self.publish_statistics_throttled();
-        Ok(())
+        Ok(wal_len)
     }
 
     /// How often `checkpoint` may recompute the maintenance gauges.
-    const STATS_PUBLISH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+    ///
+    /// Prod 2026-11-19: once a second this scan was ~7% of the journal lock's time, with
+    /// 200 ms spikes every ingest ack queued behind.
+    const STATS_PUBLISH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 
     /// `publish_statistics`, but at most once per [`Self::STATS_PUBLISH_INTERVAL`] — it is a
     /// full scan of `snapshot.tasks` under the global journal mutex, costed by journal
@@ -2973,12 +3010,30 @@ impl TaskJournal {
         dropped
     }
 
+    /// Compact now, holding the caller's lock throughout. Boot migrations and tests only:
+    /// the live path is [`Self::take_due_compaction`], which writes without the lock.
     pub fn compact(&mut self) -> anyhow::Result<()> {
-        let policies_changed = !self.dirty_rollup_policies.is_empty();
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent)?;
-        }
+        let job = self.begin_compact()?;
+        let written = job.write();
+        self.finish_compact(job, written)
+    }
 
+    /// The due compaction, if one is owed and none is out.
+    pub fn take_due_compaction(&mut self) -> anyhow::Result<Option<CompactJob>> {
+        if !self.compact_due || self.compacting {
+            return Ok(None);
+        }
+        self.begin_compact().map(Some)
+    }
+
+    /// Under the lock: make the WAL hold every durable state, then clone it. Recovery
+    /// replays the whole WAL over the snapshot in order, so once each key's last WAL
+    /// record equals its snapshot state, a crash before [`Self::finish_compact`]
+    /// replays to the same journal. Clearing dirt WITHOUT appending it broke that: the
+    /// stale WAL record would replay over the newer snapshot state.
+    fn begin_compact(&mut self) -> anyhow::Result<CompactJob> {
+        anyhow::ensure!(!self.compacting, "a maintenance journal compaction is already in flight");
+        let wal_len = self.append_dirty()?;
         // Derived work is left out of the authoritative snapshot: a reload starts with none
         // of it and `plan_compaction_debt` re-derives it.
         let durable = Snapshot {
@@ -2987,24 +3042,33 @@ impl TaskJournal {
             source_cursors: self.snapshot.source_cursors.clone(),
             rollup_policies: self.snapshot.rollup_policies.clone(),
         };
-        // Serialize AND write off the worker: the `to_vec` over every live task is as costly
-        // as the fsync, and both hold the journal mutex.
-        crate::support::without_blocking_the_worker(|| -> anyhow::Result<()> {
-            let bytes = serde_json::to_vec(&durable)?;
-            crate::write::wal::write_atomic_with(&self.path, true, |file| file.write_all(&bytes))?;
-            let wal = OpenOptions::new().create(true).write(true).truncate(true).open(&self.wal_path)?;
-            self.incomplete_append = None;
-            wal.sync_all()?;
-            Ok(())
-        })?;
-        self.dirty_tasks.clear();
-        self.removed_tasks.clear();
-        self.dirty_cursors.clear();
-        self.dirty_rollup_policies.clear();
-        if policies_changed {
-            self.rebuild_claimable();
+        self.compacting = true;
+        self.compact_due = false;
+        Ok(CompactJob { durable, path: self.path.clone(), wal_len })
+    }
+
+    /// Under the lock again: drop the WAL prefix the written snapshot covers, keeping
+    /// records appended while it was written. A failed write leaves the WAL whole and
+    /// the compaction due again.
+    pub fn finish_compact(&mut self, job: CompactJob, written: anyhow::Result<()>) -> anyhow::Result<()> {
+        self.compacting = false;
+        if let Err(error) = written {
+            self.compact_due = true;
+            return Err(error);
         }
-        Ok(())
+        crate::support::without_blocking_the_worker(|| -> anyhow::Result<()> {
+            let bytes = match fs::read(&self.wal_path) {
+                Ok(bytes) => bytes,
+                Err(error) if error.kind() == ErrorKind::NotFound => Vec::new(),
+                Err(error) => return Err(error.into()),
+            };
+            // A failed append's partial bytes are dropped here; its dirt is still queued.
+            let end = self.incomplete_append.map_or(bytes.len(), |start| usize::try_from(start).unwrap_or(usize::MAX)).min(bytes.len());
+            let start = usize::try_from(job.wal_len)?.min(end);
+            crate::write::wal::write_atomic_with(&self.wal_path, true, |file| file.write_all(&bytes[start..end]))?;
+            self.incomplete_append = None;
+            Ok(())
+        })
     }
 
     pub fn publish_statistics(&self) {
@@ -5571,6 +5635,51 @@ mod tests {
         assert!(journal.is_indexed_claimable(&derived(0, HOUR)), "a reopened cell must be claimable without a restart");
 
         assert_eq!(journal.reopen_derived_over("p", "derived", 0, 2 * HOUR), 0, "reopening is idempotent");
+    }
+
+    /// A crash after the snapshot is written but before the WAL prefix is dropped replays
+    /// the whole old WAL over the new snapshot. Dirt the snapshot holds but the WAL does
+    /// not would be rolled back by its older record.
+    #[test]
+    fn a_crash_before_the_wal_rewrite_replays_to_the_compacted_journal() -> anyhow::Result<()> {
+        let (dir, mut journal) = new_journal();
+        let key = upserted(&mut journal, task("p", 0, MIN_SLICE_MICROS, Operation::BaseRollup));
+        journal.checkpoint()?;
+        assert!(journal.complete(&key), "dirty, not yet appended");
+        journal.begin_compact()?.write()?;
+        drop(journal);
+        assert_eq!(TaskJournal::load(dir.path())?.state(&key), Some(TaskState::Complete));
+        Ok(())
+    }
+
+    /// The snapshot is written without the lock, so checkpoints land meanwhile; dropping
+    /// the covered WAL prefix must keep them.
+    #[test]
+    fn records_appended_while_the_snapshot_is_written_survive_the_wal_rewrite() -> anyhow::Result<()> {
+        let (dir, mut journal) = new_journal();
+        let first = upserted(&mut journal, task("p", 0, MIN_SLICE_MICROS, Operation::BaseRollup));
+        journal.checkpoint()?;
+        let job = journal.begin_compact()?;
+        assert!(journal.take_due_compaction()?.is_none() && journal.begin_compact().is_err(), "one compaction at a time");
+        let later = upserted(&mut journal, task("q", 0, MIN_SLICE_MICROS, Operation::BaseRollup));
+        journal.checkpoint()?;
+        let written = job.write();
+        journal.finish_compact(job, written)?;
+        let reloaded = TaskJournal::load(dir.path())?;
+        assert_eq!((reloaded.state(&first), reloaded.state(&later)), (Some(TaskState::Pending), Some(TaskState::Pending)));
+        let kept = fs::read_to_string(&journal.wal_path)?;
+        assert!(kept.contains("\"q\"") && !kept.contains("\"p\""), "only the post-snapshot record stays in the WAL: {kept}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_failed_snapshot_write_leaves_the_compaction_due() -> anyhow::Result<()> {
+        let (_dir, mut journal) = new_journal();
+        journal.compact_due = true;
+        let job = journal.take_due_compaction()?.expect("due");
+        assert!(journal.finish_compact(job, Err(anyhow::anyhow!("disk full"))).is_err());
+        assert!(journal.take_due_compaction()?.is_some(), "retried by the next checkpoint");
+        Ok(())
     }
 
     #[test]

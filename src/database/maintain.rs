@@ -4861,7 +4861,26 @@ impl Database {
         let stats = crate::observability::maintenance_stats();
         stats.task_journal_checkpoints.store(performed, std::sync::atomic::Ordering::Relaxed);
         stats.task_journal_checkpoints_coalesced.store(coalesced, std::sync::atomic::Ordering::Relaxed);
+        self.compact_task_journal_if_due();
         Ok(())
+    }
+
+    /// The compaction a checkpoint marked due, with the snapshot written while the journal
+    /// lock is free: holding it across a 158 MB serialize stalled every ingest ack ~1 s.
+    /// The caller's records are already durable, so a failure here is retried, not raised.
+    fn compact_task_journal_if_due(&self) {
+        let job = match self.journal().take_due_compaction() {
+            Ok(Some(job)) => job,
+            Ok(None) => return,
+            Err(error) => return warn!(%error, event = "maintenance_journal_compaction_failed"),
+        };
+        let written = {
+            let _timed = crate::observability::TimedSection::new("journal_compact_write");
+            job.write()
+        };
+        if let Err(error) = self.journal().finish_compact(job, written) {
+            warn!(%error, event = "maintenance_journal_compaction_failed");
+        }
     }
 
     /// In-memory half: mark the partition dirty and mint its slice work. Not
