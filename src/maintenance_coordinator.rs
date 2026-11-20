@@ -3489,9 +3489,17 @@ pub const ROLLUP_STATE_PER_INPUT_BYTE: u64 = 32;
 /// its decoded input. Linear in `sketches` (t-digest/HLL measures) — inferred:
 /// only single-sketch tiers have a clean measurement.
 pub fn rollup_state_bytes(sketches: usize, prior_output_rows: Option<u64>, input_decoded_bytes: u64) -> u64 {
-    prior_output_rows.map_or(input_decoded_bytes.saturating_mul(ROLLUP_STATE_PER_INPUT_BYTE), |rows| {
-        rows.saturating_mul((sketches as u64).saturating_mul(ROLLUP_STATE_BYTES_PER_ROW_SKETCH).max(ROLLUP_STATE_BYTES_PER_PLAIN_ROW))
-    })
+    let per_row = (sketches as u64).saturating_mul(ROLLUP_STATE_BYTES_PER_ROW_SKETCH).max(ROLLUP_STATE_BYTES_PER_PLAIN_ROW);
+    // The input multiple was measured on a one-sketch tier; a sketch-less tier's groups cost
+    // `PLAIN_ROW / ROW_SKETCH` of that. Prod 11-20: the new gen_ai_1m tier's first builds
+    // priced 32x input, clamped to the whole pool and ran alone while using ~1 MB.
+    prior_output_rows.map_or_else(
+        || {
+            input_decoded_bytes.saturating_mul(ROLLUP_STATE_PER_INPUT_BYTE).saturating_mul(per_row.min(ROLLUP_STATE_BYTES_PER_ROW_SKETCH))
+                / ROLLUP_STATE_BYTES_PER_ROW_SKETCH
+        },
+        |rows| rows.saturating_mul(per_row),
+    )
 }
 
 /// Rows a unit over `slice` will publish, extrapolated from the published
@@ -5725,6 +5733,14 @@ mod tests {
     #[test_case::test_case(2, 100_000 => 9 ; "sketches still multiply")]
     fn rollup_state_is_priced_by_sketch_count(sketches: usize, rows: u64) -> u64 {
         rollup_state_bytes(sketches, Some(rows), 0) >> 30
+    }
+
+    /// With no published output yet, a new tier is priced from its decoded input.
+    #[test_case::test_case(0 => 682 ; "a sketch-less tier at the plain-row share")]
+    #[test_case::test_case(1 => 16_384 ; "a one-sketch tier at the measured multiple")]
+    #[test_case::test_case(2 => 16_384 ; "the measured multiple already covers several sketches")]
+    fn a_new_tier_is_priced_from_its_input_by_sketch_count(sketches: usize) -> u64 {
+        rollup_state_bytes(sketches, None, 512 << 20) >> 20
     }
 
     #[test]
