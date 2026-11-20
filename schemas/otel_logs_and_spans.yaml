@@ -624,6 +624,22 @@ rollups:
       - { name: duration_count, agg: count, column: duration }
       - { name: duration_sum, agg: sum, column: duration }
       - { name: duration_digest, agg: tdigest, column: duration }
+  # monoscope's LLM dashboard (gen-ai widgets): request, error-rate, token and cost charts
+  # by service and model, filtered by `attributes___gen_ai___operation___name IN (...)`.
+  # Raw they scanned a project's every span for that sparse subset: p50 3.5-11.5 s on
+  # 11-20. Spans with no gen-ai operation collapse to one NULL group per minute, service
+  # and status, so the tier stays the size of the gen-ai traffic.
+  - grain: 1m
+    name: gen_ai_1m
+    dimensions: [resource___service___name, attributes___gen_ai___operation___name, attributes___gen_ai___request___model, status_code]
+    backfill_days: 14
+    measures:
+      - { name: request_count, agg: count }
+      - { name: error_count, agg: count, filter: "status_code = 'ERROR'" }
+      - { name: input_tokens_sum, agg: sum, column: attributes___gen_ai___usage___input_tokens }
+      - { name: output_tokens_sum, agg: sum, column: attributes___gen_ai___usage___output_tokens }
+      - { name: cost_sum, agg: sum, column: attributes___gen_ai___usage___cost }
+      - { name: cost_count, agg: count, column: attributes___gen_ai___usage___cost }
   # Per-hash tier for monoscope's endpoint/issue widgets, which filter on
   # `hashes @> ARRAY[h]` / `array_has(hashes, h)` over 7-14 d and timed out at 90 s:
   # a hash's rows sit in ~98% of pages, so only an aggregate keyed by hash is cheap.

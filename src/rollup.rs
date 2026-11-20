@@ -2042,9 +2042,9 @@ async fn match_aggregate(
             // declined that way. A grain miss is only reached AFTER the filter was
             // accepted, so it outranks another spec's filter miss.
             Err(reason @ (MissReason::PartialBucket | MissReason::TinyInterior)) => grain_miss = Some(reason),
-            // "No tier's measures mention these columns" is the least actionable reason, so
+            // "This tier's columns don't cover the query" is the least actionable reason, so
             // another tier's (a near miss, a missing measure) is never overwritten by it.
-            Err(MissReason::FilterNotEligible) if miss.is_some() => {}
+            Err(MissReason::FilterNotEligible | MissReason::UnknownGroupBy) if miss.is_some() => {}
             Err(reason) => miss = Some(reason),
         }
     }
@@ -3841,7 +3841,7 @@ mod tests {
     /// best first. One reading an undeclared column must DECLINE, not vanish as a
     /// silent `Ok(empty)`.
     #[test_case::test_case("coalesce(status_code, level)", Ok(&["dashboard_1h_v3", "dashboard_1m_v4"]) ; "monoscope's status chart reads level")]
-    #[test_case::test_case("status_code", Ok(&["dashboard_1h_v3", "routes_30m", "dashboard_1m_v4"]) ; "a plain status group")]
+    #[test_case::test_case("status_code", Ok(&["dashboard_1h_v3", "routes_30m", "dashboard_1m_v4", "gen_ai_1m"]) ; "a plain status group")]
     #[test_case::test_case("coalesce(status_code, name)", Err(MissReason::UnsupportedShape) ; "an unservable group expression is counted rather than silent")]
     #[tokio::test]
     async fn a_group_expression_routes_to_the_tiers_declaring_its_columns(key: &str, expected: Result<&[&str], MissReason>) {
@@ -3857,6 +3857,25 @@ mod tests {
         }
     }
 
+    /// monoscope's LLM dashboard widgets, with their `'all'` variables bound as prod sends them.
+    #[test_case::test_case("(((count(*) FILTER (WHERE status_code = 'ERROR')::float * 100) / NULLIF(count(*)::float, 0)))::float", "", "" ; "error rate stat")]
+    #[test_case::test_case("time_bucket('5 minutes', timestamp) AS tb, ((sum((attributes___gen_ai___usage___input_tokens)::float) + sum((attributes___gen_ai___usage___output_tokens)::float)))::float", "", "GROUP BY 1" ; "tokens chart")]
+    #[test_case::test_case("time_bucket('5 minutes', timestamp) AS tb, sum((attributes___gen_ai___usage___cost)::float)", " AND attributes___gen_ai___usage___cost IS NOT NULL", "GROUP BY 1" ; "cost chart")]
+    #[test_case::test_case("time_bucket('5 minutes', timestamp) AS tb, COALESCE((attributes___gen_ai___request___model)::text, 'null') AS m, count(*)::float", "", "GROUP BY 1, 2" ; "requests by model")]
+    #[tokio::test]
+    async fn the_gen_ai_dashboard_routes_to_its_tier(select: &str, extra: &str, group: &str) {
+        for service in ["'all' = 'all' OR resource___service___name = 'all'", "'chat-api' = 'all' OR resource___service___name = 'chat-api'"] {
+            let sql = format!(
+                "SELECT {select} FROM {SOURCE} WHERE project_id = 'project' AND timestamp >= to_timestamp_micros(0) AND timestamp < to_timestamp_micros(7200000000) \
+                 AND ((attributes___gen_ai___operation___name IN ('chat', 'text_completion', 'embeddings', 'execute_tool') AND ({service}) \
+                 AND ('all' = 'all' OR attributes___gen_ai___request___model = 'all'){extra})) {group}"
+            );
+            let state = session().await;
+            assert_eq!(targets(&state, &sql).await.map(|t| t.first().cloned()), Ok(Some("gen_ai_1m".to_owned())), "{sql}");
+            assert_substitutes(&state, &sql, None).await;
+        }
+    }
+
     /// Prod's `1h_by_1m` probe verbatim.
     #[tokio::test]
     async fn the_last_hour_probe_routes_to_v4() {
@@ -3865,16 +3884,18 @@ mod tests {
              WHERE project_id = 'project' AND timestamp >= now() - interval '1 hour' GROUP BY 1"
         );
         // Both minute tiers can serve a bare count; the dashboard tier, declared first, leads.
-        assert_eq!(targets(&session().await, &sql).await, Ok(vec!["dashboard_1m_v4".to_owned(), "endpoints_1m".to_owned()]));
+        assert_eq!(targets(&session().await, &sql).await, Ok(vec!["dashboard_1m_v4".to_owned(), "endpoints_1m".to_owned(), "gen_ai_1m".to_owned()]));
     }
 
     /// The status chart routes under any status filter, whether or not it leaves the `level` fallback reachable.
-    #[test_case::test_case("status_code = 'pickup_accepted'")]
-    #[test_case::test_case("status_code IS NOT NULL")]
-    #[test_case::test_case("status_code IS NULL")]
-    #[test_case::test_case("status_code = 'pickup_accepted' OR status_code IS NULL")]
+    /// A predicate proving `status_code` non-null folds the `level` fallback away, so the
+    /// gen-ai tier (no `level`) serves it too.
+    #[test_case::test_case("status_code = 'pickup_accepted'", &["dashboard_1m_v4", "gen_ai_1m"])]
+    #[test_case::test_case("status_code IS NOT NULL", &["dashboard_1m_v4", "gen_ai_1m"])]
+    #[test_case::test_case("status_code IS NULL", &["dashboard_1m_v4"])]
+    #[test_case::test_case("status_code = 'pickup_accepted' OR status_code IS NULL", &["dashboard_1m_v4"])]
     #[tokio::test]
-    async fn a_status_filtered_status_chart_routes(predicate: &str) {
+    async fn a_status_filtered_status_chart_routes(predicate: &str, expected: &[&str]) {
         let state = session().await;
         let sql = format!(
             "SELECT extract(epoch from time_bucket('2 hours', timestamp))::integer, \
@@ -3882,7 +3903,7 @@ mod tests {
             FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW} AND ({predicate}) \
             GROUP BY time_bucket('2 hours', timestamp), COALESCE(coalesce(status_code, level)::text, 'null')"
         );
-        assert_eq!(targets(&state, &sql).await, Ok(vec!["dashboard_1m_v4".to_owned()]));
+        assert_eq!(targets(&state, &sql).await, Ok(expected.iter().map(|name| (*name).to_owned()).collect()));
         assert_substitutes(&state, &sql, None).await;
     }
 

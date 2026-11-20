@@ -12287,8 +12287,8 @@ mod rollup_noop_skip_tests {
         assert_eq!(active(&db), queued, "neither recovery nor the census may queue work beyond the pending rebuilds");
         let (start, end) = sibling;
         let sql = format!(
-            "SELECT status_code, COUNT(*) AS n FROM otel_logs_and_spans WHERE project_id = '{project}' \
-             AND timestamp >= to_timestamp_micros({start}) AND timestamp < to_timestamp_micros({end}) GROUP BY status_code ORDER BY status_code"
+            "SELECT kind, status_code, COUNT(*) AS n FROM otel_logs_and_spans WHERE project_id = '{project}' \
+             AND timestamp >= to_timestamp_micros({start}) AND timestamp < to_timestamp_micros({end}) GROUP BY kind, status_code ORDER BY kind, status_code"
         );
         let mut ctx = Arc::clone(&db).create_session_context();
         db.setup_session_context(&mut ctx)?;
@@ -14317,7 +14317,7 @@ mod rollup_relevance_tests {
     #[test_case::test_case(&["attributes___user___id"] => Vec::<String>::new() ; "user enrichment touches no tier")]
     #[test_case::test_case(&["attributes___http___response___status_code"] => vec!["dashboard_1h_v3", "dashboard_1m_v4", "endpoints_1m", "hashes_30m", "routes_30m"] ; "a measure filter column touches the dashboard, endpoint, hash and route tiers")]
     #[test_case::test_case(&["level"] => vec!["dashboard_1h_v3", "dashboard_1m_v4"] ; "a level change touches every tier that reads level")]
-    #[test_case::test_case(&["timestamp"] => vec!["dashboard_1h_v3", "dashboard_1m_v4", "endpoints_1m", "hashes_30m", "routes_30m"] ; "moving a row touches every tier")]
+    #[test_case::test_case(&["timestamp"] => vec!["dashboard_1h_v3", "dashboard_1m_v4", "endpoints_1m", "gen_ai_1m", "hashes_30m", "routes_30m"] ; "moving a row touches every tier")]
     fn tiers_reading(columns: &[&str]) -> Vec<String> {
         super::rollup_tiers_reading("otel_logs_and_spans", columns)
             .into_iter()
