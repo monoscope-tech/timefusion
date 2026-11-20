@@ -2062,6 +2062,11 @@ async fn match_aggregate(
         MissReason::UnsupportedShape => {
             tracing::warn!(event = "rollup_declined_shape", source, reason = reason.label(), plan = %shape, "no declared rollup can serve this aggregate")
         }
+        // The two largest miss families, otherwise invisible: sampled so the filters no
+        // declared tier serves can be named from logs without flooding them.
+        MissReason::UnknownFilter | MissReason::FilterNotEligible if crate::observability::sample_rollup_miss(reason.label()) => {
+            tracing::info!(event = "rollup_declined_shape", source, reason = reason.label(), plan = %shape, "no declared rollup can serve this aggregate")
+        }
         _ => tracing::debug!(event = "rollup_declined_shape", source, reason = reason.label(), plan = %shape, "no declared rollup can serve this aggregate"),
     }
     Err(reason)
