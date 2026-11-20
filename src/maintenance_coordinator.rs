@@ -3475,6 +3475,11 @@ pub struct Resources {
 /// for six totalling 89k — 43-50 KB per output row across slice widths and shard
 /// counts. Shards do NOT divide it: every shard holds ~every group.
 pub const ROLLUP_STATE_BYTES_PER_ROW_SKETCH: u64 = 48 << 10;
+/// A sketch-less tier's group row: keys plus a few scalar accumulators. Measured prod
+/// 2026-11-20: an hour of the demo project's `series_5m_v1` (~1.08M rows) held 190-250 MB
+/// of the coordinator pool, ~230 B/row. Priced as one sketch it was 52 GB, clamped to the
+/// whole pool, and every such hour ran alone with the rollup lane queued behind it.
+pub const ROLLUP_STATE_BYTES_PER_PLAIN_ROW: u64 = 2 << 10;
 /// With no prior publication to count: the same units' peak was 24-31x their
 /// decoded input. Over-prices sparse tiers several-fold, which only serializes them.
 pub const ROLLUP_STATE_PER_INPUT_BYTE: u64 = 32;
@@ -3485,7 +3490,7 @@ pub const ROLLUP_STATE_PER_INPUT_BYTE: u64 = 32;
 /// only single-sketch tiers have a clean measurement.
 pub fn rollup_state_bytes(sketches: usize, prior_output_rows: Option<u64>, input_decoded_bytes: u64) -> u64 {
     prior_output_rows.map_or(input_decoded_bytes.saturating_mul(ROLLUP_STATE_PER_INPUT_BYTE), |rows| {
-        rows.saturating_mul(ROLLUP_STATE_BYTES_PER_ROW_SKETCH).saturating_mul(sketches.max(1) as u64)
+        rows.saturating_mul((sketches as u64).saturating_mul(ROLLUP_STATE_BYTES_PER_ROW_SKETCH).max(ROLLUP_STATE_BYTES_PER_PLAIN_ROW))
     })
 }
 
@@ -5711,6 +5716,15 @@ mod tests {
             );
         }
         Ok(())
+    }
+
+    /// A sketch-less tier priced as one sketch made each prod hour of the demo project's
+    /// `series_5m_v1` (~1.08M rows, ~250 MB measured) a 52 GB unit that ran alone.
+    #[test_case::test_case(0, 1_080_000 => 2 ; "a sketch-less hour of a 5m tier")]
+    #[test_case::test_case(1, 1_080_000 => 49 ; "the same rows with one t-digest")]
+    #[test_case::test_case(2, 100_000 => 9 ; "sketches still multiply")]
+    fn rollup_state_is_priced_by_sketch_count(sketches: usize, rows: u64) -> u64 {
+        rollup_state_bytes(sketches, Some(rows), 0) >> 30
     }
 
     #[test]
