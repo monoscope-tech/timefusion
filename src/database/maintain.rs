@@ -3446,10 +3446,24 @@ impl Database {
             Some(crate::maintenance_coordinator::StateRequester::for_task(&key, now)),
             now,
         ) {
-            Ok(permit) => permit,
+            Ok(permit) => {
+                // A unit at half the pool or more runs nearly alone; name its price.
+                if state_bytes >= self.maintenance_admission.state_capacity() / 2 {
+                    info!(table = %key.physical_table, project_id = %key.project_id, slice_start = key.slice.start_micros, slice_end = key.slice.end_micros,
+                        state_bytes, prior_rows, estimated_bytes, event = "rollup_state_whale_admitted");
+                }
+                permit
+            }
             // Transient, never "too big to admit": the shard count above was chosen so
             // `per_shard_bytes <= MAX_DECODED_BYTES`, and state clamps to its capacity.
-            Err(refused) => return retry(format!("admission_busy:{refused}"), self.admission_backoff_for(&key)),
+            Err(refused) => {
+                if crate::observability::sample_rollup_miss("rollup_state_refused") {
+                    let used = self.maintenance_admission.utilization().state_bytes;
+                    info!(table = %key.physical_table, project_id = %key.project_id, slice_start = key.slice.start_micros, slice_end = key.slice.end_micros,
+                        state_bytes, prior_rows, estimated_bytes, state_used = used, %refused, event = "rollup_state_refused");
+                }
+                return retry(format!("admission_busy:{refused}"), self.admission_backoff_for(&key));
+            }
         };
         let mut fingerprint_items = selected.clone();
         fingerprint_items.sort_unstable();
