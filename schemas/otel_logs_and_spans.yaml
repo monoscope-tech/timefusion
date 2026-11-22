@@ -468,6 +468,17 @@ fields:
   - name: attributes___gen_ai___usage___cost
     data_type: Float64
     nullable: true
+  # The LLM pages' text fields (conversation title, tool call arguments, finish reasons), promoted so
+  # a cold hour skips the `attributes` blob. Storage widened 2026-11-22 (102 -> 105) by migrate-columns.
+  - name: attributes___gen_ai___input___preview
+    data_type: Utf8
+    nullable: true
+  - name: attributes___gen_ai___tool___call___arguments
+    data_type: Utf8
+    nullable: true
+  - name: attributes___gen_ai___response___finish_reasons
+    data_type: Utf8
+    nullable: true
 
 # Continuous-aggregate rollups derived from this table. The rollup's own table
 # (`otel_logs_and_spans_rollup_dashboard_1m_v4`) is SYNTHESIZED from this spec plus the field
