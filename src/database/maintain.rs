@@ -143,6 +143,45 @@ impl RollupOutputCoverage {
     }
 }
 
+/// Samples the coordinator pool while a whale-priced rollup unit runs. Every other
+/// rollup is refused state meanwhile, so the pool's peak bounds what the unit really
+/// held, to set against its price on the same log line.
+struct WhalePeak {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    peak: Arc<std::sync::atomic::AtomicUsize>,
+    key: crate::maintenance_coordinator::TaskKey,
+    state_bytes: u64,
+    started: std::time::Instant,
+}
+
+impl WhalePeak {
+    fn start(env: Arc<datafusion::execution::runtime_env::RuntimeEnv>, key: crate::maintenance_coordinator::TaskKey, state_bytes: u64) -> Self {
+        use std::sync::atomic::Ordering::Relaxed;
+        let (stop, peak) = (Arc::<std::sync::atomic::AtomicBool>::default(), Arc::<std::sync::atomic::AtomicUsize>::default());
+        tokio::spawn({
+            let (stop, peak) = (Arc::clone(&stop), Arc::clone(&peak));
+            async move {
+                while !stop.load(Relaxed) {
+                    peak.fetch_max(env.memory_pool.reserved(), Relaxed);
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                }
+            }
+        });
+        Self { stop, peak, key, state_bytes, started: std::time::Instant::now() }
+    }
+}
+
+impl Drop for WhalePeak {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.stop.store(true, Relaxed);
+        let key = &self.key;
+        info!(table = %key.physical_table, project_id = %key.project_id, slice_start = key.slice.start_micros, slice_end = key.slice.end_micros,
+            state_bytes = self.state_bytes, pool_peak_bytes = self.peak.load(Relaxed), ran_secs = self.started.elapsed().as_secs(),
+            event = "rollup_state_whale_finished");
+    }
+}
+
 /// The repair list in the order the backfill consumes it — newest date first.
 /// Sorted here rather than trusted from the source list: the cursor into it is
 /// durable, so a reorder would silently re-target it. `configured` REPLACES
@@ -3439,7 +3478,7 @@ impl Database {
         anyhow::ensure!(hash_shards <= 65_536, "one-minute slice needs {hash_shards} hash shards; maximum is 65536");
         let per_shard_bytes = estimated_bytes.div_ceil(hash_shards).max(1);
         let now = crate::support::now_micros();
-        let _permit = match self.maintenance_admission.acquire(
+        let (_permit, _whale) = match self.maintenance_admission.acquire(
             Resources { cpu: 1, decoded_bytes: per_shard_bytes, state_bytes, object_reads: 1, object_writes: 1 },
             crate::maintenance_coordinator::AdmissionLane::Rollup,
             self.admission_memory(),
@@ -3448,11 +3487,12 @@ impl Database {
         ) {
             Ok(permit) => {
                 // A unit at half the pool or more runs nearly alone; name its price.
-                if state_bytes >= self.maintenance_admission.state_capacity() / 2 {
+                let whale = (state_bytes >= self.maintenance_admission.state_capacity() / 2).then(|| {
                     info!(table = %key.physical_table, project_id = %key.project_id, slice_start = key.slice.start_micros, slice_end = key.slice.end_micros,
                         state_bytes, prior_rows, estimated_bytes, event = "rollup_state_whale_admitted");
-                }
-                permit
+                    WhalePeak::start(self.coordinator_runtime_env(), key.clone(), state_bytes)
+                });
+                (permit, whale)
             }
             // Transient, never "too big to admit": the shard count above was chosen so
             // `per_shard_bytes <= MAX_DECODED_BYTES`, and state clamps to its capacity.

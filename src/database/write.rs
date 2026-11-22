@@ -549,7 +549,13 @@ impl Database {
         };
         let mut table = match restored {
             Some(t) => t,
-            None => builder()?.load().await.map_err(|e| anyhow::anyhow!("Failed to load table: {}", e))?,
+            None => {
+                // A missing log is the normal first open of a new table; loading it anyway makes
+                // the kernel log an ERROR (filing a critical issue) before we create it.
+                let probe = builder()?.build()?;
+                anyhow::ensure!(has_delta_log(probe.log_store().object_store(None).as_ref()).await, "table at '{storage_uri}' has no _delta_log yet");
+                builder()?.load().await.map_err(|e| anyhow::anyhow!("Failed to load table: {}", e))?
+            }
         };
         // Correctness, not just perf: with incremental snapshots on, a
         // non-materialized snapshot enumerates an EMPTY file set that the
@@ -1632,4 +1638,26 @@ pub fn spill_disk_builder(spill_dir: std::path::PathBuf, max_gb: u64) -> datafus
     DiskManagerBuilder::default()
         .with_mode(DiskManagerMode::Directories(vec![spill_dir]))
         .with_max_temp_directory_size(max_gb.saturating_mul(1024 * 1024 * 1024))
+}
+
+/// Whether a table root holds any `_delta_log` entry: one LIST, never a log read.
+pub(crate) async fn has_delta_log(store: &dyn object_store::ObjectStore) -> bool {
+    use futures::StreamExt;
+    store.list(Some(&object_store::path::Path::from("_delta_log"))).next().await.is_some_and(|entry| entry.is_ok())
+}
+
+#[cfg(test)]
+mod delta_log_probe_tests {
+    use object_store::{ObjectStoreExt, PutPayload, memory::InMemory, path::Path};
+
+    /// A new table's first open must not reach the kernel's ERROR-logging load.
+    #[tokio::test]
+    async fn a_table_root_without_a_log_reports_none() {
+        let store = InMemory::new();
+        assert!(!super::has_delta_log(&store).await);
+        store.put(&Path::from("date=2026-11-20/part-0.parquet"), PutPayload::from_static(b"x")).await.unwrap();
+        assert!(!super::has_delta_log(&store).await, "data files alone are not a table");
+        store.put(&Path::from("_delta_log/00000000000000000000.json"), PutPayload::from_static(b"{}")).await.unwrap();
+        assert!(super::has_delta_log(&store).await);
+    }
 }
