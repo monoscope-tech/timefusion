@@ -14370,10 +14370,10 @@ mod rollup_relevance_tests {
     /// tier's inheritance of its base's reads cannot be isolated here: `dashboard_1h_v3`
     /// restates every column its base reads.
     #[test_case::test_case(&["hashes"] => vec!["hashes_30m"] ; "monoscope's hashes enrichment touches only the hash tier")]
-    #[test_case::test_case(&["attributes___user___id"] => Vec::<String>::new() ; "user enrichment touches no tier")]
+    #[test_case::test_case(&["attributes___user___id"] => vec!["llm_1h"] ; "user enrichment touches only the LLM tier, which groups by user")]
     #[test_case::test_case(&["attributes___http___response___status_code"] => vec!["dashboard_1h_v3", "dashboard_1m_v4", "endpoints_1m", "hashes_30m", "routes_30m"] ; "a measure filter column touches the dashboard, endpoint, hash and route tiers")]
     #[test_case::test_case(&["level"] => vec!["dashboard_1h_v3", "dashboard_1m_v4"] ; "a level change touches every tier that reads level")]
-    #[test_case::test_case(&["timestamp"] => vec!["dashboard_1h_v3", "dashboard_1m_v4", "endpoints_1m", "gen_ai_1m", "hashes_30m", "routes_30m"] ; "moving a row touches every tier")]
+    #[test_case::test_case(&["timestamp"] => vec!["dashboard_1h_v3", "dashboard_1m_v4", "endpoints_1m", "gen_ai_1m", "hashes_30m", "llm_1h", "routes_30m"] ; "moving a row touches every tier")]
     fn tiers_reading(columns: &[&str]) -> Vec<String> {
         super::rollup_tiers_reading("otel_logs_and_spans", columns)
             .into_iter()

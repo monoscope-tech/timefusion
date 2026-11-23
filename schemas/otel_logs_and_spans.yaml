@@ -651,6 +651,36 @@ rollups:
       - { name: output_tokens_sum, agg: sum, column: attributes___gen_ai___usage___output_tokens }
       - { name: cost_sum, agg: sum, column: attributes___gen_ai___usage___cost }
       - { name: cost_count, agg: count, column: attributes___gen_ai___usage___cost }
+  # monoscope's LLM pages: GenAI spans per trace and conversation (Pages.LLM.selectUnits). Built
+  # from the GenAI rows only (rows_with), ~0.1% of a project's spans, so keying on the trace id
+  # stays the size of the GenAI traffic. Filters are spelled as monoscope's query spells them.
+  - grain: 1h
+    name: llm_1h
+    rows_with: attributes___gen_ai___operation___name
+    dimensions: [context___trace_id, attributes___gen_ai___conversation___id, attributes___gen_ai___agent___name, attributes___gen_ai___request___model, attributes___user___id, resource___service___name]
+    backfill_days: 14
+    measures:
+      - { name: llm_calls, agg: count, filter: "attributes___gen_ai___operation___name IN ('chat', 'text_completion', 'generate_content', 'embeddings')" }
+      - { name: tool_calls, agg: count, filter: "attributes___gen_ai___operation___name = 'execute_tool'" }
+      - { name: agent_runs, agg: count, filter: "attributes___gen_ai___operation___name IN ('invoke_agent', 'invoke_workflow')" }
+      - { name: input_tokens, agg: sum, column: attributes___gen_ai___usage___input_tokens, filter: "attributes___gen_ai___operation___name IN ('chat', 'text_completion', 'generate_content', 'embeddings')" }
+      - { name: output_tokens, agg: sum, column: attributes___gen_ai___usage___output_tokens, filter: "attributes___gen_ai___operation___name IN ('chat', 'text_completion', 'generate_content', 'embeddings')" }
+      - { name: cost_sum, agg: sum, column: attributes___gen_ai___usage___cost, filter: "attributes___gen_ai___operation___name IN ('chat', 'text_completion', 'generate_content', 'embeddings')" }
+      - { name: cost_count, agg: count, column: attributes___gen_ai___usage___cost, filter: "attributes___gen_ai___operation___name IN ('chat', 'text_completion', 'generate_content', 'embeddings')" }
+      - { name: errors, agg: count, filter: "status_code = 'ERROR'" }
+      - { name: tool_errors, agg: count, filter: "status_code = 'ERROR' AND attributes___gen_ai___operation___name = 'execute_tool'" }
+      - { name: model_errors, agg: count, filter: "status_code = 'ERROR' AND attributes___gen_ai___operation___name IN ('chat', 'text_completion', 'generate_content', 'embeddings')" }
+      - { name: truncated, agg: count, filter: "(attributes___gen_ai___response___finish_reasons LIKE '%\"length\"%' OR attributes___gen_ai___response___finish_reasons LIKE '%\"max_tokens\"%' OR attributes___gen_ai___response___finish_reasons LIKE '%\"MAX_TOKENS\"%')" }
+      - { name: filtered, agg: count, filter: "(attributes___gen_ai___response___finish_reasons LIKE '%\"content_filter\"%' OR attributes___gen_ai___response___finish_reasons LIKE '%\"refusal\"%' OR attributes___gen_ai___response___finish_reasons LIKE '%\"SAFETY\"%')" }
+      - { name: started, agg: min, column: timestamp }
+      - { name: ended, agg: max, column: end_time }
+      - { name: max_input, agg: max, column: attributes___gen_ai___usage___input_tokens }
+      - { name: preview, agg: first, column: attributes___gen_ai___input___preview, filter: "attributes___gen_ai___input___preview IS NOT NULL" }
+      - { name: preview_at, agg: min, column: timestamp, filter: "attributes___gen_ai___input___preview IS NOT NULL" }
+      - { name: first_tool, agg: first, column: attributes___gen_ai___tool___name, filter: "attributes___gen_ai___operation___name = 'execute_tool'" }
+      - { name: first_args, agg: first, column: attributes___gen_ai___tool___call___arguments, filter: "attributes___gen_ai___operation___name = 'execute_tool'" }
+      - { name: tool_at, agg: min, column: timestamp, filter: "attributes___gen_ai___operation___name = 'execute_tool'" }
+      - { name: distinct_args, agg: hll, column: attributes___gen_ai___tool___call___arguments, filter: "attributes___gen_ai___operation___name = 'execute_tool'" }
   # Per-hash tier for monoscope's endpoint/issue widgets, which filter on
   # `hashes @> ARRAY[h]` / `array_has(hashes, h)` over 7-14 d and timed out at 90 s:
   # a hash's rows sit in ~98% of pages, so only an aggregate keyed by hash is cheap.
