@@ -12347,3 +12347,43 @@ async fn vacuum_reloads_a_snapshot_whose_checkpoint_was_cleaned_up() -> Result<(
     assert!(deleted > 0, "the overwritten files must be vacuumed, not lost to a 404 on the cleaned-up checkpoint");
     Ok(())
 }
+
+/// monoscope's LLM list, verbatim, over built `llm_1h` days: the query prod sends must route.
+/// Its error counts filter on `status_code`, which tantivy indexes: the measure probe's WHERE
+/// gained a routing hint the query's aggregate FILTER lacks, and every error measure declined
+/// as `missing_measure` (prod, 2026-11-23), so the whole list ran raw.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_llm_list_routes_over_built_days() -> Result<()> {
+    use crate::maintenance_coordinator::Operation;
+    let db = std::sync::Arc::new(Database::with_config(rollup_backfill_config("llm-route", 35)).await?);
+    db.cancel_maintenance();
+    let project = format!("llm_{}", uuid::Uuid::new_v4().simple());
+    let days: Vec<chrono::NaiveDate> = (3..=4).rev().map(|back| (Utc::now() - chrono::Duration::days(back)).date_naive()).collect();
+    for (index, day) in days.iter().enumerate() {
+        for hour in [1, 7, 13, 19] {
+            let at = day.and_hms_opt(hour, 0, 0).expect("hour").and_utc().timestamp_micros();
+            let row = serde_json::json!({
+                "timestamp": at, "id": format!("d{index}h{hour}"), "name": "chat", "project_id": project, "hashes": [],
+                "summary": ["llm fixture"], "date": day.to_string(), "duration": 100 + hour, "kind": "client", "status_code": "OK",
+                "context___trace_id": format!("t{index}{hour}"), "attributes___gen_ai___operation___name": "chat",
+                "attributes___gen_ai___conversation___id": "c", "attributes___gen_ai___usage___input_tokens": 10,
+            });
+            db.insert_records_batch(&project, "otel_logs_and_spans", vec![json_to_batch(vec![row])?], true, None).await?;
+        }
+        db.run_unit_once("otel_logs_and_spans", &project, *day, Operation::BaseRollup, 24, 0, Some("otel_logs_and_spans_rollup_llm_1h")).await?;
+    }
+    let (lo, hi) = (
+        days[0].and_hms_opt(0, 0, 0).expect("midnight").and_utc().timestamp_micros(),
+        days[1].and_hms_opt(23, 0, 0).expect("end").and_utc().timestamp_micros(),
+    );
+    let sql = format!(
+        "SELECT context___trace_id, attributes___gen_ai___conversation___id, attributes___gen_ai___agent___name, attributes___gen_ai___request___model, attributes___user___id, resource___service___name, count(*) FILTER (WHERE attributes___gen_ai___operation___name IN ('chat', 'text_completion', 'generate_content', 'embeddings')), count(*) FILTER (WHERE attributes___gen_ai___operation___name = 'execute_tool'), count(*) FILTER (WHERE attributes___gen_ai___operation___name IN ('invoke_agent', 'invoke_workflow')), CAST(sum(attributes___gen_ai___usage___input_tokens) FILTER (WHERE attributes___gen_ai___operation___name IN ('chat', 'text_completion', 'generate_content', 'embeddings')) AS DOUBLE PRECISION), CAST(sum(attributes___gen_ai___usage___output_tokens) FILTER (WHERE attributes___gen_ai___operation___name IN ('chat', 'text_completion', 'generate_content', 'embeddings')) AS DOUBLE PRECISION), sum(attributes___gen_ai___usage___cost) FILTER (WHERE attributes___gen_ai___operation___name IN ('chat', 'text_completion', 'generate_content', 'embeddings')), count(attributes___gen_ai___usage___cost) FILTER (WHERE attributes___gen_ai___operation___name IN ('chat', 'text_completion', 'generate_content', 'embeddings')), count(*) FILTER (WHERE status_code = 'ERROR'), count(*) FILTER (WHERE status_code = 'ERROR' AND attributes___gen_ai___operation___name = 'execute_tool'), count(*) FILTER (WHERE status_code = 'ERROR' AND attributes___gen_ai___operation___name IN ('chat', 'text_completion', 'generate_content', 'embeddings')), count(*) FILTER (WHERE (attributes___gen_ai___response___finish_reasons LIKE '%\"length\"%' OR attributes___gen_ai___response___finish_reasons LIKE '%\"max_tokens\"%' OR attributes___gen_ai___response___finish_reasons LIKE '%\"MAX_TOKENS\"%')), count(*) FILTER (WHERE (attributes___gen_ai___response___finish_reasons LIKE '%\"content_filter\"%' OR attributes___gen_ai___response___finish_reasons LIKE '%\"refusal\"%' OR attributes___gen_ai___response___finish_reasons LIKE '%\"SAFETY\"%')), min(timestamp), max(end_time), CAST(max(attributes___gen_ai___usage___input_tokens) AS DOUBLE PRECISION), first_value(attributes___gen_ai___input___preview ORDER BY timestamp) FILTER (WHERE attributes___gen_ai___input___preview IS NOT NULL), min(timestamp) FILTER (WHERE attributes___gen_ai___input___preview IS NOT NULL), first_value(attributes___gen_ai___tool___name ORDER BY timestamp) FILTER (WHERE attributes___gen_ai___operation___name = 'execute_tool'), first_value(attributes___gen_ai___tool___call___arguments ORDER BY timestamp) FILTER (WHERE attributes___gen_ai___operation___name = 'execute_tool'), min(timestamp) FILTER (WHERE attributes___gen_ai___operation___name = 'execute_tool'), CAST(distinct_count(hll_agg(attributes___gen_ai___tool___call___arguments) FILTER (WHERE attributes___gen_ai___operation___name = 'execute_tool')) AS BIGINT) FROM otel_logs_and_spans WHERE project_id = '{project}' AND timestamp >= to_timestamp_micros({lo}) AND timestamp < to_timestamp_micros({hi}) AND attributes___gen_ai___operation___name IS NOT NULL GROUP BY context___trace_id, attributes___gen_ai___conversation___id, attributes___gen_ai___agent___name, attributes___gen_ai___request___model, attributes___user___id, resource___service___name"
+    );
+    let mut ctx = std::sync::Arc::clone(&db).create_session_context();
+    db.setup_session_context(&mut ctx)?;
+    let state = ctx.state();
+    let plan = state.optimize(&state.create_logical_plan(&sql).await.expect("parse")).expect("optimize");
+    let routed = db.rollup_sql(&plan, &state).await.map(|rewrites| rewrites.into_iter().map(|r| r.sql).collect::<Vec<_>>()).map_err(|reason| reason.label());
+    assert!(routed.as_ref().is_ok_and(|sqls| sqls.iter().any(|s| s.contains("llm_1h"))), "{routed:?}");
+    Ok(())
+}
