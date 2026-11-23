@@ -242,7 +242,7 @@ opt-level = 1
 
 [profile.release]
 lto = "thin"
-codegen-units = 16
+codegen-units = 32
 strip = "symbols"
 
 # Profiling/iteration variant of `release`: identical optimization, but keeps
