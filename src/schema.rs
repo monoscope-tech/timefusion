@@ -47,6 +47,7 @@ pub struct RollupSpec {
     /// high-cardinality dimension (a trace id) stores the sparse rows it is for, not every
     /// row of the table. Only queries guarding the same column (`col IS NOT NULL`) route
     /// here, and their raw edges re-apply the guard, so both legs read one population.
+    /// Keep it the LAST field: `generation_render` strips it when absent by its position.
     #[serde(default)]
     pub rows_with: Option<String>,
 }
@@ -836,6 +837,23 @@ mod tests {
 
     fn measure(name: &str, agg: &str, column: Option<&str>, filter: Option<&str>) -> RollupMeasure {
         RollupMeasure { name: name.into(), agg: agg.into(), column: column.map(str::to_owned), filter: filter.map(str::to_owned) }
+    }
+
+    #[test_case(Some("attributes___gen_ai___operation___name"), None => true ; "a source column")]
+    #[test_case(Some("no_such_column"), None => false ; "an unknown column")]
+    #[test_case(Some("kind"), None => false ; "a dimension")]
+    #[test_case(Some("duration"), Some(None) => false ; "a derived tier whose base reads other rows")]
+    #[test_case(Some("duration"), Some(Some("duration")) => true ; "a derived tier over the same rows")]
+    fn rows_with_names_a_non_dimension_column_its_derived_tiers_share(rows_with: Option<&str>, base: Option<Option<&str>>) -> bool {
+        let tier = |name: &str, grain: &str, rows_with: Option<&str>| RollupSpec {
+            grain: grain.into(),
+            rows_with: rows_with.map(Into::into),
+            ..spec(name, vec![measure("c", "count", None, None)])
+        };
+        let mut schema = source().clone();
+        schema.rollups = base.map(|base| tier("rows_base", "1m", base)).into_iter().collect();
+        let checked = RollupSpec { derive_from: base.map(|_| "rows_base".into()), ..tier("rows_tier", "1h", rows_with) };
+        checked.validate(&schema).is_ok()
     }
 
     /// A 1m rollup over `kind` — the shape every spec test varies.

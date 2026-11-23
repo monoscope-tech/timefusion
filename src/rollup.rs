@@ -3518,6 +3518,15 @@ mod tests {
         Ok(routed.raw_row_filters.iter().any(|filter| filter.contains("attributes___gen_ai___operation___name") && filter.contains("IS NOT NULL")))
     }
 
+    /// An absent `rows_with` leaves every shipped tier's generation where it was (see the
+    /// legacy render test); a present one is a different population, so a different id.
+    #[test]
+    fn rows_with_changes_the_generation_only_when_present() {
+        let without = RollupSpec { rows_with: None, ..llm_spec() };
+        assert!(!generation_render(&without).contains("rows_with"));
+        assert_ne!(generation_id(&without, SOURCE, "p", "2026-11-22", None), generation_id(&llm_spec(), SOURCE, "p", "2026-11-22", None));
+    }
+
     #[test]
     fn a_rows_with_tier_builds_from_its_rows_only() {
         let base = build_partition_sql(&llm_spec(), SOURCE, "p", "2026-11-22").unwrap();
@@ -3971,6 +3980,19 @@ mod tests {
             assert_eq!(targets(&state, &sql).await.map(|t| t.first().cloned()), Ok(Some("gen_ai_1m".to_owned())), "{sql}");
             assert_substitutes(&state, &sql, None).await;
         }
+    }
+
+    /// monoscope's LLM list (Pages.LLM.selectUnits) verbatim: GenAI spans per trace and
+    /// conversation over a week, served by `llm_1h` with the edges read raw.
+    #[tokio::test]
+    async fn the_llm_list_routes_to_its_tier() {
+        let sql = format!(
+            "SELECT context___trace_id, attributes___gen_ai___conversation___id, attributes___gen_ai___agent___name, attributes___gen_ai___request___model, attributes___user___id, resource___service___name, count(*) FILTER (WHERE attributes___gen_ai___operation___name IN ('chat', 'text_completion', 'generate_content', 'embeddings')), count(*) FILTER (WHERE attributes___gen_ai___operation___name = 'execute_tool'), count(*) FILTER (WHERE attributes___gen_ai___operation___name IN ('invoke_agent', 'invoke_workflow')), sum(attributes___gen_ai___usage___input_tokens) FILTER (WHERE attributes___gen_ai___operation___name IN ('chat', 'text_completion', 'generate_content', 'embeddings')), sum(attributes___gen_ai___usage___output_tokens) FILTER (WHERE attributes___gen_ai___operation___name IN ('chat', 'text_completion', 'generate_content', 'embeddings')), sum(attributes___gen_ai___usage___cost) FILTER (WHERE attributes___gen_ai___operation___name IN ('chat', 'text_completion', 'generate_content', 'embeddings')), count(attributes___gen_ai___usage___cost) FILTER (WHERE attributes___gen_ai___operation___name IN ('chat', 'text_completion', 'generate_content', 'embeddings')), count(*) FILTER (WHERE status_code = 'ERROR'), count(*) FILTER (WHERE status_code = 'ERROR' AND attributes___gen_ai___operation___name = 'execute_tool'), count(*) FILTER (WHERE status_code = 'ERROR' AND attributes___gen_ai___operation___name IN ('chat', 'text_completion', 'generate_content', 'embeddings')), count(*) FILTER (WHERE (attributes___gen_ai___response___finish_reasons LIKE '%\"length\"%' OR attributes___gen_ai___response___finish_reasons LIKE '%\"max_tokens\"%' OR attributes___gen_ai___response___finish_reasons LIKE '%\"MAX_TOKENS\"%')), count(*) FILTER (WHERE (attributes___gen_ai___response___finish_reasons LIKE '%\"content_filter\"%' OR attributes___gen_ai___response___finish_reasons LIKE '%\"refusal\"%' OR attributes___gen_ai___response___finish_reasons LIKE '%\"SAFETY\"%')), min(timestamp), max(end_time), max(attributes___gen_ai___usage___input_tokens), first_value(attributes___gen_ai___input___preview ORDER BY timestamp) FILTER (WHERE attributes___gen_ai___input___preview IS NOT NULL), first_value(attributes___gen_ai___tool___name ORDER BY timestamp) FILTER (WHERE attributes___gen_ai___operation___name = 'execute_tool'), first_value(attributes___gen_ai___tool___call___arguments ORDER BY timestamp) FILTER (WHERE attributes___gen_ai___operation___name = 'execute_tool'), hll_agg(attributes___gen_ai___tool___call___arguments) FILTER (WHERE attributes___gen_ai___operation___name = 'execute_tool') FROM {SOURCE} WHERE project_id = 'project' AND timestamp >= to_timestamp_micros(1800000000) AND timestamp < to_timestamp_micros(604800000000) \
+             AND attributes___gen_ai___operation___name IS NOT NULL GROUP BY context___trace_id, attributes___gen_ai___conversation___id, attributes___gen_ai___agent___name, attributes___gen_ai___request___model, attributes___user___id, resource___service___name"
+        );
+        let state = session().await;
+        assert_eq!(targets(&state, &sql).await.map(|t| t.first().cloned()), Ok(Some("llm_1h".to_owned())), "{sql}");
+        assert_substitutes(&state, &sql, None).await;
     }
 
     /// Prod's `1h_by_1m` probe verbatim.
