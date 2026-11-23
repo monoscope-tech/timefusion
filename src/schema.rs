@@ -43,6 +43,12 @@ pub struct RollupSpec {
     /// See [`RollupUnnest`]; its `dimension` is also listed in `dimensions`.
     #[serde(default)]
     pub unnest: Option<RollupUnnest>,
+    /// Build only from source rows where this column IS NOT NULL, so a tier keyed on a
+    /// high-cardinality dimension (a trace id) stores the sparse rows it is for, not every
+    /// row of the table. Only queries guarding the same column (`col IS NOT NULL`) route
+    /// here, and their raw edges re-apply the guard, so both legs read one population.
+    #[serde(default)]
+    pub rows_with: Option<String>,
 }
 
 /// Explode an array column into one row per DISTINCT element, grouped as `dimension`, so
@@ -169,6 +175,10 @@ impl RollupSpec {
             );
         }
         anyhow::ensure!(!self.measures.is_empty(), "rollup {target}: needs at least one measure");
+        if let Some(column) = &self.rows_with {
+            anyhow::ensure!(source.field(column).is_some(), "rollup {target}: unknown `rows_with` column `{column}`");
+            anyhow::ensure!(!self.dimensions.contains(column), "rollup {target}: `rows_with` column `{column}` is a dimension; filter on it instead");
+        }
         if let Some(base) = &self.derive_from {
             let base_spec = source
                 .rollups
@@ -176,6 +186,7 @@ impl RollupSpec {
                 .find(|spec| spec.name.as_deref() == Some(base.as_str()))
                 .ok_or_else(|| anyhow::anyhow!("rollup {target}: `derive_from: {base}` names no rollup on this table"))?;
             anyhow::ensure!(base_spec.derive_from.is_none(), "rollup {target}: `derive_from` may not chain — `{base}` is itself derived");
+            anyhow::ensure!(base_spec.rows_with == self.rows_with, "rollup {target}: `rows_with` must match `{base}`'s, which built the rows it derives from");
             let (Some(fine), Some(coarse)) = (base_spec.grain_micros(), self.grain_micros()) else {
                 anyhow::bail!("rollup {target}: cannot compare grains with `{base}`")
             };
@@ -837,6 +848,7 @@ mod tests {
             derive_from: None,
             backfill_days: None,
             unnest: None,
+            rows_with: None,
         }
     }
 

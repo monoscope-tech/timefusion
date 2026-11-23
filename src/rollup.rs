@@ -114,7 +114,9 @@ pub(crate) fn generation_id_from(prefix: u64, source: &str, project_id: &str, da
 fn generation_render(spec: &RollupSpec) -> String {
     #[cfg(test)]
     GENERATION_RENDERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let rendered = format!("{:?}", RollupSpec { backfill_days: legacy_backfill_days(spec.backfill_days), ..spec.clone() });
+    // `rows_with` came after every shipped tier, so its absence renders as nothing.
+    let rendered =
+        format!("{:?}", RollupSpec { backfill_days: legacy_backfill_days(spec.backfill_days), ..spec.clone() }).replacen(", rows_with: None }", " }", 1);
     match spec.unnest {
         None => rendered.replacen(", unnest: None }", " }", 1),
         Some(_) => rendered,
@@ -278,7 +280,7 @@ pub(crate) fn build_partition_sql_ranges(
     let group_by = (1..=1 + spec.dimensions.len()).join(", ");
 
     let partition = format!("project_id = {} AND date = {}", sql_literal(project_id), sql_literal(date));
-    let rebuilt = format!("SELECT {projection} FROM {source} WHERE {partition}");
+    let rebuilt = format!("SELECT {projection} FROM {source} WHERE {partition}{}", rows_with(spec, from != source));
     if ranges.is_empty() {
         return Ok(format!("{rebuilt} GROUP BY {group_by}"));
     }
@@ -305,11 +307,18 @@ pub(crate) fn build_cohort_sql_range_mode(
     let projects = project_ids.iter().map(|project| sql_literal(project)).join(", ");
     Ok(format!(
         "SELECT project_id, {projection} \
-         FROM {} WHERE project_id IN ({projects}) AND date = {} AND timestamp >= to_timestamp_micros({start}) AND timestamp < to_timestamp_micros({end}) \
+         FROM {} WHERE project_id IN ({projects}) AND date = {} AND timestamp >= to_timestamp_micros({start}) AND timestamp < to_timestamp_micros({end}){} \
          GROUP BY {group_by}",
         unnested(spec, from, derived),
-        sql_literal(date)
+        sql_literal(date),
+        rows_with(spec, derived)
     ))
+}
+
+/// The ` AND col IS NOT NULL` a raw build reads under [`RollupSpec::rows_with`]. A derived
+/// build reads its base tier, which already applied it.
+fn rows_with(spec: &RollupSpec, derived: bool) -> String {
+    spec.rows_with.as_deref().filter(|_| !derived).map_or_else(String::new, |column| format!(" AND {} IS NOT NULL", quoted(column)))
 }
 
 /// FROZEN HASH: this IS the persisted bucket id in rollup slices, so changing
@@ -2246,7 +2255,18 @@ async fn route_with_spec(
     if !null_guards.iter().all_equal() {
         return Err(MissReason::FilterMultipleNullGuards);
     }
-    let null_guard = null_guards.first().copied();
+    // The tier holds only `rows_with` rows, so it answers only a query guarding the same
+    // column. That guard is then a row filter both legs apply — the build already did, the
+    // raw edges re-apply it — not the count-guard a bare `col IS NOT NULL` otherwise needs,
+    // so measures over other columns, `count(*)` and `first_value` stay exact under it.
+    let null_guard = match (spec.rows_with.as_deref(), null_guards.first().copied()) {
+        (Some(column), Some(guarded)) if guarded == column => {
+            raw_row_filters.push(format!("{} IS NOT NULL", quoted(column)));
+            None
+        }
+        (Some(_), _) => return Err(MissReason::FilterNotEligible),
+        (None, guard) => guard,
+    };
     // A query that neither pins nor groups by project_id would fold every tenant
     // into one row.
     if project_id.is_none() && !aggregate.group_expr.iter().any(|expr| column_name(expr) == Some("project_id")) {
@@ -2838,6 +2858,7 @@ mod tests {
             derive_from: None,
             backfill_days: None,
             unnest: None,
+            rows_with: None,
         };
         let ctx = datafusion::prelude::SessionContext::new();
         let (first, second) = (rows(0, 9), rows(0, 7));
@@ -2908,6 +2929,7 @@ mod tests {
             derive_from: None,
             backfill_days: None,
             unnest: None,
+            rows_with: None,
         }
     }
 
@@ -3243,6 +3265,7 @@ mod tests {
             derive_from: derive_from.map(str::to_string),
             backfill_days: None,
             unnest: None,
+            rows_with: None,
         };
         let raw = build_partition_sql(&spec(None), SOURCE, "project", "2026-08-01").expect("valid SQL");
         assert!(raw.contains("hll_agg(context___trace_id) FILTER (WHERE kind = 'server') AS traces"), "{raw}");
@@ -3309,6 +3332,7 @@ mod tests {
             derive_from: None,
             backfill_days: None,
             unnest: Some(crate::schema::RollupUnnest { column: "hashes".into(), dimension: "hash".into() }),
+            rows_with: None,
         }
     }
 
@@ -3404,6 +3428,7 @@ mod tests {
             derive_from: None,
             backfill_days: None,
             unnest: Some(crate::schema::RollupUnnest { column: "hashes".into(), dimension: "hash".into() }),
+            rows_with: None,
         }
     }
 
@@ -3429,6 +3454,78 @@ mod tests {
         let source = source_and_filters(&aggregate.input, &mut predicates).expect("walkable");
         let routed = route_with_spec(&endpoint_spec(), &source, SOURCE, &predicates, aggregate, None, &state).await;
         routed.is_ok()
+    }
+
+    /// monoscope's LLM pages aggregate the sparse GenAI rows per trace: a `rows_with` tier
+    /// stores only those rows, and answers the query guarding the same column exactly.
+    fn llm_spec() -> RollupSpec {
+        const OP: &str = "attributes___gen_ai___operation___name";
+        let m = |name: &str, agg: &str, column: Option<&str>, filter: Option<&str>| RollupMeasure {
+            name: name.into(),
+            agg: agg.into(),
+            column: column.map(Into::into),
+            filter: filter.map(Into::into),
+        };
+        let (model, tool) = (format!("{OP} IN ('chat', 'embeddings')"), format!("{OP} = 'execute_tool'"));
+        RollupSpec {
+            grain: "1h".into(),
+            name: Some("llm_test".into()),
+            dimensions: vec!["context___trace_id".into(), "attributes___gen_ai___conversation___id".into()],
+            measures: vec![
+                m("llm_calls", "count", None, Some(&model)),
+                m("tool_calls", "count", None, Some(&tool)),
+                m("tokens", "sum", Some("attributes___gen_ai___usage___input_tokens"), Some(&model)),
+                m("errors", "count", None, Some("status_code = 'ERROR'")),
+                m("started", "min", Some("timestamp"), None),
+                m("ended", "max", Some("end_time"), None),
+                m("preview", "first", Some("attributes___gen_ai___input___preview"), Some("attributes___gen_ai___input___preview IS NOT NULL")),
+                m("preview_at", "min", Some("timestamp"), Some("attributes___gen_ai___input___preview IS NOT NULL")),
+                m("distinct_args", "hll", Some("attributes___gen_ai___tool___call___arguments"), Some(&tool)),
+            ],
+            derive_from: None,
+            backfill_days: None,
+            unnest: None,
+            rows_with: Some(OP.into()),
+        }
+    }
+
+    #[test_case::test_case("AND attributes___gen_ai___operation___name IS NOT NULL" => Ok(true) ; "the guarded query routes")]
+    #[test_case::test_case("" => Err(MissReason::FilterNotEligible) ; "an unguarded query reads rows the tier never stored")]
+    #[test_case::test_case("AND duration IS NOT NULL" => Err(MissReason::FilterNotEligible) ; "a different guard is a different population")]
+    #[tokio::test]
+    async fn a_rows_with_tier_answers_only_its_guard(guard: &str) -> Result<bool, MissReason> {
+        let state = session().await;
+        let sql = format!(
+            "SELECT context___trace_id, attributes___gen_ai___conversation___id, \
+             count(*) FILTER (WHERE attributes___gen_ai___operation___name IN ('chat', 'embeddings')), \
+             count(*) FILTER (WHERE attributes___gen_ai___operation___name = 'execute_tool'), \
+             sum(attributes___gen_ai___usage___input_tokens) FILTER (WHERE attributes___gen_ai___operation___name IN ('chat', 'embeddings')), \
+             count(*) FILTER (WHERE status_code = 'ERROR'), min(timestamp), max(end_time), \
+             first_value(attributes___gen_ai___input___preview ORDER BY timestamp) FILTER (WHERE attributes___gen_ai___input___preview IS NOT NULL), \
+             hll_agg(attributes___gen_ai___tool___call___arguments) FILTER (WHERE attributes___gen_ai___operation___name = 'execute_tool') \
+             FROM otel_logs_and_spans WHERE project_id = 'p' AND timestamp >= to_timestamp_micros(0) AND timestamp < to_timestamp_micros(86400000000) {guard} \
+             GROUP BY context___trace_id, attributes___gen_ai___conversation___id"
+        );
+        let plan = optimized(&state, &sql).await;
+        let aggregates = outermost_aggregates(&plan);
+        let datafusion::logical_expr::LogicalPlan::Aggregate(original) = aggregates[0] else { panic!("an aggregate") };
+        let inlined = inline_common_exprs(original);
+        let aggregate = inlined.as_ref().unwrap_or(original);
+        let mut predicates = Vec::new();
+        let source = source_and_filters(&aggregate.input, &mut predicates).expect("walkable");
+        let routed = route_with_spec(&llm_spec(), &source, SOURCE, &predicates, aggregate, None, &state).await?;
+        // The raw edges read the tier's population: the guard rides along as a row filter.
+        Ok(routed.raw_row_filters.iter().any(|filter| filter.contains("attributes___gen_ai___operation___name") && filter.contains("IS NOT NULL")))
+    }
+
+    #[test]
+    fn a_rows_with_tier_builds_from_its_rows_only() {
+        let base = build_partition_sql(&llm_spec(), SOURCE, "p", "2026-11-22").unwrap();
+        assert!(base.contains(r#"AND "attributes___gen_ai___operation___name" IS NOT NULL"#), "{base}");
+        let cohort = build_cohort_sql_range_mode(&llm_spec(), SOURCE, &["p".into()], "2026-11-22", (0, 3_600_000_000), false).unwrap();
+        assert!(cohort.contains("IS NOT NULL"), "{cohort}");
+        // A derived tier reads its base, which already applied it.
+        assert!(!build_cohort_sql_range_mode(&llm_spec(), SOURCE, &["p".into()], "2026-11-22", (0, 3_600_000_000), true).unwrap().contains("IS NOT NULL"));
     }
 
     #[test_case::test_case(MissReason::NotBuilt, true; "a missing build counts against routing")]
