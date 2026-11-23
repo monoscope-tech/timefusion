@@ -1906,7 +1906,13 @@ async fn measure_filters<'a>(
                     tracing::warn!(event = "rollup_measure_probe_unwalkable", source, measure = %measure.name, node, plan = %plan.display_indent(), "a declared measure filter planned to a shape the matcher cannot read");
                     MissReason::UnknownFilter
                 })?;
-                canonical_and(filters.iter().flat_map(datafusion::logical_expr::utils::split_conjunction).filter(|term| !is_probe_scaffolding(term)))
+                // The same hint stripping the query side gets: the probe puts the filter in a WHERE,
+                // where tantivy adds accelerators (a routing hint on an indexed column such as
+                // `status_code`) the query's aggregate FILTER never carries.
+                let unhinted: Vec<_> = filters.iter().flat_map(datafusion::logical_expr::utils::split_conjunction).map(without_index_hints).collect();
+                let mut terms: Vec<_> = unhinted.iter().filter(|term| !is_probe_scaffolding(term)).collect();
+                strip_index_hints(&mut terms);
+                canonical_and(terms)
             }
         };
         cache.insert(key, filter.clone());
