@@ -3097,8 +3097,7 @@ async fn per_date_dedup_skip_matches_the_all_or_nothing_result() -> Result<()> {
         Ok::<Vec<String>, anyhow::Error>(rows)
     };
 
-    let baseline = run(false).await?;
-    let split = run(true).await?;
+    let (baseline, split) = tokio::try_join!(run(false), run(true))?;
 
     assert_eq!(split, baseline, "per-date skip changed the result set — over/under-count regression");
     assert_eq!(split.len(), 2, "one winning row per key across the two dates, got {split:?}");
@@ -3159,7 +3158,7 @@ async fn per_date_skip_with_a_mem_leg_never_skips_a_buffered_version(late_versio
         let deduped = find_node(&plan, "DedupExec").and_then(|dedup| dedup.metrics()?.sum_by_name("input_rows")).map(|rows| rows.as_usize());
         Ok::<_, anyhow::Error>((tags, deduped, rendered(&plan)))
     };
-    let ((baseline, _, _), (split, deduped, plan)) = (run(false).await?, run(true).await?);
+    let ((baseline, _, _), (split, deduped, plan)) = tokio::try_join!(run(false), run(true))?;
     let want = if late_version { ["final", "today"] } else { ["today", "updated"] };
     assert_eq!(split, want, "one winning version per key: {plan}");
     assert_eq!(split, baseline, "the split must answer what the single dedup answers");

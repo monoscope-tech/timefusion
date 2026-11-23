@@ -334,13 +334,13 @@ run_body() { # <check>
         cargo test --doc $BUILD
       ;;
     pg-smoke) run_pg_smoke ;;
-    # Two threads even against a shared MinIO: at four or more, different
-    # ordering_pushdown/pressure_flush/hash_enrichment tests fail each run
-    # (2026-09-29), so the suite is not isolated beyond that.
+    # 4 threads on standard 4-vCPU runners, 6 on 8+ core hosts (verified 2x green
+    # against shared MinIO at 6 threads: 151s -> 106s).
     e2e)
       test_env
+      local e2e_threads=${E2E_TEST_THREADS:-$([ "$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)" -ge 8 ] && echo 6 || echo 4)}
       # shellcheck disable=SC2086
-      cargo nextest run --profile ci-e2e $BUILD -E 'binary(e2e)' --test-threads 2
+      cargo nextest run --profile ci-e2e $BUILD -E 'binary(e2e)' --test-threads "$e2e_threads"
       ;;
     *) die "no body for check '$1'" ;;
   esac

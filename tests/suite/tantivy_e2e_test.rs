@@ -269,20 +269,23 @@ impl Pair {
     async fn with<S: AsRef<str>>(tag: &str, land: Land, rows: &[(S, S, S)], tweak: impl FnOnce(&mut AppConfig)) -> Result<Self> {
         let id = uuid::Uuid::new_v4().to_string()[..8].to_string();
         let on_id = format!("{id}-{tag}-on");
-        let (on, ctx, svc) = build_db_with(&on_id, true, tweak).await?;
-        let (off, ctx_off, _) = build_db(&format!("{id}-{tag}-off"), false).await?;
+        let off_id = format!("{id}-{tag}-off");
+        let ((on, ctx, svc), (off, ctx_off, _)) = tokio::try_join!(build_db_with(&on_id, true, tweak), build_db(&off_id, false))?;
         let pair = Self { on, off, ctx, ctx_off, svc: svc.expect("tantivy enabled"), cache_root: data_dir(&on_id), p: unique_project() };
         pair.write(land, rows).await?;
         Ok(pair)
     }
 
     async fn write<S: AsRef<str>>(&self, land: Land, rows: &[(S, S, S)]) -> Result<()> {
-        for db in [&self.on, &self.off] {
-            db.insert_records_batch(&self.p, TABLE, vec![make_batch(&self.p, rows)], matches!(land, Land::Delta), None).await?;
+        async fn write_one(db: &Database, p: &str, land: Land, b: RecordBatch) -> Result<()> {
+            db.insert_records_batch(p, TABLE, vec![b], matches!(land, Land::Delta), None).await?;
             if matches!(land, Land::Flushed) {
                 flush_all(db).await?;
             }
+            Ok(())
         }
+        let batch = make_batch(&self.p, rows);
+        tokio::try_join!(write_one(&self.on, &self.p, land, batch.clone()), write_one(&self.off, &self.p, land, batch))?;
         if matches!(land, Land::Mem) {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
@@ -1669,18 +1672,21 @@ async fn mutable_candidate_fixture(complete: bool, cold_disk: bool, contract: Pa
     let requires_raw_fallback = !complete && background_divisor == Some(1);
     let route = matches!(contract, PageContract::RouteLogExplorer);
     let id = uuid::Uuid::new_v4().to_string()[..8].to_string();
-    let (on, ctx, svc) = build_db_with(&format!("{id}-mutcand-on"), true, |cfg| {
-        cfg.core.timefusion_pgwire_max_statement_secs = budget_secs;
-        // The fixture's derived TantivyConfig::default has a one-reader floor;
-        // use the production capacity so the warm pass does not thrash it.
-        let production = AppConfig::default().tantivy;
-        cfg.tantivy.timefusion_tantivy_reader_cache_entries = production.timefusion_tantivy_reader_cache_entries;
-        cfg.tantivy.timefusion_tantivy_bundle_writes = production.timefusion_tantivy_bundle_writes;
-        cfg.tantivy.timefusion_tantivy_range_reads = production.timefusion_tantivy_range_reads;
-        cfg.tantivy.timefusion_tantivy_block_cache_mb = production.timefusion_tantivy_block_cache_mb;
-    })
-    .await?;
-    let (off, ctx_off, _) = build_db_with(&format!("{id}-mutcand-off"), false, |cfg| cfg.core.timefusion_pgwire_max_statement_secs = budget_secs).await?;
+    let on_id = format!("{id}-mutcand-on");
+    let off_id = format!("{id}-mutcand-off");
+    let ((on, ctx, svc), (off, ctx_off, _)) = tokio::try_join!(
+        build_db_with(&on_id, true, |cfg| {
+            cfg.core.timefusion_pgwire_max_statement_secs = budget_secs;
+            // The fixture's derived TantivyConfig::default has a one-reader floor;
+            // use the production capacity so the warm pass does not thrash it.
+            let production = AppConfig::default().tantivy;
+            cfg.tantivy.timefusion_tantivy_reader_cache_entries = production.timefusion_tantivy_reader_cache_entries;
+            cfg.tantivy.timefusion_tantivy_bundle_writes = production.timefusion_tantivy_bundle_writes;
+            cfg.tantivy.timefusion_tantivy_range_reads = production.timefusion_tantivy_range_reads;
+            cfg.tantivy.timefusion_tantivy_block_cache_mb = production.timefusion_tantivy_block_cache_mb;
+        }),
+        build_db_with(&off_id, false, |cfg| cfg.core.timefusion_pgwire_max_statement_secs = budget_secs),
+    )?;
     let (p, table, hash) = (unique_project(), "otel_logs_and_spans", "pat:E12e74a9");
     let now = chrono::Utc::now().timestamp_micros();
     let row = |id: &str, minutes: i64, h: &str| {
@@ -1719,44 +1725,44 @@ async fn mutable_candidate_fixture(complete: bool, cold_disk: bool, contract: Pa
         record
     };
     let fillers = |n: i64| (0..n).map(|i| row(&format!("f{i}"), 60 + i, "other")).collect::<Vec<_>>();
-    for db in [&on, &off] {
-        if let Some(divisor) = background_divisor {
-            append_browser_background(db, &p, now, divisor).await?;
-        }
-        // Unindexed (direct) file: `ghost`'s older matching version, and `solo`, matching only here.
-        let older = match contract {
-            PageContract::IssueSample => Vec::new(),
-            PageContract::LogExplorer | PageContract::RouteLogExplorer => (0..512)
-                .map(|i| row(&format!("page-{i}"), 181 + i * if route { 18 } else { 36 }, hash))
-                .chain([row("tie-a", 8, "ties"), row("tie-b", 8, "ties")])
-                .collect(),
-        };
-        let excluded = if route {
-            [
-                ("attributes___server___address", serde_json::Value::Null),
-                ("resource___deployment___environment___name", json!("other")),
-                ("resource___service___name", json!("browser-proxy")),
-                ("kind", json!("client")),
-                ("attributes___http___request___method", json!("POST")),
-                ("attributes___url___path", json!("/other")),
-            ]
-            .into_iter()
-            .map(|(column, value)| {
-                // Separate timestamps keep these route-only controls outside the
-                // membership fixture's eight-version candidate budget.
-                let mut record = row(&format!("excluded-{column}"), 9, hash);
-                record[column] = value;
-                record["hashes"] = json!([]);
-                record
-            })
-            .collect()
-        } else {
-            Vec::new()
-        };
-        let direct = [vec![row("ghost", 1, hash), row("solo", 5, hash), row("removed-only", 6, "removed")], fillers(30), older, excluded].concat();
-        db.insert_records_batch(&p, table, vec![json_to_batch_for(table, direct)?], true, None).await?;
-        // Indexed file: `ghost` stops matching, `stale` and `kept` match, `late` does not yet.
-        let indexed = [
+    // Unindexed (direct) file: `ghost`'s older matching version, and `solo`, matching only here.
+    let older = match contract {
+        PageContract::IssueSample => Vec::new(),
+        PageContract::LogExplorer | PageContract::RouteLogExplorer => (0..512)
+            .map(|i| row(&format!("page-{i}"), 181 + i * if route { 18 } else { 36 }, hash))
+            .chain([row("tie-a", 8, "ties"), row("tie-b", 8, "ties")])
+            .collect(),
+    };
+    let excluded = if route {
+        [
+            ("attributes___server___address", serde_json::Value::Null),
+            ("resource___deployment___environment___name", json!("other")),
+            ("resource___service___name", json!("browser-proxy")),
+            ("kind", json!("client")),
+            ("attributes___http___request___method", json!("POST")),
+            ("attributes___url___path", json!("/other")),
+        ]
+        .into_iter()
+        .map(|(column, value)| {
+            // Separate timestamps keep these route-only controls outside the
+            // membership fixture's eight-version candidate budget.
+            let mut record = row(&format!("excluded-{column}"), 9, hash);
+            record[column] = value;
+            record["hashes"] = json!([]);
+            record
+        })
+        .collect()
+    } else {
+        Vec::new()
+    };
+    let direct_batch = json_to_batch_for(
+        table,
+        [vec![row("ghost", 1, hash), row("solo", 5, hash), row("removed-only", 6, "removed")], fillers(30), older, excluded].concat(),
+    )?;
+    // Indexed file: `ghost` stops matching, `stale` and `kept` match, `late` does not yet.
+    let indexed_batch = json_to_batch_for(
+        table,
+        [
             vec![
                 row("ghost", 1, "other"),
                 row("stale", 2, hash),
@@ -1767,10 +1773,22 @@ async fn mutable_candidate_fixture(complete: bool, cold_disk: bool, contract: Pa
             ],
             fillers(30),
         ]
-        .concat();
-        db.insert_records_batch(&p, table, vec![json_to_batch_for(table, indexed)?], false, None).await?;
-        flush_all(db).await?;
+        .concat(),
+    )?;
+    async fn seed_db(
+        db: &Database, p: &str, table: &str, now: i64, background_divisor: Option<usize>, direct_b: RecordBatch, indexed_b: RecordBatch,
+    ) -> Result<()> {
+        if let Some(divisor) = background_divisor {
+            append_browser_background(db, p, now, divisor).await?;
+        }
+        db.insert_records_batch(p, table, vec![direct_b], true, None).await?;
+        db.insert_records_batch(p, table, vec![indexed_b], false, None).await?;
+        flush_all(db).await
     }
+    tokio::try_join!(
+        seed_db(&on, &p, table, now, background_divisor, direct_batch.clone(), indexed_batch.clone()),
+        seed_db(&off, &p, table, now, background_divisor, direct_batch, indexed_batch),
+    )?;
     let service = svc.expect("tantivy");
     let store = service.object_store.clone();
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
@@ -1923,6 +1941,7 @@ async fn verify_mutable_candidate_input(
     let mut warm_opens = 0;
     let mut warm_bytes = 0;
     let mut cancellation_sql = None;
+    let mut cached_oracles: std::collections::HashMap<&str, Vec<serde_json::Value>> = std::collections::HashMap::new();
     let passes = if run == PageRun::FirstPair { 1 } else { 2 };
     for pass in 0..passes {
         for (tag, trace) in [
@@ -2005,29 +2024,35 @@ async fn verify_mutable_candidate_input(
                 "{contract:?} complete={complete} cold_disk={cold_disk} pass={pass} tag={tag} elapsed_us={} first_row={first_row:?} parquet_bytes={read_bytes} index_range_bytes={index_read_bytes} phases={cost:?}",
                 elapsed.as_micros()
             );
-            let oracle_bytes = deltalake::delta_datafusion::parquet_metrics::snapshot().bytes_read;
-            let phases: Vec<_> = timefusion::observability::plan_phases().collect();
-            let oracle_started = std::time::Instant::now();
-            let oracle_page = tokio::time::timeout(std::time::Duration::from_secs(budget_secs + 1), wire_page(&clients[1], &sql, contract)).await;
-            let cost: Vec<_> = timefusion::observability::plan_phases()
-                .zip(phases)
-                .map(|((phase, us, calls), (_, old_us, old_calls))| (phase, us - old_us, calls - old_calls))
-                .collect();
-            eprintln!(
-                "{contract:?} raw_oracle complete={complete} cold_disk={cold_disk} pass={pass} tag={tag} elapsed_us={} first_row={:?} parquet_bytes={} phases={cost:?} reserved_bytes={} spill_bytes={} outcome={:?}",
-                oracle_started.elapsed().as_micros(),
-                oracle_page.as_ref().ok().and_then(|page| page.as_ref().ok()).and_then(|(_, first_row)| *first_row),
-                deltalake::delta_datafusion::parquet_metrics::snapshot().bytes_read - oracle_bytes,
-                ctx_off.runtime_env().memory_pool.reserved(),
-                ctx_off.runtime_env().disk_manager.used_disk_space(),
-                oracle_page.as_ref().map(|result| result.as_ref().map(|_| ()))
-            );
-            let (oracle, _) = oracle_page??;
-            assert_eq!(
-                counter_value(PREFILTER_MUTABLE_CANDIDATES),
-                before + u64::from(!requires_raw_fallback && !route),
-                "oracle must not use the candidate path"
-            );
+            let oracle = if let Some(cached) = cached_oracles.get(tag) {
+                cached.clone()
+            } else {
+                let oracle_bytes = deltalake::delta_datafusion::parquet_metrics::snapshot().bytes_read;
+                let phases: Vec<_> = timefusion::observability::plan_phases().collect();
+                let oracle_started = std::time::Instant::now();
+                let oracle_page = tokio::time::timeout(std::time::Duration::from_secs(budget_secs + 1), wire_page(&clients[1], &sql, contract)).await;
+                let cost: Vec<_> = timefusion::observability::plan_phases()
+                    .zip(phases)
+                    .map(|((phase, us, calls), (_, old_us, old_calls))| (phase, us - old_us, calls - old_calls))
+                    .collect();
+                eprintln!(
+                    "{contract:?} raw_oracle complete={complete} cold_disk={cold_disk} pass={pass} tag={tag} elapsed_us={} first_row={:?} parquet_bytes={} phases={cost:?} reserved_bytes={} spill_bytes={} outcome={:?}",
+                    oracle_started.elapsed().as_micros(),
+                    oracle_page.as_ref().ok().and_then(|page| page.as_ref().ok()).and_then(|(_, first_row)| *first_row),
+                    deltalake::delta_datafusion::parquet_metrics::snapshot().bytes_read - oracle_bytes,
+                    ctx_off.runtime_env().memory_pool.reserved(),
+                    ctx_off.runtime_env().disk_manager.used_disk_space(),
+                    oracle_page.as_ref().map(|result| result.as_ref().map(|_| ()))
+                );
+                let (oracle, _) = oracle_page??;
+                assert_eq!(
+                    counter_value(PREFILTER_MUTABLE_CANDIDATES),
+                    before + u64::from(!requires_raw_fallback && !route),
+                    "oracle must not use the candidate path"
+                );
+                cached_oracles.insert(tag, oracle.clone());
+                oracle
+            };
             assert_eq!(actual, oracle, "pass {pass}: all projected values must match the full latest-visible-row oracle for {tag}");
             assert_eq!(actual.first().and_then(|row| row[2].as_str()), trace, "pass {pass}: expected visible winner for {tag}");
             let expected_len = match (contract, tag) {
