@@ -43,6 +43,13 @@ pub struct RollupSpec {
     /// See [`RollupUnnest`]; its `dimension` is also listed in `dimensions`.
     #[serde(default)]
     pub unnest: Option<RollupUnnest>,
+    /// Build only from source rows where this column IS NOT NULL, so a tier keyed on a
+    /// high-cardinality dimension (a trace id) stores the sparse rows it is for, not every
+    /// row of the table. Only queries guarding the same column (`col IS NOT NULL`) route
+    /// here, and their raw edges re-apply the guard, so both legs read one population.
+    /// Keep it the LAST field: `generation_render` strips it when absent by its position.
+    #[serde(default)]
+    pub rows_with: Option<String>,
 }
 
 /// Explode an array column into one row per DISTINCT element, grouped as `dimension`, so
@@ -169,6 +176,10 @@ impl RollupSpec {
             );
         }
         anyhow::ensure!(!self.measures.is_empty(), "rollup {target}: needs at least one measure");
+        if let Some(column) = &self.rows_with {
+            anyhow::ensure!(source.field(column).is_some(), "rollup {target}: unknown `rows_with` column `{column}`");
+            anyhow::ensure!(!self.dimensions.contains(column), "rollup {target}: `rows_with` column `{column}` is a dimension; filter on it instead");
+        }
         if let Some(base) = &self.derive_from {
             let base_spec = source
                 .rollups
@@ -176,6 +187,7 @@ impl RollupSpec {
                 .find(|spec| spec.name.as_deref() == Some(base.as_str()))
                 .ok_or_else(|| anyhow::anyhow!("rollup {target}: `derive_from: {base}` names no rollup on this table"))?;
             anyhow::ensure!(base_spec.derive_from.is_none(), "rollup {target}: `derive_from` may not chain — `{base}` is itself derived");
+            anyhow::ensure!(base_spec.rows_with == self.rows_with, "rollup {target}: `rows_with` must match `{base}`'s, which built the rows it derives from");
             let (Some(fine), Some(coarse)) = (base_spec.grain_micros(), self.grain_micros()) else {
                 anyhow::bail!("rollup {target}: cannot compare grains with `{base}`")
             };
@@ -827,6 +839,23 @@ mod tests {
         RollupMeasure { name: name.into(), agg: agg.into(), column: column.map(str::to_owned), filter: filter.map(str::to_owned) }
     }
 
+    #[test_case(Some("attributes___gen_ai___operation___name"), None => true ; "a source column")]
+    #[test_case(Some("no_such_column"), None => false ; "an unknown column")]
+    #[test_case(Some("kind"), None => false ; "a dimension")]
+    #[test_case(Some("duration"), Some(None) => false ; "a derived tier whose base reads other rows")]
+    #[test_case(Some("duration"), Some(Some("duration")) => true ; "a derived tier over the same rows")]
+    fn rows_with_names_a_non_dimension_column_its_derived_tiers_share(rows_with: Option<&str>, base: Option<Option<&str>>) -> bool {
+        let tier = |name: &str, grain: &str, rows_with: Option<&str>| RollupSpec {
+            grain: grain.into(),
+            rows_with: rows_with.map(Into::into),
+            ..spec(name, vec![measure("c", "count", None, None)])
+        };
+        let mut schema = source().clone();
+        schema.rollups = base.map(|base| tier("rows_base", "1m", base)).into_iter().collect();
+        let checked = RollupSpec { derive_from: base.map(|_| "rows_base".into()), ..tier("rows_tier", "1h", rows_with) };
+        checked.validate(&schema).is_ok()
+    }
+
     /// A 1m rollup over `kind` — the shape every spec test varies.
     fn spec(name: &str, measures: Vec<RollupMeasure>) -> RollupSpec {
         RollupSpec {
@@ -837,6 +866,7 @@ mod tests {
             derive_from: None,
             backfill_days: None,
             unnest: None,
+            rows_with: None,
         }
     }
 

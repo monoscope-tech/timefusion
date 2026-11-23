@@ -687,6 +687,8 @@ fn spec_source_columns<'a>(source: &'a crate::schema::TableSchema, spec: &'a cra
         .chain(spec.dimensions.iter().map(String::as_str))
         // An unnest tier's dimension is no source column; the list it explodes is.
         .chain(spec.unnest.iter().map(|unnest| unnest.column.as_str()))
+        // A `rows_with` change moves a row into or out of the tier.
+        .chain(spec.rows_with.as_deref())
         .chain(spec.measures.iter().filter_map(|measure| measure.column.as_deref()))
         .chain(
             spec.measures
