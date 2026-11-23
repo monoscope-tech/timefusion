@@ -2051,6 +2051,9 @@ async fn match_aggregate(
             // declined that way. A grain miss is only reached AFTER the filter was
             // accepted, so it outranks another spec's filter miss.
             Err(reason @ (MissReason::PartialBucket | MissReason::TinyInterior)) => grain_miss = Some(reason),
+            // A query not guarding a `rows_with` tier's column was never its candidate: that
+            // tier's refusal would only mask why the tiers that could serve it declined.
+            Err(MissReason::FilterNotEligible) if spec.rows_with.is_some() => {}
             // "This tier's columns don't cover the query" is the least actionable reason, so
             // another tier's (a near miss, a missing measure) is never overwritten by it.
             Err(MissReason::FilterNotEligible | MissReason::UnknownGroupBy) if miss.is_some() => {}
