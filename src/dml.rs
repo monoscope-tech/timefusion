@@ -26,7 +26,7 @@ use datafusion::{
         SendableRecordBatchStream, SessionStateBuilder, TaskContext,
         context::{QueryPlanner, SessionState},
     },
-    logical_expr::{BinaryExpr, Expr, Join, LogicalPlan, Operator, WriteOp, binary_expr, utils::split_conjunction},
+    logical_expr::{Analyze, BinaryExpr, Explain, Expr, Join, LogicalPlan, Operator, WriteOp, binary_expr, utils::split_conjunction},
     physical_plan::{DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, PlanProperties, stream::RecordBatchStreamAdapter},
     physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner},
     prelude::lit,
@@ -189,6 +189,18 @@ pub(crate) fn substitute(plan: &LogicalPlan, matched: &LogicalPlan, replacement:
     rewritten.transform_up(|node| node.recompute_schema().map(Transformed::yes)).map(|rewritten| rewritten.data)
 }
 
+impl DmlQueryPlanner {
+    /// `plan` with every aggregate a rollup serves rewritten onto it, or `None` when none routes.
+    async fn routed_plan(&self, plan: &LogicalPlan, session_state: &SessionState) -> Option<LogicalPlan> {
+        let rewrites = self.database.rollup_sql(plan, session_state).await.ok().filter(|rewrites| !rewrites.is_empty())?;
+        let mut routed = plan.clone();
+        for crate::database::RollupRewrite { sql, matched, .. } in &rewrites {
+            routed = substitute(&routed, matched, requalified(session_state.create_logical_plan(sql).await.ok()?, matched.schema()).ok()?).ok()?;
+        }
+        session_state.optimize(&routed).ok()
+    }
+}
+
 #[async_trait]
 impl QueryPlanner for DmlQueryPlanner {
     fn supports_update_from(&self) -> bool {
@@ -199,6 +211,20 @@ impl QueryPlanner for DmlQueryPlanner {
     async fn create_physical_plan(&self, logical_plan: &LogicalPlan, session: &dyn Session) -> Result<Arc<dyn ExecutionPlan>> {
         let session_state =
             session.as_any().downcast_ref::<SessionState>().ok_or_else(|| DataFusionError::Internal("DmlQueryPlanner requires a SessionState".into()))?;
+        // EXPLAIN [ANALYZE] describes the plan its statement would run, so it explains the routed
+        // one: otherwise a query served from a rollup reads as a raw scan and routing can't be checked.
+        let explained = match logical_plan {
+            LogicalPlan::Explain(explain) => {
+                self.routed_plan(&explain.plan, session_state).await.map(|plan| LogicalPlan::Explain(Explain { plan: Arc::new(plan), ..explain.clone() }))
+            }
+            LogicalPlan::Analyze(analyze) => {
+                self.routed_plan(&analyze.input, session_state).await.map(|input| LogicalPlan::Analyze(Analyze { input: Arc::new(input), ..analyze.clone() }))
+            }
+            _ => None,
+        };
+        if let Some(explained) = explained {
+            return self.planner.create_physical_plan(&explained, session_state).await;
+        }
         let route_started = Instant::now();
         let routed = self.database.rollup_sql(logical_plan, session_state).await;
         crate::observability::record_plan_phase(crate::observability::PlanPhase::RollupRoute, route_started);

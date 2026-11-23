@@ -12385,5 +12385,11 @@ async fn the_llm_list_routes_over_built_days() -> Result<()> {
     let plan = state.optimize(&state.create_logical_plan(&sql).await.expect("parse")).expect("optimize");
     let routed = db.rollup_sql(&plan, &state).await.map(|rewrites| rewrites.into_iter().map(|r| r.sql).collect::<Vec<_>>()).map_err(|reason| reason.label());
     assert!(routed.as_ref().is_ok_and(|sqls| sqls.iter().any(|s| s.contains("llm_1h"))), "{routed:?}");
+    // EXPLAIN shows the plan the query runs, so routing is checkable with one statement.
+    for explain in ["EXPLAIN", "EXPLAIN ANALYZE"] {
+        let out = ctx.sql(&format!("{explain} {sql}")).await?.collect().await?;
+        let text = arrow::util::pretty::pretty_format_batches(&out)?.to_string();
+        assert!(text.contains("otel_logs_and_spans_rollup_llm_1h"), "{explain} must show the tier scan:\n{text}");
+    }
     Ok(())
 }
