@@ -22,11 +22,12 @@ RUN case "$TARGETARCH" in \
       compiler_packages="gcc-$package_target g++-$package_target"; \
     fi && \
     dpkg --add-architecture "$TARGETARCH" && apt-get update && \
-    apt-get install -y pkg-config make $compiler_packages \
+    apt-get install -y --no-install-recommends pkg-config make lld $compiler_packages \
       "libssl-dev:$TARGETARCH" "libunwind-dev:$TARGETARCH" && \
     rustup target add "$rust_target" && \
     printf '%s\n' "$rust_target" > /rust-target && \
     printf '%s\n' "$gnu_target" > /gnu-target && \
+    ln -sf /usr/bin/ld.lld "/usr/bin/${gnu_target}-ld.lld" && \
     printf '[target.%s]\nlinker = "%s-gcc"\n' "$rust_target" "$gnu_target" > /usr/local/cargo/config.toml && \
     rm -rf /var/lib/apt/lists/*
 # cc-rs and pkg-config must resolve target C libraries, including the profilers.
@@ -103,7 +104,8 @@ ENV CARGO_PROFILE_RELEASE_STRIP=none
 ARG TARGET_CPU=x86-64-v3
 # ONE definition, used by both the cook and build steps below — they must see
 # identical RUSTFLAGS or cargo-chef's cached dep layer is silently discarded.
-ENV RUSTFLAGS="-C force-frame-pointers=yes -C target-cpu=${TARGET_CPU}"
+# lld links this Arrow/DataFusion binary several times faster than GNU ld.bfd.
+ENV RUSTFLAGS="-C force-frame-pointers=yes -C target-cpu=${TARGET_CPU} -C link-arg=-fuse-ld=lld"
 # ...but frame pointers alone were not enough: jemalloc's profiler unwinds with
 # whatever method it was *configured* with, and stock tikv-jemalloc-sys leaves it
 # on the libgcc unwinder, which returns zero frames here — 100% of an 88GB prod
@@ -112,13 +114,14 @@ ENV RUSTFLAGS="-C force-frame-pointers=yes -C target-cpu=${TARGET_CPU}"
 # `--enable-prof-libunwind`. Fallback needing no libs: `gcc` (uses the frame
 # pointers above). Verify with scripts/verify-jemalloc-prof.sh.
 ENV JEMALLOC_SYS_PROF_BACKTRACE=libunwind
-# Registry and git checkouts persist across builds (download caches only, no
-# artifacts, and cargo never judges a registry or git dependency by mtime): a
-# re-cook otherwise re-clones every git dependency, including DataFusion's
-# test-data submodule, before compiling anything. Locked because two builds
-# would share the directory without sharing cargo's package lock.
+# Registry, git, and target caches persist across builds: a Cargo.lock or
+# vendor/ edit then recompiles only changed crates instead of all ~900 deps,
+# and src/ edits reuse compiled dependency artifacts across layer busts.
+# Locked because concurrent builds would share target/ without sharing cargo's lock.
+ARG TARGETARCH
 RUN --mount=type=cache,id=tf-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=tf-cargo-git,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=tf-cargo-target-${TARGETARCH}-${TARGET_CPU},target=/app/target,sharing=locked \
     target-cargo chef cook --release --locked --features profiling --recipe-path recipe.json
 
 # Now compile the real binary. Deps are already built, so this only rebuilds
@@ -128,6 +131,7 @@ COPY src/ src/
 COPY schemas/ schemas/
 RUN --mount=type=cache,id=tf-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=tf-cargo-git,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=tf-cargo-target-${TARGETARCH}-${TARGET_CPU},target=/app/target,sharing=locked \
     target-cargo build --release --locked --features profiling && \
     mkdir -p /output && cp "target/$(cat /rust-target)/release/timefusion" /output/timefusion
 

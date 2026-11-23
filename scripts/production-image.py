@@ -90,15 +90,19 @@ def smoke(image, recipe=ROOT / 'ci/smoke.Dockerfile'):
                 '-e', 'AWS_SECRET_ACCESS_KEY=smoke', '-e', 'RUST_LOG=info',
                 image, *command[1:])
             deadline = time.monotonic() + 12
+            ready = False
             while True:
                 status = json.loads(output('docker', 'inspect', '--format', '{{json .State}}', name))
                 if not status['Running']:
                     raise RuntimeError('Production image exited: ' + json.dumps(status))
+                logs = subprocess.run(['docker', 'logs', name], capture_output=True, text=True, check=True)
+                if re.search(r'Listening on 0\.0\.0\.0:5432', logs.stdout + logs.stderr):
+                    ready = True
+                    break
                 if time.monotonic() >= deadline:
                     break
-                time.sleep(1)
-            logs = subprocess.run(['docker', 'logs', name], capture_output=True, text=True, check=True)
-            if not re.search(r'Listening on 0\.0\.0\.0:5432', logs.stdout + logs.stderr):
+                time.sleep(0.5)
+            if not ready:
                 raise RuntimeError('Production image did not reach PGWire within 12 seconds')
             # Run the image's real protocol probe explicitly on both platforms.
             # Docker's normal probe would bypass the emulator on ARM64.

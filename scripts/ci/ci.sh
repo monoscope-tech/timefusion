@@ -394,9 +394,8 @@ run_pg_smoke() {
     sleep 1
   done
   "$ready" || { cat "$log"; return 1; }
-  for command in '\dt' '\d otel_logs_and_spans' '\l' '\du' '\dn'; do
-    smoke_psql -v ON_ERROR_STOP=1 -c "$command" || return 1
-  done
+  smoke_psql -v ON_ERROR_STOP=1 \
+    -c '\dt' -c '\d otel_logs_and_spans' -c '\l' -c '\du' -c '\dn' || return 1
 }
 
 # ---------------------------------------------------------------- subcommands
@@ -432,8 +431,9 @@ cmd_gate() {
 }
 
 # Every check's wall time, so the signoff's cost is measured rather than guessed.
-timing() { # <check> <start> <result>
-  local secs=$(( $(date +%s) - $2 ))
+timing() { # <check> <start> <result> [end]
+  local end=${4:-$(date +%s)}
+  local secs=$(( end - $2 ))
   mkdir -p .ci && printf '%s\t%s\t%s\t%s\n' "$(date -u +%FT%TZ)" "$1" "$secs" "$3" >> .ci/timings.tsv
   note "$1 $3 in ${secs}s"
 }
@@ -442,15 +442,15 @@ timing() { # <check> <start> <result>
 # neither wait on nor hold the build lock the test build needs.
 BACKGROUND=' clippy '
 
-finish() { # <check> <status> <start>
+finish() { # <check> <status> <start> [end]
   if [ "$2" -eq 0 ]; then
-    timing "$1" "$3" pass
+    timing "$1" "$3" pass "${4:-}"
     # A green check stays green even if we cannot record it. Publishing touches
     # the network and the object store; neither is part of what the check proved.
     case " $degraded " in *" $1 "*) ;; *) [ "${CI_NO_ATTEST:-}" = "true" ] \
       || record_result "$1" || note "could not record $1 — it still passed, just isn't cached" ;; esac
   else
-    timing "$1" "$3" FAIL
+    timing "$1" "$3" FAIL "${4:-}"
     note "FAILED $1"
     return 1
   fi
@@ -489,7 +489,7 @@ cmd_run() {
       note "running $c in the background → .ci/$c.log"
       ( t0=$(date +%s); st=0
         CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target}/$c" run_body "$c" >".ci/$c.log" 2>&1 || st=$?
-        echo "$st $t0" >".ci/$c.status" ) &
+        echo "$st $t0 $(date +%s)" >".ci/$c.status" ) &
       bg="$bg $c"; continue
     fi ;; esac
     note "running $c"
