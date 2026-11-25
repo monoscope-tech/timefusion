@@ -167,7 +167,7 @@ pub fn warm(searcher: &tantivy::Searcher, query: &dyn tantivy::query::Query) -> 
 fn open_set(dir: &Path) -> anyhow::Result<Vec<(PathBuf, Range<usize>)>> {
     let recording = RecordingDirectory::new(tantivy::directory::MmapDirectory::open(dir)?);
     let log = recording.log.clone();
-    drop(super::open_index_in(recording)?.reader()?.searcher());
+    drop(super::immutable_reader(&super::open_index_in(recording)?)?.searcher());
     let mut ranges = std::mem::take(&mut *log.lock());
     ranges.sort_by(|(a, x), (b, y)| (a, x.start).cmp(&(b, y.start)));
     Ok(ranges

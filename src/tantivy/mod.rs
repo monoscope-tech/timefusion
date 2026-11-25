@@ -101,7 +101,10 @@ pub fn build_in_memory(table: &TableSchema, batches: &[RecordBatch]) -> Result<(
 pub fn index_to_writer(
     built: &BuiltSchema, index: &Index, batches: impl IntoIterator<Item = impl std::borrow::Borrow<RecordBatch>>, merge: MergeMode,
 ) -> Result<IndexBuildStats> {
-    let mut writer: IndexWriter = index.writer(WRITER_HEAP_BYTES).context("create tantivy writer")?;
+    // One thread owning the whole arena: `writer(64 MiB)` splits it into four 16 MiB arenas,
+    // which on real spans cut a segment every ~500 rows and paid a merge for every build
+    // (60k rows: 120 segments and 28.7 s CPU, against 7 segments and 24.2 s).
+    let mut writer: IndexWriter = index.writer_with_num_threads(1, WRITER_HEAP_BYTES).context("create tantivy writer")?;
     // Explicit merges keep `TermMerger` off the ingest path.
     writer.set_merge_policy(Box::new(NoMergePolicy));
     let mut stats = IndexBuildStats { element_fields: built.element_fields(), fields: built.user_fields.keys().cloned().collect(), ..Default::default() };
@@ -1501,7 +1504,7 @@ pub fn verify_blob(blob: &[u8]) -> Result<()> {
     if hotcache::is_bundle(blob) {
         let dir = hotcache::BundleDirectory::in_memory(Bytes::copy_from_slice(blob))?;
         ensure!(dir.bundle_len() == blob.len() as u64, "bundle is {} bytes, its table describes {}", blob.len(), dir.bundle_len());
-        return open_index_in(dir)?.reader().map(drop).map_err(|e| anyhow!("open bundle reader: {e}"));
+        return immutable_reader(&open_index_in(dir)?).map(drop).map_err(|e| anyhow!("open bundle reader: {e}"));
     }
     let tar_bytes = zstd::decode_all(blob).context("zstd decode")?;
     let staged = tantivy::directory::RamDirectory::create();
@@ -1524,6 +1527,12 @@ pub fn verify_blob(blob: &[u8]) -> Result<()> {
         anyhow::bail!("packed blob contains no files");
     }
     open_index_in(staged).map(drop)
+}
+
+/// A reader that never watches for commits. Published indexes are immutable, and tantivy's
+/// default policy polls `meta.json` from one thread per watched directory.
+pub fn immutable_reader(index: &Index) -> tantivy::Result<tantivy::IndexReader> {
+    index.reader_builder().reload_policy(tantivy::ReloadPolicy::Manual).try_into()
 }
 
 /// Open an unpacked tantivy index for querying.
