@@ -196,7 +196,7 @@ impl Database {
                     let mut carried: HashSet<String> = HashSet::new();
                     for (pid, removed) in removed_by_pid.iter().filter(|_| sole_commit) {
                         let for_pid: Vec<String> = added.iter().filter(|(p, _, _)| p == pid).map(|(_, _, uri)| uri.clone()).collect();
-                        match svc.carry_forward_after_compaction(table_name, pid, removed, &for_pid).await {
+                        match svc.carry_forward(table_name, pid, removed, &for_pid).await {
                             Ok(true) => carried.extend(for_pid),
                             Ok(false) => {}
                             Err(e) => warn!("tantivy carry-forward failed table={} project={}: {}", table_name, pid, e),

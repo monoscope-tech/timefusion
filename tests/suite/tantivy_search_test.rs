@@ -663,6 +663,31 @@ async fn carry_forward_declines_past_the_carried_entry_cap() {
     assert!(env.carry_forward(&refs[..2], &["out2"]).await, "two entries are still carried");
 }
 
+/// Past the cap the output is covered by MERGING its inputs' indexes into one entry. The
+/// store holds no parquet, so a rebuild could not succeed: only the merge can cover it.
+#[tokio::test]
+async fn past_the_cap_a_rewrite_merges_its_inputs_indexes_instead_of_rebuilding() {
+    let env = Env::prod("otel_logs_and_spans", "p-merge-cap").seeded();
+    let inputs: Vec<String> = (0..3).map(|i| format!("in_{i}")).collect();
+    for (i, uri) in inputs.iter().enumerate() {
+        env.publish(&[(1_000_000 + i as i64, &format!("id{i}"), if i == 1 { "ERROR" } else { "INFO" })], &[uri]).await;
+    }
+    let (removed, added) = (inputs.clone(), vec!["out".to_string()]);
+    assert!(env.svc.carry_forward(env.table, env.project, &removed, &added).await.unwrap(), "a covered rewrite past the cap must be merged");
+    let m = env.manifest().await;
+    let covering: Vec<_> = m.entries.values().filter(|e| e.covered_files.contains(&"out".to_string())).collect();
+    assert_eq!(covering.len(), 1, "the merge replaces the carried entries with one, so a query over the output searches one index");
+    assert!(covering[0].rows == 3 && !covering[0].ordinals_valid, "every input row, under the inputs' ordinals: {:?}", covering[0]);
+    env.gc(&["out"]).await;
+    let ids = |hits: Vec<timefusion::tantivy::search::Hit>| hits.into_iter().map(|h| h.id).collect::<Vec<_>>();
+    assert_eq!(ids(env.hits("level", "ERROR").await.expect("covered")), ["id1"], "the merged index answers for the inputs once they are gone");
+    assert_eq!(ids(env.hits("level", "INFO").await.expect("covered")).len(), 2);
+    assert!(
+        !env.svc.carry_forward(env.table, env.project, &["never_indexed".to_string()], &["out2".to_string()]).await.unwrap(),
+        "an uncovered input is never merged"
+    );
+}
+
 /// A multi-file entry must not take its live siblings down with it when one
 /// covered file is compacted away. Keeping the entry is sound because the index
 /// is a candidate generator, but row ordinals are per-file positions and must be

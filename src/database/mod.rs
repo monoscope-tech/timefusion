@@ -276,6 +276,9 @@ pub mod scan_metric_names {
         /// Output files covered by extending an existing entry across a compaction
         /// instead of re-indexing them.
         TANTIVY_CARRIED_FORWARD = "timefusion.scan.tantivy_carried_forward" as scan.tantivy_carried_forward;
+        /// Output files covered by MERGING the inputs' indexes, when carrying them would
+        /// exceed the per-output entry cap — no parquet decode, no tokenizing.
+        TANTIVY_MERGED_FORWARD = "timefusion.scan.tantivy_merged_forward" as scan.tantivy_merged_forward;
         // Inside the file-pruned scan: which of its three steps owns the time.
         PRUNED_SELECT_US = "timefusion.scan.pruned_select_us" as scan.pruned_select_us_total;
         PRUNED_BUILD_US = "timefusion.scan.pruned_build_us" as scan.pruned_build_us_total;

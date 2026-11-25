@@ -9472,7 +9472,7 @@ impl Database {
                 continue;
             }
             let target_paths: Vec<_> = bin.targets.iter().map(|add| add.path.clone()).collect();
-            match svc.carry_forward_after_compaction(table_name, &bin.project_id, &target_paths, &for_bin).await {
+            match svc.carry_forward(table_name, &bin.project_id, &target_paths, &for_bin).await {
                 Ok(true) => carried.extend(for_bin),
                 Ok(false) => {}
                 Err(error) => warn!(table_name, %error, event = "tantivy_wave_carry_forward_failed"),

@@ -2182,6 +2182,71 @@ impl TantivyIndexService {
         Ok(applied)
     }
 
+    /// Cover a rewrite's outputs from its inputs' indexes: carried when few enough, else merged.
+    /// A merge failure only costs the caller's rebuild.
+    pub async fn carry_forward(&self, table: &str, project_id: &str, removed: &[String], added: &[String]) -> Result<bool> {
+        if self.carry_forward_after_compaction(table, project_id, removed, added).await? {
+            return Ok(true);
+        }
+        Ok(self
+            .merge_forward_after_compaction(table, project_id, removed, added)
+            .await
+            .inspect_err(|error| warn!(table, project_id, %error, event = "tantivy_merge_forward_failed"))
+            .unwrap_or(false))
+    }
+
+    /// When [`Self::carry_forward_after_compaction`] declines only because the output would
+    /// carry more than [`MAX_CARRIED_ENTRIES`] indexes, merge those indexes into ONE for the
+    /// output instead of re-indexing its parquet. Same soundness as carrying — the merged
+    /// index is a superset of the output's rows — at the cost of a segment merge, without
+    /// decoding or tokenizing. `Ok(false)` (an uncovered input, or entries that disagree on
+    /// what they index) leaves the caller to rebuild.
+    pub async fn merge_forward_after_compaction(&self, table: &str, project_id: &str, removed: &[String], added: &[String]) -> Result<bool> {
+        let (Some(reader), Some(first_added)) = (self.reader(), added.first()) else { return Ok(false) };
+        let rel_of = |u: &str| parquet_rel_of_uri(u).unwrap_or(u).to_string();
+        let removed_rel: HashSet<String> = removed.iter().map(|u| rel_of(u)).collect();
+        let manifest = super::load_manifest(self.object_store.as_ref(), table, project_id).await?;
+        let carried: Vec<(String, ManifestEntry)> =
+            manifest.entries.into_iter().filter(|(_, e)| usable_entry(e) && e.covered_files.iter().any(|u| removed_rel.contains(&rel_of(u)))).collect();
+        let covered: HashSet<String> = carried.iter().flat_map(|(_, e)| e.covered_files.iter().map(|u| rel_of(u))).collect();
+        let Some((_, first)) = carried.first() else { return Ok(false) };
+        let alike = |e: &ManifestEntry| e.positional && e.fields == first.fields && e.element_fields == first.element_fields;
+        if carried.len() < 2 || removed_rel.is_empty() || !removed_rel.is_subset(&covered) || !carried.iter().all(|(_, e)| alike(e)) {
+            return Ok(false);
+        }
+        let mut indexes = Vec::with_capacity(carried.len());
+        for (key, e) in &carried {
+            let blob = e.index.as_deref().context("usable entry has an index")?;
+            indexes.push(reader.opened(reader.open_index(table, project_id, file_uuid(key), blob, e.bundle_head).await?)?.0);
+        }
+        let stats = super::IndexBuildStats {
+            element_fields: first.element_fields.clone(),
+            fields: first.fields.clone(),
+            rows: carried.iter().map(|(_, e)| e.rows).sum(),
+            batches: 0,
+            min_timestamp_micros: carried.iter().map(|(_, e)| e.min_timestamp_micros).collect::<Option<Vec<_>>>().and_then(|v| v.into_iter().min()),
+            max_timestamp_micros: carried.iter().map(|(_, e)| e.max_timestamp_micros).collect::<Option<Vec<_>>>().and_then(|v| v.into_iter().max()),
+            segments: 1,
+        };
+        let (pack, scratch) = (self.pack(), self.scratch_root.clone());
+        // A failed merge must not publish a failed entry over the output: the caller rebuilds.
+        let merged = tokio::task::spawn_blocking(move || {
+            let tmp = super::scratch_tempdir(&scratch)?;
+            let dir = tantivy::directory::MmapDirectory::open(tmp.path()).map_err(|e| anyhow!("open mmap dir: {e}"))?;
+            tantivy::indexer::merge_indices(&indexes, dir).map_err(|e| anyhow!("merge indexes: {e}"))?;
+            let blob = pack.pack(tmp.path())?;
+            super::verify_blob(&blob).context("verify merged blob")?;
+            Ok::<_, anyhow::Error>((blob, stats))
+        })
+        .await
+        .context("join tantivy merge")??;
+        let rel = rel_of(first_added);
+        self.publish_built_index(table, project_id, &rel, super::index_path_for_parquet(table, &rel), added.to_vec(), false, Ok(merged), false).await?;
+        metrics::counter!(crate::database::scan_metric_names::TANTIVY_MERGED_FORWARD).increment(added.len() as u64);
+        info!(table, project_id, merged = carried.len(), rows = carried.iter().map(|(_, e)| e.rows).sum::<u64>(), event = "tantivy_merged_forward");
+        Ok(true)
+    }
+
     /// Targeted compaction GC: drop manifest entries none of whose
     /// `covered_files` are still present in `live_uris`, and prune the departed
     /// files from the entries that survive.
