@@ -220,6 +220,8 @@ const CAP_EXCEEDED_TTL: Duration = Duration::from_secs(600);
 /// 33 files of one project were searched as 260 indexes. Hot-tail outputs are small, so a
 /// rebuild is cheap.
 const MAX_CARRIED_ENTRIES: usize = 2;
+/// Indexed docs per live output row a merged index may reach before a rebuild resets it.
+const MAX_MERGED_DRIFT: u64 = 2;
 
 fn window_width(time_range: Option<(i64, i64)>) -> u64 {
     time_range.map_or(u64::MAX, |(lo, hi)| hi.abs_diff(lo))
@@ -2183,13 +2185,13 @@ impl TantivyIndexService {
     }
 
     /// Cover a rewrite's outputs from its inputs' indexes: carried when few enough, else merged.
-    /// A merge failure only costs the caller's rebuild.
-    pub async fn carry_forward(&self, table: &str, project_id: &str, removed: &[String], added: &[String]) -> Result<bool> {
+    /// A merge failure only costs the caller's rebuild. `output_rows`, when known, bounds drift.
+    pub async fn carry_forward(&self, table: &str, project_id: &str, removed: &[String], added: &[String], output_rows: Option<u64>) -> Result<bool> {
         if self.carry_forward_after_compaction(table, project_id, removed, added).await? {
             return Ok(true);
         }
         Ok(self
-            .merge_forward_after_compaction(table, project_id, removed, added)
+            .merge_forward_after_compaction(table, project_id, removed, added, output_rows)
             .await
             .inspect_err(|error| warn!(table, project_id, %error, event = "tantivy_merge_forward_failed"))
             .unwrap_or(false))
@@ -2201,7 +2203,13 @@ impl TantivyIndexService {
     /// index is a superset of the output's rows — at the cost of a segment merge, without
     /// decoding or tokenizing. `Ok(false)` (an uncovered input, or entries that disagree on
     /// what they index) leaves the caller to rebuild.
-    pub async fn merge_forward_after_compaction(&self, table: &str, project_id: &str, removed: &[String], added: &[String]) -> Result<bool> {
+    ///
+    /// A merge keeps every doc its inputs held, including versions and duplicates the rewrite
+    /// dropped, where a rebuild starts from the output's live rows. So it declines once the
+    /// inputs hold more than [`MAX_MERGED_DRIFT`]× the output's rows, letting a rebuild reset it.
+    pub async fn merge_forward_after_compaction(
+        &self, table: &str, project_id: &str, removed: &[String], added: &[String], output_rows: Option<u64>,
+    ) -> Result<bool> {
         let (Some(reader), Some(first_added)) = (self.reader(), added.first()) else { return Ok(false) };
         let rel_of = |u: &str| parquet_rel_of_uri(u).unwrap_or(u).to_string();
         let removed_rel: HashSet<String> = removed.iter().map(|u| rel_of(u)).collect();
@@ -2211,7 +2219,9 @@ impl TantivyIndexService {
         let covered: HashSet<String> = carried.iter().flat_map(|(_, e)| e.covered_files.iter().map(|u| rel_of(u))).collect();
         let Some((_, first)) = carried.first() else { return Ok(false) };
         let alike = |e: &ManifestEntry| e.positional && e.fields == first.fields && e.element_fields == first.element_fields;
-        if carried.len() < 2 || removed_rel.is_empty() || !removed_rel.is_subset(&covered) || !carried.iter().all(|(_, e)| alike(e)) {
+        let rows: u64 = carried.iter().map(|(_, e)| e.rows).sum();
+        let drifted = output_rows.is_some_and(|live| rows > live.saturating_mul(MAX_MERGED_DRIFT));
+        if carried.len() < 2 || drifted || removed_rel.is_empty() || !removed_rel.is_subset(&covered) || !carried.iter().all(|(_, e)| alike(e)) {
             return Ok(false);
         }
         let mut indexes = Vec::with_capacity(carried.len());
@@ -2222,7 +2232,7 @@ impl TantivyIndexService {
         let stats = super::IndexBuildStats {
             element_fields: first.element_fields.clone(),
             fields: first.fields.clone(),
-            rows: carried.iter().map(|(_, e)| e.rows).sum(),
+            rows,
             batches: 0,
             min_timestamp_micros: carried.iter().map(|(_, e)| e.min_timestamp_micros).collect::<Option<Vec<_>>>().and_then(|v| v.into_iter().min()),
             max_timestamp_micros: carried.iter().map(|(_, e)| e.max_timestamp_micros).collect::<Option<Vec<_>>>().and_then(|v| v.into_iter().max()),
@@ -2243,7 +2253,7 @@ impl TantivyIndexService {
         let rel = rel_of(first_added);
         self.publish_built_index(table, project_id, &rel, super::index_path_for_parquet(table, &rel), added.to_vec(), false, Ok(merged), false).await?;
         metrics::counter!(crate::database::scan_metric_names::TANTIVY_MERGED_FORWARD).increment(added.len() as u64);
-        info!(table, project_id, merged = carried.len(), rows = carried.iter().map(|(_, e)| e.rows).sum::<u64>(), event = "tantivy_merged_forward");
+        info!(table, project_id, merged = carried.len(), rows, output_rows, event = "tantivy_merged_forward");
         Ok(true)
     }
 

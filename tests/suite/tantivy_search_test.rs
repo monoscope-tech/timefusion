@@ -673,7 +673,11 @@ async fn past_the_cap_a_rewrite_merges_its_inputs_indexes_instead_of_rebuilding(
         env.publish(&[(1_000_000 + i as i64, &format!("id{i}"), if i == 1 { "ERROR" } else { "INFO" })], &[uri]).await;
     }
     let (removed, added) = (inputs.clone(), vec!["out".to_string()]);
-    assert!(env.svc.carry_forward(env.table, env.project, &removed, &added).await.unwrap(), "a covered rewrite past the cap must be merged");
+    assert!(
+        !env.svc.carry_forward(env.table, env.project, &removed, &added, Some(1)).await.unwrap(),
+        "three indexed rows for one live row is drift a rebuild must reset"
+    );
+    assert!(env.svc.carry_forward(env.table, env.project, &removed, &added, Some(3)).await.unwrap(), "a covered rewrite past the cap must be merged");
     let m = env.manifest().await;
     let covering: Vec<_> = m.entries.values().filter(|e| e.covered_files.contains(&"out".to_string())).collect();
     assert_eq!(covering.len(), 1, "the merge replaces the carried entries with one, so a query over the output searches one index");
@@ -683,7 +687,7 @@ async fn past_the_cap_a_rewrite_merges_its_inputs_indexes_instead_of_rebuilding(
     assert_eq!(ids(env.hits("level", "ERROR").await.expect("covered")), ["id1"], "the merged index answers for the inputs once they are gone");
     assert_eq!(ids(env.hits("level", "INFO").await.expect("covered")).len(), 2);
     assert!(
-        !env.svc.carry_forward(env.table, env.project, &["never_indexed".to_string()], &["out2".to_string()]).await.unwrap(),
+        !env.svc.carry_forward(env.table, env.project, &["never_indexed".to_string()], &["out2".to_string()], None).await.unwrap(),
         "an uncovered input is never merged"
     );
 }

@@ -9472,7 +9472,15 @@ impl Database {
                 continue;
             }
             let target_paths: Vec<_> = bin.targets.iter().map(|add| add.path.clone()).collect();
-            match svc.carry_forward(table_name, &bin.project_id, &target_paths, &for_bin).await {
+            let output_rows = bin
+                .adds
+                .iter()
+                .map(|action| match action {
+                    deltalake::kernel::Action::Add(add) => add_row_count(add),
+                    _ => Some(0),
+                })
+                .sum::<Option<u64>>();
+            match svc.carry_forward(table_name, &bin.project_id, &target_paths, &for_bin, output_rows).await {
                 Ok(true) => carried.extend(for_bin),
                 Ok(false) => {}
                 Err(error) => warn!(table_name, %error, event = "tantivy_wave_carry_forward_failed"),
