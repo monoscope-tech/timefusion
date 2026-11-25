@@ -1597,7 +1597,7 @@ fn analyzed_conjunction_query(index: &Index, field: Field, tokenizer: &str, quer
 /// Run a tantivy `Query` against the index and return hits up to `limit`.
 /// `limit = None` returns up to a hard cap (currently 1M) to bound memory.
 pub fn query_index(index: &Index, query: &dyn Query, limit: Option<usize>) -> Result<Vec<Hit>> {
-    let reader = super::immutable_reader(&index).map_err(|e| anyhow!("open reader: {e}"))?;
+    let reader = super::immutable_reader(index).map_err(|e| anyhow!("open reader: {e}"))?;
     query_with_searcher(&reader.searcher(), query, limit)
 }
 

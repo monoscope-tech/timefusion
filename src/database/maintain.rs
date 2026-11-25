@@ -799,6 +799,8 @@ const VERSION_ONLY_TTL_MICROS: i64 = 2 * 3600 * 1_000_000;
 /// A table's commit sequence and its recent commits' `(sequence, row-time range)`.
 type CommitLog = (u64, std::collections::VecDeque<(u64, Option<(i64, i64)>)>);
 type LiveFile = (String, Option<deltalake::kernel::DeletionVectorDescriptor>);
+/// Per `date=` partition: its Parquet file URIs and its live files.
+type FilesByDate = HashMap<String, (Vec<String>, Vec<LiveFile>)>;
 /// Recent commit ranges kept per `(project, table)`; one evicted since a read counts as overlapping.
 const VERSION_ONLY_COMMIT_RANGES: usize = 1024;
 
@@ -7194,9 +7196,9 @@ impl Database {
 
     /// Each `date=` partition's Parquet file URIs and live `(path, deletion vector)`s,
     /// grouped once per snapshot version: scans ask per day, and each ask walked the whole log.
-    fn files_by_date(table: &DeltaTable) -> Result<Arc<HashMap<String, (Vec<String>, Vec<LiveFile>)>>> {
+    fn files_by_date(table: &DeltaTable) -> Result<Arc<FilesByDate>> {
         per_version(table, "files_by_date".into(), || {
-            let mut by_date: HashMap<String, (Vec<String>, Vec<LiveFile>)> = HashMap::new();
+            let mut by_date = FilesByDate::new();
             for uri in table.get_file_uris()?.filter(|uri| uri.ends_with(".parquet")) {
                 if let Some(date) = path_partition_value(&uri, "date") {
                     by_date.entry(date.to_string()).or_default().0.push(uri.clone());
