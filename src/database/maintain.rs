@@ -1357,7 +1357,7 @@ impl Database {
     }
 
     fn persist_rollup_journal(&self) -> std::io::Result<()> {
-        self.persist_rollup_journal_bytes(crate::rollup_journal::encode(&self.rollup_journal_entries())?, false)
+        self.persist_rollup_journal_with(false)
     }
 
     /// Source freshness alone does not prove that the output still exists.
@@ -1650,24 +1650,27 @@ impl Database {
     /// one per second rather than one per commit.
     const ROLLUP_JOURNAL_MAX_STALENESS: std::time::Duration = std::time::Duration::from_secs(1);
 
-    /// Persist the encoded rollup journal, unless unchanged or not yet due.
+    /// Persist the encoded rollup journal, unless not yet due or unchanged.
     /// Safe to defer: the task journal is the source of truth and an absent entry
     /// here already means "full rebuild required". `force` bypasses the staleness
-    /// window for shutdown, where no next commit carries the write.
-    fn persist_rollup_journal_bytes(&self, bytes: Vec<u8>, force: bool) -> std::io::Result<()> {
+    /// window for shutdown, where no next commit carries the write. The window is
+    /// checked first: encoding walks, sorts and serializes every entry, and every
+    /// ingest ack reaches here.
+    fn persist_rollup_journal_with(&self, force: bool) -> std::io::Result<()> {
         use std::sync::atomic::Ordering::Relaxed;
         let stats = crate::observability::maintenance_stats();
-        let digest = digest_of(&bytes);
         let mut persisted = crate::support::lock(&self.rollup_journal_persisted);
-        if persisted.digest == Some(digest) {
-            stats.rollup_journal_persist_skipped.fetch_add(1, Relaxed);
-            return Ok(());
-        }
         if !force
             && let Some(at) = persisted.at
             && at.elapsed() < Self::ROLLUP_JOURNAL_MAX_STALENESS
         {
             stats.rollup_journal_persist_deferred.fetch_add(1, Relaxed);
+            return Ok(());
+        }
+        let bytes = crate::rollup_journal::encode(&self.rollup_journal_entries())?;
+        let digest = digest_of(&bytes);
+        if persisted.digest == Some(digest) {
+            stats.rollup_journal_persist_skipped.fetch_add(1, Relaxed);
             return Ok(());
         }
         crate::rollup_journal::store_encoded(&self.config.core.timefusion_data_dir, &bytes)?;
@@ -1681,7 +1684,7 @@ impl Database {
     /// where no later commit exists to carry a deferred write.
     pub(crate) fn flush_rollup_journal(&self) -> std::io::Result<()> {
         let _journal_guard = crate::support::lock_off_worker(&self.rollup_journal_lock);
-        self.persist_rollup_journal_bytes(crate::rollup_journal::encode(&self.rollup_journal_entries())?, true)
+        self.persist_rollup_journal_with(true)
     }
 
     /// `mint_dedup=false` only for hours touched EXCLUSIVELY by self-authored
@@ -14044,8 +14047,9 @@ mod rollup_journal_persist_tests {
             persisted.iter().find(|entry| entry.project_id == project && entry.date == date).expect("the partition must be on disk after a forced flush");
         assert_eq!(entry.dirty_hours & 0x1fff, 0x1fff, "every hour marked during the deferred window must have reached disk");
 
-        // Nothing changed since that flush, so the next commit writes nothing even though the
-        // window has no say — the idle case.
+        // Nothing changed since that flush, so once the window has passed the next commit is
+        // skipped on content — the idle case.
+        tokio::time::sleep(Database::ROLLUP_JOURNAL_MAX_STALENESS).await;
         let before = counts();
         db.commit_journal()?;
         assert_eq!(counts().1 - before.1, 1, "an unchanged journal must be skipped on content, not merely deferred");

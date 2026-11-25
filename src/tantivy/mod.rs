@@ -101,7 +101,10 @@ pub fn build_in_memory(table: &TableSchema, batches: &[RecordBatch]) -> Result<(
 pub fn index_to_writer(
     built: &BuiltSchema, index: &Index, batches: impl IntoIterator<Item = impl std::borrow::Borrow<RecordBatch>>, merge: MergeMode,
 ) -> Result<IndexBuildStats> {
-    let mut writer: IndexWriter = index.writer(WRITER_HEAP_BYTES).context("create tantivy writer")?;
+    // One thread owning the whole arena: `writer(64 MiB)` splits it into four 16 MiB arenas,
+    // which on real spans cut a segment every ~500 rows and paid a merge for every build
+    // (60k rows: 120 segments and 28.7 s CPU, against 7 segments and 24.2 s).
+    let mut writer: IndexWriter = index.writer_with_num_threads(1, WRITER_HEAP_BYTES).context("create tantivy writer")?;
     // Explicit merges keep `TermMerger` off the ingest path.
     writer.set_merge_policy(Box::new(NoMergePolicy));
     let mut stats = IndexBuildStats { element_fields: built.element_fields(), fields: built.user_fields.keys().cloned().collect(), ..Default::default() };
