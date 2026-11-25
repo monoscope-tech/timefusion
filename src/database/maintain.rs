@@ -5191,20 +5191,30 @@ impl Database {
     ///
     /// A file with missing statistics maps to `None`, which callers must treat as
     /// overlapping everything — never as empty.
+    ///
+    /// Every scan asks for each day of its window, so the whole table's spans are grouped
+    /// once per snapshot version rather than rebuilding the add-actions batch per call.
     pub(crate) fn partition_file_spans(table: &DeltaTable, project_id: &str, date_marker: &str) -> Result<HashMap<String, crate::read::FileSpan>> {
-        let project_prefix = format!("project_id={project_id}/");
-        let snapshot = table.snapshot()?.snapshot();
-        let actions = snapshot.add_actions_table(true)?;
-        let Some(paths) = actions.column_by_name("path").cloned() else { return Ok(HashMap::new()) };
-        let min_ts = crate::read::ts_micros_column(&actions, "min.timestamp");
-        let max_ts = crate::read::ts_micros_column(&actions, "max.timestamp");
-        Ok((0..actions.num_rows())
-            .filter_map(|row| {
+        type Spans = HashMap<(String, String), HashMap<String, crate::read::FileSpan>>;
+        let all = per_version(table, "file_spans".into(), || -> Result<Spans> {
+            let actions = table.snapshot()?.snapshot().add_actions_table(true)?;
+            let Some(paths) = actions.column_by_name("path").cloned() else { return Ok(Spans::new()) };
+            let min_ts = crate::read::ts_micros_column(&actions, "min.timestamp");
+            let max_ts = crate::read::ts_micros_column(&actions, "max.timestamp");
+            Ok((0..actions.num_rows()).fold(Spans::new(), |mut acc, row| {
                 let path = crate::support::test_helpers::array_get_str(paths.as_ref(), row);
-                let rel = crate::tantivy::search::parquet_rel_of_uri(&path)?.to_string();
-                (rel.starts_with(&project_prefix) && rel.contains(date_marker)).then(|| (rel, Self::valid_at(&min_ts, row).zip(Self::valid_at(&max_ts, row))))
-            })
-            .collect())
+                let Some(rel) = crate::tantivy::search::parquet_rel_of_uri(&path) else { return acc };
+                let project = rel.split('/').next().and_then(|segment| segment.strip_prefix("project_id="));
+                let date = rel.split('/').find_map(|segment| segment.strip_prefix("date="));
+                if let (Some(project), Some(date)) = (project, date) {
+                    let span = Self::valid_at(&min_ts, row).zip(Self::valid_at(&max_ts, row));
+                    acc.entry((project.to_owned(), date.to_owned())).or_default().insert(rel.to_owned(), span);
+                }
+                acc
+            }))
+        })?;
+        let date = date_marker.strip_prefix("date=").unwrap_or(date_marker);
+        Ok(all.get(&(project_id.to_owned(), date.to_owned())).cloned().unwrap_or_default())
     }
 
     /// `column[row]`, when the column is present and the row is not null.
@@ -5419,17 +5429,7 @@ impl Database {
     /// path asks for it on every routed query, and each call rebuilds the whole table's
     /// add-actions batch (~80% of a routed 30-day chart's planning CPU on prod).
     pub(crate) fn partition_stats(table: &DeltaTable, source: &str, tier: Option<&str>) -> Result<Arc<PartitionStatsMap>> {
-        type Memo = dashmap::DashMap<(String, String, Option<String>), (u64, Arc<PartitionStatsMap>)>;
-        static MEMO: std::sync::LazyLock<Memo> = std::sync::LazyLock::new(Memo::new);
-        let (key, version) = ((table.table_url().to_string(), source.to_owned(), tier.map(str::to_owned)), table.version());
-        if let Some(hit) = MEMO.get(&key).filter(|hit| Some(hit.0) == version) {
-            return Ok(Arc::clone(&hit.1));
-        }
-        let stats = Arc::new(Self::partition_stats_bounded(table, source, tier, &|_, _| i64::MAX)?);
-        if let Some(version) = version {
-            MEMO.insert(key, (version, Arc::clone(&stats)));
-        }
-        Ok(stats)
+        per_version(table, format!("stats:{source}:{tier:?}"), || Self::partition_stats_bounded(table, source, tier, &|_, _| i64::MAX))
     }
 
     pub(crate) fn partition_stats_bounded(
@@ -7016,14 +7016,11 @@ impl Database {
         let mut certified_any = false;
         // One snapshot pass for the whole window, keyed by `date=` segment: listing the
         // snapshot once per date made a 30-day planning pay ~60 full-snapshot walks.
-        let (Ok(uris), Ok(live)) = (table.get_file_uris(), Self::live_files(table)) else {
+        let Ok(by_date) = Self::files_by_date(table) else {
             return (DedupSkipVerdict::Unresolved, HashSet::new());
         };
-        let uris_by_date =
-            uris.filter(|uri| uri.ends_with(".parquet")).filter_map(|uri| Some((path_partition_value(&uri, "date")?.to_string(), uri))).into_group_map();
-        let mut live_by_date = live.into_iter().filter_map(|file| Some((path_partition_value(&file.0, "date")?.to_string(), file))).into_group_map();
         for date in dates {
-            let mut by_pid = Self::group_by_pid(uris_by_date.get(&date.to_string()).into_iter().flatten().cloned());
+            let mut by_pid = Self::group_by_pid(by_date.get(&date.to_string()).into_iter().flat_map(|(uris, _)| uris).cloned());
             // The sweep keys custom-project tables (no project_id= path
             // segment) under "default"; match its grouping exactly.
             let Some((key_pid, files)) =
@@ -7032,7 +7029,8 @@ impl Database {
                 continue; // no Delta files for this date → nothing to dedup
             };
             let fp_key = (key_pid, table_name.to_string(), date.to_string());
-            let Ok((_, visibility)) = Self::count_partition(live_by_date.remove(&fp_key.2).unwrap_or_default(), &fp_key.0, &fp_key.2) else {
+            let Ok((_, visibility)) = Self::count_partition(by_date.get(&fp_key.2).map(|(_, live)| live.clone()).unwrap_or_default(), &fp_key.0, &fp_key.2)
+            else {
                 return (DedupSkipVerdict::Unresolved, HashSet::new());
             };
             // Bound in a `let`, NOT inlined as the match scrutinee: the `Ref` would live
@@ -7191,12 +7189,27 @@ impl Database {
     }
 
     pub(crate) fn logical_count_partition_snapshot(table: &DeltaTable, project_id: &str, date: &str) -> Result<(u64, crate::read::CountFiles)> {
-        Self::count_partition(Self::live_files(table)?, project_id, date)
+        Self::count_partition(Self::files_by_date(table)?.get(date).map(|(_, live)| live.clone()).unwrap_or_default(), project_id, date)
     }
 
-    /// Every live `(path, deletion vector)` of the snapshot.
-    fn live_files(table: &DeltaTable) -> Result<Vec<LiveFile>> {
-        Ok(table.snapshot()?.snapshot().log_data().iter().map(|file| (file.path().into_owned(), file.deletion_vector_descriptor())).collect())
+    /// Each `date=` partition's Parquet file URIs and live `(path, deletion vector)`s,
+    /// grouped once per snapshot version: scans ask per day, and each ask walked the whole log.
+    fn files_by_date(table: &DeltaTable) -> Result<Arc<HashMap<String, (Vec<String>, Vec<LiveFile>)>>> {
+        per_version(table, "files_by_date".into(), || {
+            let mut by_date: HashMap<String, (Vec<String>, Vec<LiveFile>)> = HashMap::new();
+            for uri in table.get_file_uris()?.filter(|uri| uri.ends_with(".parquet")) {
+                if let Some(date) = path_partition_value(&uri, "date") {
+                    by_date.entry(date.to_string()).or_default().0.push(uri.clone());
+                }
+            }
+            for file in table.snapshot()?.snapshot().log_data().iter() {
+                let path = file.path().into_owned();
+                if let Some(date) = path_partition_value(&path, "date") {
+                    by_date.entry(date.to_string()).or_default().1.push((path.clone(), file.deletion_vector_descriptor()));
+                }
+            }
+            Ok(by_date)
+        })
     }
 
     /// [`Self::logical_count_partition_snapshot`] over an already-listed live set.
@@ -14382,4 +14395,20 @@ mod rollup_relevance_tests {
             .sorted()
             .collect()
     }
+}
+
+/// `compute` over `table`'s snapshot, memoized per `(table, kind)` at the snapshot's version:
+/// add-actions derived views are immutable for a version and costly to rebuild per query.
+fn per_version<T: Send + Sync + 'static>(table: &DeltaTable, kind: String, compute: impl FnOnce() -> Result<T>) -> Result<Arc<T>> {
+    type Memo = dashmap::DashMap<(String, String), (u64, Arc<dyn std::any::Any + Send + Sync>)>;
+    static MEMO: std::sync::LazyLock<Memo> = std::sync::LazyLock::new(Memo::new);
+    let (key, version) = ((table.table_url().to_string(), kind), table.version());
+    if let Some(hit) = MEMO.get(&key).filter(|hit| Some(hit.0) == version).and_then(|hit| Arc::clone(&hit.1).downcast::<T>().ok()) {
+        return Ok(hit);
+    }
+    let value = Arc::new(compute()?);
+    if let Some(version) = version {
+        MEMO.insert(key, (version, Arc::clone(&value) as _));
+    }
+    Ok(value)
 }

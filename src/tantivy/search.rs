@@ -887,7 +887,7 @@ impl TantivySearchService {
             }
             Err(_) => super::open_index(dir)?,
         };
-        let reader = index.reader().map_err(|e| anyhow!("open reader: {e}"))?;
+        let reader = super::immutable_reader(&index).map_err(|e| anyhow!("open reader: {e}"))?;
         SearchStats::timed(&self.stats.index_opens, &self.stats.index_open_us, started);
         self.readers.lock().put(dir.to_path_buf(), (index.clone(), reader.clone()));
         Ok((index, reader))
@@ -941,7 +941,7 @@ impl TantivySearchService {
         }
         let head = self.object_store.get_range(&ObjPath::from(blob_path), 0..head_len).await.with_context(|| format!("get head of {blob_path}"))?;
         let index = super::open_index_in(self.bundle_directory(blob_path, head)?)?;
-        let reader = index.reader().map_err(|e| anyhow!("open bundle reader: {e}"))?;
+        let reader = super::immutable_reader(&index).map_err(|e| anyhow!("open bundle reader: {e}"))?;
         SearchStats::add(&self.stats.bundle_opens, 1);
         self.readers.lock().put(key, (index.clone(), reader.clone()));
         Ok((index, reader))
@@ -1597,7 +1597,7 @@ fn analyzed_conjunction_query(index: &Index, field: Field, tokenizer: &str, quer
 /// Run a tantivy `Query` against the index and return hits up to `limit`.
 /// `limit = None` returns up to a hard cap (currently 1M) to bound memory.
 pub fn query_index(index: &Index, query: &dyn Query, limit: Option<usize>) -> Result<Vec<Hit>> {
-    let reader = index.reader().map_err(|e| anyhow!("open reader: {e}"))?;
+    let reader = super::immutable_reader(&index).map_err(|e| anyhow!("open reader: {e}"))?;
     query_with_searcher(&reader.searcher(), query, limit)
 }
 
@@ -1867,7 +1867,7 @@ mod reader_tests {
 use std::{collections::BTreeMap, sync::atomic::AtomicI64};
 
 use chrono::Utc;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::{
@@ -2161,7 +2161,10 @@ impl TantivyIndexService {
             // packed files accumulated ~550 (2.8 s of fan-out per query). Past the cap the caller
             // rebuilds one index, and the inputs' entries age out with their files.
             let carried = m.entries.values().filter(|e| carries(e)).count();
-            if !removed_rel.is_subset(&covered) || carried > MAX_CARRIED_ENTRIES {
+            let uncovered = removed_rel.iter().filter(|u| !covered.contains(*u)).count();
+            if uncovered > 0 || carried > MAX_CARRIED_ENTRIES {
+                let rows: u64 = m.entries.values().filter(|e| carries(e)).map(|e| e.rows).sum();
+                info!(table, project_id, uncovered, carried, carried_rows = rows, event = "tantivy_carry_declined");
                 return (false, false);
             }
             m.entries.values_mut().filter(|e| carries(e)).for_each(|e| {

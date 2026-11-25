@@ -1501,7 +1501,7 @@ pub fn verify_blob(blob: &[u8]) -> Result<()> {
     if hotcache::is_bundle(blob) {
         let dir = hotcache::BundleDirectory::in_memory(Bytes::copy_from_slice(blob))?;
         ensure!(dir.bundle_len() == blob.len() as u64, "bundle is {} bytes, its table describes {}", blob.len(), dir.bundle_len());
-        return open_index_in(dir)?.reader().map(drop).map_err(|e| anyhow!("open bundle reader: {e}"));
+        return immutable_reader(&open_index_in(dir)?).map(drop).map_err(|e| anyhow!("open bundle reader: {e}"));
     }
     let tar_bytes = zstd::decode_all(blob).context("zstd decode")?;
     let staged = tantivy::directory::RamDirectory::create();
@@ -1524,6 +1524,12 @@ pub fn verify_blob(blob: &[u8]) -> Result<()> {
         anyhow::bail!("packed blob contains no files");
     }
     open_index_in(staged).map(drop)
+}
+
+/// A reader that never watches for commits. Published indexes are immutable, and tantivy's
+/// default policy polls `meta.json` from one thread per watched directory.
+pub fn immutable_reader(index: &Index) -> tantivy::Result<tantivy::IndexReader> {
+    index.reader_builder().reload_policy(tantivy::ReloadPolicy::Manual).try_into()
 }
 
 /// Open an unpacked tantivy index for querying.

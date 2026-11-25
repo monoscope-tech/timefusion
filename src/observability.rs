@@ -2486,8 +2486,10 @@ mod imp {
     /// sample for `WINDOW`, write a flamegraph, drop, repeat. A fresh guard per
     /// window keeps each SVG scoped to a recent interval.
     fn spawn_cpu_sampler(dir: PathBuf) {
-        const HZ: i32 = 99; // 99Hz: cheap, avoids lock-step with periodic timers
-        const WINDOW: Duration = Duration::from_secs(60);
+        // Off lock-step with periodic timers. Report building, not sampling, is the cost
+        // (2.4% of prod CPU at 99Hz/60s): it symbolizes every distinct stack per window.
+        const HZ: i32 = 49;
+        const WINDOW: Duration = Duration::from_secs(300);
         const KEEP_CPU: usize = 10;
         std::thread::Builder::new()
             .name("cpu-profiler".into())
