@@ -2581,6 +2581,26 @@ pub use imp::start;
 #[cfg(not(all(feature = "profiling", target_os = "linux")))]
 pub fn start(_data_dir: std::path::PathBuf, _heap_profile_active: bool) {}
 
+/// Arm or disarm jemalloc heap sampling without a restart; disarming first dumps what was
+/// sampled to the baked `prof_prefix` (`<data_dir>/profiles/jeprof.*.heap`).
+#[cfg(all(feature = "profiling", target_os = "linux"))]
+pub fn set_heap_profile(active: bool) -> String {
+    // SAFETY: `prof.dump` takes a `const char *` (NULL = default file name under
+    // `prof_prefix`); `prof.active` takes a `bool`. Both names are NUL-terminated.
+    let dumped = (!active).then(|| unsafe { tikv_jemalloc_ctl::raw::write(b"prof.dump\0", std::ptr::null::<std::ffi::c_char>()) });
+    match (dumped, unsafe { tikv_jemalloc_ctl::raw::write(b"prof.active\0", active) }) {
+        (_, Err(e)) => format!("prof.active failed: {e}"),
+        (Some(Err(e)), Ok(())) => format!("heap profiling off; prof.dump failed: {e}"),
+        (Some(Ok(())), Ok(())) => "heap profiling off; profile dumped to the profiles directory".to_owned(),
+        (None, Ok(())) => "heap profiling on".to_owned(),
+    }
+}
+
+#[cfg(not(all(feature = "profiling", target_os = "linux")))]
+pub fn set_heap_profile(_active: bool) -> String {
+    "heap profiling needs a Linux build with the `profiling` feature".to_owned()
+}
+
 // ===== errors =====
 // Shared `.map_err` helpers; each preserves the original variant and message.
 
