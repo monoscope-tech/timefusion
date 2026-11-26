@@ -3032,7 +3032,7 @@ impl Database {
         let after = snapshot();
         let (state, retry_reason) = {
             let journal = self.journal();
-            journal.tasks().find(|task| task.key == key).map_or((None, None), |task| (Some(task.state), task.retry_reason.clone()))
+            journal.task(&key).map_or((None, None), |task| (Some(task.state), task.retry_reason.clone()))
         };
         Ok(UnitRunReport {
             operation,
@@ -6540,9 +6540,10 @@ impl Database {
                 }
                 let _guard = crate::support::lock_off_worker(&self.rollup_journal_lock);
                 if epoch() != before
-                    || !self.journal().tasks().any(|task| {
-                        task.key == *key && task.state == crate::maintenance_coordinator::TaskState::Complete && task.publication.as_ref() == Some(publication)
-                    })
+                    || !self
+                        .journal()
+                        .task(key)
+                        .is_some_and(|task| task.state == crate::maintenance_coordinator::TaskState::Complete && task.publication.as_ref() == Some(publication))
                 {
                     continue;
                 }
