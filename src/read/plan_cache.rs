@@ -202,6 +202,38 @@ fn fold_literal_casts(plan: LogicalPlan) -> DfResult<LogicalPlan> {
         let exprs = folded.into_iter().map(|t| t.data).collect();
         node.with_new_exprs(exprs, node.inputs().into_iter().cloned().collect()).map(Transformed::yes)
     })
+    .and_then(|t| hoist_list_literals(t.data))
+}
+
+/// A bound array parameter lands as a list literal in a projection over the single empty
+/// row (`unnest($1::text[])`). `Alias::to_field` renders its inner expression's name, so
+/// every schema recompute — type coercion, projection pruning, the Variant schema patch —
+/// formats the whole array. Move each aliased list literal into a one-row `VALUES` the
+/// projection reads by column: same row, same names, the array rendered never.
+fn hoist_list_literals(plan: LogicalPlan) -> DfResult<LogicalPlan> {
+    use datafusion::logical_expr::{LogicalPlanBuilder, Projection, expr::Alias};
+    plan.transform_up(|node| {
+        let LogicalPlan::Projection(Projection { expr, input, .. }) = &node else { return Ok(Transformed::no(node)) };
+        let one_row = matches!(input.as_ref(), LogicalPlan::EmptyRelation(e) if e.produce_one_row);
+        let is_list = |e: &Expr| matches!(e, Expr::Alias(Alias { expr, .. }) if matches!(expr.as_ref(), Expr::Literal(ScalarValue::List(_) | ScalarValue::LargeList(_), _)));
+        if !one_row || !expr.iter().any(is_list) {
+            return Ok(Transformed::no(node));
+        }
+        let mut row = vec![];
+        let exprs = expr
+            .iter()
+            .map(|e| match e {
+                Expr::Alias(Alias { expr: inner, relation, name, metadata }) if is_list(e) => {
+                    row.push(inner.as_ref().clone());
+                    let column = Expr::Column(datafusion::common::Column::from_name(format!("column{}", row.len())));
+                    Expr::Alias(Alias { expr: Box::new(column), relation: relation.clone(), name: name.clone(), metadata: metadata.clone() })
+                }
+                other => other.clone(),
+            })
+            .collect::<Vec<_>>();
+        let values = LogicalPlanBuilder::values(vec![row])?.build()?;
+        Ok(Transformed::yes(LogicalPlan::Projection(Projection::try_new(exprs, Arc::new(values))?)))
+    })
     .map(|t| t.data)
 }
 
@@ -1007,6 +1039,32 @@ impl QueryHook for PlanCacheHook {
 
 #[cfg(test)]
 mod tests {
+    /// A bound array parameter must not stay a literal under an alias: every schema
+    /// recompute renders it as a name. Hoisted into VALUES, the plan names no array and
+    /// still yields the same rows in the same order.
+    #[tokio::test]
+    async fn bound_arrays_leave_the_projection_for_values() {
+        let ctx = SessionContext::new();
+        let sql = "select event_id, tag from (select unnest($1::text[]) as event_id, unnest($2::text[]) as tag) raw order by event_id";
+        let plan = ctx.state().create_logical_plan(sql).await.unwrap();
+        let list = |p: &str| {
+            ScalarValue::List(ScalarValue::new_list_nullable(
+                &(0..50).rev().map(|i| ScalarValue::from(format!("{p}{i:03}"))).collect::<Vec<_>>(),
+                &DataType::Utf8,
+            ))
+        };
+        let bound = plan.replace_params_with_values(&ParamValues::List(vec![list("e").into(), list("t").into()])).unwrap();
+        let hoisted = fold_literal_casts(bound.clone()).unwrap();
+        let names_an_array = |plan: &LogicalPlan| {
+            let list_literal = |e: &Expr| e.exists(|x| Ok(matches!(x, Expr::Literal(ScalarValue::List(_), _)))).unwrap();
+            plan.exists(|node| Ok(matches!(node, LogicalPlan::Projection(_)) && node.expressions().iter().any(list_literal))).unwrap()
+        };
+        assert!(names_an_array(&bound), "precondition: the bound plan holds the array in a projection");
+        assert!(!names_an_array(&hoisted), "after the hoist no projection holds the array");
+        let rows = async |plan: LogicalPlan| ctx.execute_logical_plan(plan).await.unwrap().collect().await.unwrap();
+        assert_eq!(rows(hoisted).await, rows(bound).await);
+    }
+
     use test_case::test_case;
 
     use super::*;
