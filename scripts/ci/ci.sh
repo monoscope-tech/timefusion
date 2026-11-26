@@ -488,7 +488,7 @@ cmd_run() {
     case "$BACKGROUND" in *" $c "*) if [ "$todo" != " $c" ]; then
       note "running $c in the background → .ci/$c.log"
       ( t0=$(date +%s); st=0
-        CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target}/$c" run_body "$c" >".ci/$c.log" 2>&1 || st=$?
+        CARGO_BUILD_JOBS="${CI_BG_JOBS:-4}" CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target}/$c" run_body "$c" >".ci/$c.log" 2>&1 || st=$?
         echo "$st $t0 $(date +%s)" >".ci/$c.status" ) &
       bg="$bg $c"; continue
     fi ;; esac

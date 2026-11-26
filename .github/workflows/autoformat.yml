@@ -36,17 +36,25 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Check attestations
+        id: gate
+        run: ./scripts/ci/ci.sh gate fmt clippy
+
       - name: Install stable toolchain
+        if: steps.gate.outputs.skip_all != 'true'
         run: rustup toolchain install stable --component rustfmt,clippy
 
 
       - uses: Swatinem/rust-cache@v2
+        if: steps.gate.outputs.skip_all != 'true'
 
       # rustfmt.toml is stable-only; plain `cargo fmt` matches the CI fmt-check.
       - name: Run cargo fmt
+        if: steps.gate.outputs.skip_all != 'true'
         run: cargo fmt --all
 
       - name: Run cargo clippy --fix
+        if: steps.gate.outputs.skip_all != 'true'
         # --allow-dirty because fmt may have already produced uncommitted changes.
         # --allow-staged for the same reason in case any pre-stage runs.
         # Intentionally non-fatal: clippy autofixes are best-effort. If a fix
@@ -64,6 +72,7 @@ jobs:
           exit 0
 
       - name: Commit & push if changed
+        if: steps.gate.outputs.skip_all != 'true'
         run: |
           if [ -z "$(git status --porcelain)" ]; then
             echo "No formatting / clippy changes — nothing to push."
