@@ -677,6 +677,7 @@ async fn past_the_cap_a_rewrite_merges_its_inputs_indexes_instead_of_rebuilding(
         !env.svc.carry_forward(env.table, env.project, &removed, &added, Some(1)).await.unwrap(),
         "three indexed rows for one live row is drift a rebuild must reset"
     );
+    assert!(!env.svc.carry_forward(env.table, env.project, &removed, &added, None).await.unwrap(), "an output nobody can price is rebuilt, never merged");
     assert!(env.svc.carry_forward(env.table, env.project, &removed, &added, Some(3)).await.unwrap(), "a covered rewrite past the cap must be merged");
     let m = env.manifest().await;
     let covering: Vec<_> = m.entries.values().filter(|e| e.covered_files.contains(&"out".to_string())).collect();
