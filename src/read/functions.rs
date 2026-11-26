@@ -689,6 +689,7 @@ pub fn register_custom_functions(ctx: &mut datafusion::execution::context::Sessi
     // substring fallback when tantivy is off or when post-filtering MemBuffer rows.
     ctx.register_udf(crate::tantivy::udf::text_match_udf());
 
+    ctx.register_udf(create_heap_profile_udf());
     // Test-only clock UDFs, gated so a production deployment can't have its
     // eviction/flush clock yanked by a stray SQL session.
     if std::env::var("TIMEFUSION_ENABLE_TEST_UDFS").is_ok_and(|v| v == "true" || v == "1") {
@@ -716,6 +717,17 @@ pub fn function_registry() -> Result<Arc<FnRegistry>> {
     // First-write-wins; if a parallel test won the race we just discard ours.
     let _ = CELL.set(Arc::clone(&arc));
     Ok(arc)
+}
+
+/// `timefusion_heap_profile(on)` → status text: heap sampling without a restart; `false` dumps.
+fn create_heap_profile_udf() -> ScalarUDF {
+    let fun: ScalarFunctionImplementation = Arc::new(move |args: &[ColumnarValue]| {
+        let arr = as_array(&args[0])?;
+        let on: &BooleanArray = downcast(&arr, "timefusion_heap_profile expects a boolean")?;
+        let status = on.iter().next().flatten().map(crate::observability::set_heap_profile);
+        Ok(ColumnarValue::Array(Arc::new(StringArray::from(vec![status]))))
+    });
+    create_udf("timefusion_heap_profile", vec![DataType::Boolean], DataType::Utf8, Volatility::Volatile, fun)
 }
 
 /// `timefusion_set_clock(rfc3339_text)` → bigint micros-since-epoch.
@@ -1740,6 +1752,16 @@ mod hll_tests {
         let batches = ctx.sql(sql).await.expect("plan").collect().await.expect("execute");
         let column = batches[0].column(0);
         ScalarValue::try_from_array(column, 0).unwrap().cast_to(&DataType::UInt64).unwrap().to_string().parse().unwrap()
+    }
+
+    /// Reachable from SQL in every build, so a heap profile never needs a restart.
+    #[tokio::test]
+    async fn heap_profile_toggle_answers_from_sql() {
+        let mut ctx = SessionContext::new();
+        register_custom_functions(&mut ctx).unwrap();
+        let batches = ctx.sql("SELECT timefusion_heap_profile(false)").await.unwrap().collect().await.unwrap();
+        let status = ScalarValue::try_from_array(batches[0].column(0), 0).unwrap().to_string();
+        assert_eq!(status, crate::observability::set_heap_profile(false));
     }
 
     /// 200k rows forces the partial/final split, so this also pins that the sketch
