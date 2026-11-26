@@ -635,6 +635,16 @@ rollups:
       - { name: duration_count, agg: count, column: duration }
       - { name: duration_sum, agg: sum, column: duration }
       - { name: duration_digest, agg: tdigest, column: duration }
+  # monoscope's PR impact review (Pkg.ImpactReview.collectEvidence): events and errors per
+  # service and environment over the last 7 days. Raw it read ~16 GB a run (~554 GB/day on
+  # 11-26). `error_count` is monoscope's isErrorSql verbatim, which is what lets it route.
+  - grain: 1h
+    name: impact_1h
+    dimensions: [resource___service___name, resource___deployment___environment___name]
+    backfill_days: 8
+    measures:
+      - { name: request_count, agg: count }
+      - { name: error_count, agg: count, filter: "(lower(level) IN ('error', 'fatal') OR severity___severity_number >= 17 OR status_code = 'ERROR' OR attributes___exception___type IS NOT NULL)" }
   # monoscope's LLM dashboard (gen-ai widgets): request, error-rate, token and cost charts
   # by service and model, filtered by `attributes___gen_ai___operation___name IN (...)`.
   # Raw they scanned a project's every span for that sparse subset: p50 3.5-11.5 s on
