@@ -1819,7 +1819,7 @@ impl TaskJournal {
     }
 
     /// The task `key` names, if the journal still holds it.
-    fn task(&self, key: &TaskKey) -> Option<&MaintenanceTask> {
+    pub(crate) fn task(&self, key: &TaskKey) -> Option<&MaintenanceTask> {
         self.snapshot.tasks.get(*self.task_indices.get(key)?)
     }
 
@@ -2730,13 +2730,9 @@ impl TaskJournal {
     }
 
     pub fn rollup_slice_complete(&self, source: &str, project_id: &str, target: &str, slice: TimeSlice) -> bool {
-        self.snapshot.tasks.iter().any(|task| {
-            task.key.source == source
-                && task.key.project_id == project_id
-                && task.key.physical_table == target
-                && task.key.slice == slice
-                && matches!(task.key.operation, Operation::BaseRollup | Operation::DerivedRollup)
-                && task.state == TaskState::Complete
+        [Operation::BaseRollup, Operation::DerivedRollup].into_iter().any(|operation| {
+            let key = TaskKey { physical_table: target.to_owned(), source: source.to_owned(), project_id: project_id.to_owned(), slice, operation };
+            self.task(&key).is_some_and(|task| task.state == TaskState::Complete)
         })
     }
 
