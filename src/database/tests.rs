@@ -12393,3 +12393,44 @@ async fn the_llm_list_routes_over_built_days() -> Result<()> {
     }
     Ok(())
 }
+
+/// monoscope's PR impact review evidence, verbatim (Pkg.ImpactReview.collectEvidence): 7 days of
+/// events and errors per service and environment read ~16 GB raw a run until it had a tier.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_impact_review_routes_to_its_tier() -> Result<()> {
+    use crate::maintenance_coordinator::Operation;
+    let db = std::sync::Arc::new(Database::with_config(rollup_backfill_config("impact-route", 35)).await?);
+    db.cancel_maintenance();
+    let project = uuid::Uuid::new_v4().to_string();
+    let days: Vec<chrono::NaiveDate> = (3..=4).rev().map(|back| (Utc::now() - chrono::Duration::days(back)).date_naive()).collect();
+    for (index, day) in days.iter().enumerate() {
+        for (hour, level) in [(1, "INFO"), (7, "ERROR"), (13, "info"), (19, "fatal")] {
+            let at = day.and_hms_opt(hour, 0, 0).expect("hour").and_utc().timestamp_micros();
+            let row = serde_json::json!({
+                "timestamp": at, "id": format!("d{index}h{hour}"), "name": "GET /", "project_id": project, "hashes": [], "summary": ["impact fixture"],
+                "date": day.to_string(), "kind": "server", "level": level, "resource___service___name": "api", "resource___deployment___environment___name": "prod",
+            });
+            db.insert_records_batch(&project, "otel_logs_and_spans", vec![json_to_batch(vec![row])?], true, None).await?;
+        }
+        db.run_unit_once("otel_logs_and_spans", &project, *day, Operation::BaseRollup, 24, 0, Some("otel_logs_and_spans_rollup_impact_1h")).await?;
+    }
+    let (from, until) = (
+        days[0].and_hms_opt(0, 30, 0).expect("from").and_utc().to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
+        days[1].and_hms_opt(23, 30, 0).expect("until").and_utc().to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
+    );
+    let sql = format!(
+        "SELECT resource___service___name, coalesce(resource___deployment___environment___name, ''), count(*)::bigint, count(*) FILTER (WHERE (lower(level) IN ('error', 'fatal') OR severity___severity_number >= 17 OR status_code = 'ERROR' OR attributes___exception___type IS NOT NULL))::bigint FROM otel_logs_and_spans WHERE project_id = '{project}' AND timestamp >= '{from}' AND timestamp <= '{until}' AND resource___service___name IN ('api', 'worker') GROUP BY resource___service___name, resource___deployment___environment___name ORDER BY count(*) DESC LIMIT 21"
+    );
+    let mut ctx = std::sync::Arc::clone(&db).create_session_context();
+    db.setup_session_context(&mut ctx)?;
+    let state = ctx.state();
+    let plan = state.optimize(&state.create_logical_plan(&sql).await.expect("parse")).expect("optimize");
+    let routed = db.rollup_sql(&plan, &state).await.map(|rewrites| rewrites.into_iter().map(|r| r.sql).collect::<Vec<_>>()).map_err(|reason| reason.label());
+    assert!(routed.as_ref().is_ok_and(|sqls| sqls.iter().any(|s| s.contains("impact_1h"))), "{routed:?}");
+    let out = ctx.sql(&sql).await?.collect().await?;
+    let text = arrow::util::pretty::pretty_format_batches(&out)?.to_string();
+    let row: Vec<&str> =
+        text.lines().find(|line| line.contains(" api ")).unwrap_or_default().split('|').map(str::trim).filter(|cell| !cell.is_empty()).collect();
+    assert_eq!(row, ["api", "prod", "8", "4"], "{text}");
+    Ok(())
+}
