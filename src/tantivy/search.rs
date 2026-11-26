@@ -2206,7 +2206,8 @@ impl TantivyIndexService {
     ///
     /// A merge keeps every doc its inputs held, including versions and duplicates the rewrite
     /// dropped, where a rebuild starts from the output's live rows. So it declines once the
-    /// inputs hold more than [`MAX_MERGED_DRIFT`]× the output's rows, letting a rebuild reset it.
+    /// inputs hold more than [`MAX_MERGED_DRIFT`]× the output's rows (or that count is unknown),
+    /// letting a rebuild reset it.
     pub async fn merge_forward_after_compaction(
         &self, table: &str, project_id: &str, removed: &[String], added: &[String], output_rows: Option<u64>,
     ) -> Result<bool> {
@@ -2220,7 +2221,8 @@ impl TantivyIndexService {
         let Some((_, first)) = carried.first() else { return Ok(false) };
         let alike = |e: &ManifestEntry| e.positional && e.fields == first.fields && e.element_fields == first.element_fields;
         let rows: u64 = carried.iter().map(|(_, e)| e.rows).sum();
-        let drifted = output_rows.is_some_and(|live| rows > live.saturating_mul(MAX_MERGED_DRIFT));
+        // Fail closed: an output the caller cannot price is rebuilt, as before merging existed.
+        let drifted = output_rows.is_none_or(|live| rows > live.saturating_mul(MAX_MERGED_DRIFT));
         if carried.len() < 2 || drifted || removed_rel.is_empty() || !removed_rel.is_subset(&covered) || !carried.iter().all(|(_, e)| alike(e)) {
             return Ok(false);
         }
