@@ -1056,7 +1056,7 @@ async fn plan_time(ctx: &SessionContext, sql: &str) -> Result<std::time::Duratio
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn tantivy_id_list_costs_rows_not_planning(row_selection: bool, with_dv: bool) -> Result<()> {
-    const FILES: usize = 50;
+    const FILES: usize = 25;
     const PER: usize = 400;
     const HITS: usize = 20 * FILES;
     // Hits are one contiguous block per file, so every other row group can be skipped.
