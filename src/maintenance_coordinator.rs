@@ -279,7 +279,7 @@ pub struct TaskKey {
 /// tier's grain. A narrower unit stamps a PARTIAL bucket state under the bucket's
 /// `(timestamp, id)`, which the tier read's keep-one dedup cannot combine.
 pub(crate) fn rollup_unit_grain(source: &str, table: &str, operation: Operation) -> i64 {
-    let declared = || crate::schema::get_schema(source)?.rollups.iter().find(|spec| spec.table_name(source) == table)?.grain_micros();
+    let declared = || crate::schema::get_schema(source)?.rollups.iter().find(|spec| spec.is_table(source, table))?.grain_micros();
     match operation {
         Operation::BaseRollup => declared().unwrap_or(MIN_SLICE_MICROS).max(MIN_SLICE_MICROS),
         Operation::DerivedRollup => declared().unwrap_or(DERIVED_SLICE_MICROS).max(MIN_SLICE_MICROS),
@@ -2414,7 +2414,7 @@ impl TaskJournal {
             return None;
         }
         crate::schema::get_schema(&task.key.source).and_then(|schema| {
-            let parent = schema.rollups.iter().find(|spec| spec.table_name(&task.key.source) == task.key.physical_table)?.derive_from.as_deref()?;
+            let parent = schema.rollups.iter().find(|spec| spec.is_table(&task.key.source, &task.key.physical_table))?.derive_from.as_deref()?;
             schema.rollups.iter().find(|spec| spec.name.as_deref() == Some(parent)).map(|spec| spec.table_name(&task.key.source))
         })
     }
@@ -2823,7 +2823,7 @@ impl TaskJournal {
     /// Persist an explicit policy change. Old binaries reject its record or v2 snapshot.
     pub fn set_rollup_build_policy(&mut self, source: &str, table: &str, policy: RollupBuildPolicy) -> anyhow::Result<()> {
         let schema = crate::schema::get_schema(source).ok_or_else(|| anyhow::anyhow!("unknown rollup source {source}"))?;
-        let spec = schema.rollups.iter().find(|spec| spec.table_name(source) == table).ok_or_else(|| anyhow::anyhow!("unknown rollup tier {table}"))?;
+        let spec = schema.rollups.iter().find(|spec| spec.is_table(source, table)).ok_or_else(|| anyhow::anyhow!("unknown rollup tier {table}"))?;
         if let RollupBuildPolicy::ResumeFrom { start_micros } = policy {
             let grain = spec.grain_micros().filter(|grain| *grain > 0).ok_or_else(|| anyhow::anyhow!("invalid rollup grain for {table}"))?;
             anyhow::ensure!(start_micros.rem_euclid(grain) == 0, "resume boundary must align to the rollup grain");
@@ -2849,7 +2849,7 @@ impl TaskJournal {
             return Some(range);
         }
         let schema = crate::schema::get_schema(source);
-        let grain = schema.and_then(|schema| schema.rollups.iter().find(|spec| spec.table_name(source) == target)).and_then(|spec| spec.grain_micros());
+        let grain = schema.and_then(|schema| schema.rollups.iter().find(|spec| spec.is_table(source, target))).and_then(|spec| spec.grain_micros());
         let mut table = target.to_owned();
         // A schema cycle must fail closed rather than loop in the scheduler.
         for _ in 0..=schema.as_ref().map_or(0, |schema| schema.rollups.len()) {
@@ -2871,7 +2871,7 @@ impl TaskJournal {
                 Some(RollupBuildPolicy::ResumeFrom { .. }) | None => {}
             }
             let Some(schema) = &schema else { return Some(range) };
-            let Some(parent) = schema.rollups.iter().find(|spec| spec.table_name(source) == table).and_then(|spec| spec.derive_from.as_deref()) else {
+            let Some(parent) = schema.rollups.iter().find(|spec| spec.is_table(source, &table)).and_then(|spec| spec.derive_from.as_deref()) else {
                 return Some(range);
             };
             let parent = schema.rollups.iter().find(|spec| spec.name.as_deref() == Some(parent))?;

@@ -1694,7 +1694,7 @@ async fn strip_rollup_measure(db: &Database, project: &str, day: chrono::NaiveDa
     use deltalake::kernel::Action;
     use object_store::ObjectStoreExt as _;
     let source = "otel_logs_and_spans";
-    for spec in get_schema(source).expect("source schema").rollups.iter().filter(|spec| tier.is_none_or(|tier| spec.table_name(source) == tier)) {
+    for spec in get_schema(source).expect("source schema").rollups.iter().filter(|spec| tier.is_none_or(|tier| spec.is_table(source, tier))) {
         let tier = db.get_or_create_table(project, &spec.table_name(source)).await?;
         let store = { tier.read().await.log_store().object_store(None) };
         let adds = live_adds(&tier).await;
@@ -3403,7 +3403,7 @@ async fn the_tag_replay_records_what_it_reads_into_the_coverage_ledger(split: bo
     // Restart seeding, validated independently of Delta replay: recreate the
     // pre-version generation from its real spec.
     use std::hash::{Hash, Hasher};
-    let spec = get_schema(&cell.0).unwrap().rollups.iter().find(|spec| spec.table_name(&cell.0) == cell.2).unwrap();
+    let spec = get_schema(&cell.0).unwrap().rollups.iter().find(|spec| spec.is_table(&cell.0, &cell.2)).unwrap();
     let mut legacy = recorded.clone();
     for entry in &mut legacy {
         let restricted = crate::schema::RollupSpec {
@@ -5180,7 +5180,7 @@ async fn a_date_with_only_slice_coverage_still_counts_as_missing() -> Result<()>
     let day = "2026-08-14";
     let day_start = chrono::NaiveDate::parse_from_str(day, "%Y-%m-%d").unwrap().and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_micros();
     let cell = (project.clone(), day.parse()?);
-    let spec = get_schema(&source).unwrap().rollups.iter().find(|spec| spec.table_name(&source) == target).unwrap();
+    let spec = get_schema(&source).unwrap().rollups.iter().find(|spec| spec.is_table(&source, &target)).unwrap();
     let generation = crate::rollup::generation_id(spec, &source, &project, day, None);
     let partitions =
         HashMap::from([((project.clone(), day.to_string()), PartitionStats { fingerprint: 1, min_ts: day_start, max_ts: day_start, rows: 1, bytes: 1 })]);

@@ -707,7 +707,7 @@ pub(crate) fn rollups_read_any(source: &str, tier: Option<&str>, columns: impl I
         let read: HashSet<&str> = schema
             .rollups
             .iter()
-            .filter(|spec| tier.is_none_or(|tier| spec.table_name(source) == tier))
+            .filter(|spec| tier.is_none_or(|tier| spec.is_table(source, tier)))
             .flat_map(|spec| spec_source_columns(schema, spec))
             .collect();
         columns.into_iter().any(|column| read.contains(column.as_ref()))
@@ -1365,7 +1365,7 @@ impl Database {
         &self, source: &str, target: &str, partitions: &HashMap<(String, String), PartitionStats>, files: SourceFiles<'_>,
     ) -> HashMap<BackfillCell, Vec<(i64, i64)>> {
         let Some(grain) =
-            get_schema(source).and_then(|schema| schema.rollups.iter().find(|spec| spec.table_name(source) == target)).and_then(|spec| spec.grain_micros())
+            get_schema(source).and_then(|schema| schema.rollups.iter().find(|spec| spec.is_table(source, target))).and_then(|spec| spec.grain_micros())
         else {
             return HashMap::new();
         };
@@ -1475,7 +1475,7 @@ impl Database {
         // A base tier coarser than a minute once cut its units below the grain; each such
         // slice holds a PARTIAL state under the bucket's `(timestamp, id)`.
         let grain = get_schema(source)
-            .and_then(|schema| schema.rollups.iter().find(|spec| spec.table_name(source) == target && spec.derive_from.is_none()))
+            .and_then(|schema| schema.rollups.iter().find(|spec| spec.is_table(source, target) && spec.derive_from.is_none()))
             .and_then(|spec| spec.grain_micros())
             .filter(|grain| *grain > crate::maintenance_coordinator::MIN_SLICE_MICROS);
         let mut sub_grain = HashSet::new();
@@ -1562,7 +1562,7 @@ impl Database {
         &self, source: &str, target: (&str, &DeltaTable, &str), partitions: &HashMap<(String, String), PartitionStats>, files: SourceFiles<'_>,
     ) -> Result<HashMap<BackfillCell, Vec<(i64, i64)>>> {
         let Some(grain) =
-            get_schema(source).and_then(|schema| schema.rollups.iter().find(|spec| spec.table_name(source) == target.0)).and_then(|spec| spec.grain_micros())
+            get_schema(source).and_then(|schema| schema.rollups.iter().find(|spec| spec.is_table(source, target.0))).and_then(|spec| spec.grain_micros())
         else {
             return Ok(HashMap::new());
         };
@@ -3086,7 +3086,7 @@ impl Database {
         let lease = crate::maintenance_coordinator::TaskLease::new(Arc::clone(&self.maintenance_tasks), key.clone(), (*self.maintenance_shutdown).clone());
         let retry = |reason: String, delay: std::time::Duration| -> Result<bool> { self.retried(&key, reason, delay) };
         let Some(source_schema) = get_schema(&key.source) else { return retry("source_schema_missing".to_owned(), std::time::Duration::from_secs(300)) };
-        let Some(spec) = source_schema.rollups.iter().find(|spec| spec.table_name(&key.source) == key.physical_table) else {
+        let Some(spec) = source_schema.rollups.iter().find(|spec| spec.is_table(&key.source, &key.physical_table)) else {
             return retry("rollup_spec_missing".to_owned(), std::time::Duration::from_secs(300));
         };
         let derived = operation == crate::maintenance_coordinator::Operation::DerivedRollup;
@@ -3327,7 +3327,7 @@ impl Database {
             let base_spec = source_schema
                 .rollups
                 .iter()
-                .find(|candidate| candidate.table_name(&key.source) == from)
+                .find(|candidate| candidate.is_table(&key.source, &from))
                 .ok_or_else(|| anyhow::anyhow!("derived rollup {} has no base spec", key.physical_table))?;
             let base_key = crate::maintenance_coordinator::TaskKey {
                 physical_table: from.clone(),
@@ -4088,7 +4088,7 @@ impl Database {
     async fn empty_rollup_output_current(&self, key: &crate::maintenance_coordinator::TaskKey, date: &str) -> Result<bool> {
         use crate::maintenance_coordinator::TimeSlice;
         let Some(grain) = get_schema(&key.source)
-            .and_then(|schema| schema.rollups.iter().find(|spec| spec.table_name(&key.source) == key.physical_table))
+            .and_then(|schema| schema.rollups.iter().find(|spec| spec.is_table(&key.source, &key.physical_table)))
             .and_then(|spec| spec.grain_micros())
         else {
             return Ok(false);
@@ -6012,7 +6012,7 @@ impl Database {
             recovered += 1;
         }
         if !moved.is_empty()
-            && let Some(spec) = get_schema(source).and_then(|schema| schema.rollups.iter().find(|spec| spec.table_name(source) == target).cloned())
+            && let Some(spec) = get_schema(source).and_then(|schema| schema.rollups.iter().find(|spec| spec.is_table(source, target)).cloned())
         {
             let queued = moved.len();
             self.enqueue_unverifiable_rebuilds(source, &spec, target, RollupRebuildReason::WitnessMoved, &moved);
@@ -6123,7 +6123,7 @@ impl Database {
         // below on every boot until they aged out of the horizon.
         let undeclared = self
             .coverage_ledger
-            .retire_where(|(source, _, table, _)| get_schema(source).is_none_or(|schema| !schema.rollups.iter().any(|spec| spec.table_name(source) == *table)));
+            .retire_where(|(source, _, table, _)| get_schema(source).is_none_or(|schema| !schema.rollups.iter().any(|spec| spec.is_table(source, table))));
         if undeclared > 0 {
             info!(undeclared, event = "rollup_coverage_ledger_retired_undeclared", "coverage cells of a tier no longer declared dropped from the ledger");
         }
@@ -9472,7 +9472,15 @@ impl Database {
                 continue;
             }
             let target_paths: Vec<_> = bin.targets.iter().map(|add| add.path.clone()).collect();
-            match svc.carry_forward_after_compaction(table_name, &bin.project_id, &target_paths, &for_bin).await {
+            let output_rows = bin
+                .adds
+                .iter()
+                .map(|action| match action {
+                    deltalake::kernel::Action::Add(add) => add_row_count(add),
+                    _ => Some(0),
+                })
+                .sum::<Option<u64>>();
+            match svc.carry_forward(table_name, &bin.project_id, &target_paths, &for_bin, output_rows).await {
                 Ok(true) => carried.extend(for_bin),
                 Ok(false) => {}
                 Err(error) => warn!(table_name, %error, event = "tantivy_wave_carry_forward_failed"),
@@ -11747,7 +11755,7 @@ mod rollup_noop_skip_tests {
         let start = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")?.and_hms_opt(12, 0, 0).expect("valid hour").and_utc().timestamp_micros();
         let range = (start, start + 60_000_000);
         let source = get_schema(SOURCE).expect("source schema");
-        let spec = source.rollups.iter().find(|spec| spec.table_name(SOURCE) == TIER).expect("dashboard spec");
+        let spec = source.rollups.iter().find(|spec| spec.is_table(SOURCE, TIER)).expect("dashboard spec");
         let dir = tempfile::tempdir()?;
         // Separate files force winner selection across physical inputs. The newest
         // version changes both the measure and tombstone, not the dedup identity.
@@ -12128,7 +12136,7 @@ mod rollup_noop_skip_tests {
         use crate::maintenance_coordinator::{RollupBuildPolicy, TimeSlice};
         let source = "otel_logs_and_spans";
         let target = "otel_logs_and_spans_rollup_routes_30m";
-        let spec = get_schema(source).expect("source schema").rollups.iter().find(|spec| spec.table_name(source) == target).expect("route tier").clone();
+        let spec = get_schema(source).expect("source schema").rollups.iter().find(|spec| spec.is_table(source, target)).expect("route tier").clone();
         let (db, project, date) = rollup_db("paused_rebuilds").await?;
         db.journal().set_rollup_build_policy(source, target, RollupBuildPolicy::Paused)?;
         let day = day_start_micros(date).expect("valid day");

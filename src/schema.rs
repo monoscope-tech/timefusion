@@ -118,6 +118,11 @@ impl RollupSpec {
         format!("{source}_rollup_{}", self.name.as_deref().unwrap_or(&self.grain))
     }
 
+    /// `table_name(source) == table` without allocating: schedulers ask it per task per spec.
+    pub fn is_table(&self, source: &str, table: &str) -> bool {
+        table.strip_prefix(source).and_then(|rest| rest.strip_prefix("_rollup_")) == Some(self.name.as_deref().unwrap_or(&self.grain))
+    }
+
     /// Grain in microseconds, parsed from the suffix. `None` if unparseable,
     /// which `validate` rejects at load.
     pub fn grain_micros(&self) -> Option<i64> {
@@ -804,6 +809,18 @@ pub fn create_insert_compatible_schema(schema: &SchemaRef) -> SchemaRef {
 
 #[cfg(test)]
 mod tests {
+    /// `is_table` must answer exactly what comparing `table_name` would, for every declared tier.
+    #[test]
+    fn is_table_agrees_with_table_name() {
+        for source in ["otel_logs_and_spans", "otel_metrics"] {
+            let rollups = &super::get_schema(source).expect("registered").rollups;
+            for (a, b) in rollups.iter().flat_map(|a| rollups.iter().map(move |b| (a, b))) {
+                assert_eq!(a.is_table(source, &b.table_name(source)), a.table_name(source) == b.table_name(source));
+                assert!(!a.is_table("other", &a.table_name(source)), "the source prefix must match too");
+            }
+        }
+    }
+
     /// Only a same-grain, same-kind tier whose dimensions are a subset lends its rows:
     /// never across grains, never from a superset.
     #[test_case::test_case("wide" => vec!["narrow"] ; "a superset borrows from its subset")]

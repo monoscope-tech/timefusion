@@ -103,7 +103,7 @@ impl Database {
             Some(prefix) => *prefix,
             None => {
                 let prefix = get_schema(source)
-                    .and_then(|schema| schema.rollups.iter().find(|spec| spec.table_name(source) == target))
+                    .and_then(|schema| schema.rollups.iter().find(|spec| spec.is_table(source, target)))
                     .map(|spec| crate::rollup::generation_prefix(spec, key.1.as_deref()));
                 PREFIXES.insert(key, prefix);
                 prefix
