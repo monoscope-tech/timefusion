@@ -397,28 +397,11 @@ FROM otel_logs_and_spans WHERE project_id = 'mono_shapes' AND id = 'ms_1'
 ----
 33.333333333333336 33.333333333333336 16.666666666666668 16.666666
 
-# §13b. Pinned as OBSERVED HERE, and explicitly NOT a production defect.
-#
-# In this harness a grouped percentage divided by a window aggregate answers 33
-# where Postgres gives 33.333…. The trigger needs a GROUP BY *and* a window
-# aggregate as the divisor: §13d divides a filtered count by a plain
-# `GREATEST(1, COUNT(*))` in the same shape and is exact (16.67), §13e shows
-# the ungrouped multiply keeps its scale, and the §13a scalar control is exact.
-#
-# It does NOT reproduce on production. Measured 2026-09-02 against prod
-# TimeFusion, both before and after deploying this very commit (process uptime
-# confirmed, so it was this build): the identical grouped+window shape answers
-# 86.1466854992369 at full precision, grouped by a declared rollup dimension
-# and by a non-dimension alike, and `COUNT(*) * 100.0` renders "9087700.0" with
-# its scale where it renders "300" here.
-#
-# So the difference is between THIS harness (`AppConfig::default()`, ephemeral
-# MinIO, six rows) and a production process — not between TimeFusion versions.
-# The mechanism is unknown and is deliberately not guessed at here. Treat this
-# as an open question about the test environment, not as a bug users are
-# hitting: the one dashboard widget in the shape was changed to cast its
-# operands (§13c), which is a no-op on prod and cheap insurance if the
-# environments ever converge.
+# §13b. A grouped percentage over a window aggregate. It once answered 33 where
+# Postgres gives 33.333…: the plan cache lifted `100.0` into an untyped `$N`,
+# which took Int64 from `COUNT(*)` and made the division integral. Prod saw it
+# too (uptime 66.67% read 66) whenever a query took the cached-shape path.
+# Fractional literals now stay inline in the shape key.
 query TTTT
 SELECT resource___service___name,
        (COUNT(*) * 100.0)::text AS mult,
@@ -430,9 +413,9 @@ WHERE project_id = 'mono_shapes'
 GROUP BY resource___service___name
 ORDER BY 1
 ----
-api 300 6 50
-db-proxy 100 6 16
-web 200 6 33
+api 300.0 6 50.0
+db-proxy 100.0 6 16.666666666666668
+web 200.0 6 33.333333333333336
 
 query TT
 SELECT resource___service___name,
@@ -444,13 +427,11 @@ GROUP BY resource___service___name
 ORDER BY 2 DESC, 1
 ----
 api 50
-web 33
-db-proxy 16
+web 33.3
+db-proxy 16.7
 
-# §13c. The fix, pinned beside the bug. Casting the operands to float keeps the
-# fraction, and it is the spelling `endpoint-stats.yaml` now uses for its
-# "% of Total" column. Same data as 13b: 33.3 and 16.7, not 33 and 16.
-# The trailing ::float matters too -- ROUND(<numeric>, 1)::text renders
+# §13c. The float-cast spelling `endpoint-stats.yaml` uses for its "% of Total"
+# column agrees. The trailing ::float matters: ROUND(<numeric>, 1)::text renders
 # "33.3000000000" here, because the numeric does not carry its scale.
 query TT
 SELECT resource___service___name,
@@ -667,9 +648,9 @@ SELECT first_value(v ORDER BY t NULLS LAST) FROM (
 ----
 real
 
-# §13d. The SAME truncation in the error-rate shape the raw-SQL dashboard
-# widgets use: `COUNT(*) FILTER (...) * 100.0 / GREATEST(1, COUNT(*))`, with no
-# cast on either operand. One error in six rows is 16.67%.
+# §13d. The error-rate shape the raw-SQL dashboard widgets use:
+# `COUNT(*) FILTER (...) * 100.0 / GREATEST(1, COUNT(*))`, with no cast on either
+# operand. One error in six rows is 16.67%, at round's two digits.
 query TT
 SELECT ROUND((COUNT(*) FILTER (WHERE status_code = 'ERROR') * 100.0 / GREATEST(1, COUNT(*)))::numeric, 2)::text AS uncast,
        ROUND((COUNT(*) FILTER (WHERE status_code = 'ERROR')::float * 100.0 / GREATEST(1, COUNT(*))::float)::numeric, 2)::float::text AS cast_
@@ -690,17 +671,12 @@ WHERE project_id = 'mono_shapes'
 GROUP BY resource___service___name
 ORDER BY 1
 ----
-100 100 16 16
-200 100 33 33
-300 100 50 50
+100.0 100.0 16.666666666666668 16.666666666666668
+200.0 100.0 33.333333333333336 33.333333333333336
+300.0 100.0 50.0 50.0
 
-# §13e. The BOUNDARY of the 13b defect, and the reason it costs one widget
-# rather than every percentage in the product. All three of these are decimal
-# divisions in real dashboard widgets (_overview's apdex, error rate and
-# throughput) and all three are exact. `COUNT(*) * 100.0` ungrouped even keeps
-# its scale ("600.0"), where the same expression under a GROUP BY renders
-# "300". So the defect needs a GROUP BY *and* a window aggregate as the divisor
-# together; neither alone reproduces it.
+# §13e. Decimal divisions from real dashboard widgets (_overview's apdex, error
+# rate and throughput), ungrouped.
 query TTTT
 SELECT ROUND((SUM(CASE WHEN duration <= 500000000 THEN 1.0 WHEN duration <= 2000000000 THEN 0.5 ELSE 0 END)
       / GREATEST(1, COUNT(*))::numeric), 2)::text AS apdex,

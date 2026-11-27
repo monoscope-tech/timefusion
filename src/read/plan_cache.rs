@@ -746,6 +746,20 @@ fn parameterize_statement(stmt: &Statement, base: usize, include_strings: bool) 
                 base,
                 &mut values,
             ),
+            // `round(x, 2)`'s digits fix its result type (Decimal(38, 2)); as `$N` the
+            // scale is unknown at plan time and `16.67` renders `16.6700000000`.
+            SqlExpr::Function(f @ Function { args: FunctionArguments::List(_), .. }) if fn_name_is_one_of(f, &["round", "trunc"]) => {
+                if let FunctionArguments::List(list) = &mut f.args {
+                    take_numbers(
+                        list.args.iter_mut().take(1).filter_map(|arg| match arg {
+                            FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e),
+                            _ => None,
+                        }),
+                        base,
+                        &mut values,
+                    )
+                }
+            }
             SqlExpr::Function(Function { args: FunctionArguments::List(list), .. }) => take_numbers(
                 list.args.iter_mut().filter_map(|arg| match arg {
                     FunctionArg::Unnamed(FunctionArgExpr::Expr(e))
@@ -1154,6 +1168,8 @@ mod tests {
         Some("SELECT time_bucket(300, timestamp), approx_percentile(0.95, duration) FROM t WHERE project_id = 'p' AND duration <= 900 AND timestamp >= 1722000000000000"),
         &["0.95"], &["60", "500"]
         => with |v: Vec<ScalarValue>| assert_eq!(v.len(), 4, "3 integers + the 'p' string captured, the fraction inline: {v:?}") ; "integer literals in value contexts parameterize")]
+    // round's digits pick its result scale, so they stay inline too.
+    #[test_case("SELECT round(avg(duration)::numeric, 2) FROM t WHERE project_id = 'p'", None::<&str>, &["::NUMERIC, 2)"], &[] => vec![utf8("p")] ; "round digits stay inline")]
     // A lifted fraction took the integer type of its operand and the division truncated.
     #[test_case("SELECT (100.0 * count(*) FILTER (WHERE level = 'ERROR') / count(*))::float8 FROM t WHERE project_id = 'p'", None::<&str>, &["100.0"], &[]
         => vec![utf8("p")] ; "a fractional literal stays inline so the division stays fractional")]
