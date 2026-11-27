@@ -28,7 +28,8 @@ phases_result="$probe_dir/phases"
   phases="unknown"
   while [ ! -e "$probe_stop" ]; do
     attempt_started_ms="$(date +%s%3N)"
-    responding_boot="$(timeout 1 psql "$PGURL" -v ON_ERROR_STOP=1 -Atqc "SELECT value FROM timefusion_stats WHERE component = 'buffered_layer' AND key = 'boot_micros'" 2>/dev/null || true)"
+    # 3s, not 1: through the Access tunnel a fresh connection takes ~0.7s locally and more from a runner, so 1s never answered.
+    responding_boot="$(timeout 3 psql "$PGURL" -v ON_ERROR_STOP=1 -Atqc "SELECT value FROM timefusion_stats WHERE component = 'buffered_layer' AND key = 'boot_micros'" 2>/dev/null || true)"
     if [ -n "$responding_boot" ]; then
       if (( unready_started_ms > 0 )); then
         interval_ms=$(( $(date +%s%3N) - unready_started_ms ))
