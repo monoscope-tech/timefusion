@@ -122,8 +122,8 @@ jobs:
       # PGWire through a Cloudflare Access TCP route (tf-pgwire.s.past3.tech).
       - name: Open PGWire tunnel
         env:
-          TUNNEL_SERVICE_TOKEN_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
-          TUNNEL_SERVICE_TOKEN_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+          TUNNEL_SERVICE_TOKEN_ID: ${{ secrets.TF_PGWIRE_ACCESS_CLIENT_ID }}
+          TUNNEL_SERVICE_TOKEN_SECRET: ${{ secrets.TF_PGWIRE_ACCESS_CLIENT_SECRET }}
         run: |
           curl -fsSL -o /usr/local/bin/cloudflared https://github.com/cloudflare/cloudflared/releases/download/2025.11.1/cloudflared-linux-amd64
           chmod +x /usr/local/bin/cloudflared
