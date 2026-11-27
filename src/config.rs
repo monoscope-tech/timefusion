@@ -2440,9 +2440,14 @@ pub struct TelemetryConfig {
     pub otel_service_version: String,
     #[serde(default)]
     pub log_format: Option<String>,
-    /// Standard OTel var; `none` disables span export (logs/metrics unaffected).
+    /// Standard OTel vars; `none` disables that signal's OTLP export (a self-hosted
+    /// TimeFusion with no collector sets all three).
     #[serde(default)]
     pub otel_traces_exporter: Option<String>,
+    #[serde(default)]
+    pub otel_logs_exporter: Option<String>,
+    #[serde(default)]
+    pub otel_metrics_exporter: Option<String>,
     /// Sets jemalloc `prof.active` at boot (`--features profiling` builds only),
     /// which is what makes the baked interval heap dumps write at all.
     #[serde(default)]

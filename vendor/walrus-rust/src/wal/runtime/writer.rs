@@ -18,7 +18,7 @@ use super::{
 #[cfg(target_os = "linux")]
 use crate::wal::block::Metadata;
 #[cfg(target_os = "linux")]
-use crate::wal::config::{USE_FD_BACKEND, checksum64};
+use crate::wal::config::{USE_FD_BACKEND, checksum64, io_uring_available};
 use crate::wal::{
     block::Block,
     config::{DEFAULT_BLOCK_SIZE, FsyncSchedule, MAX_BATCH_BYTES, MAX_BATCH_ENTRIES, PREFIX_META_SIZE, debug_print},
@@ -187,7 +187,7 @@ impl Writer {
 
         #[cfg(target_os = "linux")]
         {
-            if USE_FD_BACKEND.load(Ordering::Relaxed) {
+            if USE_FD_BACKEND.load(Ordering::Relaxed) && io_uring_available() {
                 return self.submit_batch_via_io_uring(&write_plan, batch, &mut revert_info, &mut *cur_offset, planning_offset, total_bytes_usize);
             }
         }

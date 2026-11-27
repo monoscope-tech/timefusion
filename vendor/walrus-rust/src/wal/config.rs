@@ -7,6 +7,21 @@ use std::{
 // Global flag to choose backend
 pub(crate) static USE_FD_BACKEND: AtomicBool = AtomicBool::new(true);
 
+/// Whether this kernel lets us create an io_uring. Docker's default seccomp profile, gVisor and
+/// some hardened kernels refuse `io_uring_setup` (ENOSYS/EPERM); the FD backend then takes the
+/// sequential pwrite/pread/fsync paths the mmap backend and non-Linux builds already use.
+#[cfg(target_os = "linux")]
+pub(crate) fn io_uring_available() -> bool {
+    static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *AVAILABLE.get_or_init(|| match io_uring::IoUring::new(1) {
+        Ok(_) => true,
+        Err(e) => {
+            eprintln!("walrus: io_uring unavailable ({e}); using sequential WAL I/O");
+            false
+        }
+    })
+}
+
 // Public function to enable FD backend
 pub fn enable_fd_backend() {
     USE_FD_BACKEND.store(true, Ordering::Relaxed);
