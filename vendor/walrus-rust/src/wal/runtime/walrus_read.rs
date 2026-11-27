@@ -489,7 +489,7 @@ impl Walrus {
 
         // 3) Read ranges via io_uring (FD backend) or mmap
         #[cfg(target_os = "linux")]
-        let buffers = if USE_FD_BACKEND.load(Ordering::Relaxed) {
+        let buffers = if USE_FD_BACKEND.load(Ordering::Relaxed) && crate::wal::config::io_uring_available() {
             // io_uring path
             let ring_size = (plan.len() + 64).min(4096) as u32;
             let mut ring = io_uring::IoUring::new(ring_size).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("io_uring init failed: {}", e)))?;

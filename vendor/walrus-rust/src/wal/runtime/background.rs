@@ -52,7 +52,7 @@ pub(super) fn start_background_workers(fsync_schedule: FsyncSchedule) -> Arc<mps
         let mut delete_pending = HashSet::new();
 
         #[cfg(target_os = "linux")]
-        let mut ring = io_uring::IoUring::new(2048).expect("Failed to create io_uring");
+        let mut ring = crate::wal::config::io_uring_available().then(|| io_uring::IoUring::new(2048).expect("Failed to create io_uring"));
 
         loop {
             // `unpark` lets a position-safe reclaim request run immediately;
@@ -76,7 +76,9 @@ pub(super) fn start_background_workers(fsync_schedule: FsyncSchedule) -> Arc<mps
             // Phase 3: Flush operations
             #[cfg(target_os = "linux")]
             {
-                if USE_FD_BACKEND.load(Ordering::Relaxed) {
+                if USE_FD_BACKEND.load(Ordering::Relaxed)
+                    && let Some(ring) = ring.as_mut()
+                {
                     // FD backend: Use io_uring for batched fsync
                     let mut fsync_batch = Vec::new();
 

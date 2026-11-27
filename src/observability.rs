@@ -388,7 +388,7 @@ pub fn init_local_metrics_for_test() {
 pub fn init_metrics(
     config: &TelemetryConfig, buffered_layer: Weak<BufferedWriteLayer>, tantivy_indexer: Option<Weak<TantivyIndexService>>,
 ) -> anyhow::Result<()> {
-    if METRICS.get().is_some() {
+    if METRICS.get().is_some() || config.otel_metrics_exporter.as_deref() == Some("none") {
         return Ok(());
     }
 
@@ -2137,15 +2137,20 @@ pub fn init_telemetry(config: &TelemetryConfig) -> anyhow::Result<()> {
     // OTLP logs: bridge tracing events to the collector. The bridge must not
     // observe the exporter's own tracing output — tonic/hyper events emitted
     // inside an export would recurse into another export.
-    let log_exporter = opentelemetry_otlp::LogExporter::builder().with_tonic().with_endpoint(otlp_endpoint).with_timeout(EXPORT_TIMEOUT).build()?;
-    // Logs carry full SQL text, so cap the log batch too.
-    let log_processor = opentelemetry_sdk::logs::BatchLogProcessor::builder(log_exporter)
-        .with_batch_config(opentelemetry_sdk::logs::BatchConfigBuilder::default().with_max_export_batch_size(EXPORT_BATCH).build())
-        .build();
-    let logger_provider = SdkLoggerProvider::builder().with_log_processor(log_processor).with_resource(resource).build();
-    let log_bridge = otlp_log_bridge(&logger_provider)
-        .with_filter(tracing_subscriber::filter::filter_fn(|meta| !["opentelemetry", "tonic", "h2", "hyper"].iter().any(|p| meta.target().starts_with(p))));
-    let _ = LOGGER_PROVIDER.set(logger_provider);
+    let log_bridge = if config.otel_logs_exporter.as_deref() == Some("none") {
+        None
+    } else {
+        let log_exporter = opentelemetry_otlp::LogExporter::builder().with_tonic().with_endpoint(otlp_endpoint).with_timeout(EXPORT_TIMEOUT).build()?;
+        // Logs carry full SQL text, so cap the log batch too.
+        let log_processor = opentelemetry_sdk::logs::BatchLogProcessor::builder(log_exporter)
+            .with_batch_config(opentelemetry_sdk::logs::BatchConfigBuilder::default().with_max_export_batch_size(EXPORT_BATCH).build())
+            .build();
+        let logger_provider = SdkLoggerProvider::builder().with_log_processor(log_processor).with_resource(resource).build();
+        let log_bridge = otlp_log_bridge(&logger_provider)
+            .with_filter(tracing_subscriber::filter::filter_fn(|meta| !["opentelemetry", "tonic", "h2", "hyper"].iter().any(|p| meta.target().starts_with(p))));
+        let _ = LOGGER_PROVIDER.set(logger_provider);
+        Some(log_bridge)
+    };
 
     // Tantivy emits an INFO event per segment operation, which floods stdout/OTLP.
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,tantivy=warn"));

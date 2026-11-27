@@ -109,6 +109,11 @@ def smoke(image, recipe=ROOT / 'ci/smoke.Dockerfile'):
             run('docker', 'exec', name, *command, 'healthcheck', timeout=5)
             if output('docker', 'inspect', '--format', '{{.State.Running}}', name) != 'true':
                 raise RuntimeError('Production image exited during its health probe')
+            # Docker's default seccomp profile refuses io_uring; the WAL's fsync thread
+            # used to panic on it while the process stayed up and passed this probe.
+            logs = subprocess.run(['docker', 'logs', name], capture_output=True, text=True, check=True)
+            if 'panicked' in logs.stdout + logs.stderr:
+                raise RuntimeError('Production image panicked under the default seccomp profile')
             print('smoke: production image stayed running and passed PGWire probe', flush=True)
         except Exception:
             subprocess.run(['docker', 'logs', '--tail', '40', name], check=False)
