@@ -679,19 +679,20 @@ fn parameterize_statement(stmt: &Statement, base: usize, include_strings: bool) 
         Value::Placeholder(format!("${}", base + idx + 1))
     }
 
-    // Parameterize a numeric literal ONLY when reached as a value-context child
+    // Parameterize an integer literal ONLY when reached as a value-context child
     // (function arg, comparison operand, CASE/BETWEEN/cast). A bare
     // `Expr::Value(Number)` — exactly what GROUP BY / ORDER BY ordinals and
     // LIMIT / OFFSET are — is never a child of these containers, so ordinals keep
-    // their positional meaning. Unparseable numbers stay inline.
+    // their positional meaning. Fractional numbers stay inline: an untyped `$N`
+    // takes its type from the other operand, so `100.0 * count(*) / count(*)`
+    // planned 100.0 as Int64 and divided as integers (a 66.67% uptime read 66).
     fn take_numbers<'a>(exprs: impl IntoIterator<Item = &'a mut SqlExpr>, base: usize, values: &mut Vec<ScalarValue>) {
         for e in exprs {
             if let SqlExpr::Value(vs) = e
                 && let Value::Number(n, _) = &vs.value
-                && let Some(sv) =
-                    n.parse::<i64>().map(|i| ScalarValue::Int64(Some(i))).ok().or_else(|| n.parse::<f64>().ok().map(|f| ScalarValue::Float64(Some(f))))
+                && let Ok(i) = n.parse::<i64>()
             {
-                vs.value = placeholder_for(values, base, sv);
+                vs.value = placeholder_for(values, base, ScalarValue::Int64(Some(i)));
             }
         }
     }
@@ -1150,9 +1151,12 @@ mod tests {
         => vec![utf8("p1"), utf8("2026-07-01"), ScalarValue::Int64(Some(5))] ; "parameterize extracts strings and value context numbers in walk order")]
     // Shapes differing only by numeric literals must collapse to one entry.
     #[test_case("SELECT time_bucket(60, timestamp), approx_percentile(0.95, duration) FROM t WHERE project_id = 'p' AND duration <= 500 AND timestamp >= 1721000000000000",
-        Some("SELECT time_bucket(300, timestamp), approx_percentile(0.99, duration) FROM t WHERE project_id = 'p' AND duration <= 900 AND timestamp >= 1722000000000000"),
-        &[], &["60", "0.95", "500"]
-        => with |v: Vec<ScalarValue>| assert_eq!(v.len(), 5, "4 numbers + the 'p' string all captured: {v:?}") ; "numeric literals in value contexts parameterize")]
+        Some("SELECT time_bucket(300, timestamp), approx_percentile(0.95, duration) FROM t WHERE project_id = 'p' AND duration <= 900 AND timestamp >= 1722000000000000"),
+        &["0.95"], &["60", "500"]
+        => with |v: Vec<ScalarValue>| assert_eq!(v.len(), 4, "3 integers + the 'p' string captured, the fraction inline: {v:?}") ; "integer literals in value contexts parameterize")]
+    // A lifted fraction took the integer type of its operand and the division truncated.
+    #[test_case("SELECT (100.0 * count(*) FILTER (WHERE level = 'ERROR') / count(*))::float8 FROM t WHERE project_id = 'p'", None::<&str>, &["100.0"], &[]
+        => vec![utf8("p")] ; "a fractional literal stays inline so the division stays fractional")]
     fn only_the_unsafe_literals_stay_inline(sql: &str, twin: Option<&str>, inline: &[&str], replaced: &[&str]) -> Vec<ScalarValue> {
         let (text, values) = shape(sql);
         for frag in inline {
