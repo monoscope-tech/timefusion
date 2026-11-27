@@ -145,3 +145,7 @@ jobs:
         run: |
           export PGURL="$(sed -E 's#@[^/]+/#@127.0.0.1:15432/#' <<<"$PGURL_PUBLIC")"
           python3 scripts/deploy/run.py ci
+
+      - name: Tunnel log
+        if: failure()
+        run: cat /tmp/cloudflared.log || true
