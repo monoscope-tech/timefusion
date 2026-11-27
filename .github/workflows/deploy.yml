@@ -118,15 +118,30 @@ jobs:
       - name: Install CapRover deploy client
         run: npm install --global caprover@2.3.1
 
+      # The captain host firewall drops public 5432, so the handoff reaches
+      # PGWire through a Cloudflare Access TCP route (tf-pgwire.s.past3.tech).
+      - name: Open PGWire tunnel
+        env:
+          TUNNEL_SERVICE_TOKEN_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+          TUNNEL_SERVICE_TOKEN_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+        run: |
+          curl -fsSL -o /usr/local/bin/cloudflared https://github.com/cloudflare/cloudflared/releases/download/2025.11.1/cloudflared-linux-amd64
+          chmod +x /usr/local/bin/cloudflared
+          nohup cloudflared access tcp --hostname tf-pgwire.s.past3.tech --url 127.0.0.1:15432 > /tmp/cloudflared.log 2>&1 &
+          for _ in $(seq 30); do nc -z 127.0.0.1 15432 && exit 0; sleep 1; done
+          cat /tmp/cloudflared.log; exit 1
+
       - name: Deploy and verify production
         env:
           CAPROVER_SERVER: ${{ secrets.CAPTAINROVER_SERVER }}
           CAPROVER_APP: ${{ secrets.CAPTAINROVER_APP_NAME }}
           CAPROVER_TOKEN: ${{ secrets.CAPTAINROVER_APP_TOKEN }}
-          PGURL: ${{ secrets.TIMEFUSION_PG_URL }}
+          PGURL_PUBLIC: ${{ secrets.TIMEFUSION_PG_URL }}
           # `gh` refuses to run in Actions without a token, and lease.py's
           # run_is_finished shells out to it. Without this line that check always
           # answered "assume alive", so the wedged-lease auto-reclaim could never
           # fire in CI — it only ever worked from a logged-in laptop.
           GH_TOKEN: ${{ github.token }}
-        run: python3 scripts/deploy/run.py ci
+        run: |
+          export PGURL="$(sed -E 's#@[^/]+/#@127.0.0.1:15432/#' <<<"$PGURL_PUBLIC")"
+          python3 scripts/deploy/run.py ci
